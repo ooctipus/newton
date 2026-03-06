@@ -731,6 +731,10 @@ class ViewerBase(ABC):
             if hasattr(geo_src, "texture"):
                 texture = geo_src.texture
 
+            color = geo_src.color if geo_src.color is not None else None
+            roughness = getattr(geo_src, "roughness", None)
+            metallic = getattr(geo_src, "metallic", None)
+
             self.log_mesh(
                 name,
                 points,
@@ -739,6 +743,9 @@ class ViewerBase(ABC):
                 uvs,
                 hidden=hidden,
                 texture=texture,
+                color=color,
+                roughness=roughness,
+                metallic=metallic,
             )
             return
 
@@ -814,6 +821,9 @@ class ViewerBase(ABC):
         texture: np.ndarray | str | None = None,
         hidden: bool = False,
         backface_culling: bool = True,
+        color: tuple[float, float, float] | None = None,
+        roughness: float | None = None,
+        metallic: float | None = None,
     ):
         """
         Register or update a mesh prototype in the viewer backend.

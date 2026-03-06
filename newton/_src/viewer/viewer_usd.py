@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 
 import numpy as np
@@ -26,9 +27,9 @@ import newton
 from ..core.types import nparray, override
 
 try:
-    from pxr import Gf, Sdf, Usd, UsdGeom, Vt
+    from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade, Vt
 except ImportError:
-    Gf = Sdf = Usd = UsdGeom = Vt = None
+    Gf = Sdf = Usd = UsdGeom = UsdShade = Vt = None
 
 from .viewer import ViewerBase
 
@@ -156,7 +157,83 @@ class ViewerUSD(ViewerBase):
         self._frame_index = 0
         self._frame_count = 0
 
+        self._instance_paths: dict[str, list[str]] = {}
+        self._instance_prim_cache: dict[str, Any] = {}
+
         self.set_model(None)
+
+    @override
+    def set_model(self, model: newton.Model | None, max_worlds: int | None = None):
+        super().set_model(model, max_worlds)
+        if model is not None:
+            self._build_instance_paths()
+
+    def _build_instance_paths(self):
+        """Build semantically meaningful USD paths for each shape instance.
+
+        Uses model.shape_label and model.body_label to create a hierarchy like:
+            /objects/env_0/shadow_hand/robot0/link_0/visual/mesh_0
+        instead of the generic:
+            /model/shapes/shape_0/instance_0
+        """
+        model = self.model
+        if model is None:
+            return
+
+        shape_labels = model.shape_label
+        shape_body_np = model.shape_body.numpy()
+        shape_world_np = model.shape_world.numpy()
+
+        num_worlds = int(shape_world_np.max()) + 1 if len(shape_world_np) > 0 else 1
+        multi_env = num_worlds > 1
+
+        def _sanitize(s: str) -> str:
+            """Sanitize a string to be a valid USD prim path segment."""
+            s = s.strip("/")
+            s = re.sub(r"[^a-zA-Z0-9_/]", "_", s)
+            s = "/".join(seg for seg in s.split("/") if seg)
+            return s
+
+        def _strip_env_prefix(label: str) -> str:
+            """Strip common Isaac Lab env scaffolding like World/envs/env_N/."""
+            return re.sub(r"^World/envs/env_\d+/", "", label)
+
+        def _world_prefix(world_idx: int) -> str:
+            if world_idx < 0:
+                return "/objects/shared"
+            if multi_env:
+                return f"/objects/env_{world_idx}"
+            return "/objects"
+
+        for batch in self._shape_instances.values():
+            paths = []
+            for i, shape_idx in enumerate(batch.model_shapes):
+                label = shape_labels[shape_idx] if shape_idx < len(shape_labels) else None
+                world_idx = int(shape_world_np[shape_idx])
+                prefix = _world_prefix(world_idx)
+
+                if label:
+                    clean = _sanitize(label)
+                    if multi_env and clean:
+                        clean = _strip_env_prefix(clean)
+                    if clean:
+                        instance_path = f"{prefix}/{clean}"
+                    else:
+                        instance_path = f"{prefix}/shape_{shape_idx}"
+                else:
+                    body_idx = int(shape_body_np[shape_idx])
+                    body_lbl = (
+                        model.body_label[body_idx]
+                        if 0 <= body_idx < len(model.body_label)
+                        else "static"
+                    )
+                    body_clean = _sanitize(body_lbl) or f"body_{body_idx}"
+                    if multi_env:
+                        body_clean = _strip_env_prefix(body_clean)
+                    instance_path = f"{prefix}/{body_clean}/shape_{i}"
+
+                paths.append(instance_path)
+            self._instance_paths[batch.name] = paths
 
     @override
     def begin_frame(self, time: float):
@@ -226,6 +303,9 @@ class ViewerUSD(ViewerBase):
         texture: np.ndarray | str | None = None,
         hidden: bool = False,
         backface_culling: bool = True,
+        color: tuple[float, float, float] | None = None,
+        roughness: float | None = None,
+        metallic: float | None = None,
     ):
         """
         Create a USD mesh prototype from vertex and index data.
@@ -239,13 +319,17 @@ class ViewerUSD(ViewerBase):
             texture: Optional texture path/URL or image array.
             hidden: If True, mesh will be hidden.
             backface_culling: If True, enable backface culling.
+            color: Optional base color as (r, g, b) in [0, 1].
+            roughness: Optional roughness in [0, 1].
+            metallic: Optional metallic in [0, 1].
         """
 
         # Convert warp arrays to numpy
         points_np = points.numpy().astype(np.float32)
         indices_np = indices.numpy().astype(np.uint32)
 
-        if name not in self._meshes:
+        first_time = name not in self._meshes
+        if first_time:
             self._ensure_scopes_for_path(self.stage, self._get_path(name))
 
             mesh_prim = UsdGeom.Mesh.Define(self.stage, self._get_path(name))
@@ -267,13 +351,120 @@ class ViewerUSD(ViewerBase):
             mesh_prim.GetNormalsAttr().Set(normals_np, self._frame_index)
             mesh_prim.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
 
-        # Set UVs if provided (simplified for now)
-        if uvs is not None:
-            # TODO: Implement UV support for USD meshes
-            pass
+        if first_time:
+            # Write UVs as a "st" primvar (only on first creation)
+            if uvs is not None:
+                uvs_np = uvs.numpy().astype(np.float32)
+                num_uvs = len(uvs_np)
+                num_verts = len(points_np)
+                num_face_verts = len(indices_np)
+                pv_api = UsdGeom.PrimvarsAPI(mesh_prim)
+                if num_uvs == num_verts:
+                    st_pv = pv_api.CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex)
+                    st_pv.Set(uvs_np)
+                elif num_uvs == num_face_verts:
+                    st_pv = pv_api.CreatePrimvar(
+                        "st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.faceVarying
+                    )
+                    st_pv.Set(uvs_np)
 
-        # how to hide the prototype mesh but not the instances in USD?
+            # Create and bind UsdPreviewSurface material
+            if texture is not None or color is not None:
+                self._create_and_bind_material(
+                    mesh_prim, name, texture=texture, color=color, roughness=roughness, metallic=metallic
+                )
+
         mesh_prim.GetVisibilityAttr().Set("inherited" if not hidden else "invisible", self._frame_index)
+
+    def _create_and_bind_material(
+        self,
+        mesh_prim: "UsdGeom.Mesh",
+        mesh_name: str,
+        *,
+        texture: np.ndarray | str | None = None,
+        color: tuple[float, float, float] | None = None,
+        roughness: float | None = None,
+        metallic: float | None = None,
+    ):
+        """Create a UsdPreviewSurface material and bind it to a mesh prim.
+
+        Handles both file-path textures and numpy-array textures (saved as
+        PNG alongside the USD). Falls back to a solid diffuseColor when no
+        texture is provided.
+        """
+        safe_name = mesh_name.strip("/").replace("/", "_")
+        mat_path = f"/root/materials/mat_{safe_name}"
+        self._ensure_scopes_for_path(self.stage, mat_path)
+
+        material = UsdShade.Material.Define(self.stage, mat_path)
+        shader = UsdShade.Shader.Define(self.stage, mat_path + "/preview_surface")
+        shader.CreateIdAttr("UsdPreviewSurface")
+
+        # Roughness / metallic
+        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(
+            roughness if roughness is not None else 0.5
+        )
+        shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(
+            metallic if metallic is not None else 0.0
+        )
+
+        # Resolve texture path (save numpy arrays to disk)
+        texture_file = None
+        if texture is not None:
+            if isinstance(texture, str):
+                texture_file = texture
+            elif isinstance(texture, np.ndarray):
+                tex_dir = os.path.dirname(self.output_path)
+                tex_filename = f"tex_{safe_name}.png"
+                tex_path = os.path.join(tex_dir, tex_filename)
+                try:
+                    from PIL import Image  # noqa: PLC0415
+
+                    img = texture
+                    if img.dtype != np.uint8:
+                        img = (np.clip(img, 0.0, 1.0) * 255).astype(np.uint8)
+                    Image.fromarray(img).save(tex_path)
+                    texture_file = f"./{tex_filename}"
+                except ImportError:
+                    pass
+
+        if texture_file is not None:
+            # Create texture reader shader
+            tex_reader = UsdShade.Shader.Define(self.stage, mat_path + "/diffuse_texture")
+            tex_reader.CreateIdAttr("UsdUVTexture")
+            tex_reader.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(texture_file)
+            tex_reader.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set("repeat")
+            tex_reader.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set("repeat")
+            tex_reader.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+
+            # Create ST reader shader
+            st_reader = UsdShade.Shader.Define(self.stage, mat_path + "/st_reader")
+            st_reader.CreateIdAttr("UsdPrimvarReader_float2")
+            st_reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+            st_reader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
+
+            # Connect texture → st reader
+            tex_reader.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(
+                st_reader.ConnectableAPI(), "result"
+            )
+
+            # Connect surface diffuseColor → texture rgb
+            shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(
+                tex_reader.ConnectableAPI(), "rgb"
+            )
+        elif color is not None:
+            shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+                Gf.Vec3f(float(color[0]), float(color[1]), float(color[2]))
+            )
+        else:
+            shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.5, 0.5, 0.5))
+
+        # Wire surface output
+        material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+
+        # Bind material to the mesh prim
+        UsdShade.MaterialBindingAPI.Apply(mesh_prim.GetPrim())
+        UsdShade.MaterialBindingAPI(mesh_prim).Bind(material)
 
     # log a set of instances as individual mesh prims, slower but makes it easier
     # to do post-editing of instance materials etc. default for Newton shapes
@@ -320,25 +511,33 @@ class ViewerUSD(ViewerBase):
         if colors is not None:
             colors = colors.numpy()
 
+        semantic_paths = self._instance_paths.get(name)
+        mesh_proto_path = self._get_path(mesh)
+
         for i in range(len(xforms)):
-            instance_path = self._get_path(name) + f"/instance_{i}"
-            instance = self.stage.GetPrimAtPath(instance_path)
+            if semantic_paths is not None and i < len(semantic_paths):
+                instance_path = self._get_path(semantic_paths[i])
+            else:
+                instance_path = self._get_path(name) + f"/instance_{i}"
 
-            if not instance:
-                instance = self.stage.DefinePrim(instance_path)
-                instance.GetReferences().AddInternalReference(self._get_path(mesh))
+            instance = self._instance_prim_cache.get(instance_path)
+            if instance is None:
+                instance = self.stage.GetPrimAtPath(instance_path)
+                if not instance:
+                    self._ensure_scopes_for_path(self.stage, instance_path)
+                    instance = self.stage.DefinePrim(instance_path)
+                    instance.GetReferences().AddInternalReference(mesh_proto_path)
+                    UsdGeom.Imageable(instance).GetVisibilityAttr().Set(
+                        "inherited" if not hidden else "invisible"
+                    )
+                    _usd_add_xform(instance)
+                self._instance_prim_cache[instance_path] = instance
 
-                UsdGeom.Imageable(instance).GetVisibilityAttr().Set("inherited" if not hidden else "invisible")
-                _usd_add_xform(instance)
-
-            # update transform
             if xforms is not None:
                 pos = xforms[i][:3]
                 rot = xforms[i][3:7]
-
                 _usd_set_xform(instance, pos, rot, scales[i], self._frame_index)
 
-            # update color
             if colors is not None:
                 displayColor = UsdGeom.PrimvarsAPI(instance).GetPrimvar("displayColor")
                 displayColor.Set(colors[i], self._frame_index)
