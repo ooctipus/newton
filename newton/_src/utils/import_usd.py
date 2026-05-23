@@ -250,6 +250,7 @@ def parse_usd(
     force_position_velocity_actuation: bool = False,
     convert_mjc_equality_constraints: bool = True,
     override_root_xform: bool = False,
+    physx_missing_inertia_fallback: bool = False,
     legacy_margin_gap: bool = False,
     return_deformable_results: bool = False,
 ) -> dict[str, Any]:
@@ -382,6 +383,9 @@ def parse_usd(
             :attr:`~newton.JointTargetMode.POSITION` if stiffness > 0, :attr:`~newton.JointTargetMode.VELOCITY` if only
             damping > 0, :attr:`~newton.JointTargetMode.EFFORT` if a drive is present but both gains are zero
             (direct torque control), or :attr:`~newton.JointTargetMode.NONE` if no drive/actuation is applied.
+        physx_missing_inertia_fallback: If True, bodies with authored positive mass but no authored diagonal
+            inertia use PhysX's 0.1 m small-sphere inertia fallback instead of shape-derived inertia. This is
+            intended for IsaacLab/PhysX parity when PhysX reports the "possibly invalid inertia tensor" fallback.
         legacy_margin_gap: If True, restore pre-MuJoCo-3.9 import behavior
             where ``shape_margin`` is computed as ``mjc_margin - mjc_gap``.
             Use for USD files authored against MuJoCo <= 3.8. Defaults to
@@ -4063,6 +4067,7 @@ def parse_usd(
             has_effective_mass = effective_mass is not None
             has_effective_inertia = effective_diag_inertia is not None
             has_effective_com = effective_com is not None
+            mass_compute_failed = False
 
             # newton:inertia (compact 6-element tensor) overrides physics:diagonalInertia + physics:principalAxes.
             inertia_tensor_val = (
@@ -4111,6 +4116,8 @@ def parse_usd(
                     cmp_mass, cmp_i_diag, cmp_com, cmp_principal_axes = rigid_body_api.ComputeMassProperties(
                         _get_collision_mass_information
                     )
+                    if cmp_mass < 0.0:
+                        mass_compute_failed = True
                 if cmp_mass < 0.0 or not math.isfinite(cmp_mass):
                     # ComputeMassProperties failed to discover colliders (e.g. shapes
                     # created by schema resolvers are not real USD prims) or aggregated
@@ -4198,7 +4205,23 @@ def parse_usd(
                     )
                 # When mass is authored but inertia is not, scale the accumulated
                 # inertia to be consistent with the authored mass.
-                if not has_effective_inertia and shape_accumulated_mass > 0.0 and mass > 0.0:
+                use_physx_missing_inertia_fallback = (
+                    not has_effective_inertia
+                    and mass > 0.0
+                    and (mass_compute_failed or physx_missing_inertia_fallback)
+                )
+                if use_physx_missing_inertia_fallback:
+                    radius = 0.1 / linear_unit if linear_unit > 0.0 else 0.1
+                    inertia_val = 0.4 * mass * radius * radius
+                    inertia = wp.mat33(np.eye(3, dtype=np.float32) * inertia_val)
+                    builder.body_inertia[body_id] = inertia
+                    builder.body_inv_inertia[body_id] = wp.inverse(inertia)
+                    if verbose:
+                        print(
+                            f"Applied PhysX small-sphere fallback inertia for body {body_path}: "
+                            f"diagonal elements = [{inertia_val}, {inertia_val}, {inertia_val}]"
+                        )
+                elif not has_effective_inertia and shape_accumulated_mass > 0.0 and mass > 0.0:
                     scale = mass / shape_accumulated_mass
                     builder.body_inertia[body_id] = wp.mat33(np.array(builder.body_inertia[body_id]) * scale)
                     builder.body_inv_inertia[body_id] = wp.inverse(builder.body_inertia[body_id])
