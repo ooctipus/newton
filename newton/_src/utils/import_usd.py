@@ -2910,11 +2910,11 @@ def parse_usd(
 
                 # SDF parameters. Applying NewtonSDFCollisionAPI is the canonical
                 # signal that SDF generation is configured for this shape.
-                has_sdf_api = prim.HasAPI("NewtonSDFCollisionAPI")
+                has_sdf_api = usd.has_applied_api_schema(prim, "NewtonSDFCollisionAPI")
                 # NewtonSDFCollisionAPI and NewtonMeshCollisionAPI are independent
                 # collision representations and should not be co-applied. SDF wins
                 # when both are present.
-                if has_sdf_api and prim.HasAPI("NewtonMeshCollisionAPI"):
+                if has_sdf_api and usd.has_applied_api_schema(prim, "NewtonMeshCollisionAPI"):
                     warnings.warn(
                         f"{prim.GetPath()}: NewtonSDFCollisionAPI and NewtonMeshCollisionAPI are "
                         f"independent collision representations and should not be co-applied; "
