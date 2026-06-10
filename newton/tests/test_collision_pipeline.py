@@ -13,6 +13,7 @@ import warp.examples
 import newton
 from newton import GeoType
 from newton._src.geometry import create_mesh_terrain
+from newton._src.geometry.contact_reduction import MAX_CONTACTS_PER_PAIR
 from newton._src.geometry.flags import MeshProperties, MeshSignMethod, ParticleFlags, ShapeFlags
 from newton._src.geometry.kernels import (
     create_soft_contacts,
@@ -2001,6 +2002,26 @@ class TestContactEstimator(unittest.TestCase):
 
         estimate = _estimate_rigid_contact_max(model)
         self.assertEqual(estimate, 1500)
+
+    def test_pair_list_uses_exact_primitive_budget(self):
+        """Precomputed primitive pairs use the narrow phase's exact per-pair cap."""
+        model = newton.Model()
+        model.world_count = 1
+        model.shape_contact_pair_count = 300
+        model.shape_type = wp.array([int(GeoType.BOX), int(GeoType.BOX)], dtype=wp.int32)
+        model.shape_contact_pairs = wp.array([[0, 1]] * 300, dtype=wp.vec2i)
+
+        self.assertEqual(_estimate_rigid_contact_max(model), 1500)
+
+    def test_pair_list_uses_reduction_cap_for_mesh_pairs(self):
+        """Mesh pairs use the contact-reduction architectural cap."""
+        model = newton.Model()
+        model.world_count = 1
+        model.shape_contact_pair_count = 5
+        model.shape_type = wp.array([int(GeoType.MESH)] + [int(GeoType.BOX)] * 5, dtype=wp.int32)
+        model.shape_contact_pairs = wp.array([[0, i] for i in range(1, 6)], dtype=wp.vec2i)
+
+        self.assertEqual(_estimate_rigid_contact_max(model), 5 * MAX_CONTACTS_PER_PAIR)
 
 
 class TestShapePairsMaxScaling(unittest.TestCase):
