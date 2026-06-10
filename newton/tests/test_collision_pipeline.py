@@ -13,7 +13,7 @@ import warp.examples
 import newton
 from newton import GeoType
 from newton._src.geometry import create_mesh_terrain
-from newton._src.geometry.contact_reduction import MAX_CONTACTS_PER_PAIR
+from newton._src.geometry.contact_reduction import MAX_CONTACTS_PER_PAIR, NUM_NORMAL_BINS
 from newton._src.geometry.flags import MeshProperties, MeshSignMethod, ParticleFlags, ShapeFlags
 from newton._src.geometry.kernels import (
     create_soft_contacts,
@@ -2022,6 +2022,19 @@ class TestContactEstimator(unittest.TestCase):
         model.shape_contact_pairs = wp.array([[0, i] for i in range(1, 6)], dtype=wp.vec2i)
 
         self.assertEqual(_estimate_rigid_contact_max(model), 5 * MAX_CONTACTS_PER_PAIR)
+
+    def test_pair_list_accounts_for_hydroelastic_anchors(self):
+        """Hydroelastic pairs reserve one synthetic anchor per normal bin."""
+        model = newton.Model()
+        model.world_count = 1
+        model.shape_contact_pair_count = 5
+        model.shape_type = wp.array([int(GeoType.BOX)] * 6, dtype=wp.int32)
+        flags = int(ShapeFlags.COLLIDE_SHAPES | ShapeFlags.HYDROELASTIC)
+        model.shape_flags = wp.array([flags] * 6, dtype=wp.int32)
+        model.shape_contact_pairs = wp.array([[0, i] for i in range(1, 6)], dtype=wp.vec2i)
+
+        expected = 5 * (MAX_CONTACTS_PER_PAIR + NUM_NORMAL_BINS)
+        self.assertEqual(_estimate_rigid_contact_max(model), expected)
 
 
 class TestShapePairsMaxScaling(unittest.TestCase):

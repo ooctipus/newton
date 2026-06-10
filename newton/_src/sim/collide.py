@@ -15,7 +15,7 @@ from ..geometry.broad_phase_sap import BroadPhaseSAP
 from ..geometry.collision_core import compute_tight_aabb_from_support
 from ..geometry.contact_data import ContactData, make_contact_sort_key
 from ..geometry.contact_match import ContactMatcher
-from ..geometry.contact_reduction import MAX_CONTACTS_PER_PAIR
+from ..geometry.contact_reduction import MAX_CONTACTS_PER_PAIR, NUM_NORMAL_BINS
 from ..geometry.contact_sort import ContactSorter
 from ..geometry.differentiable_contacts import launch_differentiable_contact_augment
 from ..geometry.flags import ShapeFlags
@@ -311,15 +311,11 @@ def _estimate_rigid_contact_max(model: Model) -> int:
     quadratic if computed globally, so it is evaluated per world when metadata is
     available.
 
-    When the finalized model has a precomputed pair list, each actual pair is
-    classified by its geometry and assigned the narrow phase's hard per-pair
-    bound. This excludes visual-only shapes and is a provable upper bound because
-    the broad phase cannot emit candidates outside the precomputed list. Models
-    with only a pair count, but no pair list, retain the neighbor-budget
-    heuristic.
-
-    When precomputed contact pairs are available their count is used as an
-    alternative tighter bound (``min`` of heuristic and pair-based estimate).
+    A finalized model's precomputed pair list instead uses the narrow phase's hard
+    per-pair bounds. This excludes visual-only shapes and is a provable upper bound
+    because the broad phase cannot emit candidates outside that list. Mesh and hydroelastic
+    bounds assume contact reduction is enabled; with ``reduce_contacts=False`` no static
+    bound exists. Models with only a pair count retain the neighbor-budget heuristic.
 
     Args:
         model: The simulation model.
@@ -340,18 +336,23 @@ def _estimate_rigid_contact_max(model: Model) -> int:
     shape_contact_pairs = getattr(model, "shape_contact_pairs", None)
     if getattr(model, "shape_contact_pair_count", 0) > 0 and shape_contact_pairs is not None:
         pairs = shape_contact_pairs.numpy().reshape(-1, 2)
-        pair_uses_reduction = mesh_mask[pairs[:, 0]] | mesh_mask[pairs[:, 1]]
+        pair_is_mesh = mesh_mask[pairs[:, 0]] | mesh_mask[pairs[:, 1]]
 
         shape_flags = getattr(model, "shape_flags", None)
         if shape_flags is not None:
             hydro_mask = (shape_flags.numpy() & int(ShapeFlags.HYDROELASTIC)) != 0
-            pair_uses_reduction |= hydro_mask[pairs[:, 0]] & hydro_mask[pairs[:, 1]]
+            pair_is_hydro = hydro_mask[pairs[:, 0]] & hydro_mask[pairs[:, 1]]
+        else:
+            pair_is_hydro = np.zeros(len(pairs), dtype=bool)
+        pair_is_mesh &= ~pair_is_hydro
 
-        reduction_pair_count = int(np.count_nonzero(pair_uses_reduction))
-        primitive_pair_count = len(pairs) - reduction_pair_count
+        hydro_pair_count = int(np.count_nonzero(pair_is_hydro))
+        mesh_pair_count = int(np.count_nonzero(pair_is_mesh))
+        primitive_pair_count = len(pairs) - mesh_pair_count - hydro_pair_count
         pair_contacts = (
             primitive_pair_count * _RIGID_CONTACTS_PER_PRIMITIVE_PAIR
-            + reduction_pair_count * MAX_CONTACTS_PER_PAIR
+            + mesh_pair_count * MAX_CONTACTS_PER_PAIR
+            + hydro_pair_count * (MAX_CONTACTS_PER_PAIR + NUM_NORMAL_BINS)
         )
         return max(_RIGID_CONTACT_MIN_CAPACITY, pair_contacts)
 
