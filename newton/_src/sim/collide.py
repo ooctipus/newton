@@ -443,10 +443,12 @@ def _estimate_rigid_contact_max(model: Model) -> int:
     available.
 
     A finalized model's precomputed pair list instead uses the narrow phase's hard
-    per-pair bounds. This excludes visual-only shapes and is a provable upper bound
-    because the broad phase cannot emit candidates outside that list. Mesh and hydroelastic
-    bounds assume contact reduction is enabled; with ``reduce_contacts=False`` no static
-    bound exists. Models with only a pair count retain the neighbor-budget heuristic.
+    per-pair bounds. The pair sum is exact for sparse graphs and capped by the same
+    spatial-locality policy for dense graphs; where the cap binds, capacity is
+    physically motivated rather than provable. Visual-only shapes contribute to
+    neither term. Mesh and hydroelastic bounds assume contact reduction is enabled;
+    with ``reduce_contacts=False`` no static bound exists. Models with only a pair
+    count retain the neighbor-budget heuristic.
 
     Args:
         model: The simulation model.
@@ -477,15 +479,29 @@ def _estimate_rigid_contact_max(model: Model) -> int:
             pair_is_hydro = np.zeros(len(pairs), dtype=bool)
         pair_is_mesh &= ~pair_is_hydro
 
-        hydro_pair_count = int(np.count_nonzero(pair_is_hydro))
-        mesh_pair_count = int(np.count_nonzero(pair_is_mesh))
-        primitive_pair_count = len(pairs) - mesh_pair_count - hydro_pair_count
-        pair_contacts = (
-            primitive_pair_count * _RIGID_CONTACTS_PER_PRIMITIVE_PAIR
-            + mesh_pair_count * MAX_CONTACTS_PER_PAIR
-            + hydro_pair_count * (MAX_CONTACTS_PER_PAIR + NUM_NORMAL_BINS)
-        )
-        return max(_RIGID_CONTACT_MIN_CAPACITY, pair_contacts)
+        pair_cap = np.full(len(pairs), _RIGID_CONTACTS_PER_PRIMITIVE_PAIR, dtype=np.int64)
+        pair_cap[pair_is_mesh] = MAX_CONTACTS_PER_PAIR
+        pair_cap[pair_is_hydro] = MAX_CONTACTS_PER_PAIR + NUM_NORMAL_BINS
+        pair_contacts = int(pair_cap.sum())
+
+        # Preserve full budgets for plane pairs, while bounding simultaneous
+        # non-plane neighbors by the established spatial-locality heuristic.
+        plane_shape = shape_types == int(GeoType.PLANE)
+        pair_has_plane = plane_shape[pairs[:, 0]] | plane_shape[pairs[:, 1]]
+        plane_pair_contacts = int(pair_cap[pair_has_plane].sum())
+        nonplane_pairs = pairs[~pair_has_plane]
+        if len(nonplane_pairs) > 0:
+            active_shapes = np.unique(nonplane_pairs)
+            shape_cap = np.full(len(active_shapes), _RIGID_CONTACTS_PER_PRIMITIVE_PAIR, dtype=np.int64)
+            shape_cap[mesh_mask[active_shapes]] = MAX_CONTACTS_PER_PAIR
+            if shape_flags is not None:
+                shape_cap[hydro_mask[active_shapes]] = MAX_CONTACTS_PER_PAIR + NUM_NORMAL_BINS
+            nonplane_locality = int(shape_cap.sum()) * _RIGID_CONTACT_MAX_NEIGHBORS_PER_SHAPE // 2
+        else:
+            nonplane_locality = 0
+        locality_cap = plane_pair_contacts + nonplane_locality
+
+        return max(_RIGID_CONTACT_MIN_CAPACITY, min(pair_contacts, locality_cap))
 
     num_meshes = int(np.count_nonzero(mesh_mask))
     num_non_planes = int(np.count_nonzero(non_plane_mask))
