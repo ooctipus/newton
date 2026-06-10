@@ -2008,10 +2008,20 @@ class TestContactEstimator(unittest.TestCase):
         model = newton.Model()
         model.world_count = 1
         model.shape_contact_pair_count = 300
-        model.shape_type = wp.array([int(GeoType.BOX), int(GeoType.BOX)], dtype=wp.int32)
-        model.shape_contact_pairs = wp.array([[0, 1]] * 300, dtype=wp.vec2i)
+        model.shape_type = wp.array([int(GeoType.BOX)] * 600, dtype=wp.int32)
+        model.shape_contact_pairs = wp.array([[2 * i, 2 * i + 1] for i in range(300)], dtype=wp.vec2i)
 
         self.assertEqual(_estimate_rigid_contact_max(model), 1500)
+
+    def test_pair_list_locality_cap_binds_for_dense_graph(self):
+        """Dense pair graphs retain the established simultaneous-neighbor cap."""
+        model = newton.Model()
+        model.world_count = 1
+        model.shape_contact_pair_count = 300
+        model.shape_type = wp.array([int(GeoType.BOX)] * 25, dtype=wp.int32)
+        model.shape_contact_pairs = wp.array([[i, j] for i in range(25) for j in range(i)], dtype=wp.vec2i)
+
+        self.assertEqual(_estimate_rigid_contact_max(model), 1250)
 
     def test_pair_list_uses_reduction_cap_for_mesh_pairs(self):
         """Mesh pairs use the contact-reduction architectural cap."""
