@@ -1278,14 +1278,23 @@ class CollisionPipeline:
             # Keep mesh and heightfield flags independent: heightfield-only scenes
             # should not trigger mesh-only kernel setup/launches.
             has_meshes = False
+            has_heightfields = False
             use_lean_gjk_mpr = False
             mesh_sdf_texture_only = False
             mesh_sdf_identity_scale_only = False
             if hasattr(model, "shape_type") and model.shape_type is not None:
                 shape_types = model.shape_type.numpy()
                 colliding_mask = _shape_collide_mask(model, len(shape_types))
-                colliding_shape_types = shape_types[colliding_mask]
-                has_meshes = bool((colliding_shape_types == int(GeoType.MESH)).any())
+                pair_capable_mask = colliding_mask
+                if self.shape_pairs_filtered is not None:
+                    pairs_np = self.shape_pairs_filtered.numpy().reshape(-1, 2)
+                    pair_idx = np.unique(pairs_np.reshape(-1).astype(np.int64))
+                    pair_idx = pair_idx[(pair_idx >= 0) & (pair_idx < len(shape_types))]
+                    pair_capable_mask = np.zeros(len(shape_types), dtype=bool)
+                    pair_capable_mask[pair_idx] = True
+                pair_shape_types = shape_types[pair_capable_mask]
+                has_meshes = bool((pair_shape_types == int(GeoType.MESH)).any())
+                has_heightfields = bool((pair_shape_types == int(GeoType.HFIELD)).any())
                 if (
                     hasattr(model, "_shape_sdf_index")
                     and model._shape_sdf_index is not None
@@ -1295,10 +1304,10 @@ class CollisionPipeline:
                     shape_sdf_index = model._shape_sdf_index.numpy()
                     shape_edge_range = model.shape_edge_range.numpy()
                     has_planar_sdf_shapes = bool(
-                        np.any(colliding_mask & (shape_sdf_index >= 0) & (shape_edge_range[:, 1] > 0))
+                        np.any(pair_capable_mask & (shape_sdf_index >= 0) & (shape_edge_range[:, 1] > 0))
                     )
                     has_meshes = has_meshes or has_planar_sdf_shapes
-                    mesh_sdf_shapes = colliding_mask & (
+                    mesh_sdf_shapes = pair_capable_mask & (
                         (shape_types != int(GeoType.HFIELD))
                         & ((shape_types == int(GeoType.MESH)) | (shape_edge_range[:, 1] > 0))
                     )
@@ -1332,7 +1341,7 @@ class CollisionPipeline:
                     int(GeoType.CYLINDER),
                     int(GeoType.CONE),
                 }
-                use_lean_gjk_mpr = not bool(lean_unsupported & set(colliding_shape_types.tolist()))
+                use_lean_gjk_mpr = not bool(lean_unsupported & set(pair_shape_types.tolist()))
 
             # Initialize narrow phase with pre-allocated buffers
             # max_triangle_pairs is a conservative estimate for mesh collision triangle pairs
@@ -1356,7 +1365,7 @@ class CollisionPipeline:
                 shape_voxel_resolution=model._shape_voxel_resolution,
                 hydroelastic_sdf=hydroelastic_sdf,
                 has_meshes=has_meshes,
-                has_heightfields=model.heightfield_count > 0,
+                has_heightfields=has_heightfields,
                 use_lean_gjk_mpr=use_lean_gjk_mpr,
                 mesh_sdf_identity_scale_only=mesh_sdf_identity_scale_only,
                 mesh_sdf_texture_only=mesh_sdf_texture_only,
