@@ -1,0 +1,44 @@
+physics_dt: 0.005
+decimation: 8
+episode_length_s: 14.0
+num_substeps: 8
+gravity:
+- 0.0
+- 0.0
+- -9.81
+use_mujoco_contacts: false
+solver:
+  solver_type: mujoco_warp
+  njmax: 1500
+  nconmax: 400
+  iterations: 100
+  ls_iterations: 50
+  solver: newton
+  integrator: implicitfast
+  use_mujoco_cpu: false
+  disable_contacts: false
+  default_actuator_gear: null
+  actuator_gears: null
+  update_data_interval: 2
+  save_to_mjcf: null
+  impratio: 1.0
+  cone: pyramidal
+  ccd_iterations: 35
+  ls_parallel: false
+  use_mujoco_contacts: false
+  tolerance: 1.0e-06
+collision:
+  broad_phase: sap
+  reduce_contacts: true
+  rigid_contact_max: 7000000
+  max_triangle_pairs: 80000000
+  contact_reduction_hashtable_size_factor: 3.0
+  soft_contact_max: null
+  soft_contact_margin: 0.01
+  requires_grad: null
+  sdf_hydroelastic_config: null
+shape:
+  margin: 0.0
+  gap: 0.01
+  ke: 10000000.0
+  kd: 10000.0
