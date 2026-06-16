@@ -165,7 +165,6 @@ def build_newton_from_bundle(
         mapping=plan.clone_mask,
         positions=plan.env_origins,
         up_axis=plan.up_axis,
-        simplify_meshes=plan.simplify_meshes,
         default_shape_cfg=bundle.sim_cfg.get("shape", {}),
         site_requests=plan.site_requests,
     )

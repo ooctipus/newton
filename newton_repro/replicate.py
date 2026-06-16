@@ -137,7 +137,6 @@ def build_and_label(
     positions: np.ndarray,
     quaternions: np.ndarray | None = None,
     up_axis: str = "Z",
-    simplify_meshes: bool = True,
     default_shape_cfg: Mapping | None = None,
     site_requests: Sequence[SiteRequest] = (),
 ) -> tuple[ModelBuilder, object]:
@@ -179,11 +178,9 @@ def build_and_label(
             stage,
             root_path=src_path,
             load_visual_shapes=True,
-            skip_mesh_approximation=True,
+            skip_mesh_approximation=False,
             schema_resolvers=schema_resolvers,
         )
-        if simplify_meshes:
-            proto.approximate_meshes("convex_hull", keep_visual_shapes=True)
         protos[src_path] = proto
 
     global_sites, proto_sites = _inject_sites(builder, protos, site_requests)

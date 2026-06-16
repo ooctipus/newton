@@ -157,7 +157,6 @@ def _verify_exported_bundle(out_dir: str, live_builder, sim_cfg: dict, num_envs:
         mapping=plan.clone_mask,
         positions=plan.env_origins,
         up_axis=plan.up_axis,
-        simplify_meshes=plan.simplify_meshes,
         default_shape_cfg=sim_cfg.get("shape", {}),
         site_requests=plan.site_requests,
     )
