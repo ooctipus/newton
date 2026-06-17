@@ -26,6 +26,7 @@ from ..geometry.support_function import (
 )
 from ..geometry.types import GeoType
 from ..sim.contacts import Contacts
+from ..sim.enums import BodyFlags
 from ..sim.model import Model
 from ..sim.state import State
 
@@ -1029,6 +1030,9 @@ class CollisionPipeline:
                 device=self.device,
                 filter_pairs=self.shape_pairs_excluded,
                 num_filter_pairs=self.shape_pairs_excluded_count,
+                shape_body=model.shape_body,
+                body_flags=model.body_flags,
+                nondynamic_mask=int(BodyFlags.KINEMATIC),
                 skip_count_zero=True,  # Already zeroed by compute_shape_aabbs
             )
         else:  # BroadPhaseExplicit

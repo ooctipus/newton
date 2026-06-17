@@ -180,6 +180,39 @@ def test_world_and_group_pair(world_a: int, world_b: int, collision_group_a: int
     return test_group_pair(collision_group_a, collision_group_b)
 
 
+@wp.func
+def is_nondynamic_pair(
+    shape1: int,
+    shape2: int,
+    shape_body: wp.array[int],  # Shape -> owning body index; -1 for static shapes (no body)
+    body_flags: wp.array[int],  # Per-body flags
+    nondynamic_mask: int,  # body_flags bits marking a body non-dynamic (e.g. BodyFlags.KINEMATIC)
+) -> bool:
+    """Test whether both shapes belong to non-dynamic (static or kinematic) bodies.
+
+    A static shape has no owning body (its ``shape_body`` entry is -1); a non-dynamic body
+    has one of the ``nondynamic_mask`` bits set in ``body_flags``. A contact between two
+    non-dynamic shapes carries no dynamics, so the pair can be pruned in broad phase. Mirrors
+    the immovable-pair skip in the MuJoCo contact converter. The caller supplies the mask so
+    this module stays independent of :mod:`newton._src.sim`.
+
+    Args:
+        shape1: First shape index.
+        shape2: Second shape index.
+        shape_body: Shape-to-body map; entry is -1 for shapes with no owning body.
+        body_flags: Per-body flags array.
+        nondynamic_mask: Bitmask tested against ``body_flags`` to mark a body non-dynamic.
+
+    Returns:
+        True if both shapes are static or non-dynamic, False otherwise.
+    """
+    body1 = shape_body[shape1]
+    body2 = shape_body[shape2]
+    a_nondynamic = body1 < 0 or (body_flags[body1] & nondynamic_mask) != 0
+    b_nondynamic = body2 < 0 or (body_flags[body2] & nondynamic_mask) != 0
+    return a_nondynamic and b_nondynamic
+
+
 def precompute_world_map(shape_world: np.ndarray | list[int], shape_flags: np.ndarray | list[int] | None = None):
     """Precompute an index map that groups shapes by world ID with shared shapes.
 

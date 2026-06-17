@@ -21,6 +21,7 @@ from ..core.types import Devicelike
 from .broad_phase_common import (
     binary_search,
     check_aabb_overlap,
+    is_nondynamic_pair,
     is_pair_excluded,
     precompute_world_map,
     test_world_and_group_pair,
@@ -289,6 +290,9 @@ def _sap_broadphase_kernel(
     shape_gap: wp.array[float],  # Optional per-shape effective gaps (can be empty if AABBs pre-expanded)
     collision_group: wp.array[int],
     shape_world: wp.array[int],  # World indices
+    shape_body: wp.array[int],  # Shape -> owning body (-1 for static); empty disables non-dynamic pruning
+    body_flags: wp.array[int],  # Per-body flags
+    nondynamic_mask: int,  # body_flags bits marking a body non-dynamic (e.g. BodyFlags.KINEMATIC)
     world_index_map: wp.array[int],
     world_slice_ends: wp.array[int],
     sap_sort_index_in: wp.array[int],  # 1D array with manual indexing
@@ -363,6 +367,12 @@ def _sap_broadphase_kernel(
         # Ensure canonical ordering
         shape1 = wp.min(shape1_tmp, shape2_tmp)
         shape2 = wp.max(shape1_tmp, shape2_tmp)
+
+        # Skip pairs whose shapes both belong to non-dynamic (static/kinematic) bodies;
+        # such contacts carry no dynamics. Empty shape_body disables this pruning.
+        if shape_body.shape[0] > 0 and is_nondynamic_pair(shape1, shape2, shape_body, body_flags, nondynamic_mask):
+            workid += nsweep_in
+            continue
 
         # Get collision and world groups
         col_group1 = collision_group[shape1]
@@ -521,6 +531,9 @@ class BroadPhaseSAP:
         device: Devicelike | None = None,  # Device to launch on
         filter_pairs: wp.array[wp.vec2i] | None = None,  # Sorted excluded pairs
         num_filter_pairs: int | None = None,
+        shape_body: wp.array[int] | None = None,  # Shape -> owning body (-1 for static); enables non-dynamic pruning
+        body_flags: wp.array[int] | None = None,  # Per-body flags
+        nondynamic_mask: int = 0,  # body_flags bits marking a body non-dynamic (e.g. BodyFlags.KINEMATIC)
         skip_count_zero: bool = False,  # Skip candidate_pair_count.zero_() if already zeroed by the caller
     ) -> None:
         """Launch the sweep and prune broad phase collision detection with per-world segmented sort.
@@ -576,6 +589,11 @@ class BroadPhaseSAP:
         else:
             filter_pairs_arr = filter_pairs
             n_filter = num_filter_pairs if num_filter_pairs is not None else filter_pairs.shape[0]
+
+        # Non-dynamic pruning: empty arrays disable it (kernel guards on shape_body length)
+        if shape_body is None or body_flags is None:
+            shape_body = wp.empty(0, dtype=wp.int32, device=device)
+            body_flags = wp.empty(0, dtype=wp.int32, device=device)
 
         # Project AABBs onto the sweep axis for each world
         wp.launch(
@@ -656,6 +674,9 @@ class BroadPhaseSAP:
                 shape_gap,
                 shape_collision_group,
                 shape_world,
+                shape_body,
+                body_flags,
+                nondynamic_mask,
                 self.world_index_map,
                 self.world_slice_ends,
                 self.sap_sort_index,
