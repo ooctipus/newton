@@ -54,6 +54,7 @@
 - Add an optional `kernel_block_dim` argument to `SensorTiledCamera.update()` for tuning the Warp ray-tracer's `render_megakernel` launch shape.
 - Add `ArticulationView.joint_template_labels`, `link_template_labels` (aliased as `body_template_labels`), and `shape_template_labels` exposing the raw template-articulation labels alongside the existing leaf-only `*_names`, so callers can disambiguate selected entries whose leaf names collide.
 - Add robotics tutorial notebook covering ModelBuilder, solvers, CUDA graphs, IK, and pick-and-place
+- Add over-relaxation to the `SolverFeatherPGS` matrix-free Gauss-Seidel solve via the `pgs_velocity_omega` parameter (defaulting to `pgs_omega`), and add an opt-in, flag-gated matrix-free warm-start (`mf_warmstart`, with `mf_warmstart_decay`) that carries converged contact impulses across steps; disabled by default, leaving numerics byte-identical when off
 - Add `newton.utils.OnnxRuntime`, a graph-capturable ONNX inference engine backed solely by Warp kernels (no `onnxruntime` or `torch` runtime dependency); used by `ControllerNeuralMLP` and `ControllerNeuralLSTM` to load `.onnx` policies. To migrate a TorchScript policy, run `torch.onnx.export(model, dummy_input, "policy.onnx", opset_version=17)` once and point the controllers at the resulting `.onnx` file. The `onnx` package is now an optional extra (`pip install newton[onnx]`); install it explicitly to use the ONNX runtime.
 - Add USD parsing for `NewtonSiteAPI` to mark shapes as sites.
 
@@ -491,6 +492,14 @@
 - Fix MJCF `xyaxes` parsing to treat the second vector as Y and derive Z from X cross Y
 - Fix `SolverMuJoCo` returning `State.joint_qd` in world frame for root `FREE` joints with non-identity `parent_xform`, violating the documented parent-frame contract and corrupting derived `body_qd`. (#2871)
 - Fix MJCF joint `damping` attribute being ignored by `SolverFeatherstone`
+- Fix `eval_fk()` overwriting VBD-simulated `JointType.CABLE` body poses.
+- Fix `SolverXPBD` `body_parent_f` reporting to include `Control.joint_f` contributions and accumulate multiple inbound joint contributions, matching the `SolverMuJoCo` and `SolverFeatherstone` convention.
+- Fix MJCF `xyaxes` parsing to treat the second vector as Y and derive Z from X cross Y.
+- Fix `SolverMuJoCo` rejecting box and other geoms whose `add_geom` parameters were Warp/NumPy arrays or 32-bit collision masks, by coercing sequence and scalar values to native Python types and wrapping `contype`/`conaffinity` into signed int32 range.
+- Fix mesh-convex and heightfield-convex contacts missing when shapes are separated by margin but still within the contact envelope.
+- Fix `SolverMuJoCo` returning `State.joint_qd` in world frame for root `FREE` joints with non-identity `parent_xform`, violating the documented parent-frame contract and corrupting derived `body_qd`.
+- Fix `example_softbody_gift` emitting spurious non-manifold edge warnings caused by mismatched 5-tet diagonals across adjacent cubes in the soft body mesh.
+- Fix `basic_conveyor` example emitting a spurious inertia validation warning at finalize.
 - Fix `SolverMuJoCo` generated MuJoCo joint names for multi-axis D6 joints to avoid duplicate names
 - Fix `SolverMuJoCo` ball-joint frame conversion: `joint_q` and position-target quaternions were applied in the wrong basis when `child_xform` had a non-identity rotation, and `joint_qd` / velocity targets / applied / actuator torques were applied and read back in the wrong basis whenever the ball was away from its rest pose. (#2981)
 - Fix `SolverMuJoCo` to preserve authored zero-valued USD `mjc:solreflimit` values as raw MuJoCo data and avoid writing limit `solref` values to unlimited joints in saved MJCF
