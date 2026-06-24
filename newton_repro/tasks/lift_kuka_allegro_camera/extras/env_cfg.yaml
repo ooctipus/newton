@@ -16,7 +16,7 @@ viewer:
   asset_name: null
   body_name: null
 sim:
-  device: cuda:1
+  device: cuda:0
   dt: 0.008333333333333333
   gravity:
   - 0.0
@@ -111,7 +111,7 @@ seed: 42
 decimation: 2
 scene:
   class_type: isaaclab.scene.interactive_scene:InteractiveScene
-  num_envs: 2
+  num_envs: 32
   env_spacing: 3
   lazy_sensor_update: true
   replicate_physics: true
@@ -971,22 +971,22 @@ scene:
         height: 0.1
         axis: Z
       spawn_paths:
-      - null
-      - null
-      - null
+      - /World/envs/env_21/Object
+      - /World/envs/env_4/Object
+      - /World/envs/env_3/Object
       - /World/envs/env_0/Object
-      - null
-      - null
-      - null
+      - /World/envs/env_18/Object
+      - /World/envs/env_24/Object
+      - /World/envs/env_2/Object
       - null
       - null
       - /World/envs/env_1/Object
       - null
-      - null
-      - null
-      - null
-      - null
-      - null
+      - /World/envs/env_14/Object
+      - /World/envs/env_7/Object
+      - /World/envs/env_12/Object
+      - /World/envs/env_6/Object
+      - /World/envs/env_5/Object
       random_choice: true
     init_state:
       pos:
