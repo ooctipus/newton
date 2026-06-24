@@ -10857,6 +10857,14 @@ class ModelBuilder:
                         sdf_kwargs["margin"] = sdf_gen_margin
                         sdf_kwargs["scale"] = tuple(shape_scale)
                         sdf_kwargs["texture_format"] = sdf_tex_fmt
+                        # Edge-simplification (Tobias): drop near-flat internal edges (<5 deg) and absorb
+                        # redundant edges to cut the edge count walked during SDF-mesh contact (the thread
+                        # mate is ~90% of the kernel); the 10 deg upper bound preserves sharp silhouette edges.
+                        sdf_kwargs["edge_lower_angle_threshold_rad"] = math.radians(5.0)
+                        sdf_kwargs["edge_upper_angle_threshold_rad"] = math.radians(10.0)
+                        sdf_kwargs["edge_box_absorption"] = True
+                        sdf_kwargs["edge_box_half_normal_rel"] = 1.0e-3
+                        sdf_kwargs["edge_box_half_lateral_rel"] = 5.0e-3
                         deferred_key = (
                             id(shape_src),
                             tuple(shape_scale),
