@@ -12,6 +12,7 @@ import pathlib
 import sys
 
 import newton.viewer as newton_viewer
+import yaml
 
 _REPRO_DIR = str(pathlib.Path(__file__).resolve().parent)
 _TASKS_DIR = pathlib.Path(_REPRO_DIR) / "tasks"
@@ -39,6 +40,34 @@ def _resolve_bundle_dir(env: str) -> str:
     )
 
 
+def _parse_set_override(override: str) -> tuple[list[str], object]:
+    """Parse a ``--set dotted.path=value`` override."""
+    if "=" not in override:
+        raise ValueError(f"--set override must have the form dotted.path=value, got {override!r}.")
+    path, value_text = override.split("=", 1)
+    keys = [part.strip() for part in path.split(".") if part.strip()]
+    if not keys:
+        raise ValueError(f"--set override has an empty path: {override!r}.")
+    return keys, yaml.safe_load(value_text)
+
+
+def _apply_set_override(cfg: dict, override: str) -> None:
+    """Apply a parsed ``--set`` override to a nested dictionary."""
+    keys, value = _parse_set_override(override)
+    node = cfg
+    for index, key in enumerate(keys[:-1]):
+        child = node.get(key)
+        if child is None:
+            child = {}
+            node[key] = child
+        if not isinstance(child, dict):
+            path = ".".join(keys)
+            prefix = ".".join(keys[: index + 1])
+            raise ValueError(f"Cannot apply --set {path}: {prefix} is {type(child).__name__}, not a dict.")
+        node = child
+    node[keys[-1]] = value
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Replay a Newton repro bundle without Isaac Lab.")
     parser.add_argument("--env", required=True, help="Bundle directory or task name under scripts/newton_repro/tasks.")
@@ -52,10 +81,20 @@ def main() -> int:
     parser.add_argument(
         "--capture_graph", action="store_true", default=False, help="Capture Newton step with Warp CUDA graph."
     )
+    parser.add_argument(
+        "--set",
+        dest="set_overrides",
+        action="append",
+        default=[],
+        metavar="DOTTED.PATH=VALUE",
+        help="Override a leaf in extras/sim_cfg.yaml. May be repeated; values are parsed as YAML.",
+    )
     args = parser.parse_args()
 
     env_dir = _resolve_bundle_dir(args.env)
     bundle = load_bundle(env_dir)
+    for override in args.set_overrides:
+        _apply_set_override(bundle.sim_cfg, override)
     sim, env_origins = build_newton_from_bundle(bundle, num_envs=args.num_envs, device=args.device)
     decimation = int(bundle.sim_cfg.get("decimation", 1))
     step_dt = sim.physics_dt * decimation
