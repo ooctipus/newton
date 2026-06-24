@@ -1,0 +1,136 @@
+{
+  "sources": [
+    "/World/envs/env_0/Robot",
+    "/World/envs/env_0/Object",
+    "/World/envs/env_1/Object",
+    "/World/envs/env_2/Object",
+    "/World/envs/env_0/Object",
+    "/World/envs/env_4/Object",
+    "/World/envs/env_5/Object",
+    "/World/envs/env_6/Object",
+    "/World/envs/env_7/Object",
+    "/World/envs/env_8/Object",
+    "/World/envs/env_1/Object",
+    "/World/envs/env_10/Object",
+    "/World/envs/env_11/Object",
+    "/World/envs/env_12/Object",
+    "/World/envs/env_13/Object",
+    "/World/envs/env_14/Object",
+    "/World/envs/env_15/Object",
+    "/World/envs/env_0/table"
+  ],
+  "destinations": [
+    "/World/envs/env_{}/Robot",
+    "/World/envs/env_{}/Object",
+    "/World/envs/env_{}/Object",
+    "/World/envs/env_{}/Object",
+    "/World/envs/env_{}/Object",
+    "/World/envs/env_{}/Object",
+    "/World/envs/env_{}/Object",
+    "/World/envs/env_{}/Object",
+    "/World/envs/env_{}/Object",
+    "/World/envs/env_{}/Object",
+    "/World/envs/env_{}/Object",
+    "/World/envs/env_{}/Object",
+    "/World/envs/env_{}/Object",
+    "/World/envs/env_{}/Object",
+    "/World/envs/env_{}/Object",
+    "/World/envs/env_{}/Object",
+    "/World/envs/env_{}/Object",
+    "/World/envs/env_{}/table"
+  ],
+  "clone_mask": [
+    [
+      true,
+      true
+    ],
+    [
+      false,
+      false
+    ],
+    [
+      false,
+      false
+    ],
+    [
+      false,
+      false
+    ],
+    [
+      true,
+      false
+    ],
+    [
+      false,
+      false
+    ],
+    [
+      false,
+      false
+    ],
+    [
+      false,
+      false
+    ],
+    [
+      false,
+      false
+    ],
+    [
+      false,
+      false
+    ],
+    [
+      false,
+      true
+    ],
+    [
+      false,
+      false
+    ],
+    [
+      false,
+      false
+    ],
+    [
+      false,
+      false
+    ],
+    [
+      false,
+      false
+    ],
+    [
+      false,
+      false
+    ],
+    [
+      false,
+      false
+    ],
+    [
+      true,
+      true
+    ]
+  ],
+  "num_envs": 2,
+  "env_spacing": 3.0,
+  "up_axis": "Z",
+  "simplify_meshes": true,
+  "site_requests": [
+    {
+      "label": "ft_0",
+      "body_pattern": null,
+      "xform": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "per_world": false
+    }
+  ]
+}

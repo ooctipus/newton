@@ -1,0 +1,2856 @@
+viewer:
+  eye:
+  - -2.25
+  - 0.0
+  - 0.75
+  lookat:
+  - 0.0
+  - 0.0
+  - 0.45
+  cam_prim_path: /OmniverseKit_Persp
+  resolution:
+  - 1280
+  - 720
+  origin_type: env
+  env_index: 0
+  asset_name: null
+  body_name: null
+sim:
+  device: cuda:1
+  dt: 0.008333333333333333
+  gravity:
+  - 0.0
+  - 0.0
+  - -9.81
+  physics_prim_path: /physicsScene
+  physics_material:
+    func: isaaclab.sim.spawners.materials.physics_materials:spawn_rigid_body_material
+    static_friction: 0.5
+    dynamic_friction: 0.5
+    restitution: 0.0
+    compliant_contact_stiffness: null
+    compliant_contact_damping: null
+    friction_combine_mode: null
+    restitution_combine_mode: null
+    _usd_applied_schema: PhysxMaterialAPI
+    _usd_field_exceptions: {}
+    _usd_namespace: physxMaterial
+  use_fabric: true
+  render_interval: 2
+  enable_scene_query_support: false
+  use_newton_actuators: false
+  physics:
+    class_type: isaaclab_newton.physics.mjwarp_manager:NewtonMJWarpManager
+    num_substeps: 2
+    collision_decimation: 0
+    debug_mode: false
+    use_cuda_graph: false
+    solver_cfg:
+      class_type: isaaclab_newton.physics.mjwarp_manager:NewtonMJWarpManager
+      solver_type: mujoco_warp
+      njmax: 300
+      nconmax: 200
+      iterations: 100
+      ls_iterations: 15
+      solver: newton
+      integrator: implicitfast
+      use_mujoco_cpu: false
+      disable_contacts: false
+      default_actuator_gear: null
+      actuator_gears: null
+      update_data_interval: 2
+      save_to_mjcf: null
+      impratio: 10.0
+      cone: elliptic
+      ccd_iterations: 35
+      ls_parallel: false
+      use_mujoco_contacts: false
+      tolerance: 1.0e-06
+    collision_cfg:
+      broad_phase: explicit
+      reduce_contacts: true
+      rigid_contact_max: null
+      max_triangle_pairs: 1000000
+      soft_contact_max: null
+      soft_contact_margin: 0.01
+      requires_grad: null
+      sdf_hydroelastic_config: null
+    default_shape_cfg:
+      margin: 0.0
+      gap: 0.01
+    simplify_meshes: true
+  render:
+    enable_translucency: null
+    enable_reflections: null
+    enable_global_illumination: null
+    antialiasing_mode: null
+    enable_dlssg: null
+    enable_dl_denoiser: null
+    dlss_mode: null
+    enable_direct_lighting: null
+    samples_per_pixel: null
+    enable_shadows: null
+    enable_ambient_occlusion: null
+    dome_light_upper_lower_strategy: null
+    max_bounces: null
+    split_glass: null
+    split_clearcoat: null
+    split_rough_reflection: null
+    ambient_light_intensity: null
+    ambient_occlusion_denoiser_mode: null
+    view_tile_limit: null
+    carb_settings: null
+    rendering_mode: null
+  create_stage_in_memory: false
+  logging_level: WARNING
+  save_logs_to_file: true
+  log_dir: null
+  visualizer_cfgs: []
+ui_window_class_type: isaaclab.envs.ui.base_env_window:BaseEnvWindow
+seed: 42
+decimation: 2
+scene:
+  class_type: isaaclab.scene.interactive_scene:InteractiveScene
+  num_envs: 2
+  env_spacing: 3
+  lazy_sensor_update: true
+  replicate_physics: true
+  filter_collisions: true
+  clone_in_fabric: false
+  robot:
+    class_type: isaaclab.assets.articulation.articulation:Articulation
+    prim_path: /World/envs/env_.*/Robot
+    spawn:
+      func: isaaclab.sim.spawners.from_files.from_files:spawn_from_usd
+      visible: true
+      semantic_tags: null
+      copy_from_source: true
+      spawn_path: /World/envs/env_0/Robot
+      mass_props: null
+      deformable_props: null
+      rigid_props:
+        rigid_body_enabled: null
+        kinematic_enabled: null
+        disable_gravity: true
+        linear_damping: 0.0
+        angular_damping: 0.0
+        max_linear_velocity: 1000.0
+        max_angular_velocity: 1000.0
+        max_depenetration_velocity: 1000.0
+        max_contact_impulse: null
+        enable_gyroscopic_forces: null
+        retain_accelerations: true
+        solver_position_iteration_count: null
+        solver_velocity_iteration_count: null
+        sleep_threshold: null
+        stabilization_threshold: null
+        _usd_applied_schema: PhysxRigidBodyAPI
+        _usd_field_exceptions:
+          PhysxRigidBodyAPI:
+          - physxRigidBody
+          - - disable_gravity
+        _usd_namespace: physxRigidBody
+      collision_props: null
+      activate_contact_sensors: true
+      scale: null
+      articulation_props:
+        articulation_enabled: null
+        fix_root_link: null
+        enabled_self_collisions: true
+        solver_position_iteration_count: 32
+        solver_velocity_iteration_count: 1
+        sleep_threshold: 0.005
+        stabilization_threshold: 0.0005
+        _usd_applied_schema: PhysxArticulationAPI
+        _usd_field_exceptions:
+          PhysxArticulationAPI:
+          - physxArticulation
+          - - articulation_enabled
+        _usd_namespace: physxArticulation
+      fixed_tendons_props: null
+      spatial_tendons_props: null
+      joint_drive_props:
+        drive_type: force
+        max_force: null
+        max_effort: null
+        stiffness: null
+        damping: null
+        ensure_drives_exist: false
+        max_joint_velocity: null
+        max_velocity: null
+        _usd_applied_schema: PhysxJointAPI
+        _usd_field_exceptions:
+          PhysxJointAPI:
+          - physxJoint
+          - - max_joint_velocity
+        _usd_namespace: physxJoint
+      visual_material_path: material
+      visual_material: null
+      physics_material_path: material
+      physics_material: null
+      usd_path: https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/6.0/Isaac/IsaacLab/Robots/KukaAllegro/kuka.usd
+      variants: null
+    init_state:
+      pos:
+      - 0.0
+      - 0.0
+      - 0.0
+      rot:
+      - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+      lin_vel:
+      - 0.0
+      - 0.0
+      - 0.0
+      ang_vel:
+      - 0.0
+      - 0.0
+      - 0.0
+      joint_pos:
+        iiwa7_joint_(1|2|7): 0.0
+        iiwa7_joint_3: 0.7854
+        iiwa7_joint_4: 1.5708
+        iiwa7_joint_(5|6): -1.5708
+        (index|middle|ring)_joint_0: 0.0
+        (index|middle|ring)_joint_1: 0.3
+        (index|middle|ring)_joint_2: 0.3
+        (index|middle|ring)_joint_3: 0.3
+        thumb_joint_0: 1.5
+        thumb_joint_1: 0.60147215
+        thumb_joint_2: 0.33795027
+        thumb_joint_3: 0.60845138
+      joint_vel:
+        .*: 0.0
+    collision_group: 0
+    debug_vis: false
+    disable_shape_checks: null
+    articulation_root_prim_path: null
+    soft_joint_pos_limit_factor: 1.0
+    actuators:
+      kuka_allegro_actuators:
+        class_type: isaaclab.actuators.actuator_pd:ImplicitActuator
+        joint_names_expr:
+        - iiwa7_joint_(1|2|3|4|5|6|7)
+        - index_joint_(0|1|2|3)
+        - middle_joint_(0|1|2|3)
+        - ring_joint_(0|1|2|3)
+        - thumb_joint_(0|1|2|3)
+        effort_limit: null
+        velocity_limit: null
+        effort_limit_sim:
+          iiwa7_joint_(1|2|3|4|5|6|7): 300.0
+          index_joint_(0|1|2|3): 0.5
+          middle_joint_(0|1|2|3): 0.5
+          ring_joint_(0|1|2|3): 0.5
+          thumb_joint_(0|1|2|3): 0.5
+        velocity_limit_sim: null
+        stiffness:
+          iiwa7_joint_(1|2|3|4): 300.0
+          iiwa7_joint_5: 100.0
+          iiwa7_joint_6: 50.0
+          iiwa7_joint_7: 25.0
+          index_joint_(0|1|2|3): 3.0
+          middle_joint_(0|1|2|3): 3.0
+          ring_joint_(0|1|2|3): 3.0
+          thumb_joint_(0|1|2|3): 3.0
+        damping:
+          iiwa7_joint_(1|2|3|4): 45.0
+          iiwa7_joint_5: 20.0
+          iiwa7_joint_6: 15.0
+          iiwa7_joint_7: 15.0
+          index_joint_(0|1|2|3): 0.1
+          middle_joint_(0|1|2|3): 0.1
+          ring_joint_(0|1|2|3): 0.1
+          thumb_joint_(0|1|2|3): 0.1
+        armature:
+          .*: 0.01
+        friction:
+          iiwa7_joint_(1|2|3|4|5|6|7): 1.0
+          index_joint_(0|1|2|3): 0.01
+          middle_joint_(0|1|2|3): 0.01
+          ring_joint_(0|1|2|3): 0.01
+          thumb_joint_(0|1|2|3): 0.01
+        dynamic_friction: null
+        viscous_friction: null
+    actuator_value_resolution_debug_print: false
+  object:
+    class_type: isaaclab.assets.rigid_object.rigid_object:RigidObject
+    prim_path: /World/envs/env_.*/Object
+    spawn:
+      func: isaaclab.sim.spawners.wrappers.wrappers:spawn_multi_asset
+      visible: true
+      semantic_tags: null
+      copy_from_source: true
+      spawn_path: null
+      mass_props:
+        mass: 0.2
+        density: null
+        _usd_applied_schema: null
+        _usd_field_exceptions: {}
+        _usd_namespace: physics
+      deformable_props: null
+      rigid_props:
+        rigid_body_enabled: null
+        kinematic_enabled: null
+        disable_gravity: false
+        linear_damping: null
+        angular_damping: null
+        max_linear_velocity: null
+        max_angular_velocity: null
+        max_depenetration_velocity: null
+        max_contact_impulse: null
+        enable_gyroscopic_forces: null
+        retain_accelerations: null
+        solver_position_iteration_count: 16
+        solver_velocity_iteration_count: 0
+        sleep_threshold: null
+        stabilization_threshold: null
+        _usd_applied_schema: PhysxRigidBodyAPI
+        _usd_field_exceptions:
+          PhysxRigidBodyAPI:
+          - physxRigidBody
+          - - disable_gravity
+        _usd_namespace: physxRigidBody
+      collision_props:
+        collision_enabled: null
+        contact_offset: null
+        rest_offset: null
+        torsional_patch_radius: null
+        min_torsional_patch_radius: null
+        _usd_applied_schema: PhysxCollisionAPI
+        _usd_field_exceptions:
+          PhysxCollisionAPI:
+          - physxCollision
+          - - contact_offset
+            - rest_offset
+        _usd_namespace: physxCollision
+      activate_contact_sensors: false
+      assets_cfg:
+      - func: isaaclab.sim.spawners.meshes.meshes:spawn_mesh_cuboid
+        visible: true
+        semantic_tags: null
+        copy_from_source: true
+        spawn_path: null
+        mass_props: null
+        deformable_props: null
+        rigid_props: null
+        collision_props:
+          collision_enabled: null
+          contact_offset: 0.002
+          rest_offset: null
+          torsional_patch_radius: null
+          min_torsional_patch_radius: null
+          _usd_applied_schema: PhysxCollisionAPI
+          _usd_field_exceptions:
+            PhysxCollisionAPI:
+            - physxCollision
+            - - contact_offset
+              - rest_offset
+          _usd_namespace: physxCollision
+        activate_contact_sensors: false
+        visual_material_path: material
+        visual_material: null
+        physics_material_path: material
+        physics_material:
+          func: isaaclab.sim.spawners.materials.physics_materials:spawn_rigid_body_material
+          static_friction: 0.5
+          dynamic_friction: 0.5
+          restitution: 0.0
+          compliant_contact_stiffness: null
+          compliant_contact_damping: null
+          friction_combine_mode: null
+          restitution_combine_mode: null
+          _usd_applied_schema: PhysxMaterialAPI
+          _usd_field_exceptions: {}
+          _usd_namespace: physxMaterial
+        size:
+        - 0.05
+        - 0.1
+        - 0.1
+      - func: isaaclab.sim.spawners.meshes.meshes:spawn_mesh_cuboid
+        visible: true
+        semantic_tags: null
+        copy_from_source: true
+        spawn_path: null
+        mass_props: null
+        deformable_props: null
+        rigid_props: null
+        collision_props:
+          collision_enabled: null
+          contact_offset: 0.002
+          rest_offset: null
+          torsional_patch_radius: null
+          min_torsional_patch_radius: null
+          _usd_applied_schema: PhysxCollisionAPI
+          _usd_field_exceptions:
+            PhysxCollisionAPI:
+            - physxCollision
+            - - contact_offset
+              - rest_offset
+          _usd_namespace: physxCollision
+        activate_contact_sensors: false
+        visual_material_path: material
+        visual_material: null
+        physics_material_path: material
+        physics_material:
+          func: isaaclab.sim.spawners.materials.physics_materials:spawn_rigid_body_material
+          static_friction: 0.5
+          dynamic_friction: 0.5
+          restitution: 0.0
+          compliant_contact_stiffness: null
+          compliant_contact_damping: null
+          friction_combine_mode: null
+          restitution_combine_mode: null
+          _usd_applied_schema: PhysxMaterialAPI
+          _usd_field_exceptions: {}
+          _usd_namespace: physxMaterial
+        size:
+        - 0.05
+        - 0.05
+        - 0.1
+      - func: isaaclab.sim.spawners.meshes.meshes:spawn_mesh_cuboid
+        visible: true
+        semantic_tags: null
+        copy_from_source: true
+        spawn_path: null
+        mass_props: null
+        deformable_props: null
+        rigid_props: null
+        collision_props:
+          collision_enabled: null
+          contact_offset: 0.002
+          rest_offset: null
+          torsional_patch_radius: null
+          min_torsional_patch_radius: null
+          _usd_applied_schema: PhysxCollisionAPI
+          _usd_field_exceptions:
+            PhysxCollisionAPI:
+            - physxCollision
+            - - contact_offset
+              - rest_offset
+          _usd_namespace: physxCollision
+        activate_contact_sensors: false
+        visual_material_path: material
+        visual_material: null
+        physics_material_path: material
+        physics_material:
+          func: isaaclab.sim.spawners.materials.physics_materials:spawn_rigid_body_material
+          static_friction: 0.5
+          dynamic_friction: 0.5
+          restitution: 0.0
+          compliant_contact_stiffness: null
+          compliant_contact_damping: null
+          friction_combine_mode: null
+          restitution_combine_mode: null
+          _usd_applied_schema: PhysxMaterialAPI
+          _usd_field_exceptions: {}
+          _usd_namespace: physxMaterial
+        size:
+        - 0.025
+        - 0.1
+        - 0.1
+      - func: isaaclab.sim.spawners.meshes.meshes:spawn_mesh_cuboid
+        visible: true
+        semantic_tags: null
+        copy_from_source: true
+        spawn_path: null
+        mass_props: null
+        deformable_props: null
+        rigid_props: null
+        collision_props:
+          collision_enabled: null
+          contact_offset: 0.002
+          rest_offset: null
+          torsional_patch_radius: null
+          min_torsional_patch_radius: null
+          _usd_applied_schema: PhysxCollisionAPI
+          _usd_field_exceptions:
+            PhysxCollisionAPI:
+            - physxCollision
+            - - contact_offset
+              - rest_offset
+          _usd_namespace: physxCollision
+        activate_contact_sensors: false
+        visual_material_path: material
+        visual_material: null
+        physics_material_path: material
+        physics_material:
+          func: isaaclab.sim.spawners.materials.physics_materials:spawn_rigid_body_material
+          static_friction: 0.5
+          dynamic_friction: 0.5
+          restitution: 0.0
+          compliant_contact_stiffness: null
+          compliant_contact_damping: null
+          friction_combine_mode: null
+          restitution_combine_mode: null
+          _usd_applied_schema: PhysxMaterialAPI
+          _usd_field_exceptions: {}
+          _usd_namespace: physxMaterial
+        size:
+        - 0.025
+        - 0.05
+        - 0.1
+      - func: isaaclab.sim.spawners.meshes.meshes:spawn_mesh_cuboid
+        visible: true
+        semantic_tags: null
+        copy_from_source: true
+        spawn_path: null
+        mass_props: null
+        deformable_props: null
+        rigid_props: null
+        collision_props:
+          collision_enabled: null
+          contact_offset: 0.002
+          rest_offset: null
+          torsional_patch_radius: null
+          min_torsional_patch_radius: null
+          _usd_applied_schema: PhysxCollisionAPI
+          _usd_field_exceptions:
+            PhysxCollisionAPI:
+            - physxCollision
+            - - contact_offset
+              - rest_offset
+          _usd_namespace: physxCollision
+        activate_contact_sensors: false
+        visual_material_path: material
+        visual_material: null
+        physics_material_path: material
+        physics_material:
+          func: isaaclab.sim.spawners.materials.physics_materials:spawn_rigid_body_material
+          static_friction: 0.5
+          dynamic_friction: 0.5
+          restitution: 0.0
+          compliant_contact_stiffness: null
+          compliant_contact_damping: null
+          friction_combine_mode: null
+          restitution_combine_mode: null
+          _usd_applied_schema: PhysxMaterialAPI
+          _usd_field_exceptions: {}
+          _usd_namespace: physxMaterial
+        size:
+        - 0.025
+        - 0.025
+        - 0.1
+      - func: isaaclab.sim.spawners.meshes.meshes:spawn_mesh_cuboid
+        visible: true
+        semantic_tags: null
+        copy_from_source: true
+        spawn_path: null
+        mass_props: null
+        deformable_props: null
+        rigid_props: null
+        collision_props:
+          collision_enabled: null
+          contact_offset: 0.002
+          rest_offset: null
+          torsional_patch_radius: null
+          min_torsional_patch_radius: null
+          _usd_applied_schema: PhysxCollisionAPI
+          _usd_field_exceptions:
+            PhysxCollisionAPI:
+            - physxCollision
+            - - contact_offset
+              - rest_offset
+          _usd_namespace: physxCollision
+        activate_contact_sensors: false
+        visual_material_path: material
+        visual_material: null
+        physics_material_path: material
+        physics_material:
+          func: isaaclab.sim.spawners.materials.physics_materials:spawn_rigid_body_material
+          static_friction: 0.5
+          dynamic_friction: 0.5
+          restitution: 0.0
+          compliant_contact_stiffness: null
+          compliant_contact_damping: null
+          friction_combine_mode: null
+          restitution_combine_mode: null
+          _usd_applied_schema: PhysxMaterialAPI
+          _usd_field_exceptions: {}
+          _usd_namespace: physxMaterial
+        size:
+        - 0.01
+        - 0.1
+        - 0.1
+      - func: isaaclab.sim.spawners.meshes.meshes:spawn_mesh_sphere
+        visible: true
+        semantic_tags: null
+        copy_from_source: true
+        spawn_path: null
+        mass_props: null
+        deformable_props: null
+        rigid_props: null
+        collision_props:
+          collision_enabled: null
+          contact_offset: 0.002
+          rest_offset: null
+          torsional_patch_radius: null
+          min_torsional_patch_radius: null
+          _usd_applied_schema: PhysxCollisionAPI
+          _usd_field_exceptions:
+            PhysxCollisionAPI:
+            - physxCollision
+            - - contact_offset
+              - rest_offset
+          _usd_namespace: physxCollision
+        activate_contact_sensors: false
+        visual_material_path: material
+        visual_material: null
+        physics_material_path: material
+        physics_material:
+          func: isaaclab.sim.spawners.materials.physics_materials:spawn_rigid_body_material
+          static_friction: 0.5
+          dynamic_friction: 0.5
+          restitution: 0.0
+          compliant_contact_stiffness: null
+          compliant_contact_damping: null
+          friction_combine_mode: null
+          restitution_combine_mode: null
+          _usd_applied_schema: PhysxMaterialAPI
+          _usd_field_exceptions: {}
+          _usd_namespace: physxMaterial
+        radius: 0.05
+      - func: isaaclab.sim.spawners.meshes.meshes:spawn_mesh_sphere
+        visible: true
+        semantic_tags: null
+        copy_from_source: true
+        spawn_path: null
+        mass_props: null
+        deformable_props: null
+        rigid_props: null
+        collision_props:
+          collision_enabled: null
+          contact_offset: 0.002
+          rest_offset: null
+          torsional_patch_radius: null
+          min_torsional_patch_radius: null
+          _usd_applied_schema: PhysxCollisionAPI
+          _usd_field_exceptions:
+            PhysxCollisionAPI:
+            - physxCollision
+            - - contact_offset
+              - rest_offset
+          _usd_namespace: physxCollision
+        activate_contact_sensors: false
+        visual_material_path: material
+        visual_material: null
+        physics_material_path: material
+        physics_material:
+          func: isaaclab.sim.spawners.materials.physics_materials:spawn_rigid_body_material
+          static_friction: 0.5
+          dynamic_friction: 0.5
+          restitution: 0.0
+          compliant_contact_stiffness: null
+          compliant_contact_damping: null
+          friction_combine_mode: null
+          restitution_combine_mode: null
+          _usd_applied_schema: PhysxMaterialAPI
+          _usd_field_exceptions: {}
+          _usd_namespace: physxMaterial
+        radius: 0.025
+      - func: isaaclab.sim.spawners.meshes.meshes:spawn_mesh_capsule
+        visible: true
+        semantic_tags: null
+        copy_from_source: true
+        spawn_path: null
+        mass_props: null
+        deformable_props: null
+        rigid_props: null
+        collision_props:
+          collision_enabled: null
+          contact_offset: 0.002
+          rest_offset: null
+          torsional_patch_radius: null
+          min_torsional_patch_radius: null
+          _usd_applied_schema: PhysxCollisionAPI
+          _usd_field_exceptions:
+            PhysxCollisionAPI:
+            - physxCollision
+            - - contact_offset
+              - rest_offset
+          _usd_namespace: physxCollision
+        activate_contact_sensors: false
+        visual_material_path: material
+        visual_material: null
+        physics_material_path: material
+        physics_material:
+          func: isaaclab.sim.spawners.materials.physics_materials:spawn_rigid_body_material
+          static_friction: 0.5
+          dynamic_friction: 0.5
+          restitution: 0.0
+          compliant_contact_stiffness: null
+          compliant_contact_damping: null
+          friction_combine_mode: null
+          restitution_combine_mode: null
+          _usd_applied_schema: PhysxMaterialAPI
+          _usd_field_exceptions: {}
+          _usd_namespace: physxMaterial
+        radius: 0.04
+        height: 0.025
+        axis: Z
+      - func: isaaclab.sim.spawners.meshes.meshes:spawn_mesh_capsule
+        visible: true
+        semantic_tags: null
+        copy_from_source: true
+        spawn_path: null
+        mass_props: null
+        deformable_props: null
+        rigid_props: null
+        collision_props:
+          collision_enabled: null
+          contact_offset: 0.002
+          rest_offset: null
+          torsional_patch_radius: null
+          min_torsional_patch_radius: null
+          _usd_applied_schema: PhysxCollisionAPI
+          _usd_field_exceptions:
+            PhysxCollisionAPI:
+            - physxCollision
+            - - contact_offset
+              - rest_offset
+          _usd_namespace: physxCollision
+        activate_contact_sensors: false
+        visual_material_path: material
+        visual_material: null
+        physics_material_path: material
+        physics_material:
+          func: isaaclab.sim.spawners.materials.physics_materials:spawn_rigid_body_material
+          static_friction: 0.5
+          dynamic_friction: 0.5
+          restitution: 0.0
+          compliant_contact_stiffness: null
+          compliant_contact_damping: null
+          friction_combine_mode: null
+          restitution_combine_mode: null
+          _usd_applied_schema: PhysxMaterialAPI
+          _usd_field_exceptions: {}
+          _usd_namespace: physxMaterial
+        radius: 0.04
+        height: 0.01
+        axis: Z
+      - func: isaaclab.sim.spawners.meshes.meshes:spawn_mesh_capsule
+        visible: true
+        semantic_tags: null
+        copy_from_source: true
+        spawn_path: null
+        mass_props: null
+        deformable_props: null
+        rigid_props: null
+        collision_props:
+          collision_enabled: null
+          contact_offset: 0.002
+          rest_offset: null
+          torsional_patch_radius: null
+          min_torsional_patch_radius: null
+          _usd_applied_schema: PhysxCollisionAPI
+          _usd_field_exceptions:
+            PhysxCollisionAPI:
+            - physxCollision
+            - - contact_offset
+              - rest_offset
+          _usd_namespace: physxCollision
+        activate_contact_sensors: false
+        visual_material_path: material
+        visual_material: null
+        physics_material_path: material
+        physics_material:
+          func: isaaclab.sim.spawners.materials.physics_materials:spawn_rigid_body_material
+          static_friction: 0.5
+          dynamic_friction: 0.5
+          restitution: 0.0
+          compliant_contact_stiffness: null
+          compliant_contact_damping: null
+          friction_combine_mode: null
+          restitution_combine_mode: null
+          _usd_applied_schema: PhysxMaterialAPI
+          _usd_field_exceptions: {}
+          _usd_namespace: physxMaterial
+        radius: 0.04
+        height: 0.1
+        axis: Z
+      - func: isaaclab.sim.spawners.meshes.meshes:spawn_mesh_capsule
+        visible: true
+        semantic_tags: null
+        copy_from_source: true
+        spawn_path: null
+        mass_props: null
+        deformable_props: null
+        rigid_props: null
+        collision_props:
+          collision_enabled: null
+          contact_offset: 0.002
+          rest_offset: null
+          torsional_patch_radius: null
+          min_torsional_patch_radius: null
+          _usd_applied_schema: PhysxCollisionAPI
+          _usd_field_exceptions:
+            PhysxCollisionAPI:
+            - physxCollision
+            - - contact_offset
+              - rest_offset
+          _usd_namespace: physxCollision
+        activate_contact_sensors: false
+        visual_material_path: material
+        visual_material: null
+        physics_material_path: material
+        physics_material:
+          func: isaaclab.sim.spawners.materials.physics_materials:spawn_rigid_body_material
+          static_friction: 0.5
+          dynamic_friction: 0.5
+          restitution: 0.0
+          compliant_contact_stiffness: null
+          compliant_contact_damping: null
+          friction_combine_mode: null
+          restitution_combine_mode: null
+          _usd_applied_schema: PhysxMaterialAPI
+          _usd_field_exceptions: {}
+          _usd_namespace: physxMaterial
+        radius: 0.025
+        height: 0.1
+        axis: Z
+      - func: isaaclab.sim.spawners.meshes.meshes:spawn_mesh_capsule
+        visible: true
+        semantic_tags: null
+        copy_from_source: true
+        spawn_path: null
+        mass_props: null
+        deformable_props: null
+        rigid_props: null
+        collision_props:
+          collision_enabled: null
+          contact_offset: 0.002
+          rest_offset: null
+          torsional_patch_radius: null
+          min_torsional_patch_radius: null
+          _usd_applied_schema: PhysxCollisionAPI
+          _usd_field_exceptions:
+            PhysxCollisionAPI:
+            - physxCollision
+            - - contact_offset
+              - rest_offset
+          _usd_namespace: physxCollision
+        activate_contact_sensors: false
+        visual_material_path: material
+        visual_material: null
+        physics_material_path: material
+        physics_material:
+          func: isaaclab.sim.spawners.materials.physics_materials:spawn_rigid_body_material
+          static_friction: 0.5
+          dynamic_friction: 0.5
+          restitution: 0.0
+          compliant_contact_stiffness: null
+          compliant_contact_damping: null
+          friction_combine_mode: null
+          restitution_combine_mode: null
+          _usd_applied_schema: PhysxMaterialAPI
+          _usd_field_exceptions: {}
+          _usd_namespace: physxMaterial
+        radius: 0.025
+        height: 0.2
+        axis: Z
+      - func: isaaclab.sim.spawners.meshes.meshes:spawn_mesh_capsule
+        visible: true
+        semantic_tags: null
+        copy_from_source: true
+        spawn_path: null
+        mass_props: null
+        deformable_props: null
+        rigid_props: null
+        collision_props:
+          collision_enabled: null
+          contact_offset: 0.002
+          rest_offset: null
+          torsional_patch_radius: null
+          min_torsional_patch_radius: null
+          _usd_applied_schema: PhysxCollisionAPI
+          _usd_field_exceptions:
+            PhysxCollisionAPI:
+            - physxCollision
+            - - contact_offset
+              - rest_offset
+          _usd_namespace: physxCollision
+        activate_contact_sensors: false
+        visual_material_path: material
+        visual_material: null
+        physics_material_path: material
+        physics_material:
+          func: isaaclab.sim.spawners.materials.physics_materials:spawn_rigid_body_material
+          static_friction: 0.5
+          dynamic_friction: 0.5
+          restitution: 0.0
+          compliant_contact_stiffness: null
+          compliant_contact_damping: null
+          friction_combine_mode: null
+          restitution_combine_mode: null
+          _usd_applied_schema: PhysxMaterialAPI
+          _usd_field_exceptions: {}
+          _usd_namespace: physxMaterial
+        radius: 0.01
+        height: 0.2
+        axis: Z
+      - func: isaaclab.sim.spawners.meshes.meshes:spawn_mesh_cone
+        visible: true
+        semantic_tags: null
+        copy_from_source: true
+        spawn_path: null
+        mass_props: null
+        deformable_props: null
+        rigid_props: null
+        collision_props:
+          collision_enabled: null
+          contact_offset: 0.002
+          rest_offset: null
+          torsional_patch_radius: null
+          min_torsional_patch_radius: null
+          _usd_applied_schema: PhysxCollisionAPI
+          _usd_field_exceptions:
+            PhysxCollisionAPI:
+            - physxCollision
+            - - contact_offset
+              - rest_offset
+          _usd_namespace: physxCollision
+        activate_contact_sensors: false
+        visual_material_path: material
+        visual_material: null
+        physics_material_path: material
+        physics_material:
+          func: isaaclab.sim.spawners.materials.physics_materials:spawn_rigid_body_material
+          static_friction: 0.5
+          dynamic_friction: 0.5
+          restitution: 0.0
+          compliant_contact_stiffness: null
+          compliant_contact_damping: null
+          friction_combine_mode: null
+          restitution_combine_mode: null
+          _usd_applied_schema: PhysxMaterialAPI
+          _usd_field_exceptions: {}
+          _usd_namespace: physxMaterial
+        radius: 0.05
+        height: 0.1
+        axis: Z
+      - func: isaaclab.sim.spawners.meshes.meshes:spawn_mesh_cone
+        visible: true
+        semantic_tags: null
+        copy_from_source: true
+        spawn_path: null
+        mass_props: null
+        deformable_props: null
+        rigid_props: null
+        collision_props:
+          collision_enabled: null
+          contact_offset: 0.002
+          rest_offset: null
+          torsional_patch_radius: null
+          min_torsional_patch_radius: null
+          _usd_applied_schema: PhysxCollisionAPI
+          _usd_field_exceptions:
+            PhysxCollisionAPI:
+            - physxCollision
+            - - contact_offset
+              - rest_offset
+          _usd_namespace: physxCollision
+        activate_contact_sensors: false
+        visual_material_path: material
+        visual_material: null
+        physics_material_path: material
+        physics_material:
+          func: isaaclab.sim.spawners.materials.physics_materials:spawn_rigid_body_material
+          static_friction: 0.5
+          dynamic_friction: 0.5
+          restitution: 0.0
+          compliant_contact_stiffness: null
+          compliant_contact_damping: null
+          friction_combine_mode: null
+          restitution_combine_mode: null
+          _usd_applied_schema: PhysxMaterialAPI
+          _usd_field_exceptions: {}
+          _usd_namespace: physxMaterial
+        radius: 0.025
+        height: 0.1
+        axis: Z
+      spawn_paths:
+      - null
+      - null
+      - null
+      - /World/envs/env_0/Object
+      - null
+      - null
+      - null
+      - null
+      - null
+      - /World/envs/env_1/Object
+      - null
+      - null
+      - null
+      - null
+      - null
+      - null
+      random_choice: true
+    init_state:
+      pos:
+      - -0.55
+      - 0.1
+      - 0.35
+      rot:
+      - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+      lin_vel:
+      - 0.0
+      - 0.0
+      - 0.0
+      ang_vel:
+      - 0.0
+      - 0.0
+      - 0.0
+    collision_group: 0
+    debug_vis: false
+    disable_shape_checks: null
+  table:
+    class_type: isaaclab.assets.rigid_object.rigid_object:RigidObject
+    prim_path: /World/envs/env_.*/table
+    spawn:
+      func: isaaclab.sim.spawners.shapes.shapes:spawn_cuboid
+      visible: false
+      semantic_tags: null
+      copy_from_source: true
+      spawn_path: /World/envs/env_0/table
+      mass_props: null
+      rigid_props:
+        rigid_body_enabled: null
+        kinematic_enabled: true
+        disable_gravity: null
+        linear_damping: null
+        angular_damping: null
+        max_linear_velocity: null
+        max_angular_velocity: null
+        max_depenetration_velocity: null
+        max_contact_impulse: null
+        enable_gyroscopic_forces: null
+        retain_accelerations: null
+        solver_position_iteration_count: null
+        solver_velocity_iteration_count: null
+        sleep_threshold: null
+        stabilization_threshold: null
+        _usd_applied_schema: PhysxRigidBodyAPI
+        _usd_field_exceptions:
+          PhysxRigidBodyAPI:
+          - physxRigidBody
+          - - disable_gravity
+        _usd_namespace: physxRigidBody
+      collision_props:
+        collision_enabled: null
+        contact_offset: null
+        rest_offset: null
+        torsional_patch_radius: null
+        min_torsional_patch_radius: null
+        _usd_applied_schema: PhysxCollisionAPI
+        _usd_field_exceptions:
+          PhysxCollisionAPI:
+          - physxCollision
+          - - contact_offset
+            - rest_offset
+        _usd_namespace: physxCollision
+      activate_contact_sensors: false
+      visual_material_path: material
+      visual_material: null
+      physics_material_path: material
+      physics_material: null
+      size:
+      - 0.8
+      - 1.5
+      - 0.04
+    init_state:
+      pos:
+      - -0.55
+      - 0.0
+      - 0.235
+      rot:
+      - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+      lin_vel:
+      - 0.0
+      - 0.0
+      - 0.0
+      ang_vel:
+      - 0.0
+      - 0.0
+      - 0.0
+    collision_group: 0
+    debug_vis: false
+    disable_shape_checks: null
+  plane:
+    class_type: null
+    prim_path: /World/GroundPlane
+    spawn:
+      func: isaaclab.sim.spawners.from_files.from_files:spawn_ground_plane
+      visible: true
+      semantic_tags: null
+      copy_from_source: true
+      spawn_path: /World/GroundPlane
+      usd_path: https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/6.0/Isaac/Environments/Grid/default_environment.usd
+      color:
+      - 1.0
+      - 1.0
+      - 1.0
+      size:
+      - 100.0
+      - 100.0
+      physics_material:
+        func: isaaclab.sim.spawners.materials.physics_materials:spawn_rigid_body_material
+        static_friction: 0.5
+        dynamic_friction: 0.5
+        restitution: 0.0
+        compliant_contact_stiffness: null
+        compliant_contact_damping: null
+        friction_combine_mode: null
+        restitution_combine_mode: null
+        _usd_applied_schema: PhysxMaterialAPI
+        _usd_field_exceptions: {}
+        _usd_namespace: physxMaterial
+    init_state:
+      pos:
+      - 0.0
+      - 0.0
+      - 0.0
+      rot:
+      - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    collision_group: -1
+    debug_vis: false
+    disable_shape_checks: null
+  sky_light:
+    class_type: null
+    prim_path: /World/skyLight
+    spawn:
+      func: isaaclab.sim.spawners.lights.lights:spawn_light
+      visible: true
+      semantic_tags: null
+      copy_from_source: true
+      spawn_path: /World/skyLight
+      prim_type: DomeLight
+      color:
+      - 1.0
+      - 1.0
+      - 1.0
+      enable_color_temperature: false
+      color_temperature: 6500.0
+      normalize: false
+      exposure: 0.0
+      intensity: 750.0
+      texture_file: https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/6.0/Isaac/Materials/Textures/Skies/PolyHaven/kloofendal_43d_clear_puresky_4k.hdr
+      texture_format: automatic
+      visible_in_primary_ray: true
+    init_state:
+      pos:
+      - 0.0
+      - 0.0
+      - 0.0
+      rot:
+      - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    collision_group: 0
+    debug_vis: false
+    disable_shape_checks: null
+  base_camera:
+    class_type: isaaclab.sensors.camera.camera:Camera
+    prim_path: /World/envs/env_.*/Camera
+    update_period: 0.0
+    debug_vis: false
+    offset:
+      pos:
+      - 0.57
+      - -0.8
+      - 0.5
+      rot:
+      - 0.6124
+      - 0.3536
+      - 0.3536
+      - 0.6124
+      convention: opengl
+    spawn:
+      func: isaaclab.sim.spawners.sensors.sensors:spawn_camera
+      visible: true
+      semantic_tags: null
+      copy_from_source: true
+      spawn_path: /World/envs/env_0/Camera
+      projection_type: pinhole
+      clipping_range:
+      - 0.01
+      - 2.5
+      focal_length: 24.0
+      focus_distance: 400.0
+      f_stop: 0.0
+      horizontal_aperture: 20.955
+      vertical_aperture: null
+      horizontal_aperture_offset: 0.0
+      vertical_aperture_offset: 0.0
+      lock_camera: true
+    depth_clipping_behavior: none
+    data_types:
+    - depth
+    width: 64
+    height: 64
+    update_latest_camera_pose: false
+    semantic_filter: '*:*'
+    colorize_semantic_segmentation: true
+    colorize_instance_id_segmentation: true
+    colorize_instance_segmentation: true
+    semantic_segmentation_mapping: {}
+    renderer_cfg:
+      renderer_type: newton_warp
+      enable_textures: true
+      enable_shadows: false
+      enable_ambient_lighting: true
+      enable_backface_culling: true
+      max_distance: 1000.0
+      create_default_light: true
+      colorize_instance_segmentation: true
+    isp_cfg: null
+  wrist_camera: null
+  index_link_3_object_s:
+    class_type: isaaclab.sensors.contact_sensor.contact_sensor:ContactSensor
+    prim_path: /World/envs/env_.*/Robot/ee_link/index_link_3
+    update_period: 0.0
+    debug_vis: false
+    track_pose: false
+    track_contact_points: false
+    track_friction_forces: false
+    max_contact_data_count_per_prim: null
+    track_air_time: false
+    force_threshold: null
+    history_length: 0
+    filter_prim_paths_expr:
+    - /World/envs/env_.*/Object
+    visualizer_cfg:
+      prim_path: /Visuals/ContactSensor
+      markers:
+        contact:
+          func: isaaclab.sim.spawners.shapes.shapes:spawn_sphere
+          visible: true
+          semantic_tags: null
+          copy_from_source: true
+          spawn_path: null
+          mass_props: null
+          rigid_props: null
+          collision_props: null
+          activate_contact_sensors: false
+          visual_material_path: material
+          visual_material:
+            func: isaaclab.sim.spawners.materials.visual_materials:spawn_preview_surface
+            diffuse_color:
+            - 1.0
+            - 0.0
+            - 0.0
+            emissive_color:
+            - 0.0
+            - 0.0
+            - 0.0
+            roughness: 0.5
+            metallic: 0.0
+            opacity: 1.0
+          physics_material_path: material
+          physics_material: null
+          radius: 0.02
+        no_contact:
+          func: isaaclab.sim.spawners.shapes.shapes:spawn_sphere
+          visible: false
+          semantic_tags: null
+          copy_from_source: true
+          spawn_path: null
+          mass_props: null
+          rigid_props: null
+          collision_props: null
+          activate_contact_sensors: false
+          visual_material_path: material
+          visual_material:
+            func: isaaclab.sim.spawners.materials.visual_materials:spawn_preview_surface
+            diffuse_color:
+            - 0.0
+            - 1.0
+            - 0.0
+            emissive_color:
+            - 0.0
+            - 0.0
+            - 0.0
+            roughness: 0.5
+            metallic: 0.0
+            opacity: 1.0
+          physics_material_path: material
+          physics_material: null
+          radius: 0.02
+      class_type: isaaclab.markers.visualization_markers:VisualizationMarkers
+  middle_link_3_object_s:
+    class_type: isaaclab.sensors.contact_sensor.contact_sensor:ContactSensor
+    prim_path: /World/envs/env_.*/Robot/ee_link/middle_link_3
+    update_period: 0.0
+    debug_vis: false
+    track_pose: false
+    track_contact_points: false
+    track_friction_forces: false
+    max_contact_data_count_per_prim: null
+    track_air_time: false
+    force_threshold: null
+    history_length: 0
+    filter_prim_paths_expr:
+    - /World/envs/env_.*/Object
+    visualizer_cfg:
+      prim_path: /Visuals/ContactSensor
+      markers:
+        contact:
+          func: isaaclab.sim.spawners.shapes.shapes:spawn_sphere
+          visible: true
+          semantic_tags: null
+          copy_from_source: true
+          spawn_path: null
+          mass_props: null
+          rigid_props: null
+          collision_props: null
+          activate_contact_sensors: false
+          visual_material_path: material
+          visual_material:
+            func: isaaclab.sim.spawners.materials.visual_materials:spawn_preview_surface
+            diffuse_color:
+            - 1.0
+            - 0.0
+            - 0.0
+            emissive_color:
+            - 0.0
+            - 0.0
+            - 0.0
+            roughness: 0.5
+            metallic: 0.0
+            opacity: 1.0
+          physics_material_path: material
+          physics_material: null
+          radius: 0.02
+        no_contact:
+          func: isaaclab.sim.spawners.shapes.shapes:spawn_sphere
+          visible: false
+          semantic_tags: null
+          copy_from_source: true
+          spawn_path: null
+          mass_props: null
+          rigid_props: null
+          collision_props: null
+          activate_contact_sensors: false
+          visual_material_path: material
+          visual_material:
+            func: isaaclab.sim.spawners.materials.visual_materials:spawn_preview_surface
+            diffuse_color:
+            - 0.0
+            - 1.0
+            - 0.0
+            emissive_color:
+            - 0.0
+            - 0.0
+            - 0.0
+            roughness: 0.5
+            metallic: 0.0
+            opacity: 1.0
+          physics_material_path: material
+          physics_material: null
+          radius: 0.02
+      class_type: isaaclab.markers.visualization_markers:VisualizationMarkers
+  ring_link_3_object_s:
+    class_type: isaaclab.sensors.contact_sensor.contact_sensor:ContactSensor
+    prim_path: /World/envs/env_.*/Robot/ee_link/ring_link_3
+    update_period: 0.0
+    debug_vis: false
+    track_pose: false
+    track_contact_points: false
+    track_friction_forces: false
+    max_contact_data_count_per_prim: null
+    track_air_time: false
+    force_threshold: null
+    history_length: 0
+    filter_prim_paths_expr:
+    - /World/envs/env_.*/Object
+    visualizer_cfg:
+      prim_path: /Visuals/ContactSensor
+      markers:
+        contact:
+          func: isaaclab.sim.spawners.shapes.shapes:spawn_sphere
+          visible: true
+          semantic_tags: null
+          copy_from_source: true
+          spawn_path: null
+          mass_props: null
+          rigid_props: null
+          collision_props: null
+          activate_contact_sensors: false
+          visual_material_path: material
+          visual_material:
+            func: isaaclab.sim.spawners.materials.visual_materials:spawn_preview_surface
+            diffuse_color:
+            - 1.0
+            - 0.0
+            - 0.0
+            emissive_color:
+            - 0.0
+            - 0.0
+            - 0.0
+            roughness: 0.5
+            metallic: 0.0
+            opacity: 1.0
+          physics_material_path: material
+          physics_material: null
+          radius: 0.02
+        no_contact:
+          func: isaaclab.sim.spawners.shapes.shapes:spawn_sphere
+          visible: false
+          semantic_tags: null
+          copy_from_source: true
+          spawn_path: null
+          mass_props: null
+          rigid_props: null
+          collision_props: null
+          activate_contact_sensors: false
+          visual_material_path: material
+          visual_material:
+            func: isaaclab.sim.spawners.materials.visual_materials:spawn_preview_surface
+            diffuse_color:
+            - 0.0
+            - 1.0
+            - 0.0
+            emissive_color:
+            - 0.0
+            - 0.0
+            - 0.0
+            roughness: 0.5
+            metallic: 0.0
+            opacity: 1.0
+          physics_material_path: material
+          physics_material: null
+          radius: 0.02
+      class_type: isaaclab.markers.visualization_markers:VisualizationMarkers
+  thumb_link_3_object_s:
+    class_type: isaaclab.sensors.contact_sensor.contact_sensor:ContactSensor
+    prim_path: /World/envs/env_.*/Robot/ee_link/thumb_link_3
+    update_period: 0.0
+    debug_vis: false
+    track_pose: false
+    track_contact_points: false
+    track_friction_forces: false
+    max_contact_data_count_per_prim: null
+    track_air_time: false
+    force_threshold: null
+    history_length: 0
+    filter_prim_paths_expr:
+    - /World/envs/env_.*/Object
+    visualizer_cfg:
+      prim_path: /Visuals/ContactSensor
+      markers:
+        contact:
+          func: isaaclab.sim.spawners.shapes.shapes:spawn_sphere
+          visible: true
+          semantic_tags: null
+          copy_from_source: true
+          spawn_path: null
+          mass_props: null
+          rigid_props: null
+          collision_props: null
+          activate_contact_sensors: false
+          visual_material_path: material
+          visual_material:
+            func: isaaclab.sim.spawners.materials.visual_materials:spawn_preview_surface
+            diffuse_color:
+            - 1.0
+            - 0.0
+            - 0.0
+            emissive_color:
+            - 0.0
+            - 0.0
+            - 0.0
+            roughness: 0.5
+            metallic: 0.0
+            opacity: 1.0
+          physics_material_path: material
+          physics_material: null
+          radius: 0.02
+        no_contact:
+          func: isaaclab.sim.spawners.shapes.shapes:spawn_sphere
+          visible: false
+          semantic_tags: null
+          copy_from_source: true
+          spawn_path: null
+          mass_props: null
+          rigid_props: null
+          collision_props: null
+          activate_contact_sensors: false
+          visual_material_path: material
+          visual_material:
+            func: isaaclab.sim.spawners.materials.visual_materials:spawn_preview_surface
+            diffuse_color:
+            - 0.0
+            - 1.0
+            - 0.0
+            emissive_color:
+            - 0.0
+            - 0.0
+            - 0.0
+            roughness: 0.5
+            metallic: 0.0
+            opacity: 1.0
+          physics_material_path: material
+          physics_material: null
+          radius: 0.02
+      class_type: isaaclab.markers.visualization_markers:VisualizationMarkers
+recorders:
+  dataset_file_handler_class_type: isaaclab.utils.datasets.hdf5_dataset_file_handler:HDF5DatasetFileHandler
+  dataset_export_dir_path: /tmp/isaaclab/logs
+  dataset_filename: dataset
+  dataset_export_mode:
+    _value_: 1
+    _name_: EXPORT_ALL
+    _sort_order_: 1
+  export_in_record_pre_reset: true
+  export_in_close: false
+  dataset_compression: true
+observations:
+  policy:
+    concatenate_terms: true
+    concatenate_dim: -1
+    enable_corruption: true
+    history_length: null
+    flatten_history_dim: true
+    object_quat_b:
+      func: isaaclab_tasks.core.dexsuite.mdp.observations:object_quat_b
+      params: {}
+      modifiers: null
+      noise:
+        func: isaaclab.utils.noise.noise_model:uniform_noise
+        operation: add
+        n_min: -0.0
+        n_max: 0.0
+      clip: null
+      scale: null
+      history_length: 0
+      flatten_history_dim: true
+    target_object_pose_b:
+      func: isaaclab.envs.mdp.observations:generated_commands
+      params:
+        command_name: object_pose
+      modifiers: null
+      noise: null
+      clip: null
+      scale: null
+      history_length: 0
+      flatten_history_dim: true
+    actions:
+      func: isaaclab.envs.mdp.observations:last_action
+      params: {}
+      modifiers: null
+      noise: null
+      clip: null
+      scale: null
+      history_length: 0
+      flatten_history_dim: true
+  proprio:
+    concatenate_terms: true
+    concatenate_dim: -1
+    enable_corruption: true
+    history_length: null
+    flatten_history_dim: true
+    contact:
+      func: isaaclab_tasks.core.dexsuite.mdp.observations:fingers_contact_force_b
+      params:
+        contact_sensor_names:
+        - index_link_3_object_s
+        - middle_link_3_object_s
+        - ring_link_3_object_s
+        - thumb_link_3_object_s
+      modifiers: null
+      noise: null
+      clip:
+      - -20.0
+      - 20.0
+      scale: null
+      history_length: 0
+      flatten_history_dim: true
+    joint_pos:
+      func: isaaclab.envs.mdp.observations:joint_pos
+      params: {}
+      modifiers: null
+      noise:
+        func: isaaclab.utils.noise.noise_model:uniform_noise
+        operation: add
+        n_min: -0.0
+        n_max: 0.0
+      clip: null
+      scale: null
+      history_length: 0
+      flatten_history_dim: true
+    joint_vel:
+      func: isaaclab.envs.mdp.observations:joint_vel
+      params: {}
+      modifiers: null
+      noise:
+        func: isaaclab.utils.noise.noise_model:uniform_noise
+        operation: add
+        n_min: -0.0
+        n_max: 0.0
+      clip: null
+      scale: null
+      history_length: 0
+      flatten_history_dim: true
+    hand_tips_state_b:
+      func: isaaclab_tasks.core.dexsuite.mdp.observations:body_state_b
+      params:
+        body_asset_cfg:
+          name: robot
+          joint_names: null
+          joint_ids:
+            start: null
+            stop: null
+            step: null
+          fixed_tendon_names: null
+          fixed_tendon_ids:
+            start: null
+            stop: null
+            step: null
+          body_names:
+          - palm_link
+          - .*_tip
+          body_ids:
+            start: null
+            stop: null
+            step: null
+          object_collection_names: null
+          object_collection_ids:
+            start: null
+            stop: null
+            step: null
+          preserve_order: false
+        base_asset_cfg:
+          name: robot
+          joint_names: null
+          joint_ids:
+            start: null
+            stop: null
+            step: null
+          fixed_tendon_names: null
+          fixed_tendon_ids:
+            start: null
+            stop: null
+            step: null
+          body_names: null
+          body_ids:
+            start: null
+            stop: null
+            step: null
+          object_collection_names: null
+          object_collection_ids:
+            start: null
+            stop: null
+            step: null
+          preserve_order: false
+      modifiers: null
+      noise:
+        func: isaaclab.utils.noise.noise_model:uniform_noise
+        operation: add
+        n_min: -0.0
+        n_max: 0.0
+      clip:
+      - -2.0
+      - 2.0
+      scale: null
+      history_length: 0
+      flatten_history_dim: true
+  perception:
+    concatenate_terms: true
+    concatenate_dim: 0
+    enable_corruption: true
+    history_length: null
+    flatten_history_dim: true
+    object_point_cloud:
+      func: isaaclab_tasks.core.dexsuite.mdp.observations:object_point_cloud_b
+      params:
+        num_points: 64
+        flatten: true
+      modifiers: null
+      noise:
+        func: isaaclab.utils.noise.noise_model:uniform_noise
+        operation: add
+        n_min: -0.0
+        n_max: 0.0
+      clip:
+      - -2.0
+      - 2.0
+      scale: null
+      history_length: 0
+      flatten_history_dim: true
+  base_image:
+    concatenate_terms: true
+    concatenate_dim: -1
+    enable_corruption: false
+    history_length: null
+    flatten_history_dim: true
+    object_observation_b:
+      func: isaaclab_tasks.core.dexsuite.mdp.observations:vision_camera
+      params:
+        sensor_cfg:
+          name: base_camera
+          joint_names: null
+          joint_ids:
+            start: null
+            stop: null
+            step: null
+          fixed_tendon_names: null
+          fixed_tendon_ids:
+            start: null
+            stop: null
+            step: null
+          body_names: null
+          body_ids:
+            start: null
+            stop: null
+            step: null
+          object_collection_names: null
+          object_collection_ids:
+            start: null
+            stop: null
+            step: null
+          preserve_order: false
+      modifiers: null
+      noise:
+        func: isaaclab.utils.noise.noise_model:uniform_noise
+        operation: add
+        n_min: -0.0
+        n_max: 0.0
+      clip:
+      - -1.0
+      - 1.0
+      scale: null
+      history_length: 0
+      flatten_history_dim: true
+actions:
+  action:
+    class_type: isaaclab.envs.mdp.actions.joint_actions:RelativeJointPositionAction
+    asset_name: robot
+    debug_vis: false
+    clip: null
+    joint_names:
+    - .*
+    scale: 0.1
+    offset: 0.0
+    preserve_order: false
+    use_zero_offset: true
+events:
+  robot_physics_material:
+    func: isaaclab.envs.mdp.events:randomize_rigid_body_material
+    params:
+      asset_cfg:
+        name: robot
+        joint_names: null
+        joint_ids:
+          start: null
+          stop: null
+          step: null
+        fixed_tendon_names: null
+        fixed_tendon_ids:
+          start: null
+          stop: null
+          step: null
+        body_names: .*
+        body_ids:
+          start: null
+          stop: null
+          step: null
+        object_collection_names: null
+        object_collection_ids:
+          start: null
+          stop: null
+          step: null
+        preserve_order: false
+      static_friction_range:
+      - 0.5
+      - 1.0
+      dynamic_friction_range:
+      - 0.5
+      - 1.0
+      restitution_range:
+      - 0.0
+      - 0.0
+      num_buckets: 250
+    mode: startup
+    interval_range_s: null
+    is_global_time: false
+    resample_interval_on_reset: true
+    min_step_count_between_reset: 0
+  object_physics_material:
+    func: isaaclab.envs.mdp.events:randomize_rigid_body_material
+    params:
+      asset_cfg:
+        name: object
+        joint_names: null
+        joint_ids:
+          start: null
+          stop: null
+          step: null
+        fixed_tendon_names: null
+        fixed_tendon_ids:
+          start: null
+          stop: null
+          step: null
+        body_names: .*
+        body_ids:
+          start: null
+          stop: null
+          step: null
+        object_collection_names: null
+        object_collection_ids:
+          start: null
+          stop: null
+          step: null
+        preserve_order: false
+      static_friction_range:
+      - 0.5
+      - 1.0
+      dynamic_friction_range:
+      - 0.5
+      - 1.0
+      restitution_range:
+      - 0.0
+      - 0.0
+      num_buckets: 250
+    mode: startup
+    interval_range_s: null
+    is_global_time: false
+    resample_interval_on_reset: true
+    min_step_count_between_reset: 0
+  object_physics_inertia:
+    func: isaaclab.envs.mdp.events:randomize_rigid_body_inertia
+    params:
+      asset_cfg:
+        name: object
+        joint_names: null
+        joint_ids:
+          start: null
+          stop: null
+          step: null
+        fixed_tendon_names: null
+        fixed_tendon_ids:
+          start: null
+          stop: null
+          step: null
+        body_names: null
+        body_ids:
+          start: null
+          stop: null
+          step: null
+        object_collection_names: null
+        object_collection_ids:
+          start: null
+          stop: null
+          step: null
+        preserve_order: false
+      inertia_distribution_params:
+      - 0.01
+      - 0.01
+      operation: add
+      diagonal_only: true
+    mode: startup
+    interval_range_s: null
+    is_global_time: false
+    resample_interval_on_reset: true
+    min_step_count_between_reset: 0
+  joint_stiffness_and_damping:
+    func: isaaclab.envs.mdp.events:randomize_actuator_gains
+    params:
+      asset_cfg:
+        name: robot
+        joint_names: .*
+        joint_ids:
+          start: null
+          stop: null
+          step: null
+        fixed_tendon_names: null
+        fixed_tendon_ids:
+          start: null
+          stop: null
+          step: null
+        body_names: null
+        body_ids:
+          start: null
+          stop: null
+          step: null
+        object_collection_names: null
+        object_collection_ids:
+          start: null
+          stop: null
+          step: null
+        preserve_order: false
+      stiffness_distribution_params:
+      - 0.5
+      - 2.0
+      damping_distribution_params:
+      - 0.5
+      - 2.0
+      operation: scale
+    mode: startup
+    interval_range_s: null
+    is_global_time: false
+    resample_interval_on_reset: true
+    min_step_count_between_reset: 0
+  joint_friction:
+    func: isaaclab.envs.mdp.events:randomize_joint_parameters
+    params:
+      asset_cfg:
+        name: robot
+        joint_names: .*
+        joint_ids:
+          start: null
+          stop: null
+          step: null
+        fixed_tendon_names: null
+        fixed_tendon_ids:
+          start: null
+          stop: null
+          step: null
+        body_names: null
+        body_ids:
+          start: null
+          stop: null
+          step: null
+        object_collection_names: null
+        object_collection_ids:
+          start: null
+          stop: null
+          step: null
+        preserve_order: false
+      friction_distribution_params:
+      - 0.0
+      - 5.0
+      operation: scale
+    mode: startup
+    interval_range_s: null
+    is_global_time: false
+    resample_interval_on_reset: true
+    min_step_count_between_reset: 0
+  object_scale_mass:
+    func: isaaclab.envs.mdp.events:randomize_rigid_body_mass
+    params:
+      asset_cfg:
+        name: object
+        joint_names: null
+        joint_ids:
+          start: null
+          stop: null
+          step: null
+        fixed_tendon_names: null
+        fixed_tendon_ids:
+          start: null
+          stop: null
+          step: null
+        body_names: null
+        body_ids:
+          start: null
+          stop: null
+          step: null
+        object_collection_names: null
+        object_collection_ids:
+          start: null
+          stop: null
+          step: null
+        preserve_order: false
+      mass_distribution_params:
+      - 0.2
+      - 2.0
+      operation: scale
+    mode: startup
+    interval_range_s: null
+    is_global_time: false
+    resample_interval_on_reset: true
+    min_step_count_between_reset: 0
+  variable_gravity:
+    func: isaaclab.envs.mdp.events:randomize_physics_scene_gravity
+    params:
+      gravity_distribution_params:
+      - - 0.0
+        - 0.0
+        - 0.0
+      - - 0.0
+        - 0.0
+        - 0.0
+      operation: abs
+    mode: reset
+    interval_range_s: null
+    is_global_time: false
+    resample_interval_on_reset: true
+    min_step_count_between_reset: 0
+  reset_object:
+    func: isaaclab.envs.mdp.events:reset_root_state_uniform
+    params:
+      pose_range:
+        x:
+        - -0.2
+        - 0.2
+        y:
+        - -0.2
+        - 0.2
+        z:
+        - 0.0
+        - 0.4
+        roll:
+        - -3.14
+        - 3.14
+        pitch:
+        - -3.14
+        - 3.14
+        yaw:
+        - -3.14
+        - 3.14
+      velocity_range:
+        x:
+        - -0.0
+        - 0.0
+        y:
+        - -0.0
+        - 0.0
+        z:
+        - -0.0
+        - 0.0
+      asset_cfg:
+        name: object
+        joint_names: null
+        joint_ids:
+          start: null
+          stop: null
+          step: null
+        fixed_tendon_names: null
+        fixed_tendon_ids:
+          start: null
+          stop: null
+          step: null
+        body_names: null
+        body_ids:
+          start: null
+          stop: null
+          step: null
+        object_collection_names: null
+        object_collection_ids:
+          start: null
+          stop: null
+          step: null
+        preserve_order: false
+    mode: reset
+    interval_range_s: null
+    is_global_time: false
+    resample_interval_on_reset: true
+    min_step_count_between_reset: 0
+  reset_root:
+    func: isaaclab.envs.mdp.events:reset_root_state_uniform
+    params:
+      pose_range:
+        x:
+        - -0.0
+        - 0.0
+        y:
+        - -0.0
+        - 0.0
+        yaw:
+        - -0.0
+        - 0.0
+      velocity_range:
+        x:
+        - -0.0
+        - 0.0
+        y:
+        - -0.0
+        - 0.0
+        z:
+        - -0.0
+        - 0.0
+      asset_cfg:
+        name: robot
+        joint_names: null
+        joint_ids:
+          start: null
+          stop: null
+          step: null
+        fixed_tendon_names: null
+        fixed_tendon_ids:
+          start: null
+          stop: null
+          step: null
+        body_names: null
+        body_ids:
+          start: null
+          stop: null
+          step: null
+        object_collection_names: null
+        object_collection_ids:
+          start: null
+          stop: null
+          step: null
+        preserve_order: false
+    mode: reset
+    interval_range_s: null
+    is_global_time: false
+    resample_interval_on_reset: true
+    min_step_count_between_reset: 0
+  reset_robot_joints:
+    func: isaaclab.envs.mdp.events:reset_joints_by_offset
+    params:
+      position_range:
+      - -0.5
+      - 0.5
+      velocity_range:
+      - 0.0
+      - 0.0
+    mode: reset
+    interval_range_s: null
+    is_global_time: false
+    resample_interval_on_reset: true
+    min_step_count_between_reset: 0
+  reset_robot_wrist_joint:
+    func: isaaclab.envs.mdp.events:reset_joints_by_offset
+    params:
+      asset_cfg:
+        name: robot
+        joint_names: iiwa7_joint_7
+        joint_ids:
+          start: null
+          stop: null
+          step: null
+        fixed_tendon_names: null
+        fixed_tendon_ids:
+          start: null
+          stop: null
+          step: null
+        body_names: null
+        body_ids:
+          start: null
+          stop: null
+          step: null
+        object_collection_names: null
+        object_collection_ids:
+          start: null
+          stop: null
+          step: null
+        preserve_order: false
+      position_range:
+      - -3
+      - 3
+      velocity_range:
+      - 0.0
+      - 0.0
+    mode: reset
+    interval_range_s: null
+    is_global_time: false
+    resample_interval_on_reset: true
+    min_step_count_between_reset: 0
+rerender_on_reset: false
+num_rerenders_on_reset: 0
+wait_for_textures: true
+xr: null
+teleop_devices:
+  devices: {}
+isaac_teleop: null
+export_io_descriptors: false
+log_dir: null
+video_recorder:
+  class_type: isaaclab.envs.utils.video_recorder:VideoRecorder
+  env_render_mode: null
+  eye:
+  - -2.25
+  - 0.0
+  - 0.75
+  lookat:
+  - 0.0
+  - 0.0
+  - 0.45
+  backend_source: visualizer
+  window_width: 1280
+  window_height: 720
+commands:
+  object_pose:
+    class_type: isaaclab_tasks.core.dexsuite.mdp.commands.pose_commands:ObjectUniformPoseCommand
+    resampling_time_range:
+    - 2.0
+    - 3.0
+    debug_vis: false
+    cmd_kind: null
+    element_names: null
+    asset_name: robot
+    object_name: object
+    make_quat_unique: false
+    ranges:
+      pos_x:
+      - -0.7
+      - -0.3
+      pos_y:
+      - -0.25
+      - 0.25
+      pos_z:
+      - 0.55
+      - 0.95
+      roll:
+      - -3.14
+      - 3.14
+      pitch:
+      - -3.14
+      - 3.14
+      yaw:
+      - 0.0
+      - 0.0
+    position_only: true
+    goal_pose_visualizer_cfg:
+      prim_path: /Visuals/Command/goal_pose
+      markers:
+        frame:
+          func: isaaclab.sim.spawners.from_files.from_files:spawn_from_usd
+          visible: true
+          semantic_tags: null
+          copy_from_source: true
+          spawn_path: null
+          mass_props: null
+          deformable_props: null
+          rigid_props: null
+          collision_props: null
+          activate_contact_sensors: false
+          scale:
+          - 0.1
+          - 0.1
+          - 0.1
+          articulation_props: null
+          fixed_tendons_props: null
+          spatial_tendons_props: null
+          joint_drive_props: null
+          visual_material_path: material
+          visual_material: null
+          physics_material_path: material
+          physics_material: null
+          usd_path: https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/6.0/Isaac/Props/UIElements/frame_prim.usd
+          variants: null
+        position_far:
+          func: isaaclab.sim.spawners.shapes.shapes:spawn_sphere
+          visible: true
+          semantic_tags: null
+          copy_from_source: true
+          spawn_path: null
+          mass_props: null
+          rigid_props: null
+          collision_props: null
+          activate_contact_sensors: false
+          visual_material_path: material
+          visual_material:
+            func: isaaclab.sim.spawners.materials.visual_materials:spawn_preview_surface
+            diffuse_color:
+            - 1.0
+            - 0.0
+            - 0.0
+            emissive_color:
+            - 0.0
+            - 0.0
+            - 0.0
+            roughness: 0.5
+            metallic: 0.0
+            opacity: 1.0
+          physics_material_path: material
+          physics_material: null
+          radius: 0.01
+        position_near:
+          func: isaaclab.sim.spawners.shapes.shapes:spawn_sphere
+          visible: true
+          semantic_tags: null
+          copy_from_source: true
+          spawn_path: null
+          mass_props: null
+          rigid_props: null
+          collision_props: null
+          activate_contact_sensors: false
+          visual_material_path: material
+          visual_material:
+            func: isaaclab.sim.spawners.materials.visual_materials:spawn_preview_surface
+            diffuse_color:
+            - 0.0
+            - 1.0
+            - 0.0
+            emissive_color:
+            - 0.0
+            - 0.0
+            - 0.0
+            roughness: 0.5
+            metallic: 0.0
+            opacity: 1.0
+          physics_material_path: material
+          physics_material: null
+          radius: 0.01
+      class_type: isaaclab.markers.visualization_markers:VisualizationMarkers
+    curr_pose_visualizer_cfg:
+      prim_path: /Visuals/Command/body_pose
+      markers:
+        frame:
+          func: isaaclab.sim.spawners.from_files.from_files:spawn_from_usd
+          visible: true
+          semantic_tags: null
+          copy_from_source: true
+          spawn_path: null
+          mass_props: null
+          deformable_props: null
+          rigid_props: null
+          collision_props: null
+          activate_contact_sensors: false
+          scale:
+          - 0.1
+          - 0.1
+          - 0.1
+          articulation_props: null
+          fixed_tendons_props: null
+          spatial_tendons_props: null
+          joint_drive_props: null
+          visual_material_path: material
+          visual_material: null
+          physics_material_path: material
+          physics_material: null
+          usd_path: https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/6.0/Isaac/Props/UIElements/frame_prim.usd
+          variants: null
+        position_far:
+          func: isaaclab.sim.spawners.shapes.shapes:spawn_sphere
+          visible: true
+          semantic_tags: null
+          copy_from_source: true
+          spawn_path: null
+          mass_props: null
+          rigid_props: null
+          collision_props: null
+          activate_contact_sensors: false
+          visual_material_path: material
+          visual_material:
+            func: isaaclab.sim.spawners.materials.visual_materials:spawn_preview_surface
+            diffuse_color:
+            - 1.0
+            - 0.0
+            - 0.0
+            emissive_color:
+            - 0.0
+            - 0.0
+            - 0.0
+            roughness: 0.5
+            metallic: 0.0
+            opacity: 1.0
+          physics_material_path: material
+          physics_material: null
+          radius: 0.01
+        position_near:
+          func: isaaclab.sim.spawners.shapes.shapes:spawn_sphere
+          visible: true
+          semantic_tags: null
+          copy_from_source: true
+          spawn_path: null
+          mass_props: null
+          rigid_props: null
+          collision_props: null
+          activate_contact_sensors: false
+          visual_material_path: material
+          visual_material:
+            func: isaaclab.sim.spawners.materials.visual_materials:spawn_preview_surface
+            diffuse_color:
+            - 0.0
+            - 1.0
+            - 0.0
+            emissive_color:
+            - 0.0
+            - 0.0
+            - 0.0
+            roughness: 0.5
+            metallic: 0.0
+            opacity: 1.0
+          physics_material_path: material
+          physics_material: null
+          radius: 0.01
+      class_type: isaaclab.markers.visualization_markers:VisualizationMarkers
+    success_vis_asset_name: table
+    success_visualizer_cfg:
+      prim_path: /Visuals/SuccessMarkers
+      markers:
+        failure:
+          func: isaaclab.sim.spawners.shapes.shapes:spawn_cuboid
+          visible: true
+          semantic_tags: null
+          copy_from_source: true
+          spawn_path: null
+          mass_props: null
+          rigid_props:
+            rigid_body_enabled: null
+            kinematic_enabled: true
+            disable_gravity: null
+            linear_damping: null
+            angular_damping: null
+            max_linear_velocity: null
+            max_angular_velocity: null
+            max_depenetration_velocity: null
+            max_contact_impulse: null
+            enable_gyroscopic_forces: null
+            retain_accelerations: null
+            solver_position_iteration_count: null
+            solver_velocity_iteration_count: null
+            sleep_threshold: null
+            stabilization_threshold: null
+            _usd_applied_schema: PhysxRigidBodyAPI
+            _usd_field_exceptions:
+              PhysxRigidBodyAPI:
+              - physxRigidBody
+              - - disable_gravity
+            _usd_namespace: physxRigidBody
+          collision_props:
+            collision_enabled: null
+            contact_offset: null
+            rest_offset: null
+            torsional_patch_radius: null
+            min_torsional_patch_radius: null
+            _usd_applied_schema: PhysxCollisionAPI
+            _usd_field_exceptions:
+              PhysxCollisionAPI:
+              - physxCollision
+              - - contact_offset
+                - rest_offset
+            _usd_namespace: physxCollision
+          activate_contact_sensors: false
+          visual_material_path: material
+          visual_material:
+            func: isaaclab.sim.spawners.materials.visual_materials:spawn_preview_surface
+            diffuse_color:
+            - 0.25
+            - 0.15
+            - 0.15
+            emissive_color:
+            - 0.0
+            - 0.0
+            - 0.0
+            roughness: 0.5
+            metallic: 0.0
+            opacity: 1.0
+          physics_material_path: material
+          physics_material: null
+          size:
+          - 0.8
+          - 1.5
+          - 0.04
+        success:
+          func: isaaclab.sim.spawners.shapes.shapes:spawn_cuboid
+          visible: true
+          semantic_tags: null
+          copy_from_source: true
+          spawn_path: null
+          mass_props: null
+          rigid_props:
+            rigid_body_enabled: null
+            kinematic_enabled: true
+            disable_gravity: null
+            linear_damping: null
+            angular_damping: null
+            max_linear_velocity: null
+            max_angular_velocity: null
+            max_depenetration_velocity: null
+            max_contact_impulse: null
+            enable_gyroscopic_forces: null
+            retain_accelerations: null
+            solver_position_iteration_count: null
+            solver_velocity_iteration_count: null
+            sleep_threshold: null
+            stabilization_threshold: null
+            _usd_applied_schema: PhysxRigidBodyAPI
+            _usd_field_exceptions:
+              PhysxRigidBodyAPI:
+              - physxRigidBody
+              - - disable_gravity
+            _usd_namespace: physxRigidBody
+          collision_props:
+            collision_enabled: null
+            contact_offset: null
+            rest_offset: null
+            torsional_patch_radius: null
+            min_torsional_patch_radius: null
+            _usd_applied_schema: PhysxCollisionAPI
+            _usd_field_exceptions:
+              PhysxCollisionAPI:
+              - physxCollision
+              - - contact_offset
+                - rest_offset
+            _usd_namespace: physxCollision
+          activate_contact_sensors: false
+          visual_material_path: material
+          visual_material:
+            func: isaaclab.sim.spawners.materials.visual_materials:spawn_preview_surface
+            diffuse_color:
+            - 0.15
+            - 0.25
+            - 0.15
+            emissive_color:
+            - 0.0
+            - 0.0
+            - 0.0
+            roughness: 0.5
+            metallic: 0.0
+            opacity: 1.0
+          physics_material_path: material
+          physics_material: null
+          size:
+          - 0.8
+          - 1.5
+          - 0.04
+      class_type: isaaclab.markers.visualization_markers:VisualizationMarkers
+    body_name: palm_link
+rewards:
+  action_l2:
+    func: isaaclab_tasks.core.dexsuite.mdp.rewards:action_l2_clamped
+    params: {}
+    weight: -0.005
+  action_rate_l2:
+    func: isaaclab_tasks.core.dexsuite.mdp.rewards:action_rate_l2_clamped
+    params: {}
+    weight: -0.005
+  fingers_to_object:
+    func: isaaclab_tasks.core.dexsuite.mdp.rewards:object_ee_distance
+    params:
+      std: 0.4
+      asset_cfg:
+        name: robot
+        joint_names: null
+        joint_ids:
+          start: null
+          stop: null
+          step: null
+        fixed_tendon_names: null
+        fixed_tendon_ids:
+          start: null
+          stop: null
+          step: null
+        body_names:
+        - palm_link
+        - .*_tip
+        body_ids:
+          start: null
+          stop: null
+          step: null
+        object_collection_names: null
+        object_collection_ids:
+          start: null
+          stop: null
+          step: null
+        preserve_order: false
+      thumb_name: thumb_link_3_object_s
+      finger_names:
+      - index_link_3_object_s
+      - middle_link_3_object_s
+      - ring_link_3_object_s
+    weight: 1.0
+  position_tracking:
+    func: isaaclab_tasks.core.dexsuite.mdp.rewards:position_command_error_tanh
+    params:
+      asset_cfg:
+        name: robot
+        joint_names: null
+        joint_ids:
+          start: null
+          stop: null
+          step: null
+        fixed_tendon_names: null
+        fixed_tendon_ids:
+          start: null
+          stop: null
+          step: null
+        body_names: null
+        body_ids:
+          start: null
+          stop: null
+          step: null
+        object_collection_names: null
+        object_collection_ids:
+          start: null
+          stop: null
+          step: null
+        preserve_order: false
+      std: 0.2
+      command_name: object_pose
+      align_asset_cfg:
+        name: object
+        joint_names: null
+        joint_ids:
+          start: null
+          stop: null
+          step: null
+        fixed_tendon_names: null
+        fixed_tendon_ids:
+          start: null
+          stop: null
+          step: null
+        body_names: null
+        body_ids:
+          start: null
+          stop: null
+          step: null
+        object_collection_names: null
+        object_collection_ids:
+          start: null
+          stop: null
+          step: null
+        preserve_order: false
+      thumb_name: thumb_link_3_object_s
+      finger_names:
+      - index_link_3_object_s
+      - middle_link_3_object_s
+      - ring_link_3_object_s
+    weight: 2.0
+  orientation_tracking: null
+  success:
+    func: isaaclab_tasks.core.dexsuite.mdp.rewards:success_reward
+    params:
+      asset_cfg:
+        name: robot
+        joint_names: null
+        joint_ids:
+          start: null
+          stop: null
+          step: null
+        fixed_tendon_names: null
+        fixed_tendon_ids:
+          start: null
+          stop: null
+          step: null
+        body_names: null
+        body_ids:
+          start: null
+          stop: null
+          step: null
+        object_collection_names: null
+        object_collection_ids:
+          start: null
+          stop: null
+          step: null
+        preserve_order: false
+      pos_std: 0.1
+      rot_std: null
+      command_name: object_pose
+      align_asset_cfg:
+        name: object
+        joint_names: null
+        joint_ids:
+          start: null
+          stop: null
+          step: null
+        fixed_tendon_names: null
+        fixed_tendon_ids:
+          start: null
+          stop: null
+          step: null
+        body_names: null
+        body_ids:
+          start: null
+          stop: null
+          step: null
+        object_collection_names: null
+        object_collection_ids:
+          start: null
+          stop: null
+          step: null
+        preserve_order: false
+      thumb_name: thumb_link_3_object_s
+      finger_names:
+      - index_link_3_object_s
+      - middle_link_3_object_s
+      - ring_link_3_object_s
+    weight: 10
+  early_termination:
+    func: isaaclab.envs.mdp.rewards:is_terminated_term
+    params:
+      term_keys: abnormal_robot
+    weight: -1
+  good_finger_contact:
+    func: isaaclab_tasks.core.dexsuite.mdp.rewards:contacts
+    params:
+      threshold: 0.1
+      thumb_name: thumb_link_3_object_s
+      finger_names:
+      - index_link_3_object_s
+      - middle_link_3_object_s
+      - ring_link_3_object_s
+    weight: 0.5
+  contact_count:
+    func: isaaclab_tasks.core.dexsuite.mdp.rewards:contact_count
+    params:
+      threshold: 0.01
+      sensor_names:
+      - index_link_3_object_s
+      - middle_link_3_object_s
+      - ring_link_3_object_s
+      - thumb_link_3_object_s
+    weight: 1.0
+terminations:
+  time_out:
+    func: isaaclab.envs.mdp.terminations:time_out
+    params: {}
+    time_out: true
+  object_out_of_bound:
+    func: isaaclab_tasks.core.dexsuite.mdp.terminations:out_of_bound
+    params:
+      in_bound_range:
+        x:
+        - -1.5
+        - 0.5
+        y:
+        - -2.0
+        - 2.0
+        z:
+        - 0.0
+        - 2.0
+      asset_cfg:
+        name: object
+        joint_names: null
+        joint_ids:
+          start: null
+          stop: null
+          step: null
+        fixed_tendon_names: null
+        fixed_tendon_ids:
+          start: null
+          stop: null
+          step: null
+        body_names: null
+        body_ids:
+          start: null
+          stop: null
+          step: null
+        object_collection_names: null
+        object_collection_ids:
+          start: null
+          stop: null
+          step: null
+        preserve_order: false
+    time_out: false
+  abnormal_robot:
+    func: isaaclab_tasks.core.dexsuite.mdp.terminations:abnormal_robot_state
+    params: {}
+    time_out: false
+curriculum:
+  adr:
+    func: isaaclab_tasks.core.dexsuite.mdp.curriculums:DifficultyScheduler
+    params:
+      init_difficulty: 0
+      min_difficulty: 0
+      max_difficulty: 10
+  joint_pos_unoise_min_adr:
+    func: isaaclab.envs.mdp.curriculums:modify_term_cfg
+    params:
+      address: observations.proprio.joint_pos.noise.n_min
+      modify_fn: isaaclab_tasks.core.dexsuite.mdp.curriculums:initial_final_interpolate_fn
+      modify_params:
+        initial_value: 0.0
+        final_value: -0.1
+        difficulty_term_str: adr
+  joint_pos_unoise_max_adr:
+    func: isaaclab.envs.mdp.curriculums:modify_term_cfg
+    params:
+      address: observations.proprio.joint_pos.noise.n_max
+      modify_fn: isaaclab_tasks.core.dexsuite.mdp.curriculums:initial_final_interpolate_fn
+      modify_params:
+        initial_value: 0.0
+        final_value: 0.1
+        difficulty_term_str: adr
+  joint_vel_unoise_min_adr:
+    func: isaaclab.envs.mdp.curriculums:modify_term_cfg
+    params:
+      address: observations.proprio.joint_vel.noise.n_min
+      modify_fn: isaaclab_tasks.core.dexsuite.mdp.curriculums:initial_final_interpolate_fn
+      modify_params:
+        initial_value: 0.0
+        final_value: -0.2
+        difficulty_term_str: adr
+  joint_vel_unoise_max_adr:
+    func: isaaclab.envs.mdp.curriculums:modify_term_cfg
+    params:
+      address: observations.proprio.joint_vel.noise.n_max
+      modify_fn: isaaclab_tasks.core.dexsuite.mdp.curriculums:initial_final_interpolate_fn
+      modify_params:
+        initial_value: 0.0
+        final_value: 0.2
+        difficulty_term_str: adr
+  hand_tips_pos_unoise_min_adr:
+    func: isaaclab.envs.mdp.curriculums:modify_term_cfg
+    params:
+      address: observations.proprio.hand_tips_state_b.noise.n_min
+      modify_fn: isaaclab_tasks.core.dexsuite.mdp.curriculums:initial_final_interpolate_fn
+      modify_params:
+        initial_value: 0.0
+        final_value: -0.01
+        difficulty_term_str: adr
+  hand_tips_pos_unoise_max_adr:
+    func: isaaclab.envs.mdp.curriculums:modify_term_cfg
+    params:
+      address: observations.proprio.hand_tips_state_b.noise.n_max
+      modify_fn: isaaclab_tasks.core.dexsuite.mdp.curriculums:initial_final_interpolate_fn
+      modify_params:
+        initial_value: 0.0
+        final_value: 0.01
+        difficulty_term_str: adr
+  object_quat_unoise_min_adr:
+    func: isaaclab.envs.mdp.curriculums:modify_term_cfg
+    params:
+      address: observations.policy.object_quat_b.noise.n_min
+      modify_fn: isaaclab_tasks.core.dexsuite.mdp.curriculums:initial_final_interpolate_fn
+      modify_params:
+        initial_value: 0.0
+        final_value: -0.03
+        difficulty_term_str: adr
+  object_quat_unoise_max_adr:
+    func: isaaclab.envs.mdp.curriculums:modify_term_cfg
+    params:
+      address: observations.policy.object_quat_b.noise.n_max
+      modify_fn: isaaclab_tasks.core.dexsuite.mdp.curriculums:initial_final_interpolate_fn
+      modify_params:
+        initial_value: 0.0
+        final_value: 0.03
+        difficulty_term_str: adr
+  object_obs_unoise_min_adr:
+    func: isaaclab.envs.mdp.curriculums:modify_term_cfg
+    params:
+      address: observations.perception.object_point_cloud.noise.n_min
+      modify_fn: isaaclab_tasks.core.dexsuite.mdp.curriculums:initial_final_interpolate_fn
+      modify_params:
+        initial_value: 0.0
+        final_value: -0.01
+        difficulty_term_str: adr
+  object_obs_unoise_max_adr:
+    func: isaaclab.envs.mdp.curriculums:modify_term_cfg
+    params:
+      address: observations.perception.object_point_cloud.noise.n_max
+      modify_fn: isaaclab_tasks.core.dexsuite.mdp.curriculums:initial_final_interpolate_fn
+      modify_params:
+        initial_value: 0.0
+        final_value: -0.01
+        difficulty_term_str: adr
+  gravity_adr:
+    func: isaaclab.envs.mdp.curriculums:modify_term_cfg
+    params:
+      address: events.variable_gravity.params.gravity_distribution_params
+      modify_fn: isaaclab_tasks.core.dexsuite.mdp.curriculums:initial_final_interpolate_fn
+      modify_params:
+        initial_value:
+        - - 0.0
+          - 0.0
+          - 0.0
+        - - 0.0
+          - 0.0
+          - 0.0
+        final_value:
+        - - 0.0
+          - 0.0
+          - -9.81
+        - - 0.0
+          - 0.0
+          - -9.81
+        difficulty_term_str: adr
+episode_length_s: 6.0
+is_finite_horizon: false
