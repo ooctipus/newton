@@ -19,6 +19,7 @@ import numpy as np
 import warp as wp
 from clone_plan import SiteRequest
 from newton import ModelBuilder, solvers
+from newton._src.geometry.types import GeoType
 from newton._src.usd.schemas import SchemaResolverNewton, SchemaResolverPhysx
 
 from pxr import Usd
@@ -128,6 +129,67 @@ def rename_builder_labels(
             _rename_pair(attr.values, world_attr.values)
 
 
+_HULL_SDF_RES = 64
+
+
+def _enable_convex_sdf(builder: ModelBuilder, res: int = _HULL_SDF_RES) -> None:
+    """Bake a texture SDF on already-approximated convex hulls and boxes.
+
+    Run after ``add_usd`` so the shapes are already ``GeoType.CONVEX_MESH``/``BOX``
+    and never re-enter ``approximate_meshes`` (which refuses to carry an SDF through
+    remeshing). The resolution is consumed by ``finalize``'s deferred SDF build,
+    routing these shapes through the planar-SDF contact kernel instead of GJK/MPR.
+    Robot hulls (convex hulls with no authored SDF) and static boxes are enabled;
+    nut/bolt thread meshes keep their own SDF and are left untouched.
+    """
+    for i, stype in enumerate(builder.shape_type):
+        if stype == GeoType.CONVEX_MESH:
+            src = builder.shape_source[i]
+            if src is not None and getattr(src, "sdf", None) is None:
+                builder.shape_sdf_max_resolution[i] = res
+        elif stype == GeoType.BOX:
+            builder.shape_sdf_max_resolution[i] = res
+
+
+_THREAD_GROUP = 1000
+
+
+def _isolate_thread_add_hull(proto: ModelBuilder) -> list[int]:
+    """PROTOTYPE (repro-only): isolate the nut/bolt thread collision meshes into a private
+    mate group and add a massless convex-hull outer to each for its world contacts.
+
+    Returns ALL new hulls' proto-local shape indices (the nut and bolt threads can live in
+    the same proto). Hacky stand-in for a coarse collider; the Lab version authors the hull.
+    """
+    hull_locals: list[int] = []
+    for i in range(len(proto.shape_type)):
+        if proto.shape_type[i] != GeoType.MESH:
+            continue
+        lo = (proto.shape_label[i] or "").lower()
+        if ("bolt" not in lo and "nut" not in lo) or "collision" not in lo:
+            continue
+        src = proto.shape_source[i]
+        if src is None:
+            continue
+        # mate: thread collides only with the other thread (same private group), out of world.
+        proto.shape_collision_group[i] = _THREAD_GROUP
+        # coarse outer: a massless convex hull handles all non-mate (world) contacts.
+        hull = src.compute_convex_hull()
+        hull_locals.append(
+            proto.add_shape_convex_hull(
+                body=proto.shape_body[i],
+                xform=proto.shape_transform[i],
+                scale=proto.shape_scale[i],
+                mesh=hull,
+                cfg=ModelBuilder.ShapeConfig(
+                    density=0.0, gap=proto.shape_gap[i], margin=proto.shape_margin[i]
+                ),
+                label=(proto.shape_label[i] or "thread") + "/coarse_hull",
+            )
+        )
+    return hull_locals
+
+
 def build_and_label(
     stage: Usd.Stage,
     sources: Sequence[str],
@@ -165,9 +227,11 @@ def build_and_label(
         if hasattr(builder.default_shape_cfg, key):
             setattr(builder.default_shape_cfg, key, value)
     stage_info = builder.add_usd(stage, ignore_paths=["/World/envs", *sources], schema_resolvers=schema_resolvers)
+    _enable_convex_sdf(builder)
 
     env0_pos = positions_arr[0]
     protos: dict[str, ModelBuilder] = {}
+    proto_hull_local: dict[str, list[int]] = {}
     for src_path in sources:
         proto = ModelBuilder(up_axis=up_axis)
         for key, value in shape_cfg_overrides.items():
@@ -181,11 +245,16 @@ def build_and_label(
             skip_mesh_approximation=False,
             schema_resolvers=schema_resolvers,
         )
+        hull_locals = _isolate_thread_add_hull(proto)
+        _enable_convex_sdf(proto)
+        if hull_locals:
+            proto_hull_local[src_path] = hull_locals
         protos[src_path] = proto
 
     global_sites, proto_sites = _inject_sites(builder, protos, site_requests)
     global_site_map: dict[str, tuple[int, None]] = {label: (idx, None) for label, idx in global_sites.items()}
     local_site_map: dict[str, list[list[int]]] = {}
+    env_hull_finals: list[list[int]] = [[] for _ in range(mapping_arr.shape[1])]
 
     for col, _env_id in enumerate(env_ids_arr.tolist()):
         builder.begin_world()
@@ -194,6 +263,8 @@ def build_and_label(
             proto = protos[sources[row]]
             offset = builder.shape_count
             builder.add_builder(proto, xform=wp.transform(delta_pos, quaternions_arr[col].tolist()))
+            for h in proto_hull_local.get(sources[row], ()):
+                env_hull_finals[col].append(offset + h)
             for label, proto_shape_indices in proto_sites.get(id(proto), {}).items():
                 if label not in local_site_map:
                     local_site_map[label] = [[] for _ in range(mapping_arr.shape[1])]
@@ -205,6 +276,13 @@ def build_and_label(
         **global_site_map,
         **{label: (None, per_world) for label, per_world in local_site_map.items()},
     }
+
+    # PROTOTYPE: forbid the coarse outer hulls of a mating pair from colliding -- they are
+    # solid (bore-filled) and would wedge and block insertion. Per env (cross-env handled by world).
+    for hulls in env_hull_finals:
+        for a in range(len(hulls)):
+            for b in range(a + 1, len(hulls)):
+                builder.add_shape_collision_filter_pair(hulls[a], hulls[b])
 
     rename_builder_labels(builder, sources, destinations, env_ids_arr, mapping_arr)
     return builder, stage_info
