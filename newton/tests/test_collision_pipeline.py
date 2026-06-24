@@ -1051,6 +1051,141 @@ for bp_name in ("explicit", "nxn", "sap"):
     )
 
 
+def _check_capsule_box_prefers_shallow_face_contact(test, device, broad_phase: str):
+    """Regression for capsule-box contacts when the capsule is slightly inside a thin box.
+
+    This pose comes from an IsaacLab Kuka-Allegro fingertip hitting the table. The generic
+    GJK/MPR fallback returned a side-face contact about 0.44 m deep, although the capsule was
+    only millimeters into the thin tabletop. The collision pipeline should use the analytical
+    capsule-box routine and report the shallow vertical contact instead.
+    """
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder(gravity=0.0)
+        builder.default_shape_cfg.margin = 0.0
+        builder.default_shape_cfg.gap = 0.01
+
+        capsule_body = builder.add_body(xform=wp.transform_identity())
+        builder.add_shape_capsule(
+            capsule_body,
+            xform=wp.transform(
+                wp.vec3(-1.9248478, 1.1764035, 0.24462557),
+                wp.quat(0.10632262, 0.97456187, 0.13008587, -0.14833598),
+            ),
+            radius=0.0075,
+            half_height=0.01,
+        )
+
+        box_body = builder.add_body(xform=wp.transform_identity())
+        builder.add_shape_box(
+            box_body,
+            xform=wp.transform(wp.vec3(-2.0500002, 1.5, 0.235), wp.quat_identity()),
+            hx=0.39999998,
+            hy=0.75,
+            hz=0.02,
+        )
+
+        model = builder.finalize(device=device)
+        state = model.state()
+        pipeline = newton.CollisionPipeline(model, broad_phase=broad_phase)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        test.assertEqual(count, 1, f"Expected exactly one capsule-box contact, got {count}")
+
+        normal = contacts.rigid_contact_normal.numpy()[0]
+        point0 = contacts.rigid_contact_point0.numpy()[0]
+        point1 = contacts.rigid_contact_point1.numpy()[0]
+        margin0 = float(contacts.rigid_contact_margin0.numpy()[0])
+        margin1 = float(contacts.rigid_contact_margin1.numpy()[0])
+        distance = float(np.dot(normal, point1 - point0) - (margin0 + margin1))
+
+        test.assertLess(
+            abs(float(normal[1])),
+            1.0e-3,
+            f"Capsule-box contact should not use the deep table side face: normal={normal}",
+        )
+        test.assertLess(float(normal[2]), -0.99, f"Expected a vertical A-to-B normal, got {normal}")
+        test.assertAlmostEqual(distance, -0.00865, delta=5.0e-4)
+        test.assertGreater(distance, -0.05, f"Contact depth regressed to a deep side penetration: {distance}")
+
+
+for bp_name in ("explicit", "nxn", "sap"):
+    add_function_test(
+        TestRigidContactNormal,
+        f"test_capsule_box_prefers_shallow_face_contact_{bp_name}",
+        _check_capsule_box_prefers_shallow_face_contact,
+        devices=devices,
+        broad_phase=bp_name,
+    )
+
+
+def _check_box_box_prefers_shallow_face_contact(test, device, broad_phase: str):
+    """Regression for fingertip box contacts slightly inside a thin table box."""
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder(gravity=0.0)
+        builder.default_shape_cfg.margin = 0.0
+        builder.default_shape_cfg.gap = 0.01
+
+        finger_body = builder.add_body(xform=wp.transform_identity())
+        builder.add_shape_box(
+            finger_body,
+            xform=wp.transform(
+                wp.vec3(-4.8731804, -4.8932548, 0.2509693),
+                wp.quat(0.2518729, -0.08389022, -0.96362984, 0.03067376),
+            ),
+            hx=0.009125,
+            hy=0.00875,
+            hz=0.00866349,
+        )
+
+        table_body = builder.add_body(xform=wp.transform_identity())
+        builder.add_shape_box(
+            table_body,
+            xform=wp.transform(wp.vec3(-5.05, -4.5, 0.235), wp.quat_identity()),
+            hx=0.39999998,
+            hy=0.75,
+            hz=0.02,
+        )
+
+        model = builder.finalize(device=device)
+        state = model.state()
+        pipeline = newton.CollisionPipeline(model, broad_phase=broad_phase)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        test.assertEqual(count, 4, f"Expected four box-box face contacts, got {count}")
+
+        normals = contacts.rigid_contact_normal.numpy()[:count]
+        points0 = contacts.rigid_contact_point0.numpy()[:count]
+        points1 = contacts.rigid_contact_point1.numpy()[:count]
+        margins0 = contacts.rigid_contact_margin0.numpy()[:count]
+        margins1 = contacts.rigid_contact_margin1.numpy()[:count]
+        distances = np.array([
+            float(np.dot(normals[i], points1[i] - points0[i]) - (margins0[i] + margins1[i]))
+            for i in range(count)
+        ])
+
+        test.assertTrue(
+            np.all(np.abs(normals[:, 1]) < 1.0e-3),
+            f"Box-box contacts should not use the deep table side face: normals={normals}",
+        )
+        test.assertTrue(np.all(normals[:, 2] < -0.99), f"Expected vertical A-to-B normals, got {normals}")
+        test.assertAlmostEqual(float(distances.min()), -0.0174, delta=1.0e-3)
+        test.assertGreater(float(distances.min()), -0.05, f"Deep side penetration returned: {distances.min()}")
+
+
+for bp_name in ("explicit", "nxn", "sap"):
+    add_function_test(
+        TestRigidContactNormal,
+        f"test_box_box_prefers_shallow_face_contact_{bp_name}",
+        _check_box_box_prefers_shallow_face_contact,
+        devices=devices,
+        broad_phase=bp_name,
+    )
+
+
 def test_box_box_quaternion_perturbation(test, device, broad_phase: str):
     """Verify box-box contacts are correct under tiny quaternion perturbation.
 
