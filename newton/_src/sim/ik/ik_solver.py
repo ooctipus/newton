@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from enum import Enum
 from typing import Any
 
@@ -13,7 +13,7 @@ import numpy as np
 import warp as wp
 
 from ..model import Model
-from .ik_common import IKJacobianType
+from .ik_common import IKJacobianType, IKMemoryEstimate, IKSolveResult
 from .ik_lbfgs_optimizer import IKOptimizerLBFGS
 from .ik_lm_optimizer import IKOptimizerLM
 from .ik_objectives import IKObjective
@@ -232,6 +232,106 @@ class IKSolver:
         wolfe_c2: Curvature constant for the L-BFGS line search.
     """
 
+    @staticmethod
+    def estimate_memory(
+        model: Model,
+        n_problems: int,
+        objectives: Sequence[IKObjective],
+        *,
+        optimizer: IKOptimizer | str = IKOptimizer.LM,
+        jacobian_mode: IKJacobianType | str = IKJacobianType.AUTODIFF,
+        sampler: IKSampler | str = IKSampler.NONE,
+        n_seeds: int = 1,
+    ) -> IKMemoryEstimate:
+        """Estimate persistent solver device memory before allocation.
+
+        Objective instances may be one-row representatives. Their
+        :meth:`~newton.ik.IKObjective.estimate_memory` implementations receive
+        the requested production dimensions and must include target arrays and
+        objective workspaces that the real batch will allocate. The small
+        representative arrays are caller-owned and already live, so they are
+        intentionally excluded.
+
+        Args:
+            model: Shared articulation model.
+            n_problems: Number of base IK problems.
+            objectives: Representative ordered objective tuple.
+            optimizer: Optimizer backend to estimate.
+            jacobian_mode: Jacobian backend used by the optimizer.
+            sampler: Initial-seed sampling strategy.
+            n_seeds: Candidate seeds generated per base problem.
+
+        Returns:
+            Persistent device-memory estimate [byte].
+        """
+        optimizer = IKOptimizer(optimizer) if isinstance(optimizer, str) else optimizer
+        jacobian_mode = IKJacobianType(jacobian_mode) if isinstance(jacobian_mode, str) else jacobian_mode
+        sampler = IKSampler(sampler) if isinstance(sampler, str) else sampler
+        if n_problems < 1:
+            raise ValueError("n_problems must be positive")
+        if n_seeds < 1:
+            raise ValueError("n_seeds must be positive")
+        if sampler is IKSampler.NONE and n_seeds != 1:
+            raise ValueError("sampler 'none' requires n_seeds == 1")
+        if optimizer is not IKOptimizer.LM:
+            raise NotImplementedError("IK memory estimation currently supports the LM optimizer")
+
+        float_bytes = wp.types.type_size_in_bytes(wp.float32)
+        int_bytes = wp.types.type_size_in_bytes(wp.int32)
+        transform_bytes = wp.types.type_size_in_bytes(wp.transform)
+        spatial_bytes = wp.types.type_size_in_bytes(wp.spatial_vector)
+        n_expanded = n_problems * n_seeds
+        n_coords = model.joint_coord_count
+        n_dofs = model.joint_dof_count
+        n_bodies = model.body_count
+        n_joints = model.joint_count
+        n_residuals = sum(objective.residual_dim() for objective in objectives)
+        if n_residuals < 1:
+            raise ValueError("objectives must contribute at least one residual")
+
+        frontend_bytes = (
+            n_expanded * n_coords * float_bytes
+            + n_problems * int_bytes
+            + 2 * int_bytes
+            + n_expanded * int_bytes
+            + 3 * n_coords * float_bytes
+        )
+        if sampler is IKSampler.ROBERTS:
+            frontend_bytes += n_coords * float_bytes
+
+        uses_autodiff = jacobian_mode in (IKJacobianType.AUTODIFF, IKJacobianType.MIXED)
+        optimizer_bytes = n_expanded * (
+            n_dofs * float_bytes
+            + n_bodies * transform_bytes * (2 if uses_autodiff else 1)
+            + (n_bodies * spatial_bytes if uses_autodiff else 0)
+            + n_residuals * float_bytes * (5 if uses_autodiff else 3)
+            + n_residuals * n_dofs * float_bytes
+            + n_dofs * float_bytes * (2 if uses_autodiff else 1)
+            + n_coords * float_bytes * (2 if uses_autodiff else 1)
+            + 6 * int_bytes
+            + n_joints * transform_bytes
+        )
+        has_analytic = any(objective.supports_analytic() for objective in objectives)
+        if jacobian_mode != IKJacobianType.AUTODIFF and has_analytic:
+            optimizer_bytes += n_expanded * n_dofs * spatial_bytes
+        optimizer_bytes += float_bytes
+
+        objective_bytes = 0
+        for objective in objectives:
+            objective_mode = jacobian_mode
+            if jacobian_mode == IKJacobianType.MIXED:
+                objective_mode = IKJacobianType.ANALYTIC if objective.supports_analytic() else IKJacobianType.AUTODIFF
+            estimate = objective.estimate_memory(model, objective_mode, n_problems, n_expanded, n_residuals)
+            if estimate < 0:
+                raise ValueError(f"{type(objective).__name__}.estimate_memory() returned a negative value")
+            objective_bytes += estimate
+
+        return IKMemoryEstimate(
+            frontend_bytes=frontend_bytes,
+            optimizer_bytes=optimizer_bytes,
+            objective_bytes=objective_bytes,
+        )
+
     def __init__(
         self,
         model: Model,
@@ -345,6 +445,70 @@ class IKSolver:
 
         self.costs_expanded = self._impl.costs
 
+    def solve(
+        self,
+        joint_q_in: wp.array2d[wp.float32],
+        joint_q_out: wp.array2d[wp.float32],
+        max_iterations: int = 50,
+        step_size: float = 1.0,
+        *,
+        active_problem_count: int | None = None,
+        convergence_tolerance: float | None = 1.0e-6,
+        convergence_check_interval: int = 1,
+        projection: Callable[[wp.array2d[wp.float32]], None] | None = None,
+        projection_interval: int = 1,
+    ) -> IKSolveResult:
+        """Solve all base problems continuously and select the best seeds.
+
+        Sampling and optimizer state are initialized once. Convergence checks
+        and projections occur inside that same solve, so accepted LM damping
+        state is preserved across every interval.
+
+        Args:
+            joint_q_in: Input joint coordinates [m or rad], shape
+                [n_problems, joint_coord_count].
+            joint_q_out: Selected joint coordinates [m or rad], shape
+                [n_problems, joint_coord_count]. It may alias ``joint_q_in``.
+            max_iterations: Maximum number of optimizer iterations.
+            step_size: Unitless LM update scale.
+            active_problem_count: Valid leading base problems included in
+                convergence and reported costs. Padded rows are not executed.
+            convergence_tolerance: Absolute mean-cost change that terminates
+                the solve. Set to ``None`` to run exactly ``max_iterations``.
+            convergence_check_interval: Iterations between convergence checks.
+            projection: Optional in-place projection of the active expanded
+                sampled coordinates. Residuals and costs are refreshed after
+                each call.
+            projection_interval: Iterations between projection calls.
+
+        Returns:
+            Immutable solve summary over expanded sampled candidates.
+        """
+        if joint_q_in.shape != (self.n_problems, self.n_coords):
+            raise ValueError("joint_q_in has incompatible shape")
+        if joint_q_out.shape != (self.n_problems, self.n_coords):
+            raise ValueError("joint_q_out has incompatible shape")
+        if self.optimizer_type is not IKOptimizer.LM:
+            raise NotImplementedError("continuous solve currently supports the LM optimizer")
+        active_problem_count = self.n_problems if active_problem_count is None else active_problem_count
+        if active_problem_count < 1 or active_problem_count > self.n_problems:
+            raise ValueError("active_problem_count must be within the solver capacity")
+
+        self._sample(joint_q_in, active_problem_count)
+        result = self._impl.solve(
+            self.joint_q_expanded,
+            self.joint_q_expanded,
+            max_iterations=max_iterations,
+            step_size=step_size,
+            active_batch_count=active_problem_count * self.n_seeds,
+            convergence_tolerance=convergence_tolerance,
+            convergence_check_interval=convergence_check_interval,
+            projection=projection,
+            projection_interval=projection_interval,
+        )
+        self._select(joint_q_out, active_problem_count)
+        return result
+
     def step(
         self,
         joint_q_in: wp.array2d[wp.float32],
@@ -381,22 +545,26 @@ class IKSolver:
             raise RuntimeError(f"Unsupported optimizer: {self.optimizer_type}")
 
         self._impl.compute_costs(self.joint_q_expanded)
+        self._select(joint_q_out)
 
+    def _select(self, joint_q_out: wp.array2d[wp.float32], active_problem_count: int | None = None) -> None:
+        """Write the lowest-cost sampled seed for every active base problem."""
+        active_problem_count = self.n_problems if active_problem_count is None else active_problem_count
         if self.n_seeds == 1:
             if joint_q_out.ptr != self.joint_q_expanded.ptr:
-                wp.copy(joint_q_out, self.joint_q_expanded)
+                wp.copy(joint_q_out[:active_problem_count], self.joint_q_expanded[:active_problem_count])
             return
 
         wp.launch(
             _select_best_seed_indices,
-            dim=self.n_problems,
+            dim=active_problem_count,
             inputs=[self.costs_expanded, self.n_seeds],
             outputs=[self.best_indices],
             device=self.device,
         )
         wp.launch(
             _gather_best_seed,
-            dim=[self.n_problems, self.n_coords],
+            dim=[active_problem_count, self.n_coords],
             inputs=[self.joint_q_expanded, self.best_indices, self.n_seeds, self.n_coords],
             outputs=[joint_q_out],
             device=self.device,
@@ -426,7 +594,9 @@ class IKSolver:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._impl, name)
 
-    def _sample(self, joint_q_in: wp.array2d[wp.float32]) -> None:
+    def _sample(self, joint_q_in: wp.array2d[wp.float32], active_problem_count: int | None = None) -> None:
+        active_problem_count = self.n_problems if active_problem_count is None else active_problem_count
+        active_expanded_count = active_problem_count * self.n_seeds
         wp.launch(
             _pull_seed,
             dim=1,
@@ -438,7 +608,7 @@ class IKSolver:
         if self.sampler is IKSampler.NONE:
             wp.launch(
                 _sample_none_kernel,
-                dim=self.n_expanded,
+                dim=active_expanded_count,
                 inputs=[joint_q_in, self.n_seeds, self.n_coords],
                 outputs=[self.joint_q_expanded],
                 device=self.device,
@@ -448,7 +618,7 @@ class IKSolver:
         if self.sampler is IKSampler.GAUSS:
             wp.launch(
                 _sample_gauss_kernel,
-                dim=self.n_expanded,
+                dim=active_expanded_count,
                 inputs=[
                     joint_q_in,
                     self.n_seeds,
@@ -467,7 +637,7 @@ class IKSolver:
         if self.sampler is IKSampler.UNIFORM:
             wp.launch(
                 _sample_uniform_kernel,
-                dim=self.n_expanded,
+                dim=active_expanded_count,
                 inputs=[
                     self.n_coords,
                     self.joint_lower,
@@ -483,7 +653,7 @@ class IKSolver:
         if self.sampler is IKSampler.ROBERTS:
             wp.launch(
                 _sample_roberts_kernel,
-                dim=self.n_expanded,
+                dim=active_expanded_count,
                 inputs=[
                     self.n_seeds,
                     self.n_coords,

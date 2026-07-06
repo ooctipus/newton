@@ -1,0 +1,1 @@
+Add `IKSolver.solve()` for convergence-aware active-prefix LM solves with projection callbacks and typed `IKSolveResult` summaries, plus `IKSolver.estimate_memory()` for pre-allocation device-memory estimates.
