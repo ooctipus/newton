@@ -130,6 +130,32 @@ class IKObjective:
         """
         pass
 
+    def estimate_memory(
+        self,
+        model: Model,
+        jacobian_mode: IKJacobianType,
+        n_problems: int,
+        n_batch: int,
+        total_residuals: int,
+    ) -> int:
+        """Estimate objective target and workspace device memory [byte].
+
+        This method is called on a small representative objective before the
+        production batch is allocated. Implementations must describe every
+        target and workspace array that the real objective will create.
+
+        Args:
+            model: Shared articulation model.
+            jacobian_mode: Effective Jacobian backend for this objective.
+            n_problems: Number of base IK problems.
+            n_batch: Expanded optimizer batch after seed sampling.
+            total_residuals: Total residual rows across all objectives.
+
+        Returns:
+            Persistent objective device memory [byte].
+        """
+        raise NotImplementedError(f"{type(self).__name__} must implement estimate_memory()")
+
     def compute_jacobian_analytic(
         self,
         body_q: wp.array2d[wp.transform],
@@ -321,6 +347,24 @@ class IKObjectivePosition(IKObjective):
                     e[prob_idx, self.residual_offset + component] = 1.0
                 self.e_arrays.append(wp.array(e.flatten(), dtype=wp.float32, device=self.device))
 
+    def estimate_memory(
+        self,
+        model: Model,
+        jacobian_mode: IKJacobianType,
+        n_problems: int,
+        n_batch: int,
+        total_residuals: int,
+    ) -> int:
+        """Estimate position targets and Jacobian workspace [byte]."""
+        target_bytes = n_problems * wp.types.type_size_in_bytes(wp.vec3)
+        if jacobian_mode in (IKJacobianType.ANALYTIC, IKJacobianType.MIXED):
+            workspace_bytes = model.joint_dof_count * wp.types.type_size_in_bytes(wp.uint8)
+        elif jacobian_mode == IKJacobianType.AUTODIFF:
+            workspace_bytes = 3 * n_batch * total_residuals * wp.types.type_size_in_bytes(wp.float32)
+        else:
+            raise ValueError(f"Unsupported Jacobian mode: {jacobian_mode}")
+        return target_bytes + workspace_bytes
+
     def supports_analytic(self) -> bool:
         """Return ``True`` because this objective has an analytic Jacobian."""
         return True
@@ -428,7 +472,8 @@ class IKObjectivePosition(IKObjective):
         """
         self._require_batch_layout()
         for component in range(3):
-            tape.backward(grads={tape.outputs[0]: self.e_arrays[component].flatten()})
+            seeds = self.e_arrays[component].reshape((self.n_batch, self.total_residuals))[: dq_dof.shape[0]]
+            tape.backward(grads={tape.outputs[0]: seeds.flatten()})
 
             q_grad = tape.gradients[dq_dof]
 
@@ -436,7 +481,7 @@ class IKObjectivePosition(IKObjective):
 
             wp.launch(
                 _pos_jac_fill,
-                dim=self.n_batch,
+                dim=dq_dof.shape[0],
                 inputs=[
                     q_grad,
                     n_dofs,
@@ -631,6 +676,24 @@ class IKObjectiveJointLimit(IKObjective):
                 dof_to_coord_np[dof0 + k] = coord0 + k
         self.dof_to_coord = wp.array(dof_to_coord_np, dtype=wp.int32, device=self.device)
 
+    def estimate_memory(
+        self,
+        model: Model,
+        jacobian_mode: IKJacobianType,
+        n_problems: int,
+        n_batch: int,
+        total_residuals: int,
+    ) -> int:
+        """Estimate joint-limit Jacobian workspace [byte]."""
+        del model, n_problems
+        scalar_bytes = wp.types.type_size_in_bytes(wp.float32)
+        workspace_bytes = self.n_dofs * wp.types.type_size_in_bytes(wp.int32)
+        if jacobian_mode == IKJacobianType.AUTODIFF:
+            workspace_bytes += n_batch * total_residuals * scalar_bytes
+        elif jacobian_mode not in (IKJacobianType.ANALYTIC, IKJacobianType.MIXED):
+            raise ValueError(f"Unsupported Jacobian mode: {jacobian_mode}")
+        return workspace_bytes
+
     def supports_analytic(self) -> bool:
         """Return ``True`` because this objective has an analytic Jacobian."""
         return True
@@ -703,13 +766,14 @@ class IKObjectiveJointLimit(IKObjective):
                 batch, shape [n_batch, joint_dof_count].
         """
         self._require_batch_layout()
-        tape.backward(grads={tape.outputs[0]: self.e_array})
+        seeds = self.e_array.reshape((self.n_batch, self.total_residuals))[: dq_dof.shape[0]]
+        tape.backward(grads={tape.outputs[0]: seeds.flatten()})
 
         q_grad = tape.gradients[dq_dof]
 
         wp.launch(
             _limit_jac_fill,
-            dim=[self.n_batch, self.n_dofs],
+            dim=[dq_dof.shape[0], self.n_dofs],
             inputs=[
                 q_grad,
                 self.n_dofs,
@@ -945,6 +1009,24 @@ class IKObjectiveRotation(IKObjective):
                     e[prob_idx, self.residual_offset + component] = 1.0
                 self.e_arrays.append(wp.array(e.flatten(), dtype=wp.float32, device=self.device))
 
+    def estimate_memory(
+        self,
+        model: Model,
+        jacobian_mode: IKJacobianType,
+        n_problems: int,
+        n_batch: int,
+        total_residuals: int,
+    ) -> int:
+        """Estimate rotation targets and Jacobian workspace [byte]."""
+        target_bytes = n_problems * wp.types.type_size_in_bytes(wp.vec4)
+        if jacobian_mode in (IKJacobianType.ANALYTIC, IKJacobianType.MIXED):
+            workspace_bytes = model.joint_dof_count * wp.types.type_size_in_bytes(wp.uint8)
+        elif jacobian_mode == IKJacobianType.AUTODIFF:
+            workspace_bytes = 3 * n_batch * total_residuals * wp.types.type_size_in_bytes(wp.float32)
+        else:
+            raise ValueError(f"Unsupported Jacobian mode: {jacobian_mode}")
+        return target_bytes + workspace_bytes
+
     def supports_analytic(self) -> bool:
         """Return ``True`` because this objective has an analytic Jacobian."""
         return True
@@ -1054,7 +1136,8 @@ class IKObjectiveRotation(IKObjective):
         """
         self._require_batch_layout()
         for component in range(3):
-            tape.backward(grads={tape.outputs[0]: self.e_arrays[component].flatten()})
+            seeds = self.e_arrays[component].reshape((self.n_batch, self.total_residuals))[: dq_dof.shape[0]]
+            tape.backward(grads={tape.outputs[0]: seeds.flatten()})
 
             q_grad = tape.gradients[dq_dof]
 
@@ -1062,7 +1145,7 @@ class IKObjectiveRotation(IKObjective):
 
             wp.launch(
                 _rot_jac_fill,
-                dim=self.n_batch,
+                dim=dq_dof.shape[0],
                 inputs=[
                     q_grad,
                     n_dofs,

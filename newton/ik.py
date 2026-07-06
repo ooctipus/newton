@@ -5,6 +5,7 @@
 
 from ._src.sim.ik import (
     IKJacobianType,
+    IKMemoryEstimate,
     IKObjective,
     IKObjectiveJointLimit,
     IKObjectivePosition,
@@ -14,10 +15,12 @@ from ._src.sim.ik import (
     IKOptimizerLM,
     IKSampler,
     IKSolver,
+    IKSolveResult,
 )
 
 __all__ = [
     "IKJacobianType",
+    "IKMemoryEstimate",
     "IKObjective",
     "IKObjectiveJointLimit",
     "IKObjectivePosition",
@@ -26,5 +29,6 @@ __all__ = [
     "IKOptimizerLBFGS",
     "IKOptimizerLM",
     "IKSampler",
+    "IKSolveResult",
     "IKSolver",
 ]

@@ -288,6 +288,229 @@ def test_convergence_mixed(test, device):
     _convergence_test_planar(test, device, ik.IKJacobianType.MIXED)
 
 
+def test_solve_converges_without_restarting(test, device):
+    with wp.ScopedDevice(device):
+        n_problems = 3
+        model = _build_two_link_planar(device)
+        joint_q = wp.zeros((n_problems, model.joint_coord_count), dtype=wp.float32)
+        targets = wp.array([[1.5, 1.0, 0.0]] * n_problems, dtype=wp.vec3, device=device)
+        objective = ik.IKObjectivePosition(1, wp.vec3(0.5, 0.0, 0.0), targets)
+        solver = ik.IKSolver(
+            model,
+            n_problems,
+            [objective],
+            lambda_initial=1.0e-3,
+            jacobian_mode=ik.IKJacobianType.ANALYTIC,
+        )
+
+        result = solver.solve(
+            joint_q,
+            joint_q,
+            max_iterations=40,
+            convergence_tolerance=1.0e-6,
+            convergence_check_interval=2,
+        )
+
+        test.assertIsInstance(result, ik.IKSolveResult)
+        test.assertTrue(result.converged)
+        test.assertLess(result.iterations, 40)
+        test.assertGreater(result.iterations, 0)
+        test.assertLess(result.final_mean_cost, result.initial_mean_cost)
+
+
+def test_solve_projection_uses_declared_intervals(test, device):
+    with wp.ScopedDevice(device):
+        n_problems = 1
+        model = _build_two_link_planar(device)
+        joint_q = wp.zeros((n_problems, model.joint_coord_count), dtype=wp.float32)
+        targets = wp.array([[1.5, 1.0, 0.0]], dtype=wp.vec3, device=device)
+        objective = ik.IKObjectivePosition(1, wp.vec3(0.5, 0.0, 0.0), targets)
+        solver = ik.IKSolver(
+            model,
+            n_problems,
+            [objective],
+            lambda_initial=1.0e-3,
+            jacobian_mode=ik.IKJacobianType.ANALYTIC,
+        )
+        projected_at = []
+
+        def project(values: wp.array2d[wp.float32]) -> None:
+            test.assertEqual(values.ptr, solver.joint_q.ptr)
+            test.assertEqual(values.shape, solver.joint_q.shape)
+            values.zero_()
+            projected_at.append(len(projected_at) + 1)
+
+        result = solver.solve(
+            joint_q,
+            joint_q,
+            max_iterations=4,
+            convergence_tolerance=None,
+            projection=project,
+            projection_interval=2,
+        )
+
+        test.assertEqual(result.iterations, 4)
+        test.assertFalse(result.converged)
+        test.assertEqual(projected_at, [1, 2])
+        test.assertAlmostEqual(result.final_mean_cost, result.initial_mean_cost, places=6)
+        assert_np_equal(joint_q.numpy(), np.zeros_like(joint_q.numpy()), tol=0.0)
+
+
+def test_solve_active_prefix_ignores_padded_tail(test, device, mode: ik.IKJacobianType):
+    with wp.ScopedDevice(device):
+        model = _build_two_link_planar(device)
+        active_target = [1.5, 1.0, 0.0]
+        q_active = wp.zeros((1, model.joint_coord_count), dtype=wp.float32, device=device)
+        active_objective = ik.IKObjectivePosition(
+            1,
+            wp.vec3(0.5, 0.0, 0.0),
+            wp.array([active_target], dtype=wp.vec3, device=device),
+        )
+        active_result = ik.IKSolver(
+            model,
+            1,
+            [active_objective],
+            lambda_initial=1.0e-3,
+            jacobian_mode=mode,
+        ).solve(
+            q_active,
+            q_active,
+            max_iterations=40,
+            convergence_tolerance=1.0e-6,
+            convergence_check_interval=2,
+        )
+
+        padded_initial = np.array([[0.0, 0.0], [0.3, -0.4]], dtype=np.float32)
+        q_padded = wp.array(padded_initial, dtype=wp.float32, device=device)
+        padded_objective = ik.IKObjectivePosition(
+            1,
+            wp.vec3(0.5, 0.0, 0.0),
+            wp.array([active_target, [10.0, -10.0, 0.0]], dtype=wp.vec3, device=device),
+        )
+        padded_result = ik.IKSolver(
+            model,
+            2,
+            [padded_objective],
+            lambda_initial=1.0e-3,
+            jacobian_mode=mode,
+        ).solve(
+            q_padded,
+            q_padded,
+            max_iterations=40,
+            active_problem_count=1,
+            convergence_tolerance=1.0e-6,
+            convergence_check_interval=2,
+        )
+
+        test.assertEqual(active_result.iterations, padded_result.iterations)
+        test.assertEqual(active_result.converged, padded_result.converged)
+        test.assertAlmostEqual(active_result.initial_mean_cost, padded_result.initial_mean_cost, places=7)
+        test.assertAlmostEqual(active_result.final_mean_cost, padded_result.final_mean_cost, places=7)
+        assert_np_equal(q_active.numpy()[0], q_padded.numpy()[0], tol=1.0e-6)
+        assert_np_equal(q_padded.numpy()[1], padded_initial[1], tol=0.0)
+
+
+def test_solve_mean_cost_is_residual_width_invariant(test, device):
+    with wp.ScopedDevice(device):
+        model = _build_two_link_planar(device)
+        target = [[1.5, 1.0, 0.0]]
+        one_objective = [
+            ik.IKObjectivePosition(
+                1,
+                wp.vec3(0.5, 0.0, 0.0),
+                wp.array(target, dtype=wp.vec3, device=device),
+            )
+        ]
+        two_objectives = [
+            ik.IKObjectivePosition(
+                1,
+                wp.vec3(0.5, 0.0, 0.0),
+                wp.array(target, dtype=wp.vec3, device=device),
+            ),
+            ik.IKObjectivePosition(
+                1,
+                wp.vec3(0.5, 0.0, 0.0),
+                wp.array(target, dtype=wp.vec3, device=device),
+            ),
+        ]
+        q_one = wp.zeros((1, model.joint_coord_count), dtype=wp.float32, device=device)
+        q_two = wp.zeros((1, model.joint_coord_count), dtype=wp.float32, device=device)
+        result_one = ik.IKSolver(
+            model,
+            1,
+            one_objective,
+            jacobian_mode=ik.IKJacobianType.ANALYTIC,
+        ).solve(q_one, q_one, max_iterations=0)
+        result_two = ik.IKSolver(
+            model,
+            1,
+            two_objectives,
+            jacobian_mode=ik.IKJacobianType.ANALYTIC,
+        ).solve(q_two, q_two, max_iterations=0)
+
+        test.assertAlmostEqual(result_one.initial_mean_cost, result_two.initial_mean_cost, places=7)
+        test.assertAlmostEqual(result_one.final_mean_cost, result_two.final_mean_cost, places=7)
+
+
+def test_solver_memory_estimate_includes_objectives(test, device):
+    class ObjectiveWithMemory(ik.IKObjectivePosition):
+        def estimate_memory(self, model, jacobian_mode, n_problems, n_batch, total_residuals):
+            del model, jacobian_mode, n_problems, total_residuals
+            return n_batch * 17
+
+    with wp.ScopedDevice(device):
+        model = _build_two_link_planar(device)
+        targets = wp.array([[1.5, 1.0, 0.0]] * 4, dtype=wp.vec3, device=device)
+        objective = ObjectiveWithMemory(1, wp.vec3(0.5, 0.0, 0.0), targets)
+
+        estimate = ik.IKSolver.estimate_memory(
+            model,
+            4,
+            [objective],
+            jacobian_mode=ik.IKJacobianType.ANALYTIC,
+        )
+
+        test.assertIsInstance(estimate, ik.IKMemoryEstimate)
+        test.assertGreater(estimate.frontend_bytes, 0)
+        test.assertGreater(estimate.optimizer_bytes, 0)
+        test.assertEqual(estimate.objective_bytes, 4 * 17)
+        test.assertEqual(
+            estimate.total_bytes,
+            estimate.frontend_bytes + estimate.optimizer_bytes + estimate.objective_bytes,
+        )
+
+        for mode in (
+            ik.IKJacobianType.ANALYTIC,
+            ik.IKJacobianType.AUTODIFF,
+            ik.IKJacobianType.MIXED,
+        ):
+            mode_targets = wp.array([[1.5, 1.0, 0.0]] * 4, dtype=wp.vec3, device=device)
+            built_in_objective = ik.IKObjectivePosition(1, wp.vec3(0.5, 0.0, 0.0), mode_targets)
+            built_in_estimate = ik.IKSolver.estimate_memory(
+                model,
+                4,
+                [built_in_objective],
+                jacobian_mode=mode,
+            )
+            solver = ik.IKSolver(model, 4, [built_in_objective], jacobian_mode=mode)
+            arrays = {}
+
+            def add_arrays(value, output):
+                if isinstance(value, wp.array):
+                    if value.device == model.device:
+                        output[(str(value.device), value.ptr)] = value.capacity
+                        if value.grad is not None:
+                            add_arrays(value.grad, output)
+                elif isinstance(value, (list, tuple)):
+                    for item in value:
+                        add_arrays(item, output)
+
+            for owner in (solver, solver._impl, built_in_objective):
+                for value in vars(owner).values():
+                    add_arrays(value, arrays)
+            test.assertEqual(built_in_estimate.total_bytes, sum(arrays.values()), str(mode))
+
+
 def _convergence_test_free(test, device, mode: ik.IKJacobianType):
     with wp.ScopedDevice(device):
         n_problems = 3
@@ -442,6 +665,45 @@ def test_joint_dof_mask(test, device, mode: ik.IKJacobianType):
         all_true = solve(wp.ones(model.joint_dof_count, dtype=wp.bool, device=device))
         no_mask = solve(None)
         assert_np_equal(all_true, no_mask, tol=0.0)
+
+
+def test_joint_dof_mask_respects_active_prefix(test, device, mode: ik.IKJacobianType):
+    """A masked ``solve()`` over an active prefix must keep masked DOFs fixed on the
+    active rows, leave padded rows untouched, and match an unpadded masked solve."""
+    with wp.ScopedDevice(device):
+        model = _build_two_link_planar(device)
+        requires_grad = mode in (ik.IKJacobianType.AUTODIFF, ik.IKJacobianType.MIXED)
+        mask = wp.array([False, True], dtype=wp.bool, device=device)
+        seeds = np.array([[0.4, 0.0], [-0.2, 0.1], [0.3, -0.4]], dtype=np.float32)
+        targets = np.array([[1.0, 1.0, 0.0], [0.5, 1.2, 0.0], [10.0, -10.0, 0.0]], dtype=np.float32)
+
+        def solve(rows, active):
+            joint_q = wp.array(seeds[:rows], dtype=wp.float32, device=device, requires_grad=requires_grad)
+            objective = ik.IKObjectivePosition(
+                link_index=1,
+                link_offset=wp.vec3(0.5, 0.0, 0.0),
+                target_positions=wp.array(targets[:rows], dtype=wp.vec3, device=device),
+            )
+            solver = ik.IKSolver(model, rows, [objective], jacobian_mode=mode, joint_dof_mask=mask)
+            result = solver.solve(
+                joint_q,
+                joint_q,
+                max_iterations=40,
+                active_problem_count=active,
+                convergence_tolerance=None,
+            )
+            return result, joint_q.numpy()
+
+        padded_result, padded = solve(3, 2)
+        reference_result, reference = solve(2, None)
+
+        # Masked DOFs stay bit-exact on the active rows; the padded row is never touched.
+        for row in range(2):
+            test.assertEqual(float(padded[row, 0]), float(seeds[row, 0]))
+        assert_np_equal(padded[2], seeds[2], tol=0.0)
+        # The active prefix must reproduce the unpadded masked solve.
+        test.assertEqual(padded_result.iterations, reference_result.iterations)
+        assert_np_equal(padded[:2], reference, tol=1.0e-6)
 
 
 def test_joint_dof_mask_free_joint(test, device):
@@ -794,6 +1056,32 @@ class TestIKModes(unittest.TestCase):
 add_function_test(TestIKModes, "test_convergence_autodiff", test_convergence_autodiff, devices)
 add_function_test(TestIKModes, "test_convergence_analytic", test_convergence_analytic, devices)
 add_function_test(TestIKModes, "test_convergence_mixed", test_convergence_mixed, devices)
+add_function_test(
+    TestIKModes, "test_solve_converges_without_restarting", test_solve_converges_without_restarting, devices
+)
+add_function_test(
+    TestIKModes, "test_solve_projection_uses_declared_intervals", test_solve_projection_uses_declared_intervals, devices
+)
+for mode in ik.IKJacobianType:
+    add_function_test(
+        TestIKModes,
+        f"test_solve_active_prefix_ignores_padded_tail_{mode.value}",
+        test_solve_active_prefix_ignores_padded_tail,
+        devices,
+        mode=mode,
+    )
+add_function_test(
+    TestIKModes,
+    "test_solve_mean_cost_is_residual_width_invariant",
+    test_solve_mean_cost_is_residual_width_invariant,
+    devices,
+)
+add_function_test(
+    TestIKModes,
+    "test_solver_memory_estimate_includes_objectives",
+    test_solver_memory_estimate_includes_objectives,
+    devices,
+)
 
 # FREE-joint convergence
 add_function_test(TestIKModes, "test_convergence_autodiff_free", test_convergence_autodiff_free, devices)
@@ -817,6 +1105,14 @@ for mode in ik.IKJacobianType:
         TestIKModes,
         f"test_joint_dof_mask_{mode.value}",
         test_joint_dof_mask,
+        devices,
+        mode=mode,
+    )
+for mode in ik.IKJacobianType:
+    add_function_test(
+        TestIKModes,
+        f"test_joint_dof_mask_respects_active_prefix_{mode.value}",
+        test_joint_dof_mask_respects_active_prefix,
         devices,
         mode=mode,
     )

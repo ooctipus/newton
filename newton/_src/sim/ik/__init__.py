@@ -3,7 +3,7 @@
 
 """Inverse-kinematics submodule."""
 
-from .ik_common import IKJacobianType
+from .ik_common import IKJacobianType, IKMemoryEstimate, IKSolveResult
 from .ik_lbfgs_optimizer import IKOptimizerLBFGS
 from .ik_lm_optimizer import IKOptimizerLM
 from .ik_objectives import IKObjective, IKObjectiveJointLimit, IKObjectivePosition, IKObjectiveRotation
@@ -11,6 +11,7 @@ from .ik_solver import IKOptimizer, IKSampler, IKSolver
 
 __all__ = [
     "IKJacobianType",
+    "IKMemoryEstimate",
     "IKObjective",
     "IKObjectiveJointLimit",
     "IKObjectivePosition",
@@ -19,5 +20,6 @@ __all__ = [
     "IKOptimizerLBFGS",
     "IKOptimizerLM",
     "IKSampler",
+    "IKSolveResult",
     "IKSolver",
 ]
