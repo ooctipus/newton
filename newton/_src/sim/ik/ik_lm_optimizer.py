@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import ctypes
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar
@@ -13,7 +14,7 @@ import numpy as np
 import warp as wp
 
 from ..model import Model
-from .ik_common import IKJacobianType, compute_costs, eval_fk_batched, fk_accum
+from .ik_common import IKJacobianType, IKSolveResult, compute_costs, eval_fk_batched, fk_accum, mean_cost
 from .ik_objectives import IKObjective
 
 
@@ -249,6 +250,11 @@ class IKOptimizerLM:
         self.lambda_values = wp.zeros(self.n_batch, dtype=wp.float32, device=device)
         self.accept_flags = wp.zeros(self.n_batch, dtype=wp.int32, device=device)
         self.pred_reduction = wp.zeros(self.n_batch, dtype=wp.float32, device=device)
+        self._cost_sum = wp.zeros(1, dtype=wp.float32, device=device)
+        self._cost_sum_host = (
+            wp.zeros(1, dtype=wp.float32, device="cpu", pinned=True) if device.is_cuda else self._cost_sum
+        )
+        self._cost_sum_value = ctypes.c_float.from_address(self._cost_sum_host.ptr)
 
         self.problem_idx_identity = wp.array(np.arange(self.n_batch, dtype=np.int32), dtype=wp.int32, device=device)
 
@@ -274,19 +280,22 @@ class IKOptimizerLM:
         residuals: wp.array2d[wp.float32] | None = None,
         jacobian: wp.array3d[wp.float32] | None = None,
     ) -> BatchCtx:
+        batch = joint_q.shape[0]
+        body_qd = getattr(self, "body_qd", None)
+        motion_subspace = getattr(self, "joint_S_s", None)
         ctx = BatchCtx(
             joint_q=joint_q,
-            residuals=residuals if residuals is not None else self.residuals,
-            fk_body_q=self.body_q,
-            problem_idx=self.problem_idx,
-            fk_body_qd=getattr(self, "body_qd", None),
-            dq_dof=self.dq_dof,
-            joint_q_proposed=self.joint_q_proposed,
-            joint_qd=self.qd_zero,
-            jacobian_out=jacobian if jacobian is not None else self.jacobian,
-            motion_subspace=getattr(self, "joint_S_s", None),
-            fk_qd_zero=self.qd_zero,
-            fk_X_local=self.X_local,
+            residuals=residuals if residuals is not None else self.residuals[:batch],
+            fk_body_q=self.body_q[:batch],
+            problem_idx=self.problem_idx[:batch],
+            fk_body_qd=None if body_qd is None else body_qd[:batch],
+            dq_dof=self.dq_dof[:batch],
+            joint_q_proposed=self.joint_q_proposed[:batch],
+            joint_qd=self.qd_zero[:batch],
+            jacobian_out=jacobian if jacobian is not None else self.jacobian[:batch],
+            motion_subspace=None if motion_subspace is None else motion_subspace[:batch],
+            fk_qd_zero=self.qd_zero[:batch],
+            fk_X_local=self.X_local[:batch],
         )
         self._validate_ctx_for_mode(ctx)
         return ctx
@@ -445,6 +454,108 @@ class IKOptimizerLM:
             ctx.motion_subspace,
         )
 
+    def _mean_cost(self, active_batch_count: int) -> float:
+        """Return the normalized cost over the valid leading rows."""
+        return mean_cost(
+            self.costs,
+            self.n_residuals,
+            active_batch_count,
+            self._cost_sum,
+            self._cost_sum_host,
+            self._cost_sum_value,
+        )
+
+    def solve(
+        self,
+        joint_q_in: wp.array2d[wp.float32],
+        joint_q_out: wp.array2d[wp.float32],
+        max_iterations: int = 10,
+        step_size: float = 1.0,
+        *,
+        active_batch_count: int | None = None,
+        convergence_tolerance: float | None = 1.0e-6,
+        convergence_check_interval: int = 1,
+        projection: Callable[[wp.array2d[wp.float32]], None] | None = None,
+        projection_interval: int = 1,
+    ) -> IKSolveResult:
+        """Run one continuous LM solve with optional convergence and projection.
+
+        Args:
+            joint_q_in: Input joint coordinates [m or rad], shape
+                [n_batch, joint_coord_count].
+            joint_q_out: Optimized joint coordinates [m or rad], shape
+                [n_batch, joint_coord_count]. It may alias ``joint_q_in``.
+            max_iterations: Maximum number of LM iterations.
+            step_size: Unitless scale applied to every LM update.
+            active_batch_count: Valid leading batch rows included in cost
+                reporting and convergence. Padded rows are not executed.
+            convergence_tolerance: Absolute mean-cost change that terminates
+                the solve. Set to ``None`` to run exactly ``max_iterations``.
+            convergence_check_interval: Iterations between convergence checks.
+            projection: Optional in-place projection of ``joint_q_out`` called
+                without resetting damping or sampling state.
+            projection_interval: Iterations between projection calls.
+
+        Returns:
+            Immutable solve summary.
+        """
+        if joint_q_in.shape != (self.n_batch, self.n_coords):
+            raise ValueError("joint_q_in has incompatible shape")
+        if joint_q_out.shape != (self.n_batch, self.n_coords):
+            raise ValueError("joint_q_out has incompatible shape")
+        if max_iterations < 0:
+            raise ValueError("max_iterations must be non-negative")
+        active_batch_count = self.n_batch if active_batch_count is None else active_batch_count
+        if active_batch_count < 1 or active_batch_count > self.n_batch:
+            raise ValueError("active_batch_count must be within the optimizer batch")
+        if convergence_tolerance is not None and convergence_tolerance < 0.0:
+            raise ValueError("convergence_tolerance must be non-negative or None")
+        if convergence_check_interval < 1:
+            raise ValueError("convergence_check_interval must be positive")
+        if projection_interval < 1:
+            raise ValueError("projection_interval must be positive")
+
+        joint_q_in_active = joint_q_in[:active_batch_count]
+        joint_q = joint_q_out[:active_batch_count]
+        if joint_q_in.ptr != joint_q_out.ptr:
+            wp.copy(joint_q, joint_q_in_active)
+
+        self.lambda_values[:active_batch_count].fill_(self.lambda_initial)
+        self.compute_costs(joint_q)
+        initial_mean_cost = self._mean_cost(active_batch_count)
+        previous_mean_cost = initial_mean_cost
+        final_mean_cost = initial_mean_cost
+        converged = False
+        iterations = 0
+
+        for iteration in range(max_iterations):
+            self._step(joint_q, step_size=step_size)
+            iterations = iteration + 1
+
+            if projection is not None and iterations % projection_interval == 0:
+                projection(joint_q)
+                self.compute_costs(joint_q)
+
+            check_convergence = convergence_tolerance is not None and (
+                iterations % convergence_check_interval == 0 or iterations == max_iterations
+            )
+            if check_convergence:
+                final_mean_cost = self._mean_cost(active_batch_count)
+                if abs(previous_mean_cost - final_mean_cost) <= convergence_tolerance:
+                    converged = True
+                    break
+                previous_mean_cost = final_mean_cost
+
+        if convergence_tolerance is None or iterations % convergence_check_interval != 0:
+            final_mean_cost = self._mean_cost(active_batch_count)
+
+        return IKSolveResult(
+            iterations=iterations,
+            converged=converged,
+            initial_mean_cost=initial_mean_cost,
+            final_mean_cost=final_mean_cost,
+        )
+
     def step(
         self,
         joint_q_in: wp.array2d[wp.float32],
@@ -452,30 +563,29 @@ class IKOptimizerLM:
         iterations: int = 10,
         step_size: float = 1.0,
     ) -> None:
-        """Run several LM iterations on a batch of joint configurations.
+        """Run a fixed number of LM iterations on joint configurations.
 
         Args:
-            joint_q_in: Input joint coordinates, shape [n_batch, joint_coord_count].
-            joint_q_out: Output buffer for the optimized coordinates, shape
-                [n_batch, joint_coord_count]. It may alias ``joint_q_in`` for
-                in-place updates.
-            iterations: Number of LM iterations to execute.
-            step_size: Scalar applied to each computed update before
-                integration.
+            joint_q_in: Input joint coordinates [m or rad], shape
+                [n_batch, joint_coord_count].
+            joint_q_out: Optimized joint coordinates [m or rad], shape
+                [n_batch, joint_coord_count]. It may alias ``joint_q_in``.
+            iterations: Number of LM iterations.
+            step_size: Unitless scale applied to every LM update.
         """
         if joint_q_in.shape != (self.n_batch, self.n_coords):
             raise ValueError("joint_q_in has incompatible shape")
         if joint_q_out.shape != (self.n_batch, self.n_coords):
             raise ValueError("joint_q_out has incompatible shape")
-
+        if iterations < 0:
+            raise ValueError("iterations must be non-negative")
         if joint_q_in.ptr != joint_q_out.ptr:
             wp.copy(joint_q_out, joint_q_in)
 
-        joint_q = joint_q_out
-
         self.lambda_values.fill_(self.lambda_initial)
-        for i in range(iterations):
-            self._step(joint_q, step_size=step_size, iteration=i)
+        self.compute_costs(joint_q_out)
+        for _ in range(iterations):
+            self._step(joint_q_out, step_size=step_size)
 
     def _compute_residuals(
         self,
@@ -560,46 +670,34 @@ class IKOptimizerLM:
         self,
         joint_q: wp.array2d[wp.float32],
         step_size: float = 1.0,
-        iteration: int = 0,
     ) -> None:
         """Execute one Levenberg-Marquardt iteration with adaptive damping."""
 
+        batch = joint_q.shape[0]
         ctx_curr = self._ctx_solver(joint_q)
-
-        if iteration == 0:
-            if self.jacobian_mode in (IKJacobianType.AUTODIFF, IKJacobianType.MIXED):
-                self._residuals_autodiff(ctx_curr)
-            else:
-                self._residuals_analytic(ctx_curr)
-
-        wp.launch(
-            compute_costs,
-            dim=self.n_batch,
-            inputs=[ctx_curr.residuals, self.n_residuals],
-            outputs=[self.costs],
-            device=self.device,
-        )
-
         self._jacobian_at(ctx_curr)
 
-        residuals_flat = ctx_curr.residuals.flatten()
-        residuals_3d_flat = self.residuals_3d.flatten()
-        wp.copy(residuals_3d_flat, residuals_flat)
+        residuals_3d = self.residuals_3d[:batch]
+        wp.copy(residuals_3d.flatten(), ctx_curr.residuals.flatten())
 
-        self.dq_dof.zero_()
+        ctx_curr.dq_dof.zero_()
         self._solve_tiled(
-            ctx_curr.jacobian_out, self.residuals_3d, self.lambda_values, self.dq_dof, self.pred_reduction
+            ctx_curr.jacobian_out,
+            residuals_3d,
+            self.lambda_values[:batch],
+            ctx_curr.dq_dof,
+            self.pred_reduction[:batch],
         )
 
         self._integrate_dq(
             joint_q,
-            dq_in=self.dq_dof,
-            joint_q_out=self.joint_q_proposed,
-            joint_qd_out=self.qd_zero,
+            dq_in=ctx_curr.dq_dof,
+            joint_q_out=ctx_curr.joint_q_proposed,
+            joint_qd_out=ctx_curr.joint_qd,
             step_size=step_size,
         )
 
-        ctx_prop = self._ctx_solver(self.joint_q_proposed, residuals=self.residuals_proposed)
+        ctx_prop = self._ctx_solver(ctx_curr.joint_q_proposed, residuals=self.residuals_proposed[:batch])
         if self.jacobian_mode in (IKJacobianType.AUTODIFF, IKJacobianType.MIXED):
             self._residuals_autodiff(ctx_prop)
         else:
@@ -607,35 +705,40 @@ class IKOptimizerLM:
 
         wp.launch(
             compute_costs,
-            dim=self.n_batch,
-            inputs=[self.residuals_proposed, self.n_residuals],
-            outputs=[self.costs_proposed],
+            dim=batch,
+            inputs=[ctx_prop.residuals, self.n_residuals],
+            outputs=[self.costs_proposed[:batch]],
             device=self.device,
         )
 
         wp.launch(
             _accept_reject,
-            dim=self.n_batch,
-            inputs=[self.costs, self.costs_proposed, self.pred_reduction, self.rho_min],
-            outputs=[self.accept_flags],
+            dim=batch,
+            inputs=[
+                self.costs[:batch],
+                self.costs_proposed[:batch],
+                self.pred_reduction[:batch],
+                self.rho_min,
+            ],
+            outputs=[self.accept_flags[:batch]],
             device=self.device,
         )
 
         wp.launch(
             _update_lm_state,
-            dim=self.n_batch,
+            dim=batch,
             inputs=[
-                self.joint_q_proposed,
-                self.residuals_proposed,
-                self.costs_proposed,
-                self.accept_flags,
+                ctx_curr.joint_q_proposed,
+                ctx_prop.residuals,
+                self.costs_proposed[:batch],
+                self.accept_flags[:batch],
                 self.n_coords,
                 self.n_residuals,
                 self.lambda_factor,
                 self.lambda_min,
                 self.lambda_max,
             ],
-            outputs=[joint_q, self.residuals, self.costs, self.lambda_values],
+            outputs=[joint_q, ctx_curr.residuals, self.costs[:batch], self.lambda_values[:batch]],
             device=self.device,
         )
 
@@ -653,15 +756,19 @@ class IKOptimizerLM:
         Returns:
             Costs for each batch row, shape [n_batch].
         """
-        self._compute_residuals(joint_q)
+        batch = joint_q.shape[0]
+        if batch < 1 or batch > self.n_batch:
+            raise ValueError("joint_q batch must be within the optimizer capacity")
+        residuals = self._compute_residuals(joint_q, self.residuals[:batch])
+        costs = self.costs[:batch]
         wp.launch(
             compute_costs,
-            dim=self.n_batch,
-            inputs=[self.residuals, self.n_residuals],
-            outputs=[self.costs],
+            dim=batch,
+            inputs=[residuals, self.n_residuals],
+            outputs=[costs],
             device=self.device,
         )
-        return self.costs
+        return costs
 
     def _solve_tiled(
         self,
@@ -933,7 +1040,7 @@ class IKOptimizerLM:
             ) -> None:
                 wp.launch_tiled(
                     _lm_solve_tiled,
-                    dim=[self.n_batch],
+                    dim=[jac.shape[0]],
                     inputs=[jac, res, lam, dq, pred],
                     block_dim=self.TILE_THREADS,
                     device=self.device,
