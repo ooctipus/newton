@@ -430,6 +430,22 @@ class DynamicsInverse:
         batch_size: Number of generalized states evaluated per call.
     """
 
+    @staticmethod
+    def estimate_memory(model: Model, batch_size: int) -> int:
+        """Return exact persistent evaluator storage [byte].
+
+        Args:
+            model: Fixed articulation model.
+            batch_size: Candidate number of generalized states.
+
+        Returns:
+            Device bytes allocated by :class:`DynamicsInverse`.
+        """
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        scalar_bytes = wp.types.type_size_in_bytes(wp.float32)
+        return batch_size * (31 * model.body_count + 6 * model.joint_dof_count) * scalar_bytes
+
     def __init__(self, model: Model, batch_size: int):
         if model.articulation_count < 1:
             raise ValueError("Inverse dynamics requires at least one articulation")

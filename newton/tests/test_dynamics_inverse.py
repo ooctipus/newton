@@ -235,6 +235,26 @@ def test_cuda_graph_capture(test, device):
     test.assertTrue(np.all(np.isfinite(joint_f.numpy())))
 
 
+def test_memory_estimate(test, device):
+    model, _body, _mass, _length, _inertia_z = _build_pendulum(device)
+    evaluator = newton.dynamics.DynamicsInverse(model, 5)
+    arrays = (
+        evaluator._body_q,
+        evaluator._body_qd,
+        evaluator._joint_S,
+        evaluator._body_v,
+        evaluator._body_a,
+        evaluator._body_f,
+    )
+    actual = sum(array.size * wp.types.type_size_in_bytes(array.dtype) for array in arrays)
+
+    test.assertEqual(newton.dynamics.DynamicsInverse.estimate_memory(model, 5), actual)
+    test.assertEqual(
+        newton.dynamics.DynamicsInverse.estimate_memory(model, 10),
+        2 * newton.dynamics.DynamicsInverse.estimate_memory(model, 5),
+    )
+
+
 class TestDynamicsInverse(unittest.TestCase):
     pass
 
@@ -267,6 +287,7 @@ add_function_test(
     devices=devices,
 )
 add_function_test(TestDynamicsInverse, "test_cuda_graph_capture", test_cuda_graph_capture, devices=devices)
+add_function_test(TestDynamicsInverse, "test_memory_estimate", test_memory_estimate, devices=devices)
 
 
 if __name__ == "__main__":
