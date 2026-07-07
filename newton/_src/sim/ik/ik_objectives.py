@@ -138,11 +138,12 @@ class IKObjective:
         n_batch: int,
         total_residuals: int,
     ) -> int:
-        """Estimate objective target and workspace device memory [byte].
+        """Estimate objective-owned persistent workspace device memory [byte].
 
         This method is called on a small representative objective before the
-        production batch is allocated. Implementations must describe every
-        target and workspace array that the real objective will create.
+        production batch is allocated. Implementations must describe every persistent array created by
+        :meth:`init_buffers`. Constructor-supplied arrays remain caller-owned
+        and must not be counted.
 
         Args:
             model: Shared articulation model.
@@ -355,15 +356,15 @@ class IKObjectivePosition(IKObjective):
         n_batch: int,
         total_residuals: int,
     ) -> int:
-        """Estimate position targets and Jacobian workspace [byte]."""
-        target_bytes = n_problems * wp.types.type_size_in_bytes(wp.vec3)
+        """Estimate objective-owned Jacobian workspace [byte]."""
+        del n_problems
         if jacobian_mode in (IKJacobianType.ANALYTIC, IKJacobianType.MIXED):
             workspace_bytes = model.joint_dof_count * wp.types.type_size_in_bytes(wp.uint8)
         elif jacobian_mode == IKJacobianType.AUTODIFF:
             workspace_bytes = 3 * n_batch * total_residuals * wp.types.type_size_in_bytes(wp.float32)
         else:
             raise ValueError(f"Unsupported Jacobian mode: {jacobian_mode}")
-        return target_bytes + workspace_bytes
+        return workspace_bytes
 
     def supports_analytic(self) -> bool:
         """Return ``True`` because this objective has an analytic Jacobian."""
@@ -1017,15 +1018,15 @@ class IKObjectiveRotation(IKObjective):
         n_batch: int,
         total_residuals: int,
     ) -> int:
-        """Estimate rotation targets and Jacobian workspace [byte]."""
-        target_bytes = n_problems * wp.types.type_size_in_bytes(wp.vec4)
+        """Estimate objective-owned Jacobian workspace [byte]."""
+        del n_problems
         if jacobian_mode in (IKJacobianType.ANALYTIC, IKJacobianType.MIXED):
             workspace_bytes = model.joint_dof_count * wp.types.type_size_in_bytes(wp.uint8)
         elif jacobian_mode == IKJacobianType.AUTODIFF:
             workspace_bytes = 3 * n_batch * total_residuals * wp.types.type_size_in_bytes(wp.float32)
         else:
             raise ValueError(f"Unsupported Jacobian mode: {jacobian_mode}")
-        return target_bytes + workspace_bytes
+        return workspace_bytes
 
     def supports_analytic(self) -> bool:
         """Return ``True`` because this objective has an analytic Jacobian."""

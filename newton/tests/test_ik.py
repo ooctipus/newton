@@ -508,7 +508,23 @@ def test_solver_memory_estimate_includes_objectives(test, device):
             for owner in (solver, solver._impl, built_in_objective):
                 for value in vars(owner).values():
                     add_arrays(value, arrays)
+            arrays.pop((str(mode_targets.device), mode_targets.ptr))
             test.assertEqual(built_in_estimate.total_bytes, sum(arrays.values()), str(mode))
+
+
+def test_builtin_objective_memory_excludes_caller_rotation_targets(test, device):
+    with wp.ScopedDevice(device):
+        model = _build_two_link_planar(device)
+        targets = wp.array([[0.0, 0.0, 0.0, 1.0]] * 4, dtype=wp.vec4, device=device)
+        objective = ik.IKObjectiveRotation(1, wp.quat_identity(), targets)
+        estimate = ik.IKSolver.estimate_memory(
+            model,
+            4,
+            [objective],
+            jacobian_mode=ik.IKJacobianType.ANALYTIC,
+        )
+
+        test.assertEqual(estimate.objective_bytes, model.joint_dof_count)
 
 
 def _convergence_test_free(test, device, mode: ik.IKJacobianType):
@@ -1080,6 +1096,12 @@ add_function_test(
     TestIKModes,
     "test_solver_memory_estimate_includes_objectives",
     test_solver_memory_estimate_includes_objectives,
+    devices,
+)
+add_function_test(
+    TestIKModes,
+    "test_builtin_objective_memory_excludes_caller_rotation_targets",
+    test_builtin_objective_memory_excludes_caller_rotation_targets,
     devices,
 )
 
