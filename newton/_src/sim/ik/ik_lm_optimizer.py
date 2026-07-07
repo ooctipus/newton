@@ -602,6 +602,77 @@ class IKOptimizerLM:
 
         return ctx.residuals
 
+    def linearize(
+        self,
+        joint_q: wp.array2d[wp.float32],
+        residuals: wp.array2d[wp.float32] | None = None,
+        jacobian: wp.array3d[wp.float32] | None = None,
+    ) -> tuple[wp.array2d[wp.float32], wp.array3d[wp.float32]]:
+        """Evaluate objective residuals and their joint-velocity Jacobian.
+
+        Args:
+            joint_q: Joint coordinates [m or rad], shape
+                ``[batch, joint_coord_count]``. The batch may use any leading
+                prefix of the optimizer capacity.
+            residuals: Optional output buffer, shape
+                ``[batch, num_residuals]``.
+            jacobian: Optional output buffer, shape
+                ``[batch, num_residuals, joint_dof_count]``.
+
+        Returns:
+            Residual and Jacobian views for the active batch.
+        """
+        batch = joint_q.shape[0]
+        if batch < 1 or batch > self.n_batch or joint_q.shape[1] != self.n_coords:
+            raise ValueError("joint_q must be a nonempty leading batch within the optimizer capacity")
+        if residuals is not None and residuals.shape != (batch, self.n_residuals):
+            raise ValueError("residuals has incompatible shape")
+        if jacobian is not None and jacobian.shape != (batch, self.n_residuals, self.n_dofs):
+            raise ValueError("jacobian has incompatible shape")
+        residuals = self.residuals[:batch] if residuals is None else residuals
+        jacobian = self.jacobian[:batch] if jacobian is None else jacobian
+        ctx = self._ctx_solver(joint_q, residuals=residuals, jacobian=jacobian)
+        if self.jacobian_mode in (IKJacobianType.AUTODIFF, IKJacobianType.MIXED):
+            self._residuals_autodiff(ctx)
+        else:
+            self._residuals_analytic(ctx)
+        self._jacobian_at(ctx)
+        return ctx.residuals, ctx.jacobian_out
+
+    def integrate(
+        self,
+        joint_q: wp.array2d[wp.float32],
+        delta: wp.array2d[wp.float32],
+        joint_q_out: wp.array2d[wp.float32],
+        *,
+        step_size: float = 1.0,
+    ) -> None:
+        """Integrate one tangent-space update into joint coordinates.
+
+        Args:
+            joint_q: Joint coordinates [m or rad], shape
+                ``[batch, joint_coord_count]``.
+            delta: Joint-velocity tangent update [m or rad], shape
+                ``[batch, joint_dof_count]``.
+            joint_q_out: Updated joint coordinates [m or rad], shape matching
+                :paramref:`joint_q`. It may alias :paramref:`joint_q`.
+            step_size: Unitless update scale.
+        """
+        batch = joint_q.shape[0]
+        if batch < 1 or batch > self.n_batch or joint_q.shape[1] != self.n_coords:
+            raise ValueError("joint_q must be a nonempty leading batch within the optimizer capacity")
+        if delta.shape != (batch, self.n_dofs) or joint_q_out.shape != joint_q.shape:
+            raise ValueError("delta or joint_q_out has incompatible shape")
+        if not np.isfinite(step_size):
+            raise ValueError("step_size must be finite")
+        self._integrate_dq(
+            joint_q,
+            dq_in=delta,
+            joint_q_out=joint_q_out,
+            joint_qd_out=self.qd_zero[:batch],
+            step_size=step_size,
+        )
+
     def _compute_motion_subspace(
         self,
         *,

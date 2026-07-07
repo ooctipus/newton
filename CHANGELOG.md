@@ -8,6 +8,7 @@
 - Add user-defined pressure laws to hydroelastic SDF contact via `HydroelasticSDF.Config.pressure_func` (a `@wp.func` mapping `(signed_depth, shape_idx, data) -> pressure`) and `pressure_data` (a `@wp.struct` carrying per-shape state). The contact patch is the iso-pressure surface `p_a == p_b`; the default linear law `pressure = -kh * signed_depth` is preserved when no callback is supplied.
 - Add `--render-fps` to cap example rendering rate without changing simulation frame timing
 - Add `IKSolver.solve()` for convergence-aware active-prefix LM solves with projection callbacks, typed results, and pre-allocation device-memory estimates
+- Add `IKOptimizerLM.linearize()` and `IKOptimizerLM.integrate()` for public residual/Jacobian evaluation and manifold tangent updates over active batch prefixes
 
 ### Changed
 

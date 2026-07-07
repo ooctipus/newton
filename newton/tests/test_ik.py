@@ -700,6 +700,81 @@ def _jacobian_compare(test, device, objective_builder):
         assert_np_equal(J_auto, J_ana, tol=1e-4)
 
 
+def test_optimizer_public_linearization_matches_finite_difference(test, device):
+    """The public linearizer must expose the same tangent convention used by integration."""
+    with wp.ScopedDevice(device):
+        batch = 3
+        capacity = 5
+        model = _build_two_link_planar(device)
+        objective = _pos_objective_builder(model, capacity)[0]
+        optimizer = ik.IKOptimizerLM(
+            model,
+            capacity,
+            [objective],
+            jacobian_mode=ik.IKJacobianType.ANALYTIC,
+        )
+        joint_q_np = np.array([[0.2, -0.4], [-0.7, 0.3], [1.1, -0.2]], dtype=np.float32)
+        joint_q = wp.array(joint_q_np, dtype=wp.float32, device=device)
+        residuals = wp.empty((batch, optimizer.n_residuals), dtype=wp.float32, device=device)
+        jacobian = wp.empty((batch, optimizer.n_residuals, optimizer.n_dofs), dtype=wp.float32, device=device)
+
+        residual_view, jacobian_view = optimizer.linearize(joint_q, residuals, jacobian)
+        test.assertEqual(residual_view.ptr, residuals.ptr)
+        test.assertEqual(jacobian_view.ptr, jacobian.ptr)
+
+        epsilon = 1.0e-3
+        finite_difference = np.empty_like(jacobian.numpy())
+        delta_np = np.zeros((batch, optimizer.n_dofs), dtype=np.float32)
+        joint_q_plus = wp.empty_like(joint_q)
+        joint_q_minus = wp.empty_like(joint_q)
+        for dof in range(optimizer.n_dofs):
+            delta_np[:, dof] = epsilon
+            delta = wp.array(delta_np, dtype=wp.float32, device=device)
+            optimizer.integrate(joint_q, delta, joint_q_plus)
+            optimizer.integrate(joint_q, delta, joint_q_minus, step_size=-1.0)
+            residual_plus, _ = optimizer.linearize(joint_q_plus)
+            residual_plus_np = residual_plus.numpy().copy()
+            residual_minus, _ = optimizer.linearize(joint_q_minus)
+            finite_difference[:, :, dof] = (residual_plus_np - residual_minus.numpy()) / (2.0 * epsilon)
+            delta_np[:, dof] = 0.0
+
+        assert_np_equal(jacobian.numpy(), finite_difference, tol=2.0e-3)
+
+
+def test_optimizer_public_integrate_supports_aliasing(test, device):
+    """Manifold integration must produce the same result in and out of place."""
+    with wp.ScopedDevice(device):
+        batch = 2
+        model = _build_free_plus_revolute(device)
+        targets = wp.zeros(batch, dtype=wp.vec3, device=device)
+        objective = ik.IKObjectivePosition(1, wp.vec3(), targets)
+        optimizer = ik.IKOptimizerLM(
+            model,
+            batch,
+            [objective],
+            jacobian_mode=ik.IKJacobianType.ANALYTIC,
+        )
+        joint_q_np = np.zeros((batch, model.joint_coord_count), dtype=np.float32)
+        joint_q_np[:, 3:7] = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        delta_np = np.array(
+            [
+                [0.1, -0.2, 0.3, 0.2, -0.1, 0.4, 0.15],
+                [-0.3, 0.1, 0.2, -0.4, 0.2, 0.1, -0.25],
+            ],
+            dtype=np.float32,
+        )
+        joint_q = wp.array(joint_q_np, dtype=wp.float32, device=device)
+        delta = wp.array(delta_np, dtype=wp.float32, device=device)
+        expected = wp.empty_like(joint_q)
+        optimizer.integrate(joint_q, delta, expected, step_size=0.5)
+
+        aliased = wp.array(joint_q_np, dtype=wp.float32, device=device)
+        optimizer.integrate(aliased, delta, aliased, step_size=0.5)
+        assert_np_equal(aliased.numpy(), expected.numpy(), tol=1.0e-6)
+        quaternion_norm = np.linalg.norm(aliased.numpy()[:, 3:7], axis=1)
+        assert_np_equal(quaternion_norm, np.ones(batch), tol=1.0e-6)
+
+
 # ----------------------------------------------------------------------------
 # 2a.  Position Jacobian
 # ----------------------------------------------------------------------------
@@ -847,6 +922,18 @@ add_function_test(TestIKModes, "test_position_jacobian_compare", test_position_j
 add_function_test(TestIKModes, "test_rotation_jacobian_compare", test_rotation_jacobian_compare, cuda_devices)
 add_function_test(TestIKModes, "test_joint_limit_jacobian_compare", test_joint_limit_jacobian_compare, devices)
 add_function_test(TestIKModes, "test_d6_jacobian_compare", test_d6_jacobian_compare, cuda_devices)
+add_function_test(
+    TestIKModes,
+    "test_optimizer_public_linearization_matches_finite_difference",
+    test_optimizer_public_linearization_matches_finite_difference,
+    devices,
+)
+add_function_test(
+    TestIKModes,
+    "test_optimizer_public_integrate_supports_aliasing",
+    test_optimizer_public_integrate_supports_aliasing,
+    devices,
+)
 
 
 if __name__ == "__main__":
