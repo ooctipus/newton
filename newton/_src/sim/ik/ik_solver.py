@@ -247,10 +247,9 @@ class IKSolver:
 
         Objective instances may be one-row representatives. Their
         :meth:`~newton.ik.IKObjective.estimate_memory` implementations receive
-        the requested production dimensions and must include target arrays and
-        objective workspaces that the real batch will allocate. The small
-        representative arrays are caller-owned and already live, so they are
-        intentionally excluded.
+        the requested production dimensions and must include persistent objective
+        workspaces created during initialization. Constructor-supplied target
+        arrays are caller-owned and excluded.
 
         Args:
             model: Shared articulation model.

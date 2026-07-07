@@ -19,7 +19,7 @@ from ..enums import BodyFlags
 class IKMemoryEstimate:
     """Estimated persistent Warp-array memory required by one IK solver [byte].
 
-    The estimate is exact for solver-owned Warp arrays and objective arrays
+    The estimate is exact for solver-owned Warp arrays and objective-owned arrays
     declared through :meth:`~newton.ik.IKObjective.estimate_memory`. It excludes
     caller-live arrays, CUDA streams/events, allocator granularity, JIT modules,
     and transient kernel or autodiff runtime storage. Callers selecting a batch
@@ -29,7 +29,7 @@ class IKMemoryEstimate:
         frontend_bytes: Sampling and selection buffers owned by
             :class:`~newton.ik.IKSolver` [byte].
         optimizer_bytes: Persistent optimizer buffers [byte].
-        objective_bytes: Objective target and workspace buffers [byte].
+        objective_bytes: Objective-owned persistent workspace buffers [byte].
     """
 
     frontend_bytes: int
