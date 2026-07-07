@@ -13,8 +13,9 @@ from typing import Any, ClassVar
 import numpy as np
 import warp as wp
 
+from ..articulation import eval_fk_batched
 from ..model import Model
-from .ik_common import IKJacobianType, IKSolveResult, compute_costs, eval_fk_batched, fk_accum, mean_cost
+from .ik_common import IKJacobianType, IKSolveResult, compute_costs, fk_accum, mean_cost
 from .ik_objectives import IKObjective
 
 

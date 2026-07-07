@@ -528,6 +528,116 @@ def eval_fk(
 
 
 @wp.kernel
+def _eval_fk_articulation_batched(
+    articulation_start: wp.array[wp.int32],
+    articulation_end: wp.array[wp.int32],
+    joint_articulation: wp.array[int],
+    joint_q: wp.array2d[wp.float32],
+    joint_qd: wp.array2d[wp.float32],
+    joint_q_start: wp.array[wp.int32],
+    joint_qd_start: wp.array[wp.int32],
+    joint_type: wp.array[wp.int32],
+    joint_parent: wp.array[wp.int32],
+    joint_child: wp.array[wp.int32],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_dof_dim: wp.array2d[wp.int32],
+    body_com: wp.array[wp.vec3],
+    body_flags: wp.array[wp.int32],
+    body_q: wp.array2d[wp.transform],
+    body_qd: wp.array2d[wp.spatial_vector],
+):
+    problem_idx, articulation_idx = wp.tid()
+
+    joint_start = articulation_start[articulation_idx]
+    joint_end = articulation_end[articulation_idx]
+
+    eval_single_articulation_fk(
+        joint_start,
+        joint_end,
+        joint_articulation,
+        joint_q[problem_idx],
+        joint_qd[problem_idx],
+        joint_q_start,
+        joint_qd_start,
+        joint_type,
+        joint_parent,
+        joint_child,
+        joint_X_p,
+        joint_X_c,
+        joint_axis,
+        joint_dof_dim,
+        body_com,
+        body_flags,
+        int(BodyFlags.ALL),
+        body_q[problem_idx],
+        body_qd[problem_idx],
+    )
+
+
+def eval_fk_batched(
+    model: Model,
+    joint_q: wp.array2d[wp.float32],
+    joint_qd: wp.array2d[wp.float32],
+    body_q: wp.array2d[wp.transform],
+    body_qd: wp.array2d[wp.spatial_vector],
+) -> None:
+    """Evaluate forward kinematics for a batch of generalized states.
+
+    All arrays are caller-owned and reside on :attr:`~newton.Model.device`.
+    The function performs no allocation or synchronization.
+
+    Args:
+        model: Fixed articulation model shared by every batch row.
+        joint_q: Generalized positions [m or rad], shape
+            ``[batch_size, joint_coord_count]``.
+        joint_qd: Generalized velocities [m/s or rad/s], shape
+            ``[batch_size, joint_dof_count]``.
+        body_q: Output body transforms [m, quaternion], shape
+            ``[batch_size, body_count]``.
+        body_qd: Output body COM twists [m/s, rad/s] in world coordinates,
+            shape ``[batch_size, body_count]``.
+    """
+    n_problems = joint_q.shape[0]
+    expected_shapes = (
+        ("joint_q", joint_q.shape, (n_problems, model.joint_coord_count)),
+        ("joint_qd", joint_qd.shape, (n_problems, model.joint_dof_count)),
+        ("body_q", body_q.shape, (n_problems, model.body_count)),
+        ("body_qd", body_qd.shape, (n_problems, model.body_count)),
+    )
+    for name, shape, expected in expected_shapes:
+        if shape != expected:
+            raise ValueError(f"{name} must have shape {expected}, received {shape}")
+    if any(array.device != model.device for array in (joint_q, joint_qd, body_q, body_qd)):
+        raise ValueError("Batched forward-kinematics arrays must reside on model.device")
+    wp.launch(
+        kernel=_eval_fk_articulation_batched,
+        dim=[n_problems, model.articulation_count],
+        inputs=[
+            model.articulation_start,
+            model.articulation_end,
+            model.joint_articulation,
+            joint_q,
+            joint_qd,
+            model.joint_q_start,
+            model.joint_qd_start,
+            model.joint_type,
+            model.joint_parent,
+            model.joint_child,
+            model.joint_X_p,
+            model.joint_X_c,
+            model.joint_axis,
+            model.joint_dof_dim,
+            model.body_com,
+            model.body_flags,
+        ],
+        outputs=[body_q, body_qd],
+        device=model.device,
+    )
+
+
+@wp.kernel
 def compute_shape_world_transforms(
     shape_transform: wp.array[wp.transform],
     shape_body: wp.array[int],

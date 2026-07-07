@@ -10,6 +10,7 @@ newton
 .. rubric:: Submodules
 
 - :doc:`newton.actuators <newton_actuators>`
+- :doc:`newton.dynamics <newton_dynamics>`
 - :doc:`newton.geometry <newton_geometry>`
 - :doc:`newton.ik <newton_ik>`
 - :doc:`newton.math <newton_math>`
@@ -56,6 +57,7 @@ newton
 
    AxisType
    eval_fk
+   eval_fk_batched
    eval_ik
    eval_jacobian
    eval_mass_matrix

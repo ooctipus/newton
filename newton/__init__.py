@@ -88,6 +88,7 @@ from ._src.sim import (  # noqa: E402
     State,
     StateFlags,
     eval_fk,
+    eval_fk_batched,
     eval_ik,
     eval_jacobian,
     eval_mass_matrix,
@@ -107,6 +108,7 @@ __all__ += [
     "State",
     "StateFlags",
     "eval_fk",
+    "eval_fk_batched",
     "eval_ik",
     "eval_jacobian",
     "eval_mass_matrix",
@@ -115,10 +117,11 @@ __all__ += [
 # ==================================================================================
 # submodule APIs
 # ==================================================================================
-from . import actuators, geometry, ik, math, selection, sensors, solvers, usd, utils, viewer  # noqa: E402
+from . import actuators, dynamics, geometry, ik, math, selection, sensors, solvers, usd, utils, viewer  # noqa: E402
 
 __all__ += [
     "actuators",
+    "dynamics",
     "geometry",
     "ik",
     "math",

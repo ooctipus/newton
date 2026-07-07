@@ -9,7 +9,7 @@ import warp as wp
 
 import newton
 import newton.ik as ik
-from newton._src.sim.ik.ik_common import eval_fk_batched
+from newton import eval_fk_batched
 from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices, get_test_devices
 
 
