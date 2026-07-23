@@ -31,7 +31,13 @@ PGS_CONSTRAINT_TYPE_JOINT_LIMIT = 3
 # appendix). Finite limits create two unilateral rows every step: one lower
 # bound row and one upper bound row. No Baumgarte / ERP bias.
 PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT = 4
-PGS_CONSTRAINT_TYPE_COUNT = 5
+# Joint mimic (coupling) row. Enforces the URDF-style relation
+# ``q0 = coef0 + coef1 * q1`` between a follower and leader DOF as a bilateral,
+# unbounded force-drive row (``qd0 - coef1 * qd1 = 0`` with a Baumgarte position
+# bias). MuJoCo projects the same ``constraint_mimic_*`` model data into a soft
+# equality, so a stiff drive row is a faithful reduced-coordinate analog.
+PGS_CONSTRAINT_TYPE_MIMIC = 5
+PGS_CONSTRAINT_TYPE_COUNT = 6
 
 # Numeric IDs for the ``friction_mode`` argument passed to the matrix-free
 # PGS solver kernels.  Mirrors the Python-side string enum on
@@ -2422,6 +2428,116 @@ def populate_joint_limit_J_for_size(
 
 
 # =============================================================================
+# Joint Mimic (Coupling) Constraint Kernels
+# =============================================================================
+# A mimic constraint enforces the URDF-style relation ``q0 = coef0 + coef1 * q1``
+# between a follower DOF (``joint0``) and a leader DOF (``joint1``) as a
+# bilateral, unclamped PGS row: ``J = [+1 @ dof0, -coef1 @ dof1]`` with a
+# position-Baumgarte bias on ``phi = q0 - coef0 - coef1 * q1``. This mirrors the
+# reduced-coordinate mimic joint of the PhysX articulation solver
+# (``DyArticulationMimicJoint``); MuJoCo projects the same ``constraint_mimic_*``
+# model data into a soft equality, so a stiff bilateral row is a faithful
+# reduced-coordinate analog. Only axis 0 of each coupled joint is handled;
+# per-axis coupling for multi-DOF joints is a follow-up.
+
+
+@wp.kernel
+def allocate_mimic_slots(
+    constraint_mimic_enabled: wp.array[wp.bool],
+    mimic_art: wp.array[int],
+    art_to_world: wp.array[int],
+    max_constraints: int,
+    # outputs
+    mimic_slot: wp.array[int],
+    world_slot_counter: wp.array[int],
+):
+    """Allocate one constraint slot per enabled mimic coupling.
+
+    Launched with ``dim = constraint_mimic_count``; each thread reserves a
+    per-world slot for its mimic constraint (``-1`` when disabled or when the
+    world's slot budget is exhausted).
+    """
+    m = wp.tid()
+    mimic_slot[m] = -1
+    if not constraint_mimic_enabled[m]:
+        return
+    world = art_to_world[mimic_art[m]]
+    slot = wp.atomic_add(world_slot_counter, world, 1)
+    if slot < max_constraints:
+        mimic_slot[m] = slot
+
+
+@wp.kernel
+def populate_mimic_J_for_size(
+    mimic_art_start: wp.array[int],
+    mimic_art_list: wp.array[int],
+    constraint_mimic_joint0: wp.array[int],
+    constraint_mimic_joint1: wp.array[int],
+    constraint_mimic_coef0: wp.array[float],
+    constraint_mimic_coef1: wp.array[float],
+    articulation_dof_start: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_q: wp.array[float],
+    art_to_world: wp.array[int],
+    mimic_slot: wp.array[int],
+    group_to_art: wp.array[int],
+    pgs_beta: float,
+    pgs_cfm: float,
+    # outputs
+    J_group: wp.array3d[float],
+    world_row_type: wp.array2d[int],
+    world_row_parent: wp.array2d[int],
+    world_row_mu: wp.array2d[float],
+    world_row_beta: wp.array2d[float],
+    world_row_cfm: wp.array2d[float],
+    world_phi: wp.array2d[float],
+    world_target_velocity: wp.array2d[float],
+):
+    """Populate Jacobian and metadata for mimic coupling rows.
+
+    Launched once per size group with ``dim = n_arts_of_size``. Each thread
+    walks the mimic constraints of one articulation and, for every constraint
+    with a non-negative ``mimic_slot``, writes a two-entry Jacobian row
+    (``+1`` at the follower DOF, ``-coef1`` at the leader DOF) and the bilateral
+    row metadata with ``phi = q0 - coef0 - coef1 * q1``.
+    """
+    group_idx = wp.tid()
+    art = group_to_art[group_idx]
+    world = art_to_world[art]
+    dof_start = articulation_dof_start[art]
+
+    for m in range(mimic_art_start[art], mimic_art_start[art + 1]):
+        mimic_idx = mimic_art_list[m]
+        slot = mimic_slot[mimic_idx]
+        if slot < 0:
+            continue
+
+        joint0 = constraint_mimic_joint0[mimic_idx]
+        joint1 = constraint_mimic_joint1[mimic_idx]
+        coef0 = constraint_mimic_coef0[mimic_idx]
+        coef1 = constraint_mimic_coef1[mimic_idx]
+
+        dof0 = joint_qd_start[joint0]
+        dof1 = joint_qd_start[joint1]
+        q0 = joint_q[joint_q_start[joint0]]
+        q1 = joint_q[joint_q_start[joint1]]
+
+        # Jacobian: +1 at the follower DOF, -coef1 at the leader DOF, so the row
+        # velocity is ``qd0 - coef1 * qd1``.
+        J_group[group_idx, slot, dof0 - dof_start] = 1.0
+        J_group[group_idx, slot, dof1 - dof_start] = -coef1
+
+        world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_MIMIC
+        world_row_parent[world, slot] = -1
+        world_row_mu[world, slot] = 0.0
+        world_row_beta[world, slot] = pgs_beta
+        world_row_cfm[world, slot] = pgs_cfm
+        world_phi[world, slot] = q0 - coef0 - coef1 * q1
+        world_target_velocity[world, slot] = 0.0
+
+
+# =============================================================================
 # Joint Velocity-Limit Constraint Kernels
 # =============================================================================
 # These kernels mirror the PhysX per-DOF velocity-limit formulation documented
@@ -3753,6 +3869,12 @@ def compute_world_contact_bias(
             # input, not as a generic constraint target. Their RHS is handled
             # by the per-row drive descriptor in the matrix-free GS kernel.
             rhs = 0.0
+        elif row_type == PGS_CONSTRAINT_TYPE_MIMIC:
+            # Bilateral coupling row: apply the Baumgarte position bias for both
+            # signs of ``phi = q0 - coef0 - coef1 * q1`` so PGS drives the
+            # coupling error to zero from either side. Left unclamped by every
+            # projection branch, so the row is solved two-sidedly.
+            rhs += bias_scale * beta * phi * inv_dt
         # PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT: no phi-based bias. The
         # constraint is an instantaneous velocity-space projection; the only
         # RHS contribution is ``-target_vel`` (already set above) plus the
