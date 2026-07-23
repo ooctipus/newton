@@ -2471,34 +2471,49 @@ def populate_joint_limit_J_for_size(
 # reduced-coordinate mimic joint of the PhysX articulation solver
 # (``DyArticulationMimicJoint``); MuJoCo projects the same ``constraint_mimic_*``
 # model data into a soft equality, so a stiff bilateral row is a faithful
-# reduced-coordinate analog. Only axis 0 of each coupled joint is handled;
-# per-axis coupling for multi-DOF joints is a follow-up.
+# reduced-coordinate analog. The relation is applied to every DOF of the coupled
+# joint pair, following URDF mimic semantics.
 
 
 @wp.kernel
 def allocate_mimic_slots(
+    constraint_mimic_joint0: wp.array[int],
+    constraint_mimic_joint1: wp.array[int],
     constraint_mimic_enabled: wp.array[wp.bool],
     mimic_art: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
     art_to_world: wp.array[int],
     max_constraints: int,
     # outputs
     mimic_slot: wp.array[int],
     world_slot_counter: wp.array[int],
 ):
-    """Allocate one constraint slot per enabled mimic coupling.
+    """Allocate one constraint slot per coupled DOF of each enabled mimic.
 
-    Launched with ``dim = constraint_mimic_count``; each thread reserves a
-    per-world slot for its mimic constraint (``-1`` when disabled or when the
-    world's slot budget is exhausted).
+    Launched with ``dim = constraint_mimic_count``. The mimic relation applies to
+    every DOF of the coupled joint pair (see
+    :meth:`~newton.ModelBuilder.add_constraint_mimic`), so an ``N``-DOF pair
+    reserves ``N`` rows. ``mimic_slot`` is indexed by the follower DOF
+    (``joint0``'s ``qd_start + axis``) and must be reset to ``-1`` before launch.
     """
     m = wp.tid()
-    mimic_slot[m] = -1
     if not constraint_mimic_enabled[m]:
         return
+    joint0 = constraint_mimic_joint0[m]
+    joint1 = constraint_mimic_joint1[m]
     world = art_to_world[mimic_art[m]]
-    slot = wp.atomic_add(world_slot_counter, world, 1)
-    if slot < max_constraints:
-        mimic_slot[m] = slot
+    # Couple axis-by-axis; take the smaller DOF count so a mismatched pair never
+    # indexes past the leader's DOFs.
+    axis_count = wp.min(
+        joint_dof_dim[joint0, 0] + joint_dof_dim[joint0, 1],
+        joint_dof_dim[joint1, 0] + joint_dof_dim[joint1, 1],
+    )
+    qd0 = joint_qd_start[joint0]
+    for axis in range(axis_count):
+        slot = wp.atomic_add(world_slot_counter, world, 1)
+        if slot < max_constraints:
+            mimic_slot[qd0 + axis] = slot
 
 
 @wp.kernel
@@ -2512,6 +2527,7 @@ def populate_mimic_J_for_size(
     articulation_dof_start: wp.array[int],
     joint_q_start: wp.array[int],
     joint_qd_start: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
     joint_q: wp.array[float],
     art_to_world: wp.array[int],
     mimic_slot: wp.array[int],
@@ -2530,11 +2546,11 @@ def populate_mimic_J_for_size(
 ):
     """Populate Jacobian and metadata for mimic coupling rows.
 
-    Launched once per size group with ``dim = n_arts_of_size``. Each thread
-    walks the mimic constraints of one articulation and, for every constraint
-    with a non-negative ``mimic_slot``, writes a two-entry Jacobian row
-    (``+1`` at the follower DOF, ``-coef1`` at the leader DOF) and the bilateral
-    row metadata with ``phi = q0 - coef0 - coef1 * q1``.
+    Launched once per size group with ``dim = n_arts_of_size``. Each thread walks
+    the mimic constraints of one articulation and, for every coupled DOF with a
+    non-negative ``mimic_slot`` (indexed by follower DOF), writes a two-entry
+    Jacobian row (``+1`` at the follower DOF, ``-coef1`` at the leader DOF) and
+    the bilateral row metadata with ``phi = q0 - coef0 - coef1 * q1``.
     """
     group_idx = wp.tid()
     art = group_to_art[group_idx]
@@ -2543,32 +2559,39 @@ def populate_mimic_J_for_size(
 
     for m in range(mimic_art_start[art], mimic_art_start[art + 1]):
         mimic_idx = mimic_art_list[m]
-        slot = mimic_slot[mimic_idx]
-        if slot < 0:
-            continue
-
         joint0 = constraint_mimic_joint0[mimic_idx]
         joint1 = constraint_mimic_joint1[mimic_idx]
         coef0 = constraint_mimic_coef0[mimic_idx]
         coef1 = constraint_mimic_coef1[mimic_idx]
 
-        dof0 = joint_qd_start[joint0]
-        dof1 = joint_qd_start[joint1]
-        q0 = joint_q[joint_q_start[joint0]]
-        q1 = joint_q[joint_q_start[joint1]]
+        qd0 = joint_qd_start[joint0]
+        qd1 = joint_qd_start[joint1]
+        q0_start = joint_q_start[joint0]
+        q1_start = joint_q_start[joint1]
+        axis_count = wp.min(
+            joint_dof_dim[joint0, 0] + joint_dof_dim[joint0, 1],
+            joint_dof_dim[joint1, 0] + joint_dof_dim[joint1, 1],
+        )
 
-        # Jacobian: +1 at the follower DOF, -coef1 at the leader DOF, so the row
-        # velocity is ``qd0 - coef1 * qd1``.
-        J_group[group_idx, slot, dof0 - dof_start] = 1.0
-        J_group[group_idx, slot, dof1 - dof_start] = -coef1
+        for axis in range(axis_count):
+            dof0 = qd0 + axis
+            slot = mimic_slot[dof0]
+            if slot < 0:
+                continue
+            dof1 = qd1 + axis
 
-        world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_MIMIC
-        world_row_parent[world, slot] = -1
-        world_row_mu[world, slot] = 0.0
-        world_row_beta[world, slot] = pgs_beta
-        world_row_cfm[world, slot] = pgs_cfm
-        world_phi[world, slot] = q0 - coef0 - coef1 * q1
-        world_target_velocity[world, slot] = 0.0
+            # Jacobian: +1 at the follower DOF, -coef1 at the leader DOF, so the
+            # row velocity is ``qd0 - coef1 * qd1``.
+            J_group[group_idx, slot, dof0 - dof_start] = 1.0
+            J_group[group_idx, slot, dof1 - dof_start] = -coef1
+
+            world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_MIMIC
+            world_row_parent[world, slot] = -1
+            world_row_mu[world, slot] = 0.0
+            world_row_beta[world, slot] = pgs_beta
+            world_row_cfm[world, slot] = pgs_cfm
+            world_phi[world, slot] = joint_q[q0_start + axis] - coef0 - coef1 * joint_q[q1_start + axis]
+            world_target_velocity[world, slot] = 0.0
 
 
 # =============================================================================

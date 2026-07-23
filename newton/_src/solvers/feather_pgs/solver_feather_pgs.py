@@ -2493,7 +2493,10 @@ class SolverFeatherPGS(SolverBase):
             self.mimic_art = wp.array(mimic_art_np, dtype=wp.int32, device=device)
             self.mimic_art_start = wp.array(csr_np, dtype=wp.int32, device=device)
             self.mimic_art_list = wp.array(order_np, dtype=wp.int32, device=device)
-            self.mimic_slot = wp.full((mimic_count,), -1, dtype=wp.int32, device=device, requires_grad=requires_grad)
+            # Indexed by follower DOF (``joint0``'s qd_start + axis), reset each step.
+            self.mimic_slot = wp.full(
+                (model.joint_dof_count,), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
+            )
         else:
             self.mimic_count = 0
             self.mimic_art = None
@@ -6653,12 +6656,17 @@ class SolverFeatherPGS(SolverBase):
         # the phase-3 family alongside drives and position limits — allocated
         # before the boundary snapshot below, never in the velocity-limit range.
         if self.mimic_slot is not None:
+            self.mimic_slot.fill_(-1)
             wp.launch(
                 allocate_mimic_slots,
                 dim=self.mimic_count,
                 inputs=[
+                    model.constraint_mimic_joint0,
+                    model.constraint_mimic_joint1,
                     model.constraint_mimic_enabled,
                     self.mimic_art,
+                    model.joint_qd_start,
+                    model.joint_dof_dim,
                     self.art_to_world,
                     max_constraints,
                 ],
@@ -6742,6 +6750,7 @@ class SolverFeatherPGS(SolverBase):
                         self.articulation_dof_start,
                         model.joint_q_start,
                         model.joint_qd_start,
+                        model.joint_dof_dim,
                         state_in.joint_q,
                         self.art_to_world,
                         self.mimic_slot,
