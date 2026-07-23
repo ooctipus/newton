@@ -54,6 +54,7 @@ from .kernels import (
     PROPAGATION_COLOR_TAIL,
     add_dense_contact_compliance_to_diag,
     allocate_joint_limit_slots,
+    allocate_mimic_slots,
     allocate_joint_velocity_limit_slots,
     allocate_physx_drive_slots,
     allocate_rigid_velocity_limit_slots,
@@ -122,6 +123,7 @@ from .kernels import (
     pgs_solve_mf_loop,
     pgs_solve_propagation_contact_loop,
     populate_joint_limit_J_for_size,
+    populate_mimic_J_for_size,
     populate_joint_velocity_limit_J_for_size,
     populate_physx_drive_J_for_size,
     populate_rigid_velocity_limit_rows,
@@ -2470,6 +2472,34 @@ class SolverFeatherPGS(SolverBase):
         else:
             self.limit_slot = None
             self.limit_sign = None
+
+        # Joint mimic (coupling) buffers. One bilateral row per enabled scalar mimic
+        # constraint (``q0 = coef0 + coef1 * q1``). The per-articulation CSR is
+        # precomputed on the host so ``populate_mimic_J_for_size`` can walk each
+        # articulation's mimic constraints the way the joint-limit kernel walks joints.
+        mimic_count = int(model.constraint_mimic_count) if model.constraint_mimic_count is not None else 0
+        if mimic_count > 0:
+            import numpy as _np
+
+            art_start_np = model.articulation_start.numpy()
+            mimic_j0_np = model.constraint_mimic_joint0.numpy()
+            # Follower joint -> owning articulation (largest art with start <= joint index).
+            mimic_art_np = (_np.searchsorted(art_start_np, mimic_j0_np, side="right") - 1).astype(_np.int32)
+            order_np = _np.argsort(mimic_art_np, kind="stable").astype(_np.int32)
+            counts_np = _np.bincount(mimic_art_np, minlength=model.articulation_count)
+            csr_np = _np.zeros(model.articulation_count + 1, dtype=_np.int32)
+            csr_np[1:] = _np.cumsum(counts_np)
+            self.mimic_count = mimic_count
+            self.mimic_art = wp.array(mimic_art_np, dtype=wp.int32, device=device)
+            self.mimic_art_start = wp.array(csr_np, dtype=wp.int32, device=device)
+            self.mimic_art_list = wp.array(order_np, dtype=wp.int32, device=device)
+            self.mimic_slot = wp.full((mimic_count,), -1, dtype=wp.int32, device=device, requires_grad=requires_grad)
+        else:
+            self.mimic_count = 0
+            self.mimic_art = None
+            self.mimic_art_start = None
+            self.mimic_art_list = None
+            self.mimic_slot = None
 
         # Joint velocity-limit buffers (per-DOF tracking). Independent from the
         # joint-position-limit buffers so the two flags can be used separately.
@@ -6619,6 +6649,26 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
+        # Mimic rows are bilateral equalities on joint DOFs, so they belong to
+        # the phase-3 family alongside drives and position limits — allocated
+        # before the boundary snapshot below, never in the velocity-limit range.
+        if self.mimic_slot is not None:
+            wp.launch(
+                allocate_mimic_slots,
+                dim=self.mimic_count,
+                inputs=[
+                    model.constraint_mimic_enabled,
+                    self.mimic_art,
+                    self.art_to_world,
+                    max_constraints,
+                ],
+                outputs=[
+                    self.mimic_slot,
+                    self.slot_counter,
+                ],
+                device=model.device,
+            )
+
         # Unconditional: the phase-3 boundary must be valid even when drive
         # and position-limit rows are disabled (it is then just the current
         # watermark, i.e. the start of the velocity-limit segment).
@@ -6654,6 +6704,47 @@ class SolverFeatherPGS(SolverBase):
                         self.art_to_world,
                         self.limit_slot,
                         self.limit_sign,
+                        self.group_to_art[size],
+                        self.pgs_beta,
+                        self.pgs_cfm,
+                    ],
+                    outputs=[
+                        self.J_by_size[size],
+                        self.row_type,
+                        self.row_parent,
+                        self.row_mu,
+                        self.row_beta,
+                        self.row_cfm,
+                        self.phi,
+                        self.target_velocity,
+                    ],
+                    device=model.device,
+                )
+
+        # Populate joint mimic (coupling) Jacobian rows (per size group)
+        if self.mimic_slot is not None:
+            if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
+                for size in self.size_groups:
+                    self.J_by_size[size].zero_()
+                j_buffers_zeroed = True
+            for size in self.size_groups:
+                n_arts = self.n_arts_by_size[size]
+                wp.launch(
+                    populate_mimic_J_for_size,
+                    dim=n_arts,
+                    inputs=[
+                        self.mimic_art_start,
+                        self.mimic_art_list,
+                        model.constraint_mimic_joint0,
+                        model.constraint_mimic_joint1,
+                        model.constraint_mimic_coef0,
+                        model.constraint_mimic_coef1,
+                        self.articulation_dof_start,
+                        model.joint_q_start,
+                        model.joint_qd_start,
+                        state_in.joint_q,
+                        self.art_to_world,
+                        self.mimic_slot,
                         self.group_to_art[size],
                         self.pgs_beta,
                         self.pgs_cfm,
