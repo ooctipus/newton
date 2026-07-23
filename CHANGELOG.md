@@ -36,6 +36,7 @@
 - Add support for pt2 neural-network checkpoints (saved via `torch.export.save`) in `ControllerNeuralMLP` and `ControllerNeuralLSTM`.
 - Add `SensorContact.position_matrix` alongside `force_matrix`, reporting per-counterpart world-frame contact positions (force-weighted average of contact midpoints).
 - Add `refine_iterations` to `newton.ik.IKSolverTrajectory`: optional float64-residual iterative-refinement passes reusing the stored factors after each `direct`/`spike` linear solve; typically one pass reaches the correctly rounded fp32 solution, and the refined fixed point is independent of the backend choice (bitwise).
+- Add `retire_after_rejects` to `newton.ik.IKSolverTrajectory`: opt-in per-trajectory retirement that masks a trajectory's per-iteration work device-side after the given number of consecutive rejected LM steps (armed once the trajectory has accepted a step), returning exactly the coordinates of its last accepted iteration; `trajectory_retired_at` reports the retirement iteration per trajectory. Off by default.
 - Forward `--warp-config KEY=VALUE` from `python -m newton.tests` to example subprocesses so `warp.config` overrides apply during example tests.
 - Add a `deterministic` constructor argument to `SolverXPBD`, `SolverSemiImplicit`, `SolverFeatherstone`, `SolverVBD`, and `SolverMuJoCo` to opt into deterministic solver execution.
 - Add `--render-fps` to cap example rendering rate without changing simulation frame timing

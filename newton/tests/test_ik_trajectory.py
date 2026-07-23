@@ -576,6 +576,124 @@ def test_trajectory_cg_dot_swap_guard(test, device):
 
 
 # ----------------------------------------------------------------------------
+# 6b.  Per-trajectory retirement (retire_after_rejects)
+# ----------------------------------------------------------------------------
+
+
+_RETIRE_ITERATIONS = 64
+
+
+def _solve_arc_with_retirement(device, linear_solver: str, retire: int | None, n_problems: int = 1):
+    """Solve the shared arc problem; returns (q, retired_at, costs, accept_streams).
+
+    The reference run (``retire=None``) executes ``step``'s host loop unrolled
+    one iteration at a time to record each trajectory's accept/reject stream
+    (bitwise identical to a plain ``step`` call); retirement runs use ``step``."""
+    model = _build_two_link_planar(device)
+    targets_np = _arc_targets(N_FRAMES)
+    solver = ik.IKSolverTrajectory(
+        model,
+        N_FRAMES,
+        _make_arc_tracking_objectives(model, np.tile(targets_np, (n_problems, 1))),
+        n_problems=n_problems,
+        jacobian_mode=ik.IKJacobianType.ANALYTIC,
+        linear_solver=linear_solver,
+        lambda_initial=1e-3,
+        retire_after_rejects=retire,
+    )
+    joint_q = wp.zeros((n_problems * N_FRAMES, model.joint_coord_count), dtype=wp.float32)
+    accepts = None
+    if retire is None:
+        accepts = np.zeros((_RETIRE_ITERATIONS, n_problems), dtype=np.int32)
+        solver.lambda_traj.fill_(solver.lambda_initial)
+        for i in range(_RETIRE_ITERATIONS):
+            solver._step(joint_q, step_size=1.0, iteration=i)
+            accepts[i] = solver.accept_traj.numpy()
+    else:
+        solver.step(joint_q, joint_q, iterations=_RETIRE_ITERATIONS)
+    return joint_q.numpy(), solver.trajectory_retired_at.numpy(), solver.trajectory_costs.numpy(), accepts
+
+
+def _safe_retire_streak(accepts: np.ndarray) -> int:
+    """Smallest bitwise-safe streak for the observed accept streams: one more
+    than the longest post-first-accept reject streak that is FOLLOWED by a
+    later (straggler) accept — the same rule a caller must apply on real
+    workloads before enabling retirement."""
+    s_max = 0
+    for p in range(accepts.shape[1]):
+        idx = np.flatnonzero(accepts[:, p])
+        for a, b in zip(idx[:-1], idx[1:], strict=False):
+            s_max = max(s_max, int(b - a - 1))
+    return s_max + 1
+
+
+def test_trajectory_retirement_bitwise(test, device):
+    """Retirement must fire on a converged solve and leave the coordinates and
+    costs bitwise identical to the full-iteration run, on every backend. A
+    rejected LM step never mutates joint_q, so a streak threshold above every
+    straggler-accept gap of the reference run retires each trajectory strictly
+    after its final accept — bitwise equality by construction. The threshold is
+    calibrated from the reference run's accept streams because the straggler
+    structure is backend- and device-dependent (gaps of 11+ observed)."""
+    with wp.ScopedDevice(device):
+        for linear_solver in ("direct", "spike", "cg"):
+            q_full, retired_full, costs_full, accepts = _solve_arc_with_retirement(device, linear_solver, None)
+            retire = _safe_retire_streak(accepts)
+            last_accept = int(max(np.flatnonzero(accepts[:, p])[-1] for p in range(accepts.shape[1])))
+            test.assertLess(
+                last_accept + retire,
+                _RETIRE_ITERATIONS,
+                f"{linear_solver}: fixture leaves no room to fire (streak {retire}, last accept {last_accept})",
+            )
+            q_ret, retired_ret, costs_ret, _ = _solve_arc_with_retirement(device, linear_solver, retire)
+
+            test.assertTrue((retired_full == -1).all(), f"{linear_solver}: retirement fired while disabled")
+            test.assertTrue(
+                (retired_ret >= 0).all(),
+                f"{linear_solver}: converged trajectory never retired ({retired_ret}, streak {retire})",
+            )
+            test.assertTrue(
+                (q_ret.view(np.uint32) == q_full.view(np.uint32)).all(),
+                f"{linear_solver}: retired coordinates are not bitwise equal to the full run",
+            )
+            test.assertTrue(
+                (costs_ret.view(np.uint32) == costs_full.view(np.uint32)).all(),
+                f"{linear_solver}: retired costs are not bitwise equal to the full run",
+            )
+
+
+def test_trajectory_retirement_batched(test, device):
+    """Batched retirement is per trajectory: retiring copies must not perturb
+    the batch (bitwise vs the unretired batched run)."""
+    with wp.ScopedDevice(device):
+        for linear_solver in ("direct", "spike"):
+            q_full, _, _, accepts = _solve_arc_with_retirement(device, linear_solver, None, n_problems=3)
+            retire = _safe_retire_streak(accepts)
+            q_ret, retired_ret, _, _ = _solve_arc_with_retirement(device, linear_solver, retire, n_problems=3)
+            test.assertTrue(
+                (retired_ret >= 0).all(),
+                f"{linear_solver}: batched trajectories never retired ({retired_ret}, streak {retire})",
+            )
+            test.assertTrue(
+                (q_ret.view(np.uint32) == q_full.view(np.uint32)).all(),
+                f"{linear_solver}: batched retirement perturbed the solution",
+            )
+
+
+def test_trajectory_retirement_validation(test, device):
+    with wp.ScopedDevice(device):
+        model = _build_two_link_planar(device)
+        targets_np = _arc_targets(N_FRAMES)
+        with test.assertRaises(ValueError):
+            ik.IKSolverTrajectory(
+                model,
+                N_FRAMES,
+                _make_arc_tracking_objectives(model, targets_np),
+                retire_after_rejects=0,
+            )
+
+
+# ----------------------------------------------------------------------------
 # 7.  Free-joint trajectory (quaternion tangent path)
 # ----------------------------------------------------------------------------
 
@@ -1038,6 +1156,11 @@ add_function_test(
 add_function_test(TestIKTrajectory, "test_trajectory_segmented_dot", test_trajectory_segmented_dot, cuda_devices)
 add_function_test(
     TestIKTrajectory, "test_trajectory_cg_dot_swap_guard", test_trajectory_cg_dot_swap_guard, cuda_devices
+)
+add_function_test(TestIKTrajectory, "test_trajectory_retirement_bitwise", test_trajectory_retirement_bitwise, devices)
+add_function_test(TestIKTrajectory, "test_trajectory_retirement_batched", test_trajectory_retirement_batched, devices)
+add_function_test(
+    TestIKTrajectory, "test_trajectory_retirement_validation", test_trajectory_retirement_validation, devices
 )
 add_function_test(TestIKTrajectory, "test_trajectory_free_joint", test_trajectory_free_joint, devices)
 add_function_test(
