@@ -288,6 +288,7 @@
 - Fix `ArticulationView.is_fixed_base` for roots with zero effective degrees of freedom, including fully locked D6 joints. (#3727)
 - Fix USD plane visual width and length to scale along the axes defined by the `UsdGeomPlane` schema, and orient X- and Y-axis plane visuals along the authored axis.
 - Validate `ArticulationView` mask shapes and devices before launching selection kernels. (#3448)
+- Fix `SolverFeatherPGS.notify_model_changed` ignoring `ModelFlags.BODY_INERTIAL_PROPERTIES`, so runtime changes to body center of mass, mass, or inertia now update the simulated dynamics.
 - Exclude active particles with non-finite positions from rebuildable `SolverImplicitMPM` sparse-grid packing.
 - Fix incorrect hydroelastic contact surfaces for primitive shapes. (#3150, #3239)
 - Fix masked `SolverCoupledProxy.reset()` calls clearing proxy feedback history for unselected worlds.
