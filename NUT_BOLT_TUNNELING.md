@@ -14,9 +14,26 @@ two minutes.
 | `nut_bolt_curves.py` | penetration vs load, per contact configuration |
 | `nut_bolt_critical.py` | bisects the load a configuration survives |
 | `nut_bolt_hydro_search.py` | scores hydroelastic `kh` on the same scale |
+| `nut_bolt_operating_point.py` | cheapest rate/stiffness that survives, per size |
+| `example_nut_bolt_tunneling.py` | **watch it happen** -- three stiffnesses side by side |
 
 ```bash
 python nut_bolt_curves.py m16_tight      # m4_tight / m8_tight / m12_tight / m16_tight
+
+# Interactive: one nut sinks through the bolt, two hold, same scene same load.
+python example_nut_bolt_tunneling.py
+python example_nut_bolt_tunneling.py --assembly m4_tight --max-force 800
+python example_nut_bolt_tunneling.py --viewer usd --output-path /tmp/nut.usd --num-frames 120
+```
+
+The viewer script prints penetration in pitches per column as it runs, so the
+numbers and the picture agree:
+
+```
+ frame    soft (newton default)           task ke=2.56e6             stiff ke=1e7
+    20                    +2.82                    +0.08                    +0.11
+    50                    +8.22                    +0.09                    +0.12
+    80                   +12.20                    +0.09                    +0.12
 ```
 
 ## What it measures
