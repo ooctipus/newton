@@ -81,6 +81,32 @@ velocity jump in one substep -- the solver explodes before any contact resolves,
 blow-up scored as "held" silently inverts the metric. The rig drives a position target
 with an effort ceiling instead, and treats NaN as a failure, never a pass.
 
+## Operating point per thread size
+
+MuJoCo clamps the contact time constant to >= 2*dt, so the stiffest critically-damped
+contact a solver rate can actually hold is `kd = solver_hz`, `ke = (kd/2)**2`. Asking
+for more stiffness than the rate supports yields a silently clamped contact, not a
+stiffer one. Walking that family upward until penetration stays under a pitch at
+1600 N (`nut_bolt_operating_point.py`):
+
+| size | cheapest safe | solver | ke | kd | worst |
+|---|---|---|---|---|---|
+| m16 | 200 Hz collide x 16 | 3200 Hz | 2.56e6 | 3200 | 0.11p |
+| m12 | 200 Hz collide x 32 | 6400 Hz | 1.02e7 | 6400 | 0.00p |
+| m8 | 200 Hz collide x 16 | 3200 Hz | 2.56e6 | 3200 | 0.14p |
+| m4 | 400 Hz collide x 32 | 12800 Hz | 4.1e7 | 12800 | 0.24p |
+
+The rule reproduces the shipping M16 setting exactly, which is the main reason to
+trust it: it was derived from REFSAFE, not fitted to the answer.
+
+m4 needs 4x the collision rate and 2x the substeps of m16 -- 16x the solver work per
+environment. Adding it to the task is a real compute decision, not a config tweak.
+
+m12 failing at the m16 rung (1.51 pitches) while m8 passes (0.14) does not follow
+thread size monotonically, so it is likely specific to that mesh's clearance rather
+than a general size trend. Worth confirming against the task's own USD before acting
+on it.
+
 ## Hydroelastic
 
 Scored on the same scale, `m16_tight`, worst penetration over 100/400/1600 N:
