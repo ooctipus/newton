@@ -25,16 +25,17 @@ import warp as wp
 import newton
 import newton.examples
 
-# Contact stiffness under test, one nut/bolt pair each.
+# One nut/bolt pair per (ke, kd) cell, laid out as a grid so the whole contact
+# parameter space is screened in a single run.
+#
 #   ke/kd reach MuJoCo as geom_solref = (2/kd, (kd/2)/sqrt(ke)), and REFSAFE
-#   clamps the time constant to >= 2*dt. At a 3200 Hz solver, kd=3200 sits
-#   exactly at that limit -- the stiffest contact the rate can represent.
-VARIANTS = (
-    ("soft (newton default)", 2500.0, 100.0),
-    ("kd = solver rate", 2.56e6, 3200.0),
-    ("stiffer than the rate", 1.0e7, 1.0e4),
-)
-SPACING = 0.06  # [m] between pairs
+#   clamps the time constant to >= 2*dt. A 3200 Hz solver therefore cannot
+#   represent anything stiffer than kd = 3200; asking for more silently yields a
+#   clamped contact. The grid makes that ceiling visible as a boundary rather
+#   than something to be taken on faith.
+KE_RANGE = (1.0e3, 1.0e8)
+KD_RANGE = (5.0e1, 2.0e4)
+SPACING = 0.05  # [m] between pairs
 
 THREAD_PITCH = {"m4": 0.0007, "m8": 0.00125, "m12": 0.00175, "m16": 0.002}
 
@@ -110,12 +111,11 @@ def load_collider(usd_path: str, gap: float, resolution: int, narrow_band: float
 
 
 @wp.kernel
-def press_nut(
+def press_nuts(
     body_q: wp.array(dtype=wp.transform),
     body_qd: wp.array(dtype=wp.spatial_vector),
     body_f: wp.array(dtype=wp.spatial_vector),
-    peak: wp.array(dtype=wp.float32),
-    nut: int,
+    nut_index: wp.array(dtype=wp.int32),
     target_z: float,
     kp: float,
     kd: float,
@@ -126,11 +126,11 @@ def press_nut(
     A raw force on a 30 g free body is unusable -- 4 kN is a 37 m/s velocity jump
     in one substep, which blows the solver up before any contact resolves.
     """
+    nut = nut_index[wp.tid()]
     z = wp.transform_get_translation(body_q[nut])[2]
     vz = wp.spatial_top(body_qd[nut])[2]
     f = wp.clamp(kp * (target_z - z) - kd * vz, -max_force, max_force)
     wp.atomic_add(body_f, nut, wp.spatial_vector(wp.vec3(0.0, 0.0, f), wp.vec3(0.0)))
-    wp.atomic_max(peak, 0, wp.abs(f))
 
 
 class Example:
@@ -144,6 +144,11 @@ class Example:
         self.sim_time = 0.0
         self.frame = 0
 
+        self.side = args.grid
+        self.count = self.side * self.side
+        # Log-spaced so each axis spans decades rather than crowding the top end.
+        self.ke_axis = np.geomspace(*KE_RANGE, self.side)
+        self.kd_axis = np.geomspace(*KD_RANGE, self.side)
         self.pitch = THREAD_PITCH[args.assembly]
         self.gap = args.gap if args.gap > 0 else 0.4 * self.pitch
         # A +/-5 mm band is about seven pitches of an m4 thread; scale it.
@@ -159,10 +164,17 @@ class Example:
 
         builder = newton.ModelBuilder()
         builder.default_shape_cfg.gap = self.gap
-        self.labels, self.nut_bodies = [], []
+        self.nut_bodies, self.cell_ke, self.cell_kd = [], [], []
 
-        for i, (label, ke, kd) in enumerate(VARIANTS):
-            x = (i - (len(VARIANTS) - 1) / 2.0) * SPACING
+        # One world per cell. Sharing a single world is fatal here: the MuJoCo
+        # solve couples every body through one linear system, so the first cell
+        # whose contact diverges takes the whole grid to NaN with it -- which is
+        # exactly the sweep's job to survive.
+        for cell in range(self.count):
+            row, col = divmod(cell, self.side)  # row -> ke, col -> kd
+            ke, kd = float(self.ke_axis[row]), float(self.kd_axis[col])
+            x = (col - (self.side - 1) / 2.0) * SPACING
+            y = (row - (self.side - 1) / 2.0) * SPACING
             shape_cfg = newton.ModelBuilder.ShapeConfig(
                 margin=0.0,
                 # Keep friction well above zero while the cone is pyramidal: mu -> 0
@@ -177,29 +189,45 @@ class Example:
                 mu_rolling=0.0,
                 is_hydroelastic=False,
             )
+            cell_builder = newton.ModelBuilder()
+            cell_builder.default_shape_cfg.gap = self.gap
             # Bolt is static: this measures nut-through-thread, not bolt shove.
-            builder.add_shape_mesh(
+            cell_builder.add_shape_mesh(
                 -1,
-                xform=wp.transform(wp.vec3(x, 0.0, 0.0), wp.quat_identity()),
+                xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
                 mesh=bolt_mesh,
                 cfg=shape_cfg,
-                label=f"bolt_{i}",
+                label="bolt",
             )
-            body = builder.add_body(
-                label=f"nut_{i}",
+            body = cell_builder.add_body(
+                label="nut",
                 xform=wp.transform(
-                    wp.vec3(x, 0.0, nut_z),
+                    wp.vec3(0.0, 0.0, nut_z),
                     wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), nut_yaw),
                 ),
             )
-            builder.add_shape_mesh(body, mesh=nut_mesh, cfg=shape_cfg, label=f"nut_shape_{i}")
-            self.labels.append(label)
-            self.nut_bodies.append(body)
+            cell_builder.add_shape_mesh(body, mesh=nut_mesh, cfg=shape_cfg, label="nut_shape")
+
+            builder.begin_world()
+            builder.add_builder(
+                cell_builder,
+                xform=wp.transform(wp.vec3(x, y, 0.0), wp.quat_identity()),
+                label_prefix=f"c{cell}_",
+            )
+            builder.end_world()
+            self.nut_bodies.append(len(self.nut_bodies))  # one body per world, in order
+            self.cell_ke.append(ke)
+            self.cell_kd.append(kd)
 
         self.model = builder.finalize()
-        self.model.rigid_contact_max = 40000
+        # Headroom matters more than memory here: an overflowing world silently
+        # drops constraints, and a cell that holds only because its contacts were
+        # discarded is indistinguishable from one that genuinely held.
+        per_world = args.per_world_contacts
+        budget = per_world * self.count
+        self.model.rigid_contact_max = budget
         self.collision_pipeline = newton.CollisionPipeline(
-            self.model, reduce_contacts=True, rigid_contact_max=40000, broad_phase="sap"
+            self.model, reduce_contacts=True, rigid_contact_max=budget, broad_phase="sap"
         )
         self.solver = newton.solvers.SolverMuJoCo(
             self.model,
@@ -207,8 +235,8 @@ class Example:
             solver="newton",
             integrator="implicitfast",
             cone=args.cone,
-            njmax=8000,
-            nconmax=8000,
+            njmax=per_world,
+            nconmax=per_world,
             iterations=15,
             ls_iterations=100,
             impratio=1.0,
@@ -220,23 +248,22 @@ class Example:
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
         self.contacts = self.collision_pipeline.contacts()
 
-        self.peak = wp.zeros(1, dtype=wp.float32)
-        self.mass = np.array([float(self.model.body_mass.numpy()[b]) for b in self.nut_bodies])
-        self.prev_vz = np.zeros(len(self.nut_bodies))
-        self.applied = np.zeros(len(self.nut_bodies))
-        self.reaction = np.zeros(len(self.nut_bodies))
-        self.peak_reaction = np.zeros(len(self.nut_bodies))
+        self.nut_index = wp.array(np.asarray(self.nut_bodies, dtype=np.int32), dtype=wp.int32)
+        self.marker_z = float(nut_z + 0.03)
         self.rest_z = None
-        self.force_scale = args.arrow_span / max(args.max_force, 1.0)
+        self.worst = np.zeros(self.count)  # deepest penetration seen, in pitches
+        self.marker_pos = wp.zeros(self.count, dtype=wp.vec3)
+        self.marker_col = wp.zeros(self.count, dtype=wp.vec3)
 
         self.viewer.set_model(self.model)
-        self.viewer.set_camera(pos=wp.vec3(0.0, -0.16, 0.05), pitch=-10.0, yaw=90.0)
+        span = self.side * SPACING
+        self.viewer.set_camera(pos=wp.vec3(0.0, -0.75 * span, 0.55 * span), pitch=-35.0, yaw=90.0)
         print(
-            f"{args.assembly} at assembly fraction {args.assembly_fraction:.2f} "
-            f"({nut_yaw / (2 * math.pi):.2f} turns on), pressing {args.max_force:.0f} N, "
-            f"pitch {self.pitch * 1000:.2f} mm, gap {self.gap * 1000:.2f} mm"
+            f"{args.assembly}, {self.side}x{self.side} = {self.count} pairs, "
+            f"assembly fraction {args.assembly_fraction:.2f} ({nut_yaw / (2 * math.pi):.2f} turns on), "
+            f"pressing {args.max_force:.0f} N, pitch {self.pitch * 1000:.2f} mm"
         )
-        print(f"{'frame':>6} " + " ".join(f"{lbl:>24}" for lbl in self.labels))
+        print(f"ke {KE_RANGE[0]:.0e}..{KE_RANGE[1]:.0e} down rows, kd {KD_RANGE[0]:.0e}..{KD_RANGE[1]:.0e} across columns")
 
     def _z(self) -> np.ndarray:
         q = self.state_0.body_q.numpy()
@@ -246,6 +273,12 @@ class Example:
         qd = self.state_0.body_qd.numpy()
         return np.array([qd[b][2] for b in self.nut_bodies])
 
+    def penetration(self) -> np.ndarray:
+        """Descent past the seated height, in thread pitches, per cell."""
+        if self.rest_z is None:
+            return np.zeros(self.count)
+        return (self.rest_z - self._z()) / self.pitch
+
     def step(self):
         driving = self.frame >= self.args.settle_frames
         self.collision_pipeline.collide(self.state_0, self.contacts)
@@ -253,90 +286,83 @@ class Example:
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)  # mouse picking in the GL viewer
             if driving:
-                for body in self.nut_bodies:
-                    wp.launch(
-                        press_nut,
-                        dim=1,
-                        inputs=[
-                            self.state_0.body_q,
-                            self.state_0.body_qd,
-                            self.state_0.body_f,
-                            self.peak,
-                            body,
-                            0.0,  # drive toward the bolt base
-                            self.args.press_kp,
-                            self.args.press_kd,
-                            self.args.max_force,
-                        ],
-                    )
+                wp.launch(
+                    press_nuts,
+                    dim=self.count,
+                    inputs=[
+                        self.state_0.body_q,
+                        self.state_0.body_qd,
+                        self.state_0.body_f,
+                        self.nut_index,
+                        0.0,  # drive toward the bolt base
+                        self.args.press_kp,
+                        self.args.press_kd,
+                        self.args.max_force,
+                    ],
+                )
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
-        # Contacts carry no force, so take the reaction from the frame's momentum
-        # balance: m*dv/dt = F_drive + m*g + F_contact.
-        vz = self._vz()
-        self.applied = np.full(len(self.nut_bodies), -self.args.max_force if driving else 0.0)
-        self.reaction = self.mass * (vz - self.prev_vz) / self.frame_dt - self.applied + self.mass * 9.81
-        self.prev_vz = vz
-        if driving:
-            self.peak_reaction = np.maximum(self.peak_reaction, np.abs(self.reaction))
-
         if self.frame == self.args.settle_frames - 1:
             self.rest_z = self._z().copy()
-        if self.rest_z is not None and self.frame % 10 == 0:
-            pen = (self.rest_z - self._z()) / self.pitch
-            cells = " ".join(f"{p:>+11.2f}p {r:>+10.0f}N" for p, r in zip(pen, self.reaction))
-            print(f"{self.frame:>6} {cells}", flush=True)
+
+        pen = self.penetration()
+        # A diverged cell must not wash out the map: keep it as NaN and colour it
+        # separately rather than letting it compare False against the threshold.
+        self.worst = np.where(np.isnan(pen), np.nan, np.fmax(self.worst, pen))
+        if driving and self.frame % 20 == 0:
+            held, gone, bad = self._tally(self.worst)
+            print(f"{self.frame:>6}  held {held:>5}   tunneled {gone:>5}   diverged {bad:>5}", flush=True)
 
         self.frame += 1
         self.sim_time += self.frame_dt
 
-    def _arrows(self, values: np.ndarray, base_dz: float):
-        z = self._z()
-        q = self.state_0.body_q.numpy()
-        starts, ends = [], []
-        for i, body in enumerate(self.nut_bodies):
-            base = wp.vec3(float(q[body][0]), float(q[body][1]), float(z[i] + base_dz))
-            starts.append(base)
-            ends.append(wp.vec3(base[0], base[1], float(base[2] + values[i] * self.force_scale)))
-        return wp.array(starts, dtype=wp.vec3), wp.array(ends, dtype=wp.vec3)
+    def _tally(self, pen: np.ndarray) -> tuple[int, int, int]:
+        bad = int(np.isnan(pen).sum())
+        gone = int(np.nansum(pen > 1.0))
+        return self.count - gone - bad, gone, bad
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
-        self.viewer.log_contacts(self.contacts, self.state_0)
 
-        # Red: the load being applied. Same in every column.
-        starts, ends = self._arrows(self.applied, 0.022)
-        self.viewer.log_arrows("force/applied", starts, ends, (1.0, 0.15, 0.15))
-
-        # Blue: descent rate. At steady state the reaction balances the load
-        # whether the nut is held or creeping, so motion is what separates them.
-        starts, ends = self._arrows(self._vz() * self.args.vel_arrow_gain / self.force_scale, 0.016)
-        self.viewer.log_arrows("force/velocity", starts, ends, (0.25, 0.5, 1.0))
-
-        # Green until the nut has sunk a pitch, then red: the contact reaction.
-        pen = (self.rest_z - self._z()) / self.pitch if self.rest_z is not None else np.zeros(len(self.nut_bodies))
-        colors = wp.array(
-            [wp.vec3(1.0, 0.2, 0.2) if p > 1.0 else wp.vec3(0.2, 1.0, 0.3) for p in pen], dtype=wp.vec3
-        )
-        starts, ends = self._arrows(self.reaction, 0.010)
-        self.viewer.log_arrows("force/reaction", starts, ends, colors)
+        # One marker per cell, above the nut: green while the thread holds, red
+        # once it has sunk a pitch, grey if the cell diverged.
+        pen = self.worst
+        q = self.state_0.body_q.numpy()
+        pos, col = [], []
+        for i, body in enumerate(self.nut_bodies):
+            pos.append(wp.vec3(float(q[body][0]), float(q[body][1]), float(self.marker_z)))
+            if np.isnan(pen[i]):
+                col.append(wp.vec3(0.45, 0.45, 0.45))
+            elif pen[i] > 1.0:
+                col.append(wp.vec3(0.95, 0.15, 0.15))
+            else:
+                # Fade green -> amber as a cell approaches the one-pitch threshold.
+                t = float(np.clip(pen[i], 0.0, 1.0))
+                col.append(wp.vec3(0.15 + 0.8 * t, 0.85, 0.2))
+        self.marker_pos.assign(pos)
+        self.marker_col.assign(col)
+        self.viewer.log_points("grid/penetration", self.marker_pos, 0.4 * SPACING, self.marker_col)
 
         self.viewer.end_frame()
 
-    def test_final(self):
-        """An unrotated nut cannot legally descend; a pitch means it ate into the bolt."""
-        pen = (self.rest_z - self._z()) / self.pitch
-        print("\nsummary")
-        for label, p, f in zip(self.labels, pen, self.peak_reaction):
-            # A diverged run must never read as a pass: `nan > 1.0` is False, so
-            # testing the threshold alone silently reports NaN as "held".
-            if not np.isfinite(p):
-                verdict, shown = "DIVERGED", "     nan"
-            else:
-                verdict, shown = ("TUNNELED" if p > 1.0 else "held"), f"{p:>+8.2f}"
-            print(f"  {label:<24} {shown} pitch   peak reaction {f:>7.0f} N   {verdict}")
+    def report(self):
+        """Print the map. Not `test_final`: the runner's NaN guard would abort on
+        the diverged cells, and those cells are the result, not a failure."""
+        pen = self.worst
+        held, gone, bad = self._tally(pen)
+        print(f"\n{self.count} cells:  held {held}   tunneled {gone}   diverged {bad}")
+        print("\nrows = ke (top: {:.0e}, bottom: {:.0e}), cols = kd (left: {:.0e}, right: {:.0e})".format(
+            KE_RANGE[1], KE_RANGE[0], KD_RANGE[0], KD_RANGE[1]))
+        print("  . held    x tunneled    ? diverged\n")
+        for row in range(self.side - 1, -1, -1):
+            line = ""
+            for col in range(self.side):
+                v = pen[row * self.side + col]
+                line += "?" if np.isnan(v) else ("x" if v > 1.0 else ".")
+            print(f"  ke={self.ke_axis[row]:>8.1e}  {line}")
+        print("\n  kd:        " + " ".join(f"{self.kd_axis[c]:.0e}" for c in (0, self.side // 2, self.side - 1)))
 
     @staticmethod
     def create_parser():
@@ -356,12 +382,16 @@ class Example:
         parser.add_argument("--settle-frames", type=int, default=10)
         parser.add_argument("--press-kp", type=float, default=5.0e4)
         parser.add_argument("--press-kd", type=float, default=5.0e2)
-        parser.add_argument("--arrow-span", type=float, default=0.02)
-        parser.add_argument("--vel-arrow-gain", type=float, default=0.25)
+        parser.add_argument("--grid", type=int, default=32,
+                            help="Grid side; 32 gives 1024 nut/bolt pairs.")
+        parser.add_argument("--per-world-contacts", type=int, default=1024,
+                            help="njmax/nconmax per cell. Too low silently drops contacts.")
         return parser
 
 
 if __name__ == "__main__":
     parser = Example.create_parser()
     viewer, args = newton.examples.init(parser)
-    newton.examples.run(Example(viewer, args), args)
+    example = Example(viewer, args)
+    newton.examples.run(example, args)
+    example.report()
