@@ -123,24 +123,23 @@ def load_collider(usd_path: str, gap: float, resolution: int, narrow_band: float
 
 @wp.kernel
 def press_nuts(
-    body_q: wp.array(dtype=wp.transform),
     body_qd: wp.array(dtype=wp.spatial_vector),
     body_f: wp.array(dtype=wp.spatial_vector),
     nut_index: wp.array(dtype=wp.int32),
-    target_z: float,
-    kp: float,
-    kd: float,
-    max_force: float,
+    force: float,
+    damping: float,
 ):
-    """Load the nut the way an arm does: a position source with an effort ceiling.
+    """Press the nut down at a fixed force, with velocity feedback.
 
-    A raw force on a 30 g free body is unusable -- 4 kN is a 37 m/s velocity jump
-    in one substep, which blows the solver up before any contact resolves.
+    This was a PD toward the bolt base with an effort ceiling, but the position
+    term only ever decided whether the ceiling was reached: above roughly 3e4
+    N/m it saturated and the drive was exactly `force`, and below that it quietly
+    delivered less, so the number on the command line was not the load applied.
+    Damping stays -- it measurably changes which cells hold.
     """
     nut = nut_index[wp.tid()]
-    z = wp.transform_get_translation(body_q[nut])[2]
     vz = wp.spatial_top(body_qd[nut])[2]
-    f = wp.clamp(kp * (target_z - z) - kd * vz, -max_force, max_force)
+    f = wp.clamp(-force - damping * vz, -force, 0.0)
     wp.atomic_add(body_f, nut, wp.spatial_vector(wp.vec3(0.0, 0.0, f), wp.vec3(0.0)))
 
 
@@ -343,14 +342,11 @@ class Example:
                     press_nuts,
                     dim=self.count,
                     inputs=[
-                        self.state_0.body_q,
                         self.state_0.body_qd,
                         self.state_0.body_f,
                         self.nut_index,
-                        0.0,  # drive toward the bolt base
-                        self.args.press_kp,
-                        self.args.press_kd,
                         self.args.max_force,
+                        self.args.press_kd,
                     ],
                 )
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
@@ -469,9 +465,12 @@ class Example:
         parser.add_argument("--narrow-band", type=float, default=0.0, help="0 = auto (2.5 x pitch) [m].")
         parser.add_argument("--sdf-resolution", type=int, default=512)
         parser.add_argument("--density", type=float, default=8000.0)
-        parser.add_argument("--settle-frames", type=int, default=10)
-        parser.add_argument("--press-kp", type=float, default=5.0e4)
-        parser.add_argument("--press-kd", type=float, default=5.0e2)
+        parser.add_argument("--settle-frames", type=int, default=10,
+                            help="Frames before the press engages. The nut is seated exactly, "
+                                 "so this only needs to be long enough to read a rest height; "
+                                 "raising it eats into the press within a fixed frame budget.")
+        parser.add_argument("--press-kd", type=float, default=5.0e2,
+                            help="Velocity feedback on the press [N.s/m].")
         parser.add_argument("--grid", type=int, default=32,
                             help="Grid side; 32 gives 1024 nut/bolt pairs.")
         parser.add_argument("--profile-start", type=str, default="fully_screwed",
