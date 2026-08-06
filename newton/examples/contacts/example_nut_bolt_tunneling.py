@@ -35,7 +35,7 @@ import newton.examples
 #   than something to be taken on faith.
 KE_RANGE = (1.0e3, 1.0e8)
 KD_RANGE = (5.0e1, 2.0e4)
-SPACING = 0.05  # [m] between pairs
+SPACING = 0.05  # [m] between pairs; override with --spacing
 
 THREAD_PITCH = {"m4": 0.0007, "m8": 0.00125, "m12": 0.00175, "m16": 0.002}
 
@@ -144,6 +144,7 @@ class Example:
         self.sim_time = 0.0
         self.frame = 0
 
+        self.spacing = args.spacing if args.spacing > 0 else SPACING
         self.side = args.grid
         self.count = self.side * self.side
         # Log-spaced so each axis spans decades rather than crowding the top end.
@@ -173,8 +174,8 @@ class Example:
         for cell in range(self.count):
             row, col = divmod(cell, self.side)  # row -> ke, col -> kd
             ke, kd = float(self.ke_axis[row]), float(self.kd_axis[col])
-            x = (col - (self.side - 1) / 2.0) * SPACING
-            y = (row - (self.side - 1) / 2.0) * SPACING
+            x = (col - (self.side - 1) / 2.0) * self.spacing
+            y = (row - (self.side - 1) / 2.0) * self.spacing
             shape_cfg = newton.ModelBuilder.ShapeConfig(
                 margin=0.0,
                 # Keep friction well above zero while the cone is pyramidal: mu -> 0
@@ -252,11 +253,14 @@ class Example:
         self.marker_z = float(nut_z + 0.03)
         self.rest_z = None
         self.worst = np.zeros(self.count)  # deepest penetration seen, in pitches
-        self.marker_pos = wp.zeros(self.count, dtype=wp.vec3)
-        self.marker_col = wp.zeros(self.count, dtype=wp.vec3)
+        self._panel = None  # matplotlib figure, built lazily on first render
 
         self.viewer.set_model(self.model)
-        span = self.side * SPACING
+        # Each cell is its own world, and the viewer spreads worlds apart on its
+        # own unless told not to. The grid position already encodes (ke, kd), so
+        # any extra spacing would just detach the picture from the layout.
+        self.viewer.set_world_offsets((0.0, 0.0, 0.0))
+        span = self.side * self.spacing
         self.viewer.set_camera(pos=wp.vec3(0.0, -0.75 * span, 0.55 * span), pitch=-35.0, yaw=90.0)
         print(
             f"{args.assembly}, {self.side}x{self.side} = {self.count} pairs, "
@@ -322,29 +326,57 @@ class Example:
         gone = int(np.nansum(pen > 1.0))
         return self.count - gone - bad, gone, bad
 
+    def _draw_panel(self) -> np.ndarray:
+        """Render the sweep as a labelled heatmap, returned as an RGB image."""
+        import matplotlib  # noqa: PLC0415
+
+        matplotlib.use("Agg", force=False)
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+        from matplotlib.colors import ListedColormap, Normalize  # noqa: PLC0415
+
+        if self._panel is None:
+            fig, ax = plt.subplots(figsize=(5.2, 4.4), dpi=110)
+            cmap = plt.get_cmap("RdYlGn_r").copy()
+            cmap.set_bad("0.45")  # diverged cells
+            image = ax.imshow(
+                np.zeros((self.side, self.side)),
+                origin="lower",
+                aspect="auto",
+                cmap=cmap,
+                norm=Normalize(vmin=0.0, vmax=2.0),
+                interpolation="nearest",
+            )
+            ticks = np.linspace(0, self.side - 1, min(6, self.side)).astype(int)
+            ax.set_xticks(ticks)
+            ax.set_xticklabels([f"{self.kd_axis[t]:.0e}" for t in ticks], fontsize=7)
+            ax.set_yticks(ticks)
+            ax.set_yticklabels([f"{self.ke_axis[t]:.0e}" for t in ticks], fontsize=7)
+            ax.set_xlabel("kd  [contact damping]", fontsize=8)
+            ax.set_ylabel("ke  [contact stiffness]", fontsize=8)
+            bar = fig.colorbar(image, ax=ax)
+            bar.set_label("penetration [thread pitches]   grey = diverged", fontsize=7)
+            bar.ax.tick_params(labelsize=7)
+            self._panel = (fig, ax, image)
+
+        fig, ax, image = self._panel
+        grid = np.ma.masked_invalid(self.worst.reshape(self.side, self.side))
+        image.set_data(grid)
+        held, gone, bad = self._tally(self.worst)
+        ax.set_title(
+            f"{self.args.assembly}  frac {self.args.assembly_fraction:.2f}  "
+            f"{self.args.max_force:.0f} N   |   held {held}  tunneled {gone}  diverged {bad}",
+            fontsize=8,
+        )
+        fig.tight_layout()
+        fig.canvas.draw()
+        return np.asarray(fig.canvas.buffer_rgba(), dtype=np.uint8)[..., :3].copy()
+
     def render(self):
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
-
-        # One marker per cell, above the nut: green while the thread holds, red
-        # once it has sunk a pitch, grey if the cell diverged.
-        pen = self.worst
-        q = self.state_0.body_q.numpy()
-        pos, col = [], []
-        for i, body in enumerate(self.nut_bodies):
-            pos.append(wp.vec3(float(q[body][0]), float(q[body][1]), float(self.marker_z)))
-            if np.isnan(pen[i]):
-                col.append(wp.vec3(0.45, 0.45, 0.45))
-            elif pen[i] > 1.0:
-                col.append(wp.vec3(0.95, 0.15, 0.15))
-            else:
-                # Fade green -> amber as a cell approaches the one-pitch threshold.
-                t = float(np.clip(pen[i], 0.0, 1.0))
-                col.append(wp.vec3(0.15 + 0.8 * t, 0.85, 0.2))
-        self.marker_pos.assign(pos)
-        self.marker_col.assign(col)
-        self.viewer.log_points("grid/penetration", self.marker_pos, 0.4 * SPACING, self.marker_col)
-
+        # Redrawing matplotlib every frame would dominate the step time.
+        if self.frame % self.args.panel_interval == 0:
+            self.viewer.log_image("penetration map", self._draw_panel())
         self.viewer.end_frame()
 
     def report(self):
@@ -384,6 +416,10 @@ class Example:
         parser.add_argument("--press-kd", type=float, default=5.0e2)
         parser.add_argument("--grid", type=int, default=32,
                             help="Grid side; 32 gives 1024 nut/bolt pairs.")
+        parser.add_argument("--panel-interval", type=int, default=10,
+                            help="Frames between heatmap panel redraws.")
+        parser.add_argument("--spacing", type=float, default=0.0,
+                            help="Metres between cells; 0 = default (0.05).")
         parser.add_argument("--per-world-contacts", type=int, default=1024,
                             help="njmax/nconmax per cell. Too low silently drops contacts.")
         return parser
