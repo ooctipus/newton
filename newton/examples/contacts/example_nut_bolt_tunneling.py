@@ -463,7 +463,7 @@ class Example:
         parser.add_argument("--cone", type=str, default="pyramidal", choices=["pyramidal", "elliptic"])
         parser.add_argument("--gap", type=float, default=0.0, help="0 = auto (0.4 x thread pitch) [m].")
         parser.add_argument("--narrow-band", type=float, default=0.0, help="0 = auto (2.5 x pitch) [m].")
-        parser.add_argument("--sdf-resolution", type=int, default=512)
+        parser.add_argument("--sdf-resolution", type=int, default=256)
         parser.add_argument("--density", type=float, default=8000.0)
         parser.add_argument("--settle-frames", type=int, default=10,
                             help="Frames before the press engages. The nut is seated exactly, "
