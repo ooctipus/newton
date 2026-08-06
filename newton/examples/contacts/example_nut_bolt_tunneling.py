@@ -54,8 +54,16 @@ ASSEMBLY_PROFILE = {
     "m4": (0.01318, 0.020, 0.0007, 0.0048),
 }
 
+# `fully_screwed_nut_offset` is well up the shaft -- 21.8 mm on a 32 mm m12 bolt --
+# so fraction 0 seats the nut flush with the tip, not down at the head. The
+# keypoint that means "bottom of the thread" is `full_thread`, and starting there
+# sweeps the nut along the whole shaft instead of its top ~13 mm. m12 authors no
+# `full_thread`, so its `head` is used. This departs from the task's own reset,
+# which starts at `fully_screwed_nut_offset`; --profile-start selects.
+FULL_THREAD = {"m16": 0.010, "m12": 0.0, "m8": 0.0084, "m4": 0.0044}
 
-def assembly_pose(size: str, fraction: float) -> tuple[float, float]:
+
+def assembly_pose(size: str, fraction: float, start: str = "fully_screwed") -> tuple[float, float]:
     """Nut root height [m] and z rotation [rad] at ``fraction`` along the assembly.
 
     Args:
@@ -66,6 +74,8 @@ def assembly_pose(size: str, fraction: float) -> tuple[float, float]:
         Nut root height [m] and its rotation about the bolt axis [rad].
     """
     seat_z, tip_z, screw_ratio, align_z = ASSEMBLY_PROFILE[size]
+    if start == "full_thread":
+        seat_z = FULL_THREAD[size]
     distance = tip_z - seat_z
     yaw = fraction * distance / (screw_ratio / (2.0 * math.pi))
     # The align offset and the rotation are both about z, so z is unaffected.
@@ -155,7 +165,7 @@ class Example:
         self.gap = args.gap if args.gap > 0 else 0.4 * self.pitch
         # A +/-5 mm band is about seven pitches of an m4 thread; scale it.
         band = args.narrow_band if args.narrow_band > 0 else 2.5 * self.pitch
-        nut_z, nut_yaw = assembly_pose(args.assembly, args.assembly_fraction)
+        nut_z, nut_yaw = assembly_pose(args.assembly, args.assembly_fraction, args.profile_start)
 
         bolt_mesh = load_collider(
             newton.examples.get_asset(f"nist_bolt_{args.assembly}.usd"), self.gap, args.sdf_resolution, band
@@ -271,10 +281,20 @@ class Example:
         self.viewer.set_world_offsets((0.0, 0.0, 0.0))
         span = self.side * self.spacing
         self.viewer.set_camera(pos=wp.vec3(0.0, -0.75 * span, 0.55 * span), pitch=-35.0, yaw=90.0)
+        # How much of the nut is actually on the bolt. The assembly range spans
+        # roughly one nut height, so a fraction step moves the nut only a few mm
+        # -- invisible on a grid this wide, but decisive for whether it holds.
+        bz = np.asarray(bolt_mesh.vertices)[:, 2]
+        nz = np.asarray(nut_mesh.vertices)[:, 2]
+        overlap = min(nut_z + nz.max(), bz.max()) - max(nut_z + nz.min(), bz.min())
         print(
             f"{args.assembly}, {self.side}x{self.side} = {self.count} pairs, "
             f"assembly fraction {args.assembly_fraction:.2f} ({nut_yaw / (2 * math.pi):.2f} turns on), "
             f"pressing {args.max_force:.0f} N, pitch {self.pitch * 1000:.2f} mm"
+        )
+        print(
+            f"nut seated at z={nut_z * 1000:.2f} mm with {overlap * 1000:.2f} mm of "
+            f"{(nz.max() - nz.min()) * 1000:.2f} mm engaged (bolt tip {bz.max() * 1000:.2f} mm)"
         )
         print(f"ke {KE_RANGE[0]:.0e}..{KE_RANGE[1]:.0e} down rows, kd {KD_RANGE[0]:.0e}..{KD_RANGE[1]:.0e} across columns")
 
@@ -454,6 +474,10 @@ class Example:
         parser.add_argument("--press-kd", type=float, default=5.0e2)
         parser.add_argument("--grid", type=int, default=32,
                             help="Grid side; 32 gives 1024 nut/bolt pairs.")
+        parser.add_argument("--profile-start", type=str, default="fully_screwed",
+                            choices=["fully_screwed", "full_thread"],
+                            help="fully_screwed matches the task reset (nut near the tip); "
+                                 "full_thread starts at the bottom of the shaft.")
         parser.add_argument("--reset-interval", type=int, default=200,
                             help="Frames per episode before re-seating; 0 never resets.")
         parser.add_argument("--panel-interval", type=int, default=10,
