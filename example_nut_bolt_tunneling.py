@@ -27,8 +27,10 @@ import newton.examples
 from nut_bolt_tunneling import (
     ISAACGYM_ENVS_REPO_URL,
     ISAACGYM_NUT_BOLT_FOLDER,
+    NIST_ASSET_DIR,
     THREAD_PITCH,
     _load_mesh,
+    _load_usd_mesh,
     _press,
 )
 
@@ -59,14 +61,24 @@ class Example:
         self.pitch = THREAD_PITCH[args.assembly.split("_")[0]]
         self.settle_frames = args.settle_frames
 
-        asset_dir = newton.examples.download_external_git_folder(ISAACGYM_ENVS_REPO_URL, ISAACGYM_NUT_BOLT_FOLDER)
-        bolt_file = str(asset_dir / f"factory_bolt_{args.assembly}.obj")
-        nut_file = str(asset_dir / f"factory_nut_{args.assembly}_subdiv_3x.obj")
-        bolt_mesh, _, bolt_extent = _load_mesh(bolt_file, args.gap, args.sdf_resolution)
-        nut_mesh, _, nut_extent = _load_mesh(nut_file, args.gap, args.sdf_resolution)
+        # Bare size (m16) = the task's own USD; m16_tight = the IsaacGymEnvs mesh.
+        self.gap = args.gap if args.gap > 0 else 0.4 * self.pitch
+        if "_" not in args.assembly:
+            bolt_file = NIST_ASSET_DIR / f"bolt_{args.assembly}.usd"
+            nut_file = NIST_ASSET_DIR / f"nut_{args.assembly}.usd"
+            loader = _load_usd_mesh
+        else:
+            asset_dir = newton.examples.download_external_git_folder(
+                ISAACGYM_ENVS_REPO_URL, ISAACGYM_NUT_BOLT_FOLDER
+            )
+            bolt_file = str(asset_dir / f"factory_bolt_{args.assembly}.obj")
+            nut_file = str(asset_dir / f"factory_nut_{args.assembly}_subdiv_3x.obj")
+            loader = _load_mesh
+        bolt_mesh, _, bolt_extent = loader(bolt_file, self.gap, args.sdf_resolution)
+        nut_mesh, _, nut_extent = loader(nut_file, self.gap, args.sdf_resolution)
 
         builder = newton.ModelBuilder()
-        builder.default_shape_cfg.gap = args.gap
+        builder.default_shape_cfg.gap = self.gap
 
         self.bolt_top_z = float(bolt_extent[2])
         self.nut_start_z = float(self.bolt_top_z + nut_extent[2] * 0.5 + args.clearance)
@@ -79,7 +91,7 @@ class Example:
                 mu=args.mu,  # keep this well above 0 while cone is pyramidal
                 ke=ke,
                 kd=kd,
-                gap=args.gap,
+                gap=self.gap,
                 density=8000.0,
                 mu_torsional=0.0,
                 mu_rolling=0.0,
@@ -138,7 +150,9 @@ class Example:
         self.viewer.set_camera(
             pos=wp.vec3(0.0, -0.22, 0.09), pitch=-12.0, yaw=90.0
         )
-        print(f"pressing {args.assembly} at {args.max_force:.0f} N, pitch {self.pitch * 1000:.2f} mm")
+        src = "task USD" if "_" not in args.assembly else "IsaacGymEnvs mesh"
+        print(f"pressing {args.assembly} ({src}) at {args.max_force:.0f} N, "
+              f"pitch {self.pitch * 1000:.2f} mm, gap {self.gap * 1000:.2f} mm")
         print(f"{'frame':>6} " + " ".join(f"{lbl:>24}" for lbl in self.labels))
 
     def _z(self) -> np.ndarray:
@@ -248,8 +262,8 @@ class Example:
     @staticmethod
     def create_parser():
         p = newton.examples.create_parser()
-        p.add_argument("--assembly", type=str, default="m16_tight",
-                       help="m4_tight / m8_tight / m12_tight / m16_tight (also _loose).")
+        p.add_argument("--assembly", type=str, default="m16",
+                       help="m4/m8/m12/m16 = task USD; m16_tight etc = IsaacGymEnvs mesh.")
         p.add_argument("--collide-hz", type=float, default=200.0, help="Collision (frame) rate.")
         p.add_argument("--substeps", type=int, default=16, help="Solver substeps per frame.")
         p.add_argument("--max-force", type=float, default=400.0, help="Arm effort ceiling [N].")
@@ -257,7 +271,7 @@ class Example:
         p.add_argument("--press-kd", type=float, default=5.0e2)
         p.add_argument("--mu", type=float, default=0.75)
         p.add_argument("--cone", type=str, default="pyramidal", choices=["pyramidal", "elliptic"])
-        p.add_argument("--gap", type=float, default=0.005)
+        p.add_argument("--gap", type=float, default=0.0, help="0 = auto (0.4 x thread pitch).")
         p.add_argument("--clearance", type=float, default=0.001)
         p.add_argument("--settle-frames", type=int, default=10)
         p.add_argument("--sdf-resolution", type=int, default=512)

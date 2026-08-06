@@ -65,7 +65,11 @@ class Cfg:
     # pyramidal: mu->0 zeroes the pyramidal row invweight, efc_D is floored to
     # ~1e15, and the float32 Hessian degenerates to NaN on contact-rich states.
     mu: float = 0.75
-    gap: float = 0.005
+    # 0 = auto: 0.4 x thread pitch. The detection distance has to be smaller
+    # than the thread interference (1.15 mm radial on the task m16); the stock
+    # example's 0.005 is four times that and reads as the baseline penetrating
+    # twenty pitches.
+    gap: float = 0.0
     margin: float = 0.0
     density: float = 8000.0
     is_hydroelastic: bool = False
@@ -240,6 +244,7 @@ class Rig:
 
     def __init__(self, cfg: Cfg):
         self.cfg = cfg
+        self.gap = cfg.gap if cfg.gap > 0 else 0.4 * THREAD_PITCH[cfg.size]
         self.frame_dt = 1.0 / cfg.collide_hz
         self.sim_dt = self.frame_dt / cfg.substeps
 
@@ -260,7 +265,7 @@ class Rig:
             ke=cfg.ke,
             kd=cfg.kd,
             kh=cfg.kh,
-            gap=cfg.gap,
+            gap=self.gap,
             density=cfg.density,
             mu_torsional=0.0,
             mu_rolling=0.0,
@@ -268,12 +273,12 @@ class Rig:
         )
 
         loader = _load_usd_mesh if use_task_assets else _load_mesh
-        bolt_mesh, bolt_center, bolt_extent = loader(bolt_file, cfg.gap, cfg.sdf_resolution)
-        nut_mesh, nut_center, nut_extent = loader(nut_file, cfg.gap, cfg.sdf_resolution)
+        bolt_mesh, bolt_center, bolt_extent = loader(bolt_file, self.gap, cfg.sdf_resolution)
+        nut_mesh, nut_center, nut_extent = loader(nut_file, self.gap, cfg.sdf_resolution)
         self.bolt_extent, self.nut_extent = bolt_extent, nut_extent
 
         builder = newton.ModelBuilder()
-        builder.default_shape_cfg.gap = cfg.gap
+        builder.default_shape_cfg.gap = self.gap
 
         # Bolt: static, base sitting at z = 0 so world z reads as height up the shank.
         self.bolt_base_z = 0.0
@@ -427,6 +432,7 @@ class Rig:
             "penetration_m": float(penetration),
             "penetration_pitches": float(penetration / pitch),
             "rest_z_ref": float(self.rest_z_ref),
+            "gap_used": float(self.gap),
             "descent_m": float(self.nut_start_z - z_min),
             "descent_pitches": float((self.nut_start_z - z_min) / pitch),
             "tunneled": tunneled,

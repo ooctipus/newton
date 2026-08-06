@@ -21,6 +21,12 @@
 > the ke/kd -> solref mapping, the REFSAFE consequence, newton's ShapeConfig
 > defaults, the mu + pyramidal NaN degeneracy, and the drive-modelling argument.
 >
+> **Only m16 is currently trustworthy on the task assets.** m12/m8/m4 come back
+> incoherent -- negative penetrations (the nut ejected upward), and on m4 outright
+> divergence (1e10 pitches, 7e10 N). Three things are still hardcoded at m16 scale
+> and need to follow the thread: the 1 mm start clearance, the SDF narrow band
+> (fixed at +/-5 mm regardless of size), and possibly the auto gap fraction.
+>
 > **New, and the reason the first re-run was incoherent:** `gap` must be smaller
 > than the thread interference. The task m16 has 1.15 mm of radial interference
 > (nut hole radius 6.23 mm vs bolt crest 7.38 mm). At the example's `gap=0.005` the
