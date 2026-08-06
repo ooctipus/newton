@@ -26,14 +26,32 @@ python example_nut_bolt_tunneling.py --assembly m4_tight --max-force 800
 python example_nut_bolt_tunneling.py --viewer usd --output-path /tmp/nut.usd --num-frames 120
 ```
 
-The viewer script prints penetration in pitches per column as it runs, so the
-numbers and the picture agree:
+The viewer draws three arrows per nut:
+
+| arrow | shows |
+|---|---|
+| red, down | the load the arm is applying |
+| green/red, up | the contact reaction, red once the nut has sunk a pitch |
+| blue | descent rate |
+
+The reaction arrow is the same in every column and that is not a bug: at steady
+state the thread balances the applied load whether the nut is held or creeping
+through. It tells you the load magnitude -- useful for checking you are inside the
+50-1000 N a Franka delivers -- but only the blue velocity arrow and the motion
+itself separate holding from tunneling.
+
+The script prints penetration and reaction per column as it runs, so the numbers
+and the picture agree:
 
 ```
  frame    soft (newton default)           task ke=2.56e6             stiff ke=1e7
-    20                    +2.82                    +0.08                    +0.11
-    50                    +8.22                    +0.09                    +0.12
-    80                   +12.20                    +0.09                    +0.12
+    20       +2.47p       +400N       +0.08p       +400N       +0.11p       +400N
+    60      +11.82p       +400N       +0.09p       +400N       +0.13p       +400N
+
+summary
+  soft (newton default)     +12.19 pitch   peak reaction  401 N   TUNNELED
+  task ke=2.56e6             +0.09 pitch   peak reaction  400 N   held
+  stiff ke=1e7               +0.12 pitch   peak reaction  400 N   held
 ```
 
 ## What it measures

@@ -32,6 +32,8 @@ from nut_bolt_tunneling import (
     _press,
 )
 
+GRAVITY_Z = -9.81
+
 # (label, ke, kd) -- kd = solver_hz and ke = (kd/2)^2 is the critically damped
 # contact that a 3200 Hz solver can actually hold; the others bracket it.
 VARIANTS = (
@@ -123,6 +125,14 @@ class Example:
         self.contacts = self.collision_pipeline.contacts()
         self.peak = wp.zeros(1, dtype=wp.float32)
         self.rest_z = None
+        self.nut_mass = np.array([float(self.model.body_mass.numpy()[b]) for b in self.nut_bodies])
+        self.prev_vz = np.zeros(len(self.nut_bodies))
+        self.applied_f = np.zeros(len(self.nut_bodies))
+        self.reaction_f = np.zeros(len(self.nut_bodies))
+        self.peak_reaction = np.zeros(len(self.nut_bodies))
+        # Arrow lengths: the effort ceiling maps to `arrow_span` metres so the
+        # picture stays readable whatever load is commanded.
+        self.force_scale = args.arrow_span / max(args.max_force, 1.0)
 
         self.viewer.set_model(self.model)
         self.viewer.set_camera(
@@ -134,6 +144,14 @@ class Example:
     def _z(self) -> np.ndarray:
         q = self.state_0.body_q.numpy()
         return np.array([q[b][2] for b in self.nut_bodies])
+
+    def _vz(self) -> np.ndarray:
+        qd = self.state_0.body_qd.numpy()
+        return np.array([qd[b][2] for b in self.nut_bodies])
+
+    def _xy(self) -> np.ndarray:
+        q = self.state_0.body_q.numpy()
+        return np.array([[q[b][0], q[b][1]] for b in self.nut_bodies])
 
     def step(self):
         driving = self.frame >= self.settle_frames
@@ -160,21 +178,69 @@ class Example:
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
+        # Contacts carry no force, so take the reaction from the momentum
+        # balance over the frame: m*dv/dt = F_drive + m*g + F_contact.
+        vz = self._vz()
+        accel = (vz - self.prev_vz) / self.frame_dt
+        self.applied_f = np.full(len(self.nut_bodies), -self.args.max_force if driving else 0.0)
+        self.reaction_f = self.nut_mass * accel - self.applied_f - self.nut_mass * GRAVITY_Z
+        self.prev_vz = vz
+        if driving:
+            self.peak_reaction = np.maximum(self.peak_reaction, np.abs(self.reaction_f))
+
         if self.frame == self.settle_frames - 1:
             self.rest_z = self._z().copy()
         if self.rest_z is not None and self.frame % 10 == 0:
             pen = (self.rest_z - self._z()) / self.pitch
-            cells = " ".join(f"{p:>+24.2f}" for p in pen)
+            cells = " ".join(f"{p:>+11.2f}p {r:>+10.0f}N" for p, r in zip(pen, self.reaction_f))
             print(f"{self.frame:>6} {cells}", flush=True)
 
         self.frame += 1
         self.sim_time += self.frame_dt
 
+    def _arrows(self, values: np.ndarray, base_dz: float) -> tuple[wp.array, wp.array]:
+        """One vertical arrow per nut, signed length proportional to `values` [N]."""
+        xy, z = self._xy(), self._z()
+        starts, ends = [], []
+        for i in range(len(self.nut_bodies)):
+            base = wp.vec3(float(xy[i][0]), float(xy[i][1]), float(z[i] + base_dz))
+            tip = wp.vec3(base[0], base[1], float(base[2] + values[i] * self.force_scale))
+            starts.append(base)
+            ends.append(tip)
+        return wp.array(starts, dtype=wp.vec3), wp.array(ends, dtype=wp.vec3)
+
     def render(self):
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
         self.viewer.log_contacts(self.contacts, self.state_0)
+
+        # Red, pointing down: what the arm is pushing with (identical per column).
+        starts, ends = self._arrows(self.applied_f, 0.030)
+        self.viewer.log_arrows("force/applied", starts, ends, (1.0, 0.15, 0.15))
+
+        # Blue, proportional to descent rate. This is the arrow that separates
+        # the columns: at steady state the reaction balances the applied load
+        # whether the nut is held or creeping, so only motion tells them apart.
+        starts, ends = self._arrows(self._vz() * self.args.vel_arrow_gain / self.force_scale, 0.024)
+        self.viewer.log_arrows("force/velocity", starts, ends, (0.25, 0.5, 1.0))
+
+        # Green while the thread is holding, red once the nut has sunk a pitch:
+        # what the contact is actually pushing back with.
+        pen = (self.rest_z - self._z()) / self.pitch if self.rest_z is not None else np.zeros(len(self.nut_bodies))
+        colors = wp.array(
+            [wp.vec3(1.0, 0.2, 0.2) if p > 1.0 else wp.vec3(0.2, 1.0, 0.3) for p in pen], dtype=wp.vec3
+        )
+        starts, ends = self._arrows(self.reaction_f, 0.018)
+        self.viewer.log_arrows("force/reaction", starts, ends, colors)
+
         self.viewer.end_frame()
+
+    def test_final(self):
+        pen = (self.rest_z - self._z()) / self.pitch
+        print("\nsummary")
+        for lbl, p_, f_ in zip(self.labels, pen, self.peak_reaction):
+            state = "TUNNELED" if p_ > 1.0 else "held"
+            print(f"  {lbl:<24} {p_:>+7.2f} pitch   peak reaction {f_:>7.0f} N   {state}")
 
     @staticmethod
     def create_parser():
@@ -192,6 +258,10 @@ class Example:
         p.add_argument("--clearance", type=float, default=0.001)
         p.add_argument("--settle-frames", type=int, default=10)
         p.add_argument("--sdf-resolution", type=int, default=512)
+        p.add_argument("--arrow-span", type=float, default=0.03,
+                       help="Metres an arrow spans at the effort ceiling [m].")
+        p.add_argument("--vel-arrow-gain", type=float, default=0.25,
+                       help="Metres of blue arrow per m/s of nut descent.")
         return p
 
 
