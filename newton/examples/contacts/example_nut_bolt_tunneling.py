@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 import numpy as np
 import warp as wp
@@ -249,6 +250,14 @@ class Example:
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
         self.contacts = self.collision_pipeline.contacts()
 
+        # joint_q is the source of truth for a free body; writing body_q is
+        # overwritten by the next eval_fk.
+        self.q0 = self.state_0.joint_q.numpy().copy()
+        self.qd0 = self.state_0.joint_qd.numpy().copy()
+        self.episode = 0
+        self.episode_frame = 0
+        self.fps = 0.0
+        self._clock = time.perf_counter()
         self.nut_index = wp.array(np.asarray(self.nut_bodies, dtype=np.int32), dtype=wp.int32)
         self.marker_z = float(nut_z + 0.03)
         self.rest_z = None
@@ -283,8 +292,28 @@ class Example:
             return np.zeros(self.count)
         return (self.rest_z - self._z()) / self.pitch
 
+    def reset(self):
+        """Re-seat every nut and start a fresh episode.
+
+        Restoring joint_q also rescues the diverged worlds: their state is NaN,
+        and nothing short of overwriting it brings them back.
+        """
+        self.state_0.joint_q.assign(self.q0)
+        self.state_0.joint_qd.assign(self.qd0)
+        self.state_0.clear_forces()
+        newton.eval_fk(self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0)
+        self.rest_z = None
+        self.worst = np.zeros(self.count)
+        self.episode += 1
+        self.episode_frame = 0
+
     def step(self):
-        driving = self.frame >= self.args.settle_frames
+        if self.args.reset_interval > 0 and self.episode_frame >= self.args.reset_interval:
+            held, gone, bad = self._tally(self.worst)
+            print(f"  episode {self.episode}: held {held}  tunneled {gone}  diverged {bad}  -- reset", flush=True)
+            self.reset()
+
+        driving = self.episode_frame >= self.args.settle_frames
         self.collision_pipeline.collide(self.state_0, self.contacts)
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
@@ -307,7 +336,7 @@ class Example:
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
-        if self.frame == self.args.settle_frames - 1:
+        if self.episode_frame == self.args.settle_frames - 1:
             self.rest_z = self._z().copy()
 
         pen = self.penetration()
@@ -315,10 +344,18 @@ class Example:
         # separately rather than letting it compare False against the threshold.
         self.worst = np.where(np.isnan(pen), np.nan, np.fmax(self.worst, pen))
         if driving and self.frame % 20 == 0:
+            now = time.perf_counter()
+            self.fps = 20.0 / max(now - self._clock, 1e-9)
+            self._clock = now
             held, gone, bad = self._tally(self.worst)
-            print(f"{self.frame:>6}  held {held:>5}   tunneled {gone:>5}   diverged {bad:>5}", flush=True)
+            print(
+                f"{self.frame:>6}  ep {self.episode}  held {held:>5}   tunneled {gone:>5}"
+                f"   diverged {bad:>5}   {self.fps:6.1f} fps",
+                flush=True,
+            )
 
         self.frame += 1
+        self.episode_frame += 1
         self.sim_time += self.frame_dt
 
     def _tally(self, pen: np.ndarray) -> tuple[int, int, int]:
@@ -364,7 +401,8 @@ class Example:
         held, gone, bad = self._tally(self.worst)
         ax.set_title(
             f"{self.args.assembly}  frac {self.args.assembly_fraction:.2f}  "
-            f"{self.args.max_force:.0f} N   |   held {held}  tunneled {gone}  diverged {bad}",
+            f"{self.args.max_force:.0f} N   |   held {held}  tunneled {gone}  diverged {bad}"
+            f"   |   ep {self.episode}   {self.fps:.0f} fps",
             fontsize=8,
         )
         fig.tight_layout()
@@ -416,12 +454,16 @@ class Example:
         parser.add_argument("--press-kd", type=float, default=5.0e2)
         parser.add_argument("--grid", type=int, default=32,
                             help="Grid side; 32 gives 1024 nut/bolt pairs.")
+        parser.add_argument("--reset-interval", type=int, default=200,
+                            help="Frames per episode before re-seating; 0 never resets.")
         parser.add_argument("--panel-interval", type=int, default=10,
                             help="Frames between heatmap panel redraws.")
         parser.add_argument("--spacing", type=float, default=0.0,
                             help="Metres between cells; 0 = default (0.05).")
         parser.add_argument("--per-world-contacts", type=int, default=1024,
                             help="njmax/nconmax per cell. Too low silently drops contacts.")
+        # The module-load chatter buries the only lines worth reading.
+        parser.set_defaults(quiet=True)
         return parser
 
 
