@@ -50,6 +50,40 @@ SDF_CACHE_DIR = Path(tempfile.gettempdir()) / "newton_sdf_cache"
 # descend before we call it tunneling".
 THREAD_PITCH = {"m4": 0.0007, "m8": 0.00125, "m12": 0.00175, "m16": 0.002, "m20": 0.0025}
 
+# Straight out of the task's assembly_keypoints.py. Bolt offsets are measured from
+# the head (z=0) up the shaft; the nut's own center_axis_middle is where the nut
+# frame carries its mid-height. The NIST USDs are authored in this same frame --
+# bolt_m16's collider spans 0.010..0.035, matching full_thread..bolt_tip_offset --
+# so the meshes must NOT be re-centered on their bounding box or the keypoints
+# stop meaning anything.
+KEYPOINTS = {
+    #        tip     first   second  third   fully_screwed   nut center_axis_middle
+    "m16": (0.035, 0.034, 0.032, 0.030, 0.022, 0.0165),
+    "m12": (0.035, None, 0.0285, None, 0.0218, 0.018),
+    "m8": (0.026, None, 0.0242, None, 0.018, 0.0126),
+    "m4": (0.020, None, 0.0189, None, 0.01318, 0.0064),
+}
+ENGAGE_NAMES = ("tip", "first_thread", "second_thread", "third_thread", "fully_screwed")
+
+
+def engaged_nut_z(size: str, engage: str) -> float:
+    """Nut-frame origin height that seats the nut at `engage` on the bolt."""
+    tip, first, second, third, screwed, nut_mid = KEYPOINTS[size]
+    target = dict(zip(ENGAGE_NAMES, (tip, first, second, third, screwed)))[engage]
+    if target is None:
+        # Only m16 authors first/third_thread. Step down from the nearest
+        # authored keypoint by whole pitches -- an approximation, flagged as one,
+        # because engage depth turns out to decide whether the test discriminates
+        # at all and the smaller sizes cannot otherwise be exercised.
+        pitch = THREAD_PITCH[size]
+        if engage == "third_thread":
+            target = second - pitch
+        elif engage == "first_thread":
+            target = second + pitch
+        else:
+            raise ValueError(f"{size} has no {engage} keypoint")
+    return target - nut_mid
+
 
 @dataclass
 class Cfg:
@@ -91,6 +125,8 @@ class Cfg:
     settle_frames: int = 10  # free-fall/settle before the drive engages
     frames: int = 120
     rest_z_ref: float = 0.0  # measured once per assembly; 0 = use start height
+    engage: str = "fully_screwed"  # where the keypoints seat the nut on the bolt
+    narrow_band: float = 0.0  # SDF band half-width; 0 = auto (2.5 x thread pitch)
     screw_frames: int = 0  # frames spent threading the nut on before the drive
     screw_force: float = 5.0  # [N] axial load while threading
     screw_torque: float = 0.05  # [N.m] about the bolt axis while threading
@@ -130,15 +166,19 @@ def _usd_collider_arrays(usd_path: Path) -> tuple[np.ndarray, np.ndarray]:
     return pts, np.asarray(tris, dtype=np.int32).flatten()
 
 
-def _load_usd_mesh(usd_path: Path, gap: float, resolution: int):
-    """Same contract as :func:`_load_mesh`, sourced from a task USD."""
+def _load_usd_mesh(usd_path: Path, gap: float, resolution: int, narrow_band: float = 0.005):
+    """Same contract as :func:`_load_mesh`, but keeps the authored frame.
+
+    The keypoints are expressed in this frame, so re-centering on the bounding
+    box -- which is what the OBJ path does -- would make them unusable.
+    """
     vertices, indices = _usd_collider_arrays(usd_path)
     lo, hi = vertices.min(axis=0), vertices.max(axis=0)
-    center = (lo + hi) / 2.0
-    mesh = newton.Mesh(vertices - center, indices)
+    center = np.zeros(3, dtype=np.float32)
+    mesh = newton.Mesh(vertices, indices)
     mesh.build_sdf(
         max_resolution=resolution,
-        narrow_band_range=(-0.005, 0.005),
+        narrow_band_range=(-narrow_band, narrow_band),
         margin=gap if gap else 0.05,
         cache_dir=SDF_CACHE_DIR,
     )
@@ -272,31 +312,47 @@ class Rig:
             is_hydroelastic=cfg.is_hydroelastic,
         )
 
-        loader = _load_usd_mesh if use_task_assets else _load_mesh
-        bolt_mesh, bolt_center, bolt_extent = loader(bolt_file, self.gap, cfg.sdf_resolution)
-        nut_mesh, nut_center, nut_extent = loader(nut_file, self.gap, cfg.sdf_resolution)
+        if use_task_assets:
+            # A +/-5 mm band is ~7 pitches of an m4 thread; scale it to the feature.
+            band = cfg.narrow_band if cfg.narrow_band > 0 else 2.5 * THREAD_PITCH[cfg.size]
+            self.narrow_band = band
+            bolt_mesh, bolt_center, bolt_extent = _load_usd_mesh(
+                bolt_file, self.gap, cfg.sdf_resolution, band
+            )
+            nut_mesh, nut_center, nut_extent = _load_usd_mesh(
+                nut_file, self.gap, cfg.sdf_resolution, band
+            )
+        else:
+            self.narrow_band = 0.005
+            bolt_mesh, bolt_center, bolt_extent = _load_mesh(bolt_file, self.gap, cfg.sdf_resolution)
+            nut_mesh, nut_center, nut_extent = _load_mesh(nut_file, self.gap, cfg.sdf_resolution)
         self.bolt_extent, self.nut_extent = bolt_extent, nut_extent
 
         builder = newton.ModelBuilder()
         builder.default_shape_cfg.gap = self.gap
 
-        # Bolt: static, base sitting at z = 0 so world z reads as height up the shank.
-        self.bolt_base_z = 0.0
-        bolt_mid_z = float(self.bolt_base_z + bolt_extent[2] / 2.0)
-        builder.add_shape_mesh(
-            -1,
-            xform=wp.transform(wp.vec3(0.0, 0.0, bolt_mid_z), wp.quat_identity()),
-            mesh=bolt_mesh,
-            cfg=shape_cfg,
-            label="bolt",
-        )
-        self.bolt_top_z = float(self.bolt_base_z + bolt_extent[2])
+        # Task assets keep their authored frame, so the bolt goes in at identity
+        # and the keypoints address it directly. The OBJ path still centers.
+        if use_task_assets:
+            bolt_xform = wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity())
+            self.bolt_base_z = float(KEYPOINTS[cfg.size][4])  # fully-screwed seat
+            self.bolt_top_z = float(KEYPOINTS[cfg.size][0])  # bolt tip
+        else:
+            self.bolt_base_z = 0.0
+            bolt_xform = wp.transform(
+                wp.vec3(0.0, 0.0, float(bolt_extent[2] / 2.0)), wp.quat_identity()
+            )
+            self.bolt_top_z = float(bolt_extent[2])
+        builder.add_shape_mesh(-1, xform=bolt_xform, mesh=bolt_mesh, cfg=shape_cfg, label="bolt")
 
-        # Nut: free body, coaxial, started fully clear of the bolt so it is not
-        # born interpenetrating the thread -- a nut spawned inside the helix is
-        # pinned by the constraint solver and no force will move it, which reads
-        # as "never tunnels" no matter how bad the parameters are.
-        self.nut_start_z = float(self.bolt_top_z + nut_extent[2] * 0.5 + cfg.clearance)
+        # Task assets: seat the nut where the task's own keypoints put it, which
+        # is what the reset does. Perching it above the tip instead tests the
+        # chamfer -- a thick barrier -- rather than the thread flank that
+        # actually loses to a softened contact.
+        if use_task_assets:
+            self.nut_start_z = float(engaged_nut_z(cfg.size, cfg.engage))
+        else:
+            self.nut_start_z = float(self.bolt_top_z + nut_extent[2] * 0.5 + cfg.clearance)
         nut_body = builder.add_body(
             label="nut",
             xform=wp.transform(wp.vec3(0.0, 0.0, self.nut_start_z), wp.quat_identity()),

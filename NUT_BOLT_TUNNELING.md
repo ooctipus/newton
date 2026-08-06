@@ -21,7 +21,26 @@
 > the ke/kd -> solref mapping, the REFSAFE consequence, newton's ShapeConfig
 > defaults, the mu + pyramidal NaN degeneracy, and the drive-modelling argument.
 >
-> **Only m16 is currently trustworthy on the task assets.** m12/m8/m4 come back
+> **Per-size state after keypoint seating** (task USDs, 400 N, penetration in pitches):
+>
+> | size | engage that discriminates | soft (newton default) | task ke=2.56e6 | stiff |
+> |---|---|---|---|---|
+> | m16 | `third_thread` (authored) | +4.89p | +0.00 | +0.00 |
+> | m12 | `second_thread` (authored) | +8.74p | +0.00 | +0.00 |
+> | m8 | `second_thread` (authored) | +55.96p | -0.00 | -0.00 |
+> | m4 | none found | NaN / +748p divergence | NaN | NaN |
+>
+> The task setting holds at every size and depth that runs; newton's default fails
+> at every one. m4 does not produce a usable answer at any engage depth, with or
+> without scaling the SDF band to the thread, so treat it as unmeasured rather than
+> as passing.
+>
+> Only m16 authors `first_thread`/`third_thread`. Stepping down from the authored
+> `second_thread` by a pitch to synthesize `third_thread` helps m12 (+10.70p) but
+> makes m8 NaN, so prefer the authored keypoints and treat the synthesized depth as
+> a fallback.
+>
+> **Superseded note, kept for the record:** m12/m8/m4 come back
 > incoherent -- negative penetrations (the nut ejected upward), and on m4 outright
 > divergence (1e10 pitches, 7e10 N). Three things are still hardcoded at m16 scale
 > and need to follow the thread: the 1 mm start clearance, the SDF narrow band
