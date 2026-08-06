@@ -1,5 +1,33 @@
 # Nut/bolt tunneling diagnosis
 
+> **Status: the mechanism findings stand, the geometry-dependent numbers do not.**
+>
+> Everything below the "Findings" heading was measured on the **IsaacGymEnvs**
+> factory meshes that newton's `example_nut_bolt_sdf.py` downloads, because the rig
+> followed the example's asset source. The task ships its own assets in
+> `isaaclab_assets/data/Assets/Props/NIST` -- `bolt_m{4,8,12,16}.usd`,
+> `nut_m{4,8,12,16}.usd`, one per size, **no tight/loose variants**. The USD prims
+> are still named `..._loose`, so it is the same lineage, but the shipped colliders
+> are decimated differently (the m16 nut collider is 650 points, not `subdiv_3x`)
+> and the m16 bolt is 25 mm tall rather than 41 mm.
+>
+> Pass a bare size (`m16`) to load the task USD; `m16_tight` still loads the
+> IsaacGymEnvs mesh.
+>
+> **Retracted pending a re-run on the task assets:** the m16 penetration table, the
+> per-size operating points, and the hydroelastic `kh` table.
+>
+> **Still valid**, because they were read off the built model rather than the mesh:
+> the ke/kd -> solref mapping, the REFSAFE consequence, newton's ShapeConfig
+> defaults, the mu + pyramidal NaN degeneracy, and the drive-modelling argument.
+>
+> **New, and the reason the first re-run was incoherent:** `gap` must be smaller
+> than the thread interference. The task m16 has 1.15 mm of radial interference
+> (nut hole radius 6.23 mm vs bolt crest 7.38 mm). At the example's `gap=0.005` the
+> detection distance is four times the feature, and the baseline "penetrates"
+> 16-20 pitches -- an artifact, not physics. At `gap=0.001` the same baseline holds
+> at 0.03-0.32 pitches across 100-1600 N. Do not copy `gap` from an example.
+
 Screens contact parameters for nut-through-thread tunneling in seconds, instead of
 training a policy and discovering it learned to hammer the nut through.
 

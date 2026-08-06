@@ -33,6 +33,15 @@ import warp as wp
 import newton
 import newton.examples
 
+# The task's own assets. The IsaacGymEnvs meshes that newton's example downloads
+# are the same lineage (the USD prims are still named ..._loose) but the shipped
+# colliders are decimated differently -- the m16 nut collider is 650 points, not
+# the subdiv_3x mesh -- and there is no "tight" variant in the task at all.
+NIST_ASSET_DIR = Path(
+    "/home/zhengyuz/Projects/IsaacLab.wt/octi-factory-newton-tunneling"
+    "/source/isaaclab_assets/data/Assets/Props/NIST"
+)
+
 ISAACGYM_ENVS_REPO_URL = "https://github.com/isaac-sim/IsaacGymEnvs.git"
 ISAACGYM_NUT_BOLT_FOLDER = "assets/factory/mesh/factory_nut_bolt"
 SDF_CACHE_DIR = Path(tempfile.gettempdir()) / "newton_sdf_cache"
@@ -46,7 +55,7 @@ THREAD_PITCH = {"m4": 0.0007, "m8": 0.00125, "m12": 0.00175, "m16": 0.002, "m20"
 class Cfg:
     """One point in the contact-parameter space under test."""
 
-    assembly: str = "m16_tight"
+    assembly: str = "m16"  # task USD; "m16_tight" etc. use the IsaacGymEnvs meshes
     # Collision runs once per frame; the solver runs `substeps` times inside it.
     collide_hz: float = 200.0
     substeps: int = 16
@@ -89,6 +98,47 @@ class Cfg:
     @property
     def solver_hz(self) -> float:
         return self.collide_hz * self.substeps
+
+
+def _usd_collider_arrays(usd_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Triangles of the collision mesh authored in a NIST asset, in world space."""
+    from pxr import Usd, UsdGeom, UsdPhysics  # noqa: PLC0415
+
+    stage = Usd.Stage.Open(str(usd_path))
+    prim = next(
+        (p for p in stage.Traverse() if p.IsA(UsdGeom.Mesh) and UsdPhysics.CollisionAPI(p)),
+        None,
+    )
+    if prim is None:
+        raise ValueError(f"no collision mesh in {usd_path}")
+
+    mesh = UsdGeom.Mesh(prim)
+    xform = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+    pts = np.array([xform.Transform(p) for p in mesh.GetPointsAttr().Get()], dtype=np.float32)
+    counts = np.asarray(mesh.GetFaceVertexCountsAttr().Get(), dtype=np.int32)
+    idx = np.asarray(mesh.GetFaceVertexIndicesAttr().Get(), dtype=np.int32)
+
+    tris, at = [], 0
+    for c in counts:  # fan-triangulate anything that is not already a triangle
+        face = idx[at : at + c]
+        tris.extend([face[0], face[i], face[i + 1]] for i in range(1, c - 1))
+        at += c
+    return pts, np.asarray(tris, dtype=np.int32).flatten()
+
+
+def _load_usd_mesh(usd_path: Path, gap: float, resolution: int):
+    """Same contract as :func:`_load_mesh`, sourced from a task USD."""
+    vertices, indices = _usd_collider_arrays(usd_path)
+    lo, hi = vertices.min(axis=0), vertices.max(axis=0)
+    center = (lo + hi) / 2.0
+    mesh = newton.Mesh(vertices - center, indices)
+    mesh.build_sdf(
+        max_resolution=resolution,
+        narrow_band_range=(-0.005, 0.005),
+        margin=gap if gap else 0.05,
+        cache_dir=SDF_CACHE_DIR,
+    )
+    return mesh, center, hi - lo
 
 
 def _load_mesh(path: str, gap: float, resolution: int) -> tuple[newton.Mesh, np.ndarray, np.ndarray]:
@@ -193,9 +243,16 @@ class Rig:
         self.frame_dt = 1.0 / cfg.collide_hz
         self.sim_dt = self.frame_dt / cfg.substeps
 
-        asset_dir = newton.examples.download_external_git_folder(ISAACGYM_ENVS_REPO_URL, ISAACGYM_NUT_BOLT_FOLDER)
-        bolt_file = str(asset_dir / f"factory_bolt_{cfg.assembly}.obj")
-        nut_file = str(asset_dir / f"factory_nut_{cfg.assembly}_subdiv_3x.obj")
+        use_task_assets = "_" not in cfg.assembly
+        if use_task_assets:
+            bolt_file = NIST_ASSET_DIR / f"bolt_{cfg.assembly}.usd"
+            nut_file = NIST_ASSET_DIR / f"nut_{cfg.assembly}.usd"
+        else:
+            asset_dir = newton.examples.download_external_git_folder(
+                ISAACGYM_ENVS_REPO_URL, ISAACGYM_NUT_BOLT_FOLDER
+            )
+            bolt_file = str(asset_dir / f"factory_bolt_{cfg.assembly}.obj")
+            nut_file = str(asset_dir / f"factory_nut_{cfg.assembly}_subdiv_3x.obj")
 
         shape_cfg = newton.ModelBuilder.ShapeConfig(
             margin=cfg.margin,
@@ -210,8 +267,9 @@ class Rig:
             is_hydroelastic=cfg.is_hydroelastic,
         )
 
-        bolt_mesh, bolt_center, bolt_extent = _load_mesh(bolt_file, cfg.gap, cfg.sdf_resolution)
-        nut_mesh, nut_center, nut_extent = _load_mesh(nut_file, cfg.gap, cfg.sdf_resolution)
+        loader = _load_usd_mesh if use_task_assets else _load_mesh
+        bolt_mesh, bolt_center, bolt_extent = loader(bolt_file, cfg.gap, cfg.sdf_resolution)
+        nut_mesh, nut_center, nut_extent = loader(nut_file, cfg.gap, cfg.sdf_resolution)
         self.bolt_extent, self.nut_extent = bolt_extent, nut_extent
 
         builder = newton.ModelBuilder()

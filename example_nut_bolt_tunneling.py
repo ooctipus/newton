@@ -158,6 +158,9 @@ class Example:
         self.collision_pipeline.collide(self.state_0, self.contacts)
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
+            # Mouse picking in the GL viewer: grab a nut and yank it around
+            # while the press keeps pushing, to probe the contact by hand.
+            self.viewer.apply_forces(self.state_0)
             if driving:
                 for body in self.nut_bodies:
                     wp.launch(
