@@ -549,6 +549,8 @@ class SolverFeatherPGS(SolverBase):
         pgs_velocity_iterations: int = 0,
         pgs_beta: float = 0.2,
         pgs_cfm: float = 1.0e-6,
+        mimic_ke: float = 2500.0,
+        mimic_kd: float = 100.0,
         dense_contact_compliance: float = 0.0,
         speculative_dense_contact_compliance: float = 0.0,
         pgs_omega: float = 1.0,
@@ -930,6 +932,12 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_iterations = pgs_iterations
         self.pgs_beta = pgs_beta
         self.pgs_cfm = pgs_cfm
+        # MuJoCo-referenced mimic (equality) compliance: solref (0.02, 1.0) =>
+        # ke=2500, kd=100 (see newton.solvers.mujoco constants), converted to a
+        # per-step Baumgarte factor for the bilateral mimic rows so the coupling
+        # matches the MJWarp training sim rather than the softer contact ERP.
+        self.mimic_ke = mimic_ke
+        self.mimic_kd = mimic_kd
         self.dense_contact_compliance = dense_contact_compliance
         self.speculative_dense_contact_compliance = speculative_dense_contact_compliance
         self.pgs_omega = pgs_omega
@@ -6729,8 +6737,13 @@ class SolverFeatherPGS(SolverBase):
                     device=model.device,
                 )
 
-        # Populate joint mimic (coupling) Jacobian rows (per size group)
+        # Populate joint mimic (coupling) Jacobian rows (per size group).
+        # A mimic is an equality; use the MuJoCo-referenced equality compliance
+        # (solref (0.02, 1.0) => ke=2500, kd=100) rather than the global
+        # pgs_beta, so the coupling matches the MJWarp training sim instead of
+        # inheriting the much softer contact/limit ERP.
         if self.mimic_slot is not None:
+            mimic_beta = dt * self.mimic_ke / (dt * self.mimic_ke + self.mimic_kd)
             if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
                 for size in self.size_groups:
                     self.J_by_size[size].zero_()
@@ -6755,7 +6768,7 @@ class SolverFeatherPGS(SolverBase):
                         self.art_to_world,
                         self.mimic_slot,
                         self.group_to_art[size],
-                        self.pgs_beta,
+                        mimic_beta,
                         self.pgs_cfm,
                     ],
                     outputs=[
