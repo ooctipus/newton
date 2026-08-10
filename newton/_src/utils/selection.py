@@ -214,6 +214,117 @@ for _dtype in [float, wp.transform, wp.spatial_vector]:
 
 
 # ========================================================================================
+# Offset-based gather/scatter kernels for irregular (non-uniform-stride) layouts.
+#
+# When a selection's placement across worlds is not representable by a FrequencyLayout's
+# uniform strides (e.g. an asset present in a non-contiguous subset of heterogeneous
+# worlds), each (world, articulation) instance carries an explicit base offset into the
+# flat attribute array and access degrades to a genuine gather/scatter:
+#   element[w, a, k] = flat[base_offsets[w, a] + local_indices[k]]
+
+
+@wp.kernel
+def _gather_offset_3d_kernel(
+    src: Any,  # 1d flat attribute array
+    base_offsets: wp.array2d[int],  # (world, arti) segment start in src
+    local_indices: wp.array[int],  # selected value indices relative to segment start
+    dst: Any,  # 3d contiguous staging buffer
+):
+    w, a, k = wp.tid()
+    dst[w, a, k] = src[base_offsets[w, a] + local_indices[k]]
+
+
+@wp.kernel
+def _gather_offset_4d_kernel(
+    src: Any,  # 2d flat attribute array (value, trailing)
+    base_offsets: wp.array2d[int],
+    local_indices: wp.array[int],
+    dst: Any,  # 4d contiguous staging buffer
+):
+    w, a, k, l = wp.tid()
+    dst[w, a, k, l] = src[base_offsets[w, a] + local_indices[k], l]
+
+
+@wp.kernel
+def _scatter_offset_3d_world_kernel(
+    world_mask: wp.array[bool],  # (world,) mask in ArticulationView
+    values: Any,  # 3d values
+    base_offsets: wp.array2d[int],
+    local_indices: wp.array[int],
+    dst: Any,  # 1d flat attribute array
+):
+    w, a, k = wp.tid()
+    if world_mask[w]:
+        dst[base_offsets[w, a] + local_indices[k]] = values[w, a, k]
+
+
+@wp.kernel
+def _scatter_offset_3d_arti_kernel(
+    arti_mask: wp.array2d[bool],  # (world, arti) mask in ArticulationView
+    values: Any,  # 3d values
+    base_offsets: wp.array2d[int],
+    local_indices: wp.array[int],
+    dst: Any,  # 1d flat attribute array
+):
+    w, a, k = wp.tid()
+    if arti_mask[w, a]:
+        dst[base_offsets[w, a] + local_indices[k]] = values[w, a, k]
+
+
+@wp.kernel
+def _scatter_offset_4d_world_kernel(
+    world_mask: wp.array[bool],
+    values: Any,  # 4d values
+    base_offsets: wp.array2d[int],
+    local_indices: wp.array[int],
+    dst: Any,  # 2d flat attribute array (value, trailing)
+):
+    w, a, k, l = wp.tid()
+    if world_mask[w]:
+        dst[base_offsets[w, a] + local_indices[k], l] = values[w, a, k, l]
+
+
+@wp.kernel
+def _scatter_offset_4d_arti_kernel(
+    arti_mask: wp.array2d[bool],
+    values: Any,  # 4d values
+    base_offsets: wp.array2d[int],
+    local_indices: wp.array[int],
+    dst: Any,  # 2d flat attribute array (value, trailing)
+):
+    w, a, k, l = wp.tid()
+    if arti_mask[w, a]:
+        dst[base_offsets[w, a] + local_indices[k], l] = values[w, a, k, l]
+
+
+for _dtype in [float, int, wp.vec3, wp.transform, wp.spatial_vector, wp.mat33]:
+    wp.overload(
+        _gather_offset_3d_kernel,
+        {"src": wp.array[_dtype], "dst": wp.array3d[_dtype]},
+    )
+    wp.overload(
+        _gather_offset_4d_kernel,
+        {"src": wp.array2d[_dtype], "dst": wp.array4d[_dtype]},
+    )
+    wp.overload(
+        _scatter_offset_3d_world_kernel,
+        {"values": wp.array3d[_dtype], "dst": wp.array[_dtype]},
+    )
+    wp.overload(
+        _scatter_offset_3d_arti_kernel,
+        {"values": wp.array3d[_dtype], "dst": wp.array[_dtype]},
+    )
+    wp.overload(
+        _scatter_offset_4d_world_kernel,
+        {"values": wp.array4d[_dtype], "dst": wp.array2d[_dtype]},
+    )
+    wp.overload(
+        _scatter_offset_4d_arti_kernel,
+        {"values": wp.array4d[_dtype], "dst": wp.array2d[_dtype]},
+    )
+
+
+# ========================================================================================
 # Actuator scatter/gather kernels
 
 
@@ -352,6 +463,7 @@ class FrequencyLayout:
         value_count: int,
         indices: list[int],
         device,
+        base_offsets: wp.array2d[int] | None = None,
     ):
         self.offset = offset  # number of values to skip at the beginning of attribute array
         self.stride_between_worlds = stride_between_worlds
@@ -359,12 +471,29 @@ class FrequencyLayout:
         self.value_count = value_count
         self.slice = None
         self.indices = None
+        # Irregular layouts (non-uniform strides): explicit (world, arti) segment starts and
+        # always-materialized local value indices; access goes through gather/scatter kernels.
+        self.base_offsets = base_offsets
+        self.local_indices = None
+        self._local_slice_cache: dict[tuple[int, int], wp.array] = {}
+        self._device = device
+        if base_offsets is not None:
+            self.local_indices = wp.array(indices, dtype=int, device=device)
         if len(indices) == 0:
             self.slice = slice(0, 0)
         elif is_contiguous_slice(indices):
             self.slice = slice(indices[0], indices[-1] + 1)
         else:
             self.indices = wp.array(indices, dtype=int, device=device)
+
+    def local_indices_for_slice(self, start: int, stop: int) -> wp.array:
+        """Return (cached) local value indices for a custom contiguous slice of the value span."""
+        key = (start, stop)
+        cached = self._local_slice_cache.get(key)
+        if cached is None:
+            cached = wp.array(list(range(start, stop)), dtype=int, device=self._device)
+            self._local_slice_cache[key] = cached
+        return cached
 
     @property
     def is_contiguous(self):
@@ -633,8 +762,19 @@ class ArticulationView:
         if articulation_count == 0:
             raise KeyError(f"No articulations matching pattern '{pattern}'")
 
-        if not all_equal(counts_per_world):
-            raise ValueError("Varying articulation counts per world are not supported")
+        # Keep only the worlds the pattern actually populated, so an articulation present in a
+        # subset of worlds (heterogeneous scenes) yields a valid view instead of raising. The
+        # view's world axis then spans exactly these worlds; ``world_ids`` maps each view world
+        # back to its model world (env id). When every world is populated this is the identity,
+        # so homogeneous behavior is unchanged.
+        present_worlds = [world_id for world_id in range(world_count) if counts_per_world[world_id] > 0]
+        if not all_equal([counts_per_world[world_id] for world_id in present_worlds]):
+            raise ValueError("Varying articulation counts across populated worlds are not supported")
+        self.world_ids = present_worlds
+        if len(present_worlds) != world_count:
+            articulation_ids = [articulation_ids[world_id] for world_id in present_worlds]
+            counts_per_world = [counts_per_world[world_id] for world_id in present_worlds]
+            world_count = len(present_worlds)
 
         count_per_world = counts_per_world[0]
 
@@ -770,6 +910,11 @@ class ArticulationView:
         else:
             shape_offset = 0
 
+        # Layouts whose placement is not representable by uniform strides (e.g. an asset
+        # deduplicated across a non-contiguous subset of heterogeneous worlds) degrade to
+        # explicit per-(world, arti) base offsets with gather/scatter access.
+        irregular = False
+
         # compute "outer" strides (strides between worlds)
         if world_count > 1:
             outer_joint_strides = []
@@ -792,7 +937,7 @@ class ArticulationView:
                 and all_equal(outer_link_strides)
                 and all_equal(outer_shape_strides)
             ):
-                raise ValueError("Non-uniform strides between worlds are not supported")
+                irregular = True
 
             outer_joint_stride = outer_joint_strides[0]
             outer_joint_dof_stride = outer_joint_dof_strides[0]
@@ -833,7 +978,7 @@ class ArticulationView:
                 and all_equal(inner_link_strides)
                 and all_equal(inner_shape_strides)
             ):
-                raise ValueError("Non-uniform strides within worlds are not supported")
+                irregular = True
 
             inner_joint_stride = inner_joint_strides[0][0]
             inner_joint_dof_stride = inner_joint_dof_strides[0][0]
@@ -973,6 +1118,18 @@ class ArticulationView:
         self.link_count = len(selected_link_indices)
         self.shape_count = len(selected_shape_indices)
 
+        # Irregular layouts carry explicit per-(world, arti) segment starts into the flat
+        # attribute arrays; regular layouts keep base offsets None and use strided views.
+        self.is_irregular = irregular
+        if irregular:
+            base_joint = wp.array(joint_starts, dtype=int, device=self.device)
+            base_joint_dof = wp.array(joint_dof_starts, dtype=int, device=self.device)
+            base_joint_coord = wp.array(joint_coord_starts, dtype=int, device=self.device)
+            base_link = wp.array(link_starts, dtype=int, device=self.device)
+            base_shape = wp.array(shape_starts, dtype=int, device=self.device)
+        else:
+            base_joint = base_joint_dof = base_joint_coord = base_link = base_shape = None
+
         # TODO: document the layout conventions and requirements
         #
         # |ooXXXoXXXoXXXooo|ooXXXoXXXoXXXooo|ooXXXoXXXoXXXooo|ooXXXoXXXoXXXooo|
@@ -986,6 +1143,7 @@ class ArticulationView:
                 arti_joint_count,
                 selected_joint_indices,
                 self.device,
+                base_offsets=base_joint,
             ),
             AttributeFrequency.JOINT_DOF: FrequencyLayout(
                 joint_dof_offset,
@@ -994,6 +1152,7 @@ class ArticulationView:
                 arti_joint_dof_count,
                 selected_joint_dof_indices,
                 self.device,
+                base_offsets=base_joint_dof,
             ),
             AttributeFrequency.JOINT_COORD: FrequencyLayout(
                 joint_coord_offset,
@@ -1002,9 +1161,16 @@ class ArticulationView:
                 arti_joint_coord_count,
                 selected_joint_coord_indices,
                 self.device,
+                base_offsets=base_joint_coord,
             ),
             AttributeFrequency.BODY: FrequencyLayout(
-                link_offset, outer_link_stride, inner_link_stride, arti_link_count, selected_link_indices, self.device
+                link_offset,
+                outer_link_stride,
+                inner_link_stride,
+                arti_link_count,
+                selected_link_indices,
+                self.device,
+                base_offsets=base_link,
             ),
             AttributeFrequency.SHAPE: FrequencyLayout(
                 shape_offset,
@@ -1013,6 +1179,7 @@ class ArticulationView:
                 arti_shape_count,
                 selected_shape_indices,
                 self.device,
+                base_offsets=base_shape,
             ),
         }
 
@@ -1228,6 +1395,48 @@ class ArticulationView:
     # ========================================================================================
     # Generic attribute API
 
+    def _irregular_attribute_array(self, attrib: wp.array, layout: FrequencyLayout, _slice):
+        """Build a contiguous staging buffer + gather bookkeeping for an irregular layout.
+
+        The selected data stays rectangular (every instance is structurally identical); only
+        the placement is not stride-representable, so element addresses are computed as
+        ``base_offsets[world, arti] + local_indices[k]``. ``_slice`` must already be
+        normalized to ``None | int | slice``. Memoization happens transitively through the
+        ``lru_cache`` on :meth:`_get_attribute_array`, so repeated gets reuse one staging
+        buffer (refreshed in place by :meth:`_get_attribute_values`).
+        """
+        if attrib.requires_grad:
+            raise NotImplementedError("Gradients are not supported for non-uniform (gathered) articulation layouts")
+
+        squeeze = False
+        if _slice is None:
+            local_indices = layout.local_indices
+            value_count = layout.selected_value_count
+        elif isinstance(_slice, int):
+            local_indices = layout.local_indices_for_slice(_slice, _slice + 1)
+            value_count = 1
+            squeeze = True
+        else:
+            local_indices = layout.local_indices_for_slice(_slice.start, _slice.stop)
+            value_count = _slice.stop - _slice.start
+
+        trailing_shape = attrib.shape[1:]
+        staging_shape = (self.world_count, self.count_per_world, value_count, *trailing_shape)
+        result_shape = (self.world_count, self.count_per_world, *trailing_shape) if squeeze else staging_shape
+        if len(staging_shape) > 4:
+            raise NotImplementedError(f"Unsupported attribute with ndim={len(staging_shape)}")
+
+        # early out for empty source arrays or empty selections (mirrors the regular path)
+        if attrib.ptr is None or value_count == 0:
+            result = wp.empty(result_shape, dtype=attrib.dtype, device=attrib.device)
+            result.ptr = None
+            return result
+
+        staging = wp.empty(staging_shape, dtype=attrib.dtype, device=attrib.device)
+        result = staging.reshape(result_shape) if squeeze else staging
+        result._offset_gather = (attrib, layout.base_offsets, local_indices, staging)
+        return result
+
     @functools.lru_cache(maxsize=None)  # noqa
     def _get_attribute_array(self, name: str, source: Model | State | Control, _slice: Slice | int | None = None):
         # get the attribute (handle namespaced attributes like "mujoco.tendon_stiffness")
@@ -1282,6 +1491,12 @@ class ArticulationView:
             _slice = _slice.get()
         elif not isinstance(_slice, (NoneType, int, slice)):
             raise ValueError(f"Invalid slice type: expected slice or int, got {type(_slice)}")
+
+        # Irregular placement (non-uniform strides): no live strided view exists; return a
+        # contiguous staging buffer with gather bookkeeping (filled by _get_attribute_values,
+        # scattered back by _set_attribute_values).
+        if layout.base_offsets is not None:
+            return self._irregular_attribute_array(attrib, layout, _slice)
 
         if _slice is None:
             value_slice = layout.indices if is_indexed else layout.slice
@@ -1358,6 +1573,18 @@ class ArticulationView:
 
     def _get_attribute_values(self, name: str, source: Model | State | Control, _slice: slice | None = None):
         attrib = self._get_attribute_array(name, source, _slice=_slice)
+        offset_gather = getattr(attrib, "_offset_gather", None)
+        if offset_gather is not None:
+            src, base_offsets, local_indices, staging = offset_gather
+            kernel = _gather_offset_4d_kernel if staging.ndim == 4 else _gather_offset_3d_kernel
+            wp.launch(
+                kernel,
+                dim=staging.shape,
+                inputs=[src, base_offsets, local_indices],
+                outputs=[staging],
+                device=self.device,
+            )
+            return attrib
         if hasattr(attrib, "_staging_array"):
             if hasattr(attrib, "_gather_src"):
                 kernel = _gather_indexed_4d_kernel if attrib.ndim == 4 else _gather_indexed_3d_kernel
@@ -1386,6 +1613,31 @@ class ArticulationView:
             values = wp.array(values, dtype=attrib.dtype, shape=attrib.shape, device=self.device, copy=False)
         assert values.shape == attrib.shape
         assert values.dtype == attrib.dtype
+
+        # Irregular placement: scatter values into the flat attribute array via base offsets.
+        offset_gather = getattr(attrib, "_offset_gather", None)
+        if offset_gather is not None:
+            src, base_offsets, local_indices, staging = offset_gather
+            if not isinstance(values, wp.array):
+                raise NotImplementedError("Indexed value arrays are not supported for non-uniform articulation layouts")
+            if values.ndim != staging.ndim:
+                values = values.reshape(staging.shape)  # re-expand the squeezed integer-slice dim
+            if mask is None:
+                mask = self.full_mask
+            else:
+                mask = self._resolve_mask(mask)
+            if mask.ndim == 1:
+                kernel = _scatter_offset_4d_world_kernel if staging.ndim == 4 else _scatter_offset_3d_world_kernel
+            else:
+                kernel = _scatter_offset_4d_arti_kernel if staging.ndim == 4 else _scatter_offset_3d_arti_kernel
+            wp.launch(
+                kernel,
+                dim=staging.shape,
+                inputs=[mask, values, base_offsets, local_indices],
+                outputs=[src],
+                device=self.device,
+            )
+            return
 
         # early out for in-place modifications
         if isinstance(attrib, wp.array) and isinstance(values, wp.array):
@@ -1935,6 +2187,14 @@ class ArticulationView:
         - actuator parameter index if that DOF is actuated
         - -1 if that DOF is not actuated by this actuator
         """
+        if self.is_irregular:
+            # The mapping kernels replicate world 0's pattern via uniform-stride arithmetic,
+            # which does not exist for irregular placement; failing loudly beats silently
+            # mismapped actuator parameters.
+            raise NotImplementedError(
+                "Actuator parameter access is not supported for articulations with a"
+                " non-uniform (irregular) placement across worlds"
+            )
         num_actuators = actuator.indices.shape[0]
         actuators_per_world = num_actuators // self.world_count
 
