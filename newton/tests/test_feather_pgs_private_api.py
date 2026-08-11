@@ -25,6 +25,10 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         solver_path = Path(__file__).parents[1] / "_src" / "solvers" / "feather_pgs" / "solver_feather_pgs.py"
+        cls.source_texts = {
+            path.name: path.read_text()
+            for path in (solver_path, solver_path.with_name("kernels.py"))
+        }
         cls.solver_module = ast.parse(solver_path.read_text())
         cls.top_level_functions = {
             node.name: node for node in cls.solver_module.body if isinstance(node, ast.FunctionDef)
@@ -37,6 +41,12 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
         cls.solver_methods = {
             node.name: node for node in cls.solver_class.body if isinstance(node, ast.FunctionDef)
         }
+
+    def test_removed_control_target_aliases_are_not_referenced(self):
+        for source_name, source in self.source_texts.items():
+            with self.subTest(source_name=source_name):
+                self.assertNotIn("joint_target_pos", source)
+                self.assertNotIn("joint_target_vel", source)
 
     def test_prescribed_response_is_not_a_public_execution_knob(self):
         init_method = self.solver_methods["__init__"]

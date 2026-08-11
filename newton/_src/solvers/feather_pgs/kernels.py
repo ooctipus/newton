@@ -1955,13 +1955,14 @@ def build_augmented_joint_rows(
     joint_type: wp.array[int],
     joint_q_start: wp.array[int],
     joint_qd_start: wp.array[int],
+    joint_target_q_start: wp.array[int],
     joint_dof_dim: wp.array2d[int],
     joint_target_ke: wp.array[float],
     joint_target_kd: wp.array[float],
     joint_q: wp.array[float],
     joint_qd: wp.array[float],
-    joint_target_pos: wp.array[float],
-    joint_target_vel: wp.array[float],
+    joint_target_q: wp.array[float],
+    joint_target_qd: wp.array[float],
     max_dofs: int,
     dt: float,
     # outputs
@@ -2000,6 +2001,7 @@ def build_augmented_joint_rows(
 
         qd_start = joint_qd_start[joint_index]
         coord_start = joint_q_start[joint_index]
+        target_q_start = joint_target_q_start[joint_index]
 
         for axis in range(axis_count):
             if slot >= max_dofs:
@@ -2020,8 +2022,8 @@ def build_augmented_joint_rows(
             row_dof_index[row_index] = dof_index
             q = joint_q[coord_index]
             qd_val = joint_qd[dof_index]
-            target_pos = joint_target_pos[dof_index]
-            target_vel = joint_target_vel[dof_index]
+            target_pos = joint_target_q[target_q_start + axis]
+            target_vel = joint_target_qd[dof_index]
             u0 = -(ke * (q - target_pos + dt * qd_val) + kd * (qd_val - target_vel))
             row_K[row_index] = K
             row_u0[row_index] = u0
@@ -2091,13 +2093,14 @@ def populate_physx_drive_J_for_size(
     joint_type: wp.array[int],
     joint_q_start: wp.array[int],
     joint_qd_start: wp.array[int],
+    joint_target_q_start: wp.array[int],
     joint_dof_dim: wp.array2d[int],
     joint_target_ke: wp.array[float],
     joint_target_kd: wp.array[float],
     joint_effort_limit: wp.array[float],
     joint_q: wp.array[float],
-    joint_target_pos: wp.array[float],
-    joint_target_vel: wp.array[float],
+    joint_target_q: wp.array[float],
+    joint_target_qd: wp.array[float],
     joint_velocity_limit: wp.array[float],
     fuse_vel_limits: int,
     art_to_world: wp.array[int],
@@ -2147,6 +2150,7 @@ def populate_physx_drive_J_for_size(
         axis_count = lin_count + ang_count
         qd_start = joint_qd_start[j]
         q_start = joint_q_start[j]
+        target_q_start = joint_target_q_start[j]
 
         for axis in range(axis_count):
             dof = qd_start + axis
@@ -2159,8 +2163,8 @@ def populate_physx_drive_J_for_size(
 
             stiffness = joint_target_ke[dof]
             damping = joint_target_kd[dof]
-            target_pos = joint_target_pos[dof]
-            target_vel = joint_target_vel[dof]
+            target_pos = joint_target_q[target_q_start + axis]
+            target_vel = joint_target_qd[dof]
             q = joint_q[q_start + axis]
 
             world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_TARGET
