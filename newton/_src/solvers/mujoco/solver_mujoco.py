@@ -9,8 +9,9 @@ import os
 import re
 import sys
 import warnings
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any
 
@@ -63,6 +64,8 @@ from .enums import EqType as _EqType
 from .enums import _ActuatorBiasType, _ActuatorDynamicsType, _ActuatorGainType
 from .equality import MJC_OBJ_BODY, MjcEqualityTargetKind, _register_equality_constraint_attributes
 from .kernels import (
+    MeshVariantBody,
+    MeshVariantShape,
     _snapshot_nacon_count,
     apply_mjc_body_f_kernel,
     apply_mjc_control_kernel,
@@ -87,6 +90,7 @@ from .kernels import (
     reset_sleeping_state_kernel,
     reset_world_buffers_kernel,
     restore_sleeping_state_kernel,
+    set_mesh_variant_index_kernel,
     sync_qpos0_kernel,
     sync_site_xposes_kernel,
     sync_worldbody_geom_xposes_kernel,
@@ -269,6 +273,18 @@ def _mujoco_warp_deterministic_max_records(mj_model: MjModel, mjw_data: MjWarpDa
 
 def _mesh_scale_key(mesh: Mesh, scale: np.ndarray) -> tuple[int, tuple[float, float, float]]:
     return id(mesh), tuple(float(s) for s in scale)
+
+
+def _prepare_mujoco_mesh(mesh: Mesh, scale: np.ndarray) -> tuple[np.ndarray, np.ndarray, int, bool]:
+    """Prepare one Newton mesh asset for MuJoCo compilation."""
+    vertices = mesh.vertices * scale
+    indices = mesh.indices.flatten()
+    maxhullvert = mesh.maxhullvert
+    extent_axis = vertices.max(axis=0) - vertices.min(axis=0)
+    is_planar = _mujoco_mesh_vertices_are_planar(vertices, extent_axis)
+    if is_planar:
+        vertices, indices, maxhullvert = _make_nonplanar_mujoco_mesh(vertices, indices, maxhullvert, extent_axis)
+    return vertices, indices, maxhullvert, is_planar
 
 
 def _mujoco_mesh_vertices_are_planar(
@@ -495,6 +511,45 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         INIT = 5
         """Initialize the tree asleep."""
 
+    class MeshVariantSet:
+        """Fixed-topology rigid-object builders selectable at runtime.
+
+        Args:
+            name: Set name.
+            shape_indices: Target Newton shape indices, shape ``[world_count, shape_count]``.
+            variant_builders: One-body source builders, in variant-index order.
+            initial_variant_ids: Initial variant per world, shape ``[world_count]``.
+        """
+
+        def __init__(
+            self,
+            *,
+            name: str,
+            shape_indices: Sequence[Sequence[int]],
+            variant_builders: Sequence[ModelBuilder],
+            initial_variant_ids: Sequence[int] | None = None,
+        ):
+            self.name = name
+            self.shape_indices = np.asarray(shape_indices, dtype=np.int32)
+            self.variant_builders = tuple(variant_builders)
+            self.initial_variant_ids = (
+                np.zeros(self.shape_indices.shape[0], dtype=np.int32)
+                if initial_variant_ids is None
+                else np.asarray(initial_variant_ids, dtype=np.int32)
+            )
+
+    @dataclass
+    class _MeshVariantBank:
+        """Device data for one mesh variant set."""
+
+        shape_indices: wp.array2d[wp.int32]
+        geom_indices: wp.array[wp.int32]
+        mj_body_index: int
+        mj_dof_index: int
+        shapes: wp.array2d[MeshVariantShape]
+        bodies: wp.array[MeshVariantBody]
+        variant_ids: wp.array[wp.int32]
+
     # Class variables to cache the imported modules
     _mujoco = None
     _mujoco_warp = None
@@ -528,6 +583,251 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 pass
             cls._versions_checked = True
         return cls._mujoco, cls._mujoco_warp
+
+    def _validate_mesh_variant_definitions(self, model: Model) -> None:
+        """Validate the rigid-object topology needed by the indexed update path."""
+        names = set()
+        shape_world = model.shape_world.numpy()
+        shape_type = model.shape_type.numpy()
+        shape_body = model.shape_body.numpy()
+        shape_flags = model.shape_flags.numpy()
+        body_world = model.body_world.numpy()
+        claimed_bodies = set()
+
+        for definition in self._mesh_variant_definitions:
+            if not definition.name or definition.name in names:
+                raise ValueError(f"Mesh variant set name must be non-empty and unique: {definition.name!r}")
+            names.add(definition.name)
+            if definition.shape_indices.ndim != 2 or definition.shape_indices.shape[0] != model.world_count:
+                raise ValueError(f"Mesh variant {definition.name!r} has invalid shape indices")
+            if definition.shape_indices.shape[1] == 0:
+                raise ValueError(f"Mesh variant {definition.name!r} has invalid rigid-object topology")
+            if len(definition.variant_builders) < 2:
+                raise ValueError(f"Mesh variant {definition.name!r} needs at least two source builders")
+            if definition.initial_variant_ids.shape != (model.world_count,):
+                raise ValueError(f"Mesh variant {definition.name!r} has invalid initial indices")
+            if np.any(
+                (definition.initial_variant_ids < 0)
+                | (definition.initial_variant_ids >= len(definition.variant_builders))
+            ):
+                raise ValueError(f"Mesh variant {definition.name!r} has an initial index outside its source range")
+            if np.any(np.bincount(definition.initial_variant_ids, minlength=len(definition.variant_builders)) == 0):
+                raise ValueError(f"Mesh variant {definition.name!r} needs every source in an initial world")
+
+            shape_indices = definition.shape_indices
+            if np.any((shape_indices < 0) | (shape_indices >= model.shape_count)):
+                raise ValueError(f"Mesh variant {definition.name!r} targets an invalid model index")
+            if any(len(set(row)) != shape_indices.shape[1] for row in shape_indices):
+                raise ValueError(f"Mesh variant {definition.name!r} repeats a target shape")
+            body_indices = shape_body[shape_indices[:, 0]]
+            if np.any(body_indices < 0) or np.any(shape_body[shape_indices] != body_indices[:, None]):
+                raise ValueError(f"Mesh variant {definition.name!r} shapes must belong to one body per world")
+            overlap = claimed_bodies.intersection(int(body) for body in body_indices)
+            if overlap:
+                raise ValueError(f"Mesh variant {definition.name!r} shares body ownership with another set")
+            claimed_bodies.update(int(body) for body in body_indices)
+            for world in range(model.world_count):
+                if np.any(shape_world[shape_indices[world]] != world) or body_world[body_indices[world]] != world:
+                    raise ValueError(f"Mesh variant {definition.name!r} crosses world boundaries")
+            if not np.all(np.isin(shape_type[shape_indices], (GeoType.MESH, GeoType.CONVEX_MESH))):
+                raise ValueError(f"Mesh variant {definition.name!r} targets a non-mesh shape")
+            if not np.all(shape_flags[shape_indices] & int(ShapeFlags.COLLIDE_SHAPES)):
+                raise ValueError(f"Mesh variant {definition.name!r} targets a non-collision shape")
+
+            for builder in definition.variant_builders:
+                if builder.body_count != 1:
+                    raise ValueError(f"Mesh variant {definition.name!r} sources must contain one body")
+                shapes = self._mesh_variant_shape_indices(builder)
+                if len(shapes) != shape_indices.shape[1]:
+                    raise ValueError(f"Mesh variant {definition.name!r} changes collision-shape topology")
+
+    @staticmethod
+    def _mesh_variant_shape_indices(builder: ModelBuilder) -> tuple[int, ...]:
+        shapes = tuple(
+            shape
+            for shape in builder.body_shapes[0]
+            if int(builder.shape_flags[shape]) & int(ShapeFlags.COLLIDE_SHAPES)
+        )
+        if not shapes or any(
+            builder.shape_type[shape] not in (GeoType.MESH, GeoType.CONVEX_MESH)
+            or not isinstance(builder.shape_source[shape], Mesh)
+            for shape in shapes
+        ):
+            raise ValueError("Mesh variants require mesh-only collision geometry")
+        return shapes
+
+    def _add_mesh_variant_assets(self, spec: Any, model: Model, shape_mapping: dict[int, str]) -> None:
+        """Add every candidate mesh to the MuJoCo asset table."""
+        if not self._mesh_variant_definitions:
+            return
+
+        mesh_asset_names: dict[tuple[int, tuple[float, float, float]], str] = {}
+        shape_scale = model.shape_scale.numpy()
+        shape_type = model.shape_type.numpy()
+        for shape, name in shape_mapping.items():
+            if shape_type[shape] in (GeoType.MESH, GeoType.CONVEX_MESH):
+                mesh_asset_names[_mesh_scale_key(model.shape_source[shape], shape_scale[shape])] = name
+
+        for set_index, definition in enumerate(self._mesh_variant_definitions):
+            asset_rows = []
+            for variant_index, builder in enumerate(definition.variant_builders):
+                names: list[str] = []
+                for shape_slot, shape in enumerate(self._mesh_variant_shape_indices(builder)):
+                    mesh = builder.shape_source[shape]
+                    scale = np.asarray(builder.shape_scale[shape], dtype=np.float32)
+                    key = _mesh_scale_key(mesh, scale)
+                    asset_name = mesh_asset_names.get(key)
+                    if asset_name is None:
+                        asset_name = f"mesh_variant_{set_index}_{variant_index}_{shape_slot}"
+                        vertices, indices, maxhullvert, is_planar = _prepare_mujoco_mesh(mesh, scale)
+                        if is_planar and self._use_mujoco_contacts:
+                            raise ValueError(f"Mesh variant {definition.name!r} contains a planar collider")
+                        spec.add_mesh(
+                            name=asset_name,
+                            uservert=vertices.flatten(),
+                            userface=indices.flatten(),
+                            maxhullvert=maxhullvert,
+                        )
+                        mesh_asset_names[key] = asset_name
+                    names.append(asset_name)
+                asset_rows.append(tuple(names))
+            self._mesh_variant_asset_names[definition.name] = tuple(asset_rows)
+
+    def _create_mesh_variant_banks(self, model: Model) -> None:
+        """Pack compiled geometry and inertial rows for device selection."""
+        if not self._mesh_variant_definitions:
+            return
+
+        mujoco = self._mujoco
+        geom_to_shape = self.mjc_geom_to_newton_shape.numpy()
+        body_to_newton = self.mjc_body_to_newton.numpy()
+        shape_body = model.shape_body.numpy()
+        shape_scales = model.shape_scale.numpy()
+        shape_transforms = model.shape_transform.numpy()
+        shape_collision_radii = model.shape_collision_radius.numpy()
+        shape_source_ptrs = model.shape_source_ptr.numpy()
+        shape_mesh_properties = model._shape_mesh_properties.numpy()
+        shape_sdf_indices = model._shape_sdf_index.numpy()
+        shape_edge_ranges = model.shape_edge_range.numpy()
+        shape_collision_aabb_lowers = model.shape_collision_aabb_lower.numpy()
+        shape_collision_aabb_uppers = model.shape_collision_aabb_upper.numpy()
+        shape_voxel_resolutions = model._shape_voxel_resolution.numpy()
+        body_masses = model.body_mass.numpy()
+        body_inv_masses = model.body_inv_mass.numpy()
+        body_coms = model.body_com.numpy()
+        body_inertias = model.body_inertia.numpy()
+        body_inv_inertias = model.body_inv_inertia.numpy()
+        device = model.device
+        for definition in self._mesh_variant_definitions:
+            geom_indices = np.asarray(
+                [np.flatnonzero(geom_to_shape[0] == shape).item() for shape in definition.shape_indices[0]],
+                dtype=np.int32,
+            )
+            for world in range(model.world_count):
+                if not np.array_equal(geom_to_shape[world, geom_indices], definition.shape_indices[world]):
+                    raise ValueError(f"Mesh variant {definition.name!r} does not preserve shape ordering")
+
+            body_indices = shape_body[definition.shape_indices[:, 0]]
+            mj_body = int(self.mj_model.geom_bodyid[geom_indices[0]])
+            if np.any(self.mj_model.geom_bodyid[geom_indices] != mj_body) or not np.array_equal(
+                body_to_newton[:, mj_body], body_indices
+            ):
+                raise ValueError(f"Mesh variant {definition.name!r} does not preserve body ordering")
+            if self.mj_model.body_parentid[mj_body] != 0 or np.any(self.mj_model.body_parentid[1:] == mj_body):
+                raise ValueError(f"Mesh variant {definition.name!r} must target a root leaf body")
+
+            joint_count = int(self.mj_model.body_jntnum[mj_body])
+            if joint_count == 0:
+                mj_dof = -1
+            else:
+                joint = int(self.mj_model.body_jntadr[mj_body])
+                if joint_count != 1 or self.mj_model.jnt_type[joint] != mujoco.mjtJoint.mjJNT_FREE:
+                    raise ValueError(f"Mesh variant {definition.name!r} must target a free or jointless body")
+                mj_dof = int(self.mj_model.jnt_dofadr[joint])
+
+            shape_rows = np.zeros(
+                (len(definition.variant_builders), definition.shape_indices.shape[1]),
+                dtype=MeshVariantShape.numpy_dtype(),
+            )
+            body_rows = np.zeros(len(definition.variant_builders), dtype=MeshVariantBody.numpy_dtype())
+            for variant, (builder, asset_names) in enumerate(
+                zip(definition.variant_builders, self._mesh_variant_asset_names[definition.name], strict=True)
+            ):
+                source_world = int(np.flatnonzero(definition.initial_variant_ids == variant)[0])
+                source_shapes = definition.shape_indices[source_world]
+                for slot, (builder_shape, source_shape, asset_name) in enumerate(
+                    zip(self._mesh_variant_shape_indices(builder), source_shapes, asset_names, strict=True)
+                ):
+                    if hash(model.shape_source[source_shape]) != hash(
+                        builder.shape_source[builder_shape]
+                    ) or not np.allclose(shape_scales[source_shape], builder.shape_scale[builder_shape]):
+                        raise ValueError(
+                            f"Mesh variant {definition.name!r} initial world {source_world} does not contain source {variant}"
+                        )
+                    dataid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_MESH, asset_name)
+                    start = int(self.mj_model.mesh_vertadr[dataid])
+                    vertices = self.mj_model.mesh_vert[start : start + int(self.mj_model.mesh_vertnum[dataid])]
+                    lower, upper = vertices.min(axis=0), vertices.max(axis=0)
+                    size = np.maximum(np.abs(lower), np.abs(upper))
+                    shape_rows["source_ptr"][variant, slot] = shape_source_ptrs[source_shape]
+                    shape_rows["mesh_properties"][variant, slot] = shape_mesh_properties[source_shape]
+                    shape_rows["sdf_index"][variant, slot] = shape_sdf_indices[source_shape]
+                    shape_rows["edge_range"][variant, slot] = shape_edge_ranges[source_shape]
+                    shape_rows["collision_aabb_lower"][variant, slot] = shape_collision_aabb_lowers[source_shape]
+                    shape_rows["collision_aabb_upper"][variant, slot] = shape_collision_aabb_uppers[source_shape]
+                    shape_rows["voxel_resolution"][variant, slot] = shape_voxel_resolutions[source_shape]
+                    shape_rows["dataid"][variant, slot] = dataid
+                    shape_rows["size"][variant, slot] = size
+                    shape_rows["rbound"][variant, slot] = np.linalg.norm(size)
+                    shape_rows["aabb_center"][variant, slot] = 0.5 * (lower + upper)
+                    shape_rows["aabb_size"][variant, slot] = 0.5 * (upper - lower)
+                    shape_rows["scale"][variant, slot] = shape_scales[source_shape]
+                    shape_rows["xform"][variant, slot] = shape_transforms[source_shape]
+                    shape_rows["collision_radius"][variant, slot] = shape_collision_radii[source_shape]
+                    xform = np.asarray(shape_transforms[source_shape], dtype=np.float64)
+                    xquat = xform[[6, 3, 4, 5]]
+                    geom_quat = np.empty(4)
+                    geom_pos = np.empty(3)
+                    mujoco.mju_mulQuat(geom_quat, xquat, self.mj_model.mesh_quat[dataid])
+                    mujoco.mju_rotVecQuat(geom_pos, self.mj_model.mesh_pos[dataid], xquat)
+                    shape_rows["geom_pos"][variant, slot] = xform[:3] + geom_pos
+                    shape_rows["geom_quat"][variant, slot] = geom_quat
+
+                source_body = body_indices[source_world]
+                mass = float(body_masses[source_body])
+                com = np.asarray(body_coms[source_body], dtype=np.float64)
+                inertia = np.asarray(body_inertias[source_body], dtype=np.float64).reshape(3, 3)
+                inv_inertia = np.asarray(body_inv_inertias[source_body], dtype=np.float64).reshape(3, 3)
+                mj_inertia, eigvec, mj_iquat = np.empty(3), np.empty(9), np.empty(4)
+                mujoco.mju_eig3(mj_inertia, eigvec, mj_iquat, inertia.ravel())
+                if mj_dof >= 0:
+                    if mass <= 0.0 or np.any(mj_inertia <= 0.0):
+                        raise ValueError(f"Mesh variant {definition.name!r} has non-positive mass or inertia")
+                    rotational_invweight = np.trace(inv_inertia) / 3.0
+                else:
+                    rotational_invweight = 0.0
+                cross = np.array(((0.0, -com[2], com[1]), (com[2], 0.0, -com[0]), (-com[1], com[0], 0.0)))
+                linear_invweight = 1.0 / mass + np.trace(cross @ inv_inertia @ cross.T) / 3.0 if mj_dof >= 0 else 0.0
+                body_rows["mass"][variant] = mass
+                body_rows["inv_mass"][variant] = body_inv_masses[source_body]
+                body_rows["com"][variant] = com
+                body_rows["inertia"][variant] = inertia
+                body_rows["inv_inertia"][variant] = inv_inertia
+                body_rows["mj_inertia"][variant] = mj_inertia
+                body_rows["mj_iquat"][variant] = mj_iquat
+                body_rows["body_invweight0"][variant] = (1.0 / mass, rotational_invweight) if mj_dof >= 0 else 0.0
+                body_rows["dof_invweight0"][variant] = (linear_invweight,) * 3 + (rotational_invweight,) * 3
+
+            bank = SolverMuJoCo._MeshVariantBank(
+                shape_indices=wp.array(definition.shape_indices, dtype=wp.int32, device=device),
+                geom_indices=wp.array(geom_indices, dtype=wp.int32, device=device),
+                mj_body_index=mj_body,
+                mj_dof_index=mj_dof,
+                shapes=wp.array(shape_rows, dtype=MeshVariantShape, device=device),
+                bodies=wp.array(body_rows, dtype=MeshVariantBody, device=device),
+                variant_ids=wp.zeros(model.world_count, dtype=wp.int32, device=device),
+            )
+            self._mesh_variant_banks[definition.name] = bank
 
     def _prepare_generated_kernels(self) -> None:
         """Invalidate MJWarp's generated kernels when determinism changes."""
@@ -3407,6 +3707,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         use_mujoco_contacts: bool = True,
         include_sites: bool = True,
         skip_visual_only_geoms: bool = True,
+        mesh_variant_sets: Sequence[SolverMuJoCo.MeshVariantSet] | None = None,
         deterministic: wp.DeterministicMode | None = None,
     ):
         """
@@ -3450,11 +3751,19 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             use_mujoco_contacts: If True, use the MuJoCo contact solver. If False, use the Newton contact solver (newton contacts must be passed in through the step function in that case).
             include_sites: If ``True`` (default), Newton shapes marked with ``ShapeFlags.SITE`` are exported as MuJoCo sites. Sites are non-colliding reference points used for sensor attachment, debugging, or as frames of reference. If ``False``, sites are skipped during export. Defaults to ``True``.
             skip_visual_only_geoms: If ``True`` (default), geometries used only for visualization (i.e. not involved in collision) are excluded from the exported MuJoCo spec. This avoids mismatches with models that use explicit ``<contact>`` definitions for collision geometry.
+            mesh_variant_sets: Optional fixed-topology mesh variant banks to compile
+                into the GPU model. Runtime selection is available through
+                :meth:`set_mesh_variant_index`. This requires separate-world GPU
+                simulation.
             deterministic: Deterministic mode for MuJoCo Warp solver kernels. Pass a
                 :class:`warp.DeterministicMode`, or ``None`` to inherit
                 ``wp.config.deterministic``.
         """
         super().__init__(model)
+
+        self._mesh_variant_definitions = tuple(mesh_variant_sets or ())
+        self._mesh_variant_banks: dict[str, SolverMuJoCo._MeshVariantBank] = {}
+        self._mesh_variant_asset_names: dict[str, tuple[tuple[str, ...], ...]] = {}
 
         # Import and cache MuJoCo modules (only happens once per class)
         mujoco, _ = self.import_mujoco()
@@ -3474,7 +3783,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 "enable_sleeping=True requires use_mujoco_contacts=True so contacts can wake sleeping bodies."
             )
         if nvmax is not None:
-            if isinstance(nvmax, bool) or not isinstance(nvmax, (int, np.integer)):
+            if isinstance(nvmax, bool) or not isinstance(nvmax, int | np.integer):
                 raise TypeError(f"nvmax must be an integer or None, got {type(nvmax).__name__}.")
             if nvmax < 0:
                 raise ValueError(f"nvmax must be non-negative, got {nvmax}.")
@@ -3689,6 +3998,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     )
         if separate_worlds is None:
             separate_worlds = not use_mujoco_cpu and model.world_count > 1
+        if self._mesh_variant_definitions:
+            if use_mujoco_cpu:
+                raise ValueError("mesh_variant_sets requires the MuJoCo Warp GPU backend.")
+            if not separate_worlds:
+                raise ValueError("mesh_variant_sets requires separate_worlds=True.")
+            self._validate_mesh_variant_definitions(model)
         # Buffers for the fast-path contact conversion optimisation.
         # See _convert_contacts_to_mjwarp / convert_newton_contacts_to_mjwarp_kernel.
         # Initialised before _convert_to_mjc because notify_model_changed (called
@@ -3749,6 +4064,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 include_sites=include_sites,
                 skip_visual_only_geoms=skip_visual_only_geoms,
             )
+        self._mesh_variant_definitions = ()
+        self._mesh_variant_asset_names.clear()
         if not use_mujoco_cpu and not use_mujoco_contacts:
             self._contact_tid_to_cid = wp.full(self.mjw_data.naconmax, -1, dtype=wp.int32, device=self.device)
         self._initial_model_sync = False
@@ -3786,6 +4103,107 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
     @event_scope
     def _mujoco_warp_step(self):
         self._mujoco_warp.step(self.mjw_model, self.mjw_data)
+
+    @property
+    def mesh_variant_names(self) -> tuple[str, ...]:
+        """Names of the compiled mesh variant sets."""
+        return tuple(self._mesh_variant_banks)
+
+    def mesh_variant_ids(self, name: str) -> wp.array[wp.int32]:
+        """Return the selected variant id in each world."""
+        try:
+            return self._mesh_variant_banks[name].variant_ids
+        except KeyError as error:
+            raise KeyError(f"Unknown mesh variant set {name!r}; available sets: {self.mesh_variant_names}.") from error
+
+    def set_mesh_variant_index(
+        self,
+        name: str,
+        *,
+        variant_ids: wp.array[wp.int32],
+        world_ids: wp.array[wp.int32],
+    ) -> None:
+        """Select precompiled geometry and inertia rows at reset.
+
+        Args:
+            name: Mesh variant set name.
+            variant_ids: Variant id per selected world, shape ``[selection_count]``.
+                Every value must be in the set's variant range.
+            world_ids: Valid, unique world indices, shape ``[selection_count]``.
+        """
+        try:
+            bank = self._mesh_variant_banks[name]
+        except KeyError as error:
+            raise KeyError(f"Unknown mesh variant set {name!r}; available sets: {self.mesh_variant_names}.") from error
+        for argument_name, array in (("variant_ids", variant_ids), ("world_ids", world_ids)):
+            if not isinstance(array, wp.array) or array.dtype != wp.int32:
+                raise TypeError(f"{argument_name} must be a one-dimensional wp.array with dtype wp.int32.")
+            if array.ndim != 1:
+                raise ValueError(f"{argument_name} must be one-dimensional; got shape {array.shape}.")
+            if array.device != self.model.device:
+                raise ValueError(f"{argument_name} must be on {self.model.device}, got {array.device}.")
+        if variant_ids.shape != world_ids.shape:
+            raise ValueError(
+                f"variant_ids and world_ids must have equal shapes; got {variant_ids.shape} and {world_ids.shape}."
+            )
+        if not variant_ids.shape[0]:
+            return
+
+        with wp.ScopedDevice(self.model.device), self._scoped_mujoco_warp_execution():
+            wp.launch(
+                set_mesh_variant_index_kernel,
+                dim=(variant_ids.shape[0], bank.shape_indices.shape[1]),
+                inputs=[
+                    variant_ids,
+                    world_ids,
+                    bank.shape_indices,
+                    bank.geom_indices,
+                    self.model.shape_body,
+                    bank.mj_body_index,
+                    bank.mj_dof_index,
+                    bank.shapes,
+                    bank.bodies,
+                    self.mjw_model.nv,
+                    _GENERATION_SENTINEL,
+                ],
+                outputs=[
+                    self.model.shape_scale,
+                    self.model.shape_transform,
+                    self.model.shape_collision_radius,
+                    self.model.shape_source_ptr,
+                    self.model._shape_mesh_properties,
+                    self.model._shape_sdf_index,
+                    self.model.shape_edge_range,
+                    self.model.shape_collision_aabb_lower,
+                    self.model.shape_collision_aabb_upper,
+                    self.model._shape_voxel_resolution,
+                    self.model.body_mass,
+                    self.model.body_inv_mass,
+                    self.model.body_com,
+                    self.model.body_inertia,
+                    self.model.body_inv_inertia,
+                    self.mjw_model.geom_dataid,
+                    self.mjw_model.geom_size,
+                    self.mjw_model.geom_rbound,
+                    self.mjw_model.geom_aabb,
+                    self.mjw_model.geom_pos,
+                    self.mjw_model.geom_quat,
+                    self.mjw_model.body_mass,
+                    self.mjw_model.body_subtreemass,
+                    self.mjw_model.body_ipos,
+                    self.mjw_model.body_inertia,
+                    self.mjw_model.body_iquat,
+                    self.mjw_model.body_invweight0,
+                    self.mjw_model.dof_invweight0,
+                    self.mjw_model.stat.meaninertia,
+                    self.mjw_data.qacc_warmstart,
+                    self.mjw_data.nacon,
+                    self._last_contact_generation,
+                    self._last_nacon_count,
+                    bank.variant_ids,
+                ],
+                device=self.model.device,
+            )
 
     @event_scope
     @override
@@ -6034,21 +6452,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     key = _mesh_scale_key(mesh_src, size)
                     mesh_export = mesh_export_cache.get(key)
                     if mesh_export is None:
-                        vertices = mesh_src.vertices * size
-                        indices = mesh_src.indices.flatten()
-                        maxhullvert = mesh_src.maxhullvert
-                        extent_axis = vertices.max(axis=0) - vertices.min(axis=0)
-                        is_planar = _mujoco_mesh_vertices_are_planar(vertices, extent_axis)
-                        if is_planar:
-                            # MuJoCo compiles every mesh geom through its convex-hull path,
-                            # which rejects lower-dimensional vertex clouds. When Newton
-                            # supplies contacts, the MuJoCo mesh only needs to compile and
-                            # keep a stable geom id, so add a tiny referenced off-plane
-                            # vertex to the exported asset.
-                            vertices, indices, maxhullvert = _make_nonplanar_mujoco_mesh(
-                                vertices, indices, maxhullvert, extent_axis
-                            )
-                        mesh_export = (vertices, indices, maxhullvert, is_planar)
+                        mesh_export = _prepare_mujoco_mesh(mesh_src, size)
                         mesh_export_cache[key] = mesh_export
 
                     vertices, indices, maxhullvert, is_planar = mesh_export
@@ -7046,6 +7450,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             and actuator.biasprm[2] > 0.0
         ]
 
+        self._add_mesh_variant_assets(spec, model, shape_mapping)
         self.mj_model = spec.compile()
         # Keep the compiled qM layout, but restore the physical COM and derived constants.
         for body_id, body, body_ipos in full_inertia_bodies:
@@ -7451,6 +7856,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
 
             # expand model fields that can be expanded:
             self._expand_model_fields(self.mjw_model, nworld)
+            self._create_mesh_variant_banks(model)
 
             # update solver options from Newton model (only if not overridden by constructor)
             self._update_solver_options(overridden_options=overridden_options)
@@ -7458,6 +7864,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             # so far we have only defined the first world,
             # now complete the data from the Newton model
             self.notify_model_changed(ModelFlags.ALL)
+            if self._mesh_variant_definitions:
+                world_ids = wp.array(np.arange(model.world_count, dtype=np.int32), dtype=wp.int32, device=model.device)
+                for definition in self._mesh_variant_definitions:
+                    variant_ids = wp.array(definition.initial_variant_ids, dtype=wp.int32, device=model.device)
+                    self.set_mesh_variant_index(definition.name, variant_ids=variant_ids, world_ids=world_ids)
 
             if target_filename:
                 # Only persist ``solreflimit`` for ``SOLREF_MODE_RAW`` joints
@@ -7594,6 +8005,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             "tendon_invweight0",  # Derived from inertia, computed by set_const_0
             # "mat_rgba",
         }
+        if self._mesh_variant_definitions:
+            model_fields_to_expand.update(("geom_dataid", "geom_aabb"))
 
         # Solver option fields to expand (nested in mj_model.opt)
         opt_fields_to_expand = {
