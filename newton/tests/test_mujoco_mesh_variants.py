@@ -127,23 +127,46 @@ def _cube_builder(
 class TestMuJoCoMeshVariants(unittest.TestCase):
     """Verify complete geometry and inertial rows switch together."""
 
-    def test_mesh_variant_sets_require_initial_source_coverage(self):
-        """Require every candidate resource to exist in the finalized model."""
+    def test_mesh_variant_sets_use_compiled_source_shapes(self):
+        """Compile candidates independently from the initial world assignment."""
         base = _cube_builder(_cube_mesh(0.05), 1.0, 0.05)
         large = _cube_builder(_cube_mesh(0.10), 8.0, 0.10)
         builder = newton.ModelBuilder()
         builder.add_world(base)
         builder.add_world(base)
+        source_shapes = []
+        for source in (base, large):
+            shape = source.body_shapes[0][0]
+            source_shapes.append(
+                builder.add_shape(
+                    body=-1,
+                    type=source.shape_type[shape],
+                    xform=source.shape_transform[shape],
+                    scale=source.shape_scale[shape],
+                    src=source.shape_source[shape],
+                    is_static=True,
+                    cfg=newton.ModelBuilder.ShapeConfig(density=0.0, gap=0.0, is_visible=False),
+                )
+            )
         model = builder.finalize()
+        flags = model.shape_flags.numpy().copy()
+        flags[source_shapes] = 0
+        model.shape_flags.assign(flags)
         variants = SolverMuJoCo.MeshVariantSet(
             name="box",
             shape_indices=((0,), (1,)),
             variant_builders=(base, large),
             initial_variant_ids=(0, 0),
+            source_shape_indices=np.asarray(source_shapes)[:, None],
         )
+        solver = SolverMuJoCo(model, mesh_variant_sets=(variants,), disable_contacts=True)
 
-        with self.assertRaisesRegex(ValueError, "every source in an initial world"):
-            SolverMuJoCo(model, mesh_variant_sets=(variants,), disable_contacts=True)
+        solver.set_mesh_variant_index(
+            "box",
+            variant_ids=wp.array([1], dtype=wp.int32, device=model.device),
+            world_ids=wp.array([1], dtype=wp.int32, device=model.device),
+        )
+        np.testing.assert_allclose(model.body_mass.numpy(), (1.0, 8.0))
 
     def test_mesh_variant_sets_reject_shared_body_ownership(self):
         """Reject variant sets that both own the same rigid body."""
