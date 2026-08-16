@@ -38,6 +38,40 @@ vec10 = wp.types.vector(length=10, dtype=wp.float32)
 vec11 = wp.types.vector(length=11, dtype=wp.float32)
 
 
+@wp.struct
+class MeshVariantShape:
+    source_ptr: wp.uint64
+    mesh_properties: wp.int32
+    sdf_index: wp.int32
+    edge_range: wp.vec2i
+    collision_aabb_lower: wp.vec3f
+    collision_aabb_upper: wp.vec3f
+    voxel_resolution: wp.vec3i
+    dataid: wp.int32
+    size: wp.vec3f
+    rbound: wp.float32
+    aabb_center: wp.vec3f
+    aabb_size: wp.vec3f
+    scale: wp.vec3f
+    xform: wp.transformf
+    collision_radius: wp.float32
+    geom_pos: wp.vec3f
+    geom_quat: wp.quatf
+
+
+@wp.struct
+class MeshVariantBody:
+    mass: wp.float32
+    inv_mass: wp.float32
+    com: wp.vec3f
+    inertia: wp.mat33f
+    inv_inertia: wp.mat33f
+    mj_inertia: wp.vec3f
+    mj_iquat: wp.quatf
+    body_invweight0: wp.vec2f
+    dof_invweight0: wp.spatial_vectorf
+
+
 # Utility functions
 @wp.func
 def safe_div(x: float, y: float) -> float:
@@ -2515,8 +2549,8 @@ def update_geom_properties_kernel(
     else:
         geom_margin[world, geom_idx] = shape_margin[shape_idx]
 
-    # update size
-    geom_size[world, geom_idx] = shape_size[shape_idx]
+    if geom_type[geom_idx] != GEOM_TYPE_MESH:
+        geom_size[world, geom_idx] = shape_size[shape_idx]
 
     # update position and orientation
 
@@ -2534,6 +2568,132 @@ def update_geom_properties_kernel(
     # store position and orientation
     geom_pos[world, geom_idx] = tf.p
     geom_quat[world, geom_idx] = quat_xyzw_to_wxyz(tf.q)
+
+
+@wp.kernel(enable_backward=False)
+def set_mesh_variant_index_kernel(
+    variant_ids: wp.array[wp.int32],
+    world_ids: wp.array[wp.int32],
+    target_shape_indices: wp.array2d[wp.int32],
+    target_geom_indices: wp.array[wp.int32],
+    shape_bodies: wp.array[wp.int32],
+    target_mj_body: int,
+    target_mj_dof: int,
+    variant_shapes: wp.array2d[MeshVariantShape],
+    variant_bodies: wp.array[MeshVariantBody],
+    nv: int,
+    contact_generation_sentinel: int,
+    shape_scales: wp.array[wp.vec3f],
+    shape_transforms: wp.array[wp.transformf],
+    shape_collision_radii: wp.array[wp.float32],
+    shape_source_ptrs: wp.array[wp.uint64],
+    shape_mesh_properties: wp.array[wp.int32],
+    shape_sdf_indices: wp.array[wp.int32],
+    shape_edge_ranges: wp.array[wp.vec2i],
+    shape_collision_aabb_lowers: wp.array[wp.vec3f],
+    shape_collision_aabb_uppers: wp.array[wp.vec3f],
+    shape_voxel_resolutions: wp.array[wp.vec3i],
+    body_masses: wp.array[wp.float32],
+    body_inv_masses: wp.array[wp.float32],
+    body_coms: wp.array[wp.vec3f],
+    body_inertias: wp.array[wp.mat33f],
+    body_inv_inertias: wp.array[wp.mat33f],
+    geom_dataids: wp.array2d[wp.int32],
+    geom_sizes: wp.array2d[wp.vec3f],
+    geom_rbounds: wp.array2d[wp.float32],
+    geom_aabbs: wp.array3d[wp.vec3f],
+    geom_positions: wp.array2d[wp.vec3f],
+    geom_quaternions: wp.array2d[wp.quatf],
+    mj_body_masses: wp.array2d[wp.float32],
+    mj_body_subtreemasses: wp.array2d[wp.float32],
+    mj_body_ipos: wp.array2d[wp.vec3f],
+    mj_body_inertias: wp.array2d[wp.vec3f],
+    mj_body_iquats: wp.array2d[wp.quatf],
+    mj_body_invweight0: wp.array2d[wp.vec2f],
+    mj_dof_invweight0: wp.array2d[wp.float32],
+    meaninertia: wp.array[wp.float32],
+    qacc_warmstart: wp.array2d[wp.float32],
+    nacon: wp.array[wp.int32],
+    last_contact_generation: wp.array[wp.int32],
+    last_nacon_count: wp.array[wp.int32],
+    current_variant_ids: wp.array[wp.int32],
+):
+    """Apply one precompiled rigid-object variant per selected world."""
+    selection, slot = wp.tid()
+    world = world_ids[selection]
+    variant = variant_ids[selection]
+    if selection == 0 and slot == 0:
+        nacon[0] = 0
+        last_contact_generation[0] = contact_generation_sentinel
+        last_nacon_count[0] = 0
+    if world < 0 or world >= target_shape_indices.shape[0]:
+        return
+    if variant < 0 or variant >= variant_shapes.shape[0]:
+        return
+
+    shape = target_shape_indices[world, slot]
+    geom = target_geom_indices[slot]
+    shape_row = variant_shapes[variant, slot]
+    shape_scales[shape] = shape_row.scale
+    shape_transforms[shape] = shape_row.xform
+    shape_collision_radii[shape] = shape_row.collision_radius
+    shape_source_ptrs[shape] = shape_row.source_ptr
+    shape_mesh_properties[shape] = shape_row.mesh_properties
+    shape_sdf_indices[shape] = shape_row.sdf_index
+    shape_edge_ranges[shape] = shape_row.edge_range
+    shape_collision_aabb_lowers[shape] = shape_row.collision_aabb_lower
+    shape_collision_aabb_uppers[shape] = shape_row.collision_aabb_upper
+    shape_voxel_resolutions[shape] = shape_row.voxel_resolution
+    geom_dataids[world, geom] = shape_row.dataid
+    geom_sizes[world, geom] = shape_row.size
+    geom_rbounds[world, geom] = shape_row.rbound
+    geom_aabbs[world, geom, 0] = shape_row.aabb_center
+    geom_aabbs[world, geom, 1] = shape_row.aabb_size
+
+    geom_positions[world, geom] = shape_row.geom_pos
+    geom_quaternions[world, geom] = shape_row.geom_quat
+
+    if slot != 0:
+        return
+
+    body = shape_bodies[shape]
+    body_row = variant_bodies[variant]
+    old_mass = body_masses[body]
+    old_com = body_coms[body]
+    old_inertia = body_inertias[body]
+    mass = body_row.mass
+    inertia = body_row.inertia
+    body_masses[body] = mass
+    body_coms[body] = body_row.com
+    body_inertias[body] = inertia
+    body_inv_masses[body] = body_row.inv_mass
+    body_inv_inertias[body] = body_row.inv_inertia
+
+    mj_body_masses[world, target_mj_body] = mass
+    mj_body_subtreemasses[world, target_mj_body] = mass
+    mj_body_subtreemasses[world, 0] += mass - old_mass
+    mj_body_ipos[world, target_mj_body] = body_row.com
+    mj_body_inertias[world, target_mj_body] = body_row.mj_inertia
+    mj_body_iquats[world, target_mj_body] = body_row.mj_iquat
+    mj_body_invweight0[world, target_mj_body] = body_row.body_invweight0
+    if target_mj_dof >= 0:
+        for axis in range(6):
+            mj_dof_invweight0[world, target_mj_dof + axis] = body_row.dof_invweight0[axis]
+            qacc_warmstart[world, target_mj_dof + axis] = 0.0
+
+        old_mean = (
+            3.0 * old_mass
+            + old_inertia[0, 0]
+            + old_inertia[1, 1]
+            + old_inertia[2, 2]
+            + 2.0 * old_mass * wp.dot(old_com, old_com)
+        ) / float(nv)
+        new_mean = (
+            3.0 * mass + inertia[0, 0] + inertia[1, 1] + inertia[2, 2] + 2.0 * mass * wp.dot(body_row.com, body_row.com)
+        ) / float(nv)
+        meaninertia[world] += new_mean - old_mean
+
+    current_variant_ids[world] = variant
 
 
 @wp.kernel
