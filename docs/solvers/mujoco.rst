@@ -610,6 +610,47 @@ raises ``ValueError``. Only shapes may live in the global world (-1);
 they are shared across all worlds without replication.
 
 
+Precompiled mesh variants
+-------------------------
+
+GPU multi-world simulations can compile fixed-topology collision-mesh variants
+once and select them per world at reset. Define the target Newton shape indices
+for each world and provide one single-body builder per variant::
+
+    import warp as wp
+    from newton.solvers import SolverMuJoCo
+
+    variants = SolverMuJoCo.MeshVariantSet(
+        name="object",
+        shape_indices=((4,), (9,)),
+        variant_builders=(small_object_builder, large_object_builder),
+        initial_variant_ids=(0, 1),
+    )
+    solver = SolverMuJoCo(model, mesh_variant_sets=(variants,))
+
+    solver.set_mesh_variant_index(
+        "object",
+        variant_ids=wp.array([1], dtype=wp.int32, device=model.device),
+        world_ids=wp.array([0], dtype=wp.int32, device=model.device),
+    )
+
+Selection updates mesh identity, collision metadata, local bounds and
+transform, mass, center of mass, inertia, subtree mass, inverse weights, and
+mean inertia in one device launch. Candidate data is stored once per variant
+and shape slot; it is not expanded across worlds. Newton-owned contacts also
+switch the mesh pointer, SDF index, edge range, local collision AABB, and voxel
+metadata.
+
+This path requires the MuJoCo Warp GPU backend, ``separate_worlds=True``, and
+one initial world for every variant. The target must be a root leaf body with a
+free joint or no joint. Every source builder must contain one body and the same
+nonzero number of mesh-only collision shapes; MuJoCo-owned contacts additionally
+require non-planar meshes. ``variant_ids`` and ``world_ids`` must be
+one-dimensional ``wp.int32`` arrays on the model device; world indices must be
+valid and unique within a call. Body flags, joints, collision filters,
+materials, and visual geometry remain fixed.
+
+
 Runtime state synchronization
 -----------------------------
 
