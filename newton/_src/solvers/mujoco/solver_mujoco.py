@@ -20,6 +20,7 @@ import warp as wp
 
 from ...core.types import MAXVAL, override, vec5, vec10
 from ...geometry import GeoType, Mesh, ShapeFlags
+from ...geometry.inertia import verify_and_correct_inertia
 from ...sim import (
     BodyFlags,
     Contacts,
@@ -519,6 +520,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             shape_indices: Target Newton shape indices, shape ``[world_count, shape_count]``.
             variant_builders: One-body source builders, in variant-index order.
             initial_variant_ids: Initial variant per world, shape ``[world_count]``.
+            source_shape_indices: Optional compiled resource shapes, shape
+                ``[variant_count, shape_count]``. When omitted, every variant must
+                be present in an initial world.
         """
 
         def __init__(
@@ -528,6 +532,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             shape_indices: Sequence[Sequence[int]],
             variant_builders: Sequence[ModelBuilder],
             initial_variant_ids: Sequence[int] | None = None,
+            source_shape_indices: Sequence[Sequence[int]] | None = None,
         ):
             self.name = name
             self.shape_indices = np.asarray(shape_indices, dtype=np.int32)
@@ -536,6 +541,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 np.zeros(self.shape_indices.shape[0], dtype=np.int32)
                 if initial_variant_ids is None
                 else np.asarray(initial_variant_ids, dtype=np.int32)
+            )
+            self.source_shape_indices = (
+                None if source_shape_indices is None else np.asarray(source_shape_indices, dtype=np.int32)
             )
 
     @dataclass
@@ -611,7 +619,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 | (definition.initial_variant_ids >= len(definition.variant_builders))
             ):
                 raise ValueError(f"Mesh variant {definition.name!r} has an initial index outside its source range")
-            if np.any(np.bincount(definition.initial_variant_ids, minlength=len(definition.variant_builders)) == 0):
+            if definition.source_shape_indices is None and np.any(
+                np.bincount(definition.initial_variant_ids, minlength=len(definition.variant_builders)) == 0
+            ):
                 raise ValueError(f"Mesh variant {definition.name!r} needs every source in an initial world")
 
             shape_indices = definition.shape_indices
@@ -640,6 +650,18 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 shapes = self._mesh_variant_shape_indices(builder)
                 if len(shapes) != shape_indices.shape[1]:
                     raise ValueError(f"Mesh variant {definition.name!r} changes collision-shape topology")
+            if definition.source_shape_indices is not None:
+                expected_shape = (len(definition.variant_builders), shape_indices.shape[1])
+                if definition.source_shape_indices.shape != expected_shape:
+                    raise ValueError(f"Mesh variant {definition.name!r} has invalid source shape indices")
+                if np.any(
+                    (definition.source_shape_indices < 0) | (definition.source_shape_indices >= model.shape_count)
+                ):
+                    raise ValueError(f"Mesh variant {definition.name!r} targets an invalid source shape")
+                if not np.all(
+                    np.isin(shape_type[definition.source_shape_indices], (GeoType.MESH, GeoType.CONVEX_MESH))
+                ):
+                    raise ValueError(f"Mesh variant {definition.name!r} has a non-mesh source shape")
 
     @staticmethod
     def _mesh_variant_shape_indices(builder: ModelBuilder) -> tuple[int, ...]:
@@ -655,6 +677,22 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         ):
             raise ValueError("Mesh variants require mesh-only collision geometry")
         return shapes
+
+    @staticmethod
+    def _mesh_variant_body(builder: ModelBuilder) -> tuple[float, float, np.ndarray, np.ndarray, np.ndarray]:
+        """Return finalized mass, inverse mass, COM, inertia, and inverse inertia."""
+        mass, inertia, _ = verify_and_correct_inertia(
+            builder.body_mass[0],
+            builder.body_inertia[0],
+            builder.balance_inertia,
+            builder.bound_mass,
+            builder.bound_inertia,
+            builder.body_label[0],
+        )
+        inertia = np.asarray(inertia, dtype=np.float64).reshape(3, 3)
+        inv_mass = 1.0 / mass if mass > 0.0 else 0.0
+        inv_inertia = np.linalg.inv(inertia) if np.any(inertia) else inertia
+        return mass, inv_mass, np.asarray(builder.body_com[0], dtype=np.float64), inertia, inv_inertia
 
     def _add_mesh_variant_assets(self, spec: Any, model: Model, shape_mapping: dict[int, str]) -> None:
         """Add every candidate mesh to the MuJoCo asset table."""
@@ -753,8 +791,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             for variant, (builder, asset_names) in enumerate(
                 zip(definition.variant_builders, self._mesh_variant_asset_names[definition.name], strict=True)
             ):
-                source_world = int(np.flatnonzero(definition.initial_variant_ids == variant)[0])
-                source_shapes = definition.shape_indices[source_world]
+                if definition.source_shape_indices is None:
+                    source_world = int(np.flatnonzero(definition.initial_variant_ids == variant)[0])
+                    source_shapes = definition.shape_indices[source_world]
+                else:
+                    source_world = None
+                    source_shapes = definition.source_shape_indices[variant]
                 for slot, (builder_shape, source_shape, asset_name) in enumerate(
                     zip(self._mesh_variant_shape_indices(builder), source_shapes, asset_names, strict=True)
                 ):
@@ -793,11 +835,15 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     shape_rows["geom_pos"][variant, slot] = xform[:3] + geom_pos
                     shape_rows["geom_quat"][variant, slot] = geom_quat
 
-                source_body = body_indices[source_world]
-                mass = float(body_masses[source_body])
-                com = np.asarray(body_coms[source_body], dtype=np.float64)
-                inertia = np.asarray(body_inertias[source_body], dtype=np.float64).reshape(3, 3)
-                inv_inertia = np.asarray(body_inv_inertias[source_body], dtype=np.float64).reshape(3, 3)
+                if source_world is None:
+                    mass, inv_mass, com, inertia, inv_inertia = self._mesh_variant_body(builder)
+                else:
+                    source_body = body_indices[source_world]
+                    mass = float(body_masses[source_body])
+                    inv_mass = float(body_inv_masses[source_body])
+                    com = np.asarray(body_coms[source_body], dtype=np.float64)
+                    inertia = np.asarray(body_inertias[source_body], dtype=np.float64).reshape(3, 3)
+                    inv_inertia = np.asarray(body_inv_inertias[source_body], dtype=np.float64).reshape(3, 3)
                 mj_inertia, eigvec, mj_iquat = np.empty(3), np.empty(9), np.empty(4)
                 mujoco.mju_eig3(mj_inertia, eigvec, mj_iquat, inertia.ravel())
                 if mj_dof >= 0:
@@ -809,7 +855,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 cross = np.array(((0.0, -com[2], com[1]), (com[2], 0.0, -com[0]), (-com[1], com[0], 0.0)))
                 linear_invweight = 1.0 / mass + np.trace(cross @ inv_inertia @ cross.T) / 3.0 if mj_dof >= 0 else 0.0
                 body_rows["mass"][variant] = mass
-                body_rows["inv_mass"][variant] = body_inv_masses[source_body]
+                body_rows["inv_mass"][variant] = inv_mass
                 body_rows["com"][variant] = com
                 body_rows["inertia"][variant] = inertia
                 body_rows["inv_inertia"][variant] = inv_inertia
