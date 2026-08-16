@@ -54,8 +54,8 @@ from .kernels import (
     PROPAGATION_COLOR_TAIL,
     add_dense_contact_compliance_to_diag,
     allocate_joint_limit_slots,
-    allocate_mimic_slots,
     allocate_joint_velocity_limit_slots,
+    allocate_mimic_slots,
     allocate_physx_drive_slots,
     allocate_rigid_velocity_limit_slots,
     allocate_world_contact_slots,
@@ -123,8 +123,8 @@ from .kernels import (
     pgs_solve_mf_loop,
     pgs_solve_propagation_contact_loop,
     populate_joint_limit_J_for_size,
-    populate_mimic_J_for_size,
     populate_joint_velocity_limit_J_for_size,
+    populate_mimic_J_for_size,
     populate_physx_drive_J_for_size,
     populate_rigid_velocity_limit_rows,
     populate_world_J_for_size,
@@ -2487,16 +2487,14 @@ class SolverFeatherPGS(SolverBase):
         # articulation's mimic constraints the way the joint-limit kernel walks joints.
         mimic_count = int(model.constraint_mimic_count) if model.constraint_mimic_count is not None else 0
         if mimic_count > 0:
-            import numpy as _np
-
             art_start_np = model.articulation_start.numpy()
             mimic_j0_np = model.constraint_mimic_joint0.numpy()
             # Follower joint -> owning articulation (largest art with start <= joint index).
-            mimic_art_np = (_np.searchsorted(art_start_np, mimic_j0_np, side="right") - 1).astype(_np.int32)
-            order_np = _np.argsort(mimic_art_np, kind="stable").astype(_np.int32)
-            counts_np = _np.bincount(mimic_art_np, minlength=model.articulation_count)
-            csr_np = _np.zeros(model.articulation_count + 1, dtype=_np.int32)
-            csr_np[1:] = _np.cumsum(counts_np)
+            mimic_art_np = (np.searchsorted(art_start_np, mimic_j0_np, side="right") - 1).astype(np.int32)
+            order_np = np.argsort(mimic_art_np, kind="stable").astype(np.int32)
+            counts_np = np.bincount(mimic_art_np, minlength=model.articulation_count)
+            csr_np = np.zeros(model.articulation_count + 1, dtype=np.int32)
+            csr_np[1:] = np.cumsum(counts_np)
             self.mimic_count = mimic_count
             self.mimic_art = wp.array(mimic_art_np, dtype=wp.int32, device=device)
             self.mimic_art_start = wp.array(csr_np, dtype=wp.int32, device=device)
