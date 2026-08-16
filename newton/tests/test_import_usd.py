@@ -9126,7 +9126,7 @@ def Xform "Articulation" (
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_massapi_authored_mass_without_inertia_can_use_physx_fallback(self):
         """Allow IsaacLab to request PhysX's small-sphere fallback for missing inertia."""
-        from pxr import Gf, Usd, UsdGeom, UsdPhysics
+        from pxr import Usd, UsdGeom, UsdPhysics
 
         stage = Usd.Stage.CreateInMemory()
         UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
