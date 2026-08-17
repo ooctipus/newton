@@ -523,6 +523,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             source_shape_indices: Optional compiled resource shapes, shape
                 ``[variant_count, shape_count]``. When omitted, every variant must
                 be present in an initial world.
+            inertia_diagonal_offset: Value [kg·m²] added to finalized body inertia.
         """
 
         def __init__(
@@ -533,10 +534,14 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             variant_builders: Sequence[ModelBuilder],
             initial_variant_ids: Sequence[int] | None = None,
             source_shape_indices: Sequence[Sequence[int]] | None = None,
+            inertia_diagonal_offset: float = 0.0,
         ):
+            if not math.isfinite(inertia_diagonal_offset) or inertia_diagonal_offset < 0.0:
+                raise ValueError("inertia_diagonal_offset must be finite and non-negative")
             self.name = name
             self.shape_indices = np.asarray(shape_indices, dtype=np.int32)
             self.variant_builders = tuple(variant_builders)
+            self.inertia_diagonal_offset = float(inertia_diagonal_offset)
             self.initial_variant_ids = (
                 np.zeros(self.shape_indices.shape[0], dtype=np.int32)
                 if initial_variant_ids is None
@@ -844,6 +849,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     com = np.asarray(body_coms[source_body], dtype=np.float64)
                     inertia = np.asarray(body_inertias[source_body], dtype=np.float64).reshape(3, 3)
                     inv_inertia = np.asarray(body_inv_inertias[source_body], dtype=np.float64).reshape(3, 3)
+                if definition.inertia_diagonal_offset:
+                    inertia = inertia.copy()
+                    inertia.flat[::4] += definition.inertia_diagonal_offset
+                    inv_inertia = np.linalg.inv(inertia)
                 mj_inertia, eigvec, mj_iquat = np.empty(3), np.empty(9), np.empty(4)
                 mujoco.mju_eig3(mj_inertia, eigvec, mj_iquat, inertia.ravel())
                 if mj_dof >= 0:
