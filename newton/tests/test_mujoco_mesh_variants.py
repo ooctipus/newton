@@ -434,17 +434,17 @@ class TestMuJoCoMeshVariants(unittest.TestCase):
         )
 
     def test_mesh_variant_uses_finalized_inertia(self):
-        """Select the validated model inertia rather than raw source-builder values."""
+        """Apply diagonal offsets after validating source-builder inertia."""
         base = _cube_builder(_cube_mesh(0.05), 1.0, 0.05)
-        authored_inertia = np.diag((0.01, 0.01, 1.0)).astype(np.float32)
+        authored_inertia = np.diag((0.005, 0.06, 0.10)).astype(np.float32)
         target = _cube_builder(_cube_mesh(0.10), 2.0, 0.10, inertia=authored_inertia)
+        inertia_offset = 0.05
 
         builder = newton.ModelBuilder()
         builder.add_world(base)
         builder.add_world(target)
         model = builder.finalize()
         corrected_inertia = model.body_inertia.numpy()[1].copy()
-        corrected_inv_inertia = model.body_inv_inertia.numpy()[1].copy()
         self.assertFalse(np.allclose(corrected_inertia, authored_inertia))
 
         variants = SolverMuJoCo.MeshVariantSet(
@@ -452,6 +452,7 @@ class TestMuJoCoMeshVariants(unittest.TestCase):
             shape_indices=((0,), (1,)),
             variant_builders=(base, target),
             initial_variant_ids=(0, 1),
+            inertia_diagonal_offset=inertia_offset,
         )
         solver = SolverMuJoCo(model, mesh_variant_sets=(variants,), disable_contacts=True)
         solver.set_mesh_variant_index(
@@ -460,8 +461,9 @@ class TestMuJoCoMeshVariants(unittest.TestCase):
             world_ids=wp.array([0], dtype=wp.int32, device=model.device),
         )
 
-        np.testing.assert_allclose(model.body_inertia.numpy()[0], corrected_inertia)
-        np.testing.assert_allclose(model.body_inv_inertia.numpy()[0], corrected_inv_inertia)
+        expected_inertia = corrected_inertia + np.eye(3) * inertia_offset
+        np.testing.assert_allclose(model.body_inertia.numpy()[0], expected_inertia)
+        np.testing.assert_allclose(model.body_inv_inertia.numpy()[0], np.linalg.inv(expected_inertia))
 
 
 if __name__ == "__main__":
