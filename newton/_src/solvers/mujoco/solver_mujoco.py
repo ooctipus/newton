@@ -65,6 +65,7 @@ from .enums import EqType as _EqType
 from .enums import _ActuatorBiasType, _ActuatorDynamicsType, _ActuatorGainType
 from .equality import MJC_OBJ_BODY, MjcEqualityTargetKind, _register_equality_constraint_attributes
 from .kernels import (
+    apply_body_sleep_override_kernel,
     MeshVariantBody,
     MeshVariantShape,
     _snapshot_nacon_count,
@@ -92,7 +93,7 @@ from .kernels import (
     reset_world_buffers_kernel,
     restore_sleeping_state_kernel,
     set_mesh_variant_index_kernel,
-    set_selected_body_sleep_kernel,
+    set_selected_body_sleep_override_kernel,
     sync_qpos0_kernel,
     sync_site_xposes_kernel,
     sync_worldbody_geom_xposes_kernel,
@@ -3889,6 +3890,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         """Mapping from MuJoCo [world, geom] to Newton shape index. Shape [nworld, ngeom], dtype int32."""
         self._collision_shape_sleep_index: wp.array[wp.vec2i] | None = None
         self._body_sleep_index: wp.array[wp.vec2i] | None = None
+        self._body_sleep_override: wp.array2d[wp.int32] | None = None
+        self._has_body_sleep_overrides = False
         # Template-relative for per-world sites and absolute for global sites.
         self._mjc_site_shape_index: wp.array[wp.int32] | None = None
         self._mjc_site_is_global: wp.array[bool] | None = None
@@ -4434,6 +4437,23 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self._mujoco_warp.fwd_position(self.mjw_model, d, factorize=False)
                 self._mujoco_warp.fwd_velocity(self.mjw_model, d)
             self._restore_initial_sleeping_state(world_mask, clear_overflow=True)
+            if self._has_body_sleep_overrides:
+                from mujoco_warp._src import sleep
+
+                with wp.ScopedDevice(self.model.device), self._scoped_mujoco_warp_execution():
+                    wp.launch(
+                        apply_body_sleep_override_kernel,
+                        dim=d.nworld,
+                        inputs=[
+                            world_mask,
+                            self._body_sleep_override,
+                            self.mjw_model.ntree,
+                            self._sleep_awake_value,
+                        ],
+                        outputs=[d.tree_asleep],
+                        device=self.model.device,
+                    )
+                    sleep.update_sleep(self.mjw_model, d)
 
     def _capture_initial_sleeping_state(self) -> None:
         """Capture the template world's initial sleep bookkeeping."""
@@ -5623,14 +5643,15 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         asleep: wp.array2d[wp.bool],
         world_ids: wp.array[wp.int32],
     ) -> None:
-        """Replace the sleep state of selected free-body trees.
+        """Set the sleep state restored for selected free-body trees.
 
         ``body_ids`` and ``asleep`` contain one row per world. ``world_ids``
-        selects the rows to update and must contain valid, unique indices.
+        selects the rows to update and must contain valid, unique indices. The
+        overrides are applied after the next reset reconciles joint coordinates.
         """
         if not self.enable_sleeping:
             raise RuntimeError("Body sleep state requires enable_sleeping=True.")
-        if self._body_sleep_index is None:
+        if self._body_sleep_index is None or self._body_sleep_override is None:
             raise RuntimeError("Body sleep mapping was not initialized.")
         for name, array, dtype, ndim in (
             ("body_ids", body_ids, wp.int32, 2),
@@ -5650,24 +5671,20 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         if not world_ids.shape[0]:
             return
 
-        from mujoco_warp._src import sleep
-
         with wp.ScopedDevice(self.model.device), self._scoped_mujoco_warp_execution():
             wp.launch(
-                set_selected_body_sleep_kernel,
+                set_selected_body_sleep_override_kernel,
                 dim=world_ids.shape[0],
                 inputs=[
                     world_ids,
                     body_ids,
                     asleep,
                     self._body_sleep_index,
-                    self.mjw_model.ntree,
-                    self._sleep_awake_value,
+                    self._body_sleep_override,
                 ],
-                outputs=[self.mjw_data.tree_asleep],
                 device=self.model.device,
             )
-            sleep.update_sleep(self.mjw_model, self.mjw_data)
+        self._has_body_sleep_overrides = True
 
     @override
     def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
@@ -7768,6 +7785,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             shape_sleep_index_np[body_shapes] = body_sleep_index_np[shape_body_np[body_shapes]]
             self._collision_shape_sleep_index = wp.array(shape_sleep_index_np, dtype=wp.vec2i, device=model.device)
             self._body_sleep_index = wp.array(body_sleep_index_np, dtype=wp.vec2i, device=model.device)
+            self._body_sleep_override = wp.full(
+                (nworld, self.mj_model.ntree), -1, dtype=wp.int32, device=model.device
+            )
 
             # Common variables for mapping creation
             njnt = self.mj_model.njnt
