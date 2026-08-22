@@ -2202,7 +2202,7 @@ def create_mesh_sdf_two_stage_kernels(
                 wp.tile_stack_clear(edge_stack)
                 mode += 1
 
-    @wp.kernel(enable_backward=False, launch_bounds=(256, 2), module=module)
+    @wp.kernel(enable_backward=False, launch_bounds=(256, 3), module=module)
     def mesh_sdf_solve_kernel(
         shape_transform: wp.array[wp.transform],
         texture_sdf_table: wp.array[TextureSDFData],
