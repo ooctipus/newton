@@ -34,6 +34,7 @@ from newton._src.solvers.mujoco.constants import (
 from newton._src.solvers.mujoco.utils import MjcEqualityTargetKind
 from newton._src.utils.import_usd import _is_uniform_scale
 from newton.math import quat_between_axes
+from newton.selection import ArticulationView
 from newton.solvers import SolverMuJoCo
 from newton.tests.unittest_utils import USD_AVAILABLE, assert_np_equal, get_test_devices, patch_sys_module
 
@@ -273,6 +274,27 @@ def Xform "Root" (
         model = builder.finalize()
         self.assertEqual(model.articulation_count, 0)
         self.assertEqual(model.joint_articulation.numpy()[root_joint_idx], -1)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_standalone_world_fixed_body_with_articulation_root_is_selectable(self):
+        """Verify a standalone fixed articulation stays selectable while contributing no DOFs."""
+        from pxr import UsdPhysics
+
+        stage = self._make_rootless_fixed_stage(with_child_joint=False)
+        UsdPhysics.ArticulationRootAPI.Apply(stage.GetPrimAtPath("/World/Base"))
+        builder = newton.ModelBuilder()
+        builder.add_usd(stage, load_visual_shapes=False)
+
+        root_joint_idx = builder.joint_label.index("/World/RootJoint")
+        self.assertEqual(builder.articulation_count, 1)
+        self.assertEqual(builder.articulation_label, ["/World/Base"])
+        self.assertEqual(builder.joint_articulation[root_joint_idx], 0)
+
+        model = builder.finalize()
+        view = ArticulationView(model, "/World/Base")
+        self.assertTrue(view.is_fixed_base)
+        self.assertEqual(view.joint_dof_count, 0)
+        self.assertEqual(view.get_root_transforms(model).shape, (1, 1))
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_rootless_mechanism_root_and_child_joints_stay_orphan(self):
