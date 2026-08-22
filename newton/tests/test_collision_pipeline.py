@@ -19,6 +19,7 @@ from newton._src.geometry.kernels import (
     mesh_sdf,
     resolve_mesh_sign_method,
 )
+from newton._src.geometry.narrow_phase import NarrowPhase
 from newton._src.geometry.sdf_texture import TextureSDFData
 from newton._src.geometry.soft_contacts_sdf import (
     SDF_EDGE_ITERS,
@@ -2671,6 +2672,79 @@ def test_scalar_sdf_texture_routes_to_sdf_contact(test, device):
             np.testing.assert_allclose(scalar_values, paired_values, rtol=1.0e-5, atol=1.0e-6, err_msg=name)
 
 
+def test_mesh_sdf_resource_grouping_preserves_reduced_contacts(test, device):
+    """Preserve reduced contacts when mesh pairs are grouped by SDF resource."""
+    meshes = [
+        newton.Mesh.create_box(0.5, 0.4, 0.3, duplicate_vertices=False, compute_inertia=False),
+        newton.Mesh.create_box(0.45, 0.35, 0.3, duplicate_vertices=False, compute_inertia=False),
+    ]
+    for mesh in meshes:
+        mesh.build_sdf(max_resolution=32, device=device)
+
+    builder = newton.ModelBuilder()
+    positions = ((-0.25, 0.0, 0.0), (0.25, 0.0, 0.0), (0.0, -0.25, 0.0), (0.0, 0.25, 0.0))
+    for index, position in enumerate(positions):
+        body = builder.add_body(xform=wp.transform(wp.vec3(*position), wp.quat_identity()))
+        builder.add_shape_mesh(body=body, mesh=meshes[index // 2])
+
+    model = builder.finalize(device=device)
+    test.assertEqual(len(set(model._shape_sdf_index.numpy().tolist())), 2)
+    state = model.state()
+
+    def collide(resource_count):
+        pipeline = newton.CollisionPipeline(
+            model, broad_phase="nxn", reduce_contacts=True, rigid_contact_max=512, max_triangle_pairs=4096
+        )
+        pipeline.narrow_phase.mesh_sdf_resource_count = resource_count
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        test.assertGreater(count, 0)
+        arrays = [
+            contacts.rigid_contact_shape0.numpy()[:count],
+            contacts.rigid_contact_shape1.numpy()[:count],
+            contacts.rigid_contact_point0.numpy()[:count],
+            contacts.rigid_contact_point1.numpy()[:count],
+            contacts.rigid_contact_normal.numpy()[:count],
+            contacts.rigid_contact_offset0.numpy()[:count],
+            contacts.rigid_contact_offset1.numpy()[:count],
+            contacts.rigid_contact_margin0.numpy()[:count],
+            contacts.rigid_contact_margin1.numpy()[:count],
+        ]
+        identity = np.column_stack((arrays[0], arrays[1], np.round(arrays[2], 6), np.round(arrays[3], 6)))
+        order = np.lexsort(tuple(identity[:, column] for column in reversed(range(identity.shape[1]))))
+        return pipeline, [array[order] for array in arrays]
+
+    _, reference = collide(0)
+    grouped_pipeline, grouped = collide(2)
+    test.assertGreaterEqual(
+        grouped_pipeline.narrow_phase.shape_pairs_mesh.shape[0], grouped_pipeline.narrow_phase.max_mesh_mesh_pairs
+    )
+    for name, reference_values, grouped_values in zip(
+        ("shape0", "shape1", "point0", "point1", "normal", "offset0", "offset1", "margin0", "margin1"),
+        reference,
+        grouped,
+        strict=True,
+    ):
+        if name.startswith("shape"):
+            np.testing.assert_array_equal(grouped_values, reference_values, err_msg=name)
+        else:
+            np.testing.assert_allclose(grouped_values, reference_values, rtol=1.0e-5, atol=1.0e-6, err_msg=name)
+
+    deterministic = NarrowPhase(
+        max_candidate_pairs=6,
+        max_triangle_pairs=64,
+        max_mesh_mesh_pairs=6,
+        reduce_contacts=True,
+        device=device,
+        mesh_sdf_texture_only=True,
+        mesh_sdf_resource_count=2,
+        deterministic=True,
+    )
+    test.assertEqual(deterministic.mesh_sdf_resource_count, 0)
+
+
 def test_mesh_convex_one_sdf_keeps_existing_route(test, device):
     """Avoid SDF routing when it would require expensive BVH fallback on one side."""
     mesh = newton.Mesh.create_box(0.5, 0.5, 0.5, duplicate_vertices=False, compute_inertia=False)
@@ -3550,6 +3624,14 @@ add_function_test(
     TestPlanarSDFRouting,
     "test_scalar_sdf_texture_routes_to_sdf_contact",
     test_scalar_sdf_texture_routes_to_sdf_contact,
+    devices=get_cuda_test_devices(),
+    check_output=False,
+)
+
+add_function_test(
+    TestPlanarSDFRouting,
+    "test_mesh_sdf_resource_grouping_preserves_reduced_contacts",
+    test_mesh_sdf_resource_grouping_preserves_reduced_contacts,
     devices=get_cuda_test_devices(),
     check_output=False,
 )
