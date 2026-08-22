@@ -127,6 +127,37 @@ def _cube_builder(
 class TestMuJoCoMeshVariants(unittest.TestCase):
     """Verify complete geometry and inertial rows switch together."""
 
+    def test_mesh_variant_switch_wakes_selected_sleeping_tree(self):
+        small = _cube_builder(_cube_mesh(0.05), 1.0, 0.05)
+        large = _cube_builder(_cube_mesh(0.10), 8.0, 0.10)
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        builder.add_world(small)
+        builder.add_world(large)
+        model = builder.finalize()
+        variants = SolverMuJoCo.MeshVariantSet(
+            name="box",
+            shape_indices=((0,), (1,)),
+            variant_builders=(small, large),
+            initial_variant_ids=(0, 1),
+        )
+        solver = SolverMuJoCo(
+            model,
+            mesh_variant_sets=(variants,),
+            enable_sleeping=True,
+            nvmax=6,
+            disable_contacts=True,
+            use_mujoco_contacts=False,
+        )
+        solver.mjw_data.tree_asleep.assign([[0], [0]])
+
+        solver.set_mesh_variant_index(
+            "box",
+            variant_ids=wp.array([0], dtype=wp.int32, device=model.device),
+            world_ids=wp.array([1], dtype=wp.int32, device=model.device),
+        )
+        self.assertEqual(int(solver.mjw_data.tree_asleep.numpy()[0, 0]), 0)
+        self.assertLess(int(solver.mjw_data.tree_asleep.numpy()[1, 0]), 0)
+
     def test_mesh_variant_sets_use_compiled_source_shapes(self):
         """Compile candidates independently from the initial world assignment."""
         base = _cube_builder(_cube_mesh(0.05), 1.0, 0.05)
