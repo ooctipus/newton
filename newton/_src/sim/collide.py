@@ -64,6 +64,7 @@ _ANALYTIC_PRIMITIVE_PAIRS = frozenset(
         (int(GeoType.CAPSULE), int(GeoType.CAPSULE)),
     }
 )
+_MESH_SDF_RESOURCE_GROUPING_CAPACITY_THRESHOLD = 65_536
 
 
 def _pair_requires_generic_convex_narrow_phase(
@@ -1559,6 +1560,11 @@ class CollisionPipeline:
                 candidate_pair_work_estimate=candidate_pair_work_estimate,
                 mesh_sdf_identity_scale_only=mesh_sdf_identity_scale_only,
                 mesh_sdf_texture_only=mesh_sdf_texture_only,
+                mesh_sdf_resource_count=(
+                    len(model._texture_sdf_coarse_textures)
+                    if max_mesh_mesh_pairs >= _MESH_SDF_RESOURCE_GROUPING_CAPACITY_THRESHOLD
+                    else 0
+                ),
                 sdf_texture_paired_samples=model._sdf_texture_paired_samples,
                 deterministic=deterministic,
                 contact_max=rigid_contact_max,

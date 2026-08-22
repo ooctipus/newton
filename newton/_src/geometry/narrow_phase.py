@@ -38,6 +38,7 @@ from ..geometry.collision_primitive import (
 )
 from ..geometry.contact_data import (
     SHAPE_PAIR_HFIELD_BIT,
+    SHAPE_PAIR_INDEX_MASK,
     ContactData,
     _contact_passes_gap_check_precomputed,
     contact_passes_speculative_gap_check,
@@ -82,6 +83,49 @@ from ..utils.heightfield import (
 )
 
 _SPARSE_GJK_PAIR_CAPACITY_THRESHOLD = 1_000_000
+
+
+@wp.func
+def _mesh_pair_resource_bucket(pair_encoded: wp.vec2i, shape_sdf_index: wp.array[wp.int32], count: int) -> int:
+    shape_a = pair_encoded[0] & SHAPE_PAIR_INDEX_MASK
+    shape_b = pair_encoded[1] & SHAPE_PAIR_INDEX_MASK
+    resource_a = shape_sdf_index[shape_a]
+    resource_b = shape_sdf_index[shape_b]
+    resource_lo = wp.min(resource_a, resource_b)
+    resource_hi = wp.max(resource_a, resource_b)
+    return resource_lo * count - resource_lo * (resource_lo - 1) // 2 + resource_hi - resource_lo
+
+
+@wp.kernel(enable_backward=False)
+def _count_mesh_pairs_by_resource(
+    pairs: wp.array[wp.vec2i],
+    pair_count: wp.array[int],
+    shape_sdf_index: wp.array[wp.int32],
+    resource_count: int,
+    bucket_counts: wp.array[wp.int32],
+    total_num_threads: int,
+):
+    count = wp.min(pair_count[0], pairs.shape[0])
+    for pair_idx in range(wp.tid(), count, total_num_threads):
+        bucket = _mesh_pair_resource_bucket(pairs[pair_idx], shape_sdf_index, resource_count)
+        wp.atomic_add(bucket_counts, bucket, 1)
+
+
+@wp.kernel(enable_backward=False)
+def _scatter_mesh_pairs_by_resource(
+    pairs: wp.array[wp.vec2i],
+    pair_count: wp.array[int],
+    shape_sdf_index: wp.array[wp.int32],
+    resource_count: int,
+    bucket_ends: wp.array[wp.int32],
+    sorted_pairs: wp.array[wp.vec2i],
+    total_num_threads: int,
+):
+    count = wp.min(pair_count[0], pairs.shape[0])
+    for pair_idx in range(wp.tid(), count, total_num_threads):
+        pair = pairs[pair_idx]
+        bucket = _mesh_pair_resource_bucket(pair, shape_sdf_index, resource_count)
+        sorted_pairs[wp.atomic_sub(bucket_ends, bucket, 1) - 1] = pair
 
 
 @wp.func
@@ -2149,6 +2193,7 @@ class NarrowPhase:
         candidate_pair_work_estimate: int | None = None,
         mesh_sdf_texture_only: bool = False,
         mesh_sdf_identity_scale_only: bool = False,
+        mesh_sdf_resource_count: int = 0,
         sdf_texture_paired_samples: bool = True,
         deterministic: bool = False,
         contact_max: int | None = None,
@@ -2198,6 +2243,8 @@ class NarrowPhase:
                 allowing BVH fallback branches to be removed from mesh/SDF kernels.
             mesh_sdf_identity_scale_only: Whether every participating texture SDF is queried with
                 identity scale, allowing scale conversion branches to be removed.
+            mesh_sdf_resource_count: Number of texture SDF resources used to group mesh pairs for
+                cache locality. Zero disables grouping.
             sdf_texture_paired_samples: Whether texture SDFs store adjacent x samples together.
                 This is model-wide so mesh-SDF kernels require only two bounded static variants.
             deterministic: Make contact generation and ordering independent of
@@ -2594,6 +2641,18 @@ class NarrowPhase:
             self.mesh_plane_target_blocks = self.num_tile_blocks
             self.mesh_plane_block_offsets = None
             self.mesh_plane_block_counts = None
+
+        bucket_count = mesh_sdf_resource_count * (mesh_sdf_resource_count + 1) // 2
+        self.mesh_sdf_resource_count = (
+            mesh_sdf_resource_count
+            if device_obj.is_cuda
+            and not deterministic
+            and self.reduce_contacts
+            and self.mesh_sdf_texture_only
+            and not self.has_heightfields
+            and 0 < bucket_count <= self.max_mesh_mesh_pairs + 1
+            else 0
+        )
 
     def launch_custom_write(
         self,
@@ -3036,6 +3095,42 @@ class NarrowPhase:
                 shape_edge_range = self._empty_edge_range
 
             if self.mesh_mesh_contacts_kernel is not None and self.max_mesh_mesh_pairs > 0:
+                mesh_mesh_pairs = self.shape_pairs_mesh_mesh
+                if self.mesh_sdf_resource_count > 0:
+                    bucket_count = self.mesh_sdf_resource_count * (self.mesh_sdf_resource_count + 1) // 2
+                    bucket_ends = self.mesh_mesh_block_counts[:bucket_count]
+                    bucket_ends.zero_()
+                    wp.launch(
+                        _count_mesh_pairs_by_resource,
+                        dim=self.total_num_threads,
+                        inputs=[
+                            mesh_mesh_pairs,
+                            self.shape_pairs_mesh_mesh_count,
+                            shape_sdf_index,
+                            self.mesh_sdf_resource_count,
+                            bucket_ends,
+                            self.total_num_threads,
+                        ],
+                        device=device,
+                        record_tape=False,
+                    )
+                    wp.utils.array_scan(bucket_ends, bucket_ends, inclusive=True)
+                    wp.launch(
+                        _scatter_mesh_pairs_by_resource,
+                        dim=self.total_num_threads,
+                        inputs=[
+                            mesh_mesh_pairs,
+                            self.shape_pairs_mesh_mesh_count,
+                            shape_sdf_index,
+                            self.mesh_sdf_resource_count,
+                            bucket_ends,
+                            self.shape_pairs_mesh,
+                            self.total_num_threads,
+                        ],
+                        device=device,
+                        record_tape=False,
+                    )
+                    mesh_mesh_pairs = self.shape_pairs_mesh
                 mesh_mesh_contacts_kernel = (
                     self.mesh_mesh_contacts_kernel_precomputed
                     if has_precomputed_edge_data
@@ -3044,7 +3139,7 @@ class NarrowPhase:
                 if self.reduce_contacts and self.mesh_mesh_block_offsets is not None:
                     # Mesh-mesh contacts → buffer + inline hashtable registration
                     compute_mesh_mesh_block_offsets_scan(
-                        shape_pairs_mesh_mesh=self.shape_pairs_mesh_mesh,
+                        shape_pairs_mesh_mesh=mesh_mesh_pairs,
                         shape_pairs_mesh_mesh_count=self.shape_pairs_mesh_mesh_count,
                         shape_edge_range=shape_edge_range,
                         shape_heightfield_index=shape_heightfield_index,
@@ -3077,7 +3172,7 @@ class NarrowPhase:
                             shape_collision_aabb_lower,
                             shape_collision_aabb_upper,
                             shape_voxel_resolution,
-                            self.shape_pairs_mesh_mesh,
+                            mesh_mesh_pairs,
                             self.shape_pairs_mesh_mesh_count,
                             shape_heightfield_index,
                             heightfield_data,
@@ -3115,7 +3210,7 @@ class NarrowPhase:
                             shape_collision_aabb_lower,
                             shape_collision_aabb_upper,
                             shape_voxel_resolution,
-                            self.shape_pairs_mesh_mesh,
+                            mesh_mesh_pairs,
                             self.shape_pairs_mesh_mesh_count,
                             shape_heightfield_index,
                             heightfield_data,
