@@ -169,6 +169,7 @@ class TestMuJoCoSleeping(unittest.TestCase):
     def test_set_body_sleep_state_updates_compact_indices(self):
         model = _build_contact_wake_model()
         solver = SolverMuJoCo(model, enable_sleeping=True, nvmax=12, disable_contacts=True)
+        state = model.state()
         body_ids = wp.array([[0, 1]], dtype=wp.int32, device=model.device)
         world_ids = wp.array([0], dtype=wp.int32, device=model.device)
 
@@ -177,6 +178,7 @@ class TestMuJoCoSleeping(unittest.TestCase):
             wp.array([[False, True]], dtype=wp.bool, device=model.device),
             world_ids,
         )
+        solver.reset(state, flags=0)
         np.testing.assert_array_equal(solver.mjw_data.tree_awake.numpy(), [[1, 0]])
         np.testing.assert_array_equal(solver.mjw_data.nv_awake.numpy(), [6])
 
@@ -185,6 +187,7 @@ class TestMuJoCoSleeping(unittest.TestCase):
             wp.array([[False, False]], dtype=wp.bool, device=model.device),
             world_ids,
         )
+        solver.reset(state, flags=0)
         np.testing.assert_array_equal(solver.mjw_data.tree_awake.numpy(), [[1, 1]])
         np.testing.assert_array_equal(solver.mjw_data.nv_awake.numpy(), [12])
 

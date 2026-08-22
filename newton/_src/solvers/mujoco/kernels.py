@@ -3536,29 +3536,41 @@ def wake_selected_tree_kernel(
 
 
 @wp.kernel(enable_backward=False)
-def set_selected_body_sleep_kernel(
+def set_selected_body_sleep_override_kernel(
     world_ids: wp.array[wp.int32],
     body_ids: wp.array2d[wp.int32],
     asleep: wp.array2d[wp.bool],
     body_sleep_index: wp.array[wp.vec2i],
+    body_sleep_override: wp.array2d[wp.int32],
+):
+    """Store reset sleep overrides for selected free-body trees."""
+    row = world_ids[wp.tid()]
+    for item in range(body_ids.shape[1]):
+        sleep_index = body_sleep_index[body_ids[row, item]]
+        if sleep_index[1] >= 0:
+            body_sleep_override[sleep_index[0], sleep_index[1]] = wp.int32(asleep[row, item])
+
+
+@wp.kernel(enable_backward=False)
+def apply_body_sleep_override_kernel(
+    world_mask: wp.array[wp.bool],
+    body_sleep_override: wp.array2d[wp.int32],
     ntree: int,
     awake_value: int,
     tree_asleep: wp.array2d[wp.int32],
 ):
-    """Replace the sleep state of selected free-body trees."""
-    row = world_ids[wp.tid()]
+    """Apply stored free-body sleep overrides after reset reconciliation."""
+    worldid = wp.tid()
+    if world_mask and not world_mask[worldid]:
+        return
 
-    # Wake existing cycles before rebuilding selected trees as singleton cycles.
-    for item in range(body_ids.shape[1]):
-        sleep_index = body_sleep_index[body_ids[row, item]]
-        if sleep_index[1] >= 0:
-            _wake_tree(sleep_index[0], sleep_index[1], ntree, awake_value, tree_asleep)
+    for treeid in range(ntree):
+        if body_sleep_override[worldid, treeid] >= 0:
+            _wake_tree(worldid, treeid, ntree, awake_value, tree_asleep)
 
-    for item in range(body_ids.shape[1]):
-        if asleep[row, item]:
-            sleep_index = body_sleep_index[body_ids[row, item]]
-            if sleep_index[1] >= 0:
-                tree_asleep[sleep_index[0], sleep_index[1]] = sleep_index[1]
+    for treeid in range(ntree):
+        if body_sleep_override[worldid, treeid] == 1:
+            tree_asleep[worldid, treeid] = treeid
 
 
 @wp.kernel(enable_backward=False)
