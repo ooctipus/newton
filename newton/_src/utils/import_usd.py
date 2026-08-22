@@ -3338,6 +3338,30 @@ def parse_usd(
         body1_path = str(joint_desc.body1)
         # World-connected joints need a reconstructed parent frame before they can be parsed.
         is_body_to_world = body0_path in ("", "/") or body1_path in ("", "/")
+        standalone_root = None
+        if (
+            parent_body == -1
+            and is_body_to_world
+            and len(joint_group) == 1
+            and joint_desc.type == UsdPhysics.ObjectType.FixedJoint
+        ):
+            child_path = body1_path if body0_path in ("", "/") else body0_path
+            candidate = next(
+                (
+                    root
+                    for root in authored_articulation_root_paths
+                    if child_path == root or child_path.startswith("/" if root == "/" else f"{root}/")
+                ),
+                None,
+            )
+            if candidate is not None:
+                bodies = [
+                    path
+                    for path in path_body_map
+                    if path == candidate or path.startswith("/" if candidate == "/" else f"{candidate}/")
+                ]
+                if bodies == [child_path]:
+                    standalone_root = candidate
         try:
             # Body-to-world joints (the world side may be body0 or body1) have no
             # world-side prim to inherit a frame from, and authoring tools often
@@ -3365,9 +3389,19 @@ def parse_usd(
                     world_body_xform_o = child_world_xform_o * child_tf_o * wp.transform_inverse(parent_tf_o)
                     orphan_incoming_xform = incoming_world_xform * world_body_xform_o
             if len(joint_group) > 1:
-                parse_merged_joints(joint_group, incoming_xform=orphan_incoming_xform)
+                joint_index = parse_merged_joints(joint_group, incoming_xform=orphan_incoming_xform)
             else:
-                parse_joint(joint_desc, incoming_xform=orphan_incoming_xform)
+                joint_index = parse_joint(joint_desc, incoming_xform=orphan_incoming_xform)
+            if joint_index is not None and standalone_root is not None:
+                root_prim = stage.GetPrimAtPath(standalone_root)
+                builder._finalize_imported_articulation(
+                    joint_indices=[joint_index],
+                    parent_body=parent_body,
+                    articulation_label=standalone_root,
+                    custom_attributes=usd.get_custom_attribute_values(
+                        root_prim, builder_custom_attr_articulation, context={"builder": builder}
+                    ),
+                )
         except ValueError as exc:
             if verbose:
                 print(f"Skipping joint group {joint_group}: {exc}")
