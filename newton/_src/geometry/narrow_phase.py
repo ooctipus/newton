@@ -83,6 +83,7 @@ from ..utils.heightfield import (
 )
 
 _SPARSE_GJK_PAIR_CAPACITY_THRESHOLD = 1_000_000
+_MESH_SDF_RESOURCE_BUCKET_LIMIT = 4096
 
 
 @wp.func
@@ -2650,7 +2651,7 @@ class NarrowPhase:
             and self.reduce_contacts
             and self.mesh_sdf_texture_only
             and not self.has_heightfields
-            and 0 < bucket_count <= self.max_mesh_mesh_pairs + 1
+            and 0 < bucket_count <= min(_MESH_SDF_RESOURCE_BUCKET_LIMIT, self.max_mesh_mesh_pairs + 1)
             else 0
         )
 
