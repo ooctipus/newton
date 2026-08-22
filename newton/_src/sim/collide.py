@@ -1315,6 +1315,8 @@ class CollisionPipeline:
         self.include_static_kinematic_pairs = include_static_kinematic_pairs
         self.speculative_config = speculative_config
         self._speculative_enabled = speculative_config is not None
+        self._shape_sleep_index = None
+        self._tree_asleep = None
         contact_writer = write_contact_speculative if self._speculative_enabled else write_contact
 
         if using_expert_components:
@@ -1735,6 +1737,17 @@ class CollisionPipeline:
         self.model._add_custom_attributes(contacts, Model.AttributeAssignment.CONTACT, requires_grad=self.requires_grad)
         return contacts
 
+    def configure_sleep_filter(
+        self,
+        shape_sleep_index: wp.array[wp.vec2i],
+        tree_asleep: wp.array2d[wp.int32],
+    ) -> None:
+        """Bind solver sleep state used to skip inactive mesh work."""
+        if shape_sleep_index.shape != (self.shape_count,):
+            raise ValueError("shape_sleep_index must have one entry per collision shape")
+        self._shape_sleep_index = shape_sleep_index
+        self._tree_asleep = tree_asleep
+
     def reset_contact_matching(self, world_mask: wp.array[wp.bool] | None = None) -> None:
         """Clear all or reset-selected previous-frame contact history.
 
@@ -2026,6 +2039,8 @@ class CollisionPipeline:
             mesh_edge_centers=model.mesh_edge_centers,
             mesh_edge_halves=model.mesh_edge_halves,
             shape_edge_range=model.shape_edge_range,
+            shape_sleep_index=self._shape_sleep_index,
+            tree_asleep=self._tree_asleep,
             writer_data=writer_data,
             hydroelastic_shape_sdf_data_prepared=self._hydro_shape_sdf_data_prepared,
             shape_linear_velocity=self._shape_linear_velocity,

@@ -2561,6 +2561,47 @@ def test_mesh_convex_with_sdf_routes_to_sdf_contact(test, device):
     test.assertGreater(contact_count, 0)
 
 
+def test_sdf_sleep_filter_skips_only_inactive_pairs(test, device):
+    """Skip inactive SDF pairs while retaining contacts that can wake a tree."""
+    mesh = newton.Mesh.create_box(0.5, 0.5, 0.5, duplicate_vertices=False, compute_inertia=False)
+    mesh.build_sdf(max_resolution=16, device=device)
+
+    builder = newton.ModelBuilder()
+    body_a = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()))
+    body_b = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.9), wp.quat_identity()))
+    builder.add_shape_mesh(body=body_a, mesh=mesh)
+    builder.add_shape_mesh(body=body_b, mesh=mesh)
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(model, broad_phase="sap", rigid_contact_max=256)
+    contacts = pipeline.contacts()
+    sleep_index = wp.array([(0, 0), (0, 1)], dtype=wp.vec2i, device=device)
+    tree_asleep = wp.array([[-1, 1]], dtype=wp.int32, device=device)
+    pipeline.configure_sleep_filter(sleep_index, tree_asleep)
+
+    pipeline.collide(model.state(), contacts)
+    test.assertGreater(int(pipeline.narrow_phase.shape_pairs_mesh_mesh_count.numpy()[0]), 0)
+
+    tree_asleep.assign([[1, 0]])
+    pipeline.collide(model.state(), contacts)
+    test.assertEqual(int(pipeline.narrow_phase.shape_pairs_mesh_mesh_count.numpy()[0]), 0)
+
+    builder = newton.ModelBuilder()
+    builder.add_shape_mesh(body=-1, mesh=mesh)
+    body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.9), wp.quat_identity()))
+    builder.add_shape_mesh(body=body, mesh=mesh)
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(model, broad_phase="sap", rigid_contact_max=256)
+    contacts = pipeline.contacts()
+    pipeline.collide(model.state(), contacts)
+    test.assertGreater(int(pipeline.narrow_phase.shape_pairs_mesh_mesh_count.numpy()[0]), 0)
+
+    sleep_index = wp.array([(-1, -1), (0, 0)], dtype=wp.vec2i, device=device)
+    tree_asleep = wp.array([[0]], dtype=wp.int32, device=device)
+    pipeline.configure_sleep_filter(sleep_index, tree_asleep)
+    pipeline.collide(model.state(), contacts)
+    test.assertEqual(int(pipeline.narrow_phase.shape_pairs_mesh_mesh_count.numpy()[0]), 0)
+
+
 def test_deferred_convex_sdf_edges_use_deduplicated_topology(test, device):
     """Finalize deferred convex SDF edges against deduplicated vertices."""
     convex = newton.Mesh.create_box(0.5, 0.5, 0.5, duplicate_vertices=True, compute_inertia=False)
@@ -3605,6 +3646,14 @@ add_function_test(
     TestPlanarSDFRouting,
     "test_mesh_convex_with_sdf_routes_to_sdf_contact",
     test_mesh_convex_with_sdf_routes_to_sdf_contact,
+    devices=get_cuda_test_devices(),
+    check_output=False,
+)
+
+add_function_test(
+    TestPlanarSDFRouting,
+    "test_sdf_sleep_filter_skips_only_inactive_pairs",
+    test_sdf_sleep_filter_skips_only_inactive_pairs,
     devices=get_cuda_test_devices(),
     check_output=False,
 )
