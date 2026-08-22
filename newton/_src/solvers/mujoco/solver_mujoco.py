@@ -4299,6 +4299,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self.mjw_model.opt.timestep.fill_(dt)
                 if not self.mjw_model.opt.run_collision_detection:
                     self._convert_contacts_to_mjwarp(self.model, state_in, contacts)
+                    if self.enable_sleeping:
+                        from mujoco_warp._src import sleep
+
+                        sleep.wake(self.mjw_model, self.mjw_data)
+                        sleep.update_sleep_trees(self.mjw_model, self.mjw_data)
+                        sleep.wake_collision(self.mjw_model, self.mjw_data)
                 self._mujoco_warp_step()
                 self._update_newton_state(self.model, state_out, self.mjw_data, state_prev=state_in)
         self._step += 1
