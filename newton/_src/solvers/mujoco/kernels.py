@@ -3490,48 +3490,8 @@ def copy_qpos_and_detect_tree_change_kernel(
     qpos[worldid, i] = value
 
 
-@wp.kernel(enable_backward=False)
-def wake_changed_trees_kernel(
-    tree_changed: wp.array2d[wp.int32],
-    ntree: int,
-    awake_value: int,
-    tree_asleep: wp.array2d[wp.int32],
-):
-    """Wake edited trees and every tree in their sleeping-island cycles."""
-    # Negative values mean awake; non-negative values link the next tree in a
-    # sleeping-island cycle. The O(ntree) scan intentionally uses one walker
-    # per world because parallel walkers for overlapping edits could overwrite
-    # a link before a peer reads it.
-    worldid = wp.tid()
-    for treeid in range(ntree):
-        if tree_changed[worldid, treeid] == 0:
-            continue
-
-        asleep_value = tree_asleep[worldid, treeid]
-        if asleep_value < 0:
-            if awake_value < asleep_value:
-                tree_asleep[worldid, treeid] = awake_value
-            continue
-
-        current = treeid
-        for _step in range(ntree + 1):
-            next_tree = tree_asleep[worldid, current]
-            tree_asleep[worldid, current] = awake_value
-            current = next_tree
-            if current == treeid:
-                break
-
-
-@wp.kernel(enable_backward=False)
-def wake_selected_tree_kernel(
-    world_ids: wp.array[wp.int32],
-    treeid: int,
-    ntree: int,
-    awake_value: int,
-    tree_asleep: wp.array2d[wp.int32],
-):
-    """Wake one tree, and its sleeping-island cycle, in selected worlds."""
-    worldid = world_ids[wp.tid()]
+@wp.func
+def _wake_tree(worldid: int, treeid: int, ntree: int, awake_value: int, tree_asleep: wp.array2d[wp.int32]):
     asleep_value = tree_asleep[worldid, treeid]
     if asleep_value < 0:
         if awake_value < asleep_value:
@@ -3545,6 +3505,60 @@ def wake_selected_tree_kernel(
         current = next_tree
         if current == treeid:
             break
+
+
+@wp.kernel(enable_backward=False)
+def wake_changed_trees_kernel(
+    tree_changed: wp.array2d[wp.int32],
+    ntree: int,
+    awake_value: int,
+    tree_asleep: wp.array2d[wp.int32],
+):
+    """Wake edited trees and every tree in their sleeping-island cycles."""
+    # One walker per world avoids races between trees in the same sleep cycle.
+    worldid = wp.tid()
+    for treeid in range(ntree):
+        if tree_changed[worldid, treeid] != 0:
+            _wake_tree(worldid, treeid, ntree, awake_value, tree_asleep)
+
+
+@wp.kernel(enable_backward=False)
+def wake_selected_tree_kernel(
+    world_ids: wp.array[wp.int32],
+    treeid: int,
+    ntree: int,
+    awake_value: int,
+    tree_asleep: wp.array2d[wp.int32],
+):
+    """Wake one tree, and its sleeping-island cycle, in selected worlds."""
+    worldid = world_ids[wp.tid()]
+    _wake_tree(worldid, treeid, ntree, awake_value, tree_asleep)
+
+
+@wp.kernel(enable_backward=False)
+def set_selected_body_sleep_kernel(
+    world_ids: wp.array[wp.int32],
+    body_ids: wp.array2d[wp.int32],
+    asleep: wp.array2d[wp.bool],
+    body_sleep_index: wp.array[wp.vec2i],
+    ntree: int,
+    awake_value: int,
+    tree_asleep: wp.array2d[wp.int32],
+):
+    """Replace the sleep state of selected free-body trees."""
+    row = world_ids[wp.tid()]
+
+    # Wake existing cycles before rebuilding selected trees as singleton cycles.
+    for item in range(body_ids.shape[1]):
+        sleep_index = body_sleep_index[body_ids[row, item]]
+        if sleep_index[1] >= 0:
+            _wake_tree(sleep_index[0], sleep_index[1], ntree, awake_value, tree_asleep)
+
+    for item in range(body_ids.shape[1]):
+        if asleep[row, item]:
+            sleep_index = body_sleep_index[body_ids[row, item]]
+            if sleep_index[1] >= 0:
+                tree_asleep[sleep_index[0], sleep_index[1]] = sleep_index[1]
 
 
 @wp.kernel(enable_backward=False)

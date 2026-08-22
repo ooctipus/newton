@@ -166,6 +166,28 @@ class TestMuJoCoSleeping(unittest.TestCase):
         np.testing.assert_array_equal(shape_sleep_index.numpy(), [[0, 0], [0, 1]])
         self.assertIs(tree_asleep, solver.mjw_data.tree_asleep)
 
+    def test_set_body_sleep_state_updates_compact_indices(self):
+        model = _build_contact_wake_model()
+        solver = SolverMuJoCo(model, enable_sleeping=True, nvmax=12, disable_contacts=True)
+        body_ids = wp.array([[0, 1]], dtype=wp.int32, device=model.device)
+        world_ids = wp.array([0], dtype=wp.int32, device=model.device)
+
+        solver.set_body_sleep_state(
+            body_ids,
+            wp.array([[False, True]], dtype=wp.bool, device=model.device),
+            world_ids,
+        )
+        np.testing.assert_array_equal(solver.mjw_data.tree_awake.numpy(), [[1, 0]])
+        np.testing.assert_array_equal(solver.mjw_data.nv_awake.numpy(), [6])
+
+        solver.set_body_sleep_state(
+            body_ids,
+            wp.array([[False, False]], dtype=wp.bool, device=model.device),
+            world_ids,
+        )
+        np.testing.assert_array_equal(solver.mjw_data.tree_awake.numpy(), [[1, 1]])
+        np.testing.assert_array_equal(solver.mjw_data.nv_awake.numpy(), [12])
+
     def test_per_world_sleep_tolerance(self):
         model = _build_sleep_model(world_count=2, register_custom_attributes=True)
         model.mujoco.sleep_tolerance.assign(np.array([0.01, 0.02], dtype=np.float32))
