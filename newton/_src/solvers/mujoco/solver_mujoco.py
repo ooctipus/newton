@@ -92,6 +92,7 @@ from .kernels import (
     reset_world_buffers_kernel,
     restore_sleeping_state_kernel,
     set_mesh_variant_index_kernel,
+    set_selected_body_sleep_kernel,
     sync_qpos0_kernel,
     sync_site_xposes_kernel,
     sync_worldbody_geom_xposes_kernel,
@@ -3887,6 +3888,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self.mjc_geom_to_newton_shape: wp.array2d[wp.int32] | None = None
         """Mapping from MuJoCo [world, geom] to Newton shape index. Shape [nworld, ngeom], dtype int32."""
         self._collision_shape_sleep_index: wp.array[wp.vec2i] | None = None
+        self._body_sleep_index: wp.array[wp.vec2i] | None = None
         # Template-relative for per-world sites and absolute for global sites.
         self._mjc_site_shape_index: wp.array[wp.int32] | None = None
         self._mjc_site_is_global: wp.array[bool] | None = None
@@ -5614,6 +5616,58 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         if self._collision_shape_sleep_index is None:
             raise RuntimeError("Collision sleep mapping was not initialized")
         return self._collision_shape_sleep_index, self.mjw_data.tree_asleep
+
+    def set_body_sleep_state(
+        self,
+        body_ids: wp.array2d[wp.int32],
+        asleep: wp.array2d[wp.bool],
+        world_ids: wp.array[wp.int32],
+    ) -> None:
+        """Replace the sleep state of selected free-body trees.
+
+        ``body_ids`` and ``asleep`` contain one row per world. ``world_ids``
+        selects the rows to update and must contain valid, unique indices.
+        """
+        if not self.enable_sleeping:
+            raise RuntimeError("Body sleep state requires enable_sleeping=True.")
+        if self._body_sleep_index is None:
+            raise RuntimeError("Body sleep mapping was not initialized.")
+        for name, array, dtype, ndim in (
+            ("body_ids", body_ids, wp.int32, 2),
+            ("asleep", asleep, wp.bool, 2),
+            ("world_ids", world_ids, wp.int32, 1),
+        ):
+            if not isinstance(array, wp.array) or array.dtype != dtype:
+                raise TypeError(f"{name} must be a {ndim}-dimensional wp.array with dtype {dtype}.")
+            if array.ndim != ndim:
+                raise ValueError(f"{name} must be {ndim}-dimensional; got shape {array.shape}.")
+            if array.device != self.model.device:
+                raise ValueError(f"{name} must be on {self.model.device}, got {array.device}.")
+        if body_ids.shape != asleep.shape:
+            raise ValueError(f"body_ids and asleep must have equal shapes; got {body_ids.shape} and {asleep.shape}.")
+        if body_ids.shape[0] != self.mjw_data.nworld:
+            raise ValueError(f"body_ids must have {self.mjw_data.nworld} rows; got {body_ids.shape[0]}.")
+        if not world_ids.shape[0]:
+            return
+
+        from mujoco_warp._src import sleep
+
+        with wp.ScopedDevice(self.model.device), self._scoped_mujoco_warp_execution():
+            wp.launch(
+                set_selected_body_sleep_kernel,
+                dim=world_ids.shape[0],
+                inputs=[
+                    world_ids,
+                    body_ids,
+                    asleep,
+                    self._body_sleep_index,
+                    self.mjw_model.ntree,
+                    self._sleep_awake_value,
+                ],
+                outputs=[self.mjw_data.tree_asleep],
+                device=self.model.device,
+            )
+            sleep.update_sleep(self.mjw_model, self.mjw_data)
 
     @override
     def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
@@ -7713,6 +7767,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             body_shapes = shape_body_np >= 0
             shape_sleep_index_np[body_shapes] = body_sleep_index_np[shape_body_np[body_shapes]]
             self._collision_shape_sleep_index = wp.array(shape_sleep_index_np, dtype=wp.vec2i, device=model.device)
+            self._body_sleep_index = wp.array(body_sleep_index_np, dtype=wp.vec2i, device=model.device)
 
             # Common variables for mapping creation
             njnt = self.mj_model.njnt
