@@ -2744,6 +2744,19 @@ def test_mesh_sdf_resource_grouping_preserves_reduced_contacts(test, device):
     )
     test.assertEqual(deterministic.mesh_sdf_resource_count, 0)
 
+    resource_count = 91  # 4,186 triangular resource pairs exceed the 4,096-bucket limit.
+    bucket_count = resource_count * (resource_count + 1) // 2
+    oversized = NarrowPhase(
+        max_candidate_pairs=bucket_count,
+        max_triangle_pairs=64,
+        max_mesh_mesh_pairs=bucket_count,
+        reduce_contacts=True,
+        device=device,
+        mesh_sdf_texture_only=True,
+        mesh_sdf_resource_count=resource_count,
+    )
+    test.assertEqual(oversized.mesh_sdf_resource_count, 0)
+
 
 def test_mesh_convex_one_sdf_keeps_existing_route(test, device):
     """Avoid SDF routing when it would require expensive BVH fallback on one side."""
