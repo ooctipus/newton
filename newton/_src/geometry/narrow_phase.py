@@ -61,8 +61,13 @@ from ..geometry.flags import ShapeFlags
 from ..geometry.mpr import create_solve_mpr, create_support_map_function
 from ..geometry.sdf_contact import (
     MESH_SDF_BLOCK_DIM,
+    SDF_WORK_SEGMENT_STRIDE_INT32,
+    SDF_WORK_STATE_SIZE,
+    MeshSDFExportContext,
+    MeshSDFSearchContext,
     compute_block_counts_from_weights,
     compute_mesh_mesh_block_offsets_scan,
+    create_mesh_sdf_two_stage_kernels,
     create_narrow_phase_process_mesh_mesh_contacts_kernel,
 )
 from ..geometry.sdf_hydroelastic import HydroelasticSDF
@@ -2320,6 +2325,15 @@ class NarrowPhase:
         # heightfield-only scenes still benefit from reduction).
         if reduce_contacts and not (has_meshes or has_heightfields):
             self.reduce_contacts = False
+        self.mesh_sdf_segment_capacity = 3 * max_triangle_pairs // SDF_WORK_SEGMENT_STRIDE_INT32
+        self._use_mesh_sdf_split = (
+            device_obj.is_cuda
+            and self.reduce_contacts
+            and self.mesh_sdf_texture_only
+            and self.mesh_sdf_identity_scale_only
+            and not has_heightfields
+            and self.mesh_sdf_segment_capacity > 0
+        )
 
         # Determine if we're using external AABBs
         self.external_aabb = shape_aabb_lower is not None and shape_aabb_upper is not None
@@ -2452,7 +2466,16 @@ class NarrowPhase:
                     use_texture_sdf_only=self.mesh_sdf_texture_only,
                     use_identity_sdf_scale=self.mesh_sdf_identity_scale_only,
                     speculative=speculative,
+                    run_on_work_overflow=self._use_mesh_sdf_split,
                 )
+                if self._use_mesh_sdf_split:
+                    self.mesh_sdf_cull_kernel, self.mesh_sdf_solve_kernel = create_mesh_sdf_two_stage_kernels(
+                        write_contact_to_reducer,
+                        speculative=speculative,
+                    )
+                else:
+                    self.mesh_sdf_cull_kernel = None
+                    self.mesh_sdf_solve_kernel = None
             else:
                 self.mesh_mesh_contacts_kernel = create_narrow_phase_process_mesh_mesh_contacts_kernel(
                     writer_func,
@@ -2469,10 +2492,14 @@ class NarrowPhase:
                     use_identity_sdf_scale=self.mesh_sdf_identity_scale_only,
                     speculative=speculative,
                 )
+                self.mesh_sdf_cull_kernel = None
+                self.mesh_sdf_solve_kernel = None
         else:
             self.mesh_plane_contacts_kernel = None
             self.mesh_mesh_contacts_kernel = None
             self.mesh_mesh_contacts_kernel_precomputed = None
+            self.mesh_sdf_cull_kernel = None
+            self.mesh_sdf_solve_kernel = None
 
         # Create global contact reduction kernels for mesh/heightfield-triangle
         # contacts (mirror the predicate used to gate ``self.reduce_contacts``
@@ -2514,6 +2541,8 @@ class NarrowPhase:
             n += 3 if has_meshes else 0  # mesh_plane, mesh_plane_vtx, mesh_mesh
             mesh_weight_idx = n if has_meshes and self.reduce_contacts else None
             n += 2 if mesh_weight_idx is not None else 0  # mesh-plane vertices, mesh-mesh edges
+            mesh_sdf_work_idx = n if self._use_mesh_sdf_split else None
+            n += SDF_WORK_STATE_SIZE if mesh_sdf_work_idx is not None else 0
             c = wp.zeros(n, dtype=wp.int32, device=device)
             self._counter_array = c
 
@@ -2530,6 +2559,11 @@ class NarrowPhase:
             )
             self.mesh_mesh_total_weight = (
                 c[mesh_weight_idx + 1 : mesh_weight_idx + 2] if mesh_weight_idx is not None else None
+            )
+            self.mesh_sdf_work_state = (
+                c[mesh_sdf_work_idx : mesh_sdf_work_idx + SDF_WORK_STATE_SIZE]
+                if mesh_sdf_work_idx is not None
+                else c[0:0]
             )
             self.shape_pairs_mesh_mesh_count = c[mesh_only_idx + 2 : mesh_only_idx + 3] if has_meshes else None
 
@@ -2552,6 +2586,24 @@ class NarrowPhase:
             self.triangle_pairs = (
                 wp.zeros(max_triangle_pairs, dtype=wp.vec3i, device=device) if has_meshes or has_heightfields else None
             )
+            if self._use_mesh_sdf_split:
+                self.mesh_sdf_search_contexts = wp.empty(
+                    2 * self.max_mesh_mesh_pairs,
+                    dtype=MeshSDFSearchContext,
+                    device=device,
+                )
+                self.mesh_sdf_export_contexts = wp.empty(
+                    2 * self.max_mesh_mesh_pairs,
+                    dtype=MeshSDFExportContext,
+                    device=device,
+                )
+                self.mesh_sdf_work_ints = self.triangle_pairs.view(dtype=wp.int32).flatten()
+                self.mesh_sdf_work_floats = self.triangle_pairs.view(dtype=wp.float32).flatten()
+            else:
+                self.mesh_sdf_search_contexts = None
+                self.mesh_sdf_export_contexts = None
+                self.mesh_sdf_work_ints = None
+                self.mesh_sdf_work_floats = None
             self.shape_pairs_mesh_plane = (
                 wp.zeros(self.max_mesh_plane_pairs, dtype=wp.vec2i, device=device) if has_meshes else None
             )
@@ -2755,7 +2807,6 @@ class NarrowPhase:
             or self.hydroelastic_sdf is not None
         ):
             self._counter_array.zero_()
-
         # Stage 1: Launch primitive kernel for fast analytical collisions
         # This handles sphere-sphere, sphere-capsule, capsule-capsule, plane-sphere, plane-capsule
         # and routes remaining pairs to gjk_candidate_pairs and mesh buffers
@@ -3154,6 +3205,67 @@ class NarrowPhase:
                         record_tape=False,
                     )
 
+                    if self._use_mesh_sdf_split and has_precomputed_edge_data:
+                        wp.launch_tiled(
+                            kernel=self.mesh_sdf_cull_kernel,
+                            dim=(self.num_mesh_mesh_blocks,),
+                            inputs=[
+                                shape_data,
+                                shape_transform,
+                                texture_sdf_data,
+                                shape_sdf_index,
+                                shape_gap,
+                                shape_base_gap,
+                                mesh_mesh_pairs,
+                                self.shape_pairs_mesh_mesh_count,
+                                mesh_edge_indices,
+                                mesh_edge_centers,
+                                shape_edge_range,
+                                self.mesh_mesh_block_offsets,
+                                self.mesh_sdf_search_contexts,
+                                self.mesh_sdf_export_contexts,
+                                self.mesh_sdf_work_ints,
+                                self.mesh_sdf_work_floats,
+                                self.mesh_sdf_work_state,
+                                self.mesh_sdf_segment_capacity,
+                                self.num_mesh_mesh_blocks,
+                            ],
+                            device=device,
+                            block_dim=self.tile_size_mesh_mesh,
+                            record_tape=False,
+                        )
+                        wp.launch_tiled(
+                            kernel=self.mesh_sdf_solve_kernel,
+                            dim=(self.num_mesh_mesh_blocks,),
+                            inputs=[
+                                shape_transform,
+                                texture_sdf_data,
+                                shape_linear_velocity,
+                                shape_angular_velocity,
+                                collision_update_dt,
+                                max_speculative_extension,
+                                shape_collision_aabb_lower,
+                                shape_collision_aabb_upper,
+                                shape_voxel_resolution,
+                                mesh_mesh_pairs,
+                                mesh_edge_indices,
+                                mesh_edge_centers,
+                                mesh_edge_halves,
+                                heightfield_elevations,
+                                reducer_data,
+                                self.mesh_sdf_search_contexts,
+                                self.mesh_sdf_export_contexts,
+                                self.mesh_sdf_work_ints,
+                                self.mesh_sdf_work_floats,
+                                self.mesh_sdf_work_state,
+                                self.mesh_sdf_segment_capacity,
+                                self.num_mesh_mesh_blocks,
+                            ],
+                            device=device,
+                            block_dim=self.tile_size_mesh_mesh,
+                            record_tape=False,
+                        )
+
                     wp.launch_tiled(
                         kernel=mesh_mesh_contacts_kernel,
                         dim=(self.num_mesh_mesh_blocks,),
@@ -3184,6 +3296,7 @@ class NarrowPhase:
                             shape_edge_range,
                             self.mesh_mesh_block_offsets,
                             reducer_data,
+                            self.mesh_sdf_work_state,
                             self.num_mesh_mesh_blocks,
                         ],
                         device=device,

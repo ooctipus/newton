@@ -8,12 +8,13 @@ import unittest
 import numpy as np
 import warp as wp
 
+import newton
 from newton._src.geometry.sdf_contact import (
     _sdf_rsqrt_rn,
     compute_block_counts_from_weights,
     mesh_sdf_contact_search_precision,
 )
-from newton.tests.unittest_utils import get_test_devices
+from newton.tests.unittest_utils import get_cuda_test_devices, get_test_devices
 
 
 @wp.kernel(enable_backward=False)
@@ -31,6 +32,57 @@ def _sdf_rsqrt_rn_kernel(values: wp.array[wp.float32], out: wp.array[wp.float32]
 
 
 class TestSDFContact(unittest.TestCase):
+    def test_split_mesh_sdf_matches_overflow_fallback(self) -> None:
+        """Preserve reduced contacts when split work exceeds its scratch capacity."""
+        for device in get_cuda_test_devices():
+            with self.subTest(device=device):
+                mesh = newton.Mesh.create_box(0.5, 0.5, 0.5, duplicate_vertices=False, compute_inertia=False)
+                mesh.build_sdf(max_resolution=32, device=device)
+                builder = newton.ModelBuilder()
+                mesh_body = builder.add_body(xform=wp.transform_identity())
+                box_body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.9), wp.quat_identity()))
+                builder.add_shape_mesh(mesh_body, mesh=mesh)
+                builder.add_shape_box(box_body, cfg=newton.ModelBuilder.ShapeConfig(sdf_max_resolution=32))
+                model = builder.finalize(device=device)
+                pipeline = newton.CollisionPipeline(
+                    model,
+                    broad_phase="nxn",
+                    deterministic=True,
+                    reduce_contacts=True,
+                    rigid_contact_max=128,
+                    max_triangle_pairs=4096,
+                )
+                self.assertTrue(pipeline.narrow_phase._use_mesh_sdf_split)
+                contacts = pipeline.contacts()
+                state = model.state()
+
+                def collide(active_pipeline, active_state, active_contacts) -> tuple[np.ndarray, ...]:
+                    active_pipeline.collide(active_state, active_contacts)
+                    count = int(active_contacts.rigid_contact_count.numpy()[0])
+                    self.assertGreater(count, 0)
+                    values = (
+                        active_contacts.rigid_contact_shape0.numpy()[:count],
+                        active_contacts.rigid_contact_shape1.numpy()[:count],
+                        active_contacts.rigid_contact_point0.numpy()[:count],
+                        active_contacts.rigid_contact_point1.numpy()[:count],
+                        active_contacts.rigid_contact_normal.numpy()[:count],
+                    )
+                    order = np.lexsort(tuple(np.column_stack(values).T[::-1]))
+                    return tuple(value[order] for value in values)
+
+                split_contacts = collide(pipeline, state, contacts)
+                self.assertEqual(int(pipeline.narrow_phase.mesh_sdf_work_state.numpy()[1]), 0)
+
+                pipeline.narrow_phase.mesh_sdf_segment_capacity = 0
+                fallback_contacts = collide(pipeline, state, contacts)
+                self.assertEqual(int(pipeline.narrow_phase.mesh_sdf_work_state.numpy()[1]), 1)
+
+                for split, fallback in zip(split_contacts, fallback_contacts, strict=True):
+                    if split.ndim == 1:
+                        np.testing.assert_array_equal(split, fallback)
+                    else:
+                        np.testing.assert_allclose(split, fallback, rtol=1.0e-5, atol=1.0e-6)
+
     def test_block_count_scan_ignores_inactive_tail(self) -> None:
         """Keep active block offsets independent of stale inactive slots."""
         for device in get_test_devices():
