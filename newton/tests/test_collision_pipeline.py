@@ -2592,6 +2592,31 @@ def test_deferred_sdf_cache_distinguishes_mesh_topology(test, device):
         test.assertNotEqual(int(sdf_indices[shapes[0]]), int(sdf_indices[shapes[1]]))
 
 
+def test_deferred_sdf_cache_uses_mesh_content_and_build_parameters(test, device):
+    """Share equivalent SDFs while preserving build-parameter boundaries."""
+    source = newton.Mesh.create_box(0.5, 0.5, 0.5, duplicate_vertices=False, compute_inertia=False)
+    equivalent = source.copy()
+    builder = newton.ModelBuilder()
+    shapes = [
+        builder.add_shape_mesh(body=-1, mesh=source),
+        builder.add_shape_mesh(body=-1, mesh=equivalent),
+        builder.add_shape_mesh(body=-1, mesh=source, scale=(2.0, 1.0, 1.0)),
+        builder.add_shape_mesh(body=-1, mesh=source),
+    ]
+    for shape in shapes:
+        builder.shape_sdf_max_resolution[shape] = 16
+    builder.shape_sdf_narrow_band_range[shapes[-1]] = (-0.2, 0.2)
+
+    model = builder.finalize(device=device)
+    sdf_indices = model._shape_sdf_index.numpy()
+    edge_ranges = model.shape_edge_range.numpy()
+
+    test.assertEqual(int(sdf_indices[shapes[0]]), int(sdf_indices[shapes[1]]))
+    np.testing.assert_array_equal(edge_ranges[shapes[0]], edge_ranges[shapes[1]])
+    test.assertNotEqual(int(sdf_indices[shapes[0]]), int(sdf_indices[shapes[2]]))
+    test.assertNotEqual(int(sdf_indices[shapes[0]]), int(sdf_indices[shapes[3]]))
+
+
 def test_scalar_sdf_texture_routes_to_sdf_contact(test, device):
     """Preserve mesh-SDF contacts across paired and scalar texture storage."""
 
@@ -3509,6 +3534,14 @@ add_function_test(
     TestPlanarSDFRouting,
     "test_deferred_sdf_cache_distinguishes_mesh_topology",
     test_deferred_sdf_cache_distinguishes_mesh_topology,
+    devices=get_cuda_test_devices(),
+    check_output=False,
+)
+
+add_function_test(
+    TestPlanarSDFRouting,
+    "test_deferred_sdf_cache_uses_mesh_content_and_build_parameters",
+    test_deferred_sdf_cache_uses_mesh_content_and_build_parameters,
     devices=get_cuda_test_devices(),
     check_output=False,
 )
