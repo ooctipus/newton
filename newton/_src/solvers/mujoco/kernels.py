@@ -3523,6 +3523,31 @@ def wake_changed_trees_kernel(
 
 
 @wp.kernel(enable_backward=False)
+def wake_selected_tree_kernel(
+    world_ids: wp.array[wp.int32],
+    treeid: int,
+    ntree: int,
+    awake_value: int,
+    tree_asleep: wp.array2d[wp.int32],
+):
+    """Wake one tree, and its sleeping-island cycle, in selected worlds."""
+    worldid = world_ids[wp.tid()]
+    asleep_value = tree_asleep[worldid, treeid]
+    if asleep_value < 0:
+        if awake_value < asleep_value:
+            tree_asleep[worldid, treeid] = awake_value
+        return
+
+    current = treeid
+    for _step in range(ntree + 1):
+        next_tree = tree_asleep[worldid, current]
+        tree_asleep[worldid, current] = awake_value
+        current = next_tree
+        if current == treeid:
+            break
+
+
+@wp.kernel(enable_backward=False)
 def reset_joint_state_kernel(
     world_mask: wp.array[wp.bool],
     coords_per_world: int,

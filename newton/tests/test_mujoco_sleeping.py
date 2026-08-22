@@ -30,15 +30,20 @@ def _build_sleep_model(world_count: int = 1, *, register_custom_attributes: bool
     return builder.finalize()
 
 
-def _build_contact_wake_model() -> newton.Model:
+def _build_contact_wake_model(*, sleeping_policies: bool = False) -> newton.Model:
     """Build two unactuated free spheres in one zero-gravity world."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    if sleeping_policies:
+        SolverMuJoCo.register_custom_attributes(builder)
     joints = []
-    for x in (0.0, -0.35):
+    policies = (SolverMuJoCo.SleepPolicy.NEVER, SolverMuJoCo.SleepPolicy.ALLOWED)
+    for index, x in enumerate((0.0, -0.35)):
+        custom_attributes = {"mujoco:sleep_policy": policies[index]} if sleeping_policies else None
         body = builder.add_link(
             xform=wp.transform((x, 0.0, 0.0), wp.quat_identity()),
             mass=1.0,
             inertia=wp.mat33(np.eye(3)),
+            custom_attributes=custom_attributes,
         )
         builder.add_shape_sphere(body=body, radius=0.1)
         joints.append(builder.add_joint_free(child=body))
@@ -163,8 +168,6 @@ class TestMuJoCoSleeping(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "GPU backend"):
             SolverMuJoCo(model, enable_sleeping=True, use_mujoco_cpu=True)
-        with self.assertRaisesRegex(ValueError, "contacts can wake"):
-            SolverMuJoCo(model, enable_sleeping=True, use_mujoco_contacts=False)
         with self.assertRaisesRegex(ValueError, "solver='newton'"):
             SolverMuJoCo(model, enable_sleeping=True, solver="cg")
         with self.assertRaisesRegex(ValueError, "does not support integrator='rk4'"):
@@ -327,6 +330,35 @@ class TestMuJoCoSleeping(unittest.TestCase):
                 break
 
         self.assertEqual(int(solver.mjw_data.ntree_awake.numpy()[0]), 2)
+
+    def test_external_contact_with_awake_tree_wakes_sleeping_tree(self):
+        model = _build_contact_wake_model(sleeping_policies=True)
+        solver = SolverMuJoCo(
+            model,
+            enable_sleeping=True,
+            nvmax=12,
+            iterations=2,
+            ls_iterations=2,
+            use_mujoco_contacts=False,
+        )
+        state_0 = model.state()
+        state_1 = model.state()
+        control = model.control()
+        collision_pipeline = newton.CollisionPipeline(model)
+        contacts = collision_pipeline.contacts()
+        state_0, state_1 = self._sleep_all(solver, state_0, state_1, control, contacts)
+        np.testing.assert_array_equal(solver.mjw_data.tree_awake.numpy()[0], [1, 0])
+
+        joint_q = state_0.joint_q.numpy()
+        joint_q[0] = -0.16
+        state_0.joint_q.assign(joint_q)
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        collision_pipeline.collide(state_0, contacts)
+
+        solver.step(state_0, state_1, control, contacts, 1.0 / 60.0)
+
+        np.testing.assert_array_equal(solver.mjw_data.tree_awake.numpy()[0], [1, 1])
+        np.testing.assert_array_equal(solver.mjw_data.overflow.numpy(), [0])
 
     def test_reset_wakes_only_selected_worlds(self):
         model, solver, state_0, state_1, control, contacts = self._make_sim(

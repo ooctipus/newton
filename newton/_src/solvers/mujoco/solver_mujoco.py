@@ -120,6 +120,7 @@ from .kernels import (
     update_solver_options_kernel,
     update_tendon_properties_kernel,
     wake_changed_trees_kernel,
+    wake_selected_tree_kernel,
 )
 
 if TYPE_CHECKING:
@@ -3799,7 +3800,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             magnetic: Global magnetic flux vector (x, y, z). If None, uses model custom attribute or MuJoCo's default (0, -0.5, 0).
             use_mujoco_cpu: If True, use the MuJoCo-C CPU backend instead of `mujoco_warp`.
             enable_multiccd: If True, enable multi-CCD contact generation (up to 4 contact points per geom pair instead of 1). Note: geom pairs where either geom has ``margin > 0`` always produce a single contact regardless of this flag.
-            enable_sleeping: Whether to enable MuJoCo Warp's sleeping optimization. If None, uses the model custom attribute or defaults to False. Sleeping requires the GPU backend, the Newton solver, MuJoCo contact handling, and a non-RK4 integrator.
+            enable_sleeping: Whether to enable MuJoCo Warp's sleeping optimization. If None, uses the model custom attribute or defaults to False. Sleeping requires the GPU backend, the Newton solver, and a non-RK4 integrator.
             nvmax: Maximum number of active degrees of freedom per world when sleeping is enabled. Must accommodate every initially awake degree of freedom. If None, allocates space for every degree of freedom, which is safe but provides no compact-solver memory savings.
             sleep_tolerance: Sleep velocity tolerance. If None, uses model custom attribute or MuJoCo default (0.001).
             disable_contacts: If True, disable contact computation in MuJoCo.
@@ -3836,10 +3837,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         enable_sleeping = bool(enable_sleeping)
         if enable_sleeping and use_mujoco_cpu:
             raise ValueError("enable_sleeping=True requires the MuJoCo Warp GPU backend (use_mujoco_cpu=False).")
-        if enable_sleeping and not use_mujoco_contacts:
-            raise ValueError(
-                "enable_sleeping=True requires use_mujoco_contacts=True so contacts can wake sleeping bodies."
-            )
         if nvmax is not None:
             if isinstance(nvmax, bool) or not isinstance(nvmax, int | np.integer):
                 raise TypeError(f"nvmax must be an integer or None, got {type(nvmax).__name__}.")
@@ -4262,6 +4259,19 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 ],
                 device=self.model.device,
             )
+            if self.enable_sleeping and bank.mj_dof_index >= 0:
+                wp.launch(
+                    wake_selected_tree_kernel,
+                    dim=world_ids.shape[0],
+                    inputs=[
+                        world_ids,
+                        int(self.mj_model.body_treeid[bank.mj_body_index]),
+                        self.mjw_model.ntree,
+                        self._sleep_awake_value,
+                    ],
+                    outputs=[self.mjw_data.tree_asleep],
+                    device=self.model.device,
+                )
 
     @event_scope
     @override
