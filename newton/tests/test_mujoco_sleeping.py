@@ -396,6 +396,35 @@ class TestMuJoCoSleeping(unittest.TestCase):
         np.testing.assert_array_equal(solver.mjw_data.tree_awake.numpy()[0], [1, 1])
         np.testing.assert_array_equal(solver.mjw_data.overflow.numpy(), [0])
 
+    def test_external_pose_edit_wakes_contacting_sleeping_tree(self):
+        model = _build_contact_wake_model()
+        solver = SolverMuJoCo(
+            model,
+            enable_sleeping=True,
+            nvmax=12,
+            iterations=2,
+            ls_iterations=2,
+            use_mujoco_contacts=False,
+        )
+        state_0 = model.state()
+        state_1 = model.state()
+        control = model.control()
+        collision_pipeline = newton.CollisionPipeline(model)
+        contacts = collision_pipeline.contacts()
+        state_0, state_1 = self._sleep_all(solver, state_0, state_1, control, contacts)
+        np.testing.assert_array_equal(solver.mjw_data.tree_awake.numpy()[0], [0, 0])
+
+        joint_q = state_0.joint_q.numpy()
+        joint_q[0] = -0.16
+        state_0.joint_q.assign(joint_q)
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        collision_pipeline.collide(state_0, contacts)
+
+        solver.step(state_0, state_1, control, contacts, 1.0 / 60.0)
+
+        np.testing.assert_array_equal(solver.mjw_data.tree_awake.numpy()[0], [1, 1])
+        np.testing.assert_array_equal(solver.mjw_data.overflow.numpy(), [0])
+
     def test_reset_wakes_only_selected_worlds(self):
         model, solver, state_0, state_1, control, contacts = self._make_sim(
             world_count=2, enable_sleeping=True, nvmax=1
