@@ -155,6 +155,17 @@ class TestMuJoCoSleeping(unittest.TestCase):
         self.assertEqual(solver.nvmax, 1)
         self.assertAlmostEqual(float(solver.mjw_model.opt.sleep_tolerance.numpy()[0]), 0.025)
 
+    def test_collision_sleep_filter_maps_shapes_to_trees(self):
+        model = _build_contact_wake_model()
+        solver = SolverMuJoCo(model, enable_sleeping=True, nvmax=12, disable_contacts=True)
+
+        sleep_filter = solver.collision_sleep_filter
+        assert sleep_filter is not None
+        shape_sleep_index, tree_asleep = sleep_filter
+
+        np.testing.assert_array_equal(shape_sleep_index.numpy(), [[0, 0], [0, 1]])
+        self.assertIs(tree_asleep, solver.mjw_data.tree_asleep)
+
     def test_per_world_sleep_tolerance(self):
         model = _build_sleep_model(world_count=2, register_custom_attributes=True)
         model.mujoco.sleep_tolerance.assign(np.array([0.01, 0.02], dtype=np.float32))

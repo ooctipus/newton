@@ -455,6 +455,7 @@ def create_narrow_phase_primitive_kernel(
     speculative: bool = False,
     sparse_gjk_pairs: bool = False,
     hydroelastic_enabled: bool = False,
+    sleep_filter: bool = False,
 ):
     """
     Create a kernel for fast analytical collision detection of primitive shapes.
@@ -473,7 +474,29 @@ def create_narrow_phase_primitive_kernel(
     Returns:
         A warp kernel for primitive collision detection
     """
-    _module = f"narrow_phase_primitive_{writer_func.__name__}_{speculative}_{sparse_gjk_pairs}_{hydroelastic_enabled}"
+    _module = (
+        f"narrow_phase_primitive_{writer_func.__name__}_{speculative}_{sparse_gjk_pairs}_"
+        f"{hydroelastic_enabled}_{sleep_filter}"
+    )
+
+    @wp.func(module=_module)
+    def _skip_sleeping_pair(
+        shape_a: int,
+        shape_b: int,
+        shape_sleep_index: wp.array[wp.vec2i],
+        tree_asleep: wp.array2d[int],
+    ) -> bool:
+        sleep_a = shape_sleep_index[shape_a]
+        sleep_b = shape_sleep_index[shape_b]
+        asleep_a = False
+        asleep_b = False
+        if sleep_a[1] >= 0:
+            asleep_a = tree_asleep[sleep_a[0], sleep_a[1]] >= 0
+        if sleep_b[1] >= 0:
+            asleep_b = tree_asleep[sleep_b[0], sleep_b[1]] >= 0
+        static_a = sleep_a[1] == -1
+        static_b = sleep_b[1] == -1
+        return (asleep_a and (asleep_b or static_b)) or (asleep_b and static_a)
 
     @wp.func(module=_module)
     def _admit(
@@ -521,6 +544,8 @@ def create_narrow_phase_primitive_kernel(
         shape_flags: wp.array[wp.int32],
         shape_sdf_index: wp.array[wp.int32],
         shape_edge_range: wp.array[wp.vec2i],
+        shape_sleep_index: wp.array[wp.vec2i],
+        tree_asleep: wp.array2d[int],
         writer_data: Any,
         total_num_threads: int,
         # Output: pairs that need GJK/MPR processing
@@ -585,6 +610,25 @@ def create_narrow_phase_primitive_kernel(
                     idx = wp.atomic_add(shape_pairs_sdf_sdf_count, 0, 1)
                     if idx < shape_pairs_sdf_sdf.shape[0]:
                         shape_pairs_sdf_sdf[idx] = wp.vec2i(shape_a, shape_b)
+                    continue
+
+            if wp.static(sleep_filter):
+                is_mesh_pair = (
+                    type_a == GeoType.MESH
+                    or type_b == GeoType.MESH
+                    or type_a == GeoType.HFIELD
+                    or type_b == GeoType.HFIELD
+                )
+                if not is_mesh_pair:
+                    has_sdf_edges_a = shape_sdf_index[shape_a] >= 0 and shape_edge_range[shape_a][1] > 0
+                    has_sdf_edges_b = shape_sdf_index[shape_b] >= 0 and shape_edge_range[shape_b][1] > 0
+                    is_mesh_pair = (
+                        shape_pairs_mesh_mesh.shape[0] > 0
+                        and has_sdf_edges_a
+                        and has_sdf_edges_b
+                        and not (type_a == GeoType.BOX and type_b == GeoType.BOX)
+                    )
+                if is_mesh_pair and _skip_sleeping_pair(shape_a, shape_b, shape_sleep_index, tree_asleep):
                     continue
 
             # Get shape data
@@ -2395,6 +2439,13 @@ class NarrowPhase:
             sparse_gjk_pairs=self.sparse_gjk_pairs,
             hydroelastic_enabled=hydroelastic_sdf is not None,
         )
+        self.primitive_sleep_kernel = create_narrow_phase_primitive_kernel(
+            writer_func,
+            speculative=speculative,
+            sparse_gjk_pairs=self.sparse_gjk_pairs,
+            hydroelastic_enabled=hydroelastic_sdf is not None,
+            sleep_filter=True,
+        )
         # GJK/MPR kernel handles remaining convex-convex pairs
         if use_lean_gjk_mpr:
             # Use lean support function (CONVEX_MESH, BOX, SPHERE only) and lean post-processing
@@ -2617,6 +2668,8 @@ class NarrowPhase:
             self.empty_tangent = None
             self._empty_sort_key = wp.zeros(0, dtype=wp.int64, device=device)
             self._empty_vec3 = wp.zeros(0, dtype=wp.vec3, device=device)
+            self._empty_sleep_index = wp.full(1, (-1, -1), dtype=wp.vec2i, device=device)
+            self._empty_tree_asleep = wp.zeros((1, 1), dtype=wp.int32, device=device)
             det_capacity = contact_max if contact_max is not None else max_candidate_pairs
             if deterministic:
                 self._sort_key_array = wp.zeros(det_capacity, dtype=wp.int64, device=device)
@@ -2733,6 +2786,8 @@ class NarrowPhase:
         mesh_edge_centers: wp.array[wp.vec4] | None = None,
         mesh_edge_halves: wp.array[wp.vec4] | None = None,
         shape_edge_range: wp.array[wp.vec2i] | None = None,
+        shape_sleep_index: wp.array[wp.vec2i] | None = None,
+        tree_asleep: wp.array2d[wp.int32] | None = None,
         hydroelastic_shape_sdf_data_prepared: bool = False,
         shape_linear_velocity: wp.array[wp.vec3] | None = None,
         shape_angular_velocity: wp.array[wp.vec3] | None = None,
@@ -2798,6 +2853,12 @@ class NarrowPhase:
                     raise ValueError(f"{name} must be a non-negative finite number, got {value!r}")
         shape_linear_velocity = self._empty_vec3 if shape_linear_velocity is None else shape_linear_velocity
         shape_angular_velocity = self._empty_vec3 if shape_angular_velocity is None else shape_angular_velocity
+        sleep_filter = shape_sleep_index is not None or tree_asleep is not None
+        if sleep_filter and (shape_sleep_index is None or tree_asleep is None):
+            raise ValueError("shape_sleep_index and tree_asleep must be provided together")
+        if not sleep_filter:
+            shape_sleep_index = self._empty_sleep_index
+            tree_asleep = self._empty_tree_asleep
 
         # Clear counters only when a routed or split path consumes them.
         if (
@@ -2811,7 +2872,7 @@ class NarrowPhase:
         # This handles sphere-sphere, sphere-capsule, capsule-capsule, plane-sphere, plane-capsule
         # and routes remaining pairs to gjk_candidate_pairs and mesh buffers
         wp.launch(
-            kernel=self.primitive_kernel,
+            kernel=self.primitive_sleep_kernel if sleep_filter else self.primitive_kernel,
             dim=self.total_num_threads,
             inputs=[
                 candidate_pair,
@@ -2828,6 +2889,8 @@ class NarrowPhase:
                 shape_flags,
                 shape_sdf_index,
                 shape_edge_range,
+                shape_sleep_index,
+                tree_asleep,
                 writer_data,
                 self.total_num_threads,
             ],

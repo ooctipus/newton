@@ -3886,6 +3886,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         """Mapping from MuJoCo [world, body] to Newton body index. Shape [nworld, nbody], dtype int32."""
         self.mjc_geom_to_newton_shape: wp.array2d[wp.int32] | None = None
         """Mapping from MuJoCo [world, geom] to Newton shape index. Shape [nworld, ngeom], dtype int32."""
+        self._collision_shape_sleep_index: wp.array[wp.vec2i] | None = None
         # Template-relative for per-world sites and absolute for global sites.
         self._mjc_site_shape_index: wp.array[wp.int32] | None = None
         self._mjc_site_is_global: wp.array[bool] | None = None
@@ -5602,6 +5603,17 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         if self.use_mujoco_cpu:
             raise NotImplementedError()
         return self.mjw_data.naconmax
+
+    @property
+    def collision_sleep_filter(
+        self,
+    ) -> tuple[wp.array[wp.vec2i], wp.array2d[wp.int32]] | None:
+        """Shape-to-tree mapping and mutable sleep state for external collision detection."""
+        if not self.enable_sleeping:
+            return None
+        if self._collision_shape_sleep_index is None:
+            raise RuntimeError("Collision sleep mapping was not initialized")
+        return self._collision_shape_sleep_index, self.mjw_data.tree_asleep
 
     @override
     def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
@@ -7685,6 +7697,22 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     for w in range(nworld):
                         mjc_body_to_newton_np[w, mjc_body] = w * bodies_per_world + newton_body_in_world
             self.mjc_body_to_newton = wp.array(mjc_body_to_newton_np, dtype=wp.int32)
+
+            body_flags_np = model.body_flags.numpy()
+            body_sleep_index_np = np.full((model.body_count, 2), (-1, -1), dtype=np.int32)
+            kinematic = (body_flags_np & int(BodyFlags.KINEMATIC)) != 0
+            body_sleep_index_np[kinematic, 1] = -2
+            for worldid in range(nworld):
+                for bodyid in range(nbody):
+                    newton_body = mjc_body_to_newton_np[worldid, bodyid]
+                    treeid = self.mj_model.body_treeid[bodyid]
+                    if newton_body >= 0 and treeid >= 0 and not kinematic[newton_body]:
+                        body_sleep_index_np[newton_body] = (worldid, treeid)
+            shape_body_np = model.shape_body.numpy()
+            shape_sleep_index_np = np.full((model.shape_count, 2), (-1, -1), dtype=np.int32)
+            body_shapes = shape_body_np >= 0
+            shape_sleep_index_np[body_shapes] = body_sleep_index_np[shape_body_np[body_shapes]]
+            self._collision_shape_sleep_index = wp.array(shape_sleep_index_np, dtype=wp.vec2i, device=model.device)
 
             # Common variables for mapping creation
             njnt = self.mj_model.njnt
