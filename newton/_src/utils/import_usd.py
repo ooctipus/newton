@@ -949,10 +949,12 @@ def parse_usd(
         material_props = _get_material_props_cached(prim)
         texture = material_props.get("texture")
         physics_mesh = _get_mesh_cached(prim)
-        if texture is not None:
-            render_mesh = _get_mesh_cached(prim, load_uvs=True)
-            # Texture UV expansion is render-only. Preserve the collision mesh's
-            # mass/inertia so visibility changes do not perturb simulation.
+        mesh_prim = UsdGeom.Mesh(prim)
+        normals_primvar = UsdGeom.PrimvarsAPI(prim).GetPrimvar("normals")
+        has_normals = bool(normals_primvar and normals_primvar.HasValue()) or mesh_prim.GetNormalsAttr().HasValue()
+        if texture is not None or has_normals:
+            render_mesh = _get_mesh_cached(prim, load_uvs=texture is not None, load_normals=has_normals)
+            # Visual-only vertex expansion must not perturb collision mass or inertia.
             mesh = Mesh(
                 render_mesh.vertices,
                 render_mesh.indices,

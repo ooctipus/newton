@@ -12385,7 +12385,9 @@ def Xform "Body" (
         self.assertFalse(flags_disabled_forced & ShapeFlags.VISIBLE)
 
     @staticmethod
-    def _create_stage_with_pbr_collision_mesh(color, roughness, metallic, *, add_visual_sphere=False):
+    def _create_stage_with_pbr_collision_mesh(
+        color, roughness, metallic, *, add_visual_sphere=False, add_normals=False
+    ):
         """Create a stage with a rigid body containing a collision mesh with PBR material."""
         from pxr import Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
 
@@ -12414,6 +12416,15 @@ def Xform "Body" (
         )
         collision_mesh.CreateFaceVertexCountsAttr().Set([3, 3, 3, 3])
         collision_mesh.CreateFaceVertexIndicesAttr().Set([0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3])
+        if add_normals:
+            normals = [
+                (0.0, 0.0, -1.0),
+                (0.0, -1.0, 0.0),
+                (-0.57735, 0.57735, 0.57735),
+                (0.57735, 0.57735, 0.57735),
+            ]
+            collision_mesh.CreateNormalsAttr().Set([normal for normal in normals for _ in range(3)])
+            collision_mesh.SetNormalsInterpolation(UsdGeom.Tokens.faceVarying)
 
         material = UsdShade.Material.Define(stage, "/Materials/PBR")
         shader = UsdShade.Shader.Define(stage, "/Materials/PBR/PreviewSurface")
@@ -12449,6 +12460,28 @@ def Xform "Body" (
         )
         self.assertAlmostEqual(mesh.roughness, 0.35, places=6)
         self.assertAlmostEqual(mesh.metallic, 0.75, places=6)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_visible_collision_mesh_preserves_authored_normals(self):
+        """Verify renderable collider meshes load normals without changing body mass."""
+        plain_stage = self._create_stage_with_pbr_collision_mesh(color=(0.2, 0.4, 0.6), roughness=0.35, metallic=0.75)
+        normal_stage = self._create_stage_with_pbr_collision_mesh(
+            color=(0.2, 0.4, 0.6), roughness=0.35, metallic=0.75, add_normals=True
+        )
+
+        plain_builder = newton.ModelBuilder()
+        plain_result = plain_builder.add_usd(plain_stage, hide_collision_shapes=True)
+        normal_builder = newton.ModelBuilder()
+        normal_result = normal_builder.add_usd(normal_stage, hide_collision_shapes=True)
+
+        shape = normal_builder.shape_source[normal_result["path_shape_map"]["/Body/CollisionMesh"]]
+        self.assertIsNotNone(shape.normals)
+        self.assertGreater(len(shape.vertices), 4)
+        self.assertAlmostEqual(
+            normal_builder.body_mass[normal_result["path_body_map"]["/Body"]],
+            plain_builder.body_mass[plain_result["path_body_map"]["/Body"]],
+            places=6,
+        )
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_visible_collision_mesh_texture_does_not_change_body_mass(self):
