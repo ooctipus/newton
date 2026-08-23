@@ -5483,6 +5483,38 @@ class TestMuJoCoContactForce(unittest.TestCase):
         np.testing.assert_allclose(force[0], 0.0, atol=1.0)
         np.testing.assert_allclose(force[1], 0.0, atol=1.0)
 
+    def test_contact_force_includes_adhesion(self):
+        """Reported contact force must include MuJoCo's passive adhesion."""
+        model, _ = self._build_box_on_ground()
+        solver = SolverMuJoCo(model)
+        state_in, state_out = model.state(), model.state()
+        control = model.control()
+        contacts = newton.CollisionPipeline(model).contacts()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state_in)
+
+        for _ in range(20):
+            state_in.clear_forces()
+            solver.step(state_in, state_out, control, contacts, 0.002)
+            state_in, state_out = state_out, state_in
+
+        solver.update_contacts(contacts, state_in)
+        nacon = int(solver.mjw_data.nacon.numpy()[0])
+        self.assertGreater(nacon, 0)
+        force_without_adhesion = contacts.force.numpy()[:nacon, :3].copy()
+
+        adhesion = 3.0
+        contact_adhesion = solver.mjw_data.contact.adhesion.numpy()
+        contact_adhesion[:nacon] = adhesion
+        solver.mjw_data.contact.adhesion.assign(contact_adhesion)
+        solver.update_contacts(contacts, state_in)
+
+        force_delta = contacts.force.numpy()[:nacon, :3] - force_without_adhesion
+        normals = contacts.rigid_contact_normal.numpy()[:nacon]
+        active = solver.mjw_data.contact.efc_address.numpy()[:nacon, 0] >= 0
+        self.assertTrue(np.any(active))
+        np.testing.assert_allclose(force_delta[active], adhesion * normals[active], atol=1.0e-5)
+        np.testing.assert_allclose(force_delta[~active], 0.0, atol=1.0e-5)
+
     def _build_incline_model(self, incline_angle: float):
         """Create a box resting on an inclined ramp with mu=1.0 (static for angle < ~45°)."""
         hz = 0.1  # box half-height

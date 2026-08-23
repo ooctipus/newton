@@ -65,10 +65,10 @@ from .enums import EqType as _EqType
 from .enums import _ActuatorBiasType, _ActuatorDynamicsType, _ActuatorGainType
 from .equality import MJC_OBJ_BODY, MjcEqualityTargetKind, _register_equality_constraint_attributes
 from .kernels import (
-    apply_body_sleep_override_kernel,
     MeshVariantBody,
     MeshVariantShape,
     _snapshot_nacon_count,
+    apply_body_sleep_override_kernel,
     apply_mjc_body_f_kernel,
     apply_mjc_control_kernel,
     apply_mjc_free_joint_f_to_body_f_kernel,
@@ -3880,7 +3880,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self._set_mujoco_warp_module_options()
 
         # Deferred from module scope: wp.static() in this kernel imports mujoco_warp.
-        if SolverMuJoCo._convert_mjw_contacts_to_newton_kernel is None:
+        if not use_mujoco_cpu and use_mujoco_contacts and SolverMuJoCo._convert_mjw_contacts_to_newton_kernel is None:
             SolverMuJoCo._convert_mjw_contacts_to_newton_kernel = create_convert_mjw_contacts_to_newton_kernel()
 
         # --- New unified mappings: MuJoCo[world, entity] -> Newton[entity] ---
@@ -5696,6 +5696,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
     def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
         """Update `contacts` from MuJoCo contacts when running with ``use_mujoco_contacts``."""
         self._apply_module_options()
+        if not self._use_mujoco_contacts:
+            raise RuntimeError("update_contacts() requires use_mujoco_contacts=True.")
         if self.use_mujoco_cpu:
             raise NotImplementedError()
 
@@ -5726,6 +5728,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 mj_contact.geom,
                 mj_contact.efc_address,
                 mj_contact.worldid,
+                mj_contact.adhesion,
                 mj_data.efc.force,
                 self.mjw_model.geom_bodyid,
                 mj_data.xpos,
@@ -7791,9 +7794,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             shape_sleep_index_np[body_shapes] = body_sleep_index_np[shape_body_np[body_shapes]]
             self._collision_shape_sleep_index = wp.array(shape_sleep_index_np, dtype=wp.vec2i, device=model.device)
             self._body_sleep_index = wp.array(body_sleep_index_np, dtype=wp.vec2i, device=model.device)
-            self._body_sleep_override = wp.full(
-                (nworld, self.mj_model.ntree), -1, dtype=wp.int32, device=model.device
-            )
+            self._body_sleep_override = wp.full((nworld, self.mj_model.ntree), -1, dtype=wp.int32, device=model.device)
 
             # Common variables for mapping creation
             njnt = self.mj_model.njnt
