@@ -2523,6 +2523,7 @@ class NarrowPhase:
                     self.mesh_sdf_cull_kernel, self.mesh_sdf_solve_kernel = create_mesh_sdf_two_stage_kernels(
                         write_contact_to_reducer,
                         speculative=speculative,
+                        sdf_texture_paired_samples=self.sdf_texture_paired_samples,
                     )
                 else:
                     self.mesh_sdf_cull_kernel = None

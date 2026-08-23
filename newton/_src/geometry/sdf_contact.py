@@ -8,8 +8,16 @@ import warp as wp
 from ..geometry.contact_data import SHAPE_PAIR_HFIELD_BIT, SHAPE_PAIR_INDEX_MASK, ContactData
 from ..geometry.sdf_texture import (
     TextureSDFData,
+    _texture_sample_sdf_grad_only_hw_paired,
+    _texture_sample_sdf_grad_only_hw_scalar,
     _texture_sample_sdf_hw_clamped,
+    _texture_sample_sdf_hw_clamped_paired,
+    _texture_sample_sdf_hw_clamped_scalar,
     _texture_sample_sdf_hw_pair,
+    _texture_sample_sdf_hw_pair_paired,
+    _texture_sample_sdf_hw_pair_scalar,
+    _texture_sample_sdf_hw_paired,
+    _texture_sample_sdf_hw_scalar,
     texture_sample_sdf_grad_only_hw,
     texture_sample_sdf_hw,
 )
@@ -2037,14 +2045,23 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
 def create_mesh_sdf_two_stage_kernels(
     writer_func: Any,
     speculative: bool = False,
+    sdf_texture_paired_samples: bool = True,
 ):
     """Create texture-SDF cull and solve kernels for global contact reduction."""
-    do_edge_sdf_collision = _create_sdf_contact_funcs(False, True, texture_sample_sdf_hw, _texture_sample_sdf_hw_pair)
-    sample_clamped = _texture_sample_sdf_hw_clamped
-    sample_grad = texture_sample_sdf_grad_only_hw
+    if sdf_texture_paired_samples:
+        sample_sdf = _texture_sample_sdf_hw_paired
+        sample_pair = _texture_sample_sdf_hw_pair_paired
+        sample_clamped = _texture_sample_sdf_hw_clamped_paired
+        sample_grad = _texture_sample_sdf_grad_only_hw_paired
+    else:
+        sample_sdf = _texture_sample_sdf_hw_scalar
+        sample_pair = _texture_sample_sdf_hw_pair_scalar
+        sample_clamped = _texture_sample_sdf_hw_clamped_scalar
+        sample_grad = _texture_sample_sdf_grad_only_hw_scalar
+    do_edge_sdf_collision = _create_sdf_contact_funcs(False, True, sample_sdf, sample_pair)
     get_mesh_edge = _create_mesh_edge_accessor_func(True)
     get_mesh_edge_bounding_sphere = _create_get_mesh_edge_bounding_sphere_func(True)
-    module = f"sdf_contact_two_stage_{writer_func.__name__}_{speculative}"
+    module = f"sdf_contact_two_stage_{writer_func.__name__}_{speculative}_{sdf_texture_paired_samples}"
 
     @wp.kernel(enable_backward=False, launch_bounds=(256, 2), module=module)
     def mesh_sdf_cull_kernel(
@@ -2270,10 +2287,11 @@ def create_mesh_sdf_two_stage_kernels(
                     heightfield_elevations,
                     context.search_precision,
                 )
+                result_context = wp.tile_extract(solve_context, 0)
                 center, radius = get_edge_bounding_sphere(v0, v1)
                 inner_cull_consistent = mesh_sdf_contact_passes_inner_cull_consistency(
                     dist,
-                    context.margin_sum,
+                    result_context.margin_sum,
                     cached_sdf_val,
                     center,
                     radius,
@@ -2283,7 +2301,7 @@ def create_mesh_sdf_two_stage_kernels(
                     True,
                 )
                 owns_endpoint = best_endpoint == 0 or corner_ownership == 0 or (corner_ownership & best_endpoint) != 0
-                if dist < context.contact_threshold and inner_cull_consistent and owns_endpoint:
+                if dist < result_context.contact_threshold and inner_cull_consistent and owns_endpoint:
                     direction = wp.static(sample_grad)(texture_sdf, point)
                     export = export_contexts[context_id]
                     pair = shape_pairs_mesh_mesh[context_id >> 1]
@@ -2337,7 +2355,7 @@ def create_mesh_sdf_two_stage_kernels(
                                 point_world,
                                 contact_normal,
                                 dist,
-                                context.margin_sum,
+                                result_context.margin_sum,
                                 0.0,
                                 0.0,
                                 (edge_idx << 2) | (mode << 1),

@@ -1284,17 +1284,10 @@ def _texture_sample_sdf_hw_clamped_pair_variant(
     uvw1 = wp.vec3f(0.0)
 
     if loc0.start_slot >= SLOT_LINEAR:
-        cx0 = float(loc0.x_base)
-        cy0 = float(loc0.y_base)
-        cz0 = float(loc0.z_base)
         coarse_f0 = (
             wp.vec3(float(loc0.ix) + loc0.tx, float(loc0.iy) + loc0.ty, float(loc0.iz) + loc0.tz) * sdf.fine_to_coarse
         )
-        uvw0 = wp.vec3f(
-            cx0 + (coarse_f0[0] - cx0) + 0.5,
-            cy0 + (coarse_f0[1] - cy0) + 0.5,
-            cz0 + (coarse_f0[2] - cz0) + 0.5,
-        )
+        uvw0 = coarse_f0 + wp.vec3f(0.5)
     else:
         texture0 = sdf.subgrid_texture
         block_x0 = float(loc0.start_slot & wp.uint32(0x3FF))
@@ -1310,17 +1303,10 @@ def _texture_sample_sdf_hw_clamped_pair_variant(
         )
 
     if loc1.start_slot >= SLOT_LINEAR:
-        cx1 = float(loc1.x_base)
-        cy1 = float(loc1.y_base)
-        cz1 = float(loc1.z_base)
         coarse_f1 = (
             wp.vec3(float(loc1.ix) + loc1.tx, float(loc1.iy) + loc1.ty, float(loc1.iz) + loc1.tz) * sdf.fine_to_coarse
         )
-        uvw1 = wp.vec3f(
-            cx1 + (coarse_f1[0] - cx1) + 0.5,
-            cy1 + (coarse_f1[1] - cy1) + 0.5,
-            cz1 + (coarse_f1[2] - cz1) + 0.5,
-        )
+        uvw1 = coarse_f1 + wp.vec3f(0.5)
     else:
         texture1 = sdf.subgrid_texture
         block_x1 = float(loc1.start_slot & wp.uint32(0x3FF))
@@ -1425,22 +1411,9 @@ def _texture_sample_sdf_hw_clamped_variant(
     sdf_val = float(0.0)
 
     if loc.start_slot >= SLOT_LINEAR:
-        # ``cx + tx + 0.5`` lands at the centre of voxel (cx, cy, cz) and
-        # ``+tx`` walks toward (cx+1, ...). The HW filter returns the
-        # interpolated value in one fetch.
-        cx = float(loc.x_base)
-        cy = float(loc.y_base)
-        cz = float(loc.z_base)
+        # ``coarse_f + 0.5`` maps grid vertices to texture-sample centers.
         coarse_f = wp.vec3(float(loc.ix) + loc.tx, float(loc.iy) + loc.ty, float(loc.iz) + loc.tz) * sdf.fine_to_coarse
-        sdf_val = _texture_sample_sdf_x0(
-            sdf.coarse_texture,
-            wp.vec3f(
-                cx + (coarse_f[0] - cx) + 0.5,
-                cy + (coarse_f[1] - cy) + 0.5,
-                cz + (coarse_f[2] - cz) + 0.5,
-            ),
-            paired_samples,
-        )
+        sdf_val = _texture_sample_sdf_x0(sdf.coarse_texture, coarse_f + wp.vec3f(0.5), paired_samples)
     else:
         block_x = float(loc.start_slot & wp.uint32(0x3FF))
         block_y = float((loc.start_slot >> wp.uint32(10)) & wp.uint32(0x3FF))
