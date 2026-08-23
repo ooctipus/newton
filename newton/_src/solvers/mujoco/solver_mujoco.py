@@ -856,6 +856,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     inertia = inertia.copy()
                     inertia.flat[::4] += definition.inertia_diagonal_offset
                     inv_inertia = np.linalg.inv(inertia)
+                if mj_dof < 0:
+                    inv_mass = 0.0
+                    inv_inertia = np.zeros_like(inertia)
                 mj_inertia, eigvec, mj_iquat = np.empty(3), np.empty(9), np.empty(4)
                 mujoco.mju_eig3(mj_inertia, eigvec, mj_iquat, inertia.ravel())
                 if mj_dof >= 0:
