@@ -149,6 +149,16 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         self.assertGreaterEqual(int(indices[1, 0]), 0)
         np.testing.assert_array_equal(indices[1, 1:], np.full(5, -1, dtype=np.int32))
 
+    def test_step_rejects_contacts_larger_than_solver_scratch(self):
+        """Reject oversized contact input before it can overwrite solver buffers."""
+        model = _build_chain_model(num_links=1, num_worlds=1)
+        model.rigid_contact_max = 1
+        solver = SolverFeatherPGS(model)
+        contacts = newton.Contacts(rigid_contact_max=2, soft_contact_max=0, device=model.device)
+
+        with self.assertRaisesRegex(ValueError, "contact capacity"):
+            solver.step(model.state(), model.state(), model.control(), contacts, 1.0 / 60.0)
+
     def test_hinv_chunk_selection_respects_shared_memory(self):
         cases = (
             (23, 384, 101376, 64),
