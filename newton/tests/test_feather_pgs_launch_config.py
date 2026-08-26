@@ -11,6 +11,7 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _DENSE_META_MAX_PARENT,
     _DENSE_META_ROW_TYPE_MASK,
     _FeatherPGSExecutionPlan,
+    _get_pgs_solve_mf_gs_kernel,
     _select_hinv_jt_chunk_size,
     _use_resident_mfgs_metadata,
     _validate_dense_metadata_encoding,
@@ -249,6 +250,116 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         self.assertTrue(compact)
         self.assertFalse(large)
         self.assertFalse(overcommitted)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "MF-GS dispatch requires CUDA")
+    def test_mfgs_compact_dispatch_matches_full_capacity(self):
+        """Match a full-capacity solve across compact, fallback, and overflow worlds."""
+        device = wp.get_device("cuda:0")
+        world_count = 4
+        dense_capacity = 4
+        compact_capacity = 2
+        mf_capacity = 1
+        dof_count = 2
+
+        constraint_count = wp.array(np.array([1, 2, 3, 5], dtype=np.int32), device=device)
+        dense_phase_bounds = wp.zeros((world_count, 2), dtype=wp.int32, device=device)
+        world_dof_indices = wp.array(
+            np.arange(world_count * dof_count, dtype=np.int32).reshape(world_count, dof_count), device=device
+        )
+        deferred_dof_mask = wp.zeros((world_count, dof_count), dtype=wp.int32, device=device)
+        rhs = -np.arange(1, world_count * dense_capacity + 1, dtype=np.float32).reshape(world_count, dense_capacity)
+        rhs *= 0.05
+        dense_rhs = wp.array(rhs, device=device)
+        dense_diag = wp.ones((world_count, dense_capacity), dtype=wp.float32, device=device)
+        dense_impulses = wp.zeros((world_count, dense_capacity), dtype=wp.float32, device=device)
+        jacobian = np.zeros((world_count, dense_capacity, dof_count), dtype=np.float32)
+        jacobian[:, 0::2, 0] = 1.0
+        jacobian[:, 1::2, 1] = 1.0
+        dense_jacobian = wp.array(jacobian, device=device)
+        dense_response = wp.array(jacobian, device=device)
+        dense_row_type = wp.zeros((world_count, dense_capacity), dtype=wp.int32, device=device)
+        dense_row_parent = wp.full((world_count, dense_capacity), -1, dtype=wp.int32, device=device)
+        dense_row_mu = wp.zeros((world_count, dense_capacity), dtype=wp.float32, device=device)
+        drive_values = wp.zeros((world_count, dense_capacity), dtype=wp.float32, device=device)
+        mf_constraint_count = wp.zeros(world_count, dtype=wp.int32, device=device)
+        mf_contact_rows_end = wp.zeros(world_count, dtype=wp.int32, device=device)
+        mf_meta = wp.zeros((world_count, 4 * mf_capacity), dtype=wp.int32, device=device)
+        mf_impulses = wp.zeros((world_count, mf_capacity), dtype=wp.float32, device=device)
+        mf_six_values = wp.zeros((world_count, mf_capacity, 6), dtype=wp.float32, device=device)
+        mf_row_mu = wp.zeros((world_count, mf_capacity), dtype=wp.float32, device=device)
+        initial_velocity = wp.array(np.linspace(-0.2, 0.2, world_count * dof_count, dtype=np.float32), device=device)
+
+        def build_kernel(max_constraints: int, min_dense_constraints: int):
+            return _get_pgs_solve_mf_gs_kernel(
+                max_constraints,
+                mf_capacity,
+                dof_count,
+                str(device.arch),
+                dense_stride=dense_capacity,
+                min_dense_constraints=min_dense_constraints,
+                has_drive_rows=False,
+                has_dense_velocity_limit_rows=False,
+            )
+
+        def run(kernels):
+            impulses = wp.clone(dense_impulses)
+            mf_lambda = wp.clone(mf_impulses)
+            velocity = wp.clone(initial_velocity)
+            inputs = [
+                constraint_count,
+                dense_phase_bounds,
+                world_dof_indices,
+                deferred_dof_mask,
+                dense_rhs,
+                dense_diag,
+                impulses,
+                dense_jacobian,
+                dense_response,
+                dense_row_type,
+                dense_row_parent,
+                dense_row_mu,
+                drive_values,
+                drive_values,
+                drive_values,
+                drive_values,
+                drive_values,
+                mf_constraint_count,
+                mf_contact_rows_end,
+                mf_meta,
+                mf_lambda,
+                mf_six_values,
+                mf_six_values,
+                mf_six_values,
+                mf_six_values,
+                mf_row_mu,
+                2,
+                1.0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]
+            for kernel in kernels:
+                wp.launch_tiled(
+                    kernel,
+                    dim=[world_count],
+                    inputs=inputs,
+                    outputs=[velocity],
+                    block_dim=32,
+                    device=device,
+                )
+            return impulses.numpy(), velocity.numpy()
+
+        reference = run((build_kernel(dense_capacity, -1),))
+        partitioned = run(
+            (
+                build_kernel(compact_capacity, -1),
+                build_kernel(dense_capacity, compact_capacity),
+            )
+        )
+        for expected, actual in zip(reference, partitioned, strict=True):
+            np.testing.assert_array_equal(actual, expected)
 
     def test_serial_kernel_block_dim_validation(self):
         model = newton.ModelBuilder().finalize()

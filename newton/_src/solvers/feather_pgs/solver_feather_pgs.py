@@ -162,6 +162,8 @@ _FPGS_SYNC_TIMINGS_START = int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_START", 
 _FPGS_SYNC_TIMINGS_COUNT = max(int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_COUNT", "1")), 0)
 _MFGS_RESIDENT_METADATA_MAX_BYTES = 4096
 _MFGS_TILE_SHARED_STORAGE_BYTES = 128
+_MFGS_COMPACT_DISPATCH_MAX_ROWS = 128
+_MFGS_COMPACT_DISPATCH_MIN_WORLDS = 4096
 _PROPAGATION_DENSE_INTERNAL_ROW_RESERVE = 16
 
 
@@ -3359,6 +3361,8 @@ class SolverFeatherPGS(SolverBase):
             self._pack_mf_meta_kernel = _get_pack_mf_meta_kernel(self.mf_max_constraints, device_arch)
 
         self._pgs_solve_mf_gs_kernel = None
+        self._pgs_solve_mf_gs_dispatch = ()
+        self._mfgs_dense_dispatch = ()
         if (
             self.pgs_mode == "matrix_free"
             and hasattr(self, "mf_meta_packed")
@@ -3367,25 +3371,43 @@ class SolverFeatherPGS(SolverBase):
             and self.mf_max_constraints > 0
         ):
             has_drive_rows = self.drive_mode == "physx_pgs"
-            shared_metadata = _use_resident_mfgs_metadata(
-                self.dense_max_constraints,
-                self.mf_max_constraints,
-                self.max_world_dofs,
-                int(getattr(model.device, "max_shared_memory_per_block", 0)),
-                has_drive_rows=has_drive_rows,
-                fuse_vel_limits=self.fuse_joint_velocity_limits,
-            )
-            self._pgs_solve_mf_gs_kernel = _get_pgs_solve_mf_gs_kernel(
-                self.dense_max_constraints,
-                self.mf_max_constraints,
-                self.max_world_dofs,
-                device_arch,
-                has_drive_rows=has_drive_rows,
-                has_dense_velocity_limit_rows=self.enable_joint_velocity_limits,
-                fuse_vel_limits=self.fuse_joint_velocity_limits,
-                friction_mode=self.friction_mode,
-                shared_metadata=shared_metadata,
-            )
+            dense_dispatch = ((self.dense_max_constraints, -1),)
+            if (
+                self.world_count >= _MFGS_COMPACT_DISPATCH_MIN_WORLDS
+                and self.dense_max_constraints > _MFGS_COMPACT_DISPATCH_MAX_ROWS
+            ):
+                dense_dispatch = (
+                    (_MFGS_COMPACT_DISPATCH_MAX_ROWS, -1),
+                    (self.dense_max_constraints, _MFGS_COMPACT_DISPATCH_MAX_ROWS),
+                )
+            kernels = []
+            for working_rows, min_rows in dense_dispatch:
+                shared_metadata = _use_resident_mfgs_metadata(
+                    working_rows,
+                    self.mf_max_constraints,
+                    self.max_world_dofs,
+                    int(getattr(model.device, "max_shared_memory_per_block", 0)),
+                    has_drive_rows=has_drive_rows,
+                    fuse_vel_limits=self.fuse_joint_velocity_limits,
+                )
+                kernels.append(
+                    _get_pgs_solve_mf_gs_kernel(
+                        working_rows,
+                        self.mf_max_constraints,
+                        self.max_world_dofs,
+                        device_arch,
+                        dense_stride=self.dense_max_constraints,
+                        min_dense_constraints=min_rows,
+                        has_drive_rows=has_drive_rows,
+                        has_dense_velocity_limit_rows=self.enable_joint_velocity_limits,
+                        fuse_vel_limits=self.fuse_joint_velocity_limits,
+                        friction_mode=self.friction_mode,
+                        shared_metadata=shared_metadata,
+                    )
+                )
+            self._pgs_solve_mf_gs_dispatch = tuple(kernels)
+            self._mfgs_dense_dispatch = dense_dispatch
+            self._pgs_solve_mf_gs_kernel = kernels[0]
 
         self._pgs_solve_mf_kernel = None
         if model.device.is_cuda and hasattr(self, "max_mf_bodies") and self.mf_max_constraints > 0:
@@ -3738,8 +3760,8 @@ class SolverFeatherPGS(SolverBase):
             return
         if friction_start_iteration is None:
             friction_start_iteration = self._contact_friction_start_iteration(iterations)
-        mf_gs_kernel = self._pgs_solve_mf_gs_kernel
-        if mf_gs_kernel is None:
+        mf_gs_kernels = self._pgs_solve_mf_gs_dispatch
+        if not mf_gs_kernels:
             raise RuntimeError("Matrix-free GS kernel is unavailable for this solver shape")
 
         def launch_row_phase(row_phase: int, phase_iterations: int, phase_iteration_offset: int) -> None:
@@ -3794,6 +3816,7 @@ class SolverFeatherPGS(SolverBase):
                             "device_arch": int(self.model.device.arch),  # INT warp arch code
                             "world_count": int(self.world_count),
                             "block_dim": 32,
+                            "dense_dispatch": self._mfgs_dense_dispatch,
                             "iterations": int(phase_iterations),
                             "omega": float(omega),
                             "row_phase": int(row_phase),
@@ -3807,50 +3830,52 @@ class SolverFeatherPGS(SolverBase):
                     )
                 print(f"[fpgs-capture] wrote {_base}.npz/.json", flush=True)
             with self._sync_timed(f"mfgs_phase{row_phase}_iters{phase_iterations}"):
-                wp.launch_tiled(
-                    mf_gs_kernel,
-                    dim=[self.world_count],
-                    inputs=[
-                        self.constraint_count,
-                        self.dense_phase_bounds,
-                        self.world_dof_indices,
-                        self.world_deferred_dof_mask,
-                        dense_rhs,
-                        self.diag,
-                        self.impulses,
-                        self.J_world,
-                        self.Y_world,
-                        self.row_type,
-                        self.row_parent,
-                        self.row_mu,
-                        self.drive_target_vel_bias,
-                        self.drive_vel_multiplier,
-                        self.drive_impulse_multiplier,
-                        self.drive_max_impulse,
-                        # (1, 1) dummy when the fused clamp is off; the kernel
-                        # only reads it when built with fuse_vel_limits.
-                        self.drive_vel_limit,
-                        self.mf_constraint_count,
-                        self.mf_contact_rows_end,
-                        mf_meta,
-                        self.mf_impulses,
-                        self.mf_J_a,
-                        self.mf_J_b,
-                        self.mf_MiJt_a,
-                        self.mf_MiJt_b,
-                        self.mf_row_mu,
-                        phase_iterations,
-                        omega,
-                        row_phase,
-                        int(friction_start_iteration),
-                        int(phase_iteration_offset),
-                        int(freeze_drive_rows),
-                        int(defer_dense_response),
-                    ],
-                    outputs=[self.v_out],
-                    block_dim=32,
-                    device=self.model.device,
-                )
+                launch_inputs = [
+                    self.constraint_count,
+                    self.dense_phase_bounds,
+                    self.world_dof_indices,
+                    self.world_deferred_dof_mask,
+                    dense_rhs,
+                    self.diag,
+                    self.impulses,
+                    self.J_world,
+                    self.Y_world,
+                    self.row_type,
+                    self.row_parent,
+                    self.row_mu,
+                    self.drive_target_vel_bias,
+                    self.drive_vel_multiplier,
+                    self.drive_impulse_multiplier,
+                    self.drive_max_impulse,
+                    # (1, 1) dummy when the fused clamp is off; the kernel
+                    # only reads it when built with fuse_vel_limits.
+                    self.drive_vel_limit,
+                    self.mf_constraint_count,
+                    self.mf_contact_rows_end,
+                    mf_meta,
+                    self.mf_impulses,
+                    self.mf_J_a,
+                    self.mf_J_b,
+                    self.mf_MiJt_a,
+                    self.mf_MiJt_b,
+                    self.mf_row_mu,
+                    phase_iterations,
+                    omega,
+                    row_phase,
+                    int(friction_start_iteration),
+                    int(phase_iteration_offset),
+                    int(freeze_drive_rows),
+                    int(defer_dense_response),
+                ]
+                for mf_gs_kernel in mf_gs_kernels:
+                    wp.launch_tiled(
+                        mf_gs_kernel,
+                        dim=[self.world_count],
+                        inputs=launch_inputs,
+                        outputs=[self.v_out],
+                        block_dim=32,
+                        device=self.model.device,
+                    )
 
         if row_phase_override is not None:
             launch_row_phase(int(row_phase_override), iterations, iteration_offset)
@@ -14662,6 +14687,8 @@ def _get_pgs_solve_mf_gs_kernel(
     device_arch: str,
     friction_mode: str = "current",
     *,
+    dense_stride: int | None = None,
+    min_dense_constraints: int = -1,
     software_pipeline: bool = True,
     shared_metadata: bool = True,
     has_drive_rows: bool = True,
@@ -14670,7 +14697,10 @@ def _get_pgs_solve_mf_gs_kernel(
 ) -> "wp.Kernel":
     """Two-phase GS PGS kernel: dense + matrix-free in one pass.
 
-    Uses one warp (32 threads) per world.
+    Uses one warp (32 threads) per world. A smaller ``max_constraints`` may
+    operate on buffers whose allocation stride is ``dense_stride``; paired
+    kernels can partition worlds by live row count with
+    ``min_dense_constraints``.
 
     Phase 1 (dense): warp-parallel dot/update over D DOFs using J_world/Y_world.
     Phase 2 (MF): lanes 0-5 handle body_a, lanes 6-11 handle body_b (6 DOFs each).
@@ -14698,6 +14728,18 @@ def _get_pgs_solve_mf_gs_kernel(
         raise ValueError("fuse_vel_limits requires has_drive_rows")
     _validate_dense_metadata_encoding(max_constraints)
     M_D = max_constraints
+    S_D = M_D if dense_stride is None else int(dense_stride)
+    if S_D < M_D:
+        raise ValueError("dense_stride must be at least max_constraints")
+    if min_dense_constraints >= M_D:
+        raise ValueError("min_dense_constraints must be smaller than max_constraints")
+    if M_D == S_D:
+        dense_count_guard = f"""
+    if (m_dense <= {min_dense_constraints}) return;
+    if (m_dense > {M_D}) m_dense = {M_D};"""
+    else:
+        dense_count_guard = f"""
+    if (m_dense <= {min_dense_constraints} || m_dense > {M_D}) return;"""
     M_MF = mf_max_constraints
     D = max_world_dofs
 
@@ -15690,8 +15732,8 @@ def _get_pgs_solve_mf_gs_kernel(
 
     int m_dense = world_constraint_count.data[world];
     int m_mf = mf_constraint_count.data[world];
+{dense_count_guard}
     if (m_dense == 0 && m_mf == 0) return;
-    if (m_dense > {M_D}) m_dense = {M_D};
     if (m_mf > {M_MF}) m_mf = {M_MF};
     int mf_contact_end = mf_contact_rows_end.data[world];
     if (mf_contact_end > m_mf) mf_contact_end = m_mf;
@@ -15716,10 +15758,10 @@ def _get_pgs_solve_mf_gs_kernel(
     }}{fused_load_lo_decl}
 
     int dof_map_base = world * {D};
-    int off_dense = world * {M_D};
+    int off_dense = world * {S_D};
     int off_mf = world * {M_MF};
     int off_meta = off_mf * 4;
-    int jy_world_base = world * {M_D} * {D};
+    int jy_world_base = world * {S_D} * {D};
     int deferred_mask_base = world * {D};
     int mf6_base = world * {M_MF} * 6;
 
@@ -16269,6 +16311,7 @@ def _get_pgs_solve_mf_gs_kernel(
     name = (
         f"pgs_solve_mf_gs_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_{friction_mode}"
         f"_drive{int(has_drive_rows)}_densevlim{int(has_dense_velocity_limit_rows)}"
+        f"_stride{S_D}_gt{min_dense_constraints}"
     )
     if fuse_vel_limits:
         name += "_fvl"
