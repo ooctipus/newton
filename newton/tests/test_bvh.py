@@ -10,7 +10,12 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.geometry.bvh import SHAPE_BOUNDS_BLOCK_DIM, compute_shape_local_bounds
+from newton._src.geometry.bvh import (
+    SHAPE_BOUNDS_BLOCK_DIM,
+    SHAPE_BOUNDS_MAX_BLOCKS,
+    compute_shape_local_bounds,
+    compute_shape_local_bounds_launch,
+)
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 # Straddle the reduction block size: fewer points than lanes (idle lanes reduce only the
@@ -115,9 +120,36 @@ def test_tiled_local_bounds_rebuild(test: TestShapeBvhBounds, device: str):
             np.testing.assert_allclose(rebuilt_bounds[shape], changed_bounds, rtol=0.0, atol=0.0)
 
 
+def test_tiled_local_bounds_chunks_large_models(test: TestShapeBvhBounds, _device: str):
+    """Limit each tiled local-bounds launch to the portable CUDA grid size."""
+    model = mock.Mock(
+        shape_count=2 * SHAPE_BOUNDS_MAX_BLOCKS + 1,
+        shape_type=None,
+        shape_source_ptr=None,
+        gaussians_data=None,
+        bvh_shape_bounds=None,
+        device="cuda:0",
+    )
+
+    with mock.patch.object(wp, "launch_tiled") as launch_tiled:
+        compute_shape_local_bounds_launch(model)
+
+    test.assertEqual(
+        [call.kwargs["dim"] for call in launch_tiled.call_args_list],
+        [SHAPE_BOUNDS_MAX_BLOCKS, SHAPE_BOUNDS_MAX_BLOCKS, 1],
+    )
+    test.assertEqual(
+        [call.kwargs["inputs"][0] for call in launch_tiled.call_args_list],
+        [0, SHAPE_BOUNDS_MAX_BLOCKS, 2 * SHAPE_BOUNDS_MAX_BLOCKS],
+    )
+
+
 add_function_test(TestShapeBvhBounds, "test_tiled_local_bounds", test_tiled_local_bounds, devices=get_test_devices())
 add_function_test(
     TestShapeBvhBounds, "test_tiled_local_bounds_rebuild", test_tiled_local_bounds_rebuild, devices=get_test_devices()
+)
+add_function_test(
+    TestShapeBvhBounds, "test_tiled_local_bounds_chunks_large_models", test_tiled_local_bounds_chunks_large_models
 )
 
 

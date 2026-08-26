@@ -1615,11 +1615,10 @@ class Model:
                 included in the BVH if any of its flags are set in the mask.
         """
         from ..geometry.bvh import (  # noqa: PLC0415
-            SHAPE_BOUNDS_BLOCK_DIM,
             compute_bvh_group_roots,
             compute_enabled_shapes,
             compute_shape_bvh_bounds_launch,
-            compute_shape_local_bounds,
+            compute_shape_local_bounds_launch,
             compute_shape_world_transforms_launch,
         )
 
@@ -1631,18 +1630,7 @@ class Model:
         world_count_total = self.world_count + 1
 
         self.bvh_shape_bounds = wp.empty((shape_count, 2), dtype=wp.vec3f, ndim=2, device=device)
-        wp.launch_tiled(
-            kernel=compute_shape_local_bounds,
-            dim=shape_count,
-            block_dim=SHAPE_BOUNDS_BLOCK_DIM,
-            inputs=[
-                self.shape_type,
-                self.shape_source_ptr,
-                self.gaussians_data,
-                self.bvh_shape_bounds,
-            ],
-            device=device,
-        )
+        compute_shape_local_bounds_launch(self)
 
         self.bvh_shape_enabled = wp.empty(shape_count, dtype=wp.uint32, device=device)
         num_enabled = wp.zeros(1, dtype=wp.int32, device=device)

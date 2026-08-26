@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
 
 SHAPE_BOUNDS_BLOCK_DIM = 256
+SHAPE_BOUNDS_MAX_BLOCKS = 65535
 
 
 @wp.func
@@ -208,12 +209,14 @@ def compute_gaussian_bounds(gaussians_data: Gaussian.Data, tid: wp.int32) -> tup
 
 @wp.kernel(enable_backward=False)
 def compute_shape_local_bounds(
+    shape_start: wp.int32,
     in_shape_type: wp.array[wp.int32],
     in_shape_ptr: wp.array[wp.uint64],
     in_gaussians: wp.array[Gaussian.Data],
     out_bounds: wp.array2d[wp.vec3f],
 ):
     shape_index, lane = wp.tid()
+    shape_index += shape_start
 
     min_point = wp.vec3(MAXVAL)
     max_point = wp.vec3(-MAXVAL)
@@ -388,6 +391,25 @@ def compute_shape_bvh_bounds_launch(
         ],
         device=model.device,
     )
+
+
+def compute_shape_local_bounds_launch(model: Model) -> None:
+    """Populate local shape bounds using bounded cooperative launches."""
+    for shape_start in range(0, model.shape_count, SHAPE_BOUNDS_MAX_BLOCKS):
+        shape_count = min(SHAPE_BOUNDS_MAX_BLOCKS, model.shape_count - shape_start)
+        wp.launch_tiled(
+            kernel=compute_shape_local_bounds,
+            dim=shape_count,
+            block_dim=SHAPE_BOUNDS_BLOCK_DIM,
+            inputs=[
+                shape_start,
+                model.shape_type,
+                model.shape_source_ptr,
+                model.gaussians_data,
+                model.bvh_shape_bounds,
+            ],
+            device=model.device,
+        )
 
 
 def compute_shape_world_transforms_launch(model: Model, state: State) -> None:
