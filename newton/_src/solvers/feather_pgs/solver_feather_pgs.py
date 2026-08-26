@@ -3390,19 +3390,24 @@ class SolverFeatherPGS(SolverBase):
                     has_drive_rows=has_drive_rows,
                     fuse_vel_limits=self.fuse_joint_velocity_limits,
                 )
+                dispatch_kwargs = {}
+                if len(dense_dispatch) > 1:
+                    dispatch_kwargs = {
+                        "dense_stride": self.dense_max_constraints,
+                        "min_dense_constraints": min_rows,
+                    }
                 kernels.append(
                     _get_pgs_solve_mf_gs_kernel(
                         working_rows,
                         self.mf_max_constraints,
                         self.max_world_dofs,
                         device_arch,
-                        dense_stride=self.dense_max_constraints,
-                        min_dense_constraints=min_rows,
                         has_drive_rows=has_drive_rows,
                         has_dense_velocity_limit_rows=self.enable_joint_velocity_limits,
                         fuse_vel_limits=self.fuse_joint_velocity_limits,
                         friction_mode=self.friction_mode,
                         shared_metadata=shared_metadata,
+                        **dispatch_kwargs,
                     )
                 )
             self._pgs_solve_mf_gs_dispatch = tuple(kernels)
@@ -14688,7 +14693,7 @@ def _get_pgs_solve_mf_gs_kernel(
     friction_mode: str = "current",
     *,
     dense_stride: int | None = None,
-    min_dense_constraints: int = -1,
+    min_dense_constraints: int | None = None,
     software_pipeline: bool = True,
     shared_metadata: bool = True,
     has_drive_rows: bool = True,
@@ -14697,10 +14702,11 @@ def _get_pgs_solve_mf_gs_kernel(
 ) -> "wp.Kernel":
     """Two-phase GS PGS kernel: dense + matrix-free in one pass.
 
-    Uses one warp (32 threads) per world. A smaller ``max_constraints`` may
-    operate on buffers whose allocation stride is ``dense_stride``; paired
-    kernels can partition worlds by live row count with
-    ``min_dense_constraints``.
+    Uses one warp (32 threads) per world. Passing both ``dense_stride`` and
+    ``min_dense_constraints`` enables partitioned dispatch: a smaller
+    ``max_constraints`` may operate on buffers whose allocation stride is
+    ``dense_stride``, while paired kernels partition worlds by live row count.
+    Leaving both unset preserves the established full-capacity kernel.
 
     Phase 1 (dense): warp-parallel dot/update over D DOFs using J_world/Y_world.
     Phase 2 (MF): lanes 0-5 handle body_a, lanes 6-11 handle body_b (6 DOFs each).
@@ -14728,18 +14734,29 @@ def _get_pgs_solve_mf_gs_kernel(
         raise ValueError("fuse_vel_limits requires has_drive_rows")
     _validate_dense_metadata_encoding(max_constraints)
     M_D = max_constraints
-    S_D = M_D if dense_stride is None else int(dense_stride)
-    if S_D < M_D:
-        raise ValueError("dense_stride must be at least max_constraints")
-    if min_dense_constraints >= M_D:
-        raise ValueError("min_dense_constraints must be smaller than max_constraints")
-    if M_D == S_D:
-        dense_count_guard = f"""
+    partitioned_dispatch = dense_stride is not None or min_dense_constraints is not None
+    if partitioned_dispatch:
+        if dense_stride is None or min_dense_constraints is None:
+            raise ValueError("dense_stride and min_dense_constraints must be set together")
+        S_D = int(dense_stride)
+        if S_D < M_D:
+            raise ValueError("dense_stride must be at least max_constraints")
+        if min_dense_constraints >= M_D:
+            raise ValueError("min_dense_constraints must be smaller than max_constraints")
+        if M_D == S_D:
+            dense_partition_guard = f"""
     if (m_dense <= {min_dense_constraints}) return;
     if (m_dense > {M_D}) m_dense = {M_D};"""
-    else:
-        dense_count_guard = f"""
+        else:
+            dense_partition_guard = f"""
     if (m_dense <= {min_dense_constraints} || m_dense > {M_D}) return;"""
+        dense_capacity_clamp = ""
+        dispatch_name = f"_stride{S_D}_gt{min_dense_constraints}"
+    else:
+        S_D = M_D
+        dense_partition_guard = ""
+        dense_capacity_clamp = f"\n    if (m_dense > {M_D}) m_dense = {M_D};"
+        dispatch_name = ""
     M_MF = mf_max_constraints
     D = max_world_dofs
 
@@ -15732,8 +15749,9 @@ def _get_pgs_solve_mf_gs_kernel(
 
     int m_dense = world_constraint_count.data[world];
     int m_mf = mf_constraint_count.data[world];
-{dense_count_guard}
+{dense_partition_guard}
     if (m_dense == 0 && m_mf == 0) return;
+{dense_capacity_clamp}
     if (m_mf > {M_MF}) m_mf = {M_MF};
     int mf_contact_end = mf_contact_rows_end.data[world];
     if (mf_contact_end > m_mf) mf_contact_end = m_mf;
@@ -16311,7 +16329,7 @@ def _get_pgs_solve_mf_gs_kernel(
     name = (
         f"pgs_solve_mf_gs_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_{friction_mode}"
         f"_drive{int(has_drive_rows)}_densevlim{int(has_dense_velocity_limit_rows)}"
-        f"_stride{S_D}_gt{min_dense_constraints}"
+        f"{dispatch_name}"
     )
     if fuse_vel_limits:
         name += "_fvl"

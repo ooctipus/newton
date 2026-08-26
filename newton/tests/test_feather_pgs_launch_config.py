@@ -252,6 +252,21 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         self.assertFalse(overcommitted)
 
     @unittest.skipUnless(wp.is_cuda_available(), "MF-GS dispatch requires CUDA")
+    def test_mfgs_full_capacity_preserves_legacy_kernel(self):
+        """Keep the unsplit solve on the established full-capacity kernel."""
+        device = wp.get_device("cuda:0")
+        kernel = _get_pgs_solve_mf_gs_kernel(
+            64,
+            32,
+            9,
+            str(device.arch),
+            has_drive_rows=False,
+            has_dense_velocity_limit_rows=True,
+        )
+
+        self.assertEqual(kernel.key, "pgs_solve_mf_gs_64_32_9_current_drive0_densevlim1")
+
+    @unittest.skipUnless(wp.is_cuda_available(), "MF-GS dispatch requires CUDA")
     def test_mfgs_compact_dispatch_matches_full_capacity(self):
         """Match a full-capacity solve across compact, fallback, and overflow worlds."""
         device = wp.get_device("cuda:0")
