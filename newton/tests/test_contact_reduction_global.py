@@ -8,7 +8,13 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.geometry.contact_data import ContactData, make_contact_sort_key
+from newton._src.geometry.contact_data import (
+    CONTACT_NORMAL_OWNER_SHAPE_A,
+    CONTACT_NORMAL_OWNER_SHAPE_B,
+    ContactData,
+    make_contact_sort_key,
+    pack_contact_normal_owner,
+)
 from newton._src.geometry.contact_reduction import float_flip
 from newton._src.geometry.contact_reduction_global import (
     CLEAR_ACTIVE_ENTRY_PARALLEL_THRESHOLD,
@@ -586,12 +592,11 @@ def test_export_reduced_contacts_kernel(test, device):
     # Define a simple writer function
     @wp.func
     def test_writer(contact_data: ContactData, writer_data: ContactWriterData, output_index: int):
-        idx = wp.atomic_add(writer_data.contact_count, 0, 1)
-        if idx < writer_data.contact_max:
-            writer_data.contact_pair[idx] = wp.vec2i(contact_data.shape_a, contact_data.shape_b)
-            writer_data.contact_position[idx] = contact_data.contact_point_center
-            writer_data.contact_normal[idx] = contact_data.contact_normal_a_to_b
-            writer_data.contact_penetration[idx] = contact_data.contact_distance
+        if output_index < writer_data.contact_max:
+            writer_data.contact_pair[output_index] = wp.vec2i(contact_data.shape_a, contact_data.shape_b)
+            writer_data.contact_position[output_index] = contact_data.contact_point_center
+            writer_data.contact_normal[output_index] = contact_data.contact_normal_a_to_b
+            writer_data.contact_penetration[output_index] = contact_data.contact_distance
 
     # Create the export kernel
     export_kernel = create_export_reduced_contacts_kernel(test_writer)
@@ -695,6 +700,34 @@ def test_export_reduced_contacts_kernel(test, device):
                 1.0, 100 + slot, contact_id
             )
 
+        owner_a_fingerprint = pack_contact_normal_owner(1, CONTACT_NORMAL_OWNER_SHAPE_A)
+        owner_b_fingerprint = pack_contact_normal_owner(2, CONTACT_NORMAL_OWNER_SHAPE_B)
+        owner_a_contact = export_contact_to_buffer(
+            shape_a=13,
+            shape_b=113,
+            position=wp.vec3(30.0, 0.0, 0.0),
+            normal=wp.vec3(0.0, 1.0, 0.0),
+            depth=-0.01,
+            fingerprint=owner_a_fingerprint,
+            reducer_data=reducer_data,
+        )
+        owner_b_contact = export_contact_to_buffer(
+            shape_a=13,
+            shape_b=113,
+            position=wp.vec3(30.0, 0.0, 0.0),
+            normal=wp.vec3(0.0, 1.0, 0.0),
+            depth=-0.01,
+            fingerprint=owner_b_fingerprint,
+            reducer_data=reducer_data,
+        )
+        owner_entry_idx = hashtable_find_or_insert(
+            make_contact_key(13, 113, 0), reducer_data.ht_keys, reducer_data.ht_active_slots
+        )
+        reducer_data.ht_values[owner_entry_idx] = _make_contact_value_fast(1.0, owner_a_fingerprint, owner_a_contact)
+        reducer_data.ht_values[reducer_data.ht_capacity + owner_entry_idx] = _make_contact_value_fast(
+            1.0, owner_b_fingerprint, owner_b_contact
+        )
+
     wp.launch(store_roundoff_duplicate_winners_kernel, dim=1, inputs=[reducer_data], device=device)
 
     # Prepare output buffers
@@ -759,7 +792,7 @@ def test_export_reduced_contacts_kernel(test, device):
         # from the numerically equivalent winner pair and all seven geometrically
         # distinct contacts from one hashtable entry.
         num_exported = int(contact_count_out.numpy()[0])
-        test.assertEqual(num_exported, 13)
+        test.assertEqual(num_exported, 15)
         pairs = contact_pair_out.numpy()[:num_exported]
         positions = contact_position_out.numpy()[:num_exported]
         duplicate_pair = np.nonzero((pairs[:, 0] == 10) & (pairs[:, 1] == 110))[0]
@@ -769,6 +802,9 @@ def test_export_reduced_contacts_kernel(test, device):
         distinct_pair = np.nonzero((pairs[:, 0] == 12) & (pairs[:, 1] == 112))[0]
         test.assertEqual(len(distinct_pair), VALUES_PER_KEY)
         np.testing.assert_array_equal(np.sort(positions[distinct_pair, 0]), np.arange(20.0, 27.0, dtype=np.float32))
+
+        different_owner_pair = np.nonzero((pairs[:, 0] == 13) & (pairs[:, 1] == 113))[0]
+        test.assertEqual(len(different_owner_pair), 2)
 
     launch_and_verify()
     for _ in range(10):
@@ -884,8 +920,8 @@ def test_centered_basic_storage_and_reduction(test, device):
     test.assertLess(len(winners), 20, "Reduction should produce fewer winners than inputs")
 
 
-def test_centered_two_spatial_depths_prefers_inner_then_outer(test, device):
-    """Test that directional lanes prefer inner contacts and keep outer fallbacks."""
+def test_centered_two_spatial_depths_preserve_outer_support(test, device):
+    """Test that inner contacts do not suppress outer spatial support."""
 
     @wp.kernel
     def store_two_depth_contact_kernel(
@@ -907,6 +943,9 @@ def test_centered_two_spatial_depths_prefers_inner_then_outer(test, device):
             centered_position=position,
             inner_spatial_depth=0.0,
             outer_spatial_depth=0.1,
+            is_speculative_shell=False,
+            is_owned_endpoint=False,
+            swept_separation_lower_bound=1.0,
             position_local=position,
             aabb_lower_voxel=wp.vec3(-1.0, -1.0, -1.0),
             aabb_upper_voxel=wp.vec3(1.0, 1.0, 1.0),
@@ -934,11 +973,11 @@ def test_centered_two_spatial_depths_prefers_inner_then_outer(test, device):
             device=device,
         )
 
-        test.assertEqual(get_contact_count(reducer), 1, mode)
+        test.assertEqual(get_contact_count(reducer), 2, mode)
         winners = get_winning_contacts(reducer)
         fingerprints = {int(reducer.contact_fingerprints.numpy()[cid]) for cid in winners}
-        test.assertIn(1, fingerprints, f"Inner contact should win over an outer directional contact ({mode})")
-        test.assertNotIn(2, fingerprints, f"Outer directional contact should be a fallback only ({mode})")
+        test.assertIn(1, fingerprints, f"Inner contact should preserve minimum-clearance and voxel coverage ({mode})")
+        test.assertIn(2, fingerprints, f"Outer contact should preserve the full-gap spatial footprint ({mode})")
         test.assertEqual(get_active_slot_count(reducer), 2, f"Only normal and voxel entries should be active ({mode})")
 
         outer_reducer = GlobalContactReducer(capacity=200, device=device, deterministic=deterministic)
@@ -1586,8 +1625,8 @@ add_function_test(
 )
 add_function_test(
     TestGlobalContactReducer,
-    "test_centered_two_spatial_depths_prefers_inner_then_outer",
-    test_centered_two_spatial_depths_prefers_inner_then_outer,
+    "test_centered_two_spatial_depths_preserve_outer_support",
+    test_centered_two_spatial_depths_preserve_outer_support,
     devices=devices,
 )
 add_function_test(

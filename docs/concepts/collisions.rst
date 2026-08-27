@@ -1367,18 +1367,22 @@ A fixed ``gap`` uses the same detection distance regardless of motion. Speculati
 contacts retain a separated rigid-contact candidate when its contact points can close
 the separation before the next collision update.
 
-For a candidate with current contact-space separation ``d``, authored pair gap ``g``,
-normal-directed closing speed ``v``, collision-update horizon ``dt``, and configured
-limit ``e_max``, the effective admission distance is:
+For a candidate with current physical separation ``d``, authored pair gap ``g``,
+predicted physical separation ``d_end`` at collision-update horizon ``dt``, and
+configured limit ``e_max``, the contact is retained when:
 
 .. math::
 
-   g_{effective} = \max\left(g, \min\left(v\,dt, e_{max}\right)\right)
+   d \le g
+   \quad\text{or}\quad
+   \left(0 < d \le e_{max}\ \land\ d_{end} \le 0\right)
 
-The contact is kept when ``d <= g_effective``. Newton computes ``v`` from relative
-linear and angular velocity at the contact points. Common motion and receding motion
-therefore do not enlarge the gap. Broad phase uses a conservative motion bound; narrow
-phase applies the normal-directed test above.
+The fixed gap is an unconditional detection band, while ``e_max`` is a total
+physical-clearance cap rather than an extension added to ``g``. Newton predicts
+``d_end`` from constant world-space shape-origin velocities and exponential-map
+rotation of shape-fixed contact anchors. Shape-owned normals rotate with their owner.
+Broad phase uses a conservative motion bound; narrow phase applies the finite-rotation
+test above.
 
 Enable the feature with :class:`CollisionPipeline.SpeculativeContactConfig`:
 
@@ -1388,6 +1392,7 @@ Enable the feature with :class:`CollisionPipeline.SpeculativeContactConfig`:
         model,
         speculative_config=newton.CollisionPipeline.SpeculativeContactConfig(
             max_speculative_extension=0.1,
+            enforce_nonpenetration=True,
         ),
     )
 
@@ -1396,17 +1401,97 @@ Enable the feature with :class:`CollisionPipeline.SpeculativeContactConfig`:
 The per-call ``dt`` is the time [s] until the next planned
 :meth:`CollisionPipeline.collide` call, including skipped solver substeps, and is
 required when speculative contacts are enabled. ``dt=0.0`` uses only the fixed
-gaps. ``max_speculative_extension`` caps the velocity-based distance [m]; ``0.0``
+gaps. ``max_speculative_extension`` caps the physical prediction distance [m]; ``0.0``
 also disables velocity adaptation.
 
 Speculation changes when a contact is retained, not its geometry: contact points remain
 at their current separation rather than a predicted impact pose. Mesh and SDF contact
-reduction preserves representative close-clearance and early-impact candidates.
+reduction preserves the physical/current manifold and uses a separate bounded predictive
+manifold per shape pair. Six slots preserve future normal support, six preserve future
+lever-arm moment support, one retains the least swept separation, and one retains the
+nearest current separation. Positive candidates already inside the fixed gap also
+compete for this predictive manifold, even when their predicted end separation remains
+positive. To preserve disconnected or concave regions between those sampled supports,
+the final swept-crossing winner in each of 15 spatial voxels may also act as a horizon
+guard. Ordinary voxel winners that are not predicted to cross remain compliant.
+
+Primitive plane--box generation additionally ranks all eight vertices by swept
+separation before retaining four. Once the pair is already inside its authored fixed
+gap, a different vertex predicted to cross the plane may be retained beyond the scalar
+extension cap. This prevents an already active pair from losing a future support feature
+solely because the current face was selected first.
+
+When these contacts are passed to :class:`~solvers.SolverMuJoCo` with
+``use_mujoco_contacts=False``, the solver re-evaluates each retained candidate before
+every solver substep. A candidate retained by the predictive manifold is represented by a
+normal-only end-of-substep positive-gap inequality. The row remains force-free unless the
+coupled solve would cross the authored contact margin, including when another contact
+reverses the candidate's pre-solve velocity. With ``enforce_nonpenetration=True``, the
+solver also performs a strict-only correction solve using the candidate end velocity so
+finite rotation created during the substep cannot bypass the linear contact Jacobian.
+Once the retained row reaches or crosses the physical margin, authored contact compliance
+and friction take over; no penetration-distance ejection is added. Contacts outside the
+predictive manifold retain their authored response unchanged. The strict correction adds
+one constraint solve per solver substep while this mode is enabled; it does not add a
+collision refresh.
+
+For pairs of explicit mesh shapes with one movable participant attached to the direct child
+of a ``FREE`` joint and one static or kinematic anchor, strict nonpenetration also validates
+the reference and candidate poses directly against raw mesh geometry. Ownership is evaluated
+from the live ``shape_body`` and ``body_flags`` arrays: exactly one participant must be movable.
+Dynamic--dynamic, articulated-body, static--kinematic, and kinematic--kinematic mesh pairs
+retain the collision-time endpoint guards instead. Live dynamic/kinematic changes therefore
+cannot leave a pair suppressed by a stale construction-time role mask. This also lets an
+active contact manifold change raw triangle features without treating that feature change
+as a new obstacle crossing. The raw-mesh oracle detects signed vertex containment and
+transverse authored-edge/surface crossings without depending on a texture SDF or the reduced
+contact manifold. Between those poses it
+certifies one additional motion class: pure translation with unchanged source orientation
+against a stationary target, using raw triangle BVH traversal and continuous
+separating-axis intervals. Before that traversal, a fixed 21-axis swept-OBB certificate
+uses the builder-computed collision bounds to clear a pair only when one axis proves the
+complete swept bounds stay separated. Exact motion tangent to both parallel triangle
+planes is also non-crossing; otherwise a positive-duration raw-triangle overlap fails
+closed. This avoids a geometry-size-dependent whole-mesh projection fallback. Motions
+outside that class are not treated as general continuous collision detection; when their
+conservative swept triangle envelopes overlap, the solver fails closed at the reference
+pose.
+
+The raw-mesh oracle is pipeline-owned and activated lazily when
+:meth:`~solvers.SolverMuJoCo.bind_collision_pipeline` claims an eligible strict external-contact
+pipeline. Bind before the first strict :meth:`CollisionPipeline.collide` call, solver step, or
+graph capture. Before binding, and for a dynamic-only pipeline with no eligible raw-mesh domain,
+ordinary endpoint guards remain enabled and no raw contact is suppressed. Once activated, the
+pipeline has one solver owner; a contact buffer whose raw guards were suppressed is rejected by
+an unbound solver or by a solver bound to another pipeline.
+
+An oracle-owned pair must be raw-clear at the solver composition pose. Exact signed-vertex or
+authored-edge overlap at that reference pose is classified as reference-infeasible: candidate and
+sweep materialization are skipped and the solver fails closed rather than treating the existing
+penetration as an allowable floor. Reset and state-injection code must therefore reject or
+resample such raw overlap before stepping. Each query clears and recomputes this status from the
+current composition pose. Candidate-pair, endpoint-pair, and retained-guard buffers remain fixed
+capacity; any overflow or unclassifiable traversal also fails the affected world closed.
 
 .. note::
 
    Speculative contacts are opt-in and currently apply to rigid, non-hydroelastic
-   contacts. They do not compute a time of impact or advance bodies to impact.
+   contacts. They do not compute a time of impact or advance bodies to impact. The
+   configured ``max_speculative_extension`` must cover the largest expected normal
+   closing distance needed to discover an initially separated shape pair; a pair outside
+   this cap cannot be enforced by a downstream solver. Within an already active
+   plane--box pair, rotational feature switching is handled as described above. Other
+   changing closest features can invalidate the constant-velocity contact prediction, so
+   applications requiring strict continuous collision detection should update collision
+   geometry more frequently.
+
+   The mesh validation above does not distinguish every coplanar or fully coincident
+   surface configuration from legitimate resting contact. It is therefore not a general
+   mesh-volume intersection oracle or a replacement for collision refreshes.
+
+   Velocity-adapted external contacts in :class:`~solvers.SolverMuJoCo` support the
+   Euler, implicit, and implicit-fast integrators. RK4 intermediate stages cannot refresh
+   external contact geometry and are therefore rejected for this mode.
 
 .. _Common Patterns:
 

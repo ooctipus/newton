@@ -41,6 +41,12 @@ KINEMATIC_ARMATURE = 1.0e10
 MJ_MINMU = 1.0e-5
 """MuJoCo's minimum friction coefficient clamp."""
 
+MJ_MAXIMP = 0.9999
+"""MuJoCo's maximum constraint impedance clamp."""
+
+MJ_MINIMP = 0.0001
+"""MuJoCo's minimum constraint impedance clamp."""
+
 MJ_MINVAL = 2.220446049250313e-16
 """MuJoCo's minimum positive scalar guard value."""
 

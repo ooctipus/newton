@@ -1153,6 +1153,88 @@ class TestSolverCoupledBasic(unittest.TestCase):
             self.assertIs(reused, filtered)
             self.assertEqual(reused.contact_matching_mode, mode)
 
+    def test_entry_contacts_preserves_contact_provenance(self):
+        """Copy and overwrite predictive and strict-guard provenance in a reused entry buffer."""
+        coupled = SolverCoupled(
+            model=self.model,
+            entries=[
+                SolverCoupled.Entry(
+                    name="A",
+                    solver=SolverSemiImplicit,
+                    bodies=[0],
+                    shapes=[0],
+                )
+            ],
+        )
+        contacts = newton.Contacts(1, 0, device="cpu")
+        contacts.rigid_contact_count.assign([1])
+        contacts.rigid_contact_shape0.assign([0])
+        contacts.rigid_contact_shape1.assign([0])
+        contacts.rigid_contact_is_predictive.assign([1])
+        contacts.rigid_contact_is_strict_guard.assign([1])
+        contacts.contact_generation.assign([1])
+        contacts._velocity_speculation_active = True
+
+        filtered = coupled.entry_contacts("A", contacts)
+        self.assertIsNotNone(filtered)
+        self.assertEqual(int(filtered.rigid_contact_is_predictive.numpy()[0]), 1)
+        self.assertEqual(int(filtered.rigid_contact_is_strict_guard.numpy()[0]), 1)
+        self.assertTrue(filtered._velocity_speculation_active)
+
+        contacts.rigid_contact_is_predictive.zero_()
+        contacts.rigid_contact_is_strict_guard.zero_()
+        contacts.contact_generation.assign([2])
+        reused = coupled.entry_contacts("A", contacts)
+        self.assertIs(reused, filtered)
+        self.assertEqual(int(reused.rigid_contact_is_predictive.numpy()[0]), 0)
+        self.assertEqual(int(reused.rigid_contact_is_strict_guard.numpy()[0]), 0)
+
+    def test_entry_contacts_preserve_speculative_barrier_behavior(self):
+        """Prevent tunneling after speculative contacts pass through an entry buffer."""
+        outer_dt = 0.03
+        sphere_radius = 0.05
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        builder.rigid_gap = 0.0
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.49)))
+        sphere = builder.add_shape_sphere(body, radius=sphere_radius)
+        builder.body_qd[body] = (0.0, 0.0, -20.0, 0.0, 0.0, 0.0)
+        plane = builder.add_shape_plane(width=0.0, length=0.0)
+        model = builder.finalize()
+
+        state_in, state_out = model.state(), model.state()
+        joint_qd = state_in.joint_qd.numpy()
+        joint_qd[:] = 0.0
+        joint_qd[2] = -20.0
+        state_in.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        pipeline = newton.CollisionPipeline(
+            model,
+            broad_phase="nxn",
+            speculative_config=newton.CollisionPipeline.SpeculativeContactConfig(max_speculative_extension=0.75),
+        )
+        contacts = pipeline.contacts()
+        pipeline.collide(state_in, contacts, dt=outer_dt)
+        try:
+            coupled = SolverCoupled(
+                model=model,
+                entries=[
+                    SolverCoupled.Entry(
+                        name="mujoco",
+                        solver=lambda view: SolverMuJoCo(view, use_mujoco_contacts=False, nconmax=32, njmax=128),
+                        bodies=[body],
+                        joints=range(model.joint_count),
+                        shapes=[sphere, plane],
+                        substeps=8,
+                    )
+                ],
+            )
+        except ImportError as exc:
+            self.skipTest(f"MuJoCo or dependencies are unavailable: {exc}")
+
+        coupled.step(state_in, state_out, control=None, contacts=contacts, dt=outer_dt)
+
+        self.assertAlmostEqual(float(state_out.body_q.numpy()[body, 2]), sphere_radius, delta=5.0e-7)
+
     def test_configure_view_applies_after_compaction(self):
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         cloth_body = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))

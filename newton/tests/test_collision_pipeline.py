@@ -305,6 +305,119 @@ class TestCollisionPipeline(unittest.TestCase):
         self.assertEqual(disabled_contacts.soft_contact_max, 0)
         self.assertEqual(int(disabled_contacts.soft_contact_count.numpy()[0]), 0)
 
+    def test_mesh_nonpenetration_query_preserves_solver_claim_ownership(self):
+        """Check exact mesh overlap without claiming or suppressing solver contacts."""
+        for device in get_test_devices():
+            with self.subTest(device=device):
+                source_mesh = newton.Mesh.create_box(
+                    0.2,
+                    0.2,
+                    0.2,
+                    duplicate_vertices=False,
+                    compute_inertia=False,
+                )
+                target_mesh = newton.Mesh.create_box(
+                    0.5,
+                    0.5,
+                    0.5,
+                    duplicate_vertices=False,
+                    compute_inertia=False,
+                )
+                builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+                source_body = builder.add_body(xform=wp.transform(wp.vec3(1.0, 0.0, 0.0)))
+                builder.add_shape_mesh(source_body, mesh=source_mesh)
+                builder.add_shape_mesh(-1, mesh=target_mesh)
+                model = builder.finalize(device=device)
+                pipeline = newton.CollisionPipeline(
+                    model,
+                    broad_phase="nxn",
+                    reduce_contacts=False,
+                    speculative_config=newton.CollisionPipeline.SpeculativeContactConfig(
+                        max_speculative_extension=0.05,
+                        enforce_nonpenetration=True,
+                    ),
+                )
+                state = model.state()
+                feasible = wp.empty(model.world_count, dtype=wp.bool, device=device)
+
+                pipeline.check_mesh_nonpenetration(state, feasible)
+
+                self.assertTrue(bool(feasible.numpy()[0]))
+                query_oracle = pipeline._strict_nonpenetration_oracle
+                self.assertIsNotNone(query_oracle)
+                self.assertIsNone(pipeline._strict_nonpenetration_claim_owner)
+                self.assertIsNone(pipeline._strict_nonpenetration_contact_token)
+                self.assertIsNone(pipeline._strict_nonpenetration_oracle_eligible_shape)
+
+                contacts = pipeline.contacts()
+                pipeline.collide(state, contacts, dt=0.01)
+                self.assertIsNone(pipeline._strict_nonpenetration_claim_owner)
+
+                body_q = state.body_q.numpy()
+                body_q[source_body, :3] = 0.0
+                state.body_q.assign(body_q)
+                pipeline.check_mesh_nonpenetration(state, feasible)
+
+                self.assertFalse(bool(feasible.numpy()[0]))
+                self.assertIsNone(pipeline._strict_nonpenetration_claim_owner)
+                owner = object()
+                claimed_oracle, token = pipeline._claim_strict_nonpenetration_oracle(owner, allow_oracle=True)
+                self.assertIs(claimed_oracle, query_oracle)
+                self.assertIs(token, owner)
+                self.assertIs(pipeline._strict_nonpenetration_claim_owner, owner)
+                self.assertIs(pipeline._strict_nonpenetration_oracle_eligible_shape, query_oracle._eligible_shape)
+
+    def test_mesh_nonpenetration_query_without_eligible_mesh_pairs_is_feasible(self):
+        """Treat an empty exact-query domain as feasible without allocating an oracle."""
+        builder = newton.ModelBuilder()
+        body = builder.add_body()
+        builder.add_shape_sphere(body, radius=0.1)
+        model = builder.finalize(device="cpu")
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+        feasible = wp.full(model.world_count, False, dtype=wp.bool, device=model.device)
+
+        pipeline.check_mesh_nonpenetration(model.state(), feasible)
+
+        self.assertTrue(bool(feasible.numpy()[0]))
+        self.assertIsNone(pipeline._strict_nonpenetration_oracle)
+        with self.assertRaisesRegex(ValueError, "shape"):
+            pipeline.check_mesh_nonpenetration(
+                model.state(),
+                wp.empty(model.world_count + 1, dtype=wp.bool, device=model.device),
+            )
+
+    def test_mesh_nonpenetration_query_with_zero_pair_capacity_fails_closed(self):
+        """Reject an eligible exact-query domain when its mesh-pair buffer is unavailable."""
+        for device in get_test_devices():
+            with self.subTest(device=device):
+                source_mesh = newton.Mesh.create_box(
+                    0.2,
+                    0.2,
+                    0.2,
+                    duplicate_vertices=False,
+                    compute_inertia=False,
+                )
+                target_mesh = newton.Mesh.create_box(
+                    0.5,
+                    0.5,
+                    0.5,
+                    duplicate_vertices=False,
+                    compute_inertia=False,
+                )
+                builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+                source_body = builder.add_body(xform=wp.transform(wp.vec3(1.0, 0.0, 0.0)))
+                builder.add_shape_mesh(source_body, mesh=source_mesh)
+                builder.add_shape_mesh(-1, mesh=target_mesh)
+                model = builder.finalize(device=device)
+                pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+                pipeline.narrow_phase.max_mesh_mesh_pairs = 0
+                feasible = wp.full(model.world_count, True, dtype=wp.bool, device=device)
+
+                pipeline.check_mesh_nonpenetration(model.state(), feasible)
+
+                self.assertFalse(bool(feasible.numpy()[0]))
+                self.assertIsNone(pipeline._strict_nonpenetration_oracle)
+
 
 def test_collision_pipeline_first_call_capture(test, device):
     builder = newton.ModelBuilder()
@@ -617,7 +730,7 @@ def test_mesh_sdf_voxel_tolerance_preserves_inner_contact_coverage(test, device)
     # survive. With an exact zero-width inner tier, only two survive and the
     # positive-X representative flickers into the gap-only outer tier.
     near_margin_points = top_face_points[top_face_points[:, 2] < 0.501]
-    test.assertEqual(len(near_margin_points), 3)
+    test.assertGreaterEqual(len(near_margin_points), 3)
     test.assertTrue(np.any(near_margin_points[:, 0] > 0.09))
 
 
@@ -626,6 +739,103 @@ add_function_test(
     "test_mesh_sdf_voxel_tolerance_preserves_inner_contact_coverage",
     test_mesh_sdf_voxel_tolerance_preserves_inner_contact_coverage,
     devices=devices,
+)
+
+
+def test_mesh_sdf_flat_edge_retains_rotational_footprint(test, device):
+    """Retain exact carrier vertices when a flat edge has no unique SDF minimum."""
+    held_half_extents = np.array([0.060, 0.025, 0.020], dtype=np.float32)
+    board_half_extents = np.array([0.300, 0.300, 0.020], dtype=np.float32)
+    held_height = 0.041
+    held_mesh = newton.Mesh.create_box(*held_half_extents, duplicate_vertices=False, compute_inertia=False)
+    board_mesh = newton.Mesh.create_box(*board_half_extents, duplicate_vertices=False, compute_inertia=False)
+    held_mesh.build_sdf(max_resolution=128, device=device)
+    board_mesh.build_sdf(max_resolution=128, device=device)
+
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, held_height)))
+    cfg = newton.ModelBuilder.ShapeConfig(density=1000.0, gap=0.01, margin=0.0)
+    held_shape = builder.add_shape_mesh(body, mesh=held_mesh, cfg=cfg)
+    builder.add_shape_mesh(-1, mesh=board_mesh, cfg=cfg)
+    model = builder.finalize(device=device)
+
+    corners = np.array(
+        [
+            [x, y, -held_half_extents[2]]
+            for x in (-held_half_extents[0], held_half_extents[0])
+            for y in (-held_half_extents[1], held_half_extents[1])
+        ],
+        dtype=np.float32,
+    )
+    axis = np.array([1.0, 0.4, 0.0], dtype=np.float64)
+    axis /= np.linalg.norm(axis)
+    angle = 0.05
+    cross = np.array([[0.0, -axis[2], axis[1]], [axis[2], 0.0, -axis[0]], [-axis[1], axis[0], 0.0]])
+    rotation = np.eye(3) * np.cos(angle) + (1.0 - np.cos(angle)) * np.outer(axis, axis) + np.sin(angle) * cross
+    clearances = held_height + (corners @ rotation.T)[:, 2] - board_half_extents[2]
+    worst_corner = int(np.argmin(clearances))
+    true_clearance = float(clearances[worst_corner])
+    test.assertLess(true_clearance, -0.001)
+
+    for reduce_contacts in (False, True):
+        with test.subTest(reduce_contacts=reduce_contacts):
+            state = model.state()
+            pipeline = newton.CollisionPipeline(
+                model,
+                broad_phase="nxn",
+                reduce_contacts=reduce_contacts,
+                deterministic=True,
+                rigid_contact_max=128,
+                max_triangle_pairs=4096,
+            )
+            if reduce_contacts:
+                test.assertTrue(pipeline.narrow_phase._use_mesh_sdf_split)
+            contacts = pipeline.contacts()
+            pipeline.collide(state, contacts)
+
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            test.assertGreater(count, 0)
+            shape0 = contacts.rigid_contact_shape0.numpy()[:count]
+            shape1 = contacts.rigid_contact_shape1.numpy()[:count]
+            point0 = contacts.rigid_contact_point0.numpy()[:count]
+            point1 = contacts.rigid_contact_point1.numpy()[:count]
+            held_indices = []
+            held_points = []
+            for contact_idx in range(count):
+                if shape0[contact_idx] == held_shape:
+                    held_indices.append(contact_idx)
+                    held_points.append(point0[contact_idx])
+                elif shape1[contact_idx] == held_shape:
+                    held_indices.append(contact_idx)
+                    held_points.append(point1[contact_idx])
+            held_points = np.asarray(held_points)
+            test.assertGreater(len(held_points), 0)
+
+            corner_contact_indices = []
+            for corner in corners:
+                corner_distances = np.linalg.norm(held_points - corner, axis=1)
+                nearest = int(np.argmin(corner_distances))
+                test.assertLess(float(corner_distances[nearest]), 2.0e-5)
+                corner_contact_indices.append(held_indices[nearest])
+
+            body_q = state.body_q.numpy()
+            half_angle = 0.5 * angle
+            body_q[body, :3] = (0.0, 0.0, held_height)
+            body_q[body, 3:6] = axis * np.sin(half_angle)
+            body_q[body, 6] = np.cos(half_angle)
+            state.body_q.assign(body_q)
+            distance = wp.empty(contacts.rigid_contact_max, dtype=float, device=device)
+            newton.eval_rigid_contact_kinematics(model, state, contacts, out_distance=distance)
+            retained_clearance = float(distance.numpy()[corner_contact_indices[worst_corner]])
+            test.assertLessEqual(retained_clearance, true_clearance + 2.0e-4)
+
+
+add_function_test(
+    TestCollisionPipeline,
+    "test_mesh_sdf_flat_edge_retains_rotational_footprint",
+    test_mesh_sdf_flat_edge_retains_rotational_footprint,
+    devices=get_cuda_test_devices(),
+    check_output=False,
 )
 
 

@@ -34,6 +34,20 @@ from ...sim import (
     StateFlags,
 )
 from ...sim.articulation import eval_articulation_fk, eval_fk
+from ...sim.contact_oracle import (
+    CONTACT_ORACLE_CAPACITY,
+    CONTACT_ORACLE_INCOMPLETE,
+    CONTACT_ORACLE_REFERENCE_INFEASIBLE,
+    CONTACT_ORACLE_SWEEP_INCOMPLETE,
+    CONTACT_ORACLE_VIOLATION,
+    RIGID_BODY_PATH_BOUNDED,
+    RIGID_BODY_PATH_CONSTANT_TWIST,
+    RIGID_BODY_PATH_LINEAR_TRANSLATION,
+    RIGID_BODY_PATH_STATIONARY,
+    RIGID_BODY_PATH_UNKNOWN,
+    RigidBodyPathCertificate,
+    RigidContactOracle,
+)
 from ...sim.contacts import GENERATION_SENTINEL as _GENERATION_SENTINEL
 from ...sim.graph_coloring import color_graph, plot_graph
 from ...utils import topological_sort
@@ -68,12 +82,18 @@ from .kernels import (
     MeshVariantBody,
     MeshVariantShape,
     _snapshot_nacon_count,
+    accumulate_constraint_nnz_kernel,
     apply_body_sleep_override_kernel,
     apply_mjc_body_f_kernel,
     apply_mjc_control_kernel,
     apply_mjc_free_joint_f_to_body_f_kernel,
     apply_mjc_qfrc_kernel,
+    apply_strict_contact_endpoint_reserve_kernel,
+    apply_velocity_contact_barrier_kernel,
+    build_free_body_path_certificate_kernel,
     build_ref_q_kernel,
+    capture_strict_endpoint_candidate_kernel,
+    clear_rejected_strict_warmstart_kernel,
     convert_mj_coords_to_warp_kernel,
     convert_newton_contacts_to_mjwarp_kernel,
     convert_qfrc_actuator_from_mj_kernel,
@@ -81,17 +101,26 @@ from .kernels import (
     convert_solref,
     convert_warp_coords_to_mj_kernel,
     copy_qpos_and_detect_tree_change_kernel,
+    count_contact_constraint_requirements_kernel,
+    count_mjwarp_contact_entries_kernel,
     create_convert_mjw_contacts_to_newton_kernel,
     create_inverse_shape_mapping_kernel,
+    deactivate_unsafe_strict_contacts_kernel,
     eval_mujoco_coupling_effective_mass_block_kernel,
     eval_mujoco_coupling_effective_mass_kernel,
     eval_mujoco_coupling_gravity_acceleration_kernel,
+    latch_strict_endpoint_status_kernel,
+    mask_strict_endpoint_qacc_kernel,
+    preflight_overlay_constraint_capacity_kernel,
+    preflight_strict_base_constraint_capacity_kernel,
+    reassert_strict_overflow_kernel,
     recompute_jnt_eq_anchor1_kernel,
     repeat_array_kernel,
     reset_joint_state_kernel,
     reset_sleeping_state_kernel,
     reset_world_buffers_kernel,
     restore_sleeping_state_kernel,
+    restore_strict_endpoint_candidate_kernel,
     set_mesh_variant_index_kernel,
     set_selected_body_sleep_override_kernel,
     sync_qpos0_kernel,
@@ -125,10 +154,29 @@ from .kernels import (
     wake_selected_tree_kernel,
 )
 
+_STRICT_NONPENETRATION_ORACLE_UNBOUND = object()
+_STRICT_ORACLE_REFINEMENT_ROUNDS = 4
+_STRICT_ENDPOINT_REJECT_STATUS = (
+    CONTACT_ORACLE_VIOLATION
+    | CONTACT_ORACLE_INCOMPLETE
+    | CONTACT_ORACLE_CAPACITY
+    | CONTACT_ORACLE_REFERENCE_INFEASIBLE
+    | CONTACT_ORACLE_SWEEP_INCOMPLETE
+)
+_STRICT_ENDPOINT_PERSISTENT_STATUS = CONTACT_ORACLE_CAPACITY | CONTACT_ORACLE_REFERENCE_INFEASIBLE
+
+# Avoid importing the optional MuJoCo package solely for this enum value.
+_MJ_INTEGRATOR_RK4 = 1
+_MJ_INTEGRATOR_IMPLICIT = 2
+_MJ_INTEGRATOR_IMPLICITFAST = 3
+_CONTACT_ENTRY_PREFLIGHT_BLOCK_DIM = 256
+
 if TYPE_CHECKING:
     from mujoco import MjData, MjModel
     from mujoco_warp import Data as MjWarpData
     from mujoco_warp import Model as MjWarpModel
+
+    from ...sim.collide import CollisionPipeline
 else:
     MjModel = object
     MjData = object
@@ -565,6 +613,45 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         shapes: wp.array2d[MeshVariantShape]
         bodies: wp.array[MeshVariantBody]
         variant_ids: wp.array[wp.int32]
+
+    @dataclass
+    class _StrictEndpointCandidate:
+        """Persistent reduced-coordinate and Newton FK workspace for strict endpoint queries."""
+
+        qpos: wp.array2d[wp.float32]
+        qvel: wp.array2d[wp.float32]
+        qacc: wp.array2d[wp.float32]
+        last_certified_qacc: wp.array2d[wp.float32]
+        last_certified_world: wp.array[wp.int32]
+        joint_q: wp.array[wp.float32]
+        joint_qd: wp.array[wp.float32]
+        body_q: wp.array[wp.transform]
+        body_qd: wp.array[wp.spatial_vector]
+        path: RigidBodyPathCertificate
+        mass: wp.array2d[wp.float32]
+        q_deriv: wp.array2d[wp.float32]
+        q_ld: wp.array2d[wp.float32]
+        q_l_diag_inv: wp.array2d[wp.float32]
+        damp_deriv: wp.array2d[wp.float32]
+        actuator_derivative_velocity: wp.array2d[wp.float32]
+        rne_dcvel: wp.array | None
+        rne_dcdof_dot: wp.array | None
+        rne_dcacc: wp.array | None
+        rne_dcfrcbody: wp.array | None
+
+    @dataclass
+    class _StrictOracleGuardState:
+        """Conversion workspace for the cumulative strict-oracle contact set."""
+
+        contacts: Contacts
+        tid_to_cid: wp.array[wp.int32]
+        horizon_state: wp.array[wp.uint8]
+        last_contact_generation: wp.array[wp.int32]
+        nacon_count: wp.array[wp.int32]
+        required_contact_entries: wp.array[wp.int32]
+        owner_rotation_at_generation: wp.array[wp.quat]
+        overlay_rows: wp.array[wp.int32]
+        overlay_nnz: wp.array[wp.int32]
 
     # Class variables to cache the imported modules
     _mujoco = None
@@ -4077,8 +4164,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         # notify_model_changed() may invalidate them during conversion. The
         # contact map is allocated below once the converted capacity is known.
         self._contact_tid_to_cid: wp.array[wp.int32] | None = None
+        self._contact_horizon_state: wp.array[wp.uint8] | None = None
         self._last_contact_generation = wp.full(1, _GENERATION_SENTINEL, dtype=wp.int32, device=self.device)
         self._last_nacon_count = wp.zeros(1, dtype=wp.int32, device=self.device)
+        self._required_mjwarp_contact_entries = wp.zeros(1, dtype=wp.int32, device=self.device)
+        self._zero_mjwarp_contact_entries = wp.zeros(1, dtype=wp.int32, device=self.device)
+        self._contact_owner_rotation_at_generation = wp.zeros(model.body_count, dtype=wp.quat, device=self.device)
         # Track the Contacts instance and its capacity, plus the MJWarp
         # naconmax used during the last full pass.  Any change to these
         # invariants invalidates the cached tid_to_cid mapping because the
@@ -4090,6 +4181,20 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self._last_contacts_id: int | None = None
         self._last_rigid_contact_max: int | None = None
         self._last_naconmax: int | None = None
+        self._last_velocity_speculation_active: bool | None = None
+        self._last_strict_nonpenetration_active: bool | None = None
+        self._strict_collision_pipeline: CollisionPipeline | object = _STRICT_NONPENETRATION_ORACLE_UNBOUND
+        self._strict_nonpenetration_claim_owner = object()
+        self._strict_nonpenetration_contact_token: object | None = None
+        self._strict_nonpenetration_oracle: RigidContactOracle | object | None = _STRICT_NONPENETRATION_ORACLE_UNBOUND
+        self._strict_nonpenetration_separation_tolerance = 0.0
+        self._strict_endpoint_candidate: SolverMuJoCo._StrictEndpointCandidate | None = None
+        self._strict_nonpenetration_unsafe_world: wp.array[wp.int32] | None = None
+        self._strict_nonpenetration_overflow: wp.array[wp.int32] | None = None
+        self._strict_oracle_guard_state: SolverMuJoCo._StrictOracleGuardState | None = None
+        self._strict_contact_endpoint_reserve: wp.array[wp.float32] | None = None
+        self._strict_base_constraint_rows: wp.array[wp.int32] | None = None
+        self._strict_base_constraint_nnz: wp.array[wp.int32] | None = None
 
         # One-shot dedup for ``_update_solref_from_invweight0``'s authored
         # ``mujoco.solreflimit`` domain validator. Re-armed by
@@ -4132,12 +4237,228 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self._mesh_variant_asset_names.clear()
         if not use_mujoco_cpu and not use_mujoco_contacts:
             self._contact_tid_to_cid = wp.full(self.mjw_data.naconmax, -1, dtype=wp.int32, device=self.device)
+            self._contact_horizon_state = wp.zeros(self.mjw_data.naconmax, dtype=wp.uint8, device=self.device)
+            self._strict_nonpenetration_unsafe_world = wp.zeros(
+                self.mjw_data.nworld,
+                dtype=wp.int32,
+                device=self.model.device,
+            )
+            self._strict_nonpenetration_overflow = wp.zeros(
+                self.mjw_data.nworld,
+                dtype=wp.int32,
+                device=self.model.device,
+            )
+            self._strict_base_constraint_rows = wp.zeros(
+                self.mjw_data.nworld,
+                dtype=wp.int32,
+                device=self.model.device,
+            )
+            self._strict_base_constraint_nnz = wp.zeros(
+                self.mjw_data.nworld,
+                dtype=wp.int32,
+                device=self.model.device,
+            )
         self._initial_model_sync = False
         self.update_data_interval = update_data_interval
         self._step = 0
 
         if self.mjw_model is not None:
             self.mjw_model.opt.run_collision_detection = use_mujoco_contacts
+
+    def bind_collision_pipeline(self, pipeline: CollisionPipeline) -> None:
+        """Bind the collision pipeline used by strict external contacts.
+
+        Binding must happen before the pipeline produces strict contacts, before the first simulation step, and
+        before graph capture. It claims and lazily activates any pipeline-owned raw-mesh oracle. Rebinding the
+        identical pipeline is a no-op so contact-pipeline initialization can be safely re-entered.
+
+        Args:
+            pipeline: Collision pipeline that owns the contacts passed to :meth:`step`.
+
+        Raises:
+            RuntimeError: If binding happens after stepping or attempts to replace an existing binding.
+            ValueError: If the pipeline does not belong to this solver's exact model and device.
+        """
+        if self._strict_collision_pipeline is not _STRICT_NONPENETRATION_ORACLE_UNBOUND:
+            if self._strict_collision_pipeline is pipeline:
+                return
+            raise RuntimeError("The collision pipeline is immutable after its first binding.")
+        if self._step != 0:
+            raise RuntimeError("The collision pipeline must be bound before the first simulation step.")
+        if pipeline.model is not self.model:
+            raise ValueError("The collision pipeline must belong to the solver's exact Newton model.")
+        if pipeline.device != self.model.device:
+            raise ValueError("The collision pipeline must reside on the solver model device.")
+
+        oracle, contact_token = pipeline._claim_strict_nonpenetration_oracle(
+            self._strict_nonpenetration_claim_owner,
+            allow_oracle=not (self.use_mujoco_cpu or self.mjw_model.opt.run_collision_detection),
+        )
+        self._bind_strict_nonpenetration_oracle(oracle)
+        self._strict_nonpenetration_contact_token = contact_token
+        self._strict_collision_pipeline = pipeline
+
+    def _validate_strict_nonpenetration_contacts(self, contacts: Contacts) -> None:
+        """Reject raw-oracle-suppressed contacts outside their solver claim."""
+        token = contacts._strict_nonpenetration_owner_token
+        if token is None:
+            return
+        if token is not self._strict_nonpenetration_contact_token:
+            if self._strict_collision_pipeline is _STRICT_NONPENETRATION_ORACLE_UNBOUND:
+                raise RuntimeError(
+                    "Strict contacts with suppressed raw-mesh guards require bind_collision_pipeline() "
+                    "on the consuming solver before collide() and step()."
+                )
+            raise RuntimeError("Strict contacts belong to a different collision-pipeline solver claim.")
+
+    def _bind_strict_nonpenetration_oracle(self, oracle: RigidContactOracle | None) -> None:
+        """Bind pipeline-owned nonpenetration state after validating its solver contract."""
+        if self._strict_nonpenetration_oracle is not _STRICT_NONPENETRATION_ORACLE_UNBOUND:
+            if self._strict_nonpenetration_oracle is oracle:
+                return
+            raise RuntimeError("The strict nonpenetration oracle is immutable after its first binding.")
+        if self._step != 0:
+            raise RuntimeError("The strict nonpenetration oracle must be bound before the first simulation step.")
+        if oracle is not None and (self.use_mujoco_cpu or self.mjw_model.opt.run_collision_detection):
+            raise ValueError("A strict nonpenetration oracle requires external contacts on the MuJoCo Warp backend.")
+
+        if oracle is None:
+            self._strict_nonpenetration_oracle = None
+            return
+        if oracle.model_token is not self.model:
+            raise ValueError("The strict nonpenetration oracle must belong to the solver's exact Newton model.")
+        expected_topology = (self.model.body_count, self.model.shape_count, self.model.world_count)
+        oracle_topology = (oracle.body_count, oracle.shape_count, oracle.world_count)
+        if oracle_topology != expected_topology:
+            raise ValueError(
+                "Strict nonpenetration oracle topology does not match the solver model "
+                f"({oracle_topology} != {expected_topology})."
+            )
+        guard_contacts = oracle.guard_contacts
+        if oracle.device != self.model.device or guard_contacts.rigid_contact_count.device != self.model.device:
+            raise ValueError(
+                "The strict nonpenetration oracle and its guard contacts must reside on the solver model device."
+            )
+        if oracle.world_status.device != self.model.device:
+            raise ValueError("The strict nonpenetration oracle world_status must reside on the solver model device.")
+        if oracle.world_status.shape[0] != self.mjw_data.nworld:
+            raise ValueError(
+                "Strict nonpenetration oracle world_status must match the MuJoCo Warp world count "
+                f"({oracle.world_status.shape[0]} != {self.mjw_data.nworld})."
+            )
+        if oracle.certified_path_fraction.device != self.model.device:
+            raise ValueError(
+                "The strict nonpenetration oracle certified_path_fraction must reside on the solver model device."
+            )
+        if oracle.certified_path_fraction.shape[0] != self.mjw_data.nworld:
+            raise ValueError(
+                "Strict nonpenetration oracle certified_path_fraction must match the MuJoCo Warp world count "
+                f"({oracle.certified_path_fraction.shape[0]} != {self.mjw_data.nworld})."
+            )
+        separation_tolerance = oracle.separation_tolerance
+        if not math.isfinite(separation_tolerance) or separation_tolerance < 0.0:
+            raise ValueError("Strict nonpenetration oracle separation_tolerance must be finite and non-negative.")
+
+        self._strict_nonpenetration_oracle = oracle
+        self._strict_nonpenetration_separation_tolerance = separation_tolerance
+        candidate_body_q = wp.empty(self.model.body_count, dtype=wp.transform, device=self.model.device)
+        candidate_path = RigidBodyPathCertificate(
+            endpoint_body_q=candidate_body_q,
+            origin_path_length=wp.zeros(self.model.body_count, dtype=wp.float32, device=self.model.device),
+            angular_path_length=wp.zeros(self.model.body_count, dtype=wp.float32, device=self.model.device),
+            motion_kind=wp.full(
+                self.model.body_count,
+                RIGID_BODY_PATH_UNKNOWN,
+                dtype=wp.uint8,
+                device=self.model.device,
+            ),
+        )
+        self._strict_endpoint_candidate = self._StrictEndpointCandidate(
+            qpos=wp.empty_like(self.mjw_data.qpos),
+            qvel=wp.empty_like(self.mjw_data.qvel),
+            qacc=wp.empty_like(self.mjw_data.qacc),
+            last_certified_qacc=wp.empty_like(self.mjw_data.qacc),
+            last_certified_world=wp.zeros(
+                self.mjw_data.nworld,
+                dtype=wp.int32,
+                device=self.model.device,
+            ),
+            joint_q=wp.empty(self.model.joint_coord_count, dtype=wp.float32, device=self.model.device),
+            joint_qd=wp.empty(self.model.joint_dof_count, dtype=wp.float32, device=self.model.device),
+            body_q=candidate_body_q,
+            body_qd=wp.empty(self.model.body_count, dtype=wp.spatial_vector, device=self.model.device),
+            path=candidate_path,
+            mass=wp.empty_like(self.mjw_data.M),
+            q_deriv=wp.empty((self.mjw_data.nworld, self.mjw_model.nC), dtype=wp.float32, device=self.model.device),
+            q_ld=wp.empty_like(self.mjw_data.qLD),
+            q_l_diag_inv=wp.empty(
+                (self.mjw_data.nworld, self.mjw_model.nv),
+                dtype=wp.float32,
+                device=self.model.device,
+            ),
+            damp_deriv=wp.empty(
+                (self.mjw_data.nworld, self.mjw_model.nv),
+                dtype=wp.float32,
+                device=self.model.device,
+            ),
+            actuator_derivative_velocity=wp.empty(
+                (self.mjw_data.nworld, self.mjw_model.nu),
+                dtype=wp.float32,
+                device=self.model.device,
+            ),
+            rne_dcvel=None,
+            rne_dcdof_dot=None,
+            rne_dcacc=None,
+            rne_dcfrcbody=None,
+        )
+        if self.mjw_model.opt.integrator == _MJ_INTEGRATOR_IMPLICIT:
+            candidate = self._strict_endpoint_candidate
+            candidate.rne_dcvel = wp.zeros(
+                (self.mjw_data.nworld, self.mjw_model.nbody, self.mjw_model.nv),
+                dtype=wp.spatial_vector,
+                device=self.model.device,
+            )
+            candidate.rne_dcdof_dot = wp.zeros(
+                (self.mjw_data.nworld, self.mjw_model.nv, self.mjw_model.nv),
+                dtype=wp.spatial_vector,
+                device=self.model.device,
+            )
+            candidate.rne_dcacc = wp.zeros(
+                (self.mjw_data.nworld, self.mjw_model.nbody, self.mjw_model.nv),
+                dtype=wp.spatial_vector,
+                device=self.model.device,
+            )
+            candidate.rne_dcfrcbody = wp.zeros(
+                (self.mjw_data.nworld, self.mjw_model.nbody, self.mjw_model.nv),
+                dtype=wp.spatial_vector,
+                device=self.model.device,
+            )
+        overlay_capacity = guard_contacts.rigid_contact_max
+        self._strict_contact_endpoint_reserve = wp.zeros(
+            self.mjw_data.naconmax,
+            dtype=wp.float32,
+            device=self.model.device,
+        )
+        self._strict_oracle_guard_state = self._StrictOracleGuardState(
+            contacts=guard_contacts,
+            tid_to_cid=wp.full(overlay_capacity, -1, dtype=wp.int32, device=self.model.device),
+            horizon_state=wp.zeros(overlay_capacity, dtype=wp.uint8, device=self.model.device),
+            last_contact_generation=wp.full(
+                1,
+                _GENERATION_SENTINEL,
+                dtype=wp.int32,
+                device=self.model.device,
+            ),
+            nacon_count=wp.zeros(1, dtype=wp.int32, device=self.model.device),
+            required_contact_entries=wp.zeros(1, dtype=wp.int32, device=self.model.device),
+            owner_rotation_at_generation=wp.zeros(
+                self.model.body_count,
+                dtype=wp.quat,
+                device=self.model.device,
+            ),
+            overlay_rows=wp.zeros(self.mjw_data.nworld, dtype=wp.int32, device=self.model.device),
+            overlay_nnz=wp.zeros(self.mjw_data.nworld, dtype=wp.int32, device=self.model.device),
+        )
 
     @contextmanager
     def _scoped_deterministic_config(self):
@@ -4164,9 +4485,1047 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         with self._scoped_deterministic_config():
             yield
 
+    def _deriv_smooth_vel_preallocated(self, out: wp.array) -> None:
+        """Evaluate MJWarp's smooth-force derivative using bind-time workspace."""
+        from mujoco_warp._src import derivative
+        from mujoco_warp._src.types import DisableBit
+
+        model = self.mjw_model
+        data = self.mjw_data
+        candidate = self._strict_endpoint_candidate
+        if candidate is None:
+            raise RuntimeError("Strict endpoint candidate workspace was not allocated before stepping.")
+        mi = model.M_fullm_i
+        mj = model.M_fullm_j
+
+        if ~(model.opt.disableflags & (DisableBit.ACTUATION | DisableBit.DAMPER)):
+            out.zero_()
+            if model.nu > 0 and not (model.opt.disableflags & DisableBit.ACTUATION):
+                wp.launch(
+                    derivative._qderiv_actuator_passive_vel,
+                    dim=(data.nworld, model.nu),
+                    inputs=[
+                        model.opt.timestep,
+                        model.actuator_dyntype,
+                        model.actuator_gaintype,
+                        model.actuator_biastype,
+                        model.actuator_actadr,
+                        model.actuator_actnum,
+                        model.actuator_dynprm,
+                        model.actuator_gainprm,
+                        model.actuator_biasprm,
+                        model.actuator_actlimited,
+                        model.actuator_actrange,
+                        model.actuator_actearly,
+                        model.actuator_forcelimited,
+                        model.actuator_forcerange,
+                        data.act,
+                        data.ctrl,
+                        data.act_dot,
+                        data.actuator_force,
+                    ],
+                    outputs=[candidate.actuator_derivative_velocity],
+                    device=self.model.device,
+                )
+                wp.launch(
+                    derivative._qderiv_actuator_passive_actuation_sparse,
+                    dim=(data.nworld, model.nu),
+                    inputs=[
+                        model.M_elemid,
+                        data.moment_rownnz,
+                        data.moment_rowadr,
+                        data.moment_colind,
+                        data.actuator_moment,
+                        candidate.actuator_derivative_velocity,
+                    ],
+                    outputs=[out],
+                    device=self.model.device,
+                )
+            wp.launch(
+                derivative._qderiv_actuator_passive,
+                dim=(data.nworld, mi.size),
+                inputs=[
+                    model.opt.timestep,
+                    model.opt.disableflags,
+                    model.dof_damping,
+                    model.dof_dampingpoly,
+                    model.M_elemid,
+                    data.qvel,
+                    data.M,
+                    mi,
+                    mj,
+                    out,
+                ],
+                outputs=[out],
+                device=self.model.device,
+            )
+        else:
+            wp.copy(out, data.M)
+
+        if not (model.opt.disableflags & DisableBit.DAMPER):
+            wp.launch(
+                derivative._qderiv_tendon_damping,
+                dim=(data.nworld, mi.size),
+                inputs=[
+                    model.ntendon,
+                    model.opt.timestep,
+                    model.ten_J_rownnz,
+                    model.ten_J_rowadr,
+                    model.ten_J_colind,
+                    model.tendon_damping,
+                    model.tendon_dampingpoly,
+                    model.M_elemid,
+                    data.ten_J,
+                    data.ten_velocity,
+                    mi,
+                    mj,
+                ],
+                outputs=[out],
+                device=self.model.device,
+            )
+        if model.has_fluid:
+            if model.body_fluid_ellipsoid_adr.size > 0:
+                wp.launch(
+                    derivative._qderiv_ellipsoid_fluid,
+                    dim=(data.nworld, model.body_fluid_ellipsoid_adr.size, mi.size),
+                    inputs=[
+                        model.opt.timestep,
+                        model.opt.wind,
+                        model.opt.density,
+                        model.opt.viscosity,
+                        model.opt.integrator,
+                        model.body_parentid,
+                        model.body_rootid,
+                        model.body_geomnum,
+                        model.body_geomadr,
+                        model.dof_bodyid,
+                        model.geom_type,
+                        model.geom_size,
+                        model.geom_fluid,
+                        model.body_fluid_ellipsoid_adr,
+                        model.body_isdofancestor,
+                        model.M_elemid,
+                        data.xipos,
+                        data.geom_xpos,
+                        data.geom_xmat,
+                        data.subtree_com,
+                        data.cdof,
+                        data.cvel,
+                        mi,
+                        mj,
+                    ],
+                    outputs=[out],
+                    device=self.model.device,
+                )
+            if model.body_fluid_box_adr.size > 0:
+                wp.launch(
+                    derivative._qderiv_box_fluid,
+                    dim=(data.nworld, model.body_fluid_box_adr.size, mi.size),
+                    inputs=[
+                        model.opt.timestep,
+                        model.opt.wind,
+                        model.opt.density,
+                        model.opt.viscosity,
+                        model.opt.integrator,
+                        model.body_parentid,
+                        model.body_rootid,
+                        model.body_mass,
+                        model.body_inertia,
+                        model.dof_bodyid,
+                        model.body_fluid_box_adr,
+                        model.body_isdofancestor,
+                        model.M_elemid,
+                        data.xipos,
+                        data.ximat,
+                        data.subtree_com,
+                        data.cdof,
+                        data.cvel,
+                        mi,
+                        mj,
+                    ],
+                    outputs=[out],
+                    device=self.model.device,
+                )
+
+    def _deriv_rne_vel_preallocated(self, out: wp.array, *, subtract: bool) -> None:
+        """Evaluate MJWarp's RNE velocity derivative using bind-time workspace."""
+        from mujoco_warp._src import derivative
+
+        model = self.mjw_model
+        data = self.mjw_data
+        candidate = self._strict_endpoint_candidate
+        if candidate is None:
+            raise RuntimeError("Strict endpoint candidate workspace was not allocated before stepping.")
+        if any(
+            buffer is None
+            for buffer in (
+                candidate.rne_dcvel,
+                candidate.rne_dcdof_dot,
+                candidate.rne_dcacc,
+                candidate.rne_dcfrcbody,
+            )
+        ):
+            raise RuntimeError("Implicit strict endpoint derivative workspace was not allocated before stepping.")
+        candidate.rne_dcvel.zero_()
+        candidate.rne_dcdof_dot.zero_()
+        candidate.rne_dcacc.zero_()
+        candidate.rne_dcfrcbody.zero_()
+        for body_tree in model.body_tree:
+            wp.launch(
+                derivative.deriv_rne_cvel_cdof_dot,
+                dim=(data.nworld, body_tree.size, model.nv),
+                inputs=[
+                    model.body_parentid,
+                    model.body_jntnum,
+                    model.body_jntadr,
+                    model.body_dofadr,
+                    model.jnt_type,
+                    data.cdof,
+                    body_tree,
+                ],
+                outputs=[candidate.rne_dcvel, candidate.rne_dcdof_dot],
+                device=self.model.device,
+            )
+        for body_tree in model.body_tree:
+            wp.launch(
+                derivative.deriv_rne_cacc_cfrcbody_forward,
+                dim=(data.nworld, body_tree.size, model.nv),
+                inputs=[
+                    model.body_parentid,
+                    model.body_dofnum,
+                    model.body_dofadr,
+                    data.qvel,
+                    data.cinert,
+                    data.cvel,
+                    data.cdof_dot,
+                    body_tree,
+                    candidate.rne_dcvel,
+                    candidate.rne_dcdof_dot,
+                ],
+                outputs=[candidate.rne_dcacc, candidate.rne_dcfrcbody],
+                device=self.model.device,
+            )
+        for body_tree in reversed(model.body_tree):
+            wp.launch(
+                derivative.deriv_rne_cfrcbody_backward,
+                dim=(data.nworld, body_tree.size, model.nv),
+                inputs=[model.body_parentid, body_tree],
+                outputs=[candidate.rne_dcfrcbody],
+                device=self.model.device,
+            )
+        wp.launch(
+            derivative.deriv_rne_body2jnt_sparse,
+            dim=(data.nworld, model.qD_fullm_i.size),
+            inputs=[
+                model.dof_bodyid,
+                data.cdof,
+                model.opt.timestep,
+                model.qD_fullm_i,
+                model.qD_fullm_j,
+                candidate.rne_dcfrcbody,
+                subtract,
+            ],
+            outputs=[out],
+            device=self.model.device,
+        )
+
+    def _preview_integrator_acceleration_legacy(self) -> wp.array:
+        """Preview MJWarp integration using its allocation-owning compatibility path."""
+        from mujoco_warp._src import derivative, forward, smooth
+        from mujoco_warp._src.types import DisableBit
+
+        model = self.mjw_model
+        data = self.mjw_data
+        if model.opt.integrator == _MJ_INTEGRATOR_IMPLICIT:
+            mass = wp.empty(data.M.shape, dtype=wp.float32, device=self.model.device)
+            derivative.deriv_smooth_vel(model, data, mass)
+            wp.launch(
+                forward._map_m2d,
+                dim=(data.nworld, model.nD),
+                inputs=[model.mapM2D, mass],
+                outputs=[data.qLU],
+                device=self.model.device,
+            )
+            derivative.deriv_rne_vel(model, data, data.qLU, flg_subtract=True)
+            qacc = wp.empty((data.nworld, model.nv), dtype=wp.float32, device=self.model.device)
+            smooth.factor_solve_lu(model, data, data.qLU, qacc, data.efc.Ma)
+            return qacc
+
+        if model.opt.integrator == _MJ_INTEGRATOR_IMPLICITFAST:
+            implicit_terms = DisableBit.ACTUATION | DisableBit.SPRING | DisableBit.DAMPER
+            if ~(model.opt.disableflags | ~implicit_terms):
+                q_deriv = wp.empty((data.nworld, model.nC), dtype=wp.float32, device=self.model.device)
+                q_ld = wp.empty_like(data.qLD)
+                q_l_diag_inv = wp.empty((data.nworld, model.nv), dtype=wp.float32, device=self.model.device)
+                qacc = wp.empty((data.nworld, model.nv), dtype=wp.float32, device=self.model.device)
+                derivative.deriv_smooth_vel(model, data, q_deriv)
+                smooth.factor_solve_i(model, data, q_deriv, q_ld, q_l_diag_inv, qacc, data.efc.Ma)
+                return qacc
+            return data.qacc
+
+        if not (model.opt.disableflags & (DisableBit.EULERDAMP | DisableBit.DAMPER)):
+            damp_deriv = wp.empty((data.nworld, model.nv), dtype=wp.float32, device=self.model.device)
+            wp.launch(
+                forward._compute_damping_deriv,
+                dim=(data.nworld, model.nv),
+                inputs=[model.dof_damping, model.dof_dampingpoly, data.qvel],
+                outputs=[damp_deriv],
+                device=self.model.device,
+            )
+            mass = wp.clone(data.M)
+            q_ld = wp.empty_like(data.qLD)
+            q_l_diag_inv = wp.empty((data.nworld, model.nv), dtype=wp.float32, device=self.model.device)
+            qacc = wp.empty((data.nworld, model.nv), dtype=wp.float32, device=self.model.device)
+            wp.launch(
+                forward._euler_damp_qfrc,
+                dim=(data.nworld, model.nv),
+                inputs=[model.opt.timestep, model.M_rownnz, model.M_rowadr, damp_deriv],
+                outputs=[mass],
+                device=self.model.device,
+            )
+            smooth.factor_solve_i(model, data, mass, q_ld, q_l_diag_inv, qacc, data.efc.Ma)
+            return qacc
+        return data.qacc
+
+    def _preview_integrator_acceleration(self) -> wp.array:
+        """Return the acceleration that MJWarp's selected integrator will use."""
+        from mujoco_warp._src import forward, smooth
+        from mujoco_warp._src.types import DisableBit
+
+        model = self.mjw_model
+        data = self.mjw_data
+        candidate = self._strict_endpoint_candidate
+        if candidate is None:
+            return self._preview_integrator_acceleration_legacy()
+        if model.opt.integrator == _MJ_INTEGRATOR_IMPLICIT:
+            self._deriv_smooth_vel_preallocated(candidate.mass)
+            wp.launch(
+                forward._map_m2d,
+                dim=(data.nworld, model.nD),
+                inputs=[model.mapM2D, candidate.mass],
+                outputs=[data.qLU],
+            )
+            self._deriv_rne_vel_preallocated(data.qLU, subtract=True)
+            smooth.factor_solve_lu(model, data, data.qLU, candidate.qacc, data.efc.Ma)
+            return candidate.qacc
+
+        if model.opt.integrator == _MJ_INTEGRATOR_IMPLICITFAST:
+            implicit_terms = DisableBit.ACTUATION | DisableBit.SPRING | DisableBit.DAMPER
+            if ~(model.opt.disableflags | ~implicit_terms):
+                self._deriv_smooth_vel_preallocated(candidate.q_deriv)
+                smooth.factor_solve_i(
+                    model,
+                    data,
+                    candidate.q_deriv,
+                    candidate.q_ld,
+                    candidate.q_l_diag_inv,
+                    candidate.qacc,
+                    data.efc.Ma,
+                )
+                return candidate.qacc
+            wp.copy(candidate.qacc, data.qacc)
+            return candidate.qacc
+
+        if not (model.opt.disableflags & (DisableBit.EULERDAMP | DisableBit.DAMPER)):
+            wp.launch(
+                forward._compute_damping_deriv,
+                dim=(data.nworld, model.nv),
+                inputs=[model.dof_damping, model.dof_dampingpoly, data.qvel],
+                outputs=[candidate.damp_deriv],
+            )
+            wp.copy(candidate.mass, data.M)
+            wp.launch(
+                forward._euler_damp_qfrc,
+                dim=(data.nworld, model.nv),
+                inputs=[model.opt.timestep, model.M_rownnz, model.M_rowadr, candidate.damp_deriv],
+                outputs=[candidate.mass],
+            )
+            smooth.factor_solve_i(
+                model,
+                data,
+                candidate.mass,
+                candidate.q_ld,
+                candidate.q_l_diag_inv,
+                candidate.qacc,
+                data.efc.Ma,
+            )
+            return candidate.qacc
+        wp.copy(candidate.qacc, data.qacc)
+        return candidate.qacc
+
+    def _compute_strict_endpoint_candidate(
+        self, state_in: State, integrator_qacc: wp.array
+    ) -> RigidBodyPathCertificate:
+        """Evaluate and certify the pose path MuJoCo Warp would commit for ``integrator_qacc``."""
+        from mujoco_warp._src import forward
+
+        candidate = self._strict_endpoint_candidate
+        if candidate is None:
+            raise RuntimeError("Strict endpoint candidate workspace was not allocated before stepping.")
+
+        model = self.model
+        mj_model = self.mjw_model
+        data = self.mjw_data
+        joints_per_world = model.joint_count // data.nworld
+        wp.copy(candidate.qacc, integrator_qacc)
+        wp.launch(
+            forward._next_velocity,
+            dim=(data.nworld, mj_model.nv),
+            inputs=[mj_model.opt.timestep, data.qvel, candidate.qacc, 1.0],
+            outputs=[candidate.qvel],
+            device=model.device,
+        )
+        candidate.path.origin_path_length.zero_()
+        candidate.path.angular_path_length.zero_()
+        candidate.path.motion_kind.fill_(RIGID_BODY_PATH_UNKNOWN)
+        wp.launch(
+            build_free_body_path_certificate_kernel,
+            dim=(data.nworld, joints_per_world),
+            inputs=[
+                candidate.qvel,
+                mj_model.opt.timestep,
+                joints_per_world,
+                model.joint_type,
+                model.joint_parent,
+                model.joint_child,
+                model.body_flags,
+                self.mj_qd_start,
+                RIGID_BODY_PATH_STATIONARY,
+                RIGID_BODY_PATH_LINEAR_TRANSLATION,
+                RIGID_BODY_PATH_BOUNDED,
+                RIGID_BODY_PATH_CONSTANT_TWIST,
+            ],
+            outputs=[
+                candidate.path.origin_path_length,
+                candidate.path.angular_path_length,
+                candidate.path.motion_kind,
+            ],
+            device=model.device,
+        )
+        wp.launch(
+            forward._next_position,
+            dim=(data.nworld, mj_model.njnt),
+            inputs=[
+                mj_model.opt.timestep,
+                mj_model.jnt_type,
+                mj_model.jnt_qposadr,
+                mj_model.jnt_dofadr,
+                data.qpos,
+                candidate.qvel,
+                1.0,
+            ],
+            outputs=[candidate.qpos],
+            device=model.device,
+        )
+
+        # Conversion intentionally starts from the reference state: loop joints have no MuJoCo coordinates and
+        # kinematic joints are prescribed by Newton rather than integrated by MuJoCo.
+        wp.copy(candidate.joint_q, state_in.joint_q)
+        wp.copy(candidate.joint_qd, state_in.joint_qd)
+        wp.copy(candidate.body_q, state_in.body_q)
+        wp.copy(candidate.body_qd, state_in.body_qd)
+        mujoco_attrs = getattr(model, "mujoco", None)
+        dof_ref = getattr(mujoco_attrs, "dof_ref", None) if mujoco_attrs is not None else None
+        wp.launch(
+            convert_mj_coords_to_warp_kernel,
+            dim=(data.nworld, joints_per_world),
+            inputs=[
+                candidate.qpos,
+                candidate.qvel,
+                joints_per_world,
+                model.joint_type,
+                model.joint_q_start,
+                model.joint_qd_start,
+                model.joint_dof_dim,
+                model.joint_child,
+                model.joint_X_p,
+                model.joint_X_c,
+                model.body_com,
+                dof_ref,
+                model.body_flags,
+                state_in.joint_q,
+                state_in.joint_qd,
+                self.mj_q_start,
+                self.mj_qd_start,
+            ],
+            outputs=[candidate.joint_q, candidate.joint_qd],
+            device=model.device,
+        )
+        eval_fk(model, candidate.joint_q, candidate.joint_qd, candidate)
+        return candidate.path
+
+    def _apply_strict_contact_endpoint_reserve(
+        self,
+        state_in: State,
+        contacts: Contacts,
+        launch_dim: int,
+        tid_to_cid: wp.array[wp.int32] | None,
+        horizon_state: wp.array[wp.uint8] | None,
+        integrator_qacc: wp.array,
+        *,
+        endpoint_reserve: wp.array[wp.float32] | None,
+        accumulate_solver_residual: bool,
+        certified_reference_clearance: float | None = None,
+    ) -> None:
+        """Raise nonlinear endpoint reserves for one fresh post-solve defect.
+
+        When ``accumulate_solver_residual`` is true, this method must be called once after a new solve before the
+        next correction solve. Repeating it against unchanged acceleration would accumulate the same defect twice.
+        ``endpoint_reserve`` may persist only while each contact index identifies the same geometric feature.
+        ``certified_reference_clearance`` is reserved for oracle contacts whose reference pose was independently
+        certified within that separation tolerance; their candidate-derived tangent plane must not define an
+        artificial negative floor.
+        """
+        if launch_dim == 0:
+            return
+        if tid_to_cid is None or horizon_state is None:
+            raise RuntimeError("Strict contact constraint workspace was not allocated before stepping.")
+        use_certified_reference_floor = certified_reference_clearance is not None
+        if certified_reference_clearance is None:
+            certified_reference_clearance = 0.0
+        wp.launch(
+            apply_strict_contact_endpoint_reserve_kernel,
+            dim=launch_dim,
+            inputs=[
+                state_in.body_q,
+                contacts.rigid_contact_count,
+                contacts.rigid_contact_shape0,
+                contacts.rigid_contact_shape1,
+                contacts.rigid_contact_point0,
+                contacts.rigid_contact_point1,
+                contacts.rigid_contact_margin0,
+                contacts.rigid_contact_margin1,
+                contacts.rigid_contact_normal_owner,
+                self.model.shape_body,
+                self.model.shape_margin,
+                self.model.body_flags,
+                tid_to_cid,
+                horizon_state,
+                endpoint_reserve,
+                self.mjw_data.contact.dist,
+                self.mjw_data.contact.frame,
+                self.mjw_data.contact.geom,
+                self.mjw_data.contact.worldid,
+                self.mjw_data.contact.efc_address,
+                self.mjw_model.geom_margin,
+                self.mjw_model.geom_bodyid,
+                self.mjw_model.body_weldid,
+                self.mjw_model.body_parentid,
+                self.mjw_model.body_dofadr,
+                self.mjw_model.body_dofnum,
+                self.mjw_model.body_rootid,
+                self.mjw_data.xpos,
+                self.mjw_data.subtree_com,
+                self.mjw_data.cdof,
+                self.mjw_data.qvel,
+                integrator_qacc,
+                self.mjw_model.opt.timestep,
+                self.mjw_data.efc.vel,
+                self.mjw_data.efc.aref,
+                accumulate_solver_residual,
+                use_certified_reference_floor,
+                certified_reference_clearance,
+            ],
+            device=self.model.device,
+        )
+
+    def _apply_strict_contact_constraints(
+        self,
+        state_in: State,
+        contacts: Contacts,
+        launch_dim: int,
+        tid_to_cid: wp.array[wp.int32] | None,
+        horizon_state: wp.array[wp.uint8] | None,
+        integrator_qacc: wp.array,
+        *,
+        endpoint_reserve: wp.array[wp.float32] | None,
+        certified_reference_clearance: float | None = None,
+    ) -> None:
+        """Restore endpoint barrier references after rebuilding the constraint graph."""
+        if launch_dim == 0:
+            return
+        if tid_to_cid is None or horizon_state is None:
+            raise RuntimeError("Strict contact constraint workspace was not allocated before stepping.")
+        wp.launch(
+            apply_velocity_contact_barrier_kernel,
+            dim=launch_dim,
+            inputs=[
+                contacts.rigid_contact_count,
+                tid_to_cid,
+                horizon_state,
+                self.mjw_data.contact.dist,
+                self.mjw_data.contact.geom,
+                self.mjw_data.contact.worldid,
+                self.mjw_data.contact.efc_address,
+                self.mjw_model.geom_margin,
+                self.mjw_model.opt.timestep,
+                self.mjw_data.efc.vel,
+                self.mjw_data.efc.aref,
+            ],
+            device=self.model.device,
+        )
+        self._apply_strict_contact_endpoint_reserve(
+            state_in,
+            contacts,
+            launch_dim,
+            tid_to_cid,
+            horizon_state,
+            integrator_qacc,
+            endpoint_reserve=endpoint_reserve,
+            accumulate_solver_residual=False,
+            certified_reference_clearance=certified_reference_clearance,
+        )
+
     @event_scope
-    def _mujoco_warp_step(self):
-        self._mujoco_warp.step(self.mjw_model, self.mjw_data)
+    def _mujoco_warp_step(
+        self,
+        state_in: State,
+        contacts: Contacts,
+        dt: float,
+        velocity_barrier_launch_dim: int = 0,
+    ):
+        if not velocity_barrier_launch_dim and not contacts._strict_nonpenetration_active:
+            self._mujoco_warp.step(self.mjw_model, self.mjw_data)
+            return
+
+        unsafe_world = self._strict_nonpenetration_unsafe_world
+        persistent_overflow = self._strict_nonpenetration_overflow
+        base_constraint_rows = self._strict_base_constraint_rows
+        base_constraint_nnz = self._strict_base_constraint_nnz
+        if contacts._strict_nonpenetration_active:
+            if unsafe_world is None or persistent_overflow is None:
+                raise RuntimeError("Strict nonpenetration failure workspace was not allocated before stepping.")
+            if base_constraint_rows is None or base_constraint_nnz is None:
+                raise RuntimeError("Strict endpoint constraint workspace was not allocated before stepping.")
+            unsafe_world.zero_()
+            if self._strict_contact_endpoint_reserve is not None:
+                # Contact generation can remain unchanged across solver substeps, but reserves belong only to the
+                # current endpoint solve and must start a new identity epoch here.
+                self._strict_contact_endpoint_reserve.zero_()
+
+            # MJWarp's fixed EFC buffers cannot represent a partial strict graph safely. Count every converted base
+            # contact entry before step1, persist any capacity failure across graph rebuilds, and remove the affected
+            # world's contacts before the first constraint consumer runs.
+            base_constraint_rows.zero_()
+            base_constraint_nnz.zero_()
+            base_contact_launch_dim = min(2 * contacts.rigid_contact_max, self.mjw_data.naconmax)
+            if base_contact_launch_dim > 0:
+                wp.launch(
+                    count_contact_constraint_requirements_kernel,
+                    dim=base_contact_launch_dim,
+                    inputs=[
+                        self.mjw_data.nacon,
+                        self._contact_tid_to_cid,
+                        False,
+                        self.mjw_model.opt.cone == self._mujoco.mjtCone.mjCONE_ELLIPTIC,
+                        self.mjw_model.flg_adhesion,
+                        self.mjw_data.contact.dist,
+                        self.mjw_data.contact.includemargin,
+                        self.mjw_data.contact.adhesion,
+                        self.mjw_data.contact.dim,
+                        self.mjw_data.contact.geom,
+                        self.mjw_data.contact.worldid,
+                        self.mjw_data.contact.type,
+                        self.mjw_model.geom_bodyid,
+                        self.mjw_model.body_weldid,
+                        self.mjw_model.body_dofadr,
+                        self.mjw_model.body_dofnum,
+                        self.mjw_model.dof_parentid,
+                        base_constraint_rows,
+                        base_constraint_nnz,
+                    ],
+                    device=self.model.device,
+                )
+            wp.launch(
+                preflight_strict_base_constraint_capacity_kernel,
+                dim=self.mjw_data.nworld,
+                inputs=[
+                    self.mjw_model.is_sparse,
+                    self.mjw_data.njmax,
+                    self.mjw_data.njmax_nnz,
+                    base_constraint_rows,
+                    base_constraint_nnz,
+                    persistent_overflow,
+                    unsafe_world,
+                    self.mjw_data.overflow,
+                ],
+                device=self.model.device,
+            )
+            if base_contact_launch_dim > 0:
+                wp.launch(
+                    deactivate_unsafe_strict_contacts_kernel,
+                    dim=base_contact_launch_dim,
+                    inputs=[
+                        self.mjw_data.nacon,
+                        self._contact_tid_to_cid,
+                        False,
+                        unsafe_world,
+                        self.mjw_data.contact.dist,
+                        self.mjw_data.contact.includemargin,
+                        self.mjw_data.contact.adhesion,
+                        self.mjw_data.contact.worldid,
+                        self.mjw_data.contact.type,
+                        self.mjw_data.contact.efc_address,
+                    ],
+                    device=self.model.device,
+                )
+
+        if self.enable_sleeping:
+            from mujoco_warp._src import sleep
+
+            sleep.wake(self.mjw_model, self.mjw_data)
+            sleep.update_sleep(self.mjw_model, self.mjw_data)
+        self._mujoco_warp.step1(self.mjw_model, self.mjw_data)
+        if velocity_barrier_launch_dim:
+            wp.launch(
+                apply_velocity_contact_barrier_kernel,
+                dim=velocity_barrier_launch_dim,
+                inputs=[
+                    contacts.rigid_contact_count,
+                    self._contact_tid_to_cid,
+                    self._contact_horizon_state,
+                    self.mjw_data.contact.dist,
+                    self.mjw_data.contact.geom,
+                    self.mjw_data.contact.worldid,
+                    self.mjw_data.contact.efc_address,
+                    self.mjw_model.geom_margin,
+                    self.mjw_model.opt.timestep,
+                    self.mjw_data.efc.vel,
+                    self.mjw_data.efc.aref,
+                ],
+                device=self.model.device,
+            )
+        if not contacts._strict_nonpenetration_active:
+            self._mujoco_warp.step2(self.mjw_model, self.mjw_data)
+            return
+
+        # Strict mode solves the ordinary reduced manifold first, refines one cumulative guard set through a
+        # fixed number of correction rounds, then accepts the result only after a scan-only endpoint query.
+        self._mujoco_warp.fwd_actuation(self.mjw_model, self.mjw_data)
+        self._mujoco_warp.fwd_acceleration(self.mjw_model, self.mjw_data)
+        self._mujoco_warp.solve(self.mjw_model, self.mjw_data)
+        oracle = self._strict_nonpenetration_oracle
+        if oracle is _STRICT_NONPENETRATION_ORACLE_UNBOUND or oracle is None:
+            for _ in range(2):
+                integrator_qacc = self._preview_integrator_acceleration()
+                self._apply_strict_contact_endpoint_reserve(
+                    state_in,
+                    contacts,
+                    velocity_barrier_launch_dim,
+                    self._contact_tid_to_cid,
+                    self._contact_horizon_state,
+                    integrator_qacc,
+                    endpoint_reserve=self._strict_contact_endpoint_reserve,
+                    accumulate_solver_residual=True,
+                )
+                wp.copy(self.mjw_data.qacc_warmstart, self.mjw_data.qacc)
+                self._mujoco_warp.solve(self.mjw_model, self.mjw_data)
+            integrator_qacc = self._preview_integrator_acceleration()
+            wp.launch(
+                reassert_strict_overflow_kernel,
+                dim=self.mjw_data.nworld,
+                inputs=[persistent_overflow, unsafe_world, self.mjw_data.overflow],
+                device=self.model.device,
+            )
+            wp.launch(
+                mask_strict_endpoint_qacc_kernel,
+                dim=(self.mjw_data.nworld, self.mjw_model.nv),
+                inputs=[
+                    self.mjw_data.qvel,
+                    self.mjw_model.opt.timestep,
+                    unsafe_world,
+                    self.mjw_data.overflow,
+                    integrator_qacc,
+                    self.mjw_data.qacc,
+                ],
+                device=self.model.device,
+            )
+            self._mujoco_warp.sensor_acc(self.mjw_model, self.mjw_data)
+            from mujoco_warp._src import forward
+
+            forward._advance(self.mjw_model, self.mjw_data, integrator_qacc)
+            wp.launch(
+                clear_rejected_strict_warmstart_kernel,
+                dim=(self.mjw_data.nworld, self.mjw_model.nv),
+                inputs=[unsafe_world, self.mjw_data.overflow, self.mjw_data.qacc_warmstart],
+                device=self.model.device,
+            )
+            return
+
+        guard_state = self._strict_oracle_guard_state
+        if guard_state is None:
+            raise RuntimeError("Strict nonpenetration oracle was not bound before stepping.")
+        from mujoco_warp._src import constraint, forward
+
+        oracle.begin_refinement()
+        candidate = self._strict_endpoint_candidate
+        if candidate is None:
+            raise RuntimeError("Strict endpoint candidate workspace was not allocated before stepping.")
+        candidate.last_certified_world.zero_()
+        if self._strict_contact_endpoint_reserve is None:
+            raise RuntimeError("Strict contact reserve workspace was not allocated before stepping.")
+        wp.copy(base_constraint_rows, self.mjw_data.nefc)
+        base_constraint_nnz.zero_()
+        if self.mjw_model.is_sparse and self.mjw_data.njmax > 0:
+            wp.launch(
+                accumulate_constraint_nnz_kernel,
+                dim=(self.mjw_data.nworld, self.mjw_data.njmax),
+                inputs=[base_constraint_rows, self.mjw_data.efc.J_rownnz, base_constraint_nnz],
+                device=self.model.device,
+            )
+        for _ in range(_STRICT_ORACLE_REFINEMENT_ROUNDS):
+            integrator_qacc = self._preview_integrator_acceleration()
+            candidate_path = self._compute_strict_endpoint_candidate(state_in, integrator_qacc)
+            oracle.refine(state_in.body_q, candidate_path)
+            # Exact endpoint violations can materialize a new guard for the next round. Capacity and an invalid
+            # reference are unrecoverable; swept-path ambiguity is advisory when exact endpoint geometry is valid.
+            wp.launch(
+                latch_strict_endpoint_status_kernel,
+                dim=self.mjw_data.nworld,
+                inputs=[
+                    oracle.world_status,
+                    _STRICT_ENDPOINT_PERSISTENT_STATUS,
+                    _STRICT_ENDPOINT_PERSISTENT_STATUS,
+                    persistent_overflow,
+                    unsafe_world,
+                    self.mjw_data.overflow,
+                ],
+                device=self.model.device,
+            )
+            wp.launch(
+                capture_strict_endpoint_candidate_kernel,
+                dim=self.mjw_data.nworld,
+                inputs=[
+                    oracle.world_status,
+                    _STRICT_ENDPOINT_REJECT_STATUS,
+                    _STRICT_ENDPOINT_PERSISTENT_STATUS,
+                    oracle.certified_path_fraction,
+                    False,
+                    self.mjw_data.qvel,
+                    self.mjw_model.opt.timestep,
+                    unsafe_world,
+                    self.mjw_data.overflow,
+                    integrator_qacc,
+                    candidate.last_certified_qacc,
+                    candidate.last_certified_world,
+                ],
+                device=self.model.device,
+            )
+
+            # The oracle set is cumulative, so rebuild the complete overlay from the ordinary-contact prefix.
+            wp.copy(self.mjw_data.nacon, self._last_nacon_count)
+            oracle_launch_dim = self._append_strict_oracle_contacts_to_mjwarp(
+                state_in,
+                dt,
+                guard_state,
+                self._last_nacon_count,
+            )
+
+            guard_state.overlay_rows.zero_()
+            guard_state.overlay_nnz.zero_()
+            if oracle_launch_dim > 0:
+                wp.launch(
+                    count_contact_constraint_requirements_kernel,
+                    dim=oracle_launch_dim,
+                    inputs=[
+                        guard_state.contacts.rigid_contact_count,
+                        guard_state.tid_to_cid,
+                        True,
+                        self.mjw_model.opt.cone == self._mujoco.mjtCone.mjCONE_ELLIPTIC,
+                        self.mjw_model.flg_adhesion,
+                        self.mjw_data.contact.dist,
+                        self.mjw_data.contact.includemargin,
+                        self.mjw_data.contact.adhesion,
+                        self.mjw_data.contact.dim,
+                        self.mjw_data.contact.geom,
+                        self.mjw_data.contact.worldid,
+                        self.mjw_data.contact.type,
+                        self.mjw_model.geom_bodyid,
+                        self.mjw_model.body_weldid,
+                        self.mjw_model.body_dofadr,
+                        self.mjw_model.body_dofnum,
+                        self.mjw_model.dof_parentid,
+                        guard_state.overlay_rows,
+                        guard_state.overlay_nnz,
+                    ],
+                    device=self.model.device,
+                )
+            wp.launch(
+                preflight_overlay_constraint_capacity_kernel,
+                dim=self.mjw_data.nworld,
+                inputs=[
+                    self.mjw_model.is_sparse,
+                    self.mjw_data.njmax,
+                    self.mjw_data.njmax_nnz,
+                    base_constraint_rows,
+                    base_constraint_nnz,
+                    guard_state.overlay_rows,
+                    guard_state.overlay_nnz,
+                    persistent_overflow,
+                    unsafe_world,
+                    self.mjw_data.overflow,
+                ],
+                device=self.model.device,
+            )
+            if oracle_launch_dim > 0:
+                wp.launch(
+                    deactivate_unsafe_strict_contacts_kernel,
+                    dim=oracle_launch_dim,
+                    inputs=[
+                        guard_state.contacts.rigid_contact_count,
+                        guard_state.tid_to_cid,
+                        True,
+                        unsafe_world,
+                        self.mjw_data.contact.dist,
+                        self.mjw_data.contact.includemargin,
+                        self.mjw_data.contact.adhesion,
+                        self.mjw_data.contact.worldid,
+                        self.mjw_data.contact.type,
+                        self.mjw_data.contact.efc_address,
+                    ],
+                    device=self.model.device,
+                )
+
+            if self.enable_sleeping:
+                from mujoco_warp._src import sleep
+
+                sleep.wake_collision(self.mjw_model, self.mjw_data)
+                sleep.update_sleep(self.mjw_model, self.mjw_data)
+                forward.fwd_acceleration(self.mjw_model, self.mjw_data)
+
+            constraint.make_constraint(self.mjw_model, self.mjw_data)
+
+            # Constraint rebuilds replace every EFC reference, including the cumulative guard rows.
+            self._apply_strict_contact_constraints(
+                state_in,
+                contacts,
+                velocity_barrier_launch_dim,
+                self._contact_tid_to_cid,
+                self._contact_horizon_state,
+                integrator_qacc,
+                endpoint_reserve=self._strict_contact_endpoint_reserve,
+            )
+            self._apply_strict_contact_constraints(
+                state_in,
+                guard_state.contacts,
+                oracle_launch_dim,
+                guard_state.tid_to_cid,
+                guard_state.horizon_state,
+                integrator_qacc,
+                endpoint_reserve=None,
+                certified_reference_clearance=self._strict_nonpenetration_separation_tolerance,
+            )
+            wp.copy(self.mjw_data.qacc_warmstart, self.mjw_data.qacc)
+            self._mujoco_warp.solve(self.mjw_model, self.mjw_data)
+
+            # Accumulate one nonlinear and finite-impedance endpoint defect for the immediate correction solve.
+            # Base-contact reserves persist within the substep because their contact identities are stable. Oracle
+            # rows deliberately do not persist reserve across rebuilds because one tid can be relinearized to a new
+            # point and normal.
+            integrator_qacc = self._preview_integrator_acceleration()
+            self._apply_strict_contact_endpoint_reserve(
+                state_in,
+                contacts,
+                velocity_barrier_launch_dim,
+                self._contact_tid_to_cid,
+                self._contact_horizon_state,
+                integrator_qacc,
+                endpoint_reserve=self._strict_contact_endpoint_reserve,
+                accumulate_solver_residual=True,
+            )
+            self._apply_strict_contact_endpoint_reserve(
+                state_in,
+                guard_state.contacts,
+                oracle_launch_dim,
+                guard_state.tid_to_cid,
+                guard_state.horizon_state,
+                integrator_qacc,
+                endpoint_reserve=None,
+                accumulate_solver_residual=True,
+                certified_reference_clearance=self._strict_nonpenetration_separation_tolerance,
+            )
+            wp.copy(self.mjw_data.qacc_warmstart, self.mjw_data.qacc)
+            self._mujoco_warp.solve(self.mjw_model, self.mjw_data)
+
+        integrator_qacc = self._preview_integrator_acceleration()
+        candidate_path = self._compute_strict_endpoint_candidate(state_in, integrator_qacc)
+        oracle.scan(state_in.body_q, candidate_path)
+        wp.launch(
+            reassert_strict_overflow_kernel,
+            dim=self.mjw_data.nworld,
+            inputs=[persistent_overflow, unsafe_world, self.mjw_data.overflow],
+            device=self.model.device,
+        )
+        # A failed full path may still carry a sound swept certificate for its longest safe prefix. Convert that
+        # prefix into the exact semi-implicit acceleration before latching the full-path rejection; persistent
+        # capacity and reference failures remain fail-closed.
+        wp.launch(
+            capture_strict_endpoint_candidate_kernel,
+            dim=self.mjw_data.nworld,
+            inputs=[
+                oracle.world_status,
+                _STRICT_ENDPOINT_REJECT_STATUS,
+                _STRICT_ENDPOINT_PERSISTENT_STATUS,
+                oracle.certified_path_fraction,
+                True,
+                self.mjw_data.qvel,
+                self.mjw_model.opt.timestep,
+                unsafe_world,
+                self.mjw_data.overflow,
+                integrator_qacc,
+                candidate.last_certified_qacc,
+                candidate.last_certified_world,
+            ],
+            device=self.model.device,
+        )
+        wp.launch(
+            latch_strict_endpoint_status_kernel,
+            dim=self.mjw_data.nworld,
+            inputs=[
+                oracle.world_status,
+                _STRICT_ENDPOINT_REJECT_STATUS,
+                _STRICT_ENDPOINT_PERSISTENT_STATUS,
+                persistent_overflow,
+                unsafe_world,
+                self.mjw_data.overflow,
+            ],
+            device=self.model.device,
+        )
+        wp.launch(
+            restore_strict_endpoint_candidate_kernel,
+            dim=self.mjw_data.nworld,
+            inputs=[
+                unsafe_world,
+                self.mjw_data.overflow,
+                candidate.last_certified_qacc,
+                candidate.last_certified_world,
+                integrator_qacc,
+                self.mjw_data.qacc,
+                self.mjw_data.qacc_warmstart,
+            ],
+            device=self.model.device,
+        )
+        wp.launch(
+            mask_strict_endpoint_qacc_kernel,
+            dim=(self.mjw_data.nworld, self.mjw_model.nv),
+            inputs=[
+                self.mjw_data.qvel,
+                self.mjw_model.opt.timestep,
+                unsafe_world,
+                self.mjw_data.overflow,
+                integrator_qacc,
+                self.mjw_data.qacc,
+            ],
+            device=self.model.device,
+        )
+        self._mujoco_warp.sensor_acc(self.mjw_model, self.mjw_data)
+        forward._advance(self.mjw_model, self.mjw_data, integrator_qacc)
+        wp.launch(
+            clear_rejected_strict_warmstart_kernel,
+            dim=(self.mjw_data.nworld, self.mjw_model.nv),
+            inputs=[unsafe_world, self.mjw_data.overflow, self.mjw_data.qacc_warmstart],
+            device=self.model.device,
+        )
 
     @property
     def mesh_variant_names(self) -> tuple[str, ...]:
@@ -4285,6 +5644,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
     @event_scope
     @override
     def step(self, state_in: State, state_out: State, control: Control, contacts: Contacts, dt: float) -> None:
+        self._validate_strict_nonpenetration_contacts(contacts)
         if self.use_mujoco_cpu:
             self._apply_mjc_control(self.model, state_in, control, self.mj_data)
             if self.update_data_interval > 0 and self._step % self.update_data_interval == 0:
@@ -4300,15 +5660,23 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 if self.update_data_interval > 0 and self._step % self.update_data_interval == 0:
                     self._update_mjc_data(self.mjw_data, self.model, state_in)
                 self.mjw_model.opt.timestep.fill_(dt)
+                velocity_barrier_launch_dim = 0
                 if not self.mjw_model.opt.run_collision_detection:
-                    self._convert_contacts_to_mjwarp(self.model, state_in, contacts)
+                    velocity_barrier_launch_dim = self._convert_contacts_to_mjwarp(self.model, state_in, contacts, dt)
                     if self.enable_sleeping:
                         from mujoco_warp._src import sleep
 
                         sleep.wake(self.mjw_model, self.mjw_data)
                         sleep.update_sleep_trees(self.mjw_model, self.mjw_data)
                         sleep.wake_collision(self.mjw_model, self.mjw_data)
-                self._mujoco_warp_step()
+                self._mujoco_warp_step(
+                    state_in,
+                    contacts,
+                    dt,
+                    velocity_barrier_launch_dim
+                    if contacts._velocity_speculation_active or contacts._strict_nonpenetration_active
+                    else 0,
+                )
                 self._update_newton_state(self.model, state_out, self.mjw_data, state_prev=state_in)
         self._step += 1
 
@@ -4326,9 +5694,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         divergence (e.g. NaNs), these buffers can poison the next step even once
         the joint state has been reset, because :meth:`step` warm-starts from
         them. This method therefore always zeros, per world, ``qacc_warmstart``,
-        ``qfrc_applied``, ``xfrc_applied``, ``act`` and ``ctrl``. (``qacc`` is
-        left alone: the solver overwrites it from ``qacc_warmstart`` at the start
-        of every step.)
+        ``qfrc_applied``, ``xfrc_applied``, ``act`` and ``ctrl``, and clears the
+        per-world overflow bitmask. (``qacc`` is left alone: the solver
+        overwrites it from ``qacc_warmstart`` at the start of every step.)
 
         In addition, the requested entries of the Newton :class:`~newton.State`
         are reset to the model defaults (``model.joint_q`` / ``model.joint_qd``)
@@ -4430,22 +5798,28 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             return
 
         buffers = (d.qacc_warmstart, d.qfrc_applied, d.ctrl, d.act, d.xfrc_applied)
-        buffer_dim = max(buffer.shape[1] for buffer in buffers)
+        buffer_dim = max(1, *(buffer.shape[1] for buffer in buffers))
         wp.launch(
             reset_world_buffers_kernel,
             dim=(d.nworld, buffer_dim),
-            inputs=[world_mask, *buffers],
+            inputs=[
+                world_mask,
+                *buffers,
+                d.overflow,
+                self._strict_nonpenetration_unsafe_world,
+                self._strict_nonpenetration_overflow,
+            ],
             device=self.model.device,
         )
         if self.enable_sleeping:
             self._update_mjc_data(d, self.model, state, world_mask=world_mask)
-            self._wake_sleeping_worlds(world_mask, clear_overflow=True)
+            self._wake_sleeping_worlds(world_mask)
             # Sleeping trees retain derived state, so rebuild it at the reset
             # coordinates before restoring the initial sleep bookkeeping.
             with wp.ScopedDevice(self.model.device), self._scoped_mujoco_warp_execution():
                 self._mujoco_warp.fwd_position(self.mjw_model, d, factorize=False)
                 self._mujoco_warp.fwd_velocity(self.mjw_model, d)
-            self._restore_initial_sleeping_state(world_mask, clear_overflow=True)
+            self._restore_initial_sleeping_state(world_mask)
             if self._has_body_sleep_overrides:
                 from mujoco_warp._src import sleep
 
@@ -4735,7 +6109,16 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             device=self.model.device,
         )
 
-    def _convert_contacts_to_mjwarp(self, model: Model, state_in: State, contacts: Contacts):
+    def _convert_contacts_to_mjwarp(self, model: Model, state_in: State, contacts: Contacts, dt: float) -> int:
+        velocity_speculation_active = contacts._velocity_speculation_active
+        strict_nonpenetration_active = contacts._strict_nonpenetration_active
+        if (
+            velocity_speculation_active or strict_nonpenetration_active
+        ) and self.mjw_model.opt.integrator == _MJ_INTEGRATOR_RK4:
+            raise NotImplementedError(
+                "Velocity-adapted external contacts are not supported with integrator='rk4'; "
+                "use 'euler', 'implicit', or 'implicitfast'."
+            )
         # Ensure the inverse shape mapping exists (lazy creation)
         if self.newton_shape_to_mjc_geom is None:
             self._create_inverse_shape_mapping()
@@ -4744,7 +6127,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         # path clamps count and rejects cid >= naconmax).  Launching more
         # threads than naconmax wastes GPU resources, so cap the grid size.
         naconmax = self.mjw_data.naconmax
-        launch_dim = min(contacts.rigid_contact_max, naconmax)
+        contact_launch_dim = min(contacts.rigid_contact_max, naconmax)
+        launch_dim = max(contact_launch_dim, model.body_count)
 
         # Grow the tid_to_cid buffer if the MJWarp data capacity changed after
         # construction.
@@ -4761,24 +6145,67 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         #    after notify_model_changed), cached cid values could index into
         #    freed memory or out-of-bounds.
         contacts_id = id(contacts.contact_generation)
-        needs_realloc = self._contact_tid_to_cid is None or self._contact_tid_to_cid.shape[0] < launch_dim
+        needs_realloc = (
+            self._contact_tid_to_cid is None
+            or self._contact_horizon_state is None
+            or self._contact_tid_to_cid.shape[0] < contact_launch_dim
+            or (
+                self._strict_contact_endpoint_reserve is not None
+                and self._strict_contact_endpoint_reserve.shape[0] < contact_launch_dim
+            )
+        )
         contacts_changed = (
             self._last_contacts_id != contacts_id
             or self._last_rigid_contact_max != contacts.rigid_contact_max
             or self._last_naconmax != naconmax
+            or self._last_velocity_speculation_active != velocity_speculation_active
+            or self._last_strict_nonpenetration_active != strict_nonpenetration_active
         )
 
         if needs_realloc or contacts_changed:
             if needs_realloc:
-                self._contact_tid_to_cid = wp.full(launch_dim, -1, dtype=wp.int32, device=model.device)
+                self._contact_tid_to_cid = wp.full(contact_launch_dim, -1, dtype=wp.int32, device=model.device)
+                self._contact_horizon_state = wp.zeros(contact_launch_dim, dtype=wp.uint8, device=model.device)
+                if self._strict_contact_endpoint_reserve is not None:
+                    self._strict_contact_endpoint_reserve = wp.zeros(
+                        contact_launch_dim,
+                        dtype=wp.float32,
+                        device=model.device,
+                    )
             # Reset existing device buffers (always pre-allocated in __init__).
             self._invalidate_contact_fast_path()
             self._last_contacts_id = contacts_id
             self._last_rigid_contact_max = contacts.rigid_contact_max
             self._last_naconmax = naconmax
+            self._last_velocity_speculation_active = velocity_speculation_active
+            self._last_strict_nonpenetration_active = strict_nonpenetration_active
 
-        # Zero nacon before the kernel — the full path uses atomic_add to count
-        # contacts; the fast path restores the count from last_nacon_count.
+        # Preflight the exact variable-size contact-entry requirement before any converter
+        # thread writes. This keeps strict contact generations all-or-nothing.
+        if strict_nonpenetration_active:
+            preflight_worker_count = max(
+                1,
+                min(
+                    contacts.rigid_contact_max,
+                    max(model.device.sm_count, 1) * _CONTACT_ENTRY_PREFLIGHT_BLOCK_DIM,
+                ),
+            )
+            self._required_mjwarp_contact_entries.zero_()
+            wp.launch(
+                count_mjwarp_contact_entries_kernel,
+                dim=preflight_worker_count,
+                inputs=[
+                    contacts.rigid_contact_count,
+                    contacts.rigid_contact_is_strict_guard,
+                    preflight_worker_count,
+                    self._required_mjwarp_contact_entries,
+                ],
+                device=model.device,
+                block_dim=_CONTACT_ENTRY_PREFLIGHT_BLOCK_DIM,
+            )
+
+        # Zero nacon before the kernel. The full path reserves one or two contact entries
+        # per contact; the fast path restores the previous compacted count.
         self.mjw_data.nacon.zero_()
 
         bodies_per_world = self.model.body_count // self.model.world_count
@@ -4791,6 +6218,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 state_in.body_q,
                 model.shape_body,
                 model.body_flags,
+                velocity_speculation_active,
+                strict_nonpenetration_active,
+                dt,
                 self.mjw_model.geom_bodyid,
                 self.mjw_model.body_weldid,
                 self.mjw_model.body_invweight0,
@@ -4813,6 +6243,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 contacts.rigid_contact_point0,
                 contacts.rigid_contact_point1,
                 contacts.rigid_contact_normal,
+                contacts.rigid_contact_normal_owner,
+                contacts.rigid_contact_is_predictive,
+                contacts.rigid_contact_is_strict_guard,
                 contacts.rigid_contact_offset0,
                 contacts.rigid_contact_offset1,
                 contacts.rigid_contact_margin0,
@@ -4841,14 +6274,21 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self.mjw_data.contact.geom,
                 self.mjw_data.contact.efc_address,
                 self.mjw_data.contact.worldid,
+                self.mjw_data.contact.type,
+                self.mjw_data.contact.adhesion,
                 # Data to clear
                 self.mjw_data.nworld,
                 self.mjw_data.ncollision,
+                self.mjw_data.overflow,
+                self._required_mjwarp_contact_entries,
+                self._zero_mjwarp_contact_entries,
                 # Fast-path generation tracking
                 contacts.contact_generation,
                 self._last_contact_generation,
                 self._contact_tid_to_cid,
+                self._contact_horizon_state,
                 self._last_nacon_count,
+                self._contact_owner_rotation_at_generation,
             ],
             device=model.device,
         )
@@ -4856,8 +6296,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         # Snapshot the final nacon count and generation so the fast path can
         # restore them on subsequent substeps.  Runs as a separate dim=1
         # kernel AFTER the main kernel completes so that:
-        #  - nacon_out has its final value (from atomic_add on full path, or
-        #    restored from last_nacon_count on fast path)
+        #  - nacon_out has its final reserved-entry count on the full path, or
+        #    the restored last_nacon_count on the fast path
         #  - last_contact_generation is only updated after ALL threads in the
         #    main kernel have read it (avoids a cross-block race)
         wp.launch(
@@ -4871,6 +6311,134 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             ],
             device=model.device,
         )
+        return contact_launch_dim
+
+    def _append_strict_oracle_contacts_to_mjwarp(
+        self,
+        state_in: State,
+        dt: float,
+        guard_state: _StrictOracleGuardState,
+        existing_contact_entries: wp.array[wp.int32],
+    ) -> int:
+        """Append the cumulative fixed-capacity guard set to the current MJWarp contacts."""
+        contacts = guard_state.contacts
+
+        model = self.model
+        naconmax = self.mjw_data.naconmax
+        contact_launch_dim = min(contacts.rigid_contact_max, naconmax)
+        launch_dim = max(contact_launch_dim, model.body_count)
+        preflight_worker_count = max(
+            1,
+            min(
+                contacts.rigid_contact_max,
+                max(model.device.sm_count, 1) * _CONTACT_ENTRY_PREFLIGHT_BLOCK_DIM,
+            ),
+        )
+        guard_state.required_contact_entries.zero_()
+        wp.launch(
+            count_mjwarp_contact_entries_kernel,
+            dim=preflight_worker_count,
+            inputs=[
+                contacts.rigid_contact_count,
+                contacts.rigid_contact_is_strict_guard,
+                preflight_worker_count,
+                guard_state.required_contact_entries,
+            ],
+            device=model.device,
+            block_dim=_CONTACT_ENTRY_PREFLIGHT_BLOCK_DIM,
+        )
+
+        bodies_per_world = model.body_count // model.world_count
+        mujoco_attrs = getattr(model, "mujoco", None)
+        shape_mjc_solref_mode = getattr(mujoco_attrs, "solref_mode", None) if mujoco_attrs is not None else None
+        wp.launch(
+            convert_newton_contacts_to_mjwarp_kernel,
+            dim=launch_dim,
+            inputs=[
+                state_in.body_q,
+                model.shape_body,
+                model.body_flags,
+                True,
+                True,
+                dt,
+                self.mjw_model.geom_bodyid,
+                self.mjw_model.body_weldid,
+                self.mjw_model.body_invweight0,
+                self.mjw_model.geom_condim,
+                self.mjw_model.geom_priority,
+                self.mjw_model.geom_solmix,
+                self.mjw_model.geom_solref,
+                self.mjw_model.geom_solimp,
+                self.mjw_model.geom_friction,
+                self.mjw_model.geom_margin,
+                self.mjw_model.geom_gap,
+                model.shape_material_ke,
+                model.shape_material_kd,
+                shape_mjc_solref_mode,
+                contacts.rigid_contact_count,
+                contacts.rigid_contact_shape0,
+                contacts.rigid_contact_shape1,
+                contacts.rigid_contact_point0,
+                contacts.rigid_contact_point1,
+                contacts.rigid_contact_normal,
+                contacts.rigid_contact_normal_owner,
+                contacts.rigid_contact_is_predictive,
+                contacts.rigid_contact_is_strict_guard,
+                contacts.rigid_contact_offset0,
+                contacts.rigid_contact_offset1,
+                contacts.rigid_contact_margin0,
+                contacts.rigid_contact_margin1,
+                contacts.rigid_contact_stiffness,
+                contacts.rigid_contact_damping,
+                contacts.rigid_contact_friction,
+                model.shape_margin,
+                model.shape_material_kf,
+                self.mjw_model.opt.impratio_invsqrt,
+                self.mjw_model.opt.cone == self._mujoco.mjtCone.mjCONE_ELLIPTIC,
+                bodies_per_world,
+                self.newton_shape_to_mjc_geom,
+                self.mjw_data.naconmax,
+                self.mjw_data.nacon,
+                self.mjw_data.contact.dist,
+                self.mjw_data.contact.pos,
+                self.mjw_data.contact.frame,
+                self.mjw_data.contact.includemargin,
+                self.mjw_data.contact.friction,
+                self.mjw_data.contact.solref,
+                self.mjw_data.contact.solreffriction,
+                self.mjw_data.contact.solimp,
+                self.mjw_data.contact.dim,
+                self.mjw_data.contact.geom,
+                self.mjw_data.contact.efc_address,
+                self.mjw_data.contact.worldid,
+                self.mjw_data.contact.type,
+                self.mjw_data.contact.adhesion,
+                self.mjw_data.nworld,
+                self.mjw_data.ncollision,
+                self.mjw_data.overflow,
+                guard_state.required_contact_entries,
+                existing_contact_entries,
+                contacts.contact_generation,
+                guard_state.last_contact_generation,
+                guard_state.tid_to_cid,
+                guard_state.horizon_state,
+                guard_state.nacon_count,
+                guard_state.owner_rotation_at_generation,
+            ],
+            device=model.device,
+        )
+        wp.launch(
+            _snapshot_nacon_count,
+            dim=1,
+            inputs=[
+                self.mjw_data.nacon,
+                guard_state.nacon_count,
+                contacts.contact_generation,
+                guard_state.last_contact_generation,
+            ],
+            device=model.device,
+        )
+        return contact_launch_dim
 
     def _sync_mjw_inertias_to_mjc_cpu(self) -> None:
         """Synchronize the complete MJWarp inertial representation to MuJoCo CPU."""
@@ -5716,6 +7284,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 f"rigid_contact_max={mj_data.naconmax}."
             )
 
+        contacts._velocity_speculation_active = False
+        contacts._strict_nonpenetration_active = False
+        contacts.rigid_contact_normal_owner.fill_(-1)
+        contacts.rigid_contact_is_predictive.zero_()
+        contacts.rigid_contact_is_strict_guard.zero_()
         wp.launch(
             self._convert_mjw_contacts_to_newton_kernel,
             dim=mj_data.naconmax,

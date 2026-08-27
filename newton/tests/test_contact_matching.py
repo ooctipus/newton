@@ -479,6 +479,7 @@ def test_save_resets_next_frame_report_flags(test, device):
             sorted_shape0=contacts.rigid_contact_shape0,
             sorted_shape1=contacts.rigid_contact_shape1,
             sorted_normal=contacts.rigid_contact_normal,
+            sorted_normal_owner=contacts.rigid_contact_normal_owner,
             body_q=state.body_q,
             shape_body=model.shape_body,
             device=device,
@@ -773,6 +774,74 @@ def test_sticky_matched_rows_replayed(test, device):
             )
 
 
+def test_normal_owner_change_breaks_match(test, device):
+    """Treat equal contact geometry with different normal ownership as unmatched."""
+    with wp.ScopedDevice(device):
+        model, state = _build_simple_scene(device)
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="latest")
+        contacts = pipeline.contacts()
+
+        count = _collide_once(pipeline, state, contacts)
+        test.assertGreater(count, 0)
+        pipeline._contact_sorter.scratch_normal_owner.fill_(0)
+
+        test.assertEqual(_collide_once(pipeline, state, contacts), count)
+        np.testing.assert_array_equal(
+            contacts.rigid_contact_match_index.numpy()[:count],
+            np.full(count, int(MATCH_BROKEN), dtype=np.int32),
+        )
+
+
+def test_sticky_replays_normal_owner_with_normal(test, device):
+    """Replay a sticky normal and its shape-relative owner as one record."""
+    with wp.ScopedDevice(device):
+        model, state = _build_simple_scene(device)
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="sticky")
+        contacts = pipeline.contacts()
+
+        count = _collide_once(pipeline, state, contacts)
+        test.assertGreater(count, 0)
+        matcher = pipeline._contact_matcher
+
+        saved_normals = matcher._prev_normal_sticky.numpy()
+        saved_normals[0] = (1.0, 0.0, 0.0)
+        matcher._prev_normal_sticky.assign(saved_normals)
+        saved_owners = matcher._prev_normal_owner_sticky.numpy()
+        saved_owners[0] = 0
+        matcher._prev_normal_owner_sticky.assign(saved_owners)
+
+        match_indices = np.full(contacts.rigid_contact_max, int(MATCH_NOT_FOUND), dtype=np.int32)
+        match_indices[0] = 0
+        contacts.rigid_contact_match_index.assign(match_indices)
+        current_owners = contacts.rigid_contact_normal_owner.numpy()
+        current_owners[0] = 1
+        contacts.rigid_contact_normal_owner.assign(current_owners)
+        margins = contacts.rigid_contact_margin0.numpy()
+        margins[0] = 1.0
+        contacts.rigid_contact_margin0.assign(margins)
+
+        matcher.replay_matched(
+            contact_count=contacts.rigid_contact_count,
+            match_index=contacts.rigid_contact_match_index,
+            point0=contacts.rigid_contact_point0,
+            point1=contacts.rigid_contact_point1,
+            offset0=contacts.rigid_contact_offset0,
+            offset1=contacts.rigid_contact_offset1,
+            normal=contacts.rigid_contact_normal,
+            normal_owner=contacts.rigid_contact_normal_owner,
+            shape0=contacts.rigid_contact_shape0,
+            shape1=contacts.rigid_contact_shape1,
+            margin0=contacts.rigid_contact_margin0,
+            margin1=contacts.rigid_contact_margin1,
+            body_q=state.body_q,
+            shape_body=model.shape_body,
+            device=device,
+        )
+
+        np.testing.assert_array_equal(contacts.rigid_contact_normal.numpy()[0], saved_normals[0])
+        test.assertEqual(int(contacts.rigid_contact_normal_owner.numpy()[0]), 0)
+
+
 def test_sticky_unmatched_rows_pass_through(test, device):
     """STICKY mode: unmatched rows keep the current frame's narrow-phase data.
 
@@ -842,6 +911,7 @@ def test_sticky_disabled_no_sticky_buffers(test, device):
         test.assertIsNone(p_latest._contact_matcher._prev_point1)
         test.assertIsNone(p_latest._contact_matcher._prev_offset0)
         test.assertIsNone(p_latest._contact_matcher._prev_offset1)
+        test.assertIsNone(p_latest._contact_matcher._prev_normal_owner_sticky)
 
         p_off = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="disabled")
         test.assertIsNone(p_off._contact_matcher)
@@ -852,6 +922,7 @@ def test_sticky_disabled_no_sticky_buffers(test, device):
         test.assertIsNotNone(p_sticky._contact_matcher._prev_point1)
         test.assertIsNotNone(p_sticky._contact_matcher._prev_offset0)
         test.assertIsNotNone(p_sticky._contact_matcher._prev_offset1)
+        test.assertIsNotNone(p_sticky._contact_matcher._prev_normal_owner_sticky)
 
 
 # ---------------------------------------------------------------------------
@@ -946,6 +1017,18 @@ add_function_test(
 
 add_function_test(
     TestContactMatchingSticky, "test_sticky_matched_rows_replayed", test_sticky_matched_rows_replayed, devices=devices
+)
+add_function_test(
+    TestContactMatchingSticky,
+    "test_normal_owner_change_breaks_match",
+    test_normal_owner_change_breaks_match,
+    devices=devices,
+)
+add_function_test(
+    TestContactMatchingSticky,
+    "test_sticky_replays_normal_owner_with_normal",
+    test_sticky_replays_normal_owner_with_normal,
+    devices=devices,
 )
 add_function_test(
     TestContactMatchingSticky,

@@ -91,6 +91,16 @@ class TestMuJoCoReset(unittest.TestCase):
             self.assertTrue(np.all(values[0] == 0.0), f"{name} not cleared in masked world 0")
             self.assertTrue(np.all(values[1] == 7.0), f"{name} wrongly cleared in unmasked world 1")
 
+    def test_reset_clears_overflow_in_masked_world_without_sleeping(self):
+        """Clear sticky overflow only in the selected world when sleeping is disabled."""
+        self.assertFalse(self.solver.enable_sleeping)
+        self.solver.mjw_data.overflow.assign(np.asarray((11, 13), dtype=np.int32))
+        mask = wp.array((True, False, False), dtype=wp.bool, device=self.model.device)
+
+        self.solver.reset(self.state_out, world_mask=mask, flags=0)
+
+        np.testing.assert_array_equal(self.solver.mjw_data.overflow.numpy(), (0, 13))
+
     def test_reset_deprecates_local_only_mask(self):
         """Preserve local-only mask behavior through the deprecation period."""
         self._poison()

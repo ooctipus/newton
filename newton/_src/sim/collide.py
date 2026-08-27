@@ -15,10 +15,18 @@ from ..geometry.broad_phase_nxn import BroadPhaseAllPairs, BroadPhaseExplicit
 from ..geometry.broad_phase_sap import BroadPhaseSAP
 from ..geometry.collision_core import compute_tight_aabb_from_support
 from ..geometry.contact_data import (
+    CONTACT_STRICT_GUARD_NONE,
+    CONTACT_STRICT_GUARD_ONLY,
+    CONTACT_STRICT_GUARD_PAIRED,
     ContactData,
     contact_passes_speculative_gap_check,
     make_contact_sort_key,
+    pack_contact_is_strict_guard,
     prepare_speculative_contact,
+    unpack_contact_feature_key,
+    unpack_contact_is_canonical_endpoint,
+    unpack_contact_is_strict_guard,
+    unpack_contact_normal_owner,
 )
 from ..geometry.contact_match import ContactMatcher
 from ..geometry.contact_sort import ContactSorter
@@ -34,6 +42,11 @@ from ..geometry.support_function import (
     pack_mesh_ptr,
 )
 from ..geometry.types import GeoType
+from ..sim.contact_oracle import (
+    RIGID_BODY_PATH_STATIONARY,
+    RigidBodyPathCertificate,
+    _MeshSDFNonpenetrationOracle,
+)
 from ..sim.contacts import Contacts
 from ..sim.model import Model
 from ..sim.state import State
@@ -65,6 +78,16 @@ _ANALYTIC_PRIMITIVE_PAIRS = frozenset(
     }
 )
 _MESH_SDF_RESOURCE_GROUPING_CAPACITY_THRESHOLD = 65_536
+
+
+@wp.kernel(enable_backward=False)
+def _write_mesh_nonpenetration_feasibility(
+    world_status: wp.array[wp.int32],
+    out_world_feasible: wp.array[wp.bool],
+):
+    """Convert the fail-closed oracle status to one Boolean per world."""
+    world = wp.tid()
+    out_world_feasible[world] = world_status[world] == 0
 
 
 def _pair_requires_generic_convex_narrow_phase(
@@ -147,6 +170,9 @@ class ContactWriterData:
     out_offset0: wp.array[wp.vec3]
     out_offset1: wp.array[wp.vec3]
     out_normal: wp.array[wp.vec3]
+    out_normal_owner: wp.array[wp.int32]
+    out_is_predictive: wp.array[wp.uint8]
+    out_is_strict_guard: wp.array[wp.uint8]
     out_margin0: wp.array[float]
     out_margin1: wp.array[float]
     out_tids: wp.array[int]
@@ -160,8 +186,10 @@ class ContactWriterData:
     shape_transform: wp.array[wp.transform]
     shape_linear_velocity: wp.array[wp.vec3]
     shape_angular_velocity: wp.array[wp.vec3]
+    shape_rotation_center_offset: wp.array[wp.vec3]
     collision_update_dt: float
     max_speculative_extension: float
+    strict_nonpenetration_active: int
 
 
 @wp.func
@@ -172,6 +200,8 @@ def _write_contact_at_index(
     point_a_world: wp.vec3,
     point_b_world: wp.vec3,
     normal_a_to_b: wp.vec3,
+    is_predictive: bool,
+    strict_guard_kind: int,
 ):
     """Write a previously accepted contact at a reserved output index."""
     if index >= writer_data.contact_max:
@@ -193,6 +223,9 @@ def _write_contact_at_index(
     writer_data.out_offset0[index] = wp.transform_vector(X_bw_a, offset_mag_a * normal_a_to_b)
     writer_data.out_offset1[index] = wp.transform_vector(X_bw_b, -offset_mag_b * normal_a_to_b)
     writer_data.out_normal[index] = normal_a_to_b
+    writer_data.out_normal_owner[index] = unpack_contact_normal_owner(contact_data.sort_sub_key)
+    writer_data.out_is_predictive[index] = wp.uint8(is_predictive)
+    writer_data.out_is_strict_guard[index] = wp.uint8(strict_guard_kind)
     writer_data.out_margin0[index] = offset_mag_a
     writer_data.out_margin1[index] = offset_mag_b
     writer_data.out_tids[index] = 0
@@ -204,7 +237,7 @@ def _write_contact_at_index(
 
     if writer_data.out_sort_key.shape[0] > 0:
         writer_data.out_sort_key[index] = make_contact_sort_key(
-            contact_data.shape_a, contact_data.shape_b, contact_data.sort_sub_key
+            contact_data.shape_a, contact_data.shape_b, unpack_contact_feature_key(contact_data.sort_sub_key)
         )
 
 
@@ -252,7 +285,17 @@ def write_contact(
         if d > contact_gap:
             return
         index = wp.atomic_add(writer_data.contact_count, 0, 1)
-    _write_contact_at_index(contact_data, writer_data, index, a_contact_world, b_contact_world, contact_normal_a_to_b)
+    contact_data.sort_sub_key = pack_contact_is_strict_guard(contact_data.sort_sub_key, False)
+    _write_contact_at_index(
+        contact_data,
+        writer_data,
+        index,
+        a_contact_world,
+        b_contact_world,
+        contact_normal_a_to_b,
+        False,
+        CONTACT_STRICT_GUARD_NONE,
+    )
 
 
 @wp.func
@@ -263,22 +306,55 @@ def write_contact_speculative(
 ):
     """Write a present or exactly predicted contact to the output arrays."""
     contact_data.gap_sum = writer_data.shape_gap[contact_data.shape_a] + writer_data.shape_gap[contact_data.shape_b]
-    normal, point_a_world, point_b_world, _separation = prepare_speculative_contact(contact_data)
+    normal, point_a_world, point_b_world, separation = prepare_speculative_contact(contact_data)
 
     index = output_index
     if index < 0:
-        if not contact_passes_speculative_gap_check(
+        passes_admission = contact_passes_speculative_gap_check(
             contact_data,
             writer_data.shape_transform,
             writer_data.shape_linear_velocity,
             writer_data.shape_angular_velocity,
+            writer_data.shape_rotation_center_offset,
             writer_data.collision_update_dt,
             writer_data.max_speculative_extension,
+        )
+        if (
+            not passes_admission
+            and writer_data.strict_nonpenetration_active != 0
+            and separation <= wp.max(contact_data.gap_sum, writer_data.max_speculative_extension)
         ):
+            passes_admission = True
+        if not passes_admission:
             return
         index = wp.atomic_add(writer_data.contact_count, 0, 1)
+    # Direct manifolds are already bounded by their generator, so every member
+    # can guard the horizon. Global reduction owns the strict subset for
+    # mesh/SDF manifolds and marks its decision final. Predictive provenance is
+    # deliberately separation-only; strict-guard provenance survives physical
+    # contact so the solver can guard a bounded subset without replacing the
+    # authored response of the remaining physical manifold.
+    guard_only = contact_data.strict_guard_provenance_finalized == 2
+    is_canonical_endpoint = unpack_contact_is_canonical_endpoint(contact_data.sort_sub_key)
+    is_strict_guard = (
+        guard_only
+        or (
+            contact_data.strict_guard_provenance_finalized == 1
+            and unpack_contact_is_strict_guard(contact_data.sort_sub_key)
+        )
+        or (contact_data.strict_guard_provenance_finalized == 0 and not is_canonical_endpoint)
+    )
+    is_predictive = separation > 0.0 and is_strict_guard
+    contact_data.sort_sub_key = pack_contact_is_strict_guard(contact_data.sort_sub_key, is_strict_guard)
+    strict_guard_kind = CONTACT_STRICT_GUARD_NONE
+    if is_strict_guard:
+        strict_guard_kind = CONTACT_STRICT_GUARD_PAIRED
+    if guard_only:
+        strict_guard_kind = CONTACT_STRICT_GUARD_ONLY
 
-    _write_contact_at_index(contact_data, writer_data, index, point_a_world, point_b_world, normal)
+    _write_contact_at_index(
+        contact_data, writer_data, index, point_a_world, point_b_world, normal, is_predictive, strict_guard_kind
+    )
 
 
 @wp.kernel(enable_backward=False)
@@ -486,6 +562,7 @@ def compute_shape_velocities(
     shape_gap: wp.array[float],
     collision_update_dt: float,
     max_speculative_extension: float,
+    strict_nonpenetration_active: int,
     # outputs
     shape_linear_velocity: wp.array[wp.vec3],
     shape_angular_velocity: wp.array[wp.vec3],
@@ -504,11 +581,20 @@ def compute_shape_velocities(
     """
     shape_id = wp.tid()
     body_id = shape_body[shape_id]
+    strict_search_extension = float(0.0)
+    if strict_nonpenetration_active != 0:
+        # Split the pair-wide geometric shell evenly between both shapes. Two
+        # stationary AABBs then overlap throughout exactly one configured
+        # extension without doubling the admitted pair clearance.
+        strict_search_extension = 0.5 * max_speculative_extension
     if body_id == -1:
         shape_linear_velocity[shape_id] = wp.vec3(0.0)
         shape_angular_velocity[shape_id] = wp.vec3(0.0)
-        shape_search_gap[shape_id] = shape_gap[shape_id]
+        shape_search_gap[shape_id] = shape_gap[shape_id] + strict_search_extension
         shape_displacement[shape_id] = wp.vec3(0.0)
+        strict_extension_vec = wp.vec3(strict_search_extension)
+        shape_aabb_lower[shape_id] = shape_aabb_lower[shape_id] - strict_extension_vec
+        shape_aabb_upper[shape_id] = shape_aabb_upper[shape_id] + strict_extension_vec
         return
 
     X_wb = body_q[body_id]
@@ -531,7 +617,7 @@ def compute_shape_velocities(
         (wp.length(shape_origin_velocity) + angular_speed_bound) * collision_update_dt,
         max_speculative_extension,
     )
-    shape_search_gap[shape_id] = shape_gap[shape_id] + search_extension
+    shape_search_gap[shape_id] = shape_gap[shape_id] + wp.max(search_extension, strict_search_extension)
 
     displacement = shape_origin_velocity * collision_update_dt
     angular_extension = angular_speed_bound * collision_update_dt
@@ -539,8 +625,28 @@ def compute_shape_velocities(
     # Preserve absolute motion so pairwise subtraction retains relative velocity.
     shape_displacement[shape_id] = displacement
     angular_extension_vec = wp.min(wp.vec3(angular_extension), cap)
-    shape_aabb_lower[shape_id] = shape_aabb_lower[shape_id] - angular_extension_vec
-    shape_aabb_upper[shape_id] = shape_aabb_upper[shape_id] + angular_extension_vec
+    aabb_extension = wp.max(angular_extension_vec, wp.vec3(strict_search_extension))
+    shape_aabb_lower[shape_id] = shape_aabb_lower[shape_id] - aabb_extension
+    shape_aabb_upper[shape_id] = shape_aabb_upper[shape_id] + aabb_extension
+
+
+@wp.kernel(enable_backward=False)
+def compute_shape_rotation_center_offsets(
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    shape_body: wp.array[int],
+    shape_transform: wp.array[wp.transform],
+    shape_rotation_center_offset: wp.array[wp.vec3],
+):
+    """Write each body's world COM offset from its shape origin [m]."""
+    shape_id = wp.tid()
+    body_id = shape_body[shape_id]
+    if body_id < 0:
+        shape_rotation_center_offset[shape_id] = wp.vec3(0.0)
+        return
+    rotation_center = wp.transform_point(body_q[body_id], body_com[body_id])
+    shape_origin = wp.transform_get_translation(shape_transform[shape_id])
+    shape_rotation_center_offset[shape_id] = rotation_center - shape_origin
 
 
 # Primitive pairs (GJK/MPR) produce up to 5 manifold contacts.
@@ -1095,6 +1201,19 @@ class CollisionPipeline:
 
         max_speculative_extension: float = 0.1
         """Upper bound on the velocity-based contact gap [m]. ``0.0`` disables velocity adaptation."""
+
+        enforce_nonpenetration: bool = False
+        """Keep retained contacts from crossing their physical surface within a solver step.
+
+        When enabled, the MuJoCo Warp solver uses a normal-only positive-gap inequality for separated guards.
+        At the physical surface it retains the authored friction cone while shifting its facet references by
+        a common hard-inequality correction. It also performs a correction solve for finite rotation created
+        during the substep. Call :meth:`~newton.solvers.SolverMuJoCo.bind_collision_pipeline` before the first
+        strict collision pass, solver step, or graph capture so eligible raw-mesh ownership can be activated.
+        This option requires a positive
+        :attr:`max_speculative_extension`, adds one constraint solve per solver substep, and is ignored by
+        solvers that do not implement the strict guard.
+        """
 
         def __post_init__(self):
             """Validate the finite, non-negative extension limit."""
@@ -1677,6 +1796,142 @@ class CollisionPipeline:
         else:
             self._contact_matcher = None
 
+        self._strict_nonpenetration_oracle: _MeshSDFNonpenetrationOracle | None = None
+        self._strict_nonpenetration_oracle_eligible_shape = None
+        self._strict_nonpenetration_oracle_anchor_shape = None
+        self._strict_nonpenetration_claim_owner: object | None = None
+        self._strict_nonpenetration_contact_token: object | None = None
+        self._mesh_nonpenetration_zero_origin_path_length: wp.array[wp.float32] | None = None
+        self._mesh_nonpenetration_zero_angular_path_length: wp.array[wp.float32] | None = None
+        self._mesh_nonpenetration_stationary_motion_kind: wp.array[wp.uint8] | None = None
+
+    def _get_or_create_mesh_nonpenetration_oracle(self) -> _MeshSDFNonpenetrationOracle | None:
+        """Return the pipeline-owned raw-mesh oracle when the model supports it."""
+        if self._strict_nonpenetration_oracle is not None:
+            return self._strict_nonpenetration_oracle
+        if self.narrow_phase.max_mesh_mesh_pairs <= 0 or not _MeshSDFNonpenetrationOracle.supports_model(self.model):
+            return None
+        self._strict_nonpenetration_oracle = _MeshSDFNonpenetrationOracle(
+            model=self.model,
+            broad_phase=self.broad_phase,
+            shape_pairs_filtered=self.shape_pairs_filtered,
+            shape_pairs_excluded=self.shape_pairs_excluded,
+            shape_pairs_excluded_count=self.shape_pairs_excluded_count,
+            include_static_kinematic_pairs=self.include_static_kinematic_pairs,
+            candidate_pairs=self.broad_phase_shape_pairs,
+            candidate_pair_count=self.broad_phase_pair_count,
+            endpoint_pairs=self.narrow_phase.shape_pairs_mesh_mesh,
+            endpoint_pair_count=self.narrow_phase.shape_pairs_mesh_mesh_count,
+        )
+        return self._strict_nonpenetration_oracle
+
+    def _claim_strict_nonpenetration_oracle(
+        self,
+        owner: object,
+        *,
+        allow_oracle: bool,
+    ) -> tuple[_MeshSDFNonpenetrationOracle | None, object | None]:
+        """Claim and lazily activate the private raw-mesh oracle for one solver."""
+        config = self.speculative_config
+        oracle_requested = config is not None and config.enforce_nonpenetration
+        if self._strict_nonpenetration_claim_owner is not None:
+            if self._strict_nonpenetration_claim_owner is owner:
+                return self._strict_nonpenetration_oracle, self._strict_nonpenetration_contact_token
+            raise RuntimeError("The collision pipeline's strict nonpenetration state is already claimed.")
+        if not oracle_requested:
+            # Without an eligible live movable--immovable mesh domain, no raw
+            # contacts are suppressed and there is no mutable oracle state to
+            # claim. Ordinary strict endpoint guards remain active.
+            return None, None
+        nonpenetration_oracle = self._get_or_create_mesh_nonpenetration_oracle()
+        if nonpenetration_oracle is None:
+            return None, None
+        if not allow_oracle:
+            raise ValueError("The strict nonpenetration oracle requires external contacts on the MuJoCo Warp backend.")
+        self._strict_nonpenetration_claim_owner = owner
+        self._strict_nonpenetration_oracle_eligible_shape = nonpenetration_oracle._eligible_shape
+        self._strict_nonpenetration_oracle_anchor_shape = nonpenetration_oracle._anchor_capable_shape
+        self._strict_nonpenetration_contact_token = owner
+        return nonpenetration_oracle, owner
+
+    def check_mesh_nonpenetration(
+        self,
+        state: State,
+        out_world_feasible: wp.array[wp.bool],
+    ) -> None:
+        """Check raw-mesh nonpenetration in a rigid-body state.
+
+        The exact domain contains raw ``MESH`` pairs with one shape attached to
+        the direct child of a ``FREE`` joint and the other attached to a static
+        or kinematic body. Query incompleteness, fixed-buffer overflows, and an
+        unavailable zero-capacity mesh-pair buffer fail closed. Models without
+        such an eligible pair return ``True`` for every world.
+
+        This experimental query reuses collision-pipeline scratch storage and
+        must not run concurrently with :meth:`collide`, a solver step, or
+        another query on this pipeline. It does not claim strict-contact
+        ownership or activate collision-time contact suppression.
+
+        Args:
+            state: State containing the rigid-body poses to check.
+            out_world_feasible: Boolean feasibility output, shape
+                ``(model.world_count,)``, on the model device.
+
+        Raises:
+            ValueError: If the output or state's rigid-body poses do not match
+                the pipeline model.
+        """
+        expected_shape = (self.model.world_count,)
+        if out_world_feasible.shape != expected_shape:
+            raise ValueError(f"out_world_feasible must have shape {expected_shape}, got {out_world_feasible.shape}")
+        if out_world_feasible.dtype != wp.bool:
+            raise ValueError("out_world_feasible must have dtype bool")
+        if out_world_feasible.device != self.model.device:
+            raise ValueError("out_world_feasible must be on the model device")
+        if state.body_q is None:
+            raise ValueError("state.body_q is required for mesh nonpenetration checks")
+        if state.body_q.shape != (self.model.body_count,):
+            raise ValueError(f"state.body_q must have shape ({self.model.body_count},), got {state.body_q.shape}")
+        if state.body_q.device != self.model.device:
+            raise ValueError("state.body_q must be on the model device")
+
+        oracle = self._get_or_create_mesh_nonpenetration_oracle()
+        if oracle is None:
+            eligible_domain_is_unavailable = (
+                self.narrow_phase.max_mesh_mesh_pairs <= 0 and _MeshSDFNonpenetrationOracle.supports_model(self.model)
+            )
+            out_world_feasible.fill_(not eligible_domain_is_unavailable)
+            return
+
+        if self._mesh_nonpenetration_zero_origin_path_length is None:
+            self._mesh_nonpenetration_zero_origin_path_length = wp.zeros(
+                self.model.body_count, dtype=wp.float32, device=self.model.device
+            )
+            self._mesh_nonpenetration_zero_angular_path_length = wp.zeros(
+                self.model.body_count, dtype=wp.float32, device=self.model.device
+            )
+            self._mesh_nonpenetration_stationary_motion_kind = wp.full(
+                self.model.body_count,
+                RIGID_BODY_PATH_STATIONARY,
+                dtype=wp.uint8,
+                device=self.model.device,
+            )
+        path = RigidBodyPathCertificate(
+            endpoint_body_q=state.body_q,
+            origin_path_length=self._mesh_nonpenetration_zero_origin_path_length,
+            angular_path_length=self._mesh_nonpenetration_zero_angular_path_length,
+            motion_kind=self._mesh_nonpenetration_stationary_motion_kind,
+        )
+        oracle.scan(state.body_q, path)
+        wp.launch(
+            kernel=_write_mesh_nonpenetration_feasibility,
+            dim=self.model.world_count,
+            inputs=[oracle.world_status],
+            outputs=[out_world_feasible],
+            device=self.model.device,
+            record_tape=False,
+        )
+
     @property
     def rigid_contact_max(self) -> int:
         """Maximum rigid contact buffer capacity used by this pipeline."""
@@ -1804,6 +2059,10 @@ class CollisionPipeline:
         :func:`newton.eval_rigid_contact_kinematics` explicitly
         after collision detection to reconstruct only the quantities it needs.
 
+        A pipeline used for strict external MuJoCo Warp contacts should be bound with
+        :meth:`~newton.solvers.SolverMuJoCo.bind_collision_pipeline` before this method is called. Before binding,
+        mesh pairs keep their ordinary collision-time endpoint guards and no raw-mesh guards are suppressed.
+
         .. experimental::
 
             This rigid-contact gradient path may change without prior notice.
@@ -1839,6 +2098,7 @@ class CollisionPipeline:
         model = self.model
         # update any additional parameters
         soft_contact_margin = soft_contact_margin if soft_contact_margin is not None else self.soft_contact_margin
+        strict_nonpenetration_active = False
         if self._speculative_enabled:
             config = self.speculative_config
             if dt is None:
@@ -1848,12 +2108,18 @@ class CollisionPipeline:
                 raise ValueError(f"dt must be a non-negative finite number, got {collision_update_dt!r}")
             max_speculative_extension = config.max_speculative_extension
             speculative_active = collision_update_dt > 0.0 and max_speculative_extension > 0.0
+            strict_nonpenetration_active = speculative_active and config.enforce_nonpenetration
             search_gap = self._shape_search_gap if speculative_active else model.shape_gap
         else:
             collision_update_dt = 0.0
             max_speculative_extension = 0.0
             speculative_active = False
             search_gap = model.shape_gap
+        contacts._velocity_speculation_active = speculative_active
+        contacts._strict_nonpenetration_active = strict_nonpenetration_active
+        contacts._strict_nonpenetration_owner_token = (
+            self._strict_nonpenetration_contact_token if strict_nonpenetration_active else None
+        )
 
         # Rigid contact detection -- broad phase + narrow phase.
         # These kernels hardcode record_tape=False internally so they are
@@ -1909,6 +2175,7 @@ class CollisionPipeline:
                     model.shape_gap,
                     collision_update_dt,
                     max_speculative_extension,
+                    int(strict_nonpenetration_active),
                 ],
                 outputs=[
                     self._shape_linear_velocity,
@@ -1979,6 +2246,23 @@ class CollisionPipeline:
                 shape_displacement=self._shape_displacement if speculative_active else None,
             )
 
+        if speculative_active:
+            # Broad phase has consumed the swept shape-origin displacements. Reuse the same scratch buffer for
+            # exact COM-centered anchor prediction in narrow phase, avoiding another persistent per-shape array.
+            wp.launch(
+                kernel=compute_shape_rotation_center_offsets,
+                dim=model.shape_count,
+                inputs=[
+                    state.body_q,
+                    model.body_com,
+                    model.shape_body,
+                    self.geom_transform,
+                ],
+                outputs=[self._shape_displacement],
+                device=self.device,
+                record_tape=False,
+            )
+
         # Create ContactWriterData struct for custom contact writing
         writer_data = ContactWriterData()
         writer_data.contact_max = contacts.rigid_contact_max
@@ -1993,6 +2277,9 @@ class CollisionPipeline:
         writer_data.out_offset0 = contacts.rigid_contact_offset0
         writer_data.out_offset1 = contacts.rigid_contact_offset1
         writer_data.out_normal = contacts.rigid_contact_normal
+        writer_data.out_normal_owner = contacts.rigid_contact_normal_owner
+        writer_data.out_is_predictive = contacts.rigid_contact_is_predictive
+        writer_data.out_is_strict_guard = contacts.rigid_contact_is_strict_guard
         writer_data.out_margin0 = contacts.rigid_contact_margin0
         writer_data.out_margin1 = contacts.rigid_contact_margin1
         writer_data.out_tids = contacts.rigid_contact_tids
@@ -2012,8 +2299,10 @@ class CollisionPipeline:
         writer_data.shape_transform = self.geom_transform
         writer_data.shape_linear_velocity = self._shape_linear_velocity
         writer_data.shape_angular_velocity = self._shape_angular_velocity
+        writer_data.shape_rotation_center_offset = self._shape_displacement
         writer_data.collision_update_dt = collision_update_dt
         writer_data.max_speculative_extension = max_speculative_extension
+        writer_data.strict_nonpenetration_active = int(strict_nonpenetration_active)
         # Run narrow phase with custom contact writer (writes directly to Contacts format)
         self.narrow_phase.launch_custom_write(
             candidate_pair=self.broad_phase_shape_pairs,
@@ -2045,8 +2334,14 @@ class CollisionPipeline:
             hydroelastic_shape_sdf_data_prepared=self._hydro_shape_sdf_data_prepared,
             shape_linear_velocity=self._shape_linear_velocity,
             shape_angular_velocity=self._shape_angular_velocity,
+            shape_rotation_center_offset=self._shape_displacement,
             collision_update_dt=collision_update_dt,
             max_speculative_extension=max_speculative_extension,
+            strict_nonpenetration_active=strict_nonpenetration_active,
+            nonpenetration_oracle_eligible_shape=self._strict_nonpenetration_oracle_eligible_shape,
+            nonpenetration_oracle_anchor_shape=self._strict_nonpenetration_oracle_anchor_shape,
+            shape_body=model.shape_body,
+            body_flags=model.body_flags,
             device=self.device,
         )
 
@@ -2066,6 +2361,7 @@ class CollisionPipeline:
                 shape0=contacts.rigid_contact_shape0,
                 shape1=contacts.rigid_contact_shape1,
                 normal=contacts.rigid_contact_normal,
+                normal_owner=contacts.rigid_contact_normal_owner,
                 body_q=state.body_q,
                 shape_body=model.shape_body,
                 match_index_out=contacts.rigid_contact_match_index,
@@ -2083,6 +2379,9 @@ class CollisionPipeline:
                 offset0=contacts.rigid_contact_offset0,
                 offset1=contacts.rigid_contact_offset1,
                 normal=contacts.rigid_contact_normal,
+                normal_owner=contacts.rigid_contact_normal_owner,
+                is_predictive=contacts.rigid_contact_is_predictive,
+                is_strict_guard=contacts.rigid_contact_is_strict_guard,
                 margin0=contacts.rigid_contact_margin0,
                 margin1=contacts.rigid_contact_margin1,
                 tids=contacts.rigid_contact_tids,
@@ -2107,6 +2406,7 @@ class CollisionPipeline:
                 offset0=contacts.rigid_contact_offset0,
                 offset1=contacts.rigid_contact_offset1,
                 normal=contacts.rigid_contact_normal,
+                normal_owner=contacts.rigid_contact_normal_owner,
                 shape0=contacts.rigid_contact_shape0,
                 shape1=contacts.rigid_contact_shape1,
                 margin0=contacts.rigid_contact_margin0,
@@ -2151,6 +2451,7 @@ class CollisionPipeline:
                 sorted_shape0=contacts.rigid_contact_shape0,
                 sorted_shape1=contacts.rigid_contact_shape1,
                 sorted_normal=contacts.rigid_contact_normal,
+                sorted_normal_owner=contacts.rigid_contact_normal_owner,
                 body_q=state.body_q,
                 shape_body=model.shape_body,
                 device=self.device,

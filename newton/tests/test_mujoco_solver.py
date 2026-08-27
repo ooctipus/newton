@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import inspect
 import itertools
 import math
 import os
@@ -16,21 +17,35 @@ import warp as wp
 import newton
 from newton import BodyFlags, JointType, Mesh, ModelFlags
 from newton._src.core.types import vec5
+from newton._src.sim.contact_oracle import (
+    CONTACT_ORACLE_INCOMPLETE,
+    CONTACT_ORACLE_REFERENCE_INFEASIBLE,
+    CONTACT_ORACLE_SWEEP_INCOMPLETE,
+    CONTACT_ORACLE_VIOLATION,
+    RIGID_BODY_PATH_BOUNDED,
+    RIGID_BODY_PATH_CONSTANT_TWIST,
+    RIGID_BODY_PATH_LINEAR_TRANSLATION,
+    RIGID_BODY_PATH_STATIONARY,
+    RIGID_BODY_PATH_UNKNOWN,
+    RigidBodyPathCertificate,
+    RigidContactOracle,
+)
 from newton._src.solvers.mujoco.constants import (
     DEFAULT_LIMIT_KD,
     DEFAULT_LIMIT_KE,
     KINEMATIC_ARMATURE,
+    MJ_MAXIMP,
     MJ_MINVAL,
     SOLREF_MODE_FORCE_SPACE,
     SOLREF_MODE_MJCF_DEFAULT,
     SOLREF_MODE_RAW,
 )
 from newton._src.solvers.mujoco.equality import _add_equality_constraint
-from newton._src.solvers.mujoco.kernels import convert_solref
+from newton._src.solvers.mujoco.kernels import build_free_body_path_certificate_kernel, convert_solref
 from newton._src.solvers.mujoco.utils import MJC_OBJ_BODY, MJC_OBJ_JOINT, MjcEqualityTargetKind
 from newton.examples import get_asset
 from newton.solvers import SolverMuJoCo
-from newton.tests.unittest_utils import USD_AVAILABLE, assert_np_equal
+from newton.tests.unittest_utils import USD_AVAILABLE, assert_np_equal, get_cuda_test_devices
 
 
 def _expected_positive_limit_solref(ke: float, kd: float, factor: float) -> np.ndarray:
@@ -4332,6 +4347,1821 @@ class TestMuJoCoSolverFixedTendonProperties(TestMuJoCoSolverPropertiesBase):
         )
 
 
+class _EmptyRigidContactOracle:
+    def __init__(
+        self,
+        model: newton.Model,
+        *,
+        fail_final: bool = False,
+        final_status: int = 0,
+        refinement_status: int = 0,
+        certified_fraction: float = 1.0,
+        guard_capacity: int = 1,
+        separation_tolerance: float = 1.0e-6,
+    ):
+        self.model_token = model
+        self.device = model.device
+        self.body_count = model.body_count
+        self.shape_count = model.shape_count
+        self.world_count = model.world_count
+        self.guard_contacts = newton.Contacts(guard_capacity, 0, device=model.device)
+        self.guard_contacts._velocity_speculation_active = True
+        self.guard_contacts._strict_nonpenetration_active = True
+        self.world_status = wp.zeros(model.world_count, dtype=wp.int32, device=model.device)
+        self.certified_path_fraction = wp.full(
+            model.world_count,
+            certified_fraction,
+            dtype=wp.float32,
+            device=model.device,
+        )
+        self.final_status = final_status | (CONTACT_ORACLE_VIOLATION if fail_final else 0)
+        self.refinement_status = refinement_status
+        self.certified_fraction = certified_fraction
+        self._separation_tolerance = separation_tolerance
+
+    @property
+    def separation_tolerance(self) -> float:
+        """Return the geometric tolerance used for acceptance and guard clearance [m]."""
+        return self._separation_tolerance
+
+    def begin_refinement(self) -> None:
+        self.guard_contacts.clear()
+        self.guard_contacts._velocity_speculation_active = True
+        self.guard_contacts._strict_nonpenetration_active = True
+
+    def refine(self, reference_body_q: wp.array, path: RigidBodyPathCertificate) -> None:
+        del reference_body_q, path
+        self.world_status.zero_()
+        self.certified_path_fraction.fill_(self.certified_fraction)
+        if self.refinement_status:
+            self.world_status.fill_(self.refinement_status)
+        generation = int(self.guard_contacts.contact_generation.numpy()[0])
+        self.guard_contacts.contact_generation.fill_(generation + 1)
+
+    def scan(self, reference_body_q: wp.array, path: RigidBodyPathCertificate) -> None:
+        del reference_body_q, path
+        self.world_status.zero_()
+        self.certified_path_fraction.fill_(self.certified_fraction)
+        if self.final_status:
+            self.world_status.fill_(self.final_status)
+
+
+class _SingleGuardOracle(_EmptyRigidContactOracle):
+    def __init__(
+        self,
+        model: newton.Model,
+        shape0: int,
+        shape1: int,
+        radius1: float,
+        *,
+        radius0: float = 0.0,
+        normal: tuple[float, float, float] = (0.0, 0.0, 1.0),
+        separation_tolerance: float = 1.0e-6,
+    ):
+        super().__init__(model, separation_tolerance=separation_tolerance)
+        normal_vector = wp.vec3(*normal)
+        contacts = self.guard_contacts
+        contacts.rigid_contact_shape0.fill_(shape0)
+        contacts.rigid_contact_shape1.fill_(shape1)
+        contacts.rigid_contact_normal.fill_(normal_vector)
+        contacts.rigid_contact_offset0.fill_(normal_vector * radius0)
+        contacts.rigid_contact_offset1.fill_(-normal_vector * radius1)
+        contacts.rigid_contact_margin0.fill_(radius0)
+        contacts.rigid_contact_margin1.fill_(radius1)
+        contacts.rigid_contact_is_predictive.fill_(1)
+        contacts.rigid_contact_is_strict_guard.fill_(2)
+
+    def refine(self, reference_body_q: wp.array, path: RigidBodyPathCertificate) -> None:
+        super().refine(reference_body_q, path)
+        self.guard_contacts.rigid_contact_count.fill_(1)
+
+
+class _CandidateSphereTangentOracle(_SingleGuardOracle):
+    def __init__(
+        self,
+        model: newton.Model,
+        fixed_shape: int,
+        moving_shape: int,
+        moving_body: int,
+        radius: float,
+    ):
+        super().__init__(
+            model,
+            fixed_shape,
+            moving_shape,
+            radius,
+            radius0=radius,
+            normal=(1.0, 0.0, 0.0),
+        )
+        self.moving_body = moving_body
+        self.total_radius = 2.0 * radius
+        self.reference_plane_gaps: list[float] = []
+        self.candidate_exact_gaps: list[float] = []
+        self.final_gap = float("nan")
+
+    def refine(self, reference_body_q: wp.array, path: RigidBodyPathCertificate) -> None:
+        candidate_center = path.endpoint_body_q.numpy()[self.moving_body, :3]
+        candidate_distance = float(np.linalg.norm(candidate_center))
+        normal = candidate_center / candidate_distance
+        normal_vector = wp.vec3(*normal)
+        radius = 0.5 * self.total_radius
+        self.guard_contacts.rigid_contact_normal.fill_(normal_vector)
+        self.guard_contacts.rigid_contact_offset0.fill_(normal_vector * radius)
+        self.guard_contacts.rigid_contact_offset1.fill_(-normal_vector * radius)
+        reference_center = reference_body_q.numpy()[self.moving_body, :3]
+        self.reference_plane_gaps.append(float(np.dot(reference_center, normal) - self.total_radius))
+        self.candidate_exact_gaps.append(candidate_distance - self.total_radius)
+        super().refine(reference_body_q, path)
+
+    def scan(self, reference_body_q: wp.array, path: RigidBodyPathCertificate) -> None:
+        del reference_body_q
+        self.world_status.zero_()
+        candidate_center = path.endpoint_body_q.numpy()[self.moving_body, :3]
+        self.final_gap = float(np.linalg.norm(candidate_center) - self.total_radius)
+        if self.final_gap < -self.separation_tolerance:
+            self.world_status.fill_(CONTACT_ORACLE_VIOLATION)
+
+
+class _CandidatePlaneGuardOracle(_SingleGuardOracle):
+    def __init__(
+        self,
+        model: newton.Model,
+        fixed_shape: int,
+        moving_shape: int,
+        moving_body: int,
+        fixed_point: np.ndarray,
+        moving_point: np.ndarray,
+        normal: np.ndarray,
+        *,
+        separation_tolerance: float = 1.0e-6,
+    ):
+        super().__init__(
+            model,
+            fixed_shape,
+            moving_shape,
+            0.0,
+            normal=tuple(normal),
+            separation_tolerance=separation_tolerance,
+        )
+        self.moving_body = moving_body
+        self.fixed_point = fixed_point
+        self.moving_point = moving_point
+        self.normal = normal
+        self.candidate_gaps: list[float] = []
+        self.final_gap = float("nan")
+        self.guard_contacts.rigid_contact_point0.assign(np.asarray((fixed_point,), dtype=np.float32))
+        self.guard_contacts.rigid_contact_point1.assign(np.asarray((moving_point,), dtype=np.float32))
+        self.guard_contacts.rigid_contact_normal_owner.fill_(0)
+
+    def _gap(self, body_q: wp.array) -> float:
+        pose = body_q.numpy()[self.moving_body]
+        quaternion_vector = pose[3:6]
+        first_cross = np.cross(quaternion_vector, self.moving_point)
+        rotated_point = self.moving_point + 2.0 * np.cross(
+            quaternion_vector,
+            first_cross + pose[6] * self.moving_point,
+        )
+        world_point = pose[:3] + rotated_point
+        return float(np.dot(world_point - self.fixed_point, self.normal))
+
+    def refine(self, reference_body_q: wp.array, path: RigidBodyPathCertificate) -> None:
+        self.candidate_gaps.append(self._gap(path.endpoint_body_q))
+        super().refine(reference_body_q, path)
+
+    def scan(self, reference_body_q: wp.array, path: RigidBodyPathCertificate) -> None:
+        del reference_body_q
+        self.world_status.zero_()
+        self.final_gap = self._gap(path.endpoint_body_q)
+        if self.final_gap < -self.separation_tolerance:
+            self.world_status.fill_(CONTACT_ORACLE_VIOLATION)
+
+
+class _RelinearizingPlaneGuardOracle(_CandidatePlaneGuardOracle):
+    def __init__(
+        self,
+        model: newton.Model,
+        fixed_shape: int,
+        moving_shape: int,
+        moving_body: int,
+        fixed_point: np.ndarray,
+        moving_point: np.ndarray,
+        normal: np.ndarray,
+    ):
+        super().__init__(model, fixed_shape, moving_shape, moving_body, fixed_point, moving_point, normal)
+        self.refinement_count = 0
+
+    def refine(self, reference_body_q: wp.array, path: RigidBodyPathCertificate) -> None:
+        shift = 1.0e-3 * self.refinement_count
+        normal = np.asarray((shift, 0.0, 1.0))
+        normal /= np.linalg.norm(normal)
+        self.fixed_point = np.asarray((shift, 0.0, 0.0))
+        self.moving_point = np.asarray((shift, 0.0, self.moving_point[2]))
+        self.normal = normal
+        self.guard_contacts.rigid_contact_point0.assign(np.asarray((self.fixed_point,), dtype=np.float32))
+        self.guard_contacts.rigid_contact_point1.assign(np.asarray((self.moving_point,), dtype=np.float32))
+        self.guard_contacts.rigid_contact_normal.assign(np.asarray((normal,), dtype=np.float32))
+        self.refinement_count += 1
+        super().refine(reference_body_q, path)
+
+
+class _DeepestBoxCornerOracle(_EmptyRigidContactOracle):
+    def __init__(
+        self,
+        model: newton.Model,
+        plane_shape: int,
+        box_shape: int,
+        box_body: int,
+        half_extents: tuple[float, float, float],
+    ):
+        super().__init__(model, guard_capacity=8)
+        self.plane_shape = plane_shape
+        self.box_shape = box_shape
+        self.box_body = box_body
+        hx, hy, hz = half_extents
+        self.local_corners = np.asarray(
+            [(x, y, z) for x in (-hx, hx) for y in (-hy, hy) for z in (-hz, hz)],
+            dtype=np.float32,
+        )
+        self.materialized_corner_indices: list[int] = []
+        self.materialized_min_separations: list[float] = []
+        self.final_min_separation = float("nan")
+        self._contact_by_corner: dict[int, int] = {}
+
+    def begin_refinement(self) -> None:
+        super().begin_refinement()
+        self._contact_by_corner.clear()
+
+    def _world_corners(self, body_q: wp.array) -> np.ndarray:
+        pose = body_q.numpy()[self.box_body]
+        position = pose[:3]
+        quaternion = pose[3:]
+        quaternion_vector = quaternion[:3]
+        quaternion_scalar = quaternion[3]
+        first_cross = np.cross(quaternion_vector, self.local_corners)
+        rotated = self.local_corners + 2.0 * np.cross(
+            quaternion_vector,
+            first_cross + quaternion_scalar * self.local_corners,
+        )
+        return rotated + position
+
+    def refine(self, reference_body_q: wp.array, path: RigidBodyPathCertificate) -> None:
+        super().refine(reference_body_q, path)
+        world_corners = self._world_corners(path.endpoint_body_q)
+        corner_index = int(np.argmin(world_corners[:, 2]))
+        min_separation = float(world_corners[corner_index, 2])
+        self.materialized_corner_indices.append(corner_index)
+        self.materialized_min_separations.append(min_separation)
+        if min_separation >= 0.0:
+            return
+        contacts = self.guard_contacts
+        contact_index = self._contact_by_corner.get(corner_index)
+        if contact_index is None:
+            contact_index = len(self._contact_by_corner)
+            self._contact_by_corner[corner_index] = contact_index
+        contacts.rigid_contact_shape0.fill_(self.plane_shape)
+        contacts.rigid_contact_shape1.fill_(self.box_shape)
+        point0 = contacts.rigid_contact_point0.numpy()
+        point1 = contacts.rigid_contact_point1.numpy()
+        point0[contact_index] = (*world_corners[corner_index, :2], 0.0)
+        point1[contact_index] = self.local_corners[corner_index]
+        contacts.rigid_contact_point0.assign(point0)
+        contacts.rigid_contact_point1.assign(point1)
+        contacts.rigid_contact_normal.fill_(wp.vec3(0.0, 0.0, 1.0))
+        contacts.rigid_contact_is_predictive.fill_(1)
+        contacts.rigid_contact_is_strict_guard.fill_(2)
+        contacts.rigid_contact_count.fill_(len(self._contact_by_corner))
+        self.world_status.fill_(CONTACT_ORACLE_VIOLATION)
+
+    def scan(self, reference_body_q: wp.array, path: RigidBodyPathCertificate) -> None:
+        del reference_body_q
+        self.world_status.zero_()
+        self.final_min_separation = float(np.min(self._world_corners(path.endpoint_body_q)[:, 2]))
+        if self.final_min_separation < -self.separation_tolerance:
+            self.world_status.fill_(CONTACT_ORACLE_VIOLATION)
+
+
+class TestMuJoCOStrictNonpenetrationOracle(unittest.TestCase):
+    def _certified_guard_reserve(
+        self,
+        solver: SolverMuJoCo,
+        tid_to_cid: wp.array,
+        reference_floor: float,
+    ) -> float:
+        """Return the nonlinear reserve currently applied to one certified guard row."""
+        contact_id = int(tid_to_cid.numpy()[0])
+        contact = solver.mjw_data.contact
+        world_id = int(contact.worldid.numpy()[contact_id])
+        normal_efc_id = int(contact.efc_address.numpy()[contact_id, 0])
+        geoms = contact.geom.numpy()[contact_id]
+        margin_row = world_id % solver.mjw_model.geom_margin.shape[0]
+        geom_margin = solver.mjw_model.geom_margin.numpy()
+        physical_margin = float(geom_margin[margin_row, geoms[0]] + geom_margin[margin_row, geoms[1]])
+        signed_gap = float(contact.dist.numpy()[contact_id]) - physical_margin
+        timestep = float(solver.mjw_model.opt.timestep.numpy()[world_id])
+        velocity = float(solver.mjw_data.efc.vel.numpy()[world_id, normal_efc_id])
+        aref = float(solver.mjw_data.efc.aref.numpy()[world_id, normal_efc_id])
+        base_reference = ((reference_floor - signed_gap) / (timestep * timestep) - velocity / timestep) / MJ_MAXIMP
+        return max((aref - base_reference) * timestep * timestep * MJ_MAXIMP, 0.0)
+
+    def _certified_guard_reference_floor(self, solver: SolverMuJoCo, tid_to_cid: wp.array) -> float:
+        """Return the reference floor encoded by a reserve-free certified guard row [m]."""
+        contact_id = int(tid_to_cid.numpy()[0])
+        contact = solver.mjw_data.contact
+        world_id = int(contact.worldid.numpy()[contact_id])
+        normal_efc_id = int(contact.efc_address.numpy()[contact_id, 0])
+        geoms = contact.geom.numpy()[contact_id]
+        margin_row = world_id % solver.mjw_model.geom_margin.shape[0]
+        geom_margin = solver.mjw_model.geom_margin.numpy()
+        physical_margin = float(geom_margin[margin_row, geoms[0]] + geom_margin[margin_row, geoms[1]])
+        signed_gap = float(contact.dist.numpy()[contact_id]) - physical_margin
+        timestep = float(solver.mjw_model.opt.timestep.numpy()[world_id])
+        velocity = float(solver.mjw_data.efc.vel.numpy()[world_id, normal_efc_id])
+        aref = float(solver.mjw_data.efc.aref.numpy()[world_id, normal_efc_id])
+        return signed_gap + timestep * timestep * MJ_MAXIMP * (aref + velocity / timestep)
+
+    def test_oracle_contract_owns_one_cumulative_guard_set(self):
+        """Keep bank selection and duplicate conversion work out of the solver/oracle boundary."""
+        self.assertIn("guard_contacts", RigidContactOracle.__annotations__)
+        self.assertNotIn("guard_contact_banks", RigidContactOracle.__annotations__)
+        self.assertIsInstance(inspect.getattr_static(RigidContactOracle, "separation_tolerance"), property)
+        self.assertEqual(
+            tuple(inspect.signature(RigidContactOracle.refine).parameters),
+            ("self", "reference_body_q", "path"),
+        )
+        self.assertFalse(hasattr(RigidContactOracle, "materialize"))
+        self.assertFalse(hasattr(SolverMuJoCo, "_StrictOracleGuardBank"))
+        self.assertNotIn("endpoint_reserve", SolverMuJoCo._StrictOracleGuardState.__annotations__)
+
+    def test_free_body_path_certificate_matches_mjwarp_integration(self):
+        """Certify free-body origin and angular paths from the committed velocity."""
+        qvel = wp.array(
+            (
+                (3.0, 4.0, 0.0, 0.0, 0.0, 2.0),
+                (0.0, 0.0, 2.0, 0.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0, 0.0, 0.0, 4.0),
+            ),
+            dtype=wp.float32,
+            device="cpu",
+        )
+        timestep = wp.array((0.25, 0.5, 0.125, 1.0), dtype=wp.float32, device="cpu")
+        joint_type = wp.array((int(JointType.FREE),) * 4, dtype=wp.int32, device="cpu")
+        joint_parent = wp.array((-1, -1, 0, -1), dtype=wp.int32, device="cpu")
+        joint_child = wp.array((0, 1, 2, 3), dtype=wp.int32, device="cpu")
+        body_flags = wp.array((int(BodyFlags.DYNAMIC),) * 4, dtype=wp.int32, device="cpu")
+        mj_qd_start = wp.array((0,), dtype=wp.int32, device="cpu")
+        origin_path_length = wp.zeros(4, dtype=wp.float32, device="cpu")
+        angular_path_length = wp.zeros(4, dtype=wp.float32, device="cpu")
+        motion_kind = wp.full(4, RIGID_BODY_PATH_UNKNOWN, dtype=wp.uint8, device="cpu")
+
+        wp.launch(
+            build_free_body_path_certificate_kernel,
+            dim=(4, 1),
+            inputs=[
+                qvel,
+                timestep,
+                1,
+                joint_type,
+                joint_parent,
+                joint_child,
+                body_flags,
+                mj_qd_start,
+                RIGID_BODY_PATH_STATIONARY,
+                RIGID_BODY_PATH_LINEAR_TRANSLATION,
+                RIGID_BODY_PATH_BOUNDED,
+                RIGID_BODY_PATH_CONSTANT_TWIST,
+            ],
+            outputs=[origin_path_length, angular_path_length, motion_kind],
+            device="cpu",
+        )
+
+        np.testing.assert_allclose(origin_path_length.numpy(), (1.25, 1.0, 0.0, 0.0), rtol=0.0, atol=1.0e-7)
+        np.testing.assert_allclose(angular_path_length.numpy(), (0.5, 0.0, 0.0, 4.0), rtol=0.0, atol=1.0e-7)
+        np.testing.assert_array_equal(
+            motion_kind.numpy(),
+            (
+                RIGID_BODY_PATH_CONSTANT_TWIST,
+                RIGID_BODY_PATH_LINEAR_TRANSLATION,
+                RIGID_BODY_PATH_UNKNOWN,
+                RIGID_BODY_PATH_BOUNDED,
+            ),
+        )
+
+    @staticmethod
+    def _run_unconstrained_step(
+        integrator: str,
+        *,
+        strict: bool,
+        fail_final: bool = False,
+        final_status: int = 0,
+        refinement_status: int = 0,
+        certified_fraction: float = 1.0,
+    ):
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        body = builder.add_body(xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()))
+        builder.add_shape_sphere(body, radius=0.1)
+        model = builder.finalize(device="cpu")
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        qd = state_in.joint_qd.numpy()
+        qd[:] = (0.4, -0.2, -1.0, 0.1, -0.15, 0.2)
+        state_in.joint_qd.assign(qd)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        initial_q = state_in.joint_q.numpy().copy()
+        contacts = newton.Contacts(1, 0, device=model.device)
+        solver = SolverMuJoCo(
+            model,
+            use_mujoco_contacts=False,
+            integrator=integrator,
+            nconmax=4,
+            njmax=32,
+        )
+        if strict:
+            contacts._velocity_speculation_active = True
+            contacts._strict_nonpenetration_active = True
+            solver._bind_strict_nonpenetration_oracle(
+                _EmptyRigidContactOracle(
+                    model,
+                    fail_final=fail_final,
+                    final_status=final_status,
+                    refinement_status=refinement_status,
+                    certified_fraction=certified_fraction,
+                )
+            )
+        solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
+        return initial_q, state_out.joint_q.numpy(), state_out.joint_qd.numpy(), solver
+
+    @staticmethod
+    def _make_falling_guard_case(*, nconmax: int = 4, njmax: int = 32, jacobian: str | None = None):
+        radius = 0.05
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        body = builder.add_body(xform=wp.transform((0.0, 0.0, 0.06), wp.quat_identity()), mass=0.02)
+        sphere = builder.add_shape_sphere(body, radius=radius)
+        plane = builder.add_shape_plane(width=0.0, length=0.0)
+        model = builder.finalize(device="cpu")
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        qd = state_in.joint_qd.numpy()
+        qd[2] = -2.0
+        state_in.joint_qd.assign(qd)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        contacts = newton.Contacts(1, 0, device=model.device)
+        contacts._strict_nonpenetration_active = True
+        solver = SolverMuJoCo(
+            model,
+            use_mujoco_contacts=False,
+            jacobian=jacobian,
+            nconmax=nconmax,
+            njmax=njmax,
+        )
+        solver._bind_strict_nonpenetration_oracle(_SingleGuardOracle(model, plane, sphere, radius))
+        return model, body, state_in, state_out, control, contacts, solver
+
+    @staticmethod
+    def _copy_oracle_guard_to_base_contacts(contacts: newton.Contacts, oracle: _SingleGuardOracle) -> None:
+        for name in (
+            "rigid_contact_shape0",
+            "rigid_contact_shape1",
+            "rigid_contact_point0",
+            "rigid_contact_point1",
+            "rigid_contact_normal",
+            "rigid_contact_normal_owner",
+            "rigid_contact_is_predictive",
+            "rigid_contact_is_strict_guard",
+            "rigid_contact_offset0",
+            "rigid_contact_offset1",
+            "rigid_contact_margin0",
+            "rigid_contact_margin1",
+        ):
+            wp.copy(getattr(contacts, name), getattr(oracle.guard_contacts, name))
+        contacts.rigid_contact_count.fill_(1)
+
+    @staticmethod
+    def _run_mesh_nonpenetration_transit_case(device: wp.Device, downward_velocity: float):
+        rod_half_extents = (0.02, 0.02, 0.1)
+        slab_half_extents = (0.3, 0.3, 0.01)
+        initial_center = 0.12
+        dt = 0.02
+        rod_mesh = newton.Mesh.create_box(
+            *rod_half_extents,
+            duplicate_vertices=False,
+            compute_normals=False,
+            compute_uvs=False,
+        )
+        slab_mesh = newton.Mesh.create_box(
+            *slab_half_extents,
+            duplicate_vertices=False,
+            compute_normals=False,
+            compute_uvs=False,
+            compute_inertia=False,
+        )
+
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        builder.rigid_gap = 0.0
+        rod_body = builder.add_body(
+            xform=wp.transform(wp.vec3(0.0, 0.0, initial_center)),
+            mass=0.02,
+        )
+        builder.add_shape_mesh(rod_body, mesh=rod_mesh)
+        slab_body = builder.add_body(xform=wp.transform_identity(), mass=1.0, is_kinematic=True)
+        builder.add_shape_mesh(slab_body, mesh=slab_mesh)
+        model = builder.finalize(device=device)
+
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        joint_qd = state_in.joint_qd.numpy()
+        joint_qd[:] = 0.0
+        joint_qd[2] = downward_velocity
+        state_in.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        initial_q = state_in.joint_q.numpy().copy()
+        initial_pose = state_in.body_q.numpy()[rod_body].copy()
+
+        pipeline = newton.CollisionPipeline(
+            model,
+            broad_phase="sap",
+            reduce_contacts=True,
+            rigid_contact_max=128,
+            max_triangle_pairs=100_000,
+            include_static_kinematic_pairs=False,
+            speculative_config=newton.CollisionPipeline.SpeculativeContactConfig(
+                max_speculative_extension=0.005,
+                enforce_nonpenetration=True,
+            ),
+        )
+        contacts = pipeline.contacts()
+        pipeline.collide(state_in, contacts, dt=dt)
+        base_contact_count = int(contacts.rigid_contact_count.numpy()[0])
+        solver = SolverMuJoCo(
+            model,
+            use_mujoco_contacts=False,
+            use_mujoco_cpu=False,
+            integrator="implicitfast",
+            iterations=100,
+            ls_iterations=50,
+            nconmax=128,
+            njmax=512,
+        )
+        solver.bind_collision_pipeline(pipeline)
+        solver.step(state_in, state_out, control, contacts, dt)
+        return (
+            rod_half_extents,
+            slab_half_extents,
+            initial_center,
+            dt,
+            initial_q,
+            initial_pose,
+            state_out,
+            rod_body,
+            base_contact_count,
+            solver,
+        )
+
+    def test_unbound_strict_contacts_retain_legacy_solver_path(self):
+        """Preserve direct and manager-bound strict-contact users without a nonpenetration oracle."""
+        for bind_none in (False, True):
+            with self.subTest(bind_none=bind_none):
+                builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+                body = builder.add_body()
+                builder.add_shape_sphere(body, radius=0.1)
+                model = builder.finalize(device="cpu")
+                state_in, state_out, control = model.state(), model.state(), model.control()
+                contacts = newton.Contacts(1, 0, device=model.device)
+                contacts._strict_nonpenetration_active = True
+                solver = SolverMuJoCo(model, use_mujoco_contacts=False)
+                if bind_none:
+                    solver._bind_strict_nonpenetration_oracle(None)
+
+                solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
+
+                self.assertIsNone(solver._strict_endpoint_candidate)
+
+    def test_unbound_strict_capacity_failure_holds_damped_integrators(self):
+        """Fail closed when base strict contacts overflow without a nonpenetration oracle."""
+        for integrator in ("euler", "implicit", "implicitfast"):
+            for bind_none in (False, True):
+                with self.subTest(integrator=integrator, bind_none=bind_none):
+                    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+                    body = builder.add_body(xform=wp.transform((0.0, 0.0, 0.06), wp.quat_identity()), mass=0.02)
+                    sphere = builder.add_shape_sphere(body, radius=0.05)
+                    plane = builder.add_shape_plane(width=0.0, length=0.0)
+                    model = builder.finalize(device="cpu")
+                    model.joint_damping.fill_(2.0)
+                    state_in, state_out, control = model.state(), model.state(), model.control()
+                    joint_qd = state_in.joint_qd.numpy()
+                    joint_qd[2] = -2.0
+                    state_in.joint_qd.assign(joint_qd)
+                    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+                    initial_q = state_in.joint_q.numpy().copy()
+                    contacts = newton.Contacts(2, 0, device=model.device)
+                    contacts._strict_nonpenetration_active = True
+                    contacts.rigid_contact_count.fill_(2)
+                    contacts.rigid_contact_shape0.fill_(plane)
+                    contacts.rigid_contact_shape1.fill_(sphere)
+                    contacts.rigid_contact_is_predictive.fill_(1)
+                    contacts.rigid_contact_is_strict_guard.fill_(2)
+                    solver = SolverMuJoCo(
+                        model,
+                        use_mujoco_contacts=False,
+                        integrator=integrator,
+                        nconmax=1,
+                        njmax=32,
+                    )
+                    if bind_none:
+                        solver._bind_strict_nonpenetration_oracle(None)
+
+                    solver.step(state_in, state_out, control, contacts, 0.01)
+
+                    np.testing.assert_allclose(state_out.joint_q.numpy(), initial_q, rtol=0.0, atol=1.0e-7)
+                    np.testing.assert_allclose(state_out.joint_qd.numpy(), 0.0, rtol=0.0, atol=1.0e-7)
+                    self.assertNotEqual(int(solver.mjw_data.overflow.numpy()[0]) & (1 << 3), 0)
+                    self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 1)
+
+    def test_oracle_binding_rejects_wrong_model_and_rebinding(self):
+        """Keep the one-time oracle binding tied to one exact model topology."""
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        body = builder.add_body()
+        builder.add_shape_sphere(body, radius=0.1)
+        model = builder.finalize(device="cpu")
+        other_model = builder.finalize(device="cpu")
+
+        solver = SolverMuJoCo(model, use_mujoco_contacts=False)
+        with self.assertRaisesRegex(ValueError, "exact Newton model"):
+            solver._bind_strict_nonpenetration_oracle(_EmptyRigidContactOracle(other_model))
+
+        oracle = _EmptyRigidContactOracle(model)
+        solver._bind_strict_nonpenetration_oracle(oracle)
+        solver._bind_strict_nonpenetration_oracle(oracle)
+        with self.assertRaisesRegex(RuntimeError, "immutable"):
+            solver._bind_strict_nonpenetration_oracle(_EmptyRigidContactOracle(model))
+
+        for invalid_tolerance in (-1.0e-6, float("inf"), float("nan")):
+            with self.subTest(separation_tolerance=invalid_tolerance):
+                invalid_solver = SolverMuJoCo(model, use_mujoco_contacts=False)
+                invalid_oracle = _EmptyRigidContactOracle(model, separation_tolerance=invalid_tolerance)
+                with self.assertRaisesRegex(ValueError, "separation_tolerance"):
+                    invalid_solver._bind_strict_nonpenetration_oracle(invalid_oracle)
+
+    def test_collision_pipeline_binding_is_the_only_public_oracle_seam(self):
+        """Bind the owning pipeline once without exposing its internal oracle."""
+
+        class Pipeline:
+            def __init__(self, model, *, device=None):
+                self.model = model
+                self.device = model.device if device is None else device
+
+            def _claim_strict_nonpenetration_oracle(self, owner, *, allow_oracle):
+                """Represent a pipeline without raw-oracle geometry."""
+                del owner, allow_oracle
+                return None, None
+
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        body = builder.add_body()
+        builder.add_shape_sphere(body, radius=0.1)
+        model = builder.finalize(device="cpu")
+        other_model = builder.finalize(device="cpu")
+
+        solver = SolverMuJoCo(model, use_mujoco_contacts=False)
+        self.assertFalse(hasattr(solver, "bind_strict_nonpenetration_oracle"))
+        with self.assertRaisesRegex(ValueError, "exact Newton model"):
+            solver.bind_collision_pipeline(Pipeline(other_model))
+        with self.assertRaisesRegex(ValueError, "device"):
+            solver.bind_collision_pipeline(Pipeline(model, device=object()))
+
+        pipeline = Pipeline(model)
+        solver.bind_collision_pipeline(pipeline)
+        solver.bind_collision_pipeline(pipeline)
+        with self.assertRaisesRegex(RuntimeError, "immutable"):
+            solver.bind_collision_pipeline(Pipeline(model))
+
+    def test_claimed_pipeline_contacts_require_the_owning_solver(self):
+        """Reject raw-oracle-suppressed contacts in unbound and mismatched solvers."""
+        mesh = newton.Mesh.create_box(0.1, 0.1, 0.1, compute_normals=False, compute_uvs=False)
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        builder.rigid_gap = 0.0
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.21), wp.quat_identity()))
+        builder.add_shape_mesh(body, mesh=mesh)
+        builder.add_shape_mesh(-1, mesh=mesh)
+        model = builder.finalize(device="cpu")
+        config = newton.CollisionPipeline.SpeculativeContactConfig(
+            max_speculative_extension=0.05,
+            enforce_nonpenetration=True,
+        )
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False, speculative_config=config)
+        contacts = pipeline.contacts()
+        state_in, state_out, control = model.state(), model.state(), model.control()
+
+        pipeline.collide(state_in, contacts, dt=0.01)
+        self.assertIsNone(pipeline._strict_nonpenetration_oracle)
+        self.assertIsNone(contacts._strict_nonpenetration_owner_token)
+        prebind_count = int(contacts.rigid_contact_count.numpy()[0])
+        self.assertGreater(prebind_count, 0)
+        self.assertGreater(
+            np.count_nonzero(contacts.rigid_contact_is_strict_guard.numpy()[:prebind_count]),
+            0,
+        )
+
+        owner = SolverMuJoCo(model, use_mujoco_contacts=False, nconmax=64, njmax=256)
+        owner.bind_collision_pipeline(pipeline)
+        pipeline.collide(state_in, contacts, dt=0.01)
+        self.assertIsNotNone(pipeline._strict_nonpenetration_oracle)
+        self.assertIs(contacts._strict_nonpenetration_owner_token, owner._strict_nonpenetration_contact_token)
+
+        unbound = SolverMuJoCo(model, use_mujoco_contacts=False, nconmax=64, njmax=256)
+        with self.assertRaisesRegex(RuntimeError, "bind_collision_pipeline"):
+            unbound.step(state_in, state_out, control, contacts, 0.01)
+
+        other_pipeline = newton.CollisionPipeline(
+            model,
+            broad_phase="nxn",
+            reduce_contacts=False,
+            speculative_config=config,
+        )
+        other = SolverMuJoCo(model, use_mujoco_contacts=False, nconmax=64, njmax=256)
+        other.bind_collision_pipeline(other_pipeline)
+        with self.assertRaisesRegex(RuntimeError, "different collision-pipeline"):
+            other.step(state_in, state_out, control, contacts, 0.01)
+
+    def test_empty_oracle_executes_strict_endpoint_loop(self):
+        """Run materialization and final validation without allocating query contacts."""
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        body = builder.add_body()
+        builder.add_shape_sphere(body, radius=0.1)
+        model = builder.finalize(device="cpu")
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        contacts = newton.Contacts(1, 0, device=model.device)
+        contacts._velocity_speculation_active = True
+        contacts._strict_nonpenetration_active = True
+        solver = SolverMuJoCo(model, use_mujoco_contacts=False, nconmax=4, njmax=32)
+        oracle = _EmptyRigidContactOracle(model)
+        solver._bind_strict_nonpenetration_oracle(oracle)
+        solver._bind_strict_nonpenetration_oracle(oracle)
+
+        solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
+
+        np.testing.assert_allclose(state_out.joint_q.numpy(), state_in.joint_q.numpy(), rtol=0.0, atol=1.0e-7)
+        self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 0)
+
+    def test_safe_endpoint_commit_matches_standard_integrators(self):
+        """Preserve standard MuJoCo integration semantics when final validation succeeds."""
+        for integrator in ("euler", "implicit", "implicitfast"):
+            with self.subTest(integrator=integrator):
+                _, expected_q, expected_qd, _ = self._run_unconstrained_step(integrator, strict=False)
+                _, actual_q, actual_qd, _ = self._run_unconstrained_step(integrator, strict=True)
+                np.testing.assert_allclose(actual_q, expected_q, rtol=1.0e-6, atol=1.0e-7)
+                np.testing.assert_allclose(actual_qd, expected_qd, rtol=1.0e-6, atol=1.0e-7)
+
+    def test_failed_endpoint_validation_holds_all_supported_integrators(self):
+        """Hold pose, stop velocity, and mark rejection for every supported strict integrator."""
+        for integrator in ("euler", "implicit", "implicitfast"):
+            with self.subTest(integrator=integrator):
+                initial_q, final_q, final_qd, solver = self._run_unconstrained_step(
+                    integrator,
+                    strict=True,
+                    fail_final=True,
+                    refinement_status=CONTACT_ORACLE_VIOLATION,
+                )
+                np.testing.assert_allclose(final_q, initial_q, rtol=0.0, atol=1.0e-7)
+                np.testing.assert_allclose(final_qd, 0.0, rtol=0.0, atol=1.0e-7)
+                self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 1)
+                self.assertEqual(int(solver.mjw_data.overflow.numpy()[0]), 0)
+                np.testing.assert_allclose(solver.mjw_data.qacc_warmstart.numpy(), 0.0, rtol=0.0, atol=0.0)
+
+    def test_final_sweep_rejection_commits_certified_prefix(self):
+        """Advance by the exact semi-implicit fraction certified by the final swept query."""
+        fraction = 0.875
+        rejected_status = CONTACT_ORACLE_VIOLATION | CONTACT_ORACLE_INCOMPLETE | CONTACT_ORACLE_SWEEP_INCOMPLETE
+        initial_q, full_q, full_qd, _ = self._run_unconstrained_step("implicitfast", strict=False)
+        _, prefix_q, prefix_qd, solver = self._run_unconstrained_step(
+            "implicitfast",
+            strict=True,
+            final_status=rejected_status,
+            refinement_status=rejected_status,
+            certified_fraction=fraction,
+        )
+
+        np.testing.assert_allclose(
+            prefix_q[:3] - initial_q[:3],
+            fraction * (full_q[:3] - initial_q[:3]),
+            rtol=1.0e-6,
+            atol=1.0e-7,
+        )
+        np.testing.assert_allclose(prefix_qd, fraction * full_qd, rtol=1.0e-6, atol=1.0e-7)
+        initial_qd = np.asarray((0.4, -0.2, -1.0, 0.1, -0.15, 0.2), dtype=np.float32)
+        expected_qacc = (prefix_qd - initial_qd) / (1.0 / 240.0)
+        np.testing.assert_allclose(
+            solver.mjw_data.qacc_warmstart.numpy()[0],
+            expected_qacc,
+            rtol=1.0e-6,
+            atol=1.0e-5,
+        )
+        self.assertGreater(np.linalg.norm(prefix_q[:3] - initial_q[:3]), 0.0)
+        self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 0)
+        self.assertEqual(int(solver.mjw_data.overflow.numpy()[0]), 0)
+
+    def test_invalid_certified_prefix_fails_closed(self):
+        """Hold a rejected full path when its certified prefix is empty or non-finite."""
+        for fraction in (0.0, math.nan, math.inf):
+            with self.subTest(fraction=fraction):
+                initial_q, final_q, final_qd, solver = self._run_unconstrained_step(
+                    "implicitfast",
+                    strict=True,
+                    final_status=CONTACT_ORACLE_SWEEP_INCOMPLETE,
+                    refinement_status=CONTACT_ORACLE_SWEEP_INCOMPLETE,
+                    certified_fraction=fraction,
+                )
+
+                np.testing.assert_allclose(final_q, initial_q, rtol=0.0, atol=1.0e-7)
+                np.testing.assert_allclose(final_qd, 0.0, rtol=0.0, atol=1.0e-7)
+                self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 1)
+                self.assertEqual(int(solver.mjw_data.overflow.numpy()[0]), 0)
+
+    def test_final_rejection_commits_last_certified_refinement_candidate(self):
+        """Commit an earlier exact certificate when a later correction candidate regresses."""
+        for final_status in (CONTACT_ORACLE_VIOLATION, CONTACT_ORACLE_INCOMPLETE):
+            with self.subTest(final_status=final_status):
+                _, expected_q, expected_qd, _ = self._run_unconstrained_step("implicitfast", strict=False)
+                _, actual_q, actual_qd, solver = self._run_unconstrained_step(
+                    "implicitfast",
+                    strict=True,
+                    final_status=final_status,
+                )
+
+                np.testing.assert_allclose(actual_q, expected_q, rtol=1.0e-6, atol=1.0e-7)
+                np.testing.assert_allclose(actual_qd, expected_qd, rtol=1.0e-6, atol=1.0e-7)
+                self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 0)
+                self.assertEqual(int(solver.mjw_data.overflow.numpy()[0]), 0)
+
+    def test_final_scan_rejection_retries_next_substep(self):
+        """Retry from the held reference after a late violation or incomplete scan."""
+        dt = 1.0 / 240.0
+        retry_velocity = 0.25
+        for final_status in (CONTACT_ORACLE_VIOLATION, CONTACT_ORACLE_INCOMPLETE):
+            with self.subTest(final_status=final_status):
+                builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+                body = builder.add_body(xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()))
+                builder.add_shape_sphere(body, radius=0.1)
+                model = builder.finalize(device="cpu")
+                state_in, state_out, control = model.state(), model.state(), model.control()
+                joint_qd = state_in.joint_qd.numpy()
+                joint_qd[0] = 0.4
+                state_in.joint_qd.assign(joint_qd)
+                newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+                initial_q = state_in.joint_q.numpy().copy()
+
+                contacts = newton.Contacts(1, 0, device=model.device)
+                contacts._velocity_speculation_active = True
+                contacts._strict_nonpenetration_active = True
+                oracle = _EmptyRigidContactOracle(
+                    model,
+                    final_status=final_status,
+                    refinement_status=final_status,
+                )
+                solver = SolverMuJoCo(
+                    model,
+                    use_mujoco_contacts=False,
+                    integrator="implicitfast",
+                    nconmax=4,
+                    njmax=32,
+                )
+                solver._bind_strict_nonpenetration_oracle(oracle)
+
+                solver.step(state_in, state_out, control, contacts, dt)
+
+                np.testing.assert_allclose(state_out.joint_q.numpy(), initial_q, rtol=0.0, atol=1.0e-7)
+                np.testing.assert_allclose(state_out.joint_qd.numpy(), 0.0, rtol=0.0, atol=1.0e-7)
+                self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 1)
+                self.assertEqual(int(solver.mjw_data.overflow.numpy()[0]), 0)
+
+                oracle.final_status = 0
+                oracle.refinement_status = 0
+                retry_qd = state_out.joint_qd.numpy()
+                retry_qd[0] = retry_velocity
+                state_out.joint_qd.assign(retry_qd)
+                newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+                retry_x = float(state_out.body_q.numpy()[body, 0])
+
+                solver.step(state_out, state_in, control, contacts, dt)
+
+                self.assertAlmostEqual(
+                    float(state_in.body_q.numpy()[body, 0]), retry_x + dt * retry_velocity, delta=1.0e-7
+                )
+                self.assertAlmostEqual(float(state_in.joint_qd.numpy()[0]), retry_velocity, delta=1.0e-7)
+                self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 0)
+                self.assertEqual(int(solver.mjw_data.overflow.numpy()[0]), 0)
+
+    def test_reference_infeasible_status_fails_before_correction(self):
+        """Hold every strict integrator when the composition pose is infeasible."""
+        status = CONTACT_ORACLE_VIOLATION | CONTACT_ORACLE_REFERENCE_INFEASIBLE
+        for integrator in ("euler", "implicit", "implicitfast"):
+            with self.subTest(integrator=integrator):
+                initial_q, final_q, final_qd, solver = self._run_unconstrained_step(
+                    integrator,
+                    strict=True,
+                    refinement_status=status,
+                    certified_fraction=0.875,
+                )
+                np.testing.assert_allclose(final_q, initial_q, rtol=0.0, atol=1.0e-7)
+                np.testing.assert_allclose(final_qd, 0.0, rtol=0.0, atol=1.0e-7)
+                self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 1)
+                self.assertNotEqual(int(solver.mjw_data.overflow.numpy()[0]) & (1 << 3), 0)
+
+    def test_materialized_guard_is_appended_and_rebuilt(self):
+        """Append one oracle guard after base conversion and include it in the correction solve."""
+        radius = 0.05
+        initial_height = 0.06
+        initial_velocity = -2.0
+        dt = 0.01
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        body = builder.add_body(xform=wp.transform((0.0, 0.0, initial_height), wp.quat_identity()), mass=0.02)
+        sphere = builder.add_shape_sphere(body, radius=radius)
+        plane = builder.add_shape_plane(width=0.0, length=0.0)
+        model = builder.finalize(device="cpu")
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        qd = state_in.joint_qd.numpy()
+        qd[2] = initial_velocity
+        state_in.joint_qd.assign(qd)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        contacts = newton.Contacts(1, 0, device=model.device)
+        contacts._strict_nonpenetration_active = True
+        solver = SolverMuJoCo(model, use_mujoco_contacts=False, nconmax=4, njmax=32)
+        solver._bind_strict_nonpenetration_oracle(_SingleGuardOracle(model, plane, sphere, radius))
+
+        solver.step(state_in, state_out, control, contacts, dt)
+
+        self.assertEqual(int(solver.mjw_data.nacon.numpy()[0]), 1)
+        self.assertGreaterEqual(int(solver.mjw_data.contact.efc_address.numpy()[0, 0]), 0)
+        self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 0)
+        final_height = float(state_out.body_q.numpy()[body, 2])
+        final_velocity = float(state_out.joint_qd.numpy()[2])
+        self.assertLess(initial_height + initial_velocity * dt, radius)
+        self.assertGreaterEqual(final_height, radius - 1.0e-6)
+        self.assertGreater(final_velocity, initial_velocity + 0.5)
+
+    def test_incomplete_refinement_keeps_materialized_guard_active_until_final_validation(self):
+        """Correct an ambiguous intermediate path before deciding whether its endpoint may commit."""
+        _, body, state_in, state_out, control, contacts, solver = self._make_falling_guard_case()
+        oracle = solver._strict_nonpenetration_oracle
+        self.assertIsInstance(oracle, _SingleGuardOracle)
+        oracle.refinement_status = CONTACT_ORACLE_VIOLATION | CONTACT_ORACLE_INCOMPLETE
+
+        solver.step(state_in, state_out, control, contacts, 0.01)
+
+        contact_id = int(solver._strict_oracle_guard_state.tid_to_cid.numpy()[0])
+        self.assertGreaterEqual(contact_id, 0)
+        self.assertNotEqual(int(solver.mjw_data.contact.type.numpy()[contact_id]) & 1, 0)
+        self.assertGreaterEqual(int(solver.mjw_data.contact.efc_address.numpy()[contact_id, 0]), 0)
+        self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 0)
+        self.assertEqual(int(solver.mjw_data.overflow.numpy()[0]), 0)
+        self.assertGreaterEqual(float(state_out.body_q.numpy()[body, 2]), 0.05 - 1.0e-6)
+
+    def test_strict_guard_corrects_finite_impedance_endpoint_residual(self):
+        """Remove the endpoint error left by MuJoCo's finite maximum impedance."""
+        radius = 0.05
+        initial_height = 0.06
+        dt = 0.01
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        body = builder.add_body(xform=wp.transform((0.0, 0.0, initial_height), wp.quat_identity()), mass=0.02)
+        sphere = builder.add_shape_sphere(body, radius=radius)
+        plane = builder.add_shape_plane(width=0.0, length=0.0)
+        model = builder.finalize(device="cpu")
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        body_f = state_in.body_f.numpy()
+        body_f[body, 2] = -120.0
+        state_in.body_f.assign(body_f)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        contacts = newton.Contacts(1, 0, device=model.device)
+        contacts._strict_nonpenetration_active = True
+        solver = SolverMuJoCo(
+            model,
+            use_mujoco_contacts=False,
+            integrator="implicitfast",
+            iterations=100,
+            ls_iterations=50,
+            nconmax=4,
+            njmax=32,
+        )
+        solver._bind_strict_nonpenetration_oracle(_SingleGuardOracle(model, plane, sphere, radius))
+
+        solver.step(state_in, state_out, control, contacts, dt)
+
+        final_clearance = float(state_out.body_q.numpy()[body, 2]) - radius
+        self.assertGreaterEqual(final_clearance, 0.0)
+        self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 0)
+
+    def test_new_translating_guard_seeds_no_endpoint_defect(self):
+        """Seed no nonlinear reserve when a new guard has zero endpoint curvature."""
+        reference_gap = 12.2813508e-6
+        candidate_gap = -2.87507009e-6
+        separation_tolerance = 3.25e-6
+        dt = 0.01
+        fixed_point = np.asarray((0.1540311575, -0.0341265202, 0.00015597045))
+        moving_point = np.asarray((0.1540311575, -0.0341265202, 0.0049998164))
+        normal = np.asarray((4.16e-8, -7.92e-9, 1.0))
+        normal /= np.linalg.norm(normal)
+
+        mesh = Mesh.create_box(
+            0.2,
+            0.05,
+            0.01,
+            duplicate_vertices=False,
+            compute_normals=False,
+            compute_uvs=False,
+        )
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        builder.rigid_gap = 0.0
+        fixed_shape = builder.add_shape_mesh(
+            -1,
+            mesh=mesh,
+            cfg=newton.ModelBuilder.ShapeConfig(density=0.0),
+        )
+        origin_z = (reference_gap - float(np.dot(moving_point - fixed_point, normal))) / normal[2]
+        moving_body = builder.add_body(
+            xform=wp.transform(wp.vec3(0.0, 0.0, origin_z), wp.quat_identity()),
+            inertia=wp.mat33(1.0e-4 * np.eye(3)),
+            mass=0.03,
+            lock_inertia=True,
+        )
+        moving_shape = builder.add_shape_mesh(
+            moving_body,
+            mesh=mesh,
+            cfg=newton.ModelBuilder.ShapeConfig(density=0.0),
+        )
+        model = builder.finalize(device="cpu")
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        joint_qd = state_in.joint_qd.numpy()
+        initial_velocity = (candidate_gap - reference_gap) * normal / dt
+        joint_qd[:3] = initial_velocity
+        state_in.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+
+        contacts = newton.Contacts(1, 0, device=model.device)
+        contacts._strict_nonpenetration_active = True
+        oracle = _CandidatePlaneGuardOracle(
+            model,
+            fixed_shape,
+            moving_shape,
+            moving_body,
+            fixed_point,
+            moving_point,
+            normal,
+            separation_tolerance=separation_tolerance,
+        )
+        solver = SolverMuJoCo(
+            model,
+            use_mujoco_contacts=False,
+            integrator="implicitfast",
+            iterations=100,
+            ls_iterations=50,
+            nconmax=4,
+            njmax=32,
+        )
+        solver._bind_strict_nonpenetration_oracle(oracle)
+
+        rebuilt_reserves: list[float] = []
+        rebuilt_reference_floors: list[float] = []
+        original_apply_constraints = solver._apply_strict_contact_constraints
+
+        def trace_rebuilt_reserve(
+            apply_state_in,
+            apply_contacts,
+            launch_dim,
+            tid_to_cid,
+            horizon_state,
+            integrator_qacc,
+            *,
+            endpoint_reserve,
+            certified_reference_clearance=None,
+        ):
+            original_apply_constraints(
+                apply_state_in,
+                apply_contacts,
+                launch_dim,
+                tid_to_cid,
+                horizon_state,
+                integrator_qacc,
+                endpoint_reserve=endpoint_reserve,
+                certified_reference_clearance=certified_reference_clearance,
+            )
+            if apply_contacts is oracle.guard_contacts and not rebuilt_reserves:
+                rebuilt_reserves.append(self._certified_guard_reserve(solver, tid_to_cid, oracle.separation_tolerance))
+                rebuilt_reference_floors.append(self._certified_guard_reference_floor(solver, tid_to_cid))
+
+        solver._apply_strict_contact_constraints = trace_rebuilt_reserve
+
+        initial_gap = oracle._gap(state_in.body_q)
+        unconstrained_gap = initial_gap + dt * float(np.dot(initial_velocity, normal))
+        solver.step(state_in, state_out, control, contacts, dt)
+
+        self.assertTrue(rebuilt_reserves)
+        self.assertAlmostEqual(initial_gap, reference_gap, delta=1.0e-9)
+        self.assertAlmostEqual(unconstrained_gap, candidate_gap, delta=1.0e-9)
+        self.assertAlmostEqual(oracle.candidate_gaps[0], candidate_gap, delta=1.0e-9)
+        self.assertGreater(-oracle.candidate_gaps[0], 2.0e-6)
+        self.assertAlmostEqual(rebuilt_reserves[0], 0.0, delta=5.0e-8)
+        self.assertAlmostEqual(rebuilt_reference_floors[0], separation_tolerance, delta=5.0e-8)
+        self.assertGreaterEqual(min(oracle.candidate_gaps[1:]), -1.0e-6)
+        self.assertGreaterEqual(oracle.final_gap, -1.0e-6)
+        self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 0)
+        self.assertEqual(int(solver.mjw_data.overflow.numpy()[0]), 0)
+        committed_gap = oracle._gap(state_out.body_q)
+        self.assertAlmostEqual(committed_gap, oracle.final_gap, delta=1.0e-9)
+        self.assertLess(committed_gap, 0.5 * reference_gap)
+
+    def test_new_rotating_guard_seeds_curvature_once(self):
+        """Seed one curvature reserve when curvature equals the endpoint defect."""
+        reference_gap = 0.0
+        candidate_gap = -2.87507009e-6
+        anchor_radius = 0.1
+        dt = 0.01
+        fixed_point = np.asarray((0.0, 0.0, 0.2))
+        moving_point = np.asarray((0.0, 0.0, anchor_radius))
+        normal = np.asarray((0.0, 0.0, 1.0))
+        rotation_angle = math.acos(1.0 - (reference_gap - candidate_gap) / anchor_radius)
+
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        builder.rigid_gap = 0.0
+        fixed_shape = builder.add_shape_plane(width=0.0, length=0.0)
+        moving_body = builder.add_body(
+            xform=wp.transform((0.0, 0.0, fixed_point[2] + reference_gap - anchor_radius), wp.quat_identity()),
+            inertia=wp.mat33(1.0e-4 * np.eye(3)),
+            mass=0.03,
+            lock_inertia=True,
+        )
+        moving_shape = builder.add_shape_sphere(
+            moving_body,
+            radius=0.01,
+            cfg=newton.ModelBuilder.ShapeConfig(density=0.0),
+        )
+        model = builder.finalize(device="cpu")
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        joint_qd = state_in.joint_qd.numpy()
+        joint_qd[4] = rotation_angle / dt
+        state_in.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+
+        contacts = newton.Contacts(1, 0, device=model.device)
+        contacts._strict_nonpenetration_active = True
+        oracle = _CandidatePlaneGuardOracle(
+            model,
+            fixed_shape,
+            moving_shape,
+            moving_body,
+            fixed_point,
+            moving_point,
+            normal,
+        )
+        solver = SolverMuJoCo(
+            model,
+            use_mujoco_contacts=False,
+            integrator="implicitfast",
+            iterations=100,
+            ls_iterations=50,
+            nconmax=4,
+            njmax=32,
+        )
+        solver._bind_strict_nonpenetration_oracle(oracle)
+
+        rebuilt_reserves: list[float] = []
+        original_apply_constraints = solver._apply_strict_contact_constraints
+
+        def trace_rebuilt_reserve(
+            apply_state_in,
+            apply_contacts,
+            launch_dim,
+            tid_to_cid,
+            horizon_state,
+            integrator_qacc,
+            *,
+            endpoint_reserve,
+            certified_reference_clearance=None,
+        ):
+            original_apply_constraints(
+                apply_state_in,
+                apply_contacts,
+                launch_dim,
+                tid_to_cid,
+                horizon_state,
+                integrator_qacc,
+                endpoint_reserve=endpoint_reserve,
+                certified_reference_clearance=certified_reference_clearance,
+            )
+            if apply_contacts is oracle.guard_contacts and not rebuilt_reserves:
+                rebuilt_reserves.append(self._certified_guard_reserve(solver, tid_to_cid, oracle.separation_tolerance))
+
+        solver._apply_strict_contact_constraints = trace_rebuilt_reserve
+        solver.step(state_in, state_out, control, contacts, dt)
+
+        self.assertTrue(rebuilt_reserves)
+        self.assertAlmostEqual(oracle.candidate_gaps[0], candidate_gap, delta=2.0e-8)
+        endpoint_defect = max(-oracle.candidate_gaps[0], 0.0)
+        curvature = max(reference_gap - oracle.candidate_gaps[0], 0.0)
+        self.assertAlmostEqual(curvature, endpoint_defect, delta=1.0e-12)
+        self.assertAlmostEqual(rebuilt_reserves[0], curvature, delta=5.0e-8)
+        self.assertGreater(abs(rebuilt_reserves[0] - 2.0 * curvature), 0.5 * curvature)
+        self.assertGreaterEqual(oracle.final_gap, -1.0e-6)
+        self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 0)
+
+    def test_relinearized_guard_tid_discards_prior_reserve(self):
+        """Discard a prior row reserve when an oracle reuses its tid for a new feature."""
+        radius = 0.05
+        dt = 0.01
+        injected_reserve = 1.0e-3
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        body = builder.add_body(xform=wp.transform((0.0, 0.0, 0.06), wp.quat_identity()), mass=0.02)
+        moving_shape = builder.add_shape_sphere(body, radius=radius)
+        fixed_shape = builder.add_shape_plane(width=0.0, length=0.0)
+        model = builder.finalize(device="cpu")
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        joint_qd = state_in.joint_qd.numpy()
+        joint_qd[2] = -2.0
+        state_in.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+
+        contacts = newton.Contacts(1, 0, device=model.device)
+        contacts._strict_nonpenetration_active = True
+        oracle = _RelinearizingPlaneGuardOracle(
+            model,
+            fixed_shape,
+            moving_shape,
+            body,
+            np.asarray((0.0, 0.0, 0.0)),
+            np.asarray((0.0, 0.0, -radius)),
+            np.asarray((0.0, 0.0, 1.0)),
+        )
+        solver = SolverMuJoCo(
+            model,
+            use_mujoco_contacts=False,
+            integrator="implicitfast",
+            iterations=100,
+            ls_iterations=50,
+            nconmax=4,
+            njmax=32,
+        )
+        solver._bind_strict_nonpenetration_oracle(oracle)
+
+        rebuilt_reserves: list[float] = []
+        rebuilt_features: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        original_apply_constraints = solver._apply_strict_contact_constraints
+
+        def trace_rebuilt_reserve(
+            apply_state_in,
+            apply_contacts,
+            launch_dim,
+            tid_to_cid,
+            horizon_state,
+            integrator_qacc,
+            *,
+            endpoint_reserve,
+            certified_reference_clearance=None,
+        ):
+            original_apply_constraints(
+                apply_state_in,
+                apply_contacts,
+                launch_dim,
+                tid_to_cid,
+                horizon_state,
+                integrator_qacc,
+                endpoint_reserve=endpoint_reserve,
+                certified_reference_clearance=certified_reference_clearance,
+            )
+            if apply_contacts is not oracle.guard_contacts:
+                return
+            self.assertIsNone(endpoint_reserve)
+            rebuilt_reserves.append(self._certified_guard_reserve(solver, tid_to_cid, oracle.separation_tolerance))
+            rebuilt_features.append(
+                (
+                    apply_contacts.rigid_contact_point0.numpy()[0].copy(),
+                    apply_contacts.rigid_contact_point1.numpy()[0].copy(),
+                    apply_contacts.rigid_contact_normal.numpy()[0].copy(),
+                )
+            )
+            if len(rebuilt_reserves) != 1:
+                return
+            contact_id = int(tid_to_cid.numpy()[0])
+            world_id = int(solver.mjw_data.contact.worldid.numpy()[contact_id])
+            efc_id = int(solver.mjw_data.contact.efc_address.numpy()[contact_id, 0])
+            timestep = float(solver.mjw_model.opt.timestep.numpy()[world_id])
+            aref = solver.mjw_data.efc.aref.numpy()
+            aref[world_id, efc_id] += injected_reserve / (timestep * timestep * MJ_MAXIMP)
+            solver.mjw_data.efc.aref.assign(aref)
+
+        solver._apply_strict_contact_constraints = trace_rebuilt_reserve
+        solver.step(state_in, state_out, control, contacts, dt)
+
+        self.assertGreaterEqual(len(rebuilt_reserves), 2)
+        self.assertFalse(np.allclose(rebuilt_features[0][0], rebuilt_features[1][0]))
+        self.assertFalse(np.allclose(rebuilt_features[0][2], rebuilt_features[1][2]))
+        self.assertAlmostEqual(rebuilt_reserves[0], 0.0, delta=5.0e-8)
+        self.assertLess(rebuilt_reserves[1], 0.1 * injected_reserve)
+
+    def test_oracle_guard_lifts_candidate_tangent_from_feasible_reference(self):
+        """Lift a candidate-derived tangent that lies behind a feasible curved reference."""
+        radius = 0.05
+        total_radius = 2.0 * radius
+        reference_clearance = 2.0e-6
+        candidate_penetration = 10.0e-6
+        tangent_angle = 0.03
+        dt = 0.01
+        reference_center = np.asarray((total_radius + reference_clearance, 0.0, 0.0))
+        candidate_center = np.asarray(
+            (
+                (total_radius - candidate_penetration) * math.cos(tangent_angle),
+                (total_radius - candidate_penetration) * math.sin(tangent_angle),
+                0.0,
+            )
+        )
+
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        fixed_sphere = builder.add_shape_sphere(-1, radius=radius)
+        moving_body = builder.add_body(
+            xform=wp.transform(wp.vec3(*reference_center), wp.quat_identity()),
+            mass=0.02,
+        )
+        moving_sphere = builder.add_shape_sphere(moving_body, radius=radius)
+        model = builder.finalize(device="cpu")
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        joint_qd = state_in.joint_qd.numpy()
+        joint_qd[:3] = (candidate_center - reference_center) / dt
+        state_in.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        contacts = newton.Contacts(1, 0, device=model.device)
+        contacts._strict_nonpenetration_active = True
+        oracle = _CandidateSphereTangentOracle(
+            model,
+            fixed_sphere,
+            moving_sphere,
+            moving_body,
+            radius,
+        )
+        solver = SolverMuJoCo(
+            model,
+            use_mujoco_contacts=False,
+            integrator="implicitfast",
+            iterations=100,
+            ls_iterations=50,
+            nconmax=4,
+            njmax=32,
+        )
+        solver._bind_strict_nonpenetration_oracle(oracle)
+
+        solver.step(state_in, state_out, control, contacts, dt)
+
+        self.assertLess(oracle.candidate_exact_gaps[0], -1.0e-6)
+        self.assertLess(oracle.reference_plane_gaps[0], oracle.candidate_exact_gaps[0])
+        self.assertGreaterEqual(oracle.final_gap, -1.0e-6)
+        self.assertGreater(float(state_out.body_q.numpy()[moving_body, 1]), 0.5 * candidate_center[1])
+        self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 0)
+        self.assertEqual(int(solver.mjw_data.overflow.numpy()[0]), 0)
+
+    def test_retained_guards_cover_deepest_box_corner_feature_switch(self):
+        """Retain the first corner guard when correction makes another box corner deepest."""
+        half_extents = (0.08, 0.012, 0.01)
+        initial_center = 0.0101
+        dt = 0.00125
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        body = builder.add_body(
+            xform=wp.transform((0.0, 0.0, initial_center), wp.quat_identity()),
+            mass=0.019,
+        )
+        box = builder.add_shape_box(body, hx=half_extents[0], hy=half_extents[1], hz=half_extents[2])
+        plane = builder.add_shape_plane(width=0.0, length=0.0)
+        model = builder.finalize(device="cpu")
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        joint_qd = state_in.joint_qd.numpy()
+        joint_qd[2] = -0.088
+        state_in.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        contacts = newton.Contacts(1, 0, device=model.device)
+        contacts._strict_nonpenetration_active = True
+        oracle = _DeepestBoxCornerOracle(model, plane, box, body, half_extents)
+        solver = SolverMuJoCo(
+            model,
+            use_mujoco_contacts=False,
+            integrator="implicitfast",
+            iterations=100,
+            ls_iterations=50,
+            nconmax=4,
+            njmax=64,
+        )
+        solver._bind_strict_nonpenetration_oracle(oracle)
+
+        solver.step(state_in, state_out, control, contacts, dt)
+
+        self.assertEqual(len(oracle.materialized_corner_indices), 4)
+        self.assertNotEqual(oracle.materialized_corner_indices[0], oracle.materialized_corner_indices[1])
+        self.assertLess(oracle.materialized_min_separations[0], 0.0)
+        self.assertLess(oracle.materialized_min_separations[1], 0.0)
+        guard_count = int(oracle.guard_contacts.rigid_contact_count.numpy()[0])
+        self.assertEqual(guard_count, len(set(oracle.materialized_corner_indices)))
+        self.assertEqual(int(solver.mjw_data.nacon.numpy()[0]), guard_count)
+        self.assertGreaterEqual(oracle.final_min_separation, -1.0e-6)
+        self.assertGreaterEqual(initial_center - float(state_out.body_q.numpy()[body, 2]), 50.0e-6)
+        self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 0)
+        self.assertEqual(int(solver.mjw_data.overflow.numpy()[0]), 0)
+
+    def test_mesh_nonpenetration_oracle_rejects_straddling_edge_overlap(self):
+        """Keep a rod above a slab when crossing edges overlap but every vertex remains outside."""
+        devices = get_cuda_test_devices()
+        if not devices:
+            self.skipTest("Mesh SDF construction requires CUDA")
+        for device in devices:
+            with self.subTest(device=device):
+                (
+                    rod_half_extents,
+                    slab_half_extents,
+                    initial_center,
+                    dt,
+                    _initial_q,
+                    _initial_pose,
+                    state_out,
+                    rod_body,
+                    base_contact_count,
+                    solver,
+                ) = self._run_mesh_nonpenetration_transit_case(device, downward_velocity=-2.0)
+                candidate_center = initial_center - 2.0 * dt
+                candidate_bottom = candidate_center - rod_half_extents[2]
+                candidate_top = candidate_center + rod_half_extents[2]
+                self.assertLess(candidate_bottom, -slab_half_extents[2])
+                self.assertGreater(candidate_top, slab_half_extents[2])
+                self.assertEqual(base_contact_count, 0)
+                final_center = float(state_out.body_q.numpy()[rod_body, 2])
+                final_bottom = final_center - rod_half_extents[2]
+                self.assertGreaterEqual(final_bottom, slab_half_extents[2] - 5.0e-4)
+                self.assertLess(final_center, initial_center - 1.0e-4)
+                self.assertEqual(int(solver._strict_nonpenetration_oracle.world_status.numpy()[0]), 0)
+                self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 0)
+                self.assertEqual(int(solver.mjw_data.overflow.numpy()[0]), 0)
+
+    def test_mesh_nonpenetration_oracle_rejects_stationary_target_pure_translation_transit(self):
+        """Advance a transiting rod only through the translation prefix certified above a slab."""
+        downward_velocity = -12.0
+        devices = [wp.get_device("cpu"), *get_cuda_test_devices()]
+        for device in devices:
+            with self.subTest(device=device):
+                (
+                    rod_half_extents,
+                    slab_half_extents,
+                    initial_center,
+                    dt,
+                    _initial_q,
+                    _initial_pose,
+                    state_out,
+                    rod_body,
+                    base_contact_count,
+                    solver,
+                ) = self._run_mesh_nonpenetration_transit_case(device, downward_velocity=downward_velocity)
+                candidate_center = initial_center + downward_velocity * dt
+                candidate_bottom = candidate_center - rod_half_extents[2]
+                candidate_top = candidate_center + rod_half_extents[2]
+                self.assertLess(candidate_top, -slab_half_extents[2])
+                self.assertLess(candidate_bottom, candidate_top)
+                self.assertEqual(base_contact_count, 0)
+                oracle = solver._strict_nonpenetration_oracle
+                certified_fraction = float(oracle.certified_path_fraction.numpy()[0])
+                self.assertGreater(certified_fraction, 0.04164)
+                self.assertLess(certified_fraction, 0.04168)
+                final_center = float(state_out.body_q.numpy()[rod_body, 2])
+                final_velocity = float(state_out.joint_qd.numpy()[2])
+                self.assertAlmostEqual(
+                    final_center,
+                    initial_center + certified_fraction * downward_velocity * dt,
+                    delta=2.0e-7,
+                )
+                self.assertAlmostEqual(final_velocity, certified_fraction * downward_velocity, delta=2.0e-6)
+                self.assertLess(final_center, initial_center - 1.0e-4)
+                self.assertGreaterEqual(final_center - rod_half_extents[2], slab_half_extents[2] - 1.0e-7)
+                self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 0)
+                self.assertEqual(int(solver.mjw_data.overflow.numpy()[0]), 0)
+
+    def test_mesh_nonpenetration_oracle_commits_constant_twist_prefix(self):
+        """Commit and recheck the real solver reconstruction of a constant-twist prefix."""
+        tolerance = 1.0e-6
+        dt = 0.01
+        source_half_extents = np.asarray((0.05, 0.01, 1.0e-4), dtype=np.float32)
+        target_half_extents = np.asarray((0.2, 0.2, 0.01), dtype=np.float32)
+        angle_offset = 0.02
+        reference_angle = 0.5 * np.pi - angle_offset
+        candidate_angle = 0.5 * np.pi + angle_offset
+        angle_delta = candidate_angle - reference_angle
+        reference_clearance = tolerance
+        candidate_clearance = tolerance
+        translation_delta = candidate_clearance - reference_clearance
+        reference_extent = source_half_extents[0] * abs(np.sin(reference_angle)) + source_half_extents[2] * abs(
+            np.cos(reference_angle)
+        )
+        source_height = target_half_extents[2] + reference_extent + reference_clearance
+
+        def clearance(fraction: float) -> float:
+            angle = reference_angle + fraction * angle_delta
+            extent = source_half_extents[0] * abs(np.sin(angle)) + source_half_extents[2] * abs(np.cos(angle))
+            return source_height + fraction * translation_delta - target_half_extents[2] - extent
+
+        self.assertAlmostEqual(clearance(0.0), tolerance, delta=1.0e-12)
+        self.assertGreater(clearance(1.0 / 32.0), -tolerance)
+        self.assertLess(clearance(0.5), -tolerance)
+        self.assertAlmostEqual(clearance(1.0), tolerance, delta=1.0e-12)
+
+        device = wp.get_device("cpu")
+        source_mesh = newton.Mesh.create_box(
+            *source_half_extents,
+            duplicate_vertices=False,
+            compute_normals=False,
+            compute_uvs=False,
+        )
+        target_mesh = newton.Mesh.create_box(
+            *target_half_extents,
+            duplicate_vertices=False,
+            compute_normals=False,
+            compute_uvs=False,
+            compute_inertia=False,
+        )
+        reference_rotation = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), reference_angle)
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        builder.rigid_gap = 0.0
+        source_body = builder.add_body(
+            xform=wp.transform(wp.vec3(0.0, 0.0, float(source_height)), reference_rotation),
+            inertia=wp.mat33(1.0e-4 * np.eye(3)),
+            mass=0.02,
+            lock_inertia=True,
+        )
+        zero_density = newton.ModelBuilder.ShapeConfig(density=0.0)
+        builder.add_shape_mesh(source_body, mesh=source_mesh, cfg=zero_density)
+        target_body = builder.add_body(
+            xform=wp.transform_identity(),
+            inertia=wp.mat33(0.1 * np.eye(3)),
+            mass=1.0,
+            lock_inertia=True,
+            is_kinematic=True,
+        )
+        builder.add_shape_mesh(target_body, mesh=target_mesh, cfg=zero_density)
+        model = builder.finalize(device=device)
+
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        joint_qd = state_in.joint_qd.numpy()
+        joint_qd[:] = 0.0
+        joint_qd[2] = translation_delta / dt
+        joint_qd[4] = angle_delta / dt
+        state_in.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        reference_body_q = wp.clone(state_in.body_q)
+        reference_pose = reference_body_q.numpy()
+        max_speculative_extension = 0.05
+        pipeline = newton.CollisionPipeline(
+            model,
+            broad_phase="nxn",
+            reduce_contacts=False,
+            rigid_contact_max=128,
+            max_triangle_pairs=100_000,
+            speculative_config=newton.CollisionPipeline.SpeculativeContactConfig(
+                max_speculative_extension=max_speculative_extension,
+                enforce_nonpenetration=True,
+            ),
+        )
+        solver = SolverMuJoCo(
+            model,
+            use_mujoco_contacts=False,
+            use_mujoco_cpu=False,
+            integrator="implicitfast",
+            iterations=100,
+            ls_iterations=50,
+            nconmax=128,
+            njmax=512,
+        )
+        solver.bind_collision_pipeline(pipeline)
+        contacts = pipeline.contacts()
+        collision_state = model.state()
+        collision_pose = reference_pose.copy()
+        collision_pose[source_body, 2] += max_speculative_extension + 1.0e-3 - reference_clearance
+        collision_state.body_q.assign(collision_pose)
+        collision_state.body_qd.zero_()
+        pipeline.collide(collision_state, contacts, dt=dt)
+        self.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 0)
+        self.assertTrue(contacts._strict_nonpenetration_active)
+        self.assertIs(
+            contacts._strict_nonpenetration_owner_token,
+            solver._strict_nonpenetration_contact_token,
+        )
+        solver.step(state_in, state_out, control, contacts, dt)
+
+        oracle = solver._strict_nonpenetration_oracle
+        certified_fraction = float(oracle.certified_path_fraction.numpy()[0])
+        self.assertEqual(int(oracle.world_status.numpy()[0]), CONTACT_ORACLE_SWEEP_INCOMPLETE)
+        self.assertGreater(certified_fraction, 0.0)
+        self.assertLess(certified_fraction, 0.5)
+        self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 0)
+        self.assertEqual(int(solver.mjw_data.overflow.numpy()[0]), 0)
+
+        final_pose = state_out.body_q.numpy()
+        self.assertAlmostEqual(
+            final_pose[source_body, 2] - reference_pose[source_body, 2],
+            certified_fraction * translation_delta,
+            delta=5.0e-8,
+        )
+        self.assertGreater(
+            float(np.linalg.norm(final_pose[source_body, 3:] - reference_pose[source_body, 3:])),
+            1.0e-5,
+        )
+        self.assertAlmostEqual(
+            float(state_out.joint_qd.numpy()[4]),
+            certified_fraction * angle_delta / dt,
+            delta=1.0e-5,
+        )
+        self.assertGreaterEqual(clearance(certified_fraction), -tolerance)
+
+        origin_path_length = np.zeros(model.body_count, dtype=np.float32)
+        angular_path_length = np.zeros(model.body_count, dtype=np.float32)
+        motion_kind = np.full(model.body_count, RIGID_BODY_PATH_STATIONARY, dtype=np.uint8)
+        origin_path_length[source_body] = certified_fraction * translation_delta
+        angular_path_length[source_body] = certified_fraction * angle_delta
+        motion_kind[source_body] = RIGID_BODY_PATH_CONSTANT_TWIST
+        oracle.scan(
+            reference_body_q,
+            RigidBodyPathCertificate(
+                endpoint_body_q=state_out.body_q,
+                origin_path_length=wp.array(origin_path_length, dtype=wp.float32, device=device),
+                angular_path_length=wp.array(angular_path_length, dtype=wp.float32, device=device),
+                motion_kind=wp.array(motion_kind, dtype=wp.uint8, device=device),
+            ),
+        )
+        self.assertEqual(int(oracle.world_status.numpy()[0]), 0)
+        self.assertEqual(float(oracle.certified_path_fraction.numpy()[0]), 1.0)
+
+    def test_overlay_capacity_failures_hold_before_constraint_rebuild(self):
+        """Reject contact-entry, EFC-row, and sparse-NNZ overflow without constructing partial rows."""
+        cases = (
+            ("contacts", 1, 32, None, None, 1 << 3),
+            ("rows", 4, 0, None, None, 1 << 0),
+            ("sparse_nnz", 4, 1, "sparse", 0, 1 << 1),
+        )
+        for name, nconmax, njmax, jacobian, njmax_nnz, expected_overflow in cases:
+            with self.subTest(name=name):
+                _model, _body, state_in, state_out, control, contacts, solver = self._make_falling_guard_case(
+                    nconmax=nconmax,
+                    njmax=njmax,
+                    jacobian=jacobian,
+                )
+                if njmax_nnz is not None:
+                    solver.mjw_data.njmax_nnz = njmax_nnz
+                if name == "contacts":
+                    solver.mjw_data.naconmax = 0
+                initial_q = state_in.joint_q.numpy().copy()
+
+                solver.step(state_in, state_out, control, contacts, 0.01)
+
+                np.testing.assert_allclose(state_out.joint_q.numpy(), initial_q, rtol=0.0, atol=1.0e-7)
+                np.testing.assert_allclose(state_out.joint_qd.numpy(), 0.0, rtol=0.0, atol=1.0e-7)
+                overflow = int(solver.mjw_data.overflow.numpy()[0])
+                self.assertNotEqual(overflow & expected_overflow, 0)
+                self.assertNotEqual(overflow & (1 << 3), 0)
+                self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 1)
+                self.assertEqual(int(solver.mjw_data.nefc.numpy()[0]), 0)
+                if int(solver._strict_oracle_guard_state.tid_to_cid.numpy()[0]) >= 0:
+                    self.assertEqual(int(solver.mjw_data.contact.type.numpy()[0]) & 1, 0)
+
+                solver.step(state_out, state_in, control, contacts, 0.01)
+                self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 1)
+                solver.reset(state_out)
+                self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 0)
+                self.assertEqual(int(solver.mjw_data.overflow.numpy()[0]), 0)
+
+    def test_base_constraint_capacity_failures_hold_before_first_strict_solve(self):
+        """Reject base EFC-row and sparse-NNZ overflow before any constraint graph consumer."""
+        cases = (
+            ("rows", 0, None, None, 1 << 0),
+            ("sparse_nnz", 1, "sparse", 0, 1 << 1),
+        )
+        for name, njmax, jacobian, njmax_nnz, expected_overflow in cases:
+            for binding in ("unbound", "none", "bound"):
+                with self.subTest(name=name, binding=binding):
+                    radius = 0.05
+                    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+                    body = builder.add_body(
+                        xform=wp.transform((0.0, 0.0, 0.06), wp.quat_identity()),
+                        mass=0.02,
+                    )
+                    sphere = builder.add_shape_sphere(body, radius=radius)
+                    plane = builder.add_shape_plane(width=0.0, length=0.0)
+                    model = builder.finalize(device="cpu")
+                    model.joint_damping.fill_(2.0)
+                    state_in, state_out, control = model.state(), model.state(), model.control()
+                    joint_qd = state_in.joint_qd.numpy()
+                    joint_qd[2] = -2.0
+                    state_in.joint_qd.assign(joint_qd)
+                    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+                    initial_q = state_in.joint_q.numpy().copy()
+                    contacts = newton.Contacts(1, 0, device=model.device)
+                    contacts._strict_nonpenetration_active = True
+                    self._copy_oracle_guard_to_base_contacts(
+                        contacts,
+                        _SingleGuardOracle(model, plane, sphere, radius),
+                    )
+                    solver = SolverMuJoCo(
+                        model,
+                        use_mujoco_contacts=False,
+                        integrator="implicitfast",
+                        jacobian=jacobian,
+                        nconmax=1,
+                        njmax=njmax,
+                    )
+                    if njmax_nnz is not None:
+                        solver.mjw_data.njmax_nnz = njmax_nnz
+                    if binding == "none":
+                        solver._bind_strict_nonpenetration_oracle(None)
+                    elif binding == "bound":
+                        solver._bind_strict_nonpenetration_oracle(_EmptyRigidContactOracle(model))
+
+                    solver.step(state_in, state_out, control, contacts, 0.01)
+
+                    np.testing.assert_allclose(state_out.joint_q.numpy(), initial_q, rtol=0.0, atol=1.0e-7)
+                    np.testing.assert_allclose(state_out.joint_qd.numpy(), 0.0, rtol=0.0, atol=1.0e-7)
+                    self.assertEqual(int(solver.mjw_data.nefc.numpy()[0]), 0)
+                    overflow = int(solver.mjw_data.overflow.numpy()[0])
+                    self.assertNotEqual(overflow & expected_overflow, 0)
+                    self.assertNotEqual(overflow & (1 << 3), 0)
+                    self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 1)
+
+                    solver.step(state_out, state_in, control, contacts, 0.01)
+                    self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 1)
+
+    def test_sparse_overlay_preflight_includes_existing_constraint_nnz(self):
+        """Include every existing sparse row width before admitting an oracle overlay."""
+        _model, _body, state_in, state_out, control, contacts, solver = self._make_falling_guard_case(
+            nconmax=2,
+            njmax=2,
+            jacobian="sparse",
+        )
+        oracle = solver._strict_nonpenetration_oracle
+        self.assertIsInstance(oracle, _SingleGuardOracle)
+        self._copy_oracle_guard_to_base_contacts(contacts, oracle)
+        solver.mjw_data.njmax_nnz = 6
+        initial_q = state_in.joint_q.numpy().copy()
+
+        solver.step(state_in, state_out, control, contacts, 0.01)
+
+        np.testing.assert_allclose(state_out.joint_q.numpy(), initial_q, rtol=0.0, atol=1.0e-7)
+        np.testing.assert_allclose(state_out.joint_qd.numpy(), 0.0, rtol=0.0, atol=1.0e-7)
+        nefc = int(solver.mjw_data.nefc.numpy()[0])
+        base_nnz = int(np.sum(solver.mjw_data.efc.J_rownnz.numpy()[0, :nefc]))
+        self.assertGreater(base_nnz, 0)
+        self.assertEqual(int(solver._strict_base_constraint_nnz.numpy()[0]), base_nnz)
+        self.assertGreater(int(solver._strict_oracle_guard_state.overlay_nnz.numpy()[0]), 0)
+        self.assertNotEqual(int(solver.mjw_data.overflow.numpy()[0]) & (1 << 1), 0)
+        self.assertEqual(int(solver._strict_nonpenetration_unsafe_world.numpy()[0]), 1)
+
+    def test_overlay_wake_refreshes_smooth_acceleration(self):
+        """Recompute smooth acceleration when an oracle contact wakes a previously sleeping tree."""
+        radius = 0.05
+        initial_height = 0.5
+        dt = 0.01
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        awake_body = builder.add_body(
+            xform=wp.transform((0.0, 0.0, initial_height), wp.quat_identity()),
+            mass=0.02,
+        )
+        awake_sphere = builder.add_shape_sphere(awake_body, radius=radius)
+        sleeping_body = builder.add_body(
+            xform=wp.transform((2.0 * radius, 0.0, initial_height), wp.quat_identity()),
+            mass=0.02,
+        )
+        sleeping_sphere = builder.add_shape_sphere(sleeping_body, radius=radius)
+        model = builder.finalize(device="cpu")
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        contacts = newton.Contacts(1, 0, device=model.device)
+        contacts._strict_nonpenetration_active = True
+        solver = SolverMuJoCo(
+            model,
+            use_mujoco_contacts=False,
+            enable_sleeping=True,
+            nconmax=4,
+            njmax=32,
+        )
+        oracle = _SingleGuardOracle(
+            model,
+            awake_sphere,
+            sleeping_sphere,
+            radius,
+            radius0=radius,
+            normal=(1.0, 0.0, 0.0),
+        )
+        solver._bind_strict_nonpenetration_oracle(oracle)
+
+        from mujoco_warp._src import sleep
+
+        tree_asleep = solver.mjw_data.tree_asleep.numpy()
+        tree_asleep[0, 0] = solver._sleep_awake_value
+        tree_asleep[0, 1] = 1
+        solver.mjw_data.tree_asleep.assign(tree_asleep)
+        with wp.ScopedDevice(model.device):
+            sleep.update_sleep(solver.mjw_model, solver.mjw_data)
+        self.assertEqual(int(solver.mjw_data.tree_awake.numpy()[0, 1]), 0)
+
+        solver.step(state_in, state_out, control, contacts, dt)
+
+        self.assertEqual(int(solver.mjw_data.tree_awake.numpy()[0, 1]), 1)
+        expected_height = initial_height - 9.81 * dt * dt
+        self.assertAlmostEqual(float(state_out.body_q.numpy()[sleeping_body, 2]), expected_height, delta=1.0e-6)
+        self.assertAlmostEqual(float(state_out.joint_qd.numpy()[8]), -9.81 * dt, delta=1.0e-6)
+
+
 class TestMuJoCoSolverNewtonContacts(unittest.TestCase):
     def setUp(self):
         """Set up a simple model with a sphere and a plane."""
@@ -4355,6 +6185,56 @@ class TestMuJoCoSolverNewtonContacts(unittest.TestCase):
         self.contacts = self.collision_pipeline.contacts()
         self.collision_pipeline.collide(self.state_in, self.contacts)
         self.sphere_body_idx = sphere_body_idx
+
+    def _make_strict_contacts(
+        self,
+        model: newton.Model,
+        shape0: int,
+        shape1: int,
+        points0: np.ndarray,
+        points1: np.ndarray,
+        normals: np.ndarray,
+        *,
+        capacity: int = 8,
+        margins1: np.ndarray | None = None,
+        offsets1: np.ndarray | None = None,
+        strict_guard_kinds: np.ndarray | None = None,
+    ) -> newton.Contacts:
+        count = len(points0)
+        contacts = newton.Contacts(capacity, 0, device=model.device, per_contact_shape_properties=True)
+        contacts._velocity_speculation_active = True
+        contacts._strict_nonpenetration_active = True
+        contacts.rigid_contact_count.assign(np.asarray((count,), dtype=np.int32))
+
+        shape_ids = np.full(capacity, -1, dtype=np.int32)
+        shape_ids[:count] = shape0
+        contacts.rigid_contact_shape0.assign(shape_ids)
+        shape_ids[:count] = shape1
+        contacts.rigid_contact_shape1.assign(shape_ids)
+
+        vectors = np.zeros((capacity, 3), dtype=np.float32)
+        vectors[:count] = points0
+        contacts.rigid_contact_point0.assign(vectors)
+        vectors[:count] = points1
+        contacts.rigid_contact_point1.assign(vectors)
+        vectors[:count] = normals
+        contacts.rigid_contact_normal.assign(vectors)
+        if offsets1 is not None:
+            vectors[:count] = offsets1
+            contacts.rigid_contact_offset1.assign(vectors)
+
+        if margins1 is not None:
+            margins = np.zeros(capacity, dtype=np.float32)
+            margins[:count] = margins1
+            contacts.rigid_contact_margin1.assign(margins)
+        strict = np.zeros(capacity, dtype=np.uint8)
+        if strict_guard_kinds is None:
+            strict[:count] = 1
+        else:
+            strict[:count] = strict_guard_kinds
+        contacts.rigid_contact_is_strict_guard.assign(strict)
+        contacts.rigid_contact_normal_owner.fill_(-1)
+        return contacts
 
     def test_sphere_on_plane_with_newton_contacts(self):
         """Test that a sphere correctly collides with a plane using Newton contacts."""
@@ -4387,6 +6267,1637 @@ class TestMuJoCoSolverNewtonContacts(unittest.TestCase):
             self.sphere_radius * 1.2,
             f"Sphere is floating above the plane. Final height: {final_height}",
         )
+
+    def test_speculative_contacts_prevent_tunneling_between_collision_updates(self):
+        """Activate retained contacts before a fast sphere crosses a plane."""
+        outer_dt = 0.03
+        substeps = 8
+        substep_dt = outer_dt / substeps
+        sphere_radius = 0.05
+
+        def rollout(
+            speculative: bool,
+            ke: float,
+            kd: float,
+            *,
+            clear_buffers: bool = False,
+            integrator: str | None = None,
+        ) -> tuple[np.ndarray, np.ndarray]:
+            builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+            builder.rigid_gap = 0.0
+            builder.default_shape_cfg.ke = ke
+            builder.default_shape_cfg.kd = kd
+            body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.49)))
+            builder.add_shape_sphere(body, radius=sphere_radius)
+            builder.body_qd[body] = (0.0, 0.0, -20.0, 0.0, 0.0, 0.0)
+            builder.add_shape_plane(width=0.0, length=0.0)
+            model = builder.finalize()
+
+            config = None
+            if speculative:
+                config = newton.CollisionPipeline.SpeculativeContactConfig(max_speculative_extension=0.75)
+            collision_pipeline = newton.CollisionPipeline(model, broad_phase="nxn", speculative_config=config)
+            contacts = collision_pipeline.contacts()
+            contacts.clear_buffers = clear_buffers
+            state_in, state_out, control = model.state(), model.state(), model.control()
+            joint_qd = state_in.joint_qd.numpy()
+            joint_qd[:] = 0.0
+            joint_qd[2] = -20.0
+            state_in.joint_qd.assign(joint_qd)
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+            collision_pipeline.collide(state_in, contacts, dt=outer_dt)
+            solver = SolverMuJoCo(
+                model,
+                use_mujoco_contacts=False,
+                iterations=100,
+                ls_iterations=50,
+                integrator=integrator,
+                nconmax=32,
+                njmax=128,
+            )
+
+            heights = []
+            velocities = []
+            for _ in range(substeps):
+                solver.step(state_in, state_out, control, contacts, substep_dt)
+                state_in, state_out = state_out, state_in
+                heights.append(float(state_in.body_q.numpy()[body, 2]))
+                velocities.append(float(state_in.joint_qd.numpy()[2]))
+            return np.asarray(heights), np.asarray(velocities)
+
+        unprotected_heights, _ = rollout(False, 1.0e6, 2.0e3)
+        self.assertLess(unprotected_heights[-1], 0.0)
+
+        protected_rollouts = [rollout(True, *gains) for gains in ((100.0, 10.0), (1.0e8, 1.0e5))]
+        protected_rollouts.append(rollout(True, 100.0, 10.0, clear_buffers=True))
+        protected_rollouts.extend(rollout(True, 100.0, 10.0, integrator=name) for name in ("euler", "implicit"))
+        expected_free_flight = 0.49 - 20.0 * substep_dt * np.arange(1, 6)
+        for heights, velocities in protected_rollouts:
+            np.testing.assert_allclose(heights[:5], expected_free_flight, rtol=0.0, atol=1.0e-6)
+            self.assertGreaterEqual(heights.min(), sphere_radius - 5.0e-7)
+            self.assertAlmostEqual(heights[-1], sphere_radius, delta=5.0e-7)
+            self.assertLess(abs(velocities[-1]), 0.01)
+        np.testing.assert_allclose(protected_rollouts[0][0], protected_rollouts[1][0], rtol=0.0, atol=1.0e-6)
+
+    def test_speculative_mesh_sdf_contacts_prevent_tunneling_between_collision_updates(self):
+        """Keep a fast mesh SDF outside a kinematic mesh SDF between collision updates."""
+        devices = get_cuda_test_devices()
+        if not devices:
+            self.skipTest("Mesh SDF construction requires CUDA")
+
+        outer_dt = 0.01
+        substeps = 8
+        substep_dt = outer_dt / substeps
+        projectile_half_extents = (0.06, 0.025, 0.02)
+        board_half_extents = (0.3, 0.3, 0.02)
+        corners = np.asarray(list(itertools.product(*((-extent, extent) for extent in projectile_half_extents))))
+
+        def rotate(quat: np.ndarray, point: np.ndarray) -> np.ndarray:
+            twice_cross = 2.0 * np.cross(quat[:3], point)
+            return point + quat[3] * twice_cross + np.cross(quat[:3], twice_cross)
+
+        for device in devices:
+            with self.subTest(device=device):
+                projectile_mesh = newton.Mesh.create_box(
+                    *projectile_half_extents,
+                    duplicate_vertices=False,
+                    compute_normals=False,
+                    compute_uvs=False,
+                )
+                projectile_mesh.build_sdf(device=device, max_resolution=32)
+                board_mesh = newton.Mesh.create_box(
+                    *board_half_extents,
+                    duplicate_vertices=False,
+                    compute_normals=False,
+                    compute_uvs=False,
+                    compute_inertia=False,
+                )
+                board_mesh.build_sdf(device=device, max_resolution=32)
+
+                def rollout(
+                    speculative: bool,
+                    projectile_mesh: newton.Mesh = projectile_mesh,
+                    board_mesh: newton.Mesh = board_mesh,
+                    device=device,
+                ) -> tuple[np.ndarray, int]:
+                    builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+                    builder.rigid_gap = 0.0
+                    builder.default_shape_cfg.ke = 1.6e5
+                    builder.default_shape_cfg.kd = 800.0
+                    builder.default_shape_cfg.mu = 0.75
+                    body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05)), mass=0.02)
+                    builder.add_shape_mesh(body, mesh=projectile_mesh)
+                    board = builder.add_body(xform=wp.transform_identity(), mass=1.0, is_kinematic=True)
+                    builder.add_shape_mesh(board, mesh=board_mesh)
+                    model = builder.finalize(device=device)
+
+                    state_in, state_out, control = model.state(), model.state(), model.control()
+                    joint_qd = state_in.joint_qd.numpy()
+                    joint_qd[:] = 0.0
+                    joint_qd[2] = -2.0
+                    state_in.joint_qd.assign(joint_qd)
+                    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+
+                    config = None
+                    if speculative:
+                        config = newton.CollisionPipeline.SpeculativeContactConfig(max_speculative_extension=0.02)
+                    pipeline = newton.CollisionPipeline(
+                        model,
+                        broad_phase="sap",
+                        reduce_contacts=True,
+                        rigid_contact_max=128,
+                        max_triangle_pairs=100_000,
+                        include_static_kinematic_pairs=False,
+                        speculative_config=config,
+                    )
+                    contacts = pipeline.contacts()
+                    pipeline.collide(state_in, contacts, dt=outer_dt if speculative else None)
+                    contact_count = int(contacts.rigid_contact_count.numpy()[0])
+                    solver = SolverMuJoCo(
+                        model,
+                        use_mujoco_contacts=False,
+                        use_mujoco_cpu=False,
+                        integrator="implicitfast",
+                        iterations=100,
+                        ls_iterations=50,
+                        nconmax=128,
+                        njmax=512,
+                    )
+
+                    clearances = []
+                    for _ in range(substeps):
+                        solver.step(state_in, state_out, control, contacts, substep_dt)
+                        state_in, state_out = state_out, state_in
+                        pose = state_in.body_q.numpy()[body]
+                        lowest_vertex = min((rotate(pose[3:7], corner) + pose[:3])[2] for corner in corners)
+                        clearances.append(lowest_vertex - board_half_extents[2])
+                    return np.asarray(clearances), contact_count
+
+                unprotected_clearances, unprotected_contacts = rollout(False)
+                protected_clearances, protected_contacts = rollout(True)
+
+                self.assertEqual(unprotected_contacts, 0)
+                self.assertLess(unprotected_clearances[-1], -5.0e-3)
+                self.assertGreater(protected_contacts, 0)
+                self.assertLessEqual(protected_contacts, 7)
+                np.testing.assert_allclose(
+                    protected_clearances[:3],
+                    (0.0075, 0.005, 0.0025),
+                    rtol=0.0,
+                    atol=2.0e-6,
+                )
+                self.assertGreaterEqual(protected_clearances.min(), -5.0e-4)
+                self.assertLessEqual(abs(protected_clearances[-1]), 5.0e-4)
+                self.assertLessEqual(protected_clearances[3:].max(), 5.0e-4)
+
+    def test_speculative_tipped_mesh_sdf_contact_prevents_tunneling_between_collision_updates(self):
+        """Retain a receding tip that an active trailing contact later drives into a board."""
+        devices = get_cuda_test_devices()
+        if not devices:
+            self.skipTest("Mesh SDF construction requires CUDA")
+
+        outer_dt = 0.01
+        substeps = 8
+        fixed_gap_sum = 0.01
+        max_speculative_extension = 0.01
+        leading_clearance = 1.865e-3
+        trailing_clearance = -5.0e-4
+        downward_velocity = -2.0
+        angular_velocity = 27.5
+        projectile_half_extents = (0.08, 0.015, 0.01)
+        board_half_extents = (0.3, 0.3, 0.02)
+        tilt_angle = np.arcsin((leading_clearance - trailing_clearance) / (2.0 * projectile_half_extents[0]))
+        tilt = np.asarray(wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), float(tilt_angle)))
+
+        def rotate(quat: np.ndarray, points: np.ndarray) -> np.ndarray:
+            twice_cross = 2.0 * np.cross(quat[:3], points)
+            return points + quat[3] * twice_cross + np.cross(quat[:3], twice_cross)
+
+        for device in devices:
+            with self.subTest(device=device):
+                projectile_mesh = newton.Mesh.create_box(
+                    *projectile_half_extents,
+                    duplicate_vertices=False,
+                    compute_normals=False,
+                    compute_uvs=False,
+                )
+                projectile_mesh.build_sdf(device=device, max_resolution=64)
+                board_mesh = newton.Mesh.create_box(
+                    *board_half_extents,
+                    duplicate_vertices=False,
+                    compute_normals=False,
+                    compute_uvs=False,
+                    compute_inertia=False,
+                )
+                board_mesh.build_sdf(device=device, max_resolution=64)
+
+                local_vertices = np.asarray(projectile_mesh.vertices)
+                rotated_vertices = rotate(tilt, local_vertices)
+                leading = local_vertices[:, 0] < 0.0
+                trailing = local_vertices[:, 0] > 0.0
+                center_height = board_half_extents[2] + leading_clearance - rotated_vertices[leading, 2].min()
+                initial_clearances = rotated_vertices[:, 2] + center_height - board_half_extents[2]
+                initial_vertical_velocities = downward_velocity - angular_velocity * rotated_vertices[:, 0]
+                initial_leading_clearance = initial_clearances[leading].min()
+                self.assertGreater(initial_leading_clearance, 0.0)
+                self.assertLess(initial_leading_clearance, fixed_gap_sum)
+                self.assertAlmostEqual(initial_clearances[trailing].min(), trailing_clearance, delta=1.0e-6)
+                self.assertGreater(initial_vertical_velocities[leading].min(), 0.0)
+                self.assertLess(initial_vertical_velocities[trailing].max(), 0.0)
+
+                builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+                builder.rigid_gap = 0.5 * fixed_gap_sum
+                builder.default_shape_cfg.ke = 1.6e5
+                builder.default_shape_cfg.kd = 800.0
+                builder.default_shape_cfg.mu = 0.75
+                body = builder.add_body(
+                    xform=wp.transform(wp.vec3(0.0, 0.0, center_height), wp.quat(*tilt)),
+                    mass=0.019,
+                )
+                projectile_shape = builder.add_shape_mesh(body, mesh=projectile_mesh)
+                board = builder.add_body(xform=wp.transform_identity(), mass=1.0, is_kinematic=True)
+                builder.add_shape_mesh(board, mesh=board_mesh)
+                model = builder.finalize(device=device)
+
+                state_in, state_out, control = model.state(), model.state(), model.control()
+                joint_qd = state_in.joint_qd.numpy()
+                joint_qd[:] = 0.0
+                joint_qd[2] = downward_velocity
+                joint_qd[4] = angular_velocity
+                state_in.joint_qd.assign(joint_qd)
+                newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+                pipeline = newton.CollisionPipeline(
+                    model,
+                    broad_phase="sap",
+                    reduce_contacts=True,
+                    rigid_contact_max=128,
+                    max_triangle_pairs=100_000,
+                    include_static_kinematic_pairs=False,
+                    speculative_config=newton.CollisionPipeline.SpeculativeContactConfig(
+                        max_speculative_extension=max_speculative_extension
+                    ),
+                )
+                contacts = pipeline.contacts()
+                pipeline.collide(state_in, contacts, dt=outer_dt)
+                contact_count = int(contacts.rigid_contact_count.numpy()[0])
+                contact_shape0 = contacts.rigid_contact_shape0.numpy()[:contact_count]
+                contact_shape1 = contacts.rigid_contact_shape1.numpy()[:contact_count]
+                projectile_is_shape0 = contact_shape0 == projectile_shape
+                projectile_is_shape1 = contact_shape1 == projectile_shape
+                projectile_contact_mask = projectile_is_shape0 | projectile_is_shape1
+                projectile_contact_points = np.where(
+                    projectile_is_shape0[:, None],
+                    contacts.rigid_contact_point0.numpy()[:contact_count],
+                    contacts.rigid_contact_point1.numpy()[:contact_count],
+                )[projectile_contact_mask]
+                has_leading_guard = np.any(projectile_contact_points[:, 0] < -0.75 * projectile_half_extents[0])
+                self.assertTrue(
+                    has_leading_guard,
+                    f"Retained projectile anchors omit the leading tip: {projectile_contact_points[:, 0]}",
+                )
+                solver = SolverMuJoCo(
+                    model,
+                    use_mujoco_contacts=False,
+                    use_mujoco_cpu=False,
+                    integrator="implicitfast",
+                    iterations=100,
+                    ls_iterations=50,
+                    nconmax=128,
+                    njmax=512,
+                )
+
+                leading_clearances = []
+                trailing_clearances = []
+                for _ in range(substeps):
+                    solver.step(state_in, state_out, control, contacts, outer_dt / substeps)
+                    state_in, state_out = state_out, state_in
+                    pose = state_in.body_q.numpy()[body]
+                    world_vertices = rotate(pose[3:7], local_vertices) + pose[:3]
+                    leading_clearances.append(world_vertices[leading, 2].min() - board_half_extents[2])
+                    trailing_clearances.append(world_vertices[trailing, 2].min() - board_half_extents[2])
+
+                self.assertGreater(contact_count, 0)
+                self.assertLessEqual(min(abs(np.asarray(trailing_clearances))), 5.0e-4)
+                self.assertLessEqual(min(abs(np.asarray(leading_clearances))), 5.0e-4)
+                self.assertGreaterEqual(min(leading_clearances), -5.0e-4)
+
+    def test_persisted_mesh_sdf_normal_follows_owner_rotation(self):
+        """Rotate a persisted mesh-SDF normal with its owning body."""
+        dynamic_mesh = newton.Mesh.create_box(
+            0.1,
+            0.05,
+            0.02,
+            duplicate_vertices=False,
+            compute_normals=False,
+            compute_uvs=False,
+        )
+        static_mesh = newton.Mesh.create_box(
+            0.3,
+            0.3,
+            0.02,
+            duplicate_vertices=False,
+            compute_normals=False,
+            compute_uvs=False,
+            compute_inertia=False,
+        )
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        body = builder.add_body(xform=wp.transform_identity(), mass=1.0)
+        shape0 = builder.add_shape_mesh(body, mesh=dynamic_mesh)
+        shape1 = builder.add_shape_mesh(-1, mesh=static_mesh)
+        model = builder.finalize(device="cpu")
+
+        contact_max = 8
+        contacts = newton.Contacts(
+            rigid_contact_max=contact_max,
+            soft_contact_max=0,
+            device="cpu",
+            per_contact_shape_properties=True,
+        )
+        contacts._velocity_speculation_active = True
+        contacts.rigid_contact_count.assign(np.array([1], dtype=np.int32))
+        contact_shape0 = np.full(contact_max, -1, dtype=np.int32)
+        contact_shape1 = np.full(contact_max, -1, dtype=np.int32)
+        contact_shape0[0] = shape0
+        contact_shape1[0] = shape1
+        contacts.rigid_contact_shape0.assign(contact_shape0)
+        contacts.rigid_contact_shape1.assign(contact_shape1)
+        contact_point1 = np.zeros((contact_max, 3), dtype=np.float32)
+        contact_point1[0, 2] = 0.01
+        contacts.rigid_contact_point1.assign(contact_point1)
+        contact_normal = np.zeros((contact_max, 3), dtype=np.float32)
+        contact_normal[0, 2] = 1.0
+        contacts.rigid_contact_normal.assign(contact_normal)
+
+        owner_values = contacts.rigid_contact_normal_owner.numpy()
+        owner_values[0] = 0  # SDF mode 1 carries the normal on canonical shape 0.
+        contacts.rigid_contact_normal_owner.assign(owner_values)
+
+        state = model.state()
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        solver = SolverMuJoCo(
+            model,
+            use_mujoco_contacts=False,
+            use_mujoco_cpu=False,
+            nconmax=contact_max,
+            njmax=32,
+        )
+        solver._convert_contacts_to_mjwarp(model, state, contacts, 0.001)
+        initial_frame = solver.mjw_data.contact.frame.numpy()[0, 0]
+        initial_dist = float(solver.mjw_data.contact.dist.numpy()[0])
+        np.testing.assert_allclose(initial_frame, (0.0, 0.0, 1.0), rtol=0.0, atol=1.0e-6)
+        self.assertAlmostEqual(initial_dist, 0.01, delta=1.0e-6)
+
+        joint_q = state.joint_q.numpy()
+        half_angle = 0.25 * np.pi
+        joint_q[3:7] = (0.0, np.sin(half_angle), 0.0, np.cos(half_angle))
+        state.joint_q.assign(joint_q)
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        solver._convert_contacts_to_mjwarp(model, state, contacts, 0.001)
+
+        self.assertEqual(int(solver.mjw_data.nacon.numpy()[0]), 1)
+        rotated_frame = solver.mjw_data.contact.frame.numpy()[0, 0]
+        rotated_dist = float(solver.mjw_data.contact.dist.numpy()[0])
+        np.testing.assert_allclose(rotated_frame, (1.0, 0.0, 0.0), rtol=0.0, atol=1.0e-6)
+        self.assertAlmostEqual(rotated_dist, 0.0, delta=1.0e-6)
+
+    def test_speculative_contacts_prevent_angular_tunneling_between_collision_updates(self):
+        """Retained contacts account for a rotating body's point velocity."""
+        outer_dt = 0.03
+        substeps = 8
+        half_extents = (0.20, 0.05, 0.05)
+        corners = np.asarray(list(itertools.product(*((-extent, extent) for extent in half_extents))))
+
+        def rotate(quat: np.ndarray, point: np.ndarray) -> np.ndarray:
+            twice_cross = 2.0 * np.cross(quat[:3], point)
+            return point + quat[3] * twice_cross + np.cross(quat[:3], twice_cross)
+
+        def rollout(speculative: bool) -> tuple[np.ndarray, int]:
+            builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+            builder.rigid_gap = 0.0
+            builder.default_shape_cfg.ke = 1.0e6
+            builder.default_shape_cfg.kd = 2.0e3
+            body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.20)))
+            builder.add_shape_box(body, hx=half_extents[0], hy=half_extents[1], hz=half_extents[2])
+            builder.body_qd[body] = (0.0, 0.0, 0.0, 0.0, 40.0, 0.0)
+            builder.add_shape_plane(width=0.0, length=0.0)
+            model = builder.finalize()
+
+            config = None
+            if speculative:
+                config = newton.CollisionPipeline.SpeculativeContactConfig(max_speculative_extension=0.5)
+            pipeline = newton.CollisionPipeline(model, broad_phase="nxn", speculative_config=config)
+            contacts = pipeline.contacts()
+            state_in, state_out, control = model.state(), model.state(), model.control()
+            joint_qd = state_in.joint_qd.numpy()
+            joint_qd[:] = 0.0
+            joint_qd[4] = 40.0
+            state_in.joint_qd.assign(joint_qd)
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+            pipeline.collide(state_in, contacts, dt=outer_dt)
+            contact_count = int(contacts.rigid_contact_count.numpy()[0])
+            solver = SolverMuJoCo(
+                model,
+                use_mujoco_contacts=False,
+                iterations=100,
+                ls_iterations=50,
+                nconmax=64,
+                njmax=256,
+            )
+
+            lowest_corner_heights = []
+            for _ in range(substeps):
+                solver.step(state_in, state_out, control, contacts, outer_dt / substeps)
+                state_in, state_out = state_out, state_in
+                pose = state_in.body_q.numpy()[body]
+                lowest_corner_heights.append(min((rotate(pose[3:7], corner) + pose[:3])[2] for corner in corners))
+            return np.asarray(lowest_corner_heights), contact_count
+
+        unprotected_heights, unprotected_contacts = rollout(False)
+        protected_heights, protected_contacts = rollout(True)
+
+        self.assertEqual(unprotected_contacts, 0)
+        self.assertGreater(protected_contacts, 0)
+        self.assertLess(unprotected_heights.min(), -2.0e-3)
+        self.assertGreaterEqual(protected_heights.min(), -1.0e-4)
+        self.assertLess(protected_heights[-1], 0.03)
+
+    def test_speculative_contact_uses_persisted_surface_anchor_velocity(self):
+        """Keep a rotated, receding surface anchor force-free despite midpoint motion."""
+        outer_dt = 0.03
+        substep_dt = outer_dt / 8
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        builder.rigid_gap = 0.0
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.20)))
+        builder.add_shape_box(body, hx=0.20, hy=0.05, hz=0.05)
+        builder.body_qd[body] = (0.0, 0.0, 0.0, 0.0, 40.0, 0.0)
+        builder.add_shape_plane(width=0.0, length=0.0)
+        model = builder.finalize()
+
+        config = newton.CollisionPipeline.SpeculativeContactConfig(max_speculative_extension=0.5)
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", speculative_config=config)
+        contacts = pipeline.contacts()
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        joint_qd = state_in.joint_qd.numpy()
+        joint_qd[:] = 0.0
+        joint_qd[4] = 40.0
+        state_in.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        pipeline.collide(state_in, contacts, dt=outer_dt)
+        self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
+
+        angle = 1.4
+        joint_q = state_in.joint_q.numpy()
+        joint_q[2] = 0.21
+        joint_q[3:7] = (0.0, np.sin(0.5 * angle), 0.0, np.cos(0.5 * angle))
+        state_in.joint_q.assign(joint_q)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        SolverMuJoCo(model, use_mujoco_contacts=False, nconmax=32, njmax=128).step(
+            state_in, state_out, control, contacts, substep_dt
+        )
+
+        self.assertAlmostEqual(float(state_out.body_q.numpy()[body, 2]), 0.21, delta=1.0e-6)
+        self.assertAlmostEqual(float(state_out.joint_qd.numpy()[4]), 40.0, delta=1.0e-5)
+
+    def test_speculative_external_contacts_reject_rk4(self):
+        """Reject an integrator whose intermediate stages cannot refresh external contacts."""
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        builder.rigid_gap = 0.0
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.10)))
+        builder.add_shape_sphere(body, radius=0.05)
+        builder.body_qd[body] = (0.0, 0.0, -20.0, 0.0, 0.0, 0.0)
+        builder.add_shape_plane(width=0.0, length=0.0)
+        model = builder.finalize()
+
+        config = newton.CollisionPipeline.SpeculativeContactConfig(max_speculative_extension=0.1)
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", speculative_config=config)
+        contacts = pipeline.contacts()
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        pipeline.collide(state_in, contacts, dt=0.03)
+        solver = SolverMuJoCo(model, use_mujoco_contacts=False, integrator="rk4", nconmax=32, njmax=128)
+
+        with self.assertRaisesRegex(NotImplementedError, "integrator='rk4'"):
+            solver.step(state_in, state_out, control, contacts, 0.00375)
+
+    def test_fixed_gap_contacts_remain_force_free(self):
+        """Do not reinterpret an ordinary fixed-gap row when speculation is active."""
+        dt = 0.00375
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        builder.rigid_gap = 0.2
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.25)))
+        builder.add_shape_sphere(body, radius=0.05)
+        builder.body_qd[body] = (0.0, 0.0, -20.0, 0.0, 0.0, 0.0)
+        builder.add_shape_plane(width=0.0, length=0.0)
+        model = builder.finalize()
+
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+        contacts = pipeline.contacts()
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        joint_qd = state_in.joint_qd.numpy()
+        joint_qd[:] = 0.0
+        joint_qd[2] = -20.0
+        state_in.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        pipeline.collide(state_in, contacts)
+        self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
+        contacts._velocity_speculation_active = True
+        contacts.rigid_contact_is_predictive.zero_()
+
+        solver = SolverMuJoCo(model, use_mujoco_contacts=False, nconmax=32, njmax=128)
+        solver.step(state_in, state_out, control, contacts, dt)
+
+        self.assertAlmostEqual(float(state_out.body_q.numpy()[body, 2]), 0.25 - 20.0 * dt, delta=1.0e-6)
+        self.assertAlmostEqual(float(state_out.joint_qd.numpy()[2]), -20.0, delta=1.0e-6)
+
+    def test_horizon_contact_restores_authored_response_and_reactivates(self):
+        """Restore authored response at impact and retain horizon provenance through rebound."""
+        outer_dt = 0.03
+        substep_dt = outer_dt / 8
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        builder.rigid_gap = 0.0
+        builder.default_shape_cfg.ke = 100.0
+        builder.default_shape_cfg.kd = 10.0
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.10)))
+        builder.add_shape_sphere(body, radius=0.05)
+        builder.body_qd[body] = (0.0, 0.0, -20.0, 0.0, 0.0, 0.0)
+        builder.add_shape_plane(width=0.0, length=0.0)
+        model = builder.finalize()
+
+        config = newton.CollisionPipeline.SpeculativeContactConfig(max_speculative_extension=0.75)
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", speculative_config=config)
+        contacts = pipeline.contacts()
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        joint_qd = state_in.joint_qd.numpy()
+        joint_qd[:] = 0.0
+        joint_qd[2] = -20.0
+        state_in.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        pipeline.collide(state_in, contacts, dt=outer_dt)
+        self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
+
+        solver = SolverMuJoCo(model, use_mujoco_contacts=False, nconmax=32, njmax=128)
+        solver.step(state_in, state_out, control, contacts, substep_dt)
+        state_in, state_out = state_out, state_in
+        self.assertAlmostEqual(float(state_in.body_q.numpy()[body, 2]), 0.05, delta=5.0e-7)
+
+        joint_qd[2] = 20.0
+        state_in.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        solver.step(state_in, state_out, control, contacts, substep_dt)
+
+        self.assertAlmostEqual(float(state_out.body_q.numpy()[body, 2]), 0.05 + 20.0 * substep_dt, delta=1.0e-6)
+        self.assertAlmostEqual(float(state_out.joint_qd.numpy()[2]), 20.0, delta=1.0e-6)
+
+        state_in, state_out = state_out, state_in
+        joint_qd[2] = -20.0
+        state_in.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        solver.step(state_in, state_out, control, contacts, substep_dt)
+
+        self.assertAlmostEqual(float(state_out.body_q.numpy()[body, 2]), 0.05, delta=1.0e-6)
+        self.assertAlmostEqual(float(state_out.joint_qd.numpy()[2]), -20.0, delta=1.0e-5)
+
+    def test_horizon_contact_boundary_handoff_keeps_authored_row_active(self):
+        """Keep an authored normal row active for the first exact-boundary handoff step."""
+        substep_dt = 0.005
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        builder.rigid_gap = 0.0
+        builder.default_shape_cfg.ke = 1.6e5
+        builder.default_shape_cfg.kd = 800.0
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.06)), mass=0.02)
+        builder.add_shape_sphere(body, radius=0.05)
+        builder.body_qd[body] = (0.0, 0.0, -2.0, 0.0, 0.0, 0.0)
+        builder.add_shape_plane(width=0.0, length=0.0)
+        model = builder.finalize(device="cpu")
+
+        pipeline = newton.CollisionPipeline(
+            model,
+            broad_phase="nxn",
+            speculative_config=newton.CollisionPipeline.SpeculativeContactConfig(max_speculative_extension=0.02),
+        )
+        contacts = pipeline.contacts()
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        joint_qd = state_in.joint_qd.numpy()
+        joint_qd[:] = 0.0
+        joint_qd[2] = -2.0
+        state_in.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        pipeline.collide(state_in, contacts, dt=2.0 * substep_dt)
+
+        solver = SolverMuJoCo(model, use_mujoco_contacts=False, nconmax=32, njmax=128)
+        solver.step(state_in, state_out, control, contacts, substep_dt)
+        state_in, state_out = state_out, state_in
+        self.assertAlmostEqual(float(state_in.body_q.numpy()[body, 2]), 0.05, delta=5.0e-7)
+
+        solver.step(state_in, state_out, control, contacts, substep_dt)
+        # Authored compliance may admit a small deformation, but the active row must prevent the 10 mm
+        # unconstrained free-flight step that motivated this boundary regression.
+        self.assertGreaterEqual(float(state_out.body_q.numpy()[body, 2]), 0.049)
+        self.assertEqual(int(solver.mjw_data.contact.dim.numpy()[0]), 3)
+        self.assertGreaterEqual(int(solver.mjw_data.contact.efc_address.numpy()[0, 0]), 0)
+        self.assertGreater(float(solver.mjw_data.contact.includemargin.numpy()[0]), 0.0)
+
+        # Once step1 confirms the authored row exists, exact resting contact no longer needs sentinel inclusion.
+        state_in, state_out = state_out, state_in
+        joint_q = state_in.joint_q.numpy()
+        joint_q[2] = 0.05
+        state_in.joint_q.assign(joint_q)
+        state_in.joint_qd.zero_()
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        solver.step(state_in, state_out, control, contacts, substep_dt)
+        self.assertEqual(int(solver.mjw_data.contact.dim.numpy()[0]), 3)
+        self.assertEqual(float(solver.mjw_data.contact.includemargin.numpy()[0]), 0.0)
+
+    def test_strict_speculative_contact_enforces_nonpenetration_across_refresh(self):
+        """Keep a retained predictor normal-only until a physical contact refresh."""
+        outer_dt = 0.01
+        substep_dt = outer_dt / 8
+        radius = 0.05
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        builder.rigid_gap = 0.0
+        builder.default_shape_cfg.ke = 100.0
+        builder.default_shape_cfg.kd = 10.0
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.06)), mass=0.02)
+        builder.add_shape_sphere(body, radius=radius)
+        builder.add_shape_plane(width=0.0, length=0.0)
+        model = builder.finalize(device="cpu")
+
+        pipeline = newton.CollisionPipeline(
+            model,
+            broad_phase="nxn",
+            speculative_config=newton.CollisionPipeline.SpeculativeContactConfig(
+                max_speculative_extension=0.02,
+                enforce_nonpenetration=True,
+            ),
+        )
+        contacts = pipeline.contacts()
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        joint_qd = state_in.joint_qd.numpy()
+        tangential_velocity = 4.0
+        joint_qd[0] = tangential_velocity
+        joint_qd[2] = -2.0
+        state_in.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        pipeline.collide(state_in, contacts, dt=outer_dt)
+        self.assertEqual(int(contacts.rigid_contact_is_predictive.numpy()[0]), 1)
+        self.assertEqual(int(contacts.rigid_contact_is_strict_guard.numpy()[0]), 1)
+
+        solver = SolverMuJoCo(model, use_mujoco_contacts=False, nconmax=32, njmax=128)
+        clearances = []
+        for _ in range(8):
+            solver.step(state_in, state_out, control, contacts, substep_dt)
+            base_cid = int(solver._contact_tid_to_cid.numpy()[0])
+            self.assertEqual(int(solver.mjw_data.nacon.numpy()[0]), 2)
+            np.testing.assert_array_equal(solver.mjw_data.contact.dim.numpy()[base_cid : base_cid + 2], (1, 3))
+            addresses = solver.mjw_data.contact.efc_address.numpy()[base_cid : base_cid + 2]
+            self.assertEqual(np.count_nonzero(addresses[0] >= 0), 1)
+            self.assertEqual(np.count_nonzero(addresses[1] >= 0), 0)
+            state_in, state_out = state_out, state_in
+            self.assertAlmostEqual(float(state_in.joint_qd.numpy()[0]), tangential_velocity, delta=1.0e-5)
+            clearances.append(float(state_in.body_q.numpy()[body, 2]) - radius)
+
+        self.assertGreaterEqual(min(clearances), -5.0e-6)
+        self.assertEqual(int(solver._contact_horizon_state.numpy()[0]), 3)
+
+        # A physical row starts a new contact generation here. It must reconstruct the strict state without
+        # relying on the predictive bit from the earlier separated candidate.
+        pipeline.collide(state_in, contacts, dt=outer_dt)
+        self.assertEqual(int(contacts.rigid_contact_is_predictive.numpy()[0]), 0)
+        self.assertEqual(int(contacts.rigid_contact_is_strict_guard.numpy()[0]), 1)
+        joint_qd[0] = 0.4
+        state_in.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        solver.step(state_in, state_out, control, contacts, substep_dt)
+        self.assertGreaterEqual(float(state_out.body_q.numpy()[body, 2]) - radius, -5.0e-6)
+        self.assertEqual(int(solver._contact_horizon_state.numpy()[0]), 3)
+
+        base_cid = int(solver._contact_tid_to_cid.numpy()[0])
+        np.testing.assert_array_equal(solver.mjw_data.contact.dim.numpy()[base_cid : base_cid + 2], (1, 3))
+        guard_efc = int(solver.mjw_data.contact.efc_address.numpy()[base_cid, 0])
+        self.assertGreaterEqual(guard_efc, 0)
+        velocity = float(solver.mjw_data.efc.vel.numpy()[0, guard_efc])
+        reference = float(solver.mjw_data.efc.aref.numpy()[0, guard_efc])
+        signed_gap = max(float(solver.mjw_data.contact.dist.numpy()[base_cid]), 0.0)
+        expected_reference = (-signed_gap / (substep_dt * substep_dt) - velocity / substep_dt) / MJ_MAXIMP
+        self.assertAlmostEqual(reference, expected_reference, delta=2.0e-5)
+        np.testing.assert_allclose(
+            solver.mjw_data.contact.solimp.numpy()[base_cid, :2],
+            (MJ_MAXIMP, MJ_MAXIMP),
+            rtol=0.0,
+            atol=1.0e-7,
+        )
+
+    def test_strict_contact_keeps_exact_boundary_tangential_motion_force_free(self):
+        """Keep the authored friction row inactive at an exact, unloaded boundary."""
+        dt = 0.00125
+        half_extents = (0.08, 0.012, 0.01)
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        builder.rigid_gap = 0.0
+        builder.default_shape_cfg.ke = 1.6e5
+        builder.default_shape_cfg.kd = 800.0
+        builder.default_shape_cfg.mu = 0.75
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, half_extents[2])), mass=0.019)
+        box = builder.add_shape_box(body, hx=half_extents[0], hy=half_extents[1], hz=half_extents[2])
+        plane = builder.add_shape_plane(width=0.0, length=0.0)
+        model = builder.finalize(device="cpu")
+
+        contacts = self._make_strict_contacts(
+            model,
+            plane,
+            box,
+            np.asarray(((0.0, 0.0, 0.0),), dtype=np.float32),
+            np.asarray(((0.0, 0.0, -half_extents[2]),), dtype=np.float32),
+            np.asarray(((0.0, 0.0, 1.0),), dtype=np.float32),
+        )
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        state_in.joint_qd.assign(np.asarray((4.0, 0.0, 0.0, 0.0, 0.0, 0.0), dtype=np.float32))
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        solver = SolverMuJoCo(
+            model,
+            use_mujoco_contacts=False,
+            integrator="implicitfast",
+            iterations=100,
+            ls_iterations=50,
+            nconmax=32,
+            njmax=128,
+        )
+        solver.step(state_in, state_out, control, contacts, dt)
+
+        base_cid = int(solver._contact_tid_to_cid.numpy()[0])
+        np.testing.assert_array_equal(solver.mjw_data.contact.dim.numpy()[base_cid : base_cid + 2], (1, 3))
+        addresses = solver.mjw_data.contact.efc_address.numpy()[base_cid : base_cid + 2]
+        self.assertEqual(np.count_nonzero(addresses[0] >= 0), 1)
+        self.assertEqual(np.count_nonzero(addresses[1] >= 0), 0)
+        guard_efc = int(addresses[0, 0])
+        self.assertAlmostEqual(float(solver.mjw_data.efc.force.numpy()[0, guard_efc]), 0.0, delta=1.0e-8)
+        np.testing.assert_allclose(
+            state_out.joint_qd.numpy(),
+            (4.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            rtol=0.0,
+            atol=1.0e-6,
+        )
+        self.assertAlmostEqual(float(state_out.body_q.numpy()[body, 2]), half_extents[2], delta=1.0e-7)
+
+    def test_strict_contact_fast_path_activates_adjacent_authored_row_after_crossing(self):
+        """Update both strict rows and activate authored material only below the physical margin."""
+        dt = 0.00125
+        radius = 0.05
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        builder.rigid_gap = 0.0
+        builder.default_shape_cfg.ke = 100.0
+        builder.default_shape_cfg.kd = 10.0
+        builder.default_shape_cfg.mu = 0.75
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, radius + 1.0e-3)), mass=1.0)
+        sphere = builder.add_shape_sphere(body, radius=radius)
+        plane = builder.add_shape_plane(width=0.0, length=0.0)
+        model = builder.finalize(device="cpu")
+
+        contacts = self._make_strict_contacts(
+            model,
+            plane,
+            sphere,
+            np.asarray(((0.0, 0.0, 0.0),), dtype=np.float32),
+            np.asarray(((0.0, 0.0, 0.0),), dtype=np.float32),
+            np.asarray(((0.0, 0.0, 1.0),), dtype=np.float32),
+            margins1=np.asarray((radius,), dtype=np.float32),
+            offsets1=np.asarray(((0.0, 0.0, -radius),), dtype=np.float32),
+        )
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        solver = SolverMuJoCo(model, use_mujoco_contacts=False, nconmax=32, njmax=128)
+        solver.step(state_in, state_out, control, contacts, dt)
+
+        base_cid = int(solver._contact_tid_to_cid.numpy()[0])
+        self.assertEqual(int(solver.mjw_data.nacon.numpy()[0]), 2)
+        np.testing.assert_array_equal(solver.mjw_data.contact.dim.numpy()[base_cid : base_cid + 2], (1, 3))
+        np.testing.assert_allclose(
+            solver.mjw_data.contact.friction.numpy()[base_cid + 1, :2],
+            (0.75, 0.75),
+            rtol=0.0,
+            atol=1.0e-7,
+        )
+        addresses = solver.mjw_data.contact.efc_address.numpy()[base_cid : base_cid + 2]
+        self.assertEqual(np.count_nonzero(addresses[0] >= 0), 1)
+        self.assertEqual(np.count_nonzero(addresses[1] >= 0), 0)
+
+        joint_q = state_out.joint_q.numpy()
+        joint_q[2] = radius - 5.0e-4
+        state_out.joint_q.assign(joint_q)
+        state_out.joint_qd.zero_()
+        newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+        solver.step(state_out, state_in, control, contacts, dt)
+
+        self.assertEqual(int(solver._contact_tid_to_cid.numpy()[0]), base_cid)
+        self.assertEqual(int(solver.mjw_data.nacon.numpy()[0]), 2)
+        np.testing.assert_allclose(
+            solver.mjw_data.contact.dist.numpy()[base_cid : base_cid + 2],
+            (-5.0e-4, -5.0e-4),
+            rtol=0.0,
+            atol=1.0e-7,
+        )
+        addresses = solver.mjw_data.contact.efc_address.numpy()[base_cid : base_cid + 2]
+        self.assertEqual(np.count_nonzero(addresses[0] >= 0), 1)
+        self.assertEqual(np.count_nonzero(addresses[1] >= 0), 4)
+
+    def test_strict_contact_does_not_eject_stale_overlap(self):
+        """Stop inward velocity without converting stale penetration depth into recovery speed."""
+        dt = 0.00125
+        radius = 0.05
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        builder.rigid_gap = 0.0
+        builder.default_shape_cfg.ke = 1.0
+        builder.default_shape_cfg.kd = 0.0
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, radius - 0.01)), mass=1.0)
+        sphere = builder.add_shape_sphere(body, radius=radius)
+        plane = builder.add_shape_plane(width=0.0, length=0.0)
+        model = builder.finalize(device="cpu")
+
+        contacts = self._make_strict_contacts(
+            model,
+            plane,
+            sphere,
+            np.asarray(((0.0, 0.0, 0.0),), dtype=np.float32),
+            np.asarray(((0.0, 0.0, 0.0),), dtype=np.float32),
+            np.asarray(((0.0, 0.0, 1.0),), dtype=np.float32),
+            margins1=np.asarray((radius,), dtype=np.float32),
+            offsets1=np.asarray(((0.0, 0.0, -radius),), dtype=np.float32),
+        )
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        state_in.joint_qd.zero_()
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        solver = SolverMuJoCo(model, use_mujoco_contacts=False, nconmax=32, njmax=128)
+        solver.step(state_in, state_out, control, contacts, dt)
+
+        base_cid = int(solver._contact_tid_to_cid.numpy()[0])
+        guard_efc = int(solver.mjw_data.contact.efc_address.numpy()[base_cid, 0])
+        self.assertGreaterEqual(guard_efc, 0)
+        self.assertAlmostEqual(float(solver.mjw_data.efc.aref.numpy()[0, guard_efc]), 0.0, delta=1.0e-6)
+        self.assertAlmostEqual(float(solver.mjw_data.efc.force.numpy()[0, guard_efc]), 0.0, delta=1.0e-8)
+        self.assertLess(abs(float(state_out.joint_qd.numpy()[2])), 0.1)
+
+    def test_strict_contact_does_not_reserve_safe_finite_rotation(self):
+        """Leave a finite-rotation endpoint force-free when its exact gap remains positive."""
+        dt = 0.00125
+        radius = 0.02
+        center_offset = 0.1
+        initial_clearance = 1.0e-3
+
+        def step(enforce_nonpenetration: bool) -> tuple[np.ndarray, float]:
+            builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+            builder.rigid_gap = 0.005
+            body = builder.add_body(
+                xform=wp.transform(wp.vec3(0.0, 0.0, radius + initial_clearance - center_offset)),
+                mass=0.019,
+                com=wp.vec3(0.0),
+                inertia=wp.mat33(0.001, 0.0, 0.0, 0.0, 0.001, 0.0, 0.0, 0.0, 0.001),
+                lock_inertia=True,
+            )
+            builder.add_shape_sphere(body, radius=radius, xform=wp.transform(wp.vec3(0.0, 0.0, center_offset)))
+            builder.add_shape_plane(width=0.0, length=0.0)
+            model = builder.finalize(device="cpu")
+            pipeline = newton.CollisionPipeline(
+                model,
+                broad_phase="nxn",
+                speculative_config=newton.CollisionPipeline.SpeculativeContactConfig(
+                    max_speculative_extension=0.02,
+                    enforce_nonpenetration=enforce_nonpenetration,
+                ),
+            )
+            contacts = pipeline.contacts()
+            state_in, state_out, control = model.state(), model.state(), model.control()
+            joint_qd = state_in.joint_qd.numpy()
+            joint_qd[:] = 0.0
+            joint_qd[4] = 80.0
+            state_in.joint_qd.assign(joint_qd)
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+            pipeline.collide(state_in, contacts, dt=0.01)
+            self.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 1)
+
+            solver = SolverMuJoCo(
+                model,
+                use_mujoco_contacts=False,
+                integrator="implicitfast",
+                iterations=100,
+                ls_iterations=50,
+                nconmax=32,
+                njmax=128,
+            )
+            solver.step(state_in, state_out, control, contacts, dt)
+
+            pose = state_out.body_q.numpy()[body]
+            quat = pose[3:7]
+            local_center = np.asarray((0.0, 0.0, center_offset))
+            twice_cross = 2.0 * np.cross(quat[:3], local_center)
+            center = pose[:3] + local_center + quat[3] * twice_cross + np.cross(quat[:3], twice_cross)
+            return state_out.joint_qd.numpy(), float(center[2]) - radius
+
+        baseline_qd, baseline_clearance = step(False)
+        strict_qd, strict_clearance = step(True)
+
+        self.assertGreater(baseline_clearance, 4.0e-4)
+        np.testing.assert_allclose(strict_qd, baseline_qd, rtol=0.0, atol=1.0e-5)
+        self.assertAlmostEqual(strict_clearance, baseline_clearance, delta=1.0e-7)
+
+    def _make_strict_capacity_contacts(
+        self, strict_guard_kinds: np.ndarray
+    ) -> tuple[newton.Model, newton.State, newton.Contacts]:
+        contact_count = len(strict_guard_kinds)
+        half_extents = (0.08, 0.012, 0.01)
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        builder.rigid_gap = 0.0
+        builder.default_shape_cfg.mu = 0.75
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, half_extents[2])), mass=1.0)
+        box = builder.add_shape_box(body, hx=half_extents[0], hy=half_extents[1], hz=half_extents[2])
+        plane = builder.add_shape_plane(width=0.0, length=0.0)
+        model = builder.finalize(device="cpu")
+
+        points_xy = np.asarray(
+            (
+                (-half_extents[0], -half_extents[1]),
+                (-half_extents[0], half_extents[1]),
+                (half_extents[0], -half_extents[1]),
+                (half_extents[0], half_extents[1]),
+            ),
+            dtype=np.float32,
+        )
+        points_xy = np.resize(points_xy, (contact_count, 2))
+        points0 = np.column_stack((points_xy, np.zeros(contact_count, dtype=np.float32)))
+        points1 = np.column_stack((points_xy, np.full(contact_count, -half_extents[2], dtype=np.float32)))
+        normals = np.zeros((contact_count, 3), dtype=np.float32)
+        normals[:, 2] = 1.0
+        contacts = self._make_strict_contacts(
+            model,
+            plane,
+            box,
+            points0,
+            points1,
+            normals,
+            capacity=contact_count,
+            strict_guard_kinds=strict_guard_kinds,
+        )
+        state = model.state()
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        return model, state, contacts
+
+    def test_strict_contact_exact_entry_capacity_accepts_mixed_generation(self):
+        """Accept a strict generation when its exact contact-entry count fits capacity."""
+        guard_kinds = np.asarray((1, 0, 0, 0), dtype=np.uint8)
+        model, state, contacts = self._make_strict_capacity_contacts(guard_kinds)
+        solver = SolverMuJoCo(model, use_mujoco_contacts=False, nconmax=5, njmax=64)
+
+        self.assertEqual(solver.mjw_data.naconmax, 5)
+        self.assertGreater(2 * int(contacts.rigid_contact_count.numpy()[0]), solver.mjw_data.naconmax)
+        solver._convert_contacts_to_mjwarp(model, state, contacts, 0.00125)
+        self.assertEqual(int(solver.mjw_data.nacon.numpy()[0]), 5)
+        self.assertEqual(int(solver.mjw_data.overflow.numpy()[0]), 0)
+        np.testing.assert_array_equal(np.sort(solver.mjw_data.contact.dim.numpy()[:5]), (1, 3, 3, 3, 3))
+        contact_ids = solver._contact_tid_to_cid.numpy()[:4]
+        self.assertEqual(len(np.unique(contact_ids)), 4)
+        self.assertGreaterEqual(int(contact_ids.min()), 0)
+        self.assertLess(int(contact_ids.max()), 5)
+        guard_id = int(contact_ids[0])
+        self.assertNotIn(guard_id + 1, contact_ids)
+        np.testing.assert_array_equal(solver.mjw_data.contact.dim.numpy()[guard_id : guard_id + 2], (1, 3))
+        np.testing.assert_array_equal(solver._contact_horizon_state.numpy()[:4], (3, 0, 0, 0))
+
+        # The retained-contact fast path must restore the exact compacted count.
+        solver._convert_contacts_to_mjwarp(model, state, contacts, 0.00125)
+        self.assertEqual(int(solver.mjw_data.nacon.numpy()[0]), 5)
+
+    def test_strict_contact_one_entry_short_rejects_generation(self):
+        """Reject an undersized strict generation without emitting partial contact entries."""
+        guard_kinds = np.asarray((1, 0, 0, 0), dtype=np.uint8)
+        model, state, contacts = self._make_strict_capacity_contacts(guard_kinds)
+        solver = SolverMuJoCo(model, use_mujoco_contacts=False, nconmax=4, njmax=64)
+
+        self.assertEqual(solver.mjw_data.naconmax, 4)
+        solver._convert_contacts_to_mjwarp(model, state, contacts, 0.00125)
+
+        self.assertEqual(int(solver._required_mjwarp_contact_entries.numpy()[0]), 5)
+        self.assertEqual(int(solver.mjw_data.nacon.numpy()[0]), 0)
+        self.assertEqual(int(solver.mjw_data.ncollision.numpy()[0]), 0)
+        np.testing.assert_array_equal(solver._contact_tid_to_cid.numpy()[:4], -1)
+        overflow = int(solver.mjw_data.overflow.numpy()[0])
+        self.assertNotEqual(overflow & int(solver._mujoco_warp.OverflowType.NARROWPHASE), 0)
+
+    def test_strict_contact_preflight_counts_entries_beyond_contact_capacity(self):
+        """Count every expanded contact entry before rejecting an oversized generation."""
+        guard_kinds = np.resize(np.asarray((1, 0, 2), dtype=np.uint8), 300)
+        model, state, contacts = self._make_strict_capacity_contacts(guard_kinds)
+        solver = SolverMuJoCo(model, use_mujoco_contacts=False, nconmax=4, njmax=64)
+
+        solver._convert_contacts_to_mjwarp(model, state, contacts, 0.00125)
+
+        expected_entries = len(guard_kinds) + int(np.count_nonzero(guard_kinds == 1))
+        self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), solver.mjw_data.naconmax)
+        self.assertEqual(int(solver._required_mjwarp_contact_entries.numpy()[0]), expected_entries)
+        self.assertEqual(int(solver.mjw_data.nacon.numpy()[0]), 0)
+        self.assertEqual(int(solver.mjw_data.ncollision.numpy()[0]), 0)
+        np.testing.assert_array_equal(solver._contact_tid_to_cid.numpy(), -1)
+        overflow = int(solver.mjw_data.overflow.numpy()[0])
+        self.assertNotEqual(overflow & int(solver._mujoco_warp.OverflowType.NARROWPHASE), 0)
+
+    def test_strict_guard_only_contact_consumes_one_normal_entry(self):
+        """Emit one normal-only MJWarp entry for a guard-only strict contact."""
+        guard_kinds = np.asarray((2, 0, 0, 0), dtype=np.uint8)
+        model, state, contacts = self._make_strict_capacity_contacts(guard_kinds)
+        contacts.rigid_contact_count.assign(np.asarray((1,), dtype=np.int32))
+        solver = SolverMuJoCo(model, use_mujoco_contacts=False, nconmax=4, njmax=64)
+
+        solver._convert_contacts_to_mjwarp(model, state, contacts, 0.00125)
+
+        self.assertEqual(int(solver.mjw_data.nacon.numpy()[0]), 1)
+        self.assertEqual(int(solver.mjw_data.contact.dim.numpy()[0]), 1)
+        self.assertEqual(int(solver._contact_tid_to_cid.numpy()[0]), 0)
+        self.assertEqual(int(solver._contact_horizon_state.numpy()[0]), 3)
+        self.assertEqual(int(solver.mjw_data.overflow.numpy()[0]), 0)
+
+        solver._convert_contacts_to_mjwarp(model, state, contacts, 0.00125)
+        self.assertEqual(int(solver.mjw_data.nacon.numpy()[0]), 1)
+        self.assertEqual(int(solver.mjw_data.contact.dim.numpy()[0]), 1)
+
+    def test_strict_authored_box_contacts_prevent_substep_rotational_tunneling(self):
+        """Arm authored shell contacts before torque rotates the box through the plane."""
+        outer_dt = 0.01
+        substeps = 8
+        substep_dt = outer_dt / substeps
+        half_extents = np.asarray((0.08, 0.012, 0.01), dtype=np.float64)
+        corners = np.asarray(list(itertools.product(*((-extent, extent) for extent in half_extents))))
+
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        builder.rigid_gap = 0.005
+        builder.default_shape_cfg.ke = 1.6e5
+        builder.default_shape_cfg.kd = 800.0
+        builder.default_shape_cfg.mu = 0.75
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.018)), mass=0.019)
+        builder.add_shape_box(body, hx=half_extents[0], hy=half_extents[1], hz=half_extents[2])
+        builder.add_shape_plane(width=0.0, length=0.0)
+        model = builder.finalize(device="cpu")
+
+        pipeline = newton.CollisionPipeline(
+            model,
+            broad_phase="nxn",
+            speculative_config=newton.CollisionPipeline.SpeculativeContactConfig(
+                max_speculative_extension=0.02,
+                enforce_nonpenetration=True,
+            ),
+        )
+        contacts = pipeline.contacts()
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        state_in.joint_qd.zero_()
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        pipeline.collide(state_in, contacts, dt=outer_dt)
+
+        contact_count = int(contacts.rigid_contact_count.numpy()[0])
+        self.assertEqual(contact_count, 4)
+        np.testing.assert_array_equal(contacts.rigid_contact_is_predictive.numpy()[:contact_count], 1)
+
+        solver = SolverMuJoCo(
+            model,
+            use_mujoco_contacts=False,
+            integrator="implicitfast",
+            iterations=100,
+            ls_iterations=50,
+            nconmax=32,
+            njmax=128,
+        )
+        minimum_clearance = float("inf")
+        for _ in range(substeps):
+            body_wrench = np.zeros((state_in.body_f.shape[0], 6), dtype=np.float32)
+            body_wrench[body, 4] = 0.35
+            state_in.body_f.assign(body_wrench)
+            solver.step(state_in, state_out, control, contacts, substep_dt)
+            state_in, state_out = state_out, state_in
+
+            pose = state_in.body_q.numpy()[body]
+            quat = pose[3:7]
+            twice_cross = 2.0 * np.cross(quat[:3], corners)
+            rotated_corners = corners + quat[3] * twice_cross + np.cross(quat[:3], twice_cross)
+            minimum_clearance = min(minimum_clearance, float(np.min(rotated_corners[:, 2] + pose[2])))
+
+        self.assertGreaterEqual(minimum_clearance, -5.0e-6)
+
+    def test_strict_contact_reserves_rotation_created_from_shallow_overlap(self):
+        """Reserve finite rotation even when the contact begins just behind the physical boundary."""
+        substep_dt = 0.00125
+        radius = 0.02
+        center_offset = 0.1
+        initial_clearance = -4.0e-6
+
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        builder.rigid_gap = 0.005
+        body = builder.add_body(
+            xform=wp.transform(wp.vec3(0.0, 0.0, radius + initial_clearance - center_offset)),
+            mass=0.019,
+            com=wp.vec3(0.0),
+            inertia=wp.mat33(0.001, 0.0, 0.0, 0.0, 0.001, 0.0, 0.0, 0.0, 0.001),
+            lock_inertia=True,
+        )
+        builder.add_shape_sphere(
+            body,
+            radius=radius,
+            xform=wp.transform(wp.vec3(0.0, 0.0, center_offset)),
+        )
+        builder.add_shape_plane(width=0.0, length=0.0)
+        model = builder.finalize(device="cpu")
+
+        pipeline = newton.CollisionPipeline(
+            model,
+            broad_phase="nxn",
+            speculative_config=newton.CollisionPipeline.SpeculativeContactConfig(
+                max_speculative_extension=0.02,
+                enforce_nonpenetration=True,
+            ),
+        )
+        contacts = pipeline.contacts()
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        joint_qd = state_in.joint_qd.numpy()
+        joint_qd[:] = 0.0
+        joint_qd[0] = 4.0
+        state_in.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        pipeline.collide(state_in, contacts, dt=0.01)
+
+        self.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 1)
+        self.assertEqual(int(contacts.rigid_contact_is_strict_guard.numpy()[0]), 1)
+
+        body_wrench = np.zeros((state_in.body_f.shape[0], 6), dtype=np.float32)
+        body_wrench[body, 4] = 64.0
+        state_in.body_f.assign(body_wrench)
+        solver = SolverMuJoCo(
+            model,
+            use_mujoco_contacts=False,
+            integrator="implicitfast",
+            iterations=100,
+            ls_iterations=50,
+            nconmax=32,
+            njmax=128,
+        )
+        solver.step(state_in, state_out, control, contacts, substep_dt)
+
+        pose = state_out.body_q.numpy()[body]
+        quat = pose[3:7]
+        local_center = np.asarray((0.0, 0.0, center_offset))
+        twice_cross = 2.0 * np.cross(quat[:3], local_center)
+        world_center = pose[:3] + local_center + quat[3] * twice_cross + np.cross(quat[:3], twice_cross)
+        self.assertGreaterEqual(float(world_center[2]) - radius, -5.0e-6)
+        base_cid = int(solver._contact_tid_to_cid.numpy()[0])
+        np.testing.assert_array_equal(solver.mjw_data.contact.dim.numpy()[base_cid : base_cid + 2], (1, 3))
+        guard_efc = int(solver.mjw_data.contact.efc_address.numpy()[base_cid, 0])
+        self.assertGreater(float(solver.mjw_data.efc.aref.numpy()[0, guard_efc]), 0.0)
+
+    def test_strict_contact_uses_implicitfast_damped_candidate_velocity(self):
+        """Keep a separated contact force-free when implicit damping makes the candidate endpoint safe."""
+        substep_dt = 0.00125
+        radius = 0.02
+        center_offset = 0.1
+        initial_clearance = 2.0e-4
+
+        def step(enforce_nonpenetration: bool) -> tuple[np.ndarray, np.ndarray, float]:
+            builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+            builder.rigid_gap = 0.005
+            body = builder.add_body(
+                xform=wp.transform(wp.vec3(0.0, 0.0, radius + initial_clearance - center_offset)),
+                mass=0.019,
+                com=wp.vec3(0.0),
+                inertia=wp.mat33(0.001, 0.0, 0.0, 0.0, 0.001, 0.0, 0.0, 0.0, 0.001),
+                lock_inertia=True,
+            )
+            builder.add_shape_sphere(body, radius=radius, xform=wp.transform(wp.vec3(0.0, 0.0, center_offset)))
+            builder.add_shape_plane(width=0.0, length=0.0)
+            model = builder.finalize(device="cpu")
+            joint_damping = model.joint_damping.numpy()
+            joint_damping[4] = 2.0
+            model.joint_damping.assign(joint_damping)
+
+            pipeline = newton.CollisionPipeline(
+                model,
+                broad_phase="nxn",
+                speculative_config=newton.CollisionPipeline.SpeculativeContactConfig(
+                    max_speculative_extension=0.02,
+                    enforce_nonpenetration=enforce_nonpenetration,
+                ),
+            )
+            contacts = pipeline.contacts()
+            state_in, state_out, control = model.state(), model.state(), model.control()
+            joint_qd = state_in.joint_qd.numpy()
+            joint_qd[:] = 0.0
+            joint_qd[0] = 4.0
+            state_in.joint_qd.assign(joint_qd)
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+            pipeline.collide(state_in, contacts, dt=0.01)
+
+            self.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 1)
+            self.assertEqual(int(contacts.rigid_contact_is_predictive.numpy()[0]), 1)
+
+            body_wrench = np.zeros((state_in.body_f.shape[0], 6), dtype=np.float32)
+            body_wrench[body, 4] = 64.0
+            state_in.body_f.assign(body_wrench)
+            solver = SolverMuJoCo(
+                model,
+                use_mujoco_contacts=False,
+                integrator="implicitfast",
+                iterations=100,
+                ls_iterations=50,
+                nconmax=32,
+                njmax=128,
+            )
+            solver.step(state_in, state_out, control, contacts, substep_dt)
+
+            pose = state_out.body_q.numpy()[body]
+            quat = pose[3:7]
+            local_center = np.asarray((0.0, 0.0, center_offset))
+            twice_cross = 2.0 * np.cross(quat[:3], local_center)
+            world_center = pose[:3] + local_center + quat[3] * twice_cross + np.cross(quat[:3], twice_cross)
+            return pose, state_out.joint_qd.numpy(), float(world_center[2]) - radius
+
+        baseline_pose, baseline_qd, baseline_clearance = step(enforce_nonpenetration=False)
+        strict_pose, strict_qd, strict_clearance = step(enforce_nonpenetration=True)
+
+        self.assertGreater(baseline_clearance, 1.0e-4)
+        self.assertAlmostEqual(float(baseline_qd[2]), 0.0, delta=1.0e-6)
+        np.testing.assert_allclose(strict_pose, baseline_pose, rtol=0.0, atol=5.0e-6)
+        np.testing.assert_allclose(strict_qd, baseline_qd, rtol=0.0, atol=1.0e-4)
+        self.assertAlmostEqual(strict_clearance, baseline_clearance, delta=5.0e-6)
+
+    def test_strict_contact_predicts_free_body_about_origin_with_off_center_com(self):
+        """Match free-joint integration when the inertial COM is offset from the body origin."""
+        substep_dt = 0.00125
+        radius = 0.02
+        center_offset = 0.1
+        initial_clearance = 2.0e-4
+
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        builder.rigid_gap = 0.005
+        body = builder.add_body(
+            xform=wp.transform(wp.vec3(0.0, 0.0, radius + initial_clearance - center_offset)),
+            mass=0.019,
+            com=wp.vec3(0.0, 0.0, 0.05),
+            inertia=wp.mat33(0.001, 0.0, 0.0, 0.0, 0.001, 0.0, 0.0, 0.0, 0.001),
+            lock_inertia=True,
+        )
+        builder.add_shape_sphere(body, radius=radius, xform=wp.transform(wp.vec3(0.0, 0.0, center_offset)))
+        builder.add_shape_plane(width=0.0, length=0.0)
+        model = builder.finalize(device="cpu")
+
+        pipeline = newton.CollisionPipeline(
+            model,
+            broad_phase="nxn",
+            speculative_config=newton.CollisionPipeline.SpeculativeContactConfig(
+                max_speculative_extension=0.02,
+                enforce_nonpenetration=True,
+            ),
+        )
+        contacts = pipeline.contacts()
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        joint_qd = state_in.joint_qd.numpy()
+        joint_qd[:] = 0.0
+        joint_qd[0] = 4.0
+        state_in.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        pipeline.collide(state_in, contacts, dt=0.01)
+
+        self.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 1)
+        self.assertEqual(int(contacts.rigid_contact_is_predictive.numpy()[0]), 1)
+
+        body_wrench = np.zeros((state_in.body_f.shape[0], 6), dtype=np.float32)
+        body_wrench[body, 4] = 64.0
+        state_in.body_f.assign(body_wrench)
+        solver = SolverMuJoCo(
+            model,
+            use_mujoco_contacts=False,
+            integrator="implicitfast",
+            iterations=100,
+            ls_iterations=50,
+            nconmax=32,
+            njmax=128,
+        )
+        solver.step(state_in, state_out, control, contacts, substep_dt)
+
+        pose = state_out.body_q.numpy()[body]
+        quat = pose[3:7]
+        local_center = np.asarray((0.0, 0.0, center_offset))
+        twice_cross = 2.0 * np.cross(quat[:3], local_center)
+        world_center = pose[:3] + local_center + quat[3] * twice_cross + np.cross(quat[:3], twice_cross)
+        self.assertGreaterEqual(float(world_center[2]) - radius, -5.0e-6)
+
+    def test_strict_separated_shell_contacts_remain_frictionless(self):
+        """Keep pre-impact shell witnesses from applying friction or lift."""
+        substep_dt = 0.00125
+        half_extents = (0.08, 0.012, 0.01)
+        initial_clearance = 2.0e-4
+
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        builder.rigid_gap = 0.005
+        builder.default_shape_cfg.ke = 1.6e5
+        builder.default_shape_cfg.kd = 800.0
+        builder.default_shape_cfg.mu = 0.75
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, half_extents[2] + initial_clearance)), mass=0.019)
+        builder.add_shape_box(body, hx=half_extents[0], hy=half_extents[1], hz=half_extents[2])
+        builder.add_shape_plane(width=0.0, length=0.0)
+        model = builder.finalize(device="cpu")
+
+        pipeline = newton.CollisionPipeline(
+            model,
+            broad_phase="nxn",
+            speculative_config=newton.CollisionPipeline.SpeculativeContactConfig(
+                max_speculative_extension=0.02,
+                enforce_nonpenetration=True,
+            ),
+        )
+        contacts = pipeline.contacts()
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        joint_qd = state_in.joint_qd.numpy()
+        joint_qd[:] = 0.0
+        joint_qd[0] = 4.0
+        state_in.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        pipeline.collide(state_in, contacts, dt=0.01)
+
+        contact_count = int(contacts.rigid_contact_count.numpy()[0])
+        self.assertEqual(contact_count, 4)
+        np.testing.assert_array_equal(contacts.rigid_contact_is_predictive.numpy()[:contact_count], 1)
+
+        solver = SolverMuJoCo(
+            model,
+            use_mujoco_contacts=False,
+            integrator="implicitfast",
+            iterations=100,
+            ls_iterations=50,
+            nconmax=32,
+            njmax=128,
+        )
+        solver.step(state_in, state_out, control, contacts, substep_dt)
+
+        self.assertEqual(int(solver.mjw_data.nacon.numpy()[0]), 2 * contact_count)
+        contact_dims = solver.mjw_data.contact.dim.numpy()
+        contact_addresses = solver.mjw_data.contact.efc_address.numpy()
+        for base_cid in solver._contact_tid_to_cid.numpy()[:contact_count]:
+            np.testing.assert_array_equal(contact_dims[base_cid : base_cid + 2], (1, 3))
+            self.assertEqual(np.count_nonzero(contact_addresses[base_cid] >= 0), 1)
+            self.assertEqual(np.count_nonzero(contact_addresses[base_cid + 1] >= 0), 0)
+        self.assertAlmostEqual(float(state_out.joint_qd.numpy()[0]), 4.0, delta=1.0e-6)
+        self.assertAlmostEqual(float(state_out.joint_qd.numpy()[2]), 0.0, delta=1.0e-6)
+        self.assertAlmostEqual(
+            float(state_out.body_q.numpy()[body, 2]), half_extents[2] + initial_clearance, delta=1.0e-7
+        )
+
+    def test_strict_speculative_contact_supports_elliptic_authored_row(self):
+        """Keep the strict normal guard independent of the authored elliptic friction cone."""
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        builder.rigid_gap = 0.0
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.06)))
+        builder.add_shape_sphere(body, radius=0.05)
+        builder.add_shape_plane(width=0.0, length=0.0)
+        model = builder.finalize(device="cpu")
+        pipeline = newton.CollisionPipeline(
+            model,
+            broad_phase="nxn",
+            speculative_config=newton.CollisionPipeline.SpeculativeContactConfig(
+                max_speculative_extension=0.02,
+                enforce_nonpenetration=True,
+            ),
+        )
+        contacts = pipeline.contacts()
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        state_in.joint_qd.assign(np.array((0.0, 0.0, -2.0, 0.0, 0.0, 0.0), dtype=np.float32))
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        pipeline.collide(state_in, contacts, dt=0.01)
+
+        solver = SolverMuJoCo(model, use_mujoco_contacts=False, cone="elliptic", nconmax=32, njmax=128)
+        solver.step(state_in, state_out, control, contacts, 0.00125)
+
+        base_cid = int(solver._contact_tid_to_cid.numpy()[0])
+        self.assertEqual(int(solver.mjw_data.nacon.numpy()[0]), 2)
+        np.testing.assert_array_equal(solver.mjw_data.contact.dim.numpy()[base_cid : base_cid + 2], (1, 3))
+        addresses = solver.mjw_data.contact.efc_address.numpy()[base_cid : base_cid + 2]
+        self.assertEqual(np.count_nonzero(addresses[0] >= 0), 1)
+        self.assertEqual(np.count_nonzero(addresses[1] >= 0), 0)
+
+    def test_disabling_speculation_invalidates_cached_horizon_fields(self):
+        """Restore authored fields when speculation changes without a new contact generation."""
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        builder.rigid_gap = 0.0
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.06)))
+        builder.add_shape_sphere(body, radius=0.05)
+        builder.add_shape_plane(width=0.0, length=0.0)
+        model = builder.finalize(device="cpu")
+
+        pipeline = newton.CollisionPipeline(
+            model,
+            broad_phase="nxn",
+            speculative_config=newton.CollisionPipeline.SpeculativeContactConfig(max_speculative_extension=0.02),
+        )
+        contacts = pipeline.contacts()
+        state = model.state()
+        state.joint_qd.assign(np.array((0.0, 0.0, -2.0, 0.0, 0.0, 0.0), dtype=np.float32))
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        pipeline.collide(state, contacts, dt=0.01)
+        self.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 1)
+        self.assertEqual(int(contacts.rigid_contact_is_predictive.numpy()[0]), 1)
+
+        solver = SolverMuJoCo(model, use_mujoco_contacts=False, nconmax=32, njmax=128)
+        solver._convert_contacts_to_mjwarp(model, state, contacts, 0.005)
+        self.assertEqual(int(solver.mjw_data.contact.dim.numpy()[0]), 1)
+        self.assertGreater(float(solver.mjw_data.contact.includemargin.numpy()[0]), 0.0)
+
+        contacts._velocity_speculation_active = False
+        solver._convert_contacts_to_mjwarp(model, state, contacts, 0.005)
+        self.assertEqual(int(solver.mjw_data.contact.dim.numpy()[0]), 3)
+        self.assertEqual(float(solver.mjw_data.contact.includemargin.numpy()[0]), 0.0)
+        self.assertEqual(int(solver._contact_horizon_state.numpy()[0]), 0)
+
+    def test_speculation_preserves_shallow_authored_contact_response(self):
+        """Do not reinterpret a collision-time physical contact as a speculative barrier."""
+        dt = 0.00375
+        initial_height = 0.049
+
+        def step(speculative: bool) -> tuple[float, float]:
+            builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+            builder.rigid_gap = 0.0
+            builder.default_shape_cfg.ke = 100.0
+            builder.default_shape_cfg.kd = 10.0
+            body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, initial_height)))
+            builder.add_shape_sphere(body, radius=0.05)
+            builder.body_qd[body] = (0.0, 0.0, -1.0, 0.0, 0.0, 0.0)
+            builder.add_shape_plane(width=0.0, length=0.0)
+            model = builder.finalize(device="cpu")
+
+            config = None
+            if speculative:
+                config = newton.CollisionPipeline.SpeculativeContactConfig(max_speculative_extension=0.1)
+            pipeline = newton.CollisionPipeline(model, broad_phase="nxn", speculative_config=config)
+            contacts = pipeline.contacts()
+            state_in, state_out, control = model.state(), model.state(), model.control()
+            joint_qd = state_in.joint_qd.numpy()
+            joint_qd[:] = 0.0
+            joint_qd[2] = -1.0
+            state_in.joint_qd.assign(joint_qd)
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+            pipeline.collide(state_in, contacts, dt=0.03 if speculative else None)
+            SolverMuJoCo(model, use_mujoco_contacts=False, nconmax=32, njmax=128).step(
+                state_in, state_out, control, contacts, dt
+            )
+            return float(state_out.body_q.numpy()[body, 2]), float(state_out.joint_qd.numpy()[2])
+
+        np.testing.assert_allclose(step(True), step(False), rtol=1.0e-6, atol=1.0e-7)
+
+    def test_speculation_preserves_soft_physical_contact_under_coupled_impulse(self):
+        """Leave physical non-guard contact rows unchanged under coupled impulses."""
+        dt = 0.00375
+        half_length = 0.08
+        half_height = 0.01
+        initial_penetration = 5.0e-4
+
+        def step(speculative: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+            builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+            builder.rigid_gap = 0.0
+            builder.default_shape_cfg.ke = 100.0
+            builder.default_shape_cfg.kd = 10.0
+            builder.default_shape_cfg.kf = 0.0
+            body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, half_height - initial_penetration)))
+            box = builder.add_shape_box(body, hx=half_length, hy=0.015, hz=half_height)
+            plane = builder.add_shape_plane(width=0.0, length=0.0)
+            model = builder.finalize(device="cpu")
+
+            state_in, state_out, control = model.state(), model.state(), model.control()
+            joint_qd = state_in.joint_qd.numpy()
+            joint_qd[:] = 0.0
+            joint_qd[2] = -0.02
+            state_in.joint_qd.assign(joint_qd)
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+
+            contact_max = 8
+            contacts = newton.Contacts(
+                contact_max,
+                0,
+                device="cpu",
+                per_contact_shape_properties=True,
+            )
+            contacts._velocity_speculation_active = speculative
+            contacts._strict_nonpenetration_active = speculative
+            contacts.rigid_contact_count.assign(np.array([2], dtype=np.int32))
+            shape_ids = np.full(contact_max, -1, dtype=np.int32)
+            shape_ids[:2] = plane
+            contacts.rigid_contact_shape0.assign(shape_ids)
+            shape_ids[:2] = box
+            contacts.rigid_contact_shape1.assign(shape_ids)
+            points = np.zeros((contact_max, 3), dtype=np.float32)
+            points[:2] = ((-half_length, 0.0, 0.0), (half_length, 0.0, 0.0))
+            contacts.rigid_contact_point0.assign(points)
+            points[:2] = (
+                (-half_length, 0.0, -half_height),
+                (half_length, 0.0, -half_height),
+            )
+            contacts.rigid_contact_point1.assign(points)
+            normals = np.zeros((contact_max, 3), dtype=np.float32)
+            normals[:2, 2] = 1.0
+            contacts.rigid_contact_normal.assign(normals)
+
+            stiffness = np.zeros(contact_max, dtype=np.float32)
+            damping = np.zeros(contact_max, dtype=np.float32)
+            stiffness[:2] = (100.0, 1.0e8)
+            damping[:2] = (10.0, 1.0e5)
+            contacts.rigid_contact_stiffness.assign(stiffness)
+            contacts.rigid_contact_damping.assign(damping)
+
+            solver = SolverMuJoCo(
+                model,
+                use_mujoco_contacts=False,
+                iterations=100,
+                ls_iterations=50,
+                nconmax=contact_max,
+                njmax=64,
+            )
+            solver.step(state_in, state_out, control, contacts, dt)
+            if speculative:
+                np.testing.assert_array_equal(contacts.rigid_contact_is_strict_guard.numpy()[:2], 0)
+                np.testing.assert_array_equal(solver._contact_horizon_state.numpy()[:2], 0)
+            pose = state_out.body_q.numpy()[body]
+
+            def corner_height(x: float) -> float:
+                point = np.array((x, 0.0, -half_height))
+                twice_cross = 2.0 * np.cross(pose[3:6], point)
+                rotated = point + pose[6] * twice_cross + np.cross(pose[3:6], twice_cross)
+                return float(rotated[2] + pose[2])
+
+            contact_dims = solver.mjw_data.contact.dim.numpy()[:2]
+            self.assertTrue(np.all(contact_dims == 3), "The regression must exercise pyramidal contact facets")
+            efc_ids = solver.mjw_data.contact.efc_address.numpy()[:2, 0]
+            efc_aref = solver.mjw_data.efc.aref.numpy()[0]
+            facet_aref = np.stack((efc_aref[efc_ids[0] : efc_ids[0] + 4], efc_aref[efc_ids[1] : efc_ids[1] + 4]))
+            return (
+                np.asarray((corner_height(-half_length), corner_height(half_length))),
+                state_out.joint_qd.numpy(),
+                facet_aref,
+                contact_dims,
+            )
+
+        authored_clearance, authored_qd, authored_aref, authored_dims = step(False)
+        speculative_clearance, speculative_qd, speculative_aref, speculative_dims = step(True)
+
+        np.testing.assert_allclose(speculative_clearance, authored_clearance, rtol=1.0e-6, atol=1.0e-7)
+        np.testing.assert_allclose(speculative_qd, authored_qd, rtol=1.0e-6, atol=2.0e-7)
+        np.testing.assert_allclose(speculative_aref, authored_aref, rtol=1.0e-6, atol=1.0e-7)
+        np.testing.assert_array_equal(speculative_dims, authored_dims)
+
+    def test_deep_horizon_crossing_restores_authored_contact_response(self):
+        """Restore authored response when a retained horizon row crosses deeply."""
+        dt = 0.00375
+        penetrated_height = 0.04
+        sphere_radius = 0.05
+
+        def recover(normal_velocity: float, refresh_contacts: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+            builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+            builder.rigid_gap = 0.0
+            builder.default_shape_cfg.ke = 100.0
+            builder.default_shape_cfg.kd = 10.0
+            body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.10)))
+            builder.add_shape_sphere(body, radius=sphere_radius)
+            builder.body_qd[body] = (0.0, 0.0, -20.0, 0.0, 0.0, 0.0)
+            builder.add_shape_plane(width=0.0, length=0.0)
+            model = builder.finalize()
+
+            config = newton.CollisionPipeline.SpeculativeContactConfig(max_speculative_extension=0.1)
+            pipeline = newton.CollisionPipeline(model, broad_phase="nxn", speculative_config=config)
+            contacts = pipeline.contacts()
+            state_in, state_out, control = model.state(), model.state(), model.control()
+            joint_qd = state_in.joint_qd.numpy()
+            joint_qd[:] = 0.0
+            joint_qd[2] = -20.0
+            state_in.joint_qd.assign(joint_qd)
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+            pipeline.collide(state_in, contacts, dt=0.03)
+
+            solver = SolverMuJoCo(model, use_mujoco_contacts=False, nconmax=32, njmax=128)
+            solver.step(state_in, state_out, control, contacts, dt)
+            state_in, state_out = state_out, state_in
+
+            joint_q = state_in.joint_q.numpy()
+            joint_q[2] = penetrated_height
+            state_in.joint_q.assign(joint_q)
+            joint_qd[:] = 0.0
+            joint_qd[2] = normal_velocity
+            state_in.joint_qd.assign(joint_qd)
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+            if refresh_contacts:
+                pipeline.collide(state_in, contacts, dt=0.03)
+                contacts._velocity_speculation_active = False
+            solver.step(state_in, state_out, control, contacts, dt)
+            motion = np.asarray((state_out.body_q.numpy()[body, 2], state_out.joint_qd.numpy()[2]))
+            solref = solver.mjw_data.contact.solref.numpy()[0].copy()
+            solimp = solver.mjw_data.contact.solimp.numpy()[0].copy()
+            condim = int(solver.mjw_data.contact.dim.numpy()[0])
+            return motion, solref, solimp, condim
+
+        for normal_velocity in (-1.0, 0.0, 1.0, 4.0):
+            with self.subTest(normal_velocity=normal_velocity):
+                stale_horizon = recover(normal_velocity, refresh_contacts=False)
+                refreshed_authored = recover(normal_velocity, refresh_contacts=True)
+                np.testing.assert_allclose(stale_horizon[0], refreshed_authored[0], rtol=1.0e-5, atol=1.0e-6)
+                np.testing.assert_allclose(stale_horizon[1], refreshed_authored[1], rtol=1.0e-6, atol=1.0e-7)
+                np.testing.assert_allclose(stale_horizon[2], refreshed_authored[2], rtol=1.0e-6, atol=1.0e-7)
+                self.assertEqual(stale_horizon[3], refreshed_authored[3])
 
     def test_sphere_rolls_without_slip_with_newton_contacts(self):
         radius = 0.1
@@ -4719,6 +8230,9 @@ class TestMuJoCoSolverNewtonContacts(unittest.TestCase):
             "rigid_contact_point0",
             "rigid_contact_point1",
             "rigid_contact_normal",
+            "rigid_contact_normal_owner",
+            "rigid_contact_is_predictive",
+            "rigid_contact_is_strict_guard",
             "rigid_contact_offset0",
             "rigid_contact_offset1",
             "rigid_contact_margin0",
@@ -4726,6 +8240,8 @@ class TestMuJoCoSolverNewtonContacts(unittest.TestCase):
             "rigid_contact_stiffness",
             "rigid_contact_damping",
             "rigid_contact_friction",
+            "_velocity_speculation_active",
+            "_strict_nonpenetration_active",
         ):
             setattr(contacts_alias, attr, getattr(contacts_a, attr))
 
@@ -4733,6 +8249,8 @@ class TestMuJoCoSolverNewtonContacts(unittest.TestCase):
         # contact_generation array — the precise dexsuite scenario.
         self.assertNotEqual(id(contacts_a), id(contacts_alias))
         self.assertEqual(id(contacts_a.contact_generation), id(contacts_alias.contact_generation))
+        self.assertIs(contacts_a.rigid_contact_is_predictive, contacts_alias.rigid_contact_is_predictive)
+        self.assertIs(contacts_a.rigid_contact_is_strict_guard, contacts_alias.rigid_contact_is_strict_guard)
 
         # Step with the new wrapper.  The cache must NOT be invalidated, since
         # the underlying contact data is identical.
@@ -11067,6 +14585,10 @@ class TestUpdateContactsPointPositions(unittest.TestCase):
             soft_contact_max=0,
             device=model.device,
         )
+        contacts._velocity_speculation_active = True
+        contacts.rigid_contact_normal_owner.fill_(1)
+        contacts.rigid_contact_is_predictive.fill_(1)
+        contacts.rigid_contact_is_strict_guard.fill_(1)
         newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
 
         dt = 1.0 / 200.0
@@ -11075,11 +14597,24 @@ class TestUpdateContactsPointPositions(unittest.TestCase):
             state_0.clear_forces()
             solver.step(state_0, state_1, control, contacts, dt)
             solver.update_contacts(contacts, state_0)
+            self.assertFalse(contacts._velocity_speculation_active)
             state_0, state_1 = state_1, state_0
 
             n = contacts.rigid_contact_count.numpy()[0]
             if n > 0:
                 found_contacts = True
+                np.testing.assert_array_equal(
+                    contacts.rigid_contact_normal_owner.numpy()[:n],
+                    np.full(n, -1, dtype=np.int32),
+                )
+                np.testing.assert_array_equal(
+                    contacts.rigid_contact_is_predictive.numpy()[:n],
+                    np.zeros(n, dtype=np.uint8),
+                )
+                np.testing.assert_array_equal(
+                    contacts.rigid_contact_is_strict_guard.numpy()[:n],
+                    np.zeros(n, dtype=np.uint8),
+                )
                 point0 = contacts.rigid_contact_point0.numpy()[:n]
                 point1 = contacts.rigid_contact_point1.numpy()[:n]
 

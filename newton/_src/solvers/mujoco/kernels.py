@@ -10,6 +10,7 @@ from typing import Any
 import warp as wp
 
 from ...core.types import vec5
+from ...geometry.contact_data import CONTACT_STRICT_GUARD_ONLY, CONTACT_STRICT_GUARD_PAIRED
 from ...sim import BodyFlags, JointTargetMode, JointType
 from ...sim.contacts import contact_surface_point, contact_surface_separation
 from .constants import (
@@ -18,6 +19,7 @@ from .constants import (
     DEFAULT_LIMIT_KE,
     DEFAULT_LIMIT_SOLREF_DAMPRATIO,
     DEFAULT_LIMIT_SOLREF_TIMECONST,
+    MJ_MAXIMP,
     MJ_MINMU,
     MJ_MINVAL,
     SOLREF_MODE_FORCE_SPACE,
@@ -36,6 +38,16 @@ def _import_contact_force_fn():
 # Custom vector types
 vec10 = wp.types.vector(length=10, dtype=wp.float32)
 vec11 = wp.types.vector(length=11, dtype=wp.float32)
+
+_VELOCITY_BARRIER_EPSILON = wp.constant(1.0e-6)
+_HORIZON_STATE_INACTIVE = wp.constant(0)
+_HORIZON_STATE_BARRIER = wp.constant(1)
+_HORIZON_STATE_AUTHORED_HANDOFF = wp.constant(2)
+_HORIZON_STATE_STRICT = wp.constant(3)
+_MUJOCO_OVERFLOW_NEFC = wp.constant(1 << 0)
+_MUJOCO_OVERFLOW_NJMAX_NNZ = wp.constant(1 << 1)
+_MUJOCO_OVERFLOW_NARROWPHASE = wp.constant(1 << 3)
+_MUJOCO_CONTACT_CONSTRAINT = wp.constant(1 << 0)
 
 
 @wp.struct
@@ -107,6 +119,64 @@ def make_frame(a: wp.vec3):
 
 
 @wp.func
+def update_owned_contact_normal(
+    normal_at_generation: wp.vec3,
+    normal_owner: int,
+    body_a: int,
+    body_b: int,
+    X_wb_a: wp.transform,
+    X_wb_b: wp.transform,
+    owner_rotation_at_generation: wp.array[wp.quat],
+) -> wp.vec3:
+    """Rotate an owned collision normal into its owner's current world frame."""
+    owner_body = -1
+    owner_rotation = wp.quat_identity()
+    if normal_owner == 0:
+        owner_body = body_a
+        owner_rotation = wp.transform_get_rotation(X_wb_a)
+    elif normal_owner == 1:
+        owner_body = body_b
+        owner_rotation = wp.transform_get_rotation(X_wb_b)
+    if owner_body < 0:
+        return normal_at_generation
+    delta_rotation = owner_rotation * wp.quat_inverse(owner_rotation_at_generation[owner_body])
+    return wp.normalize(wp.quat_rotate(delta_rotation, normal_at_generation))
+
+
+@wp.func
+def horizon_contact_parameters(
+    dist: float,
+    margin: float,
+    timestep: float,
+    enabled: bool,
+    barrier_active: bool,
+):
+    """Return the sentinel inclusion margin, damping, and separated-barrier state."""
+    if not enabled or not barrier_active:
+        return margin, 0.0, False
+
+    # Keep collision-time horizon candidates in the constraint graph. The sentinel inclusion margin is replaced
+    # with the physical positive-gap inequality after MJWarp builds the EFC row, so non-crossing rows stay
+    # force-free while coupled impulses can still activate them within the solve.
+    return wp.max(dist, margin) + _VELOCITY_BARRIER_EPSILON, 1.0 / timestep, True
+
+
+@wp.func
+def horizon_contact_position(
+    point_a: wp.vec3,
+    point_b: wp.vec3,
+    a_immovable: bool,
+    b_immovable: bool,
+) -> wp.vec3:
+    """Choose a solver point consistent with the persisted contact anchors."""
+    if a_immovable:
+        return point_b
+    if b_immovable:
+        return point_a
+    return 0.5 * (point_a + point_b)
+
+
+@wp.func
 def write_contact(
     # Data in:
     # In:
@@ -135,6 +205,8 @@ def write_contact(
     contact_geom_out: wp.array[wp.vec2i],
     contact_efc_address_out: wp.array2d[int],
     contact_worldid_out: wp.array[int],
+    contact_type_out: wp.array[int],
+    contact_adhesion_out: wp.array[float],
 ):
     # See function write_contact in mujoco_warp, file collision_primitive.py
 
@@ -144,6 +216,8 @@ def write_contact(
     contact_frame_out[cid] = frame_in
     contact_geom_out[cid] = geoms_in
     contact_worldid_out[cid] = worldid_in
+    contact_type_out[cid] = contact_type_out[cid] | _MUJOCO_CONTACT_CONSTRAINT
+    contact_adhesion_out[cid] = 0.0
     contact_includemargin_out[cid] = margin_in
     contact_dim_out[cid] = condim_in
     contact_friction_out[cid] = friction_in
@@ -154,6 +228,18 @@ def write_contact(
     # initialize constraint address to -1 (max 10 elements; populated during constraint generation)
     for i in range(contact_efc_address_out.shape[1]):
         contact_efc_address_out[cid, i] = -1
+
+
+@wp.func
+def reserve_contact_entries(nacon: wp.array[int], entry_count: int, capacity: int) -> int:
+    """Atomically reserve a contiguous range without exceeding contact capacity."""
+    first = nacon[0]
+    while first + entry_count <= capacity:
+        observed = wp.atomic_cas(nacon, 0, first, first + entry_count)
+        if observed == first:
+            return first
+        first = observed
+    return -1
 
 
 @wp.func
@@ -238,6 +324,115 @@ def convert_solref(ke: float, kd: float, d_width: float, d_r: float) -> wp.vec2:
     # see https://mujoco.readthedocs.io/en/latest/modeling.html#solver-parameters
 
     return wp.vec2(timeconst, dampratio)
+
+
+@wp.func
+def resolve_newton_contact_params(
+    shape_a: int,
+    shape_b: int,
+    body_a: int,
+    body_b: int,
+    mj_body_a: int,
+    mj_body_b: int,
+    geoms: wp.vec2i,
+    worldid: int,
+    contact_id: int,
+    geom_condim: wp.array[int],
+    geom_priority: wp.array[int],
+    geom_solmix: wp.array2d[float],
+    geom_solref: wp.array2d[wp.vec2],
+    geom_solimp: wp.array2d[vec5],
+    geom_friction: wp.array2d[wp.vec3],
+    geom_margin: wp.array2d[float],
+    geom_gap: wp.array2d[float],
+    body_invweight0: wp.array2d[wp.vec2],
+    shape_material_ke: wp.array[float],
+    shape_material_kd: wp.array[float],
+    shape_mjc_solref_mode: wp.array[wp.int32],
+    rigid_contact_stiffness: wp.array[wp.float32],
+    rigid_contact_damping: wp.array[wp.float32],
+    rigid_contact_friction: wp.array[wp.float32],
+    shape_material_kf: wp.array[float],
+    opt_impratio_invsqrt: wp.array[float],
+    use_kf_mapping: bool,
+):
+    """Resolve authored and Newton-specific material parameters for one contact."""
+    margin, _gap, condim, friction, solref, solreffriction, solimp, mix = contact_params(
+        geom_condim,
+        geom_priority,
+        geom_solmix,
+        geom_solref,
+        geom_solimp,
+        geom_friction,
+        geom_margin,
+        geom_gap,
+        geoms,
+        worldid,
+    )
+
+    if shape_mjc_solref_mode:
+        mode_a = shape_mjc_solref_mode[shape_a]
+        mode_b = shape_mjc_solref_mode[shape_b]
+        if mode_a == SOLREF_MODE_FORCE_SPACE and mode_b == SOLREF_MODE_FORCE_SPACE:
+            ke = mix * shape_material_ke[shape_a] + (1.0 - mix) * shape_material_ke[shape_b]
+            kd = mix * shape_material_kd[shape_a] + (1.0 - mix) * shape_material_kd[shape_b]
+            invw_a = float(0.0)
+            invw_b = float(0.0)
+            if body_a >= 0:
+                invw_a = body_invweight0[worldid, mj_body_a][0]
+            if body_b >= 0:
+                invw_b = body_invweight0[worldid, mj_body_b][0]
+            m_inv = invw_a + invw_b
+            dmax = solimp[1]
+            if m_inv > 0.0 and dmax < 1.0:
+                factor = m_inv * (1.0 - dmax)
+                solref = convert_solref(
+                    wp.max(ke * factor, MJ_MINVAL),
+                    wp.max(kd * factor, MJ_MINVAL),
+                    1.0,
+                    1.0,
+                )
+
+    if rigid_contact_stiffness:
+        contact_ke = rigid_contact_stiffness[contact_id]
+        if contact_ke > 0.0:
+            imp = solimp[1]
+            solimp = vec5(imp, imp, 0.001, 1.0, 0.5)
+            contact_ke = contact_ke * (1.0 - imp)
+            kd = rigid_contact_damping[contact_id]
+            if kd > 0.0:
+                timeconst = 2.0 / kd
+                dampratio = wp.sqrt(1.0 / (timeconst * timeconst * contact_ke))
+            else:
+                timeconst = wp.sqrt(1.0 / contact_ke)
+                dampratio = 1.0
+            solref = wp.vec2(timeconst, dampratio)
+
+        friction_scale = rigid_contact_friction[contact_id]
+        if friction_scale > 0.0:
+            friction = vec5(
+                friction[0] * friction_scale,
+                friction[1] * friction_scale,
+                friction[2],
+                friction[3],
+                friction[4],
+            )
+
+    if shape_material_kf and use_kf_mapping:
+        kf = mix * shape_material_kf[shape_a] + (1.0 - mix) * shape_material_kf[shape_b]
+        if kf > 0.0:
+            invw = body_invweight0[worldid, mj_body_a][0] + body_invweight0[worldid, mj_body_b][0]
+            ir = opt_impratio_invsqrt[worldid % opt_impratio_invsqrt.shape[0]]
+            imp = solimp[1]
+            denom = kf * invw * ((1.0 - imp) * ir * ir + imp)
+            if denom > 0.0 and wp.isfinite(denom):
+                timeconst = 2.0 / denom
+                if wp.isfinite(timeconst):
+                    solreffriction = wp.vec2(timeconst, 1.0)
+        elif kf == 0.0:
+            condim = 1
+
+    return margin, condim, friction, solref, solreffriction, solimp
 
 
 @wp.func
@@ -417,11 +612,325 @@ def eval_mujoco_coupling_effective_mass_block_kernel(
 
 
 # Kernel functions
+@wp.kernel(enable_backward=False)
+def count_mjwarp_contact_entries_kernel(
+    rigid_contact_count: wp.array[wp.int32],
+    rigid_contact_is_strict_guard: wp.array[wp.uint8],
+    worker_count: int,
+    required_contact_entries: wp.array[wp.int32],
+):
+    """Count exact MJWarp contact entries required by strict Newton contacts."""
+    count = wp.min(rigid_contact_count[0], rigid_contact_is_strict_guard.shape[0])
+    contact_id = wp.tid()
+    entry_count = int(0)
+    while contact_id < count:
+        entry_count += 1
+        if int(rigid_contact_is_strict_guard[contact_id]) == CONTACT_STRICT_GUARD_PAIRED:
+            entry_count += 1
+        contact_id += worker_count
+    if entry_count > 0:
+        wp.atomic_add(required_contact_entries, 0, entry_count)
+
+
+@wp.kernel(enable_backward=False)
+def latch_strict_endpoint_status_kernel(
+    oracle_world_status: wp.array[wp.int32],
+    reject_status_mask: int,
+    persistent_status_mask: int,
+    persistent_overflow: wp.array[wp.int32],
+    unsafe_world: wp.array[wp.int32],
+    overflow: wp.array[wp.int32],
+):
+    """Reject unsafe substeps and persist only unrecoverable failures per world."""
+    world_id = wp.tid()
+    status = oracle_world_status[world_id]
+    persistent_failure = (status & persistent_status_mask) != 0 or overflow[world_id] != 0
+    if (status & reject_status_mask) != 0 or persistent_failure:
+        unsafe_world[world_id] = 1
+    if persistent_failure:
+        wp.atomic_or(persistent_overflow, world_id, _MUJOCO_OVERFLOW_NARROWPHASE)
+        wp.atomic_or(overflow, world_id, _MUJOCO_OVERFLOW_NARROWPHASE)
+
+
+@wp.kernel(enable_backward=False)
+def capture_strict_endpoint_candidate_kernel(
+    oracle_world_status: wp.array[wp.int32],
+    reject_status_mask: int,
+    persistent_status_mask: int,
+    certified_path_fraction: wp.array[wp.float32],
+    allow_certified_prefix: bool,
+    qvel: wp.array2d[wp.float32],
+    timestep: wp.array[wp.float32],
+    unsafe_world: wp.array[wp.int32],
+    overflow: wp.array[wp.int32],
+    integrator_qacc: wp.array2d[wp.float32],
+    certified_qacc: wp.array2d[wp.float32],
+    certified_world: wp.array[wp.int32],
+):
+    """Retain the latest acceleration whose complete or prefix path is certified."""
+    world_id = wp.tid()
+    status = oracle_world_status[world_id]
+    if unsafe_world[world_id] != 0 or overflow[world_id] != 0 or (status & persistent_status_mask) != 0:
+        return
+    fraction = float(1.0)
+    if (status & reject_status_mask) != 0:
+        fraction = certified_path_fraction[world_id]
+        if not allow_certified_prefix or not wp.isfinite(fraction) or fraction <= 0.0 or fraction >= 1.0:
+            return
+        dt = timestep[world_id % timestep.shape[0]]
+        if not wp.isfinite(dt) or dt <= 0.0:
+            return
+        for dof_id in range(integrator_qacc.shape[1]):
+            endpoint_qvel = qvel[world_id, dof_id] + dt * integrator_qacc[world_id, dof_id]
+            certified_qacc[world_id, dof_id] = (fraction * endpoint_qvel - qvel[world_id, dof_id]) / dt
+        certified_world[world_id] = 1
+        return
+    for dof_id in range(integrator_qacc.shape[1]):
+        certified_qacc[world_id, dof_id] = integrator_qacc[world_id, dof_id]
+    certified_world[world_id] = 1
+
+
+@wp.kernel(enable_backward=False)
+def restore_strict_endpoint_candidate_kernel(
+    unsafe_world: wp.array[wp.int32],
+    overflow: wp.array[wp.int32],
+    certified_qacc: wp.array2d[wp.float32],
+    certified_world: wp.array[wp.int32],
+    integrator_qacc: wp.array2d[wp.float32],
+    solver_qacc: wp.array2d[wp.float32],
+    qacc_warmstart: wp.array2d[wp.float32],
+):
+    """Restore a certified candidate when a later transient candidate is rejected."""
+    world_id = wp.tid()
+    recover = unsafe_world[world_id] != 0 and certified_world[world_id] != 0 and overflow[world_id] == 0
+    if recover:
+        for dof_id in range(integrator_qacc.shape[1]):
+            qacc = certified_qacc[world_id, dof_id]
+            integrator_qacc[world_id, dof_id] = qacc
+            solver_qacc[world_id, dof_id] = qacc
+            qacc_warmstart[world_id, dof_id] = qacc
+        unsafe_world[world_id] = 0
+    certified_world[world_id] = 0
+
+
+@wp.kernel(enable_backward=False)
+def accumulate_constraint_nnz_kernel(
+    nefc: wp.array[wp.int32],
+    J_rownnz: wp.array2d[wp.int32],
+    constraint_nnz: wp.array[wp.int32],
+):
+    """Sum sparse row widths without assuming EFC-row and NNZ reservation order match."""
+    world_id, row_id = wp.tid()
+    if row_id < wp.min(nefc[world_id], J_rownnz.shape[1]):
+        wp.atomic_add(constraint_nnz, world_id, J_rownnz[world_id, row_id])
+
+
+@wp.kernel(enable_backward=False)
+def count_contact_constraint_requirements_kernel(
+    contact_count: wp.array[wp.int32],
+    contact_id_map: wp.array[wp.int32],
+    mapped_contacts: bool,
+    is_elliptic: bool,
+    adhesion_enabled: bool,
+    contact_dist: wp.array[wp.float32],
+    contact_includemargin: wp.array[wp.float32],
+    contact_adhesion: wp.array[wp.float32],
+    contact_dim: wp.array[wp.int32],
+    contact_geom: wp.array[wp.vec2i],
+    contact_worldid: wp.array[wp.int32],
+    contact_type: wp.array[wp.int32],
+    geom_bodyid: wp.array[wp.int32],
+    body_weldid: wp.array[wp.int32],
+    body_dofadr: wp.array[wp.int32],
+    body_dofnum: wp.array[wp.int32],
+    dof_parentid: wp.array[wp.int32],
+    required_rows: wp.array[wp.int32],
+    required_nnz: wp.array[wp.int32],
+):
+    """Count exact EFC rows and sparse Jacobian entries for active contacts."""
+    contact_tid = wp.tid()
+    if contact_tid >= contact_count[0]:
+        return
+    contact_id = contact_tid
+    if mapped_contacts:
+        contact_id = contact_id_map[contact_tid]
+    if contact_id < 0 or (contact_type[contact_id] & _MUJOCO_CONTACT_CONSTRAINT) == 0:
+        return
+    active = contact_dist[contact_id] < contact_includemargin[contact_id]
+    if adhesion_enabled:
+        active = active or contact_adhesion[contact_id] != 0.0
+    if not active:
+        return
+    dim = contact_dim[contact_id]
+    row_count = dim
+    if not is_elliptic:
+        row_count = 1
+        if dim != 1:
+            row_count = 2 * (dim - 1)
+    geoms = contact_geom[contact_id]
+    body_a = body_weldid[geom_bodyid[geoms[0]]]
+    body_b = body_weldid[geom_bodyid[geoms[1]]]
+    dof_a = int(body_dofadr[body_a] + body_dofnum[body_a] - 1)
+    dof_b = int(body_dofadr[body_b] + body_dofnum[body_b] - 1)
+    row_nnz = int(0)
+    while dof_a >= 0 or dof_b >= 0:
+        dof = wp.max(dof_a, dof_b)
+        if dof_a == dof and dof_b == dof:
+            break
+        if dof_a == dof:
+            dof_a = dof_parentid[dof_a]
+        if dof_b == dof:
+            dof_b = dof_parentid[dof_b]
+        row_nnz += 1
+    world_id = contact_worldid[contact_id]
+    wp.atomic_add(required_rows, world_id, row_count)
+    wp.atomic_add(required_nnz, world_id, row_count * row_nnz)
+
+
+@wp.kernel(enable_backward=False)
+def preflight_strict_base_constraint_capacity_kernel(
+    is_sparse: bool,
+    njmax: int,
+    njmax_nnz: int,
+    required_rows: wp.array[wp.int32],
+    required_nnz: wp.array[wp.int32],
+    persistent_overflow: wp.array[wp.int32],
+    unsafe_world: wp.array[wp.int32],
+    overflow: wp.array[wp.int32],
+):
+    """Reject an incomplete strict base-contact graph before its first construction."""
+    world_id = wp.tid()
+    failure = persistent_overflow[world_id] | overflow[world_id]
+    if failure == 0 and required_rows[world_id] > njmax:
+        failure = failure | _MUJOCO_OVERFLOW_NEFC
+    elif failure == 0 and is_sparse and required_nnz[world_id] > njmax_nnz:
+        failure = failure | _MUJOCO_OVERFLOW_NJMAX_NNZ
+    if failure != 0:
+        persistent_overflow[world_id] = failure
+        unsafe_world[world_id] = 1
+        wp.atomic_or(overflow, world_id, failure)
+
+
+@wp.kernel(enable_backward=False)
+def preflight_overlay_constraint_capacity_kernel(
+    is_sparse: bool,
+    njmax: int,
+    njmax_nnz: int,
+    base_nefc: wp.array[wp.int32],
+    base_nnz: wp.array[wp.int32],
+    overlay_rows: wp.array[wp.int32],
+    overlay_nnz: wp.array[wp.int32],
+    persistent_overflow: wp.array[wp.int32],
+    unsafe_world: wp.array[wp.int32],
+    overflow: wp.array[wp.int32],
+):
+    """Reject overlay worlds before rebuilding a graph that cannot fit fixed EFC buffers."""
+    world_id = wp.tid()
+    failure = persistent_overflow[world_id] | overflow[world_id]
+    if failure != 0:
+        persistent_overflow[world_id] = failure
+        unsafe_world[world_id] = 1
+        wp.atomic_or(overflow, world_id, failure)
+        return
+    row_count = base_nefc[world_id]
+    if row_count + overlay_rows[world_id] > njmax:
+        unsafe_world[world_id] = 1
+        wp.atomic_or(persistent_overflow, world_id, _MUJOCO_OVERFLOW_NEFC)
+        wp.atomic_or(overflow, world_id, _MUJOCO_OVERFLOW_NEFC)
+        return
+    if is_sparse:
+        if base_nnz[world_id] + overlay_nnz[world_id] > njmax_nnz:
+            unsafe_world[world_id] = 1
+            wp.atomic_or(persistent_overflow, world_id, _MUJOCO_OVERFLOW_NJMAX_NNZ)
+            wp.atomic_or(overflow, world_id, _MUJOCO_OVERFLOW_NJMAX_NNZ)
+
+
+@wp.kernel(enable_backward=False)
+def reassert_strict_overflow_kernel(
+    persistent_overflow: wp.array[wp.int32],
+    unsafe_world: wp.array[wp.int32],
+    overflow: wp.array[wp.int32],
+):
+    """Restore solver-owned strict failure bits after third-party graph rebuilds."""
+    world_id = wp.tid()
+    failure = persistent_overflow[world_id]
+    if failure != 0:
+        unsafe_world[world_id] = 1
+        wp.atomic_or(overflow, world_id, failure)
+
+
+@wp.kernel(enable_backward=False)
+def deactivate_unsafe_strict_contacts_kernel(
+    contact_count: wp.array[wp.int32],
+    contact_id_map: wp.array[wp.int32],
+    mapped_contacts: bool,
+    unsafe_world: wp.array[wp.int32],
+    contact_dist: wp.array[wp.float32],
+    contact_includemargin: wp.array[wp.float32],
+    contact_adhesion: wp.array[wp.float32],
+    contact_worldid: wp.array[wp.int32],
+    contact_type: wp.array[wp.int32],
+    contact_efc_address: wp.array2d[wp.int32],
+):
+    """Make contacts in fail-closed worlds inactive before rebuilding constraints."""
+    contact_tid = wp.tid()
+    if contact_tid >= contact_count[0]:
+        return
+    contact_id = contact_tid
+    if mapped_contacts:
+        contact_id = contact_id_map[contact_tid]
+    if contact_id < 0 or unsafe_world[contact_worldid[contact_id]] == 0:
+        return
+    contact_includemargin[contact_id] = contact_dist[contact_id]
+    contact_adhesion[contact_id] = 0.0
+    contact_type[contact_id] = contact_type[contact_id] & ~_MUJOCO_CONTACT_CONSTRAINT
+    for dim in range(contact_efc_address.shape[1]):
+        contact_efc_address[contact_id, dim] = -1
+
+
+@wp.kernel(enable_backward=False)
+def mask_strict_endpoint_qacc_kernel(
+    qvel: wp.array2d[wp.float32],
+    timestep: wp.array[wp.float32],
+    unsafe_world: wp.array[wp.int32],
+    overflow: wp.array[wp.int32],
+    integrator_qacc: wp.array2d[wp.float32],
+    solver_qacc: wp.array2d[wp.float32],
+):
+    """Replace unsafe acceleration so the semi-implicit commit holds position and stops velocity."""
+    world_id, dof_id = wp.tid()
+    overflowed = overflow[world_id] != 0
+    if unsafe_world[world_id] == 0 and not overflowed:
+        return
+    unsafe_world[world_id] = 1
+    if dof_id == 0 and overflowed:
+        wp.atomic_or(overflow, world_id, _MUJOCO_OVERFLOW_NARROWPHASE)
+    dt = timestep[world_id % timestep.shape[0]]
+    hold_qacc = -qvel[world_id, dof_id] / dt
+    integrator_qacc[world_id, dof_id] = hold_qacc
+    solver_qacc[world_id, dof_id] = hold_qacc
+
+
+@wp.kernel(enable_backward=False)
+def clear_rejected_strict_warmstart_kernel(
+    unsafe_world: wp.array[wp.int32],
+    overflow: wp.array[wp.int32],
+    qacc_warmstart: wp.array2d[wp.float32],
+):
+    """Discard recoverably rejected accelerations before the next solver substep."""
+    world_id, dof_id = wp.tid()
+    if unsafe_world[world_id] != 0 and overflow[world_id] == 0:
+        qacc_warmstart[world_id, dof_id] = 0.0
+
+
 @wp.kernel
 def convert_newton_contacts_to_mjwarp_kernel(
     body_q: wp.array[wp.transform],
     shape_body: wp.array[int],
     body_flags: wp.array[int],
+    velocity_speculation_active: bool,
+    strict_nonpenetration_active: bool,
+    timestep: float,
     # Model:
     geom_bodyid: wp.array[int],
     body_weldid: wp.array[int],
@@ -445,6 +954,9 @@ def convert_newton_contacts_to_mjwarp_kernel(
     rigid_contact_point0: wp.array[wp.vec3],
     rigid_contact_point1: wp.array[wp.vec3],
     rigid_contact_normal: wp.array[wp.vec3],
+    rigid_contact_normal_owner: wp.array[wp.int32],
+    rigid_contact_is_predictive: wp.array[wp.uint8],
+    rigid_contact_is_strict_guard: wp.array[wp.uint8],
     rigid_contact_offset0: wp.array[wp.vec3],
     rigid_contact_offset1: wp.array[wp.vec3],
     rigid_contact_margin0: wp.array[wp.float32],
@@ -473,24 +985,30 @@ def convert_newton_contacts_to_mjwarp_kernel(
     contact_geom_out: wp.array[wp.vec2i],
     contact_efc_address_out: wp.array2d[int],
     contact_worldid_out: wp.array[int],
+    contact_type_out: wp.array[int],
+    contact_adhesion_out: wp.array[float],
     # Values to clear - see _zero_collision_arrays kernel from mujoco_warp
     nworld_in: int,
     ncollision_out: wp.array[int],
+    overflow_out: wp.array[wp.int32],
+    required_contact_entries: wp.array[wp.int32],
+    existing_contact_entries: wp.array[wp.int32],
     # Fast-path generation tracking
     contact_generation: wp.array[wp.int32],
     last_contact_generation: wp.array[wp.int32],
     tid_to_cid: wp.array[wp.int32],
+    contact_horizon_state: wp.array[wp.uint8],
     last_nacon_count: wp.array[wp.int32],
+    owner_rotation_at_generation: wp.array[wp.quat],
 ):
-    # nacon_out must be zeroed before this kernel is launched so that
-    # wp.atomic_add below produces the correct compacted count.
+    # nacon_out must be zeroed before this kernel is launched so contact-entry
+    # reservations produce the correct compacted count.
     #
     # When the contact set hasn't changed since the last full pass
     # (contact_generation == last_contact_generation), the kernel takes a
-    # fast path that only recomputes the body-q-dependent fields (dist, pos)
-    # and resets efc_address.  All other MJWarp contact fields (frame,
-    # friction, solref, solimp, condim, geom, worldid, includemargin) are
-    # still valid from the previous full pass.
+    # fast path that recomputes body-state-dependent fields and resets
+    # efc_address. Static material fields remain valid from the full pass,
+    # except when a horizon barrier row transitions into physical contact.
 
     tid = wp.tid()
 
@@ -500,10 +1018,44 @@ def convert_newton_contacts_to_mjwarp_kernel(
     last_gen = last_contact_generation[0]
     needs_full = gen != last_gen
 
+    total_required_contact_entries = existing_contact_entries[0] + required_contact_entries[0]
+    strict_capacity_failure = strict_nonpenetration_active and (
+        count > rigid_contact_is_strict_guard.shape[0]
+        or existing_contact_entries[0] > naconmax
+        or total_required_contact_entries > naconmax
+    )
+    if strict_capacity_failure:
+        if tid < nworld_in:
+            wp.atomic_or(overflow_out, tid, _MUJOCO_OVERFLOW_NARROWPHASE)
+        if tid == 0:
+            nacon_out[0] = existing_contact_entries[0]
+            ncollision_out[0] = 0
+            wp.printf(
+                "Strict Newton contacts require %d MJWarp contact entries for %d contacts, exceeding capacity %d; "
+                "rejecting the generation.\n",
+                total_required_contact_entries,
+                count,
+                naconmax,
+            )
+        if tid < tid_to_cid.shape[0]:
+            tid_to_cid[tid] = -1
+            contact_horizon_state[tid] = wp.uint8(_HORIZON_STATE_INACTIVE)
+        return
+
+    # Snapshot each body exactly once on a new contact generation. The FULL
+    # path keeps using the collision-time world normal; kernel completion
+    # orders these writes before the next FAST conversion reads them.
+    if needs_full and tid < body_q.shape[0]:
+        owner_rotation_at_generation[tid] = wp.transform_get_rotation(body_q[tid])
+    if tid >= tid_to_cid.shape[0]:
+        return
+
     if needs_full:
         # ── FULL PATH ────────────────────────────────────────────────────
         # Runs on the first substep after collision detection.  Identical to
         # the original kernel plus recording the tid→cid mapping.
+
+        contact_horizon_state[tid] = wp.uint8(_HORIZON_STATE_INACTIVE)
 
         if tid == 0:
             if count > naconmax:
@@ -587,7 +1139,16 @@ def convert_newton_contacts_to_mjwarp_kernel(
         if body_a < 0:
             worldid = body_b // bodies_per_world
 
-        margin, _gap, condim, friction, solref, solreffriction, solimp, mix = contact_params(
+        margin, condim, friction, solref, solreffriction, solimp = resolve_newton_contact_params(
+            shape_a,
+            shape_b,
+            body_a,
+            body_b,
+            mj_body_a,
+            mj_body_b,
+            geoms,
+            worldid,
+            tid,
             geom_condim,
             geom_priority,
             geom_solmix,
@@ -596,100 +1157,139 @@ def convert_newton_contacts_to_mjwarp_kernel(
             geom_friction,
             geom_margin,
             geom_gap,
-            geoms,
-            worldid,
+            body_invweight0,
+            shape_material_ke,
+            shape_material_kd,
+            shape_mjc_solref_mode,
+            rigid_contact_stiffness,
+            rigid_contact_damping,
+            rigid_contact_friction,
+            shape_material_kf,
+            opt_impratio_invsqrt,
+            use_kf_mapping,
         )
 
-        # FORCE_SPACE per-contact override: bypass contact_params' per-geom
-        # solref averaging and recompute the solref from the combined
-        # two-body factor. See docs/solvers/mujoco.rst > "Shape-material
-        # contact stiffness and damping" for the mechanism.
-        if shape_mjc_solref_mode:
-            mode_a = shape_mjc_solref_mode[shape_a]
-            mode_b = shape_mjc_solref_mode[shape_b]
-            if mode_a == SOLREF_MODE_FORCE_SPACE and mode_b == SOLREF_MODE_FORCE_SPACE:
-                ke_a = shape_material_ke[shape_a]
-                kd_a = shape_material_kd[shape_a]
-                ke_b = shape_material_ke[shape_b]
-                kd_b = shape_material_kd[shape_b]
-                # Reuse mix from contact_params so heterogeneous materials
-                # combine consistently with friction/solimp.
-                ke = mix * ke_a + (1.0 - mix) * ke_b
-                kd = mix * kd_a + (1.0 - mix) * kd_b
-                invw_a = float(0.0)
-                invw_b = float(0.0)
-                if body_a >= 0:
-                    invw_a = body_invweight0[worldid, mj_body_a][0]
-                if body_b >= 0:
-                    invw_b = body_invweight0[worldid, mj_body_b][0]
-                m_inv = invw_a + invw_b
-                dmax = solimp[1]
-                if m_inv > 0.0 and dmax < 1.0:
-                    factor = m_inv * (1.0 - dmax)
-                    solref = convert_solref(
-                        wp.max(ke * factor, MJ_MINVAL),
-                        wp.max(kd * factor, MJ_MINVAL),
-                        1.0,
-                        1.0,
-                    )
-
-        # Convert Newton per-contact stiffness/damping to MuJoCo solref
-        # (timeconst, dampratio). Per-contact overrides take precedence over
-        # the shape-material force-space override above. solimp is set to
-        # approximate a linear force-displacement relationship at rest,
-        # compensating for impedance scaling. See
-        # https://mujoco.readthedocs.io/en/latest/modeling.html#solver-parameters
-        if rigid_contact_stiffness:
-            contact_ke = rigid_contact_stiffness[tid]
-            if contact_ke > 0.0:
-                imp = solimp[1]
-                solimp = vec5(imp, imp, 0.001, 1.0, 0.5)
-                contact_ke = contact_ke * (1.0 - imp)
-                kd = rigid_contact_damping[tid]
-                if kd > 0.0:
-                    timeconst = 2.0 / kd
-                    dampratio = wp.sqrt(1.0 / (timeconst * timeconst * contact_ke))
-                else:
-                    timeconst = wp.sqrt(1.0 / contact_ke)
-                    dampratio = 1.0
-                solref = wp.vec2(timeconst, dampratio)
-
-            friction_scale = rigid_contact_friction[tid]
-            if friction_scale > 0.0:
-                friction = vec5(
-                    friction[0] * friction_scale,
-                    friction[1] * friction_scale,
-                    friction[2],
-                    friction[3],
-                    friction[4],
-                )
-
-        # Match Newton's force-space friction slope using MuJoCo's inverse-weight
-        # approximation; positive solref lets refsafe limit overly stiff damping.
-        if shape_material_kf and use_kf_mapping:
-            kf1 = shape_material_kf[shape_a]
-            kf2 = shape_material_kf[shape_b]
-            kf = mix * kf1 + (1.0 - mix) * kf2
-            if kf > 0.0:
-                invw = body_invweight0[worldid, mj_body_a][0] + body_invweight0[worldid, mj_body_b][0]
-                ir = opt_impratio_invsqrt[worldid % opt_impratio_invsqrt.shape[0]]
-                imp = solimp[1]
-                denom = kf * invw * ((1.0 - imp) * ir * ir + imp)
-                if denom > 0.0 and wp.isfinite(denom):
-                    timeconst = 2.0 / denom
-                    if wp.isfinite(timeconst):
-                        solreffriction = wp.vec2(timeconst, 1.0)
-            elif kf == 0.0:
-                # A zero gain means no friction force in Newton, so omit all
-                # sliding, torsional, and rolling constraint rows.
-                condim = 1
-
-        cid = wp.atomic_add(nacon_out, 0, 1)
-        if cid >= naconmax:
+        predictive_contact = rigid_contact_is_predictive[tid] != wp.uint8(0)
+        strict_guard_kind = int(rigid_contact_is_strict_guard[tid])
+        paired_strict_guard = strict_guard_kind == CONTACT_STRICT_GUARD_PAIRED
+        guard_only = strict_guard_kind == CONTACT_STRICT_GUARD_ONLY
+        barrier_active = velocity_speculation_active and predictive_contact and dist >= margin
+        # Strict guards are selected by the bounded collision manifold. Keep
+        # this independent of current separation: physical non-guard rows must
+        # retain their authored soft response.
+        # Capacity was validated for the complete generation before this kernel,
+        # so variable-size reservations cannot starve a later authored row.
+        strict_guard = strict_nonpenetration_active and (paired_strict_guard or guard_only)
+        entry_count = 1
+        if strict_nonpenetration_active and paired_strict_guard:
+            entry_count = 2
+        cid = reserve_contact_entries(nacon_out, entry_count, naconmax)
+        if cid < 0:
+            wp.atomic_or(overflow_out, worldid, _MUJOCO_OVERFLOW_NARROWPHASE)
             tid_to_cid[tid] = -1
             return
 
         tid_to_cid[tid] = cid
+        if strict_guard:
+            contact_horizon_state[tid] = wp.uint8(_HORIZON_STATE_STRICT)
+        elif barrier_active:
+            contact_horizon_state[tid] = wp.uint8(_HORIZON_STATE_BARRIER)
+        else:
+            contact_horizon_state[tid] = wp.uint8(_HORIZON_STATE_INACTIVE)
+
+        if strict_guard:
+            # The guard is solver-private and always normal-only. The adjacent authored row retains the
+            # complete material response, but it remains inactive until the physical boundary is reached.
+            guard_margin, barrier_damping, _barrier_row = horizon_contact_parameters(
+                dist,
+                margin,
+                timestep,
+                True,
+                True,
+            )
+            guard_pos = horizon_contact_position(point_a, point_b, a_immovable, b_immovable)
+            impedance = MJ_MAXIMP
+            guard_solimp = vec5(impedance, impedance, 1.0, 0.5, 2.0)
+            write_contact(
+                dist_in=dist,
+                pos_in=guard_pos,
+                frame_in=frame,
+                margin_in=guard_margin,
+                condim_in=1,
+                friction_in=friction,
+                solref_in=wp.vec2(0.0, -barrier_damping),
+                solreffriction_in=solreffriction,
+                solimp_in=guard_solimp,
+                geoms_in=geoms,
+                worldid_in=worldid,
+                contact_id_in=cid,
+                contact_dist_out=contact_dist_out,
+                contact_pos_out=contact_pos_out,
+                contact_frame_out=contact_frame_out,
+                contact_includemargin_out=contact_includemargin_out,
+                contact_friction_out=contact_friction_out,
+                contact_solref_out=contact_solref_out,
+                contact_solreffriction_out=contact_solreffriction_out,
+                contact_solimp_out=contact_solimp_out,
+                contact_dim_out=contact_dim_out,
+                contact_geom_out=contact_geom_out,
+                contact_efc_address_out=contact_efc_address_out,
+                contact_worldid_out=contact_worldid_out,
+                contact_type_out=contact_type_out,
+                contact_adhesion_out=contact_adhesion_out,
+            )
+
+            if guard_only:
+                return
+
+            authored_margin = margin
+            if dist < margin:
+                authored_margin = wp.max(dist, margin) + _VELOCITY_BARRIER_EPSILON
+            write_contact(
+                dist_in=dist,
+                pos_in=pos,
+                frame_in=frame,
+                margin_in=authored_margin,
+                condim_in=condim,
+                friction_in=friction,
+                solref_in=solref,
+                solreffriction_in=solreffriction,
+                solimp_in=solimp,
+                geoms_in=geoms,
+                worldid_in=worldid,
+                contact_id_in=cid + 1,
+                contact_dist_out=contact_dist_out,
+                contact_pos_out=contact_pos_out,
+                contact_frame_out=contact_frame_out,
+                contact_includemargin_out=contact_includemargin_out,
+                contact_friction_out=contact_friction_out,
+                contact_solref_out=contact_solref_out,
+                contact_solreffriction_out=contact_solreffriction_out,
+                contact_solimp_out=contact_solimp_out,
+                contact_dim_out=contact_dim_out,
+                contact_geom_out=contact_geom_out,
+                contact_efc_address_out=contact_efc_address_out,
+                contact_worldid_out=contact_worldid_out,
+                contact_type_out=contact_type_out,
+                contact_adhesion_out=contact_adhesion_out,
+            )
+            return
+
+        margin, barrier_damping, barrier_row = horizon_contact_parameters(
+            dist,
+            margin,
+            timestep,
+            velocity_speculation_active,
+            barrier_active,
+        )
+        if barrier_row:
+            pos = horizon_contact_position(point_a, point_b, a_immovable, b_immovable)
+            # Direct damping creates the sentinel row; the post-step1 barrier replaces its reference with the
+            # physical end-of-substep inequality before the constraint solve.
+            impedance = MJ_MAXIMP
+            condim = 1
+            solref = wp.vec2(0.0, -barrier_damping)
+            solimp = vec5(impedance, impedance, 1.0, 0.5, 2.0)
 
         write_contact(
             dist_in=dist,
@@ -716,16 +1316,17 @@ def convert_newton_contacts_to_mjwarp_kernel(
             contact_geom_out=contact_geom_out,
             contact_efc_address_out=contact_efc_address_out,
             contact_worldid_out=contact_worldid_out,
+            contact_type_out=contact_type_out,
+            contact_adhesion_out=contact_adhesion_out,
         )
     else:
         # ── FAST PATH ────────────────────────────────────────────────────
-        # Subsequent substeps with the same contact set.  Only dist, pos,
-        # and efc_address need updating; all other MJWarp fields are still
-        # valid from the full pass.
+        # Subsequent substeps with the same contact set. Reclassify the retained horizon row from the current
+        # pose while reusing the narrow-phase anchors and static material fields.
         #
-        # NOTE: rigid_contact_normal is computed once by the narrow phase
-        # and is invariant across substeps.  The fast path is only correct
-        # when collide() has not been called since the last full pass.
+        # The narrow phase stores a collision-time world normal. Mesh-SDF
+        # contacts additionally identify the shape whose local SDF gradient
+        # owns that normal, allowing it to follow finite owner rotation.
 
         if tid == 0:
             ncollision_out[0] = 0
@@ -738,6 +1339,8 @@ def convert_newton_contacts_to_mjwarp_kernel(
         # out-of-bounds writes that corrupt the GPU allocator state.
         if cid < 0 or cid >= naconmax:
             return
+        contact_type_out[cid] = contact_type_out[cid] | _MUJOCO_CONTACT_CONSTRAINT
+        contact_adhesion_out[cid] = 0.0
 
         shape_a = rigid_contact_shape0[tid]
         shape_b = rigid_contact_shape1[tid]
@@ -763,16 +1366,151 @@ def convert_newton_contacts_to_mjwarp_kernel(
         point_a = contact_surface_point(X_wb_a, rigid_contact_point0[tid], offset_a)
         point_b = contact_surface_point(X_wb_b, rigid_contact_point1[tid], offset_b)
 
-        n = rigid_contact_normal[tid]
+        n = update_owned_contact_normal(
+            rigid_contact_normal[tid],
+            rigid_contact_normal_owner[tid],
+            body_a,
+            body_b,
+            X_wb_a,
+            X_wb_b,
+            owner_rotation_at_generation,
+        )
         # rigid_contact_margin includes shape_margin; MuJoCo handles it explicitly, subtract to recover radius_eff.
-        contact_dist_out[cid] = contact_surface_separation(
+        dist = contact_surface_separation(
             bx_a,
             bx_b,
             n,
             rigid_contact_margin0[tid] - shape_margin[shape_a],
             rigid_contact_margin1[tid] - shape_margin[shape_b],
         )
-        contact_pos_out[cid] = 0.5 * (point_a + point_b)
+        pos = 0.5 * (point_a + point_b)
+        contact_dist_out[cid] = dist
+        contact_frame_out[cid] = make_frame(n)
+
+        if not velocity_speculation_active and not strict_nonpenetration_active:
+            contact_pos_out[cid] = pos
+            for i in range(contact_efc_address_out.shape[1]):
+                contact_efc_address_out[cid, i] = -1
+            return
+
+        geom_a = newton_shape_to_mjc_geom[shape_a]
+        geom_b = newton_shape_to_mjc_geom[shape_b]
+        mj_body_a = geom_bodyid[geom_a]
+        mj_body_b = geom_bodyid[geom_b]
+        a_immovable = body_a < 0 or (body_flags[body_a] & BodyFlags.KINEMATIC) != 0 or body_weldid[mj_body_a] == 0
+        b_immovable = body_b < 0 or (body_flags[body_b] & BodyFlags.KINEMATIC) != 0 or body_weldid[mj_body_b] == 0
+        worldid = body_a // bodies_per_world
+        if body_a < 0:
+            worldid = body_b // bodies_per_world
+        margin = geom_margin[worldid, geom_a] + geom_margin[worldid, geom_b]
+        horizon_state = int(contact_horizon_state[tid])
+
+        if horizon_state == _HORIZON_STATE_STRICT:
+            guard_only = int(rigid_contact_is_strict_guard[tid]) == CONTACT_STRICT_GUARD_ONLY
+            authored_cid = cid + 1
+            if not guard_only and authored_cid >= naconmax:
+                return
+            if not guard_only:
+                contact_type_out[authored_cid] = contact_type_out[authored_cid] | _MUJOCO_CONTACT_CONSTRAINT
+                contact_adhesion_out[authored_cid] = 0.0
+
+            guard_margin, barrier_damping, _barrier_row = horizon_contact_parameters(
+                dist,
+                margin,
+                timestep,
+                True,
+                True,
+            )
+            guard_pos = horizon_contact_position(point_a, point_b, a_immovable, b_immovable)
+            impedance = MJ_MAXIMP
+            contact_pos_out[cid] = guard_pos
+            contact_includemargin_out[cid] = guard_margin
+            contact_solref_out[cid] = wp.vec2(0.0, -barrier_damping)
+            contact_solimp_out[cid] = vec5(impedance, impedance, 1.0, 0.5, 2.0)
+            contact_dim_out[cid] = 1
+
+            if guard_only:
+                for i in range(contact_efc_address_out.shape[1]):
+                    contact_efc_address_out[cid, i] = -1
+                return
+
+            authored_margin = margin
+            if dist < margin:
+                authored_margin = wp.max(dist, margin) + _VELOCITY_BARRIER_EPSILON
+            contact_dist_out[authored_cid] = dist
+            contact_pos_out[authored_cid] = pos
+            contact_frame_out[authored_cid] = make_frame(n)
+            contact_includemargin_out[authored_cid] = authored_margin
+            for i in range(contact_efc_address_out.shape[1]):
+                contact_efc_address_out[cid, i] = -1
+                contact_efc_address_out[authored_cid, i] = -1
+            return
+
+        if (
+            horizon_state == _HORIZON_STATE_INACTIVE
+            and rigid_contact_is_predictive[tid] != wp.uint8(0)
+            and dist > margin
+        ):
+            horizon_state = _HORIZON_STATE_BARRIER
+            contact_horizon_state[tid] = wp.uint8(_HORIZON_STATE_BARRIER)
+        was_barrier_row = contact_includemargin_out[cid] > margin
+        barrier_active = horizon_state == _HORIZON_STATE_BARRIER and dist > margin
+        authored_handoff = horizon_state == _HORIZON_STATE_AUTHORED_HANDOFF
+        if horizon_state == _HORIZON_STATE_BARRIER and not barrier_active:
+            authored_handoff = True
+            contact_horizon_state[tid] = wp.uint8(_HORIZON_STATE_AUTHORED_HANDOFF)
+        margin, barrier_damping, barrier_row = horizon_contact_parameters(
+            dist,
+            margin,
+            timestep,
+            velocity_speculation_active,
+            barrier_active,
+        )
+        if authored_handoff:
+            # MuJoCo activates contact rows only for strict inclusion. Keep the authored response law but retain
+            # a one-step sentinel until step1 confirms that its normal EFC exists at the exact physical boundary.
+            margin = wp.max(dist, margin) + _VELOCITY_BARRIER_EPSILON
+        if barrier_row:
+            pos = horizon_contact_position(point_a, point_b, a_immovable, b_immovable)
+            impedance = MJ_MAXIMP
+            contact_solref_out[cid] = wp.vec2(0.0, -barrier_damping)
+            contact_solimp_out[cid] = vec5(impedance, impedance, 1.0, 0.5, 2.0)
+            contact_dim_out[cid] = 1
+        elif was_barrier_row or authored_handoff:
+            _margin, condim, _friction, solref, _solreffriction, solimp = resolve_newton_contact_params(
+                shape_a,
+                shape_b,
+                body_a,
+                body_b,
+                mj_body_a,
+                mj_body_b,
+                wp.vec2i(geom_a, geom_b),
+                worldid,
+                tid,
+                geom_condim,
+                geom_priority,
+                geom_solmix,
+                geom_solref,
+                geom_solimp,
+                geom_friction,
+                geom_margin,
+                geom_gap,
+                body_invweight0,
+                shape_material_ke,
+                shape_material_kd,
+                shape_mjc_solref_mode,
+                rigid_contact_stiffness,
+                rigid_contact_damping,
+                rigid_contact_friction,
+                shape_material_kf,
+                opt_impratio_invsqrt,
+                use_kf_mapping,
+            )
+            contact_solref_out[cid] = solref
+            contact_solimp_out[cid] = solimp
+            contact_dim_out[cid] = condim
+        contact_pos_out[cid] = pos
+        contact_includemargin_out[cid] = margin
 
         for i in range(contact_efc_address_out.shape[1]):
             contact_efc_address_out[cid, i] = -1
@@ -787,6 +1525,315 @@ def _snapshot_nacon_count(
 ):
     last_nacon_count[0] = nacon[0]
     last_contact_generation[0] = contact_generation[0]
+
+
+@wp.kernel(enable_backward=False)
+def apply_velocity_contact_barrier_kernel(
+    rigid_contact_count: wp.array[wp.int32],
+    tid_to_cid: wp.array[wp.int32],
+    contact_horizon_state: wp.array[wp.uint8],
+    contact_dist: wp.array[float],
+    contact_geom: wp.array[wp.vec2i],
+    contact_worldid: wp.array[int],
+    contact_efc_address: wp.array2d[int],
+    geom_margin: wp.array2d[float],
+    timestep: wp.array[float],
+    efc_vel: wp.array2d[float],
+    efc_aref: wp.array2d[float],
+):
+    """Apply the physical positive-gap inequality to retained horizon candidates."""
+    contact_tid = wp.tid()
+    if contact_tid >= rigid_contact_count[0]:
+        return
+    horizon_state = int(contact_horizon_state[contact_tid])
+    if horizon_state == _HORIZON_STATE_INACTIVE:
+        return
+
+    contact_id = tid_to_cid[contact_tid]
+    if contact_id < 0:
+        return
+
+    world_id = contact_worldid[contact_id]
+    geoms = contact_geom[contact_id]
+    margin_row = world_id % geom_margin.shape[0]
+    physical_margin = geom_margin[margin_row, geoms[0]] + geom_margin[margin_row, geoms[1]]
+    if horizon_state == _HORIZON_STATE_AUTHORED_HANDOFF:
+        normal_efc_id = contact_efc_address[contact_id, 0]
+        if normal_efc_id < 0:
+            return
+        # The current step uses the authored contact law with strict sentinel inclusion. Once the row exists,
+        # retire the sentinel; a later separation can re-arm from immutable collision-generation provenance.
+        contact_horizon_state[contact_tid] = wp.uint8(_HORIZON_STATE_INACTIVE)
+        return
+
+    timestep_row = world_id % timestep.shape[0]
+    h = timestep[timestep_row]
+    signed_gap = contact_dist[contact_id] - physical_margin
+    if horizon_state == _HORIZON_STATE_STRICT:
+        normal_efc_id = contact_efc_address[contact_id, 0]
+        if normal_efc_id < 0:
+            return
+        # A stale overlap is already outside the invariant set. Do not turn
+        # its depth into an ejecting recovery velocity; only stop further
+        # inward motion while the authored row resolves penetration softly.
+        effective_gap = wp.max(signed_gap, 0.0)
+        velocity = efc_vel[world_id, normal_efc_id]
+        efc_aref[world_id, normal_efc_id] = (-effective_gap / (h * h) - velocity / h) / MJ_MAXIMP
+        return
+
+    normal_efc_id = contact_efc_address[contact_id, 0]
+    if normal_efc_id < 0 or signed_gap <= 0.0:
+        return
+
+    velocity = efc_vel[world_id, normal_efc_id]
+    barrier_aref = (-signed_gap / (h * h) - velocity / h) / MJ_MAXIMP
+    # The expanded inclusion margin is only an activation sentinel. Replace its reference exactly so the row
+    # remains force-free unless the coupled end-of-step motion would cross the physical margin.
+    efc_aref[world_id, normal_efc_id] = barrier_aref
+
+
+@wp.func
+def candidate_body_velocity(
+    body_id: int,
+    world_id: int,
+    h: float,
+    body_parentid: wp.array[int],
+    body_dofadr: wp.array[int],
+    body_dofnum: wp.array[int],
+    cdof: wp.array2d[wp.spatial_vector],
+    qvel: wp.array2d[float],
+    qacc: wp.array2d[float],
+) -> wp.spatial_vector:
+    """Return a body's candidate end-step spatial velocity at the current pose."""
+    velocity = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    current_body = body_id
+    while current_body > 0:
+        dof_start = body_dofadr[current_body]
+        dof_count = body_dofnum[current_body]
+        for local_dof in range(6):
+            if local_dof < dof_count:
+                dof = dof_start + local_dof
+                candidate_qvel = qvel[world_id, dof] + h * qacc[world_id, dof]
+                velocity += cdof[world_id, dof] * candidate_qvel
+        current_body = body_parentid[current_body]
+    return velocity
+
+
+@wp.func
+def rotate_vector_over_timestep(vector: wp.vec3, angular_velocity: wp.vec3, h: float) -> wp.vec3:
+    """Rotate a world vector by constant world angular velocity over one timestep."""
+    angular_speed = wp.length(angular_velocity)
+    if angular_speed == 0.0:
+        return vector
+    axis = angular_velocity / angular_speed
+    angle = angular_speed * h
+    return (
+        wp.cos(angle) * vector
+        + wp.sin(angle) * wp.cross(axis, vector)
+        + (1.0 - wp.cos(angle)) * axis * wp.dot(axis, vector)
+    )
+
+
+@wp.func
+def candidate_body_point_motion(
+    body_id: int,
+    world_id: int,
+    point: wp.vec3,
+    h: float,
+    body_parentid: wp.array[int],
+    body_dofadr: wp.array[int],
+    body_dofnum: wp.array[int],
+    body_rootid: wp.array[int],
+    xpos: wp.array2d[wp.vec3],
+    subtree_com: wp.array2d[wp.vec3],
+    cdof: wp.array2d[wp.spatial_vector],
+    qvel: wp.array2d[float],
+    qacc: wp.array2d[float],
+):
+    """Return the candidate endpoint, tangent velocity, and angular velocity for one body point."""
+    body_velocity = candidate_body_velocity(
+        body_id,
+        world_id,
+        h,
+        body_parentid,
+        body_dofadr,
+        body_dofnum,
+        cdof,
+        qvel,
+        qacc,
+    )
+    angular_velocity = wp.spatial_top(body_velocity)
+    origin = xpos[world_id, body_id]
+    subtree_center = subtree_com[world_id, body_rootid[body_id]]
+    origin_velocity = wp.spatial_bottom(body_velocity) + wp.cross(angular_velocity, origin - subtree_center)
+    radius = point - origin
+    point_velocity = origin_velocity + wp.cross(angular_velocity, radius)
+    endpoint = origin + h * origin_velocity + rotate_vector_over_timestep(radius, angular_velocity, h)
+    return endpoint, point_velocity, angular_velocity
+
+
+@wp.kernel(enable_backward=False)
+def apply_strict_contact_endpoint_reserve_kernel(
+    body_q: wp.array[wp.transform],
+    rigid_contact_count: wp.array[wp.int32],
+    rigid_contact_shape0: wp.array[wp.int32],
+    rigid_contact_shape1: wp.array[wp.int32],
+    rigid_contact_point0: wp.array[wp.vec3],
+    rigid_contact_point1: wp.array[wp.vec3],
+    rigid_contact_margin0: wp.array[float],
+    rigid_contact_margin1: wp.array[float],
+    rigid_contact_normal_owner: wp.array[wp.int32],
+    shape_body: wp.array[int],
+    shape_margin: wp.array[float],
+    body_flags: wp.array[int],
+    tid_to_cid: wp.array[wp.int32],
+    contact_horizon_state: wp.array[wp.uint8],
+    contact_endpoint_reserve: wp.array[float],
+    contact_dist: wp.array[float],
+    contact_frame: wp.array[wp.mat33],
+    contact_geom: wp.array[wp.vec2i],
+    contact_worldid: wp.array[int],
+    contact_efc_address: wp.array2d[int],
+    geom_margin: wp.array2d[float],
+    geom_bodyid: wp.array[int],
+    body_weldid: wp.array[int],
+    body_parentid: wp.array[int],
+    body_dofadr: wp.array[int],
+    body_dofnum: wp.array[int],
+    body_rootid: wp.array[int],
+    xpos: wp.array2d[wp.vec3],
+    subtree_com: wp.array2d[wp.vec3],
+    cdof: wp.array2d[wp.spatial_vector],
+    qvel: wp.array2d[float],
+    qacc: wp.array2d[float],
+    timestep: wp.array[float],
+    efc_vel: wp.array2d[float],
+    efc_aref: wp.array2d[float],
+    accumulate_solver_residual: bool,
+    use_certified_reference_floor: bool,
+    certified_reference_clearance: float,
+):
+    """Raise the nonlinear reserve, optionally accumulating a same-row endpoint defect."""
+    contact_tid = wp.tid()
+    if contact_tid >= rigid_contact_count[0] or int(contact_horizon_state[contact_tid]) != _HORIZON_STATE_STRICT:
+        return
+
+    contact_id = tid_to_cid[contact_tid]
+    if contact_id < 0:
+        return
+    world_id = contact_worldid[contact_id]
+    h = timestep[world_id % timestep.shape[0]]
+
+    geoms = contact_geom[contact_id]
+    mj_body_a = geom_bodyid[geoms[0]]
+    mj_body_b = geom_bodyid[geoms[1]]
+    shape_a = rigid_contact_shape0[contact_tid]
+    shape_b = rigid_contact_shape1[contact_tid]
+    body_a = shape_body[shape_a]
+    body_b = shape_body[shape_b]
+    a_immovable = body_a < 0 or (body_flags[body_a] & BodyFlags.KINEMATIC) != 0 or body_weldid[mj_body_a] == 0
+    b_immovable = body_b < 0 or (body_flags[body_b] & BodyFlags.KINEMATIC) != 0 or body_weldid[mj_body_b] == 0
+
+    normal = contact_frame[contact_id][0]
+    X_wb_a = wp.transform_identity()
+    X_wb_b = wp.transform_identity()
+    if body_a >= 0:
+        X_wb_a = body_q[body_a]
+    if body_b >= 0:
+        X_wb_b = body_q[body_b]
+    # Predict the collision support generators. Effective radii are scalar shape dilations (a sphere's center
+    # rotates about the body origin, but its radius does not rotate as a retained material offset).
+    point_a = wp.transform_point(X_wb_a, rigid_contact_point0[contact_tid])
+    point_b = wp.transform_point(X_wb_b, rigid_contact_point1[contact_tid])
+    radius_a = rigid_contact_margin0[contact_tid] - shape_margin[shape_a]
+    radius_b = rigid_contact_margin1[contact_tid] - shape_margin[shape_b]
+
+    endpoint_a = point_a
+    endpoint_b = point_b
+    point_velocity_a = wp.vec3(0.0)
+    point_velocity_b = wp.vec3(0.0)
+    angular_velocity_a = wp.vec3(0.0)
+    angular_velocity_b = wp.vec3(0.0)
+    if not a_immovable:
+        endpoint_a, point_velocity_a, angular_velocity_a = candidate_body_point_motion(
+            mj_body_a,
+            world_id,
+            point_a,
+            h,
+            body_parentid,
+            body_dofadr,
+            body_dofnum,
+            body_rootid,
+            xpos,
+            subtree_com,
+            cdof,
+            qvel,
+            qacc,
+        )
+    if not b_immovable:
+        endpoint_b, point_velocity_b, angular_velocity_b = candidate_body_point_motion(
+            mj_body_b,
+            world_id,
+            point_b,
+            h,
+            body_parentid,
+            body_dofadr,
+            body_dofnum,
+            body_rootid,
+            xpos,
+            subtree_com,
+            cdof,
+            qvel,
+            qacc,
+        )
+
+    endpoint_normal = normal
+    normal_owner = rigid_contact_normal_owner[contact_tid]
+    if normal_owner == 0 and not a_immovable:
+        endpoint_normal = rotate_vector_over_timestep(normal, angular_velocity_a, h)
+    elif normal_owner == 1 and not b_immovable:
+        endpoint_normal = rotate_vector_over_timestep(normal, angular_velocity_b, h)
+
+    margin_row = world_id % geom_margin.shape[0]
+    physical_margin = geom_margin[margin_row, geoms[0]] + geom_margin[margin_row, geoms[1]]
+    linear_endpoint_a = point_a + h * point_velocity_a
+    linear_endpoint_b = point_b + h * point_velocity_b
+    linear_gap = wp.dot(linear_endpoint_b - linear_endpoint_a, normal) - (radius_a + radius_b + physical_margin)
+    exact_gap = wp.dot(endpoint_b - endpoint_a, endpoint_normal) - (radius_a + radius_b + physical_margin)
+    normal_efc_id = contact_efc_address[contact_id, 0]
+    if normal_efc_id < 0:
+        return
+
+    # Reconstruct the linear guard reference so rotation-only checks are idempotent. Ordinary contacts preserve a
+    # stale overlap, while an oracle guard targets its tolerance-sized positive clearance so finite solver residual
+    # remains inside the oracle's geometric acceptance bound. A candidate-derived tangent can lie behind the true
+    # reference surface, so its signed gap is not a valid oracle floor. Each pass may raise but never lower the
+    # reserve already applied to this row. The optional external reserve is valid only while contact_tid identifies
+    # the same geometric feature; relinearized oracle rows pass a null array and therefore start from their freshly
+    # rebuilt EFC reference.
+    signed_gap = contact_dist[contact_id] - physical_margin
+    reference_floor = wp.min(signed_gap, 0.0)
+    if use_certified_reference_floor:
+        reference_floor = certified_reference_clearance
+    velocity = efc_vel[world_id, normal_efc_id]
+    base_reference = ((reference_floor - signed_gap) / (h * h) - velocity / h) / MJ_MAXIMP
+    reserve_scale = h * h * MJ_MAXIMP
+    applied_reserve = wp.max((efc_aref[world_id, normal_efc_id] - base_reference) * reserve_scale, 0.0)
+    carried_reserve = float(0.0)
+    if contact_endpoint_reserve:
+        carried_reserve = contact_endpoint_reserve[contact_tid]
+    prior_reserve = wp.max(applied_reserve, carried_reserve)
+    curvature_required = wp.max(linear_gap - exact_gap, 0.0)
+    endpoint_defect = wp.max(reference_floor - exact_gap, 0.0)
+    required_reserve = wp.max(curvature_required, prior_reserve)
+    if accumulate_solver_residual:
+        # MuJoCo caps impedance below one, so even a converged guard solve retains a small fraction of the
+        # unconstrained acceleration. Accumulate exactly one measured defect after each fresh solve; repeating this
+        # branch without solving would add the same defect twice.
+        required_reserve = wp.max(curvature_required, prior_reserve + endpoint_defect)
+    if contact_endpoint_reserve:
+        contact_endpoint_reserve[contact_tid] = required_reserve
+    efc_aref[world_id, normal_efc_id] = base_reference + required_reserve / reserve_scale
 
 
 @wp.kernel
@@ -917,6 +1964,63 @@ def convert_mj_coords_to_warp_kernel(
         for i in range(axis_count):
             # convert velocity components
             joint_qd[wqd_i + i] = qvel[worldid, qd_i + i]
+
+
+@wp.kernel(enable_backward=False)
+def build_free_body_path_certificate_kernel(
+    qvel: wp.array2d[wp.float32],
+    timestep: wp.array[wp.float32],
+    joints_per_world: int,
+    joint_type: wp.array[wp.int32],
+    joint_parent: wp.array[wp.int32],
+    joint_child: wp.array[wp.int32],
+    body_flags: wp.array[wp.int32],
+    mj_qd_start: wp.array[wp.int32],
+    stationary_path_kind: int,
+    linear_translation_path_kind: int,
+    bounded_path_kind: int,
+    constant_twist_path_kind: int,
+    origin_path_length: wp.array[wp.float32],
+    angular_path_length: wp.array[wp.float32],
+    motion_kind: wp.array[wp.uint8],
+):
+    """Certify the exact semi-implicit path of direct free rigid bodies."""
+    world_id, joint_template_id = wp.tid()
+    joint_id = joints_per_world * world_id + joint_template_id
+    child = joint_child[joint_id]
+
+    if (body_flags[child] & BodyFlags.KINEMATIC) != 0:
+        motion_kind[child] = wp.uint8(stationary_path_kind)
+        return
+    if joint_type[joint_id] != JointType.FREE or joint_parent[joint_id] != -1:
+        return
+
+    qd_start = mj_qd_start[joint_template_id]
+    if qd_start < 0:
+        return
+    h = wp.abs(timestep[world_id % timestep.shape[0]])
+    linear_velocity = wp.vec3(
+        qvel[world_id, qd_start],
+        qvel[world_id, qd_start + 1],
+        qvel[world_id, qd_start + 2],
+    )
+    angular_velocity = wp.vec3(
+        qvel[world_id, qd_start + 3],
+        qvel[world_id, qd_start + 4],
+        qvel[world_id, qd_start + 5],
+    )
+    translation_length = h * wp.length(linear_velocity)
+    rotation_length = h * wp.length(angular_velocity)
+    origin_path_length[child] = translation_length
+    angular_path_length[child] = rotation_length
+    if translation_length == 0.0 and rotation_length == 0.0:
+        motion_kind[child] = wp.uint8(stationary_path_kind)
+    elif rotation_length == 0.0:
+        motion_kind[child] = wp.uint8(linear_translation_path_kind)
+    elif rotation_length <= wp.pi:
+        motion_kind[child] = wp.uint8(constant_twist_path_kind)
+    else:
+        motion_kind[child] = wp.uint8(bounded_path_kind)
 
 
 @wp.kernel
@@ -3345,6 +4449,9 @@ def reset_world_buffers_kernel(
     ctrl: wp.array2d[wp.float32],
     act: wp.array2d[wp.float32],
     xfrc_applied: wp.array2d[wp.spatial_vector],
+    overflow: wp.array[wp.int32],
+    strict_nonpenetration_unsafe_world: wp.array[wp.int32],
+    strict_nonpenetration_overflow: wp.array[wp.int32],
 ):
     """Zero the persistent MuJoCo buffers for the worlds selected by ``world_mask``.
 
@@ -3352,11 +4459,18 @@ def reset_world_buffers_kernel(
     ``(world, max_dim)`` where ``max_dim`` covers the widest buffer; each buffer
     is guarded by its own column count. ``qacc_warmstart`` and ``qfrc_applied``
     share the DOF dimension. ``qacc`` is intentionally omitted: the solver
-    overwrites it from ``qacc_warmstart`` at the start of every step.
+    overwrites it from ``qacc_warmstart`` at the start of every step. The
+    per-world overflow bitmask is cleared by the first column thread.
     """
     worldid, i = wp.tid()
     if world_mask and not world_mask[worldid]:
         return
+    if i == 0:
+        overflow[worldid] = 0
+        if strict_nonpenetration_unsafe_world:
+            strict_nonpenetration_unsafe_world[worldid] = 0
+        if strict_nonpenetration_overflow:
+            strict_nonpenetration_overflow[worldid] = 0
     if i < qacc_warmstart.shape[1]:
         qacc_warmstart[worldid, i] = 0.0
         qfrc_applied[worldid, i] = 0.0

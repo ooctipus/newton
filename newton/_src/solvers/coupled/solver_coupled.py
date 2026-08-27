@@ -2750,6 +2750,9 @@ class SolverCoupled(SolverBase, CouplingInterface):
                     contacts.rigid_contact_offset0,
                     contacts.rigid_contact_offset1,
                     contacts.rigid_contact_normal,
+                    contacts.rigid_contact_normal_owner,
+                    contacts.rigid_contact_is_predictive,
+                    contacts.rigid_contact_is_strict_guard,
                     contacts.rigid_contact_margin0,
                     contacts.rigid_contact_margin1,
                     contacts.rigid_contact_tids,
@@ -2764,6 +2767,9 @@ class SolverCoupled(SolverBase, CouplingInterface):
                     filtered.rigid_contact_offset0,
                     filtered.rigid_contact_offset1,
                     filtered.rigid_contact_normal,
+                    filtered.rigid_contact_normal_owner,
+                    filtered.rigid_contact_is_predictive,
+                    filtered.rigid_contact_is_strict_guard,
                     filtered.rigid_contact_margin0,
                     filtered.rigid_contact_margin1,
                     filtered.rigid_contact_tids,
@@ -2905,6 +2911,8 @@ class SolverCoupled(SolverBase, CouplingInterface):
                 device=contacts.device,
             )
         filtered._contact_matching_mode = contacts.contact_matching_mode
+        filtered._velocity_speculation_active = contacts._velocity_speculation_active
+        filtered._strict_nonpenetration_active = contacts._strict_nonpenetration_active
         filtered._enable_rigid_soft_full_surface_contact = bool(
             contacts._enable_rigid_soft_full_surface_contact
             and entry.solver.coupling_supports_full_surface_soft_contacts()
@@ -3526,6 +3534,9 @@ def _filter_rigid_contacts_global_shape_ids_kernel(
     src_offset0: wp.array[wp.vec3],
     src_offset1: wp.array[wp.vec3],
     src_normal: wp.array[wp.vec3],
+    src_normal_owner: wp.array[wp.int32],
+    src_is_predictive: wp.array[wp.uint8],
+    src_is_strict_guard: wp.array[wp.uint8],
     src_margin0: wp.array[wp.float32],
     src_margin1: wp.array[wp.float32],
     src_tids: wp.array[wp.int32],
@@ -3540,6 +3551,9 @@ def _filter_rigid_contacts_global_shape_ids_kernel(
     dst_offset0: wp.array[wp.vec3],
     dst_offset1: wp.array[wp.vec3],
     dst_normal: wp.array[wp.vec3],
+    dst_normal_owner: wp.array[wp.int32],
+    dst_is_predictive: wp.array[wp.uint8],
+    dst_is_strict_guard: wp.array[wp.uint8],
     dst_margin0: wp.array[wp.float32],
     dst_margin1: wp.array[wp.float32],
     dst_tids: wp.array[wp.int32],
@@ -3572,6 +3586,9 @@ def _filter_rigid_contacts_global_shape_ids_kernel(
     dst_offset0[dst_id] = src_offset0[contact_id]
     dst_offset1[dst_id] = src_offset1[contact_id]
     dst_normal[dst_id] = src_normal[contact_id]
+    dst_normal_owner[dst_id] = src_normal_owner[contact_id]
+    dst_is_predictive[dst_id] = src_is_predictive[contact_id]
+    dst_is_strict_guard[dst_id] = src_is_strict_guard[contact_id]
     dst_margin0[dst_id] = src_margin0[contact_id]
     dst_margin1[dst_id] = src_margin1[contact_id]
     dst_tids[dst_id] = src_tids[contact_id]

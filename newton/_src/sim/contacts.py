@@ -224,6 +224,15 @@ class Contacts:
         self.per_contact_shape_properties = per_contact_shape_properties
         self.clear_buffers = clear_buffers
         self._contact_matching_mode: Literal["disabled", "latest", "sticky"] = "disabled"
+        # Set by CollisionPipeline.collide(). Solvers use this provenance marker to distinguish
+        # velocity-retained candidates from ordinary fixed-gap contacts.
+        self._velocity_speculation_active = False
+        # Set by CollisionPipeline.collide() when speculative contacts must also enforce a
+        # hard end-of-substep nonpenetration inequality after reaching the physical surface.
+        self._strict_nonpenetration_active = False
+        # Opaque pipeline/solver claim copied by CollisionPipeline.collide() only when raw-mesh
+        # endpoint guards were suppressed in favor of a bound solver-side oracle.
+        self._strict_nonpenetration_owner_token: object | None = None
         with wp.ScopedDevice(device):
             # One int32[2] array holding two independent contact counts: [0] rigid, [1] soft.
             # rigid_contact_count (the [0:1] view) and soft_contact_count (the [1:2] view) index
@@ -267,6 +276,28 @@ class Contacts:
             calculations."""
             self.rigid_contact_normal = wp.zeros(rigid_contact_max, dtype=wp.vec3)
             """Contact normal pointing from shape 0 toward shape 1 (A-to-B) [unitless], shape (rigid_contact_max,), dtype :class:`vec3`."""
+            self.rigid_contact_normal_owner = wp.full(rigid_contact_max, -1, dtype=wp.int32)
+            """Shape-relative owner of the contact normal, shape (rigid_contact_max,), dtype int32.
+
+            :attr:`rigid_contact_normal` remains in collision-generation world space. Values ``0`` and ``1`` mean
+            that vector co-rotates with shape 0's or shape 1's local surface frame while a solver caches the contact,
+            respectively. ``-1`` means the collision-time world-space normal remains fixed.
+            """
+            self.rigid_contact_is_predictive = wp.zeros(rigid_contact_max, dtype=wp.uint8)
+            """Whether a contact belongs to the collision generation's predictive manifold, shape (rigid_contact_max,), dtype uint8.
+
+            This provenance is immutable until the next collision generation. A non-zero value marks a separated
+            horizon guard. Direct bounded manifolds mark every separated member; globally reduced mesh/SDF
+            manifolds mark only their final predictive support winners. Physical contacts are unmarked even when
+            generated inside the authored fixed gap.
+            """
+            self.rigid_contact_is_strict_guard = wp.zeros(rigid_contact_max, dtype=wp.uint8)
+            """Strict nonpenetration row kind, shape (rigid_contact_max,), dtype uint8.
+
+            Zero denotes an authored row, one denotes a paired guard plus authored response, and two denotes a
+            dedicated guard-only row. This provenance is independent of current separation and immutable until the
+            next collision generation.
+            """
             self.rigid_contact_margin0 = wp.zeros(rigid_contact_max, dtype=wp.float32)
             """Surface thickness for shape 0: effective radius + margin [m], shape (rigid_contact_max,), dtype float."""
             self.rigid_contact_margin1 = wp.zeros(rigid_contact_max, dtype=wp.float32)
@@ -436,6 +467,10 @@ class Contacts:
                 generation via another fused kernel (e.g. :func:`compute_shape_aabbs`) can pass
                 ``False`` to avoid an unnecessary double-bump per collision pass.
         """
+        self._velocity_speculation_active = False
+        self._strict_nonpenetration_active = False
+        self._strict_nonpenetration_owner_token = None
+
         # Clear all counters and (optionally) bump generation in a single kernel launch.
         num_counters = self.contact_counters.shape[0]
         wp.launch(
@@ -452,6 +487,9 @@ class Contacts:
             self.rigid_contact_shape0.fill_(-1)
             self.rigid_contact_shape1.fill_(-1)
             self.rigid_contact_tids.fill_(-1)
+            self.rigid_contact_normal_owner.fill_(-1)
+            self.rigid_contact_is_predictive.zero_()
+            self.rigid_contact_is_strict_guard.zero_()
             self.rigid_contact_force.zero_()
 
             if self.force is not None:
