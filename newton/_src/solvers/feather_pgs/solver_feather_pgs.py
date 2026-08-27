@@ -368,6 +368,9 @@ def _use_resident_mfgs_metadata(
 _HINV_JT_MAX_CHUNK_SIZE = 64
 _HINV_JT_COMPACT_DOF_MAX = 20
 _HINV_JT_COMPACT_CHUNK_SIZE = 32
+_HINV_JT_CACHED_MAX_DOFS = 32
+_HINV_JT_CACHED_MIN_ARTICULATIONS = 16384
+_HINV_JT_CACHED_BLOCK_THREADS = 1024
 
 
 def _align_shared_memory(size: int) -> int:
@@ -406,6 +409,13 @@ def _select_hinv_jt_chunk_size(
     return None
 
 
+def _select_cached_hinv_jt_block_dim(n_dofs: int, max_threads_per_block: int) -> int | None:
+    """Select a CUDA block size for cached inverse response rows."""
+    if n_dofs <= 0 or n_dofs > _HINV_JT_CACHED_MAX_DOFS or max_threads_per_block < 32:
+        return None
+    return min(_HINV_JT_CACHED_BLOCK_THREADS, max_threads_per_block) // 32 * 32
+
+
 @dataclass(frozen=True)
 class _FeatherPGSExecutionPlan:
     """Immutable device-resource choices for one solver shape."""
@@ -413,6 +423,7 @@ class _FeatherPGSExecutionPlan:
     hinv_jt_tiled_sizes: frozenset[int]
     hinv_jt_chunk_sizes: tuple[tuple[int, int], ...]
     hinv_jt_fused_sizes: frozenset[int]
+    hinv_jt_cached_block_dims: tuple[tuple[int, int], ...]
 
     @classmethod
     def build(
@@ -424,13 +435,18 @@ class _FeatherPGSExecutionPlan:
         hinv_jt_kernel: str,
         small_dof_threshold: int,
         tile_threads: int,
+        articulation_counts: dict[int, int] | None = None,
+        allow_cached_inverse: bool = False,
+        max_threads_per_block: int = 0,
     ) -> "_FeatherPGSExecutionPlan":
         """Resolve H-inverse implementations from solver shape and device limits."""
         tiled_sizes: set[int] = set()
         chunk_sizes: list[tuple[int, int]] = []
         fused_sizes: set[int] = set()
+        cached_block_dims: list[tuple[int, int]] = []
         if max_constraints <= 0:
-            return cls(frozenset(), (), frozenset())
+            return cls(frozenset(), (), frozenset(), ())
+        articulation_counts = articulation_counts or {}
         for size in size_groups:
             requested = hinv_jt_kernel == "tiled" or (hinv_jt_kernel == "auto" and size > small_dof_threshold)
             if not requested:
@@ -448,13 +464,20 @@ class _FeatherPGSExecutionPlan:
 
             tiled_sizes.add(size)
             chunk_sizes.append((size, chunk_size))
+            cached_block_dim = _select_cached_hinv_jt_block_dim(size, max_threads_per_block)
+            if (
+                allow_cached_inverse
+                and articulation_counts.get(size, 0) >= _HINV_JT_CACHED_MIN_ARTICULATIONS
+                and cached_block_dim is not None
+            ):
+                cached_block_dims.append((size, cached_block_dim))
             if (
                 _estimate_hinv_jt_shared_memory(size, max_constraints, fused=True, tile_threads=tile_threads)
                 <= max_shared_memory
             ):
                 fused_sizes.add(size)
 
-        return cls(frozenset(tiled_sizes), tuple(chunk_sizes), frozenset(fused_sizes))
+        return cls(frozenset(tiled_sizes), tuple(chunk_sizes), frozenset(fused_sizes), tuple(cached_block_dims))
 
     def hinv_jt_chunk_size(self, size: int) -> int | None:
         """Return the tiled H-inverse chunk size for a response group."""
@@ -470,6 +493,17 @@ class _FeatherPGSExecutionPlan:
     def use_fused_hinv_jt(self, size: int) -> bool:
         """Return whether a response group may fuse H-inverse and Delassus."""
         return size in self.hinv_jt_fused_sizes
+
+    def cached_hinv_jt_block_dim(self, size: int) -> int | None:
+        """Return the cached-inverse response block size, if selected."""
+        for planned_size, block_dim in self.hinv_jt_cached_block_dims:
+            if planned_size == size:
+                return block_dim
+        return None
+
+    def use_cached_hinv_jt(self, size: int) -> bool:
+        """Return whether a response group reuses an explicit inverse."""
+        return self.cached_hinv_jt_block_dim(size) is not None
 
 
 class SolverFeatherPGS(SolverBase):
@@ -1383,6 +1417,14 @@ class SolverFeatherPGS(SolverBase):
             hinv_jt_kernel=self.hinv_jt_kernel,
             small_dof_threshold=self.small_dof_threshold,
             tile_threads=self.tile_threads,
+            articulation_counts=self.n_arts_by_size,
+            allow_cached_inverse=(
+                model.device.is_cuda
+                and self.pgs_mode == "matrix_free"
+                and not self._preelim_active
+                and self.update_mass_matrix_interval > 1
+            ),
+            max_threads_per_block=int(getattr(model.device, "max_threads_per_block", 1024)),
         )
         self._hinv_jt_computes_diag = self.pgs_mode == "matrix_free" and not self._preelim_active
         self._hinv_jt_diag_sizes = frozenset(
@@ -2849,6 +2891,7 @@ class SolverFeatherPGS(SolverBase):
     def _allocate_buffers(self, model):
         if not self.size_groups:
             self.H_by_size = {}
+            self.H_inv_by_size = {}
             self.L_by_size = {}
             self.J_by_size = {}
             self.Y_by_size = {}
@@ -2866,6 +2909,7 @@ class SolverFeatherPGS(SolverBase):
         max_constraints = self.dense_max_constraints
 
         self.L_by_size = {}
+        self.H_inv_by_size = {}
         self.Y_by_size = {}
         self.diag_by_size = {}
         self._dummy_hinv_diag = wp.zeros((1, 1), dtype=wp.float32, device=device, requires_grad=requires_grad)
@@ -2900,6 +2944,8 @@ class SolverFeatherPGS(SolverBase):
             self.L_by_size[size] = wp.zeros(
                 (n_arts, h_dim, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
             )
+            if self._execution_plan.use_cached_hinv_jt(size):
+                self.H_inv_by_size[size] = wp.zeros_like(self.L_by_size[size], requires_grad=requires_grad)
 
             self.Y_by_size[size] = wp.zeros(
                 (n_arts, j_rows, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
@@ -3791,7 +3837,9 @@ class SolverFeatherPGS(SolverBase):
         device_arch = model.device.arch
         self._cholesky_kernels_by_size = {}
         self._triangular_solve_kernels_by_size = {}
+        self._hinv_kernels_by_size = {}
         self._hinv_jt_kernels_by_size = {}
+        self._hinv_jt_cached_kernels_by_size = {}
         self._hinv_jt_chunk_count_by_size = {}
         self._hinv_jt_fused_kernels_by_size = {}
         self._delassus_kernels_by_size = {}
@@ -3802,30 +3850,49 @@ class SolverFeatherPGS(SolverBase):
                 size, device_arch, self.tile_threads
             )
             if self.dense_max_constraints <= 0:
+                self._hinv_kernels_by_size[size] = None
                 self._hinv_jt_kernels_by_size[size] = None
+                self._hinv_jt_cached_kernels_by_size[size] = None
                 self._hinv_jt_chunk_count_by_size[size] = 0
                 self._hinv_jt_fused_kernels_by_size[size] = None
                 self._delassus_kernels_by_size[size] = None
                 continue
 
-            hinv_jt_chunk_size = self._execution_plan.hinv_jt_chunk_size(size)
-            if hinv_jt_chunk_size is None:
-                self._hinv_jt_kernels_by_size[size] = None
-                self._hinv_jt_chunk_count_by_size[size] = 0
-            else:
-                self._hinv_jt_chunk_count_by_size[size] = (
-                    self.dense_max_constraints + hinv_jt_chunk_size - 1
-                ) // hinv_jt_chunk_size
-                self._hinv_jt_kernels_by_size[size] = _get_hinv_jt_kernel(
+            cached_block_dim = self._execution_plan.cached_hinv_jt_block_dim(size)
+            if cached_block_dim is not None:
+                self._hinv_kernels_by_size[size] = _get_hinv_kernel(size, device_arch, self.tile_threads)
+                self._hinv_jt_cached_kernels_by_size[size] = _get_hinv_jt_cached_kernel(
                     size,
                     self.dense_max_constraints,
                     device_arch,
-                    self.tile_threads,
-                    constraint_chunk_size=hinv_jt_chunk_size,
+                    cached_block_dim,
                     write_world=self._hinv_jt_writes_world,
                     write_group=self._hinv_jt_tiled_writes_group,
                     compute_diag=self._hinv_jt_computes_diag,
                 )
+                self._hinv_jt_kernels_by_size[size] = None
+                self._hinv_jt_chunk_count_by_size[size] = 0
+            else:
+                self._hinv_kernels_by_size[size] = None
+                self._hinv_jt_cached_kernels_by_size[size] = None
+                hinv_jt_chunk_size = self._execution_plan.hinv_jt_chunk_size(size)
+                if hinv_jt_chunk_size is None:
+                    self._hinv_jt_kernels_by_size[size] = None
+                    self._hinv_jt_chunk_count_by_size[size] = 0
+                else:
+                    self._hinv_jt_chunk_count_by_size[size] = (
+                        self.dense_max_constraints + hinv_jt_chunk_size - 1
+                    ) // hinv_jt_chunk_size
+                    self._hinv_jt_kernels_by_size[size] = _get_hinv_jt_kernel(
+                        size,
+                        self.dense_max_constraints,
+                        device_arch,
+                        self.tile_threads,
+                        constraint_chunk_size=hinv_jt_chunk_size,
+                        write_world=self._hinv_jt_writes_world,
+                        write_group=self._hinv_jt_tiled_writes_group,
+                        compute_diag=self._hinv_jt_computes_diag,
+                    )
             self._hinv_jt_fused_kernels_by_size[size] = (
                 _get_hinv_jt_fused_kernel(size, self.dense_max_constraints, device_arch, self.tile_threads)
                 if self._execution_plan.use_fused_hinv_jt(size)
@@ -6951,6 +7018,7 @@ class SolverFeatherPGS(SolverBase):
             block_dim=self.tile_threads,
             device=model.device,
         )
+        self._stage2_refresh_hinv(size)
 
     def _stage2_cholesky_loop(self, size: int):
         model = self.model
@@ -6967,6 +7035,20 @@ class SolverFeatherPGS(SolverBase):
             ],
             outputs=[self.L_by_size[size]],
             device=model.device,
+        )
+        self._stage2_refresh_hinv(size)
+
+    def _stage2_refresh_hinv(self, size: int):
+        hinv_kernel = self._hinv_kernels_by_size[size]
+        if hinv_kernel is None:
+            return
+        wp.launch_tiled(
+            hinv_kernel,
+            dim=[self.n_arts_by_size[size]],
+            inputs=[self.L_by_size[size], self.group_to_art[size], self.mass_update_mask],
+            outputs=[self.H_inv_by_size[size]],
+            block_dim=self.tile_threads,
+            device=self.model.device,
         )
 
     def _stage3_zero_qdd(self, state_aug: State):
@@ -7975,6 +8057,34 @@ class SolverFeatherPGS(SolverBase):
     def _stage4_hinv_jt_tiled(self, size: int):
         model = self.model
         n_arts = self.n_arts_by_size[size]
+        cached_kernel = self._hinv_jt_cached_kernels_by_size[size]
+        if cached_kernel is not None:
+            block_dim = self._execution_plan.cached_hinv_jt_block_dim(size)
+            if block_dim is None:
+                raise RuntimeError(f"Cached H^-1 J^T launch is unavailable for DOF size {size}")
+            J_world = self.J_world if self.J_world is not None else self.J_by_size[size]
+            Y_world = self.Y_world if self.Y_world is not None else self.Y_by_size[size]
+            world_dof_offset = (
+                self.articulation_world_dof_offset if self._hinv_jt_writes_world else self.group_to_art[size]
+            )
+            wp.launch_tiled(
+                cached_kernel,
+                dim=[n_arts],
+                inputs=[
+                    self.H_inv_by_size[size],
+                    self.J_by_size[size],
+                    self.group_to_art[size],
+                    self.art_to_world,
+                    world_dof_offset,
+                    self.constraint_count,
+                    self.max_world_dofs,
+                ],
+                outputs=[self.Y_by_size[size], J_world, Y_world, self.diag_by_size[size]],
+                block_dim=block_dim,
+                device=model.device,
+            )
+            return
+
         hinv_jt_kernel = self._hinv_jt_kernels_by_size[size]
         J_world = self.J_world if self.J_world is not None else self.J_by_size[size]
         Y_world = self.Y_world if self.Y_world is not None else self.Y_by_size[size]
@@ -9300,6 +9410,164 @@ class SolverFeatherPGS(SolverBase):
             self._remove_free_root_transport(state_in, state_aug)
             wp.copy(state_out.joint_qd, self.v_out)
             eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+
+
+@cache
+def _get_hinv_kernel(n_dofs: int, device_arch: str, tile_threads: int = 64) -> "wp.Kernel":
+    """Build a masked tiled kernel computing H^-1 from its Cholesky factor."""
+    tile_dofs = wp.constant(int(n_dofs))
+
+    def hinv_template(
+        L_group: wp.array3d[float],
+        group_to_art: wp.array[int],
+        mass_update_mask: wp.array[int],
+        H_inv_group: wp.array3d[float],
+    ):
+        idx = wp.tid()
+        art = group_to_art[idx]
+        if mass_update_mask[art] == 0:
+            return
+
+        L_tile = wp.tile_load(L_group[idx], shape=(tile_dofs, tile_dofs), bounds_check=False)
+        zero_tile = wp.tile_zeros(shape=(tile_dofs, tile_dofs), dtype=wp.float32)
+        one_tile = wp.tile_ones(shape=(tile_dofs,), dtype=wp.float32)
+        identity_tile = wp.tile_diag_add(zero_tile, one_tile)
+        z_tile = wp.tile_lower_solve(L_tile, identity_tile)
+        H_inv_tile = wp.tile_upper_solve(wp.tile_transpose(L_tile), z_tile)
+        wp.tile_store(H_inv_group[idx], H_inv_tile)
+
+    hinv_template.__name__ = f"hinv_from_cholesky_{n_dofs}_bd{tile_threads}"
+    hinv_template.__qualname__ = hinv_template.__name__
+    return wp.kernel(enable_backward=False, module="unique")(hinv_template)
+
+
+@cache
+def _get_hinv_jt_cached_kernel(
+    n_dofs: int,
+    max_constraints: int,
+    device_arch: str,
+    block_dim: int,
+    *,
+    write_world: bool,
+    write_group: bool,
+    compute_diag: bool,
+) -> "wp.Kernel":
+    """Build a cached-inverse response kernel with one subgroup per active row."""
+    group_width = 8 if n_dofs <= 8 else 16 if n_dofs <= 16 else 32
+    groups_per_block = block_dim // group_width
+    if group_width == 32:
+        group_mask = "0xffffffffu"
+    else:
+        group_mask = f"(((1u << {group_width}) - 1u) << ((t & 31) / {group_width} * {group_width}))"
+    reduction = "\n".join(
+        f"    diag_part += __shfl_down_sync(group_mask, diag_part, {offset}, GROUP_WIDTH);"
+        for offset in (16, 8, 4, 2, 1)
+        if offset < group_width
+    )
+    snippet = f"""
+#if defined(__CUDA_ARCH__)
+const int D = {n_dofs};
+const int M = {max_constraints};
+const int WRITE_WORLD = {int(write_world)};
+const int WRITE_GROUP = {int(write_group)};
+const int COMPUTE_DIAG = {int(compute_diag)};
+const int GROUP_WIDTH = {group_width};
+const int GROUPS = {groups_per_block};
+const int t = threadIdx.x;
+const int lane = t & (GROUP_WIDTH - 1);
+const int group = t / GROUP_WIDTH;
+const unsigned group_mask = {group_mask};
+const int art = group_to_art.data[idx];
+const int world = art_to_world.data[art];
+const int m = world_constraint_count.data[world];
+
+__shared__ float s_H_inv[D * D];
+for (int e = t; e < D * D; e += blockDim.x)
+    s_H_inv[e] = H_inv_group.data[idx * D * D + e];
+__syncthreads();
+
+for (int row = group; row < m; row += GROUPS) {{
+    float j = 0.0f;
+    if (lane < D)
+        j = J_group.data[(idx * M + row) * D + lane];
+
+    float y = 0.0f;
+    for (int k = 0; k < D; ++k) {{
+        const float j_k = __shfl_sync(group_mask, j, k, GROUP_WIDTH);
+        if (lane < D && j_k != 0.0f)
+            y += s_H_inv[lane * D + k] * j_k;
+    }}
+    if (lane < D) {{
+        if (WRITE_GROUP != 0)
+            Y_group.data[(idx * M + row) * D + lane] = y;
+        if (WRITE_WORLD != 0) {{
+            const int dof_offset = articulation_world_dof_offset.data[art];
+            J_world.data[(world * M + row) * max_world_dofs + dof_offset + lane] = j;
+            Y_world.data[(world * M + row) * max_world_dofs + dof_offset + lane] = y;
+        }}
+    }}
+
+    if (COMPUTE_DIAG != 0) {{
+        float diag_part = j * y;
+{reduction}
+        if (lane == 0)
+            diag_group.data[idx * M + row] = diag_part;
+    }}
+}}
+#endif
+"""
+
+    @wp.func_native(snippet)
+    def hinv_jt_cached_native(
+        idx: int,
+        H_inv_group: wp.array3d[float],
+        J_group: wp.array3d[float],
+        group_to_art: wp.array[int],
+        art_to_world: wp.array[int],
+        articulation_world_dof_offset: wp.array[int],
+        world_constraint_count: wp.array[int],
+        max_world_dofs: int,
+        Y_group: wp.array3d[float],
+        J_world: wp.array3d[float],
+        Y_world: wp.array3d[float],
+        diag_group: wp.array2d[float],
+    ): ...
+
+    def hinv_jt_cached_template(
+        H_inv_group: wp.array3d[float],
+        J_group: wp.array3d[float],
+        group_to_art: wp.array[int],
+        art_to_world: wp.array[int],
+        articulation_world_dof_offset: wp.array[int],
+        world_constraint_count: wp.array[int],
+        max_world_dofs: int,
+        Y_group: wp.array3d[float],
+        J_world: wp.array3d[float],
+        Y_world: wp.array3d[float],
+        diag_group: wp.array2d[float],
+    ):
+        idx, _lane = wp.tid()
+        hinv_jt_cached_native(
+            idx,
+            H_inv_group,
+            J_group,
+            group_to_art,
+            art_to_world,
+            articulation_world_dof_offset,
+            world_constraint_count,
+            max_world_dofs,
+            Y_group,
+            J_world,
+            Y_world,
+            diag_group,
+        )
+
+    suffix = "_world" if write_world else ""
+    suffix += "_nogroup" if not write_group else ""
+    suffix += "_diag" if compute_diag else ""
+    hinv_jt_cached_template.__name__ = f"hinv_jt_cached_{n_dofs}_{max_constraints}_g{group_width}_bd{block_dim}{suffix}"
+    hinv_jt_cached_template.__qualname__ = hinv_jt_cached_template.__name__
+    return wp.kernel(enable_backward=False, module="unique")(hinv_jt_cached_template)
 
 
 @cache

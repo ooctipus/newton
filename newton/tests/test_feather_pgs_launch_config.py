@@ -11,6 +11,9 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _DENSE_META_MAX_PARENT,
     _DENSE_META_ROW_TYPE_MASK,
     _FeatherPGSExecutionPlan,
+    _get_hinv_jt_cached_kernel,
+    _get_hinv_jt_kernel,
+    _get_hinv_kernel,
     _select_hinv_jt_chunk_size,
     _use_resident_mfgs_metadata,
     _validate_dense_metadata_encoding,
@@ -172,6 +175,114 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         """Cap compact articulation chunks without restricting larger groups."""
         self.assertEqual(_select_hinv_jt_chunk_size(20, 384, 101376, 64), 32)
         self.assertEqual(_select_hinv_jt_chunk_size(21, 384, 101376, 64), 64)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "cached H-inverse response requires CUDA")
+    def test_cached_hinv_matches_tiled_response(self):
+        """Match tiled responses and preserve inverses across masked refreshes."""
+        device = wp.get_device()
+        rng = np.random.default_rng(41)
+        articulation_count = 4
+        max_constraints = 16
+        counts_np = np.array([16, 13, 7, 1], dtype=np.int32)
+
+        for n_dofs in (14, 23):
+            with self.subTest(n_dofs=n_dofs):
+                factors = rng.normal(size=(articulation_count, n_dofs, n_dofs)).astype(np.float32)
+                mass = factors @ np.transpose(factors, (0, 2, 1))
+                mass += np.eye(n_dofs, dtype=np.float32)[None, :, :] * 2.0
+                cholesky = wp.array(np.linalg.cholesky(mass).astype(np.float32), device=device)
+
+                jacobian_np = np.zeros((articulation_count, max_constraints, n_dofs), dtype=np.float32)
+                for art, count in enumerate(counts_np):
+                    for row in range(int(count)):
+                        columns = rng.choice(n_dofs, size=3, replace=False)
+                        jacobian_np[art, row, columns] = rng.normal(size=len(columns))
+
+                jacobian = wp.array(jacobian_np, device=device)
+                group_to_art = wp.array(np.arange(articulation_count, dtype=np.int32), device=device)
+                art_to_world = wp.array(np.arange(articulation_count, dtype=np.int32), device=device)
+                dof_offsets = wp.zeros(articulation_count, dtype=wp.int32, device=device)
+                counts = wp.array(counts_np, device=device)
+                update_mask = wp.ones(articulation_count, dtype=wp.int32, device=device)
+                cached_inverse = wp.zeros_like(cholesky)
+
+                reference_Y_group = wp.zeros_like(jacobian)
+                reference_J_world = wp.zeros_like(jacobian)
+                reference_Y_world = wp.zeros_like(jacobian)
+                reference_diag = wp.zeros((articulation_count, max_constraints), device=device)
+                cached_Y_group = wp.zeros_like(jacobian)
+                cached_J_world = wp.zeros_like(jacobian)
+                cached_Y_world = wp.zeros_like(jacobian)
+                cached_diag = wp.zeros((articulation_count, max_constraints), device=device)
+
+                inverse_kernel = _get_hinv_kernel(n_dofs, str(device.arch), 64)
+                reference_kernel = _get_hinv_jt_kernel(
+                    n_dofs,
+                    max_constraints,
+                    str(device.arch),
+                    64,
+                    constraint_chunk_size=8,
+                    write_world=True,
+                    write_group=False,
+                    compute_diag=True,
+                )
+                cached_kernel = _get_hinv_jt_cached_kernel(
+                    n_dofs,
+                    max_constraints,
+                    str(device.arch),
+                    1024,
+                    write_world=True,
+                    write_group=False,
+                    compute_diag=True,
+                )
+
+                wp.launch_tiled(
+                    inverse_kernel,
+                    dim=[articulation_count],
+                    inputs=[cholesky, group_to_art, update_mask],
+                    outputs=[cached_inverse],
+                    block_dim=64,
+                    device=device,
+                )
+                wp.launch_tiled(
+                    reference_kernel,
+                    dim=[articulation_count, max_constraints // 8],
+                    inputs=[cholesky, jacobian, group_to_art, art_to_world, dof_offsets, counts],
+                    outputs=[reference_Y_group, reference_J_world, reference_Y_world, reference_diag],
+                    block_dim=64,
+                    device=device,
+                )
+                wp.launch_tiled(
+                    cached_kernel,
+                    dim=[articulation_count],
+                    inputs=[
+                        cached_inverse,
+                        jacobian,
+                        group_to_art,
+                        art_to_world,
+                        dof_offsets,
+                        counts,
+                        n_dofs,
+                    ],
+                    outputs=[cached_Y_group, cached_J_world, cached_Y_world, cached_diag],
+                    block_dim=1024,
+                    device=device,
+                )
+
+                np.testing.assert_array_equal(cached_J_world.numpy(), reference_J_world.numpy())
+                np.testing.assert_allclose(cached_Y_world.numpy(), reference_Y_world.numpy(), rtol=2.0e-5, atol=2.0e-6)
+                np.testing.assert_allclose(cached_diag.numpy(), reference_diag.numpy(), rtol=2.0e-5, atol=2.0e-6)
+
+                inverse_before_skip = cached_inverse.numpy()
+                wp.launch_tiled(
+                    inverse_kernel,
+                    dim=[articulation_count],
+                    inputs=[cholesky, group_to_art, wp.zeros_like(update_mask)],
+                    outputs=[cached_inverse],
+                    block_dim=64,
+                    device=device,
+                )
+                np.testing.assert_array_equal(cached_inverse.numpy(), inverse_before_skip)
 
     def test_dense_metadata_encoding_bounds(self):
         _validate_dense_metadata_encoding(32)
