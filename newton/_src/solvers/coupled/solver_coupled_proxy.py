@@ -1115,7 +1115,7 @@ class SolverCoupledProxy(SolverCoupled):
             if world_mask is None:
                 config.collide_counter = 0
             if config.pipeline is not None:
-                self._reset_collision_provider_contact_matching(config.pipeline, world_mask)
+                self._reset_collision_provider_contact_history(config.pipeline, world_mask)
             if world_mask is None and config.contacts is not None:
                 config.contacts.clear(bump_generation=True)
 

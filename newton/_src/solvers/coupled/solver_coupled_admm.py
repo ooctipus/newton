@@ -1777,7 +1777,7 @@ class SolverCoupledADMM(SolverCoupled):
         """Clear ADMM warm-start and internal contact buffers after reset."""
         super()._reset_coupling_state(state, world_mask=world_mask, flags=flags)
         if self._admm_collision_pipeline is not None:
-            self._reset_collision_provider_contact_matching(self._admm_collision_pipeline, world_mask)
+            self._reset_collision_provider_contact_history(self._admm_collision_pipeline, world_mask)
         if world_mask is not None:
             self._reset_admm_history(world_mask)
             return

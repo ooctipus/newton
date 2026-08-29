@@ -1122,6 +1122,34 @@ class TestSolverCoupledBasic(unittest.TestCase):
                 entries=[SolverCoupled.Entry(name="unsupported", solver=SolverBase, bodies=[0])],
             )
 
+    def test_collision_provider_reset_prefers_all_contact_history(self):
+        """Invalidate every temporal contact cache while retaining legacy providers."""
+
+        class Provider:
+            def __init__(self):
+                self.calls = []
+
+            def reset_contact_history(self, world_mask):
+                self.calls.append(("history", world_mask))
+
+            def reset_contact_matching(self, world_mask):
+                self.calls.append(("matching", world_mask))
+
+        class LegacyProvider:
+            def __init__(self):
+                self.calls = []
+
+            def reset_contact_matching(self, world_mask):
+                self.calls.append(("matching", world_mask))
+
+        provider = Provider()
+        legacy_provider = LegacyProvider()
+        SolverCoupled._reset_collision_provider_contact_history(provider, None)
+        SolverCoupled._reset_collision_provider_contact_history(legacy_provider, None)
+
+        self.assertEqual(provider.calls, [("history", None)])
+        self.assertEqual(legacy_provider.calls, [("matching", None)])
+
     def test_entry_contacts_preserves_contact_matching_mode(self):
         """Preserve matching mode metadata when coupled entry buffers are reused."""
         coupled = SolverCoupled(

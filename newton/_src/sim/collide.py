@@ -21,6 +21,7 @@ from ..geometry.contact_data import (
     prepare_speculative_contact,
 )
 from ..geometry.contact_match import ContactMatcher
+from ..geometry.contact_replay import SDFContactReplay
 from ..geometry.contact_sort import ContactSorter
 from ..geometry.differentiable_contacts import launch_differentiable_contact_augment
 from ..geometry.flags import ShapeFlags
@@ -1131,6 +1132,7 @@ class CollisionPipeline:
         verify_buffers: bool = True,
         contact_reduction_hashtable_size_factor: float = 0.25,
         speculative_config: SpeculativeContactConfig | None = None,
+        sdf_contact_replay_max: int = 0,
     ):
         """
         Initialize the CollisionPipeline (expert API).
@@ -1244,6 +1246,12 @@ class CollisionPipeline:
                 collision-update horizon. See
                 :ref:`Speculative contacts <speculative-contacts>` and
                 :class:`SpeculativeContactConfig`.
+            sdf_contact_replay_max: Maximum final contact rows cached for exact
+                replay of unchanged sleeping dynamic-kinematic SDF pairs. Zero
+                disables replay. Cache overflow falls back to full contact
+                generation on the next pass. Replay is active only after
+                :meth:`configure_sleep_filter` binds solver sleep state.
+                Defaults to zero.
 
         .. experimental::
 
@@ -1267,6 +1275,10 @@ class CollisionPipeline:
         matching_sticky = contact_matching == "sticky"
         if contact_report and not matching_enabled:
             raise ValueError('contact_report=True requires contact_matching != "disabled"')
+        if sdf_contact_replay_max < 0:
+            raise ValueError(f"sdf_contact_replay_max must be non-negative, got {sdf_contact_replay_max}")
+        if sdf_contact_replay_max > 0 and not reduce_contacts:
+            raise ValueError("sdf_contact_replay_max requires reduce_contacts=True")
 
         # Any non-disabled matching mode implies deterministic sorting.
         if matching_enabled:
@@ -1283,6 +1295,8 @@ class CollisionPipeline:
         shape_count = model.shape_count
         device = model.device
         using_expert_components = broad_phase_instance is not None or narrow_phase is not None
+        if sdf_contact_replay_max > 0 and using_expert_components:
+            raise ValueError("sdf_contact_replay_max does not support expert broad-phase or narrow-phase components")
 
         # Resolve rigid contact capacity with explicit > model > estimated precedence.
         if rigid_contact_max is None:
@@ -1593,6 +1607,11 @@ class CollisionPipeline:
                 self._shape_angular_velocity = wp.zeros(shape_count, dtype=wp.vec3, device=device)
                 self._shape_search_gap = wp.zeros(shape_count, dtype=wp.float32, device=device)
                 self._shape_displacement = wp.zeros(shape_count, dtype=wp.vec3, device=device)
+            elif sdf_contact_replay_max > 0:
+                self._shape_linear_velocity = wp.zeros(shape_count, dtype=wp.vec3, device=device)
+                self._shape_angular_velocity = wp.zeros(shape_count, dtype=wp.vec3, device=device)
+                self._shape_search_gap = wp.empty(0, dtype=wp.float32, device=device)
+                self._shape_displacement = wp.empty(0, dtype=wp.vec3, device=device)
             else:
                 self._shape_linear_velocity = wp.empty(0, dtype=wp.vec3, device=device)
                 self._shape_angular_velocity = wp.empty(0, dtype=wp.vec3, device=device)
@@ -1677,6 +1696,17 @@ class CollisionPipeline:
         else:
             self._contact_matcher = None
 
+        if sdf_contact_replay_max > 0:
+            if self.narrow_phase.global_contact_reducer is None:
+                raise ValueError("sdf_contact_replay_max requires global contact reduction")
+            if self.narrow_phase.shape_pairs_mesh_mesh is None or self.narrow_phase.shape_pairs_mesh_mesh_count is None:
+                raise ValueError("sdf_contact_replay_max requires mesh-mesh collision buffers")
+            if self.hydroelastic_sdf is not None:
+                raise ValueError("sdf_contact_replay_max does not support hydroelastic contacts")
+            self._sdf_contact_replay = SDFContactReplay(shape_count, sdf_contact_replay_max, device)
+        else:
+            self._sdf_contact_replay = None
+
     @property
     def rigid_contact_max(self) -> int:
         """Maximum rigid contact buffer capacity used by this pipeline."""
@@ -1749,7 +1779,7 @@ class CollisionPipeline:
         self._tree_asleep = tree_asleep
 
     def reset_contact_matching(self, world_mask: wp.array[wp.bool] | None = None) -> None:
-        """Clear all or reset-selected previous-frame contact history.
+        """Clear all or reset-selected contact-matching history.
 
         Masked selections accumulate until the next :meth:`collide` call
         consumes them.
@@ -1760,7 +1790,7 @@ class CollisionPipeline:
             world_mask: Optional one-dimensional Warp boolean mask on the
                 model device with shape ``(model.world_count + 1,)``. The final
                 entry selects global entities whose world index is ``-1``. If
-                ``None``, clear all previous-frame contact history immediately.
+                ``None``, clear all contact-matching history immediately.
         """
         world_mask = normalize_reset_world_mask(
             world_mask,
@@ -1769,6 +1799,58 @@ class CollisionPipeline:
         )
         if self._contact_matcher is not None:
             self._contact_matcher.reset(world_mask)
+
+    def reset_contact_history(self, world_mask: wp.array[wp.bool] | None = None) -> None:
+        """Clear all or reset-selected temporal collision history.
+
+        This resets contact matching and SDF contact replay through one episode-
+        reset boundary. Masked selections accumulate until the next
+        :meth:`collide` call consumes them.
+
+        .. experimental::
+
+        Args:
+            world_mask: Optional one-dimensional Warp boolean mask on the
+                model device with shape ``(model.world_count + 1,)``. The final
+                entry selects global entities whose world index is ``-1``. If
+                ``None``, clear all temporal collision history immediately.
+        """
+        world_mask = normalize_reset_world_mask(
+            world_mask,
+            world_count=int(self.model.world_count),
+            device=self.model.device,
+        )
+        if self._contact_matcher is not None:
+            self._contact_matcher.reset(world_mask)
+        if self._sdf_contact_replay is not None:
+            self._sdf_contact_replay.reset(self.model.shape_world, int(self.model.world_count), world_mask)
+
+    def reset_sdf_contact_replay(self, world_mask: wp.array[wp.bool] | None = None) -> None:
+        """Invalidate all or reset-selected SDF contact replay history.
+
+        Per-shape poses and scalar collision configuration are checked every
+        pass. Call :meth:`reset_contact_history` with ``world_mask=None`` after
+        mutating shared finalized mesh vertices, indices, descriptors,
+        acceleration structures, SDF texture contents, or global
+        collision-pair/filter topology in place. When contact matching is
+        disabled, this method alone is sufficient. A partial mask is safe only
+        for resources owned exclusively by the selected worlds. Rebuild the
+        collision pipeline when an array changes size.
+
+        .. experimental::
+
+        Args:
+            world_mask: Optional one-dimensional Warp boolean mask on the
+                model device with shape ``(model.world_count + 1,)``. The final
+                entry selects global entities whose world index is ``-1``.
+        """
+        world_mask = normalize_reset_world_mask(
+            world_mask,
+            world_count=int(self.model.world_count),
+            device=self.model.device,
+        )
+        if self._sdf_contact_replay is not None:
+            self._sdf_contact_replay.reset(self.model.shape_world, int(self.model.world_count), world_mask)
 
     @staticmethod
     def _build_excluded_pairs(model: Model) -> wp.array[wp.vec2i] | None:
@@ -1854,6 +1936,9 @@ class CollisionPipeline:
             max_speculative_extension = 0.0
             speculative_active = False
             search_gap = model.shape_gap
+        replay_active = self._sdf_contact_replay is not None and self._shape_sleep_index is not None
+        if replay_active and contacts.per_contact_shape_properties:
+            raise ValueError("sdf_contact_replay_max does not support per-contact shape properties")
 
         # Rigid contact detection -- broad phase + narrow phase.
         # These kernels hardcode record_tape=False internally so they are
@@ -1920,6 +2005,34 @@ class CollisionPipeline:
                 ],
                 device=self.device,
                 record_tape=False,
+            )
+
+        if replay_active:
+            self._sdf_contact_replay.classify(
+                shape_data=self.geom_data,
+                shape_transform=self.geom_transform,
+                shape_source=model.shape_source_ptr,
+                shape_type=model.shape_type,
+                shape_mesh_properties=model._shape_mesh_properties,
+                shape_sdf_index=model._shape_sdf_index,
+                shape_edge_range=model.shape_edge_range,
+                shape_voxel_resolution=model._shape_voxel_resolution,
+                shape_collision_aabb_lower=model.shape_collision_aabb_lower,
+                shape_collision_aabb_upper=model.shape_collision_aabb_upper,
+                shape_body=model.shape_body,
+                shape_sleep_index=self._shape_sleep_index,
+                body_q=state.body_q,
+                body_flags=model.body_flags,
+                shape_flags=model.shape_flags,
+                shape_world=model.shape_world,
+                shape_collision_group=model.shape_collision_group,
+                shape_gap=search_gap,
+                shape_base_gap=model.shape_gap,
+                shape_collision_radius=model.shape_collision_radius,
+                shape_linear_velocity=self._shape_linear_velocity,
+                shape_angular_velocity=self._shape_angular_velocity,
+                collision_update_dt=collision_update_dt,
+                max_speculative_extension=max_speculative_extension,
             )
 
         # Run broad phase (AABBs are already expanded by effective gaps, so pass None)
@@ -2014,6 +2127,20 @@ class CollisionPipeline:
         writer_data.shape_angular_velocity = self._shape_angular_velocity
         writer_data.collision_update_dt = collision_update_dt
         writer_data.max_speculative_extension = max_speculative_extension
+        if replay_active:
+            replay_rows = self._sdf_contact_replay.make_rows(contacts, self._sort_key_array)
+            self._sdf_contact_replay.replay_and_mask(
+                output=replay_rows,
+                output_tids=contacts.rigid_contact_tids,
+                candidate_pairs=self.broad_phase_shape_pairs,
+                candidate_pair_count=self.broad_phase_pair_count,
+                shape_type=model.shape_type,
+                shape_sdf_index=model._shape_sdf_index,
+                shape_edge_range=model.shape_edge_range,
+                shape_flags=model.shape_flags,
+                shape_sleep_index=self._shape_sleep_index,
+                tree_asleep=self._tree_asleep,
+            )
         # Run narrow phase with custom contact writer (writes directly to Contacts format)
         self.narrow_phase.launch_custom_write(
             candidate_pair=self.broad_phase_shape_pairs,
@@ -2155,6 +2282,28 @@ class CollisionPipeline:
                 shape_body=model.shape_body,
                 device=self.device,
                 **sticky_offsets,
+            )
+
+        if replay_active:
+            replay_sort_keys = (
+                self._contact_sorter.sorted_keys_view if self._contact_sorter is not None else self._sort_key_array
+            )
+            replay_rows = self._sdf_contact_replay.make_rows(contacts, replay_sort_keys)
+            reducer = self.narrow_phase.global_contact_reducer
+            self._sdf_contact_replay.save(
+                output=replay_rows,
+                broad_phase_pair_count=self.broad_phase_pair_count,
+                broad_phase_pair_capacity=self.broad_phase_shape_pairs.shape[0],
+                sdf_pair_count=self.narrow_phase.shape_pairs_mesh_mesh_count,
+                sdf_pair_capacity=self.narrow_phase.shape_pairs_mesh_mesh.shape[0],
+                reducer_contact_count=reducer.contact_count,
+                reducer_contact_capacity=reducer.capacity,
+                reducer_insert_failures=reducer.ht_insert_failures,
+                shape_type=model.shape_type,
+                shape_sdf_index=model._shape_sdf_index,
+                shape_edge_range=model.shape_edge_range,
+                shape_flags=model.shape_flags,
+                shape_sleep_index=self._shape_sleep_index,
             )
 
         # Differentiable contact augmentation: reconstruct world-space contact

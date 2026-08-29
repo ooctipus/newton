@@ -2327,11 +2327,15 @@ class SolverCoupled(SolverBase, CouplingInterface):
         del state, world_mask, flags
 
     @staticmethod
-    def _reset_collision_provider_contact_matching(
+    def _reset_collision_provider_contact_history(
         pipeline: object,
         world_mask: wp.array[wp.bool] | None,
     ) -> None:
         """Reset an optional provider's contact history using the shared mask contract."""
+        reset_contact_history = getattr(pipeline, "reset_contact_history", None)
+        if callable(reset_contact_history):
+            reset_contact_history(world_mask)
+            return
         reset_contact_matching = getattr(pipeline, "reset_contact_matching", None)
         if callable(reset_contact_matching):
             reset_contact_matching(world_mask)

@@ -13,6 +13,7 @@ import warp.examples
 import newton
 from newton import GeoType
 from newton._src.geometry import create_mesh_terrain
+from newton._src.geometry.contact_replay import SDFContactReplay
 from newton._src.geometry.flags import MeshProperties, MeshSignMethod, ParticleFlags, ShapeFlags
 from newton._src.geometry.kernels import (
     create_soft_contacts,
@@ -251,6 +252,21 @@ devices = get_cuda_test_devices(mode="basic")
 
 
 class TestCollisionPipeline(unittest.TestCase):
+    def test_sdf_contact_replay_rejects_expert_components(self):
+        """Reject replay when custom collision components can change row semantics."""
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        model = builder.finalize(device="cpu")
+        standard = newton.CollisionPipeline(model, broad_phase="nxn")
+
+        with self.assertRaisesRegex(ValueError, "expert broad-phase or narrow-phase"):
+            newton.CollisionPipeline(
+                model,
+                broad_phase=standard.broad_phase,
+                narrow_phase=standard.narrow_phase,
+                sdf_contact_replay_max=1,
+            )
+
     def test_model_collision_helpers_deprecated(self):
         builder = newton.ModelBuilder()
         builder.add_ground_plane()
@@ -2602,6 +2618,325 @@ def test_sdf_sleep_filter_skips_only_inactive_pairs(test, device):
     test.assertEqual(int(pipeline.narrow_phase.shape_pairs_mesh_mesh_count.numpy()[0]), 0)
 
 
+def _make_sdf_contact_replay_fixture(device, cache_capacity=8):
+    """Build device inputs without requiring CUDA-only texture-SDF creation."""
+    shape_count = 2
+    fixture = {
+        "replay": SDFContactReplay(shape_count, cache_capacity, wp.get_device(device)),
+        "contacts": newton.Contacts(rigid_contact_max=8, soft_contact_max=0, device=device),
+        "shape_data": wp.array([wp.vec4(1.0), wp.vec4(1.0)], dtype=wp.vec4, device=device),
+        "shape_transform": wp.array(
+            [wp.transform_identity(), wp.transform(wp.vec3(0.0, 0.0, 0.9), wp.quat_identity())],
+            dtype=wp.transform,
+            device=device,
+        ),
+        "shape_source": wp.array([11, 12], dtype=wp.uint64, device=device),
+        "shape_type": wp.array([GeoType.MESH, GeoType.MESH], dtype=wp.int32, device=device),
+        "shape_mesh_properties": wp.zeros(shape_count, dtype=wp.int32, device=device),
+        "shape_sdf_index": wp.array([0, 1], dtype=wp.int32, device=device),
+        "shape_edge_range": wp.array([(0, 12), (12, 12)], dtype=wp.vec2i, device=device),
+        "shape_voxel_resolution": wp.array([(16, 16, 16), (16, 16, 16)], dtype=wp.vec3i, device=device),
+        "shape_collision_aabb_lower": wp.array([(-0.5, -0.5, -0.5), (-0.5, -0.5, -0.5)], dtype=wp.vec3, device=device),
+        "shape_collision_aabb_upper": wp.array([(0.5, 0.5, 0.5), (0.5, 0.5, 0.5)], dtype=wp.vec3, device=device),
+        "shape_body": wp.array([0, 1], dtype=wp.int32, device=device),
+        "body_q": wp.array(
+            [wp.transform_identity(), wp.transform(wp.vec3(0.0, 0.0, 0.9), wp.quat_identity())],
+            dtype=wp.transform,
+            device=device,
+        ),
+        "body_flags": wp.array([newton.BodyFlags.DYNAMIC, newton.BodyFlags.KINEMATIC], dtype=wp.int32, device=device),
+        "shape_flags": wp.zeros(shape_count, dtype=wp.int32, device=device),
+        "shape_world": wp.zeros(shape_count, dtype=wp.int32, device=device),
+        "shape_collision_group": wp.ones(shape_count, dtype=wp.int32, device=device),
+        "shape_gap": wp.full(shape_count, value=0.005, dtype=wp.float32, device=device),
+        "shape_base_gap": wp.full(shape_count, value=0.005, dtype=wp.float32, device=device),
+        "shape_collision_radius": wp.zeros(shape_count, dtype=wp.float32, device=device),
+        "shape_linear_velocity": wp.zeros(shape_count, dtype=wp.vec3, device=device),
+        "shape_angular_velocity": wp.zeros(shape_count, dtype=wp.vec3, device=device),
+        "shape_sleep_index": wp.array([(0, 0), (-1, -2)], dtype=wp.vec2i, device=device),
+        "tree_asleep": wp.array([[0]], dtype=wp.int32, device=device),
+        "candidate_pairs": wp.array([(0, 1)], dtype=wp.vec2i, device=device),
+        "candidate_pair_count": wp.array([1], dtype=wp.int32, device=device),
+        "sdf_pair_count": wp.array([1], dtype=wp.int32, device=device),
+        "reducer_contact_count": wp.array([2], dtype=wp.int32, device=device),
+        "reducer_insert_failures": wp.zeros(1, dtype=wp.int32, device=device),
+        "empty_sort_keys": wp.empty(0, dtype=wp.int64, device=device),
+    }
+    return fixture
+
+
+def _classify_sdf_contact_replay(fixture):
+    """Update the fixture's exact per-shape replay signatures."""
+    fixture["replay"].classify(
+        shape_data=fixture["shape_data"],
+        shape_transform=fixture["shape_transform"],
+        shape_source=fixture["shape_source"],
+        shape_type=fixture["shape_type"],
+        shape_mesh_properties=fixture["shape_mesh_properties"],
+        shape_sdf_index=fixture["shape_sdf_index"],
+        shape_edge_range=fixture["shape_edge_range"],
+        shape_voxel_resolution=fixture["shape_voxel_resolution"],
+        shape_collision_aabb_lower=fixture["shape_collision_aabb_lower"],
+        shape_collision_aabb_upper=fixture["shape_collision_aabb_upper"],
+        shape_body=fixture["shape_body"],
+        shape_sleep_index=fixture["shape_sleep_index"],
+        body_q=fixture["body_q"],
+        body_flags=fixture["body_flags"],
+        shape_flags=fixture["shape_flags"],
+        shape_world=fixture["shape_world"],
+        shape_collision_group=fixture["shape_collision_group"],
+        shape_gap=fixture["shape_gap"],
+        shape_base_gap=fixture["shape_base_gap"],
+        shape_collision_radius=fixture["shape_collision_radius"],
+        shape_linear_velocity=fixture["shape_linear_velocity"],
+        shape_angular_velocity=fixture["shape_angular_velocity"],
+        collision_update_dt=0.0,
+        max_speculative_extension=0.0,
+    )
+
+
+def _seed_sdf_contact_replay(fixture):
+    """Seed two deterministic reduced contact rows and save the cache."""
+    contacts = fixture["contacts"]
+    capacity = contacts.rigid_contact_max
+    contacts.rigid_contact_count.assign([2])
+    contacts.rigid_contact_shape0.assign([0, 0] + [0] * (capacity - 2))
+    contacts.rigid_contact_shape1.assign([1, 1] + [0] * (capacity - 2))
+    for name, first, second in (
+        ("rigid_contact_point0", (-0.1, 0.0, 0.5), (0.1, 0.0, 0.5)),
+        ("rigid_contact_point1", (-0.1, 0.0, -0.5), (0.1, 0.0, -0.5)),
+        ("rigid_contact_offset0", (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+        ("rigid_contact_offset1", (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+        ("rigid_contact_normal", (0.0, 0.0, 1.0), (0.0, 0.0, 1.0)),
+    ):
+        getattr(contacts, name).assign([first, second] + [(0.0, 0.0, 0.0)] * (capacity - 2))
+    contacts.rigid_contact_margin0.assign([0.005, 0.006] + [0.0] * (capacity - 2))
+    contacts.rigid_contact_margin1.assign([0.007, 0.008] + [0.0] * (capacity - 2))
+
+    output = fixture["replay"].make_rows(contacts, fixture["empty_sort_keys"])
+    fixture["replay"].save(
+        output=output,
+        broad_phase_pair_count=fixture["candidate_pair_count"],
+        broad_phase_pair_capacity=fixture["candidate_pairs"].shape[0],
+        sdf_pair_count=fixture["sdf_pair_count"],
+        sdf_pair_capacity=1,
+        reducer_contact_count=fixture["reducer_contact_count"],
+        reducer_contact_capacity=8,
+        reducer_insert_failures=fixture["reducer_insert_failures"],
+        shape_type=fixture["shape_type"],
+        shape_sdf_index=fixture["shape_sdf_index"],
+        shape_edge_range=fixture["shape_edge_range"],
+        shape_flags=fixture["shape_flags"],
+        shape_sleep_index=fixture["shape_sleep_index"],
+    )
+
+
+def _replay_sdf_contacts(fixture):
+    """Clear live rows, then attempt replay and candidate-pair masking."""
+    contacts = fixture["contacts"]
+    contacts.rigid_contact_count.zero_()
+    fixture["candidate_pairs"].assign([(0, 1)])
+    output = fixture["replay"].make_rows(contacts, fixture["empty_sort_keys"])
+    fixture["replay"].replay_and_mask(
+        output=output,
+        output_tids=contacts.rigid_contact_tids,
+        candidate_pairs=fixture["candidate_pairs"],
+        candidate_pair_count=fixture["candidate_pair_count"],
+        shape_type=fixture["shape_type"],
+        shape_sdf_index=fixture["shape_sdf_index"],
+        shape_edge_range=fixture["shape_edge_range"],
+        shape_flags=fixture["shape_flags"],
+        shape_sleep_index=fixture["shape_sleep_index"],
+        tree_asleep=fixture["tree_asleep"],
+    )
+
+
+def _copy_rigid_contact_geometry(contacts):
+    """Copy the live reduced geometry fields for exact comparison."""
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    fields = (
+        "rigid_contact_shape0",
+        "rigid_contact_shape1",
+        "rigid_contact_point0",
+        "rigid_contact_point1",
+        "rigid_contact_offset0",
+        "rigid_contact_offset1",
+        "rigid_contact_normal",
+        "rigid_contact_margin0",
+        "rigid_contact_margin1",
+    )
+    return count, {name: getattr(contacts, name).numpy()[:count].copy() for name in fields}
+
+
+def test_sdf_contact_replay_preserves_force_wake_contacts(test, device):
+    """Replay exact support contacts when a sleeping body's force changes before solve."""
+    fixture = _make_sdf_contact_replay_fixture(device)
+    contacts = fixture["contacts"]
+    _classify_sdf_contact_replay(fixture)
+    _seed_sdf_contact_replay(fixture)
+    expected_count, expected_geometry = _copy_rigid_contact_geometry(contacts)
+    test.assertEqual(expected_count, 2)
+
+    body_force = wp.zeros(2, dtype=wp.spatial_vector, device=device)
+    body_force.assign([(0.0, 0.0, 0.0, 10.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)])
+    _classify_sdf_contact_replay(fixture)
+    _replay_sdf_contacts(fixture)
+
+    np.testing.assert_array_equal(fixture["candidate_pairs"].numpy(), [[-1, -1]])
+    actual_count, actual_geometry = _copy_rigid_contact_geometry(contacts)
+    test.assertEqual(actual_count, expected_count)
+    for name, expected in expected_geometry.items():
+        np.testing.assert_array_equal(actual_geometry[name], expected, err_msg=name)
+
+
+def test_sdf_contact_replay_invalidates_changed_inputs(test, device):
+    """Regenerate contacts after pose, collision-config, and explicit reset changes."""
+    fixture = _make_sdf_contact_replay_fixture(device)
+    _classify_sdf_contact_replay(fixture)
+    _seed_sdf_contact_replay(fixture)
+    _classify_sdf_contact_replay(fixture)
+    _replay_sdf_contacts(fixture)
+    test.assertEqual(int(fixture["contacts"].rigid_contact_count.numpy()[0]), 2)
+
+    body_q = fixture["body_q"].numpy()
+    body_q[0, 0] += 0.01
+    fixture["body_q"].assign(body_q)
+    _classify_sdf_contact_replay(fixture)
+    _replay_sdf_contacts(fixture)
+    test.assertEqual(int(fixture["contacts"].rigid_contact_count.numpy()[0]), 0)
+    np.testing.assert_array_equal(fixture["candidate_pairs"].numpy(), [[0, 1]])
+
+    _seed_sdf_contact_replay(fixture)
+    _classify_sdf_contact_replay(fixture)
+    shape_gap = fixture["shape_gap"].numpy()
+    shape_gap[0] += 0.001
+    fixture["shape_gap"].assign(shape_gap)
+    _classify_sdf_contact_replay(fixture)
+    _replay_sdf_contacts(fixture)
+    test.assertEqual(int(fixture["contacts"].rigid_contact_count.numpy()[0]), 0)
+
+    _seed_sdf_contact_replay(fixture)
+    fixture["replay"].reset(fixture["shape_world"], world_count=1, world_mask=None)
+    _classify_sdf_contact_replay(fixture)
+    _replay_sdf_contacts(fixture)
+    test.assertEqual(int(fixture["contacts"].rigid_contact_count.numpy()[0]), 0)
+
+
+def test_sdf_contact_replay_overflow_falls_back(test, device):
+    """Keep full SDF generation when either replay or live output capacity is insufficient."""
+    fixture = _make_sdf_contact_replay_fixture(device, cache_capacity=1)
+    _classify_sdf_contact_replay(fixture)
+    _seed_sdf_contact_replay(fixture)
+    test.assertEqual(int(fixture["replay"].complete.numpy()[0]), 0)
+
+    _classify_sdf_contact_replay(fixture)
+    _replay_sdf_contacts(fixture)
+    test.assertEqual(int(fixture["contacts"].rigid_contact_count.numpy()[0]), 0)
+    np.testing.assert_array_equal(fixture["candidate_pairs"].numpy(), [[0, 1]])
+
+    fixture = _make_sdf_contact_replay_fixture(device)
+    _classify_sdf_contact_replay(fixture)
+    _seed_sdf_contact_replay(fixture)
+    _classify_sdf_contact_replay(fixture)
+    fixture["contacts"] = newton.Contacts(rigid_contact_max=1, soft_contact_max=0, device=device)
+    _replay_sdf_contacts(fixture)
+    test.assertEqual(int(fixture["contacts"].rigid_contact_count.numpy()[0]), 0)
+    np.testing.assert_array_equal(fixture["candidate_pairs"].numpy(), [[0, 1]])
+
+
+def test_sdf_contact_replay_invalidates_sleep_mapping_change(test, device):
+    """Full-scan a pair that becomes eligible after its sleep mapping changes."""
+    fixture = _make_sdf_contact_replay_fixture(device)
+    fixture["shape_sleep_index"].assign([(0, 0), (0, 0)])
+    _classify_sdf_contact_replay(fixture)
+    _seed_sdf_contact_replay(fixture)
+    test.assertEqual(int(fixture["replay"].contact_count.numpy()[0]), 0)
+    test.assertEqual(int(fixture["replay"].complete.numpy()[0]), 1)
+
+    fixture["shape_sleep_index"].assign([(0, 0), (-1, -2)])
+    _classify_sdf_contact_replay(fixture)
+    _replay_sdf_contacts(fixture)
+
+    test.assertEqual(int(fixture["contacts"].rigid_contact_count.numpy()[0]), 0)
+    np.testing.assert_array_equal(fixture["candidate_pairs"].numpy(), [[0, 1]])
+
+
+def test_sdf_contact_replay_invalidates_only_selected_worlds(test, device):
+    """Preserve replay certificates outside a partial episode reset mask."""
+    replay = SDFContactReplay(shape_count=4, contact_capacity=1, device=wp.get_device(device))
+    replay.signature_valid.fill_(1)
+    shape_world = wp.array([0, 0, 1, -1], dtype=wp.int32, device=device)
+
+    replay.reset(
+        shape_world,
+        world_count=2,
+        world_mask=wp.array([True, False, False], dtype=wp.bool, device=device),
+    )
+    np.testing.assert_array_equal(replay.signature_valid.numpy(), [0, 0, 1, 1])
+
+    replay.reset(
+        shape_world,
+        world_count=2,
+        world_mask=wp.array([False, False, True], dtype=wp.bool, device=device),
+    )
+    np.testing.assert_array_equal(replay.signature_valid.numpy(), [0, 0, 1, 0])
+
+
+def test_sdf_contact_replay_pipeline_reuses_unchanged_pair(test, device):
+    """Replay a real reduced SDF manifold and regenerate it after a pose change."""
+    mesh = newton.Mesh.create_box(0.5, 0.5, 0.5, duplicate_vertices=False, compute_inertia=False)
+    mesh.build_sdf(max_resolution=16, device=device)
+
+    builder = newton.ModelBuilder()
+    dynamic_body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()))
+    kinematic_body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.9), wp.quat_identity()))
+    builder.body_flags[kinematic_body] = int(newton.BodyFlags.KINEMATIC)
+    builder.add_shape_mesh(body=dynamic_body, mesh=mesh)
+    builder.add_shape_mesh(body=kinematic_body, mesh=mesh)
+
+    model = builder.finalize(device=device)
+    state = model.state()
+    pipeline = newton.CollisionPipeline(
+        model,
+        broad_phase="sap",
+        rigid_contact_max=256,
+        sdf_contact_replay_max=256,
+    )
+    pipeline.configure_sleep_filter(
+        wp.array([(0, 0), (-1, -2)], dtype=wp.vec2i, device=device),
+        wp.array([[0]], dtype=wp.int32, device=device),
+    )
+    contacts = pipeline.contacts()
+
+    pipeline.collide(state, contacts)
+    test.assertGreater(int(pipeline.narrow_phase.shape_pairs_mesh_mesh_count.numpy()[0]), 0)
+    expected_count, expected_geometry = _copy_rigid_contact_geometry(contacts)
+    test.assertGreater(expected_count, 0)
+    test.assertEqual(int(pipeline._sdf_contact_replay.complete.numpy()[0]), 1)
+
+    body_force = np.zeros((state.body_f.shape[0], 6), dtype=np.float32)
+    body_force[dynamic_body, 3] = 10.0
+    state.body_f.assign(body_force)
+    pipeline.collide(state, contacts)
+    test.assertEqual(int(pipeline.narrow_phase.shape_pairs_mesh_mesh_count.numpy()[0]), 0)
+    actual_count, actual_geometry = _copy_rigid_contact_geometry(contacts)
+    test.assertEqual(actual_count, expected_count)
+    for name, expected in expected_geometry.items():
+        np.testing.assert_array_equal(actual_geometry[name], expected, err_msg=name)
+
+    pipeline.reset_contact_history()
+    pipeline.collide(state, contacts)
+    test.assertGreater(int(pipeline.narrow_phase.shape_pairs_mesh_mesh_count.numpy()[0]), 0)
+    pipeline.collide(state, contacts)
+    test.assertEqual(int(pipeline.narrow_phase.shape_pairs_mesh_mesh_count.numpy()[0]), 0)
+
+    body_q = state.body_q.numpy()
+    body_q[dynamic_body, 0] += 0.01
+    state.body_q.assign(body_q)
+    pipeline.collide(state, contacts)
+    test.assertGreater(int(pipeline.narrow_phase.shape_pairs_mesh_mesh_count.numpy()[0]), 0)
+
+
 def test_deferred_convex_sdf_edges_use_deduplicated_topology(test, device):
     """Finalize deferred convex SDF edges against deduplicated vertices."""
     convex = newton.Mesh.create_box(0.5, 0.5, 0.5, duplicate_vertices=True, compute_inertia=False)
@@ -3654,6 +3989,54 @@ add_function_test(
     TestPlanarSDFRouting,
     "test_sdf_sleep_filter_skips_only_inactive_pairs",
     test_sdf_sleep_filter_skips_only_inactive_pairs,
+    devices=get_cuda_test_devices(),
+    check_output=False,
+)
+
+add_function_test(
+    TestPlanarSDFRouting,
+    "test_sdf_contact_replay_preserves_force_wake_contacts",
+    test_sdf_contact_replay_preserves_force_wake_contacts,
+    devices=["cpu"],
+    check_output=False,
+)
+
+add_function_test(
+    TestPlanarSDFRouting,
+    "test_sdf_contact_replay_invalidates_changed_inputs",
+    test_sdf_contact_replay_invalidates_changed_inputs,
+    devices=["cpu"],
+    check_output=False,
+)
+
+add_function_test(
+    TestPlanarSDFRouting,
+    "test_sdf_contact_replay_overflow_falls_back",
+    test_sdf_contact_replay_overflow_falls_back,
+    devices=["cpu"],
+    check_output=False,
+)
+
+add_function_test(
+    TestPlanarSDFRouting,
+    "test_sdf_contact_replay_invalidates_sleep_mapping_change",
+    test_sdf_contact_replay_invalidates_sleep_mapping_change,
+    devices=["cpu"],
+    check_output=False,
+)
+
+add_function_test(
+    TestPlanarSDFRouting,
+    "test_sdf_contact_replay_invalidates_only_selected_worlds",
+    test_sdf_contact_replay_invalidates_only_selected_worlds,
+    devices=["cpu"],
+    check_output=False,
+)
+
+add_function_test(
+    TestPlanarSDFRouting,
+    "test_sdf_contact_replay_pipeline_reuses_unchanged_pair",
+    test_sdf_contact_replay_pipeline_reuses_unchanged_pair,
     devices=get_cuda_test_devices(),
     check_output=False,
 )
