@@ -3546,7 +3546,14 @@ class SolverFeatherPGS(SolverBase):
             response_end = response_start + int(response_dof_count[articulation])
             ancestor_joint = joint
             response_dofs = []
+            visited_joints: set[int] = set()
             while ancestor_joint >= 0:
+                if ancestor_joint in visited_joints:
+                    raise ValueError(
+                        "SolverFeatherPGS: cyclic joint ancestry while building body response maps "
+                        f"(body {body}, articulation {articulation}, joint {ancestor_joint})."
+                    )
+                visited_joints.add(ancestor_joint)
                 joint_dof_start = int(joint_qd_start[ancestor_joint])
                 joint_dof_end = int(joint_qd_start[ancestor_joint + 1])
                 overlap_start = max(joint_dof_start, response_start)
