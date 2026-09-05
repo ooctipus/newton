@@ -1,0 +1,1 @@
+Probe the normal-bin and voxel hashtable entries of an inner mesh-SDF contact together in the global contact reducer, removing one dependent memory round trip per candidate. Reduced contact output is unchanged; no migration needed.

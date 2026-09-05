@@ -159,6 +159,93 @@ def hashtable_find_or_insert(
     return -1
 
 
+@wp.func
+def hashtable_find_or_insert_pair(
+    key_a: wp.uint64,
+    key_b: wp.uint64,
+    keys: wp.array[wp.uint64],
+    active_slots: wp.array[wp.int32],
+) -> tuple[int, int]:
+    """Find or insert two keys while overlapping their probe loads.
+
+    Behaves like :func:`hashtable_find_or_insert` applied to each key, but the
+    two probe chains advance in lockstep so each probing step issues both key
+    loads before consuming either. Callers that need two entries per contact
+    (normal bin and voxel bin) save one dependent memory round trip.
+
+    Args:
+        key_a: First uint64 key to find or insert
+        key_b: Second uint64 key to find or insert
+        keys: The hash table keys array (length must be power of two)
+        active_slots: Array of size (capacity + 1) tracking active entry indices.
+                      active_slots[capacity] is the count of active entries.
+
+    Returns:
+        ``(entry_a, entry_b)``; each is the entry index (>= 0) or -1 if the table is full
+    """
+    capacity = keys.shape[0]
+    capacity_mask = capacity - 1
+    idx_a = _hashtable_hash(key_a, capacity_mask)
+    idx_b = _hashtable_hash(key_b, capacity_mask)
+    entry_a = int(-1)
+    entry_b = int(-1)
+    done_a = bool(False)
+    done_b = bool(False)
+
+    for _i in range(capacity):
+        stored_a = HASHTABLE_EMPTY_KEY
+        stored_b = HASHTABLE_EMPTY_KEY
+        if not done_a:
+            stored_a = keys[idx_a]
+        if not done_b:
+            stored_b = keys[idx_b]
+
+        if not done_a:
+            if stored_a == key_a:
+                entry_a = idx_a
+                done_a = True
+            elif stored_a == HASHTABLE_EMPTY_KEY:
+                old_key = wp.atomic_cas(keys, idx_a, HASHTABLE_EMPTY_KEY, key_a)
+                if old_key == HASHTABLE_EMPTY_KEY:
+                    active_idx = wp.atomic_add(active_slots, capacity, 1)
+                    if active_idx < capacity:
+                        active_slots[active_idx] = idx_a
+                    entry_a = idx_a
+                    done_a = True
+                elif old_key == key_a:
+                    entry_a = idx_a
+                    done_a = True
+                else:
+                    idx_a = (idx_a + 1) & capacity_mask
+            else:
+                idx_a = (idx_a + 1) & capacity_mask
+
+        if not done_b:
+            if stored_b == key_b:
+                entry_b = idx_b
+                done_b = True
+            elif stored_b == HASHTABLE_EMPTY_KEY:
+                old_key = wp.atomic_cas(keys, idx_b, HASHTABLE_EMPTY_KEY, key_b)
+                if old_key == HASHTABLE_EMPTY_KEY:
+                    active_idx = wp.atomic_add(active_slots, capacity, 1)
+                    if active_idx < capacity:
+                        active_slots[active_idx] = idx_b
+                    entry_b = idx_b
+                    done_b = True
+                elif old_key == key_b:
+                    entry_b = idx_b
+                    done_b = True
+                else:
+                    idx_b = (idx_b + 1) & capacity_mask
+            else:
+                idx_b = (idx_b + 1) & capacity_mask
+
+        if done_a and done_b:
+            break
+
+    return entry_a, entry_b
+
+
 @wp.kernel(enable_backward=False)
 def _hashtable_clear_keys_kernel(
     keys: wp.array[wp.uint64],

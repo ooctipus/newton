@@ -9,7 +9,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.geometry.contact_reduction_global import GlobalContactReducer, reduction_insert_slot
-from newton._src.geometry.hashtable import HashTable
+from newton._src.geometry.hashtable import HashTable, hashtable_find, hashtable_find_or_insert_pair
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 # =============================================================================
@@ -340,6 +340,50 @@ def test_early_exit_optimization(test, device):
     test.assertEqual(values_np[0 * ht.capacity + idx], 999)
 
 
+def test_find_or_insert_pair_matches_single_probe(test, device):
+    """The paired probe must resolve both keys exactly like two single probes."""
+
+    @wp.kernel
+    def pair_insert_kernel(
+        keys: wp.array[wp.uint64],
+        active_slots: wp.array[wp.int32],
+        entries: wp.array[wp.vec2i],
+    ):
+        tid = wp.tid()
+        # Many threads share keys, some pairs repeat a key, and the second key of
+        # even threads equals the first key of odd threads.
+        key_a = wp.uint64(tid % 7 + 1)
+        key_b = wp.uint64(tid % 5 + 3)
+        if tid % 11 == 0:
+            key_b = key_a
+        entry_a, entry_b = hashtable_find_or_insert_pair(key_a, key_b, keys, active_slots)
+        entries[tid] = wp.vec2i(entry_a, entry_b)
+
+    @wp.kernel
+    def single_lookup_kernel(keys: wp.array[wp.uint64], expected: wp.array[wp.vec2i]):
+        tid = wp.tid()
+        key_a = wp.uint64(tid % 7 + 1)
+        key_b = wp.uint64(tid % 5 + 3)
+        if tid % 11 == 0:
+            key_b = key_a
+        expected[tid] = wp.vec2i(hashtable_find(key_a, keys), hashtable_find(key_b, keys))
+
+    count = 2048
+    ht = HashTable(capacity=64, device=device)
+    entries = wp.zeros(count, dtype=wp.vec2i, device=device)
+    expected = wp.zeros(count, dtype=wp.vec2i, device=device)
+    wp.launch(pair_insert_kernel, dim=count, inputs=[ht.keys, ht.active_slots, entries], device=device)
+    wp.launch(single_lookup_kernel, dim=count, inputs=[ht.keys, expected], device=device)
+
+    # Keys 1..7 and 3..7 give seven distinct keys, each stored exactly once.
+    test.assertEqual(int(ht.active_slots.numpy()[ht.capacity]), 7)
+    keys_np = ht.keys.numpy()
+    test.assertEqual(int(np.sum(keys_np != 0xFFFFFFFFFFFFFFFF)), 7)
+    entries_np = entries.numpy()
+    test.assertTrue(np.all(entries_np >= 0))
+    np.testing.assert_array_equal(entries_np, expected.numpy())
+
+
 # =============================================================================
 # Test registration
 # =============================================================================
@@ -362,6 +406,12 @@ add_function_test(TestHashTable, "test_clear", test_clear, devices=devices)
 add_function_test(TestHashTable, "test_clear_active", test_clear_active, devices=devices)
 add_function_test(TestHashTable, "test_high_collision", test_high_collision, devices=devices)
 add_function_test(TestHashTable, "test_early_exit_optimization", test_early_exit_optimization, devices=devices)
+add_function_test(
+    TestHashTable,
+    "test_find_or_insert_pair_matches_single_probe",
+    test_find_or_insert_pair_matches_single_probe,
+    devices=devices,
+)
 
 
 if __name__ == "__main__":

@@ -60,6 +60,7 @@ from newton._src.geometry.hashtable import (
     HASHTABLE_EMPTY_KEY,
     HashTable,
     hashtable_find_or_insert,
+    hashtable_find_or_insert_pair,
 )
 
 from ..utils.heightfield import HeightfieldData, get_triangle_shape_from_heightfield
@@ -1563,7 +1564,26 @@ def export_and_reduce_contact_centered_two_spatial_depths(
     pos_2d = project_point_to_plane(bin_id, centered_position)
     key = make_contact_key(shape_a, shape_b, bin_id)
 
-    entry_idx = hashtable_find_or_insert(key, reducer_data.ht_keys, reducer_data.ht_active_slots)
+    # === Voxel bin: inner depth coverage ===
+    voxel_idx = compute_voxel_index(position_local, aabb_lower_voxel, aabb_upper_voxel, voxel_res)
+    voxel_idx = wp.clamp(voxel_idx, 0, wp.static(NUM_VOXEL_DEPTH_SLOTS - 1))
+
+    voxels_per_group = wp.static(NUM_SPATIAL_DIRECTIONS + 1)
+    voxel_group = voxel_idx // voxels_per_group
+    voxel_local_slot = voxel_idx % voxels_per_group
+    voxel_bin_id = wp.static(NUM_NORMAL_BINS) + voxel_group
+    voxel_key = make_contact_key(shape_a, shape_b, voxel_bin_id)
+
+    # Every inner contact resolves both entries eventually (pre-prune or
+    # claim), so probe them together and save one dependent round trip on
+    # the common losing path.
+    voxel_entry_idx = -1
+    if use_inner:
+        entry_idx, voxel_entry_idx = hashtable_find_or_insert_pair(
+            key, voxel_key, reducer_data.ht_keys, reducer_data.ht_active_slots
+        )
+    else:
+        entry_idx = hashtable_find_or_insert(key, reducer_data.ht_keys, reducer_data.ht_active_slots)
     might_win = False
 
     # Provisional slot values (contact id zero) shared by the phases below.
@@ -1575,16 +1595,21 @@ def export_and_reduce_contact_centered_two_spatial_depths(
         )
     depth_value = make_contact_value(-depth, fingerprint, 0, reducer_data.deterministic)
 
+    # Issue every probe load before consuming any: the export path is bound
+    # by dependent memory round trips, so one batched read replaces one
+    # round trip per slot.
+    current_values = replaced_values_vec_type()
     if entry_idx >= 0:
-        # Issue every probe load before consuming any: the export path is bound
-        # by dependent memory round trips, so one batched read replaces one
-        # round trip per slot.
-        current_values = replaced_values_vec_type()
         for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
             current_values[dir_i] = reducer_data.ht_values[dir_i * ht_capacity + entry_idx]
         current_values[wp.static(NUM_SPATIAL_DIRECTIONS)] = reducer_data.ht_values[
             wp.static(NUM_SPATIAL_DIRECTIONS) * ht_capacity + entry_idx
         ]
+    voxel_current = wp.uint64(0)
+    if voxel_entry_idx >= 0:
+        voxel_current = reducer_data.ht_values[voxel_local_slot * ht_capacity + voxel_entry_idx]
+
+    if entry_idx >= 0:
         if use_inner:
             if reducer_data.deterministic != 0:
                 max_depth_probe = _make_preprune_probe_det(-depth, fingerprint)
@@ -1601,26 +1626,13 @@ def export_and_reduce_contact_centered_two_spatial_depths(
     else:
         wp.atomic_add(reducer_data.ht_insert_failures, 0, 1)
 
-    # === Voxel bin: inner depth coverage ===
-    voxel_idx = compute_voxel_index(position_local, aabb_lower_voxel, aabb_upper_voxel, voxel_res)
-    voxel_idx = wp.clamp(voxel_idx, 0, wp.static(NUM_VOXEL_DEPTH_SLOTS - 1))
-
-    voxels_per_group = wp.static(NUM_SPATIAL_DIRECTIONS + 1)
-    voxel_group = voxel_idx // voxels_per_group
-    voxel_local_slot = voxel_idx % voxels_per_group
-    voxel_bin_id = wp.static(NUM_NORMAL_BINS) + voxel_group
-    voxel_key = make_contact_key(shape_a, shape_b, voxel_bin_id)
-
-    voxel_entry_idx = -1
-    if use_inner and not might_win:
-        voxel_entry_idx = hashtable_find_or_insert(voxel_key, reducer_data.ht_keys, reducer_data.ht_active_slots)
-        if voxel_entry_idx >= 0:
-            if reducer_data.deterministic != 0:
-                voxel_probe = _make_preprune_probe_det(-depth, fingerprint)
-            else:
-                voxel_probe = _make_contact_value_fast(-depth, 0, 0)
-            if reducer_data.ht_values[voxel_local_slot * ht_capacity + voxel_entry_idx] < voxel_probe:
-                might_win = True
+    if use_inner and not might_win and voxel_entry_idx >= 0:
+        if reducer_data.deterministic != 0:
+            voxel_probe = _make_preprune_probe_det(-depth, fingerprint)
+        else:
+            voxel_probe = _make_contact_value_fast(-depth, 0, 0)
+        if voxel_current < voxel_probe:
+            might_win = True
 
     if not might_win:
         return -1
