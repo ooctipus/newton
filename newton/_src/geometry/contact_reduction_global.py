@@ -1566,22 +1566,38 @@ def export_and_reduce_contact_centered_two_spatial_depths(
     entry_idx = hashtable_find_or_insert(key, reducer_data.ht_keys, reducer_data.ht_active_slots)
     might_win = False
 
+    # Provisional slot values (contact id zero) shared by the phases below.
+    provisional_values = replaced_values_vec_type()
+    for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
+        score = wp.dot(pos_2d, get_spatial_direction_2d(dir_i))
+        provisional_values[dir_i] = make_spatial_contact_value(
+            score, use_inner, fingerprint, 0, reducer_data.deterministic
+        )
+    depth_value = make_contact_value(-depth, fingerprint, 0, reducer_data.deterministic)
+
     if entry_idx >= 0:
+        # Issue every probe load before consuming any: the export path is bound
+        # by dependent memory round trips, so one batched read replaces one
+        # round trip per slot.
+        current_values = replaced_values_vec_type()
+        for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
+            current_values[dir_i] = reducer_data.ht_values[dir_i * ht_capacity + entry_idx]
+        current_values[wp.static(NUM_SPATIAL_DIRECTIONS)] = reducer_data.ht_values[
+            wp.static(NUM_SPATIAL_DIRECTIONS) * ht_capacity + entry_idx
+        ]
         if use_inner:
             if reducer_data.deterministic != 0:
                 max_depth_probe = _make_preprune_probe_det(-depth, fingerprint)
             else:
                 max_depth_probe = _make_contact_value_fast(-depth, 0, 0)
-            if reducer_data.ht_values[wp.static(NUM_SPATIAL_DIRECTIONS) * ht_capacity + entry_idx] < max_depth_probe:
+            if current_values[wp.static(NUM_SPATIAL_DIRECTIONS)] < max_depth_probe:
                 might_win = True
 
         for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
-            if not might_win:
-                dir_2d = get_spatial_direction_2d(dir_i)
-                score = wp.dot(pos_2d, dir_2d)
-                probe = make_spatial_preprune_probe(score, use_inner, fingerprint, reducer_data.deterministic)
-                if reducer_data.ht_values[dir_i * ht_capacity + entry_idx] < probe:
-                    might_win = True
+            score = wp.dot(pos_2d, get_spatial_direction_2d(dir_i))
+            probe = make_spatial_preprune_probe(score, use_inner, fingerprint, reducer_data.deterministic)
+            if current_values[dir_i] < probe:
+                might_win = True
     else:
         wp.atomic_add(reducer_data.ht_insert_failures, 0, 1)
 
@@ -1616,47 +1632,32 @@ def export_and_reduce_contact_centered_two_spatial_depths(
 
     won_mask = int(0)
     replaced_values = replaced_values_vec_type()
-    if use_inner and entry_idx >= 0:
+    if entry_idx >= 0:
+        # Unconditional atomic_max returns the authoritative previous value and
+        # yields the same win decisions as read-then-atomic (values only grow),
+        # while letting all slot claims be in flight together.
+        previous_values = replaced_values_vec_type()
         for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
-            dir_2d = get_spatial_direction_2d(dir_i)
-            score = wp.dot(pos_2d, dir_2d)
-            provisional_value = make_spatial_contact_value(score, True, fingerprint, 0, reducer_data.deterministic)
-            previous_value = reduction_try_update_slot(
-                entry_idx, dir_i, provisional_value, reducer_data.ht_values, ht_capacity
+            previous_values[dir_i] = wp.atomic_max(
+                reducer_data.ht_values, dir_i * ht_capacity + entry_idx, provisional_values[dir_i]
             )
-            if previous_value < provisional_value:
+        if use_inner:
+            previous_values[wp.static(NUM_SPATIAL_DIRECTIONS)] = wp.atomic_max(
+                reducer_data.ht_values, wp.static(NUM_SPATIAL_DIRECTIONS) * ht_capacity + entry_idx, depth_value
+            )
+        for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
+            if previous_values[dir_i] < provisional_values[dir_i]:
                 won_mask |= 1 << dir_i
-                replaced_values[dir_i] = previous_value
-
-        provisional_value = make_contact_value(-depth, fingerprint, 0, reducer_data.deterministic)
-        previous_value = reduction_try_update_slot(
-            entry_idx,
-            wp.static(NUM_SPATIAL_DIRECTIONS),
-            provisional_value,
-            reducer_data.ht_values,
-            ht_capacity,
-        )
-        if previous_value < provisional_value:
+                replaced_values[dir_i] = previous_values[dir_i]
+        if use_inner and previous_values[wp.static(NUM_SPATIAL_DIRECTIONS)] < depth_value:
             won_mask |= 1 << wp.static(NUM_SPATIAL_DIRECTIONS)
-            replaced_values[wp.static(NUM_SPATIAL_DIRECTIONS)] = previous_value
-    elif entry_idx >= 0:
-        for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
-            dir_2d = get_spatial_direction_2d(dir_i)
-            score = wp.dot(pos_2d, dir_2d)
-            provisional_value = make_spatial_contact_value(score, False, fingerprint, 0, reducer_data.deterministic)
-            previous_value = reduction_try_update_slot(
-                entry_idx, dir_i, provisional_value, reducer_data.ht_values, ht_capacity
-            )
-            if previous_value < provisional_value:
-                won_mask |= 1 << dir_i
-                replaced_values[dir_i] = previous_value
+            replaced_values[wp.static(NUM_SPATIAL_DIRECTIONS)] = previous_values[wp.static(NUM_SPATIAL_DIRECTIONS)]
 
     if use_inner and voxel_entry_idx >= 0:
-        provisional_value = make_contact_value(-depth, fingerprint, 0, reducer_data.deterministic)
-        previous_value = reduction_try_update_slot(
-            voxel_entry_idx, voxel_local_slot, provisional_value, reducer_data.ht_values, ht_capacity
+        previous_value = wp.atomic_max(
+            reducer_data.ht_values, voxel_local_slot * ht_capacity + voxel_entry_idx, depth_value
         )
-        if previous_value < provisional_value:
+        if previous_value < depth_value:
             won_mask |= 1 << wp.static(NUM_SPATIAL_DIRECTIONS + 1)
             replaced_values[wp.static(NUM_SPATIAL_DIRECTIONS + 1)] = previous_value
 
@@ -1666,20 +1667,22 @@ def export_and_reduce_contact_centered_two_spatial_depths(
     # Avoid allocating candidates superseded during their own slot updates.
     still_wins = False
     if entry_idx >= 0:
+        # Batched re-read of the claimed slots (one round trip).
+        current_values = replaced_values_vec_type()
         for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
-            if not still_wins and (won_mask & (1 << dir_i)) != 0:
-                dir_2d = get_spatial_direction_2d(dir_i)
-                score = wp.dot(pos_2d, dir_2d)
-                provisional_value = make_spatial_contact_value(
-                    score, use_inner, fingerprint, 0, reducer_data.deterministic
-                )
-                if reducer_data.ht_values[dir_i * ht_capacity + entry_idx] == provisional_value:
-                    still_wins = True
-
-        if not still_wins and use_inner and (won_mask & (1 << wp.static(NUM_SPATIAL_DIRECTIONS))) != 0:
-            provisional_value = make_contact_value(-depth, fingerprint, 0, reducer_data.deterministic)
-            if reducer_data.ht_values[wp.static(NUM_SPATIAL_DIRECTIONS) * ht_capacity + entry_idx] == provisional_value:
+            current_values[dir_i] = reducer_data.ht_values[dir_i * ht_capacity + entry_idx]
+        current_values[wp.static(NUM_SPATIAL_DIRECTIONS)] = reducer_data.ht_values[
+            wp.static(NUM_SPATIAL_DIRECTIONS) * ht_capacity + entry_idx
+        ]
+        for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
+            if (won_mask & (1 << dir_i)) != 0 and current_values[dir_i] == provisional_values[dir_i]:
                 still_wins = True
+        if (
+            use_inner
+            and (won_mask & (1 << wp.static(NUM_SPATIAL_DIRECTIONS))) != 0
+            and current_values[wp.static(NUM_SPATIAL_DIRECTIONS)] == depth_value
+        ):
+            still_wins = True
 
     if (
         not still_wins
@@ -1687,8 +1690,7 @@ def export_and_reduce_contact_centered_two_spatial_depths(
         and voxel_entry_idx >= 0
         and (won_mask & (1 << wp.static(NUM_SPATIAL_DIRECTIONS + 1))) != 0
     ):
-        provisional_value = make_contact_value(-depth, fingerprint, 0, reducer_data.deterministic)
-        if reducer_data.ht_values[voxel_local_slot * ht_capacity + voxel_entry_idx] == provisional_value:
+        if reducer_data.ht_values[voxel_local_slot * ht_capacity + voxel_entry_idx] == depth_value:
             still_wins = True
 
     if not still_wins:
@@ -1733,30 +1735,25 @@ def export_and_reduce_contact_centered_two_spatial_depths(
             )
         return -1
 
-    if use_inner and entry_idx >= 0:
+    # Final slot updates carry the materialized contact id. atomic_max is
+    # idempotent, so the results are not consumed and the writes overlap.
+    if entry_idx >= 0:
         for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
-            dir_2d = get_spatial_direction_2d(dir_i)
-            score = wp.dot(pos_2d, dir_2d)
-            value = make_spatial_contact_value(score, True, fingerprint, contact_id, reducer_data.deterministic)
-            reduction_update_slot(entry_idx, dir_i, value, reducer_data.ht_values, ht_capacity)
-
-        max_depth_value = make_contact_value(-depth, fingerprint, contact_id, reducer_data.deterministic)
-        reduction_update_slot(
-            entry_idx, wp.static(NUM_SPATIAL_DIRECTIONS), max_depth_value, reducer_data.ht_values, ht_capacity
-        )
-    elif entry_idx >= 0:
-        for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
-            dir_2d = get_spatial_direction_2d(dir_i)
-            score = wp.dot(pos_2d, dir_2d)
-            value = make_spatial_contact_value(score, False, fingerprint, contact_id, reducer_data.deterministic)
-            reduction_update_slot(entry_idx, dir_i, value, reducer_data.ht_values, ht_capacity)
+            score = wp.dot(pos_2d, get_spatial_direction_2d(dir_i))
+            value = make_spatial_contact_value(score, use_inner, fingerprint, contact_id, reducer_data.deterministic)
+            wp.atomic_max(reducer_data.ht_values, dir_i * ht_capacity + entry_idx, value)
+        if use_inner:
+            max_depth_value = make_contact_value(-depth, fingerprint, contact_id, reducer_data.deterministic)
+            wp.atomic_max(
+                reducer_data.ht_values, wp.static(NUM_SPATIAL_DIRECTIONS) * ht_capacity + entry_idx, max_depth_value
+            )
 
     if use_inner:
         if voxel_entry_idx < 0:
             voxel_entry_idx = hashtable_find_or_insert(voxel_key, reducer_data.ht_keys, reducer_data.ht_active_slots)
         if voxel_entry_idx >= 0:
             voxel_value = make_contact_value(-depth, fingerprint, contact_id, reducer_data.deterministic)
-            reduction_update_slot(voxel_entry_idx, voxel_local_slot, voxel_value, reducer_data.ht_values, ht_capacity)
+            wp.atomic_max(reducer_data.ht_values, voxel_local_slot * ht_capacity + voxel_entry_idx, voxel_value)
         else:
             wp.atomic_add(reducer_data.ht_insert_failures, 0, 1)
 

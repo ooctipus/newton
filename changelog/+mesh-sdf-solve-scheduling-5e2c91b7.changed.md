@@ -1,0 +1,1 @@
+Speed up the texture mesh-SDF narrow phase: cull and solve blocks claim work dynamically, the solve kernel launches its resident block count, and the global contact reducer batches its slot probes and claims. Reduced contact output is unchanged; no migration needed.
