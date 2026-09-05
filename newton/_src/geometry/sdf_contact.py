@@ -2093,7 +2093,11 @@ def create_mesh_sdf_two_stage_kernels(
     get_mesh_edge_bounding_sphere = _create_get_mesh_edge_bounding_sphere_func(True)
     module = f"sdf_contact_two_stage_{writer_func.__name__}_{speculative}_{sdf_texture_paired_samples}"
 
-    @wp.kernel(enable_backward=False, launch_bounds=(256, 2), module=module)
+    # The cull is a latency-bound chain of edge load, texture sample and
+    # stack push per 256-edge batch. Two blocks was only a minimum (at 80
+    # registers three fit); the four-block cap (64 registers, a few spills)
+    # adds a resident block and measured 282-305 -> 259-268 us per collide.
+    @wp.kernel(enable_backward=False, launch_bounds=(256, 4), module=module)
     def mesh_sdf_cull_kernel(
         shape_data: wp.array[wp.vec4],
         shape_transform: wp.array[wp.transform],

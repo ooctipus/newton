@@ -1,0 +1,1 @@
+Raised the texture mesh-SDF cull kernel's launch bound to four resident blocks per SM (it was a two-block minimum that already yielded three); the cull runs about 10 % faster on large mesh-mesh workloads and emits the same segments.
