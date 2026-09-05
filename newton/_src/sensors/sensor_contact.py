@@ -64,6 +64,10 @@ def compute_sensing_transforms_kernel(
             transforms[tid] = shape_transform[index]
 
 
+# Contact-force accumulation grid-strides over the live count; this bounds the launch.
+_ACCUMULATE_MAX_THREADS = 262_144
+
+
 @wp.kernel(enable_backward=False)
 def accumulate_contact_forces_kernel(
     num_contacts: wp.array[wp.int32],
@@ -86,11 +90,60 @@ def accumulate_contact_forces_kernel(
     total_force_friction: wp.array[wp.vec3],
     position_matrix: wp.array2d[wp.vec3],
     position_weight: wp.array2d[float],
+    total_threads: int,
 ):
-    """Accumulate per-contact forces, friction, and weighted positions. Parallelizes over contacts."""
-    contact_index = wp.tid()
-    if contact_index >= num_contacts[0]:
-        return
+    """Accumulate per-contact forces, friction, and weighted positions.
+
+    Grid-strides over the live contact count so the launch stays far smaller than
+    the contact buffer capacity.
+    """
+    contact_end = wp.min(num_contacts[0], contact_shape0.shape[0])
+    for contact_index in range(wp.tid(), contact_end, total_threads):
+        _accumulate_one_contact(
+            contact_index,
+            contact_shape0,
+            contact_shape1,
+            contact_point0,
+            contact_point1,
+            contact_offset0,
+            contact_offset1,
+            contact_force,
+            contact_normal,
+            shape_body,
+            body_q,
+            sensing_shape_to_row,
+            counterpart_shape_to_col,
+            force_matrix,
+            total_force,
+            force_matrix_friction,
+            total_force_friction,
+            position_matrix,
+            position_weight,
+        )
+
+
+@wp.func
+def _accumulate_one_contact(
+    contact_index: int,
+    contact_shape0: wp.array[wp.int32],
+    contact_shape1: wp.array[wp.int32],
+    contact_point0: wp.array[wp.vec3],
+    contact_point1: wp.array[wp.vec3],
+    contact_offset0: wp.array[wp.vec3],
+    contact_offset1: wp.array[wp.vec3],
+    contact_force: wp.array[wp.spatial_vector],
+    contact_normal: wp.array[wp.vec3],
+    shape_body: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    sensing_shape_to_row: wp.array[wp.int32],
+    counterpart_shape_to_col: wp.array[wp.int32],
+    force_matrix: wp.array2d[wp.vec3],
+    total_force: wp.array[wp.vec3],
+    force_matrix_friction: wp.array2d[wp.vec3],
+    total_force_friction: wp.array[wp.vec3],
+    position_matrix: wp.array2d[wp.vec3],
+    position_weight: wp.array2d[float],
+):
 
     shape0 = contact_shape0[contact_index]
     shape1 = contact_shape1[contact_index]
@@ -736,9 +789,10 @@ class SensorContact:
             self.position_matrix.zero_()
             self._position_weight.zero_()
         update_contact_positions = self.position_matrix is not None and state is not None and state.body_q is not None
+        accumulate_threads = min(contacts.rigid_contact_max, _ACCUMULATE_MAX_THREADS)
         wp.launch(
             accumulate_contact_forces_kernel,
-            dim=contacts.rigid_contact_max,
+            dim=accumulate_threads,
             inputs=[
                 contacts.rigid_contact_count,
                 contacts.rigid_contact_shape0,
@@ -755,14 +809,13 @@ class SensorContact:
                 state.body_q if update_contact_positions else None,
                 self._sensing_shape_to_row,
                 self._counterpart_shape_to_col,
-            ],
-            outputs=[
                 self.force_matrix,
                 self.total_force,
                 self.force_matrix_friction,
                 self.total_force_friction,
                 self.position_matrix if update_contact_positions else None,
                 self._position_weight if update_contact_positions else None,
+                accumulate_threads,
             ],
             device=self.device,
         )

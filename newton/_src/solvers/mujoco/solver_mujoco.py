@@ -4879,24 +4879,30 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             inputs=[d.tree_asleep, self._tree_asleep_prev, self._wake_event],
             device=model.device,
         )
-        wp.launch(
-            convert_newton_contacts_to_mjwarp_kernel,
-            dim=(self._contact_tid_to_cid.shape[0],),
-            inputs=self._contact_conversion_inputs(model, state_in, contacts, inject_mode=1),
-            device=model.device,
-        )
-        wp.launch(_clear_wake_event, dim=1, inputs=[self._wake_event], device=model.device)
-        wp.launch(
-            _snapshot_nacon_count,
-            dim=1,
-            inputs=[
-                self.mjw_data.nacon,
-                self._last_nacon_count,
-                contacts.contact_generation,
-                self._last_contact_generation,
-            ],
-            device=model.device,
-        )
+
+        def _inject():
+            wp.launch(
+                convert_newton_contacts_to_mjwarp_kernel,
+                dim=(self._contact_tid_to_cid.shape[0],),
+                inputs=self._contact_conversion_inputs(model, state_in, contacts, inject_mode=1),
+                device=model.device,
+            )
+            wp.launch(
+                _snapshot_nacon_count,
+                dim=1,
+                inputs=[
+                    self.mjw_data.nacon,
+                    self._last_nacon_count,
+                    contacts.contact_generation,
+                    self._last_contact_generation,
+                ],
+                device=model.device,
+            )
+            wp.launch(_clear_wake_event, dim=1, inputs=[self._wake_event], device=model.device)
+
+        # Quiet substeps (no asleep->awake transition) skip the scan through a
+        # conditional graph node instead of launching over every contact slot.
+        wp.capture_if(self._wake_event, on_true=_inject)
 
     def _convert_contacts_to_mjwarp(self, model: Model, state_in: State, contacts: Contacts):
         # Ensure the inverse shape mapping exists (lazy creation)
@@ -8474,6 +8480,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             outputs=[self.mjw_model.body_inertia, self.mjw_model.body_iquat],
             device=self.model.device,
         )
+        # Gravity compensation may have moved between bodies: rebuild the compact launch list.
+        refresh = getattr(getattr(self._mujoco_warp, "_src", None), "io", None)
+        refresh = getattr(refresh, "refresh_gravcomp_bodies", None) if refresh is not None else None
+        if refresh is not None and self.mjw_model is not None:
+            refresh(self.mjw_model)
 
     def _set_const_0_with_physical_meaninertia(self) -> None:
         """Recompute constants without counting kinematic locking armature in solver statistics."""
