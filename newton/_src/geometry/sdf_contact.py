@@ -76,9 +76,14 @@ STACK_CAPACITY = 2 * MESH_SDF_BLOCK_DIM
 # The two-int header is followed by packed ``(edge index, midpoint SDF)`` pairs.
 _SDF_WORK_SEGMENT_HEADER_INT32 = 2
 SDF_WORK_SEGMENT_STRIDE_INT32 = _SDF_WORK_SEGMENT_HEADER_INT32 + 2 * MESH_SDF_BLOCK_DIM
-SDF_WORK_STATE_SIZE = 2
+# ``work_state`` layout: segment count, overflow flag, then the cull and solve
+# work cursors that persistent blocks advance atomically to claim their next
+# combo or segment (dynamic scheduling keeps the tail wave balanced).
+SDF_WORK_STATE_SIZE = 4
 _SDF_WORK_SEGMENT_COUNT = 0
 _SDF_WORK_OVERFLOWED = 1
+_SDF_WORK_CULL_CURSOR = 2
+_SDF_WORK_SOLVE_CURSOR = 3
 
 
 @wp.func_native("""
@@ -2083,17 +2088,24 @@ def create_mesh_sdf_two_stage_kernels(
         work_floats: wp.array[wp.float32],
         work_state: wp.array[wp.int32],
         work_segment_capacity: int,
-        total_num_blocks: int,
     ):
-        block_id, t = wp.tid()
+        _block_id, t = wp.tid()
         pair_count = wp.min(shape_pairs_mesh_mesh_count[0], shape_pairs_mesh_mesh.shape[0])
         total_combos = block_offsets[pair_count]
         edge_stack = wp.tile_stack(capacity=STACK_CAPACITY, dtype=EdgeCullResult)
         cull_context = wp.tile_empty(shape=1, dtype=MeshSDFCullContext, storage="shared")
         progress = wp.tile_zeros(shape=1, dtype=int, storage="shared")
         segment_slot = wp.tile_zeros(shape=1, dtype=int, storage="shared")
+        work_slot = wp.tile_zeros(shape=1, dtype=int, storage="shared")
 
-        for combo_idx in range(block_id, total_combos, total_num_blocks):
+        # Claim combos dynamically so blocks that draw cheap combos keep working
+        # instead of idling behind a static round-robin assignment.
+        combo_idx = int(0)
+        if t == 0:
+            combo_idx = wp.atomic_add(work_state, _SDF_WORK_CULL_CURSOR, 1)
+        wp.tile_scatter_masked(work_slot, 0, combo_idx, t == 0)
+        combo_idx = wp.tile_extract(work_slot, 0)
+        while combo_idx < total_combos:
             mode = int(0)
             while mode < 2:
                 context = MeshSDFCullContext()
@@ -2219,6 +2231,11 @@ def create_mesh_sdf_two_stage_kernels(
                 wp.tile_stack_clear(edge_stack)
                 mode += 1
 
+            if t == 0:
+                combo_idx = wp.atomic_add(work_state, _SDF_WORK_CULL_CURSOR, 1)
+            wp.tile_scatter_masked(work_slot, 0, combo_idx, t == 0)
+            combo_idx = wp.tile_extract(work_slot, 0)
+
     @wp.kernel(enable_backward=False, launch_bounds=(256, 3), module=module)
     def mesh_sdf_solve_kernel(
         shape_transform: wp.array[wp.transform],
@@ -2242,15 +2259,22 @@ def create_mesh_sdf_two_stage_kernels(
         work_floats: wp.array[wp.float32],
         work_state: wp.array[wp.int32],
         work_segment_capacity: int,
-        total_num_blocks: int,
     ):
-        block_id, t = wp.tid()
+        _block_id, t = wp.tid()
         if work_state[_SDF_WORK_OVERFLOWED] != 0:
             return
         segment_count = wp.min(work_state[_SDF_WORK_SEGMENT_COUNT], work_segment_capacity)
         solve_context = wp.tile_empty(shape=1, dtype=MeshSDFSearchContext, storage="shared")
+        work_slot = wp.tile_zeros(shape=1, dtype=int, storage="shared")
 
-        for segment in range(block_id, segment_count, total_num_blocks):
+        # Claim segments dynamically; per-segment cost varies several-fold with
+        # the number of edges that reach the reducer.
+        segment = int(0)
+        if t == 0:
+            segment = wp.atomic_add(work_state, _SDF_WORK_SOLVE_CURSOR, 1)
+        wp.tile_scatter_masked(work_slot, 0, segment, t == 0)
+        segment = wp.tile_extract(work_slot, 0)
+        while segment < segment_count:
             base = segment * SDF_WORK_SEGMENT_STRIDE_INT32
             context_id = work_ints[base]
             context = MeshSDFSearchContext()
@@ -2367,5 +2391,10 @@ def create_mesh_sdf_two_stage_kernels(
                                 contact_id,
                                 reducer_data,
                             )
+
+            if t == 0:
+                segment = wp.atomic_add(work_state, _SDF_WORK_SOLVE_CURSOR, 1)
+            wp.tile_scatter_masked(work_slot, 0, segment, t == 0)
+            segment = wp.tile_extract(work_slot, 0)
 
     return mesh_sdf_cull_kernel, mesh_sdf_solve_kernel

@@ -2730,6 +2730,10 @@ class NarrowPhase:
             # Mesh-mesh
             self.num_mesh_mesh_blocks = target_blocks * 2 if device_obj.is_cuda else target_blocks
             self.mesh_mesh_target_blocks = target_blocks
+            # The split solve kernel claims segments dynamically, so launch exactly
+            # the resident block count (3 per SM, matching its launch bounds) and
+            # avoid a partially filled trailing wave.
+            self.num_mesh_sdf_solve_blocks = device_obj.sm_count * 3 if device_obj.is_cuda else target_blocks
             mesh_mesh_scan_size = self.max_mesh_mesh_pairs + 1
             self.mesh_mesh_block_offsets = wp.zeros(mesh_mesh_scan_size, dtype=wp.int32, device=device)
             self.mesh_mesh_block_counts = wp.zeros(mesh_mesh_scan_size, dtype=wp.int32, device=device)
@@ -2742,6 +2746,7 @@ class NarrowPhase:
         else:
             self.num_mesh_mesh_blocks = self.num_tile_blocks
             self.mesh_mesh_target_blocks = self.num_tile_blocks
+            self.num_mesh_sdf_solve_blocks = self.num_tile_blocks
             self.mesh_mesh_block_offsets = None
             self.mesh_mesh_block_counts = None
             self.num_mesh_plane_blocks = self.num_tile_blocks
@@ -3292,7 +3297,6 @@ class NarrowPhase:
                                 self.mesh_sdf_work_floats,
                                 self.mesh_sdf_work_state,
                                 self.mesh_sdf_segment_capacity,
-                                self.num_mesh_mesh_blocks,
                             ],
                             device=device,
                             block_dim=self.tile_size_mesh_mesh,
@@ -3300,7 +3304,7 @@ class NarrowPhase:
                         )
                         wp.launch_tiled(
                             kernel=self.mesh_sdf_solve_kernel,
-                            dim=(self.num_mesh_mesh_blocks,),
+                            dim=(self.num_mesh_sdf_solve_blocks,),
                             inputs=[
                                 shape_transform,
                                 texture_sdf_data,
@@ -3323,7 +3327,6 @@ class NarrowPhase:
                                 self.mesh_sdf_work_floats,
                                 self.mesh_sdf_work_state,
                                 self.mesh_sdf_segment_capacity,
-                                self.num_mesh_mesh_blocks,
                             ],
                             device=device,
                             block_dim=self.tile_size_mesh_mesh,
