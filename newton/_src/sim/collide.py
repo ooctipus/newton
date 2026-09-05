@@ -1133,6 +1133,7 @@ class CollisionPipeline:
         contact_reduction_hashtable_size_factor: float = 0.25,
         speculative_config: SpeculativeContactConfig | None = None,
         sdf_contact_replay_max: int = 0,
+        broad_phase_sap_sort_type: Literal["segmented", "tile"] = "segmented",
     ):
         """
         Initialize the CollisionPipeline (expert API).
@@ -1258,6 +1259,8 @@ class CollisionPipeline:
             Rigid-contact autodiff via
             :func:`newton.eval_rigid_contact_kinematics` may change
             without prior notice; see :meth:`collide`.
+            broad_phase_sap_sort_type: SAP broad-phase sort mode, ``"segmented"`` (default) or
+                ``"tile"`` (single ``wp.tile_sort`` launch per pass; requires at most 512 shapes per world).
         """
         if contact_matching not in ("disabled", "latest", "sticky"):
             raise ValueError(
@@ -1413,7 +1416,9 @@ class CollisionPipeline:
             elif self.broad_phase_mode == "sap":
                 if shape_world is None:
                     raise ValueError("model.shape_world is required for broad_phase=SAP")
-                self.broad_phase = BroadPhaseSAP(shape_world, shape_flags=shape_flags, device=device)
+                self.broad_phase = BroadPhaseSAP(
+                    shape_world, shape_flags=shape_flags, device=device, sort_type=broad_phase_sap_sort_type
+                )
                 self.shape_pairs_filtered = None
                 self.shape_pairs_max = _resolve_shape_pairs_max(model, shape_pairs_max)
                 self.shape_pairs_excluded = self._build_excluded_pairs(model)
