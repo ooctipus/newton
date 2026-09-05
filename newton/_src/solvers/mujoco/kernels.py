@@ -864,6 +864,7 @@ def convert_newton_contacts_to_mjwarp_kernel(
     tid_to_cid: wp.array[wp.int32],
     last_nacon_count: wp.array[wp.int32],
     total_num_threads: int,
+    refresh_poses: int,
 ):
     # nacon_out must be zeroed before this kernel is launched so that
     # wp.atomic_add below produces the correct compacted count.
@@ -1050,6 +1051,11 @@ def convert_newton_contacts_to_mjwarp_kernel(
             # Restore the compacted contact count from the full pass
             nacon_out[0] = last_nacon_count[0]
 
+        if refresh_poses == 0:
+            # dist/pos/efc_address are refreshed from MJWarp's kinematics inside the step
+            # (refresh_contact_poses_from_mjc_kernel).
+            return
+
         count = wp.min(count, wp.min(tid_to_cid.shape[0], rigid_contact_shape0.shape[0]))
         for tid in range(thread, count, total_num_threads):
             _refresh_one_contact(
@@ -1072,6 +1078,81 @@ def convert_newton_contacts_to_mjwarp_kernel(
                 contact_efc_address_out,
                 tid_to_cid,
             )
+
+
+@wp.kernel(enable_backward=False)
+def refresh_contact_poses_from_mjc_kernel(
+    rigid_contact_count: wp.array[wp.int32],
+    rigid_contact_shape0: wp.array[wp.int32],
+    rigid_contact_shape1: wp.array[wp.int32],
+    rigid_contact_point0: wp.array[wp.vec3],
+    rigid_contact_point1: wp.array[wp.vec3],
+    rigid_contact_normal: wp.array[wp.vec3],
+    rigid_contact_offset0: wp.array[wp.vec3],
+    rigid_contact_offset1: wp.array[wp.vec3],
+    rigid_contact_margin0: wp.array[wp.float32],
+    rigid_contact_margin1: wp.array[wp.float32],
+    shape_margin: wp.array[float],
+    newton_shape_to_mjc_geom: wp.array[wp.int32],
+    geom_bodyid: wp.array[int],
+    xpos: wp.array2d[wp.vec3],
+    xquat: wp.array2d[wp.quat],
+    tid_to_cid: wp.array[wp.int32],
+    contact_worldid: wp.array[int],
+    naconmax: int,
+    total_num_threads: int,
+    # outputs
+    contact_dist_out: wp.array[float],
+    contact_pos_out: wp.array[wp.vec3],
+    contact_efc_address_out: wp.array2d[int],
+):
+    """Refresh the pose-dependent contact fields from MJWarp's body kinematics.
+
+    Runs from MJWarp's ``post_position`` callback, where ``xpos``/``xquat`` hold this substep's
+    body frames, so the converted contacts do not need Newton's ``body_q`` between substeps.
+    Same arithmetic as :func:`_refresh_one_contact` with the body transform taken from
+    ``xpos``/``xquat`` (MuJoCo body frames coincide with Newton body frames; static geoms live on
+    the world body, whose frame is the identity).
+    """
+    thread = wp.tid()
+    count = wp.min(rigid_contact_count[0], wp.min(tid_to_cid.shape[0], rigid_contact_shape0.shape[0]))
+    for tid in range(thread, count, total_num_threads):
+        cid = tid_to_cid[tid]
+        if cid < 0 or cid >= naconmax:
+            continue
+        shape_a = rigid_contact_shape0[tid]
+        shape_b = rigid_contact_shape1[tid]
+        if shape_a < 0 or shape_b < 0:
+            continue
+        worldid = contact_worldid[cid]
+        body_a = geom_bodyid[newton_shape_to_mjc_geom[shape_a]]
+        body_b = geom_bodyid[newton_shape_to_mjc_geom[shape_b]]
+        X_wb_a = wp.transform(xpos[worldid, body_a], quat_wxyz_to_xyzw(xquat[worldid, body_a]))
+        X_wb_b = wp.transform(xpos[worldid, body_b], quat_wxyz_to_xyzw(xquat[worldid, body_b]))
+
+        offset_scale_a = safe_div(rigid_contact_margin0[tid] - shape_margin[shape_a], rigid_contact_margin0[tid])
+        offset_scale_b = safe_div(rigid_contact_margin1[tid] - shape_margin[shape_b], rigid_contact_margin1[tid])
+        offset_a = rigid_contact_offset0[tid] * offset_scale_a
+        offset_b = rigid_contact_offset1[tid] * offset_scale_b
+
+        bx_a = wp.transform_point(X_wb_a, rigid_contact_point0[tid])
+        bx_b = wp.transform_point(X_wb_b, rigid_contact_point1[tid])
+        point_a = contact_surface_point(X_wb_a, rigid_contact_point0[tid], offset_a)
+        point_b = contact_surface_point(X_wb_b, rigid_contact_point1[tid], offset_b)
+
+        n = rigid_contact_normal[tid]
+        # rigid_contact_margin includes shape_margin; MuJoCo handles it explicitly, subtract to recover radius_eff.
+        contact_dist_out[cid] = contact_surface_separation(
+            bx_a,
+            bx_b,
+            n,
+            rigid_contact_margin0[tid] - shape_margin[shape_a],
+            rigid_contact_margin1[tid] - shape_margin[shape_b],
+        )
+        contact_pos_out[cid] = 0.5 * (point_a + point_b)
+
+        for i in range(contact_efc_address_out.shape[1]):
+            contact_efc_address_out[cid, i] = -1
 
 
 @wp.kernel

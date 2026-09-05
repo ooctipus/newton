@@ -3,6 +3,7 @@
 
 """Tests for optional MuJoCo Warp sleeping support."""
 
+import os
 import unittest
 
 import numpy as np
@@ -656,6 +657,84 @@ class TestMuJoCoSleeping(unittest.TestCase):
         solver.step(state_0, state_1, control, contacts, 1.0 / 120.0)
         solver._step_intermediate(state_1, state_0, control, contacts, 1.0 / 240.0)
         np.testing.assert_allclose(solver.mjw_model.opt.timestep.numpy(), 1.0 / 240.0)
+
+    def test_contact_pose_hook_matches_pre_step_refresh_and_defers_body_state(self):
+        """Contact poses refreshed inside the MJWarp step match the pre-step refresh from body_q."""
+        if not wp.is_cuda_available():
+            self.skipTest("The fused per-world MJWarp path requires a CUDA device")
+        model = _build_contact_wake_model()
+        substeps = 4
+        dt = 1.0 / 240.0
+
+        def run(*, hook: bool, publish_intermediate: bool):
+            if not hook:
+                os.environ["NEWTON_MJWARP_CONTACT_POSE_HOOK"] = "0"
+            try:
+                solver = SolverMuJoCo(
+                    model,
+                    enable_sleeping=True,
+                    nvmax=12,
+                    iterations=10,
+                    ls_iterations=10,
+                    use_mujoco_contacts=False,
+                    jacobian="sparse",
+                )
+            finally:
+                os.environ.pop("NEWTON_MJWARP_CONTACT_POSE_HOOK", None)
+            if not hasattr(solver.mjw_model.callback, "post_position"):
+                self.skipTest("The installed MuJoCo Warp has no post_position callback")
+            self.assertEqual(solver._contact_pose_hook, hook)
+            solver.publish_intermediate_body_state = publish_intermediate
+            state = model.state()
+            control = model.control()
+            pipeline = newton.CollisionPipeline(model)
+            contacts = pipeline.contacts()
+            newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+            state, _ = self._sleep_all(solver, state, model.state(), control, contacts)
+            np.testing.assert_array_equal(solver.mjw_data.tree_awake.numpy()[0], [0, 0])
+            # Launch the second sphere at the sleeping first one; contacts wake it mid-run.
+            qd = state.joint_qd.numpy()
+            qd[int(model.joint_qd_start.numpy()[1])] = 1.0
+            state.joint_qd.assign(qd)
+            solver.reset(state, flags=0)
+            tree_asleep = []
+            nacon = []
+            for _tick in range(12):
+                pipeline.collide(state, contacts)
+                for substep in range(substeps):
+                    if substep == substeps - 1:
+                        solver.step(state, state, control, contacts, dt)
+                    else:
+                        solver._step_intermediate(state, state, control, contacts, dt)
+                    tree_asleep.append(solver.mjw_data.tree_asleep.numpy().copy())
+                    nacon.append(int(solver.mjw_data.nacon.numpy()[0]))
+            # the hook is unbound outside the step
+            self.assertIsNone(solver.mjw_model.callback.post_position)
+            fk_state = model.state()
+            newton.eval_fk(model, state.joint_q, state.joint_qd, fk_state)
+            return {
+                "tree_asleep": np.stack(tree_asleep),
+                "nacon": np.array(nacon),
+                "qpos": solver.mjw_data.qpos.numpy().copy(),
+                "qvel": solver.mjw_data.qvel.numpy().copy(),
+                "body_q": state.body_q.numpy().copy(),
+                "body_qd": state.body_qd.numpy().copy(),
+                "body_q_fk": fk_state.body_q.numpy().copy(),
+                "body_qd_fk": fk_state.body_qd.numpy().copy(),
+            }
+
+        reference = run(hook=False, publish_intermediate=True)
+        self.assertGreater(reference["nacon"].max(), 0)
+        self.assertTrue((reference["tree_asleep"][-1] < 0).all())
+        for publish_intermediate in (True, False):
+            hooked = run(hook=True, publish_intermediate=publish_intermediate)
+            np.testing.assert_array_equal(hooked["tree_asleep"], reference["tree_asleep"])
+            np.testing.assert_array_equal(hooked["nacon"], reference["nacon"])
+            for name in ("qpos", "qvel", "body_q", "body_qd"):
+                np.testing.assert_allclose(hooked[name], reference[name], rtol=1.0e-5, atol=1.0e-5, err_msg=name)
+            # The finalizing step always publishes body state consistent with the joint coordinates.
+            np.testing.assert_array_equal(hooked["body_q"], hooked["body_q_fk"])
+            np.testing.assert_array_equal(hooked["body_qd"], hooked["body_qd_fk"])
 
     def test_sleeping_step_and_reset_support_cuda_graph_capture(self):
         model, solver, state_0, state_1, control, contacts = self._make_sim(enable_sleeping=True, nvmax=1)
