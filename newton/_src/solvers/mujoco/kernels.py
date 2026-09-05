@@ -973,7 +973,8 @@ def convert_newton_contacts_to_mjwarp_kernel(
                 )
             ncollision_out[0] = 0
 
-        count = wp.min(count, wp.min(naconmax, tid_to_cid.shape[0]))
+        # The live count may exceed the Newton buffer (overflow signal), so clamp by every buffer touched.
+        count = wp.min(count, wp.min(naconmax, wp.min(tid_to_cid.shape[0], rigid_contact_shape0.shape[0])))
         for tid in range(thread, count, total_num_threads):
             _convert_one_contact(
                 tid,
@@ -1049,7 +1050,7 @@ def convert_newton_contacts_to_mjwarp_kernel(
             # Restore the compacted contact count from the full pass
             nacon_out[0] = last_nacon_count[0]
 
-        count = wp.min(count, tid_to_cid.shape[0])
+        count = wp.min(count, wp.min(tid_to_cid.shape[0], rigid_contact_shape0.shape[0]))
         for tid in range(thread, count, total_num_threads):
             _refresh_one_contact(
                 tid,

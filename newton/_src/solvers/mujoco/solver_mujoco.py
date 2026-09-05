@@ -4885,6 +4885,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             store = None
         if not self.dormant_contact_filter and store is None:
             return
+        if not self.enable_sleeping or self._tree_asleep_prev is None:
+            # A store configured without sleeping has nothing to wake; the tree buffers do not exist.
+            return
         if os.environ.get("NEWTON_DEBUG_SKIP_DORMANT_INJECT") == "1":  # timing diagnostics only
             return
         d = self.mjw_data
