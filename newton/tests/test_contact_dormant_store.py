@@ -79,29 +79,52 @@ class TestContactDormantStore(unittest.TestCase):
             self.skipTest("Texture SDF construction requires CUDA")
         self.device = wp.get_device()
 
-    def _make_sim(self, model, *, store: bool, slab_rows: int = 64, dormant_contact_filter: bool = True):
+    def _make_sim(
+        self,
+        model,
+        *,
+        store: bool,
+        slab_rows: int = 64,
+        dormant_contact_filter: bool = True,
+        rigid_contact_max: int = 64,
+        nconmax: int = 64,
+        enable_sleeping: bool = True,
+    ):
         solver = SolverMuJoCo(
             model,
-            enable_sleeping=True,
-            nvmax=model.joint_dof_count // model.world_count,
+            enable_sleeping=enable_sleeping,
+            nvmax=model.joint_dof_count // model.world_count if enable_sleeping else None,
             iterations=10,
             ls_iterations=5,
             njmax=128,
-            nconmax=64,
+            nconmax=nconmax,
             use_mujoco_contacts=False,
             dormant_contact_filter=dormant_contact_filter,
         )
         pipeline = newton.CollisionPipeline(
             model,
             broad_phase="sap",
-            rigid_contact_max=64,
+            rigid_contact_max=rigid_contact_max,
             max_triangle_pairs=4096,
             deterministic=True,
             verify_buffers=False,
             sdf_contact_replay_max=64 if store else 0,
             sdf_contact_slab_rows=slab_rows,
         )
-        shape_sleep_index, tree_asleep = solver.collision_sleep_filter
+        if enable_sleeping:
+            shape_sleep_index, tree_asleep = solver.collision_sleep_filter
+        else:
+            # Without solver sleeping the filter is hand-built: dynamic shapes form tree 0 of
+            # their world, kinematic fixtures have no tree, and every tree is awake.
+            body_flags = model.body_flags.numpy()
+            shape_world = model.shape_world.numpy()
+            kinematic = (body_flags[model.shape_body.numpy()] & int(newton.BodyFlags.KINEMATIC)) != 0
+            shape_sleep_index = wp.array(
+                [(-1, -2) if kinematic[shape] else (int(shape_world[shape]), 0) for shape in range(model.shape_count)],
+                dtype=wp.vec2i,
+                device=self.device,
+            )
+            tree_asleep = wp.full((model.world_count, 1), -1, dtype=wp.int32, device=self.device)
         pipeline.configure_sleep_filter(shape_sleep_index, tree_asleep)
         self.assertEqual(pipeline.dormant_contact_store is not None, store)
         state_in = model.state()
@@ -109,10 +132,28 @@ class TestContactDormantStore(unittest.TestCase):
         newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
         return solver, pipeline, state_in, state_out, model.control(), pipeline.contacts()
 
+    def _assert_converted_contacts_within_capacity(self, solver, contacts) -> int:
+        """Check that MJWarp holds at most the live buffer's rows and that every row is well formed."""
+        nacon = int(solver.mjw_data.nacon.numpy()[0])
+        self.assertLessEqual(nacon, contacts.rigid_contact_max)
+        geoms = solver.mjw_data.contact.geom.numpy()[:nacon]
+        self.assertTrue(np.all((geoms >= 0) & (geoms < solver.mjw_model.ngeom)), geoms)
+        worlds = solver.mjw_data.contact.worldid.numpy()[:nacon]
+        self.assertTrue(np.all((worlds >= 0) & (worlds < solver.mjw_data.nworld)), worlds)
+        return nacon
+
     def _sleep_body(self, solver, state, body: int, world: int) -> None:
+        # One row per world names that world's copy of ``body``; only ``world`` is selected.
+        world_count = int(solver.model.world_count)
+        bodies_per_world = int(solver.model.body_count) // world_count
+        local_body = body % bodies_per_world
         solver.set_body_sleep_state(
-            wp.array([[body]], dtype=wp.int32, device=self.device),
-            wp.array([[True]], dtype=wp.bool, device=self.device),
+            wp.array(
+                [[local_body + index * bodies_per_world] for index in range(world_count)],
+                dtype=wp.int32,
+                device=self.device,
+            ),
+            wp.array([[True]] * world_count, dtype=wp.bool, device=self.device),
             wp.array([world], dtype=wp.int32, device=self.device),
         )
         solver.reset(state, flags=0)
@@ -286,6 +327,85 @@ class TestContactDormantStore(unittest.TestCase):
         # An all-false mask leaves both slabs alone.
         pipeline.reset_contact_history(wp.zeros(3, dtype=wp.bool, device=self.device))
         np.testing.assert_array_equal(store.slab_count.numpy()[slabs], [per_world, per_world])
+
+    def test_contact_count_past_live_capacity_is_not_read(self):
+        """Rows past the live buffer stay unread when MJWarp's ``naconmax`` exceeds ``rigid_contact_max``.
+
+        World 1 sleeps from the start so its rows exist only in the store while the live
+        buffer is sized for one world's rows. Both the wake injection and the following
+        all-awake collide push ``rigid_contact_count`` past the buffer, which is the
+        documented overflow signal, and every conversion pass must still convert only
+        the rows the buffer holds.
+        """
+        model, dynamic_body, dynamic_shape = _build_supported_box_model(self.device, world_count=2)
+        bodies_per_world = model.body_count // 2
+        shapes_per_world = model.shape_count // 2
+        # Measure one world's manifold with ample capacity before sizing the live buffer.
+        _solver, pipeline, state_in, _state_out, _control, contacts = self._make_sim(model, store=False)
+        pipeline.collide(state_in, contacts)
+        per_world = int(contacts.rigid_contact_count.numpy()[0]) // 2
+        self.assertGreaterEqual(per_world, 2)
+
+        live_capacity = per_world + per_world // 2
+        solver, pipeline, state_in, state_out, control, contacts = self._make_sim(
+            model, store=True, rigid_contact_max=live_capacity, nconmax=64
+        )
+        self.assertEqual(contacts.rigid_contact_max, live_capacity)
+        self.assertGreater(solver.get_max_contact_count(), live_capacity)
+        store = pipeline.dormant_contact_store
+        shape_sleep_index, tree_asleep = solver.collision_sleep_filter
+        sleeper_body = dynamic_body + bodies_per_world
+        sleeper_shape = dynamic_shape + shapes_per_world
+        sleeper_world, sleeper_tree = (int(value) for value in shape_sleep_index.numpy()[sleeper_shape])
+        self._sleep_body(solver, state_in, sleeper_body, sleeper_world)
+
+        # World 0 is live and fits; world 1 is parked in its slab.
+        pipeline.collide(state_in, contacts)
+        self.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), per_world)
+        slab = int(store.slab_of_shape.numpy()[sleeper_shape])
+        self.assertEqual(int(store.slab_count.numpy()[slab]), per_world)
+        solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
+        self.assertEqual(self._assert_converted_contacts_within_capacity(solver, contacts), per_world)
+
+        # Waking world 1 injects more rows than the buffer has room for.
+        body_force = np.zeros((model.body_count, 6), dtype=np.float32)
+        body_force[sleeper_body, 3] = 20.0
+        state_in.body_f.assign(body_force)
+        solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
+        self.assertLess(int(tree_asleep.numpy()[sleeper_world, sleeper_tree]), 0)
+        self.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 2 * per_world)
+        self.assertEqual(self._assert_converted_contacts_within_capacity(solver, contacts), live_capacity)
+        for _ in range(3):
+            state_in, state_out = state_out, state_in
+            state_in.body_f.assign(body_force)
+            solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
+            self.assertEqual(self._assert_converted_contacts_within_capacity(solver, contacts), live_capacity)
+
+        # Both worlds awake: the narrow phase itself overflows and the full conversion must clamp too.
+        pipeline.collide(state_in, contacts)
+        self.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 2 * per_world)
+        for _ in range(3):
+            solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
+            self.assertEqual(self._assert_converted_contacts_within_capacity(solver, contacts), live_capacity)
+            state_in, state_out = state_out, state_in
+
+    def test_store_steps_without_solver_sleeping(self):
+        """A store bound to hand-built awake sleep state steps with ``enable_sleeping=False`` and keeps rows live."""
+        model, _dynamic_body, _dynamic_shape = _build_supported_box_model(self.device)
+        solver, pipeline, state_in, state_out, control, contacts = self._make_sim(
+            model, store=True, enable_sleeping=False
+        )
+        self.assertFalse(solver.enable_sleeping)
+        self.assertFalse(solver.dormant_contact_filter)
+
+        pipeline.collide(state_in, contacts)
+        self.assertIs(contacts.dormant_contact_store, pipeline.dormant_contact_store)
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        self.assertGreater(count, 0)
+        for _ in range(3):
+            solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
+            self.assertEqual(self._assert_converted_contacts_within_capacity(solver, contacts), count)
+            state_in, state_out = state_out, state_in
 
 
 if __name__ == "__main__":
