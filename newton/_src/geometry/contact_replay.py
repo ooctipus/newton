@@ -28,6 +28,8 @@ if TYPE_CHECKING:
 
 # Grid-stride budget for the candidate-pair mask launch.
 _MASK_MAX_THREADS = 65_536
+# Threads per slab in the retention pass: one warp sweeps a slab's rows cooperatively.
+_RETAIN_BLOCK_DIM = 32
 
 
 @wp.struct
@@ -297,17 +299,47 @@ def _is_replay_eligible(
     return (asleep_a and sleep_b[1] == -2) or (asleep_b and sleep_a[1] == -2)
 
 
+@wp.struct
+class _SlabRow:
+    """Register copy of one slab row (the fields of :class:`DormantContactSlabs`)."""
+
+    shape0: wp.int32
+    shape1: wp.int32
+    point0: wp.vec3
+    point1: wp.vec3
+    offset0: wp.vec3
+    offset1: wp.vec3
+    normal: wp.vec3
+    margin0: wp.float32
+    margin1: wp.float32
+
+
 @wp.func
-def _move_slab_row(slabs: DormantContactSlabs, source: int, target: int):
-    slabs.shape0[target] = slabs.shape0[source]
-    slabs.shape1[target] = slabs.shape1[source]
-    slabs.point0[target] = slabs.point0[source]
-    slabs.point1[target] = slabs.point1[source]
-    slabs.offset0[target] = slabs.offset0[source]
-    slabs.offset1[target] = slabs.offset1[source]
-    slabs.normal[target] = slabs.normal[source]
-    slabs.margin0[target] = slabs.margin0[source]
-    slabs.margin1[target] = slabs.margin1[source]
+def _load_slab_row(slabs: DormantContactSlabs, index: int) -> _SlabRow:
+    row = _SlabRow()
+    row.shape0 = slabs.shape0[index]
+    row.shape1 = slabs.shape1[index]
+    row.point0 = slabs.point0[index]
+    row.point1 = slabs.point1[index]
+    row.offset0 = slabs.offset0[index]
+    row.offset1 = slabs.offset1[index]
+    row.normal = slabs.normal[index]
+    row.margin0 = slabs.margin0[index]
+    row.margin1 = slabs.margin1[index]
+    return row
+
+
+@wp.func
+def _store_slab_row(slabs: DormantContactSlabs, index: int, row: _SlabRow):
+    slabs.shape0[index] = row.shape0
+    slabs.shape1[index] = row.shape1
+    slabs.point0[index] = row.point0
+    slabs.point1[index] = row.point1
+    slabs.offset0[index] = row.offset0
+    slabs.offset1[index] = row.offset1
+    slabs.normal[index] = row.normal
+    slabs.margin0[index] = row.margin0
+    slabs.margin1[index] = row.margin1
 
 
 @wp.kernel(enable_backward=False)
@@ -325,50 +357,66 @@ def retain_dormant_slabs(
 ):
     """Keep slab rows whose pair is replayed this pass and drop everything else.
 
-    One thread per slab. A slab survives only when its dynamic shape is asleep,
-    exactly unchanged, and did not overflow last pass; surviving rows are then
-    compacted to those whose partner is also unchanged, i.e. exactly the pairs
-    :func:`mask_dormant_pairs` removes from the current candidate list.
+    One thread block per slab, launched with :func:`warp.launch_tiled`. The block
+    sweeps the slab's rows ``block_dim`` at a time and compacts the kept rows in
+    order with a block-wide prefix sum. A slab survives only when its dynamic
+    shape is asleep, exactly unchanged, and did not overflow last pass; surviving
+    rows are then compacted to those whose partner is also unchanged, i.e. exactly
+    the pairs :func:`mask_dormant_pairs` removes from the current candidate list.
     """
-    slab = wp.tid()
+    slab, lane = wp.tid()
     shape = slabs.slab_shape[slab]
     sleep = shape_sleep_index[shape]
     asleep = tree_asleep[sleep[0], sleep[1]] >= 0
-    if not asleep:
-        # The writer exports this shape's rows live this pass; stamp the slab so a
-        # wake later in the tick does not inject them a second time.
-        slabs.slab_live_gen[slab] = contact_generation[0]
     if not asleep or shape_unchanged[shape] == 0 or slabs.slab_overflow[slab] != 0:
-        slabs.slab_count[slab] = 0
-        slabs.slab_overflow[slab] = 0
-        slab_masking[slab] = 0
+        # Uniform across the block, so no thread reaches the collective scan below.
+        if lane == 0:
+            if not asleep:
+                # The writer exports this shape's rows live this pass; stamp the slab so a
+                # wake later in the tick does not inject them a second time.
+                slabs.slab_live_gen[slab] = contact_generation[0]
+            slabs.slab_count[slab] = 0
+            slabs.slab_overflow[slab] = 0
+            slab_masking[slab] = 0
         return
 
     capacity = slabs.capacity
     base = slab * capacity
     count = wp.min(slabs.slab_count[slab], capacity)
+    lanes = wp.block_dim()
     kept = int(0)
-    for row in range(count):
-        shape_a = slabs.shape0[base + row]
-        shape_b = slabs.shape1[base + row]
-        partner = shape_b
-        if shape_b == shape:
-            partner = shape_a
-        keep = shape_unchanged[partner] != 0 and _is_replay_pair(
-            shape_a,
-            shape_b,
-            shape_type,
-            shape_sdf_index,
-            shape_edge_range,
-            shape_flags,
-            shape_sleep_index,
-        )
-        if keep:
-            if kept != row:
-                _move_slab_row(slabs, base + row, base + kept)
-            kept += 1
-    slabs.slab_count[slab] = kept
-    slab_masking[slab] = 1
+    for chunk in range(0, count, lanes):
+        row = chunk + lane
+        keep = int(0)
+        staged = _SlabRow()
+        if row < count:
+            shape_a = slabs.shape0[base + row]
+            shape_b = slabs.shape1[base + row]
+            partner = shape_b
+            if shape_b == shape:
+                partner = shape_a
+            if shape_unchanged[partner] != 0 and _is_replay_pair(
+                shape_a,
+                shape_b,
+                shape_type,
+                shape_sdf_index,
+                shape_edge_range,
+                shape_flags,
+                shape_sleep_index,
+            ):
+                keep = 1
+                # Stage the row before the scan: a lower lane may overwrite this slot after it.
+                staged = _load_slab_row(slabs, base + row)
+        keep_tile = wp.tile(keep)
+        # Kept rows land at kept + (number of kept rows before this one in the chunk), so
+        # the compaction preserves row order and never writes above the row it reads.
+        target = kept + wp.untile(wp.tile_scan_exclusive(keep_tile))
+        kept += wp.tile_sum(keep_tile)[0]
+        if keep != 0 and target != row:
+            _store_slab_row(slabs, base + target, staged)
+    if lane == 0:
+        slabs.slab_count[slab] = kept
+        slab_masking[slab] = 1
 
 
 @wp.kernel(enable_backward=False)
@@ -633,9 +681,9 @@ class DormantContactStore:
         """
         if self.slab_count_total == 0:
             return
-        wp.launch(
+        wp.launch_tiled(
             retain_dormant_slabs,
-            dim=self.slab_count_total,
+            dim=[self.slab_count_total],
             inputs=[
                 self.slabs,
                 shape_type,
@@ -649,6 +697,7 @@ class DormantContactStore:
             ],
             outputs=[self.slab_masking],
             device=self.device,
+            block_dim=_RETAIN_BLOCK_DIM,
             record_tape=False,
         )
         thread_count = min(max(candidate_pairs.shape[0], 1), _MASK_MAX_THREADS)
