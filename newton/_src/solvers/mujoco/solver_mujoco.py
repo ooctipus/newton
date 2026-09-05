@@ -94,6 +94,7 @@ from .kernels import (
     inject_dormant_slab_contacts_kernel,
     prepare_contact_conversion_kernel,
     recompute_jnt_eq_anchor1_kernel,
+    refresh_contact_poses_from_mjc_kernel,
     refresh_tree_awake_kernel,
     repeat_array_kernel,
     reset_joint_state_kernel,
@@ -4168,6 +4169,25 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         # intermediate substeps of the same tick reuse it.
         self._timestep_fill_pending = True
         self._last_timestep: float | None = None
+        self.publish_intermediate_body_state: bool = True
+        """Whether intermediate substeps (:meth:`_step_intermediate`) publish ``body_q``/``body_qd``.
+
+        With the in-step contact pose refresh the converted contacts read their body poses from
+        MuJoCo Warp's kinematics, so Newton's forward kinematics is only needed when the state is
+        consumed outside the solver. Set ``False`` when nothing reads Newton body state between the
+        substeps of a tick (no mid-tick collision, no per-substep force callbacks); the finalizing
+        :meth:`step` always publishes. Ignored when the pose refresh is unavailable.
+        """
+        # Newton-side contacts refresh dist/pos from xpos/xquat inside the MJWarp step through its
+        # post_position callback (MJWarp versions without the hook keep the pre-step refresh).
+        self._contact_pose_hook = (
+            not use_mujoco_cpu
+            and not use_mujoco_contacts
+            and self.mjw_model is not None
+            and hasattr(self.mjw_model.callback, "post_position")
+            and os.environ.get("NEWTON_MJWARP_CONTACT_POSE_HOOK") != "0"  # timing diagnostics only
+        )
+        self._hook_contacts: Contacts | None = None
 
         if self.mjw_model is not None:
             self.mjw_model.opt.run_collision_detection = use_mujoco_contacts
@@ -4198,11 +4218,64 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             yield
 
     @event_scope
-    def _mujoco_warp_step(self, finalize: bool = True):
-        if finalize:
-            self._mujoco_warp.step(self.mjw_model, self.mjw_data)
-        else:
-            self._mujoco_warp._step_intermediate(self.mjw_model, self.mjw_data)
+    def _mujoco_warp_step(self, finalize: bool = True, contacts: Contacts | None = None):
+        """Advance MJWarp by one substep.
+
+        Args:
+            finalize: Whether this substep materializes MJWarp's deferred derived data.
+            contacts: Newton contacts whose converted rows are refreshed from MJWarp's kinematics
+                inside the step (:meth:`_refresh_contact_poses_from_mjwarp`); ``None`` leaves the
+                ``post_position`` callback unbound.
+        """
+        callback = self.mjw_model.callback
+        if contacts is not None:
+            self._hook_contacts = contacts
+            callback.post_position = self._refresh_contact_poses_from_mjwarp
+        try:
+            if finalize:
+                self._mujoco_warp.step(self.mjw_model, self.mjw_data)
+            else:
+                self._mujoco_warp._step_intermediate(self.mjw_model, self.mjw_data)
+        finally:
+            if contacts is not None:
+                # scoped to the step so other MJWarp passes on this model (reset) leave the rows alone
+                callback.post_position = None
+
+    def _refresh_contact_poses_from_mjwarp(self, m: MjWarpModel, d: MjWarpData) -> None:
+        """Recompute dist/pos of every live converted contact from MJWarp's body kinematics.
+
+        Bound to ``m.callback.post_position`` for the duration of :meth:`_mujoco_warp_step`, so it
+        runs after MJWarp's kinematics and before ``make_constraint`` reads the contact rows.
+        """
+        contacts = self._hook_contacts
+        threads = min(self._contact_tid_to_cid.shape[0], CONTACT_CONVERSION_MAX_THREADS)
+        wp.launch(
+            refresh_contact_poses_from_mjc_kernel,
+            dim=threads,
+            inputs=[
+                contacts.rigid_contact_count,
+                contacts.rigid_contact_shape0,
+                contacts.rigid_contact_shape1,
+                contacts.rigid_contact_point0,
+                contacts.rigid_contact_point1,
+                contacts.rigid_contact_normal,
+                contacts.rigid_contact_offset0,
+                contacts.rigid_contact_offset1,
+                contacts.rigid_contact_margin0,
+                contacts.rigid_contact_margin1,
+                self.model.shape_margin,
+                self.newton_shape_to_mjc_geom,
+                m.geom_bodyid,
+                d.xpos,
+                d.xquat,
+                self._contact_tid_to_cid,
+                d.contact.worldid,
+                d.naconmax,
+                threads,
+            ],
+            outputs=[d.contact.dist, d.contact.pos, d.contact.efc_address],
+            device=self.model.device,
+        )
 
     @property
     def mesh_variant_names(self) -> tuple[str, ...]:
@@ -4349,14 +4422,26 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     self.mjw_model.opt.timestep.fill_(dt)
                     self._last_timestep = dt
                 self._timestep_fill_pending = finalize
+                hook = convert_contacts and self._contact_pose_hook
                 if convert_contacts:
                     self._convert_contacts_to_mjwarp(
-                        self.model, state_in, contacts, prepared=prepared, snapshot=not self.enable_sleeping
+                        self.model,
+                        state_in,
+                        contacts,
+                        prepared=prepared,
+                        snapshot=not self.enable_sleeping,
+                        refresh_poses=not hook,
                     )
                     if self.enable_sleeping:
                         self._wake_before_step(self.model, state_in, contacts)
-                self._mujoco_warp_step(finalize)
-                self._update_newton_state(self.model, state_out, self.mjw_data, state_prev=state_in)
+                self._mujoco_warp_step(finalize, contacts if hook else None)
+                self._update_newton_state(
+                    self.model,
+                    state_out,
+                    self.mjw_data,
+                    state_prev=state_in,
+                    publish_body_state=finalize or not hook or self.publish_intermediate_body_state,
+                )
         self._step += 1
 
     @event_scope
@@ -5112,9 +5197,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 wp.launch(
                     convert_newton_contacts_to_mjwarp_kernel,
                     dim=parked_threads,
-                    inputs=self._contact_conversion_inputs(
-                        model, state_in, contacts, inject_mode=1, total_num_threads=parked_threads
-                    ),
+                    inputs=[
+                        *self._contact_conversion_inputs(
+                            model, state_in, contacts, inject_mode=1, total_num_threads=parked_threads
+                        ),
+                        1,  # refresh_poses: unused by the injection pass
+                    ],
                     device=model.device,
                 )
             if store is not None:
@@ -5174,6 +5262,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         *,
         prepared: bool = False,
         snapshot: bool = True,
+        refresh_poses: bool = True,
     ):
         """Convert the Newton contact buffer into MJWarp contacts for this substep.
 
@@ -5185,6 +5274,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 restarted the parked-contact list for this substep.
             snapshot: Whether to snapshot the converted count and generation here. With sleeping
                 enabled :meth:`_wake_before_step` takes the snapshot in its refresh kernel.
+            refresh_poses: Whether the fast path refreshes dist/pos from ``state_in.body_q``.
+                ``False`` when :meth:`_refresh_contact_poses_from_mjwarp` refreshes them from
+                MJWarp's kinematics inside the step.
         """
         # Ensure the inverse shape mapping exists (lazy creation)
         if self.newton_shape_to_mjc_geom is None:
@@ -5245,9 +5337,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         wp.launch(
             convert_newton_contacts_to_mjwarp_kernel,
             dim=thread_count,
-            inputs=self._contact_conversion_inputs(
-                model, state_in, contacts, inject_mode=0, total_num_threads=thread_count
-            ),
+            inputs=[
+                *self._contact_conversion_inputs(
+                    model, state_in, contacts, inject_mode=0, total_num_threads=thread_count
+                ),
+                int(refresh_poses),
+            ],
             device=model.device,
         )
 
@@ -5857,6 +5952,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         state: State,
         mj_data: MjWarpData | MjData,
         state_prev: State,
+        *,
+        publish_body_state: bool = True,
     ):
         """Update a Newton state from MuJoCo coordinates and kinematics.
 
@@ -5867,6 +5964,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             state_prev: Previous Newton state. Kinematic joint coordinates and
                 velocities are copied from this state because MuJoCo does not
                 independently integrate those DOFs.
+            publish_body_state: Whether to run forward kinematics for ``body_q``/``body_qd``.
+                Intermediate substeps skip it when the converted contacts read their poses from
+                MJWarp and nothing else reads Newton body state before the finalizing substep.
         """
         is_mjwarp = SolverMuJoCo._data_is_mjwarp(mj_data)
         single_world_template = False
@@ -5913,7 +6013,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             device=model.device,
         )
 
-        eval_fk(model, state.joint_q, state.joint_qd, state)
+        if publish_body_state:
+            eval_fk(model, state.joint_q, state.joint_qd, state)
 
         # Update rigid force fields on state.
         if state.body_qdd is not None or state.body_parent_f is not None:
