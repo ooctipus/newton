@@ -65,10 +65,11 @@ from .enums import EqType as _EqType
 from .enums import _ActuatorBiasType, _ActuatorDynamicsType, _ActuatorGainType
 from .equality import MJC_OBJ_BODY, MjcEqualityTargetKind, _register_equality_constraint_attributes
 from .kernels import (
+    CONTACT_CONVERSION_MAX_THREADS,
     MeshVariantBody,
     MeshVariantShape,
-    _clear_wake_event,
     _detect_tree_wake_events,
+    _finish_wake_injection,
     _prepare_dormant_contact_list,
     _snapshot_nacon_count,
     apply_body_sleep_override_kernel,
@@ -77,6 +78,7 @@ from .kernels import (
     apply_mjc_free_joint_f_to_body_f_kernel,
     apply_mjc_qfrc_kernel,
     build_ref_q_kernel,
+    collect_woken_dormant_slabs_kernel,
     convert_mj_coords_to_warp_kernel,
     convert_newton_contacts_to_mjwarp_kernel,
     convert_qfrc_actuator_from_mj_kernel,
@@ -89,6 +91,7 @@ from .kernels import (
     eval_mujoco_coupling_effective_mass_block_kernel,
     eval_mujoco_coupling_effective_mass_kernel,
     eval_mujoco_coupling_gravity_acceleration_kernel,
+    inject_dormant_slab_contacts_kernel,
     recompute_jnt_eq_anchor1_kernel,
     repeat_array_kernel,
     reset_joint_state_kernel,
@@ -3815,7 +3818,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             disable_contacts: If True, disable contact computation in MuJoCo.
             disable_sensors: If True, disable sensor computation in MuJoCo.
             update_data_interval: Frequency (in simulation steps) at which to update the MuJoCo Data object from the Newton state. If 0, Data is never updated after initialization.
-            dormant_contact_filter: When sleeping is enabled and contacts come from Newton's collision pipeline, skip converting contacts whose bodies are all asleep or immovable and inject them only when a tree wakes. Sleeping DOFs are frozen and excluded from the solve, so these rows never influence the solution; skipping them keeps ``nacon``/``nefc`` proportional to awake work.
+            dormant_contact_filter: When sleeping is enabled and contacts come from Newton's collision pipeline, skip converting contacts whose bodies are all asleep or immovable and inject them only when a tree wakes. Sleeping DOFs are frozen and excluded from the solve, so these rows never influence the solution; skipping them keeps ``nacon``/``nefc`` proportional to awake work. Independently of this flag, rows held in a pipeline :class:`~newton.Contacts.dormant_contact_store` are injected in the substep their tree wakes.
             save_to_mjcf: Optional path to save the generated MJCF model file.
             use_mujoco_contacts: If True, use the MuJoCo contact solver. If False, use the Newton contact solver (newton contacts must be passed in through the step function in that case).
             include_sites: If ``True`` (default), Newton shapes marked with ``ShapeFlags.SITE`` are exported as MuJoCo sites. Sites are non-colliding reference points used for sensor attachment, debugging, or as frames of reference. If ``False``, sites are skipped during export. Defaults to ``True``.
@@ -4784,7 +4787,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self._dormant_dummy_tree_asleep_array = dummy
         return dummy
 
-    def _contact_conversion_inputs(self, model: Model, state_in: State, contacts: Contacts, *, inject_mode: int) -> list:
+    def _contact_conversion_inputs(
+        self, model: Model, state_in: State, contacts: Contacts, *, inject_mode: int, total_num_threads: int
+    ) -> list:
         """Argument list for :func:`convert_newton_contacts_to_mjwarp_kernel`."""
         bodies_per_world = self.model.body_count // self.model.world_count
         mujoco_attrs = getattr(model, "mujoco", None)
@@ -4859,16 +4864,26 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self._last_contact_generation,
             self._contact_tid_to_cid,
             self._last_nacon_count,
+            total_num_threads,
         ]
 
     def _inject_woken_dormant_contacts(self, model: Model, state_in: State, contacts: Contacts) -> None:
-        """Convert parked contacts whose tree woke this substep.
+        """Give trees that woke this substep their dormant contacts.
 
-        Runs after :func:`mujoco_warp._src.sleep.wake_collision` so a tree woken
-        by an awake neighbour receives its support contacts in the same substep,
-        exactly as when every cached contact was converted unconditionally.
+        Runs after :func:`mujoco_warp._src.sleep.wake_collision`, the last wake
+        point before the solve, so a woken tree receives its support contacts in
+        the same substep, exactly as when every cached contact was converted
+        unconditionally. Two sources are handled: rows the full conversion pass
+        parked (``dormant_contact_filter``) and slabs of the pipeline's
+        :attr:`Contacts.dormant_contact_store`, which are appended to the Newton
+        buffer as well so the fast path tracks them on later substeps.
         """
-        if not self.dormant_contact_filter or self._contact_tid_to_cid is None:
+        if self._contact_tid_to_cid is None:
+            return
+        store = getattr(contacts, "dormant_contact_store", None)
+        if store is not None and store.slab_count_total == 0:
+            store = None
+        if not self.dormant_contact_filter and store is None:
             return
         if os.environ.get("NEWTON_DEBUG_SKIP_DORMANT_INJECT") == "1":  # timing diagnostics only
             return
@@ -4879,29 +4894,66 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             inputs=[d.tree_asleep, self._tree_asleep_prev, self._wake_event],
             device=model.device,
         )
+        live_capacity = min(contacts.rigid_contact_max, self._contact_tid_to_cid.shape[0])
+        parked_threads = min(self._contact_tid_to_cid.shape[0], CONTACT_CONVERSION_MAX_THREADS)
 
         def _inject():
+            if self.dormant_contact_filter:
+                wp.launch(
+                    convert_newton_contacts_to_mjwarp_kernel,
+                    dim=parked_threads,
+                    inputs=self._contact_conversion_inputs(
+                        model, state_in, contacts, inject_mode=1, total_num_threads=parked_threads
+                    ),
+                    device=model.device,
+                )
+            if store is not None:
+                # Two-level launch: list the woken slabs, then convert their rows with a
+                # fixed grid so a substep waking many trees stays one short launch.
+                wp.launch(
+                    collect_woken_dormant_slabs_kernel,
+                    dim=store.slab_count_total,
+                    inputs=[
+                        d.tree_asleep,
+                        store.slab_world_tree,
+                        store.slabs.slab_count,
+                        store.slabs.slab_live_gen,
+                        contacts.contact_generation,
+                        store.inject_slabs,
+                        store.inject_count,
+                    ],
+                    device=model.device,
+                )
+                inject_threads = min(store.slab_count_total * store.rows_per_shape, CONTACT_CONVERSION_MAX_THREADS)
+                wp.launch(
+                    inject_dormant_slab_contacts_kernel,
+                    dim=inject_threads,
+                    inputs=[
+                        store.inject_slabs,
+                        store.inject_count,
+                        store.slabs,
+                        live_capacity,
+                        contacts.rigid_contact_tids,
+                        *self._contact_conversion_inputs(
+                            model, state_in, contacts, inject_mode=0, total_num_threads=inject_threads
+                        ),
+                    ],
+                    device=model.device,
+                )
             wp.launch(
-                convert_newton_contacts_to_mjwarp_kernel,
-                dim=(self._contact_tid_to_cid.shape[0],),
-                inputs=self._contact_conversion_inputs(model, state_in, contacts, inject_mode=1),
-                device=model.device,
-            )
-            wp.launch(
-                _snapshot_nacon_count,
+                _finish_wake_injection,
                 dim=1,
                 inputs=[
-                    self.mjw_data.nacon,
+                    d.nacon,
                     self._last_nacon_count,
-                    contacts.contact_generation,
-                    self._last_contact_generation,
+                    store.inject_count if store is not None else None,
+                    self._wake_event,
                 ],
                 device=model.device,
             )
-            wp.launch(_clear_wake_event, dim=1, inputs=[self._wake_event], device=model.device)
 
-        # Quiet substeps (no asleep->awake transition) skip the scan through a
-        # conditional graph node instead of launching over every contact slot.
+        # Quiet substeps (no asleep->awake transition) skip the injection through a
+        # conditional graph node.
         wp.capture_if(self._wake_event, on_true=_inject)
 
     def _convert_contacts_to_mjwarp(self, model: Model, state_in: State, contacts: Contacts):
@@ -4910,10 +4962,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self._create_inverse_shape_mapping()
 
         # The kernel only produces valid output for tid < naconmax (the full
-        # path clamps count and rejects cid >= naconmax).  Launching more
-        # threads than naconmax wastes GPU resources, so cap the grid size.
+        # path clamps count and rejects cid >= naconmax), so the tid->cid map is
+        # sized by min(rigid_contact_max, naconmax). The launch itself grid-strides
+        # over the live count with a fixed thread budget.
         naconmax = self.mjw_data.naconmax
         launch_dim = min(contacts.rigid_contact_max, naconmax)
+        thread_count = min(launch_dim, CONTACT_CONVERSION_MAX_THREADS)
 
         # Grow the tid_to_cid buffer if the MJWarp data capacity changed after
         # construction.
@@ -4960,8 +5014,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         )
         wp.launch(
             convert_newton_contacts_to_mjwarp_kernel,
-            dim=(launch_dim,),
-            inputs=self._contact_conversion_inputs(model, state_in, contacts, inject_mode=0),
+            dim=thread_count,
+            inputs=self._contact_conversion_inputs(
+                model, state_in, contacts, inject_mode=0, total_num_threads=thread_count
+            ),
             device=model.device,
         )
 

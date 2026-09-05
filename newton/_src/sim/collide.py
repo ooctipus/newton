@@ -21,7 +21,7 @@ from ..geometry.contact_data import (
     prepare_speculative_contact,
 )
 from ..geometry.contact_match import ContactMatcher
-from ..geometry.contact_replay import SDFContactReplay
+from ..geometry.contact_replay import DormantContactSlabs, DormantContactStore
 from ..geometry.contact_sort import ContactSorter
 from ..geometry.differentiable_contacts import launch_differentiable_contact_augment
 from ..geometry.flags import ShapeFlags
@@ -163,6 +163,110 @@ class ContactWriterData:
     shape_angular_velocity: wp.array[wp.vec3]
     collision_update_dt: float
     max_speculative_extension: float
+    # Dormant-store routing inputs. Empty arrays when the store is disabled.
+    shape_sleep_index: wp.array[wp.vec2i]
+    tree_asleep: wp.array2d[int]
+    dormant: DormantContactSlabs
+
+
+@wp.func
+def _route_contact(shape_a: int, shape_b: int, writer_data: ContactWriterData) -> int:
+    """Decide where a freshly accepted row goes.
+
+    Returns ``-1`` for the live buffer only, ``slab >= 0`` for the dormant slab only
+    (asleep dynamic shape against an immovable partner), or ``-2 - slab`` for the live
+    buffer plus a slab copy (awake dynamic shape against a kinematic partner, so the
+    pair can still be replayed if the tree falls asleep without moving).
+    """
+    if writer_data.dormant.slab_count.shape[0] == 0:
+        return -1
+    sleep_a = writer_data.shape_sleep_index[shape_a]
+    sleep_b = writer_data.shape_sleep_index[shape_b]
+    dynamic_a = sleep_a[1] >= 0
+    dynamic_b = sleep_b[1] >= 0
+    if dynamic_a == dynamic_b:
+        # Dynamic-dynamic rows (at least one awake side, or primitive asleep-asleep
+        # pairs the sleep filter does not skip) and immovable-immovable rows stay live.
+        return -1
+    dynamic_shape = shape_a
+    dynamic_sleep = sleep_a
+    partner_sleep = sleep_b
+    if dynamic_b:
+        dynamic_shape = shape_b
+        dynamic_sleep = sleep_b
+        partner_sleep = sleep_a
+    slab = writer_data.dormant.slab_of_shape[dynamic_shape]
+    if slab < 0:
+        return -1
+    if writer_data.tree_asleep[dynamic_sleep[0], dynamic_sleep[1]] >= 0:
+        return slab
+    if partner_sleep[1] == -2:
+        return -2 - slab
+    return -1
+
+
+@wp.func
+def _write_slab_row(
+    contact_data: ContactData,
+    writer_data: ContactWriterData,
+    index: int,
+    point_a_world: wp.vec3,
+    point_b_world: wp.vec3,
+    normal_a_to_b: wp.vec3,
+):
+    """Write an accepted contact into a dormant slab row (same fields as the live buffer)."""
+    slabs = writer_data.dormant
+    slabs.shape0[index] = contact_data.shape_a
+    slabs.shape1[index] = contact_data.shape_b
+
+    body0 = writer_data.shape_body[contact_data.shape_a]
+    body1 = writer_data.shape_body[contact_data.shape_b]
+    X_bw_a = wp.transform_identity() if body0 == -1 else wp.transform_inverse(writer_data.body_q[body0])
+    X_bw_b = wp.transform_identity() if body1 == -1 else wp.transform_inverse(writer_data.body_q[body1])
+
+    slabs.point0[index] = wp.transform_point(X_bw_a, point_a_world)
+    slabs.point1[index] = wp.transform_point(X_bw_b, point_b_world)
+
+    offset_mag_a = contact_data.radius_eff_a + contact_data.margin_a
+    offset_mag_b = contact_data.radius_eff_b + contact_data.margin_b
+    slabs.offset0[index] = wp.transform_vector(X_bw_a, offset_mag_a * normal_a_to_b)
+    slabs.offset1[index] = wp.transform_vector(X_bw_b, -offset_mag_b * normal_a_to_b)
+    slabs.normal[index] = normal_a_to_b
+    slabs.margin0[index] = offset_mag_a
+    slabs.margin1[index] = offset_mag_b
+
+
+@wp.func
+def _reserve_live_index(
+    contact_data: ContactData,
+    writer_data: ContactWriterData,
+    point_a_world: wp.vec3,
+    point_b_world: wp.vec3,
+    normal_a_to_b: wp.vec3,
+) -> int:
+    """Route an accepted row to its slab and/or reserve a live index (``-1`` when slab-only)."""
+    route = _route_contact(contact_data.shape_a, contact_data.shape_b, writer_data)
+    if route != -1:
+        slab = route
+        if route < -1:
+            slab = -2 - route
+        row = wp.atomic_add(writer_data.dormant.slab_count, slab, 1)
+        if row < writer_data.dormant.capacity:
+            _write_slab_row(
+                contact_data,
+                writer_data,
+                slab * writer_data.dormant.capacity + row,
+                point_a_world,
+                point_b_world,
+                normal_a_to_b,
+            )
+            if route >= 0:
+                return -1
+        else:
+            # Full slab: the row falls through to the live buffer so nothing is lost,
+            # and the flag stops the next pass from masking this shape's pairs.
+            writer_data.dormant.slab_overflow[slab] = 1
+    return wp.atomic_add(writer_data.contact_count, 0, 1)
 
 
 @wp.func
@@ -252,7 +356,11 @@ def write_contact(
         # compute index using atomic counter
         if d > contact_gap:
             return
-        index = wp.atomic_add(writer_data.contact_count, 0, 1)
+        # Pre-reserved indices (output_index >= 0) bypass routing: their live slot is
+        # already claimed, so the row must be written there.
+        index = _reserve_live_index(contact_data, writer_data, a_contact_world, b_contact_world, contact_normal_a_to_b)
+        if index < 0:
+            return
     _write_contact_at_index(contact_data, writer_data, index, a_contact_world, b_contact_world, contact_normal_a_to_b)
 
 
@@ -277,7 +385,9 @@ def write_contact_speculative(
             writer_data.max_speculative_extension,
         ):
             return
-        index = wp.atomic_add(writer_data.contact_count, 0, 1)
+        index = _reserve_live_index(contact_data, writer_data, point_a_world, point_b_world, normal)
+        if index < 0:
+            return
 
     _write_contact_at_index(contact_data, writer_data, index, point_a_world, point_b_world, normal)
 
@@ -1133,6 +1243,7 @@ class CollisionPipeline:
         contact_reduction_hashtable_size_factor: float = 0.25,
         speculative_config: SpeculativeContactConfig | None = None,
         sdf_contact_replay_max: int = 0,
+        sdf_contact_slab_rows: int = 256,
         broad_phase_sap_sort_type: Literal["segmented", "tile"] = "segmented",
     ):
         """
@@ -1247,12 +1358,24 @@ class CollisionPipeline:
                 collision-update horizon. See
                 :ref:`Speculative contacts <speculative-contacts>` and
                 :class:`SpeculativeContactConfig`.
-            sdf_contact_replay_max: Maximum final contact rows cached for exact
-                replay of unchanged sleeping dynamic-kinematic SDF pairs. Zero
-                disables replay. Cache overflow falls back to full contact
-                generation on the next pass. Replay is active only after
-                :meth:`configure_sleep_filter` binds solver sleep state.
+            sdf_contact_replay_max: A positive value enables the dormant contact
+                store: rows between a sleeping dynamic shape and an immovable
+                (static or kinematic) partner are kept in a per-dynamic-shape slab
+                instead of the live :class:`~newton.Contacts` buffer, unchanged
+                sleeping dynamic-kinematic SDF pairs are skipped exactly, and the
+                MuJoCo solver injects slab rows in the substep a tree wakes.
+                Zero disables the store. The magnitude is retained for
+                compatibility; per-shape capacity is ``sdf_contact_slab_rows``.
+                The store is active only after :meth:`configure_sleep_filter`
+                binds solver sleep state. Requires ``contact_matching="disabled"``.
                 Defaults to zero.
+            sdf_contact_slab_rows: Dormant rows kept per dynamic collision shape
+                when the store is enabled. A shape whose slab overflows falls back
+                to live rows and full contact generation until it fits again, so
+                size this above the largest reduced manifold a resting shape can
+                hold against its fixtures (a part seated in a socket can exceed
+                200 rows). Store memory is ``dynamic shapes x rows x 84 B``.
+                Defaults to 256.
 
         .. experimental::
 
@@ -1282,6 +1405,12 @@ class CollisionPipeline:
             raise ValueError(f"sdf_contact_replay_max must be non-negative, got {sdf_contact_replay_max}")
         if sdf_contact_replay_max > 0 and not reduce_contacts:
             raise ValueError("sdf_contact_replay_max requires reduce_contacts=True")
+        if sdf_contact_slab_rows <= 0:
+            raise ValueError(f"sdf_contact_slab_rows must be positive, got {sdf_contact_slab_rows}")
+        if sdf_contact_replay_max > 0 and contact_matching != "disabled":
+            # Dormant rows leave the live buffer while a tree sleeps, which matching would
+            # report as broken contacts.
+            raise ValueError("sdf_contact_replay_max requires contact_matching='disabled'")
 
         # Any non-disabled matching mode implies deterministic sorting.
         if matching_enabled:
@@ -1708,9 +1837,10 @@ class CollisionPipeline:
                 raise ValueError("sdf_contact_replay_max requires mesh-mesh collision buffers")
             if self.hydroelastic_sdf is not None:
                 raise ValueError("sdf_contact_replay_max does not support hydroelastic contacts")
-            self._sdf_contact_replay = SDFContactReplay(shape_count, sdf_contact_replay_max, device)
-        else:
-            self._sdf_contact_replay = None
+        self._dormant_store_enabled = sdf_contact_replay_max > 0
+        self._sdf_contact_slab_rows = int(sdf_contact_slab_rows)
+        # Built by configure_sleep_filter: the slab mapping needs the solver's shape-to-tree table.
+        self._dormant_contact_store: DormantContactStore | None = None
 
     @property
     def rigid_contact_max(self) -> int:
@@ -1777,11 +1907,30 @@ class CollisionPipeline:
         shape_sleep_index: wp.array[wp.vec2i],
         tree_asleep: wp.array2d[wp.int32],
     ) -> None:
-        """Bind solver sleep state used to skip inactive mesh work."""
+        """Bind solver sleep state used to skip inactive mesh work.
+
+        When the pipeline was constructed with a positive ``sdf_contact_replay_max``,
+        this also allocates the dormant contact store (one slab of
+        ``sdf_contact_slab_rows`` rows per dynamic collision shape) and exposes it to
+        solvers through :attr:`Contacts.dormant_contact_store` on the buffers passed
+        to :meth:`collide`.
+        """
         if shape_sleep_index.shape != (self.shape_count,):
             raise ValueError("shape_sleep_index must have one entry per collision shape")
         self._shape_sleep_index = shape_sleep_index
         self._tree_asleep = tree_asleep
+        if self._dormant_store_enabled and (
+            self._dormant_contact_store is None
+            or self._dormant_contact_store.shape_sleep_index is not shape_sleep_index
+        ):
+            self._dormant_contact_store = DormantContactStore(
+                self.model, shape_sleep_index, self._sdf_contact_slab_rows, self.device
+            )
+
+    @property
+    def dormant_contact_store(self) -> DormantContactStore | None:
+        """Dormant contact store, or ``None`` until the store is enabled and sleep state is bound."""
+        return self._dormant_contact_store
 
     def reset_contact_matching(self, world_mask: wp.array[wp.bool] | None = None) -> None:
         """Clear all or reset-selected contact-matching history.
@@ -1827,11 +1976,11 @@ class CollisionPipeline:
         )
         if self._contact_matcher is not None:
             self._contact_matcher.reset(world_mask)
-        if self._sdf_contact_replay is not None:
-            self._sdf_contact_replay.reset(self.model.shape_world, int(self.model.world_count), world_mask)
+        if self._dormant_contact_store is not None:
+            self._dormant_contact_store.reset(self.model.shape_world, int(self.model.world_count), world_mask)
 
     def reset_sdf_contact_replay(self, world_mask: wp.array[wp.bool] | None = None) -> None:
-        """Invalidate all or reset-selected SDF contact replay history.
+        """Invalidate all or reset-selected dormant contact store history.
 
         Per-shape poses and scalar collision configuration are checked every
         pass. Call :meth:`reset_contact_history` with ``world_mask=None`` after
@@ -1854,8 +2003,8 @@ class CollisionPipeline:
             world_count=int(self.model.world_count),
             device=self.model.device,
         )
-        if self._sdf_contact_replay is not None:
-            self._sdf_contact_replay.reset(self.model.shape_world, int(self.model.world_count), world_mask)
+        if self._dormant_contact_store is not None:
+            self._dormant_contact_store.reset(self.model.shape_world, int(self.model.world_count), world_mask)
 
     @staticmethod
     def _build_excluded_pairs(model: Model) -> wp.array[wp.vec2i] | None:
@@ -1941,9 +2090,12 @@ class CollisionPipeline:
             max_speculative_extension = 0.0
             speculative_active = False
             search_gap = model.shape_gap
-        replay_active = self._sdf_contact_replay is not None and self._shape_sleep_index is not None
-        if replay_active and contacts.per_contact_shape_properties:
+        store = self._dormant_contact_store
+        store_active = store is not None and self._shape_sleep_index is not None
+        if store_active and contacts.per_contact_shape_properties:
             raise ValueError("sdf_contact_replay_max does not support per-contact shape properties")
+        # Solvers pick the store up from the buffer they are handed (see SolverMuJoCo).
+        contacts.dormant_contact_store = store if store_active else None
 
         # Rigid contact detection -- broad phase + narrow phase.
         # These kernels hardcode record_tape=False internally so they are
@@ -2012,8 +2164,8 @@ class CollisionPipeline:
                 record_tape=False,
             )
 
-        if replay_active:
-            self._sdf_contact_replay.classify(
+        if store_active:
+            store.classify(
                 shape_data=self.geom_data,
                 shape_transform=self.geom_transform,
                 shape_source=model.shape_source_ptr,
@@ -2132,13 +2284,14 @@ class CollisionPipeline:
         writer_data.shape_angular_velocity = self._shape_angular_velocity
         writer_data.collision_update_dt = collision_update_dt
         writer_data.max_speculative_extension = max_speculative_extension
-        if replay_active:
-            replay_rows = self._sdf_contact_replay.make_rows(contacts, self._sort_key_array)
-            self._sdf_contact_replay.replay_and_mask(
-                output=replay_rows,
-                output_tids=contacts.rigid_contact_tids,
+        if store_active:
+            writer_data.shape_sleep_index = self._shape_sleep_index
+            writer_data.tree_asleep = self._tree_asleep
+            writer_data.dormant = store.slabs
+            store.retain_and_mask(
                 candidate_pairs=self.broad_phase_shape_pairs,
                 candidate_pair_count=self.broad_phase_pair_count,
+                contact_generation=contacts.contact_generation,
                 shape_type=model.shape_type,
                 shape_sdf_index=model._shape_sdf_index,
                 shape_edge_range=model.shape_edge_range,
@@ -2287,28 +2440,6 @@ class CollisionPipeline:
                 shape_body=model.shape_body,
                 device=self.device,
                 **sticky_offsets,
-            )
-
-        if replay_active:
-            replay_sort_keys = (
-                self._contact_sorter.sorted_keys_view if self._contact_sorter is not None else self._sort_key_array
-            )
-            replay_rows = self._sdf_contact_replay.make_rows(contacts, replay_sort_keys)
-            reducer = self.narrow_phase.global_contact_reducer
-            self._sdf_contact_replay.save(
-                output=replay_rows,
-                broad_phase_pair_count=self.broad_phase_pair_count,
-                broad_phase_pair_capacity=self.broad_phase_shape_pairs.shape[0],
-                sdf_pair_count=self.narrow_phase.shape_pairs_mesh_mesh_count,
-                sdf_pair_capacity=self.narrow_phase.shape_pairs_mesh_mesh.shape[0],
-                reducer_contact_count=reducer.contact_count,
-                reducer_contact_capacity=reducer.capacity,
-                reducer_insert_failures=reducer.ht_insert_failures,
-                shape_type=model.shape_type,
-                shape_sdf_index=model._shape_sdf_index,
-                shape_edge_range=model.shape_edge_range,
-                shape_flags=model.shape_flags,
-                shape_sleep_index=self._shape_sleep_index,
             )
 
         # Differentiable contact augmentation: reconstruct world-space contact

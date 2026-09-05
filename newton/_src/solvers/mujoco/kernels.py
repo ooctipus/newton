@@ -10,6 +10,7 @@ from typing import Any
 import warp as wp
 
 from ...core.types import vec5
+from ...geometry.contact_replay import DormantContactSlabs
 from ...sim import BodyFlags, JointTargetMode, JointType
 from ...sim.contacts import contact_surface_point, contact_surface_separation
 from .constants import (
@@ -417,6 +418,379 @@ def eval_mujoco_coupling_effective_mass_block_kernel(
 
 
 # Kernel functions
+# Grid-stride budget for the contact conversion and wake-injection launches.
+CONTACT_CONVERSION_MAX_THREADS = 262_144
+
+
+@wp.func
+def _convert_one_contact(
+    tid: int,
+    allow_park: int,
+    body_q: wp.array[wp.transform],
+    shape_body: wp.array[int],
+    body_flags: wp.array[int],
+    # Model:
+    geom_bodyid: wp.array[int],
+    body_weldid: wp.array[int],
+    body_treeid: wp.array[int],
+    tree_asleep: wp.array2d[int],
+    dormant_filter: int,
+    dormant_flag: wp.array[int],
+    dormant_tids: wp.array[int],
+    dormant_count: wp.array[int],
+    body_invweight0: wp.array2d[wp.vec2],
+    geom_condim: wp.array[int],
+    geom_priority: wp.array[int],
+    geom_solmix: wp.array2d[float],
+    geom_solref: wp.array2d[wp.vec2],
+    geom_solimp: wp.array2d[vec5],
+    geom_friction: wp.array2d[wp.vec3],
+    geom_margin: wp.array2d[float],
+    geom_gap: wp.array2d[float],
+    # Newton shape-material force-space inputs (issue #2009)
+    shape_material_ke: wp.array[float],
+    shape_material_kd: wp.array[float],
+    shape_mjc_solref_mode: wp.array[wp.int32],
+    # Newton contacts
+    rigid_contact_shape0: wp.array[wp.int32],
+    rigid_contact_shape1: wp.array[wp.int32],
+    rigid_contact_point0: wp.array[wp.vec3],
+    rigid_contact_point1: wp.array[wp.vec3],
+    rigid_contact_normal: wp.array[wp.vec3],
+    rigid_contact_offset0: wp.array[wp.vec3],
+    rigid_contact_offset1: wp.array[wp.vec3],
+    rigid_contact_margin0: wp.array[wp.float32],
+    rigid_contact_margin1: wp.array[wp.float32],
+    rigid_contact_stiffness: wp.array[wp.float32],
+    rigid_contact_damping: wp.array[wp.float32],
+    rigid_contact_friction: wp.array[wp.float32],
+    shape_margin: wp.array[float],
+    shape_material_kf: wp.array[float],
+    opt_impratio_invsqrt: wp.array[float],
+    use_kf_mapping: bool,
+    bodies_per_world: int,
+    newton_shape_to_mjc_geom: wp.array[wp.int32],
+    # Mujoco warp contacts
+    naconmax: int,
+    nacon_out: wp.array[int],
+    contact_dist_out: wp.array[float],
+    contact_pos_out: wp.array[wp.vec3],
+    contact_frame_out: wp.array[wp.mat33],
+    contact_includemargin_out: wp.array[float],
+    contact_friction_out: wp.array[vec5],
+    contact_solref_out: wp.array[wp.vec2],
+    contact_solreffriction_out: wp.array[wp.vec2],
+    contact_solimp_out: wp.array[vec5],
+    contact_dim_out: wp.array[int],
+    contact_geom_out: wp.array[wp.vec2i],
+    contact_efc_address_out: wp.array2d[int],
+    contact_worldid_out: wp.array[int],
+    tid_to_cid: wp.array[wp.int32],
+) -> int:
+    """Convert Newton contact row ``tid`` into a new MJWarp contact and return its id.
+
+    Returns ``-1`` when the row is skipped (invalid shapes, immovable-immovable pair,
+    dormant pair, or MJWarp capacity exhausted). Dormant rows (no awake dynamic
+    tree) are parked in the adapter's dormant list when ``allow_park`` is set and
+    left untouched otherwise.
+    """
+    shape_a = rigid_contact_shape0[tid]
+    shape_b = rigid_contact_shape1[tid]
+
+    if shape_a < 0 or shape_b < 0:
+        tid_to_cid[tid] = -1
+        dormant_flag[tid] = 0
+        return -1
+
+    geom_a = newton_shape_to_mjc_geom[shape_a]
+    geom_b = newton_shape_to_mjc_geom[shape_b]
+
+    body_a = shape_body[shape_a]
+    body_b = shape_body[shape_b]
+
+    mj_body_a = geom_bodyid[geom_a]
+    mj_body_b = geom_bodyid[geom_b]
+
+    # A body is "immovable" in three cases:
+    #  1. body < 0 → static shape (no body)
+    #  2. BodyFlags.KINEMATIC → kinematic body (e.g. armature=1e10)
+    #  3. body_weldid == 0 → fixed root body (worldbody)
+    # Pairs where both sides are immovable produce degenerate efc_D values
+    # in MuJoCo's solver, so we skip them.
+    a_immovable = body_a < 0 or (body_flags[body_a] & BodyFlags.KINEMATIC) != 0 or body_weldid[mj_body_a] == 0
+    b_immovable = body_b < 0 or (body_flags[body_b] & BodyFlags.KINEMATIC) != 0 or body_weldid[mj_body_b] == 0
+
+    if a_immovable and b_immovable:
+        tid_to_cid[tid] = -1
+        dormant_flag[tid] = 0
+        return -1
+
+    # Dormant contacts: both bodies asleep (or one asleep, one immovable).
+    # MJWarp's own collision driver never emits such contacts because the
+    # sleeping trees are frozen and their DOFs are excluded from the solve,
+    # so converting them only inflates nacon/nefc for every downstream
+    # kernel.  Park them instead; the wake-injection pass converts a parked
+    # row as soon as its tree wakes so support contacts are never missing.
+    if dormant_filter != 0:
+        worldid_early = body_a // bodies_per_world
+        if body_a < 0:
+            worldid_early = body_b // bodies_per_world
+        awake_a = False
+        awake_b = False
+        if not a_immovable:
+            tree_a = body_treeid[mj_body_a]
+            if tree_a >= 0:
+                awake_a = tree_asleep[worldid_early, tree_a] < 0
+        if not b_immovable:
+            tree_b = body_treeid[mj_body_b]
+            if tree_b >= 0:
+                awake_b = tree_asleep[worldid_early, tree_b] < 0
+        if (not awake_a) and (not awake_b):
+            if allow_park != 0:
+                tid_to_cid[tid] = -1
+                dormant_flag[tid] = 1
+                dormant_tids[wp.atomic_add(dormant_count, 0, 1)] = tid
+            return -1
+    dormant_flag[tid] = 0
+
+    X_wb_a = wp.transform_identity()
+    X_wb_b = wp.transform_identity()
+    if body_a >= 0:
+        X_wb_a = body_q[body_a]
+    if body_b >= 0:
+        X_wb_b = body_q[body_b]
+
+    # Strip artificial shape margins from Newton offsets before computing MuJoCo's geometry-surface anchor.
+    offset_scale_a = safe_div(rigid_contact_margin0[tid] - shape_margin[shape_a], rigid_contact_margin0[tid])
+    offset_scale_b = safe_div(rigid_contact_margin1[tid] - shape_margin[shape_b], rigid_contact_margin1[tid])
+    offset_a = rigid_contact_offset0[tid] * offset_scale_a
+    offset_b = rigid_contact_offset1[tid] * offset_scale_b
+
+    bx_a = wp.transform_point(X_wb_a, rigid_contact_point0[tid])
+    bx_b = wp.transform_point(X_wb_b, rigid_contact_point1[tid])
+    point_a = contact_surface_point(X_wb_a, rigid_contact_point0[tid], offset_a)
+    point_b = contact_surface_point(X_wb_b, rigid_contact_point1[tid], offset_b)
+
+    n = rigid_contact_normal[tid]
+    # rigid_contact_margin includes shape_margin; MuJoCo handles it explicitly, subtract to recover radius_eff.
+    dist = contact_surface_separation(
+        bx_a,
+        bx_b,
+        n,
+        rigid_contact_margin0[tid] - shape_margin[shape_a],
+        rigid_contact_margin1[tid] - shape_margin[shape_b],
+    )
+    pos = 0.5 * (point_a + point_b)
+
+    frame = make_frame(n)
+
+    geoms = wp.vec2i(geom_a, geom_b)
+
+    worldid = body_a // bodies_per_world
+    if body_a < 0:
+        worldid = body_b // bodies_per_world
+
+    margin, _gap, condim, friction, solref, solreffriction, solimp, mix = contact_params(
+        geom_condim,
+        geom_priority,
+        geom_solmix,
+        geom_solref,
+        geom_solimp,
+        geom_friction,
+        geom_margin,
+        geom_gap,
+        geoms,
+        worldid,
+    )
+
+    # FORCE_SPACE per-contact override: bypass contact_params' per-geom
+    # solref averaging and recompute the solref from the combined
+    # two-body factor. See docs/solvers/mujoco.rst > "Shape-material
+    # contact stiffness and damping" for the mechanism.
+    if shape_mjc_solref_mode:
+        mode_a = shape_mjc_solref_mode[shape_a]
+        mode_b = shape_mjc_solref_mode[shape_b]
+        if mode_a == SOLREF_MODE_FORCE_SPACE and mode_b == SOLREF_MODE_FORCE_SPACE:
+            ke_a = shape_material_ke[shape_a]
+            kd_a = shape_material_kd[shape_a]
+            ke_b = shape_material_ke[shape_b]
+            kd_b = shape_material_kd[shape_b]
+            # Reuse mix from contact_params so heterogeneous materials
+            # combine consistently with friction/solimp.
+            ke = mix * ke_a + (1.0 - mix) * ke_b
+            kd = mix * kd_a + (1.0 - mix) * kd_b
+            invw_a = float(0.0)
+            invw_b = float(0.0)
+            if body_a >= 0:
+                invw_a = body_invweight0[worldid, mj_body_a][0]
+            if body_b >= 0:
+                invw_b = body_invweight0[worldid, mj_body_b][0]
+            m_inv = invw_a + invw_b
+            dmax = solimp[1]
+            if m_inv > 0.0 and dmax < 1.0:
+                factor = m_inv * (1.0 - dmax)
+                solref = convert_solref(
+                    wp.max(ke * factor, MJ_MINVAL),
+                    wp.max(kd * factor, MJ_MINVAL),
+                    1.0,
+                    1.0,
+                )
+
+    # Convert Newton per-contact stiffness/damping to MuJoCo solref
+    # (timeconst, dampratio). Per-contact overrides take precedence over
+    # the shape-material force-space override above. solimp is set to
+    # approximate a linear force-displacement relationship at rest,
+    # compensating for impedance scaling. See
+    # https://mujoco.readthedocs.io/en/latest/modeling.html#solver-parameters
+    if rigid_contact_stiffness:
+        contact_ke = rigid_contact_stiffness[tid]
+        if contact_ke > 0.0:
+            imp = solimp[1]
+            solimp = vec5(imp, imp, 0.001, 1.0, 0.5)
+            contact_ke = contact_ke * (1.0 - imp)
+            kd = rigid_contact_damping[tid]
+            if kd > 0.0:
+                timeconst = 2.0 / kd
+                dampratio = wp.sqrt(1.0 / (timeconst * timeconst * contact_ke))
+            else:
+                timeconst = wp.sqrt(1.0 / contact_ke)
+                dampratio = 1.0
+            solref = wp.vec2(timeconst, dampratio)
+
+        friction_scale = rigid_contact_friction[tid]
+        if friction_scale > 0.0:
+            friction = vec5(
+                friction[0] * friction_scale,
+                friction[1] * friction_scale,
+                friction[2],
+                friction[3],
+                friction[4],
+            )
+
+    # Match Newton's force-space friction slope using MuJoCo's inverse-weight
+    # approximation; positive solref lets refsafe limit overly stiff damping.
+    if shape_material_kf and use_kf_mapping:
+        kf1 = shape_material_kf[shape_a]
+        kf2 = shape_material_kf[shape_b]
+        kf = mix * kf1 + (1.0 - mix) * kf2
+        if kf > 0.0:
+            invw = body_invweight0[worldid, mj_body_a][0] + body_invweight0[worldid, mj_body_b][0]
+            ir = opt_impratio_invsqrt[worldid % opt_impratio_invsqrt.shape[0]]
+            imp = solimp[1]
+            denom = kf * invw * ((1.0 - imp) * ir * ir + imp)
+            if denom > 0.0 and wp.isfinite(denom):
+                timeconst = 2.0 / denom
+                if wp.isfinite(timeconst):
+                    solreffriction = wp.vec2(timeconst, 1.0)
+        elif kf == 0.0:
+            # A zero gain means no friction force in Newton, so omit all
+            # sliding, torsional, and rolling constraint rows.
+            condim = 1
+
+    cid = wp.atomic_add(nacon_out, 0, 1)
+    if cid >= naconmax:
+        tid_to_cid[tid] = -1
+        return -1
+
+    tid_to_cid[tid] = cid
+
+    write_contact(
+        dist_in=dist,
+        pos_in=pos,
+        frame_in=frame,
+        margin_in=margin,
+        condim_in=condim,
+        friction_in=friction,
+        solref_in=solref,
+        solreffriction_in=solreffriction,
+        solimp_in=solimp,
+        geoms_in=geoms,
+        worldid_in=worldid,
+        contact_id_in=cid,
+        contact_dist_out=contact_dist_out,
+        contact_pos_out=contact_pos_out,
+        contact_frame_out=contact_frame_out,
+        contact_includemargin_out=contact_includemargin_out,
+        contact_friction_out=contact_friction_out,
+        contact_solref_out=contact_solref_out,
+        contact_solreffriction_out=contact_solreffriction_out,
+        contact_solimp_out=contact_solimp_out,
+        contact_dim_out=contact_dim_out,
+        contact_geom_out=contact_geom_out,
+        contact_efc_address_out=contact_efc_address_out,
+        contact_worldid_out=contact_worldid_out,
+    )
+    return cid
+
+
+@wp.func
+def _refresh_one_contact(
+    tid: int,
+    body_q: wp.array[wp.transform],
+    shape_body: wp.array[int],
+    rigid_contact_shape0: wp.array[wp.int32],
+    rigid_contact_shape1: wp.array[wp.int32],
+    rigid_contact_point0: wp.array[wp.vec3],
+    rigid_contact_point1: wp.array[wp.vec3],
+    rigid_contact_normal: wp.array[wp.vec3],
+    rigid_contact_offset0: wp.array[wp.vec3],
+    rigid_contact_offset1: wp.array[wp.vec3],
+    rigid_contact_margin0: wp.array[wp.float32],
+    rigid_contact_margin1: wp.array[wp.float32],
+    shape_margin: wp.array[float],
+    naconmax: int,
+    contact_dist_out: wp.array[float],
+    contact_pos_out: wp.array[wp.vec3],
+    contact_efc_address_out: wp.array2d[int],
+    tid_to_cid: wp.array[wp.int32],
+):
+    """Fast path: refresh the body-pose-dependent fields of an already converted row."""
+    cid = tid_to_cid[tid]
+    # Defensive bounds check: a stale tid_to_cid (e.g. cached from a
+    # previous mjw_data with larger naconmax) could otherwise produce
+    # out-of-bounds writes that corrupt the GPU allocator state.
+    if cid < 0 or cid >= naconmax:
+        return
+
+    shape_a = rigid_contact_shape0[tid]
+    shape_b = rigid_contact_shape1[tid]
+    if shape_a < 0 or shape_b < 0:
+        return
+    body_a = shape_body[shape_a]
+    body_b = shape_body[shape_b]
+
+    X_wb_a = wp.transform_identity()
+    X_wb_b = wp.transform_identity()
+    if body_a >= 0:
+        X_wb_a = body_q[body_a]
+    if body_b >= 0:
+        X_wb_b = body_q[body_b]
+
+    offset_scale_a = safe_div(rigid_contact_margin0[tid] - shape_margin[shape_a], rigid_contact_margin0[tid])
+    offset_scale_b = safe_div(rigid_contact_margin1[tid] - shape_margin[shape_b], rigid_contact_margin1[tid])
+    offset_a = rigid_contact_offset0[tid] * offset_scale_a
+    offset_b = rigid_contact_offset1[tid] * offset_scale_b
+
+    bx_a = wp.transform_point(X_wb_a, rigid_contact_point0[tid])
+    bx_b = wp.transform_point(X_wb_b, rigid_contact_point1[tid])
+    point_a = contact_surface_point(X_wb_a, rigid_contact_point0[tid], offset_a)
+    point_b = contact_surface_point(X_wb_b, rigid_contact_point1[tid], offset_b)
+
+    n = rigid_contact_normal[tid]
+    # rigid_contact_margin includes shape_margin; MuJoCo handles it explicitly, subtract to recover radius_eff.
+    contact_dist_out[cid] = contact_surface_separation(
+        bx_a,
+        bx_b,
+        n,
+        rigid_contact_margin0[tid] - shape_margin[shape_a],
+        rigid_contact_margin1[tid] - shape_margin[shape_b],
+    )
+    contact_pos_out[cid] = 0.5 * (point_a + point_b)
+
+    for i in range(contact_efc_address_out.shape[1]):
+        contact_efc_address_out[cid, i] = -1
+
+
 @wp.kernel
 def convert_newton_contacts_to_mjwarp_kernel(
     body_q: wp.array[wp.transform],
@@ -489,6 +863,7 @@ def convert_newton_contacts_to_mjwarp_kernel(
     last_contact_generation: wp.array[wp.int32],
     tid_to_cid: wp.array[wp.int32],
     last_nacon_count: wp.array[wp.int32],
+    total_num_threads: int,
 ):
     # nacon_out must be zeroed before this kernel is launched so that
     # wp.atomic_add below produces the correct compacted count.
@@ -499,277 +874,167 @@ def convert_newton_contacts_to_mjwarp_kernel(
     # and resets efc_address.  All other MJWarp contact fields (frame,
     # friction, solref, solimp, condim, geom, worldid, includemargin) are
     # still valid from the previous full pass.
+    #
+    # Every path grid-strides over the live row count, so the launch is sized
+    # by a fixed thread budget rather than the contact buffer capacity.
+    # tid_to_cid entries past the live count are stale and never read.
 
-    tid = wp.tid()
+    thread = wp.tid()
 
     if inject_mode != 0:
         # Wake-injection pass: visit only rows the full pass parked as dormant
-        # (both bodies asleep or static) and convert those whose tree is awake
+        # (both bodies asleep or immovable) and convert those whose tree is awake
         # now, appending them to the live MJWarp contact set. Skipped entirely
         # unless some tree went from asleep to awake since the last pass.
         if wake_event[0] == 0:
             return
-        if tid >= dormant_count[0]:
-            return
-        tid = dormant_tids[tid]
-        if dormant_flag[tid] == 0:
-            return
+        parked = wp.min(dormant_count[0], dormant_tids.shape[0])
+        for index in range(thread, parked, total_num_threads):
+            tid = dormant_tids[index]
+            if dormant_flag[tid] == 0:
+                continue
+            _convert_one_contact(
+                tid,
+                0,
+                body_q,
+                shape_body,
+                body_flags,
+                geom_bodyid,
+                body_weldid,
+                body_treeid,
+                tree_asleep,
+                dormant_filter,
+                dormant_flag,
+                dormant_tids,
+                dormant_count,
+                body_invweight0,
+                geom_condim,
+                geom_priority,
+                geom_solmix,
+                geom_solref,
+                geom_solimp,
+                geom_friction,
+                geom_margin,
+                geom_gap,
+                shape_material_ke,
+                shape_material_kd,
+                shape_mjc_solref_mode,
+                rigid_contact_shape0,
+                rigid_contact_shape1,
+                rigid_contact_point0,
+                rigid_contact_point1,
+                rigid_contact_normal,
+                rigid_contact_offset0,
+                rigid_contact_offset1,
+                rigid_contact_margin0,
+                rigid_contact_margin1,
+                rigid_contact_stiffness,
+                rigid_contact_damping,
+                rigid_contact_friction,
+                shape_margin,
+                shape_material_kf,
+                opt_impratio_invsqrt,
+                use_kf_mapping,
+                bodies_per_world,
+                newton_shape_to_mjc_geom,
+                naconmax,
+                nacon_out,
+                contact_dist_out,
+                contact_pos_out,
+                contact_frame_out,
+                contact_includemargin_out,
+                contact_friction_out,
+                contact_solref_out,
+                contact_solreffriction_out,
+                contact_solimp_out,
+                contact_dim_out,
+                contact_geom_out,
+                contact_efc_address_out,
+                contact_worldid_out,
+                tid_to_cid,
+            )
+        return
 
     count = rigid_contact_count[0]
 
     gen = contact_generation[0]
     last_gen = last_contact_generation[0]
-    needs_full = gen != last_gen or inject_mode != 0
 
-    if needs_full:
+    if gen != last_gen:
         # ── FULL PATH ────────────────────────────────────────────────────
-        # Runs on the first substep after collision detection.  Identical to
-        # the original kernel plus recording the tid→cid mapping.
-
-        if inject_mode == 0:
-            if tid == 0:
-                if count > naconmax:
-                    wp.printf(
-                        "Number of Newton contacts (%d) exceeded MJWarp limit (%d). Increase nconmax.\n",
-                        count,
-                        naconmax,
-                    )
-                ncollision_out[0] = 0
-
+        # Runs on the first substep after collision detection.  Converts every
+        # live row and records the tid→cid mapping.
+        if thread == 0:
             if count > naconmax:
-                count = naconmax
-
-            if tid >= count:
-                tid_to_cid[tid] = -1
-                dormant_flag[tid] = 0
-                return
-
-        shape_a = rigid_contact_shape0[tid]
-        shape_b = rigid_contact_shape1[tid]
-
-        if shape_a < 0 or shape_b < 0:
-            tid_to_cid[tid] = -1
-            dormant_flag[tid] = 0
-            return
-
-        geom_a = newton_shape_to_mjc_geom[shape_a]
-        geom_b = newton_shape_to_mjc_geom[shape_b]
-
-        body_a = shape_body[shape_a]
-        body_b = shape_body[shape_b]
-
-        mj_body_a = geom_bodyid[geom_a]
-        mj_body_b = geom_bodyid[geom_b]
-
-        # A body is "immovable" in three cases:
-        #  1. body < 0 → static shape (no body)
-        #  2. BodyFlags.KINEMATIC → kinematic body (e.g. armature=1e10)
-        #  3. body_weldid == 0 → fixed root body (worldbody)
-        # Pairs where both sides are immovable produce degenerate efc_D values
-        # in MuJoCo's solver, so we skip them.
-        a_immovable = body_a < 0 or (body_flags[body_a] & BodyFlags.KINEMATIC) != 0 or body_weldid[mj_body_a] == 0
-        b_immovable = body_b < 0 or (body_flags[body_b] & BodyFlags.KINEMATIC) != 0 or body_weldid[mj_body_b] == 0
-
-        if a_immovable and b_immovable:
-            tid_to_cid[tid] = -1
-            dormant_flag[tid] = 0
-            return
-
-        # Dormant contacts: both bodies asleep (or one asleep, one immovable).
-        # MJWarp's own collision driver never emits such contacts because the
-        # sleeping trees are frozen and their DOFs are excluded from the solve,
-        # so converting them only inflates nacon/nefc for every downstream
-        # kernel.  Park them instead; the wake-injection pass converts a parked
-        # row as soon as its tree wakes so support contacts are never missing.
-        if dormant_filter != 0:
-            worldid_early = body_a // bodies_per_world
-            if body_a < 0:
-                worldid_early = body_b // bodies_per_world
-            awake_a = False
-            awake_b = False
-            if not a_immovable:
-                tree_a = body_treeid[mj_body_a]
-                if tree_a >= 0:
-                    awake_a = tree_asleep[worldid_early, tree_a] < 0
-            if not b_immovable:
-                tree_b = body_treeid[mj_body_b]
-                if tree_b >= 0:
-                    awake_b = tree_asleep[worldid_early, tree_b] < 0
-            if (not awake_a) and (not awake_b):
-                if inject_mode == 0:
-                    tid_to_cid[tid] = -1
-                    dormant_flag[tid] = 1
-                    dormant_tids[wp.atomic_add(dormant_count, 0, 1)] = tid
-                return
-        dormant_flag[tid] = 0
-
-        X_wb_a = wp.transform_identity()
-        X_wb_b = wp.transform_identity()
-        if body_a >= 0:
-            X_wb_a = body_q[body_a]
-        if body_b >= 0:
-            X_wb_b = body_q[body_b]
-
-        # Strip artificial shape margins from Newton offsets before computing MuJoCo's geometry-surface anchor.
-        offset_scale_a = safe_div(rigid_contact_margin0[tid] - shape_margin[shape_a], rigid_contact_margin0[tid])
-        offset_scale_b = safe_div(rigid_contact_margin1[tid] - shape_margin[shape_b], rigid_contact_margin1[tid])
-        offset_a = rigid_contact_offset0[tid] * offset_scale_a
-        offset_b = rigid_contact_offset1[tid] * offset_scale_b
-
-        bx_a = wp.transform_point(X_wb_a, rigid_contact_point0[tid])
-        bx_b = wp.transform_point(X_wb_b, rigid_contact_point1[tid])
-        point_a = contact_surface_point(X_wb_a, rigid_contact_point0[tid], offset_a)
-        point_b = contact_surface_point(X_wb_b, rigid_contact_point1[tid], offset_b)
-
-        n = rigid_contact_normal[tid]
-        # rigid_contact_margin includes shape_margin; MuJoCo handles it explicitly, subtract to recover radius_eff.
-        dist = contact_surface_separation(
-            bx_a,
-            bx_b,
-            n,
-            rigid_contact_margin0[tid] - shape_margin[shape_a],
-            rigid_contact_margin1[tid] - shape_margin[shape_b],
-        )
-        pos = 0.5 * (point_a + point_b)
-
-        frame = make_frame(n)
-
-        geoms = wp.vec2i(geom_a, geom_b)
-
-        worldid = body_a // bodies_per_world
-        if body_a < 0:
-            worldid = body_b // bodies_per_world
-
-        margin, _gap, condim, friction, solref, solreffriction, solimp, mix = contact_params(
-            geom_condim,
-            geom_priority,
-            geom_solmix,
-            geom_solref,
-            geom_solimp,
-            geom_friction,
-            geom_margin,
-            geom_gap,
-            geoms,
-            worldid,
-        )
-
-        # FORCE_SPACE per-contact override: bypass contact_params' per-geom
-        # solref averaging and recompute the solref from the combined
-        # two-body factor. See docs/solvers/mujoco.rst > "Shape-material
-        # contact stiffness and damping" for the mechanism.
-        if shape_mjc_solref_mode:
-            mode_a = shape_mjc_solref_mode[shape_a]
-            mode_b = shape_mjc_solref_mode[shape_b]
-            if mode_a == SOLREF_MODE_FORCE_SPACE and mode_b == SOLREF_MODE_FORCE_SPACE:
-                ke_a = shape_material_ke[shape_a]
-                kd_a = shape_material_kd[shape_a]
-                ke_b = shape_material_ke[shape_b]
-                kd_b = shape_material_kd[shape_b]
-                # Reuse mix from contact_params so heterogeneous materials
-                # combine consistently with friction/solimp.
-                ke = mix * ke_a + (1.0 - mix) * ke_b
-                kd = mix * kd_a + (1.0 - mix) * kd_b
-                invw_a = float(0.0)
-                invw_b = float(0.0)
-                if body_a >= 0:
-                    invw_a = body_invweight0[worldid, mj_body_a][0]
-                if body_b >= 0:
-                    invw_b = body_invweight0[worldid, mj_body_b][0]
-                m_inv = invw_a + invw_b
-                dmax = solimp[1]
-                if m_inv > 0.0 and dmax < 1.0:
-                    factor = m_inv * (1.0 - dmax)
-                    solref = convert_solref(
-                        wp.max(ke * factor, MJ_MINVAL),
-                        wp.max(kd * factor, MJ_MINVAL),
-                        1.0,
-                        1.0,
-                    )
-
-        # Convert Newton per-contact stiffness/damping to MuJoCo solref
-        # (timeconst, dampratio). Per-contact overrides take precedence over
-        # the shape-material force-space override above. solimp is set to
-        # approximate a linear force-displacement relationship at rest,
-        # compensating for impedance scaling. See
-        # https://mujoco.readthedocs.io/en/latest/modeling.html#solver-parameters
-        if rigid_contact_stiffness:
-            contact_ke = rigid_contact_stiffness[tid]
-            if contact_ke > 0.0:
-                imp = solimp[1]
-                solimp = vec5(imp, imp, 0.001, 1.0, 0.5)
-                contact_ke = contact_ke * (1.0 - imp)
-                kd = rigid_contact_damping[tid]
-                if kd > 0.0:
-                    timeconst = 2.0 / kd
-                    dampratio = wp.sqrt(1.0 / (timeconst * timeconst * contact_ke))
-                else:
-                    timeconst = wp.sqrt(1.0 / contact_ke)
-                    dampratio = 1.0
-                solref = wp.vec2(timeconst, dampratio)
-
-            friction_scale = rigid_contact_friction[tid]
-            if friction_scale > 0.0:
-                friction = vec5(
-                    friction[0] * friction_scale,
-                    friction[1] * friction_scale,
-                    friction[2],
-                    friction[3],
-                    friction[4],
+                wp.printf(
+                    "Number of Newton contacts (%d) exceeded MJWarp limit (%d). Increase nconmax.\n",
+                    count,
+                    naconmax,
                 )
+            ncollision_out[0] = 0
 
-        # Match Newton's force-space friction slope using MuJoCo's inverse-weight
-        # approximation; positive solref lets refsafe limit overly stiff damping.
-        if shape_material_kf and use_kf_mapping:
-            kf1 = shape_material_kf[shape_a]
-            kf2 = shape_material_kf[shape_b]
-            kf = mix * kf1 + (1.0 - mix) * kf2
-            if kf > 0.0:
-                invw = body_invweight0[worldid, mj_body_a][0] + body_invweight0[worldid, mj_body_b][0]
-                ir = opt_impratio_invsqrt[worldid % opt_impratio_invsqrt.shape[0]]
-                imp = solimp[1]
-                denom = kf * invw * ((1.0 - imp) * ir * ir + imp)
-                if denom > 0.0 and wp.isfinite(denom):
-                    timeconst = 2.0 / denom
-                    if wp.isfinite(timeconst):
-                        solreffriction = wp.vec2(timeconst, 1.0)
-            elif kf == 0.0:
-                # A zero gain means no friction force in Newton, so omit all
-                # sliding, torsional, and rolling constraint rows.
-                condim = 1
-
-        cid = wp.atomic_add(nacon_out, 0, 1)
-        if cid >= naconmax:
-            tid_to_cid[tid] = -1
-            return
-
-        tid_to_cid[tid] = cid
-
-        write_contact(
-            dist_in=dist,
-            pos_in=pos,
-            frame_in=frame,
-            margin_in=margin,
-            condim_in=condim,
-            friction_in=friction,
-            solref_in=solref,
-            solreffriction_in=solreffriction,
-            solimp_in=solimp,
-            geoms_in=geoms,
-            worldid_in=worldid,
-            contact_id_in=cid,
-            contact_dist_out=contact_dist_out,
-            contact_pos_out=contact_pos_out,
-            contact_frame_out=contact_frame_out,
-            contact_includemargin_out=contact_includemargin_out,
-            contact_friction_out=contact_friction_out,
-            contact_solref_out=contact_solref_out,
-            contact_solreffriction_out=contact_solreffriction_out,
-            contact_solimp_out=contact_solimp_out,
-            contact_dim_out=contact_dim_out,
-            contact_geom_out=contact_geom_out,
-            contact_efc_address_out=contact_efc_address_out,
-            contact_worldid_out=contact_worldid_out,
-        )
+        count = wp.min(count, wp.min(naconmax, tid_to_cid.shape[0]))
+        for tid in range(thread, count, total_num_threads):
+            _convert_one_contact(
+                tid,
+                1,
+                body_q,
+                shape_body,
+                body_flags,
+                geom_bodyid,
+                body_weldid,
+                body_treeid,
+                tree_asleep,
+                dormant_filter,
+                dormant_flag,
+                dormant_tids,
+                dormant_count,
+                body_invweight0,
+                geom_condim,
+                geom_priority,
+                geom_solmix,
+                geom_solref,
+                geom_solimp,
+                geom_friction,
+                geom_margin,
+                geom_gap,
+                shape_material_ke,
+                shape_material_kd,
+                shape_mjc_solref_mode,
+                rigid_contact_shape0,
+                rigid_contact_shape1,
+                rigid_contact_point0,
+                rigid_contact_point1,
+                rigid_contact_normal,
+                rigid_contact_offset0,
+                rigid_contact_offset1,
+                rigid_contact_margin0,
+                rigid_contact_margin1,
+                rigid_contact_stiffness,
+                rigid_contact_damping,
+                rigid_contact_friction,
+                shape_margin,
+                shape_material_kf,
+                opt_impratio_invsqrt,
+                use_kf_mapping,
+                bodies_per_world,
+                newton_shape_to_mjc_geom,
+                naconmax,
+                nacon_out,
+                contact_dist_out,
+                contact_pos_out,
+                contact_frame_out,
+                contact_includemargin_out,
+                contact_friction_out,
+                contact_solref_out,
+                contact_solreffriction_out,
+                contact_solimp_out,
+                contact_dim_out,
+                contact_geom_out,
+                contact_efc_address_out,
+                contact_worldid_out,
+                tid_to_cid,
+            )
     else:
         # ── FAST PATH ────────────────────────────────────────────────────
         # Subsequent substeps with the same contact set.  Only dist, pos,
@@ -779,56 +1044,243 @@ def convert_newton_contacts_to_mjwarp_kernel(
         # NOTE: rigid_contact_normal is computed once by the narrow phase
         # and is invariant across substeps.  The fast path is only correct
         # when collide() has not been called since the last full pass.
-
-        if tid == 0:
+        if thread == 0:
             ncollision_out[0] = 0
             # Restore the compacted contact count from the full pass
             nacon_out[0] = last_nacon_count[0]
 
-        cid = tid_to_cid[tid]
-        # Defensive bounds check: a stale tid_to_cid (e.g. cached from a
-        # previous mjw_data with larger naconmax) could otherwise produce
-        # out-of-bounds writes that corrupt the GPU allocator state.
-        if cid < 0 or cid >= naconmax:
-            return
+        count = wp.min(count, tid_to_cid.shape[0])
+        for tid in range(thread, count, total_num_threads):
+            _refresh_one_contact(
+                tid,
+                body_q,
+                shape_body,
+                rigid_contact_shape0,
+                rigid_contact_shape1,
+                rigid_contact_point0,
+                rigid_contact_point1,
+                rigid_contact_normal,
+                rigid_contact_offset0,
+                rigid_contact_offset1,
+                rigid_contact_margin0,
+                rigid_contact_margin1,
+                shape_margin,
+                naconmax,
+                contact_dist_out,
+                contact_pos_out,
+                contact_efc_address_out,
+                tid_to_cid,
+            )
 
-        shape_a = rigid_contact_shape0[tid]
-        shape_b = rigid_contact_shape1[tid]
-        if shape_a < 0 or shape_b < 0:
-            return
-        body_a = shape_body[shape_a]
-        body_b = shape_body[shape_b]
 
-        X_wb_a = wp.transform_identity()
-        X_wb_b = wp.transform_identity()
-        if body_a >= 0:
-            X_wb_a = body_q[body_a]
-        if body_b >= 0:
-            X_wb_b = body_q[body_b]
+@wp.kernel
+def collect_woken_dormant_slabs_kernel(
+    tree_asleep: wp.array2d[wp.int32],
+    slab_world_tree: wp.array[wp.vec2i],
+    slab_count: wp.array[wp.int32],
+    slab_live_gen: wp.array[wp.int32],
+    contact_generation: wp.array[wp.int32],
+    inject_slabs: wp.array[wp.int32],
+    inject_count: wp.array[wp.int32],
+):
+    """List slabs whose tree is awake but whose rows are not yet live, and stamp them.
 
-        offset_scale_a = safe_div(rigid_contact_margin0[tid] - shape_margin[shape_a], rigid_contact_margin0[tid])
-        offset_scale_b = safe_div(rigid_contact_margin1[tid] - shape_margin[shape_b], rigid_contact_margin1[tid])
-        offset_a = rigid_contact_offset0[tid] * offset_scale_a
-        offset_b = rigid_contact_offset1[tid] * offset_scale_b
+    The stamp (``slab_live_gen == contact_generation``) is set once per collision
+    generation so a tree that wakes, sleeps and wakes again within one tick does
+    not receive its rows twice; :func:`retain_dormant_slabs` stamps slabs whose
+    rows were exported live by ``collide()`` itself.
+    """
+    slab = wp.tid()
+    generation = contact_generation[0]
+    if slab_live_gen[slab] == generation:
+        return
+    world_tree = slab_world_tree[slab]
+    if tree_asleep[world_tree[0], world_tree[1]] >= 0:
+        return
+    slab_live_gen[slab] = generation
+    if slab_count[slab] > 0:
+        inject_slabs[wp.atomic_add(inject_count, 0, 1)] = slab
 
-        bx_a = wp.transform_point(X_wb_a, rigid_contact_point0[tid])
-        bx_b = wp.transform_point(X_wb_b, rigid_contact_point1[tid])
-        point_a = contact_surface_point(X_wb_a, rigid_contact_point0[tid], offset_a)
-        point_b = contact_surface_point(X_wb_b, rigid_contact_point1[tid], offset_b)
 
-        n = rigid_contact_normal[tid]
-        # rigid_contact_margin includes shape_margin; MuJoCo handles it explicitly, subtract to recover radius_eff.
-        contact_dist_out[cid] = contact_surface_separation(
-            bx_a,
-            bx_b,
-            n,
-            rigid_contact_margin0[tid] - shape_margin[shape_a],
-            rigid_contact_margin1[tid] - shape_margin[shape_b],
+@wp.kernel
+def inject_dormant_slab_contacts_kernel(
+    inject_slabs: wp.array[wp.int32],
+    inject_count: wp.array[wp.int32],
+    slabs: DormantContactSlabs,
+    live_capacity: int,
+    rigid_contact_tids: wp.array[wp.int32],
+    # Same argument block as convert_newton_contacts_to_mjwarp_kernel.
+    body_q: wp.array[wp.transform],
+    shape_body: wp.array[int],
+    body_flags: wp.array[int],
+    geom_bodyid: wp.array[int],
+    body_weldid: wp.array[int],
+    body_treeid: wp.array[int],
+    tree_asleep: wp.array2d[int],
+    dormant_filter: int,
+    inject_mode: int,
+    dormant_flag: wp.array[int],
+    dormant_tids: wp.array[int],
+    dormant_count: wp.array[int],
+    wake_event: wp.array[int],
+    body_invweight0: wp.array2d[wp.vec2],
+    geom_condim: wp.array[int],
+    geom_priority: wp.array[int],
+    geom_solmix: wp.array2d[float],
+    geom_solref: wp.array2d[wp.vec2],
+    geom_solimp: wp.array2d[vec5],
+    geom_friction: wp.array2d[wp.vec3],
+    geom_margin: wp.array2d[float],
+    geom_gap: wp.array2d[float],
+    shape_material_ke: wp.array[float],
+    shape_material_kd: wp.array[float],
+    shape_mjc_solref_mode: wp.array[wp.int32],
+    rigid_contact_count: wp.array[wp.int32],
+    rigid_contact_shape0: wp.array[wp.int32],
+    rigid_contact_shape1: wp.array[wp.int32],
+    rigid_contact_point0: wp.array[wp.vec3],
+    rigid_contact_point1: wp.array[wp.vec3],
+    rigid_contact_normal: wp.array[wp.vec3],
+    rigid_contact_offset0: wp.array[wp.vec3],
+    rigid_contact_offset1: wp.array[wp.vec3],
+    rigid_contact_margin0: wp.array[wp.float32],
+    rigid_contact_margin1: wp.array[wp.float32],
+    rigid_contact_stiffness: wp.array[wp.float32],
+    rigid_contact_damping: wp.array[wp.float32],
+    rigid_contact_friction: wp.array[wp.float32],
+    shape_margin: wp.array[float],
+    shape_material_kf: wp.array[float],
+    opt_impratio_invsqrt: wp.array[float],
+    use_kf_mapping: bool,
+    bodies_per_world: int,
+    newton_shape_to_mjc_geom: wp.array[wp.int32],
+    naconmax: int,
+    nacon_out: wp.array[int],
+    contact_dist_out: wp.array[float],
+    contact_pos_out: wp.array[wp.vec3],
+    contact_frame_out: wp.array[wp.mat33],
+    contact_includemargin_out: wp.array[float],
+    contact_friction_out: wp.array[vec5],
+    contact_solref_out: wp.array[wp.vec2],
+    contact_solreffriction_out: wp.array[wp.vec2],
+    contact_solimp_out: wp.array[vec5],
+    contact_dim_out: wp.array[int],
+    contact_geom_out: wp.array[wp.vec2i],
+    contact_efc_address_out: wp.array2d[int],
+    contact_worldid_out: wp.array[int],
+    nworld_in: int,
+    ncollision_out: wp.array[int],
+    contact_generation: wp.array[wp.int32],
+    last_contact_generation: wp.array[wp.int32],
+    tid_to_cid: wp.array[wp.int32],
+    last_nacon_count: wp.array[wp.int32],
+    total_num_threads: int,
+):
+    """Append the rows of every listed slab to the Newton buffer and convert them.
+
+    Grid-strides over ``inject_count * capacity`` (slab, row) items so a substep
+    that wakes many trees is still one short launch. Appending to the Newton
+    buffer lets the fast path track the woken body's motion on later substeps
+    and keeps contact sensors consistent.
+    """
+    thread = wp.tid()
+    capacity = slabs.capacity
+    total = wp.min(inject_count[0], inject_slabs.shape[0]) * capacity
+    for index in range(thread, total, total_num_threads):
+        list_index = index / capacity
+        row = index - list_index * capacity
+        slab = inject_slabs[list_index]
+        if row >= wp.min(slabs.slab_count[slab], capacity):
+            continue
+        source = slab * capacity + row
+        tid = wp.atomic_add(rigid_contact_count, 0, 1)
+        if tid >= live_capacity:
+            # Buffer full: the count keeps growing so the overflow stays visible.
+            continue
+        rigid_contact_shape0[tid] = slabs.shape0[source]
+        rigid_contact_shape1[tid] = slabs.shape1[source]
+        rigid_contact_point0[tid] = slabs.point0[source]
+        rigid_contact_point1[tid] = slabs.point1[source]
+        rigid_contact_offset0[tid] = slabs.offset0[source]
+        rigid_contact_offset1[tid] = slabs.offset1[source]
+        rigid_contact_normal[tid] = slabs.normal[source]
+        rigid_contact_margin0[tid] = slabs.margin0[source]
+        rigid_contact_margin1[tid] = slabs.margin1[source]
+        rigid_contact_tids[tid] = 0
+        _convert_one_contact(
+            tid,
+            1,
+            body_q,
+            shape_body,
+            body_flags,
+            geom_bodyid,
+            body_weldid,
+            body_treeid,
+            tree_asleep,
+            dormant_filter,
+            dormant_flag,
+            dormant_tids,
+            dormant_count,
+            body_invweight0,
+            geom_condim,
+            geom_priority,
+            geom_solmix,
+            geom_solref,
+            geom_solimp,
+            geom_friction,
+            geom_margin,
+            geom_gap,
+            shape_material_ke,
+            shape_material_kd,
+            shape_mjc_solref_mode,
+            rigid_contact_shape0,
+            rigid_contact_shape1,
+            rigid_contact_point0,
+            rigid_contact_point1,
+            rigid_contact_normal,
+            rigid_contact_offset0,
+            rigid_contact_offset1,
+            rigid_contact_margin0,
+            rigid_contact_margin1,
+            rigid_contact_stiffness,
+            rigid_contact_damping,
+            rigid_contact_friction,
+            shape_margin,
+            shape_material_kf,
+            opt_impratio_invsqrt,
+            use_kf_mapping,
+            bodies_per_world,
+            newton_shape_to_mjc_geom,
+            naconmax,
+            nacon_out,
+            contact_dist_out,
+            contact_pos_out,
+            contact_frame_out,
+            contact_includemargin_out,
+            contact_friction_out,
+            contact_solref_out,
+            contact_solreffriction_out,
+            contact_solimp_out,
+            contact_dim_out,
+            contact_geom_out,
+            contact_efc_address_out,
+            contact_worldid_out,
+            tid_to_cid,
         )
-        contact_pos_out[cid] = 0.5 * (point_a + point_b)
 
-        for i in range(contact_efc_address_out.shape[1]):
-            contact_efc_address_out[cid, i] = -1
+
+@wp.kernel(enable_backward=False)
+def _finish_wake_injection(
+    nacon: wp.array[wp.int32],
+    last_nacon_count: wp.array[wp.int32],
+    inject_count: wp.array[wp.int32],
+    wake_event: wp.array[wp.int32],
+):
+    """Publish the grown contact count to the fast path and rearm the wake gate."""
+    last_nacon_count[0] = nacon[0]
+    if inject_count.shape[0] > 0:
+        inject_count[0] = 0
+    wake_event[0] = 0
 
 
 @wp.kernel(enable_backward=False)
@@ -854,11 +1306,6 @@ def _detect_tree_wake_events(
     if tree_asleep_prev[worldid, treeid] >= 0 and current < 0:
         wake_event[0] = 1
     tree_asleep_prev[worldid, treeid] = current
-
-
-@wp.kernel
-def _clear_wake_event(wake_event: wp.array[wp.int32]):
-    wake_event[0] = 0
 
 
 @wp.kernel

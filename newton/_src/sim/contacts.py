@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import warnings
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import warp as wp
 from warp import DeviceLike as Devicelike
 
 from ..utils.deprecation import deprecate_nonkeyword_arguments
+
+if TYPE_CHECKING:
+    from ..geometry.contact_replay import DormantContactStore
 
 GENERATION_SENTINEL = -1
 """Value reserved as an impossible generation; the increment kernel skips it."""
@@ -224,6 +227,13 @@ class Contacts:
         self.per_contact_shape_properties = per_contact_shape_properties
         self.clear_buffers = clear_buffers
         self._contact_matching_mode: Literal["disabled", "latest", "sticky"] = "disabled"
+        self.dormant_contact_store: DormantContactStore | None = None
+        """Dormant contact store that shadows this buffer, set by :meth:`CollisionPipeline.collide`.
+
+        When present, rows between sleeping dynamic shapes and immovable shapes are held
+        in the store instead of this buffer, and solvers that support it inject them
+        when a tree wakes. ``None`` when the pipeline runs without the store.
+        """
         with wp.ScopedDevice(device):
             # One int32[2] array holding two independent contact counts: [0] rigid, [1] soft.
             # rigid_contact_count (the [0:1] view) and soft_contact_count (the [1:2] view) index

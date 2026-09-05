@@ -425,141 +425,11 @@ class TestMuJoCoSleeping(unittest.TestCase):
         np.testing.assert_array_equal(solver.mjw_data.tree_awake.numpy()[0], [1, 1])
         np.testing.assert_array_equal(solver.mjw_data.overflow.numpy(), [0])
 
-    def test_sdf_replay_force_wake_matches_full_collision(self):
-        """Match a full SDF contact solve when force wakes a supported sleeping body."""
-        if not wp.is_cuda_available():
-            self.skipTest("Texture SDF construction requires CUDA")
-
-        device = wp.get_device()
-        support_mesh = newton.Mesh.create_box(0.3, 0.3, 0.08, duplicate_vertices=False)
-        dynamic_mesh = newton.Mesh.create_box(0.1, 0.1, 0.08, duplicate_vertices=False)
-        for mesh in (support_mesh, dynamic_mesh):
-            mesh.build_sdf(
-                device=device,
-                max_resolution=16,
-                narrow_band_range=(-0.02, 0.02),
-                margin=0.02,
-            )
-
-        builder = newton.ModelBuilder()
-        builder.rigid_gap = 0.005
-        support_body = builder.add_body(
-            xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
-            mass=1.0,
-            inertia=wp.mat33(np.eye(3)),
-            lock_inertia=True,
-            is_kinematic=True,
-        )
-        support_shape = builder.add_shape_mesh(body=support_body, mesh=support_mesh)
-        dynamic_body = builder.add_body(
-            xform=wp.transform(wp.vec3(0.0, 0.0, 0.158), wp.quat_identity()),
-            mass=1.0,
-            inertia=wp.mat33(np.eye(3)),
-            lock_inertia=True,
-        )
-        dynamic_shape = builder.add_shape_mesh(body=dynamic_body, mesh=dynamic_mesh)
-        model = builder.finalize(device=device)
-
-        def run_case(*, replay_contact_max: int):
-            solver = SolverMuJoCo(
-                model,
-                enable_sleeping=True,
-                nvmax=model.joint_dof_count,
-                iterations=10,
-                ls_iterations=5,
-                njmax=128,
-                nconmax=64,
-                use_mujoco_contacts=False,
-            )
-            pipeline = newton.CollisionPipeline(
-                model,
-                broad_phase="sap",
-                rigid_contact_max=64,
-                max_triangle_pairs=4096,
-                deterministic=True,
-                verify_buffers=False,
-                sdf_contact_replay_max=replay_contact_max,
-            )
-            sleep_filter = solver.collision_sleep_filter
-            assert sleep_filter is not None
-            shape_sleep_index, tree_asleep = sleep_filter
-            sleep_index = shape_sleep_index.numpy()
-            np.testing.assert_array_equal(sleep_index[support_shape], [-1, -2])
-            dynamic_world, dynamic_tree = (int(value) for value in sleep_index[dynamic_shape])
-            self.assertGreaterEqual(dynamic_world, 0)
-            self.assertGreaterEqual(dynamic_tree, 0)
-            if replay_contact_max > 0:
-                pipeline.configure_sleep_filter(shape_sleep_index, tree_asleep)
-
-            state_in = model.state()
-            state_out = model.state()
-            control = model.control()
-            contacts = pipeline.contacts()
-            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-
-            # Seed replay while the tree is awake, then put it to sleep without
-            # changing the certified contact pose.
-            pipeline.collide(state_in, contacts)
-            self.assertGreater(int(pipeline.narrow_phase.shape_pairs_mesh_mesh_count.numpy()[0]), 0)
-            self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
-            solver.set_body_sleep_state(
-                wp.array([[dynamic_body]], dtype=wp.int32, device=device),
-                wp.array([[True]], dtype=wp.bool, device=device),
-                wp.array([dynamic_world], dtype=wp.int32, device=device),
-            )
-            solver.reset(state_in, flags=0)
-            self.assertGreaterEqual(int(tree_asleep.numpy()[dynamic_world, dynamic_tree]), 0)
-
-            body_force = np.zeros((model.body_count, 6), dtype=np.float32)
-            body_force[dynamic_body, 3] = 20.0
-            state_in.body_f.assign(body_force)
-            pipeline.collide(state_in, contacts)
-            sdf_pair_count = int(pipeline.narrow_phase.shape_pairs_mesh_mesh_count.numpy()[0])
-            contact_count = int(contacts.rigid_contact_count.numpy()[0])
-            self.assertGreater(contact_count, 0)
-            contact_geometry = {
-                name: getattr(contacts, name).numpy()[:contact_count].copy()
-                for name in (
-                    "rigid_contact_shape0",
-                    "rigid_contact_shape1",
-                    "rigid_contact_point0",
-                    "rigid_contact_point1",
-                    "rigid_contact_offset0",
-                    "rigid_contact_offset1",
-                    "rigid_contact_normal",
-                    "rigid_contact_margin0",
-                    "rigid_contact_margin1",
-                )
-            }
-
-            solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
-            self.assertLess(int(tree_asleep.numpy()[dynamic_world, dynamic_tree]), 0)
-            self.assertGreater(int(solver.mjw_data.nacon.numpy()[0]), 0)
-            self.assertGreater(abs(float(state_out.body_qd.numpy()[dynamic_body, 3])), 1.0e-5)
-            return {
-                "sdf_pair_count": sdf_pair_count,
-                "contact_count": contact_count,
-                "contact_geometry": contact_geometry,
-                "joint_q": state_out.joint_q.numpy(),
-                "joint_qd": state_out.joint_qd.numpy(),
-                "body_q": state_out.body_q.numpy(),
-                "body_qd": state_out.body_qd.numpy(),
-                "qacc": solver.mjw_data.qacc.numpy(),
-                "qfrc_constraint": solver.mjw_data.qfrc_constraint.numpy(),
-            }
-
-        reference = run_case(replay_contact_max=0)
-        replayed = run_case(replay_contact_max=64)
-        self.assertGreater(reference["sdf_pair_count"], 0)
-        self.assertEqual(replayed["sdf_pair_count"], 0)
-        self.assertEqual(replayed["contact_count"], reference["contact_count"])
-        for name, expected in reference["contact_geometry"].items():
-            np.testing.assert_array_equal(replayed["contact_geometry"][name], expected, err_msg=name)
-        for name in ("joint_q", "joint_qd", "body_q", "body_qd", "qacc", "qfrc_constraint"):
-            np.testing.assert_allclose(replayed[name], reference[name], rtol=1.0e-5, atol=1.0e-6, err_msg=name)
-
     def test_dormant_contact_filter_parks_sleeping_contacts_and_injects_on_wake(self):
-        """Park asleep-vs-kinematic contacts and restore them in the substep the tree wakes."""
+        """Park asleep-vs-kinematic live rows and restore them in the substep the tree wakes.
+
+        Runs without the pipeline's dormant contact store so every row reaches the adapter.
+        """
         if not wp.is_cuda_available():
             self.skipTest("Texture SDF construction requires CUDA")
 
@@ -610,7 +480,6 @@ class TestMuJoCoSleeping(unittest.TestCase):
                 max_triangle_pairs=4096,
                 deterministic=True,
                 verify_buffers=False,
-                sdf_contact_replay_max=64,
             )
             shape_sleep_index, tree_asleep = solver.collision_sleep_filter
             dynamic_world, dynamic_tree = (int(value) for value in shape_sleep_index.numpy()[dynamic_shape])
@@ -622,7 +491,7 @@ class TestMuJoCoSleeping(unittest.TestCase):
             contacts = pipeline.contacts()
             newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
 
-            # Seed the replay cache while awake, then put the resting body to sleep.
+            # Put the resting body to sleep.
             pipeline.collide(state_in, contacts)
             solver.set_body_sleep_state(
                 wp.array([[dynamic_body]], dtype=wp.int32, device=device),
@@ -632,7 +501,7 @@ class TestMuJoCoSleeping(unittest.TestCase):
             solver.reset(state_in, flags=0)
             self.assertGreaterEqual(int(tree_asleep.numpy()[dynamic_world, dynamic_tree]), 0)
 
-            # A quiet substep: the replayed support contacts reach MJWarp only without the filter.
+            # A quiet substep: the recomputed support rows reach MJWarp only without the filter.
             pipeline.collide(state_in, contacts)
             replayed_count = int(contacts.rigid_contact_count.numpy()[0])
             self.assertGreater(replayed_count, 0)

@@ -1,10 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Exact replay of unchanged reduced SDF contacts."""
+"""Dormant contact store for sleeping dynamic shapes resting on immovable shapes.
+
+The collision pipeline emits only *live* rows (at least one awake dynamic tree) into
+the :class:`~newton.Contacts` buffer. Rows between an asleep dynamic shape and an
+immovable (static or kinematic) partner are parked in a per-dynamic-shape slab
+instead. Exact per-shape signatures certify that a slab still describes the current
+contact configuration so the corresponding SDF pairs can be skipped, and the MuJoCo
+adapter injects slab rows when a tree wakes inside a step.
+"""
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+import numpy as np
 import warp as wp
 
 from ..core.reset import reset_world_selected
@@ -12,23 +23,49 @@ from .contact_data import SHAPE_PAIR_INDEX_MASK
 from .flags import ShapeFlags
 from .types import GeoType
 
+if TYPE_CHECKING:
+    from ..sim.model import Model
+
+# Grid-stride budget for the candidate-pair mask launch.
+_MASK_MAX_THREADS = 65_536
+
 
 @wp.struct
-class ContactRows:
-    """Device arrays holding final rigid-contact rows."""
+class DormantContactSlabs:
+    """Per-dynamic-shape slabs of contact rows that are absent from the live contact buffer.
+
+    Rows are stored flattened as ``slab * capacity + row`` in the pipeline's
+    body-local contact format (the same nine fields as the live buffer).
+    """
 
     capacity: int
-    count: wp.array[wp.int32]
+    """Rows per slab."""
+    slab_of_shape: wp.array[wp.int32]
+    """Slab index per collision shape, ``-1`` for shapes without a slab, shape ``[shape_count]``."""
+    slab_shape: wp.array[wp.int32]
+    """Dynamic shape owning each slab, shape ``[slab_count]``."""
+    slab_count: wp.array[wp.int32]
+    """Rows currently held per slab (may exceed ``capacity`` after an overflow), shape ``[slab_count]``."""
+    slab_overflow: wp.array[wp.int32]
+    """Nonzero when a slab dropped rows to the live buffer this pass, shape ``[slab_count]``."""
+    slab_live_gen: wp.array[wp.int32]
+    """Contact generation whose live buffer already holds this slab's rows, shape ``[slab_count]``."""
     shape0: wp.array[wp.int32]
     shape1: wp.array[wp.int32]
     point0: wp.array[wp.vec3]
+    """Body-frame contact point on shape 0 [m]."""
     point1: wp.array[wp.vec3]
+    """Body-frame contact point on shape 1 [m]."""
     offset0: wp.array[wp.vec3]
+    """Body-frame friction anchor offset for shape 0 [m]."""
     offset1: wp.array[wp.vec3]
+    """Body-frame friction anchor offset for shape 1 [m]."""
     normal: wp.array[wp.vec3]
+    """Contact normal from shape 0 toward shape 1."""
     margin0: wp.array[wp.float32]
+    """Surface thickness for shape 0 [m]."""
     margin1: wp.array[wp.float32]
-    sort_key: wp.array[wp.int64]
+    """Surface thickness for shape 1 [m]."""
 
 
 @wp.struct
@@ -261,28 +298,81 @@ def _is_replay_eligible(
 
 
 @wp.func
-def _copy_contact_row(source: ContactRows, source_index: int, target: ContactRows, target_index: int):
-    target.shape0[target_index] = source.shape0[source_index]
-    target.shape1[target_index] = source.shape1[source_index]
-    target.point0[target_index] = source.point0[source_index]
-    target.point1[target_index] = source.point1[source_index]
-    target.offset0[target_index] = source.offset0[source_index]
-    target.offset1[target_index] = source.offset1[source_index]
-    target.normal[target_index] = source.normal[source_index]
-    target.margin0[target_index] = source.margin0[source_index]
-    target.margin1[target_index] = source.margin1[source_index]
-    if target.sort_key.shape[0] > 0:
-        target.sort_key[target_index] = wp.int64(0)
-        if source.sort_key.shape[0] > 0:
-            target.sort_key[target_index] = source.sort_key[source_index]
+def _move_slab_row(slabs: DormantContactSlabs, source: int, target: int):
+    slabs.shape0[target] = slabs.shape0[source]
+    slabs.shape1[target] = slabs.shape1[source]
+    slabs.point0[target] = slabs.point0[source]
+    slabs.point1[target] = slabs.point1[source]
+    slabs.offset0[target] = slabs.offset0[source]
+    slabs.offset1[target] = slabs.offset1[source]
+    slabs.normal[target] = slabs.normal[source]
+    slabs.margin0[target] = slabs.margin0[source]
+    slabs.margin1[target] = slabs.margin1[source]
 
 
 @wp.kernel(enable_backward=False)
-def replay_contacts_and_mask_pairs(
-    cached: ContactRows,
-    cache_complete: wp.array[wp.int32],
-    output: ContactRows,
-    output_tids: wp.array[wp.int32],
+def retain_dormant_slabs(
+    slabs: DormantContactSlabs,
+    shape_type: wp.array[wp.int32],
+    shape_sdf_index: wp.array[wp.int32],
+    shape_edge_range: wp.array[wp.vec2i],
+    shape_flags: wp.array[wp.int32],
+    shape_sleep_index: wp.array[wp.vec2i],
+    tree_asleep: wp.array2d[wp.int32],
+    shape_unchanged: wp.array[wp.int32],
+    contact_generation: wp.array[wp.int32],
+    slab_masking: wp.array[wp.int32],
+):
+    """Keep slab rows whose pair is replayed this pass and drop everything else.
+
+    One thread per slab. A slab survives only when its dynamic shape is asleep,
+    exactly unchanged, and did not overflow last pass; surviving rows are then
+    compacted to those whose partner is also unchanged, i.e. exactly the pairs
+    :func:`mask_dormant_pairs` removes from the current candidate list.
+    """
+    slab = wp.tid()
+    shape = slabs.slab_shape[slab]
+    sleep = shape_sleep_index[shape]
+    asleep = tree_asleep[sleep[0], sleep[1]] >= 0
+    if not asleep:
+        # The writer exports this shape's rows live this pass; stamp the slab so a
+        # wake later in the tick does not inject them a second time.
+        slabs.slab_live_gen[slab] = contact_generation[0]
+    if not asleep or shape_unchanged[shape] == 0 or slabs.slab_overflow[slab] != 0:
+        slabs.slab_count[slab] = 0
+        slabs.slab_overflow[slab] = 0
+        slab_masking[slab] = 0
+        return
+
+    capacity = slabs.capacity
+    base = slab * capacity
+    count = wp.min(slabs.slab_count[slab], capacity)
+    kept = int(0)
+    for row in range(count):
+        shape_a = slabs.shape0[base + row]
+        shape_b = slabs.shape1[base + row]
+        partner = shape_b
+        if shape_b == shape:
+            partner = shape_a
+        keep = shape_unchanged[partner] != 0 and _is_replay_pair(
+            shape_a,
+            shape_b,
+            shape_type,
+            shape_sdf_index,
+            shape_edge_range,
+            shape_flags,
+            shape_sleep_index,
+        )
+        if keep:
+            if kept != row:
+                _move_slab_row(slabs, base + row, base + kept)
+            kept += 1
+    slabs.slab_count[slab] = kept
+    slab_masking[slab] = 1
+
+
+@wp.kernel(enable_backward=False)
+def mask_dormant_pairs(
     candidate_pairs: wp.array[wp.vec2i],
     candidate_pair_count: wp.array[wp.int32],
     shape_type: wp.array[wp.int32],
@@ -292,33 +382,12 @@ def replay_contacts_and_mask_pairs(
     shape_sleep_index: wp.array[wp.vec2i],
     tree_asleep: wp.array2d[wp.int32],
     shape_unchanged: wp.array[wp.int32],
+    slab_of_shape: wp.array[wp.int32],
+    slab_masking: wp.array[wp.int32],
     total_num_threads: int,
 ):
-    """Append exact cached rows and remove their pairs from the current scan."""
-    if cache_complete[0] == 0 or cached.count[0] > cached.capacity or cached.count[0] > output.capacity:
-        return
-
+    """Remove candidate pairs whose rows are retained in a certified slab."""
     tid = wp.tid()
-    cached_count = wp.min(cached.count[0], cached.capacity)
-    for index in range(tid, cached_count, total_num_threads):
-        shape_a = cached.shape0[index]
-        shape_b = cached.shape1[index]
-        if _is_replay_eligible(
-            shape_a,
-            shape_b,
-            shape_type,
-            shape_sdf_index,
-            shape_edge_range,
-            shape_flags,
-            shape_sleep_index,
-            tree_asleep,
-            shape_unchanged,
-        ):
-            output_index = wp.atomic_add(output.count, 0, 1)
-            if output_index < output.capacity:
-                _copy_contact_row(cached, index, output, output_index)
-                output_tids[output_index] = 0
-
     pair_count = wp.min(candidate_pair_count[0], candidate_pairs.shape[0])
     for index in range(tid, pair_count, total_num_threads):
         pair = candidate_pairs[index]
@@ -326,7 +395,7 @@ def replay_contacts_and_mask_pairs(
             continue
         shape_a = pair[0] & SHAPE_PAIR_INDEX_MASK
         shape_b = pair[1] & SHAPE_PAIR_INDEX_MASK
-        if _is_replay_eligible(
+        if not _is_replay_eligible(
             shape_a,
             shape_b,
             shape_type,
@@ -337,66 +406,13 @@ def replay_contacts_and_mask_pairs(
             tree_asleep,
             shape_unchanged,
         ):
+            continue
+        dynamic = shape_a
+        if shape_sleep_index[shape_a][1] < 0:
+            dynamic = shape_b
+        slab = slab_of_shape[dynamic]
+        if slab >= 0 and slab_masking[slab] != 0:
             candidate_pairs[index] = wp.vec2i(-1, -1)
-
-
-@wp.kernel(enable_backward=False)
-def begin_contact_cache_save(
-    output_count: wp.array[wp.int32],
-    output_capacity: int,
-    broad_phase_pair_count: wp.array[wp.int32],
-    broad_phase_pair_capacity: int,
-    sdf_pair_count: wp.array[wp.int32],
-    sdf_pair_capacity: int,
-    reducer_contact_count: wp.array[wp.int32],
-    reducer_contact_capacity: int,
-    reducer_insert_failures: wp.array[wp.int32],
-    cached_count: wp.array[wp.int32],
-    cache_complete: wp.array[wp.int32],
-):
-    """Reset the compact cache and reject incomplete collision output."""
-    cached_count[0] = 0
-    cache_complete[0] = int(
-        output_count[0] <= output_capacity
-        and broad_phase_pair_count[0] <= broad_phase_pair_capacity
-        and sdf_pair_count[0] <= sdf_pair_capacity
-        and reducer_contact_count[0] < reducer_contact_capacity
-        and reducer_insert_failures[0] == 0
-    )
-
-
-@wp.kernel(enable_backward=False)
-def save_replay_contacts(
-    output: ContactRows,
-    cached: ContactRows,
-    cache_complete: wp.array[wp.int32],
-    shape_type: wp.array[wp.int32],
-    shape_sdf_index: wp.array[wp.int32],
-    shape_edge_range: wp.array[wp.vec2i],
-    shape_flags: wp.array[wp.int32],
-    shape_sleep_index: wp.array[wp.vec2i],
-    total_num_threads: int,
-):
-    """Compact replay-capable final contact rows for the next pass."""
-    tid = wp.tid()
-    output_count = wp.min(output.count[0], output.capacity)
-    for index in range(tid, output_count, total_num_threads):
-        shape_a = output.shape0[index]
-        shape_b = output.shape1[index]
-        if _is_replay_pair(
-            shape_a,
-            shape_b,
-            shape_type,
-            shape_sdf_index,
-            shape_edge_range,
-            shape_flags,
-            shape_sleep_index,
-        ):
-            cached_index = wp.atomic_add(cached.count, 0, 1)
-            if cached_index < cached.capacity:
-                _copy_contact_row(output, index, cached, cached_index)
-            else:
-                cache_complete[0] = 0
 
 
 @wp.kernel(enable_backward=False)
@@ -412,56 +428,111 @@ def invalidate_shape_signatures(
         signature_valid[shape] = 0
 
 
-class SDFContactReplay:
-    """Own the bounded cache for exact unchanged SDF contact replay."""
+@wp.kernel(enable_backward=False)
+def invalidate_dormant_slabs(
+    slab_world: wp.array[wp.int32],
+    world_mask: wp.array[wp.bool],
+    world_count: int,
+    slab_count: wp.array[wp.int32],
+    slab_overflow: wp.array[wp.int32],
+):
+    """Drop slab rows of reset-selected worlds."""
+    slab = wp.tid()
+    if reset_world_selected(slab_world[slab], world_mask, world_count):
+        slab_count[slab] = 0
+        slab_overflow[slab] = 0
 
-    def __init__(self, shape_count: int, contact_capacity: int, device: wp.Device):
+
+class DormantContactStore:
+    """Own the per-dynamic-shape dormant slabs and the exact per-shape replay certificates.
+
+    One slab is allocated for every collision-enabled shape attached to a dynamic
+    MuJoCo tree (``shape_sleep_index[shape][1] >= 0``).
+    """
+
+    def __init__(
+        self,
+        model: Model,
+        shape_sleep_index: wp.array[wp.vec2i],
+        rows_per_shape: int,
+        device: wp.Device,
+    ):
+        if rows_per_shape <= 0:
+            raise ValueError(f"rows_per_shape must be positive, got {rows_per_shape}")
+        shape_count = int(model.shape_count)
+        if shape_sleep_index.shape != (shape_count,):
+            raise ValueError("shape_sleep_index must have one entry per collision shape")
         self.device = device
-        self.contact_capacity = contact_capacity
+        self.shape_sleep_index = shape_sleep_index
+        self.rows_per_shape = int(rows_per_shape)
+
+        sleep_index = shape_sleep_index.numpy()
+        shape_flags = model.shape_flags.numpy()
+        has_slab = (sleep_index[:, 1] >= 0) & ((shape_flags & int(ShapeFlags.COLLIDE_SHAPES)) != 0)
+        slab_shapes = np.nonzero(has_slab)[0].astype(np.int32)
+        slab_of_shape = np.full(shape_count, -1, dtype=np.int32)
+        slab_of_shape[slab_shapes] = np.arange(slab_shapes.shape[0], dtype=np.int32)
+        self.slab_count_total = int(slab_shapes.shape[0])
+        """Number of slabs (dynamic collision shapes)."""
+        row_total = self.slab_count_total * self.rows_per_shape
+
         with wp.ScopedDevice(device):
             self.signatures = wp.zeros(shape_count, dtype=ShapeReplaySignature, device=device)
             self.signature_valid = wp.zeros(shape_count, dtype=wp.int32, device=device)
             self.shape_unchanged = wp.zeros(shape_count, dtype=wp.int32, device=device)
-            self.contact_count = wp.zeros(1, dtype=wp.int32, device=device)
-            self.complete = wp.zeros(1, dtype=wp.int32, device=device)
-            self._empty_sort_key = wp.zeros(0, dtype=wp.int64, device=device)
-            self.rows = ContactRows()
-            self.rows.capacity = contact_capacity
-            self.rows.count = self.contact_count
-            self.rows.shape0 = wp.empty(contact_capacity, dtype=wp.int32, device=device)
-            self.rows.shape1 = wp.empty(contact_capacity, dtype=wp.int32, device=device)
-            self.rows.point0 = wp.empty(contact_capacity, dtype=wp.vec3, device=device)
-            self.rows.point1 = wp.empty(contact_capacity, dtype=wp.vec3, device=device)
-            self.rows.offset0 = wp.empty(contact_capacity, dtype=wp.vec3, device=device)
-            self.rows.offset1 = wp.empty(contact_capacity, dtype=wp.vec3, device=device)
-            self.rows.normal = wp.empty(contact_capacity, dtype=wp.vec3, device=device)
-            self.rows.margin0 = wp.empty(contact_capacity, dtype=wp.float32, device=device)
-            self.rows.margin1 = wp.empty(contact_capacity, dtype=wp.float32, device=device)
-            self.rows.sort_key = wp.empty(contact_capacity, dtype=wp.int64, device=device)
+            self.slab_world_tree = wp.array(sleep_index[slab_shapes], dtype=wp.vec2i, device=device)
+            """MuJoCo ``(world, tree)`` per slab, shape ``[slab_count_total]``."""
+            self.slab_world = wp.array(model.shape_world.numpy()[slab_shapes], dtype=wp.int32, device=device)
+            self.slab_masking = wp.zeros(self.slab_count_total, dtype=wp.int32, device=device)
+            """Nonzero for slabs whose pairs are masked in the current pass, shape ``[slab_count_total]``."""
+            # Scratch for the solver-side wake injection (slabs whose tree woke this substep).
+            self.inject_slabs = wp.zeros(self.slab_count_total, dtype=wp.int32, device=device)
+            self.inject_count = wp.zeros(1, dtype=wp.int32, device=device)
+            slabs = DormantContactSlabs()
+            slabs.capacity = self.rows_per_shape
+            slabs.slab_of_shape = wp.array(slab_of_shape, dtype=wp.int32, device=device)
+            slabs.slab_shape = wp.array(slab_shapes, dtype=wp.int32, device=device)
+            slabs.slab_count = wp.zeros(self.slab_count_total, dtype=wp.int32, device=device)
+            slabs.slab_overflow = wp.zeros(self.slab_count_total, dtype=wp.int32, device=device)
+            slabs.slab_live_gen = wp.full(self.slab_count_total, -1, dtype=wp.int32, device=device)
+            slabs.shape0 = wp.empty(row_total, dtype=wp.int32, device=device)
+            slabs.shape1 = wp.empty(row_total, dtype=wp.int32, device=device)
+            slabs.point0 = wp.empty(row_total, dtype=wp.vec3, device=device)
+            slabs.point1 = wp.empty(row_total, dtype=wp.vec3, device=device)
+            slabs.offset0 = wp.empty(row_total, dtype=wp.vec3, device=device)
+            slabs.offset1 = wp.empty(row_total, dtype=wp.vec3, device=device)
+            slabs.normal = wp.empty(row_total, dtype=wp.vec3, device=device)
+            slabs.margin0 = wp.empty(row_total, dtype=wp.float32, device=device)
+            slabs.margin1 = wp.empty(row_total, dtype=wp.float32, device=device)
+            self.slabs = slabs
+            """Device view of the slab arrays shared with the contact writer and the solver."""
 
-    def make_rows(self, contacts, sort_key: wp.array[wp.int64]) -> ContactRows:
-        """Build a row view over a live :class:`newton.Contacts` buffer."""
-        rows = ContactRows()
-        rows.capacity = contacts.rigid_contact_max
-        rows.count = contacts.rigid_contact_count
-        rows.shape0 = contacts.rigid_contact_shape0
-        rows.shape1 = contacts.rigid_contact_shape1
-        rows.point0 = contacts.rigid_contact_point0
-        rows.point1 = contacts.rigid_contact_point1
-        rows.offset0 = contacts.rigid_contact_offset0
-        rows.offset1 = contacts.rigid_contact_offset1
-        rows.normal = contacts.rigid_contact_normal
-        rows.margin0 = contacts.rigid_contact_margin0
-        rows.margin1 = contacts.rigid_contact_margin1
-        rows.sort_key = sort_key
-        return rows
+    @property
+    def slab_count(self) -> wp.array[wp.int32]:
+        """Rows held per slab, shape ``[slab_count_total]``."""
+        return self.slabs.slab_count
+
+    @property
+    def slab_overflow(self) -> wp.array[wp.int32]:
+        """Overflow flag per slab, shape ``[slab_count_total]``."""
+        return self.slabs.slab_overflow
+
+    @property
+    def slab_live_gen(self) -> wp.array[wp.int32]:
+        """Contact generation whose live buffer holds each slab's rows, shape ``[slab_count_total]``."""
+        return self.slabs.slab_live_gen
+
+    @property
+    def slab_of_shape(self) -> wp.array[wp.int32]:
+        """Slab index per shape (``-1`` without a slab), shape ``[shape_count]``."""
+        return self.slabs.slab_of_shape
 
     def reset(self, shape_world: wp.array[wp.int32], world_count: int, world_mask: wp.array[wp.bool] | None):
-        """Invalidate all or reset-selected shape signatures."""
+        """Invalidate signatures and drop slab rows for all or reset-selected worlds."""
         if world_mask is None:
             self.signature_valid.zero_()
-            self.contact_count.zero_()
-            self.complete.zero_()
+            self.slabs.slab_count.zero_()
+            self.slabs.slab_overflow.zero_()
             return
         wp.launch(
             invalidate_shape_signatures,
@@ -470,6 +541,14 @@ class SDFContactReplay:
             device=self.device,
             record_tape=False,
         )
+        if self.slab_count_total > 0:
+            wp.launch(
+                invalidate_dormant_slabs,
+                dim=self.slab_count_total,
+                inputs=[self.slab_world, world_mask, world_count, self.slabs.slab_count, self.slabs.slab_overflow],
+                device=self.device,
+                record_tape=False,
+            )
 
     def classify(
         self,
@@ -534,13 +613,12 @@ class SDFContactReplay:
             record_tape=False,
         )
 
-    def replay_and_mask(
+    def retain_and_mask(
         self,
         *,
-        output: ContactRows,
-        output_tids: wp.array[wp.int32],
         candidate_pairs: wp.array[wp.vec2i],
         candidate_pair_count: wp.array[wp.int32],
+        contact_generation: wp.array[wp.int32],
         shape_type: wp.array[wp.int32],
         shape_sdf_index: wp.array[wp.int32],
         shape_edge_range: wp.array[wp.vec2i],
@@ -548,16 +626,36 @@ class SDFContactReplay:
         shape_sleep_index: wp.array[wp.vec2i],
         tree_asleep: wp.array2d[wp.int32],
     ):
-        """Replay cached rows and mask the corresponding current SDF pairs."""
-        thread_count = min(max(self.contact_capacity, candidate_pairs.shape[0], 1), 65_536)
+        """Retain certified slab rows, then mask their candidate pairs.
+
+        Two launches: the mask pass reads the per-slab masking flags the retention
+        pass writes, so they must not share a launch.
+        """
+        if self.slab_count_total == 0:
+            return
         wp.launch(
-            replay_contacts_and_mask_pairs,
+            retain_dormant_slabs,
+            dim=self.slab_count_total,
+            inputs=[
+                self.slabs,
+                shape_type,
+                shape_sdf_index,
+                shape_edge_range,
+                shape_flags,
+                shape_sleep_index,
+                tree_asleep,
+                self.shape_unchanged,
+                contact_generation,
+            ],
+            outputs=[self.slab_masking],
+            device=self.device,
+            record_tape=False,
+        )
+        thread_count = min(max(candidate_pairs.shape[0], 1), _MASK_MAX_THREADS)
+        wp.launch(
+            mask_dormant_pairs,
             dim=thread_count,
             inputs=[
-                self.rows,
-                self.complete,
-                output,
-                output_tids,
                 candidate_pairs,
                 candidate_pair_count,
                 shape_type,
@@ -567,61 +665,8 @@ class SDFContactReplay:
                 shape_sleep_index,
                 tree_asleep,
                 self.shape_unchanged,
-                thread_count,
-            ],
-            device=self.device,
-            record_tape=False,
-        )
-
-    def save(
-        self,
-        *,
-        output: ContactRows,
-        broad_phase_pair_count: wp.array[wp.int32],
-        broad_phase_pair_capacity: int,
-        sdf_pair_count: wp.array[wp.int32],
-        sdf_pair_capacity: int,
-        reducer_contact_count: wp.array[wp.int32],
-        reducer_contact_capacity: int,
-        reducer_insert_failures: wp.array[wp.int32],
-        shape_type: wp.array[wp.int32],
-        shape_sdf_index: wp.array[wp.int32],
-        shape_edge_range: wp.array[wp.vec2i],
-        shape_flags: wp.array[wp.int32],
-        shape_sleep_index: wp.array[wp.vec2i],
-    ):
-        """Replace the compact cache with replay-capable final rows."""
-        wp.launch(
-            begin_contact_cache_save,
-            dim=1,
-            inputs=[
-                output.count,
-                output.capacity,
-                broad_phase_pair_count,
-                broad_phase_pair_capacity,
-                sdf_pair_count,
-                sdf_pair_capacity,
-                reducer_contact_count,
-                reducer_contact_capacity,
-                reducer_insert_failures,
-            ],
-            outputs=[self.contact_count, self.complete],
-            device=self.device,
-            record_tape=False,
-        )
-        thread_count = min(max(output.capacity, 1), 65_536)
-        wp.launch(
-            save_replay_contacts,
-            dim=thread_count,
-            inputs=[
-                output,
-                self.rows,
-                self.complete,
-                shape_type,
-                shape_sdf_index,
-                shape_edge_range,
-                shape_flags,
-                shape_sleep_index,
+                self.slabs.slab_of_shape,
+                self.slab_masking,
                 thread_count,
             ],
             device=self.device,
