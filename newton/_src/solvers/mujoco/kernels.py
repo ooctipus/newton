@@ -1582,11 +1582,12 @@ def _store_qpos(
     qpos[worldid, index] = value
 
 
-@wp.kernel
-def convert_warp_coords_to_mj_kernel(
+@wp.func
+def _convert_warp_joint_to_mj(
+    worldid: int,
+    jntid: int,
     joint_q: wp.array[wp.float32],
     joint_qd: wp.array[wp.float32],
-    world_mask: wp.array[wp.bool],
     joints_per_world: int,
     joint_type: wp.array[wp.int32],
     joint_q_start: wp.array[wp.int32],
@@ -1601,22 +1602,16 @@ def convert_warp_coords_to_mj_kernel(
     mj_qd_start: wp.array[wp.int32],
     qpos_treeid: wp.array[wp.int32],
     change_tolerance: float,
-    # outputs
     qpos: wp.array2d[wp.float32],
     qvel: wp.array2d[wp.float32],
     tree_changed: wp.array2d[wp.int32],
 ):
-    """Write Newton joint coordinates and velocities into MuJoCo ``qpos`` / ``qvel``.
+    """Write one Newton joint's coordinates and velocities into MuJoCo ``qpos`` / ``qvel``.
 
     When ``tree_changed`` is bound, every coordinate that moves by more than ``change_tolerance``
     flags its tree (``qpos_treeid``) so :func:`wake_changed_trees_kernel` can wake externally
     edited trees; otherwise the coordinates are stored unconditionally.
     """
-    worldid, jntid = wp.tid()
-
-    if world_mask and not world_mask[worldid]:
-        return
-
     joint_id = joints_per_world * worldid + jntid
 
     # Skip loop joints — they have no MuJoCo qpos/qvel entries
@@ -1695,6 +1690,126 @@ def convert_warp_coords_to_mj_kernel(
         for i in range(axis_count):
             # convert velocity components
             qvel[worldid, qd_i + i] = joint_qd[wqd_i + i]
+
+
+@wp.kernel
+def convert_warp_coords_to_mj_kernel(
+    joint_q: wp.array[wp.float32],
+    joint_qd: wp.array[wp.float32],
+    world_mask: wp.array[wp.bool],
+    joints_per_world: int,
+    joint_type: wp.array[wp.int32],
+    joint_q_start: wp.array[wp.int32],
+    joint_qd_start: wp.array[wp.int32],
+    joint_dof_dim: wp.array2d[wp.int32],
+    joint_child: wp.array[wp.int32],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    dof_ref: wp.array[wp.float32],
+    mj_q_start: wp.array[wp.int32],
+    mj_qd_start: wp.array[wp.int32],
+    qpos_treeid: wp.array[wp.int32],
+    change_tolerance: float,
+    # outputs
+    qpos: wp.array2d[wp.float32],
+    qvel: wp.array2d[wp.float32],
+    tree_changed: wp.array2d[wp.int32],
+):
+    """Write Newton joint coordinates and velocities into MuJoCo ``qpos`` / ``qvel``.
+
+    Launched over ``(world, joint)``; a ``None`` ``world_mask`` converts every world. See
+    :func:`_convert_warp_joint_to_mj` for the tree-change flags.
+    """
+    worldid, jntid = wp.tid()
+
+    if world_mask and not world_mask[worldid]:
+        return
+
+    _convert_warp_joint_to_mj(
+        worldid,
+        jntid,
+        joint_q,
+        joint_qd,
+        joints_per_world,
+        joint_type,
+        joint_q_start,
+        joint_qd_start,
+        joint_dof_dim,
+        joint_child,
+        joint_X_p,
+        joint_X_c,
+        body_com,
+        dof_ref,
+        mj_q_start,
+        mj_qd_start,
+        qpos_treeid,
+        change_tolerance,
+        qpos,
+        qvel,
+        tree_changed,
+    )
+
+
+@wp.kernel
+def convert_warp_coords_to_mj_worlds_kernel(
+    joint_q: wp.array[wp.float32],
+    joint_qd: wp.array[wp.float32],
+    world_ids: wp.array[wp.int32],
+    world_count: wp.array[wp.int32],
+    joints_per_world: int,
+    joint_type: wp.array[wp.int32],
+    joint_q_start: wp.array[wp.int32],
+    joint_qd_start: wp.array[wp.int32],
+    joint_dof_dim: wp.array2d[wp.int32],
+    joint_child: wp.array[wp.int32],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    dof_ref: wp.array[wp.float32],
+    mj_q_start: wp.array[wp.int32],
+    mj_qd_start: wp.array[wp.int32],
+    qpos_treeid: wp.array[wp.int32],
+    change_tolerance: float,
+    # outputs
+    qpos: wp.array2d[wp.float32],
+    qvel: wp.array2d[wp.float32],
+    tree_changed: wp.array2d[wp.int32],
+):
+    """Write Newton joint coordinates and velocities into ``qpos`` / ``qvel`` of listed worlds.
+
+    Launched over ``(slot, joint)``: slot ``s`` converts world ``world_ids[s]``. A bound
+    ``world_count`` (one int32) limits the valid slots without a host sync; ``None`` accepts every
+    slot of the launch.
+    """
+    slot, jntid = wp.tid()
+
+    if world_count and slot >= world_count[0]:
+        return
+
+    _convert_warp_joint_to_mj(
+        world_ids[slot],
+        jntid,
+        joint_q,
+        joint_qd,
+        joints_per_world,
+        joint_type,
+        joint_q_start,
+        joint_qd_start,
+        joint_dof_dim,
+        joint_child,
+        joint_X_p,
+        joint_X_c,
+        body_com,
+        dof_ref,
+        mj_q_start,
+        mj_qd_start,
+        qpos_treeid,
+        change_tolerance,
+        qpos,
+        qvel,
+        tree_changed,
+    )
 
 
 @wp.kernel
@@ -4258,24 +4373,66 @@ def update_pair_properties_kernel(
 
 
 @wp.kernel(enable_backward=False)
-def reset_world_buffers_kernel(
+def compact_reset_world_ids_kernel(
     world_mask: wp.array[wp.bool],
+    world_count: int,
+    world_ids: wp.array[wp.int32],
+    count: wp.array[wp.int32],
+):
+    """Compact the local worlds selected by a reset mask into an ascending id list.
+
+    One thread block (``wp.launch_tiled`` with ``dim=[1]``) sweeps the first
+    ``world_count`` mask entries ``block_dim`` at a time and assigns ids with a
+    block-wide prefix sum, so the list is deterministic and no host sync is
+    needed: ``count`` receives the number of selected worlds on the device.
+    """
+    _block, lane = wp.tid()
+    lanes = wp.block_dim()
+    total = int(0)
+    for chunk in range(0, world_count, lanes):
+        world = chunk + lane
+        selected = int(0)
+        if world < world_count and world_mask[world]:
+            selected = 1
+        selected_tile = wp.tile(selected)
+        offset = total + wp.untile(wp.tile_scan_exclusive(selected_tile))
+        total += wp.tile_sum(selected_tile)[0]
+        if selected != 0:
+            world_ids[offset] = world
+    if lane == 0:
+        count[0] = total
+
+
+@wp.func
+def _selected_world(slot: int, world_ids: wp.array[wp.int32], world_count: wp.array[wp.int32]) -> int:
+    """World served by launch slot ``slot``, or ``-1`` when the slot is beyond the device count."""
+    if world_count and slot >= world_count[0]:
+        return -1
+    return world_ids[slot]
+
+
+@wp.kernel(enable_backward=False)
+def reset_world_buffers_kernel(
+    world_ids: wp.array[wp.int32],
+    world_count: wp.array[wp.int32],
     qacc_warmstart: wp.array2d[wp.float32],
     qfrc_applied: wp.array2d[wp.float32],
     ctrl: wp.array2d[wp.float32],
     act: wp.array2d[wp.float32],
     xfrc_applied: wp.array2d[wp.spatial_vector],
 ):
-    """Zero the persistent MuJoCo buffers for the worlds selected by ``world_mask``.
+    """Zero the persistent MuJoCo buffers of the worlds listed in ``world_ids``.
 
-    A ``None`` ``world_mask`` resets every world. Launched over
-    ``(world, max_dim)`` where ``max_dim`` covers the widest buffer; each buffer
-    is guarded by its own column count. ``qacc_warmstart`` and ``qfrc_applied``
+    Launched over ``(slot, max_dim)`` where ``max_dim`` covers the widest
+    buffer; each buffer is guarded by its own column count. Slot ``s`` serves
+    world ``world_ids[s]``; a bound ``world_count`` (one int32) limits the
+    valid slots without a host sync. ``qacc_warmstart`` and ``qfrc_applied``
     share the DOF dimension. ``qacc`` is intentionally omitted: the solver
     overwrites it from ``qacc_warmstart`` at the start of every step.
     """
-    worldid, i = wp.tid()
-    if world_mask and not world_mask[worldid]:
+    slot, i = wp.tid()
+    worldid = _selected_world(slot, world_ids, world_count)
+    if worldid < 0:
         return
     if i < qacc_warmstart.shape[1]:
         qacc_warmstart[worldid, i] = 0.0
@@ -4290,7 +4447,8 @@ def reset_world_buffers_kernel(
 
 @wp.kernel(enable_backward=False)
 def reset_sleeping_state_kernel(
-    world_mask: wp.array[wp.bool],
+    world_ids: wp.array[wp.int32],
+    world_count: wp.array[wp.int32],
     clear_overflow: int,
     nv: int,
     nbody: int,
@@ -4311,9 +4469,14 @@ def reset_sleeping_state_kernel(
     nv_awake: wp.array[wp.int32],
     overflow: wp.array[wp.int32],
 ):
-    """Wake every tree and rebuild sleep bookkeeping in selected worlds."""
-    worldid, elemid = wp.tid()
-    if world_mask and not world_mask[worldid]:
+    """Wake every tree and rebuild sleep bookkeeping in the worlds listed in ``world_ids``.
+
+    Launched over ``(slot, max(nv, nbody, ntree))``; see
+    :func:`reset_world_buffers_kernel` for the slot convention.
+    """
+    slot, elemid = wp.tid()
+    worldid = _selected_world(slot, world_ids, world_count)
+    if worldid < 0:
         return
 
     if elemid < ntree:
@@ -4344,7 +4507,8 @@ def reset_sleeping_state_kernel(
 
 @wp.kernel(enable_backward=False)
 def restore_sleeping_state_kernel(
-    world_mask: wp.array[wp.bool],
+    world_ids: wp.array[wp.int32],
+    world_count: wp.array[wp.int32],
     clear_overflow: int,
     nv: int,
     nbody: int,
@@ -4367,9 +4531,14 @@ def restore_sleeping_state_kernel(
     nv_awake: wp.array[wp.int32],
     overflow: wp.array[wp.int32],
 ):
-    """Restore the initial sleep bookkeeping in selected worlds."""
-    worldid, elemid = wp.tid()
-    if world_mask and not world_mask[worldid]:
+    """Restore the initial sleep bookkeeping in the worlds listed in ``world_ids``.
+
+    Launched over ``(slot, max(nv, nbody, ntree))``; see
+    :func:`reset_world_buffers_kernel` for the slot convention.
+    """
+    slot, elemid = wp.tid()
+    worldid = _selected_world(slot, world_ids, world_count)
+    if worldid < 0:
         return
 
     if elemid < ntree:
@@ -4455,15 +4624,40 @@ def set_selected_body_sleep_override_kernel(
 
 @wp.kernel(enable_backward=False)
 def apply_body_sleep_override_kernel(
-    world_mask: wp.array[wp.bool],
+    world_ids: wp.array[wp.int32],
+    world_count: wp.array[wp.int32],
     body_sleep_override: wp.array2d[wp.int32],
+    nv: int,
+    nbody: int,
     ntree: int,
     awake_value: int,
+    sleep_state_static: int,
+    sleep_state_awake: int,
+    sleep_state_asleep: int,
+    body_rootid: wp.array[wp.int32],
+    body_mocapid: wp.array[wp.int32],
+    body_treeid: wp.array[wp.int32],
+    dof_bodyid: wp.array[wp.int32],
     tree_asleep: wp.array2d[wp.int32],
+    tree_awake: wp.array2d[wp.int32],
+    body_awake: wp.array2d[wp.int32],
+    body_awake_ind: wp.array2d[wp.int32],
+    dof_awake_ind: wp.array2d[wp.int32],
+    ntree_awake: wp.array[wp.int32],
+    nbody_awake: wp.array[wp.int32],
+    nv_awake: wp.array[wp.int32],
 ):
-    """Apply stored free-body sleep overrides after reset reconciliation."""
-    worldid = wp.tid()
-    if world_mask and not world_mask[worldid]:
+    """Apply stored free-body sleep overrides and republish the sleep bookkeeping.
+
+    One thread per listed world (slot convention of
+    :func:`reset_world_buffers_kernel`). After the overrides edit ``tree_asleep``,
+    the tree/body/DOF awake arrays and counts are rebuilt exactly like MuJoCo
+    Warp's ``update_sleep`` (world-attached bodies are static unless they descend
+    from a mocap root), with the compact index lists in ascending body/DOF order.
+    """
+    slot = wp.tid()
+    worldid = _selected_world(slot, world_ids, world_count)
+    if worldid < 0:
         return
 
     for treeid in range(ntree):
@@ -4473,6 +4667,39 @@ def apply_body_sleep_override_kernel(
     for treeid in range(ntree):
         if body_sleep_override[worldid, treeid] == 1:
             tree_asleep[worldid, treeid] = treeid
+
+    trees_awake = int(0)
+    for treeid in range(ntree):
+        awake = int(0)
+        if tree_asleep[worldid, treeid] < 0:
+            awake = 1
+        tree_awake[worldid, treeid] = awake
+        trees_awake += awake
+    ntree_awake[worldid] = trees_awake
+
+    bodies_awake = int(0)
+    for bodyid in range(nbody):
+        treeid = body_treeid[bodyid]
+        state = sleep_state_asleep
+        if treeid < 0:
+            state = sleep_state_static
+            if body_mocapid[body_rootid[bodyid]] >= 0:
+                state = sleep_state_awake
+        elif tree_awake[worldid, treeid] == 1:
+            state = sleep_state_awake
+        body_awake[worldid, bodyid] = state
+        if state != sleep_state_asleep:
+            body_awake_ind[worldid, bodies_awake] = bodyid
+            bodies_awake += 1
+    nbody_awake[worldid] = bodies_awake
+
+    dofs_awake = int(0)
+    for dofid in range(nv):
+        bodyid = dof_bodyid[dofid]
+        if body_treeid[bodyid] >= 0 and body_awake[worldid, bodyid] == sleep_state_awake:
+            dof_awake_ind[worldid, dofs_awake] = dofid
+            dofs_awake += 1
+    nv_awake[worldid] = dofs_awake
 
 
 @wp.kernel(enable_backward=False)

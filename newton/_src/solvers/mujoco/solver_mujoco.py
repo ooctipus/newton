@@ -78,12 +78,14 @@ from .kernels import (
     apply_mjc_qfrc_kernel,
     build_ref_q_kernel,
     collect_woken_dormant_slabs_kernel,
+    compact_reset_world_ids_kernel,
     convert_mj_coords_to_warp_kernel,
     convert_newton_contacts_to_mjwarp_kernel,
     convert_qfrc_actuator_from_mj_kernel,
     convert_rigid_forces_from_mj_kernel,
     convert_solref,
     convert_warp_coords_to_mj_kernel,
+    convert_warp_coords_to_mj_worlds_kernel,
     create_convert_mjw_contacts_to_newton_kernel,
     create_inverse_shape_mapping_kernel,
     eval_mujoco_coupling_effective_mass_block_kernel,
@@ -3870,6 +3872,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self._sleep_awake_value = -(1 + int(mujoco.mjMINAWAKE))
         self._sleep_qpos_treeid: wp.array[wp.int32] | None = None
         self._sleep_tree_changed: wp.array2d[wp.int32] | None = None
+        # Reset-world selection: ids compacted from the reset mask with their device count, and the
+        # identity list used when every world resets (see _reset_world_selection).
+        self._reset_world_ids: wp.array[wp.int32] | None = None
+        self._reset_world_count: wp.array[wp.int32] | None = None
+        self._all_world_ids: wp.array[wp.int32] | None = None
         self._initial_tree_asleep: wp.array[wp.int32] | None = None
         self._initial_tree_awake: wp.array[wp.int32] | None = None
         self._initial_body_awake: wp.array[wp.int32] | None = None
@@ -4403,6 +4410,13 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         MuJoCo Warp's cached position- and velocity-dependent data, and restores
         the initial sleep state in the selected worlds.
 
+        With MuJoCo Warp the work is proportional to the number of selected
+        worlds: the mask is compacted on the device into a world id list (no
+        host synchronization), every reset kernel runs over that list, and the
+        derived data is rebuilt with ``mujoco_warp.forward_worlds``, which
+        leaves unselected worlds untouched. Models outside MuJoCo Warp's fused
+        per-world path fall back to rebuilding every world.
+
         Args:
             state: The simulation state to reset (modified in place).
             world_mask: Optional boolean mask of shape ``(world_count + 1,)``
@@ -4481,40 +4495,143 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         if d is None:
             return
 
+        world_ids, world_count, launch_worlds = self._reset_world_selection(world_mask)
         buffers = (d.qacc_warmstart, d.qfrc_applied, d.ctrl, d.act, d.xfrc_applied)
         buffer_dim = max(buffer.shape[1] for buffer in buffers)
         wp.launch(
             reset_world_buffers_kernel,
-            dim=(d.nworld, buffer_dim),
-            inputs=[world_mask, *buffers],
+            dim=(launch_worlds, buffer_dim),
+            inputs=[world_ids, world_count, *buffers],
             device=self.model.device,
         )
         if self.enable_sleeping:
-            self._update_mjc_data(d, self.model, state, world_mask=world_mask)
-            self._wake_sleeping_worlds(world_mask, clear_overflow=True)
+            m = self.mjw_model
+            self._update_mjc_data_worlds(d, self.model, state, world_ids, world_count, launch_worlds)
+            self._launch_reset_sleeping_state(world_ids, world_count, launch_worlds, clear_overflow=True)
             # Sleeping trees retain derived state, so rebuild it at the reset
             # coordinates before restoring the initial sleep bookkeeping.
             with wp.ScopedDevice(self.model.device), self._scoped_mujoco_warp_execution():
-                self._mujoco_warp.fwd_position(self.mjw_model, d, factorize=False)
-                self._mujoco_warp.fwd_velocity(self.mjw_model, d)
-            self._restore_initial_sleeping_state(world_mask, clear_overflow=True)
+                self._forward_worlds(d, world_ids, launch_worlds if world_count is None else world_count)
+            self._launch_restore_sleeping_state(world_ids, world_count, launch_worlds, clear_overflow=True)
             if self._has_body_sleep_overrides:
-                from mujoco_warp._src import sleep
+                # The overrides edit tree_asleep, so the kernel also republishes the
+                # sleep bookkeeping of these worlds (MuJoCo Warp's update_sleep).
+                wp.launch(
+                    apply_body_sleep_override_kernel,
+                    dim=launch_worlds,
+                    inputs=[
+                        world_ids,
+                        world_count,
+                        self._body_sleep_override,
+                        m.nv,
+                        m.nbody,
+                        m.ntree,
+                        self._sleep_awake_value,
+                        int(self._mujoco.mjtSleepState.mjS_STATIC),
+                        int(self._mujoco.mjtSleepState.mjS_AWAKE),
+                        int(self._mujoco.mjtSleepState.mjS_ASLEEP),
+                        m.body_rootid,
+                        m.body_mocapid,
+                        m.body_treeid,
+                        m.dof_bodyid,
+                    ],
+                    outputs=[
+                        d.tree_asleep,
+                        d.tree_awake,
+                        d.body_awake,
+                        d.body_awake_ind,
+                        d.dof_awake_ind,
+                        d.ntree_awake,
+                        d.nbody_awake,
+                        d.nv_awake,
+                    ],
+                    device=self.model.device,
+                )
 
-                with wp.ScopedDevice(self.model.device), self._scoped_mujoco_warp_execution():
-                    wp.launch(
-                        apply_body_sleep_override_kernel,
-                        dim=d.nworld,
-                        inputs=[
-                            world_mask,
-                            self._body_sleep_override,
-                            self.mjw_model.ntree,
-                            self._sleep_awake_value,
-                        ],
-                        outputs=[d.tree_asleep],
-                        device=self.model.device,
-                    )
-                    sleep.update_sleep(self.mjw_model, d)
+    def _reset_world_selection(
+        self, world_mask: wp.array[wp.bool] | None
+    ) -> tuple[wp.array[wp.int32], wp.array[wp.int32] | None, int]:
+        """Turn a reset mask into ``(world_ids, device count, launch worlds)`` for the reset kernels.
+
+        ``None`` selects every world through a cached identity list and a host
+        count (no device count). Otherwise one block-wide scan compacts the mask
+        into ascending world ids and writes their number to a one-element device
+        array; the reset launches then span ``nworld`` slots and their kernels
+        exit the unused ones, so no host synchronization is needed and the
+        sequence stays CUDA-graph capturable.
+        """
+        nworld = self.mjw_data.nworld
+        device = self.model.device
+        if world_mask is None:
+            if self._all_world_ids is None:
+                self._all_world_ids = wp.array(np.arange(nworld, dtype=np.int32), dtype=wp.int32, device=device)
+            return self._all_world_ids, None, nworld
+        if self._reset_world_ids is None:
+            self._reset_world_ids = wp.empty(nworld, dtype=wp.int32, device=device)
+            self._reset_world_count = wp.zeros(1, dtype=wp.int32, device=device)
+        wp.launch_tiled(
+            compact_reset_world_ids_kernel,
+            dim=[1],
+            inputs=[world_mask, nworld, self._reset_world_ids, self._reset_world_count],
+            block_dim=256,
+            device=device,
+        )
+        return self._reset_world_ids, self._reset_world_count, nworld
+
+    def _update_mjc_data_worlds(
+        self,
+        mj_data: MjWarpData,
+        model: Model,
+        state: State,
+        world_ids: wp.array[wp.int32],
+        world_count: wp.array[wp.int32] | None,
+        launch_worlds: int,
+    ) -> None:
+        """Push the Newton joint state of the listed worlds into MuJoCo Warp ``qpos`` / ``qvel``.
+
+        Reset-only sibling of :meth:`_update_mjc_data`. The caller wakes every
+        tree of these worlds right after, so the per-tree edit detection of the
+        step path is not needed here.
+        """
+        joints_per_world = model.joint_count // mj_data.nworld
+        mujoco_attrs = getattr(model, "mujoco", None)
+        dof_ref = getattr(mujoco_attrs, "dof_ref", None) if mujoco_attrs is not None else None
+        wp.launch(
+            convert_warp_coords_to_mj_worlds_kernel,
+            dim=(launch_worlds, joints_per_world),
+            inputs=[
+                state.joint_q,
+                state.joint_qd,
+                world_ids,
+                world_count,
+                joints_per_world,
+                model.joint_type,
+                model.joint_q_start,
+                model.joint_qd_start,
+                model.joint_dof_dim,
+                model.joint_child,
+                model.joint_X_p,
+                model.joint_X_c,
+                model.body_com,
+                dof_ref,
+                self.mj_q_start,
+                self.mj_qd_start,
+                None,
+                1.0e-6,
+            ],
+            outputs=[mj_data.qpos, mj_data.qvel, None],
+            device=model.device,
+        )
+
+    def _forward_worlds(self, mj_data: MjWarpData, world_ids: wp.array[wp.int32], count: int | wp.array) -> None:
+        """Rebuild MuJoCo Warp's position- and velocity-dependent data for the listed worlds."""
+        forward_worlds = getattr(self._mujoco_warp, "forward_worlds", None)
+        if forward_worlds is None:
+            # MuJoCo Warp without world subsets: rebuild every world.
+            self._mujoco_warp.fwd_position(self.mjw_model, mj_data, factorize=False)
+            self._mujoco_warp.fwd_velocity(self.mjw_model, mj_data)
+            return
+        forward_worlds(self.mjw_model, mj_data, world_ids, count)
 
     def _capture_initial_sleeping_state(self) -> None:
         """Capture the template world's initial sleep bookkeeping."""
@@ -4561,6 +4678,16 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         """Restore the initial sleep state in selected MuJoCo Warp worlds."""
         if not self.enable_sleeping or self.mjw_data is None:
             return
+        self._launch_restore_sleeping_state(*self._reset_world_selection(world_mask), clear_overflow=clear_overflow)
+
+    def _launch_restore_sleeping_state(
+        self,
+        world_ids: wp.array[wp.int32],
+        world_count: wp.array[wp.int32] | None,
+        launch_worlds: int,
+        *,
+        clear_overflow: bool,
+    ) -> None:
         if self._initial_tree_asleep is None:
             raise RuntimeError("Initial MuJoCo Warp sleep state was not captured.")
 
@@ -4571,9 +4698,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             return
         wp.launch(
             restore_sleeping_state_kernel,
-            dim=(d.nworld, sleep_dim),
+            dim=(launch_worlds, sleep_dim),
             inputs=[
-                world_mask,
+                world_ids,
+                world_count,
                 int(clear_overflow),
                 m.nv,
                 m.nbody,
@@ -4608,7 +4736,16 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         """Wake all dynamic trees in the selected MuJoCo Warp worlds."""
         if not self.enable_sleeping or self.mjw_data is None:
             return
+        self._launch_reset_sleeping_state(*self._reset_world_selection(world_mask), clear_overflow=clear_overflow)
 
+    def _launch_reset_sleeping_state(
+        self,
+        world_ids: wp.array[wp.int32],
+        world_count: wp.array[wp.int32] | None,
+        launch_worlds: int,
+        *,
+        clear_overflow: bool,
+    ) -> None:
         m = self.mjw_model
         d = self.mjw_data
         sleep_dim = max(m.nv, m.nbody, m.ntree)
@@ -4616,9 +4753,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             return
         wp.launch(
             reset_sleeping_state_kernel,
-            dim=(d.nworld, sleep_dim),
+            dim=(launch_worlds, sleep_dim),
             inputs=[
-                world_mask,
+                world_ids,
+                world_count,
                 int(clear_overflow),
                 m.nv,
                 m.nbody,

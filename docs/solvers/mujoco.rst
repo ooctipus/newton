@@ -779,7 +779,9 @@ explicitly changed to allow sleeping, changing actuator controls alone does not
 wake them; apply a force or set a nonzero velocity first. Newton-side
 joint-position edits wake only the affected sleeping trees.
 :meth:`~newton.solvers.SolverMuJoCo.reset` restores the initial sleep state in
-selected worlds, while
+selected worlds and rebuilds their position- and velocity-dependent MuJoCo Warp
+data, with a cost proportional to the number of selected worlds (unselected
+worlds are left untouched), while
 :meth:`~newton.solvers.SolverMuJoCo.notify_model_changed` wakes all worlds
 after model-property updates. The sleeping path supports whole-step CUDA graph
 capture.

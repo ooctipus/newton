@@ -95,6 +95,24 @@ def _build_imported_sleep_policy_model() -> newton.Model:
     return builder.finalize()
 
 
+def _build_free_body_worlds_model(world_count: int, body_count: int = 6) -> newton.Model:
+    """Build worlds of free spheres large enough for MuJoCo Warp's fused per-world path (nv > 32)."""
+    template = newton.ModelBuilder()
+    for index in range(body_count):
+        body = template.add_link(
+            xform=wp.transform((0.5 * index, 0.0, 1.0), wp.quat_identity()),
+            mass=1.0,
+            inertia=wp.mat33(np.eye(3)),
+        )
+        template.add_shape_sphere(body=body, radius=0.1)
+        template.add_articulation([template.add_joint_free(child=body)])
+
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    for i in range(world_count):
+        builder.add_world(template, xform=wp.transform((0.0, 4.0 * i, 0.0), wp.quat_identity()))
+    return builder.finalize()
+
+
 def _build_selective_wake_model() -> newton.Model:
     """Build one awake tree and two initially sleeping trees."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
@@ -581,6 +599,104 @@ class TestMuJoCoSleeping(unittest.TestCase):
         solver.reset(state_0, world_mask=all_false, flags=0)
         for name, values in before.items():
             np.testing.assert_array_equal(getattr(solver.mjw_data, name).numpy(), values, err_msg=name)
+
+    def test_reset_rebuilds_only_selected_worlds(self):
+        """A masked reset rebuilds the selected world's derived data and leaves other worlds untouched."""
+        from mujoco_warp._src import fused_world
+
+        model = _build_free_body_worlds_model(world_count=2)
+        solver = SolverMuJoCo(
+            model,
+            enable_sleeping=True,
+            use_mujoco_contacts=False,
+            disable_contacts=True,
+            iterations=2,
+            ls_iterations=2,
+        )
+        m, d = solver.mjw_model, solver.mjw_data
+        if not fused_world.fused_world(m, d):
+            self.skipTest("model does not take MuJoCo Warp's fused per-world path")
+        state_0 = model.state()
+        state_1 = model.state()
+        control = model.control()
+        contacts = newton.CollisionPipeline(model).contacts()
+        dofs_per_world = model.joint_dof_count // model.world_count
+        coords_per_world = model.joint_coord_count // model.world_count
+
+        # World 1 drifts, so its kinematic data lags the integrated coordinates by one substep:
+        # an all-worlds rebuild at reset would visibly rewrite it.
+        joint_qd = state_0.joint_qd.numpy()
+        joint_qd[dofs_per_world::6] = 0.3
+        state_0.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        solver.step(state_0, state_1, control, contacts, 1.0 / 60.0)
+        state_0, state_1 = state_1, state_0
+
+        # Authored reset of world 0: lift the first sphere, zero the velocities and park it asleep
+        # through the overrides (a moving tree would be woken again by the next step).
+        joint_q = state_0.joint_q.numpy()
+        joint_q[2] += 0.5
+        state_0.joint_q.assign(joint_q)
+        joint_qd = state_0.joint_qd.numpy()
+        joint_qd[:dofs_per_world] = 0.0
+        state_0.joint_qd.assign(joint_qd)
+        first_bodies = np.nonzero(model.body_world.numpy() == 0)[0][:1]
+        solver.set_body_sleep_state(
+            wp.array(np.tile(first_bodies, (model.world_count, 1)), dtype=wp.int32, device=model.device),
+            wp.array(np.ones((model.world_count, 1), dtype=bool), dtype=wp.bool, device=model.device),
+            wp.array([0], dtype=wp.int32, device=model.device),
+        )
+        derived = (
+            "xpos",
+            "xquat",
+            "xipos",
+            "subtree_com",
+            "cinert",
+            "cdof",
+            "cvel",
+            "cdof_dot",
+            "cacc",
+            "qfrc_bias",
+            "M",
+        )
+        bookkeeping = ("tree_asleep", "tree_awake", "body_awake", "body_awake_ind", "dof_awake_ind")
+        counts = ("ntree_awake", "nbody_awake", "nv_awake")
+        before = {name: getattr(d, name).numpy().copy() for name in derived + bookkeeping + counts + ("qpos", "qvel")}
+
+        mask = wp.array([True, False, False], dtype=wp.bool, device=model.device)
+        solver.reset(state_0, world_mask=mask, flags=0)
+
+        for name, values in before.items():
+            np.testing.assert_array_equal(getattr(d, name).numpy()[1], values[1], err_msg=f"{name} changed in world 1")
+        self.assertGreater(np.abs(d.xpos.numpy()[0] - before["xpos"][0]).max(), 0.4)
+        # world 0 poses agree with Newton's forward kinematics at the authored coordinates
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        body_q = state_0.body_q.numpy()
+        newton_body = solver.mjc_body_to_newton.numpy()[0]
+        for mj_body in range(1, m.nbody):
+            np.testing.assert_allclose(
+                d.xpos.numpy()[0, mj_body], body_q[newton_body[mj_body]][:3], atol=1e-6, err_msg=f"xpos body {mj_body}"
+            )
+        np.testing.assert_allclose(d.qpos.numpy()[0, :coords_per_world][:3], joint_q[:3], atol=1e-6)
+        # sleep bookkeeping of world 0: the parked tree asleep, everything else awake, compact lists in order
+        tree_awake = d.tree_awake.numpy()[0]
+        np.testing.assert_array_equal(tree_awake, [0] + [1] * (m.ntree - 1))
+        self.assertEqual(int(d.ntree_awake.numpy()[0]), m.ntree - 1)
+        awake_bodies = [
+            body
+            for body in range(m.nbody)
+            if m.body_treeid.numpy()[body] < 0 or tree_awake[m.body_treeid.numpy()[body]]
+        ]
+        self.assertEqual(int(d.nbody_awake.numpy()[0]), len(awake_bodies))
+        np.testing.assert_array_equal(d.body_awake_ind.numpy()[0, : len(awake_bodies)], awake_bodies)
+        awake_dofs = [dof for dof in range(m.nv) if tree_awake[m.body_treeid.numpy()[m.dof_bodyid.numpy()[dof]]]]
+        self.assertEqual(int(d.nv_awake.numpy()[0]), len(awake_dofs))
+        np.testing.assert_array_equal(d.dof_awake_ind.numpy()[0, : len(awake_dofs)], awake_dofs)
+        np.testing.assert_array_equal(d.overflow.numpy(), [0, 0])
+
+        solver.step(state_0, state_1, control, contacts, 1.0 / 60.0)
+        self.assertTrue(np.all(np.isfinite(state_1.joint_q.numpy())))
+        np.testing.assert_array_equal(d.tree_awake.numpy()[0], tree_awake)
 
     def test_model_update_wakes_sleeping_trees(self):
         _, solver, state_0, state_1, control, contacts = self._make_sim(enable_sleeping=True, nvmax=1)
