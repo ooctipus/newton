@@ -486,13 +486,24 @@ def _convert_one_contact(
     contact_efc_address_out: wp.array2d[int],
     contact_worldid_out: wp.array[int],
     tid_to_cid: wp.array[wp.int32],
+    # MJWarp body kinematics of the current substep (in-step conversion); null: use body_q
+    xpos: wp.array2d[wp.vec3],
+    xquat: wp.array2d[wp.quat],
+    # per-contact records for the in-step pose refresh (null when the hook is unavailable)
+    hook_tid: wp.array[wp.int32],
+    hook_body: wp.array[wp.vec2i],
+    hook_geom: wp.array[wp.vec4],
 ) -> int:
     """Convert Newton contact row ``tid`` into a new MJWarp contact and return its id.
 
     Returns ``-1`` when the row is skipped (invalid shapes, immovable-immovable pair,
     dormant pair, or MJWarp capacity exhausted). Dormant rows (no awake dynamic
     tree) are parked in the adapter's dormant list when ``allow_park`` is set and
-    left untouched otherwise.
+    left untouched otherwise. Body poses come from ``xpos``/``xquat`` when bound
+    (MuJoCo body frames coincide with Newton body frames; static geoms live on the
+    world body, whose frame is the identity) and from ``body_q`` otherwise. When the
+    hook records are bound, the new contact stores its Newton row, its MuJoCo bodies and
+    the pose-independent offset scales and surface radii for the by-contact refresh.
     """
     shape_a = rigid_contact_shape0[tid]
     shape_b = rigid_contact_shape1[tid]
@@ -553,12 +564,20 @@ def _convert_one_contact(
             return -1
     dormant_flag[tid] = 0
 
+    worldid = body_a // bodies_per_world
+    if body_a < 0:
+        worldid = body_b // bodies_per_world
+
     X_wb_a = wp.transform_identity()
     X_wb_b = wp.transform_identity()
-    if body_a >= 0:
-        X_wb_a = body_q[body_a]
-    if body_b >= 0:
-        X_wb_b = body_q[body_b]
+    if xpos:
+        X_wb_a = wp.transform(xpos[worldid, mj_body_a], quat_wxyz_to_xyzw(xquat[worldid, mj_body_a]))
+        X_wb_b = wp.transform(xpos[worldid, mj_body_b], quat_wxyz_to_xyzw(xquat[worldid, mj_body_b]))
+    else:
+        if body_a >= 0:
+            X_wb_a = body_q[body_a]
+        if body_b >= 0:
+            X_wb_b = body_q[body_b]
 
     # Strip artificial shape margins from Newton offsets before computing MuJoCo's geometry-surface anchor.
     offset_scale_a = safe_div(rigid_contact_margin0[tid] - shape_margin[shape_a], rigid_contact_margin0[tid])
@@ -573,22 +592,14 @@ def _convert_one_contact(
 
     n = rigid_contact_normal[tid]
     # rigid_contact_margin includes shape_margin; MuJoCo handles it explicitly, subtract to recover radius_eff.
-    dist = contact_surface_separation(
-        bx_a,
-        bx_b,
-        n,
-        rigid_contact_margin0[tid] - shape_margin[shape_a],
-        rigid_contact_margin1[tid] - shape_margin[shape_b],
-    )
+    radius_a = rigid_contact_margin0[tid] - shape_margin[shape_a]
+    radius_b = rigid_contact_margin1[tid] - shape_margin[shape_b]
+    dist = contact_surface_separation(bx_a, bx_b, n, radius_a, radius_b)
     pos = 0.5 * (point_a + point_b)
 
     frame = make_frame(n)
 
     geoms = wp.vec2i(geom_a, geom_b)
-
-    worldid = body_a // bodies_per_world
-    if body_a < 0:
-        worldid = body_b // bodies_per_world
 
     margin, _gap, condim, friction, solref, solreffriction, solimp, mix = contact_params(
         geom_condim,
@@ -693,6 +704,10 @@ def _convert_one_contact(
         return -1
 
     tid_to_cid[tid] = cid
+    if hook_tid:
+        hook_tid[cid] = tid
+        hook_body[cid] = wp.vec2i(mj_body_a, mj_body_b)
+        hook_geom[cid] = wp.vec4(offset_scale_a, offset_scale_b, radius_a, radius_b)
 
     write_contact(
         dist_in=dist,
@@ -791,6 +806,52 @@ def _refresh_one_contact(
         contact_efc_address_out[cid, i] = -1
 
 
+@wp.func
+def _refresh_one_contact_mjc(
+    cid: int,
+    hook_tid: wp.array[wp.int32],
+    hook_body: wp.array[wp.vec2i],
+    hook_geom: wp.array[wp.vec4],
+    contact_worldid: wp.array[int],
+    xpos: wp.array2d[wp.vec3],
+    xquat: wp.array2d[wp.quat],
+    rigid_contact_point0: wp.array[wp.vec3],
+    rigid_contact_point1: wp.array[wp.vec3],
+    rigid_contact_normal: wp.array[wp.vec3],
+    rigid_contact_offset0: wp.array[wp.vec3],
+    rigid_contact_offset1: wp.array[wp.vec3],
+    contact_dist_out: wp.array[float],
+    contact_pos_out: wp.array[wp.vec3],
+    contact_efc_address_out: wp.array2d[int],
+):
+    """In-step fast path: refresh the pose-dependent fields of live MJWarp contact ``cid``.
+
+    Same arithmetic as :func:`_refresh_one_contact` with the body transforms taken from MJWarp's
+    ``xpos``/``xquat`` of the current substep and the pose-independent per-contact terms read from
+    the records written at conversion, so one thread per contact does a single dependent gather.
+    """
+    tid = hook_tid[cid]
+    bodies = hook_body[cid]
+    geom = hook_geom[cid]
+    worldid = contact_worldid[cid]
+    X_wb_a = wp.transform(xpos[worldid, bodies[0]], quat_wxyz_to_xyzw(xquat[worldid, bodies[0]]))
+    X_wb_b = wp.transform(xpos[worldid, bodies[1]], quat_wxyz_to_xyzw(xquat[worldid, bodies[1]]))
+
+    offset_a = rigid_contact_offset0[tid] * geom[0]
+    offset_b = rigid_contact_offset1[tid] * geom[1]
+
+    bx_a = wp.transform_point(X_wb_a, rigid_contact_point0[tid])
+    bx_b = wp.transform_point(X_wb_b, rigid_contact_point1[tid])
+    point_a = contact_surface_point(X_wb_a, rigid_contact_point0[tid], offset_a)
+    point_b = contact_surface_point(X_wb_b, rigid_contact_point1[tid], offset_b)
+
+    contact_dist_out[cid] = contact_surface_separation(bx_a, bx_b, rigid_contact_normal[tid], geom[2], geom[3])
+    contact_pos_out[cid] = 0.5 * (point_a + point_b)
+
+    for i in range(contact_efc_address_out.shape[1]):
+        contact_efc_address_out[cid, i] = -1
+
+
 @wp.kernel
 def convert_newton_contacts_to_mjwarp_kernel(
     body_q: wp.array[wp.transform],
@@ -864,7 +925,14 @@ def convert_newton_contacts_to_mjwarp_kernel(
     tid_to_cid: wp.array[wp.int32],
     last_nacon_count: wp.array[wp.int32],
     total_num_threads: int,
-    refresh_poses: int,
+    # In-step conversion (post_position hook): MJWarp kinematics and per-contact records
+    xpos: wp.array2d[wp.vec3],
+    xquat: wp.array2d[wp.quat],
+    hook_tid: wp.array[wp.int32],
+    hook_body: wp.array[wp.vec2i],
+    hook_geom: wp.array[wp.vec4],
+    # Wake-event detection (in-step conversion with wake injection): null otherwise
+    tree_asleep_prev: wp.array2d[int],
 ):
     # nacon_out must be zeroed before this kernel is launched so that
     # wp.atomic_add below produces the correct compacted count.
@@ -879,6 +947,11 @@ def convert_newton_contacts_to_mjwarp_kernel(
     # Every path grid-strides over the live row count, so the launch is sized
     # by a fixed thread budget rather than the contact buffer capacity.
     # tid_to_cid entries past the live count are stale and never read.
+    #
+    # In-step conversion (xpos bound): body poses come from MJWarp's kinematics of this
+    # substep, the fast path refreshes one thread per live MJWarp contact from the records
+    # written at conversion, and the first nworld * ntree threads flag trees that woke since
+    # the last wake-injection gate (the pre-step refresh_tree_awake_kernel's role).
 
     thread = wp.tid()
 
@@ -953,8 +1026,26 @@ def convert_newton_contacts_to_mjwarp_kernel(
                 contact_efc_address_out,
                 contact_worldid_out,
                 tid_to_cid,
+                xpos,
+                xquat,
+                hook_tid,
+                hook_body,
+                hook_geom,
             )
         return
+
+    if tree_asleep_prev:
+        # Flag trees that are awake now but were asleep at the previous injection gate (woken inside
+        # the last MJWarp step, by this step's force/velocity wake pass or through the reset/property
+        # APIs); wake_contact_trees_kernel reports the trees it wakes itself.
+        ntree = tree_asleep.shape[1]
+        if thread < tree_asleep.shape[0] * ntree:
+            worldid = thread / ntree
+            treeid = thread - worldid * ntree
+            asleep = tree_asleep[worldid, treeid]
+            if asleep < 0 and tree_asleep_prev[worldid, treeid] >= 0:
+                wake_event[0] = 1
+            tree_asleep_prev[worldid, treeid] = asleep
 
     count = rigid_contact_count[0]
 
@@ -1036,6 +1127,11 @@ def convert_newton_contacts_to_mjwarp_kernel(
                 contact_efc_address_out,
                 contact_worldid_out,
                 tid_to_cid,
+                xpos,
+                xquat,
+                hook_tid,
+                hook_body,
+                hook_geom,
             )
     else:
         # ── FAST PATH ────────────────────────────────────────────────────
@@ -1051,9 +1147,28 @@ def convert_newton_contacts_to_mjwarp_kernel(
             # Restore the compacted contact count from the full pass
             nacon_out[0] = last_nacon_count[0]
 
-        if refresh_poses == 0:
-            # dist/pos/efc_address are refreshed from MJWarp's kinematics inside the step
-            # (refresh_contact_poses_from_mjc_kernel).
+        if xpos:
+            # One thread per live MJWarp contact (the count includes the rows injected on earlier
+            # substeps; nacon itself is being restored by thread 0 above).
+            live = wp.min(last_nacon_count[0], wp.min(naconmax, hook_tid.shape[0]))
+            for cid in range(thread, live, total_num_threads):
+                _refresh_one_contact_mjc(
+                    cid,
+                    hook_tid,
+                    hook_body,
+                    hook_geom,
+                    contact_worldid_out,
+                    xpos,
+                    xquat,
+                    rigid_contact_point0,
+                    rigid_contact_point1,
+                    rigid_contact_normal,
+                    rigid_contact_offset0,
+                    rigid_contact_offset1,
+                    contact_dist_out,
+                    contact_pos_out,
+                    contact_efc_address_out,
+                )
             return
 
         count = wp.min(count, wp.min(tid_to_cid.shape[0], rigid_contact_shape0.shape[0]))
@@ -1078,81 +1193,6 @@ def convert_newton_contacts_to_mjwarp_kernel(
                 contact_efc_address_out,
                 tid_to_cid,
             )
-
-
-@wp.kernel(enable_backward=False)
-def refresh_contact_poses_from_mjc_kernel(
-    rigid_contact_count: wp.array[wp.int32],
-    rigid_contact_shape0: wp.array[wp.int32],
-    rigid_contact_shape1: wp.array[wp.int32],
-    rigid_contact_point0: wp.array[wp.vec3],
-    rigid_contact_point1: wp.array[wp.vec3],
-    rigid_contact_normal: wp.array[wp.vec3],
-    rigid_contact_offset0: wp.array[wp.vec3],
-    rigid_contact_offset1: wp.array[wp.vec3],
-    rigid_contact_margin0: wp.array[wp.float32],
-    rigid_contact_margin1: wp.array[wp.float32],
-    shape_margin: wp.array[float],
-    newton_shape_to_mjc_geom: wp.array[wp.int32],
-    geom_bodyid: wp.array[int],
-    xpos: wp.array2d[wp.vec3],
-    xquat: wp.array2d[wp.quat],
-    tid_to_cid: wp.array[wp.int32],
-    contact_worldid: wp.array[int],
-    naconmax: int,
-    total_num_threads: int,
-    # outputs
-    contact_dist_out: wp.array[float],
-    contact_pos_out: wp.array[wp.vec3],
-    contact_efc_address_out: wp.array2d[int],
-):
-    """Refresh the pose-dependent contact fields from MJWarp's body kinematics.
-
-    Runs from MJWarp's ``post_position`` callback, where ``xpos``/``xquat`` hold this substep's
-    body frames, so the converted contacts do not need Newton's ``body_q`` between substeps.
-    Same arithmetic as :func:`_refresh_one_contact` with the body transform taken from
-    ``xpos``/``xquat`` (MuJoCo body frames coincide with Newton body frames; static geoms live on
-    the world body, whose frame is the identity).
-    """
-    thread = wp.tid()
-    count = wp.min(rigid_contact_count[0], wp.min(tid_to_cid.shape[0], rigid_contact_shape0.shape[0]))
-    for tid in range(thread, count, total_num_threads):
-        cid = tid_to_cid[tid]
-        if cid < 0 or cid >= naconmax:
-            continue
-        shape_a = rigid_contact_shape0[tid]
-        shape_b = rigid_contact_shape1[tid]
-        if shape_a < 0 or shape_b < 0:
-            continue
-        worldid = contact_worldid[cid]
-        body_a = geom_bodyid[newton_shape_to_mjc_geom[shape_a]]
-        body_b = geom_bodyid[newton_shape_to_mjc_geom[shape_b]]
-        X_wb_a = wp.transform(xpos[worldid, body_a], quat_wxyz_to_xyzw(xquat[worldid, body_a]))
-        X_wb_b = wp.transform(xpos[worldid, body_b], quat_wxyz_to_xyzw(xquat[worldid, body_b]))
-
-        offset_scale_a = safe_div(rigid_contact_margin0[tid] - shape_margin[shape_a], rigid_contact_margin0[tid])
-        offset_scale_b = safe_div(rigid_contact_margin1[tid] - shape_margin[shape_b], rigid_contact_margin1[tid])
-        offset_a = rigid_contact_offset0[tid] * offset_scale_a
-        offset_b = rigid_contact_offset1[tid] * offset_scale_b
-
-        bx_a = wp.transform_point(X_wb_a, rigid_contact_point0[tid])
-        bx_b = wp.transform_point(X_wb_b, rigid_contact_point1[tid])
-        point_a = contact_surface_point(X_wb_a, rigid_contact_point0[tid], offset_a)
-        point_b = contact_surface_point(X_wb_b, rigid_contact_point1[tid], offset_b)
-
-        n = rigid_contact_normal[tid]
-        # rigid_contact_margin includes shape_margin; MuJoCo handles it explicitly, subtract to recover radius_eff.
-        contact_dist_out[cid] = contact_surface_separation(
-            bx_a,
-            bx_b,
-            n,
-            rigid_contact_margin0[tid] - shape_margin[shape_a],
-            rigid_contact_margin1[tid] - shape_margin[shape_b],
-        )
-        contact_pos_out[cid] = 0.5 * (point_a + point_b)
-
-        for i in range(contact_efc_address_out.shape[1]):
-            contact_efc_address_out[cid, i] = -1
 
 
 @wp.kernel
@@ -1257,6 +1297,11 @@ def inject_dormant_slab_contacts_kernel(
     tid_to_cid: wp.array[wp.int32],
     last_nacon_count: wp.array[wp.int32],
     total_num_threads: int,
+    xpos: wp.array2d[wp.vec3],
+    xquat: wp.array2d[wp.quat],
+    hook_tid: wp.array[wp.int32],
+    hook_body: wp.array[wp.vec2i],
+    hook_geom: wp.array[wp.vec4],
 ):
     """Append the rows of every listed slab to the Newton buffer and convert them.
 
@@ -1352,6 +1397,11 @@ def inject_dormant_slab_contacts_kernel(
             contact_efc_address_out,
             contact_worldid_out,
             tid_to_cid,
+            xpos,
+            xquat,
+            hook_tid,
+            hook_body,
+            hook_geom,
         )
 
 
@@ -1475,20 +1525,29 @@ def wake_contact_trees_kernel(
     contact_geom: wp.array[wp.vec2i],
     contact_worldid: wp.array[wp.int32],
     nacon: wp.array[wp.int32],
+    contact_generation: wp.array[wp.int32],
     total_num_threads: int,
     # outputs
     tree_asleep: wp.array2d[wp.int32],
     tree_asleep_prev: wp.array2d[wp.int32],
     wake_event: wp.array[wp.int32],
+    last_nacon_count: wp.array[wp.int32],
+    last_contact_generation: wp.array[wp.int32],
 ):
     """Wake sleeping trees that touch awake trees (``sleep.wake_collision`` over the live count).
 
-    The awake test reads the ``tree_awake`` snapshot published by :func:`refresh_tree_awake_kernel`,
-    exactly like the stock kernel, so a tree woken by one contact does not wake its own
-    neighbours until the next substep. Woken trees are recorded in ``tree_asleep_prev`` and
-    raise ``wake_event`` so their dormant contacts are injected in this substep.
+    The awake test reads the ``tree_awake`` snapshot (published by MJWarp's own wake pass on the
+    in-step path, by :func:`refresh_tree_awake_kernel` on the pre-step path), exactly like the
+    stock kernel, so a tree woken by one contact does not wake its own neighbours until the next
+    substep. Woken trees are recorded in ``tree_asleep_prev`` and raise ``wake_event`` so their
+    dormant contacts are injected in this substep. Thread 0 also snapshots the converted contact
+    count and generation for the fast conversion path; this kernel runs after the conversion
+    kernel completed, so every thread of that kernel has read the previous generation.
     """
     thread = wp.tid()
+    if thread == 0:
+        last_nacon_count[0] = nacon[0]
+        last_contact_generation[0] = contact_generation[0]
     count = wp.min(nacon[0], contact_geom.shape[0])
     for conid in range(thread, count, total_num_threads):
         geom_pair = contact_geom[conid]

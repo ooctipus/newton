@@ -782,7 +782,7 @@ class TestMuJoCoSleeping(unittest.TestCase):
         substeps = 4
         dt = 1.0 / 240.0
 
-        def run(*, hook: bool, publish_intermediate: bool):
+        def run(*, hook: bool, publish_intermediate: bool, publish_joint_state: bool = True):
             if not hook:
                 os.environ["NEWTON_MJWARP_CONTACT_POSE_HOOK"] = "0"
             try:
@@ -794,6 +794,7 @@ class TestMuJoCoSleeping(unittest.TestCase):
                     ls_iterations=10,
                     use_mujoco_contacts=False,
                     jacobian="sparse",
+                    update_data_interval=2,
                 )
             finally:
                 os.environ.pop("NEWTON_MJWARP_CONTACT_POSE_HOOK", None)
@@ -801,6 +802,7 @@ class TestMuJoCoSleeping(unittest.TestCase):
                 self.skipTest("The installed MuJoCo Warp has no post_position callback")
             self.assertEqual(solver._contact_pose_hook, hook)
             solver.publish_intermediate_body_state = publish_intermediate
+            solver.publish_intermediate_joint_state = publish_joint_state
             state = model.state()
             control = model.control()
             pipeline = newton.CollisionPipeline(model)
@@ -842,8 +844,8 @@ class TestMuJoCoSleeping(unittest.TestCase):
         reference = run(hook=False, publish_intermediate=True)
         self.assertGreater(reference["nacon"].max(), 0)
         self.assertTrue((reference["tree_asleep"][-1] < 0).all())
-        for publish_intermediate in (True, False):
-            hooked = run(hook=True, publish_intermediate=publish_intermediate)
+        for publish_intermediate, publish_joint_state in ((True, True), (False, True), (False, False)):
+            hooked = run(hook=True, publish_intermediate=publish_intermediate, publish_joint_state=publish_joint_state)
             np.testing.assert_array_equal(hooked["tree_asleep"], reference["tree_asleep"])
             np.testing.assert_array_equal(hooked["nacon"], reference["nacon"])
             for name in ("qpos", "qvel", "body_q", "body_qd"):
@@ -851,6 +853,31 @@ class TestMuJoCoSleeping(unittest.TestCase):
             # The finalizing step always publishes body state consistent with the joint coordinates.
             np.testing.assert_array_equal(hooked["body_q"], hooked["body_q_fk"])
             np.testing.assert_array_equal(hooked["body_qd"], hooked["body_qd_fk"])
+
+    def test_mjwarp_derived_publish_follows_state_requests(self):
+        """The fused forward publishes MuJoCo Warp's derived data only when something reads it."""
+        model = _build_contact_wake_model()
+        solver = SolverMuJoCo(model, enable_sleeping=True, nvmax=12, iterations=2, ls_iterations=2)
+        if not hasattr(solver.mjw_model.opt, "fused_world_publish_derived"):
+            self.skipTest("The installed MuJoCo Warp has no fused_world_publish_derived option")
+        state_0 = model.state()
+        state_1 = model.state()
+        control = model.control()
+        contacts = newton.CollisionPipeline(model).contacts()
+        solver.step(state_0, state_1, control, contacts, 1.0 / 60.0)
+        self.assertFalse(solver.mjw_model.opt.fused_world_publish_derived)
+
+        solver.mjwarp_publish_derived = True
+        solver.step(state_1, state_0, control, contacts, 1.0 / 60.0)
+        self.assertTrue(solver.mjw_model.opt.fused_world_publish_derived)
+
+        # body_qdd / body_parent_f read cacc / cfrc_int, so the request forces the publish.
+        solver.mjwarp_publish_derived = False
+        model.request_state_attributes("body_qdd", "body_parent_f")
+        derived_state = model.state()
+        solver.step(state_0, derived_state, control, contacts, 1.0 / 60.0)
+        self.assertTrue(solver.mjw_model.opt.fused_world_publish_derived)
+        self.assertTrue(np.all(np.isfinite(derived_state.body_qdd.numpy())))
 
     def test_sleeping_step_and_reset_support_cuda_graph_capture(self):
         model, solver, state_0, state_1, control, contacts = self._make_sim(enable_sleeping=True, nvmax=1)

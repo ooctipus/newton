@@ -4595,7 +4595,7 @@ class TestMuJoCoSolverNewtonContacts(unittest.TestCase):
 
     def test_fast_path_buffers_eagerly_allocated(self):
         """The fast-path tracking buffers must be allocated in ``__init__``,
-        not lazily inside :meth:`_convert_contacts_to_mjwarp`.
+        not lazily inside :meth:`_prepare_contact_conversion`.
 
         Regression (PR #2678 bisect, "Fix 2"): lazy ``wp.full(...)`` allocation
         on the first step often runs while a CUDA graph is being captured.  The

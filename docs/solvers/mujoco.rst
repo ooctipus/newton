@@ -659,31 +659,43 @@ same three-phase cycle:
 
 1. **Push Newton → MuJoCo.** ``SolverMuJoCo._apply_mjc_control`` and
    ``SolverMuJoCo._update_mjc_data`` transfer the Newton ``State``
-   and ``Control`` inputs to MuJoCo's working data. When
-   ``use_mujoco_contacts=False``, Newton-side contacts are also
-   converted before the integrator runs. The joint-state re-sync
-   frequency can be controlled via the ``update_data_interval``
-   kwarg for substepping schemes.
+   and ``Control`` inputs to MuJoCo's working data. The joint-state
+   re-sync frequency can be controlled via the ``update_data_interval``
+   kwarg for substepping schemes; with
+   :attr:`~newton.solvers.SolverMuJoCo.publish_intermediate_joint_state`
+   set to ``False`` the re-sync runs on the first substep of a tick only.
 2. **Integrate.** ``mujoco_warp`` steps the MuJoCo model forward by ``dt``.
-   With Newton-side contacts the solver binds MuJoCo Warp's
+   When ``use_mujoco_contacts=False`` the solver binds MuJoCo Warp's
    ``Callback.post_position`` hook for the duration of the step
-   (``SolverMuJoCo._refresh_contact_poses_from_mjwarp``): after MuJoCo
-   Warp's kinematics it recomputes the pose-dependent contact fields
-   (``dist``, ``pos``) from ``xpos`` / ``xquat`` of the current substep,
-   so the converted contacts do not read Newton ``body_q`` between
-   substeps. MuJoCo Warp versions without the hook keep the pre-step
-   refresh from ``body_q``.
+   (``SolverMuJoCo._convert_contacts_in_step``): after MuJoCo Warp's own
+   wake pass and kinematics it converts the Newton contacts from
+   ``xpos`` / ``xquat`` of the current substep (or refreshes the
+   pose-dependent fields ``dist``, ``pos`` of the live MuJoCo Warp
+   contacts on substeps that keep the contact set), wakes sleeping trees
+   touched by awake ones, and injects the dormant contacts of trees that
+   woke since the previous substep, mirroring the collision prelude of
+   MuJoCo Warp's internal step. The converted contacts therefore never
+   read Newton ``body_q``. MuJoCo Warp versions without the hook keep the
+   pre-step conversion and wake pass from ``body_q``. Before every step
+   the solver also sets ``Option.fused_world_publish_derived`` from
+   :attr:`~newton.solvers.SolverMuJoCo.mjwarp_publish_derived` (default
+   ``False``): the fused per-world forward then skips the derived data
+   fields no stage and no Newton conversion reads, unless ``body_qdd`` /
+   ``body_parent_f`` or sensors are requested.
 3. **Pull MuJoCo → Newton.** ``SolverMuJoCo._update_newton_state``
    populates the output ``State`` from the integrated MuJoCo data.
    Kinematic roots pass through unchanged from ``state_in`` (see
    `Kinematic links and fixed roots`_). Intermediate substeps of a
    substepping scheme (``SolverMuJoCo._step_intermediate``) publish joint
-   coordinates every substep; with the in-step contact pose refresh they
-   skip the forward kinematics for ``body_q`` / ``body_qd`` when
+   coordinates every substep unless
+   :attr:`~newton.solvers.SolverMuJoCo.publish_intermediate_joint_state`
+   is ``False``; with the in-step contact conversion they skip the
+   forward kinematics for ``body_q`` / ``body_qd`` when
    :attr:`~newton.solvers.SolverMuJoCo.publish_intermediate_body_state`
-   is ``False``, which is safe only when nothing reads Newton body state
-   before the finalizing :meth:`~newton.solvers.SolverMuJoCo.step` of
-   the tick (no mid-tick collision, no per-substep force callbacks).
+   is ``False``. Both are safe only when nothing reads (or, for joint
+   state, writes) the Newton state before the finalizing
+   :meth:`~newton.solvers.SolverMuJoCo.step` of the tick (no mid-tick
+   collision, no per-substep force callbacks).
 
 Contacts are **not** pulled back into a Newton ``Contacts`` object
 automatically. Call :meth:`~newton.solvers.SolverMuJoCo.update_contacts`
@@ -994,9 +1006,9 @@ API and subject to change.
   category-specific parsers that consume the MuJoCo custom attributes.
 - ``SolverMuJoCo._apply_mjc_control``,
   ``SolverMuJoCo._update_mjc_data``,
-  ``SolverMuJoCo._refresh_contact_poses_from_mjwarp``, and
+  ``SolverMuJoCo._convert_contacts_in_step``, and
   ``SolverMuJoCo._update_newton_state`` — per-step control, data,
-  in-step contact pose refresh, and state sync between Newton and MuJoCo.
+  in-step contact conversion, and state sync between Newton and MuJoCo.
 - :meth:`~newton.solvers.SolverMuJoCo.update_contacts` — explicit pull
   of MuJoCo's resolved contacts into a Newton ``Contacts`` object
   (default per-step path does not pull contacts back).
