@@ -267,10 +267,10 @@ class TestContactDormantStore(unittest.TestCase):
         self.assertEqual(stored["tracked_nacon"], count)
         self._assert_states_match(stored["tracked_state"], reference["tracked_state"])
 
-    def test_unconditional_wake_injection_matches_gated_injection(self):
-        """With the conditional graph node disabled, quiet substeps inject nothing and wakes inject once."""
-        gated = self._run_sleep_wake_scenario(store=True)
-        ungated = self._run_sleep_wake_scenario(store=True, conditional_wake_injection=False)
+    def test_conditional_wake_injection_matches_unconditional_injection(self):
+        """Under the conditional graph node, quiet substeps inject nothing and wakes inject once, as without it."""
+        ungated = self._run_sleep_wake_scenario(store=True)
+        gated = self._run_sleep_wake_scenario(store=True, conditional_wake_injection=True)
         for key in (
             "asleep_count",
             "slab_count",

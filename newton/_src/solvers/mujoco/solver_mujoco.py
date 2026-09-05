@@ -4198,14 +4198,14 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         for ``body_qdd``/``body_parent_f`` (which read ``cacc``/``cfrc_int``) and sensors publish
         them regardless. Set ``True`` when reading those fields from :attr:`mjw_data` directly.
         """
-        self.conditional_wake_injection: bool = True
+        self.conditional_wake_injection: bool = False
         """Whether the dormant-contact injection runs under a conditional graph node.
 
-        ``True`` skips the injection launches on substeps without a wake event (``wp.capture_if``);
-        ``False`` launches them every substep, where they exit early without a wake event. The
-        wake event is shared by all worlds, so in large batches some tree wakes on most substeps
-        and the conditional node's scheduling cost (about 10 us per taken branch in a CUDA graph)
-        exceeds the near-empty launches it would skip; set ``False`` there.
+        ``False`` (default) launches the injection kernels every substep; without a wake event they
+        exit early. ``True`` wraps them in ``wp.capture_if`` on the wake event instead. Measured in a
+        CUDA graph, the conditional node costs about 9 us of scheduling per substep whether or not
+        the branch is taken, more than the near-empty launches it skips, and the wake event is
+        shared by all worlds so large batches take the branch on most substeps anyway.
         """
         # Newton-side contacts are converted inside the MJWarp step, after its wake pass and
         # kinematics, through the post_position callback (MJWarp versions without the hook keep the
