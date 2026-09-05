@@ -4198,6 +4198,15 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         for ``body_qdd``/``body_parent_f`` (which read ``cacc``/``cfrc_int``) and sensors publish
         them regardless. Set ``True`` when reading those fields from :attr:`mjw_data` directly.
         """
+        self.conditional_wake_injection: bool = True
+        """Whether the dormant-contact injection runs under a conditional graph node.
+
+        ``True`` skips the injection launches on substeps without a wake event (``wp.capture_if``);
+        ``False`` launches them every substep, where they exit early without a wake event. The
+        wake event is shared by all worlds, so in large batches some tree wakes on most substeps
+        and the conditional node's scheduling cost (about 10 us per taken branch in a CUDA graph)
+        exceeds the near-empty launches it would skip; set ``False`` there.
+        """
         # Newton-side contacts are converted inside the MJWarp step, after its wake pass and
         # kinematics, through the post_position callback (MJWarp versions without the hook keep the
         # pre-step conversion from body_q).
@@ -5312,6 +5321,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                         store.slabs.slab_count,
                         store.slabs.slab_live_gen,
                         contacts.contact_generation,
+                        self._wake_event,
                         store.inject_slabs,
                         store.inject_count,
                     ],
@@ -5351,9 +5361,13 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 device=model.device,
             )
 
-        # Quiet substeps (no asleep->awake transition) skip the injection through a
-        # conditional graph node.
-        wp.capture_if(self._wake_event, on_true=_inject)
+        if self.conditional_wake_injection:
+            # Quiet substeps (no asleep->awake transition) skip the injection through a
+            # conditional graph node.
+            wp.capture_if(self._wake_event, on_true=_inject)
+        else:
+            # Every injection kernel exits early without a wake event (see conditional_wake_injection).
+            _inject()
 
     def _prepare_contact_conversion(self, contacts: Contacts, *, prepared: bool = False) -> None:
         """Host-side bookkeeping and device prelude of this substep's contact conversion.

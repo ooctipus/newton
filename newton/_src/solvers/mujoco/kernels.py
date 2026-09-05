@@ -1202,6 +1202,7 @@ def collect_woken_dormant_slabs_kernel(
     slab_count: wp.array[wp.int32],
     slab_live_gen: wp.array[wp.int32],
     contact_generation: wp.array[wp.int32],
+    wake_event: wp.array[wp.int32],
     inject_slabs: wp.array[wp.int32],
     inject_count: wp.array[wp.int32],
 ):
@@ -1210,8 +1211,11 @@ def collect_woken_dormant_slabs_kernel(
     The stamp (``slab_live_gen == contact_generation``) is set once per collision
     generation so a tree that wakes, sleeps and wakes again within one tick does
     not receive its rows twice; :func:`retain_dormant_slabs` stamps slabs whose
-    rows were exported live by ``collide()`` itself.
+    rows were exported live by ``collide()`` itself. Without a wake event the pass
+    is a no-op, so it can run outside the conditional injection gate.
     """
+    if wake_event[0] == 0:
+        return
     slab = wp.tid()
     generation = contact_generation[0]
     if slab_live_gen[slab] == generation:

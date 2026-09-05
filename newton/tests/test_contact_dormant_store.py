@@ -89,6 +89,7 @@ class TestContactDormantStore(unittest.TestCase):
         rigid_contact_max: int = 64,
         nconmax: int = 64,
         enable_sleeping: bool = True,
+        conditional_wake_injection: bool = True,
     ):
         solver = SolverMuJoCo(
             model,
@@ -101,6 +102,7 @@ class TestContactDormantStore(unittest.TestCase):
             use_mujoco_contacts=False,
             dormant_contact_filter=dormant_contact_filter,
         )
+        solver.conditional_wake_injection = conditional_wake_injection
         pipeline = newton.CollisionPipeline(
             model,
             broad_phase="sap",
@@ -168,11 +170,22 @@ class TestContactDormantStore(unittest.TestCase):
             "qfrc_constraint": solver.mjw_data.qfrc_constraint.numpy(),
         }
 
-    def _run_sleep_wake_scenario(self, *, store: bool, slab_rows: int = 64, dormant_contact_filter: bool = True):
+    def _run_sleep_wake_scenario(
+        self,
+        *,
+        store: bool,
+        slab_rows: int = 64,
+        dormant_contact_filter: bool = True,
+        conditional_wake_injection: bool = True,
+    ):
         """Awake seed -> sleep -> quiet substep -> force wake -> one tracked substep."""
         model, dynamic_body, dynamic_shape = _build_supported_box_model(self.device)
         solver, pipeline, state_in, state_out, control, contacts = self._make_sim(
-            model, store=store, slab_rows=slab_rows, dormant_contact_filter=dormant_contact_filter
+            model,
+            store=store,
+            slab_rows=slab_rows,
+            dormant_contact_filter=dormant_contact_filter,
+            conditional_wake_injection=conditional_wake_injection,
         )
         shape_sleep_index, tree_asleep = solver.collision_sleep_filter
         dynamic_world, dynamic_tree = (int(value) for value in shape_sleep_index.numpy()[dynamic_shape])
@@ -253,6 +266,25 @@ class TestContactDormantStore(unittest.TestCase):
         self._assert_states_match(stored["woken_state"], reference["woken_state"])
         self.assertEqual(stored["tracked_nacon"], count)
         self._assert_states_match(stored["tracked_state"], reference["tracked_state"])
+
+    def test_unconditional_wake_injection_matches_gated_injection(self):
+        """With the conditional graph node disabled, quiet substeps inject nothing and wakes inject once."""
+        gated = self._run_sleep_wake_scenario(store=True)
+        ungated = self._run_sleep_wake_scenario(store=True, conditional_wake_injection=False)
+        for key in (
+            "asleep_count",
+            "slab_count",
+            "quiet_nacon",
+            "woken_nacon",
+            "woken_count",
+            "woken_nefc",
+            "tracked_nacon",
+        ):
+            self.assertEqual(ungated[key], gated[key], key)
+        self.assertEqual(ungated["quiet_nacon"], 0)
+        np.testing.assert_array_equal(ungated["woken_rows"], gated["woken_rows"])
+        self._assert_states_match(ungated["woken_state"], gated["woken_state"])
+        self._assert_states_match(ungated["tracked_state"], gated["tracked_state"])
 
     def test_store_does_not_inject_twice_within_one_generation(self):
         """A tree that re-sleeps and wakes again before the next collide keeps its live rows once."""

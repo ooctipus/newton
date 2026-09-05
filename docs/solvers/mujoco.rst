@@ -674,7 +674,12 @@ same three-phase cycle:
    contacts on substeps that keep the contact set), wakes sleeping trees
    touched by awake ones, and injects the dormant contacts of trees that
    woke since the previous substep, mirroring the collision prelude of
-   MuJoCo Warp's internal step. The converted contacts therefore never
+   MuJoCo Warp's internal step. The injection runs under a conditional
+   graph node that quiet substeps skip; with
+   :attr:`~newton.solvers.SolverMuJoCo.conditional_wake_injection` set to
+   ``False`` its launches run every substep instead (exiting early without
+   a wake event), which is cheaper in large batches where some tree wakes
+   on most substeps. The converted contacts therefore never
    read Newton ``body_q``. MuJoCo Warp versions without the hook keep the
    pre-step conversion and wake pass from ``body_q``. Before every step
    the solver also sets ``Option.fused_world_publish_derived`` from
