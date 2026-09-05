@@ -108,6 +108,9 @@ CLEAR_ACTIVE_ENTRY_PARALLEL_THRESHOLD = 1024
 # scan the whole table.
 HASHTABLE_WARN_LOAD_PERCENT = 80
 
+_CLEAR_ACTIVE_BLOCK_DIM = 256
+_CLEAR_ACTIVE_BLOCKS_PER_SM = 4
+
 # Vector type for tracking exported contact IDs (used in export kernels)
 exported_ids_vec_type = wp.types.vector(length=VALUES_PER_KEY, dtype=wp.int32)
 replaced_values_vec_type = wp.types.vector(length=VALUES_PER_KEY + 1, dtype=wp.uint64)
@@ -1081,8 +1084,14 @@ class GlobalContactReducer:
         later-scheduled blocks (or even later-issued warps/lanes under
         independent thread scheduling), causing some entries to be skipped.
         """
-        # Use fixed thread count for efficient GPU utilization
-        num_threads = min(1024, self.hashtable.capacity)
+        device = self.hashtable.keys.device
+        if device.is_cuda:
+            block_dim = _CLEAR_ACTIVE_BLOCK_DIM
+            thread_budget = device.sm_count * _CLEAR_ACTIVE_BLOCKS_PER_SM * block_dim
+            num_threads = min(self.hashtable.capacity * self.values_per_key, thread_budget)
+        else:
+            block_dim = 1
+            num_threads = min(1024, self.hashtable.capacity)
 
         wp.launch(
             _clear_active_kernel,
@@ -1108,7 +1117,9 @@ class GlobalContactReducer:
                 self.values_per_key,
                 num_threads,
             ],
-            device=self.device,
+            device=device,
+            block_dim=block_dim,
+            record_tape=False,
         )
         # Zero the active-slots count in a separate kernel so the write is
         # ordered (by the CUDA kernel-launch boundary) after every read in
@@ -1117,7 +1128,8 @@ class GlobalContactReducer:
             _zero_active_count_kernel,
             dim=1,
             inputs=[self.hashtable.active_slots, self.hashtable.capacity],
-            device=self.device,
+            device=device,
+            record_tape=False,
         )
 
     def get_data_struct(self) -> GlobalContactReducerData:

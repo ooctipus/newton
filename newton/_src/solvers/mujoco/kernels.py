@@ -425,6 +425,14 @@ def convert_newton_contacts_to_mjwarp_kernel(
     # Model:
     geom_bodyid: wp.array[int],
     body_weldid: wp.array[int],
+    body_treeid: wp.array[int],
+    tree_asleep: wp.array2d[int],
+    dormant_filter: int,
+    inject_mode: int,
+    dormant_flag: wp.array[int],
+    dormant_tids: wp.array[int],
+    dormant_count: wp.array[int],
+    wake_event: wp.array[int],
     body_invweight0: wp.array2d[wp.vec2],
     geom_condim: wp.array[int],
     geom_priority: wp.array[int],
@@ -494,38 +502,54 @@ def convert_newton_contacts_to_mjwarp_kernel(
 
     tid = wp.tid()
 
+    if inject_mode != 0:
+        # Wake-injection pass: visit only rows the full pass parked as dormant
+        # (both bodies asleep or static) and convert those whose tree is awake
+        # now, appending them to the live MJWarp contact set. Skipped entirely
+        # unless some tree went from asleep to awake since the last pass.
+        if wake_event[0] == 0:
+            return
+        if tid >= dormant_count[0]:
+            return
+        tid = dormant_tids[tid]
+        if dormant_flag[tid] == 0:
+            return
+
     count = rigid_contact_count[0]
 
     gen = contact_generation[0]
     last_gen = last_contact_generation[0]
-    needs_full = gen != last_gen
+    needs_full = gen != last_gen or inject_mode != 0
 
     if needs_full:
         # ── FULL PATH ────────────────────────────────────────────────────
         # Runs on the first substep after collision detection.  Identical to
         # the original kernel plus recording the tid→cid mapping.
 
-        if tid == 0:
+        if inject_mode == 0:
+            if tid == 0:
+                if count > naconmax:
+                    wp.printf(
+                        "Number of Newton contacts (%d) exceeded MJWarp limit (%d). Increase nconmax.\n",
+                        count,
+                        naconmax,
+                    )
+                ncollision_out[0] = 0
+
             if count > naconmax:
-                wp.printf(
-                    "Number of Newton contacts (%d) exceeded MJWarp limit (%d). Increase nconmax.\n",
-                    count,
-                    naconmax,
-                )
-            ncollision_out[0] = 0
+                count = naconmax
 
-        if count > naconmax:
-            count = naconmax
-
-        if tid >= count:
-            tid_to_cid[tid] = -1
-            return
+            if tid >= count:
+                tid_to_cid[tid] = -1
+                dormant_flag[tid] = 0
+                return
 
         shape_a = rigid_contact_shape0[tid]
         shape_b = rigid_contact_shape1[tid]
 
         if shape_a < 0 or shape_b < 0:
             tid_to_cid[tid] = -1
+            dormant_flag[tid] = 0
             return
 
         geom_a = newton_shape_to_mjc_geom[shape_a]
@@ -548,7 +572,36 @@ def convert_newton_contacts_to_mjwarp_kernel(
 
         if a_immovable and b_immovable:
             tid_to_cid[tid] = -1
+            dormant_flag[tid] = 0
             return
+
+        # Dormant contacts: both bodies asleep (or one asleep, one immovable).
+        # MJWarp's own collision driver never emits such contacts because the
+        # sleeping trees are frozen and their DOFs are excluded from the solve,
+        # so converting them only inflates nacon/nefc for every downstream
+        # kernel.  Park them instead; the wake-injection pass converts a parked
+        # row as soon as its tree wakes so support contacts are never missing.
+        if dormant_filter != 0:
+            worldid_early = body_a // bodies_per_world
+            if body_a < 0:
+                worldid_early = body_b // bodies_per_world
+            awake_a = False
+            awake_b = False
+            if not a_immovable:
+                tree_a = body_treeid[mj_body_a]
+                if tree_a >= 0:
+                    awake_a = tree_asleep[worldid_early, tree_a] < 0
+            if not b_immovable:
+                tree_b = body_treeid[mj_body_b]
+                if tree_b >= 0:
+                    awake_b = tree_asleep[worldid_early, tree_b] < 0
+            if (not awake_a) and (not awake_b):
+                if inject_mode == 0:
+                    tid_to_cid[tid] = -1
+                    dormant_flag[tid] = 1
+                    dormant_tids[wp.atomic_add(dormant_count, 0, 1)] = tid
+                return
+        dormant_flag[tid] = 0
 
         X_wb_a = wp.transform_identity()
         X_wb_b = wp.transform_identity()
@@ -787,6 +840,36 @@ def _snapshot_nacon_count(
 ):
     last_nacon_count[0] = nacon[0]
     last_contact_generation[0] = contact_generation[0]
+
+
+@wp.kernel
+def _detect_tree_wake_events(
+    tree_asleep: wp.array2d[wp.int32],
+    tree_asleep_prev: wp.array2d[wp.int32],
+    wake_event: wp.array[wp.int32],
+):
+    """Flag any asleep->awake transition since the previous check and refresh the snapshot."""
+    worldid, treeid = wp.tid()
+    current = tree_asleep[worldid, treeid]
+    if tree_asleep_prev[worldid, treeid] >= 0 and current < 0:
+        wake_event[0] = 1
+    tree_asleep_prev[worldid, treeid] = current
+
+
+@wp.kernel
+def _clear_wake_event(wake_event: wp.array[wp.int32]):
+    wake_event[0] = 0
+
+
+@wp.kernel
+def _prepare_dormant_contact_list(
+    contact_generation: wp.array[wp.int32],
+    last_contact_generation: wp.array[wp.int32],
+    dormant_count: wp.array[wp.int32],
+):
+    """Reset the parked-contact list when a new collision generation arrives."""
+    if contact_generation[0] != last_contact_generation[0]:
+        dormant_count[0] = 0
 
 
 @wp.kernel

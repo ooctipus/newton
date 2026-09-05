@@ -391,7 +391,7 @@ class SolverBase:
         """
         raise NotImplementedError()
 
-    def notify_model_changed(self, flags: ModelFlags | int) -> None:
+    def notify_model_changed(self, flags: ModelFlags | int, world_mask: wp.array[wp.bool] | None = None) -> None:
         """Notify the solver that parts of the :class:`~newton.Model` were modified.
 
         The *flags* argument is a bit-mask composed of the
@@ -400,6 +400,9 @@ class SolverBase:
         updated after the solver was created.  Passing the appropriate
         combination of flags enables a solver implementation to refresh its
         internal buffers without having to recreate the whole solver object.
+        ``world_mask`` optionally restricts the change to selected worlds
+        (shape ``(world_count + 1,)``); solvers may use it to avoid waking
+        or refreshing untouched worlds. ``None`` means every world.
         Valid flags are:
 
         * ``ModelFlags.JOINT_PROPERTIES``: Joint transforms or coordinates

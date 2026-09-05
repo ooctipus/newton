@@ -558,6 +558,118 @@ class TestMuJoCoSleeping(unittest.TestCase):
         for name in ("joint_q", "joint_qd", "body_q", "body_qd", "qacc", "qfrc_constraint"):
             np.testing.assert_allclose(replayed[name], reference[name], rtol=1.0e-5, atol=1.0e-6, err_msg=name)
 
+    def test_dormant_contact_filter_parks_sleeping_contacts_and_injects_on_wake(self):
+        """Park asleep-vs-kinematic contacts and restore them in the substep the tree wakes."""
+        if not wp.is_cuda_available():
+            self.skipTest("Texture SDF construction requires CUDA")
+
+        device = wp.get_device()
+        support_mesh = newton.Mesh.create_box(0.3, 0.3, 0.08, duplicate_vertices=False)
+        dynamic_mesh = newton.Mesh.create_box(0.1, 0.1, 0.08, duplicate_vertices=False)
+        for mesh in (support_mesh, dynamic_mesh):
+            mesh.build_sdf(device=device, max_resolution=16, narrow_band_range=(-0.02, 0.02), margin=0.02)
+
+        builder = newton.ModelBuilder()
+        builder.rigid_gap = 0.005
+        # A kinematic articulated fixed root becomes a MuJoCo mocap body without a tree
+        # (sleep index -2), the same classification as fixed-base sockets in Isaac Lab.
+        support_body = builder.add_link(
+            xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
+            mass=1.0,
+            inertia=wp.mat33(np.eye(3)),
+            is_kinematic=True,
+        )
+        builder.add_articulation([builder.add_joint_fixed(parent=-1, child=support_body)])
+        builder.add_shape_mesh(body=support_body, mesh=support_mesh)
+        dynamic_body = builder.add_body(
+            xform=wp.transform(wp.vec3(0.0, 0.0, 0.158), wp.quat_identity()),
+            mass=1.0,
+            inertia=wp.mat33(np.eye(3)),
+            lock_inertia=True,
+        )
+        dynamic_shape = builder.add_shape_mesh(body=dynamic_body, mesh=dynamic_mesh)
+        model = builder.finalize(device=device)
+
+        def run_case(*, dormant_contact_filter: bool):
+            solver = SolverMuJoCo(
+                model,
+                enable_sleeping=True,
+                nvmax=model.joint_dof_count,
+                iterations=10,
+                ls_iterations=5,
+                njmax=128,
+                nconmax=64,
+                use_mujoco_contacts=False,
+                dormant_contact_filter=dormant_contact_filter,
+            )
+            self.assertEqual(solver.dormant_contact_filter, dormant_contact_filter)
+            pipeline = newton.CollisionPipeline(
+                model,
+                broad_phase="sap",
+                rigid_contact_max=64,
+                max_triangle_pairs=4096,
+                deterministic=True,
+                verify_buffers=False,
+                sdf_contact_replay_max=64,
+            )
+            shape_sleep_index, tree_asleep = solver.collision_sleep_filter
+            dynamic_world, dynamic_tree = (int(value) for value in shape_sleep_index.numpy()[dynamic_shape])
+            pipeline.configure_sleep_filter(shape_sleep_index, tree_asleep)
+
+            state_in = model.state()
+            state_out = model.state()
+            control = model.control()
+            contacts = pipeline.contacts()
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+
+            # Seed the replay cache while awake, then put the resting body to sleep.
+            pipeline.collide(state_in, contacts)
+            solver.set_body_sleep_state(
+                wp.array([[dynamic_body]], dtype=wp.int32, device=device),
+                wp.array([[True]], dtype=wp.bool, device=device),
+                wp.array([dynamic_world], dtype=wp.int32, device=device),
+            )
+            solver.reset(state_in, flags=0)
+            self.assertGreaterEqual(int(tree_asleep.numpy()[dynamic_world, dynamic_tree]), 0)
+
+            # A quiet substep: the replayed support contacts reach MJWarp only without the filter.
+            pipeline.collide(state_in, contacts)
+            replayed_count = int(contacts.rigid_contact_count.numpy()[0])
+            self.assertGreater(replayed_count, 0)
+            solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
+            self.assertGreaterEqual(int(tree_asleep.numpy()[dynamic_world, dynamic_tree]), 0)
+            quiet_nacon = int(solver.mjw_data.nacon.numpy()[0])
+            if dormant_contact_filter:
+                self.assertEqual(quiet_nacon, 0)
+                self.assertEqual(int(solver._dormant_count.numpy()[0]), replayed_count)
+            else:
+                self.assertEqual(quiet_nacon, replayed_count)
+
+            # A force wakes the tree: the parked rows must be converted in that same substep.
+            body_force = np.zeros((model.body_count, 6), dtype=np.float32)
+            body_force[dynamic_body, 3] = 20.0
+            state_in.body_f.assign(body_force)
+            solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
+            self.assertLess(int(tree_asleep.numpy()[dynamic_world, dynamic_tree]), 0)
+            woken_nacon = int(solver.mjw_data.nacon.numpy()[0])
+            self.assertEqual(woken_nacon, replayed_count)
+            return {
+                "joint_q": state_out.joint_q.numpy(),
+                "joint_qd": state_out.joint_qd.numpy(),
+                "body_q": state_out.body_q.numpy(),
+                "body_qd": state_out.body_qd.numpy(),
+                "qacc": solver.mjw_data.qacc.numpy(),
+                "qfrc_constraint": solver.mjw_data.qfrc_constraint.numpy(),
+                "nefc": int(solver.mjw_data.nefc.numpy()[0]),
+            }
+
+        reference = run_case(dormant_contact_filter=False)
+        filtered = run_case(dormant_contact_filter=True)
+        self.assertGreater(reference["nefc"], 0)
+        self.assertEqual(filtered["nefc"], reference["nefc"])
+        for name in ("joint_q", "joint_qd", "body_q", "body_qd", "qacc", "qfrc_constraint"):
+            np.testing.assert_allclose(filtered[name], reference[name], rtol=1.0e-5, atol=1.0e-6, err_msg=name)
+
     def test_reset_wakes_only_selected_worlds(self):
         model, solver, state_0, state_1, control, contacts = self._make_sim(
             world_count=2, enable_sleeping=True, nvmax=1
