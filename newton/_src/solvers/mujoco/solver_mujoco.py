@@ -3818,7 +3818,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             disable_contacts: If True, disable contact computation in MuJoCo.
             disable_sensors: If True, disable sensor computation in MuJoCo.
             update_data_interval: Frequency (in simulation steps) at which to update the MuJoCo Data object from the Newton state. If 0, Data is never updated after initialization.
-            dormant_contact_filter: When sleeping is enabled and contacts come from Newton's collision pipeline, skip converting contacts whose bodies are all asleep or immovable and inject them only when a tree wakes. Sleeping DOFs are frozen and excluded from the solve, so these rows never influence the solution; skipping them keeps ``nacon``/``nefc`` proportional to awake work. Independently of this flag, rows held in a pipeline :class:`~newton.Contacts.dormant_contact_store` are injected in the substep their tree wakes.
+            dormant_contact_filter: When sleeping is enabled and contacts come from Newton's collision pipeline, skip converting contacts whose bodies are all asleep or immovable and inject them only when a tree wakes. Sleeping DOFs are frozen and excluded from the solve, so these rows never influence the solution; skipping them keeps ``nacon``/``nefc`` proportional to awake work. Independently of this flag, rows held in a pipeline :attr:`~newton.Contacts.dormant_contact_store` are injected in the substep their tree wakes. Injection runs after the adapter's own wake pass (external forces, pose edits, contact with an awake tree); trees that MJWarp wakes inside the step through tendon or equality constraints receive their rows one substep later.
             save_to_mjcf: Optional path to save the generated MJCF model file.
             use_mujoco_contacts: If True, use the MuJoCo contact solver. If False, use the Newton contact solver (newton contacts must be passed in through the step function in that case).
             include_sites: If ``True`` (default), Newton shapes marked with ``ShapeFlags.SITE`` are exported as MuJoCo sites. Sites are non-colliding reference points used for sensor attachment, debugging, or as frames of reference. If ``False``, sites are skipped during export. Defaults to ``True``.
@@ -4870,11 +4870,17 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
     def _inject_woken_dormant_contacts(self, model: Model, state_in: State, contacts: Contacts) -> None:
         """Give trees that woke this substep their dormant contacts.
 
-        Runs after :func:`mujoco_warp._src.sleep.wake_collision`, the last wake
-        point before the solve, so a woken tree receives its support contacts in
-        the same substep, exactly as when every cached contact was converted
-        unconditionally. Two sources are handled: rows the full conversion pass
-        parked (``dormant_contact_filter``) and slabs of the pipeline's
+        Runs after the adapter's pre-step wake pass (``sleep.wake``,
+        ``update_sleep_trees`` and ``wake_collision``), so a tree woken by an
+        external force, a pose edit or contact with an awake tree receives its
+        support contacts in the same substep, exactly as when every cached contact
+        was converted unconditionally. It is not the last wake point, however: with
+        ``run_collision_detection=False`` MJWarp still runs ``sleep.wake_tendon`` in
+        ``fwd_kinematics`` (models with tendons) and ``sleep.wake_equality`` after
+        ``make_constraint`` (models with equality constraints) inside the step, and
+        trees woken there receive their dormant rows one substep late, from the next
+        call. Two sources are handled: rows the full conversion pass parked
+        (``dormant_contact_filter``) and slabs of the pipeline's
         :attr:`Contacts.dormant_contact_store`, which are appended to the Newton
         buffer as well so the fast path tracks them on later substeps.
         """

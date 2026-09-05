@@ -1208,6 +1208,10 @@ def inject_dormant_slab_contacts_kernel(
         rigid_contact_margin0[tid] = slabs.margin0[source]
         rigid_contact_margin1[tid] = slabs.margin1[source]
         rigid_contact_tids[tid] = 0
+        # Slabs carry no per-contact stiffness/damping/friction: the pipeline rejects
+        # per_contact_shape_properties while the store is active (CollisionPipeline.collide),
+        # so those arrays are empty here. If that guard is relaxed, slot tid would keep
+        # whatever material an earlier row left behind.
         _convert_one_contact(
             tid,
             1,

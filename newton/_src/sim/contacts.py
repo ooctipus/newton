@@ -232,7 +232,10 @@ class Contacts:
 
         When present, rows between sleeping dynamic shapes and immovable shapes are held
         in the store instead of this buffer, and solvers that support it inject them
-        when a tree wakes. ``None`` when the pipeline runs without the store.
+        when a tree wakes. ``None`` when the pipeline runs without the store. Treat the
+        value as an opaque handle owned by the pipeline: its class is internal, and
+        :meth:`CollisionPipeline.reset_contact_history` is the supported way to
+        invalidate it.
         """
         with wp.ScopedDevice(device):
             # One int32[2] array holding two independent contact counts: [0] rigid, [1] soft.

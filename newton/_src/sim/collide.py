@@ -350,14 +350,14 @@ def write_contact(
     gap_b = writer_data.shape_gap[contact_data.shape_b]
     contact_gap = gap_a + gap_b
 
+    # Pre-reserved indices (output_index >= 0) bypass routing: their live slot is
+    # already claimed, so the row must be written there.
     index = output_index
 
     if index < 0:
         # compute index using atomic counter
         if d > contact_gap:
             return
-        # Pre-reserved indices (output_index >= 0) bypass routing: their live slot is
-        # already claimed, so the row must be written there.
         index = _reserve_live_index(contact_data, writer_data, a_contact_world, b_contact_world, contact_normal_a_to_b)
         if index < 0:
             return
@@ -1186,6 +1186,15 @@ class CollisionPipeline:
 
     For most users, construct with ``CollisionPipeline(model, ...)``.
 
+    .. note::
+
+        With the dormant contact store enabled (``sdf_contact_replay_max > 0``),
+        :meth:`collide` publishes the store on the :class:`~newton.Contacts` it
+        fills (:attr:`Contacts.dormant_contact_store`), and solvers pick it up from
+        that buffer when they step. Capture a solver step into a CUDA graph only
+        after the first :meth:`collide` with that buffer: a graph captured before
+        it records the step without the store and never injects parked rows.
+
     .. experimental::
 
         Differentiable rigid-contact kinematics computed by
@@ -1374,7 +1383,8 @@ class CollisionPipeline:
                 to live rows and full contact generation until it fits again, so
                 size this above the largest reduced manifold a resting shape can
                 hold against its fixtures (a part seated in a socket can exceed
-                200 rows). Store memory is ``dynamic shapes x rows x 84 B``.
+                200 rows). Store memory is ``dynamic shapes x rows x 76 B`` (two
+                shape indices, five ``vec3`` fields and two margins per row).
                 Defaults to 256.
 
         .. experimental::
@@ -1929,7 +1939,13 @@ class CollisionPipeline:
 
     @property
     def dormant_contact_store(self) -> DormantContactStore | None:
-        """Dormant contact store, or ``None`` until the store is enabled and sleep state is bound."""
+        """Dormant contact store, or ``None`` until the store is enabled and sleep state is bound.
+
+        The store is an opaque handle shared with solvers through
+        :attr:`Contacts.dormant_contact_store`; its class is internal and may change
+        without notice. Use :meth:`reset_contact_history` or
+        :meth:`reset_sdf_contact_replay` to invalidate it.
+        """
         return self._dormant_contact_store
 
     def reset_contact_matching(self, world_mask: wp.array[wp.bool] | None = None) -> None:
@@ -1957,9 +1973,12 @@ class CollisionPipeline:
     def reset_contact_history(self, world_mask: wp.array[wp.bool] | None = None) -> None:
         """Clear all or reset-selected temporal collision history.
 
-        This resets contact matching and SDF contact replay through one episode-
-        reset boundary. Masked selections accumulate until the next
-        :meth:`collide` call consumes them.
+        This resets contact matching and the dormant contact store (per-shape
+        replay certificates and parked slab rows) through one episode-reset
+        boundary. Masked contact-matching selections accumulate until the next
+        :meth:`collide` call consumes them; the store drops the selected worlds'
+        certificates and rows immediately and recomputes their pairs on the next
+        :meth:`collide`.
 
         .. experimental::
 
@@ -1980,16 +1999,18 @@ class CollisionPipeline:
             self._dormant_contact_store.reset(self.model.shape_world, int(self.model.world_count), world_mask)
 
     def reset_sdf_contact_replay(self, world_mask: wp.array[wp.bool] | None = None) -> None:
-        """Invalidate all or reset-selected dormant contact store history.
+        """Drop the dormant contact store's certificates and parked rows for all or selected worlds.
 
-        Per-shape poses and scalar collision configuration are checked every
-        pass. Call :meth:`reset_contact_history` with ``world_mask=None`` after
-        mutating shared finalized mesh vertices, indices, descriptors,
+        The store certifies a sleeping shape's slab from per-shape poses and scalar
+        collision configuration, which it re-checks every pass. It cannot see
+        in-place mutation of shared finalized mesh vertices, indices, descriptors,
         acceleration structures, SDF texture contents, or global
-        collision-pair/filter topology in place. When contact matching is
-        disabled, this method alone is sufficient. A partial mask is safe only
-        for resources owned exclusively by the selected worlds. Rebuild the
-        collision pipeline when an array changes size.
+        collision-pair/filter topology, so call this method (or
+        :meth:`reset_contact_history`, which also resets contact matching) with
+        ``world_mask=None`` after such changes. A partial mask is safe only for
+        resources owned exclusively by the selected worlds. Rebuild the collision
+        pipeline when an array changes size. The selected worlds' slabs empty
+        immediately and their pairs are recomputed on the next :meth:`collide`.
 
         .. experimental::
 
