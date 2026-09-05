@@ -1299,29 +1299,138 @@ def _snapshot_nacon_count(
     last_contact_generation[0] = contact_generation[0]
 
 
-@wp.kernel
-def _detect_tree_wake_events(
+@wp.kernel(enable_backward=False)
+def prepare_contact_conversion_kernel(
+    contact_generation: wp.array[wp.int32],
+    last_contact_generation: wp.array[wp.int32],
+    nacon: wp.array[wp.int32],
+    dormant_count: wp.array[wp.int32],
+):
+    """Zero the MJWarp contact count and restart the parked list on a new collision generation.
+
+    Fallback for substeps without :func:`apply_mjc_inputs_kernel`, which otherwise runs this prelude.
+    """
+    nacon[0] = 0
+    if contact_generation[0] != last_contact_generation[0]:
+        dormant_count[0] = 0
+
+
+@wp.kernel(enable_backward=False)
+def refresh_tree_awake_kernel(
+    tree_asleep: wp.array2d[wp.int32],
+    nacon: wp.array[wp.int32],
+    contact_generation: wp.array[wp.int32],
+    # outputs
+    tree_awake: wp.array2d[wp.int32],
+    tree_asleep_prev: wp.array2d[wp.int32],
+    wake_event: wp.array[wp.int32],
+    last_nacon_count: wp.array[wp.int32],
+    last_contact_generation: wp.array[wp.int32],
+):
+    """Publish ``tree_awake`` after the pre-step wake pass and flag asleep->awake transitions.
+
+    Replaces ``sleep.update_sleep_trees`` for the adapter's collision wake (MJWarp recomputes
+    the awake counters inside the step). Thread ``(0, 0)`` also snapshots the converted contact
+    count and generation for the fast conversion path, which must happen after the conversion
+    kernel completed; this kernel is the first launch after it. When ``tree_asleep_prev`` is
+    bound, a tree that is awake now but was asleep at the previous snapshot raises
+    ``wake_event`` (wakes inside the last MJWarp step or through the reset/property APIs);
+    :func:`wake_contact_trees_kernel` reports the trees it wakes itself.
+    """
+    worldid, treeid = wp.tid()
+    if worldid == 0 and treeid == 0:
+        last_nacon_count[0] = nacon[0]
+        last_contact_generation[0] = contact_generation[0]
+    asleep = tree_asleep[worldid, treeid]
+    awake = int(asleep < 0)
+    tree_awake[worldid, treeid] = awake
+    if tree_asleep_prev:
+        if awake == 1 and tree_asleep_prev[worldid, treeid] >= 0:
+            wake_event[0] = 1
+        tree_asleep_prev[worldid, treeid] = asleep
+
+
+@wp.func
+def _wake_tree_tracked(
+    ntree: int,
+    worldid: int,
+    treeid: int,
+    wakeval: int,
     tree_asleep: wp.array2d[wp.int32],
     tree_asleep_prev: wp.array2d[wp.int32],
     wake_event: wp.array[wp.int32],
 ):
-    """Flag any asleep->awake transition since the previous check and refresh the snapshot."""
-    worldid, treeid = wp.tid()
-    current = tree_asleep[worldid, treeid]
-    if tree_asleep_prev[worldid, treeid] >= 0 and current < 0:
-        wake_event[0] = 1
-    tree_asleep_prev[worldid, treeid] = current
+    """``mujoco_warp.sleep._wake_tree`` that also records the woken trees for wake injection."""
+    if treeid < 0 or treeid >= ntree:
+        return
+
+    asleep_val = tree_asleep[worldid, treeid]
+    if asleep_val < 0:
+        if wakeval < asleep_val:
+            tree_asleep[worldid, treeid] = wakeval
+        return
+
+    current = int(treeid)
+    for _step in range(ntree + 1):  # safe upper bound
+        next_tree = tree_asleep[worldid, current]
+        if next_tree < 0 or next_tree >= ntree:
+            break
+
+        tree_asleep[worldid, current] = wakeval
+        if tree_asleep_prev:
+            tree_asleep_prev[worldid, current] = wakeval
+            wake_event[0] = 1
+        current = next_tree
+        if current == treeid:
+            break
 
 
-@wp.kernel
-def _prepare_dormant_contact_list(
-    contact_generation: wp.array[wp.int32],
-    last_contact_generation: wp.array[wp.int32],
-    dormant_count: wp.array[wp.int32],
+@wp.kernel(enable_backward=False)
+def wake_contact_trees_kernel(
+    ntree: int,
+    body_treeid: wp.array[wp.int32],
+    geom_bodyid: wp.array[wp.int32],
+    tree_awake: wp.array2d[wp.int32],
+    contact_geom: wp.array[wp.vec2i],
+    contact_worldid: wp.array[wp.int32],
+    nacon: wp.array[wp.int32],
+    total_num_threads: int,
+    # outputs
+    tree_asleep: wp.array2d[wp.int32],
+    tree_asleep_prev: wp.array2d[wp.int32],
+    wake_event: wp.array[wp.int32],
 ):
-    """Reset the parked-contact list when a new collision generation arrives."""
-    if contact_generation[0] != last_contact_generation[0]:
-        dormant_count[0] = 0
+    """Wake sleeping trees that touch awake trees (``sleep.wake_collision`` over the live count).
+
+    The awake test reads the ``tree_awake`` snapshot published by :func:`refresh_tree_awake_kernel`,
+    exactly like the stock kernel, so a tree woken by one contact does not wake its own
+    neighbours until the next substep. Woken trees are recorded in ``tree_asleep_prev`` and
+    raise ``wake_event`` so their dormant contacts are injected in this substep.
+    """
+    thread = wp.tid()
+    count = wp.min(nacon[0], contact_geom.shape[0])
+    for conid in range(thread, count, total_num_threads):
+        geom_pair = contact_geom[conid]
+        g1 = geom_pair[0]
+        g2 = geom_pair[1]
+        if g1 < 0 or g2 < 0:
+            continue
+
+        tree1 = body_treeid[geom_bodyid[g1]]
+        tree2 = body_treeid[geom_bodyid[g2]]
+        if tree1 < 0 or tree2 < 0:
+            continue
+
+        worldid = contact_worldid[conid]
+        awake1 = tree_awake[worldid, tree1]
+        awake2 = tree_awake[worldid, tree2]
+        if awake1 == awake2:
+            continue
+
+        # wake the sleeping tree with the awake partner's countdown value
+        sleeping_tree = wp.where(awake1 == 1, tree2, tree1)
+        wakeval = wp.where(awake1 == 1, tree_asleep[worldid, tree1], tree_asleep[worldid, tree2])
+        _wake_tree_tracked(ntree, worldid, sleeping_tree, wakeval, tree_asleep, tree_asleep_prev, wake_event)
 
 
 @wp.kernel
@@ -1454,6 +1563,25 @@ def convert_mj_coords_to_warp_kernel(
             joint_qd[wqd_i + i] = qvel[worldid, qd_i + i]
 
 
+@wp.func
+def _store_qpos(
+    worldid: int,
+    index: int,
+    value: float,
+    qpos_treeid: wp.array[wp.int32],
+    tolerance: float,
+    qpos: wp.array2d[wp.float32],
+    tree_changed: wp.array2d[wp.int32],
+):
+    """Store one MuJoCo coordinate, flagging its tree when the value moved by more than ``tolerance``."""
+    if tree_changed:
+        if wp.abs(value - qpos[worldid, index]) > tolerance:
+            treeid = qpos_treeid[index]
+            if treeid >= 0:
+                wp.atomic_max(tree_changed, worldid, treeid, 1)
+    qpos[worldid, index] = value
+
+
 @wp.kernel
 def convert_warp_coords_to_mj_kernel(
     joint_q: wp.array[wp.float32],
@@ -1471,10 +1599,19 @@ def convert_warp_coords_to_mj_kernel(
     dof_ref: wp.array[wp.float32],
     mj_q_start: wp.array[wp.int32],
     mj_qd_start: wp.array[wp.int32],
+    qpos_treeid: wp.array[wp.int32],
+    change_tolerance: float,
     # outputs
     qpos: wp.array2d[wp.float32],
     qvel: wp.array2d[wp.float32],
+    tree_changed: wp.array2d[wp.int32],
 ):
+    """Write Newton joint coordinates and velocities into MuJoCo ``qpos`` / ``qvel``.
+
+    When ``tree_changed`` is bound, every coordinate that moves by more than ``change_tolerance``
+    flags its tree (``qpos_treeid``) so :func:`wake_changed_trees_kernel` can wake externally
+    edited trees; otherwise the coordinates are stored unconditionally.
+    """
     worldid, jntid = wp.tid()
 
     if world_mask and not world_mask[worldid]:
@@ -1506,16 +1643,12 @@ def convert_warp_coords_to_mj_kernel(
         world_pos = wp.transform_get_translation(world_xform)
         world_rot = wp.transform_get_rotation(world_xform)
 
-        qpos[worldid, q_i + 0] = world_pos[0]
-        qpos[worldid, q_i + 1] = world_pos[1]
-        qpos[worldid, q_i + 2] = world_pos[2]
-
         # change quaternion order from xyzw to wxyz
         rot_wxyz = quat_xyzw_to_wxyz(world_rot)
-        qpos[worldid, q_i + 3] = rot_wxyz[0]
-        qpos[worldid, q_i + 4] = rot_wxyz[1]
-        qpos[worldid, q_i + 5] = rot_wxyz[2]
-        qpos[worldid, q_i + 6] = rot_wxyz[3]
+        for i in range(3):
+            _store_qpos(worldid, q_i + i, world_pos[i], qpos_treeid, change_tolerance, qpos, tree_changed)
+        for i in range(4):
+            _store_qpos(worldid, q_i + 3 + i, rot_wxyz[i], qpos_treeid, change_tolerance, qpos, tree_changed)
 
         # Velocities: rotate parent-frame twist into world, then apply CoM→origin
         # and world→body conversions to match MuJoCo qvel.
@@ -1544,10 +1677,8 @@ def convert_warp_coords_to_mj_kernel(
         r = wp.quat(joint_q[wq_i + 0], joint_q[wq_i + 1], joint_q[wq_i + 2], joint_q[wq_i + 3])
         q_mj = q_cj * r * wp.quat_inverse(q_cj)
         ball_q_wxyz = quat_xyzw_to_wxyz(q_mj)
-        qpos[worldid, q_i + 0] = ball_q_wxyz[0]
-        qpos[worldid, q_i + 1] = ball_q_wxyz[1]
-        qpos[worldid, q_i + 2] = ball_q_wxyz[2]
-        qpos[worldid, q_i + 3] = ball_q_wxyz[3]
+        for i in range(4):
+            _store_qpos(worldid, q_i + i, ball_q_wxyz[i], qpos_treeid, change_tolerance, qpos, tree_changed)
 
         w_newton = wp.vec3(joint_qd[wqd_i + 0], joint_qd[wqd_i + 1], joint_qd[wqd_i + 2])
         w_mj = wp.quat_rotate(q_cj * wp.quat_inverse(r), w_newton)
@@ -1560,7 +1691,7 @@ def convert_warp_coords_to_mj_kernel(
             ref = float(0.0)
             if dof_ref:
                 ref = dof_ref[wqd_i + i]
-            qpos[worldid, q_i + i] = joint_q[wq_i + i] + ref
+            _store_qpos(worldid, q_i + i, joint_q[wq_i + i] + ref, qpos_treeid, change_tolerance, qpos, tree_changed)
         for i in range(axis_count):
             # convert velocity components
             qvel[worldid, qd_i + i] = joint_qd[wqd_i + i]
@@ -2141,8 +2272,10 @@ def _target_quat_to_axis_angle(qx: float, qy: float, qz: float, qw: float) -> wp
     return wp.vec3(x, y, z) * (speed / sin_a_2)
 
 
-@wp.kernel
-def apply_mjc_control_kernel(
+@wp.func
+def _apply_mjc_control(
+    world: int,
+    actuator: int,
     mjc_actuator_ctrl_source: wp.array[wp.int32],
     mjc_actuator_to_newton_idx: wp.array[wp.int32],
     mjc_actuator_to_newton_target_q_idx: wp.array[wp.int32],
@@ -2162,24 +2295,7 @@ def apply_mjc_control_kernel(
     # outputs
     mj_ctrl: wp.array2d[wp.float32],
 ):
-    """Apply Newton control inputs to MuJoCo control array.
-
-    For JOINT_TARGET (source=0), uses sign encoding in mjc_actuator_to_newton_idx:
-    - Positive value (>=0): position actuator; the index into
-      ``joint_target_q`` is read from ``mjc_actuator_to_newton_target_q_idx``.
-    - Value of -1: unmapped/skip
-    - Negative value (<=-2): velocity actuator, newton_axis = -(value + 2)
-
-    For ball-joint actuators, ``axis_idx >= 0`` selects the angular component to feed MuJoCo.
-    Position targets are rotated by the per-world child anchor ``q_cj`` (``joint_X_c`` indexed by
-    ``mjc_actuator_to_newton_ball_jnt`` and the current world). Velocity targets read the current
-    quaternion start from ``mjc_actuator_to_newton_target_q_idx`` and rotate by ``q_cj * r^{-1}``
-    (mirroring the qpos / qvel bridges in :func:`convert_warp_coords_to_mj_kernel` BALL). The
-    velocity case reuses the existing target-q lookup slot.
-
-    For CTRL_DIRECT (source=1), mjc_actuator_to_newton_idx is the ctrl index.
-    """
-    world, actuator = wp.tid()
+    """Write the MuJoCo ctrl entry of one actuator (see :func:`apply_mjc_control_kernel`)."""
     source = mjc_actuator_ctrl_source[actuator]
     idx = mjc_actuator_to_newton_idx[actuator]
 
@@ -2267,7 +2383,71 @@ def apply_mjc_control_kernel(
 
 
 @wp.kernel
-def apply_mjc_body_f_kernel(
+def apply_mjc_control_kernel(
+    mjc_actuator_ctrl_source: wp.array[wp.int32],
+    mjc_actuator_to_newton_idx: wp.array[wp.int32],
+    mjc_actuator_to_newton_target_q_idx: wp.array[wp.int32],
+    mjc_actuator_to_target_q_axis_idx: wp.array[wp.int32],
+    mjc_actuator_to_newton_ball_jnt: wp.array[wp.int32],
+    joint_X_c: wp.array[wp.transform],
+    joint_target_q: wp.array[wp.float32],
+    joint_target_qd: wp.array[wp.float32],
+    joint_q: wp.array[wp.float32],
+    mujoco_ctrl: wp.array[wp.float32],
+    target_q_per_world: wp.int32,
+    coords_per_world: wp.int32,
+    dofs_per_world: wp.int32,
+    ctrls_per_world: wp.int32,
+    joints_per_world: wp.int32,
+    use_coord_layout_targets: bool,
+    # outputs
+    mj_ctrl: wp.array2d[wp.float32],
+):
+    """Apply Newton control inputs to MuJoCo control array.
+
+    For JOINT_TARGET (source=0), uses sign encoding in mjc_actuator_to_newton_idx:
+    - Positive value (>=0): position actuator; the index into
+      ``joint_target_q`` is read from ``mjc_actuator_to_newton_target_q_idx``.
+    - Value of -1: unmapped/skip
+    - Negative value (<=-2): velocity actuator, newton_axis = -(value + 2)
+
+    For ball-joint actuators, ``axis_idx >= 0`` selects the angular component to feed MuJoCo.
+    Position targets are rotated by the per-world child anchor ``q_cj`` (``joint_X_c`` indexed by
+    ``mjc_actuator_to_newton_ball_jnt`` and the current world). Velocity targets read the current
+    quaternion start from ``mjc_actuator_to_newton_target_q_idx`` and rotate by ``q_cj * r^{-1}``
+    (mirroring the qpos / qvel bridges in :func:`convert_warp_coords_to_mj_kernel` BALL). The
+    velocity case reuses the existing target-q lookup slot.
+
+    For CTRL_DIRECT (source=1), mjc_actuator_to_newton_idx is the ctrl index.
+    """
+    world, actuator = wp.tid()
+    _apply_mjc_control(
+        world,
+        actuator,
+        mjc_actuator_ctrl_source,
+        mjc_actuator_to_newton_idx,
+        mjc_actuator_to_newton_target_q_idx,
+        mjc_actuator_to_target_q_axis_idx,
+        mjc_actuator_to_newton_ball_jnt,
+        joint_X_c,
+        joint_target_q,
+        joint_target_qd,
+        joint_q,
+        mujoco_ctrl,
+        target_q_per_world,
+        coords_per_world,
+        dofs_per_world,
+        ctrls_per_world,
+        joints_per_world,
+        use_coord_layout_targets,
+        mj_ctrl,
+    )
+
+
+@wp.func
+def _apply_mjc_body_f(
+    world: int,
+    mjc_body: int,
     mjc_body_to_newton: wp.array2d[wp.int32],
     body_flags: wp.array[wp.int32],
     body_f: wp.array[wp.spatial_vector],
@@ -2278,13 +2458,7 @@ def apply_mjc_body_f_kernel(
     # outputs
     xfrc_applied: wp.array2d[wp.spatial_vector],
 ):
-    """Apply Newton body forces to MuJoCo xfrc_applied array.
-
-    Iterates over MuJoCo bodies [world, mjc_body], looks up the Newton body
-    index, copies its force, and corrects for body-specific gravity when a
-    MuJoCo world contains both local and global bodies.
-    """
-    world, mjc_body = wp.tid()
+    """Write the applied Cartesian force of one MuJoCo body (see :func:`apply_mjc_body_f_kernel`)."""
     newton_body = mjc_body_to_newton[world, mjc_body]
     if newton_body < 0 or (body_flags[newton_body] & BodyFlags.KINEMATIC) != 0:
         xfrc_applied[world, mjc_body] = wp.spatial_vector(wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 0.0))
@@ -2303,7 +2477,42 @@ def apply_mjc_body_f_kernel(
 
 
 @wp.kernel
-def apply_mjc_qfrc_kernel(
+def apply_mjc_body_f_kernel(
+    mjc_body_to_newton: wp.array2d[wp.int32],
+    body_flags: wp.array[wp.int32],
+    body_f: wp.array[wp.spatial_vector],
+    body_mass: wp.array[float],
+    body_world: wp.array[wp.int32],
+    gravity: wp.array[wp.vec3],
+    body_gravcomp: wp.array2d[float],
+    # outputs
+    xfrc_applied: wp.array2d[wp.spatial_vector],
+):
+    """Apply Newton body forces to MuJoCo xfrc_applied array.
+
+    Iterates over MuJoCo bodies [world, mjc_body], looks up the Newton body
+    index, copies its force, and corrects for body-specific gravity when a
+    MuJoCo world contains both local and global bodies.
+    """
+    world, mjc_body = wp.tid()
+    _apply_mjc_body_f(
+        world,
+        mjc_body,
+        mjc_body_to_newton,
+        body_flags,
+        body_f,
+        body_mass,
+        body_world,
+        gravity,
+        body_gravcomp,
+        xfrc_applied,
+    )
+
+
+@wp.func
+def _apply_mjc_qfrc(
+    worldid: int,
+    jntid: int,
     joint_f: wp.array[wp.float32],
     joint_q: wp.array[wp.float32],
     joint_type: wp.array[wp.int32],
@@ -2318,8 +2527,7 @@ def apply_mjc_qfrc_kernel(
     # outputs
     qfrc_applied: wp.array2d[wp.float32],
 ):
-    worldid, jntid = wp.tid()
-
+    """Write the applied generalized force of one joint (see :func:`apply_mjc_qfrc_kernel`)."""
     # Skip loop joints — they have no MuJoCo DOF entries
     qd_i = mj_qd_start[jntid]
     if qd_i < 0:
@@ -2356,7 +2564,44 @@ def apply_mjc_qfrc_kernel(
 
 
 @wp.kernel
-def apply_mjc_free_joint_f_to_body_f_kernel(
+def apply_mjc_qfrc_kernel(
+    joint_f: wp.array[wp.float32],
+    joint_q: wp.array[wp.float32],
+    joint_type: wp.array[wp.int32],
+    joint_child: wp.array[wp.int32],
+    body_flags: wp.array[wp.int32],
+    joint_q_start: wp.array[wp.int32],
+    joint_qd_start: wp.array[wp.int32],
+    joint_dof_dim: wp.array2d[wp.int32],
+    joint_X_c: wp.array[wp.transform],
+    joints_per_world: int,
+    mj_qd_start: wp.array[wp.int32],
+    # outputs
+    qfrc_applied: wp.array2d[wp.float32],
+):
+    worldid, jntid = wp.tid()
+    _apply_mjc_qfrc(
+        worldid,
+        jntid,
+        joint_f,
+        joint_q,
+        joint_type,
+        joint_child,
+        body_flags,
+        joint_q_start,
+        joint_qd_start,
+        joint_dof_dim,
+        joint_X_c,
+        joints_per_world,
+        mj_qd_start,
+        qfrc_applied,
+    )
+
+
+@wp.func
+def _apply_mjc_free_joint_f(
+    worldid: int,
+    mjc_body: int,
     mjc_body_to_newton: wp.array2d[wp.int32],
     body_flags: wp.array[wp.int32],
     body_free_qd_start: wp.array[wp.int32],
@@ -2364,7 +2609,7 @@ def apply_mjc_free_joint_f_to_body_f_kernel(
     # outputs
     xfrc_applied: wp.array2d[wp.spatial_vector],
 ):
-    worldid, mjc_body = wp.tid()
+    """Add the free-joint force of one MuJoCo body to ``xfrc_applied``."""
     newton_body = mjc_body_to_newton[worldid, mjc_body]
     if newton_body < 0 or (body_flags[newton_body] & BodyFlags.KINEMATIC) != 0:
         return
@@ -2380,6 +2625,146 @@ def apply_mjc_free_joint_f_to_body_f_kernel(
         wp.spatial_top(xfrc) + v,
         wp.spatial_bottom(xfrc) + w,
     )
+
+
+@wp.kernel
+def apply_mjc_free_joint_f_to_body_f_kernel(
+    mjc_body_to_newton: wp.array2d[wp.int32],
+    body_flags: wp.array[wp.int32],
+    body_free_qd_start: wp.array[wp.int32],
+    joint_f: wp.array[wp.float32],
+    # outputs
+    xfrc_applied: wp.array2d[wp.spatial_vector],
+):
+    worldid, mjc_body = wp.tid()
+    _apply_mjc_free_joint_f(
+        worldid, mjc_body, mjc_body_to_newton, body_flags, body_free_qd_start, joint_f, xfrc_applied
+    )
+
+
+@wp.kernel
+def apply_mjc_inputs_kernel(
+    # Which passes run (host flags): ctrl, qfrc, body_f, free-joint force, contact prelude
+    apply_ctrl: int,
+    apply_qfrc: int,
+    apply_body_f: int,
+    apply_free_joint_f: int,
+    prepare_contacts: int,
+    # control -> ctrl
+    mjc_actuator_ctrl_source: wp.array[wp.int32],
+    mjc_actuator_to_newton_idx: wp.array[wp.int32],
+    mjc_actuator_to_newton_target_q_idx: wp.array[wp.int32],
+    mjc_actuator_to_target_q_axis_idx: wp.array[wp.int32],
+    mjc_actuator_to_newton_ball_jnt: wp.array[wp.int32],
+    joint_X_c: wp.array[wp.transform],
+    joint_target_q: wp.array[wp.float32],
+    joint_target_qd: wp.array[wp.float32],
+    joint_q: wp.array[wp.float32],
+    mujoco_ctrl: wp.array[wp.float32],
+    target_q_per_world: wp.int32,
+    coords_per_world: wp.int32,
+    dofs_per_world: wp.int32,
+    ctrls_per_world: wp.int32,
+    joints_per_world: wp.int32,
+    use_coord_layout_targets: bool,
+    # joint_f -> qfrc_applied
+    joint_f: wp.array[wp.float32],
+    joint_type: wp.array[wp.int32],
+    joint_child: wp.array[wp.int32],
+    body_flags: wp.array[wp.int32],
+    joint_q_start: wp.array[wp.int32],
+    joint_qd_start: wp.array[wp.int32],
+    joint_dof_dim: wp.array2d[wp.int32],
+    mj_qd_start: wp.array[wp.int32],
+    # body_f / free-joint force -> xfrc_applied
+    mjc_body_to_newton: wp.array2d[wp.int32],
+    body_f: wp.array[wp.spatial_vector],
+    body_mass: wp.array[float],
+    body_world: wp.array[wp.int32],
+    gravity: wp.array[wp.vec3],
+    body_gravcomp: wp.array2d[float],
+    body_free_qd_start: wp.array[wp.int32],
+    # contact conversion prelude
+    contact_generation: wp.array[wp.int32],
+    last_contact_generation: wp.array[wp.int32],
+    # outputs
+    mj_ctrl: wp.array2d[wp.float32],
+    qfrc_applied: wp.array2d[wp.float32],
+    xfrc_applied: wp.array2d[wp.spatial_vector],
+    nacon: wp.array[wp.int32],
+    dormant_count: wp.array[wp.int32],
+):
+    """Apply every per-substep Newton input to MJWarp in one launch.
+
+    Thread ``(world, index)`` runs the actuator pass for ``index < nu``, the joint-force pass
+    for ``index < joints_per_world`` and the body-force passes for ``index < nbody``; the
+    free-joint force is added after the body force of the same body, so the order of the
+    former separate launches is kept within one thread. Thread ``(0, 0)`` also runs the
+    contact-conversion prelude: it zeroes ``nacon`` (the full conversion path counts with
+    atomics) and restarts the parked-contact list on a new collision generation.
+    """
+    world, index = wp.tid()
+    if prepare_contacts != 0 and world == 0 and index == 0:
+        nacon[0] = 0
+        if contact_generation[0] != last_contact_generation[0]:
+            dormant_count[0] = 0
+    if apply_ctrl != 0 and index < mjc_actuator_ctrl_source.shape[0]:
+        _apply_mjc_control(
+            world,
+            index,
+            mjc_actuator_ctrl_source,
+            mjc_actuator_to_newton_idx,
+            mjc_actuator_to_newton_target_q_idx,
+            mjc_actuator_to_target_q_axis_idx,
+            mjc_actuator_to_newton_ball_jnt,
+            joint_X_c,
+            joint_target_q,
+            joint_target_qd,
+            joint_q,
+            mujoco_ctrl,
+            target_q_per_world,
+            coords_per_world,
+            dofs_per_world,
+            ctrls_per_world,
+            joints_per_world,
+            use_coord_layout_targets,
+            mj_ctrl,
+        )
+    if apply_qfrc != 0 and index < joints_per_world:
+        _apply_mjc_qfrc(
+            world,
+            index,
+            joint_f,
+            joint_q,
+            joint_type,
+            joint_child,
+            body_flags,
+            joint_q_start,
+            joint_qd_start,
+            joint_dof_dim,
+            joint_X_c,
+            joints_per_world,
+            mj_qd_start,
+            qfrc_applied,
+        )
+    if index < mjc_body_to_newton.shape[1]:
+        if apply_body_f != 0:
+            _apply_mjc_body_f(
+                world,
+                index,
+                mjc_body_to_newton,
+                body_flags,
+                body_f,
+                body_mass,
+                body_world,
+                gravity,
+                body_gravcomp,
+                xfrc_applied,
+            )
+        if apply_free_joint_f != 0:
+            _apply_mjc_free_joint_f(
+                world, index, mjc_body_to_newton, body_flags, body_free_qd_start, joint_f, xfrc_applied
+            )
 
 
 @wp.kernel
@@ -4006,27 +4391,6 @@ def restore_sleeping_state_kernel(
             overflow[worldid] = 0
 
 
-@wp.kernel(enable_backward=False)
-def copy_qpos_and_detect_tree_change_kernel(
-    qpos_new: wp.array2d[wp.float32],
-    world_mask: wp.array[wp.bool],
-    tolerance: float,
-    qpos_treeid: wp.array[wp.int32],
-    qpos: wp.array2d[wp.float32],
-    tree_changed: wp.array2d[wp.int32],
-):
-    """Copy converted coordinates and flag trees with external pose edits."""
-    worldid, i = wp.tid()
-    if world_mask and not world_mask[worldid]:
-        return
-    value = qpos_new[worldid, i]
-    if wp.abs(value - qpos[worldid, i]) > tolerance:
-        treeid = qpos_treeid[i]
-        if treeid >= 0:
-            wp.atomic_max(tree_changed, worldid, treeid, 1)
-    qpos[worldid, i] = value
-
-
 @wp.func
 def _wake_tree(worldid: int, treeid: int, ntree: int, awake_value: int, tree_asleep: wp.array2d[wp.int32]):
     asleep_value = tree_asleep[worldid, treeid]
@@ -4051,11 +4415,12 @@ def wake_changed_trees_kernel(
     awake_value: int,
     tree_asleep: wp.array2d[wp.int32],
 ):
-    """Wake edited trees and every tree in their sleeping-island cycles."""
+    """Wake edited trees and every tree in their sleeping-island cycles, consuming the flags."""
     # One walker per world avoids races between trees in the same sleep cycle.
     worldid = wp.tid()
     for treeid in range(ntree):
         if tree_changed[worldid, treeid] != 0:
+            tree_changed[worldid, treeid] = 0
             _wake_tree(worldid, treeid, ntree, awake_value, tree_asleep)
 
 

@@ -645,6 +645,18 @@ class TestMuJoCoSleeping(unittest.TestCase):
         self.assertEqual(int(solver.mjw_data.nv_awake.numpy()[0]), 2)
         np.testing.assert_array_equal(solver.mjw_data.overflow.numpy(), [0])
 
+    def test_intermediate_substeps_share_the_tick_timestep(self):
+        """opt.timestep is written at the first substep of a tick and whenever dt changes."""
+        _, solver, state_0, state_1, control, contacts = self._make_sim(enable_sleeping=True, nvmax=1)
+
+        solver._step_intermediate(state_0, state_1, control, contacts, 1.0 / 60.0)
+        np.testing.assert_allclose(solver.mjw_model.opt.timestep.numpy(), 1.0 / 60.0)
+        solver._step_intermediate(state_1, state_0, control, contacts, 1.0 / 120.0)
+        np.testing.assert_allclose(solver.mjw_model.opt.timestep.numpy(), 1.0 / 120.0)
+        solver.step(state_0, state_1, control, contacts, 1.0 / 120.0)
+        solver._step_intermediate(state_1, state_0, control, contacts, 1.0 / 240.0)
+        np.testing.assert_allclose(solver.mjw_model.opt.timestep.numpy(), 1.0 / 240.0)
+
     def test_sleeping_step_and_reset_support_cuda_graph_capture(self):
         model, solver, state_0, state_1, control, contacts = self._make_sim(enable_sleeping=True, nvmax=1)
         if not model.device.is_cuda:
