@@ -61,6 +61,7 @@ from ..geometry.flags import ShapeFlags
 from ..geometry.mpr import create_solve_mpr, create_support_map_function
 from ..geometry.sdf_contact import (
     MESH_SDF_BLOCK_DIM,
+    SDF_WORK_SEGMENT_FOOTPRINT_INT32,
     SDF_WORK_SEGMENT_STRIDE_INT32,
     SDF_WORK_STATE_SIZE,
     MeshSDFExportContext,
@@ -2369,7 +2370,11 @@ class NarrowPhase:
         # heightfield-only scenes still benefit from reduction).
         if reduce_contacts and not (has_meshes or has_heightfields):
             self.reduce_contacts = False
-        self.mesh_sdf_segment_capacity = 3 * max_triangle_pairs // SDF_WORK_SEGMENT_STRIDE_INT32
+        # Segments and their worst-case hit records share the triangle-pair
+        # scratch buffer, so hits cannot overflow unless the segments do.
+        self.mesh_sdf_segment_capacity = 3 * max_triangle_pairs // SDF_WORK_SEGMENT_FOOTPRINT_INT32
+        self.mesh_sdf_hit_offset_vec2 = self.mesh_sdf_segment_capacity * SDF_WORK_SEGMENT_STRIDE_INT32 // 2
+        self.mesh_sdf_hit_capacity = self.mesh_sdf_segment_capacity * MESH_SDF_BLOCK_DIM
         self._use_mesh_sdf_split = (
             device_obj.is_cuda
             and self.reduce_contacts
@@ -2520,7 +2525,11 @@ class NarrowPhase:
                     run_on_work_overflow=self._use_mesh_sdf_split,
                 )
                 if self._use_mesh_sdf_split:
-                    self.mesh_sdf_cull_kernel, self.mesh_sdf_solve_kernel = create_mesh_sdf_two_stage_kernels(
+                    (
+                        self.mesh_sdf_cull_kernel,
+                        self.mesh_sdf_solve_kernel,
+                        self.mesh_sdf_export_kernel,
+                    ) = create_mesh_sdf_two_stage_kernels(
                         write_contact_to_reducer,
                         speculative=speculative,
                         sdf_texture_paired_samples=self.sdf_texture_paired_samples,
@@ -2528,6 +2537,7 @@ class NarrowPhase:
                 else:
                     self.mesh_sdf_cull_kernel = None
                     self.mesh_sdf_solve_kernel = None
+                    self.mesh_sdf_export_kernel = None
             else:
                 self.mesh_mesh_contacts_kernel = create_narrow_phase_process_mesh_mesh_contacts_kernel(
                     writer_func,
@@ -2546,12 +2556,14 @@ class NarrowPhase:
                 )
                 self.mesh_sdf_cull_kernel = None
                 self.mesh_sdf_solve_kernel = None
+                self.mesh_sdf_export_kernel = None
         else:
             self.mesh_plane_contacts_kernel = None
             self.mesh_mesh_contacts_kernel = None
             self.mesh_mesh_contacts_kernel_precomputed = None
             self.mesh_sdf_cull_kernel = None
             self.mesh_sdf_solve_kernel = None
+            self.mesh_sdf_export_kernel = None
 
         # Create global contact reduction kernels for mesh/heightfield-triangle
         # contacts (mirror the predicate used to gate ``self.reduce_contacts``
@@ -2651,11 +2663,18 @@ class NarrowPhase:
                 )
                 self.mesh_sdf_work_ints = self.triangle_pairs.view(dtype=wp.int32).flatten()
                 self.mesh_sdf_work_floats = self.triangle_pairs.view(dtype=wp.float32).flatten()
+                # Hit records are addressed in vec2 slots (see SDF_WORK_HIT_RECORD_VEC2).
+                vec2_count = self.mesh_sdf_work_ints.shape[0] // 2
+                work_pairs = self.mesh_sdf_work_ints[: 2 * vec2_count].reshape((vec2_count, 2))
+                self.mesh_sdf_work_int2 = work_pairs.view(dtype=wp.vec2i)
+                self.mesh_sdf_work_float2 = work_pairs.view(dtype=wp.vec2f)
             else:
                 self.mesh_sdf_search_contexts = None
                 self.mesh_sdf_export_contexts = None
                 self.mesh_sdf_work_ints = None
                 self.mesh_sdf_work_floats = None
+                self.mesh_sdf_work_int2 = None
+                self.mesh_sdf_work_float2 = None
             self.shape_pairs_mesh_plane = (
                 wp.zeros(self.max_mesh_plane_pairs, dtype=wp.vec2i, device=device) if has_meshes else None
             )
@@ -2731,9 +2750,14 @@ class NarrowPhase:
             self.num_mesh_mesh_blocks = target_blocks * 2 if device_obj.is_cuda else target_blocks
             self.mesh_mesh_target_blocks = target_blocks
             # The split solve kernel claims segments dynamically, so launch exactly
-            # the resident block count (3 per SM, matching its launch bounds) and
-            # avoid a partially filled trailing wave.
+            # the resident block count (3 per SM, matching its launch bounds; a
+            # 4-block cap forces spills in the Brent loop and measured slower)
+            # and avoid a partially filled trailing wave. The export kernel
+            # strides over hit records with one full-occupancy wave of threads.
             self.num_mesh_sdf_solve_blocks = device_obj.sm_count * 3 if device_obj.is_cuda else target_blocks
+            self.num_mesh_sdf_export_threads = (
+                device_obj.sm_count * 6 * MESH_SDF_BLOCK_DIM if device_obj.is_cuda else target_blocks * self.block_dim
+            )
             mesh_mesh_scan_size = self.max_mesh_mesh_pairs + 1
             self.mesh_mesh_block_offsets = wp.zeros(mesh_mesh_scan_size, dtype=wp.int32, device=device)
             self.mesh_mesh_block_counts = wp.zeros(mesh_mesh_scan_size, dtype=wp.int32, device=device)
@@ -2747,6 +2771,7 @@ class NarrowPhase:
             self.num_mesh_mesh_blocks = self.num_tile_blocks
             self.mesh_mesh_target_blocks = self.num_tile_blocks
             self.num_mesh_sdf_solve_blocks = self.num_tile_blocks
+            self.num_mesh_sdf_export_threads = self.total_num_threads
             self.mesh_mesh_block_offsets = None
             self.mesh_mesh_block_counts = None
             self.num_mesh_plane_blocks = self.num_tile_blocks
@@ -3306,6 +3331,29 @@ class NarrowPhase:
                             kernel=self.mesh_sdf_solve_kernel,
                             dim=(self.num_mesh_sdf_solve_blocks,),
                             inputs=[
+                                texture_sdf_data,
+                                mesh_edge_indices,
+                                mesh_edge_centers,
+                                mesh_edge_halves,
+                                heightfield_elevations,
+                                self.mesh_sdf_search_contexts,
+                                self.mesh_sdf_work_ints,
+                                self.mesh_sdf_work_floats,
+                                self.mesh_sdf_work_int2,
+                                self.mesh_sdf_work_float2,
+                                self.mesh_sdf_work_state,
+                                self.mesh_sdf_segment_capacity,
+                                self.mesh_sdf_hit_offset_vec2,
+                                self.mesh_sdf_hit_capacity,
+                            ],
+                            device=device,
+                            block_dim=self.tile_size_mesh_mesh,
+                            record_tape=False,
+                        )
+                        wp.launch(
+                            kernel=self.mesh_sdf_export_kernel,
+                            dim=self.num_mesh_sdf_export_threads,
+                            inputs=[
                                 shape_transform,
                                 texture_sdf_data,
                                 shape_linear_velocity,
@@ -3316,17 +3364,15 @@ class NarrowPhase:
                                 shape_collision_aabb_upper,
                                 shape_voxel_resolution,
                                 mesh_mesh_pairs,
-                                mesh_edge_indices,
-                                mesh_edge_centers,
-                                mesh_edge_halves,
-                                heightfield_elevations,
                                 reducer_data,
                                 self.mesh_sdf_search_contexts,
                                 self.mesh_sdf_export_contexts,
-                                self.mesh_sdf_work_ints,
-                                self.mesh_sdf_work_floats,
+                                self.mesh_sdf_work_int2,
+                                self.mesh_sdf_work_float2,
                                 self.mesh_sdf_work_state,
-                                self.mesh_sdf_segment_capacity,
+                                self.mesh_sdf_hit_offset_vec2,
+                                self.mesh_sdf_hit_capacity,
+                                self.num_mesh_sdf_export_threads,
                             ],
                             device=device,
                             block_dim=self.tile_size_mesh_mesh,

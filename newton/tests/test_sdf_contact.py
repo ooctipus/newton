@@ -72,16 +72,25 @@ class TestSDFContact(unittest.TestCase):
 
                 split_contacts = collide(pipeline, state, contacts)
                 self.assertEqual(int(pipeline.narrow_phase.mesh_sdf_work_state.numpy()[1]), 0)
+                self.assertGreater(int(pipeline.narrow_phase.mesh_sdf_work_state.numpy()[4]), 0)
+
+                def assert_same_contacts(expected, actual) -> None:
+                    for lhs, rhs in zip(expected, actual, strict=True):
+                        if lhs.ndim == 1:
+                            np.testing.assert_array_equal(lhs, rhs)
+                        else:
+                            np.testing.assert_allclose(lhs, rhs, rtol=1.0e-5, atol=1.0e-6)
+
+                # Hit records that do not fit trip the same fallback as segments that do not fit.
+                hit_capacity = pipeline.narrow_phase.mesh_sdf_hit_capacity
+                pipeline.narrow_phase.mesh_sdf_hit_capacity = 0
+                assert_same_contacts(split_contacts, collide(pipeline, state, contacts))
+                self.assertEqual(int(pipeline.narrow_phase.mesh_sdf_work_state.numpy()[1]), 1)
+                pipeline.narrow_phase.mesh_sdf_hit_capacity = hit_capacity
 
                 pipeline.narrow_phase.mesh_sdf_segment_capacity = 0
-                fallback_contacts = collide(pipeline, state, contacts)
+                assert_same_contacts(split_contacts, collide(pipeline, state, contacts))
                 self.assertEqual(int(pipeline.narrow_phase.mesh_sdf_work_state.numpy()[1]), 1)
-
-                for split, fallback in zip(split_contacts, fallback_contacts, strict=True):
-                    if split.ndim == 1:
-                        np.testing.assert_array_equal(split, fallback)
-                    else:
-                        np.testing.assert_allclose(split, fallback, rtol=1.0e-5, atol=1.0e-6)
 
     def test_block_count_scan_ignores_inactive_tail(self) -> None:
         """Keep active block offsets independent of stale inactive slots."""

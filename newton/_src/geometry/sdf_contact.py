@@ -76,14 +76,25 @@ STACK_CAPACITY = 2 * MESH_SDF_BLOCK_DIM
 # The two-int header is followed by packed ``(edge index, midpoint SDF)`` pairs.
 _SDF_WORK_SEGMENT_HEADER_INT32 = 2
 SDF_WORK_SEGMENT_STRIDE_INT32 = _SDF_WORK_SEGMENT_HEADER_INT32 + 2 * MESH_SDF_BLOCK_DIM
-# ``work_state`` layout: segment count, overflow flag, then the cull and solve
-# work cursors that persistent blocks advance atomically to claim their next
-# combo or segment (dynamic scheduling keeps the tail wave balanced).
-SDF_WORK_STATE_SIZE = 4
+# Hit records follow the segment region in the same scratch buffer. Each edge
+# that survives the search stores three ``vec2`` slots: ``(context id, edge
+# index)`` as ints, then ``(x, y)`` and ``(z, distance)`` of the contact point
+# in SDF space as floats. A segment yields at most ``MESH_SDF_BLOCK_DIM``
+# records, so sizing the two regions together keeps hits from overflowing
+# whenever the segments fit.
+SDF_WORK_HIT_RECORD_VEC2 = 3
+SDF_WORK_HIT_RECORD_INT32 = 2 * SDF_WORK_HIT_RECORD_VEC2
+SDF_WORK_SEGMENT_FOOTPRINT_INT32 = SDF_WORK_SEGMENT_STRIDE_INT32 + MESH_SDF_BLOCK_DIM * SDF_WORK_HIT_RECORD_INT32
+# ``work_state`` layout: segment count, overflow flag, the cull and solve work
+# cursors that persistent blocks advance atomically to claim their next combo
+# or segment (dynamic scheduling keeps the tail wave balanced), and the hit
+# record count that the export kernel consumes.
+SDF_WORK_STATE_SIZE = 5
 _SDF_WORK_SEGMENT_COUNT = 0
 _SDF_WORK_OVERFLOWED = 1
 _SDF_WORK_CULL_CURSOR = 2
 _SDF_WORK_SOLVE_CURSOR = 3
+_SDF_WORK_HIT_COUNT = 4
 
 
 @wp.func_native("""
@@ -197,6 +208,20 @@ class MeshSDFSearchContext:
 class MeshSDFExportContext:
     inner_spatial_depth: float
     outer_spatial_depth: float
+
+
+@wp.struct
+class MeshSDFHitRecord:
+    """Edge-search result handed from the solve kernel to the export kernel.
+
+    ``point`` is the deepest edge point in SDF-local space [m] and ``dist`` the
+    signed distance there [m]; ``context_id`` indexes the pair/mode contexts.
+    """
+
+    context_id: int
+    edge_idx: int
+    point: wp.vec3
+    dist: float
 
 
 @wp.func
@@ -2238,37 +2263,39 @@ def create_mesh_sdf_two_stage_kernels(
 
     @wp.kernel(enable_backward=False, launch_bounds=(256, 3), module=module)
     def mesh_sdf_solve_kernel(
-        shape_transform: wp.array[wp.transform],
         texture_sdf_table: wp.array[TextureSDFData],
-        shape_linear_velocity: wp.array[wp.vec3],
-        shape_angular_velocity: wp.array[wp.vec3],
-        collision_update_dt: float,
-        max_speculative_extension: float,
-        shape_collision_aabb_lower: wp.array[wp.vec3],
-        shape_collision_aabb_upper: wp.array[wp.vec3],
-        shape_voxel_resolution: wp.array[wp.vec3i],
-        shape_pairs_mesh_mesh: wp.array[wp.vec2i],
         mesh_edge_indices: wp.array[wp.vec2i],
         mesh_edge_centers: wp.array[wp.vec4],
         mesh_edge_halves: wp.array[wp.vec4],
         heightfield_elevations: wp.array[wp.float32],
-        reducer_data: GlobalContactReducerData,
         search_contexts: wp.array[MeshSDFSearchContext],
-        export_contexts: wp.array[MeshSDFExportContext],
         work_ints: wp.array[wp.int32],
         work_floats: wp.array[wp.float32],
+        work_int2: wp.array[wp.vec2i],
+        work_float2: wp.array[wp.vec2f],
         work_state: wp.array[wp.int32],
         work_segment_capacity: int,
+        hit_offset_vec2: int,
+        hit_capacity: int,
     ):
+        """Run the edge search only and emit compact hit records.
+
+        Keeping the reducer export out of this kernel removes the hashtable
+        round trips from the texture-bound Brent loop; ``mesh_sdf_export_kernel``
+        then reduces only the surviving hits. The launch bounds keep the loop
+        at three resident blocks per SM: a four-block register cap forces
+        spills in the search loop and measured slower.
+        """
         _block_id, t = wp.tid()
         if work_state[_SDF_WORK_OVERFLOWED] != 0:
             return
         segment_count = wp.min(work_state[_SDF_WORK_SEGMENT_COUNT], work_segment_capacity)
-        solve_context = wp.tile_empty(shape=1, dtype=MeshSDFSearchContext, storage="shared")
+        hit_stack = wp.tile_stack(capacity=MESH_SDF_BLOCK_DIM, dtype=MeshSDFHitRecord)
         work_slot = wp.tile_zeros(shape=1, dtype=int, storage="shared")
+        hit_slot = wp.tile_zeros(shape=1, dtype=int, storage="shared")
 
-        # Claim segments dynamically; per-segment cost varies several-fold with
-        # the number of edges that reach the reducer.
+        # Claim segments dynamically; per-segment cost varies with the number
+        # of edges that converge inside the contact threshold.
         segment = int(0)
         if t == 0:
             segment = wp.atomic_add(work_state, _SDF_WORK_SOLVE_CURSOR, 1)
@@ -2276,13 +2303,13 @@ def create_mesh_sdf_two_stage_kernels(
         segment = wp.tile_extract(work_slot, 0)
         while segment < segment_count:
             base = segment * SDF_WORK_SEGMENT_STRIDE_INT32
+            # The header is block-uniform, so plain loads broadcast without a
+            # shared-memory round trip.
             context_id = work_ints[base]
-            context = MeshSDFSearchContext()
-            if t == 0:
-                context = search_contexts[context_id]
-            wp.tile_scatter_masked(solve_context, 0, context, t == 0)
-            context = wp.tile_extract(solve_context, 0)
+            context = search_contexts[context_id]
             count = work_ints[base + 1]
+            record = MeshSDFHitRecord()
+            is_hit = False
             if t < count:
                 texture_sdf = texture_sdf_table[context.sdf_index]
                 item = base + _SDF_WORK_SEGMENT_HEADER_INT32 + 2 * t
@@ -2311,11 +2338,10 @@ def create_mesh_sdf_two_stage_kernels(
                     heightfield_elevations,
                     context.search_precision,
                 )
-                result_context = wp.tile_extract(solve_context, 0)
                 center, radius = get_edge_bounding_sphere(v0, v1)
                 inner_cull_consistent = mesh_sdf_contact_passes_inner_cull_consistency(
                     dist,
-                    result_context.margin_sum,
+                    context.margin_sum,
                     cached_sdf_val,
                     center,
                     radius,
@@ -2325,76 +2351,144 @@ def create_mesh_sdf_two_stage_kernels(
                     True,
                 )
                 owns_endpoint = best_endpoint == 0 or corner_ownership == 0 or (corner_ownership & best_endpoint) != 0
-                if dist < result_context.contact_threshold and inner_cull_consistent and owns_endpoint:
-                    direction = wp.static(sample_grad)(texture_sdf, point)
-                    export = export_contexts[context_id]
-                    pair = shape_pairs_mesh_mesh[context_id >> 1]
-                    mode = context_id & 1
-                    tri_shape = pair[mode]
-                    sdf_shape = pair[1 - mode]
-                    tri_transform = shape_transform[tri_shape]
-                    sdf_transform = shape_transform[sdf_shape]
-                    point_world = wp.transform_point(sdf_transform, point)
-                    direction_world = wp.transform_vector(sdf_transform, direction)
-                    direction_len_sq = wp.length_sq(direction_world)
-                    if direction_len_sq > 0.0:
-                        direction_world = direction_world * _sdf_rsqrt_rn(direction_len_sq)
-                    else:
-                        fallback_dir = point_world - wp.transform_get_translation(sdf_transform)
-                        fallback_len_sq = wp.length_sq(fallback_dir)
-                        if fallback_len_sq > 0.0:
-                            direction_world = fallback_dir * _sdf_rsqrt_rn(fallback_len_sq)
-                        else:
-                            direction_world = wp.vec3(0.0, 1.0, 0.0)
+                if dist < context.contact_threshold and inner_cull_consistent and owns_endpoint:
+                    is_hit = True
+                    record.context_id = context_id
+                    record.edge_idx = edge_idx
+                    record.point = point
+                    record.dist = dist
 
-                    contact_normal = -direction_world if mode == 0 else direction_world
-                    position_local_tri = wp.quat_rotate_inv(
-                        wp.transform_get_rotation(tri_transform),
-                        point_world - wp.transform_get_translation(tri_transform),
-                    )
-                    pair_midpoint = (
-                        wp.transform_get_translation(tri_transform) + wp.transform_get_translation(sdf_transform)
-                    ) * 0.5
-                    contact_id = export_and_reduce_contact_centered_two_spatial_depths(
-                        pair[0],
-                        pair[1],
-                        point_world,
-                        contact_normal,
-                        dist,
-                        (edge_idx << 2) | (mode << 1),
-                        point_world - pair_midpoint,
-                        export.inner_spatial_depth,
-                        export.outer_spatial_depth,
-                        position_local_tri,
-                        shape_collision_aabb_lower[tri_shape],
-                        shape_collision_aabb_upper[tri_shape],
-                        shape_voxel_resolution[tri_shape],
-                        reducer_data,
-                    )
-                    if wp.static(speculative):
-                        if dist >= export.inner_spatial_depth:
-                            export_and_reduce_predictive_contact(
-                                pair[0],
-                                pair[1],
-                                point_world,
-                                contact_normal,
-                                dist,
-                                result_context.margin_sum,
-                                0.0,
-                                0.0,
-                                (edge_idx << 2) | (mode << 1),
-                                shape_transform,
-                                shape_linear_velocity,
-                                shape_angular_velocity,
-                                collision_update_dt,
-                                max_speculative_extension,
-                                contact_id,
-                                reducer_data,
-                            )
+            # Compact the segment's hits into one contiguous run of records.
+            wp.tile_stack_push(hit_stack, record, is_hit)
+            hit_fill = wp.tile_stack_count(hit_stack)
+            if hit_fill > 0:
+                hit_base = int(0)
+                if t == 0:
+                    hit_base = wp.atomic_add(work_state, _SDF_WORK_HIT_COUNT, hit_fill)
+                    if hit_base + hit_fill > hit_capacity:
+                        wp.atomic_max(work_state, _SDF_WORK_OVERFLOWED, 1)
+                wp.tile_scatter_masked(hit_slot, 0, hit_base, t == 0)
+                hit_base = wp.tile_extract(hit_slot, 0)
+                popped, hit_index = wp.tile_stack_pop(hit_stack)
+                if hit_index >= 0:
+                    hit_index += hit_base
+                    if hit_index < hit_capacity:
+                        slot = hit_offset_vec2 + SDF_WORK_HIT_RECORD_VEC2 * hit_index
+                        work_int2[slot] = wp.vec2i(popped.context_id, popped.edge_idx)
+                        work_float2[slot + 1] = wp.vec2f(popped.point[0], popped.point[1])
+                        work_float2[slot + 2] = wp.vec2f(popped.point[2], popped.dist)
+                wp.tile_stack_clear(hit_stack)
 
             if t == 0:
                 segment = wp.atomic_add(work_state, _SDF_WORK_SOLVE_CURSOR, 1)
             wp.tile_scatter_masked(work_slot, 0, segment, t == 0)
             segment = wp.tile_extract(work_slot, 0)
 
-    return mesh_sdf_cull_kernel, mesh_sdf_solve_kernel
+    @wp.kernel(enable_backward=False, launch_bounds=(256, 3), module=module)
+    def mesh_sdf_export_kernel(
+        shape_transform: wp.array[wp.transform],
+        texture_sdf_table: wp.array[TextureSDFData],
+        shape_linear_velocity: wp.array[wp.vec3],
+        shape_angular_velocity: wp.array[wp.vec3],
+        collision_update_dt: float,
+        max_speculative_extension: float,
+        shape_collision_aabb_lower: wp.array[wp.vec3],
+        shape_collision_aabb_upper: wp.array[wp.vec3],
+        shape_voxel_resolution: wp.array[wp.vec3i],
+        shape_pairs_mesh_mesh: wp.array[wp.vec2i],
+        reducer_data: GlobalContactReducerData,
+        search_contexts: wp.array[MeshSDFSearchContext],
+        export_contexts: wp.array[MeshSDFExportContext],
+        work_int2: wp.array[wp.vec2i],
+        work_float2: wp.array[wp.vec2f],
+        work_state: wp.array[wp.int32],
+        hit_offset_vec2: int,
+        hit_capacity: int,
+        total_num_threads: int,
+    ):
+        """Reduce the hit records of ``mesh_sdf_solve_kernel`` into the global reducer.
+
+        One thread per hit record: consecutive records come from the same
+        segment, so the per-pair context loads stay warp-uniform.
+        """
+        if work_state[_SDF_WORK_OVERFLOWED] != 0:
+            return
+        hit_count = wp.min(work_state[_SDF_WORK_HIT_COUNT], hit_capacity)
+        for hit_index in range(wp.tid(), hit_count, total_num_threads):
+            slot = hit_offset_vec2 + SDF_WORK_HIT_RECORD_VEC2 * hit_index
+            ids = work_int2[slot]
+            point_xy = work_float2[slot + 1]
+            point_zd = work_float2[slot + 2]
+            context_id = ids[0]
+            edge_idx = ids[1]
+            point = wp.vec3(point_xy[0], point_xy[1], point_zd[0])
+            dist = point_zd[1]
+            context = search_contexts[context_id]
+            export = export_contexts[context_id]
+            texture_sdf = texture_sdf_table[context.sdf_index]
+            direction = wp.static(sample_grad)(texture_sdf, point)
+            pair = shape_pairs_mesh_mesh[context_id >> 1]
+            mode = context_id & 1
+            tri_shape = pair[mode]
+            sdf_shape = pair[1 - mode]
+            tri_transform = shape_transform[tri_shape]
+            sdf_transform = shape_transform[sdf_shape]
+            point_world = wp.transform_point(sdf_transform, point)
+            direction_world = wp.transform_vector(sdf_transform, direction)
+            direction_len_sq = wp.length_sq(direction_world)
+            if direction_len_sq > 0.0:
+                direction_world = direction_world * _sdf_rsqrt_rn(direction_len_sq)
+            else:
+                fallback_dir = point_world - wp.transform_get_translation(sdf_transform)
+                fallback_len_sq = wp.length_sq(fallback_dir)
+                if fallback_len_sq > 0.0:
+                    direction_world = fallback_dir * _sdf_rsqrt_rn(fallback_len_sq)
+                else:
+                    direction_world = wp.vec3(0.0, 1.0, 0.0)
+
+            contact_normal = -direction_world if mode == 0 else direction_world
+            position_local_tri = wp.quat_rotate_inv(
+                wp.transform_get_rotation(tri_transform),
+                point_world - wp.transform_get_translation(tri_transform),
+            )
+            pair_midpoint = (
+                wp.transform_get_translation(tri_transform) + wp.transform_get_translation(sdf_transform)
+            ) * 0.5
+            contact_id = export_and_reduce_contact_centered_two_spatial_depths(
+                pair[0],
+                pair[1],
+                point_world,
+                contact_normal,
+                dist,
+                (edge_idx << 2) | (mode << 1),
+                point_world - pair_midpoint,
+                export.inner_spatial_depth,
+                export.outer_spatial_depth,
+                position_local_tri,
+                shape_collision_aabb_lower[tri_shape],
+                shape_collision_aabb_upper[tri_shape],
+                shape_voxel_resolution[tri_shape],
+                reducer_data,
+            )
+            if wp.static(speculative):
+                if dist >= export.inner_spatial_depth:
+                    export_and_reduce_predictive_contact(
+                        pair[0],
+                        pair[1],
+                        point_world,
+                        contact_normal,
+                        dist,
+                        context.margin_sum,
+                        0.0,
+                        0.0,
+                        (edge_idx << 2) | (mode << 1),
+                        shape_transform,
+                        shape_linear_velocity,
+                        shape_angular_velocity,
+                        collision_update_dt,
+                        max_speculative_extension,
+                        contact_id,
+                        reducer_data,
+                    )
+
+    return mesh_sdf_cull_kernel, mesh_sdf_solve_kernel, mesh_sdf_export_kernel
