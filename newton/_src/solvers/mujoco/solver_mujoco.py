@@ -94,7 +94,6 @@ from .kernels import (
     inject_dormant_slab_contacts_kernel,
     prepare_contact_conversion_kernel,
     recompute_jnt_eq_anchor1_kernel,
-    refresh_contact_poses_from_mjc_kernel,
     refresh_tree_awake_kernel,
     repeat_array_kernel,
     reset_joint_state_kernel,
@@ -4085,7 +4084,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 raise ValueError("mesh_variant_sets requires separate_worlds=True.")
             self._validate_mesh_variant_definitions(model)
         # Buffers for the fast-path contact conversion optimisation.
-        # See _convert_contacts_to_mjwarp / convert_newton_contacts_to_mjwarp_kernel.
+        # See _prepare_contact_conversion / convert_newton_contacts_to_mjwarp_kernel.
         # Initialised before _convert_to_mjc because notify_model_changed (called
         # during conversion) may call _invalidate_contact_fast_path.
         #
@@ -4172,14 +4171,45 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self.publish_intermediate_body_state: bool = True
         """Whether intermediate substeps (:meth:`_step_intermediate`) publish ``body_q``/``body_qd``.
 
-        With the in-step contact pose refresh the converted contacts read their body poses from
+        With the in-step contact conversion the converted contacts read their body poses from
         MuJoCo Warp's kinematics, so Newton's forward kinematics is only needed when the state is
         consumed outside the solver. Set ``False`` when nothing reads Newton body state between the
         substeps of a tick (no mid-tick collision, no per-substep force callbacks); the finalizing
-        :meth:`step` always publishes. Ignored when the pose refresh is unavailable.
+        :meth:`step` always publishes. Ignored when the in-step conversion is unavailable.
         """
-        # Newton-side contacts refresh dist/pos from xpos/xquat inside the MJWarp step through its
-        # post_position callback (MJWarp versions without the hook keep the pre-step refresh).
+        self.publish_intermediate_joint_state: bool = True
+        """Whether intermediate substeps publish ``joint_q``/``joint_qd`` and re-read them.
+
+        Set ``False`` when nothing reads or writes Newton joint state between the substeps of a
+        tick: intermediate substeps then skip the joint-coordinate publish, the ``update_data_interval``
+        re-sync of ``qpos``/``qvel`` from the state runs on the first substep of a tick only, and the
+        finalizing :meth:`step` publishes as usual. Implies the body-state publish is skipped as well
+        unless :attr:`publish_intermediate_body_state` requests it.
+        """
+        self.mjwarp_publish_derived: bool = False
+        """Whether MuJoCo Warp's fused forward publishes the derived data Newton never reads.
+
+        ``Option.fused_world_publish_derived`` (MuJoCo Warp versions that have it) is set from this
+        flag before every step: ``False`` lets the fused per-world forward skip the derived fields
+        no stage of the step and no Newton conversion reads (``xmat``, ``ximat``, ``xanchor``,
+        ``xaxis``, ``geom_xpos``, ``geom_xmat``, ``site_xpos``, ``site_xmat``, ``crb``,
+        ``actuator_length``, ``actuator_velocity``, ``actuator_moment``, ``cdof_dot``,
+        ``qfrc_spring``, ``qfrc_damper``, ``qfrc_adhesion``, ``cacc``, ``cfrc_int``). Requests
+        for ``body_qdd``/``body_parent_f`` (which read ``cacc``/``cfrc_int``) and sensors publish
+        them regardless. Set ``True`` when reading those fields from :attr:`mjw_data` directly.
+        """
+        self.conditional_wake_injection: bool = True
+        """Whether the dormant-contact injection runs under a conditional graph node.
+
+        ``True`` skips the injection launches on substeps without a wake event (``wp.capture_if``);
+        ``False`` launches them every substep, where they exit early without a wake event. The
+        wake event is shared by all worlds, so in large batches some tree wakes on most substeps
+        and the conditional node's scheduling cost (about 10 us per taken branch in a CUDA graph)
+        exceeds the near-empty launches it would skip; set ``False`` there.
+        """
+        # Newton-side contacts are converted inside the MJWarp step, after its wake pass and
+        # kinematics, through the post_position callback (MJWarp versions without the hook keep the
+        # pre-step conversion from body_q).
         self._contact_pose_hook = (
             not use_mujoco_cpu
             and not use_mujoco_contacts
@@ -4188,6 +4218,14 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             and os.environ.get("NEWTON_MJWARP_CONTACT_POSE_HOOK") != "0"  # timing diagnostics only
         )
         self._hook_contacts: Contacts | None = None
+        self._hook_state_in: State | None = None
+        # Per-MJWarp-contact records for the in-step refresh: Newton row, MuJoCo bodies and the
+        # pose-independent offset scales / surface radii (see _convert_one_contact).
+        self._hook_tid: wp.array[wp.int32] | None = None
+        self._hook_body: wp.array[wp.vec2i] | None = None
+        self._hook_geom: wp.array[wp.vec4] | None = None
+        if self._contact_pose_hook:
+            self._allocate_hook_records(self.mjw_data.naconmax)
 
         if self.mjw_model is not None:
             self.mjw_model.opt.run_collision_detection = use_mujoco_contacts
@@ -4218,19 +4256,20 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             yield
 
     @event_scope
-    def _mujoco_warp_step(self, finalize: bool = True, contacts: Contacts | None = None):
+    def _mujoco_warp_step(self, finalize: bool = True, contacts: Contacts | None = None, state_in: State | None = None):
         """Advance MJWarp by one substep.
 
         Args:
             finalize: Whether this substep materializes MJWarp's deferred derived data.
-            contacts: Newton contacts whose converted rows are refreshed from MJWarp's kinematics
-                inside the step (:meth:`_refresh_contact_poses_from_mjwarp`); ``None`` leaves the
-                ``post_position`` callback unbound.
+            contacts: Newton contacts converted inside the step (:meth:`_convert_contacts_in_step`);
+                ``None`` leaves the ``post_position`` callback unbound.
+            state_in: Newton input state of the substep (contact conversion inputs).
         """
         callback = self.mjw_model.callback
         if contacts is not None:
             self._hook_contacts = contacts
-            callback.post_position = self._refresh_contact_poses_from_mjwarp
+            self._hook_state_in = state_in
+            callback.post_position = self._convert_contacts_in_step
         try:
             if finalize:
                 self._mujoco_warp.step(self.mjw_model, self.mjw_data)
@@ -4240,41 +4279,58 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             if contacts is not None:
                 # scoped to the step so other MJWarp passes on this model (reset) leave the rows alone
                 callback.post_position = None
+                self._hook_contacts = None
+                self._hook_state_in = None
 
-    def _refresh_contact_poses_from_mjwarp(self, m: MjWarpModel, d: MjWarpData) -> None:
-        """Recompute dist/pos of every live converted contact from MJWarp's body kinematics.
+    def _convert_contacts_in_step(self, m: MjWarpModel, d: MjWarpData) -> None:
+        """Convert the Newton contacts inside the MJWarp step, after its wake pass and kinematics.
 
         Bound to ``m.callback.post_position`` for the duration of :meth:`_mujoco_warp_step`, so it
-        runs after MJWarp's kinematics and before ``make_constraint`` reads the contact rows.
+        runs after MJWarp's own ``sleep.wake`` (forces, velocities, user requests) and kinematics
+        and before ``make_constraint`` reads the contact rows. Mirrors the collision prelude of
+        MJWarp's internal step for externally supplied contacts: conversion of the live rows (or
+        the by-contact refresh of ``dist``/``pos`` from ``xpos``/``xquat`` on substeps that keep
+        the contact set), the collision wake, and the injection of dormant contacts of trees that
+        woke since the previous substep. Trees woken here take part in this substep's solve, as
+        with MJWarp's ``wake_collision``; the awake counters and body/DOF compaction are left to
+        MJWarp's forward pass, which recomputes them before they are read.
         """
         contacts = self._hook_contacts
-        threads = min(self._contact_tid_to_cid.shape[0], CONTACT_CONVERSION_MAX_THREADS)
-        wp.launch(
-            refresh_contact_poses_from_mjc_kernel,
-            dim=threads,
-            inputs=[
-                contacts.rigid_contact_count,
-                contacts.rigid_contact_shape0,
-                contacts.rigid_contact_shape1,
-                contacts.rigid_contact_point0,
-                contacts.rigid_contact_point1,
-                contacts.rigid_contact_normal,
-                contacts.rigid_contact_offset0,
-                contacts.rigid_contact_offset1,
-                contacts.rigid_contact_margin0,
-                contacts.rigid_contact_margin1,
-                self.model.shape_margin,
-                self.newton_shape_to_mjc_geom,
-                m.geom_bodyid,
-                d.xpos,
-                d.xquat,
-                self._contact_tid_to_cid,
-                d.contact.worldid,
-                d.naconmax,
-                threads,
-            ],
-            outputs=[d.contact.dist, d.contact.pos, d.contact.efc_address],
-            device=self.model.device,
+        state_in = self._hook_state_in
+        model = self.model
+        inject, store = self._wake_injection_store(contacts) if self.enable_sleeping else (False, None)
+        self._launch_contact_conversion(
+            model,
+            state_in,
+            contacts,
+            xpos=d.xpos,
+            xquat=d.xquat,
+            tree_asleep_prev=self._tree_asleep_prev if inject else None,
+        )
+        if self.enable_sleeping:
+            self._wake_contact_trees(contacts, tree_asleep_prev=self._tree_asleep_prev if inject else None)
+            if inject:
+                self._inject_woken_dormant_contacts(model, state_in, contacts, store, xpos=d.xpos, xquat=d.xquat)
+        else:
+            self._snapshot_contact_generation(contacts)
+
+    def _allocate_hook_records(self, naconmax: int) -> None:
+        """Allocate the per-MJWarp-contact records of the in-step refresh for ``naconmax`` contacts."""
+        self._hook_tid = wp.zeros(naconmax, dtype=wp.int32, device=self.device)
+        self._hook_body = wp.zeros(naconmax, dtype=wp.vec2i, device=self.device)
+        self._hook_geom = wp.zeros(naconmax, dtype=wp.vec4, device=self.device)
+
+    def _apply_mjwarp_publish_option(self, state_out: State) -> None:
+        """Set ``Option.fused_world_publish_derived`` for this step (see :attr:`mjwarp_publish_derived`)."""
+        m = self.mjw_model
+        if not hasattr(m.opt, "fused_world_publish_derived"):
+            return
+        m.opt.fused_world_publish_derived = bool(
+            self.mjwarp_publish_derived
+            or m.nsensor > 0
+            or m.sensor_rne_postconstraint
+            or state_out.body_qdd is not None
+            or state_out.body_parent_f is not None
         )
 
     @property
@@ -4412,35 +4468,41 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         else:
             with wp.ScopedDevice(self.model.device), self._scoped_mujoco_warp_execution():
                 self._enable_rne_postconstraint(state_out)
+                self._apply_mjwarp_publish_option(state_out)
                 convert_contacts = not self.mjw_model.opt.run_collision_detection
                 prepared = self._apply_mjc_inputs(
                     self.model, state_in, control, contacts, prepare_contacts=convert_contacts
                 )
-                if self.update_data_interval > 0 and self._step % self.update_data_interval == 0:
+                first_of_tick = self._timestep_fill_pending
+                if self.update_data_interval > 0 and (
+                    first_of_tick
+                    if not self.publish_intermediate_joint_state
+                    else self._step % self.update_data_interval == 0
+                ):
                     self._update_mjc_data(self.mjw_data, self.model, state_in)
-                if self._timestep_fill_pending or dt != self._last_timestep:
+                if first_of_tick or dt != self._last_timestep:
                     self.mjw_model.opt.timestep.fill_(dt)
                     self._last_timestep = dt
                 self._timestep_fill_pending = finalize
                 hook = convert_contacts and self._contact_pose_hook
                 if convert_contacts:
-                    self._convert_contacts_to_mjwarp(
-                        self.model,
-                        state_in,
-                        contacts,
-                        prepared=prepared,
-                        snapshot=not self.enable_sleeping,
-                        refresh_poses=not hook,
-                    )
-                    if self.enable_sleeping:
-                        self._wake_before_step(self.model, state_in, contacts)
-                self._mujoco_warp_step(finalize, contacts if hook else None)
+                    self._prepare_contact_conversion(contacts, prepared=prepared)
+                    if not hook:
+                        # pre-step conversion from body_q (MJWarp without the post_position hook)
+                        self._launch_contact_conversion(self.model, state_in, contacts)
+                        if self.enable_sleeping:
+                            self._wake_before_step(self.model, state_in, contacts)
+                        else:
+                            self._snapshot_contact_generation(contacts)
+                self._mujoco_warp_step(finalize, contacts if hook else None, state_in)
+                publish_body_state = finalize or not hook or self.publish_intermediate_body_state
                 self._update_newton_state(
                     self.model,
                     state_out,
                     self.mjw_data,
                     state_prev=state_in,
-                    publish_body_state=finalize or not hook or self.publish_intermediate_body_state,
+                    publish_body_state=publish_body_state,
+                    publish_joint_state=publish_body_state or self.publish_intermediate_joint_state,
                 )
         self._step += 1
 
@@ -5025,8 +5087,14 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         *,
         inject_mode: int,
         total_num_threads: int,
+        xpos: wp.array | None = None,
+        xquat: wp.array | None = None,
     ) -> list:
-        """Argument list for :func:`convert_newton_contacts_to_mjwarp_kernel`."""
+        """Argument list shared by the conversion and slab-injection kernels.
+
+        ``xpos``/``xquat`` select MJWarp's body kinematics of the current substep as the pose
+        source (in-step conversion); ``None`` uses ``state_in.body_q``.
+        """
         bodies_per_world = self.model.body_count // self.model.world_count
         mujoco_attrs = getattr(model, "mujoco", None)
         shape_mjc_solref_mode = getattr(mujoco_attrs, "solref_mode", None) if mujoco_attrs is not None else None
@@ -5101,6 +5169,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self._contact_tid_to_cid,
             self._last_nacon_count,
             total_num_threads,
+            # In-step conversion: MJWarp kinematics and the per-contact refresh records
+            xpos,
+            xquat,
+            self._hook_tid,
+            self._hook_body,
+            self._hook_geom,
         ]
 
     def _wake_injection_store(self, contacts: Contacts) -> tuple[bool, Any]:
@@ -5152,6 +5226,14 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             ],
             device=model.device,
         )
+        self._wake_contact_trees(contacts, tree_asleep_prev=tree_asleep_prev)
+        if inject:
+            self._inject_woken_dormant_contacts(model, state_in, contacts, store)
+
+    def _wake_contact_trees(self, contacts: Contacts, *, tree_asleep_prev: wp.array | None) -> None:
+        """Wake sleeping trees touched by awake ones and snapshot the converted count and generation."""
+        m = self.mjw_model
+        d = self.mjw_data
         threads = min(d.naconmax, CONTACT_CONVERSION_MAX_THREADS)
         wp.launch(
             wake_contact_trees_kernel,
@@ -5164,18 +5246,33 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 d.contact.geom,
                 d.contact.worldid,
                 d.nacon,
+                contacts.contact_generation,
                 threads,
             ],
-            outputs=[d.tree_asleep, tree_asleep_prev, wake_event],
-            device=model.device,
+            outputs=[
+                d.tree_asleep,
+                tree_asleep_prev,
+                self._wake_event if tree_asleep_prev is not None else None,
+                self._last_nacon_count,
+                self._last_contact_generation,
+            ],
+            device=self.model.device,
         )
-        if inject:
-            self._inject_woken_dormant_contacts(model, state_in, contacts, store)
 
-    def _inject_woken_dormant_contacts(self, model: Model, state_in: State, contacts: Contacts, store: Any) -> None:
+    def _inject_woken_dormant_contacts(
+        self,
+        model: Model,
+        state_in: State,
+        contacts: Contacts,
+        store: Any,
+        *,
+        xpos: wp.array | None = None,
+        xquat: wp.array | None = None,
+    ) -> None:
         """Give trees that woke this substep their dormant contacts.
 
-        Runs after the adapter's pre-step wake pass (:meth:`_wake_before_step`), so a
+        Runs after the collision wake (inside the step through :meth:`_convert_contacts_in_step`,
+        or after the adapter's pre-step wake pass :meth:`_wake_before_step`), so a
         tree woken by an external force, a pose edit or contact with an awake tree
         receives its support contacts in the same substep, exactly as when every
         cached contact was converted unconditionally. It is not the last wake point,
@@ -5187,6 +5284,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         full conversion pass parked (``dormant_contact_filter``) and slabs of the
         pipeline's :attr:`Contacts.dormant_contact_store`, which are appended to the
         Newton buffer as well so the fast path tracks them on later substeps.
+        Body poses come from ``xpos``/``xquat`` when given and from ``state_in.body_q`` otherwise.
         """
         d = self.mjw_data
         live_capacity = min(contacts.rigid_contact_max, self._contact_tid_to_cid.shape[0])
@@ -5199,9 +5297,15 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     dim=parked_threads,
                     inputs=[
                         *self._contact_conversion_inputs(
-                            model, state_in, contacts, inject_mode=1, total_num_threads=parked_threads
+                            model,
+                            state_in,
+                            contacts,
+                            inject_mode=1,
+                            total_num_threads=parked_threads,
+                            xpos=xpos,
+                            xquat=xquat,
                         ),
-                        1,  # refresh_poses: unused by the injection pass
+                        None,  # tree_asleep_prev: the injection pass detects no wake events
                     ],
                     device=model.device,
                 )
@@ -5217,6 +5321,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                         store.slabs.slab_count,
                         store.slabs.slab_live_gen,
                         contacts.contact_generation,
+                        self._wake_event,
                         store.inject_slabs,
                         store.inject_count,
                     ],
@@ -5233,7 +5338,13 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                         live_capacity,
                         contacts.rigid_contact_tids,
                         *self._contact_conversion_inputs(
-                            model, state_in, contacts, inject_mode=0, total_num_threads=inject_threads
+                            model,
+                            state_in,
+                            contacts,
+                            inject_mode=0,
+                            total_num_threads=inject_threads,
+                            xpos=xpos,
+                            xquat=xquat,
                         ),
                     ],
                     device=model.device,
@@ -5250,33 +5361,21 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 device=model.device,
             )
 
-        # Quiet substeps (no asleep->awake transition) skip the injection through a
-        # conditional graph node.
-        wp.capture_if(self._wake_event, on_true=_inject)
+        if self.conditional_wake_injection:
+            # Quiet substeps (no asleep->awake transition) skip the injection through a
+            # conditional graph node.
+            wp.capture_if(self._wake_event, on_true=_inject)
+        else:
+            # Every injection kernel exits early without a wake event (see conditional_wake_injection).
+            _inject()
 
-    def _convert_contacts_to_mjwarp(
-        self,
-        model: Model,
-        state_in: State,
-        contacts: Contacts,
-        *,
-        prepared: bool = False,
-        snapshot: bool = True,
-        refresh_poses: bool = True,
-    ):
-        """Convert the Newton contact buffer into MJWarp contacts for this substep.
+    def _prepare_contact_conversion(self, contacts: Contacts, *, prepared: bool = False) -> None:
+        """Host-side bookkeeping and device prelude of this substep's contact conversion.
 
         Args:
-            model: Newton model.
-            state_in: Newton state providing the body poses.
             contacts: Newton contact buffer.
             prepared: Whether :func:`apply_mjc_inputs_kernel` already zeroed ``nacon`` and
                 restarted the parked-contact list for this substep.
-            snapshot: Whether to snapshot the converted count and generation here. With sleeping
-                enabled :meth:`_wake_before_step` takes the snapshot in its refresh kernel.
-            refresh_poses: Whether the fast path refreshes dist/pos from ``state_in.body_q``.
-                ``False`` when :meth:`_refresh_contact_poses_from_mjwarp` refreshes them from
-                MJWarp's kinematics inside the step.
         """
         # Ensure the inverse shape mapping exists (lazy creation)
         if self.newton_shape_to_mjc_geom is None:
@@ -5288,7 +5387,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         # over the live count with a fixed thread budget.
         naconmax = self.mjw_data.naconmax
         launch_dim = min(contacts.rigid_contact_max, naconmax)
-        thread_count = min(launch_dim, CONTACT_CONVERSION_MAX_THREADS)
 
         # Grow the tid_to_cid buffer if the MJWarp data capacity changed after
         # construction.
@@ -5314,9 +5412,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
 
         if needs_realloc or contacts_changed:
             if needs_realloc:
-                self._contact_tid_to_cid = wp.full(launch_dim, -1, dtype=wp.int32, device=model.device)
-                self._dormant_flag = wp.zeros(launch_dim, dtype=wp.int32, device=model.device)
-                self._dormant_tids = wp.zeros(launch_dim, dtype=wp.int32, device=model.device)
+                self._contact_tid_to_cid = wp.full(launch_dim, -1, dtype=wp.int32, device=self.model.device)
+                self._dormant_flag = wp.zeros(launch_dim, dtype=wp.int32, device=self.model.device)
+                self._dormant_tids = wp.zeros(launch_dim, dtype=wp.int32, device=self.model.device)
+            if self._contact_pose_hook and (self._hook_tid is None or self._hook_tid.shape[0] < naconmax):
+                self._allocate_hook_records(naconmax)
             # Reset existing device buffers (always pre-allocated in __init__).
             self._invalidate_contact_fast_path()
             self._last_contacts_id = contacts_id
@@ -5332,39 +5432,68 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 dim=1,
                 inputs=[contacts.contact_generation, self._last_contact_generation],
                 outputs=[self.mjw_data.nacon, self._dormant_count],
-                device=model.device,
+                device=self.model.device,
             )
+
+    def _launch_contact_conversion(
+        self,
+        model: Model,
+        state_in: State,
+        contacts: Contacts,
+        *,
+        xpos: wp.array | None = None,
+        xquat: wp.array | None = None,
+        tree_asleep_prev: wp.array | None = None,
+    ) -> None:
+        """Convert the Newton contact buffer into MJWarp contacts for this substep.
+
+        Args:
+            model: Newton model.
+            state_in: Newton state providing the body poses when ``xpos`` is ``None``.
+            contacts: Newton contact buffer.
+            xpos: MJWarp body positions of the current substep (in-step conversion).
+            xquat: MJWarp body orientations of the current substep (in-step conversion).
+            tree_asleep_prev: When given, the kernel also flags trees that woke since this
+                snapshot (``wake_event``) and refreshes the snapshot.
+        """
+        thread_count = min(contacts.rigid_contact_max, self.mjw_data.naconmax, CONTACT_CONVERSION_MAX_THREADS)
         wp.launch(
             convert_newton_contacts_to_mjwarp_kernel,
             dim=thread_count,
             inputs=[
                 *self._contact_conversion_inputs(
-                    model, state_in, contacts, inject_mode=0, total_num_threads=thread_count
+                    model,
+                    state_in,
+                    contacts,
+                    inject_mode=0,
+                    total_num_threads=thread_count,
+                    xpos=xpos,
+                    xquat=xquat,
                 ),
-                int(refresh_poses),
+                tree_asleep_prev,
             ],
             device=model.device,
         )
 
-        # Snapshot the final nacon count and generation so the fast path can
-        # restore them on subsequent substeps.  Runs as a separate dim=1
-        # kernel AFTER the main kernel completes so that:
-        #  - nacon_out has its final value (from atomic_add on full path, or
-        #    restored from last_nacon_count on fast path)
-        #  - last_contact_generation is only updated after ALL threads in the
-        #    main kernel have read it (avoids a cross-block race)
-        if snapshot:
-            wp.launch(
-                _snapshot_nacon_count,
-                dim=1,
-                inputs=[
-                    self.mjw_data.nacon,
-                    self._last_nacon_count,
-                    contacts.contact_generation,
-                    self._last_contact_generation,
-                ],
-                device=model.device,
-            )
+    def _snapshot_contact_generation(self, contacts: Contacts) -> None:
+        """Snapshot the converted count and generation for the fast conversion path.
+
+        Runs as a separate dim=1 kernel after the conversion kernel completed so that ``nacon``
+        has its final value and ``last_contact_generation`` is only updated once every thread
+        of the conversion kernel has read it. With sleeping enabled the collision-wake kernel
+        takes the snapshot instead.
+        """
+        wp.launch(
+            _snapshot_nacon_count,
+            dim=1,
+            inputs=[
+                self.mjw_data.nacon,
+                self._last_nacon_count,
+                contacts.contact_generation,
+                self._last_contact_generation,
+            ],
+            device=self.model.device,
+        )
 
     def _sync_mjw_inertias_to_mjc_cpu(self) -> None:
         """Synchronize the complete MJWarp inertial representation to MuJoCo CPU."""
@@ -5954,6 +6083,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         state_prev: State,
         *,
         publish_body_state: bool = True,
+        publish_joint_state: bool = True,
     ):
         """Update a Newton state from MuJoCo coordinates and kinematics.
 
@@ -5967,6 +6097,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             publish_body_state: Whether to run forward kinematics for ``body_q``/``body_qd``.
                 Intermediate substeps skip it when the converted contacts read their poses from
                 MJWarp and nothing else reads Newton body state before the finalizing substep.
+            publish_joint_state: Whether to convert ``qpos``/``qvel`` into ``joint_q``/``joint_qd``.
+                Intermediate substeps skip it when nothing reads Newton joint state before the
+                finalizing substep (see :attr:`publish_intermediate_joint_state`); the body-state
+                publish requires it.
         """
         is_mjwarp = SolverMuJoCo._data_is_mjwarp(mj_data)
         single_world_template = False
@@ -5987,31 +6121,32 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         )
         mujoco_attrs = getattr(model, "mujoco", None)
         dof_ref = getattr(mujoco_attrs, "dof_ref", None) if mujoco_attrs is not None else None
-        wp.launch(
-            convert_mj_coords_to_warp_kernel,
-            dim=(nworld, joints_per_world),
-            inputs=[
-                qpos,
-                qvel,
-                joints_per_world,
-                model.joint_type,
-                model.joint_q_start,
-                model.joint_qd_start,
-                model.joint_dof_dim,
-                model.joint_child,
-                model.joint_X_p,
-                model.joint_X_c,
-                model.body_com,
-                dof_ref,
-                model.body_flags,
-                state_prev.joint_q,
-                state_prev.joint_qd,
-                self.mj_q_start,
-                self.mj_qd_start,
-            ],
-            outputs=[state.joint_q, state.joint_qd],
-            device=model.device,
-        )
+        if publish_joint_state or publish_body_state:
+            wp.launch(
+                convert_mj_coords_to_warp_kernel,
+                dim=(nworld, joints_per_world),
+                inputs=[
+                    qpos,
+                    qvel,
+                    joints_per_world,
+                    model.joint_type,
+                    model.joint_q_start,
+                    model.joint_qd_start,
+                    model.joint_dof_dim,
+                    model.joint_child,
+                    model.joint_X_p,
+                    model.joint_X_c,
+                    model.body_com,
+                    dof_ref,
+                    model.body_flags,
+                    state_prev.joint_q,
+                    state_prev.joint_qd,
+                    self.mj_q_start,
+                    self.mj_qd_start,
+                ],
+                outputs=[state.joint_q, state.joint_qd],
+                device=model.device,
+            )
 
         if publish_body_state:
             eval_fk(model, state.joint_q, state.joint_qd, state)
