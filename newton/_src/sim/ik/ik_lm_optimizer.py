@@ -852,6 +852,36 @@ class IKOptimizerLM:
         self.lambda_values.zero_()
         self.accept_flags.zero_()
 
+    def compute_residuals(
+        self,
+        joint_q: wp.array2d[wp.float32],
+        residuals: wp.array2d[wp.float32] | None = None,
+    ) -> wp.array2d[wp.float32]:
+        """Evaluate objective residuals without constructing a Jacobian.
+
+        Args:
+            joint_q: Joint coordinates [m or rad, depending on joint type],
+                shape ``[batch, joint_coord_count]``. The batch may use any
+                nonempty leading prefix of the optimizer capacity.
+            residuals: Optional output buffer, shape
+                ``[batch, num_residuals]``. Each residual row uses the units
+                documented by its :class:`IKObjective`.
+
+        Returns:
+            The evaluated residual view. It aliases :paramref:`residuals`
+            when provided, or the optimizer-owned leading prefix otherwise.
+
+        Raises:
+            ValueError: If an input or output shape is incompatible.
+        """
+        batch = joint_q.shape[0]
+        if batch < 1 or batch > self.n_batch or joint_q.shape[1] != self.n_coords:
+            raise ValueError("joint_q must be a nonempty leading batch within the optimizer capacity")
+        if residuals is not None and residuals.shape != (batch, self.n_residuals):
+            raise ValueError("residuals has incompatible shape")
+        residuals = self.residuals[:batch] if residuals is None else residuals
+        return self._compute_residuals(joint_q, residuals)
+
     def compute_costs(self, joint_q: wp.array2d[wp.float32]) -> wp.array[wp.float32]:
         """Evaluate squared residual costs for a batch of joint configurations.
 

@@ -631,6 +631,36 @@ def test_convergence_mixed_d6(test, device):
     _convergence_test_d6(test, device, ik.IKJacobianType.MIXED)
 
 
+def test_optimizer_public_residuals_reuse_active_prefix_without_jacobian(test, device, mode):
+    """Residual-only evaluation must preserve mode semantics without touching Jacobian storage."""
+    with wp.ScopedDevice(device):
+        batch = 3
+        capacity = 5
+        model = _build_two_link_planar(device)
+        objective = _pos_objective_builder(model, capacity)[0]
+        optimizer = ik.IKOptimizerLM(model, capacity, [objective], jacobian_mode=mode)
+        joint_q = wp.array(
+            [[0.2, -0.4], [-0.7, 0.3], [1.1, -0.2]],
+            dtype=wp.float32,
+            device=device,
+        )
+        optimizer.compute_costs(joint_q)
+        expected_np = optimizer.residuals.numpy()[:batch].copy()
+
+        optimizer.jacobian.fill_(37.0)
+        output = wp.empty((batch, optimizer.n_residuals), dtype=wp.float32, device=device)
+        residual_view = optimizer.compute_residuals(joint_q, output)
+
+        test.assertEqual(residual_view.ptr, output.ptr)
+        assert_np_equal(residual_view.numpy(), expected_np, tol=1.0e-6)
+        assert_np_equal(optimizer.jacobian.numpy(), np.full(optimizer.jacobian.shape, 37.0, dtype=np.float32))
+
+        internal_view = optimizer.compute_residuals(joint_q)
+        test.assertEqual(internal_view.ptr, optimizer.residuals.ptr)
+        test.assertEqual(internal_view.shape, (batch, optimizer.n_residuals))
+        assert_np_equal(internal_view.numpy(), expected_np, tol=1.0e-6)
+
+
 def test_joint_dof_mask(test, device, mode: ik.IKJacobianType):
     """The LM solver must leave masked joint DOFs exactly unchanged while the
     free DOFs still converge, across the batch dimension."""
@@ -1104,6 +1134,15 @@ add_function_test(
     test_builtin_objective_memory_excludes_caller_rotation_targets,
     devices,
 )
+
+for mode in ik.IKJacobianType:
+    add_function_test(
+        TestIKModes,
+        f"test_optimizer_public_residuals_reuse_active_prefix_without_jacobian_{mode.value}",
+        test_optimizer_public_residuals_reuse_active_prefix_without_jacobian,
+        devices,
+        mode=mode,
+    )
 
 # FREE-joint convergence
 add_function_test(TestIKModes, "test_convergence_autodiff_free", test_convergence_autodiff_free, devices)
