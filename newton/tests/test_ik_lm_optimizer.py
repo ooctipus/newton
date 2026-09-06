@@ -10,12 +10,12 @@ import warp as wp
 
 import newton
 import newton.ik as ik
-from newton.ik import IKOptimizerLM
 from newton._src.sim.ik.ik_lm_optimizer import (
     _lm_global_workspace_bytes,
     _lm_tiled_solve_fits,
     _lm_tiled_solve_shared_memory_bytes,
 )
+from newton.ik import IKOptimizerLM
 from newton.tests.unittest_utils import add_function_test, assert_np_equal, get_selected_cuda_test_devices
 
 
