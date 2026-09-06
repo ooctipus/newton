@@ -326,6 +326,11 @@ class TestMuJoCoMeshVariants(unittest.TestCase):
         self.assertGreater(contact_count, 0)
         np.testing.assert_array_equal(solver.mjw_data.contact.worldid.numpy()[:contact_count], 1)
         np.testing.assert_array_equal(solver.mesh_variant_ids("box").numpy(), [0, 1])
+        # The per-set ids are row views of the shared table that batched writers update in one launch.
+        np.testing.assert_array_equal(
+            solver.mesh_variant_id_table.numpy()[solver.mesh_variant_names.index("box")],
+            solver.mesh_variant_ids("box").numpy(),
+        )
 
         geom = 1
         mj_body = 1

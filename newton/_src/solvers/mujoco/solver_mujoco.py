@@ -574,6 +574,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         shapes: wp.array2d[MeshVariantShape]
         bodies: wp.array[MeshVariantBody]
         variant_ids: wp.array[wp.int32]
+        table_row: int
 
     # Class variables to cache the imported modules
     _mujoco = None
@@ -773,7 +774,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         body_inertias = model.body_inertia.numpy()
         body_inv_inertias = model.body_inv_inertia.numpy()
         device = model.device
-        for definition in self._mesh_variant_definitions:
+        self._mesh_variant_id_table = wp.zeros(
+            (len(self._mesh_variant_definitions), model.world_count), dtype=wp.int32, device=device
+        )
+        for row, definition in enumerate(self._mesh_variant_definitions):
             geom_indices = np.asarray(
                 [np.flatnonzero(geom_to_shape[0] == shape).item() for shape in definition.shape_indices[0]],
                 dtype=np.int32,
@@ -895,7 +899,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 mj_dof_index=mj_dof,
                 shapes=wp.array(shape_rows, dtype=MeshVariantShape, device=device),
                 bodies=wp.array(body_rows, dtype=MeshVariantBody, device=device),
-                variant_ids=wp.zeros(model.world_count, dtype=wp.int32, device=device),
+                variant_ids=self._mesh_variant_id_table[row],
+                table_row=row,
             )
             self._mesh_variant_banks[definition.name] = bank
 
@@ -3842,6 +3847,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
 
         self._mesh_variant_definitions = tuple(mesh_variant_sets or ())
         self._mesh_variant_banks: dict[str, SolverMuJoCo._MeshVariantBank] = {}
+        self._mesh_variant_id_table: wp.array | None = None
         self._mesh_variant_asset_names: dict[str, tuple[tuple[str, ...], ...]] = {}
 
         # Import and cache MuJoCo modules (only happens once per class)
@@ -4345,8 +4351,17 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         """Names of the compiled mesh variant sets."""
         return tuple(self._mesh_variant_banks)
 
+    @property
+    def mesh_variant_id_table(self) -> wp.array | None:
+        """Selected variant id per mesh variant set and world, shape ``[num_sets, world_count]``.
+
+        Rows follow :attr:`mesh_variant_names`; :meth:`mesh_variant_ids` returns a view of one row, so a
+        batched writer can update every set with one launch. ``None`` without mesh variant sets.
+        """
+        return self._mesh_variant_id_table
+
     def mesh_variant_ids(self, name: str) -> wp.array[wp.int32]:
-        """Return the selected variant id in each world."""
+        """Return the selected variant id in each world (a row view of :attr:`mesh_variant_id_table`)."""
         try:
             return self._mesh_variant_banks[name].variant_ids
         except KeyError as error:

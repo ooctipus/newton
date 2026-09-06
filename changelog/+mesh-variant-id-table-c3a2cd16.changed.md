@@ -1,0 +1,1 @@
+Give SolverMuJoCo mesh variant banks one shared variant-id table (`mesh_variant_id_table`, rows in `mesh_variant_names` order); `mesh_variant_ids(name)` returns a row view, so batched writers update every set with one launch.
