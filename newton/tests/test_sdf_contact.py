@@ -92,6 +92,52 @@ class TestSDFContact(unittest.TestCase):
                 assert_same_contacts(split_contacts, collide(pipeline, state, contacts))
                 self.assertEqual(int(pipeline.narrow_phase.mesh_sdf_work_state.numpy()[1]), 1)
 
+    def test_split_mesh_sdf_dedicated_work_buffer(self) -> None:
+        """A dedicated work-buffer capacity matches the aliased path and is independent of max_triangle_pairs."""
+        for device in get_cuda_test_devices():
+            with self.subTest(device=device):
+                mesh = newton.Mesh.create_box(0.5, 0.5, 0.5, duplicate_vertices=False, compute_inertia=False)
+                mesh.build_sdf(max_resolution=32, device=device)
+                builder = newton.ModelBuilder()
+                mesh_body = builder.add_body(xform=wp.transform_identity())
+                box_body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.9), wp.quat_identity()))
+                builder.add_shape_mesh(mesh_body, mesh=mesh)
+                builder.add_shape_box(box_body, cfg=newton.ModelBuilder.ShapeConfig(sdf_max_resolution=32))
+                model = builder.finalize(device=device)
+                common = {
+                    "broad_phase": "nxn",
+                    "deterministic": True,
+                    "reduce_contacts": True,
+                    "rigid_contact_max": 128,
+                }
+
+                def reduced(pipeline, active_model) -> np.ndarray:
+                    contacts = pipeline.contacts()
+                    pipeline.collide(active_model.state(), contacts)
+                    count = int(contacts.rigid_contact_count.numpy()[0])
+                    self.assertGreater(count, 0)
+                    self.assertEqual(int(pipeline.narrow_phase.mesh_sdf_work_state.numpy()[1]), 0)
+                    rows = np.column_stack(
+                        (
+                            contacts.rigid_contact_shape0.numpy()[:count],
+                            contacts.rigid_contact_shape1.numpy()[:count],
+                            contacts.rigid_contact_point0.numpy()[:count],
+                            contacts.rigid_contact_normal.numpy()[:count],
+                        )
+                    )
+                    return rows[np.lexsort(rows.T[::-1])]
+
+                aliased = newton.CollisionPipeline(model, max_triangle_pairs=4096, **common)
+                dedicated = newton.CollisionPipeline(model, max_triangle_pairs=64, mesh_sdf_work_segments=64, **common)
+                self.assertEqual(dedicated.narrow_phase.mesh_sdf_segment_capacity, 64)
+                self.assertGreater(
+                    dedicated.narrow_phase.mesh_sdf_segment_capacity,
+                    aliased.narrow_phase.mesh_sdf_segment_capacity * 64 // 4096,
+                )
+                np.testing.assert_allclose(reduced(dedicated, model), reduced(aliased, model), rtol=1.0e-5, atol=1.0e-6)
+                with self.assertRaises(ValueError):
+                    newton.CollisionPipeline(model, mesh_sdf_work_segments=-1, **common)
+
     def test_block_count_scan_ignores_inactive_tail(self) -> None:
         """Keep active block offsets independent of stale inactive slots."""
         for device in get_test_devices():

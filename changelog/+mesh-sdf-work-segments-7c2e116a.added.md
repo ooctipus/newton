@@ -1,0 +1,1 @@
+Add `mesh_sdf_work_segments` to `CollisionPipeline` and `NarrowPhase` to size the two-stage mesh-SDF work buffer independently of `max_triangle_pairs`; when the buffer overflows the mesh-SDF pass falls back to the single-stage kernel, which is several times slower at large environment counts.

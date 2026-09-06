@@ -1254,6 +1254,7 @@ class CollisionPipeline:
         sdf_contact_replay_max: int = 0,
         sdf_contact_slab_rows: int = 256,
         broad_phase_sap_sort_type: Literal["segmented", "tile"] = "segmented",
+        mesh_sdf_work_segments: int | None = None,
     ):
         """
         Initialize the CollisionPipeline (expert API).
@@ -1271,6 +1272,13 @@ class CollisionPipeline:
                 for mesh and heightfield collisions.  Increase this when
                 scenes with large/complex meshes or heightfields report
                 triangle-pair overflow warnings.
+            mesh_sdf_work_segments:
+                Capacity of the two-stage mesh-SDF work buffer in edge segments.
+                ``None`` aliases the triangle-pair scratch buffer, tying the
+                capacity to ``max_triangle_pairs`` (and so to the contact-reducer
+                size). Size it from the number of awake mesh-SDF pairs instead;
+                an overflow drops the whole mesh-SDF pass to the single-stage
+                kernel, which is several times slower.
             contact_reduction_hashtable_size_factor: Multiplier applied to
                 ``max_triangle_pairs`` when allocating the global contact
                 reduction hashtable. Increase this if hashtable fill/failure
@@ -1703,6 +1711,7 @@ class CollisionPipeline:
             self.narrow_phase = NarrowPhase(
                 max_candidate_pairs=self.shape_pairs_max,
                 max_triangle_pairs=max_triangle_pairs,
+                mesh_sdf_work_segments=mesh_sdf_work_segments,
                 max_mesh_mesh_pairs=max_mesh_mesh_pairs,
                 max_mesh_plane_pairs=max_mesh_plane_pairs,
                 reduce_contacts=self.reduce_contacts,

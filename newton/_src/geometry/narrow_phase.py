@@ -2246,6 +2246,7 @@ class NarrowPhase:
         mesh_sdf_identity_scale_only: bool = False,
         mesh_sdf_resource_count: int = 0,
         sdf_texture_paired_samples: bool = True,
+        mesh_sdf_work_segments: int | None = None,
         deterministic: bool = False,
         contact_max: int | None = None,
         verify_buffers: bool = True,
@@ -2260,6 +2261,14 @@ class NarrowPhase:
             max_candidate_pairs: Maximum number of candidate pairs from broad phase
             max_triangle_pairs: Maximum number of triangle pairs for mesh and
                 heightfield collisions (conservative estimate).
+            mesh_sdf_work_segments: Capacity of the two-stage mesh-SDF work buffer in
+                edge segments of ``MESH_SDF_BLOCK_DIM`` edges. ``None`` aliases the
+                triangle-pair scratch buffer (``3 * max_triangle_pairs`` ints), which ties
+                the capacity to the contact-reducer size; a positive value allocates a
+                dedicated buffer so the capacity can follow the number of mesh pairs
+                (roughly ``segments = awake mesh-SDF pairs x edge blocks per pair``).
+                When the segments or their hit records overflow, the whole mesh-SDF pass
+                falls back to the single-stage kernel, which is several times slower.
             max_mesh_mesh_pairs: Maximum number of routed mesh-SDF pairs. Defaults
                 to ``max_candidate_pairs``.
             max_mesh_plane_pairs: Maximum number of routed mesh-plane pairs. Defaults
@@ -2370,9 +2379,16 @@ class NarrowPhase:
         # heightfield-only scenes still benefit from reduction).
         if reduce_contacts and not (has_meshes or has_heightfields):
             self.reduce_contacts = False
-        # Segments and their worst-case hit records share the triangle-pair
-        # scratch buffer, so hits cannot overflow unless the segments do.
-        self.mesh_sdf_segment_capacity = 3 * max_triangle_pairs // SDF_WORK_SEGMENT_FOOTPRINT_INT32
+        # Segments and their worst-case hit records share one scratch buffer, so hits
+        # cannot overflow unless the segments do. Without an explicit capacity the buffer
+        # aliases the triangle-pair scratch (3 * max_triangle_pairs ints).
+        if mesh_sdf_work_segments is None:
+            self.mesh_sdf_segment_capacity = 3 * max_triangle_pairs // SDF_WORK_SEGMENT_FOOTPRINT_INT32
+        elif mesh_sdf_work_segments < 0:
+            raise ValueError(f"mesh_sdf_work_segments must be non-negative, got {mesh_sdf_work_segments}")
+        else:
+            self.mesh_sdf_segment_capacity = int(mesh_sdf_work_segments)
+        self._mesh_sdf_dedicated_work = mesh_sdf_work_segments is not None
         self.mesh_sdf_hit_offset_vec2 = self.mesh_sdf_segment_capacity * SDF_WORK_SEGMENT_STRIDE_INT32 // 2
         self.mesh_sdf_hit_capacity = self.mesh_sdf_segment_capacity * MESH_SDF_BLOCK_DIM
         self._use_mesh_sdf_split = (
@@ -2661,8 +2677,15 @@ class NarrowPhase:
                     dtype=MeshSDFExportContext,
                     device=device,
                 )
-                self.mesh_sdf_work_ints = self.triangle_pairs.view(dtype=wp.int32).flatten()
-                self.mesh_sdf_work_floats = self.triangle_pairs.view(dtype=wp.float32).flatten()
+                if self._mesh_sdf_dedicated_work:
+                    work = wp.zeros(
+                        self.mesh_sdf_segment_capacity * SDF_WORK_SEGMENT_FOOTPRINT_INT32, dtype=wp.int32, device=device
+                    )
+                    self.mesh_sdf_work_ints = work
+                    self.mesh_sdf_work_floats = work.view(dtype=wp.float32)
+                else:
+                    self.mesh_sdf_work_ints = self.triangle_pairs.view(dtype=wp.int32).flatten()
+                    self.mesh_sdf_work_floats = self.triangle_pairs.view(dtype=wp.float32).flatten()
                 # Hit records are addressed in vec2 slots (see SDF_WORK_HIT_RECORD_VEC2).
                 vec2_count = self.mesh_sdf_work_ints.shape[0] // 2
                 work_pairs = self.mesh_sdf_work_ints[: 2 * vec2_count].reshape((vec2_count, 2))
