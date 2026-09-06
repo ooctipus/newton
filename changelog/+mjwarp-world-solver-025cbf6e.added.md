@@ -1,0 +1,1 @@
+Add `world_solver` to `SolverMuJoCo` to solve each world with MuJoCo Warp's per-world solver (`Option.world_solver`) on the sleeping path; worlds it does not certify fall back to the stock solver inside the same step.

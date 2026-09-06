@@ -774,6 +774,18 @@ class TestMuJoCoSleeping(unittest.TestCase):
         solver._step_intermediate(state_1, state_0, control, contacts, 1.0 / 240.0)
         np.testing.assert_allclose(solver.mjw_model.opt.timestep.numpy(), 1.0 / 240.0)
 
+    def test_world_solver_option_reaches_mjwarp(self):
+        """``world_solver=True`` selects MuJoCo Warp's per-world solver through ``Option.world_solver``."""
+        if not wp.is_cuda_available():
+            self.skipTest("MuJoCo Warp requires a CUDA device")
+        kwargs = {"enable_sleeping": True, "nvmax": 12, "use_mujoco_contacts": False, "jacobian": "sparse"}
+        solver = SolverMuJoCo(_build_contact_wake_model(), **kwargs)
+        if not hasattr(solver.mjw_model.opt, "world_solver"):
+            self.skipTest("The installed MuJoCo Warp has no Option.world_solver")
+        self.assertFalse(solver.mjw_model.opt.world_solver)
+        solver = SolverMuJoCo(_build_contact_wake_model(), world_solver=True, **kwargs)
+        self.assertTrue(solver.mjw_model.opt.world_solver)
+
     def test_contact_pose_hook_matches_pre_step_refresh_and_defers_body_state(self):
         """Contact poses refreshed inside the MJWarp step match the pre-step refresh from body_q."""
         if not wp.is_cuda_available():

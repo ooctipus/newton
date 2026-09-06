@@ -3773,6 +3773,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         enable_sleeping: bool | None = None,
         nvmax: int | None = None,
         sleep_tolerance: float | None = None,
+        world_solver: bool = False,
         disable_contacts: bool = False,
         disable_sensors: bool = False,
         update_data_interval: int = 1,
@@ -3818,6 +3819,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             enable_sleeping: Whether to enable MuJoCo Warp's sleeping optimization. If None, uses the model custom attribute or defaults to False. Sleeping requires the GPU backend, the Newton solver, and a non-RK4 integrator.
             nvmax: Maximum number of active degrees of freedom per world when sleeping is enabled. Must accommodate every initially awake degree of freedom. If None, allocates space for every degree of freedom, which is safe but provides no compact-solver memory savings.
             sleep_tolerance: Sleep velocity tolerance. If None, uses model custom attribute or MuJoCo default (0.001).
+            world_solver: Solve each world with MuJoCo Warp's per-world solver on the sleeping path; worlds it does not
+                certify fall back to the stock solver inside the same step. Requires the sparse Jacobian and a MuJoCo
+                Warp build with ``Option.world_solver``.
             disable_contacts: If True, disable contact computation in MuJoCo.
             disable_sensors: If True, disable sensor computation in MuJoCo.
             update_data_interval: Frequency (in simulation steps) at which to update the MuJoCo Data object from the Newton state. If 0, Data is never updated after initialization.
@@ -4143,6 +4147,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 include_sites=include_sites,
                 skip_visual_only_geoms=skip_visual_only_geoms,
             )
+        if world_solver:
+            if use_mujoco_cpu or not hasattr(self.mjw_model.opt, "world_solver"):
+                raise ValueError("world_solver=True requires MuJoCo Warp with Option.world_solver.")
+            self.mjw_model.opt.world_solver = True
         self._mesh_variant_definitions = ()
         self._mesh_variant_asset_names.clear()
         if not use_mujoco_cpu and not use_mujoco_contacts:
