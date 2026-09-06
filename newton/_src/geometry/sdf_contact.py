@@ -1635,6 +1635,7 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
         block_offsets: wp.array[wp.int32],
         reducer_data: GlobalContactReducerData,
         work_state: wp.array[wp.int32],
+        context_incomplete: wp.array[wp.int32],
         total_num_blocks: int,
     ):
         """Process mesh-mesh collisions with global hashtable contact reduction.
@@ -1686,6 +1687,10 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
             base_gap_sum = shape_base_gap[pair[0]] + shape_base_gap[pair[1]]
 
             for mode in range(2):
+                if wp.static(run_on_work_overflow):
+                    # Contexts the two-stage path completed are already exported; redo only the rest.
+                    if context_incomplete[2 * pair_idx + mode] == 0:
+                        continue
                 tri_shape = pair[mode]
                 sdf_shape = pair[1 - mode]
 
@@ -2117,6 +2122,7 @@ def create_mesh_sdf_two_stage_kernels(
         work_floats: wp.array[wp.float32],
         work_state: wp.array[wp.int32],
         work_segment_capacity: int,
+        context_incomplete: wp.array[wp.int32],
     ):
         _block_id, t = wp.tid()
         pair_count = wp.min(shape_pairs_mesh_mesh_count[0], shape_pairs_mesh_mesh.shape[0])
@@ -2246,6 +2252,7 @@ def create_mesh_sdf_two_stage_kernels(
                         if t == 0:
                             if segment >= work_segment_capacity:
                                 wp.atomic_max(work_state, _SDF_WORK_OVERFLOWED, 1)
+                                wp.atomic_max(context_incomplete, context.context_id, 1)
                         popped, edge_slot = wp.tile_stack_pop(edge_stack)
                         if segment < work_segment_capacity:
                             base = segment * SDF_WORK_SEGMENT_STRIDE_INT32
@@ -2281,6 +2288,7 @@ def create_mesh_sdf_two_stage_kernels(
         work_segment_capacity: int,
         hit_offset_vec2: int,
         hit_capacity: int,
+        context_incomplete: wp.array[wp.int32],
     ):
         """Run the edge search only and emit compact hit records.
 
@@ -2291,8 +2299,6 @@ def create_mesh_sdf_two_stage_kernels(
         spills in the search loop and measured slower.
         """
         _block_id, t = wp.tid()
-        if work_state[_SDF_WORK_OVERFLOWED] != 0:
-            return
         segment_count = wp.min(work_state[_SDF_WORK_SEGMENT_COUNT], work_segment_capacity)
         hit_stack = wp.tile_stack(capacity=MESH_SDF_BLOCK_DIM, dtype=MeshSDFHitRecord)
         work_slot = wp.tile_zeros(shape=1, dtype=int, storage="shared")
@@ -2312,6 +2318,9 @@ def create_mesh_sdf_two_stage_kernels(
             context_id = work_ints[base]
             context = search_contexts[context_id]
             count = work_ints[base + 1]
+            if context_incomplete[context_id] != 0:
+                # Another segment of this context did not fit; the fallback redoes the whole context.
+                count = 0
             record = MeshSDFHitRecord()
             is_hit = False
             if t < count:
@@ -2371,6 +2380,7 @@ def create_mesh_sdf_two_stage_kernels(
                     hit_base = wp.atomic_add(work_state, _SDF_WORK_HIT_COUNT, hit_fill)
                     if hit_base + hit_fill > hit_capacity:
                         wp.atomic_max(work_state, _SDF_WORK_OVERFLOWED, 1)
+                        wp.atomic_max(context_incomplete, context_id, 1)
                 wp.tile_scatter_masked(hit_slot, 0, hit_base, t == 0)
                 hit_base = wp.tile_extract(hit_slot, 0)
                 popped, hit_index = wp.tile_stack_pop(hit_stack)
@@ -2409,21 +2419,22 @@ def create_mesh_sdf_two_stage_kernels(
         hit_offset_vec2: int,
         hit_capacity: int,
         total_num_threads: int,
+        context_incomplete: wp.array[wp.int32],
     ):
         """Reduce the hit records of ``mesh_sdf_solve_kernel`` into the global reducer.
 
         One thread per hit record: consecutive records come from the same
         segment, so the per-pair context loads stay warp-uniform.
         """
-        if work_state[_SDF_WORK_OVERFLOWED] != 0:
-            return
         hit_count = wp.min(work_state[_SDF_WORK_HIT_COUNT], hit_capacity)
         for hit_index in range(wp.tid(), hit_count, total_num_threads):
             slot = hit_offset_vec2 + SDF_WORK_HIT_RECORD_VEC2 * hit_index
             ids = work_int2[slot]
+            context_id = ids[0]
+            if context_incomplete[context_id] != 0:
+                continue
             point_xy = work_float2[slot + 1]
             point_zd = work_float2[slot + 2]
-            context_id = ids[0]
             edge_idx = ids[1]
             point = wp.vec3(point_xy[0], point_xy[1], point_zd[0])
             dist = point_zd[1]

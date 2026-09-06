@@ -73,6 +73,8 @@ class TestSDFContact(unittest.TestCase):
                 split_contacts = collide(pipeline, state, contacts)
                 self.assertEqual(int(pipeline.narrow_phase.mesh_sdf_work_state.numpy()[1]), 0)
                 self.assertGreater(int(pipeline.narrow_phase.mesh_sdf_work_state.numpy()[4]), 0)
+                segments_used = int(pipeline.narrow_phase.mesh_sdf_work_state.numpy()[0])
+                self.assertGreater(segments_used, 1)
 
                 def assert_same_contacts(expected, actual) -> None:
                     for lhs, rhs in zip(expected, actual, strict=True):
@@ -91,6 +93,15 @@ class TestSDFContact(unittest.TestCase):
                 pipeline.narrow_phase.mesh_sdf_segment_capacity = 0
                 assert_same_contacts(split_contacts, collide(pipeline, state, contacts))
                 self.assertEqual(int(pipeline.narrow_phase.mesh_sdf_work_state.numpy()[1]), 1)
+
+                # A partial overflow exports the complete contexts through the two-stage path and lets the
+                # fallback redo only the incomplete ones: same contacts, hits from both paths.
+                pipeline.narrow_phase.mesh_sdf_segment_capacity = max(1, segments_used // 2)
+                assert_same_contacts(split_contacts, collide(pipeline, state, contacts))
+                work_state = pipeline.narrow_phase.mesh_sdf_work_state.numpy()
+                self.assertEqual(int(work_state[1]), 1)
+                self.assertGreater(int(work_state[4]), 0)
+                self.assertGreater(int(pipeline.narrow_phase.mesh_sdf_context_incomplete.numpy().sum()), 0)
 
     def test_split_mesh_sdf_dedicated_work_buffer(self) -> None:
         """A dedicated work-buffer capacity matches the aliased path and is independent of max_triangle_pairs."""

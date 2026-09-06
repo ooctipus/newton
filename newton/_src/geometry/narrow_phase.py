@@ -2677,6 +2677,8 @@ class NarrowPhase:
                     dtype=MeshSDFExportContext,
                     device=device,
                 )
+                # Per (pair, mode) context: set when a segment or hit record of that context did not fit.
+                self.mesh_sdf_context_incomplete = wp.zeros(2 * self.max_mesh_mesh_pairs, dtype=wp.int32, device=device)
                 if self._mesh_sdf_dedicated_work:
                     work = wp.zeros(
                         self.mesh_sdf_segment_capacity * SDF_WORK_SEGMENT_FOOTPRINT_INT32, dtype=wp.int32, device=device
@@ -2694,6 +2696,7 @@ class NarrowPhase:
             else:
                 self.mesh_sdf_search_contexts = None
                 self.mesh_sdf_export_contexts = None
+                self.mesh_sdf_context_incomplete = wp.zeros(1, dtype=wp.int32, device=device)
                 self.mesh_sdf_work_ints = None
                 self.mesh_sdf_work_floats = None
                 self.mesh_sdf_work_int2 = None
@@ -2922,6 +2925,8 @@ class NarrowPhase:
             or self.hydroelastic_sdf is not None
         ):
             self._counter_array.zero_()
+            if self._use_mesh_sdf_split:
+                self.mesh_sdf_context_incomplete.zero_()
         # Stage 1: Launch primitive kernel for fast analytical collisions
         # This handles sphere-sphere, sphere-capsule, capsule-capsule, plane-sphere, plane-capsule
         # and routes remaining pairs to gjk_candidate_pairs and mesh buffers
@@ -3345,6 +3350,7 @@ class NarrowPhase:
                                 self.mesh_sdf_work_floats,
                                 self.mesh_sdf_work_state,
                                 self.mesh_sdf_segment_capacity,
+                                self.mesh_sdf_context_incomplete,
                             ],
                             device=device,
                             block_dim=self.tile_size_mesh_mesh,
@@ -3368,6 +3374,7 @@ class NarrowPhase:
                                 self.mesh_sdf_segment_capacity,
                                 self.mesh_sdf_hit_offset_vec2,
                                 self.mesh_sdf_hit_capacity,
+                                self.mesh_sdf_context_incomplete,
                             ],
                             device=device,
                             block_dim=self.tile_size_mesh_mesh,
@@ -3396,6 +3403,7 @@ class NarrowPhase:
                                 self.mesh_sdf_hit_offset_vec2,
                                 self.mesh_sdf_hit_capacity,
                                 self.num_mesh_sdf_export_threads,
+                                self.mesh_sdf_context_incomplete,
                             ],
                             device=device,
                             block_dim=self.tile_size_mesh_mesh,
@@ -3433,6 +3441,7 @@ class NarrowPhase:
                             self.mesh_mesh_block_offsets,
                             reducer_data,
                             self.mesh_sdf_work_state,
+                            self.mesh_sdf_context_incomplete,
                             self.num_mesh_mesh_blocks,
                         ],
                         device=device,

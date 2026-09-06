@@ -1,0 +1,1 @@
+Two-stage mesh-SDF collision now degrades proportionally when its work buffer overflows: pair contexts whose segments and hit records fit are exported by the two-stage path and the single-stage fallback redoes only the incomplete contexts, instead of every pair.
