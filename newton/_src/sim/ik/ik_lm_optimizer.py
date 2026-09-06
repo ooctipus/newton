@@ -38,6 +38,36 @@ class BatchCtx:
     fk_X_local: wp.array2d[wp.transform] | None = None
 
 
+def _tile_storage_bytes(num_values: int) -> int:
+    """Return the 16-byte-aligned shared storage for float tile values."""
+    return (num_values * 4 + 15) // 16 * 16
+
+
+def _lm_tiled_solve_shared_memory_bytes(n_dofs: int, n_residuals: int) -> int:
+    """Return exact shared memory used by the fused LM linear solve [byte]."""
+    if n_dofs < 1 or n_residuals < 1:
+        raise ValueError("LM dimensions must be positive")
+    return (
+        _tile_storage_bytes(n_residuals * n_dofs)
+        + _tile_storage_bytes(n_residuals)
+        + 2 * _tile_storage_bytes(n_dofs * n_dofs)
+        + 5 * _tile_storage_bytes(n_dofs)
+        + _tile_storage_bytes(1)
+    )
+
+
+def _lm_tiled_solve_fits(n_dofs: int, n_residuals: int, available_bytes: int | None) -> bool:
+    """Return whether the fused LM solve fits the device shared-memory limit."""
+    return available_bytes is None or _lm_tiled_solve_shared_memory_bytes(n_dofs, n_residuals) <= available_bytes
+
+
+def _lm_global_workspace_bytes(n_batch: int, n_dofs: int, n_residuals: int, available_shared_bytes: int | None) -> int:
+    """Return global workspace needed when the fused LM solve cannot launch [byte]."""
+    if _lm_tiled_solve_fits(n_dofs, n_residuals, available_shared_bytes):
+        return 0
+    return 4 * (n_batch * (n_dofs * n_dofs + n_dofs) + n_dofs)
+
+
 @wp.kernel
 def _accept_reject(
     cost_curr: wp.array[wp.float32],
@@ -153,7 +183,8 @@ class IKOptimizerLM:
 
     TILE_N_DOFS = None
     TILE_N_RESIDUALS = None
-    _cache: ClassVar[dict[tuple[int, int, str], type]] = {}
+    USE_TILED_SOLVE = None
+    _cache: ClassVar[dict[tuple[int, int, str, bool], type]] = {}
 
     def __new__(
         cls,
@@ -166,7 +197,9 @@ class IKOptimizerLM:
         n_dofs = model.joint_dof_count
         n_residuals = sum(o.residual_dim() for o in objectives)
         arch = model.device.arch
-        key = (n_dofs, n_residuals, arch)
+        available_shared_bytes = model.device.max_shared_memory_per_block if model.device.is_cuda else None
+        use_tiled_solve = _lm_tiled_solve_fits(n_dofs, n_residuals, available_shared_bytes)
+        key = (n_dofs, n_residuals, arch, use_tiled_solve)
 
         spec_cls = cls._cache.get(key)
         if spec_cls is None:
@@ -215,6 +248,8 @@ class IKOptimizerLM:
             assert self.n_dofs == self.TILE_N_DOFS
         if self.TILE_N_RESIDUALS is not None:
             assert self.n_residuals == self.TILE_N_RESIDUALS
+        if self.USE_TILED_SOLVE is None:
+            raise RuntimeError("IKOptimizerLM must be instantiated through its specialized constructor")
 
         grad = jacobian_mode in (IKJacobianType.AUTODIFF, IKJacobianType.MIXED)
 
@@ -299,6 +334,14 @@ class IKOptimizerLM:
         self.lambda_values = wp.zeros(self.n_batch, dtype=wp.float32, device=device)
         self.accept_flags = wp.zeros(self.n_batch, dtype=wp.int32, device=device)
         self.pred_reduction = wp.zeros(self.n_batch, dtype=wp.float32, device=device)
+        if self.USE_TILED_SOLVE:
+            self._lm_normal_matrix = None
+            self._lm_gradient = None
+            self._lm_zero_diagonal = None
+        else:
+            self._lm_normal_matrix = wp.empty(self.n_batch * self.n_dofs * self.n_dofs, dtype=wp.float32, device=device)
+            self._lm_gradient = wp.empty(self.n_batch * self.n_dofs, dtype=wp.float32, device=device)
+            self._lm_zero_diagonal = wp.zeros(self.n_dofs, dtype=wp.float32, device=device)
         self._cost_sum = wp.zeros(1, dtype=wp.float32, device=device)
         self._cost_sum_host = (
             wp.zeros(1, dtype=wp.float32, device="cpu", pinned=True) if device.is_cuda else self._cost_sum
@@ -743,7 +786,7 @@ class IKOptimizerLM:
         wp.copy(residuals_3d.flatten(), ctx_curr.residuals.flatten())
 
         ctx_curr.dq_dof.zero_()
-        self._solve_tiled(
+        self._solve_normal_equations(
             ctx_curr.jacobian_out,
             residuals_3d,
             self.lambda_values[:batch],
@@ -832,7 +875,7 @@ class IKOptimizerLM:
         )
         return costs
 
-    def _solve_tiled(
+    def _solve_normal_equations(
         self,
         jacobian: wp.array3d[wp.float32],
         residuals: wp.array3d[wp.float32],
@@ -843,9 +886,9 @@ class IKOptimizerLM:
         raise NotImplementedError("This method should be overridden by specialized solver")
 
     @classmethod
-    def _build_specialized(cls, key: tuple[int, int, str]) -> type[IKOptimizerLM]:
-        """Build a specialized IKOptimizerLM subclass with tiled solver for given dimensions."""
-        C, R, _ = key
+    def _build_specialized(cls, key: tuple[int, int, str, bool]) -> type[IKOptimizerLM]:
+        """Build a specialized LM optimizer with a device-compatible linear solve."""
+        C, R, _, use_tiled_solve = key
 
         def _template(
             jacobians: wp.array3d[wp.float32],  # (n_batch, n_residuals, n_dofs)
@@ -877,9 +920,9 @@ class IKOptimizerLM:
             for i in range(DOF):
                 g[i] = tmp2d[i, 0]
 
-            rhs = wp.tile_map(wp.neg, g)
-            L = wp.tile_cholesky(A)
-            delta = wp.tile_cholesky_solve(L, rhs)
+            delta = wp.tile_map(wp.neg, g)
+            wp.tile_cholesky_inplace(A)
+            wp.tile_cholesky_solve_inplace(A, delta)
             wp.tile_store(dq_dof[row], delta)
             lambda_delta = wp.tile_zeros(shape=(DOF,), dtype=wp.float32)
             for i in range(DOF):
@@ -900,9 +943,58 @@ class IKOptimizerLM:
             write_free_distance_motion_subspace,
         )
         from ...solvers.featherstone.kernels import (  # noqa: PLC0415
+            dense_cholesky,
+            dense_subs,
             jcalc_integrate,
             jcalc_transform,
         )
+
+        @wp.kernel(module="unique")
+        def _lm_normal_equations_global(
+            jacobians: wp.array3d[wp.float32],
+            residuals: wp.array3d[wp.float32],
+            lambda_values: wp.array[wp.float32],
+            n_residuals: int,
+            n_dofs: int,
+            normal_matrix: wp.array[wp.float32],
+            gradient: wp.array[wp.float32],
+            delta: wp.array2d[wp.float32],
+        ):
+            row, i, j = wp.tid()
+            if j <= i:
+                value = float(0.0)
+                for residual in range(n_residuals):
+                    value += jacobians[row, residual, i] * jacobians[row, residual, j]
+                if i == j:
+                    value += lambda_values[row]
+                normal_matrix[row * n_dofs * n_dofs + i * n_dofs + j] = value
+            if j == 0:
+                value = float(0.0)
+                for residual in range(n_residuals):
+                    value += jacobians[row, residual, i] * residuals[row, residual, 0]
+                gradient[row * n_dofs + i] = value
+                delta[row, i] = -value
+
+        @wp.kernel(module="unique")
+        def _lm_cholesky_solve_global(
+            normal_matrix: wp.array[wp.float32],
+            gradient: wp.array[wp.float32],
+            zero_diagonal: wp.array[wp.float32],
+            lambda_values: wp.array[wp.float32],
+            n_dofs: int,
+            delta: wp.array[wp.float32],
+            pred_reduction_out: wp.array[wp.float32],
+        ):
+            row = wp.tid()
+            matrix_start = row * n_dofs * n_dofs
+            vector_start = row * n_dofs
+            dense_cholesky(n_dofs, normal_matrix, zero_diagonal, matrix_start, 0, normal_matrix)
+            dense_subs(n_dofs, matrix_start, vector_start, normal_matrix, delta, delta)
+            predicted_reduction = float(0.0)
+            for i in range(n_dofs):
+                value = delta[vector_start + i]
+                predicted_reduction += value * (lambda_values[row] * value - gradient[vector_start + i])
+            pred_reduction_out[row] = 0.5 * predicted_reduction
 
         @wp.kernel
         def _integrate_dq_dof(
@@ -1108,8 +1200,9 @@ class IKOptimizerLM:
             TILE_N_DOFS = wp.constant(C)
             TILE_N_RESIDUALS = wp.constant(R)
             TILE_THREADS = wp.constant(32)
+            USE_TILED_SOLVE = use_tiled_solve
 
-            def _solve_tiled(
+            def _solve_normal_equations(
                 self,
                 jac: wp.array3d[wp.float32],
                 res: wp.array3d[wp.float32],
@@ -1117,11 +1210,42 @@ class IKOptimizerLM:
                 dq: wp.array2d[wp.float32],
                 pred: wp.array[wp.float32],
             ) -> None:
-                wp.launch_tiled(
-                    _lm_solve_tiled,
-                    dim=[jac.shape[0]],
-                    inputs=[jac, res, lam, dq, pred],
-                    block_dim=self.TILE_THREADS,
+                if self.USE_TILED_SOLVE:
+                    wp.launch_tiled(
+                        _lm_solve_tiled,
+                        dim=[jac.shape[0]],
+                        inputs=[jac, res, lam, dq, pred],
+                        block_dim=self.TILE_THREADS,
+                        device=self.device,
+                    )
+                    return
+                wp.launch(
+                    _lm_normal_equations_global,
+                    dim=[jac.shape[0], self.TILE_N_DOFS, self.TILE_N_DOFS],
+                    inputs=[
+                        jac,
+                        res,
+                        lam,
+                        self.TILE_N_RESIDUALS,
+                        self.TILE_N_DOFS,
+                        self._lm_normal_matrix,
+                        self._lm_gradient,
+                        dq,
+                    ],
+                    device=self.device,
+                )
+                wp.launch(
+                    _lm_cholesky_solve_global,
+                    dim=jac.shape[0],
+                    inputs=[
+                        self._lm_normal_matrix,
+                        self._lm_gradient,
+                        self._lm_zero_diagonal,
+                        lam,
+                        self.TILE_N_DOFS,
+                        dq.flatten(),
+                        pred,
+                    ],
                     device=self.device,
                 )
 

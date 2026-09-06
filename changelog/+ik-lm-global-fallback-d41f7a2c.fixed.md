@@ -1,0 +1,1 @@
+Fall back to a global-memory normal-equations solve in `IKOptimizerLM` when the tiled Cholesky solve does not fit the device's shared memory, and account for that workspace in `IKSolver.estimate_memory()`.
