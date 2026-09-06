@@ -15,7 +15,7 @@ import warp as wp
 from ..model import Model
 from .ik_common import IKJacobianType, IKMemoryEstimate, IKSolveResult
 from .ik_lbfgs_optimizer import IKOptimizerLBFGS
-from .ik_lm_optimizer import IKOptimizerLM
+from .ik_lm_optimizer import IKOptimizerLM, _lm_global_workspace_bytes
 from .ik_objectives import IKObjective
 
 
@@ -313,6 +313,8 @@ class IKSolver:
         has_analytic = any(objective.supports_analytic() for objective in objectives)
         if jacobian_mode != IKJacobianType.AUTODIFF and has_analytic:
             optimizer_bytes += n_expanded * n_dofs * spatial_bytes
+        available_shared_bytes = model.device.max_shared_memory_per_block if model.device.is_cuda else None
+        optimizer_bytes += _lm_global_workspace_bytes(n_expanded, n_dofs, n_residuals, available_shared_bytes)
         optimizer_bytes += float_bytes
 
         objective_bytes = 0
