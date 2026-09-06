@@ -4223,7 +4223,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             and not use_mujoco_contacts
             and self.mjw_model is not None
             and hasattr(self.mjw_model.callback, "post_position")
-            and os.environ.get("NEWTON_MJWARP_CONTACT_POSE_HOOK") != "0"  # timing diagnostics only
         )
         self._hook_contacts: Contacts | None = None
         self._hook_state_in: State | None = None
@@ -5196,8 +5195,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             return False, None
         if not self.enable_sleeping or self._tree_asleep_prev is None:
             # A store configured without sleeping has nothing to wake; the tree buffers do not exist.
-            return False, None
-        if os.environ.get("NEWTON_DEBUG_SKIP_DORMANT_INJECT") == "1":  # timing diagnostics only
             return False, None
         return True, store
 

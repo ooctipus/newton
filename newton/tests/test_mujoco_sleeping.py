@@ -3,7 +3,6 @@
 
 """Tests for optional MuJoCo Warp sleeping support."""
 
-import os
 import unittest
 
 import numpy as np
@@ -795,23 +794,21 @@ class TestMuJoCoSleeping(unittest.TestCase):
         dt = 1.0 / 240.0
 
         def run(*, hook: bool, publish_intermediate: bool, publish_joint_state: bool = True):
-            if not hook:
-                os.environ["NEWTON_MJWARP_CONTACT_POSE_HOOK"] = "0"
-            try:
-                solver = SolverMuJoCo(
-                    model,
-                    enable_sleeping=True,
-                    nvmax=12,
-                    iterations=10,
-                    ls_iterations=10,
-                    use_mujoco_contacts=False,
-                    jacobian="sparse",
-                    update_data_interval=2,
-                )
-            finally:
-                os.environ.pop("NEWTON_MJWARP_CONTACT_POSE_HOOK", None)
+            solver = SolverMuJoCo(
+                model,
+                enable_sleeping=True,
+                nvmax=12,
+                iterations=10,
+                ls_iterations=10,
+                use_mujoco_contacts=False,
+                jacobian="sparse",
+                update_data_interval=2,
+            )
             if not hasattr(solver.mjw_model.callback, "post_position"):
                 self.skipTest("The installed MuJoCo Warp has no post_position callback")
+            if not hook:
+                # Exercise the pre-step conversion path the hook replaces.
+                solver._contact_pose_hook = False
             self.assertEqual(solver._contact_pose_hook, hook)
             solver.publish_intermediate_body_state = publish_intermediate
             solver.publish_intermediate_joint_state = publish_joint_state
