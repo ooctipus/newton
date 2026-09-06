@@ -289,6 +289,7 @@ class MeshSDFCullContext:
     edge_range: wp.vec2i
     mesh_to_sdf: wp.transform
     contact_threshold: float
+    inner_spatial_depth: float
 
 
 @wp.struct
@@ -2228,6 +2229,7 @@ def create_mesh_sdf_two_stage_kernels(
         work_state: wp.array[wp.int32],
         work_segment_capacity: int,
         context_incomplete: wp.array[wp.int32],
+        edge_voxel: wp.array[wp.int32],
     ):
         _block_id, t = wp.tid()
         pair_count = wp.min(shape_pairs_mesh_mesh_count[0], shape_pairs_mesh_mesh.shape[0])
@@ -2237,6 +2239,10 @@ def create_mesh_sdf_two_stage_kernels(
         progress = wp.tile_zeros(shape=1, dtype=int, storage="shared")
         segment_slot = wp.tile_zeros(shape=1, dtype=int, storage="shared")
         work_slot = wp.tile_zeros(shape=1, dtype=int, storage="shared")
+        if wp.static(candidate_filter):
+            # streaming filter table: best midpoint SDF seen so far per reducer voxel of this block's context
+            # (as MAX - flip so atomicMax keeps the minimum); reset per context
+            stream_best = wp.tile_zeros(shape=_FILTER_KEYS, dtype=wp.uint32, storage="shared")
 
         # Claim combos dynamically so blocks that draw cheap combos keep working
         # instead of idling behind a static round-robin assignment.
@@ -2279,6 +2285,7 @@ def create_mesh_sdf_two_stage_kernels(
                     context.edge_range = shape_edge_range[tri_shape]
                     context.mesh_to_sdf = wp.transform_multiply(wp.transform_inverse(sdf_transform), tri_transform)
                     context.contact_threshold = gap_sum + margin_sum
+                    context.inner_spatial_depth = margin_sum + wp.min(texture_sdf.voxel_radius, base_gap_sum)
                     search_precision = mesh_sdf_contact_search_precision(
                         margin_sum, 1.0, texture_sdf.voxel_radius, True
                     )
@@ -2309,6 +2316,10 @@ def create_mesh_sdf_two_stage_kernels(
                 edge_start = context.block_in_pair * chunk_size
                 edge_end = wp.min(edge_start + chunk_size, num_edges)
                 wp.tile_scatter_masked(progress, 0, edge_start, t == 0)
+                if wp.static(candidate_filter):
+                    if t < _FILTER_KEYS:
+                        _filter_key_store(stream_best, t, wp.uint32(0))
+                    _filter_sync()
 
                 while wp.tile_extract(progress, 0) < edge_end or wp.tile_stack_count(edge_stack) > 0:
                     while (
@@ -2318,6 +2329,7 @@ def create_mesh_sdf_two_stage_kernels(
                         edge_idx = base_edge_idx + t
                         add_edge = False
                         midpoint_sdf = float(0.0)
+                        radius = float(0.0)
                         if edge_idx < edge_end:
                             center, radius = get_mesh_edge_bounding_sphere(
                                 wp.uint64(0),
@@ -2339,6 +2351,25 @@ def create_mesh_sdf_two_stage_kernels(
                                     diff_mag = wp.sqrt(aabb_dist_sq)
                                 midpoint_sdf = wp.static(sample_clamped)(texture_sdf, clamped, diff_mag)
                                 add_edge = midpoint_sdf <= culling_radius
+                        if wp.static(candidate_filter):
+                            # Deterministic streaming prune: a candidate that cannot be an inner contact and whose
+                            # Lipschitz lower bound (midpoint - radius) exceeds the best midpoint an EARLIER batch
+                            # registered for the same reducer voxel cannot be deeper than that candidate, so it can
+                            # only lose the reduction to it. Reads use the table state before this batch, so the
+                            # decision does not depend on the atomics' order within the batch.
+                            stream_key = int(-1)
+                            stream_prev = wp.uint32(0)
+                            if add_edge:
+                                stream_key = edge_voxel[edge_range_tri[0] + edge_idx]
+                                if stream_key >= 0:
+                                    stream_prev = stream_best[stream_key]
+                            _filter_sync()
+                            if add_edge and stream_key >= 0:
+                                _filter_key_max(stream_best, stream_key, _FILTER_U32_MAX - float_flip(midpoint_sdf))
+                                lower_bound = midpoint_sdf - radius
+                                if lower_bound >= context.inner_spatial_depth:
+                                    if float_flip(lower_bound) > _FILTER_U32_MAX - stream_prev:
+                                        add_edge = False
 
                         cull_result = EdgeCullResult()
                         cull_result.edge_idx = edge_idx

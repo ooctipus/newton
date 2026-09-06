@@ -3370,6 +3370,7 @@ class NarrowPhase:
                                 self.mesh_sdf_work_state,
                                 self.mesh_sdf_segment_capacity,
                                 self.mesh_sdf_context_incomplete,
+                                self._mesh_sdf_edge_voxel,
                             ],
                             device=device,
                             block_dim=self.tile_size_mesh_mesh,
