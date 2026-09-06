@@ -2247,6 +2247,8 @@ class NarrowPhase:
         mesh_sdf_resource_count: int = 0,
         sdf_texture_paired_samples: bool = True,
         mesh_sdf_work_segments: int | None = None,
+        mesh_sdf_candidate_filter: bool = False,
+        mesh_sdf_edge_voxel: wp.array | None = None,
         deterministic: bool = False,
         contact_max: int | None = None,
         verify_buffers: bool = True,
@@ -2269,6 +2271,15 @@ class NarrowPhase:
                 (roughly ``segments = awake mesh-SDF pairs x edge blocks per pair``).
                 When the segments or their hit records overflow, the whole mesh-SDF pass
                 falls back to the single-stage kernel, which is several times slower.
+            mesh_sdf_candidate_filter: Run the two-stage edge search only on the candidates of each work
+                segment that can still yield a reduced contact: those whose Lipschitz lower bound
+                (midpoint SDF minus edge radius) does not exceed the segment's best midpoint SDF of the same
+                reducer voxel, plus the six axis extremes of the possibly-inner candidates per voxel. Halves the
+                edge searches and reducer inserts on dense assembly scenes; the exported contacts are a subset
+                of the unfiltered ones with the same deepest contact per voxel and normal bin up to the
+                Lipschitz assumption the cull already makes. Defaults to False.
+            mesh_sdf_edge_voxel: Static reducer voxel per precomputed edge centre (see
+                :func:`build_mesh_sdf_edge_voxel_table`); required when ``mesh_sdf_candidate_filter`` is set.
             max_mesh_mesh_pairs: Maximum number of routed mesh-SDF pairs. Defaults
                 to ``max_candidate_pairs``.
             max_mesh_plane_pairs: Maximum number of routed mesh-plane pairs. Defaults
@@ -2389,6 +2400,13 @@ class NarrowPhase:
         else:
             self.mesh_sdf_segment_capacity = int(mesh_sdf_work_segments)
         self._mesh_sdf_dedicated_work = mesh_sdf_work_segments is not None
+        self.mesh_sdf_candidate_filter = bool(mesh_sdf_candidate_filter)
+        if self.mesh_sdf_candidate_filter and mesh_sdf_edge_voxel is None:
+            raise ValueError("mesh_sdf_candidate_filter requires mesh_sdf_edge_voxel")
+        # the solve kernel always takes the table; a one-entry placeholder stands in when the filter is off
+        self._mesh_sdf_edge_voxel = (
+            mesh_sdf_edge_voxel if mesh_sdf_edge_voxel is not None else wp.zeros(1, dtype=wp.int32, device=device)
+        )
         self.mesh_sdf_hit_offset_vec2 = self.mesh_sdf_segment_capacity * SDF_WORK_SEGMENT_STRIDE_INT32 // 2
         self.mesh_sdf_hit_capacity = self.mesh_sdf_segment_capacity * MESH_SDF_BLOCK_DIM
         self._use_mesh_sdf_split = (
@@ -2549,6 +2567,7 @@ class NarrowPhase:
                         write_contact_to_reducer,
                         speculative=speculative,
                         sdf_texture_paired_samples=self.sdf_texture_paired_samples,
+                        candidate_filter=self.mesh_sdf_candidate_filter,
                     )
                 else:
                     self.mesh_sdf_cull_kernel = None
@@ -3366,6 +3385,8 @@ class NarrowPhase:
                                 mesh_edge_halves,
                                 heightfield_elevations,
                                 self.mesh_sdf_search_contexts,
+                                self.mesh_sdf_export_contexts,
+                                self._mesh_sdf_edge_voxel,
                                 self.mesh_sdf_work_ints,
                                 self.mesh_sdf_work_floats,
                                 self.mesh_sdf_work_int2,

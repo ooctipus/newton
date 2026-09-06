@@ -31,6 +31,18 @@ def _sdf_rsqrt_rn_kernel(values: wp.array[wp.float32], out: wp.array[wp.float32]
     out[tid] = _sdf_rsqrt_rn(values[tid])
 
 
+def _points_to_world(points: np.ndarray, shapes: np.ndarray, shape_body: np.ndarray, body_q: np.ndarray) -> np.ndarray:
+    """Body-frame contact points to world space (static shapes are already in world space)."""
+    out = np.empty_like(points)
+    for i, (point, shape) in enumerate(zip(points, shapes, strict=True)):
+        body = int(shape_body[shape])
+        if body >= 0:
+            out[i] = wp.transform_point(wp.transform(*body_q[body]), wp.vec3(*point))
+        else:
+            out[i] = point
+    return out
+
+
 class TestSDFContact(unittest.TestCase):
     def test_split_mesh_sdf_matches_overflow_fallback(self) -> None:
         """Preserve reduced contacts when split work exceeds its scratch capacity."""
@@ -148,6 +160,65 @@ class TestSDFContact(unittest.TestCase):
                 np.testing.assert_allclose(reduced(dedicated, model), reduced(aliased, model), rtol=1.0e-5, atol=1.0e-6)
                 with self.assertRaises(ValueError):
                     newton.CollisionPipeline(model, mesh_sdf_work_segments=-1, **common)
+
+    def test_mesh_sdf_candidate_filter_keeps_deepest_contacts(self) -> None:
+        """The candidate filter prunes edge searches but keeps every shape pair's deepest contact."""
+        for device in get_cuda_test_devices():
+            with self.subTest(device=device):
+                sphere = newton.Mesh.create_sphere(0.3, num_latitudes=24, num_longitudes=48, compute_inertia=False)
+                sphere.build_sdf(max_resolution=32, device=device)
+                builder = newton.ModelBuilder()
+                sphere_body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.545), wp.quat_identity()))
+                box_body = builder.add_body(xform=wp.transform_identity())
+                builder.add_shape_mesh(sphere_body, mesh=sphere)
+                builder.add_shape_box(
+                    box_body, hx=0.6, hy=0.6, hz=0.25, cfg=newton.ModelBuilder.ShapeConfig(sdf_max_resolution=32)
+                )
+                model = builder.finalize(device=device)
+                state = model.state()
+                results = {}
+                for candidate_filter in (False, True):
+                    pipeline = newton.CollisionPipeline(
+                        model,
+                        broad_phase="nxn",
+                        deterministic=True,
+                        reduce_contacts=True,
+                        rigid_contact_max=256,
+                        max_triangle_pairs=65536,
+                        mesh_sdf_candidate_filter=candidate_filter,
+                    )
+                    self.assertTrue(pipeline.narrow_phase._use_mesh_sdf_split)
+                    contacts = pipeline.contacts()
+                    pipeline.collide(state, contacts)
+                    count = int(contacts.rigid_contact_count.numpy()[0])
+                    self.assertGreater(count, 0)
+                    shape0 = contacts.rigid_contact_shape0.numpy()[:count]
+                    shape1 = contacts.rigid_contact_shape1.numpy()[:count]
+                    point0 = contacts.rigid_contact_point0.numpy()[:count]
+                    point1 = contacts.rigid_contact_point1.numpy()[:count]
+                    normal = contacts.rigid_contact_normal.numpy()[:count]
+                    body_q = state.body_q.numpy()
+                    shape_body = model.shape_body.numpy()
+                    world0 = _points_to_world(point0, shape0, shape_body, body_q)
+                    world1 = _points_to_world(point1, shape1, shape_body, body_q)
+                    separation = np.einsum("ij,ij->i", world1 - world0, normal)
+                    results[candidate_filter] = {
+                        "count": count,
+                        "hits": int(pipeline.narrow_phase.mesh_sdf_work_state.numpy()[4]),
+                        "pairs": {tuple(pair) for pair in np.column_stack((shape0, shape1)).tolist()},
+                        "deepest": float(separation.min()),
+                    }
+                    if candidate_filter:
+                        edge_voxel = pipeline.narrow_phase._mesh_sdf_edge_voxel.numpy()
+                        self.assertGreaterEqual(int(edge_voxel.min()), 0)
+                        self.assertLess(int(edge_voxel.max()), 100)
+                unfiltered, filtered = results[False], results[True]
+                # the filter only removes candidates: never more hits, the same shape pairs, and the deepest
+                # contact of the scene (a voxel winner by construction) survives
+                self.assertLessEqual(filtered["hits"], unfiltered["hits"])
+                self.assertEqual(filtered["pairs"], unfiltered["pairs"])
+                self.assertAlmostEqual(filtered["deepest"], unfiltered["deepest"], delta=2.0e-4)
+                self.assertGreaterEqual(filtered["count"], 1)
 
     def test_block_count_scan_ignores_inactive_tail(self) -> None:
         """Keep active block offsets independent of stale inactive slots."""

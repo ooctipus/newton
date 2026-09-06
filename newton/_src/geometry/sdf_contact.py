@@ -3,6 +3,7 @@
 
 from typing import Any
 
+import numpy as np
 import warp as wp
 
 from ..geometry.contact_data import SHAPE_PAIR_HFIELD_BIT, SHAPE_PAIR_INDEX_MASK, ContactData
@@ -23,6 +24,7 @@ from ..geometry.sdf_texture import (
 )
 from ..geometry.types import GeoType
 from ..utils.heightfield import HeightfieldData, sample_sdf_grad_heightfield, sample_sdf_heightfield
+from .contact_reduction import NUM_VOXEL_DEPTH_SLOTS, compute_voxel_index, float_flip
 from .contact_reduction_global import (
     GlobalContactReducerData,
     export_and_reduce_contact_centered_two_spatial_depths,
@@ -95,6 +97,101 @@ _SDF_WORK_OVERFLOWED = 1
 _SDF_WORK_CULL_CURSOR = 2
 _SDF_WORK_SOLVE_CURSOR = 3
 _SDF_WORK_HIT_COUNT = 4
+
+# Candidate filter of the two-stage path (``mesh_sdf_candidate_filter``): a segment's candidates are keyed by the
+# reducer voxel of their edge centre (static per edge); a candidate runs the edge search only if its Lipschitz
+# lower bound ``midpoint_sdf - radius`` does not exceed the segment's best midpoint SDF of the same key (the
+# key's deepest candidate cannot be shallower than its own midpoint), or if it is one of the six axis extremes of
+# the key's possibly-inner candidates (the reducer's spatial slots select extremes). Shared-memory tables hold
+# monotone ``float_flip`` encodings so ``atomicMax`` implements both the minimum and the maxima.
+_FILTER_KEYS = NUM_VOXEL_DEPTH_SLOTS
+_FILTER_AXES = 6
+_FILTER_EXT_SLOTS = _FILTER_KEYS * _FILTER_AXES
+_FILTER_U32_MAX = wp.constant(wp.uint32(0xFFFFFFFF))
+
+
+@wp.func_native(snippet="WP_TILE_SYNC();")
+def _filter_sync(): ...
+
+
+@wp.func_native(snippet="atomicMax((unsigned int*)&values.data(wp::tile_coord(index)), value);")
+def _filter_key_max(values: wp.tile[wp.uint32, _FILTER_KEYS], index: int, value: wp.uint32): ...
+
+
+@wp.func_native(snippet="atomicMax((unsigned int*)&values.data(wp::tile_coord(index)), value);")
+def _filter_ext_max(values: wp.tile[wp.uint32, _FILTER_EXT_SLOTS], index: int, value: wp.uint32): ...
+
+
+@wp.func_native(snippet="values.data(wp::tile_coord(index)) = value;")
+def _filter_key_store(values: wp.tile[wp.uint32, _FILTER_KEYS], index: int, value: wp.uint32): ...
+
+
+@wp.func_native(snippet="values.data(wp::tile_coord(index)) = value;")
+def _filter_ext_store(values: wp.tile[wp.uint32, _FILTER_EXT_SLOTS], index: int, value: wp.uint32): ...
+
+
+@wp.kernel(enable_backward=False)
+def compute_mesh_sdf_edge_voxel_kernel(
+    edge_owner_shape: wp.array[wp.int32],
+    mesh_edge_centers: wp.array[wp.vec4],
+    shape_collision_aabb_lower: wp.array[wp.vec3],
+    shape_collision_aabb_upper: wp.array[wp.vec3],
+    shape_voxel_resolution: wp.array[wp.vec3i],
+    edge_voxel: wp.array[wp.int32],
+):
+    """Reducer voxel of every precomputed edge centre in its owning shape's local grid (``-1`` without owner)."""
+    edge = wp.tid()
+    shape = edge_owner_shape[edge]
+    if shape < 0:
+        edge_voxel[edge] = -1
+        return
+    packed = mesh_edge_centers[edge]
+    voxel = compute_voxel_index(
+        wp.vec3(packed[0], packed[1], packed[2]),
+        shape_collision_aabb_lower[shape],
+        shape_collision_aabb_upper[shape],
+        shape_voxel_resolution[shape],
+    )
+    edge_voxel[edge] = wp.clamp(voxel, 0, wp.static(NUM_VOXEL_DEPTH_SLOTS - 1))
+
+
+def build_mesh_sdf_edge_voxel_table(
+    shape_edge_range: wp.array,
+    mesh_edge_centers: wp.array,
+    shape_collision_aabb_lower: wp.array,
+    shape_collision_aabb_upper: wp.array,
+    shape_voxel_resolution: wp.array,
+    device=None,
+) -> wp.array:
+    """Static edge -> reducer-voxel table for the candidate filter.
+
+    Every edge range is owned by the first shape that references it; shapes sharing a mesh share its scale,
+    collision AABB and voxel resolution, so one owner per range suffices.
+    """
+    ranges = shape_edge_range.numpy()
+    total = int(mesh_edge_centers.shape[0])
+    owner = np.full(total, -1, dtype=np.int32)
+    valid = ranges[:, 1] > 0
+    starts, first = np.unique(ranges[valid, 0], return_index=True)
+    shapes = np.nonzero(valid)[0][first]
+    for start, shape in zip(starts.tolist(), shapes.tolist(), strict=True):
+        count = int(ranges[shape, 1])
+        owner[start : start + count] = shape
+    edge_voxel = wp.empty(max(total, 1), dtype=wp.int32, device=device)
+    wp.launch(
+        compute_mesh_sdf_edge_voxel_kernel,
+        dim=max(total, 1),
+        inputs=[
+            wp.array(owner if total > 0 else np.full(1, -1, dtype=np.int32), dtype=wp.int32, device=device),
+            mesh_edge_centers,
+            shape_collision_aabb_lower,
+            shape_collision_aabb_upper,
+            shape_voxel_resolution,
+        ],
+        outputs=[edge_voxel],
+        device=device,
+    )
+    return edge_voxel
 
 
 @wp.func_native("""
@@ -2081,8 +2178,14 @@ def create_mesh_sdf_two_stage_kernels(
     writer_func: Any,
     speculative: bool = False,
     sdf_texture_paired_samples: bool = True,
+    candidate_filter: bool = False,
 ):
-    """Create texture-SDF cull and solve kernels for global contact reduction."""
+    """Create texture-SDF cull and solve kernels for global contact reduction.
+
+    With ``candidate_filter`` the solve kernel runs the edge search only on the candidates of each segment that
+    can still produce a reduced contact (see the ``_FILTER_*`` constants); the exported hits are a subset of the
+    unfiltered ones.
+    """
     if sdf_texture_paired_samples:
         sample_sdf = _texture_sample_sdf_hw_paired
         sample_pair = _texture_sample_sdf_hw_pair_paired
@@ -2096,7 +2199,9 @@ def create_mesh_sdf_two_stage_kernels(
     do_edge_sdf_collision = _create_sdf_contact_funcs(False, True, sample_sdf, sample_pair)
     get_mesh_edge = _create_mesh_edge_accessor_func(True)
     get_mesh_edge_bounding_sphere = _create_get_mesh_edge_bounding_sphere_func(True)
-    module = f"sdf_contact_two_stage_{writer_func.__name__}_{speculative}_{sdf_texture_paired_samples}"
+    module = (
+        f"sdf_contact_two_stage_{writer_func.__name__}_{speculative}_{sdf_texture_paired_samples}_{candidate_filter}"
+    )
 
     # The cull is a latency-bound chain of edge load, texture sample and
     # stack push per 256-edge batch. Two blocks was only a minimum (at 80
@@ -2280,6 +2385,8 @@ def create_mesh_sdf_two_stage_kernels(
         mesh_edge_halves: wp.array[wp.vec4],
         heightfield_elevations: wp.array[wp.float32],
         search_contexts: wp.array[MeshSDFSearchContext],
+        export_contexts: wp.array[MeshSDFExportContext],
+        edge_voxel: wp.array[wp.int32],
         work_ints: wp.array[wp.int32],
         work_floats: wp.array[wp.float32],
         work_int2: wp.array[wp.vec2i],
@@ -2303,6 +2410,10 @@ def create_mesh_sdf_two_stage_kernels(
         hit_stack = wp.tile_stack(capacity=MESH_SDF_BLOCK_DIM, dtype=MeshSDFHitRecord)
         work_slot = wp.tile_zeros(shape=1, dtype=int, storage="shared")
         hit_slot = wp.tile_zeros(shape=1, dtype=int, storage="shared")
+        if wp.static(candidate_filter):
+            # per-segment filter tables: best midpoint per voxel key (as MAX - flip) and six axis extremes
+            filter_key_best = wp.tile_zeros(shape=_FILTER_KEYS, dtype=wp.uint32, storage="shared")
+            filter_ext_best = wp.tile_zeros(shape=_FILTER_EXT_SLOTS, dtype=wp.uint32, storage="shared")
 
         # Claim segments dynamically; per-segment cost varies with the number
         # of edges that converge inside the contact threshold.
@@ -2323,8 +2434,15 @@ def create_mesh_sdf_two_stage_kernels(
                 count = 0
             record = MeshSDFHitRecord()
             is_hit = False
+            texture_sdf = texture_sdf_table[context.sdf_index]
+            edge_idx = int(0)
+            cached_sdf_val = float(0.0)
+            v0 = wp.vec3(0.0)
+            v1 = wp.vec3(0.0)
+            corner_ownership = int(0)
+            center = wp.vec3(0.0)
+            radius = float(0.0)
             if t < count:
-                texture_sdf = texture_sdf_table[context.sdf_index]
                 item = base + _SDF_WORK_SEGMENT_HEADER_INT32 + 2 * t
                 edge_idx = work_ints[item]
                 cached_sdf_val = work_floats[item + 1]
@@ -2338,6 +2456,45 @@ def create_mesh_sdf_two_stage_kernels(
                     context.mesh_to_sdf,
                     edge_idx,
                 )
+                center, radius = get_edge_bounding_sphere(v0, v1)
+            selected = t < count
+            if wp.static(candidate_filter):
+                # clear the segment's tables, then register every candidate's proxies (uniform barriers)
+                for slot_idx in range(t, _FILTER_EXT_SLOTS, MESH_SDF_BLOCK_DIM):
+                    _filter_ext_store(filter_ext_best, slot_idx, wp.uint32(0))
+                if t < _FILTER_KEYS:
+                    _filter_key_store(filter_key_best, t, wp.uint32(0))
+                _filter_sync()
+                filter_key = int(-1)
+                lower_bound = float(0.0)
+                possibly_inner = False
+                if t < count:
+                    filter_key = edge_voxel[context.edge_range[0] + edge_idx]
+                    lower_bound = cached_sdf_val - radius
+                    possibly_inner = lower_bound < export_contexts[context_id].inner_spatial_depth
+                    if filter_key >= 0:
+                        _filter_key_max(filter_key_best, filter_key, _FILTER_U32_MAX - float_flip(cached_sdf_val))
+                        if possibly_inner:
+                            for axis in range(3):
+                                _filter_ext_max(
+                                    filter_ext_best, filter_key * _FILTER_AXES + 2 * axis, float_flip(center[axis])
+                                )
+                                _filter_ext_max(
+                                    filter_ext_best,
+                                    filter_key * _FILTER_AXES + 2 * axis + 1,
+                                    float_flip(-center[axis]),
+                                )
+                _filter_sync()
+                if t < count and filter_key >= 0:
+                    # lower_bound <= best midpoint of the key  <=>  flip(lower_bound) <= MAX - stored
+                    selected = float_flip(lower_bound) <= _FILTER_U32_MAX - filter_key_best[filter_key]
+                    if not selected and possibly_inner:
+                        for axis in range(3):
+                            if float_flip(center[axis]) == filter_ext_best[filter_key * _FILTER_AXES + 2 * axis]:
+                                selected = True
+                            if float_flip(-center[axis]) == filter_ext_best[filter_key * _FILTER_AXES + 2 * axis + 1]:
+                                selected = True
+            if selected:
                 dist, point, best_endpoint = do_edge_sdf_collision(
                     texture_sdf,
                     wp.uint64(0),
@@ -2351,7 +2508,6 @@ def create_mesh_sdf_two_stage_kernels(
                     heightfield_elevations,
                     context.search_precision,
                 )
-                center, radius = get_edge_bounding_sphere(v0, v1)
                 inner_cull_consistent = mesh_sdf_contact_passes_inner_cull_consistency(
                     dist,
                     context.margin_sum,

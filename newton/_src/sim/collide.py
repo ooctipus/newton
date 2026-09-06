@@ -27,6 +27,7 @@ from ..geometry.differentiable_contacts import launch_differentiable_contact_aug
 from ..geometry.flags import ShapeFlags
 from ..geometry.kernels import create_soft_contacts
 from ..geometry.narrow_phase import NarrowPhase
+from ..geometry.sdf_contact import build_mesh_sdf_edge_voxel_table
 from ..geometry.sdf_hydroelastic import HydroelasticSDF
 from ..geometry.soft_contacts_sdf import launch_soft_ef_contacts
 from ..geometry.support_function import (
@@ -1255,6 +1256,7 @@ class CollisionPipeline:
         sdf_contact_slab_rows: int = 256,
         broad_phase_sap_sort_type: Literal["segmented", "tile"] = "segmented",
         mesh_sdf_work_segments: int | None = None,
+        mesh_sdf_candidate_filter: bool = False,
     ):
         """
         Initialize the CollisionPipeline (expert API).
@@ -1279,6 +1281,13 @@ class CollisionPipeline:
                 size). Size it from the number of awake mesh-SDF pairs instead;
                 an overflow drops the whole mesh-SDF pass to the single-stage
                 kernel, which is several times slower.
+            mesh_sdf_candidate_filter:
+                Run the two-stage mesh-SDF edge search only on the candidates
+                that can still yield a reduced contact (Lipschitz lower bound
+                against the segment's best midpoint per reducer voxel, plus the
+                axis extremes of the possibly-inner candidates). Halves the edge
+                searches and reducer inserts on dense assembly scenes; exported
+                contacts are a subset of the unfiltered ones. Defaults to False.
             contact_reduction_hashtable_size_factor: Multiplier applied to
                 ``max_triangle_pairs`` when allocating the global contact
                 reduction hashtable. Increase this if hashtable fill/failure
@@ -1708,10 +1717,28 @@ class CollisionPipeline:
             # the candidate-pair bound (N*(N-1)/2 per world) is orders of
             # magnitude larger than the neighbor-budget contact estimate and
             # allocating sorter scratch at that size burns multi-GB of VRAM.
+            mesh_sdf_edge_voxel = None
+            if mesh_sdf_candidate_filter:
+                if (
+                    getattr(model, "shape_edge_range", None) is None
+                    or getattr(model, "mesh_edge_centers", None) is None
+                    or getattr(model, "_shape_voxel_resolution", None) is None
+                ):
+                    raise ValueError("mesh_sdf_candidate_filter requires precomputed mesh edges and contact reduction")
+                mesh_sdf_edge_voxel = build_mesh_sdf_edge_voxel_table(
+                    model.shape_edge_range,
+                    model.mesh_edge_centers,
+                    model.shape_collision_aabb_lower,
+                    model.shape_collision_aabb_upper,
+                    model._shape_voxel_resolution,
+                    device=device,
+                )
             self.narrow_phase = NarrowPhase(
                 max_candidate_pairs=self.shape_pairs_max,
                 max_triangle_pairs=max_triangle_pairs,
                 mesh_sdf_work_segments=mesh_sdf_work_segments,
+                mesh_sdf_candidate_filter=mesh_sdf_candidate_filter,
+                mesh_sdf_edge_voxel=mesh_sdf_edge_voxel,
                 max_mesh_mesh_pairs=max_mesh_mesh_pairs,
                 max_mesh_plane_pairs=max_mesh_plane_pairs,
                 reduce_contacts=self.reduce_contacts,
