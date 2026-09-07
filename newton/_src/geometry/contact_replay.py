@@ -32,6 +32,10 @@ _MASK_MAX_THREADS = 65_536
 _RETAIN_BLOCK_DIM = 32
 
 
+@wp.func_native(snippet="WP_TILE_SYNC();")
+def _retain_sync(): ...
+
+
 @wp.struct
 class DormantContactSlabs:
     """Per-dynamic-shape slabs of contact rows that are absent from the live contact buffer.
@@ -373,7 +377,6 @@ def retain_dormant_slabs(
     for chunk in range(0, count, lanes):
         row = chunk + lane
         keep = int(0)
-        staged = _SlabRow()
         if row < count:
             shape_a = slabs.shape0[base + row]
             shape_b = slabs.shape1[base + row]
@@ -386,14 +389,19 @@ def retain_dormant_slabs(
                 and _is_replay_pair_class(owner_class, shape_replay_class[partner])
             ):
                 keep = 1
-                # Stage the row before the scan: a lower lane may overwrite this slot after it.
-                staged = _load_slab_row(slabs, base + row)
         keep_tile = wp.tile(keep)
         # Kept rows land at kept + (number of kept rows before this one in the chunk), so
         # the compaction preserves row order and never writes above the row it reads.
         target = kept + wp.untile(wp.tile_scan_exclusive(keep_tile))
         kept += wp.tile_sum(keep_tile)[0]
-        if keep != 0 and target != row:
+        # Only rows that move are read in full (most slabs keep every row in place); every lane has
+        # read its row before any lane overwrites a slot below it.
+        moved = keep != 0 and target != row
+        staged = _SlabRow()
+        if moved:
+            staged = _load_slab_row(slabs, base + row)
+        _retain_sync()
+        if moved:
             _store_slab_row(slabs, base + target, staged)
     if lane == 0:
         slabs.slab_count[slab] = kept
