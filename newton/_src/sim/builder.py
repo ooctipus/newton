@@ -101,6 +101,33 @@ not show up in builder-state comparisons or survive past either builder's lifeti
 """
 
 
+def _spread_bits_3d(values: np.ndarray) -> np.ndarray:
+    """Spread the low 10 bits of each value so that consecutive bits sit three positions apart."""
+    v = values.astype(np.int64) & 0x3FF
+    v = (v | (v << 16)) & 0x030000FF
+    v = (v | (v << 8)) & 0x0300F00F
+    v = (v | (v << 4)) & 0x030C30C3
+    v = (v | (v << 2)) & 0x09249249
+    return v
+
+
+def _spatially_ordered_edges(edges: np.ndarray, vertices: np.ndarray) -> np.ndarray:
+    """Return ``edges`` sorted along a Morton curve of their midpoints.
+
+    Consecutive edges of the packed collision-edge list are then spatially adjacent, so the lanes of a
+    narrow-phase warp sample neighbouring SDF texels. The edge set is unchanged; only its order is.
+    """
+    edges = np.asarray(edges)
+    if len(edges) < 2:
+        return edges
+    midpoints = (vertices[edges[:, 0]] + vertices[edges[:, 1]]) * 0.5
+    lower = midpoints.min(axis=0)
+    extent = np.maximum(midpoints.max(axis=0) - lower, 1.0e-9)
+    cells = np.clip(((midpoints - lower) / extent * 1023.0).astype(np.int64), 0, 1023)
+    codes = _spread_bits_3d(cells[:, 0]) | (_spread_bits_3d(cells[:, 1]) << 1) | (_spread_bits_3d(cells[:, 2]) << 2)
+    return edges[np.argsort(codes, kind="stable")]
+
+
 def _deduplicate_convex_collision_mesh(source: Mesh) -> Mesh:
     """Build a collision-only mesh containing each exact vertex position once."""
     vertices = source.vertices
@@ -12087,9 +12114,11 @@ class ModelBuilder:
                             edges = mesh.edges  # lazily computed and cached on the Mesh
                         start = edge_offset
                         count = len(edges)
-                        edge_chunks.append(edges)
                         if count > 0:
                             vertices = np.asarray(mesh.vertices, dtype=np.float32) * shape_scale
+                            # Neighbouring edges of the packed list are spatially adjacent, so the lanes of a
+                            # narrow-phase warp sample nearby SDF texels.
+                            edges = _spatially_ordered_edges(edges, vertices)
                             edge_v0 = vertices[edges[:, 0]]
                             edge_v1 = vertices[edges[:, 1]]
                             edge_halves = np.ascontiguousarray((edge_v1 - edge_v0) * 0.5, dtype=np.float32)
@@ -12112,6 +12141,7 @@ class ModelBuilder:
                             edge_half_chunks.append(
                                 np.ascontiguousarray(np.concatenate((edge_halves, corner_ownership), axis=1))
                             )
+                        edge_chunks.append(edges)
                         edge_offset += count
                         entry = (start, count)
                         edge_cache[mesh_key] = entry

@@ -518,7 +518,9 @@ class TestBuildCollisionEdges(unittest.TestCase):
 
         ranges = model.shape_edge_range.numpy()
         self.assertEqual(int(ranges[0][1]), len(seeded))
-        np.testing.assert_array_equal(model.mesh_edge_indices.numpy(), seeded)
+        # The builder orders the packed edges spatially; the consumed set is the seeded one.
+        consumed = model.mesh_edge_indices.numpy()
+        np.testing.assert_array_equal(consumed[np.lexsort(consumed.T[::-1])], seeded[np.lexsort(seeded.T[::-1])])
 
     def test_empty_mesh_produces_empty_collision_edges(self):
         mesh = newton.Mesh(np.zeros((0, 3), dtype=np.float32), np.zeros(0, dtype=np.int32), compute_inertia=False)
