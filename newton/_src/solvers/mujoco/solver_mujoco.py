@@ -4306,7 +4306,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self._hook_state_in = state_in
             callback.post_position = self._convert_contacts_in_step
             if self._contact_ranges_active():
-                callback.contact_records = self._contact_records()
+                inject = self.enable_sleeping and self._wake_injection_store(contacts)[0]
+                callback.contact_records = self._contact_records(inject)
         try:
             if finalize:
                 self._mujoco_warp.step(self.mjw_model, self.mjw_data)
@@ -4321,8 +4322,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self._hook_contacts = None
                 self._hook_state_in = None
 
-    def _contact_records(self):
-        """MJWarp ``ContactRecords`` view of the world-contiguous ids and their refresh records."""
+    def _contact_records(self, inject: bool):
+        """MJWarp ``ContactRecords`` view of the world-contiguous ids and their refresh records.
+
+        With ``inject`` the wake-injection snapshot and event are bound too, so MJWarp's collision wake
+        records the trees it wakes for the injection that follows in the hook.
+        """
         return self._mujoco_warp.ContactRecords(
             capacity=self._world_capacity,
             count=self._world_nacon,
@@ -4337,6 +4342,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             row_capacity=self._world_capacity,
             row_count=self._row_count,
             row_ids=self._row_ids,
+            tree_asleep_prev=self._tree_asleep_prev if inject else None,
+            wake_event=self._wake_event if inject else None,
         )
 
     def _convert_contacts_in_step(self, m: MjWarpModel, d: MjWarpData) -> None:
@@ -4357,6 +4364,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         state_in = self._hook_state_in
         model = self.model
         inject, store = self._wake_injection_store(contacts) if self.enable_sleeping else (False, None)
+        if self._contact_ranges_active():
+            # MJWarp's position stage refreshed the contacts, ran the wake-event scan and the collision
+            # wake from the records; only the injection of woken contacts is left to the hook
+            if inject:
+                self._inject_woken_dormant_contacts(model, state_in, contacts, store, xpos=d.xpos, xquat=d.xquat)
+            return
         self._launch_contact_conversion(
             model,
             state_in,
@@ -4567,8 +4580,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self._enable_rne_postconstraint(state_out)
                 self._apply_mjwarp_publish_option(state_out)
                 convert_contacts = not self.mjw_model.opt.run_collision_detection
+                ranges = convert_contacts and self._contact_pose_hook and self._contact_ranges_active()
                 prepared = self._apply_mjc_inputs(
-                    self.model, state_in, control, contacts, prepare_contacts=convert_contacts
+                    self.model, state_in, control, contacts, prepare_contacts=convert_contacts and not ranges
                 )
                 first_of_tick = self._timestep_fill_pending
                 if self.update_data_interval > 0 and (
@@ -5571,7 +5585,17 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self._last_rigid_contact_max = contacts.rigid_contact_max
             self._last_naconmax = naconmax
 
-        if not prepared:
+        if self._contact_ranges_active():
+            # world-contiguous ids: restart the counts and the parked list on a new collision
+            # generation only (the count is not restored per substep on this path)
+            wp.launch(
+                prepare_contact_ranges_kernel,
+                dim=self.mjw_data.nworld,
+                inputs=[contacts.contact_generation, self._last_contact_generation],
+                outputs=[self._world_nacon, self.mjw_data.nacon, self._dormant_count],
+                device=self.model.device,
+            )
+        elif not prepared:
             # Zero nacon before the kernel (the full path counts with atomic_add; the fast path
             # restores the count from last_nacon_count) and restart the parked (dormant) contact
             # list on a new collision generation.
@@ -5580,15 +5604,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 dim=1,
                 inputs=[contacts.contact_generation, self._last_contact_generation],
                 outputs=[self.mjw_data.nacon, self._dormant_count],
-                device=self.model.device,
-            )
-        if self._contact_ranges_active():
-            # world-contiguous ids: restart every world's slot count on a new collision generation
-            wp.launch(
-                prepare_contact_ranges_kernel,
-                dim=self.mjw_data.nworld,
-                inputs=[contacts.contact_generation, self._last_contact_generation],
-                outputs=[self._world_nacon],
                 device=self.model.device,
             )
 

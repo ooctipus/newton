@@ -1569,11 +1569,20 @@ def prepare_contact_ranges_kernel(
     contact_generation: wp.array[wp.int32],
     last_contact_generation: wp.array[wp.int32],
     world_nacon: wp.array[wp.int32],
+    nacon: wp.array[wp.int32],
+    dormant_count: wp.array[wp.int32],
 ):
-    """Restart every world's slot count on a new collision generation (world-contiguous MJWarp ids)."""
+    """Restart the contact counts and the parked list on a new collision generation (world-contiguous ids).
+
+    One thread per world; the contact count is only reset here (there is no per-substep restore on
+    this path), so it keeps counting the converted contacts between collision generations.
+    """
     worldid = wp.tid()
     if contact_generation[0] != last_contact_generation[0]:
         world_nacon[worldid] = 0
+        if worldid == 0:
+            nacon[0] = 0
+            dormant_count[0] = 0
 
 
 @wp.kernel(enable_backward=False)
