@@ -28,7 +28,9 @@ from .contact_reduction import NUM_VOXEL_DEPTH_SLOTS, compute_voxel_index, float
 from .contact_reduction_global import (
     GlobalContactReducerData,
     export_and_reduce_contact_centered_two_spatial_depths,
+    export_and_reduce_contact_centered_two_spatial_depths_dense,
     export_and_reduce_predictive_contact,
+    export_and_reduce_predictive_contact_dense,
 )
 from .flags import MeshSignMethod
 from .kernels import mesh_query_point_sign, resolve_mesh_sign_method
@@ -2221,8 +2223,13 @@ def create_mesh_sdf_two_stage_kernels(
     speculative: bool = False,
     sdf_texture_paired_samples: bool = True,
     candidate_filter: bool = False,
+    dense_pairs: bool = False,
 ):
     """Create texture-SDF cull and solve kernels for global contact reduction.
+
+    With ``dense_pairs`` the export kernel addresses the reducer's dense pair table by the pair index
+    (``context_id >> 1``) instead of probing the hashtable; the reducer must have been built with a dense
+    table of at least the mesh-pair capacity.
 
     With ``candidate_filter`` the solve kernel runs the edge search only on the candidates of each segment that
     can still produce a reduced contact (see the ``_FILTER_*`` constants); the exported hits are a subset of the
@@ -2766,41 +2773,86 @@ def create_mesh_sdf_two_stage_kernels(
             pair_midpoint = (
                 wp.transform_get_translation(tri_transform) + wp.transform_get_translation(sdf_transform)
             ) * 0.5
-            contact_id = export_and_reduce_contact_centered_two_spatial_depths(
-                pair[0],
-                pair[1],
-                point_world,
-                contact_normal,
-                dist,
-                (edge_idx << 2) | (mode << 1),
-                point_world - pair_midpoint,
-                export.inner_spatial_depth,
-                export.outer_spatial_depth,
-                position_local_tri,
-                shape_collision_aabb_lower[tri_shape],
-                shape_collision_aabb_upper[tri_shape],
-                shape_voxel_resolution[tri_shape],
-                reducer_data,
-            )
+            contact_id = int(-1)
+            # pairs beyond the dense table's capacity keep the hashtable path
+            use_dense = False
+            if wp.static(dense_pairs):
+                use_dense = (context_id >> 1) < reducer_data.dense_stride // reducer_data.dense_bins
+            if use_dense:
+                contact_id = export_and_reduce_contact_centered_two_spatial_depths_dense(
+                    pair[0],
+                    pair[1],
+                    context_id >> 1,
+                    point_world,
+                    contact_normal,
+                    dist,
+                    (edge_idx << 2) | (mode << 1),
+                    point_world - pair_midpoint,
+                    export.inner_spatial_depth,
+                    export.outer_spatial_depth,
+                    position_local_tri,
+                    shape_collision_aabb_lower[tri_shape],
+                    shape_collision_aabb_upper[tri_shape],
+                    shape_voxel_resolution[tri_shape],
+                    reducer_data,
+                )
+            else:
+                contact_id = export_and_reduce_contact_centered_two_spatial_depths(
+                    pair[0],
+                    pair[1],
+                    point_world,
+                    contact_normal,
+                    dist,
+                    (edge_idx << 2) | (mode << 1),
+                    point_world - pair_midpoint,
+                    export.inner_spatial_depth,
+                    export.outer_spatial_depth,
+                    position_local_tri,
+                    shape_collision_aabb_lower[tri_shape],
+                    shape_collision_aabb_upper[tri_shape],
+                    shape_voxel_resolution[tri_shape],
+                    reducer_data,
+                )
             if wp.static(speculative):
                 if dist >= export.inner_spatial_depth:
-                    export_and_reduce_predictive_contact(
-                        pair[0],
-                        pair[1],
-                        point_world,
-                        contact_normal,
-                        dist,
-                        context.margin_sum,
-                        0.0,
-                        0.0,
-                        (edge_idx << 2) | (mode << 1),
-                        shape_transform,
-                        shape_linear_velocity,
-                        shape_angular_velocity,
-                        collision_update_dt,
-                        max_speculative_extension,
-                        contact_id,
-                        reducer_data,
-                    )
+                    if use_dense:
+                        export_and_reduce_predictive_contact_dense(
+                            pair[0],
+                            pair[1],
+                            context_id >> 1,
+                            point_world,
+                            contact_normal,
+                            dist,
+                            context.margin_sum,
+                            0.0,
+                            0.0,
+                            (edge_idx << 2) | (mode << 1),
+                            shape_transform,
+                            shape_linear_velocity,
+                            shape_angular_velocity,
+                            collision_update_dt,
+                            max_speculative_extension,
+                            contact_id,
+                            reducer_data,
+                        )
+                    else:
+                        export_and_reduce_predictive_contact(
+                            pair[0],
+                            pair[1],
+                            point_world,
+                            contact_normal,
+                            dist,
+                            context.margin_sum,
+                            0.0,
+                            0.0,
+                            (edge_idx << 2) | (mode << 1),
+                            shape_transform,
+                            shape_linear_velocity,
+                            shape_angular_velocity,
+                            collision_update_dt,
+                            max_speculative_extension,
+                            contact_id,
+                            reducer_data,
+                        )
 
     return mesh_sdf_cull_kernel, mesh_sdf_solve_kernel, mesh_sdf_export_kernel

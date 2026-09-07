@@ -88,6 +88,9 @@ from ..utils.heightfield import (
     heightfield_vs_convex_midphase,
 )
 
+# Dense reducer table capacity for mesh-mesh pairs (36 bins x 7 slots x 8 B = 2 KB per pair).
+MESH_SDF_DENSE_PAIR_CAP = 65536
+
 _SPARSE_GJK_PAIR_CAPACITY_THRESHOLD = 1_000_000
 _MESH_SDF_RESOURCE_BUCKET_LIMIT = 4096
 
@@ -2417,6 +2420,14 @@ class NarrowPhase:
             and not has_heightfields
             and self.mesh_sdf_segment_capacity > 0
         )
+        # Mesh-mesh pairs of the two-stage path address the reducer's dense pair table by their pair index
+        # (fast reduction mode only; the hydroelastic aggregates are indexed by hashtable entry). Pairs beyond
+        # the table's capacity keep using the hashtable.
+        self._mesh_sdf_dense_pairs = (
+            min(self.max_mesh_mesh_pairs, MESH_SDF_DENSE_PAIR_CAP)
+            if self._use_mesh_sdf_split and not deterministic and hydroelastic_sdf is None
+            else 0
+        )
 
         # Determine if we're using external AABBs
         self.external_aabb = shape_aabb_lower is not None and shape_aabb_upper is not None
@@ -2568,6 +2579,7 @@ class NarrowPhase:
                         speculative=speculative,
                         sdf_texture_paired_samples=self.sdf_texture_paired_samples,
                         candidate_filter=self.mesh_sdf_candidate_filter,
+                        dense_pairs=self._mesh_sdf_dense_pairs > 0,
                     )
                 else:
                     self.mesh_sdf_cull_kernel = None
@@ -2614,6 +2626,7 @@ class NarrowPhase:
                 deterministic=deterministic,
                 hashtable_size_factor=contact_reduction_hashtable_size_factor,
                 enable_contact_reclamation=speculative,
+                dense_pairs=self._mesh_sdf_dense_pairs,
             )
         else:
             self.export_reduced_contacts_kernel = None
@@ -2665,6 +2678,11 @@ class NarrowPhase:
                 else c[0:0]
             )
             self.shape_pairs_mesh_mesh_count = c[mesh_only_idx + 2 : mesh_only_idx + 3] if has_meshes else None
+            self._dense_pair_count_array = (
+                self.shape_pairs_mesh_mesh_count
+                if self.shape_pairs_mesh_mesh_count is not None
+                else wp.zeros(1, dtype=wp.int32, device=device)
+            )
 
             # Pair and work buffers
             self.gjk_candidate_pairs = wp.zeros(max_candidate_pairs, dtype=wp.vec2i, device=device)
@@ -3144,7 +3162,9 @@ class NarrowPhase:
             if self.reduce_contacts:
                 # Unified global reduction for all mesh contact types.
                 assert self.global_contact_reducer is not None
-                self.global_contact_reducer.clear_active()
+                self.global_contact_reducer.clear_active(
+                    dense_pair_count=self.shape_pairs_mesh_mesh_count if self._mesh_sdf_dense_pairs > 0 else None
+                )
                 reducer_data = self.global_contact_reducer.get_data_struct()
 
                 # Mesh-plane contacts → global reducer (meshes only)
@@ -3536,6 +3556,11 @@ class NarrowPhase:
                         export_num_blocks,
                         int(self.block_dim > 1),
                         int(self.global_contact_reducer.deterministic),
+                        self.global_contact_reducer.dense_values,
+                        self.global_contact_reducer.dense_touched,
+                        self.global_contact_reducer.dense_stride,
+                        self.global_contact_reducer.dense_bins,
+                        self._dense_pair_count_array,
                     ],
                     device=device,
                     block_dim=EXPORT_REDUCED_CONTACTS_BLOCK_DIM,

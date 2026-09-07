@@ -750,6 +750,11 @@ def test_export_reduced_contacts_kernel(test, device):
                 total_blocks,
                 int(not device.is_cpu),
                 0,  # deterministic=0 (fast packing)
+                reducer.dense_values,
+                reducer.dense_touched,
+                reducer.dense_stride,
+                reducer.dense_bins,
+                wp.zeros(1, dtype=wp.int32, device=device),
             ],
             device=device,
             block_dim=EXPORT_REDUCED_CONTACTS_BLOCK_DIM,
