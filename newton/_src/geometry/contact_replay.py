@@ -225,8 +225,10 @@ def classify_unchanged_shapes(
     unchanged = unchanged and previous.max_speculative_extension == current.max_speculative_extension
 
     shape_unchanged[shape] = int(unchanged)
-    signatures[shape] = current
-    signature_valid[shape] = 1
+    # An unchanged shape's stored signature already equals the current one: skip the rewrite.
+    if not unchanged:
+        signatures[shape] = current
+        signature_valid[shape] = 1
 
 
 @wp.func

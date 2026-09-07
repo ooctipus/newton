@@ -1,0 +1,1 @@
+The dormant-contact replay classification writes a shape's replay signature only when the shape changed; an unchanged shape's stored signature already equals the current one, so the per-collide pass moves less memory. Behavior is unchanged.
