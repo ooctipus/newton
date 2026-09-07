@@ -504,6 +504,12 @@ def _convert_one_contact(
     rec_offset1: wp.array[wp.vec3],
     rec_radius: wp.array[wp.float32],
     rec_tree: wp.array[wp.vec2i],
+    # Row lists of the fused forward (MJWarp ContactRecords): the row-building ids of each world,
+    # appended to by the conversions inside the step
+    row_capacity: int,
+    row_count: wp.array[wp.int32],
+    row_ids: wp.array[wp.int32],
+    list_rows: int,
 ) -> int:
     """Convert Newton contact row ``tid`` into a new MJWarp contact and return its id.
 
@@ -735,6 +741,12 @@ def _convert_one_contact(
         rec_offset1[cid] = offset_b
         rec_radius[cid] = radius_a + radius_b
         rec_tree[cid] = wp.vec2i(body_treeid[mj_body_a], body_treeid[mj_body_b])
+        if list_rows != 0 and dist - margin < 0.0:
+            # converted inside the step (injection): the fused forward's position stage has already
+            # listed this world's row-building ids, so append this one to its list
+            row_slot = wp.atomic_add(row_count, worldid, 1)
+            if row_slot < row_capacity:
+                row_ids[worldid * row_capacity + row_slot] = cid
 
     write_contact(
         dist_in=dist,
@@ -969,6 +981,11 @@ def convert_newton_contacts_to_mjwarp_kernel(
     rec_offset1: wp.array[wp.vec3],
     rec_radius: wp.array[wp.float32],
     rec_tree: wp.array[wp.vec2i],
+    # Row lists of the fused forward (MJWarp ContactRecords): the row-building ids of each world,
+    # appended to by the conversions inside the step
+    row_capacity: int,
+    row_count: wp.array[wp.int32],
+    row_ids: wp.array[wp.int32],
     # Wake-event detection (in-step conversion with wake injection): null otherwise
     tree_asleep_prev: wp.array2d[int],
 ):
@@ -1078,6 +1095,10 @@ def convert_newton_contacts_to_mjwarp_kernel(
                 rec_offset1,
                 rec_radius,
                 rec_tree,
+                row_capacity,
+                row_count,
+                row_ids,
+                1,
             )
         return
 
@@ -1188,6 +1209,10 @@ def convert_newton_contacts_to_mjwarp_kernel(
                 rec_offset1,
                 rec_radius,
                 rec_tree,
+                row_capacity,
+                row_count,
+                row_ids,
+                0,
             )
     else:
         # ── FAST PATH ────────────────────────────────────────────────────
@@ -1203,10 +1228,11 @@ def convert_newton_contacts_to_mjwarp_kernel(
             # Restore the compacted contact count from the full pass
             nacon_out[0] = last_nacon_count[0]
 
+        if world_capacity > 0:
+            # MJWarp's fused forward refreshes dist/pos from the records (ContactRecords)
+            return
+
         if xpos:
-            if world_capacity > 0:
-                # MJWarp's constraint stage refreshes dist/pos from the records (ContactRecords)
-                return
             # One thread per live MJWarp contact (the count includes the rows injected on earlier
             # substeps; nacon itself is being restored by thread 0 above).
             live = wp.min(last_nacon_count[0], wp.min(naconmax, hook_tid.shape[0]))
@@ -1376,6 +1402,11 @@ def inject_dormant_slab_contacts_kernel(
     rec_offset1: wp.array[wp.vec3],
     rec_radius: wp.array[wp.float32],
     rec_tree: wp.array[wp.vec2i],
+    # Row lists of the fused forward (MJWarp ContactRecords): the row-building ids of each world,
+    # appended to by the conversions inside the step
+    row_capacity: int,
+    row_count: wp.array[wp.int32],
+    row_ids: wp.array[wp.int32],
 ):
     """Append the rows of every listed slab to the Newton buffer and convert them.
 
@@ -1485,6 +1516,10 @@ def inject_dormant_slab_contacts_kernel(
             rec_offset1,
             rec_radius,
             rec_tree,
+            row_capacity,
+            row_count,
+            row_ids,
+            1,
         )
 
 

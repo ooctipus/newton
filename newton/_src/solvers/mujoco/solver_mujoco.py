@@ -4255,6 +4255,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self._rec_tree: wp.array | None = None
         self._world_nacon: wp.array | None = None
         self._world_capacity = 0
+        # row-building ids per world: filled by MJWarp's position stage every substep, appended to
+        # by the in-step injection, consumed by MJWarp's constraint stage
+        self._row_count: wp.array | None = None
+        self._row_ids: wp.array | None = None
         if self._contact_pose_hook:
             self._allocate_hook_records(self.mjw_data.naconmax)
 
@@ -4323,12 +4327,16 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             capacity=self._world_capacity,
             count=self._world_nacon,
             body=self._hook_body,
+            tree=self._rec_tree,
             point0=self._rec_point0,
             point1=self._rec_point1,
             normal=self._rec_normal,
             offset0=self._rec_offset0,
             offset1=self._rec_offset1,
             radius=self._rec_radius,
+            row_capacity=self._world_capacity,
+            row_count=self._row_count,
+            row_ids=self._row_ids,
         )
 
     def _convert_contacts_in_step(self, m: MjWarpModel, d: MjWarpData) -> None:
@@ -4385,6 +4393,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self._rec_offset1 = wp.zeros(naconmax, dtype=wp.vec3, device=self.device)
             self._rec_radius = wp.zeros(naconmax, dtype=wp.float32, device=self.device)
             self._rec_tree = wp.zeros(naconmax, dtype=wp.vec2i, device=self.device)
+            self._row_count = wp.zeros(nworld, dtype=wp.int32, device=self.device)
+            self._row_ids = wp.zeros(naconmax, dtype=wp.int32, device=self.device)
 
     def _contact_ranges_active(self) -> bool:
         """Whether the in-step conversion places the contacts in world-contiguous MJWarp id ranges.
@@ -4581,6 +4591,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                             self._wake_before_step(self.model, state_in, contacts)
                         else:
                             self._snapshot_contact_generation(contacts)
+                    elif self._contact_ranges_active():
+                        # a new collision generation is converted before the step from the Newton poses
+                        # (the records are pose independent and MJWarp's position stage refreshes
+                        # dist/pos every substep); the in-step hook keeps the wake and the injection
+                        self._launch_contact_conversion(self.model, state_in, contacts, ranges=True)
+                        self._snapshot_contact_generation(contacts)
                 self._mujoco_warp_step(finalize, contacts if hook else None, state_in)
                 publish_body_state = finalize or not hook or self.publish_intermediate_body_state
                 self._update_newton_state(
@@ -5176,12 +5192,17 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         total_num_threads: int,
         xpos: wp.array | None = None,
         xquat: wp.array | None = None,
+        ranges: bool | None = None,
     ) -> list:
         """Argument list shared by the conversion and slab-injection kernels.
 
         ``xpos``/``xquat`` select MJWarp's body kinematics of the current substep as the pose
-        source (in-step conversion); ``None`` uses ``state_in.body_q``.
+        source (in-step conversion); ``None`` uses ``state_in.body_q``. ``ranges`` selects the
+        world-contiguous id layout of MJWarp's ContactRecords; by default the in-step conversion
+        uses it whenever it is active.
         """
+        if ranges is None:
+            ranges = xpos is not None and self._contact_ranges_active()
         bodies_per_world = self.model.body_count // self.model.world_count
         mujoco_attrs = getattr(model, "mujoco", None)
         shape_mjc_solref_mode = getattr(mujoco_attrs, "solref_mode", None) if mujoco_attrs is not None else None
@@ -5262,8 +5283,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self._hook_tid,
             self._hook_body,
             self._hook_geom,
-            # world-contiguous ids with refresh records on the in-step path of a MJWarp with ContactRecords
-            self._world_capacity if (xpos is not None and self._contact_ranges_active()) else 0,
+            # world-contiguous ids with refresh records (MJWarp ContactRecords)
+            self._world_capacity if ranges else 0,
             self._world_nacon,
             self._rec_point0,
             self._rec_point1,
@@ -5272,6 +5293,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self._rec_offset1,
             self._rec_radius,
             self._rec_tree,
+            self._world_capacity,
+            self._row_count,
+            self._row_ids,
         ]
 
     def _wake_injection_store(self, contacts: Contacts) -> tuple[bool, Any]:
@@ -5577,6 +5601,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         xpos: wp.array | None = None,
         xquat: wp.array | None = None,
         tree_asleep_prev: wp.array | None = None,
+        ranges: bool | None = None,
     ) -> None:
         """Convert the Newton contact buffer into MJWarp contacts for this substep.
 
@@ -5588,6 +5613,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             xquat: MJWarp body orientations of the current substep (in-step conversion).
             tree_asleep_prev: When given, the kernel also flags trees that woke since this
                 snapshot (``wake_event``) and refreshes the snapshot.
+            ranges: Place the contacts in world-contiguous MJWarp id ranges with refresh records
+                (see :meth:`_contact_conversion_inputs`).
         """
         thread_count = min(contacts.rigid_contact_max, self.mjw_data.naconmax, CONTACT_CONVERSION_MAX_THREADS)
         wp.launch(
@@ -5602,6 +5629,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     total_num_threads=thread_count,
                     xpos=xpos,
                     xquat=xquat,
+                    ranges=ranges,
                 ),
                 tree_asleep_prev,
             ],
