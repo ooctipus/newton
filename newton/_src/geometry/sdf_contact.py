@@ -2218,6 +2218,75 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
     return mesh_sdf_collision_global_reduce_kernel
 
 
+@wp.kernel(enable_backward=False)
+def mesh_sdf_cull_context_kernel(
+    shape_data: wp.array[wp.vec4],
+    shape_transform: wp.array[wp.transform],
+    texture_sdf_table: wp.array[TextureSDFData],
+    shape_sdf_index: wp.array[wp.int32],
+    shape_gap: wp.array[float],
+    shape_base_gap: wp.array[float],
+    shape_pairs_mesh_mesh: wp.array[wp.vec2i],
+    shape_pairs_mesh_mesh_count: wp.array[int],
+    shape_edge_range: wp.array[wp.vec2i],
+    block_offsets: wp.array[wp.int32],
+    speculative: int,
+    cull_contexts: wp.array[MeshSDFCullContext],
+    search_contexts: wp.array[MeshSDFSearchContext],
+    export_contexts: wp.array[MeshSDFExportContext],
+):
+    """Prepare the cull contexts of every (block, mode) combo and the search/export contexts of every (pair, mode).
+
+    One thread per active pair. The cull kernel's blocks then read their context with one broadcast load
+    instead of resolving it on one thread per context (a binary search over the block offsets and a chain
+    of dependent shape loads while the other lanes wait); the values are the same expressions as before.
+    """
+    pair_idx = wp.tid()
+    pair_count = wp.min(shape_pairs_mesh_mesh_count[0], shape_pairs_mesh_mesh.shape[0])
+    if pair_idx >= pair_count:
+        return
+    pair_block_start = block_offsets[pair_idx]
+    blocks_for_pair = block_offsets[pair_idx + 1] - pair_block_start
+    pair = shape_pairs_mesh_mesh[pair_idx]
+    gap_sum = shape_gap[pair[0]] + shape_gap[pair[1]]
+    base_gap_sum = shape_base_gap[pair[0]] + shape_base_gap[pair[1]]
+    for mode in range(2):
+        tri_shape = pair[mode]
+        sdf_shape = pair[1 - mode]
+        scale_data_tri = shape_data[tri_shape]
+        scale_data_sdf = shape_data[sdf_shape]
+        margin_sum = scale_data_tri[3] + scale_data_sdf[3]
+        tri_transform = shape_transform[tri_shape]
+        sdf_transform = shape_transform[sdf_shape]
+        sdf_index = shape_sdf_index[sdf_shape]
+        texture_sdf = texture_sdf_table[sdf_index]
+        context = MeshSDFCullContext()
+        context.context_id = 2 * pair_idx + mode
+        context.blocks_for_pair = blocks_for_pair
+        context.sdf_index = sdf_index
+        context.edge_range = shape_edge_range[tri_shape]
+        context.mesh_to_sdf = wp.transform_multiply(wp.transform_inverse(sdf_transform), tri_transform)
+        context.contact_threshold = gap_sum + margin_sum
+        context.inner_spatial_depth = margin_sum + wp.min(texture_sdf.voxel_radius, base_gap_sum)
+        for block_in_pair in range(blocks_for_pair):
+            context.block_in_pair = block_in_pair
+            cull_contexts[2 * (pair_block_start + block_in_pair) + mode] = context
+        search = MeshSDFSearchContext()
+        search.sdf_index = sdf_index
+        search.edge_range = context.edge_range
+        search.mesh_to_sdf = context.mesh_to_sdf
+        search.contact_threshold = context.contact_threshold
+        search.search_precision = mesh_sdf_contact_search_precision(margin_sum, 1.0, texture_sdf.voxel_radius, True)
+        search.margin_sum = margin_sum
+        export = MeshSDFExportContext()
+        export.inner_spatial_depth = margin_sum + wp.min(texture_sdf.voxel_radius, base_gap_sum)
+        export.outer_spatial_depth = margin_sum + gap_sum
+        if speculative != 0:
+            export.outer_spatial_depth = margin_sum + base_gap_sum
+        search_contexts[context.context_id] = search
+        export_contexts[context.context_id] = export
+
+
 def create_mesh_sdf_two_stage_kernels(
     writer_func: Any,
     speculative: bool = False,
@@ -2258,20 +2327,13 @@ def create_mesh_sdf_two_stage_kernels(
     # adds a resident block and measured 282-305 -> 259-268 us per collide.
     @wp.kernel(enable_backward=False, launch_bounds=(256, 4), module=module)
     def mesh_sdf_cull_kernel(
-        shape_data: wp.array[wp.vec4],
-        shape_transform: wp.array[wp.transform],
         texture_sdf_table: wp.array[TextureSDFData],
-        shape_sdf_index: wp.array[wp.int32],
-        shape_gap: wp.array[float],
-        shape_base_gap: wp.array[float],
         shape_pairs_mesh_mesh: wp.array[wp.vec2i],
         shape_pairs_mesh_mesh_count: wp.array[int],
         mesh_edge_indices: wp.array[wp.vec2i],
         mesh_edge_centers: wp.array[wp.vec4],
-        shape_edge_range: wp.array[wp.vec2i],
         block_offsets: wp.array[wp.int32],
-        search_contexts: wp.array[MeshSDFSearchContext],
-        export_contexts: wp.array[MeshSDFExportContext],
+        cull_contexts: wp.array[MeshSDFCullContext],
         work_ints: wp.array[wp.int32],
         work_floats: wp.array[wp.float32],
         work_state: wp.array[wp.int32],
@@ -2284,7 +2346,6 @@ def create_mesh_sdf_two_stage_kernels(
         warp_lanemask = (wp.uint32(1) << wp.uint32(lane)) - wp.uint32(1)
         pair_count = wp.min(shape_pairs_mesh_mesh_count[0], shape_pairs_mesh_mesh.shape[0])
         total_combos = block_offsets[pair_count]
-        cull_context = wp.tile_empty(shape=1, dtype=MeshSDFCullContext, storage="shared")
         segment_slot = wp.tile_zeros(shape=1, dtype=int, storage="shared")
         work_slot = wp.tile_zeros(shape=1, dtype=int, storage="shared")
         ring_count = wp.tile_zeros(shape=1, dtype=int, storage="shared")
@@ -2309,58 +2370,9 @@ def create_mesh_sdf_two_stage_kernels(
         while combo_idx < total_combos:
             mode = int(0)
             while mode < 2:
-                context = MeshSDFCullContext()
-                if t == 0:
-                    lo = int(0)
-                    hi = int(pair_count)
-                    while lo < hi:
-                        mid = (lo + hi) // 2
-                        if block_offsets[mid + 1] <= combo_idx:
-                            lo = mid + 1
-                        else:
-                            hi = mid
-                    pair_idx = int(lo)
-                    pair_block_start = block_offsets[pair_idx]
-                    pair = shape_pairs_mesh_mesh[pair_idx]
-                    tri_shape = pair[mode]
-                    sdf_shape = pair[1 - mode]
-                    scale_data_tri = shape_data[tri_shape]
-                    scale_data_sdf = shape_data[sdf_shape]
-                    margin_sum = scale_data_tri[3] + scale_data_sdf[3]
-                    gap_sum = shape_gap[pair[0]] + shape_gap[pair[1]]
-                    base_gap_sum = shape_base_gap[pair[0]] + shape_base_gap[pair[1]]
-                    tri_transform = shape_transform[tri_shape]
-                    sdf_transform = shape_transform[sdf_shape]
-                    sdf_index = shape_sdf_index[sdf_shape]
-                    texture_sdf = texture_sdf_table[sdf_index]
-                    context.context_id = 2 * pair_idx + mode
-                    context.block_in_pair = combo_idx - pair_block_start
-                    context.blocks_for_pair = block_offsets[pair_idx + 1] - pair_block_start
-                    context.sdf_index = sdf_index
-                    context.edge_range = shape_edge_range[tri_shape]
-                    context.mesh_to_sdf = wp.transform_multiply(wp.transform_inverse(sdf_transform), tri_transform)
-                    context.contact_threshold = gap_sum + margin_sum
-                    context.inner_spatial_depth = margin_sum + wp.min(texture_sdf.voxel_radius, base_gap_sum)
-                    search_precision = mesh_sdf_contact_search_precision(
-                        margin_sum, 1.0, texture_sdf.voxel_radius, True
-                    )
-                    if context.block_in_pair == 0:
-                        search = MeshSDFSearchContext()
-                        search.sdf_index = sdf_index
-                        search.edge_range = context.edge_range
-                        search.mesh_to_sdf = context.mesh_to_sdf
-                        search.contact_threshold = context.contact_threshold
-                        search.search_precision = search_precision
-                        search.margin_sum = margin_sum
-                        export = MeshSDFExportContext()
-                        export.inner_spatial_depth = margin_sum + wp.min(texture_sdf.voxel_radius, base_gap_sum)
-                        export.outer_spatial_depth = margin_sum + gap_sum
-                        if wp.static(speculative):
-                            export.outer_spatial_depth = margin_sum + base_gap_sum
-                        search_contexts[context.context_id] = search
-                        export_contexts[context.context_id] = export
-                wp.tile_scatter_masked(cull_context, 0, context, t == 0)
-                context = wp.tile_extract(cull_context, 0)
+                # prepared by mesh_sdf_cull_context_kernel: one broadcast load, no barrier (the previous
+                # context's last round ended with one)
+                context = cull_contexts[2 * combo_idx + mode]
 
                 texture_sdf = texture_sdf_table[context.sdf_index]
                 X_mesh_to_sdf = context.mesh_to_sdf

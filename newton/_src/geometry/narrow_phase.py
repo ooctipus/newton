@@ -64,12 +64,14 @@ from ..geometry.sdf_contact import (
     SDF_WORK_SEGMENT_FOOTPRINT_INT32,
     SDF_WORK_SEGMENT_STRIDE_INT32,
     SDF_WORK_STATE_SIZE,
+    MeshSDFCullContext,
     MeshSDFExportContext,
     MeshSDFSearchContext,
     compute_block_counts_from_weights,
     compute_mesh_mesh_block_offsets_scan,
     create_mesh_sdf_two_stage_kernels,
     create_narrow_phase_process_mesh_mesh_contacts_kernel,
+    mesh_sdf_cull_context_kernel,
 )
 from ..geometry.sdf_hydroelastic import HydroelasticSDF
 from ..geometry.sdf_texture import TextureSDFData
@@ -2716,6 +2718,7 @@ class NarrowPhase:
                 )
                 # Per (pair, mode) context: set when a segment or hit record of that context did not fit.
                 self.mesh_sdf_context_incomplete = wp.zeros(2 * self.max_mesh_mesh_pairs, dtype=wp.int32, device=device)
+                self.mesh_sdf_cull_contexts = None  # allocated with the block partition below
                 if self._mesh_sdf_dedicated_work:
                     work = wp.zeros(
                         self.mesh_sdf_segment_capacity * SDF_WORK_SEGMENT_FOOTPRINT_INT32, dtype=wp.int32, device=device
@@ -2733,6 +2736,7 @@ class NarrowPhase:
             else:
                 self.mesh_sdf_search_contexts = None
                 self.mesh_sdf_export_contexts = None
+                self.mesh_sdf_cull_contexts = None
                 self.mesh_sdf_context_incomplete = wp.zeros(1, dtype=wp.int32, device=device)
                 self.mesh_sdf_work_ints = None
                 self.mesh_sdf_work_floats = None
@@ -2830,6 +2834,14 @@ class NarrowPhase:
             mesh_plane_scan_size = self.max_mesh_plane_pairs + 1
             self.mesh_plane_block_offsets = wp.zeros(mesh_plane_scan_size, dtype=wp.int32, device=device)
             self.mesh_plane_block_counts = wp.zeros(mesh_plane_scan_size, dtype=wp.int32, device=device)
+            if self._use_mesh_sdf_split:
+                # Per (block, mode) cull context; the block count is at most pairs + 2 x the target block count
+                # (each pair rounds up to one block, and the weight per block is at least half the mean).
+                self.mesh_sdf_cull_contexts = wp.empty(
+                    2 * (self.max_mesh_mesh_pairs + 2 * self.num_mesh_mesh_blocks),
+                    dtype=MeshSDFCullContext,
+                    device=device,
+                )
         else:
             self.num_mesh_mesh_blocks = self.num_tile_blocks
             self.mesh_mesh_target_blocks = self.num_tile_blocks
@@ -3367,9 +3379,9 @@ class NarrowPhase:
                     )
 
                     if self._use_mesh_sdf_split and has_precomputed_edge_data:
-                        wp.launch_tiled(
-                            kernel=self.mesh_sdf_cull_kernel,
-                            dim=(self.num_mesh_mesh_blocks,),
+                        wp.launch(
+                            kernel=mesh_sdf_cull_context_kernel,
+                            dim=self.max_mesh_mesh_pairs,
                             inputs=[
                                 shape_data,
                                 shape_transform,
@@ -3379,12 +3391,29 @@ class NarrowPhase:
                                 shape_base_gap,
                                 mesh_mesh_pairs,
                                 self.shape_pairs_mesh_mesh_count,
-                                mesh_edge_indices,
-                                mesh_edge_centers,
                                 shape_edge_range,
                                 self.mesh_mesh_block_offsets,
+                                1 if self.speculative else 0,
+                            ],
+                            outputs=[
+                                self.mesh_sdf_cull_contexts,
                                 self.mesh_sdf_search_contexts,
                                 self.mesh_sdf_export_contexts,
+                            ],
+                            device=device,
+                            record_tape=False,
+                        )
+                        wp.launch_tiled(
+                            kernel=self.mesh_sdf_cull_kernel,
+                            dim=(self.num_mesh_mesh_blocks,),
+                            inputs=[
+                                texture_sdf_data,
+                                mesh_mesh_pairs,
+                                self.shape_pairs_mesh_mesh_count,
+                                mesh_edge_indices,
+                                mesh_edge_centers,
+                                self.mesh_mesh_block_offsets,
+                                self.mesh_sdf_cull_contexts,
                                 self.mesh_sdf_work_ints,
                                 self.mesh_sdf_work_floats,
                                 self.mesh_sdf_work_state,
