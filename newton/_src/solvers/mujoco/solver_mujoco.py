@@ -93,7 +93,6 @@ from .kernels import (
     eval_mujoco_coupling_gravity_acceleration_kernel,
     inject_dormant_slab_contacts_kernel,
     prepare_contact_conversion_kernel,
-    prepare_contact_ranges_kernel,
     recompute_jnt_eq_anchor1_kernel,
     refresh_tree_awake_kernel,
     repeat_array_kernel,
@@ -132,7 +131,6 @@ from .kernels import (
     update_tendon_properties_kernel,
     wake_changed_trees_kernel,
     wake_contact_trees_kernel,
-    wake_contact_trees_ranges_kernel,
     wake_selected_tree_kernel,
 )
 
@@ -4239,26 +4237,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self._hook_tid: wp.array[wp.int32] | None = None
         self._hook_body: wp.array[wp.vec2i] | None = None
         self._hook_geom: wp.array[wp.vec4] | None = None
-        # MJWarp versions with Callback.contact_records take the converted contacts in world-contiguous
-        # id ranges (nconmax slots per world) with per-contact refresh records: their fused constraint
-        # stage then reads each world's range directly and refreshes dist/pos itself, so the hook keeps
-        # neither the bucket pass nor the by-contact refresh
-        self._contact_records_supported = self.mjw_model is not None and hasattr(
-            self.mjw_model.callback, "contact_records"
-        )
-        self._rec_point0: wp.array | None = None
-        self._rec_point1: wp.array | None = None
-        self._rec_normal: wp.array | None = None
-        self._rec_offset0: wp.array | None = None
-        self._rec_offset1: wp.array | None = None
-        self._rec_radius: wp.array | None = None
-        self._rec_tree: wp.array | None = None
-        self._world_nacon: wp.array | None = None
-        self._world_capacity = 0
-        # row-building ids per world: filled by MJWarp's position stage every substep, appended to
-        # by the in-step injection, consumed by MJWarp's constraint stage
-        self._row_count: wp.array | None = None
-        self._row_ids: wp.array | None = None
         if self._contact_pose_hook:
             self._allocate_hook_records(self.mjw_data.naconmax)
 
@@ -4305,9 +4283,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self._hook_contacts = contacts
             self._hook_state_in = state_in
             callback.post_position = self._convert_contacts_in_step
-            if self._contact_ranges_active():
-                inject = self.enable_sleeping and self._wake_injection_store(contacts)[0]
-                callback.contact_records = self._contact_records(inject)
         try:
             if finalize:
                 self._mujoco_warp.step(self.mjw_model, self.mjw_data)
@@ -4317,34 +4292,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             if contacts is not None:
                 # scoped to the step so other MJWarp passes on this model (reset) leave the rows alone
                 callback.post_position = None
-                if self._contact_ranges_active():
-                    callback.contact_records = None
                 self._hook_contacts = None
                 self._hook_state_in = None
-
-    def _contact_records(self, inject: bool):
-        """MJWarp ``ContactRecords`` view of the world-contiguous ids and their refresh records.
-
-        With ``inject`` the wake-injection snapshot and event are bound too, so MJWarp's collision wake
-        records the trees it wakes for the injection that follows in the hook.
-        """
-        return self._mujoco_warp.ContactRecords(
-            capacity=self._world_capacity,
-            count=self._world_nacon,
-            body=self._hook_body,
-            tree=self._rec_tree,
-            point0=self._rec_point0,
-            point1=self._rec_point1,
-            normal=self._rec_normal,
-            offset0=self._rec_offset0,
-            offset1=self._rec_offset1,
-            radius=self._rec_radius,
-            row_capacity=self._world_capacity,
-            row_count=self._row_count,
-            row_ids=self._row_ids,
-            tree_asleep_prev=self._tree_asleep_prev if inject else None,
-            wake_event=self._wake_event if inject else None,
-        )
 
     def _convert_contacts_in_step(self, m: MjWarpModel, d: MjWarpData) -> None:
         """Convert the Newton contacts inside the MJWarp step, after its wake pass and kinematics.
@@ -4354,9 +4303,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         and before ``make_constraint`` reads the contact rows. Mirrors the collision prelude of
         MJWarp's internal step for externally supplied contacts: conversion of the live rows (or
         the by-contact refresh of ``dist``/``pos`` from ``xpos``/``xquat`` on substeps that keep
-        the contact set, unless MJWarp takes the contacts as ``ContactRecords`` and refreshes them
-        in its constraint stage), the collision wake, and the injection of dormant contacts of
-        trees that woke since the previous substep. Trees woken here take part in this substep's solve, as
+        the contact set), the collision wake, and the injection of dormant contacts of trees that
+        woke since the previous substep. Trees woken here take part in this substep's solve, as
         with MJWarp's ``wake_collision``; the awake counters and body/DOF compaction are left to
         MJWarp's forward pass, which recomputes them before they are read.
         """
@@ -4364,12 +4312,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         state_in = self._hook_state_in
         model = self.model
         inject, store = self._wake_injection_store(contacts) if self.enable_sleeping else (False, None)
-        if self._contact_ranges_active():
-            # MJWarp's position stage refreshed the contacts, ran the wake-event scan and the collision
-            # wake from the records; only the injection of woken contacts is left to the hook
-            if inject:
-                self._inject_woken_dormant_contacts(model, state_in, contacts, store, xpos=d.xpos, xquat=d.xquat)
-            return
         self._launch_contact_conversion(
             model,
             state_in,
@@ -4379,11 +4321,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             tree_asleep_prev=self._tree_asleep_prev if inject else None,
         )
         if self.enable_sleeping:
-            self._wake_contact_trees(
-                contacts,
-                tree_asleep_prev=self._tree_asleep_prev if inject else None,
-                ranges=self._contact_ranges_active(),
-            )
+            self._wake_contact_trees(contacts, tree_asleep_prev=self._tree_asleep_prev if inject else None)
             if inject:
                 self._inject_woken_dormant_contacts(model, state_in, contacts, store, xpos=d.xpos, xquat=d.xquat)
         else:
@@ -4394,32 +4332,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self._hook_tid = wp.zeros(naconmax, dtype=wp.int32, device=self.device)
         self._hook_body = wp.zeros(naconmax, dtype=wp.vec2i, device=self.device)
         self._hook_geom = wp.zeros(naconmax, dtype=wp.vec4, device=self.device)
-        if self._contact_records_supported:
-            # allocated by capability: whether a step uses the ranges follows the fused-forward predicate
-            nworld = self.mjw_data.nworld
-            self._world_capacity = naconmax // nworld
-            self._world_nacon = wp.zeros(nworld, dtype=wp.int32, device=self.device)
-            self._rec_point0 = wp.zeros(naconmax, dtype=wp.vec3, device=self.device)
-            self._rec_point1 = wp.zeros(naconmax, dtype=wp.vec3, device=self.device)
-            self._rec_normal = wp.zeros(naconmax, dtype=wp.vec3, device=self.device)
-            self._rec_offset0 = wp.zeros(naconmax, dtype=wp.vec3, device=self.device)
-            self._rec_offset1 = wp.zeros(naconmax, dtype=wp.vec3, device=self.device)
-            self._rec_radius = wp.zeros(naconmax, dtype=wp.float32, device=self.device)
-            self._rec_tree = wp.zeros(naconmax, dtype=wp.vec2i, device=self.device)
-            self._row_count = wp.zeros(nworld, dtype=wp.int32, device=self.device)
-            self._row_ids = wp.zeros(naconmax, dtype=wp.int32, device=self.device)
-
-    def _contact_ranges_active(self) -> bool:
-        """Whether the in-step conversion places the contacts in world-contiguous MJWarp id ranges.
-
-        Only MJWarp's fused per-world forward consumes the ranges (the stock constraint stage walks the
-        dense id prefix), so the layout follows its predicate.
-        """
-        if not (self._contact_pose_hook and self._contact_records_supported) or self._world_nacon is None:
-            return False
-        from mujoco_warp._src import fused_world
-
-        return bool(fused_world.fused_world(self.mjw_model, self.mjw_data))
 
     def _apply_mjwarp_publish_option(self, state_out: State) -> None:
         """Set ``Option.fused_world_publish_derived`` for this step (see :attr:`mjwarp_publish_derived`)."""
@@ -4580,9 +4492,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self._enable_rne_postconstraint(state_out)
                 self._apply_mjwarp_publish_option(state_out)
                 convert_contacts = not self.mjw_model.opt.run_collision_detection
-                ranges = convert_contacts and self._contact_pose_hook and self._contact_ranges_active()
                 prepared = self._apply_mjc_inputs(
-                    self.model, state_in, control, contacts, prepare_contacts=convert_contacts and not ranges
+                    self.model, state_in, control, contacts, prepare_contacts=convert_contacts
                 )
                 first_of_tick = self._timestep_fill_pending
                 if self.update_data_interval > 0 and (
@@ -4605,12 +4516,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                             self._wake_before_step(self.model, state_in, contacts)
                         else:
                             self._snapshot_contact_generation(contacts)
-                    elif self._contact_ranges_active():
-                        # a new collision generation is converted before the step from the Newton poses
-                        # (the records are pose independent and MJWarp's position stage refreshes
-                        # dist/pos every substep); the in-step hook keeps the wake and the injection
-                        self._launch_contact_conversion(self.model, state_in, contacts, ranges=True)
-                        self._snapshot_contact_generation(contacts)
                 self._mujoco_warp_step(finalize, contacts if hook else None, state_in)
                 publish_body_state = finalize or not hook or self.publish_intermediate_body_state
                 self._update_newton_state(
@@ -5206,17 +5111,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         total_num_threads: int,
         xpos: wp.array | None = None,
         xquat: wp.array | None = None,
-        ranges: bool | None = None,
     ) -> list:
         """Argument list shared by the conversion and slab-injection kernels.
 
         ``xpos``/``xquat`` select MJWarp's body kinematics of the current substep as the pose
-        source (in-step conversion); ``None`` uses ``state_in.body_q``. ``ranges`` selects the
-        world-contiguous id layout of MJWarp's ContactRecords; by default the in-step conversion
-        uses it whenever it is active.
+        source (in-step conversion); ``None`` uses ``state_in.body_q``.
         """
-        if ranges is None:
-            ranges = xpos is not None and self._contact_ranges_active()
         bodies_per_world = self.model.body_count // self.model.world_count
         mujoco_attrs = getattr(model, "mujoco", None)
         shape_mjc_solref_mode = getattr(mujoco_attrs, "solref_mode", None) if mujoco_attrs is not None else None
@@ -5297,19 +5197,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self._hook_tid,
             self._hook_body,
             self._hook_geom,
-            # world-contiguous ids with refresh records (MJWarp ContactRecords)
-            self._world_capacity if ranges else 0,
-            self._world_nacon,
-            self._rec_point0,
-            self._rec_point1,
-            self._rec_normal,
-            self._rec_offset0,
-            self._rec_offset1,
-            self._rec_radius,
-            self._rec_tree,
-            self._world_capacity,
-            self._row_count,
-            self._row_ids,
         ]
 
     def _wake_injection_store(self, contacts: Contacts) -> tuple[bool, Any]:
@@ -5363,39 +5250,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         if inject:
             self._inject_woken_dormant_contacts(model, state_in, contacts, store)
 
-    def _wake_contact_trees(
-        self, contacts: Contacts, *, tree_asleep_prev: wp.array | None, ranges: bool = False
-    ) -> None:
-        """Wake sleeping trees touched by awake ones and snapshot the converted count and generation.
-
-        ``ranges`` selects the world-contiguous id layout of the in-step conversion (recorded tree pairs).
-        """
+    def _wake_contact_trees(self, contacts: Contacts, *, tree_asleep_prev: wp.array | None) -> None:
+        """Wake sleeping trees touched by awake ones and snapshot the converted count and generation."""
         m = self.mjw_model
         d = self.mjw_data
-        if ranges:
-            wp.launch(
-                wake_contact_trees_ranges_kernel,
-                dim=(d.nworld, 128),
-                inputs=[
-                    m.ntree,
-                    d.tree_awake,
-                    self._rec_tree,
-                    self._world_nacon,
-                    self._world_capacity,
-                    d.nacon,
-                    contacts.contact_generation,
-                ],
-                outputs=[
-                    d.tree_asleep,
-                    tree_asleep_prev,
-                    self._wake_event if tree_asleep_prev is not None else None,
-                    self._last_nacon_count,
-                    self._last_contact_generation,
-                ],
-                block_dim=128,
-                device=self.model.device,
-            )
-            return
         threads = min(d.naconmax, CONTACT_CONVERSION_MAX_THREADS)
         wp.launch(
             wake_contact_trees_kernel,
@@ -5585,17 +5443,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self._last_rigid_contact_max = contacts.rigid_contact_max
             self._last_naconmax = naconmax
 
-        if self._contact_ranges_active():
-            # world-contiguous ids: restart the counts and the parked list on a new collision
-            # generation only (the count is not restored per substep on this path)
-            wp.launch(
-                prepare_contact_ranges_kernel,
-                dim=self.mjw_data.nworld,
-                inputs=[contacts.contact_generation, self._last_contact_generation],
-                outputs=[self._world_nacon, self.mjw_data.nacon, self._dormant_count],
-                device=self.model.device,
-            )
-        elif not prepared:
+        if not prepared:
             # Zero nacon before the kernel (the full path counts with atomic_add; the fast path
             # restores the count from last_nacon_count) and restart the parked (dormant) contact
             # list on a new collision generation.
@@ -5616,7 +5464,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         xpos: wp.array | None = None,
         xquat: wp.array | None = None,
         tree_asleep_prev: wp.array | None = None,
-        ranges: bool | None = None,
     ) -> None:
         """Convert the Newton contact buffer into MJWarp contacts for this substep.
 
@@ -5628,8 +5475,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             xquat: MJWarp body orientations of the current substep (in-step conversion).
             tree_asleep_prev: When given, the kernel also flags trees that woke since this
                 snapshot (``wake_event``) and refreshes the snapshot.
-            ranges: Place the contacts in world-contiguous MJWarp id ranges with refresh records
-                (see :meth:`_contact_conversion_inputs`).
         """
         thread_count = min(contacts.rigid_contact_max, self.mjw_data.naconmax, CONTACT_CONVERSION_MAX_THREADS)
         wp.launch(
@@ -5644,7 +5489,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     total_num_threads=thread_count,
                     xpos=xpos,
                     xquat=xquat,
-                    ranges=ranges,
                 ),
                 tree_asleep_prev,
             ],

@@ -674,13 +674,7 @@ same three-phase cycle:
    contacts on substeps that keep the contact set), wakes sleeping trees
    touched by awake ones, and injects the dormant contacts of trees that
    woke since the previous substep, mirroring the collision prelude of
-   MuJoCo Warp's internal step. With a MuJoCo Warp that offers
-   ``Callback.contact_records`` the converted contacts occupy
-   world-contiguous id ranges (``nconmax`` slots per world) and carry
-   per-contact refresh records; MuJoCo Warp's fused constraint stage then
-   reads each world's contacts directly and refreshes ``dist`` / ``pos``
-   itself, so neither the by-contact refresh pass nor MuJoCo Warp's
-   per-world bucket pass runs. The injection launches run every substep
+   MuJoCo Warp's internal step. The injection launches run every substep
    and exit early without a wake event;
    :attr:`~newton.solvers.SolverMuJoCo.conditional_wake_injection` wraps
    them in a conditional graph node instead, which measured slower in CUDA

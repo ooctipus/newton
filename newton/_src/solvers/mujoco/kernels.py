@@ -493,23 +493,6 @@ def _convert_one_contact(
     hook_tid: wp.array[wp.int32],
     hook_body: wp.array[wp.vec2i],
     hook_geom: wp.array[wp.vec4],
-    # World-contiguous MJWarp ids and per-contact refresh records (MJWarp ContactRecords); a zero
-    # capacity keeps the global id pool
-    world_capacity: int,
-    world_nacon: wp.array[wp.int32],
-    rec_point0: wp.array[wp.vec3],
-    rec_point1: wp.array[wp.vec3],
-    rec_normal: wp.array[wp.vec3],
-    rec_offset0: wp.array[wp.vec3],
-    rec_offset1: wp.array[wp.vec3],
-    rec_radius: wp.array[wp.float32],
-    rec_tree: wp.array[wp.vec2i],
-    # Row lists of the fused forward (MJWarp ContactRecords): the row-building ids of each world,
-    # appended to by the conversions inside the step
-    row_capacity: int,
-    row_count: wp.array[wp.int32],
-    row_ids: wp.array[wp.int32],
-    list_rows: int,
 ) -> int:
     """Convert Newton contact row ``tid`` into a new MJWarp contact and return its id.
 
@@ -716,14 +699,7 @@ def _convert_one_contact(
             condim = 1
 
     cid = wp.atomic_add(nacon_out, 0, 1)
-    if world_capacity > 0:
-        # world-contiguous ids: the next slot of this world's range (nacon stays the contact count)
-        slot = wp.atomic_add(world_nacon, worldid, 1)
-        if slot >= world_capacity:
-            tid_to_cid[tid] = -1
-            return -1
-        cid = worldid * world_capacity + slot
-    elif cid >= naconmax:
+    if cid >= naconmax:
         tid_to_cid[tid] = -1
         return -1
 
@@ -732,21 +708,6 @@ def _convert_one_contact(
         hook_tid[cid] = tid
         hook_body[cid] = wp.vec2i(mj_body_a, mj_body_b)
         hook_geom[cid] = wp.vec4(offset_scale_a, offset_scale_b, radius_a, radius_b)
-    if world_capacity > 0:
-        # pose-independent terms of the in-kernel refresh (MJWarp reads them by id, coalesced)
-        rec_point0[cid] = rigid_contact_point0[tid]
-        rec_point1[cid] = rigid_contact_point1[tid]
-        rec_normal[cid] = n
-        rec_offset0[cid] = offset_a
-        rec_offset1[cid] = offset_b
-        rec_radius[cid] = radius_a + radius_b
-        rec_tree[cid] = wp.vec2i(body_treeid[mj_body_a], body_treeid[mj_body_b])
-        if list_rows != 0 and dist - margin < 0.0:
-            # converted inside the step (injection): the fused forward's position stage has already
-            # listed this world's row-building ids, so append this one to its list
-            row_slot = wp.atomic_add(row_count, worldid, 1)
-            if row_slot < row_capacity:
-                row_ids[worldid * row_capacity + row_slot] = cid
 
     write_contact(
         dist_in=dist,
@@ -970,22 +931,6 @@ def convert_newton_contacts_to_mjwarp_kernel(
     hook_tid: wp.array[wp.int32],
     hook_body: wp.array[wp.vec2i],
     hook_geom: wp.array[wp.vec4],
-    # World-contiguous MJWarp ids and per-contact refresh records (MJWarp ContactRecords); a zero
-    # capacity keeps the global id pool
-    world_capacity: int,
-    world_nacon: wp.array[wp.int32],
-    rec_point0: wp.array[wp.vec3],
-    rec_point1: wp.array[wp.vec3],
-    rec_normal: wp.array[wp.vec3],
-    rec_offset0: wp.array[wp.vec3],
-    rec_offset1: wp.array[wp.vec3],
-    rec_radius: wp.array[wp.float32],
-    rec_tree: wp.array[wp.vec2i],
-    # Row lists of the fused forward (MJWarp ContactRecords): the row-building ids of each world,
-    # appended to by the conversions inside the step
-    row_capacity: int,
-    row_count: wp.array[wp.int32],
-    row_ids: wp.array[wp.int32],
     # Wake-event detection (in-step conversion with wake injection): null otherwise
     tree_asleep_prev: wp.array2d[int],
 ):
@@ -1086,19 +1031,6 @@ def convert_newton_contacts_to_mjwarp_kernel(
                 hook_tid,
                 hook_body,
                 hook_geom,
-                world_capacity,
-                world_nacon,
-                rec_point0,
-                rec_point1,
-                rec_normal,
-                rec_offset0,
-                rec_offset1,
-                rec_radius,
-                rec_tree,
-                row_capacity,
-                row_count,
-                row_ids,
-                1,
             )
         return
 
@@ -1200,19 +1132,6 @@ def convert_newton_contacts_to_mjwarp_kernel(
                 hook_tid,
                 hook_body,
                 hook_geom,
-                world_capacity,
-                world_nacon,
-                rec_point0,
-                rec_point1,
-                rec_normal,
-                rec_offset0,
-                rec_offset1,
-                rec_radius,
-                rec_tree,
-                row_capacity,
-                row_count,
-                row_ids,
-                0,
             )
     else:
         # ── FAST PATH ────────────────────────────────────────────────────
@@ -1227,10 +1146,6 @@ def convert_newton_contacts_to_mjwarp_kernel(
             ncollision_out[0] = 0
             # Restore the compacted contact count from the full pass
             nacon_out[0] = last_nacon_count[0]
-
-        if world_capacity > 0:
-            # MJWarp's fused forward refreshes dist/pos from the records (ContactRecords)
-            return
 
         if xpos:
             # One thread per live MJWarp contact (the count includes the rows injected on earlier
@@ -1391,22 +1306,6 @@ def inject_dormant_slab_contacts_kernel(
     hook_tid: wp.array[wp.int32],
     hook_body: wp.array[wp.vec2i],
     hook_geom: wp.array[wp.vec4],
-    # World-contiguous MJWarp ids and per-contact refresh records (MJWarp ContactRecords); a zero
-    # capacity keeps the global id pool
-    world_capacity: int,
-    world_nacon: wp.array[wp.int32],
-    rec_point0: wp.array[wp.vec3],
-    rec_point1: wp.array[wp.vec3],
-    rec_normal: wp.array[wp.vec3],
-    rec_offset0: wp.array[wp.vec3],
-    rec_offset1: wp.array[wp.vec3],
-    rec_radius: wp.array[wp.float32],
-    rec_tree: wp.array[wp.vec2i],
-    # Row lists of the fused forward (MJWarp ContactRecords): the row-building ids of each world,
-    # appended to by the conversions inside the step
-    row_capacity: int,
-    row_count: wp.array[wp.int32],
-    row_ids: wp.array[wp.int32],
 ):
     """Append the rows of every listed slab to the Newton buffer and convert them.
 
@@ -1507,19 +1406,6 @@ def inject_dormant_slab_contacts_kernel(
             hook_tid,
             hook_body,
             hook_geom,
-            world_capacity,
-            world_nacon,
-            rec_point0,
-            rec_point1,
-            rec_normal,
-            rec_offset0,
-            rec_offset1,
-            rec_radius,
-            rec_tree,
-            row_capacity,
-            row_count,
-            row_ids,
-            1,
         )
 
 
@@ -1562,71 +1448,6 @@ def prepare_contact_conversion_kernel(
     nacon[0] = 0
     if contact_generation[0] != last_contact_generation[0]:
         dormant_count[0] = 0
-
-
-@wp.kernel(enable_backward=False)
-def prepare_contact_ranges_kernel(
-    contact_generation: wp.array[wp.int32],
-    last_contact_generation: wp.array[wp.int32],
-    world_nacon: wp.array[wp.int32],
-    nacon: wp.array[wp.int32],
-    dormant_count: wp.array[wp.int32],
-):
-    """Restart the contact counts and the parked list on a new collision generation (world-contiguous ids).
-
-    One thread per world; the contact count is only reset here (there is no per-substep restore on
-    this path), so it keeps counting the converted contacts between collision generations.
-    """
-    worldid = wp.tid()
-    if contact_generation[0] != last_contact_generation[0]:
-        world_nacon[worldid] = 0
-        if worldid == 0:
-            nacon[0] = 0
-            dormant_count[0] = 0
-
-
-@wp.kernel(enable_backward=False)
-def wake_contact_trees_ranges_kernel(
-    ntree: int,
-    tree_awake: wp.array2d[wp.int32],
-    rec_tree: wp.array[wp.vec2i],
-    world_nacon: wp.array[wp.int32],
-    world_capacity: int,
-    nacon: wp.array[wp.int32],
-    contact_generation: wp.array[wp.int32],
-    # outputs
-    tree_asleep: wp.array2d[wp.int32],
-    tree_asleep_prev: wp.array2d[wp.int32],
-    wake_event: wp.array[wp.int32],
-    last_nacon_count: wp.array[wp.int32],
-    last_contact_generation: wp.array[wp.int32],
-):
-    """:func:`wake_contact_trees_kernel` over world-contiguous id ranges with the recorded tree pairs.
-
-    Launched with ``(nworld, threads)``; each thread walks the slots of its world with a stride of
-    ``threads``, so the tree pairs are read coalesced. Thread ``(0, 0)`` snapshots the converted count
-    and generation for the conversion kernel's fast path.
-    """
-    worldid, thread = wp.tid()
-    threads = wp.block_dim()
-    if worldid == 0 and thread == 0:
-        last_nacon_count[0] = nacon[0]
-        last_contact_generation[0] = contact_generation[0]
-    count = wp.min(world_nacon[worldid], world_capacity)
-    base = worldid * world_capacity
-    for slot in range(thread, count, threads):
-        trees = rec_tree[base + slot]
-        tree1 = trees[0]
-        tree2 = trees[1]
-        if tree1 < 0 or tree2 < 0:
-            continue
-        awake1 = tree_awake[worldid, tree1]
-        awake2 = tree_awake[worldid, tree2]
-        if awake1 == awake2:
-            continue
-        sleeping_tree = wp.where(awake1 == 1, tree2, tree1)
-        wakeval = wp.where(awake1 == 1, tree_asleep[worldid, tree1], tree_asleep[worldid, tree2])
-        _wake_tree_tracked(ntree, worldid, sleeping_tree, wakeval, tree_asleep, tree_asleep_prev, wake_event)
 
 
 @wp.kernel(enable_backward=False)

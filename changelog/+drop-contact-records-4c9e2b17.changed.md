@@ -1,0 +1,1 @@
+Removed the world-contiguous contact id ranges, the pre-step collision-generation conversion and the MuJoCo Warp contact-record binding from `SolverMuJoCo`: the in-step hook converts, refreshes, wakes and injects the contacts again as before, and MuJoCo Warp buckets the contact pool itself. `Data.nacon` counts the contacts and their ids form the prefix `[0, nacon)` again.
