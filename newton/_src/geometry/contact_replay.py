@@ -161,8 +161,9 @@ def classify_unchanged_shapes(
     signatures: wp.array[ShapeReplaySignature],
     signature_valid: wp.array[wp.int32],
     shape_unchanged: wp.array[wp.int32],
+    shape_replay_class: wp.array[wp.int32],
 ):
-    """Classify exact shape identity and update the next-pass signature."""
+    """Classify exact shape identity, update the next-pass signature and emit the shape's replay class."""
     shape = wp.tid()
     body = shape_body[shape]
     body_transform = wp.transform_identity()
@@ -225,6 +226,9 @@ def classify_unchanged_shapes(
     unchanged = unchanged and previous.max_speculative_extension == current.max_speculative_extension
 
     shape_unchanged[shape] = int(unchanged)
+    shape_replay_class[shape] = _replay_class_from(
+        current.shape_type, current.sdf_index, current.edge_range, current.shape_flags, current.shape_sleep_index
+    )
     # An unchanged shape's stored signature already equals the current one: skip the rewrite.
     if not unchanged:
         signatures[shape] = current
@@ -232,64 +236,45 @@ def classify_unchanged_shapes(
 
 
 @wp.func
-def _is_replay_pair(
-    shape_a: int,
-    shape_b: int,
-    shape_type: wp.array[wp.int32],
-    shape_sdf_index: wp.array[wp.int32],
-    shape_edge_range: wp.array[wp.vec2i],
-    shape_flags: wp.array[wp.int32],
-    shape_sleep_index: wp.array[wp.vec2i],
-) -> bool:
-    """Return whether a pair belongs to the reduced dynamic-kinematic SDF path."""
-    if shape_a < 0 or shape_b < 0:
-        return False
-    type_a = shape_type[shape_a]
-    type_b = shape_type[shape_b]
-    if type_a == GeoType.HFIELD or type_b == GeoType.HFIELD:
-        return False
-    if type_a == GeoType.BOX and type_b == GeoType.BOX:
-        return False
-    if shape_sdf_index[shape_a] < 0 or shape_sdf_index[shape_b] < 0:
-        return False
-    if shape_edge_range[shape_a][1] <= 0 or shape_edge_range[shape_b][1] <= 0:
-        return False
-    if (shape_flags[shape_a] & ShapeFlags.HYDROELASTIC) != 0:
-        return False
-    if (shape_flags[shape_b] & ShapeFlags.HYDROELASTIC) != 0:
-        return False
+def _replay_class_from(
+    shape_type: int, sdf_index: int, edge_range: wp.vec2i, shape_flags: int, sleep_index: wp.vec2i
+) -> int:
+    """Per-shape summary of :func:`_is_replay_pair`: bit 0 eligible, bit 1 dynamic, bit 2 kinematic, bit 3 box."""
+    if shape_type == GeoType.HFIELD or sdf_index < 0 or edge_range[1] <= 0:
+        return 0
+    if (shape_flags & ShapeFlags.HYDROELASTIC) != 0:
+        return 0
+    replay_class = int(1)
+    if sleep_index[1] >= 0:
+        replay_class |= 2
+    if sleep_index[1] == -2:
+        replay_class |= 4
+    if shape_type == GeoType.BOX:
+        replay_class |= 8
+    return replay_class
 
-    sleep_a = shape_sleep_index[shape_a]
-    sleep_b = shape_sleep_index[shape_b]
-    dynamic_a = sleep_a[1] >= 0
-    dynamic_b = sleep_b[1] >= 0
-    kinematic_a = sleep_a[1] == -2
-    kinematic_b = sleep_b[1] == -2
-    return (dynamic_a and kinematic_b) or (dynamic_b and kinematic_a)
+
+@wp.func
+def _is_replay_pair_class(class_a: int, class_b: int) -> bool:
+    """:func:`_is_replay_pair` on two per-shape replay classes (same decisions, two loads instead of ten)."""
+    if (class_a & 1) == 0 or (class_b & 1) == 0:
+        return False
+    if (class_a & 8) != 0 and (class_b & 8) != 0:
+        return False
+    return ((class_a & 2) != 0 and (class_b & 4) != 0) or ((class_b & 2) != 0 and (class_a & 4) != 0)
 
 
 @wp.func
 def _is_replay_eligible(
     shape_a: int,
     shape_b: int,
-    shape_type: wp.array[wp.int32],
-    shape_sdf_index: wp.array[wp.int32],
-    shape_edge_range: wp.array[wp.vec2i],
-    shape_flags: wp.array[wp.int32],
+    shape_replay_class: wp.array[wp.int32],
     shape_sleep_index: wp.array[wp.vec2i],
     tree_asleep: wp.array2d[wp.int32],
     shape_unchanged: wp.array[wp.int32],
 ) -> bool:
     """Return whether a cached pair is exact and currently asleep."""
-    if not _is_replay_pair(
-        shape_a,
-        shape_b,
-        shape_type,
-        shape_sdf_index,
-        shape_edge_range,
-        shape_flags,
-        shape_sleep_index,
-    ):
+    if not _is_replay_pair_class(shape_replay_class[shape_a], shape_replay_class[shape_b]):
         return False
     if shape_unchanged[shape_a] == 0 or shape_unchanged[shape_b] == 0:
         return False
@@ -347,10 +332,7 @@ def _store_slab_row(slabs: DormantContactSlabs, index: int, row: _SlabRow):
 @wp.kernel(enable_backward=False)
 def retain_dormant_slabs(
     slabs: DormantContactSlabs,
-    shape_type: wp.array[wp.int32],
-    shape_sdf_index: wp.array[wp.int32],
-    shape_edge_range: wp.array[wp.vec2i],
-    shape_flags: wp.array[wp.int32],
+    shape_replay_class: wp.array[wp.int32],
     shape_sleep_index: wp.array[wp.vec2i],
     tree_asleep: wp.array2d[wp.int32],
     shape_unchanged: wp.array[wp.int32],
@@ -368,6 +350,7 @@ def retain_dormant_slabs(
     """
     slab, lane = wp.tid()
     shape = slabs.slab_shape[slab]
+    owner_class = shape_replay_class[shape]
     sleep = shape_sleep_index[shape]
     asleep = tree_asleep[sleep[0], sleep[1]] >= 0
     if not asleep or shape_unchanged[shape] == 0 or slabs.slab_overflow[slab] != 0:
@@ -397,14 +380,10 @@ def retain_dormant_slabs(
             partner = shape_b
             if shape_b == shape:
                 partner = shape_a
-            if shape_unchanged[partner] != 0 and _is_replay_pair(
-                shape_a,
-                shape_b,
-                shape_type,
-                shape_sdf_index,
-                shape_edge_range,
-                shape_flags,
-                shape_sleep_index,
+            if (
+                partner >= 0
+                and shape_unchanged[partner] != 0
+                and _is_replay_pair_class(owner_class, shape_replay_class[partner])
             ):
                 keep = 1
                 # Stage the row before the scan: a lower lane may overwrite this slot after it.
@@ -425,10 +404,7 @@ def retain_dormant_slabs(
 def mask_dormant_pairs(
     candidate_pairs: wp.array[wp.vec2i],
     candidate_pair_count: wp.array[wp.int32],
-    shape_type: wp.array[wp.int32],
-    shape_sdf_index: wp.array[wp.int32],
-    shape_edge_range: wp.array[wp.vec2i],
-    shape_flags: wp.array[wp.int32],
+    shape_replay_class: wp.array[wp.int32],
     shape_sleep_index: wp.array[wp.vec2i],
     tree_asleep: wp.array2d[wp.int32],
     shape_unchanged: wp.array[wp.int32],
@@ -448,10 +424,7 @@ def mask_dormant_pairs(
         if not _is_replay_eligible(
             shape_a,
             shape_b,
-            shape_type,
-            shape_sdf_index,
-            shape_edge_range,
-            shape_flags,
+            shape_replay_class,
             shape_sleep_index,
             tree_asleep,
             shape_unchanged,
@@ -530,6 +503,7 @@ class DormantContactStore:
             self.signatures = wp.zeros(shape_count, dtype=ShapeReplaySignature, device=device)
             self.signature_valid = wp.zeros(shape_count, dtype=wp.int32, device=device)
             self.shape_unchanged = wp.zeros(shape_count, dtype=wp.int32, device=device)
+            self.shape_replay_class = wp.zeros(shape_count, dtype=wp.int32, device=device)
             self.slab_world_tree = wp.array(sleep_index[slab_shapes], dtype=wp.vec2i, device=device)
             """MuJoCo ``(world, tree)`` per slab, shape ``[slab_count_total]``."""
             self.slab_world = wp.array(model.shape_world.numpy()[slab_shapes], dtype=wp.int32, device=device)
@@ -658,7 +632,7 @@ class DormantContactStore:
                 collision_update_dt,
                 max_speculative_extension,
             ],
-            outputs=[self.signatures, self.signature_valid, self.shape_unchanged],
+            outputs=[self.signatures, self.signature_valid, self.shape_unchanged, self.shape_replay_class],
             device=self.device,
             record_tape=False,
         )
@@ -688,10 +662,7 @@ class DormantContactStore:
             dim=[self.slab_count_total],
             inputs=[
                 self.slabs,
-                shape_type,
-                shape_sdf_index,
-                shape_edge_range,
-                shape_flags,
+                self.shape_replay_class,
                 shape_sleep_index,
                 tree_asleep,
                 self.shape_unchanged,
@@ -709,10 +680,7 @@ class DormantContactStore:
             inputs=[
                 candidate_pairs,
                 candidate_pair_count,
-                shape_type,
-                shape_sdf_index,
-                shape_edge_range,
-                shape_flags,
+                self.shape_replay_class,
                 shape_sleep_index,
                 tree_asleep,
                 self.shape_unchanged,

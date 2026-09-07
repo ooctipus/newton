@@ -1,0 +1,1 @@
+Classified each collision shape's dormant-contact replay role once per pass so the slab retention and pair masking test a pair from two per-shape values instead of re-reading the shape tables for every retained row; the decisions are unchanged.
