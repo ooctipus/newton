@@ -75,9 +75,13 @@ MESH_SDF_BLOCK_DIM = 256
 STACK_CAPACITY = 2 * MESH_SDF_BLOCK_DIM
 
 # Segments reuse the triangle-pair scratch buffer after triangle contacts finish.
-# The two-int header is followed by packed ``(edge index, midpoint SDF)`` pairs.
+# The two-int header ``(fill, unused)`` is followed by packed ``(context id, edge
+# index, midpoint SDF)`` triples. A segment holds the candidates of several
+# consecutive contexts: the cull carries its partial ring across context and
+# combo boundaries so that every segment but a block's last one is full.
 _SDF_WORK_SEGMENT_HEADER_INT32 = 2
-SDF_WORK_SEGMENT_STRIDE_INT32 = _SDF_WORK_SEGMENT_HEADER_INT32 + 2 * MESH_SDF_BLOCK_DIM
+_SDF_WORK_ITEM_INT32 = 3
+SDF_WORK_SEGMENT_STRIDE_INT32 = _SDF_WORK_SEGMENT_HEADER_INT32 + _SDF_WORK_ITEM_INT32 * MESH_SDF_BLOCK_DIM
 # Hit records follow the segment region in the same scratch buffer. Each edge
 # that survives the search stores three ``vec2`` slots: ``(context id, edge
 # index)`` as ints, then ``(x, y)`` and ``(z, distance)`` of the contact point
@@ -98,12 +102,14 @@ _SDF_WORK_CULL_CURSOR = 2
 _SDF_WORK_SOLVE_CURSOR = 3
 _SDF_WORK_HIT_COUNT = 4
 
-# Candidate filter of the two-stage path (``mesh_sdf_candidate_filter``): a segment's candidates are keyed by the
-# reducer voxel of their edge centre (static per edge); a candidate runs the edge search only if its Lipschitz
-# lower bound ``midpoint_sdf - radius`` does not exceed the segment's best midpoint SDF of the same key (the
-# key's deepest candidate cannot be shallower than its own midpoint), or if it is one of the six axis extremes of
-# the key's possibly-inner candidates (the reducer's spatial slots select extremes). Shared-memory tables hold
-# monotone ``float_flip`` encodings so ``atomicMax`` implements both the minimum and the maxima.
+# Candidate filter of the two-stage path (``mesh_sdf_candidate_filter``): while the cull sweeps a context's edges
+# in rounds, every in-band edge registers its midpoint SDF for the reducer voxel of its edge centre (static per
+# edge) in a shared table holding monotone ``float_flip`` encodings (``atomicMax`` implements the minimum); a
+# candidate that cannot be an inner contact is dropped when its Lipschitz lower bound ``midpoint_sdf - radius``
+# exceeds the voxel's best midpoint registered so far (that candidate cannot be shallower than its midpoint, so
+# this one can only lose the reduction to it). Possibly-inner candidates are kept when they are one of the six axis
+# extremes of their voxel's possibly-inner candidates (the reducer's spatial slots select extremes) even if they
+# fail the depth rule.
 _FILTER_KEYS = NUM_VOXEL_DEPTH_SLOTS
 _FILTER_AXES = 6
 _FILTER_EXT_SLOTS = _FILTER_KEYS * _FILTER_AXES
@@ -118,16 +124,51 @@ def _filter_sync(): ...
 def _filter_key_max(values: wp.tile[wp.uint32, _FILTER_KEYS], index: int, value: wp.uint32): ...
 
 
+@wp.func_native(snippet="values.data(wp::tile_coord(index)) = value;")
+def _filter_key_store(values: wp.tile[wp.uint32, _FILTER_KEYS], index: int, value: wp.uint32): ...
+
+
 @wp.func_native(snippet="atomicMax((unsigned int*)&values.data(wp::tile_coord(index)), value);")
 def _filter_ext_max(values: wp.tile[wp.uint32, _FILTER_EXT_SLOTS], index: int, value: wp.uint32): ...
 
 
 @wp.func_native(snippet="values.data(wp::tile_coord(index)) = value;")
-def _filter_key_store(values: wp.tile[wp.uint32, _FILTER_KEYS], index: int, value: wp.uint32): ...
+def _filter_ext_store(values: wp.tile[wp.uint32, _FILTER_EXT_SLOTS], index: int, value: wp.uint32): ...
+
+
+# Cull rounds: every lane tests ``_CULL_K`` edges per round with the texture fetches in flight together; the
+# candidates go to a shared ring (edge index, midpoint SDF) that holds a carried partial segment plus a full round.
+# Warps append with one shared atomic per warp (lanes ranked by ballot), so the append needs no block barrier.
+_CULL_K = 4
+_CULL_RING = MESH_SDF_BLOCK_DIM + _CULL_K * MESH_SDF_BLOCK_DIM
+
+
+@wp.func_native(snippet="return __ballot_sync(0xffffffffu, flag != 0);")
+def _cull_ballot(flag: int) -> wp.uint32: ...
+
+
+@wp.func_native(snippet="return __popc(mask);")
+def _cull_popc(mask: wp.uint32) -> int: ...
+
+
+@wp.func_native(snippet="return __shfl_sync(0xffffffffu, value, lane);")
+def _cull_shfl(value: int, lane: int) -> int: ...
+
+
+@wp.func_native(snippet="return atomicAdd(&values.data(wp::tile_coord(0)), count);")
+def _ring_reserve(values: wp.tile[int, 1], count: int) -> int: ...
+
+
+@wp.func_native(snippet="values.data(wp::tile_coord(0)) = value;")
+def _ring_store_count(values: wp.tile[int, 1], value: int): ...
 
 
 @wp.func_native(snippet="values.data(wp::tile_coord(index)) = value;")
-def _filter_ext_store(values: wp.tile[wp.uint32, _FILTER_EXT_SLOTS], index: int, value: wp.uint32): ...
+def _ring_store_i(values: wp.tile[int, _CULL_RING], index: int, value: int): ...
+
+
+@wp.func_native(snippet="values.data(wp::tile_coord(index)) = value;")
+def _ring_store_f(values: wp.tile[float, _CULL_RING], index: int, value: float): ...
 
 
 @wp.kernel(enable_backward=False)
@@ -2232,17 +2273,24 @@ def create_mesh_sdf_two_stage_kernels(
         edge_voxel: wp.array[wp.int32],
     ):
         _block_id, t = wp.tid()
+        lane = t & 31
+        warp_lanemask = (wp.uint32(1) << wp.uint32(lane)) - wp.uint32(1)
         pair_count = wp.min(shape_pairs_mesh_mesh_count[0], shape_pairs_mesh_mesh.shape[0])
         total_combos = block_offsets[pair_count]
-        edge_stack = wp.tile_stack(capacity=STACK_CAPACITY, dtype=EdgeCullResult)
         cull_context = wp.tile_empty(shape=1, dtype=MeshSDFCullContext, storage="shared")
-        progress = wp.tile_zeros(shape=1, dtype=int, storage="shared")
         segment_slot = wp.tile_zeros(shape=1, dtype=int, storage="shared")
         work_slot = wp.tile_zeros(shape=1, dtype=int, storage="shared")
+        ring_count = wp.tile_zeros(shape=1, dtype=int, storage="shared")
+        ring_ctx = wp.tile_zeros(shape=_CULL_RING, dtype=int, storage="shared")
+        ring_edge = wp.tile_zeros(shape=_CULL_RING, dtype=int, storage="shared")
+        ring_mid = wp.tile_zeros(shape=_CULL_RING, dtype=float, storage="shared")
+        # Block-uniform ring head; the ring's partial remainder is carried across contexts and combos.
+        ring_head = int(0)
         if wp.static(candidate_filter):
             # streaming filter table: best midpoint SDF seen so far per reducer voxel of this block's context
             # (as MAX - flip so atomicMax keeps the minimum); reset per context
             stream_best = wp.tile_zeros(shape=_FILTER_KEYS, dtype=wp.uint32, storage="shared")
+            stream_ext = wp.tile_zeros(shape=_FILTER_EXT_SLOTS, dtype=wp.uint32, storage="shared")
 
         # Claim combos dynamically so blocks that draw cheap combos keep working
         # instead of idling behind a static round-robin assignment.
@@ -2315,21 +2363,23 @@ def create_mesh_sdf_two_stage_kernels(
                 chunk_size = (num_edges + context.blocks_for_pair - 1) // context.blocks_for_pair
                 edge_start = context.block_in_pair * chunk_size
                 edge_end = wp.min(edge_start + chunk_size, num_edges)
-                wp.tile_scatter_masked(progress, 0, edge_start, t == 0)
                 if wp.static(candidate_filter):
                     if t < _FILTER_KEYS:
                         _filter_key_store(stream_best, t, wp.uint32(0))
+                    for slot_idx in range(t, _FILTER_EXT_SLOTS, MESH_SDF_BLOCK_DIM):
+                        _filter_ext_store(stream_ext, slot_idx, wp.uint32(0))
                     _filter_sync()
 
-                while wp.tile_extract(progress, 0) < edge_end or wp.tile_stack_count(edge_stack) > 0:
-                    while (
-                        wp.tile_extract(progress, 0) < edge_end and wp.tile_stack_count(edge_stack) < MESH_SDF_BLOCK_DIM
-                    ):
-                        base_edge_idx = wp.tile_extract(progress, 0)
-                        edge_idx = base_edge_idx + t
-                        add_edge = False
-                        midpoint_sdf = float(0.0)
-                        radius = float(0.0)
+                # Wide rounds: every lane tests _CULL_K edges with the texture fetches in flight together, the
+                # candidates are appended to the ring per warp, and full segments are flushed at the round end.
+                base_edge = int(edge_start)
+                while base_edge < edge_end:
+                    mids = wp.vec4(0.0)
+                    rads = wp.vec4(0.0)
+                    crads = wp.vec4(0.0)
+                    in_aabb = wp.vec4i(0)
+                    for k in range(_CULL_K):
+                        edge_idx = base_edge + k * MESH_SDF_BLOCK_DIM + t
                         if edge_idx < edge_end:
                             center, radius = get_mesh_edge_bounding_sphere(
                                 wp.uint64(0),
@@ -2349,64 +2399,162 @@ def create_mesh_sdf_two_stage_kernels(
                                 diff_mag = float(0.0)
                                 if aabb_dist_sq > 0.0:
                                     diff_mag = wp.sqrt(aabb_dist_sq)
-                                midpoint_sdf = wp.static(sample_clamped)(texture_sdf, clamped, diff_mag)
-                                add_edge = midpoint_sdf <= culling_radius
-                        if wp.static(candidate_filter):
-                            # Deterministic streaming prune: a candidate that cannot be an inner contact and whose
-                            # Lipschitz lower bound (midpoint - radius) exceeds the best midpoint an EARLIER batch
-                            # registered for the same reducer voxel cannot be deeper than that candidate, so it can
-                            # only lose the reduction to it. Reads use the table state before this batch, so the
-                            # decision does not depend on the atomics' order within the batch.
-                            stream_key = int(-1)
-                            stream_prev = wp.uint32(0)
-                            if add_edge:
+                                # consumed only after every sub-batch has issued its fetch
+                                mids[k] = wp.static(sample_clamped)(texture_sdf, clamped, diff_mag)
+                                rads[k] = radius
+                                crads[k] = culling_radius
+                                in_aabb[k] = 1
+                    stream_keys = wp.vec4i(-1)
+                    if wp.static(candidate_filter):
+                        # Deterministic streaming prune, round scope: every in-band edge of the round registers its
+                        # midpoint SDF for its reducer voxel first; after one barrier each candidate that cannot be
+                        # an inner contact and whose Lipschitz lower bound (midpoint - radius) exceeds the voxel's
+                        # best midpoint registered so far (this round included) is dropped, since it cannot be
+                        # deeper than that candidate and can only lose the reduction to it. The maximum does not
+                        # depend on the atomics' order and a voxel's shallowest-midpoint candidate never prunes
+                        # itself, so the decision is deterministic and independent of the edge order.
+                        for k in range(_CULL_K):
+                            if in_aabb[k] != 0 and mids[k] <= crads[k]:
+                                edge_idx = base_edge + k * MESH_SDF_BLOCK_DIM + t
                                 stream_key = edge_voxel[edge_range_tri[0] + edge_idx]
+                                stream_keys[k] = stream_key
                                 if stream_key >= 0:
-                                    stream_prev = stream_best[stream_key]
-                            _filter_sync()
-                            if add_edge and stream_key >= 0:
-                                _filter_key_max(stream_best, stream_key, _FILTER_U32_MAX - float_flip(midpoint_sdf))
-                                lower_bound = midpoint_sdf - radius
-                                if lower_bound >= context.inner_spatial_depth:
-                                    if float_flip(lower_bound) > _FILTER_U32_MAX - stream_prev:
-                                        add_edge = False
+                                    _filter_key_max(stream_best, stream_key, _FILTER_U32_MAX - float_flip(mids[k]))
+                                    if mids[k] - rads[k] < context.inner_spatial_depth:
+                                        # possibly inner: register the six axis extremes (centre reloaded, coalesced)
+                                        center, radius = get_mesh_edge_bounding_sphere(
+                                            wp.uint64(0),
+                                            mesh_edge_indices,
+                                            mesh_edge_centers,
+                                            edge_range_tri,
+                                            wp.vec3(1.0, 1.0, 1.0),
+                                            X_mesh_to_sdf,
+                                            wp.vec3(1.0, 1.0, 1.0),
+                                            1.0,
+                                            edge_idx,
+                                        )
+                                        for axis in range(3):
+                                            _filter_ext_max(
+                                                stream_ext,
+                                                stream_key * _FILTER_AXES + 2 * axis,
+                                                float_flip(center[axis]),
+                                            )
+                                            _filter_ext_max(
+                                                stream_ext,
+                                                stream_key * _FILTER_AXES + 2 * axis + 1,
+                                                float_flip(-center[axis]),
+                                            )
+                        _filter_sync()
+                    for k in range(_CULL_K):
+                        edge_idx = base_edge + k * MESH_SDF_BLOCK_DIM + t
+                        midpoint_sdf = mids[k]
+                        add_edge = in_aabb[k] != 0 and midpoint_sdf <= crads[k]
+                        if wp.static(candidate_filter):
+                            if add_edge and stream_keys[k] >= 0:
+                                lower_bound = midpoint_sdf - rads[k]
+                                if float_flip(lower_bound) > _FILTER_U32_MAX - stream_best[stream_keys[k]]:
+                                    add_edge = False
+                                    if lower_bound < context.inner_spatial_depth:
+                                        # possibly inner: kept when it is an axis extreme of its voxel's inner set
+                                        center, radius = get_mesh_edge_bounding_sphere(
+                                            wp.uint64(0),
+                                            mesh_edge_indices,
+                                            mesh_edge_centers,
+                                            edge_range_tri,
+                                            wp.vec3(1.0, 1.0, 1.0),
+                                            X_mesh_to_sdf,
+                                            wp.vec3(1.0, 1.0, 1.0),
+                                            1.0,
+                                            edge_idx,
+                                        )
+                                        for axis in range(3):
+                                            if (
+                                                float_flip(center[axis])
+                                                == stream_ext[stream_keys[k] * _FILTER_AXES + 2 * axis]
+                                            ):
+                                                add_edge = True
+                                            if (
+                                                float_flip(-center[axis])
+                                                == stream_ext[stream_keys[k] * _FILTER_AXES + 2 * axis + 1]
+                                            ):
+                                                add_edge = True
+                        # warp-aggregated append: one shared atomic per warp, lanes ranked by ballot
+                        add_flag = int(0)
+                        if add_edge:
+                            add_flag = 1
+                        add_mask = _cull_ballot(add_flag)
+                        ring_base = int(0)
+                        if lane == 0:
+                            ring_base = _ring_reserve(ring_count, _cull_popc(add_mask))
+                        ring_base = _cull_shfl(ring_base, 0)
+                        if add_edge:
+                            slot = (ring_head + ring_base + _cull_popc(add_mask & warp_lanemask)) % _CULL_RING
+                            _ring_store_i(ring_ctx, slot, context.context_id)
+                            _ring_store_i(ring_edge, slot, edge_idx)
+                            _ring_store_f(ring_mid, slot, midpoint_sdf)
+                    base_edge += _CULL_K * MESH_SDF_BLOCK_DIM
+                    # appends visible, and the table reads of this round precede the next round's registrations
+                    _filter_sync()
 
-                        cull_result = EdgeCullResult()
-                        cull_result.edge_idx = edge_idx
-                        cull_result.midpoint_sdf = midpoint_sdf
-                        wp.tile_stack_push(edge_stack, cull_result, add_edge)
-                        wp.tile_scatter_masked(progress, 0, base_edge_idx + wp.block_dim(), t == 0)
-
-                    stack_count = wp.tile_stack_count(edge_stack)
-                    fill = wp.min(stack_count, MESH_SDF_BLOCK_DIM)
-                    if fill > 0:
+                    # flush full segments (block-uniform count)
+                    ring_fill = ring_count[0]
+                    while ring_fill >= MESH_SDF_BLOCK_DIM:
                         segment = int(0)
                         if t == 0:
                             segment = wp.atomic_add(work_state, _SDF_WORK_SEGMENT_COUNT, 1)
                         wp.tile_scatter_masked(segment_slot, 0, segment, t == 0)
                         segment = wp.tile_extract(segment_slot, 0)
-                        if t == 0:
-                            if segment >= work_segment_capacity:
-                                wp.atomic_max(work_state, _SDF_WORK_OVERFLOWED, 1)
-                                wp.atomic_max(context_incomplete, context.context_id, 1)
-                        popped, edge_slot = wp.tile_stack_pop(edge_stack)
+                        slot = (ring_head + t) % _CULL_RING
                         if segment < work_segment_capacity:
                             base = segment * SDF_WORK_SEGMENT_STRIDE_INT32
                             if t == 0:
-                                work_ints[base] = context.context_id
-                                work_ints[base + 1] = fill
-                            if edge_slot >= 0:
-                                item = base + _SDF_WORK_SEGMENT_HEADER_INT32 + 2 * (edge_slot - (stack_count - fill))
-                                work_ints[item] = popped.edge_idx
-                                work_floats[item + 1] = popped.midpoint_sdf
-
-                wp.tile_stack_clear(edge_stack)
+                                work_ints[base] = MESH_SDF_BLOCK_DIM
+                                work_ints[base + 1] = 0
+                            item = base + _SDF_WORK_SEGMENT_HEADER_INT32 + _SDF_WORK_ITEM_INT32 * t
+                            work_ints[item] = ring_ctx[slot]
+                            work_ints[item + 1] = ring_edge[slot]
+                            work_floats[item + 2] = ring_mid[slot]
+                        else:
+                            # every context with a dropped candidate is redone whole by the fallback
+                            if t == 0:
+                                wp.atomic_max(work_state, _SDF_WORK_OVERFLOWED, 1)
+                            wp.atomic_max(context_incomplete, ring_ctx[slot], 1)
+                        ring_head = (ring_head + MESH_SDF_BLOCK_DIM) % _CULL_RING
+                        ring_fill -= MESH_SDF_BLOCK_DIM
+                    if t == 0:
+                        _ring_store_count(ring_count, ring_fill)
+                    _filter_sync()
                 mode += 1
 
             if t == 0:
                 combo_idx = wp.atomic_add(work_state, _SDF_WORK_CULL_CURSOR, 1)
             wp.tile_scatter_masked(work_slot, 0, combo_idx, t == 0)
             combo_idx = wp.tile_extract(work_slot, 0)
+
+        # The block's last, partial segment (visible: the last round ended with a barrier).
+        ring_fill = ring_count[0]
+        if ring_fill > 0:
+            segment = int(0)
+            if t == 0:
+                segment = wp.atomic_add(work_state, _SDF_WORK_SEGMENT_COUNT, 1)
+            wp.tile_scatter_masked(segment_slot, 0, segment, t == 0)
+            segment = wp.tile_extract(segment_slot, 0)
+            slot = (ring_head + t) % _CULL_RING
+            if segment < work_segment_capacity:
+                base = segment * SDF_WORK_SEGMENT_STRIDE_INT32
+                if t == 0:
+                    work_ints[base] = ring_fill
+                    work_ints[base + 1] = 0
+                if t < ring_fill:
+                    item = base + _SDF_WORK_SEGMENT_HEADER_INT32 + _SDF_WORK_ITEM_INT32 * t
+                    work_ints[item] = ring_ctx[slot]
+                    work_ints[item + 1] = ring_edge[slot]
+                    work_floats[item + 2] = ring_mid[slot]
+            else:
+                if t == 0:
+                    wp.atomic_max(work_state, _SDF_WORK_OVERFLOWED, 1)
+                if t < ring_fill:
+                    wp.atomic_max(context_incomplete, ring_ctx[slot], 1)
 
     @wp.kernel(enable_backward=False, launch_bounds=(256, 3), module=module)
     def mesh_sdf_solve_kernel(
@@ -2441,10 +2589,6 @@ def create_mesh_sdf_two_stage_kernels(
         hit_stack = wp.tile_stack(capacity=MESH_SDF_BLOCK_DIM, dtype=MeshSDFHitRecord)
         work_slot = wp.tile_zeros(shape=1, dtype=int, storage="shared")
         hit_slot = wp.tile_zeros(shape=1, dtype=int, storage="shared")
-        if wp.static(candidate_filter):
-            # per-segment filter tables: best midpoint per voxel key (as MAX - flip) and six axis extremes
-            filter_key_best = wp.tile_zeros(shape=_FILTER_KEYS, dtype=wp.uint32, storage="shared")
-            filter_ext_best = wp.tile_zeros(shape=_FILTER_EXT_SLOTS, dtype=wp.uint32, storage="shared")
 
         # Claim segments dynamically; per-segment cost varies with the number
         # of edges that converge inside the contact threshold.
@@ -2455,28 +2599,29 @@ def create_mesh_sdf_two_stage_kernels(
         segment = wp.tile_extract(work_slot, 0)
         while segment < segment_count:
             base = segment * SDF_WORK_SEGMENT_STRIDE_INT32
-            # The header is block-uniform, so plain loads broadcast without a
-            # shared-memory round trip.
-            context_id = work_ints[base]
-            context = search_contexts[context_id]
-            count = work_ints[base + 1]
-            if context_incomplete[context_id] != 0:
-                # Another segment of this context did not fit; the fallback redoes the whole context.
-                count = 0
+            count = work_ints[base]
             record = MeshSDFHitRecord()
             is_hit = False
-            texture_sdf = texture_sdf_table[context.sdf_index]
+            # Lanes of one context are consecutive, so the per-lane context loads broadcast within a run.
+            context_id = int(0)
             edge_idx = int(0)
             cached_sdf_val = float(0.0)
+            if t < count:
+                item = base + _SDF_WORK_SEGMENT_HEADER_INT32 + _SDF_WORK_ITEM_INT32 * t
+                context_id = work_ints[item]
+                edge_idx = work_ints[item + 1]
+                cached_sdf_val = work_floats[item + 2]
+            context = search_contexts[context_id]
+            texture_sdf = texture_sdf_table[context.sdf_index]
             v0 = wp.vec3(0.0)
             v1 = wp.vec3(0.0)
             corner_ownership = int(0)
             center = wp.vec3(0.0)
             radius = float(0.0)
+            selected = False
             if t < count:
-                item = base + _SDF_WORK_SEGMENT_HEADER_INT32 + 2 * t
-                edge_idx = work_ints[item]
-                cached_sdf_val = work_floats[item + 1]
+                # A context with a dropped candidate or hit is redone whole by the fallback.
+                selected = context_incomplete[context_id] == 0
                 v0, v1, corner_ownership = get_mesh_edge(
                     wp.uint64(0),
                     mesh_edge_indices,
@@ -2488,43 +2633,6 @@ def create_mesh_sdf_two_stage_kernels(
                     edge_idx,
                 )
                 center, radius = get_edge_bounding_sphere(v0, v1)
-            selected = t < count
-            if wp.static(candidate_filter):
-                # clear the segment's tables, then register every candidate's proxies (uniform barriers)
-                for slot_idx in range(t, _FILTER_EXT_SLOTS, MESH_SDF_BLOCK_DIM):
-                    _filter_ext_store(filter_ext_best, slot_idx, wp.uint32(0))
-                if t < _FILTER_KEYS:
-                    _filter_key_store(filter_key_best, t, wp.uint32(0))
-                _filter_sync()
-                filter_key = int(-1)
-                lower_bound = float(0.0)
-                possibly_inner = False
-                if t < count:
-                    filter_key = edge_voxel[context.edge_range[0] + edge_idx]
-                    lower_bound = cached_sdf_val - radius
-                    possibly_inner = lower_bound < export_contexts[context_id].inner_spatial_depth
-                    if filter_key >= 0:
-                        _filter_key_max(filter_key_best, filter_key, _FILTER_U32_MAX - float_flip(cached_sdf_val))
-                        if possibly_inner:
-                            for axis in range(3):
-                                _filter_ext_max(
-                                    filter_ext_best, filter_key * _FILTER_AXES + 2 * axis, float_flip(center[axis])
-                                )
-                                _filter_ext_max(
-                                    filter_ext_best,
-                                    filter_key * _FILTER_AXES + 2 * axis + 1,
-                                    float_flip(-center[axis]),
-                                )
-                _filter_sync()
-                if t < count and filter_key >= 0:
-                    # lower_bound <= best midpoint of the key  <=>  flip(lower_bound) <= MAX - stored
-                    selected = float_flip(lower_bound) <= _FILTER_U32_MAX - filter_key_best[filter_key]
-                    if not selected and possibly_inner:
-                        for axis in range(3):
-                            if float_flip(center[axis]) == filter_ext_best[filter_key * _FILTER_AXES + 2 * axis]:
-                                selected = True
-                            if float_flip(-center[axis]) == filter_ext_best[filter_key * _FILTER_AXES + 2 * axis + 1]:
-                                selected = True
             if selected:
                 dist, point, best_endpoint = do_edge_sdf_collision(
                     texture_sdf,
@@ -2567,7 +2675,6 @@ def create_mesh_sdf_two_stage_kernels(
                     hit_base = wp.atomic_add(work_state, _SDF_WORK_HIT_COUNT, hit_fill)
                     if hit_base + hit_fill > hit_capacity:
                         wp.atomic_max(work_state, _SDF_WORK_OVERFLOWED, 1)
-                        wp.atomic_max(context_incomplete, context_id, 1)
                 wp.tile_scatter_masked(hit_slot, 0, hit_base, t == 0)
                 hit_base = wp.tile_extract(hit_slot, 0)
                 popped, hit_index = wp.tile_stack_pop(hit_stack)
@@ -2578,6 +2685,9 @@ def create_mesh_sdf_two_stage_kernels(
                         work_int2[slot] = wp.vec2i(popped.context_id, popped.edge_idx)
                         work_float2[slot + 1] = wp.vec2f(popped.point[0], popped.point[1])
                         work_float2[slot + 2] = wp.vec2f(popped.point[2], popped.dist)
+                    else:
+                        # a context with a dropped hit is redone whole by the fallback
+                        wp.atomic_max(context_incomplete, popped.context_id, 1)
                 wp.tile_stack_clear(hit_stack)
 
             if t == 0:

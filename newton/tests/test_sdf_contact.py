@@ -51,10 +51,13 @@ class TestSDFContact(unittest.TestCase):
                 mesh = newton.Mesh.create_box(0.5, 0.5, 0.5, duplicate_vertices=False, compute_inertia=False)
                 mesh.build_sdf(max_resolution=32, device=device)
                 builder = newton.ModelBuilder()
-                mesh_body = builder.add_body(xform=wp.transform_identity())
-                box_body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.9), wp.quat_identity()))
-                builder.add_shape_mesh(mesh_body, mesh=mesh)
-                builder.add_shape_box(box_body, cfg=newton.ModelBuilder.ShapeConfig(sdf_max_resolution=32))
+                # Two far-apart mesh/box pairs: each pair is culled by its own block, so the work lands in more
+                # than one segment and a halved capacity leaves some contexts incomplete.
+                for offset in (0.0, 4.0):
+                    mesh_body = builder.add_body(xform=wp.transform(wp.vec3(offset, 0.0, 0.0), wp.quat_identity()))
+                    box_body = builder.add_body(xform=wp.transform(wp.vec3(offset, 0.0, 0.9), wp.quat_identity()))
+                    builder.add_shape_mesh(mesh_body, mesh=mesh)
+                    builder.add_shape_box(box_body, cfg=newton.ModelBuilder.ShapeConfig(sdf_max_resolution=32))
                 model = builder.finalize(device=device)
                 pipeline = newton.CollisionPipeline(
                     model,
