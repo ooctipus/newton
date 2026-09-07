@@ -2151,14 +2151,40 @@ def _roundoff_duplicate_bit_for_slot_pair(
     return 1 << slot_b
 
 
+@wp.func_native(snippet="WP_TILE_SYNC();")
+def _export_sync(): ...
+
+
+@wp.func
+def _records_are_numerically_equivalent(pd_a: wp.vec4, n_a: wp.vec2, pd_b: wp.vec4, n_b: wp.vec2) -> bool:
+    """``_contacts_are_numerically_equivalent`` on already loaded records."""
+    if not _floats_are_near_ulps(pd_a[0], pd_b[0]):
+        return False
+    if not _floats_are_near_ulps(pd_a[1], pd_b[1]):
+        return False
+    if not _floats_are_near_ulps(pd_a[2], pd_b[2]):
+        return False
+    if not _floats_are_near_ulps(pd_a[3], pd_b[3]):
+        return False
+    if not _floats_are_near_ulps(n_a[0], n_b[0]):
+        return False
+    return _floats_are_near_ulps(n_a[1], n_b[1])
+
+
+# Fast-mode export: a 32-lane block handles four entries at once, one lane per value slot.
+EXPORT_REDUCED_ENTRIES_PER_BLOCK = EXPORT_REDUCED_CONTACTS_BLOCK_DIM // 8
+
+
 def create_export_reduced_contacts_kernel(writer_func: Any):
     """Create a tiled kernel that exports globally reduced contacts.
 
-    One thread block processes each active hashtable entry. Its first 21 lanes
-    compare the seven possible winner pairs in parallel, preserving the
-    lower-fingerprint representative for roundoff-equivalent geometry. CUDA
-    lanes export the seven surviving slots concurrently in fast mode; CPU and
-    deterministic paths stream them serially from lane zero.
+    In fast mode on CUDA a 32-lane block handles four active hashtable entries
+    at once, one lane per value slot: each lane loads its slot's winner once and
+    the roundoff-duplicate rule (keep the lower-fingerprint representative of
+    numerically equivalent geometry) is decided from the seven records exchanged
+    through warp shuffles, after which the surviving lanes export concurrently.
+    CPU and deterministic paths process one entry per block and stream the
+    surviving slots serially from lane zero.
     """
     exported_ids_vec = wp.types.vector(length=VALUES_PER_KEY, dtype=wp.int32)
     _module = f"export_reduced_contacts_{writer_func.__name__}"
@@ -2225,6 +2251,72 @@ def create_export_reduced_contacts_kernel(writer_func: Any):
         block_id, lane = wp.tid()
         ht_capacity = ht_keys.shape[0]
         num_active = ht_active_slots[ht_capacity]
+
+        if parallel_pairs != 0 and deterministic == 0:
+            group_base = lane & ~7
+            slot = lane & 7
+            group = lane >> 3
+            stride = total_num_blocks * wp.static(EXPORT_REDUCED_ENTRIES_PER_BLOCK)
+            xchg_id = wp.tile_zeros(shape=wp.static(EXPORT_REDUCED_CONTACTS_BLOCK_DIM), dtype=int, storage="shared")
+            xchg_fp = wp.tile_zeros(shape=wp.static(EXPORT_REDUCED_CONTACTS_BLOCK_DIM), dtype=int, storage="shared")
+            xchg_pd = wp.tile_zeros(shape=wp.static(EXPORT_REDUCED_CONTACTS_BLOCK_DIM), dtype=wp.vec4, storage="shared")
+            xchg_n = wp.tile_zeros(shape=wp.static(EXPORT_REDUCED_CONTACTS_BLOCK_DIM), dtype=wp.vec2, storage="shared")
+            for base_idx in range(block_id * wp.static(EXPORT_REDUCED_ENTRIES_PER_BLOCK), num_active, stride):
+                active_idx = base_idx + group
+                contact_id = int(0)
+                if active_idx < num_active and slot < wp.static(VALUES_PER_KEY):
+                    value = ht_values[slot * ht_capacity + ht_active_slots[active_idx]]
+                    if value != wp.uint64(0):
+                        contact_id = unpack_contact_id(value, deterministic)
+                pd = wp.vec4(0.0)
+                n2 = wp.vec2(0.0)
+                fingerprint = int(0)
+                if contact_id != 0:
+                    pd = position_depth[contact_id]
+                    n2 = normal[contact_id]
+                    fingerprint = contact_fingerprints[contact_id]
+                # roundoff duplicates: slot a < b, equivalent geometry, different ids -> drop a when
+                # fp_b < fp_a, else drop b (the same rule as _roundoff_duplicate_bit_for_slot_pair);
+                # a contact id held by several slots is exported by its lowest slot only
+                # the previous iteration's reads must complete before the exchange tiles are rewritten
+                _export_sync()
+                wp.tile_scatter_masked(xchg_id, lane, contact_id, True)
+                wp.tile_scatter_masked(xchg_fp, lane, fingerprint, True)
+                wp.tile_scatter_masked(xchg_pd, lane, pd, True)
+                wp.tile_scatter_masked(xchg_n, lane, n2, True)
+                _export_sync()
+                suppressed = False
+                for j in range(wp.static(VALUES_PER_KEY)):
+                    src = group_base + j
+                    id_j = wp.tile_extract(xchg_id, src)
+                    fp_j = wp.tile_extract(xchg_fp, src)
+                    pd_j = wp.tile_extract(xchg_pd, src)
+                    n_j = wp.tile_extract(xchg_n, src)
+                    if j != slot and contact_id != 0 and id_j != 0:
+                        if id_j == contact_id:
+                            if j < slot:
+                                suppressed = True
+                        elif _records_are_numerically_equivalent(pd, n2, pd_j, n_j):
+                            if slot < j:
+                                if fp_j < fingerprint:
+                                    suppressed = True
+                            elif fp_j <= fingerprint:
+                                suppressed = True
+                if contact_id != 0 and not suppressed:
+                    export_contact_id(
+                        contact_id,
+                        position_depth,
+                        normal,
+                        shape_pairs,
+                        contact_fingerprints,
+                        exported_flags,
+                        shape_types,
+                        shape_data,
+                        shape_gap,
+                        writer_data,
+                    )
+            return
+
         duplicate_bits = wp.tile_zeros(shape=wp.static(EXPORT_REDUCED_CONTACTS_BLOCK_DIM), dtype=int, storage="shared")
 
         for active_idx in range(block_id, num_active, total_num_blocks):
