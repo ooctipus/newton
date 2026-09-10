@@ -259,6 +259,14 @@ def create_prepare_convex_pair(external_aabb: bool, speculative: bool = False):
             ):
                 return False, result
 
+        else:
+            # Bounding-sphere reject for non-plane pairs: AABB overlap admits many pairs whose hulls cannot come
+            # within the gap (elongated finger links next to each other); GJK on those is wasted work.
+            reject_radius = (
+                shape_collision_radius[shape_a] + shape_collision_radius[shape_b] + rigid_gap + margin_a + margin_b
+            )
+            if wp.length_sq(pos_a - pos_b) > reject_radius * reject_radius:
+                return False, result
         if is_infinite_plane_a:
             geom_a, pos_a = convert_infinite_plane_to_cube(geom_a, quat_a, pos_a, pos_b, bsphere_radius_b + rigid_gap)
         if is_infinite_plane_b:

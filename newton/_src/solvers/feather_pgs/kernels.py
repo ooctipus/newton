@@ -3496,6 +3496,7 @@ def allocate_joint_velocity_limit_slots(
 
     joint_start = articulation_start[art]
     joint_end = articulation_start[art + 1]
+    n_eligible = int(0)
 
     for j in range(joint_start, joint_end):
         jtype = joint_type[j]
@@ -3530,18 +3531,29 @@ def allocate_joint_velocity_limit_slots(
                 if wp.abs(joint_qd[dof]) < velocity_limit_activation_fraction * qdot_max:
                     continue
 
-            lower_idx = 2 * dof
-            upper_idx = lower_idx + 1
+            # Mark eligible; slots are reserved below with a single atomic per articulation (the
+            # per-DOF pair of atomics was a 2*dofs-long serial chain per thread).
+            velocity_limit_sign[2 * dof] = 1.0
+            n_eligible += 1
 
-            lower_slot = wp.atomic_add(world_slot_counter, world, 1)
-            if lower_slot < max_constraints:
-                velocity_limit_slot[lower_idx] = lower_slot
-                velocity_limit_sign[lower_idx] = 1.0
-
-            upper_slot = wp.atomic_add(world_slot_counter, world, 1)
-            if upper_slot < max_constraints:
-                velocity_limit_slot[upper_idx] = upper_slot
-                velocity_limit_sign[upper_idx] = -1.0
+    if n_eligible == 0:
+        return
+    base = wp.atomic_add(world_slot_counter, world, 2 * n_eligible)
+    slot = base
+    for d in range(dof_count):
+        dof = dof_base + d
+        lower_idx = 2 * dof
+        if velocity_limit_sign[lower_idx] != 1.0:
+            continue
+        upper_idx = lower_idx + 1
+        if slot < max_constraints:
+            velocity_limit_slot[lower_idx] = slot
+        else:
+            velocity_limit_sign[lower_idx] = 0.0
+        if slot + 1 < max_constraints:
+            velocity_limit_slot[upper_idx] = slot + 1
+            velocity_limit_sign[upper_idx] = -1.0
+        slot += 2
 
 
 @wp.kernel
@@ -3557,6 +3569,7 @@ def populate_joint_velocity_limit_J_for_size(
     velocity_limit_sign: wp.array[float],
     group_to_art: wp.array[int],
     pgs_cfm: float,
+    articulation_dof_count_of_size: int,
     # outputs
     J_group: wp.array3d[float],
     world_row_type: wp.array2d[int],
@@ -3569,7 +3582,8 @@ def populate_joint_velocity_limit_J_for_size(
 ):
     """Populate Jacobian and metadata for joint velocity-limit rows.
 
-    Launched once per size group with ``dim = n_arts_of_size``. For every DOF
+    Launched once per size group with ``dim = n_arts_of_size * size * 2`` (one thread per DOF side;
+    eligibility is read from ``velocity_limit_slot``, so no joint-type walk is needed). For every DOF
     whose two ``velocity_limit_slot`` entries are non-negative, writes signed
     ±1 entries into the local DOF column of the grouped Jacobian and sets the
     constraint metadata. The rows have **no Baumgarte bias** (``beta = 0``,
@@ -3583,59 +3597,30 @@ def populate_joint_velocity_limit_J_for_size(
     ``velocity_limit_slot == -1`` and are skipped here through the same
     per-row slot check; this kernel needs no separate skip flag.
     """
-    group_idx = wp.tid()
+    tid = wp.tid()
+    n_dofs = articulation_dof_count_of_size
+    side = tid % 2
+    local_dof = (tid // 2) % n_dofs
+    group_idx = tid // (2 * n_dofs)
     art = group_to_art[group_idx]
     world = art_to_world[art]
-    dof_start = articulation_dof_start[art]
+    dof = articulation_dof_start[art] + local_dof
+    row_idx = 2 * dof + side
+    slot = velocity_limit_slot[row_idx]
+    if slot < 0:
+        return
+    qdot_max = joint_velocity_limit[dof]
+    sign = velocity_limit_sign[row_idx]
 
-    joint_start = articulation_start[art]
-    joint_end = articulation_start[art + 1]
+    J_group[group_idx, slot, local_dof] = sign
 
-    for j in range(joint_start, joint_end):
-        jtype = joint_type[j]
-        if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
-            continue
-
-        lin_count = joint_dof_dim[j, 0]
-        ang_count = joint_dof_dim[j, 1]
-        axis_count = lin_count + ang_count
-        qd_start = joint_qd_start[j]
-
-        for axis in range(axis_count):
-            dof = qd_start + axis
-            qdot_max = joint_velocity_limit[dof]
-            if qdot_max <= 0.0:
-                continue
-
-            local_dof = dof - dof_start
-            lower_idx = 2 * dof
-
-            for side in range(2):
-                row_idx = lower_idx + side
-                slot = velocity_limit_slot[row_idx]
-                if slot < 0:
-                    continue
-
-                sign = velocity_limit_sign[row_idx]
-
-                # Single signed ±1 entry at the local DOF column. The selector
-                # row on generalised velocity is ``J = sign * e_i``; the
-                # articulated-body response ``J M^-1 J^T`` is exactly PhysX's
-                # ``recipResponse`` on the same axis and is computed by the
-                # existing ``hinv_jt_par_row`` / ``diag_from_JY_par_art`` path.
-                J_group[group_idx, slot, local_dof] = sign
-
-                world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
-                world_row_parent[world, slot] = -1
-                world_row_mu[world, slot] = 0.0
-                # No Baumgarte / ERP — matches PhysX vel-limit row (§4).
-                world_row_beta[world, slot] = 0.0
-                world_row_cfm[world, slot] = pgs_cfm
-                world_phi[world, slot] = 0.0
-                # ``target_vel = -qdot_max`` for both signs: rhs = -target + J*v
-                # = qdot_max +/- qdot_i, which is negative exactly when the
-                # corresponding side of the box is violated.
-                world_target_velocity[world, slot] = -qdot_max
+    world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
+    world_row_parent[world, slot] = -1
+    world_row_mu[world, slot] = 0.0
+    world_row_beta[world, slot] = 0.0
+    world_row_cfm[world, slot] = pgs_cfm
+    world_phi[world, slot] = 0.0
+    world_target_velocity[world, slot] = -qdot_max
 
 
 # =============================================================================
@@ -5501,6 +5486,8 @@ def compute_world_contact_bias(
     contact_speculative_scale: float,
     joint_limit_speculative_scale: float,
     contact_w: float,
+    mf_constraint_count: wp.array[int],
+    owned_rows_le: int,
     # outputs
     world_rhs: wp.array2d[float],
     world_row_w: wp.array2d[float],
@@ -5510,16 +5497,25 @@ def compute_world_contact_bias(
     The RHS follows the convention: rhs = J*v + stabilization
     For contacts with penetration (phi < 0): rhs = J*v + beta * phi / dt (negative)
     This leads to positive impulses when resolved by PGS.
+
+    One thread per (world, row): ``dim = world_count * max_constraints``. The previous one-thread-per-world loop
+    left the GPU idle (64-128 blocks) for 30-60 us per launch.
     """
-    world = wp.tid()
+    tid = wp.tid()
+    world = tid // max_constraints
+    i = tid - world * max_constraints
     m = world_constraint_count[world]
 
     inv_dt = 1.0 / dt
 
-    for i in range(m):
+    if i < m:
         phi = world_phi[world, i]
         beta = world_row_beta[world, i]
         row_type = world_row_type[world, i]
+        if owned_rows_le > 0 and m <= owned_rows_le and mf_constraint_count[world] == 0:
+            # World owned by the sweep kernel with in-kernel contact rows: it forms the contact bias itself.
+            if row_type == PGS_CONSTRAINT_TYPE_CONTACT or row_type == PGS_CONSTRAINT_TYPE_FRICTION:
+                return
         target_vel = world_target_velocity[world, i]
 
         # Initialize with -target_velocity (will add J*v later)
@@ -5578,6 +5574,8 @@ def apply_world_contact_restitution_matrix_free(
     dt: float,
     restitution_velocity_threshold: float,
     write_row_w: int,
+    mf_constraint_count: wp.array[int],
+    owned_rows_le: int,
     # in/out
     world_rhs: wp.array2d[float],
     world_row_w: wp.array2d[float],
@@ -5586,8 +5584,11 @@ def apply_world_contact_restitution_matrix_free(
     tid = wp.tid()
     world = tid // max_constraints
     i = tid - world * max_constraints
-    if i >= world_constraint_count[world]:
+    m = world_constraint_count[world]
+    if i >= m:
         return
+    if owned_rows_le > 0 and m <= owned_rows_le and mf_constraint_count[world] == 0:
+        return  # world_rows: the sweep kernel applies restitution to its own contact rows
     if world_row_type[world, i] != PGS_CONSTRAINT_TYPE_CONTACT:
         return
 
@@ -5839,12 +5840,16 @@ def diag_from_JY_par_art(
     n_dofs: int,
     max_constraints: int,
     n_arts: int,
+    mf_constraint_count: wp.array[int],
+    skip_rows_le: int,
     # output
     world_diag: wp.array2d[float],
 ):
     """Compute diagonal of Delassus from J and Y without assembling the full matrix.
 
     diag[w,c] += sum_k J[idx,c,k] * Y[idx,c,k]. Thread dim: n_arts * max_constraints.
+    Worlds with at most ``skip_rows_le`` dense rows and no matrix-free rows are skipped when
+    ``skip_rows_le > 0`` (their sweep kernel forms the diagonal itself).
     """
     tid = wp.tid()
     c = tid % max_constraints
@@ -5853,7 +5858,10 @@ def diag_from_JY_par_art(
         return
     art = group_to_art[idx]
     world = art_to_world[art]
-    if c >= world_constraint_count[world]:
+    m = world_constraint_count[world]
+    if c >= m:
+        return
+    if skip_rows_le > 0 and m <= skip_rows_le and mf_constraint_count[world] == 0:
         return
     val = float(0.0)
     for k in range(n_dofs):
@@ -5870,6 +5878,8 @@ def accumulate_group_diag_worlds(
     art_group_idx: wp.array[int],
     world_constraint_count: wp.array[int],
     max_constraints: int,
+    mf_constraint_count: wp.array[int],
+    skip_rows_le: int,
     # output
     world_diag: wp.array2d[float],
 ):
@@ -5877,7 +5887,10 @@ def accumulate_group_diag_worlds(
     tid = wp.tid()
     c = tid % max_constraints
     world = tid // max_constraints
-    if c >= world_constraint_count[world]:
+    m = world_constraint_count[world]
+    if c >= m:
+        return
+    if skip_rows_le > 0 and m <= skip_rows_le and mf_constraint_count[world] == 0:
         return
     value = float(0.0)
     for offset in range(world_group_art_start[world], world_group_art_start[world + 1]):
@@ -10343,15 +10356,70 @@ def apply_mf_warmstart_impulses(
 
 
 @wp.kernel
+def build_world_contact_lists(
+    contact_count: wp.array[int],
+    total_threads: int,
+    contact_world: wp.array[int],
+    contact_slot: wp.array[int],
+    contact_path: wp.array[int],
+    max_per_world: int,
+    # outputs
+    world_contacts: wp.array2d[int],
+    world_contact_counts: wp.array[int],
+):
+    """Append every dense-routed contact to its world's list so one block can own a world end to end."""
+    total = wp.min(contact_count[0], contact_slot.shape[0])
+    for c in range(wp.tid(), total, total_threads):
+        if contact_path[c] != 0 or contact_slot[c] < 0:
+            continue
+        w = contact_world[c]
+        idx = wp.atomic_add(world_contact_counts, w, 1)
+        if idx < max_per_world:
+            world_contacts[w, idx] = c
+
+
+@wp.kernel
+def classify_parallel_sweep_tiers(
+    world_constraint_count: wp.array[int],
+    mf_constraint_count: wp.array[int],
+    tier_lo: wp.array[int],
+    tier_hi: wp.array[int],
+    n_tiers: int,
+    # outputs
+    tier_worlds: wp.array2d[int],
+    tier_counts: wp.array[int],
+):
+    """Append each dense-only world to the list of the parallel sweep tier that owns it.
+
+    Tier ``t`` owns worlds with ``tier_lo[t] < rows <= tier_hi[t]`` and no matrix-free rows. Each tier kernel then
+    grid-strides over its own list instead of launching every world and exiting (an exiting block still paid four
+    dependent global loads: ~55 us per launch at 16k worlds).
+    """
+    world = wp.tid()
+    m = world_constraint_count[world]
+    if m <= 0 or mf_constraint_count[world] != 0:
+        return
+    for t in range(n_tiers):
+        if m > tier_lo[t] and m <= tier_hi[t]:
+            idx = wp.atomic_add(tier_counts, t, 1)
+            tier_worlds[t, idx] = world
+            return
+
+
+@wp.kernel
 def finalize_world_diag_cfm(
     world_constraint_count: wp.array[int],
     world_row_cfm: wp.array2d[float],
+    mf_constraint_count: wp.array[int],
+    skip_rows_le: int,
     # in/out
     world_diag: wp.array2d[float],
 ):
     """Add CFM to world diagonal after Delassus accumulation."""
     world = wp.tid()
     m = world_constraint_count[world]
+    if skip_rows_le > 0 and m <= skip_rows_le and mf_constraint_count[world] == 0:
+        return
 
     for i in range(m):
         world_diag[world, i] += world_row_cfm[world, i]

@@ -1,0 +1,1 @@
+Add experimental FeatherPGS grouped dynamics, parallel projection sweeps, and in-kernel contact response and row construction for performance evaluation. The opt-in parallel projection uses a different friction metric and does not preserve the legacy row Gauss-Seidel solver's converged velocities; keep `mf_gs_parallel_rows=0` to retain the legacy contact solve.
