@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 import warnings
 import weakref
 from dataclasses import dataclass
@@ -332,6 +333,204 @@ def compute_shape_aabbs(
             g = g + 1
         contact_generation[0] = g
         broad_phase_pair_count[0] = 0
+
+    rigid_id = shape_body[shape_id]
+    geo_type = shape_type[shape_id]
+
+    # Compute world transform
+    if rigid_id == -1:
+        X_ws = shape_transform[shape_id]
+    else:
+        X_ws = wp.transform_multiply(body_q[rigid_id], shape_transform[shape_id])
+
+    pos = wp.transform_get_translation(X_ws)
+    orientation = wp.transform_get_rotation(X_ws)
+
+    margin = shape_margin[shape_id]
+
+    # Enlarge AABB by per-shape effective gap for contact detection
+    effective_gap = margin + shape_gap[shape_id]
+    margin_vec = wp.vec3(effective_gap, effective_gap, effective_gap)
+
+    # Check if this is an infinite plane or a shape with a pre-computed local AABB
+    scale = shape_scale[shape_id]
+    is_infinite_plane = (geo_type == GeoType.PLANE) and (scale[0] == 0.0 and scale[1] == 0.0)
+    has_local_aabb = geo_type == GeoType.MESH or geo_type == GeoType.HFIELD or geo_type == GeoType.CONVEX_MESH
+
+    geom_scale = scale
+
+    if is_infinite_plane:
+        # Clamp to the half space the plane bounds, replacing a bounding-sphere
+        # fallback whose 1e6 m cube made every shape a permanent ground-plane
+        # candidate. A nearly-aligned normal's surface rises by
+        # (|n_j| + |n_k|) * d / |n_i| at lateral offset d from the anchor, so
+        # bounding d by the reach this AABB itself admits keeps the clamp
+        # conservative for every shape it does not already prune laterally; a
+        # tilted plane's rise exceeds that reach and the bound stays unbounded.
+        normal = wp.quat_rotate(orientation, wp.vec3(0.0, 0.0, 1.0))
+        # Matches compute_shape_radius's infinite-plane radius.
+        HALF_SPACE_EXTENT = 1.0e6
+        half_extents = wp.vec3(HALF_SPACE_EXTENT, HALF_SPACE_EXTENT, HALF_SPACE_EXTENT)
+        lo = pos - half_extents - margin_vec
+        hi = pos + half_extents + margin_vec
+        for i in range(3):
+            n_i = normal[i]
+            # Below this the rise exceeds HALF_SPACE_EXTENT anyway, and the division stays well conditioned.
+            if wp.abs(n_i) > 0.5:
+                lateral = wp.abs(normal[(i + 1) % 3]) + wp.abs(normal[(i + 2) % 3])
+                rise = lateral * HALF_SPACE_EXTENT / wp.abs(n_i)
+                if n_i > 0.0:
+                    hi[i] = wp.min(hi[i], pos[i] + rise + effective_gap)
+                else:
+                    lo[i] = wp.max(lo[i], pos[i] - rise - effective_gap)
+        aabb_lower[shape_id] = lo
+        aabb_upper[shape_id] = hi
+    elif geo_type == GeoType.SPHERE:
+        radius = scale[0]
+        half_extents = wp.vec3(radius, radius, radius)
+        aabb_lower[shape_id] = pos - half_extents - margin_vec
+        aabb_upper[shape_id] = pos + half_extents + margin_vec
+    elif geo_type == GeoType.BOX:
+        # The absolute rotation maps local half-extents to exact world AABB extents.
+        r0 = wp.quat_rotate(orientation, wp.vec3(1.0, 0.0, 0.0))
+        r1 = wp.quat_rotate(orientation, wp.vec3(0.0, 1.0, 0.0))
+        r2 = wp.quat_rotate(orientation, wp.vec3(0.0, 0.0, 1.0))
+        half_extents = wp.vec3(
+            wp.abs(r0[0]) * scale[0] + wp.abs(r1[0]) * scale[1] + wp.abs(r2[0]) * scale[2],
+            wp.abs(r0[1]) * scale[0] + wp.abs(r1[1]) * scale[1] + wp.abs(r2[1]) * scale[2],
+            wp.abs(r0[2]) * scale[0] + wp.abs(r1[2]) * scale[1] + wp.abs(r2[2]) * scale[2],
+        )
+        aabb_lower[shape_id] = pos - half_extents - margin_vec
+        aabb_upper[shape_id] = pos + half_extents + margin_vec
+    elif geo_type == GeoType.CAPSULE:
+        radius = scale[0]
+        half_height = scale[1]
+        axis = wp.quat_rotate(orientation, wp.vec3(0.0, 0.0, 1.0))
+        half_extents = wp.vec3(radius, radius, radius) + wp.abs(axis) * half_height
+        aabb_lower[shape_id] = pos - half_extents - margin_vec
+        aabb_upper[shape_id] = pos + half_extents + margin_vec
+    elif geo_type == GeoType.CYLINDER:
+        radius = scale[0]
+        half_height = scale[1]
+        barrel_radius = scale[2]
+        # Imported MuJoCo site display sizes may use scale[2] without barrel semantics.
+        if barrel_radius >= half_height and barrel_radius > 0.0:
+            radius += (half_height * half_height) / (
+                barrel_radius + wp.sqrt(barrel_radius * barrel_radius - half_height * half_height)
+            )
+        r0 = wp.quat_rotate(orientation, wp.vec3(1.0, 0.0, 0.0))
+        r1 = wp.quat_rotate(orientation, wp.vec3(0.0, 1.0, 0.0))
+        r2 = wp.quat_rotate(orientation, wp.vec3(0.0, 0.0, 1.0))
+        half_extents = wp.vec3(
+            radius * wp.sqrt(r0[0] * r0[0] + r1[0] * r1[0]) + half_height * wp.abs(r2[0]),
+            radius * wp.sqrt(r0[1] * r0[1] + r1[1] * r1[1]) + half_height * wp.abs(r2[1]),
+            radius * wp.sqrt(r0[2] * r0[2] + r1[2] * r1[2]) + half_height * wp.abs(r2[2]),
+        )
+        aabb_lower[shape_id] = pos - half_extents - margin_vec
+        aabb_upper[shape_id] = pos + half_extents + margin_vec
+    elif has_local_aabb:
+        # Pre-computed local AABB transformed to world space.
+        # Scale is already baked into shape_collision_aabb by the builder,
+        # so we only need to handle the rotation here.
+        local_lo = shape_collision_aabb_lower[shape_id]
+        local_hi = shape_collision_aabb_upper[shape_id]
+
+        center = (local_lo + local_hi) * 0.5
+        half = (local_hi - local_lo) * 0.5
+
+        # Rotate center to world frame
+        world_center = wp.quat_rotate(orientation, center) + pos
+
+        # Rotated AABB half-extents via abs of rotation matrix columns
+        r0 = wp.quat_rotate(orientation, wp.vec3(1.0, 0.0, 0.0))
+        r1 = wp.quat_rotate(orientation, wp.vec3(0.0, 1.0, 0.0))
+        r2 = wp.quat_rotate(orientation, wp.vec3(0.0, 0.0, 1.0))
+
+        world_half = wp.vec3(
+            wp.abs(r0[0]) * half[0] + wp.abs(r1[0]) * half[1] + wp.abs(r2[0]) * half[2],
+            wp.abs(r0[1]) * half[0] + wp.abs(r1[1]) * half[1] + wp.abs(r2[1]) * half[2],
+            wp.abs(r0[2]) * half[0] + wp.abs(r1[2]) * half[1] + wp.abs(r2[2]) * half[2],
+        )
+
+        aabb_lower[shape_id] = world_center - world_half - margin_vec
+        aabb_upper[shape_id] = world_center + world_half + margin_vec
+    else:
+        # Use support function to compute tight AABB
+        # Create generic shape data
+        shape_data = GenericShapeData()
+        shape_data.shape_type = geo_type
+        if geo_type == GeoType.PLANE:
+            geom_scale = wp.vec3(scale[0] * 0.5, scale[1] * 0.5, 0.0)
+        shape_data.scale = geom_scale
+        shape_data.auxiliary = wp.vec3(0.0, 0.0, 0.0)
+        shape_data.center = wp.vec3(0.0, 0.0, 0.0)
+
+        # For CONVEX_MESH, pack the mesh pointer
+        if geo_type == GeoType.CONVEX_MESH:
+            shape_data.auxiliary = pack_mesh_ptr(shape_source_ptr[shape_id])
+
+        data_provider = SupportMapDataProvider()
+
+        # Compute tight AABB using helper function
+        aabb_min_world, aabb_max_world = compute_tight_aabb_from_support(shape_data, orientation, pos, data_provider)
+
+        aabb_lower[shape_id] = aabb_min_world - margin_vec
+        aabb_upper[shape_id] = aabb_max_world + margin_vec
+
+    # Narrow-phase geometry data (reuses X_ws and scale already computed above)
+    geom_data[shape_id] = wp.vec4(geom_scale[0], geom_scale[1], geom_scale[2], margin)
+    geom_xform[shape_id] = X_ws
+
+
+@wp.kernel(enable_backward=False)
+def _compute_pair_shape_aabbs(
+    shape_indices: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[int],
+    shape_type: wp.array[int],
+    shape_scale: wp.array[wp.vec3],
+    shape_collision_radius: wp.array[float],
+    shape_source_ptr: wp.array[wp.uint64],
+    shape_margin: wp.array[float],
+    shape_gap: wp.array[float],
+    shape_collision_aabb_lower: wp.array[wp.vec3],
+    shape_collision_aabb_upper: wp.array[wp.vec3],
+    # Fused counter arrays — zeroed by thread 0 to avoid separate kernel launches.
+    contact_counters: wp.array[wp.int32],
+    contact_generation: wp.array[wp.int32],
+    broad_phase_pair_count: wp.array[wp.int32],
+    num_contact_counters: int,
+    # outputs
+    aabb_lower: wp.array[wp.vec3],
+    aabb_upper: wp.array[wp.vec3],
+    geom_data: wp.array[wp.vec4],
+    geom_xform: wp.array[wp.transform],
+):
+    """Prepare the fixed explicit-pair participants without renumbering shapes.
+
+    The per-shape arithmetic mirrors ``compute_shape_aabbs`` verbatim. Keep
+    the full kernel unchanged until exact device replay gates this opt-in path.
+    """
+    work_id = wp.tid()
+
+    # Thread 0: zero contact counters, bump contact generation, and zero the
+    # broad phase candidate-pair count in a single fused step.
+    if work_id == 0:
+        for c in range(num_contact_counters):
+            contact_counters[c] = 0
+        g = contact_generation[0]
+        if g == 2147483647:
+            g = 0
+        else:
+            g = g + 1
+        contact_generation[0] = g
+        broad_phase_pair_count[0] = 0
+
+    # One thread still performs counter maintenance for an empty pair set.
+    if work_id >= shape_indices.shape[0]:
+        return
+    shape_id = shape_indices[work_id]
 
     rigid_id = shape_body[shape_id]
     geo_type = shape_type[shape_id]
@@ -1355,6 +1554,21 @@ class CollisionPipeline:
         """
         Initialize the CollisionPipeline (expert API).
 
+        Experimental performance mode: setting the environment variable
+        ``NEWTON_NARROW_PHASE_PAIR_SHAPE_PREP=1`` before construction prepares
+        geometry only for the fixed explicit pair list. In this opt-in mode,
+        only shape IDs in ``pipeline.prepared_shape_indices`` have current
+        entries in ``geom_data``, ``geom_transform``, and
+        ``pipeline.narrow_phase.shape_aabb_lower/upper`` after ``collide``.
+        Other entries are unspecified and must not be consumed. Shape IDs,
+        pairs, and contact ordering are not remapped. The pair list must not
+        change during the pipeline lifetime; rebuild after changing it.
+        The exposed ``prepared_shape_indices`` array is read-only by contract
+        and must not be modified or replaced during the pipeline lifetime.
+        This mode requires internal explicit broad/narrow phases, no particles,
+        no hydroelastic or speculative contacts, and no gradients. The default
+        remains full preparation, including unpaired and visual-only shapes.
+
         Args:
             model: The simulation model.
             reduce_contacts: Ordinary rigid-contact reduction policy.  A bool
@@ -1545,6 +1759,11 @@ class CollisionPipeline:
         shape_count = model.shape_count
         device = model.device
         using_expert_components = broad_phase_instance is not None or narrow_phase is not None
+        pair_shape_prep = os.environ.get("NEWTON_NARROW_PHASE_PAIR_SHAPE_PREP", "0")
+        if pair_shape_prep not in ("0", "1"):
+            raise ValueError("NEWTON_NARROW_PHASE_PAIR_SHAPE_PREP must be 0 or 1")
+        self._pair_shape_prep = pair_shape_prep == "1"
+        self.prepared_shape_indices = None
 
         # Resolve rigid contact capacity with explicit > model > estimated precedence.
         model_rigid_contact_max = int(getattr(model, "rigid_contact_max", 0) or 0)
@@ -1926,6 +2145,26 @@ class CollisionPipeline:
                 "narrow_phase.shape_aabb_upper must have one entry per model shape "
                 f"(expected {shape_count}, got {self.narrow_phase.shape_aabb_upper.shape[0]})"
             )
+
+        if self._pair_shape_prep:
+            if (
+                using_expert_components
+                or self.broad_phase_mode != "explicit"
+                or model.particle_count != 0
+                or self.hydroelastic_sdf is not None
+                or self._speculative_enabled
+                or requires_grad
+            ):
+                raise ValueError(
+                    "NEWTON_NARROW_PHASE_PAIR_SHAPE_PREP=1 requires internal explicit broad/narrow phases, "
+                    "no particles, no hydroelastic or speculative contacts, and no gradients"
+                )
+            # The explicit-pair constructor contract already prohibits pair mutation.
+            # Do not intersect with shape flags: explicit pairs are authoritative.
+            pair_indices = np.unique(self.shape_pairs_filtered.numpy().reshape(-1))
+            if np.any(pair_indices < 0) or np.any(pair_indices >= shape_count):
+                raise ValueError("Explicit pair shape IDs must be within model.shape_count")
+            self.prepared_shape_indices = wp.array(pair_indices, dtype=wp.int32, device=device)
 
         # Built here (not in finalize) so models/tasks that never collide don't pay for it.
         # Host-side, so not graph-capture-safe -- construct the pipeline before any capture.
@@ -2462,10 +2701,18 @@ class CollisionPipeline:
 
         # Compute AABBs for all shapes, zero counters, bump generation.
         # Fuses contacts.clear() + broad_phase_pair_count.zero_() + AABB update.
+        aabb_kernel = compute_shape_aabbs
+        aabb_dim = model.shape_count
+        aabb_index_inputs = []
+        if self._pair_shape_prep:
+            aabb_kernel = _compute_pair_shape_aabbs
+            aabb_dim = max(1, len(self.prepared_shape_indices)) if model.shape_count else 0
+            aabb_index_inputs = [self.prepared_shape_indices]
         wp.launch(
-            kernel=compute_shape_aabbs,
-            dim=model.shape_count,
+            kernel=aabb_kernel,
+            dim=aabb_dim,
             inputs=[
+                *aabb_index_inputs,
                 state.body_q,
                 model.shape_transform,
                 model.shape_body,

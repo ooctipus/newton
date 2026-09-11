@@ -43,6 +43,7 @@ class TestFeatherPGSDenseRowBudgetFactory(unittest.TestCase):
         state = SimpleNamespace(
             _pgs_solve_tiled_row_kernel=object(),
             _pgs_solve_tiled_row_budgets=(),
+            _pgs_solve_tiled_row_register_kernels=(),
             world_count=17,
             model=SimpleNamespace(device="mock-device"),
             pgs_iterations=8,

@@ -42,6 +42,7 @@ from ..semi_implicit.kernels_particle import (
     eval_triangle_forces,
 )
 from ..solver import SolverBase
+from .dense_row_state import get_dense_row_state_kernel
 from .fused_dynamics import fused_dynamics_launch_shape, get_fused_dynamics_kernel, template_supported
 from .grouped_dynamics import (
     GroupedTopology,
@@ -184,6 +185,7 @@ from .kernels import (
     remove_free_root_transport_from_qdd,
     reset_world_warmstart_buffers,
     rhs_accum_world_par_art,
+    rhs_accum_world_par_row,
     scatter_qdd_from_groups,
     snapshot_dense_phase_bound,
     snapshot_dense_prev_slots,
@@ -238,6 +240,7 @@ _GROUPED_HINV_MAX = int(
     os.environ.get("FEATHER_PGS_GROUPED_HINV_MAX", "32")
 )  # grouped response solve for DOF sizes up to this
 _INK_ON = os.environ.get("FEATHER_PGS_INK") == "1"
+_REGISTER_WHITENING = os.environ.get("FEATHER_PGS_REGISTER_WHITENING") == "1"
 _WR_ON = os.environ.get("FEATHER_PGS_WORLD_ROWS") == "1"  # experiment: contact rows built inside the sweep kernel
 _WR_CHECK = os.environ.get("FEATHER_PGS_WORLD_ROWS_CHECK") == "1"
 _WR_WARM = (
@@ -845,6 +848,18 @@ class SolverFeatherPGS(SolverBase):
     rebound velocity is used for the whole step; this gives the intended
     post-impact velocity but a first-order, impact-phase-dependent position
     offset. Reduce the timestep when substep impact position matters.
+
+    Experimental performance modes are disabled by default. Set
+    ``FEATHER_PGS_DENSE_ROW_BUDGETS=1`` and
+    ``FEATHER_PGS_DENSE_ROW_REGISTERS=1`` before construction to retain row
+    state in registers in the CUDA, 64-row-capacity ``tiled_row`` path.
+    Other capacities, CPU execution and other sweep mappings retain their
+    existing implementation. Set ``FEATHER_PGS_REGISTER_WHITENING=1`` before
+    importing Newton to enable register whitening for the measured 18-DOF,
+    32/48-row matrix-free world-row layouts on CUDA architectures 103/120.
+    Unsupported whitening configurations retain the existing implementation.
+    These modes preserve the selected solver formulation and iteration policy;
+    they do not imply equivalence between different solver formulations.
 
     """
 
@@ -5319,6 +5334,7 @@ class SolverFeatherPGS(SolverBase):
 
         self._pgs_solve_tiled_row_kernel = None
         self._pgs_solve_tiled_row_budgets = ()
+        self._pgs_solve_tiled_row_register_kernels = ()
         self._pgs_solve_tiled_contact_kernel = None
         self._pgs_solve_streaming_kernel = None
         if self.dense_max_constraints > 0:
@@ -5337,6 +5353,11 @@ class SolverFeatherPGS(SolverBase):
                         _get_pgs_solve_tiled_row_kernel(64, device_arch, row_budget=budget, min_rows=minimum)
                         for budget, minimum in ((32, 0), (64, 32))
                     )
+                    if os.environ.get("FEATHER_PGS_DENSE_ROW_REGISTERS") == "1":
+                        self._pgs_solve_tiled_row_register_kernels = tuple(
+                            get_dense_row_state_kernel(device_arch, 2, row_budget=budget) for budget in (32, 64)
+                        )
+                        self._pgs_solve_tiled_row_budgets = self._pgs_solve_tiled_row_register_kernels
             elif self.pgs_kernel == "tiled_contact":
                 self._pgs_solve_tiled_contact_kernel = _get_pgs_solve_tiled_contact_kernel(
                     self.dense_max_constraints, device_arch
@@ -13022,9 +13043,10 @@ class SolverFeatherPGS(SolverBase):
         n_arts = self.n_arts_by_size[size]
         if velocity is None:
             velocity = self.v_hat
+        parallel_rows = model.device.is_cuda and not model.requires_grad and self._is_one_solve_art_per_world
         wp.launch(
-            rhs_accum_world_par_art,
-            dim=n_arts,
+            rhs_accum_world_par_row if parallel_rows else rhs_accum_world_par_art,
+            dim=n_arts * self.dense_max_constraints if parallel_rows else n_arts,
             inputs=[
                 self.constraint_count,
                 self.dense_max_constraints,
@@ -13160,9 +13182,10 @@ class SolverFeatherPGS(SolverBase):
         if pgs_kernel is None:
             raise RuntimeError("Tiled row PGS kernel is unavailable for this solver shape")
         for kernel in self._pgs_solve_tiled_row_budgets or (pgs_kernel,):
+            worlds_per_block = 2 if kernel in self._pgs_solve_tiled_row_register_kernels else 1
             wp.launch_tiled(
                 kernel,
-                dim=[self.world_count],
+                dim=[(self.world_count + worlds_per_block - 1) // worlds_per_block],
                 inputs=[
                     self.constraint_count,
                     self.diag,
@@ -13177,7 +13200,7 @@ class SolverFeatherPGS(SolverBase):
                     self._pgs_friction_start_iteration,
                     self._pgs_iteration_offset,
                 ],
-                block_dim=32,
+                block_dim=32 * worlds_per_block,
                 device=self.model.device,
             )
 
@@ -25045,6 +25068,48 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_incremental_template)
 
 
+def _parallel_register_whitening_mode(
+    *,
+    enabled: bool,
+    device_arch: int | str,
+    rows: int,
+    max_world_dofs: int,
+    matrix_free: bool,
+    inkernel_response: tuple[int, int, int, int] | None,
+    world_rows: bool,
+    exact_row_sums: bool,
+    has_drive_rows: bool = False,
+    has_dense_velocity_limit_rows: bool = False,
+    nesterov: bool = True,
+    sweeps: int = 24,
+    warm_start: bool = False,
+    debug: bool = False,
+) -> int:
+    """Select only measured layouts: 0 original, 1 register rows, 2 shared L/Z overlay."""
+    if (
+        not enabled
+        or rows not in (32, 48)
+        or max_world_dofs != 18
+        or inkernel_response != (18, 0, 0, 0)
+        or not (matrix_free and world_rows and exact_row_sums)
+        or has_drive_rows
+        or has_dense_velocity_limit_rows
+        or not nesterov
+        or sweeps != 24
+        or warm_start
+        or debug
+        or not isinstance(device_arch, (int, str))
+    ):
+        return 0
+    try:
+        arch = int(device_arch)
+    except ValueError:
+        return 0
+    if arch not in (103, 120):
+        return 0
+    return 2 if rows == 32 and arch == 103 else 1
+
+
 def _get_pgs_solve_parallel_kernel(
     max_constraints: int,
     mf_max_constraints: int,
@@ -25160,6 +25225,24 @@ def _get_pgs_solve_parallel_kernel(
         else ""
     )
     WR_CHECK = 1 if (WR and _WR_CHECK) else 0
+    whitening_mode = _parallel_register_whitening_mode(
+        enabled=_REGISTER_WHITENING,
+        device_arch=device_arch,
+        rows=AM,
+        max_world_dofs=D,
+        matrix_free=bool(MF),
+        inkernel_response=(NA, NB, OA, OB) if INK else None,
+        world_rows=bool(WR),
+        exact_row_sums=bool(EXACT),
+        has_drive_rows=has_drive_rows,
+        has_dense_velocity_limit_rows=has_dense_velocity_limit_rows,
+        nesterov=nesterov,
+        sweeps=NSWEEPS,
+        warm_start=bool(WW),
+        debug=bool(INK_CHECK or WR_CHECK or STOP or LEAN or BF),
+    )
+    register_whitening = whitening_mode != 0
+    whitening_overlay = whitening_mode == 2
     ink_stage = f"""    // In-kernel response in whitened coordinates: Z_i = L^-1 J_i^T per row (forward substitution in place with the
     // Cholesky factors staged in shared memory). A = Z^T Z, so the sweep needs neither J nor Y = H^-1 J^T; the
     // velocity update is recovered at the end with one backward substitution on the accumulated D-vector.
@@ -25293,6 +25376,34 @@ def _get_pgs_solve_parallel_kernel(
 #endif
     }}
 """
+    if register_whitening:
+        # Keep each row in its existing Jr registers during the triangular solve.
+        # Volatile factors prevent the fully unrolled recurrence from hoisting
+        # all 153 coefficients; the ascending multiply-subtract order is unchanged.
+        whitening = ["        {", "            const volatile float* Lg = s_L;"]
+        for a in range(NA):
+            whitening.append(f"            float z{a} = Jr[{a}];")
+            whitening.extend(f"            z{a} -= Lg[{a * NA + k}] * Jr[{k}];" for k in range(a))
+            whitening.append(f"            Jr[{a}] = z{a} * s_Dinv[{a}];")
+        whitening.append("        }\n")
+        start = ink_stage.index("        {\n            const float* Lg = s_L;")
+        end = ink_stage.index(f"        if ({NB} > 0 && ink_gb >= 0) {{", start)
+        ink_stage = ink_stage[:start] + "\n".join(whitening) + ink_stage[end:]
+        old_row = "        float* Zi = &s_Yt[i];\n        constexpr int ZS = YS;"
+        assert ink_stage.count(old_row) == 1
+        ink_stage = ink_stage.replace(old_row, "        float* Zi = Jr;\n        constexpr int ZS = 1;")
+        old_publish = (
+            f"        for (int d = 0; d < {D}; ++d) Jr[d] = Zi[d * ZS];   // Jr holds this lane's row of Z from here on"
+        )
+        assert ink_stage.count(old_publish) == 1
+        publication = f"        for (int d = 0; d < {D}; ++d) s_Yt[d * YS + i] = Jr[d];"
+        if whitening_overlay:
+            ink_stage = ink_stage.replace(
+                old_publish, "        // Publish only after every row has finished reading the shared factor."
+            )
+            ink_stage += f"    SYNC();\n    if (lane < n_rows) {{ const int i = lane;\n{publication}\n    }}\n"
+        else:
+            ink_stage = ink_stage.replace(old_publish, publication)
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const unsigned MASK = 0xFFFFFFFF;
@@ -25823,6 +25934,19 @@ def _get_pgs_solve_parallel_kernel(
 #undef SYNC
 #endif
 """
+    if whitening_overlay:
+        old_factor = f"    __shared__ float s_L[{INK} ? ({NA} * {NA} + ({NB} > 0 ? {NB} * {NB} : 1)) : 1];  // in-kernel response: Cholesky factors"
+        assert snippet.count(old_factor) == 1
+        snippet = snippet.replace(
+            old_factor, "    float* s_L = s_Yt;  // L and Z occupy disjoint phases of this shared allocation"
+        )
+        reconstruct = f"    SYNC();\n    if (lane == 0) {{\n        for (int a = {NA} - 1; a >= 0; --a) {{"
+        assert snippet.count(reconstruct) == 1
+        reloaded = (
+            f"    SYNC();\n    for (int e = lane; e < {NA} * {NA}; e += NT) "
+            f"s_L[e] = ink_L_a.data[(size_t)ink_ga * {NA} * {NA} + e];\n" + reconstruct
+        )
+        snippet = snippet.replace(reconstruct, reloaded)
 
     @wp.func_native(snippet)
     def pgs_solve_parallel_native(
@@ -26140,6 +26264,7 @@ def _get_pgs_solve_parallel_kernel(
         + (f"_lean{LEAN}" if LEAN else "")
         + ("_ww" if WW else "")
         + ("_bf" if BF else "")
+        + ("_rw2" if whitening_overlay else "_rw1" if register_whitening else "")
     )
     if skip_local_internal_worlds:
         name += "_local_fallback"

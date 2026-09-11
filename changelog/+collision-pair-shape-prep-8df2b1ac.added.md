@@ -1,0 +1,1 @@
+Add experimental explicit-pair shape preparation with `NEWTON_NARROW_PHASE_PAIR_SHAPE_PREP=1`; only `CollisionPipeline.prepared_shape_indices` have current narrow-phase AABB and geometry entries in this default-off mode, which requires a fixed pair list, internal collision components, no particles, no hydroelastic or speculative contacts, and no gradients.

@@ -5753,6 +5753,39 @@ def rhs_accum_world_par_art(
         wp.atomic_add(world_rhs, world, c, jv)  # Add J*v (positive)
 
 
+@wp.kernel(enable_backward=False, module="unique")
+def rhs_accum_world_par_row(
+    world_constraint_count: wp.array[int],
+    max_constraints: int,
+    art_to_world: wp.array[int],
+    art_dof_start: wp.array[int],
+    v_hat: wp.array[float],
+    group_to_art: wp.array[int],
+    J_group: wp.array3d[float],
+    n_dofs: int,
+    world_rhs: wp.array2d[float],
+):
+    """Accumulate independent rows without changing their serial DOF reduction.
+
+    Use only when each world has one solve articulation. Multiple articulation
+    writers retain the original mapping and its atomic accumulation order.
+    """
+    tid = wp.tid()
+    idx = tid // max_constraints
+    c = tid - idx * max_constraints
+    art = group_to_art[idx]
+    world = art_to_world[art]
+    n_constraints = world_constraint_count[world]
+    if c >= n_constraints:
+        return
+    dof_start = art_dof_start[art]
+    jv = float(0.0)
+    for d in range(n_dofs):
+        jv += J_group[idx, c, d] * v_hat[dof_start + d]
+    # Retain CUDA atomic floating-point semantics, including denormal handling.
+    wp.atomic_add(world_rhs, world, c, jv)
+
+
 @wp.kernel
 def prepare_world_impulses(
     world_constraint_count: wp.array[int],
