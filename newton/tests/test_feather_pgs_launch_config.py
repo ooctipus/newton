@@ -450,6 +450,21 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         q = np.tile(np.concatenate((np.full(16, -0.105), np.full(3, 0.205))).astype(np.float32), 2)
         qd = np.tile(np.concatenate((np.full(16, -0.2), np.full(3, 0.1))).astype(np.float32), 2)
         trajectories = []
+        original_launch = wp.launch
+        cleared_shapes = {id(optimized): [], id(reference): []}
+
+        def checked_launch(kernel, *args, **kwargs):
+            if kernel is feather_pgs_kernels.clear_grouped_jacobian_active_rows:
+                jacobian = kwargs["outputs"][0]
+                group_to_art, _, _, dofs, rows = kwargs["inputs"]
+                self.assertEqual(
+                    jacobian.shape,
+                    (group_to_art.shape[0], rows, dofs),
+                    "Dense maintenance must not write the sparse response placeholder",
+                )
+                cleared_shapes[id(solver)].append(jacobian.shape)
+            return original_launch(kernel, *args, **kwargs)
+
         for solver in (optimized, reference):
             state_in, state_out = model.state(), model.state()
             state_in.joint_q.assign(q)
@@ -459,10 +474,22 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             history = []
             for _ in range(3):
                 state_in.clear_forces()
-                solver.step(state_in, state_out, control, None, 1.0 / 120.0)
+                # Fail before dispatching an invalid write, so this regression
+                # can safely diagnose the old four-byte placeholder bug.
+                with mock.patch.object(wp, "launch", side_effect=checked_launch):
+                    solver.step(state_in, state_out, control, None, 1.0 / 120.0)
                 state_in, state_out = state_out, state_in
                 history.append((state_in.joint_q.numpy().copy(), state_in.joint_qd.numpy().copy()))
+                if solver is optimized:
+                    # Order snapshots after maintenance on its owning stream.
+                    with wp.ScopedStream(solver._memset_stream):
+                        for buffers in solver._J_bufs:
+                            np.testing.assert_array_equal(buffers[16].numpy(), np.zeros((1, 1, 1), dtype=np.float32))
+                            self.assertFalse(np.any(buffers[3].numpy()), "Dense Jacobian maintenance was skipped")
             trajectories.append(history)
+
+        self.assertEqual(cleared_shapes[id(optimized)], [(2, 64, 3)] * 3)
+        self.assertCountEqual(cleared_shapes[id(reference)], [(2, 64, 16), (2, 64, 3)] * 3)
 
         first_q, first_qd = trajectories[0][0]
         np.testing.assert_allclose(first_q.reshape(2, 19)[:, :16], -0.104, rtol=0.0, atol=2.0e-6)

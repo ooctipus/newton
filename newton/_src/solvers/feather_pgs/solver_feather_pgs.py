@@ -8967,6 +8967,9 @@ class SolverFeatherPGS(SolverBase):
                     for size in self.size_groups:
                         if self._mass_update_global_flag:
                             self._H_bufs[self._buf_idx][size].zero_()
+                        if self._sparse_diagonal_contact_solve and size == self._sparse_diagonal_response_size:
+                            # Sparse response owns no dense J; its buffer is a one-float placeholder.
+                            continue
                         if _SKIP_J_CLEAR and (_ROWS_MASKED or _ROWS_NATIVE) and size <= 32:
                             continue
                         wp.launch(
