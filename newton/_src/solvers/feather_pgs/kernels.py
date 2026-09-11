@@ -2828,6 +2828,7 @@ def build_joint_limit_rows_for_size(
     max_constraints: int,
     pgs_beta: float,
     pgs_cfm: float,
+    resolved_worlds: wp.array[int],
     # outputs
     world_slot_counter: wp.array[int],
     J_group: wp.array3d[float],
@@ -2843,6 +2844,8 @@ def build_joint_limit_rows_for_size(
     group_idx = wp.tid()
     art = group_to_art[group_idx]
     world = art_to_world[art]
+    if world >= 0 and world < resolved_worlds.shape[0] and resolved_worlds[world] != 0:
+        return
     dof_start = articulation_dof_start[art]
 
     for j in range(articulation_start[art], articulation_start[art + 1]):
@@ -3946,6 +3949,7 @@ def allocate_world_contact_slots(
     contact_friction_anchor_limit: int,
     contact_friction_articulation_pairs_only: int,
     row_capacity_telemetry: int,
+    resolved_worlds: wp.array[int],
     # outputs
     contact_world: wp.array[int],
     contact_slot: wp.array[int],
@@ -3978,6 +3982,27 @@ def allocate_world_contact_slots(
         return
 
     for c in range(thread, total_contacts, total_num_threads):
+        if resolved_worlds.shape[0] > 0:
+            shape_a = contact_shape0[c]
+            shape_b = contact_shape1[c]
+            body_a = shape_body[shape_a] if shape_a >= 0 else -1
+            body_b = shape_body[shape_b] if shape_b >= 0 else -1
+            art_a = body_to_articulation[body_a] if body_a >= 0 else -1
+            art_b = body_to_articulation[body_b] if body_b >= 0 else -1
+            world_a = art_to_world[art_a] if art_a >= 0 else -1
+            world_b = art_to_world[art_b] if art_b >= 0 else -1
+            world = world_a if world_a >= 0 else world_b
+            same_world = world_a < 0 or world_b < 0 or world_a == world_b
+            if same_world and world >= 0 and world < resolved_worlds.shape[0] and resolved_worlds[world] != 0:
+                # Refresh every active mapping each solve. The original force
+                # converter publishes zero before reading any row for this path.
+                contact_world[c] = world
+                contact_art_a[c] = art_a
+                contact_art_b[c] = art_b
+                contact_slot[c] = -1
+                contact_path[c] = -1
+                contact_slots_needed[c] = 0
+                continue
         _allocate_world_contact_slot(
             c,
             total_contacts,
@@ -6885,6 +6910,7 @@ def allocate_rigid_velocity_limit_slots(
     joint_qd: wp.array[float],
     velocity_limit_activation_fraction: float,
     mf_max_constraints: int,
+    resolved_worlds: wp.array[int],
     # outputs
     rigid_velocity_limit_slot: wp.array[int],
     rigid_velocity_limit_sign: wp.array[float],
@@ -6925,6 +6951,8 @@ def allocate_rigid_velocity_limit_slots(
 
     world = art_to_world[art]
     if world < 0:
+        return
+    if world < resolved_worlds.shape[0] and resolved_worlds[world] != 0:
         return
 
     lin_limit = rigid_body_max_linear_velocity[body]

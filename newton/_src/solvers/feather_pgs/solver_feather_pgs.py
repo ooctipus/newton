@@ -241,6 +241,7 @@ _GROUPED_HINV_MAX = int(
 )  # grouped response solve for DOF sizes up to this
 _INK_ON = os.environ.get("FEATHER_PGS_INK") == "1"
 _REGISTER_WHITENING = os.environ.get("FEATHER_PGS_REGISTER_WHITENING") == "1"
+_SIMPLE_WORLD_ZERO = os.environ.get("FEATHER_PGS_SIMPLE_WORLD_ZERO") == "1"
 _WR_ON = os.environ.get("FEATHER_PGS_WORLD_ROWS") == "1"  # experiment: contact rows built inside the sweep kernel
 _WR_CHECK = os.environ.get("FEATHER_PGS_WORLD_ROWS_CHECK") == "1"
 _WR_WARM = (
@@ -2361,6 +2362,14 @@ class SolverFeatherPGS(SolverBase):
             )
 
         self._init_double_buffer_stream()
+
+        self._simple_world_classifier = None
+        self._resolved_simple_worlds = wp.empty(0, dtype=wp.int32, device=model.device)
+        if _SIMPLE_WORLD_ZERO:
+            from .simple_world import SimpleWorldClassifier  # noqa: PLC0415 - optional experimental dispatcher
+
+            self._simple_world_classifier = SimpleWorldClassifier(self)
+            self._resolved_simple_worlds = self._simple_world_classifier.resolved
 
     def _update_kinematic_state(self) -> None:
         """Refresh cached kinematic flags and effective joint armature."""
@@ -8354,6 +8363,8 @@ class SolverFeatherPGS(SolverBase):
         # STAGE 4: Build contact problem
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S4_ContactBuild", print=False, use_nvtx=self._nvtx, synchronize=False):
+            if self._simple_world_classifier is not None:
+                self._simple_world_classifier.classify(state_in, state_aug, contacts, dt)
             self._stage4_build_rows(state_in, state_aug, control, contacts, dt)
 
         if self.pgs_mode == "matrix_free":
@@ -10930,6 +10941,7 @@ class SolverFeatherPGS(SolverBase):
                             max_constraints,
                             self.pgs_beta,
                             self.pgs_cfm,
+                            self._resolved_simple_worlds,
                         ],
                         outputs=[
                             self.slot_counter,
@@ -10965,6 +10977,7 @@ class SolverFeatherPGS(SolverBase):
                             max_constraints,
                             self.pgs_beta,
                             self.pgs_cfm,
+                            self._resolved_simple_worlds,
                         ],
                         outputs=[
                             self.slot_counter,
@@ -11131,6 +11144,7 @@ class SolverFeatherPGS(SolverBase):
                     self.contact_friction_anchor_limit,
                     1 if self.contact_friction_articulation_pairs_only else 0,
                     1 if self._row_watermark else 0,
+                    self._resolved_simple_worlds,
                 ],
                 outputs=[
                     self.contact_world,
@@ -12101,6 +12115,7 @@ class SolverFeatherPGS(SolverBase):
                     self.v_hat,
                     self.velocity_limit_activation_fraction,
                     self.mf_max_constraints,
+                    self._resolved_simple_worlds,
                 ],
                 outputs=[
                     self.rigid_velocity_limit_slot,
@@ -13926,6 +13941,7 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
 
     const int articulation = group_to_art.data[group_idx];
     const int world = art_to_world.data[articulation];
+    if (world >= 0 && world < resolved_worlds.shape[0] && resolved_worlds.data[world] != 0) return;
     const int dof_start = articulation_dof_start.data[articulation];
     for (int base = 0; base < {2 * size}; base += 32) {{
         const int candidate = base + lane;
@@ -13982,6 +13998,7 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
         max_constraints: int,
         pgs_beta: float,
         pgs_cfm: float,
+        resolved_worlds: wp.array[int],
         world_slot_counter: wp.array[int],
         J_group: wp.array3d[float],
         world_row_type: wp.array2d[int],
@@ -14006,6 +14023,7 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
         max_constraints: int,
         pgs_beta: float,
         pgs_cfm: float,
+        resolved_worlds: wp.array[int],
         world_slot_counter: wp.array[int],
         J_group: wp.array3d[float],
         world_row_type: wp.array2d[int],
@@ -14031,6 +14049,7 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
             max_constraints,
             pgs_beta,
             pgs_cfm,
+            resolved_worlds,
             world_slot_counter,
             J_group,
             world_row_type,

@@ -13,6 +13,7 @@ import newton
 from newton._src.solvers.feather_pgs.kernels import (
     allocate_world_contact_slots,
     apply_world_contact_restitution_accumulated,
+    compute_contact_linear_force_from_impulses,
     compute_mf_effective_mass_and_rhs,
     compute_propagation_effective_mass_and_rhs,
     compute_world_contact_bias,
@@ -39,6 +40,7 @@ def _launch_contact_allocator(
     friction_gap: float = float("inf"),
     friction_anchors: int = 0,
     friction_pairs_only: bool = False,
+    resolved: bool = False,
 ):
     """Allocate one contact and return its route metadata and counters."""
     device = "cpu"
@@ -98,6 +100,7 @@ def _launch_contact_allocator(
             friction_anchors,
             int(friction_pairs_only),
             0,
+            wp.array([int(resolved)], dtype=wp.int32, device=device),
         ],
         outputs=[
             outputs["world"],
@@ -179,6 +182,7 @@ def _launch_articulation_pair_contact_allocator(
             friction_anchors,
             int(friction_pairs_only),
             0,
+            wp.empty(0, dtype=wp.int32, device=device),
         ],
         outputs=[
             wp.full((1,), -9, dtype=wp.int32, device=device),
@@ -515,6 +519,67 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
 
 
 class TestFeatherPGSContactControls(unittest.TestCase):
+    def test_skipped_contact_publishes_zero_without_reading_stale_rows(self):
+        """An invalidated mapping must clear a previous force even with poisoned rows."""
+        device = "cpu"
+        force = wp.full(1, wp.vec3(91.0), dtype=wp.vec3, device=device)
+        integers = wp.array([-1], dtype=wp.int32, device=device)
+        poisoned = wp.full((1, 1), float("nan"), dtype=wp.float32, device=device)
+        row_metadata = wp.full((1, 1), -91, dtype=wp.int32, device=device)
+        wp.launch(
+            compute_contact_linear_force_from_impulses,
+            dim=1,
+            inputs=[
+                wp.array([1], dtype=wp.int32, device=device),
+                wp.full(1, wp.vec3(float("nan")), dtype=wp.vec3, device=device),
+                integers,
+                integers,
+                integers,
+                poisoned,
+                poisoned,
+                poisoned,
+                integers,
+                integers,
+                integers,
+                row_metadata,
+                row_metadata,
+                row_metadata,
+                row_metadata,
+                row_metadata,
+                row_metadata,
+                1,
+                240.0,
+            ],
+            outputs=[force],
+            device=device,
+        )
+        np.testing.assert_array_equal(force.numpy(), np.zeros((1, 3), dtype=np.float32))
+
+    def test_resolved_world_skips_all_contact_routes_and_refreshes_mapping(self):
+        """Zero-world allocation must overwrite stale mappings without producing rows."""
+        for route in (PATH_DENSE, PATH_MATRIX_FREE, PATH_PROPAGATION):
+            with self.subTest(route=route):
+                fallback = _launch_contact_allocator(route=route, gap=-0.01, gate=0.0)
+                self.assertGreaterEqual(fallback["slot"], 0)
+                self.assertEqual(fallback["path"], route)
+                skipped = _launch_contact_allocator(route=route, gap=float("nan"), gate=0.0, resolved=True)
+                self.assertEqual(skipped["world"], 0)
+                self.assertEqual(skipped["art_a"], 0)
+                self.assertEqual(skipped["art_b"], -1)
+                self.assertEqual(skipped["slot"], -1)
+                self.assertEqual(skipped["path"], -1)
+                self.assertEqual(skipped["slots_needed"], 0)
+                for name in (
+                    "dense_count",
+                    "mf_count",
+                    "propagation_count",
+                    "dense_world_flag",
+                    "dense_dropped",
+                    "mf_dropped",
+                    "propagation_dropped",
+                ):
+                    self.assertEqual(skipped[name], 0, name)
+
     def test_compact_contact_builder_matches_tree_walk(self):
         """Match dense Jacobians and metadata for a same-articulation contact."""
         serial, compact = _launch_dense_contact_builders()

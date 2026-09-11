@@ -67,6 +67,7 @@ class TestFeatherPGSJointLimitWarp(unittest.TestCase):
                 max_constraints,
                 0.2,
                 1.0e-6,
+                wp.empty(0, dtype=wp.int32, device=device),
             ],
             outputs=list(scalar),
             device=device,
@@ -91,6 +92,7 @@ class TestFeatherPGSJointLimitWarp(unittest.TestCase):
                 max_constraints,
                 0.2,
                 1.0e-6,
+                wp.empty(0, dtype=wp.int32, device=device),
             ],
             outputs=list(parallel),
             block_dim=32 * warps_per_block,
@@ -100,6 +102,38 @@ class TestFeatherPGSJointLimitWarp(unittest.TestCase):
 
         for parallel_array, scalar_array in zip(parallel, scalar, strict=True):
             np.testing.assert_array_equal(parallel_array.numpy(), scalar_array.numpy())
+
+        # Mixed decisions share a block: returning resolved warps must leave
+        # neighboring fallback warps' ballots and row order unchanged.
+        resolved = np.arange(articulation_count) % 3 == 0
+        mixed = _outputs(articulation_count, max_constraints, size, device)
+        wp.launch_tiled(
+            kernel,
+            dim=[(articulation_count + warps_per_block - 1) // warps_per_block],
+            inputs=[
+                articulation_count,
+                articulation_dof_start,
+                art_to_world,
+                group_to_art,
+                wp.array(np.arange(dof_count), dtype=wp.int32, device=device),
+                lower,
+                upper,
+                joint_q,
+                0.25,
+                max_constraints,
+                0.2,
+                1.0e-6,
+                wp.array(resolved.astype(np.int32), dtype=wp.int32, device=device),
+            ],
+            outputs=list(mixed),
+            block_dim=32 * warps_per_block,
+            device=device,
+        )
+        wp.synchronize_device(device)
+        for actual, original in zip(mixed, scalar, strict=True):
+            expected = original.numpy()
+            expected[resolved] = 0
+            np.testing.assert_array_equal(actual.numpy(), expected)
 
 
 if __name__ == "__main__":

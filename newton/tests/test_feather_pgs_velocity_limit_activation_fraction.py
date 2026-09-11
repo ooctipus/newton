@@ -48,10 +48,12 @@ def _allocated_joint_velocity_slots(qd: float, *, fraction: float, qdot_max: flo
     )
 
 
-def _allocated_rigid_velocity_slots(qd6, *, fraction: float, lin_limit: float = 1.0, ang_limit: float = 1.0):
+def _allocated_rigid_velocity_slots(
+    qd6, *, fraction: float, lin_limit: float = 1.0, ang_limit: float = 1.0, resolved: bool = False
+):
     device = "cpu"
-    rigid_velocity_limit_slot = wp.full((12,), -1, dtype=wp.int32, device=device)
-    rigid_velocity_limit_sign = wp.zeros((12,), dtype=wp.float32, device=device)
+    rigid_velocity_limit_slot = wp.full((12,), 91, dtype=wp.int32, device=device)
+    rigid_velocity_limit_sign = wp.full((12,), 19.0, dtype=wp.float32, device=device)
     mf_slot_counter = wp.zeros((1,), dtype=wp.int32, device=device)
 
     wp.launch(
@@ -69,6 +71,7 @@ def _allocated_rigid_velocity_slots(qd6, *, fraction: float, lin_limit: float = 
             wp.array(list(qd6), dtype=wp.float32, device=device),
             fraction,
             64,
+            wp.array([int(resolved)], dtype=wp.int32, device=device),
         ],
         outputs=[rigid_velocity_limit_slot, rigid_velocity_limit_sign, mf_slot_counter],
         device=device,
@@ -81,6 +84,13 @@ def _allocated_rigid_velocity_slots(qd6, *, fraction: float, lin_limit: float = 
 
 
 class TestFeatherPGSVelocityLimitActivationFraction(unittest.TestCase):
+    def test_resolved_world_clears_stale_rigid_slots_without_allocating(self):
+        """Resolved worlds leave no stale velocity-limit publication metadata."""
+        slots, signs, count = _allocated_rigid_velocity_slots([0.0] * 6, fraction=0.0, resolved=True)
+        self.assertEqual(slots, [-1] * 12)
+        self.assertEqual(signs, [0.0] * 12)
+        self.assertEqual(count, 0)
+
     def test_solver_rejects_invalid_velocity_limit_activation_fraction(self):
         model = newton.ModelBuilder().finalize()
 

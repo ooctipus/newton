@@ -19,7 +19,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 from newton.solvers import SolverFeatherPGS
 
 
-def _built_rows(q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0):
+def _built_rows(q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0, resolved: bool = False):
     device = "cpu"
     max_constraints = 8
     world_slot_counter = wp.zeros((1,), dtype=wp.int32, device=device)
@@ -51,6 +51,7 @@ def _built_rows(q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0
             max_constraints,
             0.2,
             0.0,
+            wp.array([int(resolved)], dtype=wp.int32, device=device),
         ],
         outputs=[
             world_slot_counter,
@@ -235,6 +236,13 @@ def _run_joint_limit_trajectory(use_warp_builder: bool):
 
 
 class TestFeatherPGSJointLimitActivationGap(unittest.TestCase):
+    def test_resolved_world_skips_active_signed_limits(self):
+        """The selector owns feasibility; the allocator must bypass either active side."""
+        for q in (-1.2, 1.2):
+            with self.subTest(q=q):
+                self.assertEqual(len(_built_rows(q, gap=0.0)[0]), 1)
+                self.assertEqual(_built_rows(q, gap=0.0, resolved=True), ([], []))
+
     def test_dense_row_families_respect_phase_bounds(self):
         """Keep active position limits before the CPU dense phase-0 bound."""
         solver = _step_once(_make_phase_layout_run("cpu", "split", enable_joint_velocity_limits=False))
