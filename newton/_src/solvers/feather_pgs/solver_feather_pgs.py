@@ -5318,6 +5318,7 @@ class SolverFeatherPGS(SolverBase):
             self._paired_factor_solve_kernel = None
 
         self._pgs_solve_tiled_row_kernel = None
+        self._pgs_solve_tiled_row_budgets = ()
         self._pgs_solve_tiled_contact_kernel = None
         self._pgs_solve_streaming_kernel = None
         if self.dense_max_constraints > 0:
@@ -5325,6 +5326,17 @@ class SolverFeatherPGS(SolverBase):
                 self._pgs_solve_tiled_row_kernel = _get_pgs_solve_tiled_row_kernel(
                     self.dense_max_constraints, device_arch
                 )
+                # Experimental storage layout; keep unmeasured hardware and small
+                # batches on the existing route unless explicitly requested.
+                if (
+                    model.device.is_cuda
+                    and self.dense_max_constraints == 64
+                    and os.environ.get("FEATHER_PGS_DENSE_ROW_BUDGETS") == "1"
+                ):
+                    self._pgs_solve_tiled_row_budgets = tuple(
+                        _get_pgs_solve_tiled_row_kernel(64, device_arch, row_budget=budget, min_rows=minimum)
+                        for budget, minimum in ((32, 0), (64, 32))
+                    )
             elif self.pgs_kernel == "tiled_contact":
                 self._pgs_solve_tiled_contact_kernel = _get_pgs_solve_tiled_contact_kernel(
                     self.dense_max_constraints, device_arch
@@ -13147,26 +13159,27 @@ class SolverFeatherPGS(SolverBase):
         pgs_kernel = self._pgs_solve_tiled_row_kernel
         if pgs_kernel is None:
             raise RuntimeError("Tiled row PGS kernel is unavailable for this solver shape")
-        wp.launch_tiled(
-            pgs_kernel,
-            dim=[self.world_count],
-            inputs=[
-                self.constraint_count,
-                self.diag,
-                self.C,
-                self.rhs,
-                self.impulses,
-                self.pgs_iterations,
-                self.pgs_omega,
-                self.row_type,
-                self.row_parent,
-                self.row_mu,
-                self._pgs_friction_start_iteration,
-                self._pgs_iteration_offset,
-            ],
-            block_dim=32,
-            device=self.model.device,
-        )
+        for kernel in self._pgs_solve_tiled_row_budgets or (pgs_kernel,):
+            wp.launch_tiled(
+                kernel,
+                dim=[self.world_count],
+                inputs=[
+                    self.constraint_count,
+                    self.diag,
+                    self.C,
+                    self.rhs,
+                    self.impulses,
+                    self.pgs_iterations,
+                    self.pgs_omega,
+                    self.row_type,
+                    self.row_parent,
+                    self.row_mu,
+                    self._pgs_friction_start_iteration,
+                    self._pgs_iteration_offset,
+                ],
+                block_dim=32,
+                device=self.model.device,
+            )
 
     def _stage5_pgs_solve_world_loop(self):
         wp.launch(
@@ -14599,11 +14612,21 @@ def _get_hinv_jt_fused_kernel(
                 C_ji = wp.tile_zeros(shape=(TILE_CHUNK_LOCAL, TILE_CHUNK_LOCAL), dtype=wp.float32)
                 wp.tile_matmul(J_j, X_i, C_ji)
                 wp.tile_store(world_C[world], C_ji, offset=(row_j, row_i), bounds_check=False)
-                if ci == cj and thread == 0:
-                    for r in range(TILE_CHUNK_LOCAL):
-                        row = row_i + r
+                # Distribute publication so a serial diagonal loop does not
+                # extend register lifetimes across the fused tile operations.
+                if wp.static(chunk <= tile_threads):
+                    if ci == cj and thread < TILE_CHUNK_LOCAL:
+                        row = row_i + thread
                         if row < n_constraints:
-                            world_diag[world, row] = C_ji[r, r] + row_cfm[world, row]
+                            world_diag[world, row] = C_ji[thread, thread] + row_cfm[world, row]
+                else:
+                    # Non-divisible capacities can select a chunk wider than
+                    # the block; retain complete publication on that path.
+                    if ci == cj and thread == 0:
+                        for r in range(TILE_CHUNK_LOCAL):
+                            row = row_i + r
+                            if row < n_constraints:
+                                world_diag[world, row] = C_ji[r, r] + row_cfm[world, row]
 
     hinv_jt_tiled_fused_template.__name__ = f"hinv_jt_tiled_fused_{n_dofs}_{max_constraints}_bd{tile_threads}"
     hinv_jt_tiled_fused_template.__qualname__ = f"hinv_jt_tiled_fused_{n_dofs}_{max_constraints}_bd{tile_threads}"
@@ -15800,19 +15823,36 @@ def _get_triangular_solve_kernel(n_dofs: int, device_arch: str, tile_threads: in
 
 
 @cache
-def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "wp.Kernel":
+def _get_pgs_solve_tiled_row_kernel(
+    max_constraints: int, device_arch: str, *, row_budget: int | None = None, min_rows: int = 0
+) -> "wp.Kernel":
     """PGS world solve kernel that stages only the LOWER triangle of Delassus.
 
     Shared memory footprint drops from M*M to M*(M+1)/2 floats.
     Uses symmetry in dot: C(i,j) = L(i,j) if j<=i else L(j,i).
+
+    Experimental C64 budgets change only local storage, not global strides or
+    the 32-lane GS reduction. Small budgets own ``min_rows < m <= row_budget``;
+    the full-budget fallback also owns small worlds whose friction metadata
+    reads outside the active prefix. A missing budget retains the original path.
     """
-    TILE_M = max_constraints
-    TILE_M_SQ = TILE_M * TILE_M
+    if row_budget is not None:
+        if max_constraints != 64 or row_budget not in (16, 32, 64) or not 0 <= min_rows < row_budget:
+            raise ValueError("Dense row budgets require C64, budget 16/32/64, and 0 <= min_rows < budget")
+    elif min_rows != 0:
+        raise ValueError("min_rows requires an explicit row_budget")
+    TILE_M = max_constraints if row_budget is None else row_budget
+    TILE_M_SQ = max_constraints * max_constraints
     TILE_TRI = TILE_M * (TILE_M + 1) // 2
+    small_budget = row_budget is not None and row_budget < max_constraints
+    stride_symbol = "TILE_M" if row_budget is None else "ROW_STRIDE"
+    stride_constant = "" if row_budget is None else f"\n    const int ROW_STRIDE = {max_constraints};"
 
     ELEMS_PER_THREAD_1D = (TILE_M + 31) // 32
 
     def gen_load_1d(dst, src):
+        if small_budget:
+            return f"    if (lane < m) {{ {dst}[lane] = {src}.data[off1 + lane]; }}"
         return "\n".join(
             [
                 f"    {dst}[lane + {k * 32}] = {src}.data[off1 + lane + {k * 32}];"
@@ -15872,10 +15912,34 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
             if (k * 32) < TILE_M
         ]
     )
+    if small_budget:
+        store_code = "    if (lane < m) { world_impulses.data[off1 + lane] = s_lam[lane]; }"
+
+    admission_code = ""
+    if row_budget is not None:
+        if small_budget:
+            admission_code += f"    if (m <= {min_rows} || m > {row_budget}) return;\n"
+        admission_code += """
+    bool unsupported = false;
+    if (m <= 32) {
+        // Match the original denominator branch, including its NaN behavior.
+        if (lane < m && !(world_diag.data[world * ROW_STRIDE + lane] <= 0.0f) &&
+            world_row_type.data[world * ROW_STRIDE + lane] == 2) {
+            const int p = world_row_parent.data[world * ROW_STRIDE + lane];
+            // Bound p before adding, so malformed integer metadata cannot overflow.
+            unsupported = p < 0 || p > m - 3 || (lane != p + 1 && lane != p + 2);
+        }
+        unsupported = __ballot_sync(MASK, unsupported) != 0u;
+    }
+"""
+        if small_budget:
+            admission_code += "    if (unsupported) return;\n"
+        else:
+            admission_code += f"    if (m <= {min_rows} && !unsupported) return;\n"
 
     snippet = f"""
 #if defined(__CUDA_ARCH__)
-    const int TILE_M = {TILE_M};
+    const int TILE_M = {TILE_M};{stride_constant}
     const int TILE_M_SQ = {TILE_M_SQ};
     const int TILE_TRI = {TILE_TRI};
     const unsigned MASK = 0xFFFFFFFF;
@@ -15884,6 +15948,7 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
 
     int m = world_constraint_count.data[world];
     if (m == 0) return;
+{admission_code}
 
     // Packed LOWER triangle of C in row-major (i*(i+1)/2 + j), j<=i
     __shared__ float s_Ctri[TILE_TRI];
@@ -15895,7 +15960,7 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
     __shared__ int   s_parent[TILE_M];
     __shared__ float s_mu[TILE_M];
 
-    int off1 = world * TILE_M;
+    int off1 = world * {stride_symbol};
     int off2 = world * TILE_M_SQ;
 
 {load_code}
@@ -15906,7 +15971,7 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
     for (int i = 0; i < m; ++i) {{
         int base = (i * (i + 1)) >> 1; // packed base for row i
         for (int j = lane; j <= i; j += 32) {{
-            s_Ctri[base + j] = world_C.data[off2 + i * TILE_M + j];
+            s_Ctri[base + j] = world_C.data[off2 + i * {stride_symbol} + j];
         }}
     }}
     __syncwarp();
@@ -16027,8 +16092,9 @@ def _get_pgs_solve_tiled_row_kernel(max_constraints: int, device_arch: str) -> "
             iteration_offset,
         )
 
-    pgs_solve_tiled_template.__name__ = f"pgs_solve_tiled_row_{max_constraints}"
-    pgs_solve_tiled_template.__qualname__ = f"pgs_solve_tiled_row_{max_constraints}"
+    suffix = "" if row_budget is None else f"_b{row_budget}_m{min_rows}"
+    pgs_solve_tiled_template.__name__ = f"pgs_solve_tiled_row_{max_constraints}{suffix}"
+    pgs_solve_tiled_template.__qualname__ = pgs_solve_tiled_template.__name__
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_tiled_template)
 
 
