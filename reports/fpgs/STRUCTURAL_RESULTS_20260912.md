@@ -227,14 +227,33 @@ serial phases. Removing logical rows does not remove the corresponding fraction
 of warp instructions; the Gram row index was already parallel too, invalidating
 the assumed quadratic elapsed-time saving. Registers increase, but local memory
 is zero; there is no evidence for a spill claim or occupancy as the sole cause.
-A single source-isolated phase diagnostic is being prepared to distinguish
-geometry/extension costs from recurrence and control costs. A retry must have
-measured headroom to remove roughly 53% / 57% of candidate owner time to reach
-the original 10% whole-time milestone. Merely recovering the baseline is not a
-gain, and no block-size/register-cap sweep is authorized by this result.
+A source-isolated phase diagnostic has now completed at 512 and 16K on both
+GPUs, with eager, two distinct graph replays and timed numerical-output controls.
+The new uninstrumented 16K owner medians remain **1.618x / 1.764x slower**.
+Candidate preparation accounts for about 42.6–45.6% RTX / 40.2–41.2% GB of
+summed lane-zero CTA cycles; recurrence accounts for 47.8–50.7% / 51.5–52.8%.
+These overlapping CTA clocks are approximate attribution, not exclusive wall
+time. Instrumentation itself adds 6.2–7.9% RTX / 10.5–11.5% GB to the original
+tier-48 owner and 1.1–2.1% to candidate owners; register changes are documented.
+Neither preparation nor recurrence became cheaper. Removing either phase alone
+has no credible route to the required 53.2% / 56.7% candidate-cost reduction for
+the original 10% whole-time milestone. This native mapping is therefore deferred
+after causal investigation, not after its first slower measurement. Reopening
+requires a different cooperative preparation and persistent recurrence design
+that removes substantial cost from both. No block-size/register-cap sweep or
+isolated cleanup is proposed. This decision does not reject different iterates;
+the separately measured improved distributions and worse physical tails remain.
 Evidence: `/tmp/fpgs-anymal-lazy-native-paired16k-20260912-01`, manifest
 `dd7adcebe1e9f34e5c84acd5ebda45a067f9d9f2473bfee1f3b97c381533c6f0`;
 independent audit `/tmp/fpgs-anymal-lazy-native-audit-SilTZE/RESULT16K.md`.
+Completed phase evidence:
+`/tmp/fpgs-anymal-lazy-phase-paired16k-20260912-01/manifest.json`, SHA256
+`59fde9b41e8108d2fd4281157f24bbdc4ee3d67b18a8a71f510099928128a536`;
+independent raw-clock/event and saved-output audit
+`/tmp/fpgs-anymal-lazy-phase-audit-WomeIa/RESULT.md`, SHA256
+`ba0f2fa5602bdcf7a78a11882e7ccab0da3504aff8f6d242a79ded287bc4b258`.
+The audit checks 4,000 source/artifact pins and 352 saved numerical observations;
+these are implementation/measurement controls, not new trajectory acceptance.
 
 Allegro's rejection-only temporal support-axis carry-forward now has repeated
 timing evidence, described below. It is an old algorithm carried onto the
@@ -433,13 +452,43 @@ overhead and peak VRAM are not included. This is memory sizing, not a measured
 speedup: the diagnostic adds statistics work, and the earlier A/B timings above
 still use their original capacities.
 
-Broad/query/unresolved capacities remain 2,834,432; seed-1 demand peaks are
-401,722/401,751 broad/query entries and 311,421 unresolved entries. Static coherent
-pair keys remain 2,523,136 and are a different allocation domain. Their separate
-sizing question is not closed. Disabled row high-water telemetry is explicitly
-not collected; finite boundaries and sticky flags are not invented row counts.
-The full held-out trial and source/process guards pass, but no new trajectory
-or backend-parity claim follows.
+A subsequent combined seed-1 trial also passes with broad/query/unresolved
+capacity **524,288**, retaining public contacts at 286,720. Across another 4,960
+calls per card, public peaks are 219,606 RTX / 220,213 GB; broad/query peaks are
+401,771 / 401,711; unresolved peaks are 311,421 on both. All raw overflows and
+four FPGS / thirteen narrow-phase sticky flags remain zero. Full input pairs
+2,834,432 and coherent static keys 2,523,136 are unchanged; these are different
+allocation domains, not query capacities. The query capacity has about 30%
+headroom above the largest observed broad demand across these runs, not a
+universal safety bound. Disabled row high-water telemetry remains explicitly
+not collected.
+
+Reducing the cap below one million would otherwise change the original sparse
+GJK auto-selection. A scoped original NarrowPhase constructor argument preserves
+`sparse_gjk_pairs=True` before factory construction; split-GJK remains true.
+All seven query/split/rejection backing arrays are actually 524,288. The original
+runtime worker counts remain 385,024 RTX / 311,296 GB with 128-thread blocks,
+including the unchanged Lab recipe's post-construction 4x grid multiplier.
+The first diagnostic incorrectly compared runtime counts to constructor counts
+and stopped after 800 calls with no overflow. That failure is preserved; only
+the successor helper's assertion/metadata and regression test changed. Seventeen
+CPU tests pass and an independent source/diff review confirms the correction.
+
+The combined run also observes the already allocated masked-row flag buffer at
+1,146,880 bytes. Including that source-selected four-byte/contact field extends
+the public-route payload reduction above from a conservative 1,589.0625 MiB to
+1,642.03125 MiB. The separately source-accounted 76 bytes/query of resized
+broad/GJK/result/work/rejection storage saves another 167.4375 MiB. These are
+payload calculations, not peak VRAM or measured speedups. Reset/cold geometry
+controls and normal timing remain necessary before using this smaller recipe
+for a new performance claim. Source/process guards pass; no new trajectory or
+backend-parity claim follows.
+
+Combined capacity evidence:
+`/tmp/fpgs-allegro-broad524288-seed1-20260912-02/paired.json`, SHA256
+`2b3a65af9708b6c2ec9b4a2ffd1e08130ae5168d2eb753c1d8ac11fc1c114286`.
+Frozen reproduction: `/tmp/fpgs-allegro-broad524288-v2-iKPQyP/READY.md`.
+The failed first diagnostic remains at the sibling `-01` output directory.
 
 Successful capacity evidence: `/tmp/fpgs-allegro-public286720-seed1-20260912-02`,
 paired manifest `feb2078607d8a4a23ddfcefbf3bf54820d704a4b9c356f4168730d6bd8fc0410`.

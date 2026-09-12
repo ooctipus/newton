@@ -49,6 +49,43 @@ def sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def fused_contact_metadata(solver) -> dict:
+    """Read current experimental ownership only at an existing untimed boundary."""
+    fusion = getattr(solver, "_fused_contact_solve", None)
+    active = getattr(solver, "_fused_contact_solve_active", None)
+    result = {"configured": fusion is not None, "active": active is not None}
+    if active is None:
+        return result
+    if active is not fusion:
+        raise RuntimeError("Current fused contact owner differs from its configured owner")
+    arrays = (fusion.owner, solver.constraint_count, fusion.fallback_counts)
+    if any(array.shape != (solver.world_count,) or array.device.is_capturing for array in arrays):
+        raise RuntimeError("Fused ownership must have one value per world and be read outside capture")
+    owners, counts, fallback = (array.numpy().tolist() for array in arrays)
+    if (
+        any(type(value) is not int or value not in (0, 1) for value in owners)
+        or any(type(value) is not int or not 0 <= value <= solver.dense_max_constraints for value in counts)
+        or any(type(value) is not int for value in fallback)
+        or fallback != [0 if owner else count for owner, count in zip(owners, counts, strict=True)]
+    ):
+        raise RuntimeError("Invalid current fused/fallback ownership or canonical row counts")
+    fused_counts = [count for owner, count in zip(owners, counts, strict=True) if owner]
+    fallback_counts = [count for owner, count in zip(owners, counts, strict=True) if not owner]
+    result.update(
+        scope="Current solver call only; not whole-run admission or a physical-quality check",
+        worlds=solver.world_count,
+        fused_worlds=len(fused_counts),
+        fallback_worlds=len(fallback_counts),
+        fused_nonempty_worlds=sum(count > 0 for count in fused_counts),
+        fallback_nonempty_worlds=sum(count > 0 for count in fallback_counts),
+        fused_rows=sum(fused_counts),
+        fallback_rows=sum(fallback_counts),
+        fused_row_max=max(fused_counts, default=0),
+        fallback_row_max=max(fallback_counts, default=0),
+    )
+    return result
+
+
 def check_solver(physics: str, solver, entry: dict) -> None:
     """Publish flag details before raising; never clear or change solver state."""
     entry["solver_class"] = type(solver).__name__
@@ -195,6 +232,8 @@ def install_boundary_check(harness: ModuleType, report: dict, save, get_manager,
                     raise RuntimeError("Requested MJWarp line-search fix does not support the actual model")
             check_solver(physics, manager._solver, entry)
             check_collision(physics, manager, entry)
+            if physics == "feather_pgs":
+                entry["fused_contact_solve"] = fused_contact_metadata(manager._solver)
             if not isinstance(metadata, dict) or "error" in metadata or metadata.get("state_finite") is not True:
                 raise RuntimeError(f"Invalid Lab state/model metadata: {metadata!r}")
             metadata["overflow_check"] = entry
