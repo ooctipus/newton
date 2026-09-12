@@ -69,3 +69,106 @@ Exact completed current mask capture:
 `/tmp/fpgs-kuka-zero-cohort-paired16k-20260912-01`.
 Source/CPU/offline readiness and mask audit:
 `/tmp/fpgs-early-kuka-ready-e9Edn0yC`.
+
+## Completed device controls and rejected timing
+
+The frozen runtime is `fb32ce78d1e0d4242d274f67e492d8ed7478af2e`.
+Root completes and reaps **65 actual GPU controls per card**, all passing:
+old 45 plus new 10, then the separate 10 original simple-world controls. The
+publication/stream/graph and original ZERO laws are tested without skips;
+this is bounded correctness evidence, not a universal trajectory guarantee.
+
+The first complete 16K paired node screen is **rejected**, not promoted:
+
+| Disjoint graph-span accounting, ms/env-step | RTX baseline | RTX early | GB baseline | GB early |
+| --- | ---: | ---: | ---: | ---: |
+| Publication-exclusive busy | 2.228693 | 1.712545 | 1.890346 | 1.559239 |
+| All non-publication work union | 11.513141 | 12.960725 | 12.048548 | 13.165468 |
+| Graph span uncovered by device activities | .196203 | .273014 | .182628 | .306055 |
+| Complete graph span | 13.938037 | 14.946284 | 14.121523 | 15.030761 |
+
+These disjoint categories add to graph span. Concurrent owner durations must
+not be added again; uncovered time is not an attribution to CPU or Lab.
+This is one paired three-profile-step node window (12 correlated graph roots,
+24 Newton substeps per arm), not balanced repeated performance acceptance.
+
+Actual selected-world boundary counts are 12,647/12,584 RTX and12,529/12,632 GB,
+of 16,384: about 76–77%, not the earlier84–85% two-call sampler. The selected
+cohort still owns all three articulations and all 35 global DOFs, including
+prescribed 6; response width remains29. All four candidate boundaries pass
+disjoint/exhaustive actual-buffer checks.
+
+All child checks complete/pass; all four solver and 13 narrow/collision sticky
+flags are zero at both boundaries in every arm. Public contacts 4,000,000,
+dense 192, MF 64, propagation 192, seed 0, 200 warmup steps, 40 wall steps,
+sim_dt 1/120, two Newton substeps, decimation 4 and maximum eight GS sweeps are
+unchanged. Parent completion, source and idle guards pass. No Lab, task/model
+parameter or capacity changes were made.
+
+### Why intended overlap did not yield a gain
+
+Early publication overlaps other work for 71.2%/75.4% of its duration, but
+complete publication union grows 2.231147 → 3.480141 ms RTX and
+1.892885 → 3.394185 ms GB. Early selected FK alone costs 1.575873/1.680565 ms,
+more than original all-world FK 1.437109/1.374922 ms. Including late FK gives
+2.243318/2.292192 ms. This is not the .026731/.031808 ms compaction kernel.
+
+The original allocator/contact-prelude/masked-J chain grows from
+.897045 → 1.723489 ms RTX and1.134175 → 1.961203 ms GB. The completed-ZERO to
+completed-MF-inverse dependency window grows 2.305365 → 3.692709 and
+2.634986 → 4.076747 ms, while ZERO and inverse kernels themselves are essentially
+unchanged. This localizes the dilation to newly concurrent publication and
+row preparation. It supports contention without uniquely establishing
+bandwidth, occupancy or cache behavior.
+
+Early finalization has zero exposed tail after late finalization in all 24
+sampled windows on both cards. It finishes213–309 us RTX /225–332 us GB before
+late publication even starts. The mandatory final join is not the loss.
+The FK-to-finalizer wait protects the original MF inertia reader and is not
+safe or useful to remove merely because it appears long.
+
+The scalar publication mapping launches articulation-count times maximum-width
+grids: early qdd 1.971 times and early integration/finalization 2.8125 times the
+original all-world slot counts, followed by original-sized masked late grids.
+Early and late FK each launch the full padded articulation capacity. Guards
+prevent invalid accesses, not launch cost or mixed-tree iteration tails.
+
+Some solve costs also change with the trajectory. MF active worlds/max rows
+differ across boundaries; RTX general duration increases, whereas GB general
+duration slightly falls. Therefore the full changed solve tail cannot be
+assigned to scheduling, and this timing capture is not a same-input physical
+comparison.
+
+Even deleting all candidate publication-exclusive busy, with other work
+unchanged, cannot deliver 10% over this paired baseline: the candidate would
+need 2.402 ms RTX /2.321 ms GB removed. A tiny compaction/event change does not
+address the inflated publication and concurrent row-chain costs. This mapping
+is closed; no layout grid or narrow publication retry is selected.
+
+### Frozen provenance
+
+Baseline `064ec8ac455fc4cde557a3b54a1a62624cf56441`; tools
+`5a9d8d76dc060b11fbd9672803c902595488caed`; unchanged Lab
+`1d8feb82d17dbfab8f0772de56f84deae2cb7974`.
+
+- Runtime early_kuka.py SHA256:
+  `2f598b15aea 10a01e371f0970a165bafeb93680ce26dc6d530c9351c41ccd176`.
+- Runtime solver SHA256:
+  `f1cecef6b9986ad5301ff1b4acd7261f03b84e95de766d624fcb9d7c499f9a13`.
+- Completed parent:
+  `/tmp/fpgs-fourx-early-kuka16k-20260912-01`; manifest SHA256
+  `015fc6dad4501f6f5e03e29284752e0c64effa7685c86241ada5f6948dc6fdf7`.
+- Frozen causal artifacts:
+  `/tmp/fpgs-early-kuka-node-audit-soIL49Ox/{FINDINGS.md,evidence.json,audit.py}`.
+  Findings SHA256:
+  `f00b876bd4977a58ef89dd7771df30bbc50338de6372916431cef9fbc1bcd019`;
+  evidence SHA256:
+  `1db6f0ff49b67b3415c63695b031e6d9700514d9c1b779b3ded5e196e474659d`;
+  audit SHA256:
+  `3574a8ef93d88b82ad91d26d89cc173fff53b0844000750ef93ce07c520fe661`.
+
+The pinned audit includes all 16 input hashes and retains signed timestamp
+adjacency discrepancies instead of claiming nanosecond event-order proof.
+Actual CUDA controls establish the source dependency separately.
+This checkpoint changes only this report; runtime, captures and parent
+dependency pointers remain unchanged. The fixed fourfold goal is not achieved.
