@@ -87,6 +87,60 @@ def fused_contact_metadata(solver) -> dict:
     return result
 
 
+def early_publication_metadata(solver) -> dict:
+    """Read current disjoint publication lists only at the existing untimed boundary."""
+    result = {}
+    for name in ("franka", "kuka"):
+        owner = getattr(solver, "_early_" + name, None)
+        entry = result[name] = {"configured": owner is not None, "whole_run_admission": False}
+        if owner is None:
+            continue
+        if owner.solver is not solver:
+            raise RuntimeError("Early publication owner is bound to another solver")
+        data = owner.data
+        arts, worlds = solver.model.articulation_count, solver.world_count
+
+        def read(array, size=None):
+            if array.device.is_capturing or len(array.shape) != 1 or (size is not None and array.shape != (size,)):
+                raise RuntimeError("Read correctly shaped early publication arrays outside capture")
+            values = array.numpy().tolist()
+            if any(type(value) is not int for value in values):
+                raise RuntimeError("Early publication maps must contain integer indices")
+            return values
+
+        counts = read(data.counts, 2)
+        mask = read(data.art_mask, arts)
+        early, late = read(data.early_arts), read(data.late_arts)
+        mapping = read(solver.art_to_world, arts)
+        if (
+            min(counts) < 0
+            or sum(counts) != arts
+            or counts[0] > len(early)
+            or counts[1] > len(late)
+            or any(value not in (0, 1) for value in mask)
+            or any(value < -1 or value >= worlds for value in mapping)
+        ):
+            raise RuntimeError("Invalid early publication counts or ownership mask")
+        early, late = early[: counts[0]], late[: counts[1]]
+        if sorted(early + late) != list(range(arts)) or set(early) != {i for i, value in enumerate(mask) if value}:
+            raise RuntimeError("Early/late publication lists must be disjoint and exhaustive")
+        if any(mapping[art] < 0 for art in early):
+            raise RuntimeError("Early publication cannot own an unmapped articulation")
+        invalid = getattr(data, "invalid_raw", None)
+        if invalid is not None and read(invalid, 1) != [0]:
+            raise RuntimeError("Early publication observed an invalid raw contact prefix")
+        entry.update(
+            scope="Most recent cohort buffer only; not sustained admission, timing or numerical quality",
+            articulations=arts,
+            early_articulations=counts[0],
+            late_articulations=counts[1],
+            worlds=worlds,
+            worlds_with_early_articulations=len({mapping[art] for art in early}),
+            disjoint_exhaustive=True,
+        )
+    return result
+
+
 def check_solver(physics: str, solver, entry: dict) -> None:
     """Publish flag details before raising; never clear or change solver state."""
     entry["solver_class"] = type(solver).__name__
@@ -237,6 +291,7 @@ def install_boundary_check(harness: ModuleType, report: dict, save, get_manager,
             check_collision(physics, manager, entry)
             if physics == "feather_pgs":
                 entry["fused_contact_solve"] = fused_contact_metadata(manager._solver)
+                entry["early_publication"] = early_publication_metadata(manager._solver)
             if not isinstance(metadata, dict) or "error" in metadata or metadata.get("state_finite") is not True:
                 raise RuntimeError(f"Invalid Lab state/model metadata: {metadata!r}")
             metadata["overflow_check"] = entry

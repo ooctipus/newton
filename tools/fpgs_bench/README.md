@@ -270,3 +270,21 @@ CUDA_VISIBLE_DEVICES='' OPENBLAS_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 \
   uv run --no-project --python /home/octi/Projects/IsaacLab.wt/fpgs-opt-20260910/.venv/bin/python \
   python -m unittest test_allegro_capacity test_compare_backends test_checked_capture
 ```
+
+### Early-publication experiment ownership
+
+The unchanged two untimed model-metadata boundaries also record
+`early_publication` for configured Franka/Kuka scheduling experiments. The
+checker reads the actual device articulation masks, valid list prefixes and
+counts, requiring disjoint and exhaustive early/late ownership. It reports
+articulation counts and worlds containing early articulations; Franka's late
+free bodies can share a world with an early arm. Unused list tails and the
+Python launch-active flag are not evidence of admission.
+
+These are the most recent cohort buffers, not sustained admission, a
+convergence certificate or a timing result. An empty early cohort is valid
+but cannot demonstrate the intended overlap. No counters, kernels or host
+reads are added inside a measured physics step. Existing capacity/finite-state
+checks and original metadata return values remain intact. CPU controls:
+`python -m unittest test_early_publication_metadata test_checked_capture` from
+this tools directory, using the selected Lab environment with CUDA hidden.
