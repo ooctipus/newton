@@ -2396,6 +2396,12 @@ class SolverFeatherPGS(SolverBase):
 
             self._compact_contact_boundary = supported(self)
 
+        self._early_franka = None
+        if os.environ.get("FEATHER_PGS_EARLY_FRANKA") == "1":
+            from .early_franka import create_owner  # noqa: PLC0415
+
+            self._early_franka = create_owner(self)
+
     def _update_kinematic_state(self) -> None:
         """Refresh cached kinematic flags and effective joint armature."""
         model = self.model
@@ -2437,6 +2443,9 @@ class SolverFeatherPGS(SolverBase):
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         """Refresh cached solver data after supported model changes."""
+        early = getattr(self, "_early_franka", None)
+        if early is not None:
+            early.wait()
         if self._row_packets is not None:
             self._row_packets.validate_notification(flags)
         if self._fk_id_cache_enabled and flags & (
@@ -2490,6 +2499,9 @@ class SolverFeatherPGS(SolverBase):
             flags: State flags, which do not affect solver-owned impulse history.
         """
         del flags
+        early = getattr(self, "_early_franka", None)
+        if early is not None:
+            early.wait()
         if world_mask is not None and world_mask.shape[0] != self.world_count:
             raise ValueError(
                 f"world_mask has length {world_mask.shape[0]}, expected {self.world_count} (one entry per world)."
@@ -6157,6 +6169,9 @@ class SolverFeatherPGS(SolverBase):
         solve_single: bool = True,
         solve_pair: bool = True,
         solve_residual: bool = True,
+        owner_view: wp.array | None = None,
+        count_view: wp.array | None = None,
+        mf_count_view: wp.array | None = None,
     ) -> None:
         """Solve articulation-local dense rows without world response buffers."""
 
@@ -6185,8 +6200,14 @@ class SolverFeatherPGS(SolverBase):
                     self.art_group_idx,
                     self.art_to_world,
                     self.articulation_dof_start,
-                    self._local_solve_owner,
-                    self.constraint_count,
+                    (
+                        owner_view
+                        if owner_view is not None
+                        else self._early_franka.data.late_owner
+                        if self._early_franka is not None and self._early_franka.active
+                        else self._local_solve_owner
+                    ),
+                    self.constraint_count if count_view is None else count_view,
                     self.L_by_size[primary_size],
                     self.J_by_size[primary_size],
                     self.L_by_size[secondary_group_size],
@@ -6195,7 +6216,7 @@ class SolverFeatherPGS(SolverBase):
                     self.row_type,
                     self.row_parent,
                     self.row_mu,
-                    self.mf_constraint_count,
+                    self.mf_constraint_count if mf_count_view is None else mf_count_view,
                     self.mf_meta_packed,
                     self.mf_impulses,
                     self.mf_J_a,
@@ -8334,6 +8355,8 @@ class SolverFeatherPGS(SolverBase):
         dt: float,
         collide_done_event=None,
     ):
+        if self._early_franka is not None:
+            self._early_franka.begin(state_in, state_out)
         if contacts is not None and contacts.rigid_contact_max > self._max_contacts_alloc:
             raise ValueError(
                 "FeatherPGS contact capacity mismatch: received "
@@ -8988,7 +9011,10 @@ class SolverFeatherPGS(SolverBase):
         # STAGE 7: Update qdd + integrate
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S7_Integrate", print=False, use_nvtx=self._nvtx, synchronize=False):
-            if self.pgs_mode == "matrix_free" and self.pgs_velocity_iterations > 0:
+            if self._early_franka is not None and self._early_franka.active:
+                self._early_franka.publish(state_in, state_aug, state_out, dt, early=False)
+                self._early_franka.join(state_out)
+            elif self.pgs_mode == "matrix_free" and self.pgs_velocity_iterations > 0:
                 self._stage6_write_final_velocity(state_in, state_aug, state_out, dt)
             else:
                 self._stage6_update_qdd(state_in, state_aug, dt)
@@ -11355,6 +11381,9 @@ class SolverFeatherPGS(SolverBase):
                 j_buffers_zeroed = True
 
             if self._row_packets is not None:
+                if self._early_franka is not None:
+                    self._stage4_allocate_rigid_velocity_rows()
+                    self._early_franka.launch(state_in, state_aug, contacts, dt)
                 self._row_packets.produce_contacts(state_in, state_aug, contacts, dt)
             elif self._compact_contact_boundary:
                 from .compact_contact import launch_contacts  # noqa: PLC0415
@@ -12274,85 +12303,22 @@ class SolverFeatherPGS(SolverBase):
                         device=model.device,
                     )
 
-        # Rigid-body velocity limits are matrix-free rows, not post-solve
-        # clamps, in the MF path. Allocate after contacts so they occupy the
-        # last MF slots; the fused PGS kernel also solves row_type=4 in a
-        # final phase so articulated and rigid velocity-limit rows are both
-        # visited after drive/contact/friction/position-limit rows.
-        if mf_active:
-            # Contact/friction rows all precede velocity-limit rows in the MF
-            # slot space (the classifier completes before the vlim allocation
-            # below). Record the partition boundary so the GS kernels can loop
-            # only the contact prefix in contact phases and only the vlim tail
-            # in velocity-limit phases instead of scanning all rows.
-            wp.copy(self.mf_contact_rows_end, self.mf_slot_counter)
-        if mf_active and self.rigid_velocity_limit_slot is not None:
-            # Dummy when no articulation metadata exists; the kernel only
-            # reads it for free-rigid roots, which then cannot occur.
-            root_dof_start = (
-                self.articulation_root_dof_start
-                if self.articulation_root_dof_start is not None
-                else wp.zeros((1,), dtype=wp.int32, device=model.device)
-            )
-            wp.launch(
-                allocate_rigid_velocity_limit_slots,
-                dim=self._free_rigid_body_count,
-                inputs=[
-                    self.free_rigid_body_indices,
-                    self.body_to_articulation,
-                    self.art_to_world,
-                    is_free_rigid,
-                    model.body_flags,
-                    self.rigid_body_max_linear_velocity,
-                    self.rigid_body_max_angular_velocity,
-                    root_dof_start,
-                    self.v_hat,
-                    self.velocity_limit_activation_fraction,
-                    self.mf_max_constraints,
-                    self._resolved_simple_worlds,
-                ],
-                outputs=[
-                    self.rigid_velocity_limit_slot,
-                    self.rigid_velocity_limit_sign,
-                    self.mf_slot_counter,
-                ],
-                device=model.device,
-            )
-            wp.launch(
-                populate_rigid_velocity_limit_rows,
-                dim=self._free_rigid_body_count,
-                inputs=[
-                    self.free_rigid_body_indices,
-                    self.body_to_articulation,
-                    self.art_to_world,
-                    is_free_rigid,
-                    self.rigid_body_max_linear_velocity,
-                    self.rigid_body_max_angular_velocity,
-                    self.rigid_velocity_limit_slot,
-                    self.rigid_velocity_limit_sign,
-                ],
-                outputs=[
-                    self.mf_body_a,
-                    self.mf_body_b,
-                    self.mf_J_a,
-                    self.mf_J_b,
-                    self.mf_row_type,
-                    self.mf_row_parent,
-                    self.mf_row_mu,
-                    self.mf_phi,
-                ],
-                device=model.device,
-            )
-            wp.launch(
-                finalize_constraint_counts_with_status,
-                dim=self.world_count,
-                inputs=[self.mf_slot_counter, self.mf_max_constraints, 1],
-                outputs=[self.mf_constraint_count, self._constraint_capacity_status],
-                device=model.device,
-            )
+        if self._early_franka is None or not self._early_franka.active:
+            self._stage4_allocate_rigid_velocity_rows()
+            if self._early_franka is not None:
+                self._early_franka.launch(state_in, state_aug, contacts, dt)
 
         if self._row_packets is not None:
             self._row_packets.finish_rows()
+            if self._early_franka is not None and self._early_franka.active:
+                from .early_franka import prepare_late_owner  # noqa: PLC0415
+
+                wp.launch(
+                    prepare_late_owner,
+                    dim=self.world_count,
+                    inputs=[self._local_solve_owner, self._early_franka.data],
+                    device=model.device,
+                )
         else:
             wp.launch(
                 finalize_constraint_counts_with_status,
@@ -12480,6 +12446,88 @@ class SolverFeatherPGS(SolverBase):
                         outputs=[active_count, active_candidates[size], active_secondaries[size]],
                         device=model.device,
                     )
+
+    def _stage4_allocate_rigid_velocity_rows(self):
+        """Allocate the original MF speed-limit tail after all raw contact slots."""
+        model = self.model
+        mf_active = self._has_free_rigid_bodies
+        is_free_rigid = self.is_free_rigid if self.is_free_rigid is not None else self._dummy_is_free_rigid
+        # Rigid-body velocity limits are matrix-free rows, not post-solve
+        # clamps, in the MF path. Allocate after contacts so they occupy the
+        # last MF slots; the fused PGS kernel also solves row_type=4 in a
+        # final phase so articulated and rigid velocity-limit rows are both
+        # visited after drive/contact/friction/position-limit rows.
+        if mf_active:
+            # Contact/friction rows all precede velocity-limit rows in the MF
+            # slot space (the classifier completes before the vlim allocation
+            # below). Record the partition boundary so the GS kernels can loop
+            # only the contact prefix in contact phases and only the vlim tail
+            # in velocity-limit phases instead of scanning all rows.
+            wp.copy(self.mf_contact_rows_end, self.mf_slot_counter)
+        if mf_active and self.rigid_velocity_limit_slot is not None:
+            # Dummy when no articulation metadata exists; the kernel only
+            # reads it for free-rigid roots, which then cannot occur.
+            root_dof_start = (
+                self.articulation_root_dof_start
+                if self.articulation_root_dof_start is not None
+                else wp.zeros((1,), dtype=wp.int32, device=model.device)
+            )
+            wp.launch(
+                allocate_rigid_velocity_limit_slots,
+                dim=self._free_rigid_body_count,
+                inputs=[
+                    self.free_rigid_body_indices,
+                    self.body_to_articulation,
+                    self.art_to_world,
+                    is_free_rigid,
+                    model.body_flags,
+                    self.rigid_body_max_linear_velocity,
+                    self.rigid_body_max_angular_velocity,
+                    root_dof_start,
+                    self.v_hat,
+                    self.velocity_limit_activation_fraction,
+                    self.mf_max_constraints,
+                    self._resolved_simple_worlds,
+                ],
+                outputs=[
+                    self.rigid_velocity_limit_slot,
+                    self.rigid_velocity_limit_sign,
+                    self.mf_slot_counter,
+                ],
+                device=model.device,
+            )
+            wp.launch(
+                populate_rigid_velocity_limit_rows,
+                dim=self._free_rigid_body_count,
+                inputs=[
+                    self.free_rigid_body_indices,
+                    self.body_to_articulation,
+                    self.art_to_world,
+                    is_free_rigid,
+                    self.rigid_body_max_linear_velocity,
+                    self.rigid_body_max_angular_velocity,
+                    self.rigid_velocity_limit_slot,
+                    self.rigid_velocity_limit_sign,
+                ],
+                outputs=[
+                    self.mf_body_a,
+                    self.mf_body_b,
+                    self.mf_J_a,
+                    self.mf_J_b,
+                    self.mf_row_type,
+                    self.mf_row_parent,
+                    self.mf_row_mu,
+                    self.mf_phi,
+                ],
+                device=model.device,
+            )
+            wp.launch(
+                finalize_constraint_counts_with_status,
+                dim=self.world_count,
+                inputs=[self.mf_slot_counter, self.mf_max_constraints, 1],
+                outputs=[self.mf_constraint_count, self._constraint_capacity_status],
+                device=model.device,
+            )
 
     def _stage4_zero_world_C(self):
         self.C.zero_()
@@ -13392,15 +13440,16 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage5_prepare_impulses_world(self):
         warmstart_flag = 1 if self.pgs_warmstart else 0
+        early = self._early_franka
         wp.launch(
-            prepare_world_impulses,
+            early.clear_kernel if early is not None and early.active else prepare_world_impulses,
             dim=self.world_count,
             inputs=[
                 self.constraint_count,
                 self.dense_max_constraints,
                 warmstart_flag,
             ],
-            outputs=[self.impulses],
+            outputs=[self.impulses, early.data] if early is not None and early.active else [self.impulses],
             device=self.model.device,
         )
 
@@ -13523,6 +13572,8 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage6_prepare_world_velocity(self):
+        if self._early_franka is not None and self._early_franka.active:
+            return  # The authoritative full copy precedes the early/late fork.
         wp.copy(self.v_out, self.v_hat)
 
     def _build_mf_body_map(self) -> None:
@@ -14175,6 +14226,9 @@ class SolverFeatherPGS(SolverBase):
             )
         ]
         streams.extend(getattr(self, "_size_streams", {}).values())
+        early = getattr(self, "_early_franka", None)
+        if early is not None:
+            streams.append(early.stream)
         synchronized = set()
         for stream in streams:
             if stream is None or id(stream) in synchronized:
