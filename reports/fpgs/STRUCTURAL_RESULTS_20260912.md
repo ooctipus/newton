@@ -65,6 +65,34 @@ the same-input implementation checks but is not a matched-control trajectory
 equivalence claim. The sampled fixed-eight-sweep physical residuals are not
 required to be exactly zero; numerical convergence, not bit identity, is the gate.
 
+## Fresh balanced Keyboard comparison with MJWarp
+
+Three long alternating FPGS/MJWarp rounds have now completed on both devices,
+using the same 4K task, 200 warmup / 1,000 synchronized / 40 graph-profile steps.
+FPGS is the retained A+B runtime `654894cb`; MJWarp uses correctness-fixed
+Newton `108459ec` and its process-local line-search correction. Original task
+timestep, substeps and each backend's effective solver allowances are unchanged.
+FPGS capacities are the 704 / 147,456 / 57,344 values above. MJWarp uses
+`njmax=320`, `nconmax=32`, 131,072 public contacts and 45,056 broad output slots.
+
+| Hardware | FPGS physics ms | MJWarp physics ms | MJWarp/FPGS | FPGS wall ms | MJWarp wall ms | Wall ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| RTX PRO 6000 | 7.819561 | 27.760556 | **3.55014x** | 35.464991 | 32.026520 | **0.90305x** |
+| GB300 | 7.176602 | 27.995816 | **3.90098x** | 31.160383 | 32.640041 | **1.04749x** |
+
+These are per-device medians of three graph-only captures, not a ratio to old
+unpaired samples. All 12 captures have finite states and pass both checked
+boundaries: four FPGS flags or all MJWarp warning-mask positions, plus all 13
+collision flags. Sources pass the checked launcher guards, children exit zero
+and their process groups are reaped. This is not a cross-backend trajectory or
+solver-parity claim. In particular, the RTX whole-environment wall result remains
+slower despite the much faster physics graph; do not advertise training speedup.
+
+Ten times the measured RTX MJWarp physics would require approximately 2.776 ms,
+versus the current 7.820 ms: about 5.044 ms / 64.5% further removal. The current
+contact and solve owners cannot deliver that alone. It is an architecture-wide
+target, not evidence that lowering iteration counts or dropping rows is justified.
+
 ## What changed, and why it was worth implementing
 
 `FEATHER_PGS_SPARSE_CONTACT_DIRECT=1` assigns one bounded worker to each sparse
@@ -150,6 +178,23 @@ row visits to 60% while retaining full preparation. That proposal is deferred
 before implementation. A replacement must also address preparation/majorizer
 cost, not spend hours polishing the same limited hypothesis.
 
+A bounded CPU reference of that replacement is now complete on all 2,048
+world-call observations from both devices' 512-world captures. It causally
+materializes tangents when needed within the current sweep, retains activated
+rows and momentum, and incrementally forms exact restricted Gram row sums.
+It changes the pair preconditioner explicitly; it is not an old-iterate shortcut.
+At the unchanged maximum 24 sweeps, materialized rows are 60.62% of full and
+ordered Gram products 36.41%. Natural residual median/p99 improves from
+0.002593/0.02037 to 0.0002817/0.001912 against an independent physical reference.
+Individual losses remain: 90 of 2,048 natural-residual cases worsen, and one
+contact's frozen-geometry next-gap prediction worsens to about -80 micrometres.
+All reference solves converge offline, but those additional reference iterations
+are not a production allowance. These are numerical/logical-work results, not
+GPU timing or general trajectory acceptance. One native full-owner experiment
+is now being implemented; parked-warp, preparation, insertion and fallback costs
+remain charged. Its append-only panel changes FP32 reduction order relative to
+the CPU reference and must be evaluated on actual outputs.
+
 Allegro's rejection-only temporal support-axis carry-forward now has repeated
 timing evidence, described below. It is an old algorithm carried onto the
 correctness-fixed source, not a newly invented collision method.
@@ -179,6 +224,27 @@ FP64 response oracle on both devices (maximum violating Y6 difference about
 completed, but the full gate did not. Original failure snapshots are retained;
 geometry-rounding amplification versus a runtime error must be diagnosed before
 changing an oracle or claiming this candidate is quality-accepted.
+
+That diagnosis is now complete. Maximum J32-versus-raw64 geometry differences
+are about 6e-7; applying the actual held-H inverse amplifies them to the observed
+1e-5 response difference. Solving against the independently checked published
+J32 passes the original Y tolerance, with componentwise backward error about
+1.4e-7. The original seven kernels on the same CPU inputs fail the old raw64-Y
+criterion too. A fresh oracle separates geometry and solve contracts without
+changing tolerances, runtime or physics; wrong-J/exact-Y and wrong-Y controls
+reject corruption. The fresh two-call loaded GPU gate now passes on both cards,
+including original/private/live publication, prefix ownership and all capacity
+checks. Original failed captures remain retained.
+
+The raw-order census rules out widespread dense/key-only warp interleaving:
+only one mixed warp per device. It does reveal poor instruction-level store
+coalescing, including scattered J/Y zeros for about 95% of contact triples.
+A source/PTX-backed address model motivates one output-ownership retry: a
+coalesced current-contact J/Y clear, followed by dense-endpoint-only J/Y stores
+in the raw producer. Canonical consumers, contacts and eight sweeps remain.
+The modeled scalar-sector-request reduction is about 43%, not measured DRAM
+traffic or a proven explanation of elapsed time. The complete new clear and
+producer must be timed before claiming a gain; no block-size tuning grid follows.
 
 The Keyboard broad-phase neighbor-list idea was closed before implementation:
 its measured 0.370/0.434 ms owner cannot meet a 10% whole-step milestone even if
@@ -260,6 +326,11 @@ capacity reports are retained in these manifests:
 - `/tmp/fpgs-keyboard-quality-paired-4k-01/paired.json`:
   loaded producer checks at the actual 4K timing population, all children and
   final source/process/idle checks pass; independent controls/resets differ.
+- `/tmp/fpgs-mj-keyboard-balanced-20260912-01/manifest.json`:
+  three long alternating backend rounds; SHA256
+  `2c567eaf412e3b16c16afe68281d941d64777b051d44bab95eb9def67c51b043`.
+  Its `summary.json` has SHA256
+  `434a8ec3b27a6a56370a5551f299fbe69c1c80877b3fa1459aa509d762f8657a`.
 - `/tmp/fpgs-scalar-key-gpu-tests-20260912-02`:
   29 targeted scalar/publication/response/mass tests per GPU. The prior `-01`
   failure is retained: the root launcher named a nonexistent test module.
@@ -274,8 +345,19 @@ capacity reports are retained in these manifests:
 - `/tmp/fpgs-compact-contact-attribution-3LyzxT/DIAGNOSIS.md` and
   `/tmp/fpgs-compact-loaded-paired-512-01/paired.json`:
   cost diagnosis and retained unsuccessful loaded FP64-oracle gate.
+- `/tmp/fpgs-compact-loaded-oracle-diagnosis-Usf5dO/result.json` and
+  `/tmp/fpgs-compact-loaded-v2-1Ds6Zb/READY.md`:
+  independently recomputed geometry/solve decomposition and corrected oracle.
+- `/tmp/fpgs-compact-loaded-paired-512-02/paired.json`:
+  fresh loaded original-E GPU gate, both cards complete and all checks pass.
+- `/tmp/fpgs-compact-raw-analysis-cyceGo/RAW_AND_STORE_MODEL.md`:
+  raw-order census and explicit scalar-store address model, not a timing result.
 - `/tmp/fpgs-anymal-phase-paired16k-20260912-01/manifest.json`:
   source-isolated preparation/sweep/publication census, not performance timing.
+- `/tmp/fpgs-anymal-lazy-reference-zE5yUe/RESULT.md`:
+  fixed-24 CPU method, independent physical references, individual losses and
+  source/input/output pins. SHA256
+  `5781a0ca6c5f03c909de13f22fcf186abab3531000f105cda6056c6bff8028e2`.
 - `/tmp/fpgs-rejection-port-allegro16k-balanced-20260912-01/manifest.json`:
   repeated Allegro timing, SHA256
   `f25866e19e02fe544b5045c04ec22491a0b71e0fb6b86702a669d8e1f35b5321`.
