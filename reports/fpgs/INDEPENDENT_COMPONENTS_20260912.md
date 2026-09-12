@@ -189,3 +189,70 @@ Fork reports and exact input/source closure:
   SHA256 `fc24127b45cd53e7814f97dbdfb5d0be6dbc2f14449c8f32811674110ebd2209`.
 - `/tmp/fpgs-independent-components-fork-jslpJHdd/READY.md` records the
   prospective cost card, full timing scope and native controls.
+
+## Repeated full-task gain and current-state numerical checks
+
+Frozen runtime87af1f8961d6937e0f175983bab76160e48d5878 completed three
+alternating AB/BA/AB rounds against accepted42, simultaneously on both GPU
+UUIDs. Each arm retains16K worlds, seed0,200 warmup,40 synchronized wall
+steps and40 graph-profiled steps. Eight GS sweeps, dt1/240, two substeps,
+decimation4 and every original capacity remain unchanged. The benchmark
+tool is15158f3a; Lab remains clean1d8feb82 with no source/config/pin edits.
+
+| GPU | Baseline physics ms | Candidate physics ms | Speedup | Baseline wall ms | Candidate wall ms | Wall speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| RTX PRO6000 | 15.453635 | 13.973622 | 1.1059x | 35.371006 | 33.165392 | 1.0665x |
+| GB300 | 15.513112 | 13.884428 | 1.1173x | 35.607505 | 33.506107 | 1.0627x |
+
+Values are medians of three per-round means, not confidence bounds. Every
+round improves physics. Independent audit matches all1920 graph records
+to their process-correlated SQLite records and all24 checked boundaries:
+finite states, four solver and13 collision sticky flags clear, identical
+budgets. All twelve children exited0 and were reaped; source/idle guards
+pass. The resulting candidate ratios against today's fixed corrected MJ
+reference are1.9655x RTX and1.8693x GB, not a fresh matched MJ comparison.
+The4x goal remains unmet: candidate time must fall another50.86%/53.27%.
+
+A separate node capture localizes the improvement to preparation plus the
+paired/general solve boundary: union3.287839 to1.376246ms RTX,4.042172
+to1.572768ms GB. Both parallel branches are joined before publication.
+Some gain comes from a shorter general solve, not overlap alone. Current
+contact trajectories and rare coupled tails differ, so these numbers do
+not prove that an identical hard world became cheaper. In particular the
+GB pre-window velocity maximum9.437655 versus baseline3.986799 is retained
+as a physical-tail caveat, not silently removed from the comparison.
+
+Root therefore captured current physical inputs from the candidate's own
+evolved state, before component preparation, plus outputs after its fork
+join. The unchanged original eight-sweep kernels then ran on those same
+inputs. Both current refresh/reuse captures pass on each actual source
+GPU, including sequential/captured replay, immutable inputs, saved selector
+agreement and source guards. All MF-positive worlds are included:43/45
+and49/51 independent/total on RTX,38/39 and36/37 on GB.
+
+Maximum candidate-versus-original velocity difference is4.7684e-7, dense
+impulse difference8.2702e-7, and physical impulse-action error4.5871e-7.
+MF impulses and coupled fallback outputs are identical. Original normal
+and limit residual tails are essentially unchanged; maximum row-residual
+difference is4.7684e-7. These checks support preservation of the original
+finite-eight-sweep operator at floating-point scale. They are not a claim
+of universal convergence, identical trajectories, training parity or MJ
+physical equivalence. These current captures reach nine MF rows, not the
+earlier trace's12-row state. The experiment remains guarded/default-off;
+its repeated measured gain is retained for subsequent structural work.
+
+Evidence (large captures remain local):
+
+- Repeated manifest: `/tmp/fpgs-fourx-kuka-independent-fork16k-repeat-20260912-01/manifest.json`,
+  SHA256 `83686f99e7a54ac6b526f591bcc12e1198638e1782b76ff3d1cd386c5b0c95f3`.
+- Independent timing audit: `/tmp/fpgs-kuka-repeat-audit-OecJlPye/RESULTS.md`,
+  SHA256 `e7df168e4e84e2a474c85480e2339a51044c8c20fcbbdd3f2ba36ae5eab4d6b6`.
+- Node audit: `/tmp/fpgs-kuka-independent-fork-audit-31Lmwyt7/FINDINGS.md`;
+  evidence SHA256 `9aa9bb17793218d6350940fc6d5d0155c3e3754513118df8313b76bcd339d475`.
+- Candidate-current manifest: `/tmp/fpgs-kuka-candidate-current-paired16k-20260912-01/manifest.json`,
+  SHA256 `322edbc6886af645b0afc38160bdb3b0e0fdf215a0f7d9af607438cc3d2fc081`.
+- Replay source/pins/commands: `/tmp/fpgs-kuka-candidate-replay-l1AySLcb/READY.md`.
+  RTX report `/tmp/fpgs-kuka-candidate-replay-rtx-20260912-01/report.json`,
+  SHA256 `e718eb1f85a790b1c66bb81061da6d0aa53e24342333d27ea9af5c947202f27c`;
+  GB report `/tmp/fpgs-kuka-candidate-replay-gb-20260912-01/report.json`,
+  SHA256 `62307c229d25e783a6b22ccfcb245923045169133e0f6aeb0c49d6baacdf4ce5`.
