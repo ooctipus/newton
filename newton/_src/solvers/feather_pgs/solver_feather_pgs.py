@@ -2396,6 +2396,13 @@ class SolverFeatherPGS(SolverBase):
 
             self._compact_contact_boundary = supported(self)
 
+        self._joint_world = None
+        self._joint_world_active = False
+        if os.environ.get("FEATHER_PGS_KUKA_JOINT_WORLD") == "1":
+            from .kuka_joint_owner import create_owner  # noqa: PLC0415
+
+            self._joint_world = create_owner(self)
+
     def _update_kinematic_state(self) -> None:
         """Refresh cached kinematic flags and effective joint armature."""
         model = self.model
@@ -2439,6 +2446,8 @@ class SolverFeatherPGS(SolverBase):
         """Refresh cached solver data after supported model changes."""
         if self._row_packets is not None:
             self._row_packets.validate_notification(flags)
+        if getattr(self, "_joint_world", None) is not None:
+            self._joint_world.validate_notification(flags)
         if self._fk_id_cache_enabled and flags & (
             ModelFlags.JOINT_PROPERTIES
             | ModelFlags.JOINT_DOF_PROPERTIES
@@ -2490,6 +2499,8 @@ class SolverFeatherPGS(SolverBase):
             flags: State flags, which do not affect solver-owned impulse history.
         """
         del flags
+        if getattr(self, "_joint_world", None) is not None:
+            self._joint_world.join_raw()
         if world_mask is not None and world_mask.shape[0] != self.world_count:
             raise ValueError(
                 f"world_mask has length {world_mask.shape[0]}, expected {self.world_count} (one entry per world)."
@@ -8393,6 +8404,10 @@ class SolverFeatherPGS(SolverBase):
             self._step += 1
             return state_out
 
+        self._joint_world_active = self._joint_world is not None and self._joint_world.begin(
+            state_in, state_out, contacts, collide_done_event
+        )
+
         # Double-buffer: select buffer set and wait for its memset to finish
         if self._memset_stream is not None:
             self.H_by_size = self._H_bufs[self._buf_idx]
@@ -8442,22 +8457,25 @@ class SolverFeatherPGS(SolverBase):
         with wp.ScopedTimer("S3_Trisolve_Vhat", print=False, use_nvtx=self._nvtx, synchronize=False):
             if inverse_dynamics_ready is not None:
                 wp.get_stream(model.device).wait_event(inverse_dynamics_ready)
-            self._stage3_zero_qdd(state_aug)
-            for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
-                with ctx:
-                    use_tiled = (self.trisolve_kernel == "tiled") or (
-                        self.trisolve_kernel == "auto" and size > self.small_dof_threshold
-                    )
-                    if size == self._compact_diagonal_mass_size:
-                        self._stage3_trisolve_compact_diagonal(size, state_aug)
-                    elif self._execution_plan.use_diagonal_mass(size):
-                        self._stage3_trisolve_diagonal(size, state_aug)
-                    elif use_tiled:
-                        self._stage3_trisolve_tiled(size, state_aug)
-                    else:
-                        self._stage3_trisolve_loop(size, state_aug)
-            self._stage3_compute_v_hat(state_in, state_aug, dt, stage3_qd)
-            self._clamp_rigid_velocity_limits(self.v_hat)
+            if self._joint_world_active:
+                self._joint_world.predict_and_classify(state_in, state_aug, state_out, contacts, stage3_qd, dt)
+            else:
+                self._stage3_zero_qdd(state_aug)
+                for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
+                    with ctx:
+                        use_tiled = (self.trisolve_kernel == "tiled") or (
+                            self.trisolve_kernel == "auto" and size > self.small_dof_threshold
+                        )
+                        if size == self._compact_diagonal_mass_size:
+                            self._stage3_trisolve_compact_diagonal(size, state_aug)
+                        elif self._execution_plan.use_diagonal_mass(size):
+                            self._stage3_trisolve_diagonal(size, state_aug)
+                        elif use_tiled:
+                            self._stage3_trisolve_tiled(size, state_aug)
+                        else:
+                            self._stage3_trisolve_loop(size, state_aug)
+                self._stage3_compute_v_hat(state_in, state_aug, dt, stage3_qd)
+                self._clamp_rigid_velocity_limits(self.v_hat)
             wp.copy(self._debug_stage3_qd_work, stage3_qd)
             wp.copy(self._debug_stage3_joint_qdd, state_aug.joint_qdd)
             wp.copy(self._debug_stage3_v_hat, self.v_hat)
@@ -8470,7 +8488,7 @@ class SolverFeatherPGS(SolverBase):
         # STAGE 4: Build contact problem
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S4_ContactBuild", print=False, use_nvtx=self._nvtx, synchronize=False):
-            if self._simple_world_classifier is not None:
+            if self._simple_world_classifier is not None and not self._joint_world_active:
                 self._simple_world_classifier.classify(state_in, state_aug, contacts, dt)
             self._stage4_build_rows(state_in, state_aug, control, contacts, dt)
 
@@ -8988,11 +9006,14 @@ class SolverFeatherPGS(SolverBase):
         # STAGE 7: Update qdd + integrate
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S7_Integrate", print=False, use_nvtx=self._nvtx, synchronize=False):
-            if self.pgs_mode == "matrix_free" and self.pgs_velocity_iterations > 0:
+            if self._joint_world_active:
+                self._joint_world.finish_active(state_in, state_aug, state_out, dt)
+            elif self.pgs_mode == "matrix_free" and self.pgs_velocity_iterations > 0:
                 self._stage6_write_final_velocity(state_in, state_aug, state_out, dt)
             else:
                 self._stage6_update_qdd(state_in, state_aug, dt)
                 self._stage6_integrate(state_in, state_aug, state_out, dt)
+        self._joint_world_active = False
 
         # ── MF warm-start carry: snapshot this step's converged impulses +
         # row-type table + per-(sorted)-contact slot map so step N+1 can seed
@@ -12610,6 +12631,9 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage4_hinv_jt_paired(self, primary_size: int, secondary_size: int) -> None:
         """Build one world response from its robot and free-body components."""
+        if getattr(self, "_joint_world_active", False):
+            self._joint_world.response.launch()
+            return
         if self._paired_response_kernel is None or self._paired_response_secondary_groups is None:
             raise RuntimeError("Paired H^-1 J^T kernel is unavailable")
         primary_linv = (
@@ -14169,11 +14193,15 @@ class SolverFeatherPGS(SolverBase):
                 "_local_internal_stream",
                 "_local_residual_stream",
                 "_local_pair_stream",
+                "_paired_general_solve_stream",
                 "_global_inertia_stream",
                 "_articulation_dynamics_stream",
                 "_memset_stream",
             )
         ]
+        joint_world = getattr(self, "_joint_world", None)
+        if joint_world is not None:
+            streams.append(joint_world.stream)
         streams.extend(getattr(self, "_size_streams", {}).values())
         synchronized = set()
         for stream in streams:
