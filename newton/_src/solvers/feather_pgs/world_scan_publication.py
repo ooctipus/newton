@@ -455,3 +455,46 @@ def get_kernel(arch):
         _release(address)
 
     return world_scan_publication
+
+
+def _resolved_source(source):
+    """Guard only generalized work already published by the current light owner."""
+    signature = "    def world_scan_publication(plan: kuka_joint_world.JointWorldPlan, data: PublicationData):\n"
+    first = "        for local in range(lane, 35, stride):\n"
+    body = (
+        "        for local in range(lane, 32, stride):\n"
+        "            joint = plan.joint_ids[world, local]\n"
+        "            transform = kernels.jcalc_transform(\n"
+    )
+    for seam in (signature, first, body, "def get_kernel(arch):\n", "    return world_scan_publication\n"):
+        if source.count(seam) != 1:
+            raise ValueError("Original publication ownership seam changed; review resolved composition")
+    start, end = source.index(first), source.index(body)
+    generalized = source[start:end]
+    if start >= end or generalized.count("        _sync()\n") != 3:
+        raise ValueError("Original generalized publication boundaries changed")
+    result = source[:start] + "        if resolved[world] == 0:\n" + textwrap.indent(generalized, "    ") + source[end:]
+    result = result.replace("def get_kernel(arch):\n", "def _get_resolved_factory(arch):\n")
+    result = result.replace(
+        signature,
+        "    def world_scan_publication_resolved(\n"
+        "        plan: kuka_joint_world.JointWorldPlan, data: PublicationData, resolved: wp.array[int]\n"
+        "    ):\n",
+    )
+    return result.replace("    return world_scan_publication\n", "    return world_scan_publication_resolved\n")
+
+
+@functools.cache
+def get_resolved_kernel(arch):
+    """Return the late body owner with a current light-resolved generalized skip.
+
+    The caller must pass the current light owner's resolved array only after that
+    invocation has integrated selected worlds. Ordinary ZERO classification does
+    not establish this ownership and must use the standalone kernel instead.
+    """
+    source = _resolved_source(inspect.getsource(get_kernel))
+    filename = f"<world-scan-resolved-{hashlib.sha256(source.encode()).hexdigest()}>"
+    linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)
+    namespace = dict(globals())
+    exec(compile(source, filename, "exec"), namespace)
+    return namespace["_get_resolved_factory"](arch)

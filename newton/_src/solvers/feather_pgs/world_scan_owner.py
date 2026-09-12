@@ -7,7 +7,7 @@ import numpy as np
 import warp as wp
 
 from ...sim import ModelFlags
-from . import kuka_joint_world, simple_world, world_scan_publication
+from . import kuka_joint_owner, kuka_joint_world, simple_world, world_scan_publication
 
 MODEL_FIELDS = (
     "joint_type",
@@ -57,12 +57,13 @@ PLAN_FIELDS = (
 
 
 def supported(solver):
-    """Restrict the first experiment to the original direct Kuka recipe, without early integration."""
+    """Restrict publication to the direct Kuka recipe and its compatible light owner."""
+    light = getattr(solver, "_joint_world", None)
     return (
         solver.model.device.is_cuda
         and not solver.model.particle_count
         and solver._fk_id_cache_enabled
-        and getattr(solver, "_joint_world", None) is None
+        and (light is None or (isinstance(light, kuka_joint_owner.JointWorldOwner) and light.solver is solver))
         and simple_world._supported(solver)
     )
 
@@ -72,8 +73,16 @@ class WorldScanOwner:
 
     def __init__(self, solver, *, host_plan):
         self.solver = solver
-        self.plan = host_plan.device_data(solver.model.device)
+        self.joint_owner = getattr(solver, "_joint_world", None)
+        self.plan = (
+            self.joint_owner.plan if self.joint_owner is not None else host_plan.device_data(solver.model.device)
+        )
         self.kernel = world_scan_publication.get_kernel(str(solver.model.device.arch))
+        self.resolved_kernel = (
+            world_scan_publication.get_resolved_kernel(str(solver.model.device.arch))
+            if self.joint_owner is not None
+            else None
+        )
         self.model_plan_values = {name: getattr(solver.model, name).numpy().copy() for name in PLAN_FIELDS}
 
     def validate_notification(self, flags):
@@ -97,6 +106,11 @@ class WorldScanOwner:
         """Bind live values and return false before any write for unsupported or aliased states."""
         solver, model = self.solver, self.solver.model
         if not supported(solver) or state_in.requires_grad or state_out.requires_grad:
+            return False
+        if getattr(solver, "_joint_world", None) is not self.joint_owner:
+            return False
+        light_active = getattr(solver, "_joint_world_active", False)
+        if light_active and self.joint_owner is None:
             return False
         data = world_scan_publication.PublicationData()
         for name in MODEL_FIELDS:
@@ -144,10 +158,17 @@ class WorldScanOwner:
         parallel_next_refresh = next_refresh and solver._global_inertia_stream is not None
         data.materialize_all_body_inertia = int(next_refresh and not parallel_next_refresh)
         data.materialize_body_inertia_terms = int(parallel_next_refresh)
+        inputs = [self.plan, data]
+        kernel = self.kernel
+        if light_active:
+            # Only the current S3 light invocation has integrated resolved worlds.
+            # The ordinary S4 classifier writes the same mask without integration.
+            inputs.append(self.joint_owner.output.resolved)
+            kernel = self.resolved_kernel
         wp.launch_tiled(
-            self.kernel,
+            kernel,
             dim=[solver.world_count],
-            inputs=[self.plan, data],
+            inputs=inputs,
             block_dim=32,
             device=model.device,
         )
@@ -160,7 +181,8 @@ def create_owner(solver):
     if not supported(solver):
         return None
     try:
-        host_plan = kuka_joint_world.bind_plan(solver)
+        light = getattr(solver, "_joint_world", None)
+        host_plan = light.host_plan if light is not None else kuka_joint_world.bind_plan(solver)
         world_scan_publication.validate_scan_plan(host_plan)
     except ValueError:
         return None

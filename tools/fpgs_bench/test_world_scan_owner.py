@@ -14,6 +14,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.sim import ModelFlags
+from newton._src.solvers.feather_pgs import kuka_joint_owner
 from newton._src.solvers.feather_pgs import world_scan_owner as owner
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 
@@ -34,6 +35,7 @@ def fixture():
         world_count=2,
         _fk_id_cache_enabled=True,
         _joint_world=None,
+        _joint_world_active=False,
         _step=0,
         update_mass_matrix_interval=2,
         _global_inertia_stream=object(),
@@ -57,10 +59,79 @@ def fixture():
     ]
     current = object.__new__(owner.WorldScanOwner)
     current.solver, current.plan, current.kernel = solver, object(), object()
+    current.joint_owner, current.resolved_kernel = None, object()
     return current, states[0], aug, states[1]
 
 
 class TestWorldScanOwner(unittest.TestCase):
+    def test_only_current_light_owner_can_skip_generalized_work(self):
+        """Ignore stale classifier bits unless this call's light kernel integrated them."""
+        current, state_in, aug, state_out = fixture()
+        light = object.__new__(kuka_joint_owner.JointWorldOwner)
+        light.solver = current.solver
+        light.plan = current.plan
+        light.output = SimpleNamespace(resolved=wp.ones(2, dtype=int, device="cpu"))
+        current.joint_owner = current.solver._joint_world = light
+        for active in (False, True, False, True):
+            current.solver._joint_world_active = active
+            with patch.object(owner, "supported", return_value=True), patch.object(owner.wp, "launch_tiled") as launch:
+                self.assertTrue(current.try_publish(state_in, aug, state_out, 0.02))
+            self.assertIs(launch.call_args.args[0], current.resolved_kernel if active else current.kernel)
+            inputs = launch.call_args.kwargs["inputs"]
+            self.assertEqual(len(inputs), 3 if active else 2)
+            if active:
+                self.assertIs(inputs[2], light.output.resolved)
+            self.assertIs(inputs[0], light.plan)
+
+    def test_active_light_rejection_preserves_fallback_and_cache_epoch(self):
+        """An aliased state must not launch or consume the active integration handoff."""
+        current, state_in, aug, state_out = fixture()
+        light = object.__new__(kuka_joint_owner.JointWorldOwner)
+        light.solver = current.solver
+        current.joint_owner = current.solver._joint_world = light
+        current.solver._joint_world_active = True
+        state_out.joint_q = state_in.joint_q
+        before = current.solver._fk_id_cache_source_state
+        with patch.object(owner, "supported", return_value=True), patch.object(owner.wp, "launch_tiled") as launch:
+            self.assertFalse(current.try_publish(state_in, aug, state_out, 0.02))
+        launch.assert_not_called()
+        self.assertTrue(current.solver._joint_world_active)
+        self.assertIs(current.solver._fk_id_cache_source_state, before)
+
+    def test_changed_light_identity_rejects_before_any_publication(self):
+        """Never combine maps from one owner with a different owner's current mask."""
+        current, state_in, aug, state_out = fixture()
+        current.solver._joint_world = object()
+        current.solver._joint_world_active = True
+        before = current.solver._fk_id_cache_source_state
+        with patch.object(owner, "supported", return_value=True), patch.object(owner.wp, "launch_tiled") as launch:
+            self.assertFalse(current.try_publish(state_in, aug, state_out, 0.02))
+        launch.assert_not_called()
+        self.assertIs(current.solver._fk_id_cache_source_state, before)
+
+    def test_composed_constructor_reuses_validated_light_plan(self):
+        """Reuse the immutable world maps instead of allocating a second copy."""
+        current, _, _, _ = fixture()
+        light = object.__new__(kuka_joint_owner.JointWorldOwner)
+        light.solver, light.host_plan, light.plan = current.solver, Mock(), object()
+        current.solver._joint_world = light
+        for name in owner.PLAN_FIELDS:
+            setattr(current.solver.model, name, Mock())
+            getattr(current.solver.model, name).numpy.return_value = np.array([1, 2])
+        with (
+            patch.object(owner, "supported", return_value=True),
+            patch.object(owner.kuka_joint_world, "bind_plan") as bind,
+            patch.object(owner.world_scan_publication, "validate_scan_plan") as validate,
+            patch.object(owner.world_scan_publication, "get_kernel"),
+            patch.object(owner.world_scan_publication, "get_resolved_kernel"),
+        ):
+            result = owner.create_owner(current.solver)
+        bind.assert_not_called()
+        validate.assert_called_once_with(light.host_plan)
+        light.host_plan.device_data.assert_not_called()
+        self.assertIs(result.plan, light.plan)
+        self.assertIs(result.joint_owner, light)
+
     def test_bind_current_cache_and_refresh_epochs(self):
         """Bind every canonical output and retain the original next-refresh predicates."""
         current, state_in, aug, state_out = fixture()
@@ -158,8 +229,8 @@ class TestWorldScanOwner(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "reconstruct"):
             current.validate_notification(ModelFlags.JOINT_PROPERTIES)
 
-    def test_unsupported_constructor_and_joint_world_composition_fall_back(self):
-        """Keep unsupported topology and the unvalidated light composition on the original owner."""
+    def test_unsupported_constructor_and_foreign_owner_fall_back(self):
+        """Keep unsupported topology and incompatible light owners on the original path."""
         current, _, _, _ = fixture()
         solver = current.solver
         with patch.object(owner.simple_world, "_supported", return_value=True):
@@ -172,6 +243,13 @@ class TestWorldScanOwner(unittest.TestCase):
         solver.model.device = SimpleNamespace(is_cuda=True)
         solver._joint_world = object()
         with patch.object(owner.simple_world, "_supported", return_value=True):
+            self.assertFalse(owner.supported(solver))
+        light = object.__new__(kuka_joint_owner.JointWorldOwner)
+        light.solver = solver
+        solver._joint_world = light
+        with patch.object(owner.simple_world, "_supported", return_value=True):
+            self.assertTrue(owner.supported(solver))
+            light.solver = object()
             self.assertFalse(owner.supported(solver))
 
     def test_solver_dispatch_replaces_the_complete_late_owner(self):
