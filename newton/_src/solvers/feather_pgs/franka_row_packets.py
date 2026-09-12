@@ -13,6 +13,8 @@ from functools import cache
 import numpy as np
 import warp as wp
 
+from ...sim import ModelFlags
+
 
 @wp.struct
 class PrefixData:
@@ -481,8 +483,23 @@ class LocalRowPackets:
         self.contact_input = None
         self._topology_signature = topology_signature(solver)
 
-    def validate_notification(self):
-        """Allow live numeric changes, but require reconstruction for structural edits."""
+    def validate_notification(self, flags: ModelFlags | int = ModelFlags.ALL):
+        """Validate structural changes without reading back numeric-only updates.
+
+        The ModelFlags contract limits these four flags to live DOF properties,
+        inertial/material values and global parameters such as gravity. None
+        changes the pinned topology. BODY_PROPERTIES can change body_flags;
+        it and all other/unknown flags retain complete validation. Structural
+        edits require reconstruction, not a numeric-only notification.
+        """
+        numeric_flags = (
+            ModelFlags.JOINT_DOF_PROPERTIES
+            | ModelFlags.BODY_INERTIAL_PROPERTIES
+            | ModelFlags.SHAPE_PROPERTIES
+            | ModelFlags.MODEL_PROPERTIES
+        )
+        if flags and not (int(flags) & ~int(numeric_flags)):
+            return
         if topology_signature(self.solver) != self._topology_signature or not topology_supported(self.solver):
             raise RuntimeError(
                 "Private row-packet topology changed; reconstruct the solver to select a complete fallback"
