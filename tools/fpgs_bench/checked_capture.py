@@ -87,6 +87,48 @@ def fused_contact_metadata(solver) -> dict:
     return result
 
 
+def joint_world_metadata(solver) -> dict:
+    """Check actual current joint-world outputs outside both timed windows."""
+    owner = getattr(solver, "_joint_world", None)
+    result = {"configured": owner is not None, "whole_run_admission": False}
+    if owner is None:
+        return result
+    if owner.solver is not solver:
+        raise RuntimeError("Joint-world owner is bound to another solver")
+    worlds, output = solver.world_count, owner.output
+
+    def read(array, size):
+        if array.device.is_capturing or array.shape != (size,):
+            raise RuntimeError("Read correctly shaped joint-world outputs outside capture")
+        values = array.numpy().tolist()
+        if any(type(value) is not int for value in values):
+            raise RuntimeError("Joint-world outputs must contain integer indices")
+        return values
+
+    count = read(output.active_count, 1)[0]
+    resolved = read(output.resolved, worlds)
+    active = read(output.active_worlds, worlds)
+    fallback = read(output.predictor_fallback, worlds)
+    invalid = read(owner.buckets.data.invalid, 1)[0]
+    if (
+        not 0 <= count <= worlds
+        or any(value not in (0, 1) for value in resolved + fallback)
+        or sorted(active[:count]) != [world for world, zero in enumerate(resolved) if not zero]
+        or any(zero and original for zero, original in zip(resolved, fallback, strict=True))
+        or invalid != 0
+    ):
+        raise RuntimeError("Invalid current joint-world partition, predictor fallback or raw prefix")
+    result.update(
+        scope="Most recent output buffers only; not whole-run admission or a numerical-convergence check",
+        worlds=worlds,
+        zero_worlds=sum(resolved),
+        active_worlds=count,
+        original_predictor_worlds=sum(fallback),
+        raw_index_storage_bytes=owner.buckets.storage_bytes,
+    )
+    return result
+
+
 def early_publication_metadata(solver) -> dict:
     """Read current disjoint publication lists only at the existing untimed boundary."""
     result = {}
@@ -292,6 +334,7 @@ def install_boundary_check(harness: ModuleType, report: dict, save, get_manager,
             if physics == "feather_pgs":
                 entry["fused_contact_solve"] = fused_contact_metadata(manager._solver)
                 entry["early_publication"] = early_publication_metadata(manager._solver)
+                entry["joint_world"] = joint_world_metadata(manager._solver)
             if not isinstance(metadata, dict) or "error" in metadata or metadata.get("state_finite") is not True:
                 raise RuntimeError(f"Invalid Lab state/model metadata: {metadata!r}")
             metadata["overflow_check"] = entry
