@@ -1,5 +1,40 @@
 # Compare FPGS and MJWarp with the existing Isaac Lab harness
 
+For an FPGS-before/after experiment, use the sibling `compare_variants.py`.
+Both arms then run FPGS with identical task recipes, capacities and seed zero;
+they are labeled baseline/candidate, not FPGS/MJWarp. It requires exactly two
+selected GPUs, starts them simultaneously for each arm, alternates AB/BA rounds,
+and reuses this directory's checked capture, source/idle guards and child-group
+cleanup. No unchecked route or arbitrary solver-attribute override is exposed.
+Example reproducing the structural Keyboard experiment:
+
+```sh
+uv run --no-project --python /path/to/isaaclab/.venv/bin/python \
+  python tools/fpgs_bench/compare_variants.py \
+  --isaaclab /path/to/isaaclab \
+  --baseline /path/to/newton-at-108459ec \
+  --candidate /path/to/newton-at-654894cb \
+  --task keyboard-so101 --gpus 0 1 --num-envs 4096 \
+  --rounds 3 --warmup-steps 200 --steps 1000 --profile-steps 40 \
+  --capacity keyboard-so101:fpgs:dense_max_constraints=704 \
+  --capacity keyboard-so101:fpgs:rigid_contact_max=147456 \
+  --capacity keyboard-so101:fpgs:broad_phase_output_max=57344 \
+  --candidate-env FEATHER_PGS_SPARSE_CONTACT_DIRECT=1 \
+  --candidate-env FEATHER_PGS_PRISMATIC_PUBLICATION=1 \
+  --output-dir /path/outside/checkouts/keyboard-structural-ab
+```
+
+These capacities are calibrated for this 4K task, not universal recommendations.
+Variant flags apply to both selected devices. `--trace-mode node` is available
+for attribution; only at least three completed graph-mode rounds are labeled
+repeated timing evidence. The manifest reports physics and wall medians and
+ratios separately. It binds the recorded public task budgets and actual capacity
+checks, not every internal generated loop. Physical quality and performance
+promotion are never automatic: use the separate numerical/physical evidence and
+the [structural report](../../reports/fpgs/STRUCTURAL_RESULTS_20260912.md).
+Run its CPU tests with `uv run --no-project python -m unittest discover -s
+tools/fpgs_bench -p test_compare_variants.py -v`.
+
 This driver compares the handoff task recipes without editing Isaac Lab or tuning physics parameters. It loads `scripts/benchmarks/fpgs_profile/compare_gpus.py` from an explicit Lab checkout and uses that checkout's unchanged capture script, analyzer, source-digest helper, and result aggregation. Existing Lab recipes are preserved; Newton-only aliases are merged into an isolated copy, with conflicting definitions rejected. The driver and its CPU tests require only Python's standard library.
 
 Checked capture is the default: missing, failed or source-mismatched boundary
