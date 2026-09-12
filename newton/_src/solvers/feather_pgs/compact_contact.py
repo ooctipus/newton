@@ -164,10 +164,9 @@ def clear_contact_response(
             Y[group, row, dof] = 0.0
 
 
-@wp.kernel
-def produce_contacts(data: ContactBoundaryData):
+@wp.func
+def produce_contact(data: ContactBoundaryData, contact: int):
     """Publish one allocated contact after the current-contact dense zero owner."""
-    contact = wp.tid()
     if contact >= wp.min(data.count[0], data.point0.shape[0]):
         return
     slot = data.slot[contact]
@@ -313,6 +312,12 @@ def produce_contacts(data: ContactBoundaryData):
 
 
 @wp.kernel
+def produce_contacts(data: ContactBoundaryData):
+    """Publish allocated contacts with the original raw-contact ownership."""
+    produce_contact(data, wp.tid())
+
+
+@wp.kernel
 def produce_limit_response(
     bounds: wp.array2d[int],
     counts: wp.array[int],
@@ -339,8 +344,8 @@ def produce_limit_response(
     diag[world, row] = diagonal + cfm[world, row]
 
 
-def launch_contacts(solver, state_in, state_aug, contacts, workers):
-    """Bind actual current owners; Warp capture retains these launch descriptors."""
+def bind_contact_data(solver, state_in, state_aug, contacts):
+    """Bind current contact inputs and canonical output owners without launching work."""
     data = ContactBoundaryData()
     for name, source in (
         ("count", "count"),
@@ -397,6 +402,12 @@ def launch_contacts(solver, state_in, state_aug, contacts, workers):
     data.Y = solver.Y_by_size[6]
     data.shared_anchor = int(solver.contact_shared_anchor)
     data.friction_shared_anchor = int(solver.contact_friction_shared_anchor)
+    return data
+
+
+def launch_contacts(solver, state_in, state_aug, contacts, workers):
+    """Bind actual current owners; Warp capture retains these launch descriptors."""
+    data = bind_contact_data(solver, state_in, state_aug, contacts)
     # Allocation has completed, but constraint_count is finalized later. Keep
     # this clear and the following producer ordered on the current stream.
     wp.launch(

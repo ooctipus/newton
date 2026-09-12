@@ -229,6 +229,7 @@ _FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
 # Experimental Stage 7 producer partition, leaving all solve/mass budgets intact.
 _PRISMATIC_PUBLICATION = os.environ.get("FEATHER_PGS_PRISMATIC_PUBLICATION", "0") == "1"
 _COMPACT_CONTACT_BOUNDARY = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_BOUNDARY", "0") == "1"
+_FUSED_CONTACT_SOLVE = os.environ.get("FEATHER_PGS_FUSED_CONTACT_SOLVE", "0") == "1"
 _DEBUG_CACHE = os.environ.get("FEATHER_PGS_DEBUG_CACHE") == "1"
 _DEBUG_CACHE_MODE = os.environ.get("FEATHER_PGS_DEBUG_CACHE_MODE", "")
 _DEBUG_DELAY = int(os.environ.get("FEATHER_PGS_DEBUG_DELAY", "0"))
@@ -2389,6 +2390,14 @@ class SolverFeatherPGS(SolverBase):
             from .compact_contact import supported  # noqa: PLC0415
 
             self._compact_contact_boundary = supported(self)
+
+        self._fused_contact_solve = None
+        self._fused_contact_solve_active = None
+        if _FUSED_CONTACT_SOLVE and not (_FPGS_CAPTURE or _GROUPED_CHECK or _CHECK_ROWS or _CHECK_ROWS_FUSED):
+            from .fused_contact_solve import FusedContactSolve, supported  # noqa: PLC0415
+
+            if supported(self):
+                self._fused_contact_solve = FusedContactSolve(self)
 
     def _update_kinematic_state(self) -> None:
         """Refresh cached kinematic flags and effective joint armature."""
@@ -6621,6 +6630,11 @@ class SolverFeatherPGS(SolverBase):
         if self._sparse_diagonal_contact_solve:
             if row_phase_override not in (None, 0):
                 raise RuntimeError("sparse diagonal response only supports the interleaved row phase")
+            if self._fused_contact_solve_active is not None:
+                self._fused_contact_solve_active.launch_solve(
+                    self, dense_rhs, iterations, omega, friction_start_iteration, iteration_offset
+                )
+                return
             kernel = self._pgs_solve_sparse_diagonal_kernel
             if kernel is None:
                 raise RuntimeError("Sparse diagonal GS kernel is unavailable for this solver shape")
@@ -10705,6 +10719,16 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage4_build_rows(self, state_in: State, state_aug: State, control: Control, contacts: Contacts, dt: float):
+        # Absence of a Contacts owner selects the complete original path for
+        # this call; no stale per-world classifier result may survive it.
+        self._fused_contact_solve_active = (
+            self._fused_contact_solve
+            if contacts is not None
+            and getattr(contacts, "rigid_contact_count", None) is not None
+            and contacts.rigid_contact_max > 0
+            and self.pgs_iterations > 0
+            else None
+        )
         model = self.model
         max_constraints = self.dense_max_constraints
         mf_active = self._has_free_rigid_bodies
@@ -11260,9 +11284,12 @@ class SolverFeatherPGS(SolverBase):
                 j_buffers_zeroed = True
 
             if self._compact_contact_boundary:
-                from .compact_contact import launch_contacts  # noqa: PLC0415
+                if self._fused_contact_solve_active is not None:
+                    self._fused_contact_solve_active.prepare(self, state_in, state_aug, contacts, dt)
+                else:
+                    from .compact_contact import launch_contacts  # noqa: PLC0415
 
-                launch_contacts(self, state_in, state_aug, contacts, contact_build_threads)
+                    launch_contacts(self, state_in, state_aug, contacts, contact_build_threads)
             elif self._compact_contact_jacobian or self._sparse_diagonal_contact_solve:
                 wp.launch(
                     prepare_world_contact_rows,
@@ -12289,7 +12316,9 @@ class SolverFeatherPGS(SolverBase):
         for launch in self._deferred_row_launches:
             launch()
         self._deferred_row_launches = []
-        if self._sparse_diagonal_contact_triples:
+        if self._fused_contact_solve_active is not None:
+            self._fused_contact_solve_active.schedule(self)
+        elif self._sparse_diagonal_contact_triples:
             schedule = self._build_independent_sparse_contact_groups_kernel
             if schedule is None:
                 raise RuntimeError("Independent sparse-contact schedule kernel is unavailable")
@@ -13155,7 +13184,9 @@ class SolverFeatherPGS(SolverBase):
             compute_world_contact_bias,
             dim=self.world_count * self.dense_max_constraints,
             inputs=[
-                self.constraint_count,
+                self.constraint_count
+                if self._fused_contact_solve_active is None
+                else self._fused_contact_solve_active.fallback_counts,
                 self.dense_max_constraints,
                 self.phi,
                 self.row_beta,
@@ -13204,7 +13235,9 @@ class SolverFeatherPGS(SolverBase):
                     apply_sparse_diagonal_contact_restitution_matrix_free,
                     dim=self.world_count * self.dense_max_constraints,
                     inputs=[
-                        self.constraint_count,
+                        self.constraint_count
+                        if self._fused_contact_solve_active is None
+                        else self._fused_contact_solve_active.fallback_counts,
                         self.dense_max_constraints,
                         self.phi,
                         self.row_type,
@@ -13275,7 +13308,9 @@ class SolverFeatherPGS(SolverBase):
             prepare_world_impulses,
             dim=self.world_count,
             inputs=[
-                self.constraint_count,
+                self.constraint_count
+                if self._fused_contact_solve_active is None
+                else self._fused_contact_solve_active.fallback_counts,
                 self.dense_max_constraints,
                 warmstart_flag,
             ],
