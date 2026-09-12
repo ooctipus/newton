@@ -2396,6 +2396,12 @@ class SolverFeatherPGS(SolverBase):
 
             self._compact_contact_boundary = supported(self)
 
+        self._early_kuka = None
+        if os.environ.get("FEATHER_PGS_EARLY_KUKA") == "1":
+            from .early_kuka import create_owner  # noqa: PLC0415
+
+            self._early_kuka = create_owner(self)
+
     def _update_kinematic_state(self) -> None:
         """Refresh cached kinematic flags and effective joint armature."""
         model = self.model
@@ -2437,6 +2443,9 @@ class SolverFeatherPGS(SolverBase):
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         """Refresh cached solver data after supported model changes."""
+        early = getattr(self, "_early_kuka", None)
+        if early is not None:
+            early.wait()
         if self._row_packets is not None:
             self._row_packets.validate_notification(flags)
         if self._fk_id_cache_enabled and flags & (
@@ -2490,6 +2499,9 @@ class SolverFeatherPGS(SolverBase):
             flags: State flags, which do not affect solver-owned impulse history.
         """
         del flags
+        early = getattr(self, "_early_kuka", None)
+        if early is not None:
+            early.wait()
         if world_mask is not None and world_mask.shape[0] != self.world_count:
             raise ValueError(
                 f"world_mask has length {world_mask.shape[0]}, expected {self.world_count} (one entry per world)."
@@ -8334,6 +8346,8 @@ class SolverFeatherPGS(SolverBase):
         dt: float,
         collide_done_event=None,
     ):
+        if self._early_kuka is not None:
+            self._early_kuka.begin(state_in, state_out)
         if contacts is not None and contacts.rigid_contact_max > self._max_contacts_alloc:
             raise ValueError(
                 "FeatherPGS contact capacity mismatch: received "
@@ -8472,6 +8486,8 @@ class SolverFeatherPGS(SolverBase):
         with wp.ScopedTimer("S4_ContactBuild", print=False, use_nvtx=self._nvtx, synchronize=False):
             if self._simple_world_classifier is not None:
                 self._simple_world_classifier.classify(state_in, state_aug, contacts, dt)
+                if self._early_kuka is not None:
+                    self._early_kuka.launch(state_in, state_aug, state_out, dt)
             self._stage4_build_rows(state_in, state_aug, control, contacts, dt)
 
         if self.pgs_mode == "matrix_free":
@@ -8988,7 +9004,9 @@ class SolverFeatherPGS(SolverBase):
         # STAGE 7: Update qdd + integrate
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S7_Integrate", print=False, use_nvtx=self._nvtx, synchronize=False):
-            if self.pgs_mode == "matrix_free" and self.pgs_velocity_iterations > 0:
+            if self._early_kuka is not None and self._early_kuka.active:
+                self._early_kuka.finish(state_in, state_aug, state_out, dt)
+            elif self.pgs_mode == "matrix_free" and self.pgs_velocity_iterations > 0:
                 self._stage6_write_final_velocity(state_in, state_aug, state_out, dt)
             else:
                 self._stage6_update_qdd(state_in, state_aug, dt)
@@ -13523,6 +13541,8 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage6_prepare_world_velocity(self):
+        if self._early_kuka is not None and self._early_kuka.active:
+            return  # The authoritative full copy already precedes the ZERO publication fork.
         wp.copy(self.v_out, self.v_hat)
 
     def _build_mf_body_map(self) -> None:
@@ -13701,6 +13721,9 @@ class SolverFeatherPGS(SolverBase):
             outputs=[self.mf_body_Hinv],
             device=model.device,
         )
+
+        if self._early_kuka is not None:
+            self._early_kuka.after_mf_inverse()
 
         # Compute effective mass and RHS
         self.mf_rhs.zero_()
@@ -14175,6 +14198,9 @@ class SolverFeatherPGS(SolverBase):
             )
         ]
         streams.extend(getattr(self, "_size_streams", {}).values())
+        early = getattr(self, "_early_kuka", None)
+        if early is not None:
+            streams.append(early.stream)
         synchronized = set()
         for stream in streams:
             if stream is None or id(stream) in synchronized:
