@@ -92,10 +92,10 @@ not be added again; uncovered time is not an attribution to CPU or Lab.
 This is one paired three-profile-step node window (12 correlated graph roots,
 24 Newton substeps per arm), not balanced repeated performance acceptance.
 
-Actual selected-world boundary counts are 12,647/12,584 RTX and12,529/12,632 GB,
-of 16,384: about 76–77%, not the earlier84–85% two-call sampler. The selected
+Actual selected-world boundary counts are 12,647/12,584 RTX and 12,529/12,632 GB,
+of 16,384: about 76–77%, not the earlier 84–85% two-call sampler. The selected
 cohort still owns all three articulations and all 35 global DOFs, including
-prescribed 6; response width remains29. All four candidate boundaries pass
+prescribed 6; response width remains 29. All four candidate boundaries pass
 disjoint/exhaustive actual-buffer checks.
 
 All child checks complete/pass; all four solver and 13 narrow/collision sticky
@@ -114,7 +114,7 @@ more than original all-world FK 1.437109/1.374922 ms. Including late FK gives
 2.243318/2.292192 ms. This is not the .026731/.031808 ms compaction kernel.
 
 The original allocator/contact-prelude/masked-J chain grows from
-.897045 → 1.723489 ms RTX and1.134175 → 1.961203 ms GB. The completed-ZERO to
+.897045 → 1.723489 ms RTX and 1.134175 → 1.961203 ms GB. The completed-ZERO to
 completed-MF-inverse dependency window grows 2.305365 → 3.692709 and
 2.634986 → 4.076747 ms, while ZERO and inverse kernels themselves are essentially
 unchanged. This localizes the dilation to newly concurrent publication and
@@ -122,7 +122,7 @@ row preparation. It supports contention without uniquely establishing
 bandwidth, occupancy or cache behavior.
 
 Early finalization has zero exposed tail after late finalization in all 24
-sampled windows on both cards. It finishes213–309 us RTX /225–332 us GB before
+sampled windows on both cards. It finishes 213–309 us RTX / 225–332 us GB before
 late publication even starts. The mandatory final join is not the loss.
 The FK-to-finalizer wait protects the original MF inertia reader and is not
 safe or useful to remove merely because it appears long.
@@ -152,7 +152,7 @@ Baseline `064ec8ac455fc4cde557a3b54a1a62624cf56441`; tools
 `1d8feb82d17dbfab8f0772de56f84deae2cb7974`.
 
 - Runtime early_kuka.py SHA256:
-  `2f598b15aea 10a01e371f0970a165bafeb93680ce26dc6d530c9351c41ccd176`.
+  `2f598b15aea10a01e371f0970a165bafeb93680ce26dc6d530c9351c41ccd176`.
 - Runtime solver SHA256:
   `f1cecef6b9986ad5301ff1b4acd7261f03b84e95de766d624fcb9d7c499f9a13`.
 - Completed parent:
