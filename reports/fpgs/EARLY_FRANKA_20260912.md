@@ -73,3 +73,104 @@ The done event is joined before whole-state publication and `active` is then
 cleared, so a new capture does not inherit a prior graph's event. Untimed
 admission metadata should inspect the persistent device cohort counts/masks,
 not interpret the deliberately cleared host `active` flag as non-admission.
+
+## Completed device controls and rejected timing
+
+The frozen runtime is `b217a144e2fa79c8fc3287712452aa5589bcb9e5`.
+Both actual GPUs pass all **58 registered controls** (old 45 plus new 13), without
+skips; root reaped the test processes before the live runs. These include the
+saved-input/native two-graph, publication, ownership, and negative overwrite
+controls described above. They establish bounded implementation correctness,
+not universal convergence or identical task trajectories.
+
+The 512 screen completes with real early admission but loses physics time:
+RTX 2.615774 → 2.696586 ms; GB 2.826325 → 3.056757 ms. The intended 16K screen
+also completes and is **rejected**, not promoted:
+
+| Current 16K node window, ms/env-step | RTX baseline | RTX early | GB baseline | GB early |
+| --- | ---: | ---: | ---: | ---: |
+| Complete graph span | 5.889696 | 6.121368 | 5.409374 | 5.835510 |
+| Device-work union | 5.636928 | 5.919330 | 5.117989 | 5.599465 |
+| Publication union | .924107 | 1.583607 | .689553 | 1.381625 |
+| Publication-exclusive busy | .924107 | .747971 | .686513 | .674520 |
+| Publication + SINGLE9 + cohort exclusive busy | .924107 | .949709 | .686513 | .910584 |
+
+This is one paired, three-profile-step node window: 12 process-correlated graph
+roots and 24 Newton substeps per arm, not repeated whole-graph promotion.
+The existing 40 synchronized wall samples are a separate measurement.
+
+Actual early counts at the two untimed boundaries are 15,569/15,608 RTX and
+15,569/15,574 GB, of 16,384. All selected/complement lists are disjoint and
+exhaustive. Both boundaries of all four arms have zero solver and collision
+sticky flags. Public contacts 4,000,000, dense 192, MF 64, propagation 192, seed 0,
+200 warmup steps, sim_dt 1/120, two Newton substeps, decimation 4 and the original
+maximum eight GS sweeps remain unchanged. Parent completion, source and idle
+guards all pass; no Lab or model/task parameter changes were made.
+
+### Why intended overlap did not yield a gain
+
+Early publication really overlaps and completes before late publication starts
+in all 24 substeps on each card. Maximum measured early overhang after late
+publication starts is zero: this is not a final-join tail failure. The cost is
+extra publication work, new exposed SINGLE9, and inflated concurrent preparation.
+
+Early publication costs 1.021377/.851527 ms union (RTX/GB), of which
+.185741/.144422 ms is exclusive busy. Late publication remains
+.562230/.530098 ms, entirely exposed. The new cohort prelude adds
+.099307/.114720 ms summed work; SINGLE9, previously hidden under other local
+owners, now has .102453/.122016 ms exclusive busy. Added routing/dispatch plus
+early and late publication increase device work from 628 to 724 operations per
+environment step.
+
+The unchanged body inverse grows .120928→.196373 ms RTX and
+.082645→.104094 ms GB; contact production grows .175776→.228853 and
+.213259→.261653 ms. This supports contention as a cause, not a hardware-counter
+claim that uniquely identifies bandwidth or occupancy. Contact trajectories
+differ, and RTX owner40 becomes .101344 ms cheaper, so not every duration delta
+can be assigned to scheduling.
+
+Late compact articulation lists mix rare primary 9 arms with mandatory free and
+prescribed trees; late qdd/integration/finalization also retain masked global
+grids. Early/late FK retain the original equations and zero reported local
+memory, with 72 RTX registers (GB early64/late72). Actual grids and all per-call
+resources are recorded in the causal evidence. Count guards protect ownership
+but do not remove launched slots or mixed-tree loop costs.
+
+A narrow late-list correction is not selected: even deleting the entire
+.562230 ms RTX late-publication owner cannot recover the .820642 ms required
+for a 10% gain over this paired baseline. The separately assessed earlier
+prefix-owned readiness variant has only about .022 ms modeled RTX margin
+under optimistic overlap/cost assumptions; root rejected implementation as too
+fragile. This scheduling branch is closed without a layout grid or runtime
+retry. The fixed fourfold backend target remains unachieved.
+
+### Frozen provenance
+
+Baseline `064ec8ac455fc4cde557a3b54a1a62624cf56441`; tools
+`5a9d8d76dc060b11fbd9672803c902595488caed`; unchanged Lab
+`1d8feb82d17dbfab8f0772de56f84deae2cb7974`.
+
+- Runtime early_franka.py SHA256:
+  `0708cbe11fd0f750d079204611b236167e5ac72ced9164fef0416f92d394f242`.
+- Runtime solver SHA256:
+  `0c6d2947ff81fbf9daaf276235b3998885e0d3f0d80d6c4954e340cd997dc13b`.
+- Completed16K parent:
+  `/tmp/fpgs-fourx-early-franka16k-20260912-01`; manifest SHA256
+  `fc73025143f4eca53960c9460c3b8114055069aefd970adc4eb13b1868ad9f5f`.
+- Completed512 parent:
+  `/tmp/fpgs-fourx-early-franka512-20260912-01`; manifest SHA256
+  `11851674e9d10540248cda55c6172b6326b30acbbd072250b1ef0184e3376598`.
+- Independent causal audit:
+  `/tmp/fpgs-early-franka16k-causal-uRiwdfIv/{RESULTS.md,evidence.json,audit.py}`.
+  Evidence SHA256:
+  `5eaa821442e618d37bef8e6b51ef25dd54a23ea8d0a3ec5e2cafb88e3076dce9`;
+  audit SHA256:
+  `b07b0792f8ac3603539807b357fe58f2f3628cb5fac6a2d4984400ff773ec695`;
+  results SHA256:
+  `f1c96d23dd7144477d6b93e72e9a288232f5789f7632c807e118108f5f331d79`.
+- Unimplemented expanded assessment:
+  `/tmp/fpgs-early-franka-prefix-assessment-Ugjf2rzT/CARD.md`, SHA256
+  `f20d5fa8da5e0696e141cebac4659091d5f51a4cb396f026c5f8d48749fe0a3f`.
+
+This checkpoint changes only this report. Frozen runtime, original captures
+and all parent dependency pointers are preserved.
