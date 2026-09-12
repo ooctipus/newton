@@ -54,6 +54,119 @@ def prepare_local_response_source(source: str, dofs: int) -> str:
     return source
 
 
+def prepare_upper_local_response_source(source: str, dofs: int) -> str:
+    """Keep original row ownership and solve H=Et Et.T with upper Et."""
+    if dofs <= 0:
+        raise ValueError("dofs must be positive")
+    pattern = (
+        rf"        for \(int i = 0; i < {dofs}; \+\+i\) \{{\n"
+        r"            float value = s_J\[row \* \d+ \+ i\];\n"
+        r"[\s\S]*?(?=        float diagonal = 0\.0f;)"
+    )
+    matches = list(re.finditer(pattern, source))
+    if len(matches) != 1:
+        raise ValueError("Expected exactly one original primary row solve")
+    start, end = matches[0].span()
+    block = source[start:end]
+    reverse = f"        for (int reverse = 0; reverse < {dofs}; ++reverse) {{\n            const int i = {dofs} - 1 - reverse;"
+    forward = f"        for (int i = 0; i < {dofs}; ++i) {{"
+    if block.count(reverse) != 1:
+        raise ValueError("Original primary transpose solve changed")
+    first, second = block.split(reverse)
+    if first.count(forward) != 1:
+        raise ValueError("Original primary forward solve changed")
+    first = first.replace(forward, reverse)
+    first = _replace_once(
+        rf"for \(int k = 0; k < i; \+\+k\) value -= s_L\[i \* {dofs} \+ k\] \* response\[k\];",
+        f"for (int k = i + 1; k < {dofs}; ++k) value -= s_L[i * {dofs} + k] * response[k];",
+        first,
+    )
+    second = _replace_once(
+        rf"for \(int k = i \+ 1; k < {dofs}; \+\+k\) value -= s_L\[k \* {dofs} \+ i\] \* response\[k\];",
+        f"for (int k = 0; k < i; ++k) value -= s_L[k * {dofs} + i] * response[k];",
+        second,
+    )
+    return source[:start] + first + forward + second + source[end:]
+
+
+@cache
+def get_upper_response_fallback_kernel(dofs: int) -> wp.Kernel:
+    """Preserve the original GENERAL/local restitution ownership using upper Et.
+
+    The ABI and ordinary one-thread-per-row launch are identical to
+    ``hinv_jt_par_row_contact_fallback``. Launch ``n_arts*32`` threads.
+    """
+    if dofs <= 0:
+        raise ValueError("dofs must be positive")
+
+    def upper_response_fallback(
+        L_group: wp.array3d[float],
+        J_group: wp.array3d[float],
+        group_to_art: wp.array[int],
+        art_to_world: wp.array[int],
+        articulation_world_dof_offset: wp.array[int],
+        world_constraint_count: wp.array[int],
+        local_solve_owner: wp.array[int],
+        world_row_restitution: wp.array2d[float],
+        n_dofs: int,
+        max_constraints: int,
+        n_arts: int,
+        write_world: int,
+        Y_group: wp.array3d[float],
+        J_world: wp.array3d[float],
+        Y_world: wp.array3d[float],
+    ):
+        tid = wp.tid()
+        group_index = tid // 32
+        lane = tid % 32
+        if group_index >= n_arts:
+            return
+        art = group_to_art[group_index]
+        world = art_to_world[art]
+        constraint_count = world_constraint_count[world]
+        if local_solve_owner[world] != 0:
+            if write_world != 0:
+                dof_offset = articulation_world_dof_offset[art]
+                constraint = lane
+                while constraint < constraint_count:
+                    if world_row_restitution[world, constraint] > 0.0:
+                        for i in range(n_dofs):
+                            J_world[world, constraint, dof_offset + i] = J_group[group_index, constraint, i]
+                    constraint += 32
+            return
+        constraint = lane
+        while constraint < constraint_count:
+            for reverse in range(n_dofs):
+                i = n_dofs - 1 - reverse
+                value = J_group[group_index, constraint, i]
+                for k in range(i + 1, n_dofs):
+                    value -= L_group[group_index, i, k] * Y_group[group_index, constraint, k]
+                diagonal = L_group[group_index, i, i]
+                if diagonal != 0.0:
+                    Y_group[group_index, constraint, i] = value / diagonal
+                else:
+                    Y_group[group_index, constraint, i] = 0.0
+            for i in range(n_dofs):
+                value = Y_group[group_index, constraint, i]
+                for k in range(i):
+                    value -= L_group[group_index, k, i] * Y_group[group_index, constraint, k]
+                diagonal = L_group[group_index, i, i]
+                if diagonal != 0.0:
+                    Y_group[group_index, constraint, i] = value / diagonal
+                else:
+                    Y_group[group_index, constraint, i] = 0.0
+            if write_world != 0:
+                dof_offset = articulation_world_dof_offset[art]
+                for i in range(n_dofs):
+                    J_world[world, constraint, dof_offset + i] = J_group[group_index, constraint, i]
+                    Y_world[world, constraint, dof_offset + i] = Y_group[group_index, constraint, i]
+            constraint += 32
+
+    upper_response_fallback.__name__ = f"upper_response_fallback_d{dofs}"
+    upper_response_fallback.__qualname__ = upper_response_fallback.__name__
+    return wp.kernel(enable_backward=False, module="unique")(upper_response_fallback)
+
+
 @cache
 def get_group_response_kernel(max_bodies: int, dofs: int, *, write_world: bool = True) -> wp.Kernel:
     """Build one warp per articulation, applying its held factor to current rows.
@@ -124,7 +237,7 @@ def get_group_response_kernel(max_bodies: int, dofs: int, *, write_world: bool =
     return wp.kernel(enable_backward=False, module="unique")(articulated_group_response)
 
 
-def whitening_bridge_source(max_links: int, dofs: int) -> str:
+def whitening_bridge_source(max_links: int, dofs: int, *, encoding_only: bool = False) -> str:
     """Build upper W and E-transpose, with H = E-transpose E and W = E-transpose^-1.
 
     The existing paired consumer uses these in its original L/Linv allocations,
@@ -133,7 +246,7 @@ def whitening_bridge_source(max_links: int, dofs: int) -> str:
     """
     if not 0 < dofs < max_links <= 128:
         raise ValueError("Expected a bounded fixed-root zero/one-DOF tree")
-    return (
+    source = (
         f"constexpr int LINKS = {max_links}, DOFS = {dofs};\n"
         + r"""
 #if defined(__CUDA_ARCH__)
@@ -152,9 +265,10 @@ def whitening_bridge_source(max_links: int, dofs: int) -> str:
     const int base = group * DOFS * DOFS;
     BRIDGE_SHARED int dof_body[DOFS];
     BRIDGE_SHARED float encoding_transpose[DOFS * DOFS];
+    BRIDGE_SHARED float inverse_encoding[DOFS * DOFS];
     for (int item = lane; item < DOFS * DOFS; item += WORKERS) {
         encoding_transpose[item] = 0.0f;
-        whitener.data[base + item] = 0.0f;
+        inverse_encoding[item] = 0.0f;
     }
     for (int item = lane; item < DOFS; item += WORKERS) dof_body[item] = -1;
     BRIDGE_SYNC();
@@ -195,16 +309,21 @@ def whitening_bridge_source(max_links: int, dofs: int) -> str:
         }
     }
     BRIDGE_SYNC();
+    // BEGIN_INVERSE
     // Solve the upper triangular encoding-transpose once per unit column.
     // Each column owns all of its output; no cross-column dependencies exist.
     for (int column = lane; column < DOFS; column += WORKERS) {
         for (int row = column; row >= 0; --row) {
             float value = row == column ? 1.0f : 0.0f;
             for (int k = row + 1; k <= column; ++k)
-                value -= encoding_transpose[row * DOFS + k] * whitener.data[base + k * DOFS + column];
-            whitener.data[base + row * DOFS + column] = value / encoding_transpose[row * DOFS + row];
+                value -= encoding_transpose[row * DOFS + k] * inverse_encoding[k * DOFS + column];
+            inverse_encoding[row * DOFS + column] = value / encoding_transpose[row * DOFS + row];
         }
     }
+    BRIDGE_SYNC();
+    for (int item = lane; item < DOFS * DOFS; item += WORKERS)
+        whitener.data[base + item] = inverse_encoding[item];
+    // END_INVERSE
     for (int item = lane; item < DOFS * DOFS; item += WORKERS)
         encode_transpose.data[base + item] = encoding_transpose[item];
     BRIDGE_SYNC();
@@ -212,6 +331,20 @@ def whitening_bridge_source(max_links: int, dofs: int) -> str:
 #undef BRIDGE_SYNC
 """
     )
+    if encoding_only:
+        start, end = source.index("    // BEGIN_INVERSE"), source.index("    // END_INVERSE")
+        source = source[:start] + source[end + len("    // END_INVERSE\n") :]
+        for statement in (
+            "    BRIDGE_SHARED float inverse_encoding[DOFS * DOFS];\n",
+            "        inverse_encoding[item] = 0.0f;\n",
+            "            whitener.data[base + item] = invalid.value;\n",
+        ):
+            if source.count(statement) != 1:
+                raise ValueError("Encoding-only source seam changed")
+            source = source.replace(statement, "")
+        if "whitener" in source or "inverse_encoding" in source:
+            raise ValueError("Encoding-only bridge still accesses whitening storage")
+    return source
 
 
 def validate_whitening_layout(factor, dofs: int) -> None:
@@ -256,3 +389,24 @@ def get_whitening_bridge_kernel(max_links: int, dofs: int) -> wp.Kernel:
     articulated_whitening_bridge.__name__ = name
     articulated_whitening_bridge.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(articulated_whitening_bridge)
+
+
+@cache
+def get_encoding_bridge_kernel(max_links: int, dofs: int) -> wp.Kernel:
+    """Publish only upper Et on held refresh; launch tiled [groups], block32."""
+    from .articulated_factor import ArticulatedFactorData  # noqa: PLC0415
+
+    @wp.func_native(whitening_bridge_source(max_links, dofs, encoding_only=True))
+    def encode_native(
+        factor: ArticulatedFactorData, group: int, mass_mask: wp.array[int], encode_transpose: wp.array3d[float]
+    ): ...
+
+    def articulated_encoding_bridge(
+        factor: ArticulatedFactorData, mass_mask: wp.array[int], encode_transpose: wp.array3d[float]
+    ):
+        group, _lane = wp.tid()
+        encode_native(factor, group, mass_mask, encode_transpose)
+
+    articulated_encoding_bridge.__name__ = f"articulated_encoding_bridge_b{max_links}_d{dofs}"
+    articulated_encoding_bridge.__qualname__ = articulated_encoding_bridge.__name__
+    return wp.kernel(enable_backward=False, module="unique")(articulated_encoding_bridge)

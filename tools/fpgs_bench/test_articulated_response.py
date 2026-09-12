@@ -9,11 +9,16 @@ from unittest.mock import patch
 import numpy as np
 import warp as wp
 
+from newton._src.solvers.feather_pgs import articulated_response
 from newton._src.solvers.feather_pgs.articulated_factor import allocate_factor_data
 from newton._src.solvers.feather_pgs.articulated_response import (
+    get_encoding_bridge_kernel,
+    get_upper_response_fallback_kernel,
     get_whitening_bridge_kernel,
     prepare_local_response_source,
+    prepare_upper_local_response_source,
     validate_whitening_layout,
+    whitening_bridge_source,
 )
 from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _get_paired_hinv_jt_kernel,
@@ -23,6 +28,15 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import (
 
 
 class TestPreparedResponseSource(unittest.TestCase):
+    def test_corrective_upper_response_api_exists(self):
+        """Require the new encoding-only and row-parallel upper response owners."""
+        for name in (
+            "prepare_upper_local_response_source",
+            "get_upper_response_fallback_kernel",
+            "get_encoding_bridge_kernel",
+        ):
+            self.assertTrue(callable(getattr(articulated_response, name)))
+
     def test_actual_local_variants(self):
         """Replace only primary response preparation in all Franka local owners."""
         original = wp.func_native
@@ -66,6 +80,103 @@ class TestPreparedResponseSource(unittest.TestCase):
         """Reject a source that does not contain exactly the inherited preparation."""
         with self.assertRaises(ValueError):
             prepare_local_response_source("not the local solver", 9)
+        with self.assertRaises(ValueError):
+            prepare_upper_local_response_source("not the local solver", 9)
+
+    def test_upper_source_preserves_load_secondary_and_recurrence(self):
+        """Reverse only the primary two triangular traversals in all local owners."""
+        original = wp.func_native
+        for paired, rows, lanes, mf in ((0, 9, 8, 0), (6, 20, 32, 0), (6, 40, 32, 12)):
+            sources = []
+
+            def capture(source, *args, _sources=sources, **kwargs):
+                _sources.append(source)
+                return original(source, *args, **kwargs)
+
+            _get_pgs_solve_local_owned_kernel.cache_clear()
+            with patch.object(wp, "func_native", capture):
+                for upper in (False, True):
+                    _get_pgs_solve_local_owned_kernel(
+                        192,
+                        rows,
+                        9,
+                        "sm_120",
+                        paired_dof_count=paired,
+                        lanes_per_world=lanes,
+                        contact_capable=bool(paired),
+                        persistent_queue=bool(paired),
+                        warps_per_block=2,
+                        mf_max_constraints=64 if mf else 0,
+                        local_mf_max_constraints=mf,
+                        dense_response_matrix=True,
+                        upper_factor=upper,
+                    )
+            self.assertEqual(len(sources), 2)
+            before, after = sources
+            self.assertEqual(prepare_upper_local_response_source(before, 9), after)
+            boundary = "        float diagonal = 0.0f;"
+            self.assertEqual(before[before.index(boundary) :], after[after.index(boundary) :])
+            load_end = "        float response[9];"
+            self.assertEqual(before[: before.index(load_end)], after[: after.index(load_end)])
+            self.assertIn("for (int k = i + 1; k < 9; ++k) value -= s_L[i * 9 + k]", after)
+            self.assertIn("for (int k = 0; k < i; ++k) value -= s_L[k * 9 + i]", after)
+
+    def test_upper_fallback_preserves_general_and_local_restitution_ownership(self):
+        """Match physical upper-factor actions and preserve all unowned publication."""
+        rng = np.random.default_rng(39)
+        upper = np.triu(rng.normal(size=(4, 3, 3))).astype(np.float32)
+        upper[:, np.arange(3), np.arange(3)] += 4
+        rows = rng.normal(size=(4, 40, 3)).astype(np.float32)
+        groups = np.array([2, 0, 3, 1], np.int32)
+        worlds = np.array([2, 3, 0, 1], np.int32)
+        offsets = np.array([2, 5, 1, 0], np.int32)
+        counts = np.array([35, 4, 3, 2], np.int32)
+        owners = np.array([0, 1, 2, 3], np.int32)
+        restitution = np.zeros((4, 40), np.float32)
+        restitution[:, 1] = 0.2
+        inputs = [
+            wp.array(value, device="cpu")
+            for value in (upper, rows, groups, worlds, offsets, counts, owners, restitution)
+        ]
+        for publish in (0, 1):
+            with self.subTest(publish=publish):
+                y = wp.full((4, 40, 3), 12345.0, device="cpu")
+                world_j = wp.full((4, 40, 9), 12345.0, device="cpu")
+                world_y = wp.full_like(world_j, 12345.0)
+                wp.launch(
+                    get_upper_response_fallback_kernel(3),
+                    dim=4 * 32,
+                    inputs=[*inputs, 3, 40, 4, publish, y, world_j, world_y],
+                    device="cpu",
+                )
+                expected_y = np.full((4, 40, 3), 12345.0, np.float32)
+                expected_jw = np.full((4, 40, 9), 12345.0, np.float32)
+                expected_yw = expected_jw.copy()
+                for group, art in enumerate(groups):
+                    world, offset = worlds[art], offsets[art]
+                    count = counts[world]
+                    if owners[world] == 0:
+                        h = upper[group].astype(np.float64) @ upper[group].astype(np.float64).T
+                        expected_y[group, :count] = np.linalg.solve(h, rows[group, :count].T).T
+                        if publish:
+                            expected_jw[world, :count, offset : offset + 3] = rows[group, :count]
+                            expected_yw[world, :count, offset : offset + 3] = expected_y[group, :count]
+                    elif publish:
+                        expected_jw[world, 1, offset : offset + 3] = rows[group, 1]
+                np.testing.assert_allclose(y.numpy(), expected_y, rtol=2e-6, atol=1e-7)
+                np.testing.assert_array_equal(world_j.numpy(), expected_jw)
+                np.testing.assert_allclose(world_y.numpy(), expected_yw, rtol=2e-6, atol=1e-7)
+                np.testing.assert_array_equal(inputs[1].numpy(), rows)
+        # A second GENERAL epoch with no rows must leave every output untouched.
+        inputs[5].zero_()
+        y.fill_(99)
+        wp.launch(
+            get_upper_response_fallback_kernel(3),
+            dim=4 * 32,
+            inputs=[*inputs, 3, 40, 4, 1, y, world_j, world_y],
+            device="cpu",
+        )
+        np.testing.assert_array_equal(y.numpy(), 99)
 
     def test_primary_upper_factor_sources(self):
         """Reverse only primary triangle ownership in the inherited paired kernels."""
@@ -151,6 +262,15 @@ class TestWhiteningBridge(unittest.TestCase):
         kernel = get_whitening_bridge_kernel(5, 3)
         wp.launch_tiled(kernel, dim=[2], inputs=[factor, mask, et, w], block_dim=32, device="cpu")
         et_np, w_np = et.numpy(), w.numpy()
+        encoding_only = wp.full_like(et, 777.0)
+        wp.launch_tiled(
+            get_encoding_bridge_kernel(5, 3), dim=[2], inputs=[factor, mask, encoding_only], block_dim=32, device="cpu"
+        )
+        np.testing.assert_array_equal(encoding_only.numpy(), et_np)
+        source = whitening_bridge_source(5, 3)
+        self.assertIn("inverse_encoding[k * DOFS + column]", source)
+        self.assertNotIn("* whitener.data[", source)
+        self.assertNotIn("whitener", whitening_bridge_source(5, 3, encoding_only=True))
         np.testing.assert_array_equal(et_np[1], 777.0)
         np.testing.assert_array_equal(w_np[1], 888.0)
         np.testing.assert_allclose(et_np[0] @ et_np[0].T, h, rtol=2e-6, atol=2e-5)
@@ -169,11 +289,19 @@ class TestWhiteningBridge(unittest.TestCase):
         wp.launch_tiled(kernel, dim=[2], inputs=[factor, mask, et, w], block_dim=32, device="cpu")
         np.testing.assert_array_equal(et.numpy(), before_et)
         np.testing.assert_array_equal(w.numpy(), before_w)
+        wp.launch_tiled(
+            get_encoding_bridge_kernel(5, 3), dim=[2], inputs=[factor, mask, encoding_only], block_dim=32, device="cpu"
+        )
+        np.testing.assert_array_equal(encoding_only.numpy(), before_et)
         factor.valid.zero_()
         mask.fill_(1)
         wp.launch_tiled(kernel, dim=[2], inputs=[factor, mask, et, w], block_dim=32, device="cpu")
         self.assertTrue(np.isnan(et.numpy()).all())
         self.assertTrue(np.isnan(w.numpy()).all())
+        wp.launch_tiled(
+            get_encoding_bridge_kernel(5, 3), dim=[2], inputs=[factor, mask, encoding_only], block_dim=32, device="cpu"
+        )
+        self.assertTrue(np.isnan(encoding_only.numpy()).all())
         bad_slots = np.tile(slots, (2, 1))
         bad_slots[:, [1, 3]] = bad_slots[:, [3, 1]]
         factor.dof_slots.assign(bad_slots)

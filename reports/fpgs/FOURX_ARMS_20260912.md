@@ -81,3 +81,87 @@ Current node-capture destinations (local raw artifacts):
 - `/tmp/fpgs-fourx-franka-nodes-20260912-01`
 
 No new speedup or physical-quality acceptance is claimed yet.
+
+## First mapping: measured loss, retained rather than promoted
+
+Frozen prototype `0056983b091afae67f34900913bd79ef17431b4f` versus accepted
+`42f1492a`, using tool source `15158f3a`. Both arms use
+`FEATHER_PGS_SIMPLE_WORLD_ZERO=1`; only the candidate enables
+`FEATHER_PGS_ARTICULATED_FACTOR=1`. Full-scale runs use 16,384 environments,
+seed 0, 200 warmup steps, 40 synchronized wall steps, and three node-profiled
+steps. These are single paired discovery rounds, not repeated acceptance.
+
+| Task / GPU | Baseline physics ms | Prototype physics ms | Baseline / prototype |
+| --- | ---: | ---: | ---: |
+| KukaAllegro / RTX | 16.367130 | 17.430860 | 0.939x |
+| KukaAllegro / GB300 | 15.645259 | 16.712926 | 0.936x |
+| Franka / RTX | 6.375587 | 9.700894 | 0.657x |
+| Franka / GB300 | 6.122442 | 9.278238 | 0.660x |
+
+The four children per task pass capacity/finite-state checks; parent source
+and post-run idle guards pass. These guards do not establish physical or
+convergence equivalence. Full512 component diagnostics retain the original
+small basis-residual tail failures; no tolerance was relaxed to accept them.
+The candidate is default-off and is **not an accepted optimization**.
+
+Kuka's new factor, predictor and whitening bridge cost respectively
+1.706/1.394/1.019 ms RTX and 1.355/.967/.934 ms GB in summed node duration,
+while original current torque accumulation remains. Repeated global factor
+reads and separate dependency traversals defeat the lower arithmetic count.
+These sums overlap other work and are not removable critical-path estimates.
+The general MF node also changes (2.766 to 1.834 ms on RTX), so trajectory-
+dependent workload changes must not be credited as a producer optimization.
+
+Franka's new row-response producer contributes 2.783/2.785 ms interval union,
+2.770/2.764 ms exclusive occupancy. It serializes all current row RHSs through
+the 11-link tree, while the original classified local owners already prepare
+rows concurrently. Their old combined union is only .509/.609 ms, not the
+1.191/1.407 ms sum. Prepared-Y local consumers do not reduce that union.
+This is a diagnosed ownership failure, not evidence that articulated methods
+can never win. Removing the added row pass alone would still leave a loss.
+
+Local source-bound manifests:
+
+- `/tmp/fpgs-fourx-kuka-aba512-20260912-01/manifest.json`,
+  SHA256 `aa3e8e87ec7c38dc254f6e454b8ca70789a78dd9ac138de7cbc810123dee23dc`.
+- `/tmp/fpgs-fourx-kuka-aba16k-20260912-01/manifest.json`,
+  SHA256 `d2afa6f5642ea01b0067dcbbe7d40d6cc523b13d02c4b24927666f66283d605c`.
+- `/tmp/fpgs-fourx-franka-aba16k-20260912-01/manifest.json`,
+  SHA256 `11582872ba449396bda0a575634cb8cdbc3251315ac0decded584609a094a4de`.
+- Franka correlated interval audit:
+  `/tmp/fpgs-franka-articulated-attribution-Y8sTiAgS/FINDINGS.md`;
+  numerical/source evidence and rehashes are retained alongside it.
+
+## Cause-directed joint-owner retry
+
+This successor keeps the first mapping selectable and adds default-off
+`FEATHER_PGS_ARTICULATED_FUSED=1` (requires the factor flag). It merges current
+inverse dynamics, held-factor refresh and predictor into one reverse tree
+traversal plus one forward traversal. Current and held axes/origins remain
+distinct; old selected torque/factor/predictor producers are excluded. Qdd
+clearing moves before this owner, without changing any integration allowance.
+
+For Franka, derive only the held upper kinetic encoding once per refresh.
+The original local owners apply its upper/transpose triangular action to
+current rows in-place. Delete the added global per-row tree-response pass;
+retain complete general fallback and J-only local restitution publication.
+Kuka retains its whitened recurrence; the transitional bridge keeps dependent
+inverse work in private shared storage before publishing its original buffers.
+All conversion, fallback and publication costs remain part of the live gate.
+
+This is one architectural repair of the measured loss, not a lane/grid search
+or a claim to reach 4x by itself. Even an ideal factor-only change cannot
+remove enough of Franka's total budget. Further progress must retire broader
+row/collision/dynamics ownership, not polish this boundary for sub-percent
+gains. A separate current-input Kuka study is checking exact independence of
+the rare MF object worlds and their dense hand rows; coupled worlds must keep
+a complete fallback, not be dropped or reclassified by impulse outcome.
+
+Pre-live retry gates: the five fused-dynamics tests pass with actual CUDA on
+both RTX PRO6000 and GB300, including the original current-torque producer and
+held-operator checks. Seven response CPU tests pass, covering all three local
+source seams, upper-factor algebra, general fallback and local restitution
+publication. All 16 selected offline builds (four fused dynamics plus twelve
+response/consumer builds across the two architectures) have zero reported
+stack/spills. Full pre-commit passes. These are component/integration readiness
+checks, not a task-level trajectory acceptance or measured speedup.

@@ -230,6 +230,7 @@ _FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
 _PRISMATIC_PUBLICATION = os.environ.get("FEATHER_PGS_PRISMATIC_PUBLICATION", "0") == "1"
 _COMPACT_CONTACT_BOUNDARY = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_BOUNDARY", "0") == "1"
 _ARTICULATED_FACTOR = os.environ.get("FEATHER_PGS_ARTICULATED_FACTOR", "0") == "1"
+_ARTICULATED_FUSED = os.environ.get("FEATHER_PGS_ARTICULATED_FUSED", "0") == "1"
 _DEBUG_CACHE = os.environ.get("FEATHER_PGS_DEBUG_CACHE") == "1"
 _DEBUG_CACHE_MODE = os.environ.get("FEATHER_PGS_DEBUG_CACHE_MODE", "")
 _DEBUG_DELAY = int(os.environ.get("FEATHER_PGS_DEBUG_DELAY", "0"))
@@ -5221,6 +5222,8 @@ class SolverFeatherPGS(SolverBase):
         self._articulated_factors = {}
         self._articulated_global_dofs = []
         self._articulated_legacy_joint_end = self.articulation_joint_end
+        if _ARTICULATED_FUSED and not _ARTICULATED_FACTOR:
+            raise ValueError("Fused articulated dynamics requires the articulated factor owner")
         if not _ARTICULATED_FACTOR:
             return
         if not (
@@ -5230,6 +5233,7 @@ class SolverFeatherPGS(SolverBase):
             and self.articulated_contact_response == "immediate"
             and self.drive_mode == "augmented"
             and self._parallel_augmented_drive_topology
+            and self._async_augmented_drives
             and self.pgs_schedule == "interleaved"
             and self.pgs_velocity_iterations == 0
             and not self.pgs_warmstart
@@ -5256,9 +5260,9 @@ class SolverFeatherPGS(SolverBase):
                 global_dofs = global_dofs[global_dofs >= 0]
                 if np.any(self._kinematic_dof_mask_host[global_dofs]):
                     raise ValueError("Articulated factors do not admit kinematic moving joints")
-                if size == self._paired_response_primary_size:
+                if size == self._paired_response_primary_size or _ARTICULATED_FUSED:
                     validate_whitening_layout(plan.data, size)
-                elif size in self._hinv_jt_diag_sizes:
+                if size != self._paired_response_primary_size and size in self._hinv_jt_diag_sizes:
                     raise ValueError("Articulated local response does not produce grouped diagonal storage")
                 self._articulated_factors[size] = plan
                 self._articulated_global_dofs.append(global_dofs)
@@ -5278,6 +5282,95 @@ class SolverFeatherPGS(SolverBase):
         composite = composite[~np.isin(composite, owned)]
         self._composite_articulation_count = len(composite)
         self._composite_articulations = wp.array(composite, dtype=wp.int32, device=self.model.device)
+
+    def _stage1_fused_articulated_dynamics(
+        self, size: int, state_in: State, state_aug: State, control: Control, *, compact_source: bool
+    ) -> None:
+        """Own current torque, held factor refresh and predictor in one tree pass."""
+        from .articulated_factor import ArticulatedCurrentData, get_fused_dynamics_kernel  # noqa: PLC0415
+        from .articulated_response import get_encoding_bridge_kernel, get_whitening_bridge_kernel  # noqa: PLC0415
+
+        current = ArticulatedCurrentData()
+        current.articulation_start = self.model.articulation_start
+        current.joint_q_start = self.model.joint_q_start
+        current.joint_q = state_in.joint_q
+        current.joint_qd = state_in.joint_qd
+        current.joint_f = control.joint_f
+        current.spring_stiffness = self._passive_spring_stiffness
+        current.spring_ref = self._passive_spring_ref
+        current.damping = self._passive_joint_damping
+        current.joint_S = state_aug.joint_S_s
+        current.body_fb_s = state_aug.body_f_s
+        current.body_f_ext = state_in.body_f
+        current.body_flags = self.model.body_flags
+        current.body_q = state_in.body_q
+        current.body_com = self.model.body_com
+        current.articulation_origin = self.articulation_origin
+        current.joint_tau = state_aug.joint_tau
+        current.joint_qdd = state_aug.joint_qdd
+        plan = self._articulated_factors[size]
+        wp.launch_tiled(
+            get_fused_dynamics_kernel(plan.max_links, size),
+            dim=[self.n_arts_by_size[size]],
+            inputs=[
+                plan.data,
+                current,
+                state_aug.body_I_s,
+                self.R_by_size[size],
+                self._augmented_drive_row_by_dof,
+                self.aug_row_K,
+                self.mass_update_mask,
+                self._body_inertia_terms,
+                self.model.body_mass,
+                int(compact_source),
+            ],
+            block_dim=32,
+            device=self.model.device,
+        )
+        if size == self._paired_response_primary_size:
+            wp.launch_tiled(
+                get_whitening_bridge_kernel(plan.max_links, size),
+                dim=[self.n_arts_by_size[size]],
+                inputs=[plan.data, self.mass_update_mask, self.L_by_size[size], self.Linv_by_size[size]],
+                block_dim=32,
+                device=self.model.device,
+            )
+        else:
+            # A local row owner needs only E.T, not a materialized inverse or
+            # a separate tree traversal per contact row.
+            wp.launch_tiled(
+                get_encoding_bridge_kernel(plan.max_links, size),
+                dim=[self.n_arts_by_size[size]],
+                inputs=[plan.data, self.mass_update_mask, self.L_by_size[size]],
+                block_dim=32,
+                device=self.model.device,
+            )
+
+    def _stage4_upper_articulated_response(self, size: int) -> None:
+        """Serve general fallbacks and restitution; local owners apply E.T in-place."""
+        from .articulated_response import get_upper_response_fallback_kernel  # noqa: PLC0415
+
+        wp.launch(
+            get_upper_response_fallback_kernel(size),
+            dim=self.n_arts_by_size[size] * 32,
+            inputs=[
+                self.L_by_size[size],
+                self.J_by_size[size],
+                self.group_to_art[size],
+                self.art_to_world,
+                self.articulation_world_dof_offset,
+                self.constraint_count,
+                self._local_solve_owner,
+                self.row_restitution,
+                size,
+                self.dense_max_constraints,
+                self.n_arts_by_size[size],
+                int(self._hinv_jt_writes_world),
+            ],
+            outputs=[self.Y_by_size[size], self.J_world, self.Y_world],
+            block_dim=256,
+            device=self.model.device,
+        )
 
     def _stage1_factor_articulation(self, size: int, state_aug: State, *, compact_source: bool) -> None:
         """Refresh the single held operator, and its paired coordinate bridge."""
@@ -5571,7 +5664,8 @@ class SolverFeatherPGS(SolverBase):
                         lanes_per_world=lanes_per_world,
                         contact_capable=False,
                         dense_response_matrix=True,
-                        prepared_response=size in self._articulated_factors,
+                        prepared_response=size in self._articulated_factors and not _ARTICULATED_FUSED,
+                        upper_factor=size in self._articulated_factors and _ARTICULATED_FUSED,
                     )
             for size, count in self._local_pair_art_counts.items():
                 if count > 0:
@@ -5587,7 +5681,8 @@ class SolverFeatherPGS(SolverBase):
                         persistent_queue=True,
                         warps_per_block=warps_per_block,
                         dense_response_matrix=True,
-                        prepared_response=size in self._articulated_factors,
+                        prepared_response=size in self._articulated_factors and not _ARTICULATED_FUSED,
+                        upper_factor=size in self._articulated_factors and _ARTICULATED_FUSED,
                     )
             for size, count in self._local_residual_art_counts.items():
                 if count > 0:
@@ -5603,7 +5698,8 @@ class SolverFeatherPGS(SolverBase):
                         mf_max_constraints=self.mf_max_constraints,
                         local_mf_max_constraints=self._local_residual_mf_max_rows,
                         dense_response_matrix=True,
-                        prepared_response=size in self._articulated_factors,
+                        prepared_response=size in self._articulated_factors and not _ARTICULATED_FUSED,
+                        upper_factor=size in self._articulated_factors and _ARTICULATED_FUSED,
                     )
 
         self._mark_independent_sparse_contact_candidates_kernel = (
@@ -6273,7 +6369,7 @@ class SolverFeatherPGS(SolverBase):
                     self._local_solve_owner,
                     self.constraint_count,
                     self.Y_by_size[primary_size]
-                    if primary_size in self._articulated_factors
+                    if primary_size in self._articulated_factors and not _ARTICULATED_FUSED
                     else self.L_by_size[primary_size],
                     self.J_by_size[primary_size],
                     self.L_by_size[secondary_group_size],
@@ -8469,6 +8565,10 @@ class SolverFeatherPGS(SolverBase):
         # STAGE 1: FK/ID + drives + CRBA
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S1_FK_ID_CRBA", print=False, use_nvtx=self._nvtx, synchronize=False):
+            if _ARTICULATED_FUSED:
+                # The joint tree owner publishes selected qdd during S1.
+                # Clear before its launch, not after it in the old S3 slot.
+                self._stage3_zero_qdd(state_aug)
             drive_rows_ready = self._stage1_prepare_augmented_drives(state_in, state_aug, control, dt)
             if self._fused_k1 and drive_rows_ready is not None:
                 wp.get_stream(model.device).wait_event(drive_rows_ready)
@@ -8481,7 +8581,7 @@ class SolverFeatherPGS(SolverBase):
             else:
                 inverse_dynamics_ready = None
 
-            self._stage1_crba(state_aug, global_inertia_ready, drive_rows_ready)
+            self._stage1_crba(state_aug, global_inertia_ready, drive_rows_ready, state_in, control)
         # ══════════════════════════════════════════════════════════════
         # STAGE 2: Cholesky
         # ══════════════════════════════════════════════════════════════
@@ -8505,11 +8605,13 @@ class SolverFeatherPGS(SolverBase):
         with wp.ScopedTimer("S3_Trisolve_Vhat", print=False, use_nvtx=self._nvtx, synchronize=False):
             if inverse_dynamics_ready is not None:
                 wp.get_stream(model.device).wait_event(inverse_dynamics_ready)
-            self._stage3_zero_qdd(state_aug)
+            if not _ARTICULATED_FUSED:
+                self._stage3_zero_qdd(state_aug)
             for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
                 with ctx:
                     if size in self._articulated_factors:
-                        self._stage3_articulated_predictor(size, state_aug)
+                        if not _ARTICULATED_FUSED:
+                            self._stage3_articulated_predictor(size, state_aug)
                         continue
                     use_tiled = (self.trisolve_kernel == "tiled") or (
                         self.trisolve_kernel == "auto" and size > self.small_dof_threshold
@@ -8555,7 +8657,10 @@ class SolverFeatherPGS(SolverBase):
                             self._stage4_hinv_jt_paired(size, self._paired_response_secondary_size)
                             continue
                         if size in self._articulated_factors:
-                            self._stage4_articulated_response(size)
+                            if _ARTICULATED_FUSED:
+                                self._stage4_upper_articulated_response(size)
+                            else:
+                                self._stage4_articulated_response(size)
                             continue
                         if self._execution_plan.use_diagonal_mass(size):
                             self._stage4_hinv_jt_diagonal(size)
@@ -9956,7 +10061,7 @@ class SolverFeatherPGS(SolverBase):
         state_aug.body_ft_s.zero_()
         tau_inputs = [
             model.articulation_start,
-            self.articulation_joint_end,
+            self._articulated_legacy_joint_end if _ARTICULATED_FUSED else self.articulation_joint_end,
             model.joint_type,
             model.joint_parent,
             model.joint_child,
@@ -10276,6 +10381,8 @@ class SolverFeatherPGS(SolverBase):
         state_aug: State,
         global_inertia_ready: wp.Event | None,
         drive_rows_ready: wp.Event | None,
+        state_in: State,
+        control: Control,
     ):
         model = self.model
         global_flag = 1 if ((self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update) else 0
@@ -10360,9 +10467,13 @@ class SolverFeatherPGS(SolverBase):
         for size in self.size_groups:
             n_arts = self.n_arts_by_size[size]
             if size in self._articulated_factors:
-                self._stage1_factor_articulation(
-                    size, state_aug, compact_source=bool(global_flag and self._global_inertia_stream is not None)
-                )
+                compact_source = bool(global_flag and self._global_inertia_stream is not None)
+                if _ARTICULATED_FUSED:
+                    self._stage1_fused_articulated_dynamics(
+                        size, state_in, state_aug, control, compact_source=compact_source
+                    )
+                else:
+                    self._stage1_factor_articulation(size, state_aug, compact_source=compact_source)
                 continue
             if size == self._compact_diagonal_mass_size:
                 if self._direct_compact_diagonal_inertia:
@@ -21480,9 +21591,12 @@ def _get_pgs_solve_local_owned_kernel(
     local_mf_max_constraints: int = 0,
     dense_response_matrix: bool = False,
     prepared_response: bool = False,
+    upper_factor: bool = False,
 ) -> "wp.Kernel":
     """Fuse response construction and PGS for one local articulation or pair."""
     del device_arch
+    if prepared_response and upper_factor:
+        raise ValueError("Prepared Y and an upper articulated factor have different input ownership")
     if warps_per_block not in (1, 2):
         raise ValueError("warps_per_block must be 1 or 2")
     if lanes_per_world not in (8, 16, 32):
@@ -22203,6 +22317,10 @@ def _get_pgs_solve_local_owned_kernel(
         from .articulated_response import prepare_local_response_source  # noqa: PLC0415
 
         snippet = prepare_local_response_source(snippet, dofs)
+    elif upper_factor:
+        from .articulated_response import prepare_upper_local_response_source  # noqa: PLC0415
+
+        snippet = prepare_upper_local_response_source(snippet, dofs)
 
     @wp.func_native(snippet)
     def pgs_solve_local_internal_native(
@@ -22403,6 +22521,8 @@ def _get_pgs_solve_local_owned_kernel(
         name += "_denseamat"
     if prepared_response:
         name += "_preparedy"
+    if upper_factor:
+        name += "_upper"
     template = pgs_solve_local_internal_template
     if persistent_queue:
         name += "_queue"
