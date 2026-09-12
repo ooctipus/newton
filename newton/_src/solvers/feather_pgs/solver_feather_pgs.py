@@ -2403,6 +2403,12 @@ class SolverFeatherPGS(SolverBase):
 
             self._joint_world = create_owner(self)
 
+        self._world_scan_publication = None
+        if os.environ.get("FEATHER_PGS_WORLD_SCAN_PUBLICATION") == "1":
+            from .world_scan_owner import create_owner as create_publication  # noqa: PLC0415
+
+            self._world_scan_publication = create_publication(self)
+
     def _update_kinematic_state(self) -> None:
         """Refresh cached kinematic flags and effective joint armature."""
         model = self.model
@@ -2448,6 +2454,8 @@ class SolverFeatherPGS(SolverBase):
             self._row_packets.validate_notification(flags)
         if getattr(self, "_joint_world", None) is not None:
             self._joint_world.validate_notification(flags)
+        if getattr(self, "_world_scan_publication", None) is not None:
+            self._world_scan_publication.validate_notification(flags)
         if self._fk_id_cache_enabled and flags & (
             ModelFlags.JOINT_PROPERTIES
             | ModelFlags.JOINT_DOF_PROPERTIES
@@ -9006,7 +9014,11 @@ class SolverFeatherPGS(SolverBase):
         # STAGE 7: Update qdd + integrate
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S7_Integrate", print=False, use_nvtx=self._nvtx, synchronize=False):
-            if self._joint_world_active:
+            if self._world_scan_publication is not None and self._world_scan_publication.try_publish(
+                state_in, state_aug, state_out, dt
+            ):
+                pass
+            elif self._joint_world_active:
                 self._joint_world.finish_active(state_in, state_aug, state_out, dt)
             elif self.pgs_mode == "matrix_free" and self.pgs_velocity_iterations > 0:
                 self._stage6_write_final_velocity(state_in, state_aug, state_out, dt)
