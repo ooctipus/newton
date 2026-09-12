@@ -1,0 +1,1 @@
+Extend the experimental opt-in benchmark MJWarp line-search correction to elliptic Newton models, with stable friction-loss cost differences and unchanged cone evaluators, derivatives, timestep and iteration budgets. Add self-contained CPU cone and Huber regressions; this is not a general trajectory-equivalence guarantee.

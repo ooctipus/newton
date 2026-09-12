@@ -756,9 +756,25 @@ def _snapshot_nacon_count(
     last_nacon_count: wp.array[wp.int32],
     contact_generation: wp.array[wp.int32],
     last_contact_generation: wp.array[wp.int32],
+    rigid_contact_count: wp.array[wp.int32],
+    rigid_contact_max: int,
+    naconmax: int,
+    contact_capacity_status: wp.array[wp.int32],
 ):
     last_nacon_count[0] = nacon[0]
     last_contact_generation[0] = contact_generation[0]
+    # Observe the raw prefix, not the converter's clamped/filtered output.
+    # This existing dim=1 launch also runs after cached or zero-grid conversion.
+    count = rigid_contact_count[0]
+    flags = int(0)
+    if count < 0:
+        flags = flags | 1
+    if count > rigid_contact_max:
+        flags = flags | 2
+    if count > naconmax:
+        flags = flags | 4
+    if flags != 0:
+        wp.atomic_or(contact_capacity_status, 0, flags)
 
 
 @wp.kernel

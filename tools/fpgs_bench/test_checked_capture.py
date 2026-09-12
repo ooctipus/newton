@@ -61,6 +61,11 @@ def mjwarp(values):
         overflow=FlagArray(values), nworld=len(values), njmax=300, naconmax=2048, njmax_nnz=600
     )
     solver.mjw_model = SimpleNamespace(opt=SimpleNamespace(warn_overflow=True))
+    solver._use_mujoco_contacts = False
+    solver.contact_capacity_status = Mock(
+        return_value={"negative_count": False, "source_contacts": False, "mjwarp_contacts": False}
+    )
+    solver.check_contact_capacity = Mock()
     return solver
 
 
@@ -450,6 +455,31 @@ class TestCheckedCapture(unittest.TestCase):
                 solver.enable_sleeping = True
             with self.subTest(field=field), self.assertRaises(RuntimeError):
                 checked.check_solver("newton_mjwarp", solver, {})
+
+    def test_external_mj_prefix_loss_rejected_with_zero_native_bits(self):
+        """Require the converter checker, including native-not-applicable records."""
+        with patch.dict("sys.modules", {"mujoco_warp": SimpleNamespace(OverflowType=Bits)}):
+            for flag in ("negative_count", "source_contacts", "mjwarp_contacts"):
+                solver = mjwarp([0])
+                solver.contact_capacity_status.return_value[flag] = True
+                entry = {}
+                with self.subTest(flag=flag), self.assertRaisesRegex(RuntimeError, "contact"):
+                    checked.check_solver("newton_mjwarp", solver, entry)
+                self.assertTrue(entry["external_contact_conversion"]["flags"][flag])
+                solver.check_contact_capacity.assert_called_once_with()
+            for missing in ("contact_capacity_status", "check_contact_capacity"):
+                solver = mjwarp([0])
+                delattr(solver, missing)
+                with self.subTest(missing=missing), self.assertRaisesRegex(RuntimeError, "lacks"):
+                    checked.check_solver("newton_mjwarp", solver, {})
+            for native in (False, True):
+                solver, entry = mjwarp([0]), {}
+                solver._use_mujoco_contacts = native
+                checked.check_solver("newton_mjwarp", solver, entry)
+                solver.check_contact_capacity.assert_called_once_with()
+                self.assertEqual(
+                    entry["external_contact_conversion"]["status"], "not_applicable" if native else "checked"
+                )
 
     def test_boundary_wrapper_saves_failure_outside_swallowing_lab_helper(self):
         """Persist the second-boundary failure even when Lab metadata succeeds."""

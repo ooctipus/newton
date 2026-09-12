@@ -59,6 +59,12 @@ Calibrate before benchmarking: measure unclamped demand through warmup,
 contact-rich states and held-out resets, then verify zero overflow with a
 documented reserve. MJWarp `njmax` is per-world; its `nconmax` sizes a pooled
 contact buffer of `nconmax * num_worlds`, not a hard per-world contact cap.
+For native MJWarp collision, that pool also bounds its broad-phase pair arrays:
+measure raw `ncollision` as well as `nacon`. A contact count below capacity does
+not rule out earlier pair loss. For external collision, distinguish the pipeline's
+requested contact capacity from the public Contacts allocation: the unchanged
+Lab/MuJoCo export contract can enlarge the latter to the MJ pooled capacity.
+Record that actual allocation; do not report the smaller request as memory saved.
 Newton `rigid_contact_max` is global. Do not reuse a global size at a different
 world count without calibration, and check actual allocated capacities because
 constructors can enlarge requested values. FPGS row storage and generated
@@ -81,7 +87,13 @@ MJWarp arm, not to FPGS or the Lab harness arguments. The Newton-owned
 `mjwarp_linesearch_compat.py` installs the reviewed process-local correction
 before model/graph construction; installed packages and Lab files are not
 modified. Unknown dependency source bytes fail closed, and the actual model
-must use the supported pyramidal-cone Newton solver at both checked boundaries.
+must use the supported pyramidal- or elliptic-cone Newton solver at both checked
+boundaries. Both use the reviewed bracket correction. The experimental elliptic
+extension additionally evaluates friction-loss Huber cost differences without
+subtracting large absolute costs; its gradients, Hessians, prepared cone
+coefficients and inherited ellipse evaluator are unchanged. The pyramidal path
+is unchanged from the previously reviewed correction. Separate immutable private
+factories prevent the elliptic cost helper from affecting that path.
 The helper's scope and dependency hashes are recorded; this option is not
 automatic warning suppression or a general numerical-quality acceptance gate.
 It leaves timestep, substeps, iteration limits and tolerances unchanged.
@@ -89,6 +101,14 @@ Reports explicitly mark `mjwarp_linesearch_fix=true`,
 `physics_work_modified=true`, and `physics_budgets_modified=false` for that arm.
 The parent binds those declarations and the helper hash before accepting results.
 Without this option the selected MJWarp algorithm remains unchanged.
+The elliptic claim is a line-search/cost-stability fix with numerical regressions,
+not general trajectory equivalence. The inherited prepared-cone evaluator still
+has ordinary FP32 cancellation error: examined ANYmal rays had corrected cost
+regrets below one full-objective FP32 ULP, without an established harmful physical
+effect. Some observed maximum stored-force-gradient tails worsened even though
+percentile changes were small. Capacity-safe held-out runs and broader physical
+reports remain separate; neither warning removal nor exact FP64 root matching
+is a substitute for evaluating numerical differences at their physical scale.
 
 The resulting timing comparison uses checked capture by default. Newton's
 `nsys_checked.sh` calls the selected Lab harness unchanged through
@@ -158,10 +178,15 @@ the optional reviewed backend is absent, so a skipped run is not validation:
 ```sh
 CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1 \
   uv run --no-project --python /path/to/isaaclab/.venv/bin/python \
-  python -m unittest discover -s tools/fpgs_bench -p test_mjwarp_linesearch_compat.py -v
+  python -m unittest discover -s tools/fpgs_bench -p 'test_mjwarp_*.py' -v
 ```
 
 These tests cover exact-zero roots, genuine budget exhaustion, representable
 brackets, and mirrored convex rays on which the original solver silently
-accepts a nonstationary point, plus installation/source/cache guards. Zero
-warning bits alone are not sufficient numerical acceptance.
+accepts a nonstationary point, plus installation/source/cache guards. Repo-local
+native MuJoCo condim 3/4/6 fixtures cover the full cone cost/force law, dense and
+sparse Jacobians, fused Jv and the actual 50-iteration elliptic budget. Huber
+tests cover all nine zone transitions, kinks, sub-ULP displacements and finite
+fallback while retaining original derivatives and nonfriction rows. They use
+the real public installer and have no scratch-directory or capture dependencies.
+Zero warning bits alone are not sufficient numerical acceptance.

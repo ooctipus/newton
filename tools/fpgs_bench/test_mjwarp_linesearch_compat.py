@@ -228,13 +228,13 @@ class CompatTests(unittest.TestCase):
         self.assertEqual(int(failed[1].overflow.numpy()[0]), 1024)
 
     def test_unsupported_models_use_original_factory(self):
-        """Leave CG and elliptic models on the complete original driver."""
+        """Leave CG and unknown cones on the complete original driver."""
         from mujoco_warp._src import types
 
         compat.install()
         for field, value in (
             ("solver", types.SolverType.CG),
-            ("cone", types.ConeType.ELLIPTIC),
+            ("cone", -1),
         ):
             model, data, context = _fixture()
             setattr(model.opt, field, value)
@@ -243,6 +243,38 @@ class CompatTests(unittest.TestCase):
                 self.solver._linesearch_iterative(model, data, context, False)
                 original.assert_called_once()
         self.assertFalse(compat.supports_model(SimpleNamespace()))
+
+    def test_ellipse_source_isolated_from_pyramid(self):
+        """Keep both cone factories immutable and preserve the reviewed pyramid source."""
+        from mujoco_warp._src import types
+
+        data = Path(self.solver.__file__).read_bytes()
+        original_source = compat._transform(data)
+        ellipse_source = compat._ellipse_transform(data)
+        self.assertEqual(
+            ellipse_source.removeprefix(compat._ELLIPTIC_HELPERS).replace(
+                "def _newton_elliptic_linesearch_iterative_kernel(", "def _newton_linesearch_iterative_kernel("
+            ),
+            original_source,
+        )
+        metadata = compat.install()
+        self.assertEqual(
+            metadata["generated_elliptic_factory_sha256"], hashlib.sha256(ellipse_source.encode()).hexdigest()
+        )
+        self.assertEqual(
+            metadata["generated_factory_sha256"], "485f85ccb4af6b8d0e4ec45be56e2b6c7e3300612e203d5e59c5dea98b934d0d"
+        )
+        self.assertTrue(metadata["friction_delta"])
+        self.assertFalse(metadata["general_trajectory_equivalence_validated"])
+        for cone in (types.ConeType.PYRAMIDAL, types.ConeType.ELLIPTIC):
+            model, data, context = _fixture()
+            model.opt.cone = cone
+            self.assertTrue(compat.supports_model(model))
+            self.solver._linesearch_iterative(model, data, context, False)
+        for name in ("_newton_linesearch_iterative_kernel", "_newton_elliptic_linesearch_iterative_kernel"):
+            self.assertTrue(any(key[-1] == hash(name) for key in self.cache))
+        self.assertFalse(any(key[-1] == hash("_linesearch_iterative_kernel") for key in self.cache))
+        self.assertIsNot(compat._INSTALLED[2], compat._INSTALLED[3])
 
     def test_missing_sign_convex_physical_newton(self):
         """Reject the original false no-progress answer on both mirrored objectives."""

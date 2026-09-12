@@ -26,6 +26,7 @@ from types import ModuleType
 HARNESS = Path("scripts/benchmarks/fpgs_profile/run_profiled.py")
 COMPAT_PATH = Path(__file__).resolve().with_name("mjwarp_linesearch_compat.py")
 FPGS_FLAGS = {"dense", "matrix_free", "propagation", "contacts"}
+MJ_CONTACT_FLAGS = {"negative_count", "source_contacts", "mjwarp_contacts"}
 NARROW_FLAGS = {
     "broad_phase",
     "split_query",
@@ -102,6 +103,23 @@ def check_solver(physics: str, solver, entry: dict) -> None:
             },
         }
         entry["capacities"] = {name: int(getattr(data, name)) for name in ("nworld", "njmax", "naconmax", "njmax_nnz")}
+        conversion = entry["external_contact_conversion"] = {"status": "checking", "check_pass": False}
+        read = getattr(solver, "contact_capacity_status", None)
+        check = getattr(solver, "check_contact_capacity", None)
+        if not callable(read) or not callable(check):
+            raise RuntimeError("This MJWarp solver revision lacks the external contact capacity-check API")
+        native = getattr(solver, "_use_mujoco_contacts", None)
+        if type(native) is not bool:
+            raise RuntimeError("Unrecognized MJWarp contact ownership contract")
+        contact_flags = read()
+        if set(contact_flags) != MJ_CONTACT_FLAGS or any(type(value) is not bool for value in contact_flags.values()):
+            raise RuntimeError("Unrecognized MJWarp external contact capacity-status contract")
+        conversion["flags"] = contact_flags
+        conversion["scope"] = "native_mujoco_contacts" if native else "external_newton_prefix"
+        check()
+        if any(contact_flags.values()):
+            raise RuntimeError("External contact capacity flags were nonzero despite a successful checker")
+        conversion.update(status="not_applicable" if native else "checked", check_pass=True)
         if combined:
             raise RuntimeError(f"MJWarp sticky warning/overflow flags are nonzero: {entry['flags']}")
     else:

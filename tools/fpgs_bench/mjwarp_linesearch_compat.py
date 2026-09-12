@@ -5,7 +5,10 @@
 
 Call ``install()`` before the first solver JIT in an isolated benchmark process.
 This rewrites only in-memory source and never changes the installed package.
-Unknown sources fail closed; elliptic-cone factories retain the original path.
+Unknown sources fail closed. The experimental elliptic extension changes only
+friction-loss cost differences beside the reviewed bracket logic; it retains
+the inherited cone evaluator. Numerical regressions are not a claim of general
+trajectory equivalence.
 """
 
 from __future__ import annotations
@@ -101,6 +104,85 @@ def _in_bracket(x: wp.vec3, y: wp.vec3) -> bool:
 
 
 '''
+
+# These aliases are installed only in the ellipse-private module. The original
+# package and the separately compiled pyramidal module keep their old helpers.
+_ELLIPTIC_HELPERS = """_original_ellipse_point = _compute_efc_eval_pt_elliptic
+_original_ellipse_three = _compute_efc_eval_pt_3alphas_elliptic
+
+
+@wp.func
+def _huber_delta(x0: float, jv: float, alpha: float, f: float, d: float, rf: float) -> float:
+  delta = alpha * jv
+  x1 = x0 + delta
+  if (-rf < x0) and (x0 < rf):
+    if (-rf < x1) and (x1 < rf):
+      return d * delta * (x0 + 0.5 * delta)
+    sign1 = wp.where(x1 <= -rf, -1.0, 1.0)
+    gap0 = sign1 * x0 - rf
+    return sign1 * f * delta - 0.5 * d * gap0 * gap0
+  sign0 = wp.where(x0 <= -rf, -1.0, 1.0)
+  if (-rf < x1) and (x1 < rf):
+    gap1 = sign0 * x1 - rf
+    return sign0 * f * delta + 0.5 * d * gap1 * gap1
+  sign1 = wp.where(x1 <= -rf, -1.0, 1.0)
+  if sign0 == sign1:
+    return sign0 * f * delta
+  return sign1 * f * (2.0 * x0 + delta)
+
+
+@wp.func
+def _safe_huber_cost(x0: float, jv: float, alpha: float, f: float, d: float, original: float) -> float:
+  delta = alpha * jv
+  x1 = x0 + delta
+  rf = math.safe_div(f, d)
+  if not (wp.isfinite(x0) and wp.isfinite(jv) and wp.isfinite(alpha)
+          and wp.isfinite(delta) and wp.isfinite(x1) and wp.isfinite(rf)
+          and wp.isfinite(f) and f >= 0.0 and wp.isfinite(d) and d > 0.0):
+    return original
+  value = _huber_delta(x0, jv, alpha, f, d, rf)
+  if not wp.isfinite(value):
+    return original
+  return value
+
+
+@wp.func
+def _compute_efc_eval_pt_elliptic(
+  efcid: int, alpha: float, ne: int, nf: int, impratio_invsqrt: float,
+  efc_type: int, d: wp.array[float], frictionloss: wp.array[float],
+  x0: float, jv: float, quad: wp.vec3, contact_friction: types.vec5,
+  address0: int, quad1: wp.vec3, quad2: wp.vec3,
+) -> wp.vec3:
+  original = _original_ellipse_point(
+    efcid, alpha, ne, nf, impratio_invsqrt, efc_type, d, frictionloss,
+    x0, jv, quad, contact_friction, address0, quad1, quad2,
+  )
+  if efcid >= ne and efcid < ne + nf:
+    cost = _safe_huber_cost(x0, jv, alpha, frictionloss[efcid], d[efcid], original[0])
+    return wp.vec3(cost, original[1], original[2])
+  return original
+
+
+@wp.func
+def _compute_efc_eval_pt_3alphas_elliptic(
+  efcid: int, lo: float, hi: float, mid: float, ne: int, nf: int,
+  impratio_invsqrt: float, efc_type: int, d: wp.array[float],
+  frictionloss: wp.array[float], x0: float, jv: float, quad: wp.vec3,
+  contact_friction: types.vec5, address0: int, quad1: wp.vec3, quad2: wp.vec3,
+) -> tuple[wp.vec3, wp.vec3, wp.vec3]:
+  a, b, c = _original_ellipse_three(
+    efcid, lo, hi, mid, ne, nf, impratio_invsqrt, efc_type, d, frictionloss,
+    x0, jv, quad, contact_friction, address0, quad1, quad2,
+  )
+  if efcid >= ne and efcid < ne + nf:
+    f, diagonal = frictionloss[efcid], d[efcid]
+    a = wp.vec3(_safe_huber_cost(x0, jv, lo, f, diagonal, a[0]), a[1], a[2])
+    b = wp.vec3(_safe_huber_cost(x0, jv, hi, f, diagonal, b[0]), b[1], b[2])
+    c = wp.vec3(_safe_huber_cost(x0, jv, mid, f, diagonal, c[0]), c[1], c[2])
+  return a, b, c
+
+
+"""
 
 
 def _transform(data: bytes) -> str:
@@ -210,6 +292,15 @@ def _transform(data: bytes) -> str:
     return _HELPERS + source
 
 
+def _ellipse_transform(data: bytes) -> str:
+    """Add cost-only ellipse aliases with a distinct immutable factory cache key."""
+    source = _transform(data)
+    old = "def _newton_linesearch_iterative_kernel("
+    if source.count(old) != 1:
+        raise RuntimeError("Unexpected private line-search factory definition")
+    return _ELLIPTIC_HELPERS + source.replace(old, "def _newton_elliptic_linesearch_iterative_kernel(")
+
+
 def supports_model(model) -> bool:
     """Return whether the actual model belongs to the tested workaround scope."""
     from mujoco_warp._src import types
@@ -217,7 +308,7 @@ def supports_model(model) -> bool:
     option = getattr(model, "opt", None)
     return (
         option is not None
-        and getattr(option, "cone", None) == types.ConeType.PYRAMIDAL
+        and getattr(option, "cone", None) in (types.ConeType.PYRAMIDAL, types.ConeType.ELLIPTIC)
         and getattr(option, "solver", None) == types.SolverType.NEWTON
     )
 
@@ -229,7 +320,7 @@ def install() -> dict:
         JSON-safe source/behavior metadata, not a numerical-quality verdict.
     """
     global _INSTALLED  # noqa: PLW0603 - one explicit process-local installation
-    from mujoco_warp._src import solver, warp_util
+    from mujoco_warp._src import solver, types, warp_util
 
     if _INSTALLED is not None:
         if solver._linesearch_iterative is not _INSTALLED[0]:
@@ -253,57 +344,68 @@ def install() -> dict:
     for filename, expected in _DEPENDENCIES.items():
         if hashlib.sha256(source_path.with_name(filename).read_bytes()).hexdigest() != expected:
             raise RuntimeError(f"Unreviewed MJWarp line-search dependency: {filename}")
-    source = _transform(source_path.read_bytes())
+    data = source_path.read_bytes()
+    source = _transform(data)
+    ellipse_source = _ellipse_transform(data)
     digest = hashlib.sha256(source.encode()).hexdigest()
-    name = "_newton_benchmark_mjwarp_linesearch_" + digest[:16]
-    filename = f"<{name}>"
-    module = ModuleType(name)
-    module.__dict__.update({key: value for key, value in solver.__dict__.items() if not key.startswith("__")})
-    module.__file__ = filename
-    sys.modules[name] = module
-    linecache.cache[filename] = (
-        len(source),
-        None,
-        source.splitlines(keepends=True),
-        filename,
-    )
-    try:
-        exec(compile(source, filename, "exec"), module.__dict__)
+    ellipse_digest = hashlib.sha256(ellipse_source.encode()).hexdigest()
+    created = []
+
+    def build_private(text: str, sha256: str, factory_name: str):
+        name = "_newton_benchmark_mjwarp_linesearch_" + sha256[:16]
+        filename = f"<{name}>"
+        module = ModuleType(name)
+        module.__dict__.update({key: value for key, value in solver.__dict__.items() if not key.startswith("__")})
+        module.__file__ = filename
+        sys.modules[name] = module
+        linecache.cache[filename] = (len(text), None, text.splitlines(keepends=True), filename)
+        created.append((name, filename))
+        exec(compile(text, filename, "exec"), module.__dict__)
         driver_globals = dict(original.__globals__)
-        driver_globals["_linesearch_iterative_kernel"] = module._newton_linesearch_iterative_kernel
+        driver_globals["_linesearch_iterative_kernel"] = getattr(module, factory_name)
         driver = FunctionType(
-            original.__code__,
-            driver_globals,
-            original.__name__,
-            original.__defaults__,
-            original.__closure__,
+            original.__code__, driver_globals, original.__name__, original.__defaults__, original.__closure__
+        )
+        return module, driver
+
+    try:
+        module, driver = build_private(source, digest, "_newton_linesearch_iterative_kernel")
+        ellipse_module, ellipse_driver = build_private(
+            ellipse_source, ellipse_digest, "_newton_elliptic_linesearch_iterative_kernel"
         )
     except BaseException:
-        sys.modules.pop(name, None)
-        linecache.cache.pop(filename, None)
+        for name, filename in created:
+            sys.modules.pop(name, None)
+            linecache.cache.pop(filename, None)
         raise
 
     @functools.wraps(original)
     def selected(model, data, context, fuse_jv):
         if supports_model(model):
+            if model.opt.cone == types.ConeType.ELLIPTIC:
+                return ellipse_driver(model, data, context, fuse_jv)
             return driver(model, data, context, fuse_jv)
         return original(model, data, context, fuse_jv)
 
     record = {
         "enabled": True,
         "experimental": True,
-        "patch_id": "pyramidal-sign-acquisition-adjacent-float-v2",
+        "patch_id": "newton-bracket-elliptic-huber-v3",
         "source_sha256": _SOURCE_SHA,
         "source_dependencies": dict(_DEPENDENCIES),
         "generated_factory_sha256": digest,
+        "generated_elliptic_factory_sha256": ellipse_digest,
         "mujoco_warp_version": "3.12.0",
-        "scope": "PYRAMIDAL+NEWTON; unsupported models use the original driver",
-        "friction_delta": False,
+        "scope": "PYRAMIDAL/ELLIPTIC+NEWTON; unsupported models use the original driver",
+        "friction_delta": True,
+        "friction_delta_scope": "ELLIPTIC only; original gradients and Hessians",
+        "ellipse_evaluator": "Inherited prepared-cone evaluator",
+        "general_trajectory_equivalence_validated": False,
         "iteration_budget_changed": False,
         "gradient_tolerance_changed": False,
         "installed_package_modified": False,
         "warning_bits_suppressed": False,
     }
     solver._linesearch_iterative = selected
-    _INSTALLED = (selected, record, module)
+    _INSTALLED = (selected, record, module, ellipse_module)
     return dict(record)
