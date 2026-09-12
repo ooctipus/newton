@@ -103,6 +103,69 @@ class Pipeline:
 
 
 class TestCheckedCapture(unittest.TestCase):
+    def test_compat_install_model_admission_and_source_guard(self):
+        """Install before execution and reject unsupported models or changed helper bytes."""
+        for supported, drift in ((True, False), (False, False), (True, True)):
+            with self.subTest(supported=supported, drift=drift), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                lab, newton, output = root / "lab", root / "newton", root / "out"
+                path, helper = lab / checked.HARNESS, root / "compat.py"
+                path.parent.mkdir(parents=True)
+                helper.write_text(
+                    "installed=False\n"
+                    "def install():\n"
+                    "    global installed\n    installed=True\n"
+                    "    return dict(installed_package_modified=False, gradient_tolerance_changed=False, iteration_budget_changed=False)\n"
+                    "def supports_model(model): return model.supported\n"
+                )
+                original_hash = checked.sha(helper)
+                path.write_text(
+                    "import sys\nfrom pathlib import Path\n"
+                    "def _model_meta(physics): return {'state_finite': True}\n"
+                    "def main():\n"
+                    "    assert sys.modules['_newton_checked_mjwarp_linesearch'].installed\n"
+                    "    for _ in range(2): _model_meta('newton_mjwarp')\n"
+                    "    Path(sys.argv[sys.argv.index('--output')+1]).write_text('{}')\n"
+                    + (f"    Path({str(helper)!r}).write_text('# changed')\n" if drift else "")
+                )
+                solver = mjwarp([0])
+                solver.mjw_model.supported = supported
+                modules = {
+                    "newton": SimpleNamespace(__file__=str(newton / "newton/__init__.py")),
+                    "mujoco_warp": SimpleNamespace(OverflowType=Bits),
+                    "isaaclab_newton.physics": SimpleNamespace(
+                        NewtonManager=SimpleNamespace(_solver=solver, _collision_pipeline=collision_pipeline())
+                    ),
+                }
+                args = [
+                    "--isaaclab",
+                    str(lab),
+                    "--newton",
+                    str(newton),
+                    "--expected-run-sha256",
+                    checked.sha(path),
+                    "--checks-output",
+                    str(output / "checks.json"),
+                    "--mjwarp-linesearch-fix",
+                    "--",
+                    "--physics",
+                    "newton_mjwarp",
+                    "--output",
+                    str(output / "capture.json"),
+                ]
+                with patch.dict("sys.modules", modules), patch.object(checked, "COMPAT_PATH", helper):
+                    if supported and not drift:
+                        self.assertEqual(checked.main(args), 0)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "actual model|helper changed"):
+                            checked.main(args)
+                report = json.loads((output / "checks.json").read_text())
+                self.assertEqual(report["complete"], supported and not drift)
+                self.assertIs(report["physics_work_modified"], True)
+                self.assertIs(report["physics_budgets_modified"], False)
+                self.assertEqual(report["mjwarp_linesearch_compat"]["helper_sha256"], original_hash)
+                self.assertEqual(report["boundaries"][0]["mjwarp_linesearch_model_supported"], supported)
+
     def test_narrow_public_checker_and_no_clear(self):
         """Execute the real checker method after retaining its immutable flag snapshot."""
         pipeline, entry = collision_pipeline(), {}
@@ -249,6 +312,15 @@ class TestCheckedCapture(unittest.TestCase):
 
     def test_shell_forwards_profile_budget_and_uses_unchanged_analyzer(self):
         """Run the real shell against inert command stubs and inspect its exact argv."""
+        for options in (
+            ["--broad-phase-output-max", "32768", "--mjwarp-linesearch-fix"],
+            ["--mjwarp-linesearch-fix", "--broad-phase-output-max", "32768"],
+        ):
+            with self.subTest(options=options):
+                self._run_shell_forwarding(options)
+
+    def _run_shell_forwarding(self, options):
+        """Check either wrapper-flag ordering without invoking a GPU or simulator."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             bin_dir, lab, output = root / "bin", root / "lab", root / "out"
@@ -284,10 +356,9 @@ class TestCheckedCapture(unittest.TestCase):
                     "bash",
                     str(Path(checked.__file__).with_name("nsys_checked.sh")),
                     "capture",
-                    "feather_pgs",
+                    "newton_mjwarp",
                     "Task",
-                    "--broad-phase-output-max",
-                    "32768",
+                    *options,
                     "--solver-attr",
                     "pgs_iterations=8",
                 ],
@@ -304,12 +375,13 @@ class TestCheckedCapture(unittest.TestCase):
             self.assertEqual(profile[profile.index("--checks-output") + 1], str(output / "capture_checks.json"))
             self.assertEqual(profile[profile.index("--broad-phase-output-max") + 1], "32768")
             self.assertLess(profile.index("--broad-phase-output-max"), profile.index("--"))
+            self.assertLess(profile.index("--mjwarp-linesearch-fix"), profile.index("--"))
             forwarded = profile[profile.index("--") + 1 :]
             self.assertEqual(
                 forwarded,
                 [
                     "--physics",
-                    "feather_pgs",
+                    "newton_mjwarp",
                     "--task",
                     "Task",
                     "--device",

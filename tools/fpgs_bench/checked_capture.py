@@ -3,7 +3,9 @@
 
 """Check existing sticky flags at the unchanged Lab harness's two metadata boundaries.
 
-This adds no physics kernels or work inside the timed windows. A clean result
+The optional MJWarp line-search correction changes the algorithm, never its
+iteration/tolerance budgets. Without that option this adds no physics kernels
+or work inside the timed windows. A clean result
 establishes only that the supported Newton narrow-phase and FPGS row/contact
 flags or MJWarp warning/overflow flags were zero; it is not a convergence proof
 or a substitute for full collision-buffer demand calibration. No flag is cleared.
@@ -22,6 +24,7 @@ from pathlib import Path
 from types import ModuleType
 
 HARNESS = Path("scripts/benchmarks/fpgs_profile/run_profiled.py")
+COMPAT_PATH = Path(__file__).resolve().with_name("mjwarp_linesearch_compat.py")
 FPGS_FLAGS = {"dense", "matrix_free", "propagation", "contacts"}
 NARROW_FLAGS = {
     "broad_phase",
@@ -154,7 +157,7 @@ def check_collision(physics: str, manager, entry: dict) -> None:
         raise
 
 
-def install_boundary_check(harness: ModuleType, report: dict, save, get_manager) -> None:
+def install_boundary_check(harness: ModuleType, report: dict, save, get_manager, compat=None) -> None:
     """Wrap only the two existing post-warmup/post-profile metadata observations."""
     original = harness._model_meta
 
@@ -167,6 +170,11 @@ def install_boundary_check(harness: ModuleType, report: dict, save, get_manager)
                 raise RuntimeError("Unexpected extra metadata boundary in checked capture")
             metadata = original(physics)
             manager = get_manager()
+            if compat is not None:
+                supported = physics == "newton_mjwarp" and bool(compat.supports_model(manager._solver.mjw_model))
+                entry["mjwarp_linesearch_model_supported"] = supported
+                if not supported:
+                    raise RuntimeError("Requested MJWarp line-search fix does not support the actual model")
             check_solver(physics, manager._solver, entry)
             check_collision(physics, manager, entry)
             if not isinstance(metadata, dict) or "error" in metadata or metadata.get("state_finite") is not True:
@@ -222,6 +230,29 @@ def install_broad_phase_limit(pipeline_type, limit: int, report: dict, save):
     return original
 
 
+def install_linesearch_fix(report: dict):
+    """Execute the exact guarded helper bytes before any model or graph construction."""
+    source = COMPAT_PATH.read_bytes()
+    record = report["mjwarp_linesearch_compat"] = {
+        "helper_sha256": hashlib.sha256(source).hexdigest(),
+        "helper_path": str(COMPAT_PATH),
+    }
+    module = ModuleType("_newton_checked_mjwarp_linesearch")
+    module.__file__ = str(COMPAT_PATH)
+    sys.modules[module.__name__] = module
+    exec(compile(source, str(COMPAT_PATH), "exec"), module.__dict__)
+    record["installation"] = module.install()
+    if not isinstance(record["installation"], dict):
+        raise RuntimeError("Unexpected MJWarp compatibility installation metadata")
+    if any(
+        record["installation"].get(name) is not False
+        for name in ("installed_package_modified", "gradient_tolerance_changed", "iteration_budget_changed")
+    ):
+        raise RuntimeError("MJWarp compatibility helper changed a protected budget or installed package")
+    json.dumps(record, allow_nan=False)
+    return module
+
+
 def main(argv: list[str] | None = None) -> int:
     """Load the pinned original harness and persist checked success or failure."""
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
@@ -230,11 +261,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expected-run-sha256", required=True)
     parser.add_argument("--checks-output", type=Path, required=True)
     parser.add_argument("--broad-phase-output-max", type=int)
+    parser.add_argument("--mjwarp-linesearch-fix", action="store_true")
     options, forwarded = parser.parse_known_args(argv)
     if options.broad_phase_output_max is not None and not 0 < options.broad_phase_output_max < 2**31:
         parser.error("--broad-phase-output-max must be a positive int32 capacity")
     if forwarded[:1] == ["--"]:
         forwarded = forwarded[1:]
+    if options.mjwarp_linesearch_fix and (
+        forwarded.count("--physics") != 1
+        or forwarded.index("--physics") + 1 >= len(forwarded)
+        or forwarded[forwarded.index("--physics") + 1] != "newton_mjwarp"
+    ):
+        parser.error("--mjwarp-linesearch-fix requires the newton_mjwarp backend")
     if "--trace-stats" in forwarded:
         parser.error("--trace-stats adds metadata reads inside timing; incompatible with boundary-only checks")
     if forwarded.count("--output") != 1:
@@ -258,7 +296,9 @@ def main(argv: list[str] | None = None) -> int:
         "scope": "Available sticky flags only; no convergence proof or complete collision-demand calibration",
         "checks_output": str(checks),
         "capture_output": str(output),
-        "physics_work_modified": False,
+        "mjwarp_linesearch_fix": options.mjwarp_linesearch_fix,
+        "physics_work_modified": options.mjwarp_linesearch_fix,
+        "physics_budgets_modified": False,
     }
     checks.parent.mkdir(parents=True, exist_ok=True)
 
@@ -284,13 +324,14 @@ def main(argv: list[str] | None = None) -> int:
         runtime_newton = importlib.import_module("newton")
         if Path(runtime_newton.__file__).resolve() != newton / "newton/__init__.py":
             raise RuntimeError("Capture imported the wrong Newton checkout")
+        compat = install_linesearch_fix(report) if options.mjwarp_linesearch_fix else None
         if options.broad_phase_output_max is not None:
             pipeline_type = runtime_newton.CollisionPipeline
             original_constructor = install_broad_phase_limit(
                 pipeline_type, options.broad_phase_output_max, report, save
             )
         install_boundary_check(
-            harness, report, save, lambda: importlib.import_module("isaaclab_newton.physics").NewtonManager
+            harness, report, save, lambda: importlib.import_module("isaaclab_newton.physics").NewtonManager, compat
         )
         sys.argv = [str(path), *forwarded]
         harness.main()
@@ -303,6 +344,8 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError("Requested broad-phase capacity was not successfully applied")
         if sha(path) != digest or sha(Path(__file__)) != report["checked_capture_sha256"]:
             raise RuntimeError("Capture source changed during execution")
+        if compat is not None and sha(COMPAT_PATH) != report["mjwarp_linesearch_compat"]["helper_sha256"]:
+            raise RuntimeError("MJWarp compatibility helper changed during execution")
         if not output.is_file():
             raise RuntimeError("Original harness did not write its capture result")
         report.update(complete=True, check_pass=True)

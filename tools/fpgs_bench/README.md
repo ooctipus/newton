@@ -61,6 +61,21 @@ calibrate their unclamped high-water marks and overflows with a full-run
 observer, including warmup and held-out contact/reset states, before timing.
 Two boundary snapshots cannot establish those transient queues' safety.
 
+An experimental numerical line-search correction can be selected explicitly
+with `--mjwarp-linesearch-fix --check-overflow`. It is forwarded only to the
+MJWarp arm, not to FPGS or the Lab harness arguments. The Newton-owned
+`mjwarp_linesearch_compat.py` installs the reviewed process-local correction
+before model/graph construction; installed packages and Lab files are not
+modified. Unknown dependency source bytes fail closed, and the actual model
+must use the supported pyramidal-cone Newton solver at both checked boundaries.
+The helper's scope and dependency hashes are recorded; this option is not
+automatic warning suppression or a general numerical-quality acceptance gate.
+It leaves timestep, substeps, iteration limits and tolerances unchanged.
+Reports explicitly mark `mjwarp_linesearch_fix=true`,
+`physics_work_modified=true`, and `physics_budgets_modified=false` for that arm.
+The parent binds those declarations and the helper hash before accepting results.
+Without this option the selected MJWarp algorithm remains unchanged.
+
 Use `--check-overflow` for the resulting timing comparison. Newton's
 `nsys_checked.sh` calls the selected Lab harness unchanged through
 `checked_capture.py`, wrapping only its existing post-warmup and post-profile
@@ -71,8 +86,9 @@ it also executes that actual owner's `NarrowPhase.check_buffer_capacity()`
 after saving all 13 sticky verifier flags. This includes broad-phase, query,
 GJK/manifold, mesh/triangle and contact buffers, plus global-reducer hash load
 and insertion failures; a hash-load warning need not imply lost contacts.
-No flags are cleared or suppressed, no additional
-physics kernels are launched, and no checks run inside the timing windows.
+The capacity checks clear or suppress no flags, launch no additional physics
+kernels, and do not run inside the timing windows. The optional line-search
+correction is an explicitly recorded algorithm change executed in those windows.
 FPGS checks dense, matrix-free and propagation row capacity plus incoming
 contact-prefix storage; the separate narrow-phase checker covers its transient
 queues. Checked mode requires narrow verification to remain enabled and rejects
@@ -102,7 +118,7 @@ The Newton-only alias `--task keyboard-so101` selects `IsaacContrib-Keyboard-SO1
 
 Each backend batch starts one process per selected GPU concurrently, waits for the full batch, and then runs the other backend. Backend order reverses on alternate rounds (A/B, B/A, A/B for three rounds); no two profilers share one selected GPU. Existing output directories and all output locations inside source checkouts are rejected. Recorded process groups receive TERM even if their leader has already exited, then KILL if group members survive the bounded grace period; direct children are reaped. This also runs after spawn failures, interrupts, or SIGTERM. Cleanup signals are recorded in the manifest. SIGKILL or machine failure cannot be handled by a Python process; inspect remaining processes before resuming after either event.
 
-`manifest.json` records commands, explicit flags, GPU UUIDs, hostname, driver and Lab runtime package versions, exact source commits and dirty-tree digests (including untracked files), and driver/helper/harness hashes. Checked mode additionally pins both Newton wrapper files and passes explicit Lab/Newton/source-hash environment values; inherited copies are removed. It checks every guarded source before and after batches. `summary.json` retains graph medians/ranges/spreads, separate auxiliary-graph time, and unprofiled wall medians/ranges. `ratios.json` is written only after every required result passes the unchanged Lab analyzer/result checks, the optional overflow checks, and every round completes. Check `manifest.json` has `status: complete`; failed manifests and raw captures remain available for diagnosis.
+`manifest.json` records commands, explicit flags, GPU UUIDs, hostname, driver and Lab runtime package versions, exact source commits and dirty-tree digests (including untracked files), and driver/helper/harness hashes. Checked mode additionally pins both Newton wrapper files and, when selected, the line-search compatibility helper; it passes explicit Lab/Newton/source-hash environment values and removes inherited copies. It checks every guarded source before and after batches. `summary.json` retains graph medians/ranges/spreads, separate auxiliary-graph time, and unprofiled wall medians/ranges. `ratios.json` is written only after every required result passes the unchanged Lab analyzer/result checks, the optional overflow checks, and every round completes. Check `manifest.json` has `status: complete`; failed manifests and raw captures remain available for diagnosis.
 
 Ratios compare physics-graph time, not equivalent solver accuracy or identical trajectories. Contact counts are diagnostic, not parity proof. Auxiliary sensor graphs are excluded from physics time and reported separately. Unprofiled environment-step wall time includes resets, events, and host work and is not reinforcement-learning training throughput. Cross-device simulations may follow different trajectories; per-device backend timings are not a same-input solver parity test.
 

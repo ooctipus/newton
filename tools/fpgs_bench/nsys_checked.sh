@@ -14,10 +14,15 @@ harness="$repo/scripts/benchmarks/fpgs_profile"
 out="${OUT_DIR:?Set a fresh output directory outside source trees}"
 name=$1; physics=$2; task=$3; shift 3
 wrapper_args=()
-if [[ "${1:-}" == "--broad-phase-output-max" ]]; then
-  wrapper_args+=("$1" "${2:?Supply a positive broad-phase output capacity}")
-  shift 2
-fi
+while true; do
+  case "${1:-}" in
+    --broad-phase-output-max)
+      wrapper_args+=("$1" "${2:?Supply a positive broad-phase output capacity}"); shift 2 ;;
+    --mjwarp-linesearch-fix)
+      wrapper_args+=("$1"); shift ;;
+    *) break ;;
+  esac
+done
 mode="${FPGS_NSYS_TRACE_MODE:-node}"
 analysis_args=()
 case "$mode" in

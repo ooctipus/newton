@@ -165,6 +165,14 @@ class TestArgumentsAndHelpers(unittest.TestCase):
             driver.parse_args(self.argv + extra)
         self.assertTrue(driver.parse_args(self.argv + extra + ["--check-overflow"]).check_overflow)
 
+    def test_linesearch_fix_requires_checked_mode(self):
+        """Require warning/overflow checks before selecting the numerical compatibility fix."""
+        with self.assertRaises(SystemExit):
+            driver.parse_args([*self.argv, "--mjwarp-linesearch-fix"])
+        self.assertTrue(
+            driver.parse_args([*self.argv, "--check-overflow", "--mjwarp-linesearch-fix"]).mjwarp_linesearch_fix
+        )
+
     def test_clean_inherited_flags_and_project_selection(self):
         """Prevent inherited solver flags or uv paths from leaking into either arm."""
         inherited = {
@@ -608,12 +616,26 @@ class TestCompleteDriver(unittest.TestCase):
                 ],
                 "checks_output": str(check_path),
                 "capture_output": str(directory / "capture.json"),
-                "physics_work_modified": False,
+                "mjwarp_linesearch_fix": "--mjwarp-linesearch-fix" in command,
+                "physics_work_modified": "--mjwarp-linesearch-fix" in command,
+                "physics_budgets_modified": False,
                 "run_profiled_sha256": env["FPGS_BENCH_RUN_SHA256"],
                 "checked_capture_sha256": driver.file_hashes([Path(driver.__file__).with_name("checked_capture.py")])[
                     str(Path(driver.__file__).with_name("checked_capture.py"))
                 ],
             }
+            if "--mjwarp-linesearch-fix" in command:
+                helper = Path(driver.__file__).with_name("mjwarp_linesearch_compat.py")
+                checks["mjwarp_linesearch_compat"] = {
+                    "helper_sha256": driver.file_hashes([helper])[str(helper)],
+                    "installation": {
+                        "installed_package_modified": False,
+                        "gradient_tolerance_changed": False,
+                        "iteration_budget_changed": False,
+                    },
+                }
+                for entry in checks["boundaries"]:
+                    entry["mjwarp_linesearch_model_supported"] = True
             if "--broad-phase-output-max" in command:
                 requested = int(command[command.index("--broad-phase-output-max") + 1])
                 checks["collision_capacity"] = {
@@ -736,6 +758,39 @@ class TestCompleteDriver(unittest.TestCase):
         self.capture._read_result.assert_not_called()
         self.assertEqual(json.loads((self.output / "manifest.json").read_text())["status"], "failed")
         self.assertFalse((self.output / "ratios.json").exists())
+
+    def test_linesearch_fix_only_reaches_mjwarp_and_is_source_bound(self):
+        """Record the algorithm change only in the MJ arm while preserving budget declarations."""
+        self.assertEqual(self.invoke(["--repeats", "1", "--check-overflow", "--mjwarp-linesearch-fix"]), 0)
+        manifest = json.loads((self.output / "manifest.json").read_text())
+        helper = Path(driver.__file__).with_name("mjwarp_linesearch_compat.py")
+        self.assertIn(str(helper), manifest["drivers"])
+        for run in manifest["runs"]:
+            fixed = run["newton"] == "mjwarp"
+            self.assertEqual(run["mjwarp_linesearch_fix"], fixed)
+            self.assertEqual("--mjwarp-linesearch-fix" in run["command"], fixed)
+            self.assertEqual(run["overflow_check"]["physics_work_modified"], fixed)
+            self.assertIs(run["overflow_check"]["physics_budgets_modified"], False)
+
+    def test_linesearch_fix_metadata_mismatch_prevents_ratios(self):
+        """Reject unbound helpers, unsupported models, false work declarations, and changed budgets."""
+        mutations = (
+            lambda report: report["mjwarp_linesearch_compat"].update(helper_sha256="wrong"),
+            lambda report: report["boundaries"][0].update(mjwarp_linesearch_model_supported=False),
+            lambda report: report.update(physics_work_modified=False),
+            lambda report: report.update(physics_budgets_modified=True),
+            lambda report: report.update(mjwarp_linesearch_fix=False),
+        )
+        for index, mutate in enumerate(mutations):
+            self.invalid_checks = lambda report, mutate=mutate: (
+                mutate(report) if report["mjwarp_linesearch_fix"] else None
+            )
+            output = self.root / f"bad-compat-{index}"
+            with self.subTest(index=index), self.assertRaisesRegex(RuntimeError, "Checked capture"):
+                self.invoke(
+                    ["--repeats", "1", "--check-overflow", "--mjwarp-linesearch-fix", "--output-dir", str(output)]
+                )
+            self.assertFalse((output / "ratios.json").exists())
 
     def test_unapplied_broad_output_capacity_prevents_ratios(self):
         """Reject a clean overflow report that did not apply its requested constructor size."""

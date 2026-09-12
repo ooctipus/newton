@@ -223,6 +223,7 @@ def check_overflow_result(run: dict, drivers: dict[str, str]) -> None:
     if not isinstance(report, dict):
         raise RuntimeError(f"Checked capture has an invalid report: {path}")
     boundaries = report.get("boundaries")
+    fix = run.get("mjwarp_linesearch_fix")
     if (
         report.get("complete") is not True
         or report.get("check_pass") is not True
@@ -242,13 +243,32 @@ def check_overflow_result(run: dict, drivers: dict[str, str]) -> None:
             or (entry["collision"]["status"] == "not_applicable" and run["backend"] != "newton_mjwarp")
             for index, entry in enumerate(boundaries)
         )
-        or report.get("physics_work_modified") is not False
+        or type(fix) is not bool
+        or report.get("mjwarp_linesearch_fix") is not fix
+        or report.get("physics_work_modified") is not fix
+        or report.get("physics_budgets_modified") is not False
         or report.get("checks_output") != str(path)
         or report.get("capture_output") != str(directory / "capture.json")
         or report.get("run_profiled_sha256") != run["environment"]["FPGS_BENCH_RUN_SHA256"]
         or report.get("checked_capture_sha256") != drivers[str(wrapper)]
     ):
         raise RuntimeError(f"Checked capture did not pass both source-bound overflow checks: {path}")
+    if fix:
+        helper = Path(__file__).resolve().with_name("mjwarp_linesearch_compat.py")
+        info = report.get("mjwarp_linesearch_compat", {})
+        if (
+            run["backend"] != "newton_mjwarp"
+            or not isinstance(info, dict)
+            or str(helper) not in drivers
+            or info.get("helper_sha256") != drivers.get(str(helper))
+            or not isinstance(info.get("installation"), dict)
+            or any(
+                info["installation"].get(name) is not False
+                for name in ("installed_package_modified", "gradient_tolerance_changed", "iteration_budget_changed")
+            )
+            or any(entry.get("mjwarp_linesearch_model_supported") is not True for entry in boundaries)
+        ):
+            raise RuntimeError(f"Checked capture did not bind the requested MJWarp line-search fix: {path}")
     requested = run.get("broad_phase_output_max")
     if requested is not None:
         capacity = report.get("collision_capacity", {})
@@ -284,7 +304,7 @@ def make_batch(
     *,
     drivers: dict[str, str] | None = None,
 ) -> list[dict]:
-    """Preserve task laws/budgets and apply only explicit calibrated storage overrides."""
+    """Preserve task budgets and record explicit storage or numerical compatibility choices."""
     task_name, attributes, recipe_flags = recipe_map(capture)[task]
     capacities = parse_capacities(args.capacity, args.task)[task][backend]
     batch = []
@@ -331,6 +351,9 @@ def make_batch(
         ]
         if "broad_phase_output_max" in capacities:
             command.extend(["--broad-phase-output-max", str(capacities["broad_phase_output_max"])])
+        fix = args.mjwarp_linesearch_fix and backend == "mjwarp"
+        if fix:
+            command.append("--mjwarp-linesearch-fix")
         command.extend(
             [
                 "--num-envs",
@@ -358,6 +381,7 @@ def make_batch(
                 "task": task,
                 "newton": backend,
                 "backend": BACKENDS[backend],
+                "mjwarp_linesearch_fix": fix,
                 "gpu_index": gpu["index"],
                 "gpu_uuid": gpu["uuid"],
                 "command": command,
@@ -476,7 +500,7 @@ def ratios(summaries: list[dict], tasks: list[str], gpus: list[int], repeats: in
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Accept sampling and calibrated capacity options, not physics/budget tuning."""
+    """Accept sampling, calibrated capacities, and the scoped fix without budget tuning."""
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("isaaclab", "fpgs", "mjwarp", "output-dir"):
         parser.add_argument(f"--{name}", required=True, type=Path)
@@ -500,12 +524,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Reject FPGS sticky row/contact flags and every MJWarp warning/overflow bit at existing metadata boundaries.",
     )
+    parser.add_argument(
+        "--mjwarp-linesearch-fix",
+        action="store_true",
+        help="Opt in to the source-guarded MJWarp numerical line-search correction; requires --check-overflow.",
+    )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--num-envs", type=int, default=16384)
     parser.add_argument("--warmup-steps", type=int, default=200)
     parser.add_argument("--steps", type=int, default=40)
     parser.add_argument("--profile-steps", type=int, default=40)
     args = parser.parse_args(argv)
+    if args.mjwarp_linesearch_fix and not args.check_overflow:
+        parser.error("--mjwarp-linesearch-fix requires --check-overflow")
     if min(args.repeats, args.num_envs, args.steps, args.profile_steps) < 1 or args.warmup_steps < 0:
         parser.error("Sample counts must be positive and warmup steps nonnegative")
     if len(set(args.gpus)) != len(args.gpus) or any(gpu < 0 for gpu in args.gpus):
@@ -547,6 +578,8 @@ def main(argv: list[str] | None = None) -> int:
     ]
     if args.check_overflow:
         files.extend(Path(__file__).resolve().with_name(name) for name in ("checked_capture.py", "nsys_checked.sh"))
+    if args.mjwarp_linesearch_fix:
+        files.append(Path(__file__).resolve().with_name("mjwarp_linesearch_compat.py"))
     drivers = file_hashes(files)
     if drivers[str(Path(capture.__file__).resolve())] != capture._loaded_source_sha256:
         raise RuntimeError("Isaac Lab helper changed while loading")
