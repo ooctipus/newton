@@ -19,13 +19,18 @@ import hashlib
 import importlib
 import inspect
 import json
+import os
+import re
 import sys
 from contextlib import ExitStack
 from pathlib import Path
 from types import ModuleType
 
+import numpy as np
+
 HARNESS = Path("scripts/benchmarks/fpgs_profile/run_profiled.py")
 COMPAT_PATH = Path(__file__).resolve().with_name("mjwarp_linesearch_compat.py")
+SAT_ENV = "NEWTON_COLLISION_BOX_SAT"
 FPGS_FLAGS = {"dense", "matrix_free", "propagation", "contacts"}
 MJ_CONTACT_FLAGS = {"negative_count", "source_contacts", "mjwarp_contacts"}
 NARROW_FLAGS = {
@@ -261,12 +266,58 @@ def check_solver(physics: str, solver, entry: dict) -> None:
     entry["check_pass"] = True
 
 
-def check_collision(physics: str, manager, entry: dict) -> None:
+def check_collision_sat(pipeline, requested: str, result: dict) -> None:
+    """Verify explicit SAT specialization and summarize model pairs outside timing."""
+    result.update(requested=requested == "1", check_pass=False)
+    if requested not in ("0", "1"):
+        raise RuntimeError(f"{SAT_ENV} must be exactly 0 or 1")
+    primitive = getattr(pipeline.narrow_phase, "primitive_kernel", None)
+    name = getattr(getattr(primitive, "module", None), "name", None)
+    result["primitive_module"] = name
+    match = re.fullmatch(r"narrow_phase_primitive_.+_sat([01])", name) if isinstance(name, str) else None
+    if match is None:
+        raise RuntimeError("Cannot verify the actual box-box SAT primitive module")
+    result["actual"] = match[1] == "1"
+    if result["actual"] != result["requested"]:
+        raise RuntimeError("Actual box-box SAT specialization differs from the explicit request")
+    model = pipeline.model
+    shapes, pairs = model.shape_type, pipeline.shape_pairs_filtered
+    if shapes.device.is_capturing or pairs.device.is_capturing:
+        raise RuntimeError("Read SAT model and pair metadata outside capture only")
+    types, indices = shapes.numpy(), pairs.numpy()
+    if (
+        types.shape != (model.shape_count,)
+        or types.dtype.kind not in "iu"
+        or np.any(types < 0)
+        or len(pairs.shape) != 1
+        or indices.shape != (pairs.shape[0], 2)
+        or indices.dtype.kind not in "iu"
+        or np.any(indices < 0)
+        or np.any(indices >= len(types))
+    ):
+        raise RuntimeError("Invalid current SAT shape types or filtered pair indices")
+    kinds, counts = np.unique(types, return_counts=True)
+    pair_types, pair_counts = np.unique(np.sort(types[indices], axis=1), axis=0, return_counts=True)
+    result.update(
+        shape_count=int(len(types)),
+        shape_type_counts={str(int(kind)): int(count) for kind, count in zip(kinds, counts, strict=True)},
+        filtered_pair_count=int(len(indices)),
+        filtered_pair_type_counts={
+            f"{int(pair[0])}:{int(pair[1])}": int(count) for pair, count in zip(pair_types, pair_counts, strict=True)
+        },
+        scope="Current model/filter topology, not current broad-phase or contact counts",
+        check_pass=True,
+    )
+
+
+def check_collision(physics: str, manager, entry: dict, *, sat_requested: str | None = None) -> None:
     """Check the actual rigid collision owner, not snapshots of reset-each-call counters."""
     result = entry["collision"] = {"check_pass": False, "status": "checking"}
     try:
         pipeline, solver = manager._collision_pipeline, manager._solver
         if pipeline is None:
+            if sat_requested is not None:
+                raise RuntimeError("Explicit box-box SAT requires an actual Newton collision pipeline")
             if (
                 physics == "newton_mjwarp"
                 and solver._use_mujoco_contacts
@@ -303,13 +354,18 @@ def check_collision(physics: str, manager, entry: dict) -> None:
         check()
         if any(flags.values()):
             raise RuntimeError("Narrow-phase capacity flags were nonzero despite a successful checker")
+        if sat_requested is not None:
+            sat = result["box_box_sat"] = {}
+            check_collision_sat(pipeline, sat_requested, sat)
         result.update(check_pass=True, status="checked")
     except BaseException as error:
         result.update(check_pass=False, status="failed", error=repr(error))
         raise
 
 
-def install_boundary_check(harness: ModuleType, report: dict, save, get_manager, compat=None, compact=None) -> None:
+def install_boundary_check(
+    harness: ModuleType, report: dict, save, get_manager, compat=None, compact=None, *, sat_requested: str | None = None
+) -> None:
     """Wrap only the two existing post-warmup/post-profile metadata observations."""
     original = harness._model_meta
 
@@ -330,7 +386,7 @@ def install_boundary_check(harness: ModuleType, report: dict, save, get_manager,
                 if not supported:
                     raise RuntimeError("Requested MJWarp line-search fix does not support the actual model")
             check_solver(physics, manager._solver, entry)
-            check_collision(physics, manager, entry)
+            check_collision(physics, manager, entry, sat_requested=sat_requested)
             if physics == "feather_pgs":
                 entry["fused_contact_solve"] = fused_contact_metadata(manager._solver)
                 entry["early_publication"] = early_publication_metadata(manager._solver)
@@ -456,6 +512,7 @@ def main(argv: list[str] | None = None) -> int:
         path.exists() or any(path.is_relative_to(root) for root in roots) for path in (output, checks)
     ):
         parser.error("Use distinct fresh capture/checks files outside all source trees")
+    sat_requested = os.environ.get(SAT_ENV)
     report = {
         "complete": False,
         "check_pass": False,
@@ -466,7 +523,12 @@ def main(argv: list[str] | None = None) -> int:
         "capture_output": str(output),
         "mjwarp_linesearch_fix": options.mjwarp_linesearch_fix,
         "allegro_compact_capacity": options.allegro_compact_capacity,
-        "physics_work_modified": options.mjwarp_linesearch_fix,
+        "box_box_sat": {
+            "requested": None if sat_requested is None else sat_requested == "1",
+            "environment_value": sat_requested,
+            "check_pass": False,
+        },
+        "physics_work_modified": options.mjwarp_linesearch_fix or sat_requested == "1",
         "physics_budgets_modified": False,
     }
     checks.parent.mkdir(parents=True, exist_ok=True)
@@ -480,6 +542,8 @@ def main(argv: list[str] | None = None) -> int:
     compact = None
     save()
     try:
+        if sat_requested is not None and sat_requested not in ("0", "1"):
+            raise RuntimeError(f"{SAT_ENV} must be exactly 0 or 1")
         path = lab / HARNESS
         source = path.read_bytes()
         digest = hashlib.sha256(source).hexdigest()
@@ -524,11 +588,16 @@ def main(argv: list[str] | None = None) -> int:
                 pipeline_type, options.broad_phase_output_max, report, save
             )
             configured_constructor = pipeline_type.__init__
-        install_boundary_check(harness, report, save, get_manager, compat, compact)
+        install_boundary_check(harness, report, save, get_manager, compat, compact, sat_requested=sat_requested)
         sys.argv = [str(path), *forwarded]
         harness.main()
         if report["boundary_count"] != 2 or not all(entry["check_pass"] for entry in report["boundaries"]):
             raise RuntimeError("Checked capture did not complete both required boundaries")
+        if os.environ.get(SAT_ENV) != sat_requested:
+            raise RuntimeError("Explicit box-box SAT environment changed during capture")
+        report["box_box_sat"]["check_pass"] = sat_requested is None or all(
+            entry["collision"]["box_box_sat"]["check_pass"] for entry in report["boundaries"]
+        )
         if options.broad_phase_output_max is not None and (
             not report["collision_capacity"]["pipelines"]
             or not all(entry["construction_pass"] for entry in report["collision_capacity"]["pipelines"])

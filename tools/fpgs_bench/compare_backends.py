@@ -36,6 +36,7 @@ SOLVER_CAPACITIES = {
 ADDITIONAL_RECIPES = {"keyboard-so101": ("IsaacContrib-Keyboard-SO101", (), {})}
 HARNESS_RELATIVE = Path("scripts/benchmarks/fpgs_profile")
 FLAG_PREFIXES = ("FEATHER_", "NEWTON_", "FPGS_PROBE_")
+BOX_SAT_FLAG = "NEWTON_COLLISION_BOX_SAT"
 HELPERS = (
     "_source",
     "_gpus",
@@ -86,11 +87,15 @@ def parse_flags(entries: list[str], gpus: list[int]) -> dict[int, dict[str, str]
             or not gpu.isdecimal()
             or int(gpu) not in flags
             or not equals
-            or not re.fullmatch(r"(?:FEATHER_PGS_|NEWTON_NARROW_PHASE_)[A-Z0-9_]+", name)
+            or not (
+                re.fullmatch(r"(?:FEATHER_PGS_|NEWTON_NARROW_PHASE_)[A-Z0-9_]+", name)
+                or (name == BOX_SAT_FLAG and value in ("0", "1"))
+            )
             or "\0" in value
         ):
             raise ValueError(
-                f"Expected selected GPU:FEATHER_PGS_NAME=VALUE or GPU:NEWTON_NARROW_PHASE_NAME=VALUE: {entry!r}"
+                "Expected selected GPU:FEATHER_PGS_NAME=VALUE, GPU:NEWTON_NARROW_PHASE_NAME=VALUE, "
+                f"or GPU:{BOX_SAT_FLAG}=0|1: {entry!r}"
             )
         if name in flags[int(gpu)]:
             raise ValueError(f"Duplicate per-GPU flag: {entry!r}")
@@ -224,6 +229,7 @@ def check_overflow_result(run: dict, drivers: dict[str, str]) -> None:
         raise RuntimeError(f"Checked capture has an invalid report: {path}")
     boundaries = report.get("boundaries")
     fix = run.get("mjwarp_linesearch_fix")
+    sat_value = run["environment"].get(BOX_SAT_FLAG)
     if (
         report.get("complete") is not True
         or report.get("check_pass") is not True
@@ -245,7 +251,7 @@ def check_overflow_result(run: dict, drivers: dict[str, str]) -> None:
         )
         or type(fix) is not bool
         or report.get("mjwarp_linesearch_fix") is not fix
-        or report.get("physics_work_modified") is not fix
+        or report.get("physics_work_modified") is not (fix or sat_value == "1")
         or report.get("physics_budgets_modified") is not False
         or report.get("checks_output") != str(path)
         or report.get("capture_output") != str(directory / "capture.json")
@@ -253,6 +259,26 @@ def check_overflow_result(run: dict, drivers: dict[str, str]) -> None:
         or report.get("checked_capture_sha256") != drivers[str(wrapper)]
     ):
         raise RuntimeError(f"Checked capture did not pass both source-bound overflow checks: {path}")
+    if sat_value is not None:
+        requested_sat = sat_value == "1"
+        sat = report.get("box_box_sat", {})
+        if (
+            sat_value not in ("0", "1")
+            or not isinstance(sat, dict)
+            or sat.get("requested") is not requested_sat
+            or sat.get("environment_value") != sat_value
+            or sat.get("check_pass") is not True
+            or any(
+                not isinstance(entry["collision"].get("box_box_sat"), dict)
+                or entry["collision"]["box_box_sat"].get("requested") is not requested_sat
+                or entry["collision"]["box_box_sat"].get("actual") is not requested_sat
+                or entry["collision"]["box_box_sat"].get("check_pass") is not True
+                or not isinstance(entry["collision"]["box_box_sat"].get("primitive_module"), str)
+                or not entry["collision"]["box_box_sat"]["primitive_module"].endswith("_sat" + sat_value)
+                for entry in boundaries
+            )
+        ):
+            raise RuntimeError(f"Checked capture did not apply the requested box-box SAT algorithm: {path}")
     if fix:
         helper = Path(__file__).resolve().with_name("mjwarp_linesearch_compat.py")
         info = report.get("mjwarp_linesearch_compat", {})
@@ -344,6 +370,10 @@ def make_batch(
         if backend == "fpgs":
             env.update(recipe_flags)
             env.update(flags[gpu["index"]])
+        if getattr(args, "box_box_sat", False):
+            if env.get(BOX_SAT_FLAG, "1") != "1":
+                raise ValueError("Shared box-box SAT conflicts with the FPGS collision override")
+            env[BOX_SAT_FLAG] = "1"
         env.update(
             GPU=gpu["uuid"],
             CUDA_VISIBLE_DEVICES=gpu["uuid"],
@@ -547,6 +577,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--fpgs-env", action="append", default=[], metavar="GPU:NAME=VALUE")
     parser.add_argument(
+        "--box-box-sat",
+        action="store_true",
+        help="Use the existing Newton box-box SAT collision algorithm for BOTH backends; requires checked capture.",
+    )
+    parser.add_argument(
         "--capacity",
         action="append",
         default=[],
@@ -585,10 +620,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.check_overflow = not args.allow_unchecked
     if args.mjwarp_linesearch_fix and not args.check_overflow:
         parser.error("--mjwarp-linesearch-fix requires checked capture; remove --allow-unchecked")
+    if args.box_box_sat and not args.check_overflow:
+        parser.error("--box-box-sat requires checked capture; remove --allow-unchecked")
     if min(args.repeats, args.num_envs, args.steps, args.profile_steps) < 1 or args.warmup_steps < 0:
         parser.error("Sample counts must be positive and warmup steps nonnegative")
     if len(set(args.gpus)) != len(args.gpus) or any(gpu < 0 for gpu in args.gpus):
         parser.error("GPU indices must be distinct and nonnegative")
+    if args.box_box_sat and any(
+        values.get(BOX_SAT_FLAG) == "0" for values in parse_flags(args.fpgs_env, args.gpus).values()
+    ):
+        parser.error("--box-box-sat conflicts with a per-GPU SAT=0 override")
     for name in ("isaaclab", "fpgs", "mjwarp", "output_dir"):
         setattr(args, name, getattr(args, name).expanduser().resolve())
     args.task = list(dict.fromkeys(args.task))

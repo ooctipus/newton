@@ -41,7 +41,7 @@ the [structural report](../../reports/fpgs/STRUCTURAL_RESULTS_20260912.md).
 Run its CPU tests with `uv run --no-project python -m unittest discover -s
 tools/fpgs_bench -p test_compare_variants.py -v`.
 
-This driver compares the handoff task recipes without editing Isaac Lab or tuning physics parameters. It loads `scripts/benchmarks/fpgs_profile/compare_gpus.py` from an explicit Lab checkout and uses that checkout's unchanged capture script, analyzer, source-digest helper, and result aggregation. Existing Lab recipes are preserved; Newton-only aliases are merged into an isolated copy, with conflicting definitions rejected. The driver and its CPU tests require only Python's standard library.
+This driver compares the handoff task recipes without editing Isaac Lab or tuning physics parameters. It loads `scripts/benchmarks/fpgs_profile/compare_gpus.py` from an explicit Lab checkout and uses that checkout's unchanged capture script, analyzer, source-digest helper, and result aggregation. Existing Lab recipes are preserved; Newton-only aliases are merged into an isolated copy, with conflicting definitions rejected. The backend driver's mock tests require only Python's standard library; the checked SAT constructor tests also use NumPy, Warp and Newton on CPU.
 
 Checked capture is the default: missing, failed or source-mismatched boundary
 warning/overflow evidence prevents timing acceptance and final ratios.
@@ -74,6 +74,22 @@ uv run --no-project --python /path/to/isaaclab/.venv/bin/python \
 The example explicitly enables the current cached dense-row implementation on both GPUs; use a Newton revision containing those flags and the FPGS sticky capacity-check API. Omit those four feature overrides to measure the selected revision's defaults. Add the separately calibrated `--capacity` settings described below; the example does not supply universal safe capacities. The two Newton paths may be the same checkout when comparing backends from one revision. Task names come from the selected Lab helper (currently `ant`, `humanoid`, `franka`, `anymald`, `allegro`, `g1`, `kuka`, and `cartpole`). Repeated `--task` options preserve order and remove duplicates. Both arms use seed zero. FPGS receives the existing FPGS recipe's solver attributes and environment settings; MJWarp receives its own existing backend defaults, with no FPGS attributes or solver flags inherited.
 
 Explicit per-device optimization flags can be added only on the FPGS side, for example `--fpgs-env 0:FEATHER_PGS_DENSE_ROW_BUDGETS=1`. The accepted prefixes are `FEATHER_PGS_` and `NEWTON_NARROW_PHASE_`. There are no generic solver/physics-attribute overrides; the driver does not judge whether a manually selected feature flag preserves numerical semantics. All inherited `FEATHER_`, `NEWTON_`, and `FPGS_PROBE_` flags are discarded before each child launch.
+
+The existing box-box SAT collision algorithm has one additional explicit flag:
+`NEWTON_COLLISION_BOX_SAT=0|1`. For an FPGS variant screen, set it separately
+with `--baseline-env` and `--candidate-env`, preserving the other accepted flags
+in both arms. For a shared-collision FPGS/MJWarp comparison, use
+`compare_backends.py --box-box-sat`: this enables SAT for **both** backends and
+rejects a conflicting per-GPU SAT-off override. It requires checked capture.
+The checked boundaries verify the actual `_sat0`/`_sat1` primitive module and
+record current model/filter type histograms outside timing. An environment
+setting alone is not activation evidence. No timestep, substep, iteration or
+capacity is changed. Both backends must actually use Newton collision.
+Different manifolds and contact counts need physical/convergence validation;
+timing and clear capacity flags alone do not establish it. A generic collision
+improvement must retime MJWarp with the same collision choice, not silently
+reuse the SAT-off denominator. No Isaac Lab edit is needed for its existing
+environment switch.
 
 Calibrated buffer sizes can be passed explicitly with repeated
 `--capacity TASK:BACKEND:FIELD=VALUE` options. Each setting applies to both GPUs

@@ -79,6 +79,7 @@ class TestArgumentsAndHelpers(unittest.TestCase):
         self.assertTrue(args.check_overflow)
         self.assertFalse(args.allow_unchecked)
         self.assertFalse(args.mjwarp_linesearch_fix)
+        self.assertFalse(args.box_box_sat)
 
     def test_unchecked_requires_explicit_mutually_exclusive_choice(self):
         """Permit legacy capture only on an explicit opt-out, never via an omitted option."""
@@ -156,6 +157,27 @@ class TestArgumentsAndHelpers(unittest.TestCase):
         self.assertEqual(result["keyboard-so101"]["mjwarp"], {"nconmax": 36})
         self.assertEqual(result["ant"], {"fpgs": {}, "mjwarp": {}})
 
+    def test_box_sat_flag_is_explicit_boolean_only(self):
+        """Admit the existing collision algorithm without opening arbitrary Newton flags."""
+        name = "NEWTON_COLLISION_BOX_SAT"
+        self.assertEqual(
+            driver.parse_flags([f"0:{name}=0", f"1:{name}=1"], [0, 1]),
+            {0: {name: "0"}, 1: {name: "1"}},
+        )
+        for value in ("", "true", "2", "1\0"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                driver.parse_flags([f"0:{name}={value}"], [0, 1])
+        with self.assertRaises(ValueError):
+            driver.parse_flags(["0:NEWTON_COLLISION_OTHER=1"], [0, 1])
+
+    def test_shared_box_sat_rejects_conflicting_fpgs_override(self):
+        """A shared collision comparison cannot silently retain a different FPGS algorithm."""
+        self.assertTrue(driver.parse_args([*self.argv, "--box-box-sat"]).box_box_sat)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            driver.parse_args([*self.argv, "--box-box-sat", "--fpgs-env", "0:NEWTON_COLLISION_BOX_SAT=0"])
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            driver.parse_args([*self.argv, "--box-box-sat", "--allow-unchecked"])
+
     def test_capacity_overrides_reject_physics_and_ambiguity(self):
         """Reject unselected tasks, wrong owners, duplicate values and physics tuning."""
         for entries in (
@@ -194,6 +216,7 @@ class TestArgumentsAndHelpers(unittest.TestCase):
             "FEATHER_OTHER": "1",
             "NEWTON_OTHER": "1",
             "NEWTON_NARROW_PHASE_BAD": "1",
+            "NEWTON_COLLISION_BOX_SAT": "1",
             "FPGS_PROBE_BAD": "1",
             "FPGS_BENCH_ISAACLAB": "bad",
             "FPGS_BENCH_NEWTON": "bad",
@@ -650,6 +673,22 @@ class TestCompleteDriver(unittest.TestCase):
                 }
                 for entry in checks["boundaries"]:
                     entry["mjwarp_linesearch_model_supported"] = True
+            sat_value = env.get("NEWTON_COLLISION_BOX_SAT")
+            if sat_value is not None:
+                requested = sat_value == "1"
+                checks["box_box_sat"] = {
+                    "requested": requested,
+                    "environment_value": sat_value,
+                    "check_pass": True,
+                }
+                checks["physics_work_modified"] |= requested
+                for entry in checks["boundaries"]:
+                    entry["collision"]["box_box_sat"] = {
+                        "requested": requested,
+                        "actual": requested,
+                        "primitive_module": "collision_primitive_test_sat" + sat_value,
+                        "check_pass": True,
+                    }
             if "--broad-phase-output-max" in command:
                 requested = int(command[command.index("--broad-phase-output-max") + 1])
                 checks["collision_capacity"] = {
@@ -765,6 +804,47 @@ class TestCompleteDriver(unittest.TestCase):
                 self.assertNotIn("--broad-phase-output-max", run["command"])
         self.assertEqual(self.capture._read_result.call_count, 4)
         self.assertTrue((self.output / "ratios.json").exists())
+
+    def test_shared_box_sat_reaches_both_backends(self):
+        """Keep the collision algorithm shared when comparing FPGS and MJWarp."""
+        self.assertEqual(self.invoke(["--repeats", "1", "--box-box-sat"]), 0)
+        manifest = json.loads((self.output / "manifest.json").read_text())
+        self.assertTrue(manifest["settings"]["box_box_sat"])
+        for run in manifest["runs"]:
+            self.assertEqual(run["environment"]["NEWTON_COLLISION_BOX_SAT"], "1")
+
+    def test_fpgs_box_sat_does_not_leak_to_mjwarp(self):
+        """Permit a labeled one-sided discovery screen without ambient leakage."""
+        self.assertEqual(self.invoke(["--repeats", "1", "--fpgs-env", "0:NEWTON_COLLISION_BOX_SAT=1"]), 0)
+        manifest = json.loads((self.output / "manifest.json").read_text())
+        for run in manifest["runs"]:
+            enabled = run["newton"] == "fpgs" and run["gpu_index"] == 0
+            self.assertEqual(run["environment"].get("NEWTON_COLLISION_BOX_SAT"), "1" if enabled else None)
+
+    def test_unapplied_box_sat_prevents_ratios(self):
+        """Bind both actual collision boundaries to an explicit SAT-off request too."""
+        mutations = (
+            lambda report: report.pop("box_box_sat"),
+            lambda report: report["box_box_sat"].update(environment_value="1"),
+            lambda report: report["boundaries"][0]["collision"]["box_box_sat"].update(actual=True),
+            lambda report: report["boundaries"][1]["collision"]["box_box_sat"].update(check_pass=False),
+            lambda report: report["boundaries"][1]["collision"]["box_box_sat"].update(primitive_module="unknown"),
+        )
+        for index, mutate in enumerate(mutations):
+            self.invalid_checks = lambda report, mutate=mutate: mutate(report) if "box_box_sat" in report else None
+            output = self.root / f"bad-sat-{index}"
+            with self.subTest(index=index), self.assertRaisesRegex(RuntimeError, "box-box SAT"):
+                self.invoke(
+                    [
+                        "--repeats",
+                        "1",
+                        "--fpgs-env",
+                        "0:NEWTON_COLLISION_BOX_SAT=0",
+                        "--output-dir",
+                        str(output),
+                    ]
+                )
+            self.assertFalse((output / "ratios.json").exists())
 
     def test_missing_checked_result_prevents_timing_acceptance(self):
         """Reject a successful child that never supplied its required checked report."""

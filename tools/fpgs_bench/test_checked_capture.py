@@ -1,9 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Test boundary-only checked capture without simulator, Warp, or GPU imports."""
+"""Test portable boundary checks and actual CPU collision constructor evidence."""
 
 import enum
+import importlib
 import inspect
 import json
 import os
@@ -16,6 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import checked_capture as checked
+import numpy as np
 
 
 class FlagArray:
@@ -108,6 +110,151 @@ class Pipeline:
 
 
 class TestCheckedCapture(unittest.TestCase):
+    def test_sat_actual_cpu_constructor(self):
+        """Verify both real constructor specializations and actual Warp pair arrays on CPU."""
+        newton = importlib.import_module("newton")
+        wp = importlib.import_module("warp")
+
+        with wp.ScopedDevice("cpu"):
+            builder = newton.ModelBuilder()
+            for index in range(2):
+                body = builder.add_body()
+                builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1, xform=wp.transform((index, 0, 0)))
+            model = builder.finalize(device="cpu")
+            for value in ("0", "1"):
+                pipeline = newton.CollisionPipeline(model, broad_phase="explicit", box_box_sat=value == "1")
+                result = {}
+                checked.check_collision_sat(pipeline, value, result)
+                self.assertTrue(result["check_pass"])
+                self.assertIs(result["actual"], value == "1")
+                self.assertTrue(result["primitive_module"].endswith("_sat" + value))
+                self.assertEqual(result["shape_type_counts"], {"7": 2})
+                self.assertEqual(result["filtered_pair_type_counts"], {"7:7": 1})
+
+    def test_sat_main_binds_environment_and_rejects_drift(self):
+        """Persist both boundary proofs and reject mutation of the explicit environment."""
+        for value, drift in (("0", False), ("1", False), ("1", True)):
+            with self.subTest(value=value, drift=drift), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                lab, newton, output = root / "lab", root / "newton", root / "out"
+                path = lab / checked.HARNESS
+                path.parent.mkdir(parents=True)
+                path.write_text(
+                    "import os, sys\nfrom pathlib import Path\n"
+                    "def _model_meta(physics): return {'state_finite': True}\n"
+                    "def main():\n"
+                    "    for _ in range(2): _model_meta('feather_pgs')\n"
+                    "    Path(sys.argv[sys.argv.index('--output')+1]).write_text('{}')\n"
+                    + (f"    os.environ[{checked.SAT_ENV!r}] = '0'\n" if drift else "")
+                )
+                modules = {
+                    "newton": SimpleNamespace(__file__=str(newton / "newton/__init__.py")),
+                    "isaaclab_newton.physics": SimpleNamespace(
+                        NewtonManager=SimpleNamespace(_solver=fpgs(), _collision_pipeline=self._sat_pipeline(value))
+                    ),
+                }
+                args = [
+                    "--isaaclab",
+                    str(lab),
+                    "--newton",
+                    str(newton),
+                    "--expected-run-sha256",
+                    checked.sha(path),
+                    "--checks-output",
+                    str(output / "checks.json"),
+                    "--",
+                    "--physics",
+                    "feather_pgs",
+                    "--output",
+                    str(output / "capture.json"),
+                ]
+                with patch.dict("sys.modules", modules), patch.dict(os.environ, {checked.SAT_ENV: value}):
+                    if drift:
+                        with self.assertRaisesRegex(RuntimeError, "environment changed"):
+                            checked.main(args)
+                    else:
+                        self.assertEqual(checked.main(args), 0)
+                report = json.loads((output / "checks.json").read_text())
+                self.assertIs(report["complete"], not drift)
+                self.assertIs(report["box_box_sat"]["check_pass"], not drift)
+                self.assertIs(report["box_box_sat"]["requested"], value == "1")
+                self.assertEqual(report["box_box_sat"]["environment_value"], value)
+                self.assertIs(report["physics_work_modified"], value == "1")
+                self.assertIs(report["physics_budgets_modified"], False)
+                self.assertEqual(report["boundary_count"], 2)
+                for boundary in report["boundaries"]:
+                    self.assertIs(boundary["collision"]["box_box_sat"]["actual"], value == "1")
+
+    def test_sat_request_checks_actual_module_and_current_pair_histogram(self):
+        """Bind each explicit SAT choice to actual runtime specialization and pair types."""
+        for value in ("0", "1"):
+            pipeline = self._sat_pipeline(value)
+            entry = {}
+            checked.check_collision(
+                "feather_pgs",
+                SimpleNamespace(_solver=fpgs(), _collision_pipeline=pipeline),
+                entry,
+                sat_requested=value,
+            )
+            actual = entry["collision"]["box_box_sat"]
+            self.assertIs(actual["actual"], value == "1")
+            self.assertIs(actual["requested"], value == "1")
+            self.assertTrue(actual["check_pass"])
+            self.assertEqual(actual["shape_type_counts"], {"7": 2, "10": 1})
+            self.assertEqual(actual["filtered_pair_type_counts"], {"7:7": 1, "7:10": 1})
+            self.assertEqual(actual["filtered_pair_count"], 2)
+            pipeline.narrow_phase.check_buffer_capacity.assert_called_once_with()
+
+    def _sat_pipeline(self, value):
+        """Provide immutable NumPy snapshots behind the real Warp array read interface."""
+        pipeline = collision_pipeline()
+        pipeline.narrow_phase.primitive_kernel = SimpleNamespace(
+            module=SimpleNamespace(name=f"narrow_phase_primitive_write_contact_False_True_False_sat{value}")
+        )
+        pipeline.model.shape_count = 3
+        pipeline.model.shape_type = SimpleNamespace(
+            shape=(3,),
+            device=SimpleNamespace(is_capturing=False),
+            numpy=lambda: np.array([7, 7, 10], dtype=np.int32),
+        )
+        pipeline.shape_pairs_filtered = SimpleNamespace(
+            shape=(2,),
+            device=SimpleNamespace(is_capturing=False),
+            numpy=lambda: np.array([[0, 1], [2, 1]], dtype=np.int32),
+        )
+        return pipeline
+
+    def test_sat_request_rejects_wrong_missing_and_unreadable_evidence(self):
+        """Reject ignored flags and malformed topology without accepting clean capacity flags."""
+        for failure in ("wrong", "missing", "unknown", "capture", "pair_index", "pair_shape", "types", "request"):
+            pipeline = self._sat_pipeline("1")
+            requested = "1"
+            if failure == "wrong":
+                pipeline.narrow_phase.primitive_kernel.module.name = "narrow_phase_primitive_x_sat0"
+            elif failure == "missing":
+                del pipeline.narrow_phase.primitive_kernel
+            elif failure == "unknown":
+                pipeline.narrow_phase.primitive_kernel.module.name = "narrow_phase_primitive_x_sat1_unverified"
+            elif failure == "capture":
+                pipeline.model.shape_type.device.is_capturing = True
+            elif failure == "pair_index":
+                pipeline.shape_pairs_filtered.numpy = lambda: np.array([[0, 3], [1, 2]], dtype=np.int32)
+            elif failure == "pair_shape":
+                pipeline.shape_pairs_filtered.numpy = lambda: np.array([0, 1], dtype=np.int32)
+            elif failure == "types":
+                pipeline.model.shape_type.numpy = lambda: np.array([7.0, 7.0, 10.0])
+            else:
+                requested = "true"
+            entry = {}
+            with self.subTest(failure=failure), self.assertRaises(RuntimeError):
+                checked.check_collision(
+                    "feather_pgs",
+                    SimpleNamespace(_solver=fpgs(), _collision_pipeline=pipeline),
+                    entry,
+                    sat_requested=requested,
+                )
+            self.assertFalse(entry["collision"]["check_pass"])
+
     def test_compat_install_model_admission_and_source_guard(self):
         """Install before execution and reject unsupported models or changed helper bytes."""
         for supported, drift in ((True, False), (False, False), (True, True)):
