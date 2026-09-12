@@ -1725,6 +1725,25 @@ class CollisionPipeline:
             Rigid-contact autodiff via
             :func:`newton.eval_rigid_contact_kinematics` may change
             without prior notice; see :meth:`collide`.
+
+            ``NEWTON_NARROW_PHASE_COHERENT_CONVEX=reject_only`` enables an
+            experimental, default-off temporal rejection filter. It requires
+            immutable model-built unique explicit pairs and the internal lean
+            CUDA split pipeline, without gradients, speculative contacts,
+            particles, triangle meshes, heightfields, hydroelastic contacts,
+            or body-pair reduction. Cached BOX/CONVEX_MESH directions are only
+            hints: current full-shape support must certify separation beyond
+            the original contact shell. Every retained or ambiguous pair uses
+            the original cold MPR/GJK and unchanged manifold writer.
+
+            Serialize collisions and resets, including stream handoffs and
+            graph replay. Only one live CUDA graph may own this cache. Rebuild
+            after changing pair membership or shape types; transforms, scale
+            and hull vertices are reread for each certificate. Resetting
+            contact matching invalidates the selected worlds' hints (a global
+            reset invalidates all buckets). An unreported reset cannot reuse
+            a cached witness as a contact answer. Optional diagnostic counters
+            use ``NEWTON_NARROW_PHASE_COHERENT_STATS=1``; keep them off for timing.
         """
         if isinstance(reduce_contacts, (bool, np.bool_)):
             reduction_config = self.ContactReductionConfig(mesh=bool(reduce_contacts))
@@ -1789,6 +1808,14 @@ class CollisionPipeline:
             raise ValueError("NEWTON_NARROW_PHASE_PAIR_SHAPE_PREP must be 0 or 1")
         self._pair_shape_prep = pair_shape_prep == "1"
         self.prepared_shape_indices = None
+        coherent_convex = os.environ.get("NEWTON_NARROW_PHASE_COHERENT_CONVEX", "0")
+        coherent_stats = os.environ.get("NEWTON_NARROW_PHASE_COHERENT_STATS", "0")
+        if coherent_convex not in ("0", "reject_only") or coherent_stats not in ("0", "1"):
+            raise ValueError(
+                "NEWTON_NARROW_PHASE_COHERENT_CONVEX must be 0 or reject_only; COHERENT_STATS must be 0 or 1"
+            )
+        if coherent_stats == "1" and coherent_convex == "0":
+            raise ValueError("coherent convex diagnostics require NEWTON_NARROW_PHASE_COHERENT_CONVEX=reject_only")
 
         # Resolve rigid contact capacity with explicit > model > estimated precedence.
         model_rigid_contact_max = int(getattr(model, "rigid_contact_max", 0) or 0)
@@ -2194,6 +2221,42 @@ class CollisionPipeline:
             self.prepared_shape_indices = wp.array(pair_indices, dtype=wp.int32, device=device)
 
         # Built here (not in finalize) so models/tasks that never collide don't pay for it.
+        if coherent_convex != "0":
+            if (
+                using_expert_components
+                or self.broad_phase_mode != "explicit"
+                or self.shape_pairs_filtered is not getattr(model, "shape_contact_pairs", None)
+                or not self.narrow_phase.split_gjk_mpr
+                or not self.narrow_phase._use_lean_gjk_mpr
+                or model.particle_count != 0
+                or self.narrow_phase.has_meshes
+                or self.narrow_phase.has_heightfields
+                or self.hydroelastic_sdf is not None
+                or self._speculative_enabled
+                or reduction_config.body_pairs
+                or requires_grad
+            ):
+                raise ValueError(
+                    "experimental coherent convex collision requires model-built unique explicit pairs, "
+                    "the internal lean CUDA split pipeline, no mesh/heightfield/particle/hydroelastic or "
+                    "speculative contacts, no body-pair reduction, and no gradients"
+                )
+            from ..geometry.coherent_convex import _ConvexQueryCache  # noqa: PLC0415
+            from ..geometry.coherent_convex_rejection import _create_rejection_query_kernels  # noqa: PLC0415
+
+            self.narrow_phase._coherent_cache = _ConvexQueryCache(
+                pairs=self.shape_pairs_filtered.numpy(),
+                shape_types=model.shape_type.numpy(),
+                shape_world=model.shape_world.numpy(),
+                world_count=model.world_count,
+                query_capacity=self.narrow_phase.split_query_results.shape[0],
+                device=device,
+            )
+            self.narrow_phase._coherent_query_kernels = _create_rejection_query_kernels(
+                diagnostics=coherent_stats == "1"
+            )
+
+        # Built here (not in finalize) so models/tasks that never collide don't pay for it.
         # Host-side, so not graph-capture-safe -- construct the pipeline before any capture.
         self.soft_rigid_contact_pairs = _build_soft_particle_rigid_contact_pairs(model)
         self._soft_rigid_contact_pair_count = len(self.soft_rigid_contact_pairs)
@@ -2559,6 +2622,8 @@ class CollisionPipeline:
         )
         if self._contact_matcher is not None:
             self._contact_matcher.reset(world_mask)
+        if self.narrow_phase._coherent_cache is not None:
+            self.narrow_phase._coherent_cache.reset(world_mask)
 
     @staticmethod
     def _build_excluded_pairs(model: Model) -> wp.array[wp.vec2i] | None:

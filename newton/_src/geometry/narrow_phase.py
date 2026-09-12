@@ -2474,6 +2474,9 @@ class NarrowPhase:
         if candidate_pair_work_estimate < 0:
             raise ValueError("candidate_pair_work_estimate must be non-negative or None")
         self.split_gjk_mpr = device_obj.is_cuda and has_generic_convex_pairs and split_gjk_mpr
+        self._use_lean_gjk_mpr = use_lean_gjk_mpr
+        self._coherent_cache = None
+        self._coherent_query_kernels = None
         # Create the appropriate kernel variants
         # Primitive kernel handles lightweight primitives and routes remaining pairs
         self.primitive_kernel = create_narrow_phase_primitive_kernel(
@@ -2910,41 +2913,85 @@ class NarrowPhase:
                     shape_collision_aabb_lower,
                     shape_collision_aabb_upper,
                 ]
-                wp.launch(
-                    kernel=self.narrow_phase_mpr_kernel,
-                    dim=self.total_num_threads,
-                    inputs=[
+                if self._coherent_cache is not None:
+                    from .coherent_convex_rejection import _PairInputs  # noqa: PLC0415
+
+                    self._coherent_cache.begin()
+                    pair_inputs = _PairInputs()
+                    for name, value in zip(
+                        (
+                            "shape_types",
+                            "shape_data",
+                            "shape_transform",
+                            "shape_source",
+                            "shape_gap",
+                            "shape_collision_radius",
+                            "shape_aabb_lower",
+                            "shape_aabb_upper",
+                            "shape_collision_aabb_lower",
+                            "shape_collision_aabb_upper",
+                        ),
+                        common_inputs,
+                        strict=True,
+                    ):
+                        setattr(pair_inputs, name, value)
+                    coherent_inputs = [
                         convex_pairs,
                         convex_pair_count,
-                        *common_inputs,
+                        pair_inputs,
+                        self._coherent_cache.data,
                         self.total_num_threads,
                         self.split_query_results,
                         self.split_gjk_work_items,
                         self.split_gjk_work_count,
                         self.split_manifold_work_items,
                         self.split_manifold_work_count,
-                    ],
-                    device=device,
-                    block_dim=self.block_dim,
-                    record_tape=False,
-                )
-                wp.launch(
-                    kernel=self.narrow_phase_gjk_kernel,
-                    dim=self.total_num_threads,
-                    inputs=[
-                        convex_pairs,
-                        *common_inputs,
-                        self.total_num_threads,
-                        self.split_query_results,
-                        self.split_gjk_work_items,
-                        self.split_gjk_work_count,
-                        self.split_manifold_work_items,
-                        self.split_manifold_work_count,
-                    ],
-                    device=device,
-                    block_dim=self.block_dim,
-                    record_tape=False,
-                )
+                    ]
+                    for coherent_kernel in self._coherent_query_kernels:
+                        wp.launch(
+                            kernel=coherent_kernel,
+                            dim=self.total_num_threads,
+                            inputs=coherent_inputs,
+                            device=device,
+                            block_dim=self.block_dim,
+                            record_tape=False,
+                        )
+                else:
+                    wp.launch(
+                        kernel=self.narrow_phase_mpr_kernel,
+                        dim=self.total_num_threads,
+                        inputs=[
+                            convex_pairs,
+                            convex_pair_count,
+                            *common_inputs,
+                            self.total_num_threads,
+                            self.split_query_results,
+                            self.split_gjk_work_items,
+                            self.split_gjk_work_count,
+                            self.split_manifold_work_items,
+                            self.split_manifold_work_count,
+                        ],
+                        device=device,
+                        block_dim=self.block_dim,
+                        record_tape=False,
+                    )
+                    wp.launch(
+                        kernel=self.narrow_phase_gjk_kernel,
+                        dim=self.total_num_threads,
+                        inputs=[
+                            convex_pairs,
+                            *common_inputs,
+                            self.total_num_threads,
+                            self.split_query_results,
+                            self.split_gjk_work_items,
+                            self.split_gjk_work_count,
+                            self.split_manifold_work_items,
+                            self.split_manifold_work_count,
+                        ],
+                        device=device,
+                        block_dim=self.block_dim,
+                        record_tape=False,
+                    )
                 wp.launch(
                     kernel=self.narrow_phase_manifold_kernel,
                     dim=self.total_num_threads,
