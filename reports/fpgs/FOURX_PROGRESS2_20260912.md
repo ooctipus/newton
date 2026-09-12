@@ -10,6 +10,11 @@ substeps, eight-sweep allowance, dependency pointer or capacity changed.
 The current Kuka path is a **repeatable opt-in physics improvement**, not a
 default-on release, proof of MJWarp physical parity, or achievement of 4x.
 The separate Franka kinetic-cache prototype is not included in this runtime.
+The subsequent [complete warm-boundary screen](FRANKA_COMPLETE_BOUNDARY_20260912.md)
+passes bounded finite-eight law checks but costs4.010/4.032ms RTX/GB and
+misses its integrated planning allowance. It is not a new whole-task result.
+The next [24-hour work plan](DATAFLOW_24H_20260912.md) targets intermediate
+work elimination across complete paths; no2--4x performance promise is made.
 The subsequent [complete private-state experiment](FRANKA_PRIVATE_STATE_20260912.md)
 also remains scratch: numerical controls pass, but its measured owner cost
 does not qualify for the proposed large whole-physics gain.
@@ -195,6 +200,14 @@ work removed explain the miss. Narrow normal-only corrections cannot meet the
 large-gain bound; the family is closed on measured cost, not a bit-identity gate.
 The same checkpoint records Franka's complete arrow-state experiment and its
 four-arm mass-collector isolation. No new whole-physics gain is promoted.
+
+The subsequent [existing box-box SAT screen](SAT_DISCOVERY_20260912.md)
+also yields no accepted gain: Kuka overflows the unchanged dense capacity
+before a valid candidate timing; Franka completes slower on both GPUs.
+The node diagnosis prices the expensive SAT primitive and the GB residual
+tail, rather than treating fewer GJK items as proportional time removed.
+Both corrected MJWarp references use external Newton collision, so a shared
+collision promotion would require matched denominator retiming.
 
 Evidence (large captures remain local):
 
