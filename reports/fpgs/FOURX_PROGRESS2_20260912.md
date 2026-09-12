@@ -187,8 +187,14 @@ accepted world-observations exactly match original eight sweeps on their own
 coefficients; serial and overlapped outputs also match. Metadata/RHS/selector/MF
 coefficients are exact. Completion/source/idle pass is not numerical acceptance:
 the diagnostic keeps its original-output acceptance flags false and reports
-focus-only physical metrics separately. Independent current-geometry physical
-assessment is in progress; no timing or tolerance waiver is claimed here.
+focus-only physical metrics separately. The subsequent
+[physical, complete-cost and node diagnosis](ARROW_AND_NORMAL_DIAGNOSIS_20260912.md)
+finds small current-geometry reassociation, then an 8.99% RTX / 11.40% GB
+complete-family slowdown. Added exposed transactions and little actual solver
+work removed explain the miss. Narrow normal-only corrections cannot meet the
+large-gain bound; the family is closed on measured cost, not a bit-identity gate.
+The same checkpoint records Franka's complete arrow-state experiment and its
+four-arm mass-collector isolation. No new whole-physics gain is promoted.
 
 Evidence (large captures remain local):
 
