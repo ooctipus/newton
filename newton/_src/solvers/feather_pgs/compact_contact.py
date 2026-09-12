@@ -164,14 +164,51 @@ def clear_contact_response(
             Y[group, row, dof] = 0.0
 
 
+@wp.struct
+class ContactGeometry:
+    world: int
+    slot: int
+    art0: int
+    art1: int
+    body0: int
+    body1: int
+    has_dense: bool
+    normal: wp.vec3
+    tangent0: wp.vec3
+    tangent1: wp.vec3
+    point0: wp.vec3
+    point1: wp.vec3
+    anchor: wp.vec3
+    phi: float
+    mu: float
+    restitution: float
+    group: int
+
+
+@wp.struct
+class ContactRow:
+    J: _Vec6
+    Y: _Vec6
+    dof0: int
+    dof1: int
+    j0: float
+    y0: float
+    j1: float
+    y1: float
+    diag: float
+    target: float
+    phi: float
+    mu: float
+    beta: float
+    cfm: float
+    restitution: float
+    kind: int
+    parent: int
+
+
 @wp.func
-def produce_contact(data: ContactBoundaryData, contact: int):
-    """Publish one allocated contact after the current-contact dense zero owner."""
-    if contact >= wp.min(data.count[0], data.point0.shape[0]):
-        return
-    slot = data.slot[contact]
-    if data.path[contact] != 0 or slot < 0:
-        return
+def prepare_contact_geometry(data: ContactBoundaryData, contact: int):
+    """Evaluate the common current raw geometry once for all three contact rows."""
     world = data.world[contact]
     art0 = data.art0[contact]
     art1 = data.art1[contact]
@@ -210,105 +247,175 @@ def produce_contact(data: ContactBoundaryData, contact: int):
     tangent0, tangent1 = contact_tangent_basis(normal)
     anchor = 0.5 * (point0 + point1)
     group = data.dense_group[world]
-    for row in range(data.slots_needed[contact]):
-        direction = normal
-        p0 = point0
-        p1 = point1
-        if row == 0:
-            if data.shared_anchor != 0:
-                p0 = anchor
-                p1 = anchor
+    geometry = ContactGeometry()
+    geometry.world = world
+    geometry.slot = data.slot[contact]
+    geometry.art0 = art0
+    geometry.art1 = art1
+    geometry.body0 = body0
+    geometry.body1 = body1
+    geometry.has_dense = has_dense
+    geometry.normal = normal
+    geometry.tangent0 = tangent0
+    geometry.tangent1 = tangent1
+    geometry.point0 = point0
+    geometry.point1 = point1
+    geometry.anchor = anchor
+    geometry.phi = phi
+    geometry.mu = mu
+    geometry.restitution = restitution
+    geometry.group = group
+    return geometry
+
+
+@wp.func
+def evaluate_contact_row(data: ContactBoundaryData, geometry: ContactGeometry, component: int):
+    """Return the original row law without choosing a persistent coefficient owner."""
+    art0 = geometry.art0
+    art1 = geometry.art1
+    body0 = geometry.body0
+    body1 = geometry.body1
+    direction = geometry.normal
+    p0 = geometry.point0
+    p1 = geometry.point1
+    if component == 0:
+        if data.shared_anchor != 0:
+            p0 = geometry.anchor
+            p1 = geometry.anchor
+    else:
+        if component == 1:
+            direction = geometry.tangent0
         else:
-            if row == 1:
-                direction = tangent0
-            else:
-                direction = tangent1
-            if data.shared_anchor != 0 or data.friction_shared_anchor != 0:
-                p0 = anchor
-                p1 = anchor
-        output_row = slot + row
-        target = prescribed_relative_contact_target(
-            body0, art0, body1, art1, p0, p1, direction, data.prescribed, data.origin, data.body_v
-        )
-        data.target[world, output_row] = target
-        data.row_cfm[world, output_row] = data.cfm
-        if row == 0:
-            data.row_type[world, output_row] = 0
-            data.row_parent[world, output_row] = -1
-            data.row_mu[world, output_row] = mu
-            data.row_beta[world, output_row] = data.beta
-            data.phi[world, output_row] = phi
-            data.restitution[world, output_row] = restitution
-        else:
-            data.row_type[world, output_row] = 2
-            data.row_parent[world, output_row] = slot
-            data.row_mu[world, output_row] = mu * data.friction_scale
-            data.row_beta[world, output_row] = 0.0
-            data.phi[world, output_row] = 0.0
-            data.restitution[world, output_row] = 0.0
-        diagonal = float(0.0)
-        if has_dense:
-            jacobian = _Vec6()
-            for dof in range(6):
-                value0 = float(0.0)
-                value1 = float(0.0)
-                bit = wp.uint32(1) << wp.uint32(dof)
-                if art0 >= 0 and body0 >= 0 and data.response_dofs[art0] == 6:
-                    if (data.body_mask[body0] & bit) != wp.uint32(0):
-                        value0 = point_projection(
-                            data.motion[data.dof_start[art0] + dof], direction, p0, data.origin[art0]
-                        )
-                if art1 >= 0 and body1 >= 0 and data.response_dofs[art1] == 6:
-                    if (data.body_mask[body1] & bit) != wp.uint32(0):
-                        value1 = -point_projection(
-                            data.motion[data.dof_start[art1] + dof], direction, p1, data.origin[art1]
-                        )
-                jacobian[dof] = value0 + value1
-            response = solve_six(data.factor, group, jacobian)
-            for dof in range(6):
-                data.J[group, output_row, dof] = jacobian[dof]
-                data.Y[group, output_row, dof] = response[dof]
-                diagonal += jacobian[dof] * response[dof]
-        coord0 = -1
+            direction = geometry.tangent1
+        if data.shared_anchor != 0 or data.friction_shared_anchor != 0:
+            p0 = geometry.anchor
+            p1 = geometry.anchor
+    packet = ContactRow()
+    packet.target = prescribed_relative_contact_target(
+        body0, art0, body1, art1, p0, p1, direction, data.prescribed, data.origin, data.body_v
+    )
+    packet.cfm = data.cfm
+    if component == 0:
+        packet.kind = 0
+        packet.parent = -1
+        packet.mu = geometry.mu
+        packet.beta = data.beta
+        packet.phi = geometry.phi
+        packet.restitution = geometry.restitution
+    else:
+        packet.kind = 2
+        packet.parent = geometry.slot
+        packet.mu = geometry.mu * data.friction_scale
+        packet.beta = 0.0
+        packet.phi = 0.0
+        packet.restitution = 0.0
+    diagonal = float(0.0)
+    if geometry.has_dense:
+        jacobian = _Vec6()
+        for dof in range(6):
+            value0 = float(0.0)
+            value1 = float(0.0)
+            bit = wp.uint32(1) << wp.uint32(dof)
+            if art0 >= 0 and body0 >= 0 and data.response_dofs[art0] == 6:
+                if (data.body_mask[body0] & bit) != wp.uint32(0):
+                    value0 = point_projection(data.motion[data.dof_start[art0] + dof], direction, p0, data.origin[art0])
+            if art1 >= 0 and body1 >= 0 and data.response_dofs[art1] == 6:
+                if (data.body_mask[body1] & bit) != wp.uint32(0):
+                    value1 = -point_projection(
+                        data.motion[data.dof_start[art1] + dof], direction, p1, data.origin[art1]
+                    )
+            jacobian[dof] = value0 + value1
+        response = solve_six(data.factor, geometry.group, jacobian)
+        packet.J = jacobian
+        packet.Y = response
+        for dof in range(6):
+            diagonal += jacobian[dof] * response[dof]
+    coord0 = -1
+    coord1 = -1
+    value0 = float(0.0)
+    value1 = float(0.0)
+    response0 = float(0.0)
+    response1 = float(0.0)
+    if art0 >= 0 and body0 >= 0 and data.response_dofs[art0] == data.sparse_size:
+        dof0 = data.body_single_dof[body0]
+        if dof0 >= 0:
+            local0 = dof0 - data.dof_start[art0]
+            if local0 >= 0 and local0 < data.sparse_size:
+                coord0 = data.dof_offset[art0] + local0
+                value0 = point_projection(data.motion[dof0], direction, p0, data.origin[art0])
+                response0 = value0 * data.inverse_mass[dof0]
+    if art1 >= 0 and body1 >= 0 and data.response_dofs[art1] == data.sparse_size:
+        dof1 = data.body_single_dof[body1]
+        if dof1 >= 0:
+            local1 = dof1 - data.dof_start[art1]
+            if local1 >= 0 and local1 < data.sparse_size:
+                coord1 = data.dof_offset[art1] + local1
+                value1 = -point_projection(data.motion[dof1], direction, p1, data.origin[art1])
+                response1 = value1 * data.inverse_mass[dof1]
+    if coord0 >= 0 and coord0 == coord1:
+        value0 += value1
+        response0 += response1
         coord1 = -1
-        value0 = float(0.0)
-        value1 = float(0.0)
-        response0 = float(0.0)
-        response1 = float(0.0)
-        if art0 >= 0 and body0 >= 0 and data.response_dofs[art0] == data.sparse_size:
-            dof0 = data.body_single_dof[body0]
-            if dof0 >= 0:
-                local0 = dof0 - data.dof_start[art0]
-                if local0 >= 0 and local0 < data.sparse_size:
-                    coord0 = data.dof_offset[art0] + local0
-                    value0 = point_projection(data.motion[dof0], direction, p0, data.origin[art0])
-                    response0 = value0 * data.inverse_mass[dof0]
-        if art1 >= 0 and body1 >= 0 and data.response_dofs[art1] == data.sparse_size:
-            dof1 = data.body_single_dof[body1]
-            if dof1 >= 0:
-                local1 = dof1 - data.dof_start[art1]
-                if local1 >= 0 and local1 < data.sparse_size:
-                    coord1 = data.dof_offset[art1] + local1
-                    value1 = -point_projection(data.motion[dof1], direction, p1, data.origin[art1])
-                    response1 = value1 * data.inverse_mass[dof1]
-        if coord0 >= 0 and coord0 == coord1:
-            value0 += value1
-            response0 += response1
-            coord1 = -1
-            value1 = 0.0
-            response1 = 0.0
-        data.sparse_dof[world, output_row, 0] = coord0
-        data.sparse_dof[world, output_row, 1] = coord1
-        data.sparse_jy[world, output_row, 0] = value0
-        data.sparse_jy[world, output_row, 1] = response0
-        data.sparse_jy[world, output_row, 2] = value1
-        data.sparse_jy[world, output_row, 3] = response1
-        sparse_diagonal = float(0.0)
-        if coord0 >= 0:
-            sparse_diagonal += value0 * response0
-        if coord1 >= 0:
-            sparse_diagonal += value1 * response1
-        data.diag[world, output_row] = (diagonal + sparse_diagonal) + data.cfm
+        value1 = 0.0
+        response1 = 0.0
+    packet.dof0 = coord0
+    packet.dof1 = coord1
+    packet.j0 = value0
+    packet.y0 = response0
+    packet.j1 = value1
+    packet.y1 = response1
+    sparse_diagonal = float(0.0)
+    if coord0 >= 0:
+        sparse_diagonal += value0 * response0
+    if coord1 >= 0:
+        sparse_diagonal += value1 * response1
+    packet.diag = (diagonal + sparse_diagonal) + data.cfm
+    return packet
+
+
+@wp.func
+def publish_row_metadata(data: ContactBoundaryData, world: int, output_row: int, packet: ContactRow):
+    """Publish current inspectable row state, independent of coefficient storage."""
+    data.target[world, output_row] = packet.target
+    data.row_cfm[world, output_row] = packet.cfm
+    data.row_type[world, output_row] = packet.kind
+    data.row_parent[world, output_row] = packet.parent
+    data.row_mu[world, output_row] = packet.mu
+    data.row_beta[world, output_row] = packet.beta
+    data.phi[world, output_row] = packet.phi
+    data.restitution[world, output_row] = packet.restitution
+    data.diag[world, output_row] = packet.diag
+
+
+@wp.func
+def publish_contact_row(data: ContactBoundaryData, geometry: ContactGeometry, component: int, packet: ContactRow):
+    """Keep the original E2 publisher and its separately cleared dense-zero contract."""
+    world = geometry.world
+    output_row = geometry.slot + component
+    publish_row_metadata(data, world, output_row, packet)
+    if geometry.has_dense:
+        for dof in range(6):
+            data.J[geometry.group, output_row, dof] = packet.J[dof]
+            data.Y[geometry.group, output_row, dof] = packet.Y[dof]
+    data.sparse_dof[world, output_row, 0] = packet.dof0
+    data.sparse_dof[world, output_row, 1] = packet.dof1
+    data.sparse_jy[world, output_row, 0] = packet.j0
+    data.sparse_jy[world, output_row, 1] = packet.y0
+    data.sparse_jy[world, output_row, 2] = packet.j1
+    data.sparse_jy[world, output_row, 3] = packet.y1
+
+
+@wp.func
+def produce_contact(data: ContactBoundaryData, contact: int):
+    """Publish one allocated contact after the current-contact dense zero owner."""
+    if contact >= wp.min(data.count[0], data.point0.shape[0]):
+        return
+    if data.path[contact] != 0 or data.slot[contact] < 0:
+        return
+    geometry = prepare_contact_geometry(data, contact)
+    for component in range(data.slots_needed[contact]):
+        packet = evaluate_contact_row(data, geometry, component)
+        publish_contact_row(data, geometry, component, packet)
 
 
 @wp.kernel

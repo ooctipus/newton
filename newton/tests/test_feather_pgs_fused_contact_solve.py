@@ -92,6 +92,9 @@ def wide_fixture(device="cpu", **kwargs):
 
 
 class TestFusedContactSolve(unittest.TestCase):
+    feature_switch = "_FUSED_CONTACT_SOLVE"
+    dense_fallback_contacts = 33
+
     def test_exact_owner_thresholds_and_current_map_transitions(self):
         """Separate 384/385 rows and 32/33 dense contacts through empty and stale-map reuse."""
         data, aux = routing_fixture()
@@ -340,7 +343,7 @@ class TestFusedContactSolve(unittest.TestCase):
             solvers = []
             for enabled in (False, True):
                 with (
-                    mock.patch.object(solver_module, "_FUSED_CONTACT_SOLVE", enabled),
+                    mock.patch.object(solver_module, self.feature_switch, enabled),
                     mock.patch.object(solver_module, "_COMPACT_CONTACT_BOUNDARY", True),
                     mock.patch.object(solver_module, "_PRISMATIC_PUBLICATION", True),
                     mock.patch.object(solver_module, "_SPARSE_CONTACT_DIRECT", True),
@@ -414,7 +417,14 @@ class TestFusedContactSolve(unittest.TestCase):
             for state in states[1]:
                 newton.eval_fk(model, state.joint_q, state.joint_qd, state)
             for step, indices in enumerate(
-                (list(range(6)), [0, 1, 2] + [3] * 33, [], list(range(6)), list(range(6)), list(range(6)))
+                (
+                    list(range(6)),
+                    [0, 1, 2] + [3] * self.dense_fallback_contacts,
+                    [],
+                    list(range(6)),
+                    list(range(6)),
+                    list(range(6)),
+                )
             ):
                 publish(indices)
                 if step == 3:
@@ -450,6 +460,8 @@ class TestFusedContactSolve(unittest.TestCase):
                 compare()
             for index, solver in enumerate(solvers):
                 current, following = states[index]
+                # Captured stream events cannot be reused by an eager launch.
+                solver.seed_double_buffer_events()
                 solver.step(current, following, controls[index], None, 1 / 240)
                 states[index] = [following, current]
             self.assertIsNone(solvers[1]._fused_contact_solve_active)
