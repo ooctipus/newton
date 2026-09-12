@@ -121,3 +121,71 @@ Pinned reports:
 - `/tmp/fpgs-independent-components-loaded-20260912-01/gpu1/report.json`,
   SHA256 `141014e492f8e67c4b891a143cc4794eac3e83724f24ba54eb369aa7abdd6c44`.
 - Replay and controls: `/tmp/fpgs-independent-components-replay-Jmjo9kWu/READY.md`.
+
+## Diagnosed scheduling loss and one fork/join retry
+
+The attribution controls confirm the sequential mapping's stop condition.
+On GB, split general costs 291.328/291.296 us for full refresh/reuse inputs,
+291.296/291.328 us with only coupled world6872 retained, and 18.912/18.976 us
+with only independent worlds. The one coupled world determines the general
+tail. Preparation plus paired hand work adds 158.624/116.544 us before it.
+Original general co-scheduled those worlds within one grid; the sequential
+split removed that overlap. RTX has the same mechanism, with about133 us
+full/coupled general versus20.48 us independent-only. Subsets preserve every
+selected world's inputs and outputs. These are diagnostic timings, not a
+reduced-work optimization claim.
+
+This concrete cause justifies one dependency-removal retry, not another grid
+search. Default-off `FEATHER_PGS_PAIRED_GENERAL_OVERLAP=1` creates a persistent
+paired stream and two events outside capture. Current preparation completes
+before the ready event; general runs on the caller stream and paired runs
+independently, with a mandatory caller join before return/publication. The
+original owners are already disjoint by world. With the component flag, the
+selected worlds are disjoint by velocity coordinates instead. Both original
+and split fork variants therefore have explicit same-input controls.
+
+No arithmetic, kernel resources, capacity or iteration allowance changes.
+Admission requires the existing23+6 factor recipe and parallel-stream setting;
+gradient, extra sweep owners, warm response readers and synchronous/debug
+instrumentation are excluded. Unsupported recipes keep the original path.
+
+The prospective RTX whole-cost card uses the fresh3.213106 ms paired/general
+boundary and a1.636206 ms ceiling for a10% whole-time step. Subtracting about
+.321216 ms preparation leaves **1.314990 ms** for the slower full concurrent
+branch plus every event/contention cost. The existing ordinary paired node
+is about1.0–1.1 ms, so this is plausible but tight; its added hand work is
+not present in the sparse replay and must be measured live. These node sums
+are not exclusive critical-path savings. GB's longer fallback tail requires
+an explicit no-regression gate.
+
+The complete sparse replay, including fork/join, now gives:
+
+| Device / phase | Original sequential us | Original fork us | Split sequential us | Split fork us |
+| --- | ---: | ---: | ---: | ---: |
+| RTX / refresh | 343.312 | 338.016 | 264.192 | 172.096 |
+| RTX / reuse | 238.896 | 234.976 | 237.776 | 173.152 |
+| GB300 / refresh | 405.600 | 401.792 | 442.464 | 339.328 |
+| GB300 / reuse | 311.424 | 305.552 | 398.832 | 334.032 |
+
+All four arms pass native five-world ownership controls, including ordinary
+non-MF, coupled fallback, both offsets and delayed friction; actual saved
+refresh/reuse outputs pass eager and two captured graphs on both cards.
+Fork output is identical to the corresponding sequential output. Original
+saved-output and before/after source guards pass. Root reaped both children
+and checked GPU idle. Ordinary non-MF work remains absent from this replay;
+this is not yet a whole-physics gain. The next gate is full16K on both GPUs.
+
+Three Python admission/dispatch tests pass on the new integration, including
+original-order preservation, prepare-before-fork and join-before-return.
+The corrected regression control passes default order but fails missing fork
+behavior on predecessor563ebc3d. An initial stub omitted a required boolean;
+that harness error was fixed before the meaningful regression check.
+
+Fork reports and exact input/source closure:
+
+- `/tmp/fpgs-independent-components-fork-20260912-01/gpu0/report.json`,
+  SHA256 `a9db9ba413fe9259332e1b5c3f297508ee97a7e6c06c4d4677177c773838a27b`.
+- `/tmp/fpgs-independent-components-fork-20260912-01/gpu1/report.json`,
+  SHA256 `fc24127b45cd53e7814f97dbdfb5d0be6dbc2f14449c8f32811674110ebd2209`.
+- `/tmp/fpgs-independent-components-fork-jslpJHdd/READY.md` records the
+  prospective cost card, full timing scope and native controls.

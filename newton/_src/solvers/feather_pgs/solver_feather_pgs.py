@@ -6032,6 +6032,32 @@ class SolverFeatherPGS(SolverBase):
         )
         self._global_inertia_stream = wp.Stream(model.device) if self._compact_inertia_refresh else None
         self._articulation_dynamics_stream = wp.Stream(model.device) if self._async_augmented_drives else None
+        # The original owners have disjoint world sets. With independent
+        # components enabled, the split worlds instead have disjoint DOFs.
+        # Both forms can fork only after response/selector preparation and
+        # must join before any downstream velocity or impulse publication.
+        paired_overlap = bool(
+            os.environ.get("FEATHER_PGS_PAIRED_GENERAL_OVERLAP", "0") == "1"
+            and self.use_parallel_streams
+            and model.device.is_cuda
+            and not model.requires_grad
+            and self._paired_factor_solve_kernel is not None
+            and self._paired_response_primary_size == 23
+            and self._paired_response_secondary_size == 6
+            and self.max_world_dofs == 29
+            and not self.pgs_debug
+            and not self._mf_warmstart_enabled
+            and self._mimic_count == 0
+            and self._connect_count == 0
+            and not getattr(self, "_pgs_solve_mf_gs_incremental_kernels", ())
+            and getattr(self, "_rb_build_kernel", None) is None
+            and not (
+                _FPGS_CAPTURE or _GROUPED_CHECK or _DEBUG_CACHE_CMP or _INK_CHECK or _WR_CHECK or _FPGS_SYNC_TIMINGS
+            )
+        )
+        self._paired_general_solve_stream = wp.Stream(model.device) if paired_overlap else None
+        self._paired_general_ready = wp.Event(model.device) if paired_overlap else None
+        self._paired_general_done = wp.Event(model.device) if paired_overlap else None
 
     def _init_double_buffer_stream(self):
         """Create a CUDA stream for mass-matrix and active-Jacobian maintenance."""
@@ -6828,6 +6854,12 @@ class SolverFeatherPGS(SolverBase):
                 if row_phase != 0 or soft_relax or defer_dense_response:
                     raise RuntimeError("Independent components require the supported physical interleaved solve")
                 components.prepare(self, dense_rhs, mf_meta)
+            factor_stream = self._paired_general_solve_stream
+            if factor_stream is not None:
+                if row_phase != 0 or soft_relax or defer_dense_response:
+                    raise RuntimeError("Paired/general overlap requires the physical interleaved solve")
+                wp.get_stream(self.model.device).record_event(self._paired_general_ready)
+                factor_stream.wait_event(self._paired_general_ready)
             if factor_kernel is not None:
                 if row_phase != 0:
                     raise RuntimeError("paired factor-coordinate solve only supports the interleaved row phase")
@@ -6844,40 +6876,46 @@ class SolverFeatherPGS(SolverBase):
                     or self._paired_factor_secondary_offsets_by_world is None
                 ):
                     raise RuntimeError("paired factor-coordinate solve metadata is incomplete")
-                with self._sync_timed(f"factor_pgs_iters{phase_iterations}"):
-                    wp.launch_tiled(
-                        factor_kernel,
-                        dim=[(self.world_count + 1) // 2],
-                        inputs=[
-                            self.world_count,
-                            self.constraint_count,
-                            self.dense_phase_bounds,
-                            self.world_dof_indices,
-                            dense_rhs,
-                            self.diag,
-                            self.impulses,
-                            self.Y_world,
-                            self.row_type,
-                            self.row_parent,
-                            self.row_mu,
-                            self.mf_constraint_count if components is None else components.selector,
-                            self.L_by_size[primary_size],
-                            self.Linv_by_size[primary_size],
-                            self.L_by_size[secondary_size],
-                            self.Linv_by_size[secondary_size],
-                            self._paired_factor_primary_groups_by_world,
-                            self._paired_factor_secondary_groups_by_world,
-                            self._paired_factor_primary_offsets_by_world,
-                            self._paired_factor_secondary_offsets_by_world,
-                            phase_iterations,
-                            omega,
-                            int(friction_start_iteration),
-                            int(phase_iteration_offset),
-                        ],
-                        outputs=[self.v_out],
-                        block_dim=64,
-                        device=self.model.device,
-                    )
+
+                def launch_factor_solve():
+                    with self._sync_timed(f"factor_pgs_iters{phase_iterations}"):
+                        wp.launch_tiled(
+                            factor_kernel,
+                            dim=[(self.world_count + 1) // 2],
+                            inputs=[
+                                self.world_count,
+                                self.constraint_count,
+                                self.dense_phase_bounds,
+                                self.world_dof_indices,
+                                dense_rhs,
+                                self.diag,
+                                self.impulses,
+                                self.Y_world,
+                                self.row_type,
+                                self.row_parent,
+                                self.row_mu,
+                                self.mf_constraint_count if components is None else components.selector,
+                                self.L_by_size[primary_size],
+                                self.Linv_by_size[primary_size],
+                                self.L_by_size[secondary_size],
+                                self.Linv_by_size[secondary_size],
+                                self._paired_factor_primary_groups_by_world,
+                                self._paired_factor_secondary_groups_by_world,
+                                self._paired_factor_primary_offsets_by_world,
+                                self._paired_factor_secondary_offsets_by_world,
+                                phase_iterations,
+                                omega,
+                                int(friction_start_iteration),
+                                int(phase_iteration_offset),
+                            ],
+                            outputs=[self.v_out],
+                            block_dim=64,
+                            device=self.model.device,
+                            stream=factor_stream,
+                        )
+
+                if factor_stream is None:
+                    launch_factor_solve()
             with self._sync_timed(f"mfgs_phase{row_phase}_iters{phase_iterations}"):
                 mf_gs_inputs = [
                     self._local_general_world_count,
@@ -7017,6 +7055,12 @@ class SolverFeatherPGS(SolverBase):
                         _report_grouped_check("ink_Y_diag", [self.Y_world, self.diag], ink_ref)
                     else:
                         _report_grouped_check("ink_diag", [self.diag], ink_ref[1:])
+            if factor_stream is not None:
+                # Queue the scarce general tail first; the independent paired
+                # grid shares only the pre-solve ready dependency with it.
+                launch_factor_solve()
+                factor_stream.record_event(self._paired_general_done)
+                wp.get_stream(self.model.device).wait_event(self._paired_general_done)
             local_done_events = []
             if launch_local:
                 if local_stream is not None:
