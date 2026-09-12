@@ -3682,6 +3682,7 @@ def _allocate_world_contact_slot(
     dense_dropped_contact_rows: wp.array[int],
     mf_dropped_contact_rows: wp.array[int],
     propagation_dropped_contact_rows: wp.array[int],
+    capacity_status: wp.array[int],
 ):
     """Classify and allocate rows for one active contact.
 
@@ -3867,6 +3868,7 @@ def _allocate_world_contact_slot(
         if slot + slots_needed > mf_max_constraints:
             # Roll back the counter so finalize sees only filled slots
             wp.atomic_add(mf_slot_counter, world, -slots_needed)
+            wp.atomic_max(capacity_status, 1, 1)
             if row_capacity_telemetry != 0:
                 wp.atomic_add(mf_dropped_contact_rows, world, slots_needed)
             contact_slot[c] = -1
@@ -3883,6 +3885,7 @@ def _allocate_world_contact_slot(
         if slot + slots_needed > propagation_max_constraints:
             # Roll back the counter so finalize sees only filled slots
             wp.atomic_add(propagation_slot_counter, world, -slots_needed)
+            wp.atomic_max(capacity_status, 2, 1)
             if row_capacity_telemetry != 0:
                 wp.atomic_add(propagation_dropped_contact_rows, world, slots_needed)
             contact_slot[c] = -1
@@ -3899,6 +3902,7 @@ def _allocate_world_contact_slot(
         if slot + slots_needed > max_constraints:
             # Roll back the counter so finalize sees only filled slots
             wp.atomic_add(world_slot_counter, world, -slots_needed)
+            wp.atomic_max(capacity_status, 0, 1)
             if row_capacity_telemetry != 0:
                 wp.atomic_add(dense_dropped_contact_rows, world, slots_needed)
             contact_slot[c] = -1
@@ -3964,6 +3968,7 @@ def allocate_world_contact_slots(
     dense_dropped_contact_rows: wp.array[int],
     mf_dropped_contact_rows: wp.array[int],
     propagation_dropped_contact_rows: wp.array[int],
+    capacity_status: wp.array[int],
 ):
     """Allocate active contacts with work proportional to the materialized prefix.
 
@@ -3975,6 +3980,8 @@ def allocate_world_contact_slots(
     total_contacts = contact_count[0]
     capacity = contact_shape0.shape[0]
     if total_contacts > capacity:
+        if thread == 0:
+            wp.atomic_max(capacity_status, 3, 1)
         for c in range(thread, capacity, total_num_threads):
             contact_slot[c] = -1
             contact_path[c] = -1
@@ -4050,6 +4057,7 @@ def allocate_world_contact_slots(
             dense_dropped_contact_rows,
             mf_dropped_contact_rows,
             propagation_dropped_contact_rows,
+            capacity_status,
         )
 
 
@@ -5316,6 +5324,23 @@ def populate_world_J_for_size(
             world_target_velocity,
             world_row_restitution,
         )
+
+
+@wp.kernel
+def finalize_constraint_counts_with_status(
+    slot_counter: wp.array[int],
+    capacity: int,
+    family: int,
+    constraint_count: wp.array[int],
+    capacity_status: wp.array[int],
+):
+    """Clamp counts while retaining sticky overflow from non-contact row producers."""
+    world = wp.tid()
+    count = slot_counter[world]
+    if count > capacity:
+        wp.atomic_max(capacity_status, family, 1)
+        count = capacity
+    constraint_count[world] = count
 
 
 @wp.kernel

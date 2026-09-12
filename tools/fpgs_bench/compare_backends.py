@@ -27,6 +27,12 @@ from pathlib import Path
 from types import ModuleType
 
 BACKENDS = {"fpgs": "feather_pgs", "mjwarp": "newton_mjwarp"}
+COLLISION_CAPACITIES = {"rigid_contact_max", "max_triangle_pairs", "broad_phase_output_max"}
+CHECKED_ENVIRONMENT = {"FPGS_BENCH_ISAACLAB", "FPGS_BENCH_NEWTON", "FPGS_BENCH_RUN_SHA256"}
+SOLVER_CAPACITIES = {
+    "fpgs": {"dense_max_constraints", "mf_max_constraints", "propagation_max_constraints"},
+    "mjwarp": {"njmax", "nconmax"},
+}
 ADDITIONAL_RECIPES = {"keyboard-so101": ("IsaacContrib-Keyboard-SO101", (), {})}
 HARNESS_RELATIVE = Path("scripts/benchmarks/fpgs_profile")
 FLAG_PREFIXES = ("FEATHER_", "NEWTON_", "FPGS_PROBE_")
@@ -92,6 +98,23 @@ def parse_flags(entries: list[str], gpus: list[int]) -> dict[int, dict[str, str]
     return flags
 
 
+def parse_capacities(entries: list[str], tasks: list[str]) -> dict:
+    """Parse explicit calibrated storage sizes without admitting solver-budget changes."""
+    result = {task: {backend: {} for backend in BACKENDS} for task in tasks}
+    for entry in entries:
+        match = re.fullmatch(r"([^:]+):(fpgs|mjwarp):([a-z_]+)=([0-9]+)", entry)
+        if match is None:
+            raise ValueError(f"Expected selected-task:backend:capacity=positive-integer: {entry!r}")
+        task, backend, name, value = match.groups()
+        if task not in result or name not in SOLVER_CAPACITIES[backend] | COLLISION_CAPACITIES:
+            raise ValueError(f"Unselected task or unsupported capacity owner: {entry!r}")
+        value = int(value)
+        if not 0 < value < 2**31 or name in result[task][backend]:
+            raise ValueError(f"Invalid or duplicate capacity: {entry!r}")
+        result[task][backend][name] = value
+    return result
+
+
 def clean_environment(overrides: dict[str, str], isaaclab: Path) -> dict[str, str]:
     """Discard inherited solver and project-selection flags before explicit setup."""
     removed = {
@@ -105,7 +128,7 @@ def clean_environment(overrides: dict[str, str], isaaclab: Path) -> dict[str, st
         "UV_ACTIVE",
         "UV_PYTHON",
         "VIRTUAL_ENV",
-    }
+    } | CHECKED_ENVIRONMENT
     env = {key: value for key, value in os.environ.items() if not key.startswith(FLAG_PREFIXES) and key not in removed}
     env.update(UV_PROJECT=str(isaaclab), UV_NO_SYNC="1", PYTHONDONTWRITEBYTECODE="1")
     env.update(overrides)
@@ -190,6 +213,64 @@ def source_guard(capture: ModuleType, roots: dict[str, Path], recorded: dict, fi
         raise RuntimeError("Benchmark driver/helper/harness changed during comparison")
 
 
+def check_overflow_result(run: dict, drivers: dict[str, str]) -> None:
+    """Bind the two successful sticky-flag checks to this capture and pinned wrapper."""
+    directory = Path(run["output_dir"])
+    path = directory / "capture_checks.json"
+    report = json.loads(path.read_text())
+    run["overflow_check"] = report
+    wrapper = Path(__file__).resolve().with_name("checked_capture.py")
+    if not isinstance(report, dict):
+        raise RuntimeError(f"Checked capture has an invalid report: {path}")
+    boundaries = report.get("boundaries")
+    if (
+        report.get("complete") is not True
+        or report.get("check_pass") is not True
+        or type(report.get("boundary_count")) is not int
+        or report["boundary_count"] != 2
+        or not isinstance(boundaries, list)
+        or len(boundaries) != 2
+        or any(
+            not isinstance(entry, dict)
+            or entry.get("check_pass") is not True
+            or type(entry.get("boundary")) is not int
+            or entry["boundary"] != index
+            or entry.get("physics") != run["backend"]
+            or not isinstance(entry.get("collision"), dict)
+            or entry["collision"].get("check_pass") is not True
+            or entry["collision"].get("status") not in ("checked", "not_applicable")
+            or (entry["collision"]["status"] == "not_applicable" and run["backend"] != "newton_mjwarp")
+            for index, entry in enumerate(boundaries)
+        )
+        or report.get("physics_work_modified") is not False
+        or report.get("checks_output") != str(path)
+        or report.get("capture_output") != str(directory / "capture.json")
+        or report.get("run_profiled_sha256") != run["environment"]["FPGS_BENCH_RUN_SHA256"]
+        or report.get("checked_capture_sha256") != drivers[str(wrapper)]
+    ):
+        raise RuntimeError(f"Checked capture did not pass both source-bound overflow checks: {path}")
+    requested = run.get("broad_phase_output_max")
+    if requested is not None:
+        capacity = report.get("collision_capacity", {})
+        pipelines = capacity.get("pipelines") if isinstance(capacity, dict) else None
+        if (
+            not isinstance(capacity, dict)
+            or capacity.get("requested") != requested
+            or not isinstance(pipelines, list)
+            or not pipelines
+            or any(
+                not isinstance(entry, dict)
+                or entry.get("construction_pass") is not True
+                or entry.get("broad_phase_mode") != "explicit"
+                or type(entry.get("full_input_pairs")) is not int
+                or entry["full_input_pairs"] < 0
+                or entry.get("effective") != min(requested, entry["full_input_pairs"])
+                for entry in pipelines
+            )
+        ):
+            raise RuntimeError(f"Checked capture did not apply the requested broad-phase capacity: {path}")
+
+
 def make_batch(
     capture: ModuleType,
     args: argparse.Namespace,
@@ -200,9 +281,12 @@ def make_batch(
     repeat: int,
     task: str,
     backend: str,
+    *,
+    drivers: dict[str, str] | None = None,
 ) -> list[dict]:
-    """Preserve the helper recipe and add FPGS-only flags without physics overrides."""
+    """Preserve task laws/budgets and apply only explicit calibrated storage overrides."""
     task_name, attributes, recipe_flags = recipe_map(capture)[task]
+    capacities = parse_capacities(args.capacity, args.task)[task][backend]
     batch = []
     for gpu in devices:
         directory = output / f"round_{repeat + 1:02d}_{task}_{backend}_gpu{gpu['index']}"
@@ -228,22 +312,46 @@ def make_batch(
             UV_NO_SYNC="1",
             PYTHONDONTWRITEBYTECODE="1",
         )
+        shell = capture.HARNESS / "nsys_run.sh"
+        if args.check_overflow:
+            if drivers is None:
+                raise ValueError("Checked capture requires parent-pinned helper hashes")
+            shell = Path(__file__).resolve().with_name("nsys_checked.sh")
+            env.update(
+                FPGS_BENCH_ISAACLAB=str(args.isaaclab),
+                FPGS_BENCH_NEWTON=str(roots[backend]),
+                FPGS_BENCH_RUN_SHA256=drivers[str(capture.HARNESS / "run_profiled.py")],
+            )
         command = [
             "bash",
-            str(capture.HARNESS / "nsys_run.sh"),
+            str(shell),
             "capture",
             BACKENDS[backend],
             task_name,
-            "--num-envs",
-            str(args.num_envs),
-            "--seed",
-            "0",
-            "--warmup-steps",
-            str(args.warmup_steps),
         ]
+        if "broad_phase_output_max" in capacities:
+            command.extend(["--broad-phase-output-max", str(capacities["broad_phase_output_max"])])
+        command.extend(
+            [
+                "--num-envs",
+                str(args.num_envs),
+                "--seed",
+                "0",
+                "--warmup-steps",
+                str(args.warmup_steps),
+            ]
+        )
         if backend == "fpgs":
             for attribute in attributes:
-                command.extend(["--solver-attr", attribute])
+                if attribute.partition("=")[0] not in capacities:
+                    command.extend(["--solver-attr", attribute])
+        for name, value in capacities.items():
+            if name == "broad_phase_output_max":
+                continue
+            if name in COLLISION_CAPACITIES:
+                command.extend(["--override", f"env.sim.physics.collision_cfg.{name}={value}"])
+            else:
+                command.extend(["--solver-attr", f"{name}={value}"])
         batch.append(
             {
                 "round": repeat + 1,
@@ -256,6 +364,11 @@ def make_batch(
                 "environment": env,
                 "output_dir": str(directory),
                 "driver_log": str(directory / "driver.log"),
+                **(
+                    {"broad_phase_output_max": capacities["broad_phase_output_max"]}
+                    if "broad_phase_output_max" in capacities
+                    else {}
+                ),
             }
         )
     return batch
@@ -363,7 +476,7 @@ def ratios(summaries: list[dict], tasks: list[str], gpus: list[int], repeats: in
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Accept benchmark sampling options, not solver or physics parameter tuning."""
+    """Accept sampling and calibrated capacity options, not physics/budget tuning."""
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("isaaclab", "fpgs", "mjwarp", "output-dir"):
         parser.add_argument(f"--{name}", required=True, type=Path)
@@ -375,6 +488,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Recipe name; repeat for multiple tasks.",
     )
     parser.add_argument("--fpgs-env", action="append", default=[], metavar="GPU:NAME=VALUE")
+    parser.add_argument(
+        "--capacity",
+        action="append",
+        default=[],
+        metavar="TASK:BACKEND:FIELD=VALUE",
+        help="Explicit calibrated buffer capacity for both GPUs; does not validate absence of overflow.",
+    )
+    parser.add_argument(
+        "--check-overflow",
+        action="store_true",
+        help="Reject FPGS sticky row/contact flags and every MJWarp warning/overflow bit at existing metadata boundaries.",
+    )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--num-envs", type=int, default=16384)
     parser.add_argument("--warmup-steps", type=int, default=200)
@@ -388,6 +513,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     for name in ("isaaclab", "fpgs", "mjwarp", "output_dir"):
         setattr(args, name, getattr(args, name).expanduser().resolve())
     args.task = list(dict.fromkeys(args.task))
+    capacities = parse_capacities(args.capacity, args.task)
+    if not args.check_overflow and any(
+        "broad_phase_output_max" in values for task in capacities.values() for values in task.values()
+    ):
+        parser.error("broad_phase_output_max requires --check-overflow; Lab configuration cannot accept this key")
     return args
 
 
@@ -415,6 +545,8 @@ def main(argv: list[str] | None = None) -> int:
         Path(capture.__file__).resolve(),
         *(capture.HARNESS / name for name in ("nsys_run.sh", "run_profiled.py", "analyze_nsys.py")),
     ]
+    if args.check_overflow:
+        files.extend(Path(__file__).resolve().with_name(name) for name in ("checked_capture.py", "nsys_checked.sh"))
     drivers = file_hashes(files)
     if drivers[str(Path(capture.__file__).resolve())] != capture._loaded_source_sha256:
         raise RuntimeError("Isaac Lab helper changed while loading")
@@ -465,6 +597,7 @@ def main(argv: list[str] | None = None) -> int:
                         repeat,
                         task,
                         backend,
+                        drivers=drivers,
                     )
                     manifest["runs"].extend(batch)
                     capture._write_json(output / "manifest.json", manifest)
@@ -474,6 +607,8 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     run_batch(batch, args.isaaclab)
                     for run in batch:
+                        if args.check_overflow:
+                            check_overflow_result(run, drivers)
                         run["result"] = capture._read_result(run)
                     source_guard(capture, guarded_roots, sources, drivers)
                     capture._write_json(output / "manifest.json", manifest)

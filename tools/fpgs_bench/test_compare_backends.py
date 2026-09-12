@@ -76,6 +76,7 @@ class TestArgumentsAndHelpers(unittest.TestCase):
             (3, 16384, 200, 40, 40),
         )
         self.assertFalse(hasattr(args, "solver_attr"))
+        self.assertFalse(args.check_overflow)
 
     def test_keyboard_recipe_defaults_and_copy_isolation(self):
         """Add the SO101 typing task without changing any Lab recipe or nested flag map."""
@@ -133,6 +134,37 @@ class TestArgumentsAndHelpers(unittest.TestCase):
             with self.subTest(entries=entries), self.assertRaises(ValueError):
                 driver.parse_flags(entries, [0, 1])
 
+    def test_scoped_capacity_overrides(self):
+        """Keep calibrated capacities task/backend-specific without changing budgets."""
+        result = driver.parse_capacities(
+            ["keyboard-so101:fpgs:dense_max_constraints=704", "keyboard-so101:mjwarp:nconmax=36"],
+            ["keyboard-so101", "ant"],
+        )
+        self.assertEqual(result["keyboard-so101"]["fpgs"], {"dense_max_constraints": 704})
+        self.assertEqual(result["keyboard-so101"]["mjwarp"], {"nconmax": 36})
+        self.assertEqual(result["ant"], {"fpgs": {}, "mjwarp": {}})
+
+    def test_capacity_overrides_reject_physics_and_ambiguity(self):
+        """Reject unselected tasks, wrong owners, duplicate values and physics tuning."""
+        for entries in (
+            ["other:fpgs:dense_max_constraints=704"],
+            ["ant:fpgs:njmax=512"],
+            ["ant:mjwarp:ls_iterations=50"],
+            ["ant:fpgs:pgs_iterations=1"],
+            ["ant:fpgs:rigid_contact_max=0"],
+            ["ant:fpgs:rigid_contact_max=1.5"],
+            ["ant:fpgs:rigid_contact_max=10", "ant:fpgs:rigid_contact_max=20"],
+        ):
+            with self.subTest(entries=entries), self.assertRaises(ValueError):
+                driver.parse_capacities(entries, ["ant"])
+
+    def test_broad_output_capacity_requires_checked_constructor_route(self):
+        """Reject the new key in legacy mode before it can reach Lab from_dict."""
+        extra = ["--capacity", "ant:fpgs:broad_phase_output_max=65536"]
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            driver.parse_args(self.argv + extra)
+        self.assertTrue(driver.parse_args(self.argv + extra + ["--check-overflow"]).check_overflow)
+
     def test_clean_inherited_flags_and_project_selection(self):
         """Prevent inherited solver flags or uv paths from leaking into either arm."""
         inherited = {
@@ -141,6 +173,9 @@ class TestArgumentsAndHelpers(unittest.TestCase):
             "NEWTON_OTHER": "1",
             "NEWTON_NARROW_PHASE_BAD": "1",
             "FPGS_PROBE_BAD": "1",
+            "FPGS_BENCH_ISAACLAB": "bad",
+            "FPGS_BENCH_NEWTON": "bad",
+            "FPGS_BENCH_RUN_SHA256": "bad",
             "PYTHONPATH": "bad",
             "UV_PROJECT": "bad",
             "UV_PROJECT_ENVIRONMENT": "bad",
@@ -460,6 +495,8 @@ class TestCompleteDriver(unittest.TestCase):
         self.source_drift = False
         self.result_error = None
         self.child_failure = False
+        self.omit_checks = False
+        self.invalid_checks = None
         self.devices = [{"index": gpu, "uuid": f"GPU-{gpu}", "name": f"mock GPU {gpu}"} for gpu in (0, 1)]
         self.capture = SimpleNamespace(
             __file__=str(self.harness / "compare_gpus.py"),
@@ -552,6 +589,47 @@ class TestCompleteDriver(unittest.TestCase):
         self.events.append(("start", pid))
         self.assertEqual(kwargs["cwd"], self.lab)
         self.assertTrue(kwargs["start_new_session"])
+        env = kwargs["env"]
+        if "FPGS_BENCH_RUN_SHA256" in env and not self.omit_checks:
+            directory = Path(env["OUT_DIR"])
+            check_path = directory / "capture_checks.json"
+            checks = {
+                "complete": True,
+                "check_pass": True,
+                "boundary_count": 2,
+                "boundaries": [
+                    {
+                        "boundary": index,
+                        "physics": command[3],
+                        "check_pass": True,
+                        "collision": {"check_pass": True, "status": "checked"},
+                    }
+                    for index in (0, 1)
+                ],
+                "checks_output": str(check_path),
+                "capture_output": str(directory / "capture.json"),
+                "physics_work_modified": False,
+                "run_profiled_sha256": env["FPGS_BENCH_RUN_SHA256"],
+                "checked_capture_sha256": driver.file_hashes([Path(driver.__file__).with_name("checked_capture.py")])[
+                    str(Path(driver.__file__).with_name("checked_capture.py"))
+                ],
+            }
+            if "--broad-phase-output-max" in command:
+                requested = int(command[command.index("--broad-phase-output-max") + 1])
+                checks["collision_capacity"] = {
+                    "requested": requested,
+                    "pipelines": [
+                        {
+                            "construction_pass": True,
+                            "broad_phase_mode": "explicit",
+                            "full_input_pairs": 100000,
+                            "effective": min(requested, 100000),
+                        }
+                    ],
+                }
+            if self.invalid_checks is not None:
+                self.invalid_checks(checks)
+            check_path.write_text(json.dumps(checks))
         return FakeProcess(pid, self.events, code=int(self.child_failure))
 
     def invoke(self, extra=()):
@@ -585,6 +663,123 @@ class TestCompleteDriver(unittest.TestCase):
             contextlib.redirect_stdout(io.StringIO()),
         ):
             return driver.main(self.argv + list(extra))
+
+    def test_capacity_commands_are_scoped_and_recorded(self):
+        """Forward identical calibrated sizes to both GPUs without cross-backend leakage."""
+        entries = [
+            "anymald:fpgs:mf_max_constraints=96",
+            "anymald:fpgs:rigid_contact_max=32768",
+            "anymald:mjwarp:njmax=128",
+        ]
+        options = ["--repeats", "1"]
+        for entry in entries:
+            options.extend(["--capacity", entry])
+        self.assertEqual(self.invoke(options), 0)
+        manifest = json.loads((self.output / "manifest.json").read_text())
+        self.assertEqual(manifest["settings"]["capacity"], entries)
+        self.assertEqual(len(self.calls), 4)
+        for run in manifest["runs"]:
+            command = run["command"]
+            if run["newton"] == "fpgs":
+                self.assertIn("mf_max_constraints=96", command)
+                self.assertIn("env.sim.physics.collision_cfg.rigid_contact_max=32768", command)
+                self.assertNotIn("njmax=128", command)
+                self.assertIn("mf_gs_parallel_rows=48", command)
+            else:
+                self.assertIn("njmax=128", command)
+                self.assertNotIn("mf_max_constraints=96", command)
+                self.assertNotIn("env.sim.physics.collision_cfg.rigid_contact_max=32768", command)
+
+    def test_checked_mode_routes_both_backends_and_pins_every_helper(self):
+        """Gate checked results and forward explicit checkout/source pins without recipe changes."""
+        self.assertEqual(
+            self.invoke(
+                [
+                    "--repeats",
+                    "1",
+                    "--check-overflow",
+                    "--capacity",
+                    "anymald:fpgs:broad_phase_output_max=65536",
+                ]
+            ),
+            0,
+        )
+        manifest = json.loads((self.output / "manifest.json").read_text())
+        self.assertTrue(manifest["settings"]["check_overflow"])
+        self.assertEqual(len(manifest["drivers"]), 7)
+        for run in manifest["runs"]:
+            self.assertEqual(run["command"][1], str(Path(driver.__file__).with_name("nsys_checked.sh")))
+            self.assertEqual(run["environment"]["FPGS_BENCH_ISAACLAB"], str(self.lab))
+            self.assertEqual(
+                run["environment"]["FPGS_BENCH_NEWTON"], str(self.fpgs if run["newton"] == "fpgs" else self.mj)
+            )
+            self.assertEqual(
+                run["environment"]["FPGS_BENCH_RUN_SHA256"],
+                manifest["drivers"][str(self.harness / "run_profiled.py")],
+            )
+            self.assertTrue(run["overflow_check"]["check_pass"])
+            self.assertEqual(run["overflow_check"]["boundary_count"], 2)
+            self.assertFalse(any("collision_cfg.broad_phase_output_max" in arg for arg in run["command"]))
+            if run["newton"] == "fpgs":
+                self.assertEqual(run["command"][5:7], ["--broad-phase-output-max", "65536"])
+                self.assertEqual(run["overflow_check"]["collision_capacity"]["pipelines"][0]["effective"], 65536)
+            else:
+                self.assertNotIn("--broad-phase-output-max", run["command"])
+        self.assertEqual(self.capture._read_result.call_count, 4)
+        self.assertTrue((self.output / "ratios.json").exists())
+
+    def test_missing_checked_result_prevents_timing_acceptance(self):
+        """Reject a successful child that never supplied its required checked report."""
+        self.omit_checks = True
+        with self.assertRaises(FileNotFoundError):
+            self.invoke(["--repeats", "1", "--check-overflow"])
+        self.capture._read_result.assert_not_called()
+        self.assertEqual(json.loads((self.output / "manifest.json").read_text())["status"], "failed")
+        self.assertFalse((self.output / "ratios.json").exists())
+
+    def test_unapplied_broad_output_capacity_prevents_ratios(self):
+        """Reject a clean overflow report that did not apply its requested constructor size."""
+        self.invalid_checks = lambda report: report["collision_capacity"].update(pipelines=[])
+        with self.assertRaisesRegex(RuntimeError, "requested broad-phase capacity"):
+            self.invoke(
+                [
+                    "--repeats",
+                    "1",
+                    "--check-overflow",
+                    "--capacity",
+                    "anymald:fpgs:broad_phase_output_max=65536",
+                ]
+            )
+        self.capture._read_result.assert_not_called()
+        self.assertFalse((self.output / "ratios.json").exists())
+
+    def test_malformed_failed_or_unbound_checks_prevent_ratios(self):
+        """Reject failed flags, partial boundaries and another capture/source's clean report."""
+        cases = [
+            lambda report: report.update(complete=False),
+            lambda report: report.update(check_pass=1),
+            lambda report: report.update(boundary_count=1),
+            lambda report: report["boundaries"].pop(),
+            lambda report: report["boundaries"][1].update(check_pass=False),
+            lambda report: report["boundaries"][0].update(physics="different-backend"),
+            lambda report: report["boundaries"][0].pop("collision"),
+            lambda report: report["boundaries"][0]["collision"].update(check_pass=False),
+            lambda report: report["boundaries"][0]["collision"].update(status="failed"),
+            lambda report: report["boundaries"][0]["collision"].update(status="not_applicable"),
+            lambda report: report.update(run_profiled_sha256="wrong-source"),
+            lambda report: report.update(checked_capture_sha256="wrong-wrapper"),
+            lambda report: report.update(capture_output="/another/capture.json"),
+            lambda report: report.update(physics_work_modified=True),
+        ]
+        for index, mutate in enumerate(cases):
+            with self.subTest(case=index):
+                self.invalid_checks = mutate
+                destination = self.root / f"invalid-checks-{index}"
+                with self.assertRaisesRegex(RuntimeError, "Checked capture"):
+                    self.invoke(["--repeats", "1", "--check-overflow", "--output-dir", str(destination)])
+                self.assertFalse((destination / "ratios.json").exists())
+                self.assertEqual(json.loads((destination / "manifest.json").read_text())["status"], "failed")
+        self.capture._read_result.assert_not_called()
 
     def test_paired_abba_recipes_manifests_and_ratios(self):
         """Preserve per-backend recipes, alternating order, source guards, and median ratios."""
@@ -623,6 +818,8 @@ class TestCompleteDriver(unittest.TestCase):
             self.assertEqual(env["FPGS_NSYS_TRACE_MODE"], "graph")
             self.assertEqual(env["PYTHONDONTWRITEBYTECODE"], "1")
             self.assertEqual(command[command.index("--seed") + 1], "0")
+            self.assertEqual(command[1], str(self.harness / "nsys_run.sh"))
+            self.assertNotIn("FPGS_BENCH_RUN_SHA256", env)
             self.assertNotIn("--physics-attr", command)
             if not fpgs:
                 self.assertFalse(any(key.startswith(driver.FLAG_PREFIXES) for key in env))

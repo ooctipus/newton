@@ -116,6 +116,7 @@ def _launch_contact_allocator(
             counters["dense_dropped"],
             counters["mf_dropped"],
             counters["propagation_dropped"],
+            wp.zeros(4, dtype=wp.int32, device=device),
         ],
         device=device,
     )
@@ -198,6 +199,7 @@ def _launch_articulation_pair_contact_allocator(
             dense_dropped,
             mf_dropped,
             propagation_dropped,
+            wp.zeros(4, dtype=wp.int32, device=device),
         ],
         device=device,
     )
@@ -224,6 +226,8 @@ def _dense_speculative_rhs(scale: float) -> float:
             scale,
             1.0,
             1.0,
+            wp.zeros(1, dtype=wp.int32, device="cpu"),
+            0,
         ],
         outputs=[rhs, wp.zeros((1, 1), dtype=wp.float32, device="cpu")],
         device="cpu",

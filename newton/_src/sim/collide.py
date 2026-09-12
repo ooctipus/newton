@@ -1541,6 +1541,7 @@ class CollisionPipeline:
         narrow_phase: NarrowPhase | None = None,
         sdf_hydroelastic_config: HydroelasticSDF.Config | None = None,
         shape_pairs_max: int | None = None,
+        broad_phase_output_max: int | None = None,
         deterministic: bool = False,
         box_box_sat: bool = False,
         contact_matching: Literal["disabled", "latest", "sticky"] = "disabled",
@@ -1664,9 +1665,21 @@ class CollisionPipeline:
                 (e.g. measured peak with ~25% headroom) to avoid multi-GB
                 allocations on large scenes; a too-small value triggers
                 a buffer overflow warning at runtime. Ignored for the
-                ``"explicit"`` mode (which uses the filtered pair list
-                length directly) and for expert paths that pass a
+                ``"explicit"`` mode and for expert paths that pass a
                 pre-built ``narrow_phase``.
+            broad_phase_output_max: Optional positive integer limiting materialized
+                broad-phase output pairs and dependent narrow-phase candidate
+                buffers for internally constructed ``"explicit"`` pipelines.
+                The entire ``shape_pairs_filtered`` input is still traversed.
+                ``None`` retains the full input-list capacity; larger requests
+                are capped to that list's length. Unsupported for ``"nxn"``,
+                ``"sap"``, or prebuilt broad/narrow phases. This is a capacity
+                bound, not a collision filter: undersizing loses pairs and
+                ``verify_buffers=True`` reports the unclamped current-frame
+                demand. Counters reset each collision call, so sample or record
+                every call when calibrating captured runs. Rebuild the pipeline
+                and recapture graphs to change this bound; an overflow invalidates
+                the affected collision results.
             deterministic: Sort contacts after the narrow phase so that results
                 are independent of GPU thread scheduling. This also enables
                 deterministic hydroelastic accumulation and contact allocation.
@@ -1759,6 +1772,18 @@ class CollisionPipeline:
         shape_count = model.shape_count
         device = model.device
         using_expert_components = broad_phase_instance is not None or narrow_phase is not None
+        if broad_phase_output_max is not None:
+            if (
+                isinstance(broad_phase_output_max, (bool, np.bool_))
+                or not isinstance(broad_phase_output_max, (int, np.integer))
+                or broad_phase_output_max <= 0
+            ):
+                raise ValueError(
+                    f"broad_phase_output_max must be a positive integer or None, got {broad_phase_output_max!r}"
+                )
+            if using_expert_components or mode_from_broad_phase not in (None, "explicit"):
+                raise ValueError("broad_phase_output_max requires internal explicit broad/narrow phases")
+        self.broad_phase_output_max = None if broad_phase_output_max is None else int(broad_phase_output_max)
         pair_shape_prep = os.environ.get("NEWTON_NARROW_PHASE_PAIR_SHAPE_PREP", "0")
         if pair_shape_prep not in ("0", "1"):
             raise ValueError("NEWTON_NARROW_PHASE_PAIR_SHAPE_PREP must be 0 or 1")
@@ -1872,6 +1897,8 @@ class CollisionPipeline:
                 self.broad_phase = BroadPhaseExplicit()
                 self.shape_pairs_filtered = shape_pairs_filtered
                 self.shape_pairs_max = len(shape_pairs_filtered)
+                if self.broad_phase_output_max is not None:
+                    self.shape_pairs_max = min(self.shape_pairs_max, self.broad_phase_output_max)
                 self.shape_pairs_excluded = None
                 self.shape_pairs_excluded_count = 0
             elif self.broad_phase_mode == "nxn":

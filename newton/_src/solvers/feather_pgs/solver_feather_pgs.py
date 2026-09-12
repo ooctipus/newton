@@ -137,8 +137,7 @@ from .kernels import (
     factor_diagonal_mass,
     factor_propagation_tree_for_size,
     finalize_body_dynamics,
-    finalize_mf_constraint_counts,
-    finalize_world_constraint_counts,
+    finalize_constraint_counts_with_status,
     finalize_world_diag_cfm,
     flatten_propagation_joint_S,
     flush_propagation_free_body_qd_to_vout,
@@ -2305,6 +2304,10 @@ class SolverFeatherPGS(SolverBase):
         # preserve the raw allocator demand before finalization clamps it to the
         # configured capacity. This is the only reliable way to distinguish a
         # full buffer from an actual overflow after a long captured rollout.
+        # Always retain overflow, including rolled-back contact reservations.
+        # Only failed allocations write these flags; successful steps need no
+        # extra launch or reset. Read explicitly outside capture via the public API.
+        self._constraint_capacity_status = wp.zeros(4, dtype=wp.int32, device=model.device)
         self._row_watermark = bool(row_watermark)
         if self._row_watermark:
             wm_device = self.constraint_count.device
@@ -9083,6 +9086,61 @@ class SolverFeatherPGS(SolverBase):
         self._step += 1
         return state_out
 
+    def constraint_capacity_status(self, *, clear: bool = False) -> dict[str, bool]:
+        """Return sticky capacity-overflow flags without enabling row telemetry.
+
+        The keys ``dense``, ``matrix_free``, and ``propagation`` identify row
+        buffers whose capacity omitted constraints. ``contacts`` identifies an
+        incoming contact count exceeding its materialized storage. Flags remain
+        set across later successful steps and :meth:`reset` calls.
+
+        Call outside CUDA graph capture, on the solver's execution stream or
+        after explicitly joining that stream. This copies four integers to the
+        host. Graph replays update the same device flags without host reads.
+
+        Args:
+            clear: Clear the flags after reading, returning their previous
+                values. Clearing acknowledges past loss; it does not repair
+                affected states or resize storage. Reconstruct the solver and
+                recapture graphs to change capacities safely.
+
+        Raises:
+            RuntimeError: If called during CUDA graph capture.
+        """
+        if wp.get_device(self.model.device).is_capturing:
+            raise RuntimeError("Constraint capacity status must be read outside CUDA graph capture")
+        values = self._constraint_capacity_status.numpy()
+        result = dict(zip(("dense", "matrix_free", "propagation", "contacts"), map(bool, values), strict=True))
+        if clear:
+            self._constraint_capacity_status.zero_()
+        return result
+
+    def check_constraint_capacity(self) -> None:
+        """Raise outside capture if any constraint/contact capacity overflowed.
+
+        Call this at a safe host observation boundary after the solver's work.
+        It requires neither ``row_watermark=True`` nor per-step synchronization.
+        Overflow does not automatically abort a device graph or repair states;
+        callers must discard affected results and correct capacity before retrying.
+        Use :meth:`constraint_row_watermarks` with telemetry enabled to measure
+        demand for calibration, not this boolean status as a size estimate.
+        """
+        status = self.constraint_capacity_status()
+        settings = {
+            "dense": f"dense_max_constraints={self.dense_max_constraints}",
+            "matrix_free": f"mf_max_constraints={self.mf_max_constraints}",
+            "propagation": f"propagation_max_constraints={self.propagation_max_constraints}",
+            "contacts": "rigid_contact_max (incoming contact storage)",
+        }
+        failed = [settings[name] for name, overflow in status.items() if overflow]
+        if failed:
+            raise RuntimeError(
+                "FeatherPGS capacity overflow omitted constraints/contacts: "
+                + ", ".join(failed)
+                + ". Reconstruct capacity-dependent buffers and recapture graphs before retrying; "
+                "do not change capacity attributes on a live solver."
+            )
+
     def constraint_row_watermarks(self) -> dict:
         """Return the opt-in constraint/contact row high-water marks.
 
@@ -9095,8 +9153,9 @@ class SolverFeatherPGS(SolverBase):
         buffers and so must be called OUTSIDE any captured/timed region (it
         forces a device sync).
 
-        Returns ``0`` for every field when the telemetry was not enabled, so the
-        caller never has to special-case the off path.
+        Returns ``0`` for every field when the telemetry was not enabled; these
+        zeros do not establish absence of overflow. Use
+        :meth:`check_constraint_capacity` for always-available overflow visibility.
         """
         if not self._row_watermark:
             return {
@@ -11160,6 +11219,7 @@ class SolverFeatherPGS(SolverBase):
                     dense_dropped_rows,
                     mf_dropped_rows,
                     propagation_dropped_rows,
+                    self._constraint_capacity_status,
                 ],
                 device=model.device,
             )
@@ -11922,12 +11982,11 @@ class SolverFeatherPGS(SolverBase):
                 )
 
             if propagation_active:
-                slots_per_contact = 3 if self.enable_contact_friction else 1
                 wp.launch(
-                    finalize_mf_constraint_counts,
+                    finalize_constraint_counts_with_status,
                     dim=self.world_count,
-                    inputs=[self.propagation_slot_counter, self.propagation_max_constraints, slots_per_contact],
-                    outputs=[self.propagation_constraint_count],
+                    inputs=[self.propagation_slot_counter, self.propagation_max_constraints, 2],
+                    outputs=[self.propagation_constraint_count, self._constraint_capacity_status],
                     device=model.device,
                 )
                 if self.pgs_warmstart and self._ws_prev_propagation_impulses is not None:
@@ -12029,12 +12088,11 @@ class SolverFeatherPGS(SolverBase):
                     )
 
             if mf_active:
-                slots_per_contact = 3 if self.enable_contact_friction else 1
                 wp.launch(
-                    finalize_mf_constraint_counts,
+                    finalize_constraint_counts_with_status,
                     dim=self.world_count,
-                    inputs=[self.mf_slot_counter, self.mf_max_constraints, slots_per_contact],
-                    outputs=[self.mf_constraint_count],
+                    inputs=[self.mf_slot_counter, self.mf_max_constraints, 1],
+                    outputs=[self.mf_constraint_count, self._constraint_capacity_status],
                     device=model.device,
                 )
 
@@ -12150,19 +12208,18 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
             wp.launch(
-                finalize_mf_constraint_counts,
+                finalize_constraint_counts_with_status,
                 dim=self.world_count,
                 inputs=[self.mf_slot_counter, self.mf_max_constraints, 1],
-                outputs=[self.mf_constraint_count],
+                outputs=[self.mf_constraint_count, self._constraint_capacity_status],
                 device=model.device,
             )
 
-        slots_per_contact_dense = 3 if self.enable_contact_friction else 1
         wp.launch(
-            finalize_world_constraint_counts,
+            finalize_constraint_counts_with_status,
             dim=self.world_count,
-            inputs=[self.slot_counter, max_constraints, slots_per_contact_dense],
-            outputs=[self.constraint_count],
+            inputs=[self.slot_counter, max_constraints, 0],
+            outputs=[self.constraint_count, self._constraint_capacity_status],
             device=model.device,
         )
         if getattr(self, "_wr_world_contacts", None) is not None:

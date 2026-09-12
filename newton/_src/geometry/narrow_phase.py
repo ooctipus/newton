@@ -2155,33 +2155,40 @@ def verify_narrow_phase_buffers(
     reduction_ht_capacity: int,
     reduction_ht_insert_failures: wp.array[int],
     reduction_ht_warn_load_percent: int,
+    capacity_status: wp.array[int],
 ):
-    """Check for buffer overflows in the collision pipeline."""
+    """Check buffers and retain warning history across subsequent collision calls."""
+    flags = capacity_status[0]
     if broad_phase_count[0] > max_broad_phase:
+        flags = flags | 1
         wp.printf(
             "Warning: Broad phase pair buffer overflowed %d > %d.\n",
             broad_phase_count[0],
             max_broad_phase,
         )
     if max_split_query >= 0 and split_query_count[0] > max_split_query:
+        flags = flags | 2
         wp.printf(
             "Warning: Split query-result buffer overflowed %d > %d.\n",
             split_query_count[0],
             max_split_query,
         )
     if gjk_count[0] > max_gjk:
+        flags = flags | 4
         wp.printf(
             "Warning: GJK candidate pair buffer overflowed %d > %d.\n",
             gjk_count[0],
             max_gjk,
         )
     if max_split_gjk >= 0 and split_gjk_count[0] > max_split_gjk:
+        flags = flags | 8
         wp.printf(
             "Warning: Split GJK work-item buffer overflowed %d > %d.\n",
             split_gjk_count[0],
             max_split_gjk,
         )
     if max_split_manifold >= 0 and split_manifold_count[0] > max_split_manifold:
+        flags = flags | 16
         wp.printf(
             "Warning: Split manifold work-item buffer overflowed %d > %d.\n",
             split_manifold_count[0],
@@ -2189,6 +2196,7 @@ def verify_narrow_phase_buffers(
         )
     if mesh_count:
         if mesh_count[0] > max_mesh:
+            flags = flags | 32
             wp.printf(
                 "Warning: Mesh-convex shape pair buffer overflowed %d > %d.\n",
                 mesh_count[0],
@@ -2196,6 +2204,7 @@ def verify_narrow_phase_buffers(
             )
     if triangle_count:
         if triangle_count[0] > max_triangle:
+            flags = flags | 64
             wp.printf(
                 "Warning: Triangle pair buffer overflowed %d > %d.\n",
                 triangle_count[0],
@@ -2203,6 +2212,7 @@ def verify_narrow_phase_buffers(
             )
     if mesh_plane_count:
         if mesh_plane_count[0] > max_mesh_plane:
+            flags = flags | 128
             wp.printf(
                 "Warning: Mesh-plane shape pair buffer overflowed %d > %d.\n",
                 mesh_plane_count[0],
@@ -2210,6 +2220,7 @@ def verify_narrow_phase_buffers(
             )
     if mesh_mesh_count:
         if mesh_mesh_count[0] > max_mesh_mesh:
+            flags = flags | 256
             wp.printf(
                 "Warning: Mesh-mesh shape pair buffer overflowed %d > %d.\n",
                 mesh_mesh_count[0],
@@ -2217,12 +2228,14 @@ def verify_narrow_phase_buffers(
             )
     if sdf_sdf_count:
         if sdf_sdf_count[0] > max_sdf_sdf:
+            flags = flags | 512
             wp.printf(
                 "Warning: SDF-SDF shape pair buffer overflowed %d > %d.\n",
                 sdf_sdf_count[0],
                 max_sdf_sdf,
             )
     if contact_count[0] > max_contacts:
+        flags = flags | 1024
         wp.printf(
             "Warning: Contact buffer overflowed %d > %d.\n",
             contact_count[0],
@@ -2231,6 +2244,7 @@ def verify_narrow_phase_buffers(
     if reduction_ht_capacity > 0:
         reduction_ht_active_count = reduction_ht_active_slots[reduction_ht_capacity]
         if reduction_ht_active_count * 100 >= reduction_ht_capacity * reduction_ht_warn_load_percent:
+            flags = flags | 2048
             wp.printf(
                 "Warning: Contact reduction hashtable fill ratio exceeded %d%% (%d / %d). "
                 "Increase contact_reduction_hashtable_size_factor or max_triangle_pairs.\n",
@@ -2239,11 +2253,13 @@ def verify_narrow_phase_buffers(
                 reduction_ht_capacity,
             )
         if reduction_ht_insert_failures[0] > 0:
+            flags = flags | 4096
             wp.printf(
                 "Warning: Contact reduction hashtable insert failures %d. "
                 "Increase contact_reduction_hashtable_size_factor or max_triangle_pairs.\n",
                 reduction_ht_insert_failures[0],
             )
+    capacity_status[0] = flags
 
 
 class NarrowPhase:
@@ -2350,8 +2366,10 @@ class NarrowPhase:
                 backing array, and checks the global contact reducer hashtable
                 fill/failure counters when reduction is enabled, printing
                 ``wp.printf`` warnings on overflow or critical hashtable load.
-                Users who want a programmatic overflow hook can disable this and
-                read those counters themselves.  Overhead is one extra kernel
+                These warnings are also latched for :meth:`buffer_capacity_status`
+                and :meth:`check_buffer_capacity`, including during graph replay.
+                The hash-load warning does not necessarily indicate lost work.
+                Overhead is one extra kernel
                 launch per collision pass (roughly a few µs of launch latency on
                 CUDA; the kernel body is a handful of scalar comparisons on one
                 thread).  Disable in hot loops or CUDA graph capture once buffer
@@ -2600,6 +2618,8 @@ class NarrowPhase:
             n += 2 if mesh_weight_idx is not None else 0  # mesh-plane vertices, mesh-mesh edges
             c = wp.zeros(n, dtype=wp.int32, device=device)
             self._counter_array = c
+            # Separate storage: per-frame counter resets must not erase history.
+            self._buffer_capacity_status = wp.zeros(1, dtype=wp.int32, device=device)
 
             self.gjk_candidate_pairs_count = c[gjk_idx : gjk_idx + 1]
             self.split_gjk_work_count = c[split_gjk_idx : split_gjk_idx + 1] if self.split_gjk_mpr else None
@@ -3365,10 +3385,62 @@ class NarrowPhase:
                     reduction_ht_capacity,
                     reduction_ht_insert_failures,
                     HASHTABLE_WARN_LOAD_PERCENT,
+                    self._buffer_capacity_status,
                 ],
                 device=device,
                 record_tape=False,
             )
+
+    def buffer_capacity_status(self, *, clear: bool = False) -> dict[str, bool]:
+        """Read sticky flags from the existing narrow-phase buffer verifier.
+
+        Keep ``verify_buffers=True`` for the entire observed run. Call outside
+        graph capture on the execution stream or after joining it. Flags survive
+        later clean calls and graph replays. Clearing acknowledges prior warnings;
+        it does not repair results, resize buffers, or recapture graphs.
+
+        This covers only :func:`verify_narrow_phase_buffers`: not soft contacts,
+        hydroelastic internal storage, or post-narrow-phase owners such as body
+        pair reduction/contact matching. ``reduction_hash_load`` is a load warning,
+        not proof that contacts were lost. Other flags identify exceeded buffers
+        or failed reducer insertions. No flag is an estimate of required capacity.
+        """
+        if not self.verify_buffers:
+            raise RuntimeError("Narrow-phase capacity status requires verify_buffers=True throughout the run")
+        if self._buffer_capacity_status.device.is_capturing:
+            raise RuntimeError("Narrow-phase capacity status must be read outside CUDA graph capture")
+        mask = int(self._buffer_capacity_status.numpy()[0])
+        names = (
+            "broad_phase",
+            "split_query",
+            "gjk",
+            "split_gjk",
+            "split_manifold",
+            "mesh",
+            "triangle",
+            "mesh_plane",
+            "mesh_mesh",
+            "sdf_sdf",
+            "contacts",
+            "reduction_hash_load",
+            "reduction_hash_insert",
+        )
+        result = {name: bool(mask & (1 << bit)) for bit, name in enumerate(names)}
+        if clear:
+            self._buffer_capacity_status.zero_()
+        return result
+
+    def check_buffer_capacity(self) -> None:
+        """Raise at a safe host boundary if any narrow-phase verification flag is set.
+
+        This adds no device work beyond the enabled verifier. An error does not
+        automatically abort a captured graph; discard affected results and correct
+        the allocation before rebuilding and recapturing. Hash-load warnings may
+        precede actual loss, so inspect the named condition before sizing storage.
+        """
+        failed = [name for name, flagged in self.buffer_capacity_status().items() if flagged]
+        if failed:
+            raise RuntimeError("Narrow-phase buffer verification failed: " + ", ".join(failed))
 
     def launch(
         self,

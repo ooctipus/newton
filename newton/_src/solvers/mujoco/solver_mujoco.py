@@ -7140,7 +7140,19 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         # just setting qpos0 to d.qpos leads to weird behavior here, needs
         # to be investigated.
 
-        mujoco.mj_forward(self.mj_model, self.mj_data)
+        # External contacts replace the CPU contact set before every Warp step.
+        # Initialize all non-contact state without making that unused set a
+        # lower bound on the requested contact/constraint allocation.
+        seed_disableflags = self.mj_model.opt.disableflags
+        external_seed = not self.use_mujoco_cpu and not self._use_mujoco_contacts
+        try:
+            if external_seed:
+                self.mj_model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
+            mujoco.mj_forward(self.mj_model, self.mj_data)
+        finally:
+            # Keep contact constraints enabled for the externally supplied data.
+            if external_seed:
+                self.mj_model.opt.disableflags = seed_disableflags
 
         # now that the model is compiled, get the actual geom indices and compute
         # shape transform corrections

@@ -111,6 +111,7 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
                 wp.zeros((1,), dtype=wp.int32, device=device),
                 wp.zeros((1,), dtype=wp.int32, device=device),
                 wp.zeros((1,), dtype=wp.int32, device=device),
+                wp.zeros(4, dtype=wp.int32, device=device),
             ],
             device=device,
         )
@@ -250,6 +251,7 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
                 wp.zeros((1,), dtype=wp.int32, device=device),
                 wp.zeros((1,), dtype=wp.int32, device=device),
                 wp.zeros((1,), dtype=wp.int32, device=device),
+                wp.zeros(4, dtype=wp.int32, device=device),
             ],
             device=device,
         )

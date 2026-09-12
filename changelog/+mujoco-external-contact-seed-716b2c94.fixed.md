@@ -1,0 +1,1 @@
+Avoid inflating requested MuJoCo Warp contact and constraint buffers from unused native CPU seed contacts when Newton supplies collision contacts, while preserving non-contact initialization and native-contact backend behavior.
