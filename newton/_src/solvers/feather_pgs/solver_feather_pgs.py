@@ -2437,7 +2437,7 @@ class SolverFeatherPGS(SolverBase):
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         """Refresh cached solver data after supported model changes."""
         if self._row_packets is not None:
-            self._row_packets.validate_notification()
+            self._row_packets.validate_notification(flags)
         if self._fk_id_cache_enabled and flags & (
             ModelFlags.JOINT_PROPERTIES
             | ModelFlags.JOINT_DOF_PROPERTIES
