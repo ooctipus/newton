@@ -100,8 +100,11 @@ must not be added to graph durations. The separate 40-step traces contain
 graph/eager ownership and original per-world reset causes. Total world resets
 are similar, but FPGS has 4,269/4,267 RTX/GB contact-threshold events versus one
 for MJ on each device, spreading resets over 980/976 steps versus 24. This
-behavioral difference needs investigation before claiming contact parity; a
-fixed-root reset-pose propagation discrepancy in MJWarp is being checked.
+behavioral difference needs investigation before claiming contact parity. A
+fixed-root reset-pose propagation discrepancy is now confirmed in actual MJWarp
+Keyboard readback (sixteen sampled roots per card in a 512-world run), despite
+correct public Newton FK. The linked report separates this confirmed internal
+pose mismatch from its still-unmeasured contribution to the 4K reset disparity.
 
 Ten times the measured RTX MJWarp physics would require approximately 2.776 ms,
 versus the current 7.820 ms: about 5.044 ms / 64.5% further removal. The current
@@ -205,10 +208,33 @@ Individual losses remain: 90 of 2,048 natural-residual cases worsen, and one
 contact's frozen-geometry next-gap prediction worsens to about -80 micrometres.
 All reference solves converge offline, but those additional reference iterations
 are not a production allowance. These are numerical/logical-work results, not
-GPU timing or general trajectory acceptance. One native full-owner experiment
-is now being implemented; parked-warp, preparation, insertion and fallback costs
-remain charged. Its append-only panel changes FP32 reduction order relative to
-the CPU reference and must be evaluated on actual outputs.
+GPU timing or general trajectory acceptance.
+
+The native complete-owner experiment has now run at 512 and 16K worlds on both
+devices. At 16K, the arithmetic sum of the two tier medians, averaged across
+refresh/reuse calls, is 481.008 to 778.096 microseconds on RTX and 515.712 to
+907.840 on GB: **1.618x / 1.760x slower**. These are selected-owner costs, not
+whole-physics timings. No fallback occurs in the 65,536 real world/call cases;
+actual delayed-insertion/fallback controls preserve the maximum 24 updates.
+Natural-residual p99 improves from 0.022292 to 0.002595, but the largest published
+normal-velocity deficit worsens from 0.078161 to 0.136166 m/s. The latter is a
+genuine numerical tail, not publication roundoff or a measured penetration.
+No trajectory-quality acceptance or general improvement is claimed.
+
+The diagnosed cost-model error is structural: original row geometry is already
+lane-parallel, whereas candidate normal and tangent construction execute in
+serial phases. Removing logical rows does not remove the corresponding fraction
+of warp instructions; the Gram row index was already parallel too, invalidating
+the assumed quadratic elapsed-time saving. Registers increase, but local memory
+is zero; there is no evidence for a spill claim or occupancy as the sole cause.
+A single source-isolated phase diagnostic is being prepared to distinguish
+geometry/extension costs from recurrence and control costs. A retry must have
+measured headroom to remove roughly 53% / 57% of candidate owner time to reach
+the original 10% whole-time milestone. Merely recovering the baseline is not a
+gain, and no block-size/register-cap sweep is authorized by this result.
+Evidence: `/tmp/fpgs-anymal-lazy-native-paired16k-20260912-01`, manifest
+`dd7adcebe1e9f34e5c84acd5ebda45a067f9d9f2473bfee1f3b97c381533c6f0`;
+independent audit `/tmp/fpgs-anymal-lazy-native-audit-SilTZE/RESULT16K.md`.
 
 Allegro's rejection-only temporal support-axis carry-forward now has repeated
 timing evidence, described below. It is an old algorithm carried onto the
