@@ -149,3 +149,100 @@ and `FEATHER_PGS_COMPACT_CONTACT_BOUNDARY=1`; only the candidate enables
 Keep capacities 704 rows, 147456 contacts and 57344 broad outputs. Run 512 then
 4096 environments; repeat balanced 4K timing and full loaded quality only if
 the early complete result qualifies. Manifests retain full runnable commands.
+
+## Integrated screen and diagnosed loss, 10:14 UTC
+
+Runtime `8e170074` passes the early capacity/source controls but **does not
+meet the performance gate and is not promoted**. Both paired parents are
+reaped. These are one-round discovery measurements, not repeated gains:
+
+| Environments | RTX E2 / candidate physics ms | RTX ratio | GB E2 / candidate physics ms | GB ratio |
+| --- | ---: | ---: | ---: | ---: |
+| 512 | 3.426289 / 3.279365 | 1.04480x | 3.628322 / 3.506766 | 1.03466x |
+| 4096 | 7.510662 / 7.157157 | 1.04939x | 6.181975 / 6.501475 | 0.95086x |
+
+The 4K result saves only 0.353505 ms on RTX, below the 0.7-ms milestone, and
+regresses by 0.319500 ms on GB. Whole-environment wall ratios are 1.00914x /
+1.00547x; these are not training measurements. The 512 discovery deliberately
+retains the same 4K capacities, not a proposed production capacity recipe.
+All checked capacity flags are zero and all 4096 candidate worlds are admitted
+at both existing metadata boundaries on each card. Boundary snapshots do not
+establish full-window admission or numerical/physical acceptance.
+
+A fresh three-step node capture charges all fifteen candidate owners and the
+ten E2 owners, with 24 calls per label/card/arm. Process-correlated interval
+unions, not overlapping kernel sums, give this complete contact boundary:
+
+| Current node window, ms/environment step | RTX E2 | RTX candidate | GB E2 | GB candidate |
+| --- | ---: | ---: | ---: | ---: |
+| Complete contact interval union | 2.764919 | 2.817154 | 2.707618 | 2.882872 |
+| Full physics graph span | 7.225392 | 7.331144 | 6.445044 | 6.563712 |
+
+The node window is a different sample and instrumentation regime from the
+whole-graph screen above. Its RTX loss must not replace that screen's small
+gain, and the small screen gain must not be called a repeated win.
+
+Candidate disjoint kernel sums, in RTX / GB milliseconds:
+
+- Retained limit prefix: 0.071104 / 0.083467.
+- Retained post-passes: 0.177195 / 0.214971.
+- Routing and partition: 0.350421 / 0.321684.
+- Masked preparation and schedule: 0.108533 / 0.124691.
+- Packed geometry and four contact-local products: 0.466155 / 0.433227.
+- Scalar private owner: 0.786017 / 0.821781.
+- Contact-local residual: 0.827798 / 0.858507.
+- Original fallback solve: 0.029931 / 0.029035.
+
+The new coupled producer/consumer union is 1.293953 / 1.291733 ms. Original
+E2 GS already solves both scalar and coupled work in 1.087489 / 1.271572 ms;
+the candidate's split scalar, residual and fallback solves total 1.643745 /
+1.709323 ms. RTX preparation/scheduling saves approximately 0.504 ms but the
+split solve owners add 0.556 ms. GB saves approximately 0.258 ms but adds
+0.438 ms. The ledger explains the complete loss without assuming an
+all-fallback path, memory spill, or unmeasured hardware-occupancy cause.
+
+The intended consumer resource reduction is real (66 registers, 4048 shared
+bytes, no local memory). It does not eliminate serial nonlinear projections,
+inter-contact dependencies or producer-to-consumer coefficient publication
+and reloads. Packing itself costs 0.466/0.433 ms. Original GB production is
+already substantially cheaper than RTX production in this window, leaving
+less saved preparation to cover the additional split solves.
+
+Holding other owners fixed, the RTX milestone now requires the complete
+coupled producer/consumer to fit **0.541718 ms**, and GB no-regression requires
+**1.116480 ms**. Keeping the current producer leaves just **0.075563 ms RTX**
+for the entire consumer (9.45 us/solver call), before any new Gram formation
+or scan. A new recurrence layered after this producer therefore has no
+credible standalone cost case. Next work must change the complete equation,
+not tune another consumer layout or waive the full preparation bill.
+
+An independent historical audit also finds that register-held residuals,
+column-major small Delassus matrices and final-only velocity reconstruction
+were already implemented in the retained `response_block_sweep.py`. Prior
+real-task losses were followed by a staged-load retry that did not repair
+the sequential friction/synchronization costs. Those mechanisms alone are
+not a novel next experiment. A differentiated coupled-only representation
+would need to charge its construction, admission, scalar work and complete
+contact-unit recurrence. Changed algorithms are permitted if convergence and
+physical behavior pass with unchanged task allowances; exact original-GS
+arithmetic or trajectory is not an additional user requirement.
+
+Full loaded quality and balanced repeats remain unperformed for this failed
+speed screen. The 59 actual-GPU controls per card remain the narrower
+correctness evidence. Accepted E2, the fixed improvement reference and all
+Isaac Lab sources/settings remain unchanged.
+
+Artifact pins:
+
+- 512 manifest: `/tmp/fpgs-contact-block-keyboard512-screen-20260912-01/manifest.json`,
+  SHA256 `8ab28f92b28d0d2fb512e070e071743b18fcddb858efc67ff499dc9f5b326bbe`.
+- 4K screen: `/tmp/fpgs-contact-block-keyboard4096-screen-20260912-01/manifest.json`,
+  SHA256 `d55f7c13140dd7d18833fc2e1c8a4dfc47abf4d7b5583f4fa6505580dabb5706`.
+- 4K nodes: `/tmp/fpgs-contact-block-keyboard4096-nodes-20260912-01/manifest.json`,
+  SHA256 `93819acd6da6293861cd7a2f36995c45f5689586d650c99f36681942a2a9a3c7`.
+- Complete audit: `/tmp/fpgs-contact-block-node-audit-fUsXEL/evidence.json`,
+  SHA256 `b7d14bfac9017413bad08f52c35b5dc336032dc9e27570660228e28cc738b356`;
+  sibling `FINDINGS.md` SHA256
+  `4c8af429ff928dfc2ae7e12d0e4e42f0aa38d3865d3a2bcc0828974544325435`.
+- Historical recurrence audit: `/tmp/fpgs-contact-space-history-ulX4DbnU/HISTORY.md`,
+  SHA256 `522613a2785aa4b3c2bd56809c985266c48a5cb34d91f8a4c5b5a42f73ead695`.
