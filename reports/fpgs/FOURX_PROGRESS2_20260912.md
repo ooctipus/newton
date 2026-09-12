@@ -10,6 +10,9 @@ substeps, eight-sweep allowance, dependency pointer or capacity changed.
 The current Kuka path is a **repeatable opt-in physics improvement**, not a
 default-on release, proof of MJWarp physical parity, or achievement of 4x.
 The separate Franka kinetic-cache prototype is not included in this runtime.
+The subsequent [complete private-state experiment](FRANKA_PRIVATE_STATE_20260912.md)
+also remains scratch: numerical controls pass, but its measured owner cost
+does not qualify for the proposed large whole-physics gain.
 
 ## Balanced paired measurements
 
@@ -33,6 +36,27 @@ baseline. Franka retains its prior accepted three-round number. The MJWarp
 denominators are earlier-today corrected single-round discovery references,
 not fresh repeated accuracy-matched runs. The old170ms/11.05x Kuka claim stays
 withdrawn. Whole-environment throughput is separate and is not RL training.
+
+**Collision-scope correction,19:30 UTC:** both tasks' quoted corrected MJWarp
+captures use **external Newton collision**, as does FPGS. The unchanged lift
+configuration explicitly sets `use_mujoco_contacts=False`; the MJWarp manager
+therefore sets `_needs_collision_pipeline=True`. More importantly, all eight
+saved MJ boundary checks read the actual solver flag and report
+`external_newton_prefix`, with conversion/collision/warning checks clear.
+An earlier scratch Franka study incorrectly used the generic native-contact
+default instead of the task override. Missing collision child-kernel names
+in these `graph:host-only` traces do not prove collision absence: none of
+their graph child nodes are individually traced.
+
+The independent exact-reference audit is
+`/tmp/fpgs-corrected-mj-scope-3o6CabAP/FINDINGS.md`, SHA256
+`3f8ee6dc95690381a7adffd86fbc5cf935d7daa7d9f22d68dff646ca39ed8ea8`.
+It recomputes all four40-sample means from completed parent
+`/tmp/fpgs-today-three-task-20260912-01/manifest.json`, SHA256
+`9600ce35ffcd7cf87162b9f8c7f7ca9e042f9cf3ff470707df5a57c83bf76d57`.
+Shared collision source does not imply identical evolving contacts or cost.
+A general collision improvement enabled for both backends would also require
+a newly timed MJ denominator; the fixed historical comparison must stay labeled.
 
 All three Kuka physics rounds improved:
 
