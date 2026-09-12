@@ -243,6 +243,7 @@ _GROUPED_HINV_MAX = int(
 _INK_ON = os.environ.get("FEATHER_PGS_INK") == "1"
 _REGISTER_WHITENING = os.environ.get("FEATHER_PGS_REGISTER_WHITENING") == "1"
 _SIMPLE_WORLD_ZERO = os.environ.get("FEATHER_PGS_SIMPLE_WORLD_ZERO") == "1"
+_SPARSE_CONTACT_DIRECT = os.environ.get("FEATHER_PGS_SPARSE_CONTACT_DIRECT") == "1"
 _WR_ON = os.environ.get("FEATHER_PGS_WORLD_ROWS") == "1"  # experiment: contact rows built inside the sweep kernel
 _WR_CHECK = os.environ.get("FEATHER_PGS_WORLD_ROWS_CHECK") == "1"
 _WR_WARM = (
@@ -11324,12 +11325,17 @@ class SolverFeatherPGS(SolverBase):
                         device=model.device,
                     )
                 if self._sparse_diagonal_contact_solve:
+                    # The compact dense builder has 32 lanes per worker; this
+                    # scalar builder needs independent contact owners instead.
+                    sparse_contact_response_workers = (
+                        contacts.rigid_contact_max if _SPARSE_CONTACT_DIRECT else contact_jacobian_workers
+                    )
                     wp.launch(
                         populate_sparse_diagonal_contact_response,
-                        dim=contact_jacobian_workers,
+                        dim=sparse_contact_response_workers,
                         inputs=[
                             contacts.rigid_contact_count,
-                            contact_jacobian_workers,
+                            sparse_contact_response_workers,
                             contacts.rigid_contact_point0,
                             contacts.rigid_contact_point1,
                             contacts.rigid_contact_normal,
