@@ -226,6 +226,8 @@ _GROUPED_FK_OFF = os.environ.get("FEATHER_PGS_GROUPED_FK") == "0"
 _GROUPED_TAU_MASS_ON = os.environ.get("FEATHER_PGS_GROUPED_TAU_MASS") == "1"
 _GROUPED_MASS_ON = os.environ.get("FEATHER_PGS_GROUPED_MASS") == "1"
 _FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
+# Experimental Stage 7 producer partition, leaving all solve/mass budgets intact.
+_PRISMATIC_PUBLICATION = os.environ.get("FEATHER_PGS_PRISMATIC_PUBLICATION", "0") == "1"
 _DEBUG_CACHE = os.environ.get("FEATHER_PGS_DEBUG_CACHE") == "1"
 _DEBUG_CACHE_MODE = os.environ.get("FEATHER_PGS_DEBUG_CACHE_MODE", "")
 _DEBUG_DELAY = int(os.environ.get("FEATHER_PGS_DEBUG_DELAY", "0"))
@@ -2365,6 +2367,12 @@ class SolverFeatherPGS(SolverBase):
             )
 
         self._init_double_buffer_stream()
+
+        self._prismatic_publication = None
+        if _PRISMATIC_PUBLICATION and not model.requires_grad and not self.grouped_dynamics:
+            from .prismatic_publication import PrismaticPublicationPlan  # noqa: PLC0415
+
+            self._prismatic_publication = PrismaticPublicationPlan.build(model, self.articulation_joint_end)
 
         self._simple_world_classifier = None
         self._resolved_simple_worlds = wp.empty(0, dtype=wp.int32, device=model.device)
@@ -13843,9 +13851,10 @@ class SolverFeatherPGS(SolverBase):
         body_a_s = cache.body_a_s if cache is not None else state_aug.body_a_s
         next_refresh = ((self._step + 1) % self.update_mass_matrix_interval) == 0
         parallel_next_refresh = next_refresh and self._global_inertia_stream is not None
+        prismatic = self._prismatic_publication
         fk_inputs = [
             model.articulation_start,
-            self.articulation_joint_end,
+            prismatic.joint_end if prismatic is not None else self.articulation_joint_end,
             model.joint_type,
             model.joint_parent,
             model.joint_child,
@@ -13930,10 +13939,30 @@ class SolverFeatherPGS(SolverBase):
                 block_dim=16,
                 device=model.device,
             )
+        finalize_kernel = finalize_body_dynamics
+        finalize_prefix = []
+        if prismatic is not None:
+            from .prismatic_publication import finalize_prismatic_body_dynamics  # noqa: PLC0415
+
+            finalize_kernel = finalize_prismatic_body_dynamics
+            finalize_prefix = [
+                prismatic.body_joint,
+                model.joint_parent,
+                model.joint_q_start,
+                model.joint_qd_start,
+                state_out.joint_q,
+                state_out.joint_qd,
+                model.joint_X_p,
+                model.joint_X_c,
+                self.body_X_com,
+                model.joint_axis,
+                joint_S_s,
+            ]
         wp.launch(
-            finalize_body_dynamics,
+            finalize_kernel,
             dim=model.body_count,
             inputs=[
+                *finalize_prefix,
                 self.body_to_articulation,
                 state_out.body_q,
                 body_q_com,
