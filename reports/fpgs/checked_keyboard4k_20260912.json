@@ -1,0 +1,277 @@
+{
+  "schema": "checked-keyboard4k-audit-v1",
+  "artifact_root": "/tmp/fpgs-checked-keyboard4096-20260912-01",
+  "manifest_status": "complete",
+  "source_checkouts": {
+    "isaaclab": {
+      "path": "/home/octi/Projects/IsaacLab.wt/fpgs-opt-20260910",
+      "sha": "1d8feb82d17dbfab8f0772de56f84deae2cb7974",
+      "dirty": false,
+      "status": "",
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "newton_both_backends": {
+      "path": "/home/octi/Projects/newton-fpgs-checked-frozen-20260912",
+      "sha": "360388d1b072663d499c41c3ffec4ad63dd6f0b4",
+      "dirty": false,
+      "status": "",
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "drivers": {
+    "/home/octi/Projects/newton-fpgs-checked-frozen-20260912/tools/fpgs_bench/compare_backends.py": "65942426a9acf898e62d29d8e3db63ea6c4e87d22a85ee698b58694c65909c23",
+    "/home/octi/Projects/IsaacLab.wt/fpgs-opt-20260910/scripts/benchmarks/fpgs_profile/compare_gpus.py": "9577dfae0074384bed34d68e2c5c99c149ff2ed4428a4b778a30c322fce82850",
+    "/home/octi/Projects/IsaacLab.wt/fpgs-opt-20260910/scripts/benchmarks/fpgs_profile/nsys_run.sh": "79f95f195551bd3cad3b07f5d338dfa97977674c23deb23ebcc0bcd44904327f",
+    "/home/octi/Projects/IsaacLab.wt/fpgs-opt-20260910/scripts/benchmarks/fpgs_profile/run_profiled.py": "586aecb18d95e317991f17e62fb2c9527b2eb76220d76d464bd4c67e9ec8b954",
+    "/home/octi/Projects/IsaacLab.wt/fpgs-opt-20260910/scripts/benchmarks/fpgs_profile/analyze_nsys.py": "aa030178f8ec4a36efdac9795c4c861e91484428b4ee0e1d5c686b08791adabb",
+    "/home/octi/Projects/newton-fpgs-checked-frozen-20260912/tools/fpgs_bench/checked_capture.py": "e6641f474ef16d0ab522ffdd60c6b6b75ed9f31db7b6fe62d9d52086959ff61d",
+    "/home/octi/Projects/newton-fpgs-checked-frozen-20260912/tools/fpgs_bench/nsys_checked.sh": "b42d86aa5151109b302ee8d244a95c015e76aa740b0fa5e8ba1d98c8a16038a4",
+    "/home/octi/Projects/newton-fpgs-checked-frozen-20260912/tools/fpgs_bench/mjwarp_linesearch_compat.py": "c5f0a6aef071e9d47baf3c646d1f8bfe715b3a31f6a079f9b244b09f080e368c"
+  },
+  "current_source_rehash_pass": true,
+  "root_artifact_sha256": {
+    "manifest.json": "e871b4b5ee9d281f81a3550f12ffae75b7e68996923eb130ebaaa845cf2bb711",
+    "summary.json": "2f28faccb67bfa88758fc58e4095e71fbd4e6adbfe502ac9c11efac16b06fc2f",
+    "ratios.json": "748f2482cbd654995170d928f2f4880c8d68d6be6b4538186e2bfb54fb1258e8"
+  },
+  "settings": {
+    "gpus": [
+      0,
+      1
+    ],
+    "task": [
+      "keyboard-so101"
+    ],
+    "fpgs_env": [],
+    "capacity": [
+      "keyboard-so101:fpgs:dense_max_constraints=704",
+      "keyboard-so101:fpgs:rigid_contact_max=147456",
+      "keyboard-so101:fpgs:broad_phase_output_max=57344",
+      "keyboard-so101:mjwarp:njmax=320",
+      "keyboard-so101:mjwarp:nconmax=32",
+      "keyboard-so101:mjwarp:rigid_contact_max=131072",
+      "keyboard-so101:mjwarp:broad_phase_output_max=45056"
+    ],
+    "check_overflow": true,
+    "mjwarp_linesearch_fix": true,
+    "repeats": 1,
+    "num_envs": 4096,
+    "warmup_steps": 200,
+    "steps": 1000,
+    "profile_steps": 40,
+    "seed": 0,
+    "sim_dt": 0.01,
+    "substeps": 2,
+    "solver_dt": 0.005,
+    "environment_decimation": 4,
+    "backend_order": [
+      "feather_pgs",
+      "newton_mjwarp"
+    ],
+    "fpgs_recipe_flags": {
+      "FEATHER_PGS_GROUP_LANES": "16",
+      "FEATHER_PGS_ROWS_MASKED": "1",
+      "NEWTON_NARROW_PHASE_THREADS_X": "4"
+    },
+    "mjwarp_inherits_fpgs_flags": false
+  },
+  "common_checks": {
+    "captures": 4,
+    "checked_boundaries": 8,
+    "all_complete": true,
+    "all_boundary_check_pass": true,
+    "all_state_finite_before_after": true,
+    "all_solver_flags_zero": true,
+    "all_13_collision_flags_zero": true,
+    "collision_unsupported_owners": [],
+    "all_physics_budgets_modified": false,
+    "graph_roots_total": 640,
+    "all_graph_roots_correlations_and_durations_recomputed_from_readonly_sqlite": true
+  },
+  "capacity_details": {
+    "feather_pgs": {
+      "dense_max_constraints": 704,
+      "mf_max_constraints": 64,
+      "propagation_max_constraints": 704
+    },
+    "newton_mjwarp": {
+      "nworld": 4096,
+      "njmax": 320,
+      "naconmax": 131072,
+      "njmax_nnz": 2246
+    }
+  },
+  "mjwarp_linesearch_compat": {
+    "helper_sha256": "c5f0a6aef071e9d47baf3c646d1f8bfe715b3a31f6a079f9b244b09f080e368c",
+    "helper_path": "/home/octi/Projects/newton-fpgs-checked-frozen-20260912/tools/fpgs_bench/mjwarp_linesearch_compat.py",
+    "installation": {
+      "enabled": true,
+      "experimental": true,
+      "patch_id": "pyramidal-sign-acquisition-adjacent-float-v2",
+      "source_sha256": "509b43da297dc6e49efeacdbb59df675213e84afbdb26770471a5ba1855a24b3",
+      "source_dependencies": {
+        "solver.py": "509b43da297dc6e49efeacdbb59df675213e84afbdb26770471a5ba1855a24b3",
+        "types.py": "a49625a8994db0d3b52dd34f98adac7f70882d473108c4e4793e4830e81ea71c",
+        "math.py": "4c58d5e3864f7b841633d403d78e7702bb547359ee846d43810e3b31c63966c2",
+        "warp_util.py": "6759883baef16fc9a5222bf0e5c858700d0847392138a8c0d2ae78a2c9a5780a"
+      },
+      "generated_factory_sha256": "485f85ccb4af6b8d0e4ec45be56e2b6c7e3300612e203d5e59c5dea98b934d0d",
+      "mujoco_warp_version": "3.12.0",
+      "scope": "PYRAMIDAL+NEWTON; unsupported models use the original driver",
+      "friction_delta": false,
+      "iteration_budget_changed": false,
+      "gradient_tolerance_changed": false,
+      "installed_package_modified": false,
+      "warning_bits_suppressed": false
+    }
+  },
+  "captures": [
+    {
+      "directory": "round_01_keyboard-so101_fpgs_gpu0",
+      "gpu_index": 0,
+      "gpu_uuid": "GPU-883586b6-3100-0610-81e5-3b4c26f45639",
+      "backend": "feather_pgs",
+      "returncode": 0,
+      "cleanup_signals": [],
+      "boundary_count": 2,
+      "contacts_before_after": [
+        105232,
+        103915
+      ],
+      "constraint_max_before_after": [
+        582,
+        570
+      ],
+      "graph_steps": 40,
+      "graph_roots": 160,
+      "auxiliary_roots": 0,
+      "mean_graph_us_per_env_step": 11186.488925,
+      "median_of_40_graph_us_per_env_step": 11205.282000000001,
+      "unprofiled_environment_wall_us_per_env_step": 37411.073283990845,
+      "physics_work_modified": false,
+      "capture_sha256": {
+        "capture.json": "3ad6f03bb2c8c30f01697ff33a54dd60da3a62dbce745311d823c937d1523192",
+        "capture_checks.json": "d940b775a0f8e9833a4eb7977ffeb9c134355907ae8c2dc1156d78aac334bef8",
+        "capture_analysis.json": "2df64baffd161564cd00de5e018eac681ec110a0e0eb74e62a659543cb4bb682",
+        "capture.nsys-rep": "dd4184b15a5feb6c4213d9addacecf6d3b6e7be6c75a51d7a62b48dfd98f1c41",
+        "capture.sqlite": "8d1f5e25b4d63b0d3a9d88b3120d0460761813f76358863e01160e21715934f5",
+        "capture.log": "4baae8d3461b3813a8edb5e0107d0645adef8199785e8461ad5612957831d5db",
+        "driver.log": "26dc596decacaf34da7e73dd39362cfcfd99b507fc25b31574e9903602a13e10"
+      }
+    },
+    {
+      "directory": "round_01_keyboard-so101_fpgs_gpu1",
+      "gpu_index": 1,
+      "gpu_uuid": "GPU-ebfac9e8-02d5-d8a9-3bfc-bac64c62ffd4",
+      "backend": "feather_pgs",
+      "returncode": 0,
+      "cleanup_signals": [],
+      "boundary_count": 2,
+      "contacts_before_after": [
+        99559,
+        106936
+      ],
+      "constraint_max_before_after": [
+        573,
+        575
+      ],
+      "graph_steps": 40,
+      "graph_roots": 160,
+      "auxiliary_roots": 0,
+      "mean_graph_us_per_env_step": 10801.2935,
+      "median_of_40_graph_us_per_env_step": 10821.712,
+      "unprofiled_environment_wall_us_per_env_step": 34040.58701201575,
+      "physics_work_modified": false,
+      "capture_sha256": {
+        "capture.json": "76e4826a67ea8511b8989944eec3cbe1ec5d57745df4dcc1451c7c662fe1b778",
+        "capture_checks.json": "9f20a310d5604eb1ddff3ebb886136de639abb2a7ef58dea4846161773fa9123",
+        "capture_analysis.json": "6daa056a682707e14a394299893c022ea8e369a34f53524088470e2e8c10b780",
+        "capture.nsys-rep": "e597b6c67b56b0f83ba08b3066794ae6445b1c7b76433bd23eae5c60747df70e",
+        "capture.sqlite": "91cc14cce7b343d70da2dbe499888268796ea6c9fe06d7d26f91e1d7bb012799",
+        "capture.log": "54de4ea06727088e6e27165204a79dff339c254bfbe11e9090d0b58412592932",
+        "driver.log": "94d843e3f93a57eb9ac49b78b130043fe85ba09437f6ef97a64f96120d7e3cd2"
+      }
+    },
+    {
+      "directory": "round_01_keyboard-so101_mjwarp_gpu0",
+      "gpu_index": 0,
+      "gpu_uuid": "GPU-883586b6-3100-0610-81e5-3b4c26f45639",
+      "backend": "newton_mjwarp",
+      "returncode": 0,
+      "cleanup_signals": [],
+      "boundary_count": 2,
+      "contacts_before_after": [
+        89454,
+        88022
+      ],
+      "constraint_max_before_after": [
+        null,
+        null
+      ],
+      "graph_steps": 40,
+      "graph_roots": 160,
+      "auxiliary_roots": 0,
+      "mean_graph_us_per_env_step": 27797.02885,
+      "median_of_40_graph_us_per_env_step": 27804.148999999998,
+      "unprofiled_environment_wall_us_per_env_step": 32118.6828489881,
+      "physics_work_modified": true,
+      "capture_sha256": {
+        "capture.json": "becd9f09b94af80ee6d28c75a1a5b5b93865d056f1a8bbf147a09eebf1d95d40",
+        "capture_checks.json": "5e19ebeb0cdbe4d424c30e57ff9897c15ab560ade9d1b4bcc80ff56ba1db50c9",
+        "capture_analysis.json": "a0e96addde67236ac9e9e4f7f11aeb3c0cba5b00d78763a59e034e3004092aca",
+        "capture.nsys-rep": "236c56f3c80e0c76a67e696e162f0609d3cc9e5b17e4ffc98f78375e67b9347d",
+        "capture.sqlite": "45f0da1925f6d0e32ba775314994e3fa4543fefc85054fbf3058ff544ae1623d",
+        "capture.log": "fa19f1efa5d367d2bc12113362a1744363dd19acfbaad854d1177f001818ccd2",
+        "driver.log": "9c6a85eaf4504a23c521407ba12f5b07214b98e693ecc9adf0a909a6380d842a"
+      }
+    },
+    {
+      "directory": "round_01_keyboard-so101_mjwarp_gpu1",
+      "gpu_index": 1,
+      "gpu_uuid": "GPU-ebfac9e8-02d5-d8a9-3bfc-bac64c62ffd4",
+      "backend": "newton_mjwarp",
+      "returncode": 0,
+      "cleanup_signals": [],
+      "boundary_count": 2,
+      "contacts_before_after": [
+        89441,
+        88016
+      ],
+      "constraint_max_before_after": [
+        null,
+        null
+      ],
+      "graph_steps": 40,
+      "graph_roots": 160,
+      "auxiliary_roots": 0,
+      "mean_graph_us_per_env_step": 27977.88,
+      "median_of_40_graph_us_per_env_step": 28020.96,
+      "unprofiled_environment_wall_us_per_env_step": 32438.660729967523,
+      "physics_work_modified": true,
+      "capture_sha256": {
+        "capture.json": "217fc7ac4836fe8324984e327385d45ffeea8350bbe993af26be92e64cfbe9a8",
+        "capture_checks.json": "c08eb921940f193835160469379d8a050eb3fc2e531b9de311cb6367b5bf8df7",
+        "capture_analysis.json": "e27ead5807898c702298ac326f8163855ae7639dbf3210272b7f2684a867eea5",
+        "capture.nsys-rep": "9c72545849466deb1844157d702a2b3847a4379e21e14d24ed38cf292347f6e8",
+        "capture.sqlite": "fafa6e41ccd3cf88048a09c7c9686863e10eaa61ec5048f466054ddbea375296",
+        "capture.log": "1008a92392591bac47313a0bf7c852898e59bc4aee05518d290854a9ec22c584",
+        "driver.log": "adc183205c748a0ba6f61dec510536281f9e7a8365126998252beba635ff90de"
+      }
+    }
+  ],
+  "scope": {
+    "timing": "Mean of 40 sums of four direct physics-graph durations per environment step. One round, no balanced order or between-round uncertainty. Full wall is separate unprofiled 1000-step environment average.",
+    "quality": "Two finite-state/sticky-overflow boundaries per capture, not per-substep numerical convergence, constitutive-law or backend parity proof. Separate diagnostic runs supply per-substep evidence.",
+    "idle": "Driver enforces pre-batch idle and reaps owned process groups. Manifest contains no final GPU-wide idle sample. Root reports a separate empty compute-app query after reaping at 01:41 UTC; not independently recoverable from these capture files."
+  },
+  "warnings": {
+    "solver_capacity_or_line_search_warning_lines_observed": 0,
+    "unrelated_shape_color_futurewarning_present_all_captures": true,
+    "mjwarp_dependency_warning_present_both_captures": "MuJoCo dependency version mismatch with Newton's declared requirements: mujoco==3.12.0 (requires ~=3.11.0); mujoco-warp==3.12.0 (requires ~=3.11.0).",
+    "qualification": "The exact installed 3.12 solver dependencies are pinned by the opt-in helper; this does not rewrite the declared dependency range or establish general 3.12 compatibility."
+  },
+  "retention": {
+    "original_small_json_total_bytes": 323137,
+    "recommendation": "Retain this JSON and companion Markdown; preferably also original manifest/summary/ratios and capture/check/analysis JSONs (323137 bytes total). Raw capture.sqlite/nsys-rep/logs remain local at recorded paths and are SHA256-addressed here. Hashes alone cannot reconstruct deleted raw evidence."
+  }
+}

@@ -60,6 +60,11 @@ samples. Internal Newton collision queues reset demand counters each call:
 calibrate their unclamped high-water marks and overflows with a full-run
 observer, including warmup and held-out contact/reset states, before timing.
 Two boundary snapshots cannot establish those transient queues' safety.
+An overflowed trial is rejected, not used as the final demand estimate: after
+resizing, rerun the complete workload because restoring dropped constraints
+can change the trajectory and its peak demand. Small-world smoke tests do not
+bound large-world tails. Record the largest observed demand, chosen capacity,
+reserve, world count, seeds and reset horizon for each accepted recipe.
 
 An experimental numerical line-search correction can be selected explicitly
 with `--mjwarp-linesearch-fix --check-overflow`. It is forwarded only to the
@@ -130,3 +135,19 @@ uv run --no-project python -m unittest discover -s tools/fpgs_bench -p test_chec
 ```
 
 The tests mock all external process and GPU operations. They cover recipe/environment isolation, alternating paired starts, source and import guards, strict result-error propagation, checked helper routing, incomplete/failed or misbound overflow reports, output protection, and child cleanup failures. The checked-capture tests also run the shell against inert command stubs and execute a pinned fake harness to verify actual boundary hooks and unchanged argument forwarding. GPU measurement and combined-physics correctness remain separate validation gates.
+
+The optional line-search helper additionally has real CPU Warp kernel tests.
+Run these explicitly in the reviewed MuJoCo/MJWarp 3.12.0 environment; standard
+`newton.tests` discovery does not include this tools directory. They skip when
+the optional reviewed backend is absent, so a skipped run is not validation:
+
+```sh
+CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1 \
+  uv run --no-project --python /path/to/isaaclab/.venv/bin/python \
+  python -m unittest discover -s tools/fpgs_bench -p test_mjwarp_linesearch_compat.py -v
+```
+
+These tests cover exact-zero roots, genuine budget exhaustion, representable
+brackets, and mirrored convex rays on which the original solver silently
+accepts a nonstationary point, plus installation/source/cache guards. Zero
+warning bits alone are not sufficient numerical acceptance.
