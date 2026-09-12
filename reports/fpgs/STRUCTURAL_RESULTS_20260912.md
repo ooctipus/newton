@@ -334,9 +334,26 @@ the old raw-geometry diagonal criterion (177 RTX rows). Its CPU/GPU results are
 not claimed bit-identical. Original same-GPU producer checks returned before
 the failing oracle assertion, but their arrays were not persisted separately.
 
-No runtime, failed helper or tolerance has changed. A fresh dependency-correct
-oracle with correlated-corruption negative controls must complete the full GPU
-gate before promotion. Diagnosis: `/tmp/fpgs-e2-diagonal-diagnosis-QzPrxh/FINDINGS.md`,
+No runtime, failed helper or tolerance changed to address that failure. A fresh
+dependency-correct oracle now completes the full 4K loaded GPU gate on both
+cards: 320 actual calls, two adjacent selected checkpoints, current-range clear,
+prefix/tail ownership, original/private/live producer controls, independent
+geometry/held response/diagonal/metadata/Jv checks, eight original sweeps and all
+capacity flags clear. Its 21 CPU controls pass independently twice, including
+real-oracle correlated-corruption rejection and both saved failed 4K inputs.
+Successful capture: `/tmp/fpgs-compact-e2-loaded-paired-4096-02`, paired manifest
+`254462f09fe4443fc6fe2c7d1f35dc765cc306f5e168f51980a1a950aa5e6613`.
+The new helper is `/tmp/fpgs-compact-e2-loaded4k-v3-1ph1U8`, oracle SHA
+`f304494841b490d1c3775d6b383aca64ec1114d515ee9aa58b4b0aea258a32c7`;
+only the diagonal block differs from the old oracle. Physical row diagnostics
+are retained, not declared exact solutions or whole-trajectory parity.
+
+The complete E2 runtime is now included as default-off in this handoff branch;
+all files under `newton/` match the directly tested experimental source exactly.
+Enable `FEATHER_PGS_COMPACT_CONTACT_BOUNDARY=1` along with the two A+B flags.
+The existing 36 targeted GPU tests per card, loaded 512/4K checks and repeated
+paired graph timings support this opt-in inclusion, not universal deployment.
+Diagnosis: `/tmp/fpgs-e2-diagonal-diagnosis-QzPrxh/FINDINGS.md`,
 SHA `d4b6486dd1fd2ee57902e543af440ec4ffa696881b74e87ae5dbfa22dd579af7`;
 failed run `/tmp/fpgs-compact-e2-loaded-paired-4096-01`, paired manifest
 `41e3f2ae19b190622dc1e9142316665d8f81040df89b3b465fcd44aa572344da`.

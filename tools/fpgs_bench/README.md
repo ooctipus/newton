@@ -25,6 +25,12 @@ uv run --no-project --python /path/to/isaaclab/.venv/bin/python \
 ```
 
 These capacities are calibrated for this 4K task, not universal recommendations.
+The handoff branch also includes the opt-in coalesced contact boundary tested at
+`5777558f`. To reproduce its incremental A+B comparison, use `654894cb` as the
+baseline, this handoff as the candidate, enable the two flags above on **both**
+arms, and add `--candidate-env FEATHER_PGS_COMPACT_CONTACT_BOUNDARY=1` only to
+the candidate. Keep the same capacities and sampling. The structural report
+records its separate repeated timing and loaded-input quality checks.
 Variant flags apply to both selected devices. `--trace-mode node` is available
 for attribution; only at least three completed graph-mode rounds are labeled
 repeated timing evidence. The manifest reports physics and wall medians and
