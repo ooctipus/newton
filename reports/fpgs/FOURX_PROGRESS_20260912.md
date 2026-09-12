@@ -70,10 +70,59 @@ and rare fallback counts differ between independent rollouts. See
 The combined runtime passes45 tests on each actual GPU, including both feature
 suites, fork dispatch, private API and existing local solves. Full pre-commit
 passes. Logs are `/tmp/fpgs-fourx-progress-native-{rtx,gb}-20260912-01.log`.
-The table above is still source-bound to the individual commits; an actual
-combined live smoke/timing check remains pending at this report checkpoint.
+The table above remains source-bound to the individual commits. The combined
+`fb0f0759` runtime now also passes live16K compatibility checks for both tasks
+on both GPUs: one round,200 warmup,40 wall and40 graph-profiled steps, with
+all four experiment flags enabled. These are integration checks, not another
+three-round speedup claim:
+
+| Task / GPU | Individual candidate ms | Combined ms | Individual / combined |
+| --- | ---: | ---: | ---: |
+| Kuka / RTX | 14.025788 | 14.152383 | 0.9911x |
+| Kuka / GB300 | 13.719741 | 13.648833 | 1.0052x |
+| Franka / RTX | 5.711621 | 5.805963 | 0.9838x |
+| Franka / GB300 | 5.182842 | 5.174058 | 1.0017x |
+
+All children exit0 and are reaped; original capacity, source and final idle
+guards pass. Compatibility manifests are
+`/tmp/fpgs-fourx-combined-kuka16k-20260912-01/manifest.json`
+(`0ad6d48115146ddbf3687c1e746914075928add580431c98deed3840a560793d`)
+and `/tmp/fpgs-fourx-combined-franka16k-20260912-01/manifest.json`
+(`5332703bbbca7442265dfeb9f144aa0102312ad2fe13550125d3fdf81d1fc300`).
 None of these checks establishes universal convergence, identical trajectories,
 training performance or physical parity with MJWarp.
+
+## Actual Kuka zero-cohort measurement
+
+A separate checked, untimed combined-runtime capture now records the actual
+classifier decision immediately after its original call, not an inference
+from zero row counts. It retains the original200 warmup and records two
+adjacent original solver calls1600/1601 (mass refresh/reuse):
+
+| GPU | Refresh resolved /16,384 | Reuse resolved /16,384 | Changed worlds |
+| --- | ---: | ---: | ---: |
+| RTX | 13,883 (84.735%) | 13,755 (83.954%) | 526 |
+| GB300 | 13,921 (84.967%) | 13,783 (84.125%) | 550 |
+
+Each observation stores only the65,536-byte binary decision array plus static
+work counts. Selected fractions are the same for this model's32 bodies/FK
+joint visits and35 global DOFs per world; the response map has only29 DOFs.
+There are three articulations per world, including a prescribed free root.
+This confirms a large eligible cohort, **not** that84% of publication time can
+be hidden. Extra indexing, events, complementary work and GPU contention count.
+The original free-body inverse still reads inertia for resolved worlds, so an
+early finalizer must explicitly wait for that reader or safely exclude it.
+
+Both children retain all eight original calls, exact source/alias/raw-capacity
+guards and two passing original checked boundaries; all4 solver and13 collision
+flags are clear. No alternate solve, live-array write or numerical-quality
+claim is added by the recorder. Parent exits0, reaps both children and passes
+final source/idle checks. Manifest:
+`/tmp/fpgs-kuka-zero-cohort-paired16k-20260912-01/manifest.json`, SHA256
+`b55b7b5190ed271752797df514c4197cab90bfb0710c9db59521e22ad8b3e089`.
+Recorder: `/tmp/fpgs-kuka-zero-cohort-UFSd8PAS/run_cohort.py`, SHA256
+`237e2929b491cb49113f7a53582f0017735f4172354aca2c4252e6bab7beb7ee`;
+its adjacent READY.md contains the exact paired command and four CPU controls.
 
 ## Reproduce and continue
 
