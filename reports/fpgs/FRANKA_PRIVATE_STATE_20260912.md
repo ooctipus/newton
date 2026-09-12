@@ -7,6 +7,10 @@ deliver the proposed large whole-physics gain. A phase diagnostic is next;
 the architectural hypothesis is not rejected merely because its first mapping
 missed an unmeasured suballocation.
 
+Follow-up: the [completed phase diagnosis and cooperative retry](FRANKA_COOPERATIVE_STATE_20260912.md)
+now measure a 1.25x RTX / 1.17x GB component improvement in a matched window.
+The complete-boundary allowance and whole-physics objective still remain unmet.
+
 ## What changed in the prototype
 
 One 32-thread world owns current force preparation, held primary mass action,

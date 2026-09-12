@@ -13,6 +13,10 @@ The separate Franka kinetic-cache prototype is not included in this runtime.
 The subsequent [complete private-state experiment](FRANKA_PRIVATE_STATE_20260912.md)
 also remains scratch: numerical controls pass, but its measured owner cost
 does not qualify for the proposed large whole-physics gain.
+Its [cooperative successor](FRANKA_COOPERATIVE_STATE_20260912.md) passes bounded
+physical controls and improves that complete private-owner component by
+1.25296x RTX / 1.17312x GB in a matched window. Missing live/fallback services
+remain unmeasured; none of these scratch numbers updates the task table below.
 
 ## Balanced paired measurements
 
@@ -160,12 +164,19 @@ Add only `FEATHER_PGS_KUKA_JOINT_WORLD=1` and
 override is needed. The full exact commands and import/source hashes are in the
 manifests. `FOURX_PROGRESS_20260912.md` preserves the preceding comparisons.
 
-The next bounded Franka experiment changes internal dynamics representation:
-publish generalized geometric mass and bias with body kinematics, then consume
-them with current controls/diagonal/factor/predictor and exact signed constraints.
-It includes the original free6/generalized/contact/external/cold fallback costs.
-Its complete optimistic20%-gain allowance is.990811ms RTX; no speed or production
-claim follows from algebra alone. The prototype is not part of this branch.
+The Franka experiments now include complete private state and geometry handoff,
+current free-body response, generalized integration and next kinetic state.
+The earlier .990811 ms allowance applied to a narrower proposal and is superseded
+for this expanded family by 1.634704 ms RTX. Even the matched cooperative owner
+alone costs 2.072576 ms RTX before live repair/demand/free-factor services, so
+the proposed 20% whole-physics gain is not established. The next study targets
+complete direct rigid-body services, not isolated factor or block-size tuning.
+
+Kuka's current-normal certificate family also remains scratch. Its first paired
+GPU gate stopped before timing on rare output disagreements (one RTX velocity
+coordinate, two GB coordinates; maximum 8.17e-5). Current same-order coefficient,
+trial-versus-full-eight and stream-ownership diagnosis is pending. No tolerance
+was widened and no performance result is claimed from that failed run.
 
 Evidence (large captures remain local):
 
