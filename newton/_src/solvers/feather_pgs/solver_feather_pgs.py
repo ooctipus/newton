@@ -52,6 +52,7 @@ from .grouped_dynamics import (
     grouped_tau_mass,
     template_fk_kinematics,
 )
+from .independent_components import IndependentComponents
 from .kernels import (
     FRICTION_MODE_BISECTION,
     FRICTION_MODE_BISECTION_DESAXCE,
@@ -5328,6 +5329,27 @@ class SolverFeatherPGS(SolverBase):
 
         self._paired_cholesky_inverse_kernel = None
         self._paired_response_kernel = None
+        self._independent_components = None
+        if (
+            os.environ.get("FEATHER_PGS_INDEPENDENT_COMPONENTS", "0") == "1"
+            and model.device.is_cuda
+            and not model.requires_grad
+            and self._paired_factor_coordinates
+            and self.pgs_velocity_iterations == 0
+            and not self.pgs_debug
+            and not (_FPGS_CAPTURE or _GROUPED_CHECK or _DEBUG_CACHE_CMP or _INK_CHECK or _WR_CHECK)
+            and self._paired_response_primary_size == 23
+            and self._paired_response_secondary_size == 6
+            and self.max_world_dofs == 29
+            and self.pgs_schedule == "interleaved"
+            and not self.pgs_warmstart
+            and not self._mf_warmstart_enabled
+            and not self._regularization_enabled
+            and not self._preelim_active
+            and self._mimic_count == 0
+            and self._connect_count == 0
+        ):
+            self._independent_components = IndependentComponents(self)
         if self._paired_response_primary_size is not None:
             primary_size = self._paired_response_primary_size
             secondary_size = self._paired_response_secondary_size
@@ -5353,6 +5375,7 @@ class SolverFeatherPGS(SolverBase):
                     secondary_size,
                     device_arch,
                     contact_triples=self._factor_coordinate_contact_triples,
+                    independent_components=self._independent_components is not None,
                 )
                 if self._paired_factor_coordinates
                 else None
@@ -5613,6 +5636,7 @@ class SolverFeatherPGS(SolverBase):
                 factor_coordinates=self._paired_factor_coordinates,
                 skip_incremental_rows=max(incremental_rows, parallel_rows),
                 skip_response_block=use_rb,
+                independent_components=self._independent_components is not None,
             )
             if use_rb:
                 self._build_response_block_sweep(model, has_drive_rows)
@@ -6799,6 +6823,11 @@ class SolverFeatherPGS(SolverBase):
                     single_ready_event = wp.get_stream(self.model.device).record_event()
                     local_stream.wait_event(single_ready_event)
             factor_kernel = self._paired_factor_solve_kernel
+            components = self._independent_components
+            if components is not None:
+                if row_phase != 0 or soft_relax or defer_dense_response:
+                    raise RuntimeError("Independent components require the supported physical interleaved solve")
+                components.prepare(self, dense_rhs, mf_meta)
             if factor_kernel is not None:
                 if row_phase != 0:
                     raise RuntimeError("paired factor-coordinate solve only supports the interleaved row phase")
@@ -6831,7 +6860,7 @@ class SolverFeatherPGS(SolverBase):
                             self.row_type,
                             self.row_parent,
                             self.row_mu,
-                            self.mf_constraint_count,
+                            self.mf_constraint_count if components is None else components.selector,
                             self.L_by_size[primary_size],
                             self.Linv_by_size[primary_size],
                             self.L_by_size[secondary_size],
@@ -6858,7 +6887,7 @@ class SolverFeatherPGS(SolverBase):
                     self._rb_class,
                     self.constraint_count,
                     self.dense_phase_bounds,
-                    self._local_solve_owner,
+                    self._local_solve_owner if components is None else components.selector,
                     self.world_dof_indices,
                     self.world_deferred_dof_mask,
                     dense_rhs,
@@ -15511,6 +15540,7 @@ def _get_pgs_solve_paired_factor_kernel(
     secondary_dofs: int,
     device_arch: str,
     contact_triples: bool = False,
+    independent_components: bool = False,
 ) -> "wp.Kernel":
     """Build the dense PGS solve for a fixed articulation/free-body pair.
 
@@ -15529,6 +15559,8 @@ def _get_pgs_solve_paired_factor_kernel(
         raise ValueError("max_constraints must be positive")
     if P <= 0 or S <= 0 or P + S != D or D > 32:
         raise ValueError("paired factor PGS requires two positive components spanning at most 32 world DOFs")
+    if independent_components and (P, S) != (23, 6):
+        raise ValueError("Independent components require the 23+6 pair")
 
     contact_type = int(PGS_CONSTRAINT_TYPE_CONTACT)
     friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
@@ -15879,6 +15911,22 @@ def _get_pgs_solve_paired_factor_kernel(
 #endif
 """
 
+    if independent_components:
+        # This argument carries the private signed selector only for this
+        # variant; canonical MF counts/force metadata remain untouched.
+        replacements = {
+            "if (m == 0 || world_mf_constraint_count.data[world] != 0) return;": "if (m == 0 || world_mf_constraint_count.data[world] > 0) return;\n"
+            "    const bool split_component = world_mf_constraint_count.data[world] < 0;",
+            "const float physical_velocity = global_dof >= 0 ? v_out.data[global_dof] : 0.0f;": f"const float physical_velocity = global_dof >= 0 && (!split_component || "
+            f"(lane >= primary_offset && lane < primary_offset + {P})) ? v_out.data[global_dof] : 0.0f;",
+            "if (global_dof >= 0) v_out.data[global_dof] = physical_output;": f"if (global_dof >= 0 && (!split_component || (primary_lane >= 0 && primary_lane < {P}))) "
+            "v_out.data[global_dof] = physical_output;",
+        }
+        for old, new in replacements.items():
+            if snippet.count(old) != 1:
+                raise RuntimeError("Independent paired ownership source seam changed")
+            snippet = snippet.replace(old, new)
+
     @wp.func_native(snippet)
     def pgs_solve_paired_factor_native(
         world: int,
@@ -15969,6 +16017,8 @@ def _get_pgs_solve_paired_factor_kernel(
     name = f"pgs_solve_paired_factor_{M}_{D}_{P}_{S}_w{W}"
     if contact_triples:
         name += "_contact3"
+    if independent_components:
+        name += "_components"
     pgs_solve_paired_factor_template.__name__ = name
     pgs_solve_paired_factor_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_paired_factor_template)
@@ -23020,6 +23070,7 @@ def _get_pgs_solve_mf_gs_kernel(
     factor_coordinates: bool = False,
     skip_incremental_rows: int = 0,
     skip_response_block: bool = False,
+    independent_components: bool = False,
 ) -> "wp.Kernel":
     """Two-phase GS PGS kernel: dense + matrix-free in one pass.
 
@@ -23062,6 +23113,8 @@ def _get_pgs_solve_mf_gs_kernel(
         or skip_local_internal_worlds
     ):
         raise ValueError("factor coordinates require the paired augmented-drive contact solve")
+    if independent_components and (not factor_coordinates or max_world_dofs != 29):
+        raise ValueError("Independent components require the paired 29D physical fallback")
     _validate_dense_metadata_encoding(max_constraints)
     M_D = max_constraints
     M_MF = mf_max_constraints
@@ -24554,6 +24607,25 @@ def _get_pgs_solve_mf_gs_kernel(
         )
         snippet = re.sub(r"s_lam_mf\[([^\]]*)\]", r"g_lam_mf[\1]", snippet)
 
+    if independent_components:
+        # Kuka does not use local-owner queues. Only this variant receives the
+        # private signed selector in that otherwise-unused owner argument.
+        replacements = {
+            "int m_dense = world_constraint_count.data[world];": "const bool split_component = local_solve_owner.data[world] < 0;\n"
+            "    int m_dense = split_component ? 0 : world_constraint_count.data[world];",
+            "int off_meta = off_mf * 4;": "int off_meta = off_mf * 4;\n"
+            "    const int first_dofs = split_component ? mf_meta.data[off_meta] : 0;\n"
+            "    const int component_offset = split_component ? max(first_dofs >> 16, static_cast<int>(static_cast<short>(first_dofs & 65535))) : 0;",
+            "s_v[d] = global_dof >= 0 ? v_out.data[global_dof] : 0.0f;": "s_v[d] = global_dof >= 0 && (!split_component || (d >= component_offset && d < component_offset + 6)) "
+            "? v_out.data[global_dof] : 0.0f;",
+            "if (global_dof >= 0) v_out.data[global_dof] = s_v[d];": "if (global_dof >= 0 && (!split_component || (d >= component_offset && d < component_offset + 6))) "
+            "v_out.data[global_dof] = s_v[d];",
+        }
+        for old, new in replacements.items():
+            if snippet.count(old) != 1:
+                raise RuntimeError("Independent MF ownership source seam changed")
+            snippet = snippet.replace(old, new)
+
     # Fixed signature (has_drive_rows precedent): world_drive_vel_limit is
     # always a parameter; launch sites pass the solver's drive_vel_limit
     # array — a (1, 1) dummy when the fused clamp is off — and
@@ -24727,6 +24799,8 @@ def _get_pgs_solve_mf_gs_kernel(
         name += f"_skipinc{int(skip_incremental_rows)}"
     if skip_response_block:
         name += "_rb"
+    if independent_components:
+        name += "_components"
     pgs_solve_mf_gs_template.__name__ = name
     pgs_solve_mf_gs_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)
