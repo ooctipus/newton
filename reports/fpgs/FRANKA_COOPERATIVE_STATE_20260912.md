@@ -182,3 +182,8 @@ The parent manifests preserve exact root-owned commands. Large captures,
 experimental sources and generated binaries remain local. Further experiments
 must price the complete changed boundary; no whole-physics or wall-time gain is
 recorded here.
+
+The follow-up [typed free-state owner](FRANKA_TYPED_FREE_STATE_20260912.md)
+passes the complete GPU physical checks but misses the complete-owner cost
+budget. The measured cooperative gain above remains a component result, not a
+new whole-physics speedup.

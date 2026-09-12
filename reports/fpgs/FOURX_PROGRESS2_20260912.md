@@ -169,14 +169,26 @@ current free-body response, generalized integration and next kinetic state.
 The earlier .990811 ms allowance applied to a narrower proposal and is superseded
 for this expanded family by 1.634704 ms RTX. Even the matched cooperative owner
 alone costs 2.072576 ms RTX before live repair/demand/free-factor services, so
-the proposed 20% whole-physics gain is not established. The next study targets
-complete direct rigid-body services, not isolated factor or block-size tuning.
+the proposed 20% whole-physics gain is not established. The follow-up
+[typed free-state owner](FRANKA_TYPED_FREE_STATE_20260912.md) passes full GPU
+physical checks but costs2.158656/2.327040ms versus its matched cooperative
+2.064448/2.257536ms. Candidate held-free refresh is included while the old
+factor refresh is excluded, conservatively; even candidate owner time alone
+still exceeds the entire family allowance. It is not promoted. The next study
+targets a complete primary dynamics/response/state representation, not isolated
+factor or block-size tuning.
 
 Kuka's current-normal certificate family also remains scratch. Its first paired
 GPU gate stopped before timing on rare output disagreements (one RTX velocity
 coordinate, two GB coordinates; maximum 8.17e-5). Current same-order coefficient,
-trial-versus-full-eight and stream-ownership diagnosis is pending. No tolerance
-was widened and no performance result is claimed from that failed run.
+trial-versus-full-eight and stream-ownership diagnosis subsequently localizes
+the differences to J/Y/diag construction in retained rejected worlds. All8649
+accepted world-observations exactly match original eight sweeps on their own
+coefficients; serial and overlapped outputs also match. Metadata/RHS/selector/MF
+coefficients are exact. Completion/source/idle pass is not numerical acceptance:
+the diagnostic keeps its original-output acceptance flags false and reports
+focus-only physical metrics separately. Independent current-geometry physical
+assessment is in progress; no timing or tolerance waiver is claimed here.
 
 Evidence (large captures remain local):
 
