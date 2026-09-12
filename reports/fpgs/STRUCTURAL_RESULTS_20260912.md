@@ -408,6 +408,45 @@ of exact eligible-pair/query cache storage; this cost is not hidden. The separat
 MJWarp Allegro capacity calibration must not be misreported as calibration of
 this FPGS pool. No fresh balanced Allegro/MJWarp speedup is claimed here.
 
+A subsequent FPGS-specific full-run census and held-out seed-1 trial now validate
+public contact capacity **286,720** for the observed 16K Allegro workload.
+The held-out trial observes every original collision call: 800 during warmup,
+4,960 cumulatively through 1,000 steps and 40 profile steps. Actual rigid-contact
+peaks are 218,845 RTX / 219,246 GB; all raw overflow counters, four FPGS sticky
+flags and thirteen narrow-phase sticky flags are zero. Model, solver scratch,
+pipeline and public Contacts all use the requested capacity at both boundaries.
+This is roughly 31% headroom above observed demand, not a universal minimum.
+
+The inherited Allegro `collision_cfg=None` cannot receive the original nested
+Hydra override. The first trial failed before construction, with no collision
+observations; this was not buffer exhaustion. Its preserved replacement helper
+sets only Newton `model.rigid_contact_max` immediately before the source-pinned
+original FPGS constructor. Original arguments and signature are preserved, the
+constructor runs exactly once and is restored on exit, and Lab/configuration
+objects remain unchanged. Fourteen CPU tests pass independently twice, including
+the real default-None parse failure and actual CPU constructor/allocation chain.
+
+The six observed int32 contact-route arrays alone shrink by 317.8125 MiB.
+Including the source-mandatory 96 bytes/contact of public Contacts storage gives
+a conservative 1,589.0625 MiB payload reduction; optional attributes, allocator
+overhead and peak VRAM are not included. This is memory sizing, not a measured
+speedup: the diagnostic adds statistics work, and the earlier A/B timings above
+still use their original capacities.
+
+Broad/query/unresolved capacities remain 2,834,432; seed-1 demand peaks are
+401,722/401,751 broad/query entries and 311,421 unresolved entries. Static coherent
+pair keys remain 2,523,136 and are a different allocation domain. Their separate
+sizing question is not closed. Disabled row high-water telemetry is explicitly
+not collected; finite boundaries and sticky flags are not invented row counts.
+The full held-out trial and source/process guards pass, but no new trajectory
+or backend-parity claim follows.
+
+Successful capacity evidence: `/tmp/fpgs-allegro-public286720-seed1-20260912-02`,
+paired manifest `feb2078607d8a4a23ddfcefbf3bf54820d704a4b9c356f4168730d6bd8fc0410`.
+Reproduction remains local in `/tmp/fpgs-allegro-public-cap-v2-8SOf5v/READY.md`.
+Independent E2/capacity audit: `/tmp/fpgs-e2-allegro-completion-audit-uDawpS/AUDIT.md`,
+SHA `e2f55a3adfa1f20532f97865f04019e6f25f85abca8484d7465fc2fd9eb48a9a`.
+
 Reproduce with this branch's portable `compare_variants.py`, selecting the two
 source commits above and `--task allegro --num-envs 16384 --rounds 3
 --warmup-steps 200 --steps 1000 --profile-steps 40`, plus
