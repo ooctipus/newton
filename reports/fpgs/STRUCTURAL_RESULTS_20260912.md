@@ -295,8 +295,25 @@ wall throughput improves only about 3.7%. This is a structural gain, not the
 additional 2–4x target and not a new paired MJWarp comparison. Fresh loaded512
 checks now pass on both GPUs: current-range clear, prefix/tail ownership,
 private original-seven and clear+raw controls, independent J/held-H response,
-original solve continuation and all capacity flags. A population-only 4K loaded
-gate is being prepared before adding this experimental runtime to the handoff.
+original solve continuation and all capacity flags. The population-only 4K
+loaded gate subsequently FAILED its first independent diagonal assertion on
+both devices and remains preserved and incomplete. Offline decomposition finds
+178/183 rejected rows among 284,274/288,786: the oracle compared the diagonal
+to raw FP64 geometry, despite already admitting the published FP32 J difference
+in its separate geometry/response gates. All rows pass the diagonal formed from
+independently checked published J/Y at the unchanged tolerance. Geometry-error
+propagation accounts for almost all the discrepancy; diagonal accumulation is
+at normal FP32 scale. The unchanged original seven-kernel CPU replay also fails
+the old raw-geometry diagonal criterion (177 RTX rows). Its CPU/GPU results are
+not claimed bit-identical. Original same-GPU producer checks returned before
+the failing oracle assertion, but their arrays were not persisted separately.
+
+No runtime, failed helper or tolerance has changed. A fresh dependency-correct
+oracle with correlated-corruption negative controls must complete the full GPU
+gate before promotion. Diagnosis: `/tmp/fpgs-e2-diagonal-diagnosis-QzPrxh/FINDINGS.md`,
+SHA `d4b6486dd1fd2ee57902e543af440ec4ffa696881b74e87ae5dbfa22dd579af7`;
+failed run `/tmp/fpgs-compact-e2-loaded-paired-4096-01`, paired manifest
+`41e3f2ae19b190622dc1e9142316665d8f81040df89b3b465fcd44aa572344da`.
 The experimental commit is pushed to `ooctipus/fpgs-compact-coalesced-20260912`.
 
 The Keyboard broad-phase neighbor-list idea was closed before implementation:

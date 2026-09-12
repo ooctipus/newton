@@ -86,12 +86,36 @@ against the current root transform, concealing the internal mismatch.
 The positive control explicitly sends JOINT_PROPERTIES notification: mocap
 updates immediately and internal root xpos agrees after the next step; the
 other world remains unchanged. Root independently reread and reran both cases,
-producing byte-identical successful evidence. This verifies the small-model
-synchronization failure, NOT its presence or quantitative effect in the actual
-Keyboard task. That task's internal root readback is the next check; do not yet
-attribute all 4,269-versus-one terminations to this mechanism. No solver or Lab
-fix has been applied. The FK dirty mechanism itself correctly refreshes Newton
-body state; the missing propagation concerns the separate MJ representation.
+producing byte-identical successful evidence.
+
+A subsequent actual Keyboard GPU readback confirms the mismatch in all sixteen
+sampled roots per card, after 200 original warmup steps in a 512-world run.
+The live articulation mapping identifies FIXED roots (not inferred locked D6),
+each mapping to MJ mocap 1 and body 8. Current intended root and Newton public
+pose are exactly equal. MJ mocap and internal root instead disagree with them:
+
+| Sampled error, identical statistics on both cards | Minimum | Median | Maximum |
+| --- | ---: | ---: | ---: |
+| Root position, meters | 0.0154801 | 0.0277712 | 0.0480247 |
+| Root orientation, radians | 0.0519354 | 0.4792413 | 0.7180327 |
+
+The maximum rotation error is about 41 degrees. Queued model-change flags are
+empty; model and graph identities are preserved. The observer performs no extra
+forward, notification, reset, sensor refresh or physics call. Both children pass
+recording, finite/capacity, source and process-cleanup checks. Independent FP64
+recomputation of the saved transforms confirms exact Newton pose agreement;
+the observer's tiny Newton angle (at most 1.64e-7 rad) was mixed-host-dtype
+normalization error, not a runtime discrepancy.
+
+This proves an actual bridge inconsistency in the sampled 512-world run, not in
+every world of the earlier 4K capture. It does not quantify how much of the
+4,269-versus-one termination disparity it causes. The earlier timings remain
+measured costs, but are not accepted equivalent-physics backend comparisons.
+The FK dirty mechanism itself correctly refreshes Newton body state; the missing
+propagation concerns the separate MJ representation. No solver or Lab fix has
+been applied. Extending the earlier FPGS/collision-only change scope to the
+Newton-side MJWarp reset bridge has been requested; implementation awaits the
+user's answer. A corrected reset-distribution and timing run is still required.
 
 ## Evidence and reproduction
 
@@ -115,6 +139,14 @@ body state; the missing propagation concerns the separate MJ representation.
   Both cases and source guards pass. The earlier failed adapter expectation
   (`attempt01.json`) is retained: it mistakenly expected returned Newton poses
   to be stale too, before the final generic-FK publication was accounted for.
+- Actual task readback: `/tmp/fpgs-keyboard-root-readback-paired-512-01`;
+  paired manifest `6adcc915830b65dc0895f567f825099f64768ce5d0b6ef814b78fa9f7bc30f6a`.
+  Helper `/tmp/fpgs-keyboard-root-readback-KwwjYQ/observe.py`, SHA
+  `4180cccb9b912942050059531cc48eb1d791c1065fee7c075dace9a70bc00aa9`;
+  parent `ff51bd270667db19f2956a4d0cc4c8faba33e0eb1ed1c0519294dfd0ae547378`.
+  Five CPU tests pass independently twice. The independent saved-transform
+  audit is `RESULT.md` in that helper directory, SHA
+  `1a2c7a12f782187f776864b8265ccdf043a8f50dd3f722e10b56b8422cedb220`.
 - First attempt `...termination-4096-20260912-01` remains FAILED and preserved:
   both FPGS raw histories were saved, but cleanup accessed a manager already
   deleted by unchanged Lab close. No MJ run or successful parent is claimed.
@@ -126,6 +158,7 @@ Use fresh output paths and no other GPU owners:
 ```bash
 CUDA_VISIBLE_DEVICES='' uv run --no-project --python /home/octi/Projects/IsaacLab.wt/fpgs-opt-20260910/.venv/bin/python python /tmp/fpgs-keyboard-same-window-Afvp9L/analyze.py /tmp/fpgs-mj-keyboard-balanced-20260912-01 --output /tmp/fpgs-keyboard-same-window-new.json
 CUDA_VISIBLE_DEVICES='' uv run --no-project --python /home/octi/Projects/IsaacLab.wt/fpgs-opt-20260910/.venv/bin/python python /tmp/fpgs-keyboard-termination-v2-6OMNnO/run_pair.py --output /tmp/fpgs-keyboard-termination-new --timeout 1800
+CUDA_VISIBLE_DEVICES='' uv run --no-project --python /home/octi/Projects/IsaacLab.wt/fpgs-opt-20260910/.venv/bin/python python /tmp/fpgs-keyboard-root-readback-KwwjYQ/run_pair.py --output /tmp/fpgs-keyboard-root-readback-new --timeout 1200
 ```
 
 Large captures and source-pinned diagnostic helpers remain local. This report
