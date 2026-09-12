@@ -83,3 +83,41 @@ Default generated sources match the accepted42 controls, and the native
 full-step recurrence text is unchanged. Regression-first import fails on
 accepted42, where the new module is absent. Tests and compiler output do not
 establish loaded physical quality or a task-level speedup.
+
+## First loaded current-input result
+
+The frozen `d49d0715` runtime completed all four saved refresh/reuse cases on
+their original devices. Source guards, eager/two-graph agreement, immutable
+input checks and original-versus-saved output controls pass. Maximum split
+velocity difference is 7.16e-7 and dense impulse difference 5.54e-7; MF
+impulses are identical. Physical impulse-action reconstruction errors remain
+below 6e-7. The larger GB normal-velocity deficits already exist in the
+baseline and are essentially unchanged. These are loaded component checks,
+not downstream force/sensor or trajectory acceptance.
+
+Median event times below include preparation, paired hand and general MF
+nodes together. Each uses the original 16K grid and original captured world
+IDs, but **uncaptured non-MF worlds are empty in both arms**. Ordinary paired
+work is therefore absent. These one-substep, original-then-split samples
+cannot be converted into whole-physics gains or added to another profile.
+
+| Device / saved phase | Original us | Split us | Original / split |
+| --- | ---: | ---: | ---: |
+| RTX / refresh | 344.064 | 263.872 | 1.304x |
+| RTX / reuse | 239.648 | 238.944 | 1.003x |
+| GB300 / refresh | 406.560 | 442.400 | 0.919x |
+| GB300 / reuse | 310.400 | 396.912 | 0.782x |
+
+This does not clear the large-gain gate. One bounded diagnostic will separate
+preparation, paired and general cost, then retain only independent or coupled
+captured worlds to test the predicted fallback-tail explanation. These
+subset timings are diagnostic only, never a reduced-work performance claim.
+If the unchanged coupled tail dominates, stop this slice without grid tuning.
+
+Pinned reports:
+
+- `/tmp/fpgs-independent-components-loaded-20260912-01/gpu0/report.json`,
+  SHA256 `34c972521bf2d9bfde7223ecb918dab04c84180df01850e58a889566c6d5bc3f`.
+- `/tmp/fpgs-independent-components-loaded-20260912-01/gpu1/report.json`,
+  SHA256 `141014e492f8e67c4b891a143cc4794eac3e83724f24ba54eb369aa7abdd6c44`.
+- Replay and controls: `/tmp/fpgs-independent-components-replay-Jmjo9kWu/READY.md`.
