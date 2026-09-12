@@ -88,6 +88,18 @@ and their process groups are reaped. This is not a cross-backend trajectory or
 solver-parity claim. In particular, the RTX whole-environment wall result remains
 slower despite the much faster physics graph; do not advertise training speedup.
 
+The subsequent read-only wall audit found a material workload difference:
+FPGS enters the batched reset path on 966–977 of 1,000 timed steps, versus 24
+for MJWarp. This means at least one world resets, not that 97% of worlds fail.
+Inclusive reset host elapsed time is about 23.6 ms/step RTX and 20.0 ms GB for
+FPGS, versus about 0.56/0.52 ms for MJWarp. It includes nested GPU waits and
+must not be added to graph durations. The separate 40-step traces contain
+40 reset calls for FPGS and none for MJWarp; the RTX reset ranges contain about
+84–85 stream synchronizations per reset. Existing captures do not identify
+per-world reset causes or episode ages. A read-only termination-mask diagnostic
+is being prepared without changing task rules, actions or reset behavior.
+This is not evidence that Isaac Lab alone owns the end-to-end shortfall.
+
 Ten times the measured RTX MJWarp physics would require approximately 2.776 ms,
 versus the current 7.820 ms: about 5.044 ms / 64.5% further removal. The current
 contact and solve owners cannot deliver that alone. It is an architecture-wide
@@ -246,6 +258,25 @@ The modeled scalar-sector-request reduction is about 43%, not measured DRAM
 traffic or a proven explanation of elapsed time. The complete new clear and
 producer must be timed before claiming a gain; no block-size tuning grid follows.
 
+The single coalesced retry is now implemented in experimental commit
+`5777558f98739c8afade7f970d79dc8a4cf52044`. All 36 targeted tests pass on each
+actual GPU, including the complete clear/producer, original solver reset/notify,
+held mass and repeated graph controls. Its first complete same-capacity 4K
+screen (200 warmup / 40 synchronized / 40 graph steps) is:
+
+| Hardware | Retained A+B physics ms | A+B+coalesced contact ms | Ratio |
+| --- | ---: | ---: | ---: |
+| RTX PRO 6000 | 8.116740 | 7.408049 | 1.095665x |
+| GB300 | 7.582394 | 6.234964 | 1.216109x |
+
+All four captures pass capacity/finite-state checks and checked source/process
+guards; the parent is reaped. The added clear is charged. This removes about
+0.709 ms / 8.73% on RTX in one screening sample, after the first compact version
+showed no RTX gain. It is not a repeated retained result or the additional 2–4x
+target. A fresh loaded-input gate observes the actual clear independently and
+replays private clear+raw from the pre-clear seed; 12 CPU observer tests pass.
+Loaded GPU checks and repeated whole-step timing remain pending at this entry.
+
 The Keyboard broad-phase neighbor-list idea was closed before implementation:
 its measured 0.370/0.434 ms owner cannot meet a 10% whole-step milestone even if
 free. This is the systematic prevention of unproductive micro-optimization:
@@ -331,6 +362,13 @@ capacity reports are retained in these manifests:
   `2c567eaf412e3b16c16afe68281d941d64777b051d44bab95eb9def67c51b043`.
   Its `summary.json` has SHA256
   `434a8ec3b27a6a56370a5551f299fbe69c1c80877b3fa1459aa509d762f8657a`.
+- `/tmp/fpgs-keyboard-wall-audit-c27E1E/AUDIT.md`:
+  all twelve timed reset counters, trace containment and measurement limits.
+- `/tmp/fpgs-compact-coalesced-keyboard4k-first-ab-20260912-01/manifest.json`:
+  first complete coalesced-retry timing screen, not repeated promotion.
+- `/tmp/fpgs-compact-coalesced-gpu-tests-20260912-01/manifest.json` and
+  `/tmp/fpgs-compact-e2-loaded-2OBF0T/READY.md`:
+  36 GPU tests per device and source-frozen loaded-check observer.
 - `/tmp/fpgs-scalar-key-gpu-tests-20260912-02`:
   29 targeted scalar/publication/response/mass tests per GPU. The prior `-01`
   failure is retained: the root launcher named a nonexistent test module.
