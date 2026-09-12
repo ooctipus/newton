@@ -277,6 +277,25 @@ target. A fresh loaded-input gate observes the actual clear independently and
 replays private clear+raw from the pre-clear seed; 12 CPU observer tests pass.
 Loaded GPU checks and repeated whole-step timing remain pending at this entry.
 
+The subsequent three long alternating A/B rounds are complete (same 4K recipe,
+200 warmup / 1,000 synchronized / 40 graph steps). All 12 captures pass both
+capacity boundaries, finite-state checks and the checked source/process guards;
+the parent has been reaped. Medians are:
+
+| Hardware | A+B physics ms | A+B+coalesced physics ms | Physics ratio | A+B wall ms | Coalesced wall ms | Wall ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| RTX PRO 6000 | 7.804528 | 6.985432 | 1.117258x | 35.683837 | 34.405500 | 1.037155x |
+| GB300 | 7.238613 | 6.147953 | 1.177402x | 30.933954 | 29.811093 | 1.037666x |
+
+Thus the measured RTX reduction is 0.819096 ms / 10.50% of physics time, while
+wall throughput improves only about 3.7%. This is a structural gain, not the
+additional 2–4x target and not a new paired MJWarp comparison. Fresh loaded512
+checks now pass on both GPUs: current-range clear, prefix/tail ownership,
+private original-seven and clear+raw controls, independent J/held-H response,
+original solve continuation and all capacity flags. A population-only 4K loaded
+gate is being prepared before adding this experimental runtime to the handoff.
+The experimental commit is pushed to `ooctipus/fpgs-compact-coalesced-20260912`.
+
 The Keyboard broad-phase neighbor-list idea was closed before implementation:
 its measured 0.370/0.434 ms owner cannot meet a 10% whole-step milestone even if
 free. This is the systematic prevention of unproductive micro-optimization:
@@ -366,6 +385,12 @@ capacity reports are retained in these manifests:
   all twelve timed reset counters, trace containment and measurement limits.
 - `/tmp/fpgs-compact-coalesced-keyboard4k-first-ab-20260912-01/manifest.json`:
   first complete coalesced-retry timing screen, not repeated promotion.
+- `/tmp/fpgs-compact-coalesced-keyboard4k-balanced-20260912-01/manifest.json`:
+  three long alternating rounds, SHA256
+  `efa126b90f0ff441030cfa87922c9c54dbebf4cadf26952325726286e80c398c`.
+- `/tmp/fpgs-compact-e2-loaded-paired-512-01/paired.json`:
+  fresh loaded E2 gate, both devices pass, SHA256
+  `efdd4418bad6af5211d2abb33e7914a2b7eb86e5e6c3a5dabc5ff7325d733660`.
 - `/tmp/fpgs-compact-coalesced-gpu-tests-20260912-01/manifest.json` and
   `/tmp/fpgs-compact-e2-loaded-2OBF0T/READY.md`:
   36 GPU tests per device and source-frozen loaded-check observer.
