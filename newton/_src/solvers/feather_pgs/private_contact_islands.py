@@ -558,8 +558,9 @@ class PrivateContactIslands(FusedContactSolve):
         wp.launch(produce_fallback, dim=contacts.rigid_contact_max, inputs=[data, self.owner], device=device)
         wp.launch(mark_fallback, dim=contacts.rigid_contact_max, inputs=[data, self.owner], device=device)
 
-    def launch_solve(self, solver, dense_rhs, iterations, omega, friction_start_iteration, iteration_offset):
-        """Charge both disjoint private owners and the complete original fallback launch."""
+    @staticmethod
+    def _bind_solve(solver, dense_rhs, iterations, omega, friction_start_iteration, iteration_offset):
+        """Bind the original solve fields for either private contact representation."""
         solve = SolveData()
         fields = {
             "world_constraint_count": "constraint_count",
@@ -596,6 +597,11 @@ class PrivateContactIslands(FusedContactSolve):
         solve.omega = omega
         solve.friction_start_iteration = friction_start_iteration
         solve.iteration_offset = iteration_offset
+        return solve
+
+    def launch_solve(self, solver, dense_rhs, iterations, omega, friction_start_iteration, iteration_offset):
+        """Charge both disjoint private owners and the complete original fallback launch."""
+        solve = self._bind_solve(solver, dense_rhs, iterations, omega, friction_start_iteration, iteration_offset)
         device = solver.model.device
         wp.launch(
             self.scalar_kernel,

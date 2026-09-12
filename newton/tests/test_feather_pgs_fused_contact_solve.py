@@ -334,6 +334,7 @@ class TestFusedContactSolve(unittest.TestCase):
 
     def test_cuda_actual_full_solve_mixed_fallback_reset_notify_and_graphs(self):
         """Compare the complete original eight-sweep law with selected and dense-panel fallback worlds."""
+        dt = getattr(self, "solve_dt", 1 / 240)
         devices = wp.get_cuda_devices()
         if not devices:
             self.skipTest("The admitted native solver and event graphs require CUDA")
@@ -439,7 +440,7 @@ class TestFusedContactSolve(unittest.TestCase):
                     # ignored coefficient storage must not become a NaN operand.
                     solver._sparse_diagonal_row_jy.fill_(float("nan"))
                     solver._sparse_diagonal_row_dof.fill_(-25)
-                    solver.step(current, following, controls[index], contacts[index], 1 / 240)
+                    solver.step(current, following, controls[index], contacts[index], dt)
                     states[index] = [following, current]
                 compare()
                 np.testing.assert_array_equal(
@@ -451,8 +452,8 @@ class TestFusedContactSolve(unittest.TestCase):
                 solver.reset(current)
                 with wp.ScopedCapture(device=device) as capture:
                     solver.seed_double_buffer_events()
-                    solver.step(current, following, controls[index], contacts[index], 1 / 240)
-                    solver.step(following, current, controls[index], contacts[index], 1 / 240)
+                    solver.step(current, following, controls[index], contacts[index], dt)
+                    solver.step(following, current, controls[index], contacts[index], dt)
                 graphs.append(capture.graph)
             for _ in range(2):
                 for graph in graphs:
@@ -462,7 +463,7 @@ class TestFusedContactSolve(unittest.TestCase):
                 current, following = states[index]
                 # Captured stream events cannot be reused by an eager launch.
                 solver.seed_double_buffer_events()
-                solver.step(current, following, controls[index], None, 1 / 240)
+                solver.step(current, following, controls[index], None, dt)
                 states[index] = [following, current]
             self.assertIsNone(solvers[1]._fused_contact_solve_active)
             compare()

@@ -231,6 +231,7 @@ _PRISMATIC_PUBLICATION = os.environ.get("FEATHER_PGS_PRISMATIC_PUBLICATION", "0"
 _COMPACT_CONTACT_BOUNDARY = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_BOUNDARY", "0") == "1"
 _FUSED_CONTACT_SOLVE = os.environ.get("FEATHER_PGS_FUSED_CONTACT_SOLVE", "0") == "1"
 _PRIVATE_CONTACT_ISLANDS = os.environ.get("FEATHER_PGS_PRIVATE_CONTACT_ISLANDS", "0") == "1"
+_CONTACT_BLOCK = os.environ.get("FEATHER_PGS_CONTACT_BLOCK", "0") == "1"
 _DEBUG_CACHE = os.environ.get("FEATHER_PGS_DEBUG_CACHE") == "1"
 _DEBUG_CACHE_MODE = os.environ.get("FEATHER_PGS_DEBUG_CACHE_MODE", "")
 _DEBUG_DELAY = int(os.environ.get("FEATHER_PGS_DEBUG_DELAY", "0"))
@@ -2394,13 +2395,17 @@ class SolverFeatherPGS(SolverBase):
 
         self._fused_contact_solve = None
         self._fused_contact_solve_active = None
-        if (_FUSED_CONTACT_SOLVE or _PRIVATE_CONTACT_ISLANDS) and not (
+        if (_FUSED_CONTACT_SOLVE or _PRIVATE_CONTACT_ISLANDS or _CONTACT_BLOCK) and not (
             _FPGS_CAPTURE or _GROUPED_CHECK or _CHECK_ROWS or _CHECK_ROWS_FUSED
         ):
             from .fused_contact_solve import FusedContactSolve, supported  # noqa: PLC0415
 
             if supported(self):
-                if _PRIVATE_CONTACT_ISLANDS:
+                if _CONTACT_BLOCK:
+                    from .contact_block_owner import ContactBlockIslands  # noqa: PLC0415
+
+                    self._fused_contact_solve = ContactBlockIslands(self)
+                elif _PRIVATE_CONTACT_ISLANDS:
                     from .private_contact_islands import PrivateContactIslands  # noqa: PLC0415
 
                     self._fused_contact_solve = PrivateContactIslands(self)
