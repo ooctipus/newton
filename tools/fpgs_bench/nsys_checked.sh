@@ -18,7 +18,7 @@ while true; do
   case "${1:-}" in
     --broad-phase-output-max)
       wrapper_args+=("$1" "${2:?Supply a positive broad-phase output capacity}"); shift 2 ;;
-    --mjwarp-linesearch-fix)
+    --mjwarp-linesearch-fix|--allegro-compact-capacity)
       wrapper_args+=("$1"); shift ;;
     *) break ;;
   esac

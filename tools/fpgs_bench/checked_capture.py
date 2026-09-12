@@ -20,6 +20,7 @@ import importlib
 import inspect
 import json
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 from types import ModuleType
 
@@ -212,7 +213,7 @@ def check_collision(physics: str, manager, entry: dict) -> None:
         raise
 
 
-def install_boundary_check(harness: ModuleType, report: dict, save, get_manager, compat=None) -> None:
+def install_boundary_check(harness: ModuleType, report: dict, save, get_manager, compat=None, compact=None) -> None:
     """Wrap only the two existing post-warmup/post-profile metadata observations."""
     original = harness._model_meta
 
@@ -225,6 +226,8 @@ def install_boundary_check(harness: ModuleType, report: dict, save, get_manager,
                 raise RuntimeError("Unexpected extra metadata boundary in checked capture")
             metadata = original(physics)
             manager = get_manager()
+            if compact is not None:
+                entry["allegro_capacity"] = compact.snapshot(manager)
             if compat is not None:
                 supported = physics == "newton_mjwarp" and bool(compat.supports_model(manager._solver.mjw_model))
                 entry["mjwarp_linesearch_model_supported"] = supported
@@ -319,6 +322,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--checks-output", type=Path, required=True)
     parser.add_argument("--broad-phase-output-max", type=int)
     parser.add_argument("--mjwarp-linesearch-fix", action="store_true")
+    parser.add_argument("--allegro-compact-capacity", action="store_true")
     options, forwarded = parser.parse_known_args(argv)
     if options.broad_phase_output_max is not None and not 0 < options.broad_phase_output_max < 2**31:
         parser.error("--broad-phase-output-max must be a positive int32 capacity")
@@ -332,6 +336,15 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--mjwarp-linesearch-fix requires the newton_mjwarp backend")
     if "--trace-stats" in forwarded:
         parser.error("--trace-stats adds metadata reads inside timing; incompatible with boundary-only checks")
+    if options.allegro_compact_capacity:
+        required = {"--physics": "feather_pgs", "--num-envs": "16384", "--task": "Isaac-Reorient-Cube-Allegro"}
+        if options.broad_phase_output_max != 524288 or any(
+            forwarded.count(key) != 1
+            or forwarded.index(key) + 1 >= len(forwarded)
+            or forwarded[forwarded.index(key) + 1] != value
+            for key, value in required.items()
+        ):
+            parser.error("Compact capacity requires the exact checked 16K Allegro FPGS recipe and broad cap 524288")
     if forwarded.count("--output") != 1:
         parser.error("Forward exactly one explicit original --output")
     output_index = forwarded.index("--output") + 1
@@ -354,6 +367,7 @@ def main(argv: list[str] | None = None) -> int:
         "checks_output": str(checks),
         "capture_output": str(output),
         "mjwarp_linesearch_fix": options.mjwarp_linesearch_fix,
+        "allegro_compact_capacity": options.allegro_compact_capacity,
         "physics_work_modified": options.mjwarp_linesearch_fix,
         "physics_budgets_modified": False,
     }
@@ -364,6 +378,8 @@ def main(argv: list[str] | None = None) -> int:
 
     previous_argv = sys.argv
     pipeline_type, original_constructor = None, None
+    stack = ExitStack()
+    compact = None
     save()
     try:
         path = lab / HARNESS
@@ -382,14 +398,35 @@ def main(argv: list[str] | None = None) -> int:
         if Path(runtime_newton.__file__).resolve() != newton / "newton/__init__.py":
             raise RuntimeError("Capture imported the wrong Newton checkout")
         compat = install_linesearch_fix(report) if options.mjwarp_linesearch_fix else None
+
+        def get_manager():
+            return importlib.import_module("isaaclab_newton.physics").NewtonManager
+
+        if options.allegro_compact_capacity:
+            helper = Path(__file__).resolve().with_name("allegro_capacity.py")
+            helper_source = helper.read_bytes()
+            compact = ModuleType("_checked_allegro_capacity")
+            compact.__file__ = str(helper)
+            exec(compile(helper_source, str(helper), "exec"), compact.__dict__)
+            info = report["allegro_capacity"] = {"helper_sha256": hashlib.sha256(helper_source).hexdigest()}
+            compact.verify_sources(lab, compact.LAB_PINS)
+            compact.require_constructor(runtime_newton.CollisionPipeline, newton, "newton/_src/sim/collide.py")
+            stack.enter_context(
+                compact.scope(
+                    importlib.import_module("newton.solvers").SolverFeatherPGS,
+                    importlib.import_module("newton.geometry").NarrowPhase,
+                    newton,
+                    info,
+                    get_manager,
+                )
+            )
         if options.broad_phase_output_max is not None:
             pipeline_type = runtime_newton.CollisionPipeline
             original_constructor = install_broad_phase_limit(
                 pipeline_type, options.broad_phase_output_max, report, save
             )
-        install_boundary_check(
-            harness, report, save, lambda: importlib.import_module("isaaclab_newton.physics").NewtonManager, compat
-        )
+            configured_constructor = pipeline_type.__init__
+        install_boundary_check(harness, report, save, get_manager, compat, compact)
         sys.argv = [str(path), *forwarded]
         harness.main()
         if report["boundary_count"] != 2 or not all(entry["check_pass"] for entry in report["boundaries"]):
@@ -405,6 +442,17 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError("MJWarp compatibility helper changed during execution")
         if not output.is_file():
             raise RuntimeError("Original harness did not write its capture result")
+        if compact is not None:
+            compact.verify_sources(newton)
+            compact.verify_sources(lab, compact.LAB_PINS)
+            if sha(helper) != info["helper_sha256"]:
+                raise RuntimeError("Compact Allegro helper changed during capture")
+        if original_constructor is not None:
+            if pipeline_type.__init__ is not configured_constructor:
+                raise RuntimeError("Broad-phase constructor ownership changed")
+            pipeline_type.__init__ = original_constructor
+            original_constructor = None
+        stack.close()
         report.update(complete=True, check_pass=True)
         return 0
     except BaseException as error:
@@ -412,9 +460,15 @@ def main(argv: list[str] | None = None) -> int:
         raise
     finally:
         if original_constructor is not None:
-            pipeline_type.__init__ = original_constructor
+            if pipeline_type.__init__ is configured_constructor:
+                pipeline_type.__init__ = original_constructor
+            else:
+                report.update(complete=False, check_pass=False, error="Broad-phase constructor ownership changed")
         sys.argv = previous_argv
-        save()
+        try:
+            stack.close()
+        finally:
+            save()
 
 
 if __name__ == "__main__":

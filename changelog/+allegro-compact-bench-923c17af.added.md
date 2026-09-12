@@ -1,0 +1,1 @@
+Add an explicit source-pinned, checked Allegro benchmark capacity option that preserves sparse collision routing and validates actual constructor and boundary allocations without per-step diagnostics.

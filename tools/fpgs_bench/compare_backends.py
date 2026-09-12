@@ -269,6 +269,28 @@ def check_overflow_result(run: dict, drivers: dict[str, str]) -> None:
             or any(entry.get("mjwarp_linesearch_model_supported") is not True for entry in boundaries)
         ):
             raise RuntimeError(f"Checked capture did not bind the requested MJWarp line-search fix: {path}")
+    compact = run.get("allegro_compact_capacity", False)
+    if report.get("allegro_compact_capacity", False) is not compact:
+        raise RuntimeError("Compact Allegro choice differs from the parent request")
+    if compact:
+        import allegro_capacity  # noqa: PLC0415 - optional source-pinned benchmark extension
+
+        helper = Path(__file__).resolve().with_name("allegro_capacity.py")
+        info = report.get("allegro_capacity", {})
+        records = info.get("constructors", [])
+        if (
+            run["backend"] != "feather_pgs"
+            or info.get("helper_sha256") != drivers.get(str(helper))
+            or str(helper) not in drivers
+            or len(records) != 2
+            or any(
+                record.get("calls") != 1 or record.get("complete") is not True or record.get("restored") is not True
+                for record in records
+            )
+        ):
+            raise RuntimeError("Compact Allegro constructor evidence is incomplete")
+        for entry in boundaries:
+            allegro_capacity.validate_snapshot(entry.get("allegro_capacity"))
     requested = run.get("broad_phase_output_max")
     if requested is not None:
         capacity = report.get("collision_capacity", {})
@@ -307,6 +329,9 @@ def make_batch(
     """Preserve task budgets and record explicit storage or numerical compatibility choices."""
     task_name, attributes, recipe_flags = recipe_map(capture)[task]
     capacities = parse_capacities(args.capacity, args.task)[task][backend]
+    compact = getattr(args, "allegro_compact_capacity", False) and backend == "fpgs"
+    if compact:
+        capacities = {**capacities, "broad_phase_output_max": 524288}
     batch = []
     for gpu in devices:
         directory = output / f"round_{repeat + 1:02d}_{task}_{backend}_gpu{gpu['index']}"
@@ -354,6 +379,13 @@ def make_batch(
         fix = args.mjwarp_linesearch_fix and backend == "mjwarp"
         if fix:
             command.append("--mjwarp-linesearch-fix")
+        if compact:
+            if (
+                env.get("NEWTON_NARROW_PHASE_COHERENT_CONVEX") != "reject_only"
+                or env.get("NEWTON_NARROW_PHASE_THREADS_X") != "4"
+            ):
+                raise ValueError("Compact Allegro requires explicit C reject_only and the original worker multiplier 4")
+            command.append("--allegro-compact-capacity")
         command.extend(
             [
                 "--num-envs",
@@ -382,6 +414,7 @@ def make_batch(
                 "newton": backend,
                 "backend": BACKENDS[backend],
                 "mjwarp_linesearch_fix": fix,
+                "allegro_compact_capacity": compact,
                 "capture_check_mode": "checked" if args.check_overflow else "unchecked",
                 "gpu_index": gpu["index"],
                 "gpu_uuid": gpu["uuid"],
@@ -539,6 +572,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Opt in to the source-guarded MJWarp numerical line-search correction; incompatible with --allow-unchecked.",
     )
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument(
+        "--allegro-compact-capacity",
+        action="store_true",
+        help="Checked 16K Allegro FPGS only: source-pinned C, public 286720 / broad 524288, preserving sparse GJK before construction.",
+    )
     parser.add_argument("--num-envs", type=int, default=16384)
     parser.add_argument("--warmup-steps", type=int, default=200)
     parser.add_argument("--steps", type=int, default=40)
@@ -555,6 +593,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         setattr(args, name, getattr(args, name).expanduser().resolve())
     args.task = list(dict.fromkeys(args.task))
     capacities = parse_capacities(args.capacity, args.task)
+    if args.allegro_compact_capacity and (
+        args.task != ["allegro"] or args.num_envs != 16384 or not args.check_overflow or capacities["allegro"]["fpgs"]
+    ):
+        parser.error(
+            "--allegro-compact-capacity requires only Allegro at 16384 worlds, checked capture, and no separate FPGS capacity overrides"
+        )
     if not args.check_overflow and any(
         "broad_phase_output_max" in values for task in capacities.values() for values in task.values()
     ):
@@ -590,6 +634,12 @@ def main(argv: list[str] | None = None) -> int:
         files.extend(Path(__file__).resolve().with_name(name) for name in ("checked_capture.py", "nsys_checked.sh"))
     if args.mjwarp_linesearch_fix:
         files.append(Path(__file__).resolve().with_name("mjwarp_linesearch_compat.py"))
+    if args.allegro_compact_capacity:
+        import allegro_capacity  # noqa: PLC0415 - optional source-pinned benchmark extension
+
+        allegro_capacity.verify_sources(args.fpgs)
+        allegro_capacity.verify_sources(args.isaaclab, allegro_capacity.LAB_PINS)
+        files.append(Path(__file__).resolve().with_name("allegro_capacity.py"))
     drivers = file_hashes(files)
     if drivers[str(Path(capture.__file__).resolve())] != capture._loaded_source_sha256:
         raise RuntimeError("Isaac Lab helper changed while loading")

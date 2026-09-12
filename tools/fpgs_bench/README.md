@@ -231,3 +231,42 @@ tests cover all nine zone transitions, kinks, sub-ULP displacements and finite
 fallback while retaining original derivatives and nonfriction rows. They use
 the real public installer and have no scratch-directory or capture dependencies.
 Zero warning bits alone are not sufficient numerical acceptance.
+
+### Explicit compact Allegro C recipe
+
+`--allegro-compact-capacity` is restricted to checked 16,384-world Allegro
+captures using the source-pinned C rejection-only checkout (`fba9fead70d1`).
+It sets model contact capacity 286,720 before FPGS allocation and broad/query
+capacity 524,288 while explicitly preserving sparse GJK before construction.
+It leaves Lab's `collision_cfg=None`, full 2,834,432 input pairs, 2,523,136 C
+cache keys, original worker multiplier ×4 and solver budgets unchanged.
+Both existing metadata boundaries verify actual dependent allocations and
+dispatch. No per-step diagnostic work is added; this reuses earlier calibrated
+storage, not a new algorithm or performance result. No other FPGS capacity
+override or task may be combined with this option. MJWarp is unaffected.
+
+```sh
+uv run --no-project python tools/fpgs_bench/compare_backends.py \
+  --isaaclab /home/octi/Projects/IsaacLab.wt/fpgs-opt-20260910 \
+  --fpgs /home/octi/Projects/newton-fpgs-rejection-port-20260912 \
+  --mjwarp /home/octi/Projects/newton-fpgs-structural-handoff-20260912 \
+  --task allegro --allegro-compact-capacity --mjwarp-linesearch-fix \
+  --capacity allegro:mjwarp:njmax=112 --capacity allegro:mjwarp:nconmax=22 \
+  --fpgs-env 0:NEWTON_NARROW_PHASE_COHERENT_CONVEX=reject_only \
+  --fpgs-env 1:NEWTON_NARROW_PHASE_COHERENT_CONVEX=reject_only \
+  --repeats 1 --num-envs 16384 --warmup-steps 200 --steps 40 --profile-steps 40 \
+  --output-dir /tmp/allegro-compact-comparison-fresh
+```
+
+Run `test_allegro_capacity` from this tools directory with `PYTHONPATH` set to
+the pinned FPGS checkout and the reviewed Lab Python environment. It includes
+an actual CPU constructor control; hide CUDA explicitly. The constructor test
+uses a tiny model and tests sparse specialization, not full-run capacity demand.
+
+```sh
+cd tools/fpgs_bench
+CUDA_VISIBLE_DEVICES='' OPENBLAS_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONPATH=/home/octi/Projects/newton-fpgs-rejection-port-20260912 \
+  uv run --no-project --python /home/octi/Projects/IsaacLab.wt/fpgs-opt-20260910/.venv/bin/python \
+  python -m unittest test_allegro_capacity test_compare_backends test_checked_capture
+```
