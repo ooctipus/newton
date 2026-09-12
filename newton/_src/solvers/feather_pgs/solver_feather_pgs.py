@@ -2283,6 +2283,11 @@ class SolverFeatherPGS(SolverBase):
         )
         self._allocate_debug_buffers(model)
         self._scatter_armature_to_groups()
+        self._row_packets = None
+        if os.environ.get("FEATHER_PGS_LOCAL_ROW_PACKETS") == "1":
+            from .franka_row_packets import create_owner  # noqa: PLC0415
+
+            self._row_packets = create_owner(self)
         self._init_tiled_kernels(model)
         self._init_size_group_streams(model)
         self._dummy_contact_impulses = wp.zeros((1, 1), dtype=wp.float32, device=model.device)
@@ -2431,6 +2436,8 @@ class SolverFeatherPGS(SolverBase):
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         """Refresh cached solver data after supported model changes."""
+        if self._row_packets is not None:
+            self._row_packets.validate_notification()
         if self._fk_id_cache_enabled and flags & (
             ModelFlags.JOINT_PROPERTIES
             | ModelFlags.JOINT_DOF_PROPERTIES
@@ -5405,6 +5412,11 @@ class SolverFeatherPGS(SolverBase):
         self._pgs_solve_local_internal_warps_per_block = {}
         self._pgs_solve_local_internal_worlds_per_block = {}
         self._pgs_solve_local_pair_warps_per_block = {}
+        local_factory = _get_pgs_solve_local_owned_kernel
+        if self._row_packets is not None:
+            from .franka_row_packets import get_local_factory  # noqa: PLC0415
+
+            local_factory = get_local_factory()
         if self._local_internal_fast_path:
             for size, count in self._local_internal_art_counts.items():
                 if count > 0:
@@ -5418,7 +5430,7 @@ class SolverFeatherPGS(SolverBase):
                     warps_per_block = 2 if count % (2 * worlds_per_warp) == 0 else 1
                     self._pgs_solve_local_internal_warps_per_block[size] = warps_per_block
                     self._pgs_solve_local_internal_worlds_per_block[size] = warps_per_block * 32 // lanes_per_world
-                    self._pgs_solve_local_internal_kernels[size] = _get_pgs_solve_local_owned_kernel(
+                    self._pgs_solve_local_internal_kernels[size] = local_factory(
                         self.dense_max_constraints,
                         min(self._local_solve_max_rows, size),
                         size,
@@ -5433,7 +5445,7 @@ class SolverFeatherPGS(SolverBase):
                     solver_blocks = self._local_pair_solver_blocks[size]
                     warps_per_block = 2 if solver_blocks % 2 == 0 else 1
                     self._pgs_solve_local_pair_warps_per_block[size] = warps_per_block
-                    self._pgs_solve_local_pair_kernels[size] = _get_pgs_solve_local_owned_kernel(
+                    self._pgs_solve_local_pair_kernels[size] = local_factory(
                         self.dense_max_constraints,
                         self._local_solve_max_rows,
                         size,
@@ -5446,7 +5458,7 @@ class SolverFeatherPGS(SolverBase):
             for size, count in self._local_residual_art_counts.items():
                 if count > 0:
                     warps_per_block = self._local_residual_warps_per_block[size]
-                    self._pgs_solve_local_residual_kernels[size] = _get_pgs_solve_local_owned_kernel(
+                    self._pgs_solve_local_residual_kernels[size] = local_factory(
                         self.dense_max_constraints,
                         self._local_residual_max_rows,
                         size,
@@ -6148,11 +6160,14 @@ class SolverFeatherPGS(SolverBase):
                     iteration_offset,
                 ]
             )
+            outputs = [self.diag, self.impulses, self.v_out]
+            if self._row_packets is not None:
+                outputs.extend([self._row_packets.prefix, self._row_packets.packet])
             wp.launch_tiled(
                 kernel,
                 dim=[count // worlds_per_block],
                 inputs=inputs,
-                outputs=[self.diag, self.impulses, self.v_out],
+                outputs=outputs,
                 block_dim=32 * warps_per_block,
                 device=self.model.device,
             )
@@ -8994,11 +9009,14 @@ class SolverFeatherPGS(SolverBase):
         # the Cholesky kernels never read H when mass_update_mask is 0.
         if self._memset_stream is not None:
             with wp.ScopedTimer("DB_Memset", print=False, use_nvtx=self._nvtx, synchronize=False):
-                wp.copy(self._j_active_counts[self._buf_idx], self.constraint_count)
+                if self._row_packets is None:
+                    wp.copy(self._j_active_counts[self._buf_idx], self.constraint_count)
                 with wp.ScopedStream(self._memset_stream):
                     for size in self.size_groups:
                         if self._mass_update_global_flag:
                             self._H_bufs[self._buf_idx][size].zero_()
+                        if self._row_packets is not None:
+                            continue  # Private J is current; general active rows are cleared before materialization.
                         if self._sparse_diagonal_contact_solve and size == self._sparse_diagonal_response_size:
                             # Sparse response owns no dense J; its buffer is a one-float placeholder.
                             continue
@@ -10757,7 +10775,7 @@ class SolverFeatherPGS(SolverBase):
         dense_dropped_rows = self._row_dropped_dense if self._row_watermark else self._dummy_mf_slot_counter
         mf_dropped_rows = self._row_dropped_mf if self._row_watermark else self._dummy_mf_slot_counter
         propagation_dropped_rows = self._row_dropped_propagation if self._row_watermark else self._dummy_mf_slot_counter
-        j_buffers_zeroed = False
+        j_buffers_zeroed = self._row_packets is not None
         if self._compact_contact_boundary:
             from .compact_contact import clear_limit_prefix  # noqa: PLC0415
 
@@ -10772,6 +10790,8 @@ class SolverFeatherPGS(SolverBase):
         if _FPGS_CAPTURE:
             self._capture_contacts = contacts
             self._capture_state_in = state_in
+        if self._row_packets is not None:
+            self._row_packets.prepare_prefix(state_in, dt)
 
         drive_active = self.drive_mode == "physx_pgs" and self.drive_slot is not None
         if drive_active:
@@ -10861,7 +10881,7 @@ class SolverFeatherPGS(SolverBase):
         # slot index across steps.
 
         # Mimic (joint coupling) equality rows — static count per model.
-        if self._mimic_count > 0:
+        if self._mimic_count > 0 and self._row_packets is None:
             wp.launch(
                 allocate_mimic_slots,
                 dim=self._mimic_count,
@@ -11003,7 +11023,7 @@ class SolverFeatherPGS(SolverBase):
             )
 
         # Allocate and populate joint-limit rows per response-size group.
-        if self.enable_joint_limits and self._joint_limit_sizes:
+        if self.enable_joint_limits and self._joint_limit_sizes and self._row_packets is None:
             if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
                 for size in self.size_groups:
                     self.J_by_size[size].zero_()
@@ -11085,13 +11105,14 @@ class SolverFeatherPGS(SolverBase):
         # Unconditional: the phase-3 boundary must include position-limit
         # rows and remain valid when that family is disabled (when it is just
         # the current watermark at the start of the velocity-limit segment).
-        wp.launch(
-            snapshot_dense_phase_bound,
-            dim=self.world_count,
-            inputs=[self.slot_counter, 0],
-            outputs=[self.dense_phase_bounds],
-            device=model.device,
-        )
+        if self._row_packets is None:
+            wp.launch(
+                snapshot_dense_phase_bound,
+                dim=self.world_count,
+                inputs=[self.slot_counter, 0],
+                outputs=[self.dense_phase_bounds],
+                device=model.device,
+            )
 
         # Allocate + populate joint velocity-limit rows (per-DOF clamp on
         # |qdot_i| against model.joint_velocity_limit). Dense contact rows
@@ -11129,13 +11150,14 @@ class SolverFeatherPGS(SolverBase):
             )
 
         # Unconditional phase-5 boundary snapshot; dense contact rows start here.
-        wp.launch(
-            snapshot_dense_phase_bound,
-            dim=self.world_count,
-            inputs=[self.slot_counter, 1],
-            outputs=[self.dense_phase_bounds],
-            device=model.device,
-        )
+        if self._row_packets is None:
+            wp.launch(
+                snapshot_dense_phase_bound,
+                dim=self.world_count,
+                inputs=[self.slot_counter, 1],
+                outputs=[self.dense_phase_bounds],
+                device=model.device,
+            )
 
         if self._sparse_diagonal_contact_solve:
             wp.launch(
@@ -11259,7 +11281,9 @@ class SolverFeatherPGS(SolverBase):
                     self.J_by_size[size].zero_()
                 j_buffers_zeroed = True
 
-            if self._compact_contact_boundary:
+            if self._row_packets is not None:
+                self._row_packets.produce_contacts(state_in, state_aug, contacts, dt)
+            elif self._compact_contact_boundary:
                 from .compact_contact import launch_contacts  # noqa: PLC0415
 
                 launch_contacts(self, state_in, state_aug, contacts, contact_build_threads)
@@ -12254,13 +12278,16 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
-        wp.launch(
-            finalize_constraint_counts_with_status,
-            dim=self.world_count,
-            inputs=[self.slot_counter, max_constraints, 0],
-            outputs=[self.constraint_count, self._constraint_capacity_status],
-            device=model.device,
-        )
+        if self._row_packets is not None:
+            self._row_packets.finish_rows()
+        else:
+            wp.launch(
+                finalize_constraint_counts_with_status,
+                dim=self.world_count,
+                inputs=[self.slot_counter, max_constraints, 0],
+                outputs=[self.constraint_count, self._constraint_capacity_status],
+                device=model.device,
+            )
         if getattr(self, "_wr_world_contacts", None) is not None:
             # World rows: per-world contact lists for the sweep kernel (contacts are dense-routed and have slots now).
             self._wr_world_contact_counts.zero_()
@@ -12309,7 +12336,7 @@ class SolverFeatherPGS(SolverBase):
                 ],
                 device=model.device,
             )
-        if self._local_internal_fast_path:
+        if self._local_internal_fast_path and self._row_packets is None:
             self._local_general_world_count.zero_()
             wp.launch(
                 classify_local_solve_worlds,
@@ -12837,6 +12864,9 @@ class SolverFeatherPGS(SolverBase):
         return int(getattr(self, "_ink_rows", 0))
 
     def _stage4_hinv_jt_par_row(self, size: int):
+        if self._row_packets is not None:
+            self._row_packets.response(size)
+            return
         model = self.model
         n_arts = self.n_arts_by_size[size]
         J_world = self.J_world if self.J_world is not None else self.J_by_size[size]
@@ -12927,6 +12957,8 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage4_finalize_world_diag_cfm(self):
+        if self._row_packets is not None:
+            return  # Current row owner and general response each add CFM exactly once.
         if self._compact_contact_boundary:
             return  # Both complete owners already add the original row CFM exactly once.
         model = self.model
@@ -13039,6 +13071,9 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage4_compute_matrix_free_diag(self):
+        if self._row_packets is not None:
+            self._row_packets.diagonal()
+            return
         if self._compact_contact_boundary:
             from .compact_contact import produce_limit_response  # noqa: PLC0415
 
@@ -13125,6 +13160,17 @@ class SolverFeatherPGS(SolverBase):
         joint_limit_speculative_scale: float = 1.0,
         output=None,
     ):
+        if self._row_packets is not None:
+            if (
+                output is not None
+                or preserve_unreached_speculative
+                or apply_restitution
+                or bias_scale != 1.0
+                or joint_limit_speculative_scale != 1.0
+                or contact_speculative_scale != self.contact_speculative_scale
+            ):
+                raise RuntimeError("Private row packets require the original single position pass")
+            return
         model = self.model
         rhs_out = self.rhs if output is None else output
         if preserve_unreached_speculative:
@@ -13198,6 +13244,8 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage4_apply_world_contact_restitution(self, dt: float, *, matrix_free: bool) -> None:
         """Replace geometric contact bias for impacts selected from ``v_hat``."""
+        if self._row_packets is not None:
+            return  # The current packet producer applies the same incident-velocity law.
         if matrix_free:
             if self._sparse_diagonal_contact_solve:
                 wp.launch(
