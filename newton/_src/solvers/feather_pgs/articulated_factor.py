@@ -477,11 +477,11 @@ def get_predictor_kernel(max_links: int, dofs: int):
     return predictor
 
 
-def fused_dynamics_source(max_links: int, dofs: int) -> str:
+def fused_dynamics_source(max_links: int, dofs: int, *, subwarp_worlds: bool = False) -> str:
     """Fuse current inverse dynamics and held response into one reverse tree pass."""
     if not 0 < dofs < max_links <= 128:
         raise ValueError("Expected a bounded fixed-root zero/one-DOF tree")
-    return (
+    source = (
         _EXECUTION
         + f"\nconstexpr int LINKS = {max_links}, DOFS = {dofs}, KINEMATIC = {int(BodyFlags.KINEMATIC)};\n"
         + r"""
@@ -687,10 +687,95 @@ def fused_dynamics_source(max_links: int, dofs: int) -> str:
 """
         + _CLEANUP
     )
+    if not subwarp_worlds:
+        return source
+    execution = r"""
+#if defined(__CUDA_ARCH__)
+    const int tree = threadIdx.x / 8;
+    const int lane = threadIdx.x & 7;
+    const unsigned MASK = 0xffu << (tree * 8);
+    constexpr int WORKERS = 8;
+    #define FACTOR_SHARED __shared__
+    #define FACTOR_SYNC() __syncwarp(MASK)
+#else
+    const int tree = 0, lane = 0;
+    constexpr int WORKERS = 1;
+    #define FACTOR_SHARED
+    #define FACTOR_SYNC() ((void)0)
+#endif
+"""
+    original_storage = """    FACTOR_SHARED float inertia[LINKS * 36];
+    FACTOR_SHARED float force[LINKS * 6], response_force[LINKS * 6];
+    FACTOR_SHARED float motion[LINKS * 6], U[LINKS * 6];
+    FACTOR_SHARED float inverse[LINKS], reduced_rhs[LINKS];
+    FACTOR_SHARED int good;"""
+    subwarp_storage = """    struct TreeScratch {
+        float inertia[LINKS * 36];
+        float force[LINKS * 6], response_force[LINKS * 6];
+        float motion[LINKS * 6], U[LINKS * 6];
+        float inverse[LINKS], reduced_rhs[LINKS];
+        int good;
+    };
+    FACTOR_SHARED TreeScratch scratch[4];
+    auto& inertia = scratch[tree].inertia;
+    auto& force = scratch[tree].force;
+    auto& response_force = scratch[tree].response_force;
+    auto& motion = scratch[tree].motion;
+    auto& U = scratch[tree].U;
+    auto& inverse = scratch[tree].inverse;
+    auto& reduced_rhs = scratch[tree].reduced_rhs;
+    auto& good = scratch[tree].good;"""
+    original_projection = """            float value = 0.0f;
+            if (lane < 6) value = current.joint_S.data[dof][lane] * force[link * 6 + lane];
+            if (lane >= 8 && lane < 14) value = motion[link * 6 + lane - 8] * response_force[link * 6 + lane - 8];
+            value += __shfl_down_sync(0xffffffffu, value, 4, 8);
+            value += __shfl_down_sync(0xffffffffu, value, 2, 8);
+            value += __shfl_down_sync(0xffffffffu, value, 1, 8);
+            current_dot = __shfl_sync(0xffffffffu, value, 0);
+            held_dot = __shfl_sync(0xffffffffu, value, 8);"""
+    subwarp_projection = """            if (lane < 6) {
+                current_dot = current.joint_S.data[dof][lane] * force[link * 6 + lane];
+                held_dot = motion[link * 6 + lane] * response_force[link * 6 + lane];
+            }
+            current_dot += __shfl_down_sync(MASK, current_dot, 4, 8);
+            current_dot += __shfl_down_sync(MASK, current_dot, 2, 8);
+            current_dot += __shfl_down_sync(MASK, current_dot, 1, 8);
+            held_dot += __shfl_down_sync(MASK, held_dot, 4, 8);
+            held_dot += __shfl_down_sync(MASK, held_dot, 2, 8);
+            held_dot += __shfl_down_sync(MASK, held_dot, 1, 8);"""
+    for old, new in (
+        (_EXECUTION, execution),
+        (original_storage, subwarp_storage),
+        (original_projection, subwarp_projection),
+    ):
+        if source.count(old) != 1:
+            raise RuntimeError("Fused subwarp source ownership seam changed")
+        source = source.replace(old, new)
+    # Warp's CPU tiled launch executes only logical lane zero. Walk the batch
+    # there, including neighbors after an invalid tree, without CUDA changes.
+    source = source.replace(
+        "    const int owner = factor.art_ids.data[art];",
+        """#if !defined(__CUDA_ARCH__)
+    const int batch_end = art + 4 < factor.art_ids.shape[0] ? art + 4 : factor.art_ids.shape[0];
+    for (; art < batch_end; ++art) {
+#endif
+    const int owner = factor.art_ids.data[art];""",
+    )
+    source = source.replace(
+        "        FACTOR_SYNC();\n        return;",
+        """        FACTOR_SYNC();
+#if defined(__CUDA_ARCH__)
+        return;
+#else
+        continue;
+#endif""",
+    )
+    source = source.replace(_CLEANUP, "\n#if !defined(__CUDA_ARCH__)\n    }\n#endif\n" + _CLEANUP)
+    return source.replace("0xffffffffu", "MASK")
 
 
 @cache
-def get_fused_dynamics_kernel(max_links: int, dofs: int):
+def _get_fused_dynamics_kernel(max_links: int, dofs: int, subwarp_worlds: bool):
     """Refresh held factors and compute current tau/qdd in one owned tree pass.
 
     Launch tiled ``[groups]`` with block_dim=32 after current FK and original
@@ -699,7 +784,7 @@ def get_fused_dynamics_kernel(max_links: int, dofs: int):
     must not also execute. No selected ``body_ft_s`` storage is read or written.
     """
 
-    @wp.func_native(fused_dynamics_source(max_links, dofs))
+    @wp.func_native(fused_dynamics_source(max_links, dofs, subwarp_worlds=subwarp_worlds))
     def fused_native(
         factor: ArticulatedFactorData,
         art: int,
@@ -728,20 +813,43 @@ def get_fused_dynamics_kernel(max_links: int, dofs: int):
         body_mass: wp.array[float],
         compact_source: int,
     ):
-        art, _lane = wp.tid()
-        fused_native(
-            factor,
-            art,
-            _lane,
-            current,
-            body_I,
-            grouped_R,
-            drive_row_by_dof,
-            drive_K,
-            mass_mask,
-            inertia_terms,
-            body_mass,
-            compact_source,
-        )
+        group, logical_lane = wp.tid()
+        art = group
+        lane = logical_lane
+        if wp.static(subwarp_worlds):
+            art = group * 4 + logical_lane // 8
+            lane = logical_lane % 8
+        # The last CTA may contain fewer than four trees. This branch is
+        # uniform within each subgroup; collectives never name another tree.
+        if art < factor.art_ids.shape[0]:
+            fused_native(
+                factor,
+                art,
+                lane,
+                current,
+                body_I,
+                grouped_R,
+                drive_row_by_dof,
+                drive_K,
+                mass_mask,
+                inertia_terms,
+                body_mass,
+                compact_source,
+            )
 
     return fused_dynamics
+
+
+def get_fused_dynamics_kernel(max_links: int, dofs: int):
+    """Return the original one-tree/32-lane owner, tiled dim=[groups]."""
+    return _get_fused_dynamics_kernel(max_links, dofs, False)
+
+
+def get_subwarp_fused_dynamics_kernel(max_links: int, dofs: int):
+    """Return four eight-lane trees per CTA, tiled dim=[ceil(groups/4)].
+
+    Use block_dim=32 and the original fused input ABI. Each subgroup owns
+    independent refresh/valid state and private scratch. Sharing instructions
+    trades against four times the CTA shared storage; speed is not implied.
+    """
+    return _get_fused_dynamics_kernel(max_links, dofs, True)

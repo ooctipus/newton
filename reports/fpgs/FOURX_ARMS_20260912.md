@@ -165,3 +165,53 @@ publication. All 16 selected offline builds (four fused dynamics plus twelve
 response/consumer builds across the two architectures) have zero reported
 stack/spills. Full pre-commit passes. These are component/integration readiness
 checks, not a task-level trajectory acceptance or measured speedup.
+
+## Joint-owner retry: measured loss and bounded mapping test
+
+Frozen fused retry `3674ac60bad931dd4df8d460f8eca0fea065c3ee` uses the same
+accepted baseline, tool source and full-scale discovery protocol above. Only
+the candidate adds the factor and fused flags. Both tasks' source, idle,
+capacity and finite-state gates pass; physical acceptance remains pending.
+
+| Task / GPU | Baseline physics ms | Fused physics ms | Baseline / fused |
+| --- | ---: | ---: | ---: |
+| KukaAllegro / RTX | 16.047575 | 17.523972 | 0.916x |
+| KukaAllegro / GB300 | 15.716480 | 16.944491 | 0.928x |
+| Franka / RTX | 6.354392 | 6.729150 | 0.944x |
+| Franka / GB300 | 6.063712 | 6.397770 | 0.948x |
+
+Franka's local upper-response repair removes most of the first regression,
+but does not beat the accepted baseline. Kuka's fused owner now costs
+3.8974/2.6002 ms RTX/GB in summed node duration; its whitening bridge costs
+.4938/.5127 ms. These overlapping durations are not additive critical-path
+savings. The algorithmic reduction in tree traversals has not overcome its
+serial dependency chain and hardware mapping. Neither retry is promoted.
+
+The next bounded test is a single four-tree-per-warp mapping, enabled only
+by `FEATHER_PGS_ARTICULATED_SUBWARP=1`, which requires the fused flag. Each
+tree receives eight lanes for six-dimensional spatial arithmetic, with
+private shared storage and subgroup synchronization. Current equations,
+held-factor masks, bridge and fallback are unchanged. No lane/block grid
+is part of this experiment.
+
+This reduces inactive-lane instructions but quadruples per-CTA shared
+storage: 29,904 B for Kuka and 11,056 B for Franka, with 40 registers and
+zero stack/spills on both offline architectures. It is **not** an occupancy
+improvement: the Kuka estimate is about twelve resident trees versus
+thirteen before, and fewer resident warps. Lower latency hiding can erase
+the benefit. Only the complete live pipeline can establish a gain.
+
+All nine fused/subwarp controls pass on actual RTX PRO6000 and GB300,
+including a five-tree partial CTA, mixed current/held state, invalid
+neighbors, graph replay and recovery. The combined CPU suite reports
+22 passes and three CUDA-only skips, covered by those device runs. These
+are readiness checks, not numerical trajectory or performance acceptance.
+
+Local source-bound fused manifests:
+
+- `/tmp/fpgs-fourx-kuka-fused16k-20260912-01/manifest.json`,
+  SHA256 `c252d7ccae0eab05d206800c10bdc90328398117b62ff88cc9c658d259c34c9c`.
+- `/tmp/fpgs-fourx-franka-fused16k-20260912-01/manifest.json`,
+  SHA256 `d8cd7a7642e244d41e835239d6ce5c5ae3565860dd100dc483fa0dfa8376b63a`.
+- `/tmp/fpgs-articulated-subwarp-ready-GpSZuPAO/READY.md` records frozen
+  kernel/test hashes and offline resource evidence.

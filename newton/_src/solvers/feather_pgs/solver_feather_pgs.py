@@ -231,6 +231,7 @@ _PRISMATIC_PUBLICATION = os.environ.get("FEATHER_PGS_PRISMATIC_PUBLICATION", "0"
 _COMPACT_CONTACT_BOUNDARY = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_BOUNDARY", "0") == "1"
 _ARTICULATED_FACTOR = os.environ.get("FEATHER_PGS_ARTICULATED_FACTOR", "0") == "1"
 _ARTICULATED_FUSED = os.environ.get("FEATHER_PGS_ARTICULATED_FUSED", "0") == "1"
+_ARTICULATED_SUBWARP = os.environ.get("FEATHER_PGS_ARTICULATED_SUBWARP", "0") == "1"
 _DEBUG_CACHE = os.environ.get("FEATHER_PGS_DEBUG_CACHE") == "1"
 _DEBUG_CACHE_MODE = os.environ.get("FEATHER_PGS_DEBUG_CACHE_MODE", "")
 _DEBUG_DELAY = int(os.environ.get("FEATHER_PGS_DEBUG_DELAY", "0"))
@@ -5222,6 +5223,8 @@ class SolverFeatherPGS(SolverBase):
         self._articulated_factors = {}
         self._articulated_global_dofs = []
         self._articulated_legacy_joint_end = self.articulation_joint_end
+        if _ARTICULATED_SUBWARP and not _ARTICULATED_FUSED:
+            raise ValueError("Subwarp articulated dynamics requires the fused owner")
         if _ARTICULATED_FUSED and not _ARTICULATED_FACTOR:
             raise ValueError("Fused articulated dynamics requires the articulated factor owner")
         if not _ARTICULATED_FACTOR:
@@ -5287,7 +5290,11 @@ class SolverFeatherPGS(SolverBase):
         self, size: int, state_in: State, state_aug: State, control: Control, *, compact_source: bool
     ) -> None:
         """Own current torque, held factor refresh and predictor in one tree pass."""
-        from .articulated_factor import ArticulatedCurrentData, get_fused_dynamics_kernel  # noqa: PLC0415
+        from .articulated_factor import (  # noqa: PLC0415
+            ArticulatedCurrentData,
+            get_fused_dynamics_kernel,
+            get_subwarp_fused_dynamics_kernel,
+        )
         from .articulated_response import get_encoding_bridge_kernel, get_whitening_bridge_kernel  # noqa: PLC0415
 
         current = ArticulatedCurrentData()
@@ -5309,9 +5316,11 @@ class SolverFeatherPGS(SolverBase):
         current.joint_tau = state_aug.joint_tau
         current.joint_qdd = state_aug.joint_qdd
         plan = self._articulated_factors[size]
+        factory = get_subwarp_fused_dynamics_kernel if _ARTICULATED_SUBWARP else get_fused_dynamics_kernel
+        groups = (self.n_arts_by_size[size] + 3) // 4 if _ARTICULATED_SUBWARP else self.n_arts_by_size[size]
         wp.launch_tiled(
-            get_fused_dynamics_kernel(plan.max_links, size),
-            dim=[self.n_arts_by_size[size]],
+            factory(plan.max_links, size),
+            dim=[groups],
             inputs=[
                 plan.data,
                 current,
