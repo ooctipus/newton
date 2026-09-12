@@ -1,8 +1,9 @@
 # Private key contacts and compact coupled solve
 
 Status: initial GPU controls pass; early whole timing misses the structural
-milestone. Residual preparation/iteration diagnosis authorized at 09:04 UTC,
-2026-09-12. No new accepted performance gain or promotion.
+milestone. The paired residual phase diagnostic completed at 09:22 UTC,
+2026-09-12. Both geometry underfill and a sequential recurrence tail are
+identified. No new accepted performance gain or promotion.
 This is a structural producer-and-consumer replacement following the diagnosed
 loss in [the full-world fusion experiment](FUSED_CONTACT_SOLVE_20260912.md).
 It does not promote that slower implementation or reset the performance target.
@@ -217,3 +218,43 @@ The exact-label audit `388338bb0a559400bc1c91dd4ed39687e4642bafd2a2cfab882b532b9
 retains the existing process correlation and interval algebra; its three CPU
 controls pass independently. Node sums are not guaranteed critical-path savings.
 No Isaac Lab, MJWarp bridge, production pointer or accepted runtime changed.
+
+## Completed phase diagnosis, 09:22 UTC
+
+Two actual 4K checkpoints per card (calls 1600/1601, mass refresh/reuse) pass
+same-input original/traced eager and two-graph noninterference, source guards
+and current capacity checks. The diagnostic adds four lane-zero clock stamps
+at existing phase boundaries, without changing math or adding barriers. It is
+not a new whole-task physical or performance acceptance result.
+
+Summed per-world cycle shares are 18.8–19.1% initialization, 51.6–52.0%
+geometry and 28.9–29.6% recurrence/publication on RTX; GB is approximately
+17.7–18.2%, 55.5–55.9% and 26.3–26.4%. These sums are **not exclusive wall
+time**. Original whole-residual event medians are 137.248/162.832 us RTX and
+166.368/156.144 us GB. Traced median differences range from -0.62% to +1.24%;
+the trace has two fewer registers, unchanged 15568 shared bytes and no spills.
+
+The slowest recorded worlds spend 81–86% of their cycles in recurrence,
+including worlds with only 13–14 contacts. Maximum current counts are 32 RTX
+and 27 GB; this window does not sample the earlier greater-than-32 tail.
+Geometry packing is therefore a real aggregate inefficiency, but eliminating
+it alone is not a demonstrated route to the 0.917-ms RTX reduction required
+from this prototype. A lighter shared layout changes potential concurrency,
+not the serial dependency chain. Native PTX already uses shared loads/stores;
+integer shared-address aliases have not converted that chain to global memory.
+
+The residency-only retry is not selected. The next structural study must
+provide a concrete recurrence-latency mechanism as well as packed geometry,
+and charge their complete producer/consumer boundary against accepted E2.
+Eight sweeps, numerical/physical checks, RTX-minus-0.7-ms first milestone and
+GB no-regression remain unchanged; that milestone is not the final 2–4x goal.
+
+Local paired manifest:
+`/tmp/fpgs-private-residual-phase-paired-4096-20260912-01/manifest.json`, SHA256
+`c5b08759a511b9bac30d8b3d63694a16a8c7601703d5bca89d066ae0aa30dd28`.
+Independent 30-hash/phase/output-record audit:
+`/tmp/fpgs-private-residual-phase-audit-LCEeO2q1/FINDINGS.md`, SHA256
+`dc27eb2614744d6ddbd2cf2620939f6206d89825aac50ac94a0a1dfd8fe3a086`.
+Tail vectors and conditional cost model:
+`/tmp/fpgs-residual-geometry-diagnosis-n2mscw/PHASE.md`, SHA256
+`3fac471c37d3747bb6b409a525dcd103ee59461c2faf7bbd45e39bd5c3f0f919`.
