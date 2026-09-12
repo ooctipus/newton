@@ -74,11 +74,24 @@ resets already occur before A+B in corrected baseline108: round-one RTX/GB
 
 The contact disparity is a behavioral-quality concern, not permission to raise
 the threshold, suppress resets or assume either solver is the correct reference.
-Source inspection suggests a missing fixed-root reset-pose propagation into
-MJWarp mocap state. Runtime verification is pending: Newton's published body
-pose alone cannot settle it because that publication uses generic Newton FK,
-while internal MJ geometry may differ. Force publication, contact laws and
-trajectory differences remain alternatives until direct checks distinguish them.
+Source inspection identified a missing fixed-root reset-pose propagation into
+MJWarp mocap state, now reproduced in a small actual MJWarp-on-Warp-CPU test
+(CUDA hidden, not the native MuJoCo CPU solver). Both FIXED and fully locked D6
+articulation roots retain stale internal mocap/xpos after a root write, masked
+flags-zero reset, generic FK, and both interval-skipped and interval-refreshed
+solver steps. Internal root position error is 0.04288191 m. Returned Newton
+body poses have zero error because final publication runs generic Newton FK
+against the current root transform, concealing the internal mismatch.
+
+The positive control explicitly sends JOINT_PROPERTIES notification: mocap
+updates immediately and internal root xpos agrees after the next step; the
+other world remains unchanged. Root independently reread and reran both cases,
+producing byte-identical successful evidence. This verifies the small-model
+synchronization failure, NOT its presence or quantitative effect in the actual
+Keyboard task. That task's internal root readback is the next check; do not yet
+attribute all 4,269-versus-one terminations to this mechanism. No solver or Lab
+fix has been applied. The FK dirty mechanism itself correctly refreshes Newton
+body state; the missing propagation concerns the separate MJ representation.
 
 ## Evidence and reproduction
 
@@ -95,6 +108,13 @@ trajectory differences remain alternatives until direct checks distinguish them.
   `e64b545dab823a4df78facb7d5130e07ab6f518e7c84bb933ac7c97ed766451b`, parent SHA
   `115a09bdfde52572df0561c65cb474d9c9f8f445b70c3a751286dc9b8b18ca78`.
   Eight CPU tests pass independently twice.
+- Tiny runtime reproducer: `/tmp/fpgs-mj-root-reset-cpu-EeDChS/repro.py`, SHA
+  `5e70f87ea7158517fe3060e895bd13f62dcfdd31465409560acb2ed8ddba4782`.
+  Agent `result02.json` and independent `root_result03.json` are identical,
+  SHA `43074f353af6752959ff413c15329a9e585853ca4ed780198824ebe05dfe12b6`.
+  Both cases and source guards pass. The earlier failed adapter expectation
+  (`attempt01.json`) is retained: it mistakenly expected returned Newton poses
+  to be stale too, before the final generic-FK publication was accounted for.
 - First attempt `...termination-4096-20260912-01` remains FAILED and preserved:
   both FPGS raw histories were saved, but cleanup accessed a manager already
   deleted by unchanged Lab close. No MJ run or successful parent is claimed.
