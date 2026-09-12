@@ -382,6 +382,7 @@ def make_batch(
                 "newton": backend,
                 "backend": BACKENDS[backend],
                 "mjwarp_linesearch_fix": fix,
+                "capture_check_mode": "checked" if args.check_overflow else "unchecked",
                 "gpu_index": gpu["index"],
                 "gpu_uuid": gpu["uuid"],
                 "command": command,
@@ -519,15 +520,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="TASK:BACKEND:FIELD=VALUE",
         help="Explicit calibrated buffer capacity for both GPUs; does not validate absence of overflow.",
     )
-    parser.add_argument(
+    checking = parser.add_mutually_exclusive_group()
+    checking.add_argument(
         "--check-overflow",
+        dest="allow_unchecked",
+        action="store_false",
+        default=False,
+        help="Use required boundary warning/overflow checks (the default; retained for existing commands).",
+    )
+    checking.add_argument(
+        "--allow-unchecked",
         action="store_true",
-        help="Reject FPGS sticky row/contact flags and every MJWarp warning/overflow bit at existing metadata boundaries.",
+        help="Explicit legacy diagnosis only: bypass boundary checks and mark every capture/manifest unchecked.",
     )
     parser.add_argument(
         "--mjwarp-linesearch-fix",
         action="store_true",
-        help="Opt in to the source-guarded MJWarp numerical line-search correction; requires --check-overflow.",
+        help="Opt in to the source-guarded MJWarp numerical line-search correction; incompatible with --allow-unchecked.",
     )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--num-envs", type=int, default=16384)
@@ -535,8 +544,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=40)
     parser.add_argument("--profile-steps", type=int, default=40)
     args = parser.parse_args(argv)
+    args.check_overflow = not args.allow_unchecked
     if args.mjwarp_linesearch_fix and not args.check_overflow:
-        parser.error("--mjwarp-linesearch-fix requires --check-overflow")
+        parser.error("--mjwarp-linesearch-fix requires checked capture; remove --allow-unchecked")
     if min(args.repeats, args.num_envs, args.steps, args.profile_steps) < 1 or args.warmup_steps < 0:
         parser.error("Sample counts must be positive and warmup steps nonnegative")
     if len(set(args.gpus)) != len(args.gpus) or any(gpu < 0 for gpu in args.gpus):
@@ -548,7 +558,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if not args.check_overflow and any(
         "broad_phase_output_max" in values for task in capacities.values() for values in task.values()
     ):
-        parser.error("broad_phase_output_max requires --check-overflow; Lab configuration cannot accept this key")
+        parser.error("broad_phase_output_max requires checked capture; remove --allow-unchecked")
     return args
 
 
@@ -597,6 +607,7 @@ def main(argv: list[str] | None = None) -> int:
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "hostname": socket.gethostname(),
         "scope": "Existing task recipes; physics graphs only, not solver-accuracy, trajectory parity, or training throughput",
+        "capture_check_mode": "checked" if args.check_overflow else "unchecked",
         "software": software,
         "isaaclab": sources["isaaclab"],
         "newton": {name: sources[name] for name in roots},

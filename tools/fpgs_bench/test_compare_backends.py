@@ -76,7 +76,19 @@ class TestArgumentsAndHelpers(unittest.TestCase):
             (3, 16384, 200, 40, 40),
         )
         self.assertFalse(hasattr(args, "solver_attr"))
+        self.assertTrue(args.check_overflow)
+        self.assertFalse(args.allow_unchecked)
+        self.assertFalse(args.mjwarp_linesearch_fix)
+
+    def test_unchecked_requires_explicit_mutually_exclusive_choice(self):
+        """Permit legacy capture only on an explicit opt-out, never via an omitted option."""
+        args = driver.parse_args([*self.argv, "--allow-unchecked"])
+        self.assertTrue(args.allow_unchecked)
         self.assertFalse(args.check_overflow)
+        self.assertTrue(driver.parse_args([*self.argv, "--check-overflow"]).check_overflow)
+        for extra in (["--check-overflow", "--allow-unchecked"], ["--allow-unchecked", "--check-overflow"]):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                driver.parse_args(self.argv + extra)
 
     def test_keyboard_recipe_defaults_and_copy_isolation(self):
         """Add the SO101 typing task without changing any Lab recipe or nested flag map."""
@@ -162,13 +174,15 @@ class TestArgumentsAndHelpers(unittest.TestCase):
         """Reject the new key in legacy mode before it can reach Lab from_dict."""
         extra = ["--capacity", "ant:fpgs:broad_phase_output_max=65536"]
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            driver.parse_args(self.argv + extra)
+            driver.parse_args(self.argv + extra + ["--allow-unchecked"])
+        self.assertTrue(driver.parse_args(self.argv + extra).check_overflow)
         self.assertTrue(driver.parse_args(self.argv + extra + ["--check-overflow"]).check_overflow)
 
     def test_linesearch_fix_requires_checked_mode(self):
         """Require warning/overflow checks before selecting the numerical compatibility fix."""
         with self.assertRaises(SystemExit):
-            driver.parse_args([*self.argv, "--mjwarp-linesearch-fix"])
+            driver.parse_args([*self.argv, "--allow-unchecked", "--mjwarp-linesearch-fix"])
+        self.assertTrue(driver.parse_args([*self.argv, "--mjwarp-linesearch-fix"]).check_overflow)
         self.assertTrue(
             driver.parse_args([*self.argv, "--check-overflow", "--mjwarp-linesearch-fix"]).mjwarp_linesearch_fix
         )
@@ -719,7 +733,6 @@ class TestCompleteDriver(unittest.TestCase):
                 [
                     "--repeats",
                     "1",
-                    "--check-overflow",
                     "--capacity",
                     "anymald:fpgs:broad_phase_output_max=65536",
                 ]
@@ -728,8 +741,11 @@ class TestCompleteDriver(unittest.TestCase):
         )
         manifest = json.loads((self.output / "manifest.json").read_text())
         self.assertTrue(manifest["settings"]["check_overflow"])
+        self.assertFalse(manifest["settings"]["allow_unchecked"])
+        self.assertEqual(manifest["capture_check_mode"], "checked")
         self.assertEqual(len(manifest["drivers"]), 7)
         for run in manifest["runs"]:
+            self.assertEqual(run["capture_check_mode"], "checked")
             self.assertEqual(run["command"][1], str(Path(driver.__file__).with_name("nsys_checked.sh")))
             self.assertEqual(run["environment"]["FPGS_BENCH_ISAACLAB"], str(self.lab))
             self.assertEqual(
@@ -754,10 +770,26 @@ class TestCompleteDriver(unittest.TestCase):
         """Reject a successful child that never supplied its required checked report."""
         self.omit_checks = True
         with self.assertRaises(FileNotFoundError):
-            self.invoke(["--repeats", "1", "--check-overflow"])
+            self.invoke(["--repeats", "1"])
         self.capture._read_result.assert_not_called()
         self.assertEqual(json.loads((self.output / "manifest.json").read_text())["status"], "failed")
         self.assertFalse((self.output / "ratios.json").exists())
+
+    def test_explicit_unchecked_uses_legacy_and_marks_manifest(self):
+        """Retain requested historical diagnosis without implying checked evidence."""
+        self.omit_checks = True
+        self.assertEqual(self.invoke(["--repeats", "1", "--allow-unchecked"]), 0)
+        manifest = json.loads((self.output / "manifest.json").read_text())
+        self.assertEqual(manifest["capture_check_mode"], "unchecked")
+        self.assertTrue(manifest["settings"]["allow_unchecked"])
+        self.assertFalse(manifest["settings"]["check_overflow"])
+        self.assertEqual(len(manifest["drivers"]), 5)
+        for run in manifest["runs"]:
+            self.assertEqual(run["capture_check_mode"], "unchecked")
+            self.assertEqual(run["command"][1], str(self.harness / "nsys_run.sh"))
+            self.assertNotIn("overflow_check", run)
+            self.assertNotIn("FPGS_BENCH_RUN_SHA256", run["environment"])
+            self.assertFalse(run["mjwarp_linesearch_fix"])
 
     def test_linesearch_fix_only_reaches_mjwarp_and_is_source_bound(self):
         """Record the algorithm change only in the MJ arm while preserving budget declarations."""
@@ -831,7 +863,7 @@ class TestCompleteDriver(unittest.TestCase):
                 self.invalid_checks = mutate
                 destination = self.root / f"invalid-checks-{index}"
                 with self.assertRaisesRegex(RuntimeError, "Checked capture"):
-                    self.invoke(["--repeats", "1", "--check-overflow", "--output-dir", str(destination)])
+                    self.invoke(["--repeats", "1", "--output-dir", str(destination)])
                 self.assertFalse((destination / "ratios.json").exists())
                 self.assertEqual(json.loads((destination / "manifest.json").read_text())["status"], "failed")
         self.capture._read_result.assert_not_called()
@@ -873,8 +905,8 @@ class TestCompleteDriver(unittest.TestCase):
             self.assertEqual(env["FPGS_NSYS_TRACE_MODE"], "graph")
             self.assertEqual(env["PYTHONDONTWRITEBYTECODE"], "1")
             self.assertEqual(command[command.index("--seed") + 1], "0")
-            self.assertEqual(command[1], str(self.harness / "nsys_run.sh"))
-            self.assertNotIn("FPGS_BENCH_RUN_SHA256", env)
+            self.assertEqual(command[1], str(Path(driver.__file__).with_name("nsys_checked.sh")))
+            self.assertIn("FPGS_BENCH_RUN_SHA256", env)
             self.assertNotIn("--physics-attr", command)
             if not fpgs:
                 self.assertFalse(any(key.startswith(driver.FLAG_PREFIXES) for key in env))
@@ -893,7 +925,7 @@ class TestCompleteDriver(unittest.TestCase):
         self.assertTrue(manifest["hostname"])
         self.assertEqual(manifest["settings"]["task"], ["anymald", "ant"])
         self.assertEqual(manifest["backends"], driver.BACKENDS)
-        self.assertEqual(len(manifest["drivers"]), 5)
+        self.assertEqual(len(manifest["drivers"]), 7)
         self.assertEqual(set(manifest["source_checkouts"]), {"isaaclab", "fpgs", "mjwarp"})
         self.assertEqual(len(manifest["runs"]), 24)
         self.assertTrue(all(run["returncode"] == 0 for run in manifest["runs"]))

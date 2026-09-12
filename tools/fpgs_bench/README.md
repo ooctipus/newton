@@ -2,6 +2,13 @@
 
 This driver compares the handoff task recipes without editing Isaac Lab or tuning physics parameters. It loads `scripts/benchmarks/fpgs_profile/compare_gpus.py` from an explicit Lab checkout and uses that checkout's unchanged capture script, analyzer, source-digest helper, and result aggregation. Existing Lab recipes are preserved; Newton-only aliases are merged into an isolated copy, with conflicting definitions rejected. The driver and its CPU tests require only Python's standard library.
 
+Checked capture is the default: missing, failed or source-mismatched boundary
+warning/overflow evidence prevents timing acceptance and final ratios.
+`--check-overflow` remains accepted for existing commands. Only explicit
+`--allow-unchecked` selects the legacy diagnostic route, and it is mutually
+exclusive with `--check-overflow`. Numerical algorithm fixes remain separately
+opt-in; enabling checks does not install the MJWarp line-search correction.
+
 Prepare the selected Lab `.venv` beforehand with compatible Newton, Warp, MuJoCo, and MuJoCo Warp dependencies. `uv`, Nsight Systems (`nsys`), `nvidia-smi`, Bash, and dedicated idle GPUs must be available. Lab's graph-aware handoff harness must support `FPGS_NSYS_TRACE_MODE=graph` and strict direct-graph analysis. The driver uses `UV_NO_SYNC=1`; it does not install or synchronize dependencies. A CPU preflight queries the actual Lab uv interpreter for backend versions, verifies `sys.prefix` is the selected Lab `.venv`, and verifies each selected `newton.__file__`, with CUDA hidden. Inherited uv project/directory/isolated-runtime overrides are removed.
 
 Example after buffer calibration, from a Newton checkout containing this directory:
@@ -35,7 +42,8 @@ MJWarp accepts `njmax` and `nconmax`. Both accept Newton collision settings
 `rigid_contact_max` and `max_triangle_pairs`. Sizes must be positive integers.
 This does not admit timestep, substep, iteration, tolerance, or contact-law changes.
 The additional Newton `broad_phase_output_max` capacity requires
-`--check-overflow`. The unchanged Lab configuration rejects that new key,
+checked capture (the default) and is incompatible with `--allow-unchecked`.
+The unchanged Lab configuration rejects that new key,
 including Hydra `+` overrides, so the checked entrypoint instead passes this
 single allowlisted option directly to `Newton.CollisionPipeline` construction.
 It does not change Lab files or configuration objects. The original constructor
@@ -67,7 +75,8 @@ bound large-world tails. Record the largest observed demand, chosen capacity,
 reserve, world count, seeds and reset horizon for each accepted recipe.
 
 An experimental numerical line-search correction can be selected explicitly
-with `--mjwarp-linesearch-fix --check-overflow`. It is forwarded only to the
+with `--mjwarp-linesearch-fix` in checked mode. It is incompatible with
+`--allow-unchecked` and is forwarded only to the
 MJWarp arm, not to FPGS or the Lab harness arguments. The Newton-owned
 `mjwarp_linesearch_compat.py` installs the reviewed process-local correction
 before model/graph construction; installed packages and Lab files are not
@@ -81,7 +90,7 @@ Reports explicitly mark `mjwarp_linesearch_fix=true`,
 The parent binds those declarations and the helper hash before accepting results.
 Without this option the selected MJWarp algorithm remains unchanged.
 
-Use `--check-overflow` for the resulting timing comparison. Newton's
+The resulting timing comparison uses checked capture by default. Newton's
 `nsys_checked.sh` calls the selected Lab harness unchanged through
 `checked_capture.py`, wrapping only its existing post-warmup and post-profile
 metadata reads. At both boundaries it executes
@@ -115,15 +124,20 @@ iteration budgets or suppressing warnings is not a clean comparison.
 This checks available sticky flags within the admitted owners, not numerical
 convergence or universal coverage of every Newton collision feature. Full-run
 high-water calibration still determines appropriate sizes; boolean flags do
-not estimate demand. Legacy behavior remains the default when `--check-overflow` is omitted:
-the original Lab shell is used, and `status: complete` alone then establishes
-neither capacity safety nor warning-free execution.
+not estimate demand. Legacy behavior is available only with explicit
+`--allow-unchecked`: the original Lab shell is used, and the manifest and every
+run record `capture_check_mode: unchecked`; settings additionally retain
+`allow_unchecked: true` and `check_overflow: false`. This is for historical
+diagnosis, not an accepted capacity-clean benchmark. Its `status: complete`
+alone establishes neither capacity safety nor warning-free execution. The
+line-search correction and broad-output constructor override cannot be used
+through this unchecked route.
 
 The Newton-only alias `--task keyboard-so101` selects `IsaacContrib-Keyboard-SO101`, the SO101 robot typing a procedural keyboard, not keyboard teleoperation. It adds no solver attributes or task-specific flags on either backend. This is a heavier scene with a 108-DOF keyboard plus the 6-DOF robot; its environment default is 4,096 worlds, while this driver's global default remains 16,384. Start with an explicit `--num-envs 32` smoke test, then try `--num-envs 4096` before considering 16K. Do not reuse Anymal/Allegro parallel-row or in-kernel-response flags. The task builds an 8,192-snapshot IK reset buffer on first reset and can perform additional IK/forward work during later resets, so wall timings can have substantial reset overhead. Headless benchmarking needs no human input; the SO101 USD and dependencies must be available. FPGS and MJWarp retain their different task-preset solver settings, so their timing ratio is not solver-accuracy parity.
 
 Each backend batch starts one process per selected GPU concurrently, waits for the full batch, and then runs the other backend. Backend order reverses on alternate rounds (A/B, B/A, A/B for three rounds); no two profilers share one selected GPU. Existing output directories and all output locations inside source checkouts are rejected. Recorded process groups receive TERM even if their leader has already exited, then KILL if group members survive the bounded grace period; direct children are reaped. This also runs after spawn failures, interrupts, or SIGTERM. Cleanup signals are recorded in the manifest. SIGKILL or machine failure cannot be handled by a Python process; inspect remaining processes before resuming after either event.
 
-`manifest.json` records commands, explicit flags, GPU UUIDs, hostname, driver and Lab runtime package versions, exact source commits and dirty-tree digests (including untracked files), and driver/helper/harness hashes. Checked mode additionally pins both Newton wrapper files and, when selected, the line-search compatibility helper; it passes explicit Lab/Newton/source-hash environment values and removes inherited copies. It checks every guarded source before and after batches. `summary.json` retains graph medians/ranges/spreads, separate auxiliary-graph time, and unprofiled wall medians/ranges. `ratios.json` is written only after every required result passes the unchanged Lab analyzer/result checks, the optional overflow checks, and every round completes. Check `manifest.json` has `status: complete`; failed manifests and raw captures remain available for diagnosis.
+`manifest.json` records commands, explicit flags, GPU UUIDs, hostname, driver and Lab runtime package versions, exact source commits and dirty-tree digests (including untracked files), and driver/helper/harness hashes. Default checked mode additionally pins both Newton wrapper files and, when selected, the line-search compatibility helper; it passes explicit Lab/Newton/source-hash environment values and removes inherited copies. It checks every guarded source before and after batches. `summary.json` retains graph medians/ranges/spreads, separate auxiliary-graph time, and unprofiled wall medians/ranges. `ratios.json` is written only after every required result passes the unchanged Lab analyzer/result checks, the default boundary checks unless explicitly opted out, and every round completes. Require both `status: complete` and `capture_check_mode: checked` for checked evidence; failed manifests and raw captures remain available for diagnosis.
 
 Ratios compare physics-graph time, not equivalent solver accuracy or identical trajectories. Contact counts are diagnostic, not parity proof. Auxiliary sensor graphs are excluded from physics time and reported separately. Unprofiled environment-step wall time includes resets, events, and host work and is not reinforcement-learning training throughput. Cross-device simulations may follow different trajectories; per-device backend timings are not a same-input solver parity test.
 
@@ -134,7 +148,7 @@ uv run --no-project python -m unittest discover -s tools/fpgs_bench -p test_comp
 uv run --no-project python -m unittest discover -s tools/fpgs_bench -p test_checked_capture.py -v
 ```
 
-The tests mock all external process and GPU operations. They cover recipe/environment isolation, alternating paired starts, source and import guards, strict result-error propagation, checked helper routing, incomplete/failed or misbound overflow reports, output protection, and child cleanup failures. The checked-capture tests also run the shell against inert command stubs and execute a pinned fake harness to verify actual boundary hooks and unchanged argument forwarding. GPU measurement and combined-physics correctness remain separate validation gates.
+The tests mock all external process and GPU operations. They cover recipe/environment isolation, alternating paired starts, source and import guards, strict result-error propagation, default checked routing, explicit unchecked labeling, incomplete/failed or misbound overflow reports, output protection, and child cleanup failures. The checked-capture tests also run the shell against inert command stubs and execute a pinned fake harness to verify actual boundary hooks and unchanged argument forwarding. GPU measurement and combined-physics correctness remain separate validation gates.
 
 The optional line-search helper additionally has real CPU Warp kernel tests.
 Run these explicitly in the reviewed MuJoCo/MJWarp 3.12.0 environment; standard
