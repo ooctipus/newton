@@ -223,8 +223,15 @@ def run_original(data, aux):
 
 
 def run_candidate(data, aux):
-    """Execute both complete owners, leaving original contact allocation untouched."""
+    """Execute complete owners and the contact clear, leaving original allocation untouched."""
     install_prefix(data, aux)
+    wp.launch(
+        compact.clear_contact_response,
+        dim=(2, 256),
+        inputs=[aux.counts, aux.bounds, data.dense_group, data.J, data.Y],
+        block_dim=256,
+        device=aux.device,
+    )
     wp.launch(compact.produce_contacts, dim=16, inputs=[data], device=aux.device)
     wp.launch(
         compact.produce_limit_response,
@@ -645,6 +652,13 @@ class TestCompactContact(unittest.TestCase):
             graphs = []
             for _ in range(2):
                 with wp.ScopedCapture(device=device) as capture:
+                    wp.launch(
+                        compact.clear_contact_response,
+                        dim=(2, 256),
+                        inputs=[aux.counts, aux.bounds, candidate.dense_group, candidate.J, candidate.Y],
+                        block_dim=256,
+                        device=device,
+                    )
                     wp.launch(compact.produce_contacts, dim=16, inputs=[candidate], device=device)
                     wp.launch(
                         compact.produce_limit_response,

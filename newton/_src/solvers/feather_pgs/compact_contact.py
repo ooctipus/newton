@@ -139,8 +139,34 @@ def clear_limit_prefix(dense_groups: wp.array[int], J: wp.array3d[float], sparse
 
 
 @wp.kernel
+def clear_contact_response(
+    counts: wp.array[int],
+    bounds: wp.array2d[int],
+    groups: wp.array[int],
+    J: wp.array3d[float],
+    Y: wp.array3d[float],
+):
+    """Clear only current contact coefficients, with contiguous lanes within each world."""
+    world, lane = wp.tid()
+    start = wp.max(bounds[world, 1], 0)
+    end = wp.min(counts[world], J.shape[1])
+    if end <= start:
+        return
+    group = groups[world]
+    # The limit prefix already contains current J. Align the first coefficient
+    # tile down for coalescing, but never write its prefix lanes.
+    first = (start * 6 // 32) * 32
+    for coefficient in range(first + lane, end * 6, 256):
+        if coefficient >= start * 6:
+            row = coefficient // 6
+            dof = coefficient % 6
+            J[group, row, dof] = 0.0
+            Y[group, row, dof] = 0.0
+
+
+@wp.kernel
 def produce_contacts(data: ContactBoundaryData):
-    """Publish one complete allocated contact, including explicit absent dense response."""
+    """Publish one allocated contact after the current-contact dense zero owner."""
     contact = wp.tid()
     if contact >= wp.min(data.count[0], data.point0.shape[0]):
         return
@@ -158,6 +184,11 @@ def produce_contacts(data: ContactBoundaryData):
         body0 = data.shape_body[shape0]
     if shape1 >= 0:
         body1 = data.shape_body[shape1]
+    has_dense = False
+    if art0 >= 0 and body0 >= 0:
+        has_dense = data.response_dofs[art0] == 6
+    if art1 >= 0 and body1 >= 0:
+        has_dense = has_dense or data.response_dofs[art1] == 6
     normal = -data.normal[contact]
     point0 = data.point0[contact] - data.margin0[contact] * normal
     point1 = data.point1[contact] + data.margin1[contact] * normal
@@ -216,26 +247,29 @@ def produce_contacts(data: ContactBoundaryData):
             data.row_beta[world, output_row] = 0.0
             data.phi[world, output_row] = 0.0
             data.restitution[world, output_row] = 0.0
-        jacobian = _Vec6()
-        for dof in range(6):
-            value0 = float(0.0)
-            value1 = float(0.0)
-            bit = wp.uint32(1) << wp.uint32(dof)
-            if art0 >= 0 and body0 >= 0 and data.response_dofs[art0] == 6:
-                if (data.body_mask[body0] & bit) != wp.uint32(0):
-                    value0 = point_projection(data.motion[data.dof_start[art0] + dof], direction, p0, data.origin[art0])
-            if art1 >= 0 and body1 >= 0 and data.response_dofs[art1] == 6:
-                if (data.body_mask[body1] & bit) != wp.uint32(0):
-                    value1 = -point_projection(
-                        data.motion[data.dof_start[art1] + dof], direction, p1, data.origin[art1]
-                    )
-            jacobian[dof] = value0 + value1
-        response = solve_six(data.factor, group, jacobian)
         diagonal = float(0.0)
-        for dof in range(6):
-            data.J[group, output_row, dof] = jacobian[dof]
-            data.Y[group, output_row, dof] = response[dof]
-            diagonal += jacobian[dof] * response[dof]
+        if has_dense:
+            jacobian = _Vec6()
+            for dof in range(6):
+                value0 = float(0.0)
+                value1 = float(0.0)
+                bit = wp.uint32(1) << wp.uint32(dof)
+                if art0 >= 0 and body0 >= 0 and data.response_dofs[art0] == 6:
+                    if (data.body_mask[body0] & bit) != wp.uint32(0):
+                        value0 = point_projection(
+                            data.motion[data.dof_start[art0] + dof], direction, p0, data.origin[art0]
+                        )
+                if art1 >= 0 and body1 >= 0 and data.response_dofs[art1] == 6:
+                    if (data.body_mask[body1] & bit) != wp.uint32(0):
+                        value1 = -point_projection(
+                            data.motion[data.dof_start[art1] + dof], direction, p1, data.origin[art1]
+                        )
+                jacobian[dof] = value0 + value1
+            response = solve_six(data.factor, group, jacobian)
+            for dof in range(6):
+                data.J[group, output_row, dof] = jacobian[dof]
+                data.Y[group, output_row, dof] = response[dof]
+                diagonal += jacobian[dof] * response[dof]
         coord0 = -1
         coord1 = -1
         value0 = float(0.0)
@@ -363,6 +397,15 @@ def launch_contacts(solver, state_in, state_aug, contacts, workers):
     data.Y = solver.Y_by_size[6]
     data.shared_anchor = int(solver.contact_shared_anchor)
     data.friction_shared_anchor = int(solver.contact_friction_shared_anchor)
+    # Allocation has completed, but constraint_count is finalized later. Keep
+    # this clear and the following producer ordered on the current stream.
+    wp.launch(
+        clear_contact_response,
+        dim=(solver.world_count, 256),
+        inputs=[solver.slot_counter, solver.dense_phase_bounds, data.dense_group, data.J, data.Y],
+        block_dim=256,
+        device=solver.model.device,
+    )
     wp.launch(produce_contacts, dim=contacts.rigid_contact_max, inputs=[data], device=solver.model.device)
     # These original kernels encode schedule links into the freshly published
     # sparse DOF slots. Never overwrite those fields after this point.
