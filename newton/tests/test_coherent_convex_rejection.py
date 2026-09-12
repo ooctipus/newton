@@ -6,6 +6,7 @@
 import ast
 import inspect
 import os
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -178,8 +179,16 @@ def test_current_motion_and_query_graph(test, device):
     def run_original():
         for buffer in baseline:
             buffer.zero_()
-        wp.launch(original[0], dim=threads, inputs=[pair_array, count, *values, threads, *baseline], device=device)
-        wp.launch(original[1], dim=threads, inputs=[pair_array, *values, threads, *baseline], device=device)
+        wp.launch(
+            original[0],
+            dim=threads,
+            inputs=[pair_array, count, *values, threads, *baseline],
+            device=device,
+            block_dim=128,
+        )
+        wp.launch(
+            original[1], dim=threads, inputs=[pair_array, *values, threads, *baseline], device=device, block_dim=128
+        )
 
     def run_candidate():
         for buffer in candidate:
@@ -301,27 +310,41 @@ def test_pipeline_rejection_capacity_status(test, device):
     test.assertEqual(cache.data.query_slot.shape[0], narrow.split_query_results.shape[0])
     contacts, state = pipeline.contacts(), model.state()
     messages = StdOutCapture()
-    messages.begin()
-    try:
-        pipeline.collide(state, contacts)
-        test.assertGreater(int(pipeline.broad_phase_pair_count.numpy()[0]), pipeline.shape_pairs_max)
-        test.assertTrue(narrow.buffer_capacity_status()["broad_phase"])
-        with wp.ScopedCapture(device=device) as capture:
+    # Outer CheckOutput redirects fd1, but sys.stdout is its separate temporary
+    # descriptor. Capture fd1 itself so native printf cannot bypass this scope.
+    with patch.object(sys, "stdout", sys.__stdout__):
+        messages.begin()
+        try:
             pipeline.collide(state, contacts)
-        narrow.buffer_capacity_status(clear=True)
-        wp.capture_launch(capture.graph)
-        test.assertTrue(narrow.buffer_capacity_status()["broad_phase"])
-        # Keep the same captured graph and allocations, but remove all overlaps.
-        poses = state.body_q.numpy()
-        poses[:, 0] = 10.0 * (np.arange(len(poses)) + 1)
-        state.body_q.assign(poses)
-        wp.capture_launch(capture.graph)
-        test.assertEqual(int(pipeline.broad_phase_pair_count.numpy()[0]), 0)
-        test.assertTrue(narrow.buffer_capacity_status(clear=True)["broad_phase"])
-        wp.capture_launch(capture.graph)
-        narrow.check_buffer_capacity()
-    finally:
-        messages.end()
+            test.assertGreater(int(pipeline.broad_phase_pair_count.numpy()[0]), pipeline.shape_pairs_max)
+            test.assertTrue(narrow.buffer_capacity_status()["broad_phase"])
+            with wp.ScopedCapture(device=device) as capture:
+                pipeline.collide(state, contacts)
+            narrow.buffer_capacity_status(clear=True)
+            wp.capture_launch(capture.graph)
+            test.assertTrue(narrow.buffer_capacity_status()["broad_phase"])
+            # Keep the same captured graph and allocations, but remove all overlaps.
+            poses = state.body_q.numpy()
+            poses[:, 0] = 10.0 * (np.arange(len(poses)) + 1)
+            state.body_q.assign(poses)
+            wp.capture_launch(capture.graph)
+            test.assertEqual(int(pipeline.broad_phase_pair_count.numpy()[0]), 0)
+            test.assertTrue(narrow.buffer_capacity_status(clear=True)["broad_phase"])
+            wp.capture_launch(capture.graph)
+            narrow.check_buffer_capacity()
+        finally:
+            wp.synchronize_device(device)
+            captured = messages.end()
+    test.assertIn("Broad phase pair buffer overflowed", captured)
+    test.assertIn("Contact buffer overflowed", captured)
+    for line in captured.splitlines():
+        if line.startswith("Module") and "load on device" in line:
+            continue
+        if line.strip():
+            test.assertRegex(
+                line,
+                r"^Warning: (Broad phase pair buffer overflowed \d+ > 27776|Contact buffer overflowed \d+ > 16)\.$",
+            )
 
 
 class TestCoherentConvexRejection(unittest.TestCase):

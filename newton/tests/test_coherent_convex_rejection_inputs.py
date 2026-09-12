@@ -50,8 +50,16 @@ def test_current_vertices_scale_and_identity(test, device):
     def run_original():
         for buffer in baseline:
             buffer.zero_()
-        wp.launch(original[0], dim=threads, inputs=[pair_array, count, *values, threads, *baseline], device=device)
-        wp.launch(original[1], dim=threads, inputs=[pair_array, *values, threads, *baseline], device=device)
+        wp.launch(
+            original[0],
+            dim=threads,
+            inputs=[pair_array, count, *values, threads, *baseline],
+            device=device,
+            block_dim=128,
+        )
+        wp.launch(
+            original[1], dim=threads, inputs=[pair_array, *values, threads, *baseline], device=device, block_dim=128
+        )
 
     def run_candidate():
         for buffer in candidate:
