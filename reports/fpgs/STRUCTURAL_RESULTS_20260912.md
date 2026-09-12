@@ -48,8 +48,11 @@ Actual loaded-input producer controls now pass in two separate 512-world paired
 runs on both GPUs: five post-warmup checkpoints per child, 320 actual solver
 calls, original sparse-response and Stage 7 publication controls, and physical
 J6-plus-two-sparse-coefficient row diagnostics. Source, capacity and process
-ownership checks pass. The 4K loaded-input gate remains pending. Finite states
-and zero capacity flags alone do not establish numerical quality.
+ownership checks pass. The same loaded-input gate also passes at 4,096 worlds
+on both devices, with five checkpoints in each baseline/candidate child and all
+four FPGS / 13 collision flags clear. Independent 4K runs have different target
+positions and reset traces, so they are not matched-control trajectories.
+Finite states and zero capacity flags alone do not establish numerical quality.
 
 Independent rollout differences must not be attributed to the candidate without
 a control: two unmodified-path baseline runs also have different reset traces and
@@ -104,7 +107,7 @@ The additional 2x target against the fixed RTX baseline means approximately
 Do not restart the target from a slow prototype, count restored dropped work as
 an optimization gain, or assume one more producer specialization will reach it.
 
-The next Keyboard experiment changes the admitted keys' representation across
+The scalar Keyboard experiment changed the admitted keys' representation across
 both producers and real scalar mass/force consumers. It must exclude legacy
 masked spatial-inertia/composite readers before omitting their inputs, retain
 current public poses/velocities and sparse-contact geometry, and preserve cold
@@ -113,8 +116,17 @@ matrix stores or tuning the finalizer alone is not the proposed experiment.
 The six-DOF arm's selected-tau owner is not removable key work. Its source is now
 frozen at `382f659dbd01f6dea468db1ff37ee6ab88da1f31`, with 29 targeted tests
 passing on each actual GPU, including cold/reset/model-notification and real
-multi-stream graph execution. Loaded-task quality and first timing are still
-pending; no scalar-representation speedup is claimed yet.
+multi-stream graph execution. Loaded-task controls now pass at 512 worlds on
+both devices: all 108 scalar keys per world, actual current force/mass inputs,
+both refresh/held mass phases, canonical publication and unchanged eight sweeps.
+The first 4K graph A/B is only 1.01278x RTX / 0.99821x GB (one short sample),
+not the required large gain. Exact node-overlap accounting finds only
+0.302315/0.108459 ms exposed savings in the three replaced owners. Current
+canonical transforms and publication remain substantial; the legacy masked
+composite work was already mostly skipped. This direction is deferred, not
+micro-tuned. Reopening requires a different producer/consumer boundary with
+newly measured headroom. Different loaded contact counts prevent attributing
+every other-owner increase to this candidate.
 
 ANYmal's 18-DOF parallel solver owns about 4.075/4.459 ms in the fresh RTX/GB
 profiles. A source-isolated diagnostic records **every executed sweep's** fresh
@@ -149,9 +161,24 @@ zero arm coupling does not mean a contact is inactive. The measured seven-owner
 union is 1.782/1.896 ms, and 92.9% of sampled contact triples have zero J6 arm
 coupling. The first target is >=0.787 ms net RTX removal after charging all new
 producer, clear, prefix and synchronization costs. Its source is frozen at
-`48c0add23be9426cfff3a9fa5a6db02a3a2aea29`; device gates and timing are pending.
-Serializing three small solves per contact and losing old overlap are explicit
-risks to measure, not reasons to guess either success or failure.
+`48c0add23be9426cfff3a9fa5a6db02a3a2aea29`; 29 targeted device tests pass on
+each GPU. The first 4K graph A/B is 0.99923x RTX / 1.22409x GB (one short
+sample): no RTX gain, so it is not promoted. A successful source-bound node
+capture localizes the mismatch: the seven old owners' exposed time is
+1.782380/1.894629 ms; the complete three-owner replacement is
+1.716397/0.771274 ms. The new contact producer alone takes
+1.641485/0.693109 ms; prefix/clear and added idle time do not explain the RTX
+loss. Its actual 113/114-register kernels have zero reported local spill bytes.
+The old J-clear sum was almost entirely overlapped and cannot be credited as
+exposed savings. Raw-index warp mixing is being measured before selecting one
+causal retry; the earlier zero-J6 fraction is not itself a divergence diagnosis.
+
+The first loaded 512-world compact-contact quality run stops at the independent
+FP64 response oracle on both devices (maximum violating Y6 difference about
+1.28e-5/1.10e-5). The preceding actual/private/original-producer comparison had
+completed, but the full gate did not. Original failure snapshots are retained;
+geometry-rounding amplification versus a runtime error must be diagnosed before
+changing an oracle or claiming this candidate is quality-accepted.
 
 The Keyboard broad-phase neighbor-list idea was closed before implementation:
 its measured 0.370/0.434 ms owner cannot meet a 10% whole-step milestone even if
@@ -230,9 +257,23 @@ capacity reports are retained in these manifests:
 - `/tmp/fpgs-keyboard-quality-paired-512-01/paired.json` and
   `/tmp/fpgs-keyboard-quality-paired-512-02/paired.json`:
   actual loaded producer/physical diagnostics; independent rollout caveat above.
+- `/tmp/fpgs-keyboard-quality-paired-4k-01/paired.json`:
+  loaded producer checks at the actual 4K timing population, all children and
+  final source/process/idle checks pass; independent controls/resets differ.
 - `/tmp/fpgs-scalar-key-gpu-tests-20260912-02`:
   29 targeted scalar/publication/response/mass tests per GPU. The prior `-01`
   failure is retained: the root launcher named a nonexistent test module.
+- `/tmp/fpgs-scalar-key-quality-paired-512-01/paired.json` and
+  `/tmp/fpgs-scalar-key-keyboard4k-first-ab-20260912-01/manifest.json`:
+  loaded scalar quality and first integrated timing, respectively.
+- `/tmp/fpgs-scalar-key-attribution-HO3pyh/evidence.json`:
+  exact successful-NVTX-graph-launch node accounting, independently recomputed.
+- `/tmp/fpgs-compact-contact-keyboard4k-first-ab-20260912-01/manifest.json`
+  and `/tmp/fpgs-compact-contact-keyboard4k-nodes-20260912-01/manifest.json`:
+  first compact-owner graph A/B and separate node diagnosis.
+- `/tmp/fpgs-compact-contact-attribution-3LyzxT/DIAGNOSIS.md` and
+  `/tmp/fpgs-compact-loaded-paired-512-01/paired.json`:
+  cost diagnosis and retained unsuccessful loaded FP64-oracle gate.
 - `/tmp/fpgs-anymal-phase-paired16k-20260912-01/manifest.json`:
   source-isolated preparation/sweep/publication census, not performance timing.
 - `/tmp/fpgs-rejection-port-allegro16k-balanced-20260912-01/manifest.json`:
