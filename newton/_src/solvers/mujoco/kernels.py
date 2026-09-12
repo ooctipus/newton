@@ -391,6 +391,7 @@ def convert_newton_contacts_to_mjwarp_kernel(
     # Model:
     geom_bodyid: wp.array[int],
     body_weldid: wp.array[int],
+    body_dofnum: wp.array[int],
     body_invweight0: wp.array2d[wp.vec2],
     geom_condim: wp.array[int],
     geom_priority: wp.array[int],
@@ -506,11 +507,16 @@ def convert_newton_contacts_to_mjwarp_kernel(
         # A body is "immovable" in three cases:
         #  1. body < 0 → static shape (no body)
         #  2. BodyFlags.KINEMATIC → kinematic body (e.g. armature=1e10)
-        #  3. body_weldid == 0 → fixed root body (worldbody)
+        #  3. its welded ancestor has no DOFs, including fixed mocap roots
+        # Use the welded ancestor: a fixed child can still have dynamic response.
         # Pairs where both sides are immovable produce degenerate efc_D values
         # in MuJoCo's solver, so we skip them.
-        a_immovable = body_a < 0 or (body_flags[body_a] & BodyFlags.KINEMATIC) != 0 or body_weldid[mj_body_a] == 0
-        b_immovable = body_b < 0 or (body_flags[body_b] & BodyFlags.KINEMATIC) != 0 or body_weldid[mj_body_b] == 0
+        a_immovable = (
+            body_a < 0 or (body_flags[body_a] & BodyFlags.KINEMATIC) != 0 or body_dofnum[body_weldid[mj_body_a]] == 0
+        )
+        b_immovable = (
+            body_b < 0 or (body_flags[body_b] & BodyFlags.KINEMATIC) != 0 or body_dofnum[body_weldid[mj_body_b]] == 0
+        )
 
         if a_immovable and b_immovable:
             tid_to_cid[tid] = -1
