@@ -215,3 +215,46 @@ Local source-bound fused manifests:
   SHA256 `d8cd7a7642e244d41e835239d6ce5c5ae3565860dd100dc483fa0dfa8376b63a`.
 - `/tmp/fpgs-articulated-subwarp-ready-GpSZuPAO/READY.md` records frozen
   kernel/test hashes and offline resource evidence.
+
+## Four-tree result and checkpoint
+
+At the roughly 90-minute checkpoint, no new arm optimization is accepted.
+The bounded mapping `ec99bd7b` completed the same full16K protocol on both
+tasks and devices. All source/idle/capacity/finite gates pass.
+
+| Task / GPU | Baseline physics ms | Four-tree physics ms | Baseline / candidate |
+| --- | ---: | ---: | ---: |
+| KukaAllegro / RTX | 15.626680 | 20.849069 | 0.750x |
+| KukaAllegro / GB300 | 15.366343 | 17.665644 | 0.870x |
+| Franka / RTX | 6.390703 | 6.963304 | 0.918x |
+| Franka / GB300 | 6.061716 | 6.403551 | 0.947x |
+
+The four-tree fused owner itself takes 6.534810/3.560203 ms on Kuka and
+1.098412/.791200 ms on Franka (RTX/GB, eight calls per environment step).
+Actual loaded kernels confirm 40 registers, zero local memory, and the
+29,904/11,056 B shared footprints predicted before the test. There is no
+spill evidence. The mapping did not make the dependent tree boundary
+cheaper; lower warp residency and per-tree shared-memory/serial work are
+remaining mechanisms, not separately measured hardware-counter claims.
+No further lane/block search follows. Reopening articulated replacement
+requires a different producer/consumer boundary with new measured headroom.
+
+The first fused retry's independently correlated Franka audit also confirms
+that dynamics interval union grew .389334/.352144 ms, including lost overlap,
+while response plus local-solve union returned to baseline. The audit is at
+`/tmp/fpgs-franka-fused-attribution-M4xzUhyh/FINDINGS.md`, with full evidence
+SHA256 `164adf96fdd432f226dfabcab8f5412586f403a233aed16ecc21b3127f7a073a`.
+
+The next primary implementation addresses the broader Franka row boundary:
+current mimic and active-limit prefixes, typed contact packets, count/owner
+dispatch, and response inside the existing local solver. Fresh 512-world
+captures contain two mimic rows per world and mostly active-limit rows, so
+a contact-only rewrite would miss dominant work. That experiment is on a
+separate branch from accepted42, not this slower dynamics prototype.
+
+Four-tree manifests:
+
+- `/tmp/fpgs-fourx-kuka-subwarp16k-20260912-01/manifest.json`,
+  SHA256 `9f133bc7f4fa041f44b85bdeb7639dbe02b3e958ba164e6d9df2c18a859e146c`.
+- `/tmp/fpgs-fourx-franka-subwarp16k-20260912-01/manifest.json`,
+  SHA256 `45f740e69fb5b3a71e2aa45796a322f20852cf02120b55ac252f80c9cdc07e0c`.
