@@ -95,10 +95,13 @@ Inclusive reset host elapsed time is about 23.6 ms/step RTX and 20.0 ms GB for
 FPGS, versus about 0.56/0.52 ms for MJWarp. It includes nested GPU waits and
 must not be added to graph durations. The separate 40-step traces contain
 40 reset calls for FPGS and none for MJWarp; the RTX reset ranges contain about
-84–85 stream synchronizations per reset. Existing captures do not identify
-per-world reset causes or episode ages. A read-only termination-mask diagnostic
-is being prepared without changing task rules, actions or reset behavior.
-This is not evidence that Isaac Lab alone owns the end-to-end shortfall.
+84–85 stream synchronizations per reset. The subsequent
+[same-window and termination audit](KEYBOARD_WALL_GAP_20260912.md) now verifies
+graph/eager ownership and original per-world reset causes. Total world resets
+are similar, but FPGS has 4,269/4,267 RTX/GB contact-threshold events versus one
+for MJ on each device, spreading resets over 980/976 steps versus 24. This
+behavioral difference needs investigation before claiming contact parity; a
+fixed-root reset-pose propagation discrepancy in MJWarp is being checked.
 
 Ten times the measured RTX MJWarp physics would require approximately 2.776 ms,
 versus the current 7.820 ms: about 5.044 ms / 64.5% further removal. The current
