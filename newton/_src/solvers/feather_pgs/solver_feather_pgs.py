@@ -228,6 +228,7 @@ _GROUPED_MASS_ON = os.environ.get("FEATHER_PGS_GROUPED_MASS") == "1"
 _FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
 # Experimental Stage 7 producer partition, leaving all solve/mass budgets intact.
 _PRISMATIC_PUBLICATION = os.environ.get("FEATHER_PGS_PRISMATIC_PUBLICATION", "0") == "1"
+_COMPACT_CONTACT_BOUNDARY = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_BOUNDARY", "0") == "1"
 _DEBUG_CACHE = os.environ.get("FEATHER_PGS_DEBUG_CACHE") == "1"
 _DEBUG_CACHE_MODE = os.environ.get("FEATHER_PGS_DEBUG_CACHE_MODE", "")
 _DEBUG_DELAY = int(os.environ.get("FEATHER_PGS_DEBUG_DELAY", "0"))
@@ -2382,6 +2383,12 @@ class SolverFeatherPGS(SolverBase):
 
             self._simple_world_classifier = SimpleWorldClassifier(self)
             self._resolved_simple_worlds = self._simple_world_classifier.resolved
+
+        self._compact_contact_boundary = False
+        if _COMPACT_CONTACT_BOUNDARY and not (_GROUPED_CHECK or _CHECK_ROWS or _CHECK_ROWS_FUSED):
+            from .compact_contact import supported  # noqa: PLC0415
+
+            self._compact_contact_boundary = supported(self)
 
     def _update_kinematic_state(self) -> None:
         """Refresh cached kinematic flags and effective joint armature."""
@@ -8384,6 +8391,8 @@ class SolverFeatherPGS(SolverBase):
             with wp.ScopedTimer("S4_HinvJt_Diag_RHS", print=False, use_nvtx=self._nvtx, synchronize=False):
                 for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
                     with ctx:
+                        if self._compact_contact_boundary:
+                            continue  # Contact owner and bounded limit prefix publish the complete response.
                         if self._sparse_diagonal_contact_solve and size == self._sparse_diagonal_response_size:
                             continue
                         if size == self._paired_response_secondary_size:
@@ -8993,6 +9002,8 @@ class SolverFeatherPGS(SolverBase):
                         if self._sparse_diagonal_contact_solve and size == self._sparse_diagonal_response_size:
                             # Sparse response owns no dense J; its buffer is a one-float placeholder.
                             continue
+                        if self._compact_contact_boundary and size == 6:
+                            continue  # Complete contact stores; the next step clears only its limit prefix.
                         if _SKIP_J_CLEAR and (_ROWS_MASKED or _ROWS_NATIVE) and size <= 32:
                             continue
                         wp.launch(
@@ -10747,6 +10758,16 @@ class SolverFeatherPGS(SolverBase):
         mf_dropped_rows = self._row_dropped_mf if self._row_watermark else self._dummy_mf_slot_counter
         propagation_dropped_rows = self._row_dropped_propagation if self._row_watermark else self._dummy_mf_slot_counter
         j_buffers_zeroed = False
+        if self._compact_contact_boundary:
+            from .compact_contact import clear_limit_prefix  # noqa: PLC0415
+
+            wp.launch(
+                clear_limit_prefix,
+                dim=(self.world_count, 12),
+                inputs=[self._sparse_diagonal_dense_groups, self.J_by_size[6], self._sparse_diagonal_row_dof],
+                device=model.device,
+            )
+            j_buffers_zeroed = True
         self._deferred_row_launches = []
         if _FPGS_CAPTURE:
             self._capture_contacts = contacts
@@ -11238,7 +11259,11 @@ class SolverFeatherPGS(SolverBase):
                     self.J_by_size[size].zero_()
                 j_buffers_zeroed = True
 
-            if self._compact_contact_jacobian or self._sparse_diagonal_contact_solve:
+            if self._compact_contact_boundary:
+                from .compact_contact import launch_contacts  # noqa: PLC0415
+
+                launch_contacts(self, state_in, state_aug, contacts, contact_build_threads)
+            elif self._compact_contact_jacobian or self._sparse_diagonal_contact_solve:
                 wp.launch(
                     prepare_world_contact_rows,
                     dim=contact_build_threads,
@@ -12902,6 +12927,8 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage4_finalize_world_diag_cfm(self):
+        if self._compact_contact_boundary:
+            return  # Both complete owners already add the original row CFM exactly once.
         model = self.model
         wp.launch(
             finalize_world_diag_cfm,
@@ -13012,6 +13039,25 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage4_compute_matrix_free_diag(self):
+        if self._compact_contact_boundary:
+            from .compact_contact import produce_limit_response  # noqa: PLC0415
+
+            wp.launch(
+                produce_limit_response,
+                dim=(self.world_count, 12),
+                inputs=[
+                    self.dense_phase_bounds,
+                    self.constraint_count,
+                    self._sparse_diagonal_dense_groups,
+                    self.L_by_size[6],
+                    self.J_by_size[6],
+                    self.Y_by_size[6],
+                    self.row_cfm,
+                    self.diag,
+                ],
+                device=self.model.device,
+            )
+            return
         if self._paired_response_primary_size is not None:
             return
         self.diag.zero_()
