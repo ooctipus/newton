@@ -210,3 +210,42 @@ an instrumentation artifact. Both child processes were reaped and final
 source/idle checks passed. Preserve the failed evidence:
 `/tmp/fpgs-fused-contact-memcheck-20260912-01/manifest.json`, SHA256
 `a47f24b1ff9ce42ab27eb7fc6ddaf3f96fbf06a86d1c4528d7d81ebed671d90e`.
+
+### Allocation and graph-transition controls
+
+The numbered-graph/pointer control identified the first failing address as the
+original E2 constructor's `_fk_id_cache_valid`, allocated once and retained for
+the solver's lifetime. The failure occurs on original graph zero, before the
+fusion graph. It is not a new contact-buffer address. This narrows attribution;
+it does not prove an allocator or sanitizer bug.
+
+Disabling the Warp memory pool before either constructor removed the invalid
+device read and allowed all four graph replays and numerical comparisons to
+finish. That control still failed on invalid event waits in the fixture's final
+captured-to-eager transition. The fixture had reused captured maintenance-event
+handles for its final eager no-Contacts step. A symmetric test-only reseed before
+that eager step fixes the transition, without changing the solve, contacts,
+outputs or tolerances. The corrected test SHA256 is
+`3fed0c23410326513301a8dc31764282928ac01ee31177345edb2d5980b4e107`.
+
+With that fixture correction, the nonpooled memcheck passes on both GPUs:
+one unskipped full-step test and an explicit zero-error sanitizer summary per
+card. The matched pooled retry STILL reports the original E2 FK allocation
+availability error. Therefore the production pooled path remains unresolved;
+do not claim an unconditional memcheck pass or change production allocation
+policy based on this diagnostic. No Newton runtime or benchmark timing changed.
+
+All four paired diagnostic parents were reaped and source/idle guards passed:
+
+- Original pointer attribution, failed:
+  `/tmp/fpgs-fused-contact-memcheck-attribution-20260912-01/manifest.json`,
+  `5182da76f66e9242f6954333b99d209540ab4d2029929ba65b88b45717f4c750`.
+- Nonpooled, original fixture/event failure:
+  `/tmp/fpgs-fused-contact-memcheck-malloc-20260912-01/manifest.json`,
+  `c03d998f3821db5c7e6984f84f3d2622393faf257078bfa92ad52b3aeb157142`.
+- Nonpooled, corrected fixture, passed:
+  `/tmp/fpgs-fused-contact-memcheck-malloc-20260912-02/manifest.json`,
+  `697680a090299890bfe5a47fde1c23c8563001d564af90e6886cdc6d46dfe1bb`.
+- Pooled, corrected fixture, failed:
+  `/tmp/fpgs-fused-contact-memcheck-attribution-20260912-02/manifest.json`,
+  `639ef9f5154fddcc0a085c5162b223fc2d63a66893d04b85ccc4d08f2447784e`.

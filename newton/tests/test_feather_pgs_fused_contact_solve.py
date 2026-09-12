@@ -450,6 +450,8 @@ class TestFusedContactSolve(unittest.TestCase):
                 compare()
             for index, solver in enumerate(solvers):
                 current, following = states[index]
+                # Captured stream events cannot be reused by an eager launch.
+                solver.seed_double_buffer_events()
                 solver.step(current, following, controls[index], None, 1 / 240)
                 states[index] = [following, current]
             self.assertIsNone(solvers[1]._fused_contact_solve_active)
