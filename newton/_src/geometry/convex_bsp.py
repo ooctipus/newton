@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Experimental immutable-hull BSP support for the complete split-convex family."""
+"""Experimental FP32-filtered hull BSP with original support on ambiguous signs."""
 
 from functools import cache
 from typing import Any
@@ -22,29 +22,7 @@ from .types import GeoType
 
 
 @wp.func_native("""
-const double d[3] = {double(direction[0]), double(direction[1]), double(direction[2])};
-if (!::isfinite(d[0]) || !::isfinite(d[1]) || !::isfinite(d[2])) return 2;
-auto add = [](double a, double b) {
-#if defined(__CUDA_ARCH__)
-    return __dadd_rn(a, b);
-#else
-    volatile double c = a + b; return double(c);
-#endif
-};
-auto sub = [](double a, double b) {
-#if defined(__CUDA_ARCH__)
-    return __dsub_rn(a, b);
-#else
-    volatile double c = a - b; return double(c);
-#endif
-};
-auto mul = [](double a, double b) {
-#if defined(__CUDA_ARCH__)
-    return __dmul_rn(a, b);
-#else
-    volatile double c = a * b; return double(c);
-#endif
-};
+if (!::isfinite(direction[0]) || !::isfinite(direction[1]) || !::isfinite(direction[2])) return 2;
 auto addf = [](float a, float b) {
 #if defined(__CUDA_ARCH__)
     return __fadd_rn(a, b);
@@ -59,57 +37,19 @@ auto mulf = [](float a, float b) {
     volatile float c = a * b; return (float)(c);
 #endif
 };
-const float p0 = (float)(high[0]), p1 = (float)(high[1]), p2 = (float)(high[2]);
-const float a0 = mulf(p0, direction[0]), a1 = mulf(p1, direction[1]), a2 = mulf(p2, direction[2]);
+const float a0 = mulf(plane[0], direction[0]), a1 = mulf(plane[1], direction[1]), a2 = mulf(plane[2], direction[2]);
 const float value32 = addf(addf(a0, a1), a2);
 const float magnitude32 = addf(addf(::fabsf(a0), ::fabsf(a1)), ::fabsf(a2));
 // 16*eps covers coefficient conversion and five rounded operations. The
-// absolute term also covers FTZ of all three products. Nonzero stored plane
-// components are at least 2^-106, hence normal in FP32 before multiplication.
+// absolute term also covers FTZ of all three products. Host admission keeps
+// nonzero exact plane components at least 2^-106, normal before rounding.
 const float error32 = addf(mulf(0x1p-19f, magnitude32), 0x1p-120f);
 if (::isfinite(value32) && ::fabsf(value32) > error32) return value32 > 0.0f ? 1 : -1;
-const double b0 = mul(high[0], d[0]), b1 = mul(high[1], d[1]), b2 = mul(high[2], d[2]);
-const double value64 = add(add(b0, b1), b2);
-const double magnitude64 = add(add(::fabs(b0), ::fabs(b1)), ::fabs(b2));
-const double error64 = mul(0x1p-48, magnitude64);
-if (::fabs(value64) > error64) return value64 > 0.0 ? 1 : -1;
-// Six exact products (two FP64 coefficient limbs times three FP32 inputs).
-// All exponents lie strictly inside normal FP64 range. Grow-expansion with
-// explicit RN TwoSum and FMA TwoProduct preserves their exact sum and zero.
-double expansion[12];
-int length = 0;
-for (int term = 0; term < 6; ++term) {
-    const double coefficient = term < 3 ? high[term] : low[term - 3];
-    const double operand = d[term % 3];
-    const double product = mul(coefficient, operand);
-    const double residual = ::fma(coefficient, operand, -product);
-    for (int part = 0; part < 2; ++part) {
-        double q = part == 0 ? residual : product;
-        int out = 0;
-        const int old_length = length;
-        for (int j = 0; j < old_length; ++j) {
-            const double item = expansion[j];
-            const double total = add(q, item);
-            const double bv = sub(total, q);
-            const double av = sub(total, bv);
-            const double br = sub(item, bv);
-            const double ar = sub(q, av);
-            const double error = add(ar, br);
-            if (error != 0.0) expansion[out++] = error;
-            q = total;
-        }
-        if (q != 0.0 || out == 0) expansion[out++] = q;
-        length = out;
-    }
-}
-for (int j = length - 1; j >= 0; --j) {
-    if (expansion[j] > 0.0) return 1;
-    if (expansion[j] < 0.0) return -1;
-}
-return 0;
+// Ambiguity, including true zero, uses the unchanged original support scan.
+return 2;
 """)
-def _adaptive_sign(high: wp.vec3d, low: wp.vec3d, direction: wp.vec3) -> int:
-    """Return an exact plane sign for admitted coefficients, or two for nonfinite input."""
+def _filtered_sign(plane: wp.vec3, direction: wp.vec3) -> int:
+    """Return a certified sign for an admitted rounded plane, or two for fallback."""
     ...
 
 
@@ -117,8 +57,7 @@ def _adaptive_sign(high: wp.vec3d, low: wp.vec3d, direction: wp.vec3) -> int:
 class _BspData:
     mesh_ids: wp.array[wp.uint64]
     roots: wp.array[int]
-    plane_high: wp.array[wp.vec3d]
-    plane_low: wp.array[wp.vec3d]
+    plane: wp.array[wp.vec3]
     node_plane: wp.array[int]
     children: wp.array[wp.vec2i]
     valid: wp.array[int]
@@ -177,7 +116,7 @@ def _query(data: _BspData, root: int, direction: wp.vec3) -> int:
     index = root
     while index >= 0:
         plane = data.node_plane[index]
-        sign = _adaptive_sign(data.plane_high[plane], data.plane_low[plane], direction)
+        sign = _filtered_sign(data.plane[plane], direction)
         if sign == 2:
             return -1
         pair = data.children[index]
@@ -252,7 +191,7 @@ class _BspOwner:
 
         meshes = {mesh.id: mesh for mesh in model._mesh_keep_alive}
         pointers = np.unique(model.shape_source_ptr.numpy()[model.shape_type.numpy() == GeoType.CONVEX_MESH])
-        ids, roots, highs, lows, planes, children = [], [], [], [], [], []
+        ids, roots, rounded, planes, children = [], [], [], [], []
         self.metadata = {"admitted_meshes": [], "unsupported_meshes": [], "invalidated": False}
         for pointer in sorted(int(p) for p in pointers if int(p) in meshes):
             mesh = meshes[pointer]
@@ -269,9 +208,8 @@ class _BspOwner:
             start = len(children)
             for plane, positive, negative in tree["nodes"]:
                 if plane not in plane_map:
-                    plane_map[plane] = len(highs)
-                    highs.append(tree["rounded64"][plane])
-                    lows.append(tree["plane_low"][plane])
+                    plane_map[plane] = len(rounded)
+                    rounded.append(tree["rounded"][plane])
                 planes.append(plane_map[plane])
                 children.append(
                     (positive + start if positive >= 0 else positive, negative + start if negative >= 0 else negative)
@@ -290,8 +228,7 @@ class _BspOwner:
         device = model.device
         self.data.mesh_ids = wp.array(ids, dtype=wp.uint64, device=device)
         self.data.roots = wp.array(roots, dtype=int, device=device)
-        self.data.plane_high = wp.array(np.asarray(highs).reshape(-1, 3), dtype=wp.vec3d, device=device)
-        self.data.plane_low = wp.array(np.asarray(lows).reshape(-1, 3), dtype=wp.vec3d, device=device)
+        self.data.plane = wp.array(np.asarray(rounded).reshape(-1, 3), dtype=wp.vec3, device=device)
         self.data.node_plane = wp.array(planes, dtype=int, device=device)
         self.data.children = wp.array(np.asarray(children).reshape(-1, 2), dtype=wp.vec2i, device=device)
         self.data.valid = wp.full(1, 1, dtype=int, device=device)
@@ -300,8 +237,7 @@ class _BspOwner:
             for a in (
                 self.data.mesh_ids,
                 self.data.roots,
-                self.data.plane_high,
-                self.data.plane_low,
+                self.data.plane,
                 self.data.node_plane,
                 self.data.children,
                 self.data.valid,

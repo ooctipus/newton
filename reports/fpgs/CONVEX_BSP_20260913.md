@@ -1,5 +1,49 @@
 # Experimental complete split-convex BSP support
 
+## FP32-only successor (current branch; CUDA unvalidated)
+
+This section supersedes the adaptive-runtime description below; the remainder
+preserves the original `c26ac5` experiment and its provenance. The successor is
+based directly on that frozen commit, without benchmark, hull, capacity, solver,
+factory, admission or invalidation changes.
+
+The source-identical actual node experiment found covered cold GJK/MPR/manifold
+cost increasing from 2.924756 to 6.402575 ms on RTX and from 3.689429 to
+4.942409 ms on GB. Generated sm120 PTX loaded all six double coefficient limbs
+and stored nine local doubles before reaching the FP32 fast decision. Evidence:
+`/tmp/fpgs-convex-bsp-allegro-candidate-nodes-paired16k-20260913-01/DIAGNOSIS.md`,
+SHA `3af7012a4227fe07ee7a77b881553cd73e83389addb03299b33c80bdbc805a6d`.
+These are diagnostic node costs, not throughput or hardware counters.
+
+The successor uploads only one rounded FP32 vec3 per exact static plane. Native
+queries retain the same explicit RN FP32 `16*eps32` work bound plus
+`64*FLT_MIN` allowance. A certified sign descends the unchanged exact tree;
+every ambiguous, zero, overflowing or nonfinite result immediately invokes the
+unchanged original support callback. No FP64 or expansion evaluation, low-limb
+descriptor, guessed sign or approximate hull remains in the device path. The
+exact host builder and its coefficient-range admission remain unchanged.
+Static descriptor storage falls from 75,784 to 32,440 bytes for the ten actual
+hulls; neither allocation is per-world.
+
+Regression first rejected the old high/low descriptor. All ten CPU BSP tests
+then passed, including 11,394 actual-hull and 104,892 historical directions,
+shared multimesh/current nonuniform-scale lookup, lean/full and coherent complete
+contact factories, primitive and invalidation controls. Certified queries must
+still attain the exact geometric maximum. Actual callback fallbacks must be
+byte-identical to the same-device original callback; they are not required to
+improve the original FP32 scan's geometric rounding. The existing physical
+manifold tolerances are unchanged. CUDA qualification is still required.
+
+The historical CPU current-bound census finds scalar fallback fractions
+3.45%/3.82%, but 63.80%/64.41% of contiguous groups of 32 include a fallback.
+Those groups are a proxy, not the current CUDA lane mapping. The complete
+unchanged full scan is charged on ambiguity, including SIMT divergence and all
+provider/feature costs. No count-to-time gain or 1.697 ms RTX saving is promised.
+Next gate: existing strict paired physical runner, then the existing whole-task
+owner if root approves. No new wrapper or protocol is introduced.
+
+## Original exact-runtime experiment (historical)
+
 Implementation started from accepted coherent-rejection `fba9fead70d17728f842954d66cf1f05f4617d40`, not the finite-query tree. No GPU work is authorized yet. CPU representation evidence: `/tmp/fpgs-allegro-normal-fan-2f31seHc/CARD.md`, SHA `ed99283f663a3d0866fa7b0d876a1a8b148ccaddba0975e7709709bded74a166`.
 
 Scope: opt-in ordinary split MPR/GJK, coherent cold MPR/GJK, and their manifold owner together. Preserve the original coherent feature/rejection producer and primitive specialization. Non-split, expert, gradient and unsupported hull inputs retain the original implementation before private construction; no BSP activation is claimed for them.

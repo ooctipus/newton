@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Focused native CPU/CUDA controls for experimental exact convex BSP support."""
+"""Check certified FP32 BSP support and unchanged original fallback on ambiguity."""
 
 import ast
 import os
@@ -16,7 +16,7 @@ import warp as wp
 import newton
 from newton._src.geometry.coherent_convex import _ConvexQueryCache
 from newton._src.geometry.coherent_convex_rejection import _create_rejection_query_kernels
-from newton._src.geometry.convex_bsp import _adaptive_sign, _bind_shape, _BspData, _BspOwner, _create_support, _query
+from newton._src.geometry.convex_bsp import _bind_shape, _BspData, _BspOwner, _create_support, _filtered_sign, _query
 from newton._src.geometry.convex_bsp_build import build_tree, dot, integer_points, pack_plane
 from newton._src.geometry.convex_bsp_factories import coherent_kernels, source_successor, split_kernels
 from newton._src.geometry.narrow_phase import (
@@ -43,6 +43,7 @@ def _support_points(
     rays: wp.array[wp.vec3],
     original: wp.array[wp.vec3],
     candidate: wp.array[wp.vec3],
+    path: wp.array[int],
 ):
     i = wp.tid()
     bound = _bind_shape(shape, data)
@@ -50,12 +51,15 @@ def _support_points(
         shape, rays[i], SupportMapDataProvider()
     )
     candidate[i] = wp.static(create_shape_support_function(_TEST_SUPPORT, True))(bound, rays[i], data)
+    path[i] = -1
+    if bound.root >= 0:
+        path[i] = _query(data, bound.root, wp.cw_mul(rays[i], shape.scale))
 
 
 @wp.kernel
-def _signs(high: wp.array[wp.vec3d], low: wp.array[wp.vec3d], directions: wp.array[wp.vec3], result: wp.array[int]):
+def _signs(planes: wp.array[wp.vec3], directions: wp.array[wp.vec3], result: wp.array[int]):
     i = wp.tid()
-    result[i] = _adaptive_sign(high[i], low[i], directions[i])
+    result[i] = _filtered_sign(planes[i], directions[i])
 
 
 @wp.kernel
@@ -78,17 +82,16 @@ def _original_indices(vertices: wp.array[wp.vec3], directions: wp.array[wp.vec3]
 
 
 def packed_tree(tree):
-    """Bind exact static CPU test descriptors without any captured coefficients."""
+    """Bind rounded static test descriptors without captured coefficients."""
     data = _BspData()
-    data.plane_high = wp.array(tree["rounded64"], dtype=wp.vec3d, device=TEST_DEVICE)
-    data.plane_low = wp.array(tree["plane_low"], dtype=wp.vec3d, device=TEST_DEVICE)
+    data.plane = wp.array(tree["rounded"], dtype=wp.vec3, device=TEST_DEVICE)
     data.node_plane = wp.array([n[0] for n in tree["nodes"]], dtype=int, device=TEST_DEVICE)
     data.children = wp.array([n[1:] for n in tree["nodes"]], dtype=wp.vec2i, device=TEST_DEVICE)
     return data
 
 
 def check_queries(test, tree, rays):
-    """Compare native winners to exact integer geometric maxima, not FP tie indices."""
+    """Require exact certified winners; record original numerical quality on fallback."""
     rays = np.asarray(rays, dtype=np.float32)
     output = wp.zeros(len(rays), dtype=int, device=TEST_DEVICE)
     wp.launch(
@@ -118,15 +121,26 @@ def check_queries(test, tree, rays):
         "changed_winners": 0,
         "changed_geometric_ties": 0,
         "strict_geometric_improvements": 0,
+        "fallback_queries": 0,
+        "max_original_normalized_geometric_deficit": 0.0,
     }
     for ray, winner, old in zip(rays, output.numpy(), original.numpy(), strict=True):
         dint = integer_points(ray.reshape(1, 3))[0]
         scores = [dot(point, dint) for point in tree["points"]]
-        test.assertGreaterEqual(winner, 0)
-        test.assertEqual(scores[winner], max(scores))
-        counts["changed_winners"] += int(winner != old)
-        counts["changed_geometric_ties"] += int(winner != old and scores[winner] == scores[old])
-        counts["strict_geometric_improvements"] += int(scores[winner] > scores[old])
+        test.assertGreaterEqual(winner, -1)
+        if winner >= 0:
+            test.assertEqual(scores[winner], max(scores))
+        else:
+            counts["fallback_queries"] += 1
+        selected = winner if winner >= 0 else old
+        values = tree["vertices"].astype(float) @ ray.astype(float)
+        counts["max_original_normalized_geometric_deficit"] = max(
+            counts["max_original_normalized_geometric_deficit"],
+            float(values.max() - values[old]) / max(float(np.linalg.norm(ray.astype(float))), 1e-300),
+        )
+        counts["changed_winners"] += int(selected != old)
+        counts["changed_geometric_ties"] += int(selected != old and scores[selected] == scores[old])
+        counts["strict_geometric_improvements"] += int(scores[selected] > scores[old])
     return counts
 
 
@@ -159,6 +173,11 @@ class _RecoverFactory(ast.NodeTransformer):
 
 
 class TestConvexBsp(unittest.TestCase):
+    def test_fp32_descriptor_contract(self):
+        """Exclude FP64 limbs and their loads from every hot-path descriptor."""
+        self.assertEqual(set(_BspData.vars), {"mesh_ids", "roots", "plane", "node_plane", "children", "valid"})
+        self.assertEqual(_BspData.vars["plane"].type.dtype, wp.vec3)
+
     def test_primitive_policy_and_graph_invalidation(self):
         """Retain primitive ties and disable old graph-visible trees before geometry mutation."""
         device = TEST_DEVICE
@@ -190,13 +209,14 @@ class TestConvexBsp(unittest.TestCase):
             device=device,
         )
         original, candidate = [wp.zeros(len(rays), dtype=wp.vec3, device=device) for _ in range(2)]
+        paths = wp.zeros(len(rays), dtype=int, device=device)
         for kind in (newton.GeoType.BOX, newton.GeoType.SPHERE):
             shape.shape_type = int(kind)
             wp.launch(
                 _support_points,
                 dim=len(rays),
                 inputs=[owner.data, shape, rays],
-                outputs=[original, candidate],
+                outputs=[original, candidate, paths],
                 device=device,
             )
             np.testing.assert_array_equal(candidate.numpy(), original.numpy())
@@ -210,11 +230,17 @@ class TestConvexBsp(unittest.TestCase):
                 _support_points,
                 dim=len(rays),
                 inputs=[owner.data, shape, rays],
-                outputs=[original, candidate],
+                outputs=[original, candidate, paths],
                 device=device,
             )
 
         launch()
+        fallback = paths.numpy() < 0
+        self.assertTrue(fallback.any())
+        self.assertTrue((~fallback).any())
+        np.testing.assert_array_equal(
+            candidate.numpy()[fallback].view(np.uint32), original.numpy()[fallback].view(np.uint32)
+        )
         graph = None
         if wp.get_device(device).is_cuda:
             with wp.ScopedCapture(device=device) as capture:
@@ -436,7 +462,7 @@ class TestConvexBsp(unittest.TestCase):
             self.assertEqual(ast.dump(recovered), ast.dump(ast.parse(baseline)))
 
     def test_native_random_and_ambiguous_signs(self):
-        """Exercise all sign tiers against exact integer predicates over admitted exponent ranges."""
+        """Certify every returned sign and reject ambiguous admitted exponent-range queries."""
         rng = np.random.default_rng(912)
         planes = []
         directions = []
@@ -452,7 +478,7 @@ class TestConvexBsp(unittest.TestCase):
                 ray = rng.normal(size=3).astype(np.float32) * np.float32(2.0 ** int(rng.integers(-120, 121)))
                 planes.append(plane)
                 directions.append(ray)
-        # Near cancelling dyadic plane components force the true exact tier.
+        # Near cancelling dyadic components must not produce guessed signs.
         for exponent in (25, 54, 80, 104):
             for delta in (-1, 0, 1):
                 planes.append((2**exponent + delta, -(2**exponent), 0))
@@ -467,8 +493,7 @@ class TestConvexBsp(unittest.TestCase):
             _signs,
             dim=len(planes),
             inputs=[
-                wp.array([p[0] for p in packed], dtype=wp.vec3d, device=TEST_DEVICE),
-                wp.array([p[1] for p in packed], dtype=wp.vec3d, device=TEST_DEVICE),
+                wp.array([p[0] for p in packed], dtype=wp.vec3, device=TEST_DEVICE),
                 wp.array(directions, dtype=wp.vec3, device=TEST_DEVICE),
             ],
             outputs=[output],
@@ -477,10 +502,14 @@ class TestConvexBsp(unittest.TestCase):
         exact = [
             dot(p, integer_points(np.asarray(d).reshape(1, 3))[0]) for p, d in zip(planes, directions, strict=True)
         ]
-        np.testing.assert_array_equal(output.numpy(), [int(v > 0) - int(v < 0) for v in exact])
+        actual = output.numpy()
+        certified = actual != 2
+        self.assertTrue(certified.any())
+        self.assertTrue((~certified).any())
+        np.testing.assert_array_equal(actual[certified], np.array([int(v > 0) - int(v < 0) for v in exact])[certified])
 
     def test_exact_tetrahedron_and_rejection(self):
-        """Keep zero/boundary queries exact and reject malformed or non-extreme hulls."""
+        """Keep certified queries exact, fall back on boundaries and reject malformed hulls."""
         vertices = np.array([[1, 1, 1], [-1, -1, 1], [-1, 1, -1], [1, -1, -1]], dtype=np.float32)
         faces = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]], dtype=np.int32)
         tree = build_tree(vertices, faces)
@@ -541,20 +570,30 @@ class TestConvexBsp(unittest.TestCase):
                 float(mesh.id & 0x3FFFFF), float((mesh.id >> 22) & 0x3FFFFF), float((mesh.id >> 44) & 0xFFFFF)
             )
             outputs = [wp.zeros(len(rays), dtype=wp.vec3, device=TEST_DEVICE) for _ in range(2)]
+            paths = wp.zeros(len(rays), dtype=int, device=TEST_DEVICE)
             wp.launch(
                 _support_points,
                 dim=len(rays),
                 inputs=[owner.data, shape, wp.array(rays, dtype=wp.vec3, device=TEST_DEVICE)],
-                outputs=outputs,
+                outputs=[*outputs, paths],
                 device=TEST_DEVICE,
             )
             scaled_vertices = (vertices * scale).astype(np.float32)
-            for ray, point in zip((rays * scale).astype(np.float32), outputs[1].numpy(), strict=True):
+            fallback = paths.numpy() < 0
+            np.testing.assert_array_equal(
+                outputs[1].numpy()[fallback].view(np.uint32), outputs[0].numpy()[fallback].view(np.uint32)
+            )
+            self.assertTrue(fallback.any())
+            self.assertTrue((~fallback).any())
+            for ray, point, used_fallback in zip(
+                (rays * scale).astype(np.float32), outputs[1].numpy(), fallback, strict=True
+            ):
                 matches = np.flatnonzero(np.all(scaled_vertices == point, axis=1))
                 self.assertGreater(len(matches), 0)
                 direction = integer_points(ray.reshape(1, 3))[0]
                 scores = [dot(p, direction) for p in tree["points"]]
-                self.assertEqual(max(scores[int(i)] for i in matches), max(scores))
+                if not used_fallback:
+                    self.assertEqual(max(scores[int(i)] for i in matches), max(scores))
             count += len(rays)
         print("BSP_ACTUAL", {"queries": count, "native_winner_differences": differences, **owner.metadata})
 
@@ -579,23 +618,26 @@ class TestConvexBsp(unittest.TestCase):
                 differences.append(check_queries(self, tree, rays))
             print("BSP_HISTORICAL", tag, len(calls["hull_index"]), differences)
 
-    def test_exact_last_tier_signs(self):
-        """Resolve cancellation, true zero and sub-FP64 residual signs exactly."""
-        high = np.array([[1.0, -1.0, 0.0]] * 3)
-        low = np.array([[2.0**-100, 0, 0], [-(2.0**-100), 0, 0], [0, 0, 0]])
-        output = wp.zeros(3, dtype=int, device=TEST_DEVICE)
+    def test_ambiguous_signs_require_fallback(self):
+        """Return fallback for cancellation, true zero, lost coefficient tails and nonfinite rays."""
+        planes = [pack_plane((2**100 + delta, -(2**100), 0))[0] for delta in (-1, 0, 1)]
+        planes.extend([[1.0, 0.0, 0.0]] * 4)
+        rays = np.ones((7, 3), dtype=np.float32)
+        rays[4, 0] = -1.0
+        rays[5, 0] = np.inf
+        rays[6, 0] = np.nan
+        output = wp.zeros(7, dtype=int, device=TEST_DEVICE)
         wp.launch(
             _signs,
-            dim=3,
+            dim=7,
             inputs=[
-                wp.array(high, dtype=wp.vec3d, device=TEST_DEVICE),
-                wp.array(low, dtype=wp.vec3d, device=TEST_DEVICE),
-                wp.array(np.ones((3, 3)), dtype=wp.vec3, device=TEST_DEVICE),
+                wp.array(planes, dtype=wp.vec3, device=TEST_DEVICE),
+                wp.array(rays, dtype=wp.vec3, device=TEST_DEVICE),
             ],
             outputs=[output],
             device=TEST_DEVICE,
         )
-        np.testing.assert_array_equal(output.numpy(), [1, -1, 0])
+        np.testing.assert_array_equal(output.numpy(), [2, 2, 2, 1, -1, 2, 2])
 
 
 if __name__ == "__main__":
