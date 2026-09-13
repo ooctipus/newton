@@ -285,3 +285,127 @@ Completed local evidence:
   manifest `71f10b8c7849a96a9ea2d3112d3f4208ec5c3734218bfe096492d10719678472`.
 - RTX cost audit: `a6751659d07150f2948c81264ff1268725cb964ebd0f26c2b88fd380e5fa65c4`.
 - GB cost audit: `d490466e754a181791754d5a81fa38883d8db8acb6858db4de940f8eeab98666`.
+
+## Causal trace and corrective decisions, 02:21--02:48 UTC
+
+The next checkpoint has a concrete cost diagnosis, not a new gain. Paired
+Nsight graph-node capture and its CPU reader both pass, with the profiler
+parents reaped and source/idle guards satisfied. Each three-environment
+equivalent contains twelve restored two-call graphs. Restores and numerical
+oracles are outside charged graph ranges; every kernel, copy and memset
+inside those ranges is retained. Nonzero CUPTI correlations are checked;
+missing IDs use explicit same-process completion-fenced intervals and repeated
+node identities, not a fabricated correlation join.
+
+| Complete-graph cost, ms/env equivalent | RTX | GB |
+| --- | ---: | ---: |
+| Graph span | 9.004254 | 9.934781 |
+| Core force/prediction/refresh/next state, exclusive | 2.768914 | 2.337514 |
+| Current dense-row family, exclusive | 2.566589 | 2.870132 |
+| Contact-row kernel alone, exclusive | 2.291911 | 2.592906 |
+| Retained CSR and ZERO, exclusive | 0.894345 | 0.775989 |
+| Joined offset/general solve union | 1.042239 | 1.514100 |
+| Coupled materialization, exclusive | 0.077749 | 0.633781 |
+| Explicit current-error guards, exclusive | 0.036299 | 0.049333 |
+| Uncovered graph span | 0.159167 | 0.191051 |
+
+The contact row is a subset of its row family, not an additional additive
+cost. On GB the general solver's1.476511ms duration overlaps the offset owner;
+its exclusive contribution is0.612341ms. Materialization plus that exclusive
+contribution exposes1.246122ms, not2.110292ms. No stall counters, bandwidth
+utilization or hardware-ceiling claim is available. Contact registers are
+90/86 with no reported local memory; few long coupled warp chains are a
+source-supported inference rather than per-warp timing evidence.
+
+The suspected large repeated state traversal was ruled out. ZERO reads the
+predictor's endpoints; it does not rebuild them. Finish computes a different
+q/qd epoch and bias acceleration. There are small dead stores and spills, but
+no source-backed1ms deletion. That narrow route is closed without a new
+state-fusion or register-tuning experiment. Diagnosis:
+`/tmp/fpgs-kuka-state-repeat-review-YFavLtzO/NOTE.md`, SHA256
+`48680579c0eda4189e7fa085e4baf020c1ae7a12a0aeccb80f5a790d58b9deb5`.
+
+Two specific corrective experiments are authorized, each against its own
+identified cause and each with the entire path charged:
+
+1. **Contact-triplet work elimination**, GO02:36 UTC, checkpoint04:06 UTC.
+   Fresh four-input counts show98.79--99.09% common-arm contacts and
+   99.69--99.73% with no responsive free endpoint; no contact touches more
+   than two fingers. The current kernel nevertheless evaluates all four
+   finger blocks and free6 action. Exact endpoint-union support removes
+   about42.5% of scalar held-action products. Batch normal/tangent0/tangent1
+   and hoist repeated incident vectors to remove repeated dependency stages;
+   retain all actual output rows/coefficient stores and all eight sweeps.
+   Arm-lane dependency remains, so arithmetic fractions are not timing
+   fractions. Hypothesis: at least1ms complete-path saving, not merely a
+   component speedup. This alone cannot meet the full2x target. No global
+   body-port cache, new screening or fused solve is added.
+2. **Coupled primary-kinetic/free-physical representation**, GO02:44 UTC,
+   checkpoint04:14 UTC. Keep primary23 as offset kinetic coordinates and
+   free6 physical, deleting primary physical-Y construction. Dense free
+   action still uses its held operator; MF uses its current-pose inverse.
+   Preserve original dense/MF/rigid-limit and friction-sibling ordering.
+   Extend the existing qualification visit and existing general dispatch;
+   do not add a second certification scan or solver launch. Unsupported
+   cases retain original fallback. The historical GB1.246122ms exposed
+   opportunity is not a savings forecast. Franka is not a drop-in transfer
+   and is not reopened without new measured structural evidence.
+
+The corresponding pinned cards are:
+
+- `/tmp/fpgs-kuka-triplet-card-pIKTct/CARD.md`,
+  `e920cc315ca5418d5fc0e586544ba1d2b22103fe491d9a0c56216527441666bc`.
+- `/tmp/fpgs-kuka-hybrid-coupled-card-AEKmC4H4/CARD.md`,
+  `5b999ff65f5782630d3aa9f31c5f14f429c91d2b0ee0924defd720553092470e`;
+  its admission/dispatch mechanics are superseded by `ABI_MINIMAL.md`,
+  `07f239ef722df74b096a72f5ec2265f83d2d045d6c3dd347e793c2f19dc93047`.
+
+### Fresh current inputs and numerical limits
+
+A separate paired full-state capture of accepted50dfa completes with exactly
+eight physical calls, original refresh/reuse, unchanged capacities, no row
+drops and original Lab code. Both complete16384-world phase archives are
+retained locally. Host snapshots perturb execution and supply **no timings**.
+Coupled cases move between samples: fresh RTX has two positive worlds in
+both phases, while fresh GB has none then one. This is a state-dependent
+tail, not a GB-specific defect. Fresh matched prototype timings must precede
+any claimed correction delta.
+
+The historical large residuals are velocity deficits, not joint-position
+errors or a CFM compliance allowance. Selected normal/bound inequality LPs
+are feasible but require maximum primary joint rates of at least39.1/16.2
+rad/s. This is not full friction-complementarity feasibility. Friction-off
+and128-sweep diagnostics do not consistently cure the tails. Bounded note:
+`/tmp/fpgs-kuka-residual-meaning-DEjZ9YJQ/FINDINGS.md`, SHA256
+`0e373d5e74b0f861656652104e21f5a846c75265a4b9d8545de172c964da000c`.
+
+Reading fresh accepted physical J, exact RHS and actual joined velocities
+gives maximum dense-normal deficits0.02670/0.02086m/s RTX and
+0.00532/0.01426m/s GB over the two phases. Joint-bound maxima are
+0.00591/0.000455rad/s RTX and0.01640/0.00986rad/s GB; most active worlds
+are near zero. The historical1rad/s tails do not occur in these snapshots.
+This dense-row census is not a complete MF/friction/trajectory convergence
+gate and does not qualify the candidate. No target or iteration was changed.
+
+The explicit fresh construction adapter restores its source selector before
+native launches. It preserves the actual original stage1-return predictor
+input, current prescribed sources and first-solve-to-second-state aliases;
+it does not substitute captured phase1 output. Five CPU binding/schema tests
+pass. Root's full fresh GPU physical gate is running at this checkpoint;
+no fresh candidate timing or corrective speedup has yet been accepted.
+
+Evidence roots and SHA256:
+
+- Nodes: `/tmp/fpgs-kuka-demand-boundary-nodes-paired16k-20260913-01`, manifest
+  `17708a4da7bc136d102d2db4a028994f72316b59d36a6e7e64671d96163c0c95`.
+- Node reader result: `/tmp/fpgs-kuka-boundary-ordered-nodes-b4EI8ujc/evidence01.json`,
+  `e193acd034c84c78a33f406ae66b00c6cc2967c90fac5e79c3f6b875c47380bf`.
+- Fresh captures: `/tmp/fpgs-kuka-full-current-paired16k-20260913-01`, manifest
+  `1dfe6a2387ac7edcfc804f59abd4db146d7601e813561dd5b865eb9bfeaf5dbc`.
+- Fresh dense census: `/tmp/fpgs-kuka-fresh-residual-UHiWKCgp/evidence01.json`,
+  `281cc9f86785339398e2a115578adbdf3091da5490eb3c94ffc6c9d17497ba40`.
+- Fresh adapter: `kinetic_fresh_fixture.py` in the kinetic scratch directory,
+  `327ed4f7f496d99a8663da0855afdc867979bca773be430db6d5f1be84e7275e`.
+
+All accepted task performance tables remain unchanged. The implementation
+successors are experiments, not promoted Newton runtime changes.
