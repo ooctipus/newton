@@ -239,6 +239,47 @@ def original_eight(J, Y, diag, rhs, types, parent, mu, vhat):
 
 
 class TestSparseFactor(unittest.TestCase):
+    def test_level_schedule_complete_dependencies(self):
+        """Prove exact entry ownership and earlier-level factor dependencies."""
+        f = fixture()
+        index = f["host"]["index"]
+        rows, cols = f["host"]["row"], f["host"]["col"]
+        schedule = sf._factor_schedule(index)
+        phase = schedule["factor_phase"]
+        entries = schedule["factor_entries"]
+        offsets = schedule["factor_offsets"]
+        terms = schedule["factor_terms"]
+        self.assertEqual(phase.shape, (31,))
+        self.assertEqual(terms.shape, (2242, 2))
+        np.testing.assert_array_equal(np.sort(entries), np.arange(434))
+        entry_phase = np.empty(434, int)
+        for step in range(30):
+            owned = entries[phase[step] : phase[step + 1]]
+            entry_phase[owned] = step
+            self.assertTrue(np.all((rows[owned] == cols[owned]) == (step % 2 == 0)))
+        for entry, (row, col) in enumerate(zip(rows, cols, strict=True)):
+            expected = np.array(
+                [(index[row, k], index[col, k]) for k in range(col) if index[row, k] >= 0 and index[col, k] >= 0],
+                dtype=np.int32,
+            ).reshape(-1, 2)
+            actual = terms[offsets[entry] : offsets[entry + 1]]
+            np.testing.assert_array_equal(actual, expected)
+            self.assertTrue(np.all(entry_phase[actual] // 2 < entry_phase[entry] // 2))
+        packed = f["H"][::-1, ::-1][rows, cols].copy()
+        for step in range(30):
+            for entry in entries[phase[step] : phase[step + 1]]:
+                value = packed[entry]
+                for left, right in terms[offsets[entry] : offsets[entry + 1]]:
+                    value -= packed[left] * packed[right]
+                packed[entry] = np.sqrt(value) if step % 2 == 0 else value / packed[index[cols[entry], cols[entry]]]
+        lower = np.zeros((43, 43))
+        lower[rows, cols] = packed
+        # The factor contract owns the lower triangle. The independent kinetic
+        # reference retains tiny upper/lower asymmetry from FP32 input inertia.
+        original_lower = np.tril(f["H"][::-1, ::-1])
+        expected = original_lower + np.tril(original_lower, -1).T
+        np.testing.assert_allclose(lower @ lower.T, expected, rtol=1e-12, atol=1e-12)
+
     def test_reject_other_canonical_producers(self):
         """Reject optional producers before they can touch retired buffers."""
         solver = SimpleNamespace(

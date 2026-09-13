@@ -24,6 +24,10 @@ class SparsePlan:
     index: wp.array2d[int]
     row: wp.array[int]
     col: wp.array[int]
+    factor_phase: wp.array[int]
+    factor_entries: wp.array[int]
+    factor_offsets: wp.array[int]
+    factor_terms: wp.array2d[int]
     source: wp.array[int]
     inverse_nodes: wp.array2d[int]
     inverse_count: wp.array[int]
@@ -49,6 +53,48 @@ class SparseData:
     Z: wp.array3d[float]
     support: wp.array2d[int]
     incident: wp.array2d[float]
+
+
+def _factor_schedule(index):
+    """Compile exact left-looking ownership from the admitted packed pattern."""
+    return _factor_schedule_cached(tuple(index.ravel()))
+
+
+@cache
+def _factor_schedule_cached(pattern):
+    """Reuse immutable topology work across model-property notifications."""
+    index = np.asarray(pattern, dtype=np.int32).reshape(43, 43)
+    rows, cols = np.nonzero(index >= 0)
+    levels = np.zeros(43, np.int32)
+    for col in range(43):
+        previous = np.flatnonzero(index[col, :col] >= 0)
+        levels[col] = 0 if not len(previous) else 1 + max(levels[previous])
+    if len(rows) != 434 or max(levels) != 14:
+        raise ValueError("Sparse G1 factor dependency depth differs from the checked tree")
+    phase, entries, offsets, terms = [0], [], [0], []
+    for level in range(15):
+        for diagonal in (True, False):
+            entries.extend(np.flatnonzero((levels[cols] == level) & ((rows == cols) == diagonal)))
+            phase.append(len(entries))
+    for row, col in zip(rows, cols, strict=True):
+        for previous in range(col):
+            left, right = index[row, previous], index[col, previous]
+            if left >= 0 and right >= 0:
+                if levels[previous] >= levels[col]:
+                    raise ValueError("Sparse G1 factor dependency is not from an earlier level")
+                terms.append((left, right))
+        offsets.append(len(terms))
+    if len(terms) != 2242:
+        raise ValueError("Sparse G1 factor product schedule differs from the checked tree")
+    result = {
+        "factor_phase": np.asarray(phase, dtype=np.int32),
+        "factor_entries": np.asarray(entries, dtype=np.int32),
+        "factor_offsets": np.asarray(offsets, dtype=np.int32),
+        "factor_terms": np.asarray(terms, dtype=np.int32),
+    }
+    for values in result.values():
+        values.setflags(write=False)
+    return result
 
 
 def make_plan(model, solver=None):
@@ -191,6 +237,7 @@ def make_plan(model, solver=None):
         "body_tag": np.tile(tags, worlds),
         "dof_joint": dof_joint,
     }
+    host.update(_factor_schedule(index))
     # Deeper physical DOF owns the composite inertia (same original source map).
     if solver is None:
         return host
@@ -252,23 +299,30 @@ def get_refresh_kernel():
         a[e] = value;
     }
     __syncthreads();
-    for (int k = 0; k < 43; ++k) {
-        const int diag = p.index.data[k*43+k];
-        if (threadIdx.x == 0) {
-            if (!(a[diag] > 0.0f) || !isfinite(a[diag])) bad = 1;
-            a[diag] = sqrtf(a[diag]);
+    // Independent columns can share Schur destinations. A final-entry owner
+    // gathers its earlier factors, avoiding concurrent scatter or atomics.
+    for (int level = 0; level < 15; ++level) {
+        const int begin = p.factor_phase.data[2*level];
+        const int middle = p.factor_phase.data[2*level+1];
+        const int end = p.factor_phase.data[2*level+2];
+        for (int task = begin+threadIdx.x; task < middle; task += blockDim.x) {
+            const int entry = p.factor_entries.data[task];
+            float value = a[entry];
+            for (int term = p.factor_offsets.data[entry]; term < p.factor_offsets.data[entry+1]; ++term) {
+                value -= a[p.factor_terms.data[2*term]] * a[p.factor_terms.data[2*term+1]];
+            }
+            if (!(value > 0.0f) || !isfinite(value)) atomicExch(&bad, 1);
+            a[entry] = sqrtf(value);
         }
         __syncthreads();
-        for (int row = k+1+threadIdx.x; row < 43; row += blockDim.x) {
-            const int entry = p.index.data[row*43+k];
-            if (entry >= 0) a[entry] /= a[diag];
-        }
-        __syncthreads();
-        for (int e = threadIdx.x; e < 434; e += blockDim.x) {
-            const int row = p.row.data[e], col = p.col.data[e];
-            if (col <= k) continue;
-            const int x = p.index.data[row*43+k], y = p.index.data[col*43+k];
-            if (x >= 0 && y >= 0) a[e] -= a[x] * a[y];
+        for (int task = middle+threadIdx.x; task < end; task += blockDim.x) {
+            const int entry = p.factor_entries.data[task];
+            const int col = p.col.data[entry];
+            float value = a[entry];
+            for (int term = p.factor_offsets.data[entry]; term < p.factor_offsets.data[entry+1]; ++term) {
+                value -= a[p.factor_terms.data[2*term]] * a[p.factor_terms.data[2*term+1]];
+            }
+            a[entry] = value / a[p.index.data[col*43+col]];
         }
         __syncthreads();
     }
