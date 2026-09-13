@@ -1,6 +1,6 @@
 # Structural window: integrated discoveries
 
-Checkpoint: 2026-09-13 18:13 UTC. Work continues toward the 24-hour window in
+Checkpoint: 2026-09-13 22:40 UTC. Work continues toward the 24-hour window in
 `STRUCTURAL_FOURX_20260913.md`; the 4x target is **not achieved**. These are
 discoveries, not replacements for accepted baselines except where repeat
 evidence is explicitly given. No candidate has met the complete 4x target.
@@ -14,6 +14,67 @@ version is promoted. The sparse solver and packed original-query midphase
 are separable from this changed manifold law.
 
 ## Current comparison and diagnosed losses (18:13 checkpoint)
+
+### Resumed until-4x work (22:40 checkpoint)
+
+The user explicitly resumed optimization until4x across all representative
+tasks. The current G1 backend reference remains the original-query19099
+comparison below; the new register-Gram candidate is slower and not promoted.
+Whole physics, environment wall, incremental FPGS gain and corrected-MJ ratio
+remain separate denominators. No new backend sweep is implied by this entry.
+
+Frozen G1 candidate `5bb57dbbf84bbb60677a80acab7f9bc2ec4e79bb` replaces sparse
+GS with on-chip32/64-row Gram/residual owners and original >64 fallback.
+Four selected CUDA tests per card pass, including full-step/graph lifecycle,
+actual current/held operators, reservation and0/31/32/33/64/65 row boundaries.
+An explicit source-pinned in-memory parent adapter adds REGISTER_RESIDUAL=1
+to the recorded child environments; the old paired parent's environment
+cleaner would otherwise silently remove an inherited outer flag. Its source
+file is unchanged, but execution is not claimed byte-original. Physical
+manifest: `/tmp/fpgs-g1-register-residual-physical-paired-20260913-01/manifest.json`,
+SHA `5c3fa283213aeb31daa56834be5c47ca3d2133f51b66a478d39e80bbbe80043b`.
+
+The complete paired A/B, basebd1cc095 versus5bb57, retains SPARSE/CELL/PACK1,
+16K seed0,200 warmup,40 wall and40 whole-physics steps, fixed Lab53ee and
+calibrated capacities. Only REGISTER_RESIDUAL changes0 to1:
+
+| GPU | Baseline physics | Register Gram | Baseline/candidate |
+| --- | ---: | ---: | ---: |
+| RTX PRO6000 |25.499776025ms|27.726071850ms|0.919704x|
+| GB300 |34.869894625ms|44.424335450ms|0.784928x|
+
+All four captures exit0, eight boundaries pass, sparse valid/status and
+capacity checks pass, and final source/idle guards pass. Manifest:
+`/tmp/fpgs-g1-register-residual-live-paired16k-20260913-01/manifest.json`,
+SHA `4dd41f0133cb1bbed2ceeca99323c8fb7dd9a4d18cc823954b7da9aec2f3598c`.
+This is a measured loss, not a numerical rejection. Existing paired node
+captures are complete; exclusive attribution is being read before selecting
+a correction. No hardware-counter stall/occupancy explanation is asserted.
+
+Allegro FP32-only BSP e25992 and subtree10a0b5 completed earlier physical and
+whole discovery gates. The later subtree result is17.037384900/17.031463175ms
+FPGS against63.797036100/82.124776150ms corrected native-MJ,3.7445322/4.8219449x.
+Its difference from the separate FP32 round is-0.0779/+0.1043ms, not a material
+gain or matched incremental A/B. No promotion. Detailed source/checks:
+`/tmp/fpgs-convex-bsp-subtree-allegro-backends-paired16k-20260913-01/RESULTS.md`.
+
+Independent source review corrects the subtree cost model: the historical CPU
+GJK corpus is query-major, so consecutive32 support calls are not simultaneous
+warp lanes. Its old contiguous32 proxy cannot predict GPU savings. Subtree
+fallback removes about92% of fallback dots, but only12--13% of an optimistic
+plane-plus-dot scalar proxy; ordinary tree traversal and GJK/MPR/manifold work
+remain. Current source/resources do not establish an occupancy cliff or exact
+timing attribution. No further support-mask tuning is funded from that census.
+
+The new ANYmal branch-response candidate is being implemented independently:
+packed reverse L117, compact root/leg contact coordinates, unchanged complete
+EX1/parallel24 law, and explicit original8 fallback. It must retire dense
+factor production rather than convert/duplicate it. Full card and physical
+contract: `/home/octi/Projects/newton-fpgs-anymal-branch-response-20260913/reports/fpgs/ANYMAL_BRANCH_RESPONSE_20260913.md`.
+This is a hypothesis, not an implemented or measured gain. The separate
+Franka/Kuka public-state consumer review found that skipping intermediate
+publication alone cannot clear the10% whole screen even under an unrealistically
+free-owner assumption; no publication micro-optimization is being implemented.
 
 The earlier **1.403934x RTX / 1.934297x GB** sparse-plus-finite result is
 FPGS versus cell-only FPGS, not FPGS versus MJWarp; that finite version remains
