@@ -288,8 +288,11 @@ def main(argv=None):
             "force_target",
             "subset_reset",
             "odd_refresh",
+            "world_gravity",
         ]:
             raise ValueError("A required lifecycle perturbation did not execute")
+        if args.perturb and not report["gravity_perturbation"]["restored"]:
+            raise ValueError("The diagnostic gravity input was not restored")
         result = json.loads(output.read_text())
         if result["decimation"] != 4 or result["sim_dt"] != 1 / 120 or result["cuda_graph"]:
             raise ValueError("The unchanged eager task recipe changed")

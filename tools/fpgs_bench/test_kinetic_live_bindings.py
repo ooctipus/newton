@@ -177,8 +177,9 @@ class TestKineticLiveBindings(unittest.TestCase):
         self.assertIs(again.inputs.joint_f, control.joint_f)
 
     def test_cold_current_refresh_predict_and_next_state(self):
-        """Run the native kinetic lifetime with no captured bias or held seed."""
-        _solver, _owner, first, second, _control, _contacts, call = bound_call(worlds=3)
+        """Run nonuniform-gravity kinetics and finish without captured seeds."""
+        solver, _owner, first, second, _control, _contacts, call = bound_call(worlds=3)
+        solver.model.gravity.assign(np.array([[1, -2, -3], [-4, 5, -6], [2, 3, 4], [0, 0, -9.81]], np.float32))
         call.construct_launch()
         call.refresh_launch()
         call.free.launch()
@@ -245,16 +246,81 @@ class TestKineticLiveBindings(unittest.TestCase):
         actual = call.output.joint_qdd.numpy()[ids].astype(np.float64) - before[ids]
         self.assertLessEqual(float(np.max(np.abs(actual - expected) / scale)), 2.0**-17)
 
-    def test_nonuniform_gravity_and_output_alias_rejected(self):
-        """Reject unsupported gravity and internal-output aliases before dispatch."""
+    def test_world_gravity_changes_current_force_not_held_mass(self):
+        """Use each owned world's gravity and ignore the separate global tail."""
+        from newton._src.solvers.feather_pgs.kinetic_predictor import unpack_T  # noqa: PLC0415
+
+        solver, owner, _first, _second, _control, _contacts, call = bound_call(worlds=3)
+        solver.model.gravity.zero_()
+        call.construct_launch()
+        call.refresh_launch()
+        call.free.launch()
+        call.predict_launch()
+        baseline = call.output.joint_qdd.numpy().astype(np.float64)
+        held = call.slots.held.T.numpy().copy()
+        free_held = call.slots.held.inverse6.numpy().copy()
+        bias = call.slots.current.bias.numpy().copy()
+        gravity = np.array([[1, -2, -3], [-4, 5, -6], [2, 3, 4], [900, -800, 700]], np.float32)
+        solver.model.gravity.assign(gravity)
+        owner.bindings.validate_notification(newton.ModelFlags.MODEL_PROPERTIES)
+        build_live_plan(solver)
+        call.slots.requested.zero_()
+        call.construct_launch()
+        call.refresh_launch()
+        call.free.launch()
+        call.predict_launch()
+        np.testing.assert_array_equal(call.output.status.numpy(), 0)
+        np.testing.assert_array_equal(call.slots.held.T.numpy(), held)
+        np.testing.assert_array_equal(call.slots.held.inverse6.numpy(), free_held)
+        self.assertIs(call.current_publication.gravity, solver.model.gravity)
+        np.testing.assert_array_equal(solver.model.gravity.numpy(), gravity)
+        mass = solver.model.body_mass.numpy()
+        bodies, dofs = owner.host_plan.host["body_ids"], owner.host_plan.host["dof_ids"]
+        axes = call.slots.current.axes.numpy().astype(np.float64)
+        free_axes = call.slots.current.free_axes.numpy().astype(np.float64)
+        radius = call.slots.current.com_offset.numpy().astype(np.float64)
+        masks = solver.body_response_dof_mask.numpy()
+        actual = call.output.joint_qdd.numpy().astype(np.float64) - baseline
+        for world in range(3):
+            tau = np.zeros(23, np.float64)
+            for local in range(30):
+                body = bodies[world, local]
+                force = float(mass[body]) * gravity[world].astype(np.float64)
+                wrench = np.r_[force, np.cross(radius[world, local], force)]
+                for dof in range(23):
+                    if int(masks[body]) & (1 << dof):
+                        tau[dof] += axes[world, dof] @ wrench
+            t = unpack_T(held[world].astype(np.float64))
+            expected = t.T @ (t @ tau)
+            scale = 1.0 + np.abs(t.T) @ (np.abs(t) @ np.abs(tau))
+            self.assertLessEqual(float(np.max(np.abs(actual[dofs[world, :23]] - expected) / scale)), 2.0**-17)
+            delta_bias = call.slots.current.bias.numpy()[world].astype(np.float64) - bias[world]
+            self.assertLessEqual(float(np.max(np.abs(delta_bias + tau) / (1 + np.abs(tau)))), 2.0**-17)
+            force = float(mass[bodies[world, 30]]) * gravity[world].astype(np.float64)
+            wrench = np.r_[force, np.cross(radius[world, 30], force)]
+            tau6 = free_axes[world] @ wrench
+            t6 = free_held[int(owner.plan.secondary_group.numpy()[world])].astype(np.float64)
+            expected6 = t6.T @ (t6 @ tau6)
+            scale6 = 1 + np.abs(t6.T) @ (np.abs(t6) @ np.abs(tau6))
+            self.assertLessEqual(float(np.max(np.abs(actual[dofs[world, 23:29]] - expected6) / scale6)), 2.0**-17)
+        before = call.output.joint_qdd.numpy().copy()
+        gravity[-1] *= -10
+        solver.model.gravity.assign(gravity)
+        owner.bindings.validate_notification(newton.ModelFlags.MODEL_PROPERTIES)
+        call.construct_launch()
+        call.predict_launch()
+        np.testing.assert_array_equal(call.output.joint_qdd.numpy(), before)
+
+    def test_invalid_gravity_and_output_alias_rejected(self):
+        """Reject nonfinite owned gravity and internal-output aliases."""
         solver, owner, first, second, control, contacts, call = bound_call()
         second.joint_qd = solver.v_hat
         with self.assertRaisesRegex(ValueError, "overlap"):
             owner.bindings.bind_step(first, second, control, contacts, 1.0 / 240.0, call.slots)
         gravity = solver.model.gravity.numpy()
-        gravity[-1, 2] += 1.0
+        gravity[0, 2] = np.nan
         solver.model.gravity.assign(gravity)
-        with self.assertRaisesRegex(ValueError, "uniform gravity"):
+        with self.assertRaisesRegex(ValueError, "gravity"):
             build_live_plan(solver)
 
 

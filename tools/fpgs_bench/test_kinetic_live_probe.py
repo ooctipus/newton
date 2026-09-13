@@ -4,13 +4,44 @@
 """Host controls for the live eager lifecycle observer, not physics acceptance."""
 
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
-from tools.fpgs_bench.kinetic_live_probe import check_held, check_publication, transition
+from tools.fpgs_bench.kinetic_live_probe import Observer, check_held, check_publication, transition
 
 
 class TestKineticLiveProbe(unittest.TestCase):
+    def test_world_gravity_perturbation_restores_on_close(self):
+        """Restore model gravity and re-notify even if the diagnostic aborts."""
+        original = np.array([[0, 0, -1], [0, 0, -1], [0, 0, -9.81]], np.float32)
+        values = original.copy()
+
+        def assign(new):
+            """Stand in for an in-place model array write."""
+            nonlocal values
+            values = new.copy()
+
+        def read():
+            """Read the current rebound array rather than capturing an old one."""
+            return values.copy()
+
+        notifications = []
+        gravity = SimpleNamespace(numpy=read, assign=assign)
+        solver = SimpleNamespace(
+            model=SimpleNamespace(gravity=gravity),
+            _kinetic_world=object(),
+            notify_model_changed=notifications.append,
+        )
+        observer = Observer(object, {}, worlds=2, perturb=True)
+        observer._perturb(solver, None, None, 7)
+        self.assertFalse(np.array_equal(values[0], values[1]))
+        np.testing.assert_array_equal(values[[0, 2]], original[[0, 2]])
+        observer.close()
+        np.testing.assert_array_equal(values, original)
+        self.assertEqual(len(notifications), 2)
+        self.assertTrue(observer.report["gravity_perturbation"]["restored"])
+
     def test_reuse_rejects_changed_held_values(self):
         """Reject operator mutation on an unrequested reuse call."""
         old = {"T": np.ones((2, 180)), "generation": np.array([1, 1])}
@@ -33,7 +64,8 @@ class TestKineticLiveProbe(unittest.TestCase):
     def test_fixed_transition_schedule(self):
         """Keep perturbations explicit and outside ordinary performance mode."""
         self.assertEqual(
-            [transition(i) for i in range(7)], [None, "force_target", None, "subset_reset", None, "odd_refresh", None]
+            [transition(i) for i in range(8)],
+            [None, "force_target", None, "subset_reset", None, "odd_refresh", None, "world_gravity"],
         )
 
 

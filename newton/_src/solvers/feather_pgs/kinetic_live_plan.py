@@ -29,6 +29,19 @@ def _require(condition, message):
         raise ValueError(message)
 
 
+def validate_gravity(model, worlds):
+    """Validate owned local gravity; the separate global-world tail is unused."""
+    values = model.gravity
+    _require(
+        values is not None
+        and values.is_contiguous
+        and (values.shape == (worlds + 1,) or (worlds == 1 and values.shape == (1,))),
+        "Kinetic owner requires the model's contiguous local/global gravity layout",
+    )
+    gravity = values.numpy()
+    _require(np.isfinite(gravity[:worlds]).all(), "Kinetic owner requires finite owned-world gravity")
+
+
 @dataclass
 class LivePlan:
     """Static host proof and immutable device maps, allocated only once."""
@@ -107,11 +120,7 @@ def build_live_plan(solver):
         np.array_equal(arts, np.arange(3 * worlds).reshape(worlds, 3)),
         "Current origin view requires world-major articulation ownership",
     )
-    gravity = model.gravity.numpy()
-    _require(
-        len(gravity) > 0 and np.array_equal(gravity, np.broadcast_to(gravity[0], gravity.shape)),
-        "Kinetic producer requires uniform gravity across all worlds",
-    )
+    validate_gravity(model, worlds)
     _require(
         not np.any(solver._kinematic_dof_mask.numpy()[dofs[:, :29]]),
         "Response coordinates cannot include prescribed DOFs",

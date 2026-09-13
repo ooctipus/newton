@@ -285,6 +285,21 @@ TRANSACTION_CORRECTIONS = {
     "kinetic_compact_coupled/get_general_kernel/closure/kinetic_compact_native": "a8a17dd80e7777c998ef027f270d5158a17873b6bd7d924c452c3f057868bb02",
 }
 
+# One register-only current-world gravity view precedes both original force
+# consumers. Keep the original 244 records after reversing only that assignment.
+WORLD_GRAVITY_PYTHON = {
+    "kinetic_state/get_construct_kernel": "c0194c61d8bfbfc015217e0079b8fa51d8abd75473d14d159d5b76b70e917a5e",
+    "kinetic_state/get_finish_kernel": "c0194c61d8bfbfc015217e0079b8fa51d8abd75473d14d159d5b76b70e917a5e",
+    "kinetic_guard/get_finish_kernel": "75c7c23bc9c74825d29f69952b5eafc5e45713b0d295d4ae0c72d5858a70ff3e",
+}
+WORLD_GRAVITY_ADDED = {
+    "kinetic_state/_world_gravity/native": "38cc4d45e3852c02ff7ebfd8015cd043bd6b0d072c1a518dba02e97abc3a5fa0",
+    "kinetic_state/_world_gravity/python": "1df1f0457ab87c6570a2d6f0e9baaa1055344f440753d210c4af46d90e783acb",
+    "kinetic_state/get_construct_kernel/closure/_world_gravity": "38cc4d45e3852c02ff7ebfd8015cd043bd6b0d072c1a518dba02e97abc3a5fa0",
+    "kinetic_state/get_finish_kernel/closure/_world_gravity": "38cc4d45e3852c02ff7ebfd8015cd043bd6b0d072c1a518dba02e97abc3a5fa0",
+    "kinetic_guard/get_finish_kernel/closure/_world_gravity": "38cc4d45e3852c02ff7ebfd8015cd043bd6b0d072c1a518dba02e97abc3a5fa0",
+}
+
 
 def source_oracle():
     """Collect exact native strings, generated dispatch ASTs and descriptor ABI."""
@@ -324,6 +339,19 @@ def source_oracle():
             for node in ast.walk(tree):
                 if isinstance(node, ast.FunctionDef):
                     node.decorator_list = []
+            if label in WORLD_GRAVITY_PYTHON:
+                if source.definition_digest(tree) != WORLD_GRAVITY_PYTHON[label]:
+                    raise ValueError("Unexpected gravity-view source change: " + label)
+                function_node = tree.body[0]
+                assignments = [
+                    node
+                    for node in function_node.body
+                    if isinstance(node, ast.Assign)
+                    and ast.unparse(node) == "data.gravity = _world_gravity(data.gravity, world)"
+                ]
+                if len(assignments) != 1:
+                    raise ValueError("Ambiguous current-world gravity assignment")
+                function_node.body.remove(assignments[0])
             result[label + "/python"] = source.definition_digest(tree)
             closure = inspect.getclosurevars(function)
             for name, value in (closure.globals | closure.nonlocals).items():
@@ -390,8 +418,9 @@ class TestKineticNativePort(unittest.TestCase):
     def test_frozen_native_and_descriptor_oracle(self):
         """Undo only explicit transaction edits, then recover every frozen record."""
         actual = source_oracle()
-        self.assertEqual(set(actual), set(EXPECTED))
-        for name, expected in EXPECTED.items():
+        expectations = EXPECTED | WORLD_GRAVITY_ADDED
+        self.assertEqual(set(actual), set(expectations))
+        for name, expected in expectations.items():
             with self.subTest(source=name):
                 self.assertEqual(actual[name], expected)
 

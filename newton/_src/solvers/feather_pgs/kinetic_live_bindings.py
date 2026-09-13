@@ -15,6 +15,7 @@ import numpy as np
 import warp as wp
 
 from . import kernels, raw_world_contacts, simple_world, world_scan_owner
+from .kinetic_live_plan import validate_gravity
 
 
 def _struct(cls, **fields):
@@ -331,9 +332,7 @@ class LiveBindings:
         )
         if int(flags) != 0 and int(flags) & ~numeric == 0:
             if int(flags) & int(ModelFlags.MODEL_PROPERTIES):
-                gravity = self.solver.model.gravity.numpy()
-                if not len(gravity) or not np.array_equal(gravity, np.broadcast_to(gravity[0], gravity.shape)):
-                    raise ValueError("Kinetic owner requires uniform gravity")
+                validate_gravity(self.solver.model, self.worlds)
             return
         for name, expected in self.model_plan_values.items():
             if not np.array_equal(getattr(self.solver.model, name).numpy(), expected):

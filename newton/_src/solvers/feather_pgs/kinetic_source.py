@@ -100,7 +100,8 @@ PINNED = {
         "_release": "58af3211560e7d4d26ca0b40e25d635e5ede62aec31568d600430a159fcb2715",
     },
     "kinetic_state.py": {
-        "_get_kernel": "80f53d36ce69b1d04b867d5bee52ae48a0d1bce771750867d7b3edd41c7ec187",
+        "_get_kernel": "7fc019e179269f7b16f819f0e3fd4fc74d2eca3f29ed956d312e15f0a9d22f9e",
+        "_world_gravity": "faffbf54ec341a09a0d99b459e6efe0956cc7b19026f6574c1bd3c99dc89806f",
         "_admit": "dad7435af0211e5b06822534a1003187a90f54ea997e4b20d5a52e123c85fe87",
         "_collect": "2c197cfa06bc5bbfeff5aa381ab6a7f594f61642a8b9bda765c4174e7dc1d6f6",
         "_COLLECT": "8409f401ce8985e5990e322896d36a57adee6185c5fb1f26c4f58ec7030e2b9b",

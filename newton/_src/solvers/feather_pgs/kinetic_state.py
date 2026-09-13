@@ -29,8 +29,18 @@ from .kinetic_types import (
 PublicationData = previous.PublicationData
 
 
+@wp.func_native(r"""
+    const int index=gravity.shape[0]==1?0:world;
+    return wp::array_t<wp::vec3>(gravity.data+index,1);
+""")
+def _world_gravity(gravity: wp.array[wp.vec3], world: int) -> wp.array[wp.vec3]:
+    """Provide a register-only one-element view for both original force laws."""
+    ...
+
+
 def checked_source():
     """Check only the retained publication/generalized source definitions."""
+    checked_definitions("kinetic_state.py", ("_world_gravity",))
     checked_definitions(
         "world_scan_publication.py",
         (
@@ -423,6 +433,7 @@ def _get_kernel(arch, finish):
             return
         if _admit(world, int(wp.static(finish)), plan, data, schedule, current, geometric) == 0:
             return
+        data.gravity = _world_gravity(data.gravity, world)
         address = _storage()
         q = data.joint_q
         qd = data.joint_qd

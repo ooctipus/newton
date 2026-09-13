@@ -180,3 +180,56 @@ namespaces still fail. An actual full Solver import reproduced the old failure
 before this correction, and a forged-namespace control remains rejected. The
 same physical and failure-audit requirements are retained for attempt02. No
 native, binding, lifecycle, Lab, budget or tolerance changes are made.
+
+### Second actual attempt: current-world gravity support gap
+
+Attempt02 used clean runner-corrected commit
+`9342b616505d954ff6951d16b60a19b6ceef447b`. The paired parent
+`/tmp/fpgs-kuka-kinetic-live-eager-paired512-20260913-02/manifest.json`, SHA256
+`26478712fdcd9add801bafd7a603b7e12c9db075e044729aee113abb5c67a98f`,
+failed before the first Solver.step on both cards; both audits retain zero
+observed calls and successful source guards. Parent final source/idle checks
+passed. The actual reset's MODEL_PROPERTIES notification reached the private
+binding, which rejected its nonuniform full gravity array. This was an actual
+input-support gap, not a performance or contact-solve failure.
+
+Model.gravity is documented as W local-world vectors plus a separate global
+world -1 tail. The unchanged Lift event writes local reset IDs only. Its
+deterministic curriculum can therefore differ from the unused global tail even
+when all owned local worlds agree. The old admission checked the whole array;
+both primary and retained free-body force consumers used gravity[0]. Merely
+removing the uniformity guard would incorrectly apply world0 gravity to other
+local worlds once they differ.
+
+The scoped correction supplies a register-only one-element view of the current
+owned-world gravity at the start of the existing construct/finish kernel. Both
+unchanged force consumers receive that view. The singleton implicit-world case
+retains index0; explicit local worlds use their own index and never consume the
+global tail. Static/body ownership is already checked against world-major local
+world IDs. Model notification still invalidates current caches. Gravity remains
+independent of held geometric mass, so no extra held refresh is introduced.
+No Lab/task change, new kernel, device allocation, panel, gravity copy, or
+floating force-law rewrite is added. All view work is inside the future charged
+producer/finish boundary. Original fallback kernels are unchanged; this is not
+a claim of a general FPGS per-world-gravity correction outside the private owner.
+
+The new regression failed on the old notification guard, then passed with three
+different owned-world gravities. It independently sums generalized gravitational
+force and applies the held operator in FP64 for primary23 and free6, using the
+existing 2^-17 scaled action bound. It also checks unchanged held T/free inverse,
+read-only gravity aliases and zero effect from changing the global tail.
+The current-to-next CPU lifetime test now uses those nonuniform local gravities.
+The source oracle retains all original244 records after reversing just the
+one view assignment, plus five separately pinned helper/closure records.
+Actual live GPU execution of this correction remains pending until root's
+next lease; no performance or convergence gate is relaxed.
+
+The authorized attempt03 also labels a correctness-only `world_gravity` event at
+physical call7. It temporarily sets world1 gravity to world0 plus a fixed small
+three-axis offset, sends the ordinary MODEL_PROPERTIES notification, and restores
+the original array plus notification after public/epoch checks. Cleanup also
+restores it if the diagnostic aborts. The task configuration and normal reset
+randomization remain untouched. This adds no call to Solver.step and changes no
+benchmark recipe; all reported harness timings remain inadmissible. The explicit
+event/restore CPU regression failed first, then passed. The full focused suite
+now has 42 passing tests; the next GPU outcome remains pending.

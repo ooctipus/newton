@@ -25,7 +25,7 @@ RETIRED = (
 
 def transition(step):
     """Select explicit diagnostic perturbations, never a performance workload."""
-    return {1: "force_target", 3: "subset_reset", 5: "odd_refresh"}.get(step)
+    return {1: "force_target", 3: "subset_reset", 5: "odd_refresh", 7: "world_gravity"}.get(step)
 
 
 def check_held(before, after, refreshed):
@@ -63,6 +63,7 @@ class Observer:
         self.cls, self.report = solver_type, report
         self.worlds, self.perturb = worlds, perturb
         self.pending, self.solver, self.reference_state = None, None, None
+        self.gravity_restore = None
         self.originals, self.replacements = {}, {}
         self.report.update(calls=[], force_exports=0, resets=0, perturbations=[])
 
@@ -131,9 +132,41 @@ class Observer:
             if step % 2 != 1:
                 raise ValueError("Odd-request control moved to an ordinary refresh")
             solver._mass_update_requested.fill_(1)
+        elif event == "world_gravity":
+            import newton  # noqa: PLC0415 - notify the actual model contract
+
+            old = solver.model.gravity.numpy().copy()
+            if old.shape != (self.worlds + 1, 3) or self.gravity_restore is not None:
+                raise ValueError("Require actual explicit-world gravity for the diagnostic")
+            changed = old.copy()
+            changed[1] = changed[0] + np.array([0.125, -0.25, 0.375], np.float32)
+            self.gravity_restore = (solver, old)
+            self.report["gravity_perturbation"] = {
+                "step": step,
+                "world": 1,
+                "before": old[1].tolist(),
+                "during": changed[1].tolist(),
+                "world0": changed[0].tolist(),
+                "global_tail": old[-1].tolist(),
+                "restored": False,
+                "scope": "One correctness-only call; no task/config or benchmark change",
+            }
+            solver.model.gravity.assign(changed)
+            solver.notify_model_changed(newton.ModelFlags.MODEL_PROPERTIES)
         if event is not None:
             self.report["perturbations"].append({"step": step, "event": event})
         return restores, event
+
+    def _restore_gravity(self):
+        """Restore after checks, then invalidate caches derived from the trial."""
+        if self.gravity_restore is not None:
+            import newton  # noqa: PLC0415 - same public notification after restoration
+
+            solver, original = self.gravity_restore
+            solver.model.gravity.assign(original)
+            solver.notify_model_changed(newton.ModelFlags.MODEL_PROPERTIES)
+            self.gravity_restore = None
+            self.report["gravity_perturbation"]["restored"] = True
 
     @staticmethod
     def _held(owner):
@@ -217,6 +250,7 @@ class Observer:
                 generation_min=int(slots.next_generation.numpy().min()),
             )
             self.report["calls"].append(record)
+            self._restore_gravity()
             print("KINETIC_LIVE_CALL", record, flush=True)
             return result
 
@@ -254,11 +288,14 @@ class Observer:
     def close(self):
         """Restore owned hooks without overwriting a foreign replacement."""
         changed = []
-        for name, replacement in self.replacements.items():
-            if getattr(self.cls, name) is replacement:
-                setattr(self.cls, name, self.originals[name])
-            else:
-                changed.append(name)
+        try:
+            self._restore_gravity()
+        finally:
+            for name, replacement in self.replacements.items():
+                if getattr(self.cls, name) is replacement:
+                    setattr(self.cls, name, self.originals[name])
+                else:
+                    changed.append(name)
         if changed:
             raise ValueError("Live probe hook ownership changed: " + repr(changed))
 
