@@ -2418,6 +2418,10 @@ class NarrowPhase:
             raise ValueError("NEWTON_HEIGHTFIELD_CELL_REJECT must be 0 or 1")
         self._heightfield_cell_reject_requested = cell_reject == "1"
         self._heightfield_cell_reject = self._heightfield_cell_reject_requested and has_heightfields and not has_meshes
+        packed_pairs = os.environ.get("NEWTON_NARROW_PHASE_PACKED_HEIGHTFIELD_PAIRS", "1")
+        if packed_pairs not in ("0", "1"):
+            raise ValueError("NEWTON_NARROW_PHASE_PACKED_HEIGHTFIELD_PAIRS must be 0 or 1")
+        self._heightfield_packed_pairs = packed_pairs == "1" and self._heightfield_cell_reject
         self.mesh_sdf_texture_only = mesh_sdf_texture_only
         self.has_generic_convex_pairs = has_generic_convex_pairs
         self.sdf_texture_paired_samples = sdf_texture_paired_samples
@@ -3030,6 +3034,7 @@ class NarrowPhase:
 
             # Launch midphase: finds overlapping triangles for both mesh and heightfield pairs
             second_dim = self.tile_size_mesh_convex if ENABLE_TILE_BVH_QUERY else 1
+            midphase_workers = self.num_tile_blocks
             midphase_kernel = narrow_phase_find_mesh_triangle_overlaps_kernel
             midphase_inputs = [
                 shape_types,
@@ -3048,6 +3053,12 @@ class NarrowPhase:
             ]
             if self._heightfield_cell_reject:
                 midphase_kernel = heightfield_cell_overlaps_kernel
+                if self._heightfield_packed_pairs:
+                    # Heightfield enumeration is scalar per pair, not a tiled
+                    # mesh-BVH query. Pack independent pairs into every lane,
+                    # retaining the same globally compacted triangle stream.
+                    midphase_workers = self.total_num_threads
+                    second_dim = 1
                 midphase_inputs = [
                     shape_transform,
                     shape_gap,
@@ -3059,11 +3070,11 @@ class NarrowPhase:
                     heightfield_elevations,
                     self.shape_pairs_mesh,
                     self.shape_pairs_mesh_count,
-                    self.num_tile_blocks,
+                    midphase_workers,
                 ]
             wp.launch(
                 kernel=midphase_kernel,
-                dim=[self.num_tile_blocks, second_dim],
+                dim=[midphase_workers, second_dim],
                 inputs=midphase_inputs,
                 outputs=[
                     self.triangle_pairs,
