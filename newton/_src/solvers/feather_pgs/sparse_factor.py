@@ -409,7 +409,7 @@ class SparseFactor:
     """Own every consumer of the selected packed held/current representation."""
 
     def __init__(self, solver, plan, host):
-        from .sparse_factor_rows import get_contact_kernel, get_solve_kernel  # noqa: PLC0415
+        from .sparse_factor_rows import get_contact_kernel, get_limit_kernel, get_solve_kernel  # noqa: PLC0415
 
         self.solver, self.plan, self.host = solver, plan, host
         self.data = SparseData()
@@ -423,6 +423,7 @@ class SparseFactor:
         self.kernels = SimpleNamespace(
             refresh=get_refresh_kernel(),
             predictor=get_predictor_kernel(),
+            limits=get_limit_kernel(),
             contacts=get_contact_kernel(),
             solve=get_solve_kernel(c),
         )
@@ -512,9 +513,10 @@ class SparseFactor:
             s._row_dropped_dense.zero_()
             s._row_dropped_mf.zero_()
             s._row_dropped_propagation.zero_()
-        wp.launch(
-            build_limit_prefix,
-            dim=s.world_count,
+        launch = wp.launch_tiled if device.is_cuda else wp.launch
+        launch(
+            self.kernels.limits if device.is_cuda else build_limit_prefix,
+            dim=[s.world_count] if device.is_cuda else s.world_count,
             inputs=[
                 self.plan,
                 self.data,
@@ -538,6 +540,7 @@ class SparseFactor:
                 s.diag,
                 s.dense_phase_bounds,
             ],
+            block_dim=32,
             device=device,
         )
         if contacts is not None and contacts.rigid_contact_max > 0:
@@ -731,6 +734,7 @@ class SparseFactor:
                 s.constraint_count,
                 rhs,
                 s.diag,
+                s.row_cfm,
                 s.impulses,
                 s.row_type,
                 s.row_parent,

@@ -14,6 +14,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import sparse_factor as sf
+from newton._src.solvers.feather_pgs import sparse_factor_rows as rows
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 
 ASSET = Path(
@@ -144,6 +145,21 @@ def unpack(owner):
     return W
 
 
+def unpack_rows(owner, solver, W, count):
+    """Interpret implicit limit codes and explicit contact packets for tests."""
+    types = solver.row_type.numpy()[0, :count]
+    code = owner.data.support.numpy()[0, :count]
+    z = owner.data.Z.numpy()[0, :count]
+    full = np.zeros((count, 43))
+    for row, value in enumerate(code):
+        if types[row] == 3:
+            full[row] = (1.0 if value % 2 == 0 else -1.0) * W[:, 42 - value // 2]
+        else:
+            n = owner.host["support_count"][value]
+            full[row, owner.host["support_nodes"][value, :n]] = z[row, :n]
+    return full
+
+
 def physical_rows(f):
     """Form current physical J independently of the native sparse packet."""
     s, o, c = f["solver"], f["owner"], f["contacts"]
@@ -239,6 +255,29 @@ def original_eight(J, Y, diag, rhs, types, parent, mu, vhat):
 
 
 class TestSparseFactor(unittest.TestCase):
+    def test_implicit_prefix_contract(self):
+        """Require a ballot owner and leave unused limit response bytes untouched."""
+        self.assertTrue(callable(rows.get_limit_kernel))
+        f = fixture()
+        s, o = f["solver"], f["owner"]
+        q = f["state"].joint_q.numpy()
+        qi = s._joint_limit_q_index.numpy()
+        lower = np.full(43, -np.inf, np.float32)
+        upper = -lower
+        lower[qi >= 0] = q[qi[qi >= 0]] - 0.001
+        upper[qi >= 0] = q[qi[qi >= 0]] + 0.001
+        f["model"].joint_limit_lower.assign(lower)
+        f["model"].joint_limit_upper.assign(upper)
+        o.data.Z.fill_(np.nan)
+        o.data.incident.fill_(np.nan)
+        s.diag.fill_(np.nan)
+        o.build_rows(f["state"], s, None, 0.0025)
+        self.assertEqual(int(s.constraint_count.numpy()[0]), 74)
+        np.testing.assert_array_equal(o.data.support.numpy()[0, :74], np.arange(12, 86))
+        self.assertTrue(np.isnan(o.data.Z.numpy()[0, :74]).all())
+        self.assertTrue(np.isnan(o.data.incident.numpy()[0, :74]).all())
+        self.assertTrue(np.isnan(s.diag.numpy()[0, :74]).all())
+
     def test_reject_other_canonical_producers(self):
         """Reject optional producers before they can touch retired buffers."""
         solver = SimpleNamespace(
@@ -281,6 +320,12 @@ class TestSparseFactor(unittest.TestCase):
         s = f["solver"]
         self.assertEqual(len(o.host["row"]), 434)
         self.assertEqual(int(o.host["support_count"].max()), 18)
+        for dof in range(6, 43):
+            template, col = o.host["limit_support"][dof], 42 - dof
+            np.testing.assert_array_equal(
+                o.host["support_nodes"][template, : o.host["support_count"][template]],
+                o.host["inverse_nodes"][col, : o.host["inverse_count"][col]],
+            )
         # Reconstruct every original ancestor H coefficient from current COM
         # inertia and screw inputs independently of native factorization.
         rebuilt = np.zeros((43, 43))
@@ -409,17 +454,21 @@ class TestSparseFactorCUDA(unittest.TestCase):
         o.check()
         count = int(s.constraint_count.numpy()[0])
         self.assertGreaterEqual(count, 9)
-        z = o.data.Z.numpy()[0, :count]
-        templates = o.data.support.numpy()[0, :count]
-        full = np.zeros((count, 43))
-        for row, tpl in enumerate(templates):
-            n = o.host["support_count"][tpl]
-            full[row, o.host["support_nodes"][tpl, :n]] = z[row, :n]
+        full = unpack_rows(o, s, W, count)
+        contact_rows = s.row_type.numpy()[0, :count] != 3
         J = physical_rows(f)
         np.testing.assert_allclose(full, (W @ J[:, ::-1].T).T, rtol=3e-5, atol=3e-6)
-        np.testing.assert_allclose(o.data.incident.numpy()[0, :count], J @ s.v_hat.numpy(), rtol=3e-5, atol=3e-6)
         np.testing.assert_allclose(
-            s.diag.numpy()[0, :count], np.sum(full * full, axis=1) + s.row_cfm.numpy()[0, :count], rtol=2e-5, atol=2e-6
+            o.data.incident.numpy()[0, :count][contact_rows],
+            (J @ s.v_hat.numpy())[contact_rows],
+            rtol=3e-5,
+            atol=3e-6,
+        )
+        np.testing.assert_allclose(
+            s.diag.numpy()[0, :count][contact_rows],
+            (np.sum(full * full, axis=1) + s.row_cfm.numpy()[0, :count])[contact_rows],
+            rtol=2e-5,
+            atol=2e-6,
         )
         before = s.v_hat.numpy().copy()
         s.v_out.assign(before)
@@ -449,9 +498,13 @@ class TestSparseFactorCUDA(unittest.TestCase):
         upper[qi >= 0] = q[qi[qi >= 0]] + 0.001
         f["model"].joint_limit_lower.assign(lower)
         f["model"].joint_limit_upper.assign(upper)
+        o.data.Z.fill_(np.nan)
+        o.data.incident.fill_(np.nan)
+        s.diag.fill_(np.nan)
         s.enable_contact_friction = False
         o.build_rows(f["state"], s, f["contacts"], 0.0025)
         self.assertEqual(int(s.constraint_count.numpy()[0]), 77)
+        np.testing.assert_array_equal(o.data.support.numpy()[0, :74], np.arange(12, 86))
         s.enable_contact_friction = True
         s.contact_shared_anchor = True
         shape = f["model"].shape_body.numpy()
@@ -463,14 +516,38 @@ class TestSparseFactorCUDA(unittest.TestCase):
         count = int(s.constraint_count.numpy()[0])
         self.assertEqual(count, 83)
         current = physical_rows(f)
-        pack = o.data.Z.numpy()[0, :count]
         tpl = o.data.support.numpy()[0, :count]
-        actual = np.zeros((count, 43))
-        for r, t in enumerate(tpl):
-            n = o.host["support_count"][t]
-            actual[r, o.host["support_nodes"][t, :n]] = pack[r, :n]
+        actual = unpack_rows(o, s, W, count)
         np.testing.assert_allclose(actual, (W @ current[:, ::-1].T).T, rtol=3e-5, atol=3e-6)
-        self.assertIn(18, o.host["support_count"][tpl])
+        self.assertIn(18, o.host["support_count"][tpl[74:]])
+        # Both active sides cross all three ballot batches. Poisoned retired
+        # fields must not enter RHS, restitution, solve or final decode.
+        before = np.random.default_rng(91).normal(0, 2, 43).astype(np.float32)
+        s.v_hat.assign(before)
+        o.build_rows(f["state"], s, f["contacts"], 0.0025)
+        current = physical_rows(f)
+        s.impulses.zero_()
+        s._stage4_compute_rhs_world(0.0025)
+        o.restitution(0.0025)
+        Y = np.linalg.solve(h, current.T).T
+        diagonal = np.sum(current * Y, axis=1) + s.row_cfm.numpy()[0, :count]
+        expected_v, expected_lam = original_eight(
+            current,
+            Y,
+            diagonal,
+            s.rhs.numpy()[0, :count],
+            s.row_type.numpy()[0, :count],
+            s.row_parent.numpy()[0, :count],
+            s.row_mu.numpy()[0, :count],
+            before,
+        )
+        o.solve(s.rhs, 8, 1.0, 0)
+        o.check()
+        np.testing.assert_allclose(s.v_out.numpy(), expected_v, rtol=3e-4, atol=3e-5)
+        np.testing.assert_allclose(s.impulses.numpy()[0, :count], expected_lam, rtol=3e-4, atol=3e-5)
+        self.assertTrue(np.isnan(o.data.Z.numpy()[0, :74]).all())
+        self.assertTrue(np.isnan(o.data.incident.numpy()[0, :74]).all())
+        self.assertTrue(np.isnan(s.diag.numpy()[0, :74]).all())
         # A row failure remains visible after a later successful refresh.
         o.data.status.fill_(4)
         s.mass_update_mask.fill_(1)

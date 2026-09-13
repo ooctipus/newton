@@ -35,7 +35,7 @@ def build_limit_prefix(
     diagonal: wp.array2d[float],
     phase: wp.array2d[int],
 ):
-    """Emit the original lower/upper candidate order directly as W columns."""
+    """Emit only original ordered metadata; limit action stays implicit in W."""
     group = wp.tid()
     art = p.group_to_art[group]
     world = p.art_to_world[art]
@@ -64,20 +64,7 @@ def build_limit_prefix(
             count += 1
             if row >= row_type.shape[1]:
                 continue
-            template = p.limit_support[local]
-            d.support[world, row] = template
-            norm = float(0.0)
-            for k in range(18):
-                node = p.support_nodes[template, k]
-                z = float(0.0)
-                if node >= 0:
-                    entry = p.index[node, 42 - local]
-                    if entry >= 0:
-                        z = sign * d.W[group, entry]
-                d.Z[world, row, k] = z
-                norm += z * z
-            diagonal[world, row] = norm + cfm
-            d.incident[world, row] = sign * vhat[dof]
+            d.support[world, row] = candidate
             row_type[world, row] = 3
             parent[world, row] = -1
             mu[world, row] = 0.0
@@ -88,6 +75,126 @@ def build_limit_prefix(
     counter[world] = count
     phase[world, 0] = count
     phase[world, 1] = count
+
+
+@cache
+def get_limit_kernel():
+    """Compact three candidate ballots in the original lower/upper order."""
+    source = r"""
+#if defined(__CUDA_ARCH__)
+    const int lane=threadIdx.x&31, art=p.group_to_art.data[group];
+    const int world=p.art_to_world.data[art], start=p.art_dof_start.data[art];
+    const int capacity=row_type.shape[1], base=world*capacity;
+    int count=0;
+    for(int batch=0;batch<3;++batch) {
+        const int candidate=batch*32+lane, local=candidate/2, side=candidate&1;
+        bool active=false;
+        float value=0.0f;
+        if(enabled && candidate<86) {
+            const int dof=start+local, qi=limit_q.data[dof];
+            if(qi>=0) {
+                const float bound=side?upper.data[dof]:lower.data[dof];
+                const float position=q.data[qi];
+                value=(side?-1.0f:1.0f)*(position-bound);
+                active=isfinite(bound) && (side?position>=bound-gap:position<=bound+gap);
+            }
+        }
+        const unsigned mask=__ballot_sync(0xffffffff,active);
+        const int row=count+__popc(mask&((1u<<lane)-1u));
+        count+=__popc(mask);
+        if(active && row<capacity) {
+            const int at=base+row;
+            d.support.data[at]=candidate;
+            row_type.data[at]=3;
+            parent.data[at]=-1;
+            mu.data[at]=0.0f;
+            row_beta.data[at]=beta;
+            row_cfm.data[at]=cfm;
+            phi.data[at]=value;
+            target.data[at]=0.0f;
+        }
+    }
+    if(lane==0) {
+        counter.data[world]=count;
+        phase.data[world*phase.shape[1]]=count;
+        phase.data[world*phase.shape[1]+1]=count;
+    }
+#endif
+"""
+
+    @wp.func_native(source)
+    def native(
+        group: int,
+        p: SparsePlan,
+        d: SparseData,
+        limit_q: wp.array[int],
+        lower: wp.array[float],
+        upper: wp.array[float],
+        q: wp.array[float],
+        enabled: int,
+        gap: float,
+        beta: float,
+        cfm: float,
+        counter: wp.array[int],
+        row_type: wp.array2d[int],
+        parent: wp.array2d[int],
+        mu: wp.array2d[float],
+        row_beta: wp.array2d[float],
+        row_cfm: wp.array2d[float],
+        phi: wp.array2d[float],
+        target: wp.array2d[float],
+        phase: wp.array2d[int],
+    ): ...
+
+    def prefix(
+        p: SparsePlan,
+        d: SparseData,
+        limit_q: wp.array[int],
+        lower: wp.array[float],
+        upper: wp.array[float],
+        q: wp.array[float],
+        vhat: wp.array[float],
+        enabled: int,
+        gap: float,
+        beta: float,
+        cfm: float,
+        counter: wp.array[int],
+        row_type: wp.array2d[int],
+        parent: wp.array2d[int],
+        mu: wp.array2d[float],
+        row_beta: wp.array2d[float],
+        row_cfm: wp.array2d[float],
+        phi: wp.array2d[float],
+        target: wp.array2d[float],
+        diagonal: wp.array2d[float],
+        phase: wp.array2d[int],
+    ):
+        group, _ = wp.tid()
+        native(
+            group,
+            p,
+            d,
+            limit_q,
+            lower,
+            upper,
+            q,
+            enabled,
+            gap,
+            beta,
+            cfm,
+            counter,
+            row_type,
+            parent,
+            mu,
+            row_beta,
+            row_cfm,
+            phi,
+            target,
+            phase,
+        )
+
+    prefix.__name__ = prefix.__qualname__ = "sparse_factor_limit_prefix_ballot"
+    return wp.kernel(enable_backward=False, module="unique")(prefix)
 
 
 @wp.kernel(enable_backward=False)
@@ -298,6 +405,7 @@ def get_solve_kernel(capacity: int):
     for(int r=lane;r<count;r+=32) {{
         const int type=row_type.data[base+r];
         if(type!=0 && type!=2 && type!=3)bad=1;
+        if(type==3 && (r>=74 || d.support.data[base+r]<12 || d.support.data[base+r]>=86))bad=1;
         if(type==2) {{
             const int par=parent.data[base+r];
             if(par<0 || par+2>=count || (r!=par+1 && r!=par+2))bad=1;
@@ -305,27 +413,45 @@ def get_solve_kernel(capacity: int):
         }}
     }}
     if(__ballot_sync(0xffffffff,bad)) {{if(lane==0)atomicOr(&d.status.data[world],4);return;}}
-    __shared__ float du[43], lam[{capacity}];
+    // The same held load serves implicit limits and the final physical decode.
+    // G1 has37 scalar joints: both active sides require at most74 prefix rows.
+    __shared__ float held[434], limit_diagonal[74], du[43], lam[{capacity}];
+    for(int k=lane;k<434;k+=32)held[k]=d.W.data[group*434+k];
     for(int k=lane;k<43;k+=32) du[k]=0.0f;
     for(int r=lane;r<count;r+=32) lam[r]=impulses.data[base+r];
+    __syncwarp();
+    for(int r=lane;r<count;r+=32) {{
+        if(row_type.data[base+r]!=3)continue;
+        const int code=d.support.data[base+r], col=42-code/2;
+        float norm=0.0f;
+        for(int k=0;k<p.inverse_count.data[col];++k) {{
+            const int node=p.inverse_nodes.data[col*18+k];
+            const float value=held[p.index.data[node*43+col]];
+            norm+=value*value;
+        }}
+        limit_diagonal[r]=norm+row_cfm.data[base+r];
+    }}
     __syncwarp();
     for(int iteration=0;iteration<iterations;++iteration) {{
         int changed=0;
         for(int row=0;row<count;++row) {{
             const int type=row_type.data[base+row];
             if(type==2 && iteration<friction_start) {{ if(lane==0)lam[row]=0.0f; __syncwarp(); continue; }}
-            const float denom=diagonal.data[base+row];
+            const float denom=type==3?limit_diagonal[row]:diagonal.data[base+row];
             if(!(denom>0.0f))continue;
-            const int tpl=d.support.data[base+row], length=p.support_count.data[tpl];
-            const int node=lane<length?p.support_nodes.data[tpl*18+lane]:-1;
-            const float z=lane<length?d.Z.data[(base+row)*18+lane]:0.0f;
+            const int tpl=d.support.data[base+row], col=type==3?42-tpl/2:0;
+            const int length=type==3?p.inverse_count.data[col]:p.support_count.data[tpl];
+            const int node=lane<length?(type==3?p.inverse_nodes.data[col*18+lane]:p.support_nodes.data[tpl*18+lane]):-1;
+            const float sign=(tpl&1)?-1.0f:1.0f;
+            const float z=lane<length?(type==3?sign*held[p.index.data[node*43+col]]:d.Z.data[(base+row)*18+lane]):0.0f;
             float dot=lane<length?z*du[node]:0.0f;
             for(int s=16;s>0;s>>=1)dot+=__shfl_down_sync(0xffffffff,dot,s);
             dot=__shfl_sync(0xffffffff,dot,0);
             float delta=0.0f,sibling_delta=0.0f;
             int sibling=-1;
             if(lane==0) {{
-                const float old=lam[row], residual=dot+d.incident.data[base+row]+rhs.data[base+row];
+                const float incident=type==3?sign*vhat.data[start+tpl/2]:d.incident.data[base+row];
+                const float old=lam[row], residual=dot+incident+rhs.data[base+row];
                 float next=old+omega*(-residual/denom);
                 if(type==0 || type==3)next=fmaxf(next,0.0f);
                 else if(type==2) {{
@@ -356,7 +482,7 @@ def get_solve_kernel(capacity: int):
     }}
     for(int col=lane;col<43;col+=32) {{
         float value=0.0f;
-        for(int k=0;k<p.inverse_count.data[col];++k) {{ const int row=p.inverse_nodes.data[col*18+k];value+=d.W.data[group*434+p.index.data[row*43+col]]*du[row]; }}
+        for(int k=0;k<p.inverse_count.data[col];++k) {{ const int row=p.inverse_nodes.data[col*18+k];value+=held[p.index.data[row*43+col]]*du[row]; }}
         vout.data[start+42-col]=vhat.data[start+42-col]+value;
     }}
     for(int r=lane;r<count;r+=32)impulses.data[base+r]=lam[r];
@@ -371,6 +497,7 @@ def get_solve_kernel(capacity: int):
         counts: wp.array[int],
         rhs: wp.array2d[float],
         diagonal: wp.array2d[float],
+        row_cfm: wp.array2d[float],
         impulses: wp.array2d[float],
         row_type: wp.array2d[int],
         parent: wp.array2d[int],
@@ -388,6 +515,7 @@ def get_solve_kernel(capacity: int):
         counts: wp.array[int],
         rhs: wp.array2d[float],
         diagonal: wp.array2d[float],
+        row_cfm: wp.array2d[float],
         impulses: wp.array2d[float],
         row_type: wp.array2d[int],
         parent: wp.array2d[int],
@@ -406,6 +534,7 @@ def get_solve_kernel(capacity: int):
             counts,
             rhs,
             diagonal,
+            row_cfm,
             impulses,
             row_type,
             parent,

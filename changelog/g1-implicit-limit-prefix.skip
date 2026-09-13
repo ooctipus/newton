@@ -1,0 +1,2 @@
+Replace private G1 sparse limit materialization with ordered implicit columns
+inside the existing default-off experimental solver; public APIs are unchanged.
