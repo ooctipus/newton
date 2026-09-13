@@ -287,12 +287,13 @@ def get_contact_kernel():
 
 
 @cache
-def get_solve_kernel(capacity: int):
+def get_solve_kernel(capacity: int, *, minimum_count: int = -1):
     """Apply original current-friction GS and decode the complete43 velocity."""
     source = f"""
 #if defined(__CUDA_ARCH__)
     const int lane=threadIdx.x&31, art=p.group_to_art.data[group], world=p.art_to_world.data[art];
     const int start=p.art_dof_start.data[art], count=counts.data[world], base=world*{capacity};
+    if(count<={minimum_count})return;
     if (!d.valid.data[world] || d.status.data[world] || count>{capacity}) return;
     int bad=0;
     for(int r=lane;r<count;r+=32) {{
@@ -417,5 +418,6 @@ def get_solve_kernel(capacity: int):
             vout,
         )
 
-    solve.__name__ = solve.__qualname__ = f"sparse_factor_gs43_s18_c{capacity}"
+    suffix = f"_gt{minimum_count}" if minimum_count >= 0 else ""
+    solve.__name__ = solve.__qualname__ = f"sparse_factor_gs43_s18_c{capacity}{suffix}"
     return wp.kernel(enable_backward=False, module="unique")(solve)

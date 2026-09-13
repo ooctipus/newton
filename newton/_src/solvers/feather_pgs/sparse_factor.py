@@ -436,6 +436,10 @@ class SparseFactor:
         solver._H_bufs = None
         solver._J_bufs = None
         solver._memset_stream = None
+        if os.environ.get("FEATHER_PGS_REGISTER_RESIDUAL") == "1":
+            from .sparse_register_gram import install  # noqa: PLC0415
+
+            install(self)
 
     def begin(self):
         """Reject changed execution ownership before any retired buffer is read."""
