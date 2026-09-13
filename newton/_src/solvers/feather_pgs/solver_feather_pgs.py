@@ -2416,6 +2416,22 @@ class SolverFeatherPGS(SolverBase):
 
             self._single_factor = create_single_factor(self)
 
+        self._sparse_factor = None
+        if os.environ.get("FEATHER_PGS_SPARSE_FACTOR") == "1":
+            from .sparse_factor import create_owner as create_sparse_factor  # noqa: PLC0415
+
+            if (
+                _FPGS_CAPTURE
+                or _GROUPED_CHECK
+                or _CHECK_ROWS
+                or _CHECK_ROWS_FUSED
+                or _DEBUG_CACHE_CMP
+                or _INK_CHECK
+                or _WR_CHECK
+            ):
+                raise ValueError("Sparse factor excludes canonical factor/row debug readers")
+            self._sparse_factor = create_sparse_factor(self)
+
     def _update_kinematic_state(self) -> None:
         """Refresh cached kinematic flags and effective joint armature."""
         model = self.model
@@ -2457,6 +2473,8 @@ class SolverFeatherPGS(SolverBase):
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         """Refresh cached solver data after supported model changes."""
+        if getattr(self, "_sparse_factor", None) is not None:
+            self._sparse_factor.validate_notification(flags)
         if self._row_packets is not None:
             self._row_packets.validate_notification(flags)
         if getattr(self, "_joint_world", None) is not None:
@@ -6709,6 +6727,17 @@ class SolverFeatherPGS(SolverBase):
             return
         if friction_start_iteration is None:
             friction_start_iteration = self._contact_friction_start_iteration(iterations)
+        if self._sparse_factor is not None:
+            if (
+                row_phase_override not in (None, 0)
+                or iteration_offset
+                or freeze_drive_rows
+                or defer_dense_response
+                or soft_relax
+            ):
+                raise RuntimeError("Sparse factor requires the complete original interleaved solve")
+            self._sparse_factor.solve(dense_rhs, iterations, omega, int(friction_start_iteration))
+            return
         if self._sparse_diagonal_contact_solve:
             if row_phase_override not in (None, 0):
                 raise RuntimeError("sparse diagonal response only supports the interleaved row phase")
@@ -8367,6 +8396,8 @@ class SolverFeatherPGS(SolverBase):
         collide_done_event=None,
     ):
         self._single_factor_active = False
+        if self._sparse_factor is not None:
+            self._sparse_factor.begin()
         if self._single_factor is not None:
             from .single_factor import supported as single_factor_supported  # noqa: PLC0415
 
@@ -9288,6 +9319,8 @@ class SolverFeatherPGS(SolverBase):
         demand for calibration, not this boolean status as a size estimate.
         """
         status = self.constraint_capacity_status()
+        if self._sparse_factor is not None:
+            self._sparse_factor.check()
         settings = {
             "dense": f"dense_max_constraints={self.dense_max_constraints}",
             "matrix_free": f"mf_max_constraints={self.mf_max_constraints}",
@@ -10342,6 +10375,9 @@ class SolverFeatherPGS(SolverBase):
         # the per-step memset.
         for size in self.size_groups:
             n_arts = self.n_arts_by_size[size]
+            if self._sparse_factor is not None:
+                self._sparse_factor.refresh(state_aug)
+                continue
             if size == self._compact_diagonal_mass_size:
                 if self._direct_compact_diagonal_inertia:
                     wp.launch(
@@ -10636,6 +10672,8 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage2_cholesky_tiled(self, size: int):
+        if self._sparse_factor is not None:
+            return
         model = self.model
         n_arts = self.n_arts_by_size[size]
         if self._crba_cholesky_kernels_by_size[size] is not None:
@@ -10753,6 +10791,9 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage3_trisolve_tiled(self, size: int, state_aug: State):
+        if self._sparse_factor is not None:
+            self._sparse_factor.predict(state_aug)
+            return
         model = self.model
         n_arts = self.n_arts_by_size[size]
 
@@ -10847,6 +10888,9 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage4_build_rows(self, state_in: State, state_aug: State, control: Control, contacts: Contacts, dt: float):
+        if self._sparse_factor is not None:
+            self._sparse_factor.build_rows(state_in, state_aug, contacts, dt)
+            return
         model = self.model
         max_constraints = self.dense_max_constraints
         mf_active = self._has_free_rigid_bodies
@@ -12537,6 +12581,8 @@ class SolverFeatherPGS(SolverBase):
         self.diag.zero_()
 
     def _stage4_hinv_jt_tiled(self, size: int):
+        if self._sparse_factor is not None:
+            return
         if self._single_factor_active:
             self._single_factor.response()
             return
@@ -13087,6 +13133,8 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage4_finalize_world_diag_cfm(self):
+        if self._sparse_factor is not None:
+            return
         if self._row_packets is not None:
             return  # Current row owner and general response each add CFM exactly once.
         if self._compact_contact_boundary:
@@ -13201,6 +13249,8 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage4_compute_matrix_free_diag(self):
+        if self._sparse_factor is not None:
+            return
         if self._single_factor_active:
             return  # Forward response already wrote every active world's diagonal.
         if self._row_packets is not None:
@@ -13376,6 +13426,11 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage4_apply_world_contact_restitution(self, dt: float, *, matrix_free: bool) -> None:
         """Replace geometric contact bias for impacts selected from ``v_hat``."""
+        if self._sparse_factor is not None:
+            if not matrix_free:
+                raise RuntimeError("Sparse factor excludes non-matrix-free restitution")
+            self._sparse_factor.restitution(dt)
+            return
         if self._row_packets is not None:
             return  # The current packet producer applies the same incident-velocity law.
         if matrix_free:
