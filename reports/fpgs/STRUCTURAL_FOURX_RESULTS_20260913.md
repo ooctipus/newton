@@ -1,6 +1,6 @@
 # Structural window: integrated discoveries
 
-Checkpoint: 2026-09-13 15:35 UTC. Work continues toward the 24-hour window in
+Checkpoint: 2026-09-13 16:02 UTC. Work continues toward the 24-hour window in
 `STRUCTURAL_FOURX_20260913.md`; the 4x target is **not achieved**. These are
 discoveries, not replacements for accepted baselines except where repeat
 evidence is explicitly given. No candidate has met the complete 4x target.
@@ -138,9 +138,20 @@ Two independent G1 structural paths have reached different gates:
   the predictor deliberately propagates NaNs after any sticky error. Thus
   factor conditioning is not the first fault. Allocation records a 1/3-row
   decision, while the original metadata producer separately recomputes friction
-  admission; this is a concrete seam to inspect, not yet the proven cause.
-  First-failure row inputs are being captured before later graph steps overwrite
-  them. No pivot clamp, status relaxation or tolerance change is authorized.
+  admission. A first-error device snapshot now proves that seam corrupts rows
+  on both cards: contact slot30 reserves one row but metadata writes three,
+  overwriting the next three-row packet at slot31. The damaged parent/type
+  topology triggers status4. Allocated intervals cover the prefix correctly,
+  all capacity flags are zero, and inputs are finite. This is not undersizing.
+  The shared producer fix54fc1e09 consumes the allocator's existing recorded
+  extent; sparse caller3bae8f77 binds that argument. Geometry, friction law,
+  thresholds and buffers are unchanged. Both opposite-admission regressions
+  fail on the old producer and pass after correction. Captured raw geometry
+  and neighbor-order CPU replays pass, with controlled materials explicitly
+  scoped as extent tests. Paired CUDA physical checks and complete live cost
+  are next. Accepted G1's ROWS_MASKED path uses a different producer; this does
+  not establish corruption in its frozen reference. No pivot clamp, status
+  relaxation or tolerance change is authorized.
 
 Post-cell G1 node attribution locates the remaining work (exclusive diagnostic
 milliseconds, RTX / GB): collision 9.364628 / 24.030058; dynamics
@@ -168,6 +179,23 @@ not a repeated promotion result. G1 still needs major FPGS-specific work
 elimination, as well as further shared collision improvement, to approach 4x.
 Other tasks' historical corrected-MJ ratios are not silently refreshed by
 these new G1/Kuka FPGS-only discoveries.
+
+The finite-query successor has now also been compared fairly with both
+backends using CELL1/FINITE1 on clean70f17773, whose native code is882e468a:
+
+| Device | FPGS physics | Corrected MJWarp physics | MJWarp / FPGS |
+| --- | ---: | ---: | ---: |
+| RTX PRO 6000 | 35.598116925 ms | 43.155616100 ms | 1.212301x |
+| GB300 | 38.107064225 ms | 42.935425875 ms | 1.126705x |
+
+Environment wall times are49.500687650 /57.684546450 ms RTX and
+52.346774825 /56.868676926 ms GB. Actual finite dispatch and handled live
+triangle entries are observed on both backends at the existing untimed
+boundaries. MJ uses external Newton contacts, the correction guard passes,
+warning mask is zero, and all original capacity checks pass. This is one
+discovery round, not evolving-task physical qualification or promotion.
+The large GB collision saving benefits MJ too; it cannot be credited as an
+equally large improvement in the FPGS/MJ ratio.
 
 ## Fresh corrected Allegro comparison and next work screen
 
@@ -242,7 +270,7 @@ and complete causal evidence pushed in experimental branch commit13f17b07;
 its runtime is identical to measured e96. A larger producer/row-state ownership
 study is separate, CPU/source-only work, not a funded implementation yet.
 
-## New finite terrain query: implemented, not GPU-qualified yet
+## Finite terrain query: physical diagnostics and first whole-task gain
 
 An isolated successor of cell-only a994 preserves the globally compacted
 triangle stream and replaces generic GJK/MPR plus iterative manifold discovery
@@ -276,13 +304,35 @@ These are CPU diagnostic results, not convergence over an evolving task or
 measured speedup. The first paired GPU run passes six control methods and
 native synthetic geometry on each card, but fails actual-scene restore/replay
 assertions that conflate equal manifold counts with marker lifetime. The
-failure is preserved. A complete diagnostic will separate logical stream and
-marked-entry identity from manifold cardinality, with the same empty/regrow
-control applied to the original query. No stale-contact fix or GPU physical
-acceptance is claimed yet; full-task timing is prepared but not launched.
+failure is preserved. Test-only successor70f17773 separates logical stream
+and marked-entry identity from manifold cardinality, applying the same
+empty/regrow and three continuing graph replays to the original query too.
+Both GPUs pass all eight methods with no skips. Direct contacts stay exactly
+700/878 original and660/761 candidate through every restore/replay. Only the
+reducer's redundant counts vary, including for the original query itself;
+the original count-gate failures remain recorded. Logical triangle sets,
+marked-entry sets and contacting-shape coverage remain exact. Maximum
+lifecycle minimum-separation change is1.001e-7 m; all2398 native queries/card
+reach the independent convex-QP/witness audit, with maximum finite-surface
+error2.063e-7 m. This diagnoses a test assumption, not a runtime marker fix.
+
+The first complete 16K A/B passes source, actual activation, capacity and
+final-idle checks on all four captures:
+
+| Device | Cell-only physics | Finite-query physics | Physics gain | Cell-only wall | Finite-query wall |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| RTX PRO 6000 | 37.955425075 | 35.672949900 | 1.063983x | 51.614142 | 50.134362 |
+| GB300 | 52.037375725 | 38.089826200 | 1.366175x | 66.959269 | 52.011439 |
+
+Net savings2.282475 /13.947550 ms exceed the discovery budgets2 /10 ms.
+This is a real complete-path discovery, not repeated gain or full evolving
+contact-convergence qualification. It is not composed with sparse G1 yet.
+Same-source diagnostic nodes are queued to attribute all retained query,
+fallback, reducer, downstream and memory work. Their original auxiliary-graph
+analyzer failures, if any, will remain failures with a separate complete reader.
 The experimental replacement allowance is 1.922660 ms RTX for
 2 ms net saving, or 7.342261 ms GB for 10 ms net saving, including fallback
-scan and downstream cost changes. Do not add these unmeasured savings to G1's
+scan and downstream cost changes. Do not add these separate savings to G1's
 unqualified sparse solver or reuse an uncorrected shared-MJ denominator.
 
 ## Exact sources and completed owners
@@ -386,7 +436,24 @@ boundaries; this is not a claim of complete trajectory equivalence.
   `/tmp/fpgs-heightfield-finite-physical-paired-20260913-01` is reaped exit1,
   with final source/idle checks passed. Runtime and tests were clean882e468a;
   both cards run eight methods with zero skips, retaining the lifecycle
-  assertion failures described above. No performance window was launched.
+  assertion failures described above. No performance window was launched in
+  that failed physical run. Test-only successor70f17773 passes paired physical
+  parent `/tmp/fpgs-heightfield-finite-physical-paired-20260913-02`, manifest
+  `29fceb8c974ba12bbb60c0ba7e83cda0645f7319338c8a70f9bfaba6f4049624`.
+  Complete live parent
+  `/tmp/fpgs-g1-finite-query-live-paired16k-20260913-01`, manifest
+  `aaa5ea37c797b52b9a0b009db996125940e5102300ef3f92a73a7233372d2f31`,
+  is reaped exit0/source-idle passed. The shared-MJ parent
+  `/tmp/fpgs-g1-finite-query-shared-mj-paired16k-20260913-01` is likewise
+  reaped exit0/source-idle passed. Both use unchanged native882e468a.
+- Sparse first-row diagnostic
+  `/tmp/fpgs-g1-sparse-row-failure-paired16k-20260913-01`, manifest
+  `31816f1c7e3cac17a7abfca02f9705135c1296262408a4925eba720bb64979d7`,
+  is reaped exit0/source-idle passed. RTX world2817 at graph410 and GB
+  world5335 at graph368 reproduce the slot30/31 overwrite. Diagnostics retain
+  raw IDs, neighbor order, current geometry and first-error row bytes, without
+  host synchronization inside the physics graph. Fix source3bae8f77 is frozen;
+  paired physical parent43599 is active at this checkpoint, not completed.
 - Fresh Allegro parent
   `/tmp/fpgs-allegro-fixed-backends-paired16k-20260913-02` exited zero.
   Attempt01 is preserved: MJ construction failed because the wrapper tried
@@ -400,7 +467,8 @@ boundaries; this is not a claim of complete trajectory equivalence.
   `/tmp/fpgs-allegro-fixed-node-owner-EE86jIM8/audit.py`. The failure is
   preserved; no GPU rerun or rewritten exit status was used for formatting.
 
-All feature modes remain explicit/default-off. Next bounded work is Kuka
-complete producer/row-state feasibility, G1's first-failing-row diagnosis, and
-the finite terrain query's CUDA physical and complete-cost gates. Keyboard's residual termination
+All feature modes remain explicit/default-off. Next bounded work is corrected
+sparse G1's complete cost, finite-query attribution and physical qualification,
+and Allegro's exact static-seed convex support feasibility. Kuka's larger
+producer ownership study is conditional, not an implemented gain. Keyboard's residual termination
 discrepancy remains parked at the user's request.
