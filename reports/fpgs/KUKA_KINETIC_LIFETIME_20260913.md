@@ -409,3 +409,61 @@ Evidence roots and SHA256:
 
 All accepted task performance tables remain unchanged. The implementation
 successors are experiments, not promoted Newton runtime changes.
+
+## Fresh matched contact correction, 03:03 UTC
+
+The unchanged prototype passes its fresh complete-boundary GPU checks on both
+cards: own current prediction, independent held action, every active world's
+original same-order eight, and repeated two-call graphs. The first actual
+solve remains the second call's state; this is not a captured phase1 replay.
+The subsequent fresh baseline cost completes with40 samples per card.
+
+The contact-triplet successor then passes both the independent historical512
+current-geometry check and fresh16384-world complete path on both GPUs, with
+two tests each and no skips/errors. Its matched cost also passes source,
+readonly, per-order original-eight, and final GPU-idle guards.
+
+| Complete replacement section, ms/env equivalent | RTX | GB |
+| --- | ---: | ---: |
+| Fresh unchanged prototype | 10.339200020 | 9.249216080 |
+| Fresh contact-triplet successor | 9.552639961 | 8.540672302 |
+| Time removed | 0.786560059 | 0.708543777 |
+| Section speedup | 1.08x | 1.08x |
+| Previously derived2x-handoff screening budget | 5.822196650 | 5.122562667 |
+
+This is a measured structural section gain, **not whole-physics performance**
+or convergence acceptance. Collision generation, callbacks, cold repair and
+Lab/sensors remain outside. The at-least1ms correction hypothesis was not
+reached; the42.5% scalar-action count was never a timing prediction. Keep
+this source fixed rather than tune it for the remaining fractions. The
+coupled representation correction is the next already-authorized experiment.
+Fresh and historical timings are different states, not an A/B gain comparison.
+
+The unchanged fresh timing range is10.191744--11.297664ms RTX and
+9.183616--9.323008ms GB. The triplet range is9.413504--9.593728ms RTX and
+8.454784--8.593920ms GB. This is one matched sequence, not yet repeated live
+task evidence. No accepted Kuka or Franka number is replaced.
+
+Evidence and frozen source pins:
+
+- Fresh physical parent:
+  `/tmp/fpgs-kuka-fresh-boundary-physical-paired16k-20260913-01`, manifest
+  `e4b81f3aaae36f1ec9d5a7fdcb8d9690fa69aab57e11cef2d53398ed7404feb5`.
+- Fresh baseline cost:
+  `/tmp/fpgs-kuka-fresh-boundary-cost-paired16k-20260913-01`, manifest
+  `1a0fc7e31c3671134b5b6f1e0cf58cf970bd8b68c2eea6bc11c6c671a4d6c890`.
+- Triplet physical parent:
+  `/tmp/fpgs-kuka-triplet-boundary-physical-paired16k-20260913-01`, manifest
+  `542703b95aba06b875b63cecf96a123fc64107c66ba790d11fb317dd134116e5`.
+- Triplet cost parent:
+  `/tmp/fpgs-kuka-triplet-fresh-boundary-cost-paired16k-20260913-01`, manifest
+  `396a39438c420c1b346a93e18d66c9aa1e3b7033141386bc8e3c89674c86e107`.
+- Native `kinetic_rows_triplet.py` in the shared kinetic scratch directory:
+  `8bbf458d280d7447afc983b25669c5dc09c6fbaae4788981b8fd6ff03e234fcc`.
+- `run_triplet_fresh_boundary_cost.py`:
+  `76287917225b2eb7b75b72e8ecec3ba9612859d34ba67530e904a0f84dc0cfad`.
+
+The runner differs from the fresh baseline only in its description and
+pre-setup contact installation. It retains10 warm samples then40 measured
+samples, two physical calls scaled by four, and the same untimed physical
+checks. All dt/substeps/eight sweeps/capacities remain unchanged.
