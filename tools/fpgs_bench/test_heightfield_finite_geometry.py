@@ -159,7 +159,7 @@ def current_fixture(gpu, device):
 @cache
 def stream_query_kernel():
     """Use the production ABI on the exact decoded current triangle stream."""
-    from newton._src.geometry.heightfield_finite import QueryResult, query  # noqa: PLC0415
+    from newton._src.geometry.heightfield_finite import QueryResult, query_contacts  # noqa: PLC0415
     from newton._src.utils.heightfield import HeightfieldData, get_triangle_shape_from_heightfield  # noqa: PLC0415
 
     @wp.kernel(enable_backward=False, module="unique")
@@ -185,7 +185,15 @@ def stream_query_kernel():
             transforms[triple[1]]
         )
         threshold = gaps[0] + gaps[triple[1]] + margins[0] + margins[triple[1]]
-        output[i] = query(tri.scale, tri.auxiliary, center, quat, scales[triple[1]] * 0.5, threshold)
+        output[i] = query_contacts(
+            tri.scale,
+            tri.auxiliary,
+            center,
+            quat,
+            scales[triple[1]] * 0.5,
+            threshold,
+            margins[0] + margins[triple[1]],
+        )
         vertices[i, 0] = wp.vec3()
         vertices[i, 1] = tri.scale
         vertices[i, 2] = tri.auxiliary

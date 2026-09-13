@@ -189,6 +189,34 @@ def query(e1: wp.vec3, e2: wp.vec3, center: wp.vec3, rotation: wp.quat, half: wp
     ...
 
 
+@wp.func
+def query_contacts(
+    e1: wp.vec3,
+    e2: wp.vec3,
+    center: wp.vec3,
+    rotation: wp.quat,
+    half: wp.vec3,
+    threshold: float,
+    margin_sum: float,
+) -> QueryResult:
+    """Retain original speculative face manifolds at the current finite-sweep law."""
+    result = query(e1, e2, center, rotation, half, threshold)
+    count = int(result[0])
+    if count > 0:
+        normal = wp.vec3(result[1], result[2], result[3])
+        top_normal = wp.normalize(wp.cross(e1, e2))
+        if wp.dot(normal, top_normal) > 1.0 - 1.0e-6:
+            minimum = result[7]
+            for k in range(1, count):
+                minimum = wp.min(minimum, result[7 + 4 * k])
+            # Positive-clearance rows do not enter the retained reducer's
+            # spatial support slots. Keep their original manifold instead of
+            # relying on depth ties to preserve finite-iteration support.
+            if minimum > margin_sum and minimum <= threshold:
+                result[0] = -1.0
+    return result
+
+
 def bind_model(narrow, model):
     """Bind immutable cuboid hull bounds once; all dynamic geometry stays current."""
     bounds = np.zeros((model.shape_count, 2, 3), dtype=np.float32)
@@ -265,13 +293,14 @@ def create_query_kernel(writer_func):
             center_world = wp.transform_get_translation(xb) + wp.quat_rotate(qb, wp.cw_mul(bounds[b, 0], scale))
             center = wp.quat_rotate_inv(qa, center_world - origin)
             gap = shape_gap[a] + shape_gap[b]
-            value = query(
+            value = query_contacts(
                 geom.scale,
                 geom.auxiliary,
                 center,
                 wp.quat_inverse(qa) * qb,
                 wp.cw_mul(bounds[b, 1], scale),
                 gap + margin_a + margin_b,
+                margin_a + margin_b,
             )
             count = int(value[0])
             if count < 0:

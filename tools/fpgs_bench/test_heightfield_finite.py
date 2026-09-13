@@ -31,6 +31,20 @@ def evaluate(
     output[0] = finite.query(e1, e2, center, rotation, half, 0.04)
 
 
+@wp.kernel(enable_backward=False)
+def evaluate_contact_policy(center: wp.vec3, margin_sum: float, output: wp.array[finite.QueryResult]):
+    """Exercise actual writer admission independently of pure geometry validity."""
+    output[0] = finite.query_contacts(
+        wp.vec3(2.0, 0.0, 0.0),
+        wp.vec3(0.0, 2.0, 0.0),
+        center,
+        wp.quat_identity(),
+        wp.vec3(0.1, 0.1, 0.1),
+        0.04,
+        margin_sum,
+    )
+
+
 class TestHeightfieldFinite(unittest.TestCase):
     def run_query(self, e1, e2, center, rotation=(0.0, 0.0, 0.0, 1.0), half=(0.1, 0.1, 0.1)):
         """Evaluate one actual native CPU query without a saved response oracle."""
@@ -73,6 +87,20 @@ class TestHeightfieldFinite(unittest.TestCase):
                 self.assertAlmostEqual(float(result[7]), 0.03, delta=2e-6)
             else:
                 self.assertGreater(float(result[7]), 0.5)
+
+    def test_positive_face_uses_original_manifold(self):
+        """Keep separated shell faces in the original manifold while retaining other queries."""
+        output = wp.empty(1, dtype=finite.QueryResult, device="cpu")
+        for center, fallback in (
+            ((0.4, 0.4, 0.13), True),
+            ((0.4, 0.4, 0.12), False),
+            ((0.4, 0.4, 0.11), False),
+            ((0.4, 0.4, 0.17), False),
+            ((1.5, 1.5, 0.13), False),
+        ):
+            wp.launch(evaluate_contact_policy, 1, inputs=[wp.vec3(*center), 0.02, output], device="cpu")
+            result = output.numpy()[0]
+            self.assertEqual(result[0] < 0, fallback, msg=str((center, result.tolist())))
 
     def test_rotated_deep_and_parallel_edge(self):
         """Retain physical top penetration and both finite parallel-edge endpoints."""
