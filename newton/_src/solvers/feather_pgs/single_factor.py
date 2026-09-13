@@ -108,9 +108,9 @@ def get_decode_kernel(dofs: int):
             return
         start = articulation_dof_start[art]
         factor = wp.tile_load(L[group], shape=(n, n), bounds_check=False)
-        delta = wp.tile_load(v_out, shape=(n,), offset=start, bounds_check=False)
+        delta = wp.tile_load(v_out, shape=(n,), offset=(start,), bounds_check=False)
         physical = wp.tile_upper_solve(wp.tile_transpose(factor), wp.tile_reshape(delta, shape=(n, 1)))
-        prediction = wp.tile_load(v_hat, shape=(n,), offset=start, bounds_check=False)
+        prediction = wp.tile_load(v_hat, shape=(n,), offset=(start,), bounds_check=False)
         result = prediction + wp.tile_reshape(physical, shape=(n,))
         wp.tile_store(v_out, result, offset=start, bounds_check=False)
 

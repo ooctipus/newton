@@ -11,6 +11,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import single_factor
+from newton._src.solvers.feather_pgs.kernels import finalize_world_diag_cfm
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_mf_gs_kernel
 
 
@@ -213,7 +214,7 @@ class TestSingleFactorCUDA(unittest.TestCase):
             "world_dof_indices": self.array(self.maps),
             "world_deferred_dof_mask": self.array(np.zeros((4, 43), np.int32)),
             "rhs_bias": self.array(rng.normal(0, 0.1, (4, 100)).astype(np.float32)),
-            "world_diag": self.array(diagonal),
+            "world_diag": self.a["diag"] if kinetic else self.array(diagonal),
             "world_row_w": self.array(np.ones((4, 100), np.float32)),
             "world_impulses": self.array(np.zeros((4, 100), np.float32)),
             "J_world": self.a["world_J"] if kinetic else self.array(self.world_J),
@@ -248,6 +249,7 @@ class TestSingleFactorCUDA(unittest.TestCase):
         self.launch_response()
         reference = self.solve_values(kinetic=False)
         candidate = self.solve_values(kinetic=True)
+        cfm = self.array(np.full((4, 100), 0.001, np.float32))
         controls = []
         for kinetic, values in ((False, reference), (True, candidate)):
             kernel = _get_pgs_solve_mf_gs_kernel(
@@ -264,6 +266,13 @@ class TestSingleFactorCUDA(unittest.TestCase):
 
         def run():
             self.launch_response()
+            wp.launch(
+                finalize_world_diag_cfm,
+                dim=4,
+                inputs=[self.a["counts"], cfm, candidate["mf_constraint_count"], 0],
+                outputs=[self.a["diag"]],
+                device=self.device,
+            )
             for kernel, arguments, values in controls:
                 wp.copy(values["v_out"], self.a["vhat"])
                 values["world_impulses"].zero_()
@@ -282,6 +291,13 @@ class TestSingleFactorCUDA(unittest.TestCase):
             rtol=1e-4,
             atol=2e-5,
         )
+        velocity = candidate["v_out"].numpy()
+        impulses = candidate["world_impulses"].numpy()
+        for world, count in enumerate(self.counts):
+            indices = self.maps[world]
+            expected = self.vhat[indices].astype(np.float64)
+            expected += self.reference_Y[world, :count].astype(np.float64).T @ impulses[world, :count]
+            np.testing.assert_allclose(velocity[indices], expected, rtol=1e-4, atol=2e-5)
 
 
 if __name__ == "__main__":
