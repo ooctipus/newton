@@ -1,8 +1,9 @@
 # Structural window: integrated discoveries
 
-Checkpoint: 2026-09-13 12:50 UTC. Work continues toward the 24-hour window in
+Checkpoint: 2026-09-13 13:40 UTC. Work continues toward the 24-hour window in
 `STRUCTURAL_FOURX_20260913.md`; the 4x target is **not achieved**. These are
-single-round discoveries, not replacements for accepted repeated baselines.
+discoveries, not replacements for accepted baselines except where repeat
+evidence is explicitly given. No candidate has met the complete 4x target.
 No Isaac Lab source, timestep, substep or iteration allowance was changed.
 
 ## Complete physics results so far
@@ -17,6 +18,7 @@ environment-wall windows are separate; neither measures full RL training.
 | G1 single-factor native response | 43.409484 / 41.665184 | 1.041865x | 72.285541 / 70.348522 | 1.027535x |
 | G1 current-height cell rejection | 43.513016 / 37.867363 | 1.149090x | 72.398981 / 52.165458 | 1.387872x |
 | Kuka complete live kinetic path | 12.778658 / 11.274877 | 1.133374x | 12.183984 / 11.740153 | 1.037805x |
+| Kuka kinetic path, shared notification reads | 12.836523 / 11.305150 | 1.13546x | 12.148953 / 11.984799 | 1.01370x |
 
 These candidates are separate, not stacked. Do not multiply their speedups.
 Physics values come from graph profiling, not sums of separately optimized
@@ -31,8 +33,19 @@ buffer or launch. Its environment wall times improve 58.465564 to 50.948728
 ms on RTX and 85.902860 to 67.300094 ms on GB. Seven focused tests pass on CPU
 and each GPU. Two actual 96-pair convex-mesh fixtures on each GPU, including
 three graph replays, preserve complete bidirectional contact tuples: 700/878
-contacts with zero observed point/distance/normal error. Balanced live repeats
-and broader physical/behavior qualification are still pending.
+contacts with zero observed point/distance/normal error.
+
+Three balanced alternating live rounds now reproduce the terrain gain. The
+following are medians of three independent 40-step means, not pooled samples:
+
+| Device | Baseline physics | Cell rejection physics | Physics gain | Baseline wall | Cell rejection wall | Wall gain |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| RTX PRO 6000 | 43.61139235 | 38.01942965 | 1.147081709x | 58.017999775 | 51.641378400 | 1.123478915x |
+| GB300 | 72.339710575 | 52.1157923 | 1.388057389x | 86.1398189998 | 66.6752308243 | 1.291931320x |
+
+All 12 repeat captures passed the original capacity, source and final-idle
+checks. This establishes repeatability for this workload, not complete
+behavioral qualification or a new MJWarp ratio.
 
 Kuka's complete path now covers real eager calls, per-world gravity changes,
 reset-before-first-graph-replay and live MF rows. Its graph-reset failure was
@@ -44,6 +57,64 @@ environment wall time **regresses**: 36.684009 to 37.468095 ms RTX and
 not disjoint causal attribution. Both the regression and small GB physics
 gain are under investigation. Boundary status/finite checks do not establish
 live contact convergence or per-replay fallback counts.
+
+The reset attribution identified duplicate topology downloads in the native
+notification owners. Correction `ad42fea95` shares one callback-local set of
+eight current topology reads between owners, retaining every comparison and
+all gravity checks. It does not cache across notifications or change physics.
+All 40 candidate reset steps drop from three topology-read sequences to one:
+16 copies and 33.947672 MB removed per reset. In fresh whole A/B, RTX wall time
+improves 36.113675 to 34.227748 ms (1.05510x), while GB wall still regresses
+35.674105 to 36.905660 ms (0.96663x). The GB physics gain remains near flat;
+the candidate is not promoted. Current node attribution is diagnostic work,
+not another claimed gain.
+
+## Complete-path losses and next structural tests
+
+Franka's complete contact-kinetic replacement passed physical tests on both
+GPUs, including loaded current/held operators, actual eight-velocity
+decoding and graph reset controls. But its complete restored-state cost
+test failed: 4.513856 ms RTX / 4.693696 ms GB, against absolute 10%-gain
+acceptance caps of 3.164793929 / 2.813527747 ms. These are replay fixtures,
+not fresh 16K task throughput or MJWarp ratios.
+
+Node attribution explains the failure: contact preparation costs
+1.004384 / 1.151264 ms and the joined solve/finish costs
+1.499605 / 1.759104 ms; the unchanged paired branch is not inflated.
+An optimistic correction restoring the older solve cost with zero bridge
+cost still misses both caps. This representation is stopped: a solve-only
+tuning pass cannot recover the necessary complete-path gain. Physical
+success is not performance success.
+
+Two independent G1 structural paths are in progress:
+
+- Direct pair-owned terrain queries retire the midphase launch and global
+  triangle-triple writes/reads, retaining the same current-height rejection,
+  MPR/GJK, manifold writer and reducer. Six tests on each GPU and both actual
+  96-pair fixtures plus graph replay pass; 700/878 contacts are retained,
+  maximum point/distance error 1.86e-9 / 3.73e-9 and normal error zero.
+  The first full-task A/B fails the performance gate: RTX
+  37.975026650 to 44.056320125 ms (0.861965469x), GB
+  51.958921700 to 86.469124850 ms (0.600895658x). All four captures pass
+  the capacity/source/idle checks. This is a work-elimination hypothesis
+  defeated by its current execution layout, not an accepted optimization.
+  One complete node attribution is running before deciding whether a
+  targeted structural correction is justified.
+- Sparse G1 dynamics replaces dense factor storage, current-force prediction,
+  dense contact rows/responses, GS and velocity decoding as one representation.
+  The static G1 graph needs 434 factor entries rather than 946 dense lower
+  entries; a possible two-endpoint contact needs at most 18 kinetic entries.
+  Those are structural counts, not runtime evidence. Physical gates precede
+  the first complete-path timing; old dense producers must be retired.
+
+Post-cell G1 node attribution locates the remaining work (exclusive diagnostic
+milliseconds, RTX / GB): collision 9.364628 / 24.030058; dynamics
+6.821106 / 6.542038; row/response 11.792834 / 11.849121; GS
+6.257073 / 7.560128; public-state publication 2.406199 / 1.611733.
+The generic triangle-query owner alone costs 3.922660 / 17.342261 ms.
+Its captured register count is 168 on both devices. A profiler local-memory
+field of zero is not proof of no local traffic: cached PTX declares a
+432-byte local depot. No memory-bound/compute-bound claim is established.
 
 ## Corrected shared-collision MJWarp comparison
 
@@ -85,14 +156,40 @@ boundaries; this is not a claim of complete trajectory equivalence.
   Shared-MJ parent `/tmp/fpgs-g1-heightfield-cells-shared-mj-paired16k-20260913-01`.
   Physical parent `/tmp/fpgs-g1-heightfield-cells-checks-paired-20260913-01`,
   manifest `eed8c778a64dd85e97d49632837612352f888d48d1fb1d76502ef71b4cf44e18`.
+  Balanced repeat parent
+  `/tmp/fpgs-g1-heightfield-cells-repeat-paired16k-20260913-01`, manifest
+  `1d92e218432ee0b2f0200ad7914aca9b2a2342d5bd80e804c890fa9502efa068`.
+  Diagnostic node parent
+  `/tmp/fpgs-g1-heightfield-cells-nodes-paired16k-20260913-01`, manifest
+  `a4ab94f3d263523513bd4e771d784e468fc6042f5021c69159bd97c1ff43e2ad`.
+  This node parent exited 1 solely because the old analyzer rejected the
+  auxiliary graph. Both simulations passed; an independent process/correlation
+  reader accounted for all 12 physics and three auxiliary graph roots, and
+  final source/idle checks passed after the parent was reaped. Do not present
+  the diagnostic parent as an exit-zero throughput run.
 - Kuka candidate: `4f76552da4f8966f96c0d2270168613142c9bd14`; benchmark-only
   current-owner observers `c9b06e9e1b86c7afbe6e34c69c17944291db9404` in a fresh
   benchmark worktree. Parent
   `/tmp/fpgs-kuka-kinetic-live-discovery-paired16k-20260913-01`, manifest
   `365d1db9fc8a254af28e7395461f030a63da30e3b3f4a049e29b2923fb9fa1fa`.
   The 25 unique pinned source/artifact files were independently rehashed.
+- Corrected Kuka candidate: `ad42fea95fd44cd5ec72afa1be1cce570b45109a`,
+  benchmark `a3a5dfead5026efabae1a35f030a4fd0e7182e26`. Fresh A/B parent
+  `/tmp/fpgs-kuka-kinetic-live-discovery-paired16k-20260913-02`, manifest
+  `9b7562872914f4a6748ab03941468d4e259c826120fdf692dd0a6256a02cfe1f`.
+- Franka complete-path candidate `0e0fc27e9bd04c419066e3a587235085b4b9af42`.
+  Cost parent `/tmp/fpgs-franka-contact-complete-cost-paired16k-20260913-01`,
+  manifest `2114a6cc16d1306d405bf19a72bb526aac496b8f9f7c06b0aa3d88cec20c5532`.
+  Node parent `/tmp/fpgs-franka-contact-complete-nodes-paired16k-20260913-01`;
+  diagnosis `/tmp/fpgs-franka-contact-complete-nodes-0QOS0f/DIAGNOSIS.md`,
+  SHA256 `2b3466d9322ca5e1ae6a106827c275b7ab30eb2eb1da20a4f2aafd38243361a8`.
+- Direct terrain candidate `c41f46e74a63fc0e1bb79a96636c42260dc63576`.
+  Physical parent `/tmp/fpgs-g1-terrain-direct-physical-paired-20260913-01`,
+  manifest `f9cbc7a5c0650a14bbcc04169bf465b75762381240d1bd933a29a7595c9b0c15`.
+  Complete A/B parent `/tmp/fpgs-g1-terrain-direct-live-paired16k-20260913-01`
+  exited zero and is reaped; the performance gate failed as reported above.
 
-All feature modes remain explicit/default-off. Next bounded work is Franka's
-complete contact-path CUDA physical gate, balanced terrain repeats, Kuka
-whole-path/reset attribution, and a G1 sparse tree-factor feasibility study.
-The latter's operation counts are a hypothesis, not a measured gain.
+All feature modes remain explicit/default-off. Next bounded work is the direct
+terrain loss diagnosis, Kuka node attribution, G1 complete sparse physical gates,
+and a current corrected-MJ Allegro comparison. Keyboard's residual termination
+discrepancy remains parked at the user's request.
