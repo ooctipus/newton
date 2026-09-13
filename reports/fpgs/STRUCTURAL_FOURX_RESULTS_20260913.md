@@ -1,6 +1,6 @@
 # Structural window: integrated discoveries
 
-Checkpoint: 2026-09-13 13:40 UTC. Work continues toward the 24-hour window in
+Checkpoint: 2026-09-13 14:12 UTC. Work continues toward the 24-hour window in
 `STRUCTURAL_FOURX_20260913.md`; the 4x target is **not achieved**. These are
 discoveries, not replacements for accepted baselines except where repeat
 evidence is explicitly given. No candidate has met the complete 4x target.
@@ -86,7 +86,7 @@ cost still misses both caps. This representation is stopped: a solve-only
 tuning pass cannot recover the necessary complete-path gain. Physical
 success is not performance success.
 
-Two independent G1 structural paths are in progress:
+Two independent G1 structural paths have reached different gates:
 
 - Direct pair-owned terrain queries retire the midphase launch and global
   triangle-triple writes/reads, retaining the same current-height rejection,
@@ -98,14 +98,28 @@ Two independent G1 structural paths are in progress:
   51.958921700 to 86.469124850 ms (0.600895658x). All four captures pass
   the capacity/source/idle checks. This is a work-elimination hypothesis
   defeated by its current execution layout, not an accepted optimization.
-  One complete node attribution is running before deciding whether a
-  targeted structural correction is justified.
+  Complete node attribution localizes the loss to the merged query itself:
+  13.346504 / 56.375385 ms, versus the old midphase plus query
+  7.264690 / 22.088587 ms. Exact current-cell enumeration on the saved actual
+  geometry finds only 37.05% / 37.02% active query lanes, versus the old
+  globally compacted stream: 2.699 / 2.702 times as many warp query entries.
+  Registers also grow from 168 to 216 / 224. Removing global compaction
+  removed useful work batching. These counts explain a concrete mechanism,
+  not measured hardware utilization or a complete causal time decomposition.
+  The path is stopped; there is no credible correction within its complete
+  RTX replacement budget. Diagnosis is preserved in branch commit d05476a3.
 - Sparse G1 dynamics replaces dense factor storage, current-force prediction,
   dense contact rows/responses, GS and velocity decoding as one representation.
   The static G1 graph needs 434 factor entries rather than 946 dense lower
   entries; a possible two-endpoint contact needs at most 18 kinetic entries.
-  Those are structural counts, not runtime evidence. Physical gates precede
-  the first complete-path timing; old dense producers must be retired.
+  Those are structural counts, not runtime evidence. The first actual full
+  solver test exposed omitted current drive-mass terms in serial mode:
+  its immutable drive map is deliberately absent, while the isolated fixture
+  had supplied it. Correction 8e8146 reads the existing compact current drive
+  rows and removes the stale old augmented-H tail. The same unchanged
+  tolerances now pass both physical methods on both GPUs, including actual
+  full-step serial and parallel configurations. Continuing graph replay and
+  warmed task-state operator gates remain before complete-path timing.
 
 Post-cell G1 node attribution locates the remaining work (exclusive diagnostic
 milliseconds, RTX / GB): collision 9.364628 / 24.030058; dynamics
@@ -134,6 +148,41 @@ elimination, as well as further shared collision improvement, to approach 4x.
 Other tasks' historical corrected-MJ ratios are not silently refreshed by
 these new G1/Kuka FPGS-only discoveries.
 
+## Fresh corrected Allegro comparison and next work screen
+
+One fresh paired round uses the existing rejection-only collision candidate
+fba9fead, compact calibrated FPGS allocation, and corrected native MJWarp
+collision with njmax=112 / nconmax=22. No new solver optimization is included.
+Both backends retain their existing substeps and iteration allowances.
+
+| Device | FPGS physics | Corrected MJWarp physics | MJWarp / FPGS |
+| --- | ---: | ---: | ---: |
+| RTX PRO 6000 | 17.531317325 ms | 63.336101650 ms | 3.612741x |
+| GB300 | 18.018165700 ms | 82.315187375 ms | 4.568455x |
+
+Environment wall times are 25.493010526 / 71.681469025 ms on RTX and
+25.901357926 / 90.487337676 ms on GB (FPGS / MJ). All four captures pass
+the capacity/source/final-idle checks. This is a discovery round, not a
+new repeated 4x-across-tasks result. RTX needs a further 1.697292 ms net
+whole-physics reduction to reach its current 4x denominator.
+
+A separate node capture accounts for all 12 physics roots and 2,064 nodes
+per GPU, with no auxiliary roots or unproven correlations. Exclusive
+row/response plus solve cost is 8.445006 / 8.959829 ms; collision is
+3.955239 / 4.871369 ms. Broad phase alone is only .189877 / .219360 ms.
+These diagnostic intervals do not replace the clean throughput means.
+Existing Allegro finger-block reduction was already tested at roughly 3%
+of solver time and withdrawn; it is not a new structural opportunity.
+The current study is a complete row-production/consumer replacement, not
+a broad-phase or finger-dot-product polishing sweep.
+
+Kuka's first-hit successor is also in physical testing: current endpoint
+wrenches remain compact packets until a changed residual first demands a
+held physical response. MF-positive worlds retain the existing complete
+path. Its planned saving must include response preparation, solving and
+all retained allocation/CSR/prefix/fallback work. CPU physical success and
+the fraction of demanded rows are not a speedup claim.
+
 ## Exact sources and completed owners
 
 All runs use fixed Lab backend
@@ -150,7 +199,9 @@ boundaries; this is not a claim of complete trajectory equivalence.
   experimental root branch through `0ad92797` is pushed to `ooctipus/newton`.
   Live parent `/tmp/fpgs-g1-single-factor-live-paired16k-20260913-02`.
 - Heightfield candidate: `a994b1b24b6073dcb10e855c10e8197ee116ef14`, isolated
-  `ooctipus/g1-heightfield-cells-20260913` branch; not yet promoted or pushed.
+  `ooctipus/g1-heightfield-cells-20260913` branch, now pushed to ooctipus/newton
+  and included default-off in the root branch as f0025014. The root branch
+  was pushed through 7a3b9abc; original handoff ancestry is retained.
   First A/B parent `/tmp/fpgs-g1-heightfield-cells-live-paired16k-20260913-01`,
   manifest `04d9b8f632e84677c577dc4516f464b362fafbd2f2258dac69b3fc2bfb283b7b`.
   Shared-MJ parent `/tmp/fpgs-g1-heightfield-cells-shared-mj-paired16k-20260913-01`.
@@ -188,8 +239,25 @@ boundaries; this is not a claim of complete trajectory equivalence.
   manifest `f9cbc7a5c0650a14bbcc04169bf465b75762381240d1bd933a29a7595c9b0c15`.
   Complete A/B parent `/tmp/fpgs-g1-terrain-direct-live-paired16k-20260913-01`
   exited zero and is reaped; the performance gate failed as reported above.
+- Sparse physical correction parent
+  `/tmp/fpgs-g1-sparse-factor-physical-paired-20260913-02` exited zero;
+  both GPUs ran exactly two CUDA methods with zero skips/failures/errors.
+  Its initial graph wiring was not a continuing state loop; test-only
+  successor 3f539fae fixes that wiring and is not yet GPU-qualified here.
+- Fresh Allegro parent
+  `/tmp/fpgs-allegro-fixed-backends-paired16k-20260913-02` exited zero.
+  Attempt01 is preserved: MJ construction failed because the wrapper tried
+  to set a Newton collision capacity on the native-MJ None configuration.
+  Removing that unsupported override is the only retry change.
+- Allegro node parent `/tmp/fpgs-allegro-fixed-nodes-paired16k-20260913-01`,
+  manifest `8819292cae82b902055dbb63bb611b4b65d0af1d4fb64f5c356d0d71c969918f`,
+  exited 1 in the final ratio formatter because this was an FPGS-only
+  capture. Both simulations and original analyzers passed; root independently
+  verified final source/idle and disjoint node membership with
+  `/tmp/fpgs-allegro-fixed-node-owner-EE86jIM8/audit.py`. The failure is
+  preserved; no GPU rerun or rewritten exit status was used for formatting.
 
-All feature modes remain explicit/default-off. Next bounded work is the direct
-terrain loss diagnosis, Kuka node attribution, G1 complete sparse physical gates,
-and a current corrected-MJ Allegro comparison. Keyboard's residual termination
+All feature modes remain explicit/default-off. Next bounded work is Kuka
+first-hit physical/live gates, G1 complete sparse physical/live gates,
+and Allegro's complete row-production feasibility. Keyboard's residual termination
 discrepancy remains parked at the user's request.
