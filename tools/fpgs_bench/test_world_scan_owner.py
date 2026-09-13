@@ -256,7 +256,8 @@ class TestWorldScanOwner(unittest.TestCase):
         """Require the opt-in path before both generalized integration and original FK dispatch."""
         source = inspect.getsource(SolverFeatherPGS)
         self.assertIn("FEATHER_PGS_WORLD_SCAN_PUBLICATION", source)
-        self.assertIn("self._world_scan_publication.validate_notification(flags)", source)
+        notification = inspect.getsource(SolverFeatherPGS.notify_model_changed)
+        self.assertIn("publication.validate_notification(flags, plan_snapshot=plan_snapshot)", notification)
         tree = ast.parse(textwrap.dedent(source))
         calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
         self.assertEqual(

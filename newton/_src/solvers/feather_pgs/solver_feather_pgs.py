@@ -2456,14 +2456,24 @@ class SolverFeatherPGS(SolverBase):
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         """Refresh cached solver data after supported model changes."""
-        if getattr(self, "_kinetic_world", None) is not None:
-            self._kinetic_world.notify_model_changed(flags)
+        kinetic = getattr(self, "_kinetic_world", None)
+        joint_world = getattr(self, "_joint_world", None)
+        publication = getattr(self, "_world_scan_publication", None)
+        plan_snapshot = None
+        if kinetic is not None or joint_world is not None or publication is not None:
+            from .kuka_joint_owner import notification_plan_snapshot  # noqa: PLC0415
+
+            plan_snapshot = notification_plan_snapshot(flags)
+        if kinetic is not None:
+            kinetic.validate_notification(flags, plan_snapshot=plan_snapshot)
         if self._row_packets is not None:
             self._row_packets.validate_notification(flags)
-        if getattr(self, "_joint_world", None) is not None:
-            self._joint_world.validate_notification(flags)
-        if getattr(self, "_world_scan_publication", None) is not None:
-            self._world_scan_publication.validate_notification(flags)
+        if joint_world is not None:
+            joint_world.validate_notification(flags, plan_snapshot=plan_snapshot)
+        if publication is not None:
+            publication.validate_notification(flags, plan_snapshot=plan_snapshot)
+        if kinetic is not None:
+            kinetic.invalidate_model_changed(flags)
         if self._fk_id_cache_enabled and flags & (
             ModelFlags.JOINT_PROPERTIES
             | ModelFlags.JOINT_DOF_PROPERTIES

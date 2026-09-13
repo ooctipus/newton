@@ -404,10 +404,13 @@ class KineticWorldOwner:
                 device=self.device,
             )
 
-    def notify_model_changed(self, flags):
-        """Reuse the original notification contract and invalidate current caches."""
+    def validate_notification(self, flags, *, plan_snapshot=None):
+        """Check current inputs before any owner publishes notification effects."""
         self.join()
-        self.bindings.validate_notification(flags)
+        self.bindings.validate_notification(flags, plan_snapshot=plan_snapshot)
+
+    def invalidate_model_changed(self, flags):
+        """Invalidate numeric caches only after all notification checks pass."""
         numeric = (
             ModelFlags.JOINT_PROPERTIES
             | ModelFlags.JOINT_DOF_PROPERTIES
@@ -417,6 +420,11 @@ class KineticWorldOwner:
         )
         if int(flags) & int(numeric):
             self.reset(None)
+
+    def notify_model_changed(self, flags):
+        """Retain the complete standalone validation and invalidation contract."""
+        self.validate_notification(flags)
+        self.invalidate_model_changed(flags)
 
     def _demote(self):
         """Restore canonical held factors before an eager original reuse step."""

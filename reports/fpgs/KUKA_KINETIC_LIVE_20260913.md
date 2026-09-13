@@ -297,3 +297,64 @@ first on the original capture-time `wp.zeros`, then passed with both directions,
 unseen capture rejection and additional eager-State reuse. The observer also
 stores `bool(device.is_capturing)` instead of a reference to Warp's mutable
 capture dictionary; this corrects only diagnostic labeling, not the fault.
+
+### Graph retry and first integrated discovery
+
+Graph02 at `4f76552da4f8966f96c0d2270168613142c9bd14` passed both cards,
+including the formerly failing reset before first replay. Paired manifest:
+`/tmp/fpgs-kuka-kinetic-live-graph-paired512-20260913-02/manifest.json`, SHA256
+`43d6a04358e5240338a2fe0c69a6420f9c0fff0e466e98be1c9810d2c910bf37`.
+There were exactly two captured private calls and two State/two call banks;
+no retired stages. Public-FK scaled velocity maxima were 9.655221e-6 RTX and
+1.238447e-5 GB, within the unchanged 3e-5 gate. This remains scoped lifecycle
+evidence, not contact convergence evidence.
+
+The first actual 16K integrated AB discovery is complete and source/idle guarded:
+`/tmp/fpgs-kuka-kinetic-live-discovery-paired16k-20260913-01/manifest.json`, SHA256
+`365d1db9fc8a254af28e7395461f030a63da30e3b3f4a049e29b2923fb9fa1fa`.
+Baseline50dfa and candidate4f765 use fixed Lab53ee with unchanged old core/tasks,
+all accepted flags, capacities and eight-iteration recipe. Sampling is one AB
+round, 200 warmup /40 clean wall /40 graph-profile steps. The new benchmark-only
+check at c9b06 reports current kinetic ownership instead of reading stale retired
+joint-world outputs. No per-step check or device graph work was added.
+
+Physics means per environment step: RTX 12.778658 ->11.274877 ms (1.133374x,
+11.77% time reduction); GB12.183984 ->11.740153 ms (1.037805x,3.64%). These are
+40-step means, not the 40-step medians. Clean wall regresses from36.684009 to
+37.468095 ms RTX and35.243540 to38.937888 ms GB. Only RTX clears the first10%
+physics screen; the environment regressions and single round prevent promotion.
+All capacity/collision flags and current guards pass, two-bank ownership stays
+active, public state is finite, and MF worlds are nonempty. These are not an
+independent contact-law/physical-parity gate. Both quality and performance
+acceptance remain false.
+
+### Cause-directed notification snapshot correction
+
+Read-only diagnosis is pinned in
+`/tmp/fpgs-kuka-live-reset-cause-giQQOjkx/CARD.md`, SHA256
+`5d57f7e7568e14fc75c02df98508f3a14b4b303b068265e4ee91b58ab883707c`.
+The existing traces have no internal graph-node kernels, but exact eager CUDA
+correlations identify repeated topology validation at each reset: two original
+owners and now a third kinetic owner independently download the SAME eight
+arrays. Candidate adds 17.170456 MB D2H/environment step, including its retained
+current-gravity check. Two candidate duplicate proof spans occupy4.824602 ms
+RTX /4.355091 ms GB on the profiled host timeline. These spans are not disjoint
+physics cost and include comparisons that the conservative correction retains.
+No guaranteed saving is inferred from their whole duration.
+
+The authorized correction shares one lazy snapshot ONLY within an individual
+Solver.notify_model_changed invocation. Every owner retains its own original
+array comparisons and exception text; incompatible expected plans still reject.
+Numeric-only notifications create no shared snapshot; current owned-world
+gravity checking remains. Kinetic validation is separated from invalidation so
+all checks finish before notification effects publish. There is no cross-call
+cache, no weaker interpretation of JOINT_PROPERTIES, no kernel change and no
+new allocation inside captured physics. Baseline operation with kinetic disabled
+also avoids its existing duplicate readback.
+
+Three fail-first regressions reproduced two/three reads instead of one, and a
+later owner's failure after premature private invalidation. The correction
+passes eight focused notification controls and52 total focused CPU/source-oracle
+tests, including unchanged native source provenance. Actual corrected live
+timing and physical lifecycle are pending. The observed first-discovery numbers
+above remain the current authority; no new performance claim is made.

@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import numpy as np
 import warp as wp
 
-from . import kernels, raw_world_contacts, simple_world, world_scan_owner
+from . import kernels, kuka_joint_owner, raw_world_contacts, simple_world, world_scan_owner
 from .kinetic_live_plan import validate_gravity
 
 
@@ -320,7 +320,7 @@ class LiveBindings:
         call.force = self._force(call.rows, call.services, call.solve.guard, contacts, dt)
         return call
 
-    def validate_notification(self, flags):
+    def validate_notification(self, flags, *, plan_snapshot=None):
         """Numeric model updates retain aliases; structural changes require recapture."""
         from ...sim import ModelFlags  # noqa: PLC0415 -- optional experimental factories stay lazy
 
@@ -335,7 +335,10 @@ class LiveBindings:
                 validate_gravity(self.solver.model, self.worlds)
             return
         for name, expected in self.model_plan_values.items():
-            if not np.array_equal(getattr(self.solver.model, name).numpy(), expected):
+            if not np.array_equal(
+                kuka_joint_owner.read_notification_plan_field(self.solver.model, name, plan_snapshot),
+                expected,
+            ):
                 raise ValueError("Kinetic topology changed; reconstruct the solver and recapture")
 
     def _rows(self, call, state_in, contacts, dt):
