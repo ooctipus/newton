@@ -71,3 +71,76 @@ triangle storage, original producer retirement, current heights and expected
 logical triangle-overflow failure. Both actual 96-pair CPU fixtures retain all
 700/878 contacts and identical 1,208/1,190 logical triangle queries, with zero
 observed full-tuple error. Scoped pre-commit passes. No GPU or timing result yet.
+
+## Completed physical and performance gates: stop this execution map
+
+The paired GPU physical parent
+`/tmp/fpgs-g1-terrain-direct-physical-paired-20260913-01` exited zero, was reaped,
+and passed final source/idle checks. Each card ran six tests, no skips, and both
+actual 96-pair fixtures with three graph replays. All 700/878 contacts remain;
+maximum point/distance errors are 1.86e-9/3.73e-9, normal error zero. Candidate
+runtime pin is `c41f46e74a63fc0e1bb79a96636c42260dc63576`.
+
+The complete actual16K A/B then **failed** the performance gate despite all four
+capture/capacity/source/idle checks passing. Parent
+`/tmp/fpgs-g1-terrain-direct-live-paired16k-20260913-01` is reaped, exit zero.
+
+| GPU | Cell-only physics ms | Direct physics ms | Throughput ratio |
+| --- | ---: | ---: | ---: |
+| RTX PRO 6000 | 37.975026650 | 44.056320125 | 0.861965469x |
+| GB300 | 51.958921700 | 86.469124850 | 0.600895658x |
+
+Environment wall also regresses, 50.838382 to 58.597690 ms RTX and 67.173939 to
+99.248259 ms GB. No direct-mode MJWarp comparison or promotion is justified.
+
+The complete three-step node attribution isolates the penalty in the merged
+owner: **13.346504 / 56.375385 ms**, versus the retired midphase plus query
+**7.264690 / 22.088587 ms**. Other physics categories remain near identical.
+New query register use is 216 RTX / 224 GB versus old168; block32/grid6144 are
+unchanged. The exact direct entry's cached PTX declares480 bytes of local state
+versus old432; reported localMemoryPerThread=0 does not establish zero traffic.
+No hardware-counter bottleneck or measured occupancy claim is made.
+
+Diagnostic parent `/tmp/fpgs-g1-terrain-direct-nodes-paired16k-20260913-01`
+was reaped with exit1: both simulations/checks completed, but the inherited
+analyzer rejects the auxiliary graph. Independent source/idle checks pass;
+the reviewed process/correlation reader accounts for all12 physics roots with
+1,248 nodes and three auxiliary roots with30 nodes on each GPU. Original
+failed parent status is retained. Reader/output:
+`/tmp/fpgs-terrain-direct-node-owner-JJQ8Yj6u/{audit.py,gpu0.json,gpu1.json}`.
+Manifest SHA256:
+`8f71dcf7f0726193e032f25d0d9ec6cb8d2b4d5867a72f1e046896e48955a4d2`.
+
+### Why deleting the triangle stream lost useful work organization
+
+A separate CPU count uses the same FP32 Warp current-range/rejection functions
+on both unchanged actual G1 geometry snapshots. It counts active entries into
+the expensive query, not executed instructions, hardware occupancy, or exact
+GPU-FMA outcomes. These are saved states, not an asserted replay of the timed
+three-step trajectory.
+
+| Snapshot | Live triangles | Pair-owned query warp entries | Active lanes | Compact-stream warp entries (minimum) | Entry inflation |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| RTX | 608,272 | 51,306 | 37.05% | 19,009 | 2.6990x |
+| GB | 609,402 | 51,448 | 37.02% | 19,044 | 2.7015x |
+
+Most nonempty pair chunks contain only12 surviving cells; each is visited
+twice, once per triangle. The original global stream packs surviving queries
+across pairs and triangles. Direct traversal removes that compaction along
+with its writes, substantially increasing query-warp entries, while keeping
+more range/loop state live through the generic query. This supplies a concrete
+mechanism compatible with the measured loss; it does not prove a complete
+hardware causal decomposition or assign all runtime to inactive lanes.
+
+Even pairing the two triangles across lanes would leave fragmented pair
+cohorts and the enlarged query lifetime. There is no demonstrated correction
+that closes the strict complete3.463 ms RTX target. Restoring a compact query
+stream largely restores the retired work rather than delivering the promised
+deletion. Stop this representation after the causal diagnosis; do not sweep
+block sizes or polish the losing kernel. Keep the repeated cell-only win.
+
+CPU diagnostic source/result:
+`/tmp/fpgs-terrain-direct-lane-audit-ylTx2xH6/{audit.py,result.json}`.
+Both inputs are SHA-pinned in that result and checked unchanged after reading.
+No original capture was modified. The distinct finite-feature contact algorithm
+remains an unimplemented hypothesis, not a correction credited to this path.
