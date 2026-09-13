@@ -23,6 +23,17 @@ PINS = {
     "newton/_src/geometry/coherent_convex.py": "467c5f3a580ee6cbe75ab27e6c2bb590a171e7f97e8a85bb70495d9b7f2ed338",
     "newton/_src/geometry/coherent_convex_rejection.py": "d26defca3d86d5f2267616ffb5207905fce58731b97bef5700dccbaad14a8abf",
 }
+BSP_PINS = {
+    **PINS,
+    # Reviewed c26ac5 preserves the same constructor/allocation contract.
+    # Select this complete source set, never independent per-file alternatives.
+    "newton/_src/geometry/narrow_phase.py": "3b4c4aef8b80ac6938b06b3fbf4b58ab5e4235dfd58dc65657f4cfce611b6bf0",
+    "newton/_src/sim/collide.py": "0ac3bed571c3d56a37dd85afe4c2468c83b146809bfd2cf726f0410b2208533e",
+    "newton/_src/geometry/support_function.py": "be95f40daa0283afb5dc8dd209f8a1a990c5c5a81f9ff275330f1e4d70854327",
+    "newton/_src/geometry/convex_bsp.py": "99016ae41a4532fb847ae53b16e2c7e2995efc1b9e23065999221f0db9f5141c",
+    "newton/_src/geometry/convex_bsp_build.py": "cb8db066aa0f2b630db32f4611fdc153cc3879c9ba8a0493ae7beb871a511be0",
+    "newton/_src/geometry/convex_bsp_factories.py": "6f61c944fc5670cda30c32bd4028ef7065e8cc6876ee5107a7721185ad644a29",
+}
 LAB_PINS = {
     "source/isaaclab_newton/isaaclab_newton/physics/feather_pgs_manager.py": "31bea42769931529365a1f067049fa577b91719923795214dda69e819e8125c3",
     # Fixed53ee adds immediate model-write notification only; the default-None
@@ -34,6 +45,10 @@ LAB_PINS = {
 
 def verify_sources(root, pins=PINS):
     """Fail closed on any unsupported source revision before construction."""
+    if pins is PINS:
+        selector = "newton/_src/geometry/narrow_phase.py"
+        if hashlib.sha256((Path(root) / selector).read_bytes()).hexdigest() == BSP_PINS[selector]:
+            pins = BSP_PINS
     for relative, expected in pins.items():
         if hashlib.sha256((Path(root) / relative).read_bytes()).hexdigest() != expected:
             raise RuntimeError(f"Unsupported compact Allegro source: {relative}")

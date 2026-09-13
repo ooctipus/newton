@@ -78,6 +78,17 @@ class TestCompactArguments(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "newton_manager.py"):
             capacity.verify_sources(old, capacity.LAB_PINS)
 
+    def test_bsp_requires_one_complete_reviewed_source_set(self):
+        """Accept both reviewed revisions but reject mixed constructor sources."""
+        baseline = Path("/home/octi/Projects/newton-fpgs-rejection-port-20260912")
+        candidate = Path("/home/octi/Projects/newton-fpgs-convex-bsp-20260913")
+        capacity.verify_sources(baseline)
+        capacity.verify_sources(candidate)
+        mixed = dict(capacity.BSP_PINS)
+        mixed["newton/_src/sim/collide.py"] = capacity.PINS["newton/_src/sim/collide.py"]
+        with patch.object(capacity, "BSP_PINS", mixed), self.assertRaisesRegex(RuntimeError, "collide.py"):
+            capacity.verify_sources(candidate)
+
     def test_actual_recipe_forwarding_fpgs_only(self):
         """Use the source-pinned Lab recipe, without loading or running simulation."""
         lab = Path("/home/octi/Projects/IsaacLab.wt/fpgs-opt-20260910")
