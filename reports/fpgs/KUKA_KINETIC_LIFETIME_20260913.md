@@ -591,3 +591,58 @@ Evidence roots and SHA256:
 - Source/PTX cause and conditional compact design:
   `/tmp/fpgs-kuka-hybrid-cause-AA6yvh5h/NOTE.md`,
   `45470c3528dfb80d06c0b78af1ba9858392b298203c4fb85b3d18c741ad5db81`.
+
+## Compact recurrence clears the standalone gate, 04:25 UTC
+
+The single compact correction completes its physical and cost gates before
+the05:33 checkpoint. It preserves primary Z, converts only six free response
+columns and replaces the eligible dense recurrence with the existing compact
+contact-triple law, followed by current MF and stateless rigid limits inside
+each sweep. Alternative native paths share one1053-float arena. Offline both
+architectures use92 registers and4340B shared with no stack/spills; the bridge
+uses40 registers and256B shared. These resource counts are not speed claims.
+
+Four CUDA physical tests pass on each GPU with no skips/errors: loaded192/64
+and both offsets, independent fresh current geometry, historical512 original
+geometry and actual fresh16384-world two-call graphs. The fresh complete
+coupled cohort remains2/2 RTX and0/1 GB. Ordinary per-order eight-sweep,
+velocity/momentum/response/contact-law and public-state checks are unchanged.
+Arbitrary nonzero initial warm-start impulses are not newly numerically tested;
+the cold recipe is retained and the existing initial-impulse readers survive.
+
+A new original companion control and the standalone compact candidate each
+complete10 warm and40 measured samples, full section and final source/idle
+guards. All parents and children are reaped.
+
+| Fresh standalone complete section | RTX | GB |
+| --- | ---: | ---: |
+| Contemporaneous original prototype, ms/env | 10.396544456 | 9.253376007 |
+| Compact correction, ms/env | 9.175871849 | 8.679872036 |
+| Time removed, ms/env | 1.220672607 | 0.573503971 |
+| Section speedup | 1.13x | 1.07x |
+
+The primary at-least1ms RTX gate and no-GB-regression condition pass. This is
+one paired prototype-section comparison, not a newly accepted live Newton
+runtime, whole-task speedup or long-run convergence result. The fixed2x/4x
+targets and accepted task table remain unchanged. No queue or contact-triplet
+correction is included in these numbers. Their composition is the next separate
+physical/cost measurement; do not add component savings.
+
+Evidence and SHA256:
+
+- Native `kinetic_compact_coupled.py` in
+  `/tmp/fpgs-kuka-compact-coupled-JaVsIZBa`:
+  `84a6bd0479dd68c47b59381ef0cc23c0b4b921c9b6dfda7c05a4148c943b88d9`.
+- Ready/readiness scope: `READY.md` in that directory,
+  `02423e4ab3b0430b548757ff996a2673b0ef90083f2f58b9184f3b974324cfbe`.
+- Physical parent `/tmp/fpgs-kuka-compact-boundary-physical-paired16k-20260913-01`,
+  manifest `a891159aa0bc9cda2f56b356569142cd3307366b8699f84d460f2cebb7f8d615`.
+- Fresh original cost `/tmp/fpgs-kuka-fresh-boundary-cost-paired16k-20260913-02`,
+  manifest `c0a70695ee37ee07188a4a33d5646133f4eab1c98bb72021754e333ed3a28093`.
+- Compact cost `/tmp/fpgs-kuka-compact-fresh-boundary-cost-paired16k-20260913-01`,
+  manifest `0dd370f7f965bc7fae8898dcefc9a0d3312d1f1d673970a30a318491eb5eaab0`.
+- Complete runner `run_compact_fresh_boundary_cost.py`:
+  `cade3b30baae7f8c8c51b1664859fcec3dbf06582d3f3ae6d4f4f541cc7157f6`.
+
+The exact full-cost scope, first-output-to-second-input ownership and excluded
+live collision/callback/cold-repair/Lab work are unchanged from the prior gates.
