@@ -646,3 +646,83 @@ Evidence and SHA256:
 
 The exact full-cost scope, first-output-to-second-input ownership and excluded
 live collision/callback/cold-repair/Lab work are unchanged from the prior gates.
+
+## Composition preserves the gain; compact trace closes the cause, 04:51 UTC
+
+The compact recurrence and contact-triplet row producer are now measured
+together, not credited by adding their separate savings. Composition changes
+the existing row-kernel closure before setup; it adds no owner, array, queue or
+launch. Two complete-boundary CUDA physical tests pass on each GPU with no
+skips/errors, followed by the unchanged current-order original-eight checks,
+10 warm and 40 measured samples, source guards and final idle checks. All
+parents and children are reaped.
+
+| Fresh Kuka prototype replacement section | RTX | GB |
+| --- | ---: | ---: |
+| Contemporary original control, ms/env | 10.396544456 | 9.253376007 |
+| Contemporary triplet-only control, ms/env | 9.503615856 | 8.542719841 |
+| Compact plus triplet, ms/env | 8.328000069 | 7.966592073 |
+| Time removed versus original, ms/env | 2.068544388 | 1.286783934 |
+| Time removed versus triplet alone, ms/env | 1.175615787 | 0.576127768 |
+| Section speedup versus original | 1.25x | 1.16x |
+
+These remain prototype-section results, normalized to eight physical calls per
+environment step. Collision generation, inter-call callbacks, cold repair and
+Isaac Lab execution are not included. They are not accepted whole-task times,
+new MJWarp ratios, long-run convergence evidence or evidence of gains in
+Franka/other tasks. In particular, do not add the new section time to an old
+retained-work estimate and call that a measured live result. Accepted task
+tables and the unmet additional 2x/4x targets are unchanged.
+
+A separate compact-only causal trace passes all source and physical authority
+checks. It covers 12 tagged two-call graphs (three environment equivalents),
+with restoration and physical comparisons outside the measured graphs. Every
+memory node and join is charged. Fork costs use the interval union rather than
+adding overlapping kernel durations.
+
+| Causal trace, ms/env | RTX | GB |
+| --- | ---: | ---: |
+| Original joined offset/general solve | 1.684873 | 1.252384 |
+| Earlier coupled joined solve | 2.113941 | 1.609173 |
+| Compact joined solve | 1.060191 | 0.928544 |
+| Compact general-solve exclusive tail | 0.000000 | 0.036661 |
+| Compact response materializer | 0.077440 | 0.073685 |
+| Compact full graph span | 9.233372 | 8.668917 |
+
+The compact correction therefore retains the conversion deletion while
+removing the larger solve cost that defeated the earlier coupled prototype.
+The RTX joined solve is below the predeclared 1.349661ms planning bound. This
+is a measured causal explanation for the successful retry, not an assertion
+about hardware occupancy or peak throughput. The trace is compact-only;
+composition performance comes from its separate complete-section cost run.
+
+Next is a bounded live-integration design: replace the old production path
+before its producers run, preserve actual contact-force export cadence, and
+handle reset/notification and held-mass refresh lifetimes. No production solver
+change has been landed at this checkpoint. A separate first-hit contact census
+failed its new synthetic CUDA control on both cards before collecting fresh
+counts; diagnosis is pending. That diagnostic failure is not a failed compact
+physical test and supplies no activity or performance evidence.
+
+Evidence and SHA256:
+
+- Composition adapter `kinetic_compact_triplet_boundary.py` in
+  `/tmp/fpgs-kuka-compact-coupled-JaVsIZBa`:
+  `525f7334d426af18bf7d80cbc8cae0f0e806a04fc304a4a8783e65bc2a80960c`.
+- Composition runner `run_compact_triplet_fresh_boundary_cost.py`:
+  `2e3abf1c4e30c29ee7918240db8e3fafa338abc87c9f7efea1d98e8b0d69e6d9`.
+- Composition physical parent
+  `/tmp/fpgs-kuka-compact-triplet-physical-paired16k-20260913-01`, manifest
+  `a01981de948f4638dbeb903b27b4017288418f27701ebe8e0ad72babf8914b33`.
+- Contemporary triplet-only cost parent
+  `/tmp/fpgs-kuka-triplet-fresh-boundary-cost-paired16k-20260913-02`, manifest
+  `184789c47808b2d3db9e91605a12d9301b7470c03e6b5488280bbdad58f00b9c`.
+- Composition cost parent
+  `/tmp/fpgs-kuka-compact-triplet-cost-paired16k-20260913-01`, manifest
+  `335861498ac2251e51a2d01f08974b1d130d926dfdb2710e66a26903da9b8ed5`.
+- Compact-only trace parent
+  `/tmp/fpgs-kuka-fresh-compact-nodes-paired16k-20260913-01`, manifest
+  `bfe926f55f01b0a8d7e7d6c46b0f5a4ffaf934c141b82c0b6860d748f7fcb0b8`.
+- Compact-only node reader
+  `/tmp/fpgs-kuka-fresh-compact-nodes-MfaDuxY8/evidence01.json`:
+  `17ec10a8f2760032af255bbd3a26bee1396962188aee26a37a9b9b752dc5691f`.
