@@ -299,58 +299,83 @@ class KineticWorldOwner:
         self.demotion_status = wp.zeros(self.worlds, dtype=int, device=self.device)
         self.empty_mask = wp.empty(0, dtype=wp.bool, device=self.device)
         self.states, self.calls = {}, {}
+        # Standard State ping-pong needs exactly two state banks and the two
+        # directed call banks. Allocate these before capture: reset/notification
+        # may access them before the first replay realizes graph allocations.
+        self._state_pool = [self._allocate_state_slot() for _ in range(2)]
+        self._call_pool = [self._allocate_call_slot() for _ in range(2)]
         self.ever_admitted = False
         self.last_private = False
         self.last_call = None
         self.last_output = None
         self.last_dt = None
 
-    def _state_slot(self, state):
-        """Allocate once per actual State, before its first captured call."""
+    def _allocate_state_slot(self):
+        """Own current and geometric storage outside graph capture only."""
         from . import kinetic_types  # noqa: PLC0415
 
+        if self.device.is_capturing:
+            raise RuntimeError("Prepare additional kinetic States eagerly and recapture")
+        return SimpleNamespace(
+            state=None,
+            current=kinetic_types.allocate_current(self.worlds, self.device),
+            geometric=kinetic_types.allocate_geometric(self.worlds, self.device),
+            generation=wp.zeros(self.worlds, dtype=wp.int64, device=self.device),
+        )
+
+    def _allocate_call_slot(self):
+        """Allocate one directed call's status vectors, never during capture."""
+        from . import kinetic_types  # noqa: PLC0415
+
+        if self.device.is_capturing:
+            raise RuntimeError("Prepare additional kinetic call directions eagerly and recapture")
+
+        def zeros(dtype=int):
+            """Allocate only the original call-owned status or generation vector."""
+            return wp.zeros(self.worlds, dtype=dtype, device=self.device)
+
+        schedule, next_schedule = kinetic_types.KineticSchedule(), kinetic_types.KineticSchedule()
+        schedule.geometry_requested, next_schedule.geometry_requested = zeros(), zeros()
+        schedule.status, next_schedule.status = zeros(), zeros()
+        return SimpleNamespace(
+            held=self.held,
+            expected_held_generation=zeros(wp.int64),
+            requested=schedule.geometry_requested,
+            repair_requested=zeros(),
+            schedule=schedule,
+            next_schedule=next_schedule,
+            refresh_status=zeros(),
+            canonical_generation=self.canonical_generation,
+        )
+
+    def _check_slot_capacity(self, state_in, state_out):
+        """Reject unseen extra capture inputs before any private array writes."""
+        missing = sum(id(state) not in self.states for state in (state_in, state_out))
+        missing_call = (id(state_in), id(state_out)) not in self.calls
+        if self.device.is_capturing and (missing > len(self._state_pool) or (missing_call and not self._call_pool)):
+            raise RuntimeError("Prepare additional kinetic States/call directions eagerly and recapture")
+
+    def _state_slot(self, state):
+        """Bind actual State identity to owned storage without capture allocation."""
         key = id(state)
         if key not in self.states:
-            self.states[key] = SimpleNamespace(
-                state=state,
-                current=kinetic_types.allocate_current(self.worlds, self.device),
-                geometric=kinetic_types.allocate_geometric(self.worlds, self.device),
-                generation=wp.zeros(self.worlds, dtype=wp.int64, device=self.device),
-            )
+            slot = self._state_pool.pop() if self._state_pool else self._allocate_state_slot()
+            slot.state = state
+            self.states[key] = slot
         return self.states[key]
 
     def _slots(self, state_in, state_out):
         """Share only held/cache-bank ownership; keep each call's statuses distinct."""
-        from . import kinetic_types  # noqa: PLC0415
-
+        self._check_slot_capacity(state_in, state_out)
         current, future = self._state_slot(state_in), self._state_slot(state_out)
         key = (id(state_in), id(state_out))
         if key not in self.calls:
-
-            def zeros(dtype=int):
-                """Allocate a call-owned status or generation vector."""
-                return wp.zeros(self.worlds, dtype=dtype, device=self.device)
-
-            schedule, next_schedule = kinetic_types.KineticSchedule(), kinetic_types.KineticSchedule()
-            schedule.generation, next_schedule.generation = current.generation, future.generation
-            schedule.geometry_requested, next_schedule.geometry_requested = zeros(), zeros()
-            schedule.status, next_schedule.status = zeros(), zeros()
-            self.calls[key] = SimpleNamespace(
-                current=current.current,
-                geometric=current.geometric,
-                next_current=future.current,
-                next_geometric=future.geometric,
-                held=self.held,
-                state_generation=current.generation,
-                next_generation=future.generation,
-                expected_held_generation=zeros(wp.int64),
-                requested=schedule.geometry_requested,
-                repair_requested=zeros(),
-                schedule=schedule,
-                next_schedule=next_schedule,
-                refresh_status=zeros(),
-                canonical_generation=self.canonical_generation,
-            )
+            slot = self._call_pool.pop() if self._call_pool else self._allocate_call_slot()
+            slot.current, slot.geometric = current.current, current.geometric
+            slot.next_current, slot.next_geometric = future.current, future.geometric
+            slot.state_generation, slot.next_generation = current.generation, future.generation
+            slot.schedule.generation, slot.next_schedule.generation = current.generation, future.generation
+            self.calls[key] = slot
         return self.calls[key]
 
     def join(self):
@@ -442,6 +467,7 @@ class KineticWorldOwner:
             if self.last_private:
                 self._demote()
             return False
+        self._check_slot_capacity(state_in, state_out)
         global_refresh = int(solver._step % 2 == 0 or solver._force_mass_update)
         if not self.last_private and self.ever_admitted and not global_refresh:
             return False

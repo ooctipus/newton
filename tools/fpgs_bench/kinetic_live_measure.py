@@ -52,7 +52,7 @@ class Boundaries:
         original = self.cls.step
 
         def step(solver, *args, **kwargs):
-            capturing = solver.model.device.is_capturing
+            capturing = bool(solver.model.device.is_capturing)
             cold = not bool(getattr(getattr(solver, "_kinetic_world", None), "ever_admitted", False))
             result = original(solver, *args, **kwargs)
             owner = getattr(solver, "_kinetic_world", None)

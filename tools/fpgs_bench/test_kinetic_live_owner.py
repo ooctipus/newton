@@ -15,6 +15,46 @@ import warp as wp
 class TestKineticLiveOwner(unittest.TestCase):
     """Check state generations, repair, and held-only canonical conversion."""
 
+    def test_pingpong_first_capture_allocates_no_device_storage(self):
+        """Bind the two actual states and both call directions from eager storage."""
+        from newton._src.solvers.feather_pgs.kinetic_live_owner import KineticWorldOwner
+        from newton._src.solvers.feather_pgs.kinetic_live_plan import build_live_plan
+        from tools.fpgs_bench.test_kinetic_live_bindings import live_solver
+
+        solver = live_solver()
+        owner = KineticWorldOwner(solver, build_live_plan(solver))
+        first, second, third = (solver.model.state() for _ in range(3))
+        owner.device = SimpleNamespace(is_capturing=True)
+        with mock.patch.object(wp, "zeros", side_effect=AssertionError("capture allocation")):
+            forward = owner._slots(first, second)
+            backward = owner._slots(second, first)
+            self.assertIs(forward.current, backward.next_current)
+            self.assertIs(forward.next_current, backward.current)
+            self.assertIs(owner._slots(first, second), forward)
+            self.assertIsNot(forward.refresh_status, backward.refresh_status)
+            before = (dict(owner.states), dict(owner.calls))
+            with self.assertRaisesRegex(RuntimeError, "recapture"):
+                owner._slots(third, first)
+            self.assertEqual((owner.states, owner.calls), before)
+
+    def test_additional_eager_state_is_prepared_before_later_capture(self):
+        """Allow actual extra eager states, without reserving an arbitrary pool."""
+        from newton._src.solvers.feather_pgs.kinetic_live_owner import KineticWorldOwner
+        from newton._src.solvers.feather_pgs.kinetic_live_plan import build_live_plan
+        from tools.fpgs_bench.test_kinetic_live_bindings import live_solver
+
+        solver = live_solver()
+        owner = KineticWorldOwner(solver, build_live_plan(solver))
+        first, second, third = (solver.model.state() for _ in range(3))
+        owner._slots(first, second)
+        owner._slots(second, first)
+        extra = owner._slots(third, first)
+        owner.device = SimpleNamespace(is_capturing=True)
+        with mock.patch.object(wp, "zeros", side_effect=AssertionError("capture allocation")):
+            self.assertIs(owner._slots(third, first), extra)
+        self.assertEqual(len(owner.states), 3)
+        self.assertEqual(len(owner.calls), 3)
+
     def test_owner_api_exists(self):
         """Require the actual opt-in owner before testing its lifecycle."""
         from newton._src.solvers.feather_pgs import kinetic_live_owner as owner

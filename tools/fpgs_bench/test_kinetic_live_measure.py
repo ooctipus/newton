@@ -86,8 +86,12 @@ class TestLiveMeasure(unittest.TestCase):
         original = cls.step
         report = {}
         observer = Boundaries(cls, report, "performance")
+        capturing = {"capture": object()}
+        solver.model.device.is_capturing = capturing
         observer.install()
         self.assertEqual(solver.step(), "original")
+        capturing.clear()
+        self.assertIs(report["pre_timing_calls"][0]["capture"], True)
         with patch("tools.fpgs_bench.kinetic_live_measure.Observer._admit"):
             observer.check(manager)
             self.assertIs(cls.step, original)

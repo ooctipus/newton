@@ -263,3 +263,37 @@ graph identity and advanced device epochs only outside timing. It makes no
 new full contact-eight or convergence claim; it does not compare unrelated
 atomic row orderings bitwise. A matched actual50dfa arm and integrated trace
 are still required before any whole-physics performance conclusion.
+
+### First graph attempt: capture-allocation lifetime fault
+
+Graph01 at `f1379fbcb96458fc95c005b957dec72a8c1677ff` failed before its first
+boundary on both GPUs. Source and final idle guards passed. Manifest SHA256
+`2a16e9c756782524ffe41a1d6504f87b94822ba0e9afa11925e6832a2eada1ec`.
+The exact RTX case was rerun under memcheck only; no task or native changes.
+Its parent `/tmp/fpgs-kuka-kinetic-live-graph-memcheck-rtx512-20260913-01/manifest.json`
+has SHA256 `e3aea9904e0f95be3b8c6f65c2b29762272ae464a1d34872d2fb4f32ef331be8`;
+`gpu0/memcheck.log` is `d4e633636b93e0945091e91658b7d06408fc0afa7902f35ac38786bc4cd94a48`.
+The FIRST fault is `_invalidate_current_15188213_cuda_kernel_forward+0xb30`,
+a four-byte global write by thread96/block0 to unallocated address0x624009b180.
+The diagnostic parent was reaped and its final source/idle guards passed.
+
+Actual setup captures the two solver substeps before reset-buffer construction.
+The owner first allocated its per-State current/geometric/epoch arrays inside
+that capture; ordinary reset then wrote those graph-allocation addresses before
+the graph's first replay. This is a Newton ownership/lifetime defect, not a
+contact-row arithmetic or publication-tolerance failure. The fixed Lab manager
+documents the same CUDA allocation behavior for another solver, but no Lab
+replay workaround is introduced here.
+
+The scoped correction moves exactly the standard two State banks and two
+directed-call status banks to owner construction. The actual A/B and B/A State
+identities are bound later without device allocation. This is the same storage
+already demanded by ordinary ping-pong execution, not an enlarged row/contact
+panel or an arbitrary reserve of States. Extra actual eager States allocate
+only on demand outside capture. Unprepared extra capture States/directions
+raise before private writes and require eager preparation/recapture. No kernel,
+floating arithmetic, solver budget or task changes occur. A regression failed
+first on the original capture-time `wp.zeros`, then passed with both directions,
+unseen capture rejection and additional eager-State reuse. The observer also
+stores `bool(device.is_capturing)` instead of a reference to Warp's mutable
+capture dictionary; this corrects only diagnostic labeling, not the fault.
