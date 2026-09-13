@@ -622,6 +622,7 @@ class SparseFactor:
                     s.contact_art_a,
                     s.contact_art_b,
                     s.contact_path,
+                    s.contact_slots_needed,
                     model.shape_body,
                     state_in.body_q,
                     state_aug.body_v_s,
