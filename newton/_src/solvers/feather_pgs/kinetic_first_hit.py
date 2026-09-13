@@ -4,7 +4,8 @@
 """Experimental current contact packets and first-demand physical responses.
 
 MF worlds retain the original eager/factor path. MF0 packet storage reuses J;
-action storage reuses Y. No state or response capacity is allocated here.
+first demand replaces the contact packet with physical J and caches Y. No
+state or response capacity is allocated here.
 """
 
 import functools
@@ -177,6 +178,11 @@ _HELPERS = r"""
         if(row<contact_start){
             const int coord=static_cast<int>(rows.physical_J.data[id*29]);
             sum=__shfl_sync(MASK,factor_velocity,coord)*rows.physical_J.data[id*29+1];
+        }else if(rows.valid.data[id]==2){
+            sum=lane<29?rows.physical_J.data[id*29+lane]*factor_velocity:0.0f;
+            sum+=__shfl_down_sync(MASK,sum,16);sum+=__shfl_down_sync(MASK,sum,8);
+            sum+=__shfl_down_sync(MASK,sum,4);sum+=__shfl_down_sync(MASK,sum,2);sum+=__shfl_down_sync(MASK,sum,1);
+            sum=__shfl_sync(MASK,sum,0);
         }else{
             rebuild_motion();
             if(lane<12){const int endpoint=lane/6,k=lane%6;
@@ -218,6 +224,9 @@ _HELPERS = r"""
                 float diag=rows.row_cfm.data[id];
                 for(int col=0;col<29;++col){const float zk=__shfl_sync(MASK,z,col);diag+=zk*zk;}
                 if(lane==0){s_diag[row]=diag;rows.diag.data[id]=diag;}
+                __syncwarp(MASK);
+                // Every packet/mask read is complete before replacing its overlapping panel.
+                if(lane<29)rows.physical_J.data[id*29+lane]=j;
                 __syncwarp(MASK);
             }
             float y=0.0f;
@@ -324,6 +333,7 @@ _CPU_LAZY = r"""
     };
     auto residual=[&](int row){const int id=off+row;
         if(row<first){const int coord=static_cast<int>(rows.physical_J.data[id*29]);return dv[coord]*rows.physical_J.data[id*29+1]+rows.r0.data[id];}
+        if(rows.valid.data[id]==2){float value=0.0f;for(int d=0;d<29;++d)value+=rows.physical_J.data[id*29+d]*dv[d];return value+rows.r0.data[id];}
         rebuild();float value=0.0f;
         for(int endpoint=0;endpoint<2;++endpoint){const int b=static_cast<int>(rows.physical_J.data[id*29+12+endpoint]);
             if(b>=0)for(int k=0;k<6;++k)value+=rows.physical_J.data[id*29+endpoint*6+k]*motion[b*6+k];}
@@ -342,6 +352,7 @@ _CPU_LAZY = r"""
             for(int d=0;d<23;++d)for(int k=0;k<23;++k)z[po+d]+=t(d,k)*j[po+k];
             for(int d=0;d<6;++d)for(int k=0;k<=d;++k)z[so+d]+=held.inverse6.data[group*36+d*6+k]*j[so+k];
             float diag=rows.row_cfm.data[id];for(int d=0;d<29;++d)diag+=z[d]*z[d];rows.diag.data[id]=diag;
+            for(int d=0;d<29;++d)rows.physical_J.data[id*29+d]=j[d];
         }
         for(int d=0;d<29;++d){float y=0.0f;
             if(d<23)for(int k=0;k<23;++k)y+=t(k,d)*z[po+k];
@@ -356,6 +367,7 @@ _CPU_LAZY = r"""
             if(type==2){parent=rows.row_parent.data[id];sibling=row==parent+1?parent+2:parent+1;
                 if(parent<0||sibling<0||sibling>=m){solve.status.data[world]=1;return;}
                 if(lambda[parent]<=0.0f&&lambda[row]==0.0f&&lambda[sibling]==0.0f)continue;}
+            if(type==2){ensure(row);ensure(sibling);}
             const float r=residual(row),old=lambda[row];
             if(row>=first&&type==0&&old==0.0f&&r>=0.0f)continue;
             ensure(row);if(type==2)ensure(sibling);

@@ -83,6 +83,16 @@ class TestFirstHit(unittest.TestCase):
         self.assertIn(branch, kinetic_solve._CPU)
         self.assertIn(branch.replace("residual", "r"), kinetic_first_hit._CPU_LAZY)
 
+    def test_demanded_residual_reuses_current_physical_j(self):
+        """Replace packet storage only after packet reads; publish valid2 last."""
+        source = kinetic_first_hit._HELPERS
+        write = "if(lane<29)rows.physical_J.data[id*29+lane]=j;"
+        self.assertIn("else if(rows.valid.data[id]==2)", source)
+        self.assertLess(source.index("__syncwarp(MASK);", source.index("float diag=")), source.index(write))
+        self.assertLess(source.index(write), source.index("rows.valid.data[id]=2"))
+        self.assertIn("if(row<contact_start)", source)
+        self.assertIn("rows.physical_J.data[id*29+1]", source)
+
     def test_live_hook_binds_both_new_owners(self):
         """Bind the actual live constructor to the new producer and consumer together."""
         from tools.fpgs_bench.test_kinetic_live_bindings import bound_call  # noqa: PLC0415

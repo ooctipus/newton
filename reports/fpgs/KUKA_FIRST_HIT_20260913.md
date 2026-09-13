@@ -43,6 +43,18 @@ worlds stay eager before any lazy buffer write. No dynamic mid-solve rollback.
 Current geometry/packet validity resets each call even when held T is reused.
 Current free-MF inverse never substitutes for held free6.
 
+The preserved97ec physical gate found a small real GB world210 residual drift:
+velocity3.206e-5 versus unchanged3e-5 bound, while mass-metric error energy was
+1.416e-11 and normal violation zero. Actual cachedY substituted into the same
+FP64 eight changes velocity only1.11e-7: repeated endpoint-motion residuals,
+not cached action, caused the drift. The one corrective representation stores
+physicalJ29 in the SAME contact packet panel on first demand, alongside cachedY.
+Demanded rows use direct J·physical-delta-velocity; never-demanded normals still
+use body motions and have no J/Y. All packet reads synchronize before overlap
+writes; valid2 publishes last. Prefix keeps its unit-row key, not a full row.
+No extra panel or eager row production is introduced. Both prior failed runs
+remain preserved; corrected physical and complete timing gates are pending.
+
 ## Physical gate and complete cost
 
 Regression-first tests cover absent API, same-current rounded geometry, physical
