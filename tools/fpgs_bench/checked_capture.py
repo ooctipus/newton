@@ -91,6 +91,9 @@ def joint_world_metadata(solver) -> dict:
     """Check actual current joint-world outputs outside both timed windows."""
     owner = getattr(solver, "_joint_world", None)
     result = {"configured": owner is not None, "whole_run_admission": False}
+    kinetic = getattr(solver, "_kinetic_world", None)
+    if kinetic is not None and kinetic.last_private:
+        return {**result, "delegated_to": "kinetic_world", "scope": "Old joint-world output buffers are not current"}
     if owner is None:
         return result
     if owner.solver is not solver:
@@ -125,6 +128,68 @@ def joint_world_metadata(solver) -> dict:
         active_worlds=count,
         original_predictor_worlds=sum(fallback),
         raw_index_storage_bytes=owner.buckets.storage_bytes,
+    )
+    return result
+
+
+def kinetic_world_metadata(solver) -> dict:
+    """Check current kinetic ownership only at the existing untimed boundaries."""
+    owner = getattr(solver, "_kinetic_world", None)
+    result = {"configured": owner is not None, "whole_run_admission": False}
+    if owner is None:
+        return result
+    if owner.solver is not solver:
+        raise RuntimeError("Kinetic owner is bound to another solver")
+    result["active"] = owner.last_private
+    if not owner.last_private:
+        return result
+    worlds = solver.world_count
+
+    def read(array, size):
+        """Read exact integer status vectors, never while capturing."""
+        if array.device.is_capturing or array.shape != (size,):
+            raise RuntimeError("Read correctly shaped kinetic outputs outside capture")
+        values = array.numpy().tolist()
+        if any(type(value) is not int for value in values):
+            raise RuntimeError("Kinetic metadata must contain integer indices")
+        return values
+
+    clock = read(owner.clock, worlds)
+    held_generation = read(owner.held.generation, worlds)
+    if read(owner.held.valid, worlds) != [1] * worlds or min(clock) < 0 or min(held_generation) < 0:
+        raise RuntimeError("Invalid current kinetic held generation or validity")
+    guard = owner.last_call.solve.guard
+    for name in ("predictor_status", "row_status", "solve_status", "error"):
+        if any(read(getattr(guard, name), worlds)):
+            raise RuntimeError("Nonzero current kinetic status: " + name)
+    for name in ("frame_status", "row_global_status", "raw_invalid"):
+        if any(read(getattr(guard, name), 1)):
+            raise RuntimeError("Nonzero current kinetic status: " + name)
+    for slots in owner.calls.values():
+        for array in (slots.schedule.status, slots.next_schedule.status, slots.refresh_status):
+            if any(read(array, worlds)):
+                raise RuntimeError("Nonzero kinetic producer status")
+    state = owner.last_call.rows.state
+    count = read(state.active_count, 1)[0]
+    resolved, active = read(state.resolved, worlds), read(state.active_worlds, worlds)
+    if (
+        not 0 <= count <= worlds
+        or any(value not in (0, 1) for value in resolved)
+        or sorted(active[:count]) != [world for world, zero in enumerate(resolved) if not zero]
+    ):
+        raise RuntimeError("Invalid current kinetic active partition")
+    result.update(
+        scope="Current graph output only; not per-replay fallback counts, original-eight or convergence acceptance",
+        worlds=worlds,
+        active_worlds=count,
+        zero_worlds=sum(resolved),
+        state_slots=len(owner.states),
+        directed_call_slots=len(owner.calls),
+        clock_min=min(clock),
+        clock_max=max(clock),
+        held_generation_min=min(held_generation),
+        held_generation_max=max(held_generation),
+        status_pass=True,
     )
     return result
 
@@ -335,6 +400,7 @@ def install_boundary_check(harness: ModuleType, report: dict, save, get_manager,
                 entry["fused_contact_solve"] = fused_contact_metadata(manager._solver)
                 entry["early_publication"] = early_publication_metadata(manager._solver)
                 entry["joint_world"] = joint_world_metadata(manager._solver)
+                entry["kinetic_world"] = kinetic_world_metadata(manager._solver)
             if not isinstance(metadata, dict) or "error" in metadata or metadata.get("state_finite") is not True:
                 raise RuntimeError(f"Invalid Lab state/model metadata: {metadata!r}")
             metadata["overflow_check"] = entry
