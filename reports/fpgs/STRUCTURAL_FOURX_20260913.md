@@ -92,3 +92,7 @@ The session goal controller still reports an older unfinished blocked goal;
 creating a replacement returned an unfinished-goal error. It was not falsely
 marked complete. Work is continuing in the active session; this report does
 not assert that an autonomous background schedule was successfully installed.
+
+Integrated discoveries and their explicit acceptance limitations are tracked
+in [the results ledger](STRUCTURAL_FOURX_RESULTS_20260913.md). Historical
+starting references above are retained, not overwritten with prototype timings.
