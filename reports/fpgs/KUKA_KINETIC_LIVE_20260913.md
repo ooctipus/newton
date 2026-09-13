@@ -1,0 +1,166 @@
+# Live Kuka kinetic integration checkpoint
+
+Implementation GO: 2026-09-13 04:58 UTC. First integrated checkpoint: 06:28
+UTC (90 minutes); reassess explicitly before any continuation past 06:58.
+This is implementation in progress, not accepted performance or convergence.
+
+The isolated branch `ooctipus/fpgs-demand-state-20260913` starts at
+`685d1df5a2492deafeb2fd16617903ea981e083a`, including the handoff and current
+reports. Its starting runtime is byte-identical to accepted Kuka
+`50dfa28d3aabe51f1b5b75721450efac2c35c5f1`. Original worktrees and Isaac Lab
+remain unchanged. The Newton remote is the ooctipus fork.
+
+## Measured motivation and limits
+
+The compact coupled recurrence plus contact-triplet producer reduced the fresh
+Kuka prototype replacement section from 10.396544456 to 8.328000069 ms on RTX
+and 9.253376007 to 7.966592073 ms on GB300: 1.25x / 1.16x. These complete-section
+measurements do not include live collision generation, callbacks, cold repair
+or Lab execution. Do not call them whole-task performance, combine them with
+old outside costs, or update the accepted task table. The additional 2x/4x
+targets remain unmet. Detailed evidence is in
+[the lifetime report](KUKA_KINETIC_LIFETIME_20260913.md).
+
+The live port must enter before the retired producers. A new representation
+beside the old full dynamics/response pipeline would not realize the hypothesis.
+No new numerical algorithm, iteration change, buffer inflation or Lab edit is
+authorized by this implementation checkpoint.
+
+## Parallel ownership
+
+- Native port: `kinetic_*` types and kernel factories, relative imports and
+  function-source guards. Preserve generated arithmetic/synchronization first;
+  keep explicit corrective changes separate and tested.
+- Plan/bindings: actual Model/State/Control/Contacts inputs and existing public
+  storage; no fixture/capture import, numerical seed, extra maximum-sized panel
+  or snapshot facade.
+- Lifecycle: solver entry, graph-safe current/geometric/held epochs, ordinary
+  reset and odd-request repair, original fallback transition, stream joins and
+  publication/contact-export hooks.
+- Root: paired actual eager/graph physical checks and whole-workload A/B. RTX
+  remains primary; one owned process per GPU, sources frozen during each run.
+
+## Required first gate
+
+Demonstrate real construction and repeated stepping without snapshot restore:
+initial refresh, reuse, subset reset on reuse, odd requested refresh, alternating
+State objects, and fresh force/target inputs. CPU alias/construction checkpoint
+is 05:45. Both primary and original free refresh must consume the same original
+request before it is cleared. Reset does not imply an extra held refresh.
+
+Keep dt1/240, two substeps, eight GS sweeps maximum, zero velocity passes,
+mass interval2 and original capacities192/64/192/raw4,000,000. Preserve complete
+public state, actual `update_contacts` cadence, original anomaly snapshots and
+callbacks between physical calls. No hidden two-call solver loop.
+
+Before first admission unsupported input stays on the original path. After
+private ownership, an eager demotion must recover canonical factors from the
+actual held augmented operator and invalidate current FK; current geometry or
+rounded T is not a historical held substitute. A newly unsupported contract
+during graph capture may reject before writes with an explicit recapture
+requirement at this experimental checkpoint. That is not a claim of completed
+general fallback support. No stronger transactional state-staging contract is
+being introduced.
+
+Later acceptance still requires no-restore graph replays, notification and
+transition coverage, live Lab readers/reset/task behavior, and repeated balanced
+whole-physics A/B on both GPUs with wall time reported separately. Approximately
+10% RTX whole improvement is a milestone to test, not a promised transfer of
+the section gain or completion of the 2x/4x objective.
+
+## Frozen design references
+
+- Lifecycle: `/tmp/fpgs-kuka-live-integration-IvdDlfQT/NOTE.md`, SHA256
+  `8f3708a5580f92d052bc345cd178e5a86ac19eb3f5a6a1a58aa3d1a6d06563a4`.
+- Full binding map: `/tmp/fpgs-kuka-live-input-binding-VZ7mNfbe/NOTE.md`, SHA256
+  `24b332d9dcf9a23b53dfe8a23ef3f0511b4225a33a95f8c2f144993ba31bb287`.
+
+An independent activity census exposed a shared sibling transaction hazard.
+The first failed runs remain diagnostic evidence, not speedups or accepted
+counts. The eventual explicit correction is recorded below; numerical tolerances
+and physical checks were not relaxed to obtain the census.
+
+## Resumed isolated live gate, 11:18 UTC
+
+The original dirty demand-state worktree is preserved. The new worktree
+`/home/octi/Projects/newton-fpgs-kinetic-live-20260913`, branch
+`ooctipus/fpgs-kinetic-live-20260913`, starts at
+`fe61a6528755ab770ac098de051beb8de0ecb8cc`. This inherits the reports and
+fixed-root contact-reset handoff, with the same starting Newton runtime as
+`685d1df5`. All 30 original candidate files were initially transferred
+byte-for-byte: 21 native/type/binding modules, five Solver hook locations in one
+existing file, seven diagnostic/test tools and this report. Only the probe's
+backend-selection guards/tests and this note change in the resumed checkpoint.
+
+This commit is **WIP and unvalidated in live GPU execution**. It is not an
+accepted solver revision, whole-task speedup, convergence result or parent
+submodule pointer. The next experiment is the actual 512-world eager lifecycle
+probe, followed by real no-restore graph/whole-cost gates if it passes. Do not
+repeat archived component tests as a substitute. The first checkpoint is
+12:48 UTC; root owns all GPU leases and promotion decisions.
+
+### Shared-impulse correction provenance
+
+The transferred `kinetic_solve.py` SHA256 is
+`6e7634e1104cf6a4702d3075f678b020990e592eecd885f8a9989632c48c537a`.
+Its explicit reversible edit log removes three dead temporary own-row stores,
+adds three old-sibling read-complete warp fences and five final-impulse
+read-complete fences. It changes neither the floating recurrence nor the
+eight-sweep budget. The compact coupled factory inherits the same recurrence.
+
+The independent diagnostic counterpart is
+`/tmp/fpgs-kuka-offset-transaction-gZfso9iY/offset_transaction.py`; its final
+paired run is
+`/tmp/fpgs-kuka-offset-transaction-paired16k-20260913-01/manifest.json`, SHA256
+`98ceac1345a91c2420c986bb078fd268a77d58ff82b2db5c881b66a889ba266e`.
+Both cards passed warm/sibling controls and the fresh two-call, same-emitted-order
+original-eight comparison. This was an untimed diagnostic, not a live-owner
+validation. Earlier failures included correct velocity but doubled published
+prefix impulses; they are not dismissed as harmless instrumentation noise.
+
+The checked edit-log SHA256 is
+`fdcabd747dd84c9549e0d344d11b95e1fe8909df4ade79ba457bfa515e654913`.
+CPU source recovery reverses only these eleven edits and matches all 244
+original native/descriptor records. It also checks the corrected offset and
+compact generated-source hashes separately. No new transaction hazard is
+known from this source transfer; actual live GPU coverage is still missing.
+No new independent peer review of the transfer is claimed.
+
+### Probe source selection and scope
+
+`run_kinetic_live_probe.py` requires explicit `--backend-isaaclab` and selects
+only `isaaclab_newton` from Lab
+`53ee6b44c2334341305dbdf385a3916c6b140799`. Core/tasks, interpreter and the
+unchanged `run_profiled.py` harness stay at Lab
+`1d8feb82d17dbfab8f0772de56f84deae2cb7974`. No Lab files are edited. Package
+origins are checked before imports, all loaded backend sources must be pinned,
+and the actual manager/articulation imports are required after execution.
+Unused lazy rigid-object imports are not artificially required. A shared `.venv`
+symlink to the selected interpreter is the only permitted fixed-Lab untracked
+entry. Other source dirt, mixed packages and scratch imports are rejected.
+
+The paired owner supplies one GPU UUID, `--newton`, old `--isaaclab`, distinct
+fresh `--output`/`--audit-output`; forwarded arguments supply the fixed backend,
+explicit pins, the WIP commit, `--num-envs 512 --perturb`. The probe retains
+three actual environment steps (24 physical calls), cold/reuse/alternating-state
+ownership, force/target changes, subset reset, odd refresh, capacity checks and
+independent public FK checks. Its printed times include readbacks and are not
+performance data. Contact-eight, convergence, timing and whole-physics acceptance
+remain explicitly false even if the lifecycle probe passes.
+
+### CPU readiness and honest budget
+
+The missing-live-module regression failed before the runtime transfer; the
+fixed-backend API regression failed before its guard was added. Afterward, all
+38 focused CPU tests pass (bindings, lifecycle, native source recovery, observer
+and runner), including a repeat after formatting. The required full-tree
+`uvx pre-commit run -a` passes; its only formatting change was the owned probe.
+Actual selected package-spec/source checks also pass without
+executing Lab or GPU code. This is not a replacement for the first live test.
+
+The old 8.328000069 ms RTX section sits only 0.157446896 ms below the planning
+8.485446965 ms replacement ceiling for a 10% whole-physics gain; new live
+bookkeeping/dilation and the later synchronization correction are not measured.
+The old GB section is already above its corresponding 10% ceiling. Thus this
+candidate has a narrow RTX milestone hypothesis, not an established 10% gain
+on both cards. It does not by itself reach 2x-handoff or 4x-MJ whole physics.
