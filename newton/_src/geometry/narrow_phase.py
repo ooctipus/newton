@@ -2280,6 +2280,13 @@ class NarrowPhase:
     and buffer capacities, and is disabled by default. Mixed triangle-mesh and
     heightfield scenes retain the original midphase. Contact ordering and
     redundant manifold point selection may change.
+
+    ``NEWTON_HEIGHTFIELD_FINITE_QUERY=1`` is a separate experimental finite-box
+    query/manifold owner for non-speculative heightfield scenes. It preserves
+    the compacted triangle stream, generic fallback, reducer and capacities,
+    but may choose different physically supported manifold points. Construction
+    through CollisionPipeline binds immutable convex hull bounds; refitting a
+    bound convex hull requires rebuilding this experimental pipeline.
     """
 
     def __init__(
@@ -2422,6 +2429,12 @@ class NarrowPhase:
         if packed_pairs not in ("0", "1"):
             raise ValueError("NEWTON_NARROW_PHASE_PACKED_HEIGHTFIELD_PAIRS must be 0 or 1")
         self._heightfield_packed_pairs = packed_pairs == "1" and self._heightfield_cell_reject
+        finite_query = os.environ.get("NEWTON_HEIGHTFIELD_FINITE_QUERY", "0")
+        if finite_query not in ("0", "1"):
+            raise ValueError("NEWTON_HEIGHTFIELD_FINITE_QUERY must be 0 or 1")
+        self._heightfield_finite_query = finite_query == "1" and has_heightfields and not has_meshes and not speculative
+        self._finite_bounds = None
+        self._finite_source = None
         self.mesh_sdf_texture_only = mesh_sdf_texture_only
         self.has_generic_convex_pairs = has_generic_convex_pairs
         self.sdf_texture_paired_samples = sdf_texture_paired_samples
@@ -2543,6 +2556,13 @@ class NarrowPhase:
             self.mesh_triangle_contacts_kernel = create_narrow_phase_process_mesh_triangle_contacts_kernel(writer_func)
         else:
             self.mesh_triangle_contacts_kernel = None
+        if self._heightfield_finite_query:
+            from .heightfield_finite import create_query_kernel, marked_fallback  # noqa: PLC0415
+
+            self._finite_direct = create_query_kernel(writer_func)
+            self._finite_reducer = create_query_kernel(write_contact_to_reducer)
+            self._finite_direct_fallback = marked_fallback(self.mesh_triangle_contacts_kernel)
+            self._finite_reducer_fallback = marked_fallback(mesh_triangle_contacts_to_reducer_kernel)
 
         # Create mesh-specific kernels only when has_meshes=True
         if has_meshes:
@@ -3129,46 +3149,74 @@ class NarrowPhase:
                     )
 
                 # Mesh/heightfield-triangle contacts → same global reducer
+                triangle_inputs = [
+                    shape_types,
+                    shape_data,
+                    shape_transform,
+                    shape_source,
+                    shape_gap,
+                    shape_heightfield_index,
+                    heightfield_data,
+                    heightfield_elevations,
+                    self.triangle_pairs,
+                    self.triangle_pairs_count,
+                    reducer_data,
+                    self.total_num_threads,
+                ]
+                if self._heightfield_finite_query:
+                    if self._finite_bounds is None:
+                        raise RuntimeError("Finite query requires CollisionPipeline model binding")
+                    wp.launch(
+                        kernel=self._finite_reducer,
+                        dim=self.total_num_threads,
+                        inputs=[*triangle_inputs, self._finite_bounds, self._finite_source],
+                        device=device,
+                        block_dim=self.mesh_triangle_block_dim,
+                        record_tape=False,
+                    )
                 wp.launch(
-                    kernel=mesh_triangle_contacts_to_reducer_kernel,
+                    kernel=self._finite_reducer_fallback
+                    if self._heightfield_finite_query
+                    else mesh_triangle_contacts_to_reducer_kernel,
                     dim=self.total_num_threads,
-                    inputs=[
-                        shape_types,
-                        shape_data,
-                        shape_transform,
-                        shape_source,
-                        shape_gap,
-                        shape_heightfield_index,
-                        heightfield_data,
-                        heightfield_elevations,
-                        self.triangle_pairs,
-                        self.triangle_pairs_count,
-                        reducer_data,
-                        self.total_num_threads,
-                    ],
+                    inputs=triangle_inputs,
                     device=device,
                     block_dim=self.mesh_triangle_block_dim,
                     record_tape=False,
                 )
             else:
                 # Direct contact processing without reduction
+                triangle_inputs = [
+                    shape_types,
+                    shape_data,
+                    shape_transform,
+                    shape_source,
+                    shape_gap,
+                    shape_heightfield_index,
+                    heightfield_data,
+                    heightfield_elevations,
+                    self.triangle_pairs,
+                    self.triangle_pairs_count,
+                    writer_data,
+                    self.total_num_threads,
+                ]
+                if self._heightfield_finite_query:
+                    if self._finite_bounds is None:
+                        raise RuntimeError("Finite query requires CollisionPipeline model binding")
+                    wp.launch(
+                        kernel=self._finite_direct,
+                        dim=self.total_num_threads,
+                        inputs=[*triangle_inputs, self._finite_bounds, self._finite_source],
+                        device=device,
+                        block_dim=self.mesh_triangle_block_dim,
+                        record_tape=False,
+                    )
                 wp.launch(
-                    kernel=self.mesh_triangle_contacts_kernel,
+                    kernel=self._finite_direct_fallback
+                    if self._heightfield_finite_query
+                    else self.mesh_triangle_contacts_kernel,
                     dim=self.total_num_threads,
-                    inputs=[
-                        shape_types,
-                        shape_data,
-                        shape_transform,
-                        shape_source,
-                        shape_gap,
-                        shape_heightfield_index,
-                        heightfield_data,
-                        heightfield_elevations,
-                        self.triangle_pairs,
-                        self.triangle_pairs_count,
-                        writer_data,
-                        self.total_num_threads,
-                    ],
+                    inputs=triangle_inputs,
                     device=device,
                     block_dim=self.mesh_triangle_block_dim,
                     record_tape=False,
