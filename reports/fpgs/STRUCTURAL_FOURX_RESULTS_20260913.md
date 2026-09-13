@@ -1,16 +1,99 @@
 # Structural window: integrated discoveries
 
-Checkpoint: 2026-09-13 17:22 UTC. Work continues toward the 24-hour window in
+Checkpoint: 2026-09-13 18:13 UTC. Work continues toward the 24-hour window in
 `STRUCTURAL_FOURX_20260913.md`; the 4x target is **not achieved**. These are
 discoveries, not replacements for accepted baselines except where repeat
 evidence is explicitly given. No candidate has met the complete 4x target.
 No Isaac Lab source, timestep, substep or iteration allowance was changed.
 
-**Current physical hold:** the finite-terrain candidate produces a large
-asymmetric GB free-foot rebound response in the loaded eight-sweep test.
-Its timing results below remain measurements, not qualified optimizations.
-Further stacking/promotion is stopped pending causal diagnosis. The sparse
-solver and packed midphase are separable from this changed manifold law.
+**Current physical hold:** the original finite-terrain candidate produces a
+large asymmetric free-foot rebound response. A narrow corrected successor
+now passes the targeted rebound controls, but the shared sliding discrepancy
+and an unreduced fixture-capacity failure remain unresolved. Neither finite
+version is promoted. The sparse solver and packed original-query midphase
+are separable from this changed manifold law.
+
+## Current comparison and diagnosed losses (18:13 checkpoint)
+
+The earlier **1.403934x RTX / 1.934297x GB** sparse-plus-finite result is
+FPGS versus cell-only FPGS, not FPGS versus MJWarp; that finite version remains
+on physical hold. It must not be presented as another improvement in the
+backend ratio or included in a promoted baseline.
+
+A fresh G1 comparison uses clean `19099e91` on both backends, with shared
+current-height rejection and packed original terrain queries, without finite
+queries. FPGS additionally enables sparse43; MJWarp retains its corrected
+solver and external Newton collision. Fixed Lab53ee, substeps and iteration
+allowances are unchanged. This is one 16K seed0, 200-warmup, 40-profile-step
+discovery round, not a repeated promotion result or full RL throughput.
+
+| GPU | FPGS physics | Corrected MJWarp physics | MJWarp / FPGS |
+| --- | ---: | ---: | ---: |
+| RTX PRO 6000 | 25.563279200 ms | 42.293261875 ms | 1.654453701x |
+| GB300 | 34.889251200 ms | 51.687804450 ms | 1.481482195x |
+
+Separate environment-wall times are FPGS/MJ 39.507002401/56.667819526 ms RTX
+and 48.788600626/65.323011951 ms GB. All four children exit zero; both checked
+boundaries pass, states are finite and MJ warning masks are zero. The original
+backend owner completes after its final source guard; this older schema does
+not contain a separate final-guard Boolean. Fresh compute-app queries are
+empty. Source and results: `/tmp/fpgs-g1-packed-original-shared-mj-paired16k-20260913-01`,
+manifest `f523aa0701b0d93bd5a39cab7e8fdd7e2ba2706d67f68915ce798142d670497f`.
+
+The same-GPU September11 handoff capture `compare_gpus_r0rvbs8o` records
+clean Newton31cf87f46 FPGS at 40.961346667/67.864682667 ms, physics-only,
+with the same two GPU UUIDs. This is a lower historical absolute-time trend,
+NOT a matched cumulative gain: the older Lab, capacities, three versus40
+profile samples and capacity-check coverage differ, and there is no matched
+old MJ arm. It neither establishes the user's recalled fpgs-main1.5x pin nor
+licenses multiplying incremental gains. Current G1 remains about1.5--1.65x
+corrected MJWarp, far below4x. Shared collision gains benefit MJWarp too.
+
+Two sparse-only successors are physically tested but not promoted:
+
+- Level factor scheduling `a8f8c62d` reduces barriers and indexing while
+  retaining all factor products. Four controls/card pass, but whole physics
+  improves only 28.971685025 to28.696025300 ms RTX and40.883787725
+  to40.436258075 ms GB (about1%). No mapping sweep is funded.
+- Implicit limit prefix `95bdb5ae` also passes four controls/card, but whole
+  physics loses on RTX: 29.088434225 to30.159742475 ms; GB changes
+  40.926988300 to40.513590675 ms. Source-identical three-step node attribution
+  shows prefix exclusive cost dropping2.243477 to0.171733 ms RTX, while
+  complete GS/decode grows5.916565 to9.244272 ms. Retained work changes only
+  +0.007991 ms. Removing stored Z adds repeated dependent inverse-index/shared-W
+  gathers inside GS; that is a source-supported mechanism, not isolated
+  hardware-stall attribution. Full40 timing remains the throughput authority.
+  Node-owner auxiliary-analyzer failures are preserved; all four captures
+  pass independent strict correlation and final source/idle checks. Details:
+  `/tmp/fpgs-g1-implicit-limit-prefix-L6rKzH/NODE_CAUSE.md`.
+
+Allegro exact BSP `c26ac5fa` passes seven native geometry/factory controls per
+card but is slower than the prior accepted discovery: full FPGS is
+20.736645200/19.332049075 ms, versus prior17.531317325/18.018165700 ms.
+Source-matched nodes localize the loss to covered MPR/GJK/manifold work:
+2.924756 to6.402575 ms RTX and3.689429 to4.942409 ms GB. PTX loads six double
+limbs and stores nine local doubles even before the FP32 fast decision.
+Corrective `e25992ce` removes the FP64 device predicate/descriptors entirely,
+retains the conservative FP32 filter and uses the unchanged original support
+scan on ambiguity. Ten CPU controls and all18 offline target/factory builds
+pass. Paired CUDA controls and complete timing are next, not a claimed gain.
+The existing capacity helper adds only this reviewed provider pin; allocation,
+constructor checks, runtime gates and benchmark protocol are unchanged.
+
+Finite-face correction `caece007` falls back to original queries for a narrow
+positive-clearance top-face class before the common writer/reducer. Four
+targeted controls/card pass, including three reduced rebound repetitions.
+Whole cell-only FPGS changes37.941748175 to36.886608050 ms RTX (1.028605x)
+and52.068057850 to41.787966100 ms GB (1.246006x), all capacity/source/idle
+checks passing. It is not stacked with sparse/packing and is not promoted.
+Remaining sliding impulses suggest an unsampled non-upward contact or another
+impulse defect; internal triangle-edge timing is a hypothesis, not a proven
+fault. No friction clamp, tolerance relaxation or blind normal override was
+made. Full cost and limitations:
+`/tmp/fpgs-heightfield-finite-qualification-J9kBvfGP/RESULT_FACE_COST_AND_SLIDING.md`.
+
+The sections below preserve earlier checkpoints and their original pending
+states; this section supersedes their current-status wording.
 
 ## Complete physics results so far
 
