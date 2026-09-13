@@ -59,6 +59,7 @@ from ..geometry.contact_reduction_global import (
 from ..geometry.contact_sort import ContactSorter
 from ..geometry.flags import ShapeFlags
 from ..geometry.heightfield_cells import heightfield_cell_overlaps_kernel
+from ..geometry.heightfield_features import WELD_FLAT_SEAMS, HeightfieldFeatureContext, flat_seam_query_allowed
 from ..geometry.mpr import create_solve_mpr, create_support_map_function
 from ..geometry.sdf_contact import (
     MESH_SDF_BLOCK_DIM,
@@ -1773,10 +1774,18 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(writer_func: Any):
             gap_b = shape_gap[shape_b]
             gap_sum = gap_a + gap_b
 
+            feature_context = HeightfieldFeatureContext()
+            if wp.static(WELD_FLAT_SEAMS):
+                feature_context.elevations = heightfield_elevations
+                feature_context.triangle = tri_idx
+                if type_a == GeoType.HFIELD:
+                    feature_context.heightfield = heightfield_data[shape_heightfield_index[shape_a]]
+
             wp.static(
                 create_compute_gjk_mpr_contacts(
                     writer_func,
                     penetration_refiner=create_triangle_prism_penetration_refiner(support_map),
+                    query_filter=flat_seam_query_allowed if WELD_FLAT_SEAMS else None,
                 )
             )(
                 shape_data_a,
@@ -1792,6 +1801,7 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(writer_func: Any):
                 margin_offset_b,
                 writer_data,
                 (tri_idx << 1) | 1,
+                feature_context,
             )
 
     return narrow_phase_process_mesh_triangle_contacts_kernel

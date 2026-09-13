@@ -79,6 +79,7 @@ from .contact_reduction import (
     get_spatial_direction_2d,
     project_point_to_plane,
 )
+from .heightfield_features import WELD_FLAT_SEAMS, HeightfieldFeatureContext, flat_seam_query_allowed
 from .support_function import (
     GeoTypeEx,
     create_triangle_prism_penetration_refiner,
@@ -2386,10 +2387,18 @@ def mesh_triangle_contacts_to_reducer_kernel(
         gap_b = shape_gap[shape_b]
         gap_sum = gap_a + gap_b
 
+        feature_context = HeightfieldFeatureContext()
+        if wp.static(WELD_FLAT_SEAMS):
+            feature_context.elevations = heightfield_elevations
+            feature_context.triangle = tri_idx
+            if type_a == GeoType.HFIELD:
+                feature_context.heightfield = heightfield_data[shape_heightfield_index[shape_a]]
+
         wp.static(
             create_compute_gjk_mpr_contacts(
                 write_contact_to_reducer,
                 penetration_refiner=create_triangle_prism_penetration_refiner(support_map),
+                query_filter=flat_seam_query_allowed if WELD_FLAT_SEAMS else None,
             )
         )(
             shape_data_a,
@@ -2405,4 +2414,5 @@ def mesh_triangle_contacts_to_reducer_kernel(
             margin_offset_b,
             reducer_data,
             (tri_idx << 1) | 1,
+            feature_context,
         )

@@ -578,6 +578,64 @@ class TestIndependentGeometry(unittest.TestCase):
         """Exercise finite edge/penetration/fallback arithmetic on the owned GPU."""
         RECORDS.append(check_synthetic_native("cuda:0"))
 
+    @unittest.skipUnless(wp.is_cuda_available(), "Requires the root-owned paired GPU lease")
+    def test_reduced_loaded_flat_seam_cuda(self):
+        """Collect reduced loaded seam cases under the unchanged eight-sweep physical checks."""
+        import importlib.util  # noqa: PLC0415
+        import sys  # noqa: PLC0415
+
+        from newton._src.geometry.heightfield_features import WELD_FLAT_SEAMS  # noqa: PLC0415
+
+        if os.environ.get("NEWTON_HEIGHTFIELD_WELD_FLAT_SEAMS") != "1":
+            self.skipTest("Requires explicit flat-seam activation before importing Newton")
+        self.assertTrue(WELD_FLAT_SEAMS, "The imported query must actually enable flat-seam filtering")
+        path = Path("/tmp/fpgs-heightfield-finite-qualification-J9kBvfGP/qualification.py")
+        self.assertEqual(
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+            "bd6d47727eeee2bb29a9f7e113b9c4282373b4b730e35f9179f38964c7265762",
+            "The original qualification and physical failures must remain unchanged",
+        )
+        q = sys.modules.get("qualification")
+        if q is None:
+            spec = importlib.util.spec_from_file_location("qualification", path)
+            q = importlib.util.module_from_spec(spec)
+            sys.modules["qualification"] = q
+            spec.loader.exec_module(q)
+        self.assertEqual(Path(q.__file__).resolve(), path.resolve(), "Mixed qualification helper import")
+        report = {
+            "scope": "Reduced support/tilt/sliding/border at original eight sweeps; not trajectory or timing acceptance",
+            "records": [],
+            "failures": [],
+            "immutable_hull_only": True,
+            "weld_flat_seams": True,
+        }
+        # Select this method after the separate rebound diagnostic to retain
+        # that earlier readback in the unchanged runner's final report.
+        if hasattr(q, "QUALIFICATION_REPORT"):
+            report["prior_qualification"] = q.QUALIFICATION_REPORT
+        q.QUALIFICATION_REPORT = report
+        for name in ("support", "tilted_foot", "sliding", "finite_border"):
+            case = next(case for case in q.CASES if case.name == name)
+            pair = []
+            for enabled in (False, True):
+                try:
+                    record = q.run_case(case, enabled, "cuda:0", reduce=True)
+                    pair.append(record)
+                    report["failures"].extend([name, enabled, error] for error in record["failures"])
+                except Exception as error:  # Retain all eight cases before reporting failure.
+                    record = {"case": {"name": name}, "enabled": enabled, "reduce": True, "error": repr(error)}
+                    q.RECORDS.append(record)
+                    report["failures"].append([name, enabled, repr(error)])
+                report["records"].append(record)
+            if len(pair) == 2 and (
+                pair[0]["initial_state"] != pair[1]["initial_state"]
+                or pair[0]["initial_velocity"] != pair[1]["initial_velocity"]
+            ):
+                report["failures"].append([name, "mismatched authored initial state"])
+        print("QUALIFICATION_REPORT " + json.dumps(report, allow_nan=False), flush=True)
+        self.assertEqual(len(report["records"]), 8)
+        self.assertEqual(report["failures"], [], msg="All reduced cases collected; see QUALIFICATION_REPORT")
+
 
 if __name__ == "__main__":
     unittest.main()
