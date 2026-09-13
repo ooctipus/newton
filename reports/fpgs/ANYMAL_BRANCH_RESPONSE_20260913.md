@@ -210,3 +210,10 @@ exits were normally1, not139. The test omitted the original documented
 `FeatherPGSManager._prepare_cuda_graph_capture` already makes that call. The
 test-only correction adds it for both original and candidate (a no-op for the
 retired candidate memset owner). No runtime or physical comparison is changed.
+
+Pair03 passed both graph replays and their full public-state comparisons, then
+failed before reset execution because the test passed int32 instead of the
+original cache invalidator's `wp.bool` world mask. Both children exited1 and
+the parent source/idle guard passed. The test now uses the actual Lab/API bool
+mask; runtime and physical tolerances remain unchanged. The failed03 record is
+preserved at `/tmp/fpgs-anymal-branch-physical-paired-20260913-03`.

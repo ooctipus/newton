@@ -618,7 +618,7 @@ class TestBranchResponse(unittest.TestCase):
             for graph in graphs:
                 wp.capture_launch(graph)
             compare(0)
-        mask = wp.array([1, 0], dtype=int, device=device)
+        mask = wp.array([True, False], dtype=wp.bool, device=device)
         for which, solver in enumerate(solvers):
             solver.reset(banks[which][0], world_mask=mask)
         one(0, 0)
