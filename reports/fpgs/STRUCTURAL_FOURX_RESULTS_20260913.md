@@ -1,10 +1,16 @@
 # Structural window: integrated discoveries
 
-Checkpoint: 2026-09-13 16:02 UTC. Work continues toward the 24-hour window in
+Checkpoint: 2026-09-13 16:52 UTC. Work continues toward the 24-hour window in
 `STRUCTURAL_FOURX_20260913.md`; the 4x target is **not achieved**. These are
 discoveries, not replacements for accepted baselines except where repeat
 evidence is explicitly given. No candidate has met the complete 4x target.
 No Isaac Lab source, timestep, substep or iteration allowance was changed.
+
+**Current physical hold:** the finite-terrain candidate produces a large
+asymmetric GB free-foot rebound response in the loaded eight-sweep test.
+Its timing results below remain measurements, not qualified optimizations.
+Further stacking/promotion is stopped pending causal diagnosis. The sparse
+solver and packed midphase are separable from this changed manifold law.
 
 ## Complete physics results so far
 
@@ -131,7 +137,7 @@ Two independent G1 structural paths have reached different gates:
   those comparisons and completes every finite supported case before deciding.
   Crucially, the first full 16K live attempt fails during warmup with sticky
   sparse status5 (factor bit1 plus row-topology bit4). No candidate timing or
-  gain exists. Eager execution with post-refresh synchronization does not
+  gain existed at that point. Eager execution with post-refresh synchronization does not
   reproduce the failure over the complete warmup. A graph-preserving observer
   then establishes the first failure as **only row-topology bit4**: RTX graph
   433, world6097; GB graph131, world14531. The later factor failure is downstream:
@@ -148,8 +154,8 @@ Two independent G1 structural paths have reached different gates:
   thresholds and buffers are unchanged. Both opposite-admission regressions
   fail on the old producer and pass after correction. Captured raw geometry
   and neighbor-order CPU replays pass, with controlled materials explicitly
-  scoped as extent tests. Paired CUDA physical checks and complete live cost
-  are next. Accepted G1's ROWS_MASKED path uses a different producer; this does
+  scoped as extent tests. Subsequent paired CUDA physical checks and live cost
+  are recorded below. Accepted G1's ROWS_MASKED path uses a different producer; this does
   not establish corruption in its frozen reference. No pivot clamp, status
   relaxation or tolerance change is authorized.
 
@@ -326,14 +332,108 @@ final-idle checks on all four captures:
 
 Net savings2.282475 /13.947550 ms exceed the discovery budgets2 /10 ms.
 This is a real complete-path discovery, not repeated gain or full evolving
-contact-convergence qualification. It is not composed with sparse G1 yet.
-Same-source diagnostic nodes are queued to attribute all retained query,
-fallback, reducer, downstream and memory work. Their original auxiliary-graph
-analyzer failures, if any, will remain failures with a separate complete reader.
+contact-convergence qualification. Later composition is recorded below.
+Same-source diagnostic nodes now account for all retained work: query family
+falls from3.911321 to1.776897 ms RTX and17.331656 to3.377930 ms GB, including
+the new fallback scan. Collision union falls9.370526 to7.562649 ms RTX and
+24.071890 to10.351359 ms GB. Both original node parents exit1 on auxiliary
+graphs; separate strict readers account for all1260/1272 physics nodes plus
+30 auxiliary nodes without converting those parent failures into passes.
 The experimental replacement allowance is 1.922660 ms RTX for
 2 ms net saving, or 7.342261 ms GB for 10 ms net saving, including fallback
 scan and downstream cost changes. Do not add these separate savings to G1's
 unqualified sparse solver or reuse an uncorrected shared-MJ denominator.
+
+## Sparse solver, composition and packed-pair discoveries
+
+After the recorded reservation fix, unchanged sparse physical controls pass
+four methods/card, including both captured reservation faults. The direct
+whole-task sparse-only discovery is37.784922400 to30.598367400 ms RTX
+(1.234867269x) and52.137139700 to40.946308525 ms GB (1.273305008x).
+Original capture/capacity/source/idle checks pass; sparse operators are
+actually valid for all16,384 worlds with zero sticky status. Historical
+warmed component-response caveats remain; no numerical tolerance changed.
+Pushed sparse report tip954895ec preserves measured runtime3bae8f77.
+
+Exact sparse+finite composition8ecd28b1 passes all12 existing methods/card.
+One complete A/B against cell-only gives37.862898900 to26.969148400 ms RTX
+(1.403933796x),52.027578975 to26.897414575 ms GB (1.934296653x).
+Wall52.043408675 to41.402623575 /66.504235224 to41.987810076 ms.
+These are FPGS-to-FPGS speedups, **not MJWarp ratios**. The separate report is
+pushed atd27575ef, branchooctipus/g1-sparse-finite-report-20260913.
+
+The fresh same8ecd/CELL1/FINITE1 corrected-MJ comparison gives:
+
+| Device | FPGS physics ms | MJWarp physics ms | MJWarp / FPGS |
+| --- | ---: | ---: | ---: |
+| RTX PRO 6000 | 26.810854525 | 43.243381150 | 1.612905740x |
+| GB300 | 26.988005350 | 42.908563300 | 1.589912361x |
+
+Both actual collision owners and external Newton-to-MJ conversion pass;
+MJ's correction guard passes and all warning/capacity flags are clear.
+This is one discovery, now subject to the finite-manifold physical hold.
+Generic collision gains also accelerate MJ; do not compare to the old slower
+denominator. A historical fpgs-main1.5x recollection is not a matched source
+or protocol and is being traced without inventing a cumulative speedup.
+
+The packed-pair candidate6a56b017 changes only pure-heightfield execution:
+old actual launch[384,128]/stride384 becomes[196608,1]/stride196608 under
+the existing THREADS_X4 recipe. The global compacted triangle stream and
+all queries/reduction/geometry/capacities remain. No tile-size sweep occurs.
+Ten physical/geometry methods/card pass, including exact logical coverage
+for nonmultiple pair counts, actual mapping, withdrawal/regrowth and graphs.
+The first complete finite-only baseline A/B is35.627923625 to32.286811550 ms
+RTX (1.103482255x) and38.122727300 to33.412042700 ms GB (1.140987627x).
+Wall49.959500025 to45.380039851 /51.306246975 to46.402043401 ms.
+All capture/activation/source/idle checks pass. This prices packing only;
+it does not qualify the unchanged finite query's loaded physical behavior.
+Exact packed compositionc76384a4 is prepared but further GPU stacking is
+paused. Transfer to the original-query sparse path remains independent.
+
+## Loaded-law finding and remaining execution studies
+
+Finite loaded GateA01 failed setup before any physics: the small fixture's
+automatic grouped lane count2 is unsupported. The identical-source A02 uses
+the existing G1 recipe's original --fpgs lane environment, not altered physics.
+All26 cases are attempted:18 records/card, eight unreduced impact cases fail
+the authored dense100 capacity because50/46 raw contacts require150/138 rows.
+Those are test-capacity failures, not a reason to inflate live G1 capacities.
+Original and finite sliding cases also miss the authored Coulomb control;
+neither is waived. Reduced scalar restitution, support, tilt, rotated-terrain
+support and finite-border controls pass.
+
+Crucially, reduced GB free-foot rebound gives finite spin9.670105 rad/s versus
+original0.000001948, at identical authored q/qd, normal speed1.800000191 m/s,
+ten contacts, mu0 and restitution0.6. Kinetic-energy ratios are0.391037452
+versus0.360000076. Linear impulse/public-force closure remains good. The
+equivalent force center lies inside the foot, so this establishes a large
+asymmetric finite-eight response, not yet a geometric impossibility or its
+cause. Contact distribution, residual and angular impulse are being diagnosed
+using this same fixture. No changed tolerance, extra sweeps or promotion.
+
+Both NCU counter attempts fail withERR_NVGPUCTRPERM; jobs are reaped and
+source/idle checks pass. No counters were collected and no hardware ceiling,
+memory-bound or spill-traffic claim follows. No permission workaround is used.
+
+Allegro exact normal-fan BSP CPU feasibility reaches122,926 geometric support
+queries without failures; actual40/64-vertex hulls have maximum6/9 decisions.
+Static exact-plane/tree storage is90,108 bytes. Adaptive predicates still
+need genuine exact final-tier implementation, and changed support winners
+require physical checks. A bounded complete split/coherent/manifold native
+implementation is under way on a fresh fork branch, not a measured gain.
+
+The recurring scaffolding problem is explicitly constrained: no further
+benchmark-framework development, no new GateB runner work, and reuse existing
+paired timing and physical tests. Added diagnostics must address a concrete
+changed-law discrepancy. Preparation is not performance progress. Kuka's
+earlier1.13546x RTX/1.01370x GB physics result remains a mixed discovery, not
+zero work and not a promoted cross-task win; GB environment wall regresses.
+
+Current local authorities: sparse live02 manifestb9e104c4; composed live01
+b9542b7d; composed shared-MJ012aa1662c; packed physical015cd3a2fa and live01
+c11dd204; loaded GateA02 is failed and preserved. Exact commands, hashes and
+per-card checks are in the corresponding /tmp/fpgs-* manifests. All parents
+for these completed runs are reaped with source and final-idle checks.
 
 ## Exact sources and completed owners
 
