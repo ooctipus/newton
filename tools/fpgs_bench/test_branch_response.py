@@ -12,6 +12,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -299,6 +300,48 @@ class TestBranchResponse(unittest.TestCase):
                 branch_response=True,
             )
             self.assertIn("branch12_L117", kernel.key)
+
+    def test_force_only_k1_admission(self):
+        """Retain the original FK/force owner but reject its competing mass producer."""
+        from newton._src.solvers.feather_pgs import branch_response as br
+        from newton._src.solvers.feather_pgs import solver_feather_pgs as original
+
+        source = fixture()
+        model = source["model"]
+        solver = SimpleNamespace(**vars(source["solver"]))
+        # CUDA-only constructor metadata is represented explicitly; retain
+        # actual CPU-model topology and every other original solver default.
+        solver.pgs_mode = "matrix_free"
+        solver.max_world_dofs = 18
+        solver.mf_gs_parallel_rows = 48
+        solver.mf_gs_parallel_matrix_free = True
+        solver.mf_gs_incremental_rows = 0
+        solver._ink_sizes = (18, 0, 0, 0)
+        solver._ink_rows = 48
+        solver._wr_world_contacts = object()
+        solver._jy_world_aliased = True
+        solver._propagation_contacts_enabled = source["solver"]._propagation_contacts_enabled
+        solver._execution_plan = SimpleNamespace(
+            use_tiled_hinv_jt=lambda size: size == 18, use_diagonal_mass=lambda size: False
+        )
+        with (
+            patch.object(original, "_INK_ON", True),
+            patch.object(original, "_WR_ON", True),
+            patch.object(original, "_MF_EXACT_ROWSUM", True),
+            patch.dict(os.environ, {"FEATHER_PGS_BRANCH_RESPONSE": "0"}),
+        ):
+            # Host admission only: all arrays remain CPU and no owner/kernel
+            # is created under this mocked device capability.
+            with (
+                patch.object(model, "device", SimpleNamespace(is_cuda=True)),
+                patch.object(solver, "_fused_k1", True),
+                patch.object(original, "_FUSED_K1_MASS_ON", False),
+            ):
+                self.assertTrue(br.supported(solver))
+                with patch.object(original, "_FUSED_K1_MASS_ON", True):
+                    self.assertFalse(br.supported(solver))
+                with patch.object(original, "_K1_REAL_CHECK", True):
+                    self.assertFalse(br.supported(solver))
 
     def test_actual_current_held_gram(self):
         """Both recorded epochs retain physical Gram and finite24 output under reordering."""

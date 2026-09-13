@@ -556,6 +556,7 @@ def supported(s):
             or original._INK_CHECK
             or original._WR_CHECK
             or original._WR_WARM
+            or original._K1_REAL_CHECK
         )
         and not (
             s._has_free_rigid_bodies
@@ -570,7 +571,7 @@ def supported(s):
             or s._debug_buffers_enabled
             or s._grouped_tau_mass
             or s._grouped_mass
-            or s._fused_k1
+            or (s._fused_k1 and original._FUSED_K1_MASS_ON)
         )
         and s._joint_world is None
         and s._row_packets is None

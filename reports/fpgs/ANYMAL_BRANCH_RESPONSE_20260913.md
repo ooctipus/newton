@@ -177,3 +177,26 @@ The coherent mapping removes the earlier hoisted-factor/local-J lifetime, not
 an arithmetic or block-size sweep. Resource reduction does not establish a
 whole gain. Actual complete physics/cost remains the next decision, targeting
 at least 0.92 ms RTX net, with all retained production and fallback charged.
+
+## First CUDA result and admission correction
+
+Preserved first pair: `/tmp/fpgs-anymal-branch-physical-paired-20260913-01`.
+Both cards passed the current/held and warm two-leg physical tests. Maximum
+current/held scaled velocity error on RTX was `3.3128989584452733e-6`. The
+actual constructor test failed at inactive owner before private work; this is
+not a completed integrated qualification. Both child exits were 139 after the
+test failure, an unresolved teardown failure, not explained merely by the
+assertion. Parent failure and final source/idle success remain preserved.
+
+A root-authorized RTX-only, unchanged-source constructor diagnostic evaluated
+every admission predicate. The sole rejected condition was `_fused_k1=True`;
+the competing mass flag was false and all topology/other predicates passed.
+The original force-only K1 returns before mass/L access (`fused_dynamics.py`),
+while the existing composite producer still supplies the current I/S refresh.
+The correction therefore retains K1 without changing it and rejects only its
+mass-producing variant plus debug checks. A focused host-admission regression
+models CUDA-only metadata explicitly and rejects mass/debug variants. No
+runtime arithmetic or physical tolerance changes accompany this correction.
+The repeated three-selector pair uses the existing `--fpgs` original GROUP16,
+ROWS_MASKED1/X4 setup for the small grouped constructor; it must also exit
+normally before acceptance. No automatic complete timing follows a failure.
