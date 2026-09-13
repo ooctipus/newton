@@ -369,6 +369,10 @@ def supported(solver):
         and solver._joint_world is None
         and solver._row_packets is None
         and not solver._debug_buffers_enabled
+        and not solver._grouped_tau_mass
+        and not solver._grouped_mass
+        and getattr(solver, "_wr_world_contacts", None) is None
+        and getattr(solver, "_ink_sizes", None) is None
     )
 
 

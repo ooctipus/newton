@@ -6,6 +6,7 @@
 import os
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -238,6 +239,36 @@ def original_eight(J, Y, diag, rhs, types, parent, mu, vhat):
 
 
 class TestSparseFactor(unittest.TestCase):
+    def test_reject_other_canonical_producers(self):
+        """Reject optional producers before they can touch retired buffers."""
+        solver = SimpleNamespace(
+            _execution_plan=SimpleNamespace(use_tiled_cholesky=lambda size: True),
+            trisolve_kernel="tiled",
+            small_dof_threshold=32,
+            _mimic_count=0,
+            _connect_count=0,
+            _joint_world=None,
+            _row_packets=None,
+            _debug_buffers_enabled=False,
+            _grouped_tau_mass=False,
+            _grouped_mass=False,
+            _wr_world_contacts=None,
+            _ink_sizes=None,
+        )
+        with patch("newton._src.solvers.feather_pgs.single_factor.supported", return_value=True):
+            self.assertTrue(sf.supported(solver))
+            for name, value in (
+                ("_grouped_tau_mass", True),
+                ("_grouped_mass", True),
+                ("_wr_world_contacts", object()),
+                ("_ink_sizes", (43,)),
+            ):
+                old = getattr(solver, name)
+                setattr(solver, name, value)
+                with self.subTest(name=name):
+                    self.assertFalse(sf.supported(solver))
+                setattr(solver, name, old)
+
     def test_private_api(self):
         """Require the complete sparse producer and consumer API."""
         self.assertTrue(callable(sf.create_owner))

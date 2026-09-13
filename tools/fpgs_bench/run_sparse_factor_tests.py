@@ -22,6 +22,13 @@ def main():
         for name in ("solver_feather_pgs.py", "sparse_factor.py", "sparse_factor_rows.py")
     ]
     files += [Path(__file__).resolve(), Path(__file__).with_name("test_sparse_factor.py")]
+    asset = Path(
+        "/tmp/https/omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/6.1/Isaac/IsaacLab/Robots/Unitree/G1/g1_minimal.usd"
+    )
+    asset_pin = "9dfe7a710aa791e49abf2d9ea74ad3163e291f02f21f59bda9bfcc40f3fab428"
+    if hashlib.sha256(asset.read_bytes()).hexdigest() != asset_pin:
+        raise RuntimeError("Actual G1 asset changed")
+    files.append(asset)
     pins = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in files}
     report = {"success": False, "performance_accepted": False, "scope": __doc__, "pins": pins}
     try:
