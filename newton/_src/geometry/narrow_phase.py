@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Any
 
 import warp as wp
@@ -57,6 +58,7 @@ from ..geometry.contact_reduction_global import (
 )
 from ..geometry.contact_sort import ContactSorter
 from ..geometry.flags import ShapeFlags
+from ..geometry.heightfield_cells import heightfield_cell_overlaps_kernel
 from ..geometry.mpr import create_solve_mpr, create_support_map_function
 from ..geometry.sdf_contact import (
     MESH_SDF_BLOCK_DIM,
@@ -2270,6 +2272,14 @@ class NarrowPhase:
     pairs. It owns the intermediate counters and pair buffers used while
     processing candidate pairs, then writes final contacts through a configurable
     contact writer function.
+
+    Experimental performance mode: ``NEWTON_HEIGHTFIELD_CELL_REJECT=1`` before
+    construction rejects heightfield cells wholly below the convex contact
+    search envelope before triangle queries. This mode uses current elevations,
+    scaled bounds and contact/speculative gaps, preserves the original solver
+    and buffer capacities, and is disabled by default. Mixed triangle-mesh and
+    heightfield scenes retain the original midphase. Contact ordering and
+    redundant manifold point selection may change.
     """
 
     def __init__(
@@ -2401,6 +2411,13 @@ class NarrowPhase:
         self.reduce_contacts = reduce_contacts
         self.has_meshes = has_meshes
         self.has_heightfields = has_heightfields
+        # Experimental shared-collision opt-in. Mixed mesh/heightfield scenes
+        # retain the original full midphase; no new buffers or cached geometry.
+        cell_reject = os.environ.get("NEWTON_HEIGHTFIELD_CELL_REJECT", "0")
+        if cell_reject not in ("0", "1"):
+            raise ValueError("NEWTON_HEIGHTFIELD_CELL_REJECT must be 0 or 1")
+        self._heightfield_cell_reject_requested = cell_reject == "1"
+        self._heightfield_cell_reject = self._heightfield_cell_reject_requested and has_heightfields and not has_meshes
         self.mesh_sdf_texture_only = mesh_sdf_texture_only
         self.has_generic_convex_pairs = has_generic_convex_pairs
         self.sdf_texture_paired_samples = sdf_texture_paired_samples
@@ -3013,24 +3030,41 @@ class NarrowPhase:
 
             # Launch midphase: finds overlapping triangles for both mesh and heightfield pairs
             second_dim = self.tile_size_mesh_convex if ENABLE_TILE_BVH_QUERY else 1
-            wp.launch(
-                kernel=narrow_phase_find_mesh_triangle_overlaps_kernel,
-                dim=[self.num_tile_blocks, second_dim],
-                inputs=[
-                    shape_types,
+            midphase_kernel = narrow_phase_find_mesh_triangle_overlaps_kernel
+            midphase_inputs = [
+                shape_types,
+                shape_transform,
+                shape_source,
+                shape_gap,
+                shape_data,
+                shape_collision_radius,
+                shape_collision_aabb_lower,
+                shape_collision_aabb_upper,
+                shape_heightfield_index,
+                heightfield_data,
+                self.shape_pairs_mesh,
+                self.shape_pairs_mesh_count,
+                self.num_tile_blocks,
+            ]
+            if self._heightfield_cell_reject:
+                midphase_kernel = heightfield_cell_overlaps_kernel
+                midphase_inputs = [
                     shape_transform,
-                    shape_source,
                     shape_gap,
                     shape_data,
-                    shape_collision_radius,
                     shape_collision_aabb_lower,
                     shape_collision_aabb_upper,
                     shape_heightfield_index,
                     heightfield_data,
+                    heightfield_elevations,
                     self.shape_pairs_mesh,
                     self.shape_pairs_mesh_count,
                     self.num_tile_blocks,
-                ],
+                ]
+            wp.launch(
+                kernel=midphase_kernel,
+                dim=[self.num_tile_blocks, second_dim],
+                inputs=midphase_inputs,
                 outputs=[
                     self.triangle_pairs,
                     self.triangle_pairs_count,
