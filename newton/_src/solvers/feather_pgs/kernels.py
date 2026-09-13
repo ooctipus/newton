@@ -4223,6 +4223,7 @@ def prepare_world_contact_rows(
     contact_art_a: wp.array[int],
     contact_art_b: wp.array[int],
     contact_path: wp.array[int],
+    contact_slots_needed: wp.array[int],
     shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
     body_v_s: wp.array[wp.spatial_vector],
@@ -4250,7 +4251,7 @@ def prepare_world_contact_rows(
     world_target_velocity: wp.array2d[float],
     world_row_restitution: wp.array2d[float],
 ):
-    """Build dense-contact metadata once, independently of articulation size groups."""
+    """Build current metadata inside each allocator-recorded contact row reservation."""
     total_contacts = wp.min(contact_count[0], contact_point0.shape[0])
     for c in range(wp.tid(), total_contacts, total_num_threads):
         if contact_path[c] != 0:
@@ -4326,9 +4327,9 @@ def prepare_world_contact_rows(
         friction_mu = mu * contact_friction_scale * friction_anchor_scale
 
         tangent0, tangent1 = contact_tangent_basis(normal)
-        add_friction = enable_friction != 0 and (not apply_friction_filter or phi <= contact_friction_gap_threshold)
-        if effective_friction_anchor_limit > 0 and friction_anchor_rank >= effective_friction_anchor_limit:
-            add_friction = False
+        # Separately compiled gap arithmetic can disagree at the threshold.
+        # The allocator owns the extent; recomputing it can overwrite the next packet.
+        add_friction = contact_slots_needed[c] == 3
 
         contact_anchor_world = 0.5 * (point_a_world + point_b_world)
         point_a_normal = point_a_world

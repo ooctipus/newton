@@ -470,6 +470,7 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
             contact_art_a,
             contact_art_b,
             contact_path,
+            contact_slots_needed,
             shape_body,
             body_q,
             body_v,

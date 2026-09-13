@@ -11476,6 +11476,7 @@ class SolverFeatherPGS(SolverBase):
                         self.contact_art_a,
                         self.contact_art_b,
                         self.contact_path,
+                        self.contact_slots_needed,
                         model.shape_body,
                         state_in.body_q,
                         state_aug.body_v_s,
