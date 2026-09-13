@@ -64,3 +64,55 @@ original ownership. New admission must not change the task parameters.
 4. Promotion requires repeated paired whole-physics gain, physical convergence,
    capacity/warning checks and unsupported-task/reset fallback checks. G1-only
    dispatch is not evidence of improvements in Franka, Kuka or other tasks.
+
+## First integrated result and correction, 12:10 UTC
+
+The original tiled candidate at `d69683f7` passed all four tests on each GPU
+(including native-produced diagonal, original eight sweeps, independent
+momentum action and graph replay); no CUDA tests skipped. Test parent:
+`/tmp/fpgs-g1-single-factor-tests-paired-20260913-02`.
+
+The first actual 16K live A/B completed with all four children, both metadata
+capacity checks per child, unchanged budgets, actual fixed-backend imports and
+final source/idle guards passing. One discovery round, not promotion:
+`/tmp/fpgs-g1-single-factor-live-paired16k-20260913-01`.
+
+| Whole physics | RTX ms | GB300 ms |
+|---|---:|---:|
+| Original 50dfa | 43.391887 | 72.405953 |
+| First tiled forward-only | 44.880584 | 74.684839 |
+| Original / candidate | 0.966830x | 0.969487x |
+
+Candidate node diagnosis at
+`/tmp/fpgs-g1-single-factor-candidate-nodes-paired16k-20260913-01`
+proves all eight calls use the replacement response, GS and decode. No old
+H-inverse response or diagonal kernels remain. Actual simulations and capacity
+checks pass; the original analyzer again refuses auxiliary graph roots and the
+failed parent is preserved. Independent final source guard passed, and GPU
+compute-idle was observed before releasing the next job. The preserved reader
+plus explicit candidate owner-name mapping is at
+`/tmp/fpgs-g1-single-factor-node-owner-00CzJ8nG/audit.py`.
+This node sample follows only one wall step versus the old attribution's 40;
+it diagnoses gross owner costs, not an accepted matched node speedup.
+
+| Owner, node sums | Original RTX / GB ms | Candidate RTX / GB ms |
+|---|---:|---:|
+| Row response | 7.992 / 9.606 | 8.193 / 9.908 |
+| Separate diagonal | 1.339 / 0.495 | retired |
+| GS | 6.228 / 7.566 | 7.729 / 8.669 |
+| New velocity decode | absent | 1.137 / 1.278 |
+
+The removed arithmetic did not reduce the forward owner's execution cost.
+Generated CUDA confirms the candidate retains the same library forward TRSM,
+shared physical-J and forward panels, and adds a squared-response tile for its
+norm. Both measured row-response kernels still use 255 registers/thread and
+23,920 dynamic shared bytes/block. This is a resource/source observation, not
+a counter-backed assertion of the limiting pipeline or occupancy.
+
+The first targeted correction replaces that materialization with one block
+per world: share L once across all active rows, let each warp hold one row's
+forward response in registers, and emit its norm directly. It keeps the same
+offset-coordinate GS and physical decode so the diagnosed response cause is
+isolated. No inverse, new persistent buffer, capacity change, iteration change,
+or Lab edit. The original library prototype remains available as a diagnostic
+control. Native tests and integrated timing are pending for this correction.

@@ -52,7 +52,7 @@ def supported(solver) -> bool:
 
 
 @cache
-def get_response_kernel(dofs: int, capacity: int, chunk: int):
+def get_tiled_response_kernel(dofs: int, capacity: int, chunk: int):
     """Form only L-inverse J-transpose and its squared norm, in existing storage."""
     if not 0 < chunk <= capacity or not 0 < dofs <= 64:
         raise ValueError("Invalid forward-response tile")
@@ -85,6 +85,105 @@ def get_response_kernel(dofs: int, capacity: int, chunk: int):
         wp.tile_store(diag[world], diagonal, offset=first, bounds_check=bounds)
 
     response.__name__ = response.__qualname__ = f"single_factor_response_{dofs}_{capacity}_c{chunk}"
+    return wp.kernel(enable_backward=False, module="unique")(response)
+
+
+@cache
+def get_response_kernel(dofs: int, capacity: int, chunk: int):
+    """Share one held factor across all current rows; one warp owns each row.
+
+    The first library implementation retained its 255-register TRSM and three
+    shared matrix copies despite removing the backward solve. This owner uses
+    one shared L, two forward-response registers per lane, and no tile copies.
+    ``chunk`` remains an explicit validated comparison parameter, not a cap.
+    """
+    if not 0 < chunk <= capacity or not 0 < dofs <= 64:
+        raise ValueError("Invalid forward-response tile")
+    source = f"""
+#if defined(__CUDA_ARCH__)
+    const int lane = threadIdx.x & 31;
+    const int warp_id = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    const int world = art_to_world.data[group_to_art.data[group]];
+    const int count = counts.data[world];
+    if (count == 0) return;
+    __shared__ float factor[{dofs * dofs}];
+    const int ls0 = L.strides[0] / sizeof(float);
+    const int ls1 = L.strides[1] / sizeof(float);
+    const int js0 = J.strides[0] / sizeof(float);
+    const int js1 = J.strides[1] / sizeof(float);
+    const int ws0 = J_world.strides[0] / sizeof(float);
+    const int ws1 = J_world.strides[1] / sizeof(float);
+    const int zs0 = Z_world.strides[0] / sizeof(float);
+    const int zs1 = Z_world.strides[1] / sizeof(float);
+    for (int k = threadIdx.x; k < {dofs * dofs}; k += blockDim.x)
+        factor[k] = L.data[group * ls0 + (k / {dofs}) * ls1 + k % {dofs}];
+    __syncthreads();
+    for (int row = warp_id; row < count && row < {capacity}; row += warps) {{
+        const int jbase = group * js0 + row * js1;
+        const int wbase = world * ws0 + row * ws1;
+        const int zbase = world * zs0 + row * zs1;
+        float z0 = lane < {dofs} ? J.data[jbase + lane] : 0.0f;
+        float z1 = lane + 32 < {dofs} ? J.data[jbase + lane + 32] : 0.0f;
+        if (lane < {dofs}) J_world.data[wbase + lane] = z0;
+        if (lane + 32 < {dofs}) J_world.data[wbase + lane + 32] = z1;
+        #pragma unroll
+        for (int pivot = 0; pivot < {dofs}; ++pivot) {{
+            float value = 0.0f;
+            if (lane == (pivot & 31)) {{
+                if (pivot < 32) {{
+                    z0 /= factor[pivot * {dofs} + pivot];
+                    value = z0;
+                }} else {{
+                    z1 /= factor[pivot * {dofs} + pivot];
+                    value = z1;
+                }}
+            }}
+            value = __shfl_sync(0xffffffff, value, pivot & 31);
+            if (lane > pivot && lane < {dofs})
+                z0 -= factor[lane * {dofs} + pivot] * value;
+            if (lane + 32 > pivot && lane + 32 < {dofs})
+                z1 -= factor[(lane + 32) * {dofs} + pivot] * value;
+        }}
+        if (lane < {dofs}) Z_world.data[zbase + lane] = z0;
+        if (lane + 32 < {dofs}) Z_world.data[zbase + lane + 32] = z1;
+        float norm = z0 * z0 + z1 * z1;
+        for (int shift = 16; shift > 0; shift >>= 1)
+            norm += __shfl_down_sync(0xffffffff, norm, shift);
+        if (lane == 0) diag.data[world * (diag.strides[0] / sizeof(float)) + row] = norm;
+    }}
+#endif
+"""
+
+    @wp.func_native(source)
+    def native_response(
+        group: int,
+        L: wp.array3d[float],
+        J: wp.array3d[float],
+        group_to_art: wp.array[int],
+        art_to_world: wp.array[int],
+        counts: wp.array[int],
+        J_world: wp.array3d[float],
+        Z_world: wp.array3d[float],
+        diag: wp.array2d[float],
+    ):
+        """Apply the original held triangular operator with warp-local rows."""
+        ...
+
+    def response(
+        L: wp.array3d[float],
+        J: wp.array3d[float],
+        group_to_art: wp.array[int],
+        art_to_world: wp.array[int],
+        counts: wp.array[int],
+        J_world: wp.array3d[float],
+        Z_world: wp.array3d[float],
+        diag: wp.array2d[float],
+    ):
+        group, _lane = wp.tid()
+        native_response(group, L, J, group_to_art, art_to_world, counts, J_world, Z_world, diag)
+
+    response.__name__ = response.__qualname__ = f"single_factor_warp_response_{dofs}_{capacity}"
     return wp.kernel(enable_backward=False, module="unique")(response)
 
 
@@ -145,7 +244,7 @@ class SingleFactor:
         solver, size = self.solver, self.size
         wp.launch_tiled(
             self.response_kernel,
-            dim=(solver.n_arts_by_size[size], (solver.dense_max_constraints + self.chunk - 1) // self.chunk),
+            dim=(solver.n_arts_by_size[size],),
             inputs=[
                 solver.L_by_size[size],
                 solver.J_by_size[size],

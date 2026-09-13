@@ -149,7 +149,7 @@ class TestSingleFactorCUDA(unittest.TestCase):
         """Use actual group-to-world routing and a partial final response tile."""
         wp.launch_tiled(
             self.response,
-            dim=(4, 7),
+            dim=(4,),
             inputs=[self.a[k] for k in ("L", "J", "group_to_art", "art_to_world", "counts")],
             outputs=[self.a[k] for k in ("world_J", "Z", "diag")],
             block_dim=64,
