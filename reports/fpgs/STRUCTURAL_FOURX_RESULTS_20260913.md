@@ -1,6 +1,6 @@
 # Structural window: integrated discoveries
 
-Checkpoint: 2026-09-13 14:12 UTC. Work continues toward the 24-hour window in
+Checkpoint: 2026-09-13 15:15 UTC. Work continues toward the 24-hour window in
 `STRUCTURAL_FOURX_20260913.md`; the 4x target is **not achieved**. These are
 discoveries, not replacements for accepted baselines except where repeat
 evidence is explicitly given. No candidate has met the complete 4x target.
@@ -118,8 +118,23 @@ Two independent G1 structural paths have reached different gates:
   had supplied it. Correction 8e8146 reads the existing compact current drive
   rows and removes the stale old augmented-H tail. The same unchanged
   tolerances now pass both physical methods on both GPUs, including actual
-  full-step serial and parallel configurations. Continuing graph replay and
-  warmed task-state operator gates remain before complete-path timing.
+  full-step serial and parallel configurations. Test-only 3f539fae then fixes
+  the continuing two-state graph test; both serial and parallel continuing
+  loops pass on both cards. The complete warmed assessment now reaches all
+  final metrics in all 16 selected cases: predictor, final velocity, impulse,
+  momentum and friction-cone gates pass. Two RTX world7410 cases fail a
+  stricter reconstructed net-response component comparison. An independent
+  original-row CPU control fails that same comparison too; this is evidence
+  about the comparison's conditioning, not an original CUDA solve replay or
+  a waived numerical gate. Earlier tests incorrectly stopped on intermediate
+  coefficient rounding before reaching physical checks; the successor records
+  those comparisons and completes every finite supported case before deciding.
+  Crucially, the first full 16K live attempt fails during warmup with sticky
+  sparse status5 (invalid refresh plus solve guard). No candidate timing or
+  gain exists. A bounded first-failing-refresh capture is in progress, before
+  predictor propagation, to distinguish input/epoch/augmentation errors from
+  factor conditioning. No pivot clamp, status relaxation or tolerance change
+  is authorized by this failure.
 
 Post-cell G1 node attribution locates the remaining work (exclusive diagnostic
 milliseconds, RTX / GB): collision 9.364628 / 24.030058; dynamics
@@ -173,15 +188,82 @@ row/response plus solve cost is 8.445006 / 8.959829 ms; collision is
 These diagnostic intervals do not replace the clean throughput means.
 Existing Allegro finger-block reduction was already tested at roughly 3%
 of solver time and withdrawn; it is not a new structural opportunity.
-The current study is a complete row-production/consumer replacement, not
-a broad-phase or finger-dot-product polishing sweep.
+The complete row-production study is now a no-go for implementation on the
+available evidence. Plain contact-row work totals only 1.656873 ms exclusive
+on RTX, less than the 1.697292 ms needed even if it became free. Including
+velocity/position prefix construction and necessary clears expands the full
+removable union to 2.389896 ms, leaving only .692604 ms for all new production,
+implicit-prefix consumption and fallback work. No demonstrated complete path
+fits that allowance. Prescaling joint velocity cannot be replaced by a final
+clamp: it affects FK, bias forces and prediction. This is a bounded feasibility
+decision, not a proof that Allegro cannot reach 4x.
 
-Kuka's first-hit successor is also in physical testing: current endpoint
+Kuka's first-hit successor has completed physical and first live testing: current endpoint
 wrenches remain compact packets until a changed residual first demands a
 held physical response. MF-positive worlds retain the existing complete
 path. Its planned saving must include response preparation, solving and
 all retained allocation/CSR/prefix/fallback work. CPU physical success and
 the fraction of demanded rows are not a speedup claim.
+
+Its first CUDA test found a small real GB velocity drift. Same-input diagnosis
+isolated repeated endpoint-motion residual accumulation, not the cached inverse
+action. Correction e96aaab3 reuses the existing contact packet panel for
+physical J only after first demand; never-demanded rows still avoid J/Y.
+All packet reads finish before overlapping stores and valid2 publishes last.
+Under unchanged physical bounds, both GPU suites now pass. The previously
+failing world210 error drops from 3.206e-5 to 9.596e-7; across four historical
+512-world cases, maximum original-current-geometry velocity error is 5.359e-6.
+
+The complete live performance result nevertheless loses:
+
+| Device | Original kinetic physics | First-hit physics | Original / first-hit | Original wall | First-hit wall |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| RTX PRO 6000 | 11.299988 ms | 12.386436 ms | 0.912287x | 34.424091 ms | 35.182237 ms |
+| GB300 | 11.666766 ms | 12.728927 ms | 0.916555x | 36.337624 ms | 35.553964 ms |
+
+All four captures pass source, actual kernel-owner activation, capacity and
+final-idle checks. This is not a new MJWarp ratio or a promoted optimization.
+Graph-only timing cannot attribute the added cost; one same-recipe node trace
+is funded to separate packet production, recurring solve work and retained
+allocation/dynamics. No tuning pass is justified until that diagnosis and
+the complete replacement allowance support it.
+
+## New finite terrain query: implemented, not GPU-qualified yet
+
+An isolated successor of cell-only a994 preserves the globally compacted
+triangle stream and replaces generic GJK/MPR plus iterative manifold discovery
+for recognized immutable cuboids. Separated distance uses three segment/AABB
+minimizations and eight vertex/triangle face tests. A nonnegative terrain-local
+separation-vector Z certifies the same witness for the finite downward prism;
+side/bottom or ambiguous cases retain the complete original query. Penetration
+uses finite-prism SAT and clipped finite top patches, never an infinite plane.
+
+At most five contacts per triangle flow through the unchanged writer/reducer.
+Far queries retain a witness for original reducer semantics. Handled entries
+encode their own triangle index reversibly; the separate original fallback
+scans the full live prefix. No new maximum-sized queue or counter is added.
+Static descriptors are exactly per shape. The extra scan and both dispatches
+must be charged in complete timing. The changed manifold law needs physical
+qualification; original contact-count equality is not imposed.
+
+Independent CPU checks on both saved 96-pair scenes pass, including complete
+direct and reduced pipelines and nonempty-to-empty-to-regrown prefixes:
+
+| Fixture | Triangle queries / analytically handled | Direct contacts old / new | Reduced contacts old / new | Maximum minimum-separation change |
+| --- | ---: | ---: | ---: | ---: |
+| RTX saved geometry | 1208 / 1205 | 700 / 648 | 199 / 198 | 1.479e-6 m |
+| GB saved geometry | 1190 / 1190 | 878 / 742 | 239 / 223 | 7.066e-7 m |
+
+Every previously contacting shape remains represented. Independent convex-QP
+distance and finite-surface witness checks pass; maximum surface error is
+1.895e-7 m. Eleven additional native synthetic cases cover finite edges,
+rotation, zero separation, deep overlap and required generic fallbacks.
+These are CPU diagnostic results, not CUDA acceptance, convergence over an
+evolving task, or measured speedup. GPU physical checks and full-task timing
+are queued. The experimental replacement allowance is 1.922660 ms RTX for
+2 ms net saving, or 7.342261 ms GB for 10 ms net saving, including fallback
+scan and downstream cost changes. Do not add these unmeasured savings to G1's
+unqualified sparse solver or reuse an uncorrected shared-MJ denominator.
 
 ## Exact sources and completed owners
 
@@ -201,7 +283,7 @@ boundaries; this is not a claim of complete trajectory equivalence.
 - Heightfield candidate: `a994b1b24b6073dcb10e855c10e8197ee116ef14`, isolated
   `ooctipus/g1-heightfield-cells-20260913` branch, now pushed to ooctipus/newton
   and included default-off in the root branch as f0025014. The root branch
-  was pushed through 7a3b9abc; original handoff ancestry is retained.
+  was pushed through 334edcfc before this checkpoint; original handoff ancestry is retained.
   First A/B parent `/tmp/fpgs-g1-heightfield-cells-live-paired16k-20260913-01`,
   manifest `04d9b8f632e84677c577dc4516f464b362fafbd2f2258dac69b3fc2bfb283b7b`.
   Shared-MJ parent `/tmp/fpgs-g1-heightfield-cells-shared-mj-paired16k-20260913-01`.
@@ -243,7 +325,27 @@ boundaries; this is not a claim of complete trajectory equivalence.
   `/tmp/fpgs-g1-sparse-factor-physical-paired-20260913-02` exited zero;
   both GPUs ran exactly two CUDA methods with zero skips/failures/errors.
   Its initial graph wiring was not a continuing state loop; test-only
-  successor 3f539fae fixes that wiring and is not yet GPU-qualified here.
+  successor 3f539fae fixes that wiring and passes continuing-loop CUDA checks
+  on both GPUs, but the later full live warmup fails as described above.
+- Complete sparse warmed assessment parent
+  `/tmp/fpgs-g1-sparse-warmed-assessment-paired-20260913-01`, manifest
+  `19c3428105c0bef4c6c7d91923be4ea74557b37190b8b0259bc77ee321678e5b`,
+  is reaped exit1 with final source/idle guards passed. All16 cases reach
+  final metrics; the two net-response failures are retained.
+  Whole live parent `/tmp/fpgs-g1-sparse-live-paired16k-20260913-01` is also
+  reaped exit1/source-idle passed: both candidates fail the original warmup
+  checker before timing, while both cell-only baselines complete normally.
+- Corrected first-hit physical parent
+  `/tmp/fpgs-kuka-first-hit-corrected-paired512-20260913-03`, manifest
+  `e55f826101eeb07ad949c6c9cb16f3d55762b4e6f2f3db433f65ece435dcc7de`,
+  is reaped exit0/source-idle passed. Complete live parent
+  `/tmp/fpgs-kuka-first-hit-live-discovery-paired16k-20260913-01`, manifest
+  `d2357eaedc2563a0b06be327e99dc66cb4a040674cdfd067c185410560fa6c83`,
+  is reaped exit0/source-idle passed, but the performance gate fails.
+  Actual native e96aaab35bd5b61578bc8a77dc8633f7bc80c68d is compared with
+  ad42fea95fd44cd5ec72afa1be1cce570b45109a, both kinetic1; first-hit0/1 is
+  the sole differing feature flag. The source-bound untimed observer verifies
+  actual packet, prefix and solve kernels rather than trusting the flag.
 - Fresh Allegro parent
   `/tmp/fpgs-allegro-fixed-backends-paired16k-20260913-02` exited zero.
   Attempt01 is preserved: MJ construction failed because the wrapper tried
@@ -258,6 +360,6 @@ boundaries; this is not a claim of complete trajectory equivalence.
   preserved; no GPU rerun or rewritten exit status was used for formatting.
 
 All feature modes remain explicit/default-off. Next bounded work is Kuka
-first-hit physical/live gates, G1 complete sparse physical/live gates,
-and Allegro's complete row-production feasibility. Keyboard's residual termination
+first-hit loss attribution, G1's first-failing-refresh diagnosis, and the
+finite terrain query's CUDA physical and complete-cost gates. Keyboard's residual termination
 discrepancy remains parked at the user's request.
