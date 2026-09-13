@@ -2432,6 +2432,12 @@ class SolverFeatherPGS(SolverBase):
                 raise ValueError("Sparse factor excludes canonical factor/row debug readers")
             self._sparse_factor = create_sparse_factor(self)
 
+        self._branch_response = None
+        if os.environ.get("FEATHER_PGS_BRANCH_RESPONSE") == "1":
+            from .branch_response import create_owner as create_branch_response  # noqa: PLC0415
+
+            self._branch_response = create_branch_response(self)
+
     def _update_kinematic_state(self) -> None:
         """Refresh cached kinematic flags and effective joint armature."""
         model = self.model
@@ -2473,6 +2479,8 @@ class SolverFeatherPGS(SolverBase):
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         """Refresh cached solver data after supported model changes."""
+        if getattr(self, "_branch_response", None) is not None:
+            self._branch_response.validate_notification(flags)
         if getattr(self, "_sparse_factor", None) is not None:
             self._sparse_factor.validate_notification(flags)
         if self._row_packets is not None:
@@ -8396,6 +8404,8 @@ class SolverFeatherPGS(SolverBase):
         collide_done_event=None,
     ):
         self._single_factor_active = False
+        if self._branch_response is not None:
+            self._branch_response.begin()
         if self._sparse_factor is not None:
             self._sparse_factor.begin()
         if self._single_factor is not None:
@@ -9319,6 +9329,8 @@ class SolverFeatherPGS(SolverBase):
         demand for calibration, not this boolean status as a size estimate.
         """
         status = self.constraint_capacity_status()
+        if self._branch_response is not None:
+            self._branch_response.check()
         if self._sparse_factor is not None:
             self._sparse_factor.check()
         settings = {
@@ -10341,7 +10353,9 @@ class SolverFeatherPGS(SolverBase):
         # The immutable drive layout gives CRBA direct DOF-to-row ownership.
         # Make the dynamic coefficients visible before any fused mass write.
         if drive_rows_ready is not None and (
-            self._parallel_augmented_drive_topology or self._sparse_factor is not None
+            self._parallel_augmented_drive_topology
+            or self._sparse_factor is not None
+            or self._branch_response is not None
         ):
             wp.get_stream(model.device).wait_event(drive_rows_ready)
 
@@ -10377,6 +10391,9 @@ class SolverFeatherPGS(SolverBase):
         # the per-step memset.
         for size in self.size_groups:
             n_arts = self.n_arts_by_size[size]
+            if self._branch_response is not None:
+                self._branch_response.refresh(state_aug)
+                continue
             if self._sparse_factor is not None:
                 self._sparse_factor.refresh(state_aug)
                 continue
@@ -10556,7 +10573,11 @@ class SolverFeatherPGS(SolverBase):
         if drive_rows_ready is not None and not self._parallel_augmented_drive_topology:
             wp.get_stream(model.device).wait_event(drive_rows_ready)
 
-        if not self._parallel_augmented_drive_topology and self._sparse_factor is None:
+        if (
+            not self._parallel_augmented_drive_topology
+            and self._sparse_factor is None
+            and self._branch_response is None
+        ):
             for size in self.size_groups:
                 n_arts = self.n_arts_by_size[size]
                 wp.launch(
@@ -10674,6 +10695,8 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage2_cholesky_tiled(self, size: int):
+        if self._branch_response is not None:
+            return
         if self._sparse_factor is not None:
             return
         model = self.model
@@ -10716,6 +10739,8 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage2_cholesky_loop(self, size: int):
+        if self._branch_response is not None:
+            return
         if self._crba_cholesky_warp_kernels_by_size[size] is not None:
             return
         model = self.model
@@ -10793,6 +10818,9 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage3_trisolve_tiled(self, size: int, state_aug: State):
+        if self._branch_response is not None:
+            self._branch_response.predict(state_aug)
+            return
         if self._sparse_factor is not None:
             self._sparse_factor.predict(state_aug)
             return
@@ -10839,6 +10867,9 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage3_trisolve_loop(self, size: int, state_aug: State):
+        if self._branch_response is not None:
+            self._branch_response.predict(state_aug)
+            return
         model = self.model
         n_arts = self.n_arts_by_size[size]
         wp.launch(
@@ -12584,6 +12615,9 @@ class SolverFeatherPGS(SolverBase):
         self.diag.zero_()
 
     def _stage4_hinv_jt_tiled(self, size: int):
+        if self._branch_response is not None:
+            self._branch_response.response()
+            return
         if self._sparse_factor is not None:
             return
         if self._single_factor_active:
@@ -12887,6 +12921,8 @@ class SolverFeatherPGS(SolverBase):
         na, nb = sizes[0], sizes[1]
         L_b = self.L_by_size[nb] if nb else self._ink_dummy3
         J_b = self.J_by_size[nb] if nb else self._ink_dummy3
+        if self._branch_response is not None:
+            return [self._ink_meta, self._branch_response.data.L, L_b, self.J_by_size[na], J_b, self.row_cfm]
         return [self._ink_meta, self.L_by_size[na], L_b, self.J_by_size[na], J_b, self.row_cfm]
 
     def _world_rows_inputs(self) -> list:
@@ -13043,6 +13079,9 @@ class SolverFeatherPGS(SolverBase):
         return int(getattr(self, "_ink_rows", 0))
 
     def _stage4_hinv_jt_par_row(self, size: int):
+        if self._branch_response is not None:
+            self._branch_response.response()
+            return
         if self._row_packets is not None:
             self._row_packets.response(size)
             return
@@ -25612,6 +25651,7 @@ def _get_pgs_solve_parallel_kernel(
     world_rows: bool = False,
     lean_sweep: bool = False,
     bound_finger: bool = False,
+    branch_response: bool = False,
 ) -> "wp.Kernel":
     """Scaled parallel projection (Jacobi with per-row step scaling and Nesterov momentum) for dense-row worlds.
 
@@ -25708,7 +25748,7 @@ def _get_pgs_solve_parallel_kernel(
     )
     WR_CHECK = 1 if (WR and _WR_CHECK) else 0
     whitening_mode = _parallel_register_whitening_mode(
-        enabled=_REGISTER_WHITENING,
+        enabled=_REGISTER_WHITENING and not branch_response,
         device_arch=device_arch,
         rows=AM,
         max_world_dofs=D,
@@ -26430,6 +26470,31 @@ def _get_pgs_solve_parallel_kernel(
         )
         snippet = snippet.replace(reconstruct, reloaded)
 
+    if branch_response:
+        if (D, NA, NB, OA, OB, MF, INK, EXACT, WR, ZG, HD, WW, INK_CHECK, WR_CHECK, STOP, LEAN, BF) != (
+            18,
+            18,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ) or AM not in (32, 48):
+            raise ValueError("Branch response needs the complete root18 EX1/WR32/48 recipe")
+        from .branch_response import compact_source  # noqa: PLC0415
+
+        snippet = compact_source(snippet, ink_stage)
+
     @wp.func_native(snippet)
     def pgs_solve_parallel_native(
         world: int,
@@ -26737,6 +26802,8 @@ def _get_pgs_solve_parallel_kernel(
             general_index += general_world_grid_stride
 
     name = f"pgs_solve_parallel_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_rows{AM}_min{MIN_ROWS}_sweeps{NSWEEPS}_nes{NESTEROV}_tol{TOL:g}_nt{NT}_rs5_mf{MF}c"
+    if branch_response:
+        name += "_branch12_L117"
     if INK:
         name += f"_ink{NA}_{NB}_o{OA}_{OB}" + ("chk" if INK_CHECK else "")
     name += (
