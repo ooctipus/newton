@@ -2112,6 +2112,11 @@ class CollisionPipeline:
             )
             self.hydroelastic_sdf = self.narrow_phase.hydroelastic_sdf
 
+        if getattr(self.narrow_phase, "_heightfield_finite_query", False):
+            from ..geometry.heightfield_finite import bind_model  # noqa: PLC0415
+
+            bind_model(self.narrow_phase, model)
+
         # NarrowPhase is authoritative for the producer stage: it disables
         # mesh/heightfield reduction when no such collision path exists, and
         # expert construction may provide a preconfigured instance.  Publish
