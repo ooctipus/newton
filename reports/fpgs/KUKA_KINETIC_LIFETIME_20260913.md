@@ -158,3 +158,67 @@ row CPU smoke produces17741 dense rows with exact original prefix bounds and
 no missing used rows; independent physical row checks are still pending at
 this checkpoint. Saved raw allocation routes are explicitly external controls
 until the retained allocator is connected. No saved J/Z/RHS feeds the candidate.
+
+## Integrated implementation checkpoint, 01:38--01:48 UTC
+
+At the 90-minute checkpoint the native two-call owner is assembled; no new
+whole-task gain is accepted. It now connects original free6 refresh, current
+force/prediction, the retained ZERO/CSR policy, current count/allocation, direct
+rows, current MF inverse/preparation, qualification and positive-selector
+materialization, original eight-sweep generic/private owners, mandatory joins,
+guarded next-state publication and public contact forces. The second current
+state comes from the first actual solved output, not a second archived state.
+Original force export is once per two physical calls, not after both calls.
+
+Actual current-eight tests pass on both GPUs, including the coupled-positive
+GB world and independent MF cases, unchanged physical velocity/momentum/cone/
+residual bounds, serial versus concurrent dispatch, poisoned outputs, two
+graphs, failure-publication guards and public-force conversion. Maximum scaled
+velocity difference against original current geometry/FP64 held H is5.373e-6,
+below the unchanged3e-5 bound. This is finite-eight agreement, not proof that
+all tasks have converged or that release parity is established.
+
+The local row test still fails its added-r0 coefficient gate:6.545e-5 RTX and
+7.559e-5 GB against7.629e-6. The failure is preserved. Both-card generated PTX
+identifies different FMA grouping in point rotation; world-point rounding
+then changes phi, amplified by phi/dt. Native arithmetic and tolerances are
+unchanged. The complete-eight physical checks pass despite this local error;
+bit-level coefficient matching is not substituted for physical acceptance.
+Diagnosis: `/tmp/fpgs-kinetic-row-diagnostic-eGFPdS/ROW_ROUNDING_DIAGNOSIS.md`,
+SHA256 `f11c133bfcdcfbf9f15f9eb22a317982d9bd09639b5c5c681a981cb39e7ea0d7`.
+
+The connected two-call512 GPU gate then passes both cards. Its strengthened
+second run independently reconstructs forces/bias on each actual current q/qd,
+checks prediction and endpoint motion, original current eight-sweep physics,
+original integration/publication, actual emitted-force conversion, repeated
+graphs, and the complete readonly inventory. The largest predictor scaled
+error is5.629e-7 and endpoint error1.172e-6. All current capacity/no-drop checks
+pass. The complete inventory has230 mutable/225 readonly arrays, with exact
+reshape aliases deduplicated; unused poisoned row storage is not consumed.
+
+The event scope is now larger than the earlier selected-only budget: it also
+charges retained MF, CSR, three count finalizers and public force conversion.
+Recomputing the original disjoint Nsight union gives RTX selected-exclusive
+9.771697ms, retained-outside2.862754667ms and gaps0.220128333ms. Thus its
+conservative full-boundary screening allowance is5.822196650ms, **not**
+4.172948ms. The same-window GB allowance is5.122562667ms. Free6 was already
+selected and receives no second credit. This scope correction is not a gain.
+Audited mapping: `/tmp/fpgs-kuka-complete-boundary-budget-MaJ7kfmz/NOTE.md`,
+SHA256 `f2cde8056607d7217b6e9d14b8cb5c9330995b0d272919cb3182b7763c90f266`.
+
+Completed/reaped physical parents:
+
+- `/tmp/fpgs-kuka-demand-current-eight-physical-paired512-20260913-01`: four
+  CUDA tests per card pass; original-current-eight and export/guard controls.
+- `/tmp/fpgs-kuka-demand-boundary-physical-paired512-20260913-01`: three tests
+  per card pass, including actual two-call solve/publication and graph replay.
+- `/tmp/fpgs-kuka-demand-boundary-physical-paired512-20260913-02`: strengthened
+  two-call gate passes both cards; manifest SHA256
+  `d3b8bbd0884c640943a12518a3907411a06a63546816c9047b22b76b8b664e42`.
+
+The first actual16K full-boundary cost run starts at01:48 UTC with a fresh
+paired parent. It retains fixed historical collision/control inputs and
+excludes collision generation, callbacks, cold repair and Lab/sensors. It is
+an architectural cost screen, not a live-task measurement. Accepted Kuka and
+Franka tables remain unchanged. A miss requires a causal whole-boundary trace
+and at most one targeted corrective experiment, not a tile-size tuning grid.
