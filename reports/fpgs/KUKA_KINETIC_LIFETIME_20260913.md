@@ -222,3 +222,66 @@ excludes collision generation, callbacks, cold repair and Lab/sensors. It is
 an architectural cost screen, not a live-task measurement. Accepted Kuka and
 Franka tables remain unchanged. A miss requires a causal whole-boundary trace
 and at most one targeted corrective experiment, not a tile-size tuning grid.
+
+## Full-cost checkpoint, 02:12 UTC
+
+The complete diagnostic owner misses its structural cost screen. At roughly
+two hours after implementation GO, the first successful40-sample paired run
+is complete, reaped and source/idle checked. Accepted task timings are unchanged.
+
+| Hardware | Complete owner median ms/env equivalent | Min--max | Screening ceiling |
+| --- | ---: | ---: | ---: |
+| RTX PRO6000 | 8.946559906 | 8.856448--9.028352 | 5.822196650 |
+| GB300 | 9.924863815 | 9.851136--10.027520 | 5.122562667 |
+
+These events contain the actual two-call producer/solve/publication chain,
+including retained free6, MF, CSR, counts, guards, fork/join and public force.
+Four times the two-call event gives the eight-call environment equivalent.
+Fixed historical raw collision/control inputs remain a diagnostic limitation;
+collision generation, callbacks, cold repair and Lab/sensors remain outside.
+Neither a whole-environment result nor a fresh MJWarp comparison is claimed.
+The miss is3.124363ms RTX and4.802301ms GB against the respective ceilings.
+
+The earlier cost01 failed its cross-replay state-identity gate before producing
+a timing result. A separate full16K eager/eager/graph diagnostic traced state
+differences to contact-slot permutations from the unchanged atomic allocator:
+initial current geometry, prediction, counts and raw routes matched. This was
+not specific to graph replay. No native correction or tolerance widening was
+made. The failed run and its original check remain preserved.
+
+The successor gate compares every active world's candidate result with the
+unmodified original CUDA eight sweeps for that same emitted contact order,
+including current MF, net response, momentum, friction and zero/prescribed
+ownership. Both physical runs and the cost run pass the unchanged numerical
+bounds. Checks occur outside timed events. Across the cost replay checks,
+maximum scaled velocity difference is below5.5e-7, versus the3e-5 bound.
+
+This is implementation agreement, **not convergence acceptance**. Some of the
+historical worst worlds retain substantial normal and joint-bound residuals
+in both implementations. Selected64/128-sweep diagnostics do not consistently
+remove them; those extra sweeps are not used in the benchmark. A bounded
+parallel diagnosis will distinguish metric interpretation and inherited law
+or conflicting constraints from new implementation harm, then check fresh
+current captures before any live promotion.
+
+The revised measurable question is where the complete graph spends its
+exposed time after the cheap core is connected. Trace current row/action
+production, retained MF/CSR preparation, guards, and the actual joined solve
+critical leg, retiming the core in the same graph. The standalone core/full
+difference is not additive causal attribution. RTX has no positive coupled
+selectors in this run, so coupled fallback alone cannot explain its miss.
+No candidate arithmetic changes or tile sweep are authorized by this miss.
+Next checkpoint is03:00 UTC: a causal complete-path trace and one structural
+correction hypothesis, or an explicit negative diagnosis if no sufficiently
+large removable cost is identified.
+
+Completed local evidence:
+
+- Cost01 failure: `/tmp/fpgs-kuka-demand-boundary-cost-paired16k-20260913-01`.
+- Order diagnostic: `/tmp/fpgs-kuka-demand-boundary-replay-diagnostic-paired16k-20260913-01`.
+- Full-order physical gate: `/tmp/fpgs-kuka-demand-full-order-physical-paired16k-20260913-01`,
+  manifest `6ed1ff6599b5571a6129c7df779176a9cdebcdf5478d366a9df0327f0d98613b`.
+- Cost02: `/tmp/fpgs-kuka-demand-boundary-cost-paired16k-20260913-02`,
+  manifest `71f10b8c7849a96a9ea2d3112d3f4208ec5c3734218bfe096492d10719678472`.
+- RTX cost audit: `a6751659d07150f2948c81264ff1268725cb964ebd0f26c2b88fd380e5fa65c4`.
+- GB cost audit: `d490466e754a181791754d5a81fa38883d8db8acb6858db4de940f8eeab98666`.
