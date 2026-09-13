@@ -79,3 +79,36 @@ root review. The live owner already charges the complete two-call path; no new
 saved-boundary timing adapter is needed.
 No GPU until root lease. Stop at the checkpoint with measured result, concrete
 diagnosed gap, or honest incomplete status. This is not by itself the4x-MJ plan.
+
+## Final measured outcome, 15:25UTC
+
+The corrected e96aaab35bd5b61578bc8a77dc8633f7bc80c68d runtime passes the
+unchanged paired physical gate: four actual512 current/held cases plus both
+cards' warm/prefix/sibling/current-cache controls. Maximum own-operator velocity
+error is1.483e-6, original-current-geometry velocity5.359e-6, net response1.787e-6,
+momentum backward2.871e-7, normal excess1.018e-7 and friction cone1.290e-8.
+The previously failing GB world210 is9.596e-7 under the unchanged3e-5 bound.
+Warm stress also passes (velocity2.215e-6/net action4.501e-6). This is not
+universal convergence or physical equivalence of every evolved live state.
+
+Actual corrected live16384-world, seed0,200warm/40wall/40profile discovery
+completed with source/idle/current ownership/capacity guards passing. Only
+FIRST_HIT differs; exact bound kernels and current argument were observed at
+both original untimed boundaries. Whole physics nevertheless regressed:
+RTX11.299988→12.386436ms, GB11.666766→12.728927ms. Wall changed
+34.424091→35.182237ms RTX and36.337624→35.553964ms GB. No promotion.
+
+Source-identical3-step node attribution accounts for all12physics graphs and
+1920nodes/card/arm. Row stage saves only0.032820/0.235318ms, whereas disjoint
+joined solve grows1.440866/1.632128ms. The original triplet was already
+support-pruned/common-arm-cancelled and MF0 stored onlyZ29, not physicalJ29;
+the new48float/contact packets retain current raw geometry and all three rows'
+metadata/RHS. The new physical consumer adds scan/gather/held-action work and
+resources. A dirty-only motion rebuild already coalesces changed cursors.
+
+No consumer-only correction has a measured10% complete-stage allowance while
+retaining this packet producer. The experiment is closed as a performance miss,
+not a numerical rejection. See [complete causal result](KUKA_FIRST_HIT_RESULT_20260913.md)
+for exact sums/exclusives, source/result pins, retained services, and limits.
+Both parents were reaped/source-idle before this report-only followup; measured
+native e96 and comparator ad42 remain recoverable. No runtime changes followed.
