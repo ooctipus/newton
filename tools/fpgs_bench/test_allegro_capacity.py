@@ -79,11 +79,13 @@ class TestCompactArguments(unittest.TestCase):
             capacity.verify_sources(old, capacity.LAB_PINS)
 
     def test_bsp_requires_one_complete_reviewed_source_set(self):
-        """Accept both reviewed revisions but reject mixed constructor sources."""
+        """Accept reviewed revisions but reject mixed constructor sources."""
         baseline = Path("/home/octi/Projects/newton-fpgs-rejection-port-20260912")
         candidate = Path("/home/octi/Projects/newton-fpgs-convex-bsp-20260913")
+        fp32 = Path("/home/octi/Projects/newton-fpgs-convex-bsp-fp32-20260913")
         capacity.verify_sources(baseline)
         capacity.verify_sources(candidate)
+        capacity.verify_sources(fp32)
         mixed = dict(capacity.BSP_PINS)
         mixed["newton/_src/sim/collide.py"] = capacity.PINS["newton/_src/sim/collide.py"]
         with patch.object(capacity, "BSP_PINS", mixed), self.assertRaisesRegex(RuntimeError, "collide.py"):

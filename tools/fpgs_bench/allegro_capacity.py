@@ -34,6 +34,8 @@ BSP_PINS = {
     "newton/_src/geometry/convex_bsp_build.py": "cb8db066aa0f2b630db32f4611fdc153cc3879c9ba8a0493ae7beb871a511be0",
     "newton/_src/geometry/convex_bsp_factories.py": "6f61c944fc5670cda30c32bd4028ef7065e8cc6876ee5107a7721185ad644a29",
 }
+# Reviewed e25992 changes only the support provider, not capacity owners.
+BSP_FP32_SHA256 = "0c57122257a709ecc44fed5608c587e966a9ea9447e4afe995cdae793b994194"
 LAB_PINS = {
     "source/isaaclab_newton/isaaclab_newton/physics/feather_pgs_manager.py": "31bea42769931529365a1f067049fa577b91719923795214dda69e819e8125c3",
     # Fixed53ee adds immediate model-write notification only; the default-None
@@ -49,6 +51,9 @@ def verify_sources(root, pins=PINS):
         selector = "newton/_src/geometry/narrow_phase.py"
         if hashlib.sha256((Path(root) / selector).read_bytes()).hexdigest() == BSP_PINS[selector]:
             pins = BSP_PINS
+            provider = "newton/_src/geometry/convex_bsp.py"
+            if hashlib.sha256((Path(root) / provider).read_bytes()).hexdigest() == BSP_FP32_SHA256:
+                pins = {**BSP_PINS, provider: BSP_FP32_SHA256}
     for relative, expected in pins.items():
         if hashlib.sha256((Path(root) / relative).read_bytes()).hexdigest() != expected:
             raise RuntimeError(f"Unsupported compact Allegro source: {relative}")
