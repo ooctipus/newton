@@ -1,6 +1,6 @@
 # Structural window: integrated discoveries
 
-Checkpoint: 2026-09-13 16:52 UTC. Work continues toward the 24-hour window in
+Checkpoint: 2026-09-13 17:22 UTC. Work continues toward the 24-hour window in
 `STRUCTURAL_FOURX_20260913.md`; the 4x target is **not achieved**. These are
 discoveries, not replacements for accepted baselines except where repeat
 evidence is explicitly given. No candidate has met the complete 4x target.
@@ -390,6 +390,52 @@ it does not qualify the unchanged finite query's loaded physical behavior.
 Exact packed compositionc76384a4 is prepared but further GPU stacking is
 paused. Transfer to the original-query sparse path remains independent.
 
+### Packing with the original query: independent gain
+
+Clean candidate `19099e91b8de83b9fdbab3a59b54d52f93e502cd` transfers only the
+packed launch to sparse `954895ec`, without the finite-query manifold code.
+Eleven unchanged/targeted physical and geometry methods pass on each GPU,
+with no skips, failures or errors. Both sparse operators and continuing
+graphs are exercised. The fresh paired whole-task discovery gives:
+
+| Device | Sparse + original query | Add packed launch | FPGS baseline / candidate | Absolute saving |
+| --- | ---: | ---: | ---: | ---: |
+| RTX PRO 6000 | 28.968070275 ms | 25.548476325 ms | 1.133847276x | 3.419593950 ms |
+| GB300 | 40.855120725 ms | 34.689812850 ms | 1.177726755x | 6.165307875 ms |
+
+Environment wall means are 43.598839825 to 39.787609050 ms RTX and
+55.151633776 to 49.279069225 ms GB. All four captures retain clear original
+capacity checks, 16,384 valid sparse operators and zero sparse status at
+both recorded boundaries. Sources and final GPU idle pass. These are one
+paired round, not repeated timing or full physical qualification. The RTX
+baseline differs from the earlier 30.598 ms sparse discovery: the paired
+28.968 ms baseline above is the authority for this incremental gain.
+
+Physical manifest SHA256:
+`2de80d65eb4b9160c785de69fa27d7af714912d700ea257da826a9ab231847a5`.
+Live manifest SHA256:
+`5f171630dec4a06346ffd2b4cbf33210a2a404b3a225aa6a40ec20815df7dd6b`.
+Directories are `/tmp/fpgs-g1-packed-original-physical-paired-20260913-01`
+and `/tmp/fpgs-g1-packed-original-live-paired16k-20260913-01`.
+The existing physical owner and sparse checked timing runner are unchanged;
+no benchmark framework was added. The same-source, shared-collision MJWarp
+comparison remains pending and must not reuse a slower old MJ denominator.
+
+### Keep starting, incremental and backend denominators distinct
+
+The quoted G1 1.403934x / 1.934297x is **cell-only FPGS divided by composed
+FPGS**, not MJWarp divided by FPGS. Its matched MJ ratios are 1.612906x /
+1.589912x, and those results are on the finite-query physical hold above.
+Do not present either pair as accepted cumulative improvement from handoff.
+
+The handoff record at Lab `2129e562` / Newton `31cf87f4` gives G1 39.014977 ms
+FPGS and 50.002362 ms MJWarp, or 1.281620x, on RTX 5090. Its G1 graph scope
+was mixed/unaudited and included an observation/sensor graph. It is not a
+matched RTX PRO 6000 or GB300 physics-only denominator. The user's recalled
+`fpgs-main` result near 1.5x has not been resolved to a matching source and
+protocol. Neither a regression nor a cumulative qualified gain follows by
+comparing that recollection with an incremental FPGS-to-FPGS ratio.
+
 ## Loaded-law finding and remaining execution studies
 
 Finite loaded GateA01 failed setup before any physics: the small fixture's
@@ -410,6 +456,19 @@ equivalent force center lies inside the foot, so this establishes a large
 asymmetric finite-eight response, not yet a geometric impossibility or its
 cause. Contact distribution, residual and angular impulse are being diagnosed
 using this same fixture. No changed tolerance, extra sweeps or promotion.
+
+The targeted same-state rebound collection now localizes the discrepancy:
+raw finite clipping already supplies near points on both sides of the foot,
+but the reduced finite near-contact subset can cover only one side. The
+retained reducer's spatial support slots exclude positive-depth contacts;
+depth/voxel selection and packet ordering then matter at eight sweeps.
+Captured-order CPU replay reproduces the bad response, and recovered
+Jacobian/angular impulse agree with the actual solve and public force.
+This is not evidence that force export or raw clipping is missing. A narrow
+successor `caece007` hands positive-clearance, in-shell top-face manifolds to
+the original query before writing or marking them handled. It preserves
+the reducer, capacities and eight sweeps; additional query/fallback work
+must be charged. CPU tests and offline compilation pass, CUDA pending.
 
 Both NCU counter attempts fail withERR_NVGPUCTRPERM; jobs are reaped and
 source/idle checks pass. No counters were collected and no hardware ceiling,
