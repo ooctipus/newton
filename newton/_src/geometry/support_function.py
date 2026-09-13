@@ -394,7 +394,12 @@ def support_map_lean(geom: GenericShapeData, direction: wp.vec3, data_provider: 
 
 def create_shape_support_function(support_func: Any, center_ties: bool = False):
     """Create a support function with built-in shape policies."""
-    fuse_builtin_box_support = support_func is support_map or support_func is support_map_lean
+    fuse_builtin_box_support = (
+        support_func is support_map
+        or support_func is support_map_lean
+        or getattr(support_func, "_preserve_builtin_box_support", False)
+    )
+    box_support = getattr(support_func, "_builtin_box_support", _support_map_box)
 
     if center_ties:
 
@@ -404,7 +409,7 @@ def create_shape_support_function(support_func: Any, center_ties: bool = False):
             if wp.static(fuse_builtin_box_support):
                 if geom.shape_type == GeoType.BOX:
                     abs_direction = wp.vec3(wp.abs(direction[0]), wp.abs(direction[1]), wp.abs(direction[2]))
-                    result = _support_map_box(geom, direction)
+                    result = box_support(geom, direction)
                     contribution = wp.cw_mul(abs_direction, geom.scale)
                     threshold = _CENTERED_BOX_SUPPORT_TIE_EPSILON * (
                         contribution[0] + contribution[1] + contribution[2]
@@ -439,7 +444,7 @@ def create_shape_support_function(support_func: Any, center_ties: bool = False):
             result = wp.vec3(0.0, 0.0, 0.0)
             if wp.static(fuse_builtin_box_support):
                 if geom.shape_type == GeoType.BOX:
-                    result = _support_map_box(geom, direction)
+                    result = box_support(geom, direction)
                 else:
                     result = support_func(geom, direction, data_provider)
             else:

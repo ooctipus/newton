@@ -1808,6 +1808,11 @@ class CollisionPipeline:
             raise ValueError("NEWTON_NARROW_PHASE_PAIR_SHAPE_PREP must be 0 or 1")
         self._pair_shape_prep = pair_shape_prep == "1"
         self.prepared_shape_indices = None
+        convex_bsp = os.environ.get("NEWTON_NARROW_PHASE_CONVEX_BSP", "0")
+        if convex_bsp not in ("0", "1"):
+            raise ValueError("NEWTON_NARROW_PHASE_CONVEX_BSP must be 0 or 1")
+        self._convex_bsp = None
+        self._convex_bsp_requested = convex_bsp == "1"
         coherent_convex = os.environ.get("NEWTON_NARROW_PHASE_COHERENT_CONVEX", "0")
         coherent_stats = os.environ.get("NEWTON_NARROW_PHASE_COHERENT_STATS", "0")
         if coherent_convex not in ("0", "reject_only") or coherent_stats not in ("0", "1"):
@@ -2220,6 +2225,31 @@ class CollisionPipeline:
                 raise ValueError("Explicit pair shape IDs must be within model.shape_count")
             self.prepared_shape_indices = wp.array(pair_indices, dtype=wp.int32, device=device)
 
+        # BSP is an opt-in complete split-family owner, never a partial callback
+        # installation in expert, non-split, gradient or triangle pipelines.
+        if self._convex_bsp_requested and (
+            not using_expert_components
+            and self.narrow_phase.split_gjk_mpr
+            and model.particle_count == 0
+            and not self.narrow_phase.has_meshes
+            and not self.narrow_phase.has_heightfields
+            and self.hydroelastic_sdf is None
+            and not self._speculative_enabled
+            and not requires_grad
+        ):
+            from ..geometry.convex_bsp import _BspOwner  # noqa: PLC0415
+            from ..geometry.convex_bsp_factories import split_kernels  # noqa: PLC0415
+
+            owner = _BspOwner(model)
+            if owner.metadata["admitted_meshes"]:
+                self._convex_bsp = owner
+                self.narrow_phase._bsp_owner = owner
+                (
+                    self.narrow_phase.narrow_phase_mpr_kernel,
+                    self.narrow_phase.narrow_phase_gjk_kernel,
+                    self.narrow_phase.narrow_phase_manifold_kernel,
+                ) = split_kernels(self.narrow_phase)
+
         # Built here (not in finalize) so models/tasks that never collide don't pay for it.
         if coherent_convex != "0":
             if (
@@ -2252,6 +2282,10 @@ class CollisionPipeline:
                 query_capacity=self.narrow_phase.split_query_results.shape[0],
                 device=device,
             )
+            if self._convex_bsp is not None:
+                from ..geometry.convex_bsp_factories import coherent_kernels  # noqa: PLC0415
+
+                _create_rejection_query_kernels = coherent_kernels
             self.narrow_phase._coherent_query_kernels = _create_rejection_query_kernels(
                 diagnostics=coherent_stats == "1"
             )
@@ -2386,6 +2420,23 @@ class CollisionPipeline:
         self._body_pair_reduction_capture_tokens.discard(token)
         if not self._body_pair_reduction_capture_tokens:
             self._captured_contacts = None
+
+    def invalidate_convex_bsp(self):
+        """Disable BSP support before any in-place mesh edit or refit.
+
+        Experimental opt-in callers must invoke this outside capture, order it
+        before writes on every participating stream, and keep the model/pipeline
+        alive until their graphs are destroyed. Existing graphs then use full
+        support scans. Rebuilding requires a new pipeline and graph recapture;
+        unnotified in-place edits are not supported. Ordinary state, transform,
+        scale and material changes do not change the stored local hull fan.
+        """
+        if self._convex_bsp is not None:
+            if self.model.device.is_capturing:
+                raise RuntimeError("BSP geometry invalidation must occur outside capture")
+            self._convex_bsp.invalidate()
+            if self.narrow_phase._coherent_cache is not None:
+                self.narrow_phase._coherent_cache.reset()
 
     def refresh_body_pair_reduction_groups(self):
         """Rebuild material-equivalence reduction groups from current materials.

@@ -2442,6 +2442,9 @@ class NarrowPhase:
         else:
             writer_func = contact_writer_warp_func
 
+        self._convex_writer_func = writer_func
+        self._bsp_owner = None
+
         # CPU kernels currently observe ``wp.block_dim() == 1`` regardless
         # of the plain ``wp.launch(..., block_dim=N)`` parameter (Warp
         # GH-1413). Keep the mesh-convex midphase launch grid, tile shape,
@@ -2913,6 +2916,7 @@ class NarrowPhase:
                     shape_collision_aabb_lower,
                     shape_collision_aabb_upper,
                 ]
+                support_inputs = [self._bsp_owner.data] if self._bsp_owner is not None else []
                 if self._coherent_cache is not None:
                     from .coherent_convex_rejection import _PairInputs  # noqa: PLC0415
 
@@ -2946,6 +2950,7 @@ class NarrowPhase:
                         self.split_gjk_work_count,
                         self.split_manifold_work_items,
                         self.split_manifold_work_count,
+                        *support_inputs,
                     ]
                     for coherent_kernel in self._coherent_query_kernels:
                         wp.launch(
@@ -2970,6 +2975,7 @@ class NarrowPhase:
                             self.split_gjk_work_count,
                             self.split_manifold_work_items,
                             self.split_manifold_work_count,
+                            *support_inputs,
                         ],
                         device=device,
                         block_dim=self.block_dim,
@@ -2987,6 +2993,7 @@ class NarrowPhase:
                             self.split_gjk_work_count,
                             self.split_manifold_work_items,
                             self.split_manifold_work_count,
+                            *support_inputs,
                         ],
                         device=device,
                         block_dim=self.block_dim,
@@ -3003,6 +3010,7 @@ class NarrowPhase:
                         self.split_query_results,
                         self.split_manifold_work_items,
                         self.split_manifold_work_count,
+                        *support_inputs,
                     ],
                     device=device,
                     block_dim=self.block_dim,
