@@ -233,3 +233,33 @@ randomization remain untouched. This adds no call to Solver.step and changes no
 benchmark recipe; all reported harness timings remain inadmissible. The explicit
 event/restore CPU regression failed first, then passed. The full focused suite
 now has 42 passing tests; the next GPU outcome remains pending.
+
+### Third actual attempt: scoped eager lifecycle pass
+
+Clean commit `50bb891f5bcbd95581ad4f08aaf7c4ccab8783fe` passed on both cards.
+The paired parent was reaped exit0; final source and idle guards passed.
+Manifest `/tmp/fpgs-kuka-kinetic-live-eager-paired512-20260913-03/manifest.json`
+SHA256 `4edff9053b127510f63e0ef3613d735dbb153b2fd53c005383983f4fc183adde`;
+RTX audit `80d6905928a24d0138f6ee6dfbbef3ca1b05d9f09e6d80680a424b44833461f2`;
+GB audit `01e11b392f87591a689b3af5ac9a092fa6f490e3ee3e34d3e1c1a483e97cd205`.
+
+Each card completed 24 actual private calls and 12 public force exports, with
+zero retired-stage calls. All four explicit perturbations ran, including the
+temporary world1 gravity, which was restored with the ordinary notification.
+Dense count reached90; MF count remained0, an explicit coverage limitation.
+The unchanged 3e-5 public-FK gate passed: maximum position error1.525879e-5
+on both, scaled velocity error1.735008e-5 RTX /1.274609e-5 GB. This admits only
+the actual eager lifecycle/publication scope. Contact-eight, convergence,
+timing and whole-physics acceptance remain false.
+
+The next thin continuation adds graph and discovery-performance modes to the
+same pinned runner. `kinetic_live_measure.py` composes with the TWO existing
+post-warmup/post-profile metadata boundaries. Host eager/capture path observers
+are removed before the first timed step; no device graph, arithmetic, counter,
+or physics call is added. The512 graph gate uses2 warm/3 measured/2 profile
+steps and the same public-FK tolerance. The16K discovery uses200 warm/40 wall/
+40 profile steps, checking finite states, current status, capacities, unchanged
+graph identity and advanced device epochs only outside timing. It makes no
+new full contact-eight or convergence claim; it does not compare unrelated
+atomic row orderings bitwise. A matched actual50dfa arm and integrated trace
+are still required before any whole-physics performance conclusion.

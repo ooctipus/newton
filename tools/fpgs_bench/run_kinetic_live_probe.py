@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run actual eager Lab/kinetic lifecycle checks under the paired process owner.
+"""Run actual Lab/kinetic lifecycle checks or a boundary-only discovery capture.
 
 The unchanged Lab core/tasks and harness supply actual models, states, collision
 and control callbacks; only isaaclab_newton uses the fixed root-notification
-backend. Printed timing includes diagnostic reads and is NOT performance evidence.
+backend. Eager timing includes diagnostic reads and is NOT performance evidence.
+Graph/performance modes observe only existing untimed metadata boundaries.
 No archived state or scratch experiment is imported by this runner.
 """
 
@@ -191,9 +192,14 @@ def main(argv=None):
     for name in ("newton", "isaaclab", "backend-isaaclab", "output", "audit-output", "pins-json"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--expected-newton-commit", required=True)
-    parser.add_argument("--num-envs", type=int, choices=(256, 512), default=512)
+    parser.add_argument("--num-envs", type=int, choices=(256, 512, 16384), default=512)
     parser.add_argument("--perturb", action="store_true")
+    parser.add_argument("--mode", choices=("eager", "graph", "performance"), default="eager")
     args = parser.parse_args(argv)
+    if args.mode != "eager" and args.perturb:
+        parser.error("Perturbations belong only to the eager correctness probe")
+    if args.mode == "eager" and args.num_envs == 16384:
+        parser.error("The eager probe is bounded to 256/512 worlds")
     root, lab = args.newton.resolve(), args.isaaclab.resolve()
     backend_lab = args.backend_isaaclab.resolve()
     output, audit = args.output.resolve(), args.audit_output.resolve()
@@ -236,11 +242,12 @@ def main(argv=None):
         "lab_core_tasks": {"path": str(lab), "commit": LAB_COMMIT},
         "lab_backend": {"path": str(backend_lab), "commit": BACKEND_COMMIT},
         "perturb": args.perturb,
+        "mode": args.mode,
         "timing_accepted": False,
         "whole_physics_accepted": False,
         "contact_eight_accepted": False,
         "convergence_accepted": False,
-        "profile_arguments": profile_arguments(args.num_envs, output),
+        "profile_arguments": profile_arguments(args.num_envs, output) if args.mode == "eager" else None,
     }
 
     def save():
@@ -254,7 +261,7 @@ def main(argv=None):
         verify_imports(root, pins, lab=lab, backend_lab=backend_lab)
         import warp as wp  # noqa: PLC0415 - flags and runtime authority precede imports
 
-        from tools.fpgs_bench import checked_capture, kinetic_live_probe  # noqa: PLC0415
+        from tools.fpgs_bench import checked_capture, kinetic_live_measure, kinetic_live_probe  # noqa: PLC0415
 
         solver_module = importlib.import_module("newton._src.solvers.feather_pgs.solver_feather_pgs")
         verify_imports(root, pins, lab=lab, backend_lab=backend_lab)
@@ -263,9 +270,16 @@ def main(argv=None):
             raise ValueError("The actual GPU differs from the paired lease")
         report["hardware"] = {"uuid": device.uuid, "name": device.name, "warp": wp.__version__}
         checks_path = output.parent / "capture_checks.json"
-        with kinetic_live_probe.observing(
-            solver_module.SolverFeatherPGS, report, worlds=args.num_envs, perturb=args.perturb
-        ):
+        if args.mode == "eager":
+            observer = kinetic_live_probe.observing(
+                solver_module.SolverFeatherPGS, report, worlds=args.num_envs, perturb=args.perturb
+            )
+        else:
+            report["profile_arguments"] = kinetic_live_measure.profile_arguments(args.num_envs, output, args.mode)
+            observer = kinetic_live_measure.measuring(
+                solver_module.SolverFeatherPGS, report, checked_capture, args.mode
+            )
+        with observer:
             checked_capture.main(
                 [
                     "--isaaclab",
@@ -280,9 +294,11 @@ def main(argv=None):
                     *report["profile_arguments"],
                 ]
             )
-        if len(report["calls"]) != 24 or [call["step"] for call in report["calls"]] != list(range(24)):
+        if args.mode == "eager" and (
+            len(report["calls"]) != 24 or [call["step"] for call in report["calls"]] != list(range(24))
+        ):
             raise ValueError("Expected all24 actual cold-through-step23 calls")
-        if not report["force_exports"]:
+        if args.mode == "eager" and not report["force_exports"]:
             raise ValueError("The actual public force API was not exercised")
         if args.perturb and [item["event"] for item in report["perturbations"]] != [
             "force_target",
@@ -294,15 +310,26 @@ def main(argv=None):
         if args.perturb and not report["gravity_perturbation"]["restored"]:
             raise ValueError("The diagnostic gravity input was not restored")
         result = json.loads(output.read_text())
-        if result["decimation"] != 4 or result["sim_dt"] != 1 / 120 or result["cuda_graph"]:
-            raise ValueError("The unchanged eager task recipe changed")
+        if result["decimation"] != 4 or result["sim_dt"] != 1 / 120 or result["cuda_graph"] != (args.mode != "eager"):
+            raise ValueError("The unchanged task recipe changed")
+        if args.mode != "eager" and (
+            len(report["graph_boundaries"]) != 2 or not all(item["passed"] for item in report["graph_boundaries"])
+        ):
+            raise ValueError("Actual graph boundary checks did not pass")
         checks = json.loads(checks_path.read_text())
         if not checks["complete"] or not checks["check_pass"] or checks["boundary_count"] != 2:
             raise ValueError("Actual collision/solver capacity checks failed")
         report["fixed_backend_imports"] = verify_imports(
             root, pins, lab=lab, backend_lab=backend_lab, require_backend=True
         )
-        report.update(checks=checks, complete=True, actual_eager_lifecycle_pass=True, public_fk_pass=True)
+        report.update(
+            checks=checks,
+            complete=True,
+            actual_eager_lifecycle_pass=args.mode == "eager",
+            graph_boundary_pass=args.mode != "eager",
+            public_fk_pass=args.mode != "performance",
+            timing_accepted=args.mode == "performance",
+        )
     except BaseException as error:
         report.update(complete=False, success=False, error=repr(error), traceback=traceback.format_exc())
         raise
