@@ -238,7 +238,15 @@ def get_refresh_kernel():
         for (int k = 0; k < 6; ++k) value += screw[k] * force[6*src+k];
         if (row == col) {
             value += R.data[group*43+original_row];
-            const int drive = drive_row.data[ds+original_row];
+            int drive = drive_row.data[ds+original_row];
+            if (drive < 0 && !parallel_drives) {
+                // Serial drive preparation compacts only its current rows.
+                // Its all-minus-one immutable map is not a no-drive predicate.
+                for (int r = 0; r < drive_counts.data[art]; ++r) {
+                    const int entry = art * drive_stride + r;
+                    if (drive_dofs.data[entry] == ds + original_row) { drive = entry; break; }
+                }
+            }
             if (drive >= 0 && K.data[drive] > 0.0f) value += K.data[drive];
         }
         a[e] = value;
@@ -296,6 +304,10 @@ def get_refresh_kernel():
         R: wp.array2d[float],
         drive_row: wp.array[int],
         K: wp.array[float],
+        drive_counts: wp.array[int],
+        drive_dofs: wp.array[int],
+        drive_stride: int,
+        parallel_drives: int,
     ): ...
 
     def refresh(
@@ -307,9 +319,13 @@ def get_refresh_kernel():
         R: wp.array2d[float],
         drive_row: wp.array[int],
         K: wp.array[float],
+        drive_counts: wp.array[int],
+        drive_dofs: wp.array[int],
+        drive_stride: int,
+        parallel_drives: int,
     ):
         group, _ = wp.tid()
-        native(group, p, d, mask, S, I, R, drive_row, K)
+        native(group, p, d, mask, S, I, R, drive_row, K, drive_counts, drive_dofs, drive_stride, parallel_drives)
 
     refresh.__name__ = refresh.__qualname__ = "sparse_factor_refresh43_434"
     return wp.kernel(enable_backward=False, module="unique")(refresh)
@@ -464,6 +480,10 @@ class SparseFactor:
                 s.R_by_size[43],
                 s._augmented_drive_row_by_dof,
                 s.aug_row_K,
+                s.aug_row_counts,
+                s.aug_row_dof_index,
+                s.articulation_max_dofs,
+                int(s._parallel_augmented_drive_topology),
             ],
             block_dim=128,
             device=s.model.device,

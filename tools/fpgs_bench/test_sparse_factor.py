@@ -311,6 +311,12 @@ class TestSparseFactor(unittest.TestCase):
 class TestSparseFactorCUDA(unittest.TestCase):
     def test_complete_owner_two_steps_and_graph(self):
         """Exercise actual constructor and every retained original service."""
+        for parallel in (False, True):
+            with self.subTest(parallel=parallel):
+                self._complete_owner_two_steps_and_graph(parallel)
+
+    def _complete_owner_two_steps_and_graph(self, parallel):
+        """Retain the failed serial control and also exercise real async drives."""
         f = fixture("cuda:0")
         m = f["model"]
         state = f["state"]
@@ -324,7 +330,7 @@ class TestSparseFactorCUDA(unittest.TestCase):
             "update_mass_matrix_interval": 2,
             "mf_gs_incremental_rows": 0,
             "fuse_joint_velocity_limits": False,
-            "use_parallel_streams": False,
+            "use_parallel_streams": parallel,
             "double_buffer": False,
         }
         with patch.dict(os.environ, {"FEATHER_PGS_SPARSE_FACTOR": "0", "FEATHER_PGS_SINGLE_FACTOR": "0"}):

@@ -10340,7 +10340,9 @@ class SolverFeatherPGS(SolverBase):
 
         # The immutable drive layout gives CRBA direct DOF-to-row ownership.
         # Make the dynamic coefficients visible before any fused mass write.
-        if drive_rows_ready is not None and self._parallel_augmented_drive_topology:
+        if drive_rows_ready is not None and (
+            self._parallel_augmented_drive_topology or self._sparse_factor is not None
+        ):
             wp.get_stream(model.device).wait_event(drive_rows_ready)
 
         # Global refreshes were accumulated by the warp-parallel launch next
@@ -10554,7 +10556,7 @@ class SolverFeatherPGS(SolverBase):
         if drive_rows_ready is not None and not self._parallel_augmented_drive_topology:
             wp.get_stream(model.device).wait_event(drive_rows_ready)
 
-        if not self._parallel_augmented_drive_topology:
+        if not self._parallel_augmented_drive_topology and self._sparse_factor is None:
             for size in self.size_groups:
                 n_arts = self.n_arts_by_size[size]
                 wp.launch(
