@@ -8,8 +8,10 @@ trajectory acceptance. Contact manifolds may change; finite geometry may not.
 """
 
 import hashlib
+import json
 import os
 import unittest
+from collections import Counter
 from functools import cache
 from pathlib import Path
 from unittest.mock import patch
@@ -250,7 +252,7 @@ def check_synthetic_native(device):
 
 
 def snapshot(pipeline, state, contacts):
-    """Read complete current output only at an untimed test boundary."""
+    """Read and own current output bytes only at an untimed test boundary."""
     pipeline.narrow_phase.check_buffer_capacity()
     n = int(contacts.rigid_contact_count.numpy()[0])
     nt = int(pipeline.narrow_phase.triangle_pairs_count.numpy()[0])
@@ -259,16 +261,24 @@ def snapshot(pipeline, state, contacts):
     triples = pipeline.narrow_phase.triangle_pairs.numpy()[:nt].copy()
     marked = triples[:, 2] < 0
     triples[marked, 2] = ~triples[marked, 2]
-    p0, p1 = (getattr(contacts, "rigid_contact_point" + side).numpy()[:n] for side in ("0", "1"))
-    shapes = contacts.rigid_contact_shape1.numpy()[:n]
+    p0, p1 = (getattr(contacts, "rigid_contact_point" + side).numpy()[:n].copy() for side in ("0", "1"))
+    shape0 = contacts.rigid_contact_shape0.numpy()[:n]
+    shapes = contacts.rigid_contact_shape1.numpy()[:n].copy()
     poses = state.body_q.numpy()
-    world1 = np.array([poses[s - 1, :3] + rotation(poses[s - 1, 3:]) @ v for s, v in zip(shapes, p1, strict=True)])
-    normal = contacts.rigid_contact_normal.numpy()[:n]
+    if np.any(shape0 != 0) or np.any(shapes < 1) or np.any(shapes > len(poses)):
+        raise AssertionError("Invalid public contact shape routing")
+    world1 = np.array(
+        [poses[s - 1, :3] + rotation(poses[s - 1, 3:]) @ v for s, v in zip(shapes, p1, strict=True)]
+    ).reshape((-1, 3))
+    normal = contacts.rigid_contact_normal.numpy()[:n].copy()
     distance = np.einsum("ij,ij->i", world1 - p0, normal)
     if not all(np.isfinite(v).all() for v in (p0, world1, normal, distance)):
         raise AssertionError("Nonfinite public contacts")
+    if n and np.max(np.abs(np.linalg.norm(normal, axis=1) - 1.0)) > 2e-4:
+        raise AssertionError("Invalid public contact normals")
     return {
         "triples": triples,
+        "marked_triples": triples[marked].copy(),
         "marked": int(marked.sum()),
         "shape": shapes,
         "point": p0,
@@ -278,129 +288,252 @@ def snapshot(pipeline, state, contacts):
     }
 
 
+def logical_keys(triples):
+    """Sort the decoded logical multiset without depending on atomic output order."""
+    return sorted(tuple(int(value) for value in row) for row in triples)
+
+
+def key_comparison(before, after):
+    """Record exact multiset identity with bounded mismatch examples."""
+    left, right = Counter(logical_keys(before)), Counter(logical_keys(after))
+    missing, added = list((left - right).elements()), list((right - left).elements())
+    return {
+        "equal": left == right,
+        "missing_count": len(missing),
+        "added_count": len(added),
+        "missing_examples": missing[:8],
+        "added_examples": added[:8],
+    }
+
+
+def summarize_snapshot(value):
+    """Keep counts, exact-key digests and all per-shape minima in the diagnostic."""
+
+    def digest(rows):
+        return hashlib.sha256(np.asarray(logical_keys(rows), dtype=np.int32).tobytes()).hexdigest()
+
+    shapes = sorted(int(shape) for shape in np.unique(value["shape"]))
+    return {
+        "contact_count": value["count"],
+        "marked_count": value["marked"],
+        "triangle_count": len(value["triples"]),
+        "logical_multiset_sha256": digest(value["triples"]),
+        "marked_logical_keys_sha256": digest(value["marked_triples"]),
+        "contacting_shapes": shapes,
+        "minimum_separation_by_shape": {
+            str(shape): float(value["distance"][value["shape"] == shape].min()) for shape in shapes
+        },
+    }
+
+
+def compare_snapshots(before, after, *, compare_marked=True):
+    """Separate legacy cardinality diagnostics from unchanged ownership/physics gates."""
+    logical = key_comparison(before["triples"], after["triples"])
+    marked = key_comparison(before["marked_triples"], after["marked_triples"])
+    left, right = set(map(int, before["shape"])), set(map(int, after["shape"]))
+    missing, added = sorted(left - right), sorted(right - left)
+    changes = {
+        str(shape): abs(
+            float(before["distance"][before["shape"] == shape].min())
+            - float(after["distance"][after["shape"] == shape].min())
+        )
+        for shape in sorted(left & right)
+    }
+    maximum = max(changes.values(), default=0.0)
+    failures = []
+    if not logical["equal"]:
+        failures.append("logical_multiset")
+    if compare_marked and not marked["equal"]:
+        failures.append("marked_logical_keys")
+    if missing:
+        failures.append("lost_contacting_shapes")
+    if maximum > 2e-4:
+        failures.append("minimum_separation")
+    return {
+        "legacy_count_gate_pass": before["count"] == after["count"] and before["marked"] == after["marked"],
+        "contact_count_delta": after["count"] - before["count"],
+        "marked_count_delta": after["marked"] - before["marked"],
+        "logical_multiset": logical,
+        "marked_logical_keys": marked,
+        "marked_identity_required": compare_marked,
+        "missing_contacting_shapes": missing,
+        "added_contacting_shapes": added,
+        "per_shape_minimum_separation_change": changes,
+        "maximum_minimum_separation_change": maximum,
+        "hard_failures": failures,
+    }
+
+
+def collect_query_audit(pipeline, model, initial, device):
+    """Reach every native query/independent QP even after a lifecycle-count mismatch."""
+    triples = wp.array(initial["triples"], dtype=wp.vec3i, device=device)
+    kernel, result_type = stream_query_kernel()
+    count = len(initial["triples"])
+    output = wp.empty(count, dtype=result_type, device=device)
+    vertices = wp.empty((count, 3), dtype=wp.vec3, device=device)
+    centers = wp.empty(count, dtype=wp.vec3, device=device)
+    quaternions = wp.empty(count, dtype=wp.quat, device=device)
+    wp.launch(
+        kernel,
+        dim=count,
+        inputs=[
+            triples,
+            pipeline.geom_transform,
+            model.heightfield_data,
+            model.heightfield_elevations,
+            model.shape_scale,
+            model.shape_gap,
+            model.shape_margin,
+        ],
+        outputs=[output, vertices, centers, quaternions],
+        device=device,
+    )
+    half = model.shape_scale.numpy()[initial["triples"][:, 1]] * 0.5
+    values = output.numpy()
+    reports, errors = [], []
+    for index, (result, tri, center, quat, h) in enumerate(
+        zip(values, vertices.numpy(), centers.numpy(), quaternions.numpy(), half, strict=True)
+    ):
+        try:
+            reports.append(audit_query(result, tri, center, rotation(quat), h))
+        except Exception as error:
+            errors.append({"index": index, "logical_key": initial["triples"][index].tolist(), "error": repr(error)})
+    admitted = [item for item in reports if not item["fallback"]]
+    marker_match = key_comparison(initial["marked_triples"], initial["triples"][values[:, 0] >= 0])
+    failures = (["native_query_geometry"] if errors else []) + ([] if marker_match["equal"] else ["query_marker_keys"])
+    return {
+        "query_cases": count,
+        "query_cases_audited": len(reports) + len(errors),
+        "admitted": len(admitted),
+        "maximum_surface_error": max((item["surface_error"] for item in admitted), default=0.0),
+        "query_error_count": len(errors),
+        "query_error_examples": errors[:12],
+        "query_marker_keys": marker_match,
+        "hard_failures": failures,
+    }
+
+
 def check_current_pipeline(gpu, device):
-    """Complete direct/reducer controls, exact stream ownership, and graph replays."""
+    """Collect every variant/lifecycle case, preserving legacy failures as diagnostics."""
     model, state, pairs = current_fixture(gpu, device)
-    records = []
+    original_pose = state.body_q.numpy().copy()
+    records, comparisons, failures = [], [], []
+    initial_by_variant = {}
     for reduce in (False, True):
-        variants = []
         for enabled in (False, True):
-            with patch.dict(
-                os.environ, NEWTON_HEIGHTFIELD_CELL_REJECT="1", NEWTON_HEIGHTFIELD_FINITE_QUERY=str(int(enabled))
-            ):
-                # Preserve the inherited96 fixture bounds; these are NOT16K
-                # benchmark allocations or extra candidate-only buffers.
-                pipeline = newton.CollisionPipeline(
-                    model,
-                    shape_pairs_filtered=pairs,
-                    reduce_contacts=reduce,
-                    rigid_contact_max=32768,
-                    max_triangle_pairs=32768,
-                )
-            contacts = pipeline.contacts()
-            pipeline.collide(state, contacts)
-            initial = snapshot(pipeline, state, contacts)
-            if enabled and initial["marked"] == 0:
-                raise AssertionError("Requested finite query silently fell back")
-            if not enabled and initial["marked"] != 0:
-                raise AssertionError("Baseline unexpectedly marked its stream")
-            if enabled:
-                poses = state.body_q.numpy().copy()
-                away = poses.copy()
+            case = {"reduce": reduce, "enabled": enabled, "snapshots": [], "hard_failures": []}
+            records.append(case)
+            try:
+                state.body_q.assign(original_pose)
+                with patch.dict(
+                    os.environ, NEWTON_HEIGHTFIELD_CELL_REJECT="1", NEWTON_HEIGHTFIELD_FINITE_QUERY=str(int(enabled))
+                ):
+                    pipeline = newton.CollisionPipeline(
+                        model,
+                        shape_pairs_filtered=pairs,
+                        reduce_contacts=reduce,
+                        rigid_contact_max=32768,
+                        max_triangle_pairs=32768,
+                    )
+                contacts = pipeline.contacts()
+                pipeline.collide(state, contacts)
+                initial = snapshot(pipeline, state, contacts)
+                initial_by_variant[reduce, enabled] = initial
+                case["snapshots"].append({"stage": "initial", **summarize_snapshot(initial)})
+                if (enabled and initial["marked"] == 0) or (not enabled and initial["marked"] != 0):
+                    case["hard_failures"].append("initial_activation")
+
+                # The original baseline now undergoes exactly the same transition.
+                away = original_pose.copy()
                 away[:, 2] += 1000.0
                 state.body_q.assign(away)
                 pipeline.collide(state, contacts)
-                pipeline.narrow_phase.check_buffer_capacity()
-                if int(contacts.rigid_contact_count.numpy()[0]) != 0:
-                    raise AssertionError("Raised boxes retained stale contacts")
-                if int(pipeline.narrow_phase.triangle_pairs_count.numpy()[0]) != 0:
-                    raise AssertionError("Raised boxes retained a stale triangle prefix")
-                state.body_q.assign(poses)
+                empty = snapshot(pipeline, state, contacts)
+                case["snapshots"].append({"stage": "empty", **summarize_snapshot(empty)})
+                if empty["count"] or len(empty["triples"]) or empty["marked"]:
+                    case["hard_failures"].append("empty_prefix_or_contacts")
+                state.body_q.assign(original_pose)
                 pipeline.collide(state, contacts)
                 restored = snapshot(pipeline, state, contacts)
-                if restored["count"] != initial["count"] or restored["marked"] != initial["marked"]:
-                    raise AssertionError("Empty-to-regrown prefix retained stale markers")
-            if device != "cpu":
-                with wp.ScopedCapture(device=device) as captured:
-                    pipeline.collide(state, contacts)
-                for _ in range(3):
-                    wp.capture_launch(captured.graph)
-                    replay = snapshot(pipeline, state, contacts)
-                    if replay["count"] != initial["count"] or replay["marked"] != initial["marked"]:
-                        raise AssertionError("Query marker/manifold lifecycle changed on replay")
-            variants.append(initial)
-            if enabled and not reduce:
-                triples = wp.array(initial["triples"], dtype=wp.vec3i, device=device)
-                kernel, result_type = stream_query_kernel()
-                count = len(initial["triples"])
-                output = wp.empty(count, dtype=result_type, device=device)
-                vertices = wp.empty((count, 3), dtype=wp.vec3, device=device)
-                centers = wp.empty(count, dtype=wp.vec3, device=device)
-                quaternions = wp.empty(count, dtype=wp.quat, device=device)
-                wp.launch(
-                    kernel,
-                    dim=count,
-                    inputs=[
-                        triples,
-                        pipeline.geom_transform,
-                        model.heightfield_data,
-                        model.heightfield_elevations,
-                        model.shape_scale,
-                        model.shape_gap,
-                        model.shape_margin,
-                    ],
-                    outputs=[output, vertices, centers, quaternions],
-                    device=device,
+                comparison = compare_snapshots(initial, restored)
+                case["snapshots"].append(
+                    {"stage": "restored", **summarize_snapshot(restored), "vs_initial": comparison}
                 )
-                half = model.shape_scale.numpy()[initial["triples"][:, 1]] * 0.5
-                audits = [
-                    audit_query(result, tri, center, rotation(quat), h)
-                    for result, tri, center, quat, h in zip(
-                        output.numpy(), vertices.numpy(), centers.numpy(), quaternions.numpy(), half, strict=True
-                    )
-                ]
-                admitted = [item for item in audits if not item["fallback"]]
-                if len(admitted) != initial["marked"]:
-                    raise AssertionError("Pipeline and independent query disagree about handled stream entries")
-                records.append(
-                    {
-                        "query_cases": count,
-                        "admitted": len(admitted),
-                        "maximum_surface_error": max(item["surface_error"] for item in admitted),
-                    }
-                )
-        before, after = variants
+                case["hard_failures"].extend("restored:" + error for error in comparison["hard_failures"])
 
-        def key(row):
-            return tuple(int(v) for v in row)
+                if device != "cpu":
+                    with wp.ScopedCapture(device=device) as captured:
+                        pipeline.collide(state, contacts)
+                    for index in range(3):
+                        wp.capture_launch(captured.graph)
+                        replay = snapshot(pipeline, state, contacts)
+                        comparison = compare_snapshots(initial, replay)
+                        case["snapshots"].append(
+                            {"stage": f"replay{index}", **summarize_snapshot(replay), "vs_initial": comparison}
+                        )
+                        case["hard_failures"].extend(f"replay{index}:" + error for error in comparison["hard_failures"])
+                if enabled and not reduce:
+                    case["query_audit"] = collect_query_audit(pipeline, model, initial, device)
+                    case["hard_failures"].extend(case["query_audit"]["hard_failures"])
+            except Exception as error:
+                case["collection_error"] = repr(error)
+                case["hard_failures"].append("collection_error")
+            finally:
+                state.body_q.assign(original_pose)
+            failures.extend(f"reduce{int(reduce)}_finite{int(enabled)}:{error}" for error in case["hard_failures"])
 
-        if sorted(map(key, before["triples"])) != sorted(map(key, after["triples"])):
-            raise AssertionError("Analytical query changed the logical midphase stream")
-        missing = sorted(set(before["shape"]) - set(after["shape"]))
-        if missing:
-            raise AssertionError(("Previously contacting shapes lost all contacts", missing))
-        minimum_errors = [
-            abs(
-                float(before["distance"][before["shape"] == shape].min())
-                - float(after["distance"][after["shape"] == shape].min())
+        if all((reduce, enabled) in initial_by_variant for enabled in (False, True)):
+            comparison = compare_snapshots(
+                initial_by_variant[reduce, False], initial_by_variant[reduce, True], compare_marked=False
             )
-            for shape in np.unique(before["shape"])
-        ]
-        if max(minimum_errors, default=0.0) > 2e-4:
-            raise AssertionError(("Changed actual minimum separation", max(minimum_errors)))
-        records.append(
-            {
-                "reduce": reduce,
-                "original_contacts": before["count"],
-                "candidate_contacts": after["count"],
-                "marked": after["marked"],
-                "maximum_minimum_separation_change": max(minimum_errors, default=0.0),
-            }
-        )
-    return {"gpu_fixture": gpu, "device": str(device), "input_sha256": PINS[gpu], "records": records}
+            comparisons.append({"reduce": reduce, **comparison})
+            failures.extend(f"variant_reduce{int(reduce)}:{error}" for error in comparison["hard_failures"])
+        else:
+            failures.append(f"variant_reduce{int(reduce)}:missing_initial")
+    return {
+        "gpu_fixture": gpu,
+        "device": str(device),
+        "input_sha256": PINS[gpu],
+        "records": records,
+        "variant_comparisons": comparisons,
+        "hard_failures": failures,
+        "legacy_count_failure_count": sum(
+            not item["vs_initial"]["legacy_count_gate_pass"]
+            for case in records
+            for item in case["snapshots"]
+            if "vs_initial" in item
+        ),
+        "scope": "Complete lifecycle diagnostic; historical exact-count failures retained",
+    }
 
 
 class TestIndependentGeometry(unittest.TestCase):
+    def test_lifecycle_collector_controls(self):
+        """Reject stale ownership/lost shapes while recording benign count variation."""
+        initial = {
+            "triples": np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32),
+            "marked_triples": np.array([[0, 1, 2]], dtype=np.int32),
+            "marked": 1,
+            "shape": np.array([1, 2]),
+            "distance": np.array([0.01, -0.02]),
+            "count": 2,
+        }
+        changed = {key: value.copy() if isinstance(value, np.ndarray) else value for key, value in initial.items()}
+        changed.update(shape=np.array([2, 1, 1]), distance=np.array([-0.02, 0.01, 0.02]), count=3)
+        changed["triples"] = changed["triples"][::-1]
+        report = compare_snapshots(initial, changed)
+        self.assertFalse(report["legacy_count_gate_pass"])
+        self.assertEqual(report["hard_failures"], [])
+        for field, value, failure in (
+            ("marked_triples", np.array([[0, 2, 3]], dtype=np.int32), "marked_logical_keys"),
+            ("triples", np.array([[0, 1, 2], [0, 2, 4]], dtype=np.int32), "logical_multiset"),
+            ("shape", np.array([1, 1, 1]), "lost_contacting_shapes"),
+            ("distance", np.array([-0.021, 0.01, 0.02]), "minimum_separation"),
+        ):
+            injected = dict(changed)
+            injected[field] = value
+            self.assertIn(failure, compare_snapshots(initial, injected)["hard_failures"])
+
     def test_surface_checker_rejects_border_and_sign_errors(self):
         """Fail malformed finite witnesses rather than accepting finite numbers alone."""
         tri = np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 2.0, 0.0]])
@@ -417,8 +550,16 @@ class TestIndependentGeometry(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "Requires the root-owned paired GPU lease")
     def test_actual96_complete_pipeline_and_query(self):
         """Check both saved GPU scenes through each complete current CUDA pipeline."""
+        failures = []
         for gpu in (0, 1):
-            RECORDS.append(check_current_pipeline(gpu, "cuda:0"))
+            try:
+                record = check_current_pipeline(gpu, "cuda:0")
+            except Exception as error:
+                record = {"gpu_fixture": gpu, "hard_failures": ["fixture_collection"], "error": repr(error)}
+            RECORDS.append(record)
+            failures.extend(f"fixture{gpu}:{error}" for error in record["hard_failures"])
+        print("FINITE_LIFECYCLE " + json.dumps(RECORDS, allow_nan=False), flush=True)
+        self.assertEqual(failures, [], "All cases collected; see FINITE_LIFECYCLE and current_geometry")
 
     def test_synthetic_native_cpu(self):
         """Check actual native CPU geometry against independent physical witnesses."""

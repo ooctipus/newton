@@ -1,5 +1,38 @@
 # Finite cuboid/prism query: complete experimental owner
 
+## Paired physical01 failure and diagnostic successor
+
+The original physical run is preserved at
+`/tmp/fpgs-heightfield-finite-physical-paired-20260913-01`: parent42126 reaped
+exit1, final source and idle checks passed. All eight selectors ran on each
+card; six CPU controls and native synthetic CUDA geometry passed. Actual96
+failed RTX's exact replay count/marked-count assertion and GB's exact restored
+count/marked-count assertion. The old test did not record which value or
+variant changed, and stopped before finishing all geometric checks. This is
+not a physical pass, a diagnosed native fix, or timing acceptance.
+
+The diagnostic-only successor changes this report and the independent test,
+not runtime. Both original and finite variants now undergo the same
+initial→empty→restored→three-graph-replay sequence, for both reducer modes and
+both saved fixtures. It records every count, preserves each old count gate as
+`legacy_count_gate_pass`, and requires exact decoded logical multisets and
+marked logical-key identity, finite valid public geometry, no lost contacting
+shape, and the unchanged 2e-4 m per-shape minimum-separation bound. Native
+query/independent FP64 QP checks remain and run after count/ownership mismatches.
+Failures aggregate only after collecting both fixtures; count-only failures
+remain diagnostic evidence, not a claim they are harmless in advance.
+
+Fail-first missing-collector control preceded implementation. Injected stale
+marker keys, altered logical stream, lost shape, and excessive separation all
+fail the CPU checker; a reordered manifold with one redundant contact changes
+the legacy count diagnostic without changing ownership/physical gates. Three
+CPU methods pass, two CUDA methods are registered/skipped CPU-side. Both full
+96-pair CPU collectors completed with no hard failures or legacy count changes
+(parent82742 reaped0). This does not explain the paired GPU difference yet.
+Diagnostic test SHA256 is
+`9492ef4e126504b5ba0092497635f5ad3aae2126f533ee864485b524da624217`.
+All three actual runtime hashes below remain byte-identical to commit882e468a.
+
 Status (2026-09-13): CPU complete-path and offline compilation ready; no GPU
 physical, trajectory, or timing acceptance yet. Isolated branch
 `ooctipus/g1-finite-query-20260913`, based on cell owner
