@@ -9,6 +9,7 @@ Binding does not launch kernels, read back dynamic values, or seed held state.
 """
 
 import inspect
+import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -318,6 +319,10 @@ class LiveBindings:
         call.kernel_arguments["finish"] = finish_args
         call.free = self._free(call, current)
         call.force = self._force(call.rows, call.services, call.solve.guard, contacts, dt)
+        if os.environ.get("FEATHER_PGS_KUKA_FIRST_HIT") == "1":
+            from . import kinetic_first_hit  # noqa: PLC0415 -- experimental opt-in
+
+            kinetic_first_hit.install(call)
         return call
 
     def validate_notification(self, flags, *, plan_snapshot=None):
