@@ -59,6 +59,7 @@ from ..geometry.contact_reduction_global import (
 from ..geometry.contact_sort import ContactSorter
 from ..geometry.flags import ShapeFlags
 from ..geometry.heightfield_cells import heightfield_cell_overlaps_kernel
+from ..geometry.heightfield_direct import create_heightfield_direct_kernel
 from ..geometry.mpr import create_solve_mpr, create_support_map_function
 from ..geometry.sdf_contact import (
     MESH_SDF_BLOCK_DIM,
@@ -2418,6 +2419,12 @@ class NarrowPhase:
             raise ValueError("NEWTON_HEIGHTFIELD_CELL_REJECT must be 0 or 1")
         self._heightfield_cell_reject_requested = cell_reject == "1"
         self._heightfield_cell_reject = self._heightfield_cell_reject_requested and has_heightfields and not has_meshes
+        direct_heightfield = os.environ.get("NEWTON_HEIGHTFIELD_DIRECT", "0")
+        if direct_heightfield not in ("0", "1"):
+            raise ValueError("NEWTON_HEIGHTFIELD_DIRECT must be 0 or 1")
+        if direct_heightfield == "1" and not self._heightfield_cell_reject_requested:
+            raise ValueError("NEWTON_HEIGHTFIELD_DIRECT requires NEWTON_HEIGHTFIELD_CELL_REJECT=1")
+        self._heightfield_direct = direct_heightfield == "1" and self._heightfield_cell_reject
         self.mesh_sdf_texture_only = mesh_sdf_texture_only
         self.has_generic_convex_pairs = has_generic_convex_pairs
         self.sdf_texture_paired_samples = sdf_texture_paired_samples
@@ -2539,6 +2546,11 @@ class NarrowPhase:
             self.mesh_triangle_contacts_kernel = create_narrow_phase_process_mesh_triangle_contacts_kernel(writer_func)
         else:
             self.mesh_triangle_contacts_kernel = None
+        self.heightfield_direct_kernel = (
+            create_heightfield_direct_kernel(write_contact_to_reducer if self.reduce_contacts else writer_func)
+            if self._heightfield_direct
+            else None
+        )
 
         # Create mesh-specific kernels only when has_meshes=True
         if has_meshes:
@@ -3061,18 +3073,19 @@ class NarrowPhase:
                     self.shape_pairs_mesh_count,
                     self.num_tile_blocks,
                 ]
-            wp.launch(
-                kernel=midphase_kernel,
-                dim=[self.num_tile_blocks, second_dim],
-                inputs=midphase_inputs,
-                outputs=[
-                    self.triangle_pairs,
-                    self.triangle_pairs_count,
-                ],
-                device=device,
-                block_dim=self.tile_size_mesh_convex,
-                record_tape=False,
-            )
+            if not self._heightfield_direct:
+                wp.launch(
+                    kernel=midphase_kernel,
+                    dim=[self.num_tile_blocks, second_dim],
+                    inputs=midphase_inputs,
+                    outputs=[
+                        self.triangle_pairs,
+                        self.triangle_pairs_count,
+                    ],
+                    device=device,
+                    block_dim=self.tile_size_mesh_convex,
+                    record_tape=False,
+                )
 
             # Launch contact processing for triangle pairs
             if self.reduce_contacts:
@@ -3118,28 +3131,29 @@ class NarrowPhase:
                     )
 
                 # Mesh/heightfield-triangle contacts → same global reducer
-                wp.launch(
-                    kernel=mesh_triangle_contacts_to_reducer_kernel,
-                    dim=self.total_num_threads,
-                    inputs=[
-                        shape_types,
-                        shape_data,
-                        shape_transform,
-                        shape_source,
-                        shape_gap,
-                        shape_heightfield_index,
-                        heightfield_data,
-                        heightfield_elevations,
-                        self.triangle_pairs,
-                        self.triangle_pairs_count,
-                        reducer_data,
-                        self.total_num_threads,
-                    ],
-                    device=device,
-                    block_dim=self.mesh_triangle_block_dim,
-                    record_tape=False,
-                )
-            else:
+                if not self._heightfield_direct:
+                    wp.launch(
+                        kernel=mesh_triangle_contacts_to_reducer_kernel,
+                        dim=self.total_num_threads,
+                        inputs=[
+                            shape_types,
+                            shape_data,
+                            shape_transform,
+                            shape_source,
+                            shape_gap,
+                            shape_heightfield_index,
+                            heightfield_data,
+                            heightfield_elevations,
+                            self.triangle_pairs,
+                            self.triangle_pairs_count,
+                            reducer_data,
+                            self.total_num_threads,
+                        ],
+                        device=device,
+                        block_dim=self.mesh_triangle_block_dim,
+                        record_tape=False,
+                    )
+            elif not self._heightfield_direct:
                 # Direct contact processing without reduction
                 wp.launch(
                     kernel=self.mesh_triangle_contacts_kernel,
@@ -3160,6 +3174,33 @@ class NarrowPhase:
                     ],
                     device=device,
                     block_dim=self.mesh_triangle_block_dim,
+                    record_tape=False,
+                )
+
+            if self._heightfield_direct:
+                pair_workers = self.total_num_threads // 32
+                wp.launch_tiled(
+                    kernel=self.heightfield_direct_kernel,
+                    dim=pair_workers,
+                    inputs=[
+                        shape_types,
+                        shape_data,
+                        shape_transform,
+                        shape_source,
+                        shape_gap,
+                        shape_collision_aabb_lower,
+                        shape_collision_aabb_upper,
+                        shape_heightfield_index,
+                        heightfield_data,
+                        heightfield_elevations,
+                        self.shape_pairs_mesh,
+                        self.shape_pairs_mesh_count,
+                        self.triangle_pairs_count,
+                        reducer_data if self.reduce_contacts else writer_data,
+                        pair_workers,
+                    ],
+                    device=device,
+                    block_dim=32,
                     record_tape=False,
                 )
 
