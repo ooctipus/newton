@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Experimental FP32-filtered hull BSP with original support on ambiguous signs."""
+"""Experimental FP32 hull BSP with original-law scans of ambiguous subtrees."""
 
 from functools import cache
 from typing import Any
@@ -60,6 +60,7 @@ class _BspData:
     plane: wp.array[wp.vec3]
     node_plane: wp.array[int]
     children: wp.array[wp.vec2i]
+    leaf_masks: wp.array[wp.uint64]
     valid: wp.array[int]
 
 
@@ -113,15 +114,60 @@ def _bind_shape(geom: GenericShapeData, data: _BspData) -> _BspShape:
 
 @wp.func
 def _query(data: _BspData, root: int, direction: wp.vec3) -> int:
+    """Return a certified vertex, -1 for full scan, or -node-2 for a subset scan."""
+    # Nonfinite directions retain the original callback's numerical behavior.
+    if not wp.isfinite(direction[0]) or not wp.isfinite(direction[1]) or not wp.isfinite(direction[2]):
+        return -1
     index = root
     while index >= 0:
         plane = data.node_plane[index]
         sign = _filtered_sign(data.plane[plane], direction)
         if sign == 2:
+            if data.leaf_masks[index] != wp.uint64(0):
+                return -index - 2
             return -1
         pair = data.children[index]
         index = pair[0] if sign >= 0 else pair[1]
     return -index - 1
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+return __ffsll(mask) - 1;
+#else
+return __builtin_ctzll(mask);
+#endif
+""")
+def _lowest_vertex(mask: wp.uint64) -> int:
+    """Return the lowest set vertex index for a nonempty mask."""
+    ...
+
+
+@wp.func
+def _scan_mask(points: wp.array[wp.vec3], direction: wp.vec3, mask: wp.uint64) -> int:
+    # Match the original scan's sentinel, FP32 dot, strict comparison and order.
+    maximum = float(-1.0e10)
+    winner = int(0)
+    remaining = mask
+    while remaining != wp.uint64(0):
+        vertex = _lowest_vertex(remaining)
+        score = wp.dot(points[vertex], direction)
+        if score > maximum:
+            maximum = score
+            winner = vertex
+        remaining = remaining & (remaining - wp.uint64(1))
+    return winner
+
+
+def _subtree_masks(nodes, vertex_count):
+    """Union duplicated leaves into one mask per node, or disable scans above 64 vertices."""
+    masks = [0] * len(nodes)
+    if vertex_count <= 64:
+        for index in range(len(nodes) - 1, -1, -1):
+            _, positive, negative = nodes[index]
+            for child in (positive, negative):
+                masks[index] |= masks[child] if child >= 0 else 1 << (-child - 1)
+    return masks
 
 
 def _create_support(lean: bool):
@@ -133,7 +179,11 @@ def _create_support(lean: bool):
         result = wp.vec3(0.0)
         winner = int(-1)
         if geom.shape_type == GeoType.CONVEX_MESH and geom.root >= 0:
-            winner = _query(data, geom.root, wp.cw_mul(direction, geom.scale))
+            scaled_direction = wp.cw_mul(direction, geom.scale)
+            winner = _query(data, geom.root, scaled_direction)
+            if winner < -1:
+                mesh = wp.mesh_get(unpack_mesh_ptr(geom.auxiliary))
+                winner = _scan_mask(mesh.points, scaled_direction, data.leaf_masks[-winner - 2])
         if winner >= 0:
             mesh = wp.mesh_get(unpack_mesh_ptr(geom.auxiliary))
             result = wp.cw_mul(mesh.points[winner], geom.scale)
@@ -191,7 +241,7 @@ class _BspOwner:
 
         meshes = {mesh.id: mesh for mesh in model._mesh_keep_alive}
         pointers = np.unique(model.shape_source_ptr.numpy()[model.shape_type.numpy() == GeoType.CONVEX_MESH])
-        ids, roots, rounded, planes, children = [], [], [], [], []
+        ids, roots, rounded, planes, children, leaf_masks = [], [], [], [], [], []
         self.metadata = {"admitted_meshes": [], "unsupported_meshes": [], "invalidated": False}
         for pointer in sorted(int(p) for p in pointers if int(p) in meshes):
             mesh = meshes[pointer]
@@ -206,6 +256,7 @@ class _BspOwner:
                 continue
             plane_map = {}
             start = len(children)
+            leaf_masks.extend(_subtree_masks(tree["nodes"], len(vertices)))
             for plane, positive, negative in tree["nodes"]:
                 if plane not in plane_map:
                     plane_map[plane] = len(rounded)
@@ -231,6 +282,7 @@ class _BspOwner:
         self.data.plane = wp.array(np.asarray(rounded).reshape(-1, 3), dtype=wp.vec3, device=device)
         self.data.node_plane = wp.array(planes, dtype=int, device=device)
         self.data.children = wp.array(np.asarray(children).reshape(-1, 2), dtype=wp.vec2i, device=device)
+        self.data.leaf_masks = wp.array(leaf_masks, dtype=wp.uint64, device=device)
         self.data.valid = wp.full(1, 1, dtype=int, device=device)
         self.metadata["descriptor_bytes"] = sum(
             a.capacity
@@ -240,6 +292,7 @@ class _BspOwner:
                 self.data.plane,
                 self.data.node_plane,
                 self.data.children,
+                self.data.leaf_masks,
                 self.data.valid,
             )
         )

@@ -1,6 +1,73 @@
 # Experimental complete split-convex BSP support
 
-## FP32-only successor (current branch; CUDA unvalidated)
+## Subtree-scan successor (current branch; CUDA unvalidated)
+
+This section supersedes only the ambiguity scan in the FP32 successor below.
+The new branch starts at frozen `e25992`; neither measured predecessor changes.
+The last complete discovery reached17.115259/16.927128ms FPGS versus
+63.791272/81.775636ms corrected MJ (3.7272x/4.8310x, one round). RTX still needs
+1.167441ms net against that denominator. No new saving is promised.
+
+At the first uncertified plane, earlier certified branches have already
+restricted the set of possible extremal vertices. Preserve that current node
+and scan its union of descendant leaves, instead of discarding the traversal
+and rescanning the entire hull. Host construction performs reverse-order child
+unions on the existing tree; duplicate leaves contribute one bit. The mask uses
+the original mesh-local vertex index, while its array uses the same global
+node offset as children. One uint64 per node costs11,912 bytes for the actual
+1,489 nodes; complete static descriptors total44,352 bytes, not per-world.
+Hull geometry, exact tree construction and range admission do not change.
+
+The numerical scan keeps the original `-1e10` sentinel, initial vertex0,
+FP32 `wp.dot`, strict greater-than update, and ascending index order. Set-bit
+enumeration visits only retained vertices. It is a numerical subset scan, not
+a new exact arithmetic tier. Certified winners still satisfy the existing
+exact geometric tests. Numerical subset winners are not required to match the
+original full-scan tie index or improve its rounding. Invalid providers,
+nonfinite directions and ambiguous hulls above64 vertices retain the original
+full callback. Above64 masks are zero, and certified queries remain available
+as before. Invalidation disables the whole provider before any geometry edit;
+rebuild/recapture and unnotified-write obligations are unchanged.
+
+The existing historical CPU directions reproduce1,810/2,003 ambiguities;
+subtree scans use8,941/9,923 vertex dots rather than complete40/64 scans. The
+independent study reports mean subset4.94/4.95, median2/3 and p90=9, about92.2%
+fewer fallback dots. Existing query tests verify every exact maximizer remains
+in the retained masks, but do not impose exact-max results on numerical scans.
+Five changed historical full-scan winners are known to move the support point
+by as much as2.45cm despite tiny directional error; the unchanged full physical
+manifold gates remain mandatory. Counts and scalar error are not performance
+or dynamics acceptance; current CUDA lane weighting remains unmeasured.
+
+Regression first rejected the missing mask descriptor. Focused native tests
+cover the first ambiguous non-root node, duplicated leaf unions, bit63,
+ascending tie behavior, the original extreme-negative sentinel, nonfinite
+full fallback, and a real66-vertex convex prism whose ambiguity uses the
+byte-original full callback. The complete eleven-test CPU suite passes with
+actual hulls and historical rays, lean/full/coherent MPR/GJK/manifold and
+invalidation. On actual per-query masks, an independent dense masked FP32 loop
+checks the actual subset-selected point's numerical dot score; tied vertex
+indices may differ. A deliberately wrong selected point fails that check.
+All original physical tolerances and complete factory source
+recovery checks remain unchanged. All nine controlled-writer factories compile
+offline for sm120 and sm103; no GPU execution is yet claimed.
+
+Final CPU result: 11 tests, no skips, 31.299s, recorded in
+`/tmp/fpgs-convex-bsp-subtree-qualification-u9yGoe/cpu03.log`. An earlier rerun
+in `cpu02.log` failed Warp source inspection after a docstring insertion
+shifted the live source lines during that same process. No numerical failure
+or production workaround is hidden: the final rerun held sources unchanged
+throughout and passed. The original failed log remains preserved.
+
+The candidate replaces the ambiguity consumer only; it does not remove or
+discount BSP traversal, lookup, coherent feature production, full fallback,
+primitive paths, solver or publication. No new kernel, per-world storage,
+callback, runner, observer, benchmark recipe or capacity is introduced. Root
+reviews the frozen source before the existing paired physical owner and one
+complete cost decision. A geometric support change cannot be promoted merely
+because a finite state/capacity check passes.
+
+## FP32-only predecessor (historical)
 
 This section supersedes the adaptive-runtime description below; the remainder
 preserves the original `c26ac5` experiment and its provenance. The successor is
