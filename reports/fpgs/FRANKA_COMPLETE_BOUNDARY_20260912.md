@@ -86,10 +86,25 @@ state seeding is outside timing. Inherited core metadata calls canonical L
 readonly; that description is obsolete for this complete harness, which
 correctly tracks demanded L9/L6 conversions as mutable restored state.
 
-The next action is one bounded node attribution to explain where the additional
-services cost time. It is not permission for another owner-layout sweep or
-an uncosted live integration. The [24-hour plan](DATAFLOW_24H_20260912.md)
+The bounded node attribution is now complete. Within the same trace, remaining
+busy work beyond the paired owner is1.843111ms RTX /2.174205ms GB, with
+0.223376/0.254646ms internal gaps. Dense+MF current preparation accounts for
+0.898267/1.125267ms, compact prepare+finish0.435385/0.493082ms, and retained
+GS union0.421475/0.455290ms. Local20/40 already overlap; their durations must
+not be added as independent savings. Even deleting every graph memory node
+and gap would save only0.314835ms RTX, short of the0.845181ms miss.
+
+There is no missing join or giant accidental copy to justify a narrow retry.
+The mapping remains closed for live integration. The [24-hour plan](DATAFLOW_24H_20260912.md)
 prioritizes broader work elimination, with Kuka first.
+
+Pinned causal findings:
+`/tmp/fpgs-franka-complete-node-audit-TQhDlhyp/FINDINGS.md`, SHA256
+`46244a47eaee7e00ff19587eac8e7e41e7b92ed3bf09928757da7c47510bcc23`;
+evidence_final.json `dbfe7ad864001e6250f1a450a226320a3d94301b7721432efd6ea694b833c6fb`.
+All314 pins and four CPU accounting tests pass. All in-graph memory is charged;
+outside seed restores/readbacks are proven disjoint and excluded. This is
+causal graph accounting, not a hardware-counter bottleneck claim.
 
 ## Exact evidence
 
