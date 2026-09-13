@@ -467,3 +467,127 @@ The runner differs from the fresh baseline only in its description and
 pre-setup contact installation. It retains10 warm samples then40 measured
 samples, two physical calls scaled by four, and the same untimed physical
 checks. All dt/substeps/eight sweeps/capacities remain unchanged.
+
+## Coupled correction and causal dispatch check, 04:00 UTC
+
+The coupled kinetic prototype passes four paired physical tests per card,
+including loaded192/64 rows, both articulation offsets, independent current
+geometry and actual fresh two-call state. These checks preserve the original
+eight-sweep law; they are not long-run convergence or live-task acceptance.
+Its forty-sample complete-section cost does not demonstrate a useful gain:
+
+| Fresh complete section, ms/env equivalent | RTX | GB |
+| --- | ---: | ---: |
+| Original prototype | 10.339200020 | 9.249216080 |
+| Coupled kinetic prototype | 10.204031944 | 9.355584145 |
+| Original with existing active queue | 10.400703907 | 9.222720146 |
+| Coupled with the same active queue | 10.195839882 | 9.270080090 |
+
+The fixed queue probe reuses the existing active-count/IDs and unchanged
+compiled general kernel, with512 workers. It adds no array, preparation pass
+or new native mathematics. Both queued variants pass fresh physical checks,
+forty cost samples, original-eight replay, source and final GPU-idle guards.
+Applying the queue to both variants avoids crediting dispatch to the kinetic
+representation. It does not recover a substantial saving; close this probe
+without a worker-count sweep. All parents and children are reaped.
+
+Fresh paired node traces explain where the original coupled gain went:
+
+| Charged stage, ms/env | RTX original -> coupled | GB original -> coupled |
+| --- | ---: | ---: |
+| Materializer exclusive | 0.764447 -> 0.077461 | 0.320715 -> 0.073835 |
+| Joined offset/general solve union | 1.684873 -> 2.113941 | 1.252384 -> 1.609173 |
+| Qualification exclusive | 0.183104 -> 0.205301 | 0.209141 -> 0.214603 |
+
+The primary conversion deletion is real. Its0.686986/0.246880ms saving is
+substantially or completely offset by the larger solve. Mutually exclusive
+native bodies reserve additive shared storage:13,184B versus4,340B, with
+89 versus82 registers and no local spills. GB phase0 has no hybrid worlds,
+yet the original-branch general duration rises48.677 to71.979us. This
+supports investigating execution/resource overhead but does not establish
+an occupancy or stall attribution. Hardware counters remain unavailable.
+
+### Actual recurring-work census
+
+A separate untimed diagnostic inserts only integer observations into both
+native paths. Removing the marked observations recovers the original source
+exactly. Its changed register count means its durations are not performance
+evidence. Both variants pass the same current-order original-eight gate on
+both GPUs, two tests per card and no skips/errors. The actual first solve
+still supplies the second call's state. No cost runner imports the counters.
+
+| Coupled world | Sweeps, original/candidate | Dense visits | Zero-normal, zero-tangent-pair visits |
+| --- | ---: | ---: | ---: |
+| RTX4930, each phase | 8 / 8 | 392 | 224 (57.14%) |
+| RTX10325, each phase | 3 / 3 | 108 | 66 (61.11%) |
+| GB8730, phase1 | 8 / 8 | 304 | 160 (52.63%) |
+
+The independent-world sweep histograms also match in this census. There is
+no observed sweep inflation here. These tangent observations occur after
+the original friction/denominator gates and before residual/impulse work;
+they identify actually visited work, not an apparent inactive-row fraction.
+All coupled MF updates are zero in these particular inputs, which does not
+authorize removing MF coupling, its current inverse, or rigid-limit laws.
+
+This is new evidence for one compact-coupled recurrence experiment: retain
+the existing offset/triplet dense loop, perform current MF and stateless
+rigid limits inside each sweep, and share mutually exclusive scratch space.
+The proposed existing-materializer bridge converts only the six secondary
+columns, preserving primary Z and the original diagonal. Its bridge,
+fallback, qualification, state publication and joins must all be charged.
+With other costs fixed, a1ms RTX net saving needs joined solve at most
+1.349661ms, versus2.113941ms in this coupled prototype. Avoidable visits
+are not proportional wall-time savings. GB cannot offer1ms from this scope
+even at the optimistic exposed floor. No compact successor is timed yet.
+
+The contact-triplet1.08x above is **prototype-to-prototype**, not improvement
+over accepted Newton. No additional whole-task gain is accepted in this
+24-hour window at this checkpoint; all accepted task tables remain unchanged.
+This coupled correction alone cannot close the full2x-handoff budget.
+
+The compact correction is authorized at04:03 UTC, with native review targeted
+at04:35 and an initial90-minute checkpoint at05:33. The actual gate uses a
+fresh companion original control, not an assumed transfer of these timings.
+Decision: `/tmp/fpgs-kuka-hybrid-cause-AA6yvh5h/CENSUS_DECISION.md`, SHA256
+`b1036cff05115f084be3cc1e6c2cf2848629ebbbc09ed73671707f61233cc850`.
+
+The separate typed-collision layout remains NO-GO for implementation: fresh
+RTX replaceable CSR/count/MF scope is1.199508ms, leaving only0.199508ms
+for every writer/replacement service to save1ms. Retaining current MF
+inverse/action alone spends0.194325ms. A new W-by32 reservation is rejected;
+existing storage can be reused only with all readers and fallback generation
+handling redesigned. Source feasibility is not sufficient timing evidence.
+Updated budget: `/tmp/fpgs-kuka-collision-layout-JRnnqo/FRESH_BUDGET.md`,
+SHA256 `746ed2dc74d551fdd0713831357a2082a98ef588cc18722774092054fbbfbe60`.
+
+Evidence roots and SHA256:
+
+- Coupled physical:
+  `/tmp/fpgs-kuka-hybrid-boundary-physical-paired16k-20260913-01`, manifest
+  `05a9243b2a6e20b08c5060f01b9d7bbc179894db47b83beb49d06577e75b2396`.
+- Coupled cost:
+  `/tmp/fpgs-kuka-hybrid-fresh-boundary-cost-paired16k-20260913-01`, manifest
+  `7ce7c31a75106e65b9ac288706b5a19a146268f4f45e1b42ecb1c0f1faa4bd4b`.
+- Fresh baseline node reader:
+  `/tmp/fpgs-kuka-fresh-baseline-nodes-VaV6hzef/evidence01.json`,
+  `cba4ec1995f7272bad0c897561a2d77508b6a91565fe12c681f1b1fe579d5418`.
+- Fresh coupled node reader:
+  `/tmp/fpgs-kuka-fresh-hybrid-nodes-48JhGLsw/evidence01.json`,
+  `07ea429e563ac909a649642ebd7f5362ad00b840de5cf32e3af40760995233e5`.
+- Queued physical:
+  `/tmp/fpgs-kuka-active-queue-physical-paired16k-20260913-01`, manifest
+  `65f62330bf302a299f5c1e2f7f3a944eb16ed6aca784d3570fe8707f4bbb7efe`.
+- Queued original/coupled cost parents:
+  `/tmp/fpgs-kuka-queued-fresh-boundary-cost-paired16k-20260913-01`, manifest
+  `99970df93f6e2f2adb97507e6947d27a4ac4d0f5ccc6d21d261fa48bc783c93e`;
+  `/tmp/fpgs-kuka-queued-hybrid-fresh-boundary-cost-paired16k-20260913-01`,
+  `7c4841b22522cddb344e2195518cf2147cc3abc564718829232eac2662c0a3c8`.
+- Actual sweep census:
+  `/tmp/fpgs-kuka-sweep-diagnostic-paired16k-20260913-01`, manifest
+  `d5b1a6a2c4ec2431ffc97ec98843f1d5b9d14eacfab7fb3575c3f808652a462b`;
+  RTX/GB driver logs respectively
+  `f976643c915d582a98156f917df4c93c05fbe5f1547a49ce68c1638c50ebe235` /
+  `4ddfc702096ed70deaa21f4da3a1665e50e663778fb5c04cfe25ad657d28a24d`.
+- Source/PTX cause and conditional compact design:
+  `/tmp/fpgs-kuka-hybrid-cause-AA6yvh5h/NOTE.md`,
+  `45470c3528dfb80d06c0b78af1ba9858392b298203c4fb85b3d18c741ad5db81`.
