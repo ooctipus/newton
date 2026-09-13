@@ -103,3 +103,58 @@ is complete and reaped; both GPUs are idle and source guards pass. SHA256:
 - Types: `cb4077d182a021399fb15c747501f111981fd06d72dc0f89ba2e96d0c0a2bf85`.
 - Independent tests: `8b291190096eb499f95af86d3c7e8ab616278b81811d280f9a11cb398ff84f00`.
 - Explicit source/input inventory: scratch `pins_predictor01.json`.
+
+## Generated-state and kinetic-core checkpoint, 00:50 UTC
+
+The current/next state producer passes its actual CUDA physical and graph test
+on both cards. The connected producer/refresh/predictor/finish chain then passes
+two actual CUDA tests per card, including changed forcing on the newly produced
+second state and two independently captured graph replays. These checks do not
+qualify contact convergence or a live cache/reset protocol.
+
+The first **kinetic-core-only lower-bound** timing uses actual historical16384
+world archives, not repeated512 worlds. Each event contains two physical calls:
+native primary refresh, current force/predictor and complete next-state producer
+for each call; the second finish also produces next geometric coefficients.
+Ten warmups precede40 measured graph replays, with every mutable seed restored
+outside events. Event times are multiplied by4 for eight-call environment
+equivalents. Both cards pass exact replay, all65 mutable/100 readonly array
+ownership checks, physical-source pins and final process/idle guards.
+
+| Hardware | Median core ms/env equivalent | Min–max |
+| --- | ---: | ---: |
+| RTX PRO6000 | 2.662528038 | 2.654336–2.678912 |
+| GB300 | 2.322815895 | 2.314496–2.335104 |
+
+**Not a whole-physics gain.** Contacts, allocation, dense rows/eight sweeps,
+MF, retained free-factor refresh, callbacks and cold repair are excluded.
+Initial warm current construction is setup, but both next-state producers
+are charged. Free6 still uses the captured held operator. The captures are
+historical full-state fixtures, not today's active-row capture distribution.
+This experiment prices an architectural portion; it is not matched live A/B.
+
+Against the planning allowance4.172948ms, the RTX core consumes2.662528ms,
+leaving1.510420ms for the remaining replacement work and required accounting.
+That is a tight **necessary budget**, not a prediction that2x will be achieved.
+Accepted Kuka and Franka performance numbers remain unchanged.
+
+Reproduction uses the root paired owner
+`/tmp/fpgs-capacity-20260911-O7dqFC/run_pair.py` and scratch
+`run_core_cost.py`, with `pins_core_cost01.json` and the completed chain physical
+manifest supplied explicitly. All runs use clean accepted Newton50dfa28d and
+the unchanged Lab environment. Completed/reaped artifact parents and SHA256:
+
+- State physical: `/tmp/fpgs-kuka-demand-state-physical-paired512-20260913-01`,
+  manifest `59c39eab60a9315cbf11fb3d8fc83a85f135c9bb519bc618e0b5f97086df9735`.
+- Chain physical: `/tmp/fpgs-kuka-demand-chain-physical-paired512-20260913-01`,
+  manifest `c07ffc5c283e9e3c2a8b60ad41cbd76944f745a3eba0d52fffaf21cd8a633496`.
+- Core cost: `/tmp/fpgs-kuka-demand-core-cost-paired16k-20260913-01`,
+  manifest `dcb292f58163681fdbcc28ce0a1e0c1381ceae74f79976d928445bc9f0a10dc6`.
+- RTX cost audit: `c328b0e3e2bc1ff060ff7e4efec7424f9724a06607a4f2e874e7240ec63df8ee`.
+- GB cost audit: `4c39163a1d731158162e7c8823acce676995d136c67e47dfc9b7fd87c4d9241f`.
+
+Direct current contact rows and the offset-eight consumer are next. The first
+row CPU smoke produces17741 dense rows with exact original prefix bounds and
+no missing used rows; independent physical row checks are still pending at
+this checkpoint. Saved raw allocation routes are explicitly external controls
+until the retained allocator is connected. No saved J/Z/RHS feeds the candidate.
