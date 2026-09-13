@@ -338,28 +338,45 @@ class TestSparseFactorCUDA(unittest.TestCase):
         with patch.dict(os.environ, {"FEATHER_PGS_SPARSE_FACTOR": "1", "FEATHER_PGS_SINGLE_FACTOR": "0"}):
             candidate = SolverFeatherPGS(m, **options)
         self.assertIsNotNone(candidate._sparse_factor)
-        a = m.state()
-        b = m.state()
+        original_states = [m.state(), m.state()]
+        candidate_states = [m.state(), m.state()]
+        original_states[0].assign(state)
+        candidate_states[0].assign(state)
         control = m.control()
         held = None
         for epoch in range(2):
-            original.step(state, a, control, contacts, 0.0025)
-            candidate.step(state, b, control, contacts, 0.0025)
+            src, dst = epoch % 2, (epoch + 1) % 2
+            original.step(original_states[src], original_states[dst], control, contacts, 0.0025)
+            candidate.step(candidate_states[src], candidate_states[dst], control, contacts, 0.0025)
             candidate.check_constraint_capacity()
-            np.testing.assert_allclose(b.joint_qd.numpy(), a.joint_qd.numpy(), rtol=3e-4, atol=3e-5)
-            np.testing.assert_allclose(b.joint_q.numpy(), a.joint_q.numpy(), rtol=3e-5, atol=3e-6)
+            np.testing.assert_allclose(
+                candidate_states[dst].joint_qd.numpy(), original_states[dst].joint_qd.numpy(), rtol=3e-4, atol=3e-5
+            )
+            np.testing.assert_allclose(
+                candidate_states[dst].joint_q.numpy(), original_states[dst].joint_q.numpy(), rtol=3e-5, atol=3e-6
+            )
             W = candidate._sparse_factor.data.W.numpy().copy()
             if epoch:
                 self.assertTrue(np.array_equal(W, held))
             held = W
-        # Two fixed calls retain refresh/reuse and original public integration.
+        # Both owners continue their own produced states. Each graph's second
+        # output is its first input, so every replay advances two more steps.
+        with wp.ScopedCapture(device="cuda:0") as original_capture:
+            original.step(original_states[0], original_states[1], control, contacts, 0.0025)
+            original.step(original_states[1], original_states[0], control, contacts, 0.0025)
         with wp.ScopedCapture(device="cuda:0") as capture:
-            candidate.step(state, b, control, contacts, 0.0025)
-            candidate.step(b, a, control, contacts, 0.0025)
+            candidate.step(candidate_states[0], candidate_states[1], control, contacts, 0.0025)
+            candidate.step(candidate_states[1], candidate_states[0], control, contacts, 0.0025)
         for _ in range(3):
+            wp.capture_launch(original_capture.graph)
             wp.capture_launch(capture.graph)
-        candidate.check_constraint_capacity()
-        self.assertTrue(np.isfinite(a.joint_qd.numpy()).all())
+            candidate.check_constraint_capacity()
+            np.testing.assert_allclose(
+                candidate_states[0].joint_qd.numpy(), original_states[0].joint_qd.numpy(), rtol=3e-4, atol=3e-5
+            )
+            np.testing.assert_allclose(
+                candidate_states[0].joint_q.numpy(), original_states[0].joint_q.numpy(), rtol=3e-5, atol=3e-6
+            )
         self.assertEqual(candidate.J_world.shape, (1, 1, 1))
         self.assertIsNone(candidate._memset_stream)
 
