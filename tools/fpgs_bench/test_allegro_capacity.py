@@ -70,6 +70,14 @@ class TestCompactArguments(unittest.TestCase):
         with self.assertRaises((RuntimeError, FileNotFoundError)):
             capacity.verify_sources(Path(__file__).parent)
 
+    def test_fixed_backend_pin_excludes_old_manager(self):
+        """Accept reviewed fixed53ee without silently timing the old reset path."""
+        fixed = Path("/home/octi/Projects/IsaacLab.wt/contact-reset-20260913")
+        old = Path("/home/octi/Projects/IsaacLab.wt/fpgs-opt-20260910")
+        capacity.verify_sources(fixed, capacity.LAB_PINS)
+        with self.assertRaisesRegex(RuntimeError, "newton_manager.py"):
+            capacity.verify_sources(old, capacity.LAB_PINS)
+
     def test_actual_recipe_forwarding_fpgs_only(self):
         """Use the source-pinned Lab recipe, without loading or running simulation."""
         lab = Path("/home/octi/Projects/IsaacLab.wt/fpgs-opt-20260910")

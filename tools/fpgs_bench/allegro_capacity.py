@@ -25,7 +25,10 @@ PINS = {
 }
 LAB_PINS = {
     "source/isaaclab_newton/isaaclab_newton/physics/feather_pgs_manager.py": "31bea42769931529365a1f067049fa577b91719923795214dda69e819e8125c3",
-    "source/isaaclab_newton/isaaclab_newton/physics/newton_manager.py": "218fd3c4ff0216fa9bd6911d08b739d12bba47cc9c90d3a834687717e545707c",
+    # Fixed53ee adds immediate model-write notification only; the default-None
+    # collision/constructor capacity contract is unchanged. The fixed-backend
+    # launch owner separately verifies actual imports and all reset-fix files.
+    "source/isaaclab_newton/isaaclab_newton/physics/newton_manager.py": "ca0338ee48ed8c5a04fc7b697c897232ec4a92364b1e27a7a8e57153a12712cd",
 }
 
 
