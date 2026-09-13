@@ -610,6 +610,7 @@ class TestBranchResponse(unittest.TestCase):
         graphs = []
         for which in range(2):
             with wp.ScopedCapture(device=device) as capture:
+                solvers[which].seed_double_buffer_events()
                 one(which, 0)
                 one(which, 1)
             graphs.append(capture.graph)

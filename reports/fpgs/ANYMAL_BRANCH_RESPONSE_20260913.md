@@ -200,3 +200,13 @@ runtime arithmetic or physical tolerance changes accompany this correction.
 The repeated three-selector pair uses the existing `--fpgs` original GROUP16,
 ROWS_MASKED1/X4 setup for the small grouped constructor; it must also exit
 normally before acceptance. No automatic complete timing follows a failure.
+
+Pair02 (`/tmp/fpgs-anymal-branch-physical-paired-20260913-02`) passed both
+saved-input controls and the actual constructor/eager publication, large-row
+producer and held-reuse checks on both cards. Its first baseline graph capture
+failed with CUDA905 (uncaptured stream dependency), followed by901; both child
+exits were normally1, not139. The test omitted the original documented
+`seed_double_buffer_events()` call inside capture. Actual unchanged
+`FeatherPGSManager._prepare_cuda_graph_capture` already makes that call. The
+test-only correction adds it for both original and candidate (a no-op for the
+retired candidate memset owner). No runtime or physical comparison is changed.
