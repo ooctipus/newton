@@ -116,3 +116,45 @@ offset-coordinate GS and physical decode so the diagnosed response cause is
 isolated. No inverse, new persistent buffer, capacity change, iteration change,
 or Lab edit. The original library prototype remains available as a diagnostic
 control. Native tests and integrated timing are pending for this correction.
+
+## Native correction: measurable but below the structural milestone
+
+At `a4093d57`, all four physical/graph tests again passed on each GPU, zero
+skips (`/tmp/fpgs-g1-single-factor-tests-paired-20260913-03`). The next clean
+paired live A/B completed at
+`/tmp/fpgs-g1-single-factor-live-paired16k-20260913-02`, with all original
+capacity/import/budget/finite/source/idle checks passing:
+
+| Whole physics | RTX ms | GB300 ms |
+|---|---:|---:|
+| Original 50dfa | 43.409484 | 72.285541 |
+| Native forward-only | 41.665184 | 70.348522 |
+| Original / candidate | 1.041865x | 1.027535x |
+
+These are one-round discovery results, not accepted performance or proof of
+actual-task convergence. They fall short of the 10% whole-physics milestone;
+no new accepted MJWarp ratio is claimed. The baseline comparison is against
+accepted FPGS, not against the slower first prototype.
+
+The follow-up three-step node capture uses the matching 200 warm / 40 wall
+schedule, unchanged capacity/budgets, and shows response 4.869476 / 5.522732 ms,
+decode 1.143821 / 1.281173 ms, and GS 7.776190 / 8.748587 ms (RTX / GB). New
+response uses 48 registers, 7,908 static shared bytes, one block/world; all
+eight old response/diagonal calls are retired. This diagnoses why the targeted
+correction helped and why most of its saving was consumed by offset-GS
+initialization and physical decoding. The complete changed boundary's exclusive
+cost is 13.787257 / 15.547852 ms versus original 15.556000 / 17.660330 ms.
+
+Raw nodes: `/tmp/fpgs-g1-single-factor-candidate-nodes-paired16k-20260913-02`.
+The original auxiliary-root analyzer failure is preserved; both simulations
+and capacity checks pass. The same process-correlated audited reader with only
+explicit native owner-name mapping is `audit_native.py` under the existing
+`/tmp/fpgs-g1-single-factor-node-owner-00CzJ8nG` directory. Root independently
+rechecked the full source guard and paired compute-idle after parent reap.
+
+The candidate remains default-off and experimental. Do not spend this window
+on tile sweeps to promote a few percent: any further work must remove the
+remaining representation conversions or a complete substantially larger owner.
+Terrain collision has a separately funded, physically tested candidate; shared
+collision improvements still require a new MJWarp denominator. A host admission
+regression additionally rejects partial-warp block sizes before native dispatch.

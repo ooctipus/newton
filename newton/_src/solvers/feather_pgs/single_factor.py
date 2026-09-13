@@ -22,6 +22,8 @@ def supported(solver) -> bool:
         and tuple(solver.size_groups) == (43,)
         and solver.max_world_dofs == 43
         and solver.n_arts_by_size[43] == solver.world_count
+        and solver.tile_threads >= 32
+        and solver.tile_threads % 32 == 0
         and solver._execution_plan.use_tiled_hinv_jt(43)
         and not solver._execution_plan.use_diagonal_mass(43)
         and solver._is_one_solve_art_per_world

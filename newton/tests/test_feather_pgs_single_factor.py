@@ -23,6 +23,7 @@ def supported_solver():
         max_world_dofs=43,
         size_groups=(43,),
         n_arts_by_size={43: 4},
+        tile_threads=128,
         _execution_plan=SimpleNamespace(use_tiled_hinv_jt=lambda size: True, use_diagonal_mass=lambda size: False),
         _is_one_solve_art_per_world=True,
         _has_free_rigid_bodies=False,
@@ -80,6 +81,8 @@ class TestSingleFactorAdmission(unittest.TestCase):
             ("_paired_factor_coordinates", True),
             ("_propagation_contacts_enabled", lambda: True),
             ("max_world_dofs", 29),
+            ("tile_threads", 16),
+            ("tile_threads", 33),
             ("_execution_plan", SimpleNamespace(use_tiled_hinv_jt=lambda size: False)),
             (
                 "_execution_plan",
