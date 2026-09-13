@@ -71,6 +71,25 @@ def verify_pins(pins):
             raise ValueError("Changed source pin: " + path)
 
 
+def owned_virtual_module(root, pins, name, module):
+    """Recognize only the two virtual objects created by pinned solvers.py."""
+    owner = sys.modules.get("newton.solvers")
+    fields = vars(owner) if owner is not None else {}
+    source = root / "newton/solvers.py"
+    if fields.get("__file__") is None or Path(fields["__file__"]).resolve() != source or str(source) not in pins:
+        return False
+    namespace = fields.get("experimental")
+    if namespace is None:
+        return False
+    if name == "newton.solvers.experimental":
+        return module is namespace and vars(namespace).get("__path__") == []
+    return (
+        name == "newton.solvers.experimental.coupled"
+        and module is vars(namespace).get("coupled")
+        and type(module) is fields.get("_LazyCoupledModule")
+    )
+
+
 def verify_imports(root, pins, *, lab, backend_lab=None, require_backend=False):
     """Bind owned packages to selected sources, allowing external dependencies."""
     root, lab = Path(root).resolve(), Path(lab).resolve()
@@ -83,12 +102,16 @@ def verify_imports(root, pins, *, lab, backend_lab=None, require_backend=False):
     }
     found = {}
     for name, module in tuple(sys.modules.items()):
-        filename = getattr(module, "__file__", None)
+        # Do not invoke a lazy module's __getattr__ merely to audit its origin.
+        fields = vars(module) if module is not None else {}
+        filename = fields.get("__file__")
+        if not filename and owned_virtual_module(root, pins, name, module):
+            continue
         for package, selected in package_roots.items():
             if name == package or name.startswith(package + "."):
                 # Namespace packages have no __file__; every search location
                 # must still belong to the selected package, not a mixed tree.
-                origins = ([filename] if filename else []) + list(getattr(module, "__path__", ()))
+                origins = ([filename] if filename else []) + list(fields.get("__path__", ()))
                 if not origins or any(not Path(origin).resolve().is_relative_to(selected) for origin in origins):
                     raise ValueError("Mixed " + package + " import: " + repr(origins))
                 break

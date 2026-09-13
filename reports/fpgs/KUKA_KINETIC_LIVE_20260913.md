@@ -164,3 +164,19 @@ bookkeeping/dilation and the later synchronization correction are not measured.
 The old GB section is already above its corresponding 10% ceiling. Thus this
 candidate has a narrow RTX milestone hypothesis, not an established 10% gain
 on both cards. It does not by itself reach 2x-handoff or 4x-MJ whole physics.
+
+### First actual probe attempt: import guard, before physics
+
+`/tmp/fpgs-kuka-kinetic-live-eager-paired512-20260913-01` failed on both cards
+before task construction. Its audits preserve `success=false`, `complete=false`
+and `source_guard_pass=true`. The guard rejected the fileless
+`newton.solvers.experimental` namespace that the pinned `newton/solvers.py`
+deliberately constructs. This is not a native solver or numerical failure.
+
+The runner-only successor inspects module dictionaries without triggering lazy
+imports. It permits only the exact experimental namespace and coupled proxy
+objects owned by the selected pinned `newton.solvers`; arbitrary/mixed fileless
+namespaces still fail. An actual full Solver import reproduced the old failure
+before this correction, and a forged-namespace control remains rejected. The
+same physical and failure-audit requirements are retained for attempt02. No
+native, binding, lifecycle, Lab, budget or tolerance changes are made.

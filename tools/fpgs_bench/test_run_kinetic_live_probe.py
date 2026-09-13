@@ -27,6 +27,23 @@ def module_at(name, filename=None, *, search_paths=None):
 
 
 class TestRunKineticLiveProbe(unittest.TestCase):
+    def test_actual_newton_import_and_owned_virtual_namespaces(self):
+        """The real selected import passes without activating its lazy proxy."""
+        from newton import solvers  # noqa: PLC0415 -- exercise the actual guarded import
+
+        runner.importlib.import_module("newton._src.solvers.feather_pgs.solver_feather_pgs")
+        root = Path(runner.__file__).resolve().parents[2]
+        namespace = vars(solvers)["experimental"]
+        coupled = vars(namespace)["coupled"]
+        pins = {
+            str(path): "pinned"
+            for folder in (root / "newton", root / "tools/fpgs_bench")
+            for path in folder.rglob("*.py")
+        }
+        runner.verify_imports(root, pins, lab=Path("/selected/lab"))
+        self.assertIs(sys.modules["newton.solvers.experimental"], namespace)
+        self.assertIs(vars(namespace)["coupled"], coupled)
+
     def test_fixed_backend_with_original_core_and_tasks(self):
         """Select the fixed backend without replacing the task/core checkout."""
         root, lab, backend = Path("/selected/newton"), Path("/selected/lab"), Path("/selected/fixed-lab")
@@ -44,6 +61,17 @@ class TestRunKineticLiveProbe(unittest.TestCase):
         with patch.dict(sys.modules, modules, clear=True):
             with self.assertRaisesRegex(ValueError, "Mixed isaaclab_newton"):
                 runner.verify_imports(root, {}, lab=lab, backend_lab=backend)
+
+    def test_forged_virtual_namespace_is_rejected(self):
+        """A matching virtual name is insufficient without exact owner identity."""
+        root = Path("/selected/newton")
+        owner = module_at("newton.solvers", root / "newton/solvers.py")
+        owner.experimental = module_at("newton.solvers.experimental", search_paths=[])
+        forged = module_at("newton.solvers.experimental", search_paths=[])
+        modules = {"newton.solvers": owner, "newton.solvers.experimental": forged}
+        with patch.dict(sys.modules, modules, clear=True):
+            with self.assertRaisesRegex(ValueError, "Mixed newton"):
+                runner.verify_imports(root, {str(root / "newton/solvers.py"): "pinned"}, lab=Path("/lab"))
 
     def test_foreign_probe_helper_is_rejected(self):
         """An otherwise pinned foreign helper cannot bypass Newton selection."""
