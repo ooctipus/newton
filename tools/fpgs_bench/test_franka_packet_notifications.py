@@ -18,6 +18,7 @@ from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 def fixture():
     """Bind the real notification method to observable existing refresh owners."""
     solver = SimpleNamespace(
+        _allegro_kinetic_rows=None,
         _fk_id_cache_enabled=True,
         _fk_id_cache_valid=Mock(),
         _update_kinematic_state=Mock(),

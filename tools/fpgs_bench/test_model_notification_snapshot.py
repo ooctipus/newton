@@ -44,6 +44,7 @@ def notification_solver(*, kinetic=True):
     solver = SimpleNamespace(
         model=model,
         _row_packets=None,
+        _allegro_kinetic_rows=None,
         _kinetic_world=None,
         _fk_id_cache_enabled=False,
         _update_kinematic_state=lambda: publications.append("kinematic"),

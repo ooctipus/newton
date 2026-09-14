@@ -1744,6 +1744,13 @@ class CollisionPipeline:
             reset invalidates all buckets). An unreported reset cannot reuse
             a cached witness as a contact answer. Optional diagnostic counters
             use ``NEWTON_NARROW_PHASE_COHERENT_STATS=1``; keep them off for timing.
+
+            Experimental NEWTON_NARROW_PHASE_CONVEX_CELLS=1 replaces the four
+            rejection-route support owners with immutable direction-cell
+            candidates for validated cooked hulls. Unsupported inputs retain
+            original scans and primitive policies. Call invalidate_convex_cells
+            before point/topology edits or refits; rebuild and recapture to
+            re-enable. Poses/scales remain live.
         """
         if isinstance(reduce_contacts, (bool, np.bool_)):
             reduction_config = self.ContactReductionConfig(mesh=bool(reduce_contacts))
@@ -1808,6 +1815,10 @@ class CollisionPipeline:
             raise ValueError("NEWTON_NARROW_PHASE_PAIR_SHAPE_PREP must be 0 or 1")
         self._pair_shape_prep = pair_shape_prep == "1"
         self.prepared_shape_indices = None
+        convex_cells = os.environ.get("NEWTON_NARROW_PHASE_CONVEX_CELLS", "0")
+        if convex_cells not in ("0", "1"):
+            raise ValueError("NEWTON_NARROW_PHASE_CONVEX_CELLS must be 0 or 1")
+        self._convex_cells = None
         coherent_convex = os.environ.get("NEWTON_NARROW_PHASE_COHERENT_CONVEX", "0")
         coherent_stats = os.environ.get("NEWTON_NARROW_PHASE_COHERENT_STATS", "0")
         if coherent_convex not in ("0", "reject_only") or coherent_stats not in ("0", "1"):
@@ -1816,6 +1827,8 @@ class CollisionPipeline:
             )
         if coherent_stats == "1" and coherent_convex == "0":
             raise ValueError("coherent convex diagnostics require NEWTON_NARROW_PHASE_COHERENT_CONVEX=reject_only")
+        if convex_cells == "1" and coherent_convex != "reject_only":
+            raise ValueError("experimental convex cells require the complete rejection-only owner")
 
         # Resolve rigid contact capacity with explicit > model > estimated precedence.
         model_rigid_contact_max = int(getattr(model, "rigid_contact_max", 0) or 0)
@@ -2260,6 +2273,16 @@ class CollisionPipeline:
             self.narrow_phase._coherent_query_kernels = _create_rejection_query_kernels(
                 diagnostics=coherent_stats == "1"
             )
+            if convex_cells == "1":
+                from ..geometry.convex_cells import _CellOwner  # noqa: PLC0415
+                from ..geometry.convex_cells_factories import coherent_kernels, manifold_kernel  # noqa: PLC0415
+
+                owner = _CellOwner(model)
+                if owner.metadata["admitted_meshes"]:
+                    self._convex_cells = owner
+                    self.narrow_phase._cells_owner = owner
+                    self.narrow_phase._coherent_query_kernels = coherent_kernels(diagnostics=coherent_stats == "1")
+                    self.narrow_phase.narrow_phase_manifold_kernel = manifold_kernel(self.narrow_phase)
 
         # Built here (not in finalize) so models/tasks that never collide don't pay for it.
         # Host-side, so not graph-capture-safe -- construct the pipeline before any capture.
@@ -2391,6 +2414,20 @@ class CollisionPipeline:
         self._body_pair_reduction_capture_tokens.discard(token)
         if not self._body_pair_reduction_capture_tokens:
             self._captured_contacts = None
+
+    def invalidate_convex_cells(self):
+        """Disable experimental direction cells before editing or refitting mesh geometry.
+
+        Call outside capture and order this operation before geometry writes on
+        every participating stream. Keep model and pipeline alive with their
+        graphs. Existing graphs then use original support scans; rebuild and
+        recapture to re-enable. Current poses and scales remain live.
+        """
+        if self._convex_cells is not None:
+            if self.model.device.is_capturing:
+                raise RuntimeError("Cell geometry invalidation must occur outside capture")
+            self._convex_cells.invalidate()
+            self.narrow_phase._coherent_cache.reset()
 
     def refresh_body_pair_reduction_groups(self):
         """Rebuild material-equivalence reduction groups from current materials.
