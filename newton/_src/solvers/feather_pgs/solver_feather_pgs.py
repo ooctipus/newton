@@ -17,6 +17,7 @@ import json
 import math
 import os
 import re
+import sys
 import time
 import warnings
 from contextlib import contextmanager
@@ -5262,6 +5263,11 @@ class SolverFeatherPGS(SolverBase):
 
     def _init_tiled_kernels(self, model):
         """Resolve size-specialized Warp kernels once for this solver shape."""
+        self._register_gram = os.environ.get("FEATHER_PGS_REGISTER_GRAM") == "1"
+        if self._register_gram:
+            from .register_gram import validate_solver  # noqa: PLC0415 - opt-in experimental owner
+
+            validate_solver(self, sys.modules[__name__])
         device_arch = model.device.arch
         self._cholesky_kernels_by_size = {}
         self._crba_cholesky_kernels_by_size = {}
@@ -5699,6 +5705,13 @@ class SolverFeatherPGS(SolverBase):
             self._pgs_solve_mf_gs_incremental_kernels = []
             self._ink_sizes = self._build_inkernel_response_meta() if (parallel_rows > 0 and _INK_ON) else None
             self._ink_rows = int(parallel_rows)
+            parallel_factory = _get_pgs_solve_parallel_kernel
+            if self._register_gram:
+                from .register_gram import get_parallel_factory  # noqa: PLC0415 - opt-in experimental owner
+
+                if self._ink_sizes != (18, 0, 0, 0) or parallel_rows != 48:
+                    raise ValueError("Register Gram requires a complete single18-coordinate world plan")
+                parallel_factory = get_parallel_factory(parallel_factory)
             if _WR_ON and self._ink_sizes is not None:
                 self._wr_world_contacts = wp.empty(
                     (self.world_count, int(self.dense_max_constraints)), dtype=wp.int32, device=model.device
@@ -5724,7 +5737,7 @@ class SolverFeatherPGS(SolverBase):
                     self._tier_blocks = int(min(self.world_count, _TIER_BLOCKS))
                 for tier_index, (rows_, min_rows_) in enumerate(tiers):
                     self._pgs_solve_mf_gs_incremental_kernels.append(
-                        _get_pgs_solve_parallel_kernel(
+                        parallel_factory(
                             self.dense_max_constraints,
                             self.mf_max_constraints,
                             self.max_world_dofs,
