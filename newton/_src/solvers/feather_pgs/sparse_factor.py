@@ -514,17 +514,20 @@ class SparseFactor:
         )
 
         self.solver, self.plan, self.host = solver, plan, host
+        w, c, device = solver.world_count, solver.dense_max_constraints, solver.model.device
+        self.packet_rows = os.environ.get("FEATHER_PGS_SPARSE_PACKETS") == "1" and c == 100
+        self.block_contacts = os.environ.get("FEATHER_PGS_SPARSE_CONTACT_BLOCK") == "1"
+        self.metric_tangents = os.environ.get("FEATHER_PGS_SPARSE_METRIC_TANGENTS") == "1" and c == 100
+        if self.metric_tangents and (self.packet_rows or self.block_contacts):
+            raise ValueError("Sparse metric tangents, packets and contact-block rows are mutually exclusive")
         self.level_update = os.environ.get("FEATHER_PGS_SPARSE_LEVEL_UPDATE") == "1"
         if self.level_update:
             for name, values in _level_update_schedule(host["index"]).items():
                 setattr(plan, name, wp.array(values, dtype=int, device=solver.model.device))
         self.data = SparseData()
-        w, c, device = solver.world_count, solver.dense_max_constraints, solver.model.device
         self.data.W = wp.empty((w, 434), dtype=float, device=device)
         self.data.valid = wp.zeros(w, dtype=int, device=device)
         self.data.status = wp.zeros(w, dtype=int, device=device)
-        self.packet_rows = os.environ.get("FEATHER_PGS_SPARSE_PACKETS") == "1" and c == 100
-        self.block_contacts = os.environ.get("FEATHER_PGS_SPARSE_CONTACT_BLOCK") == "1"
         if self.packet_rows and self.block_contacts:
             raise ValueError("Sparse packets and contact-block rows are mutually exclusive")
         self.parallel_limit_prefix = os.environ.get("FEATHER_PGS_SPARSE_PARALLEL_LIMITS") == "1" and c == 100
@@ -538,7 +541,7 @@ class SparseFactor:
             refresh=get_refresh_kernel(self.level_update),
             predictor=get_predictor_kernel(),
             contacts=get_contact_kernel(),
-            solve=get_solve_kernel(c, self.block_contacts),
+            solve=get_solve_kernel(c, self.block_contacts, metric_tangents=self.metric_tangents),
         )
         # Drop canonical matrix/row storage only after complete constructor admission.
         # Dummy shapes make accidental readers fail visibly, not reinterpret packed W/Z.

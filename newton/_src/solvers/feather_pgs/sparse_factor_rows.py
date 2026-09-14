@@ -533,7 +533,7 @@ def _contact_block_fragments(capacity: int):
 
 
 @cache
-def get_solve_kernel(capacity: int, block_contacts: bool = False):
+def get_solve_kernel(capacity: int, block_contacts: bool = False, *, metric_tangents: bool = False):
     """Apply original current-friction GS and decode the complete43 velocity."""
     source = f"""
 #if defined(__CUDA_ARCH__)
@@ -608,8 +608,15 @@ def get_solve_kernel(capacity: int, block_contacts: bool = False):
     for(int r=lane;r<count;r+=32)impulses.data[base+r]=lam[r];
 #endif
 """
-    if block_contacts:
-        setup, update = _contact_block_fragments(capacity)
+    if metric_tangents and (block_contacts or capacity != 100):
+        raise ValueError("Sparse metric tangents require the exclusive capacity100 owner")
+    if block_contacts or metric_tangents:
+        if metric_tangents:
+            from .sparse_metric_tangents import get_fragments  # noqa: PLC0415
+
+            setup, update = get_fragments(capacity)
+        else:
+            setup, update = _contact_block_fragments(capacity)
         setup_anchor = "    for(int iteration=0;iteration<iterations;++iteration) {"
         update_anchor = "            if(type==2 && iteration<friction_start)"
         assert source.count(setup_anchor) == source.count(update_anchor) == 1
@@ -670,7 +677,8 @@ def get_solve_kernel(capacity: int, block_contacts: bool = False):
             vout,
         )
 
-    solve.__name__ = solve.__qualname__ = (
-        f"sparse_contact_block43_s18_c{capacity}" if block_contacts else f"sparse_factor_gs43_s18_c{capacity}"
+    name = (
+        "sparse_metric_tangent" if metric_tangents else "sparse_contact_block" if block_contacts else "sparse_factor_gs"
     )
+    solve.__name__ = solve.__qualname__ = f"{name}43_s18_c{capacity}"
     return wp.kernel(enable_backward=False, module="unique")(solve)
