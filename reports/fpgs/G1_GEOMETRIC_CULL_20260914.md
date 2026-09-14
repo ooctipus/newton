@@ -91,3 +91,60 @@ same current admission guards on the GPU; the latter audits original callbacks
 for all actual omitted triangles, not a diagnostic mask oracle. Reuse the
 existing accepted loaded support/tilt/sliding/border qualification under the
 explicit new flag for the physical dynamics gate.
+
+## Native and repeated whole result, 12:22 UTC
+
+Frozen runtime `7790c35b348dd1885a90f6c2def9b336cde80399` passes the four
+original/current physical selectors on each GPU with no skips or failures.
+All 28 original loaded-support/rebound checks also pass. Artifact:
+`/tmp/fpgs-g1-geometric-cull-physical-paired-20260914-01`, manifest SHA256
+`1810c0d55e34f25f64dc4dc04461dd31f0c877d7dfcd8baa1d7465ffb93269ce`.
+The actual welded-reducer callback audits inspect every emitted callback at
+both current poses, not just a selected saved subset; minimum omitted slack
+above the complete current shell/beta bound is 3.163 mm.
+
+The original paired 16,384-world protocol keeps Lab, timestep, substeps,
+iteration allowances, warmup, current contact capacity and timing ownership
+unchanged. Three complete FPGS A/B rounds have no source, capacity or idle
+guard failures. The two alternating repeat rounds give:
+
+| Whole FPGS physics | Before | Cull enabled | Speedup |
+| --- | ---: | ---: | ---: |
+| RTX PRO 6000 | 19.4992 ms | 18.1763 ms | 1.0728x |
+| GB300 | 25.1200 ms | 20.9576 ms | 1.1986x |
+
+These are medians from
+`/tmp/fpgs-g1-geometric-cull-paired16k-20260914-repeat02`.
+The separate discovery round was 1.0692x / 1.2005x. Environment-wall repeat
+medians improve 33.7319 -> 31.9614 ms RTX and 39.2986 -> 35.9180 ms GB300.
+This is a measured shared-collision gain, not the 4x solver target.
+
+## Fair shared MJWarp denominator
+
+The refreshed shared comparison explicitly enables the same five collision
+changes and `NEWTON_NARROW_PHASE_THREADS_X=4` for both backends. The earlier
+G1 MJWarp recipe omitted THREADS_X and inherited Lab's default 1; FPGS used 4.
+The new common value changes the actual launch size and stride from 49,152
+to 196,608 on MJWarp, so changes in its denominator cannot be attributed to
+the cull alone. This recipe correction is disclosed, not credited as a new
+FPGS algorithm gain. MJWarp uses the shared Newton contact path, verified by
+its actual conversion owner and `_use_mujoco_contacts=False`.
+
+| Whole physics, two-round medians | FPGS | Corrected MJWarp | MJWarp/FPGS |
+| --- | ---: | ---: | ---: |
+| RTX PRO 6000 | 18.1758 ms | 37.8185 ms | 2.0807x |
+| GB300 | 20.9272 ms | 38.2270 ms | 1.8267x |
+
+Artifact: `/tmp/fpgs-g1-shared-geometric-paired16k-20260914-repeat02`.
+An independent first round gives 2.0801x / 1.8311x. All original source,
+capacity, actual feature and final idle checks pass on both cards. Complete
+environment-wall repeat medians are 32.7126 versus 51.5760 ms RTX and 35.1819
+versus 52.6833 ms GB300; these exclude policy inference and learning.
+
+The shared helper is `/tmp/fpgs-g1-shared-geometric-CHbQCtkF`, with run SHA256
+`672e9eb909e53c645512ab4237259e06a6c41961fe11f91700f50e0de2db3214`
+and observer SHA256
+`e638ce3fa1bb122f5aa8c93a8b86f24427cd330f768978fb1a2b28a6c0f0ea22`.
+It preserves original timing/physical/source/capacity ownership and adds
+untimed actual shared-collision admission checks. Existing captures retain
+the clean runtime pin above; this report-only update does not change it.
