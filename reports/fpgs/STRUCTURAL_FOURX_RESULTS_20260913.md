@@ -1,6 +1,6 @@
 # Structural window: integrated discoveries
 
-Checkpoint: 2026-09-14 04:43 UTC. Work continues toward the 24-hour window in
+Checkpoint: 2026-09-14 05:23 UTC. Work continues toward the 24-hour window in
 `STRUCTURAL_FOURX_20260913.md`; the 4x target is **not achieved**. These are
 discoveries, not replacements for accepted baselines except where repeat
 evidence is explicitly given. No candidate has met the complete 4x target.
@@ -64,13 +64,60 @@ Two proposed follow-ups were screened without opening implementation:
   removed even before certification/plane costs to save2ms. No work-weighted
   cohort measurement supports that claim. No patch system is being built.
 
-The next bounded CPU study targets the still-unresolved global coupling in
-loaded contacts: a small active-contact simultaneous correction after one PGS
-sweep, with non-associated normal/disk law, full normal feasibility and unsafe
-fallback. It must account for active-rank deficiency, all Gram/factor/line-search
-costs and current numerical convergence before any native implementation.
-This is an unvalidated algorithm study, not a speed claim. It does not change
-substeps or the maximum iteration allowance.
+That bounded active-global CPU study is now complete, with no native GO for
+the tested directions. The16 selected world/epochs have small active systems
+(maximum13), but RTX7410's held system has physical rank6 and a poorly
+conditioned natural-map Jacobian. Its proposed correction norm1493.54 produces
+huge impulse growth; seven attempts spend28 rejected trial scans and fall back
+to the original eight-sweep result. One predicted-active expansion reaches25
+unknowns and56 scans without fixing the cause. A separately justified,
+fixed-rule direction-only LM control repairs much of the natural/MDP defect,
+but not all physical defects: held complementarity rises2.88450e-4->4.18205e-4;
+refresh develops negative normal velocity1.07840e-3 versus original0.
+
+This is a concrete globalization/work failure, not immediate rejection of a
+slow first mapping. GB's two loaded cases reach a coupled root in two
+corrections after the seed, a useful retained numerical result. Independent
+coupled Jacobian finite differences pass (max1.46e-9). The16 selected cases
+are not population-weighted performance evidence. LM charges29 factors,
+43 trial scans and two fallback sweeps, including full-Jacobian scaling work;
+no factor-only cost is reported as a speedup. No fourth variant or native
+implementation is funded. Full study and three preserved controls:
+`/tmp/fpgs-g1-active-contact-cpu-maLTCcDg/RESULTS.md`.
+Final LM result SHA256
+`68e785eae803c8f6ef157b8b66578a65abc6412ef7419cc809cd8c54ab6e002e`.
+
+## Further work-elimination screens (September14,05:23)
+
+Independent source/consumer audits find no newly dead>=1.5ms Franka or>=2ms
+G1 publication boundary. Franka's complete private state/contact owners were
+already implemented and measured, including the diagnosed repeated-residual
+regression. Its local solves expose only~0.55ms and collision~1.2ms. G1's
+2.404418ms publication already prepares next-step S/V/bias and current public
+poses/velocities; the following FK/ID owner returns on the valid cache. This
+does not rule out a different algorithm, but prevents repackaging existing
+deletions as a new large-gain project.
+
+A new bounded geometry census tests horizontal CELL RUNS inside mixed terrain
+footprints, unlike the prior entire-footprint flatness screen. Exact unions
+could remove internal triangle boundaries without a persistent height cache.
+But the existing paired complete16K snapshots contain only49.18/49.64% live
+triangles in horizontal cells. Run grouping retains60.12/59.79% of query items;
+merging identical adjacent runs into rectangles still retains55.70/55.27%.
+Mean flat run length is only2.64/2.63 cells. There is no time-weighted evidence
+for the>=63.2% RTX query-time retirement needed before replacement overhead.
+Closed without native code, capture or profiling. Top-surface refinement,
+neighbor seam handling, positive-face support and complete span fallback would
+also remain physical obligations, not free consequences of equal proxy volume.
+Card/census/results: `/tmp/fpgs-g1-live-flat-runs-p1kkj4qj`.
+
+Next bounded numerical study asks whether current sparse GS is doing avoidable
+near-converged sweeps: its early exit currently requires EXACT zero updates.
+The user's unchanged maximum allowance does not require bit-stationary stopping.
+The study will use physical residual/work criteria, not small impulse change
+alone, count the additional full residual pass, and distinguish selected-case
+curves from population/timing evidence. No new stopping policy or gain is yet
+accepted; no task timestep, substep or maximum iteration count changes.
 
 ## Further structural screens (September14,03:24)
 
