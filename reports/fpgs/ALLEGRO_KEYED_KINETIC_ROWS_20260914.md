@@ -106,3 +106,83 @@ contact tokens. There is no global coefficient/support encoding allocation
 or separate fallback dof/sign array. New solve keys start
 `pgs_solve_kinetic_keyed_parallel_`; key emission is `scatter_contact_keys`,
 fallback is `get_fallback_kernel__locals__allegro_kinetic_keyed_fallback`.
+
+## Completed whole qualification, 21:55 UTC
+
+Frozen runtime `7fca2fdf5ef090e1e28fc9e327ce9f4de5e879df` passes all four
+existing CUDA selectors on both cards (18.745s RTX /18.764s GB including
+module loading). Current/held momentum defects are3.39e-8--3.90e-8; maximum
+velocity differences are3.81e-6--6.20e-6. Complete production reset, held
+factor/current geometry, crowded fallback and seeded graph grow/shrink pass.
+These checks retain their original physical tolerances and iteration budgets.
+
+The guarded16K200/40/40 whole comparison against925 cells, enabled on BOTH
+arms, measures RTX16.340675->15.201010ms (1.074973x) and
+GB16.517619->16.719848ms (0.987905x). Wall times are24.023163->23.410114ms
+RTX and24.794111->24.805209ms GB. The correction reverses55's regression,
+but misses its planned2ms whole saving. It is a real RTX discovery gain, not
+a cross-GPU incremental win. Artifact:
+`/tmp/fpgs-allegro-keyed-kinetic-rows-paired16k-20260914-02`.
+First01 stopped before any child because its required local launch card was
+missing; that failed manifest remains preserved.
+
+One original three-step node capture per arm/card, with the same strict
+process/correlation/all-memory reader, confirms12 physics roots, zero auxiliary
+roots,2064->1848 graph nodes and no unproven records. The complete row/solve
+exclusive boundary is8.449931->7.549881ms RTX and8.969132->9.340897ms GB.
+The original boundary differs from the earlier9.034745ms sample because of
+transient fallback; do not subtract unrelated samples as matched savings.
+Retained-row removal pays, but the actual parallel tiers grow4.889749->
+5.852930ms RTX and5.508978->7.396244ms GB. All four tiers slow;64/96 dominate.
+GB has one821.568us serial fallback call, raising exposed fallback0.081034->
+0.351402ms; RTX fallback is0.084971->0.083808ms. Thus fallback does NOT explain
+most of GB's solve growth. Actual executed sweeps were not recorded, so the
+split between solve-local geometry cost and rounding-sensitive early stopping
+is unresolved. No generic register-pressure explanation is supported.
+Artifact `/tmp/fpgs-allegro-keyed-kinetic-rows-nodes-paired16k-20260914-01`,
+with `strict_keyed_node_audit.json` in each capture directory; unchanged strict
+reader extended only with exact owner names at
+`/tmp/fpgs-allegro-keyed-nodes-checked-NV3Dj1lZ/audit.py`.
+
+### Fresh corrected MJWarp reference: RTX target crossed
+
+Three alternating FPGS/MJ, MJ/FPGS, FPGS/MJ rounds each run the two GPUs
+simultaneously. Both backends use clean7fca and fixed Lab53ee. Original task
+dt/substeps/decimation and maximum iterations remain unchanged; original
+capacity, source, idle, finite-state and corrected-line-search checks pass.
+All12 children return zero. Values below are medians, ms per environment step.
+
+|GPU|FPGS physics|corrected MJ physics|physics ratio|FPGS wall|MJ wall|wall ratio|
+|---|---:|---:|---:|---:|---:|---:|
+|RTX PRO6000|15.103509|63.536818|4.206759x|23.131495|71.449856|3.088856x|
+|GB300|16.664395|82.023917|4.922106x|24.920978|91.547777|3.673523x|
+
+RTX FPGS samples are15.015833,15.331838,15.103509ms; MJ samples63.431669,
+63.632510,63.536818ms. Every same-round RTX ratio exceeds4x. GB FPGS samples
+are16.585155,16.664395,16.702456ms; MJ samples82.023917,81.965890,
+94.850148ms. The last GB MJ sample is a large outlier and is retained, not
+silently discarded. The reported GB median is82.023917ms. Environment wall
+times exclude policy optimization: these are not full RL-training speedups.
+Allegro meets the RTX physics target in this repeated fixed recipe; the
+4x-across-all-representative-tasks target remains unmet.
+
+Allegro's original MJ configuration defaults `use_mujoco_contacts=True`:
+it has native MuJoCo contacts and NO Newton collision pipeline. Newton direction
+cells therefore do not apply to it. Do not switch MJ to external contacts or
+claim that disabling a relevant shared improvement funded the comparison.
+MJ retains calibrated njmax112/nconmax22; FPGS retains raw286720,
+broad524288,dense192/MF64/prop192 and original12/24 iterations.
+
+Artifact and exact reproducible invocation:
+`/tmp/fpgs-allegro-keyed-corrected-backends-paired16k-20260914-01` and
+`/tmp/fpgs-allegro-keyed-backends-akOBZj8M/LAUNCH.md`.
+The minimal adapter there has SHA-256
+`e82a61022ee44ae92b57d0b336b862f8a3858b0a73f9c93503f948bc00f59f7a`;
+its launch card SHA-256 is
+`e19978bf30b9ea3fde847cf9ba0107f9cf912039344f61e50ddd9f3805384fba`.
+It reuses original compare_backends798 and fixed-import adapterc062, routing
+only FPGS to the existing keyed observer. MJ retains the original checked
+native-contact/line-search path. Manifest driver hashes include every source
+selection prerequisite. These retained `/tmp` prerequisites are required for
+the exact local reproduction; the report does not claim a self-contained
+download. A later report-only revision must be recorded separately from7fca.
