@@ -273,13 +273,17 @@ auto evaluate=[&](wp::vec2 u,float &ha,float &hb,int &ia,int &ib){
 #endif
 };
 for(int iteration=0;iteration<=64;++iteration){
-    int bank=s.bank;
-    for(int v=0;v<s.count;++v){
+    // Keep every lane on the same polygon epoch. Lane zero clips and changes
+    // count/bank only after all peer lanes have left the evaluation loop.
+    const int bank=s.bank,vertex_count=s.count;
+    sync();
+    for(int v=0;v<vertex_count;++v){
         if(s.active_a[bank][v]<0){float ha,hb;int ia,ib;evaluate(s.polygon[bank][v],ha,hb,ia,ib);
             if(lane==0){s.gap[bank][v]=hb-ha;s.active_a[bank][v]=ia;s.active_b[bank][v]=ib;
                 if(ia<0||ib<0||!::isfinite(ha)||!::isfinite(hb))s.failed=6;}}
         sync();
     }
+    sync();
     if(lane==0 && !s.failed){
         int violated=-1;
         for(int i=0;i<s.count;++i)if(s.gap[bank][i]>shell+s.guard){violated=i;break;}

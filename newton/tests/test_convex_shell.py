@@ -212,6 +212,18 @@ def _warm_fixture(device):
 
 
 class TestConvexShell(unittest.TestCase):
+    def test_polygon_evaluation_has_immutable_warp_epoch(self):
+        """Do not let the clipping lane change a peer's evaluation loop bound."""
+        from newton._src.geometry.convex_shell import _NATIVE  # noqa: PLC0415
+
+        epoch = _NATIVE.split("for(int iteration=0;iteration<=64;++iteration){", 1)[1]
+        evaluation, clipping = epoch.split("    if(lane==0 && !s.failed){", 1)
+        self.assertIn("const int bank=s.bank,vertex_count=s.count;", evaluation)
+        self.assertIn("for(int v=0;v<vertex_count;++v)", evaluation)
+        self.assertNotIn("v<s.count", evaluation)
+        self.assertTrue(evaluation.rstrip().endswith("sync();"))
+        self.assertIn("s.count=output;s.bank=next", clipping)
+
     def test_native_shell_api(self):
         """The complete native shell primitive is available without pipeline mutation."""
         from newton._src.geometry.convex_shell import _shell_patch, _ShellData, _ShellResult  # noqa: PLC0415
