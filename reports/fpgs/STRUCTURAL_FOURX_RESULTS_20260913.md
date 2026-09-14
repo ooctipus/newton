@@ -1,6 +1,6 @@
 # Structural window: integrated discoveries
 
-Checkpoint: 2026-09-14 00:30 UTC. Work continues toward the 24-hour window in
+Checkpoint: 2026-09-14 02:20 UTC. Work continues toward the 24-hour window in
 `STRUCTURAL_FOURX_20260913.md`; the 4x target is **not achieved**. These are
 discoveries, not replacements for accepted baselines except where repeat
 evidence is explicitly given. No candidate has met the complete 4x target.
@@ -13,6 +13,99 @@ failure and the unreduced fixture-capacity failure remain preserved, not
 erased. The latest finite/weld source remains default-off; its fresh shared-MJ
 comparison passes, while repeated timing remains. Do not use old rejected variants
 as performance denominators.
+
+## Repeated G1 corrective gain (September14,02:20)
+
+Parallel limit construction `da85acb1d1a547ef60a4bc6b45bd8096610f6a42`
+retains the original global sparse rows, contact producer and finite-eight
+ordered solver. It replaces one thread's serial limit scan with a stable
+warp prefix and parallel row production; no physics allowance changes.
+Four physical selectors per card pass. Three balanced paired whole-task
+rounds at16K, seed0,200 warm/40 wall/40 physics confirm:
+
+| GPU | Original4a physics median | Parallel limits | Incremental ratio | Saved |
+|---|---:|---:|---:|---:|
+| RTX |22.884747ms|21.218831ms|1.078511x|1.665916ms|
+| GB300 |27.670977ms|26.427946ms|1.047035x|1.243031ms|
+
+Whole-environment wall medians improve37.281070->35.887896ms RTX and
+42.747072->41.110784ms GB (1.038820/1.039802x). These are not training
+throughput and not ratios versus MJWarp. All12 children,24 capacity/actual
+ownership boundaries and final source/idle guards pass. Unsupported tasks
+retain original dispatch; cross-task promotion is not yet established.
+Manifest `/tmp/fpgs-g1-parallel-limits-live-paired16k-20260914-02/manifest.json`,
+SHA256 `c4dd51a43e6f5352b87bff7f21136e0757f8f78215ebb2aa88b148d059386534`.
+The unchanged whole owner and exact launch are recorded in
+`/tmp/fpgs-g1-limits-checked-9oJezvat/LAUNCH.md` (use rounds3/output02).
+
+This correction follows a diagnosed **loss**, not an untested packet idea.
+Packet7ecb whole physics22.873006->25.547120ms RTX and27.789969->28.111901ms
+GB; its physical and capacity checks pass. Exclusive row preparation saves
+3.344172/3.077257ms, but shared-row GS grows4.923319->11.000920ms RTX and
+4.772011->8.213632ms GB. Runtime shared storage700->9100B and registers
+40->64 RTX/37->63 GB increase; local spills remain0. Shared residency bounds
+and serialized row formation explain the targeted return to original global
+rows, not a claim of measured hardware occupancy. No third shared mapping.
+Packet manifest SHA256
+`91bc1e7b064b0e9f2d469aab6259b6ee9393010f00fe2b0f0f90151fc43e5680`;
+paired node diagnostic is
+`/tmp/fpgs-g1-packet-nodes-paired16k-20260914-01`. Its inherited auxiliary
+analyzer refusal remains a failed parent result; independent original
+source/capacity checks and strict disjoint-node ownership checks pass.
+
+Next structural candidate `d3ccebffd9147ba55a92f7b9a4e512cefdccae6e` skips
+finite face clipping only when its patch would immediately select the
+unchanged speculative fallback. Nine CPU tests pass with the switch off/on;
+paired physical checks are running. No timing or additional gain is claimed.
+
+Allegro synchronization fix `8a45444bf3a61c36560e9d3a008988b31697ed8d`
+freezes the shared polygon count/bank before peer evaluation and adds the
+missing warp epoch before clipping. Eighteen physical controls/card pass;
+both full warmups now finish without the earlier shared-read crash. However,
+actual raw demand390708 RTX/390594 GB exceeds286720 and RTX also exceeds
+row capacity192. The full-task run is rejected, with **no candidate timing**.
+Shell wide patches legitimately can publish more contacts than the original
+fitted manifold; no duplicated warm/cold queue ownership was found. Demand
+calibration, not blind buffer inflation or contact pruning, is next.
+Physical manifest SHA256
+`62ccb96cd7579e887b35ad93af4edc16e628013b7816ead60546d0e128a0224a`;
+failed whole manifest SHA256
+`334c8c8368bdd566a65c9b38dd94176ace5d389dca5a5e90df37c814a80c791c`.
+
+## Earlier resumed checkpoint (September14,01:31)
+
+The corrected ANYmal contiguous response is a complete-task loss, not an
+unvalidated improvement. Original50dfa versus candidate4af15fe0 costs
+9.295346->11.759834ms RTX and9.508051->11.425918ms GB, ratios0.790432/0.832148.
+All four children, actual-owner/capacity checks and final source/idle guards
+pass. Three physical selectors/card pass after retaining and diagnosing the
+near-zero-action normalization failure; native arithmetic was unchanged by
+the test-oracle correction. The initial loss received one structural mapping
+correction, but its remaining loss is not promoted or followed by blind tuning.
+Manifest `/tmp/fpgs-anymal-contiguous-live-paired16k-20260914-01/manifest.json`,
+SHA256 `68733c2271d2ab1cd4e1d17c42af28ef0e13b6e885b671a90d4344a7e73f5740`.
+
+Allegro shell28a81a33 passes the small physical controls below but fails both
+full-task warmups before timing. Paired memcheck's first pre_flags allocation
+ordering report also occurs on baseline10a0b524 and is non-discriminating.
+A second diagnostic disables only that detector and localizes an actual
+out-of-bounds shared read in candidate `current_shell_commit`, lane0, on both
+GPUs. This is a correctness bug, not a speed result or a clean memory verdict.
+Spatial logs `/tmp/fpgs-convex-shell-memcheck-spatial-paired16k-20260914-01/gpu*/memcheck.log`
+have SHA256 ae99af5d (RTX) and717b2264 (GB). Both children exit86, the parent
+exits1 and final source/idle checks pass. Right-level native correction is
+under investigation; the prior failures remain preserved.
+
+G1 packet candidate7ecb233dc11feab618c4d854cd87b6faf8d90cb2 is frozen on
+`ooctipus/fpgs-g1-sparse-packet-20260914`, based on4a0bf739. It retires global
+per-row Z/incident production and storage, forms current sparse rows once in
+the existing solve's shared memory, and retains original ordered finite-eight
+PGS, current geometry, capacity and force publication. Nine CPU controls and
+SM100/120 native compilation pass; GPU physical and complete timing are next.
+The first whole-RTX milestone is>=2.286135ms saving, not a4x claim. Original
+row-plus-GS costs9.103631ms; the complete replacement including retained row
+services must fit6.817495ms. Shared-memory residency and serialized preparation
+are explicit risks. No new benchmark framework or Isaac Lab change is made.
 
 ## Fresh corrected shared-collision G1 comparison (September14,00:28)
 
