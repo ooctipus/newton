@@ -1,5 +1,9 @@
 # Allegro row-local endpoint wrench reuse
 
+Closed after physical, whole and node qualification: below the1 ms RTX
+funding gate, no promotion and no further runtime variants. The qualified
+7fca/1a9 Allegro result remains accepted; this attempt makes no new MJ claim.
+
 Pre-code card, 2026-09-14 22:28 UTC. Isolated branch from composed
 `1a9efc33efbc0f23e1e7676a5edded795f224c97`; qualified Allegro runtime remains
 7fca and original worktrees are preserved. One causal correction, no mapping
@@ -126,7 +130,101 @@ env CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1 \
 
 Use the same four Allegro CUDA selectors listed in the
 [composed integration card](FOURX_QUALIFIED_INTEGRATION_20260914.md), with this
-tree selected explicitly. They remain pending root execution, followed by
-the existing corrected/current-capacity whole driver. Full pre-commit passes.
-Status: concrete emitted-work deletion; GPU physical and performance outcomes
-unmeasured. Original qualified source and measured gains remain unchanged.
+tree selected explicitly. They were pending at source freeze; completed root
+results follow. Full pre-commit passes. Original qualified source and measured
+gains remain unchanged.
+
+## Completed physical and whole gate
+
+Frozen candidate `a73fb4ba32e7a507ee55b46f07c46a8b6f215bb7` passes the four
+unchanged Allegro CUDA selectors on each card, no skips/errors:44.798 s RTX
+(session89508) and47.221 s GB (65854), both reaped0. Current/held physical
+defects are3.39e-8--3.90e-8; velocity differences are3.81e-6--6.20e-6. Original
+fallback, reset and two-graph lifecycle controls pass. These test durations
+include loading and are not simulation performance measurements.
+
+Original guarded16K/200warm/40wall/40graph discovery against clean1a9 completes
+all four children with source/capacity/owner/finite/idle guards passing; parent
+34907 is reaped0. Both arms enable direction cells AND keyed kinetic rows.
+Fixed Lab remains53ee, raw286720, broad524288, dense192/MF64/propagation192,
+and original12 fallback iterations/24 parallel sweeps; no budget changes.
+
+| Card | Baseline physics ms | Candidate physics ms | Ratio | Baseline wall ms | Candidate wall ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| RTX | 15.28952945 | 14.985817275 | 1.020267x | 23.233902 | 22.876923 |
+| GB | 16.5846168 | 16.714201525 | 0.992247x | 24.943494 | 24.149656 |
+
+The measured RTX saving is0.303712 ms, below the planned1 ms; GB physics
+regresses0.129585 ms. This is one discovery, not balanced repeated evidence.
+Environment wall timing is separate and does not measure RL training.
+
+Whole artifact: `/tmp/fpgs-allegro-endpoint-wrench-paired16k-20260914-01`,
+manifest SHA256
+`1aa5e034069b3c659d137bd2b9f0709e2da6140bfd9265cedba3d63ad4fe0de7`.
+Exact tested invocation and preserved prerequisites are in
+`/tmp/fpgs-allegro-endpoint-wrench-checked-ydtLZA/LAUNCH.md`. The original
+798/484 driver and c062 fixed-import seam remain mandatory; this closure
+does not substitute this worktree's current benchmark scripts.
+
+## Closed node attribution: parallel savings, fallback tail
+
+Root's original16K/200warm/40wall/3node protocol completes all four children;
+parent15138 is reaped0. Each completed strict audit has12 physics roots,
+1848 nodes, zero auxiliary roots and zero unproven records, with source and
+process-correlation checks passing. The unchanged strict reader includes all
+kernel/memory intervals. Values below are milliseconds per environment step
+in this short node window, not additional whole-timing samples.
+
+| Owner | RTX baseline -> candidate | GB baseline -> candidate |
+| --- | ---: | ---: |
+| Parallel32 | 0.394208 -> 0.364853 | 0.430592 -> 0.410400 |
+| Parallel64 | 3.147285 -> 3.190638 | 4.183957 -> 4.285258 |
+| Parallel96 | 1.884843 -> 1.719883 | 2.362539 -> 1.953867 |
+| Parallel128 | 0.401941 -> 0.374464 | 0.417642 -> 0.383445 |
+| All parallel tiers | 5.828277 -> 5.649839 | 7.394730 -> 7.032969 |
+| Original serial fallback solve | 0.084171 -> 0.350208 | 0.081055 -> 2.027604 |
+| Fallback physical-row materialization | 0.084149 -> 0.094325 | 0.079755 -> 0.159787 |
+| Complete rows+solve, exclusive | 7.524767 -> 7.624923 | 9.053549 -> 10.732662 |
+| Whole physics node span | 15.035669 -> 15.145664 | 16.541728 -> 18.223763 |
+
+Three tiers improve on both cards, but64 slows0.043354 ms RTX /0.101301 ms
+GB. Actual captured resources match the offline table:64 registers rise
+82->108 RTX /83->110 GB. All four tiers keep their original block sizes,
+16384-world grids, eight calls per environment step, shared storage and zero
+reported local memory. There are no achieved-occupancy, stall or executed-sweep
+counters here: register growth is a measured resource change, NOT proof that
+occupancy caused the64-tier slowdown.
+
+The aggregate parallel saving is only0.178437 ms RTX /0.361761 ms GB. Most
+of the complete-boundary regression instead belongs to the unchanged serial
+fallback: one807.328 us call on RTX and seven808.896--919.808 us calls on GB,
+versus no calls above100 us in either baseline's24-call window. Its native
+resources remain83 registers/4312 shared bytes. Materialization grows with
+that tail. Counts of long launches are not counts of fallback worlds; the
+two boundary snapshots do not identify every transient route transition.
+No numerical harm or specific trajectory cause is inferred from timing alone.
+
+Non-target collision, dynamics, publication, MF service and memory families
+remain nearly flat. Thus fewer endpoint instructions did improve most parallel
+tiers, but that limited saving plus the retained fallback tail cannot meet
+the complete1 ms goal. The40-step graph discovery's small RTX gain and the
+three-step node window's RTX loss are both retained; different windows and
+transient fallback exposure are not interchangeable evidence. This is not a
+claim that every parallel tier regressed or that all geometry reuse is invalid.
+
+Node artifact: `/tmp/fpgs-allegro-endpoint-wrench-nodes-paired16k-20260914-01`,
+manifest SHA256
+`13c3d4a3e4141ad168a5017b2154e53ed73426276ee2b7ce726144a76e63c6eb`.
+Each capture contains `strict_endpoint_node_audit.json`; the retained base
+reader SHA256 is
+`e76d53f685871f8d3e38a221ce89485d3d87014b9c8af1f6ac22e10af8e74dc6`.
+Exact original node invocation is in
+`/tmp/fpgs-allegro-endpoint-wrench-nodes-checked-xZrRnX/LAUNCH.md`.
+Both local runners retain SHA256
+`56933d7a45d7b335c9fed9470595b73f277a7fcc3b1fb6dc83d4e756e5207e7d`;
+they differ only in the tested node/graph recipe and preserved observer binding.
+Reproduction requires the frozen source commits and a NEW output directory.
+
+Closure changes this report only. Runtime, tests, successful and failed
+artifacts remain frozen; no promotion, mapping/grid sweep, additional GPU work
+or repeated backend comparison is authorized by this result.
