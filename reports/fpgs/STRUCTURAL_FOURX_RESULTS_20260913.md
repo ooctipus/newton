@@ -1,6 +1,6 @@
 # Structural window: integrated discoveries
 
-Checkpoint: 2026-09-14 03:24 UTC. Work continues toward the 24-hour window in
+Checkpoint: 2026-09-14 04:43 UTC. Work continues toward the 24-hour window in
 `STRUCTURAL_FOURX_20260913.md`; the 4x target is **not achieved**. These are
 discoveries, not replacements for accepted baselines except where repeat
 evidence is explicitly given. No candidate has met the complete 4x target.
@@ -13,6 +13,64 @@ failure and the unreduced fixture-capacity failure remain preserved, not
 erased. The latest finite/weld source remains default-off; its fresh shared-MJ
 comparison passes, while repeated timing remains. Do not use old rejected variants
 as performance denominators.
+
+## Coupled-contact numerical discovery (September14,04:43)
+
+G1 now has an independently tested different numerical iteration, not another
+exact-GS layout. Native643cc8cb uses a guarded3x3 simultaneous sticking solve
+and exact open-triplet elimination, with lazy local self-block construction.
+Sliding/unsafe cases retain scalar transactions; denominator-only CFM and
+unchanged eight-iteration allowance remain. It is default-off and pushed on
+`ooctipus/fpgs-g1-contact-block-20260914` through reportf2baf6de, with handoff
+ancestry and no Lab/pointer change.
+
+| GPU | Previous level-update physics | Contact block | Incremental ratio | Saved |
+|---|---:|---:|---:|---:|
+| RTX |20.327910ms|19.844018ms|1.024385x|0.483892ms|
+| GB300 |25.392105ms|25.178416ms|1.008487x|0.213689ms|
+
+One discovery only, four children exit0 and eight original actual-owner/
+capacity boundaries pass. Original source/idle guards independently rechecked.
+Whole manifest`2e832676ceaa77d6b4d7894b9347eb8867448034afa098e48a4fee791d8087d8`.
+This misses the >=2ms RTX milestone and is not promoted or followed by a tile
+tuning campaign. One node diagnosis puts GS4.243129/4.525760ms against earlier
+level-update4.840935/4.763809: only~0.598/0.238ms actually leaves the intended
+owner. Rows, publication and collision remain near flat. No large gain is
+hidden by downstream growth; native has zero observed local-memory allocation.
+
+Physical testing first mistakenly reinstated an elementwise warm-coefficient
+barrier that prevented eight saved cases from reaching the solve. That failed
+source/run is preserved. Corrected tests record the same coefficient diagnostic
+and enforce own-rounded-Z numerical law plus independent current-J/held-H
+momentum and cone checks. Four selectors/card pass; maximum momentum4.2573e-8,
+cone7.4506e-9. A further matched-current comparison records atomic row-order
+permutations and RHS differences: scalar->block residual for RTX7410 is
+0.003907325->0.003537294 refresh and0.004428779->0.004227882 held. Other cases
+are equal/better apart from<1e-9 rounding. Do not compare captured-order CPU
+iterates with fresh current-order native iterates as though inputs match.
+Final physical manifest`2d25c0f5efe0424b8dcb131eb80638a442ead98b5eb9175a17a98670051a11ed`.
+These are selected numerical checks, not sustained-trajectory qualification.
+
+Two proposed follow-ups were screened without opening implementation:
+
+- Cold whole-world admission already exists inside prior losing Gram/coordinate
+  owners; their active paths confound isolated screen timing. Selected6 zero
+  worlds carry only51/452 rows and already stop after one sweep. A world-count
+  argument does not fund another>=2ms experiment.
+- One certified flat-footprint plane query is not equivalent to seam welding,
+  but is already a CPU-studied proposal. Saved full16K data assigns only22.8%
+  of surviving triangles to that cohort. Current finite+fallback exclusive
+  query cost is3.164546ms RTX/10.754357ms GB; RTX requires>=63.2% of query time
+  removed even before certification/plane costs to save2ms. No work-weighted
+  cohort measurement supports that claim. No patch system is being built.
+
+The next bounded CPU study targets the still-unresolved global coupling in
+loaded contacts: a small active-contact simultaneous correction after one PGS
+sweep, with non-associated normal/disk law, full normal feasibility and unsafe
+fallback. It must account for active-rank deficiency, all Gram/factor/line-search
+costs and current numerical convergence before any native implementation.
+This is an unvalidated algorithm study, not a speed claim. It does not change
+substeps or the maximum iteration allowance.
 
 ## Further structural screens (September14,03:24)
 
