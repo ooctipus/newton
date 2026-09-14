@@ -104,3 +104,11 @@ Physical selectors in `newton.tests.test_convex_cells.TestConvexCells`:
 Reuse the original paired physical/whole recipe and fixed Lab53ee. Whole
 comparison is integrated baf0 versus this default-off successor, not either
 failed hill prototype.
+
+First paired GPU validation retained: all three support/query selectors passed
+on both cards, but actual production construction failed because integrated
+baf0 did not retain the resolved writer as an owner field. A new CPU constructor
+regression reproduced that AttributeError before the fix. Retaining the already
+resolved writer at its original constructor seam fixes dispatch without changing
+the four native algorithms, table data or any numerical branch. The failed run
+is not a performance result; a paired repeat is required before whole timing.

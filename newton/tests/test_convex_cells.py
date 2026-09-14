@@ -118,6 +118,21 @@ def support_check(
 
 
 class TestConvexCells(unittest.TestCase):
+    def test_actual_constructor_writer_cpu(self):
+        """Bind the resolved production writer before the cell manifold factory."""
+        from newton._src.geometry.narrow_phase import NarrowPhase  # noqa: PLC0415
+
+        narrow = NarrowPhase(
+            max_candidate_pairs=8,
+            max_triangle_pairs=1,
+            has_meshes=False,
+            reduce_contacts=False,
+            use_lean_gjk_mpr=True,
+            device="cpu",
+        )
+        self.assertIs(narrow._convex_writer_func, write_contact_simple)
+        self.assertEqual(manifold_kernel(narrow).func.__name__, "narrow_phase_manifold_kernel_cells")
+
     def test_direction_range_cpu(self):
         """Keep nonfinite/zero/extreme directions on the original support path."""
         rays = np.array(
