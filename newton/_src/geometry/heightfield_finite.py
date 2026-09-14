@@ -12,6 +12,7 @@ original generic query, writer and reducer.
 import functools
 import inspect
 import linecache
+import os
 import textwrap
 from typing import Any
 
@@ -24,6 +25,7 @@ from .heightfield_features import WELD_FLAT_SEAMS, HeightfieldFeatureContext, fl
 from .types import GeoType
 
 QueryResult = wp.types.vector(length=24, dtype=wp.float32)
+DIRECT_SPECULATIVE_FACE = os.environ.get("NEWTON_NARROW_PHASE_FINITE_FACE_DIRECT", "0") == "1"
 
 _QUERY = r"""
 using V=wp::vec3;
@@ -190,6 +192,41 @@ def query(e1: wp.vec3, e2: wp.vec3, center: wp.vec3, rotation: wp.quat, half: wp
     ...
 
 
+_FACE_BRANCH = "if(plane_gap>=0.0f&&inside(support-normal*plane_gap)){"
+if _QUERY.count(_FACE_BRANCH) != 1:
+    raise RuntimeError("Expected the unique finite supporting-face branch")
+_DIRECT_QUERY = _QUERY.replace(
+    _FACE_BRANCH,
+    _FACE_BRANCH
+    + r"""
+    // The supporting point projects inside the actual finite triangle, so
+    // the clipped face includes the minimum-depth support. Its speculative
+    // manifold will be refused below; do not construct the discarded patch.
+    // Near a writer boundary retain the original floating-point path.
+    if(plane_gap>margin_sum && plane_gap<threshold){
+        const float guard=32.0f*1.1920928955078125e-7f*
+            (wp::length(center)+wp::length(half)+wp::length(e1)+wp::length(e2));
+        if(plane_gap>margin_sum+guard && plane_gap<threshold-guard)return result;
+    }
+""",
+    1,
+)
+
+
+@wp.func_native(_DIRECT_QUERY)
+def _query_contact_geometry(
+    e1: wp.vec3,
+    e2: wp.vec3,
+    center: wp.vec3,
+    rotation: wp.quat,
+    half: wp.vec3,
+    threshold: float,
+    margin_sum: float,
+) -> QueryResult:
+    """Retain original geometry or directly select its speculative fallback."""
+    ...
+
+
 @wp.func
 def query_contacts(
     e1: wp.vec3,
@@ -201,7 +238,10 @@ def query_contacts(
     margin_sum: float,
 ) -> QueryResult:
     """Retain original speculative face manifolds at the current finite-sweep law."""
-    result = query(e1, e2, center, rotation, half, threshold)
+    if wp.static(DIRECT_SPECULATIVE_FACE):
+        result = _query_contact_geometry(e1, e2, center, rotation, half, threshold, margin_sum)
+    else:
+        result = query(e1, e2, center, rotation, half, threshold)
     count = int(result[0])
     if count > 0:
         normal = wp.vec3(result[1], result[2], result[3])

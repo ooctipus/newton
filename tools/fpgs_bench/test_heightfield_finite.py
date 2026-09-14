@@ -45,7 +45,91 @@ def evaluate_contact_policy(center: wp.vec3, margin_sum: float, output: wp.array
     )
 
 
+@wp.kernel(enable_backward=False)
+def evaluate_direct_face(
+    e1: wp.vec3,
+    e2: wp.vec3,
+    center: wp.vec3,
+    rotation: wp.quat,
+    half: wp.vec3,
+    output: wp.array[finite.QueryResult],
+):
+    output[0] = finite._query_contact_geometry(
+        e1,
+        e2,
+        center,
+        rotation,
+        half,
+        0.04,
+        0.02,
+    )
+
+
 class TestHeightfieldFinite(unittest.TestCase):
+    def test_direct_face_skips_only_discarded_patch(self):
+        """Direct speculative refusal retains the existing contact policy."""
+        self.assertTrue(callable(getattr(finite, "_query_contact_geometry", None)))
+        device = os.environ.get("FPGS_TEST_DEVICE", "cpu")
+        direct = wp.empty(1, dtype=finite.QueryResult, device=device)
+        geometry = wp.empty(1, dtype=finite.QueryResult, device=device)
+        for center in (
+            (0.4, 0.4, 0.13),
+            (0.4, 0.4, 0.12),
+            (0.4, 0.4, 0.11),
+            (0.4, 0.4, 0.17),
+            (1.5, 1.5, 0.13),
+            (0.4, 0.4, 0.09),
+        ):
+            inputs = [
+                wp.vec3(2.0, 0.0, 0.0),
+                wp.vec3(0.0, 2.0, 0.0),
+                wp.vec3(*center),
+                wp.quat_identity(),
+                wp.vec3(0.1, 0.1, 0.1),
+            ]
+            wp.launch(evaluate_direct_face, 1, inputs=[*inputs, direct], device=device)
+            wp.launch(evaluate, 1, inputs=[*inputs, geometry], device=device)
+            a, b = direct.numpy()[0], geometry.numpy()[0]
+            if a[0] < 0:
+                self.assertGreater(b[0], 0)
+                minimum = min(b[7 + 4 * k] for k in range(int(b[0])))
+                self.assertGreater(minimum, 0.02)
+                self.assertLessEqual(minimum, 0.04)
+            else:
+                np.testing.assert_allclose(a, b, atol=2e-6, rtol=2e-6)
+            if center == (0.4, 0.4, 0.13):
+                self.assertLess(a[0], 0)
+
+    def test_direct_face_rotated_slopes_and_boundaries(self):
+        """Keep discarded-patch selection independent of the active writer path."""
+        device = os.environ.get("FPGS_TEST_DEVICE", "cpu")
+        direct = wp.empty(1, dtype=finite.QueryResult, device=device)
+        geometry = wp.empty(1, dtype=finite.QueryResult, device=device)
+        refused = 0
+        for slope in (0.0, 0.17, -0.31):
+            e1, e2 = wp.vec3(2.0, 0.0, slope), wp.vec3(0.0, 2.0, -slope * 0.3)
+            normal = wp.normalize(wp.cross(e1, e2))
+            for angle in (0.0, 0.21, 0.73):
+                q = wp.quat_from_axis_angle(wp.normalize(wp.vec3(1.0, 2.0, 0.3)), angle)
+                half = wp.vec3(0.1, 0.08, 0.15)
+                axes = [wp.quat_rotate(q, wp.vec3(*(float(i == k) for i in range(3)))) for k in range(3)]
+                radius = sum(abs(wp.dot(axis, normal)) * half[k] for k, axis in enumerate(axes))
+                for gap in (-0.02, 0.01, 0.02, 0.020001, 0.03, 0.039999, 0.04, 0.06):
+                    center = (e1 + e2) * 0.25 + normal * (radius + gap)
+                    inputs = [e1, e2, center, q, half]
+                    wp.launch(evaluate_direct_face, 1, inputs=[*inputs, direct], device=device)
+                    wp.launch(evaluate, 1, inputs=[*inputs, geometry], device=device)
+                    a, b = direct.numpy()[0], geometry.numpy()[0]
+                    if a[0] < 0 and b[0] > 0:
+                        refused += 1
+                        np.testing.assert_allclose(b[1:4], np.asarray(normal), atol=2e-6)
+                        minimum = min(b[7 + 4 * k] for k in range(int(b[0])))
+                        self.assertGreater(minimum, 0.02)
+                        self.assertLessEqual(minimum, 0.04)
+                    else:
+                        np.testing.assert_allclose(a, b, atol=2e-6, rtol=2e-6)
+        self.assertGreaterEqual(refused, 9)
+
     def run_query(self, e1, e2, center, rotation=(0.0, 0.0, 0.0, 1.0), half=(0.1, 0.1, 0.1)):
         """Evaluate one actual native CPU query without a saved response oracle."""
         output = wp.empty(1, dtype=finite.QueryResult, device="cpu")
