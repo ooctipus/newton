@@ -192,3 +192,132 @@ a sufficient implementation argument. All original capacities remain fixed.
 Study `/tmp/fpgs-g1-geometric-separation-UYfUwYR8/RESULTS.md`, final result
 SHA256`3e15be7c639d8da489b8498189ea6d3ff22c439d794b90bb327c350c45d2a8e4`.
 No new terrain speedup or native physical acceptance is claimed yet.
+
+## Native terrain query decision, approximately11:09 UTC
+
+The first native mask-only test passed the omitted-callback safety audit but
+saved no time: retaining holes in the old stream retained expensive mixed
+warps and the original launch footprint. Original plus screening changed the
+four-collision query boundary by -0.152064ms RTX /-0.132992ms GB (a loss).
+Preserve `/tmp/fpgs-g1-geometric-query-native-paired-20260914-PV7oXt`.
+
+One causal correction used the compact surviving prefix that the proposed
+original midphase append would naturally produce. It used the ORIGINAL
+unmasked finite/generic query kernels and original reducer writer, with live
+launch AND stride196,608 (fixed Lab's existing thread multiplier). The stable
+diagnostic prefix was built outside timing; production must obtain compactness
+from its original append, not add an uncharged compaction pass. Screening was
+charged, while reduction/export/clear savings were not credited.
+
+| Four-collision query boundary | RTX ms | GB300 ms |
+| --- | ---: | ---: |
+| Original | 3.224064 | 11.502592 |
+| Compact survivors plus screening | 2.247424 | 7.336320 |
+| Saving | 0.976640 | 4.166272 |
+
+These are saved-input native query timings, NOT live whole-physics gains.
+Both cards pass full callback accounting:608,272/609,402 original triangles,
+269,395/269,222 safely omitted, and161,820/161,188 omitted original callbacks.
+No omitted callback crossed max(current shell, scaled reducer beta)+pad;
+minimum remaining slack1.357mm/1.255mm. Preserved packed artifact:
+`/tmp/fpgs-g1-geometric-packed-native-paired-20260914-YoLrRO`.
+Frozen diagnostic SHA256
+`68239bb36a9bb96499732ab99cb013574b82e6dbed42600fc9edd0e2514064cb`.
+
+Funded production integration in `ooctipus/fpgs-g1-geometric-cull-20260914`,
+base7df, with11:45 checkpoint. It must retain uncertain/predictive/custom
+writer geometry and current scaled reducer semantics, use no new queue or
+launch, and pass existing physical plus paired whole-cost checks. Because
+collision is shared, a successful change must also reach the MJWarp control.
+
+In parallel, `ooctipus/fpgs-g1-analytic-manifold-20260914` at
+`ef7e22587e7fca00f601e32e6803010510487e32` supplies certified separated
+supporting-face witnesses directly to the ORIGINAL manifold tail, retiring
+discarded finite clipping and MPR/GJK for that class. CPU geometry/lifecycle
+and offline compilation pass; larger allocation184 registers/688B stack in
+the reducer overload is a charged risk. Saved96 admission64.15%/77.78% of
+old fallback entries is not a population timing claim. Root independently
+reviewed native/test source; paired physical checks are next. No promotion
+or whole-step gain is claimed for this implementation yet.
+
+## Production terrain result, approximately11:39 UTC
+
+Frozen `7790c35b348dd1885a90f6c2def9b336cde80399` integrates the conservative
+separator into the original triangle append. Unsupported/current-uncertain
+pairs retain the original cell midphase; no new queue, launch or compaction
+pass. Default-off `NEWTON_HEIGHTFIELD_GEOMETRIC_CULL=1` admits only the
+qualified nonpredictive stock-writer path. The complete runtime and geometry
+proof are in its `G1_GEOMETRIC_CULL_20260914.md` card.
+
+All four original/new physical selectors pass on both GPUs, including
+actual emitted-stream subset and every original reducer-buffer callback,
+current geometry/guard changes, empty/regrowing graph capture, repeated
+same-state rebound and loaded flat/seam response. No skips or capacity
+failures. Physical artifact
+`/tmp/fpgs-g1-geometric-cull-physical-paired-20260914-01`, manifest SHA256
+`1810c0d55e34f25f64dc4dc04461dd31f0c877d7dfcd8baa1d7465ffb93269ce`.
+
+| One whole-physics discovery | Baseline7df ms | Cull7790 ms | Incremental ratio |
+| --- | ---: | ---: | ---: |
+| RTX PRO6000 |19.449285075|18.189770725|1.069243x|
+| GB300 |25.086320725|20.896425375|1.200508x|
+
+Whole wall32.730027->31.666569ms RTX,39.539466->34.807193ms GB. Original
+source, actual-feature, sticky capacity and final-idle guards all pass.
+Artifact `/tmp/fpgs-g1-geometric-cull-paired16k-20260914-01`.
+Two alternating paired repeat rounds are running; the MJWarp denominator
+must also enable the shared cull before reporting a new backend ratio.
+This is a measured structural gain, not4x or cross-task promotion.
+
+## Analytic-manifold whole-cost loss
+
+The separate certified-witness/original-manifold runtime is unchanged at
+SHA256`c50c889e2b93643ab63a59ef3d1a2e5ce65e15450e0f3bb13a54c715f27fdbaa`.
+Final test/report-only tip is `122eb87e63123698ab6aaa33e19727597cbbec36`.
+The first physical attempt exposed an invalid new oracle: the original CUDA
+GJK normal differed from the authored flat plane by3.97364e-6, exceeding
+the new bilateral2e-6 comparison. The candidate was exact. Corrected the
+test to compare the candidate to the authored plane with the SAME2e-6
+tolerance, retained original point/distance/material/fallback and physical
+gates, and preserved the failed attempt. No physics or tolerance relaxation.
+All four selectors/card pass in physical attempt02, manifest SHA256
+`b8fe52080784323eac071ee054ec2e37563e34a513ca4ca0c6bd82e6a2490ed3`.
+
+Whole physics loses:19.458857175->20.587984375ms RTX (0.945156x),
+25.1015952->30.004724475ms GB (0.836588x). Original caps/source/activation
+checks pass. Contacts/rows changed approximately0.4--1.3%, insufficient by
+itself to explain the complete loss. Artifact
+`/tmp/fpgs-g1-analytic-manifold-paired16k-20260914-02`.
+Keep this candidate default-off and OUT of the good baseline. One original
+node capture is next to diagnose added owner cost; larger register allocation
+is a hypothesis, not a demonstrated occupancy cause. Do not start a sweep.
+
+Preserve whole attempt01: its untimed observer expected the short old kernel
+key instead of actual `create_query_kernel__locals__heightfield_finite_contacts`.
+Both baseline children failed before measured physics, so no timing is valid.
+The corrected derivative changes only that literal and retains the old
+parent/metric/capacity/source laws; successful02 uses the independently
+checked wrapper `/tmp/fpgs-g1-collision-redesign-checked-rn5lvjV1`.
+
+## Next bounded owner: exact convex adjacency
+
+Funded at11:40, first checkpoint12:25 and hard90-minute checkpoint13:10 UTC.
+Branch `ooctipus/fpgs-allegro-exact-hill-20260914` starts at accepted Allegro
+rejection-only `fba9fead70d17728f842954d66cf1f05f4617d40`.
+Prior previous-winner hill climbing reduced certified scalar support work
+2.305x/2.306x but had NO CUDA timing; it is unmeasured, not a diagnosed
+native loss. Existing sampled directions contain zero complete original
+warps, so no SIMT throughput claim follows from that scalar work reduction.
+
+The bounded implementation must replace the coherent classifier's full
+support/feature/magnitude contract AND cold MPR, cold GJK and manifold support.
+Their source-matched RTX owner sum3.564852ms leaves at most2.094574ms for
+the replacement to close today's1.470278ms Allegro gap to4x. This is high
+risk, but measurable. Charge the actual2,523,136-key persistent pair domain:
+two endpoint words, four packed eight-bit family seeds each, cost19.25MiB.
+By-value provider scalar mutation is not persistent state. Preserve current
+source/epoch ownership, immutable valid cooked convex adjacency, primitive
+specializations and original full-scan fallback for uncertain certificates.
+Use existing physical and integrated16K paired benchmark owners, not a new
+census/framework. Whole cost is authoritative; one evidence-backed causal
+correction may follow a miss.
