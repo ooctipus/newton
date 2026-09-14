@@ -1,4 +1,80 @@
-# Current warm shell implementation — not GPU qualified
+# Current warm shell implementation — closed whole-task loss
+
+## September14,02:40: valid full cost and decisive diagnosis
+
+Runtime `8a45444bf3a61c36560e9d3a008988b31697ed8d` fixes the shared polygon
+epoch: peer lanes capture count/bank before evaluating vertices, and all
+lanes finish before lane0 clips or changes either shared value. The new
+source regression fails without the fix. Twelve CPU tests/pre-commit pass;
+18 physical methods/card pass with0 skips/errors/failures. Both full warmups
+then finish without the earlier shared-read crash. This is not a claim that
+the earlier allocation-order memcheck report was resolved: baseline repeats
+that non-discriminating report, and the original diagnostic logs remain.
+
+The first post-fix full run was correctly rejected by capacity checks:
+raw peaks390708/390594 exceed286720, and RTX also exceeds row capacity192.
+No timing was accepted from that run. Read-only ownership review finds no
+duplicate warm/cold queue publication. The shell publishes a wide3–4 point
+patch plus deepest witness, whereas the original fitted manifold can reject
+its patch at the2-degree gate and retain just its deepest point. More
+contacts are not themselves proof of better or worse physics.
+
+Existing demand calibration first uses raw393216 with rows192. It records
+attempted row peaks214 RTX/218 GB, retaining failure and dropped telemetry.
+One measured retry with rows224 completes200/40/40 with all1120 collision
+checks and all row-drop counters clean: raw376215/375786 and rows223/218.
+Because223 leaves only one row of margin, the final comparison uses rows240,
+raw393216, original MF64 and broad524288 in **both arms**; propagation240 is
+constructor-derived. No timestep, iteration, material or contact threshold
+changes. These are measured capacities, not guaranteed maxima for every run.
+
+| GPU | Current10a baseline | Complete8a shell | Baseline/candidate |
+|---|---:|---:|---:|
+| RTX |17.326773ms|130.477195ms|0.132795x|
+| GB300 |16.987419ms|105.718710ms|0.160685x|
+
+One16K seed0,200 warm/40 wall/40 physics discovery. All four children,
+original two-boundary capacity/finite/source checks, actual shell activation,
+equal allocation checks and final source/idle guards pass. Whole manifest
+`/tmp/fpgs-convex-shell-allegro-variants-paired16k-20260914-03/manifest.json`,
+SHA256 `afe6400323063f786fb5ab1115d1c2a8ae0389d3147bd9078eb0d53a28ab7132`.
+The existing original owner command from READY.md uses only the compatibility
+folder `/tmp/fpgs-shell-measured-capacity-pbb508cK` and new output03. It
+executes the original capacity helper with four explicit allocation-source
+substitutions (SHA cd737b4c); the files and actual contract are recorded by
+the parent. Original helpers, Lab and installed packages remain unchanged.
+
+Three-step nodes identify102.488358ms RTX/76.867317ms GB in
+`current_shell_commit` alone. Runtime uses3008/2432 blocks of32, registers
+124/128,10496B shared and reported local memory0. Complete cap reconstruction,
+edge/slab intersection, serial sorting/clipping and repeated surface-plane
+evaluations are new work; they overwhelm the historical~2.925ms covered cold
+query envelope. This is an expensive representation, not a small mapping
+defect. PGS also costs15.6131/16.9802ms with the new contact output. Even
+subtracting the entire shell kernel from the captured whole span leaves
+about29.22/29.88ms, already above the current baseline. This optimistic
+fixed-trace subtraction is not a measured zero-shell implementation or a
+hardware-counter attribution.
+
+Both node children and the original process-scoped physics-graph analyzer
+pass, retaining12 physics roots and all2088 graph kernel/memory nodes per
+card. The backend parent subsequently fails its final ratio calculation
+because this deliberately single-FPGS diagnostic has no MJ arm; that failed
+status is preserved. Independent original capacity/source/idle checks pass.
+Node manifest `/tmp/fpgs-convex-shell-allegro-nodes-paired16k-20260914-01/manifest.json`,
+SHA256 `5477c3569b4d9d0755c1e7e2601f869c2825db055b3ec42ca31bb7f4cf451204`.
+Demand retry manifest SHA256
+`435d22e9d7a1b1b52dae7641c1d0816c35aea5b6316345ec63cd4c7ba189a482`;
+physical fix manifest SHA256
+`62ccb96cd7579e887b35ad93af4edc16e628013b7816ead60546d0e128a0224a`.
+
+Decision: keep default-off and do not promote or tune this representation.
+A replacement needs inexpensive feasible contact support without building
+the complete shell polygon, and must account for its downstream row/solve
+cost. No new such algorithm has yet met that cost model. The earlier
+physical holds, capacity failures and original handoff remain preserved.
+
+## Original implementation checkpoint
 
 This isolated experiment starts from `10a0b5242109000c699cc92f8c884254ac329ddf`
 on branch `ooctipus/convex-shell-warm-20260913`. The measured predecessor and
