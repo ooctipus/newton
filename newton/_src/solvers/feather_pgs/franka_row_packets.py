@@ -258,20 +258,46 @@ def get_local_factory():
 
 
 def validate_prefix_topology(groups, worlds, starts, mimic_start, mimic_list, mimic_dof0, mimic_dof1, mimic_world=None):
-    """Reject omitted list entries, including disabled entries before valid ones."""
-    if len(groups) != len(set(worlds[groups])) or len(groups) != len(set(worlds)):
+    """Check every prefix entry without per-world Python iteration.
+
+    Notifications can reach this predicate on every batch reset. Keep the
+    complete current topology checks, including disabled mimic entries, but
+    vectorize over worlds and iterate only over the two possible mimic slots.
+    """
+    art_count = min(len(worlds), len(starts) - 1, len(mimic_start) - 1)
+    if np.any(groups < 0) or np.any(groups >= art_count):
         return False
-    for art in groups:
-        if starts[art + 1] - starts[art] != 9 or mimic_start[art + 1] - mimic_start[art] > 2:
+    group_worlds = worlds[groups]
+    if len(groups) != np.unique(group_worlds).size or len(groups) != np.unique(worlds).size:
+        return False
+    first_dof, end_dof = starts[groups], starts[groups + 1]
+    first_entry, end_entry = mimic_start[groups], mimic_start[groups + 1]
+    counts = end_entry - first_entry
+    if (
+        np.any(first_dof < 0)
+        or np.any(end_dof - first_dof != 9)
+        or np.any(first_entry < 0)
+        or np.any(end_entry > len(mimic_list))
+        or np.any(counts < 0)
+        or np.any(counts > 2)
+    ):
+        return False
+    entry_count = min(len(mimic_dof0), len(mimic_dof1))
+    if mimic_world is not None:
+        entry_count = min(entry_count, len(mimic_world))
+    for slot in range(2):
+        active = counts > slot
+        entries = mimic_list[first_entry[active] + slot]
+        if np.any(entries < 0) or np.any(entries >= entry_count):
             return False
-        for entry in mimic_list[mimic_start[art] : mimic_start[art + 1]]:
-            if mimic_world is not None and mimic_world[entry] != worlds[art]:
-                return False
-            # Even disabled entries must be safe if subsequently enabled.
-            if not (starts[art] <= mimic_dof0[entry] < starts[art + 1]):
-                return False
-            if not (starts[art] <= mimic_dof1[entry] < starts[art + 1]):
-                return False
+        if mimic_world is not None and np.any(mimic_world[entries] != group_worlds[active]):
+            return False
+        # Even disabled entries must be safe if subsequently enabled.
+        lower, upper = first_dof[active], end_dof[active]
+        if np.any(mimic_dof0[entries] < lower) or np.any(mimic_dof0[entries] >= upper):
+            return False
+        if np.any(mimic_dof1[entries] < lower) or np.any(mimic_dof1[entries] >= upper):
+            return False
     return True
 
 

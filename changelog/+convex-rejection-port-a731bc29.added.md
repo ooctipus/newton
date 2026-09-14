@@ -1,0 +1,1 @@
+Add an experimental, default-off `NEWTON_NARROW_PHASE_COHERENT_CONVEX=reject_only` filter for admitted lean CUDA explicit collision pipelines, reusing current full-shape separation certificates while preserving original cold retained queries, manifold publication, reset ownership, and buffer checks.

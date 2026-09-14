@@ -2297,6 +2297,12 @@ class NarrowPhase:
     but may choose different physically supported manifold points. Construction
     through CollisionPipeline binds immutable convex hull bounds; refitting a
     bound convex hull requires rebuilding this experimental pipeline.
+
+    Experimental ``NEWTON_HEIGHTFIELD_GEOMETRIC_CULL=1`` additionally rejects
+    separated cuboid triangles inside the existing cell append owner. It
+    requires finite query, cell rejection and the stock nonpredictive global
+    reducer. Current scale, poses, heights, gaps and scaled reducer threshold
+    remain live; unsupported geometry and custom writers retain the old path.
     """
 
     def __init__(
@@ -2443,6 +2449,21 @@ class NarrowPhase:
         if finite_query not in ("0", "1"):
             raise ValueError("NEWTON_HEIGHTFIELD_FINITE_QUERY must be 0 or 1")
         self._heightfield_finite_query = finite_query == "1" and has_heightfields and not has_meshes and not speculative
+        geometric_cull = os.environ.get("NEWTON_HEIGHTFIELD_GEOMETRIC_CULL", "0")
+        if geometric_cull not in ("0", "1"):
+            raise ValueError("NEWTON_HEIGHTFIELD_GEOMETRIC_CULL must be 0 or 1")
+        geometric_writer_supported = contact_writer_warp_func is None
+        if geometric_cull == "1" and not geometric_writer_supported:
+            from ..sim.collide import write_contact as stock_contact_writer  # noqa: PLC0415
+
+            geometric_writer_supported = contact_writer_warp_func is stock_contact_writer
+        self._heightfield_geometric_cull = (
+            geometric_cull == "1"
+            and self._heightfield_cell_reject
+            and self._heightfield_finite_query
+            and reduce_contacts
+            and geometric_writer_supported
+        )
         self._finite_bounds = None
         self._finite_source = None
         self.mesh_sdf_texture_only = mesh_sdf_texture_only
@@ -2518,6 +2539,9 @@ class NarrowPhase:
         if candidate_pair_work_estimate < 0:
             raise ValueError("candidate_pair_work_estimate must be non-negative or None")
         self.split_gjk_mpr = device_obj.is_cuda and has_generic_convex_pairs and split_gjk_mpr
+        self._use_lean_gjk_mpr = use_lean_gjk_mpr
+        self._coherent_cache = None
+        self._coherent_query_kernels = None
         # Create the appropriate kernel variants
         # Primitive kernel handles lightweight primitives and routes remaining pairs
         self.primitive_kernel = create_narrow_phase_primitive_kernel(
@@ -2961,41 +2985,85 @@ class NarrowPhase:
                     shape_collision_aabb_lower,
                     shape_collision_aabb_upper,
                 ]
-                wp.launch(
-                    kernel=self.narrow_phase_mpr_kernel,
-                    dim=self.total_num_threads,
-                    inputs=[
+                if self._coherent_cache is not None:
+                    from .coherent_convex_rejection import _PairInputs  # noqa: PLC0415
+
+                    self._coherent_cache.begin()
+                    pair_inputs = _PairInputs()
+                    for name, value in zip(
+                        (
+                            "shape_types",
+                            "shape_data",
+                            "shape_transform",
+                            "shape_source",
+                            "shape_gap",
+                            "shape_collision_radius",
+                            "shape_aabb_lower",
+                            "shape_aabb_upper",
+                            "shape_collision_aabb_lower",
+                            "shape_collision_aabb_upper",
+                        ),
+                        common_inputs,
+                        strict=True,
+                    ):
+                        setattr(pair_inputs, name, value)
+                    coherent_inputs = [
                         convex_pairs,
                         convex_pair_count,
-                        *common_inputs,
+                        pair_inputs,
+                        self._coherent_cache.data,
                         self.total_num_threads,
                         self.split_query_results,
                         self.split_gjk_work_items,
                         self.split_gjk_work_count,
                         self.split_manifold_work_items,
                         self.split_manifold_work_count,
-                    ],
-                    device=device,
-                    block_dim=self.block_dim,
-                    record_tape=False,
-                )
-                wp.launch(
-                    kernel=self.narrow_phase_gjk_kernel,
-                    dim=self.total_num_threads,
-                    inputs=[
-                        convex_pairs,
-                        *common_inputs,
-                        self.total_num_threads,
-                        self.split_query_results,
-                        self.split_gjk_work_items,
-                        self.split_gjk_work_count,
-                        self.split_manifold_work_items,
-                        self.split_manifold_work_count,
-                    ],
-                    device=device,
-                    block_dim=self.block_dim,
-                    record_tape=False,
-                )
+                    ]
+                    for coherent_kernel in self._coherent_query_kernels:
+                        wp.launch(
+                            kernel=coherent_kernel,
+                            dim=self.total_num_threads,
+                            inputs=coherent_inputs,
+                            device=device,
+                            block_dim=self.block_dim,
+                            record_tape=False,
+                        )
+                else:
+                    wp.launch(
+                        kernel=self.narrow_phase_mpr_kernel,
+                        dim=self.total_num_threads,
+                        inputs=[
+                            convex_pairs,
+                            convex_pair_count,
+                            *common_inputs,
+                            self.total_num_threads,
+                            self.split_query_results,
+                            self.split_gjk_work_items,
+                            self.split_gjk_work_count,
+                            self.split_manifold_work_items,
+                            self.split_manifold_work_count,
+                        ],
+                        device=device,
+                        block_dim=self.block_dim,
+                        record_tape=False,
+                    )
+                    wp.launch(
+                        kernel=self.narrow_phase_gjk_kernel,
+                        dim=self.total_num_threads,
+                        inputs=[
+                            convex_pairs,
+                            *common_inputs,
+                            self.total_num_threads,
+                            self.split_query_results,
+                            self.split_gjk_work_items,
+                            self.split_gjk_work_count,
+                            self.split_manifold_work_items,
+                            self.split_manifold_work_count,
+                        ],
+                        device=device,
+                        block_dim=self.block_dim,
+                        record_tape=False,
+                    )
                 wp.launch(
                     kernel=self.narrow_phase_manifold_kernel,
                     dim=self.total_num_threads,
@@ -3102,6 +3170,13 @@ class NarrowPhase:
                     self.shape_pairs_mesh_count,
                     midphase_workers,
                 ]
+                if self._heightfield_geometric_cull:
+                    from .heightfield_geometric import heightfield_geometric_overlaps_kernel  # noqa: PLC0415
+
+                    if self._finite_bounds is None:
+                        raise RuntimeError("Geometric cull requires CollisionPipeline finite model binding")
+                    midphase_kernel = heightfield_geometric_overlaps_kernel
+                    midphase_inputs.extend([shape_types, shape_source, self._finite_bounds, self._finite_source])
             wp.launch(
                 kernel=midphase_kernel,
                 dim=[midphase_workers, second_dim],
