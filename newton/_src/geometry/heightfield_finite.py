@@ -12,6 +12,7 @@ original generic query, writer and reducer.
 import functools
 import inspect
 import linecache
+import os
 import textwrap
 from typing import Any
 
@@ -19,11 +20,72 @@ import numpy as np
 import warp as wp
 
 from ..utils.heightfield import HeightfieldData, get_triangle_shape_from_heightfield
+from .collision_convex import ConvexQueryResult, create_write_convex_query_result
+from .collision_core import post_process_axial_on_discrete_contact
 from .contact_data import ContactData
 from .heightfield_features import WELD_FLAT_SEAMS, HeightfieldFeatureContext, flat_seam_query_allowed
+from .support_function import SupportMapDataProvider, extract_shape_data, support_map
 from .types import GeoType
 
 QueryResult = wp.types.vector(length=24, dtype=wp.float32)
+ANALYTIC_MANIFOLD = os.environ.get("NEWTON_HEIGHTFIELD_ANALYTIC_MANIFOLD", "0") == "1"
+
+
+@wp.func
+def query_top_face_witness(
+    e1: wp.vec3,
+    e2: wp.vec3,
+    center: wp.vec3,
+    rotation: wp.quat,
+    half: wp.vec3,
+    threshold: float,
+    margin_sum: float,
+) -> tuple[bool, ConvexQueryResult]:
+    """Certify a separated supporting face, retaining uncertain boundaries."""
+    result = ConvexQueryResult()
+    for k in range(3):
+        if not (wp.isfinite(e1[k]) and wp.isfinite(e2[k]) and wp.isfinite(center[k]) and wp.isfinite(half[k])):
+            return False, result
+        if half[k] <= 0.0:
+            return False, result
+    for k in range(4):
+        if not wp.isfinite(rotation[k]):
+            return False, result
+    if not (wp.isfinite(threshold) and wp.isfinite(margin_sum)) or margin_sum < 1.0e-4:
+        return False, result
+    q2 = wp.dot(rotation, rotation)
+    normal = wp.cross(e1, e2)
+    n2 = wp.length_sq(normal)
+    if q2 < 1.0e-12 or not wp.isfinite(q2) or n2 < 1.0e-20 or not wp.isfinite(n2) or normal[2] <= 0.0:
+        return False, result
+    normal /= wp.sqrt(n2)
+    q = wp.normalize(rotation)
+    local_normal = wp.quat_rotate_inv(q, normal)
+    local_support = wp.vec3()
+    for k in range(3):
+        if local_normal[k] > 0.0:
+            local_support[k] = -half[k]
+        elif local_normal[k] < 0.0:
+            local_support[k] = half[k]
+    point_b = center + wp.quat_rotate(q, local_support)
+    distance = wp.dot(point_b, normal)
+    # Keep finite-query and writer-boundary roundoff on the original route.
+    guard = 32.0 * 1.1920928955078125e-7 * (wp.length(center) + wp.length(half) + wp.length(e1) + wp.length(e2))
+    if not wp.isfinite(distance) or distance <= margin_sum + guard or distance >= threshold - guard:
+        return False, result
+    point_a = point_b - distance * normal
+    if wp.dot(wp.cross(e1, point_a), normal) <= guard * wp.length(e1):
+        return False, result
+    if wp.dot(wp.cross(e2 - e1, point_a - e1), normal) <= guard * wp.length(e2 - e1):
+        return False, result
+    if wp.dot(wp.cross(-e2, point_a - e2), normal) <= guard * wp.length(e2):
+        return False, result
+    result.point_a = point_a
+    result.point_b = point_b
+    result.normal = normal
+    result.signed_distance = distance
+    return True, result
+
 
 _QUERY = r"""
 using V=wp::vec3;
@@ -247,10 +309,16 @@ def bind_model(narrow, model):
 
 
 @functools.cache
-def create_query_kernel(writer_func):
+def create_query_kernel(writer_func, *, analytic_manifold: bool = ANALYTIC_MANIFOLD):
     """Create the analytical writer for the same global triangle stream."""
 
-    @wp.kernel(enable_backward=False, module="unique")
+    write_manifold = create_write_convex_query_result(support_map, writer_func, post_process_axial_on_discrete_contact)
+
+    @wp.kernel(
+        name="heightfield_analytic_manifold_contacts" if analytic_manifold else None,
+        enable_backward=False,
+        module="unique",
+    )
     def heightfield_finite_contacts(
         shape_types: wp.array[int],
         shape_data: wp.array[wp.vec4],
@@ -294,6 +362,55 @@ def create_query_kernel(writer_func):
             center_world = wp.transform_get_translation(xb) + wp.quat_rotate(qb, wp.cw_mul(bounds[b, 0], scale))
             center = wp.quat_rotate_inv(qa, center_world - origin)
             gap = shape_gap[a] + shape_gap[b]
+            if wp.static(analytic_manifold):
+                certified, witness = query_top_face_witness(
+                    geom.scale,
+                    geom.auxiliary,
+                    center,
+                    wp.quat_inverse(qa) * qb,
+                    wp.cw_mul(bounds[b, 1], scale),
+                    gap + margin_a + margin_b,
+                    margin_a + margin_b,
+                )
+                if certified:
+                    context = HeightfieldFeatureContext()
+                    if wp.static(WELD_FLAT_SEAMS):
+                        context.heightfield = heightfield_data[shape_heightfield_index[a]]
+                        context.elevations = heightfield_elevations
+                        context.triangle = tri_idx
+                    allowed = True
+                    if wp.static(WELD_FLAT_SEAMS):
+                        allowed = flat_seam_query_allowed(geom, witness.point_a, witness.normal, context)
+                    if allowed:
+                        pos_b, _rot_b, geom_b, _scale_b, _margin_b = extract_shape_data(
+                            b, shape_transform, shape_types, shape_data, shape_source
+                        )
+                        template = ContactData()
+                        template.shape_a = a
+                        template.shape_b = b
+                        template.margin_a = margin_a
+                        template.margin_b = margin_b
+                        template.gap_sum = gap
+                        template.sort_sub_key = (tri_idx << 1) | 1
+                        wp.static(write_manifold)(
+                            geom,
+                            geom_b,
+                            qa,
+                            qb,
+                            origin,
+                            pos_b,
+                            wp.quat_inverse(qa) * qb,
+                            wp.quat_rotate_inv(qa, pos_b - origin),
+                            witness,
+                            SupportMapDataProvider(),
+                            False,
+                            writer_data,
+                            template,
+                        )
+                    # A filtered certified query is handled too, exactly as in
+                    # the original query-filter-before-manifold ordering.
+                    triangle_pairs[i] = wp.vec3i(a, b, ~tri_idx)
+                    continue
             value = query_contacts(
                 geom.scale,
                 geom.auxiliary,

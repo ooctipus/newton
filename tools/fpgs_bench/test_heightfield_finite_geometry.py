@@ -157,10 +157,18 @@ def current_fixture(gpu, device):
 
 
 @cache
-def stream_query_kernel():
+def stream_query_kernel(*, analytic_manifold=None):
     """Use the production ABI on the exact decoded current triangle stream."""
-    from newton._src.geometry.heightfield_finite import QueryResult, query_contacts  # noqa: PLC0415
+    from newton._src.geometry.heightfield_finite import (  # noqa: PLC0415
+        ANALYTIC_MANIFOLD,
+        QueryResult,
+        query_contacts,
+        query_top_face_witness,
+    )
     from newton._src.utils.heightfield import HeightfieldData, get_triangle_shape_from_heightfield  # noqa: PLC0415
+
+    if analytic_manifold is None:
+        analytic_manifold = ANALYTIC_MANIFOLD
 
     @wp.kernel(enable_backward=False, module="unique")
     def evaluate(
@@ -194,6 +202,27 @@ def stream_query_kernel():
             threshold,
             margins[0] + margins[triple[1]],
         )
+        if wp.static(analytic_manifold):
+            certified, witness = query_top_face_witness(
+                tri.scale,
+                tri.auxiliary,
+                center,
+                quat,
+                scales[triple[1]] * 0.5,
+                threshold,
+                margins[0] + margins[triple[1]],
+            )
+            if certified:
+                # Audit the closest witness and logical ownership. The full
+                # original manifold is checked separately at public output.
+                value = QueryResult()
+                value[0] = 1.0
+                middle = 0.5 * (witness.point_a + witness.point_b)
+                for k in range(3):
+                    value[k + 1] = witness.normal[k]
+                    value[k + 4] = middle[k]
+                value[7] = witness.signed_distance
+                output[i] = value
         vertices[i, 0] = wp.vec3()
         vertices[i, 1] = tri.scale
         vertices[i, 2] = tri.auxiliary
