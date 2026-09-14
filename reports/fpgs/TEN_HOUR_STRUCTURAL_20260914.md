@@ -589,3 +589,72 @@ Original guarded whole16K200/40/40 comparison against925 cells is starting,
 with cells enabled on both arms. There is no performance result yet.
 First launch01 stopped before children because the required local launch-card
 file was missing; its failed manifest is retained. Corrected02 includes it.
+
+## September14 22:10: Allegro crosses the RTX four-times threshold
+
+Corrected keyed runtime7fca2fdf whole discovery against925 cells on both arms:
+RTX16.340675->15.201010ms (1.074973x); GB16.517619->16.719848ms
+(0.987905x). The planned2ms saving was missed. Actual strict node attribution
+shows row/setup retirement offset partly by slower parallel tiers, not a
+hidden removal of required contact work. RTX parallel4.889749->5.852930ms;
+GB5.508978->7.396244ms. GB's one821.568us fallback spike adds only0.270368ms,
+not most of the solve growth. Actual executed sweeps are not captured, so
+geometry cost versus rounding-sensitive early stopping remains unresolved.
+
+Fresh three-round same-source corrected MJWarp comparison completes at21:55:
+
+|GPU|FPGS physics ms|MJ physics ms|median physics ratio|FPGS/MJ wall ms|
+|---|---:|---:|---:|---:|
+|RTX PRO6000|15.103509|63.536818|4.206759x|23.131495 /71.449856|
+|GB300|16.664395|82.023917|4.922106x|24.920978 /91.547777|
+
+All three same-round RTX ratios exceed4x. All12 children and original source,
+capacity, idle, finite-state and line-search checks pass. GB MJ's third round
+is94.850148ms, an explicit retained outlier; the median above is82.023917ms.
+These physics ratios are not environment throughput or full RL training.
+Allegro's original MJ recipe uses native MuJoCo contacts: no Newton collision
+pipeline exists there, so direction cells are genuinely inapplicable. Do not
+change that contact mode to manufacture a common-pipeline comparison.
+Artifact `/tmp/fpgs-allegro-keyed-corrected-backends-paired16k-20260914-01`;
+full qualification/reproduction report commit a08f7f19 is pushed to
+`ooctipus/fpgs-allegro-keyed-kinetic-rows-20260914` on the user's fork.
+
+Kuka's report-only tip298c038e and prior ledger531a9294 are also pushed and
+remote-verified. A new source composition1921e214 retains both qualified
+ancestors, original31cf handoff ancestry and all existing accepted features.
+Its249 Kuka records and eight Allegro native hashes/ordered ABIs are unchanged;
+91 executed CPU checks pass,28 actual-CUDA cases explicitly skipped in that
+CPU batch. Existing GPU integration controls are running, not a fresh timing
+claim for the composed tree. Original Lab and all prior worktrees remain intact.
+
+### Next bounded work: ANYmal reuse of already-computed exact Gram products
+
+Current ANY18/WR/EX1 already forms full admitted pairwise products for its
+step-size row sums, then discards them. New default-off prototype retains
+those coefficients in fixed-index registers and reuses the original dense
+four-accumulator product inside the same24-step projected/Nesterov law. It
+retires the repeated MF transpose/reduction and its synchronization, without
+global A/Z publication or reactivating the legacy producers. The historical
+shared-A/global-Z path already lost to MF and is not being rebranded as new.
+Original current/held fixtures and physical quality gates are reused.
+
+First offline compile has no stack/spills but registers rise from86/80 to
+172/204 on RTX32/48 tiers; GB80/80->170/202. Shared storage is unchanged5408B
+at32 and7492->7276B at48. This is a major resource risk, NOT a measured loss.
+Inspect one code-generation/lifetime cause before any correction; no launch
+grid or arbitrary register cap. Whole saving target is at least1ms on ANY,
+not merely the0.22ms required to round its current3.91x over4x.
+
+Read-only boundaries closed without another prototype: Keyboard's historical
+source-equivalent full contact/solve boundary2.764919ms already had losing
+private and packed replacements; lazy-publication plus following FK has only
+0.491777ms zero-cost ceiling. G1 corresponding publication/FK ceiling0.931126ms
+already excludes its cache-hit next FK. Do not count a nonexistent second FK
+traversal as removable work. A separate check of16 pinned selected G1 current/
+held operator cases finds no exact duplicate contact triples or coplanar group
+with more than two distinct contacts, so it does not fund exact redundant
+contact-hull elimination. These selected cases are not a population census.
+
+The all-task RTX4x target remains unmet. Latest known RTX ratios are Franka
+1.95x, Kuka about2.47x versus the previous MJ reference, Allegro4.21x fresh,
+ANY3.91x, G12.08x and Keyboard3.69x. Do not relabel old rows as new measurements.
