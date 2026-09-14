@@ -614,16 +614,87 @@ class TestIndependentGeometry(unittest.TestCase):
         if hasattr(q, "QUALIFICATION_REPORT"):
             report["prior_qualification"] = q.QUALIFICATION_REPORT
         q.QUALIFICATION_REPORT = report
+
+        def support_tail_diagnostic(record, tail):
+            """Compare every actual tail impulse without replacing the original sampled gate."""
+            result = {"steps": [161, 240], "samples": tail, "complete_80_steps": len(tail) == 80}
+            if not result["complete_80_steps"]:
+                return result
+            forces = np.asarray([item["force"] for item in tail])
+            weight = record["mass"] * 9.81
+            dt = record["dt"]
+            duration = len(tail) * dt
+            before = np.asarray(tail[0]["momentum_before"])
+            after = np.asarray(tail[-1]["momentum_after"])
+            contact_impulse = forces.sum(axis=0) * dt
+            required_impulse = after - before + np.array([0.0, 0.0, weight * duration])
+            closure = float(
+                np.linalg.norm(contact_impulse - required_impulse)
+                / max(1.0, np.linalg.norm(contact_impulse), np.linalg.norm(required_impulse))
+            )
+            force_departure = np.abs(forces[:, 2] - weight) > 0.02 * weight
+            longest = current = 0
+            for departed in force_departure:
+                current = current + 1 if departed else 0
+                longest = max(longest, current)
+            result.update(
+                duration_s=duration,
+                weight_n=weight,
+                mean_force_n=forces.mean(axis=0).tolist(),
+                mean_vertical_relative_error=float(abs(forces[:, 2].mean() - weight) / weight),
+                mean_within_original_2_percent=bool(abs(forces[:, 2].mean() - weight) <= 0.02 * weight),
+                contact_impulse_ns=contact_impulse.tolist(),
+                required_impulse_ns=required_impulse.tolist(),
+                momentum_scaled_error=closure,
+                momentum_within_original_2e_4=bool(closure <= 2e-4),
+                force_departure_total_s=float(force_departure.sum() * dt),
+                force_departure_longest_s=longest * dt,
+                three_contact_total_s=sum(item["contacts"] == 3 for item in tail) * dt,
+                peak_spin_rad_s=max(float(np.linalg.norm(item["twist"][3:])) for item in tail),
+                original_five_sample_mean_n=float(np.mean([item["force"][2] for item in record["samples"][-5:]])),
+                original_failures=list(record["failures"]),
+            )
+            return result
+
         for name in ("support", "tilted_foot", "sliding", "finite_border"):
             case = next(case for case in q.CASES if case.name == name)
             pair = []
             for enabled in (False, True):
+                tail = []
+                step = 0
+                original_public_force = q.public_force
+
+                def observe_support_force(scene, state, original=original_public_force, samples=tail):
+                    """Read the just-solved output bank after the one original force publication."""
+                    nonlocal step
+                    force = original(scene, state)
+                    step += 1
+                    if scene.case.name == "support" and 161 <= step <= 240:
+                        out = scene.states[1] if state is scene.states[0] else scene.states[0]
+                        samples.append(
+                            {
+                                "step": step,
+                                "force": force.tolist(),
+                                "contacts": int(scene.contacts.rigid_contact_count.numpy()[0]),
+                                "pose": out.body_q.numpy()[scene.foot].astype(float).tolist(),
+                                "twist": out.body_qd.numpy()[scene.foot].astype(float).tolist(),
+                                "momentum_before": q.linear_momentum(scene, state).tolist(),
+                                "momentum_after": q.linear_momentum(scene, out).tolist(),
+                            }
+                        )
+                    return force
+
                 try:
-                    record = q.run_case(case, enabled, "cuda:0", reduce=True)
+                    with patch.object(q, "public_force", observe_support_force):
+                        record = q.run_case(case, enabled, "cuda:0", reduce=True)
+                    if name == "support":
+                        record["support_tail_diagnostic"] = support_tail_diagnostic(record, tail)
                     pair.append(record)
                     report["failures"].extend([name, enabled, error] for error in record["failures"])
                 except Exception as error:  # Retain all eight cases before reporting failure.
                     record = {"case": {"name": name}, "enabled": enabled, "reduce": True, "error": repr(error)}
+                    if name == "support":
+                        record["support_tail_diagnostic"] = {"samples": tail, "complete_80_steps": False}
                     q.RECORDS.append(record)
                     report["failures"].append([name, enabled, repr(error)])
                 report["records"].append(record)
