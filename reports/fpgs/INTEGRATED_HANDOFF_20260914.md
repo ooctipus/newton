@@ -106,3 +106,29 @@ The original Lab handoff remains unchanged at
 `/home/octi/Projects/IsaacLab.wt/contact-reset-20260913/reports/fpgs/HANDOFF_fpgs_20260911.md`.
 Its historical source/timing context is preserved, not relabeled as today's
 baseline. Lab remains pinned to `53ee6b44c2334341305dbdf385a3916c6b140799`.
+
+## Current composed successor, September 14
+
+Branch `ooctipus/fpgs-fourx-qualified-20260914` now combines the qualified Kuka
+and Allegro sources. Code merge `17f8a19ae1a5c388838b1d9000d96f27ecd16b77`
+retains parents 298c and 7fca; report merge
+`1921e214b59a80046cb3804df6aee7d95e23bb02` additionally preserves a08's
+completed Allegro evidence. Original trees and the inherited fork remain intact.
+See the [composed integration card](FOURX_QUALIFIED_INTEGRATION_20260914.md)
+for source proofs, exact selectors, results and reproduction prerequisites.
+
+On composed 1921, six focused CUDA tests per card pass with zero skips:
+16.141 s RTX and 16.971 s GB. Four cover Allegro current/held rows, physical
+fallback and actual production reset/graph behavior; two cover retained Kuka
+joint/predictor/publication queue controls, not full private-kinetic trajectory
+requalification. Kuka's 249-record oracle and all eight Allegro original/keyed
+PARALLEL native contracts remain unchanged. Allegro scalar fallback instead
+uses the retained Kuka MF factory; its physical controls pass, but its native
+bytes are not claimed identical to 7fca.
+
+The qualified 7fca predecessor measures 4.206759x RTX / 4.922106x GB against
+corrected native-contact MJWarp, with the retained GB outlier and incremental
+GB loss documented. These are not new timings of the composed tree. The
+all-six-task 4x goal remains unmet; neither test durations nor environment
+wall comparisons measure full RL-training throughput. This update changes
+reports only, leaving runtime, source pins and physics budgets unchanged.

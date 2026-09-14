@@ -14,9 +14,10 @@ replacing the solver wholesale. Fixed Lab remains
 
 This composes separately qualified task-specific implementations. It is not
 a fresh measurement of the composed tree or completion of the user's
-four-times-corrected-MJ goal across all six tasks. No GPU job, new benchmark
-framework, timestep, substep, iteration or capacity change is part of this
-source integration.
+four-times-corrected-MJ goal across all six tasks. The initial source merge
+uses no GPU job or new benchmark framework; the later root-owned focused CUDA
+checks are recorded below. No timestep, substep, iteration or capacity change
+is part of this integration.
 
 ## Required compatibility gates
 
@@ -62,6 +63,13 @@ and keyed 32/64/96/128-row kernels against 7fca: their generated native bytes,
 keys and ordered parameter/type ABIs match. No GPU or AOT benchmark was run
 for that comparison. The keyed ABI differs from the ordinary ABI as intended;
 each matches its corresponding qualified original, not each other.
+
+This eight-kernel identity proof covers the PARALLEL tiers, not every Allegro
+native entry. Allegro's scalar fallback uses the retained Kuka MF factory,
+whose restored default interpolation formatting differs from 7fca. The
+observed generated module suffix changes from `03bd` to `772c`. Do not claim
+scalar-fallback byte identity with 7fca: its physical fallback behavior passes
+the integrated CUDA controls below. No frozen Kuka expectation is regenerated.
 
 Default-off cells allocate no masks and retain the original query owners.
 Their built-in box-support hook resolves to the original function for existing
@@ -126,8 +134,47 @@ Kuka's qualified 6c229 successor retains repeated physics medians
 12.506653 -> 11.119767 ms RTX and 12.033355 -> 11.339816 ms GB against baf.
 Its GB wall evidence remains mixed, including the original paired regression;
 see [the retained Kuka report](KUKA_KINETIC_INTEGRATION_20260914.md).
-The combined source still requires root's integrated checks. Allegro has
+The focused integrated CUDA checks below pass; whole-physics throughput has
+not been remeasured on the combined tree. Allegro's qualified predecessor has
 crossed its measured RTX target; the all-six-task goal remains unmet.
+
+## Focused CUDA qualification on the composed source
+
+Root executes the six unchanged selectors below on clean report tip
+`1921e214b59a80046cb3804df6aee7d95e23bb02`, whose runtime is code merge
+17f8a19a. Both owned sessions finish successfully, with no skipped tests:
+
+| Card | Tests passed | Test duration | Reaped session | Exit |
+| --- | ---: | ---: | ---: | ---: |
+| RTX PRO6000 | 6 | 16.141 s | 97544 | 0 |
+| GB300 | 6 | 16.971 s | 89940 | 0 |
+
+The four Allegro selectors retain current/held physical defects of
+3.39e-8--3.90e-8 and pass actual production fallback, reset and graph
+grow/shrink, including the merged notification/full-step path. The two Kuka
+selectors exercise the retained joint/predictor/publication owner and queue
+transitions. They are NOT full private-kinetic trajectory requalification.
+These durations include test execution/module loading, not representative
+whole-physics or environment-wall timing. No new performance claim follows.
+
+Reproduce from the composed worktree using the fixed Lab interpreter, one
+leased GPU UUID per process on each card, and require six passes with zero
+skips. The only environment placeholders below are that process's same UUID:
+
+```bash
+env CUDA_VISIBLE_DEVICES='<leased GPU UUID>' GPU='<leased GPU UUID>' \
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONPATH=/home/octi/Projects/newton-fpgs-fourx-qualified-20260914 \
+  uv run --no-project \
+  --python /home/octi/Projects/IsaacLab.wt/contact-reset-20260913/.venv/bin/python \
+  python -m unittest \
+  tools.fpgs_bench.test_allegro_kinetic_rows.TestAllegroKineticRowsCUDA.test_native_current_held_rows_and_fallback \
+  tools.fpgs_bench.test_allegro_kinetic_rows.TestAllegroKineticRowsCUDA.test_native_parallel_matched_current_inputs \
+  tools.fpgs_bench.test_allegro_kinetic_rows.TestAllegroKineticRowsCUDA.test_native_graph_refresh_and_grow_shrink \
+  tools.fpgs_bench.test_allegro_kinetic_lifecycle.TestAllegroKineticLifecycleCUDA.test_production_step_held_refresh_fallback_reset_and_graph \
+  tools.fpgs_bench.test_kuka_joint_world.TestKukaJointWorld.test_actual_native_cuda \
+  tools.fpgs_bench.test_kuka_joint_world.TestKukaJointWorld.test_two_actual_graphs_empty_invalid_and_regrowth
+```
 
 ## Frozen handoff
 
@@ -135,6 +182,6 @@ Code merge `17f8a19ae1a5c388838b1d9000d96f27ecd16b77` has parents 298c and
 7fca. The subsequent merge of a08 changes only reports. The original Kuka
 and Allegro trees remain untouched by this composition, including the failed55
 ancestry and the inherited `31cf87f4694f873a027e41e2ca5e9ad441234456` fork.
-No source pin or parent dependency pointer is advanced, and no push or GPU
-execution is performed by this integration task. Root owns review and the
-remaining integrated qualification.
+No source pin or parent dependency pointer is advanced. Root's subsequent
+focused CUDA results are recorded above; this report update changes no runtime
+and launches no additional GPU work. Root owns review and pushing the handoff.
