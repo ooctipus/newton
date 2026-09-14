@@ -1,12 +1,124 @@
 # Structural window: integrated discoveries
 
-Checkpoint: 2026-09-14 05:23 UTC. Work continues toward the 24-hour window in
+Checkpoint: 2026-09-14 06:35 UTC. Work continues toward the 24-hour window in
 `STRUCTURAL_FOURX_20260913.md`; the 4x target is **not achieved**. These are
 discoveries, not replacements for accepted baselines except where repeat
 evidence is explicitly given. No candidate has met the complete 4x target.
 No Isaac Lab source, timestep, substep or iteration allowance was changed.
 
-**Current status:** the original finite-terrain manifold remains rejected.
+**Current status:** the new scalar-normal/metric-tangent contact path is frozen
+and pushed to the ooctipus fork at `7df75c46bd468b64c17958190fc800cfeb62201e`.
+CPU/native and four physical selectors per card pass. First whole timing saves
+only0.730459ms RTX/0.232808ms GB, below the planned2ms RTX milestone. The bounded
+node diagnosis finds only~0.897/0.333ms actually leaves the solver; retained
+stages are near flat. No tuning campaign or performance promotion follows.
+Initial GPU contention stopped the first launch before any output directory
+was created. Both cards became free at06:11 and the unchanged launch completed;
+no unrelated job was interrupted or benchmarked over.
+
+## Metric-tangent structural experiment (September14,06:35)
+
+The stopping-only CPU screen is closed. On the selected16 epochs, a fixed
+physical stopping test saves only123 of3227 row visits before charging2693
+checking visits. Six open worlds already stop exactly after one sweep.
+Loaded scalar tangent/sibling iterations retain a maximum-dissipation plateau
+even at1024 sweeps, identifying a numerical cause rather than just a slow
+execution mapping. Study: `/tmp/fpgs-g1-numerical-stop-cpu-InHlO554`.
+
+The new experiment keeps the original scalar normal update, then solves the
+two tangents jointly in their2x2 metric disk and publishes one combined triplet
+velocity update. A zero friction radius avoids tangent residual/cache/root
+work. Positive-radius contacts lazily form only three cross terms; a bounded
+reciprocal-norm Newton solve enforces the disk. Unsafe inputs/root failures
+fall back before changing physics outputs. CFM remains proximal-delta damping,
+not an added physical force. Maximum8 sweeps and exact-stationary exit remain;
+no new numerical stopping policy, global Gram or producer launch is added.
+
+Independent selected-case FP64 evidence reduces residual dots3227->1927 and
+nonzero publication transactions550->191, including removal of123 sibling
+updates. Added work is17 lazy three-cross caches,114 unconstrained checks and
+194 additional sliding-root probes. These are selected work counts, NOT native
+population frequencies or speedups. Loaded physical friction defects improve
+substantially, although some small normal/complementarity components worsen;
+changed velocities require actual physical qualification.
+
+Native branch `ooctipus/fpgs-g1-metric-tangent-20260914` preserves the handoff
+and is default-off, G1 capacity100 only. Card/source/tests are included in its
+commit. Admission regression failed before implementation; final CPU numerical
+law/admission and eight inherited controls pass, as does full pre-commit.
+Offline SM120/SM100 compilation uses72 registers and1116B shared with zero
+stack/spills, versus original40/37 registers and700B. No occupancy or hardware
+ceiling follows from these compiler facts. The independent oracle uses
+FP64 eigensolve/bisection rather than copying native root iteration.
+
+The approximately2ms primary-RTX whole-physics milestone was missed before
+the07:10 pre-code checkpoint. Reused launch documents are
+`/tmp/fpgs-g1-metric-tangent-physical-ready-vafP7Wlz/LAUNCH.md` and
+`/tmp/fpgs-g1-metric-tangent-checked-dmtXHBkY/LAUNCH.md`.
+Physical launch SHA256
+`68f566258e61e1b15136b9942a1173510e8a94376a9e5a86fa50723f169ccef8`;
+863 dependency pins SHA256
+`a53541f154c6f454f3fc65ab697c41bc55e966bdf5bbf22972f3f1cc6719ad12`.
+The missing cached robot asset was restored from its original versioned URL
+with identical SHA9dfe7a71; no model or fixture changed. Paired physical01 runs
+all four selectors/card without skips, with maximum momentum4.2573e-8 and
+cone7.4506e-9. Maximum selected natural residual improves0.004428779->0.000228466,
+complementarity0.001502610->0.000696698 and MDP0.042833458->0.000510853.
+The combined contact/limit negative-residual maximum worsens
+0.000316975->0.001631122. Independent CPU replay with the logged current row
+order reproduces this to~1e-7 and identifies a contact separating/bias-target
+shortfall, not measured penetration or closing speed; native rowwise argmax
+was not captured. Current/held factor, cone, publication and graph tests pass,
+but sustained candidate-trajectory support/slip/reset behavior remains unqualified.
+Physical manifest`e2f047fa99d3ba7f137b2b1b3e3742a25afba45a497b680dc4ef38b159df59c9`.
+
+| GPU | Level-update physics | Metric tangents | Incremental ratio | Saved |
+|---|---:|---:|---:|---:|
+| RTX |20.334124ms|19.603665ms|1.037261x|0.730459ms|
+| GB300 |25.368532ms|25.135724ms|1.009262x|0.232808ms|
+
+One discovery only, fixed Lab53ee and unchanged capacities/allowances. Four
+children exit0; all eight actual-owner/capacity boundaries and original source,
+cleanup and idle checks pass independently. Wall improves only1.003962x RTX
+and1.008708x GB. This is not a new paired ratio against MJWarp. Whole manifest
+`82dac683b90fd9610a7be7718df0cb858e64eadb4c87b00816a64ec01d35336b`.
+
+The single node diagnostic preserves the inherited auxiliary-graph analyzer
+failure; simulation/capacity completion and the original source/idle checks
+pass. The strict process/correlation reader accounts for12 physics roots and
+1020 nodes per card, with three auxiliary roots separated and no unknown
+physics owner. GS exclusive3.944015/4.430976ms compares with earlier level
+4.840935/4.763809ms. Collision5.034575/12.514069, dynamics4.885851/3.632117,
+rows2.516354/2.524903 and publication2.417378/1.620618 remain near flat.
+Audit: `/tmp/fpgs-g1-metric-tangent-checked-dmtXHBkY/NODE_AUDIT.json`.
+
+The causal source review explains why the operation-count headline overstated
+the complete opportunity. Positive-radius contacts still consume all three Z
+residuals and three response terms; the retirement is two intermediate update/
+sync transactions and sibling work. Most selected dot removal is zero-radius
+work. Metadata, ordered visits, sweep recurrence, W decode and publication
+remain, while root/SPD guards add work. Runtime shows72 registers,1116B shared
+and zero local-memory bytes/thread. These do not expose a new RTX block-residency
+cliff below its24 block slots. No measured phase identifies the additional
+~1.3ms needed for a corrective GO; no register/layout/root-tolerance grid is
+funded. The result is a modest numerical/performance discovery, not a large win.
+
+A read-only portability check finds ANYmal-D and Allegro's dominant parallel
+owners already update the tangent pair together and reconstruct velocity once.
+G1's triplet/sibling publication retirement is absent there; this is not a
+funded direct transfer or evidence of cross-task benefit. No new framework or
+unrelated runtime change was made while waiting for GPU availability.
+
+Next bounded CPU-only screen: an implicit articulated spatial kinetic operator
+that removes generalized composite/CRBA/inverse construction and moves ALL W434
+consumers together. This exact current sparse43/Z18 boundary is unmeasured, but
+the Kuka/Franka articulated losses and older G1 forward-only loss/correction
+remain mandatory counterevidence. Held S versus current J, augmentation, all
+weld inertias, predictor, signed limit rows, contact Z and adjoint decode are
+explicit obligations. No native GO follows from the factor budget alone.
+Pre-code card: `/tmp/fpgs-g1-spatial-kinetic-cpu-xEXrAnxk/CARD.md`, CPU checkpoint06:58.
+
+**Earlier terrain status:** the original finite-terrain manifold remains rejected.
 Its corrected successor now passes rebound and sliding/support/border checks,
 including full-history support-force readback. One earlier decimated-force
 failure and the unreduced fixture-capacity failure remain preserved, not
@@ -111,12 +223,12 @@ neighbor seam handling, positive-face support and complete span fallback would
 also remain physical obligations, not free consequences of equal proxy volume.
 Card/census/results: `/tmp/fpgs-g1-live-flat-runs-p1kkj4qj`.
 
-Next bounded numerical study asks whether current sparse GS is doing avoidable
+At that checkpoint, the next bounded numerical study asked whether current sparse GS was doing avoidable
 near-converged sweeps: its early exit currently requires EXACT zero updates.
 The user's unchanged maximum allowance does not require bit-stationary stopping.
-The study will use physical residual/work criteria, not small impulse change
-alone, count the additional full residual pass, and distinguish selected-case
-curves from population/timing evidence. No new stopping policy or gain is yet
+The study used physical residual/work criteria, not small impulse change
+alone, counted the additional full residual pass, and distinguished selected-case
+curves from population/timing evidence. It is now closed as described above. No new stopping policy or gain is
 accepted; no task timestep, substep or maximum iteration count changes.
 
 ## Further structural screens (September14,03:24)
