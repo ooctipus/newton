@@ -322,17 +322,32 @@ if(lane==0){
     int selected[4]={p1,p2,p3,p4},output=0;
     float diameter=::sqrtf(longest);
     // At least a few FP32 ulps, scaled by actual geometry/patch extent.
-    float weight=wp::max(8.f*1.1920928955078125e-7f,4.f*s.guard/wp::max(diameter,1e-12f));
-    if(weight>0.01f || !::isfinite(weight))s.failed=8;
-    for(int k=0;k<4 && !s.failed;++k){bool duplicate=false;
-        for(int before=0;before<k;++before)if(selected[k]==selected[before])duplicate=true;
-        if(duplicate)continue;
-        auto u=(1.f-weight)*p[selected[k]]+weight*center;
+    float spatial_weight=wp::max(8.f*1.1920928955078125e-7f,4.f*s.guard/wp::max(diameter,1e-12f));
+    auto heights=[&](wp::vec2 u){
         float ha=INFINITY,hb=-INFINITY;
         for(int f=0;f<s.face_count[0];++f)if(s.plane_valid[0][f]>0){auto plane=s.planes[0][f];
             ha=wp::min(ha,plane[0]*u[0]+plane[1]*u[1]+plane[2]);}
         for(int f=0;f<s.face_count[1];++f)if(s.plane_valid[1][f]>0){auto plane=s.planes[1][f];
             hb=wp::max(hb,plane[0]*u[0]+plane[1]*u[1]+plane[2]);}
+        return wp::vec2(ha,hb);
+    };
+    auto center_heights=heights(center);
+    float center_gap=center_heights[1]-center_heights[0],safe_gap=shell-4.f*s.guard;
+    if(spatial_weight>0.01f || !::isfinite(spatial_weight) || !::isfinite(center_gap) ||
+       safe_gap<=0.f || center_gap<=0.f || center_gap>safe_gap)s.failed=8;
+    for(int k=0;k<4 && !s.failed;++k){bool duplicate=false;
+        for(int before=0;before<k;++before)if(selected[k]==selected[before])duplicate=true;
+        if(duplicate)continue;
+        float vertex_gap=s.gap[bank][selected[k]],weight=spatial_weight;
+        // g=max(B planes)-min(A planes) is convex. This inward move must
+        // gain GAP headroom, not merely a few ulps of projected distance.
+        // Already-safe vertices avoid division, including equal gap planes.
+        if(vertex_gap>safe_gap){float denominator=vertex_gap-center_gap;
+            if(!(denominator>0.f) || !::isfinite(denominator)){s.failed=8;break;}
+            weight=wp::max(weight,(vertex_gap-safe_gap)/denominator+8.f*1.1920928955078125e-7f);}
+        if(!::isfinite(vertex_gap)||!::isfinite(weight)||weight>0.01f){s.failed=8;break;}
+        auto u=(1.f-weight)*p[selected[k]]+weight*center;
+        auto current_heights=heights(u);float ha=current_heights[0],hb=current_heights[1];
         if(!::isfinite(ha)||!::isfinite(hb)||hb-ha>=shell||hb<=ha){s.failed=8;break;}
         auto pa=s.basis[0]*u[0]+s.basis[1]*u[1]+s.basis[2]*ha;
         auto pb=s.basis[0]*u[0]+s.basis[1]*u[1]+s.basis[2]*hb;

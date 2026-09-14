@@ -112,6 +112,9 @@ def _impact(device, enabled, restitution, friction, tangent):
     scene.states[0].clear_forces()
     scene.solver.step(scene.states[0], scene.states[1], scene.control, scene.contacts, DT)
     scene.solver.check_constraint_capacity()
+    # The task's lazy mode intentionally leaves body_q/body_qd unpublished.
+    # Use its public publication API, without another solve or timestep.
+    scene.solver.publish_kinematics(scene.states[1])
     after = scene.states[1].body_qd.numpy().copy()
     masses = scene.model.body_mass.numpy().astype(float)
     inertia = scene.model.body_inertia.numpy().astype(float)

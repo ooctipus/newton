@@ -59,9 +59,10 @@ it is not given a special threshold.
 
 To avoid rejecting mathematically boundary contacts solely through FP32
 writer rounding, selected points move by a tiny convex combination toward
-the polygon vertex centroid. The weight is the greater of 8 FP32 epsilons
-and four scale-aware guards divided by patch diameter, and must be at most
-one percent. Both current surface witnesses are reconstructed at that
+the polygon vertex centroid. The weight includes a tiny spatial guard and
+the convex-gap interpolation needed to gain four existing guards of gap
+headroom, and must be at most one percent. Both current surface witnesses
+are reconstructed at that
 interior point. Actual positive gap must remain strictly inside the authored
 shell before any write. No gap clamp or shell widening is used. Strict
 point/count/vertex identity is not a physical acceptance criterion.
@@ -117,3 +118,37 @@ GPU physical or timing result for this implementation at this checkpoint.
 Exact reproducible commands, full source/input pins, offline artifacts and
 the explicit root-owned paired lease command live in
 `/tmp/fpgs-convex-shell-qualification-9EDYH9XH/READY.md`.
+
+## First paired gate and bounded correction
+
+The first frozen source `c5ea3b8a` ran all 17 methods on both GPUs at
+`/tmp/fpgs-convex-shell-physical-paired-20260914-01`. Both had two failures,
+no skips or errors; final source/idle checks passed. Manifest SHA:
+`9b5fede72629b717d664cd896b00551b8dd6649f893396212151227894ebd440`.
+The failed evidence and original pins are preserved. No whole timing ran.
+
+The saved GB patch safely refused with reason 8 on both GPUs. This was a
+warm-coverage failure, not publication of invalid contacts: complete cold
+fallback remains authoritative. CPU selected gap was 0.002999998629 m versus
+shell 0.003000000142 m, only 1.5134e-9 m headroom, below one FP32 ulp of its
+approximately 0.039 m surface witness. A spatial-distance interpolation alone
+does not guarantee gap headroom on a shallow face.
+
+The correction retains the same centroid, one-percent movement cap and four
+existing guards. For convex current gap g, interpolation obeys
+g((1-alpha)p+alpha*c) <= (1-alpha)g(p)+alpha*g(c). Each selected point uses
+the larger of the spatial weight and the weight required for gap headroom.
+Already-safe vertices avoid division. A missing interior centroid, invalid
+denominator or excessive weight refuses; both surfaces and the actual strict
+gap are still reconstructed and checked before publication. No shell or
+physical tolerance is widened. The added work is one current centroid
+surface evaluation; selected vertex gaps reuse the existing per-call cache.
+
+The loaded test executed a real warm commit, but both original and candidate
+read zeros from unpublished body velocities. With the task's lazy mode,
+`_stage7_update_kinematics` intentionally returns before publishing body_qd.
+The test now calls the documented `publish_kinematics(state_out)` once after
+the existing solve/capacity check. It adds no solve, timestep or iteration.
+Raw records from the failed test are not treated as physical solver results.
+The unchanged loaded momentum/energy/rebound/spin assertions await the
+corrected paired gate. No physical gain is promoted from this first attempt.
