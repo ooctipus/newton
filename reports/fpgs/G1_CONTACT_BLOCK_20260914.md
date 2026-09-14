@@ -113,3 +113,24 @@ held W with current geometry, graph replay and empty follow-up. GPU numerical
 and complete-cost checks remain pending. The saved numerical screen allows
 the explicitly reported6.7% residual degradation in one case, not a claim
 that the new method dominates every finite-eight result.
+
+## First paired native run and test correction
+
+Frozen643cc8cb ran four selectors on each GPU in
+`/tmp/fpgs-g1-contact-block-physical-paired-20260914-01`. Simple numerical cases,
+current/held graph replay and constructor admission pass on both. Eight of16
+saved cases per card fail before entering the block solver, solely at a newly
+copied elementwise Z-versus-FP64-WJ gate (4.4e-6 to1.72e-5 absolute mismatch).
+The parent exits1 and its final source/idle guard passes. This is not a complete
+physical pass or a measured solver loss.
+
+The warm-replay test erroneously reintroduced the intermediate barrier that
+the prior original-response cancellation diagnosis had already separated from
+final physical acceptance. The follow-up records the same3e-5/3e-6 coefficient
+diagnostic with finite checks, executes the unchanged own-rounded-Z block law,
+impulse and decoded-velocity checks, and evaluates independent held-H/current-J
+momentum defect<2e-6 plus unchanged cone checks. No coefficient tolerance or
+native arithmetic is changed. Original logs, source and pin files remain
+untouched; follow-up uses a new source revision and fresh physical folder.
+This correction allows the new solve to be assessed, not an advance claim that
+every coefficient mismatch or final result is harmless.
