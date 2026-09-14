@@ -21,7 +21,7 @@ ASSET = Path(
 )
 
 
-def fixture(device="cpu"):
+def fixture(device="cpu", *, capacity=100):
     """Bind the actual complete USD tree and independent COM kinetic operator."""
     b = newton.ModelBuilder()
     b.begin_world()
@@ -84,7 +84,7 @@ def fixture(device="cpu"):
             m,
             pgs_mode="split" if device == "cpu" else "matrix_free",
             pgs_iterations=8,
-            dense_max_constraints=100,
+            dense_max_constraints=capacity,
             enable_joint_limits=True,
             joint_limit_activation_gap=0.01,
             update_mass_matrix_interval=2,
@@ -409,6 +409,13 @@ class TestSparseFactorCUDA(unittest.TestCase):
         o.check()
         count = int(s.constraint_count.numpy()[0])
         self.assertGreaterEqual(count, 9)
+        if o.packet_rows:
+            from tools.fpgs_bench.test_sparse_packet_rows import check_packet_operator  # noqa: PLC0415
+
+            check_packet_operator(f)
+            # The native refresh/current-force/reuse checks above remain unchanged;
+            # packet rows have no global Z panel for the old coefficient snapshot.
+            return
         z = o.data.Z.numpy()[0, :count]
         templates = o.data.support.numpy()[0, :count]
         full = np.zeros((count, 43))

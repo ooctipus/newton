@@ -417,9 +417,10 @@ class SparseFactor:
         self.data.W = wp.empty((w, 434), dtype=float, device=device)
         self.data.valid = wp.zeros(w, dtype=int, device=device)
         self.data.status = wp.zeros(w, dtype=int, device=device)
-        self.data.Z = wp.empty((w, c, 18), dtype=float, device=device)
+        self.packet_rows = os.environ.get("FEATHER_PGS_SPARSE_PACKETS") == "1" and c == 100
+        self.data.Z = wp.empty((1, 1, 1) if self.packet_rows else (w, c, 18), dtype=float, device=device)
         self.data.support = wp.empty((w, c), dtype=int, device=device)
-        self.data.incident = wp.empty((w, c), dtype=float, device=device)
+        self.data.incident = wp.empty((1, 1) if self.packet_rows else (w, c), dtype=float, device=device)
         self.kernels = SimpleNamespace(
             refresh=get_refresh_kernel(),
             predictor=get_predictor_kernel(),
@@ -436,6 +437,10 @@ class SparseFactor:
         solver._H_bufs = None
         solver._J_bufs = None
         solver._memset_stream = None
+        if self.packet_rows:
+            from .sparse_packet_rows import install  # noqa: PLC0415
+
+            install(self)
 
     def begin(self):
         """Reject changed execution ownership before any retired buffer is read."""
@@ -507,14 +512,19 @@ class SparseFactor:
 
         s, model, device = self.solver, self.solver.model, self.solver.model.device
         c = s.dense_max_constraints
+        if self.packet_rows:
+            from .sparse_packet_rows import bind_current  # noqa: PLC0415
+
+            bind_current(self, state_in, state_aug, contacts, dt)
         s.dense_contact_world_flag.zero_()
         if s._row_watermark:
             s._row_dropped_dense.zero_()
             s._row_dropped_mf.zero_()
             s._row_dropped_propagation.zero_()
-        wp.launch(
-            build_limit_prefix,
-            dim=s.world_count,
+        prefix_launch = wp.launch_tiled if self.packet_rows else wp.launch
+        prefix_launch(
+            self.kernels.prefix if self.packet_rows else build_limit_prefix,
+            dim=[s.world_count] if self.packet_rows else s.world_count,
             inputs=[
                 self.plan,
                 self.data,
@@ -538,6 +548,7 @@ class SparseFactor:
                 s.diag,
                 s.dense_phase_bounds,
             ],
+            block_dim=32 if self.packet_rows else 256,
             device=device,
         )
         if contacts is not None and contacts.rigid_contact_max > 0:
@@ -653,42 +664,58 @@ class SparseFactor:
                 ],
                 device=device,
             )
-            workers = min(contacts.rigid_contact_max, 16384)
-            wp.launch_tiled(
-                self.kernels.contacts,
-                dim=[workers],
-                inputs=[
-                    workers,
-                    self.plan,
-                    self.data,
-                    contacts.rigid_contact_count,
-                    s.contact_path,
-                    s.contact_slot,
-                    s.contact_world,
-                    s.contact_art_a,
-                    s.contact_art_b,
-                    s.contact_slots_needed,
-                    contacts.rigid_contact_shape0,
-                    contacts.rigid_contact_shape1,
-                    contacts.rigid_contact_point0,
-                    contacts.rigid_contact_point1,
-                    contacts.rigid_contact_normal,
-                    contacts.rigid_contact_margin0,
-                    contacts.rigid_contact_margin1,
-                    model.shape_body,
-                    state_in.body_q,
-                    state_aug.joint_S_s,
-                    s.articulation_origin,
-                    s.art_group_idx,
-                    s.v_hat,
-                    int(s.contact_shared_anchor),
-                    int(s.contact_friction_shared_anchor),
-                    s.row_cfm,
-                    s.diag,
-                ],
-                block_dim=32,
-                device=device,
-            )
+            if self.packet_rows:
+                wp.launch(
+                    self.kernels.contacts,
+                    dim=threads,
+                    inputs=[
+                        contacts.rigid_contact_count,
+                        threads,
+                        s.contact_path,
+                        s.contact_slot,
+                        s.contact_world,
+                        s.contact_slots_needed,
+                        self.data.support,
+                    ],
+                    device=device,
+                )
+            else:
+                workers = min(contacts.rigid_contact_max, 16384)
+                wp.launch_tiled(
+                    self.kernels.contacts,
+                    dim=[workers],
+                    inputs=[
+                        workers,
+                        self.plan,
+                        self.data,
+                        contacts.rigid_contact_count,
+                        s.contact_path,
+                        s.contact_slot,
+                        s.contact_world,
+                        s.contact_art_a,
+                        s.contact_art_b,
+                        s.contact_slots_needed,
+                        contacts.rigid_contact_shape0,
+                        contacts.rigid_contact_shape1,
+                        contacts.rigid_contact_point0,
+                        contacts.rigid_contact_point1,
+                        contacts.rigid_contact_normal,
+                        contacts.rigid_contact_margin0,
+                        contacts.rigid_contact_margin1,
+                        model.shape_body,
+                        state_in.body_q,
+                        state_aug.joint_S_s,
+                        s.articulation_origin,
+                        s.art_group_idx,
+                        s.v_hat,
+                        int(s.contact_shared_anchor),
+                        int(s.contact_friction_shared_anchor),
+                        s.row_cfm,
+                        s.diag,
+                    ],
+                    block_dim=32,
+                    device=device,
+                )
         wp.launch(
             k.finalize_constraint_counts_with_status,
             dim=s.world_count,
@@ -699,6 +726,9 @@ class SparseFactor:
 
     def restitution(self, dt):
         """Use the original current incident trigger after original bias construction."""
+        if self.packet_rows:
+            self.packet_input.dt = dt
+            return  # Applied from the current incident during local row formation.
         from .sparse_factor_rows import apply_restitution  # noqa: PLC0415
 
         s = self.solver
@@ -721,6 +751,11 @@ class SparseFactor:
 
     def solve(self, rhs, iterations, omega, friction_start):
         """Visit every original row and return complete physical velocity once."""
+        if self.packet_rows:
+            from .sparse_packet_rows import solve  # noqa: PLC0415
+
+            solve(self, rhs, iterations, omega, friction_start)
+            return
         s = self.solver
         wp.launch_tiled(
             self.kernels.solve,
