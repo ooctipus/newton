@@ -658,3 +658,84 @@ contact-hull elimination. These selected cases are not a population census.
 The all-task RTX4x target remains unmet. Latest known RTX ratios are Franka
 1.95x, Kuka about2.47x versus the previous MJ reference, Allegro4.21x fresh,
 ANY3.91x, G12.08x and Keyboard3.69x. Do not relabel old rows as new measurements.
+
+## September14 22:29: retained-Gram numerical diagnosis before promotion
+
+Combined qualified tree1a9efc33 and ledger281d50a7 are pushed and remote-verified.
+Its six existing integration CUDA selectors pass on each card; these do not
+constitute a new whole benchmark of the combined source.
+
+ANYmal prototype acdb168e is frozen. One causal compiler correction prevents
+cross-column Gram loads from keeping a72-value temporary tile live. Final AOT
+register counts are111/121 on both architectures, with no stack/spills. This
+reduces the original resource risk, not proof of a timing gain.
+
+Actual three-selector CUDA suites fail the saved-case selector on BOTH cards;
+warm/padding and production graph/fallback selectors pass. Full diagnostic
+replay preserves the failed gate and evaluates all2,048 cases including29
+limit rows: one case fails, capture GPU1/current/tier32/world357. Its relative
+cross-variant velocity difference is8.998622e-5, normal-contact residual rises
+from5.838641e-7 to1.217565e-4m/s, and complementarity3.572787e-7 to5.299579e-5.
+Momentum and cones pass; aggregate natural and friction residuals slightly
+improve. Other cases' maximum velocity difference is3.140934e-6. This is not
+just a bit-identity failure, nor evidence of dropped contacts.
+
+Existing FP64 dense/factor references stop at16 of24 and agree with the old
+native result. Ordinary CPU arithmetic does not reproduce the new native
+deviation; native setup/restart/stopping attribution remains open. Keep the
+original physical thresholds, source and failed results unchanged. Artifact:
+`/tmp/fpgs-anymal-register-physical-diagnostic-rtNJ6c/actual/gpu{0,1}.json`.
+The lifecycle also emits two stream-wait invalid-argument warnings per card
+around graph-to-eager transition; a passing assertion is not a clean-warning
+claim. That event lifetime is being checked separately.
+
+One original16K paired whole A/B is running as EXPLORATORY performance only,
+while a native trace diagnoses the numerical case. It is not a promotion or
+physical-qualification claim. This avoids spending hours on a numerical detail
+before learning whether the structural change has worthwhile performance.
+No timestep, substep, maximum iteration or capacity change is authorized by
+this diagnostic. The all-task4x minimum remains unmet.
+
+## September14 22:57: close two attempts; fund a different complete G1 boundary
+
+ANYmal retained Gram is closed, not promoted. Whole16K original checked A/B:
+RTX9.332332->9.525339ms, GB9.530262->10.399400ms. Strict nodes attribute
+parallel32/48 total4.067974->4.388095ms RTX and4.391071->5.202762ms GB.
+RTX32 alone saves0.080915ms; that does not fund a tier-only tuning branch.
+Fewer products did not offset increased live register state. Actual registers
+rise86/80->110/121 RTX and80/80->111/121 GB, with zero local memory; these
+resource counts do not establish achieved occupancy or a hardware ceiling.
+
+The numerical failure now has an exact native trace on both GPUs: setup is
+bit-identical, but residual reassociation changes sweep15's restart dot from
++1.189393e-11 to-2.446598e-12. Old restarts/stops16; candidate extrapolates,
+then stops17 with the larger normal defect documented above. Traced outputs
+exactly match both uninstrumented owners. FP64 dot-only does not repair the
+opposite signs of the different operands. No contact-drop explanation or
+tolerance relaxation is used. A stabilization change is not funded for this
+losing performance path. Report-only tip e5cccc54 preserves runtime acdb168e;
+native trace `/tmp/fpgs-anymal-register-trace-Z7z4dJ/actual/gpu{0,1}.json`.
+The graph-to-eager stream warnings remain disclosed, not silently qualified.
+
+Allegro endpoint-wrench reuse a73fb4ba passes the existing four CUDA physical/
+lifecycle selectors on each card. Whole discovery against qualified1a9:
+RTX15.289529->14.985817ms, GB16.584617->16.714202ms. The0.303712ms RTX
+saving misses the1ms gate. Existing strict node audits find complete rows+
+solve7.524767->7.624923ms RTX and9.053549->10.732662ms GB. Importantly,
+the parallel tiers themselves improve0.178437/0.361761ms; unchanged serial
+fallback adds0.266037/1.946549ms in those short windows. The64 tier grows
+0.043354/0.101301ms, with registers82->108 RTX and83->110 GB. Do not call
+all solve growth a register effect. Both graph and node records are retained
+in report-only7b29937d; no promotion, retuning or new accepted MJ ratio.
+
+Next prototype starts from qualified1a9, not either losing experiment:
+`newton-fpgs-g1-kinetic-state-20260914`. Keep W434 factor/rows/GS, replace the
+publication->spatial-body-cache->force/composite source chain with compact
+subtree moments and current/next bias. Unlike the earlier losing502 spatial
+operator, no contact action or final sparse decode is replaced. Conservative
+old dynamics+publication exclusive7.309204ms reserves ALL2.342925ms of the
+current factor node,0.154144ms drive preparation and0.027829ms mask work.
+The complete new finish+predict+repair allowance is2.784305ms for a2ms RTX
+saving. This is a falsifiable budget, not a predicted or measured speedup.
+Original root inertial/transport terms, current external/control forces,
+current geometry versus held-factor cadence, and public state remain required.
