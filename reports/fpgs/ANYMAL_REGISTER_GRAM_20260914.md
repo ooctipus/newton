@@ -129,3 +129,109 @@ arguments; the production lifecycle toggles only the register-Gram flag.
 Whole testing reuses the existing fixed-Lab ANYmal paired variants owner,
 base `baf0c57a`, candidate flag0→1, original16K/200/40/40 sampling and
 0.005 sim_dt, two0.0025 substeps, fallback8/parallel24 allowances.
+
+## Closed integrated result, 22:40 UTC
+
+Runtime `acdb168e12e12f0907c9b13fdeee37f416d8d53a` is a measured loss,
+not promoted. Root confirmed every physical, diagnostic, whole and node process
+for this source reaped before this report-only amendment. Runtime and the
+original failed physical test remain unchanged. No32-only micro-fork or further
+compiler, layout or numerical correction is funded.
+
+One exploratory paired whole round used the original checked variants owner,
+fixed Lab and16K/200/40/40 settings above. Identical allocations were dense72,
+raw contacts212992 and broad-phase294912. Original source/capacity/budget and
+final idle checks passed. Physical qualification was explicitly still open;
+these are valid measured costs, not accepted performance or convergence.
+
+| Per environment step, ms | RTX original | RTX retained | GB original | GB retained |
+| --- | ---: | ---: | ---: | ---: |
+| Complete physics | 9.332332 | 9.525339 | 9.530262 | 10.399400 |
+| Synchronized environment wall | 16.8238 | 18.0500 | 17.8829 | 19.1133 |
+| Node diagnostic: tier32 | 1.685203 | 1.604288 | 1.791466 | 1.985803 |
+| Node diagnostic: tier48 | 2.382771 | 2.783807 | 2.599605 | 3.216960 |
+| Node diagnostic: both tiers | 4.067974 | 4.388095 | 4.391071 | 5.202762 |
+
+Whole speed ratios are0.97974 RTX and0.91642 GB. The separate three-step
+node capture retains four physics graphs/step; all four arms have936 kernel,
+372 memset and120 copy nodes with successful process-scoped correlation.
+Actual candidate owner names end in `_rg1`. Tier32 saves only.080915ms RTX;
+tier48 adds.401036ms. Both GB tiers regress. Thus no measured path to the
+funded1ms saving remains in this representation.
+
+Actual native resources: tier32 registers RTX86→110, GB80→111; tier48
+80→121 on both. Shared32 remains5408B; shared48 changes7492→7276B;
+no local memory was reported. The retained products and removed transpose/
+reduction are real, but the saved census gives tier48 only about.54% fewer
+recurrence products, while tier32 has about27.5% fewer. Gram setup, current
+WR/whitening and final decode remain. Extra coefficient lifetime and static
+Gram-load/code expansion are costs, not proven achieved-occupancy or hardware-
+counter diagnoses. Resource ceilings alone do not establish the timing cause;
+the measured complete owners establish that this mapping does not win.
+
+Artifacts (all preserved):
+
+- Whole: `/tmp/fpgs-anymal-register-gram-paired16k-20260914-01`, manifest
+  `418fcc4b1925072a79e9fb735ac1d0a8cdea99fde9f7b5ae664ee77839b9f67a`.
+- Nodes: `/tmp/fpgs-anymal-register-gram-nodes-paired16k-20260914-01`, manifest
+  `8bd1faacdbd57bd1aa472191cbdf1d0f18a01de8a2d3ec2ac3606185e3291578`;
+  each arm's original `capture_analysis.json` records membership and owners.
+
+## Physical failure and exact native numerical explanation
+
+Both GPUs passed warm/self-contact/padding and the production lifecycle's
+assertions. The saved selector failed at captured GPU1/step0/tier32/world357:
+scaled cross-variant velocity8.9986223e-5 exceeds its unchanged3e-5 gate.
+An external diagnostic then evaluated all2048 cases without stopping at that
+assertion: exactly one case fails, including normal velocity and complementarity,
+not merely the cross-variant distance. Momentum/cone checks pass. Its nine
+contact triplets contain no limits; the normal metric in this specific case is
+contact velocity, not a mixed contact/limit aggregate.
+
+Old/new negative normal velocity is5.83864e-7/1.217565e-4 and complementarity
+3.5728e-7/5.29958e-5. Natural residual and MDP slightly improve. Existing
+FP64 references stop at16 and agree closely with the original. Neither a
+non-FMA FP32 replay nor the FP64 replay reproduced the native divergence, so
+neither was used to assume the difference harmless.
+
+The narrowly instrumented native trace matches its uninstrumented outputs
+EXACTLY on both GPUs. Initial current Z, b-prime, preconditioner, metadata and
+impulses match between owners. Through sweep15 impulse differences stay below
+8.95e-8. At15, residual reassociation changes the restart dot from original
++1.189393e-11 to retained−2.446598e-12: original drops momentum, retained
+keeps beta.7185. Original stops at16; retained overshoots, restarts at16 and
+passes the inherited relative-impulse stopping vote at17 with the larger
+physical defect. FP64 summation of the traced FP32 restart operands preserves
+those signs: higher precision for the dot reduction alone would not fix it.
+This diagnoses residual-rounding-sensitive momentum plus the existing stopping
+rule, not missing geometry, stale held factors or dropped rows.
+
+The separate lifecycle emits two invalid-argument stream-event warnings/card.
+Source review identifies a graph→eager transition after reset that retains
+capture-created double-buffer event handles; initial in-capture seeding is
+present. This location was not experimentally isolated. Do not call that
+selector warning-free or the candidate physically qualified. The same warning
+affects both owners and no additional warning-only GPU experiment was run.
+
+External diagnostic scope/commands reuse the frozen fixture/oracle only, with
+one UUID-isolated process/device and `uv run --no-project --python` pointing
+to the existing fixed-Lab Python. They are not a replacement test or benchmark:
+
+```text
+python /tmp/fpgs-anymal-register-physical-diagnostic-rtNJ6c/diagnose.py --device cuda:0 --output <fresh-gpu-result.json>
+python /tmp/fpgs-anymal-register-trace-Z7z4dJ/trace.py --device cuda:0 --output <fresh-gpu-trace.json>
+```
+
+All-case source SHA256 `809f9becd8611d0d09e2a9fc213f018216f43a3de8e4be22f3a0f43c62861790`;
+actual/gpu0.json `4dae55734dac8c63c791522f16c564c270abe872077ba10e3337536f315cde42`,
+gpu1.json `6514dba16eebf3d55e5fdcfecd1469ebd9641b48f9102075653f9d08dde5ce08`.
+Trace source SHA256 `837aaa248fdf0168009742d4d4d6202f164d3758d5364bee6265ebe85c7c3140`;
+both output hashes `e8b0281ece597bfafc8d62807e56ad812b3b4211d1483e8c0257aee9850cc4a8`.
+The trace derives actual saved dense192/MF1 capacities and checks the ordered
+ABI. An initial hardcoded72/32 draft was caught and corrected before any GPU
+launch and supplies no numerical evidence. Full explanation remains in
+`/tmp/fpgs-anymal-register-trace-Z7z4dJ/FINDINGS.md`.
+
+A near-stationary projected-gradient momentum restart was suggested after the
+trace, but is unimplemented and not funded for this slower representation.
+No physics tolerance was relaxed and no original acceptance gate was removed.
