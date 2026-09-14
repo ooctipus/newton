@@ -261,7 +261,7 @@ def make_plan(model, solver=None):
 
 
 @cache
-def get_refresh_kernel(level_update=False):
+def get_refresh_kernel(level_update=False, geometric=False):
     """Build the packed held inverse-whitener directly from current CRBA inputs."""
     source = r"""
 #if defined(__CUDA_ARCH__)
@@ -347,6 +347,16 @@ def get_refresh_kernel(level_update=False):
     if (threadIdx.x == 0) { if (bad) atomicOr(&d.status.data[world], 1); d.valid.data[world] = bad == 0; }
 #endif
 """
+    if geometric:
+        # Only replace mass assembly. The held factor, inverse, R/K policy and
+        # status publication below keep their original arithmetic and cadence.
+        start = source.index("    for (int col = threadIdx.x; col < 43; col += blockDim.x) {")
+        end = source.index("    for (int e = threadIdx.x; e < 434; e += blockDim.x) {", start)
+        source = source[:start] + source[end:]
+        start = source.index("        const int src = p.source.data[e];")
+        end = source.index("        if (row == col) {", start)
+        source = source[:start] + "        float value = I.data[group*434+e];\n" + source[end:]
+        source = source.replace("__shared__ float a[434], force[258];", "__shared__ float a[434];")
     if level_update:
         start = source.index("    for (int k = 0; k < 43; ++k) {")
         end = source.index("    for (int col = threadIdx.x; col < 43; col += blockDim.x) {", start)
@@ -388,6 +398,8 @@ def get_refresh_kernel(level_update=False):
             + source[end:]
         )
 
+    inertia_type = wp.array2d[float] if geometric else wp.array[wp.spatial_matrix]
+
     @wp.func_native(source)
     def native(
         group: int,
@@ -395,7 +407,7 @@ def get_refresh_kernel(level_update=False):
         d: SparseData,
         mask: wp.array[int],
         S: wp.array[wp.spatial_vector],
-        I: wp.array[wp.spatial_matrix],
+        I: inertia_type,
         R: wp.array2d[float],
         drive_row: wp.array[int],
         K: wp.array[float],
@@ -410,7 +422,7 @@ def get_refresh_kernel(level_update=False):
         d: SparseData,
         mask: wp.array[int],
         S: wp.array[wp.spatial_vector],
-        I: wp.array[wp.spatial_matrix],
+        I: inertia_type,
         R: wp.array2d[float],
         drive_row: wp.array[int],
         K: wp.array[float],
@@ -425,6 +437,8 @@ def get_refresh_kernel(level_update=False):
     refresh.__name__ = refresh.__qualname__ = (
         "sparse_factor_level_update43_434" if level_update else "sparse_factor_refresh43_434"
     )
+    if geometric:
+        refresh.__name__ = refresh.__qualname__ = "g1_kinetic_" + refresh.__name__
     return wp.kernel(enable_backward=False, module="unique")(refresh)
 
 
@@ -557,11 +571,26 @@ class SparseFactor:
             from .sparse_packet_rows import install  # noqa: PLC0415
 
             install(self)
+        self.kinetic_state = None
+
+    def install_kinetic_state(self):
+        """Admit the complete state producer only after solver construction."""
+        from .g1_kinetic_state import G1KineticState  # noqa: PLC0415
+        from .g1_kinetic_state import supported as kinetic_supported  # noqa: PLC0415
+
+        if kinetic_supported(self.solver):
+            self.kinetic_state = G1KineticState(self)
+            self.kernels.refresh = get_refresh_kernel(self.level_update, geometric=True)
 
     def begin(self):
         """Reject changed execution ownership before any retired buffer is read."""
         if not supported(self.solver):
             raise RuntimeError("Sparse G1 configuration changed; reconstruct the solver and recapture before stepping")
+        if self.kinetic_state is not None:
+            from .g1_kinetic_state import supported as kinetic_supported  # noqa: PLC0415
+
+            if not kinetic_supported(self.solver):
+                raise RuntimeError("G1 kinetic-state ownership changed; reconstruct and recapture before stepping")
 
     def validate_notification(self, flags):
         """Re-prove structural ownership on model notifications before writes."""
@@ -579,12 +608,18 @@ class SparseFactor:
                 raise RuntimeError("Sparse G1 structural ownership changed; reconstruct and recapture") from error
             if self.solver._mimic_count or self.solver._connect_count:
                 raise RuntimeError("Sparse G1 constraint ownership changed; reconstruct and recapture")
+        if self.kinetic_state is not None:
+            self.kinetic_state.validate_model()
 
     def check(self):
         """Surface a failed packed operator/row guard at existing checked boundaries."""
         status = self.data.status.numpy()
         if np.any(status):
             raise RuntimeError(f"Sparse G1 representation guard failed: {np.unique(status[status != 0]).tolist()}")
+        if self.kinetic_state is not None:
+            status = self.kinetic_state.status.numpy()
+            if np.any(status):
+                raise RuntimeError(f"G1 kinetic-state guard failed: {np.unique(status[status != 0]).tolist()}")
 
     def refresh(self, state_aug):
         """Publish only the original requested held generation."""
@@ -597,7 +632,7 @@ class SparseFactor:
                 self.data,
                 s.mass_update_mask,
                 state_aug.joint_S_s,
-                s.body_I_c,
+                s.body_I_c if self.kinetic_state is None else self.kinetic_state.geometric,
                 s.R_by_size[43],
                 s._augmented_drive_row_by_dof,
                 s.aug_row_K,

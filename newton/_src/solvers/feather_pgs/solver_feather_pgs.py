@@ -2443,6 +2443,11 @@ class SolverFeatherPGS(SolverBase):
 
             self._kinetic_world = create_kinetic_owner(self)
 
+        self._g1_kinetic_state = None
+        if self._sparse_factor is not None and os.environ.get("FEATHER_PGS_G1_KINETIC_STATE") == "1":
+            self._sparse_factor.install_kinetic_state()
+            self._g1_kinetic_state = self._sparse_factor.kinetic_state
+
     def _update_kinematic_state(self) -> None:
         """Refresh cached kinematic flags and effective joint armature."""
         model = self.model
@@ -2506,6 +2511,15 @@ class SolverFeatherPGS(SolverBase):
             publication.validate_notification(flags, plan_snapshot=plan_snapshot)
         if kinetic is not None:
             kinetic.invalidate_model_changed(flags)
+        g1_kinetic = getattr(self, "_g1_kinetic_state", None)
+        if g1_kinetic is not None and flags & (
+            ModelFlags.JOINT_PROPERTIES
+            | ModelFlags.JOINT_DOF_PROPERTIES
+            | ModelFlags.BODY_PROPERTIES
+            | ModelFlags.BODY_INERTIAL_PROPERTIES
+            | ModelFlags.MODEL_PROPERTIES
+        ):
+            g1_kinetic.invalidate()
         if self._fk_id_cache_enabled and flags & (
             ModelFlags.JOINT_PROPERTIES
             | ModelFlags.JOINT_DOF_PROPERTIES
@@ -2568,6 +2582,8 @@ class SolverFeatherPGS(SolverBase):
 
         if getattr(self, "_kinetic_world", None) is not None:
             self._kinetic_world.reset(state, world_mask)
+        if getattr(self, "_g1_kinetic_state", None) is not None:
+            self._g1_kinetic_state.invalidate(world_mask)
 
         if self._fk_id_cache_enabled:
             wp.launch(
@@ -8556,7 +8572,10 @@ class SolverFeatherPGS(SolverBase):
         with wp.ScopedTimer("S3_Trisolve_Vhat", print=False, use_nvtx=self._nvtx, synchronize=False):
             if inverse_dynamics_ready is not None:
                 wp.get_stream(model.device).wait_event(inverse_dynamics_ready)
-            if self._joint_world_active:
+            if self._g1_kinetic_state is not None:
+                self._g1_kinetic_state.predict(state_in, state_aug, control, stage3_qd, dt)
+                self._clamp_rigid_velocity_limits(self.v_hat)
+            elif self._joint_world_active:
                 self._joint_world.predict_and_classify(state_in, state_aug, state_out, contacts, stage3_qd, dt)
             else:
                 self._stage3_zero_qdd(state_aug)
@@ -9725,6 +9744,9 @@ class SolverFeatherPGS(SolverBase):
             stage3_qd = state_in.joint_qd
 
         refresh_composite = (self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update
+        if getattr(self, "_g1_kinetic_state", None) is not None:
+            self._g1_kinetic_state.begin(state_in, state_aug, stage3_qd, self._last_step_dt, refresh_composite)
+            return None, stage3_qd
         parallel_global_refresh = refresh_composite and self._global_inertia_stream is not None
         if self._fused_k1:
             self._fused_k1_legacy_state_in = state_in
@@ -10241,6 +10263,12 @@ class SolverFeatherPGS(SolverBase):
         drive_rows_ready: wp.Event | None,
     ) -> wp.Event | None:
         """Complete ``joint_tau`` through async inverse dynamics or the fused fallback."""
+        if getattr(self, "_g1_kinetic_state", None) is not None:
+            if drive_rows_ready is None:
+                raise RuntimeError("G1 kinetic state requires asynchronous augmented-drive preparation")
+            # joint_tau currently holds only u0. Current external/control/bias
+            # contributions are added by the retained-W predictor after waiting.
+            return drive_rows_ready
         if drive_rows_ready is None:
             self._stage1_drives(state_in, state_aug, control, dt)
             return None
@@ -10362,6 +10390,16 @@ class SolverFeatherPGS(SolverBase):
             outputs=[self.mass_update_mask],
             device=model.device,
         )
+
+        if getattr(self, "_g1_kinetic_state", None) is not None:
+            if drive_rows_ready is not None:
+                wp.get_stream(model.device).wait_event(drive_rows_ready)
+            self._sparse_factor.refresh(state_aug)
+            # Consume requests just like the common tail. Leaving either set
+            # changes the held-factor cadence on subsequent captured steps.
+            self._mass_update_requested.zero_()
+            self._force_mass_update = False
+            return
 
         if not global_flag:
             wp.launch(
@@ -14074,6 +14112,8 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage6_update_qdd(self, state_in: State, state_aug: State, dt: float):
+        if getattr(self, "_g1_kinetic_state", None) is not None:
+            return  # finish owns conversion, free-root transport and integration
         model = self.model
         wp.launch(
             update_qdd_from_velocity,
@@ -14086,6 +14126,12 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage6_integrate(self, state_in: State, state_aug: State, state_out: State, dt: float):
         model = self.model
+
+        if getattr(self, "_g1_kinetic_state", None) is not None:
+            next_refresh = ((self._step + 1) % self.update_mass_matrix_interval) == 0
+            self._g1_kinetic_state.finish(state_in, state_aug, state_out, dt, next_refresh)
+            self._fk_id_cache_source_state = state_out
+            return
 
         if model.joint_count:
             wp.launch(
