@@ -12,7 +12,7 @@ from .sparse_factor import SparseData, SparsePlan
 
 
 @cache
-def get_parallel_limit_kernel():
+def get_parallel_limit_kernel(skip_selected=False):
     """Emit original global rows with three stable active-candidate ballots."""
     source = r"""
     const int art=p.group_to_art.data[group], world=p.art_to_world.data[art];
@@ -71,6 +71,11 @@ def get_parallel_limit_kernel():
     phase.data[world*phase.shape[1]]=count;phase.data[world*phase.shape[1]+1]=count;
 #endif
 """
+
+    if skip_selected:
+        anchor = "    auto emit=[&](int candidate,int row,float value) {"
+        assert source.count(anchor) == 1
+        source = source.replace(anchor, "    if(d.selected.data[world]) return;\n" + anchor)
 
     @wp.func_native(source)
     def native(
@@ -147,7 +152,9 @@ def get_parallel_limit_kernel():
             phase,
         )
 
-    prefix.__name__ = prefix.__qualname__ = "sparse_factor_parallel_limit_prefix43"
+    prefix.__name__ = prefix.__qualname__ = "sparse_factor_parallel_limit_prefix43" + (
+        "_fallback" if skip_selected else ""
+    )
     return wp.kernel(enable_backward=False, module="unique")(prefix)
 
 
@@ -253,7 +260,7 @@ def apply_restitution(
 
 
 @cache
-def get_contact_kernel():
+def get_contact_kernel(skip_selected=False):
     """Hoist current contact geometry and apply W to three sparse directions."""
     source = r"""
 #if defined(__CUDA_ARCH__)
@@ -328,6 +335,11 @@ def get_contact_kernel():
     }
 #endif
 """
+
+    if skip_selected:
+        anchor = "        const int w = world.data[c], row0 = slot.data[c];"
+        assert source.count(anchor) == 1
+        source = source.replace(anchor, anchor + "\n        if(d.selected.data[w]) continue;")
 
     @wp.func_native(source)
     def native(
@@ -422,7 +434,9 @@ def get_contact_kernel():
             diagonal,
         )
 
-    contacts.__name__ = contacts.__qualname__ = "sparse_factor_contact_triplet18"
+    contacts.__name__ = contacts.__qualname__ = "sparse_factor_contact_triplet18" + (
+        "_fallback" if skip_selected else ""
+    )
     return wp.kernel(enable_backward=False, module="unique")(contacts)
 
 
@@ -533,7 +547,9 @@ def _contact_block_fragments(capacity: int):
 
 
 @cache
-def get_solve_kernel(capacity: int, block_contacts: bool = False, *, metric_tangents: bool = False):
+def get_solve_kernel(
+    capacity: int, block_contacts: bool = False, *, metric_tangents: bool = False, skip_selected: bool = False
+):
     """Apply original current-friction GS and decode the complete43 velocity."""
     source = f"""
 #if defined(__CUDA_ARCH__)
@@ -608,6 +624,10 @@ def get_solve_kernel(capacity: int, block_contacts: bool = False, *, metric_tang
     for(int r=lane;r<count;r+=32)impulses.data[base+r]=lam[r];
 #endif
 """
+    if skip_selected:
+        anchor = "    const int start=p.art_dof_start.data[art], count=counts.data[world], base=world*"
+        position = source.index(anchor)
+        source = source[:position] + "    if(d.selected.data[world])return;\n" + source[position:]
     if metric_tangents and (block_contacts or capacity != 100):
         raise ValueError("Sparse metric tangents require the exclusive capacity100 owner")
     if block_contacts or metric_tangents:
@@ -680,5 +700,5 @@ def get_solve_kernel(capacity: int, block_contacts: bool = False, *, metric_tang
     name = (
         "sparse_metric_tangent" if metric_tangents else "sparse_contact_block" if block_contacts else "sparse_factor_gs"
     )
-    solve.__name__ = solve.__qualname__ = f"{name}43_s18_c{capacity}"
+    solve.__name__ = solve.__qualname__ = f"{name}43_s18_c{capacity}" + ("_fallback" if skip_selected else "")
     return wp.kernel(enable_backward=False, module="unique")(solve)

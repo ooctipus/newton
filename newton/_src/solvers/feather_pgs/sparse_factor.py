@@ -52,6 +52,7 @@ class SparseData:
     W: wp.array2d[float]
     valid: wp.array[int]
     status: wp.array[int]
+    selected: wp.array[int]
     Z: wp.array3d[float]
     support: wp.array2d[int]
     incident: wp.array2d[float]
@@ -429,7 +430,7 @@ def get_refresh_kernel(level_update=False):
 
 
 @cache
-def get_predictor_kernel():
+def get_predictor_kernel(skip_selected=False):
     """Apply both sparse current-force actions without grouped intermediates."""
     source = r"""
 #if defined(__CUDA_ARCH__)
@@ -456,6 +457,11 @@ def get_predictor_kernel():
 #endif
 """
 
+    if skip_selected:
+        anchor = "    const int start = p.art_dof_start.data[art];"
+        assert source.count(anchor) == 1
+        source = source.replace(anchor, "    if (d.selected.data[world]) return;\n" + anchor)
+
     @wp.func_native(source)
     def native(group: int, p: SparsePlan, d: SparseData, tau: wp.array[float], qdd: wp.array[float]): ...
 
@@ -463,7 +469,7 @@ def get_predictor_kernel():
         group, _ = wp.tid()
         native(group, p, d, tau, qdd)
 
-    predictor.__name__ = predictor.__qualname__ = "sparse_factor_predict43"
+    predictor.__name__ = predictor.__qualname__ = "sparse_factor_predict43" + ("_fallback" if skip_selected else "")
     return wp.kernel(enable_backward=False, module="unique")(predictor)
 
 
@@ -494,10 +500,14 @@ def create_owner(solver):
     if os.environ.get("FEATHER_PGS_SINGLE_FACTOR") == "1":
         raise ValueError("Sparse factor and single-factor owners are mutually exclusive")
     if not supported(solver):
+        if os.environ.get("FEATHER_PGS_SPARSE_SMALL_STEP") == "1":
+            raise ValueError("Small-step requires the complete supported sparse G1 configuration")
         return None
     try:
         plan, host = make_plan(solver.model, solver)
     except ValueError:
+        if os.environ.get("FEATHER_PGS_SPARSE_SMALL_STEP") == "1":
+            raise
         return None
     return SparseFactor(solver, plan, host)
 
@@ -528,6 +538,7 @@ class SparseFactor:
         self.data.W = wp.empty((w, 434), dtype=float, device=device)
         self.data.valid = wp.zeros(w, dtype=int, device=device)
         self.data.status = wp.zeros(w, dtype=int, device=device)
+        self.data.selected = wp.zeros(w, dtype=int, device=device)
         if self.packet_rows and self.block_contacts:
             raise ValueError("Sparse packets and contact-block rows are mutually exclusive")
         self.parallel_limit_prefix = os.environ.get("FEATHER_PGS_SPARSE_PARALLEL_LIMITS") == "1" and c == 100
@@ -543,6 +554,11 @@ class SparseFactor:
             contacts=get_contact_kernel(),
             solve=get_solve_kernel(c, self.block_contacts, metric_tangents=self.metric_tangents),
         )
+        self.small_step = None
+        if os.environ.get("FEATHER_PGS_SPARSE_SMALL_STEP") == "1":
+            from .small_step_dispatch import SmallStep  # noqa: PLC0415
+
+            self.small_step = SmallStep(self)
         # Drop canonical matrix/row storage only after complete constructor admission.
         # Dummy shapes make accidental readers fail visibly, not reinterpret packed W/Z.
         dummy = wp.empty((1, 1, 1), dtype=float, device=device)
@@ -562,6 +578,8 @@ class SparseFactor:
         """Reject changed execution ownership before any retired buffer is read."""
         if not supported(self.solver):
             raise RuntimeError("Sparse G1 configuration changed; reconstruct the solver and recapture before stepping")
+        if self.small_step is not None:
+            self.small_step.validate()
 
     def validate_notification(self, flags):
         """Re-prove structural ownership on model notifications before writes."""
@@ -579,6 +597,8 @@ class SparseFactor:
                 raise RuntimeError("Sparse G1 structural ownership changed; reconstruct and recapture") from error
             if self.solver._mimic_count or self.solver._connect_count:
                 raise RuntimeError("Sparse G1 constraint ownership changed; reconstruct and recapture")
+            if self.small_step is not None:
+                self.small_step.validate_notification()
 
     def check(self):
         """Surface a failed packed operator/row guard at existing checked boundaries."""
@@ -621,12 +641,17 @@ class SparseFactor:
             device=s.model.device,
         )
 
-    def build_rows(self, state_in, state_aug, contacts, dt):
+    def build_rows(self, state_in, state_aug, contacts, dt, *, layout_only=False):
         """Retain original allocation/metadata while replacing all dense J production."""
         from . import kernels as k  # noqa: PLC0415
 
+        if self.small_step is not None and not layout_only:
+            self.small_step.fallback_rows(state_in, state_aug, contacts, dt)
+            return
         s, model, device = self.solver, self.solver.model, self.solver.model.device
         c = s.dense_max_constraints
+        row_data = self.small_step.layout_data if layout_only else self.data
+        prefix_kernel = self.small_step.layout_prefix if layout_only else self.kernels.prefix
         if self.packet_rows:
             from .sparse_packet_rows import bind_current  # noqa: PLC0415
 
@@ -636,14 +661,14 @@ class SparseFactor:
             s._row_dropped_dense.zero_()
             s._row_dropped_mf.zero_()
             s._row_dropped_propagation.zero_()
-        tiled_prefix = self.packet_rows or self.parallel_limit_prefix
+        tiled_prefix = layout_only or self.packet_rows or self.parallel_limit_prefix
         prefix_launch = wp.launch_tiled if tiled_prefix else wp.launch
         prefix_launch(
-            self.kernels.prefix,
+            prefix_kernel,
             dim=[s.world_count] if tiled_prefix else s.world_count,
             inputs=[
                 self.plan,
-                self.data,
+                row_data,
                 s._joint_limit_q_index,
                 model.joint_limit_lower,
                 model.joint_limit_upper,
@@ -780,9 +805,9 @@ class SparseFactor:
                 ],
                 device=device,
             )
-            if self.packet_rows:
+            if layout_only or self.packet_rows:
                 wp.launch(
-                    self.kernels.contacts,
+                    self.small_step.packet_contacts if layout_only else self.kernels.contacts,
                     dim=threads,
                     inputs=[
                         contacts.rigid_contact_count,
@@ -791,7 +816,7 @@ class SparseFactor:
                         s.contact_slot,
                         s.contact_world,
                         s.contact_slots_needed,
-                        self.data.support,
+                        row_data.support,
                     ],
                     device=device,
                 )
@@ -853,7 +878,7 @@ class SparseFactor:
             dim=(s.world_count, s.dense_max_constraints),
             inputs=[
                 self.data,
-                s.constraint_count,
+                self.small_step.fallback_counts if self.small_step is not None else s.constraint_count,
                 s.row_type,
                 s.phi,
                 s.target_velocity,
@@ -895,3 +920,5 @@ class SparseFactor:
             block_dim=32,
             device=s.model.device,
         )
+        if self.small_step is not None:
+            self.small_step.solve(rhs, iterations, omega, friction_start)

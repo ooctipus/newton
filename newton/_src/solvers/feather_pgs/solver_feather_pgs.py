@@ -8484,6 +8484,11 @@ class SolverFeatherPGS(SolverBase):
             if self._fused_k1 and drive_rows_ready is not None:
                 wp.get_stream(model.device).wait_event(drive_rows_ready)
             global_inertia_ready, stage3_qd = self._stage1_fk_id(state_in, state_aug, state_out)
+            if self._sparse_factor is not None and self._sparse_factor.small_step is not None:
+                self._sparse_factor.small_step.begin_step(
+                    state_in, state_aug, control, contacts, stage3_qd, dt, collide_done_event
+                )
+                collide_done_event = None
 
             if model.articulation_count:
                 inverse_dynamics_ready = self._stage1_complete_joint_tau(
@@ -8533,9 +8538,10 @@ class SolverFeatherPGS(SolverBase):
                             self._stage3_trisolve_loop(size, state_aug)
                 self._stage3_compute_v_hat(state_in, state_aug, dt, stage3_qd)
                 self._clamp_rigid_velocity_limits(self.v_hat)
-            wp.copy(self._debug_stage3_qd_work, stage3_qd)
-            wp.copy(self._debug_stage3_joint_qdd, state_aug.joint_qdd)
-            wp.copy(self._debug_stage3_v_hat, self.v_hat)
+            if self._sparse_factor is None or self._sparse_factor.small_step is None:
+                wp.copy(self._debug_stage3_qd_work, stage3_qd)
+                wp.copy(self._debug_stage3_joint_qdd, state_aug.joint_qdd)
+                wp.copy(self._debug_stage3_v_hat, self.v_hat)
 
         # Wait for pipelined collide (if running on separate stream)
         if collide_done_event is not None:
@@ -9971,7 +9977,11 @@ class SolverFeatherPGS(SolverBase):
         """Launch inverse dynamics for the non-actuator torque bucket."""
         model = self.model
         body_f = state_in.body_f if state_in.body_count else None
-        state_aug.body_ft_s.zero_()
+        small_step = self._sparse_factor.small_step if self._sparse_factor is not None else None
+        if small_step is None:
+            state_aug.body_ft_s.zero_()
+        else:
+            small_step.clear_force(state_aug)
         tau_inputs = [
             model.articulation_start,
             self.articulation_joint_end,
@@ -10088,9 +10098,10 @@ class SolverFeatherPGS(SolverBase):
                 # flags, body_q, body_com, origin.
                 t = tau_inputs
                 wp.launch_tiled(
-                    grouped_tau,
+                    small_step.tau_kernel if small_step is not None else grouped_tau,
                     dim=[topo.blocks],
-                    inputs=[
+                    inputs=([small_step.selected, self.art_to_world] if small_step is not None else [])
+                    + [
                         topo.lanes_per_articulation,
                         int(model.articulation_count),
                         topo.max_levels,
@@ -10758,6 +10769,8 @@ class SolverFeatherPGS(SolverBase):
             )
 
     def _stage3_zero_qdd(self, state_aug: State):
+        if self._sparse_factor is not None and self._sparse_factor.small_step is not None:
+            return  # Fallback prediction covers every DOF; the selected owner keeps qdd private.
         state_aug.joint_qdd.zero_()
 
     def _stage3_trisolve_diagonal(self, size: int, state_aug: State) -> None:
@@ -10856,6 +10869,9 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage3_compute_v_hat(self, state_in: State, state_aug: State, dt: float, stage3_qd: wp.array):
+        if self._sparse_factor is not None and self._sparse_factor.small_step is not None:
+            self._sparse_factor.small_step.predict_velocity(state_in, state_aug, dt, stage3_qd)
+            return
         model = self.model
         if not model.joint_count:
             return
@@ -13345,6 +13361,18 @@ class SolverFeatherPGS(SolverBase):
         joint_limit_speculative_scale: float = 1.0,
         output=None,
     ):
+        counts = self.constraint_count
+        if self._sparse_factor is not None and self._sparse_factor.small_step is not None:
+            if (
+                output is not None
+                or preserve_unreached_speculative
+                or apply_restitution
+                or bias_scale != 1.0
+                or joint_limit_speculative_scale != 1.0
+                or contact_speculative_scale != self.contact_speculative_scale
+            ):
+                raise RuntimeError("Small-step packets require the original single position pass")
+            counts = self._sparse_factor.small_step.fallback_counts
         if self._row_packets is not None:
             if (
                 output is not None
@@ -13386,7 +13414,7 @@ class SolverFeatherPGS(SolverBase):
             compute_world_contact_bias,
             dim=self.world_count * self.dense_max_constraints,
             inputs=[
-                self.constraint_count,
+                counts,
                 self.dense_max_constraints,
                 self.phi,
                 self.row_beta,
@@ -13509,11 +13537,14 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage5_prepare_impulses_world(self):
         warmstart_flag = 1 if self.pgs_warmstart else 0
+        counts = self.constraint_count
+        if self._sparse_factor is not None and self._sparse_factor.small_step is not None:
+            counts = self._sparse_factor.small_step.fallback_counts
         wp.launch(
             prepare_world_impulses,
             dim=self.world_count,
             inputs=[
-                self.constraint_count,
+                counts,
                 self.dense_max_constraints,
                 warmstart_flag,
             ],
@@ -13640,6 +13671,9 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage6_prepare_world_velocity(self):
+        if self._sparse_factor is not None and self._sparse_factor.small_step is not None:
+            self._sparse_factor.small_step.prepare_velocity()
+            return
         wp.copy(self.v_out, self.v_hat)
 
     def _build_mf_body_map(self) -> None:
