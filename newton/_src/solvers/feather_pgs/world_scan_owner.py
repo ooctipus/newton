@@ -85,7 +85,7 @@ class WorldScanOwner:
         )
         self.model_plan_values = {name: getattr(solver.model, name).numpy().copy() for name in PLAN_FIELDS}
 
-    def validate_notification(self, flags):
+    def validate_notification(self, flags, *, plan_snapshot=None):
         """Keep numeric changes on current bindings without repeated topology readbacks."""
         numeric = int(
             ModelFlags.JOINT_DOF_PROPERTIES
@@ -97,7 +97,9 @@ class WorldScanOwner:
         if value != 0 and value & ~numeric == 0:
             return
         for name, expected in self.model_plan_values.items():
-            if not np.array_equal(getattr(self.solver.model, name).numpy(), expected):
+            if not np.array_equal(
+                kuka_joint_owner.read_notification_plan_field(self.solver.model, name, plan_snapshot), expected
+            ):
                 raise RuntimeError(
                     "World publication static ownership changed; reconstruct the solver and recapture graphs"
                 )

@@ -2432,6 +2432,12 @@ class SolverFeatherPGS(SolverBase):
                 raise ValueError("Sparse factor excludes canonical factor/row debug readers")
             self._sparse_factor = create_sparse_factor(self)
 
+        self._kinetic_world = None
+        if os.environ.get("FEATHER_PGS_KUKA_KINETIC_WORLD") == "1":
+            from .kinetic_live_owner import create_owner as create_kinetic_owner  # noqa: PLC0415
+
+            self._kinetic_world = create_kinetic_owner(self)
+
     def _update_kinematic_state(self) -> None:
         """Refresh cached kinematic flags and effective joint armature."""
         model = self.model
@@ -2475,12 +2481,24 @@ class SolverFeatherPGS(SolverBase):
         """Refresh cached solver data after supported model changes."""
         if getattr(self, "_sparse_factor", None) is not None:
             self._sparse_factor.validate_notification(flags)
+        kinetic = getattr(self, "_kinetic_world", None)
+        joint_world = getattr(self, "_joint_world", None)
+        publication = getattr(self, "_world_scan_publication", None)
+        plan_snapshot = None
+        if kinetic is not None or joint_world is not None or publication is not None:
+            from .kuka_joint_owner import notification_plan_snapshot  # noqa: PLC0415
+
+            plan_snapshot = notification_plan_snapshot(flags)
+        if kinetic is not None:
+            kinetic.validate_notification(flags, plan_snapshot=plan_snapshot)
         if self._row_packets is not None:
             self._row_packets.validate_notification(flags)
-        if getattr(self, "_joint_world", None) is not None:
-            self._joint_world.validate_notification(flags)
-        if getattr(self, "_world_scan_publication", None) is not None:
-            self._world_scan_publication.validate_notification(flags)
+        if joint_world is not None:
+            joint_world.validate_notification(flags, plan_snapshot=plan_snapshot)
+        if publication is not None:
+            publication.validate_notification(flags, plan_snapshot=plan_snapshot)
+        if kinetic is not None:
+            kinetic.invalidate_model_changed(flags)
         if self._fk_id_cache_enabled and flags & (
             ModelFlags.JOINT_PROPERTIES
             | ModelFlags.JOINT_DOF_PROPERTIES
@@ -2540,6 +2558,9 @@ class SolverFeatherPGS(SolverBase):
             )
         if self.world_count == 0:
             return
+
+        if getattr(self, "_kinetic_world", None) is not None:
+            self._kinetic_world.reset(state, world_mask)
 
         if self._fk_id_cache_enabled:
             wp.launch(
@@ -8461,6 +8482,12 @@ class SolverFeatherPGS(SolverBase):
             self._step += 1
             return state_out
 
+        if self._kinetic_world is not None and self._kinetic_world.try_step(
+            state_in, state_out, state_aug, control, contacts, dt, collide_done_event
+        ):
+            self._step += 1
+            return state_out
+
         self._joint_world_active = self._joint_world is not None and self._joint_world.begin(
             state_in, state_out, contacts, collide_done_event
         )
@@ -9404,6 +9431,9 @@ class SolverFeatherPGS(SolverBase):
     def update_contacts(self, contacts: Contacts) -> None:
         """Populate Newton contact-force buffers from the last FeatherPGS solve."""
         if contacts is None or contacts.rigid_contact_count is None:
+            return
+
+        if self._kinetic_world is not None and self._kinetic_world.update_contacts(contacts):
             return
 
         dt = self._last_step_dt
@@ -24454,8 +24484,7 @@ def _get_pgs_solve_mf_gs_kernel(
         int global_dof = world_dof_indices.data[dof_map_base + d];
         s_v[d] = global_dof >= 0 ? v_out.data[global_dof] : 0.0f;
     }}
-    __syncwarp();
-{kinetic_initialization}
+    __syncwarp();{kinetic_initialization}
 
     // ═══════════════════════════════════════════════════════
     // SOLVE PHASE

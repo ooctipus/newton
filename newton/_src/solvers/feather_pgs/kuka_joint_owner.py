@@ -121,6 +121,27 @@ def simple_inputs(solver, state_in, state_aug, dt):
     return data
 
 
+def notification_plan_snapshot(flags):
+    """Create one lazy host snapshot for this callback, never for numeric flags."""
+    numeric = int(
+        ModelFlags.JOINT_DOF_PROPERTIES
+        | ModelFlags.BODY_INERTIAL_PROPERTIES
+        | ModelFlags.SHAPE_PROPERTIES
+        | ModelFlags.MODEL_PROPERTIES
+    )
+    value = int(flags)
+    return None if value != 0 and value & ~numeric == 0 else {}
+
+
+def read_notification_plan_field(model, name, snapshot):
+    """Share a current read, while each owner retains its own admission check."""
+    if snapshot is None:
+        return getattr(model, name).numpy()
+    if name not in snapshot:
+        snapshot[name] = getattr(model, name).numpy()
+    return snapshot[name]
+
+
 class JointWorldOwner:
     """Overlap only raw-ID indexing; keep all public FK/cache publication late."""
 
@@ -158,7 +179,7 @@ class JointWorldOwner:
 
         self.response = ActiveKukaResponse(solver, self.output.active_worlds, self.output.active_count)
 
-    def validate_notification(self, flags):
+    def validate_notification(self, flags, *, plan_snapshot=None):
         """Keep numeric reset notifications free of static-plan readbacks."""
         self.join_raw()
         numeric = int(
@@ -171,7 +192,7 @@ class JointWorldOwner:
         if value != 0 and value & ~numeric == 0:
             return
         for name, expected in self.model_plan_values.items():
-            if not np.array_equal(getattr(self.solver.model, name).numpy(), expected):
+            if not np.array_equal(read_notification_plan_field(self.solver.model, name, plan_snapshot), expected):
                 raise RuntimeError("Joint-world static ownership changed; reconstruct the solver and recapture graphs")
 
     def begin(self, state_in, state_out, contacts, collide_done_event):
