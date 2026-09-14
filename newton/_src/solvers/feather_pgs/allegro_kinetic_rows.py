@@ -14,29 +14,7 @@ import numpy as np
 import warp as wp
 
 from ...sim import JointType, ModelFlags
-from .franka_contact_packet import (
-    ContactInput,
-    _broadcast,
-    _join,
-    _lane,
-    _stride,
-    bind,
-    contact_points,
-    endpoint_projection,
-    friction_multiplier,
-)
-from .kernels import (
-    contact_restitution_fires,
-    contact_tangent_basis,
-    mixed_contact_restitution,
-    prescribed_relative_contact_target,
-)
-
-
-@wp.struct
-class KineticRows:
-    coefficients: wp.array3d[float]
-    encoding: wp.array2d[int]
+from .franka_contact_packet import ContactInput, bind
 
 
 @wp.struct
@@ -138,8 +116,6 @@ class PrefixInput:
     bounds: wp.array2d[int]
     velocity_slots: wp.array[int]
     velocity_signs: wp.array[float]
-    row_dof: wp.array2d[int]
-    row_sign: wp.array2d[float]
     kind: wp.array2d[int]
     parent: wp.array2d[int]
     mu: wp.array2d[float]
@@ -154,6 +130,14 @@ class PrefixInput:
     pgs_beta: float
     pgs_cfm: float
     dt: float
+
+
+@wp.struct
+class KineticRows:
+    rowkeys: wp.array2d[int]
+    maps: MapInput
+    prefix: PrefixInput
+    contact: ContactInput
 
 
 @cache
@@ -207,7 +191,7 @@ def get_prefix_kernel():
         const int slot = base + rank;
         if (active && slot < M) {
             const int at = world * M + slot;
-            p.row_dof.data[at] = d; p.row_sign.data[at] = sign;
+            z.rowkeys.data[at] = ~(d * 2 + side);
             p.kind.data[at] = phase == 0 ? 3 : 4;
             p.parent.data[at] = -1; p.mu.data[at] = 0.0f;
             p.beta.data[at] = phase == 0 ? p.pgs_beta : 0.0f;
@@ -215,9 +199,6 @@ def get_prefix_kernel():
             p.phi.data[at] = phi; p.target.data[at] = target;
             p.restitution.data[at] = 0.0f;
             p.rhs.data[at] = phase == 1 ? -target : ((phi < 0.0f ? p.pgs_beta : 1.0f) * phi / p.dt);
-            const int offset = (d / 4) * 4;
-            z.encoding.data[at] = offset | (4 << 5);
-            for (int k = 0; k < 4; ++k) z.coefficients.data[at * 10 + k] = sign * p.inverse.data[world * 100 + (d / 4) * 16 + k * 4 + d % 4];
             if (phase == 1) {
                 p.velocity_slots.data[dof * 2 + side] = slot;
                 p.velocity_signs.data[dof * 2 + side] = sign;
@@ -249,208 +230,224 @@ def get_prefix_kernel():
     return allegro_kinetic_limit_prefix
 
 
-@wp.func
-def _map_id(maps: MapInput, body: int, art: int):
-    result = int(-1)
-    if body >= 0 and art >= 0:
-        result = maps.body_map[body]
-    return result
-
-
-@wp.func
-def _map_offset(index: int):
-    return 16 if index == 16 else (index // 4) * 4
-
-
-@wp.func
-def _map_length(index: int):
-    return 6 if index == 16 else 4
-
-
-@wp.func
-def _project_map(maps: MapInput, world: int, index: int, coordinate: int, lever: wp.vec3, direction: wp.vec3):
-    value = float(0.0)
-    if index >= 0:
-        start = 384 if index == 16 else index * 24
-        local = coordinate - _map_offset(index)
-        if local >= 0 and local < _map_length(index):
-            torque = wp.cross(lever, direction)
-            for axis in range(3):
-                value += maps.maps[world, start + local * 6 + axis] * direction[axis]
-                value += maps.maps[world, start + local * 6 + axis + 3] * torque[axis]
-    return value
-
-
 @wp.kernel(enable_backward=False)
-def produce_contacts(workers: int, data: ContactInput, maps: MapInput, z: KineticRows):
-    """Share current geometry and emit compact Z with original contact metadata."""
-    worker, _logical_lane = wp.tid()
-    lane, stride = _lane(), _stride()
-    total = wp.min(data.count[0], data.point0.shape[0])
-    for contact in range(worker, total, workers):
-        if data.path[contact] != 0 or data.slot[contact] < 0:
-            continue
-        world, slot = data.world[contact], data.slot[contact]
-        art0, art1 = data.art0[contact], data.art1[contact]
-        body0, body1 = int(-1), int(-1)
-        if data.shape0[contact] >= 0:
-            body0 = data.shape_body[data.shape0[contact]]
-        if data.shape1[contact] >= 0:
-            body1 = data.shape_body[data.shape1[contact]]
-        normal = -data.normal[contact]
-        point0, point1, t0, t1 = wp.vec3(), wp.vec3(), wp.vec3(), wp.vec3()
-        if lane == 0:
-            _body0, _body1, point0, point1 = contact_points(data, contact)
-            t0, t1 = contact_tangent_basis(normal)
-        # Warp-coherent geometry is read once by lane zero at the physical seam.
-        point0, point1 = _broadcast(point0), _broadcast(point1)
-        t0, t1 = _broadcast(t0), _broadcast(t1)
-        anchor = 0.5 * (point0 + point1)
-        id0, id1 = _map_id(maps, body0, art0), _map_id(maps, body1, art1)
-        offset0, offset1, length0, length1 = int(0), int(0), int(0), int(0)
-        if id0 >= 0:
-            offset0, length0 = _map_offset(id0), _map_length(id0)
-        if id1 >= 0:
-            if length0 == 0:
-                offset0, length0 = _map_offset(id1), _map_length(id1)
-            elif _map_offset(id1) != offset0:
-                offset1, length1 = _map_offset(id1), _map_length(id1)
-        code = offset0 | (length0 << 5) | (offset1 << 8) | (length1 << 13)
-        for item in range(lane, data.slots_needed[contact] * 10, stride):
-            row, k = item // 10, item % 10
-            if k < length0 + length1:
-                coordinate = offset0 + k if k < length0 else offset1 + k - length0
-                direction = normal if row == 0 else (t0 if row == 1 else t1)
-                p0, p1 = point0, point1
-                if data.shared_anchor != 0 or (row > 0 and data.friction_shared_anchor != 0):
-                    p0, p1 = anchor, anchor
-                value = float(0.0)
-                if art0 >= 0:
-                    value += _project_map(maps, world, id0, coordinate, p0 - data.origin[art0], direction)
-                if art1 >= 0:
-                    value -= _project_map(maps, world, id1, coordinate, p1 - data.origin[art1], direction)
-                z.coefficients[world, slot + row, k] = value
-        _join()
-        if lane == 0:
-            mu, materials = float(0.0), int(0)
-            if data.shape0[contact] >= 0:
-                mu += data.material_mu[data.shape0[contact]]
-                materials += 1
-            if data.shape1[contact] >= 0:
-                mu += data.material_mu[data.shape1[contact]]
-                materials += 1
-            if materials > 0:
-                mu /= float(materials)
-            rest = mixed_contact_restitution(data.shape0[contact], data.shape1[contact], data.material_restitution)
-            friction_mu = mu * friction_multiplier(data, contact, total, art0, art1)
-            separation = wp.dot(normal, point0 - point1)
-            for row in range(data.slots_needed[contact]):
-                r = slot + row
-                direction = normal if row == 0 else (t0 if row == 1 else t1)
-                p0, p1 = point0, point1
-                if data.shared_anchor != 0 or (row > 0 and data.friction_shared_anchor != 0):
-                    p0, p1 = anchor, anchor
-                target = prescribed_relative_contact_target(
-                    body0, art0, body1, art1, p0, p1, direction, data.prescribed, data.origin, data.body_v
-                )
-                rhs = -target
-                phi, beta, restitution = float(0.0), float(0.0), float(0.0)
-                kind = int(2)
-                parent = int(slot)
-                row_mu = float(friction_mu)
-                if row == 0:
-                    phi = separation
-                    beta = data.beta
-                    restitution = rest
-                    kind = 0
-                    parent = -1
-                    row_mu = mu
-                    rhs += (data.bias_scale * beta if phi <= 0.0 else data.speculative_scale) * phi / data.dt
-                    if restitution > 0.0:
-                        relative = -target
-                        for k in range(length0 + length1):
-                            coordinate = offset0 + k if k < length0 else offset1 + k - length0
-                            relative += z.coefficients[world, r, k] * maps.kinetic_incident[world, coordinate]
-                        if contact_restitution_fires(phi, relative, data.dt, data.restitution_threshold):
-                            rhs = -target + restitution * relative
-                z.encoding[world, r] = code
-                data.row_type[world, r] = kind
-                data.row_parent[world, r] = parent
-                data.row_mu[world, r] = row_mu
-                data.row_beta[world, r] = beta
-                data.row_cfm[world, r] = data.cfm
-                data.phi[world, r] = phi
-                data.target[world, r] = target
-                data.restitution[world, r] = restitution
-                data.rhs[world, r] = rhs
-                data.diag[world, r] = data.cfm
-        _join()
+def scatter_contact_keys(data: ContactInput, z: KineticRows):
+    """Emit only the original allocated raw contact ID and row direction."""
+    contact = wp.tid()
+    if contact < wp.min(data.count[0], data.point0.shape[0]):
+        if data.path[contact] == 0 and data.slot[contact] >= 0:
+            for direction in range(data.slots_needed[contact]):
+                z.rowkeys[data.world[contact], data.slot[contact] + direction] = contact * 4 + direction
 
 
-@wp.kernel(enable_backward=False)
-def materialize_prefix(
-    p: PrefixInput,
-    counts: wp.array[int],
-    mf_counts: wp.array[int],
-    maps: MapInput,
-    J16: wp.array3d[float],
-    J6: wp.array3d[float],
-):
-    """Clear all current fallback rows and materialize its exact coordinate prefix."""
-    world, lane = wp.tid()
-    if counts[world] <= 128 and mf_counts[world] == 0:
-        return
-    ga, gb = maps.groups[world, 0], maps.groups[world, 1]
-    for item in range(lane, counts[world] * 22, _stride()):
-        row, d = item // 22, item % 22
-        value = float(0.0)
-        if row < p.bounds[world, 1] and p.row_dof[world, row] == d:
-            value = p.row_sign[world, row]
-        if d < 16:
-            J16[ga, row, d] = value
-        else:
-            J6[gb, row, d - 16] = value
+def _row_source(*, kinetic):
+    """Share original WR geometry and metadata between direct ingestion and fallback."""
+    prefix = """
+        const int token = ~key, d = token / 2;
+        const float sign = (token & 1) == 0 ? 1.0f : -1.0f;
+        #pragma unroll
+        for (int q = 0; q < 22; ++q) {
+            __PREFIX_VALUE__
+        }
+    """
+    prefix = prefix.replace(
+        "__PREFIX_VALUE__",
+        "Jr[q] = q / 4 == d / 4 ? sign * z.maps.inverse.data[world * 100 + (d / 4) * 16 + (q % 4) * 4 + d % 4] : 0.0f;"
+        if kinetic
+        else "Jr[q] = q == d ? sign : 0.0f;",
+    )
+    projection = """
+        #pragma unroll
+        for (int q = 0; q < 22; ++q) {
+            float value = 0.0f;
+            for (int side = 0; side < 2; ++side) {
+                const int body = side == 0 ? ba : bb, art = side == 0 ? aa : ab;
+                if (body < 0 || art < 0) continue;
+                const float sign = side == 0 ? 1.0f : -1.0f;
+                const wp::vec3 point = side == 0 ? pa : pb;
+                __PROJECT__
+            }
+            Jr[q] = value;
+        }
+    """
+    projection = projection.replace(
+        "__PROJECT__",
+        """
+                const int id = z.maps.body_map.data[body];
+                if (id < 0) continue;
+                const int offset = id == 16 ? 16 : (id / 4) * 4;
+                const int n = id == 16 ? 6 : 4;
+                if (q < offset || q >= offset + n) continue;
+                const int start = id == 16 ? 384 : id * 24;
+                const float* map = z.maps.maps.data + world * 420 + start + (q - offset) * 6;
+                const wp::vec3 torque = wp::cross(point - c.origin.data[art], direction);
+                float v = 0.0f;
+                #pragma unroll
+                for (int axis = 0; axis < 3; ++axis) {
+                    v += map[axis] * direction[axis];
+                    v += map[axis + 3] * torque[axis];
+                }
+                value += sign * v;
+        """
+        if kinetic
+        else """
+                const int n = c.response_dofs.data[art], local = q < 16 ? q : q - 16;
+                if (n != (q < 16 ? 16 : 6) || (c.body_mask.data[body] & (1u << local)) == 0u) continue;
+                const wp::spatial_vector S = c.motion.data[c.dof_start.data[art] + local];
+                const wp::vec3 linear(S[0], S[1], S[2]), angular(S[3], S[4], S[5]);
+                value += sign * wp::dot(direction, linear + wp::cross(angular, point - c.origin.data[art]));
+        """,
+    )
+    incident = (
+        "relative += Jr[q] * z.maps.kinetic_incident.data[world * 22 + q];"
+        if kinetic
+        else "relative += Jr[q] * c.incident.data[z.maps.starts.data[world * 2 + (q < 16 ? 0 : 1)] + (q < 16 ? q : q - 16)];"
+    )
+    return (
+        r"""
+    const int at = world * z.rowkeys.shape[1] + row;
+    const int key = z.rowkeys.data[at];
+    if (key < 0) {
+__PREFIX__
+    } else {
+        const auto& c = z.contact;
+        const int contact = key >> 2, r = key & 3;
+        const int sa = c.shape0.data[contact], sb = c.shape1.data[contact];
+        const int ba = sa >= 0 ? c.shape_body.data[sa] : -1;
+        const int bb = sb >= 0 ? c.shape_body.data[sb] : -1;
+        const int aa = c.art0.data[contact], ab = c.art1.data[contact];
+        const wp::vec3 normal = -c.normal.data[contact];
+        wp::vec3 pa = ba >= 0 ? wp::transform_point(c.body_q.data[ba], c.point0.data[contact]) : c.point0.data[contact];
+        wp::vec3 pb = bb >= 0 ? wp::transform_point(c.body_q.data[bb], c.point1.data[contact]) : c.point1.data[contact];
+        pa = pa - c.margin0.data[contact] * normal;
+        pb = pb + c.margin1.data[contact] * normal;
+        const float separation = wp::dot(normal, pa - pb);
+        wp::vec3 direction = normal;
+        if (r > 0) {
+            wp::vec3 t0 = wp::cross(normal, wp::vec3(1.0f, 0.0f, 0.0f));
+            if (wp::length_sq(t0) < 1.0e-12f) t0 = wp::cross(normal, wp::vec3(0.0f, 1.0f, 0.0f));
+            t0 = wp::normalize(t0);
+            direction = r == 1 ? t0 : wp::normalize(wp::cross(normal, t0));
+        }
+        if (c.shared_anchor != 0 || (r > 0 && c.friction_shared_anchor != 0)) {
+            const wp::vec3 anchor = 0.5f * (pa + pb); pa = anchor; pb = anchor;
+        }
+        float known = 0.0f;
+        for (int side = 0; side < 2; ++side) {
+            const int body = side == 0 ? ba : bb, art = side == 0 ? aa : ab;
+            if (body >= 0 && art >= 0 && c.prescribed.data[art] != 0) {
+                const wp::spatial_vector v = c.body_v.data[body];
+                const wp::vec3 linear(v[0], v[1], v[2]), angular(v[3], v[4], v[5]);
+                const wp::vec3 p = side == 0 ? pa : pb;
+                const float value = wp::dot(direction, linear + wp::cross(angular, p - c.origin.data[art]));
+                known += side == 0 ? value : -value;
+            }
+        }
+        const float target = -known;
+        float mu = 0.0f, restitution = 0.0f; int materials = 0;
+        for (int side = 0; side < 2; ++side) {
+            const int shape = side == 0 ? sa : sb;
+            if (shape >= 0) {
+                ++materials; mu += c.material_mu.data[shape];
+                const float rest = c.material_restitution.data[shape];
+                if (isfinite(rest)) restitution += rest < 0.0f ? 0.0f : (rest > 1.0f ? 1.0f : rest);
+            }
+        }
+        if (materials) { mu /= static_cast<float>(materials); restitution /= static_cast<float>(materials); }
+        float friction = mu * c.friction_scale;
+        const bool filter = c.friction_pairs_only == 0 || (aa >= 0 && ab >= 0 && c.is_free.data[aa] == 0 && c.is_free.data[ab] == 0);
+        if (r > 0 && filter && c.friction_anchor_limit > 0) {
+            const int total = wp::min(c.count.data[0], c.point0.shape[0]);
+            int rank = 0;
+            for (int look = 1; look <= 8; ++look) {
+                const int prev = contact - look;
+                if (prev < 0 || prev >= total) break;
+                if (c.shape0.data[prev] != sa || c.shape1.data[prev] != sb) break;
+                ++rank;
+            }
+            const int next = contact + 1;
+            if (rank > 0 || (next < total && c.shape0.data[next] == sa && c.shape1.data[next] == sb)) friction *= 0.5f;
+        }
+__PROJECTION__
+        const float phi = r == 0 ? separation : 0.0f;
+        float rhs = -target;
+        if (r == 0) {
+            rhs += (phi <= 0.0f ? c.bias_scale * c.beta : c.speculative_scale) * phi / c.dt;
+            if (restitution > 0.0f) {
+                float relative = -target;
+                #pragma unroll
+                for (int q = 0; q < 22; ++q) { __INCIDENT__ }
+                if (relative < -c.restitution_threshold && (phi <= 1.0e-6f || phi + c.dt * relative <= 1.0e-6f))
+                    rhs = -target + restitution * relative;
+            }
+        }
+        c.row_type.data[at] = r == 0 ? 0 : 2;
+        c.row_parent.data[at] = r == 0 ? -1 : c.slot.data[contact];
+        c.row_mu.data[at] = r == 0 ? mu : friction;
+        c.row_beta.data[at] = r == 0 ? c.beta : 0.0f;
+        c.row_cfm.data[at] = c.cfm;
+        c.phi.data[at] = phi; c.target.data[at] = target;
+        c.restitution.data[at] = r == 0 ? restitution : 0.0f;
+        c.rhs.data[at] = rhs; c.diag.data[at] = c.cfm;
+        __PRIVATE_METADATA__
+    }
+""".replace("__PREFIX__", prefix)
+        .replace("__PROJECTION__", projection)
+        .replace("__INCIDENT__", incident)
+        .replace(
+            "__PRIVATE_METADATA__",
+            "built_rhs = rhs; built_mu = r == 0 ? mu : friction; built_parent = r == 0 ? -1 : c.slot.data[contact];"
+            if kinetic
+            else "",
+        )
+    )
 
 
-@wp.kernel(enable_backward=False)
-def materialize_contacts(
-    workers: int,
-    data: ContactInput,
-    counts: wp.array[int],
-    mf_counts: wp.array[int],
-    maps: MapInput,
-    J16: wp.array3d[float],
-    J6: wp.array3d[float],
-):
-    """Publish exact current endpoint rows only for the original 12-step fallback."""
-    worker, _logical_lane = wp.tid()
-    lane, stride = _lane(), _stride()
-    total = wp.min(data.count[0], data.point0.shape[0])
-    for contact in range(worker, total, workers):
-        if data.path[contact] != 0 or data.slot[contact] < 0:
-            continue
-        world = data.world[contact]
-        if counts[world] <= 128 and mf_counts[world] == 0:
-            continue
-        body0, body1, point0, point1 = contact_points(data, contact)
-        normal = -data.normal[contact]
-        t0, t1 = contact_tangent_basis(normal)
-        anchor = 0.5 * (point0 + point1)
-        for item in range(lane, data.slots_needed[contact] * 22, stride):
-            row, d = item // 22, item % 22
-            size = 16 if d < 16 else 6
-            local = d if d < 16 else d - 16
-            direction = normal if row == 0 else (t0 if row == 1 else t1)
-            p0, p1 = point0, point1
-            if data.shared_anchor != 0 or (row > 0 and data.friction_shared_anchor != 0):
-                p0, p1 = anchor, anchor
-            value = endpoint_projection(data, body0, data.art0[contact], size, local, p0, direction)
-            value -= endpoint_projection(data, body1, data.art1[contact], size, local, p1, direction)
-            r = data.slot[contact] + row
-            if d < 16:
-                J16[maps.groups[world, 0], r, d] = value
-            else:
-                J6[maps.groups[world, 1], r, d - 16] = value
+@cache
+def get_fallback_kernel():
+    """Materialize current physical rows in one pass over fallback worlds only."""
+    source = (
+        """
+    if (counts.data[world] <= 128 && mf_counts.data[world] == 0) return;
+#if defined(__CUDA_ARCH__)
+    const int lane = threadIdx.x, stride = blockDim.x;
+#else
+    const int lane = 0, stride = 1;
+#endif
+    const int ga = z.maps.groups.data[world * 2], gb = z.maps.groups.data[world * 2 + 1];
+    for (int row = lane; row < counts.data[world]; row += stride) {
+        float Jr[22];
+"""
+        + _row_source(kinetic=False)
+        + """
+        #pragma unroll
+        for (int q = 0; q < 22; ++q) {
+            if (q < 16) J16.data[(ga * J16.shape[1] + row) * 16 + q] = Jr[q];
+            else J6.data[(gb * J6.shape[1] + row) * 6 + q - 16] = Jr[q];
+        }
+    }
+"""
+    )
+
+    @wp.func_native(source)
+    def native(
+        world: int,
+        logical_lane: int,
+        z: KineticRows,
+        counts: wp.array[int],
+        mf_counts: wp.array[int],
+        J16: wp.array3d[float],
+        J6: wp.array3d[float],
+    ): ...
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def allegro_kinetic_keyed_fallback(
+        z: KineticRows, counts: wp.array[int], mf_counts: wp.array[int], J16: wp.array3d[float], J6: wp.array3d[float]
+    ):
+        world, lane = wp.tid()
+        native(world, lane, z, counts, mf_counts, J16, J6)
+
+    return allegro_kinetic_keyed_fallback
 
 
 def get_ink_stage(na, nb, oa, ob, dofs, capacity):
@@ -474,15 +471,24 @@ def get_ink_stage(na, nb, oa, ob, dofs, capacity):
     SYNC();
     if (lane < n_rows) {{
         const int i = lane;
-        const int code = kinetic_rows.encoding.data[off_dense + i];
-        const int o0 = code & 31, n0 = (code >> 5) & 7;
-        const int o1 = (code >> 8) & 31, n1 = (code >> 13) & 7;
+        const int row = i;
+        const auto& z = kinetic_rows;
+        float built_rhs = 0.0f, built_mu = 0.0f;
+        int built_parent = -1;
+        {{
+        {_row_source(kinetic=True)}
+        }}
+        if (z.rowkeys.data[off_dense + i] >= 0) {{
+            const int direction = z.rowkeys.data[off_dense + i] & 3;
+            s_rhs[i] = built_rhs;
+            s_parent[i] = built_parent;
+            s_mu[i] = built_mu;
+            const bool admit = i >= dense_lo && row_phase != 2 && row_phase != 3 && row_phase != 5;
+            s_kind[i] = admit ? (direction == 0 ? 0 : 1) : -1;
+        }}
         float bjv = 0.0f;
         #pragma unroll
         for (int d = 0; d < 22; ++d) {{
-            const int k = d >= o0 && d < o0 + n0 ? d - o0
-                        : d >= o1 && d < o1 + n1 ? n0 + d - o1 : -1;
-            Jr[d] = k >= 0 ? kinetic_rows.coefficients.data[((size_t)world * {capacity} + i) * 10 + k] : 0.0f;
             s_Yt[d * YS + i] = Jr[d]; bjv += Jr[d] * s_dv[d];
         }}
         s_rhs[i] += bjv;
@@ -531,7 +537,17 @@ def get_parallel_factory(original):
     factory.body[final_return:final_return] = ast.parse("kernel._fpgs_kinetic_rows = True").body
     for node in ast.walk(factory):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            node.value = node.value.replace("pgs_solve_parallel_", "pgs_solve_kinetic_parallel_")
+            node.value = node.value.replace("pgs_solve_parallel_", "pgs_solve_kinetic_keyed_parallel_")
+            node.value = node.value.replace(
+                "const int row_type = world_row_type.data[off_dense + i] & ",
+                "const int row_type = (kinetic_rows.rowkeys.data[off_dense + i] >= 0 ? ((kinetic_rows.rowkeys.data[off_dense + i] & 3) == 0 ? 0 : 2) : world_row_type.data[off_dense + i]) & ",
+            )
+            # Contact metadata is produced by the row lane below, not an earlier global pass.
+            for field, source in (("s_rhs", "rhs_bias"), ("s_parent", "world_row_parent"), ("s_mu", "world_row_mu")):
+                node.value = node.value.replace(
+                    f"{field}[i] = {source}.data[off_dense + i];",
+                    f"{field}[i] = kinetic_rows.rowkeys.data[off_dense + i] < 0 ? {source}.data[off_dense + i] : 0;",
+                )
     namespace = dict(original.__globals__)
     namespace.update(KineticRows=KineticRows, get_ink_stage=get_ink_stage)
     ast.fix_missing_locations(tree)
@@ -606,19 +622,17 @@ class AllegroKineticRows:
 
     def __init__(self, solver):
         self.solver = solver
+        self.keyed_rows = True
         groups, starts, body_map = topology_plan(solver)
         dev, worlds, capacity = solver.model.device, solver.world_count, solver.dense_max_constraints
         self.data, self.maps, self.prefix = KineticRows(), MapInput(), PrefixInput()
-        self.data.coefficients = wp.empty((worlds, capacity, 10), dtype=float, device=dev)
-        self.data.encoding = wp.empty((worlds, capacity), dtype=int, device=dev)
+        self.data.rowkeys = wp.empty((worlds, capacity), dtype=int, device=dev)
         self.maps.groups = wp.array(groups, dtype=int, device=dev)
         self.maps.starts = wp.array(starts, dtype=int, device=dev)
         self.maps.body_map = wp.array(body_map, dtype=int, device=dev)
         self.maps.inverse = wp.empty((worlds, 100), dtype=float, device=dev)
         self.maps.maps = wp.empty((worlds, 420), dtype=float, device=dev)
         self.maps.kinetic_incident = wp.empty((worlds, 22), dtype=float, device=dev)
-        self.prefix.row_dof = wp.empty((worlds, capacity), dtype=int, device=dev)
-        self.prefix.row_sign = wp.empty((worlds, capacity), dtype=float, device=dev)
         self.contact_input = None
         self._signature = _signature(solver)
 
@@ -671,6 +685,7 @@ class AllegroKineticRows:
             dt,
         )
         self.contact_input = None
+        self.data.maps, self.data.prefix = m, p
         wp.launch_tiled(get_map_kernel(), dim=[s.world_count], inputs=[m], block_dim=32, device=s.model.device)
         wp.launch_tiled(
             get_prefix_kernel(), dim=[s.world_count], inputs=[p, self.data], block_dim=32, device=s.model.device
@@ -679,41 +694,25 @@ class AllegroKineticRows:
     def produce_contacts(self, state_in, state_aug, contacts, dt):
         """Defer current contact construction until final fallback counts are known."""
         self.contact_input = bind(self.solver, state_in, state_aug, contacts, dt, 1.0)
+        self.data.contact = self.contact_input
 
     def finish_rows(self):
         """Publish current direct rows and fully materialize only fallback worlds."""
         s = self.solver
+        if self.contact_input is not None:
+            wp.launch(
+                scatter_contact_keys,
+                dim=self.contact_input.point0.shape[0],
+                inputs=[self.contact_input, self.data],
+                device=s.model.device,
+            )
         wp.launch_tiled(
-            materialize_prefix,
+            get_fallback_kernel(),
             dim=[s.world_count],
-            inputs=[self.prefix, s.constraint_count, s.mf_constraint_count, self.maps, s.J_by_size[16], s.J_by_size[6]],
+            inputs=[self.data, s.constraint_count, s.mf_constraint_count, s.J_by_size[16], s.J_by_size[6]],
             block_dim=32,
             device=s.model.device,
         )
-        if self.contact_input is not None:
-            workers = min(self.contact_input.point0.shape[0], 16384)
-            wp.launch_tiled(
-                produce_contacts,
-                dim=[workers],
-                inputs=[workers, self.contact_input, self.maps, self.data],
-                block_dim=32,
-                device=s.model.device,
-            )
-            wp.launch_tiled(
-                materialize_contacts,
-                dim=[workers],
-                inputs=[
-                    workers,
-                    self.contact_input,
-                    s.constraint_count,
-                    s.mf_constraint_count,
-                    self.maps,
-                    s.J_by_size[16],
-                    s.J_by_size[6],
-                ],
-                block_dim=32,
-                device=s.model.device,
-            )
 
 
 def create_owner(solver):

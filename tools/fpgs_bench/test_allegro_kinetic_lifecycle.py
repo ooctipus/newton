@@ -181,6 +181,10 @@ class TestAllegroKineticLifecycleCUDA(unittest.TestCase):
         original, candidate = make_solver(model, False), make_solver(model, True)
         self.assertIsNone(original._allegro_kinetic_rows)
         self.assertIsNotNone(candidate._allegro_kinetic_rows)
+        self.assertTrue(candidate._allegro_kinetic_rows.keyed_rows)
+        self.assertEqual(candidate._allegro_kinetic_rows.data.rowkeys.shape, (1, candidate.dense_max_constraints))
+        self.assertFalse(hasattr(candidate._allegro_kinetic_rows.data, "coefficients"))
+        self.assertFalse(hasattr(candidate._allegro_kinetic_rows.data, "encoding"))
         for buffers in candidate._J_bufs:
             for value in buffers.values():
                 value.fill_(float("nan"))

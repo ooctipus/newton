@@ -68,6 +68,7 @@ def fixture(snapshot, device):
     solver.diag = wp.zeros_like(solver.rhs)
     solver.row_w = wp.zeros_like(solver.rhs)
     solver._contact_w = 1.0
+    solver._reference_J = np.concatenate((snapshot["J_16"], snapshot["J_6"]), axis=2).astype(np.float64)
     state = SimpleNamespace(body_q=array("state_body_q", wp.transform), joint_q=array("state_joint_q"))
     aug = SimpleNamespace(
         joint_S_s=array("aug_joint_S_s", wp.spatial_vector), body_v_s=array("aug_body_v_s", wp.spatial_vector)
@@ -83,18 +84,28 @@ def fixture(snapshot, device):
     return solver, state, aug, contact, owner
 
 
-def expand(owner):
-    """Expand the two kinetic segments solely for the independent test oracle."""
-    coefficients = owner.data.coefficients.numpy()
-    code = owner.data.encoding.numpy()
-    result = np.zeros((*code.shape, 22), dtype=np.float64)
-    count = owner.solver.constraint_count.numpy()
-    for world, n in enumerate(count):
-        for row in range(int(n)):
-            value = int(code[world, row])
-            o0, n0, o1, n1 = value & 31, (value >> 5) & 7, (value >> 8) & 31, (value >> 13) & 7
-            result[world, row, o0 : o0 + n0] = coefficients[world, row, :n0]
-            result[world, row, o1 : o1 + n1] = coefficients[world, row, n0 : n0 + n1]
+def expected_keys(snapshot):
+    """Recover typed identities independently from captured physical prefix J and raw slots."""
+    J = np.concatenate((snapshot["J_16"], snapshot["J_6"]), axis=2)
+    result = np.full(J.shape[:2], np.iinfo(np.int32).min, dtype=np.int32)
+    for world, bound in enumerate(snapshot["solver_dense_phase_bounds"][:, 1]):
+        for row in range(int(bound)):
+            nonzero = np.flatnonzero(J[world, row])
+            if len(nonzero) != 1 or abs(J[world, row, nonzero[0]]) != 1:
+                raise AssertionError("Captured prefix is not an original signed unit row")
+            dof = int(nonzero[0])
+            result[world, row] = ~(2 * dof + int(J[world, row, dof] < 0))
+    total = int(snapshot["contact_rigid_contact_count"][0])
+    for contact in range(total):
+        if snapshot["solver_contact_path"][contact] != 0:
+            continue
+        slot = int(snapshot["solver_contact_slot"][contact])
+        if slot < 0:
+            continue
+        world = int(snapshot["solver_contact_world"][contact])
+        for direction in range(int(snapshot["solver_contact_slots_needed"][contact])):
+            if slot + direction < result.shape[1]:
+                result[world, slot + direction] = 4 * contact + direction
     return result
 
 
@@ -137,7 +148,10 @@ def rhs_reference(solver, owner):
     expected = result.numpy().astype(np.float64)
     kind, rest, phi = solver.row_type.numpy(), solver.row_restitution.numpy(), solver.phi.numpy()
     target = solver.target_velocity.numpy()
-    relative = np.einsum("wrd,wd->wr", expand(owner), owner.maps.kinetic_incident.numpy().astype(np.float64)) - target
+    incident = solver.v_hat.numpy().astype(np.float64)
+    starts = owner.maps.starts.numpy()
+    current = np.concatenate((incident[starts[:, :1] + np.arange(16)], incident[starts[:, 1:] + np.arange(6)]), axis=1)
+    relative = np.einsum("wrd,wd->wr", solver._reference_J, current) - target
     fire = (
         (kind == 0)
         & (rest > 0)
@@ -244,6 +258,14 @@ class TestAllegroKineticRowsCPU(unittest.TestCase):
         """Expose the complete typed-row owner and direct kinetic consumer."""
         self.assertTrue(callable(rows.create_owner))
         self.assertTrue(callable(rows.get_ink_stage))
+        with np.load(next(captures())) as snapshot:
+            solver, _state, _aug, _contact, owner = fixture(snapshot, "cpu")
+            self.assertTrue(owner.keyed_rows)
+            self.assertEqual(owner.data.rowkeys.shape, (solver.world_count, solver.dense_max_constraints))
+            self.assertFalse(hasattr(owner.data, "coefficients"))
+            self.assertFalse(hasattr(owner.data, "encoding"))
+            self.assertFalse(hasattr(owner.prefix, "row_dof"))
+            self.assertFalse(hasattr(owner.prefix, "row_sign"))
 
     def test_current_and_held_maps(self):
         """Check current motion maps against independent held-factor actions."""
@@ -282,7 +304,7 @@ class TestAllegroKineticRowsCPU(unittest.TestCase):
                     np.testing.assert_array_equal(solver.L_by_size[n].numpy(), held[n])
 
     def test_actual_prefix_and_contact_rows(self):
-        """Preserve current row metadata and physical J through direct held Z."""
+        """Preserve typed identities and independently verify fallback current physical rows."""
         for path in captures():
             with self.subTest(path=path.name), np.load(path) as snapshot:
                 solver, _state, _aug, _contact, owner = run_rows(snapshot, "cpu")
@@ -292,6 +314,13 @@ class TestAllegroKineticRowsCPU(unittest.TestCase):
                 )
                 counts = snapshot["solver_constraint_count"]
                 active = np.arange(solver.dense_max_constraints)[None, :] < counts[:, None]
+                np.testing.assert_array_equal(owner.data.rowkeys.numpy()[active], expected_keys(snapshot)[active])
+                # No global kinetic-row producer remains. Ordinary worlds retain
+                # their poisoned J until the actual solve constructs private Jr.
+                for n in (16, 6):
+                    self.assertTrue(np.all(solver.J_by_size[n].numpy() == 91.0))
+                solver.mf_constraint_count.fill_(1)
+                owner.finish_rows()
                 for name in (
                     "row_type",
                     "row_parent",
@@ -305,11 +334,8 @@ class TestAllegroKineticRowsCPU(unittest.TestCase):
                     np.testing.assert_allclose(
                         getattr(solver, name).numpy()[active], snapshot[f"solver_{name}"][active], rtol=2e-5, atol=2e-6
                     )
-                Z = expand(owner)
                 J = np.concatenate((snapshot["J_16"], snapshot["J_6"]), axis=2).astype(np.float64)
-                rebuilt = np.empty_like(J)
-                rebuilt[:, :, :16] = Z[:, :, :16] @ np.swapaxes(snapshot["L_16"].astype(np.float64), 1, 2)
-                rebuilt[:, :, 16:] = Z[:, :, 16:] @ np.swapaxes(snapshot["L_6"].astype(np.float64), 1, 2)
+                rebuilt = np.concatenate((solver.J_by_size[16].numpy(), solver.J_by_size[6].numpy()), axis=2)
                 defect = np.linalg.norm((rebuilt - J)[active]) / max(np.linalg.norm(J[active]), 1.0)
                 self.assertLess(defect, 2e-6)
                 print(json.dumps({"fixture": path.name, "current_J_defect": float(defect)}))
@@ -318,9 +344,6 @@ class TestAllegroKineticRowsCPU(unittest.TestCase):
                 np.testing.assert_allclose(
                     solver.rhs.numpy()[active], rhs_reference(solver, owner)[active], rtol=2e-5, atol=2e-5
                 )
-                # Owned worlds never wrote canonical J.
-                for n in (16, 6):
-                    self.assertTrue(np.all(solver.J_by_size[n].numpy() == 91.0))
 
     def test_complete_fallback_materialization(self):
         """Keep exact physical rows when matrix-free rows force the original fallback."""
@@ -342,7 +365,7 @@ class TestAllegroKineticRowsCPU(unittest.TestCase):
         candidate = factory(192, 64, 22, "cuda", **kwargs)
         self.assertFalse(getattr(ordinary, "_fpgs_kinetic_rows", False))
         self.assertTrue(candidate._fpgs_kinetic_rows)
-        self.assertIn("kinetic", candidate.key)
+        self.assertIn("kinetic_keyed_parallel", candidate.key)
 
     def test_parallel_cpu_bindings(self):
         """Compile both native ABIs on CPU without claiming CUDA solve execution."""
@@ -366,21 +389,30 @@ class TestAllegroKineticRowsCUDA(unittest.TestCase):
         for path in captures():
             with self.subTest(path=str(path)), np.load(path) as snapshot:
                 solver, _state, _aug, _contact, owner = run_rows(snapshot, self.device)
-                Z = expand(owner)
                 active = np.arange(solver.dense_max_constraints)[None, :] < snapshot["solver_constraint_count"][:, None]
-                J = np.concatenate((snapshot["J_16"], snapshot["J_6"]), axis=2).astype(np.float64)
-                reconstructed = np.concatenate(
-                    (
-                        Z[:, :, :16] @ np.swapaxes(snapshot["L_16"].astype(np.float64), 1, 2),
-                        Z[:, :, 16:] @ np.swapaxes(snapshot["L_6"].astype(np.float64), 1, 2),
-                    ),
-                    axis=2,
-                )
-                defect = np.linalg.norm((reconstructed - J)[active]) / max(np.linalg.norm(J[active]), 1.0)
-                self.assertLess(defect, 2e-6)
+                np.testing.assert_array_equal(owner.data.rowkeys.numpy()[active], expected_keys(snapshot)[active])
+                calls, _velocity, _impulse = bind_parallel(snapshot, solver, owner, self.device, kinetic=True)
+                launch_parallel(calls, solver.world_count, self.device)
+                # Selected contact metadata is produced by the actual solve;
+                # the next selector checks its full held-H impulse response.
+                for name in (
+                    "row_type",
+                    "row_parent",
+                    "row_mu",
+                    "row_beta",
+                    "row_cfm",
+                    "phi",
+                    "target_velocity",
+                    "row_restitution",
+                ):
+                    np.testing.assert_allclose(
+                        getattr(solver, name).numpy()[active], snapshot[f"solver_{name}"][active], rtol=2e-5, atol=2e-6
+                    )
                 np.testing.assert_allclose(
                     solver.rhs.numpy()[active], rhs_reference(solver, owner)[active], rtol=2e-5, atol=2e-5
                 )
+                for n in (16, 6):
+                    self.assertTrue(np.all(solver.J_by_size[n].numpy() == 91.0))
                 solver.mf_constraint_count.fill_(1)
                 owner.finish_rows()
                 for n in (16, 6):
@@ -395,8 +427,10 @@ class TestAllegroKineticRowsCUDA(unittest.TestCase):
                 solver, _state, _aug, _contact, owner = run_rows(snapshot, self.device)
                 original, vo, lo = bind_parallel(snapshot, solver, owner, self.device, kinetic=False)
                 candidate, vc, lc = bind_parallel(snapshot, solver, owner, self.device, kinetic=True)
-                launch_parallel(original, solver.world_count, self.device)
                 launch_parallel(candidate, solver.world_count, self.device)
+                # Match the candidate's CURRENT rounded geometry bias, as in the
+                # original test, after private ingestion has actually published it.
+                launch_parallel(original, solver.world_count, self.device)
                 va, vb = vo.numpy(), vc.numpy()
                 la, lb = lo.numpy(), lc.numpy()
                 self.assertTrue(np.isfinite(vb).all() and np.isfinite(lb).all())
@@ -455,6 +489,12 @@ class TestAllegroKineticRowsCUDA(unittest.TestCase):
             solver.mf_constraint_count.zero_()
             wp.capture_launch(captured.graph)
             self.assertTrue(np.isfinite(velocity.numpy()).all())
+            contact.rigid_contact_count.assign(snapshot["contact_rigid_contact_count"])
+            solver.constraint_count.assign(snapshot["solver_constraint_count"])
+            wp.capture_launch(captured.graph)
+            self.assertTrue(np.isfinite(velocity.numpy()).all())
+            active = np.arange(solver.dense_max_constraints)[None, :] < snapshot["solver_constraint_count"][:, None]
+            np.testing.assert_array_equal(owner.data.rowkeys.numpy()[active], expected_keys(snapshot)[active])
 
 
 if __name__ == "__main__":
