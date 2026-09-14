@@ -495,3 +495,97 @@ The next check samples real post-warm refresh/held Solver.step calls and
 compares current contact/control inputs to the original eight-sweep numerical
 law before original finish mutates current state. No copied saved population
 substitutes for that live qualification. Missing cohorts remain unqualified.
+
+## September14 21:20: four-times minimum, current implementation checkpoint
+
+The user reaffirmed **at least4x corrected MJWarp physics on RTX for every
+representative task**, not4x on average or a cap on further gains. The target
+remains unmet. Original Lab53ee and accepted Newtonbaf0c57a remain unchanged.
+No newly failed candidate below replaces an accepted comparison baseline.
+
+### Kuka: physical qualification recovered; accepted-source composition wins
+
+The4K live current/held readsets passed the unchanged physical allowances after
+correcting a test-only signed-limit metric: a smaller positive safe velocity
+is not increased limit violation. The old failed diagnostic remains visible in
+`/tmp/fpgs-kuka-limit-violation-20260914-dnHZ5Nwl/FINDINGS.md`. Loaded actual
+CUDA coupled/type-4 controls also pass on both GPUs; these are not assertions
+that the sampled live4K worlds contained that cohort.
+
+Clean6c2297ca composes ad42's byte-identical native owners onto acceptedbaf,
+retaining its existing features. CPU68 executed checks and249 frozen native/
+descriptor records pass;19 CUDA-only cases explicitly skipped in the CPU batch.
+Original paired16K200/40/40 discovery, identical six existing flags plus only
+candidate KUKA_KINETIC_WORLD=1:
+
+|GPU|baf physics ms|composed physics ms|incremental ratio|wall old/new ms|
+|---|---:|---:|---:|---:|
+|RTX PRO6000|12.379235|10.963438|1.129138x|36.788461 /35.906270|
+|GB300|11.983935|11.270214|1.063328x|35.482980 /38.251759|
+
+All original source, capacity and idle checks pass. Artifact:
+`/tmp/fpgs-kuka-kinetic-integrated-paired16k-20260914-01`.
+Three alternating RTX rounds completed21:24: median physics12.506653->
+11.119767ms (1.124723x), wall36.993766->33.680188ms (1.098384x).
+Artifact `/tmp/fpgs-kuka-kinetic-integrated-repeat-rtx16k-20260914-01`;
+all original source/capacity/idle guards pass. Deferred GB-only repeats also
+pass: median physics12.033355->11.339816ms (1.061160x), wall36.255405->
+35.576291ms (1.019089x). Artifact
+`/tmp/fpgs-kuka-kinetic-integrated-repeat-gb16k-20260914-01`.
+These repeats are not simultaneous.
+The paired repeat stopped before launching because GB300 became externally
+occupied; that failed artifact remains. A source-pinned scheduling-only
+derivatives admit explicit RTX GPU0 or GB GPU1 alone; no physics/timing checks change.
+
+### Failed mappings: retain causes, do not polish small remnants
+
+- G1 lazy compliance4c2a22cf: whole RTX18.149754->21.314393ms and
+  GB20.915280->23.350513ms. Exact node ownership isolates GS3.914287->
+  7.159739ms RTX. Cache column construction/residual updates add real work;
+  shared storage increases1116->8316B and theoretical resident blocks24->10
+  on RTX. This is not achieved-occupancy evidence. No cache/block grid follows.
+  Full result and cause are retained in its report-only tipa476bbb5.
+- Franka paired late publication5bc2d73d: whole RTX5.480331->5.211907ms
+  (1.051502x), GB4.992435->4.875338ms; environment wall time worsens.
+  Below the funded whole-task milestone. Preserved, not promoted or retuned;
+  report-only tip7a772365 records the complete boundary and failed predecessor.
+- Allegro direct kinetic rows55a0259e: four CUDA selectors/card and all
+  original whole checks pass, but whole RTX16.499407->18.444526ms and
+  GB16.421763->19.581437ms versus direction-cell92507273 with cells on
+  BOTH arms. Original12/24 sweeps and calibrated capacities are unchanged.
+  Artifact `/tmp/fpgs-allegro-kinetic-rows-paired16k-20260914-01`.
+  Complete strict node02 proves192 graph nodes removed, but new contact
+  publication costs3.422595ms RTX and fallback scans0.502646ms. The solve
+  FAMILY appears0.513706ms faster RTX and0.928817ms slower GB, but this is
+  partly intermittent serial fallback: RTX baseline has two881.984/856.928us
+  calls while candidate has none; GB baseline has one814.656us call versus
+  candidate two825.632/833.440us calls. The actual four parallel tiers cost
+  4.906914->4.965593ms RTX and5.446110->6.096678ms GB. Do not credit the
+  apparent RTX family gain to faster parallel whitening. Two untimed row
+  snapshots do not prove an entire capture had no fallback. Full boundary grows
+  9.034745->10.739260ms RTX. Failed node01 records external GB contention;
+  uncontended02 passes all source/process/correlation/capacity checks.
+
+### One funded Allegro correction, not another launch sweep
+
+New worktree `newton-fpgs-allegro-keyed-kinetic-rows-20260914` preserves55a0259e.
+Replace global contact Z/metadata publication with typed raw-row keys and
+current geometry-to-register ingestion inside the actual parallel tier. Keep
+the efficient full22-coordinate float4 sweep and original24-iteration law.
+Use complete world-centric original-J fallback for >128/MF worlds; no contact
+is discarded. The complete row/solve budget is **<=7.034745ms RTX**, including
+every key, prefix, fallback, map and solve cost. That is not yet demonstrated.
+Early native/resource and existing physical tests precede whole timing. No
+bit-identical trajectory requirement, new benchmark framework or Lab edit.
+
+At21:37 keyed candidate7fca2fdf is clean, CPU8 and both cards' unchanged four
+CUDA selectors pass. Actual current/held momentum defects3.39e-8--3.90e-8;
+full production lifecycle includes current geometry, held factor, crowded
+fallback, reset and seeded graph grow/shrink. No global contact coefficient
+buffer remains. Final source-matched AOT03 reports no stack/spills. Source/
+admission review confirms the preceding response and diagonal stages skip
+selected worlds; metadata is created in the actual row lane before solve.
+Original guarded whole16K200/40/40 comparison against925 cells is starting,
+with cells enabled on both arms. There is no performance result yet.
+First launch01 stopped before children because the required local launch-card
+file was missing; its failed manifest is retained. Corrected02 includes it.
