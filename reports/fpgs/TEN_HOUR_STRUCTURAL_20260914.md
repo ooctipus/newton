@@ -16,7 +16,7 @@ environment wall time separately from physics. Neither is full RL training.
 Shared collision improvements must be enabled for both backends. Preserve
 calibrated capacity and warning gates; do not drop contacts or inflate maxima.
 
-Current best G1 candidate is Newton
+At the start of this window, the best G1 candidate was Newton
 `7df75c46bd468b64c17958190fc800cfeb62201e`, with metric tangents, parallel
 limit prefix, level-scheduled sparse factor and corrected finite terrain
 queries. Approximately 19.5 ms RTX / 25.1 ms GB is a discovery reference, not
@@ -321,3 +321,93 @@ specializations and original full-scan fallback for uncertain certificates.
 Use existing physical and integrated16K paired benchmark owners, not a new
 census/framework. Whole cost is authoritative; one evidence-backed causal
 correction may follow a miss.
+
+## Repeated shared-collision result, 12:22 UTC
+
+The geometric cull holds over three FPGS A/B rounds. Two alternating repeat
+medians are RTX19.499192->18.176309ms (1.072781x),
+GB25.119965->20.957624ms (1.198608x), with all original guards passing.
+The detailed repeated physical/cost card is pushed on
+`ooctipus/fpgs-g1-geometric-cull-20260914`, report tip `2f84ae50`;
+the measured runtime remains clean `7790c35b`.
+
+The fair shared comparison discovered that earlier G1 MJWarp omitted
+THREADS_X and inherited Lab's default1 while FPGS used4. New paired runs
+explicitly set4 for BOTH backends plus all five shared collision improvements.
+This changes MJWarp's actual launch AND stride49152->196608. Denominator
+improvement cannot be attributed solely to the cull or called an FPGS gain.
+MJWarp's actual shared Newton contact path remains verified.
+
+| Latest repeated G1 physics | FPGS ms | Corrected MJWarp ms | Ratio |
+| --- | ---: | ---: | ---: |
+| RTX PRO6000 |18.175791|37.818479|2.080706x|
+| GB300 |20.927221|38.226997|1.826664x|
+
+Artifacts are `/tmp/fpgs-g1-geometric-cull-paired16k-20260914-repeat02`
+and `/tmp/fpgs-g1-shared-geometric-paired16k-20260914-repeat02`.
+These replace the earlier G1 denominator, not the other five task values.
+
+## Analytic-manifold causal closure
+
+Matched200warm/40wall/3profile nodes localize the loss to the fused collision
+producer, not GS or publication. Finite query grows2.207010->3.700568ms RTX
+and7.408693->14.509192ms GB. Its generic fallback genuinely shrinks
+.937473->.475883ms RTX /3.364981->1.146581ms GB, but the larger producer
+erases that saving. Its184-register allocation is observed; occupancy or
+memory-bandwidth causation is NOT proven without hardware counters.
+
+Artifact `/tmp/fpgs-g1-analytic-manifold-nodes-paired16k-20260914-02`, strict
+matched audit SHA256
+`be73b6a3ce2f22e1ab49085e3594e56e0ddcfc32a3b09e2b32d42cb66127f305`.
+The original auxiliary-graph analyzer failure is retained; independent strict
+attribution proves12physics+3auxiliary roots/card, all device-memory nodes and
+zero unproven owners. All original capacity/source/idle checks pass.
+The proposed split-witness correction lacks a new >=2ms RTX removable-work
+budget because the entire old fallback is under1ms. Close rather than tune.
+Report-only tip `39a39c54` is pushed; runtime remains unchanged/default-off.
+
+## Two active large-cost boundaries, 12:29 UTC
+
+Allegro hill runtime `99a23652bde24ca61946be90ccc7841466a89557` passes CPU,
+actual four-owner SM120/SM100 compilation and four physical selectors on each
+GPU. Its first integrated result is a loss: RTX17.330418->19.351608ms and
+GB17.742004->20.072446ms. All original checks pass and actual four-owner
+dispatch plus19.25MiB hint/15164B descriptor costs are present. Keep it OUT
+of the baseline. Matched node attribution is running before one causal
+correction decision; do not confuse scalar work reduction with SIMT speed.
+
+G1 `ooctipus/fpgs-g1-publication-compact-20260914` replaces complete
+publication and current-force/composite production with two owners. It retains
+the original W434 factor and all consumers, uses one current combined external
+plus intrinsic wrench reduction, and compact ten-moment composites. It does
+not revive the closed implicit-spatial consumer path or cache future forces.
+Old complete boundary exclusive time4.125572ms RTX gives a2.125572ms replacement
+allowance for a2ms whole saving. CPU/AOT review is progressing; no timing gain
+claimed. Checkpoint13:00, hard13:45. Card is
+`reports/fpgs/G1_PUBLICATION_COMPACT_20260914.md` in that separate worktree.
+
+## Franka large environment-step repair: first measured result
+
+The corrected Lab root-pose notification exposes complete row-packet topology
+validation inside resets. Preserve that correctness fix and every current
+structural check; replace only the per-world Python predicate with array
+operations. No solver/kernel/capacity/notification-law change. Original
+regression fails with28735 Python line events at4096worlds versus the351bound;
+the replacement and all18 current prefix/notification CPU tests pass with no
+skips. Independent source review and full pre-commit pass.
+
+Frozen runtime `99c796ca` in `ooctipus/fpgs-notification-validation-20260914`
+gives the following first complete paired result:
+
+| Franka,16K worlds | Old wall ms | New wall ms | Wall ratio | Old/new physics ms |
+| --- | ---: | ---: | ---: | ---: |
+| RTX PRO6000 |62.723041|29.532334|2.123877x|5.495731/5.478576|
+| GB300 |63.690820|28.592554|2.227532x|4.997234/5.031553|
+
+This is a substantial environment-throughput improvement, NOT a physics or
+RL-training speedup. It does not meet the4x physics objective. All original
+capacity/source/final-idle checks pass and physics budgets are unchanged.
+Artifact `/tmp/fpgs-franka-notification-validation-paired16k-20260914-01`,
+manifest SHA256
+`ed3a7098d2b8c7207ce0a38a80f14e0de910ccd183e96fd57b2afd35215cf743`.
+Two alternating paired repeats are queued after the current Allegro node run.
