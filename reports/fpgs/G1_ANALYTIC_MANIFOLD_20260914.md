@@ -106,3 +106,29 @@ Prepared original physical selector set (not launched):
 The rebound collector's execution success alone is not physical acceptance;
 review its original spin, residual, energy and momentum diagnostics. No GPU,
 whole-step performance or physical-promotion claim is made at this checkpoint.
+
+## First paired physical run and test-oracle correction
+
+Frozenef7 physical01 is preserved at
+`/tmp/fpgs-g1-analytic-manifold-physical-paired-20260914-01`, manifest
+`f027b574a444fb53ff377a7084a3f3edd898d69eaa69e6b21d0be6917303acab`.
+Parent2002870 and both children were reaped; final source/idle guards pass.
+All four selectors ran without skips on both cards. The new simple writer
+test failed; saved96, rebound and loaded seam controls passed.
+
+The exact failure is a wrong bilateral normal oracle: the candidate returns
+the authored plane normal(0,0,1), while original CUDA GJK returns
+(0,-3.973643742938293e-6,1). Requiring these two normals to agree within2e-6
+rejects the exact geometric answer. Correct only that test to compare the
+candidate with the independent authored plane at the same2e-6 tolerance,
+and record the original approximate normal error. Point/distance/material/
+sort ownership, real manifold invocation and uncertain-fallback gates remain.
+There is no tolerance relaxation or native change. Native SHA remains
+`c50c889e2b93643ab63a59ef3d1a2e5ce65e15450e0f3bb13a54c715f27fdbaa`.
+
+Root independently reapplied original `qualification.physical_failures` to
+all28 saved seam/rebound records with no failures. Candidate rebound spin is
+.00920686rad/s RTX and .00984394GB; energy ratios .36000011/.35994361 and
+maximum foot-corner residual .00140013 remain in the retained original
+physical envelope. This does not turn the failed execution into a PASS.
+A fresh paired test-only correction repeat is authorized; whole timing is not.

@@ -119,10 +119,29 @@ def check_manifold(device):
     triples.assign(np.array([[0, 1, 0]], dtype=np.int32))
     wp.launch(fallback, 1, inputs=inputs, device=device)
     original = data.values.numpy()[: int(data.count.numpy()[0])]
-    for field in ("contact_point_center", "contact_normal_a_to_b", "contact_distance", "sort_sub_key"):
+    for field in ("contact_point_center", "contact_distance", "sort_sub_key"):
         order_a = np.argsort(candidate["sort_sub_key"])
         order_b = np.argsort(original["sort_sub_key"])
         np.testing.assert_allclose(candidate[field][order_a], original[field][order_b], rtol=0, atol=2e-6)
+    # The authored flat plane, not GJK's approximate normal, is the geometric
+    # oracle. Keep the same tolerance and record the original approximation.
+    plane = np.array([0.0, 0.0, 1.0])
+    np.testing.assert_allclose(candidate["contact_normal_a_to_b"], np.tile(plane, (count, 1)), rtol=0, atol=2e-6)
+    print(
+        "ANALYTIC_MANIFOLD_NORMAL_DIAGNOSTIC "
+        + json.dumps(
+            {
+                "device": str(device),
+                "candidate_plane_max_error": float(
+                    np.max(np.linalg.norm(candidate["contact_normal_a_to_b"] - plane, axis=1))
+                ),
+                "original_plane_max_error": float(
+                    np.max(np.linalg.norm(original["contact_normal_a_to_b"] - plane, axis=1))
+                ),
+            }
+        ),
+        flush=True,
+    )
     for field in ("shape_a", "shape_b", "margin_a", "margin_b", "gap_sum", "radius_eff_a", "radius_eff_b"):
         np.testing.assert_array_equal(candidate[field], original[field])
     # The supporting face center is exactly on the diagonal: retain old fallback.
