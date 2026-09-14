@@ -191,3 +191,30 @@ confound isolated screen timing. The only selected population evidence is
 6 cold worlds but51/452 rows, already terminating after one sweep. That does
 not fund another >=2ms experiment. No extra screening/mapping tune is opened
 without current work-weighted demand evidence.
+
+## Matched-current numerical closure
+
+Test/report-only9cdd0f71 passes the same four selectors per card in
+`/tmp/fpgs-g1-contact-block-physical-paired-20260914-03`; manifest SHA256
+`2d25c0f5efe0424b8dcb131eb80638a442ead98b5eb9175a17a98670051a11ed`.
+No native code changed after643cc8cb. All16 cases on each card now compare
+scalar CPU eight and native block eight on identical CURRENT rows. For
+RTX fixture7410, scalar->block natural residual is0.003907325->0.003537294
+at1600 and0.004428779->0.004227882 at1601. Other cases are equal or better
+apart from rounding changes below1e-9. Momentum/cone maxima remain
+4.2573383e-8/7.4505806e-9. Current-to-captured permutations change up to65
+slots; permuted RHS maximum difference is2.9802322e-6. This accounts for the
+misleading captured-order comparison without declaring order invariance.
+
+Exact reproducibility uses the three preserved physical-ready launch/pin
+pairs (`vGGB00iG`, `oosWaBYq`, `XoP8VUPt`), each with the original155eba parent,
+027da child and efd166 adapter. Physical03 launch SHA256
+`ca1f34fdb92159b0a0d2b90b7fe7f7dc1a1fdaaad0191af7eaba38b1f17aebdd`,
+861-input pin file SHA256
+`e9536e32ecd367b372cb0bd1375aca119d7097f60579f01d90e5410ade0c98aa`.
+Whole/node commands remain in
+`/tmp/fpgs-g1-contact-block-checked-J04Hb8oV/{LAUNCH,NODES}.md`.
+Whole executed-parent SHA256
+`23e9e3c3fd7c038af666975d3c7de6265754628b7c1699dd19fe04d67ee453ad`.
+The original saved captures remain local. All runs and failures are retained;
+the branch is experimental/default-off, with no Lab or parent pointer update.
