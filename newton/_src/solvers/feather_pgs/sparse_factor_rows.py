@@ -426,8 +426,114 @@ def get_contact_kernel():
     return wp.kernel(enable_backward=False, module="unique")(contacts)
 
 
+def _contact_block_fragments(capacity: int):
+    """Local sticking corrections; retain original scalar transactions on rejection."""
+    setup = r"""
+    __shared__ float contact_cross[BLOCK_CAPACITY];
+    __shared__ unsigned int contact_ready[(BLOCK_CAPACITY+31)/32];
+    for(int word=lane;word<(BLOCK_CAPACITY+31)/32;word+=32)contact_ready[word]=0u;
+    __syncwarp();
+""".replace("BLOCK_CAPACITY", str(capacity))
+    update = r"""
+            if(type==0 && row+2<count && iteration>=friction_start &&
+               isfinite(omega) && omega>0.0f && omega<=1.0f &&
+               row_type.data[base+row+1]==2 && row_type.data[base+row+2]==2 &&
+               parent.data[base+row+1]==row && parent.data[base+row+2]==row &&
+               d.support.data[base+row]==d.support.data[base+row+1] &&
+               d.support.data[base+row]==d.support.data[base+row+2]) {
+                const float friction=mu.data[base+row+1];
+                if(isfinite(friction) && friction>=0.0f && friction==mu.data[base+row+2]) {
+                    const int tpl=d.support.data[base+row], length=p.support_count.data[tpl];
+                    const int node=lane<length?p.support_nodes.data[tpl*18+lane]:-1;
+                    const float z0=lane<length?d.Z.data[(base+row)*18+lane]:0.0f;
+                    float r0=lane<length?z0*du[node]:0.0f;
+                    for(int shift=16;shift>0;shift>>=1)r0+=__shfl_down_sync(0xffffffff,r0,shift);
+                    r0=__shfl_sync(0xffffffff,r0,0)+d.incident.data[base+row]+rhs.data[base+row];
+                    // At zero normal radius, zero tangents cannot change the
+                    // state. This is the exact original open-contact branch.
+                    if(lam[row]==0.0f && lam[row+1]==0.0f && lam[row+2]==0.0f && r0>=0.0f) {
+                        row+=2;
+                        continue;
+                    }
+                    const float z1=lane<length?d.Z.data[(base+row+1)*18+lane]:0.0f;
+                    const float z2=lane<length?d.Z.data[(base+row+2)*18+lane]:0.0f;
+                    // An open contact never consumes the self block. Build it
+                    // only on its first non-open visit in this solver call.
+                    const int word=row/32;
+                    const unsigned int bit=1u<<(row%32);
+                    int needs_block=lane==0 && (contact_ready[word]&bit)==0u;
+                    needs_block=__shfl_sync(0xffffffff,needs_block,0);
+                    if(needs_block) {
+                        float a01=z0*z1,a02=z0*z2,a12=z1*z2;
+                        for(int shift=16;shift>0;shift>>=1) {
+                            a01+=__shfl_down_sync(0xffffffff,a01,shift);
+                            a02+=__shfl_down_sync(0xffffffff,a02,shift);
+                            a12+=__shfl_down_sync(0xffffffff,a12,shift);
+                        }
+                        if(lane==0) {
+                            contact_cross[row]=a01;contact_cross[row+1]=a02;contact_cross[row+2]=a12;
+                            contact_ready[word]|=bit;
+                        }
+                        __syncwarp();
+                    }
+                    float r1=lane<length?z1*du[node]:0.0f, r2=lane<length?z2*du[node]:0.0f;
+                    for(int shift=16;shift>0;shift>>=1) {
+                        r1+=__shfl_down_sync(0xffffffff,r1,shift);
+                        r2+=__shfl_down_sync(0xffffffff,r2,shift);
+                    }
+                    r1=__shfl_sync(0xffffffff,r1,0)+d.incident.data[base+row+1]+rhs.data[base+row+1];
+                    r2=__shfl_sync(0xffffffff,r2,0)+d.incident.data[base+row+2]+rhs.data[base+row+2];
+                    int accepted=0;
+                    float change0=0.0f,change1=0.0f,change2=0.0f;
+                    if(lane==0) {
+                        const float a00=diagonal.data[base+row],a11=diagonal.data[base+row+1],a22=diagonal.data[base+row+2];
+                        const float a01=contact_cross[row],a02=contact_cross[row+1],a12=contact_cross[row+2];
+                        const float scale=fmaxf(a00,fmaxf(a11,a22));
+                        const float floor=1.0e-7f*scale;
+                        if(isfinite(scale) && a00>floor) {
+                            const float l10=a01/a00,l20=a02/a00,d1=a11-a01*l10;
+                            if(isfinite(d1) && d1>floor) {
+                                const float u12=a12-a02*l10,l21=u12/d1,d2=a22-a02*l20-u12*l21;
+                                if(isfinite(d2) && d2>floor) {
+                                    // Existing diagonal includes denominator-only
+                                    // CFM; the current residual does not contain CFM*lambda.
+                                    const float y0=-r0,y1=-r1-l10*y0,y2=-r2-l20*y0-l21*y1;
+                                    const float delta2=y2/d2,delta1=y1/d1-l21*delta2;
+                                    const float delta0=y0/a00-l10*delta1-l20*delta2;
+                                    const float n0=lam[row]+omega*delta0,n1=lam[row+1]+omega*delta1,n2=lam[row+2]+omega*delta2;
+                                    const float radius=friction*n0;
+                                    if(isfinite(n0) && isfinite(n1) && isfinite(n2) &&
+                                       isfinite(radius) && n0>=0.0f && hypotf(n1,n2)<=radius) {
+                                        change0=n0-lam[row];change1=n1-lam[row+1];change2=n2-lam[row+2];
+                                        lam[row]=n0;lam[row+1]=n1;lam[row+2]=n2;accepted=1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    accepted=__shfl_sync(0xffffffff,accepted,0);
+                    if(accepted) {
+                        change0=__shfl_sync(0xffffffff,change0,0);
+                        change1=__shfl_sync(0xffffffff,change1,0);
+                        change2=__shfl_sync(0xffffffff,change2,0);
+                        if(change0!=0.0f || change1!=0.0f || change2!=0.0f) {
+                            if(lane<length)du[node]+=z0*change0+z1*change1+z2*change2;
+                            changed=1;
+                        }
+                        __syncwarp();
+                        row+=2;
+                        continue;
+                    }
+                    // Rejection has not touched lambda or kinetic velocity.
+                    // The following original scalar rows own all slip/fallback work.
+                }
+            }
+"""
+    return setup, update
+
+
 @cache
-def get_solve_kernel(capacity: int):
+def get_solve_kernel(capacity: int, block_contacts: bool = False):
     """Apply original current-friction GS and decode the complete43 velocity."""
     source = f"""
 #if defined(__CUDA_ARCH__)
@@ -502,6 +608,13 @@ def get_solve_kernel(capacity: int):
     for(int r=lane;r<count;r+=32)impulses.data[base+r]=lam[r];
 #endif
 """
+    if block_contacts:
+        setup, update = _contact_block_fragments(capacity)
+        setup_anchor = "    for(int iteration=0;iteration<iterations;++iteration) {"
+        update_anchor = "            if(type==2 && iteration<friction_start)"
+        assert source.count(setup_anchor) == source.count(update_anchor) == 1
+        source = source.replace(setup_anchor, setup + setup_anchor)
+        source = source.replace(update_anchor, update + update_anchor)
 
     @wp.func_native(source)
     def native(
@@ -557,5 +670,7 @@ def get_solve_kernel(capacity: int):
             vout,
         )
 
-    solve.__name__ = solve.__qualname__ = f"sparse_factor_gs43_s18_c{capacity}"
+    solve.__name__ = solve.__qualname__ = (
+        f"sparse_contact_block43_s18_c{capacity}" if block_contacts else f"sparse_factor_gs43_s18_c{capacity}"
+    )
     return wp.kernel(enable_backward=False, module="unique")(solve)

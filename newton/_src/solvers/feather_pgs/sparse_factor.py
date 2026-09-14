@@ -524,6 +524,9 @@ class SparseFactor:
         self.data.valid = wp.zeros(w, dtype=int, device=device)
         self.data.status = wp.zeros(w, dtype=int, device=device)
         self.packet_rows = os.environ.get("FEATHER_PGS_SPARSE_PACKETS") == "1" and c == 100
+        self.block_contacts = os.environ.get("FEATHER_PGS_SPARSE_CONTACT_BLOCK") == "1"
+        if self.packet_rows and self.block_contacts:
+            raise ValueError("Sparse packets and contact-block rows are mutually exclusive")
         self.parallel_limit_prefix = os.environ.get("FEATHER_PGS_SPARSE_PARALLEL_LIMITS") == "1" and c == 100
         if self.packet_rows and self.parallel_limit_prefix:
             raise ValueError("Sparse packets and parallel global limit rows are mutually exclusive")
@@ -535,7 +538,7 @@ class SparseFactor:
             refresh=get_refresh_kernel(self.level_update),
             predictor=get_predictor_kernel(),
             contacts=get_contact_kernel(),
-            solve=get_solve_kernel(c),
+            solve=get_solve_kernel(c, self.block_contacts),
         )
         # Drop canonical matrix/row storage only after complete constructor admission.
         # Dummy shapes make accidental readers fail visibly, not reinterpret packed W/Z.

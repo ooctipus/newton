@@ -406,6 +406,27 @@ class TestSparseLevelUpdate(unittest.TestCase):
         self.assertIs(original_owner.kernels.solve, o.kernels.solve)
 
 
+class TestSparseContactBlock(unittest.TestCase):
+    """Require an isolated numerical opt-in without new global row buffers."""
+
+    def test_contact_block_owner_admission(self):
+        """Check explicit block admission, unchanged buffers and packet exclusion."""
+        flags = {"FEATHER_PGS_SPARSE_CONTACT_BLOCK": "1", "FEATHER_PGS_SPARSE_PACKETS": "0"}
+        with patch.dict(os.environ, flags):
+            owner = fixture()["owner"]
+        self.assertTrue(owner.block_contacts)
+        self.assertEqual(owner.kernels.solve.key, "sparse_contact_block43_s18_c100")
+        self.assertEqual(owner.kernels.contacts.key, "sparse_factor_contact_triplet18")
+        self.assertEqual(owner.data.Z.shape, (1, 100, 18))
+        with patch.dict(os.environ, {**flags, "FEATHER_PGS_SPARSE_CONTACT_BLOCK": "0"}):
+            original = fixture()["owner"]
+        self.assertFalse(original.block_contacts)
+        self.assertEqual(original.kernels.solve.key, "sparse_factor_gs43_s18_c100")
+        with patch.dict(os.environ, {**flags, "FEATHER_PGS_SPARSE_PACKETS": "1"}):
+            with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                fixture()
+
+
 class TestSparseParallelLimits(unittest.TestCase):
     """Check the isolated global-row prefix on the original actual-tree fixture."""
 
