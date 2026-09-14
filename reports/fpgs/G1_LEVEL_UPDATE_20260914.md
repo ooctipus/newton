@@ -112,3 +112,54 @@ All selectors are in `tools.fpgs_bench.test_sparse_factor`. The first two
 exercise the actual native operator, held/current geometry and original
 serial/parallel continuing graph controls; the last two are host-side
 schedule/action and constructor controls. No new physical runner is added.
+
+## Completed whole-cost discovery and bounded diagnosis
+
+Runtime `3ca99cc3633c60fbe6b179837fd62c20fe2520e9` passed all four selected
+physical controls on each GPU, zero skips/failures/errors, including current
+rows, held-factor reuse and the continuing complete-owner graph. Physical
+manifest `/tmp/fpgs-g1-level-update-physical-paired-20260914-01/manifest.json`
+has SHA256 `4da8eaaf0f01376e0166419bafbf2f68970661a68f7c005a4eec7b5bc4c2e8d9`.
+
+The unchanged paired 16K seed0/200 warm/40 wall/40 physics protocol compared
+da85 against3ca, with parallel limits enabled in both and only level updates
+differing. Fixed Lab53ee, original two substeps/eight sweeps, F100/raw294912,
+broad49152/tri1769472 and CELL/FINITE/WELD/PACK1 remained identical.
+
+| GPU | Baseline physics | Level updates | Incremental ratio | Saved |
+|---|---:|---:|---:|---:|
+| RTX PRO6000 |21.148316ms|20.354962ms|1.038976x|0.793355ms|
+| GB300 |26.345063ms|25.414346ms|1.036622x|0.930717ms|
+
+Environment wall35.605495->35.832308ms RTX and40.211606->39.569081ms GB.
+These are one-round discoveries, not repeated acceptance, training throughput
+or ratios versus MJWarp. All four children exit0; eight original capacity
+and actual-owner boundaries, source and final-idle checks pass. Whole manifest
+`/tmp/fpgs-g1-level-update-live-paired16k-20260914-01/manifest.json`, SHA256
+`075bc336f15c491d8202f77874e5bebb5296a8846146faa02598d5c92af99bee`.
+Exact launch: `/tmp/fpgs-g1-level-update-checked-Dh40MvE1/LAUNCH.md`.
+
+One bounded three-step node diagnosis gives refresh2.334110ms RTX/1.770069ms
+GB, compared with the preserved current4a refresh3.184972/2.816128ms. The
+factor column schedule is unchanged between4a and baseline da85; their limit
+producer differs. Current GS4.840935/4.763809ms stays close to4a
+4.923319/4.773600ms; collision and publication likewise do not grow materially.
+The approximately0.85/1.05ms refresh reduction reaches whole physics. This is
+not a large hidden saving erased by downstream conversion. Unchanged source
+contraction, inverse and W publication still belong to the complete refresh;
+no claim isolates their individual costs or proves hardware saturation.
+
+Node manifest `/tmp/fpgs-g1-level-update-nodes-paired16k-20260914-01/manifest.json`,
+SHA256 `da472575d3d91bf3d534e63e8c14f51b0a4b669a9302514bd9e8821b8f5bdc4e`.
+The original analyzer refuses G1 auxiliary graph roots; parent1768194 and
+both child wrappers exit1 after completed captures. This status is preserved.
+The existing strict74c5928 reader, adding only the two finite-collision names,
+parallel-limit name and new factor name, accounts for12 physics roots,
+3 auxiliary roots and1020 physics nodes per card, zero unproven nodes.
+Original source/capacity/actual-owner checks independently pass after reaping,
+with fresh device-idle verification. No throughput result is taken from nodes.
+
+The approximately1ms target is narrowly missed on primary RTX. Retain this
+default-off experimental improvement, but do not launch another level/inverse
+tuning campaign or present it as4x. Further work must retire larger complete
+producer/consumer contracts; no repeated timing or cross-task promotion yet.
