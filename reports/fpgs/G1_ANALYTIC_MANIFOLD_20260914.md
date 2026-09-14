@@ -132,3 +132,62 @@ all28 saved seam/rebound records with no failures. Candidate rebound spin is
 maximum foot-corner residual .00140013 remain in the retained original
 physical envelope. This does not turn the failed execution into a PASS.
 A fresh paired test-only correction repeat is authorized; whole timing is not.
+
+## Completed physical and whole-cost decision, 11:57 UTC
+
+Test/report-only `122eb87e63123698ab6aaa33e19727597cbbec36` passes all four
+selectors on both cards without skips. No native code or physical tolerance
+changed. Physical02 manifest SHA256
+`b8fe52080784323eac071ee054ec2e37563e34a513ca4ca0c6bd82e6a2490ed3`,
+under `/tmp/fpgs-g1-analytic-manifold-physical-paired-20260914-02`.
+Original source, capacity and final-idle checks pass.
+
+The authorized original16K/200warm/40wall/40physics whole test then loses:
+
+| GPU | Original7df ms | Analytic manifold ms | Incremental ratio |
+| --- | ---: | ---: | ---: |
+| RTX PRO6000 |19.458857175|20.587984375|0.945156x|
+| GB300 |25.1015952|30.004724475|0.836588x|
+
+Artifact `/tmp/fpgs-g1-analytic-manifold-paired16k-20260914-02`.
+All original source, actual-feature, capacity and idle checks pass. Contacts
+and rows change approximately0.4--1.3%, not enough alone to explain the loss.
+Whole attempt01 is preserved: its new untimed observer expected a short old
+kernel key instead of actual qualified key; both baseline children failed
+before measured physics. Only that observer literal was repaired for02.
+
+One bounded node diagnosis at the matched200warm/40wall/3profile recipe
+localizes the loss:
+
+| Four collision calls per environment step | Original RTX ms | New RTX ms | Original GB ms | New GB ms |
+| --- | ---: | ---: | ---: | ---: |
+| Finite or fused analytic query |2.207010|3.700568|7.408693|14.509192|
+| Retained generic fallback |0.937473|0.475883|3.364981|1.146581|
+
+Fallback retirement is real, but the fused producer grows more. Solver
+3.950146/4.424095ms and publication2.416790/1.621748ms stay close to the
+source-matched reference. This is not a downstream solver regression hiding
+a fast query. The new producer uses184 registers across its entire6144x32
+launch, versus original finite139/133. Register allocation and changed kernel
+composition are observed; occupancy or memory-bandwidth causality is NOT
+established without unavailable hardware counters.
+
+Original node parent/wrappers retain their auxiliary-graph analyzer failure.
+The complete captures are preserved in
+`/tmp/fpgs-g1-analytic-manifold-nodes-paired16k-20260914-02`. Reapplying original
+source/capacity/activation checks passes; strict reader74c5928 accounts for
+12 physics roots,3 auxiliary roots, all memory nodes and zero unproven nodes.
+Only the observed analytic kernel alias is added to the established sparse
+classification. `NODE_AUDIT_MATCHED.json` SHA256
+`be73b6a3ce2f22e1ab49085e3594e56e0ddcfc32a3b09e2b32d42cb66127f305`.
+Node01 used only3 wall steps and is retained as an earlier-trajectory
+diagnostic, not substituted for the matched40-wall-step attribution.
+
+Decision: keep default-off and OUT of the good baseline. No mapping/register
+sweep. A separate two-stage dispatch could reduce the observed fused-producer
+tax, but it must pay for admission and remaining manifold work; the original
+entire RTX fallback is under1ms and discarded-clipping saving only.167ms.
+No new >=2ms primary-GPU boundary is demonstrated by splitting this path.
+Prioritize the measured geometric cull and larger complete representations;
+do not label this numerical implementation incorrect or its scalar work
+retirement imaginary merely because the integrated timing loses.
