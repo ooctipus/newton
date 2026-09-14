@@ -8,6 +8,7 @@
 
 import hashlib
 import importlib.util
+import json
 import os
 import tempfile
 import unittest
@@ -93,6 +94,35 @@ def launch_saved(a, scalar, tier, device, branch):
     return {
         name: buffers[name].numpy()
         for name in ("v_out", "world_impulses", "world_row_type", "world_row_parent", "world_row_mu")
+    }
+
+
+def momentum_backward(problem, delta, velocity):
+    """Report physical momentum with an uncancelled componentwise backward scale."""
+    jacobian = problem["J"].astype(np.float64)
+    lower = problem["L"].astype(np.float64)
+    mass = lower @ lower.T
+    dv = velocity.astype(np.float64) - problem["predictor"].astype(np.float64)
+    impulse = delta.astype(np.float64)
+    mass_action, impulse_action = mass @ dv, jacobian.T @ impulse
+    defect = float(np.max(np.abs(mass_action - impulse_action)))
+    mass_scale = float(np.max(np.abs(mass) @ np.abs(dv)))
+    impulse_scale = float(np.max(np.abs(jacobian).T @ np.abs(impulse)))
+    scale = max(mass_scale, impulse_scale)
+    original_scale = max(
+        1e-30, np.linalg.norm(mass, np.inf) * np.linalg.norm(dv, np.inf), np.linalg.norm(impulse_action, np.inf)
+    )
+    return {
+        "absolute_defect": defect,
+        "original_scaled": float(defect / original_scale),
+        "mass_action_inf": float(np.max(np.abs(mass_action))),
+        "impulse_action_inf": float(np.max(np.abs(impulse_action))),
+        "mass_contribution_scale": mass_scale,
+        "impulse_contribution_scale": impulse_scale,
+        "backward_scale": scale,
+        "backward_scaled": defect / scale if scale > 0 else (0.0 if defect == 0 else float("inf")),
+        "mass_action": mass_action.tolist(),
+        "impulse_action": impulse_action.tolist(),
     }
 
 
@@ -198,6 +228,22 @@ def fixture(device="cpu"):
 
 
 class TestBranchResponse(unittest.TestCase):
+    def test_momentum_cancellation_scale(self):
+        """A null impulse cycle keeps its raw defect without dividing by cancellation."""
+        problem = {"J": np.array([[1.0], [-1.0]]), "L": np.ones((1, 1)), "predictor": np.zeros(1)}
+        delta = np.ones(2)
+        small = momentum_backward(problem, delta, np.array([np.finfo(np.float32).eps]))
+        self.assertEqual(small["original_scaled"], 1.0)
+        self.assertEqual(small["impulse_action_inf"], 0.0)
+        self.assertEqual(small["impulse_contribution_scale"], 2.0)
+        self.assertLess(small["backward_scaled"], 3e-5)
+        bad = momentum_backward(problem, delta, np.array([0.01]))
+        self.assertGreater(bad["backward_scaled"], 3e-5)
+        zero = momentum_backward(problem, np.zeros(2), np.zeros(1))
+        self.assertEqual(zero["backward_scaled"], 0.0)
+        loaded = momentum_backward(problem, np.array([1.0, 0.0]), np.ones(1))
+        self.assertEqual(loaded["backward_scaled"], 0.0)
+
     def test_packed_leaf_first_pattern(self):
         """The admitted root-six/four-leg-three tree has precisely 117 entries."""
         from newton._src.solvers.feather_pgs import branch_response as br
@@ -550,10 +596,22 @@ class TestBranchResponse(unittest.TestCase):
             problem = rows.world(case, old, s, 0)
             velocity_error = float(np.max(np.abs(old["v_out"][:18] - new["v_out"][:18])))
             self.assertLess(velocity_error, 3e-5 * max(1, float(np.max(np.abs(old["v_out"][:18])))))
-            # Momentum uses the applied impulse DELTA; retain the original warm reference.
-            delta = new["world_impulses"][0, :count] - case["world_impulses"][0, :count]
-            metric = physical.residuals(problem, delta, new["v_out"][:18])
-            self.assertLess(metric["momentum_scaled"], 3e-5)
+            # Keep the closed four-leg cycle: its exact net action vanishes.
+            # Scale backward error by uncancelled contributions, not the tiny net.
+            # Momentum still uses the applied DELTA and the same 3e-5 threshold.
+            metrics = {}
+            for label, output in (("old", old), ("new", new)):
+                delta = output["world_impulses"][0, :count] - case["world_impulses"][0, :count]
+                metric = physical.residuals(problem, delta, output["v_out"][:18])
+                metrics[label] = momentum_backward(problem, delta, output["v_out"][:18])
+                metrics[label]["original_physical_ratio"] = metric["momentum_scaled"]
+                metrics[label]["physical_velocity_error"] = metric["physical_velocity_error"]
+            print(
+                "BRANCH_WARM_MOMENTUM",
+                json.dumps({"contacts": contact_total, "rows": count, "tier": tier, **metrics}, allow_nan=False),
+                flush=True,
+            )
+            self.assertLess(metrics["new"]["backward_scaled"], 3e-5)
             self.assertTrue(np.isfinite(new["v_out"]).all())
             for lam in new["world_impulses"][0, :count].reshape(-1, 3):
                 self.assertGreaterEqual(lam[0], 0)

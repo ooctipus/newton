@@ -2,7 +2,8 @@
 
 2026-09-14. Experimental successor from frozen eec1b91a, on a new branch;
 the failed whole measurement and its sources remain unchanged. CPU/source
-implementation only at this checkpoint. No CUDA physical or cost result yet.
+implementation at the initial checkpoint. The first CUDA result and its
+test-oracle diagnosis are recorded below; no whole-cost result yet.
 The governing contract remains CROSS_TASK_20260911.md. No Lab, task, capacity,
 iteration, physical tolerance or benchmark code changes accompany this work.
 
@@ -83,6 +84,39 @@ The warm two-leg control now covers3/30/48 rows, all four adjacent leg pairs,
 float4 padding and second-warp ranks. Actual constructor/graph/reset/public-body
 and >48 original-row-production tests remain at unchanged physical tolerances.
 No new runner or fixture corpus is introduced.
+
+### First physical failure and cancellation-safe momentum scale
+
+The first paired physical parent at
+/tmp/fpgs-anymal-contiguous-physical-paired-20260914-01 remains FAILED, with
+normal child exits1 and source/final-idle guards passing. Current/held and
+actual constructor/graph/publication controls passed both cards; the expanded
+warm selector failed its original momentum ratio at1.0. Raw CUDA subcase
+outputs were not retained, so the following diagnosis is explicitly CPU-only.
+
+Reusing the exact test construction and existing fixed24 FP32 oracle isolates
+16 contacts/48 rows: four repetitions of the closed adjacent-leg cycle with
+identical warm triples. J-transpose times the warm impulse is only4.83692e-19.
+Both reference mappings reach total impulse zero in6 sweeps. Packed publication
+rounds exactly to the input velocity: absolute momentum defect4.83692e-19 and
+physical velocity error0, but the old net-action scale is also4.83692e-19,
+giving ratio1.0. Original FP32 publication instead has velocity delta5.96046e-8,
+absolute defect2.18039e-8 and ratio0.0057119. Both therefore fail the old ratio;
+cases1/10 give ordinary old/new ratios around2e-8 to4e-8. This does not recover
+the missing CUDA raw values or turn the preserved failed parent into a pass.
+
+The test-only correction retains every input, native statement and the closed
+cycle. It reports old/new raw M*delta-v and J-transpose*delta-lambda vectors,
+absolute defects and the original ratios before asserting. For this warm
+momentum check only, the same3e-5 threshold uses the backward scale
+max(norm(abs(M)*abs(delta-v),infinity),
+norm(abs(J)-transpose*abs(delta-lambda),infinity)). These are actual uncancelled
+contribution magnitudes; there is no arbitrary unit floor or tolerance increase.
+When the scale is exactly zero, only zero defect passes. A focused CPU control
+preserves a cancelling roundoff residual, rejects a material0.01 velocity error,
+and covers zero and noncancelling actions. Current/held, velocity, cone, graph,
+reset, fallback and public-output gates remain unchanged. Native aa3 source
+hashes are unchanged. Actual CUDA replay is still required.
 
 Correct-launch offline build artifacts:
 /tmp/fpgs-anymal-contiguous-offline-launch-h3iu5x20. Both sm120/sm103 compile;
