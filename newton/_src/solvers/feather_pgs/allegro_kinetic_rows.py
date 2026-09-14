@@ -273,14 +273,11 @@ def _row_source(*, kinetic):
     projection = projection.replace(
         "__PROJECT__",
         """
-                const int id = z.maps.body_map.data[body];
-                if (id < 0) continue;
-                const int offset = id == 16 ? 16 : (id / 4) * 4;
-                const int n = id == 16 ? 6 : 4;
+                const int offset = side == 0 ? offset_a : offset_b;
+                const int n = side == 0 ? size_a : size_b;
                 if (q < offset || q >= offset + n) continue;
-                const int start = id == 16 ? 384 : id * 24;
-                const float* map = z.maps.maps.data + world * 420 + start + (q - offset) * 6;
-                const wp::vec3 torque = wp::cross(point - c.origin.data[art], direction);
+                const float* map = (side == 0 ? map_a : map_b) + (q - offset) * 6;
+                const wp::vec3 torque = side == 0 ? torque_a : torque_b;
                 float v = 0.0f;
                 #pragma unroll
                 for (int axis = 0; axis < 3; ++axis) {
@@ -298,6 +295,25 @@ def _row_source(*, kinetic):
                 value += sign * wp::dot(direction, linear + wp::cross(angular, point - c.origin.data[art]));
         """,
     )
+    if kinetic:
+        projection = (
+            """
+        const int id_a = ba >= 0 && aa >= 0 ? z.maps.body_map.data[ba] : -1;
+        const int id_b = bb >= 0 && ab >= 0 ? z.maps.body_map.data[bb] : -1;
+        const int offset_a = id_a == 16 ? 16 : (id_a >= 0 ? (id_a / 4) * 4 : 0);
+        const int offset_b = id_b == 16 ? 16 : (id_b >= 0 ? (id_b / 4) * 4 : 0);
+        const int size_a = id_a < 0 ? 0 : (id_a == 16 ? 6 : 4);
+        const int size_b = id_b < 0 ? 0 : (id_b == 16 ? 6 : 4);
+        const int start_a = id_a == 16 ? 384 : (id_a >= 0 ? id_a * 24 : 0);
+        const int start_b = id_b == 16 ? 384 : (id_b >= 0 ? id_b * 24 : 0);
+        const float* map_a = z.maps.maps.data + world * 420 + start_a;
+        const float* map_b = z.maps.maps.data + world * 420 + start_b;
+        wp::vec3 torque_a(0.0f), torque_b(0.0f);
+        if (size_a > 0) torque_a = wp::cross(pa - c.origin.data[aa], direction);
+        if (size_b > 0) torque_b = wp::cross(pb - c.origin.data[ab], direction);
+        """
+            + projection
+        )
     incident = (
         "relative += Jr[q] * z.maps.kinetic_incident.data[world * 22 + q];"
         if kinetic

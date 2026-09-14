@@ -258,6 +258,9 @@ class TestAllegroKineticRowsCPU(unittest.TestCase):
         """Expose the complete typed-row owner and direct kinetic consumer."""
         self.assertTrue(callable(rows.create_owner))
         self.assertTrue(callable(rows.get_ink_stage))
+        source = rows._row_source(kinetic=True)
+        self.assertEqual(source.count("z.maps.body_map.data["), 2)
+        self.assertNotIn("z.maps.body_map.data[body]", source)
         with np.load(next(captures())) as snapshot:
             solver, _state, _aug, _contact, owner = fixture(snapshot, "cpu")
             self.assertTrue(owner.keyed_rows)
