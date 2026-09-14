@@ -1,17 +1,76 @@
 # Structural window: integrated discoveries
 
-Checkpoint: 2026-09-13 22:40 UTC. Work continues toward the 24-hour window in
+Checkpoint: 2026-09-14 00:17 UTC. Work continues toward the 24-hour window in
 `STRUCTURAL_FOURX_20260913.md`; the 4x target is **not achieved**. These are
 discoveries, not replacements for accepted baselines except where repeat
 evidence is explicitly given. No candidate has met the complete 4x target.
 No Isaac Lab source, timestep, substep or iteration allowance was changed.
 
-**Current physical hold:** the original finite-terrain candidate produces a
-large asymmetric free-foot rebound response. A narrow corrected successor
-now passes the targeted rebound controls, but the shared sliding discrepancy
-and an unreduced fixture-capacity failure remain unresolved. Neither finite
-version is promoted. The sparse solver and packed original-query midphase
-are separable from this changed manifold law.
+**Current status:** the original finite-terrain manifold remains rejected.
+Its corrected successor now passes rebound and sliding/support/border checks,
+including full-history support-force readback. One earlier decimated-force
+failure and the unreduced fixture-capacity failure remain preserved, not
+erased. The latest finite/weld source remains default-off pending fresh
+shared-MJ comparison and repeated timing. Do not use old rejected variants
+as performance denominators.
+
+## Latest completed experiments (September14,00:17)
+
+G1 finite/WELD geometry is composed onto current sparse/packed bd1, branch
+`ooctipus/g1-finite-seam-compose-20260913`, pushed to ooctipus/newton through
+report-only `4a0bf739778041d5f833abfd1d077703677eb12d`. Runtime7e6cb1bd,
+timed source6e08, diagnostic-only successor f375. Original31cf ancestry and
+the inherited handoff are retained; no parent pointer or Lab source changes.
+
+The flat internal-triangle-edge fix changes premature sliding stops
+.337–.408m to approximately.5072m, consistent with the original timestep's
+Coulomb prediction. Composed saved96 geometry/lifecycle/rebound passes on
+both cards. An initial GB support check failed by2.126% against2%, using only
+five decimated samples. Direct80-step tail force readback then passes with
+<=0.001508% average-weight error and<=6.01e-8 momentum mismatch. A genuine
+2.5ms three-contact/5ms force transient is recorded, not hidden; the original
+failure and original test assertion/tolerance remain unchanged.
+
+Complete same-source FPGS A/B, finite0->1 and SPARSE/CELL/PACK/WELD1 on BOTH:
+
+| GPU | Corrected original physics | Finite physics | Incremental ratio |
+|---|---:|---:|---:|
+| RTX |24.714743ms|22.905959ms|1.078966x|
+| GB300 |38.007732ms|27.702692ms|1.371987x|
+
+All four children/activation/capacity/source/idle checks pass. One discovery
+round, not4x or a fresh MJWarp ratio. Full wall numbers, exact commands,
+manifests and numerical caveats are in that branch's
+`reports/fpgs/G1_FINITE_SEAM_COMPOSE_20260913.md`. Fresh same-collision MJWarp
+comparison is next; historical1.654/1.481 ratios below are not current new-tip
+denominators.
+
+G1 coordinate-register corrective experiment e8fa7955 also fails performance,
+despite four physical controls/card passing: currentbd1 25.533741->28.504674ms
+RTX and34.814945->46.843395ms GB. Strict nodes attribute the loss to solve,
+8.869/17.880ms versus recent original5.867/5.764ms; other owners stay near flat.
+It removes the >64 tail but adds dense43 dot work, replicated projection and
+large static code. No hardware-counter attribution or third register mapping.
+Evidence: `/tmp/fpgs-g1-coordinate-register-AodDkeuk/NODE_CAUSE.md`.
+
+ANYmal complete directL117/compact-root-leg source eec1 passes current/held,
+two-leg/warm and actual constructor/fallback/graph/reset controls on both
+cards, after preserving and correcting test API setup errors. Whole loss:
+9.244660->14.167829ms RTX;9.521509->16.000075ms GB. Actual owner/all16384 valid/
+status0/capacity/source/idle checks pass. Strict paired node attribution finds
+compact solve4.079->8.641ms RTX/4.455->10.849ms GB. Repeated FFS/tag gathers
+replace the original regular float4 schedule; factor/predictor saves nothing.
+Retiring buffers also revived redundant full-J clears. One costed correction
+is authorized: contiguous per-leg panels once/CTA, regular24-sweep contractions
+and original active-J owner, not another small register/sync tuning.
+Full evidence: `/tmp/fpgs-anymal-branch-physical-m2e7L8gI/NODE_FINDINGS.md`.
+
+Allegro full warm shell c5ea is implemented and has its first paired GPU
+result, not a speedup. One saved patch safely falls back because the old
+spatial inward movement leaves sub-ulp gap slack; loaded test also omitted
+the original lazy-publication API in BOTH arms. One gap-aware interior
+selection correction and the test API correction are underway. All complete
+warm/patch/cold-fallback costs must be measured. No achieved4x claim.
 
 ## Current comparison and diagnosed losses (18:13 checkpoint)
 
