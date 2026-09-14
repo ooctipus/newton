@@ -11,6 +11,146 @@ from .kernels import contact_restitution_fires
 from .sparse_factor import SparseData, SparsePlan
 
 
+@cache
+def get_parallel_limit_kernel():
+    """Emit original global rows with three stable active-candidate ballots."""
+    source = r"""
+    const int art=p.group_to_art.data[group], world=p.art_to_world.data[art];
+    const int start=p.art_dof_start.data[art], capacity=row_type.shape[1], base=world*capacity;
+    auto emit=[&](int candidate,int row,float value) {
+        if(row>=capacity)return;
+        const int local=candidate/2, tpl=p.limit_support.data[local], at=base+row;
+        const float sign=(candidate&1)?-1.0f:1.0f;
+        float norm=0.0f;
+        for(int k=0;k<18;++k) {
+            const int node=p.support_nodes.data[tpl*18+k];
+            float z=0.0f;
+            if(node>=0) {
+                const int entry=p.index.data[node*43+42-local];
+                if(entry>=0)z=sign*d.W.data[group*434+entry];
+            }
+            d.Z.data[at*18+k]=z;norm+=z*z;
+        }
+        d.support.data[at]=tpl; d.incident.data[at]=sign*vhat.data[start+local];
+        diagonal.data[at]=norm+cfm;
+        row_type.data[at]=3;parent.data[at]=-1;mu.data[at]=0.0f;
+        row_beta.data[at]=beta;row_cfm.data[at]=cfm;
+        phi.data[at]=value;target.data[at]=0.0f;
+    };
+    int count=0;
+#if defined(__CUDA_ARCH__)
+    const int lane=threadIdx.x&31;
+    for(int batch=0;batch<3;++batch) {
+        const int candidate=batch*32+lane, local=candidate/2, side=candidate&1;
+        bool active=false;float value=0.0f;
+        if(enabled && candidate<86) {
+            const int dof=start+local, qi=limit_q.data[dof];
+            if(qi>=0) {
+                const float bound=side?upper.data[dof]:lower.data[dof], position=q.data[qi];
+                value=(side?-1.0f:1.0f)*(position-bound);
+                active=isfinite(bound) && (side?position>=bound-gap:position<=bound+gap);
+            }
+        }
+        const unsigned mask=__ballot_sync(0xffffffff,active);
+        const int row=count+__popc(mask&((1u<<lane)-1u));count+=__popc(mask);
+        if(active)emit(candidate,row,value);
+    }
+    if(lane==0) {
+        counter.data[world]=count;
+        phase.data[world*phase.shape[1]]=count;phase.data[world*phase.shape[1]+1]=count;
+    }
+#else
+    if(enabled)for(int candidate=0;candidate<86;++candidate) {
+        const int local=candidate/2,side=candidate&1,dof=start+local,qi=limit_q.data[dof];
+        if(qi<0)continue;
+        const float bound=side?upper.data[dof]:lower.data[dof],position=q.data[qi];
+        if(!isfinite(bound) || !(side?position>=bound-gap:position<=bound+gap))continue;
+        emit(candidate,count++,(side?-1.0f:1.0f)*(position-bound));
+    }
+    counter.data[world]=count;
+    phase.data[world*phase.shape[1]]=count;phase.data[world*phase.shape[1]+1]=count;
+#endif
+"""
+
+    @wp.func_native(source)
+    def native(
+        group: int,
+        p: SparsePlan,
+        d: SparseData,
+        limit_q: wp.array[int],
+        lower: wp.array[float],
+        upper: wp.array[float],
+        q: wp.array[float],
+        vhat: wp.array[float],
+        enabled: int,
+        gap: float,
+        beta: float,
+        cfm: float,
+        counter: wp.array[int],
+        row_type: wp.array2d[int],
+        parent: wp.array2d[int],
+        mu: wp.array2d[float],
+        row_beta: wp.array2d[float],
+        row_cfm: wp.array2d[float],
+        phi: wp.array2d[float],
+        target: wp.array2d[float],
+        diagonal: wp.array2d[float],
+        phase: wp.array2d[int],
+    ): ...
+
+    def prefix(
+        p: SparsePlan,
+        d: SparseData,
+        limit_q: wp.array[int],
+        lower: wp.array[float],
+        upper: wp.array[float],
+        q: wp.array[float],
+        vhat: wp.array[float],
+        enabled: int,
+        gap: float,
+        beta: float,
+        cfm: float,
+        counter: wp.array[int],
+        row_type: wp.array2d[int],
+        parent: wp.array2d[int],
+        mu: wp.array2d[float],
+        row_beta: wp.array2d[float],
+        row_cfm: wp.array2d[float],
+        phi: wp.array2d[float],
+        target: wp.array2d[float],
+        diagonal: wp.array2d[float],
+        phase: wp.array2d[int],
+    ):
+        group, _ = wp.tid()
+        native(
+            group,
+            p,
+            d,
+            limit_q,
+            lower,
+            upper,
+            q,
+            vhat,
+            enabled,
+            gap,
+            beta,
+            cfm,
+            counter,
+            row_type,
+            parent,
+            mu,
+            row_beta,
+            row_cfm,
+            phi,
+            target,
+            diagonal,
+            phase,
+        )
+
+    prefix.__name__ = prefix.__qualname__ = "sparse_factor_parallel_limit_prefix43"
+    return wp.kernel(enable_backward=False, module="unique")(prefix)
+
+
 @wp.kernel(enable_backward=False)
 def build_limit_prefix(
     p: SparsePlan,

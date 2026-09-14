@@ -409,7 +409,12 @@ class SparseFactor:
     """Own every consumer of the selected packed held/current representation."""
 
     def __init__(self, solver, plan, host):
-        from .sparse_factor_rows import get_contact_kernel, get_solve_kernel  # noqa: PLC0415
+        from .sparse_factor_rows import (  # noqa: PLC0415
+            build_limit_prefix,
+            get_contact_kernel,
+            get_parallel_limit_kernel,
+            get_solve_kernel,
+        )
 
         self.solver, self.plan, self.host = solver, plan, host
         self.data = SparseData()
@@ -418,10 +423,14 @@ class SparseFactor:
         self.data.valid = wp.zeros(w, dtype=int, device=device)
         self.data.status = wp.zeros(w, dtype=int, device=device)
         self.packet_rows = os.environ.get("FEATHER_PGS_SPARSE_PACKETS") == "1" and c == 100
+        self.parallel_limit_prefix = os.environ.get("FEATHER_PGS_SPARSE_PARALLEL_LIMITS") == "1" and c == 100
+        if self.packet_rows and self.parallel_limit_prefix:
+            raise ValueError("Sparse packets and parallel global limit rows are mutually exclusive")
         self.data.Z = wp.empty((1, 1, 1) if self.packet_rows else (w, c, 18), dtype=float, device=device)
         self.data.support = wp.empty((w, c), dtype=int, device=device)
         self.data.incident = wp.empty((1, 1) if self.packet_rows else (w, c), dtype=float, device=device)
         self.kernels = SimpleNamespace(
+            prefix=get_parallel_limit_kernel() if self.parallel_limit_prefix else build_limit_prefix,
             refresh=get_refresh_kernel(),
             predictor=get_predictor_kernel(),
             contacts=get_contact_kernel(),
@@ -508,7 +517,6 @@ class SparseFactor:
     def build_rows(self, state_in, state_aug, contacts, dt):
         """Retain original allocation/metadata while replacing all dense J production."""
         from . import kernels as k  # noqa: PLC0415
-        from .sparse_factor_rows import build_limit_prefix  # noqa: PLC0415
 
         s, model, device = self.solver, self.solver.model, self.solver.model.device
         c = s.dense_max_constraints
@@ -521,10 +529,11 @@ class SparseFactor:
             s._row_dropped_dense.zero_()
             s._row_dropped_mf.zero_()
             s._row_dropped_propagation.zero_()
-        prefix_launch = wp.launch_tiled if self.packet_rows else wp.launch
+        tiled_prefix = self.packet_rows or self.parallel_limit_prefix
+        prefix_launch = wp.launch_tiled if tiled_prefix else wp.launch
         prefix_launch(
-            self.kernels.prefix if self.packet_rows else build_limit_prefix,
-            dim=[s.world_count] if self.packet_rows else s.world_count,
+            self.kernels.prefix,
+            dim=[s.world_count] if tiled_prefix else s.world_count,
             inputs=[
                 self.plan,
                 self.data,
@@ -548,7 +557,7 @@ class SparseFactor:
                 s.diag,
                 s.dense_phase_bounds,
             ],
-            block_dim=32 if self.packet_rows else 256,
+            block_dim=32 if tiled_prefix else 256,
             device=device,
         )
         if contacts is not None and contacts.rigid_contact_max > 0:

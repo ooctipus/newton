@@ -307,6 +307,119 @@ class TestSparseFactor(unittest.TestCase):
             sf.make_plan(f["model"])
 
 
+class TestSparseParallelLimits(unittest.TestCase):
+    """Check the isolated global-row prefix on the original actual-tree fixture."""
+
+    device = "cpu"
+
+    def test_parallel_limit_owner_admission(self):
+        """Require actual opt-in dispatch, original row storage and c100 admission."""
+        flags = {"FEATHER_PGS_SPARSE_PACKETS": "0", "FEATHER_PGS_SPARSE_PARALLEL_LIMITS": "1"}
+        with patch.dict(os.environ, flags):
+            for capacity in (100, 128):
+                o = fixture(self.device, capacity=capacity)["owner"]
+                self.assertEqual(o.parallel_limit_prefix, capacity == 100)
+                self.assertFalse(o.packet_rows)
+                self.assertEqual(o.data.W.shape, (1, 434))
+                self.assertEqual(o.data.Z.shape, (1, capacity, 18))
+                self.assertEqual(o.data.incident.shape, (1, capacity))
+                self.assertEqual(o.data.support.shape, (1, capacity))
+                self.assertEqual(o.kernels.contacts.key, "sparse_factor_contact_triplet18")
+                self.assertEqual(o.kernels.solve.key, f"sparse_factor_gs43_s18_c{capacity}")
+                expected = "sparse_factor_parallel_limit_prefix43" if capacity == 100 else "build_limit_prefix"
+                self.assertEqual(o.kernels.prefix.key, expected)
+        with patch.dict(os.environ, {**flags, "FEATHER_PGS_SPARSE_PACKETS": "1"}):
+            with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                fixture(self.device)
+        with patch.dict(os.environ, {**flags, "FEATHER_PGS_SPARSE_PARALLEL_LIMITS": "0"}):
+            self.assertFalse(fixture(self.device)["owner"].parallel_limit_prefix)
+
+    def test_parallel_limit_prefix_order_and_capacity(self):
+        """Preserve current and held W columns, stable boundaries and uncapped counts."""
+        from newton._src.solvers.feather_pgs.sparse_factor_rows import (  # noqa: PLC0415
+            build_limit_prefix,
+            get_parallel_limit_kernel,
+        )
+
+        flags = {"FEATHER_PGS_SPARSE_PACKETS": "0", "FEATHER_PGS_SPARSE_PARALLEL_LIMITS": "1"}
+        for capacity in (100, 7):
+            with patch.dict(os.environ, flags):
+                f = fixture(self.device, capacity=capacity)
+            s, o, m = f["solver"], f["owner"], f["model"]
+            W = np.linalg.solve(np.linalg.cholesky(f["H"][::-1, ::-1]), np.eye(43))
+            o.data.W.assign(W[o.host["row"], o.host["col"]][None].astype(np.float32))
+            held = o.data.W.numpy().copy()
+            qi, q = s._joint_limit_q_index.numpy(), f["state"].joint_q.numpy()
+            lower = np.full(43, -np.inf, np.float32)
+            upper = -lower
+            lower[qi >= 0] = q[qi[qi >= 0]] - 0.001
+            upper[qi >= 0] = q[qi[qi >= 0]] + 0.001
+            m.joint_limit_lower.assign(lower)
+            m.joint_limit_upper.assign(upper)
+            outputs = [
+                o.data.Z,
+                o.data.incident,
+                o.data.support,
+                s.slot_counter,
+                s.row_type,
+                s.row_parent,
+                s.row_mu,
+                s.row_beta,
+                s.row_cfm,
+                s.phi,
+                s.target_velocity,
+                s.diag,
+                s.dense_phase_bounds,
+            ]
+            for enabled, velocity in ((1, 0.2), (1, -0.3), (0, 0.1)):
+                s.v_hat.assign(np.linspace(-velocity, velocity, 43, dtype=np.float32))
+                args = [
+                    o.plan,
+                    o.data,
+                    s._joint_limit_q_index,
+                    m.joint_limit_lower,
+                    m.joint_limit_upper,
+                    f["state"].joint_q,
+                    s.v_hat,
+                    enabled,
+                    s.joint_limit_activation_gap,
+                    s.pgs_beta,
+                    s.pgs_cfm,
+                    s.slot_counter,
+                    s.row_type,
+                    s.row_parent,
+                    s.row_mu,
+                    s.row_beta,
+                    s.row_cfm,
+                    s.phi,
+                    s.target_velocity,
+                    s.diag,
+                    s.dense_phase_bounds,
+                ]
+                for output in outputs:
+                    output.fill_(-777)
+                wp.launch(build_limit_prefix, dim=1, inputs=args, device=self.device)
+                expected = [output.numpy().copy() for output in outputs]
+                for output in outputs:
+                    output.fill_(-777)
+                wp.launch_tiled(get_parallel_limit_kernel(), dim=[1], inputs=args, block_dim=32, device=self.device)
+                for output, reference in zip(outputs, expected, strict=True):
+                    np.testing.assert_allclose(output.numpy(), reference, rtol=3e-5, atol=3e-6)
+                self.assertEqual(int(s.slot_counter.numpy()[0]), 74 if enabled else 0)
+                np.testing.assert_array_equal(o.data.W.numpy(), held)
+                if enabled:
+                    # The first two candidates are lower/upper of the same DOF;
+                    # boundaries at candidates32/64 retain the original order.
+                    np.testing.assert_allclose(o.data.Z.numpy()[0, 0], -o.data.Z.numpy()[0, 1])
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "Native parallel-limit controls require CUDA")
+class TestSparseParallelLimitsCUDA(TestSparseParallelLimits):
+    """Run the same current/held prefix and capacity controls on the leased device."""
+
+    device = "cuda:0"
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "Native sparse physical controls require CUDA")
 class TestSparseFactorCUDA(unittest.TestCase):
     def test_complete_owner_two_steps_and_graph(self):
@@ -338,6 +451,9 @@ class TestSparseFactorCUDA(unittest.TestCase):
         with patch.dict(os.environ, {"FEATHER_PGS_SPARSE_FACTOR": "1", "FEATHER_PGS_SINGLE_FACTOR": "0"}):
             candidate = SolverFeatherPGS(m, **options)
         self.assertIsNotNone(candidate._sparse_factor)
+        if os.environ.get("FEATHER_PGS_SPARSE_PARALLEL_LIMITS") == "1":
+            self.assertTrue(candidate._sparse_factor.parallel_limit_prefix)
+            self.assertEqual(candidate._sparse_factor.kernels.prefix.key, "sparse_factor_parallel_limit_prefix43")
         original_states = [m.state(), m.state()]
         candidate_states = [m.state(), m.state()]
         original_states[0].assign(state)
@@ -386,6 +502,10 @@ class TestSparseFactorCUDA(unittest.TestCase):
         s = f["solver"]
         o = f["owner"]
         h = f["H"]
+        if os.environ.get("FEATHER_PGS_SPARSE_PARALLEL_LIMITS") == "1":
+            self.assertTrue(o.parallel_limit_prefix)
+            self.assertFalse(o.packet_rows)
+            self.assertEqual(o.kernels.prefix.key, "sparse_factor_parallel_limit_prefix43")
         o.refresh(s)
         o.check()
         W = unpack(o)
