@@ -2542,6 +2542,7 @@ class NarrowPhase:
         self._use_lean_gjk_mpr = use_lean_gjk_mpr
         self._coherent_cache = None
         self._coherent_query_kernels = None
+        self._cells_owner = None
         # Create the appropriate kernel variants
         # Primitive kernel handles lightweight primitives and routes remaining pairs
         self.primitive_kernel = create_narrow_phase_primitive_kernel(
@@ -3019,6 +3020,8 @@ class NarrowPhase:
                         self.split_manifold_work_items,
                         self.split_manifold_work_count,
                     ]
+                    if self._cells_owner is not None:
+                        coherent_inputs.append(self._cells_owner.data)
                     for coherent_kernel in self._coherent_query_kernels:
                         wp.launch(
                             kernel=coherent_kernel,
@@ -3075,6 +3078,7 @@ class NarrowPhase:
                         self.split_query_results,
                         self.split_manifold_work_items,
                         self.split_manifold_work_count,
+                        *([self._cells_owner.data] if self._cells_owner is not None else []),
                     ],
                     device=device,
                     block_dim=self.block_dim,
