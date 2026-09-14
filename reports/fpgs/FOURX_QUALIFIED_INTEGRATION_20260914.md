@@ -119,7 +119,8 @@ correction. Exact local prerequisites and command remain at
 `/tmp/fpgs-allegro-keyed-backends-akOBZj8M/LAUNCH.md` (adapter e82a6102,
 original driver798/fixed-import c062). Root's full Allegro result report is
 preserved separately by report-only commit
-`a08f7f193d01f642dbf3c489a0f742d45a341a46` for inclusion after the code merge.
+`a08f7f193d01f642dbf3c489a0f742d45a341a46`, included unchanged after the
+code merge.
 
 Kuka's qualified 6c229 successor retains repeated physics medians
 12.506653 -> 11.119767 ms RTX and 12.033355 -> 11.339816 ms GB against baf.
@@ -127,3 +128,13 @@ Its GB wall evidence remains mixed, including the original paired regression;
 see [the retained Kuka report](KUKA_KINETIC_INTEGRATION_20260914.md).
 The combined source still requires root's integrated checks. Allegro has
 crossed its measured RTX target; the all-six-task goal remains unmet.
+
+## Frozen handoff
+
+Code merge `17f8a19ae1a5c388838b1d9000d96f27ecd16b77` has parents 298c and
+7fca. The subsequent merge of a08 changes only reports. The original Kuka
+and Allegro trees remain untouched by this composition, including the failed55
+ancestry and the inherited `31cf87f4694f873a027e41e2ca5e9ad441234456` fork.
+No source pin or parent dependency pointer is advanced, and no push or GPU
+execution is performed by this integration task. Root owns review and the
+remaining integrated qualification.
