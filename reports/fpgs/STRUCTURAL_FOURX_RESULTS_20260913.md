@@ -1,6 +1,6 @@
 # Structural window: integrated discoveries
 
-Checkpoint: 2026-09-14 00:17 UTC. Work continues toward the 24-hour window in
+Checkpoint: 2026-09-14 00:30 UTC. Work continues toward the 24-hour window in
 `STRUCTURAL_FOURX_20260913.md`; the 4x target is **not achieved**. These are
 discoveries, not replacements for accepted baselines except where repeat
 evidence is explicitly given. No candidate has met the complete 4x target.
@@ -10,9 +10,41 @@ No Isaac Lab source, timestep, substep or iteration allowance was changed.
 Its corrected successor now passes rebound and sliding/support/border checks,
 including full-history support-force readback. One earlier decimated-force
 failure and the unreduced fixture-capacity failure remain preserved, not
-erased. The latest finite/weld source remains default-off pending fresh
-shared-MJ comparison and repeated timing. Do not use old rejected variants
+erased. The latest finite/weld source remains default-off; its fresh shared-MJ
+comparison passes, while repeated timing remains. Do not use old rejected variants
 as performance denominators.
+
+## Fresh corrected shared-collision G1 comparison (September14,00:28)
+
+Both backends use clean Newton4a0bf739, fixed Lab53ee, 16K seed0,200 warm,
+40 wall and40 graph steps. CELL/FINITE/WELD/PACK are explicitly enabled and
+observed at both original untimed boundaries. Sparse is enabled only for
+FPGS. MJ uses the corrected line search and actual external Newton contacts:
+both conversion checks pass with scope `external_newton_prefix`, not merely
+an allocated unused Newton collision pipeline.
+
+| GPU | FPGS physics | Corrected MJ physics | MJ/FPGS | FPGS wall | MJ wall |
+|---|---:|---:|---:|---:|---:|
+| RTX |22.861354ms|40.869610ms|1.787716x|36.400055ms|55.445849ms|
+| GB300 |27.668025ms|44.941774ms|1.624322x|41.967366ms|58.190690ms|
+
+One discovery round, not repeated acceptance or4x. All four children exit0,
+eight checked boundaries pass, and final source/idle checks pass. Capacities
+remain F100/raw294912, MJ120/19/raw311296, shared broad49152/tri1769472.
+Original timestep, substeps and solver allowances are unchanged. The4x
+ceilings for this denominator are10.217402ms RTX/11.235444ms GB.
+
+Manifest `/tmp/fpgs-g1-finite-seam-shared-mj-paired16k-20260914-01/manifest.json`,
+SHA256 `1722edd24494e5de3f4bfa21888a5eb299f63b1d63028f3a816265d0b4c08dde`.
+Exact existing-parent command: `/tmp/fpgs-g1-shared-current-J4apUubZ/LAUNCH.md`,
+SHA256 `fca5eface12f9af4d25cc1be62ebb12831d03f377e0de60bbb9e7e3f2771f77e`.
+Explicit in-memory executed parentdc09c6aa/activation6adb2e00 are recorded
+in every run; original helpers remain unchanged. Versioned observer477c8c01
+adds actual external-MJ consumption checks at the same two boundaries.
+
+The prior1.40x structural figure was incremental FPGS improvement, not a
+ratio over MJWarp. These new numbers do not compare against fpgs-main or
+establish an exact cumulative handoff gain; those are separate denominators.
 
 ## Latest completed experiments (September14,00:17)
 
@@ -41,9 +73,9 @@ Complete same-source FPGS A/B, finite0->1 and SPARSE/CELL/PACK/WELD1 on BOTH:
 All four children/activation/capacity/source/idle checks pass. One discovery
 round, not4x or a fresh MJWarp ratio. Full wall numbers, exact commands,
 manifests and numerical caveats are in that branch's
-`reports/fpgs/G1_FINITE_SEAM_COMPOSE_20260913.md`. Fresh same-collision MJWarp
-comparison is next; historical1.654/1.481 ratios below are not current new-tip
-denominators.
+`reports/fpgs/G1_FINITE_SEAM_COMPOSE_20260913.md`. The subsequent same-collision
+MJWarp comparison is above; historical1.654/1.481 ratios below are not current
+new-tip denominators.
 
 G1 coordinate-register corrective experiment e8fa7955 also fails performance,
 despite four physical controls/card passing: currentbd1 25.533741->28.504674ms
@@ -65,12 +97,19 @@ is authorized: contiguous per-leg panels once/CTA, regular24-sweep contractions
 and original active-J owner, not another small register/sync tuning.
 Full evidence: `/tmp/fpgs-anymal-branch-physical-m2e7L8gI/NODE_FINDINGS.md`.
 
-Allegro full warm shell c5ea is implemented and has its first paired GPU
-result, not a speedup. One saved patch safely falls back because the old
+Allegro full warm shell c5ea had an initial failed paired GPU
+result, not a speedup. One saved patch safely fell back because the old
 spatial inward movement leaves sub-ulp gap slack; loaded test also omitted
-the original lazy-publication API in BOTH arms. One gap-aware interior
-selection correction and the test API correction are underway. All complete
-warm/patch/cold-fallback costs must be measured. No achieved4x claim.
+the original lazy-publication API in BOTH arms. Corrected28a81a33 adds
+gap-aware inward selection without widening the shell and calls the original
+publication API in the test. All17 selected checks/card now pass, zero skips,
+normal exits and source/idle guards. Maximum loaded momentum defect5.37e-7;
+rebound1.80000043m/s; centered candidate spin5.71e-7rad/s. The finite hull
+friction case preserves original energy/spin closely. Manifest
+`/tmp/fpgs-convex-shell-physical-paired-20260914-02/manifest.json`, SHA256
+`450f050f165c1f69d27f02cf78fef21e1a7d0885e45ba6b76469be8def1ba9ed`.
+All complete warm/patch/cold-fallback costs still need whole-task timing.
+No achieved4x claim.
 
 ## Current comparison and diagnosed losses (18:13 checkpoint)
 
