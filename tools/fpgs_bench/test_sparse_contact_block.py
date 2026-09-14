@@ -395,16 +395,28 @@ class TestSparseContactBlockCUDA(unittest.TestCase):
                     s.impulses.zero_()
                     count = int(s.constraint_count.numpy()[0])
                     J = physical_rows(f)
-                    z, _ = full_rows(owner, count)
+                    z, templates = full_rows(owner, count)
                     # Warm geometry has known FP32 coefficient cancellation.
                     # Report the unchanged diagnostic, then assess the solve and
                     # physical response instead of stopping at an intermediate.
                     coefficient = replay.component_diagnostic(z, (unpack(owner) @ J[:, ::-1].T).T)
-                    actual, lam = check_native(self, f)
                     diagonal, rhs, types, parents, mu = (
                         getattr(s, name).numpy()[0, :count]
                         for name in ("diag", "rhs", "row_type", "row_parent", "row_mu")
                     )
+                    # Compare numerical iterations on identical current rows,
+                    # not the original capture's different atomic slot order.
+                    seed = rhs.astype(float) + owner.data.incident.numpy()[0, :count]
+                    scalar_du, scalar_lam, _ = reference(
+                        z, z, diagonal, seed, types, parents, mu, np.zeros(43), block=False, templates=templates
+                    )
+                    scalar_v = s.v_hat.numpy() + (unpack(owner).T @ scalar_du)[::-1]
+                    scalar_score, scalar_cone = residual_metrics(
+                        J, diagonal, rhs, types, parents, mu, s.v_hat.numpy(), scalar_v, scalar_lam
+                    )
+                    permutation = replay.row_permutation(f, count)
+                    rhs_diagnostic = replay.component_diagnostic(rhs, data[f"rhs_{world}"][permutation])
+                    actual, lam = check_native(self, f)
                     score, cone = residual_metrics(J, diagonal, rhs, types, parents, mu, s.v_hat.numpy(), actual, lam)
                     delta = actual.astype(float) - s.v_hat.numpy().astype(float)
                     force = J.T @ lam.astype(float)
@@ -424,6 +436,10 @@ class TestSparseContactBlockCUDA(unittest.TestCase):
                                 "step": record["step"],
                                 "world": int(world),
                                 "coefficient": coefficient,
+                                "current_to_captured_row": permutation.tolist(),
+                                "rhs_vs_captured": rhs_diagnostic,
+                                "scalar_current_natural_residual": scalar_score,
+                                "scalar_current_cone_error": scalar_cone,
                                 "natural_residual": score,
                                 "cone_error": cone,
                                 "momentum_defect": momentum,

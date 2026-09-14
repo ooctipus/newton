@@ -134,3 +134,60 @@ native arithmetic is changed. Original logs, source and pin files remain
 untouched; follow-up uses a new source revision and fresh physical folder.
 This correction allows the new solve to be assessed, not an advance claim that
 every coefficient mismatch or final result is harmless.
+
+## Complete-cost result and bounded diagnosis
+
+Test-only3414c3b4 retains native643cc8cb. Four paired physical selectors pass
+on both cards in`/tmp/fpgs-g1-contact-block-physical-paired-20260914-02`;
+manifest SHA256`4e9763c43281d3f657300f3a37531729958375eff1232bbdc0fb8bd3f9b9959c`.
+Each card assesses all16 saved cases: maximum independent momentum defect
+4.2573383e-8 and cone error7.4505806e-9. Eight coefficient-diagnostic cases
+still exceed the unchanged elementwise scale and remain recorded.
+
+The original CPU captured-order screen and fresh native replay do not share
+row ordering: the latter reruns atomic contact allocation. Its largest natural
+residual is0.004227882; RTX fixture7410 refresh is0.003537294 rather than the
+captured-order CPU0.000756891. A CPU order-only experiment confirms material
+finite-eight sensitivity, but does not recover this run's exact permutation.
+The final diagnostic addition therefore records the current-to-captured order
+and RHS discrepancy and evaluates original scalar eight on the SAME current
+rounded Z/diagonal/incident/RHS used by the native block. It does not treat
+the original captured-order iterate as an oracle or silently waive a native
+numerical-law failure. These selected checks do not qualify long trajectories.
+
+Whole discovery: `/tmp/fpgs-g1-contact-block-live-paired16k-20260914-01`,
+manifest SHA256`2e832676ceaa77d6b4d7894b9347eb8867448034afa098e48a4fee791d8087d8`.
+Both arms use fixed Lab53ee, identical16K/seed0/200warm/40wall/40physics,
+unchanged allowances and F100/raw294912/broad49152/tri1769472 capacities.
+Only block0->1 changes; baseline0e7f9580 carries native level-update3ca99cc3.
+
+| GPU | Baseline physics | Block physics | Incremental ratio | Saving |
+|---|---:|---:|---:|---:|
+| RTX |20.327910ms|19.844018ms|1.024385x|0.483892ms|
+| GB300 |25.392105ms|25.178416ms|1.008487x|0.213689ms|
+
+Walls34.667975->34.445300ms RTX and39.461055->39.544527ms GB. Four children
+exit0, eight original capacity/actual-activation boundaries and original final
+source/idle guards pass. One discovery only: not a repeat, MJ ratio or promotion.
+The >=2ms primary-GPU milestone is not met; do not tune this small gain.
+
+One three-step attribution uses unchanged owners under
+`/tmp/fpgs-g1-contact-block-nodes-paired16k-20260914-01`. The original auxiliary
+graph analyzer rejects its trace, so parent/wrappers exit1; that status remains
+preserved. All current checks and independent original source/idle guards pass.
+The strict74c5928b reader plus exact finite-collision, parallel-limit,
+level-update and block-solve aliases proves12 physics roots,3 auxiliary roots,
+1020 physics nodes and zero unproven nodes/card. GS exclusive4.243129ms RTX /
+4.525760ms GB versus the earlier level-update4.840935/4.763809 diagnostic:
+the intended solver owner saves only about0.598/0.238ms, not the required2ms.
+Rows2.503105/2.525865, publication2.404418/1.615414 and collision5.047458/
+12.476585ms remain. This is not a gain erased by large downstream growth.
+Actual native resources62/61 registers,1116B shared and zero local-memory
+allocation match offline compilation; no hardware-counter ceiling is claimed.
+
+Cold whole-world screening is not a newly discovered algorithm: the prior
+losing Gram/coordinate implementations already contain it. Their active paths
+confound isolated screen timing. The only selected population evidence is
+6 cold worlds but51/452 rows, already terminating after one sweep. That does
+not fund another >=2ms experiment. No extra screening/mapping tune is opened
+without current work-weighted demand evidence.
