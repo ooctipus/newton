@@ -39,7 +39,7 @@ remove at least 20 ms of the current complete RTX environment step.
 - First CPU result by 12:35 UTC; frozen candidate by 12:45 UTC. GPU A/B runs
   immediately after the currently leased Allegro batch. Diagnose a miss once.
 
-## CPU checkpoint, 12:24 UTC
+## CPU checkpoint, approximately 12:21 UTC
 
 Regression first confirmed: the old function executed 251 versus 28,735
 Python line events for 32 versus 4,096 worlds (the bound was 351). It also
@@ -48,9 +48,48 @@ raised on too-short DOF/world arrays. The new checks reject these inputs before
 gathering. This is conservative strengthening for malformed plans, not a change
 to any valid supported topology.
 
-The four new tests and all nine existing row-packet tests pass, with no skips.
+The four new tests, all nine existing row-packet tests, and all five existing
+notification tests pass, with no skips.
 The independent scalar oracle covers 192 valid/mutated configurations with and
 without explicit mimic-world validation. Actual saved prefix captures, disabled
 leading entries, sticky queue overflow and structural reconstruction checks
 also pass. GPU kernel sources, notify flag semantics and invalidation are
-unchanged. Complete environment A/B remains pending; no gain claimed yet.
+unchanged. Independent review found no changed valid topology semantics or
+notification behavior. Full pre-commit passed before the frozen runtime
+commit `99c796ca`.
+
+## Complete paired results, 12:39 UTC
+
+Three original paired A/B rounds preserve fixed Lab, 16,384 worlds, 200 warmup
+steps, 40 synchronized environment steps and 40 graph physics steps. Both arms
+retain SIMPLE_WORLD_ZERO and LOCAL_ROW_PACKETS, raw32768/broad7680,
+dense192/MF64/prop192, original timestep/two substeps/eight maximum GS sweeps.
+All original source, capacity, actual-owner and final idle guards pass.
+
+| Two alternating repeat medians | Old wall | New wall | Wall ratio | Old/new physics |
+| --- | ---: | ---: | ---: | ---: |
+| RTX PRO 6000 | 62.8812 ms | 28.9060 ms | 2.1754x | 5.5276 / 5.4836 ms |
+| GB300 | 63.0507 ms | 28.9393 ms | 2.1787x | 5.0361 / 5.0121 ms |
+
+The independent discovery round was 62.7230 -> 29.5323 ms RTX (2.1239x)
+and 63.6908 -> 28.5926 ms GB300 (2.2275x). This comfortably exceeds the
+20 ms RTX environment saving gate; physics is essentially unchanged. These
+are environment steps, not full policy/learning throughput, and this result
+does NOT count toward the 4x-over-MJWarp physics objective.
+
+Artifacts:
+
+- `/tmp/fpgs-franka-notification-validation-paired16k-20260914-01`, manifest
+  SHA256 `ed3a7098d2b8c7207ce0a38a80f14e0de910ccd183e96fd57b2afd35215cf743`.
+- `/tmp/fpgs-franka-notification-validation-paired16k-20260914-repeat02`,
+  manifest SHA256
+  `01994506d028ffeff980c8738b8d89daefbfe86dd147df5eda94ffd956fedbb0`.
+
+Reproduction uses the existing
+`/tmp/fpgs-kinetic-fixed-variants-TZRkIPYw/run.py`, baseline worktree
+`newton-fpgs-g1-metric-tangent-20260914` at7df75c46 and this candidate at
+99c796ca. Exact command, runtime imports, file pins, device UUIDs and every
+capacity result are recorded in each original parent manifest. Runtime source
+remains unchanged by this report-only update. A standalone CPU check on a
+constructed full two-mimic16K topology reduced the predicate from median
+43.1679 to4.2881 ms; that is diagnostic evidence, not the environment metric.
