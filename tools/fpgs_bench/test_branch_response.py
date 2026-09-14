@@ -282,24 +282,64 @@ class TestBranchResponse(unittest.TestCase):
             br.make_plan(m)
 
     def test_complete_factory_seams(self):
-        """Both cooperative tiers compile their compact source without altering projection law."""
+        """Retain regular contiguous contractions and no membership walk in either tier."""
         from newton._src.solvers.feather_pgs import solver_feather_pgs as original
 
         for rows in (32, 48):
-            kernel = original._get_pgs_solve_parallel_kernel(
-                72,
-                64,
-                18,
-                120,
-                rows=rows,
-                sweeps=24,
-                matrix_free=True,
-                inkernel_response=(18, 0, 0, 0),
-                exact_row_sums=True,
-                world_rows=True,
-                branch_response=True,
-            )
-            self.assertIn("branch12_L117", kernel.key)
+            bodies = []
+            native = wp.func_native
+
+            def record(source, *args, body_sink=bodies, native_fn=native, **kwargs):
+                body_sink.append(source)
+                return native_fn(source, *args, **kwargs)
+
+            with patch.object(wp, "func_native", record):
+                kernel = original._get_pgs_solve_parallel_kernel(
+                    72,
+                    64,
+                    18,
+                    120,
+                    rows=rows,
+                    sweeps=24,
+                    matrix_free=True,
+                    inkernel_response=(18, 0, 0, 0),
+                    exact_row_sums=True,
+                    world_rows=True,
+                    branch_response=True,
+                )
+            self.assertIn("branch_panels_L117", kernel.key)
+            source = next(body for body in bodies if "float t_k = 1.0f" in body)
+            self.assertNotIn("__ffsll", source)
+            self.assertNotIn("BR_SLOT", source)
+            self.assertIn("constexpr int LP = 2*AM+28", source)
+            self.assertIn("s_leg_y[s_pos1[i]] = s_y[i]", source)
+            contraction = source[source.index("constexpr int NCH = NT/18") : source.index("int changed = 0")]
+            self.assertIn("const float4 y=y4[j], z=z4[j]", contraction)
+            self.assertIn("if (NCH == 1) s_dv[d] = acc", contraction)
+            self.assertNotIn("s_members", contraction)
+
+    def test_preserve_original_j_clear_owner(self):
+        """Retire only mass storage while retaining both original J banks and events."""
+        from newton._src.solvers.feather_pgs import branch_response as br
+
+        f = fixture()
+        solver = f["solver"]
+        old_h = solver.H_by_size[18]
+        old_j = solver.J_by_size[18]
+        solver._par_tiers = []
+        solver._H_bufs = [{18: old_h}, {18: old_h}]
+        j_banks = [{18: old_j}, {18: old_j}]
+        stream = object()
+        solver._J_bufs, solver._memset_stream = j_banks, stream
+        self.addCleanup(setattr, solver, "_memset_stream", None)
+        owner = br.BranchResponse(solver, f["plan"], f["host"])
+        self.assertEqual(owner.data.L.shape, (1, 1, 117))
+        self.assertIs(solver._J_bufs, j_banks)
+        self.assertIs(solver._memset_stream, stream)
+        self.assertIs(solver.J_by_size[18], old_j)
+        for bank in solver._H_bufs:
+            self.assertEqual(bank[18].shape, (1, 1, 1))
+            self.assertIs(bank[18], solver.H_by_size[18])
 
     def test_force_only_k1_admission(self):
         """Retain the original FK/force owner but reject its competing mass producer."""
@@ -458,7 +498,7 @@ class TestBranchResponse(unittest.TestCase):
         a["contact_art_a"][0] = a["contact_art_b"][0] = art
         bodies = a["shape_body"]
         shapes = []
-        for leg in (0, 1):
+        for leg in range(4):
             found = [
                 i
                 for i, b in enumerate(bodies)
@@ -466,7 +506,7 @@ class TestBranchResponse(unittest.TestCase):
             ]
             self.assertTrue(found)
             shapes.append(found[0])
-        a["contact_shape0"][0], a["contact_shape1"][0] = shapes
+        a["contact_shape0"][0], a["contact_shape1"][0] = shapes[:2]
         a["contact_point0"][0] = a["contact_point1"][0] = 0
         a["contact_thickness0"][0] = a["contact_thickness1"][0] = 0
         a["contact_normal"][0] = [0, 0, -1]
@@ -476,19 +516,48 @@ class TestBranchResponse(unittest.TestCase):
         a["world_row_parent"][0, :3] = [-1, 0, 0]
         a["world_impulses"][0, :3] = [0.2, 0.05, -0.06]
         a["v_out"][:18] += np.linspace(-0.3, 0.3, 18).astype(np.float32)
-        old = launch_saved(a, s, 32, device, False)
-        new = launch_saved(a, s, 32, device, True)
-        problem = rows.world(a, old, s, 0)
-        velocity_error = float(np.max(np.abs(old["v_out"][:18] - new["v_out"][:18])))
-        self.assertLess(velocity_error, 3e-5 * max(1, float(np.max(np.abs(old["v_out"][:18])))))
-        # Momentum uses the applied impulse DELTA; the original warm reference is retained.
-        delta = new["world_impulses"][0, :3] - a["world_impulses"][0, :3]
-        metric = physical.residuals(problem, delta, new["v_out"][:18])
-        self.assertLess(metric["momentum_scaled"], 3e-5)
-        self.assertTrue(np.isfinite(new["v_out"]).all())
-        lam = new["world_impulses"][0, :3]
-        self.assertGreaterEqual(lam[0], 0)
-        self.assertLessEqual(np.linalg.norm(lam[1:]), 0.7 * lam[0] + 3e-5)
+        for contact_total in (1, 10, 16):
+            # Cross both the float4 padding and second-warp rank boundaries.
+            # Every row retains its original index and normal/tangent siblings.
+            case = {key: value.copy() for key, value in a.items()}
+            count = 3 * contact_total
+            case["world_constraint_count"][0] = count
+            case["world_contact_counts"][0] = contact_total
+            case["world_contacts"][0, :contact_total] = np.arange(contact_total)
+            case["contact_count"][0] = contact_total
+            for c in range(contact_total):
+                lo = 3 * c
+                for field in (
+                    "contact_slots_needed",
+                    "contact_art_a",
+                    "contact_art_b",
+                    "contact_point0",
+                    "contact_point1",
+                    "contact_thickness0",
+                    "contact_thickness1",
+                    "contact_normal",
+                ):
+                    case[field][c] = a[field][0]
+                case["contact_slot"][c] = lo
+                case["contact_shape0"][c] = shapes[c % 4]
+                case["contact_shape1"][c] = shapes[(c + 1) % 4]
+                case["world_row_type"][0, lo : lo + 3] = [0, 2, 2]
+                case["world_row_parent"][0, lo : lo + 3] = [-1, lo, lo]
+                case["world_impulses"][0, lo : lo + 3] = np.array([0.2, 0.05, -0.06]) / contact_total
+            tier = 32 if count <= 32 else 48
+            old = launch_saved(case, s, tier, device, False)
+            new = launch_saved(case, s, tier, device, True)
+            problem = rows.world(case, old, s, 0)
+            velocity_error = float(np.max(np.abs(old["v_out"][:18] - new["v_out"][:18])))
+            self.assertLess(velocity_error, 3e-5 * max(1, float(np.max(np.abs(old["v_out"][:18])))))
+            # Momentum uses the applied impulse DELTA; retain the original warm reference.
+            delta = new["world_impulses"][0, :count] - case["world_impulses"][0, :count]
+            metric = physical.residuals(problem, delta, new["v_out"][:18])
+            self.assertLess(metric["momentum_scaled"], 3e-5)
+            self.assertTrue(np.isfinite(new["v_out"]).all())
+            for lam in new["world_impulses"][0, :count].reshape(-1, 3):
+                self.assertGreaterEqual(lam[0], 0)
+                self.assertLessEqual(np.linalg.norm(lam[1:]), 0.7 * lam[0] + 3e-5)
 
     @unittest.skipUnless(os.environ.get("FPGS_TEST_DEVICE", "").startswith("cuda"), "root-owned CUDA gate only")
     def test_cuda_live_constructor_fallback_and_graph(self):
@@ -600,6 +669,17 @@ class TestBranchResponse(unittest.TestCase):
         self.assertTrue(48 < count[1] <= 72)
         fallback_y = solvers[1].Y_world.numpy()[1, : count[1]]
         self.assertTrue(np.any(fallback_y != 0) and np.isfinite(fallback_y).all())
+        live = solvers[1]
+        self.assertIsNotNone(live._memset_stream)
+        self.assertNotEqual(live._J_bufs[0][18].ptr, live._J_bufs[1][18].ptr)
+        for bank in live._H_bufs:
+            self.assertEqual(bank[18].shape, (1, 1, 1))
+        # Observe on the original clear stream: the nonzero fallback response
+        # proves current J was produced, and its consumed active prefix is now clear.
+        with wp.ScopedStream(live._memset_stream):
+            cleared = live._J_bufs[1 - live._buf_idx][18].numpy()
+        for world, active in enumerate(count):
+            np.testing.assert_array_equal(cleared[world, :active], 0.0)
         before = owner.data.L.numpy().copy()
         one(0, 1)
         one(1, 1)

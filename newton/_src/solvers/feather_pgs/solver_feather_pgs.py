@@ -26803,7 +26803,7 @@ def _get_pgs_solve_parallel_kernel(
 
     name = f"pgs_solve_parallel_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_rows{AM}_min{MIN_ROWS}_sweeps{NSWEEPS}_nes{NESTEROV}_tol{TOL:g}_nt{NT}_rs5_mf{MF}c"
     if branch_response:
-        name += "_branch12_L117"
+        name += "_branch_panels_L117"
     if INK:
         name += f"_ink{NA}_{NB}_o{OA}_{OB}" + ("chk" if INK_CHECK else "")
     name += (

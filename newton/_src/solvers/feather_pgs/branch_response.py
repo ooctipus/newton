@@ -434,31 +434,84 @@ def compact_source(source, ink_stage):
             for (int c = 0; c < r; ++c) v -= s_L[BR_LI(12+r,12+c)]*Jr[c];
             Jr[r] = v*s_Dinv[12+r];
         }
-        for (int d = 0; d < 12; ++d) s_Yt[d*YS+i] = Jr[d];
     }
+    // Physical compact scratch is dead only after every row finished whitening.
+    // Reuse that same response storage for root planes plus contiguous leg planes.
+    SYNC();
     for (int leg = 0; leg < 4; ++leg) {
         const bool member = lane < n_rows && (s_tag0[lane] == leg || s_tag1[lane] == leg);
         const unsigned bits = __ballot_sync(MASK, member);
         if ((lane & 31) == 0) s_members[leg*2+(lane >> 5)] = bits;
     }
     SYNC();
+    if (lane < 4) {
+        int offset = 0;
+        for (int leg = 0; leg < lane; ++leg) {
+            const int count = __popc(s_members[leg*2])+__popc(s_members[leg*2+1]);
+            offset += ((count+3)&~3)+4;
+        }
+        s_leg_offset[lane] = offset;
+        s_leg_count[lane] = __popc(s_members[lane*2])+__popc(s_members[lane*2+1]);
+    }
+    for (int e = lane; e < 3*LP; e += NT) s_Yt[6*YS+e] = 0.0f;
+    for (int e = lane; e < LP; e += NT) s_leg_y[e] = 0.0f;
+    SYNC();
+    if (lane < n_rows) {
+        s_pos0[lane] = -1; s_pos1[lane] = -1;
+        for (int d = 0; d < 6; ++d) s_Yt[d*YS+lane] = Jr[d];
+        for (int slot = 0; slot < 2; ++slot) {
+            const int leg = slot == 0 ? s_tag0[lane] : s_tag1[lane];
+            if (leg >= 0) {
+                const unsigned before = (1u << (lane & 31))-1u;
+                int rank = __popc(s_members[leg*2+(lane>>5)] & before);
+                if (lane >= 32) rank += __popc(s_members[leg*2]);
+                const int pos = s_leg_offset[leg]+rank;
+                if (slot == 0) s_pos0[lane] = pos; else s_pos1[lane] = pos;
+                s_leg_y[pos] = s_lam0[lane];
+                for (int d = 0; d < 3; ++d) BR_LEG_Z(d,pos) = Jr[6+3*slot+d];
+            }
+        }
+    }
+    SYNC();
 """
     source = once(source, ink_stage, stage, count=2)
     macros = r"""
 #define BR_LI(r,c) ((r)<12 ? 6*((r)/3)+((r)%3)*(((r)%3)+1)/2+(c)%3 : 24+12*((r)-12)+((r)-12)*((r)-11)/2+(c))
-#define BR_SLOT(d,i) ((d)>=12 ? (d)-12 : (s_tag0[i]==(d)/3 ? 6+(d)%3 : (s_tag1[i]==(d)/3 ? 9+(d)%3 : -1)))
-#define BR_Z(d,i) (BR_SLOT(d,i)>=0 ? s_Yt[BR_SLOT(d,i)*YS+(i)] : 0.0f)
+    // At most two legs per row. Four independently padded leg lists need no
+    // more than 2*AM+12 rounding slots plus four spare float4s.
+    constexpr int LP = 2*AM+28;
+#define BR_LEG_Z(d,pos) s_Yt[6*YS+(d)*LP+(pos)]
     __shared__ int s_tag0[AM], s_tag1[AM];
+    __shared__ int s_pos0[AM], s_pos1[AM];
+    __shared__ int s_leg_offset[4], s_leg_count[4];
+    __shared__ __align__(16) float s_leg_y[LP];
     __shared__ unsigned s_members[8];
     for (int e = lane; e < 8; e += NT) s_members[e] = 0u;
 """
     source = once(source, "    __shared__ float s_v[18];", macros + "\n    __shared__ float s_v[18];")
     source = once(source, "float Jr[18];", "float Jr[12];")
     source = once(source, "for (int d = 0; d < 18; ++d) Jr[d] = 0.0f;", "for (int d = 0; d < 12; ++d) Jr[d] = 0.0f;")
-    source = once(source, "float s_Yt[1 ? YS * 18 : 4]", "float s_Yt[YS * 12]")
+    source = once(source, "float s_Yt[1 ? YS * 18 : 4]", "float s_Yt[6*YS+3*LP]")
     source = once(source, "float s_L[1 ? (18 * 18 + (0 > 0 ? 0 * 0 : 1)) : 1]", "float s_L[117]")
-    source = once(source, "for (int e = lane; e < 18 * 4; e += NT)", "for (int e = lane; e < 12 * 4; e += NT)")
-    source = once(source, "const float yv = s_Yt[d * YS + j];", "const float yv = BR_Z(d, j);")
+    source = once(source, "for (int e = lane; e < 18 * 4; e += NT)", "for (int e = lane; e < 6 * 4; e += NT)")
+    start = source.index("    // b'_i = rhs_i + J_i . (v_in - Y^T lam0)")
+    end = source.index("    SYNC();\n    for (int i = lane; i < n_rows; i += NT)", start)
+    source = (
+        source[:start]
+        + r"""
+    // Initial warm action uses the same packed row ownership as every sweep.
+    for (int d = lane; d < 18; d += NT) {
+        const int offset = d >= 12 ? 0 : s_leg_offset[d/3];
+        const int count = d >= 12 ? n_rows : s_leg_count[d/3];
+        const float* z = d >= 12 ? &s_Yt[(d-12)*YS] : &BR_LEG_Z(d%3,offset);
+        const float* a = d >= 12 ? s_lam0 : &s_leg_y[offset];
+        float acc = 0.0f;
+        for (int j = 0; j < count; ++j) acc += z[j]*a[j];
+        s_dv[d] = -acc;
+    }
+"""
+        + source[end:]
+    )
     for dest in ("b", "r"):
         old = f"for (int d = 0; d < 18; ++d) {dest} += Ji[d] * s_dv[d];"
         new = f"for (int d = 0; d < 6; ++d) {dest} += Ji[d] * s_dv[12+d];\n"
@@ -469,8 +522,8 @@ def compact_source(source, ink_stage):
                 for (int slot = 0; slot < 2; ++slot) {
                     const int tag = slot == 0 ? s_tag0[i] : s_tag1[i];
                     if (tag >= 0) {
-                        const int other = s_tag0[j] == tag ? 6 : s_tag1[j] == tag ? 9 : -1;
-                        if (other >= 0) for (int d = 0; d < 3; ++d) acc += Ji[6+3*slot+d]*s_Yt[(other+d)*YS+j];
+                        const int pos = s_tag0[j] == tag ? s_pos0[j] : s_tag1[j] == tag ? s_pos1[j] : -1;
+                        if (pos >= 0) for (int d = 0; d < 3; ++d) acc += Ji[6+3*slot+d]*BR_LEG_Z(d,pos);
                     }
                 }"""
     source = once(source, old, new)
@@ -480,44 +533,71 @@ def compact_source(source, ink_stage):
         source[:start]
         + r"""
             constexpr int NCH = NT/18;
-            const int per = (((n_rows+3)/4)+NCH-1)/NCH;
             if (lane < NCH*18) {
                 const int d = lane%18, ch = lane/18;
-                float acc = 0.0f;
-                if (d >= 12) {
-                    const float4* y4 = reinterpret_cast<const float4*>(s_y);
-                    const float4* z4 = reinterpret_cast<const float4*>(&s_Yt[(d-12)*YS]);
-                    float a0=0.0f,a1=0.0f,a2=0.0f,a3=0.0f;
-                    const int end = min((n_rows+3)/4,(ch+1)*per);
-                    for (int j = ch*per; j < end; ++j) {
-                        const float4 y=y4[j], z=z4[j];
-                        a0+=z.x*y.x; a1+=z.y*y.y; a2+=z.z*y.z; a3+=z.w*y.w;
-                    }
-                    acc=(a0+a1)+(a2+a3);
-                } else {
-                    const int leg = d/3;
-                    unsigned long long members = s_members[leg*2] | ((unsigned long long)s_members[leg*2+1]<<32);
-                    const int lo=ch*per*4, hi=min(n_rows,(ch+1)*per*4);
-                    if (lo>=64 || lo>=hi) members=0;
-                    else { members &= ~0ull<<lo; if (hi<64) members &= (1ull<<hi)-1; }
-                    while (members) {
-                        const int j = __ffsll(members)-1;
-                        acc += BR_Z(d,j)*s_y[j];
-                        members &= members-1;
-                    }
+                const int offset = d >= 12 ? 0 : s_leg_offset[d/3];
+                const int count = d >= 12 ? n_rows : s_leg_count[d/3];
+                const int n4 = (count+3)/4, per = (n4+NCH-1)/NCH;
+                const float* yp = d >= 12 ? s_y : &s_leg_y[offset];
+                const float* zp = d >= 12 ? &s_Yt[(d-12)*YS] : &BR_LEG_Z(d%3,offset);
+                const float4* y4 = reinterpret_cast<const float4*>(yp);
+                const float4* z4 = reinterpret_cast<const float4*>(zp);
+                float a0=0.0f,a1=0.0f,a2=0.0f,a3=0.0f;
+                const int end = min(n4,(ch+1)*per);
+                for (int j = ch*per; j < end; ++j) {
+                    const float4 y=y4[j], z=z4[j];
+                    a0+=z.x*y.x; a1+=z.y*y.y; a2+=z.z*y.z; a3+=z.w*y.w;
                 }
-                s_dvp[ch*18+d] = acc;
+                const float acc=(a0+a1)+(a2+a3);
+                if (NCH == 1) s_dv[d] = acc;
+                else s_dvp[ch*18+d] = acc;
             }
             SYNC();
-            for (int d=lane; d<18; d+=NT) {
-                float acc=0.0f;
-                for (int ch=0; ch<NCH; ++ch) acc+=s_dvp[ch*18+d];
-                s_dv[d]=acc;
+            if (NCH > 1) {
+                for (int d=lane; d<18; d+=NT) {
+                    float acc=0.0f;
+                    for (int ch=0; ch<NCH; ++ch) acc+=s_dvp[ch*18+d];
+                    s_dv[d]=acc;
+                }
+                SYNC();
             }
-            SYNC();"""
+"""
         + source[end:]
     )
-    source = once(source, "u += ZAT(d, i) * a;", "u += BR_Z(d, i) * a;")
+    source = once(
+        source,
+        "s_y[i] = x_new[q] + beta * (x_new[q] - x_old[q]);",
+        """s_y[i] = x_new[q] + beta * (x_new[q] - x_old[q]);
+                // Publish the one/two packed aliases before the original sweep fence.
+                if (s_pos0[i] >= 0) s_leg_y[s_pos0[i]] = s_y[i];
+                if (s_pos1[i] >= 0) s_leg_y[s_pos1[i]] = s_y[i];""",
+    )
+    start = source.index("    // u = Z^T (x - lam0)")
+    end = source.index("    SYNC();\n    if (lane == 0)", start)
+    source = (
+        source[:start]
+        + r"""
+    // Final physical action uses the same contiguous panels, not tag gathers.
+    if (lane < n_rows) {
+        const float a = s_x[lane]-s_lam0[lane];
+        if (s_pos0[lane] >= 0) s_leg_y[s_pos0[lane]] = a;
+        if (s_pos1[lane] >= 0) s_leg_y[s_pos1[lane]] = a;
+    }
+    SYNC();
+    for (int d = lane; d < 18; d += NT) {
+        const int offset = d >= 12 ? 0 : s_leg_offset[d/3];
+        const int count = d >= 12 ? n_rows : s_leg_count[d/3];
+        const float* z = d >= 12 ? &s_Yt[(d-12)*YS] : &BR_LEG_Z(d%3,offset);
+        float u = 0.0f;
+        for (int j = 0; j < count; ++j) {
+            const float a = d >= 12 ? s_x[j]-s_lam0[j] : s_leg_y[offset+j];
+            if (a != 0.0f) u += z[j]*a;
+        }
+        s_dv[d] = u;
+    }
+"""
+        + source[end:]
+    )
     start = source.index("    if (lane == 0) {\n        for (int a = 18 - 1; a >= 0; --a)")
     end = source.index("    if (0 > 0 && ink_gb >= 0 && lane", start)
     backward = ["    if (lane == 0) {"]
@@ -529,7 +609,7 @@ def compact_source(source, ink_stage):
     backward.append("    }\n")
     source = source[:start] + "\n".join(backward) + source[end:]
     source = once(source, "v_out.data[global_dof] = s_v[d] + s_dv[d];", "v_out.data[global_dof] = s_v[d] + s_dv[17-d];")
-    return source.replace("#undef A_AT", "#undef BR_LI\n#undef BR_SLOT\n#undef BR_Z\n#undef A_AT")
+    return source.replace("#undef A_AT", "#undef BR_LI\n#undef BR_LEG_Z\n#undef A_AT")
 
 
 def supported(s):
@@ -650,9 +730,11 @@ class BranchResponse:
         dummy = wp.empty((1, 1, 1), dtype=float, device=device)
         solver.H_by_size[18] = dummy
         solver.L_by_size[18] = dummy
-        solver._H_bufs = None
-        solver._J_bufs = None
-        solver._memset_stream = None
+        if solver._H_bufs is not None:
+            # Retire mass storage, not the existing J ping-pong/active-clear
+            # owner. Both original banks now select only this H placeholder.
+            for bank in solver._H_bufs:
+                bank[18] = dummy
 
     def begin(self):
         """Reject new unsupported ownership before retired storage can be touched."""
