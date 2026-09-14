@@ -307,6 +307,105 @@ class TestSparseFactor(unittest.TestCase):
             sf.make_plan(f["model"])
 
 
+class TestSparseLevelUpdate(unittest.TestCase):
+    """Check exact level-owned updates without changing the held representation."""
+
+    def test_level_schedule_owns_exact_schur_terms(self):
+        """Cover each actual Schur product once with conflict-free destinations."""
+        self.assertTrue(callable(getattr(sf, "_level_update_schedule", None)))
+        f = fixture()
+        index = f["host"]["index"]
+        rows, cols = f["host"]["row"], f["host"]["col"]
+        schedule = sf._level_update_schedule(index)
+        offsets = schedule["level_offsets"]
+        pivots, scales = schedule["level_pivots"], schedule["level_scales"]
+        entries, starts = schedule["level_entries"], schedule["level_term_offsets"]
+        terms = schedule["level_terms"]
+        self.assertEqual(offsets.shape, (16, 3))
+        self.assertEqual(offsets[-1].tolist(), [43, 391, 1142])
+        self.assertEqual(terms.shape, (2242, 2))
+        self.assertEqual(sorted(pivots.tolist()), list(range(43)))
+        self.assertEqual(sorted(scales.tolist()), np.flatnonzero(rows > cols).tolist())
+        levels = np.empty(43, np.int32)
+        for level in range(15):
+            levels[pivots[offsets[level, 0] : offsets[level + 1, 0]]] = level
+        coverage, longest = [], []
+        for level in range(15):
+            current = pivots[offsets[level, 0] : offsets[level + 1, 0]]
+            self.assertEqual(current.tolist(), sorted(current.tolist()))
+            for col in current:
+                self.assertTrue(np.all(levels[np.flatnonzero(index[col, :col] >= 0)] < level))
+            tasks = range(int(offsets[level, 2]), int(offsets[level + 1, 2]))
+            destinations = [int(entries[task]) for task in tasks]
+            self.assertEqual(len(destinations), len(set(destinations)))
+            longest.append(max((int(starts[t + 1] - starts[t]) for t in tasks), default=0))
+            for task in tasks:
+                entry = int(entries[task])
+                r, c = int(rows[entry]), int(cols[entry])
+                self.assertGreater(levels[c], level)
+                expected = [
+                    (int(index[r, k]), int(index[c, k])) for k in current if index[r, k] >= 0 and index[c, k] >= 0
+                ]
+                self.assertEqual([tuple(x) for x in terms[starts[task] : starts[task + 1]]], expected)
+                for x, y in expected:
+                    self.assertEqual(cols[x], cols[y])
+                    coverage.append((entry, int(cols[x])))
+        expected = [
+            (e, k)
+            for e, (r, c) in enumerate(zip(rows, cols, strict=True))
+            for k in range(c)
+            if index[r, k] >= 0 and index[c, k] >= 0
+        ]
+        self.assertEqual(sorted(coverage), expected)
+        self.assertEqual(sum(longest), 42)
+        self.assertEqual(max(longest), 8)
+        broken = index.copy()
+        broken[42, 42] = -1
+        with self.assertRaises(ValueError):
+            sf._level_update_schedule(broken)
+
+    def test_level_factor_actual_operator_and_owner_admission(self):
+        """Reconstruct actual augmented H and retain the unchanged inverse action."""
+        with patch.dict(os.environ, {"FEATHER_PGS_SPARSE_LEVEL_UPDATE": "1"}):
+            f = fixture()
+        o, host = f["owner"], f["host"]
+        self.assertTrue(o.level_update)
+        self.assertEqual(o.kernels.refresh.key, "sparse_factor_level_update43_434")
+        self.assertEqual(o.data.W.shape, (1, 434))
+        self.assertEqual(o.data.Z.shape, (1, 100, 18))
+        schedule = sf._level_update_schedule(host["index"])
+        rows, cols, index = host["row"], host["col"], host["index"]
+        original = f["H"][::-1, ::-1]
+        a = original[rows, cols].astype(np.float32)
+        offsets = schedule["level_offsets"]
+        for level in range(15):
+            for k in schedule["level_pivots"][offsets[level, 0] : offsets[level + 1, 0]]:
+                a[index[k, k]] = np.sqrt(a[index[k, k]])
+            for entry in schedule["level_scales"][offsets[level, 1] : offsets[level + 1, 1]]:
+                a[entry] /= a[index[cols[entry], cols[entry]]]
+            for task in range(int(offsets[level, 2]), int(offsets[level + 1, 2])):
+                entry = schedule["level_entries"][task]
+                start, end = schedule["level_term_offsets"][task : task + 2]
+                for x, y in schedule["level_terms"][start:end]:
+                    a[entry] -= a[x] * a[y]
+        L = np.zeros((43, 43), np.float64)
+        L[rows, cols] = a
+        np.testing.assert_allclose(L @ L.T, original, rtol=3e-5, atol=3e-6)
+        W = np.linalg.solve(L, np.eye(43))
+        tau = np.random.default_rng(38).normal(0, 0.2, 43)
+        np.testing.assert_allclose(W.T @ (W @ tau), np.linalg.solve(original, tau), rtol=2e-4, atol=3e-5)
+        with patch.dict(os.environ, {"FEATHER_PGS_SPARSE_LEVEL_UPDATE": "0"}):
+            original_plan, _ = sf.make_plan(f["model"], f["solver"])
+            original_owner = sf.SparseFactor(f["solver"], original_plan, host)
+        self.assertFalse(original_owner.level_update)
+        for name in schedule:
+            self.assertIsNone(getattr(original_owner.plan, name))
+        self.assertEqual(original_owner.kernels.refresh.key, "sparse_factor_refresh43_434")
+        self.assertIs(original_owner.kernels.predictor, o.kernels.predictor)
+        self.assertIs(original_owner.kernels.contacts, o.kernels.contacts)
+        self.assertIs(original_owner.kernels.solve, o.kernels.solve)
+
+
 class TestSparseParallelLimits(unittest.TestCase):
     """Check the isolated global-row prefix on the original actual-tree fixture."""
 
@@ -454,6 +553,9 @@ class TestSparseFactorCUDA(unittest.TestCase):
         if os.environ.get("FEATHER_PGS_SPARSE_PARALLEL_LIMITS") == "1":
             self.assertTrue(candidate._sparse_factor.parallel_limit_prefix)
             self.assertEqual(candidate._sparse_factor.kernels.prefix.key, "sparse_factor_parallel_limit_prefix43")
+        if os.environ.get("FEATHER_PGS_SPARSE_LEVEL_UPDATE") == "1":
+            self.assertTrue(candidate._sparse_factor.level_update)
+            self.assertEqual(candidate._sparse_factor.kernels.refresh.key, "sparse_factor_level_update43_434")
         original_states = [m.state(), m.state()]
         candidate_states = [m.state(), m.state()]
         original_states[0].assign(state)
@@ -506,6 +608,9 @@ class TestSparseFactorCUDA(unittest.TestCase):
             self.assertTrue(o.parallel_limit_prefix)
             self.assertFalse(o.packet_rows)
             self.assertEqual(o.kernels.prefix.key, "sparse_factor_parallel_limit_prefix43")
+        if os.environ.get("FEATHER_PGS_SPARSE_LEVEL_UPDATE") == "1":
+            self.assertTrue(o.level_update)
+            self.assertEqual(o.kernels.refresh.key, "sparse_factor_level_update43_434")
         o.refresh(s)
         o.check()
         W = unpack(o)

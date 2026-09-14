@@ -25,6 +25,12 @@ class SparsePlan:
     row: wp.array[int]
     col: wp.array[int]
     source: wp.array[int]
+    level_offsets: wp.array2d[int]
+    level_pivots: wp.array[int]
+    level_scales: wp.array[int]
+    level_entries: wp.array[int]
+    level_term_offsets: wp.array[int]
+    level_terms: wp.array2d[int]
     inverse_nodes: wp.array2d[int]
     inverse_count: wp.array[int]
     support_nodes: wp.array2d[int]
@@ -49,6 +55,55 @@ class SparseData:
     Z: wp.array3d[float]
     support: wp.array2d[int]
     incident: wp.array2d[float]
+
+
+def _level_update_schedule(index):
+    """Compile exact right-looking Schur ownership for the admitted topology."""
+    if index.shape != (43, 43):
+        raise ValueError("Sparse level updates require the checked 43-coordinate pattern")
+    return _level_update_schedule_cached(tuple(index.ravel()))
+
+
+@cache
+def _level_update_schedule_cached(pattern):
+    """Share immutable exact-size schedule data across model notifications."""
+    index = np.asarray(pattern, dtype=np.int32).reshape(43, 43)
+    rows, cols = np.nonzero(index >= 0)
+    if len(rows) != 434 or not np.array_equal(index[rows, cols], np.arange(434)) or np.any(rows < cols):
+        raise ValueError("Sparse level updates require the checked packed lower triangle")
+    levels = np.zeros(43, np.int32)
+    for col in range(43):
+        previous = np.flatnonzero(index[col, :col] >= 0)
+        levels[col] = 0 if not len(previous) else 1 + max(levels[previous])
+    if np.any(np.diag(index) < 0) or max(levels) != 14:
+        raise ValueError("Sparse level dependency depth differs from the checked tree")
+    offsets, pivots, scales, entries, starts, terms = [(0, 0, 0)], [], [], [], [0], []
+    for level in range(15):
+        current = np.flatnonzero(levels == level)
+        pivots.extend(current)
+        scales.extend(np.flatnonzero((rows > cols) & (levels[cols] == level)))
+        for entry, (row, col) in enumerate(zip(rows, cols, strict=True)):
+            if levels[col] <= level:
+                continue
+            update = [(index[row, k], index[col, k]) for k in current if index[row, k] >= 0 and index[col, k] >= 0]
+            if update:
+                entries.append(entry)
+                terms.extend(update)
+                starts.append(len(terms))
+        offsets.append((len(pivots), len(scales), len(entries)))
+    if offsets[-1] != (43, 391, 1142) or len(terms) != 2242:
+        raise ValueError("Sparse level update work differs from the checked tree")
+    result = {
+        "level_offsets": np.asarray(offsets, dtype=np.int32),
+        "level_pivots": np.asarray(pivots, dtype=np.int32),
+        "level_scales": np.asarray(scales, dtype=np.int32),
+        "level_entries": np.asarray(entries, dtype=np.int32),
+        "level_term_offsets": np.asarray(starts, dtype=np.int32),
+        "level_terms": np.asarray(terms, dtype=np.int32),
+    }
+    for values in result.values():
+        values.setflags(write=False)
+    return result
 
 
 def make_plan(model, solver=None):
@@ -206,7 +261,7 @@ def make_plan(model, solver=None):
 
 
 @cache
-def get_refresh_kernel():
+def get_refresh_kernel(level_update=False):
     """Build the packed held inverse-whitener directly from current CRBA inputs."""
     source = r"""
 #if defined(__CUDA_ARCH__)
@@ -292,6 +347,46 @@ def get_refresh_kernel():
     if (threadIdx.x == 0) { if (bad) atomicOr(&d.status.data[world], 1); d.valid.data[world] = bad == 0; }
 #endif
 """
+    if level_update:
+        start = source.index("    for (int k = 0; k < 43; ++k) {")
+        end = source.index("    for (int col = threadIdx.x; col < 43; col += blockDim.x) {", start)
+        source = (
+            source[:start]
+            + r"""
+    // Columns within a level are independent, but their ancestor Schur
+    // destinations overlap. One destination owner gathers this level only.
+    for (int level = 0; level < 15; ++level) {
+        const int begin = 3*level, end = 3*(level+1);
+        for (int task = p.level_offsets.data[begin]+threadIdx.x;
+             task < p.level_offsets.data[end]; task += blockDim.x) {
+            const int k = p.level_pivots.data[task];
+            const int diag = p.index.data[k*43+k];
+            if (!(a[diag] > 0.0f) || !isfinite(a[diag])) atomicExch(&bad, 1);
+            a[diag] = sqrtf(a[diag]);
+        }
+        __syncthreads();
+        for (int task = p.level_offsets.data[begin+1]+threadIdx.x;
+             task < p.level_offsets.data[end+1]; task += blockDim.x) {
+            const int entry = p.level_scales.data[task];
+            const int col = p.col.data[entry];
+            a[entry] /= a[p.index.data[col*43+col]];
+        }
+        __syncthreads();
+        for (int task = p.level_offsets.data[begin+2]+threadIdx.x;
+             task < p.level_offsets.data[end+2]; task += blockDim.x) {
+            const int entry = p.level_entries.data[task];
+            float value = a[entry];
+            for (int term = p.level_term_offsets.data[task];
+                 term < p.level_term_offsets.data[task+1]; ++term) {
+                value -= a[p.level_terms.data[2*term]] * a[p.level_terms.data[2*term+1]];
+            }
+            a[entry] = value;
+        }
+        __syncthreads();
+    }
+"""
+            + source[end:]
+        )
 
     @wp.func_native(source)
     def native(
@@ -327,7 +422,9 @@ def get_refresh_kernel():
         group, _ = wp.tid()
         native(group, p, d, mask, S, I, R, drive_row, K, drive_counts, drive_dofs, drive_stride, parallel_drives)
 
-    refresh.__name__ = refresh.__qualname__ = "sparse_factor_refresh43_434"
+    refresh.__name__ = refresh.__qualname__ = (
+        "sparse_factor_level_update43_434" if level_update else "sparse_factor_refresh43_434"
+    )
     return wp.kernel(enable_backward=False, module="unique")(refresh)
 
 
@@ -417,6 +514,10 @@ class SparseFactor:
         )
 
         self.solver, self.plan, self.host = solver, plan, host
+        self.level_update = os.environ.get("FEATHER_PGS_SPARSE_LEVEL_UPDATE") == "1"
+        if self.level_update:
+            for name, values in _level_update_schedule(host["index"]).items():
+                setattr(plan, name, wp.array(values, dtype=int, device=solver.model.device))
         self.data = SparseData()
         w, c, device = solver.world_count, solver.dense_max_constraints, solver.model.device
         self.data.W = wp.empty((w, 434), dtype=float, device=device)
@@ -431,7 +532,7 @@ class SparseFactor:
         self.data.incident = wp.empty((1, 1) if self.packet_rows else (w, c), dtype=float, device=device)
         self.kernels = SimpleNamespace(
             prefix=get_parallel_limit_kernel() if self.parallel_limit_prefix else build_limit_prefix,
-            refresh=get_refresh_kernel(),
+            refresh=get_refresh_kernel(self.level_update),
             predictor=get_predictor_kernel(),
             contacts=get_contact_kernel(),
             solve=get_solve_kernel(c),
