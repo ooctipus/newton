@@ -411,3 +411,87 @@ Artifact `/tmp/fpgs-franka-notification-validation-paired16k-20260914-01`,
 manifest SHA256
 `ed3a7098d2b8c7207ce0a38a80f14e0de910ccd183e96fd57b2afd35215cf743`.
 Two alternating paired repeats are queued after the current Allegro node run.
+
+## Mid-window checkpoint, approximately13:20 UTC
+
+Franka's two alternating repeats preserve the large host-side result:
+RTX wall median62.881182->28.905997ms (2.175368x),
+GB63.050704->28.939305ms (2.178722x). Physics remains effectively unchanged
+at5.527632->5.483634ms RTX /5.036061->5.012089ms GB. All eight captures'
+original capacity/source/final-idle checks pass, with unchanged physics budgets.
+Runtime99c796ca and report-only04b2328e are pushed on the notification branch.
+Artifact `/tmp/fpgs-franka-notification-validation-paired16k-20260914-repeat02`,
+manifest01994506d028ffeff980c8738b8d89daefbfe86dd147df5eda94ffd956fedbb0.
+This is not a4x physics result or evidence of faster RL training.
+
+### Compact G1: numerical pass, diagnosed complete-step miss
+
+Frozen compact runtime `dd05a1e53b2c795db4e812931eeb3e38abfc7cf2` passes
+all three actual CUDA physical/lifecycle selectors on each GPU, including
+current forces, compact mass, original integration, held factor, reset and
+empty/regrowing graph transitions. Whole physics is18.157995->17.883307ms
+RTX (1.015360x),20.875017->23.143626ms GB (0.901977x). Do not promote.
+Whole artifact `/tmp/fpgs-g1-compact-paired16k-20260914-01`.
+
+Strict matched attribution includes12physics+3auxiliary roots and all device
+memory/correlations, preserving the generic analyzer's original auxiliary-root
+rejections. New publication increases2.439264->3.129909ms RTX and
+1.621152->3.781076ms GB. The retained factor is faster, not the cause of
+the loss. Complete touched producers plus retained factor exclusive time is
+6.674709->6.590537ms RTX /4.536299->6.987038ms GB. Original tau/factor and
+tau/composite overlap is also partly lost; summed savings are not additive.
+Audit `/tmp/fpgs-g1-compact-checked-oyNUm1/NODE_AUDIT_COMPLETE.json`.
+
+The source exposes a specific mapping mismatch: new publication uses one
+world per64threads, whereas the old template owner packs two worlds into32.
+The eleven tree levels have at most seven bodies each. Fund one correction
+using four independent eight-lane worlds perwarp, charging its larger shared
+storage and preserving all44 current public bodies and compact moments.
+No factor retuning or mapping sweep. Source/CPU/AOT checkpoint14:00,
+whole-cost decision14:25. This correction is unmeasured.
+
+### Allegro: valid causal counts, one ownership correction
+
+Matched original four-owner collision time grows3.547650->5.613530ms RTX,
+4.531648->6.819508ms GB. MPR and GJK each contribute approximately1ms of
+RTX loss; unrelated owners remain near-flat. Production remains99a23652,
+default-off and unpromoted.
+
+The first diagnostic histogram is INVALID: it allocated for the constructor's
+thread count before Lab applied its existing4x multiplier. Preserve artifact01
+but withdraw every count from it. Corrected probe02 asserts the final worker
+domain before enabling its counters and passes original source/capacity/final
+idle checks. The valid RTX sample contains267.385M MPR callbacks with98.373%
+terminal certificates and278.110M GJK callbacks with92.547%. Neighbor loads
+remain17.674/15.909 percallback across3.213/2.844 dependent hill rounds.
+Instrumentation perturbs owner times; these are counts, NOT performance.
+Evidence `/tmp/fpgs-allegro-hill-callback-counts-fixed-UXhOGD/RESULT.md`;
+valid artifact `/tmp/fpgs-allegro-hill-callback-counts-paired16k-20260914-02`.
+
+Fund one distinct correction: keep support hints in per-query shared cells,
+loading/flushing persistent hints once perquery instead of publishing every
+callback to global memory. Keep original geometry, terminal proof and full
+fallback. Charge1024B per cold/manifold block and all query lifetime seams.
+This removes intermediate hint traffic but retains dependent CSR traversal;
+the required approximately3.49ms candidate reduction is NOT established by
+callback counts. Source/CPU/AOT checkpoint14:00, whole decision14:25.
+
+### Recover and qualify the actual Kuka win
+
+The old live kinetic runtime `ad42fea95fd44cd5ec72afa1be1cce570b45109a`
+was a measured RTX gain with incomplete live-contact qualification, NOT a
+closed whole-cost loss. Do not confuse it with its failed first-hit successor.
+One fresh current-capacity comparison against7df uses the same six established
+Kuka flags, with only KINETIC_WORLD added to the candidate. Raw311296,
+broad442368, dense192/MF64/prop192 and original eight sweeps/two substeps
+are unchanged between arms.
+
+RTX physics12.357853->10.909528ms (1.132758x), GB11.934729->11.218563ms
+(1.063838x). RTX whole wall36.390353->35.781557ms, but GB worsens
+34.022117->36.469050ms. This is one discovery, not promotion or a fresh
+MJWarp ratio. Original checks pass; artifact
+`/tmp/fpgs-kuka-kinetic-current-capacity-paired16k-20260914-01`.
+The next check samples real post-warm refresh/held Solver.step calls and
+compares current contact/control inputs to the original eight-sweep numerical
+law before original finish mutates current state. No copied saved population
+substitutes for that live qualification. Missing cohorts remain unqualified.
