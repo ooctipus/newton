@@ -1,6 +1,6 @@
 # Structural window: integrated discoveries
 
-Checkpoint: 2026-09-14 02:20 UTC. Work continues toward the 24-hour window in
+Checkpoint: 2026-09-14 03:24 UTC. Work continues toward the 24-hour window in
 `STRUCTURAL_FOURX_20260913.md`; the 4x target is **not achieved**. These are
 discoveries, not replacements for accepted baselines except where repeat
 evidence is explicitly given. No candidate has met the complete 4x target.
@@ -13,6 +13,64 @@ failure and the unreduced fixture-capacity failure remain preserved, not
 erased. The latest finite/weld source remains default-off; its fresh shared-MJ
 comparison passes, while repeated timing remains. Do not use old rejected variants
 as performance denominators.
+
+## Further structural screens (September14,03:24)
+
+The direct speculative-face shortcut passed paired physical checks but saved
+only0.169841ms RTX/0.449375ms GB whole physics. One bounded node diagnosis
+shows only0.167251/0.490507ms saved in the finite producer, with retained
+fallback near unchanged. This is insufficient work removal, not a hidden
+large gain erased elsewhere. Closed without composition or tuning; report
+branch `ooctipus/g1-direct-speculative-face-20260914`, runtime d3ccebff,
+report03209d7d, is pushed to the ooctipus fork.
+
+Allegro's8a shell now has a valid, equal-capacity whole result after measured
+demand calibration. Rows240/raw393216, MF64/broad524288 and original12/24
+allowances are identical in both arms. Actual whole physics regresses
+17.326773->130.477195ms RTX and16.987419->105.718710ms GB; all capacity,
+actual ownership and source/idle checks pass. Shell construction alone costs
+102.488358/76.867317ms in the bounded node diagnostic, with substantially
+more downstream solver work. Closed as an expensive representation, not
+scheduled for block-size tuning. Complete diagnosis, earlier physical
+failures, epoch fix and calibrated demand are preserved in
+`ooctipus/convex-shell-warm-20260913`, pushed through reportec874a4d.
+Whole manifest SHA256
+`afe6400323063f786fb5ab1115d1c2a8ae0389d3147bd9078eb0d53a28ab7132`.
+
+Independent process-correlated interval accounting includes all kernel and
+memory nodes. Shell-exclusive busy102.488337/76.867120ms; retained non-shell
+busy28.967640/29.545502ms, with only0.000021/0.000181ms overlap. Removing graph
+gaps from the earlier subtraction does not rescue the representation: the
+retained work alone exceeds the whole baseline by11.64/12.56ms. This is
+captured-work accounting, not a measured hypothetical optimized runtime.
+
+The next G1 candidate retains the repeated parallel-limit gain below and
+changes only sparse factorization's Schur update schedule. Runtime
+`3ca99cc3633c60fbe6b179837fd62c20fe2520e9` uses15 independent-pivot levels,
+1142 actual update destinations rather than18662 candidate visits, and45
+factor barriers rather than129. All2242 mathematical products and the
+original inverse W/contact/PGS representation remain. Unlike the earlier
+closed left-looking schedule, per-level gathers have at most8 terms rather
+than late37–42-term chains. Thirteen CPU controls, native compilation and
+four physical selectors/card pass. Its paired complete A/B against da85 now
+finishes: RTX21.148316->20.354962ms (1.038976x), GB26.345063->25.414346ms
+(1.036622x), saving0.793355/0.930717ms. All original capacity, actual-owner,
+source and idle guards pass. One discovery, not repeated acceptance or a
+ratio versus MJWarp. Whole manifest075bc336f15c491d8202f77874e5bebb5296a8846146faa02598d5c92af99bee.
+
+One bounded node diagnosis measures refresh2.334110/1.770069ms versus prior
+unchanged factor3.184972/2.816128ms. GS, collision and publication stay near
+flat; the gain is not erased downstream. Retain the default-off experiment
+without another level/inverse tuning campaign. Node parent preserves the
+inherited auxiliary-analyzer failure; independent strict interval accounting
+and original source/capacity/actual/idle checks pass. Manifestda472575d3d91bf3d534e63e8c14f51b0a4b669a9302514bd9e8821b8f5bdc4e.
+
+The next CPU feasibility study asks whether spatial articulated elimination
+can retire composite inertia, scalar mass assembly/factor work and possibly
+the separate force-tree reduction together. No implementation or gain is
+claimed. Another contact-metadata cleanup is not funded: all non-prefix row
+producers/services together have only1.929665ms measured RTX exclusive cost,
+and the genuinely dead MF packing producer is just0.080288ms.
 
 ## Repeated G1 corrective gain (September14,02:20)
 
