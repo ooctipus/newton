@@ -1815,6 +1815,11 @@ class CollisionPipeline:
         self._convex_bsp_requested = convex_bsp == "1"
         coherent_convex = os.environ.get("NEWTON_NARROW_PHASE_COHERENT_CONVEX", "0")
         coherent_stats = os.environ.get("NEWTON_NARROW_PHASE_COHERENT_STATS", "0")
+        coherent_shell = os.environ.get("NEWTON_NARROW_PHASE_COHERENT_SHELL", "0")
+        if coherent_shell not in ("0", "1"):
+            raise ValueError("NEWTON_NARROW_PHASE_COHERENT_SHELL must be 0 or 1")
+        if coherent_shell == "1" and (coherent_convex != "reject_only" or convex_bsp != "1"):
+            raise ValueError("experimental coherent shell requires COHERENT_CONVEX=reject_only and CONVEX_BSP=1")
         if coherent_convex not in ("0", "reject_only") or coherent_stats not in ("0", "1"):
             raise ValueError(
                 "NEWTON_NARROW_PHASE_COHERENT_CONVEX must be 0 or reject_only; COHERENT_STATS must be 0 or 1"
@@ -2274,6 +2279,9 @@ class CollisionPipeline:
             from ..geometry.coherent_convex import _ConvexQueryCache  # noqa: PLC0415
             from ..geometry.coherent_convex_rejection import _create_rejection_query_kernels  # noqa: PLC0415
 
+            if coherent_shell == "1":
+                from ..geometry.coherent_convex_warm import _ConvexQueryCache  # noqa: PLC0415
+
             self.narrow_phase._coherent_cache = _ConvexQueryCache(
                 pairs=self.shape_pairs_filtered.numpy(),
                 shape_types=model.shape_type.numpy(),
@@ -2289,6 +2297,16 @@ class CollisionPipeline:
             self.narrow_phase._coherent_query_kernels = _create_rejection_query_kernels(
                 diagnostics=coherent_stats == "1"
             )
+            if coherent_shell == "1":
+                from ..geometry.coherent_convex_shell import _create_shell_kernel  # noqa: PLC0415
+                from ..geometry.coherent_convex_warm_queries import _create_query_kernels  # noqa: PLC0415
+                from ..geometry.convex_shell import _ShellOwner  # noqa: PLC0415
+
+                if self._convex_bsp is None:
+                    raise ValueError("experimental coherent shell requires an admitted immutable convex BSP provider")
+                self.narrow_phase._coherent_shell = _ShellOwner(model, self._convex_bsp)
+                self.narrow_phase._coherent_shell_kernel = _create_shell_kernel(self.narrow_phase._convex_writer_func)
+                self.narrow_phase._coherent_query_kernels = _create_query_kernels(diagnostics=coherent_stats == "1")
 
         # Built here (not in finalize) so models/tasks that never collide don't pay for it.
         # Host-side, so not graph-capture-safe -- construct the pipeline before any capture.

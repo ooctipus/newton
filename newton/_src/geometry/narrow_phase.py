@@ -2479,6 +2479,7 @@ class NarrowPhase:
         self.split_gjk_mpr = device_obj.is_cuda and has_generic_convex_pairs and split_gjk_mpr
         self._use_lean_gjk_mpr = use_lean_gjk_mpr
         self._coherent_cache = None
+        self._coherent_shell = None
         self._coherent_query_kernels = None
         # Create the appropriate kernel variants
         # Primitive kernel handles lightweight primitives and routes remaining pairs
@@ -2920,6 +2921,9 @@ class NarrowPhase:
                 if self._coherent_cache is not None:
                     from .coherent_convex_rejection import _PairInputs  # noqa: PLC0415
 
+                    if self._coherent_shell is not None:
+                        from .coherent_convex_warm_queries import _PairInputs  # noqa: PLC0415
+
                     self._coherent_cache.begin()
                     pair_inputs = _PairInputs()
                     for name, value in zip(
@@ -2952,7 +2956,7 @@ class NarrowPhase:
                         self.split_manifold_work_count,
                         *support_inputs,
                     ]
-                    for coherent_kernel in self._coherent_query_kernels:
+                    for stage, coherent_kernel in enumerate(self._coherent_query_kernels):
                         wp.launch(
                             kernel=coherent_kernel,
                             dim=self.total_num_threads,
@@ -2961,6 +2965,24 @@ class NarrowPhase:
                             block_dim=self.block_dim,
                             record_tape=False,
                         )
+                        if self._coherent_shell is not None and stage == 1:
+                            workers = self.total_num_threads // self.block_dim
+                            wp.launch(
+                                kernel=self._coherent_shell_kernel,
+                                dim=(workers, 32),
+                                inputs=[
+                                    convex_pairs,
+                                    pair_inputs,
+                                    self._coherent_cache.data,
+                                    workers,
+                                    self.split_query_results,
+                                    self._coherent_shell.data,
+                                    writer_data,
+                                ],
+                                device=device,
+                                block_dim=32,
+                                record_tape=False,
+                            )
                 else:
                     wp.launch(
                         kernel=self.narrow_phase_mpr_kernel,
