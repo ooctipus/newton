@@ -1,7 +1,7 @@
 # Pair-private terrain query and reduction
 
 Candidate funded 2026-09-15 13:46 UTC; first checkpoint 15:16 UTC. This is
-a default-off Newton collision experiment, currently a measured loss, based on retained
+a CLOSED, unpromoted default-off Newton collision experiment based on retained
 `ca0d427af809571bb5501f644c1a6e03990cd2a8`. Isaac Lab, task parameters,
 substeps, iterations and calibrated capacities remain unchanged. No parent
 dependency pointer change or accepted speedup is implied.
@@ -318,3 +318,57 @@ register-spill stores/loads. The code is only slightly smaller (SM120
 29,344 ->29,216 instructions). Exceptional normalized SASS instruction
 streams are exactly identical on both architectures. These CPU assembler
 facts are not achieved occupancy, driver-counter or timing evidence.
+
+## Close the fused pair-owner experiment, 15:18 UTC
+
+Final measured runtime is `a68ad0dc184284b8af9fcf677d339236688a91ba`.
+The valid RTX discovery still loses:15.633675 ->24.555561 ms physics,
+retained/candidate0.636665x. Environment wall29.317159 ->38.990825 ms,
+0.751899x. Parent54026 exits zero; source, both actual finite/capacity
+boundaries and selected-device final-idle checks pass. Artifact:
+`/tmp/fpgs-g1-pair-terrain-rtx16k-20260915-03`.
+
+The planned paired parent22163 stopped BEFORE launching simulations because
+an unrelated user started a GB300 process3040296. No process was interrupted.
+The original parser then rejected an explicit single-GPU invocation before
+creating output. A21-line source-pinned continuation narrows the already
+validated device list toRTX before enumeration, launching and final checks;
+all actual selected-device checks and original timing/budget law remain
+unchanged. Its manifest explicitly disclaims a simultaneous pair. Adapter:
+`/tmp/fpgs-g1-pair-terrain-single-card-Eh9GUsil/run.py`, SHA256
+`b627a3e210ba71d2a7bd65100b647ead9f7c5d4ff2040a08bd96c4dc5542d259`.
+
+GB300 became idle and the symmetric GB-only continuation started18434.
+Both simulations/source/capacity checks finished, but another unrelated
+process3046952 appeared before the final idle check. Parent18434 exits one.
+Therefore its20.476986 ->63.151481 ms raw physics values are INVALID comparison
+evidence and are not included in a valid GPU speedup table. Preserve artifacts
+`/tmp/fpgs-g1-pair-terrain-gb16k-20260915-03`; do not repeatedly compete with
+external jobs. GB-only adapter SHA256 is
+`5c16d94f7cbd467f560f81ca40925a3ce85ddb1f2749293a7f2a3dec33b03f0f`.
+All root GPU/profiler sessions from this experiment are reaped; no external
+process was signaled or modified.
+
+Decision: do not promote and do not run another mapping/register/slot sweep.
+The original global pipeline really was retired, capacities stayed intact,
+and two diagnosed implementation issues were addressed:16x underlaunch and
+shared64 winner-update lowering. Neither correction delivered a net gain.
+The replacement selection also adds scans; its loss does NOT prove a measured
+CAS stall fraction, memory-bound status or impossibility of pair-local
+ownership. This particular fused query/consumer mapping remains much slower
+than retained packed queries. No new MJWarp ratio, other-task benefit or
+accepted optimization is claimed. Retained ca0d and the fixed Lab are unchanged.
+
+Do not fund remaining high-mask/ULP fixture expansion or loaded-contact
+qualification for this losing candidate. Preserve the stated coverage gaps.
+The next distinct investigation measures complete-world row/solve bypass
+eligibility across the full16K retained population, using only an untimed
+last-solved-row census; it does not assume the biased historical16 cases are
+representative. No new runtime for that proposal is funded here.
+
+Exact local paired launch is preserved in
+`reports/fpgs/REPRO_G1_PAIR_TERRAIN_20260915.sh`; invoke it with `bash` and a
+fresh output directory. It depends on the source-pinned local observer/driver
+paths recorded above. Large captures and original worktrees remain local and
+unchanged. This script reproduces the closed candidate, NOT a recommended
+production setting.
