@@ -1807,6 +1807,9 @@ class SolverFeatherPGS(SolverBase):
             factor_dense_contract=self._fused_diagonal_joint_limits
         )
         self._sparse_diagonal_contact_solve = sparse_diagonal_pair is not None
+        self._sparse_readonly_rows = os.environ.get("FEATHER_PGS_SPARSE_READONLY_ROWS", "0") == "1"
+        if self._sparse_readonly_rows and not self._sparse_diagonal_contact_solve:
+            raise ValueError("read-only sparse rows require the sparse-diagonal response owner")
         if sparse_diagonal_pair is None:
             # Limit rows belong to this specialized owner. If the complete
             # response composition is unavailable, retain the ordinary rows.
@@ -5608,6 +5611,7 @@ class SolverFeatherPGS(SolverBase):
                 device_arch,
                 contact_triples=self._sparse_diagonal_contact_triples,
                 speculative_contact_batches=self._sparse_diagonal_speculative_contact_batches,
+                readonly_rows=self._sparse_readonly_rows,
             )
             if self._sparse_diagonal_contact_solve
             else None
@@ -22804,6 +22808,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
     *,
     contact_triples: bool = False,
     speculative_contact_batches: bool = False,
+    readonly_rows: bool = False,
 ) -> "wp.Kernel":
     """Build the persistent ``small dense + two sparse`` GS owner."""
     M = int(max_constraints)
@@ -22813,6 +22818,39 @@ def _get_pgs_solve_sparse_diagonal_kernel(
     if speculative_contact_batches and (not contact_triples or P + 2 > 8):
         raise ValueError("speculative contact batches require an eight-lane sparse contact triple")
     elems_per_lane = (D + 31) // 32
+
+    def row_read(field: str, row: str) -> str:
+        """Select resident staging or the current immutable producer value."""
+        if not readonly_rows:
+            return f"s_{field}[{row}]"
+        index = f"row_base + ({row})"
+        if field == "meta":
+            return (
+                f"((__ldg(&world_row_type.data[{index}]) & {_DENSE_META_ROW_TYPE_MASK})"
+                f" | ((__ldg(&world_row_parent.data[{index}]) + 1) << {_DENSE_META_ROW_TYPE_BITS}))"
+            )
+        array = {"rhs": "rhs_bias", "diag": "world_diag", "mu": "world_row_mu"}[field]
+        return f"__ldg(&{array}.data[{index}])"
+
+    row_shared = (
+        ""
+        if readonly_rows
+        else f"""    __shared__ float s_rhs[{M}];
+    __shared__ float s_diag[{M}];
+    __shared__ int s_meta[{M}];
+    __shared__ float s_mu[{M}];"""
+    )
+    row_staging = (
+        ""
+        if readonly_rows
+        else f"""        s_rhs[row] = rhs_bias.data[index];
+        s_diag[row] = world_diag.data[index];
+        const int row_type = world_row_type.data[index];
+        const int row_parent = world_row_parent.data[index];
+        s_meta[row] = (row_type & {_DENSE_META_ROW_TYPE_MASK})
+            | ((row_parent + 1) << {_DENSE_META_ROW_TYPE_BITS});
+        s_mu[row] = world_row_mu.data[index];"""
+    )
 
     limit_declarations = []
     limit_loads = []
@@ -22896,10 +22934,10 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                 const int normal_jy = normal_sparse_row * 4 + normal_slot * 2;
                 const float normal_j = sparse_row_jy.data[normal_jy];
                 const float normal_y = sparse_row_jy.data[normal_jy + 1];
-                const float normal_denom = s_diag[normal];
+                const float normal_denom = {row_read("diag", "normal")};
                 if (normal_denom > 0.0f) {{
                     const float normal_jv = __fmul_rn(normal_j, s_v[scalar_coord]);
-                    const float residual = __fadd_rn(normal_jv, s_rhs[normal]);
+                    const float residual = __fadd_rn(normal_jv, {row_read("rhs", "normal")});
                     const float old_impulse = s_lambda[normal];
                     float new_impulse = old_impulse - omega * residual / normal_denom;
                     if (new_impulse < 0.0f) new_impulse = 0.0f;
@@ -22937,13 +22975,13 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                 const float tangent2_j = sparse_row_jy.data[tangent2_jy];
                 const float tangent2_y = sparse_row_jy.data[tangent2_jy + 1];
 
-                const float tangent1_denom = s_diag[tangent1];
+                const float tangent1_denom = {row_read("diag", "tangent1")};
                 if (tangent1_denom > 0.0f) {{
                     const float tangent1_jv = __fmul_rn(tangent1_j, s_v[scalar_coord]);
-                    const float residual = __fadd_rn(tangent1_jv, s_rhs[tangent1]);
+                    const float residual = __fadd_rn(tangent1_jv, {row_read("rhs", "tangent1")});
                     const float old_impulse = s_lambda[tangent1];
                     float new_impulse = old_impulse - omega * residual / tangent1_denom;
-                    const float radius = fmaxf(s_mu[tangent1] * s_lambda[normal], 0.0f);
+                    const float radius = fmaxf({row_read("mu", "tangent1")} * s_lambda[normal], 0.0f);
                     if (radius <= 0.0f) {{
                         new_impulse = 0.0f;
                     }} else {{
@@ -22970,13 +23008,13 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                     }}
                 }}
 
-                const float tangent2_denom = s_diag[tangent2];
+                const float tangent2_denom = {row_read("diag", "tangent2")};
                 if (tangent2_denom > 0.0f) {{
                     const float tangent2_jv = __fmul_rn(tangent2_j, s_v[scalar_coord]);
-                    const float residual = __fadd_rn(tangent2_jv, s_rhs[tangent2]);
+                    const float residual = __fadd_rn(tangent2_jv, {row_read("rhs", "tangent2")});
                     const float old_impulse = s_lambda[tangent2];
                     float new_impulse = old_impulse - omega * residual / tangent2_denom;
-                    const float radius = fmaxf(s_mu[tangent2] * s_lambda[normal], 0.0f);
+                    const float radius = fmaxf({row_read("mu", "tangent2")} * s_lambda[normal], 0.0f);
                     if (radius <= 0.0f) {{
                         new_impulse = 0.0f;
                     }} else {{
@@ -23065,10 +23103,10 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                     if (candidate_valid) {{
                         const float old_impulse = s_lambda[candidate_normal];
                         float new_impulse = old_impulse;
-                        const float denominator = s_diag[candidate_normal];
+                        const float denominator = {row_read("diag", "candidate_normal")};
                         if (denominator > 0.0f) {{
                             new_impulse -= omega
-                                * (candidate_velocity + s_rhs[candidate_normal]) / denominator;
+                                * (candidate_velocity + {row_read("rhs", "candidate_normal")}) / denominator;
                             if (new_impulse < 0.0f) new_impulse = 0.0f;
                         }}
                         candidate_noop = old_impulse == 0.0f && new_impulse == 0.0f
@@ -23113,23 +23151,14 @@ def _get_pgs_solve_sparse_diagonal_kernel(
 
     __shared__ float s_v[{D}];
     __shared__ float s_lambda[{M}];
-    __shared__ float s_rhs[{M}];
-    __shared__ float s_diag[{M}];
-    __shared__ int s_meta[{M}];
-    __shared__ float s_mu[{M}];
+{row_shared}
 
 {chr(10).join(limit_declarations)}
 
     for (int row = lane; row < row_count; row += 32) {{
         const int index = row_base + row;
         s_lambda[row] = world_impulses.data[index];
-        s_rhs[row] = rhs_bias.data[index];
-        s_diag[row] = world_diag.data[index];
-        const int row_type = world_row_type.data[index];
-        const int row_parent = world_row_parent.data[index];
-        s_meta[row] = (row_type & {_DENSE_META_ROW_TYPE_MASK})
-            | ((row_parent + 1) << {_DENSE_META_ROW_TYPE_BITS});
-        s_mu[row] = world_row_mu.data[index];
+{row_staging}
     }}
     for (int coord = lane; coord < {D}; coord += 32) {{
         const int global_dof = world_dof_indices.data[dof_map_base + coord];
@@ -23149,14 +23178,14 @@ def _get_pgs_solve_sparse_diagonal_kernel(
 
 {serial_loop_open}
 {skip_independent_contact}
-            const int row_type = s_meta[row] & {_DENSE_META_ROW_TYPE_MASK};
+            const int row_type = {row_read("meta", "row")} & {_DENSE_META_ROW_TYPE_MASK};
             if (row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}
                 && global_iteration < friction_start_iteration) {{
                 s_lambda[row] = 0.0f;
                 __syncwarp(MASK);
                 continue;
             }}
-            const float denominator = s_diag[row];
+            const float denominator = {row_read("diag", "row")};
             if (denominator <= 0.0f) continue;
 
             int coord = -1;
@@ -23183,13 +23212,13 @@ def _get_pgs_solve_sparse_diagonal_kernel(
             const float velocity = __shfl_sync(MASK, partial, 0);
 
             const float old_impulse = s_lambda[row];
-            float new_impulse = old_impulse - omega * (velocity + s_rhs[row]) / denominator;
+            float new_impulse = old_impulse - omega * (velocity + {row_read("rhs", "row")}) / denominator;
             if (row_type == {int(PGS_CONSTRAINT_TYPE_CONTACT)}
                 || row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)}) {{
                 new_impulse = fmaxf(new_impulse, 0.0f);
             }} else if (row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}) {{
-                const int parent = (s_meta[row] >> {_DENSE_META_ROW_TYPE_BITS}) - 1;
-                const float radius = fmaxf(s_mu[row] * s_lambda[parent], 0.0f);
+                const int parent = ({row_read("meta", "row")} >> {_DENSE_META_ROW_TYPE_BITS}) - 1;
+                const float radius = fmaxf({row_read("mu", "row")} * s_lambda[parent], 0.0f);
                 if (radius <= 0.0f) {{
                     new_impulse = 0.0f;
                 }} else {{
@@ -23353,6 +23382,8 @@ def _get_pgs_solve_sparse_diagonal_kernel(
         )
 
     name = f"pgs_solve_sparse_diagonal_{M}_{D}_{P}"
+    if readonly_rows:
+        name += "_readonly_rows"
     if contact_triples:
         name += "_contact_groups"
     if speculative_contact_batches:

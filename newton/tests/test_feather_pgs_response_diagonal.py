@@ -150,8 +150,127 @@ def _run_mixed_response(
 
 
 class TestFeatherPGSResponseDiagonal(unittest.TestCase):
+    def test_sparse_readonly_rows_factory(self):
+        """Remove only immutable staging while preserving the original native ABI."""
+        original = _get_pgs_solve_sparse_diagonal_kernel(704, 114, 6, "readonly-test")
+        with mock.patch.object(wp, "func_native", wraps=wp.func_native) as native:
+            candidate = _get_pgs_solve_sparse_diagonal_kernel(704, 114, 6, "readonly-test", readonly_rows=True)
+        self.assertEqual([a.label for a in original.adj.args], [a.label for a in candidate.adj.args])
+        self.assertIn("_readonly_rows", candidate.key)
+        source = native.call_args.args[0]
+        for name in ("s_rhs", "s_diag", "s_meta", "s_mu"):
+            self.assertNotIn(name, source)
+        self.assertIn("__shared__ float s_v[114]", source)
+        self.assertIn("__shared__ float s_lambda[704]", source)
+        for name in ("rhs_bias", "world_diag", "world_row_type", "world_row_parent", "world_row_mu"):
+            self.assertIn(f"__ldg(&{name}.data[", source)
+        with mock.patch.dict("os.environ", {"FEATHER_PGS_SPARSE_READONLY_ROWS": "1"}):
+            with self.assertRaisesRegex(ValueError, "require the sparse-diagonal"):
+                SolverFeatherPGS(_build_mixed_response_model("cpu"), dense_max_constraints=32)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "read-only sparse rows require CUDA")
+    def test_readonly_rows_scalar_reference(self):
+        """Exercise the unchanged scalar physical oracle with direct read-only loads."""
+        self.test_sparse_diagonal_gs_matches_scalar_reference(readonly_rows=True)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "read-only sparse rows require CUDA")
+    def test_readonly_rows_speculative_reference(self):
+        """Exercise the unchanged speculative-contact oracle with direct read-only loads."""
+        self.test_speculative_sparse_contact_batches_match_serial_reference(readonly_rows=True)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "read-only sparse rows require CUDA")
+    def test_readonly_rows_changed_inputs_graph(self):
+        """Read current two-world row values after capture through empty and growing states."""
+        device = wp.get_device("cuda:0")
+        with mock.patch.object(wp, "launch_tiled", wraps=wp.launch_tiled) as launch:
+            self.test_sparse_diagonal_gs_matches_scalar_reference()
+        call = launch.call_args
+        original_kernel = call.args[0]
+        original_args = call.kwargs["inputs"] + call.kwargs["outputs"]
+        values = {}
+        host = {}
+        for argument, value in zip(original_kernel.adj.args, original_args, strict=True):
+            name = argument.label
+            if isinstance(value, wp.array):
+                data = value.numpy()
+                data = np.tile(data, 2) if data.ndim == 1 and data.size == 4 else np.repeat(data, 2, axis=0)
+                if name == "world_dof_indices":
+                    data[1] += 4
+                if name == "dense_groups":
+                    data[:] = (0, 1)
+                host[name] = data
+                values[name] = wp.array(data, dtype=value.dtype, device=device)
+            else:
+                values[name] = value
+        outputs = ("world_impulses", "fused_limit_lower_lambda", "fused_limit_upper_lambda", "v_out")
+        values["friction_start_iteration"] = 2
+        kernels = [
+            original_kernel,
+            _get_pgs_solve_sparse_diagonal_kernel(8, 4, 2, str(device.arch), contact_triples=True, readonly_rows=True),
+        ]
+        args = [values[argument.label] for argument in original_kernel.adj.args]
+        graphs = []
+        for kernel in kernels:
+            wp.launch_tiled(kernel, dim=[2], inputs=args, block_dim=32, device=device)
+            with wp.ScopedCapture(device=device) as capture:
+                wp.launch_tiled(kernel, dim=[2], inputs=args, block_dim=32, device=device)
+            graphs.append(capture.graph)
+        row_fields = (
+            "rhs_bias",
+            "world_diag",
+            "world_row_type",
+            "world_row_parent",
+            "world_row_mu",
+            "dense_J",
+            "dense_Y",
+            "sparse_row_dof",
+            "sparse_row_jy",
+        )
+        for stage, counts in enumerate(((0, 0), (3, 0), (4, 3), (3, 3))):
+            current = {name: data.copy() for name, data in host.items()}
+            current["world_constraint_count"][:] = counts
+            current["dense_phase_bounds"][:] = 0
+            if stage == 2:
+                for name in row_fields:
+                    current[name][0, 1:4] = host[name][0, :3]
+                current["dense_phase_bounds"][0, 1] = 1
+                current["world_row_type"][0, 0] = 3  # One prefix limit before a contact triple.
+                current["world_row_parent"][0, 2:4] = 1
+            # Each world differs; all five authoritative row arrays change after capture.
+            current["rhs_bias"] += np.array((0.03 * stage, -0.07 * stage), dtype=np.float32)[:, None]
+            current["world_diag"] *= np.array((1.0 + 0.1 * stage, 1.2 + 0.1 * stage), dtype=np.float32)[:, None]
+            current["world_row_mu"][:] = 0.1 + 0.2 * stage
+            current["world_row_type"] |= 8  # Retain the original packed three-bit interpretation.
+            if stage == 3:
+                # Give the second world one real independent scalar chain.
+                current["dense_J"][1] = 0.0
+                current["dense_Y"][1] = 0.0
+                current["sparse_row_dof"][1, :3] = (2, -1)
+                current["sparse_row_dof"][1, 0, 1] = -2
+                current["sparse_row_jy"][1, :, 2:] = 0.0
+                current["sparse_contact_group_count"][1] = 1
+                current["sparse_contact_group_heads"][1, 0] = 0
+            for name, data in current.items():
+                if name not in outputs:
+                    wp.copy(values[name], wp.array(data, dtype=values[name].dtype, device=device))
+            expected = None
+            for arm, graph in enumerate(graphs):
+                for name in outputs:
+                    wp.copy(values[name], wp.array(host[name], dtype=values[name].dtype, device=device))
+                wp.capture_launch(graph)
+                actual = [values[name].numpy() for name in outputs]
+                self.assertTrue(all(np.isfinite(data).all() for data in actual))
+                if arm == 0:
+                    expected = actual
+                else:
+                    for before, after in zip(expected, actual, strict=True):
+                        np.testing.assert_allclose(after, before, rtol=2.0e-5, atol=2.0e-6)
+            for name, data in current.items():
+                if name not in outputs:
+                    np.testing.assert_array_equal(values[name].numpy(), data)
+
     @unittest.skipUnless(wp.is_cuda_available(), "sparse diagonal GS requires CUDA")
-    def test_sparse_diagonal_gs_matches_scalar_reference(self):
+    def test_sparse_diagonal_gs_matches_scalar_reference(self, *, readonly_rows=False):
         """Match a scalar PGS reference with coupled limits and friction."""
         device = wp.get_device("cuda:0")
         max_constraints, world_dofs, dense_dofs = 8, 4, 2
@@ -225,7 +344,12 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         upper_lambda = wp.zeros_like(lower_lambda)
         velocity = wp.array(initial_velocity, dtype=wp.float32, device=device)
         kernel = _get_pgs_solve_sparse_diagonal_kernel(
-            max_constraints, world_dofs, dense_dofs, str(device.arch), contact_triples=True
+            max_constraints,
+            world_dofs,
+            dense_dofs,
+            str(device.arch),
+            contact_triples=True,
+            readonly_rows=readonly_rows,
         )
         wp.launch_tiled(
             kernel,
@@ -271,7 +395,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         self.assertEqual(float(upper_lambda.numpy()[0, 2]), 0.0)
 
     @unittest.skipUnless(wp.is_cuda_available(), "speculative contact batches require CUDA")
-    def test_speculative_sparse_contact_batches_match_serial_reference(self):
+    def test_speculative_sparse_contact_batches_match_serial_reference(self, *, readonly_rows=False):
         """Skip exact no-op prefixes without changing later serial contact updates."""
         device = wp.get_device("cuda:0")
         max_constraints, world_dofs, dense_dofs = 12, 8, 6
@@ -326,6 +450,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             str(device.arch),
             contact_triples=True,
             speculative_contact_batches=True,
+            readonly_rows=readonly_rows,
         )
         wp.launch_tiled(
             kernel,
