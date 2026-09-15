@@ -1009,3 +1009,62 @@ current/next state has no demonstrated0.94 ms removable-work budget. These
 closures are source/algebra studies, not new timings or general impossibility
 proofs. Accepted runtime remainsb1bad and the at-least4x-every-RTX-task target
 remains unmet; the paused goal controller is unchanged.
+
+## September15 05:59: close present ports; qualify active-dual CUDA
+
+G1 present ports is closed without promotion. Its final test-only tip00ac8a1
+passes all nine native selectors per GPU, including all sixteen saved physical
+cases. Root sessions45004/28609 exit0 (8.315/8.522 seconds). The initial two
+failures were newly added incident/diagonal component barriers that accepted
+b1bad also fails on the same physical inputs; their exact controls and failed
+logs remain. Saved components now use the inherited diagnostic contract;
+synthetic and final physical tolerances and all runtime bytes are unchanged.
+
+The original whole16K screen remains a loss: RTX15.607145525->18.255871400 ms,
+GB20.457185200->24.529586400 ms. All four children and eight capacity/owner
+boundaries pass. Each observed candidate boundary has16,384 fast worlds and
+zero fallback. This is not evidence that every unobserved substep is identical.
+
+Matched strict node attribution locates the loss in the replacement itself.
+Complete changed-family exclusive time is6.052297->8.768441 ms RTX and
+6.591892->10.723241 ms GB. Main ports alone sums7.754851/9.808511 ms versus
+old contact-Z, limit-prefix and GS5.716383/6.312212 ms. All retained owner sums
+change by only-0.037314/-0.060689 ms. Metadata, packet prefix and all guarded
+fallback launches are charged; deleting every fallback tail cannot recover
+the main-owner loss. A>=1.5 ms complete RTX gain would require over54% cut
+inside the new main owner with other costs held. No such work retirement is
+established, so no launch cleanup, mapping grid or runtime correction follows.
+
+The original node parents73715/90992 exit1 at the inherited auxiliary-graph
+analyzer rejection. The unchanged strict reader proves all physics, auxiliary,
+memory and process/correlation ownership; it excludes no unknown nodes.
+Derived `strict_present_ports_node_audit.json` files live under the paired
+baseline and candidate node capture directories. The complete closure is
+pushed and remotely verified on ooctipus at86d421c7ade81e709bd59601f703045e64599911,
+in `newton-fpgs-g1-present-ports-20260915/reports/fpgs/G1_PRESENT_PORTS_20260915.md`.
+
+ANYmal's separate active-dual owner now has native physical qualification,
+not a timing win yet. First native10dfa823 failed a missing host import and
+a real rank-deficient saved-case normal-feasibility gate. The CPU terminal
+fallback control reproduces the GPU defect; simply taking one original-majorizer
+step and resuming Newton still fails two of four hard records. Both negative
+controls are retained. One principled correction backtracks along the projected
+direction after a failed Newton direction, requiring the same all-row merit
+decrease. Each direction has at most eight trials, exceptionally sixteen total,
+with only one committed correction and the unchanged24-outer budget. Terminal
+unsupported/active-overflow paths retain only the remaining original budget.
+
+Corrected CPU control passes all2,048 cases and singular/initial/late-budget
+controls; mean residual evaluations7.72217, maximum110. These are not GPU-time
+predictions. Clean16f114edfc913eaf0b761c4f72067c27055845b0 passes five CUDA groups
+per card, including all2,048 actual saved cases and29 limits, current/held state,
+public FK, graph/reset, warm/self and exact remaining-budget fallback checks.
+Root78230/6434 exit0 (23.310/23.312 seconds). The two inherited invalid-stream-event
+warnings per card and target-layout deprecation remain explicitly documented.
+No physical tolerance was relaxed. Original whole16K paired session69505 exits0
+but loses substantially: RTX9.400964600->21.632151675 ms and
+GB9.514574625->25.799906300 ms. Both arms retain acceptedb1bad/fixed Lab53ee
+comparison settings and unchanged capacities/allowances. No promotion. Matched
+node attribution and actual contact-work/source checks are next: selected CPU
+iteration counts do not locate this large native-cost failure. All candidate
+files remain frozen. Accepted ratios and runtime are unchanged.
