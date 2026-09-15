@@ -1752,3 +1752,40 @@ decode are explicit risks. Card: `reports/fpgs/G1_PAIRED_SOLVE_20260915.md` in
 Runtime and focused test implementation proceed in parallel; first native/
 whole checkpoint is budgeted within45 minutes from16:22 UTC. No accepted
 solver gain or fresh MJWarp ratio is claimed. Retained Newton and Lab unchanged.
+
+## 2026-09-15 16:54 UTC — paired-world loss diagnosed; no promotion
+
+First native/whole checkpoint completed within16 minutes of funding. Three
+CPU controls and all three focused CUDA selectors pass on both cards, with
+unchanged physical tolerances. One new17-world fixture binding error was
+corrected before its native execution; no runtime correctness fix was needed.
+Whole paired16K physics regresses15.610799 ->18.741587 ms RTX (0.832950x) and
+20.437277 ->22.294128 ms GB (0.916711x). Original source/capacity/finite/actual
+owner and final-idle checks pass. This is one discovery, not accepted throughput.
+
+A reused unprivileged same-input replay rules out trajectories as the isolated
+loss cause: original0.484096 ->paired0.896864 ms RTX (1.852657x longer), and
+0.577312 ->0.796432 ms GB (1.379552x). Full16K impulses/velocities have ZERO
+numerical difference; statuses agree, same-kernel graph bytes and all live
+array/plan hashes pass. Thirty alternatingAB/BA turns discard ten. These are
+standalone kernel timings, not whole physics. No sudo or driver modification.
+
+Actual registers94/92 versus72 miss the three-CTA budget. Peak live state is
+at the metric root, not the initial sort. Ideal32->48-world capacity recovery
+alone still leaves RTX1.2351x slower than original: no register-only rescue
+funded. Full metadata shows79.94% RTX/78.65% GB count-sorted pairs have different
+limit prefixes. But correcting the count proxy for limits, singleton normals
+and triplets changes it only1.895 ->1.882x; that does NOT explain the timing
+loss. Path divergence's percentage contribution remains unquantified. Do not
+mistake a count model for executable cost or claim counters were measured.
+
+Close this count-only paired mapping as NO-FUND. No register cap, mapping grid,
+extra loaded qualification or new runtime variant. This does not rule out all
+paired architectures; another proposal needs a new complete cost case. Runtime
+e2f616478fba08a77c7aa6df9fd01a378afd8db4, complete report and exact local
+reproduction are pushed and remote-verified at9e368f7471b68042be2d2dfe41379be47aa31cd7
+on `ooctipus/fpgs-g1-paired-solve-20260915` in `ooctipus/newton`.
+See its `reports/fpgs/G1_PAIRED_SOLVE_20260915.md` for raw data/source hashes.
+Retained ca0d and fixed Lab53ee remain clean/unchanged; all GPU sessions reaped.
+No new accepted gain, MJWarp ratio or pointer update. The no-sudo measurement
+path is operational, not a permission blocker; the4x-across-tasks target remains unmet.
