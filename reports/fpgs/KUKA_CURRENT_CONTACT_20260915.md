@@ -150,3 +150,77 @@ CPU checks use the same interpreter with `CUDA_VISIBLE_DEVICES=''`, selecting
 `test_kinetic_live_owner` and `test_kinetic_native_port`. Repeat the two lifecycle
 modules with `FEATHER_PGS_KUKA_CURRENT_CONTACT=1`. The first complete CPU/offline
 checkpoint was reached around 00:26 UTC, well before the 01:29 deadline.
+
+## Completed physical checks and repeated timing, 01:12 UTC
+
+Runtime is clean `c1c678a8738b306a32ed6c241b7cb004c93804aa`; the baseline is
+qualified `1a9efc33efbc0f23e1e7676a5edded795f224c97`. The new boundary CUDA
+selector passes on both cards in 4.315/4.483 s, including original-current
+normal/tangent/MF physical rows and two graphs with counts 0/8/1/8.
+Logs: `/tmp/fpgs-kuka-current-contact-cuda-20260915-6QaLN8zd`.
+
+The existing eager 4K loaded-trajectory qualifier completes 1608 Newton calls
+on both cards, sampling refresh1600 and held1601. Actual new-owner identity,
+current geometry, original eight-sweep physical criteria and original public
+finish pass. Momentum backward defects are at most 1.746e-7 RTX /3.061e-7 GB,
+cone error 4.374e-8 /2.304e-8, and contact-normal excess 4.905e-7 /5.132e-7.
+The trajectory contains ZERO, MF0 and independent worlds but no coupled cohort;
+its `contact_eight_accepted=false` and `missing_cohorts=["coupled"]` are retained,
+not relabeled as complete natural-cohort coverage. Evidence:
+`/tmp/fpgs-kuka-current-contact-live-physical-paired4k-20260915-01`.
+
+The unchanged loaded coupled/type-4 fixture separately passes against the exact
+c1 production module aliases on both UUIDs: one test, no skips, 1.325/1.349 s,
+sessions64985/32054, both clean exit0. Selector:
+`test_kinetic_compact_physical.TestCompactPhysical.test_cuda_loaded_capacity_and_vlim`
+in `/tmp/fpgs-kuka-compact-coupled-JaVsIZBa`. It retains loaded192/64 capacities,
+swapped offsets, current MF distinct from held free inertia and active stateless
+limits. This is compositional coverage of the retained mixed solver; it does
+not itself exercise the new raw cache or establish coupled trajectory coverage.
+
+The original paired benchmark is unchanged: fixed corrected Lab
+`53ee6b44c2334341305dbdf385a3916c6b140799`, 16K worlds, seed0, 200 warm steps,
+40 wall steps, 40 profiled steps, original eight-sweep/two-substep allowance.
+Both arms retain raw311296/broad442368/dense192/MF64/propagation192 capacities
+and SIMPLE_WORLD_ZERO, LOCAL_ROW_PACKETS, INDEPENDENT_COMPONENTS,
+PAIRED_GENERAL_OVERLAP, KUKA_JOINT_WORLD, WORLD_SCAN_PUBLICATION and
+KUKA_KINETIC_WORLD. Only KUKA_CURRENT_CONTACT changes from0 to1.
+
+| Three alternating paired rounds, median ms/env step | RTX | GB300 |
+| --- | ---: | ---: |
+| Baseline physics |10.999563|11.276758|
+| Current-contact physics |10.480220|10.689198|
+| Physics baseline/candidate |1.049555x|1.054968x|
+| Baseline environment wall |35.900195|38.259504|
+| Current-contact environment wall |35.257890|37.119032|
+| Wall baseline/candidate |1.018217x|1.030725x|
+
+These are environment stepping, not full RL training measurements. Candidate
+physics samples are [10.475700,10.535112,10.480220] RTX and
+[10.738321,10.689198,10.685025] GB. All12 child processes exit0 without cleanup
+signals; all24 finite/capacity boundaries pass. All16 helper/source hashes match;
+the final source/idle guard passes. The unchanged Lab has only its existing
+untracked venv symlink. Full recipe, sources and artifacts:
+`/tmp/fpgs-kuka-current-contact-repeat-paired16k-20260915-01/manifest.json`,
+SHA256 `7760ca66391b3375b00f22c733dc87e2e080c0320d8035cf10ba48fd833f8557`.
+The prior one-round discovery is separately retained at
+`/tmp/fpgs-kuka-current-contact-paired16k-20260915-01` (RTX10.991662->10.468107,
+GB11.338841->10.640728 ms); do not pool it with the three repeats.
+
+### Complete node diagnosis and next structural opportunity
+
+Original node analyzer and strict membership audit pass all four captures,
+12 physics roots each, zero unproven correlations. Physics nodes fall from
+1920 to1728. The complete replaced family is2.977986->2.543053 ms RTX and
+3.404967->2.861500 ms GB. All five old producers disappear; all five new entries
+execute eight times per environment step. The retained triplet contraction
+still costs1.476172/1.860778 ms, or58%/65% of the new family. Thus the original
+1 ms whole-saving plan was missed because expensive contraction remains, not
+because old producers were left running or a register-spill regression.
+The measured approximately5% whole gain remains useful, but it is not4x.
+
+Evidence: `/tmp/fpgs-kuka-current-contact-nodes-paired16k-20260915-01` and
+`/tmp/fpgs-kuka-current-contact-node-audit-zU6BTmOA`. Using the previous corrected
+MJWarp denominator only gives approximately2.62x RTX /2.42x GB; this experiment
+does not measure MJWarp anew. A separate next experiment will test an early
+MF0 response/solve fork, including retained mixed work and all join/guard costs.
