@@ -118,6 +118,10 @@ class LiveBindings:
         self.lazy_response = os.environ.get("FEATHER_PGS_KUKA_LAZY_RESPONSE", "0") == "1"
         if self.lazy_response and self.current_contact is None:
             raise ValueError("Kuka lazy response requires current-contact ownership")
+        self.endpoint_residual = os.environ.get("FEATHER_PGS_KUKA_ENDPOINT_RESIDUAL", "0") == "1"
+        if self.endpoint_residual and (self.current_contact is None or self.lazy_response):
+            raise ValueError("Kuka endpoint residual requires exclusive current-contact ownership")
+        self.endpoint_route = wp.zeros(worlds, dtype=int, device=device) if self.endpoint_residual else None
         self.free_mass_mask = solver.mass_update_mask
         self.free_row_K = getattr(solver, "aug_row_K", None)
         if self.free_row_K is None:
@@ -335,6 +339,11 @@ class LiveBindings:
             from . import kinetic_lazy_response  # noqa: PLC0415 -- optional response owner
 
             kinetic_lazy_response.install(self, call)
+        call.endpoint_residual = None
+        if self.endpoint_residual:
+            from . import kinetic_endpoint_residual  # noqa: PLC0415 -- optional response owner
+
+            kinetic_endpoint_residual.install(self, call)
         return call
 
     def validate_notification(self, flags, *, plan_snapshot=None):
