@@ -878,3 +878,40 @@ preserved. Root CUDA and whole-cost checks are pending; checkpoint03:20 UTC,
 no silent extension beyond03:35. Accepted ratios remain those at01:18 until
 qualification is complete. The goal controller still reports paused; it has
 not been marked complete, and at-least4x on every RTX task remains unmet.
+
+## September15 03:26: Franka repeat closed without promotion
+
+Franka's exact device-side notification proof passes eleven CPU controls and
+four existing/new CUDA selectors on each card. It removes the prototype's
+large host-copy regression without weakening static-value checks or the
+original null-stream read envelope. Runtime remains865dbd6c; report-only
+tip106a149fe5db78d876f834e1f60ff8bfc7709118 is pushed and remotely verified
+on `ooctipus/fpgs-franka-device-proof-20260915`. The first whole attempt is
+preserved: its GB baseline exited139 during scene replication, before CUDA
+initialization/results, and no candidate arm ran. The exact fresh-directory
+retry and subsequent alternating three-round comparison complete cleanly.
+
+Against the accepted1a9 baseline, median physics is5.545875575->5.070682400 ms
+RTX (1.093714x,0.475193175 ms saved) and4.999355200->4.721928800 ms GB
+(1.058753x,0.277426400 ms saved). All12 repeated children exit0 and all24
+capacity/collision boundaries, finite-state, source and final-idle guards pass.
+The repeat manifest is
+`/tmp/fpgs-franka-device-proof-repeat-paired16k-20260915-01/manifest.json`,
+SHA256 `01527229b579d1353e5b670340b4dd78307f69f4424d80442aa523b90f8df45d`.
+
+No round reaches the declared0.55 ms physics milestone. RTX paired wall deltas
+are+0.366682,-0.630973,-0.004096 ms, approximately unchanged. GB deltas are
++1.195283,+0.048059,+0.235423 ms: slower in all three pairs, mean+0.492922 ms.
+The almost-neutral ratio of GB wall medians must not hide that paired result.
+There is no established environment-step win or promotion. This candidate
+stays separate from acceptedb1bad, whose six-task MJWarp ratios are unchanged.
+No third packing/host-tuning round or new all-task benchmark is funded here.
+
+Read-only follow-up studies distinguish untested ideas from measured losses.
+Full G1 body-plus-present-limit ports remain algebraically plausible but were
+never implemented; prior sparse packets and lazy compliance are different,
+measured losing representations. Warm-starting the second Solver.step did
+not reduce sweeps on the selected hard cases. A new conservative within-solve
+zero-row expiry bound is being assessed on the existing current/held payloads;
+there is no native implementation or speedup claim for it at this checkpoint.
+The at-least4x target is not achieved and the paused controller is unchanged.
