@@ -1068,3 +1068,51 @@ comparison settings and unchanged capacities/allowances. No promotion. Matched
 node attribution and actual contact-work/source checks are next: selected CPU
 iteration counts do not locate this large native-cost failure. All candidate
 files remain frozen. Accepted ratios and runtime are unchanged.
+
+## September15 06:45: close the active-dual loss with causal evidence
+
+The physically qualified ANYmal implementation is closed without promotion at
+report tip `eb3bc634dbf10ce88f332d87b264146179ce25ab`, pushed and remotely
+verified on `ooctipus/fpgs-anymal-active-dual-20260915`. Runtime remains16f114ed;
+accepted runtime remainsb1bad. Its full closure is in that worktree's
+`reports/fpgs/ANYMAL_ACTIVE_DUAL_20260915.md`.
+
+Strict complete-node attribution places the loss in BOTH replacement solve
+owners: their combined exclusive time rises4.091680->16.000468 ms RTX and
+4.399958->20.390717 ms GB. All retained work is approximately unchanged.
+The matched saved-input control also loses3.1--9.7x, ruling out divergent
+trajectories as the sole explanation. Its first helper failed before timing
+because it used live72/32 strides with saved192/1 arrays; that failed helper,
+logs and the corrected actual-array-stride control are preserved separately.
+
+Clock-only diagnostics pass all2,048 saved cases/card, byte-exact against the
+frozen candidate, with <=2.55% instrumentation timing distortion. Combined
+Jacobian construction and LU account for54.52% RTX/54.89% GB of summed
+within-world cycles. These are NOT live wall fractions or removable-time
+bounds. Every sampled case finishes without original fallback. Trial counts
+match the CPU prediction, including the hard110-residual-evaluation tail.
+Fewer arithmetic products did not remove dependent pivots, shared row updates,
+divisions, repeated projections and synchronization. A register-LU-only repair
+has no evidence for the required80.45% complete-owner reduction; no such rescue
+or mapping grid is funded.
+
+The distinct cold natural-map transfer to G1 also closes at its CPU gate:
+13/16 current/held cases pass. The two difficult RTX cases exhaust the fixed
+eight corrections with worse normal/complementarity/friction defects. Across
+all sixteen,135 map evaluations visit7,144 rows versus the original eight-sweep
+upper bound3,616, before other costs. Tightening the stopping test cannot repair
+the exhausted-budget cases. No G1 native implementation follows. Evidence:
+`/tmp/fpgs-g1-natural-transfer-control-20260915.md` and its pinned JSON.
+
+The next bounded CPU test is ANYmal history-four Anderson acceleration of the
+physical natural map, not the old Ant/Humanoid eight-pass block-map experiment.
+It removes the full active Jacobian/Gram/LU and weights its history fit in
+velocity units. It retains24 total corrections, the uniform physical stop,
+all rows and the remaining-budget original safeguard. All history formation,
+small solves, trial evaluations and fallback work are charged. The prior AA
+tail failures are explicitly reviewed before this test; no history/tolerance
+grid or GPU funding follows merely from a smaller iteration count.
+
+No new speedup is claimed in this section. The accepted RTX ratios remain
+Franka1.95x, Kuka2.62x, Allegro4.21x, ANYmal3.91x, G1 2.42x and Keyboard3.69x
+against the previously corrected MJWarp references, not a fresh backend run.
