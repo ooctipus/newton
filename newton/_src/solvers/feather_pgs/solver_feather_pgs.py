@@ -5306,6 +5306,11 @@ class SolverFeatherPGS(SolverBase):
 
     def _init_tiled_kernels(self, model):
         """Resolve size-specialized Warp kernels once for this solver shape."""
+        self._active_dual = os.environ.get("FEATHER_PGS_ACTIVE_DUAL") == "1"
+        if self._active_dual:
+            from .active_dual import validate_solver  # noqa: PLC0415 - experimental opt-in owner
+
+            validate_solver(self, sys.modules[__name__])
         device_arch = model.device.arch
         self._cholesky_kernels_by_size = {}
         self._crba_cholesky_kernels_by_size = {}
@@ -5750,6 +5755,10 @@ class SolverFeatherPGS(SolverBase):
                 self._wr_world_contact_counts = wp.zeros(self.world_count, dtype=wp.int32, device=model.device)
             if parallel_rows > 0:
                 parallel_factory = _get_pgs_solve_parallel_kernel
+                if self._active_dual:
+                    from .active_dual import get_parallel_factory  # noqa: PLC0415
+
+                    parallel_factory = get_parallel_factory(parallel_factory)
                 if self._allegro_kinetic_rows is not None:
                     from .allegro_kinetic_rows import get_parallel_factory  # noqa: PLC0415
 
