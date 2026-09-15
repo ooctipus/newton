@@ -124,3 +124,29 @@ inputs at the same existing host boundary. No GPU kernel changes are needed
 for that diagnosis. Source/control budgets and all capacities stay fixed.
 
 Raw discovery: `/tmp/fpgs-general-sleeping-paired4k-20260915-01/manifest.json`.
+
+## Diagnosed wake-scope loss and targeted correction
+
+Same-physics diagnostic captures at `e4164aa8`:
+`/tmp/fpgs-general-sleeping-gates-YkVfGXlI/gpu{0,1}/capture.log`.
+More than 438K of 442,368 eligible components pass the output acceleration
+gate, and roughly 415–417K pass current input/contact admission. Quiet counters
+are all zero at three of four boundaries; the remaining boundary has 416,158
+components at exactly eight steps, never the required sixteen. Fixed Lab
+performs eight solver substeps per environment step. A partial fixed-root
+reset issues unmasked JOINT_PROPERTIES; our initial controller invalidated
+every world on that notification. This erases unrelated quiet history.
+
+Correct in Newton without changing Lab or motion thresholds: snapshot the
+complete documented JOINT_PROPERTIES set (model joint_q, joint_X_p, joint_X_c)
+and compare actual device values on notification. Include immobile roots via
+joint-to-world mapping. Invalidate only changed worlds for this flag alone;
+nonfinite/global changes and all other property flags remain conservative.
+Snapshots and masks are persistent graph-safe arrays, not host readbacks.
+
+Regression-first: an unchanged notification incorrectly woke 215/218 native
+components on both GPUs before the correction. Afterward all four native
+selectors pass on both cards (3.67/3.78 s), including unchanged notification,
+changed fixed-root wake confined to one world, current public FK, and existing
+contact/force/target/reset/in-place/graph controls. Full pre-commit passes.
+This fixes missing task admission; task-level benefit is not yet established.

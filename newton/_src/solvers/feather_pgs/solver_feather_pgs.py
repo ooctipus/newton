@@ -2551,7 +2551,7 @@ class SolverFeatherPGS(SolverBase):
         if publication is not None:
             publication.validate_notification(flags, plan_snapshot=plan_snapshot)
         if getattr(self, "_sleeping", None) is not None:
-            self._sleeping.invalidate()
+            self._sleeping.notify_model_changed(flags)
         if kinetic is not None:
             kinetic.invalidate_model_changed(flags)
         g1_kinetic = getattr(self, "_g1_kinetic_state", None)

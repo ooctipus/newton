@@ -273,6 +273,36 @@ class TestFeatherPGSSleeping(unittest.TestCase):
         for device in devices:
             model, cases, joints, bodies, dofs, _targets = _physical_pair(self, device)
             _settle(self, model, cases, bodies, joints)
+            controller = cases[1].solver._sleeping
+            sleeping_before = controller.sleeping.numpy().copy()
+            counters_before = controller.counters.numpy().copy()
+            for case in cases:
+                case.solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
+            np.testing.assert_array_equal(controller.sleeping.numpy(), sleeping_before)
+            np.testing.assert_array_equal(controller.counters.numpy(), counters_before)
+            _tick(cases)
+            _compare(self, model, cases)
+            np.testing.assert_array_equal(controller.body_awake.numpy()[bodies[4:]], 0)
+
+            # A changed anchored root affects every independent branch below it,
+            # but not the otherwise-identical articulation in the other world.
+            root_body = int(model.joint_parent.numpy()[joints[0]])
+            root_joint = int(np.flatnonzero(model.joint_child.numpy() == root_body)[0])
+            previous_position = cases[1].state.body_q.numpy()[bodies[0], :3].copy()
+            shift = np.array((0.007, -0.002, 0.0), dtype=np.float32)
+            frames = model.joint_X_p.numpy()
+            frames[root_joint, :3] += shift
+            model.joint_X_p.assign(frames)
+            for case in cases:
+                case.solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
+            np.testing.assert_array_equal(controller.body_awake.numpy()[bodies[:108]], 1)
+            np.testing.assert_array_equal(controller.body_awake.numpy()[bodies[108:]], 0)
+            _tick(cases)
+            _compare(self, model, cases)
+            np.testing.assert_allclose(
+                cases[1].state.body_q.numpy()[bodies[0], :3] - previous_position, shift, rtol=3e-6, atol=3e-6
+            )
+            _settle(self, model, cases, bodies, joints)
             # In-place stepping must preserve the lease and all public state.
             _tick(cases, inplace=True)
             _compare(self, model, cases)

@@ -14,7 +14,7 @@ import math
 import numpy as np
 import warp as wp
 
-from ...sim import BodyFlags
+from ...sim import BodyFlags, ModelFlags
 from .sleep_topology import build_sleep_topology
 
 # A quiet velocity must also remain quiet under the current solved acceleration
@@ -244,6 +244,62 @@ def _finish_components(
 
 
 @wp.kernel(enable_backward=False)
+def _mark_changed_joint_worlds(
+    joint_world: wp.array[int],
+    q_start: wp.array[int],
+    q: wp.array[float],
+    parent_frame: wp.array[wp.transform],
+    child_frame: wp.array[wp.transform],
+    saved_q: wp.array[float],
+    saved_parent_frame: wp.array[wp.transform],
+    saved_child_frame: wp.array[wp.transform],
+    changed_world: wp.array[int],
+):
+    joint = wp.tid()
+    parent, child = parent_frame[joint], child_frame[joint]
+    old_parent, old_child = saved_parent_frame[joint], saved_child_frame[joint]
+    changed = bool(False)
+    for element in range(7):
+        changed = changed or parent[element] != old_parent[element] or child[element] != old_child[element]
+        changed = changed or not wp.isfinite(parent[element]) or not wp.isfinite(child[element])
+    for coordinate in range(q_start[joint], q_start[joint + 1]):
+        value = q[coordinate]
+        changed = changed or value != saved_q[coordinate] or not wp.isfinite(value)
+        saved_q[coordinate] = value
+    saved_parent_frame[joint] = parent
+    saved_child_frame[joint] = child
+    if changed:
+        world = joint_world[joint]
+        global_slot = changed_world.shape[0] - 1
+        if world < 0 or world >= global_slot:
+            world = global_slot
+        wp.atomic_max(changed_world, world, 1)
+
+
+@wp.kernel(enable_backward=False)
+def _invalidate_changed_joint_worlds(
+    component_world: wp.array[int],
+    changed_world: wp.array[int],
+    sleeping: wp.array[int],
+    counters: wp.array[int],
+    expected_valid: wp.array[int],
+):
+    component = wp.tid()
+    world = component_world[component]
+    global_slot = changed_world.shape[0] - 1
+    changed = changed_world[global_slot] != 0
+    if world >= 0 and world < global_slot:
+        changed = changed or changed_world[world] != 0
+    else:
+        for index in range(global_slot):
+            changed = changed or changed_world[index] != 0
+    if changed:
+        sleeping[component] = 0
+        counters[component] = 0
+        expected_valid[component] = 0
+
+
+@wp.kernel(enable_backward=False)
 def _invalidate_components(
     component_world: wp.array[int],
     world_mask: wp.array[wp.bool],
@@ -367,6 +423,18 @@ class SleepController:
         self.body_awake = wp.ones(model.body_count, dtype=wp.int32, device=device)
         self.joint_awake = wp.ones(model.joint_count, dtype=wp.int32, device=device)
         self._empty_mask = wp.empty(0, dtype=wp.bool, device=device)
+        # JOINT_PROPERTIES has no world mask in the public API. A partial
+        # fixed-root reset must not erase every other world's quiet history.
+        # Include the immobile root joints, which have no dynamic component.
+        joint_articulation = model.joint_articulation.numpy()
+        joint_world = np.full(model.joint_count, -1, dtype=np.int32)
+        valid = (joint_articulation >= 0) & (joint_articulation < model.articulation_count)
+        joint_world[valid] = solver._model_plan.articulation_world[joint_articulation[valid]]
+        self._joint_world = wp.array(joint_world, dtype=wp.int32, device=device)
+        self._saved_model_q = wp.clone(model.joint_q)
+        self._saved_parent_frame = wp.clone(model.joint_X_p)
+        self._saved_child_frame = wp.clone(model.joint_X_c)
+        self._changed_joint_world = wp.zeros(solver.world_count + 1, dtype=wp.int32, device=device)
 
     def _publish_masks(self) -> None:
         wp.launch(
@@ -485,6 +553,47 @@ class SleepController:
             ],
             device=self.model.device,
         )
+
+    def notify_model_changed(self, flags: ModelFlags | int) -> None:
+        """Wake actual changed worlds for pose-only model notifications.
+
+        Other properties remain a conservative global wake. These snapshots
+        cover the complete documented JOINT_PROPERTIES set, not task-specific
+        reset assumptions. State coordinate writes are also checked by begin.
+        """
+        if not self.enabled:
+            return
+        if flags & ModelFlags.JOINT_PROPERTIES:
+            self._changed_joint_world.zero_()
+            wp.launch(
+                _mark_changed_joint_worlds,
+                dim=self.model.joint_count,
+                inputs=[
+                    self._joint_world,
+                    self.model.joint_q_start,
+                    self.model.joint_q,
+                    self.model.joint_X_p,
+                    self.model.joint_X_c,
+                ],
+                outputs=[
+                    self._saved_model_q,
+                    self._saved_parent_frame,
+                    self._saved_child_frame,
+                    self._changed_joint_world,
+                ],
+                device=self.model.device,
+            )
+        if int(flags) != int(ModelFlags.JOINT_PROPERTIES):
+            self.invalidate()
+            return
+        wp.launch(
+            _invalidate_changed_joint_worlds,
+            dim=self.plan.component_count,
+            inputs=[self.plan.component_world, self._changed_joint_world],
+            outputs=[self.sleeping, self.counters, self.expected_valid],
+            device=self.model.device,
+        )
+        self._publish_masks()
 
     def invalidate(self, world_mask=None) -> None:
         """Wake reset/changed-model components without changing authored state."""
