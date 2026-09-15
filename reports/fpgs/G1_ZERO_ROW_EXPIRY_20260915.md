@@ -171,3 +171,108 @@ entry hashes. The new native module remains SHA256
 `1d9f4998d62d4286c52fbdd1977b8df91a3a0f7a28ae26dd7c7900a8dbd16ee9`.
 The original metric helper changes only its expected-key assertion according
 to actual `owner.zero_expiry`; no numerical assertion is weakened.
+
+## First integrated result and one corrective hypothesis — 04:11 UTC
+
+The corrected eight-selector CUDA run passed on both cards without skips or
+CUDA errors: RTX 6.117 s, GB 6.238 s, parents 88482/75542 reaped 0. This
+includes fresh zero reactivation, negative compliance/omega, nonfinite and
+metric fallback controls, saved sixteen rows, and actual five-world current,
+held, reset and graph tests. Only the inherited target-layout deprecation
+warning remained. Aggregate Python source guard:
+`014cca03469f414e3b273cafa52bda3eb5de803161766eec6000609aa3b416cb`.
+
+The original whole protocol then compared accepted b1bad against clean
+`6c2e1fa94e06e91b263b8c944d5d6e1df5a258c3`, changing only the expiry flag.
+All four children and root parent 23383 returned zero, with original capacity,
+source and actual old/new owner checks passing. Artifacts:
+`/tmp/fpgs-g1-zero-row-expiry-whole-paired16k-20260915-01`.
+
+| Whole physics, ms | Accepted baseline | First expiry | Difference |
+| --- | ---: | ---: | ---: |
+| RTX | 15.608483850 | 15.894541375 | +0.286057525 |
+| GB | 20.468369600 | 20.230433600 | -0.237936000 |
+
+The 1.5 ms RTX target was missed. This is one discovery comparison, not a
+promotion or a repeated throughput claim. Wall time was
+29.777891550 to 30.028116098 ms on RTX and 34.092557302 to 34.434227750 ms
+on GB; these environment timings are not training throughput.
+
+The original paired node parent 17564 stopped after its two baseline captures
+because the inherited Lab analyzer rejects the already-known auxiliary graph
+roots. The unchanged original parent therefore never launched its candidate
+arm. Root preserved that failed result, then captured the candidate explicitly
+with both source slots at 6c2 and both expiry flags on; parent 86626 likewise
+returned 1 from that analyzer after its two complete captures. Those second
+directories are labelled `round_01_baseline`, but contain the explicitly
+observed candidate source/key and must not be relabelled as accepted baseline.
+
+Existing strict reader 74c5928b, with only owner-name classification additions,
+validated each capture's source/correlation scope, twelve physics roots and
+three separate auxiliary roots, with zero unproven nodes. Its
+`strict_zero_expiry_node_audit.json` files are preserved under:
+
+- `/tmp/fpgs-g1-zero-row-expiry-nodes-paired16k-20260915-01` (accepted baseline).
+- `/tmp/fpgs-g1-zero-row-expiry-candidate-nodes-paired16k-20260915-01` (first expiry).
+
+| GS exclusive diagnostic, ms | Accepted baseline | First expiry | Difference |
+| --- | ---: | ---: | ---: |
+| RTX | 3.943349333 | 4.175872000 | +0.232522667 |
+| GB | 4.363572333 | 4.113962000 | -0.249610333 |
+
+Other RTX family deltas are at most 0.0042 ms. On GB collision changes by
+-0.047913 ms, and other families by at most 0.00182 ms. This isolates the
+whole discrepancy to GS but does **not** prove whether invariant guard reads,
+norm setup, certificate arithmetic, or lower actual hit exposure dominates.
+The selected CPU 62% figure is not a measured population exposure, and the
+original zero-radius metric path already skips both tangent residual dots.
+
+### Approved correction, recorded before runtime edits
+
+Only move a certified lookup ahead of per-row metadata and lambda reads.
+Add four shared uint32 words (16 bytes) recording whether a certificate owns
+one normal/limit row or the complete validated metric triplet. A hit reads
+the existing expiry and clock, then advances by the certified transaction
+width. It no longer repeats immutable type/parent/support/friction admission
+or the already-proven zero-lambda checks. Initial norm work, inward record
+division, directed clock updates, all producers, eight sweeps and exact exit
+remain charged and unchanged. No initial-prefix seeding, new queue or second
+algorithm is included.
+
+Safety rests on existing full upfront row/parent validation. Normal/limit
+lambda has no foreign writer; a validated triplet owns both its tangent
+siblings. Kind-three is issued only after original metric admission and an
+unchanged all-zero transaction. Arguments and metadata are immutable within
+the solve, and the friction-start predicate remains true after admission.
+Monotone clock advancement prevents an expired certificate from reviving.
+A delayed-friction kind-one certificate skips only its normal row and leaves
+the original tangent visits in place; it is not promoted to a triplet without
+an original accepted metric transaction. Expiry/kind state resets per launch.
+
+Regression-first CPU parent 6660 failed on original 6c2 because its first
+certificate check still followed row metadata reads. Focused tests will cover
+the hoisted source boundary, delayed kind transitions, reactivation, siblings,
+incoming impulses and unchanged upfront invalid-row rejection. The target
+remains at least 1.5 ms original whole RTX savings against accepted b1bad,
+not recovery relative to the slower first expiry attempt. The 05:00 readiness
+checkpoint and no-silent-extension-after-05:20 limit remain in force.
+
+### Corrective source readiness — 04:16 UTC
+
+The correction changes only the expiry insertion module, its focused tests
+and this report. Kernel arguments, key, producers, mathematical bounds and
+original numerical paths remain unchanged. Independent source reviews found
+no concrete lifetime or bound blocker. The focused regression now passes;
+four expiry CPU tests plus the six retained metric/G1 controls pass (ten tests
+in 1.632 s, parent 98476 reaped 0). CUDA cases additionally cover all four
+bitmap words, bit31, a final97–99 triplet, delayed kind transitions and invalid
+metadata on a continuing graph. Root's review added start70 to explicitly
+cover bitmap word2; the focused CPU controls passed again afterward.
+
+Both original/candidate entries compile on SM120/SM100 at
+`/tmp/fpgs-g1-zero-expiry-offline-Kd5Qumz3/offline03/report.json`, SHA256
+`7c3730c1136762c826b23ec49686da0f7d6a92cae21387da24b9014ba188202a`.
+The correction uses 72 registers and 1932 shared bytes on each target, exactly
+16 additional shared bytes over first expiry; stack and spills remain zero.
+These are static resources, not an achieved-occupancy claim. Native module
+SHA256 is `3103c2697b245ba144411c7b94c55b604e25edd278593efed89ce9da8134bdac`.
