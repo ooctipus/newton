@@ -9,6 +9,7 @@ Binding does not launch kernels, read back dynamic values, or seed held state.
 """
 
 import inspect
+import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -109,6 +110,11 @@ class LiveBindings:
             self.limit_slot = wp.full(12 * worlds, -1, dtype=int, device=device)
             self.limit_sign = wp.zeros(12 * worlds, dtype=float, device=device)
         self._calls = {}
+        self.current_contact = None
+        if os.environ.get("FEATHER_PGS_KUKA_CURRENT_CONTACT", "0") == "1":
+            from . import kinetic_current_contact  # noqa: PLC0415 -- default-off experimental owner
+
+            self.current_contact = kinetic_current_contact.allocate(worlds, solver._max_contacts_alloc, device)
         self.free_mass_mask = solver.mass_update_mask
         self.free_row_K = getattr(solver, "aug_row_K", None)
         if self.free_row_K is None:
@@ -318,6 +324,10 @@ class LiveBindings:
         call.kernel_arguments["finish"] = finish_args
         call.free = self._free(call, current)
         call.force = self._force(call.rows, call.services, call.solve.guard, contacts, dt)
+        if self.current_contact is not None:
+            from . import kinetic_current_contact  # noqa: PLC0415 -- default-off experimental owner
+
+            kinetic_current_contact.install(self, call)
         return call
 
     def validate_notification(self, flags, *, plan_snapshot=None):
