@@ -1,5 +1,9 @@
 # Kuka MF0 private response and early solve fork
 
+Status: **diagnosed loss, closed after one separately preserved correction**.
+Neither this mapping nor its cooperative successor is promoted. The original
+source-guard failure below remains a failed, provisional graph screen.
+
 ## Pre-code contract
 
 Experimental, default off; no performance result yet. Parent authorized one
@@ -279,3 +283,86 @@ diagnostics, not promotion evidence. The expected removal of global panels
 and late ownership did not translate into a whole win. The unchanged native
 candidate is retained for one existing-protocol node attribution; no corrective
 mapping change or occupancy claim is authorized by these timings alone.
+
+## Clean attribution and closure
+
+The subsequent node pair is clean: parent 12281 reaped zero, all four children
+returned zero, final source/idle guards passed and task budgets were unchanged.
+It compares accepted current-contact `629dedb057cc34cb05139b98d6dece5609ae306e`
+against corrected-fixture tip `867e6b77c7186c31858a688638076578337f23ed`.
+The latter retains exactly the d8cc numerical source and binding hashes above.
+Fixed Lab is `53ee6b44c2334341305dbdf385a3916c6b140799`; its only recorded
+untracked entry is `.venv`, not a source edit. Both actual Newton imports and
+the fixed Lab backend import were verified.
+
+Artifacts are under
+`/tmp/fpgs-kuka-private-response-nodes-paired16k-20260915-01`.
+The existing strict reader
+`/tmp/fpgs-kuka-live-node-audit-VoxZZR5Z/audit.py` (SHA256
+`ce09a4964d8ffc1b529eec077f93b0a755dae7fc351768582166b756b8823bbe`)
+produced `strict_private_response_node_audit.json` in all four capture
+directories. Each has 12 physics roots, 1728 baseline or 1752 candidate
+nodes, zero auxiliary roots/unproven nodes, and successful source/process/
+correlation checks. These are three-step diagnostic intervals, not repeated
+whole-physics throughput.
+
+| Strict interval, ms/environment step | RTX baseline | RTX private | GB baseline | GB private |
+| --- | ---: | ---: | ---: | ---: |
+| Whole physics root spans | 10.530701 | 14.054306 | 10.841696 | 12.144554 |
+| Complete affected fork union | 3.564513 | 7.128285 | 4.095402 | 5.439198 |
+| Affected fork exclusive busy | 3.564513 | 7.065714 | 4.093023 | 5.375269 |
+| State/held union, retained | 3.207850 | 3.215680 | 2.823551 | 2.824234 |
+| Allocator including candidate slot map | 0.209483 | 0.214806 | 0.211883 | 0.214976 |
+
+The affected family includes rows/response, MF services, qualification/
+materialization, both original solve owners and the private owner. Its sum
+is not added to its union. Candidate RTX affected-memory overlap is
+0.062571 ms. Whole disjoint accounting also retains current geometry,
+allocation prefix, collision, force sensors, memory and graph gaps.
+
+The private kernel alone costs 6.153778 ms RTX / 4.750538 ms GB, with eight
+calls per environment step. Actual resources on both cards are 99 registers,
+27,984 shared bytes, zero local memory and block32. The positive-MF offset
+owner then costs 0.880502 / 0.617355 ms on that SAME private stream. The
+large loss is not the 0.005323 / 0.003093 ms added allocator work.
+
+Source inspection identified two concrete causes: the formerly raw-striped
+contact build becomes serial per world while retaining a full-capacity panel,
+and independent positive-MF offset work has an unnecessary dependency on
+private MF0 completion. Static resources and source lifetime do not establish
+achieved occupancy or the contact phase's measured fraction.
+
+Exactly one combined correction was therefore funded in branch
+`ooctipus/fpgs-kuka-cooperative-response-20260915`, runtime
+`e5d682c8c8702012bbcbb6f9bacc3f87588b8c44`. Its card is
+`reports/fpgs/KUKA_COOPERATIVE_RESPONSE_20260915.md` in that branch. It uses
+four contact warps and removes the false stream edge, without changing the
+original eight-sweep law, capacities or fallback. That successor passes both
+CUDA selectors on both cards, but its clean whole comparison STILL loses
+against accepted current-contact: RTX 10.411883 -> 11.834728 ms and GB300
+10.678865 -> 11.665263 ms. Its complete affected node union is
+3.595766 -> 5.092613 ms RTX and 3.967386 -> 4.763133 ms GB.
+
+Thus the correction recovers part of a diagnosed prototype loss, not an
+accepted speedup. Close this ownership/mapping attempt; no further grid,
+promotion, new MJWarp ratio or changed accepted task reference follows.
+
+The preserved original whole manifest has SHA256
+`c5a555a35d158744874a8eb0b5907b7e59c97b9b48b6fa021c4d3b68f4e9b32a`;
+the clean private node manifest has SHA256
+`f66f23db48331c457fa46c5119a5f5ac2d1c981f02334864156f59a6488481dc`.
+Both original source trees, the failed test/source-guard timeline and all
+captures remain intact. This closure changes this report only.
+
+### Reproduction prerequisite
+
+The existing comparison must run through
+`/tmp/fpgs-kinetic-fixed-variants-TZRkIPYw/run.py` (SHA256
+`c062388f23f82c524690f272fb2d14141ed4126db641de6dcd86f8ade5bfe416`),
+not a direct invocation of the current repository's changed benchmark files.
+It retains original variants `48406c07`, backend owner `79818fce`, capture
+`42b289bd` and explicit fixed Lab package selection. The cooperative card
+records the complete tested command; use this tree at 867e as its candidate
+for this private node experiment. Keep the eight common flags, private flag
+0/1, 16K raw311296/broad442368, seed0, 200 warm/40 wall and three node steps.
+No new runner, benchmark law or GPU experiment was introduced for closure.
