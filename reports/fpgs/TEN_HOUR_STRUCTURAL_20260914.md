@@ -1166,3 +1166,59 @@ complete sparse owner before mask/check overhead. No limit-phase timing or
 GPU gain is claimed. One implementation/paired screen is funded, with no
 tile grid or new benchmark framework. Accepted runtime and ratios remain
 unchanged until actual integrated evidence warrants promotion.
+
+## September 15 08:14: diagnose stationary limits; test immutable-row residency
+
+Keyboard stationary-limit runtime `fa0b41f8e1bc270a501c294ccc2734408982b0d1`
+is not promoted. All three new test methods pass on both cards; the wider
+response-diagonal module is 14/15, with the documented inherited tiled
+response test passing seven arguments to a nine-argument kernel. Do not call
+that full module a pass. The actual GPU compilation succeeded; there was no
+separate completed offline-AOT run for this candidate.
+
+One whole-step paired screen, with all capacity/source/idle checks passing:
+
+| GPU | Accepted physics ms | Stationary candidate ms | Ratio |
+| --- | ---: | ---: | ---: |
+| RTX | 7.443361925 | 7.662634675 | 0.971x |
+| GB300 | 6.654806375 | 6.591330550 | 1.010x |
+
+The existing three-step node diagnostic locates both changed RTX costs:
+GS 1.078966 -> 1.129783 ms and grouping 0.265622 -> 0.285675 ms. Thus a
+large solver gain is not merely hidden by the small mask producer. GB300 GS
+falls 1.274048 -> 0.993770 ms while grouping rises 0.283883 -> 0.309387 ms;
+that separate node sample is not a repeated whole-step speedup. Actual GS
+registers remain 94/88 and shared memory remains 14,664 B, with zero local
+memory. Source-level retired branch percentages did not remove the resource
+ceiling or establish the number of executed heavy-world sweeps. There are no
+hardware-counter grounds for a definitive instruction-stall explanation.
+
+Raw artifacts are `/tmp/fpgs-keyboard-stationary-native-qGrY3s3m`,
+`/tmp/fpgs-keyboard-stationary-limits-whole-paired4k-20260915-01` and
+`/tmp/fpgs-keyboard-stationary-limits-nodes-paired4k-20260915-01`. All root
+sessions are reaped. The candidate branch retains its full physical tests
+and negative results; accepted runtime remains b1bad.
+
+One distinct representation experiment is now funded from b1bad: remove the
+sparse owner's four read-only shared row copies, keeping shared mutable
+velocity/impulses and reading the same authoritative inputs at use. No mask,
+row tier, public capacity change, additional producer or launch is introduced.
+The source/cache audit finds no production mutation or output-alias blocker;
+unbiased passes must read the actually passed RHS and every graph invocation
+must observe newly written inputs. Private metadata retains the old encoding.
+
+The resource case is conditional: shared storage would fall from 14,664 B to
+about 3,400 B. At unchanged physical registers, 256-register warp allocation
+and four register subpartitions bound both cards at 20 one-warp blocks/SM,
+versus old shared ceilings of six RTX and fifteen GB300. The previously rough
+21/23 register ceilings were incorrect. Reserved block shared memory and
+carveout may constrain this further. Neither ceiling is achieved occupancy.
+The ideal RTX owner saving is about 0.755 ms; repeated global reads, packing,
+address arithmetic and changed registers can erase it. One whole-step screen
+will decide whether that narrow large-gain opportunity exists in practice.
+
+Pre-code card and branch:
+`newton-fpgs-keyboard-readonly-rows-20260915/reports/fpgs/KEYBOARD_READONLY_ROWS_20260915.md`,
+`ooctipus/fpgs-keyboard-readonly-rows-20260915`. The ambition is 0.7 ms RTX,
+with repeated qualification also allowed for a smaller substantial gain that
+actually reaches the user's 4x task goal. No new speedup is claimed here.
