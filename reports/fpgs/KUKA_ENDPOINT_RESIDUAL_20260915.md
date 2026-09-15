@@ -167,3 +167,99 @@ The early screen uses retained `ca0d427a`, fixed Lab `53ee6b44`, fixed bench
 steps, two substeps/eight solver visits and unchanged 311296/442368 raw/broad
 capacities. Both variants keep the closed lazy-response flag off; only the
 candidate enables endpoint residuals. No new MJWarp ratio is implied.
+
+## Closed integrated result, 13:21 UTC
+
+Measured runtime `8dcbf9597680e44394471ecfbc7b4145678b349d` is **not promoted**.
+It removes substantial row-production work, but does not produce a useful
+complete speedup. This version remains default-off; retained `ca0d427a` is
+unchanged. No repeated timing or long qualification is funded for this version.
+
+| Paired discovery, ms/environment step | RTX retained | RTX candidate | GB retained | GB candidate |
+| --- | ---: | ---: | ---: | ---: |
+| Complete physics | 10.462228 | 10.491465 | 10.648697 | 10.601913 |
+| Environment wall, not training | 34.525367 | 35.009569 | 37.406492 | 36.126657 |
+| Physics retained/candidate | | 0.997213x | | 1.004413x |
+
+All capacity, finite-current-state, source and final-idle guards pass. This
+single discovery is effectively flat, not a claim of a sub-percent win. RTX
+end-of-run dense rows are 139093 retained versus 141082 candidate; trajectories
+are not bit-identical, but there is no capacity-drop explanation for the time.
+
+The immediate paired three-step node diagnosis uses the same source and caps.
+Every input has 12 physics roots, 1728 nodes, zero auxiliary/unproven nodes and
+passing source/process-correlation guards. The preserved strict interval
+reader is reused with name-only aliases. Crucially, the affected family now
+includes the **entire allocator** because production work moved into it.
+
+| Strict node interval union, ms | RTX retained | RTX candidate | GB retained | GB candidate |
+| --- | ---: | ---: | ---: | ---: |
+| Current allocator | 0.207425 | 0.411702 | 0.213909 | 0.344384 |
+| Row/response producers | 1.743841 | 0.507297 | 2.186068 | 0.641350 |
+| Joined ordered/general solve | 1.403361 | 2.281357 | 1.041365 | 2.134431 |
+| MF services | 0.448555 | 0.458539 | 0.499855 | 0.494686 |
+| Qualification/materialization | 0.331830 | 0.328406 | 0.410034 | 0.481680 |
+| Complete affected union | 4.135012 | 3.987300 | 4.351232 | 4.095476 |
+| Diagnostic whole span | 10.897874 | 10.762840 | 10.853483 | 10.645587 |
+
+Rows retire 1.236544/1.544717 ms RTX/GB, but the allocator adds
+0.204277/0.130474 ms and joined solve adds 0.877996/1.093066 ms. Only
+0.147712/0.255756 ms survives in the complete affected union. GB phase unions
+overlap slightly; complete exclusive affected time is 4.348554 to 4.093438 ms.
+These three-step diagnostic spans do not supersede whole-screen throughput.
+
+The new offset entry alone costs 2.239426/2.084650 ms versus retained
+1.361516/0.992704 ms. Its resource table reports 119/116 registers per thread,
+versus 60/56 retained, and 12080 B shared versus 5760 B, with zero reported
+local memory. The shared footprint contains both eager and endpoint row
+arenas plus readiness scratch. This is declared resource evidence, **not**
+achieved occupancy, stall counters or proof that shared memory is the limiter.
+
+Why the complete prediction missed: r0/public metadata work was moved, not
+deleted; every contact visit still decodes its packet, loads direction and
+anchors and evaluates endpoint projection arithmetic. Dirty refreshes add
+the 35-shuffle body scan; first-use J, T and T-transpose actions still cost
+time. Reducing a dot product's shuffle count alone did not price these costs.
+The producer retirement is real, but the cheaper complete consumer assumed
+by the 1.30 ms planning ceiling was not achieved. No register/tile grid or
+isolated shared-arena tuning follows this failed screen.
+
+Any further solver redesign must justify roughly 0.94 ms additional RTX
+joined-solve removal with current other costs (including its own new block
+production/storage) to reach a 10% whole-time target in the paired diagnosis.
+A read-only prior-art/accounting study of triplet-local residual reuse is
+separate, not authorization for another prototype or a claimed speedup.
+
+Artifacts:
+
+- Whole: `/tmp/fpgs-kuka-endpoint-residual-paired16k-20260915-01`, manifest
+  SHA256 `1d82db625fbfd796e991c3f4d34937460208563e47d358a18ced1ea75e8f2f2f`.
+- Nodes: `/tmp/fpgs-kuka-endpoint-residual-nodes-paired16k-20260915-01`, manifest
+  SHA256 `e85b1e12a568f48391fcfd90a1c6997528f71eb5429ca5112c3b61680a583ec5`.
+- Strict outputs: `/tmp/fpgs-kuka-endpoint-node-audit-2lE7fAC3/{baseline,candidate}_gpu{0,1}.json`.
+  The reader is `/tmp/fpgs-kuka-lazy-node-audit-AQ9Y0jsn/audit.py`, with only
+  endpoint owner names appended to the existing categories and
+  `current_allocator` added to `affected_fork`.
+
+### Triplet-local residual follow-up: not funded
+
+Read-only prior-art and exact original FP64 replay accounting found an
+implementable four-coefficient cache that would preserve ordered normal,
+tangent and sibling transactions. It is not the earlier G1 sticking-block
+solver, which changed the numerical law. It still needs four 29-term dot
+products per first-used friction block, coefficient loads, normal geometry,
+all physical velocity updates and the original cone work.
+
+Current 11 selected controls: 230 refreshes = 86 normal + 72 tangent1 + 72
+tangent2; ideal triplet reuse removes 144 (62.61%), with nine first-use blocks.
+Historical 351 active MF0 controls: 2494 = 1456 normal + 519 tangent1 + 519
+tangent2; ideal removal is 1038 (41.62%), with 65 first-use blocks. The
+31766 effective residual visits and 3365 nonzero updates remain. Instrumented
+FP64 outputs are byte-identical to the existing uninstrumented oracle.
+
+Removing about 41.2% of the entire current joined solve would therefore
+require almost all of it to be removable scan cost at the historical average,
+before new block work. The selected hard tail is not population evidence.
+This does not fund a substantial-gain prototype; no runtime/test changes or
+GPU tuning were made for it. Do not reopen it as an untested new 4x direction
+without a materially different complete budget and exposure evidence.
