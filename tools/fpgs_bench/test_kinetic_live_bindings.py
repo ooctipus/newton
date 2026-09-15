@@ -35,7 +35,7 @@ def bound_call(worlds=2):
     return solver, owner, first, second, control, contacts, call
 
 
-def live_model(worlds=2):
+def live_model(worlds=2, *, device="cpu"):
     """Construct the exact supported topology from public live builder inputs."""
     template = newton.ModelBuilder()
     bodies, joints = [], []
@@ -69,10 +69,10 @@ def live_model(worlds=2):
         template.add_articulation([template.add_joint_free(body)])
     builder = newton.ModelBuilder()
     builder.replicate(template, worlds, spacing=(2.0, 2.0, 0.0))
-    model = builder.finalize(device="cpu")
+    model = builder.finalize(device=device)
     model.rigid_contact_max = 256
-    model.rigid_body_max_linear_velocity = wp.full(model.body_count, float("inf"), dtype=float, device="cpu")
-    model.rigid_body_max_angular_velocity = wp.full(model.body_count, float("inf"), dtype=float, device="cpu")
+    model.rigid_body_max_linear_velocity = wp.full(model.body_count, float("inf"), dtype=float, device=device)
+    model.rigid_body_max_angular_velocity = wp.full(model.body_count, float("inf"), dtype=float, device=device)
     return model
 
 

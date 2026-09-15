@@ -115,6 +115,11 @@ class LiveBindings:
             from . import kinetic_current_contact  # noqa: PLC0415 -- default-off experimental owner
 
             self.current_contact = kinetic_current_contact.allocate(worlds, solver._max_contacts_alloc, device)
+        self.private_response_slots = None
+        if self.current_contact is not None and os.environ.get("FEATHER_PGS_KUKA_PRIVATE_RESPONSE", "0") == "1":
+            from . import kinetic_private_response  # noqa: PLC0415 -- default-off experimental owner
+
+            self.private_response_slots = kinetic_private_response.allocate(worlds, device)
         self.free_mass_mask = solver.mass_update_mask
         self.free_row_K = getattr(solver, "aug_row_K", None)
         if self.free_row_K is None:
@@ -328,6 +333,10 @@ class LiveBindings:
             from . import kinetic_current_contact  # noqa: PLC0415 -- default-off experimental owner
 
             kinetic_current_contact.install(self, call)
+        if self.private_response_slots is not None:
+            from . import kinetic_private_response  # noqa: PLC0415 -- default-off experimental owner
+
+            kinetic_private_response.install(self, call)
         return call
 
     def validate_notification(self, flags, *, plan_snapshot=None):

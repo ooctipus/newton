@@ -14343,33 +14343,19 @@ class SolverFeatherPGS(SolverBase):
         self._fk_id_cache_source_state = state_out
 
     def __del__(self):
-        """Wait for solver-owned streams before releasing their buffers."""
-        streams = [
-            getattr(self, name, None)
-            for name in (
-                "_local_internal_stream",
-                "_local_residual_stream",
-                "_local_pair_stream",
-                "_paired_general_solve_stream",
-                "_global_inertia_stream",
-                "_articulation_dynamics_stream",
-                "_memset_stream",
-            )
-        ]
-        joint_world = getattr(self, "_joint_world", None)
-        if joint_world is not None:
-            streams.append(joint_world.stream)
-        streams.extend(getattr(self, "_size_streams", {}).values())
-        synchronized = set()
-        for stream in streams:
-            if stream is None or id(stream) in synchronized:
-                continue
-            synchronized.add(id(stream))
-            try:
-                wp.synchronize_stream(stream)
-            except (AttributeError, RuntimeError):
-                # CUDA may already be shutting down during interpreter teardown.
-                pass
+        """Drain queued work without accessing cyclically finalized streams."""
+        model = getattr(self, "model", None)
+        if model is None:
+            return
+        try:
+            # Cyclic GC may finalize a stream before its owning solver. Its
+            # Python wrapper can still contain the destroyed native handle.
+            # Synchronizing the context avoids dereferencing that handle and
+            # drains all solver work before the remaining buffers are released.
+            wp.synchronize_device(model.device)
+        except (AttributeError, RuntimeError, TypeError):
+            # CUDA/Python callables may already be unavailable at shutdown.
+            pass
 
 
 @cache
