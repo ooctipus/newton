@@ -167,6 +167,11 @@ class TestActiveDualCPU(unittest.TestCase):
                 self.assertIn("24 - ad_consumed", native)
                 self.assertIn("ad_lu_ok", native)
                 self.assertIn("ad_nactive", native)
+                self.assertIn("direction < 2 && !accepted", native)
+                self.assertIn("trial < 8", native)
+                self.assertEqual(native.count("++ad_consumed"), 1)
+                self.assertLess(native.index("const float projected_direction"), native.index("for (int direction"))
+                self.assertLess(native.index("if (!accepted) break;"), native.index("++ad_consumed"))
         for changed in ({"sweeps": 8}, {"matrix_free": False}, {"exact_row_sums": False}, {"world_rows": False}):
             kw = factory_arguments(32) | changed
             old = original._get_pgs_solve_parallel_kernel(72, 32, 18, 120, **kw)
@@ -227,6 +232,20 @@ class TestActiveDualCPU(unittest.TestCase):
         _, _, singular = limits_case("singular")
         self.assertEqual(np.linalg.matrix_rank(singular["A"]), 1)
         self.assertEqual(len(singular["J"]), 2)
+        # The full diagonal projected action nearly oscillates and fails Armijo;
+        # its half step decreases the same merit and satisfies physical quality.
+        eta = 1 / (np.diag(singular["A"]) + singular["cfm"])
+        direction = np.maximum(0, -eta * singular["b"])
+        merit0 = np.linalg.norm(direction / eta)
+        for alpha, accepted in ((1.0, False), (0.5, True)):
+            value = alpha * direction
+            residual = singular["b"] + singular["A"] @ value
+            projected = np.maximum(0, value - eta * residual)
+            merit = np.linalg.norm((value - projected) / eta)
+            self.assertEqual(merit < (1 - 1e-4 * alpha) * merit0, accepted)
+            if accepted:
+                self.assertLess(np.max(np.abs(residual)), 3e-5)
+                self.assertLess(np.max(np.abs(value * residual)), 3e-5)
         _, _, late = limits_case("late")
         active0 = late["b"] < 0
         self.assertEqual(int(active0.sum()), 18)
@@ -332,10 +351,11 @@ class TestActiveDualCUDA(unittest.TestCase):
             self.assertLess(metric["negative_normal_impulse"], 1e-7)
             self.assertTrue(np.isfinite(impulse).all())
             if kind == "singular":
-                old = launch_saved(a, scalar, 32, device, False)
-                for name, value in new.items():
-                    np.testing.assert_array_equal(value, old[name], err_msg=name)
+                # A merit-tested projected retry can converge without terminal
+                # fallback. Its nonunique impulses need physical quality, not
+                # exact agreement with the original numerical trajectory.
                 self.assertLess(metric["natural_residual_scaled"], 3e-5)
+                self.assertLess(metric["normal_negative_velocity"], 3e-5)
                 self.assertLess(metric["complementarity"], 3e-5)
             elif kind == "initial_overflow":
                 old = launch_saved(a, scalar, 32, device, False)

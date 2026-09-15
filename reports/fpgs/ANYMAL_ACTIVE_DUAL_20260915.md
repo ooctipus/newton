@@ -196,3 +196,61 @@ solver-hook SHA `e911476e839a7241d5cf3eccfe475e3ae4daf5264e3fa19f5b1a14df4d4c70e
 No GPU or whole-timing result is claimed at this checkpoint.
 Five focused CPU tests pass (session49672,0.999s, exit0). The full-tree
 `uvx pre-commit run -a` passes; all native/solver/test bytes remain AOT03-exact.
+
+### First native failures and causal safeguard correction,05:48UTC
+
+Root's native01 sessions54777/9444 both exit1. Warm/self/padding, unsupported
+flags, singular/initial-overflow/late23-budget controls pass. Actual construction
+fails on a missing `sys` import, fixed without changing numerical kernels.
+The saved gate stops at capturegpu0/currentstep0/tier48/world142: independent
+normal-negative velocity1.2046871e-4 exceeds original6.21345e-6 plus3e-5.
+Logs are preserved at `/tmp/fpgs-anymal-active-dual-native-1RnAUUn0/gpu{0,1}.log`.
+No all2,048 native qualification or whole cost is claimed from this run.
+
+The four world142 CPU controls isolate the cause. Terminal original-recurrence
+handoff reproduces the GPU defect (CPU1.2044581e-4) and fails allfour records:
+it abandons Newton after the transient rejected step. One original-majorizer
+projected update then retry also fails twoheld records; do not implement it.
+Both results remain preserved as `safeguard_terminal_four_result.json` and
+`safeguard_retry_four_result.json` in the original CPU-study directory.
+
+Root approved one principled safeguard: on rejected LU/Newton line search,
+backtrack along the projected direction with the SAME all-row merit-decrease
+test. This is not the unstable unconditional diagonal update. Each direction
+has at most8 trials; exceptional outers can therefore cost16 trial evaluations.
+Only one accepted correction counts, total outer allowance stays24. If both
+directions fail, or the active dimension exceeds18, use the original remaining
+budget. No new cutoff grid, compliance, or acceptance-tolerance change.
+
+This exact CPU action passes all2,048 plus duplicate-singular and exact initial
+and late23-budget controls (session53044 exit0). Outer min/median/p90/p99/max
+2/4/5/7/15; all residual evaluations3/7/9/19/110, mean7.72217. There are2 rejected
+LU actions and16 projected-direction retries. Gram cache counts are unchanged.
+Result `safeguard_projected_all_result.json`, SHA
+`191937445b15503ac875ec574a4b0ff2308cb63a61c6cd3f15dc216514842ba9`.
+These are CPU observations, not native timing predictions. The projected
+direction's storage, additional trials and final/terminal L reload are charged;
+no original majorizer is built unless the terminal original fallback executes.
+
+Corrected actual-source offline04 passes all eight original/active entries on
+SM120/100 (session83449, exit0). Active32 uses99 registers on both cards and
+6,836B shared; active48 uses128 RTX/96 GB registers and9,176B shared. All have
+zero stack and spill loads/stores. Original32/48 use86/80 RTX and80/80 GB
+registers,5,408/7,492B shared. The64-thread entry has one CTA barrier resource;
+the32-thread entry has none. The restored projected-direction lifetime is
+therefore included in these allocations, not hidden behind the earlier03 data.
+These are static resource facts, not achieved occupancy or cost evidence.
+
+Offline04 report SHA
+`4499098b63c94473a0a2d4b91ed464a2a4c1d16a1467ff9b88e095508d64f813`;
+compiler derivative SHA
+`2806d5a7bc47a104cbdd16725c31b932e3fe9393e934c6ff271b4f24957348c2`.
+Runtime SHA `945fecad7da140c1d993d0300bc69d3c23602734cdf8c1054decfcfa3b192695`;
+solver SHA `597d74fd6e39c41850a38fb2bc603f048861a00ddddc90b0e2401c7b8104a5a4`.
+Independent safeguard review found no blocker. Five corrected CPU tests pass
+(session54264,0.969s); test SHA
+`2ecb3a34afb09d3759a066bf5f815d2a55cd27dd03db2d5a3349b324ab961960`.
+The singular fixture now checks the unchanged physical thresholds rather than
+requiring the original impulse solution; its normal-feasibility gate is also
+explicit. Initial/late-overflow, warm and unsupported exact fallback gates are
+unchanged. Corrected native qualification and whole timing remain pending.

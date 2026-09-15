@@ -196,6 +196,7 @@ _NATIVE = r"""
         for (int ad_outer = 0; ad_outer < 24; ++ad_outer) {
             const float residual = ad_residual(s_x, true);
             const float natural = ad_map_value(s_x, residual);
+            const float projected_direction = ad_row ? ad_pg[ad_i] - s_x[ad_i] : 0.0f;
             const float scale = ad_max(ad_row ? fmaxf(fabsf(s_rhs[ad_i]), fabsf(residual - s_rhs[ad_i])) : 0.0f);
             bool physical_bad = false;
             if (ad_row) {
@@ -370,10 +371,15 @@ _NATIVE = r"""
             if (ad_row) ad_delta[ad_i] = active ? ad_lu_rhs[ad_map[ad_i]] : -s_x[ad_i];
             const bool direction_bad = ad_any(ad_row && !isfinite(ad_delta[ad_i]));
             bool accepted = false;
-            if (ad_lu_ok && !direction_bad) {
+            // A failed Newton direction gets a merit-tested projected direction,
+            // not an unconditional diagonal update. Each direction has at most
+            // eight trials, and only one accepted correction consumes an outer.
+            for (int direction = 0; direction < 2 && !accepted; ++direction) {
+                if (direction == 0 && (!ad_lu_ok || direction_bad)) continue;
+                const float update = direction == 0 && ad_row ? ad_delta[ad_i] : projected_direction;
                 for (int trial = 0; trial < 8; ++trial) {
                     const float alpha = ldexpf(1.0f, -trial);
-                    if (ad_row) s_y[ad_i] = s_x[ad_i] + alpha * ad_delta[ad_i];
+                    if (ad_row) s_y[ad_i] = s_x[ad_i] + alpha * update;
                     SYNC();
                     ad_project(s_y);
                     const float trial_residual = ad_residual(s_y, true);
@@ -387,9 +393,8 @@ _NATIVE = r"""
                     }
                 }
             }
-            // A diagonal projected step is not a safe safeguard for dependent
-            // rows. Rejected LU/globalization hands off to the literal original
-            // EX1 recurrence, with only the unused outer budget remaining.
+            // If neither direction decreases the all-row merit, retain the
+            // literal original EX1 recurrence with only the unused budget.
             if (!accepted) break;
             ++ad_consumed;
             SYNC();
