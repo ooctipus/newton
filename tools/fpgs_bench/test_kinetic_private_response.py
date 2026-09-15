@@ -8,6 +8,7 @@ Positive-MF checks cover retained row ownership and routing, not an original
 CUDA general solve running on CPU through the diagnostic constructor shim.
 """
 
+import inspect
 import os
 import unittest
 from types import SimpleNamespace
@@ -25,10 +26,10 @@ from tools.fpgs_bench.test_kinetic_current_contact import contact_call
 from tools.fpgs_bench.test_kinetic_live_bindings import live_model
 
 
-def private_call(enabled, *, current=True):
+def private_call(enabled, *, current=True, friction_limit=0):
     """Bind the actual opt-in owner without changing the fixture's topology."""
     with patch.dict("os.environ", {"FEATHER_PGS_KUKA_PRIVATE_RESPONSE": str(int(enabled))}):
-        call = contact_call(current)[-1]
+        call = contact_call(current, friction_limit=friction_limit)[-1]
     # Oblique contacts exercise articulated response as well as the active
     # prefix limit in world 0; the original fixture's vertical normal can be
     # orthogonal to every revolute response axis.
@@ -91,16 +92,27 @@ def device_boundary(source, device, *, private):
     offset_eight = kinetic_solve.get_solve_kernel(arch)
     # These are the actual installed complement kernels. Their native snippets
     # select the CUDA branch when compiled on CUDA, even from a CPU-bound call.
-    row_kernels = (
-        source.private_response.complementary_rows
-        if private
-        else (
-            kinetic_rows.get_arm_kernel(arch),
-            kinetic_rows.get_prefix_kernel(arch),
-            current_contact.get_contact_kernel(arch),
-            kinetic_rows.get_validate_kernel(arch),
-        )
+    original_rows = (
+        kinetic_rows.get_arm_kernel(arch),
+        kinetic_rows.get_prefix_kernel(arch),
+        current_contact.get_contact_kernel(arch),
+        kinetic_rows.get_validate_kernel(arch),
     )
+    row_kernels = source.private_response.complementary_rows if private else original_rows
+
+    def launch_private():
+        wp.launch_tiled(
+            response_eight, dim=[worlds], inputs=private_args, block_dim=private_response.BLOCK_DIM, device=device
+        )
+
+    def original_rows_eight():
+        # Reuse the same completed allocator output: mixed one/three-row atomic
+        # reservations need not have equal order in two separate launches.
+        for kernel, arguments, dim in zip(
+            original_rows, row_args, (worlds, worlds, source.rows.settings.workers, worlds), strict=True
+        ):
+            wp.launch_tiled(kernel, dim=[dim], inputs=arguments, block_dim=32, device=device)
+        wp.launch_tiled(offset_eight, dim=[(worlds + 1) // 2], inputs=solve_args, block_dim=64, device=device)
 
     def launch():
         out.global_status.zero_()
@@ -134,7 +146,7 @@ def device_boundary(source, device, *, private):
         # Their positive finalized count tells the original offset owner to skip.
         wp.copy(solve.selector, state.mf_count)
         if private:
-            wp.launch_tiled(response_eight, dim=[worlds], inputs=private_args, block_dim=32, device=device)
+            launch_private()
         for kernel, arguments, dim in zip(
             row_kernels, row_args, (worlds, worlds, source.rows.settings.workers, worlds), strict=True
         ):
@@ -144,6 +156,8 @@ def device_boundary(source, device, *, private):
 
     return SimpleNamespace(
         launch=launch,
+        launch_private=launch_private,
+        original_rows_eight=original_rows_eight,
         device=device,
         plan=plan,
         held=held,
@@ -250,6 +264,25 @@ class TestKineticPrivateResponse(unittest.TestCase):
         self.assertIsNotNone(owner)
         self.assertTrue(callable(owner.kernel.func))
         self.assertTrue(owner.arguments)
+
+    def test_cooperative_mapping_and_independent_join(self):
+        """Bind all four warps and leave only the early owner on its stream."""
+        call = private_call(True)
+        self.assertEqual(call.private_response.block_dim, 128)
+        self.assertEqual(private_response.BLOCK_DIM, 128)
+        with patch.object(wp, "launch_tiled", wraps=wp.launch_tiled) as launch:
+            call.zero.launch()
+            call.solve.setup()
+            call.solve.allocate()
+        selected = [entry for entry in launch.call_args_list if entry.args[0] is call.private_response.kernel]
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0].kwargs["block_dim"], 128)
+        source = inspect.getsource(call.solve.solve)
+        self.assertNotIn("record_event", source)
+        self.assertNotIn("ScopedStream", source)
+        self.assertLess(source.index('dispatch("offset_eight")'), source.index('dispatch("general")'))
+        self.assertIn("finally:", source)
+        self.assertIn("solve.join()", source)
 
     def test_early_eight_retires_selected_panels_and_preserves_fallback(self):
         """Solve MF0 before old rows while preserving positive-MF and ZERO."""
@@ -416,6 +449,52 @@ class TestKineticPrivateResponse(unittest.TestCase):
     def test_cuda_private_response_boundary(self):
         """Run actual CUDA prefix/triplet/eight, graphs and finalized-MF skip."""
         self.check_device_boundary(os.environ["FPGS_TEST_DEVICE"])
+        self.check_cooperative_contacts(os.environ["FPGS_TEST_DEVICE"])
+
+    def check_cooperative_contacts(self, device):
+        """Cover mixed slot widths and one nonleader error on the same rows."""
+        source = private_call(True, friction_limit=2)
+        source.rows.raw.shape0.fill_(13)
+        source.rows.raw.shape1.fill_(17)
+        source.rows.raw.count.assign([12])
+        arm = device_boundary(source, device, private=True)
+        arm.launch()
+        count = int(arm.state.dense_count.numpy()[0])
+        prefix = int(arm.out.slot_counter.numpy()[0])
+        self.assertEqual(prefix % 2, 1)
+        widths = arm.raw.slots_needed.numpy()[:12]
+        self.assertEqual(set(widths), {1, 3})
+        slots = arm.raw.slot.numpy()[:12]
+        self.assertEqual(set((slots - prefix) % 4), {0, 1, 2, 3})
+        np.testing.assert_array_equal(arm.out.valid.numpy()[0, :count], 1)
+        np.testing.assert_array_equal(arm.solve.status.numpy(), 0)
+        velocity = arm.solve.v_out.numpy().copy()
+        impulses = arm.out.impulses.numpy()[0, :count].copy()
+        # These original kernels consume the exact same row order and operands,
+        # not a second allocation or a snapshot-restored production step.
+        arm.original_rows_eight()
+        self.assert_scaled_close(velocity, arm.solve.v_out.numpy())
+        self.assert_scaled_close(impulses, arm.out.impulses.numpy()[0, :count])
+        slot_map = arm.slot_raw.numpy().copy()
+        bad_slot = int(slots[np.flatnonzero((slots - prefix) % 4 == 2)[0]])
+        bad_map = slot_map.copy()
+        bad_map[0, bad_slot] = 13
+        arm.slot_raw.assign(bad_map)
+        before = arm.solve.v_out.numpy().copy()
+        arm.launch_private()
+        self.assertNotEqual(int(arm.out.status.numpy()[0]), 0)
+        self.assertNotEqual(int(arm.solve.status.numpy()[0]), 0)
+        self.assertEqual(int(arm.out.valid.numpy()[0, bad_slot]), 0)
+        np.testing.assert_array_equal(arm.solve.v_out.numpy(), before)
+        arm.slot_raw.assign(slot_map)
+        arm.launch_private()
+        np.testing.assert_array_equal(arm.out.status.numpy(), 0)
+        np.testing.assert_array_equal(arm.solve.status.numpy(), 0)
+        self.assert_scaled_close(arm.solve.v_out.numpy(), velocity)
+
+    def test_cooperative_mixed_slots_and_error_retirement(self):
+        """Check the CPU law and mixed-slot fixture before root's CUDA lease."""
+        self.check_cooperative_contacts("cpu")
 
     @unittest.skipUnless(os.environ.get("FPGS_TEST_DEVICE", "cpu").startswith("cuda"), "Explicit root-owned CUDA lease")
     def test_cuda_two_bank_stream_lifecycle(self):

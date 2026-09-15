@@ -28,15 +28,16 @@ from .kinetic_solve_types import KineticSolveData
 from .kinetic_types import CurrentKineticCache, HeldKineticOperator, KineticPlan
 
 PANEL_FLOATS = 192 * 29
-ARENA_FLOATS = 6276
+BLOCK_DIM = 128
+ARENA_FLOATS = 7144
 
 
 @wp.func_native(r"""
 #if defined(__CUDA_ARCH__)
-    __shared__ float private_response_arena[6276];
+    __shared__ float private_response_arena[7144];
     return reinterpret_cast<uint64_t>(private_response_arena);
 #else
-    return reinterpret_cast<uint64_t>(malloc(6276*sizeof(float)));
+    return reinterpret_cast<uint64_t>(malloc(7144*sizeof(float)));
 #endif
 """)
 def _storage() -> wp.uint64: ...
@@ -51,6 +52,34 @@ def _storage() -> wp.uint64: ...
 #endif
 """)
 def _good(world: int, out: DenseRowOutput) -> bool: ...
+
+
+@wp.func_native(r"""
+#if defined(__CUDA_ARCH__)
+    __syncthreads();
+#endif
+""")
+def _prefix_done(): ...
+
+
+@wp.func_native(r"""
+#if defined(__CUDA_ARCH__)
+    __syncthreads();
+    const int lane=threadIdx.x&31,warp=threadIdx.x>>5;
+#else
+    const int lane=0,warp=0;
+#endif
+    if(warp==0){
+        if(lane==0){
+            const auto* errors=reinterpret_cast<const int*>(reinterpret_cast<const float*>(address)+7140);
+            for(int k=0;k<4;++k)out.status.data[world]=wp::max(out.status.data[world],errors[k]);
+        }
+#if defined(__CUDA_ARCH__)
+        __syncwarp(0xffffffffu);
+#endif
+    }
+""")
+def _contacts_done(address: wp.uint64, world: int, out: DenseRowOutput): ...
 
 
 _VIEWS = r"""
@@ -95,8 +124,13 @@ _BEGIN = (
         && state.raw_invalid.data[0]==0 && solve.iterations==8 && solve.omega==1.0f
         && solve.iteration_offset==0 && solve.friction_start_iteration>=0;
     for(int k=0;k<4;++k)good=good && state.capacity_status.data[k]==0;
+#if defined(__CUDA_ARCH__)
+    good=good && blockDim.x==128;
+#endif
     if(lane==0){out.status.data[world]=good?0:2;out.secondary_nonzero.data[world]=0;
-        out.slot_counter.data[world]=0;solve.status.data[world]=good?0:1;}
+        out.slot_counter.data[world]=0;solve.status.data[world]=good?0:1;
+        auto* errors=reinterpret_cast<int*>(arena+7140);
+        for(int k=0;k<4;++k)errors[k]=0;}
     if(!all(good))return false;
     const int group=plan.secondary_group.data[world];
     for(int k=lane;k<180;k+=stride)arena[5856+k]=held.T.data[world*180+k];
@@ -178,12 +212,11 @@ def contact_source():
     const int count=raw.count.data[0],m=state.dense_count.data[world];
     if(count<0||count>settings.raw_capacity||count>raw.shape0.shape[0]){
         if(lane==0)out.status.data[world]=4;return;}
-    for(int slot=out.slot_counter.data[world];slot<m;++slot){
+    for(int slot=out.slot_counter.data[world]+warp;slot<m;slot+=warps){
         const int c=slot_raw.data[world*192+slot];
         if(c==-1)continue;
         if(c<0||c>=count||raw.world.data[c]!=world||raw.slot.data[c]!=slot||raw.path.data[c]!=0){
             if(lane==0)out.status.data[world]=4;continue;}
-        if(!all(out.status.data[world]==0))continue;
 """
         + source[end:]
     )
@@ -202,7 +235,23 @@ def contact_source():
         "/* Finalized MF0 has no physical-J consumer. */",
     )
     views = _VIEWS.replace("float* z=", "float* private_z=")
-    return views + _MOTION_VIEWS + _operator_local(source)
+    # Each contact warp owns its scratch and error word. No warp reads another
+    # warp's in-flight error; the block joins before canonical status is merged.
+    source = contact._replace(
+        source,
+        "float* s=reinterpret_cast<float*>(address);",
+        "float* s=arena+(warp==0?0:6276+(warp-1)*288);",
+    )
+    source = source.replace("out.status.data[world]", "private_errors[warp]")
+    ownership = r"""
+#if defined(__CUDA_ARCH__)
+    const int warp=threadIdx.x>>5,warps=4;
+#else
+    const int warp=0,warps=1;
+#endif
+    auto* private_errors=reinterpret_cast<int*>(arena+7140);
+"""
+    return views + _MOTION_VIEWS + ownership + _operator_local(source)
 
 
 @wp.func_native(contact_source())
@@ -306,7 +355,7 @@ def _solve(
 
 @functools.cache
 def get_kernel(arch):
-    """One warp owns one active MF0 world's complete row/solve lifetime."""
+    """Four contact warps share one panel; warp zero retains the original eight."""
 
     @wp.kernel(module="unique", enable_backward=False)
     def kinetic_private_response_eight(
@@ -337,10 +386,14 @@ def get_kernel(arch):
         if state.resolved[world] != 0 or state.mf_count[world] != 0:
             return
         address = _storage()
-        if _begin(address, world, plan, current, held, state, settings, out, solve):
-            _prefix(address, index, plan, held, prefix, state, settings, out)
-            if _good(world, out):
-                _contact(address, world, plan, current, held, raw, state, settings, arm, out, cache, slot_raw)
+        if logical < 32:
+            if _begin(address, world, plan, current, held, state, settings, out, solve):
+                _prefix(address, index, plan, held, prefix, state, settings, out)
+        _prefix_done()
+        if _good(world, out):
+            _contact(address, world, plan, current, held, raw, state, settings, arm, out, cache, slot_raw)
+        _contacts_done(address, world, out)
+        if logical < 32:
             if _validate(world, state, out, solve):
                 _solve(address, world, plan, held, state, out, solve)
         rows_source._release(address)
@@ -556,7 +609,7 @@ def install(binding, call):
         wp.launch_tiled(solve.kernels[name], dim=[dim], block_dim=block, inputs=solve.arguments[name], device=device)
 
     def launch_private():
-        wp.launch_tiled(private_kernel, dim=[worlds], block_dim=32, inputs=private_args, device=device)
+        wp.launch_tiled(private_kernel, dim=[worlds], block_dim=BLOCK_DIM, inputs=private_args, device=device)
 
     def allocate_launch():
         # The old row closure's clear moves BEFORE the fork. No other private
@@ -604,24 +657,13 @@ def install(binding, call):
         wp.launch(_check_positive, dim=worlds, inputs=[solve.guard, rows.state], device=device)
 
     def solve_phase():
-        if device.is_cuda:
-            # The independent positive-MF offset owner queues after private
-            # MF0 completion on the same stream, then overlaps original general.
-            wp.record_event(binding.ready)
-            with wp.ScopedStream(binding.stream):
-                wp.wait_event(binding.ready)
-                try:
-                    dispatch("offset_eight")
-                finally:
-                    wp.record_event(binding.done)
-                    binding.pending = True
-            try:
-                dispatch("general")
-            finally:
-                solve.join()
-        else:
-            dispatch("general")
+        # Positive-MF work consumes only the completed main-stream chain. It
+        # must not queue behind the independent early MF0 owner.
+        try:
             dispatch("offset_eight")
+            dispatch("general")
+        finally:
+            solve.join()
         guards.check_guard(solve.guard, device)
 
     solve.allocate = allocation.launch = allocate_launch
@@ -629,6 +671,7 @@ def install(binding, call):
     solve.materialize, solve.solve = materialize, solve_phase
     call.private_response = SimpleNamespace(
         kernel=private_kernel,
+        block_dim=BLOCK_DIM,
         arguments=private_args,
         slot_raw=slot_raw,
         allocator=mapped_allocator,
