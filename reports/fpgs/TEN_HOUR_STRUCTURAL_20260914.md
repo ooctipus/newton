@@ -739,3 +739,50 @@ The complete new finish+predict+repair allowance is2.784305ms for a2ms RTX
 saving. This is a falsifiable budget, not a predicted or measured speedup.
 Original root inertial/transport terms, current external/control forces,
 current geometry versus held-factor cadence, and public state remain required.
+
+## September15 01:18: two structural gains reproduced; Franka implemented
+
+The complete G1 current/next moment-and-bias owner removes2.531360 ms RTX
+physics in three alternating paired16K rounds:18.188705->15.657344 ms,
+1.161672x. GB20.916696->20.503290 ms,1.020163x. No old current dynamics,
+composite, predictor or publication producer remains in its selected boundary.
+The new finish/predict/repair sum3.148854 ms RTX exceeds its initial2.70 ms
+allocation, but geometric-input factorization additionally saves0.552298 ms.
+The smaller GB gain is explained by its cheaper original boundary and more
+expensive new owner, not a hidden duplicated producer. Physical current/held,
+loaded contact, reset/graph and retained Allegro/Kuka CUDA checks pass on both.
+The reproducible cyclic stream-destruction crash was fixed in Newton teardown;
+there is no per-step synchronization change. Code/report is pushed on
+`ooctipus/fpgs-g1-kinetic-state-20260914`, report tip8cd56886.
+
+Kuka's combined current geometry/ZERO/allocation cache removes0.519343 ms RTX
+physics over qualified1a9 in three paired rounds:10.999563->10.480220 ms,
+1.049555x. GB11.276758->10.689198 ms,1.054968x. Old CSR/ZERO/count/allocation/
+triplet entries are replaced, not retained alongside it; the remaining response
+contraction costs1.476172/1.860778 ms. The original1ms saving plan is missed,
+but the measured whole gain is useful. New-boundary CUDA and actual current/
+held4K1608-call physical checks pass. Natural trajectories lack a coupled
+cohort; the retained loaded coupled/type-4 CUDA fixture passes separately on
+both cards. This compositional qualification is explicit, not relabeled as
+complete naturally coupled coverage. Runtimec1c678a and detailed results are
+pushed on `ooctipus/fpgs-kuka-current-contact-20260915`.
+
+Latest RTX physics ratios using each task's LAST corrected MJWarp denominator
+(not a new all-backend benchmark) are Franka1.95x, Kuka2.62x, Allegro4.21x,
+ANYmal-D3.91x, G12.42x, Keyboard3.69x. Only Kuka/G1 changed in this paragraph.
+The user requires at least4x for every task; that minimum remains unmet.
+
+Franka now implements the same complete current/next representation retirement
+for13 bodies, retaining original9/6 factors and every contact/PGS consumer.
+Saved current H/bias/held-force/publication and actual loaded eight-sweep reset/
+notification/two-bank graph tests pass on both cards. The final formatted full
+suite is being rerun, followed immediately by original16K whole A/B. There is
+no Franka timing claim yet. Native checkpoint is before its01:59 deadline.
+
+Next Kuka work is one distinct MF-count-zero private response/eight-sweep owner
+forked BEFORE current MF preparation, retaining positive-MF fallback and the
+complete post-join guard/publication. Current complete affected region3.642265
+ms gives a2.595454 ms allowance for a10% whole gain, including reverse-map,
+allocator, fallback, overlap and resource costs. Prototype checkpoint02:40 UTC;
+no mapping grid or new benchmark framework. Its isolated branch is
+`ooctipus/fpgs-kuka-private-response-20260915`; it has no measured result yet.
