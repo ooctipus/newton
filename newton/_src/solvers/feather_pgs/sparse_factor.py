@@ -532,6 +532,10 @@ class SparseFactor:
         self.packet_rows = os.environ.get("FEATHER_PGS_SPARSE_PACKETS") == "1" and c == 100
         self.block_contacts = os.environ.get("FEATHER_PGS_SPARSE_CONTACT_BLOCK") == "1"
         self.metric_tangents = os.environ.get("FEATHER_PGS_SPARSE_METRIC_TANGENTS") == "1" and c == 100
+        self.present_ports = os.environ.get("FEATHER_PGS_SPARSE_PRESENT_PORTS") == "1"
+        self.port_owner = None
+        if self.present_ports and (not self.metric_tangents or self.packet_rows or self.block_contacts):
+            raise ValueError("Present ports require the exclusive metric capacity100 owner")
         if self.metric_tangents and (self.packet_rows or self.block_contacts):
             raise ValueError("Sparse metric tangents, packets and contact-block rows are mutually exclusive")
         self.level_update = os.environ.get("FEATHER_PGS_SPARSE_LEVEL_UPDATE") == "1"
@@ -572,6 +576,10 @@ class SparseFactor:
 
             install(self)
         self.kinetic_state = None
+        if self.present_ports:
+            from .sparse_present_ports import PresentPorts  # noqa: PLC0415
+
+            self.port_owner = PresentPorts(self)
 
     def install_kinetic_state(self):
         """Admit the complete state producer only after solver construction."""
@@ -662,6 +670,8 @@ class SparseFactor:
 
         s, model, device = self.solver, self.solver.model, self.solver.model.device
         c = s.dense_max_constraints
+        if self.present_ports:
+            self.port_owner.bind_current(state_in, state_aug, contacts, dt)
         if self.packet_rows:
             from .sparse_packet_rows import bind_current  # noqa: PLC0415
 
@@ -671,7 +681,7 @@ class SparseFactor:
             s._row_dropped_dense.zero_()
             s._row_dropped_mf.zero_()
             s._row_dropped_propagation.zero_()
-        tiled_prefix = self.packet_rows or self.parallel_limit_prefix
+        tiled_prefix = self.packet_rows or self.parallel_limit_prefix or self.present_ports
         prefix_launch = wp.launch_tiled if tiled_prefix else wp.launch
         prefix_launch(
             self.kernels.prefix,
@@ -767,7 +777,7 @@ class SparseFactor:
                 device=device,
             )
             wp.launch(
-                k.prepare_world_contact_rows,
+                self.port_owner.metadata if self.present_ports else k.prepare_world_contact_rows,
                 dim=threads,
                 inputs=[
                     contacts.rigid_contact_count,
@@ -812,10 +822,11 @@ class SparseFactor:
                     s.phi,
                     s.target_velocity,
                     s.row_restitution,
+                    *([self.port_owner.data] if self.present_ports else []),
                 ],
                 device=device,
             )
-            if self.packet_rows:
+            if self.packet_rows or self.present_ports:
                 wp.launch(
                     self.kernels.contacts,
                     dim=threads,
@@ -877,6 +888,9 @@ class SparseFactor:
 
     def restitution(self, dt):
         """Use the original current incident trigger after original bias construction."""
+        if self.present_ports:
+            self.port_owner.packet_input.dt = dt
+            return
         if self.packet_rows:
             self.packet_input.dt = dt
             return  # Applied from the current incident during local row formation.
@@ -902,6 +916,9 @@ class SparseFactor:
 
     def solve(self, rhs, iterations, omega, friction_start):
         """Visit every original row and return complete physical velocity once."""
+        if self.present_ports:
+            self.port_owner.solve(rhs, iterations, omega, friction_start)
+            return
         if self.packet_rows:
             from .sparse_packet_rows import solve  # noqa: PLC0415
 

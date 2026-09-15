@@ -195,3 +195,43 @@ root's GPU runs. A first loss gets causal owner attribution, not a new grid.
 
 Status at this commit: pre-code plan only. No native timing, new physical
 qualification, promotion or all-task four-times result is claimed.
+
+## First complete native readiness
+
+The original driver-query results, already recorded in
+`FRANKA_KINETIC_PAIRED16_20260915.md:321--330`, take precedence over generic
+guide limits for these cards: RTX reports24 CTAs and102400 shared bytes per
+SM; GB reports32 CTAs and233472 shared bytes. Both report65536 registers.
+These are static limits, not observed occupancy. No new device query was run.
+
+Initial source/AOT work is complete before the06:15 checkpoint. The first
+source-matched offline report is
+`/tmp/fpgs-g1-present-ports-offline-5jml9ov6/offline01/report.json`.
+All six actual port/fallback entries compile on SM120/SM100. Port owner uses
+80/78 registers,5764 shared bytes including inherited128-byte scratch,
+zero stack and zero spills. Masked original contact is56 registers/128 bytes;
+masked original metric is72 registers/1116 bytes. Root's review requested
+placing the new contact mode guard after the original capacity/valid check;
+that ordering is corrected in the final source. It still precedes all contact
+geometry and held-W reads.
+
+Final offline02 compiles all14 actual entries on SM120/SM100, including the
+augmented metadata, original packet prefix and both remaining fallback owners:
+`/tmp/fpgs-g1-present-ports-offline-5jml9ov6/offline02/report.json`, SHA256
+`4286c57e835067f92096c31c7602e8625dc25f2e8cbdb5e848a8bad5cf23fa11`.
+Port/fallback resources above are unchanged. Metadata costs106/96 registers
+and1024 shared bytes; prefix48/40 registers and128 bytes; fallback limits48
+registers/1024 bytes; fallback restitution30/32 registers/1024 bytes.
+All14 entries have zero stack and spills. These static resources do not
+establish achieved occupancy or a performance gain.
+
+The new CPU regression first failed on missing explicit default-off ownership.
+All10 CPU controls pass in3.481 seconds (session69442), including two new
+controls: API/admission and metadata-only stable limit keys plus current
+signed wrench geometry, with W/Z/diagonal/incident poisoned. An intervening
+CPU run caught an exact decorator-cloning mismatch in the restitution wrapper;
+the corrected wrapper retains the original disable-backward setting and law.
+Existing numerical helper tolerances are unchanged. Root and the independent
+test/source reviewer found no concrete F/C, committed-delta, sign or alias
+lifetime blocker. Native physical correctness and whole cost remain unmeasured
+at this readiness checkpoint; CPU/AOT is not a CUDA qualification claim.
