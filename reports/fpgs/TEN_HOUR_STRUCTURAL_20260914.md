@@ -1510,3 +1510,57 @@ test and completed report after measured runtime94153754; runtime bytes are
 unchanged. Full staged `uvx pre-commit run --all-files` passes. The branch
 report is `reports/fpgs/KEYBOARD_LINEAR_STATE_20260915.md`; no PR was opened,
 no Isaac Lab code or parent pointer changed, and all root GPU sessions exited.
+
+## 2026-09-15 11:58 UTC — full-visit lazy-response checkpoint
+
+Continued from retained Keyboard `ca0d427a`, without changing its worktree or
+the fixed Lab. A new full-visit physical-delta response prototype was funded
+at11:07, passed five CPU and two native tests per GPU, and reached the first
+paired16K whole screen by11:34. It preserves every original normal visit,
+eight sweeps, friction law, original endpoint r0, capacities and stream joins.
+It is distinct from the closed once-per-sweep omission/private-panel paths.
+
+Measured runtime `eb9c0ec8f9a57dcf1c574ed5fcc5591d8f686eef` gives
+RTX10.508200→10.645301 ms (0.987121x) and GB10.634408→10.393238 ms
+(1.023205x) versus retained, one discovery round only. All eight capacity/
+finite boundaries, source guards and final idle checks pass. No accepted
+new gain or new MJWarp ratio follows. A three-step paired node diagnosis
+immediately follows, not a long qualification/repeat campaign.
+
+The diagnosed failed premise is producer retirement. Complete RTX row/
+response time only falls1.731265→1.435265 ms: original MF0 already formed
+physical J in shared storage before publishing Z; publishing J instead
+retains almost the same row traffic, current geometry and metadata. Joined
+solve1.157664→1.132097 ms is roughly unchanged. Qualification/materialization
+grows0.329248→0.514188 ms. Complete affected union only saves0.129757 ms RTX
+and0.103862 ms GB. Added registers are measured but do not explain the
+missing millisecond on RTX; no register/tile grid is funded.
+
+Source and report are clean and remote-verified at
+`dfc1112872798027bf224ec5b086cfc33a6cc0e2`, branch
+`ooctipus/fpgs-kuka-lazy-response-20260915` on `ooctipus/newton`.
+Full pre-commit passes. This branch retains a default-off, UNPROMOTED
+prototype, not a replacement for validated `ca0d427a`. Reproduction and
+exact source/artifact pins are in its
+`reports/fpgs/KUKA_LAZY_RESPONSE_20260915.md`.
+Whole artifacts are `/tmp/fpgs-kuka-lazy-response-paired16k-20260915-01`;
+node artifacts append`-nodes` after`response`; strict readout is
+`/tmp/fpgs-kuka-lazy-node-audit-AQ9Y0jsn`. All root GPU/profiler processes
+have exited without cleanup signals. No parent pointer or Lab change.
+
+Two bounded follow-up cost checks prevent an immediate unfunded rewrite:
+
+- Lazy J still needs106/106 normal Jacobians in11 selected current worst
+  cases, and3822/3841 in351 historical active MF0 worlds. Only tangent J
+  largely disappears (18/212 and130/7682). Total J-block counts fall61–66%,
+  not97%; remaining normal construction moves into the serial world solve.
+  These are saved-scope CPU counts, not today's16K population telemetry.
+  A complete packet/producer replacement remains unvalidated and must price
+  packet construction, lookup, normal construction and efficient fallback.
+- Franka explicit-J lazy-Y/no-A changes only its local solve owner. The
+  three local owner sums1.383692 ms overlap to0.662678 ms union and only
+  0.558550 ms exclusive under retained scheduling. A0.55 ms milestone would
+  consume98.47% of that exclusive interval. Its J/prefix/MF producers remain;
+  the broader1.295 ms family cannot be claimed as this proposal's budget.
+
+The additional large-gain and all-representative RTX4x goals remain unfinished.
