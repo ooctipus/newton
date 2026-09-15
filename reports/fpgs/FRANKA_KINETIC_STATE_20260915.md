@@ -193,3 +193,61 @@ All six CPU owner controls and three retained-factor controls pass, including
 changed-input rejection and unchanged-notification reuse. No native arithmetic,
 factor factory, solver allowance or Lab behavior changed. A fresh integrated
 screen will determine the actual wall cost and remaining GPU shortfall.
+
+## Post-fix whole screen and diagnosed GPU miss
+
+Clean host-fix candidate `edd49d0b` passes all three original CUDA selectors
+again: RTX6.491 s, GB6.701 s, clean exits with no skips and unchanged numerical
+error maxima. Whole screen02 completes four children, eight capacity boundaries,
+source/idle guards and all13 helper rehashes without changing a physics budget.
+Manifest `/tmp/fpgs-franka-kinetic-state-paired16k-20260915-02/manifest.json`,
+SHA256 `06a30f25fd7e441d4781df9ef1daa9d1e1660cf716f4e30098c76778689ff255`.
+
+| Per environment step | RTX baseline | RTX candidate | GB baseline | GB candidate |
+| --- | ---: | ---: | ---: | ---: |
+| Physics graph (ms) | 5.457961 | 5.466557 | 5.025921 | 5.383826 |
+| Environment wall (ms) | 28.784147 | 44.972803 | 27.884037 | 44.296596 |
+
+There is no physics gain:0.99843x RTX /0.93352x GB. The major host regression
+is reduced, not fully resolved: full structural fingerprints still add about
+16 ms to this reset-heavy wall comparison. Do not count host-function speedup
+against the broken1.69-second prototype as improvement over accepted FPGS.
+
+The clean three-step node pair also passes the original analyzer and all
+source/capacity/idle checks. Manifest
+`/tmp/fpgs-franka-kinetic-state-nodes-paired16k-20260915-01/manifest.json`,
+SHA256 `9b0bcbb2c3873adf6ff10c829d8da4ca4df302bfa3bceeb96ff15ec319242b62`.
+All13 helpers rehash correctly. The preserved strict process/correlation/NVTX
+interval reader (`ce09a496`, with explicit in-memory Franka owner names) finds
+12 physics roots and1860->1584 nodes, including memory work, per capture.
+
+| Complete state/factor/drive/mask family (ms) | RTX old | RTX new | GB old | GB new |
+| --- | ---: | ---: | ---: | ---: |
+| Summed kernel durations | 2.513538 | 2.055565 | 2.089395 | 2.141363 |
+| Union duration | 2.105090 | 2.024397 | 1.695736 | 2.113129 |
+| Exclusive busy contribution | 2.026978 | 2.019715 | 1.635162 | 2.105043 |
+
+The decisive mismatch is lost overlap, not a duplicate old producer. Internal
+family overlap falls0.408448->0.031168 ms RTX and0.393659->0.028235 ms GB.
+Old tau overlaps composite/factor work by0.271510/0.260445 ms. Moving the new
+live-force reduction and its serial factor actions after both factors loses
+that opportunity. Fewer summed operations therefore do not imply the planned
+whole-step saving.
+
+New finish/predict/repair cost1.047489/.538603/.216000 ms RTX and
+1.177771/.534400/.1916 ms GB. Original integration/FK/finalization publication
+is0.939467/.724846 ms, so the new finish itself is also more expensive,
+especially on GB. Each new owner launches eight times per environment step;
+24 observed calls per capture show the expected full first repair followed
+by early-return repairs, and alternating requested/held geometry. No duplicate
+full repair or H refresh was found. Retired producer absence is confirmed.
+The unchanged RTX mixed packet solve also grows0.5093->0.6627 ms in these
+short trajectory-sensitive windows; it is not credited as native owner work.
+
+Packing finish alone is not a funded large correction. The three new owners
+total1.802093 ms RTX; a conservative0.75 ms reduction would require all three
+to fit1.052093 ms, while retaining every factor/row/PGS consumer. The earlier
+small paired-publication improvement does not establish that result. Any next
+mapping hypothesis must explicitly charge longer per-lane loops, scratch,
+lost overlap and the remaining host regression. This prototype remains off
+and unpromoted; accepted Franka performance is unchanged.
