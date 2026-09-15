@@ -139,3 +139,57 @@ certificate inferred from trajectory distance. Required PGS consumers and
 their iteration allowances remain unchanged.
 
 Whole16K timing follows these checks; no performance gain is established yet.
+
+## First integrated screen: not promoted, 01:30 UTC
+
+The unchanged paired driver completed at clean candidate
+`4d35ca1abe4a8887dd00fe57b534958fb2779e93` versus qualified `1a9efc33`.
+Output: `/tmp/fpgs-franka-kinetic-state-paired16k-20260915-01`;
+manifest SHA256
+`5a87056ab394e8024d4e4117860d80a8e58f8739e7bfac2ecb0d20b27fb97ecc`.
+All four children exited0 without cleanup signals; eight boundary checks,
+source/idle guards and unchanged budgets passed. This is one discovery round,
+not repeated timing evidence or a promotion.
+
+| Per environment step | RTX baseline | RTX candidate | GB baseline | GB candidate |
+| --- | ---: | ---: | ---: | ---: |
+| Physics graph (ms) | 5.464454 | 5.369242 | 5.032037 | 5.412950 |
+| Environment wall (ms) | 29.233054 | 1694.440487 | 28.371940 | 1692.517603 |
+
+The physics saving is only0.095212 ms on RTX (1.01773x), with a0.380913 ms
+loss on GB (0.92963x). The planned1 ms structural saving was not achieved.
+The separate wall result is a severe regression and is preserved, not excluded
+as noise. The GB host breakdown places1672.220 ms in `event.apply` inside
+1676.156 ms of reset work; the GPUs were mostly idle during warmup.
+
+Static inspection identifies a new host-side suspect: unchanged fixed-root
+pose writes notify `JOINT_PROPERTIES`, and the new owner's `validate_model`
+rebuilds the complete16K Python ownership plan after already matching its
+fingerprints. The original row-packet validation does not redo that world loop.
+A CPU timing/regression is being added before replacing that redundant proof
+with checks of all proof inputs. No Lab notification or numerical flag is
+being disabled. An attempted read-only process stack sample was permission
+denied; the report does not claim a successful stack attribution.
+
+Fixing that host regression alone cannot establish the missing physics gain.
+The next screen must measure the complete replacement boundary and diagnose
+why the structural cost allowance failed before any targeted correction.
+
+### Host regression correction, 01:50 UTC
+
+On the actual saved512-world owner, median `build_plan` time is47.402 ms
+and original `validate_model` is47.698 ms. Its old incomplete fingerprint
+checks alone take0.457 ms. A regression first failed on the unconditional
+plan reconstruction. The correction fingerprints the previously omitted
+articulation ends, body ownership, both group maps, CRBA source9, and scalar
+model/solver/group dimensions. It preserves every original model/anchor
+fingerprint and the original numeric-notification allowlist. Because all
+inputs to the pure construction function are unchanged, redoing its per-world
+loop adds no proof. Changed arrays or dimensions still require reconstruction.
+
+Corrected complete validation takes0.492 ms median at512 worlds. This is a
+host-function measurement, not a physics speedup or a measured16K wall result.
+All six CPU owner controls and three retained-factor controls pass, including
+changed-input rejection and unchanged-notification reuse. No native arithmetic,
+factor factory, solver allowance or Lab behavior changed. A fresh integrated
+screen will determine the actual wall cost and remaining GPU shortfall.

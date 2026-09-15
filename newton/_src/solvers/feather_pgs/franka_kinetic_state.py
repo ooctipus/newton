@@ -646,6 +646,21 @@ def _fingerprint(array):
     return value.shape, value.dtype.str, hashlib.sha256(value.tobytes()).digest()
 
 
+def _plan_dimensions(solver):
+    """Include scalar proof inputs and the dimensions of the retained storage owners."""
+    return (
+        solver.world_count,
+        solver.model.world_count,
+        solver.model.body_count,
+        solver.model.joint_count,
+        solver.model.articulation_count,
+        solver.model.joint_coord_count,
+        solver.model.joint_dof_count,
+        solver.n_arts_by_size.get(9),
+        solver.n_arts_by_size.get(6),
+    )
+
+
 @wp.kernel
 def _invalidate(world_mask: wp.array[wp.bool], plan: KineticPlan, cache: KineticData):
     world = wp.tid()
@@ -693,13 +708,20 @@ class FrankaKineticState:
             name: _fingerprint(getattr(solver, name))
             for name in (
                 "art_to_world",
+                "articulation_joint_end",
                 "articulation_dof_start",
                 "articulation_response_dof_count",
+                "body_to_articulation",
                 "_prescribed_articulation",
                 "body_response_dof_mask",
                 "_free_root_joint_indices",
             )
         }
+        self._group_plan = {
+            (name, size): _fingerprint(getattr(solver, name)[size])
+            for name, size in (("group_to_art", 9), ("group_to_art", 6), ("_crba_source_dof_by_size", 9))
+        }
+        self._plan_dimensions = _plan_dimensions(solver)
 
     def validate_model(self, flags=None):
         """Check all immutable ownership before caller mutates validity or held epochs."""
@@ -713,15 +735,22 @@ class FrankaKineticState:
             # Match the already qualified notification contract: these flags
             # change numeric bindings, not parent/axis/anchor/body membership.
             return
+        if _plan_dimensions(self.solver) != self._plan_dimensions:
+            raise RuntimeError("Franka kinetic dimensions changed; reconstruct and recapture")
         for name, expected in self._model_plan.items():
             if _fingerprint(getattr(self.solver.model, name)) != expected:
                 raise RuntimeError(f"Franka kinetic model {name} changed; reconstruct and recapture")
         for name, expected in self._solver_plan.items():
             if _fingerprint(getattr(self.solver, name)) != expected:
                 raise RuntimeError(f"Franka kinetic mapping {name} changed; reconstruct and recapture")
-        fresh = build_plan(self.solver)
-        if any(not np.array_equal(value, fresh[name]) for name, value in self.host_plan.items()):
-            raise RuntimeError("Franka kinetic ownership changed; reconstruct and recapture")
+        for (name, size), expected in self._group_plan.items():
+            value = getattr(self.solver, name).get(size)
+            if value is None or _fingerprint(value) != expected:
+                raise RuntimeError(f"Franka kinetic mapping {name}[{size}] changed; reconstruct and recapture")
+        # build_plan is a pure function of the complete inputs checked above.
+        # Equal shape/dtype/content and scalar dimensions preserve its original
+        # proof; rebuilding its per-world Python loop on every unchanged root
+        # notification adds no validation and scales with the environment count.
 
     def invalidate(self, world_mask=None):
         if world_mask is not None and (

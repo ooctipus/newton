@@ -567,6 +567,95 @@ class TestFrankaKineticStateCPU(unittest.TestCase):
         for name in ("begin", "predict", "finish", "invalidate", "validate_model", "check"):
             self.assertTrue(callable(getattr(module.FrankaKineticState, name)))
 
+    def test_structural_notification_reuses_complete_proof(self):
+        """Unchanged fixed-root notifications must not repeat the per-world topology proof."""
+        native = importlib.import_module("newton._src.solvers.feather_pgs.franka_kinetic_state")
+        capture = next(captures())
+        with np.load(capture["path"], allow_pickle=False) as snapshot:
+            case = bind_saved(snapshot, capture, "cpu")
+        with patch.object(native, "build_plan", side_effect=AssertionError("repeated topology proof")):
+            for flags in (None, 0, newton.ModelFlags.JOINT_PROPERTIES):
+                case.owner.validate_model(flags)
+        # Preserve the existing numeric-notification contract, not a wider one.
+        with patch.object(native, "_fingerprint", side_effect=AssertionError("numeric proof rescan")):
+            for flags in (
+                newton.ModelFlags.JOINT_DOF_PROPERTIES,
+                newton.ModelFlags.BODY_INERTIAL_PROPERTIES,
+                newton.ModelFlags.SHAPE_PROPERTIES,
+                newton.ModelFlags.MODEL_PROPERTIES,
+            ):
+                case.owner.validate_model(flags)
+
+    def test_structural_notification_rejects_changed_proof_inputs(self):
+        """Every plan input and allocation dimension still requires reconstruction when changed."""
+        capture = next(captures())
+        with np.load(capture["path"], allow_pickle=False) as snapshot:
+            case = bind_saved(snapshot, capture, "cpu")
+        model, solver = case.model, case.solver
+        arrays = [
+            (name, getattr(model, name))
+            for name in (*world_scan_owner.PLAN_FIELDS, "joint_axis", "joint_X_p", "joint_X_c")
+        ]
+        arrays.extend(
+            (name, getattr(solver, name))
+            for name in (
+                "art_to_world",
+                "articulation_joint_end",
+                "articulation_dof_start",
+                "articulation_response_dof_count",
+                "body_to_articulation",
+                "_prescribed_articulation",
+                "body_response_dof_mask",
+                "_free_root_joint_indices",
+            )
+        )
+        arrays.extend((f"group_to_art[{size}]", solver.group_to_art[size]) for size in (9, 6))
+        arrays.append(("source9", solver._crba_source_dof_by_size[9]))
+        for name, array in arrays:
+            original = array.numpy().copy()
+            changed = original.copy()
+            changed.flat[0] += 1
+            with self.subTest(array=name):
+                try:
+                    array.assign(changed)
+                    with self.assertRaisesRegex(RuntimeError, "reconstruct"):
+                        case.owner.validate_model(newton.ModelFlags.JOINT_PROPERTIES)
+                finally:
+                    array.assign(original)
+        for target, fields in (
+            (
+                model,
+                (
+                    "world_count",
+                    "body_count",
+                    "joint_count",
+                    "articulation_count",
+                    "joint_coord_count",
+                    "joint_dof_count",
+                ),
+            ),
+            (solver, ("world_count",)),
+        ):
+            for name in fields:
+                original = getattr(target, name)
+                with self.subTest(scalar=name):
+                    try:
+                        setattr(target, name, original + 1)
+                        with self.assertRaisesRegex(RuntimeError, "reconstruct"):
+                            case.owner.validate_model(newton.ModelFlags.JOINT_PROPERTIES)
+                    finally:
+                        setattr(target, name, original)
+        for size in (9, 6):
+            original = solver.n_arts_by_size[size]
+            with self.subTest(group_count=size):
+                try:
+                    solver.n_arts_by_size[size] += 1
+                    with self.assertRaisesRegex(RuntimeError, "reconstruct"):
+                        case.owner.validate_model(newton.ModelFlags.JOINT_PROPERTIES)
+                finally:
+                    solver.n_arts_by_size[size] = original
+        case.owner.validate_model(newton.ModelFlags.JOINT_PROPERTIES)
+
     def test_saved_current_physical_geometry_and_held_force(self):
         """Check four real current epochs, held factors and every retained free/prescribed service."""
         for capture in captures():
