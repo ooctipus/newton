@@ -127,7 +127,7 @@ class TestSparsePairedWorldsCUDA(unittest.TestCase):
         extra = nodes[full].copy()
         extra[17] = -1
         nodes = np.concatenate((nodes, extra[None]))
-        plan.support_nodes = wp.array(nodes.ravel(), dtype=int, device=device)
+        plan.support_nodes = wp.array(nodes, dtype=int, device=device)
         plan.support_count = wp.array(np.append(lengths, 17).astype(np.int32), dtype=int, device=device)
         counts_host = np.array([0, 3, 4, 7, 13, 9, 6, 33, 66, 99, 100, 12, 3, 45, 8, 2, 7], np.int32)
         counts = wp.array(counts_host, dtype=int, device=device)
