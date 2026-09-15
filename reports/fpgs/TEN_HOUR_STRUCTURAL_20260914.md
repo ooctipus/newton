@@ -1726,3 +1726,29 @@ normal/residual/update work remains. This is not an implemented optimization.
 No new accepted gain, MJWarp ratio, Lab edit or retained runtime change.
 Read-only sudo profiling authority was requested because both unprivileged
 hardware-counter attempts failed; no privileged command has been attempted.
+
+## 2026-09-15 16:30 UTC — profiling works without sudo; paired solve funded
+
+User requires no sudo. Same-input native software profiling now passes on
+both GPUs without privileged access or driver changes. The first detailed
+18-counter version distorted runtime by42% RTX/55% GB and is not used for
+phase timing. Corrected two-region captures preserve72 registers and all
+original math/barriers, with measured overhead0.52–1.21%, byte-exact outputs
+and unchanged live buffers. Scalar rows account for33.85–35.89% of sampled
+elapsed cycles; metric disk calculation12.30–15.37%. These are not wall-time
+fractions or hardware stall counters. Source, raw data hashes and reproduction
+are pushed and remote-verified at465cb7706e9c8fb6f8ad6a1f0fb0409a24bcdccf on
+`ooctipus/fpgs-g1-unprivileged-profile-20260915` in `ooctipus/newton`.
+
+Fund one distinct packing prototype: two16-lane worlds per warp, sixteen
+worlds per256-thread CTA, locally sorted by current row count inside that
+same launch. Support17/18 stays complete, with original metric/scalar order
+and physical settings. No new global queue or producer. First10% RTX whole
+milestone requires saving1.5686 ms, taking the3.9188 ms GS owner below2.3502 ms.
+The fresh full16K count-only packing proxy is1.895x on both cards, not a
+measured speedup. Register residency, branch divergence and extra lane-striped
+decode are explicit risks. Card: `reports/fpgs/G1_PAIRED_SOLVE_20260915.md` in
+`/home/octi/Projects/newton-fpgs-g1-paired-solve-20260915`.
+Runtime and focused test implementation proceed in parallel; first native/
+whole checkpoint is budgeted within45 minutes from16:22 UTC. No accepted
+solver gain or fresh MJWarp ratio is claimed. Retained Newton and Lab unchanged.
