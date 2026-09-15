@@ -100,3 +100,31 @@ Factor file remains byte-identical to91f505f5, SHA256
 The runtime diff starts after all three paired16 physics factories and changes
 only the proof kernel, constructor proof setup and validator helpers/dispatch.
 CPU generated repair/finish/predict kernel identities remain unchanged.
+
+## Preserve the original stream envelope before CUDA qualification
+
+Pre-correction commit `04254d65e0794777523d2d97f8fa4a224e914775` was not
+GPU-tested or promoted. Independent review found that Warp `array.numpy()`
+enters `ScopedStream(device.null_stream)` before reading model data, whereas
+the initial device comparison used the caller stream before its final
+readback. The fixed Lab same-stream path was ordered, but preserving the
+generic existing contract requires the null-stream envelope before comparison.
+
+The minimal correction wraps `_validate_device_proof()` in
+`wp.ScopedStream(self._proof_device.null_stream)`. Its existing `sync_enter`
+orders after the caller stream and exit restores that caller. This does not
+claim synchronization with every independent non-blocking stream and adds no
+new global-device synchronization API or additional host payload.
+
+Regression first: the focused test extension fails on04254d65 because the
+first comparison has no preceding stream envelope. After correction, all11
+CPU controls and full pre-commit pass again. The existing CUDA test helper now
+uses an explicit caller stream, requires comparisons on the null stream and
+caller restoration, and queues each changed last word on the caller stream
+before notification without an intervening readback. Root alone executes it.
+
+Corrected runtime SHA256:
+`fa9aa0e1888c1b6bf0e05e73b89e92175ee5fa6de40ee08286e8e952e85c1cfe`.
+Corrected test SHA256:
+`a19104b5f56e84b92afb55aca324fbae66cdd250c8a7e57f6d0a2f5cb4aa17a7`.
+All paired16 physical factories and retained-factor sources remain unchanged.

@@ -872,7 +872,10 @@ class FrankaKineticState:
         if _plan_dimensions(self.solver) != self._plan_dimensions:
             raise RuntimeError("Franka kinetic dimensions changed; reconstruct and recapture")
         if self._device_proof is not None:
-            self._validate_device_proof()
+            # Match array.numpy(): order reads on the null stream after the
+            # caller stream, then restore it without a new global sync API.
+            with wp.ScopedStream(self._proof_device.null_stream):
+                self._validate_device_proof()
             return
         for name, expected in self._model_plan.items():
             if _fingerprint(getattr(self.solver.model, name)) != expected:

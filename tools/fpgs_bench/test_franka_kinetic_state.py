@@ -572,24 +572,44 @@ def check_device_proof(test, device):
     owner._initialize_device_proof()
     test.assertEqual(len(owner._device_proof), 22)
     test.assertEqual(sum(entry[0].size * 4 for entry in owner._device_proof), 813392)
+    proof_device = wp.get_device(device)
+    caller_stream = wp.Stream(device=proof_device) if proof_device.is_cuda else None
+    original_launch = wp.launch
+
+    def checked_launch(kernel, *args, **kwargs):
+        if kernel is native._compare_proof_words:
+            test.assertGreater(stream_scope.call_count, 0, "compare precedes the original read-ordering envelope")
+            test.assertIs(stream_scope.call_args_list[0].args[0], proof_device.null_stream)
+            if proof_device.is_cuda:
+                test.assertEqual(wp.get_stream(proof_device), proof_device.null_stream)
+        return original_launch(kernel, *args, **kwargs)
+
     with (
+        wp.ScopedStream(caller_stream),
         patch.object(native, "_fingerprint", side_effect=AssertionError("model-array readback")),
-        patch.object(wp, "launch", wraps=wp.launch) as launch,
+        patch.object(wp, "ScopedStream", wraps=wp.ScopedStream) as stream_scope,
+        patch.object(wp, "launch", side_effect=checked_launch) as launch,
         patch.object(owner._proof_status, "numpy", wraps=owner._proof_status.numpy) as readback,
     ):
         owner.validate_model(newton.ModelFlags.JOINT_PROPERTIES)
         test.assertEqual(sum(call.args[0] is native._compare_proof_words for call in launch.call_args_list), 22)
         test.assertEqual(readback.call_count, 1)
+        if proof_device.is_cuda:
+            test.assertEqual(wp.get_stream(proof_device), caller_stream)
     for label, array, _ in owner._proof_arrays():
         original = array.numpy().copy()
         changed = original.copy()
         changed.flat[-1] += 1
-        with test.subTest(proof=label):
+        with test.subTest(proof=label), wp.ScopedStream(caller_stream):
             try:
+                # Queue the write on the explicit caller stream. Notification
+                # must order the comparison after it without a preceding readback.
                 array.assign(changed)
                 with patch.object(native, "_fingerprint", side_effect=AssertionError("changed-array readback")):
                     with test.assertRaisesRegex(RuntimeError, "reconstruct"):
                         owner.validate_model(newton.ModelFlags.JOINT_PROPERTIES)
+                if proof_device.is_cuda:
+                    test.assertEqual(wp.get_stream(proof_device), caller_stream)
             finally:
                 array.assign(original)
         owner.validate_model(newton.ModelFlags.JOINT_PROPERTIES)
