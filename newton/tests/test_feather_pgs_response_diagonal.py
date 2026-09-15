@@ -419,6 +419,64 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         expected = np.float32(1.0) / (np.dot(motion, response) + armature + drive_stiffness)
         np.testing.assert_allclose(inverse_mass.numpy()[0], expected, rtol=2.0e-6, atol=0.0)
 
+    def test_linear_diagonal_mass_ignores_retired_terms_and_holds_masks(self):
+        """Use current translational mass and positive drive K without inertia terms."""
+        for device in [wp.get_device("cpu"), *wp.get_cuda_devices()]:
+            with self.subTest(device=str(device)):
+                mass = wp.array((2.5, 1.7), dtype=float, device=device)
+                motion = wp.array(
+                    (
+                        wp.spatial_vector(0.3, -0.2, 1.4, 0.0, 0.0, 0.0),
+                        wp.spatial_vector(-0.7, 0.5, 0.2, 0.0, 0.0, 0.0),
+                    ),
+                    dtype=wp.spatial_vector,
+                    device=device,
+                )
+                mask = wp.array((1, 0), dtype=int, device=device)
+                stiffness = wp.array((0.75, 0.0), dtype=float, device=device)
+                inverse = wp.array((7.0, 11.0), dtype=float, device=device)
+                terms = wp.full((2, 12), float("nan"), dtype=float, device=device)
+                kernel = _get_direct_diagonal_inverse_mass_kernel(1, str(device.arch), linear_state=True)
+                inputs = [
+                    wp.array((0, 1, 2), dtype=int, device=device),
+                    wp.array((0, 1, 2), dtype=int, device=device),
+                    mask,
+                    wp.array((0, 1), dtype=int, device=device),
+                    motion,
+                    mass,
+                    terms,
+                    wp.array((0, 1), dtype=int, device=device),
+                    wp.array((0,), dtype=int, device=device),
+                    wp.array(((0.25,), (0.4,)), dtype=float, device=device),
+                    wp.array((0, 1), dtype=int, device=device),
+                    stiffness,
+                ]
+                expected = np.array((7.0, 11.0), dtype=np.float32)
+                for step in range(3):
+                    if step == 1:
+                        mask.assign(np.array((0, 1), dtype=np.int32))
+                        mass.assign(np.array((3.2, 2.1), dtype=np.float32))
+                        stiffness.assign(np.array((0.6, -1.0), dtype=np.float32))
+                    elif step == 2:
+                        mask.fill_(1)
+                        stiffness.fill_(0.0)
+                        values = motion.numpy()
+                        values[:, :3] *= 1.3
+                        motion.assign(values)
+                    current_mass, current_motion = mass.numpy(), motion.numpy()
+                    current_mask, current_k = mask.numpy(), stiffness.numpy()
+                    for index in range(2):
+                        if current_mask[index]:
+                            denominator = (
+                                current_mass[index] * np.dot(current_motion[index, :3], current_motion[index, :3])
+                                + (0.25, 0.4)[index]
+                                + max(current_k[index], 0.0)
+                            )
+                            expected[index] = 1.0 / denominator
+                    wp.launch(kernel, dim=2, inputs=inputs, outputs=[inverse], device=device)
+                    np.testing.assert_allclose(inverse.numpy(), expected, rtol=2e-6, atol=0.0)
+                self.assertTrue(np.isnan(terms.numpy()).all())
+
     @unittest.skipUnless(wp.is_cuda_available(), "partitioned inverse dynamics requires CUDA")
     def test_direct_branch_inverse_dynamics_matches_articulation_path(self):
         """A one-body branch must produce the same torque through either schedule."""

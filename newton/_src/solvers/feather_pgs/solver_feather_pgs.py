@@ -229,6 +229,7 @@ _GROUPED_MASS_ON = os.environ.get("FEATHER_PGS_GROUPED_MASS") == "1"
 _FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
 # Experimental Stage 7 producer partition, leaving all solve/mass budgets intact.
 _PRISMATIC_PUBLICATION = os.environ.get("FEATHER_PGS_PRISMATIC_PUBLICATION", "0") == "1"
+_PRISMATIC_LINEAR_STATE = os.environ.get("FEATHER_PGS_PRISMATIC_LINEAR_STATE", "0") == "1"
 _COMPACT_CONTACT_BOUNDARY = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_BOUNDARY", "0") == "1"
 _DEBUG_CACHE = os.environ.get("FEATHER_PGS_DEBUG_CACHE") == "1"
 _DEBUG_CACHE_MODE = os.environ.get("FEATHER_PGS_DEBUG_CACHE_MODE", "")
@@ -2382,10 +2383,22 @@ class SolverFeatherPGS(SolverBase):
         self._init_double_buffer_stream()
 
         self._prismatic_publication = None
-        if _PRISMATIC_PUBLICATION and not model.requires_grad and not self.grouped_dynamics:
+        self._prismatic_linear_state = False
+        self._prismatic_linear_valid = None
+        if (
+            (_PRISMATIC_PUBLICATION or _PRISMATIC_LINEAR_STATE)
+            and not model.requires_grad
+            and not self.grouped_dynamics
+        ):
             from .prismatic_publication import PrismaticPublicationPlan  # noqa: PLC0415
 
             self._prismatic_publication = PrismaticPublicationPlan.build(model, self.articulation_joint_end)
+        if _PRISMATIC_LINEAR_STATE:
+            if _GROUPED_CHECK or _DEBUG_CACHE_CMP:
+                raise ValueError("prismatic linear state does not support materialized-inertia debug comparisons")
+            from .prismatic_linear_state import configure_linear_state  # noqa: PLC0415
+
+            configure_linear_state(self)
 
         self._simple_world_classifier = None
         self._resolved_simple_worlds = wp.empty(0, dtype=wp.int32, device=model.device)
@@ -9782,12 +9795,18 @@ class SolverFeatherPGS(SolverBase):
         if self._fused_k1 and not _GROUPED_CHECK:
             pass  # kinematics and inverse dynamics produced by the fused world-dynamics kernel
         else:
+            if self._prismatic_linear_state:
+                # The shortened root producer stamps validity before the leaf
+                # pass. Preserve admission from before either producer runs.
+                wp.copy(self._prismatic_linear_valid, self._fk_id_cache_valid)
             wp.launch(
                 eval_rigid_fk_id,
                 dim=model.articulation_count,
                 inputs=[
                     model.articulation_start,
-                    self.articulation_joint_end,
+                    self._prismatic_publication.joint_end
+                    if self._prismatic_linear_state
+                    else self.articulation_joint_end,
                     model.joint_type,
                     model.joint_parent,
                     model.joint_child,
@@ -9824,6 +9843,40 @@ class SolverFeatherPGS(SolverBase):
                 block_dim=16,
                 device=model.device,
             )
+            if self._prismatic_linear_state:
+                from .prismatic_linear_state import repair_prismatic_linear_state  # noqa: PLC0415
+
+                wp.launch(
+                    repair_prismatic_linear_state,
+                    dim=model.body_count,
+                    inputs=[
+                        self._prismatic_publication.body_joint,
+                        self._prismatic_linear_valid,
+                        model.joint_parent,
+                        model.joint_q_start,
+                        model.joint_qd_start,
+                        state_in.joint_q,
+                        stage3_qd,
+                        model.joint_X_p,
+                        model.joint_X_c,
+                        self.body_X_com,
+                        model.joint_axis,
+                        self.body_to_articulation,
+                        model.body_mass,
+                        self.articulation_origin,
+                        model.gravity,
+                    ],
+                    outputs=[
+                        state_in.body_q,
+                        state_aug.body_q_com,
+                        state_aug.joint_S_s,
+                        state_aug.body_v_s,
+                        state_aug.body_a_s,
+                        state_aug.body_f_s,
+                    ],
+                    block_dim=128,
+                    device=model.device,
+                )
         if _DEBUG_CACHE_CMP and self._fk_id_cache_enabled and not self._fused_k1:
             self._debug_compare_cache(state_in, state_aug, stage3_qd)
         global_inertia_ready = None
@@ -14422,6 +14475,10 @@ class SolverFeatherPGS(SolverBase):
             from .prismatic_publication import finalize_prismatic_body_dynamics  # noqa: PLC0415
 
             finalize_kernel = finalize_prismatic_body_dynamics
+            if self._prismatic_linear_state:
+                from .prismatic_linear_state import finalize_prismatic_linear_state  # noqa: PLC0415
+
+                finalize_kernel = finalize_prismatic_linear_state
             finalize_prefix = [
                 prismatic.body_joint,
                 model.joint_parent,
@@ -14621,8 +14678,14 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
 
 
 @cache
-def _get_direct_diagonal_inverse_mass_kernel(n_dofs: int, device_arch: str) -> "wp.Kernel":
+def _get_direct_diagonal_inverse_mass_kernel(
+    n_dofs: int, device_arch: str, *, linear_state: bool = False
+) -> "wp.Kernel":
     """Project one-body diagonal branches without materializing composite spatial inertia."""
+    if linear_state:
+        from .prismatic_linear_state import get_linear_inverse_mass_kernel  # noqa: PLC0415
+
+        return get_linear_inverse_mass_kernel(n_dofs)
     del device_arch
     N = int(n_dofs)
     if N <= 0:

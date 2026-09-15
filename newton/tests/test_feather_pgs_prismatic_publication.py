@@ -15,7 +15,7 @@ from newton._src.solvers.feather_pgs.prismatic_publication import PrismaticPubli
 from newton.solvers import SolverFeatherPGS
 
 
-def _build_model(device="cpu", *, locked_d6=False, chain=False, leaves=7):
+def _build_model(device="cpu", *, locked_d6=False, chain=False, leaves=7, worlds=1):
     """Use real joints, nontrivial anchors/COMs, and unrelated moving bodies."""
     builder = newton.ModelBuilder(gravity=(0.7, -1.2, -9.1))
 
@@ -63,6 +63,10 @@ def _build_model(device="cpu", *, locked_d6=False, chain=False, leaves=7):
     builder.add_articulation([hinge])
     free = body(leaves + 2)
     builder.add_articulation([builder.add_joint_free(free)])
+    if worlds != 1:
+        replicated = newton.ModelBuilder(gravity=(0.7, -1.2, -9.1))
+        replicated.replicate(builder, worlds, spacing=(3.0, 0.0, 0.0))
+        builder = replicated
     model = builder.finalize(device=device)
     model.rigid_contact_max = 1
     q = model.joint_q.numpy()
@@ -76,7 +80,7 @@ def _build_model(device="cpu", *, locked_d6=False, chain=False, leaves=7):
     return model, joints, leaf_bodies
 
 
-def _solver(model, *, enabled, mode="split"):
+def _solver(model, *, enabled, mode="split", linear_state=False):
     with mock.patch.object(solver_module, "_PRISMATIC_PUBLICATION", enabled):
         solver = SolverFeatherPGS(
             model,
@@ -90,6 +94,11 @@ def _solver(model, *, enabled, mode="split"):
     solver._fk_id_cache_enabled = True
     # CPU does not normally allocate the optional parallel-refresh terms.
     solver._body_inertia_terms = wp.empty((model.body_count, 12), dtype=float, device=model.device)
+    if linear_state:
+        # Exercise the production launch boundary on CPU without broadening
+        # constructor admission, just as the existing cache override above.
+        solver._prismatic_linear_state = True
+        solver._prismatic_linear_valid = wp.zeros(model.articulation_count, dtype=int, device=model.device)
     return solver
 
 
@@ -110,6 +119,72 @@ def _fields(solver, state):
 
 
 class TestPrismaticPublication(unittest.TestCase):
+    def test_linear_state_default_off_and_unsupported_cpu(self):
+        """Keep linear-state admission explicit and reject unsupported CPU owners."""
+        self.assertFalse(solver_module._PRISMATIC_LINEAR_STATE)
+        model, _, _ = _build_model()
+        baseline = _solver(model, enabled=False)
+        self.assertFalse(baseline._prismatic_linear_state)
+        with mock.patch.object(solver_module, "_PRISMATIC_LINEAR_STATE", True):
+            with self.assertRaisesRegex(ValueError, "[Pp]rismatic|linear"):
+                SolverFeatherPGS(model, pgs_mode="split")
+
+    def test_linear_cold_repair_cache_and_partial_reset(self):
+        """Repair cold leaves before validity changes and preserve warm other worlds."""
+        model, _, _ = _build_model(locked_d6=True, worlds=2)
+        solvers = [_solver(model, enabled=True, linear_state=value) for value in (False, True)]
+        states = [model.state(), model.state()]
+        leaf = solvers[1]._prismatic_publication.body_joint.numpy() >= 0
+        reset_mask = wp.array((True, False), dtype=wp.bool, device=model.device)
+        first_world_dofs = int(model.joint_dof_count // 2)
+        for solver, state in zip(solvers, states, strict=True):
+            for name, array in _fields(solver, state).items():
+                array.fill_(0 if name == "valid" else -123.25)
+        for phase in ("cold", "warm", "reset", "held"):
+            observed = []
+            for solver, state in zip(solvers, states, strict=True):
+                solver._step = 1 if phase == "held" else 0
+                if phase == "reset":
+                    q, qd = state.joint_q.numpy(), state.joint_qd.numpy()
+                    q[:7] += 0.13
+                    qd[:first_world_dofs] *= -0.6
+                    state.joint_q.assign(q)
+                    state.joint_qd.assign(qd)
+                    solver.reset(state, reset_mask)
+                    np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), (0, 0, 0, 1, 1, 1))
+                solver._stage1_fk_id(state, solver, state)
+                fields = _fields(solver, state)
+                observed.append({name: array.numpy().copy() for name, array in fields.items()})
+                np.testing.assert_array_equal(observed[-1]["valid"], 1)
+            for name in observed[0]:
+                if name == "body_qd":
+                    continue  # Original cold FK does not publish this field.
+                selected = ~leaf if name in ("I", "terms") else slice(None)
+                np.testing.assert_allclose(
+                    observed[1][name][selected],
+                    observed[0][name][selected],
+                    rtol=3e-6,
+                    atol=3e-6,
+                    err_msg=f"{phase} {name}",
+                )
+            for solver, state in zip(solvers, states, strict=True):
+                solver._stage7_update_kinematics(state, solver)
+                reference = model.state()
+                newton.eval_fk(model, state.joint_q, state.joint_qd, reference)
+                for name in ("body_q", "body_qd"):
+                    np.testing.assert_allclose(
+                        getattr(state, name).numpy(),
+                        getattr(reference, name).numpy(),
+                        rtol=3e-6,
+                        atol=3e-6,
+                    )
+                com = solver.body_q_com.numpy()[leaf, :3]
+                origin = solver.articulation_origin.numpy()[solver.body_to_articulation.numpy()[leaf]]
+                gravity_force = model.body_mass.numpy()[leaf, None] * model.gravity.numpy()[0]
+                expected_force = -np.concatenate((gravity_force, np.cross(com - origin, gravity_force)), axis=1)
+                np.testing.assert_allclose(solver.body_f_s.numpy()[leaf], expected_force, rtol=3e-6, atol=3e-6)
+                np.testing.assert_array_equal(solver.body_a_s.numpy()[leaf], 0.0)
+
     def test_cuda_actual_graph_publication(self):
         """Check the actual matrix-free Stage 7 eager/two-graph outputs and inputs."""
         devices = wp.get_cuda_devices()
@@ -218,7 +293,11 @@ class TestPrismaticPublication(unittest.TestCase):
     def test_current_root_frames_and_inertial_notifications(self):
         """Use notified current root/leaf frames, axes, COMs, mass, inertia, and gravity."""
         model, _, _ = _build_model()
-        solvers = [_solver(model, enabled=value) for value in (False, True)]
+        solvers = [
+            _solver(model, enabled=False),
+            _solver(model, enabled=True),
+            _solver(model, enabled=True, linear_state=True),
+        ]
         before = []
         for solver in solvers:
             state = model.state()
@@ -229,6 +308,12 @@ class TestPrismaticPublication(unittest.TestCase):
         frames[0, :3] += (0.3, -0.7, 0.5)
         frames[1, :3] += (0.2, 0.4, -0.1)
         model.joint_X_p.assign(frames)
+        child_frames = model.joint_X_c.numpy()
+        child_frames[1] = np.asarray(wp.transform(wp.vec3(0.12, -0.08, 0.03), wp.quat_rpy(-0.2, 0.4, 0.1)))
+        model.joint_X_c.assign(child_frames)
+        axes = model.joint_axis.numpy()
+        axes[0] = (0.7, -0.4, 1.3)
+        model.joint_axis.assign(axes)
         com = model.body_com.numpy()
         com += (0.01, 0.02, -0.03)
         model.body_com.assign(com)
@@ -248,8 +333,20 @@ class TestPrismaticPublication(unittest.TestCase):
             solver.reset(state)
             np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 0)
         self.assertFalse(np.array_equal(before[1], after[1]["body_q"]))
-        for name in after[0]:
-            np.testing.assert_allclose(after[1][name], after[0][name], rtol=3e-6, atol=3e-6, err_msg=name)
+        for index in (1, 2):
+            for name in after[0]:
+                selected = (
+                    solvers[index]._prismatic_publication.body_joint.numpy() < 0
+                    if index == 2 and name == "I"
+                    else slice(None)
+                )
+                np.testing.assert_allclose(
+                    after[index][name][selected],
+                    after[0][name][selected],
+                    rtol=3e-6,
+                    atol=3e-6,
+                    err_msg=name,
+                )
 
     def test_cached_next_step_dynamics_and_reset(self):
         """Feed publication back into original dynamics across refresh/reuse and reset."""
