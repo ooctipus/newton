@@ -147,3 +147,78 @@ flag and an untimed private owner/status observation added. Timing, capacity,
 source/idle and existing G1 kinetic checks are unchanged. Prepared adapter:
 `/tmp/fpgs-g1-pair-terrain-checked-lDHRWzAJ/run_live_sparse_checked.py`.
 The first complete 16K physics comparison is next; no gain is claimed yet.
+
+## First whole result and diagnosed launch mismatch
+
+Runtime `9b230fdf9ab597293de706780df554177c0dd4db` fails the first screen:
+
+| GPU | Retained physics ms | Pair-private physics ms | Retained/candidate |
+| --- | ---: | ---: | ---: |
+| RTX PRO6000 | 15.580928 | 40.319060 | 0.386441x |
+| GB300 | 20.471399 | 71.914381 | 0.284664x |
+
+Whole environment wall also regresses, 29.826997 -> 53.163606 ms RTX and
+34.426962 -> 85.664914 ms GB. Parent28520 exits zero, all source/finite/
+capacity and final-idle checks pass. No promotion or new MJWarp ratio.
+Artifacts: `/tmp/fpgs-g1-pair-terrain-paired16k-20260915-01`.
+
+The immediate node diagnosis preserves the original analyzer limitation:
+baseline parent97775 and candidate-only continuation4186 exit one because
+the inherited node analyzer rejects auxiliary graphs. Actual simulations
+and boundary checks complete; final source/idle guards pass. The existing
+auxiliary-aware strict reader accepts all four captures: 12 physics roots,
+3 separate auxiliary roots, 768 baseline/720 candidate physics nodes and
+zero unproven nodes. The failed original parent statuses are not relabeled.
+
+Complete affected ownership includes geometric culling and active-count reset,
+which the conservative first card had not credited. Baseline union is
+3.658525 ms RTX / 8.292071 ms GB; candidate is 28.755518 / 59.631313 ms,
+including the new four-byte callback-counter clear. All seven retired kernel
+owners have zero candidate calls. New fast owner costs 28.627177/59.466502;
+exceptional owner costs only 0.124384/0.161824; clear costs 0.003957/0.002987.
+All four untimed candidate boundaries have zero overflow routes, which is
+not a claim about every captured step. Timed exception cost nevertheless
+bounds its contribution to the loss.
+
+Native fast resources are 254/252 registers, 8176 B shared, grid384/block32.
+The exceptional kernel has 255 registers, 8968 B shared, grid384/block32.
+The old finite/generic kernels launch grid6144/block32, with registers
+139/168 RTX and 133/168 GB; original packed culling uses grid1536/block128.
+No achieved occupancy, bandwidth or hardware-stall attribution is claimed.
+
+Source confirms additional costs: serial pair culling, querying with selection
+inside callbacks, and visiting all 35 bins/245 slots even on empty pairs.
+However, it also reveals a concrete implementation mismatch: new launch
+sizing derives from `num_tile_blocks`, ignoring the calibrated expanded
+`total_num_threads` domain. It therefore launches 16x fewer query blocks.
+This is separate from register pressure and invalidates treating the first
+loss as sufficient evidence against the ownership algorithm.
+
+One cause-specific corrective trial is funded before editing: derive fast
+pair groups from `total_num_threads / 16` on CUDA (single-lane CPU), preserving
+the original calibrated query launch width. Keep every kernel equation,
+record capacity, selection rule and other launch unchanged. No tile sweep
+or setup-only polishing. Repeat focused tests and one whole paired screen
+against retained ca0d; a gain over the losing prototype is not progress.
+The >=10% whole saving remains about1.56 ms, not a reset target. With the
+complete boundary credited, replacement must be about2.10 ms or less.
+
+Strict full readouts and unchanged-reader reproduction:
+`/tmp/fpgs-g1-pair-terrain-strict-Mj8ohc2j` (`REPRODUCE.sh`). Baseline capture:
+`/tmp/fpgs-g1-pair-terrain-nodes-paired16k-20260915-01`; candidate continuation:
+`/tmp/fpgs-g1-pair-terrain-nodes-candidate-paired16k-20260915-01`.
+
+## Launch-only correction readiness, 14:35 UTC
+
+Fast groups now derive from `total_num_threads / width`, with width16 on
+CUDA and width1 on CPU. The live CUDA grid becomes6144/block32; kernel
+mathematics, native module source, contact selection and exceptional launch
+are unchanged. Corrected module SHA256:
+`1fd344b03de537f5534bb25beb05e5766742616f1fa6467320c5d07c058ee753`.
+All other runtime/test hashes above remain unchanged.
+
+CPU18633 passes4/4 in1.935 s. Native RTX30778 passes2/2 in3.457 s and
+GB67579 passes2/2 in3.629 s, without skips. These are cached-module test
+durations, not performance evidence. All sessions exit zero and are reaped.
+Full staged pre-commit21098 passes. The next whole paired screen retains
+the original ca0d baseline, task settings, capacities and measurement law.

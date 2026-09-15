@@ -595,8 +595,8 @@ def launch(narrow, scene, writer_data, device):
     owner.callback_count.zero_()
     # Status is sticky like the existing public capacity status. Active pair
     # overflow slots are overwritten by fast traversal on every call.
-    groups = 2 * narrow.num_tile_blocks
     width = 1 if wp.get_device(device).is_cpu else 16
+    groups = max(1, narrow.total_num_threads // width)
     wp.launch(
         owner.fast,
         dim=(groups, width),
