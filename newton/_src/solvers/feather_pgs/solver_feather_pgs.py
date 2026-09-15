@@ -2448,6 +2448,17 @@ class SolverFeatherPGS(SolverBase):
             self._sparse_factor.install_kinetic_state()
             self._g1_kinetic_state = self._sparse_factor.kinetic_state
 
+        self._franka_kinetic_state = None
+        if os.environ.get("FEATHER_PGS_FRANKA_KINETIC_STATE") == "1":
+            from .franka_kinetic_factor import get_kernel as get_geometric_factor  # noqa: PLC0415
+            from .franka_kinetic_state import FrankaKineticState, supported  # noqa: PLC0415
+
+            if supported(self):
+                self._franka_kinetic_state = FrankaKineticState(self)
+                self._franka_kinetic_factor9 = get_geometric_factor(
+                    str(model.device.arch), warps_per_block=_CRBA_CHOLESKY_WARPS_PER_BLOCK
+                )
+
     def _update_kinematic_state(self) -> None:
         """Refresh cached kinematic flags and effective joint armature."""
         model = self.model
@@ -2489,6 +2500,9 @@ class SolverFeatherPGS(SolverBase):
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         """Refresh cached solver data after supported model changes."""
+        franka_kinetic = getattr(self, "_franka_kinetic_state", None)
+        if franka_kinetic is not None:
+            franka_kinetic.validate_model(flags)
         if getattr(self, "_sparse_factor", None) is not None:
             self._sparse_factor.validate_notification(flags)
         kinetic = getattr(self, "_kinetic_world", None)
@@ -2520,6 +2534,8 @@ class SolverFeatherPGS(SolverBase):
             | ModelFlags.MODEL_PROPERTIES
         ):
             g1_kinetic.invalidate()
+        if franka_kinetic is not None:
+            franka_kinetic.invalidate(None)
         if self._fk_id_cache_enabled and flags & (
             ModelFlags.JOINT_PROPERTIES
             | ModelFlags.JOINT_DOF_PROPERTIES
@@ -2584,6 +2600,8 @@ class SolverFeatherPGS(SolverBase):
             self._kinetic_world.reset(state, world_mask)
         if getattr(self, "_g1_kinetic_state", None) is not None:
             self._g1_kinetic_state.invalidate(world_mask)
+        if getattr(self, "_franka_kinetic_state", None) is not None:
+            self._franka_kinetic_state.invalidate(world_mask)
 
         if self._fk_id_cache_enabled:
             wp.launch(
@@ -8575,6 +8593,9 @@ class SolverFeatherPGS(SolverBase):
             if self._g1_kinetic_state is not None:
                 self._g1_kinetic_state.predict(state_in, state_aug, control, stage3_qd, dt)
                 self._clamp_rigid_velocity_limits(self.v_hat)
+            elif self._franka_kinetic_state is not None:
+                self._franka_kinetic_state.predict(state_in, state_aug, control, stage3_qd, dt)
+                self._clamp_rigid_velocity_limits(self.v_hat)
             elif self._joint_world_active:
                 self._joint_world.predict_and_classify(state_in, state_aug, state_out, contacts, stage3_qd, dt)
             else:
@@ -9124,7 +9145,9 @@ class SolverFeatherPGS(SolverBase):
         # STAGE 7: Update qdd + integrate
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S7_Integrate", print=False, use_nvtx=self._nvtx, synchronize=False):
-            if self._world_scan_publication is not None and self._world_scan_publication.try_publish(
+            if self._franka_kinetic_state is not None:
+                self._stage6_integrate(state_in, state_aug, state_out, dt)
+            elif self._world_scan_publication is not None and self._world_scan_publication.try_publish(
                 state_in, state_aug, state_out, dt
             ):
                 pass
@@ -9382,6 +9405,8 @@ class SolverFeatherPGS(SolverBase):
         status = self.constraint_capacity_status()
         if self._sparse_factor is not None:
             self._sparse_factor.check()
+        if getattr(self, "_franka_kinetic_state", None) is not None:
+            self._franka_kinetic_state.check()
         settings = {
             "dense": f"dense_max_constraints={self.dense_max_constraints}",
             "matrix_free": f"mf_max_constraints={self.mf_max_constraints}",
@@ -9746,6 +9771,9 @@ class SolverFeatherPGS(SolverBase):
         refresh_composite = (self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update
         if getattr(self, "_g1_kinetic_state", None) is not None:
             self._g1_kinetic_state.begin(state_in, state_aug, stage3_qd, self._last_step_dt, refresh_composite)
+            return None, stage3_qd
+        if self._franka_kinetic_state is not None:
+            self._franka_kinetic_state.begin(state_in, state_aug, self._last_step_dt, refresh_composite)
             return None, stage3_qd
         parallel_global_refresh = refresh_composite and self._global_inertia_stream is not None
         if self._fused_k1:
@@ -10269,6 +10297,12 @@ class SolverFeatherPGS(SolverBase):
             # joint_tau currently holds only u0. Current external/control/bias
             # contributions are added by the retained-W predictor after waiting.
             return drive_rows_ready
+        if self._franka_kinetic_state is not None:
+            if drive_rows_ready is None:
+                raise RuntimeError("Franka kinetic prediction requires original asynchronous augmented drives")
+            # joint_tau retains only the current clamped actuator u0. The
+            # compact predictor consumes live passive/control/external forces.
+            return drive_rows_ready
         if drive_rows_ready is None:
             self._stage1_drives(state_in, state_aug, control, dt)
             return None
@@ -10397,6 +10431,42 @@ class SolverFeatherPGS(SolverBase):
             self._sparse_factor.refresh(state_aug)
             # Consume requests just like the common tail. Leaving either set
             # changes the held-factor cadence on subsequent captured steps.
+            self._mass_update_requested.zero_()
+            self._force_mass_update = False
+            return
+
+        if self._franka_kinetic_state is not None:
+            if drive_rows_ready is None:
+                raise RuntimeError("Franka kinetic factor requires current augmented-drive coefficients")
+            wp.get_stream(model.device).wait_event(drive_rows_ready)
+            for size in self.size_groups:
+                kernel = self._franka_kinetic_factor9 if size == 9 else self._crba_cholesky_warp_kernels_by_size[size]
+                inputs = [
+                    self.n_arts_by_size[size],
+                    model.articulation_start,
+                    self.articulation_dof_start,
+                    self.mass_update_mask,
+                    model.joint_child,
+                    state_aug.joint_S_s,
+                    state_aug.body_I_s,
+                    self.group_to_art[size],
+                    self.R_by_size[size],
+                    self._crba_dof_joint_offset_by_size[size],
+                    self._crba_lower_schedule_by_size[size],
+                    1,
+                    self._augmented_drive_row_by_dof,
+                    self.aug_row_K,
+                ]
+                if size == 9:
+                    inputs.append(self._franka_kinetic_state.data.geometric)
+                wp.launch(
+                    kernel,
+                    dim=self.n_arts_by_size[size] * 32,
+                    inputs=inputs,
+                    outputs=[self.L_by_size[size]],
+                    block_dim=_CRBA_CHOLESKY_WARPS_PER_BLOCK * 32,
+                    device=model.device,
+                )
             self._mass_update_requested.zero_()
             self._force_mass_update = False
             return
@@ -14114,6 +14184,8 @@ class SolverFeatherPGS(SolverBase):
     def _stage6_update_qdd(self, state_in: State, state_aug: State, dt: float):
         if getattr(self, "_g1_kinetic_state", None) is not None:
             return  # finish owns conversion, free-root transport and integration
+        if self._franka_kinetic_state is not None:
+            return
         model = self.model
         wp.launch(
             update_qdd_from_velocity,
@@ -14126,6 +14198,11 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage6_integrate(self, state_in: State, state_aug: State, state_out: State, dt: float):
         model = self.model
+        if self._franka_kinetic_state is not None:
+            next_refresh = ((self._step + 1) % self.update_mass_matrix_interval) == 0
+            self._franka_kinetic_state.finish(state_in, state_aug, state_out, dt, next_refresh)
+            self._fk_id_cache_source_state = state_out
+            return
 
         if getattr(self, "_g1_kinetic_state", None) is not None:
             next_refresh = ((self._step + 1) % self.update_mass_matrix_interval) == 0
