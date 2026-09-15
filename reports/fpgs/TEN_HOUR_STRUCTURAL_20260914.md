@@ -915,3 +915,31 @@ not reduce sweeps on the selected hard cases. A new conservative within-solve
 zero-row expiry bound is being assessed on the existing current/held payloads;
 there is no native implementation or speedup claim for it at this checkpoint.
 The at-least4x target is not achieved and the paused controller is unchanged.
+
+## September15 04:09: first zero-row expiry loses on RTX; one correction
+
+G1 solve-local zero-row expiry at clean6c2e1fa9 passes nine CPU controls and
+eight original/focused CUDA selectors on each card. It preserves the original
+eight-sweep law, current/held geometry, all row/collision capacity checks and
+default-off native source. All four original whole16K children pass: accepted
+b1bad15.608484 -> candidate15.894541 ms RTX, a0.286058 ms loss; GB20.468370 ->
+20.230434 ms, a0.237936 ms gain. No promotion or accepted-ratio change.
+Whole manifest SHA256:
+`d25e107a5cd590a926c7a144110bb89ef78e93e2256c75bcc022a5e2e961862c`.
+
+Both node parents exit1 at the inherited auxiliary-graph analyzer rejection;
+the original failures remain. Existing strict ownership reader accepts both
+saved baseline and candidate pairs:12 physics roots,3 auxiliary roots,
+768 physics nodes,0 unproven nodes, with source/process/correlation checks.
+RTX complete GS exclusive grows3.943349 ->4.175872 ms; every other family
+changes by at most0.004181 ms. GB GS falls4.363572 ->4.113962 ms. This isolates
+the timing change to GS but does not establish which internal check dominates
+or that selected CPU omission counts represent the full population.
+
+One correction is funded before the original05:00 checkpoint: remember the
+certified scalar/triplet kind and test expiry before repeated immutable row
+metadata and impulse guards. Keep upfront complete row validation, the same
+conservative norm/travel/rounding bound and all producer/setup costs. No initial
+certificate seeding, new stopping law, mapping grid or lowered milestone:
+require at least1.5 ms whole RTX saving against acceptedb1bad, not against the
+losing6c2e prototype. This correction is not yet measured.
