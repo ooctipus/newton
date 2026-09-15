@@ -177,3 +177,52 @@ A CPU topology regression fails before preserving raw articulation worlds in
 both sleeping maps. This conservative edge fix does not change the replicated
 Keyboard map. Next diagnostic: reuse node tracing to separate retired owner
 work from controller cost and still-full producers, not another mapping sweep.
+
+## Kernel-level cost closure (no performance promotion)
+
+Runtime `b00df921`; paired diagnostic manifest:
+`/tmp/fpgs-general-sleeping-nodes-20260915-01/manifest.json`.
+Same task, control budgets and capacities; 200 warmup, 40 wall steps and ten
+node-traced physics steps. All four runs finish with passing capacity flags
+and finite observations. Node instrumentation is diagnostic, not a replacement
+for the preceding uninstrumented-node whole-graph comparison. Raw manifests
+contain the exact commands, environment, pins and check outputs.
+
+Summed graph-kernel time per environment step (milliseconds):
+
+| GPU | Original force/integrate/publication | Awake versions | Removed | Added sleep controller |
+| --- | ---: | ---: | ---: | ---: |
+| RTX PRO 6000 | 1.143610 | 0.480852 | 0.662759 | 0.541249 |
+| GB300 | 0.532205 | 0.364003 | 0.168202 | 0.398493 |
+
+Controller total includes current-contact marking, begin checks, finish checks
+and in-graph awake-mask publication, excluding eager reset/model notification
+work and memory nodes. Kernel sums overlap and are not critical-path savings.
+Thus real work retirement occurs, but its controller cost nearly consumes the
+RTX saving and exceeds the GB saving. GS also varies across these trajectories
+(RTX 1.516/1.208 ms, GB 1.369/1.562 ms baseline/candidate); do not attribute those
+differences to a changed GS implementation, which this candidate does not have.
+
+Drive preparation, scalar inverse mass/solve, prediction and limit preparation
+still execute across the full domain. Their entire baseline bundle is only
+0.331 ms RTX / 0.269 ms GB in this capture, so a separate awake-queue conversion
+of those kernels alone cannot fund an additional 2–4x whole-physics gain.
+Collision, contact production and contact scheduling remain full and correct.
+No capacity changes, artificial contact filtering or shortened iterations are
+introduced to manufacture a saving.
+
+The larger next architecture is a complete awake-component owner, with shared
+queues replacing producers rather than supplementing them, followed by actual
+resting-contact island support and collision wake/incremental processing.
+MJWarp's masks/compact maps and collision-wake ordering are useful references;
+this first implementation does not yet provide that full lifecycle. A compact
+active-limit schedule is possible without changing global row/DOF strides, but
+there is no evidence that limits dominate enough of GS to justify another
+mapping sweep. Retain this branch as a tested default-off foundation, not a
+new accepted performance baseline. Representative-task MJWarp ratios stay
+unchanged; unsupported consumer dispatch is not evidence of general speedup.
+
+Final focused tests after the global-world guard: all four selectors pass on
+both cards (2.45/3.29 s), including the regression-first global topology check.
+Full pre-commit passes. Full sustained-contact/training qualification remains
+required before any production promotion. No Isaac Lab files were modified.
