@@ -786,3 +786,43 @@ ms gives a2.595454 ms allowance for a10% whole gain, including reverse-map,
 allocator, fallback, overlap and resource costs. Prototype checkpoint02:40 UTC;
 no mapping grid or new benchmark framework. Its isolated branch is
 `ooctipus/fpgs-kuka-private-response-20260915`; it has no measured result yet.
+
+## September15 01:57: two new prototypes miss; accepted gains unchanged
+
+Franka's first complete owner screen passed capacity/source guards but measured
+5.464454->5.369242 ms RTX and5.032037->5.412950 ms GB. Worse, wall time grew
+from29/28 ms to1694/1693 ms. The new immutable-plan validation rebuilt all16K
+worlds on every unchanged root-property notification. Regression-first host
+fix `edd49d0b` fingerprints ALL proof inputs and avoids that redundant loop;
+no notification, numerical flag, solver allowance or Lab source changed.
+Three physical/lifecycle CUDA selectors still pass on both cards. Fresh whole
+screen02 now measures5.457961->5.466557 ms RTX and5.025921->5.383826 ms GB:
+no physics improvement. Wall is44.972803/44.296596 ms, still worse than accepted
+28.784147/27.884037 ms; added full fingerprint checks remain costly. No promotion.
+Manifest `/tmp/fpgs-franka-kinetic-state-paired16k-20260915-02/manifest.json`
+SHA256 `06a30f25fd7e441d4781df9ef1daa9d1e1660cf716f4e30098c76778689ff255`.
+All four children, eight capacity boundaries,13 helper rehashes and source/idle
+guards pass. A matched node profile is in progress to diagnose the GPU miss.
+
+Kuka private-response native boundary and corrected actual two-bank stream/
+fallback/failure-publication tests pass on both cards at `867e6b77`. Its first
+graph screen is preserved as INVALID comparison evidence because a test-only
+fixture correction crossed the source freeze; runtime bytes did not change.
+The clean node comparison confirms the loss:10.530701->14.054306 ms RTX and
+10.841696->12.144554 ms GB. All source/capacity/idle checks pass. Original strict
+reader finds12 physics roots, no unproven nodes, and1728->1752 total nodes.
+The complete affected fork union grows3.564513->7.128285 ms RTX and
+4.095402->5.439198 ms GB. New private response/eight alone costs6.153778/4.750538
+ms; allocation adds only0.005323/0.003093 ms. This is a concurrency/serial-work
+problem, not hidden global panel storage or spills. A four-warp contact build
+alone has little RTX budget headroom because positive-MF offset remains queued
+behind private on the same stream. A single corrective hypothesis is being
+costed for cooperative contact construction and removal of that false stream
+dependency, charging any lost overlap of the original mixed-world solves.
+No correction or new gain is claimed yet. The clean node manifest is
+`/tmp/fpgs-kuka-private-response-nodes-paired16k-20260915-01/manifest.json`,
+SHA256 `f66f23db48331c457fa46c5119a5f5ac2d1c981f02334864156f59a6488481dc`.
+
+The accepted RTX ratios above remain unchanged; the at-least4x-every-task
+target is still unmet. These losing prototypes have not replaced accepted
+runtime or been used as new improvement baselines.
