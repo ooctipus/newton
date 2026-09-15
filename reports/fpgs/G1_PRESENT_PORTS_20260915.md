@@ -261,3 +261,30 @@ checks remain on small synthetic cases. Diagonal and restitution checks,
 momentum2e-6, cone3e-5 and final reference rtol3e-4/atol3e-5 are unchanged.
 All production bytes remain those of `d03063f1`. Saved-sixteen final physical
 qualification remains pending until the corrected selector completes.
+
+The second native batch on clean test tip `3fcd90e1` completed twelve of the
+sixteen saved cases through their final gates, but four hard cases stopped at
+the newly added diagonal per-component check. Parents11299/57512 reaped1;
+logs are `native02_gpu{0,1}.log` in the same native directory. Original accepted
+`b1bad06a` also fails this criterion on the same four physical inputs, with
+2.65e-5--3.50e-5 absolute errors versus candidate2.69e-5--3.48e-5. Root's control
+parent38918 reaped0; `original_diagonal_gpu0.log` preserves it. Atomic contact
+allocation can change row indices, so this comparison is by physical input
+and coefficient values, not an assumed equal raw row order.
+
+The second test-only correction records saved diagonal differences through
+the same inherited component diagnostic. Synthetic diagonal checks and all
+final velocity/impulse, cone and momentum tolerances remain unchanged. Runtime
+still exactly matches `d03063f1`; four hard final physical gates remain open
+until this corrected test runs.
+
+## First whole cost screen: loss, qualification still open
+
+Root ran the original paired whole protocol on clean `3fcd90e1` before spending
+more sequential runs on new component criteria. Parent34672 reaped0; artifacts
+are `/tmp/fpgs-g1-present-ports-whole-paired16k-20260915-01`. RTX graph time was
+15.607145525 to18.255871400 ms, a2.648725875 ms loss. GB was20.457185200
+to24.529586400 ms, a4.072401200 ms loss. The >=1.5 ms RTX milestone is missed.
+This is an unqualified cost screen, not a promotion or completed physical
+qualification. Matched original node attribution is pending; source work and
+static resource counts alone do not locate the measured loss internally.
