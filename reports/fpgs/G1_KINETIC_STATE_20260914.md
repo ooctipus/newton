@@ -224,6 +224,17 @@ exit0 without CUDA709 or crash. Logs and the preserved failing controls are in
 `/tmp/fpgs-g1-gc-isolated-lNKjkZ`. This closes the observed teardown blocker;
 repeated whole timing and retained-path qualification remain before adoption.
 
+### Retained-path CUDA qualification
+
+On report tip dcb71e5b, the six unchanged Allegro/Kuka integration selectors
+listed in `FOURX_QUALIFIED_INTEGRATION_20260914.md` all pass on both cards:
+16.978 s RTX and17.357 s GB, sessions4225/89148, clean exit0 with no skips.
+They exercise retained current/held rows, parallel response, complete fallback,
+reset, actual stepping and two-graph transitions; they do not replace G1's
+separate physical tests or establish new whole-task timings. The only warning
+is the inherited target-layout deprecation. This confirms that adding the
+default-off owner and generic teardown repair retains those checked paths.
+
 ### Three-round paired confirmation, 01:04 UTC
 
 The existing checked alternating parent completed all twelve children at
