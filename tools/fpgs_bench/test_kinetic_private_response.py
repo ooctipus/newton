@@ -482,8 +482,12 @@ class TestKineticPrivateResponse(unittest.TestCase):
             a[:3], b[:3] = [13, 62, 30], [17, -1, -1]
             contacts.rigid_contact_shape0.assign(a)
             contacts.rigid_contact_shape1.assign(b)
-            contacts.rigid_contact_normal.assign(np.tile([0.6, 0.0, 0.8], (256, 1)))
-            contacts.rigid_contact_margin0.fill_(0.005)
+            normals = np.tile([0.6, 0.0, 0.8], (256, 1))
+            # The solver uses -raw.normal. Floors must oppose gravity; the
+            # oblique downward normal lets a corrected free body become ZERO.
+            normals[1:3] = [0.0, 0.0, -1.0]
+            contacts.rigid_contact_normal.assign(normals)
+            contacts.rigid_contact_margin0.fill_(0.001)
             contacts.rigid_contact_margin1.zero_()
             contacts.rigid_contact_point0.zero_()
             contacts.rigid_contact_point1.zero_()
@@ -492,6 +496,7 @@ class TestKineticPrivateResponse(unittest.TestCase):
             contacts.rigid_contact_margin0.assign(margin)
             ground = contacts.rigid_contact_point1.numpy()
             ground[1] = model.body_q.numpy()[62, :3]
+            ground[2] = model.body_q.numpy()[30, :3]
             contacts.rigid_contact_point1.assign(ground)
             contacts.rigid_contact_count.assign([3])
             return SimpleNamespace(

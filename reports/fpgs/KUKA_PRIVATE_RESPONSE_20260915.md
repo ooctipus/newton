@@ -243,3 +243,39 @@ in both arms and private-response=1 only in the candidate. The baseline is not
 the older 1a9 runtime without current-contact. Reuse the original fixed-import
 variants/capture driver, 16K raw311296/broad442368, 200 warmup and 40 wall/40
 profile steps. No new driver or whole-time claim is introduced here.
+
+## CUDA qualification and first exploratory whole
+
+The frozen numerical source is commit
+`d8cc35683a78c9c584eb223a7dd9e3cea71da9df`. The direct native boundary
+selector passed on both cards. The first two-bank test failed its authored
+positive-MF cohort assertion, before a reported numerical mismatch. Its
+free/ground normals described a ceiling: after contact projection, gravity can
+make that world legitimately ZERO. The test-only correction uses a
+gravity-loaded floor with 1 mm penetration and both original world-fixed
+anchors. Dense self-contact, cohort assertions and all numerical bounds remain
+unchanged. CPU diagnostic post-projection inputs were constructed analytically;
+they were not presented as a full CPU MF solve or a captured failing GPU state.
+
+With that correction, both original selectors pass on RTX (2 tests, 3.286 s,
+session 84936) and GB300 (2 tests, 3.333 s, session 26988), both reaped zero.
+This includes actual two-bank stream/graph execution, positive-MF/MF0 changes,
+held/current cadence and failure withholding publication. The only output
+warning is the inherited target-layout deprecation. Corrected CPU selection:
+four pass and two explicit CUDA skips in 2.052 s. Native and binding hashes
+above remain unchanged.
+
+The first whole run at
+`/tmp/fpgs-kuka-private-response-paired16k-20260915-01` is exploratory, not a
+fully guarded accepted result. Every GPU child completed successfully, but the
+parent (session 12260) failed its final source guard because the test correction
+landed at 01:45:02.449285858 UTC during that run. The sole tracked drift was the
+test; neither production source nor bindings changed. That timeline and the
+failed guard are preserved, without reverting or relabeling the run.
+
+Its raw graph times are RTX 10.466297 -> 13.896157 ms (3.429860 ms loss) and
+GB300 10.628976 -> 11.965026 ms (1.336050 ms loss). These are provisional
+diagnostics, not promotion evidence. The expected removal of global panels
+and late ownership did not translate into a whole win. The unchanged native
+candidate is retained for one existing-protocol node attribution; no corrective
+mapping change or occupancy claim is authorized by these timings alone.
