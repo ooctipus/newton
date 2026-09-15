@@ -709,6 +709,13 @@ def _fingerprint(array):
     return value.shape, value.dtype.str, hashlib.sha256(value.tobytes()).digest()
 
 
+@wp.kernel(module="unique", enable_backward=False)
+def _compare_proof_words(current: wp.array[wp.uint32], frozen: wp.array[wp.uint32], mismatch: wp.array[int], bit: int):
+    index = wp.tid()
+    if current[index] != frozen[index]:
+        wp.atomic_or(mismatch, 0, bit)
+
+
 def _plan_dimensions(solver):
     """Include scalar proof inputs and the dimensions of the retained storage owners."""
     return (
@@ -785,6 +792,70 @@ class FrankaKineticState:
             for name, size in (("group_to_art", 9), ("group_to_art", 6), ("_crba_source_dof_by_size", 9))
         }
         self._plan_dimensions = _plan_dimensions(solver)
+        self._device_proof = None
+        if device.is_cuda:
+            self._initialize_device_proof()
+
+    def _proof_arrays(self):
+        """Yield the original proof operands and errors in their original order."""
+        for name, expected in self._model_plan.items():
+            yield f"model {name}", getattr(self.solver.model, name), expected
+        for name, expected in self._solver_plan.items():
+            yield f"mapping {name}", getattr(self.solver, name), expected
+        for (name, size), expected in self._group_plan.items():
+            yield f"mapping {name}[{size}]", getattr(self.solver, name).get(size), expected
+
+    def _initialize_device_proof(self):
+        """Freeze exact-sized proof words without changing the host fallback."""
+        device = self.solver.model.device
+        views = []
+        for _, value, _ in self._proof_arrays():
+            if value is None or value.device != device or not value.is_contiguous:
+                return
+            try:
+                view = value.view(wp.uint32).flatten()
+            except (TypeError, RuntimeError):
+                return
+            views.append((value, view))
+        # Each view retains its source allocation. Only these exact proof
+        # words are duplicated; no maximum-capacity or physics buffers enter.
+        self._device_proof = [(wp.clone(view), value, view, value.shape, value.dtype) for value, view in views]
+        self._proof_device = device
+        self._proof_status = wp.zeros(1, dtype=int, device=device)
+
+    def _validate_device_proof(self):
+        """Compare all pinned bits before one compact readback and cache mutation."""
+        arrays = list(self._proof_arrays())
+        self._proof_status.zero_()
+        for index, (label, value, expected) in enumerate(arrays):
+            frozen, source, view, shape, dtype = self._device_proof[index]
+            if (
+                value is None
+                or value.shape != shape
+                or value.dtype != dtype
+                or value.device != self._proof_device
+                or not value.is_contiguous
+            ):
+                # Preserve logical NumPy shape/dtype/content semantics for
+                # unusual layouts or bindings; do not silently reject them.
+                if value is None or _fingerprint(value) != expected:
+                    raise RuntimeError(f"Franka kinetic {label} changed; reconstruct and recapture")
+                continue
+            if value is not source or value.ptr != view.ptr:
+                view = value.view(wp.uint32).flatten()
+                self._device_proof[index] = frozen, value, view, shape, dtype
+            # Identity only reuses a zero-copy descriptor. Every current word
+            # is compared even when the source object and pointer are stable.
+            wp.launch(
+                _compare_proof_words,
+                dim=frozen.size,
+                inputs=[view, frozen, self._proof_status, 1 << index],
+                device=self._proof_device,
+            )
+        mismatch = int(self._proof_status.numpy()[0])
+        for index, (label, _, _) in enumerate(arrays):
+            if mismatch & (1 << index):
+                raise RuntimeError(f"Franka kinetic {label} changed; reconstruct and recapture")
 
     def validate_model(self, flags=None):
         """Check all immutable ownership before caller mutates validity or held epochs."""
@@ -800,6 +871,9 @@ class FrankaKineticState:
             return
         if _plan_dimensions(self.solver) != self._plan_dimensions:
             raise RuntimeError("Franka kinetic dimensions changed; reconstruct and recapture")
+        if self._device_proof is not None:
+            self._validate_device_proof()
+            return
         for name, expected in self._model_plan.items():
             if _fingerprint(getattr(self.solver.model, name)) != expected:
                 raise RuntimeError(f"Franka kinetic model {name} changed; reconstruct and recapture")

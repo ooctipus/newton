@@ -560,7 +560,78 @@ def check_factor(test, case):
         scaled(test, lower @ lower.swapaxes(-1, -2), H, name=f"actual refreshed factor{size}")
 
 
+def check_device_proof(test, device):
+    """Exercise the exact proof kernel without changing any physical owner."""
+    native = importlib.import_module("newton._src.solvers.feather_pgs.franka_kinetic_state")
+    capture = next(captures())
+    with np.load(capture["path"], allow_pickle=False) as snapshot:
+        case = bind_saved(snapshot, capture, device)
+    owner = case.owner
+    # Production CPU notifications retain the original host fallback. Exercise
+    # the same comparison owner on CPU explicitly before root-owned CUDA tests.
+    owner._initialize_device_proof()
+    test.assertEqual(len(owner._device_proof), 22)
+    test.assertEqual(sum(entry[0].size * 4 for entry in owner._device_proof), 813392)
+    with (
+        patch.object(native, "_fingerprint", side_effect=AssertionError("model-array readback")),
+        patch.object(wp, "launch", wraps=wp.launch) as launch,
+        patch.object(owner._proof_status, "numpy", wraps=owner._proof_status.numpy) as readback,
+    ):
+        owner.validate_model(newton.ModelFlags.JOINT_PROPERTIES)
+        test.assertEqual(sum(call.args[0] is native._compare_proof_words for call in launch.call_args_list), 22)
+        test.assertEqual(readback.call_count, 1)
+    for label, array, _ in owner._proof_arrays():
+        original = array.numpy().copy()
+        changed = original.copy()
+        changed.flat[-1] += 1
+        with test.subTest(proof=label):
+            try:
+                array.assign(changed)
+                with patch.object(native, "_fingerprint", side_effect=AssertionError("changed-array readback")):
+                    with test.assertRaisesRegex(RuntimeError, "reconstruct"):
+                        owner.validate_model(newton.ModelFlags.JOINT_PROPERTIES)
+            finally:
+                array.assign(original)
+        owner.validate_model(newton.ModelFlags.JOINT_PROPERTIES)
+
+    original = case.model.joint_X_p
+    values = original.numpy().copy()
+    try:
+        case.model.joint_X_p = wp.clone(original)
+        with patch.object(native, "_fingerprint", side_effect=AssertionError("rebound-array readback")):
+            owner.validate_model(newton.ModelFlags.JOINT_PROPERTIES)
+        case.model.joint_X_p = wp.array(values[:-1], dtype=original.dtype, device=device)
+        with test.assertRaisesRegex(RuntimeError, "reconstruct"):
+            owner.validate_model(newton.ModelFlags.JOINT_PROPERTIES)
+        backing = wp.zeros(original.size * 2, dtype=original.dtype, device=device)
+        case.model.joint_X_p = backing[::2]
+        case.model.joint_X_p.assign(values)
+        test.assertFalse(case.model.joint_X_p.is_contiguous)
+        with patch.object(native, "_fingerprint", wraps=native._fingerprint) as fallback:
+            owner.validate_model(newton.ModelFlags.JOINT_PROPERTIES)
+            test.assertEqual(fallback.call_count, 1)
+    finally:
+        case.model.joint_X_p = original
+    owner.validate_model(newton.ModelFlags.JOINT_PROPERTIES)
+
+    # Exact words distinguish signed zero and retain identical NaN payloads.
+    words = np.array([0, 0x80000000, 0x7FC01234, 0xFFFFFFFF], dtype=np.uint32)
+    current = wp.array(words, dtype=wp.uint32, device=device)
+    frozen = wp.clone(current)
+    mismatch = wp.zeros(1, dtype=int, device=device)
+    wp.launch(native._compare_proof_words, 4, inputs=[current, frozen, mismatch, 8], device=device)
+    np.testing.assert_array_equal(mismatch.numpy(), [0])
+    words[0] = 0x80000000
+    current.assign(words)
+    wp.launch(native._compare_proof_words, 4, inputs=[current, frozen, mismatch, 8], device=device)
+    np.testing.assert_array_equal(mismatch.numpy(), [8])
+
+
 class TestFrankaKineticStateCPU(unittest.TestCase):
+    def test_device_proof_skips_host_copies_without_relaxing_rejection(self):
+        """Retain the complete proof while eliminating all normal model-array readbacks."""
+        check_device_proof(self, "cpu")
+
     def test_paired16_native_mapping_and_launch_counts(self):
         """Require all three paired owners and preserve one complete CPU world per item."""
         capture = next(captures())
@@ -713,6 +784,10 @@ class TestFrankaKineticStateCUDA(unittest.TestCase):
         if not wp.get_cuda_devices():
             raise unittest.SkipTest("Root owns CUDA lease")
         cls.device = wp.get_cuda_devices()[0]
+
+    def test_device_proof_skips_host_copies_without_relaxing_rejection(self):
+        """Verify exact CUDA comparison, rebinding and the original descriptor fallback."""
+        check_device_proof(self, self.device)
 
     def test_saved_current_geometry_held_force_and_services(self):
         """Check all four loaded current/held epochs with nonzero live forces and prescribed response."""
