@@ -115,6 +115,9 @@ class LiveBindings:
             from . import kinetic_current_contact  # noqa: PLC0415 -- default-off experimental owner
 
             self.current_contact = kinetic_current_contact.allocate(worlds, solver._max_contacts_alloc, device)
+        self.lazy_response = os.environ.get("FEATHER_PGS_KUKA_LAZY_RESPONSE", "0") == "1"
+        if self.lazy_response and self.current_contact is None:
+            raise ValueError("Kuka lazy response requires current-contact ownership")
         self.free_mass_mask = solver.mass_update_mask
         self.free_row_K = getattr(solver, "aug_row_K", None)
         if self.free_row_K is None:
@@ -328,6 +331,10 @@ class LiveBindings:
             from . import kinetic_current_contact  # noqa: PLC0415 -- default-off experimental owner
 
             kinetic_current_contact.install(self, call)
+        if self.lazy_response:
+            from . import kinetic_lazy_response  # noqa: PLC0415 -- optional response owner
+
+            kinetic_lazy_response.install(self, call)
         return call
 
     def validate_notification(self, flags, *, plan_snapshot=None):
