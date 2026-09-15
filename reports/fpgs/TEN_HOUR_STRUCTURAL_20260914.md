@@ -1422,3 +1422,83 @@ all original budgets/capacities. A small external adapter preserves all
 existing guards; it is not a Lab/runtime change. Historical Keyboard ratios
 must not be presented as this new symmetric comparison. No new all-task
 4x claim is made.
+
+## September 15 10:32: repeated Keyboard gain and fresh 4x physics result
+
+The unchanged linear-state runtime `94153754` passes three alternating paired
+whole runs. Session 24599 exits 0; all twelve children, 24 capacity boundaries,
+source and idle guards pass. Artifact directory:
+`/tmp/fpgs-keyboard-linear-state-repeated-paired4k-20260915-01`, manifest SHA256
+`f9514371a72fe2ffd4122e6eeff9a776d5b17013ed7938ce54d133e6f21108ab`.
+
+| GPU | Baseline physics median | Linear physics median | Speedup | Median saving |
+| --- | ---: | ---: | ---: | ---: |
+| RTX PRO6000 | 7.755844 ms | 6.803919 ms | 1.139908x | 0.951925 ms |
+| GB300 | 6.654423 ms | 5.945697 ms | 1.119200x | 0.708727 ms |
+
+Every physics pair improves. RTX baseline samples are 7.755844, 7.758568,
+7.676726 ms and candidate samples 6.772816, 6.803919, 6.817308 ms. GB baseline
+samples are 6.740669, 6.552950, 6.654423 ms and candidate 5.945697, 5.928910,
+5.999382 ms. The repeated RTX result exceeds the original 0.7 ms target;
+the separate first discovery miss and short node diagnosis remain preserved.
+Environment-wall medians improve 1.049277x RTX and 1.019566x GB, but the third
+GB pair regresses about 4.15%; do not claim every wall-time pair improves.
+
+The fresh corrected-MJWarp comparison also passes all twelve children and
+24 checked boundaries. Session 49962 exits 0; original source guards complete
+and root separately verifies both GPUs idle. The backend driver has no
+final-idle boolean field, unlike the variant driver. Artifact directory:
+`/tmp/fpgs-keyboard-linear-state-corrected-backends-paired4k-20260915-01`, manifest
+SHA256 `dc35d8ff7510ab1711c1c27b7207a996ddb0dec6d5734f5b00eaf69a3a677c6e`.
+
+Both backends use the same Newton `94153754` source, fixed Lab `53ee6b44`,
+shared `NEWTON_NARROW_PHASE_THREADS_X=4` and the existing calibrated capacities.
+The unchanged checked MJWarp line-search helper is `7506361f`; warning bits
+are not suppressed. External adapter SHA256 is
+`9f2e361692ea9df502b2c5c8f3c555bb146ebb5dff574dd859592308674c81d0`, at
+`/tmp/fpgs-keyboard-shared-backends-u1bZoGuc/run.py`. It preserves the checked
+driver and fixed imports, only matching the shared mapping and pinning its
+own bytes. The capacity report records constructor thread counts before the
+manager applies the multiplier, not the final launch multiplier.
+
+| GPU | FPGS physics median | MJWarp physics median | MJWarp/FPGS physics | Environment wall ratio |
+| --- | ---: | ---: | ---: | ---: |
+| RTX PRO6000 | 6.914322 ms | 28.227042 ms | 4.082402x | 1.050538x |
+| GB300 | 6.068582 ms | 28.517297 ms | 4.699169x | 1.191544x |
+
+All three fresh pairs exceed 4x on each card; the lowest RTX pair is 4.051701x.
+This is 4K Keyboard physics under the recorded recipe, not full RL training,
+trajectory identity or an all-task result. Different rollout/reset workloads
+still limit interpretation of the environment-wall ratio. Retain the new
+path as default-off opt-in, preserving all timestep/substep/iteration and
+capacity budgets. The portable native regression and full report are being
+integrated in its branch without changing the measured runtime.
+
+No follow-on micro-tuning is funded. A scalar-key consumer boundary could
+retire spatial motion/bias intermediates, but its current 1.123479 ms producer
+and tau envelope is not exclusive, and does not establish another 0.7 ms
+removable after retaining public poses/velocities. The bounded Franka/Kuka
+triage likewise identifies no new complete >=1 ms case: Franka rows/GS are
+1.295 ms exclusive, Kuka contact/GS 3.619 ms exclusive, and previous private
+implementations of those boundaries already lost. Current publication costs
+0.918/1.667 ms retain real angular dynamics and public-state consumers.
+These are next-target cost facts, not a proof of impossibility or permission
+to recycle failed paths without a new cause. The all-representative RTX 4x
+objective remains unfinished.
+
+The portable qualification subsequently passes ten tests on each GPU
+(RTX session 54460, 0.997 s; GB session 84595, 1.054 s; both exit 0, no skips).
+This is the complete prismatic-publication module plus the scalar-mass oracle.
+The added helper and GPU method are AST-equivalent to the passed external
+test after only portable import/name substitutions; runtime hashes remain
+`e3bfb421`/`f5fe2237`. Test SHA256 is
+`b88973d9abbf498c7856c96015a581ac1c6b887dfe5f00d9e76faf0bbbc23575`.
+Logs under `/tmp/fpgs-keyboard-linear-integrated-vAKSDPdl` have RTX SHA256
+`ae9f24ba21d68620c604a644a09ec203fc2506766b25c2f0af5a64669abc4e2e`
+and GB `c39c77e8d352cf1feb1a93d62ad0332bf6947f1c614400916826c60ba87e5273`.
+The CUDA-hidden module also passes seven CPU tests with two explicit GPU
+skips in the pinned Lab interpreter (session 38125, 0.376 s).
+An earlier mistaken `uv run --extra dev` CPU invocation was stopped before
+qualification and is not counted; it created an ignored local `.venv` but
+changed no lock/runtime files or benchmark environment. Reproduction and
+qualification use the explicit existing Lab interpreter with `--no-project`.
