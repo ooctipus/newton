@@ -124,3 +124,29 @@ After focused CPU/source checks, the first clean paired whole run is expressly
 an **unqualified cost screen**, not promotion. Full native cold/reset/current
 mass and captured lifecycle controls remain a retention gate. This sequencing
 does not claim that source review or CPU compilation proves CUDA physics.
+
+## First screen: constructor failure, no candidate timing
+
+The first paired screen at runtime `cd3ec68d5a5c65eb54abc1faaef028fcbd4f794c`
+failed before either candidate was constructed. Root parent 58617 was reaped
+with exit 1; both baseline captures completed, but neither candidate produced
+a timing report. Preserve the original artifacts at
+`/tmp/fpgs-keyboard-linear-state-whole-paired4k-20260915-01` (manifest SHA256
+`f0319b699acf1285ccab3b246d80a544a6fe2655520b7d58889061d2ca3a9f91`).
+
+The admission check incorrectly boolean-indexed the N+1 articulation-start
+array with an N-articulation mask (8193 versus 8192 in the real task). The
+intended comparison is against `starts[:-1][admitted]`: the final entry is
+the end sentinel, not another articulation. Correct only this host slice and
+add a real-plan CPU admission regression. No native math, cache ordering,
+physical tolerance or solver budget changes are involved.
+
+The new actual-plan CPU regression first reproduced the same `IndexError`
+(session 36463, four starts versus three articulation flags). After the slice
+fix, all eight CPU controls passed with one explicit CUDA skip (session 69208,
+nine tests total, 0.364 s). An earlier invocation used a nonexistent scalar
+test-class name; its loader error was corrected without source changes.
+AST comparison confirms every native function is unchanged from `cd3ec68d`;
+only `configure_linear_state` differs. Corrected module SHA256:
+`e3bfb42113b651aabcce92902771b025109e1d7186a31edeae02b225de733e1c`.
+The solver-hook hash remains `f5fe22374ec9f60a9400a5e73cb8e334195cc6833afb028b0b460d6c27493d3e`.

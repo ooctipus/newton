@@ -11,6 +11,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
+from newton._src.solvers.feather_pgs.prismatic_linear_state import configure_linear_state
 from newton._src.solvers.feather_pgs.prismatic_publication import PrismaticPublicationPlan
 from newton.solvers import SolverFeatherPGS
 
@@ -119,6 +120,22 @@ def _fields(solver, state):
 
 
 class TestPrismaticPublication(unittest.TestCase):
+    def test_linear_configure_uses_sentinel_closed_articulation_starts(self):
+        """Admit an actual topology with N+1 starts and N articulation flags."""
+        model, _, _ = _build_model()
+        solver = _solver(model, enabled=True)
+        self.assertEqual(len(model.articulation_start), model.articulation_count + 1)
+        # Execute the admission proof on actual CPU model/plan arrays; this
+        # does not enable a CPU production solve or elide generic inertia.
+        with (
+            mock.patch.object(solver, "pgs_mode", "matrix_free"),
+            mock.patch.object(solver, "_direct_compact_diagonal_inertia", True),
+            mock.patch.object(solver, "_compact_diagonal_mass_size", 7),
+        ):
+            configure_linear_state(solver)
+        self.assertTrue(solver._prismatic_linear_state)
+        self.assertEqual(solver._prismatic_linear_valid.shape, (model.articulation_count,))
+
     def test_linear_state_default_off_and_unsupported_cpu(self):
         """Keep linear-state admission explicit and reject unsupported CPU owners."""
         self.assertFalse(solver_module._PRISMATIC_LINEAR_STATE)

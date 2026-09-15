@@ -32,7 +32,7 @@ def configure_linear_state(solver) -> None:
     ends = plan.joint_end.numpy()
     admitted = ends != solver.articulation_joint_end.numpy()
     direct = solver._model_plan.response_dof_count == solver._compact_diagonal_mass_size
-    if not np.array_equal(admitted, direct) or np.any(ends[admitted] != starts[admitted] + 1):
+    if not np.array_equal(admitted, direct) or np.any(ends[admitted] != starts[:-1][admitted] + 1):
         raise ValueError("prismatic linear state requires every direct branch to belong to the prismatic plan")
     solver._prismatic_linear_valid = wp.empty_like(solver._fk_id_cache_valid)
     solver._direct_compact_diagonal_inertia_kernel = get_linear_inverse_mass_kernel(solver._compact_diagonal_mass_size)
