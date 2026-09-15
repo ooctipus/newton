@@ -3,6 +3,7 @@
 
 """Check complete current/next G1 kinetics with retained sparse W consumers."""
 
+import gc
 import importlib
 import json
 import os
@@ -417,6 +418,12 @@ class TestG1KineticStateCUDA(unittest.TestCase):
         if not wp.get_cuda_devices():
             raise unittest.SkipTest("Root owns the native GPU lease")
         cls.device = wp.get_cuda_devices()[0]
+
+    @classmethod
+    def tearDownClass(cls):
+        """Release cyclic solver/owner references while CUDA is still alive."""
+        wp.synchronize_device(cls.device)
+        gc.collect()
 
     def test_current_force_predictor_and_publication(self):
         """Check physical H, current force buckets and original anchored-root integration."""
