@@ -1824,6 +1824,11 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_diagonal_speculative_contact_batches = bool(
             self._sparse_diagonal_contact_triples and self._sparse_diagonal_dense_size + 2 <= 8
         )
+        self._stationary_limits = os.environ.get("FEATHER_PGS_STATIONARY_LIMITS", "0") == "1"
+        if self._stationary_limits and not (
+            self._sparse_diagonal_contact_triples and self._fused_diagonal_joint_limits
+        ):
+            raise ValueError("stationary limits require the sparse-diagonal fused-limit owner")
         self._sparse_diagonal_dense_offsets = wp.array(
             sparse_diagonal_pair[2] if sparse_diagonal_pair is not None else np.zeros(1, dtype=np.int32),
             dtype=wp.int32,
@@ -2275,6 +2280,11 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
         self._sparse_contact_serial_normals = wp.empty(sparse_serial_shape, dtype=wp.int32, device=model.device)
+        self._stationary_limit_mask = (
+            wp.empty((self.world_count, (self.max_world_dofs + 31) // 32), dtype=wp.uint32, device=model.device)
+            if self._stationary_limits
+            else None
+        )
         self._allocate_mf_buffers(model)
         self._allocate_propagation_buffers(model)
         self.mf_target_velocity = (
@@ -5596,6 +5606,7 @@ class SolverFeatherPGS(SolverBase):
                 self.max_world_dofs,
                 device_arch,
                 build_serial_contacts=self._sparse_diagonal_speculative_contact_batches,
+                stationary_limit_dofs=self._sparse_diagonal_dense_size if self._stationary_limits else 0,
             )
             if self._sparse_diagonal_contact_triples
             else None
@@ -5608,6 +5619,7 @@ class SolverFeatherPGS(SolverBase):
                 device_arch,
                 contact_triples=self._sparse_diagonal_contact_triples,
                 speculative_contact_batches=self._sparse_diagonal_speculative_contact_batches,
+                stationary_limits=self._stationary_limits,
             )
             if self._sparse_diagonal_contact_solve
             else None
@@ -6831,7 +6843,8 @@ class SolverFeatherPGS(SolverBase):
                     self._fused_diagonal_limit_lower_lambda,
                     self._fused_diagonal_limit_upper_lambda,
                     self.v_out,
-                ],
+                ]
+                + ([self._stationary_limit_mask] if self._stationary_limits else []),
                 block_dim=32,
                 device=self.model.device,
             )
@@ -12606,7 +12619,12 @@ class SolverFeatherPGS(SolverBase):
                     self._sparse_contact_group_heads,
                     self._sparse_contact_serial_count,
                     self._sparse_contact_serial_normals,
-                ],
+                ]
+                + (
+                    [self._sparse_diagonal_dense_offsets, self._stationary_limit_mask]
+                    if self._stationary_limits
+                    else []
+                ),
                 device=model.device,
             )
         if self._local_internal_fast_path and self._row_packets is None:
@@ -22648,12 +22666,44 @@ def _get_build_independent_sparse_contact_groups_kernel(
     device_arch: str,
     *,
     build_serial_contacts: bool = False,
+    stationary_limit_dofs: int = 0,
 ) -> "wp.Kernel":
     """Build exact independent and serial contact schedules for sparse diagonal response."""
     del device_arch
     M = int(max_constraints)
     D = int(max_world_dofs)
     S = (M + 2) // 3
+    P = int(stationary_limit_dofs)
+    if P < 0 or P > D:
+        raise ValueError("stationary-limit dense size must be within the world coordinates")
+    ownership_scan = ""
+    ownership_ballot = ""
+    if P:
+        ownership_scan = f"""
+    // Links and serial membership are complete. Reserve only empty heads:
+    // every active row, including prefix and tangent-only endpoints, counts.
+    const bool valid_span = contact_start >= 0 && contact_start <= contact_end
+        && contact_end >= 0 && contact_end <= {M};
+    const int ownership_end = contact_end < 0 ? 0 : (contact_end < {M} ? contact_end : {M});
+    const int dense_offset = dense_offsets.data[world];
+    const bool valid_dense = dense_offset >= 0 && dense_offset + {P} <= {D};
+    for (int row = lane; row < ownership_end; row += 32) {{
+        for (int endpoint = 0; endpoint < 2; ++endpoint) {{
+            const int coordinate = sparse_row_dof.data[sparse_world_base + row * 2 + endpoint];
+            if (coordinate >= 0 && coordinate < {D}
+                && group_heads.data[head_base + coordinate] == -1)
+                atomicCAS(group_heads.data + head_base + coordinate, -1, -2);
+        }}
+    }}
+    __syncwarp(MASK);
+"""
+        ownership_ballot = f"""
+        const bool isolated = valid_span && valid_dense && coordinate < {D} && head == -1
+            && (coordinate < dense_offset || coordinate >= dense_offset + {P});
+        const unsigned isolated_mask = __ballot_sync(MASK, isolated);
+        if (lane == 0)
+            stationary_limit_mask.data[world * {(D + 31) // 32} + coordinate_base / 32] = isolated_mask;
+"""
     serial_schedule = (
         f"""
     // Compact the remaining contacts in original row order. The solve may
@@ -22733,10 +22783,13 @@ def _get_build_independent_sparse_contact_groups_kernel(
 
 {serial_schedule}
 
+{ownership_scan}
+
     int count = 0;
     for (int coordinate_base = 0; coordinate_base < {D}; coordinate_base += 32) {{
         const int coordinate = coordinate_base + lane;
         const int head = coordinate < {D} ? group_heads.data[head_base + coordinate] : -1;
+{ownership_ballot}
         const unsigned active = __ballot_sync(MASK, head >= 0);
         const unsigned lower_lanes = lane == 0 ? 0u : 0xffffffffu >> (32 - lane);
         if (head >= 0) {{
@@ -22788,6 +22841,51 @@ def _get_build_independent_sparse_contact_groups_kernel(
         )
 
     name = f"build_independent_sparse_contact_groups_{M}_{D}"
+    if P:
+
+        @wp.func_native(snippet)
+        def build_stationary_limit_groups_native(
+            world: int,
+            lane: int,
+            world_constraint_count: wp.array[int],
+            dense_phase_bounds: wp.array2d[int],
+            sparse_row_dof: wp.array3d[int],
+            group_count: wp.array[int],
+            group_heads: wp.array2d[int],
+            serial_count_out: wp.array[int],
+            serial_normals: wp.array2d[int],
+            dense_offsets: wp.array[int],
+            stationary_limit_mask: wp.array2d[wp.uint32],
+        ): ...
+
+        def build_stationary_limit_groups_template(
+            world_constraint_count: wp.array[int],
+            dense_phase_bounds: wp.array2d[int],
+            sparse_row_dof: wp.array3d[int],
+            group_count: wp.array[int],
+            group_heads: wp.array2d[int],
+            serial_count_out: wp.array[int],
+            serial_normals: wp.array2d[int],
+            dense_offsets: wp.array[int],
+            stationary_limit_mask: wp.array2d[wp.uint32],
+        ):
+            thread = wp.tid()
+            build_stationary_limit_groups_native(
+                thread // 32,
+                thread % 32,
+                world_constraint_count,
+                dense_phase_bounds,
+                sparse_row_dof,
+                group_count,
+                group_heads,
+                serial_count_out,
+                serial_normals,
+                dense_offsets,
+                stationary_limit_mask,
+            )
+
+        build_independent_sparse_contact_groups_template = build_stationary_limit_groups_template
+        name += "_stationary_limits"
     if build_serial_contacts:
         name += "_serial_contacts"
     build_independent_sparse_contact_groups_template.__name__ = name
@@ -22804,12 +22902,15 @@ def _get_pgs_solve_sparse_diagonal_kernel(
     *,
     contact_triples: bool = False,
     speculative_contact_batches: bool = False,
+    stationary_limits: bool = False,
 ) -> "wp.Kernel":
     """Build the persistent ``small dense + two sparse`` GS owner."""
     M = int(max_constraints)
     D = int(max_world_dofs)
     P = int(dense_dofs)
     S = (M + 2) // 3
+    if stationary_limits and not contact_triples:
+        raise ValueError("stationary limits require a complete current contact-group ownership mask")
     if speculative_contact_batches and (not contact_triples or P + 2 > 8):
         raise ValueError("speculative contact batches require an eight-lane sparse contact triple")
     elems_per_lane = (D + 31) // 32
@@ -22818,6 +22919,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
     limit_loads = []
     limit_projection = []
     limit_stores = []
+    limit_retirement = []
     for element in range(elems_per_lane):
         coord = f"lane + {element * 32}" if element else "lane"
         limit_declarations.append(
@@ -22861,6 +22963,22 @@ def _get_pgs_solve_sparse_diagonal_kernel(
             }}
         }}"""
         )
+        if stationary_limits:
+            limit_retirement.append(f"""    if ({coord} < {D} && omega == 1.0f
+        && (stationary_limit_mask.data[world * {elems_per_lane} + {element}] & (1u << lane))) {{
+        const float velocity = s_v[{coord}];
+        const float response = limit_response_{element};
+        const float denominator = response + fused_limit_cfm;
+        const float lower = velocity + limit_lower_rhs_{element};
+        const float upper = -velocity + limit_upper_rhs_{element};
+        const bool lower_ok = !(limit_active_{element} & 1) || (isfinite(lower) && lower >= 0.0f);
+        const bool upper_ok = !(limit_active_{element} & 2) || (isfinite(upper) && upper >= 0.0f);
+        if (isfinite(velocity) && (velocity == 0.0f || fabsf(velocity) >= 1.17549435e-38f)
+            && isfinite(response) && response > 0.0f
+            && isfinite(fused_limit_cfm) && fused_limit_cfm >= 0.0f
+            && isfinite(denominator) && denominator > 0.0f && lower_ok && upper_ok)
+            limit_active_{element} = 0;
+    }}""")
         limit_stores.append(
             f"""    if ({coord} < {D}) {{
         const int limit_index = world * {D} + {coord};
@@ -23136,6 +23254,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
         s_v[coord] = global_dof >= 0 ? v_out.data[global_dof] : 0.0f;
     }}
 {chr(10).join(limit_loads)}
+{chr(10).join(limit_retirement)}
     __syncwarp(MASK);
 
     for (int iteration = 0; iteration < iterations; ++iteration) {{
@@ -23353,6 +23472,118 @@ def _get_pgs_solve_sparse_diagonal_kernel(
         )
 
     name = f"pgs_solve_sparse_diagonal_{M}_{D}_{P}"
+    if stationary_limits:
+
+        @wp.func_native(snippet)
+        def pgs_solve_stationary_limits_native(
+            world: int,
+            world_constraint_count: wp.array[int],
+            world_dof_indices: wp.array2d[int],
+            rhs_bias: wp.array2d[float],
+            world_diag: wp.array2d[float],
+            world_impulses: wp.array2d[float],
+            world_row_type: wp.array2d[int],
+            world_row_parent: wp.array2d[int],
+            world_row_mu: wp.array2d[float],
+            dense_phase_bounds: wp.array2d[int],
+            sparse_contact_group_count: wp.array[int],
+            sparse_contact_group_heads: wp.array2d[int],
+            sparse_contact_serial_count: wp.array[int],
+            sparse_contact_serial_normals: wp.array2d[int],
+            dense_offsets: wp.array[int],
+            dense_groups: wp.array[int],
+            dense_J: wp.array3d[float],
+            dense_Y: wp.array3d[float],
+            sparse_row_dof: wp.array3d[int],
+            sparse_row_jy: wp.array3d[float],
+            fused_limit_active: wp.array2d[int],
+            fused_limit_lower_rhs: wp.array2d[float],
+            fused_limit_upper_rhs: wp.array2d[float],
+            diagonal_inverse_mass: wp.array[float],
+            fused_limit_cfm: float,
+            iterations: int,
+            omega: float,
+            friction_start_iteration: int,
+            iteration_offset: int,
+            fused_limit_lower_lambda: wp.array2d[float],
+            fused_limit_upper_lambda: wp.array2d[float],
+            v_out: wp.array[float],
+            stationary_limit_mask: wp.array2d[wp.uint32],
+        ): ...
+
+        def pgs_solve_stationary_limits_template(
+            world_constraint_count: wp.array[int],
+            world_dof_indices: wp.array2d[int],
+            rhs_bias: wp.array2d[float],
+            world_diag: wp.array2d[float],
+            world_impulses: wp.array2d[float],
+            world_row_type: wp.array2d[int],
+            world_row_parent: wp.array2d[int],
+            world_row_mu: wp.array2d[float],
+            dense_phase_bounds: wp.array2d[int],
+            sparse_contact_group_count: wp.array[int],
+            sparse_contact_group_heads: wp.array2d[int],
+            sparse_contact_serial_count: wp.array[int],
+            sparse_contact_serial_normals: wp.array2d[int],
+            dense_offsets: wp.array[int],
+            dense_groups: wp.array[int],
+            dense_J: wp.array3d[float],
+            dense_Y: wp.array3d[float],
+            sparse_row_dof: wp.array3d[int],
+            sparse_row_jy: wp.array3d[float],
+            fused_limit_active: wp.array2d[int],
+            fused_limit_lower_rhs: wp.array2d[float],
+            fused_limit_upper_rhs: wp.array2d[float],
+            diagonal_inverse_mass: wp.array[float],
+            fused_limit_cfm: float,
+            iterations: int,
+            omega: float,
+            friction_start_iteration: int,
+            iteration_offset: int,
+            fused_limit_lower_lambda: wp.array2d[float],
+            fused_limit_upper_lambda: wp.array2d[float],
+            v_out: wp.array[float],
+            stationary_limit_mask: wp.array2d[wp.uint32],
+        ):
+            world, _lane = wp.tid()
+            pgs_solve_stationary_limits_native(
+                world,
+                world_constraint_count,
+                world_dof_indices,
+                rhs_bias,
+                world_diag,
+                world_impulses,
+                world_row_type,
+                world_row_parent,
+                world_row_mu,
+                dense_phase_bounds,
+                sparse_contact_group_count,
+                sparse_contact_group_heads,
+                sparse_contact_serial_count,
+                sparse_contact_serial_normals,
+                dense_offsets,
+                dense_groups,
+                dense_J,
+                dense_Y,
+                sparse_row_dof,
+                sparse_row_jy,
+                fused_limit_active,
+                fused_limit_lower_rhs,
+                fused_limit_upper_rhs,
+                diagonal_inverse_mass,
+                fused_limit_cfm,
+                iterations,
+                omega,
+                friction_start_iteration,
+                iteration_offset,
+                fused_limit_lower_lambda,
+                fused_limit_upper_lambda,
+                v_out,
+                stationary_limit_mask,
+            )
+
+        pgs_solve_sparse_diagonal_template = pgs_solve_stationary_limits_template
+        name += "_stationary_limits"
     if contact_triples:
         name += "_contact_groups"
     if speculative_contact_batches:

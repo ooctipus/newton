@@ -150,6 +150,222 @@ def _run_mixed_response(
 
 
 class TestFeatherPGSResponseDiagonal(unittest.TestCase):
+    def test_stationary_limit_factory_admission(self):
+        """Keep the optional mask ABI separate from the original factories."""
+        old = _get_build_independent_sparse_contact_groups_kernel(12, 114, 120)
+        new = _get_build_independent_sparse_contact_groups_kernel(12, 114, 120, stationary_limit_dofs=6)
+        self.assertNotIn("stationary_limit_mask", [a.label for a in old.adj.args])
+        self.assertEqual([a.label for a in new.adj.args][-2:], ["dense_offsets", "stationary_limit_mask"])
+        self.assertIn("_stationary_limits", new.key)
+        with self.assertRaises(ValueError):
+            _get_pgs_solve_sparse_diagonal_kernel(12, 114, 6, 120, stationary_limits=True)
+        solve = _get_pgs_solve_sparse_diagonal_kernel(12, 114, 6, 120, contact_triples=True, stationary_limits=True)
+        self.assertEqual(solve.adj.args[-1].label, "stationary_limit_mask")
+        self.assertIn("_stationary_limits", solve.key)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "stationary-limit ownership requires CUDA")
+    def test_stationary_limit_mask_refresh_and_schedule(self):
+        """Reserve every row endpoint without changing contact schedules across resets."""
+        device = wp.get_device("cuda:0")
+        worlds, rows, dofs, dense = 5, 12, 114, 6
+        offsets = np.array([0, 108, 0, 108, 0], dtype=np.int32)
+        raw = np.full((worlds, rows, 2), -1, dtype=np.int32)
+        raw[:, 0, 0] = 20  # A prefix-only endpoint.
+        raw[:, 1:4, 0] = 8
+        raw[:, 1, 1] = -2  # An independent normal and its scalar chain.
+        raw[:, 2, 1] = 9  # A tangent-only endpoint not present on the normal.
+        raw[:, 4:7] = (10, 11)  # A coupled contact.
+        raw[3, 4:7, 0] = 8  # A later coupled row must demote an earlier scalar chain.
+        raw[:, 7:10, 0] = 8
+        raw[:, 7, 1] = -2
+        mask = wp.full((worlds, 4), 0xFFFFFFFF, dtype=wp.uint32, device=device)
+        owners = []
+        for enabled in (False, True):
+            sparse = wp.array(raw, device=device)
+            group_count = wp.zeros(worlds, dtype=wp.int32, device=device)
+            heads = wp.full((worlds, dofs), 777, dtype=wp.int32, device=device)
+            serial_count = wp.zeros(worlds, dtype=wp.int32, device=device)
+            serial = wp.full((worlds, 4), 777, dtype=wp.int32, device=device)
+            counts_wp = wp.zeros(worlds, dtype=wp.int32, device=device)
+            phase_wp = wp.zeros((worlds, 2), dtype=wp.int32, device=device)
+            kernel = _get_build_independent_sparse_contact_groups_kernel(
+                rows,
+                dofs,
+                device.arch,
+                build_serial_contacts=True,
+                stationary_limit_dofs=dense if enabled else 0,
+            )
+            arguments = [counts_wp, phase_wp, sparse, group_count, heads, serial_count, serial]
+            if enabled:
+                arguments += [wp.array(offsets, device=device), mask]
+            wp.launch(kernel, dim=worlds * 32, inputs=arguments, device=device)
+            with wp.ScopedCapture(device=device) as capture:
+                wp.launch(kernel, dim=worlds * 32, inputs=arguments, device=device)
+            owners.append((arguments, capture.graph))
+        for counts in ([10, 7, 4, 1, 0], [0] * worlds, [10] * worlds, [1, 4, 0, 7, 1]):
+            phase = np.zeros((worlds, 2), dtype=np.int32)
+            phase[:, 1] = np.minimum(counts, 1)
+            results = []
+            for arguments, graph in owners:
+                wp.copy(arguments[0], wp.array(counts, dtype=wp.int32, device=device))
+                wp.copy(arguments[1], wp.array(phase, device=device))
+                wp.copy(arguments[2], wp.array(raw, device=device))
+                wp.capture_launch(graph)
+                results.append([a.numpy() for a in arguments[2:7]])
+            for index in (0, 1, 3):
+                np.testing.assert_array_equal(results[0][index], results[1][index])
+            for world in range(worlds):
+                for data_index, count_index in ((2, 1), (4, 3)):
+                    count = results[0][count_index][world]
+                    np.testing.assert_array_equal(
+                        results[0][data_index][world, :count], results[1][data_index][world, :count]
+                    )
+                expected = np.ones(dofs, dtype=bool)
+                expected[offsets[world] : offsets[world] + dense] = False
+                endpoints = raw[world, : counts[world]].ravel()
+                expected[endpoints[endpoints >= 0]] = False
+                words = mask.numpy()[world]
+                actual = np.array([(words[i // 32] >> (i % 32)) & 1 for i in range(dofs)], dtype=bool)
+                np.testing.assert_array_equal(actual, expected)
+                self.assertEqual(int(words[-1]) >> (dofs % 32), 0)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "stationary-limit solve requires CUDA")
+    def test_stationary_limit_native_matches_original_and_graph(self):
+        """Keep stationary, violated, inconsistent and contacted coordinates physically unchanged."""
+        device = wp.get_device("cuda:0")
+        worlds, rows, dofs, dense = 5, 8, 114, 6
+        count = np.array([3, 3, 3, 3, 0], dtype=np.int32)
+        dof_map = np.arange(worlds * dofs, dtype=np.int32).reshape(worlds, dofs)
+        velocity = np.zeros((worlds, dofs), dtype=np.float32)
+        velocity[:, 6] = -0.5
+        velocity[:, 7] = 0.2
+        velocity[:, 8] = -2.0  # Violated lower bound.
+        velocity[:, 12] = -0.0
+        velocity[:, 13] = np.nextafter(np.float32(0), np.float32(1))
+        active = np.full((worlds, dofs), 3, dtype=np.int32)
+        active[:, :dense] = 0
+        active[:, 14] = 1
+        active[:, 15] = 2
+        active[:, 16] = 0
+        lower = np.ones((worlds, dofs), dtype=np.float32)
+        upper = lower.copy()
+        lower[:, 9] = -1.0  # Inconsistent lower=1, upper=-1.
+        upper[:, 9] = -1.0
+        lower[:, 15] = np.nan  # Disabled RHS must not reject a supported bound.
+        upper[:, 14] = np.nan
+        inverse = np.full(worlds * dofs, 0.75, dtype=np.float32)
+        rhs = np.zeros((worlds, rows), dtype=np.float32)
+        rhs[:, 0] = -0.1
+        diagonal = np.ones_like(rhs) * (0.75 + 1.0e-6)
+        types = np.zeros((worlds, rows), dtype=np.int32)
+        types[:, :3] = (PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_FRICTION)
+        parent = np.full((worlds, rows), -1, dtype=np.int32)
+        parent[:, 1:3] = 0
+        mu = np.full((worlds, rows), 0.6, dtype=np.float32)
+        sparse = np.full((worlds, rows, 2), -1, dtype=np.int32)
+        sparse[:, 0, 0] = 6
+        sparse[:, 1:3, 0] = 7
+        jy = np.zeros((worlds, rows, 4), dtype=np.float32)
+        jy[:, :3, 0] = 1.0
+        jy[:, :3, 1] = 0.75
+        phase = wp.zeros((worlds, 2), dtype=wp.int32, device=device)
+        sparse_wp = wp.array(sparse, device=device)
+        groups = wp.zeros(worlds, dtype=wp.int32, device=device)
+        heads = wp.empty((worlds, dofs), dtype=wp.int32, device=device)
+        serial_count = wp.zeros(worlds, dtype=wp.int32, device=device)
+        serial = wp.empty((worlds, 3), dtype=wp.int32, device=device)
+        offsets = wp.zeros(worlds, dtype=wp.int32, device=device)
+        mask = wp.empty((worlds, 4), dtype=wp.uint32, device=device)
+        counts = wp.array(count, device=device)
+        builder = _get_build_independent_sparse_contact_groups_kernel(
+            rows, dofs, device.arch, build_serial_contacts=True, stationary_limit_dofs=dense
+        )
+        wp.launch(
+            builder,
+            dim=worlds * 32,
+            inputs=[counts, phase, sparse_wp, groups, heads, serial_count, serial, offsets, mask],
+            device=device,
+        )
+        shared = [
+            counts,
+            wp.array(dof_map, device=device),
+            wp.array(rhs, device=device),
+            wp.array(diagonal, device=device),
+            None,
+            wp.array(types, device=device),
+            wp.array(parent, device=device),
+            wp.array(mu, device=device),
+            phase,
+            groups,
+            heads,
+            serial_count,
+            serial,
+            offsets,
+            wp.array(np.arange(worlds, dtype=np.int32), device=device),
+            wp.zeros((worlds, rows, dense), dtype=wp.float32, device=device),
+            wp.zeros((worlds, rows, dense), dtype=wp.float32, device=device),
+            sparse_wp,
+            wp.array(jy, device=device),
+            wp.array(active, device=device),
+            wp.array(lower, device=device),
+            wp.array(upper, device=device),
+            wp.array(inverse, device=device),
+        ]
+        readonly = [(a, a.numpy().copy()) for a in shared if isinstance(a, wp.array)]
+        for omega, cfm, invalid_response in (
+            (1.0, 1.0e-6, False),
+            (0.8, 1.0e-6, False),
+            (1.0, 0.0, False),
+            (1.0, 1.0e-6, True),
+            (1.0, -1.0, False),
+            (1.0, float("inf"), False),
+        ):
+            case_inverse = inverse.copy()
+            if invalid_response:
+                case_inverse[np.arange(4) * dofs + 17] = (0.0, -1.0, np.nan, np.inf)
+            case_inverse_wp = wp.array(case_inverse, device=device)
+            expected = None
+            for enabled, graph in ((False, False), (True, False), (True, True)):
+                impulses = wp.zeros((worlds, rows), dtype=wp.float32, device=device)
+                lower_out = wp.full((worlds, dofs), 123.0, dtype=wp.float32, device=device)
+                upper_out = wp.full((worlds, dofs), 123.0, dtype=wp.float32, device=device)
+                output = wp.array(velocity.ravel(), device=device)
+                args = shared.copy()
+                args[4] = impulses
+                args[22] = case_inverse_wp
+                args += [cfm, 8, omega, 0, 0, lower_out, upper_out, output]
+                if enabled:
+                    args += [mask]
+                kernel = _get_pgs_solve_sparse_diagonal_kernel(
+                    rows,
+                    dofs,
+                    dense,
+                    device.arch,
+                    contact_triples=True,
+                    speculative_contact_batches=True,
+                    stationary_limits=enabled,
+                )
+                if graph:
+                    with wp.ScopedCapture(device=device) as capture:
+                        wp.launch_tiled(kernel, dim=[worlds], inputs=args, block_dim=32, device=device)
+                    wp.capture_launch(capture.graph)
+                else:
+                    wp.launch_tiled(kernel, dim=[worlds], inputs=args, block_dim=32, device=device)
+                actual = [a.numpy() for a in (output, impulses, lower_out, upper_out)]
+                if not invalid_response:
+                    self.assertTrue(all(np.all(np.isfinite(value)) for value in actual))
+                if expected is None:
+                    expected = actual
+                else:
+                    for original, candidate in zip(expected, actual, strict=True):
+                        np.testing.assert_allclose(candidate, original, atol=3.0e-6, rtol=3.0e-6)
+                if cfm >= 0.0:
+                    np.testing.assert_array_equal(actual[2][:, 10:], 0.0)
+                    np.testing.assert_array_equal(actual[3][:, 10:], 0.0)
+            np.testing.assert_array_equal(case_inverse_wp.numpy(), case_inverse)
+        for array, before in readonly:
+            np.testing.assert_array_equal(array.numpy(), before)
+
     @unittest.skipUnless(wp.is_cuda_available(), "sparse diagonal GS requires CUDA")
     def test_sparse_diagonal_gs_matches_scalar_reference(self):
         """Match a scalar PGS reference with coupled limits and friction."""
