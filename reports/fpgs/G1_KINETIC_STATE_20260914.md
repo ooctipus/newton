@@ -98,3 +98,101 @@ without changing equations.
 These are native resource results, not achieved occupancy, local-memory-free
 claims or timing. Actual owner CPU/current-held physical and integrated whole
 cost remain required. No GPU work was performed by this agent.
+
+## First complete checkpoint (2026-09-15 00:28 UTC)
+
+Runtime `9a2d417f82116288eec9e9c3ed58975dd6271c7e`, test-only followups
+through `bf3a3c8adfee7aa5ce3cc4b1c8ad5ba495711484`; qualified baseline
+`1a9efc33efbc0f23e1e7676a5edded795f224c97`. The runtime did not change
+during these checks. This is a measured discovery gain, **not promotion**.
+
+| Per-environment-step physics, 16K | RTX PRO6000 | GB300 |
+| --- | ---: | ---: |
+| Qualified baseline |18.205599 ms|20.909588 ms|
+| Compact current/next state |15.658029 ms|20.464849 ms|
+| Baseline / candidate |1.1627x|1.0217x|
+| Time removed |2.547571 ms|0.444739 ms|
+
+The unchanged graph-level protocol used seed0, 200 warm steps, 40 wall steps
+and 40 profiled steps, with two Newton substeps and eight-sweep allowance.
+Both arms use the same sparse level/metric/parallel-limit and terrain-query
+options; only `FEATHER_PGS_G1_KINETIC_STATE` changes. Lab stays at corrected
+`53ee6b44c2334341305dbdf385a3916c6b140799`. Capacities remain dense100,
+raw294912, broad49152 and triangle1769472. Wall times, not RL training, were
+32.526046 ->29.785007 ms RTX and36.179844 ->34.203834 ms GB.
+
+Whole evidence: `/tmp/fpgs-g1-kinetic-state-paired16k-20260915-02`.
+All four child processes exit0 with no cleanup signals; all eight boundary
+checks pass actual source/owner, finite state and native capacity/status
+checks. Each arm has160 physics and40 auxiliary direct graphs. Independent
+review rehashed all16 pinned helper/source files and found no CUDA error or
+traceback in the four capture logs. One round does not estimate timing spread.
+
+The preserved `...-01` discovery attempt stopped in the external observer,
+which incorrectly required every current cache to be valid after Lab resets.
+The actual owner intentionally invalidates reset worlds and repairs before
+use. The observer now accepts Boolean validity, checks generation for valid
+geometry and retains sticky native status checks. Whole02 has331--358
+reset-invalidated worlds at boundaries with status0. This observer correction
+does not change solver code or excuse a failed native read.
+
+### Disjoint node diagnosis
+
+Original strict node membership reader was reused. Each of four captures
+passes12 physics/3 auxiliary roots and zero unproven correlations; candidate
+has768 physics nodes versus1020 baseline. The original generic Lab analyzer
+rejects auxiliary graphs in node mode, so both node parent manifests remain
+failed. These independently resolved nodes are diagnostic evidence, not a
+replacement for the successful whole-graph timing above.
+
+Baseline: `/tmp/fpgs-g1-kinetic-state-nodes-paired16k-20260915-01`.
+Candidate: `/tmp/fpgs-g1-kinetic-state-nodes-candidate-paired16k-20260915-01`
+(first pair labeled baseline by that parent, but explicitly candidate source
+and flag1; do not mistake the label for old code).
+
+| Exclusive complete replaced boundary | RTX | GB300 |
+| --- | ---: | ---: |
+| Original current dynamics + publication |7.308948 ms|5.184853 ms|
+| Candidate current dynamics + publication |5.054775 ms|4.917256 ms|
+| Candidate finish / predict / repair sum |3.148854 ms|3.329983 ms|
+| Retained factor, original -> geometric input |2.333621 ->1.781323 ms|1.765184 ->1.505024 ms|
+
+RTX finish2.329569 +predict0.632704 +repair0.186581 ms exceeds the2.70 ms
+planning allocation. The geometric-input factor recovers0.552298 ms against
+the conservative full-old-factor reserve. No old torque, FK/finalizer,
+composite-inertia, predictor or conversion producer remains. GB's old
+boundary was already2.124095 ms cheaper, and its new family costs more;
+the small GB saving is therefore not evidence of an unconsumed refresh flag
+or hidden duplicate pipeline. Launch counts alone are not active-world
+refresh counts: native cache/mass guards can early-return within a launch.
+
+### Physical status and remaining gates
+
+Five CPU tests pass. On both GPUs all three focused physical methods pass
+their assertions: current/held H and force prediction,16 saved loaded-contact
+states, complete five-world eager steps, masked reset/model notification,
+source-bank replacement and graph contact sequence0/5/0/5. Saved physical
+contact momentum defect is at most4.257338e-8 and cone violation7.45e-9.
+
+An independent FP64 public pose/COM-velocity oracle replaced generic FP32 FK
+as the public velocity reference. At saved root translations35--76 m, generic
+and original serial FK lose accuracy by world-position subtraction. The
+candidate satisfies the original component gate against FP64 on all16 saved
+states. A separate near-zero angular component in complete stepping cancels
+ancestor terms with condition~285.57; the final public velocity gate is a
+coordinate-invariant, separate linear/angular three-vector error divided by
+`1 + norm(reference)`, bounded by3e-6. Observed maximum1.412238199e-6.
+This is an explicitly changed physical error metric, not bit-identity or an
+unchanged elementwise tolerance claim. Pose and downstream physical gates
+remain unchanged.
+
+Standalone CUDA tests still intermittently crash or emit CUDA709 during
+cyclic solver destruction, including explicit `gc.collect()` before shutdown.
+All physical assertions can pass before this failure; that does **not** make
+the test process clean. A destructor-order instrumentation control exited0
+but detected no already-destroyed-stream use, so that cause is not established.
+Do not blindly patch weak references: the original solver also stores itself
+as its debug augmented state. Minimal original-versus-new lifecycle diagnosis
+and a clean paired rerun remain required, as do repeated whole timing and
+representative retained-path checks before adoption. The all-task4x target
+remains unmet; these results concern G1 only.
