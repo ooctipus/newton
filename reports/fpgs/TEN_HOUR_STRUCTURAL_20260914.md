@@ -826,3 +826,55 @@ SHA256 `f66f23db48331c457fa46c5119a5f5ac2d1c981f02334864156f59a6488481dc`.
 The accepted RTX ratios above remain unchanged; the at-least4x-every-task
 target is still unmet. These losing prototypes have not replaced accepted
 runtime or been used as new improvement baselines.
+
+## September15 02:55: retained composition, closed Kuka correction, Franka gain candidate
+
+The independently repeated G1 and Kuka current-contact gains are now composed
+without semantic edits on `ooctipus/fpgs-kinetic-qualified-20260915`, merge
+`ded651f83ce4539e4f7ab13bebb5edde9d4dcc4d`, report tip
+`b1bad06ae0cd5b86ac07b2f2844ef62770e99075`. The branch is pushed and its remote
+hash verified. All106 selected CPU controls pass with two explicit CUDA skips;
+root's ten actual CUDA selectors pass on each card. These are integration
+checks, not a new all-task timing sweep. The qualified report includes exact
+parent/source pins and retains handoff ancestry. No Lab pointer changed.
+
+Kuka's one causal cooperative correction is closed as a loss, not discarded
+without diagnosis. Four warps construct separate contacts and the false
+private-to-positive-solve host dependency is removed. Clean whole graph costs
+are10.411883->11.834728 ms RTX and10.678865->11.665263 ms GB. The strict complete
+affected union grows3.595766->5.092613 ms RTX and3.967386->4.763133 ms GB.
+Private response/eight improves6.153778->3.146638 ms RTX versus the FIRST
+PROTOTYPE, but still exceeds its entire2.595454 ms replacement allowance before
+retained work. Only0.614892 ms of retained-main sums overlaps private; positive
+solves remain fully exposed in the measured interval. Physical controls pass;
+no promotion or further mapping grid. Both original/private source-guard
+failure and clean corrected evidence remain in pushed report tips4affa72a and
+60a8a454, respectively. Accepted Kuka remains the current-contact branch.
+
+Franka's complete kinetic owner received one all-three-owner paired16 mapping
+correction. Independent source review and the original three CUDA selectors
+pass on both cards, including five-world odd-tail/mixed-cache/error isolation.
+One clean whole round at91f505f5 measures5.453217->5.032845 ms RTX (1.083526x)
+and5.060164->4.729254 ms GB (1.069971x). This positive result misses the declared
+0.55 ms RTX saving by0.129628 ms and is not repeated or promoted. Wall remains
+28.026434->44.762043 ms RTX and28.648983->44.353130 ms GB. Detailed physical,
+whole and matched-node closure is pushed atc643e157 on its isolated branch.
+
+The actual three-owner RTX sum is1.463051 ms, not the proposed<=1.052093 ms;
+full matched state/factor/drive/mask exclusive falls2.049643->1.675650 ms.
+Lost original overlap is not recovered. Static driver queries additionally
+show RTX102400 shared bytes/SM and24 maximum CTAs/SM: doubled state scratch
+7296 bytes/block limits nominal shared-memory CTAs to14, rather than the old
+24-block combined ceiling at3712 bytes/block. This weakens the ideal2x packing
+premise; it is not achieved occupancy or a throughput/stall proof. No third
+packing variant is funded.
+
+A separate bounded Newton-only repair now targets the remaining approximately
+16 ms host regression, not a new physics milestone. Unchanged notifications
+copy/hash22 arrays,26,017,792 bytes at16K. The isolated device-proof candidate
+retains all checks with exact-sized constructor snapshots and word comparisons
+before one four-byte readback. The original null-stream read envelope is
+preserved. Root CUDA and whole-cost checks are pending; checkpoint03:20 UTC,
+no silent extension beyond03:35. Accepted ratios remain those at01:18 until
+qualification is complete. The goal controller still reports paused; it has
+not been marked complete, and at-least4x on every RTX task remains unmet.
