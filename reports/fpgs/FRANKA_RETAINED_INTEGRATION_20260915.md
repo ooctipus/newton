@@ -114,3 +114,61 @@ does not relabel the inherited timings as a new benchmark or establish a
 new backend ratio. The original negative reports remain unchanged.
 Full `uvx pre-commit run -a` passes (session3475, exit0); the native and resolved
 solver hashes remain unchanged after formatting and checks.
+
+## Combined-source native qualification and retention
+
+The root-owned paired native run on clean merge
+`b9ba04a471aa659206d4e67518e421d527e41aad` passes all eight selectors on each
+card: RTX 17.882 seconds (session40388), GB300 18.021 seconds (session49686).
+Both sessions were reaped with exit0, with no skipped tests or errors. The only
+warnings are the inherited joint-target-layout deprecations. These durations
+include test/module loading and are not whole-physics benchmark measurements.
+
+The four Franka controls cover loaded current/held forces, publication, exact
+device-proof rejection/rebinding, five-world odd-tail/reset and two-bank graph
+lifetime. The three retained G1 controls include anchored-root current-force
+prediction, current/held geometry, all sixteen saved inputs and the actual
+five-world mixed-cache graph. The retained Kuka current-contact boundary
+control also passes. Its scope is the existing boundary control, not a new
+complete Kuka qualification campaign. All original physical tolerances remain
+unchanged. Franka's reported maximum current-H9 error is 1.3396387e-6, bias
+error 2.0842464e-6, held momentum9 error 1.7301406e-7 and public velocity error
+7.1193080e-7; the retained G1 independent-H error is 8.906245e-8.
+
+Verified complete logs under `/tmp/fpgs-franka-retained-native-jLfTopU1`:
+
+| Card/log | SHA256 |
+| --- | --- |
+| RTX `gpu0.log` | `6b911ff277707e6903ecfa11bc7fca186e4a50b0134137ca05cbe880699bcbd4` |
+| GB300 `gpu1.log` | `0d62ed72f75843dcff98d68628aa56f66108cd6c1ec8adda4aad501e20dbaf6b` |
+
+Exact RTX invocation, from the retained worktree:
+
+```bash
+set -o pipefail
+env CUDA_VISIBLE_DEVICES=GPU-883586b6-3100-0610-81e5-3b4c26f45639 \
+  PYTHONPATH=/home/octi/Projects/newton-fpgs-franka-retained-20260915 \
+  FPGS_TEST_DEVICE=cuda:0 OPENBLAS_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 \
+  uv run --no-project \
+  --python /home/octi/Projects/IsaacLab.wt/contact-reset-20260913/.venv/bin/python \
+  python -m unittest \
+  tools.fpgs_bench.test_franka_kinetic_state.TestFrankaKineticStateCUDA \
+  tools.fpgs_bench.test_g1_kinetic_state.TestG1KineticStateCUDA \
+  tools.fpgs_bench.test_kinetic_current_contact.TestKineticCurrentContact.test_cuda_current_contact_boundary \
+  -v 2>&1 | tee /tmp/fpgs-franka-retained-native-jLfTopU1/gpu0.log
+```
+
+The simultaneous GB300 command is identical except
+`CUDA_VISIBLE_DEVICES=GPU-ebfac9e8-02d5-d8a9-3bfc-bac64c62ffd4` and the output
+path ends in `gpu1.log`. No external solver feature flags were set; the
+existing selectors manage their explicit opt-ins. Use fresh log destinations
+when reproducing to preserve these original artifacts.
+
+Final decision: retain this qualified integration as the existing default-off,
+physics-focused opt-in. The reported repeated speedups remain measurements of
+865dbd6c, not new timings of this merge. RTX wall neutrality and the measured
+GB300 mean wall regression of 0.492922 ms remain explicit tradeoffs. This is
+neither an environment/training throughput claim nor achievement of the
+all-task 4x goal. The report-only qualification update changes no runtime,
+test, original negative report, Isaac Lab source or parent dependency pointer;
+all source/test hashes above remain exact.
