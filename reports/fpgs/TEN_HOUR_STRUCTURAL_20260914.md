@@ -1564,3 +1564,44 @@ Two bounded follow-up cost checks prevent an immediate unfunded rewrite:
   the broader1.295 ms family cannot be claimed as this proposal's budget.
 
 The additional large-gain and all-representative RTX4x goals remain unfinished.
+
+## 2026-09-15 13:29 UTC — complete endpoint producer/consumer checkpoint
+
+Funded at12:27 after explicitly auditing the failed e96aaab3 first-hit path,
+the new default-off endpoint experiment folds minimal current rows into
+allocation, removes lazy-world J/Z production, caches private endpoint motion
+and retains original eager mixed fallback. Unlike first-hit it removes the
+separate48-float packet producer and replaces its expensive response/gathers.
+No Lab, timestep, substep, eight-visit or capacity changes were made.
+
+Three CPU and two native tests per GPU pass with the original tolerance.
+The first CUDA shared-anchor test exposed fixed-child scan-rounding noise;
+canonical moving-ancestor sampling fixes it without changing actual anchors,
+r0 or J/R. Both same native tests pass after that numerical correction.
+
+Whole16K discovery at runtime8dcbf959: RTX10.462228→10.491465ms (0.997213x),
+GB10.648697→10.601913ms (1.004413x). This is flat, not an accepted gain.
+The immediate strict node diagnosis includes the entire allocator: RTX rows
+save1.236544ms, allocator adds0.204277 and joinedGS adds0.877996. Complete
+affected union only saves0.147712ms; GB saves0.255756. Source/correlation,
+capacity/finite and final-idle guards pass; each node input owns exactly
+12 physics roots/1728 nodes with no auxiliary or unproven nodes. The cheaper
+complete consumer assumed by the budget was not achieved. No tuning grid.
+
+Closed report and default-off source are pushed and remote-verified at
+`ab6fb11cf81952cce2c4438377fc1b61ed9531d1`, branch
+`ooctipus/fpgs-kuka-endpoint-residual-20260915` on `ooctipus/newton`.
+See its `reports/fpgs/KUKA_ENDPOINT_RESIDUAL_20260915.md` for exact pins,
+resource/phase tables and whole/node artifacts. Full pre-commit passes.
+Retained `ca0d427a` and original worktrees are unchanged; no parent pointer.
+
+A follow-up exact ordered triplet residual cache is NO-FUND: historical
+351-case replay removes at most1038/2494 scans (41.62%) while31766 residual
+visits,3365 updates and new block setup remain. Meeting the~0.94ms RTX target
+would require almost all GS cost to be removable scans. The selected11 hard
+cases'62.61% scan removal is not population evidence. No prototype or GPU
+tuning was run for it. Do not reopen either path without a materially new,
+complete cost case. Next read-only study is full G1 pair-private terrain
+query/reduction ownership, not the failed uniform-range direct-query patch.
+
+No new MJWarp ratio follows; the all-task RTX4x objective remains unfinished.
