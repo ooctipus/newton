@@ -223,3 +223,50 @@ all three CUDA physical methods on both GPUs in3.888/3.948 s; both processes
 exit0 without CUDA709 or crash. Logs and the preserved failing controls are in
 `/tmp/fpgs-g1-gc-isolated-lNKjkZ`. This closes the observed teardown blocker;
 repeated whole timing and retained-path qualification remain before adoption.
+
+### Three-round paired confirmation, 01:04 UTC
+
+The existing checked alternating parent completed all twelve children at
+baseline `1a9efc33efbc0f23e1e7676a5edded795f224c97` and candidate
+`58063eea6163f87b9310a9ef8ddc3e777fd2decc`. Both Newton trees were clean and
+actual imports matched the pins. Unchanged Lab `53ee6b44` had only its known
+untracked environment directory; no Lab source changed. All sixteen helper
+hashes recheck, all children exit0 without cleanup signals, and final source
+and idle guards pass.
+
+The run retains16,384 worlds, seed0,200 warmup,40 synchronized wall and40
+profile steps per child; sim dt0.005, decimation4, two Newton substeps at
+dt0.0025 and maximum8 GS sweeps. Both arms retain metric sparse W434,
+parallel limits, level factor and the same finite/weld/packed/cull collision
+owners. Only the kinetic-state selector differs. Dense100, rigid294,912,
+broad49,152 and triangle1,769,472 capacities are unchanged.
+
+| Median of three complete-physics runs | RTX | GB300 |
+| --- | ---: | ---: |
+| Baseline |18.188704850 ms|20.916695625 ms|
+| Kinetic current/next producer |15.657344400 ms|20.503289775 ms|
+| Saving |2.531360450 ms|0.413405850 ms|
+| Baseline / candidate |1.161672x|1.020163x|
+| Baseline range |18.149767--18.245808 ms|20.887191--20.938246 ms|
+| Candidate range |15.651164--15.712527 ms|20.488669--20.516612 ms|
+
+This confirms13.917% lower RTX physics time and1.976% lower GB time.
+Unprofiled whole-environment wall medians are32.453053 ->30.327333 ms RTX
+and35.407030 ->35.022617 ms GB; these include host/reset work and are not
+physics or RL-training throughput. Every capture independently validates
+160 physics and40 auxiliary graph launches, totaling1,920 physics roots
+and480 separately excluded auxiliary roots. All24 finite/capacity/owner
+boundaries pass; no unsupported collision owner or sticky failure appears.
+Post-reset invalid private caches are explicitly observed and legal: the
+next native use repairs them. The twelve driver logs contain no warning,
+deprecation, traceback or CUDA-error matches under this limited log scan.
+
+Artifact: `/tmp/fpgs-g1-kinetic-state-repeat-paired16k-20260915-01`;
+manifest SHA256
+`26c9b353b807694e4415733b98c9d1873ef0afb593e9b2cb9f653cc42ea30fdd`.
+This closes repeated timing, not a new convergence or cross-task qualification
+claim. The focused physical evidence above and clean teardown remain separate
+gates; representative retained-path qualification is still required before
+adoption. No MJWarp backend was run in this batch. Any MJWarp normalization
+must remain explicitly labeled as the earlier historical reference, not a
+fresh simultaneous denominator or proof of the all-task4x target.
