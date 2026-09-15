@@ -305,6 +305,7 @@ def _debug_spin(iterations: int, out: wp.array[float]):
 
 
 _FUSED_K1_OFF = os.environ.get("FEATHER_PGS_FUSED_K1") == "0"
+_FUSED_K1_CACHE_ON = os.environ.get("FEATHER_PGS_FUSED_K1_CACHE") == "1"
 # Opt-in: let the fused world-dynamics kernel also build and factor the mass matrix (slower today).
 _FUSED_K1_MASS_ON = os.environ.get("FEATHER_PGS_FUSED_K1_MASS") == "1"
 _K1_TPL_GLOBAL = os.environ.get("FEATHER_PGS_K1_TPL_SHARED") == "0"  # debug: read template tables from global memory
@@ -1583,6 +1584,7 @@ class SolverFeatherPGS(SolverBase):
         self._grouped_tau_mass = False
         self._grouped_mass = False
         self._fused_k1 = False
+        self._fused_k1_cached = False
         self._fused_k1_mass_done = False
         self._grouped_check_pending = None
         self._grouped_check_pending_L = None
@@ -5693,6 +5695,14 @@ class SolverFeatherPGS(SolverBase):
                 )
             )
             if self._fused_k1:
+                self._fused_k1_cached = bool(
+                    _FUSED_K1_CACHE_ON
+                    and self._fk_id_cache_enabled
+                    and not self._fk_id_cache_uses_snapshot
+                    and not _FUSED_K1_MASS_ON
+                    and not _GROUPED_CHECK
+                    and not _K1_REAL_CHECK
+                )
                 # Host-side template uniformity per size group, computed here (never inside a graph capture).
                 for size_ in self.size_groups:
                     self._k1_size_single_template(int(size_))
@@ -6491,6 +6501,7 @@ class SolverFeatherPGS(SolverBase):
                     lanes=lanes,
                     with_mass=_FUSED_K1_MASS_ON,
                     tpl_shared=self._k1_size_single_template(size) and not _K1_TPL_GLOBAL,
+                    reuse_cached=self._fused_k1_cached,
                 )
                 self._grouped_kernels[key] = kern
             wpb, slots = fused_dynamics_launch_shape(lanes, _FUSED_K1_MASS_ON)
@@ -14379,7 +14390,11 @@ class SolverFeatherPGS(SolverBase):
         body_v_s = cache.body_v_s if cache is not None else state_aug.body_v_s
         body_f_s = cache.body_f_s if cache is not None else state_aug.body_f_s
         body_a_s = cache.body_a_s if cache is not None else state_aug.body_a_s
-        next_refresh = ((self._step + 1) % self.update_mass_matrix_interval) == 0
+        # Forced lazy publication runs after step() increments the counter.
+        # Its cache prepares the current counter's upcoming substep, whereas
+        # in-step publication prepares the following counter value.
+        next_step = self._step if force and self._fused_k1_cached else self._step + 1
+        next_refresh = (next_step % self.update_mass_matrix_interval) == 0
         parallel_next_refresh = next_refresh and self._global_inertia_stream is not None
         prismatic = self._prismatic_publication
         fk_inputs = [

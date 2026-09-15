@@ -68,8 +68,16 @@ def fused_dynamics_launch_shape(lanes: int, with_mass: bool) -> tuple[int, int]:
 
 
 def get_fused_dynamics_kernel(
-    n_dofs: int, max_joints: int, lanes: int = 8, *, with_mass: bool = False, tpl_shared: bool = False
+    n_dofs: int,
+    max_joints: int,
+    lanes: int = 8,
+    *,
+    with_mass: bool = False,
+    tpl_shared: bool = False,
+    reuse_cached: bool = False,
 ) -> wp.Kernel:
+    if reuse_cached and with_mass:
+        raise ValueError("Cached world dynamics requires the separate mass-factor path")
     N = int(n_dofs)
     MJ = int(max_joints)
     G = int(lanes)
@@ -77,6 +85,7 @@ def get_fused_dynamics_kernel(
     APB = 32 // G
     WM = 1 if with_mass else 0
     TS = 1 if tpl_shared else 0  # one template per block: stage the template tables in shared memory
+    RC = int(reuse_cached)
     T_PRISMATIC = int(JointType.PRISMATIC)
     T_REVOLUTE = int(JointType.REVOLUTE)
     T_BALL = int(JointType.BALL)
@@ -103,6 +112,7 @@ def get_fused_dynamics_kernel(
     const int slot = warp * APB + grp;
     const int gidx = block * SLOTS + slot;
     constexpr int WITH_MASS = {WM};
+    constexpr int REUSE_CACHED = {RC};
     __shared__ xform s_bq_all[SLOTS * MJ_];
     __shared__ vec6 s_v_all[SLOTS * MJ_];
     __shared__ vec6 s_a_all[SLOTS * MJ_];
@@ -390,24 +400,43 @@ def get_fused_dynamics_kernel(
         s_f[jl] = f_s;
         if (publish_aux != 0) body_f_s.data[child] = f_s;  // read only by the legacy chain and the checks
     }};
-    // Poses level by level, then the articulation origin, then motion level by level
-    // (a merged single sweep measured slower: 177 us against 156 us at 16k articulations).
-    for (int level = 0; level < n_levels; ++level) {{
-        const int lo = TPL_LVL(level);
-        const int hi = TPL_LVL(level + 1);
-        for (int k = lo + local; k < hi; k += G) do_pose(k);
-        __syncwarp();
+    // Publication owns these values until the next integration or explicit
+    // invalidation. A whole-warp hit keeps the original full-warp barriers
+    // converged when only some articulations have been reset.
+    bool cache_hit = false;
+    if (REUSE_CACHED) {{
+        const unsigned int active = __activemask();
+        cache_hit = __all_sync(active, fk_id_cache_valid.data[art] != 0);
     }}
-    {{
-        const int root_body = body_base + TPL_CHILD(0);
-        if (count > 0 && root_body >= 0) origin = wp::transform_point(s_bq[0], body_com.data[root_body]);
-        if (local == 0) articulation_origin.data[art] = origin;
-    }}
-    for (int level = 0; level < n_levels; ++level) {{
-        const int lo = TPL_LVL(level);
-        const int hi = TPL_LVL(level + 1);
-        for (int k = lo + local; k < hi; k += G) do_motion(k);
+    if (cache_hit) {{
+        origin = articulation_origin.data[art];
+        for (int jl = local; jl < count; jl += G) {{
+            const int child = body_base + TPL_CHILD(jl);
+            s_bq[jl] = body_q.data[child];
+            s_f[jl] = body_f_s.data[child];
+        }}
+        for (int d = local; d < N_; d += G) s_S[d] = joint_S_s.data[qd_base + d];
         __syncwarp();
+    }} else {{
+        // Poses level by level, then origin, then motion level by level.
+        // The existing separate sweeps remain the cold/reset fallback.
+        for (int level = 0; level < n_levels; ++level) {{
+            const int lo = TPL_LVL(level);
+            const int hi = TPL_LVL(level + 1);
+            for (int k = lo + local; k < hi; k += G) do_pose(k);
+            __syncwarp();
+        }}
+        {{
+            const int root_body = body_base + TPL_CHILD(0);
+            if (count > 0 && root_body >= 0) origin = wp::transform_point(s_bq[0], body_com.data[root_body]);
+            if (local == 0) articulation_origin.data[art] = origin;
+        }}
+        for (int level = 0; level < n_levels; ++level) {{
+            const int lo = TPL_LVL(level);
+            const int hi = TPL_LVL(level + 1);
+            for (int k = lo + local; k < hi; k += G) do_motion(k);
+            __syncwarp();
+        }}
     }}
 
     // ── Pass 3: inverse dynamics (and composite inertia), leaves to root ──
@@ -497,6 +526,10 @@ def get_fused_dynamics_kernel(
         }}
         __syncwarp();
     }}
+    // The next integration may write the same State buffers in place. Do not
+    // rely on host pointer changes to invalidate that pre-integration state.
+    // Full publication, not K1, grants the next reuse lease.
+    if (REUSE_CACHED && local == 0) fk_id_cache_valid.data[art] = 0;
     if (!WITH_MASS || do_mass == 0) return;
     // Publish body_I_c.
     for (int e = local; e < count * 36; e += G) {{
@@ -786,6 +819,8 @@ def get_fused_dynamics_kernel(
         )
 
     name = f"fused_dynamics_{N}_j{MJ}_g{G}_m{WM}_t{TS}"
+    if reuse_cached:
+        name += "_c1"
     fused_dynamics_template.__name__ = name
     fused_dynamics_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(fused_dynamics_template)

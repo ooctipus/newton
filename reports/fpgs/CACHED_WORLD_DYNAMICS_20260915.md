@@ -55,3 +55,45 @@ state identity changes, live forces and requested mass refresh.
 The first control is bounded to one batch. Any implementation that loses
 must receive a cause-specific diagnosis before closure; do not start a
 mapping grid or new validation framework. No new speedup is claimed here.
+
+## First control and cause-specific correction
+
+The paired control completed with source, idle and capacity guards passing.
+RTX physics: 9.316078 -> 9.381486 ms (0.9930x); GB: 9.470825 -> 9.548018 ms
+(0.9919x). This is one discovery run, not repeated evidence. Artifact:
+`/tmp/fpgs-cached-world-control-paired16k-20260915-01/manifest.json`.
+No improvement is retained. The source establishes an additional publication
+after the intermediate substep; its causal cost is not separately measured
+in this graph-only control.
+
+Fund one bounded correction: reuse valid published inputs inside K1 while
+retaining the original lazy-publication schedule and current-force Pass3.
+Use whole-warp hit admission to keep existing full-warp synchronization safe
+under mixed masked resets. Load poses/S/bias/origin on a hit, otherwise run
+the original cold path. Consume validity before integration so same-buffer
+lazy steps cannot reuse pre-integration state. Ordinary publication restores
+validity. Limit admission to existing non-snapshot FK caching, no fused mass.
+
+This exposes only a proper subset of 0.404432 ms in the old RTX K1 owner,
+less current-force work and cache loads. It is a small bounded dataflow
+correction, not a claimed route to another 2--4x. Its specific value is that
+ANYmal's last accepted RTX ratio (3.91x, historical MJWarp denominator) is
+close to 4x. Do not report crossing 4x without repeated fresh backend timing.
+Target one integrated screen within 30 minutes; do not pursue a mapping grid
+or promote merely because the kernel is faster in isolation.
+
+### Native correctness before the first screen
+
+The cache reuse exposed a publication-cadence defect: public lazy publication
+runs after `step()` increments `_step`, but the old preparatory inertia flag
+uses `_step + 1`. K1 previously hid stale compact terms by recomputing them.
+The opt-in owner now prepares the actual upcoming `_step` on forced
+publication; normal/default publication is unchanged.
+
+Regression-first RTX test failed before that repair: 85/90 velocity entries,
+maximum difference 8.460134e-5 with unchanged rtol/atol3e-6. Source patch and
+failure log are preserved in `/tmp/fpgs-cached-world-native-X47xqnXj/`.
+After the repair all three selectors pass on each GPU, covering current
+forces, mixed graph resets, held/requested mass and foreign state identity.
+These compact floating18 fixtures are contact-free; this is dynamics/cache
+qualification, not an assertion of loaded-contact or task quality.
