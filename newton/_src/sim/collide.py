@@ -2157,6 +2157,18 @@ class CollisionPipeline:
 
             bind_model(self.narrow_phase, model)
 
+        if (
+            not using_expert_components
+            and self.broad_phase_mode == "explicit"
+            and self.shape_pairs_filtered is not None
+            and self.narrow_phase._heightfield_pair_reducer_requested
+        ):
+            from ..geometry.heightfield_pair_terrain import bind as bind_pair_terrain  # noqa: PLC0415
+
+            # Reuse construction's current host read. Explicit pairs are
+            # immutable for the lifetime of CollisionPipeline.
+            bind_pair_terrain(self.narrow_phase, pairs_np, shape_types)
+
         # NarrowPhase is authoritative for the producer stage: it disables
         # mesh/heightfield reduction when no such collision path exists, and
         # expert construction may provide a preconfigured instance.  Publish

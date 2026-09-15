@@ -2466,6 +2466,16 @@ class NarrowPhase:
         )
         self._finite_bounds = None
         self._finite_source = None
+        pair_reducer = os.environ.get("NEWTON_HEIGHTFIELD_PAIR_REDUCER", "0")
+        if pair_reducer not in ("0", "1"):
+            raise ValueError("NEWTON_HEIGHTFIELD_PAIR_REDUCER must be 0 or 1")
+        self._heightfield_pair_reducer_requested = (
+            pair_reducer == "1" and self._heightfield_geometric_cull and not deterministic and hydroelastic_sdf is None
+        )
+        # A model-bound unique explicit pair list is required. Standalone and
+        # expert NarrowPhase instances retain their entire original pipeline.
+        self._heightfield_pair_reducer = False
+        self._pair_terrain = None
         self.mesh_sdf_texture_only = mesh_sdf_texture_only
         self.has_generic_convex_pairs = has_generic_convex_pairs
         self.sdf_texture_paired_samples = sdf_texture_paired_samples
@@ -3111,8 +3121,23 @@ class NarrowPhase:
                     record_tape=False,
                 )
 
-        # Skip mesh/heightfield kernels when no meshes or heightfields are present
-        if self.has_meshes or self.has_heightfields:
+        # The admitted owner includes traversal, both queries, local reduction,
+        # overflow replay and publication. None of the global lifecycle below
+        # executes for it; unsupported scenes keep the original branch intact.
+        if self._heightfield_pair_reducer:
+            from .heightfield_pair_terrain import Scene  # noqa: PLC0415
+            from .heightfield_pair_terrain import launch as launch_pair_terrain  # noqa: PLC0415
+
+            scene = Scene()
+            scene.types, scene.data, scene.transforms = shape_types, shape_data, shape_transform
+            scene.sources, scene.gaps = shape_source, shape_gap
+            scene.heightfield_index, scene.heightfield = shape_heightfield_index, heightfield_data
+            scene.elevations = heightfield_elevations
+            scene.lower, scene.upper = shape_collision_aabb_lower, shape_collision_aabb_upper
+            scene.voxels = shape_voxel_resolution
+            scene.bounds, scene.bound_source = self._finite_bounds, self._finite_source
+            launch_pair_terrain(self, scene, writer_data, device)
+        elif self.has_meshes or self.has_heightfields:
             # Launch mesh-plane contact processing kernel (meshes only)
             if self.has_meshes and not self.reduce_contacts and self.max_mesh_plane_pairs > 0:
                 wp.launch(
