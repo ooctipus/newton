@@ -103,3 +103,24 @@ and inertial/drive-gain notification. No CUDA event errors remain. The ordinary
 target-layout deprecation warning is inherited. Original CPU prismatic tests
 also pass (9 selectors, 2 CUDA-only skips). This is focused qualification, not
 a resting-stack sleeping implementation or a full training-quality study.
+
+## First whole-task discovery
+
+Runtime `20ce737c7c75dd0bc2d85441dcab69a04ad2ad01`, retained base `ca0d427a`.
+Both paired jobs completed with finite states and passing capacity checks.
+One round, fixed Keyboard 4K recipe, 200 warmup, 40 wall and 40 graph steps:
+
+| GPU | Retained physics ms | Sleeping physics ms | Retained / candidate |
+| --- | ---: | ---: | ---: |
+| RTX PRO 6000 | 6.926593 | 7.277697 | 0.95176x |
+| GB300 | 5.991970 | 6.412042 | 0.93449x |
+
+This is a measured loss, not promoted. Both snapshots show 442,368 eligible
+components out of 446,464, but **zero asleep**. Only about 27–29K components
+are contact-incident. The prototype pays controller overhead without observed
+sleep admission. Before rejecting the mechanism or adjusting tolerances,
+inspect can-sleep counts, quiet counters, solved motion and current force/target
+inputs at the same existing host boundary. No GPU kernel changes are needed
+for that diagnosis. Source/control budgets and all capacities stay fixed.
+
+Raw discovery: `/tmp/fpgs-general-sleeping-paired4k-20260915-01/manifest.json`.

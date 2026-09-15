@@ -8568,6 +8568,7 @@ class SolverFeatherPGS(SolverBase):
                 collide_done_event = None
             self._sleeping.begin(state_in, control, contacts, dt)
             self._sleeping_body_q_source = state_in.body_q
+            self._sleeping_state_in = state_in
 
         if not model.joint_count:
             self.integrate_particles(model, state_in, state_out, dt)
@@ -9470,13 +9471,38 @@ class SolverFeatherPGS(SolverBase):
             sleeping = self._sleeping
             snapshot = {"enabled": sleeping is not None}
             if sleeping is not None:
+                eligible = sleeping.component_eligible.numpy() != 0
+                dofs = sleeping.component_dof.numpy()[eligible]
+                bodies = sleeping.component_body.numpy()[eligible]
+                axes = self.model.joint_axis.numpy()[dofs]
+                scale = np.linalg.norm(axes, axis=1)
+                counters = sleeping.counters.numpy()[eligible]
+                speed = np.abs(sleeping.expected_qd.numpy()[eligible]) * scale
                 snapshot.update(
                     components=sleeping.plan.component_count,
-                    eligible=int(np.count_nonzero(sleeping.component_eligible.numpy())),
+                    eligible=int(np.count_nonzero(eligible)),
                     asleep=int(np.count_nonzero(sleeping.sleeping.numpy())),
+                    can_sleep=int(np.count_nonzero(sleeping.can_sleep.numpy())),
+                    quiet_counter_histogram=np.bincount(counters, minlength=sleeping.quiet_steps + 1).tolist(),
+                    output_speed_within_tolerance=int(np.count_nonzero(speed <= sleeping.velocity_tolerance)),
+                    output_speed_max=float(np.max(speed, initial=0.0)),
                     contact_incident=int(np.count_nonzero(sleeping.contact_component.numpy())),
                     invalid_contact_input=bool(sleeping.invalid_contacts.numpy()[0]),
                 )
+                if hasattr(self, "_sleeping_state_in"):
+                    control = self._fused_k1_control
+                    acceleration = np.abs(self._last_debug_state_aug.joint_qdd.numpy()[dofs]) * scale
+                    snapshot.update(
+                        output_acceleration_max=float(np.max(acceleration, initial=0.0)),
+                        output_acceleration_within_tolerance=int(
+                            np.count_nonzero(acceleration * 0.05 <= sleeping.velocity_tolerance)
+                        ),
+                        applied_joint_force_nonzero=int(np.count_nonzero(control.joint_f.numpy()[dofs])),
+                        target_velocity_nonzero=int(np.count_nonzero(control.joint_target_qd.numpy()[dofs])),
+                        applied_body_force_nonzero=int(
+                            np.count_nonzero(np.any(self._sleeping_state_in.body_f.numpy()[bodies] != 0.0, axis=1))
+                        ),
+                    )
             print("FPGS_SLEEPING_STATUS " + json.dumps(snapshot, sort_keys=True))
 
     def constraint_row_watermarks(self) -> dict:
