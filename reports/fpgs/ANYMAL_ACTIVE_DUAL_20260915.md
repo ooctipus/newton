@@ -254,3 +254,161 @@ The singular fixture now checks the unchanged physical thresholds rather than
 requiring the original impulse solution; its normal-feasibility gate is also
 explicit. Initial/late-overflow, warm and unsupported exact fallback gates are
 unchanged. Corrected native qualification and whole timing remain pending.
+
+## Final closure: physically qualified performance loss, no promotion
+
+The runtime at `16f114edfc913eaf0b761c4f72067c27055845b0` is closed after
+paired physical qualification, whole-environment timing, strict node attribution,
+same-input owner timing, and a source-exact clock-only diagnostic. No register-LU
+rescue or further mapping/parameter variant is funded. This closes this native
+representation, not every possible contact-solver algorithm. Runtime and test
+bytes remain the 945fec/597d74/2ecb3a pins recorded above.
+
+### Corrected physical qualification
+
+Root native02 sessions78230/6434 both reaped exit0: five test groups per card,
+23.310 s RTX and23.312 s GB. All 2,048 actual current/held saved cases and their
+29 limit rows pass the unchanged independent physical gates. The singular
+projected safeguard passes physical quality; initial-overflow, late23-budget,
+nonzero incoming/warm, self-contact and unsupported paths retain their exact
+original controls. The actual two-world lifecycle covers counts12/54, two
+graphs, reset and regrowth. No skipped test or relaxed numerical threshold.
+Two inherited invalid-stream-event warnings per card and the legacy target-layout
+deprecation remain in the logs; this is not a warning-free claim.
+
+Logs `/tmp/fpgs-anymal-active-dual-native-1RnAUUn0/native02_gpu{0,1}.log`, SHA256:
+
+- RTX: `a6382d81b019dcc6f0dc8dbc812891a4fc3b4fee4a379a4fc6371647e30fa910`.
+- GB: `95e399b3adf8dddefe754c43b5772bbbf9257b6f537f80fa51168a715b2da1f2`.
+
+### Whole environment and complete node attribution
+
+Root whole session69505 reaped0 using the original paired protocol: 16,384 worlds,
+seed0, 200 warmup,40 wall and40 graph-profile steps, unchanged24 parallel/8
+fallback budgets, two substeps and decimation4. Both arms use the same accepted
+INK/WR/EX1/MF/lazy/simple-zero recipe, dense72/MF32, raw212,992 and broad294,912.
+Only the requested active-dual owner and candidate source differ. Actual `_ad1`
+keys, capacities, source and idle checks pass at both original boundaries.
+
+| Complete timing, ms/env step | RTX baseline | RTX active | GB baseline | GB active |
+| --- | ---: | ---: | ---: | ---: |
+| Physics graph | 9.400965 | 21.632152 | 9.514575 | 25.799906 |
+| Unprofiled environment wall | 17.169826 | 28.962356 | 17.893967 | 33.830285 |
+
+Physics regresses by12.231187 ms RTX and16.285332 ms GB; baseline/candidate is
+0.434583x/0.368783x. Artifact directory
+`/tmp/fpgs-anymal-active-dual-whole-paired16k-20260915-01`, manifest SHA
+`ba06fed4c9faf3ef72d275d05807d0857e702d3f59170baa5443ed01c85a867c`.
+The trajectory has modestly fewer contacts and more GJK queries, but that is not
+the measured source of the large regression.
+
+Root matched node session93896 reaped0 with the same200 warm/40 wall and3
+profile steps. Each of four strict audits covers all12 physics graph roots,
+all memory, original process/correlation/source laws and both checked boundaries.
+The original strict reader is `/tmp/fpgs-franka-articulated-attribution-Y8sTiAgS/audit.py`,
+SHA `e76d53f685871f8d3e38a221ce89485d3d87014b9c8af1f6ac22e10af8e74dc6`.
+Each tier executes eight calls/env step,24 calls over the captured three steps.
+
+| Exclusive busy time, ms/env step | RTX baseline | RTX active | GB baseline | GB active |
+| --- | ---: | ---: | ---: | ---: |
+| Complete32 owner | 1.709216 | 6.501955 | 1.797216 | 9.082132 |
+| Complete48 owner | 2.382464 | 9.498512 | 2.602283 | 11.308190 |
+| Parallel-owner union | 4.091680 | 16.000468 | 4.399958 | 20.390717 |
+| All retained owners, including collision/memory | 5.062068 | 5.027597 | 5.056388 | 5.047635 |
+| Collision subset | 1.029141 | 1.026731 | 0.936116 | 0.938698 |
+
+Thus both actual complete solve owners regress while retained work is nearly
+flat; it is not an added external producer or collision-cost explanation.
+The table uses interval union/exclusive cost, not summed kernels with overlap
+double-counted. Node graph spans9.335700→21.215393 ms RTX and
+9.708524→25.690066 ms GB are attribution observations, not the whole timing
+authority. The required3.127974 ms complete owner would now require an80.45%
+cut from measured RTX16.000468 ms.
+
+Node directory `/tmp/fpgs-anymal-active-dual-nodes-paired16k-20260915-01`,
+manifest SHA `572af4ca9ac38aae51c581875cf2a2bf8c229c75e682a700d119cdf04435734c`.
+Each arm/card folder contains `strict_active_dual_node_audit.json`; SHA256 in
+baselineRTX, baselineGB, candidateRTX, candidateGB order:
+
+- `af2079c477216ace703fa7130d90b34e8012ca455eb0f43e7e7a1470871a8036`.
+- `0f75587a094000d39c1ff26e1f35b3690c1b8aa3d556be7e40806f3a54f670ba`.
+- `7e80eb9527699dfaccde6a2b7bb8c17a4bd732dd82b4e891b0e99a69828734fa`.
+- `316de3f57d93affc18faa36f1966ea097f3ec70ece9b6c2d414ebee47d58be76`.
+
+### Saved-input timing and preserved helper failure
+
+The first external timing helper incorrectly hardcoded live72/32 capacities
+against saved192/1 arrays, changing the native dense stride. Sessions35113/20471
+both failed their eager-output check before timing. This was a helper defect,
+not a solver failure. Failed bytes remain as
+`/tmp/fpgs-anymal-active-dual-same-input-jLn9EWCC/time_saved_failed01.py`, SHA
+`f7b1db22466385c79ffde7f56a25dba3d5e7d4a5f794ace0aaea9f65e64fd4e1`;
+original logs and incomplete gpu0/gpu1 results remain untouched.
+
+The corrected helper derives both capacities from the saved arrays exactly as
+the frozen physical helper does; no repacking. Its CPU expected-key and negative
+old-key controls pass. Root89699/58981 both reap0 on all eight saved512 groups,
+covering2,048 tier-owned cases per card. Every timed launch restores all five
+written arrays before the CUDA-event interval. The existing50 alternating
+rounds/first10-discard graph recipe measures the complete selected owner only.
+Eager, graph and last-timed outputs agree within each arm; readonly inputs remain
+unchanged. Active/original GPU-duration ratios are3.0982–9.5200 RTX and
+3.1266–9.7106 GB on identical inputs: a large native execution loss independent
+of trajectory/contact changes. Saved512/192/1 latency is not live16K/72/32
+throughput or a live population census.
+
+Corrected script SHA `e5a120feb9989deda890428e0f9380a746989904b5cead151bdea918ff4aa683`.
+Results in that directory at `gpu{0,1}_02/result.json`, SHA256:
+
+- RTX: `fe058d47ad2e13498eb96b1977bbaac4108ecfae7c39fb798ee50fd5e86b2df7`.
+- GB: `d24d718613d15e2f295ceaaacb6701b288b1e08d7d4094b5af5f43a8c41d457a`.
+
+### Clock-only attribution and final causal verdict
+
+The external phase factory strips back to the exact frozen native source,
+preserves its barriers, and appends only a26-field uint64 diagnostic array.
+The saved runner compares all five written arrays and readonly inputs byte-exact
+against frozen active, resets diagnostics outside timing, saves every world's
+raw fields, and checks cycle conservation and24-budget/trial counters. All
+eight groups pass on both cards. Instrumentation/frozen timing distortion is
+1.0002–1.0254 RTX and1.0118–1.0243 GB; its higher130/130 RTX and128/132 GB
+register allocations are charged, not claimed to preserve achieved occupancy.
+
+Combined Jacobian construction plus LU consumes54.518% RTX/54.894% GB of summed
+within-world cycles, with per-world median fractions53.563%/53.687%. This is
+neither a GPU-wall fraction nor a claim that those cycles are removable. All
+2,048 worlds are admitted/done, with zero original fallback sweeps. Non-timing
+counter fields agree exactly across the two execution GPUs. Residual calls agree
+with the CPU work model except eight separately charged inactive couplings and
+one earlier world331 stop, net six extra calls. Gram-ID reuse already avoids
+66.17% of rebuilds relative to LU attempts. Unexpected fallback or an unmodeled
+iteration explosion is not the observed explanation.
+
+The slow held captured-RTX world142 has the predicted15 outer evaluations,
+110 residual calls,83 Newton trials,12 projected trials,14 active18 LU attempts
+and one Gram build. On RTX its within-world split is61.76% Jacobian/LU and
+23.14% trials. Raw per-world tails and p50/p95/p99/max statistics are preserved;
+one such world can dominate a few-wave512-world kernel, so averages or summed
+cycles are not converted into live16K wall time.
+
+The source explains the expensive execution structure. A successful active12 LU
+has12 dependent pivots,120 pivot shuffle operations,37 warp joins, shared
+Jacobian row traversals and12 single-lane reverse solves. Every line trial adds
+eight warp joins at tier32 or eleven CTA joins at tier48, all-row products and
+projections. Gram reuse does not retire Jacobian/LU or globalization. Any LU
+also requires the324-float held-factor reload. These costs were only arithmetic
+proxies in the CPU feasibility study; fewer products did not predict GPU speed.
+
+Phase directory `/tmp/fpgs-anymal-active-dual-phase-KYE5yRY9`; factory SHA
+`c9fcc9b50d4634d562758cceea6e66265e31ddffb7be31cd0e7756b80b9790b1`,
+runner SHA `522ab40e7a6327097c52a4e1722e77c7cf4020d5f35450495aac1fd78bfae58c`.
+Results `gpu{0,1}/result.json` pin every raw diagnostic NPZ; SHA256:
+
+- RTX: `19ee32b83d998dc2f2bc6c0dbf36d6a0432437cca51ca0e7db02866cbf0e41a5`.
+- GB: `04725b74c871ab02fad3a426b6c8d9536209ae7f78165957cde67f72b594958b`.
+
+Conclusion: independent physics passes, but the complete native solve is far
+outside the funded cost envelope. The phase data do not support the80.45%
+complete-owner reduction required for a register-LU-only rescue. No promotion,
+no rescue grid, and no physics/iteration/tolerance change. Preserve this complete
+loss and all diagnostic failures for future algorithm selection.
