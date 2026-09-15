@@ -1116,3 +1116,53 @@ grid or GPU funding follows merely from a smaller iteration count.
 No new speedup is claimed in this section. The accepted RTX ratios remain
 Franka1.95x, Kuka2.62x, Allegro4.21x, ANYmal3.91x, G1 2.42x and Keyboard3.69x
 against the previously corrected MJWarp references, not a fresh backend run.
+
+## September 15 07:30: close AA4 tails; fund stationary Keyboard work retirement
+
+The one fixed ANYmal history-four natural-map control passes 2,033/2,048 saved
+physical cases and 3/3 synthetic safeguards, not full qualification. Five
+failures stop near the rounded-operator physical floor; six exhaust 24 allowed
+corrections; four finish worse after a budget-correct original fallback from
+an already changed state. A fixed-regularizer FP64 augmented-QR replay repairs
+zero of the 15, with the same correction/trial/fallback counts. This diagnoses
+the easy history-solve-precision hypothesis rather than rejecting the method
+without investigation. It does not rule out every Anderson algorithm.
+
+Literal AA4 costs 33.374 residual evaluations/world on average. Reusing accepted
+trial residuals would reduce that to 17.7075, but that carry was neither native
+implemented nor timed. Full residual/history/fallback arithmetic is 88.897212M
+products versus 84.268494M original; hypothetical carry lowers it to 55.326528M,
+before all remaining reductions, small solves, projections and storage. Those
+counts are not milliseconds. Physical tails close this exact candidate with
+no GPU funding, parameter/history grid or claimed speedup. Evidence is
+`/tmp/fpgs-anymal-aa4-natural-wcfB7tcL/RESULTS.md`; result SHA256
+`fa27b4d1dbe39f0fcbc642b27bbb9082e39bcbf2941f4699c209c03538da57c0`,
+QR diagnostic `02649c65b76f67f329d6ce2e0972e26aa1b3e5f92eb770ba2dbf2af05a7b59dc`.
+All failures and the initial empty-quantile reporting error are preserved.
+
+Keyboard now has a distinct, bounded integrated candidate. The finite-eight
+limit study found 1,661,952 contactless-key observations across four existing
+4K checkpoints; every one starts inside its enabled limits and has exactly
+zero lower/upper impulse in literal eight-sweep and saved native outputs.
+Unlike the closed separate private-key owner, the accepted world-wide owner
+continues evaluating those no-op limits while any other coordinate changes.
+
+The implementation therefore uses only the simpler stationary fixed-point
+proof, not the nonzero finite-eight closed form. After a complete current-row
+ownership mask, clear local limit flags only for row-isolated, nondense
+coordinates with supported finite inputs and nonnegative enabled residuals.
+All other coordinates keep the exact original loop. Preserve public masks,
+both zero impulse outputs, all contact schedules and the exact changed ballot.
+Signed-zero normalization need not be bit-identical; there is no physical
+approximation or contact deletion. The mask scans both endpoints of every
+active row after contact linking, touches only empty heads, and is published
+before head compaction. Its 16 bytes/world and complete builder cost are charged.
+
+Root created branch `ooctipus/fpgs-keyboard-stationary-limits-20260915` from
+accepted b1bad. Its pre-code card is
+`reports/fpgs/KEYBOARD_STATIONARY_LIMITS_20260915.md`. The ambitious 0.7 ms RTX
+whole-physics milestone would require about 64% of the historical 1.087489 ms
+complete sparse owner before mask/check overhead. No limit-phase timing or
+GPU gain is claimed. One implementation/paired screen is funded, with no
+tile grid or new benchmark framework. Accepted runtime and ratios remain
+unchanged until actual integrated evidence warrants promotion.
