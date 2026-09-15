@@ -130,3 +130,97 @@ Run from this Newton checkout, explicitly set its PYTHONPATH and
 `FEATHER_PGS_KUKA_LAZY_RESPONSE=0`; each fixture chooses its tested arm.
 For each isolated GPU UUID set `FPGS_TEST_DEVICE=cuda:0`; for CPU hide CUDA
 and leave that selector unset. Root alone owns paired GPU launches.
+
+## Whole-task decision, 11:44 UTC: do not promote this version
+
+Measured runtime is clean `eb9c0ec8f9a57dcf1c574ed5fcc5591d8f686eef`;
+retained baseline is `ca0d427af809571bb5501f644c1a6e03990cd2a8`.
+The first complete graph A/B finished at11:34, about27 minutes after the
+pre-code decision. All four children exit0, all eight finite/capacity
+boundaries pass, and final source/idle guards pass. This is one discovery
+round, not repeated acceptance evidence.
+
+| Whole physics, ms/environment step | RTX | GB300 |
+| --- | ---: | ---: |
+| Retained | 10.508200 | 10.634408 |
+| Lazy response | 10.645301 | 10.393238 |
+| Retained/candidate | 0.987121x | 1.023205x |
+
+Environment wall time is separately35.137717→36.750310 ms RTX and
+36.645139→34.758045 ms GB. Neither is a full training measurement.
+The ≥1.05 ms whole-saving milestone is missed; no new accepted gain or
+updated MJWarp ratio is claimed. No long qualification/repeat campaign is
+funded for this version.
+
+The immediate three-step node diagnosis finishes at11:37. All four strict
+audits pass:12 physics roots and1728 nodes each, zero auxiliary/unproven
+nodes, same capacities and eight calls per changed owner. These diagnostics
+are not additional whole-timing repeats.
+
+| Complete affected family, ms/env step | RTX retained | RTX lazy | GB retained | GB lazy |
+| --- | ---: | ---: | ---: | ---: |
+| Rows/response | 1.731265 | 1.435265 | 2.157866 | 1.510495 |
+| Joined solve union | 1.157664 | 1.132097 | 1.040373 | 1.333973 |
+| Qualification/materialization | 0.329248 | 0.514188 | 0.384198 | 0.642000 |
+| MF services | 0.450102 | 0.456972 | 0.497487 | 0.489594 |
+| Complete affected union | 3.668279 | 3.538522 | 4.079923 | 3.976062 |
+
+The failed premise is identifiable. RTX raw contact production only falls
+1.432822→1.178934 ms, not to the conditional0.55 ms allowance. Original
+MF0 production already constructs current J in shared memory and publishes
+Z; this version publishes equally sized J instead. It retains current
+axis/anchor projection, endpoint incident/restitution and row metadata.
+Unused responses therefore do not mean unused producer work. Positive
+materialization adds0.207115 ms RTX, consuming most of the modest retirement.
+RTX primary solve is roughly unchanged1.115776→1.090220 ms; register tuning
+is not justified as the explanation for the missing millisecond.
+
+On GB, primary solve grows0.991659→1.284810 ms and positive materialization
+adds0.292661 ms. Reduced general-owner sum is offset by lost overlap; use the
+joined union above. Actual traced lazy solve uses120/118 registers versus
+60/56, shared6576 versus5760 bytes, local0. These do not establish achieved
+occupancy or a unique hardware stall cause.
+
+Decision: close this version unpromoted. Eliminating only the added fallback
+cost cannot recover the missing≥0.92 ms RTX. A subsequent candidate must
+retire J/metadata production itself or another substantial owner, and price
+its replacement consumers; it requires a new pre-code budget. No mapping
+grid, micro-optimization or solver-law change is authorized by this result.
+
+Artifacts: `/tmp/fpgs-kuka-lazy-response-paired16k-20260915-01/manifest.json`
+SHA256`d3b7ebebbdaa73ddb1a5bc53f28bba60f29c6ac159cbcada7d630a391f5214f1`;
+node manifest in `/tmp/fpgs-kuka-lazy-response-nodes-paired16k-20260915-01`
+SHA256`6122be56a14b7273cdd7b9a555a2e45f666bc0f511a04c5f61f4efeba0b358f2`;
+strict unchanged-reader alias audit `/tmp/fpgs-kuka-lazy-node-audit-AQ9Y0jsn`.
+Large captures remain local.
+
+Reproduce the graph screen with a NEW output directory:
+
+```bash
+kuka_variant_args=()
+for kuka_flag in SIMPLE_WORLD_ZERO LOCAL_ROW_PACKETS INDEPENDENT_COMPONENTS \
+  PAIRED_GENERAL_OVERLAP KUKA_JOINT_WORLD WORLD_SCAN_PUBLICATION \
+  KUKA_KINETIC_WORLD KUKA_CURRENT_CONTACT; do
+  kuka_variant_args+=(--baseline-env "FEATHER_PGS_${kuka_flag}=1")
+  kuka_variant_args+=(--candidate-env "FEATHER_PGS_${kuka_flag}=1")
+done
+uv run --no-project \
+  --python /home/octi/Projects/IsaacLab.wt/contact-reset-20260913/.venv/bin/python \
+  python /tmp/fpgs-kinetic-fixed-variants-TZRkIPYw/run.py \
+  --isaaclab /home/octi/Projects/IsaacLab.wt/contact-reset-20260913 \
+  --baseline /home/octi/Projects/newton-fpgs-keyboard-linear-state-20260915 \
+  --candidate /home/octi/Projects/newton-fpgs-kuka-lazy-response-20260915 \
+  --task kuka --gpus 0 1 --rounds 1 --seed 0 --num-envs 16384 \
+  --warmup-steps 200 --steps 40 --profile-steps 40 --trace-mode graph \
+  --capacity kuka:fpgs:rigid_contact_max=311296 \
+  --capacity kuka:fpgs:broad_phase_output_max=442368 \
+  "${kuka_variant_args[@]}" \
+  --baseline-env FEATHER_PGS_KUKA_LAZY_RESPONSE=0 \
+  --candidate-env FEATHER_PGS_KUKA_LAZY_RESPONSE=1 \
+  --output-dir /tmp/fpgs-kuka-lazy-response-reproduction-new
+```
+
+For the diagnostic only, select`--profile-steps 3 --trace-mode node` and a
+different new output directory. Adapter SHA256 is
+`c062388f23f82c524690f272fb2d14141ed4126db641de6dcd86f8ade5bfe416`;
+unchanged benchmark tools are at`961b7e2f751bcd1d8b03368e7956b54c81414897`.
