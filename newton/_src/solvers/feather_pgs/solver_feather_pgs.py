@@ -1836,6 +1836,19 @@ class SolverFeatherPGS(SolverBase):
         )
         self._dense_internal_max_rows = self._estimate_dense_internal_rows_per_world(model)
         self.dense_max_constraints = self._select_dense_row_capacity(model)
+        self._sparse_shared_tier = os.environ.get("FEATHER_PGS_SPARSE_SHARED_TIER", "0") == "1"
+        if self._sparse_shared_tier and not (
+            self._sparse_diagonal_speculative_contact_batches
+            and self._sparse_diagonal_response_size == 108
+            and self._sparse_diagonal_dense_size == 6
+            and self.max_world_dofs == 114
+            and self.dense_max_constraints == 704
+            and set(self.size_groups) == {6, 108}
+            and self.use_parallel_streams
+            and model.device.is_cuda
+            and not model.requires_grad
+        ):
+            raise ValueError("Sparse shared tier requires the CUDA 704-row, 108+6 speculative diagonal owner")
         self._propagation_full_fused_size = self._select_propagation_full_fused_size()
         # Build the execution plan after dense_max_constraints has been
         # finalized by _select_dense_row_capacity so chunk selection sees the
@@ -5608,8 +5621,23 @@ class SolverFeatherPGS(SolverBase):
                 device_arch,
                 contact_triples=self._sparse_diagonal_contact_triples,
                 speculative_contact_batches=self._sparse_diagonal_speculative_contact_batches,
+                **({"shared_row_capacity": 384} if self._sparse_shared_tier else {}),
             )
             if self._sparse_diagonal_contact_solve
+            else None
+        )
+        self._pgs_solve_sparse_diagonal_tail_kernel = (
+            _get_pgs_solve_sparse_diagonal_kernel(
+                self.dense_max_constraints,
+                self.max_world_dofs,
+                self._sparse_diagonal_dense_size,
+                device_arch,
+                contact_triples=True,
+                speculative_contact_batches=True,
+                shared_row_capacity=704,
+                min_row_count=385,
+            )
+            if self._sparse_shared_tier
             else None
         )
         self._pgs_solve_mf_gs_kernel = None
@@ -6758,6 +6786,38 @@ class SolverFeatherPGS(SolverBase):
         for event in done_events:
             main_stream.wait_event(event)
 
+    def _launch_sparse_shared_tier(self, kernel, *, dim, inputs, outputs, block_dim, device) -> None:
+        """Fork disjoint row-count owners on existing streams and join all outputs."""
+        main_stream = wp.get_stream(device)
+        tail_stream = self._size_streams[6]
+        ready = self._size_events[6]
+        done = self._size_events[108]
+        # The original solve boundary follows all response producers and v_out
+        # initialization. These stable size events have no other consumers.
+        main_stream.record_event(ready)
+        tail_stream.wait_event(ready)
+        try:
+            wp.launch_tiled(
+                self._pgs_solve_sparse_diagonal_tail_kernel,
+                dim=dim,
+                inputs=inputs,
+                outputs=outputs,
+                block_dim=block_dim,
+                device=device,
+                stream=tail_stream,
+            )
+            wp.launch_tiled(
+                kernel,
+                dim=dim,
+                inputs=inputs,
+                outputs=outputs,
+                block_dim=block_dim,
+                device=device,
+            )
+        finally:
+            tail_stream.record_event(done)
+            main_stream.wait_event(done)
+
     def _launch_matrix_free_gs_solve(
         self,
         *,
@@ -6794,7 +6854,8 @@ class SolverFeatherPGS(SolverBase):
             if kernel is None:
                 raise RuntimeError("Sparse diagonal GS kernel is unavailable for this solver shape")
             dense_size = self._sparse_diagonal_dense_size
-            wp.launch_tiled(
+            launch = self._launch_sparse_shared_tier if self._sparse_shared_tier else wp.launch_tiled
+            launch(
                 kernel,
                 dim=[self.world_count],
                 inputs=[
@@ -22804,12 +22865,17 @@ def _get_pgs_solve_sparse_diagonal_kernel(
     *,
     contact_triples: bool = False,
     speculative_contact_batches: bool = False,
+    shared_row_capacity: int | None = None,
+    min_row_count: int = 0,
 ) -> "wp.Kernel":
     """Build the persistent ``small dense + two sparse`` GS owner."""
     M = int(max_constraints)
     D = int(max_world_dofs)
     P = int(dense_dofs)
     S = (M + 2) // 3
+    C = M if shared_row_capacity is None else int(shared_row_capacity)
+    if not 0 < C <= M or not 0 <= min_row_count <= C or (shared_row_capacity is None and min_row_count):
+        raise ValueError("Shared row capacity and count interval must fit the public row capacity")
     if speculative_contact_batches and (not contact_triples or P + 2 > 8):
         raise ValueError("speculative contact batches require an eight-lane sparse contact triple")
     elems_per_lane = (D + 31) // 32
@@ -23112,11 +23178,11 @@ def _get_pgs_solve_sparse_diagonal_kernel(
     const int contact_start = {"dense_phase_bounds.data[world * 2 + 1]" if contact_triples else "row_count"};
 
     __shared__ float s_v[{D}];
-    __shared__ float s_lambda[{M}];
-    __shared__ float s_rhs[{M}];
-    __shared__ float s_diag[{M}];
-    __shared__ int s_meta[{M}];
-    __shared__ float s_mu[{M}];
+    __shared__ float s_lambda[{C}];
+    __shared__ float s_rhs[{C}];
+    __shared__ float s_diag[{C}];
+    __shared__ int s_meta[{C}];
+    __shared__ float s_mu[{C}];
 
 {chr(10).join(limit_declarations)}
 
@@ -23246,6 +23312,16 @@ def _get_pgs_solve_sparse_diagonal_kernel(
 {chr(10).join(limit_stores)}
 #endif
 """
+    if shared_row_capacity is not None:
+        # Admission precedes every staged input and output; public M/S strides
+        # remain fixed even when a world uses the smaller private row arrays.
+        guard = f"    if (row_count > {C}) return;"
+        if min_row_count:
+            guard += f"\n    if (row_count < {int(min_row_count)}) return;"
+        count_clamp = f"    if (row_count > {M}) row_count = {M};"
+        if snippet.count(count_clamp) != 1:
+            raise RuntimeError("Sparse shared tier count-admission seam changed")
+        snippet = snippet.replace(count_clamp, count_clamp + "\n" + guard, 1)
 
     @wp.func_native(snippet)
     def pgs_solve_sparse_diagonal_native(
@@ -23357,6 +23433,8 @@ def _get_pgs_solve_sparse_diagonal_kernel(
         name += "_contact_groups"
     if speculative_contact_batches:
         name += "_speculative_batches"
+    if shared_row_capacity is not None:
+        name += f"_shared{C}_rows{int(min_row_count)}_{C}"
     pgs_solve_sparse_diagonal_template.__name__ = name
     pgs_solve_sparse_diagonal_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_sparse_diagonal_template)
