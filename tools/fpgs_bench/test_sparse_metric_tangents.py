@@ -180,7 +180,12 @@ def check_native(test, f, *, iterations=8, omega=1.0, friction_start=0, metric=T
     """Compare the native law on current rounded rows and verify its impulse publication."""
     s, owner = f["solver"], f["owner"]
     test.assertTrue(owner.metric_tangents)
-    test.assertEqual(owner.kernels.solve.key, "sparse_metric_tangent43_s18_c100")
+    expected_key = (
+        "sparse_metric_expiry43_s18_c100"
+        if getattr(owner, "zero_expiry", False)
+        else "sparse_metric_tangent43_s18_c100"
+    )
+    test.assertEqual(owner.kernels.solve.key, expected_key)
     count = int(s.constraint_count.numpy()[0])
     z, templates = full_rows(owner, count)
     diagonal, rhs, types, parents, mu, incoming = (

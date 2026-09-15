@@ -532,6 +532,9 @@ class SparseFactor:
         self.packet_rows = os.environ.get("FEATHER_PGS_SPARSE_PACKETS") == "1" and c == 100
         self.block_contacts = os.environ.get("FEATHER_PGS_SPARSE_CONTACT_BLOCK") == "1"
         self.metric_tangents = os.environ.get("FEATHER_PGS_SPARSE_METRIC_TANGENTS") == "1" and c == 100
+        self.zero_expiry = os.environ.get("FEATHER_PGS_SPARSE_ZERO_EXPIRY") == "1"
+        if self.zero_expiry and not self.metric_tangents:
+            raise ValueError("Sparse zero expiry requires the exclusive metric capacity100 owner")
         if self.metric_tangents and (self.packet_rows or self.block_contacts):
             raise ValueError("Sparse metric tangents, packets and contact-block rows are mutually exclusive")
         self.level_update = os.environ.get("FEATHER_PGS_SPARSE_LEVEL_UPDATE") == "1"
@@ -555,7 +558,9 @@ class SparseFactor:
             refresh=get_refresh_kernel(self.level_update),
             predictor=get_predictor_kernel(),
             contacts=get_contact_kernel(),
-            solve=get_solve_kernel(c, self.block_contacts, metric_tangents=self.metric_tangents),
+            solve=get_solve_kernel(
+                c, self.block_contacts, metric_tangents=self.metric_tangents, zero_expiry=self.zero_expiry
+            ),
         )
         # Drop canonical matrix/row storage only after complete constructor admission.
         # Dummy shapes make accidental readers fail visibly, not reinterpret packed W/Z.

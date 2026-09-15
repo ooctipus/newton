@@ -533,7 +533,9 @@ def _contact_block_fragments(capacity: int):
 
 
 @cache
-def get_solve_kernel(capacity: int, block_contacts: bool = False, *, metric_tangents: bool = False):
+def get_solve_kernel(
+    capacity: int, block_contacts: bool = False, *, metric_tangents: bool = False, zero_expiry: bool = False
+):
     """Apply original current-friction GS and decode the complete43 velocity."""
     source = f"""
 #if defined(__CUDA_ARCH__)
@@ -610,6 +612,8 @@ def get_solve_kernel(capacity: int, block_contacts: bool = False, *, metric_tang
 """
     if metric_tangents and (block_contacts or capacity != 100):
         raise ValueError("Sparse metric tangents require the exclusive capacity100 owner")
+    if zero_expiry and (not metric_tangents or block_contacts or capacity != 100):
+        raise ValueError("Sparse zero expiry requires the exclusive metric capacity100 owner")
     if block_contacts or metric_tangents:
         if metric_tangents:
             from .sparse_metric_tangents import get_fragments  # noqa: PLC0415
@@ -622,6 +626,10 @@ def get_solve_kernel(capacity: int, block_contacts: bool = False, *, metric_tang
         assert source.count(setup_anchor) == source.count(update_anchor) == 1
         source = source.replace(setup_anchor, setup + setup_anchor)
         source = source.replace(update_anchor, update + update_anchor)
+    if zero_expiry:
+        from .sparse_zero_expiry import apply_expiry  # noqa: PLC0415
+
+        source = apply_expiry(source, capacity)
 
     @wp.func_native(source)
     def native(
@@ -678,7 +686,15 @@ def get_solve_kernel(capacity: int, block_contacts: bool = False, *, metric_tang
         )
 
     name = (
-        "sparse_metric_tangent" if metric_tangents else "sparse_contact_block" if block_contacts else "sparse_factor_gs"
+        "sparse_metric_expiry"
+        if zero_expiry
+        else (
+            "sparse_metric_tangent"
+            if metric_tangents
+            else "sparse_contact_block"
+            if block_contacts
+            else "sparse_factor_gs"
+        )
     )
     solve.__name__ = solve.__qualname__ = f"{name}43_s18_c{capacity}"
     return wp.kernel(enable_backward=False, module="unique")(solve)
