@@ -176,11 +176,20 @@ def physical_metrics(J, diagonal, rhs, types, parents, mu, vhat, v, lam):
     return {"natural": natural, "cone": cone, "normal": normal_error, "complementarity": complementarity, "mdp": mdp}
 
 
-def check_native(test, f, *, iterations=8, omega=1.0, friction_start=0, metric=True):
+def check_native(
+    test,
+    f,
+    *,
+    iterations=8,
+    omega=1.0,
+    friction_start=0,
+    metric=True,
+    expected_key="sparse_metric_tangent43_s18_c100",
+):
     """Compare the native law on current rounded rows and verify its impulse publication."""
     s, owner = f["solver"], f["owner"]
     test.assertTrue(owner.metric_tangents)
-    test.assertEqual(owner.kernels.solve.key, "sparse_metric_tangent43_s18_c100")
+    test.assertEqual(owner.kernels.solve.key, expected_key)
     count = int(s.constraint_count.numpy()[0])
     z, templates = full_rows(owner, count)
     diagonal, rhs, types, parents, mu, incoming = (

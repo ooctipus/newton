@@ -557,6 +557,13 @@ class SparseFactor:
             contacts=get_contact_kernel(),
             solve=get_solve_kernel(c, self.block_contacts, metric_tangents=self.metric_tangents),
         )
+        self.paired_worlds = False
+        if os.environ.get("FEATHER_PGS_SPARSE_PAIRED_WORLDS") == "1":
+            from . import sparse_paired_worlds  # noqa: PLC0415
+
+            if sparse_paired_worlds.supported(self):
+                self.kernels.solve = sparse_paired_worlds.get_solve_kernel()
+                self.paired_worlds = True
         # Drop canonical matrix/row storage only after complete constructor admission.
         # Dummy shapes make accidental readers fail visibly, not reinterpret packed W/Z.
         dummy = wp.empty((1, 1, 1), dtype=float, device=device)
@@ -586,6 +593,11 @@ class SparseFactor:
         """Reject changed execution ownership before any retired buffer is read."""
         if not supported(self.solver):
             raise RuntimeError("Sparse G1 configuration changed; reconstruct the solver and recapture before stepping")
+        if self.paired_worlds:
+            from .sparse_paired_worlds import supported as paired_supported  # noqa: PLC0415
+
+            if not paired_supported(self):
+                raise RuntimeError("Paired G1 configuration changed; reconstruct and recapture before stepping")
         if self.kinetic_state is not None:
             from .g1_kinetic_state import supported as kinetic_supported  # noqa: PLC0415
 
@@ -902,6 +914,11 @@ class SparseFactor:
 
     def solve(self, rhs, iterations, omega, friction_start):
         """Visit every original row and return complete physical velocity once."""
+        if self.paired_worlds:
+            from .sparse_paired_worlds import solve  # noqa: PLC0415
+
+            solve(self, rhs, iterations, omega, friction_start)
+            return
         if self.packet_rows:
             from .sparse_packet_rows import solve  # noqa: PLC0415
 
