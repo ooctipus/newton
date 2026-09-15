@@ -230,6 +230,7 @@ _FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
 # Experimental Stage 7 producer partition, leaving all solve/mass budgets intact.
 _PRISMATIC_PUBLICATION = os.environ.get("FEATHER_PGS_PRISMATIC_PUBLICATION", "0") == "1"
 _PRISMATIC_LINEAR_STATE = os.environ.get("FEATHER_PGS_PRISMATIC_LINEAR_STATE", "0") == "1"
+_SLEEPING = os.environ.get("FEATHER_PGS_SLEEPING", "0") == "1"
 _COMPACT_CONTACT_BOUNDARY = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_BOUNDARY", "0") == "1"
 _DEBUG_CACHE = os.environ.get("FEATHER_PGS_DEBUG_CACHE") == "1"
 _DEBUG_CACHE_MODE = os.environ.get("FEATHER_PGS_DEBUG_CACHE_MODE", "")
@@ -2472,6 +2473,19 @@ class SolverFeatherPGS(SolverBase):
                     str(model.device.arch), warps_per_block=_CRBA_CHOLESKY_WARPS_PER_BLOCK
                 )
 
+        self._sleeping = None
+        self._sleeping_body_q_source = None
+        self._awake_direct_tau_kernel = None
+        if _SLEEPING:
+            from .sleeping import SleepController  # noqa: PLC0415
+
+            sleeping = SleepController(self)
+            if sleeping.enabled:
+                from .sleeping_consumers import get_awake_direct_tau_kernel  # noqa: PLC0415
+
+                self._sleeping = sleeping
+                self._awake_direct_tau_kernel = get_awake_direct_tau_kernel(self._compact_diagonal_mass_size)
+
     def _update_kinematic_state(self) -> None:
         """Refresh cached kinematic flags and effective joint armature."""
         model = self.model
@@ -2536,6 +2550,8 @@ class SolverFeatherPGS(SolverBase):
             joint_world.validate_notification(flags, plan_snapshot=plan_snapshot)
         if publication is not None:
             publication.validate_notification(flags, plan_snapshot=plan_snapshot)
+        if getattr(self, "_sleeping", None) is not None:
+            self._sleeping.invalidate()
         if kinetic is not None:
             kinetic.invalidate_model_changed(flags)
         g1_kinetic = getattr(self, "_g1_kinetic_state", None)
@@ -2608,6 +2624,9 @@ class SolverFeatherPGS(SolverBase):
             )
         if self.world_count == 0:
             return
+
+        if getattr(self, "_sleeping", None) is not None:
+            self._sleeping.invalidate(world_mask)
 
         if getattr(self, "_kinetic_world", None) is not None:
             self._kinetic_world.reset(state, world_mask)
@@ -8516,6 +8535,8 @@ class SolverFeatherPGS(SolverBase):
             self._force_mass_update = True
             if self._fk_id_cache_enabled:
                 self._fk_id_cache_valid.zero_()
+            if self._sleeping is not None:
+                self._sleeping.invalidate()
             self._last_step_dt = dt
         else:
             self._last_step_dt = dt
@@ -8538,6 +8559,15 @@ class SolverFeatherPGS(SolverBase):
             collide_done_event = None  # consumed
 
         self._eval_particle_forces(state_in, control, contacts)
+
+        if self._sleeping is not None:
+            # New impacts must wake their components before any force producer
+            # can be skipped. The default path retains its original overlap.
+            if collide_done_event is not None:
+                wp.get_stream(model.device).wait_event(collide_done_event)
+                collide_done_event = None
+            self._sleeping.begin(state_in, control, contacts, dt)
+            self._sleeping_body_q_source = state_in.body_q
 
         if not model.joint_count:
             self.integrate_particles(model, state_in, state_out, dt)
@@ -9434,6 +9464,20 @@ class SolverFeatherPGS(SolverBase):
                 + ". Reconstruct capacity-dependent buffers and recapture graphs before retrying; "
                 "do not change capacity attributes on a live solver."
             )
+        if os.environ.get("FEATHER_PGS_SLEEPING_DIAGNOSTICS") == "1":
+            # Reuse the existing host observation boundary; no counters, host
+            # reads or additional launches are inserted into timed graphs.
+            sleeping = self._sleeping
+            snapshot = {"enabled": sleeping is not None}
+            if sleeping is not None:
+                snapshot.update(
+                    components=sleeping.plan.component_count,
+                    eligible=int(np.count_nonzero(sleeping.component_eligible.numpy())),
+                    asleep=int(np.count_nonzero(sleeping.sleeping.numpy())),
+                    contact_incident=int(np.count_nonzero(sleeping.contact_component.numpy())),
+                    invalid_contact_input=bool(sleeping.invalid_contacts.numpy()[0]),
+                )
+            print("FPGS_SLEEPING_STATUS " + json.dumps(snapshot, sort_keys=True))
 
     def constraint_row_watermarks(self) -> dict:
         """Return the opt-in constraint/contact row high-water marks.
@@ -10304,9 +10348,10 @@ class SolverFeatherPGS(SolverBase):
             )
         direct_size = self._compact_diagonal_mass_size
         wp.launch(
-            self._direct_branch_tau_kernel,
+            self._awake_direct_tau_kernel if self._sleeping is not None else self._direct_branch_tau_kernel,
             dim=self.n_arts_by_size[direct_size] * direct_size,
             inputs=[
+                *([self._sleeping.body_awake] if self._sleeping is not None else []),
                 self.group_to_art[direct_size],
                 self._crba_dof_joint_offset_by_size[direct_size],
                 model.articulation_start,
@@ -14264,10 +14309,18 @@ class SolverFeatherPGS(SolverBase):
             return
 
         if model.joint_count:
+            integrate_kernel = integrate_generalized_joints
+            integrate_prefix = []
+            if self._sleeping is not None:
+                from .sleeping_consumers import integrate_awake_joints  # noqa: PLC0415
+
+                integrate_kernel = integrate_awake_joints
+                integrate_prefix = [self._sleeping.joint_awake]
             wp.launch(
-                kernel=integrate_generalized_joints,
+                kernel=integrate_kernel,
                 dim=model.joint_count,
                 inputs=[
+                    *integrate_prefix,
                     model.joint_type,
                     model.joint_parent,
                     model.joint_child,
@@ -14287,6 +14340,8 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
+            if self._sleeping is not None:
+                self._sleeping.finish(state_in, state_out, dt)
             self._stage7_update_kinematics(state_out, state_aug)
 
         self.integrate_particles(model, state_in, state_out, dt)
@@ -14491,6 +14546,15 @@ class SolverFeatherPGS(SolverBase):
                 self.body_X_com,
                 model.joint_axis,
                 joint_S_s,
+            ]
+        if self._sleeping is not None:
+            from .sleeping_consumers import finalize_awake_linear_state  # noqa: PLC0415
+
+            finalize_kernel = finalize_awake_linear_state
+            finalize_prefix = [
+                self._sleeping.body_awake,
+                self._sleeping_body_q_source if self._sleeping_body_q_source is not None else state_out.body_q,
+                *finalize_prefix,
             ]
         wp.launch(
             finalize_kernel,
