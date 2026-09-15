@@ -197,8 +197,8 @@ def get_awake_direct_tau_kernel(n_dofs: int) -> wp.Kernel:
         joint = articulation_start[articulation] + dof_joint_offset[local_dof]
         child = joint_child[joint]
         if body_awake[child] == 0:
-            # Driven components and externally forced components cannot sleep.
-            # The frozen equilibrium also replaces its passive/limit response.
+            # Only unchanged equilibrium targets may sleep. Replace the
+            # already prepared augmented-drive torque as well as passive tau.
             tau[joint_qd_start[joint]] = 0.0
             return
         external_com = wp.spatial_vector()

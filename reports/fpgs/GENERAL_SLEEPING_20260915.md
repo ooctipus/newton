@@ -27,7 +27,7 @@ Remove repeated force evaluation, joint integration arithmetic and body-state
 publication for sleeping components. Copy frozen public state across output
 buffers rather than trusting stale buffer contents. Preserve complete awake
 fallback. A newly sleeping body gets a final current publication after velocity
-is zeroed. Any applied force, actuator drive, authored state change, reset or
+is zeroed. Any applied force, changed drive target, authored state change, reset or
 relevant model notification keeps it awake or wakes it. Passive equilibrium is
 admitted only after multiple quiet steps, with finite checks.
 
@@ -150,3 +150,30 @@ selectors pass on both cards (3.67/3.78 s), including unchanged notification,
 changed fixed-root wake confined to one world, current public FK, and existing
 contact/force/target/reset/in-place/graph controls. Full pre-commit passes.
 This fixes missing task admission; task-level benefit is not yet established.
+
+## Corrected whole-task discovery
+
+Pinned runtime `2c3d532d3261daf2f063d828b1f4bd408e30dbd4`, unchanged retained
+base/recipe/budgets. Raw `/tmp/fpgs-general-sleeping-paired4k-20260915-02/manifest.json`.
+All capacity flags pass and observed states are finite. This single discovery
+is still **not a performance win or promotion**:
+
+| GPU | Retained physics ms | Sleeping physics ms | Retained / candidate |
+| --- | ---: | ---: | ---: |
+| RTX PRO 6000 | 7.028155 | 7.073679 | 0.99356x |
+| GB300 | 6.065000 | 6.286362 | 0.96479x |
+
+RTX boundary asleep counts are 413,841 and 406,747; GB counts are 415,711 and
+406,804, out of 442,368 eligible. Admission now works, but 92–94% sleeping
+does not imply comparable work removal. Wall-step measurements are
+31.401/34.189 ms retained/candidate on RTX and 29.381/29.495 ms on GB;
+these are environment stepping, not full training. Do not update MJWarp ratios
+or retained runtime based on this candidate.
+
+Review also found that the inherited response plan normalizes global
+articulations to world zero. Sleeping must retain raw global ownership:
+global components remain ineligible, and changed global joints broadcast wake.
+A CPU topology regression fails before preserving raw articulation worlds in
+both sleeping maps. This conservative edge fix does not change the replicated
+Keyboard map. Next diagnostic: reuse node tracing to separate retired owner
+work from controller cost and still-full producers, not another mapping sweep.

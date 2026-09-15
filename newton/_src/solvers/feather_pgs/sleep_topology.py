@@ -51,7 +51,13 @@ def build_sleep_topology(solver) -> SleepTopology:
     body_count, joint_count = int(model.body_count), int(model.joint_count)
     starts = model.articulation_start.numpy()
     ends = solver._model_plan.articulation_joint_end
-    art_world = solver._model_plan.articulation_world
+    # The response plan normalizes globals to world zero. Sleep ownership must
+    # retain their global identity for conservative admission and reset wake.
+    art_world = (
+        model.articulation_world.numpy()
+        if model.articulation_world is not None
+        else solver._model_plan.articulation_world
+    )
     parents = model.joint_parent.numpy()
     children = model.joint_child.numpy()
     types = model.joint_type.numpy()

@@ -156,6 +156,18 @@ class TestFeatherPGSSleeping(unittest.TestCase):
                 self.assertEqual(int(plan.body_component_host[0]), -1)
                 self.assertEqual(int(plan.joint_component_host[joints[0]]), -1)
                 np.testing.assert_array_equal(plan.joint_component_host[joints[1:]], components)
+                if leaves == 3:
+                    # A normalized solver window must not grant sleep ownership
+                    # to raw global (-1) articulations.
+                    np.testing.assert_array_equal(model.articulation_world.numpy(), -1)
+                    np.testing.assert_array_equal(plan.component_world_host, -1)
+                    np.testing.assert_array_equal(plan.component_eligible_host, 0)
+        model, _joints, _bodies = _build_model(leaves=3, worlds=2)
+        plan = build_sleep_topology(_solver(model, enabled=True))
+        prismatic = np.flatnonzero(model.joint_type.numpy() == int(newton.JointType.PRISMATIC))
+        components = plan.joint_component_host[prismatic]
+        np.testing.assert_array_equal(plan.component_world_host[components], np.repeat((0, 1), 3))
+        np.testing.assert_array_equal(plan.component_eligible_host[components], 1)
         model, _joints, bodies = _build_model(leaves=7, chain=True)
         model.joint_target_ke.zero_()
         model.joint_target_kd.zero_()

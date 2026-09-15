@@ -429,7 +429,12 @@ class SleepController:
         joint_articulation = model.joint_articulation.numpy()
         joint_world = np.full(model.joint_count, -1, dtype=np.int32)
         valid = (joint_articulation >= 0) & (joint_articulation < model.articulation_count)
-        joint_world[valid] = solver._model_plan.articulation_world[joint_articulation[valid]]
+        art_world = (
+            model.articulation_world.numpy()
+            if model.articulation_world is not None
+            else solver._model_plan.articulation_world
+        )
+        joint_world[valid] = art_world[joint_articulation[valid]]
         self._joint_world = wp.array(joint_world, dtype=wp.int32, device=device)
         self._saved_model_q = wp.clone(model.joint_q)
         self._saved_parent_frame = wp.clone(model.joint_X_p)
