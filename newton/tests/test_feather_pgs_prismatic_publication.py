@@ -14,6 +14,7 @@ from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.prismatic_linear_state import configure_linear_state
 from newton._src.solvers.feather_pgs.prismatic_publication import PrismaticPublicationPlan
 from newton.solvers import SolverFeatherPGS
+from newton.tests.test_feather_pgs_compact_contact import build_solver_fixture, install_contacts
 
 
 def _build_model(device="cpu", *, locked_d6=False, chain=False, leaves=7, worlds=1):
@@ -119,7 +120,179 @@ def _fields(solver, state):
     }
 
 
+def _build_linear_fullstep_model(device):
+    """Extend the original two-world108+6 fixture with nontrivial linear inputs."""
+    model = build_solver_fixture(device)
+    model.joint_q.assign(np.linspace(-0.02, 0.02, model.joint_coord_count, dtype=np.float32))
+    model.joint_armature.fill_(0.02)
+    model.joint_spring_stiffness.fill_(0.4)
+    model.joint_spring_ref.fill_(0.01)
+    model.joint_damping.fill_(0.03)
+    axes = model.joint_axis.numpy()
+    axes[0] = (0.3, -0.2, 1.4)
+    model.joint_axis.assign(axes)
+    child = model.joint_X_c.numpy()
+    child[1] = np.asarray(wp.transform(wp.vec3(0.03, -0.02, 0.01), wp.quat_rpy(0.2, -0.1, 0.3)))
+    model.joint_X_c.assign(child)
+    com = model.body_com.numpy()
+    com += (0.01, -0.02, 0.03)
+    model.body_com.assign(com)
+    return model
+
+
 class TestPrismaticPublication(unittest.TestCase):
+    def test_actual_linear_fullstep_reset_graph(self):
+        """Qualify actual direct admission, live forces, mass cadence and reset graph."""
+        devices = wp.get_cuda_devices()
+        if not devices:
+            self.skipTest("Actual direct-diagonal owner and captured streams require CUDA")
+        for device in devices:
+            model = _build_linear_fullstep_model(device)
+            solvers = []
+            for enabled in (False, True):
+                with (
+                    mock.patch.object(solver_module, "_COMPACT_CONTACT_BOUNDARY", True),
+                    mock.patch.object(solver_module, "_PRISMATIC_PUBLICATION", True),
+                    mock.patch.object(solver_module, "_SPARSE_CONTACT_DIRECT", True),
+                    mock.patch.object(solver_module, "_PRISMATIC_LINEAR_STATE", enabled),
+                ):
+                    solvers.append(
+                        SolverFeatherPGS(
+                            model,
+                            pgs_mode="matrix_free",
+                            pgs_iterations=8,
+                            update_mass_matrix_interval=2,
+                            use_parallel_streams=True,
+                            enable_joint_limits=True,
+                            dense_max_constraints=64,
+                            mf_max_constraints=64,
+                        )
+                    )
+            self.assertFalse(solvers[0]._prismatic_linear_state)
+            self.assertTrue(solvers[1]._prismatic_linear_state)
+            for solver in solvers:
+                self.assertTrue(solver._direct_compact_diagonal_inertia)
+                self.assertEqual(solver._compact_diagonal_mass_size, 108)
+                self.assertIsNotNone(solver._global_inertia_stream)
+            states = [[model.state(), model.state()] for _ in solvers]
+            controls = [model.control() for _ in solvers]
+            contacts = [newton.Contacts(model.rigid_contact_max, 0, device=device) for _ in solvers]
+            mask = wp.array((True, False), dtype=wp.bool, device=device)
+            for index, pair in enumerate(states):
+                newton.eval_fk(model, pair[0].joint_q, pair[0].joint_qd, pair[0])
+                install_contacts(model, pair[0], contacts[index])
+
+            def inputs(sequence, model=model, states=states, controls=controls):
+                force = np.zeros((model.body_count, 6), dtype=np.float32)
+                force[1, :] = (0.1 * sequence, -0.2, 0.3, 0.04, -0.02, 0.01)
+                force[110, :] = (-0.2, 0.1, 0.05 * sequence, 0.03, 0.01, -0.04)
+                for index, pair in enumerate(states):
+                    for state in pair:
+                        state.body_f.assign(force)
+                    controls[index].joint_f.assign(
+                        np.linspace(-0.1, 0.2, model.joint_dof_count, dtype=np.float32) * sequence
+                    )
+                    controls[index].joint_target_q.fill_(0.005 * sequence)
+
+            def compare(model=model, states=states, solvers=solvers):
+                # These are the unchanged tolerances of the reused compact lifecycle.
+                for field in ("joint_q", "joint_qd", "body_q", "body_qd"):
+                    np.testing.assert_allclose(
+                        getattr(states[1][0], field).numpy(),
+                        getattr(states[0][0], field).numpy(),
+                        rtol=3e-5,
+                        atol=5e-6,
+                        err_msg=field,
+                    )
+                for field in ("v_hat", "_diagonal_inverse_mass"):
+                    np.testing.assert_allclose(
+                        getattr(solvers[1], field).numpy(),
+                        getattr(solvers[0], field).numpy(),
+                        rtol=3e-5,
+                        atol=5e-6,
+                        err_msg=field,
+                    )
+                np.testing.assert_allclose(
+                    solvers[1].L_by_size[6].numpy(),
+                    solvers[0].L_by_size[6].numpy(),
+                    rtol=3e-5,
+                    atol=5e-6,
+                    err_msg="generic angular factor",
+                )
+                for solver, pair in zip(solvers, states, strict=True):
+                    solver.check_constraint_capacity()
+                    self.assertGreater(int(solver.constraint_count.numpy().sum()), 0)
+                    reference = model.state()
+                    newton.eval_fk(model, pair[0].joint_q, pair[0].joint_qd, reference)
+                    for field in ("body_q", "body_qd"):
+                        np.testing.assert_allclose(
+                            getattr(pair[0], field).numpy(),
+                            getattr(reference, field).numpy(),
+                            rtol=3e-6,
+                            atol=3e-6,
+                            err_msg="public " + field,
+                        )
+
+            held_seen = requested_seen = False
+            for step in range(6):
+                inputs(step + 1)
+                if step == 3:
+                    model.body_mass.assign(model.body_mass.numpy() * 1.1)
+                    model.joint_armature.assign(model.joint_armature.numpy() * 1.2)
+                    model.joint_target_ke.assign(model.joint_target_ke.numpy() * 1.15)
+                    model.joint_damping.fill_(0.06)
+                    axes = model.joint_axis.numpy()
+                    axes[0] *= 1.1
+                    model.joint_axis.assign(axes)
+                    for solver in solvers:
+                        solver.notify_model_changed(
+                            newton.ModelFlags.BODY_INERTIAL_PROPERTIES | newton.ModelFlags.JOINT_DOF_PROPERTIES
+                        )
+                for index, solver in enumerate(solvers):
+                    current, following = states[index]
+                    if step == 2:
+                        q = current.joint_q.numpy()
+                        q[:108] += 0.002
+                        current.joint_q.assign(q)
+                        solver.reset(current, mask)
+                    solver.step(current, following, controls[index], contacts[index], 1 / 240)
+                    states[index] = [following, current]
+                compare()
+                current_mask = solvers[1].mass_update_mask.numpy()
+                held_seen |= step % 2 == 1 and np.any(current_mask == 0)
+                if step == 3:
+                    self.assertFalse(solvers[1]._mass_update_global_flag)
+                    np.testing.assert_array_equal(current_mask, 1)
+                    requested_seen = True
+            self.assertTrue(held_seen)
+            self.assertTrue(requested_seen)
+
+            graphs = []
+            for index, solver in enumerate(solvers):
+                current, following = states[index]
+                with wp.ScopedCapture(device=device) as capture:
+                    solver.seed_double_buffer_events()
+                    solver.reset(current, mask)
+                    solver.step(current, following, controls[index], contacts[index], 1 / 240)
+                    solver.step(following, current, controls[index], contacts[index], 1 / 240)
+                graphs.append(capture.graph)
+            # Reset-mask contents and current forces change without rebinding graph inputs.
+            for replay, reset in enumerate(((True, False), (False, True), (False, False))):
+                mask.assign(np.asarray(reset, dtype=np.bool_))
+                inputs(replay + 7)
+                for current, _following in states:
+                    q, qd = current.joint_q.numpy(), current.joint_qd.numpy()
+                    for world, selected in enumerate(reset):
+                        if selected:
+                            start = world * 114
+                            q[start : start + 3] += 0.001
+                            qd[start : start + 3] *= -0.7
+                    current.joint_q.assign(q)
+                    current.joint_qd.assign(qd)
+                for graph in graphs:
+                    wp.capture_launch(graph)
+                compare()
+
     def test_linear_configure_uses_sentinel_closed_articulation_starts(self):
         """Admit an actual topology with N+1 starts and N articulation flags."""
         model, _, _ = _build_model()
