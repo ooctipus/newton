@@ -240,6 +240,7 @@ class TestHeightfieldPairTerrainCPU(unittest.TestCase):
     def test_feature_module(self):
         """Require the new complete pair owner before its integration controls."""
         self.assertEqual(module().__name__, "newton._src.geometry.heightfield_pair_terrain")
+        self.assertTrue(callable(module()._write_record), "Missing deferred record-only callback")
         fast, exceptional = module().create_pair_kernels(write_contact)
         self.assertIsNot(fast, exceptional)
 

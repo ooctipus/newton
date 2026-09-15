@@ -123,7 +123,7 @@ const int records = s.streaming ? 245 : s.capacity;
 const int head = 490 + (s.streaming ? 0 : 64) + 7 * records;
 if (lane == 0) for (int k=0;k<4;++k) p[head+k]=0;
 auto scores = reinterpret_cast<uint64_t*>(p);
-for (int k=lane;k<245;k+=lanes) scores[k]=0;
+if (s.streaming) for (int k=lane;k<245;k+=lanes) scores[k]=0;
 """)
 def _clear(s: Scratch, lane: int, lanes: int): ...
 
@@ -195,6 +195,28 @@ def _fingerprint(s: Scratch, i: int) -> int: ...
 def _value(s: Scratch, slot: int) -> wp.uint64: ...
 
 
+@wp.func_native("reinterpret_cast<uint64_t*>(s.ptr)[slot]=value;")
+def _set_value(s: Scratch, slot: int, value: wp.uint64): ...
+
+
+@wp.func_native("reinterpret_cast<unsigned int*>(s.ptr)[490+i]=static_cast<unsigned int>(tag);")
+def _store_tag(s: Scratch, i: int, tag: int): ...
+
+
+@wp.func_native("return static_cast<int>(reinterpret_cast<unsigned int*>(s.ptr)[490+i]);")
+def _tag(s: Scratch, i: int) -> int: ...
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+const unsigned int mask=0xffffu << (16*((threadIdx.x & 31)>>4));
+for (int delta=8;delta;delta>>=1) value |= __shfl_xor_sync(mask,value,delta,16);
+#endif
+return value;
+""")
+def _or16(value: int) -> int: ...
+
+
 @wp.func_native("reinterpret_cast<uint64_t*>(s.ptr)[slot]=0;")
 def _erase(s: Scratch, slot: int): ...
 
@@ -263,6 +285,62 @@ def _write_local(contact: ContactData, s: Scratch, ignored: int):
 
 
 @wp.func
+def _write_record(contact: ContactData, s: Scratch, ignored: int):
+    # The query lifetime owns only immutable callback records. Selection starts
+    # after every query lane finishes, so triangle IDs are still untouched here.
+    i = _reserve(s)
+    if i < s.capacity:
+        p = contact.contact_point_center
+        _store(
+            s,
+            i,
+            wp.vec4(p[0], p[1], p[2], contact.contact_distance),
+            encode_oct(contact.contact_normal_a_to_b),
+            contact.sort_sub_key,
+        )
+
+
+@wp.func
+def _classify_records(s: Scratch, lane: int, lanes: int) -> wp.vec2i:
+    low, high = int(0), int(0)
+    for i in range(lane, _count(s, 1), lanes):
+        pd = _pd(s, i)
+        normal_bin = get_slot(decode_oct(_normal(s, i)))
+        local = wp.transform_point(s.inverse_a, wp.vec3(pd[0], pd[1], pd[2]))
+        voxel = wp.clamp(compute_voxel_index(local, s.lower, s.upper, s.voxels), 0, 99)
+        _store_tag(s, i, normal_bin | (voxel << 5))
+        low = low | (1 << normal_bin)
+        voxel_bin = 20 + voxel // 7
+        if voxel_bin < 32:
+            low = low | (1 << voxel_bin)
+        else:
+            high = high | (1 << (voxel_bin - 32))
+    return wp.vec2i(_or16(low), _or16(high))
+
+
+@wp.func
+def _select_slot(s: Scratch, bin_id: int, slot: int, count: int) -> wp.uint64:
+    winner = wp.uint64(0)
+    for i in range(count):
+        tag = _tag(s, i)
+        if bin_id < 20:
+            if (tag & 31) != bin_id:
+                continue
+        elif (tag >> 5) != (bin_id - 20) * 7 + slot:
+            continue
+        pd = _pd(s, i)
+        score = -pd[3]
+        if bin_id < 20 and slot < 6:
+            if not (pd[3] < s.beta):
+                continue
+            projected = project_point_to_plane(bin_id, wp.vec3(pd[0], pd[1], pd[2]))
+            score = wp.dot(projected, get_spatial_direction_2d(slot))
+        value = make_contact_value(score, _fingerprint(s, i), i + 1, 0)
+        winner = wp.max(winner, value)
+    return winner
+
+
+@wp.func
 def _equivalent(s: Scratch, a: int, b: int) -> bool:
     pa, pb = _pd(s, a), _pd(s, b)
     na, nb = _normal(s, a), _normal(s, b)
@@ -297,6 +375,35 @@ def _suppress_bin(s: Scratch, bin_id: int):
     for k in range(7):
         if bits & (1 << k) != 0:
             _erase(s, 7 * bin_id + k)
+
+
+@wp.func
+def _suppress_active_bin(s: Scratch, bin_id: int, lane: int, lanes: int) -> int:
+    bits = int(0)
+    for comparison in range(lane, 21, lanes):
+        # Enumerate the same upper triangle as _suppress_bin, with all reads
+        # preceding the simultaneous mask application (two CUDA subgroup waves).
+        a, b = int(5), int(6)
+        if comparison < 6:
+            a, b = 0, comparison + 1
+        elif comparison < 11:
+            a, b = 1, comparison - 4
+        elif comparison < 15:
+            a, b = 2, comparison - 8
+        elif comparison < 18:
+            a, b = 3, comparison - 11
+        elif comparison < 20:
+            a, b = 4, comparison - 13
+        va, vb = _value(s, 7 * bin_id + a), _value(s, 7 * bin_id + b)
+        if va == wp.uint64(0) or vb == wp.uint64(0) or wp.uint32(va) == wp.uint32(vb):
+            continue
+        ra, rb = int(wp.uint32(va)) - 1, int(wp.uint32(vb)) - 1
+        if _equivalent(s, ra, rb):
+            if _fingerprint(s, rb) < _fingerprint(s, ra):
+                bits = bits | (1 << a)
+            else:
+                bits = bits | (1 << b)
+    return _or16(bits)
 
 
 @wp.func
@@ -402,6 +509,26 @@ def _query_triangle(tri: int, scene: Scene, s: Scratch):
     )
 
 
+@functools.cache
+def _record_query():
+    """Specialize only the callback; preserve both original query bodies."""
+    namespace = dict(globals())
+    for original in (_finite_triangle, _query_triangle):
+        source = textwrap.dedent(inspect.getsource(original.func))
+        source = source[source.index("def ") :]
+        if source.count("_write_local") != 1:
+            raise RuntimeError("Pair query callback seam changed")
+        source = source.replace("_write_local", "_write_record")
+        source = source.replace("_finite_triangle", "_finite_triangle_record")
+        source = source.replace("_query_triangle", "_query_triangle_record")
+        name = f"<pair_terrain_records_{original.key}>"
+        linecache.cache[name] = (len(source), None, source.splitlines(True), name)
+        exec(compile(source, name, "exec"), namespace)
+        key = original.func.__name__ + "_record"
+        namespace[key] = wp.func(namespace[key])
+    return namespace["_query_triangle_record"]
+
+
 @wp.func
 def _collect_triangle(tri: int, scene: Scene, s: Scratch):
     _append_triangle(s, tri)
@@ -465,7 +592,8 @@ def create_pair_kernels(writer_func, local_capacity=64):
 
     def make(streaming):
         arena = _arena(local_capacity, streaming)
-        visitor = _traversal(_query_triangle if streaming else _collect_triangle)
+        query = _query_triangle if streaming else _record_query()
+        visitor = _traversal(query if streaming else _collect_triangle)
 
         @wp.kernel(enable_backward=False, module="unique")
         def heightfield_pair_owner(scene: Scene, writer_data: Any, num_groups: int):
@@ -537,7 +665,7 @@ def create_pair_kernels(writer_func, local_capacity=64):
                         _release(s.ptr)
                         continue
                     for t in range(lane, _count(s, 0), lanes):
-                        _query_triangle(_triangle(s, t), scene, s)
+                        wp.static(query)(_triangle(s, t), scene, s)
                     _sync(s.streaming)
                     if _count(s, 1) > wp.static(local_capacity):
                         if lane == 0:
@@ -550,11 +678,35 @@ def create_pair_kernels(writer_func, local_capacity=64):
                     start = wp.atomic_add(scene.callback_count, 0, callbacks)
                     if start + callbacks > scene.callback_capacity:
                         wp.atomic_or(scene.status, 0, 2)
-                for bin_id in range(lane, 35, lanes):
-                    _suppress_bin(s, bin_id)
-                _sync(s.streaming)
-                for slot in range(lane, 245, lanes):
-                    publish(s, scene, slot, writer_data)
+                if wp.static(streaming):
+                    for bin_id in range(lane, 35, lanes):
+                        _suppress_bin(s, bin_id)
+                    for slot in range(lane, 245, lanes):
+                        publish(s, scene, slot, writer_data)
+                elif _count(s, 1) > 0:
+                    # The final query fence and overflow branch above end every
+                    # triangle-ID read before classification reuses those words.
+                    active = _classify_records(s, lane, lanes)
+                    _sync(s.streaming)
+                    for bin_id in range(35):
+                        occupied = int(0)
+                        if bin_id < 32:
+                            occupied = active[0] & (1 << bin_id)
+                        else:
+                            occupied = active[1] & (1 << (bin_id - 32))
+                        if occupied == 0:
+                            continue
+                        for k in range(lane, 7, lanes):
+                            _set_value(s, 7 * bin_id + k, _select_slot(s, bin_id, k, _count(s, 1)))
+                        _sync(s.streaming)
+                        suppressed = _suppress_active_bin(s, bin_id, lane, lanes)
+                        _sync(s.streaming)
+                        for k in range(lane, 7, lanes):
+                            slot = 7 * bin_id + k
+                            if suppressed & (1 << k):
+                                _erase(s, slot)
+                            publish(s, scene, slot, writer_data)
+                        _sync(s.streaming)
                 _sync(s.streaming)
                 _release(s.ptr)
 

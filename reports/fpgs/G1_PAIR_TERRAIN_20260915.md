@@ -1,7 +1,7 @@
 # Pair-private terrain query and reduction
 
 Candidate funded 2026-09-15 13:46 UTC; first checkpoint 15:16 UTC. This is
-an unmeasured, default-off Newton collision experiment based on retained
+a default-off Newton collision experiment, currently a measured loss, based on retained
 `ca0d427af809571bb5501f644c1a6e03990cd2a8`. Isaac Lab, task parameters,
 substeps, iterations and calibrated capacities remain unchanged. No parent
 dependency pointer change or accepted speedup is implied.
@@ -222,3 +222,99 @@ GB67579 passes2/2 in3.629 s, without skips. These are cached-module test
 durations, not performance evidence. All sessions exit zero and are reaped.
 Full staged pre-commit21098 passes. The next whole paired screen retains
 the original ca0d baseline, task settings, capacities and measurement law.
+
+## Corrected whole result and consumer redesign, 14:52 UTC
+
+The launch-only runtime `358e2efdabfde100966635e979c437b504ba7b95` still loses:
+
+| GPU | Retained physics ms | Corrected pair owner ms | Retained/candidate |
+| --- | ---: | ---: | ---: |
+| RTX PRO6000 | 15.607482 | 23.863201 | 0.654040x |
+| GB300 | 20.531565 | 59.539593 | 0.344839x |
+
+Environment wall is28.921012 ->37.613297 ms RTX and34.206417 ->73.200989 ms
+GB. Whole parent69745 exits zero with source/finite/capacity/final-idle guards
+passing. Artifacts: `/tmp/fpgs-g1-pair-terrain-paired16k-20260915-02`.
+This remains unpromoted; recovery relative to the first losing prototype
+is not an optimization gain over retained ca0d.
+
+Immediate candidate-only node parent21326 exits one at the same inherited
+auxiliary-graph analyzer limitation. Capture/source/idle checks complete.
+The unchanged strict reader accepts both captures:12 physics roots/720 nodes,
+3 separate auxiliary roots, no unproven nodes. Complete affected union is
+11.944897 ms RTX /47.281805 ms GB (GB exclusive47.281389). Fast owner alone
+is11.817697/47.115501; exception0.123606/0.162741 and counter clear
+0.003595/0.003563. All seven retired owners have zero calls. The actual fast
+grid is6144/block32 with unchanged254/252 registers and8176 B shared.
+Strict JSONs and frozen-reader reproduction:
+`/tmp/fpgs-g1-pair-terrain-strict02-y1pApaGg`.
+
+A single live16K fast-launch hardware-counter attempt per GPU is blocked by
+`ERR_NVGPUCTRPERM`; sessions12783/58442 both exit one and are reaped. No
+privilege/driver changes were attempted, and no counter evidence exists.
+Commands/logs: `/tmp/fpgs-g1-pair-terrain-ncu-2c8P43ww`. Its instrumented
+wall timings are NOT performance evidence. Source/pair settings were reused
+from the pinned node manifest; this is a diagnostic, not another benchmark.
+
+Static evidence reveals a distinct implementation mismatch. Exact cached
+PTX contains eight generic-address `atom.max.u64` score sites. CPU ptxas13.2
+assembly of that NVRTC12.9 PTX lowers each on both architectures to shared
+64-bit CAS retry/control loops after pointer-space dispatch. The original
+ordinary reducer's eight explicit global MAX sites lower to direct
+`REDG.E.MAX.64` instructions (its separate hash CAS remains). This proves
+different generated work, NOT that CAS dominates measured time. Fast SASS
+has29,344 instructions versus old generic26,360 and finite7,224: an
+order-of-magnitude code-size expansion is not supported either.
+
+One complete fast-consumer redesign is now funded, not a launch/register
+grid: callbacks reserve/store immutable records only. After all query lanes
+finish and complete-pair overflow is ruled out, reuse dead triangle-ID words
+for cached normal-bin/voxel tags and derive a35-bit active-bin mask. Seven
+slot-owner lanes compute original packed-score maxima in registers and
+write each winner once, without shared64 score atomics. Perform original
+simultaneous ULP suppression in two subgroup comparison waves, then publish
+active bins only with the original32-bit cross-bin deduplication. Fast clear
+initializes four header words, not245 scores. Exceptional streaming replay,
+query mathematics, budgets, capacities and public writer remain unchanged.
+
+Charge all new work:7*B*n tag probes (worst15,680 forB35/n64), record
+classification, repeated matching projection loads, subgroup mask reductions,
+seven winner stores per active bin and remaining reservation/public atomics.
+This removes score CAS, unconditional empty-slot scans and callback scoring
+live state; it does not hoist pair setup or restore cross-pair query packing.
+Neither the static lowering nor the proposed work count certifies a gain.
+Focused existing controls then one whole paired retained/candidate screen
+decide it. The complete replacement budget remains about2.10 ms RTX for
+the first10% whole milestone; a win against23.86 ms alone does not count.
+
+## Deferred-consumer readiness, 15:05 UTC
+
+Runtime SHA256`3dfd1a018d74928570529e2d17ee33409a1449b1dd1a1e488d0de3a16c0ce970`;
+test SHA256`263b976e221b1ab01ae8931eb10633a2d869385d24c227a9b5ea45d731e32774`.
+Narrow/collision hooks are unchanged. The added record-callback API check
+fails against exact358e source loaded in memory (98423); an earlier first
+attempt raced implementation and passed58138, which is not a failed control.
+CPU30417 passes4/4 in14.667 s including changed-module compilation; full
+pre-commit90941 passes. Native RTX85461 passes2/2 in36.807 s and GB84291
+passes2/2 in37.053 s, including compilation. All sessions exit zero and are
+reaped. These durations are readiness checks, not performance measurements.
+
+Existing fixtures cover empty/regrowth/current heights and poses, captured
+replay, three-pair odd halves, complete forced overflow and both saved96
+geometry scenes. The saved scenes include24 multi-normal pairs per card and
+5/1 multi-voxel pairs. Highest saved voxel is82: high bits32--34/voxel99 and
+an explicit nontransitive ULP winner-bank fixture remain source-reviewed,
+not independently exercised. The unfinished helper was not added to delay
+the first whole discovery. These gaps must close before promotion if useful.
+
+Review corrected a predicate inversion before final qualification: spatial
+selection uses original positive `depth < beta`, including original NaN
+behavior. No numerical tolerance or query equation changed.
+
+Fresh exact PTX and CPU-assembled SASS confirm zero shared64 score MAX/CAS
+sites in the fast owner. Static resource estimates do NOT improve:254
+registers on both architectures,8176 B shared,784 B stack and no assembler
+register-spill stores/loads. The code is only slightly smaller (SM120
+29,344 ->29,216 instructions). Exceptional normalized SASS instruction
+streams are exactly identical on both architectures. These CPU assembler
+facts are not achieved occupancy, driver-counter or timing evidence.
