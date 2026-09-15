@@ -1,5 +1,9 @@
 # Kuka cooperative response: one causal correction
 
+Status: **diagnosed loss; the one corrective experiment is closed**. Physical
+controls pass, but clean whole time is slower than accepted current-contact
+on both cards. No promotion or further mapping grid is justified here.
+
 ## Pre-code contract
 
 Authorized 2026-09-15 near 02:01 UTC; first source/offline/cost-ready checkpoint
@@ -144,3 +148,176 @@ layout, block-uniform returns/barriers and changed stream join without a
 source blocker. Actual CUDA qualification and integrated cost remain pending;
 root can run the same two selectors and original current-contact comparison
 without a new benchmark wrapper.
+
+## Frozen physical and whole result
+
+Numerical source/test tip is
+`e5d682c8c8702012bbcbb6f9bacc3f87588b8c44`. Both existing CUDA selectors pass:
+RTX two tests in 4.204 s (session 68868), GB300 two in 4.386 s (48192), both
+reaped zero. They cover original/native numerical law, mixed one/three-row
+slots, nonleader-warp errors and repair, plus actual two-bank streams/graphs,
+positive-MF transitions, held/current cadence and failure withholding public
+finish. The only warning is the inherited target-layout deprecation. The
+selector names and nine-flag isolated-device recipe are in the predecessor
+card; tolerances and task allowances are unchanged.
+
+The original paired whole parent 27686 reaped zero with all four children
+zero at this clean frozen tip. This is ONE discovery round, not repeated
+promotion evidence. All values below are ms per batched environment step;
+wall is synchronized environment time, not RL training throughput.
+
+| Card | Accepted physics | Cooperative physics | Candidate minus baseline | Accepted wall | Cooperative wall |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| RTX PRO 6000 | 10.411883 | 11.834728 | +1.422845 | 35.638270 | 36.318580 |
+| GB300 | 10.678865 | 11.665263 | +0.986398 | 36.380676 | 37.412236 |
+
+The baseline is clean accepted current-contact
+`629dedb057cc34cb05139b98d6dece5609ae306e`, never the slower first private
+prototype. Runtime imports, source and final idle guards pass. Both arms use
+the eight accepted flags including CURRENT_CONTACT=1; PRIVATE_RESPONSE is
+0 only in baseline and 1 only in candidate. Fixed Lab remains
+`53ee6b44c2334341305dbdf385a3916c6b140799` (only untracked `.venv` recorded),
+with actual selected Newton and fixed backend imports verified. Budgets stay
+16,384 environments, seed0, 200 warmup/40 wall/40 graph steps, raw311296,
+broad442368, dense192/MF64/propagation192, two substeps, solver dt1/240,
+simulation dt1/120, decimation4 and original eight sweeps. The timing driver's
+physical-acceptance field remains false: the separate bounded CUDA tests are
+not silently relabeled a full production physical qualification.
+
+Whole artifacts:
+`/tmp/fpgs-kuka-cooperative-response-paired16k-20260915-01`, manifest SHA256
+`f4b8de86833886f4d4cf174668a90121cf9e7394db0348e024ac245de3af15c3`.
+
+## Final strict attribution
+
+Node parent 37051 reaped zero, with all four children and final source/idle
+guards passing at the SAME source. Output:
+`/tmp/fpgs-kuka-cooperative-response-nodes-paired16k-20260915-01`, manifest
+SHA256 `8d7e8923871a03e14b99922de548c868c25caed86dd5c721a441fb9d5d529f69`.
+The existing ce09 strict interval reader, unchanged apart from reviewed
+owner/family aliases, produced `strict_cooperative_response_node_audit.json`
+inside each `round_01_{baseline,candidate}/round_01_kuka_fpgs_gpu{0,1}`.
+Every audit has 12 physics roots, 1728 baseline or 1752 candidate nodes,
+zero unproven nodes/auxiliary roots and successful source/process/correlation
+checks. These three-step diagnostic spans are kept separate from graph whole
+timings above.
+
+| Strict interval, ms/environment step | RTX baseline | RTX candidate | GB baseline | GB candidate |
+| --- | ---: | ---: | ---: | ---: |
+| Whole physics root spans | 10.538243 | 12.058912 | 10.702230 | 11.490696 |
+| Complete affected fork union | 3.595766 | 5.092613 | 3.967386 | 4.763133 |
+| Affected fork exclusive busy | 3.595766 | 5.046533 | 3.964324 | 4.721917 |
+| State/held union, retained | 3.204715 | 3.213205 | 2.824085 | 2.822292 |
+| Current geometry union, retained | 0.859392 | 0.871767 | 0.791443 | 0.789449 |
+| Allocator including candidate slot map | 0.208192 | 0.216203 | 0.212693 | 0.214955 |
+| Collision union, retained | 1.832513 | 1.869367 | 2.065333 | 2.088596 |
+
+The complete affected family is rows/response + MF services + qualification/
+materialization + positive offset/general + private response. It excludes
+current geometry and allocator, which are charged separately rather than
+forgotten. Candidate family sums are 5.707505 / 5.492076 ms, but the measured
+unions above, not these sums, determine overlap accounting. RTX complete
+disjoint accounting is affected-exclusive5.046533 + prefix0.103829 +
+collision1.869367 + allocator0.216203 + geometry0.871767 + sensors0.282251 +
+memory-exclusive0.212949 + state/held3.213205 + overlap-once0.046080 +
+gap0.196728 = 12.058912 ms. No large memset or hidden retired-owner saving is
+inserted into this budget.
+
+| Candidate owner sums, ms/environment step | RTX | GB300 |
+| --- | ---: | ---: |
+| Complete private response/eight | 3.146638 | 2.952277 |
+| Masked retained rows/response | 0.625889 | 0.736975 |
+| Retained MF services | 0.455851 | 0.503692 |
+| Qualification/materialization/guards | 0.371702 | 0.365736 |
+| Positive-MF offset | 0.682219 | 0.631284 |
+| Positive-MF general | 0.425206 | 0.302112 |
+
+Actual private resources match the cooperative binding: eight calls per
+environment step, grid16384/block128, 96 registers, 31,840 shared bytes and
+zero local memory on both cards. Positive offset retains block64, 5760 shared
+bytes and 60/56 registers; general retains block32, 4340 shared bytes and
+100 registers. There is no measured occupancy counter or isolated private
+contact-versus-sweep phase timing in these captures.
+
+### Why the conditional budget failed
+
+The first private RTX owner cost 6.153778 ms; this correction costs 3.146638
+ms, about 1.956x diagnostic recovery. It is NOT a task speedup versus accepted
+current-contact. The private owner alone exceeds the entire pre-code
+2.595454 ms replacement allowance by 0.551184 ms, before added allocator
+work, exposed retained main work and gaps. The ideal four-way construction
+premise requiring roughly 79% contact time did not yield its required result.
+The unchanged full panel and leader-only prefix/eight lifetime remain real
+source constraints; their individual time shares are not measured here.
+
+Removing the explicit private-to-offset dependency also did not achieve the
+ideal max(private,main) overlap. RTX retained main affected owners sum to
+2.560867 ms; only 0.614892 ms of their summed intervals overlap private within
+the affected union. Positive solves together are sum=union=exclusive
+1.107425 ms: their actual GPU intervals do not overlap private or another
+category in this capture. Thus independent host streams do not make the
+sequential positive work free. The source still pays its row/MF readiness
+chain and lost original positive offset/general overlap. These measured
+intervals establish the failed overlap premise, not a claim that register
+counts caused achieved occupancy or identify a unique hardware stall reason.
+
+The complete affected union is higher by 1.496847 ms RTX / 0.795747 ms GB;
+allocator deltas are only 0.008010 / 0.002262 ms. Retained state and collision
+remain close to their controls. The loss is concentrated in the complete
+replacement boundary rather than an unrelated publication/collision change.
+
+Close the one corrective experiment as a diagnosed loss. Preserve both first
+private and cooperative sources and their distinct whole/node evidence. No
+promotion, repeat against the slower prototype, further tile/warp grid or new
+MJWarp ratio follows. Reopening needs a genuinely different work-removal
+hypothesis and evidence, not another mapping of this same full panel.
+
+## Exact existing-protocol reproduction
+
+Retain the source pins above in separate clean checkouts and original tool
+tree `newton-fpgs-structural-bench-20260913` at
+`961b7e2f751bcd1d8b03368e7956b54c81414897`. The mandatory existing adapter is
+`/tmp/fpgs-kinetic-fixed-variants-TZRkIPYw/run.py`, SHA256
+`c062388f23f82c524690f272fb2d14141ed4126db641de6dcd86f8ade5bfe416`.
+It preserves original `compare_variants.py` SHA256
+`48406c079588d3088fc25c1cdce2bc2659aaec28539013e5811c9c55378445b5`,
+`compare_backends.py` SHA256
+`79818fce1deab05b9409d386d7a240265cf2f7e5b7f019109f3ab99c9f52e403`,
+and `checked_capture.py` SHA256
+`42b289bd0082d194180d5981651a108d11a66058ff4e67649ad7ddb408c9bea6`.
+The current repository copies are not interchangeable with these pins.
+Preserve the fixed import startup identified in each manifest; no direct
+driver command may omit that explicit Lab package selection.
+
+The tested one-round graph settings are reproduced below; choose a NEW output
+directory and let the original driver enforce both UUID idle/source guards.
+This is documentation, not a requested additional GPU run.
+
+```bash
+kuka_variant_args=()
+for kuka_flag in SIMPLE_WORLD_ZERO LOCAL_ROW_PACKETS INDEPENDENT_COMPONENTS \
+  PAIRED_GENERAL_OVERLAP KUKA_JOINT_WORLD WORLD_SCAN_PUBLICATION \
+  KUKA_KINETIC_WORLD KUKA_CURRENT_CONTACT; do
+  kuka_variant_args+=(--baseline-env "FEATHER_PGS_${kuka_flag}=1")
+  kuka_variant_args+=(--candidate-env "FEATHER_PGS_${kuka_flag}=1")
+done
+uv run --no-project \
+  --python /home/octi/Projects/IsaacLab.wt/contact-reset-20260913/.venv/bin/python \
+  python /tmp/fpgs-kinetic-fixed-variants-TZRkIPYw/run.py \
+  --isaaclab /home/octi/Projects/IsaacLab.wt/contact-reset-20260913 \
+  --baseline /home/octi/Projects/newton-fpgs-kuka-current-contact-20260915 \
+  --candidate /home/octi/Projects/newton-fpgs-kuka-cooperative-response-20260915 \
+  --task kuka --gpus 0 1 --rounds 1 --seed 0 --num-envs 16384 \
+  --warmup-steps 200 --steps 40 --profile-steps 40 --trace-mode graph \
+  --capacity kuka:fpgs:rigid_contact_max=311296 \
+  --capacity kuka:fpgs:broad_phase_output_max=442368 \
+  "${kuka_variant_args[@]}" \
+  --baseline-env FEATHER_PGS_KUKA_PRIVATE_RESPONSE=0 \
+  --candidate-env FEATHER_PGS_KUKA_PRIVATE_RESPONSE=1 \
+  --output-dir /tmp/fpgs-kuka-cooperative-response-reproduction-new
+```
+
+For the closed node protocol only, use `--profile-steps 3 --trace-mode node`
+and another new output directory. The strict reader/source aliases described
+above are unchanged. Closing documentation introduces no runner, runtime,
+test, native-factory, Lab or task-budget change.
