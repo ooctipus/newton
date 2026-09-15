@@ -198,7 +198,7 @@ KUKA_KINETIC_WORLD. Only KUKA_CURRENT_CONTACT changes from0 to1.
 These are environment stepping, not full RL training measurements. Candidate
 physics samples are [10.475700,10.535112,10.480220] RTX and
 [10.738321,10.689198,10.685025] GB. All12 child processes exit0 without cleanup
-signals; all24 finite/capacity boundaries pass. All16 helper/source hashes match;
+signals; all24 finite/capacity boundaries pass. All13 helper/source hashes match;
 the final source/idle guard passes. The unchanged Lab has only its existing
 untracked venv symlink. Full recipe, sources and artifacts:
 `/tmp/fpgs-kuka-current-contact-repeat-paired16k-20260915-01/manifest.json`,
