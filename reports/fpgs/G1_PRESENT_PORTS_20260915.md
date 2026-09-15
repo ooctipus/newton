@@ -235,3 +235,29 @@ Existing numerical helper tolerances are unchanged. Root and the independent
 test/source reviewer found no concrete F/C, committed-delta, sign or alias
 lifetime blocker. Native physical correctness and whole cost remain unmeasured
 at this readiness checkpoint; CPU/AOT is not a CUDA qualification claim.
+
+## First native controls and inherited saved-payload criterion
+
+Root's first nine-selector native batch on clean runtime `d03063f1` completed
+with eight selectors passing on each card, including synthetic lifecycle and
+actual five-world mixed graph checks. The saved-sixteen selector stopped seven
+subcases at a newly added per-incident allclose, before their final physical
+gates; the final tested-count assertion consequently also failed. Both parents
+63538/55610 reaped1 with the aggregate Python source unchanged. Logs remain at
+`/tmp/fpgs-g1-present-ports-native-5Mtt1tKj/gpu{0,1}.log`.
+
+Root then ran accepted `b1bad06a` on exactly the same sixteen inputs. It failed
+that new incident criterion on the same seven cases and indices, with nearly
+identical 4e-6--1.31e-5 errors at near-cancelled entries. The control reaped0
+(parent78386); evidence is `original_incident_gpu0.log` in the same directory.
+For GB-fixture step1601/world4625, the original incident is0.064740613 versus
+physical FP64 reconstruction0.064727635; candidate is0.064740717. This does not
+establish a candidate runtime or geometry defect.
+
+The test-only correction restores the inherited saved-payload component
+diagnostic contract: log incident reconstruction differences and use the
+actual FP32 incident in the same-input eight-sweep reference. Tight incident
+checks remain on small synthetic cases. Diagonal and restitution checks,
+momentum2e-6, cone3e-5 and final reference rtol3e-4/atol3e-5 are unchanged.
+All production bytes remain those of `d03063f1`. Saved-sixteen final physical
+qualification remains pending until the corrected selector completes.
