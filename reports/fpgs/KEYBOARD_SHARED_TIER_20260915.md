@@ -151,3 +151,93 @@ but cannot establish physical acceptance or promotion. Existing native
 scalar/speculative and focused complete-owner tests remain mandatory before
 retention. Freeze every source, test and report byte through root's whole-run
 reap; no benchmark-tree edits are permitted during the screen.
+
+## Closure: qualified native routing, insufficient whole gain
+
+**Not promoted; no further tier grid.** Runtime remains the measured
+`995e4ed8b0f686b875caa5f8eeee59a195c1f514`, solver SHA256
+`94ce8a2cd08a08cfebba14034845db071d024d921ea8ddd2c5bcb91e0850b7d9`.
+This closure adds only the focused test and these results. The accepted
+baseline remains b1bad; increased driver residency did not deliver the
+predicted complete-owner saving.
+
+### Native checks and preserved fixture failure
+
+Four focused CPU tests pass: unchanged generated math/public strides and ABI,
+default-off/unsupported admission, the actual fixture's required call signature,
+and ready/fork/finally-join ordering. The five-world native fixture uses counts
+0/383/384/385/704, reversed dense groups, independent and coupled contacts,
+loaded boundary triples, empty-world limits, and captured growth/shrink/reset.
+Current-stream copies after the real solver method check downstream consumers.
+Floating comparisons retain the inherited rtol2e-5/atol2e-6; schedule and
+read-only-input checks remain exact.
+
+The first paired native run passed both inherited physical oracles and every
+original-versus-tier output/schedule/consumer comparison reached, but failed an
+unjustified fixture expectation that every last normal impulse be positive.
+On reversal, world1 has385 rows/prefix1: its first dense limit sets v0 near.1,
+v1 remains -.1191564, and the key limit sets v6 near.15. The final normal's
+residual is +.03766257, so its cold impulse correctly stays zero for all eight
+sweeps. A CPU replay confirmed this. Only that case now explicitly expects
+zero; positive loaded coverage elsewhere, fixtures and tolerances are unchanged.
+The earlier missing required `mf_meta` fixture argument was corrected before
+GPU execution and is covered by the CPU signature test.
+
+Failed logs remain at `/tmp/fpgs-keyboard-shared-tier-native-s5xIqpXM`.
+The exact failed test is preserved at
+`/tmp/fpgs-keyboard-shared-tier-tests-Ziyox1pw/failed_8f79ae4b_test_sparse_shared_tier.py`,
+SHA256 `8f79ae4b941d07e9e503ab5dad187da8eebca64f33b4f362f261c23001eb700a`.
+The corrected external test SHA256 is
+`2fbb49b0bccba9809b52dd55694a623c6344392310912cad818f31b98791edc1`.
+All three native selectors subsequently pass on each GPU: RTX 0.138s, GB 0.173s,
+without skips. Corrected logs under
+`/tmp/fpgs-keyboard-shared-tier-native-corrected-v2Dw1234` have SHA256:
+
+- gpu0: `78cd10f88fcbb1493d446ddee41c8dcbdc999f1175bd97041a5d8f502ab5b288`.
+- gpu1: `74e2fa184d31b6b9de8e866d5640a74449639113cc5f0da37a032a793243ccc7`.
+
+### Whole screen and separate node diagnosis
+
+Milliseconds per batched environment step, accepted -> candidate:
+
+| Measurement | RTX PRO6000 | GB300 |
+| --- | ---: | ---: |
+| Whole physics, 40-step graph screen | 7.852563150 -> 7.757965125 | 6.805157400 -> 6.715505425 |
+| Synchronized environment wall | 30.621105 -> 31.789279 | 27.988174 -> 28.266865 |
+| Separate three-step node graph span | 7.432094 -> 7.564035 | 6.758763 -> 6.929589 |
+| Original GS, node sample | 1.112650667 | 1.353609667 |
+| Candidate bulk384, node sample | 1.185835000 | 1.425930667 |
+| Candidate tail704, node sample | .893557667 | .908533333 |
+
+The whole screen saves only 0.094598025ms RTX/0.089651975ms GB, far below the
+structural target and without reaching the historical RTX 4x ceiling. This is
+one discovery round, not repeated evidence. Node timing is a separate window:
+**bulk and tail overlap and must not be added**. Even the bulk alone is slower
+than original GS in that sample. The resource gate passed, but the complete
+dispatch did not reveal a substantial hidden gain. These observations do not
+identify a particular hardware stall or prove achieved occupancy; no counters
+or additional tier variants were run. Environment wall and physics are distinct.
+
+### Reproduction and guard scope
+
+Reuse `/tmp/fpgs-kinetic-fixed-variants-TZRkIPYw/run.py` (SHA256 prefix c062388f)
+with the original settings and exact child commands/environments in:
+
+- `/tmp/fpgs-keyboard-shared-tier-whole-paired4k-20260915-01/manifest.json`,
+  SHA256 `6d80dbf50b2fdca949b9710603dd290a8a6a1520eef517645d98032ecbe79ad8`.
+- `/tmp/fpgs-keyboard-shared-tier-nodes-paired4k-20260915-01/manifest.json`,
+  SHA256 `c69b9392fa7cc230b9e35ebbb9d9d2d7d4a4d3674d4b1a1c34f7b1610d6eec9d`.
+
+Both use 4096 worlds, seed 0, 200 warmup, fixed Lab contact-reset worktree,
+sim_dt 0.01, decimation 4, two 0.005 substeps and at most eight GS sweeps. Whole
+uses 40 wall/40 graph steps; the node run records 3 wall/3 node-profile steps.
+Caps are dense/propagation 704, MF 64, raw contacts 147456 and broad output 57344.
+Both arms retain sparse-contact-direct, prismatic-publication and compact-contact
+flags 1, group lanes 16, masked rows 1 and narrow-phase threads 4; only shared-tier
+changes 0->1. No Lab, capacity or physics-budget edits occurred.
+
+Each screen completed all four children and eight capacity boundaries, with
+finite state and final source/idle guards passing. Root reaped 37155, 14083 and
+79028. Available sticky checks do not establish universal convergence or complete
+collision-demand calibration. No repeated timing, backend-ratio update, or
+performance promotion follows from this experiment.
