@@ -18,6 +18,7 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from tools.fpgs_bench.test_sparse_contact_block import saved_records
 from tools.fpgs_bench.test_sparse_factor import ASSET, fixture, physical_rows, unpack
 from tools.fpgs_bench.test_sparse_metric_tangents import check_native, physical_metrics
+from tools.fpgs_bench.test_world_scan_publication import compose, inverse, rotate
 
 DT = 1.0 / 240.0
 ENV = {
@@ -87,16 +88,79 @@ def backward_error(matrix, value, rhs):
     )
 
 
+def public_reference(model, state):
+    """Evaluate current public poses/COM twists in FP64, including free-root anchors.
+
+    Reuse the independent publication reference's exact transform primitives,
+    not the candidate's scan or its current S. Generic FP32 FK subtracts world
+    positions at each joint: saved translations of 35--76 m make that a less
+    accurate velocity oracle. No quaternion/input renormalization is introduced.
+    """
+    names = (
+        "joint_type",
+        "joint_parent",
+        "joint_child",
+        "joint_q_start",
+        "joint_qd_start",
+        "joint_X_p",
+        "joint_X_c",
+        "joint_axis",
+        "body_com",
+    )
+    values = {name: getattr(model, name).numpy() for name in names}
+    q, qd = (getattr(state, name).numpy().astype(np.float64) for name in ("joint_q", "joint_qd"))
+    poses = np.zeros((model.body_count, 7), np.float64)
+    anchors = np.zeros((model.joint_count, 7), np.float64)
+    roots = np.zeros(model.body_count, int)
+    for joint in range(model.joint_count):
+        kind, parent, body, qs, ds = (int(values[name][joint]) for name in names[:5])
+        anchor = values["joint_X_p"][joint].astype(np.float64)
+        if parent >= 0:
+            anchor = compose(poses[parent], anchor)
+        transform = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+        if kind == int(newton.JointType.REVOLUTE):
+            transform[3:6] = values["joint_axis"][ds].astype(np.float64) * np.sin(q[qs] / 2)
+            transform[6] = np.cos(q[qs] / 2)
+        elif kind == int(newton.JointType.PRISMATIC):
+            transform[:3] = values["joint_axis"][ds].astype(np.float64) * q[qs]
+        elif kind == int(newton.JointType.FREE):
+            transform = q[qs : qs + 7]
+            if parent >= 0:
+                raise ValueError("Public oracle admits free articulation roots only")
+        elif kind != int(newton.JointType.FIXED):
+            raise ValueError(f"Unsupported public oracle joint type: {kind}")
+        anchors[joint] = anchor
+        poses[body] = compose(compose(anchor, transform), inverse(values["joint_X_c"][joint].astype(np.float64)))
+        roots[body] = roots[parent] if parent >= 0 else body
+    com = poses[:, :3] + rotate(poses[:, 3:], values["body_com"].astype(np.float64))
+    motion = np.zeros((model.body_count, 6), np.float64)
+    for joint in range(model.joint_count):
+        kind, parent, body, _, ds = (int(values[name][joint]) for name in names[:5])
+        anchor, local = anchors[joint], np.zeros(6)
+        if kind in (int(newton.JointType.PRISMATIC), int(newton.JointType.REVOLUTE)):
+            axis = rotate(anchor[3:], values["joint_axis"][ds].astype(np.float64))
+            if kind == int(newton.JointType.PRISMATIC):
+                local[:3] = axis * qd[ds]
+            else:
+                local[3:] = axis * qd[ds]
+                local[:3] = np.cross(anchor[:3] - com[roots[body]], local[3:])
+        elif kind == int(newton.JointType.FREE):
+            # Free-root linear DOFs describe its COM, in the parent-anchor basis.
+            local[:3] = rotate(anchor[3:], qd[ds : ds + 3])
+            local[3:] = rotate(anchor[3:], qd[ds + 3 : ds + 6])
+        motion[body] = local + (motion[parent] if parent >= 0 else 0)
+    public = motion.copy()
+    public[:, :3] += np.cross(motion[:, 3:], com - com[roots])
+    return {"body_q": poses, "body_qd": public}
+
+
 def public_state(test, model, state):
-    """All public poses and COM velocities must match current generalized state."""
-    expected = model.state()
-    newton.eval_fk(model, state.joint_q, state.joint_qd, expected)
+    """Keep the original tolerance against an independent FP64 physical oracle."""
+    expected = public_reference(model, state)
     for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
         test.assertTrue(np.isfinite(getattr(state, name).numpy()).all(), name)
     for name in ("body_q", "body_qd"):
-        np.testing.assert_allclose(
-            getattr(state, name).numpy(), getattr(expected, name).numpy(), rtol=2e-5, atol=3e-6, err_msg=name
-        )
+        np.testing.assert_allclose(getattr(state, name).numpy(), expected[name], rtol=2e-5, atol=3e-6, err_msg=name)
 
 
 def stage_predict(solver, state, output, control):
@@ -262,6 +326,37 @@ class TestG1KineticStateCPU(unittest.TestCase):
     def test_physical_geometry_and_invalidation(self):
         """Run the representation oracle on CPU without claiming CPU production admission."""
         direct_geometry(self, "cpu")
+
+    def test_public_oracle_anchored_translation_and_rest(self):
+        """World translation must not alter the anchored-root physical COM twist."""
+        case = fixture("cpu")
+        model, state = case["model"], case["state"]
+        set_anchor(model)
+        rotated_input(model, state)
+        reference = public_reference(model, state)
+        generic = model.state()
+        newton.eval_fk(model, state.joint_q, state.joint_qd, generic)
+        np.testing.assert_allclose(generic.body_qd.numpy(), reference["body_qd"], rtol=2e-5, atol=3e-6)
+        before = state.joint_q.numpy().copy()
+        shifted = before.copy()
+        shifted[:3] += np.array([-36.0, -76.0, 0.0], np.float32)
+        state.joint_q.assign(shifted)
+        translated = public_reference(model, state)
+        displacement = rotate(
+            model.joint_X_p.numpy()[0, 3:].astype(np.float64), shifted[:3].astype(np.float64) - before[:3]
+        )
+        np.testing.assert_allclose(
+            translated["body_q"][:, :3], reference["body_q"][:, :3] + displacement, atol=3e-12, rtol=0
+        )
+        np.testing.assert_allclose(translated["body_q"][:, 3:], reference["body_q"][:, 3:], atol=3e-12, rtol=0)
+        np.testing.assert_allclose(translated["body_qd"], reference["body_qd"], atol=3e-12, rtol=0)
+        module = importlib.import_module("newton._src.solvers.feather_pgs.g1_kinetic_state")
+        owner = module.G1KineticState(case["owner"])
+        augmented = case["solver"]._prepare_augmented_state(state, model.state(), model.control())
+        owner.begin(state, augmented, state.joint_qd, DT, True)
+        public_state(self, model, state)
+        state.joint_qd.zero_()
+        np.testing.assert_array_equal(public_reference(model, state)["body_qd"], np.zeros((44, 6)))
 
     def test_constructor_and_model_guards(self):
         """Do not retire original storage on unsupported CPU/kinematic configurations."""
