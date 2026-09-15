@@ -1313,3 +1313,50 @@ the approximately0.372 ms saving implied by the recent whole baseline and
 historical4x ceiling. Actual compiled resources are checked early. Full cost
 is max(bulk, tail) plus fork/join and interference, not bulk time alone. There
 is no tier-size grid, and historical world coverage is not a timing claim.
+
+## September 15 09:42: close shared tier; fund translation-only state production
+
+Keyboard shared-tier closure is commit
+`10a6c07f2b9beee6602658e76b89388e2e2654e6`, runtime `995e4ed8`.
+The corrected boundary/control suite passes three native selectors per GPU.
+Its original failed positive-impulse assertion described a legitimately
+inactive contact after reset; the failed source/logs remain preserved, and
+the corrected test retains all numerical tolerances and loaded-tail coverage.
+
+The first paired whole screen gives RTX 7.852563 -> 7.757965 ms and GB
+6.805157 -> 6.715505 ms, only about 1.01x, with worse environment wall times.
+Separate node evidence gives original GS 1.112651/1.353610 ms RTX/GB versus
+bulk 1.185835/1.425931 ms and overlapping tail 0.893558/0.908533 ms.
+Do not add bulk and tail. Even bulk is not faster in this sample; increased
+driver residency did not expose a substantial hidden gain. All capacity and
+source/idle guards pass. No promotion, new backend ratio or tier-size grid.
+
+Bounded read-only audits also found no funded shortcut in ANYmal's accepted
+solver or the Franka/Kuka/G1 state intermediates. ANY already builds its exact
+majorizer once and uses factorized per-sweep actions; saved cases do not
+support a cheap earlier physical stop. In the failed active-dual owner,
+projected line-search trials are not generally affine in step size, and
+existing trial counts/phase evidence cannot fund the required roughly 81%
+complete-owner reduction. Keyboard key elimination alone likewise does not
+supply a unique six-variable contact response for dense-only/sticking/tied
+contacts. The dense six coordinates belong to the SO101 arm, not a free body.
+These are specific closures, not proofs that further speedups are impossible.
+
+One new complete production boundary is now funded on
+`ooctipus/fpgs-keyboard-linear-state-20260915`, based on retained `28f93014`.
+Card: `reports/fpgs/KEYBOARD_LINEAR_STATE_20260915.md` in that worktree.
+The existing next-state prismatic publisher still runs general spatial
+inertia/Coriolis calculations for translation-only leaves, while cold Stage1
+still traverses all 108 leaves serially. Replace cold and next publication
+together with the translation-only law and scalar mass projection. Keep live
+frames/axes, all public state, the original arm/contact solver and exceptional
+masked inertia materialization. Preserve prelaunch cache validity for cold
+leaf admission and finish leaf writes before consumer events.
+
+Current source-equivalent RTX owners are 0.867157 ms next publication,
+0.712224 ms cold/cache FK and 0.124224 ms direct mass. The first cold call
+accounts for about 0.67472 ms; later cache hits are already cheap. The summed
+1.703605 ms is only an upper envelope, with overlap and required work retained.
+Target at least 0.7 ms whole saving, first integrated screen within 90 minutes
+of the 09:36 card, using existing tests and the unchanged paired4K runner.
+No candidate performance or all-task 4x achievement is claimed yet.
