@@ -276,3 +276,59 @@ The correction uses 72 registers and 1932 shared bytes on each target, exactly
 16 additional shared bytes over first expiry; stack and spills remain zero.
 These are static resources, not an achieved-occupancy claim. Native module
 SHA256 is `3103c2697b245ba144411c7b94c55b604e25edd278593efed89ce9da8134bdac`.
+
+## Corrective whole result: measured small gain, target missed
+
+The one approved correction was frozen at
+`bc0cfd161c30631ac1cdc633e35b944a8bd507fd`. All eight existing/focused CUDA
+selectors passed on each card: RTX 6.776 s and GB 6.828 s, parents
+4486/11753 reaped with exit 0. These include the saved sixteen current/held
+cases, five-world graph lifecycle, reactivation, delayed transaction kinds,
+all four bitmap words and the original fallback/error controls. Aggregate
+Python source SHA256 was unchanged before and after:
+`8a6d85b7883400eef6aab9c230bcf83718cdf511dcce2e30a5344de9b56aaf7d`.
+The tool retained test names, summaries and exit status, but truncated the
+middle of verbose stdout; this is not a claim of full saved unit-test logs.
+
+Root then ran the unchanged paired 16K protocol, 200 warmup, 40 wall and
+40 graph steps, against accepted `b1bad06ae0cd5b86ac07b2f2844ef62770e99075`.
+Parent 85494 and all four children returned zero. The manifest and every
+child artifact hash were independently checked. All eight untimed capacity
+boundaries, original collision checks, requested/observed expiry flags and
+actual old/new solve keys pass; final source and device-idle guards pass.
+Both Newton sources remained clean throughout. Fixed Lab remains
+`53ee6b44c2334341305dbdf385a3916c6b140799`, with only its inherited untracked
+`.venv` entry. No physics budget changed: eight sweeps, two Newton substeps,
+solver dt 0.0025, sim dt 0.005 and decimation four remain original. Capacities
+remain dense100, MF32, raw294912, broad49152 and triangle1769472.
+
+| Whole physics, ms | Accepted baseline | Corrected expiry | Saving |
+| --- | ---: | ---: | ---: |
+| RTX | 15.604870425 | 15.305637050 | 0.299233375 |
+| GB | 20.516338400 | 19.752022575 | 0.764315825 |
+
+The paired physics ratios are 1.019550534 on RTX and 1.038695573 on GB.
+Environment wall time is 29.290500650 to 29.393717099 ms on RTX (slower),
+and 35.519032949 to 33.621285800 ms on GB. Wall time is not training
+throughput. This is one checked discovery comparison, not repeated evidence.
+
+Artifacts: `/tmp/fpgs-g1-zero-row-expiry-whole-paired16k-20260915-02`.
+Manifest SHA256:
+`27a20e538216bb86e635e5b13734711f434d7a5d724decda6ab8c50585ddcd49`.
+Reproduction must retain the existing adapter
+`/tmp/fpgs-g1-zero-expiry-checked-CR7edpTQ/run_live_sparse_checked.py`
+(`81edb4daeb5a3e0ef0ce8dca421d422bfbc6b7dd25a9382cc74140caba395273`),
+its checked child `d7dbc9cbeddb1b17e70a12a88dfc968601b3467e47d77a31cd332d4c7657cb0d`,
+and the original 484 variants / 798 owner / 42b capture / c062 fixed-import
+drivers recorded in the manifest. The manifest contains the exact flags and
+four child commands; a current repository driver is not an interchangeable
+replacement for these pinned files.
+
+The correction recovers the first RTX loss and measures a small positive
+whole-physics gain, but does not meet the 1.5 ms RTX milestone. No repeated
+comparison, third tuning round, promotion, new MJ ratio or four-times claim
+is authorized. Keep this isolated measured result and the first loss and
+auxiliary-analyzer failures above. No corrected node capture is claimed;
+the first node comparison isolates GS, not the correction's internal cause.
+The broader all-task target remains unmet. Runtime stays frozen at bc0c;
+this closure changes only the report.
