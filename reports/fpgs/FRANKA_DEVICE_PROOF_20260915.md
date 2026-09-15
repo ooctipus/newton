@@ -128,3 +128,132 @@ Corrected runtime SHA256:
 Corrected test SHA256:
 `a19104b5f56e84b92afb55aca324fbae66cdd250c8a7e57f6d0a2f5cb4aa17a7`.
 All paired16 physical factories and retained-factor sources remain unchanged.
+
+## Final qualification and closure
+
+Runtime and tests were frozen at
+`865dbd6c7c5009b0b1f381c2a62baa55a125ce6e` throughout the following checks.
+This closure changes only this report. The runtime/test/factor hashes above
+remain the exact measured sources. All original physics/guard/plan callables
+are unchanged from91f505f5; an AST comparison also confirms the original
+constructor prefix and complete numeric-flag/shape/fallback validator path
+are unchanged apart from the new device-proof dispatch.
+
+### Native physical and notification checks
+
+Root ran all four selectors in `TestFrankaKineticStateCUDA`: the new exact
+proof/stream test plus the three existing current geometry/held-force,
+integration/publication/graph and actual loaded/reset/odd-tail controls.
+All four pass on each GPU: 2.439 seconds RTX and2.467 seconds GB300. Root
+sessions65231/13136 were reaped with exit0. The proof comparison was the only
+new binary; paired16 physical errors and kernels are unchanged. Selected
+unchanged normalized maxima are current H9 `1.3396386644807769e-6`, positive
+bias `2.084246440695394e-6`, matched8 joint velocity
+`1.1976400452964131e-4`, and matched8 body velocity
+`1.3237149835899564e-4`. These are the existing tests' measured errors, not
+a new end-to-end training/convergence claim.
+
+Local complete native logs:
+
+- `/tmp/fpgs-franka-deviceproof-native-mHEiW6v9/gpu0.log`, SHA256
+  `1c5d1db80e9f05b7c59fc9b23cd15bb9aefa0d7f6931009f37b0af51ac9a37b4`.
+- `/tmp/fpgs-franka-deviceproof-native-mHEiW6v9/gpu1.log`, SHA256
+  `4c80afd3d492f2abd05f4ee6ad6e6d43afbf5abb55dc03c0733be33e004a6c96`.
+
+### Fixed comparison and preserved failed launch
+
+Both arms use fixed Lab `53ee6b44c2334341305dbdf385a3916c6b140799` and its
+unchanged root-write notification. The accepted Newton baseline is
+`1a9efc33efbc0f23e1e7676a5edded795f224c97`; the candidate is865dbd6c above.
+The existing driver source is961b7e2f751bcd1d8b03368e7956b54c81414897,
+`compare_variants.py` SHA256
+`48406c079588d3088fc25c1cdce2bc2659aaec28539013e5811c9c55378445b5`.
+The fixed Lab profiling entry retains SHA256
+`586aecb18d95e317991f17e62fb2c9527b2eb76220d76d464bd4c67e9ec8b954`.
+Exact commands, imports, GPU UUIDs, source hashes and guards are in each
+manifest; the complete recorded command is the reproduction authority.
+
+Recipe: Franka16,384 worlds, seed0,200 warmup/40 synchronized environment
+steps/40 graph steps, environment decimation4, sim_dt1/120, two Newton
+substeps (solver_dt1/240), matrix-free/immediate contact response, eight PGS
+iterations and unchanged parallel streams. Both arms retain rigid contacts
+32768, broad-phase output7680, dense192, matrix-free64 and propagation192.
+Both enable `FEATHER_PGS_SIMPLE_WORLD_ZERO=1` and
+`FEATHER_PGS_LOCAL_ROW_PACKETS=1`; the candidate alone sets the existing
+default-off `FEATHER_PGS_FRANKA_KINETIC_STATE=1` (baseline0). No Lab, budget,
+capacity, material, collision or solver-law changes were made for timing.
+
+Initial whole01 failed before the candidate ran: RTX baseline returned0;
+GB baseline returned139 during setup before timing/CUDA initialization, with
+no stack or numerical/capacity failure identified. Root reaped session36190
+with exit1; final source and idle guards passed. No performance conclusion is
+drawn from that failure. Preserved manifest:
+`/tmp/fpgs-franka-device-proof-whole-paired16k-20260915-01/manifest.json`,
+SHA256 `811aaba9b831fb3cb7323709240ff65dab9962cc187d89ae8c31096978d78d10`.
+
+Retry02 changed only the output directory. All four runs and eight checked
+boundaries passed; root85732 was reaped with exit0. Discovery measurements:
+
+| GPU | Baseline physics ms | Candidate physics ms | Baseline wall ms | Candidate wall ms |
+| --- | ---: | ---: | ---: | ---: |
+| RTX PRO6000 | 5.468874475 | 5.030387075 | 29.411064551 | 29.365427076 |
+| GB300 | 4.989347100 | 4.686589625 | 27.546460851 | 29.650233375 |
+
+The RTX wall regression repair exceeds the12 ms criterion relative to the
+earlier broken paired16 prototype's44.762 ms wall, removing about15.4 ms.
+That is not an accepted-baseline speedup: retry02 RTX wall is essentially
+unchanged against accepted1a9, while GB wall is2.103772524 ms slower.
+Preserved retry manifest:
+`/tmp/fpgs-franka-device-proof-whole-paired16k-20260915-02/manifest.json`,
+SHA256 `1388a9d84c85ea8e7a659a3be50c02b7aaac96c2449b9aa2bdbf809f0d26fa2b`.
+
+### Three-round balanced repeat
+
+The repeat changes only the output directory and rounds1→3. Order is
+baseline/candidate, candidate/baseline, baseline/candidate; each arm runs on
+both GPUs together. Root reaped session92243 with exit0. All12 runs return0
+without cleanup signals; all24 solver/collision boundaries pass, states are
+finite, actual budgets/capacities and host call counts match, and final source
+and idle guards pass. Large captures remain local.
+
+All times below are milliseconds per batched environment step. Wall delta
+is candidate minus baseline, so positive means slower:
+
+| Round | GPU | Baseline physics | Candidate physics | Baseline wall | Candidate wall | Wall delta |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | RTX PRO6000 | 5.545875575 | 5.007319825 | 29.034897248 | 29.401579627 | +0.366682379 |
+| 2 | RTX PRO6000 | 5.577463450 | 5.070682400 | 29.771972052 | 29.140999549 | -0.630972502 |
+| 3 | RTX PRO6000 | 5.493414325 | 5.124493950 | 28.787714726 | 28.783619098 | -0.004095628 |
+| 1 | GB300 | 4.983208450 | 4.728083100 | 27.333656178 | 28.528939001 | +1.195282824 |
+| 2 | GB300 | 4.999355200 | 4.710292000 | 28.657098752 | 28.705157625 | +0.048058873 |
+| 3 | GB300 | 4.999479250 | 4.721928800 | 29.309731274 | 29.545154702 | +0.235423428 |
+
+Published ratio-of-medians physics results are RTX5.545875575→5.070682400 ms,
+**1.093713851×**, and GB4.999355200→4.721928800 ms, **1.058752771×**.
+Median savings are0.475193175 ms RTX and0.277426400 ms GB. **No round on
+either GPU reaches the0.55 ms physics milestone.**
+
+Whole-environment results do not establish a gain. RTX varies around parity:
+mean29.198194675→29.108732758 ms, while ratio of medians is0.996359003×.
+GB is slower in all three paired rounds. Its mean wall time is
+**28.433495401→28.926417109 ms, +0.492921708 ms** (about+0.492922 ms;
+mean-time throughput ratio0.982959462×). The GB ratio of medians0.998325776×
+looks nearly neutral but must not hide the consistently positive paired
+losses; median paired loss is0.235423428 ms. Inherited host timers show mean
+candidate `event.apply` overhead of0.397329173 ms RTX /0.495626450 ms GB,
+but nested timers overlap and are not an exact standalone proof-kernel cost.
+
+Repeat manifest:
+`/tmp/fpgs-franka-device-proof-repeat-paired16k-20260915-01/manifest.json`,
+SHA256 `01527229b579d1353e5b670340b4dd78307f69f4424d80442aa523b90f8df45d`.
+
+### Decision
+
+**No promotion.** The large prototype host regression is repaired and the
+paired16 physics gains repeat, but the physics milestone remains missed and
+whole-environment throughput does not improve; GB retains a measured wall
+regression. This candidate stays on its separate ooctipus branch and is not
+composed into acceptedb1bad06a. It does not establish an additional2–4× gain
+or4× across representative tasks. No further packing, benchmark campaign or
+micro-fix is part of this closure; original trees, Lab and measured runtime
+remain unchanged.
