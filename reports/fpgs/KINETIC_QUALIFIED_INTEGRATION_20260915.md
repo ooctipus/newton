@@ -74,3 +74,21 @@ This source composition is not a fresh CUDA qualification, all-task timing,
 MJWarp denominator or achievement of the all-task four-times target. Root
 owns subsequent GPU checks, review and publication. No parent pointer is
 advanced by preparing this merge.
+
+## Root-owned CUDA integration checks
+
+At clean merge `ded651f83ce4539e4f7ab13bebb5edde9d4dcc4d`, ten existing
+CUDA tests pass on each card:20.882 s RTX and21.275 s GB, both clean exit0
+without skips or CUDA errors. The only warning is the inherited target-layout
+deprecation. Each process sees exactly its leased GPU UUID and this source
+tree through `PYTHONPATH`; all prior GPU jobs were reaped before launch.
+
+The selectors are the three tests in
+`tools.fpgs_bench.test_g1_kinetic_state.TestG1KineticStateCUDA`, the explicit
+`tools.fpgs_bench.test_kinetic_current_contact.TestKineticCurrentContact.test_cuda_current_contact_boundary`
+with `FPGS_TEST_DEVICE=cuda:0`, and the six retained Allegro/Kuka selectors
+listed in [the previous integration report](FOURX_QUALIFIED_INTEGRATION_20260914.md).
+They exercise actual native current/held geometry, force response, complete
+steps, resets, graph growth/shrink and retained fallback on the composed
+source. No bound or frozen input changed. These are integration controls,
+not a fresh all-task throughput measurement or a new MJWarp comparison.
