@@ -1502,3 +1502,11 @@ An earlier mistaken `uv run --extra dev` CPU invocation was stopped before
 qualification and is not counted; it created an ignored local `.venv` but
 changed no lock/runtime files or benchmark environment. Reproduction and
 qualification use the explicit existing Lab interpreter with `--no-project`.
+
+Retention is complete: clean, remote-verified
+`ca0d427af809571bb5501f644c1a6e03990cd2a8` is pushed to `ooctipus/newton`,
+branch `ooctipus/fpgs-keyboard-linear-state-20260915`. It adds only the portable
+test and completed report after measured runtime94153754; runtime bytes are
+unchanged. Full staged `uvx pre-commit run --all-files` passes. The branch
+report is `reports/fpgs/KEYBOARD_LINEAR_STATE_20260915.md`; no PR was opened,
+no Isaac Lab code or parent pointer changed, and all root GPU sessions exited.
