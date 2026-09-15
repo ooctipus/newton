@@ -1222,3 +1222,94 @@ Pre-code card and branch:
 `ooctipus/fpgs-keyboard-readonly-rows-20260915`. The ambition is 0.7 ms RTX,
 with repeated qualification also allowed for a smaller substantial gain that
 actually reaches the user's 4x task goal. No new speedup is claimed here.
+
+## September 15 08:36: retain a real Franka gain; readonly Keyboard screen misses
+
+The original 0.55 ms Franka funding threshold should not have acted as a binary
+correctness/promotion criterion. The existing balanced three-round result is
+a real structural physics improvement: 5.545875575 -> 5.070682400 ms RTX,
+1.093714x, and 4.999355200 -> 4.721928800 ms GB300, 1.058753x. This is an
+explicit policy reconsideration, not newly created performance or a changed
+physical tolerance. RTX environment wall time remains approximately neutral;
+GB wall remains worse in every pair, mean +0.492922 ms (about 1.73%). Retain
+the default-off option with that tradeoff; do not call it training speedup.
+
+New merge `b9ba04a471aa659206d4e67518e421d527e41aad` combines accepted b1bad
+and the existing qualified Franka report tip 106a149fe5 on
+`ooctipus/fpgs-franka-retained-20260915`. Eight host-hook conflicts preserve
+both disjoint G1/Franka owners, current/held mass request handling, validation
+before mutation, force/size-stream dependencies, complete publication and
+Kuka's accepted current-contact path. Native Franka files and tests are exact
+865dbd copies. Independent source review, 77 CPU test executions and pre-commit
+pass. Root's eight CUDA selectors pass on each card without skips or errors:
+four Franka, three G1 and one Kuka current-contact boundary, 17.882/18.021 s.
+Logs: `/tmp/fpgs-franka-retained-native-jLfTopU1/gpu0.log` and `gpu1.log`.
+This qualifies the opt-in composition; its report/push is being finalized.
+No fresh all-backend table is inferred from these integration tests.
+
+The distinct Keyboard read-only-row candidate is frozen at
+`46f24d32d6548ab6b8a550ade04874972cbf2cb9`. Original scalar/speculative
+physical oracles and the new two-world changed-input graph replay pass on
+both cards. The full response-diagonal module is 15/16 per card, with only
+the unchanged inherited seven-versus-nine-argument tiled test error. Eleven
+CPU controls and independent source review pass. Default-off generated
+native source is byte-exact to b1bad for all three existing factory modes.
+
+Actual CUDA driver queries confirm the intended resource change: static
+shared 14,664 -> 3,400 B, registers 94 -> 88 RTX and 88 -> 86 GB300, zero
+dynamic shared. Driver active-block ceilings are six -> twenty RTX and
+fourteen -> twenty GB300; the earlier shared-only GB estimate of fifteen
+omitted additional driver allocation constraints. This is not measured
+achieved occupancy or a guarantee of proportional throughput.
+
+The whole-step screen nevertheless misses: RTX physics 7.428472925 ->
+7.777718350 ms (0.95510x); GB 6.843528050 -> 6.826663150 ms (1.00247x).
+All four children and eight capacity boundaries pass, with unchanged budgets
+and successful final source/idle guards. Wall times are 30.422374 -> 29.885452
+ms RTX and 28.021014 -> 26.822576 ms GB, a separate one-round measurement
+that does not establish a solver speedup or repair the physics regression.
+The candidate is not promoted. Existing node attribution is running to
+locate the failed throughput prediction; no blind cache-policy/tile grid.
+
+Artifacts: `/tmp/fpgs-keyboard-readonly-resource-4rw2va19`,
+`/tmp/fpgs-keyboard-readonly-native-IicjyVO3`, and
+`/tmp/fpgs-keyboard-readonly-rows-whole-paired4k-20260915-01`.
+The accepted b1bad worktree and all original worktrees remain unchanged.
+
+### 08:44 follow-through: published opt-in; localized loss; one shared tier
+
+Franka opt-in integration is now pushed and remotely verified at report tip
+`28f93014520504e90be34a304507368c7c82c4cc`; runtime remains b9ba04a4.
+The full report is `reports/fpgs/FRANKA_RETAINED_INTEGRATION_20260915.md` in
+`newton-fpgs-franka-retained-20260915`. It retains the original measured
+physics gain, GB wall caveat and unchanged default-off option. No old negative
+report was rewritten and no new all-backend timing was invented.
+
+Readonly Keyboard's original node analyzer completes successfully on all four
+children, with all boundaries/source/idle guards passing. Each capture has
+12 physics roots and 1,260 graph nodes: 936 kernels, 204 memsets, 120 copies.
+RTX graph span grows 7.607929 -> 7.779795 ms; the changed GS itself grows
+1.287766 -> 1.448033 ms, explaining most of the +0.171866 ms in this sample.
+GB GS is 1.426954 -> 1.435936 ms, essentially unchanged, while graph span
+is 6.897206 -> 6.854346 ms. These three-step node windows are not the separate
+40-step whole result. Actual resources match the driver query, with no spills
+or new launches. Additional global rereads remain the source-level new cost;
+there is no hardware-counter attribution to a particular cache/stall cause.
+Full unpromoted closure is pushed at `daf0c407432c8fb08ee630c92327fbf7ba5653c6`
+on `ooctipus/fpgs-keyboard-readonly-rows-20260915`.
+
+One distinct, costed alternative is funded from b1bad: private shared rows384
+with the original public704/S235 strides, all original shared reuse, and a
+disjoint original full704 tail on the existing size6 stream. Reuse the existing
+otherwise-unused size events; join before any output consumer. This introduces
+no global classifier/queue/JY panel/new stream or public-capacity reduction.
+No stationary mask or read-only-row code is carried into it. The single
+pre-code card is `newton-fpgs-keyboard-shared-tier-20260915/reports/fpgs/KEYBOARD_SHARED_TIER_20260915.md`.
+
+Its route is narrow, not promised: at an expected ten RTX resident blocks,
+ideal scaling leaves only about 0.059 ms overhead/tail allowance using the
+earlier1.079 ms owner, or 0.143 ms using the newer1.288 ms node sample, to reach
+the approximately0.372 ms saving implied by the recent whole baseline and
+historical4x ceiling. Actual compiled resources are checked early. Full cost
+is max(bulk, tail) plus fork/join and interference, not bulk time alone. There
+is no tier-size grid, and historical world coverage is not a timing claim.
