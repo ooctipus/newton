@@ -1,5 +1,10 @@
 # G1 current body-plus-present-limit ports: pre-code card
 
+Final status: CLOSED, physically qualified but slower on both cards; no
+promotion or further correction for this version. The chronological pre-code
+plan and failed intermediate test criteria remain below; final evidence is
+recorded in the closure section.
+
 Recorded September15, before runtime edits. This is an unimplemented
 representation hypothesis, not a speedup or a reopened measured port loss.
 The isolated branch is `ooctipus/fpgs-g1-present-ports-20260915`, based on
@@ -288,3 +293,68 @@ to24.529586400 ms, a4.072401200 ms loss. The >=1.5 ms RTX milestone is missed.
 This is an unqualified cost screen, not a promotion or completed physical
 qualification. Matched original node attribution is pending; source work and
 static resource counts alone do not locate the measured loss internally.
+
+## Final qualification and causal closure
+
+Native03 on clean test/report tip `00ac8a10` passes all nine CUDA selectors on
+each card, including all sixteen current/held saved cases through the final
+physical gates. RTX took8.315 seconds, GB8.522; root parents45004/28609 reaped0.
+Logs are `/tmp/fpgs-g1-present-ports-native-5Mtt1tKj/native03_gpu{0,1}.log`.
+The original two failed batches and accepted-solver component controls above
+are preserved, not relabeled as runtime failures or removed from the record.
+No runtime or final physical tolerance changed to obtain this pass.
+
+Frozen native source remains SHA256
+`c63761fa42af859f83e01ae00ae1c5ca3617b89f02c7fe268f112a25ed542204`,
+hooks `942eacbbab7c1b3c06dbf59973cccc64c1b63f73e489df6cd66ec103003e5fb1`,
+and qualified test
+`bb6b5549a6a4b263b5a52c38906892cbea266751f01b37c097d7e17de3d69b36`.
+The measured runtime is exactly the original `d03063f1` implementation;
+later commits changed only tests and this report.
+
+Matched three-step node evidence uses baseline root
+`/tmp/fpgs-g1-present-ports-nodes-paired16k-20260915-01` and candidate root
+`/tmp/fpgs-g1-present-ports-candidate-nodes-paired16k-20260915-01`.
+Each has `round_01_baseline/round_01_g1_fpgs_gpu{0,1}/strict_present_ports_node_audit.json`.
+The candidate-only run's directory label is not its actual arm: its manifest,
+source and native key explicitly identify the candidate. Original parents
+73715/90992 reaped1 because the inherited analyzer rejects auxiliary graph
+scope; those failures are preserved. The unchanged strict reader
+`74c5928beff9685e341135728d6213d9febbdd8fd821e2e91dc6ae020191e589`
+passes all four captures, separating three auxiliary roots per capture with
+zero unproven graph nodes. Source, artifact hashes, process correlation and
+parent source/idle checks all pass. These node runs establish causal ownership,
+not replacement whole-throughput estimates.
+
+| Complete charge, milliseconds per environment step | RTX | GB |
+| --- | ---: | ---: |
+| Old contact Z + limit response + metric GS, summed | 5.716383 | 6.312212 |
+| New main port owner alone, summed | 7.754851 | 9.808511 |
+| New metadata, summed | 0.431798 | 0.285227 |
+| New prefix + packet mapping, summed | 0.207083 | 0.176096 |
+| All four guarded fallback tails, summed | 0.374709 | 0.462346 |
+| Old complete changed family, exclusive | 6.052297 | 6.591892 |
+| New complete changed family, exclusive | 8.768441 | 10.723241 |
+
+The exclusive complete-family regression is2.716144 ms RTX and4.131348 ms GB;
+all retained owners' summed differences are only-0.037314/-0.060689 ms.
+All sampled boundaries on both cards report16384 fast worlds and zero fallback
+worlds. The loss is not an observed admission miss or merely four extra launches.
+The complete whole graph result remains15.607145525 to18.255871400 ms RTX and
+20.457185200 to24.529586400 ms GB, with final source/idle guards passing.
+
+Source explains the expensive replacement work without claiming internal
+counter attribution: current F and triangular C formation, six-by-six row
+self/cross quadratics, and six C-column transactions over all present ports
+per accepted contact update replace shorter original sparse-Z operations.
+The reduced residual-dot count did not remove comparable total arithmetic;
+the pre-code selected replay already charged increased update products.
+No achieved occupancy is inferred from shared memory or register counts.
+
+Holding all other measured charges fixed, the RTX main owner would need to
+fall from7.754851 to approximately3.538707 ms, more than54 percent, to save the
+declared1.5 ms whole milestone. Even removing every fallback-tail charge is
+insufficient. No supported work retirement of that magnitude was identified.
+Root therefore closes this version without promotion, launch cleanup, another
+mapping grid or a further runtime correction. All original and failed artifacts
+remain preserved; the user goal is not claimed achieved by this experiment.
