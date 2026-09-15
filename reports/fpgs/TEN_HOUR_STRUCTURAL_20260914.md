@@ -1605,3 +1605,68 @@ complete cost case. Next read-only study is full G1 pair-private terrain
 query/reduction ownership, not the failed uniform-range direct-query patch.
 
 No new MJWarp ratio follows; the all-task RTX4x objective remains unfinished.
+
+## 2026-09-15 15:29 UTC — pair-terrain closure and full-population cost gate
+
+The complete pair-private terrain trial is CLOSED, default-off and unpromoted.
+It actually retires the old global callback/hash/clear/reduce/export pipeline,
+preserves current query geometry and calibrated capacities, and replays entire
+overflow pairs before publication. Initial paired whole physics loses:
+RTX15.580928 ->40.319060 ms and GB20.471399 ->71.914381 ms. Strict node evidence
+identified a16x underlaunch. Correcting it improves the candidate substantially
+but still loses: RTX15.607482 ->23.863201 ms, GB20.531565 ->59.539593 ms.
+
+The next diagnosed implementation issue was shared64 winner MAX lowering to
+CAS loops. Deferred immutable-record selection removes all eight fast-owner
+shared64 MAX/CAS sites, verified in exact PTX and CPU-assembled SASS; however,
+it adds selection scans and does not reduce the254-register fast-owner count.
+Its valid final RTX whole result remains a loss:15.633675 ->24.555561 ms,
+0.636665x. This is not evidence that CAS caused a measured fraction of stalls.
+No hardware counters were collected: unprivileged Nsight Compute returns
+ERR_NVGPUCTRPERM on both cards. No driver or privilege changes were made.
+
+The final planned pair was prevented by an unrelated GB300 job. A minimal
+source-pinned single-card continuation retains all selected-device guards.
+RTX source, finite/capacity and final-idle checks pass. The subsequent GB-only
+continuation finishes both simulations but fails final idle after another
+unrelated job appears; its raw timing is INVALID comparison evidence.
+No external process was interrupted. All root GPU/profiler sessions are reaped.
+
+Four focused CPU tests and two native tests per card pass. Remaining explicit
+high-mask/nontransitive-ULP fixture gaps are documented, not hidden or expanded
+for a losing candidate. No loaded qualification, mapping grid or promotion.
+The complete causal report, default-off source and exact local reproduction
+are pushed and remote-verified at33b450ed06764315b336111164d00bc27bef8e61 on
+`ooctipus/fpgs-g1-pair-terrain-20260915` in `ooctipus/newton`. See its
+`reports/fpgs/G1_PAIR_TERRAIN_20260915.md`; final measured runtime is
+a68ad0dc184284b8af9fcf677d339236688a91ba. Full pre-commit passes. Retainedca0d,
+fixed Lab and all original worktrees/pointers remain unchanged.
+
+A distinct full-world row/solve bypass was screened with an untimed, read-only
+last-solved-row census across all16,384 current RTX G1 worlds. A sufficient
+cold all-open predicate covers14.563% and14.313% of worlds at two boundaries,
+but only6.292% and6.625% of contact-response work counts and14.194% and14.074%
+of limit rows. No empty worlds; all eligible solved impulses are exactly zero.
+Rows remain from the last solve even after a reset: this is not eligibility
+computed from post-reset poses or a claim about the next substep.
+
+Close this proposal as distinct but insufficient exposure; no runtime funded.
+Measured contact/limit/GS ownership totals5.7158 ms; a1.5686 ms first milestone
+requires27.4% removal before certificate cost. Eligible worlds already avoid
+loaded metric work. The measured fractions were NOT multiplied by stage times
+and presented as timing bounds. Original source/capacity/status guards and an
+independent accounting review pass.
+
+Census artifact: `/tmp/fpgs-g1-allopen-population-u3K953lx/rtx_checks.json`, SHA256
+420023566b6022ee5f411128d9328049209feb73016b4cca0b15f9d5e5cb3f7a. Exact local
+launcher is `run.py` in that directory, SHA256
+29bf880d4e4e1c7b60edd48fad4a7da3ad5406ba224cc5fe4906bfdd4c477437.
+The small external observer is
+`/tmp/fpgs-g1-allopen-observer-60qaFLgA/checked_allopen.py`, SHA256
+3640f197d43a301165544abd4dbb21270c3fe707c5c188cb613885b986e0a130.
+Its diagnostic wall timings are not performance-comparison evidence.
+
+Next bounded study: physically applied sparse/metric warm start, including
+matching and current-response initialization costs. Existing incoming-lambda
+tests initialize du=0 and do not qualify this behavior. No new solver runtime
+or accepted performance gain is claimed at this checkpoint.
