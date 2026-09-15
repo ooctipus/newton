@@ -1360,3 +1360,65 @@ accounts for about 0.67472 ms; later cache hits are already cheap. The summed
 Target at least 0.7 ms whole saving, first integrated screen within 90 minutes
 of the 09:36 card, using existing tests and the unchanged paired4K runner.
 No candidate performance or all-task 4x achievement is claimed yet.
+
+## September 15 10:10: linear-state first gain, qualification and bounded diagnosis
+
+The initial clean runtime `cd3ec68d` reached the paired screen about eleven
+minutes after the card. Both candidate constructors failed before simulation:
+the admission check indexed an N+1 articulation-start array with an N mask.
+The failed run is preserved at
+`/tmp/fpgs-keyboard-linear-state-whole-paired4k-20260915-01`; this is neither a
+physical failure nor a performance result. The actual-plan CPU regression
+first reproduced it. Corrected runtime `94153754aeaca76f92d3fbf8cb0ebc0de03160be`
+changes only that host slice to omit the end sentinel; every native function
+is unchanged. Eight CPU controls pass with one explicit CUDA skip.
+
+The actual-constructor native full-step/contact/captured-partial-reset test
+then passes on both RTX and GB300 (sessions 37328/89433, exit 0). It exercises
+non-unit axes, current forces and targets, held and requested mass refresh,
+notified mass/axis/drive changes, the original angular-arm factor, public FK
+and all three captured reset masks. Original physical tolerances, eight
+sweeps and existing fixture capacities are retained. External test SHA256
+`f3ccab467cf28dada66b081613b942868039507c2b0f26c72378a2efddcec59e`;
+logs under `/tmp/fpgs-keyboard-linear-native-run-ycj8u078` have RTX SHA256
+`195287c9fa2beb1c958f68e068b4030415bb5db2511eaddf2f2af99995967c02`
+and GB `fe3da794781afc1ad45392d2507f14b21880a7cc9efcebdd3507d57a6c673005`.
+
+The corrected whole screen completes in approximately three and a half
+minutes, with all four children, eight capacity boundaries and source/idle
+guards passing (session 3010, exit 0). RTX physics is 7.600451 -> 6.990566 ms,
+1.087244x, saving 0.609886 ms. GB is 6.814330 -> 6.120821 ms, 1.113303x,
+saving 0.693509 ms. Environment wall time is 31.150027 -> 30.249062 ms RTX
+and 27.249869 -> 27.267263 ms GB. Preserve
+`/tmp/fpgs-keyboard-linear-state-whole-paired4k-20260915-02`, manifest SHA256
+`7563b5963dbed8ba091af6f0bb0957cec0205940dad6c3b044c3695ff4955eee`.
+This is one discovery run, below the 0.7 ms RTX target, not a fresh MJWarp ratio.
+
+The single funded node diagnosis also completes with all guards passing
+(session 11320, exit 0), under
+`/tmp/fpgs-keyboard-linear-state-nodes-paired4k-20260915-01`, manifest SHA256
+`f355360218d2350a2fea811ac2a1b0f73e6ae81767cee757429a21963d738476`.
+RTX original FK 0.442304 ms becomes root 0.066166 + leaf repair 0.125323
++ validity copy 0.019723 ms; publication 0.830219 -> 0.723638 ms; scalar
+mass 0.131989 -> 0.080192 ms. The replacement-owner sum falls 0.389473 ms,
+but it is not an exclusive graph saving. Regular publication improves much
+less than the arithmetic reduction might suggest; required state writes
+remain. No hardware-counter stall or bandwidth attribution is available.
+The three-step reset mix differs (RTX baseline two resets, candidate three),
+so its 0.170 ms whole-graph difference does not replace the 40-step result.
+No launch-size grid or micro-tuning is funded. Repeated whole timing is running.
+
+Cold-cache diagnosis also closes: the same first-FK graph node is cold after
+real reset/root-frame writes and cheap on later replays. There is no persistent
+capture-time identity mismatch. Keyboard resets change `model.joint_X_p` and
+notify JOINT_PROPERTIES, legitimately invalidating the cache; deleting that
+invalidation would expose stale frames and dynamics.
+
+A fresh-backend setup audit found that the old checked comparison stripped
+the shared THREADS_X flag from MJWarp, leaving default 1 against FPGS 4.
+The upcoming comparison must use shared 4 and the same frozen Newton source
+on both arms, with the existing checked MJWarp line-search correction and
+all original budgets/capacities. A small external adapter preserves all
+existing guards; it is not a Lab/runtime change. Historical Keyboard ratios
+must not be presented as this new symmetric comparison. No new all-task
+4x claim is made.
