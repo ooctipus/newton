@@ -69,3 +69,66 @@ region with only elapsed/selected clocks and no18-field per-row counter state.
 Measure its complete overhead again. This is not a phase/tolerance/register
 tuning grid, and it does not change physics. Resource evidence and the final
 distortion gate must precede any performance interpretation.
+
+## Corrected unprivileged result, 16:19 UTC
+
+Binary-region clock32 timing succeeds on both cards, with only0.52--1.21%
+whole-kernel instrumentation overhead. All original checks, private replay
+output-byte checks, sampled bounds and live-array/plan digests pass. Parents
+65611/14006 exit0 and are reaped; both selected GPUs pass final idle. No sudo,
+driver change, hardware-counter-policy bypass or external-job interruption.
+
+| Region | RTX original / observed ms | Overhead | GB original / observed ms | Overhead |
+|---|---:|---:|---:|---:|
+| Complete scalar rows |0.524288 /0.529024|0.90%|0.547376 /0.554016|1.21%|
+| Metric disk calculation |0.525744 /0.528496|0.52%|0.546528 /0.550560|0.74%|
+
+On the256 sampled worlds, scalar rows account for35.89% RTX /33.85% GB of
+summed within-world elapsed cycles. The metric disk calculation accounts
+for12.30% /15.37%. The latter includes conditioning, the sticking test,
+sliding roots and final verification, NOT roots alone. These are separately
+measured sampled elapsed-cycle fractions, not additive whole-physics wall
+fractions or hardware stall counters. No memory-/compute-bound or peak-CUDA
+claim follows. Original source-index setup and final diagnostic writes are
+outside the internal total; complete kernel events include all of them.
+
+The concrete observer perturbation is supported by offline assembly of exact
+cached NVRTC PTX: original72registers versus clock18 107RTX/108GB; both binary
+versions return to72 on both architectures. Shared1116B and zero register
+spills/stack remain. This is ptxas13.2 static evidence, not driver-loaded
+resource telemetry or a measured causal fraction of the initial overhead.
+The binary clock uses unsigned32 differences, checks selected<=total and
+total<2^31, and rejects replay samples>=100ms; no long-interval claim is made.
+
+Binary artifacts: `/tmp/fpgs-g1-unprivileged-binary-PehdrvlV/gpu{0,1}`.
+The exact source-pinned local launcher is `run.py` in its parent; both0/1
+arguments were launched simultaneously, one job/card, as normal uid1002.
+The observer runs inside the original first untimed checked boundary and is
+never installed into the simulation. Region3/5 raw NPZ SHA256 values:
+
+- RTX scalar:1c9ef557f5c4f04dcebf4c0a94371b4e0abe4a4658df34b6c62631f4aa586812
+- RTX disk:446a78a4ed03631419776b50df86314963143c4d704f0318185f2119718c326f
+- GB scalar:a41f899c52695fd5f8855b0e4ae37c9864f96ee15287704aaba67f137abf219c
+- GB disk:dd2a5d03e007445c8ae1b70402bf67fe0a0b689e64c1dc22cff2c51e73f5973f
+
+Final binary helper SHA256 is
+da12069cd62e4b0399ffdd270e4d2ae0a64d3723826ab42a85c50a8a70b7a279;
+observer7a84f1b0cef3730fc36e6923ca843169d6e386d60501e5382d30d20d37820ed1.
+The original detailed helper remains25563bf9; original measured observer bytes
+are preserved by commit9da957ef. CPU factory and independent seam/ABI reviews
+pass. One import-only correction makes the new binary helper load from its
+diagnostic directory while Newton imports remain pinned to retainedca0d.
+
+Profiling without sudo is now operational. This is diagnostic progress, not
+a solver speedup. Hardware-counter restrictions do not block the next
+optimization. No further profiler rewrite is funded here. The next experiment
+is the separately carded paired-world G1 solve, not a friction-root micro-tune.
+
+Local reproduction is included as `REPRO_G1_UNPRIVILEGED_20260915.py`.
+Invoke with the fixed Lab interpreter through uv, arguments0 or1 and the same
+fresh output-root path; launch one invocation per card concurrently. This
+packaged copy adds an explicit output-root argument to the measured launcher
+and has not itself rerun the GPU study. Its source/recipe checks and selected
+device idle guards are unchanged; populated per-card output directories are
+never overwritten. It requires the preserved local source-pinned manifest and
+checked driver, not a new environment install or sudo.

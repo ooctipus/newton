@@ -29,7 +29,7 @@ def exact(actual, expected, label):
     )
 
 
-def profile(solver):
+def profile(solver, phase=None):
     """Replay original last-solved inputs without writing live simulation arrays."""
     import warp as wp  # noqa: PLC0415
     from profile_sparse_metric_clock import build_clock_kernel  # noqa: PLC0415
@@ -53,9 +53,16 @@ def profile(solver):
     if solver.model.device.is_capturing:
         raise RuntimeError("Diagnostics must remain outside simulation capture")
     output = Path(os.environ["FPGS_CLOCK_OUTPUT"])
+    if phase is not None:
+        output = output.with_name(output.stem + f"_region{phase}" + output.suffix)
     if output.exists() or output.suffix != ".npz":
         raise RuntimeError("Require a fresh explicit .npz diagnostic output")
-    kernel, metadata = build_clock_kernel()
+    if phase is None:
+        kernel, metadata = build_clock_kernel()
+    else:
+        from profile_sparse_metric_binary import build_binary_clock_kernel  # noqa: PLC0415
+
+        kernel, metadata = build_binary_clock_kernel(phase)
     original = owner.kernels.solve
     if original.key != "sparse_metric_tangent43_s18_c100":
         raise RuntimeError("Unexpected retained solve owner")
@@ -178,20 +185,29 @@ def profile(solver):
     values = {name: raw[sampled, i] for i, name in enumerate(fields)}
     if np.any(raw[~sampled]) or not np.array_equal(values["rows"], counts[sampled]):
         raise RuntimeError("Unexpected sampled-world publication")
-    if not np.array_equal(values["total_cycles"], raw[sampled, 1:7].sum(axis=1)):
-        raise RuntimeError("Phase cycles do not conserve total")
-    if (
-        np.any(values["total_cycles"] == 0)
-        or np.any(values["sweeps"] > 8)
-        or np.any(values["root_probes"] > 16 * values["sliding_roots"])
-        or np.any(values["self_block_builds"] > values["positive_radius"])
-        or np.any(values["positive_radius"] > values["metric_visits"])
-        or not np.array_equal(values["metric_accepted"] + values["metric_rejected"], values["metric_visits"])
-        or not np.array_equal(
-            values["scalar_row_visits"] + 3 * values["metric_accepted"], values["rows"] * values["sweeps"]
-        )
-    ):
-        raise RuntimeError("Algorithm-count conservation failed")
+    if np.any(values["total_cycles"] == 0):
+        raise RuntimeError("Missing sampled total elapsed time")
+    if phase is None:
+        if not np.array_equal(values["total_cycles"], raw[sampled, 1:7].sum(axis=1)):
+            raise RuntimeError("Phase cycles do not conserve total")
+        if (
+            np.any(values["sweeps"] > 8)
+            or np.any(values["root_probes"] > 16 * values["sliding_roots"])
+            or np.any(values["self_block_builds"] > values["positive_radius"])
+            or np.any(values["positive_radius"] > values["metric_visits"])
+            or not np.array_equal(values["metric_accepted"] + values["metric_rejected"], values["metric_visits"])
+            or not np.array_equal(
+                values["scalar_row_visits"] + 3 * values["metric_accepted"], values["rows"] * values["sweeps"]
+            )
+        ):
+            raise RuntimeError("Algorithm-count conservation failed")
+        phase_fields = fields[1:7]
+    else:
+        if np.any(values["selected_cycles"] > values["total_cycles"]) or np.any(values["total_cycles"] >= 2**31):
+            raise RuntimeError("Invalid binary elapsed-cycle bounds")
+        if any(max(a["samples_ms"]) >= 100.0 for a in arms):
+            raise RuntimeError("Replay too long for bounded clock32 diagnostic")
+        phase_fields = ("selected_cycles",)
     np.savez(output, diagnostic=raw, counts=counts, fields=np.asarray(fields))
     return {
         "scope": "Last-solved full16K standalone replay; not whole-physics timing or hardware stall counters",
@@ -202,9 +218,10 @@ def profile(solver):
         "rounds": 30,
         "discard": 10,
         "sampled_worlds": int(sampled.sum()),
+        "binary_region": phase,
         "field_totals": {name: int(value.sum()) for name, value in values.items()},
         "phase_fraction_of_sampled_elapsed_cycles_not_wall": {
-            name: float(values[name].sum() / values["total_cycles"].sum()) for name in fields[1:7]
+            name: float(values[name].sum() / values["total_cycles"].sum()) for name in phase_fields
         },
         "arms": [
             {"key": a["kernel_key"], "samples_ms": a["samples_ms"], "median_ms": float(np.median(a["samples_ms"]))}
@@ -236,7 +253,10 @@ def main():
         nonlocal completed
         result = original(solver, requested)
         if requested and not completed:
-            result["unprivileged_metric_profile"] = profile(solver)
+            if os.environ.get("FPGS_CLOCK_BINARY") == "1":
+                result["unprivileged_metric_profiles"] = [profile(solver, phase) for phase in (5, 3)]
+            else:
+                result["unprivileged_metric_profile"] = profile(solver)
             completed = True
         return result
 
