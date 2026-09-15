@@ -196,3 +196,30 @@ as its debug augmented state. Minimal original-versus-new lifecycle diagnosis
 and a clean paired rerun remain required, as do repeated whole timing and
 representative retained-path checks before adoption. The all-task4x target
 remains unmet; these results concern G1 only.
+
+### Teardown repair and clean physical rerun (00:48 UTC)
+
+The isolated original/new eight-lifetime probe passes on both cards, but the
+full unchanged three-method suite reproducibly exits139 on both. Faulthandler
+locates the crash in `SolverFeatherPGS.__del__ -> wp.synchronize_stream`, during
+explicit cyclic collection. The local Warp stream finalizer destroys its CUDA
+handle without clearing the surviving Python wrapper's handle. The solver
+therefore must not assume that all referenced stream wrappers remain usable
+when cyclic finalization reaches it. Exact finalization order was not observed
+in the earlier instrumented run; the full crash location is now established.
+
+A causal control changes only the destructor to drain the device context,
+leaving the entire physical suite untouched. Both processes exit0, all three
+methods pass (5.133/5.235 s),40 solver owners drain, and no CUDA/error/exception
+is logged. The actual Newton destructor now uses that context synchronization,
+handling partial construction and unavailable shutdown callables. It changes
+no timestep operation or native physics kernel; at destruction it may also
+wait for unrelated work in the same device context.
+
+The new CPU teardown regression fails on the original implementation and
+passes after the repair. Combined with the five existing CPU methods, seven
+tests pass. The actual edited source, without the control monkeypatch, passes
+all three CUDA physical methods on both GPUs in3.888/3.948 s; both processes
+exit0 without CUDA709 or crash. Logs and the preserved failing controls are in
+`/tmp/fpgs-g1-gc-isolated-lNKjkZ`. This closes the observed teardown blocker;
+repeated whole timing and retained-path qualification remain before adoption.
