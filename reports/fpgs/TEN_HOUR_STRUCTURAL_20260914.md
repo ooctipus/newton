@@ -1670,3 +1670,59 @@ Next bounded study: physically applied sparse/metric warm start, including
 matching and current-response initialization costs. Existing incoming-lambda
 tests initialize du=0 and do not qualify this behavior. No new solver runtime
 or accepted performance gain is claimed at this checkpoint.
+
+## 2026-09-15 15:40 UTC — same-generation warm-start feasibility closure
+
+The bounded CPU study closes same-generation contact carry as NO-FUND for
+the large-gain target, not as a claim that all warm-start algorithms fail.
+Seven true consecutive selected-world pairs share collision generation801.
+All68 raw contact identities/payloads agree, but52 row slots move: current
+slot remapping is required. Tangent frames derive from unchanged held normals.
+The replay applies the donor metric-eight contact impulses through CURRENT Y
+before solving; limits remain cold. This is physically applied warm start,
+not the existing incoming-lambda/zero-du synthetic test. No collision matching,
+cross-generation yield, population performance or native FP32 is qualified.
+
+Across seven pairs, full-budget stationary recurrence sweeps remain35 ->35,
+residual dots952 ->938 and updates97 ->91; sliding root calls35 ->27.
+Root iteration counts are FP64 oracle work, not native Newton telemetry.
+First warm sweeps matching all four actual cold-eight physical defects are
+[0,0,7,7,0,8,8]. Natural-only acceptance at sweep3 for RTX7410 would hide worse
+complementarity. Its final natural defect improves9.56e-5 ->4.69e-6, but it
+still needs all eight sweeps under the separate fixed1e-5 diagnostic rule.
+Thus closure is not based on imposing that stronger floor on cold-eight.
+All final states are finite; maximum cone/momentum defects are1.39e-17 and
+1.54e-16. The diagnostic threshold remains unqualified for production.
+
+Diagnostic early-stop recurrence dots660 ->625 are accompanied by1270 ->1237
+full-row check dots under the same check policy, before warm seed/cache costs.
+The exact hashed retained node captures independently give first/second-substep
+GS costs1.959189/1.959595 ms RTX and2.229301/2.219019 ms GB per environment step.
+There are exactly24 GS calls in12 physics roots; each root contains two calls.
+Only the second calls qualify for this no-matcher carry, so the1.5686 ms RTX
+whole milestone needs >80.05% of their cost removed before new work. The saved
+replay does not approach this. No GPU implementation or tuning grid follows.
+
+CPU20904 exits zero. Existing reference SHA256 is
+ba918d8ef1523a9824f1e2f0487a93ad10b9e1279ad3a1a7ced39bd03e07d9a1 at retained
+`tools/fpgs_bench/test_sparse_metric_tangents.py`; replay loader is
+`/tmp/fpgs-g1-tree-factor-OzkV0Het/replay_operator_assessment.py`, SHA256
+7b82e5bbce00088b131153c05f5437cf0ddadac3709b0259eea4ca70ceb73e90.
+Physical helper is `/tmp/fpgs-g1-numerical-stop-cpu-InHlO554/study.py`, SHA256
+76a7628f2e75ad6146cf0586f22397eb6f2b8f900a91fddd6611f5b94aa02474.
+Inline instrumented reference SHA256 is
+40cd8965f4a0b9ddd7f8e6d2cfea5498a7a2504112f065376852a2e5810f0224; every replay
+asserts byte equality to the unmodified reference. No standalone study file
+was created. Payloads under `/tmp/fpgs-g1-sparse-operator-paired16k-20260913-02`:
+
+- `gpu0/operator_1600.npz`:4841c835c11341b8681ca3d7e24527c9a584bc39afcb75c3758cc391fbad41bc
+- `gpu0/operator_1601.npz`:cea512719353aa1a1f1f1ee2bd3ee6bf409e7cea60de4507c05cf2b04834b1db
+- `gpu1/operator_1600.npz`:323fc0f71d749706b63de8758a09bf5e0250112435129235432f0df011dcd740
+- `gpu1/operator_1601.npz`:be3cbe45678f5a6850d65ba9fe5776b7102a8708b57f7d00bd2ad625200836fd
+
+One separate bounded root-seed replay also has no large-gain cost case:
+114 fixed positive-radius QPs need308 ->284 total2D evaluations; unchanged
+normal/residual/update work remains. This is not an implemented optimization.
+No new accepted gain, MJWarp ratio, Lab edit or retained runtime change.
+Read-only sudo profiling authority was requested because both unprivileged
+hardware-counter attempts failed; no privileged command has been attempted.
