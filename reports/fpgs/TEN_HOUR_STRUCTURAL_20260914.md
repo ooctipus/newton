@@ -943,3 +943,69 @@ conservative norm/travel/rounding bound and all producer/setup costs. No initial
 certificate seeding, new stopping law, mapping grid or lowered milestone:
 require at least1.5 ms whole RTX saving against acceptedb1bad, not against the
 losing6c2e prototype. This correction is not yet measured.
+
+## September15 04:58: close expiry; fund present-port replacement
+
+The one zero-expiry correction is measured and closed, not promoted. Clean
+runtime `bc0cfd161c30631ac1cdc633e35b944a8bd507fd` passes ten CPU controls,
+eight actual CUDA selectors per card, and the unchanged paired whole16K
+protocol. All four children and eight finite/capacity boundaries pass; source,
+requested/observed owner and final-idle guards pass. Acceptedb1bad physics is
+15.604870425->15.305637050 ms RTX (1.019550534x,0.299233375 ms saved) and
+20.516338400->19.752022575 ms GB (1.038695573x,0.764315825 ms saved).
+RTX wall is29.290500650->29.393717099 ms, slightly slower; GB wall is
+35.519032949->33.621285800 ms. These are not training measurements.
+
+The correction recovers the first RTX loss but misses the declared1.5 ms
+milestone. No third tuning round, corrected node capture, repeated comparison
+or accepted MJ-ratio change is claimed. The first loss and original auxiliary
+analyzer failures are retained. Full closure is pushed and remotely verified
+at `de2e288274550abe4c7ce3ed2bfba93ac777eca6` on
+`ooctipus/fpgs-g1-zero-row-expiry-20260915`. Corrected whole manifest:
+`/tmp/fpgs-g1-zero-row-expiry-whole-paired16k-20260915-02/manifest.json`,
+SHA256 `27a20e538216bb86e635e5b13734711f434d7a5d724decda6ab8c50585ddcd49`.
+
+A distinct G1 present-port replacement is funded after a complete pre-code
+card, commit `11d5ee6d6f43f60fa75d14c9fd47602c35e1ab99`, on
+`ooctipus/fpgs-g1-present-ports-20260915`, directly from acceptedb1bad rather
+than expiry. The card is `reports/fpgs/G1_PRESENT_PORTS_20260915.md` in that
+worktree. It replaces contact Z, limit response and metric GS with one compact
+body/limit response representation, maintaining only actually committed
+impulse deltas and decoding once. Up to32 present ports are supported;
+unsupported bodies, two responding bodies and larger sets take the complete
+original fallback before public writes. Current geometry is refreshed on held
+factor calls. The ordered eight-sweep metric law is unchanged.
+
+The full affected RTX boundary is5.743082666 ms; all new geometry, response
+construction, solve, decode, guards and retained fallback must fit within
+4.243082666 ms to save1.5 ms whole physics. Explicit shared planning is5636
+bytes plus compiler overhead. Six geometry scalars per already-reserved row
+cost39,321,600 bytes at16K/dense100; row capacities are not increased and old
+Z allocation remains for fallback. This is not an allocation-saving claim.
+Selected CPU algebra passes, but residual-dot savings are substantially offset
+by port-update arithmetic. Native performance must establish whether removing
+global response traffic and reductions wins; no operation-count-to-time
+prediction is made. Independent tests/review run alongside runtime work.
+First integrated readiness checkpoint06:15 UTC, no silent extension past06:45.
+
+ANYmal has a separate CPU-only active-dual semismooth Newton study under
+`/tmp/fpgs-anymal-semismooth-cpu-ioOhLY`. The existing2048 saved cases pass
+unchanged physical gates in FP64 and guarded FP32 controls. FP64 median outer
+iterations are6, maximum13, active linear dimension at most18; the original
+executes all24 iterations in2026/2048 cases. Raw FP32 Euclidean stopping has
+long tails (median7,maximum24; residual evaluations up to171), so these FP64
+counts are not native cost evidence. A baseline-independent physical stopping
+control is pending. Same-active-ID Gram reuse can avoid repeated matrix builds;
+all setup, pivoted LU, trials, final factor reload and fallback must be charged.
+There is no ANYmal native funding or GPU gain yet. The original24 total outer
+allowance and separate original eight-iteration fallback remain unchanged.
+
+Read-only follow-ups also prevent reimplementing existing work: Franka already
+builds local response Gram matrices and updates residuals; Keyboard already
+solves independent key chains in parallel. A simple Keyboard scalar feasible
+interval excludes almost all loaded key impulse because opposing finite limits
+make those selected intervals inconsistent. A direct ANYmal port of G1's
+current/next state has no demonstrated0.94 ms removable-work budget. These
+closures are source/algebra studies, not new timings or general impossibility
+proofs. Accepted runtime remainsb1bad and the at-least4x-every-RTX-task target
+remains unmet; the paused goal controller is unchanged.
