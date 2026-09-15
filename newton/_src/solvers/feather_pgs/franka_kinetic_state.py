@@ -78,8 +78,6 @@ class ForceInput:
     dt: float
 
 
-_lane = world_scan_publication._lane
-_sync = world_scan_publication._sync
 _release = world_scan_publication._release
 _store_pose = world_scan_publication._store_pose
 _load_pose = world_scan_publication._load_pose
@@ -94,8 +92,46 @@ _store_axis = kinetic_state._store_axis
 
 @wp.func_native(r"""
 #if defined(__CUDA_ARCH__)
-    __shared__ float values[896];
-    return reinterpret_cast<uint64_t>(values);
+    return wp::vec2i(threadIdx.x&15,16);
+#else
+    return wp::vec2i(0,1);
+#endif
+""")
+def _lane() -> wp.vec2i: ...
+
+
+@wp.func_native(r"""
+#if defined(__CUDA_ARCH__)
+    return 2*group+((threadIdx.x&31)>>4);
+#else
+    return group;
+#endif
+""")
+def _world(group: int) -> int: ...
+
+
+@wp.func_native(r"""
+#if defined(__CUDA_ARCH__)
+    return 16;
+#else
+    return 32;
+#endif
+""")
+def _scan_width() -> int: ...
+
+
+@wp.func_native(r"""
+#if defined(__CUDA_ARCH__)
+    __syncwarp(0xffffu<<(threadIdx.x&16));
+#endif
+""")
+def _sync(): ...
+
+
+@wp.func_native(r"""
+#if defined(__CUDA_ARCH__)
+    __shared__ float values[2*896];
+    return reinterpret_cast<uint64_t>(values+896*((threadIdx.x&31)>>4));
 #else
     return reinterpret_cast<uint64_t>(malloc(896*sizeof(float)));
 #endif
@@ -103,11 +139,24 @@ _store_axis = kinetic_state._store_axis
 def _storage() -> wp.uint64: ...
 
 
-@wp.func_native(world_scan_publication._POSE_SCAN)
+def _paired_scan(source):
+    """Keep the original parent-jump arithmetic, with independent CUDA half-warps."""
+    cuda, cpu = source.split("#else\n", 1)
+    original = "const int lane=threadIdx.x&31;"
+    if cuda.count(original) != 1 or cuda.count(",source);") != cuda.count("__shfl_sync"):
+        raise RuntimeError("Original world scan lane/shuffle seam changed")
+    cuda = cuda.replace(original, "const int lane=threadIdx.x&15; const unsigned mask=0xffffu<<(threadIdx.x&16);")
+    cuda = cuda.replace("__shfl_sync(0xffffffffu,", "__shfl_sync(mask,")
+    cuda = cuda.replace(",source);", ",source,16);")
+    cuda = cuda.replace("__syncwarp(0xffffffffu);", "__syncwarp(mask);")
+    return cuda + "#else\n" + cpu
+
+
+@wp.func_native(_paired_scan(world_scan_publication._POSE_SCAN))
 def _scan_poses(address: wp.uint64, world: int, plan: KineticPlan): ...
 
 
-@wp.func_native(world_scan_publication._MOTION_SCAN)
+@wp.func_native(_paired_scan(world_scan_publication._MOTION_SCAN))
 def _scan_motion(address: wp.uint64, world: int, plan: KineticPlan): ...
 
 
@@ -186,7 +235,8 @@ def _primary_terms(
 @wp.func_native(r"""
     float* s=reinterpret_cast<float*>(address);
 #if defined(__CUDA_ARCH__)
-    const int lane=threadIdx.x&31,stride=32;
+    const int lane=threadIdx.x&15,stride=16;
+    const unsigned mask=0xffffu<<(threadIdx.x&16);
 #else
     const int lane=0,stride=1;
 #endif
@@ -201,7 +251,7 @@ def _primary_terms(
         }
     }
 #if defined(__CUDA_ARCH__)
-    __syncwarp();
+    __syncwarp(mask);
 #endif
     bool good=true;
     for(int dof=lane;dof<9;dof+=stride) {
@@ -219,7 +269,7 @@ def _primary_terms(
         }
     }
 #if defined(__CUDA_ARCH__)
-    __syncwarp();
+    __syncwarp(mask);
 #endif
     if(refresh)for(int e=lane;e<81;e+=stride) {
         const int row=e/9,col=e%9,src=plan.source.data[e];
@@ -234,7 +284,7 @@ def _primary_terms(
         for(int k=0;k<6;++k)good&=wp::isfinite(qd[k]);
     }
 #if defined(__CUDA_ARCH__)
-    good=__all_sync(0xffffffffu,good);
+    good=__all_sync(mask,good);
 #endif
     if(lane==0) {
         if(!good)cache.status.data[world]|=1;
@@ -264,6 +314,15 @@ def state_source():
     source = _replace(source, '    @wp.kernel(module="unique", enable_backward=False)\n', "")
     source = _replace(
         source,
+        "        world, logical_lane = wp.tid()\n",
+        """        group, logical_lane = wp.tid()
+        world = _world(group)
+        if world >= plan.body_ids.shape[0]:
+            return
+""",
+    )
+    source = _replace(
+        source,
         "        schedule: KineticSchedule,\n        current: CurrentKineticCache,\n        geometric: GeometricCache,",
         "        cache: KineticData,\n        requests: wp.array[int],\n        global_refresh: int,",
     )
@@ -282,7 +341,7 @@ def state_source():
 """,
     )
     source = source.replace("range(lane, 35, stride)", "range(lane, 21, stride)")
-    # Only the padded pose/motion scans require all32 lanes; physical accesses use13.
+    # Only pose/motion scans use padding; physical accesses retain all13 bodies.
     source = source.replace("range(lane, 32, stride)", "range(lane, 13, stride)")
     source = (
         source.replace("local >= 30", "local >= 11")
@@ -294,7 +353,7 @@ def state_source():
     source = _replace(
         source,
         "        _scan_poses(address, world, plan)",
-        """        for padding in range(lane, 32, stride):
+        """        for padding in range(lane, _scan_width(), stride):
             if padding >= 13:
                 _store_pose(address, padding, wp.transform_identity())
         _sync()
@@ -323,7 +382,7 @@ def state_source():
     source = _replace(
         source,
         "        _scan_motion(address, world, plan)",
-        """        for padding in range(lane, 32, stride):
+        """        for padding in range(lane, _scan_width(), stride):
             if padding >= 13:
                 _store_motion(address, padding, wp.spatial_vector())
         _sync()
@@ -355,7 +414,7 @@ def state_source():
     source = _replace(
         source,
         "    return kinetic_state",
-        """    name = "franka_kinetic_finish13_h81" if finish else "franka_kinetic_repair13_h81"
+        """    name = "franka_kinetic_finish13_h81_p16" if finish else "franka_kinetic_repair13_h81_p16"
     kinetic_state.__name__ = name
     kinetic_state.__qualname__ = name
     return wp.kernel(module="unique", enable_backward=False)(kinetic_state)""",
@@ -375,8 +434,8 @@ def get_state_kernel(finish):
 
 @wp.func_native(r"""
 #if defined(__CUDA_ARCH__)
-    __shared__ float values[120];
-    return reinterpret_cast<uint64_t>(values);
+    __shared__ float values[2*120];
+    return reinterpret_cast<uint64_t>(values+120*((threadIdx.x&31)>>4));
 #else
     return reinterpret_cast<uint64_t>(malloc(120*sizeof(float)));
 #endif
@@ -387,7 +446,8 @@ def _force_storage() -> wp.uint64: ...
 @wp.func_native(r"""
     float* s=reinterpret_cast<float*>(address);
 #if defined(__CUDA_ARCH__)
-    const int lane=threadIdx.x&31,stride=32;
+    const int lane=threadIdx.x&15,stride=16;
+    const unsigned mask=0xffffu<<(threadIdx.x&16);
 #else
     const int lane=0,stride=1;
 #endif
@@ -405,12 +465,12 @@ def _force_storage() -> wp.uint64: ...
         for(int k=0;k<6;++k){s[6*b+k]=v[k];good&=wp::isfinite(v[k]);}
     }
 #if defined(__CUDA_ARCH__)
-    __syncwarp();
+    __syncwarp(mask);
 #endif
     for(int component=lane;component<6;component+=stride)
         for(int b=10;b>0;--b)s[6*plan.body_parent.data[world*32+b]+component]+=s[6*b+component];
 #if defined(__CUDA_ARCH__)
-    __syncwarp();
+    __syncwarp(mask);
 #endif
     for(int i=lane;i<15;i+=stride) {
         const int dof=plan.dof_ids.data[world*21+i];
@@ -427,7 +487,7 @@ def _force_storage() -> wp.uint64: ...
         s[78+i]=tau;good&=wp::isfinite(tau);
     }
 #if defined(__CUDA_ARCH__)
-    __syncwarp();
+    __syncwarp(mask);
 #endif
     // Two independent original held-L triangular actions; no new factor or inverse.
     for(int family=lane;family<2;family+=stride) {
@@ -447,7 +507,7 @@ def _force_storage() -> wp.uint64: ...
         }
     }
 #if defined(__CUDA_ARCH__)
-    good=__all_sync(0xffffffffu,good);__syncwarp();
+    good=__all_sync(mask,good);__syncwarp(mask);
 #endif
     if(!good){if(lane==0)cache.status.data[world]|=2;return;}
     for(int i=lane;i<21;i+=stride) {
@@ -457,7 +517,7 @@ def _force_storage() -> wp.uint64: ...
         f.vhat.data[dof]=f.predictor_qd.data[dof]+acceleration*f.dt;
     }
 #if defined(__CUDA_ARCH__)
-    __syncwarp();
+    __syncwarp(mask);
 #endif
     for(int root=lane;root<2;root+=stride) {
         const int joint=plan.joint_ids.data[world*32+11+root];
@@ -474,7 +534,10 @@ def _predict(address: wp.uint64, world: int, plan: KineticPlan, cache: KineticDa
 @functools.cache
 def get_predictor_kernel():
     def predictor(plan: KineticPlan, cache: KineticData, force: ForceInput):
-        world, logical_lane = wp.tid()
+        group, logical_lane = wp.tid()
+        world = _world(group)
+        if world >= plan.body_ids.shape[0]:
+            return
         lanes = _lane()
         if lanes[1] == 1 and logical_lane != 0:
             return
@@ -482,7 +545,7 @@ def get_predictor_kernel():
         _predict(address, world, plan, cache, force)
         _release(address)
 
-    predictor.__name__ = "franka_kinetic_current_force_held9_6"
+    predictor.__name__ = "franka_kinetic_current_force_held9_6_p16"
     predictor.__qualname__ = predictor.__name__
     return wp.kernel(module="unique", enable_backward=False)(predictor)
 
@@ -804,11 +867,16 @@ class FrankaKineticState:
         data.materialize_body_inertia_terms = 0
         return data
 
+    def _launch_count(self):
+        """Use two independent CUDA worlds per CTA; retain serial CPU ownership."""
+        worlds = self.solver.world_count
+        return (worlds + 1) // 2 if self.solver.model.device.is_cuda else worlds
+
     def begin(self, state_in, state_aug, dt, global_refresh):
         self._validate_call(state_in, state_aug, dt)
         wp.launch_tiled(
             self.repair_kernel,
-            dim=[self.solver.world_count],
+            dim=[self._launch_count()],
             inputs=[
                 self.plan,
                 self._publication(state_in, state_aug, state_in, dt),
@@ -840,7 +908,7 @@ class FrankaKineticState:
         force.qdd, force.vhat, force.dt = state_aug.joint_qdd, solver.v_hat, dt
         wp.launch_tiled(
             self.predictor_kernel,
-            dim=[solver.world_count],
+            dim=[self._launch_count()],
             inputs=[self.plan, self.data, force],
             block_dim=32,
             device=solver.model.device,
@@ -857,7 +925,7 @@ class FrankaKineticState:
             raise RuntimeError("Franka kinetic integration requires disjoint generalized state banks")
         wp.launch_tiled(
             self.finish_kernel,
-            dim=[self.solver.world_count],
+            dim=[self._launch_count()],
             inputs=[
                 self.plan,
                 self._publication(state_in, state_aug, state_out, dt),

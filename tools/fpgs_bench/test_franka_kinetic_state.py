@@ -129,7 +129,7 @@ def launch_state(case, *, finish=False, refresh=True):
     output = case.output if finish else case.state
     wp.launch_tiled(
         owner.finish_kernel if finish else owner.repair_kernel,
-        dim=[case.model.world_count],
+        dim=[owner._launch_count()],
         inputs=[
             owner.plan,
             owner._publication(case.state, case.solver, output, case.dt),
@@ -329,7 +329,7 @@ def check_predictor(test, case, ref):
     expected_vhat[:, 9:12] += case.dt * np.cross(qd[:, 12:15], qd[:, 9:12])
     wp.launch_tiled(
         case.owner.predictor_kernel,
-        dim=[model.world_count],
+        dim=[case.owner._launch_count()],
         inputs=[case.owner.plan, case.owner.data, force],
         block_dim=32,
         device=case.device,
@@ -561,6 +561,20 @@ def check_factor(test, case):
 
 
 class TestFrankaKineticStateCPU(unittest.TestCase):
+    def test_paired16_native_mapping_and_launch_counts(self):
+        """Require all three paired owners and preserve one complete CPU world per item."""
+        capture = next(captures())
+        with np.load(capture["path"], allow_pickle=False) as snapshot:
+            case = bind_saved(snapshot, capture, "cpu")
+        for kernel in (case.owner.repair_kernel, case.owner.finish_kernel, case.owner.predictor_kernel):
+            self.assertTrue(kernel.key.endswith("_p16"), kernel.key)
+        self.assertEqual(case.owner._launch_count(), case.solver.world_count)
+        with patch.object(case.model, "device", SimpleNamespace(is_cuda=True)):
+            with patch.object(case.solver, "world_count", 5):
+                self.assertEqual(case.owner._launch_count(), 3)
+            with patch.object(case.solver, "world_count", 4):
+                self.assertEqual(case.owner._launch_count(), 2)
+
     def test_owner_api(self):
         """Require complete current/next ownership before retiring original producers."""
         module = importlib.import_module("newton._src.solvers.feather_pgs.franka_kinetic_state")
@@ -730,8 +744,8 @@ class TestFrankaKineticStateCUDA(unittest.TestCase):
         report_errors(self)
 
     def test_actual_steps_loaded_reset_masked_refresh_and_graph(self):
-        """Exercise actual eight-sweep dispatch, current/held factors, public outputs and reset/graph lifetimes."""
-        model = model_fixture(self.device, worlds=2)
+        """Check five actual worlds, independent half-warp repair/votes, and an absent paired tail."""
+        model = model_fixture(self.device, worlds=5)
         solvers = [make_solver(model, enabled) for enabled in (False, True)]
         self.addCleanup(lambda owners=solvers: wp.synchronize_device(owners[0].model.device))
         original, candidate = solvers
@@ -747,12 +761,15 @@ class TestFrankaKineticStateCUDA(unittest.TestCase):
             newton.eval_fk(model, pair[0].joint_q, pair[0].joint_qd, pair[0])
         contacts = loaded_contacts(model, states[0][0])
         seen = []
+        paired_launches = []
         old_launch, old_tiled = wp.launch, wp.launch_tiled
 
         def watch(original_launch):
             def launch(*args, **kwargs):
                 kernel = kwargs.get("kernel", args[0] if args else None)
                 seen.append(kernel.key)
+                if kernel.key.endswith("_p16"):
+                    paired_launches.append((kwargs["dim"], kwargs["block_dim"]))
                 return original_launch(*args, **kwargs)
 
             return launch
@@ -774,7 +791,9 @@ class TestFrankaKineticStateCUDA(unittest.TestCase):
                 solver.check_constraint_capacity()
                 self.assertFalse(solver._force_mass_update)
                 np.testing.assert_array_equal(solver._mass_update_requested.numpy(), [0])
-                np.testing.assert_array_equal(solver.mass_update_mask.numpy(), np.full(6, int(refresh), np.int32))
+                np.testing.assert_array_equal(
+                    solver.mass_update_mask.numpy(), np.full(model.articulation_count, int(refresh), np.int32)
+                )
                 for name, value in inputs.items():
                     np.testing.assert_array_equal(getattr(pair[source], name).numpy(), value)
                 np.testing.assert_array_equal(control.joint_f.numpy(), control_before)
@@ -798,8 +817,8 @@ class TestFrankaKineticStateCUDA(unittest.TestCase):
                 # H/momentum/public-velocity gates retain their 3e-6 bounds.
                 scaled(
                     self,
-                    getattr(states[1][destination], name).numpy().reshape(2, -1),
-                    getattr(states[0][destination], name).numpy().reshape(2, -1),
+                    getattr(states[1][destination], name).numpy().reshape(model.world_count, -1),
+                    getattr(states[0][destination], name).numpy().reshape(model.world_count, -1),
                     tolerance=7e-4,
                     name="matched8 forward " + name,
                 )
@@ -810,16 +829,22 @@ class TestFrankaKineticStateCUDA(unittest.TestCase):
         complete(1, 0, False)
         for size in (9, 6):
             np.testing.assert_array_equal(candidate.L_by_size[size].numpy(), held[size])
-        mask = wp.array([False, True], dtype=wp.bool, device=self.device)
+        mask_values = np.array([False, True, True, False, True])
+        mask = wp.array(mask_values, dtype=wp.bool, device=self.device)
+        generation = candidate._franka_kinetic_state.data.generation.numpy().copy()
         for solver, pair in zip(solvers, states, strict=True):
             values = pair[0].joint_q.numpy().copy()
-            values[23:32] += np.float32(0.001)
+            for world in np.flatnonzero(mask_values):
+                values[23 * world : 23 * world + 9] += np.float32(0.001)
             pair[0].joint_q.assign(values)
             solver.reset(pair[0], mask)
             solver._step, solver._force_mass_update = 3, False
             solver._mass_update_requested.fill_(1)
-        np.testing.assert_array_equal(candidate._franka_kinetic_state.geometry_valid.numpy(), [1, 0])
+        np.testing.assert_array_equal(candidate._franka_kinetic_state.geometry_valid.numpy(), ~mask_values)
         complete(0, 1, True)
+        np.testing.assert_array_equal(
+            candidate._franka_kinetic_state.data.generation.numpy(), generation + 1 + mask_values
+        )
         model.body_mass.assign(model.body_mass.numpy() * np.float32(1.01))
         model.body_inertia.assign(model.body_inertia.numpy() * np.float32(1.02))
         com = model.body_com.numpy().copy()
@@ -840,6 +865,8 @@ class TestFrankaKineticStateCUDA(unittest.TestCase):
         ):
             self.assertFalse(any(retired in key for key in seen), retired)
         self.assertTrue(any("franka_kinetic" in key for key in seen))
+        self.assertTrue(paired_launches)
+        self.assertTrue(all(dim == [3] and block == 32 for dim, block in paired_launches))
         contacts.rigid_contact_count.zero_()
         candidate._step = 8
         wp.synchronize_device(self.device)
@@ -847,7 +874,7 @@ class TestFrankaKineticStateCUDA(unittest.TestCase):
             candidate.seed_double_buffer_events()
             candidate.step(states[1][0], states[1][1], controls[1], contacts, DT)
             candidate.step(states[1][1], states[1][0], controls[1], contacts, DT)
-        for count in (0, 6, 0, 6):
+        for count in (0, 3 * model.world_count, 0, 3 * model.world_count):
             candidate.reset(states[1][0], mask)
             candidate._mass_update_requested.fill_(1)
             contacts.rigid_contact_count.fill_(count)
@@ -864,6 +891,27 @@ class TestFrankaKineticStateCUDA(unittest.TestCase):
                     ref["public"][..., half].reshape(-1, 3),
                     name="graph public velocity",
                 )
+        # A failed upper half-warp must not poison its valid lower neighbor.
+        owner, state = candidate._franka_kinetic_state, states[1][0]
+        owner.predict(state, candidate, controls[1], state.joint_qd, DT)
+        expected_vhat = candidate.v_hat.numpy().copy()
+        original_force = state.body_f.numpy().copy()
+        bad_force = original_force.copy()
+        bad_force[owner.host_plan["body_ids"][1, 9], 0] = np.nan
+        try:
+            state.body_f.assign(bad_force)
+            candidate.v_hat.fill_(123.0)
+            owner.predict(state, candidate, controls[1], state.joint_qd, DT)
+            np.testing.assert_array_equal(owner.status.numpy(), [0, 2, 0, 0, 0])
+            good_dofs = owner.host_plan["dof_ids"][[0, 2, 3, 4]].reshape(-1)
+            np.testing.assert_allclose(
+                candidate.v_hat.numpy()[good_dofs], expected_vhat[good_dofs], atol=1e-6, rtol=1e-6
+            )
+            np.testing.assert_array_equal(candidate.v_hat.numpy()[owner.host_plan["dof_ids"][1]], 123.0)
+        finally:
+            state.body_f.assign(original_force)
+            owner.status.zero_()
+            candidate.v_hat.assign(expected_vhat)
         report_errors(self)
 
 
