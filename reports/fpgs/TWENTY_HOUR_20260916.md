@@ -1841,3 +1841,177 @@ norm Armijo and false-fresh-stop allowance semantics explicit; frozen SHA
 `783517c6b3153af5564447c26a8cb0179ea2e1df4ec0421ec2a0d326e70f914a`.
 Helper and numerical policy remain as reviewed above; actual counters retain
 the correction from24 to28 reductions atq4 rather than the old card subtotal.
+
+## Coupled all2048 result and causal globalization correction, 22:49 UTC
+
+The unchanged broader CPU screen completes in about20s, with all2048 source,
+input and existing-reference guards passing twice. Zero hard feasibility or
+momentum failures;2017 pointwise checks pass,2032 results are closer in held-H,
+12 are genuinely farther,2029 improve natural residual. Candidate corrections
+7345 plus literal original fallback1454 total8799, versus24*2048 allowance.
+1982 results pass the physical stop. There are67 fallback cases:58 exhausted
+Newton-chord lines and nine true-linear forcing failures. Complete retained
+traces, not a newly solved reference, are in
+`/tmp/fpgs-krylov-chord-cpu-622baUWd/all2048/`; summary SHA
+`e5b622fdb05fb02b1000ca68eebf95d84ff4b3b70bacd0eddf4694ccf7ab14fc`,
+compressed trace SHA
+`8d7fb438fdc7f1b5894082c7fed526c3fb333df5893f5921ddf2ba4c935eee35`.
+
+Held-H scaled median/p99/max improve0.0063899/0.0319958/0.0557385 to
+0.000002626/0.0102766/0.0302664. Not every component improves: the worst MDP
+gap increases0.0794364->0.0897091, and RTX current48/world21 normal violation
+increases0.00435972->0.0343440 after terminal fallback. These tails remain
+explicit. All12 held-H losses occur in line-search fallback; the worst scaled
+increase is0.00270612 (RTX held48/world232).
+
+Counted products34.404153M equal15.97177 original action pairs versus84.268494M
+original EX1+recurrence products. Krylov q=9876, q-squared18332,7412 true
+linear checks,7971 line trials/626 rejections,2229 Gram builds/5183 reuses.
+This is not a complete instruction or timing model: independent review finds
+at least277462 additional retraction/slide products and72546 retraction roots
+omitted from the frozen counters. Those corrections alone raise the proxy to
+16.1006 pairs. Retained whitening/decode, additional scalar control, divisions,
+square roots and reductions are not assigned free wall time. The original
+product comparator also omits its scalar services.
+
+One exact replay of all67 guarded states matches each complete stored work
+record. All58 failed Newton directions have genuine descent slopes between
+-1.000 and-0.920 relative to squared merit. Endpoint retraction changes24--95%
+of their norm and makes50 chords ascend; the other eight need steps smaller
+than the allowed1/128. One-sided differences confirm the analytic derivative.
+The nine forcing failures exhaust the fixed eight Krylov steps, not a hidden
+rank/nonfinite failure. Root read the complete causal replay source. Artifact
+`/tmp/fpgs-krylov-chord-cause-HseE5K9Z/result.json`, SHA
+`3754e203c3bf029ae01ac75a5cb4c2e028e6dcd605ffeb13b64644a3071a3e5f`.
+
+The existing full-map projected endpoint supplies a merit-decreasing chord
+within the original eight trial values at all67 frozen failure states. This
+does not predict later trajectories. Root approves exactly one correction:
+only after eight failed Newton-chord trials, try the old proven direction
+pg-x with one additional physical response and up to eight same-Armijo trials.
+Because both endpoints are feasible, every chord point is feasible; the old
+per-trial cone retraction is redundant in exact arithmetic. This restores the
+prior safeguarded direction without its repeated line-trial physical operators.
+Keep forcing/rank/nonfinite/capacity guards, original24 committed corrections,
+initial forcing norm, cache epochs, fresh check and remaining-budget fallback.
+No native authority yet; freeze and test this one correction before judging
+complete cost or transfer to G1's separate original eight-pass allowance.
+
+## Corrected CPU checkpoint and bounded native cost authorization, 23:08 UTC
+
+The single projected-direction correction is preserved at clean pushed fork
+commit `c1b00ae5b4fe682481f574569f2307fa57b0020c`; initial CPU implementation
+remains independently preserved at `31db487eae7bb093cd25733db07bc18ff98edcfe`.
+Thirteen regression controls pass, including exhausted Newton trials followed
+by an accepted projected chord, both directions failing after a prior commit,
+zero allowance and nonfinite-trial routing. Full and owned-file pre-commit pass.
+Corrected helper SHA
+`05d97ac7c04e13b835235ceaf1cf2e9d2c97ff2d7191d58852f85f9aff5b269b`,
+tests `74446257733338d7a423aa73e04c5c615a450345b691483a91086c48b92cff0c`.
+Root and independent review read the complete changed source/card/tests.
+
+Corrected all2048 has zero hard failures,2029 pointwise passes,2041 closer
+held-H results and five genuine held-H regressions.2017 pass the fresh
+physical stop. Scaled H median/p99/max are2.312e-6/0.00584668/0.0268277.
+7625 candidate corrections plus607 original fallback passes total8232.
+There are137 safeguard directions,398 retry trials/120 accepts, with169956
+extra physical-response products.30 terminal fallbacks remain:17 line and
+13 forcing. Actual Krylov q10961/q-squared23919;9405 total line trials include
+1780 rejections. Counted products34.318395M equal15.93196 action pairs;
+known omissions add292802 products, raising the lower bound to16.06789.
+This remains a proxy, not a measured GPU gain.
+
+The correction DOES NOT pass the old all-case pointwise component gate.
+Of19 misses, nine follow line fallback, nine forcing fallback, and one
+exhausts all24 candidate corrections. Worst scaled H loss is GB current48/
+world168:0.0186851->0.0268277; RTX held48/world142 is0.0218130->0.0246959.
+The other three H losses are about4.51--5.11e-5. RTX current48/world21 normal
+violation increases0.00435972->0.0378981 after forcing fallback. RTX held32/
+world224 exhausts24 with complementarity0.0103814->0.0243626. Aggregate and
+MDP maxima improve, but do not hide these genuine finite-budget losses.
+Artifact `/tmp/fpgs-krylov-chord-safeguard-HV6mVO8t/all2048/summary.json`, SHA
+`c23294122313374c0873ddcce553af4e04a2a28692267a27dd77b4d396053ce5`;
+compressed trace SHA
+`815d93d4e78865c9c23bcd8f463a47898d29a21dc89c5f9601836673208b837a`.
+
+Root explicitly funds ONE default-off native COST-FALSIFICATION prototype,
+not promotion or full numerical qualification. The low coupled inner count,
+many physical stops and roughly2.45x counted-product retirement justify an
+early integrated measurement despite missing the optimistic planning proxy.
+Further pure-CPU globalization tuning before that measurement risks repeating
+the prior validation-first failure pattern. No third numerical policy is
+funded. Native hard physical, implementation, budget and lifecycle controls
+precede timing; known component/reference tradeoffs stay separately reported.
+Only a substantial complete saving would fund deeper numerical qualification.
+The first-integrated target is00:30 UTC; a miss must be explained, not hidden.
+
+Native tree `newton-fpgs-krylov-chord-native-20260916` branches from c1b00ae5.
+The linear fragment and outer owner are implemented independently; root adds
+the opt-in constructor and original-protocol observer. Active<=18 GMRES can
+remain within warp0 with two enclosing CTA handoffs; the old LU was already
+warp-local, so warp-locality itself is not a new saving. Additional scratch
+and resource pressure remain charged. Held L is never reused as a Jacobian
+scratchpad. Original row staging, whitening and publication are retained.
+The new observer explicitly labels the unresolved numerical qualification,
+checks actual kernel identity and unchanged24/settings, and keeps all original
+source/capacity guards. Three observer controls pass after a missing-module
+regression; root-owned pre-commit passes. No GPU work or new timing yet.
+
+## Native first cost and G1 transfer closure, 23:36 UTC
+
+The corrected policy's unchanged G1 transfer is not funded for native work.
+The initial 16-case port retained the borrowed ANY 64-row guard. Separately
+raising only that CPU admission to G1's original 100-row capacity exposed the
+four excluded cases, without changing runtime capacities, active18, or G1's
+eight-correction allowance. All four hard checks pass, but RTX current world7410
+held-H error worsens 0.00270058 to 0.0453928; the current/held RTX cases use all
+eight corrections, 34/46 Krylov steps and 45/68 line trials. The held case does
+improve H error 0.152670 to 0.0492656. Two GB cases stop after two corrections,
+but computed stopping is not identical to every independent diagnostic gate.
+This is a genuine quality/work limitation, not an unsupported-row success.
+External results SHA `60d471fd71e01749914f3497aa309447e710bd9e4bae1b367f20a8b1d5b00128`
+at `/tmp/fpgs-g1-krylov-chord-transfer-t231GMpM/RESULTS.md`.
+
+Native outer SHA `bca38cf5a2b624533f59f478d564831f1655a976d6bf89efb21b1974b8b2e0de`
+and linear SHA `d68534d5a8abe82901f63707d3d27a661296aec5344dcf75fa3b1debab964249`
+pass root and independent source reviews. The first AOT compile exposed Warp's
+int/float cast macros; static_cast fixes that exact failure. Explicit nonfinite
+map propagation prevents CUDA fmaxf from masking an invalid line trial.
+Full actual 72/32-capacity owners compile on both architectures: RTX tier32/48
+use 96/128 registers and 9572/11912 shared bytes; GB uses 97/128 registers and
+8272/11912 shared bytes. All four have zero stack/spill. No occupancy/stall
+claim follows from those static resources. AOT report SHA
+`c224ce8c1a2fa9a063699704cd5cd8f52acdc800db53129592f3391b9bebfaee`.
+
+Three linear CUDA controls pass on RTX. GB passes the same three plus actual
+original fallback with incoming impulse/delayed friction on both staged tiers.
+The existing GB saved probe completes all 1024 cases with zero hard failures,
+ten pointwise diagnostic records and four CPU translation H errors at most
+1.342e-5. The ten diagnostic IDs are a subset of the frozen CPU's eleven GB
+IDs, not evidence that all finite-budget components are qualified.
+
+Complete restored-operator replay is substantially slower:
+
+| GB saved partition | Original ms | Candidate ms | Original/candidate |
+|---|---:|---:|---:|
+| current32 | 0.050219 | 0.227130 | 0.2211x |
+| current48 | 0.054536 | 0.565464 | 0.0964x |
+| held32 | 0.050224 | 0.269453 | 0.1864x |
+| held48 | 0.054528 | 0.356765 | 0.1528x |
+
+Artifact `/tmp/fpgs-krylov-chord-native-probe-t9F4yYPG/gb-probe.log`.
+These 512-world, restored-output component timings are NOT whole-physics
+ratios. The worst frozen CPU current48 case already requires 15 corrections,
+80 Krylov steps, sum(q squared)=490 and 97 line trials. Native iteration blowup
+is not established. Serial reductions, control and long-tail completion are
+credible causes despite lower counted products; one phase/counter diagnostic
+is authorized to distinguish them before proposing a structural correction.
+
+The first whole GB attempt stopped at its initial idle guard: an unrelated Kit
+job occupied GB after preparation. No capture or whole timing was produced;
+failed artifact `fpgs-anymal-krylov-chord-whole-gb16k-20260916-01` is preserved.
+RTX also has unrelated simulator jobs. Root requested a reserved GPU and does
+not kill them or weaken the idle check. The root-owned runner now accepts one
+or two distinct GPUs, with the exact original sampling, source, budget,
+capacity and idle guards unchanged. Four observer/CLI controls pass; scoped
+pre-commit passes. This scheduling adaptation changes no Lab or solver code.
