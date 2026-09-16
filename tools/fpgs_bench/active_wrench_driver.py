@@ -30,7 +30,9 @@ def solve(J, L, diagonal, rhs, types, parents, mu, vhat, *, iterations=8):
     types, parents = np.asarray(types, int), np.asarray(parents, int)
     n, dofs = J.shape
     normals = np.flatnonzero(np.isin(types, (0, 3)))
-    roots = np.sqrt(diagonal)
+    # Saved diagonals are value oracles only after their response is produced.
+    # No unpublished/open value participates in global scaling or admission.
+    roots = np.full(n, np.nan)
     work = dict.fromkeys(
         (
             "committed",
@@ -55,6 +57,8 @@ def solve(J, L, diagonal, rhs, types, parents, mu, vhat, *, iterations=8):
             "processed_normal_probes",
             "stop_checks",
             "stop_full_residual_products",
+            "diagonal_requests",
+            "diagonal_rows",
         ),
         0,
     )
@@ -85,6 +89,17 @@ def solve(J, L, diagonal, rhs, types, parents, mu, vhat, *, iterations=8):
         work["full_residual_products"] += n * dofs
         return out, J @ out + rhs
 
+    def need_diagonal(rows):
+        for item in rows:
+            row = int(item)
+            work["diagonal_requests"] += 1
+            if np.isnan(roots[row]):
+                materialize((row,))
+                if not np.isfinite(diagonal[row]) or diagonal[row] <= 0:
+                    raise ValueError(f"Requested row {row} has no valid physical update diagonal")
+                roots[row] = np.sqrt(diagonal[row])
+                work["diagonal_rows"] += 1
+
     def mode_for(row, residual):
         if (
             types[row] == 0
@@ -99,33 +114,56 @@ def solve(J, L, diagonal, rhs, types, parents, mu, vhat, *, iterations=8):
         return "normal"
 
     velocity, residual = evaluate(impulse)
-    amplitude = float(np.max(np.abs(residual) / roots, initial=0.0))
-    amplitude_scale, work_scale = 1.0 + amplitude, 1.0 + amplitude**2
-    equation_tolerance = 1e-5 * amplitude_scale
+    equation_tolerance = 1e-5
+    # Frozen, post-hoc budget heuristic; this is NOT a convergence guarantee.
+    closing = normals[residual[normals] < -original.EVENT_TOL]
+    work["cold_estimated_slots"] = sum(1 if mode_for(int(row), residual) == "normal" else 2 for row in closing)
+    if work["cold_estimated_slots"] > iterations:
+        work["reason"] = "cold_budget"
 
     def stopped():
         work["stop_checks"] += 1
-        score = original.physical_metrics(J, diagonal, rhs, types, parents, mu, vhat, velocity, impulse)
-        work["stop_full_residual_products"] += 3 * n * dofs
-        negative = np.max(np.maximum(-residual[normals], 0.0) / roots[normals], initial=0.0)
-        return (
-            score["natural"] <= 1e-5
-            and negative <= 1e-5 * amplitude_scale
-            and score["complementarity"] <= 1e-5 * work_scale
-            and score["mdp"] <= 1e-5 * work_scale
-            and score["cone"] <= 1e-10
-        )
+        numerator, cone, mdp = 0.0, 0.0, 0.0
+        for row in normals:
+            cone = max(cone, -impulse[row])
+            if (residual[row] == 0 and impulse[row] >= 0) or (impulse[row] == 0 and residual[row] >= 0):
+                continue
+            need_diagonal((row,))
+            correction = impulse[row] - max(0.0, impulse[row] - residual[row] / diagonal[row])
+            numerator = max(numerator, roots[row] * abs(correction))
+        for row in np.flatnonzero(types == 2):
+            if row != parents[row] + 1:
+                continue
+            pair = slice(row, row + 2)
+            radius = max(0.0, mu[row] * impulse[parents[row]])
+            tangent, tangent_residual = impulse[pair], residual[pair]
+            length = np.linalg.norm(tangent)
+            cone = max(cone, length - radius)
+            mdp = max(mdp, abs(tangent @ tangent_residual + radius * np.linalg.norm(tangent_residual)))
+            if (radius == 0 and length == 0) or (np.all(tangent_residual == 0) and length <= radius):
+                continue
+            need_diagonal((row, row + 1))
+            trial = tangent - tangent_residual / max(diagonal[pair])
+            projected = trial * min(1.0, radius / max(np.linalg.norm(trial), 1e-300))
+            numerator = max(numerator, float(np.max(roots[pair] * np.abs(tangent - projected))))
+        negative = np.max(np.maximum(-residual[normals], 0.0), initial=0.0)
+        complementarity = np.max(np.abs(impulse[normals] * residual[normals]), initial=0.0)
+        return numerator <= 1e-5 and negative <= 3e-5 and complementarity <= 3e-5 and mdp <= 3e-5 and cone <= 1e-10
 
-    while work["committed"] < iterations:
+    while work["reason"] is None and work["committed"] < iterations:
         if driver is None:
             candidates = [int(r) for r in normals if r not in modes and residual[r] < -original.EVENT_TOL]
             if candidates:
+                need_diagonal(candidates)
                 driver = min(candidates, key=lambda r: residual[r] / roots[r])
                 modes[driver] = mode_for(driver, residual)
                 work["driver_admissions"] += 1
                 settling = False
-            elif not modes or stopped():
+            elif stopped():
                 work["reason"] = "physical_diagnostic_stop"
+                break
+            elif not modes:
+                work["reason"] = "unresolved_small_cold_residual"
                 break
             else:
                 settling = True
@@ -133,6 +171,7 @@ def solve(J, L, diagonal, rhs, types, parents, mu, vhat, *, iterations=8):
         blocks = [(r, modes[r], float(mu[r + 1]) if modes[r] != "normal" else 0.0) for r in sorted(modes)]
         ids = np.asarray([i for r, mode, _ in blocks for i in (range(r, r + 3) if mode != "normal" else (r,))], int)
         materialize(ids)
+        need_diagonal([r for r, _mode, _friction in blocks])
         work["active_rebuilds"] += 1
         work["max_active"] = max(work["max_active"], len(ids))
         Z = np.stack([z_cache[int(row)] for row in ids])
@@ -194,6 +233,9 @@ def solve(J, L, diagonal, rhs, types, parents, mu, vhat, *, iterations=8):
         if not restore:
             rate = float(response[driver] @ delta)
             entry["incoming_response_rate"] = rate
+            if rate < -original.RANK_TOL * diagonal[driver]:
+                work["reason"] = "negative_driver_response"
+                break
             if rate > original.RANK_TOL * diagonal[driver]:
                 bound = max(0.0, -residual[driver] / rate)
                 incoming_event = True
@@ -249,16 +291,21 @@ def solve(J, L, diagonal, rhs, types, parents, mu, vhat, *, iterations=8):
             bound, release, incoming_event = low, None, False
             proposal = probe(bound)
         # A finite polar path can cross rn=0 before its linear prediction.
-        if driver is not None and not restore and proposal[3][driver] > original.EVENT_TOL:
+        if driver is not None and not restore and proposal[3][driver] > equation_tolerance * roots[driver]:
             low, high = 0.0, bound
+            root_fraction = low
             for _ in range(24):
                 middle = (low + high) * 0.5
                 trial = probe(middle)
+                if abs(trial[3][driver]) <= equation_tolerance * roots[driver]:
+                    root_fraction = middle
+                    break
                 if trial[3][driver] >= 0:
                     high = middle
                 else:
                     low = middle
-            bound, release, incoming_event = low, None, True
+                root_fraction = low
+            bound, release, incoming_event = root_fraction, None, True
             proposal = probe(bound)
             blocked = proposal[-1]
         entry["advance"] = bound
@@ -321,6 +368,7 @@ def solve(J, L, diagonal, rhs, types, parents, mu, vhat, *, iterations=8):
             # Old equations and the new normal are checked on actual reconstructed
             # motion. Any drift remains unprocessed and needs a counted restore.
             check_blocks = [(r, modes[r], float(mu[r + 1]) if modes[r] != "normal" else 0.0) for r in sorted(modes)]
+            need_diagonal([r for r, _mode, _friction in check_blocks])
             check_x = original.encode(impulse, check_blocks, angles)
             check_values, _ = original.equations(check_x, check_blocks, residual, np.zeros((n, len(check_x))))
             check_scales = np.asarray(
@@ -340,11 +388,16 @@ def solve(J, L, diagonal, rhs, types, parents, mu, vhat, *, iterations=8):
             break
 
     work["working_set_response_rows"] = work["materialized_rows"]
+    work["working_set_diagonal_rows"] = work["diagonal_rows"]
     work["fallback_new_response_rows"] = 0
+    work["fallback_new_diagonal_rows"] = 0
     remaining = iterations - work["committed"]
     if work["reason"] not in (None, "physical_diagnostic_stop") and remaining:
         materialize(range(n))
         work["fallback_new_response_rows"] = work["materialized_rows"] - work["working_set_response_rows"]
+        work["fallback_new_diagonal_rows"] = n - work["diagonal_rows"]
+        work["diagonal_requests"] += n
+        work["diagonal_rows"] = n
         Y = np.stack([y_cache[row] for row in range(n)])
         (velocity, impulse, stats), counters = original.counted_reference(
             J, Y, diagonal, rhs, types, parents, mu, velocity, iterations=remaining, incoming=impulse

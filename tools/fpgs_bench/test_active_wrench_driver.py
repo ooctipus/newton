@@ -42,6 +42,22 @@ class TestActiveWrenchDriver(unittest.TestCase):
         self.check_normals(np.eye(2), [-2, -1], [2, 1])
         self.check_normals([[1, 0], [0.8, 0.6], [0.8, -0.6]], [-1, -0.9, -0.9], [0, 0.703125, 0.703125], release=True)
 
+    def test_small_cold_residual_still_checks_weighted_defect(self):
+        """A small raw residual is not proof that an unpublished correction is zero."""
+        result = driver.solve(
+            np.array([[1e-10]]),
+            np.eye(1),
+            np.array([1e-20]),
+            np.array([-5e-11]),
+            np.array([3]),
+            np.array([-1]),
+            np.zeros(1),
+            np.zeros(1),
+        )
+        self.assertEqual(result.work["reason"], "unresolved_small_cold_residual")
+        self.assertGreater(result.work["fallback_sweeps"], 0)
+        self.assertEqual(result.work["materialized_rows"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
