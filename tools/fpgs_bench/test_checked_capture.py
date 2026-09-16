@@ -96,6 +96,7 @@ class Pipeline:
         if broad_phase != "explicit":
             raise ValueError("original constructor rejects unsupported mode")
         self.shape_pairs_filtered = list(range(100))
+        self.model = model
         self.shape_pairs_max = min(100, broad_phase_output_max or 100)
         self.broad_phase_mode = broad_phase
         self.narrow_phase = SimpleNamespace(
@@ -106,8 +107,94 @@ class Pipeline:
             total_num_threads=128,
         )
 
+    def contacts(self):
+        """Create an unbound canonical buffer without a device runtime."""
+        return SimpleNamespace(rigid_contact_max=24, _rigid_sleep_owner=None)
+
 
 class TestCheckedCapture(unittest.TestCase):
+    def setUp(self):
+        """Keep legacy controls opt-out unless a test explicitly enables setup."""
+        environment = patch.dict(os.environ, {"FEATHER_PGS_CONTACT_ISLANDS": "0"})
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def test_contact_sleep_factory_initializes_before_return_and_checks_ownership(self):
+        """Bind the original canonical buffer during setup, preserving factory arguments."""
+        events = []
+
+        class ContactPipeline:
+            def contacts(self, *, marker=None):
+                events.append(("factory", marker))
+                return SimpleNamespace(rigid_contact_max=24, _rigid_sleep_owner=None)
+
+        pipeline = ContactPipeline()
+        pipeline.model = object()
+        owner = SimpleNamespace(contacts=None)
+        solver = fpgs()
+        solver.model, solver._contact_sleep = pipeline.model, owner
+
+        def prepare(contacts):
+            events.append(("prepare", contacts))
+            owner.contacts = contacts
+            contacts._rigid_sleep_owner = owner
+
+        solver.prepare_contact_sleep = Mock(side_effect=prepare)
+        manager = SimpleNamespace(_model=pipeline.model, _solver=solver, _collision_pipeline=pipeline)
+        report, saved = {}, []
+        original = ContactPipeline.contacts
+        try:
+            restore, metadata = checked.install_contact_sleep_setup(
+                ContactPipeline, report, lambda: saved.append(True), lambda: manager
+            )
+            self.assertIs(restore, original)
+            self.assertEqual(inspect.signature(ContactPipeline.contacts), inspect.signature(original))
+            contacts = pipeline.contacts(marker="unchanged")
+            manager._contacts = contacts
+            self.assertEqual(events, [("factory", "unchanged"), ("prepare", contacts)])
+            solver.prepare_contact_sleep.assert_called_once_with(contacts)
+            self.assertIs(owner.contacts, contacts)
+            result = metadata(manager)
+            self.assertEqual(result["setup_calls"], 1)
+            self.assertEqual(result["rigid_contact_max"], 24)
+            self.assertEqual(result["api"], "SolverFeatherPGS.prepare_contact_sleep")
+            self.assertTrue(result["check_pass"])
+            solver._contact_sleep = object()
+            with self.assertRaisesRegex(RuntimeError, "ownership"):
+                metadata(manager)
+            self.assertEqual(len(saved), 1)
+        finally:
+            ContactPipeline.contacts = original
+
+    def test_contact_sleep_setup_rejects_wrong_model_or_missing_owner(self):
+        """Refuse unrelated factories and unsupported solvers instead of timing an unbound owner."""
+        for wrong_model in (False, True):
+            with self.subTest(wrong_model=wrong_model):
+
+                class ContactPipeline:
+                    def contacts(self):
+                        return SimpleNamespace(rigid_contact_max=24, _rigid_sleep_owner=None)
+
+                pipeline = ContactPipeline()
+                pipeline.model = object()
+                solver = fpgs()
+                solver.model = pipeline.model
+                solver._contact_sleep = object() if wrong_model else None
+                solver.prepare_contact_sleep = Mock()
+                manager = SimpleNamespace(_model=object() if wrong_model else pipeline.model, _solver=solver)
+                report = {}
+                original = ContactPipeline.contacts
+                try:
+                    checked.install_contact_sleep_setup(
+                        ContactPipeline, report, lambda: None, lambda manager=manager: manager
+                    )
+                    with self.assertRaisesRegex(RuntimeError, "model|owner"):
+                        pipeline.contacts()
+                    solver.prepare_contact_sleep.assert_not_called()
+                    self.assertFalse(report["contact_sleep_setup"]["check_pass"])
+                finally:
+                    ContactPipeline.contacts = original
+
     def test_compat_install_model_admission_and_source_guard(self):
         """Install before execution and reject unsupported models or changed helper bytes."""
         for supported, drift in ((True, False), (False, False), (True, True)):
@@ -260,26 +347,45 @@ class TestCheckedCapture(unittest.TestCase):
 
     def test_actual_harness_execution_preserves_argv_and_requires_two_boundaries(self):
         """Exercise loading, forwarding, output, and strict boundary completion without a simulator."""
-        for boundary_count in (0, 1, 2, 3):
-            with self.subTest(boundary_count=boundary_count), tempfile.TemporaryDirectory() as tmp:
+        for boundary_count, contact_sleep in ((0, True), (1, True), (2, True), (3, True), (2, False)):
+            with (
+                self.subTest(boundary_count=boundary_count, contact_sleep=contact_sleep),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
                 root = Path(tmp)
                 lab, newton, output = root / "lab", root / "newton", root / "out"
                 path = lab / checked.HARNESS
                 path.parent.mkdir(parents=True)
                 path.write_text(
                     "import json, sys, newton\nfrom pathlib import Path\n"
+                    "from isaaclab_newton.physics import NewtonManager as manager\n"
                     "def _model_meta(physics): return {'state_finite': True}\n"
                     "def main():\n"
-                    "    newton.CollisionPipeline()\n"
+                    "    pipeline = newton.CollisionPipeline(manager._model)\n"
+                    "    pipeline.narrow_phase = manager._collision_pipeline.narrow_phase\n"
+                    "    for name in ('contact_reduction_config', '_body_pair_reducer', '_contact_matcher',\n"
+                    "                 'contact_matching', '_contact_sorter', 'deterministic'):\n"
+                    "        setattr(pipeline, name, getattr(manager._collision_pipeline, name))\n"
+                    "    manager._collision_pipeline = pipeline\n"
+                    "    manager._contacts = pipeline.contacts()\n"
                     f"    for _ in range({boundary_count}): _model_meta('feather_pgs')\n"
                     "    p = Path(sys.argv[sys.argv.index('--output') + 1])\n"
                     "    p.write_text(json.dumps({'argv': sys.argv[1:]}))\n"
                 )
                 solver = fpgs()
+                pipeline = collision_pipeline()
+                solver.model = pipeline.model
+                owner = solver._contact_sleep = SimpleNamespace(contacts=None)
+
+                def prepare(contacts, owner=owner):
+                    owner.contacts = contacts
+                    contacts._rigid_sleep_owner = owner
+
+                solver.prepare_contact_sleep = Mock(side_effect=prepare)
                 modules = {
                     "newton": SimpleNamespace(__file__=str(newton / "newton/__init__.py"), CollisionPipeline=Pipeline),
                     "isaaclab_newton.physics": SimpleNamespace(
-                        NewtonManager=SimpleNamespace(_solver=solver, _collision_pipeline=collision_pipeline())
+                        NewtonManager=SimpleNamespace(_model=solver.model, _solver=solver, _collision_pipeline=pipeline)
                     ),
                 }
                 forwarded = ["--output", str(output / "capture.json"), "--solver-attr", "pgs_iterations=8"]
@@ -299,7 +405,11 @@ class TestCheckedCapture(unittest.TestCase):
                 ]
                 original_argv = sys.argv
                 original_constructor = Pipeline.__init__
-                with patch.dict("sys.modules", modules):
+                original_factory = Pipeline.contacts
+                with (
+                    patch.dict("sys.modules", modules),
+                    patch.dict(os.environ, {"FEATHER_PGS_CONTACT_ISLANDS": "1" if contact_sleep else "0"}),
+                ):
                     if boundary_count == 2:
                         self.assertEqual(checked.main(argv), 0)
                         self.assertEqual(json.loads((output / "capture.json").read_text())["argv"], forwarded)
@@ -309,11 +419,19 @@ class TestCheckedCapture(unittest.TestCase):
                             checked.main(argv)
                 self.assertIs(sys.argv, original_argv)
                 self.assertIs(Pipeline.__init__, original_constructor)
+                self.assertIs(Pipeline.contacts, original_factory)
                 report = json.loads((output / "checks.json").read_text())
                 self.assertEqual(report["complete"], boundary_count == 2)
                 self.assertEqual(report["check_pass"], boundary_count == 2)
                 self.assertEqual(report["boundary_count"], boundary_count)
                 self.assertEqual(report["collision_capacity"]["pipelines"][0]["effective"], 32)
+                self.assertEqual(solver.prepare_contact_sleep.call_count, int(contact_sleep))
+                if contact_sleep:
+                    self.assertEqual(report["contact_sleep_setup"]["setup_calls"], 1)
+                    for entry in report["boundaries"][:2]:
+                        self.assertTrue(entry["contact_sleep_setup"]["check_pass"])
+                else:
+                    self.assertNotIn("contact_sleep_setup", report)
 
     def test_shell_forwards_profile_budget_and_uses_unchanged_analyzer(self):
         """Run the real shell against inert command stubs and inspect its exact argv."""

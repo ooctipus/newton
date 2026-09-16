@@ -20,9 +20,9 @@ from newton.tests.test_feather_pgs_prismatic_publication import _build_model, _s
 DT = 1 / 240
 
 
-def _physical_pair(test, device, *, leaves=108):
+def _physical_pair(test, device, *, leaves=108, floor=False):
     """Reuse the admitted contact fixture, now at a gravity/PD equilibrium."""
-    model = build_solver_fixture(device, leaves=leaves)
+    model = build_solver_fixture(device, leaves=leaves, floor=floor)
     model.gravity.assign(np.tile(np.array((0.0, 0.0, -1.0), np.float32), (model.gravity.shape[0], 1)))
     model.joint_q.zero_()
     model.joint_qd.zero_()

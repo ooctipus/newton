@@ -2719,6 +2719,12 @@ class CollisionPipeline:
                 this call. Ignored when speculative contacts are disabled. See
                 :ref:`Speculative contacts <speculative-contacts>`.
         """
+        sleep_owner = contacts._rigid_sleep_owner
+        if sleep_owner is not None:
+            # Reject unsupported modes and bindings before the owner snapshots
+            # or this pipeline mutates anything. Callers order all buffer use.
+            sleep_owner.before_collision(self, state, contacts)
+
         # Validate the buffer BEFORE any marker assignment, clear, or launch:
         # a rejected buffer must come back untouched, and a wrong-device buffer
         # must produce this ValueError rather than a cross-device Warp launch.
@@ -2959,6 +2965,9 @@ class CollisionPipeline:
                 shape_displacement=self._shape_displacement if speculative_active else None,
             )
 
+        if sleep_owner is not None:
+            sleep_owner.after_broad_phase(self, state, contacts)
+
         # Create ContactWriterData struct for custom contact writing
         writer_data = ContactWriterData()
         writer_data.contact_max = contacts.rigid_contact_max
@@ -3168,6 +3177,11 @@ class CollisionPipeline:
                 shape_body=model.shape_body,
                 device=self.device,
             )
+
+        if sleep_owner is not None:
+            # Rigid geometry, matching/reduction and augmentation are complete.
+            # Soft contacts remain a separate owner and are generated below.
+            sleep_owner.after_collision(self, state, contacts)
 
         # Generate soft contacts for particles and shapes
         if state.particle_q and self.soft_contact_max > 0 and self.soft_rigid_contact_pair_count > 0:

@@ -21,6 +21,7 @@ from .sleeping import _REST_HORIZON, _mark_contacts
 
 @wp.struct
 class ComponentData:
+    managed_sleep: int
     owned: wp.array[int]
     body: wp.array[int]
     joint: wp.array[int]
@@ -167,7 +168,8 @@ def prepare_components(
         target != data.expected_target_q[component] or target_velocity != data.expected_target_qd[component]
     )
     allowed = data.parameters[component].allow_sleep != 0
-    allowed = allowed and data.invalid_contact[0] == 0 and data.contact[component] == 0
+    allowed = allowed and data.invalid_contact[0] == 0
+    allowed = allowed and (data.managed_sleep != 0 or data.contact[component] == 0)
     allowed = allowed and wp.isfinite(position) and wp.isfinite(velocity) and wp.isfinite(target)
     allowed = allowed and target_velocity == 0.0 and joint_force[dof] == 0.0 and kinematic[dof] == 0
     for element in range(6):
@@ -294,26 +296,27 @@ def finish_components(
     if not was_asleep and kinematic[dof] == 0:
         velocity += acceleration * dt
         position += velocity * dt
-    scale = wp.length(p.axis)
-    speed = wp.abs(velocity) * scale
-    displacement = wp.abs(position - data.begin_q[component]) * scale
-    quiet = data.can_sleep[component] != 0
-    quiet = quiet and wp.isfinite(position) and wp.isfinite(velocity)
-    quiet = quiet and wp.isfinite(speed) and wp.isfinite(displacement)
-    quiet = quiet and speed <= tolerance and displacement <= tolerance * dt
-    quiet = quiet and wp.isfinite(acceleration) and wp.abs(acceleration) * scale * _REST_HORIZON <= tolerance
-    if quiet:
-        data.counters[component] = wp.min(data.counters[component] + 1, quiet_steps)
-        if data.counters[component] >= quiet_steps:
-            data.sleeping[component] = 1
-            velocity = 0.0
-            acceleration = 0.0
-            v_out[dof] = 0.0
-            state.tau[dof] = 0.0
-            state.v_hat[dof] = 0.0
-    else:
-        data.counters[component] = 0
-        data.sleeping[component] = 0
+    if data.managed_sleep == 0:
+        scale = wp.length(p.axis)
+        speed = wp.abs(velocity) * scale
+        displacement = wp.abs(position - data.begin_q[component]) * scale
+        quiet = data.can_sleep[component] != 0
+        quiet = quiet and wp.isfinite(position) and wp.isfinite(velocity)
+        quiet = quiet and wp.isfinite(speed) and wp.isfinite(displacement)
+        quiet = quiet and speed <= tolerance and displacement <= tolerance * dt
+        quiet = quiet and wp.isfinite(acceleration) and wp.abs(acceleration) * scale * _REST_HORIZON <= tolerance
+        if quiet:
+            data.counters[component] = wp.min(data.counters[component] + 1, quiet_steps)
+            if data.counters[component] >= quiet_steps:
+                data.sleeping[component] = 1
+                velocity = 0.0
+                acceleration = 0.0
+                v_out[dof] = 0.0
+                state.tau[dof] = 0.0
+                state.v_hat[dof] = 0.0
+        else:
+            data.counters[component] = 0
+            data.sleeping[component] = 0
     q_new[coordinate] = position
     qd_new[dof] = velocity
     state.qdd[dof] = acceleration
@@ -337,6 +340,91 @@ def finish_components(
         state.body_v[body] = body_v
         state.body_a[body] = body_a
         state.body_f[body] = body_f
+
+
+@wp.kernel(enable_backward=False)
+def assess_sleep_ready(
+    data: ComponentData,
+    q: wp.array[float],
+    qd: wp.array[float],
+    kinematic: wp.array[int],
+    v_out: wp.array[float],
+    dt: float,
+    tolerance: float,
+    quiet_steps: int,
+    collision_q: wp.array[float],
+    collision_valid: wp.array[int],
+    ready: wp.array[int],
+):
+    """Evaluate local quiet history before a complete island grants sleep.
+
+    A new contacted lease freezes the input pose, not the small proposed output
+    displacement. Its complete collision packet must have been generated at
+    exactly that input coordinate. This is a geometry-cache identity check,
+    not a requirement that independent numerical solvers be bit-identical.
+    """
+    component = data.owned[wp.tid()]
+    dof = data.dof[component]
+    if data.sleeping[component] != 0:
+        # Preserve the ordinary finish's defensive wake on an unexpected
+        # solved response, including nonfinite values. Island agreement must
+        # reject this lease before any grant can overwrite that response.
+        ready[component] = int(v_out[dof] == 0.0)
+        return
+    position = q[data.coordinate[component]]
+    velocity = qd[dof]
+    acceleration = (v_out[dof] - velocity) / dt
+    velocity += acceleration * dt
+    scale = wp.length(data.parameters[component].axis)
+    quiet = data.can_sleep[component] != 0 and kinematic[dof] == 0
+    quiet = quiet and wp.isfinite(position) and wp.isfinite(velocity) and wp.isfinite(acceleration)
+    quiet = quiet and wp.abs(velocity) * scale <= tolerance
+    quiet = quiet and wp.abs(dt * velocity) * scale <= tolerance * dt
+    quiet = quiet and wp.abs(acceleration) * scale * _REST_HORIZON <= tolerance
+    if quiet:
+        data.counters[component] = wp.min(data.counters[component] + 1, quiet_steps)
+    else:
+        data.counters[component] = 0
+    geometry_valid = data.contact[component] == 0
+    geometry_valid = geometry_valid or (collision_valid[component] != 0 and position == collision_q[component])
+    ready[component] = int(quiet and geometry_valid and data.counters[component] >= quiet_steps)
+
+
+@wp.kernel(enable_backward=False)
+def apply_sleep_grants(
+    data: ComponentData,
+    source: ParameterSources,
+    state: ComponentState,
+    q: wp.array[float],
+    approved: wp.array[int],
+    status: wp.array[int],
+    v_out: wp.array[float],
+):
+    """Freeze only islands whose geometry, forces and all members are ready."""
+    component = data.owned[wp.tid()]
+    asleep = approved[component] != 0 and status[0] == 0
+    if data.sleeping[component] != 0 and not asleep:
+        # A revoked island must accumulate fresh quiet history. Keep its
+        # solved velocity untouched for the normal integration below.
+        data.counters[component] = 0
+        data.can_sleep[component] = 0
+    data.sleeping[component] = int(asleep)
+    data.body_awake[data.body[component]] = int(not asleep)
+    data.joint_awake[data.joint[component]] = int(not asleep)
+    if asleep:
+        dof = data.dof[component]
+        v_out[dof] = 0.0
+        state.tau[dof] = 0.0
+        state.qdd[dof] = 0.0
+        state.v_hat[dof] = 0.0
+        # New grants enter finish's stationary shortcut, which copies public
+        # state without rebuilding this canonical spatial-velocity cache.
+        state.body_v[data.body[component]] = wp.spatial_vector()
+        data.expected_q[component] = q[data.coordinate[component]]
+        data.expected_qd[component] = 0.0
+        data.expected_target_q[component] = data.begin_target_q[component]
+        data.expected_target_qd[component] = data.begin_target_qd[component]
+        data.expected_valid[component] = 1
 
 
 @wp.kernel(enable_backward=False)
@@ -588,6 +676,7 @@ class AwakePipeline:
         self.solver = solver
         self.model = model = solver.model
         self.sleep = sleep = solver._sleeping
+        self.contact_sleep = None
         owned, bodies, joints, dofs, art, group_to_art, owned_art = _coverage
         direct = solver._compact_diagonal_mass_size
         device = model.device
@@ -707,6 +796,8 @@ class AwakePipeline:
                 outputs=[sleep.contact_component, sleep.invalid_contacts],
                 device=self.model.device,
             )
+        if self.contact_sleep is not None:
+            self.contact_sleep.begin(state_in, state_aug, control, contacts, dt)
         wp.launch(
             prepare_components,
             dim=len(self.data.owned),
@@ -730,6 +821,8 @@ class AwakePipeline:
 
     def finish(self, state_in, state_aug, state_out, dt):
         """Integrate and publish owned state with the current solved response."""
+        if self.contact_sleep is not None:
+            self.contact_sleep.prepare_finish(state_in, state_aug, state_out, dt)
         wp.launch(
             finish_components,
             dim=len(self.data.owned),
@@ -762,3 +855,5 @@ class AwakePipeline:
             )
         else:
             self.data.dirty_world.fill_(1)
+        if self.contact_sleep is not None:
+            self.contact_sleep.notify_model_changed(flags)

@@ -232,6 +232,7 @@ _PRISMATIC_PUBLICATION = os.environ.get("FEATHER_PGS_PRISMATIC_PUBLICATION", "0"
 _PRISMATIC_LINEAR_STATE = os.environ.get("FEATHER_PGS_PRISMATIC_LINEAR_STATE", "0") == "1"
 _SLEEPING = os.environ.get("FEATHER_PGS_SLEEPING", "0") == "1"
 _AWAKE_PIPELINE = os.environ.get("FEATHER_PGS_AWAKE_PIPELINE", "0") == "1"
+_CONTACT_ISLANDS = os.environ.get("FEATHER_PGS_CONTACT_ISLANDS", "0") == "1"
 _COMPACT_CONTACT_BOUNDARY = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_BOUNDARY", "0") == "1"
 _DEBUG_CACHE = os.environ.get("FEATHER_PGS_DEBUG_CACHE") == "1"
 _DEBUG_CACHE_MODE = os.environ.get("FEATHER_PGS_DEBUG_CACHE_MODE", "")
@@ -2476,6 +2477,7 @@ class SolverFeatherPGS(SolverBase):
 
         self._sleeping = None
         self._awake_pipeline = None
+        self._contact_sleep = None
         self._sleeping_body_q_source = None
         self._awake_direct_tau_kernel = None
         if _SLEEPING:
@@ -2491,6 +2493,28 @@ class SolverFeatherPGS(SolverBase):
             from .awake_pipeline import AwakePipeline  # noqa: PLC0415
 
             self._awake_pipeline = AwakePipeline.create(self)
+        if _CONTACT_ISLANDS and self._awake_pipeline is not None:
+            from .contact_sleep import ContactSleep  # noqa: PLC0415
+
+            self._contact_sleep = ContactSleep.create(self._awake_pipeline)
+            if self._contact_sleep is not None:
+                self._awake_pipeline.contact_sleep = self._contact_sleep
+                self._awake_pipeline.data.managed_sleep = 1
+
+    def prepare_contact_sleep(self, contacts: Contacts) -> None:
+        """Bind experimental contact sleeping before the first collision.
+
+        Call outside CUDA graph capture with the canonical Contacts allocation.
+        The enabled owner allocates history at exactly that buffer's capacity
+        and installs its collision hooks. The method is a no-op when contact
+        sleeping is disabled or unsupported by this solver configuration.
+
+        Collision, solve and graph replay must remain ordered by the caller.
+        Synchronized stream migration is supported; concurrent use of the
+        bound collision pipeline, solver or captured graphs is not.
+        """
+        if self._contact_sleep is not None:
+            self._contact_sleep._bind(contacts)
 
     def _update_kinematic_state(self) -> None:
         """Refresh cached kinematic flags and effective joint armature."""
@@ -2635,6 +2659,8 @@ class SolverFeatherPGS(SolverBase):
 
         if getattr(self, "_sleeping", None) is not None:
             self._sleeping.invalidate(world_mask)
+        if getattr(self, "_contact_sleep", None) is not None:
+            self._contact_sleep.invalidate(world_mask)
 
         if getattr(self, "_kinetic_world", None) is not None:
             self._kinetic_world.reset(state, world_mask)
@@ -9476,11 +9502,24 @@ class SolverFeatherPGS(SolverBase):
                 + ". Reconstruct capacity-dependent buffers and recapture graphs before retrying; "
                 "do not change capacity attributes on a live solver."
             )
+        if self._contact_sleep is not None:
+            self._contact_sleep.check_status()
         if os.environ.get("FEATHER_PGS_SLEEPING_DIAGNOSTICS") == "1":
             # Reuse the existing host observation boundary; no counters, host
             # reads or additional launches are inserted into timed graphs.
             sleeping = self._sleeping
-            snapshot = {"enabled": sleeping is not None, "awake_pipeline": self._awake_pipeline is not None}
+            snapshot = {
+                "enabled": sleeping is not None,
+                "awake_pipeline": self._awake_pipeline is not None,
+                "contact_islands": self._contact_sleep is not None,
+            }
+            if self._contact_sleep is not None and self._contact_sleep.cache is not None:
+                snapshot.update(
+                    asleep_contacts=int(np.count_nonzero(self._contact_sleep.contact_asleep.numpy())),
+                    collision_cached_contacts=int(
+                        np.count_nonzero(self._contact_sleep.cache.source_index.numpy() >= 0)
+                    ),
+                )
             if sleeping is not None:
                 eligible = sleeping.component_eligible.numpy() != 0
                 dofs = sleeping.component_dof.numpy()[eligible]
@@ -9644,6 +9683,9 @@ class SolverFeatherPGS(SolverBase):
             outputs=[contacts.rigid_contact_force],
             device=self.model.device,
         )
+
+        if self._contact_sleep is not None:
+            self._contact_sleep.publish_contacts(contacts)
 
         if contacts.force is not None:
             wp.launch(
@@ -11742,10 +11784,18 @@ class SolverFeatherPGS(SolverBase):
             enable_friction_flag = 1 if self.enable_contact_friction else 0
             contact_build_threads = min(contacts.rigid_contact_max, _CONTACT_BUILD_THREAD_CAP * _CONTACT_THREADS_X)
 
+            allocation_kernel = allocate_world_contact_slots
+            allocation_prefix = []
+            if self._contact_sleep is not None:
+                from .sleep_contact_rows import allocate_awake_world_contact_slots  # noqa: PLC0415
+
+                allocation_kernel = allocate_awake_world_contact_slots
+                allocation_prefix = [self._contact_sleep.contact_asleep]
             wp.launch(
-                allocate_world_contact_slots,
+                allocation_kernel,
                 dim=contact_build_threads,
                 inputs=[
+                    *allocation_prefix,
                     contacts.rigid_contact_count,
                     contact_build_threads,
                     contacts.rigid_contact_shape0,

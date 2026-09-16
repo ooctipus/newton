@@ -482,6 +482,9 @@ class Contacts:
 
         self.rigid_contact_max = rigid_contact_max
         self.soft_contact_max = soft_contact_max
+        # Explicit private owner; collision itself never registers a sleeping
+        # policy. The owner validates its binding before any buffer mutation.
+        self._rigid_sleep_owner = None
 
         self.rigid_contacts_pair_sorted = False
         """Provenance: whether the pipeline that last wrote this buffer sorts

@@ -19,7 +19,9 @@ import hashlib
 import importlib
 import inspect
 import json
+import os
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 from types import ModuleType
 
@@ -212,7 +214,9 @@ def check_collision(physics: str, manager, entry: dict) -> None:
         raise
 
 
-def install_boundary_check(harness: ModuleType, report: dict, save, get_manager, compat=None) -> None:
+def install_boundary_check(
+    harness: ModuleType, report: dict, save, get_manager, compat=None, contact_setup=None
+) -> None:
     """Wrap only the two existing post-warmup/post-profile metadata observations."""
     original = harness._model_meta
 
@@ -232,6 +236,8 @@ def install_boundary_check(harness: ModuleType, report: dict, save, get_manager,
                     raise RuntimeError("Requested MJWarp line-search fix does not support the actual model")
             check_solver(physics, manager._solver, entry)
             check_collision(physics, manager, entry)
+            if contact_setup is not None:
+                entry["contact_sleep_setup"] = contact_setup(manager)
             if physics == "feather_pgs":
                 entry["fused_contact_solve"] = fused_contact_metadata(manager._solver)
             if not isinstance(metadata, dict) or "error" in metadata or metadata.get("state_finite") is not True:
@@ -245,6 +251,81 @@ def install_boundary_check(harness: ModuleType, report: dict, save, get_manager,
             save()
 
     harness._model_meta = checked
+
+
+def install_contact_sleep_setup(pipeline_type, report: dict, save, get_manager):
+    """Call the explicit initializer as the canonical buffer is created, before capture."""
+    original = pipeline_type.contacts
+    record = report["contact_sleep_setup"] = {
+        "api": "SolverFeatherPGS.prepare_contact_sleep",
+        "setup_only": True,
+        "setup_calls": 0,
+        "check_pass": False,
+    }
+    binding = None
+
+    def metadata(manager):
+        if binding is None:
+            raise RuntimeError("Contact-sleep setup did not bind a canonical Contacts buffer")
+        expected_manager, pipeline, solver, owner, contacts, capacity = binding
+        if (
+            manager is not expected_manager
+            or manager._model is not pipeline.model
+            or manager._solver is not solver
+            or solver.model is not pipeline.model
+            or solver._contact_sleep is not owner
+            or manager._collision_pipeline is not pipeline
+            or manager._contacts is not contacts
+            or owner.contacts is not contacts
+            or contacts._rigid_sleep_owner is not owner
+            or contacts.rigid_contact_max != capacity
+        ):
+            raise RuntimeError("Contact-sleep setup ownership or capacity changed")
+        return dict(record)
+
+    @functools.wraps(original)
+    def prepared(pipeline, *args, **kwargs):
+        nonlocal binding
+        try:
+            contacts = original(pipeline, *args, **kwargs)
+            manager = get_manager()
+            if manager._model is not pipeline.model:
+                raise RuntimeError("Contact-sleep setup resolved a different manager model")
+            solver = manager._solver
+            owner = getattr(solver, "_contact_sleep", None)
+            prepare = getattr(solver, "prepare_contact_sleep", None)
+            if (
+                type(solver).__name__ != "SolverFeatherPGS"
+                or solver.model is not pipeline.model
+                or owner is None
+                or not callable(prepare)
+            ):
+                raise RuntimeError("Contact-sleep setup requires the actual enabled solver owner and explicit API")
+            if binding is not None:
+                raise RuntimeError("Contact-sleep setup canonical ownership changed through another factory call")
+            capacity = int(contacts.rigid_contact_max)
+            record["setup_calls"] += 1
+            record["rigid_contact_max"] = capacity
+            prepare(contacts)
+            if (
+                manager._solver is not solver
+                or solver._contact_sleep is not owner
+                or owner.contacts is not contacts
+                or contacts._rigid_sleep_owner is not owner
+                or contacts.rigid_contact_max != capacity
+            ):
+                raise RuntimeError("Contact-sleep initializer changed ownership or capacity")
+            binding = manager, pipeline, solver, owner, contacts, capacity
+            record["check_pass"] = True
+            return contacts
+        except BaseException as error:
+            record.update(check_pass=False, error=repr(error))
+            raise
+        finally:
+            save()
+
+    pipeline_type.contacts = prepared
+    return original, metadata
 
 
 def install_broad_phase_limit(pipeline_type, limit: int, report: dict, save):
@@ -363,7 +444,7 @@ def main(argv: list[str] | None = None) -> int:
         checks.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
 
     previous_argv = sys.argv
-    pipeline_type, original_constructor = None, None
+    restores = ExitStack()
     save()
     try:
         path = lab / HARNESS
@@ -387,9 +468,17 @@ def main(argv: list[str] | None = None) -> int:
             original_constructor = install_broad_phase_limit(
                 pipeline_type, options.broad_phase_output_max, report, save
             )
-        install_boundary_check(
-            harness, report, save, lambda: importlib.import_module("isaaclab_newton.physics").NewtonManager, compat
-        )
+            restores.callback(setattr, pipeline_type, "__init__", original_constructor)
+
+        def get_manager():
+            return importlib.import_module("isaaclab_newton.physics").NewtonManager
+
+        contact_setup = None
+        if os.environ.get("FEATHER_PGS_CONTACT_ISLANDS") == "1":
+            pipeline_type = runtime_newton.CollisionPipeline
+            original_factory, contact_setup = install_contact_sleep_setup(pipeline_type, report, save, get_manager)
+            restores.callback(setattr, pipeline_type, "contacts", original_factory)
+        install_boundary_check(harness, report, save, get_manager, compat, contact_setup)
         sys.argv = [str(path), *forwarded]
         harness.main()
         if report["boundary_count"] != 2 or not all(entry["check_pass"] for entry in report["boundaries"]):
@@ -411,8 +500,7 @@ def main(argv: list[str] | None = None) -> int:
         report.update(complete=False, check_pass=False, error=repr(error))
         raise
     finally:
-        if original_constructor is not None:
-            pipeline_type.__init__ = original_constructor
+        restores.close()
         sys.argv = previous_argv
         save()
 

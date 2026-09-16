@@ -345,7 +345,7 @@ def geometry_reference(data):
     return results
 
 
-def build_solver_fixture(device, *, leaves=108):
+def build_solver_fixture(device, *, leaves=108, floor=False):
     """Build admitted two-world prismatic branches plus serial-six live contact shapes."""
     template = newton.ModelBuilder()
     inertia = wp.mat33(0.04, 0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0, 0.06)
@@ -388,6 +388,14 @@ def build_solver_fixture(device, *, leaves=108):
             template.add_shape_sphere(body=body, radius=0.01)
         parent = body
     template.add_articulation(joints)
+    if floor:
+        template.add_shape_box(
+            body=root,
+            xform=wp.transform(wp.vec3(0.005, 0.0, 0.18), wp.quat_identity()),
+            hx=0.04,
+            hy=0.025,
+            hz=0.01,
+        )
     builder = newton.ModelBuilder(gravity=(0.4, -0.9, -9.2))
     builder.add_world(template)
     builder.add_world(template)
