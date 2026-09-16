@@ -496,3 +496,281 @@ for independent triple roots, a CTA join across triple boundaries, and two
 matrix-free actions per pass. First source checkpoint06:35 UTC. Early complete
 owner timing decides whether further convergence work can have a large payoff;
 the old solver remains accepted and no new whole-task gain is claimed.
+
+## Concurrent result and numerical interpretation, 06:20 UTC
+
+The frozen native concurrent owner is `coupled_jacobi.py`, SHA256
+`3da318644dad50d0f56955bd72ad042ab07ca21cfc7dc85d3b13f0098c75cf3d`.
+It is selected only by `FEATHER_PGS_COUPLED_JACOBI=1`. Five focused CPU checks
+and four offline architecture/tier compilations pass. Original producers,
+decode and unsupported fallback remain; the ordered module stays frozen.
+
+Saved512 replay remains slower: original/candidate RTX0.1544--0.2098x,
+GB0.1757--0.1817x. Hard physical, metadata, unowned and read-only checks pass;
+eleven RTX and nine GB states fail the old pointwise nonworsening comparisons.
+Logs `/tmp/fpgs-jacobi-native-paired512-20260916-jrrZT5/gpu{0,1}.log`.
+The same restore-copy charge and small-batch limitations apply as above.
+
+One full-size discovery confirms that this is not just a512-world tail or
+underfill artifact. Original unchanged driver, fixed Lab,16,384 environments,
+200 warmup,40 wall/40 graph steps, original24/8 iteration allowances,
+two substeps and decimation4; identical public capacities72 dense/32 MF,
+raw212,992 and broad294,912. All four runs and eight boundaries pass the
+finite/capacity/source checks; these do not prove numerical equivalence.
+
+| ms/environment step | RTX original | RTX concurrent | GB original | GB concurrent |
+| --- | ---: | ---: | ---: | ---: |
+| Whole physics |9.408004|17.399814|9.624115|20.775221|
+| Environment wall |17.286177|24.850491|17.749275|28.347603|
+
+Whole physics original/candidate is0.5407x RTX/0.4632x GB. This is a measured
+loss, not an accepted runtime regression: the candidate remains default-off.
+Manifest `/tmp/fpgs-coupled-jacobi-whole-paired16k-20260916-01/manifest.json`;
+root81722 reaped exit0 and both devices verified idle. No repeated timing of
+this losing implementation is funded. A three-step node diagnosis and a
+source-exact clock-only observer locate the cause separately from graph timing.
+
+### Physical comparison must not become a stronger contract than requested
+
+The pointwise comparison is not a complete ordering of physical accuracy.
+Using already-saved, converged full-law references (no new production budget),
+the permanent-latch CPU result is closer in held-mass velocity norm on
+**all2,048 cases**. Scaled error uses
+norm(L^T(v-v_ref))/(1+norm(L^T v_ref)); median improves0.00638992 to8.17796e-6,
+p99 0.0319958 to0.00226889, maximum0.0557385 to0.0164769.
+No case exceeds the original scaled error plus3e-5. Natural error improves
+in2,047 cases; the remaining increase is1.09e-5, below the existing3e-5
+absolute allowance. The eighteen original component failures remain recorded,
+not silently relabeled as passes or automatically called physical bugs.
+
+The eighteen also improve against the independently qualified semismooth
+reference: candidate/original velocity-error ratio median0.18123, max0.62948.
+This supports genuinely better overall velocity convergence despite component
+tradeoffs. It does not prove uniqueness, long-horizon behavior or native
+performance. Exact input/source/reference guards pass. Artifacts:
+
+- `jacobi_reference_comparison.json`, SHA256
+  `a47918f0ad3a4192a7abeb75a2d81d6b88e1239989ebd1dc8716e18c645ea460`.
+- `jacobi_all_reference_comparison.json`, SHA256
+  `6cee6f322321131158fb81860a7c4789f3519d80d445df8306d2c89979c77487`.
+
+Local Jacobian diagnosis at passes23/24 finds contractive half-step maps in
+all eighteen cases, final spectral radii0.525--0.964. Finite differences at
+h/2h agree to1.60e-9 relative; an isolated sticking derivative agrees with
+H^-1 CFM to1.32e-10. These are finite-budget slow modes, not a final local
+half-step instability. A single cause-directed per-pass relaxation-recovery
+policy improves old pointwise counts to2,041/2,048, but introduces **five
+genuine reference-distance regressions**. It is therefore closed without
+native work. This is direct evidence that optimizing the pointwise pass count
+alone would select the wrong numerical policy. Artifact
+`jacobi_recover_qualification.json`, SHA256
+`2d2a505ead7ddb8e708810e4648affb284d8dba482f69ed0e047dd50ba217426`.
+
+## Next bounded structural card: joint impulse/multiplier iteration
+
+CPU-only funding at06:15; native funding remains conditional on measured
+phase costs and numerical evidence. No warm-start parameter grid is funded.
+The frozen full-root algorithm spends80% of its199,049 scalar evaluations
+after the first global pass. Merely improving seven-probe roots to roughly
+three evaluations would cut about44% of total probes, insufficient by itself
+to promise the required complete-owner saving. Do not call that a2x result.
+
+Instead remove the nested local convergence loop: retain contact multiplier
+gamma as solver state alongside lambda and take one Newton multiplier action
+per global pass. Evaluate the clamped current gamma once, derive its update
+from that same2x2 inverse, and publish that current trial. Rebuild the analytic
+upper bound from current bias; never reuse stale bracket signs. Exact open,
+frictionless and gamma-zero sticking branches remain. Unsafe matrices,
+nonfinite actions or nonnegative derivatives take the original local metric
+transaction. An unfinished safe local solve is not mislabeled as unsafe.
+
+Only inward coupled cone/normal repair is permitted; no outward repair.
+Damp BOTH lambda and gamma with the same permanent-half policy. The resulting
+global physical residual controls early stopping, with the same3e-5 FP32 cone
+criterion and unchanged other bounds. Original8/24 maximum global passes,
+current rows, held factors and two factor-space operator actions/pass remain. At a genuine
+joint fixed point, proximal CFM times delta-lambda vanishes and the original
+Coulomb law is recovered; this is not a convergence proof for finite passes.
+
+The hypothesis is a substantially smaller, one-evaluation contact update with
+less nested work and shorter native state lifetimes, not cheaper proof code.
+Extra outer passes, multiplier state, repair, safeguards, physical projections
+and unchanged producers/publication must all be charged. Success still means
+at least1ms saved against accepted whole physics, not against17.40ms. First
+CPU/source checkpoint06:45, hard07:00 without a new diagnosed cause. Freeze
+before full2048 reference/physical checks; do not fund native if that fails
+or measured remaining cost makes the complete-owner target implausible.
+
+## Complete cost closure, 06:38 UTC
+
+The source-matched three-step node audit includes all12 physics roots,
+process-correlated kernels and memory, and interval overlap. Actual live
+candidate keys end in `_ccj24` at72/32 capacities; each32/48 tier executes
+eight times per environment step. Exclusive complete solver cost rises
+**4.079856 to11.838243ms RTX**, **4.431955 to15.500263ms GB**. Retained work
+is5.054821 to5.021173ms RTX and5.050209 to5.232479ms GB. Thus the large loss
+is inside the replacement owner, not missing activation or collateral
+collision work. RTX registers are122/129 versus86/80; GB124/128 versus80/80.
+No local-memory spill is reported. These allocations do not establish
+achieved occupancy or a hardware ceiling.
+
+Node evidence:
+`/tmp/fpgs-coupled-jacobi-nodes-paired16k-20260916-01/strict_audit02.json`.
+It reuses the unchanged strict reader, SHA256
+`e76d53f685871f8d3e38a221ce89485d3d87014b9c8af1f6ac22e10af8e74dc6`.
+The initial audit command had a mistyped hash and exited before analysis;
+the corrected02 output is the evidence, not its empty predecessor.
+
+The output-only clock observer strips to the frozen native source. All2,048
+physics outputs match byte-exactly on both cards; immutable inputs and unowned
+counter rows pass. Actual9,291 passes match CPU, with1,939 physical stops and
+no admission failures. Root probes199,061 versus CPU199,049 are separately
+recorded, not assumed identical. Within-world clock fractions are:
+
+| Phase | RTX | GB |
+| --- | ---: | ---: |
+| Original row staging plus local preparation |23.79%|24.06%|
+| Concurrent proposals and join |48.67%|49.43%|
+| Two matrix-free actions |3.11%|3.11%|
+| Physical merit/stop and commit |17.55%|17.24%|
+| Decode/publication |6.88%|6.16%|
+
+These are sums of diagnostic within-world cycle windows, NOT GPU-wall
+fractions or an Amdahl proof. The observer changes register allocation and
+is not used for latency claims. It nonetheless falsifies the idea that almost
+all work consists of repeated local root iterations. Its preparation and
+merit work remain substantial, and the true whole owner needs roughly74%
+retirement to meet the original one-millisecond saving milestone.
+Source `/tmp/fpgs-jacobi-phase-uhgzy9Lf/jacobi_phase.py`, SHA256
+`28cf624ff6956b0e8e08692123d4a45578c3a1eba590de6d4c09d67c67c363da`;
+logs `/tmp/fpgs-jacobi-phase-paired512-20260916-FeC9sJ/gpu{0,1}.log`.
+Root1092/51175 reaped0; all exact64-bit phase sums pass.
+
+The joint-state CPU source freezes at
+`40fe61ee36418748a5c49fceb9c32c198fafb6bbcff8d98e81e86b5402f1dba6`.
+Five focused controls pass, including one-evaluation semantics, unfinished
+feasibility, exact stick/slip fixed points and matched auxiliary-state damping.
+Full2048:2,032 old pointwise passes; all2,048 remain closer to the converged
+reference in held-mass velocity error, with no hard physical failure or unsafe
+fallback. Local evaluations fall199,049 to63,510, but passes rise9,291 to15,056
+(median6,p90=14), operator products10.616M to16.501M and physical projections
+294,884 to458,358. G1 remains10/16 pointwise with63 versus62 passes.
+Result `joint_state_qualification.json`, SHA256
+`eb2ea3f2aef58d6e1a1a3c9e06137ac1a0d9fde5ebfa7498da267f218bb57502`.
+
+**No native funding for this joint-state mapping.** It retains all current
+row whitening, Schur/eigenvalue preparation, physical merit and decode, while
+increasing the non-root iterative work. A lower register peak is possible but
+unmeasured; it is not sufficient evidence for the required further acceleration
+of all retained phases. No parameter or launch-grid sweep is funded.
+
+Before choosing another representation, prior-art review also closes a blind
+repeat of ANYmal leaf-first/root-last9-support whitening. It already replaced
+canonical dense H/L, predictor, whitening, exact majorizer, recurrence and
+decode with direct L117. Its contiguous-panel correction removed repeated
+tag/membership walks but still lost9.295346 to11.759834ms RTX and9.508051
+to11.425918ms GB. It was not merely a duplicate conversion layered on top of
+the old producer. Exact closure and manifest remain in
+`newton-fpgs-anymal-contiguous-response-20260914/reports/fpgs/ANYMAL_CONTIGUOUS_RESPONSE_20260914.md`
+and `/tmp/fpgs-anymal-contiguous-live-paired16k-20260914-01/manifest.json`.
+
+## Original-owner cost and reference-based reopening, 06:55 UTC
+
+The output-only original-owner observer preserves all 2,048 native outputs
+byte-exactly, immutable inputs and unowned rows. Its exact-limb phase sums pass.
+Within-world cycle fractions (not GPU-wall fractions) are:
+
+| Original phase | RTX | GB |
+| --- | ---: | ---: |
+| Current row staging, geometry and whitening | 31.325% | 33.976% |
+| Exact all-pair majorizer and bias preparation | 10.563% | 10.540% |
+| Original Nesterov loop | 48.588% | 46.444% |
+| Decode/publication | 9.524% | 9.040% |
+
+Mean executed passes are 23.96289/23.94629 of the unchanged maximum 24.
+Source `/tmp/fpgs-original-any-phase-WN0VI0hM/original_phase.py`, SHA256
+`5f6834e9259bdbfc9d3812953f8e00dc915dec62eed37122ba935183b7de93ae`;
+logs `/tmp/fpgs-original-phase-paired512-20260916-An6F0B/gpu{0,1}.log`.
+Both GPU sessions exited zero. These measurements do not support an EX1-only
+structural experiment: its operation count overstates its cost ownership.
+
+The reference-distance finding justified reopening the exact older AA4 CPU
+result, not rerunning or modifying that algorithm. Its saved impulses improve
+held-H reference distance in 2,046/2,048 cases, including 14 of the original
+15 pointwise misses. Two genuine scaled-error regressions remain: GB current
+tier48 world168 rises 0.0186851 to 0.0441590, and world494 rises 0.0101604 to
+0.0103660. The latter passed the original component gates. All original
+2,033/15 labels remain recorded. Median error improves 0.00638992 to
+0.0000121666; p99 improves 0.0319958 to 0.0000933164. This is not an
+all-cases accuracy win like permanent-latch Jacobi.
+
+AA4 was CPU-only, not a native measured loss. The exact source is
+`/tmp/fpgs-anymal-aa4-natural-wcfB7tcL/control.py`; the new reconstruction uses
+existing saved candidate impulses and converged references, without new
+candidate or reference solves. Artifact
+`/tmp/fpgs-anymal-aa4-reference-9DWofRRJ/reference_comparison.json`, SHA256
+`2444ec35de66f91121f365c153aaf32693c56bb8576af77b164598f1e6b6c0de`.
+
+Cost review also rejects describing AA4 as cheap history attached to the
+original EX1 recurrence. It uses its own diagonal-normal/spectral-tangent
+natural map; original EX1 is built only for nine fallback cases. Literal work
+averages 33.374 residual evaluations/world with 30,089 small solves. Exact
+accepted-map carry, not implemented, could reduce evaluations to 17.7075/world;
+its modeled 55.327M products already charge history and fallback. Retaining
+EX1 up front adds 32.478M products, exceeding the original 84.268M before
+additional projections, history traffic, reductions and tiny solves. There
+is no credible one-millisecond complete-owner case for that combination.
+No native AA4 implementation or history-size grid is funded.
+
+The terrain planar-patch screen found real whole-footprint coverage, not
+whole-mesh coverage: 22.76%/22.96% of saved post-height-cull triangles belong
+to wholly contained, bit-equal horizontal patches. This predates current
+geometric/finite-path filtering and is not query-time-weighted evidence.
+Current finite-query cost alone is below the 1.57ms milestone; retiring that
+milestone from all queries would require about 72% time-weighted coverage
+before metadata and replacement-plane cost. Current-height mutation also
+requires ordered invalidation or charged metadata rebuilding. No such
+funding case was established; no new terrain implementation was started.
+
+Next bounded checks target repeated original iteration work: actual temporal
+warm-start support and prior art; physical stopping using an already available
+residual; and whether the multi-warp owner has a previously untested way to
+remove synchronization. These are independent read-only/CPU screens, not
+permission for a parameter or layout grid. Preserve current producers unless
+their replacement is the explicit, costed hypothesis.
+
+## Cheap natural-map recurrence: bounded CPU card, 07:00 UTC
+
+CPU feasibility was authorized before implementation. Retain original current
+rows, held factors, one pair of factor-space actions per pass, adaptive restart
+and maximum 24 passes. Use AA4's diagonal normal step and common spectral
+tangent step, but no history solve, Armijo search, contact root or all-pair
+majorizer. Common tangent scaling has the correct radial Coulomb fixed point;
+the inherited unequal tangent steps generally do not. This is a previously
+documented solver-parity limitation, not a newly discovered contact bug.
+
+Recover the current feasible iterate's residual from the already-computed
+extrapolated residual: if y=(1+beta)x-beta*x_previous, then
+r(x)=(r(y)+beta*r(x_previous))/(1+beta). Bias is included on both sides.
+Store one residual vector and the beta that actually formed y. Check the
+existing AA4 physical bounds on current x before proposing another update;
+no extra operator is donated to the 24-pass allowance. The previous residual
+error multiplier is below one half, but fresh FP32 cancellation still needs
+independent physical checks. The original impulse-change exit is separately
+recorded, not treated as a physical certificate.
+
+The cost hypothesis is removal of quadratic majorizer preparation plus many
+of the original nearly 24 passes, without nested solves or history products.
+Added residual carry, physical projection/vote, local spectral preparation
+and unchanged row producers/decode must be charged. The same at-least-1ms
+whole-physics milestone applies; majorizer removal alone cannot fund it.
+
+There is a known general stability counterexample: three duplicate normal
+rows with unit coupling and diagonal step one cycle even without momentum.
+Original adaptive restart is not a substitute for AA4's globalization. Thus
+this is a bounded feasibility test, not a convergence claim or promotion
+proposal. Include the counterexample, residual-history identity and isolated
+anisotropic sliding in regression-first controls. Start with eight saved
+cases; expand only if useful. Stop on instability before funding native work;
+no damping, step-size or line-search grid follows. First CPU checkpoint within
+25 minutes; root continues owning all GPU execution.
