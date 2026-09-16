@@ -231,6 +231,7 @@ _FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
 _PRISMATIC_PUBLICATION = os.environ.get("FEATHER_PGS_PRISMATIC_PUBLICATION", "0") == "1"
 _PRISMATIC_LINEAR_STATE = os.environ.get("FEATHER_PGS_PRISMATIC_LINEAR_STATE", "0") == "1"
 _SLEEPING = os.environ.get("FEATHER_PGS_SLEEPING", "0") == "1"
+_AWAKE_PIPELINE = os.environ.get("FEATHER_PGS_AWAKE_PIPELINE", "0") == "1"
 _COMPACT_CONTACT_BOUNDARY = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_BOUNDARY", "0") == "1"
 _DEBUG_CACHE = os.environ.get("FEATHER_PGS_DEBUG_CACHE") == "1"
 _DEBUG_CACHE_MODE = os.environ.get("FEATHER_PGS_DEBUG_CACHE_MODE", "")
@@ -2474,6 +2475,7 @@ class SolverFeatherPGS(SolverBase):
                 )
 
         self._sleeping = None
+        self._awake_pipeline = None
         self._sleeping_body_q_source = None
         self._awake_direct_tau_kernel = None
         if _SLEEPING:
@@ -2485,6 +2487,10 @@ class SolverFeatherPGS(SolverBase):
 
                 self._sleeping = sleeping
                 self._awake_direct_tau_kernel = get_awake_direct_tau_kernel(self._compact_diagonal_mass_size)
+        if _AWAKE_PIPELINE and self._sleeping is not None:
+            from .awake_pipeline import AwakePipeline  # noqa: PLC0415
+
+            self._awake_pipeline = AwakePipeline.create(self)
 
     def _update_kinematic_state(self) -> None:
         """Refresh cached kinematic flags and effective joint armature."""
@@ -2552,6 +2558,8 @@ class SolverFeatherPGS(SolverBase):
             publication.validate_notification(flags, plan_snapshot=plan_snapshot)
         if getattr(self, "_sleeping", None) is not None:
             self._sleeping.notify_model_changed(flags)
+        if getattr(self, "_awake_pipeline", None) is not None:
+            self._awake_pipeline.notify_model_changed(flags)
         if kinetic is not None:
             kinetic.invalidate_model_changed(flags)
         g1_kinetic = getattr(self, "_g1_kinetic_state", None)
@@ -8566,7 +8574,10 @@ class SolverFeatherPGS(SolverBase):
             if collide_done_event is not None:
                 wp.get_stream(model.device).wait_event(collide_done_event)
                 collide_done_event = None
-            self._sleeping.begin(state_in, control, contacts, dt)
+            if self._awake_pipeline is not None:
+                self._awake_pipeline.begin(state_in, state_aug, control, contacts, dt)
+            else:
+                self._sleeping.begin(state_in, control, contacts, dt)
             self._sleeping_body_q_source = state_in.body_q
             self._sleeping_state_in = state_in
 
@@ -9469,7 +9480,7 @@ class SolverFeatherPGS(SolverBase):
             # Reuse the existing host observation boundary; no counters, host
             # reads or additional launches are inserted into timed graphs.
             sleeping = self._sleeping
-            snapshot = {"enabled": sleeping is not None}
+            snapshot = {"enabled": sleeping is not None, "awake_pipeline": self._awake_pipeline is not None}
             if sleeping is not None:
                 eligible = sleeping.component_eligible.numpy() != 0
                 dofs = sleeping.component_dof.numpy()[eligible]
@@ -9865,7 +9876,7 @@ class SolverFeatherPGS(SolverBase):
         if self._fused_k1 and not _GROUPED_CHECK:
             pass  # kinematics and inverse dynamics produced by the fused world-dynamics kernel
         else:
-            if self._prismatic_linear_state:
+            if self._prismatic_linear_state and self._awake_pipeline is None:
                 # The shortened root producer stamps validity before the leaf
                 # pass. Preserve admission from before either producer runs.
                 wp.copy(self._prismatic_linear_valid, self._fk_id_cache_valid)
@@ -9913,7 +9924,7 @@ class SolverFeatherPGS(SolverBase):
                 block_dim=16,
                 device=model.device,
             )
-            if self._prismatic_linear_state:
+            if self._prismatic_linear_state and self._awake_pipeline is None:
                 from .prismatic_linear_state import repair_prismatic_linear_state  # noqa: PLC0415
 
                 wp.launch(
@@ -10132,10 +10143,20 @@ class SolverFeatherPGS(SolverBase):
         dynamics_stream.wait_event(wp.get_stream(model.device).record_event())
         with wp.ScopedStream(dynamics_stream, sync_enter=False):
             if self._parallel_augmented_drive_topology:
+                drive_kernel = _prepare_augmented_joint_drives_by_dof
+                drive_dim = model.joint_dof_count
+                drive_prefix = []
+                if self._awake_pipeline is not None:
+                    from .awake_pipeline import prepare_fallback_drives  # noqa: PLC0415
+
+                    drive_kernel = prepare_fallback_drives
+                    drive_dim = len(self._awake_pipeline.fallback_dofs)
+                    drive_prefix = [self._awake_pipeline.fallback_dofs]
                 wp.launch(
-                    _prepare_augmented_joint_drives_by_dof,
-                    dim=model.joint_dof_count,
+                    drive_kernel,
+                    dim=drive_dim,
                     inputs=[
+                        *drive_prefix,
                         self._augmented_drive_row_by_dof,
                         self._augmented_drive_q_index_by_dof,
                         state_in.joint_q,
@@ -10189,7 +10210,18 @@ class SolverFeatherPGS(SolverBase):
         """Launch inverse dynamics for the non-actuator torque bucket."""
         model = self.model
         body_f = state_in.body_f if state_in.body_count else None
-        state_aug.body_ft_s.zero_()
+        if self._awake_pipeline is not None:
+            from .awake_pipeline import zero_fallback_body_force  # noqa: PLC0415
+
+            wp.launch(
+                zero_fallback_body_force,
+                dim=len(self._awake_pipeline.fallback_bodies),
+                inputs=[self._awake_pipeline.fallback_bodies],
+                outputs=[state_aug.body_ft_s],
+                device=model.device,
+            )
+        else:
+            state_aug.body_ft_s.zero_()
         tau_inputs = [
             model.articulation_start,
             self.articulation_joint_end,
@@ -10372,6 +10404,8 @@ class SolverFeatherPGS(SolverBase):
                 block_dim=self.serial_kernel_block_dim,
                 device=model.device,
             )
+        if self._awake_pipeline is not None:
+            return  # The component owner already produced its complete force.
         direct_size = self._compact_diagonal_mass_size
         wp.launch(
             self._awake_direct_tau_kernel if self._sleeping is not None else self._direct_branch_tau_kernel,
@@ -10538,10 +10572,18 @@ class SolverFeatherPGS(SolverBase):
         # baked memset cadence always matches the baked update cadence.
         self._mass_update_global_flag = bool(global_flag)
 
+        mask_kernel = build_mass_update_mask
+        mask_prefix = []
+        if self._awake_pipeline is not None:
+            from .awake_pipeline import fallback_mass_mask  # noqa: PLC0415
+
+            mask_kernel = fallback_mass_mask
+            mask_prefix = [self._awake_pipeline.owned_art]
         wp.launch(
-            build_mass_update_mask,
+            mask_kernel,
             dim=model.articulation_count,
             inputs=[
+                *mask_prefix,
                 global_flag,
                 self._mass_update_requested,
             ],
@@ -10658,6 +10700,8 @@ class SolverFeatherPGS(SolverBase):
                 self._sparse_factor.refresh(state_aug)
                 continue
             if size == self._compact_diagonal_mass_size:
+                if self._awake_pipeline is not None:
+                    continue  # Scalar inverses belong to the component owner.
                 if self._direct_compact_diagonal_inertia:
                     wp.launch(
                         self._direct_compact_diagonal_inertia_kernel,
@@ -11035,7 +11079,18 @@ class SolverFeatherPGS(SolverBase):
             )
 
     def _stage3_zero_qdd(self, state_aug: State):
-        state_aug.joint_qdd.zero_()
+        if self._awake_pipeline is not None:
+            from .awake_pipeline import zero_fallback_qdd  # noqa: PLC0415
+
+            wp.launch(
+                zero_fallback_qdd,
+                dim=len(self._awake_pipeline.fallback_dofs),
+                inputs=[self._awake_pipeline.fallback_dofs],
+                outputs=[state_aug.joint_qdd],
+                device=self.model.device,
+            )
+        else:
+            state_aug.joint_qdd.zero_()
 
     def _stage3_trisolve_diagonal(self, size: int, state_aug: State) -> None:
         """Apply a diagonal generalized inertia inverse to joint forces."""
@@ -11055,6 +11110,8 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage3_trisolve_compact_diagonal(self, size: int, state_aug: State) -> None:
         """Apply a directly stored diagonal inverse without grouped mass storage."""
+        if self._awake_pipeline is not None:
+            return
         wp.launch(
             solve_compact_diagonal_mass,
             dim=self.n_arts_by_size[size] * size,
@@ -11136,10 +11193,20 @@ class SolverFeatherPGS(SolverBase):
         model = self.model
         if not model.joint_count:
             return
+        predictor_kernel = compute_velocity_predictor
+        predictor_dim = model.joint_dof_count
+        predictor_prefix = []
+        if self._awake_pipeline is not None:
+            from .awake_pipeline import predict_fallback  # noqa: PLC0415
+
+            predictor_kernel = predict_fallback
+            predictor_dim = len(self._awake_pipeline.fallback_dofs)
+            predictor_prefix = [self._awake_pipeline.fallback_dofs]
         wp.launch(
-            compute_velocity_predictor,
-            dim=model.joint_dof_count,
+            predictor_kernel,
+            dim=predictor_dim,
             inputs=[
+                *predictor_prefix,
                 stage3_qd,
                 self._kinematic_dof_mask,
                 dt,
@@ -14311,10 +14378,19 @@ class SolverFeatherPGS(SolverBase):
         if self._franka_kinetic_state is not None:
             return
         model = self.model
+        update_kernel = update_qdd_from_velocity
+        update_dim = model.joint_dof_count
+        update_prefix = []
+        if self._awake_pipeline is not None:
+            from .awake_pipeline import update_fallback_qdd  # noqa: PLC0415
+
+            update_kernel = update_fallback_qdd
+            update_dim = len(self._awake_pipeline.fallback_dofs)
+            update_prefix = [self._awake_pipeline.fallback_dofs]
         wp.launch(
-            update_qdd_from_velocity,
-            dim=model.joint_dof_count,
-            inputs=[state_in.joint_qd, self._kinematic_dof_mask, 1.0 / dt],
+            update_kernel,
+            dim=update_dim,
+            inputs=[*update_prefix, state_in.joint_qd, self._kinematic_dof_mask, 1.0 / dt],
             outputs=[self.v_out, state_aug.joint_qdd],
             device=model.device,
         )
@@ -14336,15 +14412,22 @@ class SolverFeatherPGS(SolverBase):
 
         if model.joint_count:
             integrate_kernel = integrate_generalized_joints
+            integrate_dim = model.joint_count
             integrate_prefix = []
-            if self._sleeping is not None:
+            if self._awake_pipeline is not None:
+                from .awake_pipeline import integrate_fallback  # noqa: PLC0415
+
+                integrate_kernel = integrate_fallback
+                integrate_dim = len(self._awake_pipeline.fallback_joints)
+                integrate_prefix = [self._awake_pipeline.fallback_joints]
+            elif self._sleeping is not None:
                 from .sleeping_consumers import integrate_awake_joints  # noqa: PLC0415
 
                 integrate_kernel = integrate_awake_joints
                 integrate_prefix = [self._sleeping.joint_awake]
             wp.launch(
                 kernel=integrate_kernel,
-                dim=model.joint_count,
+                dim=integrate_dim,
                 inputs=[
                     *integrate_prefix,
                     model.joint_type,
@@ -14366,7 +14449,9 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
-            if self._sleeping is not None:
+            if self._awake_pipeline is not None:
+                self._awake_pipeline.finish(state_in, state_aug, state_out, dt)
+            elif self._sleeping is not None:
                 self._sleeping.finish(state_in, state_out, dt)
             self._stage7_update_kinematics(state_out, state_aug)
 
@@ -14551,6 +14636,7 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
         finalize_kernel = finalize_body_dynamics
+        finalize_dim = model.body_count
         finalize_prefix = []
         if prismatic is not None:
             from .prismatic_publication import finalize_prismatic_body_dynamics  # noqa: PLC0415
@@ -14573,7 +14659,13 @@ class SolverFeatherPGS(SolverBase):
                 model.joint_axis,
                 joint_S_s,
             ]
-        if self._sleeping is not None:
+        if self._awake_pipeline is not None:
+            from .awake_pipeline import finalize_fallback  # noqa: PLC0415
+
+            finalize_kernel = finalize_fallback
+            finalize_dim = len(self._awake_pipeline.fallback_bodies)
+            finalize_prefix = [self._awake_pipeline.fallback_bodies]
+        elif self._sleeping is not None:
             from .sleeping_consumers import finalize_awake_linear_state  # noqa: PLC0415
 
             finalize_kernel = finalize_awake_linear_state
@@ -14584,7 +14676,7 @@ class SolverFeatherPGS(SolverBase):
             ]
         wp.launch(
             finalize_kernel,
-            dim=model.body_count,
+            dim=finalize_dim,
             inputs=[
                 *finalize_prefix,
                 self.body_to_articulation,
