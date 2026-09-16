@@ -112,6 +112,34 @@ status_replacement = """    csr_flag = os.environ.get("NEWTON_HEIGHTFIELD_PAIR_C
 if source.count(status_seam) != 1:
     raise RuntimeError("The original capacity-contract loading seam changed")
 source = source.replace(status_seam, status_replacement)
+source = source.replace(collision_seam, collision_replacement)
+spectral_seam = '    result["solve_key"] = getattr(sparse.kernels.solve, "key", None)\n'
+spectral_replacement = """    spectral_flag = os.environ.get("FEATHER_PGS_SPARSE_SPECTRAL_TANGENTS")
+    if spectral_flag not in ("0", "1"):
+        raise RuntimeError("Require explicit spectral tangent flag on both arms")
+    spectral_wanted = spectral_flag == "1"
+    spectral_actual = getattr(sparse, "spectral_tangents", False)
+    if type(spectral_actual) is not bool or spectral_actual != spectral_wanted:
+        raise RuntimeError("Requested spectral tangent owner is not active")
+    if spectral_wanted:
+        from newton._src.solvers.feather_pgs.sparse_spectral_tangents import get_solve_kernel
+        import warp as wp
+        solve = "sparse_spectral_tangent43_s18_c100"
+        if sparse.kernels.solve is not get_solve_kernel():
+            raise RuntimeError("Spectral solve is not the exact cached factory")
+        arguments = [argument.label for argument in sparse.kernels.solve.adj.args]
+        if len(arguments) != 15 or arguments[5] != "cfm":
+            raise RuntimeError("Unexpected spectral current-CFM argument ownership")
+        cfm = solver.row_cfm
+        if cfm.shape != (int(solver.world_count), 100) or cfm.dtype is not wp.float32:
+            raise RuntimeError("Unexpected existing current-CFM array layout")
+    result["spectral_tangents"] = {"requested": spectral_wanted, "observed": spectral_actual,
+        "kernel_key": solve, "check_pass": True}
+    result["solve_key"] = getattr(sparse.kernels.solve, "key", None)
+"""
+if source.count(spectral_seam) != 1:
+    raise RuntimeError("The original solve-factory observation seam changed")
+source = source.replace(spectral_seam, spectral_replacement)
 # __file__ deliberately remains this wrapper: its digest pins the complete
 # source transformation and the retained observer's required SHA256.
-exec(compile(source.replace(collision_seam, collision_replacement), str(RETAINED), "exec"), globals())
+exec(compile(source, str(RETAINED), "exec"), globals())

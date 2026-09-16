@@ -532,6 +532,17 @@ class SparseFactor:
         self.packet_rows = os.environ.get("FEATHER_PGS_SPARSE_PACKETS") == "1" and c == 100
         self.block_contacts = os.environ.get("FEATHER_PGS_SPARSE_CONTACT_BLOCK") == "1"
         self.metric_tangents = os.environ.get("FEATHER_PGS_SPARSE_METRIC_TANGENTS") == "1" and c == 100
+        spectral = os.environ.get("FEATHER_PGS_SPARSE_SPECTRAL_TANGENTS", "0")
+        if spectral not in ("0", "1"):
+            raise ValueError("FEATHER_PGS_SPARSE_SPECTRAL_TANGENTS must be 0 or 1")
+        self.spectral_tangents = spectral == "1" and c == 100
+        if self.spectral_tangents and (
+            not self.metric_tangents
+            or self.packet_rows
+            or self.block_contacts
+            or os.environ.get("FEATHER_PGS_SPARSE_PAIRED_GS") == "1"
+        ):
+            raise ValueError("Sparse spectral tangents require the original capacity100 metric owner")
         if self.metric_tangents and (self.packet_rows or self.block_contacts):
             raise ValueError("Sparse metric tangents, packets and contact-block rows are mutually exclusive")
         self.level_update = os.environ.get("FEATHER_PGS_SPARSE_LEVEL_UPDATE") == "1"
@@ -557,6 +568,10 @@ class SparseFactor:
             contacts=get_contact_kernel(),
             solve=get_solve_kernel(c, self.block_contacts, metric_tangents=self.metric_tangents),
         )
+        if self.spectral_tangents:
+            from .sparse_spectral_tangents import get_solve_kernel as spectral_solve  # noqa: PLC0415
+
+            self.kernels.solve = spectral_solve()
         # Drop canonical matrix/row storage only after complete constructor admission.
         # Dummy shapes make accidental readers fail visibly, not reinterpret packed W/Z.
         dummy = wp.empty((1, 1, 1), dtype=float, device=device)
@@ -918,25 +933,28 @@ class SparseFactor:
             solve(self, rhs, iterations, omega, friction_start)
             return
         s = self.solver
+        inputs = [
+            self.plan,
+            self.data,
+            s.constraint_count,
+            rhs,
+            s.diag,
+            s.impulses,
+            s.row_type,
+            s.row_parent,
+            s.row_mu,
+            iterations,
+            omega,
+            friction_start,
+            s.v_hat,
+            s.v_out,
+        ]
+        if self.spectral_tangents:
+            inputs.insert(5, s.row_cfm)
         wp.launch_tiled(
             self.kernels.solve,
             dim=[s.world_count],
-            inputs=[
-                self.plan,
-                self.data,
-                s.constraint_count,
-                rhs,
-                s.diag,
-                s.impulses,
-                s.row_type,
-                s.row_parent,
-                s.row_mu,
-                iterations,
-                omega,
-                friction_start,
-                s.v_hat,
-                s.v_out,
-            ],
+            inputs=inputs,
             block_dim=32,
             device=s.model.device,
         )
