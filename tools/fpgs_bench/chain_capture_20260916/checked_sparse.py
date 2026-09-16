@@ -12,7 +12,7 @@ source = RETAINED.read_text()
 if hashlib.sha256(source.encode()).hexdigest() != RETAINED_PIN:
     raise RuntimeError("The retained G1 boundary observer has changed")
 seam = '    if keys != {"repair": "g1_kinetic_repair44", "finish": "g1_kinetic_finish44", "predictor": "g1_kinetic_predict43"}:\n'
-replacement = '''    chain_flag = os.environ.get("FEATHER_PGS_G1_CHAIN_SCAN")
+replacement = """    chain_flag = os.environ.get("FEATHER_PGS_G1_CHAIN_SCAN")
     if chain_flag not in ("0", "1"):
         raise RuntimeError("Require explicit Boolean chain traversal on both arms")
     chain = chain_flag == "1"
@@ -20,8 +20,18 @@ replacement = '''    chain_flag = os.environ.get("FEATHER_PGS_G1_CHAIN_SCAN")
         raise RuntimeError("Requested chain traversal differs from the actual owner")
     suffix = "_chain" if chain else ""
     result["chain_scan"] = {"requested": chain, "observed": chain, "check_pass": True}
-    if keys != {"repair": "g1_kinetic_repair44" + suffix, "finish": "g1_kinetic_finish44" + suffix, "predictor": "g1_kinetic_predict43" + suffix}:
-'''
+    compiled_flag = os.environ.get("FEATHER_PGS_COMPILED_COORDINATE_STATE", "0")
+    if compiled_flag not in ("0", "1"):
+        raise RuntimeError("Require Boolean compiled-coordinate selection")
+    compiled = compiled_flag == "1"
+    if getattr(owner, "compiled_coordinate_state", False) is not compiled:
+        raise RuntimeError("Requested compiled coordinates differ from the actual owner")
+    if compiled and getattr(owner, "coordinate_plan", None) is None:
+        raise RuntimeError("Compiled coordinates are missing their model descriptor")
+    result["compiled_coordinate_state"] = {"requested": compiled, "observed": compiled, "check_pass": True}
+    state_suffix = suffix + ("_compiled" if compiled else "")
+    if keys != {"repair": "g1_kinetic_repair44" + state_suffix, "finish": "g1_kinetic_finish44" + state_suffix, "predictor": "g1_kinetic_predict43" + suffix}:
+"""
 if source.count(seam) != 1:
     raise RuntimeError("The original exact-key observation seam changed")
 # __file__ deliberately remains this wrapper: its digest pins the complete

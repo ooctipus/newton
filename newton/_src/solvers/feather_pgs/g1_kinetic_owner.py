@@ -171,8 +171,20 @@ class G1KineticState:
         self.geometric = self.data.geometric
         self.geometry_valid = self.data.geometry_valid
         self.status = self.data.status
-        self.repair_kernel = native.get_state_kernel(False, self.chain_scan)
-        self.finish_kernel = native.get_state_kernel(True, self.chain_scan)
+        self.compiled_coordinate_state = os.environ.get("FEATHER_PGS_COMPILED_COORDINATE_STATE", "0") == "1"
+        self.coordinate_plan = None
+        if self.compiled_coordinate_state:
+            from . import compiled_coordinate_state  # noqa: PLC0415
+
+            com = solver.body_X_com.numpy()
+            if not np.array_equal(com[:, :3], model.body_com.numpy()) or not np.all(
+                com[:, 3:] == np.array([0, 0, 0, 1], np.float32)
+            ):
+                self.compiled_coordinate_state = False
+            else:
+                self.coordinate_plan = compiled_coordinate_state.build_coordinates(model)
+        self.repair_kernel = native.get_state_kernel(False, self.chain_scan, self.compiled_coordinate_state)
+        self.finish_kernel = native.get_state_kernel(True, self.chain_scan, self.compiled_coordinate_state)
         self.predictor_kernel = native.get_predictor_kernel(self.chain_scan)
         self._model_plan = {name: _fingerprint(getattr(model, name)) for name in _PLAN_FIELDS}
         self._mapping_plan = {
@@ -271,7 +283,8 @@ class G1KineticState:
                 self.data,
                 self.solver._mass_update_requested,
                 int(global_refresh),
-            ],
+            ]
+            + ([self.coordinate_plan] if self.compiled_coordinate_state else []),
             block_dim=64,
             device=self.solver.model.device,
         )
@@ -322,7 +335,8 @@ class G1KineticState:
                 self.data,
                 self.solver._mass_update_requested,
                 int(next_refresh),
-            ],
+            ]
+            + ([self.coordinate_plan] if self.compiled_coordinate_state else []),
             block_dim=64,
             device=self.solver.model.device,
         )

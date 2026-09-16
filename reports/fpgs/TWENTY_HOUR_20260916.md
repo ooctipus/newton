@@ -241,3 +241,112 @@ qdd/qnext reloads, not just type dispatch. It does not establish that half the
 state family or10% of whole physics will disappear. Reuse original CPU/native
 physical controls plus focused general-child-frame/kinematic algebra tests,
 then an early complete whole screen. Do not extend into a math/mapping sweep.
+
+### Vector-chain attribution and coordinate candidate readiness
+
+The vector candidate's separate strict node accounting passes all48 physics
+and12 auxiliary roots across both cards. The legacy parent retains exit1 for
+its known auxiliary-graph analyzer limitation; this is diagnostic evidence,
+not a replacement throughput run. Artifacts:
+`/tmp/fpgs-g1-chain-vector-node-candidate16k-20260916-01` and
+`/tmp/fpgs-g1-chain-vector-strict-Os6BOg4H/candidate_gpu{0,1}.json`.
+
+| Owner ms/env step | RTX | GB300 |
+| --- | ---: | ---: |
+| Complete finish |1.842625|1.930120|
+| Predictor |0.560355|0.581146|
+| Repair |0.181208|0.198781|
+| Three-owner exclusive union |2.567020|2.688023|
+
+These replace the older2.33/2.50ms finish estimates when costing further work.
+Removing1ms now requires eliminating about54% of RTX finish time, not43%.
+Finish still owes the original integration, physical state, bias/geometric
+cache and public outputs; its whole duration is not disposable work.
+
+Compiled-coordinate first source freeze12:27 UTC, before the13:04 checkpoint.
+Focused CPU and original controls12/12 pass. The descriptor algebra admits
+ordinary FP32 unit-normalization roundoff but falls back to original algebra
+for nonrigid/nonfinite constants; it never normalizes authored input. Native
+testing and complete timing are still pending. Hidden-CUDA AOT actual repair/
+finish registers are64/76 onSM120 and64/82 onSM100, versus vector-chain72/91
+and72/92. Shared8000B, stack72B, no spills. This is static resource evidence,
+not achieved occupancy or speed. AOT report:
+`/tmp/fpgs-g1-chain-offline-haLDAvku/offline03/report.json`, SHA256
+`3f5a8335a0d3eaa91e4e91c5aec507117c59d7246d4ab25dd06eee4243a8c8b8`.
+
+### Fresh ca0d backend refresh, continued
+
+Same accepted ca0d source on both backends, corrected MJWarp and unchanged
+Lab/budgets, one paired discovery round. Shared G1 terrain changes apply on
+both sides; Allegro MJWarp keeps its native contact pipeline. These are fresh
+baseline ratios, not new optimization gains.
+
+| Task | RTX FPGS ms | RTX MJWarp ms | MJ/FPGS | GB FPGS ms | GB MJWarp ms | MJ/FPGS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| G1 rough |15.610290|37.959959|2.431727x|20.440196|38.258522|1.871730x|
+| Allegro reorient |15.146122|63.862091|4.216399x|16.531282|81.857731|4.951687x|
+
+Artifacts `/tmp/fpgs-ca0d-refresh-g1-JZ51Sjhs-01` and
+`/tmp/fpgs-ca0d-refresh-allegro-JZ51Sjhs-01`; both parents exit0. This G1 row
+does not include the newer chain traversal. Do not present a cross-run ratio
+using its MJ denominator and a different FPGS capture as a paired comparison.
+
+Keyboard4096 refresh also completes exit0: FPGS/MJ physics6.960440/27.851542ms
+RTX (4.001405x),6.054350/28.557772ms GB (4.716902x). Environment wall is
+27.455639/31.150523ms RTX and24.369083/32.006444ms GB. Artifact:
+`/tmp/fpgs-ca0d-refresh-keyboard-so101-JZ51Sjhs-01`. RTX is only just above4x
+in this discovery round, not evidence of comfortable margin.
+
+Compiled-coordinate native controls now pass3/3 on both devices, exit0:
+41.372/45.778s including module loading/compilation. Existing complete graph,
+reset/refresh, current-force, held-factor and physical saved-row controls
+use their unchanged tolerances. Actual repair/finish keys end `_chain_compiled`;
+predictor remains `_chain`. Logs:
+`/tmp/fpgs-g1-compiled-native-20260916-KhBYwmTS/gpu{0,1}.log`.
+The first whole screen compares qualified chain ef9481bc with this candidate,
+CHAIN_SCAN=1 on both, COMPILED_COORDINATE_STATE=0/1, not against a losing
+prototype. Source is frozen through completion of that screen.
+
+### Close coordinate-only replacement, 12:44 UTC
+
+First paired complete discovery passes source/capacity/finite/idle guards:
+
+| Whole physics ms/env step | RTX | GB300 |
+| --- | ---: | ---: |
+| Qualified vector chain |15.099226|19.818439|
+| Compiled coordinates |14.937630|19.838525|
+| Baseline/candidate |1.010818x|0.998988x|
+
+Environment wall27.878866 ->28.674384ms RTX and33.803177 ->34.436833ms GB.
+Artifact `/tmp/fpgs-g1-compiled-coordinate-whole-paired16k-20260916-01`.
+This is not a substantial gain and is not promoted into the retained recipe.
+
+One node diagnosis explains the limited effect: finish1.842625 ->1.709921ms
+RTX (1.077609x),1.930120 ->1.925291ms GB; repair0.181208 ->0.175995ms RTX,
+0.198781 ->0.179859ms GB. Predictor, factor, rows, GS and collision remain
+unchanged. The lower-register candidate really retires its three preparatory
+joins and scalar rereads, but leaves15 executed full-finish joins, complete
+pose/motion/subtree scans, current inertia/bias/publication, and on refresh
+the19-channel moments and434 six-term projections. There is no discovered
+duplicate producer, cadence error or missed retirement to correct.
+
+At least1,135 FP32 public/cache values per world still have to be emitted,
+plus434 geometric values on refresh. This is a source output count, not a
+DRAM-traffic or memory-bound claim. Descriptor indirection and the shared
+scalar-speed transfer are added work. Neither static register reductions
+nor deleted arithmetic imply a large whole-step saving.
+
+Node capture `/tmp/fpgs-g1-compiled-coordinate-node-candidate16k-20260916-01`
+retains legacy parent exit1 for its auxiliary analyzer. The exact-key extension
+of the existing strict reader passes48 physics/12 auxiliary roots on both:
+`/tmp/fpgs-g1-compiled-strict-lb18MR06/read_compiled.py` and
+`candidate_gpu{0,1}.json`. The reader adds only exact compiled-owner aliases
+and requires actual compiled owner selection, retaining all old checks.
+
+Close the candidate default-off, preserve source/tests/evidence, and do not
+start a mapping/algebra sweep or port it to other tasks on this result.
+The retained runtime choice remains vector chain with compiled coordinates0.
+Franka and Kuka coordinate-only port screens also lack a substantial budget:
+affected finish+repair families are approximately1.102/1.920ms; a10% whole
+saving would require removing about46%/55% of those complete families while
+their scans, inertial work and public outputs remain. No port is funded.

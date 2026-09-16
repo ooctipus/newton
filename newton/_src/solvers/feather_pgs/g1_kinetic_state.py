@@ -352,7 +352,7 @@ def _collect(
 
 
 @functools.cache
-def get_state_kernel(finish: bool, chain_scan: bool = False):
+def get_state_kernel(finish: bool, chain_scan: bool = False, compiled_coordinates: bool = False):
     """Build complete repair/finish using original generalized integration laws."""
     plan_type = KineticPlan
     scan_poses, scan_motion, collect = _scan_poses, _scan_motion, _collect
@@ -525,9 +525,15 @@ def get_state_kernel(finish: bool, chain_scan: bool = False):
             _stamp_source(cache, group, q, qd)
         _release(address)
 
+    if compiled_coordinates:
+        from . import compiled_coordinate_state  # noqa: PLC0415
+
+        state = compiled_coordinate_state.compile_g1_state(state)
     state.__name__ = state.__qualname__ = "g1_kinetic_finish44" if finish else "g1_kinetic_repair44"
     if chain_scan:
         state.__name__ = state.__qualname__ = state.__name__ + "_chain"
+    if compiled_coordinates:
+        state.__name__ = state.__qualname__ = state.__name__ + "_compiled"
     return wp.kernel(module="unique", enable_backward=False)(state)
 
 
