@@ -1042,3 +1042,178 @@ justify funding before implementation; normal-bin equality is not a plane
 certificate, and voxel exports cannot silently resurrect suppressed points.
 No contact is dropped from current production, no capacity or Lab code changes,
 and no gain is claimed from this open question.
+
+## Streaming closure and finite-manifold implementation, 18:20 UTC
+
+The cause-directed Franka world-lane streaming correction is closed and
+unpromoted. Its physical/lifecycle tests pass on both cards, and the intended
+finish register reduction occurs (167/255 to80, no spills). Complete paired
+physics nevertheless regresses RTX5.141021 to5.286214ms and
+GB4.715610 to5.077819ms. Strict48-root attribution shows publication adds
+.355465/.487562ms, outweighing factor/prediction savings of.188539/.171183ms.
+No duplicate old producer or changed cadence explains the miss. Shared traffic,
+22 publication joins and only512 world-lane warps are explicit costs; hardware
+counters do not establish a dominant stall cause. No further mapping variant.
+Source and full evidence are preserved in fork commit
+`c56caee4ec13b226d19626621c1e881764e79571`, branch
+`ooctipus/fpgs-world-lane-streaming-20260916`, including
+`reports/fpgs/FRANKA_WORLD_LANE_STREAMING_20260916.md`.
+
+The contact census required one coherent snapshot, not an untimed read of
+overwritten next-state geometry. Private copies immediately after original
+SparseFactor.build_rows identify the same retained solved rows byte-for-byte;
+the unchanged private cold-eight replay exactly matches all active impulses
+and public velocity on both cards. Copied geometry/material/route arrays are
+diagnostic only and their188,984,988 bytes per build are not timing evidence.
+Capture01 failed an overly strict eager-allocation guard before measurement;
+capture02 uses Warp's supported graph-owned mempool allocation with persistent
+user references. Failed01 and its original adapter remain unchanged.
+
+Valid capture, both children exit0 and final source/idle guard pass:
+`/tmp/fpgs-g1-raw-manifold-input-paired16k-20260916-02`.
+Input NPZ hashes: RTX
+`aa34c04517f34656ce2d2413c0d2f8113bff21ad04639bbac30e1474a73c888e`;
+GB `cab846f8c85522e083de92f9160459802efe944773c8daf5865292020ba4b8a9`.
+CPU census:
+`/tmp/fpgs-adaptive-witness-population-90c5BsvH/{census.py,population.json}`.
+An independent reader confirms geometry signs/charts and pair/run counts.
+
+| One last-solved exported snapshot | RTX | GB |
+| --- | ---: | ---: |
+| Actual heightfield/convex shape pairs |24,868|24,840|
+| Normal contacts |78,284|78,360|
+| Pairs with more than four contacts |5,553|5,601|
+| Normal contacts removed by unconditional cap4 |14,666|14,711|
+| Pairs fragmented across raw runs |14,919|15,238|
+| Contiguous raw pair runs |53,859|54,438|
+
+These are OLD reducer-export contacts, not pre-reduction triangle candidates.
+Only roughly300 contacts meet the descriptive parallel-normal/near-plane
+cap4 subset, so that restrictive path cannot justify a structural gain.
+General pair selection is a different finite manifold: the median maximum
+normal separation in pairs above four is about50 degrees. Existing-width
+removal proxies are not predicted candidate row counts or speedups. The
+documented friction-anchor limit applies to raw contiguous runs; changed export
+ordering can change it. Pair-level ownership alone does not guarantee raw
+contiguity under the unchanged atomic contact writer.
+
+Fund one default-off replacement-export prototype, based on clean qualified
+chain ef9481, in `newton-heightfield-adaptive-manifold-20260916`, branch
+`ooctipus/heightfield-adaptive-manifold-20260916`. Reuse existing pair lists and
+global-reducer winners; replace final export rather than retain it and add a
+second compaction. For admitted standard heightfield/box-or-convex pairs,
+choose deepest, farthest, line-spread and triangle-edge-spread witnesses using
+the local MJWarp strategy. Keep each witness's own geometry/normal/material,
+original final-writer acceptance and deterministic ID ties. Retain up to four
+distinct admissible IDs even at zero scores; do not import mixed-unit .001
+cutoffs. Unsupported/speculative/custom writer paths retain the old exporter.
+No changes to the friction allocator, Lab, capacities, substeps or iterations.
+
+The bounded screen must charge all hash requests, old duplicate filtering,
+selection passes and export. Native-ready checkpoint is approximately19:30;
+the performance milestone is at least1ms whole G1 RTX saving, standalone or
+combined with the existing shell path, not a one-percent export improvement.
+Reuse loaded finite/shell fixtures for support/COP, rebound, tilt, border,
+slide, yaw and step-straddling. Own-manifold reference convergence and hard
+cone/momentum checks are necessary but do not alone certify cross-manifold
+physical quality. Shared collision improvements also belong in MJWarp's arm.
+
+Operational correction: completed-agent tasks sent as ordinary messages did
+not restart work. New bounded assignments now always use followup_task, and
+completion is checked before scheduling. This prevented-work interval is not
+counted as implementation or validation progress.
+
+### Root-free sequential solve reopened,18:42 UTC
+
+Re-examining the frozen ANYmal spectral-GS control found that the prior
+13/2048 pointwise velocity-reference regressions are finite-iteration
+tradeoffs, not cone/sign/momentum failures. They remain documented, including
+maximum excess scaled kinetic velocity error0.0030623. Across the complete
+saved cohort, median/p99/max kinetic error changed from
+0.006389918/0.03199576/0.05573845 to
+0.00006906845/0.002584805/0.006777305. The biased normal residual is not raw
+contact closing velocity; these quantities must not be conflated.
+
+The user permits numerical changes and does not require every finite-budget
+case to improve monotonically. Fund one unqualified native cost screen of
+the same frozen algorithm: retire EX1 and Nesterov, normal-first ordered
+updates with a shared tangent spectral denominator and circular projection,
+at most the same24 sweeps, same physical stop, same staging/whitening/decode,
+and complete original fallback. No root iterations, Schur preparation,
+history, extra passes or mapping grid. The milestone is at least1ms whole
+ANYmal RTX saving, not a replay-only arithmetic reduction.
+
+Prototype tree: `newton-fpgs-anymal-spectral-gs-20260916`, base57e1dcfa,
+flag `FEATHER_PGS_SPECTRAL_GS=1`, default off. Native runtime SHA256
+`aedd42a5ef76041620c7333bf34029c06d12d1410aeed1deaf366befa8f69943`.
+CPU controls and independent source review pass. Exact live72/32-capacity
+AOT report `/tmp/fpgs-spectral-contact-offline-tVyCzVM2/offline02/report.json`
+SHA256 `b7b7cc0d0b8d8732d2f8998c7fe02a6efff6e62b0e6149a3992ab63809425872`:
+SM120 tier32/48 uses83/128 registers; SM10389/95, no stack/spills.
+Sequential warp dependencies and the tier48 second-warp resource lifetime
+remain cost risks. Neither AOT nor operation counts establish GPU speed.
+
+The adaptive terrain native pool tests pass on both cards, but loaded
+qualification currently fails support/sliding assertions in both old and
+new paths. A cause-focused audit found sparse instantaneous-force sampling
+and a full-friction analytic sliding assumption incompatible with the
+explicit production two-anchor policy. Those are leads, not qualification.
+The runtime remains frozen while an early, explicitly unqualified whole
+physics cost screen runs. No candidate gain is promoted from these checks.
+
+### Integrated outcomes and next structural direction,19:01 UTC
+
+The ordered spectral prototype is closed, default-off and unpromoted, committed
+and pushed as `2dfa26a753b380213a2e9dd4733df4d461bd4446` on the scoped fork
+branch. Whole02 original/candidate physics: RTX9.219848/22.605269075ms,
+GB9.501435475/24.7519868ms. All source/idle/capacity guards pass. Native saved
+operators pass2048 hard checks, but the owner is4–5x slower; eight CPU/native
+translation checks have scaled kinetic velocity error<=1.2112e-5.
+The ordered per-contact dependencies, reductions and lane-zero projections
+are not removed by lower scalar-product counts. Correcting the CPU proxy for
+unconditional native updates gives72.008M versus84.268M products, only14.55%
+less, not the earlier31.76%. No hardware stall claim is made.
+
+Whole01 is preserved as an observer setup failure: root checked a constructor
+compatibility argument `mf_warmstart` as if it were an instance attribute.
+The actual stored field is `_mf_warmstart_enabled`. This was fixed before the
+fresh02 capture; source-based actual-assignment controls were then added to
+the independent review. No physics result came from01. Review dummy objects
+that repeat an observer's assumed fields cannot establish real API validity.
+
+Adaptive4 standalone whole: RTX15.032385825->14.81613825ms(1.014595x),
+GB19.827471325->19.789886175ms(1.001899x), one unpromoted round. Strict12-step
+node audit proves48 physics/12 auxiliary roots, zero unproven nodes, and
+replacement export exactly4 calls with the old export absent. Export grows
+RTX0.302094->0.979333ms andGB0.323757->1.526946ms, erasing much of the
+row-plus-solve saving0.847520/0.894178ms. State/factor work is approximately
+flat. Strict artifacts: `/tmp/fpgs-adaptive-manifold-strict-kolTndj0/`.
+This is evidence of hash-pool gathering/selection cost, not measured stalls.
+
+Corrected loaded controls use every force sample over the same fixed final80
+steps, retain the original2% support and2e-4 momentum bounds, and preserve the
+old five-sample diagnostics. A separate full-friction sliding case retains
+the analytic stopping test; production-anchor cases check their actual law.
+Both cards complete18 records. All9 candidate cases/card pass; the old
+initially penetrating step-support case still fails settling, so the suite
+correctly exits1 rather than hiding the baseline failure. Logs:
+`/tmp/fpgs-adaptive-manifold-loaded-tail-20260916-iws6t0uD/gpu{0,1}.log`.
+This bounded geometry/physical evidence is not yet an independent full-task
+or own-manifold reference-convergence qualification.
+
+Next funded studies target the demonstrated causes, not exporter tuning:
+query-to-adaptive-manifold dataflow that retires global bin/hash round trips,
+and concurrent root-free contact proposals that avoid both the sequential
+dependency chain and the earlier coupled-Jacobi local roots. Exact adaptive
+selection still requires retained candidates or repeated queries; four
+output witnesses do not imply four-record streaming state. Each study must
+account for complete producer/fallback/selection/solve work before promotion.
+
+Adaptive standalone closure is committed/pushed as
+`c59c10bcf732ec719ba5a353c7b1bf1fe7996ca5`; measured runtime bytes are
+unchanged. The new isolated pair-CSR branch starts there, not from shell, so
+there is no hidden shell-policy composition. It keeps separate packed query
+kernels and replaces bin/hash bookkeeping with variable-cardinality pair
+membership over the existing raw witness buffer. A fixed four-record query
+pool is expressly not the design. Native-ready checkpoint20:30 UTC; root
+retains exclusive GPU scheduling and the early complete-cost decision.
