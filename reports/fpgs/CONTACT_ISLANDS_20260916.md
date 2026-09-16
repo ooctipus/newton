@@ -199,3 +199,72 @@ and loaded three-component chains remain awake independent of pair order.
 Cold capture, synchronized stream migration, masked resets and fresh/in-place
 publication pass. Full repository pre-commit passes before pinning the
 whole-physics measurement; no performance acceptance follows from these tests.
+
+## Corrected complete measurement and closure
+
+Runtime `348896b433b47d066d61045fa3c03aba0469c5d2`, reference `ca0d427a`,
+unchanged Lab `53ee6b44`. The 40-step whole screen is at
+`/tmp/fpgs-contact-islands-paired4k-20260916-02/manifest.json`, SHA256
+`f9b380f6985203754bf864050240d57b82106994938116d9fe311f0d603b2fe5`.
+
+| GPU | Reference physics | Candidate physics | Reference / candidate |
+| --- | ---: | ---: | ---: |
+| RTX PRO6000 | 6.842999 ms | 6.376398 ms | 1.073176x |
+| GB300 | 5.955107 ms | 6.531289 ms | 0.911781x |
+
+Whole-environment wall time is 28.694467 -> 32.295702 ms RTX and
+26.784003 -> 27.230645 ms GB. It does not improve. This is one discovery
+round, not repeat-qualified performance or a new MJWarp ratio.
+
+Independent artifact review verifies 26 recorded hashes, all four child exits,
+all eight capacity/finite boundaries, unchanged budgets and final source/idle
+guards. Setup binding ran exactly once per candidate at raw capacity 147456.
+Dense 704 and broad 57344 capacities remain unchanged. Post-profile candidate
+sleep counts are 428610 RTX / 429546 GB of 442368 eligible components;
+dormant-contact counts are 80462 / 85228 and cached counts 80462 / 85172.
+Invalid-contact flags remain false. These are endpoint samples, not
+time-weighted admission or full physical qualification.
+
+The matched short node diagnosis is
+`/tmp/fpgs-contact-islands-nodes-paired4k-20260916-02/manifest.json`.
+All four children, eight capacity boundaries and final source/idle guards pass.
+The following are graph-only summed kernel times, NOT additive critical-path
+savings:
+
+| Owner | RTX reference -> candidate | GB reference -> candidate |
+| --- | ---: | ---: |
+| Explicit sleep/cache/held-force maintenance | 0 -> 0.514 ms | 0 -> 0.468 ms |
+| Fused scalar prepare + finish | 0 -> 0.965 ms | 0 -> 0.654 ms |
+| Contact producer | 0.814 -> 0.508 ms | 0.559 -> 0.378 ms |
+| Contact schedule | 0.316 -> 0.180 ms | 0.342 -> 0.218 ms |
+| Other row/response kernels | 0.544 -> 0.510 ms | 0.614 -> 0.577 ms |
+| Main GS | 1.013 -> 1.488 ms | 1.490 -> 1.110 ms |
+| Collision | 1.219 -> 1.132 ms | 1.243 -> 1.163 ms |
+
+The baseline uses its original scalar dynamics/publication owners, not a free
+zero-cost replacement for prepare/finish. Compared with mode 1, explicit
+maintenance falls 1.979 -> 0.514 ms RTX and 1.861 -> 0.468 ms GB; these totals
+include the old `_mark_contacts` pass omitted from the earlier maintenance-only
+figures. Some checks moved into prepare/finish, whose combined time grows
+0.777 -> 0.965 ms RTX and 0.517 -> 0.654 ms GB. The funded replacement really
+removed its targeted duplicated work.
+
+The remaining opportunity is limited: retained broadphase and convex
+GJK/MPR/manifold work dominate the narrowphase savings, while the original GS
+kernel still launches eight times with unchanged resources and retained coupled
+work. Its opposite short-window time changes across cards are measured, but
+the exact cause is not established. Five-step node spans also invert the
+40-step whole-screen ordering (RTX 6.618 -> 6.746 ms; GB 6.227 -> 5.993 ms).
+They are workload-sensitive diagnostic windows, not replacement whole results.
+
+Close this candidate for the current large-gain target. The approximately
+0.7 ms RTX milestone was not achieved, GB regresses in the whole screen, and
+the result is not consistently beneficial. No repeat/qualification campaign,
+mapping grid, default enablement or dependency-pointer promotion follows.
+Retain the default-off implementation and causal evidence on the fork; accepted
+`ca0d427a` and all previously accepted backend ratios remain unchanged.
+
+Next funded work is a separate rank-aware active-contact CPU falsification
+from retained `ca0d427a`, documented in `ACTIVE_WRENCH_20260916.md` on
+`ooctipus/fpgs-active-wrench-20260916`. That is a new complete response/solve
+boundary, not another sleeping-controller micro-optimization.
