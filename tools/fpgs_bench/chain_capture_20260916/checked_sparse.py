@@ -83,13 +83,19 @@ collision_replacement = """
                     or array.device != wp.get_device(narrow.device)
                     or not array.is_contiguous or array is not getattr(csr_owner.data, name)):
                 raise RuntimeError("Unexpected pair-CSR array ownership/layout: " + name)
+        separation = csr_owner.separation
+        if (separation.shape != (raw_capacity + 1,) or separation.dtype is not wp.vec2
+                or separation.device != wp.get_device(narrow.device)
+                or not separation.is_contiguous or separation is not csr_owner.data.separation):
+            raise RuntimeError("Unexpected pair-CSR separation interval ownership/layout")
         status = csr_owner.status.numpy().tolist()
         if status != [0]:
             raise RuntimeError("Pair-CSR has a sticky routing/capacity failure: " + str(status))
         csr_result.update(kernel_key=expected_export.key,
             query_keys=[kernel.key for kernel in actual_queries], fallback_export_key=observed.key,
-            sizes=sizes, logical_extra_bytes=4*sum(sizes.values()), status=status,
-            scope="Actual factories, integer-buffer ownership and sticky status; not manifold quality")
+            sizes=sizes, separation_size=raw_capacity + 1,
+            logical_extra_bytes=4*sum(sizes.values())+8*(raw_capacity+1), status=status,
+            scope="Actual factories, integer/interval-buffer ownership and sticky status; not manifold quality")
     result["pair_csr"] = csr_result
     return {**result, "check_pass": True}
 """

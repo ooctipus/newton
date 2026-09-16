@@ -1,6 +1,6 @@
-# Raw-witness heightfield pair CSR: measured, physically unqualified
+# Raw-witness heightfield pair CSR: unpromoted checkpoints
 
-This checkpoint preserves the first `NEWTON_HEIGHTFIELD_PAIR_CSR=1`
+The initial checkpoint preserves the first `NEWTON_HEIGHTFIELD_PAIR_CSR=1`
 prototype before any selection correction. The flag defaults off. It is **not
 promoted**: one whole-physics screen saves less than the funded 1 ms RTX
 milestone, and the loaded support/impact behavior is unacceptable. Cone and
@@ -152,3 +152,106 @@ explicit arithmetic-bound and complete added-cost review. No corrected result
 exists at this checkpoint. It must retain upcoming separated contacts,
 per-witness laws and the unchanged loaded physical gates; successful cone or
 momentum checks alone cannot qualify it. The feature remains default off.
+
+## One cause-directed interval-priority correction
+
+The first prototype is recoverable at pushed commit
+`eabc4f8c3d2aacae78e78a6004d02047b175f7f5`. The correction changes selection
+priority, not the query witness pool, stock writer, fallback, friction policy,
+capacities or solver allowance. A fail-first actual-query regression reproduced
+the side-witness displacement in both support and positive-gap rebound before
+the runtime change.
+
+Count now caches one outward `(L,U)` separation interval per admitted raw ID,
+reusing the stock decode and its second normalization. With represented normal
+`n`, center `p`, depth `t`, effective radii `ra/rb` and margins `ma/mb`, define
+`S = sum(abs(n)*(2*abs(p)+abs(n)*(abs(t)+abs(ra)+abs(rb))))
++abs(ra)+abs(rb)+abs(ma)+abs(mb)`. For `u=2^-24` and
+`gamma(k)=k*u/(1-k*u)`, the upward-rounded multiplier is
+`K=up(gamma(16)/(1-gamma(8)))=9.536757943351404e-7f`. The implementation uses
+`E=up(up(K*S_hat)+64*FLT_MIN)`, `L=down(phi-E)`, `U=up(phi+E)`, with literal
+stock reconstructed `phi`. CUDA uses `nextafterf`; CPU uses tested binary32
+successors because Warp's CPU module has no C-runtime declaration for it.
+The count module explicitly disables fast math. Nonfinite arithmetic latches
+failure. This bounds represented-witness endpoint arithmetic only: it is not
+a query-error, body-local roundtrip or geometric-support certificate, and the
+underflow slack is not a physical depth band.
+
+One preliminary bucket scan computes `cutoff=max(0,min(U))`. The original four
+scans choose minimum U first, then prioritize nonnegative spread scores from
+`L<=cutoff`; outside witnesses have negative `-U` scores and fill remaining
+slots by nearest separation only after that cohort is exhausted. There is no
+normal-angle threshold, extra per-stage reduction or score-bit truncation.
+All-positive closest footprints are retained. The single new vec2 array costs
+`8*(R+1)=14,155,784` bytes at the original raw capacity, with at most 52 added
+logical bytes per accepted record across count/export, no new launch or extra
+normal decode. Shared export scratch increases by 16 bytes.
+
+Final runtime SHA256 is
+`0be8626e13df2995d6b3a9f00a148cf612726b69ed83cda734f4d2d3a5608e3f`;
+focused tests are
+`9607a44dc57112feee32de4cd664e1adfd7a82b0e1bbc18ff963f8743914c4b0`.
+CPU nine controls passed, including active/positive footprint geometry,
+outward rounding at signed zero/infinities/NaN, large-center cancellation,
+radii, zero/negative margins, unchanged gap acceptance and nonfinite interval
+failure. SM120/103 hidden AOT passed at
+`/tmp/fpgs-pair-csr-offline-2y6ompmN/offline02/report.json`, SHA256
+`ed1de0df32f88b9b6a293389755c4859491ae357e4083592c98f0f743c848202`:
+count uses 38 registers; export uses 72 registers and 128+336 B shared;
+neither has stack/spill loads/stores. Original query resource profiles remain.
+
+### Native physical result: inspect outcomes, not only failure lists
+
+Seven native selectors/card ran with the unchanged original fixture environment
+at `/tmp/fpgs-pair-csr-priority-native-20260916-1Tn0yyls/gpu{0,1}.log`.
+Log hashes are RTX
+`9ebe060b3fdf654d7193c0028114e2b97aa64f37d56e4650632a62635c90118b`
+and GB `8914ae3f7163a4f2832cf510d0c09319013dd1b8514ccadc44888a0fb54539e7`.
+Six standalone native controls pass on both cards. The loaded selector still
+exits 1, solely for retained old-arm failures: full-friction sliding/yaw/step
+on RTX and full-friction sliding/step on GB. All nine candidate case records
+have no listed failures; no old failure was removed or threshold changed.
+
+Independent log inspection confirms more than that empty candidate list:
+
+- Free rebound now has vertical velocity +1.80000019 m/s and energy ratio
+  0.360000076, consistent with authored restitution 0.6 and incoming -3 m/s;
+  spin is 3.36e-5 rad/s. The original catastrophic asymmetric rebound is gone.
+- Flat support final speed/spin are 2.04e-6 m/s / 1.97e-5 rad/s. Its full
+  80-step mean-weight relative error is 5.33e-7 and momentum error 5.65e-8.
+  Tilt/yaw settle. Step final spin is 0.00646 rad/s (tail maximum 0.01391),
+  weight error 9.67e-5 and minimum separation about -16.3 micrometers.
+- Candidate maximum recorded cone excess is 7.46e-9, negative normal impulse
+  is zero, and maximum momentum error across the nine cases is 4.57e-7.
+- Full-friction sliding stops at 0.507185 m versus analytic 0.509684 m, with
+  final speed approximately 1.01e-7 m/s. Production anchor-limit-two sliding
+  is a different selected-anchor law: it reaches x=1.27577 m beyond the
+  finite terrain edge, with vertical velocity -0.3723 m/s and continued
+  tipping. Samples remain near the support height through center x=1.18742;
+  descent appears after the center crosses edge x=1.2. This is not an observed
+  interior terrain fallthrough, nor an assertion of trajectory equivalence.
+  The separate finite-border case finishes outside with zero contacts.
+
+These are bounded loaded controls, not cross-task or long-horizon promotion.
+In particular the inherited free-rebound failure list alone lacks an analytic
+free-foot gate; the explicit velocity/energy/spin inspection above is retained.
+
+### Corrected whole screen and disposition
+
+`/tmp/fpgs-g1-heightfield-pair-csr-priority-whole-paired16k-20260916-01/manifest.json`
+is complete, SHA256
+`e2f6cfee1e7e5f9b44f6969214723209bfc4cd5c2a50855a902f2ac5c2729b3a`.
+All original source, idle, budget, capacity and actual-owner guards passed,
+including exact interval array ownership. Same paired 16K recipe as above:
+
+| Corrected whole physics | Qualified chain | Priority CSR | Saving | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| RTX ms/env step | 15.005645075 | 14.326358525 | 0.679286550 | 1.047415x |
+| GB300 ms/env step | 19.825631200 | 19.141688100 | 0.683943100 | 1.035731x |
+
+Environment wall time is separate: RTX 28.13218 to 28.37751 ms; GB 35.20044
+to 33.68487 ms. The arithmetic/selection correction costs some of the initial
+prototype's saving while resolving the diagnosed loaded failures. It remains
+below the 1 ms standalone milestone and is **default off, not promoted**.
+No corrected node attribution, repeated qualification, new MJWarp comparison
+or shell/spectral composition result is claimed at this checkpoint.

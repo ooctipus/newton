@@ -30,8 +30,89 @@ from .contact_reduction_global import (
     reduce_contact_in_hashtable,
     unpack_contact,
 )
-from .heightfield_manifold import _selection_score, _stock_writer_accepts
+from .heightfield_manifold import _selection_score
 from .types import GeoType
+
+# The error interval below assumes round-to-nearest IEEE arithmetic, not
+# fast-math reassociation/approximation. It bounds the represented witness's
+# stock endpoint arithmetic, not collision-query or body-local roundtrip error.
+wp.set_module_options({"fast_math": False})
+_UNIT_ROUNDOFF = 2.0**-24
+_GAMMA16 = 16.0 * _UNIT_ROUNDOFF / (1.0 - 16.0 * _UNIT_ROUNDOFF)
+_GAMMA8 = 8.0 * _UNIT_ROUNDOFF / (1.0 - 8.0 * _UNIT_ROUNDOFF)
+_INTERVAL_FACTOR = wp.constant(float(np.nextafter(np.float32(_GAMMA16 / (1.0 - _GAMMA8)), np.float32(np.inf))))
+_INTERVAL_UNDERFLOW = wp.constant(64.0 * 2.0**-126)
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+return nextafterf(x, INFINITY);
+#else
+// Warp's WP_NO_CRT CPU module does not declare nextafterf. This is the
+// identical binary32 successor, including signed zero, infinities and NaNs.
+union { float f; unsigned int u; } value;
+value.f=x;
+if ((value.u&0x7fffffffu)>0x7f800000u || value.u==0x7f800000u) return x;
+if ((value.u&0x7fffffffu)==0u) value.u=1u;
+else if (value.u&0x80000000u) --value.u;
+else ++value.u;
+return value.f;
+#endif
+""")
+def _next_up(x: float) -> float: ...
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+return nextafterf(x, -INFINITY);
+#else
+union { float f; unsigned int u; } value;
+value.f=x;
+if ((value.u&0x7fffffffu)>0x7f800000u || value.u==0xff800000u) return x;
+if ((value.u&0x7fffffffu)==0u) value.u=0x80000001u;
+else if (value.u&0x80000000u) ++value.u;
+else --value.u;
+return value.f;
+#endif
+""")
+def _next_down(x: float) -> float: ...
+
+
+@wp.func
+def _writer_separation_interval(
+    position: wp.vec3, normal: wp.vec3, depth: float, ra: float, rb: float, ma: float, mb: float
+) -> wp.vec3:
+    """Return literal stock separation and an outward arithmetic interval.
+
+    ``normal`` is unpack_contact's already-normalized output. The second
+    normalization below matches write_contact exactly. Expanded endpoint/dot
+    terms have at most sixteen rounding factors. The positive absolute scale
+    has at most eight sequential factors, so gamma16/(1-gamma8) also covers
+    its downward rounding. The constants are rounded upward explicitly.
+    """
+    n = wp.normalize(normal)
+    total = ra + rb + ma + mb
+    point_a = position - n * (0.5 * depth + ra)
+    point_b = position + n * (0.5 * depth + rb)
+    distance = wp.dot(point_b - point_a, n)
+    phi = distance - total
+    amplitude = wp.abs(depth) + wp.abs(ra) + wp.abs(rb)
+    scale = wp.abs(ra) + wp.abs(rb) + wp.abs(ma) + wp.abs(mb)
+    for axis in range(3):
+        component = wp.abs(n[axis])
+        scale += component * (2.0 * wp.abs(position[axis]) + component * amplitude)
+    error = _next_up(_next_up(wp.static(_INTERVAL_FACTOR) * scale) + wp.static(_INTERVAL_UNDERFLOW))
+    lower = _next_down(phi - error)
+    upper = _next_up(phi + error)
+    # Finite endpoints catch intermediate overflow even if later arithmetic
+    # could otherwise hide it. Invalid intervals cause the caller's sticky
+    # failure, never an implicit geometry drop or a broadened admission gap.
+    for axis in range(3):
+        if not wp.isfinite(n[axis]) or not wp.isfinite(point_a[axis]) or not wp.isfinite(point_b[axis]):
+            lower = wp.inf
+    if not wp.isfinite(total) or not wp.isfinite(distance) or not wp.isfinite(amplitude) or not wp.isfinite(scale):
+        lower = wp.inf
+    return wp.vec3(phi, lower, upper)
 
 
 @wp.struct
@@ -43,6 +124,7 @@ class PairCSRData:
     offsets: wp.array[int]
     cursors: wp.array[int]
     ids: wp.array[int]
+    separation: wp.array[wp.vec2]
     status: wp.array[int]
     pair_index: int
 
@@ -114,18 +196,25 @@ def count_contacts(
             continue
         if types[a] != GeoType.HFIELD or (types[b] != GeoType.BOX and types[b] != GeoType.CONVEX_MESH):
             data.raw_pair[contact_id] = -1
-        elif _stock_writer_accepts(
-            contact_id,
-            data.reducer.position_depth,
-            data.reducer.normal,
-            data.reducer.shape_pairs,
-            types,
-            shape_data,
-            gaps,
-        ):
-            wp.atomic_add(data.counts, pair, 1)
         else:
-            data.raw_pair[contact_id] = -2
+            point, n, depth = unpack_contact(contact_id, data.reducer.position_depth, data.reducer.normal)
+            interval = _writer_separation_interval(
+                point,
+                n,
+                depth,
+                compute_effective_radius(types[a], shape_data[a]),
+                compute_effective_radius(types[b], shape_data[b]),
+                shape_data[a][3],
+                shape_data[b][3],
+            )
+            if not wp.isfinite(interval[0]) or not wp.isfinite(interval[1]) or not wp.isfinite(interval[2]):
+                data.raw_pair[contact_id] = -2
+                wp.atomic_or(data.status, 0, 32)
+            elif not (interval[0] > gaps[a] + gaps[b]):
+                data.separation[contact_id] = wp.vec2(interval[1], interval[2])
+                wp.atomic_add(data.counts, pair, 1)
+            else:
+                data.raw_pair[contact_id] = -2
 
 
 @wp.kernel(enable_backward=False)
@@ -194,6 +283,21 @@ def create_export_kernel(writer_func):
         scores = wp.tile_zeros(shape=32, dtype=wp.uint64, storage="shared")
         for pair in range(block, pair_count[0], total_blocks):
             begin, end = data.offsets[pair], data.offsets[pair + 1]
+            if begin == end:
+                continue
+            # One additional membership scan; intervals were decoded once in
+            # count_contacts. The min-upper cohort contains all potentially
+            # active witnesses, or the closest represented positive footprint.
+            nearest = wp.uint64(0)
+            for index in range(begin + lane, end, width):
+                contact_id = data.ids[index]
+                upper = data.separation[contact_id][1]
+                key = (wp.uint64(float_flip(-upper)) << wp.uint64(32)) | (wp.uint64(0xFFFFFFFF) - wp.uint64(contact_id))
+                nearest = wp.max(nearest, key)
+            wp.tile_scatter_masked(scores, lane, nearest, True)
+            nearest_key = wp.tile_reduce(wp.max, scores)[0]
+            nearest_id = int(wp.uint64(0xFFFFFFFF) - (nearest_key & wp.uint64(0xFFFFFFFF)))
+            cutoff = wp.max(0.0, data.separation[nearest_id][1])
             selected = wp.vec4i(0)
             p0, p1, p2, n0 = wp.vec3(0.0), wp.vec3(0.0), wp.vec3(0.0), wp.vec3(0.0)
             for stage in range(4):
@@ -208,7 +312,14 @@ def create_export_kernel(writer_func):
                     ):
                         continue
                     pd = data.reducer.position_depth[contact_id]
-                    score = _selection_score(stage, wp.vec3(pd[0], pd[1], pd[2]), pd[3], p0, p1, p2, n0)
+                    interval = data.separation[contact_id]
+                    score = -interval[1]
+                    if stage > 0 and interval[0] <= cutoff:
+                        # Spread scores are nonnegative; all outside-cohort
+                        # upper bounds are positive. The existing full32-bit
+                        # score therefore gives exact priority without adding
+                        # another reduction or dropping score precision.
+                        score = _selection_score(stage, wp.vec3(pd[0], pd[1], pd[2]), pd[3], p0, p1, p2, n0)
                     key = (wp.uint64(float_flip(score)) << wp.uint64(32)) | (
                         wp.uint64(0xFFFFFFFF) - wp.uint64(contact_id)
                     )
@@ -360,7 +471,7 @@ def get_query_kernels():
 
 
 class PairCSR:
-    """Own integer membership while retaining the calibrated raw geometry pool."""
+    """Own membership and arithmetic intervals for the calibrated raw pool."""
 
     def __init__(self, reducer, pair_capacity, triangle_capacity, device):
         self.data = data = PairCSRData()
@@ -368,11 +479,12 @@ class PairCSR:
         data.triangle_pair = wp.empty(triangle_capacity, dtype=int, device=device)
         data.raw_pair = wp.empty(reducer.capacity + 1, dtype=int, device=device)
         data.ids = wp.empty(reducer.capacity, dtype=int, device=device)
+        data.separation = wp.empty(reducer.capacity + 1, dtype=wp.vec2, device=device)
         data.counts = wp.zeros(pair_capacity + 1, dtype=int, device=device)
         data.offsets = wp.empty(pair_capacity + 1, dtype=int, device=device)
         data.cursors = wp.zeros(pair_capacity, dtype=int, device=device)
         data.status = wp.zeros(1, dtype=int, device=device)
-        for name in ("triangle_pair", "raw_pair", "ids", "counts", "offsets", "cursors", "status"):
+        for name in ("triangle_pair", "raw_pair", "ids", "separation", "counts", "offsets", "cursors", "status"):
             setattr(self, name, getattr(data, name))
         self.device = device
         self.midphase, self.finite, self.generic = get_query_kernels()

@@ -13,7 +13,13 @@ from newton._src.geometry.contact_reduction_global import (
     GlobalContactReducerData,
     export_contact_to_buffer,
 )
-from newton._src.geometry.heightfield_pair_csr import PairCSRData, _write_pair
+from newton._src.geometry.heightfield_pair_csr import (
+    PairCSRData,
+    _next_down,
+    _next_up,
+    _write_pair,
+    _writer_separation_interval,
+)
 from newton._src.geometry.types import GeoType
 from tools.fpgs_bench import test_heightfield_adaptive_manifold as adaptive_tests
 
@@ -52,10 +58,160 @@ def overflow_raw_writer(data: PairCSRData):
         _write_pair(contact, local, -1)
 
 
+@wp.kernel
+def evaluate_intervals(
+    points: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
+    depths: wp.array[float],
+    parameters: wp.array[wp.vec4],
+    result: wp.array[wp.vec3],
+    represented_normal: wp.array[wp.vec3],
+):
+    index = wp.tid()
+    p = parameters[index]
+    result[index] = _writer_separation_interval(points[index], normals[index], depths[index], p[0], p[1], p[2], p[3])
+    represented_normal[index] = wp.normalize(normals[index])
+
+
+@wp.kernel
+def evaluate_successors(values: wp.array[float], result: wp.array[wp.vec2]):
+    index = wp.tid()
+    result[index] = wp.vec2(_next_down(values[index]), _next_up(values[index]))
+
+
 class TestHeightfieldPairCSR(unittest.TestCase):
     loaded_feature_env = "NEWTON_HEIGHTFIELD_PAIR_CSR"
     loaded_feature_attribute = "_heightfield_pair_csr"
     loaded_report_label = "PAIR_CSR_QUALIFICATION"
+
+    def _interval_arithmetic(self, device):
+        from newton._src.geometry.heightfield_pair_csr import count_contacts  # noqa: PLC0415
+
+        self.assertIs(count_contacts.module.options["fast_math"], False)
+        values = np.array(
+            [
+                0.0,
+                -0.0,
+                1.0,
+                -1.0,
+                np.finfo(np.float32).tiny,
+                -np.finfo(np.float32).tiny,
+                np.finfo(np.float32).max,
+                -np.finfo(np.float32).max,
+                np.inf,
+                -np.inf,
+                np.nan,
+            ],
+            dtype=np.float32,
+        )
+        successors = wp.empty(len(values), dtype=wp.vec2, device=device)
+        wp.launch(
+            evaluate_successors, dim=len(values), inputs=[wp.array(values, device=device), successors], device=device
+        )
+        with np.errstate(over="ignore", invalid="ignore"):
+            expected = np.column_stack(
+                (np.nextafter(values, np.float32(-np.inf)), np.nextafter(values, np.float32(np.inf)))
+            )
+        np.testing.assert_array_equal(successors.numpy(), expected)
+
+        points = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [0.1, -0.1, 0.0025],
+                [1e5, -1e5, 1e5],
+                [1e5, -1e5, 1e5],
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        normals = np.array([[0, 0, 1], [0, 0, 1], [0, 0, 1], [0.6, 0.8, 0], [0, 0, 1], [0, 0, 1]], dtype=np.float32)
+        depths = np.array([0.005, 0.008, 0.005, 0.012, 0.001, -0.001], dtype=np.float32)
+        # Includes zero/negative authored margins and nonzero radii, without
+        # changing the stock separation algebra or widening the detection gap.
+        parameters = np.array(
+            [
+                [0, 0, 0.0025, 0.0025],
+                [0, 0, 0.0025, 0.0025],
+                [0, 0, 0.0025, 0.0025],
+                [0.01, 0.02, 0.0025, 0.0025],
+                [0, 0, 0, 0],
+                [0, 0, -0.002, -0.003],
+            ],
+            dtype=np.float32,
+        )
+        intervals = wp.empty(len(points), dtype=wp.vec3, device=device)
+        represented = wp.empty(len(points), dtype=wp.vec3, device=device)
+        wp.launch(
+            evaluate_intervals,
+            dim=len(points),
+            inputs=[
+                wp.array(points, dtype=wp.vec3, device=device),
+                wp.array(normals, dtype=wp.vec3, device=device),
+                wp.array(depths, device=device),
+                wp.array(parameters, dtype=wp.vec4, device=device),
+                intervals,
+                represented,
+            ],
+            device=device,
+        )
+        actual, n = intervals.numpy().astype(float), represented.numpy().astype(float)
+        p = parameters.astype(float)
+        exact = (depths.astype(float) + p[:, 0] + p[:, 1]) * np.sum(n * n, axis=1) - p.sum(axis=1)
+        self.assertTrue(np.isfinite(actual).all())
+        self.assertTrue(np.all(actual[:, 1] <= exact), (actual, exact))
+        self.assertTrue(np.all(exact <= actual[:, 2]), (actual, exact))
+        self.assertTrue(np.all(actual[:, 1] < actual[:, 0]))
+        self.assertTrue(np.all(actual[:, 0] < actual[:, 2]))
+        # Large-center cancellation broadens the arithmetic interval; it must
+        # not fabricate precision or silently become a geometric certificate.
+        self.assertGreater(actual[2, 2] - actual[2, 1], actual[0, 2] - actual[0, 1])
+        np.testing.assert_allclose(actual[[4, 5], 0], [0.001, 0.004], rtol=1e-6, atol=1e-9)
+
+        from newton._src.geometry.heightfield_pair_csr import PairCSR  # noqa: PLC0415
+
+        reducer = GlobalContactReducer(4, device=device)
+        owner = PairCSR(reducer, 1, 1, device=device)
+        pairs = wp.array([(0, 1)], dtype=wp.vec2i, device=device)
+        pair_count = wp.array([1], dtype=int, device=device)
+        types = wp.array([GeoType.HFIELD, GeoType.BOX], dtype=int, device=device)
+        gaps = wp.full(2, 0.01, dtype=float, device=device)
+        for margins, center, expected_count, expected_status in (
+            ((0.0, 0.0), 0.0, 1, 0),
+            ((-0.002, -0.003), 0.0, 0, 0),
+            # All source fields are finite, but 2*|center| overflows the
+            # interval scale. A broad/NaN cohort must not hide this failure.
+            ((0.0, 0.0), 3e38, 0, 32),
+        ):
+            reducer.contact_count.zero_()
+            owner.status.zero_()
+            wp.launch(
+                seed_raw_pool,
+                dim=1,
+                inputs=[
+                    reducer.get_data_struct(),
+                    owner.raw_pair,
+                    pairs,
+                    wp.array([(center, 0.0, 0.0)], dtype=wp.vec3, device=device),
+                    wp.array([(1.0, 0.0, 0.0)], dtype=wp.vec3, device=device),
+                    wp.array([0.018], dtype=float, device=device),
+                    wp.array([0], dtype=int, device=device),
+                ],
+                device=device,
+            )
+            shape_data = wp.array([(0.0, 0.0, 0.0, m) for m in margins], dtype=wp.vec4, device=device)
+            owner.build(pairs, pair_count, types, shape_data, gaps, 32)
+            self.assertEqual(int(owner.counts.numpy()[0]), expected_count)
+            self.assertEqual(int(owner.status.numpy()[0]), expected_status)
+
+    def test_interval_arithmetic_cpu(self):
+        """Bound represented-witness arithmetic, including margins and cancellation."""
+        self._interval_arithmetic("cpu")
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Root owns CUDA execution")
+    def test_interval_arithmetic_cuda(self):
+        """Check native outward rounding and the same finite arithmetic controls."""
+        self._interval_arithmetic("cuda:0")
 
     def test_module_exists(self):
         """Require the independently owned pair-CSR implementation."""
@@ -194,6 +350,48 @@ class TestHeightfieldPairCSR(unittest.TestCase):
     def test_stock_nxn_reset_cpu(self):
         """Preserve live geometry and clear stale CSR membership after empty frames."""
         self._stock_nxn_reset("cpu")
+
+    def _nearest_footprint(self, device):
+        q = adaptive_tests.qualification_module()
+        for name in ("support", "rebound"):
+            with self.subTest(case=name):
+                case = next(case for case in q.CASES if case.name == name)
+                with patch.dict(
+                    os.environ,
+                    {
+                        "NEWTON_HEIGHTFIELD_PAIR_CSR": "1",
+                        "NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD": "0",
+                        "NEWTON_HEIGHTFIELD_GEOMETRIC_CULL": "1",
+                    },
+                ):
+                    scene = q.build_scene(case, True, device, make_solver=False)
+                scene.pipeline.collide(scene.states[0], scene.contacts)
+                observed = q.geometry(scene, scene.states[0])
+                self.assertEqual(observed["contacts"], 4)
+                # The actual raw pool includes side witnesses 3--4 cm away.
+                # A resting or uniformly approaching planar footprint must not
+                # lose three near-surface constraints to those outer witnesses.
+                normal = scene.contacts.rigid_contact_normal.numpy()[:4]
+                np.testing.assert_allclose(normal, np.tile(scene.normal, (4, 1)), rtol=0.0, atol=3e-5)
+                np.testing.assert_allclose(scene.distance.numpy()[:4], case.gap, rtol=0.0, atol=3e-6)
+                points = scene.point0.numpy()[:4, :2].astype(float)
+                self.assertGreater(float(np.ptp(points[:, 0])), 0.15)
+                self.assertGreater(float(np.ptp(points[:, 1])), 0.12)
+                # Origin lies inside the selected support polygon. This is a
+                # geometry regression, not a replacement for loaded dynamics.
+                points = points[np.argsort(np.arctan2(points[:, 1], points[:, 0]))]
+                following = np.roll(points, -1, axis=0)
+                cross = points[:, 0] * following[:, 1] - points[:, 1] * following[:, 0]
+                self.assertTrue(np.all(cross >= -1e-7), points)
+
+    def test_nearest_footprint_cpu(self):
+        """Retain active and all-positive nearest footprints from actual query pools."""
+        self._nearest_footprint("cpu")
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Root owns CUDA execution")
+    def test_nearest_footprint_cuda(self):
+        """Check the native selector without changing the loaded fixture or gates."""
+        self._nearest_footprint("cuda:0")
 
     def _stock_nxn_reset(self, device):
         q = adaptive_tests.qualification_module()
