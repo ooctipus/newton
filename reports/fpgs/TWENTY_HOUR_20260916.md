@@ -196,3 +196,48 @@ Evidence: `/tmp/fpgs-g1-chain-vector-whole-paired16k-20260916-01`.
 This is a discovery gain, not repeated qualification or the4x target.
 No further mapping, register or arithmetic micro-tuning is funded for this
 candidate. Check repeatability and move to a larger work-retirement boundary.
+
+### Three-round repeat and second funded boundary
+
+Three alternating paired rounds complete with all12 children clean and all
+24 boundaries passing. Median physics15.672744 ->15.091197 ms RTX (1.038535x),
+20.452424 ->19.848266 ms GB (1.030439x). Candidate samples:
+RTX[15.091197,15.086214,15.095232], GB[19.848266,19.842375,19.883883] ms.
+Median environment wall29.609188 ->29.377521 ms RTX,34.177377 ->34.317887 GB.
+This confirms a modest physics gain, not a substantial environment-wall gain.
+Evidence: `/tmp/fpgs-g1-chain-vector-repeat-paired16k-20260916-01`.
+The explicit G1 recipe may retain CHAIN_SCAN=1; unrelated task owners remain
+unchanged. No further traversal tuning is planned.
+
+Second boundary funded at12:14 UTC: model-compiled coordinate-to-current-state
+production. First native-ready checkpoint13:04, no silent extension beyond
+13:34. Reusable exact per-model FIXED/scalar joint descriptors replace repeated
+local transform and motion-axis reconstruction. Joint-owned qdd conversion,
+original free-root transport, integration and local pose formation carry scalar
+coordinates in registers, publishing all original qdd/q/qd outputs. Keep the
+old scalar integration arithmetic, all root COM/normalization/damping laws,
+kinematic DOF v_out side effects and kinematic joint copy behavior. One join
+before pose scan replaces the separate preparatory joins; tree traversal is
+the unchanged now-measured vector-chain implementation.
+
+Relative scalar quaternions use precomputed A*cos(q/2)+B*sin(q/2); prismatic
+translation is constant-plus-linear. Motion axes come from the already computed
+child pose and constant child-local screw, not a reconstructed parent anchor.
+Use the live body's COM point once for physical and public state. The original
+solver builds body_X_com=(body_com,identity rotation), so its repeated rotation
+product is unnecessary; no approximate inertia or principal-axis change.
+
+Descriptor constants are exactly deduplicated, with a per-joint index map
+(approximately2.75 MiB for16K G1) and about80 bytes per unique descriptor;
+worst-case unique count is bounded by the existing joint count. Charge the
+added indexed reads, constructor cost and register liveness. G1's existing
+static axis/anchor proof protects these constants; mass/COM/inertia remain
+live. General/free cases preserve original laws. No new per-step launch or
+world-state intermediate. Keep current bias/geometric434, held W, all contact,
+solve, sensor and public-state contracts.
+
+Source retirement includes redundant quaternion/point transformations and
+qdd/qnext reloads, not just type dispatch. It does not establish that half the
+state family or10% of whole physics will disappear. Reuse original CPU/native
+physical controls plus focused general-child-frame/kinematic algebra tests,
+then an early complete whole screen. Do not extend into a math/mapping sweep.
