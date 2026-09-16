@@ -1217,3 +1217,146 @@ kernels and replaces bin/hash bookkeeping with variable-cardinality pair
 membership over the existing raw witness buffer. A fixed four-record query
 pool is expressly not the design. Native-ready checkpoint20:30 UTC; root
 retains exclusive GPU scheduling and the early complete-cost decision.
+
+### Concurrent spectral and pair-CSR checkpoints,19:30 UTC
+
+The concurrent spectral proposal preserves the earlier parallel delta-response
+recurrence and permanent half-step latch, but removes local roots/Schur work
+and the ordered contact loop. Same24-pass maximum and original staging,
+whitening, decode, capacities and complete unsupported fallback. Default-off
+`FEATHER_PGS_SPECTRAL_JACOBI`; isolated tree
+`newton-fpgs-spectral-jacobi-20260916`, runtime SHA256
+`8fd17fcbdb8ffce9b2df33d4ce226636ebf82047b5df7dc7f983e121a57b0065`.
+
+CPU2048 saved cases: no hard failures;1982 closer to the fixed velocity
+reference,66 genuine regressions. Scaled kinetic error median/p99/max changes
+0.006389918/0.031995761/0.055738454 to
+0.000118792/0.006623684/0.018130025. Maximum regression excess0.007910961;
+these tails are not declared converged away. Counted operator+setup products
+49.830876M versus84.268494M; physical merit/projection and synchronization are
+additional work, not free. CPU artifact
+`/tmp/fpgs-spectral-jacobi-cpu-etPRAs/`; four exact-capacity AOT builds pass,
+zero spills, with86/91 registers on RTX and87/101 on GB.
+
+Native saved-operator replay completes on both cards,2048 hard checks pass,
+eight CPU/native translation controls have scaled kinetic velocity
+error<=1.21146e-5. Despite lower counted products, original/candidate replay
+is roughly0.048/0.095ms RTX tier32 and0.052/0.095ms tier48;
+GB0.050/0.101 and0.054/0.101ms. Replay includes identical output restore and
+is not extrapolated to whole-task speed. Artifact
+`/tmp/fpgs-spectral-jacobi-native-20260916-AbNbPv7B/`.
+This recovers much of the ordered prototype's loss, not parity or a gain.
+One complete paired whole-physics screen is running; the cause review now
+charges physical stopping/merit and operator synchronization rather than
+assuming arithmetic retirement predicts time.
+
+Pair-CSR runtime and focused tests are ready, earlier than the20:30 checkpoint.
+The full raw pool is retained; count/scan/scatter supplies variable-length
+pair buckets with no fixed per-pair cap. Selection uses all stock-writer-
+accepted raw witnesses, so this is a different manifold from selecting old
+hash survivors. Separate original finite/generic queries remain. Stock-writer,
+unique-pair and supported-mode admission is checked; unsupported contacts
+alone reach old reduction/export. Added integer storage is
+4*(triangle_capacity+2*raw_capacity+3*pair_capacity+4) bytes,20.8125MiB at
+the unchanged G1 capacities. Original fallback geometry/hash storage remains.
+
+Seven CPU controls, native-code AOT and full/targeted pre-commit pass. A real
+raw-overflow test exposed that the public status(clear=True) API must return
+the CSR error before clearing it; the implementation now does so. Actual
+CPU CollisionPipeline objects pass the literal observer in both flag arms;
+six wrong-dispatch/ownership/status cases reject. This is dispatch evidence,
+not physical quality. Native loaded controls and early whole cost follow.
+No new candidate is promoted, and no Isaac Lab code was edited.
+
+### Cause-directed corrections,19:53 UTC
+
+Concurrent spectral whole-task screen completed with all source/idle/ownership
+and capacity checks passing: RTX9.218097850->12.435956575ms (0.741246x),
+GB9.483441025->14.137671900ms (0.670792x). Artifact
+`/tmp/fpgs-anymal-spectral-jacobi-whole-paired16k-20260916-01`.
+An output-only adaptation of the existing five-phase clock observer preserves
+byte-identical physical outputs on both cards and strips back to production
+source exactly. In the instrumented owner, merit/commit occupies52.35--54.57%
+on RTX and53.44--55.74% on GB; proposals another roughly15%, operators11%,
+preparation14--16%. Its changed register use means these fractions are not
+uninstrumented task-time measurements. Artifact
+`/tmp/fpgs-spectral-jacobi-phase-f78F1Iy2/`.
+
+The old counted-products prediction omitted repeated invariant divisions and
+square roots inside full physical merit. Across the frozen CPU schedules the
+literal native map repeats6.451M invariant-denominator divisions and1.398M
+invariant diagonal square roots. The original Nesterov owner instead caches
+its step and has a cheap delta exit. One cause-directed correction is funded:
+compute proposal reciprocals and physical-merit weights once, recycling the
+same three shared caches, while retaining every merit term, stop, permanent
+latch, physical operator and24-pass maximum. No removal of validation from
+the solver algorithm and no mapping grid. It must save4.218ms relative to the
+losing RTX candidate to reach original-minus1ms. That recovery is unproven.
+Pre-correction source/evidence is committed/pushed as
+`5f1548faccf787e2930c06cdb7f5e1e65284bf38`.
+
+Pair-CSR whole02: RTX15.036678875->14.161686525ms (1.061786x),
+GB19.870284175->18.936348000ms (1.049320x), source/idle/capacity checks pass.
+The0.875/0.934ms savings are below the standalone1ms milestone and are NOT
+accepted because loaded support fails. Whole01 stopped before measurement:
+the new public CSR capacity flag was correctly exposed by runtime, but root
+had not extended the pinned observer's exact permitted-key set. The wrapper
+now adds exactly that one named flag only when explicitly requested; full
+actual CPU pipeline checks pass both arms and reject sticky failure. Old
+failure artifacts remain.
+
+First four native routing/reset/overflow controls pass both cards. The first
+loaded attempt failed before stepping because root omitted the fixture's
+existing `FEATHER_PGS_GROUP_LANES=16`; it was NOT a CSR physics failure. The
+correct repeated recipe also uses `FEATHER_PGS_ROWS_MASKED=1` and
+`NEWTON_NARROW_PHASE_THREADS_X=4`; no runtime change was made for this setup.
+Corrected logs `/tmp/fpgs-pair-csr-loaded-20260916-HBoLF6K6/gpu{0,1}.log`
+complete18 cases/card and expose actual candidate failures: flat/tilted/yaw/
+step support does not settle. Flat support final spin0.5844rad/s versus old
+about1e-6; penetration0.675mm. Weight average and momentum/cone pass, showing
+that these checks alone do not certify the manifold. No gate is relaxed.
+
+The causal CPU geometry study finds that unrestricted spread over all raw
+witnesses keeps one near-vertical support witness and three distant positive-
+gap side witnesses. Those side witnesses are valid detection candidates, but
+cannot replace the load-bearing footprint. Four outputs are not in themselves
+a correct manifold. MJWarp's inspected heightfield producer uses zero-cutoff
+queries of margin-inflated geometry, not Newton's full positive detection-gap
+domain; there is no established identical pre-selection eligibility rule to
+copy. An activation/nearest-depth priority correction is under study, with
+operation-scaled roundoff handling, not guessed distance/angle thresholds.
+
+Strict node audit `/tmp/fpgs-pair-csr-strict-UGnL9ijL/` proves48 physics and12
+auxiliary roots with zero unproven nodes. Original full hash reduction is
+absent; only fallback export remains. RTX hash clear falls0.659046->0.007328ms;
+new count/scan/scatter/fallback reduction/export plus retained fallback export
+cost0.558189ms. CSR exporter alone0.368163ms RTX/0.627026ms GB. Compared with
+the qualified chain, rows get WORSE by0.175580/0.189590ms while GS saves
+0.392467/0.464824ms. The raw manifold differs from old-survivor adaptive4;
+its previously measured downstream savings cannot simply be carried over.
+
+The previously CPU-screened ordered spectral policy is also reopened for one
+G1-specific cost screen. Unlike ANYmal's parallel baseline, G1 already uses
+ordered fused transactions, so it need not incur a new sequential dependency
+chain. This retires the complete metric inverse/root/KKT proposal, retaining
+the current physical operator, normal-first transaction, own-parent cone,
+CFM denominators and eight sweeps. Isolated default-off branch
+`ooctipus/fpgs-g1-spectral-tangents-20260916` starts at qualified chain ef9481,
+without CSR or shell. Native transaction/current-held/graph/empty/saved16
+controls pass on both cards; full native translation uses the frozen CPU map,
+not a claim that every finite-budget case improves. AOT64 registers versus
+original72, unchanged1116B shared, no spills. First whole screen is running.
+
+Read-only collision-coherence audit did not fund duplicate work: the proposed
+cached-axis/current-support rejection already exists for Allegro. Franka's
+entire relevant generic owner is0.481ms and Kuka's GJK+MPR owners total
+0.960673ms RTX before necessary cache/support overhead, below this study's
+1ms structural threshold. Current Kuka uses explicit pairs; its historical
+kernel name alone was not evidence of NXN admission. No new implementation.
+
+G1 spectral whole screen completed19:54 with all guards passing:
+RTX15.031834625->14.480169350ms (1.038098x),
+GB19.837211200->18.904325600ms (1.049348x). Positive but below the1ms RTX
+standalone milestone; default-off and not promoted. Preserve it as a possible
+composition component, without funding instruction/mapping micro-tuning or a
+new qualification campaign before a material combined whole-task gain exists.
