@@ -979,3 +979,66 @@ pairs provide a CPU falsification screen only; they do not cover the next
 scheduled refresh, resets or a whole-task population. Charge matrix assembly,
 all passes, residual/norm checks, retained factor storage and full fallback.
 No runtime implementation or speedup is implied by this question.
+
+## Warm-factor and field-major screens closed, 17:16 UTC
+
+The three-pass warm Jacobi Cholesky screen fails the existing current-H
+operator and predictor backward checks in all seven retained one-step pairs,
+despite positive pivots. Actual energy-operator defects are 1.98%--8.05%; the
+exact inverse is not the failure. The unfinished factor dependency propagation
+is. Three passes plus unchanged exact inversion and a residual check require
+11,644 counted products versus 4,484 original, before norms and fallback.
+This is not a measured runtime comparison. No native implementation is funded.
+The initial rounded-LLT off-pattern initialization assertion is retained; the
+corrected study uses independently reconstructed previous physical H rather
+than truncating a factor. Exact formulation and outputs:
+`/tmp/fpgs-g1-warm-jacobi3-A6251f/RESULTS.md`, SHA256
+`3d3e5a4ca468faae2e07012c256bd7946e1b5090314c0093d7643d6529cbcc43`.
+
+A distinct field-major solver screen replaces per-row warp reductions with
+one independent world per GPU lane, transposed contact fields, private
+shared-coordinate state, and a separately charged canonical-W decode.
+Original finite-eight transactions, native tangent root, scalar fallback and
+incoming-impulse semantics remain. There is no production hook or W transpose.
+CPU and two native selectors per GPU pass, including sixteen physical saved
+cases and thirty-five mapped worlds with graph/stale-state controls.
+
+Actual full16K last-solved inputs reproduce the original solver exactly on
+both cards. Valid complete-component medians (ms per call) are:
+
+| GPU | Original GS+decode | Field-major GS+decode | Original/candidate |
+| --- | ---: | ---: | ---: |
+| RTX | 0.507535994 | 3.791040063 | 0.13387777x |
+| GB | 0.557071984 | 3.533216000 | 0.15766712x |
+
+Ten warmup and forty measured balanced AB/BA rounds restore cold inputs outside
+every event. Both candidate kernels are charged; packing is explicitly excluded.
+All16,384 worlds per card pass hard finite/cone/sign/momentum checks and native
+velocity-reference tolerances. One GB complementarity diagnostic worsens,
+without a hard-law failure. The loss therefore is not attributed to physics
+rejection. Valid artifact:
+`/tmp/fpgs-g1-field-major-component-paired16k-20260916-02`.
+Run01's helper-hash edit during execution correctly fails its source guard and
+is preserved separately. No accepted result relies on it.
+
+The intended collective retirement occurred: no main-kernel spills, explicit
+barriers or shuffles. But main work exposes only512 warps rather than16,384,
+serializes up-to18-term support operations, reloads coefficients, moves impulse
+and cross scratch into global memory, and incurs divergent row/root work.
+These are source/resource facts, not hardware-counter causal percentages.
+Even with free packing the component needs roughly9--11x improvement to reach
+its declared saving target. No justified single correction supports that;
+the path is closed without a subgroup grid or production rewrite. Detailed
+source/native/resource/quality pins: `FIELD_MAJOR_GS_20260916.md`.
+
+The next bounded structural question revisits finite contact representation,
+not another execution mapping. MJWarp's adaptive four-witness selection is
+distinct from the previously failed four fixed directions. A different
+manifold can be a legitimate approximation; lack of bit identity or exact
+old pointwise friction is not itself a rejection. It must still preserve
+physical support, impact/friction behavior and convergence against its own
+discretization. Current geometry and complete selection/export cost must
+justify funding before implementation; normal-bin equality is not a plane
+certificate, and voxel exports cannot silently resurrect suppressed points.
+No contact is dropped from current production, no capacity or Lab code changes,
+and no gain is claimed from this open question.
