@@ -2303,6 +2303,14 @@ class NarrowPhase:
     requires finite query, cell rejection and the stock nonpredictive global
     reducer. Current scale, poses, heights, gaps and scaled reducer threshold
     remain live; unsupported geometry and custom writers retain the old path.
+
+    Experimental ``NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD=1`` replaces final
+    global-reducer export with a pair-level adaptive four-witness manifold for
+    ordinary heightfield/box and heightfield/convex contacts. This is a new
+    discretization, not an equivalent pointwise Coulomb system. Selected
+    witnesses retain their own normals/depths/materials. Unsupported pairs
+    preserve all old survivors; custom writers, speculative, deterministic
+    and hydroelastic modes retain the original exporter.
     """
 
     def __init__(
@@ -2463,6 +2471,23 @@ class NarrowPhase:
             and self._heightfield_finite_query
             and reduce_contacts
             and geometric_writer_supported
+        )
+        adaptive_manifold = os.environ.get("NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD", "0")
+        if adaptive_manifold not in ("0", "1"):
+            raise ValueError("NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD must be 0 or 1")
+        adaptive_writer_supported = False
+        if adaptive_manifold == "1" and contact_writer_warp_func is not None:
+            from ..sim.collide import write_contact as adaptive_stock_writer  # noqa: PLC0415
+
+            adaptive_writer_supported = contact_writer_warp_func is adaptive_stock_writer
+        self._heightfield_adaptive_manifold = (
+            adaptive_manifold == "1"
+            and has_heightfields
+            and reduce_contacts
+            and not speculative
+            and not deterministic
+            and hydroelastic_sdf is None
+            and adaptive_writer_supported
         )
         self._finite_bounds = None
         self._finite_source = None
@@ -2661,6 +2686,10 @@ class NarrowPhase:
             # Global contact reducer uses hardcoded BETA_THRESHOLD (0.1mm) same as shared-memory reduction
             # Slot layout: NUM_SPATIAL_DIRECTIONS spatial + 1 max-depth = VALUES_PER_KEY slots per key
             self.export_reduced_contacts_kernel = create_export_reduced_contacts_kernel(writer_func)
+            if self._heightfield_adaptive_manifold:
+                from .heightfield_manifold import create_export_kernel  # noqa: PLC0415
+
+                self.export_reduced_contacts_kernel = create_export_kernel(writer_func)
             # Global contact reducer for all mesh contact types
             self.global_contact_reducer = GlobalContactReducer(
                 max_triangle_pairs,
@@ -3477,26 +3506,38 @@ class NarrowPhase:
                     1,
                     EXPORT_REDUCED_CONTACTS_THREAD_BUDGET_MULTIPLIER * self.total_num_threads // effective_block_dim,
                 )
+                export_inputs = [
+                    self.global_contact_reducer.hashtable.keys,
+                    self.global_contact_reducer.ht_values,
+                    self.global_contact_reducer.hashtable.active_slots,
+                    self.global_contact_reducer.position_depth,
+                    self.global_contact_reducer.normal,
+                    self.global_contact_reducer.shape_pairs,
+                    self.global_contact_reducer.contact_fingerprints,
+                    self.global_contact_reducer.exported_flags,
+                    shape_types,
+                    shape_data,
+                    shape_gap,
+                    writer_data,
+                    export_num_blocks,
+                    int(self.block_dim > 1),
+                    int(self.global_contact_reducer.deterministic),
+                ]
+                if self._heightfield_adaptive_manifold:
+                    export_inputs.extend(
+                        [
+                            self.shape_pairs_mesh,
+                            self.shape_pairs_mesh_count,
+                            self.shape_pairs_mesh_plane,
+                            self.shape_pairs_mesh_plane_count,
+                            self.shape_pairs_mesh_mesh,
+                            self.shape_pairs_mesh_mesh_count,
+                        ]
+                    )
                 wp.launch_tiled(
                     kernel=self.export_reduced_contacts_kernel,
                     dim=export_num_blocks,
-                    inputs=[
-                        self.global_contact_reducer.hashtable.keys,
-                        self.global_contact_reducer.ht_values,
-                        self.global_contact_reducer.hashtable.active_slots,
-                        self.global_contact_reducer.position_depth,
-                        self.global_contact_reducer.normal,
-                        self.global_contact_reducer.shape_pairs,
-                        self.global_contact_reducer.contact_fingerprints,
-                        self.global_contact_reducer.exported_flags,
-                        shape_types,
-                        shape_data,
-                        shape_gap,
-                        writer_data,
-                        export_num_blocks,
-                        int(self.block_dim > 1),
-                        int(self.global_contact_reducer.deterministic),
-                    ],
+                    inputs=export_inputs,
                     device=device,
                     block_dim=EXPORT_REDUCED_CONTACTS_BLOCK_DIM,
                     record_tape=False,
