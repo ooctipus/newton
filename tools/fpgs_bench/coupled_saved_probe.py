@@ -98,7 +98,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gpu-source", type=int, choices=(0, 1), required=True)
     parser.add_argument(
-        "--candidate", choices=("coupled_contact", "coupled_jacobi", "spectral_contact"), default="coupled_contact"
+        "--candidate",
+        choices=("coupled_contact", "coupled_jacobi", "spectral_contact", "spectral_jacobi"),
+        default="coupled_contact",
     )
     parser.add_argument("--candidate-sha", help="Required frozen source SHA for a new native candidate")
     parser.add_argument("--register-whitening", action="store_true", help="Retain the accepted register row producer")
@@ -109,6 +111,8 @@ def main():
     native_sha = args.candidate_sha or NATIVE_SHA
     source_path = Path(candidate_module.__file__)
     assert hashlib.sha256(source_path.read_bytes()).hexdigest() == native_sha
+    for name, digest in getattr(candidate_module, "SOURCE_PINS", {}).items():
+        assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest
     assert hashlib.sha256(Path(coupled_contact.__file__).read_bytes()).hexdigest() == NATIVE_SHA
     assert hashlib.sha256(HELPER.read_bytes()).hexdigest() == HELPER_SHA
     spec = importlib.util.spec_from_file_location("coupled_existing_physics", HELPER)
@@ -125,6 +129,11 @@ def main():
         cpu_control = importlib.import_module("tools.fpgs_bench.spectral_gs_control")
         assert hashlib.sha256(Path(cpu_control.__file__).read_bytes()).hexdigest() == (
             "a39eb83e4f5b240a24416f96683df0cc5e7453c8f180cbf539f9d752141256c7"
+        )
+    elif args.candidate == "spectral_jacobi":
+        cpu_control = importlib.import_module("tools.fpgs_bench.spectral_jacobi_control")
+        assert hashlib.sha256(Path(cpu_control.__file__).read_bytes()).hexdigest() == (
+            "f3cb2e5e15de8ff7d5b876bbf966d69139c134226a2338d15072ffa998385a70"
         )
     candidate_module.get_parallel_factory.cache_clear()
     print(
@@ -241,6 +250,8 @@ def main():
             assert not hard_failures, "Native hard physical failure; no further timing funded"
             assert len(leases) == 2
     assert hashlib.sha256(source_path.read_bytes()).hexdigest() == native_sha
+    for name, digest in getattr(candidate_module, "SOURCE_PINS", {}).items():
+        assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest
     assert hashlib.sha256(Path(coupled_contact.__file__).read_bytes()).hexdigest() == NATIVE_SHA
     print("COMPLETE", flush=True)
 

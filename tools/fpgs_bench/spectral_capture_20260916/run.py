@@ -31,8 +31,10 @@ def main():
             for run in batch:
                 if run["command"][:2] != ["bash", str(adapter.TOOLS / "nsys_checked.sh")]:
                     raise RuntimeError("Unexpected original capture command")
-                if run["environment"].get("FEATHER_PGS_SPECTRAL_GS") not in ("0", "1"):
+                if run["environment"].get("FEATHER_PGS_SPECTRAL_JACOBI") not in ("0", "1"):
                     raise RuntimeError("Require explicit spectral flags on both arms")
+                if run["environment"].get("FEATHER_PGS_SPECTRAL_GS") != "0":
+                    raise RuntimeError("The closed ordered spectral experiment must stay off")
                 run["command"][1] = str(HERE / "nsys_checked.sh")
             return batch
 
@@ -41,9 +43,9 @@ def main():
             if any(str(HERE / name) not in drivers for name in ("run.py", "checked_capture.py", "nsys_checked.sh")):
                 raise RuntimeError("Spectral observer files missing from source guard")
             report = json.loads((Path(run["output_dir"]) / "capture_checks.json").read_text())
-            wanted = run["environment"]["FEATHER_PGS_SPECTRAL_GS"] == "1"
+            wanted = run["environment"]["FEATHER_PGS_SPECTRAL_JACOBI"] == "1"
             for boundary in report["boundaries"]:
-                item = boundary.get("spectral_gs", {})
+                item = boundary.get("spectral_jacobi", {})
                 if (
                     item.get("check_pass") is not True
                     or item.get("requested") is not wanted
