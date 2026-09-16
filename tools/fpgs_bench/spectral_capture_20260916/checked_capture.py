@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Append spectral-Jacobi owner identity at the original untimed boundaries."""
+"""Append spectral-residual owner identity at the original untimed boundaries."""
 
 import hashlib
 import os
@@ -15,9 +15,11 @@ PIN = "42b289bd0082d194180d5981651a108d11a66058ff4e67649ad7ddb408c9bea6"
 
 def snapshot(solver):
     """Observe factory/configuration, not per-world convergence or admission."""
-    value = os.environ.get("FEATHER_PGS_SPECTRAL_JACOBI")
+    value = os.environ.get("FEATHER_PGS_SPECTRAL_RESIDUAL")
     if value not in ("0", "1"):
-        raise RuntimeError("Require explicit spectral Jacobi on both arms")
+        raise RuntimeError("Require explicit spectral residual on both arms")
+    if os.environ.get("FEATHER_PGS_SPECTRAL_JACOBI") != "0":
+        raise RuntimeError("The previous spectral Jacobi experiment must stay off")
     if os.environ.get("FEATHER_PGS_SPECTRAL_GS") != "0":
         raise RuntimeError("The closed ordered spectral experiment must stay off")
     wanted = value == "1"
@@ -25,9 +27,9 @@ def snapshot(solver):
     if len(kernels) != 2 or solver._par_tiers != [(32, 0), (48, 32)]:
         raise RuntimeError("Unexpected original ANY18 tier ownership")
     for kernel in kernels:
-        if bool(getattr(kernel, "_fpgs_spectral_jacobi", False)) != wanted:
+        if bool(getattr(kernel, "_fpgs_spectral_residual", False)) != wanted:
             raise RuntimeError("Requested spectral factory differs from actual owner")
-        if kernel.key.endswith("_sj24") != wanted:
+        if kernel.key.endswith("_sr24") != wanted:
             raise RuntimeError("Unexpected spectral kernel suffix")
     fields = {
         "max_world_dofs": 18,
@@ -47,7 +49,7 @@ def snapshot(solver):
         "keys": [kernel.key for kernel in kernels],
         "settings": actual,
         "native_source_sha256": [
-            hashlib.sha256(kernel._fpgs_spectral_jacobi_native.encode()).hexdigest() for kernel in kernels
+            hashlib.sha256(kernel._fpgs_spectral_residual_native.encode()).hexdigest() for kernel in kernels
         ]
         if wanted
         else [],
@@ -75,7 +77,7 @@ def main():
             try:
                 if physics != "feather_pgs":
                     raise RuntimeError("This owner screen requires FPGS on both arms")
-                entry["spectral_jacobi"] = snapshot(get_manager()._solver)
+                entry["spectral_residual"] = snapshot(get_manager()._solver)
                 return metadata
             except BaseException as error:
                 entry.update(check_pass=False, error=repr(error))

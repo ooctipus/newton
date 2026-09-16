@@ -99,7 +99,7 @@ def main():
     parser.add_argument("--gpu-source", type=int, choices=(0, 1), required=True)
     parser.add_argument(
         "--candidate",
-        choices=("coupled_contact", "coupled_jacobi", "spectral_contact", "spectral_jacobi"),
+        choices=("coupled_contact", "coupled_jacobi", "spectral_contact", "spectral_jacobi", "spectral_residual"),
         default="coupled_contact",
     )
     parser.add_argument("--candidate-sha", help="Required frozen source SHA for a new native candidate")
@@ -134,6 +134,11 @@ def main():
         cpu_control = importlib.import_module("tools.fpgs_bench.spectral_jacobi_control")
         assert hashlib.sha256(Path(cpu_control.__file__).read_bytes()).hexdigest() == (
             "f3cb2e5e15de8ff7d5b876bbf966d69139c134226a2338d15072ffa998385a70"
+        )
+    elif args.candidate == "spectral_residual":
+        cpu_control = importlib.import_module("tools.fpgs_bench.spectral_residual_normal_control")
+        assert hashlib.sha256(Path(cpu_control.__file__).read_bytes()).hexdigest() == (
+            "e550c62dbbab2aab3743e2cc0e32406ab51701cc8a0dff83df624cf212171a07"
         )
     candidate_module.get_parallel_factory.cache_clear()
     print(
