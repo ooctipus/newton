@@ -17,7 +17,23 @@ def main():
         raise RuntimeError("The retained G1 paired owner has changed")
     spec = importlib.util.spec_from_file_location("retained_g1_paired_capture", ORIGINAL)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    source = ORIGINAL.read_text()
+    seam = '            if kinetic.get("solve_key") != solve:\n'
+    replacement = """            spectral_flag = run["environment"].get("FEATHER_PGS_SPARSE_SPECTRAL_TANGENTS")
+            if spectral_flag not in ("0", "1"):
+                raise RuntimeError("Require explicit spectral tangent flags on both arms")
+            spectral = spectral_flag == "1"
+            if spectral:
+                solve = "sparse_spectral_tangent43_s18_c100"
+            if kinetic.get("spectral_tangents") != {"requested": spectral, "observed": spectral,
+                    "kernel_key": solve, "check_pass": True}:
+                raise RuntimeError("Missing actual spectral tangent owner observation")
+            if kinetic.get("solve_key") != solve:
+"""
+    if source.count(seam) != 1:
+        raise RuntimeError("The original solve-key validation seam changed")
+    exec(compile(source.replace(seam, replacement), str(ORIGINAL), "exec"), module.__dict__)
+    module.FLAGS.add("FEATHER_PGS_SPARSE_SPECTRAL_TANGENTS")
     module.__file__ = str(Path(__file__).resolve())
     module.adapter.EXTRA.extend(
         Path(__file__).with_name(name).resolve() for name in ("run.py", "checked_sparse.py", "nsys_sparse_checked.sh")
