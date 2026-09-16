@@ -16,6 +16,7 @@ from newton.tests.test_feather_pgs_sleeping import (
     _compare,
     _physical_pair,
     _settle,
+    _step,
     _tick,
 )
 
@@ -149,6 +150,119 @@ class TestFeatherPGSAwakePipeline(unittest.TestCase):
                         np.testing.assert_array_equal(solver.mass_update_mask.numpy()[dense_arts], 0)
                         np.testing.assert_array_equal(solver.L_by_size[6].numpy(), held_factor)
                 self.assertLess(scalar_inverses[1], 0.5 * scalar_inverses[0])
+
+    def test_native_authored_scalar_preserves_held_articulated_mass(self):
+        """Repair an authored scalar coordinate without refreshing unrelated factors."""
+        devices = wp.get_cuda_devices()
+        if not devices:
+            self.skipTest("Actual authored-state repair and held articulated factors require CUDA")
+        for device in devices:
+            with self.subTest(device=str(device)), mock.patch.object(solver_module, "_AWAKE_PIPELINE", True):
+                model, cases, joints, _bodies, _dofs, _targets = _physical_pair(self, device, leaves=37)
+                case = cases[1]
+                solver = case.solver
+                self.assertIsNotNone(solver._awake_pipeline)
+                self.assertEqual(solver.update_mass_matrix_interval, 2)
+                _step(case)
+                self.assertEqual(solver._step, 1)
+                dense_arts = solver.group_to_art[6].numpy()
+                np.testing.assert_array_equal(solver.mass_update_mask.numpy()[dense_arts], 1)
+                held_factor = solver.L_by_size[6].numpy()
+                np.testing.assert_array_equal(solver._mass_update_requested.numpy(), 0)
+
+                coordinate = int(model.joint_q_start.numpy()[joints[0]])
+                q = case.state.joint_q.numpy()
+                q[coordinate] += 1e-4
+                case.state.joint_q.assign(q)  # No reset: only the owned leaf was authored.
+                _step(case)
+                self.assertEqual(solver._step, 2)
+                np.testing.assert_array_equal(solver.mass_update_mask.numpy()[dense_arts], 0)
+                np.testing.assert_array_equal(solver.L_by_size[6].numpy(), held_factor)
+                reference = model.state()
+                newton.eval_fk(model, case.state.joint_q, case.state.joint_qd, reference)
+                for field in ("body_q", "body_qd"):
+                    np.testing.assert_allclose(
+                        getattr(case.state, field).numpy(),
+                        getattr(reference, field).numpy(),
+                        rtol=3e-6,
+                        atol=3e-6,
+                        err_msg="authored public " + field,
+                    )
+
+    def test_native_sleep_lease_output_buffers_and_tiny_dt(self):
+        """Preserve buffer leases but wake on every actual timestep change."""
+        devices = wp.get_cuda_devices()
+        if not devices:
+            self.skipTest("Actual scalar leases and output-buffer publication require CUDA")
+        for device in devices:
+            with self.subTest(device=str(device)), mock.patch.object(solver_module, "_AWAKE_PIPELINE", True):
+                model, cases, joints, bodies, _dofs, _targets = _physical_pair(self, device, leaves=37)
+                self.assertIsNotNone(cases[1].solver._awake_pipeline)
+                _settle(self, model, cases, bodies, joints)
+                controller = cases[1].solver._sleeping
+                asleep_before = controller.sleeping.numpy()
+                for case in cases:
+                    case.solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
+                np.testing.assert_array_equal(controller.sleeping.numpy(), asleep_before)
+                _tick(cases)  # Reuse both existing ping-pong output buffers.
+                _compare(self, model, cases)
+                self.assertEqual(int(controller.body_awake.numpy()[bodies[0]]), 0)
+
+                for case in cases:
+                    case.out = model.state()  # No previous publication exists in this output.
+                    _step(case)
+                _compare(self, model, cases)
+                self.assertEqual(int(controller.body_awake.numpy()[bodies[0]]), 0)
+
+                # Every actual dt change wakes, including changes below the
+                # articulated mass-refresh threshold. Re-establish the lease first.
+                for case in cases:
+                    case.solver.step(case.state, case.out, case.control, case.contacts, 1e-9)
+                    case.state, case.out = case.out, case.state
+                self.assertEqual(int(controller.body_awake.numpy()[bodies[0]]), 1)
+                for _ in range(controller.quiet_steps):
+                    for case in cases:
+                        case.solver.step(case.state, case.out, case.control, case.contacts, 1e-9)
+                        case.state, case.out = case.out, case.state
+                _compare(self, model, cases)
+                self.assertEqual(int(controller.body_awake.numpy()[bodies[0]]), 0)
+                for case in cases:
+                    case.solver.step(case.state, case.out, case.control, case.contacts, 2e-9)
+                    case.state, case.out = case.out, case.state
+                _compare(self, model, cases)
+                self.assertEqual(int(controller.body_awake.numpy()[bodies[0]]), 1)
+
+    def test_native_cold_graph_acquires_sleep_lease(self):
+        """A capture-time first timestep must not wake every graph replay."""
+        devices = wp.get_cuda_devices()
+        if not devices:
+            self.skipTest("Cold captured scalar ownership requires CUDA")
+        for device in devices:
+            with self.subTest(device=str(device)), mock.patch.object(solver_module, "_AWAKE_PIPELINE", True):
+                # Compile through a disposable owner; the captured owner has
+                # never stepped and must establish its timestep on the device.
+                _model, warm_cases, _joints, _bodies, _dofs, _targets = _physical_pair(self, device, leaves=37)
+                _tick([warm_cases[1]])
+                _model, cases, _joints, bodies, _dofs, _targets = _physical_pair(self, device, leaves=37)
+                case = cases[1]
+                solver = case.solver
+                self.assertIsNotNone(solver._awake_pipeline)
+                self.assertEqual(solver._step, 0)
+                controller = solver._sleeping
+                self.assertLess(controller.quiet_steps, 40)
+                with wp.ScopedCapture(device=device) as capture:
+                    solver.seed_double_buffer_events()
+                    solver.step(case.state, case.out, case.control, case.contacts, sleeping_tests.DT)
+                    solver.step(case.out, case.state, case.control, case.contacts, sleeping_tests.DT)
+                    solver.publish_kinematics(case.state)
+                for _ in range(20):
+                    wp.capture_launch(capture.graph)
+                # Restore ordinary event handles even when the assertion below
+                # exposes repeated wake-up from the captured first-step flag.
+                wp.synchronize_device(device)
+                solver.seed_double_buffer_events()
+                self.assertEqual(int(controller.body_awake.numpy()[bodies[0]]), 0)
+                self.assertEqual(int(controller.body_awake.numpy()[bodies[2]]), 1)
 
     def test_actual_contacts_and_existing_sleep_wake_contract(self):
         """Preserve loaded forces, real collision wake and tiny-dt drive behavior."""

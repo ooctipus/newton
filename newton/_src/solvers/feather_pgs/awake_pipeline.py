@@ -40,6 +40,7 @@ class ComponentData:
     expected_qd: wp.array[float]
     expected_target_q: wp.array[float]
     expected_target_qd: wp.array[float]
+    expected_dt: wp.array[float]
     begin_q: wp.array[float]
     begin_target_q: wp.array[float]
     begin_target_qd: wp.array[float]
@@ -84,8 +85,6 @@ class ComponentState:
     v_hat: wp.array[float]
     inverse_mass: wp.array[float]
     drive_K: wp.array[float]
-    fk_valid: wp.array[int]
-    mass_requested: wp.array[int]
 
 
 @wp.func
@@ -154,7 +153,6 @@ def prepare_components(
     coordinate = data.coordinate[component]
     world = data.world[component]
     dirty = data.dirty_world[world] != 0 or data.dirty_world[data.dirty_world.shape[0] - 1] != 0
-    p = data.parameters[component]
     if dirty:
         p = _parameters(data, source, component)
         data.parameters[component] = p
@@ -168,26 +166,50 @@ def prepare_components(
     target_changed = (
         target != data.expected_target_q[component] or target_velocity != data.expected_target_qd[component]
     )
-    allowed = p.allow_sleep != 0 and data.invalid_contact[0] == 0 and data.contact[component] == 0
+    allowed = data.parameters[component].allow_sleep != 0
+    allowed = allowed and data.invalid_contact[0] == 0 and data.contact[component] == 0
     allowed = allowed and wp.isfinite(position) and wp.isfinite(velocity) and wp.isfinite(target)
     allowed = allowed and target_velocity == 0.0 and joint_force[dof] == 0.0 and kinematic[dof] == 0
     for element in range(6):
         allowed = allowed and force[element] == 0.0
-    if dirty or authored or target_changed or not allowed:
+    if dirty or authored or target_changed or data.expected_dt[component] != dt or not allowed:
         data.sleeping[component] = 0
         data.counters[component] = 0
-    articulation = source.articulation[joint]
-    if authored:
-        wp.atomic_min(state.fk_valid, articulation, 0)
-        # This is a solver-wide one-element request, not an articulation map.
-        wp.atomic_max(state.mass_requested, 0, 1)
+    # Authored scalar coordinates change neither their fixed root nor an
+    # unrelated articulation's mass. Their complete owner repairs geometry
+    # below; do not invalidate those independent producers or request a global
+    # factor refresh. Explicit reset/model notifications retain their owners.
     asleep = data.sleeping[component] != 0
     data.body_awake[body] = int(not asleep)
     data.joint_awake[joint] = int(not asleep)
+    if asleep:
+        # Grant established zero tau/qdd/predictor and fixed drive response.
+        # No fallback producer writes these entries; unchanged input/contact
+        # checks above are sufficient to retain the complete scalar lease.
+        # A different state allocation still needs its public geometry filled,
+        # but not a second force, inverse-mass, or predictor evaluation.
+        if source_changed != 0:
+            p = data.parameters[component]
+            articulation = source.articulation[joint]
+            pose, com, motion, body_v, body_a, body_f = scalar_publication(
+                p, position, velocity, state.origin[articulation]
+            )
+            state.body_q[body] = pose
+            state.body_q_com[body] = com
+            state.joint_S[dof] = motion
+            state.body_v[body] = body_v
+            state.body_a[body] = body_a
+            state.body_f[body] = body_f
+        return
+    p = data.parameters[component]
+    articulation = source.articulation[joint]
     data.can_sleep[component] = int(allowed)
     data.begin_q[component] = position
     data.begin_target_q[component] = target
     data.begin_target_qd[component] = target_velocity
+    # Keep coefficient lifetime on the device: a cold CUDA graph capture must
+    # not bake a Python "timestep changed" decision into every later replay.
+    data.expected_dt[component] = dt
     external = wp.spatial_top(force)
     if kinematic[dof] != 0:
         external = wp.vec3()
@@ -200,8 +222,6 @@ def prepare_components(
     # cadence for the articulated fallback.
     inverse = 1.0 / (p.mass * wp.dot(p.axis, p.axis) + p.armature + K)
     state.inverse_mass[dof] = inverse
-    if asleep:
-        tau = 0.0
     acceleration = tau * inverse
     if kinematic[dof] != 0:
         acceleration = 0.0
@@ -243,10 +263,19 @@ def finish_components(
     joint = data.joint[component]
     dof = data.dof[component]
     coordinate = data.coordinate[component]
+    was_asleep = data.sleeping[component] != 0
+    if was_asleep and v_out[dof] == 0.0:
+        # Public output may be a fresh allocation, so publication cannot be
+        # skipped even though the internal stationary state is already valid.
+        q_new[coordinate] = q[coordinate]
+        qd_new[dof] = 0.0
+        body_q_new[body] = body_q_previous[body]
+        body_qd_new[body] = wp.spatial_vector()
+        v_out[dof] = 0.0
+        return
     p = data.parameters[component]
     position = q[coordinate]
     velocity = qd[dof]
-    was_asleep = data.sleeping[component] != 0
     acceleration = (v_out[dof] - velocity) / dt
     if kinematic[dof] != 0:
         v_out[dof] = velocity
@@ -269,6 +298,8 @@ def finish_components(
             velocity = 0.0
             acceleration = 0.0
             v_out[dof] = 0.0
+            state.tau[dof] = 0.0
+            state.v_hat[dof] = 0.0
     else:
         data.counters[component] = 0
         data.sleeping[component] = 0
@@ -573,6 +604,7 @@ class AwakePipeline:
         data.group = wp.array(group, dtype=wp.int32, device=device)
         data.local_dof = wp.array(local_dof, dtype=wp.int32, device=device)
         data.parameters = wp.zeros(sleep.plan.component_count, dtype=ScalarParameters, device=device)
+        data.expected_dt = wp.zeros(sleep.plan.component_count, dtype=wp.float32, device=device)
         data.dirty_world = wp.ones(solver.world_count + 1, dtype=wp.int32, device=device)
         data.contact, data.invalid_contact = sleep.contact_component, sleep.invalid_contacts
         for name in (
@@ -639,8 +671,6 @@ class AwakePipeline:
             ("v_hat", "v_hat"),
             ("inverse_mass", "_diagonal_inverse_mass"),
             ("drive_K", "aug_row_K"),
-            ("fk_valid", "_fk_id_cache_valid"),
-            ("mass_requested", "_mass_update_requested"),
         ):
             setattr(state, name, getattr(self.solver, attribute))
         return state

@@ -106,3 +106,54 @@ that independent tiny-dt analytical check and unchanged held serial factors.
 the first owner commit. First paired graph timing uses the included
 `REPRO_AWAKE_PIPELINE_20260916.sh`, unchanged 4K task/capacities and the
 retained `ca0d427a` reference; it is a discovery round, not promotion.
+
+## First timing and targeted correction, 00:29 UTC
+
+Runtime `9b4c1b59` passes all four paired children, original capacity/finite
+boundaries and final source/idle guards. Actual `awake_pipeline=true` is
+recorded. Discovery artifact `/tmp/fpgs-awake-pipeline-paired4k-20260916-01`:
+
+| GPU | Retained physics ms | Owner physics ms | Retained/owner |
+| --- | ---: | ---: | ---: |
+| RTX | 6.830238 | 7.223458 | 0.945563x |
+| GB300 | 6.187150 | 6.309748 | 0.980570x |
+
+This is a loss, not promotion. Environment wall time is 31.760667->31.570786
+ms RTX and 28.499547->28.201683 ms GB; one round does not establish a wall gain.
+
+The immediately reused node diagnostic also passes all guards at
+`/tmp/fpgs-awake-pipeline-nodes-paired4k-20260916-01`. Its three-step window
+is diagnostic, not a replacement for the 40-step whole result. Prepare and
+finish cost 0.840353+0.693217=1.533570 ms RTX, 0.417600+0.285515=0.703115 ms
+GB. Actual resources are 56/48 registers, no local memory. Offline exact-PTX
+assembly agrees, with zero stack/spills; no hardware-stall attribution is
+claimed. This does not support a spill-based tuning exercise.
+
+The new owner still evaluates force, inverse/predictor, quiet-counter and
+expected-state updates for unchanged sleepers. Complete ownership makes
+those values persistent: they can be established once at sleep grant, with
+current input/contact wake checks and required public output copy on later
+calls. Any timestep change must wake the component to preserve exact current
+scalar coefficients; unexpected solved velocity still takes the full finish
+path. New state-buffer identity must repair current public geometry.
+
+A second redundant boundary was found: each authored scalar wake atomically
+requests a solver-wide mass refresh, although the scalar mass is independent
+of coordinates and its owner already computes the exact response. This
+needlessly refreshes unrelated articulated factors and contends on one flag.
+Remove that request and leaf-driven root-cache invalidation; retain explicit
+solver resets/model notifications and original fallback refresh cadence.
+Add a regression demonstrating the redundant refresh before removing it.
+
+This is the single targeted correction to the measured ownership mismatch,
+not a register cap or parameter grid. It must beat retained `ca0d427a`, not
+the slower first owner. First corrected whole checkpoint is 00:59 UTC.
+
+The correction passes all eight native owner tests on both GPUs. Added
+regressions first reproduced the unrelated-factor refresh, tiny-dt sleep
+lease, and cold-graph permanent-wake defects on both cards. Coefficient
+lifetime is now device-backed per component: a Python first-call flag must
+not be captured as "timestep changed" for every replay. A changed source
+allocation repairs public geometry without redoing sleeping force/response.
+The cold-graph regression warms only a disposable solver, then captures a
+fresh unstepped owner and verifies that replay can acquire its sleep lease.
