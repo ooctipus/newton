@@ -20,9 +20,9 @@ from newton.tests.test_feather_pgs_prismatic_publication import _build_model, _s
 DT = 1 / 240
 
 
-def _physical_pair(test, device):
+def _physical_pair(test, device, *, leaves=108):
     """Reuse the admitted contact fixture, now at a gravity/PD equilibrium."""
-    model = build_solver_fixture(device)
+    model = build_solver_fixture(device, leaves=leaves)
     model.gravity.assign(np.tile(np.array((0.0, 0.0, -1.0), np.float32), (model.gravity.shape[0], 1)))
     model.joint_q.zero_()
     model.joint_qd.zero_()
@@ -142,6 +142,24 @@ def _settle(test, model, cases, bodies, joints):
 
 
 class TestFeatherPGSSleeping(unittest.TestCase):
+    def test_authored_wake_preserves_scalar_mass_request_guards(self):
+        """Keep authored-state wake writes inside the scalar mass-request flag."""
+        devices = wp.get_cuda_devices()
+        if not devices:
+            self.skipTest("Actual sleeping wake and guarded native writes require CUDA")
+        for device in devices:
+            model, cases, _joints, _bodies, _dofs, _targets = _physical_pair(self, device)
+            candidate = cases[1]
+            self.assertEqual(candidate.solver._mass_update_requested.shape, (1,))
+            guarded = np.full(model.articulation_count + 4, -17, dtype=np.int32)
+            guarded[0] = 0
+            storage = wp.array(guarded, dtype=wp.int32, device=device)
+            candidate.solver._mass_update_requested = storage[:1]
+            # The first real step authors all components, including world1's
+            # articulation2. Keep the owning allocation alive until the readback.
+            _step(candidate)
+            np.testing.assert_array_equal(storage.numpy()[1:], guarded[1:])
+
     def test_topology_independence_without_branch_count_specialization(self):
         """Split anchored siblings but retain shared responsive ancestry."""
         for leaves, locked in ((3, False), (7, True), (11, False)):

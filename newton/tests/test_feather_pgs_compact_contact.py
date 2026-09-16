@@ -345,13 +345,13 @@ def geometry_reference(data):
     return results
 
 
-def build_solver_fixture(device):
-    """Actual admitted two-world sparse108 + serial-six model with live contact shapes."""
+def build_solver_fixture(device, *, leaves=108):
+    """Build admitted two-world prismatic branches plus serial-six live contact shapes."""
     template = newton.ModelBuilder()
     inertia = wp.mat33(0.04, 0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0, 0.06)
     root = template.add_link(mass=2.0, inertia=inertia)
     joints = [template.add_joint_fixed(parent=-1, child=root)]
-    for index in range(108):
+    for index in range(leaves):
         body = template.add_link(mass=0.2 + index / 300, inertia=inertia)
         joints.append(
             template.add_joint_prismatic(

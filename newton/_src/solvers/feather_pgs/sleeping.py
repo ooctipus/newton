@@ -154,7 +154,8 @@ def _begin_components(
         articulation = joint_articulation[link]
         if articulation >= 0:
             wp.atomic_min(fk_valid, articulation, 0)
-            wp.atomic_max(mass_requested, articulation, 1)
+        # Mass refresh is a solver-wide scalar request, not a per-articulation array.
+        wp.atomic_max(mass_requested, 0, 1)
     if not unsupported:
         can_sleep[component] = 1
 
