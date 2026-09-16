@@ -660,11 +660,16 @@ class TestG1KineticStateCUDA(unittest.TestCase):
         candidate.check_constraint_capacity()
         public_state(self, model, states[1][1])
         self.assertIs(candidate._fk_id_cache_source_state, states[1][1])
-        self.assertLess(
-            np.linalg.norm(candidate.v_hat.numpy() - original.v_hat.numpy())
-            / (1.0 + np.linalg.norm(original.v_hat.numpy())),
-            7e-4,
-        )
+        parallel = getattr(candidate._sparse_factor, "parallel_world", None)
+        if parallel is None or not parallel.active:
+            # The complete parallel owner keeps its predictor private. Its
+            # independent momentum check lives in test_parallel_world; the
+            # public state comparison below remains required for every owner.
+            self.assertLess(
+                np.linalg.norm(candidate.v_hat.numpy() - original.v_hat.numpy())
+                / (1.0 + np.linalg.norm(original.v_hat.numpy())),
+                7e-4,
+            )
         self.assertLess(
             np.linalg.norm(states[1][1].joint_qd.numpy() - reference_output.joint_qd.numpy())
             / (1.0 + np.linalg.norm(reference_output.joint_qd.numpy())),

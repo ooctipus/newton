@@ -572,6 +572,7 @@ class SparseFactor:
 
             install(self)
         self.kinetic_state = None
+        self.parallel_world = None
         self.body_basis_rows = False
         if os.environ.get("FEATHER_PGS_BODY_BASIS_ROWS") == "1":
             from .body_basis_rows import install as install_body_basis_rows  # noqa: PLC0415
@@ -630,6 +631,8 @@ class SparseFactor:
             status = self.kinetic_state.status.numpy()
             if np.any(status):
                 raise RuntimeError(f"G1 kinetic-state guard failed: {np.unique(status[status != 0]).tolist()}")
+        if self.parallel_world is not None:
+            self.parallel_world.check()
 
     def refresh(self, state_aug):
         """Publish only the original requested held generation."""
@@ -669,6 +672,10 @@ class SparseFactor:
     def build_rows(self, state_in, state_aug, contacts, dt):
         """Retain original allocation/metadata while replacing all dense J production."""
         from . import kernels as k  # noqa: PLC0415
+
+        if self.parallel_world is not None and self.parallel_world.active:
+            self.parallel_world.build_rows()
+            return
 
         s, model, device = self.solver, self.solver.model, self.solver.model.device
         c = s.dense_max_constraints
@@ -887,6 +894,8 @@ class SparseFactor:
 
     def restitution(self, dt):
         """Use the original current incident trigger after original bias construction."""
+        if self.parallel_world is not None and self.parallel_world.active:
+            return
         if self.packet_rows:
             self.packet_input.dt = dt
             return  # Applied from the current incident during local row formation.
@@ -912,6 +921,9 @@ class SparseFactor:
 
     def solve(self, rhs, iterations, omega, friction_start):
         """Visit every original row and return complete physical velocity once."""
+        if self.parallel_world is not None and self.parallel_world.active:
+            self.parallel_world.solve(iterations, omega, friction_start)
+            return
         if self.packet_rows:
             from .sparse_packet_rows import solve  # noqa: PLC0415
 

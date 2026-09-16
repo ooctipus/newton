@@ -350,3 +350,419 @@ Franka and Kuka coordinate-only port screens also lack a substantial budget:
 affected finish+repair families are approximately1.102/1.920ms; a10% whole
 saving would require removing about46%/55% of those complete families while
 their scans, inertial work and public outputs remain. No port is funded.
+
+### Branch-local nonlinear iteration: bounded CPU closure
+
+The distinct branch-Jacobi study uses one original metric sweep per structural
+branch per global pass, with foreign root response frozen, then merges physical
+response deltas. Same maximum8 passes, all rows and original circular-friction
+law. Branches come from non-root held-factor connectivity, not body names;
+shared waist DOFs stay together. A second prescribed control scales only the
+shared six-coordinate response by the number of nonempty branch blocks,
+retaining original full physical impulse application. No parameter grid.
+
+Plain branch-Jacobi passes the existing16 selected component gates, but the
+hardest7410 cases load only one branch. Original/plain residual dots1927/1931,
+global passes78/79 and sliding roots69/69: there is no total-work retirement.
+An ideal parallel branch critical path of901 dots is not a2x throughput claim
+when16384 worlds already supply GPU parallelism. Of69 sliding roots,67 remain
+on the serial branch. The split control misses2 component gates; held-H error
+improves in one of them despite component misses, so these are not all labeled
+global convergence regressions.
+
+A controlled actual-USD two-foot fixture loads both feet. Baseline/plain/split
+scaled held-H velocity errors are1.092e-6/1.790e-5/1.365e-3 at8 passes;
+complementarity4.198e-6/5.985e-5/6.091e-3. Independent original512/1024
+reference velocities are stable. Plain has a modest real finite-budget change;
+root splitting slows this fixture substantially. A6x6 root-only correction
+cannot freely remove nonlinear branch coupling while preserving momentum:
+consistent branch impulse sensitivities/solves would be additional work.
+
+Close without native funding. Frozen CPU evidence, exact scripts and source
+pins: `/tmp/fpgs-g1-branch-split-cpu-QQECL6nh/README.md`, SHA256
+`93fd234ec87eafbf662431ce4d162f6d03003464dc4c6654fb2721089545262d`.
+This is numerical/work evidence, not GPU performance. The initial invalid
+zero-diagonal fixture was preserved and excluded; the corrected fixture uses
+independent physical J H^-1 J^T and original CFM.
+
+### Fund one complete parallel-construction owner
+
+Start13:10 UTC; native-ready/first-integrated checkpoint14:40, no silent
+extension beyond15:10 without a concrete implementation cause. Default-off
+Newton-only candidate on qualified vector-chain semantics; coordinate-only
+experiment remains disabled. Primary milestone is2ms RTX whole-physics
+saving, not a standalone contact-kernel gain.
+
+Replace the complete current prediction/row-preparation/solve boundary with
+raw-world indexing followed by four contact-worker warps per world and the
+original metric GS on warp0. Current-state repair, held-factor refresh and
+complete final-state production stay separate and unchanged. Use the existing
+exact-capacity raw-ID bucket implementation, not a new routing framework.
+All contact admission, raw-ID neighbor friction rules, material mixing,
+speculative bias/restitution, limits, physical response and sensor mapping
+remain covered. Row-slot order may differ; physical convergence must qualify.
+No dropped constraints, smaller capacity, extra solver passes or stale forces.
+
+This is distinct from PACKETS/SMALL_STEP: both form all contact triplets
+serially inside one warp. PACKETS retains separate allocation/metadata/key/bias
+services; SMALL_STEP additionally splits the heavy fallback cohort. The new
+owner must retire those old producers, not retain their full work alongside it.
+Do not fuse final state or count its necessary mathematics as removed work.
+
+Charge raw indexing: three clears, count, exclusive scan, scatter and validation,
+two endpoint-to-world walks per raw contact, count/scatter atomics, and
+1,310,732 bytes of exact-capacity IDs/world arrays plus existing scan workspace.
+New geometry-based admission/material work is required, not free. Old raw IDs
+must remain the keys for neighboring-contact decisions; bucket neighbors are
+not raw neighbors.
+
+The critical adverse cost is retained128-thread CTA registers and approximately
+10KB shared storage throughout warp0 GS, with three idle worker warps, versus
+old32-thread/1116B GS. This may reduce independent resident solve warps and
+erase construction gains. No occupancy or memory-bound claim is established.
+The current exposed prediction+rows+GS boundary is approximately7.046ms RTX;
+new owner PLUS indexing must fit about5.046ms for the2ms milestone. One early
+complete paired screen decides, followed by one causal diagnosis/correction
+if justified—not a block-size, arena-size or register sweep.
+
+Routing review before integration: original allocation deliberately skips
+static/static and cross-world raw contacts. The parallel owner will preserve
+their canonical raw IDs and mark their metadata unused, counting these skips
+separately when validating bucket coverage. It will not turn one benign gap
+into a whole-cohort O(worlds * raw_count) fallback. Invalid descriptors remain
+errors. These are local candidate bucket kernels; existing source-pinned
+bucket consumers remain unchanged.
+
+### Fund one world-lane complete-state prototype, 13:25 UTC
+
+Separate worktree `/home/octi/Projects/newton-fpgs-world-lane-20260916`, fork
+branch `ooctipus/fpgs-world-lane-20260916`, based on120c37fc. The G1 candidate
+and its source-frozen timing can proceed independently. CPU/AOT/resource
+checkpoint14:40 UTC; complete integrated-ready target16:30. Default-off,
+initially admitted to the existing Franka topology, never task-name dispatch.
+
+The existing retained control already packs two worlds per warp using16
+lanes/world and half-warp synchronization. The proposed complete owner uses
+one world per thread, model-generated typed forward/reverse traversal,
+field-major private caches and unchanged canonical public outputs. It must
+replace current-state repair, force/factor/prediction and finish together.
+Physical parameters remain live; notification/source-bank/held cadence and
+next-call drive coefficients retain their original contracts.
+
+This is not the closed coordinate-only experiment. The primary tree's scan
+currently executes29 pose and29 motion compositions; a generated traversal
+needs10 of each. Its factor9 is serial in one of16 lanes and prediction uses
+two lanes. A lower-only geometric cache needs44 distinct nonzero entries
+plus one structural zero, rather than evaluating79 nonzero full-matrix
+entries. No native or throughput result exists yet.
+
+Use one liveness-aware DFS/unwind layout, not a block-size/layout sweep.
+Separate held/refresh finish at the original cadence avoids charging refresh
+register allocation to held calls. Root-fixed terms cannot affect generalized
+outputs; ancestor moment blocks die as six-float inertia-action columns are
+formed and projected. Preliminary register estimates are110–150 held,
+215–255+ refresh and80–120 factor/predict, not compiled measurements.
+Refresh spills and strided canonical AoS publication are explicit risks.
+
+The minimum core public q/qd/qdd, body pose/velocity and S output is about
+1440 bytes/world/finish, excluding free-body auxiliary outputs. It cannot be
+removed or treated as a free transpose. The approximately1.676ms original
+state family needs roughly2.25x repair/finish and4x factor/predict to save1ms;
+even perfect removal would not alone make Franka4x faster than MJWarp.
+Judge the complete original-versus-candidate physics path first, then one
+causal correction if justified. No source-only arithmetic saving is promoted
+as measured progress.
+
+Parallel-world first runnable freeze approximately13:40 UTC, ahead of the
+14:40 checkpoint. CPU4 focused controls pass, including raw gaps/cross-world
+skips, malformed descriptors, legal row permutation and missing-owner fallback.
+The original G1 lifecycle test skips only its internal v_hat comparison when
+the complete owner is actually active: v_hat is now private, while independent
+prediction/momentum and public state/reset/graph checks remain. Candidate
+global v_hat is poisoned in focused native controls to expose hidden consumers.
+
+The first complete entry compiles at128/120 registers per thread onSM120/100,
+10428B shared, zero stack/spills. Four128-thread resident-resource costs remain
+through the warp0-only GS phase; this strengthens the residency risk, not a
+measured slowdown claim. Retained sparse Z/support/incident buffers stay
+allocated for unsupported host fallback, but candidate Z/incident production
+and consumption are private. All old preparation producers must disappear
+from actual candidate graph accounting; allocation reduction is not claimed.
+
+Paired original-law native controls launched after UUID idle and source-pin
+checks. Logs `/tmp/fpgs-g1-parallel-native-20260916-RJMp4PPD/gpu{0,1}.log`.
+No whole-physics gain has been measured for this candidate yet.
+
+An additional terrain idea was screened against exact prior art, not recoded:
+general mixed-height flat-cell run/rectangle coalescing already has a CPU-only
+study at `/tmp/fpgs-g1-live-flat-runs-p1kkj4qj/RESULTS.md`. Its old, pre-current-
+geometric-cull cohort reduces606886 candidate triangles to338007 retained query
+items,44.30%; only49.18% are in complete horizontal cells. This is not the
+closed22.8% whole-foot gate. Current finite/fallback queries cost1.388055/
+0.823625ms RTX and buffered reduction0.201310ms. Uniformly applying that old
+count fraction gives only about1.069ms gross across all three, BEFORE grouping,
+new queries, seam handling and mutation invalidation; this is not a timing
+prediction. Active-key clear/export remain. No credible>=1ms net case is yet
+established, so no native implementation or new census is funded.
+
+First native run completes three full-production selectors on both devices,
+but saved-row diagonal comparisons fail seven cases. CPU diagnosis establishes
+a fixture input mismatch: begin() recomputes shared body poses and candidate
+screws while the control retained captured screws. For current world0, the
+independent physical diagonal discrepancy7.619e-5 relative matches observed
+7.572e-5; this is not evidence of a changed row law. Restore the independent
+captured pose/S/origin inputs for BOTH row producers after cache initialization.
+No diagonal or physical tolerance changes; full-production recomputation tests
+remain unchanged apart from the already-declared retired v_hat comparison.
+
+A separate real raw-overflow bug is fixed: preserve public contacts-capacity
+latching and canonical invalid raw-slot clearing, not only the private error.
+The exact missing-latch regression was reproduced on RTX by removing only
+that atomic latch in an isolated source-generated test process: one expected
+failure at the public contacts assertion, exit1. Fixed runtime preserves the
+sticky flag across reset. Valid-frame arithmetic is unchanged.
+
+Corrected GB native4/4 passes; RTX passes all metadata/momentum/cone/lifecycle/
+overflow controls but misses two finite-eight natural-residual comparisons in
+world7410 (current0.000360334 vs original0.000217287; held0.000187893 vs
+0.000096506). The same saved cases improve on GB, consistent with changed
+atomic row ordering. Do not call this qualification or relax the tolerances:
+independent original-H high-iteration diagnosis is pending. Logs and the
+separate failing-latch control are preserved in
+`/tmp/fpgs-g1-parallel-native-fixed-20260916-eL2lqGml`.
+
+The first complete timing screen will proceed as a provisional cost diagnosis
+while that numerical question is investigated. It cannot promote the candidate
+or establish the4x goal. Final guard-corrected hidden AOT is
+`/tmp/fpgs-parallel-world-aot-9d_2gcsc/offline04/report.json`, SHA256
+`8b7e880739c5f18f3e59b71ae880d70701d51771b56b8426b80b6ebefb5d6f1d`;
+resources remain128/120 registers,10428B shared, zero stack/spills.
+
+### First integrated parallel-owner fault and numerical diagnosis, 14:07 UTC
+
+The first paired16K whole screen is a FAILED integration run, not a timing:
+`/tmp/fpgs-g1-parallel-world-whole-paired16k-20260916-01`. Both baseline
+children exit0; both candidate children fail with CUDA illegal memory access.
+Parent43895 is reaped exit1. No candidate throughput is reported.
+
+Exact32-endpoint capture and independent CPU original-H references explain
+the two earlier component misses. Artifact
+`/tmp/fpgs-parallel-row-order-ySECtv/rtx_reference.json`, SHA256
+`ec71bc55842b08f9cc9d87176971b49dadc22a2af3016ac0a43f5166e2a34355`.
+All32 high-iteration references converge (maximum physical score9.83e-12);
+the two world7410 orderings reach the same reference within1.04e-11 held-H
+distance. Native scaled H error improves0.1015515 to0.1011291 current and
+0.1526113 to0.1522775 held. Both eight-sweep endpoints remain substantially
+underconverged; no universal convergence claim. Independently reconstructed
+physical J rows are equal under permutation; original FP64 eight-sweep
+recurrences reproduce each ordering's native endpoint within8.08e-6 H.
+Replace unnecessary component-by-component monotonicity with the original-law
+reproduction and common converged-reference accuracy gates, retaining absolute
+momentum/cone checks and printing component diagnostics. Do not tune tolerances
+to these misses or erase the original failing logs.
+
+A first memcheck with zero warmup did not exercise physics: the observer
+correctly rejected uninitialized private state. Reaped89369 exit1; its zero
+memory errors are NOT clearance. Actual16K warmup2 memcheck13557 exits86 with
+five out-of-bounds four-byte writes in the complete owner, preserved at
+`/tmp/fpgs-parallel-live-memcheck-warm-20260916-AVtXypam/run.log`.
+Root localization: row_w is intentionally a one-element dummy when contact
+regularization is disabled, which is required by this candidate's admission.
+The new native row producer writes it unconditionally at per-row offsets.
+Remove these unused writes and add the production-shaped dummy regression;
+do not allocate a full buffer to conceal the ownership error. Re-run the
+actual integrated memory check before interpreting whole timings.
+
+The isolated world-lane complete Franka owner is native-ready at14:01 UTC,
+ahead of its checkpoint. Five CPU tests pass. Actual AOT reports SM120/100
+repair255/255 registers with8/16B spill stores/loads, held finish167/168,
+refresh255/255 and fused factor/predict152/148, all other spill counts zero.
+No block-size or numerical sweep. RTX two native selectors pass, including
+saved physical references and actual five-world loaded/reset/notification/
+two-bank graph replay. Maximum physical H error1.02e-6; matched p16 body
+velocity error5.22e-5. GB native check is pending; no speedup claim yet.
+
+The exact two row_w stores are removed in parallel_world_rows.py SHA256
+`98e1f79c7c88f7e56edd19bdb8e9d6c3659e3d17b6af545a7671a6b208e01834`.
+No allocation, law or ABI change. CPU6 tests pass, including the source
+regression that fails before this removal. Native production-shaped dummy
+weight storage remains(1,1), with a poison-unchanged assertion. The frozen
+reference-based helper passes all16 preserved RTX cases in0.915s; maximum
+scaled H-error increase is4.9007e-8. This is not a new GPU run.
+
+Corrected actual16K GB memcheck26152 exits0 with zero errors and both checked
+capacity/private-owner boundaries passing:
+`/tmp/fpgs-parallel-live-memcheck-rowwfix-20260916-30gpbWZx`.
+The instrumented timings are not performance evidence.
+
+First complete clean parallel-world cost screen, root95571 exit0:
+`/tmp/fpgs-g1-parallel-world-whole-paired16k-20260916-02/manifest.json`.
+All four children and eight boundaries pass; final source/idle guard passes.
+RTX qualified chain15.028502 -> complete owner21.378284ms (0.702980x).
+GB19.838911 ->26.804659ms (0.740129x). This is a substantial loss, not
+accepted progress. Actual solve counters advance1600 to2240, matching the
+640 expected measured substeps; routing sees about78K raw contacts at the
+boundaries, not world_count times the raw allocation. Node attribution is
+still required to establish retired calls and locate the extra6.35/6.97ms.
+
+One possible causal correction is documented but not yet funded: preserve
+four-warp parallel prediction/row construction, publish existing Z/incident/
+v_hat and cold impulses, then launch the unchanged32-thread GS. It restores
+the original solve residency at the price of one extra launch and up to
+127.69MiB additional stores/substep at maximum row occupancy, plus cache-
+dependent reads. No new buffers; old fallback storage already exists. It
+must not reinstate old allocation/bias/row/predictor producers. Producer
+error must veto the separate solve through its original status guard.
+This is one boundary correction, not a block/register sweep. Actual timing
+must justify it before implementation.
+
+Franka world-lane GB native2/2 also passes. Its first paired16K whole screen
+starts14:17 UTC against exact ca0d p16, unchanged flags/capacities/budgets,
+with a minimal untimed owner-key/layout observer. No new performance claim
+exists until that complete screen finishes.
+
+### Causal cost diagnosis and one split correction, 14:28 UTC
+
+The G1 node capture preserves the original auxiliary-graph analyzer failure;
+the existing strict12-step reader separately verifies48 physics and12 auxiliary
+roots, every process/correlation, both checked boundaries, and final source/idle
+guards. No unproven nodes. Exact extension:
+`/tmp/fpgs-g1-parallel-world-strict-jMoAcF1R/read_parallel.py`, SHA256
+`031b5ff7536cb7f8db7bafac219794f2940907714642c12e476e614760afc612`.
+
+RTX complete owner13.221249ms plus CSR0.175301; GB14.363626 plus0.188515.
+The replaced family grows7.046171 ->13.396550ms RTX and7.566958 ->14.552141GB
+against the existing qualified-chain node reference, independently explaining
+the whole loss. Retained factor, collision and finish stay flat. All old
+prediction/row/GS producers have zero calls. Memory activity decreases rather
+than duplicating:32 memcpy nodes/90.18MB per environment step disappear.
+Observed owner resources:126/120 registers,128 threads,10428B shared and zero
+reported local memory. This does not measure achieved occupancy or counters.
+
+Independent generated-source comparison establishes identical GS control flow
+after private-storage substitutions: no extra sweeps,16-probe roots, row visits
+or fallback rules. Legal contact reordering and different incident+rhs floating
+association can change observed iteration work; actual root/probe counts are
+not measured. The new CSR cost is small. The concrete adverse boundary keeps
+four warps' resources resident throughout a warp0-only solve and serializes
+each world's parallel contact completion before that solve.
+
+Fund the one planned split correction with native-ready checkpoint15:20 UTC.
+Keep the complete experiment reproducible as split=0; add nested default-off
+FEATHER_PGS_PARALLEL_WORLD_SPLIT=1. Parallel construction publishes existing
+interfaces, followed by the unchanged32-thread metric solver. Retain the
+complete cost budget and numerical/capacity gates. No tuning grid. A missing
+producer-factory CPU regression fails before implementation.
+
+Franka world-lane whole01 is not a performance comparison: RTX ca0d baseline
+aborts with malloc_consolidate during scene cloning before solver creation;
+GB baseline passes and no candidate launches. Original failed artifact is
+preserved. The unchanged retry whole02 completes with all source/idle/capacity
+guards passing. RTX5.020306 ->5.166324ms (0.971737x); GB4.693110 ->4.834694ms
+(0.970715x). This is a small loss, not accepted progress. A paired node capture
+will identify whether forward/reverse work reduction was erased by factor,
+publication, or execution costs before proposing any corrective implementation.
+
+Franka paired node23346 exits0; the strict original interval reader verifies
+all four captures (48 physics roots each, no auxiliary roots). Complete
+state-family exclusive RTX1.671307 ->1.774082ms; GB1.400978 ->1.540940ms.
+Factor/prediction saves about0.18ms, while publication adds about0.29ms.
+All old factor/predictor calls retire and held/refresh cadence is correct.
+Held and refresh publication cost0.592005/0.613865ms RTX despite167/255
+registers, so refresh-register reduction alone is not a supported diagnosis.
+Source exposes serial per-world arithmetic and world-strided canonical/model
+AoS accesses, but no bandwidth/stall claim is established. The driver reports
+RmProfilingAdminOnly=1; no sudo or permission change is attempted.
+
+Artifact `/tmp/fpgs-franka-world-lane-strict-wX7i4mJ2/SUMMARY.md`, SHA256
+`3abf71fc53701595fdbbafe85102534a3a7612de6368b9820d980af7e2910878`.
+The original1ms saving milestone would now require publication to fall by
+about91% while retaining the other measured work. No such corrective design
+is supported. Preserve this experiment as unpromoted; do not extract the
+0.18ms factor-only change as a claimed large whole-physics improvement.
+
+The split G1 correction is native-ready14:34, ahead of15:20. Hidden AOT
+reports producer128/120 registers,2440B shared, no stack/spills, versus the
+unchanged32-thread GS72 registers/1116B shared. It releases producer resources
+before solving rather than pretending its peak register count disappeared.
+CPU7 tests pass; the untimed observer has3 positive and8 negative controls.
+Paired native runs pass three production lifecycle/capacity selectors each,
+but a newly added componentwise W*J check rejects8 saved cases on both cards
+at4–8e-6 absolute coefficient differences. Original-control diagnosis is
+pending; no runtime or tolerance change has been made in response.
+
+### Parallel split closure: correct publication, remaining producer loss
+
+The exact original-control probe resolves the new coefficient diagnostic:
+`/tmp/fpgs-g1-split-coeff-control-Av2BjEPS/probe.py`, SHA256
+`f4b5d4b6a3704aad011807c102010e23bd2878a2fafa721420f2919abde0d7c2`;
+its `rtx.log` SHA256 is
+`d84072607249cb59ac08d6ed033d5378dd5bb4b0b7df7c1e79374f11a487c9ff`.
+Root process 38070 exits 0. Both original and candidate fail the same eight
+FP64 componentwise coefficient comparisons, while published native Z is
+bit-identical in all 16 cases after matching canonical raw-contact IDs.
+All 16 unchanged momentum, cone, original-law eight-sweep reproduction and
+independent converged held-H reference checks pass. This is a newly exposed
+control-incompatible coefficient check, not evidence of a candidate row error;
+the initial failing logs remain preserved.
+
+The narrow test repair retains finite coefficients, support identities and
+zero padding through `check_rows(coefficients=False)`. It compares canonical
+Z and incident values to the unchanged original producer after raw-ID matching,
+using the existing `rtol=3e-5, atol=3e-6`, without widening either tolerance.
+All metadata, physical component diagnostics, momentum/cone and independent
+eight-sweep/reference assertions remain; publication comparisons run after
+those physical checks. Frozen test SHA256:
+`af193338e0aa7b0a96e32791c5e7b32bced6e42628bb0cdd54998cd48e26c47a`.
+CPU 7/7 and targeted precommit pass. Final native reruns 40542/63414 both exit 0,
+with all four selectors passing on each card: saved current/held physical rows,
+empty predictor publication, loaded reset/notification/graph lifecycle, and
+sticky capacity plus production-shaped dummy-weight storage. Logs:
+`/tmp/fpgs-g1-parallel-split-native-final-20260916-sJ6l4wuR/gpu{0,1}.log`.
+
+The clean paired whole-physics screen 87023 exits 0, with source, idle,
+activation and capacity guards passing and unchanged physics budgets:
+`/tmp/fpgs-g1-parallel-split-whole-paired16k-20260916-01/manifest.json`.
+
+| Device | Qualified chain baseline (ms) | Split candidate (ms) | Baseline/candidate |
+| --- | ---: | ---: | ---: |
+| RTX | 15.053081175 | 17.438470650 | 0.86321x |
+| GB | 19.887524600 | 23.348452625 | 0.85177x |
+
+The correction recovers much of the complete-owner loss but remains slower
+than the qualified chain. It is not accepted or promoted.
+
+Node process 62877 preserves the expected old auxiliary-graph analyzer exit 1:
+`/tmp/fpgs-g1-parallel-split-node-candidate16k-20260916-01`. Both captures and
+final source/idle checks complete. The supplemental strict reader retains all
+48 physics/12 auxiliary roots, process/correlation checks, source pins and both
+checked boundaries; it explicitly verifies the split producer and restored
+original solver, each eight calls per environment step. Reader:
+`/tmp/fpgs-g1-parallel-split-strict-R1HtzAhs/read_split.py`, SHA256
+`abe95f3747e9f8a9d08b08f811b35e89828a6c0f5f28994a71f5d527abf456b5`.
+Its `candidate_gpu0.json` / `candidate_gpu1.json` hashes are
+`03137f5bb89803c579e1606b5f622d516e6eab6892cd5829b329becd004a647d` /
+`e7bf34d2833e8a8fb361fe69bf24e7bd3e31a82a0d01d92e1f34e0311b93cd17`.
+
+| Summed node time per environment step (ms) | RTX | GB |
+| --- | ---: | ---: |
+| New parallel predictor/row producer | 5.294352 | 6.506496 |
+| Exact raw-contact CSR and CUB scan | 0.174584 | 0.188234 |
+| Restored original 32-thread metric GS | 3.994346 | 4.411032 |
+| All physics graph memory activity | 0.099728 | 0.091558 |
+
+Against the existing qualified-chain strict reference, not a new paired
+baseline node capture, old prediction plus all row work was 3.088404/3.144614 ms.
+New producer plus CSR is 5.468936/6.694730 ms: an increase of 2.380532/3.550116 ms.
+Original GS is essentially flat, changing only +0.036579/-0.011312 ms. Memory
+activity decreases by 0.052736/0.055771 ms; retained factor, collision and finish
+remain essentially flat. All old predictor/row producers and the complete
+fused owner have zero calls. Thus remaining loss is localized to the producer,
+not duplicated old work, CSR or a slower replacement solve.
+
+Actual producer launches use 128 threads, 128/120 registers and 2440 B shared;
+original GS remains 32 threads, 72 registers and 1116 B shared. Reported local
+memory per thread is zero. These are launch resource facts, not measured
+occupancy, bandwidth, stall or instruction counters. No further mapping or
+parameter sweep is justified by this closure. Runtime and tests stay frozen;
+the separate unpromoted world-lane closure was preserved by commit `cd9315da`.

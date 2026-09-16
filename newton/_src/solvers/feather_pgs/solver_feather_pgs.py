@@ -2472,6 +2472,12 @@ class SolverFeatherPGS(SolverBase):
                     str(model.device.arch), warps_per_block=_CRBA_CHOLESKY_WARPS_PER_BLOCK
                 )
 
+        self._parallel_world_active = False
+        if self._sparse_factor is not None and os.environ.get("FEATHER_PGS_PARALLEL_WORLD") == "1":
+            from .parallel_world import create as create_parallel_world  # noqa: PLC0415
+
+            self._sparse_factor.parallel_world = create_parallel_world(self._sparse_factor)
+
     def _update_kinematic_state(self) -> None:
         """Refresh cached kinematic flags and effective joint armature."""
         model = self.model
@@ -6258,6 +6264,8 @@ class SolverFeatherPGS(SolverBase):
         return iterations - active
 
     def _pack_mf_meta(self, mf_rhs: wp.array) -> None:
+        if getattr(self, "_parallel_world_active", False):
+            return  # This complete owner excludes MF bodies and their empty pack.
         pack_kernel = self._pack_mf_meta_kernel
         if pack_kernel is None:
             raise RuntimeError("Matrix-free metadata pack kernel is unavailable for this solver shape")
@@ -8612,8 +8620,13 @@ class SolverFeatherPGS(SolverBase):
             if inverse_dynamics_ready is not None:
                 wp.get_stream(model.device).wait_event(inverse_dynamics_ready)
             if self._g1_kinetic_state is not None:
-                self._g1_kinetic_state.predict(state_in, state_aug, control, stage3_qd, dt)
-                self._clamp_rigid_velocity_limits(self.v_hat)
+                parallel = self._sparse_factor.parallel_world
+                self._parallel_world_active = parallel is not None and parallel.prepare(
+                    state_in, state_aug, control, stage3_qd, contacts, dt
+                )
+                if not self._parallel_world_active:
+                    self._g1_kinetic_state.predict(state_in, state_aug, control, stage3_qd, dt)
+                    self._clamp_rigid_velocity_limits(self.v_hat)
             elif self._franka_kinetic_state is not None:
                 self._franka_kinetic_state.predict(state_in, state_aug, control, stage3_qd, dt)
                 self._clamp_rigid_velocity_limits(self.v_hat)
@@ -8636,9 +8649,10 @@ class SolverFeatherPGS(SolverBase):
                             self._stage3_trisolve_loop(size, state_aug)
                 self._stage3_compute_v_hat(state_in, state_aug, dt, stage3_qd)
                 self._clamp_rigid_velocity_limits(self.v_hat)
-            wp.copy(self._debug_stage3_qd_work, stage3_qd)
-            wp.copy(self._debug_stage3_joint_qdd, state_aug.joint_qdd)
-            wp.copy(self._debug_stage3_v_hat, self.v_hat)
+            if not self._parallel_world_active:
+                wp.copy(self._debug_stage3_qd_work, stage3_qd)
+                wp.copy(self._debug_stage3_joint_qdd, state_aug.joint_qdd)
+                wp.copy(self._debug_stage3_v_hat, self.v_hat)
 
         # Wait for pipelined collide (if running on separate stream)
         if collide_done_event is not None:
@@ -13578,6 +13592,8 @@ class SolverFeatherPGS(SolverBase):
         joint_limit_speculative_scale: float = 1.0,
         output=None,
     ):
+        if self._parallel_world_active:
+            return
         if self._row_packets is not None or self._allegro_kinetic_rows is not None:
             if (
                 output is not None
@@ -13741,6 +13757,8 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage5_prepare_impulses_world(self):
+        if self._parallel_world_active:
+            return  # The owner cold-starts local and canonical impulses.
         warmstart_flag = 1 if self.pgs_warmstart else 0
         wp.launch(
             prepare_world_impulses,
@@ -13873,6 +13891,8 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage6_prepare_world_velocity(self):
+        if self._parallel_world_active:
+            return  # Private prediction and complete decode publish v_out.
         wp.copy(self.v_out, self.v_hat)
 
     def _build_mf_body_map(self) -> None:

@@ -1,10 +1,86 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Extend only the original untimed observer's exact kinetic factory keys."""
+"""Extend the original untimed observer with exact replacement-owner checks."""
 
 import hashlib
+import os
 from pathlib import Path
+
+import numpy as np
+
+
+def parallel_snapshot(solver):
+    """Require actual device use, not merely an installed experimental owner."""
+    flag = os.environ.get("FEATHER_PGS_PARALLEL_WORLD", "0")
+    split_flag = os.environ.get("FEATHER_PGS_PARALLEL_WORLD_SPLIT", "0")
+    if flag not in ("0", "1") or split_flag not in ("0", "1"):
+        raise RuntimeError("Require Boolean parallel-world selection")
+    requested = flag == "1"
+    split = split_flag == "1"
+    if split and not requested:
+        raise RuntimeError("Split production requires the parallel-world owner")
+    sparse = solver._sparse_factor
+    owner = getattr(sparse, "parallel_world", None)
+    observed = owner is not None
+    result = {"requested": requested, "observed": observed, "split": split, "check_pass": False}
+    if observed != requested:
+        raise RuntimeError("Requested parallel world differs from the installed owner")
+    if not requested:
+        return {**result, "check_pass": True}
+    from newton._src.solvers.feather_pgs import parallel_world_rows  # noqa: PLC0415
+
+    if getattr(owner, "split", False) is not split:
+        raise RuntimeError("Requested split boundary differs from the actual owner")
+    factory = parallel_world_rows.get_producer_kernel if split else parallel_world_rows.get_kernel
+    kernel = factory(solver._g1_kinetic_state.chain_scan)
+    expected_key = "sparse_parallel_world_rows43_s18_c100" if split else "sparse_parallel_world43_s18_c100"
+    if owner.active is not True or owner.kernel is not kernel or kernel.key != expected_key:
+        raise RuntimeError("Parallel owner fell back or selected an unexpected kernel")
+    solve_key = kernel.key
+    if split:
+        if (
+            owner.solve_kernel is not sparse.kernels.solve
+            or owner.solve_kernel.key != "sparse_metric_tangent43_s18_c100"
+        ):
+            raise RuntimeError("Split production did not retain the original metric solver")
+        solve_key = owner.solve_kernel.key
+    if tuple(owner.status.shape) != (2,):
+        raise RuntimeError("Unexpected parallel-world status shape")
+    status = owner.status.numpy()
+    if int(status[0]) != 0 or int(status[1]) <= 0:
+        raise RuntimeError("Parallel-world device guard failed or no successful solve ran")
+    buckets = owner.buckets
+    worlds, capacity = int(solver.world_count), int(solver._max_contacts_alloc)
+    if (
+        tuple(buckets.data.ids.shape) != (capacity,)
+        or tuple(buckets.data.offsets.shape) != (worlds + 1,)
+        or tuple(buckets.counts.shape) != (worlds + 1,)
+        or tuple(buckets.data.invalid.shape) != (1,)
+    ):
+        raise RuntimeError("Parallel-world routing changed the exact allocated capacity")
+    if int(buckets.data.invalid.numpy()[0]) != 0:
+        raise RuntimeError("Parallel-world raw routing failed coverage validation")
+    offsets = buckets.data.offsets.numpy()
+    if int(offsets[0]) != 0 or np.any(offsets[1:] < offsets[:-1]) or int(offsets[-1]) > capacity:
+        raise RuntimeError("Invalid parallel-world raw bucket offsets")
+    return {
+        **result,
+        "check_pass": True,
+        "active": True,
+        "kernel_key": kernel.key,
+        "solve_kernel_key": solve_key,
+        "successful_solve_launches": int(status[1]),
+        "status_nonzero": 0,
+        "raw_capacity": capacity,
+        "routed_raw_count": int(offsets[-1]),
+        "retained_fallback_arrays": (
+            "Existing Z/support/incident are published and consumed by the original solver"
+            if split
+            else "Z/support/incident remain allocated; candidate uses private response scratch"
+        ),
+    }
+
 
 RETAINED = Path("/tmp/fpgs-g1-paired-gs-checked-t0NFbw6H/checked_sparse.py")
 RETAINED_PIN = "5bea2bec51735a02f34a6623b136ca557a84df4678683ff888cab0297bf75046"
@@ -34,6 +110,20 @@ replacement = """    chain_flag = os.environ.get("FEATHER_PGS_G1_CHAIN_SCAN")
 """
 if source.count(seam) != 1:
     raise RuntimeError("The original exact-key observation seam changed")
+source = source.replace(seam, replacement)
+parallel_seam = '    result["solve_key"] = getattr(sparse.kernels.solve, "key", None)\n'
+parallel_replacement = (
+    parallel_seam
+    + """    result["parallel_world"] = parallel_snapshot(solver)
+    result["executed_solve_key"] = (
+        result["parallel_world"]["solve_kernel_key"]
+        if result["parallel_world"]["observed"] else result["solve_key"]
+    )
+"""
+)
+if source.count(parallel_seam) != 1:
+    raise RuntimeError("The original solve-owner observation seam changed")
+source = source.replace(parallel_seam, parallel_replacement)
 # __file__ deliberately remains this wrapper: its digest pins the complete
 # source transformation and the retained observer's required SHA256.
-exec(compile(source.replace(seam, replacement), str(RETAINED), "exec"), globals())
+exec(compile(source, str(RETAINED), "exec"), globals())
