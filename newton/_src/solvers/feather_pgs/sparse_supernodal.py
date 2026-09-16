@@ -83,100 +83,140 @@ def validate_plan(index):
         raise ValueError("Supernodal refresh requires the admitted 434-entry pattern")
 
 
-def _select(values, variable="lane"):
-    """Emit short affine runs for a panel's topology-only coordinate map."""
-    runs = []
-    first = 0
-    for i in range(1, len(values) + 1):
-        if i == len(values) or values[i] - i != values[first] - first:
-            delta = values[first] - first
-            expr = variable if delta == 0 else f"({variable}+{delta})"
-            runs.append((i, expr))
-            first = i
-    result = runs[-1][1]
-    for end, expr in reversed(runs[:-1]):
-        result = f"({variable}<{end}?{expr}:{result})"
-    return result
+def _cuda_helpers():
+    """Keep one bounded element-parallel routine rather than twelve expansions."""
+    return r"""
+    struct Panels {
+        static __device__ __forceinline__ int tri(int r,int c){return r*(r+1)/2+c;}
+        static __device__ __forceinline__ int node(int r,int b,int start,int s,int first){
+            if(r<b)return start+r;
+            r-=b;
+            if(s==12){if(r<5)return first+r;if(r==5)return 24;return 31+r;}
+            if(s==7)return r==0?24:36+r;
+            return 37+r;
+        }
+        static __device__ __noinline__ void factor(
+            float* a,float* updates,float* f,float* C,float* W,int* bad,
+            const int* index,const int* rc,int lane,int start,int b,int s,int first,
+            int offset,int child0,int child1,int child2){
+            const int n=b+s,entries=n*(n+1)/2;
+            #pragma unroll 1
+            for(int e=lane;e<entries;e+=32){
+                const int pair=rc[e],r=pair>>4,c=pair&15;
+                float value=c<b?a[index[node(r,b,start,s,first)*43+start+c]]:0.0f;
+                if(child0>=0)value+=updates[child0+e];
+                if(child1>=0)value+=updates[child1+e];
+                if(child2>=0)value+=updates[child2+e];
+                f[e]=value;
+            }
+            __syncwarp(0xffffffffu);
+            #pragma unroll 1
+            for(int k=0;k<b;++k){
+                if(lane==0){
+                    const float value=f[tri(k,k)];
+                    if(!(value>0.0f)||!wp::isfinite(value))atomicExch(bad,1);
+                    f[tri(k,k)]=wp::sqrt(value);
+                }
+                __syncwarp(0xffffffffu);
+                const int row=k+1+lane;
+                if(row<n)f[tri(row,k)]/=f[tri(k,k)];
+                __syncwarp(0xffffffffu);
+                #pragma unroll 1
+                for(int e=lane;e<entries;e+=32){
+                    const int pair=rc[e],r=pair>>4,c=pair&15;
+                    if(c>k)f[e]-=f[tri(r,k)]*f[tri(c,k)];
+                }
+                __syncwarp(0xffffffffu);
+            }
+            #pragma unroll 1
+            for(int e=lane;e<s*(s+1)/2;e+=32){
+                const int pair=rc[e],r=pair>>4,c=pair&15;
+                updates[offset+e]=f[tri(r+b,c+b)];
+            }
+            if(lane<b*(b+1)/2)C[lane]=f[lane];
+            __syncwarp(0xffffffffu);
+            // Preserve C while the same front becomes C^-1 and E=V*C^-1.
+            #pragma unroll 1
+            for(int c=b-1;c>=0;--c){
+                if(lane<n&&lane>=c){
+                    float value=lane<b?(lane==c?1.0f:0.0f):f[tri(lane,c)];
+                    #pragma unroll 1
+                    for(int k=c+1;k<b&&k<=lane;++k)value-=f[tri(lane,k)]*C[tri(k,c)];
+                    f[tri(lane,c)]=value/C[tri(c,c)];
+                }
+                __syncwarp(0xffffffffu);
+            }
+            #pragma unroll 1
+            for(int e=lane;e<entries;e+=32){
+                const int pair=rc[e],r=pair>>4,c=pair&15;
+                if(c<b){
+                    const int entry=index[node(r,b,start,s,first)*43+start+c];
+                    const float value=f[e];a[entry]=value;
+                    if(r<b){W[entry]=value;if(!wp::isfinite(value))atomicExch(bad,1);}
+                }
+            }
+        }
+        static __device__ __noinline__ void inverse(
+            float* a,float* f,float* W,int* bad,const int* index,const int* rc,
+            int lane,int start,int b,int s,int first){
+            const int coupling=b*s;
+            #pragma unroll 1
+            for(int e=lane;e<coupling;e+=32){
+                const int r=e/b,c=e-r*b;
+                f[e]=a[index[node(r+b,b,start,s,first)*43+start+c]];
+            }
+            #pragma unroll 1
+            for(int e=lane;e<s*(s+1)/2;e+=32){
+                const int pair=rc[e],r=pair>>4,c=pair&15;
+                f[coupling+e]=a[index[node(r+b,b,start,s,first)*43+node(c+b,b,start,s,first)]];
+            }
+            __syncwarp(0xffffffffu);
+            #pragma unroll 1
+            for(int e=lane;e<coupling;e+=32){
+                const int r=e/b,c=e-r*b;
+                float value=0.0f;
+                #pragma unroll 1
+                for(int k=0;k<=r;++k)value-=f[coupling+tri(r,k)]*f[k*b+c];
+                const int entry=index[node(r+b,b,start,s,first)*43+start+c];
+                a[entry]=value;W[entry]=value;
+                if(!wp::isfinite(value))atomicExch(bad,1);
+            }
+        }
+    };
+"""
 
 
 def _factor_cuda(panel):
     block, separator = _BLOCKS[panel], _SEPARATORS[panel]
-    b, s = len(block), len(separator)
-    nodes = block + separator
-    n = b + s
-    out = ["{", f"const int node={_select(nodes)};", f"const bool live=lane<{n};"]
-    for c in range(n):
-        if c < b:
-            out.append(f"float v{c}=(live&&lane>={c})?a[p.index.data[node*43+{nodes[c]}]]:0.0f;")
-        else:
-            out.append(f"float v{c}=0.0f;")
-    # A child separator is a subset of this complete front. Emit only its
-    # contribution, never the child's original ancestor mass submatrix.
-    for child, parent in enumerate(_PARENTS):
-        if parent != panel:
-            continue
-        child_s = _SEPARATORS[child]
-        local = [nodes.index(k) for k in child_s]
-        start = local[0]
-        if local != list(range(start, n)):
-            raise ValueError("Panel child separator is not a suffix")
-        off = schedule()["offsets"][child]
-        for c, dest in enumerate(local):
-            out.append(f"if(live&&lane>={dest})v{dest}+=updates[{off}+(lane-{start})*(lane-{start}+1)/2+{c}];")
-    for k in range(b):
-        out.extend(
-            [
-                f"if(lane=={k}){{if(!(v{k}>0.0f)||!wp::isfinite(v{k}))atomicExch(&bad,1);v{k}=wp::sqrt(v{k});}}",
-                f"const float pivot{k}=__shfl_sync(0xffffffffu,v{k},{k});",
-                f"if(live&&lane>{k})v{k}/=pivot{k};",
-            ]
-        )
-        for c in range(k + 1, n):
-            out.append(f"const float edge{k}_{c}=__shfl_sync(0xffffffffu,v{k},{c});")
-            out.append(f"if(live&&lane>={c})v{c}-=v{k}*edge{k}_{c};")
-    off = schedule()["offsets"][panel]
-    for c in range(s):
-        out.append(f"if(live&&lane>={b + c})updates[{off}+(lane-{b})*(lane-{b}+1)/2+{c}]=v{b + c};")
-    # One right solve computes C^-1 in the first b rows and E=V*C^-1 in
-    # separator rows. C itself stays in v while all right-hand sides advance.
-    for c in range(b):
-        out.append(f"float e{c}=0.0f;")
-    for c in reversed(range(b)):
-        out.append(f"float rhs{c}=lane<{b}?(lane=={c}?1.0f:0.0f):v{c};")
-        for k in range(c + 1, b):
-            out.append(f"const float inverse_edge{c}_{k}=__shfl_sync(0xffffffffu,v{c},{k});")
-            out.append(f"if(live&&lane>={k})rhs{c}-=e{k}*inverse_edge{c}_{k};")
-        out.append(f"const float inverse_diag{c}=__shfl_sync(0xffffffffu,v{c},{c});")
-        out.append(f"if(live&&lane>={c})e{c}=rhs{c}/inverse_diag{c};")
-    for c in range(b):
-        out.append(
-            f"if(live&&lane>={c}){{const int entry=p.index.data[node*43+{block[c]}];a[entry]=e{c};if(lane<{b}){{d.W.data[group*434+entry]=e{c};if(!wp::isfinite(e{c}))atomicExch(&bad,1);}}}}"
-        )
-    out.append("}")
-    return "\n".join(out)
+    children = [child for child, parent in enumerate(_PARENTS) if parent == panel]
+    for child in children:
+        if _SEPARATORS[child] != block + separator:
+            raise ValueError("Child separator must cover its parent's complete front")
+    offsets = [schedule()["offsets"][child] for child in children]
+    offsets.extend([-1] * (3 - len(offsets)))
+    args = (
+        block[0],
+        len(block),
+        len(separator),
+        separator[0] if separator else 0,
+        schedule()["offsets"][panel],
+        *offsets,
+    )
+    return (
+        "Panels::factor(a,updates,front+warp*120,diagonal+warp*21,d.W.data+group*434,&bad,p.index.data,tri_rc,lane,"
+        + ",".join(map(str, args))
+        + ");"
+    )
 
 
 def _inverse_cuda(panel):
     block, separator = _BLOCKS[panel], _SEPARATORS[panel]
-    b, s = len(block), len(separator)
-    if not s:
-        return ""
-    out = ["{", f"const int node={_select(separator)};", f"const bool live=lane<{s};"]
-    for c in range(b):
-        out.append(f"const float e{c}=live?a[p.index.data[node*43+{block[c]}]]:0.0f;")
-    for k, ancestor in enumerate(separator):
-        out.append(f"const float q{k}=(live&&lane>={k})?a[p.index.data[node*43+{ancestor}]]:0.0f;")
-    out.append("__syncwarp(0xffffffffu);")
-    for c in range(b):
-        out.append(f"float value{c}=0.0f;")
-        for k in range(s):
-            out.append(f"const float edge{c}_{k}=__shfl_sync(0xffffffffu,e{c},{k});")
-            out.append(f"if(live&&lane>={k})value{c}-=q{k}*edge{c}_{k};")
-        out.append(
-            f"if(live){{const int entry=p.index.data[node*43+{block[c]}];a[entry]=value{c};d.W.data[group*434+entry]=value{c};if(!wp::isfinite(value{c}))atomicExch(&bad,1);}}"
-        )
-    out.append("}")
-    return "\n".join(out)
+    args = (block[0], len(block), len(separator), separator[0])
+    return (
+        "Panels::inverse(a,front+warp*120,d.W.data+group*434,&bad,p.index.data,tri_rc,lane,"
+        + ",".join(map(str, args))
+        + ");"
+    )
 
 
 def _cpu_panels():
@@ -240,8 +280,17 @@ def native_source(*, geometric=False):
 #if defined(__CUDA_ARCH__)
     const int tid=threadIdx.x,lane=tid&31,warp=tid>>5;
     __shared__ float a[434],updates[587];
+    __shared__ float front[480], diagonal[84];
+    __shared__ int tri_rc[120];
     __shared__ int bad;
     if(tid==0){bad=0;d.valid.data[world]=0;}
+    if(tid<120){
+        int r=tid>=36?8:0;
+        if(tid>=(r+4)*(r+5)/2)r+=4;
+        if(tid>=(r+2)*(r+3)/2)r+=2;
+        if(tid>=(r+1)*(r+2)/2)r+=1;
+        tri_rc[tid]=(r<<4)|(tid-r*(r+1)/2);
+    }
 #else
     const int tid=0;
     float a[434],updates[587];
@@ -301,18 +350,26 @@ def native_source(*, geometric=False):
     for stage in _STAGES:
         for worker, panels in enumerate(stage):
             if panels:
-                source += f"if(warp=={worker}){{\n" + "\n".join(_factor_cuda(p) for p in panels) + "\n}\n"
+                source += (
+                    f"if(warp=={worker}){{\n"
+                    + "\n__syncwarp(0xffffffffu);\n".join(_factor_cuda(p) for p in panels)
+                    + "\n}\n"
+                )
         source += "__syncthreads();\n"
     for stage in reversed(_STAGES[:-1]):
         for worker, panels in enumerate(stage):
             if panels:
-                source += f"if(warp=={worker}){{\n" + "\n".join(_inverse_cuda(p) for p in panels) + "\n}\n"
+                source += (
+                    f"if(warp=={worker}){{\n"
+                    + "\n__syncwarp(0xffffffffu);\n".join(_inverse_cuda(p) for p in panels)
+                    + "\n}\n"
+                )
         source += "__syncthreads();\n"
     source += "#else\n" + _cpu_panels() + "\n#endif\n"
     source += "if(tid==0){if(bad)atomicOr(&d.status.data[world],1);d.valid.data[world]=bad==0;}\n"
     # CPU compilation has no CUDA atomic primitive; one thread owns the world.
     source = source.replace("if(tid==0){if(bad)atomicOr", "if(tid==0){if(bad)wp::atomic_or")
-    return source
+    return "#if defined(__CUDA_ARCH__)\n" + _cuda_helpers() + "\n#endif\n" + source
 
 
 @cache

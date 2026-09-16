@@ -924,3 +924,58 @@ or coefficient grid; first formula checkpoint16:35, results17:00.
 The accepted session increment remains the earlier vector-chain improvement.
 Neither the shell nor first supernodal result is promoted as progress toward
 the RTX4x-everywhere goal, which remains unmet.
+
+## Shared-front correction and numerical screen closure, 16:33 UTC
+
+The one shared-front supernodal correction completes five native tests on each
+GPU, then an early whole-task comparison with all source/capacity/idle guards
+passing. RTX15.071086600 ->14.804360150ms (1.018017x),
+GB19.864856800 ->20.088351775ms (0.988874x). It misses the predeclared large-gain
+targets and remains default-off. No further panel/mapping tuning is funded.
+
+Strict node attribution retains48 physics and12 auxiliary roots per card,
+preserving the inherited auxiliary-analyzer failure separately. Complete factor
+time is1.565091ms RTX /1.768867ms GB, versus the original1.780024/1.504000ms
+and first register-front1.574609/2.376645ms. The correction recovers about0.608ms
+of the GB prototype loss while barely changing RTX. Actual resource records
+show58/56 registers,7336 bytes shared and zero local memory. Reduced registers
+and static code size are not proof of a hardware bottleneck or sufficient gain.
+Other owners remain approximately flat; no old refresh is duplicated.
+
+Artifacts: `/tmp/fpgs-supernodal-shared-native-20260916-x4R0c3LI`,
+`/tmp/fpgs-g1-supernodal-shared-whole-paired16k-20260916-01`,
+`/tmp/fpgs-g1-supernodal-shared-node-candidate16k-20260916-01`, and unchanged
+strict-reader reuse at `/tmp/fpgs-supernodal-shared-strict-PKqnl8i1`.
+Full frozen source, resource and measurement pins are in `SUPERNODAL_20260916.md`.
+
+The single frozen original-GS AA(2) CPU screen reduces consumed sweeps79->48
+and actual native-root probes157->111 across sixteen saved G1 cases. Charging
+physical-stop scans, proposed-impulse reconstruction and merit checks instead
+increases operator dot/action events2408->5340 before history arithmetic.
+These events differ in support/latency and are not measured wall time, but
+they do not establish the cheap complete replacement required for native work.
+Fifteen cases meet unchanged physical stopping tolerances versus fourteen
+original. RTX current8192 is farther from the common held-H reference while
+still passing every physical stop criterion; this is an accuracy trade-off,
+not a false declaration of an incorrect contact law. No more AA variants are
+funded. Exact policy, per-case results and charges are preserved in
+`/tmp/fpgs-g1-aa2-metric-gs-IPTQJpKv/RESULTS.md`.
+
+Source studies also recover the already-measured Franka pair-shape preparation
+option: historical RTX whole savings0.315868ms, not a new architecture or a
+current timing claim. The existing flag replaces full shape preparation with
+the immutable explicit-pair endpoint union. Current per-shape arithmetic stays
+identical to the full producer. Prior rigid-body hierarchy screening found one
+leaf per participating Franka body and no new pair reduction. Kuka's current
+state family already contains compact next-state bias/mass, one-warp four-round
+pose/motion scans and no duplicated primary canonical factor/tau producer.
+Neither audit establishes another1ms deletion.
+
+Next bounded numerical question: can three warm, element-parallel Cholesky
+relaxation passes replace the sequential pivot schedule, retain the original
+exact sparse-inverse consumer, and satisfy a conservative current-H error check?
+This is not stale-H reuse or unchanged-W contact response. Seven saved one-step
+pairs provide a CPU falsification screen only; they do not cover the next
+scheduled refresh, resets or a whole-task population. Charge matrix assembly,
+all passes, residual/norm checks, retained factor storage and full fallback.
+No runtime implementation or speedup is implied by this question.

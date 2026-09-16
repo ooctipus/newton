@@ -74,6 +74,15 @@ class TestSparseSupernodal(unittest.TestCase):
         self.assertEqual(sparse_supernodal.get_refresh_kernel().key, "sparse_supernodal43_434")
         self.assertEqual(sparse_supernodal.get_refresh_kernel(geometric=True).key, "g1_kinetic_sparse_supernodal43_434")
 
+    def test_shared_front_ownership(self):
+        """Retire full-row broadcasts without adding whole-CTA joins."""
+        from newton._src.solvers.feather_pgs.sparse_supernodal import native_source  # noqa: PLC0415
+
+        source = native_source(geometric=True)
+        self.assertEqual(source.count("__shfl_sync("), 0)
+        self.assertIn("__shared__ float front[480], diagonal[84]", source)
+        self.assertEqual(source.count("__syncthreads();"), 8)
+
     def test_actual_operator_current_held_and_drive_readiness(self):
         """Check all branch contributions against independent physical H/action."""
         f = self.make_fixture()

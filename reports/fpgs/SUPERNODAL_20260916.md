@@ -231,3 +231,119 @@ CPU actual-H/lifecycle checks and compact-loop/lower-register AOT evidence
 precede root-owned paired native and early whole tests. Native-ready target
 17:15 UTC, no unexplained extension beyond17:30. No correction runtime has
 been written at this closure checkpoint.
+
+## Shared-front correction: native-ready checkpoint, 16:23 UTC
+
+The first implementation is recoverable at commit `0689f7a3`. Exactly one
+execution-ownership correction is now frozen; the panel graph, four-worker
+schedule, eight geometric CTA joins, mathematical work, canonical W434
+layout, ABI, admission and lifecycle bindings are unchanged. No timing or
+native qualification of this correction is claimed at this checkpoint.
+
+Each worker now owns120 shared front entries and21 saved lower-C entries.
+Compact, non-inlined device helpers execute element-parallel factor and
+inverse loops instead of holding complete front rows in registers and
+duplicating twelve unrolled panel bodies. A120-entry shared integer
+triangular decoder is initialized once before the existing assembly join;
+there is no new global metadata or per-pivot square root for addressing.
+Original H is loaded only for panel-owned columns. Separator columns start
+at zero and receive child updates only, avoiding duplicated ancestor H.
+
+The factor helper preserves C before its descending in-place right solve.
+The reverse helper snapshots E and the complete ancestor inverse into
+disjoint portions of the same private front: its largest snapshot uses114
+of120 entries. Explicit warp joins protect consecutive sibling calls that
+reuse this storage. All32 lanes participate in every full-mask warp join;
+underfull predicates guard arithmetic only. The source performs215
+warp-local joins per complete refreshed world, including sibling reuse;
+this is an algorithmic count, not a measured hardware synchronization cost.
+Additional shared traffic and the larger shared footprint are explicit
+costs of retiring register liveness and shuffle broadcasts.
+
+The changed-ownership regression failed against the preserved old source
+before implementation, then passed on the correction. Four focused CPU
+controls pass, including actual physical H/action, drive readiness,
+held/failure behavior and the new source-ownership contract. The CPU
+algebra remains unchanged; CUDA execution is still required. Targeted
+precommit passes. Independent read-only reviews found no concrete algebra,
+triangular-index, private-scratch lifetime, mask or barrier blocker.
+
+| Offline geometric owner, block128 | SM120 | SM100 |
+| --- | ---: | ---: |
+| Registers | 58 | 55 |
+| Shared bytes | 7,336 | 7,336 |
+| Stack bytes / spill loads / spill stores | 0 / 0 / 0 | 0 / 0 / 0 |
+| Total static SASS instructions, including helpers | 1,864 | 1,840 |
+| Static SHFL instructions | 0 | 0 |
+| Static whole-CTA BAR instructions | 8 | 8 |
+
+The nongeometric test factory uses60/62 registers and8,368 B shared, also
+with zero stack/spills including the device helpers. PTX contains eight
+CTA-barrier sites and fifteen looped warp-barrier sites, with no shuffle
+instruction. Static code size falls from17,384/17,296 instructions, but
+these are not dynamic instruction counts or a speed prediction. Native
+occupancy, stalls and full refresh cost remain unmeasured for this version.
+
+Frozen correction pins:
+
+- `sparse_supernodal.py`: `cfd08d4c43a2a206011c57da657c34d54b98ab5ffbbb4804523ed235fa404b36`
+- `test_sparse_supernodal.py`: `ee0970f1febf2656097604cb58ffdf2bd344d424a7d6becc7541e688aeae3c61`
+- Unchanged `sparse_factor.py`: `1ff4a3b329c81d4368963a5dfd67d238b407a07208d0e6bfcceb707f8ef2a24f`
+- Immutable offline report:
+  `/tmp/fpgs-supernodal-offline-sGFHXsrp/offline03_shared/report.json`,
+  SHA256 `e63882d19036b949600219cf9b0367feadd32b169e64c7ec4fabf34444433cc5`.
+
+Root owns the paired native and early whole checks. The runtime/test freeze
+does not change the default-off status or authorize a further mapping
+variant. The prospective thresholds above remain unproven.
+
+## Shared-front native and whole closure
+
+Root ran all five native controls on each GPU: all pass, including the
+unchanged physical, held-factor, failure and continuing-state graph gates.
+Logs: `/tmp/fpgs-supernodal-shared-native-20260916-x4R0c3LI/gpu{0,1}.log`.
+The paired whole run then completed with exit0 and all source, idle,
+capacity and actual-owner guards passing:
+`/tmp/fpgs-g1-supernodal-shared-whole-paired16k-20260916-01/`.
+
+| Actual graph physics, ms/environment step | RTX | GB |
+| --- | ---: | ---: |
+| Qualified chain baseline | 15.071086600 | 19.864856800 |
+| Shared-front supernodal | 14.804360150 | 20.088351775 |
+| Baseline / candidate | 1.01801675 | 0.98887440 |
+| Baseline minus candidate | 0.26672645 | -0.22349498 |
+
+The corrected node capture retains the inherited auxiliary-root analyzer
+exit1. Its strict reader passes both cards:48 physics and12 auxiliary
+roots, zero unproven nodes, original source/process-correlation/capacity
+guards and final idle checks. Only the new refresh key executes, eight
+times per environment step; the old refresh keys are absent. All retained
+row, GS, state and collision families remain approximately flat.
+
+| Complete refresh, ms/environment step | RTX | GB |
+| --- | ---: | ---: |
+| Preserved qualified-chain node baseline | 1.780023500 | 1.504000000 |
+| First register-front mapping | 1.574608833 | 2.376645167 |
+| Shared-front correction | 1.565091000 | 1.768866667 |
+
+The correction recovers about0.608ms of the first mapping's GB factor
+regression but changes RTX by only about0.010ms. The factor still misses
+both prospective thresholds: RTX0.980ms and GB1.504ms. Actual launch
+resources are58/56 registers,7,336 B shared and zero reported local memory
+at block128. Offline and device-compiled resource numbers need not be
+identical. Node comparisons are owner diagnostics from separate short
+windows, not additive whole-savings claims or hardware-stall measurements.
+
+Strict artifacts:
+`/tmp/fpgs-supernodal-shared-strict-PKqnl8i1/candidate_gpu0.json`, SHA256
+`215bca4dff798d347dbcabb4907cc2ad290f33b75d24b34d921f325a961b018c`;
+`candidate_gpu1.json`, SHA256
+`10718d5092eed978b1fc6e2e5f9c670d1ee7558f4650038da95ca3a29e053448`.
+Raw capture:
+`/tmp/fpgs-g1-supernodal-shared-node-candidate16k-20260916-01/`.
+
+This closes the funded factor experiment without promotion or further
+mapping variants. The flag remains default off and the accepted default
+dispatch is unchanged. Lower register and static instruction counts were
+real, but did not produce the required complete-owner gain. No new MJWarp
+comparison, other-task measurement or cross-task qualification is implied.
