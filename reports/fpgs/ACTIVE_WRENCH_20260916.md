@@ -1,4 +1,37 @@
-# Rank-aware active contact owner: bounded CPU falsification
+# Structural FPGS study: 2026-09-16
+
+## Handoff status
+
+**No accepted additional speedup over `ca0d427a`.** The user's ten-hour
+window is 2026-09-15 23:44 through 2026-09-16 09:44 UTC. Numerical controls,
+native implementations, paired whole timings and cause-directed corrections
+below are research results, not a completed performance target. The accepted
+runtime remains unchanged; no new MJWarp ratio or across-task gain is claimed.
+
+The native body-basis producer loses about 5% physics throughput on both cards.
+Paired-world GS loses about 9% RTX/3% GB; its one literal-mask correction also
+loses. The original and corrected versions are retained separately in
+`45491fa7` and `9f01e841`. Earlier local-block, parallel-block and numerical
+controls have their own complete cost/convergence closures below. Do not
+enable an experiment merely because its correctness controls pass.
+
+All experiment switches are opt-in and default off. Independent final review
+finds only 18 opt-in dispatch/attribute lines changed in existing solver
+files relative to the accepted base; new runtime modules are otherwise
+unreferenced. Isaac Lab remains `53ee6b44c2334341305dbdf385a3916c6b140799`
+with no source edits, and the accepted baseline worktree remains clean at
+`ca0d427af809571bb5501f644c1a6e03990cd2a8`. No parent dependency pointer,
+substep, maximum iteration allowance or capacity was changed. No sudo was
+used. Branch: `ooctipus/newton:ooctipus/fpgs-active-wrench-20260916`.
+
+Final CPU rerun covers all 19 test modules added or changed since the base:
+58 tests pass, four CUDA tests skip intentionally with CUDA hidden. The
+body-basis and both paired-GS versions have their separate native checks on
+RTX PRO6000 and GB300 recorded below. Full pre-commit passes. Runtime/test
+sources and this report are in the branch; large captures, checked temporary
+adapters and diagnostic artifacts remain at their pinned local paths.
+
+## Initial candidate: rank-aware active contact owner
 
 Funded at 02:52 UTC during the user's 23:44--09:44 UTC structural window.
 Start from retained `ca0d427a`, not the unpromoted sleeping prototypes. Isaac
@@ -1193,7 +1226,7 @@ An off-tree compile of per-collective literal-low/high mask branches removes
 the MATCH/VOTEU/REDUX sites but increases static SHFL/WARPSYNC sites twofold,
 BSSY/BSYNC59 ->106, registers85 ->89 and static instructions2520 ->3256 on
 RTX. No physics, width, root, row order or budget changes. All shared-memory
-synchronization remains. NVIDIA's documented participant-mask requirements
+synchronization remains. NVIDIA's [documented participant-mask requirements](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/cpp-language-extensions.html#warp-sync-intrinsic-constraints)
 must still hold separately for each half; a full-warp mask inside divergent
 world loops would not be a safe shortcut.
 
@@ -1242,3 +1275,54 @@ to `ooctipus/newton:ooctipus/fpgs-active-wrench-20260916`. The correction is
 retained as a separately reproducible failed experiment, not as a production
 optimization. No fresh MJWarp or cross-task speedup is claimed from these
 G1-only measurements.
+
+## Remaining tree-dataflow screen, 09:30 UTC: not a measured gain
+
+A final read-only audit finds no redundant complete next-state producer to
+delete. Current bias43, screws and COM offsets feed live force/contact
+consumers. Public poses/COM velocities are required. Rotated inertia,
+subtree moments and geometric434 already run only for the upcoming original
+factor refresh; matching valid current state skips repair. Existing finish
+launches alternate about 250/332us on RTX and 271/353us on GB. Equal-count
+cadence groups differ by 0.328ms/env on each GPU. This is observational
+cadence evidence, not isolated phase timing or permission to remove refresh.
+
+A general additive-only chain representation is distinct from another tile
+size. The actual 44-body G1 tree has 12 heavy chains, maximum light depth 2,
+and maximum chain lengths by stage 11/9/2. Each complete-chain warp could
+scan poses, construct existing world-origin screws, scan the original
+motion/bias law, and publish both before its light-child chains advance.
+Reverse additive suffix/gather stages would form subtree wrenches/moments.
+It needs no extra numeric global cache and preserves every public output.
+
+| Source-derived work, not GPU timing | Current | Interleaved chains |
+| --- | ---: | ---: |
+| Pose compositions | 124 | 87 |
+| Common-frame motion compositions | 124 | 87 |
+| Forward critical-path scan rounds | 8 | 18 |
+| Forward/reverse CTA stage joins | 27 | approximately 6 |
+| Subtree additions per component | 43 | 87 |
+
+The longer staged critical path is material: a light child of an early
+node waits for a complete heavy chain, even when its own ancestry was short.
+Other integration, root-origin, publication, projection and status barriers
+remain. No phase evidence establishes a one-millisecond whole saving.
+Replacing the separate local pose/motion scans with an associative
+SE(3) motion/bias tuple is algebraically valid, but adds up to 348 vector
+rotations and 174 translation crosses per world and increases live tuple
+storage. It is not assumed to be the faster implementation.
+
+Global prefix-end subtraction is not the proposed subtree algorithm. A
+prior controlled counterexample at
+`/tmp/fpgs-franka-cooperative-state-FMucSlN7/test_source.py:74` places 1e20
+outside a subtree and 1.25 inside: additive projection retains 1.25 while
+FP32 prefix subtraction returns 0. This is a regression counterexample, not
+a claim that current G1 traces contain that mass/force ratio.
+
+No new native variant is funded from this source-only screen. The next
+decision requires the actual traversal cost and a complete replacement
+budget; reduced joins or operation counts must not again be substituted
+for whole-physics improvement. Existing Newton serial FK combines pose and
+motion, but the inspected installed MJWarp branch kernels keep kinematics,
+COM motion/acceleration and reverse force propagation separate. Neither
+inspection supplies measured evidence for this particular chain design.
