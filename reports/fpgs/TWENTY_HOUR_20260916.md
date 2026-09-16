@@ -1360,3 +1360,54 @@ GB19.837211200->18.904325600ms (1.049348x). Positive but below the1ms RTX
 standalone milestone; default-off and not promoted. Preserve it as a possible
 composition component, without funding instruction/mapping micro-tuning or a
 new qualification campaign before a material combined whole-task gain exists.
+
+## Closed checkpoints and corrective algorithms, 20:14 UTC
+
+The cached spectral-Jacobi correction preserves every original physical merit
+term, stop, permanent half latch and24-pass limit. Twelve CPU controls and
+the native2048-case hard checks pass on both cards, including the previously
+reported664 pointwise metric trade-offs (not newly relabeled failures or
+universal improvement). Registers85/91, unchanged shared memory and no spills.
+The complete paired screen passes all guards:
+
+| Whole physics, ms/env step | RTX | GB300 |
+| --- | ---: | ---: |
+| Original production reference |9.214019375|9.488502400|
+| Cached spectral Jacobi |10.193371200|11.207959225|
+| Reference/candidate |0.903923x|0.846586x|
+
+Artifact `/tmp/fpgs-anymal-spectral-jacobi-cached-whole-paired16k-20260916-01`.
+The cause-directed correction recovers roughly2.24/2.93ms versus the separate
+uncached screen, but still loses to production. It is closed default-off and
+unpromoted at fork commit `72b3bb0302c885cf3db3c3ec9e62f306438aded5`.
+Further instruction tuning is not funded. A distinct, fixed-policy CPU study
+will test reusing the next unrelaxed contact proposal as a conservative natural-
+residual bound for the permanent latch and early-stop gate. Full physical
+checks remain required when that gate permits stopping and for final quality;
+small natural residual alone does not bound absolute complementarity/MDP.
+All final lookahead and midpoint replacement proposals must be charged. The
+new workflow needs a further1.979352ms RTX whole saving from the cached version
+to reach original-minus1ms; the uncached instrumented merit fraction is not a
+prediction of this saving.
+
+G1 spectral tangents are preserved at fork commit
+`da4d74f816b59f43308140c67bbc10db17264dce`, and physically unqualified pair-CSR
+at `eabc4f8c3d2aacae78e78a6004d02047b175f7f5`. Both include root's exact measured
+observer extensions; all measured runtime bytes remain pinned in their reports.
+Full and targeted pre-commit pass and all three checkpoint trees are clean.
+
+One bounded pair-CSR correction is funded after independent arithmetic review.
+Cache outward lower/upper intervals for the stock writer's reconstructed
+separation during the existing count pass. Use the same second normalization
+as the writer, not just unpack_contact's first normalization. The interval
+covers represented witness arithmetic only, not geometric-query error or the
+later body-local/world roundtrip. One additional bucket scan obtains the
+minimum upper separation; the original four spread scans prioritize intervals
+whose lower bound is at most max(0, minimum upper). Outside that cohort, fill
+only remaining slots by nearest upper separation. This retains nearest
+all-separated footprints without a guessed physical distance or normal angle.
+Nonfinite bounds stick a failure. All raw candidates and original fallback
+remain; capacities are unchanged. Added vec2 storage is14,155,784 bytes at the
+calibrated raw capacity, plus count arithmetic and one extra scan. The original
+loaded support/rebound/friction fixtures and an early whole screen decide;
+neither a geometry-only pass nor an isolated exporter speed is promotion.
