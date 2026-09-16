@@ -1701,3 +1701,143 @@ normal residual after the certified normal solve. No native implementation
 is funded on this result. Full saved-input/reference guards pass in
 `/tmp/fpgs-normal-block-cpu-oGrTia7y/all2048`; this does not establish generic
 overflow admission or a new timing gain.
+
+## Further structural falsification, 22:19 UTC
+
+Staged-row closure is preserved at clean pushed fork commit
+`24e5f298cd9523cb77777434ed4c2b589076fd7e`; all measured runtime/test/observer
+hashes remain unchanged. The normal-block CPU helper, tests and report are
+preserved at clean pushed fork commit
+`2f70a1f7b41eed945806f7b73633babe198d6263`. Neither is promoted.
+
+The unchanged simultaneous spectral proposal was transferred to the old16
+pinned G1 current/held cases with its original G1 eight-pass cap. This is a
+CPU falsification, not a new reference or current-population qualification.
+At RTX7410 refresh, ordered->concurrent natural residual is0.000199078->
+0.020362671, biased normal violation0->0.213406934, complementarity
+0.001155671->0.050467060, and MDP0.000097995->0.024654545. Cone and momentum
+remain sound; they do not excuse the much worse contact equation errors.
+Artifacts `/tmp/fpgs-g1-concurrent-spectral-screen-FJbJr7zv/{CARD.md,check.py}`.
+The first invocation lacked the concurrent helper on the G1 branch; a pinned
+import of the existing helper corrected setup without changing its algorithm.
+
+One cause diagnosis independently differentiates the same map, including
+normal-dependent disk radius, and reproduces all16 eight-pass trajectories.
+192 directional checks agree within4.006e-9 relative error. An observable
+quotient excludes only invariant response-null impulse directions. Along
+RTX7410's existing cold trajectory, half-relaxed observable eigenvalues reach
+-1.70 to-1.76 while active normal counts alternate6/2/5/2; near its ordered-eight
+endpoint the map is locally stable. This is off-target coupled active-set
+overshoot, not a proved unstable final fixed point. GB8192 instead settles
+onto a stable local map near0.735 but decays too slowly within eight passes.
+No new damping/iteration grid or native implementation is funded. Full note:
+`/tmp/fpgs-g1-concurrent-derivative-BvS9IN1y/CARD.md`; final diagnostic log SHA
+`7f567f6e868fde96f269316e948a9ff6a32047286f51b20384f06629bf1c1f68`.
+
+Two additional source budgets close without runtime work. Direct G1 ancestor
+reconstruction replaces109 pose combines with226 and109 motion combines with
+at least206, while removing only about five joins; bias/moments/projection
+and publication remain. It cannot be credited with the whole1.84ms finish.
+Card `/tmp/fpgs-g1-direct-ancestor-card-mG5KmX/CARD.md`.
+G1 ancestor-prefix endpoint maps are a transfer of implemented Allegro
+algebra, not new algebra. On the old16 cases, shared-root union reduces map
+setup8424->7416 products; adding all emitted-direction endpoint contractions
+gives31464 versus original31824, before lookup/incident/copy costs. There is
+no new1ms case. The old Allegro report's native/lifecycle pass does not alone
+establish its performance acceptance.
+
+Temporal positive-distance warm GJK already existed in the old coherent
+convex query. The corrected full-shell successor lost17.327->130.477ms RTX.
+Penetrating MPR portal seeding is distinct, but its complete Kuka GJK+MPR
+owner ceiling0.9607ms is below10% whole before any cache/revalidation work;
+no AABB/broadphase/manifold/publication retirement follows. No implementation.
+
+An independent final-state census uses the existing coherent full16K inputs,
+not new captures: nonzero impulses passing the fixed physical gates occupy
+7679 worlds/136048 rows RTX and7768/137771 GB (41.23%/41.65% of all rows).
+Zero-impulse worlds are excluded from this possible early-stop opportunity.
+This is own-rounded-Z FP64 diagnostic arithmetic, not native stopping or
+independent J/H qualification; final convergence alone does not say when
+those worlds could stop. Artifact
+`/tmp/fpgs-g1-physical-stop-screen-6evKUP1W/{CARD.md,check.py}`. A same-trajectory
+prefix/work screen is in progress, with check cost and original stationary
+exits charged; there is no timing or native claim.
+
+The next funded CPU hypothesis combines analytic coupled Jacobian actions
+with feasible-chord globalization. It retains the existing small physical
+active Gram, but removes Jacobian/LU construction, held-L reload and repeated
+line-trial physical operators. A single chord response supplies affine
+residuals for all eight line trials, each still paying its nonlinear full-map
+merit check. Fixed max8 GMRES/CGS2, original24 committed outer allowance,
+literal remaining-budget fallback and fresh final physical check are charged.
+Card `/tmp/fpgs-anymal-krylov-chord-card-nJhiwwNd/CARD.md`, SHA
+`79da7879550483df1553fd5ea8d1dc35a36aaa0db28c7a7207de2813604e1097`.
+Root and independent review find no algebraic blocker for one frozen CPU
+falsification. Actual inner/outer counts, physical tails and complete costs
+must justify native work; no speedup or GPU authority follows from the card.
+
+## Population-stop closure and coupled-prototype readiness, 22:34 UTC
+
+The full16K prefix replay closes the G1 physical-stop route without native
+work. It uses current spectral8 on the old coherent metric/terrain inputs,
+not today's shell/CSR population. Zero-final-impulse worlds are excluded.
+Compared with original exact-stationary/max8 exits, nonzero-world update
+row dots fall1,643,273->1,396,789 RTX and1,648,436->1,398,740 GB:15.00%/15.15%.
+Tangent proposals fall only7.20%/7.32%; lazy setup is effectively unchanged.
+Even legal first-failing-row checks, omitting terminal/unchanged passes and
+zero-disk tangent work, add644,378/644,968 dots. Complete net dots therefore
+grow24.21%/23.98%, before projection, normalization, metadata and control.
+No check-cadence grid or native implementation is funded.
+
+Independent existing-helper checks on34 fixed worlds/card pass unchanged
+tolerances; maximum impulse difference3.45e-7. The replay uses FP32 warp-tree
+dots, not a claim of native FMA/bit identity or independent J/H qualification.
+Earlier passing states need not remain passing after further allowed sweeps.
+Full first-pass and stationary accounting is retained in
+`/tmp/fpgs-g1-spectral-stop-population-6jOtK9kO/RESULTS.md`, SHA
+`a37abc39024857988180fccc6e8007936e1b1cd14547509a06b91d350c6cff79`.
+Replay SHA
+`c347d9f252e97b785bc2a8e93eb9874ccdba226e327a1ebe7f232c6217a5f8bc`.
+Root read the complete report. This is a work-count rejection, not a measured
+GPU regression or a new gain.
+
+The coupled Krylov/chord prototype passes10 CPU tests, including literal
+original-reference translation, analytic moving-radius derivative, nonsymmetric
+right-block solve, inactive RHS, feasible-chord counterexamples, held/current
+publication, singular continuation, late23-correction budget and false-carried
+stop. Root read the complete helper/tests/card; independent final review finds
+no algebra or allowance blocker for the frozen first-eight screen.
+Helper SHA
+`88a2cc806b618deebc9c39a76f7fd2d987cdc0f9a3c2e70e4b906af8663efd5e`;
+tests SHA
+`301764615f82e07474f28e019690adb95c55fb699b7eb34d2efbe845da4b2d68`.
+Review corrected omitted pre-CGS/control norm costs before cohort evaluation:
+the actual q4 Krylov plus orthogonal reductions total28, not the card's24.
+No numerical policy changed. The first-eight saved-workload screen is next;
+no native authority or performance claim is established by these tests.
+
+The frozen first-eight screen then passes all eight hard/pointwise checks;
+all eight improve held-H reference distance and natural residual and stop
+physically in3--6 corrections (34 total), with zero fallback. GMRES takes51
+steps, q-squared95:22 directions useq1, sevenq2, fiveq3. All34 line trials
+accept alpha1. Complete counted products148,052 equal17.13565 original action
+pairs, versus338,904 original products including EX1. This misses the
+optimistic10--12-pair planning gate; physical success is not a speed result.
+Chord responses4.325, full Gram3.244, derivative1.693, Krylov Gram1.107 and
+fresh checks1.000 action equivalents are substantial; local/preparation/merit
+services make up the rest. No counterfactual triangular-Gram saving is counted.
+
+Root authorizes one unchanged existing all2048 CPU run to resolve fallback
+and cost tails, particularly historical world142: q1.5 and few outer
+corrections support the central coupling hypothesis, while eight samples
+cannot establish or reject the complete native case. This is an explicit
+broader falsification despite missing the planning gate, not a gate silently
+relaxed for promotion. No native work is authorized yet.
+First-eight summary SHA
+`ad73e3515fc77df41953eabd7cd9616c498412ba653d564c0a4d7ca56b2fd97b` at
+`/tmp/fpgs-krylov-chord-cpu-622baUWd/first8/summary.json`.
+The same card's pre-cohort clarifications make full-F forcing, exact inherited
+norm Armijo and false-fresh-stop allowance semantics explicit; frozen SHA
+`783517c6b3153af5564447c26a8cb0179ea2e1df4ec0421ec2a0d326e70f914a`.
+Helper and numerical policy remain as reviewed above; actual counters retain
+the correction from24 to28 reductions atq4 rather than the old card subtotal.
