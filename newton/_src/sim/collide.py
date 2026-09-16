@@ -2157,6 +2157,20 @@ class CollisionPipeline:
 
             bind_model(self.narrow_phase, model)
 
+        if (
+            not using_expert_components
+            and self.broad_phase_mode in ("explicit", "nxn")
+            and getattr(self.narrow_phase, "_heightfield_pair_csr_requested", False)
+        ):
+            from ..geometry.heightfield_pair_csr import bind as bind_pair_csr  # noqa: PLC0415
+
+            bind_pair_csr(
+                self.narrow_phase,
+                pairs_np if self.broad_phase_mode == "explicit" else None,
+                shape_types,
+                unique_generated=self.broad_phase_mode == "nxn",
+            )
+
         # NarrowPhase is authoritative for the producer stage: it disables
         # mesh/heightfield reduction when no such collision path exists, and
         # expert construction may provide a preconfigured instance.  Publish

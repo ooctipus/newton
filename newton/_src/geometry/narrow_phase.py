@@ -2489,6 +2489,25 @@ class NarrowPhase:
             and hydroelastic_sdf is None
             and adaptive_writer_supported
         )
+        pair_csr = os.environ.get("NEWTON_HEIGHTFIELD_PAIR_CSR", "0")
+        if pair_csr not in ("0", "1"):
+            raise ValueError("NEWTON_HEIGHTFIELD_PAIR_CSR must be 0 or 1")
+        pair_csr_writer_supported = False
+        if pair_csr == "1" and contact_writer_warp_func is not None:
+            from ..sim.collide import write_contact as pair_csr_stock_writer  # noqa: PLC0415
+
+            pair_csr_writer_supported = contact_writer_warp_func is pair_csr_stock_writer
+        self._heightfield_pair_csr_requested = (
+            pair_csr == "1"
+            and self._heightfield_geometric_cull
+            and not has_meshes
+            and not speculative
+            and not deterministic
+            and hydroelastic_sdf is None
+            and pair_csr_writer_supported
+        )
+        self._heightfield_pair_csr = False
+        self._pair_csr = None
         self._finite_bounds = None
         self._finite_source = None
         self.mesh_sdf_texture_only = mesh_sdf_texture_only
@@ -3212,14 +3231,15 @@ class NarrowPhase:
                         raise RuntimeError("Geometric cull requires CollisionPipeline finite model binding")
                     midphase_kernel = heightfield_geometric_overlaps_kernel
                     midphase_inputs.extend([shape_types, shape_source, self._finite_bounds, self._finite_source])
+            midphase_outputs = [self.triangle_pairs, self.triangle_pairs_count]
+            if self._heightfield_pair_csr:
+                midphase_kernel = self._pair_csr.midphase
+                midphase_outputs.append(self._pair_csr.triangle_pair)
             wp.launch(
                 kernel=midphase_kernel,
                 dim=[midphase_workers, second_dim],
                 inputs=midphase_inputs,
-                outputs=[
-                    self.triangle_pairs,
-                    self.triangle_pairs_count,
-                ],
+                outputs=midphase_outputs,
                 device=device,
                 block_dim=self.tile_size_mesh_convex,
                 record_tape=False,
@@ -3280,14 +3300,14 @@ class NarrowPhase:
                     heightfield_elevations,
                     self.triangle_pairs,
                     self.triangle_pairs_count,
-                    reducer_data,
+                    self._pair_csr.data if self._heightfield_pair_csr else reducer_data,
                     self.total_num_threads,
                 ]
                 if self._heightfield_finite_query:
                     if self._finite_bounds is None:
                         raise RuntimeError("Finite query requires CollisionPipeline model binding")
                     wp.launch(
-                        kernel=self._finite_reducer,
+                        kernel=self._pair_csr.finite if self._heightfield_pair_csr else self._finite_reducer,
                         dim=self.total_num_threads,
                         inputs=[*triangle_inputs, self._finite_bounds, self._finite_source],
                         device=device,
@@ -3295,7 +3315,9 @@ class NarrowPhase:
                         record_tape=False,
                     )
                 wp.launch(
-                    kernel=self._finite_reducer_fallback
+                    kernel=self._pair_csr.generic
+                    if self._heightfield_pair_csr
+                    else self._finite_reducer_fallback
                     if self._heightfield_finite_query
                     else mesh_triangle_contacts_to_reducer_kernel,
                     dim=self.total_num_threads,
@@ -3345,7 +3367,33 @@ class NarrowPhase:
             # Register mesh-plane/mesh-triangle contacts in hashtable BEFORE mesh-mesh.
             # Mesh-mesh does inline hashtable registration in its kernel.
             if self.reduce_contacts:
-                if self.speculative:
+                if self._heightfield_pair_csr:
+                    from .heightfield_pair_csr import reduce_fallback_contacts  # noqa: PLC0415
+
+                    self._pair_csr.build(
+                        self.shape_pairs_mesh,
+                        self.shape_pairs_mesh_count,
+                        shape_types,
+                        shape_data,
+                        shape_gap,
+                        self.total_num_threads,
+                    )
+                    wp.launch(
+                        kernel=reduce_fallback_contacts,
+                        dim=self.total_num_threads,
+                        inputs=[
+                            self._pair_csr.data,
+                            shape_transform,
+                            shape_collision_aabb_lower,
+                            shape_collision_aabb_upper,
+                            shape_voxel_resolution,
+                            self.total_num_threads,
+                        ],
+                        device=device,
+                        block_dim=self.block_dim,
+                        record_tape=False,
+                    )
+                elif self.speculative:
                     wp.launch(
                         kernel=reduce_buffered_contacts_speculative_kernel,
                         dim=self.total_num_threads,
@@ -3523,7 +3571,7 @@ class NarrowPhase:
                     int(self.block_dim > 1),
                     int(self.global_contact_reducer.deterministic),
                 ]
-                if self._heightfield_adaptive_manifold:
+                if self._heightfield_adaptive_manifold and not self._heightfield_pair_csr:
                     export_inputs.extend(
                         [
                             self.shape_pairs_mesh,
@@ -3534,8 +3582,28 @@ class NarrowPhase:
                             self.shape_pairs_mesh_mesh_count,
                         ]
                     )
+                if self._heightfield_pair_csr:
+                    wp.launch_tiled(
+                        kernel=self._pair_csr.export_kernel,
+                        dim=export_num_blocks,
+                        inputs=[
+                            self._pair_csr.data,
+                            self.shape_pairs_mesh_count,
+                            shape_types,
+                            shape_data,
+                            shape_gap,
+                            writer_data,
+                            export_num_blocks,
+                            int(self.block_dim > 1),
+                        ],
+                        device=device,
+                        block_dim=EXPORT_REDUCED_CONTACTS_BLOCK_DIM,
+                        record_tape=False,
+                    )
                 wp.launch_tiled(
-                    kernel=self.export_reduced_contacts_kernel,
+                    kernel=self._pair_csr.fallback_export
+                    if self._heightfield_pair_csr
+                    else self.export_reduced_contacts_kernel,
                     dim=export_num_blocks,
                     inputs=export_inputs,
                     device=device,
@@ -3624,9 +3692,10 @@ class NarrowPhase:
         later clean calls and graph replays. Clearing acknowledges prior warnings;
         it does not repair results, resize buffers, or recapture graphs.
 
-        This covers only :func:`verify_narrow_phase_buffers`: not soft contacts,
-        hydroelastic internal storage, or post-narrow-phase owners such as body
-        pair reduction/contact matching. ``reduction_hash_load`` is a load warning,
+        This covers :func:`verify_narrow_phase_buffers` and the optional pair-CSR
+        raw-witness/membership guard: not soft contacts, hydroelastic internal
+        storage, or post-narrow-phase owners such as body pair reduction/contact
+        matching. ``reduction_hash_load`` is a load warning,
         not proof that contacts were lost. Other flags identify exceeded buffers
         or failed reducer insertions. No flag is an estimate of required capacity.
         """
@@ -3651,8 +3720,12 @@ class NarrowPhase:
             "reduction_hash_insert",
         )
         result = {name: bool(mask & (1 << bit)) for bit, name in enumerate(names)}
+        if self._heightfield_pair_csr:
+            result["heightfield_pair_csr_raw_or_membership"] = int(self._pair_csr.status.numpy()[0]) != 0
         if clear:
             self._buffer_capacity_status.zero_()
+            if self._heightfield_pair_csr:
+                self._pair_csr.status.zero_()
         return result
 
     def check_buffer_capacity(self) -> None:

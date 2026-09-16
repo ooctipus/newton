@@ -27,10 +27,22 @@ if source.count(seam) != 1:
 source = source.replace(seam, replacement)
 collision_seam = '\n    return {**result, "check_pass": True}\n'
 collision_replacement = """
+    csr_flag = os.environ.get("NEWTON_HEIGHTFIELD_PAIR_CSR")
+    if csr_flag not in ("0", "1"):
+        raise RuntimeError("Require explicit pair-CSR flag on both arms")
+    csr_wanted = csr_flag == "1"
+    csr_actual = getattr(narrow, "_heightfield_pair_csr", False)
+    if type(csr_actual) is not bool or csr_actual != csr_wanted:
+        raise RuntimeError("Requested pair-CSR differs from the bound owner")
+    csr_owner = getattr(narrow, "_pair_csr", None)
+    if (csr_owner is not None) != csr_wanted:
+        raise RuntimeError("Pair-CSR owner existence disagrees with actual dispatch")
     flag = os.environ.get("NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD")
     if flag not in ("0", "1"):
         raise RuntimeError("Require explicit adaptive manifold flag on both arms")
     wanted = flag == "1"
+    if wanted and csr_wanted:
+        raise RuntimeError("The old-survivor and raw-pool experiments must not be combined")
     actual = getattr(narrow, "_heightfield_adaptive_manifold", False)
     from newton._src.sim.collide import write_contact
     if wanted:
@@ -41,17 +53,59 @@ collision_replacement = """
         expected = create_export_reduced_contacts_kernel(write_contact)
     # The original factory is not cached; its stable key is the exact dispatch
     # check for the off arm. The new cached factory also permits identity proof.
-    observed = narrow.export_reduced_contacts_kernel
+    observed = csr_owner.fallback_export if csr_wanted else narrow.export_reduced_contacts_kernel
     if type(actual) is not bool or actual != wanted or observed.key != expected.key:
         raise RuntimeError("Requested adaptive exporter differs from actual owner")
     if wanted and observed is not expected:
         raise RuntimeError("Adaptive exporter is not the exact cached factory")
     result["adaptive_manifold"] = {"requested": wanted, "observed": actual,
         "kernel_key": observed.key, "check_pass": True}
+    csr_result = {"requested": csr_wanted, "observed": csr_actual, "check_pass": True}
+    if csr_wanted:
+        import warp as wp
+        from newton._src.geometry.heightfield_pair_csr import create_export_kernel, get_query_kernels
+        expected_export = create_export_kernel(write_contact)
+        expected_queries = get_query_kernels()
+        actual_queries = (csr_owner.midphase, csr_owner.finite, csr_owner.generic)
+        if (csr_owner.export_kernel is not expected_export
+                or narrow.export_reduced_contacts_kernel is not expected_export
+                or any(a is not b for a, b in zip(actual_queries, expected_queries))):
+            raise RuntimeError("Pair-CSR does not own the exact production factories")
+        raw_capacity = narrow.global_contact_reducer.capacity
+        pair_capacity = narrow.max_candidate_pairs
+        triangle_capacity = narrow.max_triangle_pairs
+        sizes = {"triangle_pair": triangle_capacity, "raw_pair": raw_capacity + 1,
+                 "ids": raw_capacity, "counts": pair_capacity + 1,
+                 "offsets": pair_capacity + 1, "cursors": pair_capacity, "status": 1}
+        for name, size in sizes.items():
+            array = getattr(csr_owner, name)
+            if (array.shape != (size,) or array.dtype is not wp.int32
+                    or array.device != wp.get_device(narrow.device)
+                    or not array.is_contiguous or array is not getattr(csr_owner.data, name)):
+                raise RuntimeError("Unexpected pair-CSR array ownership/layout: " + name)
+        status = csr_owner.status.numpy().tolist()
+        if status != [0]:
+            raise RuntimeError("Pair-CSR has a sticky routing/capacity failure: " + str(status))
+        csr_result.update(kernel_key=expected_export.key,
+            query_keys=[kernel.key for kernel in actual_queries], fallback_export_key=observed.key,
+            sizes=sizes, logical_extra_bytes=4*sum(sizes.values()), status=status,
+            scope="Actual factories, integer-buffer ownership and sticky status; not manifold quality")
+    result["pair_csr"] = csr_result
     return {**result, "check_pass": True}
 """
 if source.count(collision_seam) != 1:
     raise RuntimeError("The original collision observation seam changed")
+status_seam = "    return module\n"
+status_replacement = """    csr_flag = os.environ.get("NEWTON_HEIGHTFIELD_PAIR_CSR")
+    if csr_flag not in ("0", "1"):
+        raise RuntimeError("Require explicit pair-CSR status contract on both arms")
+    if csr_flag == "1":
+        module.NARROW_FLAGS = module.NARROW_FLAGS | {"heightfield_pair_csr_raw_or_membership"}
+    return module
+"""
+if source.count(status_seam) != 1:
+    raise RuntimeError("The original capacity-contract loading seam changed")
+source = source.replace(status_seam, status_replacement)
 # __file__ deliberately remains this wrapper: its digest pins the complete
 # source transformation and the retained observer's required SHA256.
 exec(compile(source.replace(collision_seam, collision_replacement), str(RETAINED), "exec"), globals())

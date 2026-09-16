@@ -270,6 +270,10 @@ def exercise_export(test, device):
 
 
 class TestAdaptiveManifold(unittest.TestCase):
+    loaded_feature_env = "NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD"
+    loaded_feature_attribute = "_heightfield_adaptive_manifold"
+    loaded_report_label = "ADAPTIVE_MANIFOLD_QUALIFICATION"
+
     def test_full_tail_and_cone_oracles(self):
         # Five selected low impulses can alias even though the complete interval
         # balances weight exactly. A truly incorrect mean must still fail 2%.
@@ -418,7 +422,9 @@ class TestAdaptiveManifold(unittest.TestCase):
                         patch.object(q.newton, "Heightfield", heightfield),
                     ):
                         scene = original_build(*args, **kwargs)
-                    self.assertEqual(scene.pipeline.narrow_phase._heightfield_adaptive_manifold, selected_enabled)
+                    self.assertEqual(
+                        getattr(scene.pipeline.narrow_phase, self.loaded_feature_attribute), selected_enabled
+                    )
                     self.assertEqual(scene.solver.contact_friction_anchor_limit, selected_limit)
                     if selected_case.name == "yaw_support":
                         for state in scene.states:
@@ -478,7 +484,7 @@ class TestAdaptiveManifold(unittest.TestCase):
 
                 try:
                     with (
-                        patch.dict(os.environ, {"NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD": str(int(enabled))}),
+                        patch.dict(os.environ, {self.loaded_feature_env: str(int(enabled))}),
                         patch.object(q, "build_scene", build),
                         patch.object(q, "public_force", force),
                     ):
@@ -531,7 +537,7 @@ class TestAdaptiveManifold(unittest.TestCase):
             if len(paired) == 2:
                 self.assertEqual(paired[0]["initial_state"], paired[1]["initial_state"])
                 self.assertEqual(paired[0]["initial_velocity"], paired[1]["initial_velocity"])
-        print("ADAPTIVE_MANIFOLD_QUALIFICATION " + json.dumps(report, allow_nan=False), flush=True)
+        print(self.loaded_report_label + " " + json.dumps(report, allow_nan=False), flush=True)
         self.assertEqual(report["failures"], [], "All original physical gates retained; see complete report")
 
 
