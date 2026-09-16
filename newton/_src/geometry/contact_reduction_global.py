@@ -1256,6 +1256,8 @@ def reduce_contact_in_hashtable(
     shape_collision_aabb_lower: wp.array[wp.vec3],
     shape_collision_aabb_upper: wp.array[wp.vec3],
     shape_voxel_resolution: wp.array[wp.vec3i],
+    prioritize_spatial: bool = False,
+    spatial_outer_depth: float = 0.0,
 ):
     """Register a buffered contact in the reduction hashtable.
 
@@ -1278,6 +1280,8 @@ def reduce_contact_in_hashtable(
         shape_collision_aabb_lower: Per-shape local AABB lower bounds
         shape_collision_aabb_upper: Per-shape local AABB upper bounds
         shape_voxel_resolution: Per-shape voxel grid resolution
+        prioritize_spatial: Prefer legacy inner contacts in finite-shell spatial slots.
+        spatial_outer_depth: Maximum geometric distance eligible for those slots.
     """
     # Read contact data from buffer (normal is octahedral-encoded)
     pd = reducer_data.position_depth[contact_id]
@@ -1309,11 +1313,21 @@ def reduce_contact_in_hashtable(
     entry_idx = hashtable_find_or_insert(key, reducer_data.ht_keys, reducer_data.ht_active_slots)
     if entry_idx >= 0:
         use_beta = depth < beta * wp.length(aabb_upper - aabb_lower)
+        use_spatial = use_beta
+        if prioritize_spatial:
+            # Eligibility is separate from priority: a large terrain AABB can
+            # put an out-of-gap witness in the legacy inner tier. It must not
+            # suppress an admissible witness and then vanish at export.
+            use_spatial = depth <= spatial_outer_depth
         for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
-            if use_beta:
+            if use_spatial:
                 dir_2d = get_spatial_direction_2d(dir_i)
                 score = wp.dot(pos_2d, dir_2d)
                 value = make_contact_value(score, fingerprint, contact_id, reducer_data.deterministic)
+                if prioritize_spatial:
+                    value = make_spatial_contact_value(
+                        score, use_beta, fingerprint, contact_id, reducer_data.deterministic
+                    )
                 slot_id = dir_i
                 reduction_update_slot(entry_idx, slot_id, value, reducer_data.ht_values, ht_capacity)
 
@@ -1964,6 +1978,52 @@ def reduce_buffered_contacts_kernel(
             shape_collision_aabb_lower,
             shape_collision_aabb_upper,
             shape_voxel_resolution,
+        )
+
+
+@wp.kernel(enable_backward=False)
+def reduce_heightfield_shell_contacts_kernel(
+    reducer_data: GlobalContactReducerData,
+    shape_types: wp.array[int],
+    shape_data: wp.array[wp.vec4],
+    shape_gap: wp.array[float],
+    shape_source: wp.array[wp.uint64],
+    bounds: wp.array2d[wp.vec3],
+    bound_source: wp.array[wp.uint64],
+    shape_transform: wp.array[wp.transform],
+    shape_collision_aabb_lower: wp.array[wp.vec3],
+    shape_collision_aabb_upper: wp.array[wp.vec3],
+    shape_voxel_resolution: wp.array[wp.vec3i],
+    total_num_threads: int,
+):
+    """Retain inner-preferred heightfield support within the original finite shell."""
+    count = wp.min(reducer_data.contact_count[0], reducer_data.capacity)
+    for i in range(wp.tid(), count, total_num_threads):
+        contact_id = i + 1
+        pair = reducer_data.shape_pairs[contact_id]
+        a, b = pair[0], pair[1]
+        outer = shape_gap[a] + shape_gap[b] + shape_data[a][3] + shape_data[b][3]
+        data_b = shape_data[b]
+        supported = (
+            shape_types[a] == GeoType.HFIELD
+            and (shape_types[b] == GeoType.BOX or shape_types[b] == GeoType.CONVEX_MESH)
+            and bounds[b, 1][0] > 0.0
+            and bound_source[b] == shape_source[b]
+            and data_b[0] > 0.0
+            and data_b[1] > 0.0
+            and data_b[2] > 0.0
+            and shape_data[a][3] + data_b[3] >= 1.0e-4
+        )
+        reduce_contact_in_hashtable(
+            contact_id,
+            reducer_data,
+            wp.static(BETA_THRESHOLD),
+            shape_transform,
+            shape_collision_aabb_lower,
+            shape_collision_aabb_upper,
+            shape_voxel_resolution,
+            supported,
+            outer,
         )
 
 

@@ -54,6 +54,7 @@ from ..geometry.contact_reduction_global import (
     mesh_triangle_contacts_to_reducer_kernel,
     reduce_buffered_contacts_kernel,
     reduce_buffered_contacts_speculative_kernel,
+    reduce_heightfield_shell_contacts_kernel,
     write_contact_to_reducer,
 )
 from ..geometry.contact_sort import ContactSorter
@@ -2449,6 +2450,10 @@ class NarrowPhase:
         if finite_query not in ("0", "1"):
             raise ValueError("NEWTON_HEIGHTFIELD_FINITE_QUERY must be 0 or 1")
         self._heightfield_finite_query = finite_query == "1" and has_heightfields and not has_meshes and not speculative
+        shell_support = os.environ.get("NEWTON_HEIGHTFIELD_SHELL_SUPPORT", "0")
+        if shell_support not in ("0", "1"):
+            raise ValueError("NEWTON_HEIGHTFIELD_SHELL_SUPPORT must be 0 or 1")
+        self._heightfield_shell_support = shell_support == "1" and self._heightfield_finite_query and reduce_contacts
         geometric_cull = os.environ.get("NEWTON_HEIGHTFIELD_GEOMETRIC_CULL", "0")
         if geometric_cull not in ("0", "1"):
             raise ValueError("NEWTON_HEIGHTFIELD_GEOMETRIC_CULL must be 0 or 1")
@@ -2597,7 +2602,11 @@ class NarrowPhase:
             from .heightfield_finite import create_query_kernel, marked_fallback  # noqa: PLC0415
 
             self._finite_direct = create_query_kernel(writer_func)
-            self._finite_reducer = create_query_kernel(write_contact_to_reducer)
+            self._finite_reducer = (
+                create_query_kernel(write_contact_to_reducer, True)
+                if self._heightfield_shell_support
+                else create_query_kernel(write_contact_to_reducer)
+            )
             self._finite_direct_fallback = marked_fallback(self.mesh_triangle_contacts_kernel)
             self._finite_reducer_fallback = marked_fallback(mesh_triangle_contacts_to_reducer_kernel)
 
@@ -3333,6 +3342,28 @@ class NarrowPhase:
                             shape_voxel_resolution,
                             collision_update_dt,
                             max_speculative_extension,
+                            self.total_num_threads,
+                        ],
+                        device=device,
+                        block_dim=self.block_dim,
+                        record_tape=False,
+                    )
+                elif self._heightfield_shell_support:
+                    wp.launch(
+                        kernel=reduce_heightfield_shell_contacts_kernel,
+                        dim=self.total_num_threads,
+                        inputs=[
+                            reducer_data,
+                            shape_types,
+                            shape_data,
+                            shape_gap,
+                            shape_source,
+                            self._finite_bounds,
+                            self._finite_source,
+                            shape_transform,
+                            shape_collision_aabb_lower,
+                            shape_collision_aabb_upper,
+                            shape_voxel_resolution,
                             self.total_num_threads,
                         ],
                         device=device,

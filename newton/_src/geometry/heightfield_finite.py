@@ -247,10 +247,9 @@ def bind_model(narrow, model):
 
 
 @functools.cache
-def create_query_kernel(writer_func):
+def create_query_kernel(writer_func, shell_support: bool = False):
     """Create the analytical writer for the same global triangle stream."""
 
-    @wp.kernel(enable_backward=False, module="unique")
     def heightfield_finite_contacts(
         shape_types: wp.array[int],
         shape_data: wp.array[wp.vec4],
@@ -294,15 +293,28 @@ def create_query_kernel(writer_func):
             center_world = wp.transform_get_translation(xb) + wp.quat_rotate(qb, wp.cw_mul(bounds[b, 0], scale))
             center = wp.quat_rotate_inv(qa, center_world - origin)
             gap = shape_gap[a] + shape_gap[b]
-            value = query_contacts(
-                geom.scale,
-                geom.auxiliary,
-                center,
-                wp.quat_inverse(qa) * qb,
-                wp.cw_mul(bounds[b, 1], scale),
-                gap + margin_a + margin_b,
-                margin_a + margin_b,
-            )
+            value = QueryResult()
+            if wp.static(shell_support):
+                # Only the paired buffered reducer supports these spatial
+                # extrema; the direct writer retains its original admission.
+                value = query(
+                    geom.scale,
+                    geom.auxiliary,
+                    center,
+                    wp.quat_inverse(qa) * qb,
+                    wp.cw_mul(bounds[b, 1], scale),
+                    gap + margin_a + margin_b,
+                )
+            else:
+                value = query_contacts(
+                    geom.scale,
+                    geom.auxiliary,
+                    center,
+                    wp.quat_inverse(qa) * qb,
+                    wp.cw_mul(bounds[b, 1], scale),
+                    gap + margin_a + margin_b,
+                    margin_a + margin_b,
+                )
             count = int(value[0])
             if count < 0:
                 continue
@@ -338,7 +350,11 @@ def create_query_kernel(writer_func):
                 wp.static(writer_func)(contact, writer_data, -1)
             triangle_pairs[i] = wp.vec3i(a, b, ~tri_idx)
 
-    return heightfield_finite_contacts
+    if shell_support:
+        heightfield_finite_contacts.__name__ = heightfield_finite_contacts.__qualname__ = (
+            "heightfield_finite_shell_contacts"
+        )
+    return wp.kernel(heightfield_finite_contacts, enable_backward=False, module="unique")
 
 
 @functools.cache

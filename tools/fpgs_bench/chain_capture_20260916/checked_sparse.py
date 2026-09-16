@@ -10,6 +10,31 @@ from pathlib import Path
 import numpy as np
 
 
+def shell_snapshot(narrow):
+    """Require the paired analytical query and buffered shell-support owner."""
+    flag = os.environ.get("NEWTON_HEIGHTFIELD_SHELL_SUPPORT", "0")
+    if flag not in ("0", "1"):
+        raise RuntimeError("Require Boolean shell-support selection")
+    requested = flag == "1"
+    observed = getattr(narrow, "_heightfield_shell_support", False)
+    if type(observed) is not bool or observed != requested:
+        raise RuntimeError("Requested shell support differs from the actual collision owner")
+    result = {"requested": requested, "observed": observed, "check_pass": False}
+    if requested:
+        from newton._src.geometry import contact_reduction_global, heightfield_finite  # noqa: PLC0415
+
+        kernel = heightfield_finite.create_query_kernel(contact_reduction_global.write_contact_to_reducer, True)
+        if narrow._finite_reducer is not kernel or kernel.key != "heightfield_finite_shell_contacts":
+            raise RuntimeError("Shell support did not select its exact paired analytical query")
+        if narrow._finite_direct.key != "create_query_kernel__locals__heightfield_finite_contacts":
+            raise RuntimeError("Shell support unexpectedly changed the direct query owner")
+        reducer = contact_reduction_global.reduce_heightfield_shell_contacts_kernel
+        if reducer.key != "reduce_heightfield_shell_contacts_kernel":
+            raise RuntimeError("Shell support buffered reducer is unavailable")
+        result.update(query_key=kernel.key, reducer_key=reducer.key)
+    return {**result, "check_pass": True}
+
+
 def parallel_snapshot(solver):
     """Require actual device use, not merely an installed experimental owner."""
     flag = os.environ.get("FEATHER_PGS_PARALLEL_WORLD", "0")
@@ -124,6 +149,16 @@ parallel_replacement = (
 if source.count(parallel_seam) != 1:
     raise RuntimeError("The original solve-owner observation seam changed")
 source = source.replace(parallel_seam, parallel_replacement)
+collision_keys = (
+    '("create_query_kernel__locals__heightfield_finite_contacts", "heightfield_analytic_manifold_contacts")'
+)
+if source.count(collision_keys) != 1:
+    raise RuntimeError("The original collision-key observation seam changed")
+source = source.replace(collision_keys, collision_keys[:-1] + ', "heightfield_finite_shell_contacts")')
+collision_seam = '    result = {"requested": requested, "observed": observed, "finite_reducer_key": key}\n'
+if source.count(collision_seam) != 1:
+    raise RuntimeError("The original collision-owner observation seam changed")
+source = source.replace(collision_seam, collision_seam + '    result["shell_support"] = shell_snapshot(narrow)\n')
 # __file__ deliberately remains this wrapper: its digest pins the complete
 # source transformation and the retained observer's required SHA256.
 exec(compile(source, str(RETAINED), "exec"), globals())
