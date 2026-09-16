@@ -2507,6 +2507,11 @@ class NarrowPhase:
             and pair_csr_writer_supported
         )
         self._heightfield_pair_csr = False
+        pair_csr_shell = os.environ.get("NEWTON_HEIGHTFIELD_PAIR_CSR_SHELL", "0")
+        if pair_csr_shell not in ("0", "1"):
+            raise ValueError("NEWTON_HEIGHTFIELD_PAIR_CSR_SHELL must be 0 or 1")
+        self._heightfield_pair_csr_shell_requested = pair_csr_shell == "1"
+        self._heightfield_pair_csr_shell = False
         self._pair_csr = None
         self._finite_bounds = None
         self._finite_source = None

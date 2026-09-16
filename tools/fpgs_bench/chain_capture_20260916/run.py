@@ -36,6 +36,7 @@ def main():
     module.FLAGS.add("FEATHER_PGS_SPARSE_SPECTRAL_TANGENTS")
     module.FLAGS.add("NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD")
     module.FLAGS.add("NEWTON_HEIGHTFIELD_PAIR_CSR")
+    module.FLAGS.add("NEWTON_HEIGHTFIELD_PAIR_CSR_SHELL")
     module.__file__ = str(Path(__file__).resolve())
     module.adapter.EXTRA.extend(
         Path(__file__).with_name(name).resolve() for name in ("run.py", "checked_sparse.py", "nsys_sparse_checked.sh")

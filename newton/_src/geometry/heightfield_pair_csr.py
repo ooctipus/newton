@@ -364,7 +364,11 @@ def _clone(original, name, replacements, extra, *, kernel=False):
     function = original.func
     source = textwrap.dedent(inspect.getsource(function))
     source = source[source.index("def ") :]
-    source = source.replace("def " + function.__name__ + "(", "def " + name + "(", 1)
+    # Factory keys can rename __name__ without changing the source definition.
+    source_name = source[4 : source.index("(")]
+    if not source_name.isidentifier():
+        raise RuntimeError(f"Pair-CSR definition seam changed: {name}")
+    source = source.replace("def " + source_name + "(", "def " + name + "(", 1)
     for before, after in replacements:
         if source.count(before) != 1:
             raise RuntimeError(f"Pair-CSR source seam changed: {name}: {before!r}")
@@ -381,7 +385,7 @@ def _clone(original, name, replacements, extra, *, kernel=False):
 
 
 @functools.cache
-def get_query_kernels():
+def get_query_kernels(shell_support: bool = False):
     """Tag the original packed triangle stream and both disjoint query routes."""
     from .heightfield_cells import _heightfield_cell_midphase  # noqa: PLC0415
     from .heightfield_finite import create_query_kernel, marked_fallback  # noqa: PLC0415
@@ -439,8 +443,8 @@ def get_query_kernels():
         kernel=True,
     )
     finite = _clone(
-        create_query_kernel(_write_pair),
-        "heightfield_pair_csr_finite_contacts",
+        create_query_kernel(_write_pair, shell_support),
+        "heightfield_pair_csr_shell_contacts" if shell_support else "heightfield_pair_csr_finite_contacts",
         [
             ("    writer_data: Any,", "    writer_data: PairCSRData,"),
             (
@@ -473,7 +477,7 @@ def get_query_kernels():
 class PairCSR:
     """Own membership and arithmetic intervals for the calibrated raw pool."""
 
-    def __init__(self, reducer, pair_capacity, triangle_capacity, device):
+    def __init__(self, reducer, pair_capacity, triangle_capacity, device, *, shell_support=False):
         self.data = data = PairCSRData()
         data.reducer = reducer.get_data_struct()
         data.triangle_pair = wp.empty(triangle_capacity, dtype=int, device=device)
@@ -487,7 +491,8 @@ class PairCSR:
         for name in ("triangle_pair", "raw_pair", "ids", "separation", "counts", "offsets", "cursors", "status"):
             setattr(self, name, getattr(data, name))
         self.device = device
-        self.midphase, self.finite, self.generic = get_query_kernels()
+        self.shell_support = shell_support
+        self.midphase, self.finite, self.generic = get_query_kernels(shell_support)
 
     def build(self, pairs, pair_count, types, shape_data, gaps, total_threads):
         """Count, scan and scatter once after both original query launches."""
@@ -523,9 +528,16 @@ def bind(narrow, pairs_np, shape_types, *, unique_generated=False):
         canonical = np.sort(pairs, axis=1)
         if np.any(canonical[:, 0] == canonical[:, 1]) or len(np.unique(canonical, axis=0)) != len(canonical):
             return
-    owner = PairCSR(narrow.global_contact_reducer, narrow.max_candidate_pairs, narrow.max_triangle_pairs, narrow.device)
+    owner = PairCSR(
+        narrow.global_contact_reducer,
+        narrow.max_candidate_pairs,
+        narrow.max_triangle_pairs,
+        narrow.device,
+        shell_support=narrow._heightfield_pair_csr_shell_requested,
+    )
     owner.export_kernel = create_export_kernel(narrow._convex_writer_func)
     owner.fallback_export = create_export_reduced_contacts_kernel(narrow._convex_writer_func)
     narrow._pair_csr = owner
     narrow._heightfield_pair_csr = True
+    narrow._heightfield_pair_csr_shell = owner.shell_support
     narrow.export_reduced_contacts_kernel = owner.export_kernel

@@ -37,6 +37,16 @@ collision_replacement = """
     csr_owner = getattr(narrow, "_pair_csr", None)
     if (csr_owner is not None) != csr_wanted:
         raise RuntimeError("Pair-CSR owner existence disagrees with actual dispatch")
+    shell_flag = os.environ.get("NEWTON_HEIGHTFIELD_PAIR_CSR_SHELL")
+    if shell_flag not in ("0", "1"):
+        raise RuntimeError("Require explicit pair-CSR shell flag on both arms")
+    shell_wanted = shell_flag == "1"
+    shell_actual = getattr(narrow, "_heightfield_pair_csr_shell", False)
+    if (type(shell_actual) is not bool or shell_actual != shell_wanted
+            or (shell_wanted and not csr_wanted)):
+        raise RuntimeError("Requested shell query differs from actual pair-CSR dispatch")
+    if csr_wanted and getattr(csr_owner, "shell_support", False) is not shell_wanted:
+        raise RuntimeError("Pair-CSR shell owner marker differs from actual dispatch")
     flag = os.environ.get("NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD")
     if flag not in ("0", "1"):
         raise RuntimeError("Require explicit adaptive manifold flag on both arms")
@@ -60,12 +70,16 @@ collision_replacement = """
         raise RuntimeError("Adaptive exporter is not the exact cached factory")
     result["adaptive_manifold"] = {"requested": wanted, "observed": actual,
         "kernel_key": observed.key, "check_pass": True}
-    csr_result = {"requested": csr_wanted, "observed": csr_actual, "check_pass": True}
+    csr_result = {"requested": csr_wanted, "observed": csr_actual,
+        "shell_requested": shell_wanted, "shell_observed": shell_actual, "check_pass": True}
     if csr_wanted:
         import warp as wp
         from newton._src.geometry.heightfield_pair_csr import create_export_kernel, get_query_kernels
         expected_export = create_export_kernel(write_contact)
-        expected_queries = get_query_kernels()
+        # The preserved measured CSR tree predates the explicit shell argument.
+        # Current trees must use the explicit Boolean factory identity.
+        expected_queries = (get_query_kernels(shell_wanted)
+            if hasattr(narrow, "_heightfield_pair_csr_shell") else get_query_kernels())
         actual_queries = (csr_owner.midphase, csr_owner.finite, csr_owner.generic)
         if (csr_owner.export_kernel is not expected_export
                 or narrow.export_reduced_contacts_kernel is not expected_export
