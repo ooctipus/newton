@@ -159,3 +159,40 @@ exact Franka mimic condensation leaves the full state family intact while
 requiring projected responses across every loaded/fallback path. Neither is
 counted as an optimization result. Historical pair-shape preparation is an
 existing opt-in feature (partial public-AABB validity contract), not new work.
+
+## One cause-directed correction: first positive whole screen
+
+Strict12-step attribution isolates the initial loss to finish:
+2.329925 ->2.644243 ms RTX,2.500325 ->3.086221 ms GB. Three-owner exclusive
+cost rises3.132194 ->3.423382 and3.302338 ->3.834197 ms. Predictor slightly
+improves; there is no added owner or mass-refresh cadence change. All four
+strict audits pass, preserved under `/tmp/fpgs-g1-chain-strict-nDEKxWay`.
+
+The single correction changes only the reverse reduction to fixed6/19-channel,
+round-major vectors. Per-channel addition order, chains, full-warp masks,
+state ownership and physical rules remain unchanged. It removes repeated
+metadata walks and exposes independent channel operations. Runtime helper SHA
+`1d45c38899df64991d666e7fe72993d9f8039d733320e3f323c71d9938d12073`.
+CPU4 controls and targeted precommit pass; all6 offline CUDA entries compile
+without spills. Finish registers91/92 and predictor56/54, shared unchanged.
+The predictor's increased register footprint is charged, not omitted.
+
+The original3 CUDA physical/lifecycle selectors pass on both GPUs, exit0,
+7.406/8.131 seconds including loading; no changed physical tolerance.
+Logs: `/tmp/fpgs-g1-chain-vector-native-20260916-32hIV2qh/gpu{0,1}.log`.
+
+First whole screen, one round, all children/guards pass:
+
+| Whole physics ms/env step | RTX | GB300 |
+| --- | ---: | ---: |
+| Accepted original |15.626156|20.496853|
+| Chain vector reduction |15.022117|19.833487|
+| Original/candidate |1.040210x|1.033447x|
+| Time removed |0.604039|0.663367|
+
+The actual environment wall baseline/candidate values are
+30.397366/28.255761 ms RTX and34.169252/33.665474 ms GB; not RL training.
+Evidence: `/tmp/fpgs-g1-chain-vector-whole-paired16k-20260916-01`.
+This is a discovery gain, not repeated qualification or the4x target.
+No further mapping, register or arithmetic micro-tuning is funded for this
+candidate. Check repeatability and move to a larger work-retirement boundary.

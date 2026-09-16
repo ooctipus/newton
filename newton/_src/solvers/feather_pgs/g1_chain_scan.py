@@ -229,6 +229,43 @@ def reduction_source(*, moments):
     """Add light subtrees before an inclusive heavy-chain suffix; never subtract."""
     address = "(k<6?1094+6*BODY+k:1358+13*BODY+k-6)" if moments else "(6*BODY+k)"
     count = "(refresh?19:6)" if moments else "6"
+    vector = r"""
+    {
+    float values[COMPONENTS];
+    for(int stage=plan.chain_levels-1;stage>=0;--stage) {
+        const bool active=body>=0&&level==stage;
+        const int width=plan.stage_width.data[stage];
+        #pragma unroll
+        for(int k=0;k<COMPONENTS;++k)values[k]=active?s[slot(body,k)]:0.0f;
+        if(active)for(int edge=first;edge<last;++edge) {
+            const int child=plan.light_children.data[edge];
+            #pragma unroll
+            for(int k=0;k<COMPONENTS;++k)values[k]+=s[slot(child,k)];
+        }
+        for(int offset=1;offset<width;offset*=2) {
+            const bool combine=active&&position+offset<length;
+            const int source=combine?((thread+offset)&31):(thread&31);
+            #pragma unroll
+            for(int k=0;k<COMPONENTS;++k) {
+                const float next=__shfl_sync(0xffffffffu,values[k],source,32);
+                if(combine)values[k]+=next;
+            }
+        }
+        if(active) {
+            #pragma unroll
+            for(int k=0;k<COMPONENTS;++k)s[slot(body,k)]=values[k];
+        }
+        __syncthreads();
+    }
+    }
+"""
+    # Fixed component counts expose independent channels to the compiler. A
+    # runtime component-major loop serialized every shuffle chain and repeated
+    # the light-child list/address walk for all 6 or 19 channels. The new loop
+    # order preserves each channel's exact light-child and suffix-add order.
+    cuda = vector.replace("COMPONENTS", "6")
+    if moments:
+        cuda = "if(refresh) " + vector.replace("COMPONENTS", "19") + " else " + cuda
     source = r"""
     {
     auto slot=[](int body,int k){return ADDRESS;};
@@ -236,25 +273,9 @@ def reduction_source(*, moments):
     const int thread=threadIdx.x,body=plan.chain_meta.data[5*thread];
     const int position=thread-plan.chain_meta.data[5*thread+1];
     const int length=plan.chain_meta.data[5*thread+2],level=plan.chain_meta.data[5*thread+3];
-    for(int stage=plan.chain_levels-1;stage>=0;--stage) {
-        const bool active=body>=0&&level==stage;
-        for(int k=0;k<COMPONENTS;++k) {
-            float value=0.0f;
-            if(active) {
-                value=s[slot(body,k)];
-                for(int edge=plan.light_offsets.data[body];edge<plan.light_offsets.data[body+1];++edge)
-                    value+=s[slot(plan.light_children.data[edge],k)];
-            }
-            for(int offset=1;offset<plan.stage_width.data[stage];offset*=2) {
-                const bool combine=active&&position+offset<length;
-                const int source=combine?((thread+offset)&31):(thread&31);
-                const float next=__shfl_sync(0xffffffffu,value,source,32);
-                if(combine)value+=next;
-            }
-            if(active)s[slot(body,k)]=value;
-        }
-        __syncthreads();
-    }
+    const int first=body>=0?plan.light_offsets.data[body]:0;
+    const int last=body>=0?plan.light_offsets.data[body+1]:0;
+VECTOR_REDUCTION
 #else
     for(int stage=plan.chain_levels-1;stage>=0;--stage) {
         for(int k=0;k<COMPONENTS;++k) {
@@ -284,7 +305,11 @@ def reduction_source(*, moments):
 #endif
     }
 """
-    return source.replace("ADDRESS", address.replace("BODY", "body")).replace("COMPONENTS", count)
+    return (
+        source.replace("VECTOR_REDUCTION", cuda)
+        .replace("ADDRESS", address.replace("BODY", "body"))
+        .replace("COMPONENTS", count)
+    )
 
 
 @functools.cache
