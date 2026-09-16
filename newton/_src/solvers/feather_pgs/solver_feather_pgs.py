@@ -2462,15 +2462,25 @@ class SolverFeatherPGS(SolverBase):
             self._g1_kinetic_state = self._sparse_factor.kinetic_state
 
         self._franka_kinetic_state = None
-        if os.environ.get("FEATHER_PGS_FRANKA_KINETIC_STATE") == "1":
+        self._world_lane_state = None
+        if (
+            os.environ.get("FEATHER_PGS_FRANKA_KINETIC_STATE") == "1"
+            or os.environ.get("FEATHER_PGS_WORLD_LANE_STATE") == "1"
+        ):
             from .franka_kinetic_factor import get_kernel as get_geometric_factor  # noqa: PLC0415
             from .franka_kinetic_state import FrankaKineticState, supported  # noqa: PLC0415
 
             if supported(self):
-                self._franka_kinetic_state = FrankaKineticState(self)
-                self._franka_kinetic_factor9 = get_geometric_factor(
-                    str(model.device.arch), warps_per_block=_CRBA_CHOLESKY_WARPS_PER_BLOCK
-                )
+                if os.environ.get("FEATHER_PGS_WORLD_LANE_STATE") == "1":
+                    from .world_lane_state import WorldLaneState  # noqa: PLC0415
+
+                    self._world_lane_state = WorldLaneState(self)
+                    self._franka_kinetic_state = self._world_lane_state
+                else:
+                    self._franka_kinetic_state = FrankaKineticState(self)
+                    self._franka_kinetic_factor9 = get_geometric_factor(
+                        str(model.device.arch), warps_per_block=_CRBA_CHOLESKY_WARPS_PER_BLOCK
+                    )
 
     def _update_kinematic_state(self) -> None:
         """Refresh cached kinematic flags and effective joint armature."""
@@ -8589,7 +8599,9 @@ class SolverFeatherPGS(SolverBase):
             else:
                 inverse_dynamics_ready = None
 
-            self._stage1_crba(state_aug, global_inertia_ready, drive_rows_ready)
+            self._stage1_crba(
+                state_aug, global_inertia_ready, drive_rows_ready, state_in=state_in, control=control, dt=dt
+            )
         # ══════════════════════════════════════════════════════════════
         # STAGE 2: Cholesky
         # ══════════════════════════════════════════════════════════════
@@ -8615,7 +8627,8 @@ class SolverFeatherPGS(SolverBase):
                 self._g1_kinetic_state.predict(state_in, state_aug, control, stage3_qd, dt)
                 self._clamp_rigid_velocity_limits(self.v_hat)
             elif self._franka_kinetic_state is not None:
-                self._franka_kinetic_state.predict(state_in, state_aug, control, stage3_qd, dt)
+                if self._world_lane_state is None:
+                    self._franka_kinetic_state.predict(state_in, state_aug, control, stage3_qd, dt)
                 self._clamp_rigid_velocity_limits(self.v_hat)
             elif self._joint_world_active:
                 self._joint_world.predict_and_classify(state_in, state_aug, state_out, contacts, stage3_qd, dt)
@@ -10462,6 +10475,10 @@ class SolverFeatherPGS(SolverBase):
         state_aug: State,
         global_inertia_ready: wp.Event | None,
         drive_rows_ready: wp.Event | None,
+        *,
+        state_in: State | None = None,
+        control: Control | None = None,
+        dt: float | None = None,
     ):
         model = self.model
         global_flag = 1 if ((self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update) else 0
@@ -10500,6 +10517,13 @@ class SolverFeatherPGS(SolverBase):
             if drive_rows_ready is None:
                 raise RuntimeError("Franka kinetic factor requires current augmented-drive coefficients")
             wp.get_stream(model.device).wait_event(drive_rows_ready)
+            if self._world_lane_state is not None:
+                if state_in is None or control is None or dt is None:
+                    raise RuntimeError("World-lane factor/predict requires current state, control and timestep")
+                self._world_lane_state.predict(state_in, state_aug, control, state_in.joint_qd, dt)
+                self._mass_update_requested.zero_()
+                self._force_mass_update = False
+                return
             for size in self.size_groups:
                 kernel = self._franka_kinetic_factor9 if size == 9 else self._crba_cholesky_warp_kernels_by_size[size]
                 inputs = [
