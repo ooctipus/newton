@@ -17,6 +17,8 @@ import linecache
 import textwrap
 from pathlib import Path
 
+import warp as wp
+
 from . import coupled_contact, coupled_jacobi, spectral_contact
 
 SOURCE_PINS = {
@@ -38,16 +40,58 @@ _INITIAL = _INITIAL.replace(
 _INITIAL = _INITIAL.replace(";sg_spectral[lane]=norm", "")
 _INITIAL = _INITIAL.replace("            sg_spectral[lane+1]=spectral;sg_spectral[lane+2]=spectral;\n", "")
 
-_PROPOSAL = r"""
+_LOCAL_NATIVE = spectral_contact._LOCAL_NATIVE.replace("sg_project", "sj_project_cached")
+_LOCAL_NATIVE = _LOCAL_NATIVE.replace("residual[0]/coefficients[0]", "residual[0]*coefficients[0]")
+_LOCAL_NATIVE = _LOCAL_NATIVE.replace("/coefficients[1]", "*coefficients[1]")
+
+
+@wp.func_native(_LOCAL_NATIVE + "\nreturn sj_project_cached(old,residual,coefficients,friction);\n")
+def project_contact_cached(old: wp.vec3, residual: wp.vec3, coefficients: wp.vec4, friction: float) -> wp.vec3:
+    """Apply the same local map with cached normal/tangent reciprocal steps."""
+
+
+_CACHE_PREP = r"""
+    float sj_scale=1.0f;
     if(!sg_bad){
         float sj_local_scale=0.0f;
         if(lane<n_rows)sj_local_scale=fabsf(s_rhs[lane])/sqrtf(sg_diag[lane]);
-        const float sj_scale=1.0f+sg_max(sj_local_scale);
+        sj_scale+=sg_max(sj_local_scale);
+        float inverse=0.0f,weight=0.0f,spectral_inverse=0.0f;
+        bool triple=false;
+        if(lane<n_rows){
+            const float diagonal=sg_diag[lane];
+            weight=sqrtf(diagonal)/(1.0e-5f*sj_scale);
+            float denominator=diagonal;
+            if(s_kind[lane]==1){
+                const int p=s_parent[lane];
+                denominator=fmaxf(sg_diag[p+1],sg_diag[p+2]);
+            }
+            inverse=1.0f/denominator;
+            triple=s_kind[lane]==0&&lane+2<n_rows&&s_kind[lane+1]==1&&
+                s_parent[lane+1]==lane&&s_parent[lane+2]==lane;
+            if(triple)spectral_inverse=1.0f/sg_cross[lane+2];
+            sg_bad|=!isfinite(inverse)||!(inverse>0.0f)||!isfinite(weight)||!(weight>0.0f)||
+                (triple&&(!isfinite(spectral_inverse)||!(spectral_inverse>0.0f)));
+        }
+        sg_bad=sg_any(sg_bad);
+        // Finish all paired-diagonal reads before recycling existing caches.
+        SYNC();
+        if(!sg_bad&&lane<n_rows){
+            sg_diag[lane]=inverse;
+            sg_physical[lane]=weight;
+            if(triple)sg_cross[lane+2]=spectral_inverse;
+        }
+        SYNC();
+    }
+"""
+
+_PROPOSAL = r"""
+    if(!sg_bad){
         auto sj_propose = [&](int row) -> wp::vec3 {
             const wp::vec3 old(s_x[row],s_x[row+1],s_x[row+2]);
             const wp::vec3 residual(s_rhs[row],s_rhs[row+1],s_rhs[row+2]);
             const wp::vec4 coefficients(sg_diag[row],sg_cross[row+2],sg_cross[row],sg_cross[row+1]);
-            return sg_project(old,residual,coefficients,s_mu[row+1]);
+            return sj_project_cached(old,residual,coefficients,s_mu[row+1]);
         };
 """
 
@@ -60,11 +104,37 @@ _RECURRENCE = _MEASURE_SEAM + coupled_jacobi._JACOBI_NATIVE.split(_MEASURE_SEAM)
 for _old, _new in (("cj_", "sj_"), ("cc_diag", "sg_diag"), ("cc_scale", "sj_scale"), ("cc_max", "sg_max")):
     _RECURRENCE = _RECURRENCE.replace(_old, _new)
 
+# Keep every merit term and the latch decision; only invariant arithmetic
+# moves to the setup producer. Dynamic hypot/disk divisions remain unchanged.
+_RECURRENCE = _RECURRENCE.replace(
+    "const float cone_tolerance=3.0e-5f;",
+    "const float cone_tolerance=3.0e-5f;\n        const float sj_inverse_tolerance=1.0f/cone_tolerance;",
+)
+_CACHE_REPLACEMENTS = {
+    "r/sg_diag[lane]": "r*sg_diag[lane]",
+    "s_rhs[lane]/sg_diag[lane]": "s_rhs[lane]*sg_diag[lane]",
+    "sqrtf(sg_diag[lane])*fabsf(correction)/(1.0e-5f*sj_scale)": "sg_physical[lane]*fabsf(correction)",
+    "const float diag=fmaxf(sg_diag[lane],sg_diag[lane+1]);": "const float inverse=sg_diag[lane];",
+    "value-r/diag,y=other-rr/diag": "value-r*inverse,y=other-rr*inverse",
+    "sqrtf(sg_diag[lane])*fabsf(value-x*factor)/(1.0e-5f*sj_scale)": "sg_physical[lane]*fabsf(value-x*factor)",
+    "sqrtf(sg_diag[lane+1])*fabsf(other-y*factor)/(1.0e-5f*sj_scale)": "sg_physical[lane+1]*fabsf(other-y*factor)",
+}
+for _old, _new in _CACHE_REPLACEMENTS.items():
+    if _RECURRENCE.count(_old) != 1:
+        raise RuntimeError(f"Frozen merit coefficient seam changed: {_old}")
+    _RECURRENCE = _RECURRENCE.replace(_old, _new)
+_RECURRENCE = _RECURRENCE.replace("/3.0e-5f", "*sj_inverse_tolerance")
+# Do not rewrite the once-only definition of the reciprocal itself.
+_RECURRENCE = _RECURRENCE.replace("-value/cone_tolerance", "-value*sj_inverse_tolerance")
+_RECURRENCE = _RECURRENCE.replace(
+    "(hypotf(value,other)-radius)/cone_tolerance", "(hypotf(value,other)-radius)*sj_inverse_tolerance"
+)
+
 
 def _rewrite_native(source):
     """Replace the admitted solve region without retaining old/root work."""
     start = "    // b'_i = rhs_i + J_i . (v_in - Y^T lam0)"
-    replacement = spectral_contact._LOCAL_NATIVE + _INITIAL + _PROPOSAL + _RECURRENCE
+    replacement = _LOCAL_NATIVE + _INITIAL + _CACHE_PREP + _PROPOSAL + _RECURRENCE
     source = coupled_contact._replace_once(source, start, replacement + "\n    if (sg_bad) {\n" + start)
     end = "    SYNC();\n#else\n#if 1\n    // In-kernel response in whitened coordinates:"
     source = coupled_contact._replace_once(

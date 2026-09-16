@@ -106,3 +106,64 @@ Dependencies are pinned by the runtime and probe. Nine focused CPU controls,
 missing-module regression, hidden AOT, full and targeted pre-commit passed.
 No Isaac Lab edits, GPU launches by the implementation agent, PR or parent
 pointer changes; the inherited handoff remains unchanged.
+
+## One coefficient-cache correction: measured improvement, still unpromoted
+
+The initial implementation above is preserved at commit `5f1548fa`. The one
+cause-directed correction reuses the same three shared arrays: `sg_diag`
+becomes normal/paired-tangent reciprocals, dead `sg_physical` becomes per-row
+natural-residual weights, and each `sg_cross[normal+2]` becomes the reciprocal
+spectral tangent denominator. Physical normal/tangent cross terms are unchanged.
+Two setup joins complete paired reads before overwriting and publish the cache.
+No device allocation, extra shared array, layout, pass, stop or latch is added.
+Nonfinite/nonpositive cached coefficients fall back before impulse mutation.
+
+The coefficient producer charges two divisions per row plus one per triplet,
+and one diagonal square root per row (cold-scale work is retained). It replaces
+the repeated coefficient divisions and square roots with multiplies. Dynamic
+disk scaling and all three merit hypot operations are unchanged. Rounding need
+not be bit-identical; all hard/quality controls remain required. The CPU helper,
+native probe and whole observer are unchanged.
+
+Regression-first controls failed before the correction. Twelve CPU controls
+now pass, including 128 FP32 proposal comparisons and 256 actual-generated-merit
+comparisons covering unequal diagonals, infeasible states and both sides of the
+unchanged stop threshold. The merit host shim substitutes CPU max/hypot helpers
+equally for both versions; this is not a CUDA transcendental-identity claim.
+The actual native all2048 translation/quality gate also passes below.
+
+Corrected runtime SHA256
+`16a112d3661f3470ddf2c581ed28f14d9255db2d32a696694af2502c69d7c32c`,
+test `a9cbcdc2e7cd7d37094a4f3c582f8daf57d31d8592a0af91490c2017549a36de`.
+Hidden AOT `/tmp/fpgs-spectral-jacobi-cached-q2wQSTTS/cached_aot/report.json`
+passes both actual live72/32 ABIs: 85/91 registers on each card, unchanged
+5792/8068 B RTX and 4492/8068 B GB shared, zero stack/spills. Report SHA256
+`5ba7b91dc5e4751df4e20f323dec1848cfa7d3717b36a3723233a8c97e0ffe8b`.
+
+Native hard laws pass all2048 cases. The same664 pointwise diagnostic records
+remain (333 RTX,331 GB, identical counts per partition), separately from the
+66 CPU H-reference regressions. Maximum translated scaled H difference is
+1.2105231e-5. Same-input owner replay falls to0.0642–0.0651 ms RTX and
+0.0684–0.0696 ms GB, but original remains0.0477–0.0518 and0.0502–0.0546 ms.
+Native logs `/tmp/fpgs-spectral-jacobi-cached-native-20260916-YVRB625O/gpu{0,1}.log`
+have SHA256 `2ed5333da2be3f29f83371cfc7e4ec3b66ddf4d44a0d2b3f240837ebfa731aa2`
+and `06c516feee2fd027163002d4926d292544507c9241da4632e685ba0c634960ba`.
+
+One complete paired discovery, all source/idle/observer/capacity guards pass:
+
+| Complete physics, ms | Original | Cached candidate | Original/candidate |
+| --- | ---: | ---: | ---: |
+| RTX | 9.214019375 | 10.193371200 | 0.903923 |
+| GB | 9.488502400 | 11.207959225 | 0.846586 |
+
+Manifest `/tmp/fpgs-anymal-spectral-jacobi-cached-whole-paired16k-20260916-01/manifest.json`,
+SHA256 `218c424979256d7b2bf7666634178eeedc800a2b5e0aa756daa95d1f3418b90b`.
+The targeted correction recovers2.242585 ms RTX/2.929713 ms GB compared with
+the prior candidate screens, validating the diagnosed invariant-math cost.
+These are separate discovery rounds, not a repeated accepted speedup. The
+candidate still loses0.979352 ms RTX/1.719457 ms GB to its matched original.
+Reaching original-minus1 ms now needs another1.979352 ms RTX reduction.
+Close this mathematical map default-off and unpromoted; no further instruction
+or mapping tuning is funded. Any proposal-residual workflow would change the
+globalization/stop workflow and requires a separate mathematical/quality card,
+not permission to drop existing physics gates. Full pre-commit passes.
