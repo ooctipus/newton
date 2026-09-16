@@ -1411,3 +1411,133 @@ remain; capacities are unchanged. Added vec2 storage is14,155,784 bytes at the
 calibrated raw capacity, plus count arithmetic and one extra scan. The original
 loaded support/rebound/friction fixtures and an early whole screen decide;
 neither a geometry-only pass nor an isolated exporter speed is promotion.
+
+## Corrected manifold and combined G1 screen, 20:43 UTC
+
+The priority correction is preserved clean/pushed at
+`1e16a323876778aaeddf6c4e8420e3f155234bfc`. Six native arithmetic/geometry/
+routing/fallback/reset/overflow controls pass on each GPU, and all nine
+candidate loaded cases pass their existing physical gates. The unchanged
+paired selector still exits1 because the OLD arm fails full-friction/step
+controls on both cards and yaw support on RTX. Those failures remain visible.
+Artifact `/tmp/fpgs-pair-csr-priority-native-20260916-1Tn0yyls`.
+
+Independent endpoint inspection also checks the free rebound omitted by the
+inherited failure-list gate: candidate normal speed1.80000019m/s matches
+authored restitution0.6 and incoming speed3, energy ratio0.360000076, and
+spin3.3587e-5rad/s. Flat support speed2.0426e-6m/s and spin1.9744e-5rad/s replace
+the earlier unstable footprint. Full-friction travel0.5071853m agrees with
+the existing0.509684m analytic control. Production selected-anchor sliding
+leaves the finite terrain; sampled descent starts after the center crosses
+the edge, not an observed interior fallthrough. This is bounded physical
+coverage, not proof of all robot trajectories.
+
+Corrected whole screen passes all guards:
+RTX15.005645075->14.326358525ms (1.047415x),
+GB19.825631200->19.141688100ms (1.035731x), in
+`/tmp/fpgs-g1-heightfield-pair-csr-priority-whole-paired16k-20260916-01`.
+The corrected selector retains0.679287/0.683943ms savings, below the standalone
+1ms milestone. Root's actual CPU collision pipeline observer passes off/on,
+rejects wrong interval ownership and sticky failure, and passes explicit
+acknowledgement; the added vec2 bytes are included in its recorded allocation.
+
+An isolated composition combines these unchanged runtime bytes with spectral
+tangents da4d74f8. Only the two existing observer wrappers require conflict
+resolution; both feature/factory/capacity checks remain. Composition commit
+`9df743db` on `ooctipus/fpgs-g1-csr-spectral-20260916`; full pre-commit and12
+executed CPU controls pass (10 CUDA controls explicitly skipped in this CPU
+run; their separate native checkpoints are above). First complete paired
+screen passes all guards: RTX15.040457050->13.729104500ms (1.095516x),
+GB19.844910400->18.179141775ms (1.091631x). Artifact
+`/tmp/fpgs-g1-csr-spectral-whole-paired16k-20260916-01`.
+Three alternating repeats are running. The combined gain is measured, not
+the sum of separate owner predictions; it is not yet promoted or a new MJWarp
+ratio. A fresh shared-CSR MJWarp denominator must use the same collision path.
+
+The separate spectral residual-reuse CPU study diagnoses a real pure-Q tail:
+its conservative scaled bound falls while absolute normal error grows, so
+the Q-only latch misses the original instability. One fixed correction uses
+independent Q-increase OR normal/complementarity-increase latch streams,
+without a deadband/grid or altered full physical stop. All2048 hard checks
+pass;1974 cases are closer to the original held-H reference,74 are genuinely
+farther (the previous66 plus8 new). Median/p99/max scaled H distance is
+0.000120582/0.006974387/0.024961323 versus original
+0.006389918/0.031995761/0.055738454. This is not universal improvement.
+The corrected workflow removes92.47% of full-merit row visits in the frozen
+CPU accounting, adds6.28% proposals and0.65% operator work, and preserves
+all unsuccessful full-stop gates. Native implementation is funded once;
+no speed claim or further policy grid follows from CPU counts.
+
+## Repeated G1 composition and fresh fair denominator, 21:01 UTC
+
+Three alternating paired repeats completed with unchanged budgets and all
+guards passing, in
+`/tmp/fpgs-g1-csr-spectral-repeat-paired16k-20260916-01`:
+
+| Median whole physics, ms/env step | RTX | GB300 |
+| --- | ---: | ---: |
+| Qualified chain reference |15.086237125|19.841528600|
+| Corrected CSR plus spectral tangents |13.766957450|18.188351025|
+| Reference/candidate |1.095829429x|1.090892109x|
+| Saving |1.319279675|1.653177575|
+
+Candidate samples are13.768985975/13.758160875/13.766957450ms RTX and
+18.141839575/18.188351025/18.216925650ms GB. Median wall throughput improves
+1.036549259x/1.045772244x, not the same ratio as physics.
+
+The twelve-step node capture preserves its inherited auxiliary-graph analyzer
+rejection. The exact strict reader
+`/tmp/fpgs-g1-csr-spectral-strict-eqJS9NBX/read_combined.py` separates all48
+physics and12 auxiliary roots and retains correlation/source/unknown-owner
+guards. New CSR owners occur4 times and spectral solve8 times per environment
+step; old full hash reducer and old metric solve are absent. Independent replay
+at `/tmp/fpgs-g1-csr-spectral-strict-review-qLL47J63` produces byte-identical
+JSON hashes: RTX `da4c825b45df40c97a553834a2ad6d6bdeff704bd030b0a5b695d60764be9006`,
+GB `7e83b6f9599336bc4631840a297d7921bf19a71cfb90073b9aa91e697a953d7d`.
+
+| Current exclusive node family, ms/env step | RTX | GB300 |
+| --- | ---: | ---: |
+| Collision |3.043369500|7.790226500|
+| Dynamics |2.635625333|2.376835500|
+| Rows/response |2.702515833|2.708331917|
+| GS |3.182044333|3.220647500|
+| Publication |1.843514250|1.931879667|
+| Force export |0.209936333|0.135122667|
+| Memory |0.158304000|0.152407250|
+
+Root spans13.895110/18.4446755ms include gaps; these diagnostic node timings
+are not substituted for graph-mode medians. Row preparation increased versus
+the qualified chain reference; all of that cost is charged.
+
+Fresh fair comparison uses composition9df743db on BOTH backends, fixed Lab53ee,
+shared corrected CSR1/adaptive0, identical original16K200/40/40 recipe and
+calibrated capacities. Only FPGS enables its chain/spectral solver owners.
+The external compatibility adapter
+`/tmp/fpgs-g1-csr-spectral-fair-GAursBVt` reuses the original checked driver;
+both actual collision owners, interval arrays and sticky status are verified.
+Artifact `/tmp/fpgs-g1-csr-spectral-fair-paired16k-20260916-01` is complete,
+all four runs exit0, both boundary checks pass, all states are finite,
+physics budgets are unchanged and MJ warning masks are0 on both cards.
+
+| Fresh whole physics, ms/env step | RTX | GB300 |
+| --- | ---: | ---: |
+| FPGS composition |13.711120450|18.148208975|
+| Corrected MJWarp with shared CSR |37.277615275|37.823784600|
+| MJWarp/FPGS |2.718786945x|2.084160737x|
+
+This is one fresh backend pair, supported by the separate three-repeat
+composition comparison; it is not4x or a claim of improved other tasks.
+The prior same-session G1 ratios were2.431726696x/1.871729653x. Do not divide
+new FPGS time by the old collision denominator. Runtime composition stays
+source-frozen at9df743db; this ledger records results without invalidating the
+replay source snapshot. General loaded robot trajectory coverage remains
+bounded by the component controls, not a universal convergence proof.
+
+The separate Q-or-N native probe passes all2048 hard checks and eight
+translation controls (maximum scaled held-H error1.2105231e-5). There are675
+pointwise diagnostics; nine native-only crossings exceed the normal threshold
+by3.7e-8 to3.04e-6, not new hard failures. Tier32 replay is11-13% slower than
+original and tier48 approximately flat, despite1.19-1.26x improvement over the
+cached loser. Original-controlled whole timing is running; no speed claim.
+Finite-shell query plus corrected CSR is also source-frozen for native/whole
+testing, without old hash priority reduction or any new arrays/capacities.
