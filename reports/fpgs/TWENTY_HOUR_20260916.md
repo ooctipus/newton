@@ -1541,3 +1541,163 @@ original and tier48 approximately flat, despite1.19-1.26x improvement over the
 cached loser. Original-controlled whole timing is running; no speed claim.
 Finite-shell query plus corrected CSR is also source-frozen for native/whole
 testing, without old hash priority reduction or any new arrays/capacities.
+
+## Shell-query composition, repeated/fair results, 21:38 UTC
+
+The Q-or-N residual workflow is closed default-off at fork commit
+`e7729d105b339e4ee6ac780b04af34fcc06feaa2`, clean and pushed. Whole physics
+is9.225785400->10.124493750ms RTX and9.564807650->10.536172725ms GB,
+reference/candidate0.911234243x/0.907806649x. Artifact
+`/tmp/fpgs-anymal-spectral-residual-whole-paired16k-20260916-01` passes all
+guards. The original recurrence has no full physical-merit scans to retire:
+the92.47% reduction was relative to the cached loser. Lookahead, grouped
+proposal, two reductions and persistent residual state remain additional work.
+No third policy or instruction-tuning rescue is funded from this loss.
+
+Finite-shell query plus corrected CSR is preserved at fork commit
+`92cd3bc81000d82ff4eb1bfc010b3b5f9d0ef1c0`. Both native suites pass22 tests
+and all18 loaded records per card, keeping CSR enabled on both loaded arms.
+Candidate rebound vz1.8000001907m/s and energy ratio0.360000076294 match the
+authored restitution; spin2.96623e-6rad/s. Full-friction travel0.50718540m
+matches the existing0.509684m control. Production selected-anchor sliding
+leaves the finite edge without observed interior fall-through. These remain
+bounded fixtures, not universal trajectory equivalence. Native artifact
+`/tmp/fpgs-shell-pair-csr-native-20260916-CxMjp4Ok`.
+
+The first whole comparison against qualified chain passes all guards:
+RTX15.044929850->13.782255325ms (1.091615958x),
+GB19.807130175->15.882781250ms (1.247081973x), in
+`/tmp/fpgs-g1-heightfield-shell-pair-csr-whole-paired16k-20260916-01`.
+This1.262674525/3.924348925ms saving includes CSR membership and every changed
+row/solve cost. The initial RTX environment wall result is slightly worse;
+it is not relabeled an end-to-end improvement.
+
+Root composes unchanged92cd runtime with9df spectral runtime at clean fork
+commit `a61ea916ab55ee83109accf1a0360a02f7e83f7f`, branch
+`ooctipus/fpgs-g1-shell-csr-spectral-20260916`, pushed. Cherry-pick is clean;
+all three actual feature observers remain. Full pre-commit passes, and the
+combined CPU suite executes16 passing controls with11 native selectors skipped.
+Separate component native coverage is recorded above; no combined loaded-G1
+physical-reference trajectory test is claimed.
+
+First integrated whole screen passes all guards:
+RTX15.045235725->13.175193875ms (1.141936572x),
+GB19.847759200->14.887794550ms (1.333156441x), in
+`/tmp/fpgs-g1-shell-csr-spectral-whole-paired16k-20260916-01`.
+Three alternating repeats then reproduce the gain:
+
+| Median whole physics, ms/env step | RTX | GB300 |
+| --- | ---: | ---: |
+| Qualified chain reference |15.087577775|19.844632975|
+| Shell/CSR/spectral composition |13.205344050|14.907120800|
+| Reference/candidate |1.142535758x|1.331218365x|
+| Saving |1.882233725|4.937512175|
+
+Candidate samples13.176627950/13.217565650/13.205344050ms RTX and
+14.907120800/14.892250600/14.925237900ms GB. Median unprofiled environment
+wall throughput improves1.074274917x/1.206008153x. Artifact
+`/tmp/fpgs-g1-shell-csr-spectral-repeat-paired16k-20260916-01`.
+
+Fresh fair backend comparison uses clean a61ea916 on both arms, fixed Lab53ee,
+shared CSR1/shell1/adaptive0 and original calibrated16K200/40/40 recipe.
+The reused adapter `/tmp/fpgs-g1-shell-csr-spectral-fair-iThUAefV` changes only
+the selected composition, exact observer pin and shared shell flag, additionally
+pinning all five prior adapter files. Original driver/checked shell are byte-
+identical. All four runs exit0, capacity/construction checks pass, states remain
+finite, budgets are unchanged, and both MJ warning masks remain0.
+
+| Fresh whole physics, ms/env step | RTX | GB300 |
+| --- | ---: | ---: |
+| FPGS shell/CSR/spectral |13.220150900|14.941340800|
+| Corrected MJWarp, same collision redesign |36.492822025|34.728007250|
+| MJWarp/FPGS |2.760393758x|2.324289882x|
+
+Artifact `/tmp/fpgs-g1-shell-csr-spectral-fair-paired16k-20260916-01`.
+The shared collision change also helps MJWarp; dividing by an older denominator
+would overstate the ratio. Other five task ratios are not newly remeasured or
+claimed improved by this G1-specific dispatch. The4x-across-tasks goal is unmet.
+
+Current twelve-step node attribution preserves the inherited auxiliary analyzer
+rejection and proves48 physics/12 auxiliary roots with zero unproven owners.
+Strict reader `/tmp/fpgs-g1-shell-csr-spectral-strict-R80XhYQP/read_shell_combined.py`
+pins the prior complete reader, shell source/factory, actual requested/observed
+flags and both interval allocation/status checks. It retains all original
+source/metadata/unknown-owner guards. Output hashes are
+RTX `a941e861d64a718890b31d375e874dbff9f4a5ed53c51dbc8aa24c2bd3db7bb0`,
+GB `7881130690022e36426ab0c5b0abfeff3c8cad5d7350d44fd0170498182340ee`.
+
+| Current exclusive node family, ms/env step | RTX | GB300 |
+| --- | ---: | ---: |
+| Collision |2.330609833|4.301366917|
+| Dynamics |2.630962750|2.370376500|
+| Rows/response |2.782452000|2.790419750|
+| GS |3.221614750|3.250951500|
+| Publication |1.842091583|1.932111833|
+
+Diagnostic spans13.298025167/15.064496917ms include all remaining owners and
+gaps. Shell query cuts collision versus the previous composition but adds row
+and GS cost; the complete gain above includes both effects.
+
+One new fixed-cohort stage-once representation now has four native test groups
+passing on each GPU: original spectral transaction/current-held/graph-empty/
+saved16 controls plus0/32/33/100-row and scalar-fallback boundaries. It stages
+existing Z and immutable metadata only for actual counts<=32, preserves the
+original>32 body and arithmetic association, and shares one3952-byte union.
+AOT63/64 registers and4080 shared bytes, no spills, are charged on both paths.
+Current eligible world share is approximately93%, not all worlds. The complete
+paired cost screen is running against a61ea916; no gain is yet established.
+
+Further source screens prevent repeated work. Exact horizontal-cell2-to-1 quad
+merging would retire only21.7-22.0% of historical current-query calls; the
+four-edge query and retained visits add work, with no credible1ms RTX budget.
+ANY18 leaf-first L117 coordinates already have a complete earlier contiguous-
+panel implementation, including rows, EX1, sparse recurrence and decode, that
+lost9.295346->11.759834ms RTX. Neither is funded as a new implementation.
+The distinct normal-only LCP elimination hypothesis gets one fixed-policy CPU
+screen, with complete on-demand Gram-column costs, all-normal feasibility,
+rank/work guards, full physical merit and literal remaining-budget fallback.
+Its small observed normal working sets are not an admission oracle or a speed
+claim; the original error is mostly tangential. No new converged reference.
+
+## Staged-row closure and coupled-normal screen, 21:56 UTC
+
+The staged-row whole screen passes every existing guard but misses the
+structural-gain gate: RTX13.168334400->13.021441900ms (1.011280817x),
+GB14.882789850->14.573015150ms (1.021256734x), in
+`/tmp/fpgs-g1-staged-rows-whole-paired16k-20260916-01`.
+RTX environment wall time is worse27.174752->28.218408ms; GB improves only
+28.465651->28.074566ms. No promotion or mapping/tile tuning is funded.
+
+One cause-directed node capture attributes exclusive GS3.221614750->
+3.060125833ms RTX and3.250951500->2.890316833ms GB, with row and collision
+families nearly unchanged. Thus removing repeated global row/metadata loads
+does save solver time, but not the proposed approximately1ms whole budget.
+Actual resources are63/64 registers and4080 shared bytes versus64/1116 in
+the reference; no local spills. This is not hardware-counter evidence of a
+cache/bandwidth bottleneck. Endpoint workload differs: RTX contacts89865->
+89080/rows385818->383509, GB89429->89434/384219->384262. These are complete
+capture costs, not an identical-input isolated kernel experiment.
+
+Artifact `/tmp/fpgs-g1-staged-rows-node-candidate16k-20260916-01` retains the
+inherited auxiliary analyzer rejection. Reader
+`/tmp/fpgs-g1-staged-rows-strict-MZC6tvqu/read_staged.py` checks exact runtime
+and observer pins, actual staged owner/flags,48 physics/12 auxiliary roots,
+all process correlations, zero unproven owners and every original source,
+status and capacity guard. Root's independent exact reader replay at
+`/tmp/fpgs-staged-root-replay-q2nNeKBN` produces byte-identical hashes:
+RTX `5c0be57df59c4449dd3e1d2edd2290c3837f358f175eb275b2a75d39d0380553`,
+GB `6bf7aef39a2f171f1bf9eea5fdbc241e71b40faf5dcda9f3c9c5e83016df4c08`.
+The first root invocation failed because the reader self-digest required a
+physical copy at its output location; that failure is retained in tool output.
+An exact patch-created copy then passed without weakening any assertion.
+
+The fixed normal-LCP/tangent CPU screen passes all2048 existing hard checks,
+with1981 closer held-H results and67 genuine held-H regressions. It still
+requires45,474 passes (22.204 mean) and56.208M counted products, equivalent
+to26.094 original action pairs before division/sqrt/reduction/branch cost.
+Only613 cases reach the physical stopping gate. Stable normal working sets
+do not eliminate normal/tangent coupling: the tangent action reintroduces
+normal residual after the certified normal solve. No native implementation
+is funded on this result. Full saved-input/reference guards pass in
+`/tmp/fpgs-normal-block-cpu-oGrTia7y/all2048`; this does not establish generic
+overflow admission or a new timing gain.
