@@ -774,3 +774,177 @@ anisotropic sliding in regression-first controls. Start with eight saved
 cases; expand only if useful. Stop on instability before funding native work;
 no damping, step-size or line-search grid follows. First CPU checkpoint within
 25 minutes; root continues owning all GPU execution.
+
+### Warm-start and natural-map falsification, 07:08 UTC
+
+Same-collision-generation warm starting was a real, previously unmeasured
+ANYmal policy, not the dormant nearest-point WR warm cache. The saved adjacent
+1600/1601 calls share all raw contact payloads and held factors, but thousands
+of dense slots move. Remapping by unchanged raw contact identity carries all
+29,878 contact rows while keeping 15 limits cold and the residual reference
+at zero. Geometry and response are still rebuilt from current inputs.
+
+Across 1,024 donor/receiver transitions, sweeps fall only 24,531 to 23,797
+(2.99%), and 855 cases still use 24. There are 811 original pointwise passes
+and 105 genuine held-H reference regressions beyond the existing allowance.
+This does not support a structural gain or native implementation. Artifact
+`/tmp/fpgs-anymal-same-generation-warm-oBqhqJ/SUMMARY.md`, SHA256
+`399f17f8a6b32068941cdec13c6c36feb619ef3ab0a7075aebe0255f29dfad3a`.
+The identical CPU run was repeated once solely because its initial stdout
+exceeded the tool limit; the compressed full result and both source guards
+are preserved. No different policy or runtime change was tested.
+
+The new natural-Nesterov screen fails all eight preselected cases: no physical
+stops, all 192 passes consumed, and every held-H reference distance worsens
+(10.77--183.28x). Residual carry agrees with the direct operator to 3.55e-15;
+this is not a carry bug. All eight have zero adaptive restarts despite large
+oscillation. The duplicate-normal test reproduces the predicted instability:
+local diagonal/spectral scaling lacks a global coupling bound. No full cohort
+or native implementation is funded. Frozen helper SHA256
+`a87ab5b6716846516d81799bd42cf66b97b9e0b2fd70411b42674e80a4363613`;
+three regression-first tests and targeted pre-commit pass.
+
+### One cause-directed correction: sequential spectral contact updates
+
+Fund a bounded CPU control that removes the simultaneous coupling error by
+using original contact-order Gauss-Seidel updates. Update and apply a normal
+first; then evaluate both tangential residuals at that changed velocity,
+take one common spectral gradient step, project the pair onto the current
+normal's disk, and apply both tangential changes together. It is not the
+old metric disk root or the expensive coupled three-dimensional root. It
+has the correct Coulomb fixed point, but no finite-budget convergence claim.
+
+Keep the 24/8 original ANYmal/G1 maximum allowances, current rows and held
+response. Remove all-pair EX1, nested roots, AA history and momentum; charge
+ordered residual/update transactions, local tangent spectral setup and the
+initially explicit end-sweep physical scan. The measured paired owner target
+remains at least 1ms below accepted whole physics, not below a slow prototype.
+Root-owned native work is conditional on both physical quality and a credible
+complete cost: ordered synchronization may erase the arithmetic saving.
+
+Check the same eight ANYmal cases plus existing sixteen G1 cases first, then
+only expand a frozen promising implementation to the existing 2,048-reference
+cohort. Regression-first controls must include duplicate normals and
+anisotropic sliding. No contact-order, damping or step-size grid is funded;
+first checkpoint within 25 minutes. This is the single ordering correction
+to the diagnosed simultaneous-map instability, not evidence of performance.
+
+### Sequential correction: full-cohort result, 07:17 UTC
+
+The eight-case screen passed, but the frozen 2,048-case qualification did not:
+1,554 pass the original pointwise gates; 2,035 improve held-H reference
+distance and 13 genuinely regress beyond original plus 3e-5. All thirteen
+are tier32 cases consuming the complete 24-pass allowance. These are not
+merely stricter residual gates rejecting a more accurate solution.
+
+Total passes fall 49,059 to 44,632 (9.02%), with median 24 and 1,372 cases
+still using 24. There are 739 physical stops, including 63 on the last pass.
+The sixteen-case G1 screen passes eleven, not sixteen. There are no hard
+cone, impulse-sign, momentum or nonfinite failures. No native implementation
+or ordering/step-size grid is funded for this policy.
+
+Counted products are 57.506M versus original EX1 plus recurrence 84.268M,
+including 1,293,603 additional stop row dots. This is not a timing estimate:
+ordered updates serialize dependencies, and current geometry, whitening and
+publication remain. The original producer function is unchanged.
+
+Frozen helper `a39eb83e4f5b240a24416f96683df0cc5e7453c8f180cbf539f9d752141256c7`;
+three regression-first tests and targeted pre-commit pass. Full evidence:
+`/tmp/fpgs-anymal-spectral-gs-qualification-6Nxtdj/README.md`, SHA256
+`1a502cfaab3ef47520b8f6c33cb210b1766ff23672ac885870766bd0eae834b6`.
+All 2,048 existing reference payloads and source/input guards pass. The CPU
+cohort took 23.39 seconds; no new reference solve or GPU job was needed.
+
+## Fixed augmented operator: bounded PADMM card, 07:35 UTC
+
+The distinct hypothesis is amortizing one augmented-operator factor over
+closed-form cone/dual updates, instead of nested contact roots or rebuilding
+an active Jacobian. Use the dual-corrected updates in
+[Carpentier et al., Algorithm 1](https://arxiv.org/html/2405.17020v1), and
+reference this checkout's Kamino preconditioner and PADMM implementation.
+This is not a claim that Kamino's default maximum 200 converges in our 24/8.
+
+CPU policy: cold start, fixed rho=1, proximal eta=1e-5, no acceleration,
+unchanged maximum 24 ANYmal / 8 G1 updates. Use one scale per contact triple,
+`S=clamp(1/sqrt(max physical diagonal + float32 epsilon),.02,50)`; scalar
+unilateral rows use their own diagonal. Let `U=S Z`, `b'=S b`, `lambda=S y`.
+Physical compliance remains zero: inherited CFM is not added to the operator.
+Factor `K=(rho+eta)I+U^T U` once and use Woodbury. The De Saxce correction
+uses the previous dual variable, not the unconstrained physical residual.
+Publish the projected impulse and its actual momentum-consistent velocity;
+the unconverged dual velocity is not a physical certificate.
+
+Cheap normalized primal/dual infinity norms at 1e-6 only trigger a separately
+charged original-law physical scan. The actual physical gate must pass to
+stop; final diagnostics are counted separately. Include independent cone,
+Woodbury, fixed-point, and update-order controls before the eight-case ANYmal
+and sixteen-case G1 screen. No parameter grid is authorized.
+
+Prior `/tmp/fpgs-desaxce-splitting-XMQOPf` already tested once-factored
+Woodbury with isotropic contact scaling on Allegro. Its lagged Douglas--Rachford
+trajectory failed, reaching only 300/2,048 original pointwise passes at 24.
+Thus Woodbury is not new; dual-corrected PADMM is the bounded new hypothesis.
+The prior result was CPU-only and cannot be described as a native timing loss.
+
+For D=18, setup costs 171N lower-Gram products plus a small factor. Each
+ordinary Woodbury application costs twice N times D plus 306 triangular products and
+36 divisions, before correction/projection/checks. An alternative native
+representation, not implemented, forms `W=U C^-T` once for `K=C C^T`:
+the application becomes `(h-W(W^T h))/(rho+eta)`, removing per-pass dependent
+triangular solves. It adds 153N products and 18N divisions during setup.
+It is a latency trade, not automatically fewer products. Correct publication
+requires `U^T y=C(W^T y)`; any physical scan and retained producers are charged.
+Native funding requires useful accuracy and a complete-owner saving case,
+not just the phrase linear in contacts.
+
+### Fixed and accelerated PADMM: diagnosis, not native funding
+
+Frozen fixed helper SHA256
+`71ef26bde2eefa3a32edbaf017dd9122689df7c62f17113d5646c04a80e6717b`
+passes four regression-first controls and independent actual-source review.
+It passes zero of eight ANYmal pointwise cases, improves five held-H reference
+distances, and consumes all 192 allowed updates without a cheap or physical
+stop. G1 passes only the six initially zero-solution cases of sixteen and
+consumes all 128 updates. No hard cone or momentum failure occurs. Screen:
+`/tmp/fpgs-padmm-screen-71ef26bd.json`, SHA256
+`c58803ef3f7a90e9550cefece39519ff707419a30eafc1831cf8ddcb580b8508`.
+
+The first prescribed failing case, RTX current world1, was diagnosed without
+changing its policy. At update24 the scaled physical-minus-dual velocity
+mismatch is 0.00440378. The exact decomposition is dominated by the negative
+dual-update term (0.00444623), not the consensus response (0.00020146) or
+changing correction (0.00019776). The augmented factor has condition 4.986;
+shifted-linear backward error stays below 2.55e-16 and independent cone/dual
+identities below 5.44e-16. This is slow outer convergence, not a poor linear
+solve or wrong fixed point. One diagnostic-only continuation reaches the
+physical bounds at update98 and the actual cheap-plus-physical stop at117.
+Neither expanded count is admitted as a performance candidate. Artifact:
+`/tmp/fpgs-padmm-failure-trace-LiY1bJ/result.json`, SHA256
+`49c6d0898eb626077197c47ad124fca9257faa4c9827531b7ad6459237fcb8d2`.
+
+One cause-directed correction then implements the actual Kamino accelerated
+policy, not a momentum-parameter grid. It retains the fixed factor, 24/8
+budgets, cone law and actual physical publication. Accelerated dual/impulse
+hats enter the update; the proximal impulse remains unaccelerated. On restart
+the hats rewind to previous unaccelerated states, while current states remain
+committed, matching Kamino's source. Three regression-first dense-oracle tests
+and independent source-order review pass. The extra merit/history operations
+are counted; no additional response action or factor is hidden.
+
+Frozen accelerated helper SHA256
+`d00bfff57e4e4a2c81495edc78fd45c67848360a976421c0e89a1484b2799782`
+still passes zero of eight ANYmal pointwise cases, improves six reference
+distances and consumes all 192 updates, with 55 restarts. G1 again passes only
+the six zero-solution cases and consumes all 128 updates, with 14 restarts.
+There are no physical stops. Screen:
+`/tmp/fpgs-accelerated-padmm-screen-d00bfff5.json`, SHA256
+`95aa2982363e5a36c687f081111a359600334dbf792c6b4766173aa0b5f20735`.
+Neither variant funds a full cohort or native implementation. No accepted
+physics improvement follows from these CPU experiments.
+
+A separate primary-source screen of
+[Song et al.'s FBF architecture](https://arxiv.org/html/2607.19599v1)
+does not supply a short-budget replacement: its reported contact-rich runs
+allow 200 outer updates with 10 or 30 inner sweeps, and its matrix-free mass
+application is for independent rigid bodies. Its timing claims are not
+evidence for this articulated 24/8-update workload. No FBF prototype is funded.
