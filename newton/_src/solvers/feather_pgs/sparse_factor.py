@@ -536,6 +536,12 @@ class SparseFactor:
         if spectral not in ("0", "1"):
             raise ValueError("FEATHER_PGS_SPARSE_SPECTRAL_TANGENTS must be 0 or 1")
         self.spectral_tangents = spectral == "1" and c == 100
+        staged = os.environ.get("FEATHER_PGS_SPARSE_STAGED_ROWS", "0")
+        if staged not in ("0", "1"):
+            raise ValueError("FEATHER_PGS_SPARSE_STAGED_ROWS must be 0 or 1")
+        self.staged_rows = staged == "1"
+        if self.staged_rows and not self.spectral_tangents:
+            raise ValueError("Sparse staged rows require the capacity100 spectral owner")
         if self.spectral_tangents and (
             not self.metric_tangents
             or self.packet_rows
@@ -572,6 +578,10 @@ class SparseFactor:
             from .sparse_spectral_tangents import get_solve_kernel as spectral_solve  # noqa: PLC0415
 
             self.kernels.solve = spectral_solve()
+        if self.staged_rows:
+            from .sparse_staged_rows import get_solve_kernel as staged_solve  # noqa: PLC0415
+
+            self.kernels.solve = staged_solve()
         # Drop canonical matrix/row storage only after complete constructor admission.
         # Dummy shapes make accidental readers fail visibly, not reinterpret packed W/Z.
         dummy = wp.empty((1, 1, 1), dtype=float, device=device)

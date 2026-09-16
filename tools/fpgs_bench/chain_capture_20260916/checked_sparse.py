@@ -135,10 +135,20 @@ spectral_replacement = """    spectral_flag = os.environ.get("FEATHER_PGS_SPARSE
     spectral_actual = getattr(sparse, "spectral_tangents", False)
     if type(spectral_actual) is not bool or spectral_actual != spectral_wanted:
         raise RuntimeError("Requested spectral tangent owner is not active")
+    staged_flag = os.environ.get("FEATHER_PGS_SPARSE_STAGED_ROWS")
+    if staged_flag not in ("0", "1"):
+        raise RuntimeError("Require explicit staged-row flag on both arms")
+    staged_wanted = staged_flag == "1"
+    staged_actual = getattr(sparse, "staged_rows", False)
+    if type(staged_actual) is not bool or staged_actual != staged_wanted or (staged_wanted and not spectral_wanted):
+        raise RuntimeError("Requested staged-row owner is not active")
     if spectral_wanted:
-        from newton._src.solvers.feather_pgs.sparse_spectral_tangents import get_solve_kernel
+        if staged_wanted:
+            from newton._src.solvers.feather_pgs.sparse_staged_rows import get_solve_kernel
+        else:
+            from newton._src.solvers.feather_pgs.sparse_spectral_tangents import get_solve_kernel
         import warp as wp
-        solve = "sparse_spectral_tangent43_s18_c100"
+        solve = "sparse_staged_spectral_tangent43_s18_c100" if staged_wanted else "sparse_spectral_tangent43_s18_c100"
         if sparse.kernels.solve is not get_solve_kernel():
             raise RuntimeError("Spectral solve is not the exact cached factory")
         arguments = [argument.label for argument in sparse.kernels.solve.adj.args]
@@ -149,6 +159,8 @@ spectral_replacement = """    spectral_flag = os.environ.get("FEATHER_PGS_SPARSE
             raise RuntimeError("Unexpected existing current-CFM array layout")
     result["spectral_tangents"] = {"requested": spectral_wanted, "observed": spectral_actual,
         "kernel_key": solve, "check_pass": True}
+    result["staged_rows"] = {"requested": staged_wanted, "observed": staged_actual,
+        "kernel_key": solve, "fast_capacity": 32, "check_pass": True}
     result["solve_key"] = getattr(sparse.kernels.solve, "key", None)
 """
 if source.count(spectral_seam) != 1:
