@@ -144,6 +144,38 @@ def _paired_source(source):
     source = source.replace("__syncwarp()", "__syncwarp(mask)")
     if "0xffffffff" in source or "__syncthreads" in source or "+=32" in source:
         raise RuntimeError("Paired sparse GS retains a whole-warp ownership operation")
+    # Specialize each collective, not the whole world function. Every member
+    # of either disjoint half still executes the same literal-mask operation.
+    # This is the exact offline-tested correction for dynamic-mask lowering.
+    counts = {}
+    for name in ("__shfl_down_sync", "__shfl_sync", "__ballot_sync", "__syncwarp"):
+        token = name + "(mask"
+        cursor = 0
+        count = 0
+        while True:
+            begin = source.find(token, cursor)
+            if begin < 0:
+                break
+            depth = 1
+            end = begin + len(name) + 1
+            while depth:
+                char = source[end]
+                depth += (char == "(") - (char == ")")
+                end += 1
+            call = source[begin:end]
+            low = call.replace("(mask", "(0x0000ffffu", 1)
+            high = call.replace("(mask", "(0xffff0000u", 1)
+            replacement = (
+                "if(half==0){" + low + ";}else{" + high + ";}"
+                if name == "__syncwarp"
+                else "(half==0?" + low + ":" + high + ")"
+            )
+            source = source[:begin] + replacement + source[end:]
+            cursor = begin + len(replacement)
+            count += 1
+        counts[name] = count
+    if counts != {"__shfl_down_sync": 7, "__shfl_sync": 11, "__ballot_sync": 3, "__syncwarp": 8} or "(mask" in source:
+        raise RuntimeError("Paired sparse GS literal-collective seam changed")
     return source
 
 

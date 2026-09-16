@@ -1206,3 +1206,39 @@ mapping, and a meaningful gain requires balanced repetition. No default or
 parent-pointer promotion is implied. Offline evidence:
 `/tmp/fpgs-g1-paired-literal-offline-Ewx2goKW/offline02/report.json`, SHA256
 `4275098a3be171c95f71f6bf8fadb1f555ba3bde895ae3bf2e9f2330336453c9`.
+
+### Literal-mask corrective run: regression confirmed, 09:12 UTC
+
+The exact offline-tested correction is frozen at module SHA256
+`b7485ab38babd9af21efc11ad6a6bad3d4db4717011f54ec6c6c072a419b1734`.
+Generated native source SHA256
+`81746dacfd257eb9cb05af262ff328677e1bc57c7d2f00b68144bf0ed7e93ecd`
+matches offline02 byte-for-byte. Independent review confirms half-uniform
+literal branches at each individual collective, not duplicated world
+functions. Both native selectors pass on both GPUs (root10372/88318), and
+the changed Warp native module actually recompiles. Existing CPU controls
+and targeted pre-commit pass. No tolerances or numerical settings change.
+
+| Complete 16K corrective discovery pair | RTX PRO6000 | GB300 |
+| --- | ---: | ---: |
+| Accepted baseline physics | 15.608934 ms | 20.508753 ms |
+| Literal-mask paired physics | 17.616157 ms | 21.599840 ms |
+| Baseline / candidate | 0.886058x | 0.949486x |
+| Baseline environment wall | 30.416604 ms | 35.352970 ms |
+| Candidate environment wall | 32.107146 ms | 36.062266 ms |
+
+All source, capacity and idle guards pass; root73652 exits0. Same checked
+driver, original producers, numerical allowance and 200/40/40 protocol.
+Artifact `/tmp/fpgs-g1-paired-gs-literal-whole-paired16k-20260916-01/manifest.json`,
+SHA256 `757a7102aca3adfaf8fe747ebe9cff632ab382fb816af667437e24d3a568f547`.
+This is a separate matched baseline pair, not a formal balanced comparison
+between the two losing implementations. It establishes that removing dynamic
+mask regrouping does not recover a whole-physics win. No further mapping
+grid, new numerical approximation or validation campaign is funded here.
+The prototype remains default off; accepted runtime is unchanged.
+
+The original mapping and native controls are preserved in `45491fa7`, pushed
+to `ooctipus/newton:ooctipus/fpgs-active-wrench-20260916`. The correction is
+retained as a separately reproducible failed experiment, not as a production
+optimization. No fresh MJWarp or cross-task speedup is claimed from these
+G1-only measurements.
