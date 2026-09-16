@@ -352,8 +352,16 @@ def _collect(
 
 
 @functools.cache
-def get_state_kernel(finish: bool):
+def get_state_kernel(finish: bool, chain_scan: bool = False):
     """Build complete repair/finish using original generalized integration laws."""
+    plan_type = KineticPlan
+    scan_poses, scan_motion, collect = _scan_poses, _scan_motion, _collect
+    if chain_scan:
+        from . import g1_chain_scan  # noqa: PLC0415
+
+        plan_type = g1_chain_scan.ChainPlan
+        scan_poses, scan_motion = g1_chain_scan.scan_poses, g1_chain_scan.scan_motion
+        collect = g1_chain_scan.get_collect(_COLLECT)
     source = "\n".join(
         kuka_joint_world.operation_source(name)
         for name in ("update_qdd_from_velocity", "remove_free_root_transport_from_qdd", "integrate_generalized_joints")
@@ -368,7 +376,7 @@ def get_state_kernel(finish: bool):
 
     def state(
         p: sparse_factor.SparsePlan,
-        plan: KineticPlan,
+        plan: plan_type,
         data: PublicationData,
         cache: KineticData,
         requests: wp.array[int],
@@ -456,7 +464,7 @@ def get_state_kernel(finish: bool):
                 relative = wp.transform(wp.vec3(), wp.transform_get_rotation(relative))
             _store_pose(address, local, relative)
         _sync()
-        _scan_poses(address, plan)
+        scan_poses(address, plan)
         if lane == 0:
             root_body = data.joint_child[js]
             origin = wp.transform_point(_load_pose(address, 0), data.body_com[root_body])
@@ -490,7 +498,7 @@ def get_state_kernel(finish: bool):
                 _store_axis(address, start - ds + k, data.joint_S_s[start + k])
             _store_motion(address, local, velocity)
         _sync()
-        _scan_motion(address, plan)
+        scan_motion(address, plan)
         for local in range(lane, 44, stride):
             body = data.joint_child[js + local]
             pose = _load_pose(address, local)
@@ -512,12 +520,14 @@ def get_state_kernel(finish: bool):
                 refresh,
             )
         _sync()
-        _collect(address, group, p, plan, cache, refresh)
+        collect(address, group, p, plan, cache, refresh)
         if lane == 0:
             _stamp_source(cache, group, q, qd)
         _release(address)
 
     state.__name__ = state.__qualname__ = "g1_kinetic_finish44" if finish else "g1_kinetic_repair44"
+    if chain_scan:
+        state.__name__ = state.__qualname__ = state.__name__ + "_chain"
     return wp.kernel(module="unique", enable_backward=False)(state)
 
 
@@ -617,26 +627,34 @@ _PREDICT = r"""
 
 
 @functools.cache
-def get_predictor_kernel():
+def get_predictor_kernel(chain_scan: bool = False):
     """Apply current external/control force and both unchanged W actions."""
+    plan_type, source = KineticPlan, _PREDICT
+    if chain_scan:
+        from . import g1_chain_scan  # noqa: PLC0415
 
-    @wp.func_native(_PREDICT)
+        plan_type = g1_chain_scan.ChainPlan
+        source = g1_chain_scan.predictor_source(source)
+
+    @wp.func_native(source)
     def native(
         group: int,
         p: sparse_factor.SparsePlan,
         d: sparse_factor.SparseData,
-        plan: KineticPlan,
+        plan: plan_type,
         cache: KineticData,
         f: ForceInput,
     ): ...
 
     def predict(
-        p: sparse_factor.SparsePlan, d: sparse_factor.SparseData, plan: KineticPlan, cache: KineticData, f: ForceInput
+        p: sparse_factor.SparsePlan, d: sparse_factor.SparseData, plan: plan_type, cache: KineticData, f: ForceInput
     ):
         group, _ = wp.tid()
         native(group, p, d, plan, cache, f)
 
     predict.__name__ = predict.__qualname__ = "g1_kinetic_predict43"
+    if chain_scan:
+        predict.__name__ = predict.__qualname__ = predict.__name__ + "_chain"
     return wp.kernel(module="unique", enable_backward=False)(predict)
 
 

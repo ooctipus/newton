@@ -5,6 +5,7 @@
 
 import hashlib
 import math
+import os
 
 import numpy as np
 import warp as wp
@@ -123,7 +124,27 @@ class G1KineticState:
             root_slot[group] = root_lookup[start]
             for dof in range(6, 43):
                 q_index[group, dof] = q_starts[start + host["dof_joint"][dof]]
-        self.plan = native.KineticPlan()
+        self.chain_scan_requested = os.environ.get("FEATHER_PGS_G1_CHAIN_SCAN", "0") == "1"
+        self.chain_scan = False
+        chain_host = None
+        if self.chain_scan_requested:
+            from . import g1_chain_scan  # noqa: PLC0415
+
+            try:
+                chain_host = g1_chain_scan.make_plan(parent)
+            except ValueError:
+                # Unsupported packing preserves the complete original owner.
+                pass
+        if chain_host is None:
+            self.plan = native.KineticPlan()
+        else:
+            self.plan = g1_chain_scan.ChainPlan()
+            self.plan.chain_meta = wp.array(chain_host["meta"].reshape(-1), dtype=int, device=device)
+            for name in ("light_offsets", "light_children", "stage_width"):
+                setattr(self.plan, name, wp.array(chain_host[name], dtype=int, device=device))
+            self.plan.chain_levels = chain_host["levels"]
+            self.plan.chain_width = int(chain_host["widths"].max())
+            self.chain_scan = True
         for name, values in (
             ("parent", parent),
             ("depth", depth),
@@ -150,9 +171,9 @@ class G1KineticState:
         self.geometric = self.data.geometric
         self.geometry_valid = self.data.geometry_valid
         self.status = self.data.status
-        self.repair_kernel = native.get_state_kernel(False)
-        self.finish_kernel = native.get_state_kernel(True)
-        self.predictor_kernel = native.get_predictor_kernel()
+        self.repair_kernel = native.get_state_kernel(False, self.chain_scan)
+        self.finish_kernel = native.get_state_kernel(True, self.chain_scan)
+        self.predictor_kernel = native.get_predictor_kernel(self.chain_scan)
         self._model_plan = {name: _fingerprint(getattr(model, name)) for name in _PLAN_FIELDS}
         self._mapping_plan = {
             "group_to_art": _fingerprint(sparse_owner.plan.group_to_art),
