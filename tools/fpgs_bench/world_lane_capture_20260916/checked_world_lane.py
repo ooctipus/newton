@@ -20,6 +20,10 @@ def snapshot(solver):
     if mode not in ("0", "1") or os.environ.get("FEATHER_PGS_FRANKA_KINETIC_STATE") != "1":
         raise RuntimeError("Require explicit world-lane mode and retained kinetic ownership")
     requested = mode == "1"
+    streaming = os.environ.get("FEATHER_PGS_WORLD_LANE_STREAMING", "0")
+    if streaming not in ("0", "1") or (streaming == "1" and not requested):
+        raise RuntimeError("Streaming requires explicit world-lane ownership")
+    streaming_requested = streaming == "1"
     owner = getattr(solver, "_franka_kinetic_state", None)
     world_lane = getattr(solver, "_world_lane_state", None)
     worlds = int(solver.world_count)
@@ -31,12 +35,19 @@ def snapshot(solver):
     if requested:
         from newton._src.solvers.feather_pgs import world_lane_state  # noqa: PLC0415
 
-        if type(owner) is not world_lane_state.WorldLaneState or owner.world_lane_state is not True:
+        state_module, owner_type = world_lane_state, world_lane_state.WorldLaneState
+        if streaming_requested:
+            from newton._src.solvers.feather_pgs import world_lane_streaming  # noqa: PLC0415
+
+            state_module, owner_type = world_lane_streaming, world_lane_streaming.StreamingWorldLaneState
+            if owner.world_lane_streaming is not True or owner.block_dim != 32:
+                raise RuntimeError("Wrong streaming owner/block contract")
+        if type(owner) is not owner_type or owner.world_lane_state is not True:
             raise RuntimeError("Wrong world-lane implementation")
         expected = {
-            "repair": world_lane_state.get_state_kernel(owner.schedule),
-            "finish_held": world_lane_state.get_state_kernel(owner.schedule, finish=True, refresh=False),
-            "finish_refresh": world_lane_state.get_state_kernel(owner.schedule, finish=True, refresh=True),
+            "repair": state_module.get_state_kernel(owner.schedule),
+            "finish_held": state_module.get_state_kernel(owner.schedule, finish=True, refresh=False),
+            "finish_refresh": state_module.get_state_kernel(owner.schedule, finish=True, refresh=True),
             "predictor": world_lane_state.get_predictor_kernel(owner.schedule),
         }
         actual = {
@@ -46,7 +57,7 @@ def snapshot(solver):
             "predictor": owner.predictor_kernel,
         }
         shapes = {"bias": (9, worlds), "com_offset": (13, worlds), "geometric": (45, worlds)}
-        plan_shape, block_dim = (32, worlds), 128
+        plan_shape, block_dim = (32, worlds), 32 if streaming_requested else 128
     else:
         if type(owner) is not retained.FrankaKineticState:
             raise RuntimeError("Baseline is not the retained p16 owner")
@@ -80,6 +91,7 @@ def snapshot(solver):
         "check_pass": True,
         "requested": requested,
         "observed": observed,
+        "streaming_requested": streaming_requested,
         "observer_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "scope": "Untimed owner/layout/status observation; not trajectory or convergence proof",
         "world_count": worlds,

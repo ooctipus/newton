@@ -2474,7 +2474,12 @@ class SolverFeatherPGS(SolverBase):
                 if os.environ.get("FEATHER_PGS_WORLD_LANE_STATE") == "1":
                     from .world_lane_state import WorldLaneState  # noqa: PLC0415
 
-                    self._world_lane_state = WorldLaneState(self)
+                    if os.environ.get("FEATHER_PGS_WORLD_LANE_STREAMING") == "1":
+                        from .world_lane_streaming import StreamingWorldLaneState  # noqa: PLC0415
+
+                        self._world_lane_state = StreamingWorldLaneState(self)
+                    else:
+                        self._world_lane_state = WorldLaneState(self)
                     self._franka_kinetic_state = self._world_lane_state
                 else:
                     self._franka_kinetic_state = FrankaKineticState(self)

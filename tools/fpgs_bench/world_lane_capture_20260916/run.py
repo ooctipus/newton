@@ -48,12 +48,14 @@ def main():
             raise RuntimeError("The world-lane observer/shell was not source-pinned")
         report = json.loads((Path(run["output_dir"]) / "capture_checks.json").read_text())
         requested = run["environment"][FLAG] == "1"
+        streaming_requested = run["environment"].get("FEATHER_PGS_WORLD_LANE_STREAMING", "0") == "1"
         for entry in report["boundaries"]:
             item = entry.get("world_lane_state", {})
             if (
                 item.get("check_pass") is not True
                 or item.get("requested") is not requested
                 or item.get("observed") is not requested
+                or item.get("streaming_requested") is not streaming_requested
                 or item.get("observer_sha256") != drivers[str(helper)]
                 or item.get("status_nonzero") != 0
             ):
