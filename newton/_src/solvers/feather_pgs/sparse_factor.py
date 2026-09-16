@@ -572,6 +572,16 @@ class SparseFactor:
 
             install(self)
         self.kinetic_state = None
+        self.body_basis_rows = False
+        if os.environ.get("FEATHER_PGS_BODY_BASIS_ROWS") == "1":
+            from .body_basis_rows import install as install_body_basis_rows  # noqa: PLC0415
+
+            install_body_basis_rows(self)
+        self.paired_gs = False
+        if os.environ.get("FEATHER_PGS_SPARSE_PAIRED_GS") == "1":
+            from .sparse_paired_gs import install as install_paired_gs  # noqa: PLC0415
+
+            install_paired_gs(self)
 
     def install_kinetic_state(self):
         """Admit the complete state producer only after solver construction."""

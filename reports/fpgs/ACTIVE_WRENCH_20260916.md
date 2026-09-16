@@ -948,3 +948,261 @@ does not supply a short-budget replacement: its reported contact-rich runs
 allow 200 outer updates with 10 or 30 inner sweeps, and its matrix-free mass
 application is for independent rigid bodies. Its timing claims are not
 evidence for this articulated 24/8-update workload. No FBF prototype is funded.
+
+## Materialized body-basis rows: one native experiment, 08:00 UTC
+
+Preserve the original solver and change only G1 sparse contact-row production.
+This is an extension of the existing Allegro body-map representation, not a
+new friction law or a rerun of the closed G1 present-port solver. Keep held W,
+current S, original materialized sparse Z, incident velocity, diagonals and
+all per-contact impulses. Do not construct a port Gram or alter eight-sweep
+GS, metric tangent roots, limit prefixes, restitution or publication.
+
+The population screen rejects an ANYmal per-body cache justification: across
+2,048 saved cases, 17,936 of 18,944 responding body instances have one contact.
+A proposed five-mask in-CTA cache covers only 47.40% of contact directions and
+no tier48 worlds. Root/common-prefix reuse is mathematically valid but adds
+an inverse and current maps; no large complete-saving case was established.
+Its within-world cycle fractions must not be called attributed GPU wall time.
+
+G1 has more reuse. Full saved RTX data contain 77,662 normal contacts and
+209,424 contact directions across 24,865 present normal-template/world pairs:
+3.123 contacts per template, not the selected sixteen cases' 7.56 per body.
+GB gives 3.144 contacts/template. The full archive lacks raw endpoints, so
+these are template counts, not a fabricated body/static census. Independently,
+the existing admitted SparsePlan proves three responsive endpoint classes.
+
+The replacement uses that proved plan bound. Extend the existing metadata
+writer with a raw-contact key in each normal row's support slot. A 128-thread
+world CTA consumes all current normal keys before replacing them with original
+support templates. Shared current body maps contract the existing held W once
+per present endpoint class. Four lanes per contact produce adjacent kinetic
+coefficients, with original padded tails zeroed. Current incident motion must
+use the predictor, not the public pre-predictor body velocity. Two-endpoint
+contacts use the original pair-support union and signs. Uniform per-world
+fallback retains complete direct reconstruction; no capacity truncation or
+additional global matrix/dispatch is authorized.
+
+This targets repeated warp-uniform geometry, W loads and contact-local
+shuffles as well as response arithmetic. Four-lane grouping is fixed before
+measurement to limit strided output stores; it is not a tile-size grid. Shared
+body maps die at the end of the producer, not after GS. The earlier measured
+present-port loss included a new Gram and solver; the earlier packet loss
+retained a large shared row cache throughout GS. Neither is the same boundary.
+
+Original contact production costs 1.241589ms RTX in the retained source-bound
+node attribution. This leaves little margin: a 0.7ms complete saving would
+require replacement plus added metadata cost below 0.541589ms. Arithmetic
+alone does not establish that. One native falsification is funded to test
+the source-visible execution advantage; the one-millisecond whole-physics
+acceptance milestone is unchanged. No gain or promotion is implied by funding.
+
+Default-off `FEATHER_PGS_BODY_BASIS_ROWS=1`; unsupported constructors retain
+the original owner. First missing-module test failed before implementation.
+Reuse existing current/held raw-contact fixtures and independent physical
+rows, then root-owned paired native checks and the existing full16K 200/40/40
+whole-step driver. First source/AOT checkpoint 08:40 UTC; window ends 09:44.
+Freeze sources before GPU work. One measured loss receives cause attribution,
+not another layout grid. Isaac Lab and all numerical/capacity settings remain
+unchanged.
+
+### Body-basis producer: paired loss and closure, 08:35 UTC
+
+Frozen runtime `body_basis_rows.py` SHA256
+`2eed3b6241200ae357911eb9b13e45a6926a2bd5eab2d5e611ce16829b9afaa0`
+passes three CPU controls and both native selectors on each GPU. The native
+checks include held factors, changed contact positions, forced complete
+fallback, same-articulation dynamic pairs, graph empty/regrow and sixteen
+saved current/held cases. The measured test SHA256 is
+`63e53003413fb76bd97ffe9155b50240975334b207a760f25ffbd750b96e1efc`;
+its later docstring clarification changes no test mathematics.
+
+Qualification scope is important: fixture coefficients/diagonal/incident
+are independently checked. The saved sixteen-case recurrence oracle consumes
+candidate-produced rows; independent cone and momentum gates pass, while
+natural/normal/complementarity/dissipation defects are reported, not bounded
+against an independently rebuilt original solve. This is not a claim of
+original finite-eight convergence parity. No promotion follows from these
+checks. A same-input original/independent physical comparator would still be
+required for a successful candidate; the timing loss does not fund that
+additional qualification campaign.
+
+Offline compilation for both SM120 and SM103 reports 64 registers/thread,
+4,116 bytes shared, zero stack and zero spills. Native resources agree.
+Original contact production used 56 registers, 128 shared bytes and a
+32-thread block; the replacement uses 128 threads. No hardware-counter or
+achieved-occupancy claim follows from these compiler/launch observations.
+
+| One complete 16K discovery pair | RTX PRO6000 | GB300 |
+| --- | ---: | ---: |
+| Accepted baseline physics | 15.626304 ms | 20.439429 ms |
+| Body-basis physics | 16.448546 ms | 21.517904 ms |
+| Baseline / candidate | 0.950011x | 0.949880x |
+| Baseline environment wall | 29.757961 ms | 34.777078 ms |
+| Candidate environment wall | 30.623391 ms | 35.502077 ms |
+
+All four children, eight capacity boundaries and final source/idle guards
+pass. Root session95636 exits0. Baseline is accepted `ca0d427a`, not the
+previous losing port implementation. All collision flags, 200 warmup,
+40 wall/40 profile steps, eight solver sweeps, substeps and capacities remain
+fixed. The original manifest deliberately records physical/performance
+acceptance false. Artifact
+`/tmp/fpgs-g1-body-basis-whole-paired16k-20260916-01/manifest.json`, SHA256
+`fc3ad2d7b3d61c15fdb9fe1f18e966dc74618ea3fac06efddc5df460f1943b06`.
+
+One three-step node diagnosis identifies the complete changed family:
+
+| Exclusive GPU owner, ms/env step | RTX old -> new | GB old -> new |
+| --- | ---: | ---: |
+| Contact producer | 1.253388 -> 2.085837 | 1.324139 -> 2.401643 |
+| Contact metadata | 0.263851 -> 0.285974 | 0.192437 -> 0.202219 |
+| Complete changed family | 1.517239 -> 2.371811 | 1.517589 -> 2.604885 |
+| Retained GS | 3.907990 -> 4.000164 | 4.344299 -> 4.395978 |
+| Retained dynamics | 2.724823 -> 2.723992 | 2.409245 -> 2.407879 |
+| Retained collision | 3.777175 -> 3.733091 | 8.272319 -> 8.277855 |
+
+These are preserved process-correlated interval/exclusive measurements, not
+component sums presented as whole-step savings. Every old metadata/producer
+call disappears in the candidate, and each new owner executes eight times.
+The loss belongs to the replacement producer, not a duplicated old pipeline.
+All four strict audits retain twelve physics and three separate auxiliary
+roots, all memory nodes and actual resource records. No source/capacity guard
+fails. The old Lab node analyzer rejects auxiliary graphs as expected; its
+two parent failures are preserved, not relabeled as successful throughput
+runs. Candidate nodes are in a directory labeled `round_01_baseline` because
+the unchanged failing parent was invoked separately with the candidate source
+and flag as its first arm; actual source/owner checks identify it explicitly.
+
+Strict reports: `/tmp/fpgs-g1-body-basis-strict-1ZgOqX94/`.
+`baseline_gpu0.json` SHA256
+`0d05d7639c34120826e5ffdc0e7bf877f4084296bc7ea1b16a856ee3aeaf9ecb`;
+`baseline_gpu1.json`
+`6a0518c1ff4ddbf9a334ada33e9df2784acb85059212170c7d30f23be70f67c3`;
+`candidate_gpu0.json`
+`60e85aa4f6fefbfed8abb49429caedf32884dc92c113adaa800816971ccda3d6`;
+`candidate_gpu1.json`
+`6fa50c46534e56fd3aafb7113259bb924e519d2922ec51c87942b8a6eba6321d`.
+
+The source work model explains why theoretical reuse alone was insufficient.
+For a static contact with twelve support coefficients, original whitening
+uses 234 products/contact; a six-component body map costs 468/body plus
+216/contact for contraction. That portion alone amortizes only above 26
+contacts/body. Removing current-J construction gives a more favorable but
+still modest complete arithmetic estimate, before key discovery, shared
+traffic and synchronization. Full captured data average 5.2386 normals per
+nonempty world; most of a 128-thread CTA can be inactive during four-lane
+contact emission. Those are source/population explanations, not an isolated
+measurement of stalls. This implementation is closed, default off, without
+a tile-size or admission-threshold grid. No accepted physics gain results.
+
+## Fixed paired-world GS ownership: bounded decision, 08:41 UTC
+
+Fund one execution-ownership experiment, not another numerical law or a
+mapping grid. The retained original G1 metric GS costs 3.907990ms RTX in the
+new strict attribution. Its twelve-to-eighteen support coefficients and
+lane-zero scalar roots leave substantial warp lanes idle. Two independent
+sixteen-lane worlds in a single warp can execute those serial roots together
+and shorten reductions. This is a plausible utilization opportunity, not
+proof of a two-times kernel gain. It changes no required arithmetic, contact
+law, order, early-exit rule, factor lifetime or eight-sweep allowance.
+
+Keep the accepted original contact producer; body-basis rows are disabled.
+Retain all eighteen coefficients: lanes zero and one additionally own the
+16/17 tails in residuals, self-cross terms, finite checks, velocity updates
+and scalar sibling fallback. Decode all 43 coordinates. Shared velocity,
+impulse, tangent-cross and readiness storage must have disjoint world banks;
+bitmaps still use row/32, not row/16. Every shuffle, vote and synchronization
+uses the correct half-warp mask and shuffle width. Odd final packs return
+before indexing their nonexistent group. No block-wide barrier or new global
+scratch is permitted. Group/articulation/world remapping remains explicit.
+
+Default off: `FEATHER_PGS_SPARSE_PAIRED_GS=1`. The missing-module regression
+fails before implementation. Reuse existing native law and physical fixtures,
+adding a five-world original-versus-paired comparison with permuted mappings,
+both halves active, empty/regrown rows, support tails and captured replay.
+Unlike the body-basis saved-row oracle, this comparator uses the unchanged
+original solver on identical input buffers. Only reduction ordering may differ.
+
+First source/native checkpoint 09:05 UTC; session ends 09:44. A meaningful
+complete-physics target remains approximately one millisecond RTX, including
+the original producer, all tails and publication. Use the existing paired16K
+200/40/40 driver immediately after bounded native checks. A loss receives one
+cause diagnosis; do not try eight/four-lane variants or change the root solver.
+No Isaac Lab, capacities, parent pointer or accepted-default change is funded.
+
+### Paired-world original mapping: measured regression, 09:00 UTC
+
+Runtime SHA256 `ca0e74a8858c8fa9ce13b3ade2010319b24abd3df2f340d0f5d4a383a58d5ae0`
+and test SHA256 `9cd9e449b4128dc6e4d61071c427d156c7561232da46a922a742a5a297b22f5e`
+pass both native selectors on both cards. These compare the original solver
+on identical saved rows, plus five permuted worlds with support tails,
+different half-warp exits, scalar fallback, graph withdrawal/regrowth and an
+odd final world. CPU controls and independent source/AOT review also pass.
+
+| Complete 16K discovery pair | RTX PRO6000 | GB300 |
+| --- | ---: | ---: |
+| Accepted baseline physics | 15.619313 ms | 20.441393 ms |
+| Paired-world physics | 17.163453 ms | 20.977020 ms |
+| Baseline / candidate | 0.910033x | 0.974466x |
+| Baseline environment wall | 30.138453 ms | 35.299111 ms |
+| Candidate environment wall | 31.946619 ms | 34.174200 ms |
+
+All source/capacity/idle checks pass; root63319 exits0. The unchanged checked
+driver uses accepted `ca0d427a`, original contact production, the same kinetic
+and collision paths, 200/40/40 steps and unchanged numerical budgets.
+Manifest `/tmp/fpgs-g1-paired-gs-whole-paired16k-20260916-01/manifest.json`
+SHA256 `f1f52e60a81f81b663caadcb7899850037fd6a2808efd43e05338e569d671d73`.
+
+One strict three-step node attribution locates the regression in GS:
+
+| Exclusive GPU owner, ms/env step | RTX old -> new | GB old -> new |
+| --- | ---: | ---: |
+| GS | 3.933331 -> 5.387362 | 4.350613 -> 4.853354 |
+| Complete rows | 2.503861 -> 2.509356 | 2.551466 -> 2.560970 |
+| Dynamics | 2.722474 -> 2.727532 | 2.410344 -> 2.408157 |
+| Collision | 3.710943 -> 3.723117 | 8.375347 -> 8.413361 |
+| Publication | 2.326730 -> 2.335862 | 2.495914 -> 2.498165 |
+
+The only kernel-family substitution is original metric GS to paired GS.
+All source/file/capacity guards pass, with twelve physics and three auxiliary
+roots preserved. Sampled trajectories differ slightly; this is not a
+byte-identical workload claim. Parents94434/52238 retain their expected
+exit1 from the old Lab auxiliary-graph analyzer. Strict reports are in
+`/tmp/fpgs-g1-paired-gs-strict-HXr2FSz7/`: baseline GPU0/GPU1 SHA256
+`974a31415ac437029e03b8858074621b7c0175bc29a95b091ce6c6ef20b198a0` /
+`bbca5acaf967a43753d2683fe3cca7a547e11196d4d917f8f5a1c9f081f910a2`;
+candidate GPU0/GPU1
+`52196ad003dad6318789c3598dca3c5229ad706d33445a8a560f6640a4715c60` /
+`61fe255aaea165d36a4846043aae56bd122fd5c767bf9923ad34dfb4059c9124`.
+
+Actual resource records show 72 -> 85 registers/thread, 1116 -> 2104 shared
+bytes and 16384 -> 8192 blocks, each with 32 threads. Per-world registers and
+shared memory actually decrease; these counts alone do not prove an
+occupancy loss. Same-compiler source inspection identifies added bookkeeping
+for divergent half masks: MATCH.ANY/VOTEU.ANY/REDUX.OR sites 0 -> 13/13/16 and
+BSSY/BSYNC sites 24 -> 59. Original/current native source matches exactly.
+Old full16K populations also show unequal adjacent row counts in over96% of
+pairs, with about25% logical row padding. Neither static instruction counts
+nor that historical population is a hardware-counter timing attribution.
+
+### One cause-directed correction: literal collective masks, 09:03 UTC
+
+Direct PTX cannot remove the identified machinery: the current PTX already
+uses the native instructions and the extra work appears in ptxas lowering.
+An off-tree compile of per-collective literal-low/high mask branches removes
+the MATCH/VOTEU/REDUX sites but increases static SHFL/WARPSYNC sites twofold,
+BSSY/BSYNC59 ->106, registers85 ->89 and static instructions2520 ->3256 on
+RTX. No physics, width, root, row order or budget changes. All shared-memory
+synchronization remains. NVIDIA's documented participant-mask requirements
+must still hold separately for each half; a full-warp mask inside divergent
+world loops would not be a safe shortcut.
+
+Root funds one native corrective measurement despite the unfavorable static
+counts: static duplication alone does not establish dynamic cost relative
+to the old runtime mask partitioning. This is the one targeted correction
+for the measured mismatch, not an eight/four-lane or threshold search. Native
+same-input parity precedes one unchanged whole pair; a regression closes the
+mapping, and a meaningful gain requires balanced repetition. No default or
+parent-pointer promotion is implied. Offline evidence:
+`/tmp/fpgs-g1-paired-literal-offline-Ewx2goKW/offline02/report.json`, SHA256
+`4275098a3be171c95f71f6bf8fadb1f555ba3bde895ae3bf2e9f2330336453c9`.
