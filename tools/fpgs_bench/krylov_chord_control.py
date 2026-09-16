@@ -448,6 +448,7 @@ def solve(J, L, diagonal, rhs, types, parents, mu, vhat, *, iterations=24, incom
         work["control_norm_reductions"] += 1
         work["control_square_roots"] += 1
         accepted = False
+        finite_newton_trials = True
         for trial in range(8):
             alpha = 2.0**-trial
             next_x, next_residual = x + alpha * direction, residual + alpha * response
@@ -458,10 +459,38 @@ def solve(J, L, diagonal, rhs, types, parents, mu, vhat, *, iterations=24, incom
             work["line_merit_products"] += count
             work["line_merit_reductions"] += 1
             work["line_merit_square_roots"] += 1
+            if not np.isfinite(merit):
+                finite_newton_trials = False
+                work["nonfinite_newton_trials"] += 1
             if np.isfinite(merit) and merit < (1 - 1e-4 * alpha) * old_merit:
                 accepted = True
                 break
             work["rejected_trials"] += 1
+        trial_count = trial + 1
+        safeguarded = False
+        if not accepted and finite_newton_trials:
+            # The existing map endpoint is feasible: one response serves its chord.
+            direction = pg - x
+            response = z @ (z.T @ direction)
+            work["safeguard_directions"] += 1
+            work["safeguard_operator_products"] += 2 * z.size
+            for safeguard_trial in range(8):
+                alpha = 2.0**-safeguard_trial
+                next_x, next_residual = x + alpha * direction, residual + alpha * response
+                next_f, next_pg, next_mode, next_active = _map(next_x, next_residual, context)
+                merit = float(np.linalg.norm(next_f))
+                work["safeguard_trials"] += 1
+                work["line_trials"] += 1
+                work["line_affine_products"] += 2 * count
+                work["line_merit_products"] += count
+                work["line_merit_reductions"] += 1
+                work["line_merit_square_roots"] += 1
+                trial_count += 1
+                if np.isfinite(merit) and merit < (1 - 1e-4 * alpha) * old_merit:
+                    accepted = safeguarded = True
+                    work["safeguard_accepts"] += 1
+                    break
+                work["rejected_trials"] += 1
         if not accepted:
             reason = "line_search"
             break
@@ -473,7 +502,8 @@ def solve(J, L, diagonal, rhs, types, parents, mu, vhat, *, iterations=24, incom
             {
                 "sweep": work["candidate_sweeps"],
                 "alpha": alpha,
-                "trial_count": trial + 1,
+                "trial_count": trial_count,
+                "safeguarded": safeguarded,
                 "old_merit": old_merit,
                 "accepted_merit": merit,
                 "physical": score,

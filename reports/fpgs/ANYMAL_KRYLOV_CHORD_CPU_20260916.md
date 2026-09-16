@@ -143,3 +143,74 @@ and source dependencies, and compressed files preserve full traces.
 - Prior safeguarded direction source:
   `/tmp/fpgs-anymal-semismooth-cpu-ioOhLY/safeguard_projected_line.py`,
   `f2b4d5052dbbe9f933435f287ca8198574a17400608c2203b4a3e2d24ab7eeab`.
+
+## One cause-directed correction, separately frozen
+
+Initial helper/tests/report are preserved by commit
+`31db487eae7bb093cd25733db07bc18ff98edcfe`. Before altered trajectories,
+root approved `/tmp/fpgs-krylov-chord-cause-HseE5K9Z/CORRECTION.md`, SHA
+`9cb5a93ab119d2987bfa6b0280037d26b208a4062a3087c095e45de3aef395f8`.
+Only exhaustion of eight finite Newton-chord trials enables an eight-trial
+`pg-x` safeguard with one additional physical response. All forcing/rank/
+nonfinite/capacity guard routes and the 24-correction allowance are unchanged.
+There is no third policy or extra reference solve.
+
+Corrected helper SHA
+`05d97ac7c04e13b835235ceaf1cf2e9d2c97ff2d7191d58852f85f9aff5b269b`;
+tests `74446257733338d7a423aa73e04c5c615a450345b691483a91086c48b92cff0c`.
+New regression-first controls failed against the initial helper, then all 13
+CPU controls passed. They cover accepted retry, both direction families
+rejected with unchanged remaining allowance, zero budget, and exclusion of
+nonfinite Newton trials. Independent review cleared the actual current-state
+endpoint lifetime, accounting and guard routing. First eight are unchanged.
+
+| Complete 2,048-case category | Initial | Corrected |
+| --- | ---: | ---: |
+| Hard failures | 0 | 0 |
+| Original pointwise passes / tradeoffs | 2017 / 31 | 2029 / 19 |
+| Closer H-reference / genuine H regressions | 2032 / 12 | 2041 / 5 |
+| Fresh physical stops | 1982 | 2017 |
+| Candidate / original continuation corrections | 7345 / 1454 | 7625 / 607 |
+| Line / forcing fallbacks | 58 / 9 | 17 / 13 |
+| Counted products, millions | 34.404153 | 34.318395 |
+| Counted action-pair equivalents | 15.97177 | 15.93196 |
+
+Corrected scaled H distance median/p99/max is
+`.000002312 / .005846682 / .026827686`, versus original
+`.006389918 / .031995761 / .055738454`. Natural residual median/p99/max is
+`.000000758 / .001335556 / .016100956`. MDP maximum improves from original
+`.079436386` to `.045929838`; normal maximum worsens from `.034372018` to
+`.037898135`. No universal component improvement or automatic original-gate
+pass is claimed.
+
+The remaining 19 component tradeoffs are nine line fallbacks, nine forcing
+fallbacks, and one full-24 candidate without fallback. Worst scaled H
+regression is GB current/tier48/world168, `.018685122` to `.026827686`, after
+11 candidate and 13 original corrections. RTX held/tier48/world142 changes
+`.021812959` to `.024695926` after four candidate and 20 original corrections
+on a newly encountered forcing guard. The other three H excesses are
+`4.51e-5` to `5.11e-5`, at world173. RTX current/tier48/world21 has biased
+normal `.004359719` to `.037898135` after a forcing fallback. RTX held/tier32/
+world224 uses all 24 candidate corrections: complementarity `.010381440` to
+`.024362635`, natural residual `.003814248` to `.005777136`. These remain
+explicit finite-budget limitations, not reasons to silently relax a gate.
+
+Actual corrected work includes 137 safeguard directions, 398 retry trials,
+120 accepted retries and 169,956 additional response products; 10,961 Krylov
+steps with squared total 23,919; 2,233 Gram builds/5,422 reuses; 7,655 true
+linear checks; 9,405 total trial maps with 1,780 rejects; 11,721 full physical
+scores and 2,048 fresh reconstructions. Recorded scalar services are 3,079,056
+divisions, 427,343 square roots and 98,862 dot/norm reductions. Known omitted
+retraction/mode products add at least 292,802: the corrected product lower
+bound is 34,611,197, approximately 16.0679 action equivalents, plus the
+previously disclosed unpriced scalar/control and retained producer work.
+
+Corrected adapter `/tmp/fpgs-krylov-chord-safeguard-HV6mVO8t/qualify.py` has SHA
+`bbc1d1bf9b7311d09694dce08005901371a93fb4f2b7a321a302d78e686e1009`.
+Its `all2048/summary.json` is
+`c23294122313374c0873ddcce553af4e04a2a28692267a27dd77b4d396053ce5`;
+complete trace is
+`815d93d4e78865c9c23bcd8f463a47898d29a21dc89c5f9601836673208b837a`.
+All original input/reference and source guards passed. The approximately
+2.4-fold product retirement is a reason to consider an explicitly bounded
+native cost screen, not a measured speedup or numerical promotion.

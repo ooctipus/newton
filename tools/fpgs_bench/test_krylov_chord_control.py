@@ -156,6 +156,85 @@ class TestKrylovChordControl(unittest.TestCase):
         np.testing.assert_allclose(result.velocity, z.T @ result.impulses, atol=1e-12)
         self.assertTrue(result.work["physical_stop"])
 
+    def test_exhausted_newton_chord_uses_existing_projected_endpoint(self):
+        """Retry the existing feasible endpoint without donating a correction."""
+        args = problem(np.eye(2), [-1, 1], cfm=0)
+
+        def ascent(*args):
+            """Inject a finite chord that cannot pass the current merit test."""
+            return np.array([0.0, 1.0]), {"krylov_steps": 0}
+
+        with patch.object(control, "_direction", side_effect=ascent):
+            result = control.solve(*args, iterations=1)
+            zero = control.solve(*args, iterations=0)
+        self.assertFalse(result.work["fallback"])
+        self.assertEqual(result.work["candidate_sweeps"], 1)
+        self.assertEqual(result.work["safeguard_accepts"], 1)
+        self.assertEqual(result.work["safeguard_trials"], 1)
+        self.assertEqual(result.work["line_trials"], 9)
+        self.assertEqual(result.work["safeguard_operator_products"], 8)
+        np.testing.assert_allclose(result.impulses, [1, 0], atol=3e-5)
+        self.assertTrue(result.work["physical_stop"])
+        self.assertEqual(zero.work.get("safeguard_directions", 0), 0)
+        self.assertEqual(zero.work["sweeps"], 0)
+
+    def test_both_chords_failed_preserve_current_remaining_budget(self):
+        """Reject both trial families without changing the committed handoff."""
+        args = problem(np.eye(2), [-1, 1], cfm=0)
+        original_map = control._map
+        calls = 0
+
+        def direction(x, residual, f, pg, modes, active, initial_norm, context):
+            """Commit one partial descent, then inject an ascent direction."""
+            nonlocal calls
+            calls += 1
+            return (0.25 * (pg - x) if calls == 1 else np.array([0.0, 1.0])), {"krylov_steps": 0}
+
+        def refuse_retry(x, residual, context):
+            """Force the second trial family to fail, without changing its state."""
+            f, pg, modes, active = original_map(x, residual, context)
+            if x[0] > 0.25:
+                f = np.ones_like(f) * 2
+            return f, pg, modes, active
+
+        with (
+            patch.object(control, "_direction", side_effect=direction),
+            patch.object(control, "_map", side_effect=refuse_retry),
+        ):
+            result = control.solve(*args, iterations=4)
+        self.assertEqual(result.work["candidate_sweeps"], 1)
+        self.assertEqual(result.work["fallback_allowance"], 3)
+        self.assertEqual(result.work["safeguard_trials"], 8)
+        self.assertEqual(result.work["line_trials"], 17)
+        self.assertEqual(result.work["fallback_reason"], "line_search")
+        seed = np.asarray(result.work["fallback_entry_impulse"])
+        np.testing.assert_allclose(seed, [0.25, 0], atol=1e-6)
+        expected = parallel_continue(args[0], args[2], args[3], *args[4:7], seed, iterations=3)
+        np.testing.assert_array_equal(result.impulses, expected.impulses)
+        self.assertLessEqual(result.work["sweeps"], 4)
+
+    def test_nonfinite_newton_trial_never_enters_projected_retry(self):
+        """Keep nonfinite trial failures on the original guarded continuation."""
+        args = problem(np.eye(2), [-1, 1])
+        original_map = control._map
+
+        def nonfinite(x, residual, context):
+            """Inject a nonfinite trial, not a different numerical policy."""
+            f, pg, modes, active = original_map(x, residual, context)
+            if x[1] > 0:
+                f[:] = np.nan
+            return f, pg, modes, active
+
+        with (
+            patch.object(control, "_direction", return_value=(np.array([0.0, 1.0]), {})),
+            patch.object(control, "_map", side_effect=nonfinite),
+        ):
+            result = control.solve(*args, iterations=4)
+        self.assertEqual(result.work["nonfinite_newton_trials"], 8)
+        self.assertEqual(result.work.get("safeguard_directions", 0), 0)
+        self.assertEqual(result.work["candidate_sweeps"], 0)
+        self.assertEqual(result.work["fallback_allowance"], 4)
+
 
 if __name__ == "__main__":
     unittest.main()
