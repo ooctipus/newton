@@ -273,6 +273,17 @@ def finish_components(
         body_qd_new[body] = wp.spatial_vector()
         v_out[dof] = 0.0
         return
+    if was_asleep:
+        # A solved nonzero response revokes the stationary lease. Consume it
+        # through ordinary integration/publication even if an earlier wake
+        # check did not anticipate the response; stale quiet history must not
+        # immediately re-grant sleep on this exceptional boundary.
+        data.sleeping[component] = 0
+        data.counters[component] = 0
+        data.can_sleep[component] = 0
+        data.body_awake[body] = 1
+        data.joint_awake[joint] = 1
+        was_asleep = False
     p = data.parameters[component]
     position = q[coordinate]
     velocity = qd[dof]

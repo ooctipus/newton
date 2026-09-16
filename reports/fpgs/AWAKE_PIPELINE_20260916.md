@@ -157,3 +157,36 @@ not be captured as "timestep changed" for every replay. A changed source
 allocation repairs public geometry without redoing sleeping force/response.
 The cold-graph regression warms only a disposable solver, then captures a
 fresh unstepped owner and verifies that replay can acquire its sleep lease.
+
+## Corrected timing: close without promotion, 00:50 UTC
+
+Runtime `59ac7b27` completes all four children and final source/idle guards
+with unchanged capacities and physical budgets. Artifact:
+`/tmp/fpgs-awake-pipeline-paired4k-20260916-02/manifest.json`.
+
+| GPU | Retained physics ms | Corrected owner ms | Retained/owner |
+| --- | ---: | ---: | ---: |
+| RTX | 6.911577 | 6.730380 | 1.026922x |
+| GB300 | 6.219330 | 6.471975 | 0.960963x |
+
+Environment wall ratios are 0.988248x RTX and 0.970990x GB. This discovery
+does not meet the structural milestone and is not an accepted speedup. Close
+the contact-free scalar owner without a mapping grid or repeat campaign.
+Its default-off implementation remains a development artifact, not a new
+production setting. No fresh MJWarp ratio follows.
+
+Next scope is the complete loaded-contact island lifecycle, not polishing
+scalar arithmetic. Existing historical snapshots suggest substantial resting
+contact populations, but separate motion/contact marginals do not prove
+sleepable islands. Current connectivity and sustained input/geometry checks
+must establish exposure before funding cached contact/force ownership.
+
+A final defensive review found that an unexpectedly nonzero solved velocity
+would leave the sleep fast path but still skip integration/publication because
+the local `was_asleep` flag remained true. A direct-finalizer regression first
+fails on both GPUs (output velocity 0 instead of 0.01). Revoke the lease and
+consume that solved response normally, without immediately re-granting sleep.
+This tests a defensive contract, not a claim that the ordinary admitted
+contact-free trajectory reaches that case. The full nine-group owner suite
+passes on both GPUs after the fix. This final safety edit is not retimed or
+claimed as a performance improvement.

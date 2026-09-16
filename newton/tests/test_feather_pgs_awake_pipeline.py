@@ -264,6 +264,57 @@ class TestFeatherPGSAwakePipeline(unittest.TestCase):
                 self.assertEqual(int(controller.body_awake.numpy()[bodies[0]]), 0)
                 self.assertEqual(int(controller.body_awake.numpy()[bodies[2]]), 1)
 
+    def test_native_sleeping_finish_consumes_nonzero_solved_velocity(self):
+        """Defensively consume solved motion even when the component began asleep.
+
+        This injects the finalizer's solved response; it does not claim that the
+        unchanged contact-free fixture ordinarily produces that response.
+        """
+        devices = wp.get_cuda_devices()
+        if not devices:
+            self.skipTest("Actual sleeping finalizer and publication require CUDA")
+        for device in devices:
+            with self.subTest(device=str(device)), mock.patch.object(solver_module, "_AWAKE_PIPELINE", True):
+                model, cases, joints, bodies, dofs, _targets = _physical_pair(self, device, leaves=37)
+                _settle(self, model, cases, bodies, joints)
+                case = cases[1]
+                solver = case.solver
+                owner = solver._awake_pipeline
+                self.assertIsNotNone(owner)
+                body, joint, dof = int(bodies[0]), int(joints[0]), int(dofs[0])
+                component = int(solver._sleeping.plan.body_component_host[body])
+                coordinate = int(model.joint_q_start.numpy()[joint])
+                self.assertEqual(int(owner.data.sleeping.numpy()[component]), 1)
+                self.assertEqual(float(case.state.joint_qd.numpy()[dof]), 0.0)
+                position = float(case.state.joint_q.numpy()[coordinate])
+                solved = solver.v_out.numpy()
+                solved[dof] = 0.01
+                solver.v_out.assign(solved)
+                output = model.state()  # The exceptional path must fill a fresh public allocation.
+                owner.finish(case.state, solver._last_debug_state_aug, output, sleeping_tests.DT)
+                np.testing.assert_allclose(output.joint_qd.numpy()[dof], solved[dof], rtol=3e-5, atol=5e-6)
+                np.testing.assert_allclose(
+                    output.joint_q.numpy()[coordinate],
+                    position + sleeping_tests.DT * float(solved[dof]),
+                    rtol=3e-5,
+                    atol=5e-6,
+                )
+                self.assertEqual(int(owner.data.sleeping.numpy()[component]), 0)
+                self.assertEqual(int(owner.data.body_awake.numpy()[body]), 1)
+                self.assertEqual(int(owner.data.joint_awake.numpy()[joint]), 1)
+                reference = model.state()
+                newton.eval_fk(model, output.joint_q, output.joint_qd, reference)
+                # Standalone finish owns scalar components, not the fallback
+                # joints; compare only this component's public pose and velocity.
+                for field in ("body_q", "body_qd"):
+                    np.testing.assert_allclose(
+                        getattr(output, field).numpy()[body],
+                        getattr(reference, field).numpy()[body],
+                        rtol=3e-6,
+                        atol=3e-6,
+                        err_msg="awakened public " + field,
+                    )
+
     def test_actual_contacts_and_existing_sleep_wake_contract(self):
         """Preserve loaded forces, real collision wake and tiny-dt drive behavior."""
         with mock.patch.object(solver_module, "_AWAKE_PIPELINE", True):
