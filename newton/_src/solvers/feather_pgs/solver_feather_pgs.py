@@ -5785,6 +5785,10 @@ class SolverFeatherPGS(SolverBase):
                     from .allegro_kinetic_rows import get_parallel_factory  # noqa: PLC0415
 
                     parallel_factory = get_parallel_factory(parallel_factory)
+                elif os.environ.get("FEATHER_PGS_COUPLED_CONTACT") == "1":
+                    from .coupled_contact import get_parallel_factory  # noqa: PLC0415
+
+                    parallel_factory = get_parallel_factory(parallel_factory)
                 tiers = [(min(32, parallel_rows), 0)]
                 if parallel_rows > 32:
                     tiers.append((min(64, parallel_rows), 32))

@@ -296,3 +296,203 @@ have direct solutions. Existing diagonal regularization belongs only to
 the update, never to the physical residual. Unsafe local blocks retain the
 original metric transaction. Fixed-eight physical quality, root work and
 required global passes decide whether any native implementation is warranted.
+
+## Coupled-block checkpoint, 04:43 UTC
+
+This is not new contact mathematics. The September 11 investigation already
+implemented the same full Coulomb Schur equation and tested 4,069 Ant/Humanoid
+states. Its preserved native helper is
+`newton-fpgs-tree-operator-20260911/newton/_src/solvers/feather_pgs/contact_block.py`
+(SHA256 `313534d6b603f287b4ea87240ea54b8a2fe02fedb53bf8d8ed4366685615eff5`).
+That helper was not integrated or timed in a production owner; its Humanoid
+tails were mixed. The present question is current-task convergence with the
+same physical stopping rule, and replacement of ANYmal's complete all-pairs
+majorizer plus parallel iteration boundary. It is not a second claim of
+inventing the local root solver.
+
+Frozen CPU control SHA256
+`0fc44df283d5284763f7fd4889b4b8cc475b197bb6314714cf1952bd0a3d5295`:
+six focused tests pass. The root-owned independent-contact and incoming-impulse
+controls fail with the old one-pass metric transaction and pass with the
+coupled transaction. The incoming-impulse test also checks uncancelled momentum;
+it does not establish an incoming-state bug in the old solver.
+
+Selected G1 fixed-eight physical comparison: **15/16 pass**. RTX world 7410
+with the held factor fails natural residual (1.458e-4 versus 9.563e-5),
+complementarity (9.078e-4 versus 2.829e-4), and dissipation
+(5.799e-4 versus 1.330e-4). No local fallback occurs. A trace isolates the cause:
+the final row-33 sticking block has immediate physical residual about 1e-9,
+but subsequent contacts change it to (0.001560, -0.002011, 0.000394).
+Thus accurate local roots do not cure global contact coupling. This blocks
+G1 promotion; neither thresholds nor routing were retuned.
+
+Original exact-stationary stopping totals 78 sweeps over these selected cases.
+Applying the identical declared physical stop to the old metric method gives
+58; the coupled method needs 36. The fair same-stop row-dot counts are
+1,502 to 943 for solving and 2,516 to 1,599 for stopping, plus 2,193 coupled
+setup products and 403 candidate root probes. Without the physical stop,
+actual sweeps are 78 versus 76. These are CPU work counts, not GPU timing.
+The legacy CPU metric helper's 80 bisection probes are explicitly excluded
+from native savings claims: today's accepted native metric root is bounded
+Newton, not that high-precision reference implementation.
+
+Final sixteen-case log:
+`/tmp/fpgs-coulomb-block-final16-20260916.log`, SHA256
+`ae28acd5440d62595d0fbfcd25bd9b7f8ac1b628b94a2536fa15c5645cab1c69`.
+ANYmal qualification now compares coupled24 and metric24, both with the same
+physical stop, separately against the actual saved native24 output. This
+population informed the self-coupling diagnosis, so it is cross-model
+qualification, not a previously unseen population.
+
+## ANYmal full cohort and bounded hybrid card, 05:01 UTC
+
+The frozen coupled24 control passes 2,034/2,048 cases against saved native24;
+same-stop metric24 passes 1,819. Coupled versus metric24 passes 2,030.
+All fourteen native-reference failures exhaust 24 passes without satisfying
+the physical stop. None is an erroneous early-stop admission or a finite,
+cone, momentum or negative-normal-impulse failure. Some physical failures
+are substantial, not roundoff: GB current world 504 dissipation rises from
+0.026855 to 0.179779. No tolerance or route was changed to admit these cases.
+
+Coupled sweeps have median 2, p90 5, p99 24, total 6,332; the same-stop metric
+total is 42,143 with median 23. Coupled root probes total 132,109, maximum
+805 per case; eight metric fallbacks occur in three cases. The 590.760-second
+CPU run exits zero with input/source guards passing. Result:
+`/tmp/fpgs-coupled24-qualification-Pab7PnYA/full_qualification.json`, SHA256
+`876f6788cbea270158283a11d9a90733ce019c4e0a9a385ce5d7fdb362abdf14`.
+
+Alternating full forward/reverse passes does not repair the G1 issue:
+14/16 pass, both RTX 7410 epochs fail, and same-stop sweeps increase from
+36 to 38. It moves the directional tail into negative normal residual.
+This deterministic policy is closed without further order tuning.
+
+**Revised native funding decision:** the median-two full-cohort result is a
+credible large-cost hypothesis, despite unqualified tails. Build the smallest
+default-off complete owner while checking a bounded hybrid independently.
+Spend at most six of the original 24 passes on coupled blocks; if they do not
+physically converge, continue the original scaled Jacobi/Nesterov method with
+exactly the unspent allowance and current impulses. The usual remainder is
+18, but an earlier exact-stationary exit must retain all actually unspent
+iterations. No cold restart, extra passes, task-name or case-ID dispatch.
+
+Keep row-parallel current geometry, restitution and held-factor whitening.
+Remove the all-pairs majorizer and original iteration loop entirely for
+physically stopped worlds; construct them only on continuation. Charge local
+self blocks, roots, end-pass physical scans, synchronization, continuation,
+and unchanged decode/publication. Preserve original ABI, row capacities,
+phase fallback and unsupported configurations; add no Lab source change or
+persistent queue. The measured RTX owner is 4.091680 ms within 9.388518 ms
+whole physics. First milestone: replace that complete owner within
+3.091680 ms and demonstrate at least 1 ms whole-physics saving, not infer it
+from operation counts. Initial integrated checkpoint: 06:30 UTC; no promotion
+without native physical checks and repeated paired whole timings.
+
+## Hybrid closure and native cost diagnosis, 05:49 UTC
+
+The fixed six-pass prefix plus original remaining-budget continuation does
+not qualify: 2,012/2,048 pass. It rescues six of the fourteen original coupled
+misses but introduces 28 others. All 36 failures use continuation; none is a
+false physical stop. There are 151 continuations, 5,294 coupled passes and
+2,708 parallel passes. An independent original-recurrence control confirms
+correct incoming impulses, zero-impulse bias and remaining allowance; semantic
+negative controls detect a fresh24 tail, cold reset and doubled incoming bias.
+The failure is not an implementation of those three bugs.
+
+A fixed merit guard (rollback on the first non-improving prefix pass, then
+choose the lower-merit handoff/final-tail endpoint) passes 2,017/2,048. It
+rescues 22 fixed-hybrid failures but introduces 17 others. All charges include
+the 19 rejected attempts, rollback, endpoint projections and continuation.
+This policy is closed; a lower scalar merit does not ensure every physical
+component improves. Artifacts in
+`/tmp/fpgs-coupled24-qualification-Pab7PnYA/`:
+
+- `hybrid_qualification.json`, SHA256
+  `0663601ccf5c2a45b5702dc21b88c95dc334497103da2449c78cd0e67ad39950`.
+- `guarded_qualification.json`, SHA256
+  `5a7d5d4fd4d2d12f85aec8aeeb7172b4e49fb581bbeefe54c6d75ddc3fb49432`.
+
+The native default-off hybrid is frozen at source SHA256
+`3e972df7b7e2659716718595a49164a3a7ed9f94c2d874c0e29855dca3384015`.
+Root replay of the original 512-world saved inputs preserves captured192/1
+strides, current geometry/held factors, read-only inputs, metadata and unowned
+outputs. All hard finite/cone/momentum/nonnegative-impulse checks pass, but
+physical nonworsening fails on 45 RTX and 27 GB cases. No promotion.
+
+| Restored512-owner replay | RTX original | RTX hybrid | GB original | GB hybrid |
+| --- | ---: | ---: | ---: | ---: |
+| Tier32, current step, ms | 0.049915 | 0.213707 | 0.051487 | 0.231947 |
+| Tier48, current step, ms | 0.054305 | 0.258812 | 0.056468 | 0.276488 |
+| Tier32, held step, ms | 0.049776 | 0.217928 | 0.051312 | 0.227069 |
+| Tier48, held step, ms | 0.053782 | 0.260418 | 0.056484 | 0.282307 |
+
+These are complete saved-owner launches INCLUDING identical output-restoration
+copies, not pure kernel or16K environment timings. Both arms alternate over
+six rounds, with32 restores/launches per graph and16 graph executions per
+sample. Register whitening is disabled, matching the accepted recipe. The
+hybrid is 4.28--5.00 times slower in this limited replay, not a task speedup.
+Logs: `/tmp/fpgs-coupled-native-paired512-20260916-MT8Jk2/gpu{0,1}-run03.log`.
+Earlier logs are preserved: first missing import path, then runner allocation
+lifetime loss during captured replay. The latter is fixed by retaining every
+buffer, reset seed, argument list and kernel, not by modifying runtime physics.
+
+An output-only counter clone strips byte-exactly to the frozen native source.
+All2,048 outputs match uninstrumented physics byte-for-byte; read-only and
+unowned controls pass. It uses more registers and IS NOT timed. Results:
+
+- 1,714 worlds physically stop; another183 fail only the1e-10 cone check.
+  Their sum exactly matches the CPU1,897 worlds stopping by six passes.
+- The remaining151 worlds fail another physical component as well.
+- Only ten local metric fallbacks occur in67,645 block calls; no admission,
+  Schur, analytic-bracket, local-law or scalar-fallback storm explains cost.
+- The nonlinear work remains serialized in lane zero; the original row-lane
+  solver does not have this contact-by-contact execution dependency.
+
+Diagnostic source SHA256
+`fcd2fa22288e72cad0f93b9f27ed92879e9c4f44026879225d78edc7b43b6ee6`;
+logs `/tmp/fpgs-coupled-native-counters-20260916-QcUc5V/gpu{0,1}-run02.log`.
+Initial counter runs supplied the captured unused1x1 dummy instead of a private
+world-count by192 bank and are invalid; corrected runs explicitly allocate the
+documented diagnostic shape. No production allocation/capacity changes.
+
+## Cause-directed correction: concurrent contact blocks
+
+Frozen CPU Jacobi SHA256
+`0ca4b931aec62f2ea7bc5587898e20c8ffd76473038fe5983f25d4fd5852ab00`:
+all contact proposals read one common residual and impulse state, then one
+transpose/forward operator pair commits their combined response. The resulting
+residual is also the physical-stop input and next iteration's input. No second
+full stopping scan, all-pairs Gram or original majorizer is needed.
+
+The policy is frozen before qualification: relaxation starts at one and latches
+permanently to one half on the first physical-merit increase, using the midpoint
+of the just-computed proposal. No further halving or old global tail. Original
+8/24 pass maxima remain unchanged. The same-state test fails when bound to the
+ordered implementation, distinguishing real concurrent dataflow from renaming.
+
+ANYmal: **2,030/2,048 pass; eighteen remain unqualified**. All eighteen latch
+and exhaust24; there are no false physical stops or hard physical failures.
+The policy rescues eleven ordered-coupled misses but introduces fifteen.
+There are1,939 physical stops,159 latches,9,291 passes (median3,p90=10),
+199,049 local root probes,10,615,824 operator products,437,832 self-block
+setup products,294,884 stopping projections and5,491 midpoint projections.
+These are incomplete arithmetic/work counts, not GPU costs. G1 at8 passes
+passes only10/16; no G1 promotion or native specialization is funded.
+
+Result `jacobi_qualification.json` in the same qualification directory,
+SHA256 `f083139859e513c1a6f14ed0f33eca5349f6e89ce49d8aed86d944fc024a4411`.
+
+Explicit precision alignment: the next FP32 native candidate uses cone3e-5
+for both stopping and merit, matching the unchanged independent physical
+allowance, instead of an FP64-scale1e-10 test. An in-memory CPU control with
+this exact change has IDENTICAL failures, work counts and physical outputs;
+it is not a rescue of the eighteen tails. Artifact
+`jacobi_precision_qualification.json`, SHA256
+`c2de15eee8323b3e8918ed4fcfe0e6c92f01bd2d7dccedd60611fe8b57b77e7c`.
+
+Fund one concurrent native mapping as the cause-directed correction to the
+measured serialization loss, despite the disclosed numerical misses. Keep
+original producer/decode, ABI/capacities and local root; use normal-row lanes
+for independent triple roots, a CTA join across triple boundaries, and two
+matrix-free actions per pass. First source checkpoint06:35 UTC. Early complete
+owner timing decides whether further convergence work can have a large payoff;
+the old solver remains accepted and no new whole-task gain is claimed.
