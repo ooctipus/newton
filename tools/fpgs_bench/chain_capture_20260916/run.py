@@ -17,7 +17,30 @@ def main():
         raise RuntimeError("The retained G1 paired owner has changed")
     spec = importlib.util.spec_from_file_location("retained_g1_paired_capture", ORIGINAL)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    source = ORIGINAL.read_text()
+    seam = '            if kinetic.get("refresh_key") != refresh:\n'
+    replacement = (
+        """            supernodal_flag = run["environment"].get("FEATHER_PGS_SPARSE_SUPERNODAL", "0")
+            if supernodal_flag not in ("0", "1"):
+                raise RuntimeError("Require Boolean supernodal factor selection")
+            supernodal = supernodal_flag == "1"
+            observed = kinetic.get("supernodal", {})
+            if (
+                observed.get("check_pass") is not True
+                or observed.get("requested") is not supernodal
+                or observed.get("observed") is not supernodal
+            ):
+                raise RuntimeError("Missing or inconsistent actual supernodal factor")
+            if supernodal:
+                refresh = ("g1_kinetic_" if kinetic_requested else "") + "sparse_supernodal43_434"
+                if observed.get("refresh_key") != refresh:
+                    raise RuntimeError("Unexpected observed supernodal refresh kernel")
+"""
+        + seam
+    )
+    if source.count(seam) != 1:
+        raise RuntimeError("The original parent refresh-owner observation seam changed")
+    exec(compile(source.replace(seam, replacement), str(ORIGINAL), "exec"), module.__dict__)
     module.__file__ = str(Path(__file__).resolve())
     module.adapter.EXTRA.extend(
         Path(__file__).with_name(name).resolve() for name in ("run.py", "checked_sparse.py", "nsys_sparse_checked.sh")

@@ -10,6 +10,32 @@ from pathlib import Path
 import numpy as np
 
 
+def supernodal_snapshot(solver, geometric):
+    """Observe the exact refresh replacement without changing its timed path."""
+    flag = os.environ.get("FEATHER_PGS_SPARSE_SUPERNODAL", "0")
+    if flag not in ("0", "1"):
+        raise RuntimeError("Require Boolean supernodal selection")
+    requested = flag == "1"
+    sparse = solver._sparse_factor
+    observed = getattr(sparse, "supernodal", False)
+    if type(observed) is not bool or observed != requested:
+        raise RuntimeError("Requested supernodal factor differs from the actual owner")
+    result = {"requested": requested, "observed": observed, "check_pass": False}
+    if requested:
+        from newton._src.solvers.feather_pgs import sparse_supernodal  # noqa: PLC0415
+
+        kernel = (
+            sparse_supernodal.get_refresh_kernel(geometric=True)
+            if geometric
+            else sparse_supernodal.get_refresh_kernel()
+        )
+        key = ("g1_kinetic_" if geometric else "") + "sparse_supernodal43_434"
+        if sparse.kernels.refresh is not kernel or kernel.key != key:
+            raise RuntimeError("Supernodal factor did not select the exact refresh factory")
+        result["refresh_key"] = key
+    return {**result, "check_pass": True}
+
+
 def parallel_snapshot(solver):
     """Require actual device use, not merely an installed experimental owner."""
     flag = os.environ.get("FEATHER_PGS_PARALLEL_WORLD", "0")
@@ -124,6 +150,15 @@ parallel_replacement = (
 if source.count(parallel_seam) != 1:
     raise RuntimeError("The original solve-owner observation seam changed")
 source = source.replace(parallel_seam, parallel_replacement)
+refresh_seam = '    result["refresh_key"] = sparse.kernels.refresh.key\n'
+refresh_replacement = (
+    '    result["supernodal"] = supernodal_snapshot(solver, requested)\n'
+    '    if result["supernodal"]["observed"]:\n'
+    '        refresh = result["supernodal"]["refresh_key"]\n' + refresh_seam
+)
+if source.count(refresh_seam) != 1:
+    raise RuntimeError("The original refresh-owner observation seam changed")
+source = source.replace(refresh_seam, refresh_replacement)
 # __file__ deliberately remains this wrapper: its digest pins the complete
 # source transformation and the retained observer's required SHA256.
 exec(compile(source, str(RETAINED), "exec"), globals())

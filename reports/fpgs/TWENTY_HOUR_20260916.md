@@ -766,3 +766,161 @@ memory per thread is zero. These are launch resource facts, not measured
 occupancy, bandwidth, stall or instruction counters. No further mapping or
 parameter sweep is justified by this closure. Runtime and tests stay frozen;
 the separate unpromoted world-lane closure was preserved by commit `cd9315da`.
+
+## Next structural decisions, 15:25 UTC
+
+Parallel-owner and split source/test/report closure is committed and pushed as
+`f22128016220fb4a4424b09f257833bef893a652`; full and new-file precommit pass.
+Both variants remain default-off. The accepted increment is still the earlier
+qualified vector-chain result, not any of the subsequent losing experiments.
+
+Read-only/CPU screens avoid repeating several apparently larger opportunities:
+
+- Exact cold zero-impulse admission is sound, but prior current RTX censuses
+  admitted only about14% of worlds and6.3--6.6% of contact-whitening work.
+  Such worlds already take one cheap unchanged GS sweep. The old full16K
+  impulse-only replay gives14.099% RTX/14.429% GB final-zero worlds; this is
+  not a cold-admission proof or the same census. Prediction is required for
+  admission, so it does not automatically retire the inverse/factor owner.
+- Implicit signed-limit columns eliminate only a subset of the0.560ms RTX
+  limit-prefix owner. They retain the same GS dot/update and add W/index
+  gathers. Maintaining physical-coordinate residuals instead was already
+  tried by PRESENT_PORTS and lazy-compliance variants, with complete losses.
+- Prior body-basis formation already discovers actual touched bodies, not a
+  fixed seven-body set. Global pair scheduling cannot claim deletion of that
+  nonexistent fixed-basis work. The saved3.123 contacts/template/world is not
+  an actual body-pair reuse census.
+- CPU replay of the exact native friction-root recurrence uses157 probes for
+  69 sliding transactions in the selected G1 controls, mostly two or three
+  probes, not16 each. These are not measured GPU counters. A fixed
+  eigenbasis squared-secular Halley policy uses172 and changes no row/sweep
+  work. Its CPU correctness is not a performance result. Preserved analysis:
+  `/tmp/fpgs-metric-secular-root-etJFmt3g/RESULTS.md`.
+- Tensor Core packing/precision emulation is not a free switch in installed
+  Warp1.17. Sparse support12 whitening has234 useful products per triple;
+  a padded16x16x8 operation already has2048 before precision emulation and
+  still owes geometry, grouping, incident, norms and publication. No native
+  Tensor Core experiment is justified by peak-throughput arithmetic alone.
+
+Fund one new **sparse supernodal factor/inverse producer**, default-off
+`FEATHER_PGS_SPARSE_SUPERNODAL=1`. Derive twelve branch-preserving panels from
+the admitted434-entry graph: six finger chains, two arm chains, torso, two
+legs and root. Independent fingers/legs, then arms, torso and root give four
+factor stages, followed by reverse-tree inverse composition. This changes
+both factor and inverse dataflow, unlike the earlier scalar-level rewrite.
+The complete algebra retains2242 factor and2242 inverse products,391 factor
+divisions,43 square roots and434 inverse divisions; it adds587 separator
+assembly additions. The proposed fixed four-warp CTA reduces whole-CTA joins
+from47 to8, with about2.35KiB additional private separator scratch. No new
+world-scaled matrix, response conversion or changed held-generation cadence.
+
+The current complete refresh owner costs1.780ms RTX/1.505ms GB. Halving it
+would be a useful structural increment, not4x across tasks; the prospective
+whole-saving target is about1ms and is not established by operation counts.
+Preserve all current H/R/K inputs, serial/parallel drive readiness, requested
+refreshes, failure/status publication and canonical W434. First missing-API,
+actual-H/action and lifecycle controls precede an early original-driver whole
+screen. Native-ready checkpoint16:30; no silent extension beyond17:00 or
+block-size grid. Main agent alone owns GPU runs.
+
+In parallel, an isolated **heightfield shell-support reduction** candidate
+starts fromf221 at `newton-heightfield-shell-support-20260916`, branch
+`ooctipus/heightfield-shell-support-20260916`. The prior finite query discards
+positive-shell analytical face manifolds and repeats the generic query because
+ordinary spatial reduction can leave one-sided close support. The proposed
+correction retains the analytical manifold only with a paired buffered
+heightfield reducer: preserve the exact legacy inner-depth predicate, allow
+outer spatial support only within unchanged margin+gap, and rank inner
+contacts above outer ones. Keep original deepest/voxel competition, finite
+borders, seam filters, capacities and all non-heightfield paths.
+
+This is not the closed direct-fallback shortcut or fused original-manifold
+experiment: those retained the old reducer and either removed only discarded
+clipping or added the original ten-support polygon builder. Every buffered
+heightfield witness sharing a bin, including generic fallback witnesses, must
+use the same priority encoding. Direct/unreduced collision keeps its original
+fallback. No extra result buffer, queue or launch is planned. Current entire
+generic fallback0.824ms RTX/2.924ms GB is only an upper bound, not guaranteed
+retirement; about1ms RTX is a stretch hypothesis including duplicate work.
+Loaded rebound/support/sliding and mixed inner/outer controls must precede
+timing; eventual MJWarp comparison must share the collision improvement.
+
+## Structural screens and causal decisions, 16:10 UTC
+
+The shell-support candidate in the isolated heightfield worktree completes its
+original paired native checks. The first standalone invocation omitted the
+historical grouped-lanes recipe and failed before any physical solve; those
+logs remain preserved. Reusing the original lanes16/rows-masked/threads4
+settings gives four passing selectors on each card. Rebound collection is
+audited separately: reconstruct cleared J as Y*(L*L.T), retain denominator-only
+CFM semantics, and compare independent contact geometry and exactly eight
+original sweeps. All loaded gates pass; candidate rebound spin/residuals are
+smaller in these repeats, not a universal trajectory or ordering guarantee.
+
+One complete G1 shell screen passes all source/capacity/idle guards:
+RTX15.051504525 ->14.913547525ms (1.00925x),
+GB19.820232075 ->16.565692400ms (1.19646x).
+This is a useful GB discovery, not an accepted RTX increment or a fresh MJWarp
+ratio. Strict node attribution against the preserved qualified-chain reference
+shows collision saving0.699232/3.851594ms, but rows plus GS add0.528779/0.488086ms.
+Two checked endpoints contain about23% more contacts and12.5% more total rows;
+these samples are not timed-average populations. There is no duplicated old
+query/reducer. Full closure and exact pins are in the isolated worktree's
+`reports/fpgs/HEIGHTFIELD_SHELL_SUPPORT_20260916.md`; the option remains off.
+
+The register-front supernodal factor also passes four native selectors/card.
+Actual whole captures give RTX15.054503250 ->14.814186625ms,
+GB19.841636000 ->20.720324550ms. A second parent exact-key check rejected the
+new refresh name after capture; the failed manifest is preserved. A narrow
+parent extension then passes all four recorded-child checks and rejects three
+negative controls. It does not rewrite the original outcome. Strict node
+analysis retains all48 physics/12 auxiliary roots and finds complete refresh
+1.780024 ->1.574609ms RTX, 1.504000 ->2.376645ms GB, with all downstream owners
+essentially flat. Eight new calls replace all old refresh calls. The GB loss
+is in the new factor, not contact count, solver iterations or retained work.
+
+Source/compiler evidence qualifies the original47->8 CTA-join hypothesis:
+the new critical path still has19 warp-local pivots versus15 old levels,
+868 explicit shuffle broadcasts,96 registers versus40/39, and about17.3K
+static SASS instructions versus980 looped instructions. Static counts are not
+dynamic work or hardware-stall measurements. Preserve this first version,
+then fund one shared-front correction: element-parallel bounded loops and
+warp-private shared fronts, retaining the same panel algebra and eight CTA
+joins. Charge additional shared traffic and warp synchronization. Prospective
+complete-owner targets are <=0.980ms RTX and <=1.504ms GB, not predictions.
+Native-ready checkpoint17:15, no silent extension beyond17:30 or mapping grid.
+Full source/native/whole/node closure: `SUPERNODAL_20260916.md`.
+
+Additional bounded screens prevent rediscovering earlier paths:
+
+- Franka current state/prediction/factor is only1.671307ms. The closed
+  world-lane owner already removes generic chain/weld work; its0.184506ms
+  predictor/factor saving cannot support a new1ms state-only claim. The
+  current owner already caches next-state bias/H and skips valid repair.
+- Existing Lab has a deferred-publication hook, but calls arbitrary state
+  force callbacks before the next solver invocation. Newton cannot infer
+  that those callbacks do not read public poses/velocities. Even deleting
+  an entire alternating Franka finish phase would save <0.475ms; mandatory
+  private geometry/motion/bias and contact inputs make actual public-only
+  savings substantially smaller. No Lab change or unsafe lazy flag is made.
+- General coplanar-hull contact deletion is not exact Coulomb equivalence:
+  moving normal load from a sticking center to sliding rim changes yaw
+  friction. Even frictionless deletion requires actual row/bias domination;
+  mixed penetration/speculation can violate it. Seven-to-four hull reduction
+  in the zero-friction rebound fixture is not a full G1 cost or quality proof.
+- The exact original metric-GS root and physical path-certificate screens
+  remain CPU closures, not native gains. Certificate16 removes only about
+  12% of row dots before added bounds/norm checks; no native funding.
+
+A separate bounded CPU study now tests history-two Anderson acceleration of
+the original ordered metric-GS map, not the earlier diagonal/spectral AA4 or
+Nesterov method. Keep the native16-cap root and maximum eight GS sweeps,
+project proposals onto original cones, rebuild the actual kinetic correction,
+and charge every history/physical-residual/projection/rebuild operation.
+Common converged held-H accuracy and physical invariants, not bit identity or
+componentwise monotonicity, decide quality. One frozen formulation, no history
+or coefficient grid; first formula checkpoint16:35, results17:00.
+
+The accepted session increment remains the earlier vector-chain improvement.
+Neither the shell nor first supernodal result is promoted as progress toward
+the RTX4x-everywhere goal, which remains unmet.

@@ -535,6 +535,11 @@ class SparseFactor:
         if self.metric_tangents and (self.packet_rows or self.block_contacts):
             raise ValueError("Sparse metric tangents, packets and contact-block rows are mutually exclusive")
         self.level_update = os.environ.get("FEATHER_PGS_SPARSE_LEVEL_UPDATE") == "1"
+        self.supernodal = os.environ.get("FEATHER_PGS_SPARSE_SUPERNODAL") == "1"
+        if self.supernodal:
+            from .sparse_supernodal import validate_plan  # noqa: PLC0415
+
+            validate_plan(host["index"])
         if self.level_update:
             for name, values in _level_update_schedule(host["index"]).items():
                 setattr(plan, name, wp.array(values, dtype=int, device=solver.model.device))
@@ -557,6 +562,10 @@ class SparseFactor:
             contacts=get_contact_kernel(),
             solve=get_solve_kernel(c, self.block_contacts, metric_tangents=self.metric_tangents),
         )
+        if self.supernodal:
+            from .sparse_supernodal import get_refresh_kernel as get_supernodal_refresh  # noqa: PLC0415
+
+            self.kernels.refresh = get_supernodal_refresh()
         # Drop canonical matrix/row storage only after complete constructor admission.
         # Dummy shapes make accidental readers fail visibly, not reinterpret packed W/Z.
         dummy = wp.empty((1, 1, 1), dtype=float, device=device)
@@ -592,6 +601,10 @@ class SparseFactor:
         if kinetic_supported(self.solver):
             self.kinetic_state = G1KineticState(self)
             self.kernels.refresh = get_refresh_kernel(self.level_update, geometric=True)
+            if self.supernodal:
+                from .sparse_supernodal import get_refresh_kernel as get_supernodal_refresh  # noqa: PLC0415
+
+                self.kernels.refresh = get_supernodal_refresh(geometric=True)
 
     def begin(self):
         """Reject changed execution ownership before any retired buffer is read."""
