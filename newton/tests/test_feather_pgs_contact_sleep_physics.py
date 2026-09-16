@@ -11,6 +11,8 @@ import warp as wp
 
 import newton
 import newton._src.solvers.feather_pgs.solver_feather_pgs as solver_module
+import newton.tests.test_feather_pgs_sleeping as sleeping_tests
+from newton.tests.test_feather_pgs_compact_contact import build_solver_fixture
 from newton.tests.test_feather_pgs_sleeping import DT, _compare, _physical_pair, _step
 
 
@@ -68,6 +70,64 @@ def _capture_tick(case, device, *, stream=None):
         case.solver.publish_kinematics(case.state)
         case.solver.update_contacts(case.contacts)
     return capture.graph
+
+
+def _coupled_fixture(test, device, *, chain=False, reverse=False):
+    """Reuse existing shapes with alternate authored attachment/placement."""
+
+    def build(device, **kwargs):
+        model = build_solver_fixture(device, **kwargs)
+        shapes = model.shape_body.numpy()
+        transforms = model.shape_transform.numpy()
+        prismatic = np.flatnonzero(model.joint_type.numpy() == int(newton.JointType.PRISMATIC))
+        bodies = model.joint_child.numpy()[prismatic]
+        for world in range(2):
+            offset = 5 * world
+            if chain:
+                # Reuse the serial companion's first collision sphere on a
+                # third scalar leaf, before constructing either solver. Explicit
+                # body masses/inertias remain the original model parameters.
+                shapes[offset + 2] = bodies[37 * world + 3]
+                transforms[offset + 1, 0] = -0.01
+                transforms[offset + 2, :3] = (-0.03, 0.0, 0.0)
+            else:
+                # Overlapping AABBs, separated spheres: distance .02546 exceeds
+                # diameter .02 plus both .001 collision envelopes.
+                transforms[offset + 1, :2] = (0.008, 0.018)
+        model.shape_body.assign(shapes)
+        model.shape_transform.assign(transforms)
+        return model
+
+    with mock.patch.object(sleeping_tests, "build_solver_fixture", build):
+        model, cases, _joints, bodies, dofs, targets, _loaded = _fixture(test, device, 37)
+    local_pairs = [(0, 4), (1, 4), (0, 1)]
+    selected = [0, 1]
+    if chain:
+        local_pairs.extend(((2, 4), (1, 2)))
+        selected.append(3)
+    pairs = [(a + 5 * world, b + 5 * world) for world in range(2) for a, b in local_pairs]
+    if reverse:
+        pairs.reverse()
+    selected = np.asarray(selected)
+    components = np.concatenate((selected, selected + 37))
+    for case in cases:
+        if chain:
+            q = case.state.joint_q.numpy()
+            q[dofs[components]] = np.tile((0.0, 0.02, 0.04), 2)
+            case.state.joint_q.assign(q)
+            target = case.control.joint_target_q.numpy()
+            target[targets[components]] = 0.0
+            case.control.joint_target_q.assign(target)
+            newton.eval_fk(model, case.state.joint_q, case.state.joint_qd, case.state)
+        case.pipeline = newton.CollisionPipeline(
+            model,
+            broad_phase="explicit",
+            shape_pairs_filtered=wp.array(pairs, dtype=wp.vec2i, device=device),
+            rigid_contact_max=8,
+        )
+        case.contacts = case.pipeline.contacts()
+        case.solver.prepare_contact_sleep(case.contacts)
+    return model, cases, bodies, components
 
 
 def _records(contacts):
@@ -132,6 +192,85 @@ def _settle_loaded(test, model, cases, bodies, loaded):
 
 
 class TestFeatherPGSContactSleepPhysics(unittest.TestCase):
+    def test_dynamic_broad_pair_without_contact_blocks_generation(self):
+        """Keep both broad-phase dynamic endpoints awake even without a raw edge."""
+        devices = wp.get_cuda_devices()
+        if not devices:
+            self.skipTest("Actual broad-only dynamic pairs require CUDA")
+        for device in devices:
+            model, cases, bodies, components = _coupled_fixture(self, device)
+            for tick in range(64):
+                _advance(cases)
+                if tick % 8 == 7:
+                    _compare(self, model, cases)
+                    _compare_contacts(self, cases)
+            candidate = cases[1]
+            count, _ = _records(candidate.contacts)
+            self.assertEqual(count, 4)
+            raw = set(
+                zip(
+                    candidate.contacts.rigid_contact_shape0.numpy()[:count],
+                    candidate.contacts.rigid_contact_shape1.numpy()[:count],
+                    strict=True,
+                )
+            )
+            self.assertNotIn((0, 1), raw)
+            self.assertNotIn((5, 6), raw)
+            broad_count = int(candidate.pipeline.broad_phase_pair_count.numpy()[0])
+            broad = candidate.pipeline.broad_phase_shape_pairs.numpy()[:broad_count]
+            self.assertTrue(np.any(np.all(broad == (0, 1), axis=1)))
+            self.assertTrue(np.any(np.all(broad == (5, 6), axis=1)))
+            np.testing.assert_array_equal(candidate.solver._sleeping.body_awake.numpy()[bodies[components]], 1)
+            generation = candidate.contacts.contact_generation.numpy().copy()
+            # The veto must survive all subsequent solves sharing this collision
+            # generation, not just the first solve after broad phase.
+            for _ in range(20):
+                for case in cases:
+                    _step(case)
+                    case.solver.publish_kinematics(case.state)
+                    case.solver.update_contacts(case.contacts)
+                np.testing.assert_array_equal(candidate.solver._sleeping.body_awake.numpy()[bodies[components]], 1)
+            np.testing.assert_array_equal(candidate.contacts.contact_generation.numpy(), generation)
+            _compare(self, model, cases)
+            _compare_contacts(self, cases)
+            np.testing.assert_array_equal(candidate.solver._contact_sleep.contact_asleep.numpy()[:count], 0)
+            self.assertTrue(np.all(candidate.solver.contact_slot.numpy()[:count] >= 0))
+
+    def test_three_component_contact_chain_stays_awake_in_both_pair_orders(self):
+        """Retain ordinary physical solving for a loaded chain, regardless of pair order."""
+        devices = wp.get_cuda_devices()
+        if not devices:
+            self.skipTest("Actual dynamic contact chains require CUDA")
+        for device in devices:
+            for reverse in (False, True):
+                with self.subTest(device=str(device), reverse=reverse):
+                    model, cases, bodies, components = _coupled_fixture(self, device, chain=True, reverse=reverse)
+                    for tick in range(64):
+                        _advance(cases)
+                        if tick % 8 == 7:
+                            _compare(self, model, cases)
+                            _compare_contacts(self, cases)
+                        np.testing.assert_array_equal(
+                            cases[1].solver._sleeping.body_awake.numpy()[bodies[components]], 1
+                        )
+                    candidate = cases[1]
+                    count, _ = _records(candidate.contacts)
+                    raw = set(
+                        zip(
+                            candidate.contacts.rigid_contact_shape0.numpy()[:count],
+                            candidate.contacts.rigid_contact_shape1.numpy()[:count],
+                            strict=True,
+                        )
+                    )
+                    for pair in ((0, 1), (1, 2), (5, 6), (6, 7)):
+                        self.assertIn(pair, raw)
+                    self.assertGreater(
+                        float(np.max(np.linalg.norm(candidate.contacts.rigid_contact_force.numpy()[:count], axis=1))),
+                        0.05,
+                    )
+                    np.testing.assert_array_equal(candidate.solver._contact_sleep.contact_asleep.numpy()[:count], 0)
+                    self.assertTrue(np.all(candidate.solver.contact_slot.numpy()[:count] >= 0))
+
     def test_cold_first_step_capture_acquires_loaded_lease(self):
         """Prepare contact ownership explicitly before the first captured step."""
         devices = wp.get_cuda_devices()

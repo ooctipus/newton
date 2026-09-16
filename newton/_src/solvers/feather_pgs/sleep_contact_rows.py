@@ -3,14 +3,40 @@
 
 """Dormant raw-contact allocation and held-force consumers.
 
-The caller owns admission, current mask construction and lease lifetime. Only
-the original dense/sparse-diagonal contact route may acquire a force lease.
-These kernels neither decide sleeping nor change the original allocator.
+The caller owns topology admission and lease lifetime. Singleton/static
+consumers derive current dormancy at use, without a separate contact-mask
+producer. Only the original dense/sparse-diagonal route may acquire a force
+lease; the original allocation and force laws remain unchanged.
 """
 
 import warp as wp
 
 from . import kernels
+
+
+@wp.func
+def _endpoint_component(shape: int, shape_body: wp.array[int], body_component: wp.array[int]) -> int:
+    # -2 is invalid; -1 denotes an actual static shape or immobile skeleton.
+    if shape < 0 or shape >= shape_body.shape[0]:
+        return -2
+    body = shape_body[shape]
+    if body == -1:
+        return -1
+    if body < 0 or body >= body_component.shape[0]:
+        return -2
+    return body_component[body]
+
+
+@wp.func
+def _singleton_component(shape0: int, shape1: int, shape_body: wp.array[int], body_component: wp.array[int]) -> int:
+    """Select one mechanical component touching static geometry, never two."""
+    first = _endpoint_component(shape0, shape_body, body_component)
+    second = _endpoint_component(shape1, shape_body, body_component)
+    if first >= 0 and second == -1:
+        return first
+    if second >= 0 and first == -1:
+        return second
+    return -1
 
 
 @wp.kernel
@@ -158,6 +184,166 @@ def allocate_awake_world_contact_slots(
         )
 
 
+@wp.kernel
+def allocate_singleton_world_contact_slots(
+    body_component: wp.array[int],
+    component_sleeping: wp.array[int],
+    held_force: wp.array[wp.vec3],
+    held_valid: wp.array[int],
+    contact_asleep: wp.array[int],
+    contact_count: wp.array[int],
+    total_num_threads: int,
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    contact_point0: wp.array[wp.vec3],
+    contact_point1: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    contact_thickness0: wp.array[float],
+    contact_thickness1: wp.array[float],
+    body_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[int],
+    body_to_articulation: wp.array[int],
+    art_to_world: wp.array[int],
+    articulation_response_dof_count: wp.array[int],
+    body_flags: wp.array[wp.int32],
+    body_has_response_dofs: wp.array[int],
+    is_free_rigid: wp.array[int],
+    has_free_rigid: int,
+    propagation_articulated_contacts: int,
+    propagation_same_articulation: int,
+    propagation_free_free: int,
+    contact_gap_gate: float,
+    same_articulation_contact_gap_gate: float,
+    articulation_pair_contact_gap_gate: float,
+    max_constraints: int,
+    mf_max_constraints: int,
+    propagation_max_constraints: int,
+    enable_friction: int,
+    contact_friction_gap_threshold: float,
+    contact_friction_anchor_limit: int,
+    contact_friction_articulation_pairs_only: int,
+    row_capacity_telemetry: int,
+    resolved_worlds: wp.array[int],
+    contact_world: wp.array[int],
+    contact_slot: wp.array[int],
+    contact_art_a: wp.array[int],
+    contact_art_b: wp.array[int],
+    world_slot_counter: wp.array[int],
+    contact_path: wp.array[int],
+    mf_slot_counter: wp.array[int],
+    propagation_slot_counter: wp.array[int],
+    dense_contact_world_flag: wp.array[int],
+    contact_slots_needed: wp.array[int],
+    dense_dropped_contact_rows: wp.array[int],
+    mf_dropped_contact_rows: wp.array[int],
+    propagation_dropped_contact_rows: wp.array[int],
+    capacity_status: wp.array[int],
+):
+    """Derive dormancy after current-input validation, before original routing.
+
+    The controller admits only supported singleton components and wakes both
+    endpoints of every dynamic pair. Even a stale pair of sleeping flags cannot
+    exclude a dynamic/dynamic contact here. Awake entries clear old force leases
+    *before* the original allocator can return a gap-filtered (-1, -1) route.
+    """
+    thread = wp.tid()
+    total_contacts = contact_count[0]
+    capacity = contact_shape0.shape[0]
+    if total_contacts > capacity:
+        if thread == 0:
+            wp.atomic_max(capacity_status, 3, 1)
+        for c in range(thread, capacity, total_num_threads):
+            contact_slot[c] = -1
+            contact_path[c] = -1
+            contact_slots_needed[c] = 0
+            contact_asleep[c] = 0
+            held_valid[c] = 0
+            held_force[c] = wp.vec3()
+        return
+
+    for c in range(thread, total_contacts, total_num_threads):
+        component = _singleton_component(contact_shape0[c], contact_shape1[c], shape_body, body_component)
+        dormant = int(0)
+        if component >= 0 and component < component_sleeping.shape[0]:
+            dormant = int(component_sleeping[component] != 0)
+        contact_asleep[c] = dormant
+        if dormant == 0:
+            held_valid[c] = 0
+            held_force[c] = wp.vec3()
+        if dormant != 0 or resolved_worlds.shape[0] > 0:
+            shape_a = contact_shape0[c]
+            shape_b = contact_shape1[c]
+            body_a = shape_body[shape_a] if shape_a >= 0 else -1
+            body_b = shape_body[shape_b] if shape_b >= 0 else -1
+            art_a = body_to_articulation[body_a] if body_a >= 0 else -1
+            art_b = body_to_articulation[body_b] if body_b >= 0 else -1
+            world_a = art_to_world[art_a] if art_a >= 0 else -1
+            world_b = art_to_world[art_b] if art_b >= 0 else -1
+            world = world_a if world_a >= 0 else world_b
+            same_world = world_a < 0 or world_b < 0 or world_a == world_b
+            skip = dormant != 0
+            if same_world and world >= 0 and world < resolved_worlds.shape[0]:
+                skip = skip or resolved_worlds[world] != 0
+            if skip:
+                contact_world[c] = world if same_world else -1
+                contact_art_a[c] = art_a
+                contact_art_b[c] = art_b
+                contact_slot[c] = -1
+                contact_path[c] = -1
+                contact_slots_needed[c] = 0
+                continue
+        kernels._allocate_world_contact_slot(
+            c,
+            total_contacts,
+            contact_shape0,
+            contact_shape1,
+            contact_point0,
+            contact_point1,
+            contact_normal,
+            contact_thickness0,
+            contact_thickness1,
+            body_q,
+            shape_transform,
+            shape_body,
+            body_to_articulation,
+            art_to_world,
+            articulation_response_dof_count,
+            body_flags,
+            body_has_response_dofs,
+            is_free_rigid,
+            has_free_rigid,
+            propagation_articulated_contacts,
+            propagation_same_articulation,
+            propagation_free_free,
+            contact_gap_gate,
+            same_articulation_contact_gap_gate,
+            articulation_pair_contact_gap_gate,
+            max_constraints,
+            mf_max_constraints,
+            propagation_max_constraints,
+            enable_friction,
+            contact_friction_gap_threshold,
+            contact_friction_anchor_limit,
+            contact_friction_articulation_pairs_only,
+            row_capacity_telemetry,
+            contact_world,
+            contact_slot,
+            contact_art_a,
+            contact_art_b,
+            world_slot_counter,
+            contact_path,
+            mf_slot_counter,
+            propagation_slot_counter,
+            dense_contact_world_flag,
+            contact_slots_needed,
+            dense_dropped_contact_rows,
+            mf_dropped_contact_rows,
+            propagation_dropped_contact_rows,
+            capacity_status,
+        )
+
+
 @wp.func
 def _dense_force(
     c: int,
@@ -199,7 +385,11 @@ def _dense_force(
 @wp.kernel
 def capture_dormant_contact_forces(
     contact_count: wp.array[int],
-    dormant: wp.array[int],
+    body_component: wp.array[int],
+    component_eligible: wp.array[int],
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    shape_body: wp.array[int],
     contact_normal: wp.array[wp.vec3],
     contact_world: wp.array[int],
     contact_slot: wp.array[int],
@@ -214,11 +404,12 @@ def capture_dormant_contact_forces(
     held_valid: wp.array[int],
     status: wp.array[int],
 ):
-    """Capture newly leased dense forces; retain already skipped valid forces.
+    """Capture eligible singleton/static forces before local sleep decisions.
 
     Call after the real solve, before granting a lease or replacing its routing
-    metadata. ``dormant`` selects proposed/current leases, not just contacts
-    already skipped during allocation. The caller clears status per pass.
+    metadata. Selection does not require a tentative sleeping mask. Other
+    dynamic endpoints and unsupported components do not touch this dense-only
+    cache. Status is sticky: the caller owns its global failure lifetime.
     Status bits: unsupported route (1), row/world bounds (2), nonfinite force
     (4), invalid raw count (8). Invalid captures cannot acquire a valid lease.
     """
@@ -232,7 +423,10 @@ def capture_dormant_contact_forces(
         return
     if c >= total:
         return
-    if dormant[c] == 0:
+    component = _singleton_component(contact_shape0[c], contact_shape1[c], shape_body, body_component)
+    if component < 0 or component >= component_eligible.shape[0]:
+        return
+    if component_eligible[component] == 0:
         return
     slot = contact_slot[c]
     path = contact_path[c]
@@ -283,7 +477,12 @@ def capture_dormant_contact_forces(
 @wp.kernel
 def publish_dormant_contact_forces(
     contact_count: wp.array[int],
-    dormant: wp.array[int],
+    body_component: wp.array[int],
+    component_sleeping: wp.array[int],
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    shape_body: wp.array[int],
+    contact_asleep: wp.array[int],
     held_force: wp.array[wp.vec3],
     held_valid: wp.array[int],
     rigid_contact_force: wp.array[wp.vec3],
@@ -295,8 +494,15 @@ def publish_dormant_contact_forces(
     """
     c = wp.tid()
     total = contact_count[0]
+    if c < contact_asleep.shape[0]:
+        contact_asleep[c] = 0
     if total < 0 or total > held_force.shape[0]:
         return
     if c < total:
-        if dormant[c] != 0 and held_valid[c] != 0:
+        component = _singleton_component(contact_shape0[c], contact_shape1[c], shape_body, body_component)
+        dormant = int(0)
+        if component >= 0 and component < component_sleeping.shape[0]:
+            dormant = int(component_sleeping[component] != 0)
+        contact_asleep[c] = dormant
+        if dormant != 0 and held_valid[c] != 0:
             rigid_contact_force[c] = held_force[c]

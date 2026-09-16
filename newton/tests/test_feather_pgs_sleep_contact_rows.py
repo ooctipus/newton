@@ -39,8 +39,13 @@ def _allocation(device):
         "mf_dropped_contact_rows": [0, 0],
         "propagation_dropped_contact_rows": [0, 0],
         "capacity_status": [0, 0, 0, 0],
+        "body_component": [0, 1, 2],
+        "component_sleeping": [0, 0, 0],
+        "held_valid": [1, 1, 1, 1],
+        "contact_asleep": [1, 1, 1, 1],
     }
     values = {name: _array(data, device) for name, data in integers.items()}
+    values["held_force"] = _array([[7, 8, 9]] * 4, device, wp.vec3)
     for name in (
         "contact_world",
         "contact_slot",
@@ -87,6 +92,10 @@ def _check_allocation(test, device):
     test.assertEqual(
         list(inspect.signature(sleeping.allocate_awake_world_contact_slots.func).parameters), ["dormant", *names]
     )
+    test.assertEqual(
+        list(inspect.signature(sleeping.allocate_singleton_world_contact_slots.func).parameters),
+        ["body_component", "component_sleeping", "held_force", "held_valid", "contact_asleep", *names],
+    )
     for changes in (
         {},
         {"propagation_articulated_contacts": 1},
@@ -95,15 +104,16 @@ def _check_allocation(test, device):
         {"resolved_worlds": [1, 0]},
         {"contact_count": [5]},
     ):
-        original, candidate = _allocation(device), _allocation(device)
-        for values in (original, candidate):
-            for name, value in changes.items():
-                values[name] = _array(value, device) if isinstance(value, list) else value
-        candidate["dormant"] = _array([0] * 4, device)
-        _launch_allocate(kernels.allocate_world_contact_slots, original, device)
-        _launch_allocate(sleeping.allocate_awake_world_contact_slots, candidate, device)
-        for name in names[names.index("contact_world") :]:
-            np.testing.assert_array_equal(candidate[name].numpy(), original[name].numpy(), err_msg=name)
+        for kernel in (sleeping.allocate_awake_world_contact_slots, sleeping.allocate_singleton_world_contact_slots):
+            original, candidate = _allocation(device), _allocation(device)
+            for values in (original, candidate):
+                for name, value in changes.items():
+                    values[name] = _array(value, device) if isinstance(value, list) else value
+            candidate["dormant"] = _array([0] * 4, device)
+            _launch_allocate(kernels.allocate_world_contact_slots, original, device)
+            _launch_allocate(kernel, candidate, device)
+            for name in names[names.index("contact_world") :]:
+                np.testing.assert_array_equal(candidate[name].numpy(), original[name].numpy(), err_msg=name)
     values = _allocation(device)
     values["dormant"] = _array([0, 1, 0, 0], device)
     _launch_allocate(sleeping.allocate_awake_world_contact_slots, values, device)
@@ -115,15 +125,68 @@ def _check_allocation(test, device):
     np.testing.assert_array_equal(values["contact_world"].numpy(), [0, 0, 1, -99])
     np.testing.assert_array_equal(values["contact_art_a"].numpy(), [0, 1, 2, -99])
     np.testing.assert_array_equal(values["contact_art_b"].numpy(), [-1, -1, -1, -99])
+    singleton = _allocation(device)
+    singleton["component_sleeping"].assign(np.array([0, 1, 0], np.int32))
+    _launch_allocate(sleeping.allocate_singleton_world_contact_slots, singleton, device)
+    for name in names[names.index("contact_world") :]:
+        np.testing.assert_array_equal(singleton[name].numpy(), values[name].numpy(), err_msg=name)
+    np.testing.assert_array_equal(singleton["held_valid"].numpy(), [0, 1, 0, 1])
+    np.testing.assert_array_equal(singleton["held_force"].numpy(), [[0, 0, 0], [7, 8, 9], [0, 0, 0], [7, 8, 9]])
+    np.testing.assert_array_equal(singleton["contact_asleep"].numpy()[:3], [0, 1, 0])
+
+    # A stale pair of sleeping flags must never suppress a dynamic pair.
+    dynamic = _allocation(device)
+    dynamic["contact_shape1"].assign(np.array([1, 3, 3, -99], np.int32))
+    dynamic["component_sleeping"].assign(np.array([1, 1, 0], np.int32))
+    _launch_allocate(sleeping.allocate_singleton_world_contact_slots, dynamic, device)
+    test.assertEqual(int(dynamic["contact_asleep"].numpy()[0]), 0)
+    test.assertEqual(int(dynamic["held_valid"].numpy()[0]), 0)
+    test.assertGreaterEqual(int(dynamic["contact_slot"].numpy()[0]), 0)
+
+    # Clearing must precede the original gap gate: (-1,-1) alone cannot
+    # distinguish a cached sleeper from a newly awake zero-force contact.
+    gap = _allocation(device)
+    gap["contact_count"].assign(np.array([1], np.int32))
+    gap["contact_point0"].assign(np.array([[0, 0, -0.1]] * 4, np.float32))
+    gap["contact_gap_gate"] = 0.01
+    _launch_allocate(sleeping.allocate_singleton_world_contact_slots, gap, device)
+    test.assertEqual(int(gap["contact_slot"].numpy()[0]), -1)
+    test.assertEqual(int(gap["contact_path"].numpy()[0]), -1)
+    test.assertEqual(int(gap["held_valid"].numpy()[0]), 0)
+    np.testing.assert_array_equal(gap["held_force"].numpy()[0], [0, 0, 0])
+    gap.update(
+        component_eligible=_array([1, 1, 0], device),
+        world_impulses=wp.zeros((2, 16), dtype=float, device=device),
+        world_constraint_count=gap["world_slot_counter"],
+        world_row_type=wp.zeros((2, 16), dtype=int, device=device),
+        world_row_parent=wp.full((2, 16), -1, dtype=int, device=device),
+        inv_dt=240.0,
+        status=_array([0], device),
+    )
+    wp.launch(
+        sleeping.capture_dormant_contact_forces,
+        dim=4,
+        inputs=[gap[name] for name in inspect.signature(sleeping.capture_dormant_contact_forces.func).parameters],
+        device=device,
+    )
+    test.assertEqual(int(gap["held_valid"].numpy()[0]), 1)
+    np.testing.assert_array_equal(gap["held_force"].numpy()[0], [0, 0, 0])
+    test.assertEqual(int(gap["status"].numpy()[0]), 0)
 
 
 def _check_forces(test, device):
     count = _array([5], device)
-    dormant = _array([1, 1, 1, 1, 0], device)
+    body_component = _array([0, 1, 2, 3, 4], device)
+    eligible = _array([1, 1, 1, 1, 1], device)
+    component_sleeping = _array([0, 1, 1, 1, 1], device)
+    shape0 = _array([0, 1, 2, 3, 4], device)
+    shape1 = _array([5, 5, 5, 5, 0], device)
+    shape_body = _array([0, 1, 2, 3, 4, -1], device)
+    contact_asleep = _array([1] * 5, device)
     normal = _array([[0, 0, 1], [1, 0, 0], [0, 1, 0], [0, 0, 1], [0, 0, 1]], device, wp.vec3)
     world = _array([0] * 5, device)
     slot = _array([0, 3, -1, -1, 0], device)
-    path = _array([0, 0, -1, -1, 0], device)
+    path = _array([0, 0, -1, -1, 1], device)
     impulse = _array([[2, 0.3, -0.4, 1, 8, 9]], device, float)
     row_count = _array([6], device)
     row_type = _array([[0, 2, 2, 0, 2, 2]], device)
@@ -133,7 +196,11 @@ def _check_forces(test, device):
     status = _array([0], device)
     args = [
         count,
-        dormant,
+        body_component,
+        eligible,
+        shape0,
+        shape1,
+        shape_body,
         normal,
         world,
         slot,
@@ -187,9 +254,25 @@ def _check_forces(test, device):
     np.testing.assert_array_equal(force.numpy()[4], [7, 8, 9])
     np.testing.assert_array_equal(valid.numpy(), [1, 1, 1, 1, 0])
     public = wp.full(5, wp.vec3(-10), dtype=wp.vec3, device=device)
-    wp.launch(
-        sleeping.publish_dormant_contact_forces, dim=5, inputs=[count, dormant, force, valid, public], device=device
-    )
+    publish_args = [
+        count,
+        body_component,
+        component_sleeping,
+        shape0,
+        shape1,
+        shape_body,
+        contact_asleep,
+        force,
+        valid,
+        public,
+    ]
+    wp.launch(sleeping.publish_dormant_contact_forces, dim=5, inputs=publish_args, device=device)
+    # Capture precedes the decision: the first force is ready, but publication
+    # must use the final component flags, not a tentative or old contact mask.
+    np.testing.assert_array_equal(public.numpy()[0], [-10] * 3)
+    np.testing.assert_array_equal(contact_asleep.numpy(), [0, 1, 1, 1, 0])
+    component_sleeping.assign(np.array([1, 1, 1, 1, 1], np.int32))
+    wp.launch(sleeping.publish_dormant_contact_forces, dim=5, inputs=publish_args, device=device)
     np.testing.assert_array_equal(public.numpy()[:4], force.numpy()[:4])
     np.testing.assert_array_equal(public.numpy()[4], [-10] * 3)
     if device.is_cuda:
@@ -198,15 +281,33 @@ def _check_forces(test, device):
             wp.launch(
                 sleeping.publish_dormant_contact_forces,
                 dim=5,
-                inputs=[count, dormant, force, valid, public],
+                inputs=publish_args,
                 device=device,
             )
         impulse.assign(np.array([[3, 0.3, -0.4, 1, 8, 9]], np.float32))
         wp.capture_launch(capture.graph)
         test.assertAlmostEqual(float(force.numpy()[0, 2]), -720.0)
+        component_sleeping.assign(np.array([0, 1, 1, 1, 1], np.int32))
+        public.fill_(wp.vec3(-10))
+        wp.capture_launch(capture.graph)
+        np.testing.assert_array_equal(public.numpy()[0], [-10] * 3)
+        test.assertEqual(int(contact_asleep.numpy()[0]), 0)
+        component_sleeping.assign(np.array([1, 1, 1, 1, 1], np.int32))
+    # An unsupported singleton's MF route must not globally veto independent
+    # eligible contacts; nor may a dynamic/dynamic pair acquire a dense lease.
+    eligible.assign(np.array([1, 1, 1, 1, 0], np.int32))
+    shape1.assign(np.array([5, 5, 5, 5, 5], np.int32))
+    wp.launch(sleeping.capture_dormant_contact_forces, dim=5, inputs=args, device=device)
+    test.assertEqual(int(status.numpy()[0]), 0)
+    test.assertEqual(int(valid.numpy()[4]), 0)
+    shape1.assign(np.array([5, 5, 5, 5, 0], np.int32))
+    count.assign(np.array([2], np.int32))
+    wp.launch(sleeping.publish_dormant_contact_forces, dim=5, inputs=publish_args, device=device)
+    np.testing.assert_array_equal(contact_asleep.numpy(), [1, 1, 0, 0, 0])
+    count.assign(np.array([5], np.int32))
     # Unsupported paths, bad world/slot, and executed nonfinite force cannot
     # grant a lease. The unrelated valid skipped contact remains untouched.
-    for values, index, expected in (([1, 0, -1, -1, 0], 5, 1), ([9, 0, 0, 0, 0], 3, 2), ([8, 3, -1, -1, 0], 4, 2)):
+    for values, index, expected in (([1, 0, -1, -1, 1], 9, 1), ([9, 0, 0, 0, 0], 7, 2), ([8, 3, -1, -1, 0], 8, 2)):
         original = args[index]
         args[index] = _array(values, device)
         status.zero_()
@@ -228,8 +329,9 @@ def _check_forces(test, device):
 
 class TestSleepContactRowsCPU(unittest.TestCase):
     def test_factory_api(self):
-        """Require the separate dormant-aware allocation kernel."""
+        """Require allocation-time singleton dormancy without a mask producer."""
         self.assertIsNotNone(sleeping.allocate_awake_world_contact_slots)
+        self.assertIsNotNone(sleeping.allocate_singleton_world_contact_slots)
 
     def test_original_allocation_and_dormant_routes(self):
         """Preserve awake allocation and overflow while excluding dormant rows."""

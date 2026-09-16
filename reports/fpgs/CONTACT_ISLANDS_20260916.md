@@ -86,3 +86,116 @@ on both GPUs before that integration correction. At 01:45 UTC the complete
 33-test targeted suite passed on each GPU, including both corrected capture
 tests, loaded physics, graph replay, topology, geometry and force primitives.
 The first whole-physics timing is pending; this is not performance acceptance.
+
+## First complete measurement: not accepted
+
+Candidate `7b003d0a`, reference `ca0d427a`, fixed Lab `53ee6b44`:
+`/tmp/fpgs-contact-islands-paired4k-20260916-01/manifest.json`.
+All four children exited 0; capacity, source and final idle guards passed.
+
+| GPU | Reference physics | Candidate physics | Reference / candidate |
+| --- | ---: | ---: | ---: |
+| RTX PRO6000 | 6.862266 ms | 7.764994 ms | 0.883744x |
+| GB300 | 6.112485 ms | 7.403039 ms | 0.825672x |
+
+Whole-environment wall time likewise regressed: 28.446714 to 31.304290 ms RTX,
+27.000021 to 29.156845 ms GB. This one discovery run is not repeat-qualified.
+Neither this candidate nor the earlier scalar-only owner replaces the accepted
+reference.
+
+At the post-profile endpoints the candidate retained 80,582 / 80,912 cached
+contacts (RTX / GB) and slept 430,190 / 430,439 components out of 446,464.
+These are two sampled endpoints per GPU, not time-weighted admission. All
+cache/island/force status checks passed. Actual dormant work was removed; lack
+of admission does not explain the loss.
+
+Matched five-step node diagnosis:
+`/tmp/fpgs-contact-islands-nodes-paired4k-20260916-01/manifest.json`.
+All guards passed. The following are kernel-duration sums, not additive
+whole-physics savings or accepted timing:
+
+| Stage | RTX reference -> candidate | GB reference -> candidate |
+| --- | ---: | ---: |
+| Contact producer | 0.8036 -> 0.4148 ms | 0.5542 -> 0.3911 ms |
+| Contact schedule | 0.2723 -> 0.1448 ms | 0.2762 -> 0.1793 ms |
+| Primitive narrowphase | 0.1809 -> 0.0495 ms | 0.1385 -> 0.0524 ms |
+| GS | 1.0368 -> 1.1499 ms | 1.2434 -> 1.3106 ms |
+| Added contact-sleep maintenance | 0 -> 1.9392 ms | 0 -> 1.8250 ms |
+
+The identical GS kernel still launches eight times per environment step with
+4096 world blocks, retains serial/coupled work and limit projections, and uses
+unchanged registers/shared memory. Actual executed sweep counts and the precise
+hardware cause of its small regression were not captured. Cached contacts
+mostly removed already-parallel independent work, not the dominant convex or
+serial solve work.
+
+RTX added maintenance: topology construction 0.4454 ms, aggregation 0.1959,
+input/wake 0.5191, masks 0.1215, grants/sealing 0.4154, geometry cache 0.1372,
+force cache 0.0493 and status 0.0553. Reusing topology between substeps exposes
+only about 0.2263 ms before replacement overhead. A topology-only tuning pass
+is therefore NOT funded as a rescue. A substantially smaller complete owner,
+not a launch/parameter grid, is required.
+
+## One funded architectural correction: singleton/static leases
+
+At 02:07 UTC, fund one complete-controller replacement, not repeated topology
+caching alone. The first dynamics consumer already owns independent scalar
+mechanical components. Restrict its contact leases to singleton components
+touching only static geometry. Every dynamic/dynamic broadphase candidate must
+wake both endpoints unconditionally and veto sleeping for the entire collision
+generation. Coupled components stay awake; do not claim general articulated or
+multi-component island sleeping. This capability is model-derived, with no
+Keyboard-specific geometry, branch count or physical parameter.
+
+Under that invariant no dormant lease contains a dynamic edge, so the full
+parent/union/aggregation pipeline is unnecessary. Fold live input validation
+and quiet/grant decisions into the existing scalar prepare/finish owners.
+Capture eligible static-contact forces before granting; preserve global status
+veto, exact input-pose geometry, total acceleration and unexpected-response
+handling. Allocator/publication consumers select current sleeping endpoints
+directly instead of repeated full-capacity mask production. Geometry incidence
+belongs to the collision generation. Keep full broadphase discovery, static
+pose/model invalidation, and fallback for unmanaged contact generations.
+
+The measured gross retirement opportunity is about 1.3885 ms RTX for topology,
+redundant input checks, separate grants and masks, before replacement costs.
+This is a plausible but tight correction, not a promised net win or a 2x path.
+Use the original 33 tests plus conservative-coupling regressions and the same
+paired protocol. Target frozen integrated implementation by 02:45 UTC and
+first paired whole result by 03:15 UTC. No microparameter grid follows if the
+complete corrected owner still fails the approximately 0.7 ms RTX milestone.
+
+At 02:24 UTC, the direct endpoint allocator/force consumers pass their three
+CPU controls, and the fused mode-2 finish passes four CPU controls. A new test
+fails its grant assertion against the exact HEAD `finish_components` body
+loaded in an isolated module using the new descriptor; this is not a replay
+of the old descriptor or the complete old controller. The test covers stale
+pose seals, total solved acceleration at tiny timesteps, cache/contact status,
+generation and coupling vetoes, canonical zero velocity and unexpected solved
+responses. Runtime integration and native timing are still pending.
+
+The first attempted native pre-replacement coupling checks encountered an ABI
+mismatch during concurrent controller replacement (15 versus 19 force-capture
+arguments). They are not evidence of a physical regression. The new broad-only
+pair and three-component-chain tests will instead qualify the explicitly more
+conservative singleton/static policy after the integrated controller is frozen.
+
+The first integrated mode-2 native run exercised 36 tests on each GPU and
+failed six loaded-sleep admission assertions per card; physical state/contact
+comparisons and the two conservative-coupling controls passed. A one-fixture
+RTX diagnosis found zero coupling/static/status vetoes and physically quiet
+velocities around 9e-11, but counters reset to zero every collision tick.
+Fusing the exact geometry-seal check into quiet-history accumulation was the
+cause: the second substep moves the input coordinate by about 7e-16 relative
+to the collision pose. The original owner accumulated physical quietness
+independently and required an exact seal only when granting sleep. Restore
+that distinction without relaxing geometry validity or physical thresholds,
+then rerun the complete native suite before timing.
+
+At 02:35 UTC, that corrected complete 36-test suite passes on both RTX and
+GB300 (11.73 / 12.17 seconds). Loaded contacts now acquire leases, retain
+geometry/forces, and restore ordinary rows on wake; broad-only dynamic pairs
+and loaded three-component chains remain awake independent of pair order.
+Cold capture, synchronized stream migration, masked resets and fresh/in-place
+publication pass. Full repository pre-commit passes before pinning the
+whole-physics measurement; no performance acceptance follows from these tests.

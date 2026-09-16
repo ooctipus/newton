@@ -2499,7 +2499,7 @@ class SolverFeatherPGS(SolverBase):
             self._contact_sleep = ContactSleep.create(self._awake_pipeline)
             if self._contact_sleep is not None:
                 self._awake_pipeline.contact_sleep = self._contact_sleep
-                self._awake_pipeline.data.managed_sleep = 1
+                self._awake_pipeline.data.managed_sleep = 2
 
     def prepare_contact_sleep(self, contacts: Contacts) -> None:
         """Bind experimental contact sleeping before the first collision.
@@ -11787,10 +11787,23 @@ class SolverFeatherPGS(SolverBase):
             allocation_kernel = allocate_world_contact_slots
             allocation_prefix = []
             if self._contact_sleep is not None:
-                from .sleep_contact_rows import allocate_awake_world_contact_slots  # noqa: PLC0415
+                owner = self._contact_sleep
+                if owner.data.managed_sleep == 2:
+                    from .sleep_contact_rows import allocate_singleton_world_contact_slots  # noqa: PLC0415
 
-                allocation_kernel = allocate_awake_world_contact_slots
-                allocation_prefix = [self._contact_sleep.contact_asleep]
+                    allocation_kernel = allocate_singleton_world_contact_slots
+                    allocation_prefix = [
+                        owner.plan.body_component,
+                        owner.data.sleeping,
+                        owner.cache.held_force,
+                        owner.cache.held_valid,
+                        owner.contact_asleep,
+                    ]
+                else:
+                    from .sleep_contact_rows import allocate_awake_world_contact_slots  # noqa: PLC0415
+
+                    allocation_kernel = allocate_awake_world_contact_slots
+                    allocation_prefix = [owner.contact_asleep]
             wp.launch(
                 allocation_kernel,
                 dim=contact_build_threads,

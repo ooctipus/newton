@@ -48,6 +48,14 @@ class ComponentData:
     can_sleep: wp.array[int]
     body_awake: wp.array[int]
     joint_awake: wp.array[int]
+    collision_q: wp.array[float]
+    collision_valid: wp.array[int]
+    collision_generation: wp.array[int]
+    contact_generation: wp.array[int]
+    contact_blocked: wp.array[int]
+    contact_status: wp.array[int]
+    cache_status: wp.array[int]
+    static_changed: wp.array[int]
 
 
 @wp.struct
@@ -174,6 +182,15 @@ def prepare_components(
     allowed = allowed and target_velocity == 0.0 and joint_force[dof] == 0.0 and kinematic[dof] == 0
     for element in range(6):
         allowed = allowed and force[element] == 0.0
+    if data.managed_sleep == 2:
+        geometry_changed = data.collision_generation[component] != data.contact_generation[0]
+        geometry_changed = geometry_changed or data.static_changed[world] != 0
+        geometry_changed = geometry_changed or data.static_changed[data.static_changed.shape[0] - 1] != 0
+        if dirty or geometry_changed:
+            data.collision_valid[component] = 0
+        allowed = allowed and data.collision_valid[component] != 0 and not geometry_changed
+        allowed = allowed and data.contact_blocked[component] == 0
+        allowed = allowed and data.contact_status[0] == 0 and data.cache_status[0] == 0
     if dirty or authored or target_changed or data.expected_dt[component] != dt or not allowed:
         data.sleeping[component] = 0
         data.counters[component] = 0
@@ -265,6 +282,16 @@ def finish_components(
     joint = data.joint[component]
     dof = data.dof[component]
     coordinate = data.coordinate[component]
+    if data.managed_sleep == 2:
+        valid = data.contact_status[0] == 0 and data.cache_status[0] == 0
+        valid = valid and data.contact_blocked[component] == 0 and data.collision_valid[component] != 0
+        valid = valid and data.collision_generation[component] == data.contact_generation[0]
+        if not valid:
+            data.sleeping[component] = 0
+            data.counters[component] = 0
+            data.can_sleep[component] = 0
+            data.body_awake[body] = 1
+            data.joint_awake[joint] = 1
     was_asleep = data.sleeping[component] != 0
     if was_asleep and v_out[dof] == 0.0:
         # Public output may be a fresh allocation, so publication cannot be
@@ -296,7 +323,7 @@ def finish_components(
     if not was_asleep and kinematic[dof] == 0:
         velocity += acceleration * dt
         position += velocity * dt
-    if data.managed_sleep == 0:
+    if data.managed_sleep == 0 or data.managed_sleep == 2:
         scale = wp.length(p.axis)
         speed = wp.abs(velocity) * scale
         displacement = wp.abs(position - data.begin_q[component]) * scale
@@ -305,15 +332,28 @@ def finish_components(
         quiet = quiet and wp.isfinite(speed) and wp.isfinite(displacement)
         quiet = quiet and speed <= tolerance and displacement <= tolerance * dt
         quiet = quiet and wp.isfinite(acceleration) and wp.abs(acceleration) * scale * _REST_HORIZON <= tolerance
+        geometry_valid = bool(True)
+        if data.managed_sleep == 2:
+            # The retained contact packet belongs to the input pose. A new
+            # lease freezes that pose, never the tiny proposed displacement.
+            # Between collisions, retain physical quiet history even when a
+            # substep has moved slightly; only the grant needs an exact seal.
+            geometry_valid = data.contact[component] == 0 or q[coordinate] == data.collision_q[component]
+            quiet = quiet and kinematic[dof] == 0
         if quiet:
             data.counters[component] = wp.min(data.counters[component] + 1, quiet_steps)
-            if data.counters[component] >= quiet_steps:
+            if data.counters[component] >= quiet_steps and geometry_valid:
                 data.sleeping[component] = 1
                 velocity = 0.0
                 acceleration = 0.0
                 v_out[dof] = 0.0
                 state.tau[dof] = 0.0
                 state.v_hat[dof] = 0.0
+                if data.managed_sleep == 2:
+                    position = q[coordinate]
+                    state.body_v[body] = wp.spatial_vector()
+                    data.body_awake[body] = 0
+                    data.joint_awake[joint] = 0
         else:
             data.counters[component] = 0
             data.sleeping[component] = 0
@@ -780,22 +820,23 @@ class AwakePipeline:
         if not math.isfinite(dt) or dt <= 0.0:
             raise ValueError("sleeping requires a positive finite timestep")
         sleep = self.sleep
-        sleep.contact_component.zero_()
-        sleep.invalid_contacts.zero_()
-        if contacts is not None:
-            wp.launch(
-                _mark_contacts,
-                dim=max(1, contacts.rigid_contact_max),
-                inputs=[
-                    contacts.rigid_contact_count,
-                    contacts.rigid_contact_shape0,
-                    contacts.rigid_contact_shape1,
-                    self.model.shape_body,
-                    sleep.plan.body_component,
-                ],
-                outputs=[sleep.contact_component, sleep.invalid_contacts],
-                device=self.model.device,
-            )
+        if self.contact_sleep is None or self.data.managed_sleep != 2:
+            sleep.contact_component.zero_()
+            sleep.invalid_contacts.zero_()
+            if contacts is not None:
+                wp.launch(
+                    _mark_contacts,
+                    dim=max(1, contacts.rigid_contact_max),
+                    inputs=[
+                        contacts.rigid_contact_count,
+                        contacts.rigid_contact_shape0,
+                        contacts.rigid_contact_shape1,
+                        self.model.shape_body,
+                        sleep.plan.body_component,
+                    ],
+                    outputs=[sleep.contact_component, sleep.invalid_contacts],
+                    device=self.model.device,
+                )
         if self.contact_sleep is not None:
             self.contact_sleep.begin(state_in, state_aug, control, contacts, dt)
         wp.launch(
