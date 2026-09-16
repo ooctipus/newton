@@ -97,8 +97,11 @@ def main():
     """Report old/new native physics and balanced replay costs without promotion."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gpu-source", type=int, choices=(0, 1), required=True)
-    parser.add_argument("--candidate", choices=("coupled_contact", "coupled_jacobi"), default="coupled_contact")
+    parser.add_argument(
+        "--candidate", choices=("coupled_contact", "coupled_jacobi", "spectral_contact"), default="coupled_contact"
+    )
     parser.add_argument("--candidate-sha", help="Required frozen source SHA for a new native candidate")
+    parser.add_argument("--register-whitening", action="store_true", help="Retain the accepted register row producer")
     args = parser.parse_args()
     if args.candidate != "coupled_contact" and args.candidate_sha is None:
         parser.error("A new native candidate requires its explicit frozen --candidate-sha")
@@ -106,6 +109,7 @@ def main():
     native_sha = args.candidate_sha or NATIVE_SHA
     source_path = Path(candidate_module.__file__)
     assert hashlib.sha256(source_path.read_bytes()).hexdigest() == native_sha
+    assert hashlib.sha256(Path(coupled_contact.__file__).read_bytes()).hexdigest() == NATIVE_SHA
     assert hashlib.sha256(HELPER.read_bytes()).hexdigest() == HELPER_SHA
     spec = importlib.util.spec_from_file_location("coupled_existing_physics", HELPER)
     helper = importlib.util.module_from_spec(spec)
@@ -115,6 +119,13 @@ def main():
     assert wp.get_device(device).is_cuda
     for name in ("_INK_CHECK", "_WR_CHECK", "_WR_WARM", "_REGISTER_WHITENING", "_SHADOW_LEAN"):
         setattr(original, name, False)
+    original._REGISTER_WHITENING = args.register_whitening
+    cpu_control = None
+    if args.candidate == "spectral_contact":
+        cpu_control = importlib.import_module("tools.fpgs_bench.spectral_gs_control")
+        assert hashlib.sha256(Path(cpu_control.__file__).read_bytes()).hexdigest() == (
+            "a39eb83e4f5b240a24416f96683df0cc5e7453c8f180cbf539f9d752141256c7"
+        )
     candidate_module.get_parallel_factory.cache_clear()
     print(
         "SCOPE",
@@ -127,7 +138,7 @@ def main():
                 "source_gpu": args.gpu_source,
                 "worlds": 512,
                 "includes_output_restore": True,
-                "register_whitening": False,
+                "register_whitening": args.register_whitening,
             }
         ),
         flush=True,
@@ -139,7 +150,7 @@ def main():
                 *(bind(arrays, scalar, tier, candidate, device, candidate_module) for candidate in (False, True)),
                 strict=True,
             )
-            failures, hard_failures = [], []
+            failures, hard_failures, translation_controls = [], [], []
             count = arrays["world_constraint_count"]
             inactive = (~np.isin(np.arange(len(count)), owned)[:, None]) | (
                 np.arange(arrays["world_impulses"].shape[1])[None, :] >= count[:, None]
@@ -172,6 +183,36 @@ def main():
                 ]
                 if failed:
                     failures.append({"world": int(world), "failed": failed, "old": old, "new": new})
+                if cpu_control is not None and world == owned[0]:
+                    # One predeclared first-owned world per partition checks
+                    # translation against the frozen double CPU map. Preserve
+                    # FP32 stopping/association differences as diagnostics.
+                    expected = cpu_control.solve(
+                        problem["J"],
+                        problem["L"],
+                        np.sum(problem["Z"] ** 2, axis=1) + problem["cfm"],
+                        problem["bias"],
+                        problem["kind"],
+                        problem["parent"],
+                        problem["mu"],
+                        problem["predictor"],
+                        iterations=24,
+                    )
+                    kinetic_reference = problem["L"].T @ expected.velocity
+                    kinetic_error = problem["L"].T @ (outputs[1]["v_out"][ids] - expected.velocity)
+                    translation_controls.append(
+                        {
+                            "world": int(world),
+                            "cpu_sweeps": expected.work["sweeps"],
+                            "cpu_physical_stop": expected.work["physical_stop"],
+                            "held_H_velocity_error_scaled": float(
+                                np.linalg.norm(kinetic_error) / (1 + np.linalg.norm(kinetic_reference))
+                            ),
+                            "impulse_error_inf": float(np.max(np.abs(impulse - expected.impulses))),
+                            "cpu_physical": physical.residuals(problem, expected.impulses, expected.velocity),
+                            "native_physical": new,
+                        }
+                    )
             samples = [[], []]
             for graph in graphs:
                 wp.capture_launch(graph)
@@ -188,6 +229,7 @@ def main():
                         "cases": len(owned),
                         "failures": failures,
                         "hard_failures": hard_failures,
+                        "translation_controls": translation_controls,
                         "samples_ms": samples,
                         "median_ms": medians,
                         "replay_speedup": medians[0] / medians[1],
@@ -199,6 +241,7 @@ def main():
             assert not hard_failures, "Native hard physical failure; no further timing funded"
             assert len(leases) == 2
     assert hashlib.sha256(source_path.read_bytes()).hexdigest() == native_sha
+    assert hashlib.sha256(Path(coupled_contact.__file__).read_bytes()).hexdigest() == NATIVE_SHA
     print("COMPLETE", flush=True)
 
 
