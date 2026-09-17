@@ -99,129 +99,145 @@ def _prefix_source():
     )
 
 
-def _row_source(row: int):
-    """Generate one constant Gram-column site, including scalar fallthrough."""
-    contact = ""
-    if row + 2 < 32:
-        first, second = row + 1, row + 2
-        contact = f"""
-            if(type==0 && {second}<count && iteration>=friction_start && omega==1.0f &&
-               __shfl_sync(0xffffffff,type_row,{first})==2 &&
-               __shfl_sync(0xffffffff,type_row,{second})==2 &&
-               __shfl_sync(0xffffffff,parent_row,{first})=={row} &&
-               __shfl_sync(0xffffffff,parent_row,{second})=={row} &&
-               __shfl_sync(0xffffffff,template_row,{first})==__shfl_sync(0xffffffff,template_row,{row}) &&
-               __shfl_sync(0xffffffff,template_row,{second})==__shfl_sync(0xffffffff,template_row,{row})) {{
-                const float friction=__shfl_sync(0xffffffff,friction_row,{first});
+def _row_source():
+    """Use one ordered body and a uniform selector of named Gram registers."""
+    selection = []
+    for row in range(32):
+        previous = f"g{row - 1}" if row > 0 else "0.0f"
+        following = f"g{row + 1}" if row < 31 else "0.0f"
+        second = f"g{row + 2}" if row < 30 else "0.0f"
+        selection.append(
+            f"            case {row}: g_previous={previous}; g_current=g{row}; "
+            f"g_next={following}; g_next2={second}; break;"
+        )
+    return (
+        r"""
+        // All lanes select the same column IDs. No register array, address,
+        // or dynamically indexed local allocation is introduced.
+        #pragma unroll 1
+        for(int row=prefix_handled?limit_count:0;row<count;++row) {
+            float g_previous=0.0f,g_current=0.0f,g_next=0.0f,g_next2=0.0f;
+            switch(row) {
+    """
+        + "\n".join(selection)
+        + r"""
+            }
+            const int first=row+1,second=row+2;
+            const int type=__shfl_sync(0xffffffff,type_row,row);
+            bool handled=false;
+            if(type==0 && second<count && iteration>=friction_start && omega==1.0f &&
+               __shfl_sync(0xffffffff,type_row,first)==2 &&
+               __shfl_sync(0xffffffff,type_row,second)==2 &&
+               __shfl_sync(0xffffffff,parent_row,first)==row &&
+               __shfl_sync(0xffffffff,parent_row,second)==row &&
+               __shfl_sync(0xffffffff,template_row,first)==__shfl_sync(0xffffffff,template_row,row) &&
+               __shfl_sync(0xffffffff,template_row,second)==__shfl_sync(0xffffffff,template_row,row)) {
+                const float friction=__shfl_sync(0xffffffff,friction_row,first);
                 if(isfinite(friction) && friction>=0.0f &&
-                   friction==__shfl_sync(0xffffffff,friction_row,{second})) {{
-                    const float old0=__shfl_sync(0xffffffff,lambda_row,{row});
-                    const float old1=__shfl_sync(0xffffffff,lambda_row,{first});
-                    const float old2=__shfl_sync(0xffffffff,lambda_row,{second});
-                    const float r0=__shfl_sync(0xffffffff,residual_row,{row});
-                    const float d0=__shfl_sync(0xffffffff,denominator_row,{row});
+                   friction==__shfl_sync(0xffffffff,friction_row,second)) {
+                    const float old0=__shfl_sync(0xffffffff,lambda_row,row);
+                    const float old1=__shfl_sync(0xffffffff,lambda_row,first);
+                    const float old2=__shfl_sync(0xffffffff,lambda_row,second);
+                    const float r0=__shfl_sync(0xffffffff,residual_row,row);
+                    const float d0=__shfl_sync(0xffffffff,denominator_row,row);
                     const float next0=fmaxf(old0-r0/d0,0.0f),delta0=next0-old0;
                     const float radius=friction*next0;
                     int accepted=isfinite(r0) && isfinite(next0) && isfinite(delta0) &&
                         isfinite(radius) && radius==0.0f;
                     float next1=0.0f,next2=0.0f;
                     if(isfinite(r0) && isfinite(next0) && isfinite(delta0) &&
-                       isfinite(radius) && radius>0.0f) {{
-                        const int ready=__shfl_sync(0xffffffff,denominator_ready,{row});
-                        if(!ready) {{
-                            const float c1=__shfl_sync(0xffffffff,cfm_row,{first});
-                            const float c2=__shfl_sync(0xffffffff,cfm_row,{second});
-                            const float a=__shfl_sync(0xffffffff,denominator_row,{first})-c1;
-                            const float c=__shfl_sync(0xffffffff,denominator_row,{second})-c2;
-                            const float cross=__shfl_sync(0xffffffff,g{second},{first});
+                       isfinite(radius) && radius>0.0f) {
+                        const int ready=__shfl_sync(0xffffffff,denominator_ready,row);
+                        if(!ready) {
+                            const float c1=__shfl_sync(0xffffffff,cfm_row,first);
+                            const float c2=__shfl_sync(0xffffffff,cfm_row,second);
+                            const float a=__shfl_sync(0xffffffff,denominator_row,first)-c1;
+                            const float c=__shfl_sync(0xffffffff,denominator_row,second)-c2;
+                            const float cross=__shfl_sync(0xffffffff,g_next2,first);
                             const float largest=0.5f*(a+c)+hypotf(0.5f*(a-c),cross);
                             const float den=largest+fmaxf(c1,c2);
-                            if(lane=={row}) {{
+                            if(lane==row) {
                                 tangent_denominator=(isfinite(a) && isfinite(c) && a>0.0f && c>0.0f &&
                                     isfinite(c1) && isfinite(c2) && c1>=0.0f && c2>=0.0f &&
                                     isfinite(cross) && isfinite(den) && den>0.0f)?den:0.0f;
                                 denominator_ready=1;
-                            }}
-                        }}
-                        const float den=__shfl_sync(0xffffffff,tangent_denominator,{row});
-                        const float r1=__shfl_sync(0xffffffff,residual_row,{first})+
-                            __shfl_sync(0xffffffff,g{row},{first})*delta0;
-                        const float r2=__shfl_sync(0xffffffff,residual_row,{second})+
-                            __shfl_sync(0xffffffff,g{row},{second})*delta0;
-                        if(den>0.0f && isfinite(r1) && isfinite(r2)) {{
+                            }
+                        }
+                        const float den=__shfl_sync(0xffffffff,tangent_denominator,row);
+                        const float r1=__shfl_sync(0xffffffff,residual_row,first)+
+                            __shfl_sync(0xffffffff,g_current,first)*delta0;
+                        const float r2=__shfl_sync(0xffffffff,residual_row,second)+
+                            __shfl_sync(0xffffffff,g_current,second)*delta0;
+                        if(den>0.0f && isfinite(r1) && isfinite(r2)) {
                             const float x1=old1-r1/den,x2=old2-r2/den;
                             const float magnitude=hypotf(x1,x2);
-                            if(isfinite(x1) && isfinite(x2) && isfinite(magnitude)) {{
+                            if(isfinite(x1) && isfinite(x2) && isfinite(magnitude)) {
                                 const float repair=magnitude>radius?radius/magnitude:1.0f;
                                 next1=x1*repair;next2=x2*repair;accepted=1;
-                            }}
-                        }}
-                    }}
+                            }
+                        }
+                    }
                     const float delta1=next1-old1,delta2=next2-old2;
-                    if(accepted && isfinite(delta1) && isfinite(delta2)) {{
-                        if(lane=={row}) {{lambda_row=next0;applied_row+=delta0;}}
-                        if(lane=={first}) {{lambda_row=next1;applied_row+=delta1;}}
-                        if(lane=={second}) {{lambda_row=next2;applied_row+=delta2;}}
-                        if(delta0!=0.0f || delta1!=0.0f || delta2!=0.0f) {{
-                            residual_row+=(g{row}*delta0+g{first}*delta1)+g{second}*delta2;
+                    if(accepted && isfinite(delta1) && isfinite(delta2)) {
+                        if(lane==row) {lambda_row=next0;applied_row+=delta0;}
+                        if(lane==first) {lambda_row=next1;applied_row+=delta1;}
+                        if(lane==second) {lambda_row=next2;applied_row+=delta2;}
+                        if(delta0!=0.0f || delta1!=0.0f || delta2!=0.0f) {
+                            residual_row+=(g_current*delta0+g_next*delta1)+g_next2*delta2;
                             changed=1;
-                        }}
-                        handled=true;skip={row + 3};
-                    }}
-                }}
-            }}
-        """
-    previous = f"g{row - 1}" if row > 0 else "0.0f"
-    following = f"g{row + 1}" if row < 31 else "0.0f"
-    return f"""
-        if({row}<count && {row}>=skip && (!prefix_handled || {row}>=limit_count)) {{
-            const int type=__shfl_sync(0xffffffff,type_row,{row});
-            bool handled=false;
-            {contact}
-            if(!handled) {{
-                if(type==2 && iteration<friction_start) {{
+                        }
+                        handled=true;
+                    }
+                }
+            }
+            if(!handled) {
+                if(type==2 && iteration<friction_start) {
                     // Original delayed-friction clearing is not a physical
                     // impulse action. Preserve applied_row/residual here.
-                    if(lane=={row})lambda_row=0.0f;
-                }} else {{
-                    const float old=__shfl_sync(0xffffffff,lambda_row,{row});
-                    const float residual=__shfl_sync(0xffffffff,residual_row,{row});
-                    const float den=__shfl_sync(0xffffffff,denominator_row,{row});
+                    if(lane==row)lambda_row=0.0f;
+                } else {
+                    const float old=__shfl_sync(0xffffffff,lambda_row,row);
+                    const float residual=__shfl_sync(0xffffffff,residual_row,row);
+                    const float den=__shfl_sync(0xffffffff,denominator_row,row);
                     float next=old+omega*(-residual/den),sibling_delta=0.0f;
                     int sibling=-1;
                     if(type==0 || type==3)next=fmaxf(next,0.0f);
-                    else {{
-                        const int par=__shfl_sync(0xffffffff,parent_row,{row});
-                        const float friction=__shfl_sync(0xffffffff,friction_row,{row});
+                    else {
+                        const int par=__shfl_sync(0xffffffff,parent_row,row);
+                        const float friction=__shfl_sync(0xffffffff,friction_row,row);
                         const float radius=fmaxf(friction*__shfl_sync(0xffffffff,lambda_row,par),0.0f);
                         if(radius<=0.0f)next=0.0f;
-                        else {{
-                            sibling={row}==par+1?par+2:par+1;
+                        else {
+                            sibling=row==par+1?par+2:par+1;
                             const float other=__shfl_sync(0xffffffff,lambda_row,sibling);
                             const float magnitude=sqrtf(next*next+other*other);
-                            if(magnitude>radius) {{
+                            if(magnitude>radius) {
                                 const float scale=radius/magnitude;next*=scale;
                                 sibling_delta=other*scale-other;
                                 if(lane==sibling)lambda_row=other*scale;
-                            }}
-                        }}
-                    }}
+                            }
+                        }
+                    }
                     const float delta=next-old;
-                    if(lane=={row})lambda_row=next;
-                    if(sibling_delta!=0.0f) {{
-                        residual_row+=(sibling=={row - 1}?{previous}:{following})*sibling_delta;
+                    if(lane==row)lambda_row=next;
+                    if(sibling_delta!=0.0f) {
+                        residual_row+=(sibling==row-1?g_previous:g_next)*sibling_delta;
                         if(lane==sibling)applied_row+=sibling_delta;
                         changed=1;
-                    }}
-                    if(delta!=0.0f) {{
-                        residual_row+=g{row}*delta;
-                        if(lane=={row})applied_row+=delta;
+                    }
+                    if(delta!=0.0f) {
+                        residual_row+=g_current*delta;
+                        if(lane==row)applied_row+=delta;
                         changed=1;
-                    }}
-                }}
-            }}
-        }}
+                    }
+                }
+            }
+            // Successful contact handling consumes this normal and both
+            // tangents. The loop increment advances to the next original row.
+            if(handled)row+=2;
+        }
     """
+    )
 
 
 def native_source():
@@ -299,10 +315,10 @@ def native_source():
     float tangent_denominator=0.0f;
     int denominator_ready=0;
     for(int iteration=0;iteration<iterations;++iteration) {
-        int changed=0,skip=0;
+        int changed=0;
     """
         + _prefix_source()
-        + "".join(_row_source(row) for row in range(32))
+        + _row_source()
         + r"""
         if(__any_sync(0xffffffff,!isfinite(lambda_row) || !isfinite(applied_row) ||
                       !isfinite(residual_row)))return;

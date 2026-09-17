@@ -108,6 +108,20 @@ def seed_contact(f, kind, *, incoming=None):
 
 
 class TestSparseRegisterResidual(unittest.TestCase):
+    def test_compact_ordered_body(self):
+        """Keep one dynamic ordered body without dynamically indexed Gram storage."""
+        source = register.native_source()
+        self.assertEqual(source.count("const float next0=fmaxf(old0-r0/d0,0.0f),delta0=next0-old0;"), 1)
+        self.assertEqual(source.count("float next=old+omega*(-residual/den),sibling_delta=0.0f;"), 1)
+        self.assertEqual(source.count("switch(row)"), 1)
+        self.assertIn("#pragma unroll 1", source)
+        self.assertIn("for(int row=prefix_handled?limit_count:0;row<count;++row)", source)
+        for row in range(32):
+            self.assertIn(f"case {row}:", source)
+            self.assertIn(f"g_current=g{row};", source)
+        self.assertNotIn("float g[", source)
+        self.assertNotIn("skip=", source)
+
     def test_factory(self):
         """Require separate cached small and original-fallback owners."""
         small = register.get_solve_kernel()
