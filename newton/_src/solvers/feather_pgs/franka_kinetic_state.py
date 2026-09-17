@@ -8,6 +8,7 @@ import hashlib
 import inspect
 import linecache
 import math
+import os
 import textwrap
 
 import numpy as np
@@ -770,7 +771,11 @@ class FrankaKineticState:
         self.data.current_valid.zero_()
         self.geometry_valid, self.status = self.data.geometry_valid, self.data.status
         self.geometric, self.bias = self.data.geometric, self.data.bias
-        self.repair_kernel, self.finish_kernel = get_state_kernel(False), get_state_kernel(True)
+        self.compact_workspace = os.environ.get("FEATHER_PGS_FRANKA_COMPACT_WORKSPACE", "0") == "1"
+        state_factory = get_state_kernel
+        if self.compact_workspace:
+            from .franka_compact_workspace import get_state_kernel as state_factory  # noqa: PLC0415
+        self.repair_kernel, self.finish_kernel = state_factory(False), state_factory(True)
         self.predictor_kernel = get_predictor_kernel()
         fields = (*world_scan_owner.PLAN_FIELDS, "joint_axis", "joint_X_p", "joint_X_c")
         self._model_plan = {name: _fingerprint(getattr(model, name)) for name in fields}
