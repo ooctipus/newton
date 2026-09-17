@@ -6,8 +6,10 @@ Default-off, unpromoted experiment from `ca0d427af809571bb5501f644c1a6e03990cd2a
 on `ooctipus/fpgs-franka-compact-workspace-20260917`. Four native controls pass
 on each GPU. Two clean RTX whole comparisons save0.311205/0.185416 ms
 (1.064874x/1.038120x), below the predeclared0.5-ms milestone. The positive
-structural result is preserved without a tuning grid or promotion. No valid
-GB whole comparison exists yet; attribution remains pending.
+structural result is preserved without a tuning grid or promotion. The clean
+GB comparison is flat:4.690438→4.688745 ms (1.000361x). The first paired RTX
+node attempt was interrupted by an external GPU job before candidate launch;
+attribution remains pending.
 
 `FEATHER_PGS_FRANKA_COMPACT_WORKSPACE=1` changes only the workspace helpers of
 the existing admitted `FrankaKineticState` repair/finish owners. The paired16
@@ -118,7 +120,7 @@ and maximum8 GS passes. Both explicitly enable the retained kinetic owner,
 paired16 and masked rows; world-lane/streaming flags remain0. Only the new
 compact-workspace flag differs0/1. Actual repair/finish factory identity,
 unchanged predictor/cache/factor shapes, source/idle and capacity guards pass
-for both completed comparisons.
+for all three completed comparisons.
 
 | RTX ms/environment step | Run01 original | Run01 compact | Retry03 original | Retry03 compact |
 | --- | ---: | ---: | ---: | ---: |
@@ -132,24 +134,39 @@ multi-round performance promotion. Wall stepping is not full RL throughput.
 No phase saving, achieved occupancy or memory-stall cause is inferred before
 strict node attribution.
 
+GB retry02 is flat: whole physics4.690438375→4.688745475 ms, a0.001692900-ms
+difference (1.000361056x). Wall stepping worsens27.596603299→28.507825048 ms.
+Both processes exit0; both boundary checks, actual flag0/1 owner identities,
+capacity checks and final source/idle guards pass. Thus the RTX benefit is not
+established as a two-card gain. Contact populations also differ between arms
+(GB before/after1739/1802 versus1680/1787); no identical-workload or isolated
+phase-cost claim is made from these whole-task runs.
+
 Completed manifests:
 
 - `/tmp/fpgs-franka-compact-workspace-whole-rtx16k-20260917-01/manifest.json`,
   SHA256 `e73489f4cbaa303e96b772ff6db896bcc1e089e23e26660661cb93c175b95cfe`.
 - `/tmp/fpgs-franka-compact-workspace-whole-rtx16k-20260917-03/manifest.json`,
   SHA256 `0f191c0999b1c6312720e0d4c620f5368ff06435dbaf16303caffa04e18a20f9`.
+- `/tmp/fpgs-franka-compact-workspace-whole-gb16k-20260917-02/manifest.json`,
+  SHA256 `b9176ef4747733753726756e5ae14afded0cce4d3a882c8ee4fe80235819d327`.
 
-Preserve two unrelated incomplete attempts without imputing candidate failure:
+Preserve three unrelated incomplete attempts without imputing candidate failure:
 
 - GB01 completed only the baseline before an external process4192934 acquired
   the selected GPU. Parent failed its idle guard before launching candidate;
-  final source guard passed. There is no valid GB comparison.
+  final source guard passed. This attempt supplies no valid GB comparison.
   `/tmp/fpgs-franka-compact-workspace-whole-gb16k-20260917-01/manifest.json`,
   SHA256 `54aa1064eaaf39ac297b00bf124f7fba9a600c911884d5d9c27431fa9efb58d9`.
 - RTX02 baseline exited139 during startup before capture reports; candidate
   never launched. Final source/idle guards passed. No runtime fix was made.
   `/tmp/fpgs-franka-compact-workspace-whole-rtx16k-20260917-02/manifest.json`,
   SHA256 `7eadc3b048dc7b75783fbf7db665f1476b41d15af34964aa6a534561127ce019`.
+- RTX node01 completed only baseline. External process56285 appeared between
+  arms; the parent idle guard stopped candidate launch. Final source guard
+  passed and final idle guard failed. There is no valid paired node attribution.
+  `/tmp/fpgs-franka-compact-workspace-node-rtx16k-20260917-01/manifest.json`,
+  SHA256 `bada0d58386aa29ca1e870e203d33c402aa9907935ae62d6c575b7724589ea7b`.
 
 ## Frozen runtime and observer pins
 
@@ -163,8 +180,10 @@ Preserve two unrelated incomplete attempts without imputing candidate failure:
 | `compact_workspace_capture_20260917/nsys_checked.sh` | `152afd356e4d38c79b486017effd0305fe737be4579bee23fe268a33391d8ba7` |
 
 Runtime/observer bytes remain the measured pins. Initial full and owned
-targeted precommit passed. Root approval is required before the scoped commit;
-no dependency pointer or accepted handoff is changed. The external strict node
+targeted precommit passed. The nine-file checkpoint was committed and pushed
+as `8ec4db342c0c5596060e89ef4923412a4a0ef1c1` on the isolated ooctipus branch;
+this later report update adds GB02 and the incomplete node attempt. No
+dependency pointer or accepted handoff is changed. The external strict node
 reader reuses the original complete Franka interval/correlation accounting and
 adds only exact compact aliases/guards. Attribution and any later measurements
 must be appended before making a phase-level claim.
