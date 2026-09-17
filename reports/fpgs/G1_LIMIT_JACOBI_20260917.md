@@ -3,9 +3,12 @@
 Status: default off and unpromoted. The first native implementation lost
 0.180 ms whole RTX; the sole actual-Z correction saves 0.625 ms against its
 paired original baseline, below the initial approximately 1 ms target. This is
-one fixed limit-only iteration change, not a contact Jacobi solver. A valid GB
-retry saves 0.469 ms physics-graph time but regresses environment wall time;
-corrected node attribution is not yet available.
+one fixed limit-only iteration change, not a contact Jacobi solver. Later
+three-round comparisons confirm median savings of 0.649229 ms RTX and
+0.467980 ms GB (1.051675x / 1.032415x), still below that target. Corrected
+strict node attribution and fresh symmetric backend comparisons are recorded
+below. The latter measure 2.915505x RTX / 2.409424x GB versus corrected MJWarp,
+not 4x or a full-convergence claim.
 Base: `a61ea916ab55ee83109accf1a0360a02f7e83f7f`.
 
 ## Initial implementation: complete ownership and numerical scope
@@ -241,7 +244,8 @@ The corrected external strict reader is prepared separately at
 It source-pins the preserved initial reader and substitutes only the corrected
 runtime hash; owner key, eight-call cadence, block32/grid16384, 48/12 root
 scopes, zero-unproven, source, budget and capacity checks are unchanged. This
-is prepared tooling, not a claimed corrected node result.
+was prepared tooling at that checkpoint; completed corrected node results are
+recorded below.
 
 Full and owned-file precommit plus diff checks passed for the corrected
 checkpoint. The initial commit `add5433f` was local-only when checked with
@@ -271,4 +275,100 @@ ratio 0.973581817: a wall-time regression, not a training throughput gain.
 Both arms completed with final source and idle guards true, unchanged physics
 budgets and the original capacity/actual-owner boundary checks. This valid
 retry does not replace or relabel the failed first attempt. It is one paired
-GB round; no repeat or whole >=1 ms achievement is claimed on either card.
+GB round; it alone establishes neither repeat evidence nor a whole >=1 ms gain.
+
+## Corrected strict node attribution
+
+The corrected RTX and GB candidate captures retain the original auxiliary-graph
+analyzer rejection; the supplemental strict readers pass 48 physics roots,
+12 separate auxiliary roots, zero unproven nodes, process/correlation/root
+membership, exact source/owner/capacity and final idle guards. They retain
+the original failure, not relabel its parent exit as success. Both observe
+exactly eight `sparse_spectral_limit_jacobi43_s18_c100` calls per environment
+step, block32/grid16384, and no original spectral solve key.
+
+| Corrected node measurement, ms/env step | RTX | GB |
+| --- | ---: | ---: |
+| GS interval union / owner sum |2.585308250|2.790901167|
+| GS exclusive busy |2.585060250|2.790109167|
+| Physics-root spans |12.678910250|14.621933333|
+
+RTX GS decreases from the original a61 owner sum 3.221638750 ms and the
+first unsuccessful limit implementation's 3.390996333 ms. This localizes the
+correction's benefit to the intended owner without crediting retained limit
+production. The current resources are 64 RTX / 66 GB registers, 1,632 shared
+bytes and zero reported local memory. These are resource facts, not measured
+occupancy or hardware-stall evidence. The 12-step node spans are attribution
+diagnostics, not substitutes for 40-step whole-graph timing. Sum, union and
+exclusive values are distinguished; overlapping phases are not added twice.
+Endpoint workloads differ between independently advanced arms, so exact
+trajectory or identical-workload attribution is not claimed.
+
+- RTX capture: `/tmp/fpgs-g1-limit-jacobi-zscatter-node-candidate16k-20260917-01`;
+  manifest SHA256 `5d7c2c2ee6f4f7ab7ded3d908df88850a4424705859bb00bde25781f6c0715b7`.
+  Strict output `/tmp/fpgs-g1-limit-zscatter-strict-OUU5xwAO/candidate_gpu0.json`,
+  SHA256 `4f4d38134307c2236a0c54dce6b6642a3bb6926b78bef2281d8720a9318e3490`.
+- GB capture: `/tmp/fpgs-g1-limit-jacobi-zscatter-node-candidate-gb16k-20260917-01`;
+  manifest SHA256 `8650660e5df95f0037f397eafeda8814fc6d2c9bf6efbfaf011757e481e81bc6`.
+  Strict output `/tmp/fpgs-g1-limit-zscatter-gb-strict-mOORZSVo/candidate_gpu1.json`,
+  SHA256 `3e5a2f209aeeed28e51f47536611ef045db390aa6c5fd820f5ba067edaef7d48`.
+
+## Three-round whole-graph evidence
+
+Each card completed three alternating AB/BA/AB rounds, all twelve total child
+processes exiting 0. Both arms retain 16K worlds, seed0, warmup200, separate
+40-step wall and profiler windows, dt0.005, two solver substeps, solver dt0.0025,
+maximum8 passes, dense100/raw294912/broad49152/triangle1769472 capacities,
+and identical shell/CSR/spectral settings. Only the limit flag differs.
+Baseline is clean a61ea916; measured candidate is clean f6ea5f2f. All recorded
+source/artifact/capacity/budget/owner checks and final source/idle guards pass.
+Independent replay reproduced all twelve results, common budget fingerprints
+and both summaries from the retained original reader.
+
+| Whole physics graph, ms/env step | Original rounds1/2/3 | Corrected rounds1/2/3 | Original/corrected medians | Ratio |
+| --- | --- | --- | --- | ---: |
+| RTX |13.196779625 /13.213030975 /13.219845450|12.563801900 /12.557283525 /12.567143800|13.213030975 /12.563801900|1.051674571x|
+| GB |14.886102400 /14.904974400 /14.908921300|14.436994400 /14.476180000 /14.429012650|14.904974400 /14.436994400|1.032415334x|
+
+Median savings are 0.649229075 ms RTX and 0.467980000 ms GB. Separately measured
+unprofiled environment-wall medians are 26.916233849→25.875517400 ms RTX
+(1.040220121x) and 28.850326201→27.198761300 ms GB (1.060722063x). These later
+repeat results do not erase the first GB round's wall regression. Wall stepping
+is not full RL throughput; the physics numbers are profiler-window graph
+measurements. Repeated modest gains do not meet the original 1-ms milestone.
+
+- `/tmp/fpgs-g1-limit-jacobi-zscatter-repeat3-rtx16k-20260917-01/manifest.json`:
+  `a2434d1138db53f502ecf9739932e62a9f562c2089a5f41ad91ad8eb9b9f77a6`.
+- `/tmp/fpgs-g1-limit-jacobi-zscatter-repeat3-gb16k-20260917-01/manifest.json`:
+  `e25cba6155e4a6161a2b8323e3d77bc9913e2e9c93e6a3e8aafd77e959ac4bdd`.
+
+## Fresh symmetric FPGS/MJWarp comparison
+
+Both backends use the same clean f6ea5f2f Newton tree and fixed Lab53ee6b44,
+with identical shared shell/CSR collision flags and unchanged calibrated
+capacities. FPGS enables the corrected limit/spectral/chain owner; MJ uses the
+existing pinned line-search correction with unchanged iteration/tolerance
+budgets and no warning suppression. MJ retains njmax120, nconmax19,
+raw311296, broad49152 and triangle1769472. The added observer checks actual
+CSR factories/buffer/status ownership on both backends, not flag presence alone.
+The root/independent audit passes source pins, actual ownership, both capacity
+and warning boundaries and ratios; a further original-reader replay confirms
+all four results, source snapshots and ratio arithmetic.
+
+| Card | FPGS physics graph, ms | MJWarp physics graph, ms | MJ/FPGS | Unprofiled wall FPGS/MJ, ms |
+| --- | ---: | ---: | ---: | ---: |
+| RTX |12.542372075|36.567342425|2.915504516x|26.078363726 /50.555739849|
+| GB |14.403644950|34.704481025|2.409423528x|29.411284998 /48.531055776|
+
+These are fresh single-round backend comparisons, not the incremental limit
+feature gain, bitwise/manifold equivalence, full numerical convergence or 4x
+acceleration. Existing finite-eight quality tradeoffs and bounded native scope
+remain; default-off and unpromoted status is unchanged. No runtime, flag,
+policy, capacity, dependency pointer or benchmark budget changed for this
+report-only update.
+
+- `/tmp/fpgs-g1-limit-jacobi-fair-rtx16k-20260917-01/manifest.json`:
+  `78ae214b9215be547fe68730d4b1099dff5401858447ad8f29ee4824e8171887`.
+- `/tmp/fpgs-g1-limit-jacobi-fair-gb16k-20260917-01/manifest.json`:
+  `ecbaafe181acb0176984875df52d790c0fdf8d05dd8eed20c73a74383eacd775`.
+- Source-pinned external recipe: `/tmp/fpgs-g1-limit-jacobi-fair-2sOK6Nrw/`.
