@@ -1,8 +1,9 @@
 # G1 register-resident residual experiment
 
-Experimental, default off, not promoted. The initial unrolled version is
-measured slower; one compact-control correction is under study. Funded 2026-09-17
-03:20 UTC; initial complete checkpoint by 04:50 UTC. Base is corrected
+Closed without an accepted gain; experimental, default off, not promoted.
+Both the initial unrolled version and its one compact-control correction are
+measured slower than the corrected-limit baseline. Funded 2026-09-17
+03:20 UTC; the complete correction was measured by 04:10 UTC. Base is corrected
 limit-Jacobi checkpoint `f6ea5f2f`, not the slower ordered-limit predecessor.
 No Isaac Lab, physics allowance, contact capacity or parent pointer changes.
 
@@ -183,4 +184,108 @@ The source-bound AOT report is
 `/tmp/fpgs-register-residual-offline-POBpNKXt/offline03/report.json`, SHA
 `4b4132eed9f83c7dfd4ee486b1ed733241321459da8af6e0df12eceb8029c04a`;
 `CODE_SIZE_COMPACT.md` records the disassembly evidence. Full-pipeline timing
-and compact-version historical replay are pending; no gain is claimed yet.
+and compact-version historical replay were pending at this checkpoint; their
+completed outcomes follow.
+
+## Compact correction closure
+
+Measured compact checkpoint is clean `f489a7ce4cea07eb6df51c6b8d71731345934ad1`.
+Its baseline is clean `c6ab26f9687f64fd2acfe66f5328f16be1820692`, a report-only
+descendant of f6ea with unchanged corrected-limit runtime. This closure changes
+only this report; runtime, tests and observer bytes remain those measured at
+f489. No further mapping, precision or instruction-tuning experiment is funded.
+
+### Bounded physical evidence
+
+Both compact native logs report five groups passed, retaining the original
+saved16 current/held J/H controls and the lifecycle/transaction cases above.
+Log SHA256 values are RTX
+`fbceff517623ed1b91f6a30a212f4fb005e6078d1fb3fef1a98136a962865013`
+and GB `b646c291f96ed01cb32f93dfda84d9224227c2514b279d02afea3ebb3782092f`.
+
+The compact historical replay also passes all 1268 unchanged hard checks, with
+zero pointwise diagnostic regressions at the inherited finite-eight thresholds.
+Selected IDs and small/fallback counts remain 556/79 RTX and 557/76 GB. Saved
+result NPZ bytes match the initial implementation on both cards; this is an
+observed result, not an added bit-identity acceptance requirement. Candidate
+momentum maximum tolerance ratios are 0.231561372042/0.213938347030 and maximum
+cone error is 1.7703387e-6 against the unchanged 3e-5 gate.
+
+This is historical ef9481 W/Z operator-consistency evidence, not a current
+shell/CSR population or new converged reference. Worst finite-eight natural,
+normal, complementarity and MDP diagnostics remain 0.0800951, 4.73185, 3.75119
+and 2.11003 respectively: passing the relative comparison is not a blanket
+convergence claim. Current/held geometry is covered separately by saved16.
+Artifact: `/tmp/fpgs-g1-register-residual-compact-historical1268-20260917-01`,
+manifest SHA `23681c53e0f05bfa5c03b40131b73283e037b89e51375bfe8f7bab002c448798`.
+Independent audit `/tmp/fpgs-register-residual-replay-jFAm9YjH/COMPACT_AUDIT.md`,
+SHA `826210d5737a537794329dea6b31b4b516cf27ddb2e22fd229a95e7739a19a87`,
+retains source/input/result guards and the diagnostic distributions.
+
+### Complete whole-physics result: still slower
+
+| Card | Corrected baseline ms | Compact register ms | Added ms | Baseline/candidate |
+| --- | ---: | ---: | ---: | ---: |
+| RTX | 12.509054475 | 12.868925575 | 0.359871100 | 0.972035653x |
+| GB300 | 14.430491375 | 14.861290400 | 0.430799025 | 0.971012004x |
+
+These are profiled whole physics-graph times, not unprofiled environment wall.
+Unprofiled wall changes 26.849472025 to 27.491607025 ms RTX and
+29.320621750 to 29.330968575 ms GB; the latter is effectively flat. Artifacts:
+`/tmp/fpgs-g1-register-residual-compact-whole-{rtx,gb}16k-20260917-01`.
+Manifest SHA256 values are RTX
+`e01c72185f740ce4c8550a30eaaeab339fff4e62d8ddd48e025e607d5931de7a`
+and GB `9f22fe1ecf1c8fd1324760b48f0b061adfc854adbec775f3defe7951fa524f31`.
+
+Independent replay passes the original result/source/artifact/capacity guards,
+all 19 driver pins, clean-tree and final-idle checks, exact owner activation and
+recomputed summaries. Only the register-residual flag differs. Both retain
+16384 worlds, 200 warmup/40 wall/40 profiled steps, dt 0.005, decimation four,
+two solver substeps and maximum eight iterations; all calibrated capacities,
+shared collision flags and chain/spectral/limit policies are unchanged.
+
+At the two recorded boundaries, contact counts differ by at most 0.630% and
+row counts by 0.444%. Candidate small/fallback counts are 15309/1075 and
+15237/1147 RTX, 15284/1100 and 15274/1110 GB, approximately 93% small on both
+cards. All worlds are nonempty with no MF rows. Host-call cadence is unchanged;
+post-boundary invalidated-cache counts do not show a reset explosion and are
+not cumulative reset counts. These observations exclude a recorded population
+explosion, not every possible executed-work difference: the captures do not
+record actual sweeps/early exits or prove identical trajectories.
+
+### Strict node attribution
+
+Candidate-only twelve-step diagnostics preserve the parent's auxiliary-label
+analyzer failure rather than relabeling the parent successful. The supplemental
+strict reader verifies all 48 physics/12 auxiliary roots, zero unproven nodes,
+process correlations, source/capacity guards, actual owners and eight calls per
+owner. Both owners enter one GS interval union; overlapping durations are not
+blindly summed.
+
+| Card | Small owner ms | Fallback ms | GS union ms | Earlier corrected GS union ms |
+| --- | ---: | ---: | ---: | ---: |
+| RTX | 2.001378083 | 0.936498500 | 2.937871250 | 2.585308250 |
+| GB300 | 2.244511917 | 0.998426333 | 3.241674250 | 2.790901167 |
+
+GS exclusive busy times are 2.937871250/3.240700917 ms. Small-owner resources
+remain 96 registers and 5760 shared bytes on both cards; fallback remains
+separate at 70/67 registers and 1632 shared bytes. Both use block32/grid16384
+with zero reported local memory. Other major families remain close; the GS
+excess of approximately 0.353/0.451 ms accounts for the whole loss. The shorter
+code removes most initial overhead but does not beat the corrected baseline.
+Neither instruction-cache stalls nor memory/occupancy bottlenecks were measured.
+These short diagnostic windows are attribution, not additional throughput runs.
+
+Node artifacts:
+`/tmp/fpgs-g1-register-residual-compact-node-candidate-{rtx,gb}16k-20260917-01`.
+Reader `/tmp/fpgs-g1-register-residual-compact-strict-Dg0vZanV/read_compact.py`,
+SHA `0ed5c49d52cba2594cecd927e573877187c63c5805330c801c3b638bf8952aaf`.
+Independent exact replay in `/tmp/fpgs-register-compact-node-review-9tVollcA`
+produces byte-identical result SHA256 values:
+
+- RTX: `0885293cd6af0184830ee58816d2039a2e7304c01b59952470b7b08b04f4d00f`.
+- GB: `5d8fbe8a58fda9e364803f65fc13b8000248f7c2d2f93c7c7aabbee940b14a3e`.
+
+Conclusion: retain the source and causal correction as an unpromoted experiment.
+Physical comparison passes within its stated scope, but neither complete version
+delivers an accepted gain, and neither the 1 ms milestone nor the 4x goal is met.
