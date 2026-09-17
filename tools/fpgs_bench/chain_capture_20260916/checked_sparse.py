@@ -8,6 +8,64 @@ import os
 from pathlib import Path
 
 
+def register_snapshot(sparse):
+    """Check both actual factories and the per-call route, not only a flag."""
+    import warp as wp  # noqa: PLC0415
+
+    flag = os.environ.get("FEATHER_PGS_SPARSE_REGISTER_RESIDUAL")
+    if flag not in ("0", "1"):
+        raise RuntimeError("Require explicit register-residual policy on both arms")
+    wanted = flag == "1"
+    actual = getattr(sparse, "register_residual", False)
+    route = getattr(sparse, "register_residual_routing", None)
+    fallback = getattr(sparse.kernels, "solve_fallback", None)
+    if type(actual) is not bool or actual != wanted:
+        raise RuntimeError("Requested register-residual policy differs from actual owner")
+    result = {"requested": wanted, "observed": actual, "check_pass": True}
+    if not wanted:
+        if route is not None or fallback is not None:
+            raise RuntimeError("Unexpected register-residual routing on the original owner")
+        return result
+    from newton._src.solvers.feather_pgs.sparse_register_residual import (  # noqa: PLC0415
+        get_fallback_kernel,
+        get_solve_kernel,
+    )
+
+    if sparse.limit_jacobi is not True or sparse.spectral_tangents is not True:
+        raise RuntimeError("Register residuals must retain corrected limits and spectral contacts")
+    if sparse.kernels.solve is not get_solve_kernel() or fallback is not get_fallback_kernel():
+        raise RuntimeError("Register-residual factories do not match actual dispatch")
+    solver = sparse.solver
+    worlds = int(solver.world_count)
+    if (
+        route is None
+        or route.dtype is not wp.int32
+        or route.shape != (worlds,)
+        or route.device != solver.model.device
+        or not route.is_contiguous
+    ):
+        raise RuntimeError("Unexpected register-residual route ownership/layout")
+    values = route.numpy()
+    if not ((values == 0) | (values == 1)).all():
+        raise RuntimeError("Register-residual route was not completely rewritten")
+    counts = solver.constraint_count.numpy()
+    if ((values == 1) & ((counts < 0) | (counts > 32))).any():
+        raise RuntimeError("Small owner published a world outside its row class")
+    for kernel in (sparse.kernels.solve, fallback):
+        arguments = [argument.label for argument in kernel.adj.args]
+        if len(arguments) != 16 or arguments[5] != "cfm" or arguments[-1] != "routing":
+            raise RuntimeError("Unexpected register-residual current-CFM/routing ABI")
+    result.update(
+        solve_key=sparse.kernels.solve.key,
+        fallback_key=fallback.key,
+        routing_shape=[worlds],
+        routing_logical_bytes=4 * worlds,
+        small_worlds=int((values == 1).sum()),
+        fallback_worlds=int((values == 0).sum()),
+    )
+    return result
+
+
 def limit_snapshot(sparse):
     """Require the actual limit-policy factory, not only its constructor marker."""
     flag = os.environ.get("FEATHER_PGS_SPARSE_LIMIT_JACOBI")
@@ -21,7 +79,9 @@ def limit_snapshot(sparse):
     if wanted and spectral is not True:
         raise RuntimeError("Limit Jacobi requires the spectral tangent owner")
     if spectral:
-        if wanted:
+        if getattr(sparse, "register_residual", False) is True:
+            from newton._src.solvers.feather_pgs.sparse_register_residual import get_solve_kernel  # noqa: PLC0415
+        elif wanted:
             from newton._src.solvers.feather_pgs.sparse_limit_jacobi import get_solve_kernel  # noqa: PLC0415
         else:
             from newton._src.solvers.feather_pgs.sparse_spectral_tangents import get_solve_kernel  # noqa: PLC0415
@@ -167,6 +227,8 @@ spectral_replacement = """    spectral_flag = os.environ.get("FEATHER_PGS_SPARSE
         raise RuntimeError("Requested spectral tangent owner is not active")
     limit_policy = limit_snapshot(sparse)
     result["limit_jacobi"] = limit_policy
+    register_policy = register_snapshot(sparse)
+    result["register_residual"] = register_policy
     if spectral_wanted:
         from newton._src.solvers.feather_pgs.sparse_spectral_tangents import get_solve_kernel
         import warp as wp
@@ -174,10 +236,13 @@ spectral_replacement = """    spectral_flag = os.environ.get("FEATHER_PGS_SPARSE
         if limit_policy["observed"]:
             from newton._src.solvers.feather_pgs.sparse_limit_jacobi import get_solve_kernel
             solve = "sparse_spectral_limit_jacobi43_s18_c100"
+        if register_policy["observed"]:
+            from newton._src.solvers.feather_pgs.sparse_register_residual import get_solve_kernel
+            solve = "sparse_register_residual43_s18_c100"
         if sparse.kernels.solve is not get_solve_kernel():
             raise RuntimeError("Spectral solve is not the exact cached factory")
         arguments = [argument.label for argument in sparse.kernels.solve.adj.args]
-        if len(arguments) != 15 or arguments[5] != "cfm":
+        if len(arguments) != (16 if register_policy["observed"] else 15) or arguments[5] != "cfm":
             raise RuntimeError("Unexpected spectral current-CFM argument ownership")
         cfm = solver.row_cfm
         if cfm.shape != (int(solver.world_count), 100) or cfm.dtype is not wp.float32:

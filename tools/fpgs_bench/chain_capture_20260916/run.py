@@ -56,6 +56,28 @@ def main():
                 if not spectral:
                     raise RuntimeError("Limit Jacobi requires spectral tangents")
                 solve = "sparse_spectral_limit_jacobi43_s18_c100"
+            register_flag = run["environment"].get("FEATHER_PGS_SPARSE_REGISTER_RESIDUAL")
+            if register_flag not in ("0", "1"):
+                raise RuntimeError("Require explicit register-residual policy on both arms")
+            register = register_flag == "1"
+            route = kinetic.get("register_residual", {})
+            if (route.get("requested") is not register or route.get("observed") is not register
+                    or route.get("check_pass") is not True):
+                raise RuntimeError("Missing actual register-residual owner observation")
+            if register:
+                if not limit_policy:
+                    raise RuntimeError("Register residuals must retain corrected limits")
+                solve = "sparse_register_residual43_s18_c100"
+                worlds = item["world_count"]
+                if (route.get("solve_key") != solve
+                        or route.get("fallback_key") != "sparse_register_residual_fallback43_s18_c100"
+                        or route.get("routing_shape") != [worlds]
+                        or route.get("routing_logical_bytes") != 4 * worlds
+                        or route.get("small_worlds", -1) < 0 or route.get("fallback_worlds", -1) < 0
+                        or route["small_worlds"] + route["fallback_worlds"] != worlds):
+                    raise RuntimeError("Missing complete per-world small/fallback routing")
+            elif route != {"requested": False, "observed": False, "check_pass": True}:
+                raise RuntimeError("Unexpected register-residual state on baseline")
             if kinetic.get("limit_jacobi") != {"requested": limit_policy, "observed": limit_policy,
                     "kernel_key": solve, "check_pass": True}:
                 raise RuntimeError("Missing actual limit-Jacobi owner observation")
@@ -70,6 +92,7 @@ def main():
     module.variants = selected_variants(module)
     module.FLAGS.add("FEATHER_PGS_SPARSE_SPECTRAL_TANGENTS")
     module.FLAGS.add("FEATHER_PGS_SPARSE_LIMIT_JACOBI")
+    module.FLAGS.add("FEATHER_PGS_SPARSE_REGISTER_RESIDUAL")
     module.FLAGS.add("NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD")
     module.FLAGS.add("NEWTON_HEIGHTFIELD_PAIR_CSR")
     module.FLAGS.add("NEWTON_HEIGHTFIELD_PAIR_CSR_SHELL")

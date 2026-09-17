@@ -542,6 +542,12 @@ class SparseFactor:
         self.limit_jacobi = limit_jacobi == "1"
         if self.limit_jacobi and not self.spectral_tangents:
             raise ValueError("Sparse limit Jacobi requires the capacity100 spectral owner")
+        register_residual = os.environ.get("FEATHER_PGS_SPARSE_REGISTER_RESIDUAL", "0")
+        if register_residual not in ("0", "1"):
+            raise ValueError("FEATHER_PGS_SPARSE_REGISTER_RESIDUAL must be 0 or 1")
+        self.register_residual = register_residual == "1"
+        if self.register_residual and not self.limit_jacobi:
+            raise ValueError("Sparse register residuals require the corrected limit-Jacobi owner")
         if self.spectral_tangents and (
             not self.metric_tangents
             or self.packet_rows
@@ -582,6 +588,16 @@ class SparseFactor:
             from .sparse_limit_jacobi import get_solve_kernel as limit_solve  # noqa: PLC0415
 
             self.kernels.solve = limit_solve()
+        self.register_residual_routing = None
+        if self.register_residual:
+            from .sparse_register_residual import get_fallback_kernel, get_solve_kernel  # noqa: PLC0415
+
+            # The small owner rewrites every mapped world's decision each call.
+            # A second kernel keeps rejected/large worlds on the original owner
+            # without imposing the small owner's register/shared-memory limits.
+            self.register_residual_routing = wp.empty(w, dtype=int, device=device)
+            self.kernels.solve = get_solve_kernel()
+            self.kernels.solve_fallback = get_fallback_kernel()
         # Drop canonical matrix/row storage only after complete constructor admission.
         # Dummy shapes make accidental readers fail visibly, not reinterpret packed W/Z.
         dummy = wp.empty((1, 1, 1), dtype=float, device=device)
@@ -961,6 +977,8 @@ class SparseFactor:
         ]
         if self.spectral_tangents:
             inputs.insert(5, s.row_cfm)
+        if self.register_residual:
+            inputs.append(self.register_residual_routing)
         wp.launch_tiled(
             self.kernels.solve,
             dim=[s.world_count],
@@ -968,3 +986,11 @@ class SparseFactor:
             block_dim=32,
             device=s.model.device,
         )
+        if self.register_residual:
+            wp.launch_tiled(
+                self.kernels.solve_fallback,
+                dim=[s.world_count],
+                inputs=inputs,
+                block_dim=32,
+                device=s.model.device,
+            )
