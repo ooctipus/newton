@@ -548,6 +548,14 @@ class SparseFactor:
         self.register_residual = register_residual == "1"
         if self.register_residual and not self.limit_jacobi:
             raise ValueError("Sparse register residuals require the corrected limit-Jacobi owner")
+        register_packets = os.environ.get("FEATHER_PGS_SPARSE_REGISTER_PACKETS", "0")
+        if register_packets not in ("0", "1"):
+            raise ValueError("FEATHER_PGS_SPARSE_REGISTER_PACKETS must be 0 or 1")
+        self.register_packets = register_packets == "1"
+        if self.register_packets and not self.register_residual:
+            raise ValueError("Sparse register packets require the register-residual owner")
+        if self.register_packets and os.environ.get("FEATHER_PGS_BODY_BASIS_ROWS") == "1":
+            raise ValueError("Sparse register packets and body-basis row owners are mutually exclusive")
         if self.spectral_tangents and (
             not self.metric_tangents
             or self.packet_rows
@@ -598,6 +606,23 @@ class SparseFactor:
             self.register_residual_routing = wp.empty(w, dtype=int, device=device)
             self.kernels.solve = get_solve_kernel()
             self.kernels.solve_fallback = get_fallback_kernel()
+        self._register_packet_contacts = None
+        if self.register_packets:
+            from types import MethodType  # noqa: PLC0415
+
+            from . import sparse_register_packet_fallback as packet_fallback  # noqa: PLC0415
+            from .sparse_packet_rows import PacketInput, get_prefix_kernel, packet_contacts  # noqa: PLC0415
+            from .sparse_register_packet_owner import build_rows  # noqa: PLC0415
+            from .sparse_register_packets import get_solve_kernel as packet_solve  # noqa: PLC0415
+
+            self.packet_input = PacketInput()
+            self.kernels.prefix = get_prefix_kernel()
+            self.kernels.contacts = packet_contacts
+            self.kernels.solve = packet_solve()
+            self.kernels.materialize_prefix = packet_fallback.get_prefix_kernel()
+            self.kernels.materialize_contacts = packet_fallback.get_contact_kernel()
+            self.kernels.materialize_restitution = packet_fallback.get_restitution_kernel()
+            self.build_rows = MethodType(build_rows, self)
         # Drop canonical matrix/row storage only after complete constructor admission.
         # Dummy shapes make accidental readers fail visibly, not reinterpret packed W/Z.
         dummy = wp.empty((1, 1, 1), dtype=float, device=device)
@@ -928,7 +953,7 @@ class SparseFactor:
 
     def restitution(self, dt):
         """Use the original current incident trigger after original bias construction."""
-        if self.packet_rows:
+        if self.packet_rows or self.register_packets:
             self.packet_input.dt = dt
             return  # Applied from the current incident during local row formation.
         from .sparse_factor_rows import apply_restitution  # noqa: PLC0415
@@ -979,13 +1004,49 @@ class SparseFactor:
             inputs.insert(5, s.row_cfm)
         if self.register_residual:
             inputs.append(self.register_residual_routing)
+        small_inputs = [*inputs, self.packet_input] if self.register_packets else inputs
         wp.launch_tiled(
             self.kernels.solve,
             dim=[s.world_count],
-            inputs=inputs,
+            inputs=small_inputs,
             block_dim=32,
             device=s.model.device,
         )
+        if self.register_packets:
+            route = self.register_residual_routing
+            wp.launch(
+                self.kernels.materialize_prefix,
+                dim=(s.world_count, 96),
+                inputs=[self.plan, self.data, s.constraint_count, s.v_hat, s.row_cfm, s.diag, route],
+                block_dim=32,
+                device=s.model.device,
+            )
+            if self._register_packet_contacts is not None:
+                workers, contact_inputs = self._register_packet_contacts
+                wp.launch_tiled(
+                    self.kernels.materialize_contacts,
+                    dim=[workers],
+                    inputs=[*contact_inputs, route],
+                    block_dim=32,
+                    device=s.model.device,
+                )
+            wp.launch(
+                self.kernels.materialize_restitution,
+                dim=(s.world_count, s.dense_max_constraints),
+                inputs=[
+                    self.data,
+                    s.constraint_count,
+                    s.row_type,
+                    s.phi,
+                    s.target_velocity,
+                    s.row_restitution,
+                    self.packet_input.dt,
+                    s._effective_restitution_velocity_threshold,
+                    rhs,
+                    route,
+                ],
+                device=s.model.device,
+            )
         if self.register_residual:
             wp.launch_tiled(
                 self.kernels.solve_fallback,

@@ -8,6 +8,48 @@ import os
 from pathlib import Path
 
 
+def packet_snapshot(sparse):
+    """Verify producer retirement and every filtered fallback factory."""
+    flag = os.environ.get("FEATHER_PGS_SPARSE_REGISTER_PACKETS")
+    if flag not in ("0", "1"):
+        raise RuntimeError("Require explicit register-packet policy on both arms")
+    wanted = flag == "1"
+    actual = getattr(sparse, "register_packets", False)
+    if type(actual) is not bool or actual != wanted:
+        raise RuntimeError("Requested register packets differ from actual owner")
+    result = {"requested": wanted, "observed": actual, "check_pass": True}
+    if not wanted:
+        return result
+    from newton._src.solvers.feather_pgs.sparse_register_packets import get_solve_kernel  # noqa: PLC0415
+
+    from newton._src.solvers.feather_pgs import sparse_register_packet_fallback as fallback  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.sparse_packet_rows import (  # noqa: PLC0415
+        PacketInput,
+        get_prefix_kernel,
+        packet_contacts,
+    )
+
+    expected = {
+        "prefix": get_prefix_kernel(),
+        "contacts": packet_contacts,
+        "solve": get_solve_kernel(),
+        "materialize_prefix": fallback.get_prefix_kernel(),
+        "materialize_contacts": fallback.get_contact_kernel(),
+        "materialize_restitution": fallback.get_restitution_kernel(),
+    }
+    if sparse.register_residual is not True or sparse.packet_rows is not False:
+        raise RuntimeError("Register packets require the retained corrected register owner")
+    if any(getattr(sparse.kernels, name, None) is not kernel for name, kernel in expected.items()):
+        raise RuntimeError("Register-packet producer/fallback factories differ from actual dispatch")
+    if not isinstance(sparse.packet_input, PacketInput.cls):
+        raise RuntimeError("Missing current packet input")
+    result.update(
+        kernels={name: kernel.key for name, kernel in expected.items()},
+        global_z="Fallback allocation retained; successful small worlds do not materialize Z",
+    )
+    return result
+
+
 def register_snapshot(sparse):
     """Check both actual factories and the per-call route, not only a flag."""
     import warp as wp  # noqa: PLC0415
@@ -31,6 +73,10 @@ def register_snapshot(sparse):
         get_solve_kernel,
     )
 
+    packets = getattr(sparse, "register_packets", False)
+    if packets:
+        from newton._src.solvers.feather_pgs.sparse_register_packets import get_solve_kernel  # noqa: PLC0415
+
     if sparse.limit_jacobi is not True or sparse.spectral_tangents is not True:
         raise RuntimeError("Register residuals must retain corrected limits and spectral contacts")
     if sparse.kernels.solve is not get_solve_kernel() or fallback is not get_fallback_kernel():
@@ -53,7 +99,13 @@ def register_snapshot(sparse):
         raise RuntimeError("Small owner published a world outside its row class")
     for kernel in (sparse.kernels.solve, fallback):
         arguments = [argument.label for argument in kernel.adj.args]
-        if len(arguments) != 16 or arguments[5] != "cfm" or arguments[-1] != "routing":
+        packet_abi = packets and kernel is sparse.kernels.solve
+        if (
+            len(arguments) != (17 if packet_abi else 16)
+            or arguments[5] != "cfm"
+            or arguments[15] != "routing"
+            or (packet_abi and arguments[16] != "x")
+        ):
             raise RuntimeError("Unexpected register-residual current-CFM/routing ABI")
     result.update(
         solve_key=sparse.kernels.solve.key,
@@ -79,7 +131,9 @@ def limit_snapshot(sparse):
     if wanted and spectral is not True:
         raise RuntimeError("Limit Jacobi requires the spectral tangent owner")
     if spectral:
-        if getattr(sparse, "register_residual", False) is True:
+        if getattr(sparse, "register_packets", False) is True:
+            from newton._src.solvers.feather_pgs.sparse_register_packets import get_solve_kernel  # noqa: PLC0415
+        elif getattr(sparse, "register_residual", False) is True:
             from newton._src.solvers.feather_pgs.sparse_register_residual import get_solve_kernel  # noqa: PLC0415
         elif wanted:
             from newton._src.solvers.feather_pgs.sparse_limit_jacobi import get_solve_kernel  # noqa: PLC0415
@@ -229,6 +283,8 @@ spectral_replacement = """    spectral_flag = os.environ.get("FEATHER_PGS_SPARSE
     result["limit_jacobi"] = limit_policy
     register_policy = register_snapshot(sparse)
     result["register_residual"] = register_policy
+    packet_policy = packet_snapshot(sparse)
+    result["register_packets"] = packet_policy
     if spectral_wanted:
         from newton._src.solvers.feather_pgs.sparse_spectral_tangents import get_solve_kernel
         import warp as wp
@@ -239,10 +295,14 @@ spectral_replacement = """    spectral_flag = os.environ.get("FEATHER_PGS_SPARSE
         if register_policy["observed"]:
             from newton._src.solvers.feather_pgs.sparse_register_residual import get_solve_kernel
             solve = "sparse_register_residual43_s18_c100"
+        if packet_policy["observed"]:
+            from newton._src.solvers.feather_pgs.sparse_register_packets import get_solve_kernel
+            solve = "sparse_register_packets43_s18_c100"
         if sparse.kernels.solve is not get_solve_kernel():
             raise RuntimeError("Spectral solve is not the exact cached factory")
         arguments = [argument.label for argument in sparse.kernels.solve.adj.args]
-        if len(arguments) != (16 if register_policy["observed"] else 15) or arguments[5] != "cfm":
+        expected_arity = 17 if packet_policy["observed"] else (16 if register_policy["observed"] else 15)
+        if len(arguments) != expected_arity or arguments[5] != "cfm":
             raise RuntimeError("Unexpected spectral current-CFM argument ownership")
         cfm = solver.row_cfm
         if cfm.shape != (int(solver.world_count), 100) or cfm.dtype is not wp.float32:
@@ -254,6 +314,15 @@ spectral_replacement = """    spectral_flag = os.environ.get("FEATHER_PGS_SPARSE
 if source.count(spectral_seam) != 1:
     raise RuntimeError("The original solve-factory observation seam changed")
 source = source.replace(spectral_seam, spectral_replacement)
+contact_seam = '    elif contact_key != "sparse_factor_contact_triplet18":\n'
+contact_replacement = """    elif packet_policy["observed"]:
+        if contact_key != "packet_contacts":
+            raise RuntimeError("Register-packet producer is not the checked key-only factory")
+    elif contact_key != "sparse_factor_contact_triplet18":
+"""
+if source.count(contact_seam) != 1:
+    raise RuntimeError("The original contact-factory observation seam changed")
+source = source.replace(contact_seam, contact_replacement)
 # __file__ deliberately remains this wrapper: its digest pins the complete
 # source transformation and the retained observer's required SHA256.
 exec(compile(source, str(RETAINED), "exec"), globals())

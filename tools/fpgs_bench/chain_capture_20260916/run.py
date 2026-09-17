@@ -60,6 +60,14 @@ def main():
             if register_flag not in ("0", "1"):
                 raise RuntimeError("Require explicit register-residual policy on both arms")
             register = register_flag == "1"
+            packet_flag = run["environment"].get("FEATHER_PGS_SPARSE_REGISTER_PACKETS")
+            if packet_flag not in ("0", "1"):
+                raise RuntimeError("Require explicit register-packet policy on both arms")
+            packets = packet_flag == "1"
+            packet_policy = kinetic.get("register_packets", {})
+            if (packet_policy.get("requested") is not packets or packet_policy.get("observed") is not packets
+                    or packet_policy.get("check_pass") is not True or (packets and not register)):
+                raise RuntimeError("Missing actual register-packet owner observation")
             route = kinetic.get("register_residual", {})
             if (route.get("requested") is not register or route.get("observed") is not register
                     or route.get("check_pass") is not True):
@@ -68,6 +76,11 @@ def main():
                 if not limit_policy:
                     raise RuntimeError("Register residuals must retain corrected limits")
                 solve = "sparse_register_residual43_s18_c100"
+                if packets:
+                    solve = "sparse_register_packets43_s18_c100"
+                    keys = packet_policy.get("kernels", {})
+                    if keys.get("solve") != solve or keys.get("contacts") != "packet_contacts":
+                        raise RuntimeError("Missing checked packet producer/consumer ownership")
                 worlds = item["world_count"]
                 if (route.get("solve_key") != solve
                         or route.get("fallback_key") != "sparse_register_residual_fallback43_s18_c100"
@@ -93,6 +106,7 @@ def main():
     module.FLAGS.add("FEATHER_PGS_SPARSE_SPECTRAL_TANGENTS")
     module.FLAGS.add("FEATHER_PGS_SPARSE_LIMIT_JACOBI")
     module.FLAGS.add("FEATHER_PGS_SPARSE_REGISTER_RESIDUAL")
+    module.FLAGS.add("FEATHER_PGS_SPARSE_REGISTER_PACKETS")
     module.FLAGS.add("NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD")
     module.FLAGS.add("NEWTON_HEIGHTFIELD_PAIR_CSR")
     module.FLAGS.add("NEWTON_HEIGHTFIELD_PAIR_CSR_SHELL")
