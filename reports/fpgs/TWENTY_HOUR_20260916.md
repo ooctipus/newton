@@ -2268,3 +2268,69 @@ The 1268-case limit replay archive remains historical ef9481, not a current
 shell/CSR full-row capture. A new cost card must price Gram construction,
 register pressure, current simultaneous limits and separate large fallback;
 no new recurrence implementation or gain is claimed at this checkpoint.
+
+## Repeated wins and register-residual falsification, 03:52 UTC
+
+Balanced AB/BA/AB repeats confirm corrected limits on RTX: median
+13.213030975 to 12.563801900 ms, 1.051674571x; GB median
+14.904974400 to 14.436994400 ms, 1.032415334x. These are whole physics-graph
+times, not unprofiled training throughput. All original source/idle/capacity
+guards pass. Artifacts are the `fpgs-g1-limit-jacobi-zscatter-repeat3-`
+`{rtx,gb}16k-20260917-01` directories under `/tmp`.
+
+Franka compact workspace's RTX balanced repeat confirms median
+5.058346075 to 4.801236475 ms, 1.053550705x (0.257109600 ms saved).
+Unprofiled environment wall median 28.674924126 to 28.602801674 ms is flat.
+GB whole remains flat. Independent full six-arm and paired-node audits pass;
+report-only feature checkpoint `1c2e7ec8` is pushed. The RTX node publication
+exclusive interval changes 0.917649583 to 0.679012083 ms and repair
+0.156829583 to 0.125437750 ms; overlapping owners are not added twice.
+
+Fresh corrected-MJ comparisons are independently audited on both cards:
+
+| Task | RTX FPGS / MJ physics ms | RTX MJ/FPGS | GB FPGS / MJ physics ms | GB MJ/FPGS |
+| --- | ---: | ---: | ---: | ---: |
+| Franka compact | 4.762999600 / 10.620445450 | 2.229780882x | 4.643132000 / 10.382175850 | 2.236028579x |
+| G1 corrected limits | 12.542372075 / 36.567342425 | 2.915504516x | 14.403644950 / 34.704481025 | 2.409423528x |
+
+Both backend arms use the same feature tree/shared collision improvements,
+unchanged Lab53ee and calibrated capacities/physics budgets. Original warning
+and overflow guards pass. These one-round backend comparisons are not matched
+full trajectories or RL-training measurements. Other representative task
+ratios have not changed because of these two specialized changes.
+
+The new register-residual experiment reached a complete native/whole checkpoint
+within about 30 minutes of its 03:20 funding. Checkpoint `8998bb98`, branch
+`ooctipus/fpgs-g1-register-residual-20260917`, is pushed, default off, and NOT
+accepted as a performance successor. It retains named register Gram columns,
+physical residuals, actual-Z prefix guards, original spectral contact laws,
+applied-delta momentum and separately compiled corrected-limit fallback.
+Both cards pass five native groups and the historical ef9481 selected corpus
+passes all 1268 finite/cone/momentum checks, with zero fixed-budget pointwise
+diagnostic regressions at the unchanged thresholds. This is not a converged
+reference or a claim of current-population coverage. Full precommit passes.
+
+Its first whole comparison is a loss against the corrected-limit baseline:
+
+| Card | Corrected baseline ms | Register candidate ms | Baseline/candidate |
+| --- | ---: | ---: | ---: |
+| RTX | 12.548266150 | 14.130901925 | 0.888001786x |
+| GB300 | 14.447917775 | 26.571799825 | 0.543731244x |
+
+Both comparisons pass independent source/capacity/flag/idle checks. Boundary
+rows/contacts remain close and approximately 93% of worlds take the small
+kernel on both cards; no GB routing or population explosion is recorded.
+Strict node attribution isolates the loss to this solver: small/fallback
+3.236040500/0.935499417 ms RTX and 14.033757417/0.997253167 ms GB.
+Other physics families stay close. The original node analyzer's auxiliary-root
+error is preserved; the source-pinned strict reader validates 48 physics and
+12 auxiliary roots, zero unproven nodes, and unions both GS kernels correctly.
+
+The small kernel has 96 registers/5760 shared bytes and no spills on either
+card. Thus no-spill compilation was not a performance prediction. Duplicated
+static contact bodies and scalar setup are being investigated, rather than
+discarding the idea without attribution. One compact-control-flow correction
+requires concrete compiled-code evidence and must beat the corrected baseline,
+not merely recover part of the losing experiment. No code-size or instruction-
+cache bottleneck is established by these node timings alone. The all-task 4x
+goal remains unmet; no Isaac Lab source or comparison allowance was changed.
