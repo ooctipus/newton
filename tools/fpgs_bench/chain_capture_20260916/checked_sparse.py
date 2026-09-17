@@ -4,7 +4,37 @@
 """Extend only the original untimed observer's exact kinetic factory keys."""
 
 import hashlib
+import os
 from pathlib import Path
+
+
+def limit_snapshot(sparse):
+    """Require the actual limit-policy factory, not only its constructor marker."""
+    flag = os.environ.get("FEATHER_PGS_SPARSE_LIMIT_JACOBI")
+    if flag not in ("0", "1"):
+        raise RuntimeError("Require explicit limit-Jacobi policy on both arms")
+    wanted = flag == "1"
+    actual = getattr(sparse, "limit_jacobi", False)
+    if type(actual) is not bool or actual != wanted:
+        raise RuntimeError("Requested limit-Jacobi policy differs from actual owner")
+    spectral = getattr(sparse, "spectral_tangents", False)
+    if wanted and spectral is not True:
+        raise RuntimeError("Limit Jacobi requires the spectral tangent owner")
+    if spectral:
+        if wanted:
+            from newton._src.solvers.feather_pgs.sparse_limit_jacobi import get_solve_kernel  # noqa: PLC0415
+        else:
+            from newton._src.solvers.feather_pgs.sparse_spectral_tangents import get_solve_kernel  # noqa: PLC0415
+
+        if sparse.kernels.solve is not get_solve_kernel():
+            raise RuntimeError("Limit-policy marker does not match the exact production factory")
+    return {
+        "requested": wanted,
+        "observed": actual,
+        "kernel_key": sparse.kernels.solve.key,
+        "check_pass": True,
+    }
+
 
 RETAINED = Path("/tmp/fpgs-g1-paired-gs-checked-t0NFbw6H/checked_sparse.py")
 RETAINED_PIN = "5bea2bec51735a02f34a6623b136ca557a84df4678683ff888cab0297bf75046"
@@ -135,10 +165,15 @@ spectral_replacement = """    spectral_flag = os.environ.get("FEATHER_PGS_SPARSE
     spectral_actual = getattr(sparse, "spectral_tangents", False)
     if type(spectral_actual) is not bool or spectral_actual != spectral_wanted:
         raise RuntimeError("Requested spectral tangent owner is not active")
+    limit_policy = limit_snapshot(sparse)
+    result["limit_jacobi"] = limit_policy
     if spectral_wanted:
         from newton._src.solvers.feather_pgs.sparse_spectral_tangents import get_solve_kernel
         import warp as wp
         solve = "sparse_spectral_tangent43_s18_c100"
+        if limit_policy["observed"]:
+            from newton._src.solvers.feather_pgs.sparse_limit_jacobi import get_solve_kernel
+            solve = "sparse_spectral_limit_jacobi43_s18_c100"
         if sparse.kernels.solve is not get_solve_kernel():
             raise RuntimeError("Spectral solve is not the exact cached factory")
         arguments = [argument.label for argument in sparse.kernels.solve.adj.args]

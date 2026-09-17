@@ -536,6 +536,12 @@ class SparseFactor:
         if spectral not in ("0", "1"):
             raise ValueError("FEATHER_PGS_SPARSE_SPECTRAL_TANGENTS must be 0 or 1")
         self.spectral_tangents = spectral == "1" and c == 100
+        limit_jacobi = os.environ.get("FEATHER_PGS_SPARSE_LIMIT_JACOBI", "0")
+        if limit_jacobi not in ("0", "1"):
+            raise ValueError("FEATHER_PGS_SPARSE_LIMIT_JACOBI must be 0 or 1")
+        self.limit_jacobi = limit_jacobi == "1"
+        if self.limit_jacobi and not self.spectral_tangents:
+            raise ValueError("Sparse limit Jacobi requires the capacity100 spectral owner")
         if self.spectral_tangents and (
             not self.metric_tangents
             or self.packet_rows
@@ -572,6 +578,10 @@ class SparseFactor:
             from .sparse_spectral_tangents import get_solve_kernel as spectral_solve  # noqa: PLC0415
 
             self.kernels.solve = spectral_solve()
+        if self.limit_jacobi:
+            from .sparse_limit_jacobi import get_solve_kernel as limit_solve  # noqa: PLC0415
+
+            self.kernels.solve = limit_solve()
         # Drop canonical matrix/row storage only after complete constructor admission.
         # Dummy shapes make accidental readers fail visibly, not reinterpret packed W/Z.
         dummy = wp.empty((1, 1, 1), dtype=float, device=device)
