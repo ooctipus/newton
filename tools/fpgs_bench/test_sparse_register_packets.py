@@ -3,6 +3,7 @@
 
 """Check row-owned formation against the retained physical row producers."""
 
+import hashlib
 import importlib
 import json
 import os
@@ -294,6 +295,23 @@ def seed_rows(f, count, *, incoming=False, ascending=False):
 
 
 class TestSparseRegisterPackets(unittest.TestCase):
+    def test_physical_width_tile_only(self):
+        """Remove padded row-bank aliasing without changing the frozen mathematics."""
+        module = importlib.import_module("newton._src.solvers.feather_pgs.sparse_register_packets")
+        source = module.native_source()
+        self.assertIn("__shared__ float staged[32*43];", source)
+        self.assertNotIn("*44", source)
+        with patch.object(module, "_physical_width_source", side_effect=lambda text: text):
+            padded = module.native_source()
+        self.assertEqual(padded.count("*44"), 105)
+        self.assertEqual(source, padded.replace("*44", "*43"))
+        self.assertEqual(
+            hashlib.sha256(padded.encode()).hexdigest(),
+            "7aeb40e66e7ddb64f317cab45a32688209b2faa98e695cbda5caa95939a821a6",
+        )
+        for flat in ("staged[item]", "staged[lane]", "staged[lane+32]", "staged[row]"):
+            self.assertEqual(source.count(flat), padded.count(flat))
+
     def test_fallback_factory(self):
         """Require separately filtered original materialization factories."""
         module = importlib.import_module("newton._src.solvers.feather_pgs.sparse_register_packet_fallback")

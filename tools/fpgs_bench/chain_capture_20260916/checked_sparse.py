@@ -20,14 +20,13 @@ def packet_snapshot(sparse):
     result = {"requested": wanted, "observed": actual, "check_pass": True}
     if not wanted:
         return result
-    from newton._src.solvers.feather_pgs.sparse_register_packets import get_solve_kernel  # noqa: PLC0415
-
     from newton._src.solvers.feather_pgs import sparse_register_packet_fallback as fallback  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.sparse_packet_rows import (  # noqa: PLC0415
         PacketInput,
         get_prefix_kernel,
         packet_contacts,
     )
+    from newton._src.solvers.feather_pgs.sparse_register_packets import get_solve_kernel  # noqa: PLC0415
 
     expected = {
         "prefix": get_prefix_kernel(),

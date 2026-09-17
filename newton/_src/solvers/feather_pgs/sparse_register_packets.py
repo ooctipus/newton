@@ -17,6 +17,26 @@ from .kernels import _FPGS_CONTACT_END_GAP_SLOP
 from .sparse_factor import SparseData, SparsePlan
 from .sparse_packet_rows import PacketInput
 
+_ROW_WIDTH = 43
+
+
+def _physical_width_source(source):
+    """Remove only padded tile addresses, retaining the dead-tile du overlay."""
+    expected = {
+        "staged[32*44]": 1,
+        "item<32*44": 1,
+        "staged[lane*44+node]": 4,
+        "staged[lane*44+col]": 1,
+        "staged[row*44+lane]": 1,
+        "staged[row*44+lane+32]": 1,
+    }
+    for row in range(32):
+        for column in ("node", "lane", "lane+32"):
+            expected[f"staged[{row}*44+{column}]"] = 1
+    if source.count("*44") != 105 or any(source.count(text) != count for text, count in expected.items()):
+        raise RuntimeError("Original padded tile's 105 address/bound sites changed")
+    return source.replace("*44", f"*{_ROW_WIDTH}")
+
 
 def _formation_source():
     """Form independent rows without a second J tile or per-contact warp loop."""
@@ -208,7 +228,7 @@ def native_source():
     source = source.replace(final, publish + final)
     if "d.Z.data" in source:
         raise RuntimeError("Local packet owner must not produce or consume global Z")
-    return source
+    return _physical_width_source(source)
 
 
 @cache
