@@ -2532,8 +2532,10 @@ differ only in the embedded reader hash. Original outputs/failure records remain
 The first ca0d backend table is a **start-of-window baseline refresh**. The later
 Franka-compact/G1-corrected-limit backend table is a **current explicit-recipe
 FPGS-versus-MJ comparison**, using the same tree and shared collision settings
-within each pair. These tables describe status at different points, not a matched
-ca0d→current optimization experiment. In particular, shared G1 collision changes
+within each pair. Those historical tables alone describe status at different
+points, not a matched ca0d→current optimization experiment. The direct G1
+experiment below now supplies that separate total-composition comparison.
+In particular, shared G1 collision changes
 also change the MJ denominator; dividing two historical ratios does not measure
 an incremental solver gain.
 
@@ -2544,3 +2546,68 @@ above; do not multiply such ratios across unrelated captures or call the current
 2.9155x G1/2.2298x Franka RTX backend ratios those increments. The new packet/
 width43 losses do not replace either accepted feature or their checkpoint. No
 four-times-across-tasks or end-to-end-training claim follows from this ledger.
+
+## Direct start-window to combined G1 confirmation, 2026-09-17
+
+The unchanged combined-tree runner now measures the **entire accepted G1
+composition**, directly and contemporaneously, against the start-window source:
+clean `ca0d427af809571bb5501f644c1a6e03990cd2a8` versus clean
+`301b6688ea74a7372a007f03989664890f0d2540`. Three balanced AB/BA/AB rounds run
+both cards, with the same Lab `53ee6b44c2334341305dbdf385a3916c6b140799`, seed 0,
+16384 environments and 200 warmup/40 unprofiled/40 profiled steps.
+
+Only five explicit feature flags change 0→1: G1 chain scan, pair CSR, CSR shell,
+spectral tangents and corrected limit Jacobi. The remaining 23 flags match;
+adaptive-manifold export is off in both arms. Budgets remain dt 0.005,
+decimation 4, two 0.0025 solver substeps and eight passes. Capacities remain
+100 rows, 294912 raw contacts, 49152 broad pairs and 1769472 triangle pairs.
+This is the accepted composition, not either closed row-owned experiment.
+
+| Whole physics graph, ms/environment step | RTX PRO 6000 | GB300 |
+| --- | ---: | ---: |
+| ca0d samples | 15.583116400,15.634412400,15.665783000 | 20.506150975,20.476167375,20.468267400 |
+| combined301b samples | 12.502576850,12.520300975,12.554175800 | 14.430670400,14.407955825,14.437309600 |
+| ca0d median → combined median | 15.634412400 → 12.520300975 | 20.476167375 → 14.430670400 |
+| Direct total speedup, baseline/candidate | **1.248724965x** | **1.418933896x** |
+| Median physics saving | **3.114111425 ms** | **6.045496975 ms** |
+| Unprofiled environment-wall medians | 29.651168251 → 27.041008900 | 35.064899977 → 28.607143075 |
+| Separate environment-wall speedup | 1.096525960x | 1.225739316x |
+
+The [complete manifest](</tmp/fpgs-g1-start-to-combined-repeat3-paired16k-20260917-01/manifest.json>)
+SHA is `b4d219ad50322111ad56c469886cf05537ecf0bff2595d4995c3e95c768d4536`.
+The [pre-launch command/card](</tmp/fpgs-g1-start-to-combined-card-GN921UCh/CARD.md>)
+SHA is `13577e1c8f0de9b53613bb01483e18400f28fecfad0c5d459cea16885d9f980a`.
+No adapter or runtime edit was needed for the old-source arm. Its geometric
+kernel is imported lazily at first collision; the observer runs at the original
+post-warmup boundaries, not prematurely at construction.
+
+Independent read-only replay of the complete inherited/current result and
+capacity checks passes all 12 captures: 19 driver pins, 47 unique artifact pins,
+24 successful boundaries, 1920 physics/480 auxiliary graph launches, identical
+budget fingerprints, finite states and zero solver/collision sticky flags.
+Actual old metric versus new spectral-limit factories, old versus chain state
+owners and candidate CSR-shell factories/interval buffers/status are observed.
+Recomputed timings and summary exactly match the manifest. Recorded source and
+idle guards pass before/after every paired arm and at final completion; this
+audit does not substitute a new device-idle query for historical evidence.
+Lab's sole recorded untracked item remains its existing `.venv`.
+
+This is **total G1 FPGS start→current evidence**, not another incremental gain
+to multiply by the limit-only 1.051674571x/1.032415334x repeats. It is also not the
+separate same-tree/shared-collision fair-MJ comparison: the latter remains
+MJ/FPGS 2.915504516x RTX/2.409423528x GB. Changing the terrain manifold and solver
+map can change trajectories/workloads; the guards do not prove bit identity,
+full numerical convergence or RL-training throughput. The accepted runtime
+checkpoint is unchanged, and no four-times-across-tasks claim follows.
+
+## Public PGS lead and bounded transfer checkpoint
+
+[PUBLIC_PGS_20260917.md](PUBLIC_PGS_20260917.md) preserves the strong public
+Yuval-Tassa lead: restarted Nesterov around C MuJoCo PGS, released in 3.11,
+with reported longer-solve convergence acceleration. It is not proof of the
+reported conversation's exact subject or a released MJWarp PGS implementation.
+The fixed-eight G1 CPU transfer improves typical residuals but only saves
+77/6496 hypothetical first-physical-stop passes before added work; difficult
+tails can worsen. No GPU port or timing gain is established. A separate bounded
+ANY24 transfer screen is pending, not covered by this G1 no-port conclusion.
+These source/CPU findings do not modify the handoff or any fair/paired timings.
