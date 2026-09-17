@@ -2134,3 +2134,63 @@ Frozen CPU decision card:
 Both GPUs are occupied by unrelated jobs at this checkpoint. Root requested
 an uninterrupted measurement window and continues implementation/review;
 no sudo, job termination, Lab change or weakened idle guard is used.
+
+## Two measured RTX gains and one causal correction, 02:15 UTC
+
+Franka compact workspace passes all four native selectors on both cards.
+RTX native correctness ran under external load and is not timing evidence.
+Two complete idle/source/capacity-guarded RTX comparisons measure:
+
+| Run | Original ms | Compact ms | Original / compact |
+| --- | ---: | ---: | ---: |
+| 01 | 5.108246725 | 4.797041475 | 1.064874413x |
+| 03 | 5.049426675 | 4.864011150 | 1.038119881x |
+
+These are 0.185--0.311 ms savings, below the intended approximately 0.5 ms
+Franka structural milestone. Preserve the useful lifetime redesign without
+a mapping grid; do not present the larger first result as a stable saving.
+Run 02 ended with a baseline initialization segfault before physics reporting;
+the candidate never ran, and retry 03 completed. The first GB whole run and
+first RTX paired node run each stopped between arms when an unrelated job
+acquired the selected GPU. Neither incomplete run supplies a comparison.
+GB whole retry is currently running. The default-off nine-file checkpoint is
+pushed on `ooctipus/fpgs-franka-compact-workspace-20260917` as
+`8ec4db342c0c5596060e89ef4923412a4a0ef1c1`; full and owned pre-commit passed.
+Whole artifacts use `/tmp/fpgs-franka-compact-workspace-whole-rtx16k-20260917-01`
+and the same prefix ending `-03`. No fresh MJWarp denominator is claimed.
+
+G1 limit-only Jacobi's initial W-column response mapping loses whole RTX:
+13.190505650 to 13.370332925 ms. Strict node attribution finds GS growing
+3.22163875 to 3.39099633 ms, accounting for almost the whole 0.179827275 ms
+loss, while other families remain flat. This was not rejected merely because
+the first implementation was slow. One cause-directed correction replaces
+43-node index probes and irregular W gathers per changed row with contiguous
+actual-Z scatter into a 43-value shared response. Prefix proposals still use
+the same old state; the same numerical descent guard commits or rolls back
+the entire update before the original ordered contact work. No iteration,
+contact law, global buffer or launch is added. Scratch shrinks 688 to 516 B;
+each changed-row scatter explicitly orders shared-node overlap.
+
+Corrected native tests pass all three selectors on each card; GB native ran
+under external load and provides correctness evidence only. Independent
+source reviews pass. The integrated RTX correction measures 13.160521725 to
+12.535854600 ms, 1.049830438x and 0.624667125 ms saved, with all source,
+capacity and idle guards passing. This is a useful one-run gain below the
+original approximately 1 ms screen, not a repeated or cross-card result.
+The finite-eight numerical tradeoffs in the preselected CPU cohort remain
+documented; neither those tests nor finite whole-run state prove arbitrary
+long-horizon convergence. Initial loss is retained at `add5433f`; corrected
+runtime SHA is `5a15a0d64f914466df6e847426f5b9e83173d33fab490ada4aaa04c6211e3ac0`.
+Artifact: `/tmp/fpgs-g1-limit-jacobi-zscatter-whole-rtx16k-20260917-01`.
+
+A bounded adaptive-held-mass study does not justify another prototype.
+The cheap operator perturbation bound is 0.546--2.386 on seven adjacent saved
+epochs, despite actual energy perturbations of 3.04--6.97%; it cannot certify
+a small longer-hold defect. Halving scheduled refreshes saves at most 0.890 ms
+of the current 1.781 ms factor owner before current-H/check/cache costs.
+This is not evidence that the original interval-two integration is wrong.
+Card: `/tmp/fpgs-heightfield-static-geometry-kF1HG0SL/ADAPTIVE_HELD_MASS.md`.
+Source screens also find no credible standalone large saving from bundled
+contact dots or a separate dense free-root publication kernel. No tuning
+grids or additional proof framework are funded. The all-task 4x goal remains
+unmet; Lab sources and physics allowances remain unchanged.
