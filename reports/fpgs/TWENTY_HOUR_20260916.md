@@ -2194,3 +2194,77 @@ Source screens also find no credible standalone large saving from bundled
 contact dots or a separate dense free-root publication kernel. No tuning
 grids or additional proof framework are funded. The all-task 4x goal remains
 unmet; Lab sources and physics allowances remain unchanged.
+
+## Cross-card closure and fresh GB comparisons, 03:15 UTC
+
+Corrected limit-Jacobi runtime is now pushed at `81c0cb20`, with report-only
+checkpoint `f6ea5f2f`. GB whole retry02 passes the original source, idle,
+capacity and budget guards: 14.896602550 to 14.427726400 ms, 1.032498270x,
+saving 0.468876150 ms. Wall time instead changes 28.930439201 to
+29.715467876 ms; do not call this an environment-throughput gain.
+Artifact `/tmp/fpgs-g1-limit-jacobi-zscatter-whole-gb16k-20260917-02`,
+manifest `23479a433eb079d164e0d2df7abf70718f0c29c45a6199f908a5bb9a3d22a7c2`.
+Failed GB01 remains preserved: an unrelated job appeared after baseline.
+
+The corrected GB node capture retains the original auxiliary-graph analyzer
+exit1. Its strict reader proves 48 physics/12 auxiliary roots, zero unproven
+nodes, original process/source/capacity scope and actual block32/grid16384
+limit owner. GS costs 2.790901167 ms versus the earlier source-matched a61
+3.25095 ms, accounting for about 0.460 ms of the 0.469 ms whole saving.
+Other families remain close. These node windows are not paired component
+measurements. Reader `/tmp/fpgs-g1-limit-zscatter-gb-strict-mOORZSVo/read_zscatter_gb.py`
+changes only the corrected runtime pin and selected card; SHA
+`fe6cfe967d7fb8b4f2a9537e46c5906644917c9eabdecf844efd114b38d5ec1b`.
+Result SHA `3e5a2f209aeeed28e51f47536611ef045db390aa6c5fd820f5ba067edaef7d48`.
+
+Franka compact workspace is flat on GB: 4.690438375 to 4.688745475 ms,
+1.000361056x, at whole retry02. Paired native node ownership subsequently
+passes the exact two factories, 48 physics/zero auxiliary roots and all
+source/capacity/process guards. Publication alone changes 0.753508167 to
+0.724597167 ms; repair 0.123888000 to 0.123245333 ms. The changed shared
+allocation is real (7296 to 3136 B) with finish still 80 registers, but these
+results do not establish a useful GB whole gain. Original RTX gains remain
+3.8--6.5%, not a universal card-independent claim. Report checkpoint `ee2a50d5`
+is pushed; failed RTX node01 remains excluded because an external job arrived.
+
+Fresh one-round GB comparisons use each clean feature tree for BOTH backends,
+fixed Lab53ee, unchanged capacities/200 warmup/40 wall/40 graph steps, the
+existing MJ line-search correction, and identical shared collision options:
+
+| Task | FPGS physics ms | MJWarp physics ms | MJ/FPGS |
+| --- | ---: | ---: | ---: |
+| G1 corrected limits | 14.403644950 | 34.704481025 | 2.409423528x |
+| Franka compact workspace | 4.643132000 | 10.382175850 | 2.236028579x |
+
+Artifacts `/tmp/fpgs-g1-limit-jacobi-fair-gb16k-20260917-01` (manifest
+`ecbaafe181acb0176984875df52d790c0fdf8d05dd8eed20c73a74383eacd775`)
+and `/tmp/fpgs-franka-compact-fair-gb16k-20260917-02` (manifest
+`b9d81fe4c868021467821f91d3c71944383cdec5c992e72e7cea294caead46cb`).
+Franka fair01 failed before timing at an added observer: it confused the
+constructor's 32768 threads with the existing Lab multiplier-four live count
+131072. The corrected observer verifies both stages, not a range; no Newton
+or Lab runtime changed. No ratio is derived from failed01.
+
+Clean pushed combined checkpoint `301b6688` on
+`ooctipus/fpgs-structural-progress-20260917` contains the exact measured G1 and
+Franka runtime bytes plus inherited handoff. CPU controls: 37 pass/15 CUDA
+skips; native controls: seven pass/card. Those native tests ran under external
+load and are correctness-only. Independent composition review and full/scoped
+precommit pass. This is not a new combined-tree performance measurement or
+default-on promotion. No Lab source or parent dependency pointer changed.
+
+Further bounded screens close Kuka support-packed Z (logical traffic saving
+does not establish a millisecond owner saving), already-reused Kuka next-state
+publication, and direct G1-prefix transfer. ANY has only 29 true limit rows
+among 59835 historical rows, never multiple limits/world, and already-parallel
+proposals. Franka uses cached scalar residuals already; type5 mimic rows are
+not type3 limits. Their counts do not justify copying the G1 deletion.
+
+Current shell/CSR GB histograms do provide new evidence for an older,
+unimplemented sparse-input/static-register residual idea: worlds with at most
+32 rows now cover 89.88--90.72% of rows, versus roughly 55% in the old screen.
+These are count/support shares, NOT measured sweep or GPU-time shares.
+The 1268-case limit replay archive remains historical ef9481, not a current
+shell/CSR full-row capture. A new cost card must price Gram construction,
+register pressure, current simultaneous limits and separate large fallback;
+no new recurrence implementation or gain is claimed at this checkpoint.
