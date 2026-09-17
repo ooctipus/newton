@@ -1,7 +1,8 @@
 # G1 row-owned local formation — 2026-09-17
 
-Status: bounded structural experiment; default off and not accepted as a gain.
-The inherited handoff remains in this branch. Isaac Lab is unchanged.
+Status: CLOSED without an accepted gain. Default off; the accepted corrected-limit
+baseline is unchanged. The one physical-width correction also lost. Isaac Lab,
+runtime physics budgets and calibrated capacities are unchanged.
 
 ## Hypothesis and complete-cost gate
 
@@ -57,16 +58,14 @@ canonical row identities and impulses, not that private Z.
 
 ## Qualification and timing
 
-Pending. The complete prototype is timeboxed to an initial checkpoint at
-05:56 UTC and a whole-path result by approximately 06:15 UTC. No source-width,
-MMA or layout sweep is funded. Numerical and physical behavior, not bit identity,
-are the gate. Timings will include every new launch and fallback cost, use the
-existing idle/source/capacity guards, and compare against the accepted corrected
-limits with unchanged Lab, timestep, substeps, maximum iterations and buffers.
+The completed screen includes every new launch and fallback cost and compares
+against the accepted corrected-limit owner. Numerical and physical behavior,
+not bit identity, are the gate. There was no MMA or layout grid; after the first
+loss, one separately preserved width43 cause-falsification was authorized.
 
 The pre-implementation factory/owner tests failed with the missing new native
 module, as expected. Existing register-residual tests remain distinct from the
-new packet tests. No speedup is claimed until complete measurement.
+new packet tests. The native controls below pass, but complete measurement loses.
 
 ## Native checkpoint and test-oracle diagnosis
 
@@ -102,3 +101,130 @@ on both cards before whole timing (3.968s RTX /3.948s GB including load/tests,
 not performance). Logs share prefix
 `/tmp/fpgs-g1-row-owned-packets-`, with `native-{rtx,gb}-20260917-02.log`,
 `momentum-control-{rtx,gb}-20260917-01.log`, and final native03.
+
+These are finite-budget current/held, restitution, incoming/delayed-friction,
+32/33/100 routing, numerical rollback and graph-transition controls, including
+the existing saved16 J/H fixtures. They are not a converged-manifold reference
+or a new full-population physical qualification. The candidate and original
+controls both exhibit the preserved FP64-J component discrepancy; the inherited
+rounded-Z check and independent H check answer different numerical questions.
+
+## Complete whole-path result
+
+Measured clean candidate `56608c664fb1f10161743b9b09865f29d5f9fb26` versus
+corrected-limit `c6ab26f9687f64fd2acfe66f5328f16be1820692`, using fixed Lab
+`53ee6b44c2334341305dbdf385a3916c6b140799`. Each card has one checked paired
+round: 16,384 worlds, seed0, 200 warmup /40 unprofiled wall /40 graph-profile
+steps. The .005 environment simulation step, decimation4, two .0025 solver
+substeps and maximum8 passes remain unchanged. Capacities remain100 dense rows,
+294,912 raw contacts,49,152 broad pairs and1,769,472 triangle pairs.
+
+| Metric, ms per environment step | RTX baseline | RTX packets | GB baseline | GB packets |
+| --- | ---: | ---: | ---: | ---: |
+| Profiled whole physics graph | 12.509309075 | 13.346259925 | 14.415478075 | 15.731324800 |
+| Unprofiled environment wall | 27.210253649 | 26.591046850 | 29.544967125 | 30.037355373 |
+
+Physics costs increase **0.836950850 ms RTX /1.315846725 ms GB**; baseline/candidate
+ratios are0.937289484 /0.916354996. The separate RTX wall decrease is not a
+physics speedup, and one round does not establish repeated timing evidence.
+
+Artifacts: `/tmp/fpgs-g1-row-owned-packets-whole-{rtx,gb}16k-20260917-01`.
+Independent replay passes all original warning, capacity, source, process,
+budget, result and final-idle guards:19 driver pins and28 artifact pins per card,
+four captures/eight boundaries,160 physics and40 auxiliary graph launches per
+capture. Only register-residual and register-packets flags change. The observer
+checks exact key-only producers, the17-argument small ABI (CFM5, routing15,
+PacketInput16),16-argument GS fallback, and all three filtered materializers.
+All sticky flags are false; warnings passing is not physical convergence.
+
+Candidate small/fallback counts at the two boundaries are15236/1148 and
+15243/1141 RTX,15281/1103 and15284/1100 GB. Contact counts differ by at most
+0.605%, row totals by0.466%; GB candidate has fewer contacts and rows at both
+endpoints. All worlds have rows, MF counts are zero and host call cadence is
+unchanged. This does not show a workload explosion explaining the loss, but
+endpoint counts are not a sweep census or a proof of identical trajectories.
+Post-environment invalid-cache counts are not cumulative reset counts.
+
+## Strict node accounting and cause
+
+Candidate traces are `/tmp/fpgs-g1-row-owned-packets-node-{rtx,gb}16k-20260917-01`.
+The strict reader preserves the original analyzer rejection of auxiliary graphs;
+it does not rewrite the failed parent as successful. Supplemental parsing proves
+48 physics /12 auxiliary roots, exact process/correlation ownership, all graph
+kernel/memory nodes, zero unproven nodes, capacities and frozen source identities.
+
+| Candidate boundary, ms/env | RTX | GB |
+| --- | ---: | ---: |
+| Small fused formation + solve, owner sum | 3.583258750 | 4.317253083 |
+| Original filtered GS fallback, owner sum | 0.913293750 | 0.969437333 |
+| Formation + solve interval union | 4.496552500 | 5.286690417 |
+| Formation + solve exclusive busy | 4.496552500 | 5.284589083 |
+| Remaining row services, exclusive busy | 1.680504917 | 1.609456167 |
+| Complete physics-root span | 13.466783750 | 15.935077000 |
+
+The old value-emitting prefix, contact triplet and restitution owners are absent,
+as are the old corrected-limit solve and compact small solve. Key prefix,
+key contacts, filtered prefix, filtered contacts and filtered restitution each
+run8 times/environment step; small and fallback each run8. They are all charged.
+Their individual sums are not substituted for interval union/exclusive metrics.
+The small kernel is **formation plus solve**, not GS-only. It retains118/112
+registers and5760 shared bytes in the trace, with zero reported local memory.
+
+Against the prior compact strict capture, row-service exclusive work falls only
+**1.089366833 /1.179004417 ms**, not the2.067035 ms optimistic pre-code RTX
+producer ceiling. New keys and filtered materializers remain. Formation+solve
+exclusive work rises1.558681250 /2.043888167 ms against compact GS; its fused
+owner must also recover compact's pre-existing deficit to the accepted owner.
+This complete accounting explains why producer retirement did not pay. These
+are separate short diagnostic captures with slightly different workloads,
+not a sum-of-overlapping-components prediction of exact whole-run time.
+No hardware stall fraction, memory-bandwidth bottleneck or instruction-cache
+cause is established by these timings.
+
+## One correction and closure
+
+The separate branch `ooctipus/fpgs-g1-row-owned-width43-20260917` replaces exactly
+105 shared-tile allocation/bound/address sites44→43 and no arithmetic. The
+stride44 equal-node access pattern can place four distinct row addresses in a
+bank; width43 removes that structural alias. This was an address-pattern
+hypothesis, not measured stall evidence. Resources change5760→5632 shared bytes,
+registers remain118/112, and all six native groups pass/card.
+
+Its clean `b21cf507` paired whole result remains a loss: RTX12.502508425→13.333823950
+ms and GB14.419813275→15.718051525 ms. No material recovery is observed. No43-wide
+node capture, additional stride, MMA or mapping correction is needed or funded.
+Both experiments remain default off and unpromoted; accepted production is
+unchanged. Neither clean guards nor native comparison asserts full convergence
+or a4× performance result.
+
+## Reproducibility pins
+
+- Whole manifests RTX `84a73f8d235486b985691f9c3ef3603010381130f8abf4369985c0fa788e4f6b`,
+  GB `e64657b2ba6411464e3cb8039fd69fe4cf456efda751700524c7c0e53881db18`.
+- Native03 logs RTX `e95ec8a092f41bb8083f7a5e4691d1cd25eee57395ea452e5a73df3740a50a1f`,
+  GB `4740166b1e8b79bb6719008e1873b65667c5aa0364ef97fe8e1bb1fd96b77928`.
+- Momentum-control logs RTX `ac190a47e4dbbcdc64b66ef264a627d013249c63a0ff15c7cf5cae3b53463e92`,
+  GB `388e404973a02b02abdeb177464eb26711128a1325190cdba5d1f020e18f8620`.
+- Bound owner `e56a42e85529961b61e39d40ecf0664fb80b323568d036487ff3b0d8097be9f2`;
+  factor `708a99fbce60f4e2cc89fb4455c2d383b138f9ac575ee27aa66991e01bda2f10`;
+  runner `649e08a5cd016b8035a9ff819da23b617a04116e5937e6fb508cd2c832bd98b2`.
+- Timed observer `dfb2fcd7016098199962bb841c4ed33363014fc1f92b05a1f1203e7fe7648e9d`.
+  This closure retains those exact bytes. The width43 branch has an import-order
+  only observer change to
+  `929464ada458dcdab7d9b6a0084d77ffcebefdcd5e10ede3682c860ea8829b8b`;
+  its observation logic is unchanged. Runtime, tests and observer are not changed
+  by this report-only closure; checkout56608 preserves the measured snapshot.
+
+Strict reader `/tmp/fpgs-register-packets-strict-IPUKfZ4S/read_packets.py` final
+SHA is `be03e7ac47b9c88b635923eb2f07724a8b093f747f37d207b645170b9df86d58`.
+The original outputs RTX `e5fdd9ade4b4aa649b16829cff8f634d3c2b3cc8074cdde3ad48795615795949`
+/GB `0642da8711a367c34a831e08db981db51729f6b364587c48098fb552fe029b7e`
+embed the earlier reader `08847b551cfa10b35920fd6c8634191d0abe108cb0c2dd341c08585a0b7474fb`.
+The only later edits strengthen the replacement-count guard from>0 to==8 and
+rename an inherited GS comment to formation-and-solve; reversing those two edits
+reconstructs the old reader hash exactly. No arithmetic or attribution changed.
+Independent final-reader replay in `/tmp/fpgs-register-packets-node-review-ec8hASPb`
+produces RTX `5ac994a815f532f2c887edc1b99572699bc39c49595825681efe52aac519e572`
+/GB `45a976ba080aedb8fb8e6a99d3ba6c06e681ae1c2f58aa86b4fe8dcee61f1910`.
+Recursive comparison differs only in the embedded reader hash. Both generations
+of outputs and the original profiler failure remain preserved.
