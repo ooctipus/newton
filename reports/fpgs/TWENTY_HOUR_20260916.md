@@ -2334,3 +2334,45 @@ requires concrete compiled-code evidence and must beat the corrected baseline,
 not merely recover part of the losing experiment. No code-size or instruction-
 cache bottleneck is established by these node timings alone. The all-task 4x
 goal remains unmet; no Isaac Lab source or comparison allowance was changed.
+
+## Register correction closed; row-owned formation funded, 04:44 UTC
+
+The code-size diagnosis was concrete: the initial small kernel's executable
+text was about 376 KB on each architecture, with 30 emitted contact bodies and
+32 scalar bodies. One common ordered row body and uniform selection of named
+Gram registers reduced executable text to about 63 KB, with the same 96
+registers, 5760 shared bytes and no spills. This removed most of the initial
+GB slowdown, but did not beat the accepted corrected-limit owner:
+
+| Card | Corrected baseline ms | Compact register candidate ms | Baseline/candidate |
+| --- | ---: | ---: | ---: |
+| RTX | 12.509054475 | 12.868925575 | 0.972035653x |
+| GB300 | 14.430491375 | 14.861290400 | 0.971012004x |
+
+Whole artifacts are `/tmp/fpgs-g1-register-residual-compact-whole-`
+`{rtx,gb}16k-20260917-01`. Native physical groups pass both cards; the historical
+1268-case replay passes unchanged gates. Independent source/capacity/idle and
+strict node audits pass. Compact GS unions remain 2.937871250 ms RTX and
+3.241674250 ms GB, above accepted 2.585308250 and 2.790901167 ms. Other families
+remain close. The experiment is CLOSED, default off, report checkpoint
+`0891dae43f3106205f84b1d45bdee4366157b723` pushed. Recovery versus a losing
+candidate is not an accepted gain. No hardware-counter claim of instruction
+cache stalls follows from this source/code-size correction.
+
+A distinct, bounded work-retirement prototype is funded in
+`newton-fpgs-g1-row-owned-packets-20260917`: form eligible contact/limit rows in
+their owning lanes inside the retained 32x44 tile, instead of producing global
+Z and then loading it into that tile. Original allocation/metadata stay; rejected
+or large worlds get filtered original materialization and solve. Its card prices
+2.067035 ms maximum displaced RTX producer work, the compact solve's existing
+0.352563 ms debt, and all added key/fallback launches. A 1 ms whole saving has
+only about 0.508 ms new-overhead allowance under an unproved 90% time-eligibility
+assumption. It is not the earlier serial-per-world packet mapping and is not a
+promised gain. Initial checkpoint 05:56 UTC; whole result target about 06:15.
+The candidate's report is `reports/fpgs/G1_ROW_OWNED_PACKETS_20260917.md`.
+
+The separate state-publication footprint screen closes without a prototype:
+G1/Kuka already share phase bodies; their remaining scan instructions represent
+required transform/moment channels. No source-backed removal of the roughly
+54%/60% owner time needed for 1 ms was found. Existing binary size alone does
+not justify a compaction experiment. No extra GPU capture was spent on it.
