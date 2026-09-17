@@ -2608,6 +2608,14 @@ with reported longer-solve convergence acceleration. It is not proof of the
 reported conversation's exact subject or a released MJWarp PGS implementation.
 The fixed-eight G1 CPU transfer improves typical residuals but only saves
 77/6496 hypothetical first-physical-stop passes before added work; difficult
-tails can worsen. No GPU port or timing gain is established. A separate bounded
-ANY24 transfer screen is pending, not covered by this G1 no-port conclusion.
+tails can worsen. No GPU port or timing gain is established. The separate
+ANY24 replacement screen is now also closed without a native speed case:
+literal CPU baseline parity holds on all 2048 cases, but passes 49059→49064 and
+core products 84704706→84708576 do not retire work before added projection.
+All hard finite/cone/momentum gates pass; zero cases meet the distinct offline
+physical stop in either arm. Actual restarts fall 2200→2139, and a median of 20
+positive-beta passes rules out reusing G1's short-horizon explanation.
+The [final report and pins](PUBLIC_PGS_20260917.md#any24-replacement-closure)
+preserve mixed reference/physical tradeoffs and impulse-implied FP64 scoring.
+These are G1/ANY-specific closures, not a claim about all tasks or private work.
 These source/CPU findings do not modify the handoff or any fair/paired timings.

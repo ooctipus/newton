@@ -103,8 +103,8 @@ no pointwise monotonicity requirement or tolerance grid is introduced.
 Conclusion: the public result demonstrates acceleration on its reported
 benchmark, but this G1 screen does not fund a GPU port or establish a gain.
 It does not rule out other tasks. The separate ANY24 projected integer-age
-replacement study is pending; the existing ANY FISTA-like recurrence is not
-silently treated as an identical prior experiment.
+replacement study is closed below; the existing ANY FISTA-like recurrence is
+not silently treated as an identical prior experiment.
 
 ## Exact local pins
 
@@ -120,3 +120,41 @@ outputs; numerical helper bytes stayed fixed. JSON label `above_original_plus_3e
 is a naming typo only: the expression uses 3e-5. Use per-case curves and explicit
 maxima, not sums of first-stop or history-size fields. No longer-horizon followup
 or GPU run is implied by this archive.
+
+## ANY24 replacement closure
+
+The [final ANY report](</tmp/fpgs-anymal-yuval-ex1-7CPHmcbl/RESULTS.md>) closes
+this transfer without a native port. Six CPU controls pass; the baseline
+matches the pinned literal CPU EX1/FISTA method exactly on all 2048 historical
+current/held cases, not CUDA bit equivalence. The replacement retains the EX1
+map, denominator-only CFM, incoming-delta publication, original cheap stop and
+24-pass cap. Independent archive verification passes all 2077 recorded
+source/payload/reference hashes.
+
+Executed passes change **49059→49064**, with **2026→2031** cases reaching 24.
+Core EX1/recurrence/publication products change **84704706→84708576**, before
+**397785 additional momentum disk norms**. Existing operator work is not
+retired. Actual restarts fall **2200→2139**; median positive-beta exposure is
+20 passes, so G1's short acceleration horizon does not explain this result.
+Removing FISTA's scalar square root does not establish a complete speed case.
+
+All candidate/baseline/native finite, cone, negative-impulse and momentum hard
+checks pass. Only 874 cases are closer to the existing H-reference; other
+physical diagnostics show mixed tradeoffs, not a componentwise rejection rule.
+Neither arm meets the separate offline full physical stop in any case.
+Those residuals use the impulse-implied FP64 physical response, while published
+FP32 velocity is checked separately for momentum consistency. Feasibility is
+not convergence, and the offline stop never terminates the map.
+
+No GPU timing, new reference, policy grid or runtime change follows. This
+closes the tested G1 and ANY transfers only, not every task or an unidentified
+private method. Accepted sources and fair/paired timings remain unchanged.
+
+Frozen directory: `/tmp/fpgs-anymal-yuval-ex1-7CPHmcbl`.
+
+- `RESULTS.md`: `05bc29ed077047d5f1649841b66126bb9a4a54d49dad6d92c08c514e4ea89c01`.
+- `control.py`: `d140e1b598fd58931c94808d3ab730035f6427721d0df5b3ade4ae1409d453e5`.
+- `test_control.py`: `4d4472c1ec9f79ddf722c2abbffcd927267665cbb6b07aa920a45199ac91ce61`.
+- `check.py`: `3f947280dd6d1114b17e0bc32d8c01a3dc6b3973aeb43c0afac9af11115dd450`.
+- `first8.json`: `c6a37727f5cf73a04acbd8598f37344a39201511a91e65c563d93498eab97cac`.
+- [All2048](</tmp/fpgs-anymal-yuval-ex1-7CPHmcbl/all2048.json>): `8812daecec45fc11588384ca6d9235c832cc1af8cc82b3c0a547abddae6311c6`.
