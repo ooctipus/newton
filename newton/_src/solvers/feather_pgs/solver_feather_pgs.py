@@ -5785,6 +5785,10 @@ class SolverFeatherPGS(SolverBase):
                     from .allegro_kinetic_rows import get_parallel_factory  # noqa: PLC0415
 
                     parallel_factory = get_parallel_factory(parallel_factory)
+                elif os.environ.get("FEATHER_PGS_KRYLOV_CHORD") == "1":
+                    from .krylov_chord import get_parallel_factory  # noqa: PLC0415
+
+                    parallel_factory = get_parallel_factory(parallel_factory)
                 elif os.environ.get("FEATHER_PGS_SPECTRAL_RESIDUAL") == "1":
                     from .spectral_residual import get_parallel_factory  # noqa: PLC0415
 
