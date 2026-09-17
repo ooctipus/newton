@@ -558,6 +558,12 @@ class SparseFactor:
         self.parallel_limit_prefix = os.environ.get("FEATHER_PGS_SPARSE_PARALLEL_LIMITS") == "1" and c == 100
         if self.packet_rows and self.parallel_limit_prefix:
             raise ValueError("Sparse packets and parallel global limit rows are mutually exclusive")
+        grouped = os.environ.get("FEATHER_PGS_SPARSE_FULLWARP_GROUP", "0")
+        if grouped not in ("0", "1"):
+            raise ValueError("FEATHER_PGS_SPARSE_FULLWARP_GROUP must be 0 or 1")
+        self.fullwarp_group = grouped == "1"
+        if self.fullwarp_group and not (self.spectral_tangents and self.parallel_limit_prefix):
+            raise ValueError("Full-warp grouping requires the capacity100 spectral and parallel-prefix owners")
         self.data.Z = wp.empty((1, 1, 1) if self.packet_rows else (w, c, 18), dtype=float, device=device)
         self.data.support = wp.empty((w, c), dtype=int, device=device)
         self.data.incident = wp.empty((1, 1) if self.packet_rows else (w, c), dtype=float, device=device)
@@ -572,6 +578,11 @@ class SparseFactor:
             from .sparse_spectral_tangents import get_solve_kernel as spectral_solve  # noqa: PLC0415
 
             self.kernels.solve = spectral_solve()
+        if self.fullwarp_group:
+            from . import sparse_fullwarp_group  # noqa: PLC0415
+
+            self.kernels.solve = sparse_fullwarp_group.get_solve_kernel()
+            self.kernels.prefix = sparse_fullwarp_group.get_prefix_kernel()
         # Drop canonical matrix/row storage only after complete constructor admission.
         # Dummy shapes make accidental readers fail visibly, not reinterpret packed W/Z.
         dummy = wp.empty((1, 1, 1), dtype=float, device=device)
@@ -698,9 +709,10 @@ class SparseFactor:
             s._row_dropped_propagation.zero_()
         tiled_prefix = self.packet_rows or self.parallel_limit_prefix
         prefix_launch = wp.launch_tiled if tiled_prefix else wp.launch
+        prefix_groups = (s.world_count + 3) // 4 if self.fullwarp_group and device.is_cuda else s.world_count
         prefix_launch(
             self.kernels.prefix,
-            dim=[s.world_count] if tiled_prefix else s.world_count,
+            dim=[prefix_groups] if tiled_prefix else s.world_count,
             inputs=[
                 self.plan,
                 self.data,
@@ -724,7 +736,7 @@ class SparseFactor:
                 s.diag,
                 s.dense_phase_bounds,
             ],
-            block_dim=32 if tiled_prefix else 256,
+            block_dim=128 if self.fullwarp_group else 32 if tiled_prefix else 256,
             device=device,
         )
         if contacts is not None and contacts.rigid_contact_max > 0:
@@ -953,8 +965,8 @@ class SparseFactor:
             inputs.insert(5, s.row_cfm)
         wp.launch_tiled(
             self.kernels.solve,
-            dim=[s.world_count],
+            dim=[(s.world_count + 3) // 4 if self.fullwarp_group and s.model.device.is_cuda else s.world_count],
             inputs=inputs,
-            block_dim=32,
+            block_dim=128 if self.fullwarp_group else 32,
             device=s.model.device,
         )

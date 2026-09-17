@@ -4,7 +4,29 @@
 """Extend only the original untimed observer's exact kinetic factory keys."""
 
 import hashlib
+import os
 from pathlib import Path
+
+
+def fullwarp_snapshot(sparse):
+    """Require both actual grouped factories, not just a constructor flag."""
+    flag = os.environ.get("FEATHER_PGS_SPARSE_FULLWARP_GROUP")
+    if flag not in ("0", "1"):
+        raise RuntimeError("Require explicit full-warp grouping on both arms")
+    wanted = flag == "1"
+    actual = getattr(sparse, "fullwarp_group", False)
+    if type(actual) is not bool or actual != wanted:
+        raise RuntimeError("Requested full-warp grouping differs from actual owner")
+    if wanted:
+        from newton._src.solvers.feather_pgs import sparse_fullwarp_group  # noqa: PLC0415
+
+        if (
+            sparse.kernels.solve is not sparse_fullwarp_group.get_solve_kernel()
+            or sparse.kernels.prefix is not sparse_fullwarp_group.get_prefix_kernel()
+        ):
+            raise RuntimeError("Full-warp grouping does not own both exact factories")
+    return {"requested": wanted, "observed": actual, "check_pass": True}
+
 
 RETAINED = Path("/tmp/fpgs-g1-paired-gs-checked-t0NFbw6H/checked_sparse.py")
 RETAINED_PIN = "5bea2bec51735a02f34a6623b136ca557a84df4678683ff888cab0297bf75046"
@@ -135,10 +157,17 @@ spectral_replacement = """    spectral_flag = os.environ.get("FEATHER_PGS_SPARSE
     spectral_actual = getattr(sparse, "spectral_tangents", False)
     if type(spectral_actual) is not bool or spectral_actual != spectral_wanted:
         raise RuntimeError("Requested spectral tangent owner is not active")
+    grouped = fullwarp_snapshot(sparse)
+    result["fullwarp_group"] = grouped
+    if grouped["observed"] and not spectral_wanted:
+        raise RuntimeError("Full-warp grouping requires the spectral owner")
     if spectral_wanted:
         from newton._src.solvers.feather_pgs.sparse_spectral_tangents import get_solve_kernel
         import warp as wp
         solve = "sparse_spectral_tangent43_s18_c100"
+        if grouped["observed"]:
+            from newton._src.solvers.feather_pgs.sparse_fullwarp_group import get_solve_kernel
+            solve += "_w4"
         if sparse.kernels.solve is not get_solve_kernel():
             raise RuntimeError("Spectral solve is not the exact cached factory")
         arguments = [argument.label for argument in sparse.kernels.solve.adj.args]
