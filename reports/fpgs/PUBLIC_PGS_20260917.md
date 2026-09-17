@@ -3,6 +3,9 @@
 2026-09-17. Public-source investigation and CPU diagnostics only; no Newton/Lab
 runtime change, GPU port, new capture, tolerance change or performance promotion.
 This is separate from the [whole-timing ledger](TWENTY_HOUR_20260916.md).
+The companion [projection design comparison](PROJECTION_DESIGN_20260917.md)
+separates repair, numerical metric and contact law, and discusses maintenance
+and implemented generality without authorizing a runtime refactor.
 
 ## Strong public match, not identification of a private conversation
 
