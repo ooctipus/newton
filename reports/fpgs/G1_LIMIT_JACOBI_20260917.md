@@ -3,8 +3,9 @@
 Status: default off and unpromoted. The first native implementation lost
 0.180 ms whole RTX; the sole actual-Z correction saves 0.625 ms against its
 paired original baseline, below the initial approximately 1 ms target. This is
-one fixed limit-only iteration change, not a contact Jacobi solver. Corrected
-node attribution and GB whole timing are not yet available.
+one fixed limit-only iteration change, not a contact Jacobi solver. A valid GB
+retry saves 0.469 ms physics-graph time but regresses environment wall time;
+corrected node attribution is not yet available.
 Base: `a61ea916ab55ee83109accf1a0360a02f7e83f7f`.
 
 ## Initial implementation: complete ownership and numerical scope
@@ -226,7 +227,7 @@ All original source/idle/capacity/owner checks passed. RTX physics-graph time
 is 13.160521725 to 12.535854600 ms: 1.049830438x, saving 0.624667125 ms.
 Environment wall time is separately 26.1776193 to 25.2724649 ms. This is one
 paired integrated result, not a node sum or an additive claim based on the
-initial experiment. No GB whole timing or repeat is claimed.
+initial experiment. It is not a repeated-performance claim.
 
 The outcome changes from the initial paired 0.179827275 ms loss to a paired
 0.624667125 ms gain, while preserving the approved map and hard-check scope.
@@ -246,3 +247,28 @@ Full and owned-file precommit plus diff checks passed for the corrected
 checkpoint. The initial commit `add5433f` was local-only when checked with
 `git ls-remote` before requesting the corrected scoped checkpoint; no remote
 branch was present at that point.
+
+The corrected checkpoint is committed and pushed as
+`81c0cb201453df67daf120438b05801906f2878c` on
+`origin/ooctipus/fpgs-g1-limit-jacobi-20260917`, preserving initial `add5433f`
+ancestry. No parent/submodule pointer changed.
+
+The first corrected GB whole attempt is explicitly not a result. Root session
+94047 exited 1 at
+`/tmp/fpgs-g1-limit-jacobi-zscatter-whole-gb16k-20260917-01`; manifest SHA256
+`7c2f6d47d7ef2759e5dc9a854ca59d22f05bc8c469052099a8665af1f0a56708`.
+Only the baseline arm ran before unrelated process 69361 occupied the card.
+Final source guard passed, idle guard failed, and no candidate arm or paired
+summary exists. No timing, speedup, GB acceptance, or runtime failure is
+inferred from this interrupted attempt. External processes were untouched.
+
+The fresh GB retry completed normally, root session 13309 exit 0:
+`/tmp/fpgs-g1-limit-jacobi-zscatter-whole-gb16k-20260917-02`, manifest SHA256
+`23479a433eb079d164e0d2df7abf70718f0c29c45a6199f908a5bb9a3d22a7c2`.
+Physics graph is 14.896602550 to 14.427726400 ms, ratio 1.032498270, saving
+0.468876150 ms. Environment wall is separately 28.930439200 to 29.715467876 ms,
+ratio 0.973581817: a wall-time regression, not a training throughput gain.
+Both arms completed with final source and idle guards true, unchanged physics
+budgets and the original capacity/actual-owner boundary checks. This valid
+retry does not replace or relabel the failed first attempt. It is one paired
+GB round; no repeat or whole >=1 ms achievement is claimed on either card.
