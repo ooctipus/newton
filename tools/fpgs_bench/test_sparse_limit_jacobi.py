@@ -176,7 +176,10 @@ class TestSparseLimitJacobi(unittest.TestCase):
         old_setup, old_update = spectral.get_fragments(100)
         self.assertEqual(setup, old_setup + jacobi._SETUP)
         self.assertEqual(update, jacobi._UPDATE + old_update)
-        self.assertEqual(jacobi.SCRATCH_BYTES, 688)
+        self.assertEqual(jacobi.SCRATCH_BYTES, 516)
+        self.assertNotIn("d.W.data", setup + update)
+        self.assertNotIn("limit_column", setup + update)
+        self.assertIn("__shared__ float limit_step[43]", setup)
         self.assertIn("isfinite(trial)", update)
         self.assertIn("omega==1.0f", update)
 
@@ -268,7 +271,27 @@ class TestSparseLimitJacobiCUDA(unittest.TestCase):
         z = f["owner"].data.Z.numpy()
         z[0, 0, 0] *= 1.25
         f["owner"].data.Z.assign(z)
-        check_native(self, f, iterations=1, fallback=True)
+        check_native(self, f, iterations=1)
+        # Template zero is a valid root-six support, not a missing-row marker.
+        # These rows are deliberately not signed coordinate columns of W.
+        # The accepted simultaneous result is (1,1); serial fallback is (1,.7).
+        seed_limits(f, 2)
+        owner, s = f["owner"], f["solver"]
+        identity = np.eye(43, dtype=np.float32)
+        owner.data.W.assign(identity[owner.host["row"], owner.host["col"]][None])
+        self.assertEqual(owner.host["support_count"][0], 6)
+        z = np.zeros((1, 100, 18), np.float32)
+        z[0, 0, 0] = 1.0
+        z[0, 1, :2] = [0.3, np.sqrt(0.91)]
+        owner.data.Z.assign(z)
+        owner.data.support.zero_()
+        s.diag.fill_(1.0)
+        s.rhs.fill_(-1.0)
+        s.row_cfm.zero_()
+        _, lam, stats = check_native(self, f, iterations=1)
+        np.testing.assert_allclose(lam, [1.0, 1.0], rtol=3e-5, atol=3e-6)
+        self.assertEqual(stats["limit_accepts"], 1)
+        self.assertEqual(stats["limit_fallbacks"], 0)
 
     def test_native_current_held_graph_and_empty(self):
         """Reuse actual current/held physical rows, graph replay and empty/regrow controls."""

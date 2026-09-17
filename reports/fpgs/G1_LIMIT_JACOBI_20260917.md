@@ -1,11 +1,13 @@
 # G1 limit-prefix Jacobi: bounded native cost screen
 
 Status: default off and unpromoted. The first native implementation lost
-0.180 ms whole RTX. This is one fixed limit-only iteration change, not a
-contact Jacobi solver. A response-representation correction is proposed below.
+0.180 ms whole RTX; the sole actual-Z correction saves 0.625 ms against its
+paired original baseline, below the initial approximately 1 ms target. This is
+one fixed limit-only iteration change, not a contact Jacobi solver. Corrected
+node attribution and GB whole timing are not yet available.
 Base: `a61ea916ab55ee83109accf1a0360a02f7e83f7f`.
 
-## Complete ownership and numerical scope
+## Initial implementation: complete ownership and numerical scope
 
 `FEATHER_PGS_SPARSE_LIMIT_JACOBI=1` requires the existing spectral-tangent
 owner. `SparseFactor.limit_jacobi` records actual ownership. The cached no-arg
@@ -165,3 +167,82 @@ before this correction is implemented.
 
 Full-repository and targeted precommit checks, focused CPU controls, and diff
 checks passed before this initial measured checkpoint.
+
+## Sole correction: contiguous actual-Z response
+
+Initial implementation and measured loss are preserved at commit `add5433f`.
+After the root's explicit correction approval, a changed-ownership regression
+failed first (session 36224, old scratch 688 != expected 516). The implementation
+now stores true signed delta[86], clears shared step[43] with a full warp fence,
+and scatters actual packed Z times delta for each changed row, in prefix order.
+Each changed-row scatter ends with a full warp fence. Immutable plan supports
+contain unique nodes within a row; the row fences order overlaps between rows.
+All proposal tiles still read old du. All node/coefficient checks precede the
+response vote; the complete step is checked for finiteness before the unchanged
+energy admission. Rejection modifies only private scratch. The zero-delta path
+never reads an uninitialized step. No atomics, W/index probes, sign metadata,
+new launches, or global arrays are introduced.
+
+Valid support template zero is admitted. The new native regression uses two
+arbitrary root-six rows with Gram diagonal one and correlation 0.3: simultaneous
+lambda [1,1] is accepted at energy -0.7, whereas original serial fallback gives
+[1,0.7]. This makes retirement of the W-column restriction observable. The
+actual-Z momentum check, genuine positive-energy rejection, signed/incoming
+cases, capacity 86/87, omega fallback, unchanged contact fragment, current/held
+physical cases and graph controls are retained. The fixed FP64 policy helper
+was not changed; this is a native representation correction, not another map.
+
+Focused plus actual-owner observer CPU session 36814 passed eight controls;
+three native selectors were skipped in that CPU-only run. Two independent
+source reviews found no concrete barrier, lifetime, finite-vote, or rollback
+blocker. The root subsequently ran all three native selectors successfully on
+both cards (RTX session 46634, GB session 68319). GB ran under external load:
+this is correctness evidence only, not performance evidence. Native logs in
+`/tmp/fpgs-limit-jacobi-native-0v3V7vRK/`:
+
+- `rtx-zscatter.log`: `40235c22ee057387198c18f72d46f1581b67bd84199c9bca55393f8c2ff8afcb`.
+- `gb-zscatter-shared-correctness.log`: `c893b92de4dfa575c61ef670aa55385960e01ae49d4723cf3aa9464883b57f87`.
+
+Hidden complete-owner AOT session 20087 passed with 64 SM120 / 66 SM103
+registers, 1,632 shared bytes, zero stack and zero spills. The old implementation
+had 62/61 registers and 1,804 shared bytes; the unchanged spectral baseline has
+64/64 and 1,116. Resource changes are charged, not treated as performance proof.
+Artifact `/tmp/fpgs-limit-jacobi-offline-LT9vM33W/offline03/report.json`, SHA256
+`5a33279a89cc7f61995127bc9ccea64d58307214a64114f60b22f809694e0ff2`.
+
+Corrected runtime SHA256:
+`5a15a0d64f914466df6e847426f5b9e83173d33fab490ada4aaa04c6211e3ac0`.
+Corrected test SHA256:
+`5261fd003460d6a4b0e55dc4fcf32d51be20422d6a414dc6921a8d66006f152a`.
+Binding, factory key, observer, CPU map, contact math, and maximum allowance
+remain exactly the initial checkpoint. Default remains off and unpromoted.
+
+### Corrected whole-step result
+
+Root session 39637 completed exit 0 at
+`/tmp/fpgs-g1-limit-jacobi-zscatter-whole-rtx16k-20260917-01`; manifest SHA256
+`9c9346a3e9f04e6e4896e4b85a759f5a41657a2f23ca6de824de7dd4d2a86538`.
+All original source/idle/capacity/owner checks passed. RTX physics-graph time
+is 13.160521725 to 12.535854600 ms: 1.049830438x, saving 0.624667125 ms.
+Environment wall time is separately 26.1776193 to 25.2724649 ms. This is one
+paired integrated result, not a node sum or an additive claim based on the
+initial experiment. No GB whole timing or repeat is claimed.
+
+The outcome changes from the initial paired 0.179827275 ms loss to a paired
+0.624667125 ms gain, while preserving the approved map and hard-check scope.
+It is useful measured improvement but below the original 1 ms screen target;
+the native representation hypothesis is not a claim of full convergence on
+arbitrary states. The prior sampled finite-eight quality tradeoffs remain.
+
+The corrected external strict reader is prepared separately at
+`/tmp/fpgs-g1-limit-zscatter-strict-OUU5xwAO/read_zscatter.py`, SHA256
+`5f5016ed7e2e109cc52cc9850f0e8539947412ff6bfd6fb61dd8d5c93ffd0403`.
+It source-pins the preserved initial reader and substitutes only the corrected
+runtime hash; owner key, eight-call cadence, block32/grid16384, 48/12 root
+scopes, zero-unproven, source, budget and capacity checks are unchanged. This
+is prepared tooling, not a claimed corrected node result.
+
+Full and owned-file precommit plus diff checks passed for the corrected
+checkpoint. The initial commit `add5433f` was local-only when checked with
+`git ls-remote` before requesting the corrected scoped checkpoint; no remote
+branch was present at that point.

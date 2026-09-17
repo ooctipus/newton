@@ -16,35 +16,24 @@ import textwrap
 from . import sparse_factor_rows, sparse_spectral_tangents
 
 PREFIX_CAPACITY = 86
-SCRATCH_BYTES = PREFIX_CAPACITY * 8
+SCRATCH_BYTES = (PREFIX_CAPACITY + 43) * 4
 ENERGY_MARGIN = 64.0 * 2.0**-24
 
 _SETUP = r"""
-    // No global allocation: existing signed W columns describe every limit.
+    // No global allocation: actual packed Z is the physical response authority.
     __shared__ float limit_delta[86];
-    __shared__ int limit_column[86];
+    __shared__ float limit_step[43];
     int limit_count=0;
     if(lane==0)while(limit_count<count && row_type.data[base+limit_count]==3)++limit_count;
     limit_count=__shfl_sync(0xffffffff,limit_count,0);
     int limit_bad=limit_count>86;
     if(limit_count<=86)for(int r=lane;r<limit_count;r+=32) {
         const int tpl=d.support.data[base+r];
-        bool good=tpl>0 && tpl<p.support_nodes.shape[0];
-        int column=0;float first=0.0f;
+        bool good=tpl>=0 && tpl<p.support_nodes.shape[0];
         if(good) {
             const int length=p.support_count.data[tpl];
-            column=p.support_nodes.data[tpl*18];
-            good=length>0 && length<=18 && column>=0 && column<37;
-            if(good)good=p.limit_support.data[42-column]==tpl;
-            if(good) {
-                const int entry=p.index.data[column*43+column];
-                first=d.Z.data[(base+r)*18];
-                const float diagonal_w=entry>=0?d.W.data[group*434+entry]:0.0f;
-                good=isfinite(first) && isfinite(diagonal_w) && diagonal_w>0.0f &&
-                    fabsf(first)==diagonal_w;
-            }
+            good=length>0 && length<=18;
         }
-        limit_column[r]=first<0.0f?~column:column;
         if(!good)limit_bad=1;
     }
     const bool limit_admitted=limit_count>0 && !__any_sync(0xffffffff,limit_bad);
@@ -80,7 +69,7 @@ _UPDATE = r"""
                         const float next=fmaxf(trial,0.0f);
                         const float delta=next-old;
                         if(!good || !isfinite(trial) || !isfinite(next) || !isfinite(delta))bad_proposal=1;
-                        limit_delta[r]=limit_column[r]<0?-delta:delta;
+                        limit_delta[r]=delta;
                         linear+=residual*delta;
                         any_delta|=delta!=0.0f;
                     }
@@ -91,30 +80,26 @@ _UPDATE = r"""
                 bool accepted=proposal_ok && !nonzero;
                 float step0=0.0f,step1=0.0f;
                 if(proposal_ok && nonzero) {
-                    // Node-owned deterministic accumulation; never mutate du
-                    // or lambda until the complete physical energy is checked.
-                    int bad_response=0;
+                    // Distinct support nodes make each row race-free. Preserve
+                    // prefix order between rows, without W/index/sign gathers.
+                    // Only scratch changes before the complete energy check.
+                    limit_step[lane]=0.0f;
+                    if(lane+32<43)limit_step[lane+32]=0.0f;
+                    __syncwarp();
                     for(int r=0;r<limit_count;++r) {
                         const float delta=limit_delta[r];
                         if(delta!=0.0f) {
-                            const int code=limit_column[r],column=code<0?~code:code;
-                            const int entry0=p.index.data[lane*43+column];
-                            if(entry0>=0) {
-                                const float value=d.W.data[group*434+entry0];
-                                bad_response|=!isfinite(value);
-                                step0+=value*delta;
+                            const int tpl=d.support.data[base+r];
+                            if(lane<p.support_count.data[tpl]) {
+                                const int node=p.support_nodes.data[tpl*18+lane];
+                                limit_step[node]+=d.Z.data[(base+r)*18+lane]*delta;
                             }
-                            if(lane+32<43) {
-                                const int entry1=p.index.data[(lane+32)*43+column];
-                                if(entry1>=0) {
-                                    const float value=d.W.data[group*434+entry1];
-                                    bad_response|=!isfinite(value);
-                                    step1+=value*delta;
-                                }
-                            }
+                            __syncwarp();
                         }
                     }
-                    bad_response|=!isfinite(step0) || !isfinite(step1);
+                    step0=limit_step[lane];
+                    if(lane+32<43)step1=limit_step[lane+32];
+                    const int bad_response=!isfinite(step0) || !isfinite(step1);
                     float norm=step0*step0+step1*step1;
                     for(int shift=16;shift>0;shift>>=1) {
                         linear+=__shfl_down_sync(0xffffffff,linear,shift);
@@ -135,8 +120,7 @@ _UPDATE = r"""
                         du[lane]+=step0;
                         if(lane+32<43)du[lane+32]+=step1;
                         for(int r=lane;r<limit_count;r+=32) {
-                            const float delta=limit_delta[r];
-                            lam[r]+=limit_column[r]<0?-delta:delta;
+                            lam[r]+=limit_delta[r];
                         }
                         changed=1;
                     }
