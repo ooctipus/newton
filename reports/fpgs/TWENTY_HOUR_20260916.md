@@ -2075,3 +2075,62 @@ Unrelated Kit jobs continue cycling on the GPUs. Root uses only verified idle
 windows, has requested a reserved device, and does not kill those jobs or
 weaken measurement guards. The twenty-hour window remains active until
 07:04 UTC; the four-times-across-tasks goal remains unmet.
+
+## Full-warp closure and two distinct structural screens, 01:20 UTC
+
+The four-world/full-warp grouping screen is complete and rejected, not
+promoted. On RTX the complete guarded comparison is 13.144145525 ms original
+to 13.961268150 ms candidate (0.941472177x); wall time also worsens. The strict
+48-physics/12-auxiliary-root trace places the loss in GS: 3.22163875 to
+4.048535 ms, while limit-prefix improves 0.5600134 to 0.520920 ms. All eight
+solve/prefix launches use the intended 128-thread/4096-block ownership, old
+keys are absent, capacity/source/idle guards pass, and registers do not grow.
+On an older source-matched population, grouping consecutive worlds exposes
+1.633x dot-work inflation from unequal completion lengths. This is a causal
+proxy, not a current-population stall measurement, but its magnitude explains
+why more reserved warps did not yield more useful throughput. A persistent
+queue would add reset/atomics/guards to an already sub-1-ms solve-only ideal;
+no queue or mapping grid is funded. Both cards pass four native correctness
+selectors, including odd-tail, remapped worlds, capacity and graph cases.
+Default-off branch `ooctipus/fpgs-g1-fullwarp-group-20260917` is pushed as
+`932e15b3c259cfa631c9622e4916db8b0c79e590`, with full/owned pre-commit passing.
+Whole artifact: `/tmp/fpgs-g1-fullwarp-group-whole-rtx16k-20260917-01`.
+Strict reader: `/tmp/fpgs-g1-fullwarp-strict-3xS3kf6f/read_fullwarp.py`.
+
+Franka's new compact-workspace screen preserves the original two-world
+half-warp execution and all arithmetic, scans, current/held lifetimes and
+public state. It overlays dead pose/motion slots with later wrench/moment
+storage; padded-body slots hold final actions without overwriting live body
+terms. Compiler shared memory falls 7296 to 3136 bytes, with repair/finish
+registers unchanged at 64/80 and no spills. This is not the earlier rejected
+scalar-world/lane streaming, which added joins and serialized worlds. CPU
+physical/lifetime tests and four GB native selectors pass. The first GB whole
+attempt stops after baseline and before candidate when an unrelated training
+job takes the device; final idle guard is false. There is NO valid whole
+comparison and no claimed speedup. The incomplete run is preserved at
+`/tmp/fpgs-franka-compact-workspace-whole-gb16k-20260917-01`.
+
+G1's second screen changes only the joint-limit prefix to one simultaneous
+projected update, retaining ordered contact/friction work and the original
+maximum eight outer passes. A finite negative quadratic-energy guard commits
+the complete prefix transaction; rejection rolls back all scratch and runs
+the original scalar prefix within the same pass. There is no contact-Jacobi
+map, Gram/factor, line-search grid, new global array, extra launch or new
+converged reference. Fixed four-lane row groups use existing support, followed
+by deterministic node-owned W gathers; all added reductions/indices/fences
+are charged. The saved 16 current/held cases pass independent physical
+checks. A preselected 1268-case interacting/uniform CPU cohort has zero hard
+finite/cone/momentum failures, but small finite-eight residual tradeoffs
+remain explicitly recorded. Uniform samples remove approximately 34.4% of
+ALL original dot-reduction stages and most serialized prefix fences, while
+outer passes rise about 1%; these are source-path counts, not GPU timings.
+The actual 3.2216 ms GS owner must reach at most 2.2216 ms to save 1 ms.
+One early native cost screen is authorized on new a61-based branch
+`ooctipus/fpgs-g1-limit-jacobi-20260917`. No further CPU policy sweep is funded.
+Frozen CPU decision card:
+`/tmp/fpgs-g1-limit-block-card-GowrgB7P/CARD.md`, SHA
+`f2445ed73fbf3fbbecf6406bf33d5fa6813d7c30609339c7fd0efaa05a2a68ad`.
+
+Both GPUs are occupied by unrelated jobs at this checkpoint. Root requested
+an uninterrupted measurement window and continues implementation/review;
+no sudo, job termination, Lab change or weakened idle guard is used.
