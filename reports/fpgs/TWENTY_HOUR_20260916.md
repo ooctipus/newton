@@ -2015,3 +2015,63 @@ not kill them or weaken the idle check. The root-owned runner now accepts one
 or two distinct GPUs, with the exact original sampling, source, budget,
 capacity and idle guards unchanged. Four observer/CLI controls pass; scoped
 pre-commit passes. This scheduling adaptation changes no Lab or solver code.
+
+## Native whole-cost closure and next ownership screen, September 17, 00:40 UTC
+
+The first complete RTX Krylov/chord comparison finished at 23:46, before its
+00:30 checkpoint. All source, idle, capacity and unchanged-budget guards pass:
+original physics 9.222293025 ms, candidate 27.762799075 ms, or 0.332181672x.
+This is an 18.540506050 ms loss, not accepted progress. Environment wall time
+also worsens, 17.281787150 to 34.908291101 ms. The GB whole run remains an
+initial-idle-guard failure with no measurements; redundant whole reruns are
+not required to establish this decisive RTX regression. Artifact
+`/tmp/fpgs-anymal-krylov-chord-whole-rtx16k-20260916-01/manifest.json`, SHA
+`23f76e015d80d0a24b072d0adb0c667f2ee874ea44584ca21754e1d8b6207f50`.
+
+The one cause-directed diagnostic is complete. On 1024 RTX saved cases the
+instrumented outputs are bit-identical to the uninstrumented candidate, and
+all eight per-world work counters exactly match the frozen CPU records:
+3809 committed corrections, 3823 linear calls, 5468 Krylov steps, 11792 sum of
+Krylov-depth squares, 1107 Gram builds, 186 projected trials, 283 old passes,
+and 4676 total line trials. Native iteration blowup is not the explanation.
+The linear service alone executes 35842 dot/norm reductions, each with five
+shuffle stages. Lower product counts did not remove their sequential control
+and communication cost. Diagnostic instrumentation raises registers to
+167--168; its within-world cycle fractions are NOT production wall-time shares.
+Root read the complete diagnostic, count-join, report and native source.
+Diagnostic result SHA
+`4de29b0310b6f2c3563905ca90bd17d4b1c4932cc44afc66541365f25ca50107`
+at `/tmp/fpgs-krylov-diagnostic-HKxyZtZT/rtx01/result.json`.
+
+The default-off prototype, tests and cost rejection are committed and pushed
+as `b189e905` on `ooctipus/fpgs-krylov-chord-native-20260916`. Full and owned
+pre-commit pass; the CPU suite has 20 passes and four CUDA skips, with native
+linear/fallback tests separately passing on both GPUs. No candidate runtime
+has been promoted, and no accepted physics timing has regressed.
+
+Additional bounded source screens close without implementation: field-major
+consumer packing already lost even with a free host transpose; integer-redux
+floating sums add scaling/conversion/control without a defensible latency
+advantage; forward prefix scans and finish-to-begin geometry coherence are
+already implemented; exact limb/root derivative elimination encounters
+singular local blocks; static terrain coefficients retain the main geometric
+work and must support live elevation mutation. No micro-optimization grid is
+funded from these findings. In particular, the old supernodal report's 17.3K
+figure counts static SASS instructions, NOT shared-memory bytes; its already
+measured shared-front correction uses 7336 bytes and remains below the gate.
+
+One inexpensive complete ownership screen is authorized: pack four independent
+full 32-lane G1 worlds per 128-thread CTA in BOTH spectral solve and limit
+prefix, preserving all numerical work, capacities, interfaces and publication.
+Actual RTX attributes limit one-warp blocks to 24 resident warps; the current
+64-register solve permits 32 with this grouping. The optimistic residency-
+scaled solve-plus-prefix saving is approximately 1.03 ms, not a promised gain
+or a hard timing bound. Although below the earlier 1.2 ms planning estimate,
+it is close to the structural 1 ms gate and cheap enough for one early whole-
+physics falsification. No mapping sweep or factor redesign is authorized.
+New isolated branch: `ooctipus/fpgs-g1-fullwarp-group-20260917`, based on a61.
+
+Unrelated Kit jobs continue cycling on the GPUs. Root uses only verified idle
+windows, has requested a reserved device, and does not kill those jobs or
+weaken measurement guards. The twenty-hour window remains active until
+07:04 UTC; the four-times-across-tasks goal remains unmet.
