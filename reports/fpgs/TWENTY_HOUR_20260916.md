@@ -11,7 +11,7 @@ is reported separately and is not end-to-end RL training throughput.
 - Worktree/branch: `newton-fpgs-structural-twentyh-20260916` /
   `ooctipus/fpgs-structural-twentyh-20260916`, on the `ooctipus/newton` fork.
 - Starting handoff: `57e1dcfaded9283dc9f62951093324b1da5acd6b`.
-- Accepted runtime comparator: `ca0d427af809571bb5501f644c1a6e03990cd2a8`.
+- Start-of-window accepted runtime comparator: `ca0d427af809571bb5501f644c1a6e03990cd2a8`.
   The previous study's experimental flags remain disabled. Its zero accepted
   additional gain and diagnosed failures are not reclassified as progress.
 - Isaac Lab: `53ee6b44c2334341305dbdf385a3916c6b140799`, unchanged.
@@ -2376,3 +2376,171 @@ G1/Kuka already share phase bodies; their remaining scan instructions represent
 required transform/moment channels. No source-backed removal of the roughly
 54%/60% owner time needed for 1 ms was found. Existing binary size alone does
 not justify a compaction experiment. No extra GPU capture was spent on it.
+
+## Row-owned formation and one width correction closed, 05:20 UTC
+
+Both complete boundaries are CLOSED, default off and unpromoted. Neither changes
+the accepted corrected-limit/Franka-compact checkpoint or its explicit recipe.
+The original local-formation runtime was measured at clean
+`56608c664fb1f10161743b9b09865f29d5f9fb26`; its report-only closure is
+[`4f3354adf91dfa66802fd90711a12693dbf11810`](https://github.com/ooctipus/newton/commit/4f3354adf91dfa66802fd90711a12693dbf11810),
+with the complete [packet report](https://github.com/ooctipus/newton/blob/4f3354adf91dfa66802fd90711a12693dbf11810/reports/fpgs/G1_ROW_OWNED_PACKETS_20260917.md).
+The separate width43 runtime was measured at clean
+`b21cf5078bfa4cba573fa9ab528c0fe905cf5337`; its report-only
+closure is [`50c5f1400036997da0a31a3c0e92586a630bc5e7`](https://github.com/ooctipus/newton/commit/50c5f1400036997da0a31a3c0e92586a630bc5e7),
+with the [width43 report](https://github.com/ooctipus/newton/blob/50c5f1400036997da0a31a3c0e92586a630bc5e7/reports/fpgs/G1_ROW_OWNED_WIDTH43_20260917.md).
+Full and report-scoped precommit pass in both branches; exactly one report changed
+in each closure commit. Runtime, tests and observer bytes remain measured bytes.
+
+### Complete whole results, not isolated solve timing
+
+Each experiment compares against corrected-limit
+`c6ab26f9687f64fd2acfe66f5328f16be1820692`, not against a losing candidate.
+One paired round/card retains Lab53ee, 16,384 worlds, seed0, 200 warmup/40 wall/
+40 graph-profile steps, simulation dt .005, decimation4, two .0025 solver
+substeps and maximum8 passes. Capacities remain100 dense rows,294,912 raw
+contacts,49,152 broad pairs and1,769,472 triangle pairs.
+
+| Experiment/card | Baseline physics ms | Candidate physics ms | Baseline/candidate | Baseline/candidate unprofiled wall ms |
+| --- | ---: | ---: | ---: | ---: |
+| Local formation, RTX | 12.509309075 | 13.346259925 | 0.937289484x | 27.210253649 / 26.591046850 |
+| Local formation, GB | 14.415478075 | 15.731324800 | 0.916354996x | 29.544967125 / 30.037355373 |
+| Width43, RTX | 12.502508425 | 13.333823950 | 0.937653630x | 27.151422025 / 27.606275125 |
+| Width43, GB | 14.419813275 | 15.718051525 | 0.917404632x | 28.862919498 / 30.756425200 |
+
+Original physics losses are0.836950850/1.315846725 ms RTX/GB; width43 losses
+are0.831315525/1.298238250 ms. The correction produces no material recovery.
+The original RTX wall decrease is not a physics gain, and none of these single
+rounds establishes repeated timing evidence or RL-training throughput.
+
+Whole manifests and SHA256:
+
+- Original [RTX](</tmp/fpgs-g1-row-owned-packets-whole-rtx16k-20260917-01/manifest.json>)
+  `84a73f8d235486b985691f9c3ef3603010381130f8abf4369985c0fa788e4f6b`;
+  [GB](</tmp/fpgs-g1-row-owned-packets-whole-gb16k-20260917-01/manifest.json>)
+  `e64657b2ba6411464e3cb8039fd69fe4cf456efda751700524c7c0e53881db18`.
+- Width43 [RTX](</tmp/fpgs-g1-row-owned-width43-whole-rtx16k-20260917-01/manifest.json>)
+  `4b9e991ab7a057f917baa9a034b7b9647ea869fc2a414b94d1d0aa792f72935c`;
+  [GB](</tmp/fpgs-g1-row-owned-width43-whole-gb16k-20260917-01/manifest.json>)
+  `cbf44b95755a4bb6dc6a278c598a81a423fc780347dee1b72df27f9a4d8655b5`.
+
+Independent original-harness replay passes all source/artifact/warning/capacity/
+budget/result/final-idle guards:19 driver and28 artifact pins/card, two boundaries
+per capture,160 physics/40 auxiliary graph launches and unchanged host cadence.
+Only register-residual/register-packets flags change. Actual key-only producers,
+17-argument small owner (CFM5/routing15/PacketInput16),16-argument original GS
+fallback and all filtered prefix/contact/restitution factories are checked.
+All sticky flags are false; this is not a numerical convergence certificate.
+
+Roughly93% of worlds take the small owner. Original endpoint contacts/rows differ
+by at most0.605%/0.466%; width43 by0.681%/0.498%. All worlds have rows and MF
+counts are zero. No workload or fallback-population explosion explains the loss.
+These endpoints do not prove identical trajectories or count executed sweeps;
+post-environment invalid-cache snapshots are not cumulative reset counters.
+
+### Strict cost attribution and the failed retirement estimate
+
+Original candidate node traces:
+[RTX](</tmp/fpgs-g1-row-owned-packets-node-rtx16k-20260917-01/manifest.json>) and
+[GB](</tmp/fpgs-g1-row-owned-packets-node-gb16k-20260917-01/manifest.json>).
+The strict supplemental reader preserves the original auxiliary-graph analyzer
+failure and proves48 physics/12 auxiliary roots, zero unproven nodes, exact
+process/correlation ownership and source/capacity/factory identity.
+
+| Original packet boundary, ms/environment step | RTX | GB |
+| --- | ---: | ---: |
+| Small fused formation + solve, owner sum | 3.583258750 | 4.317253083 |
+| Filtered original GS fallback, owner sum | 0.913293750 | 0.969437333 |
+| Formation + solve interval union | 4.496552500 | 5.286690417 |
+| Formation + solve exclusive busy | 4.496552500 | 5.284589083 |
+| Remaining row-service exclusive busy | 1.680504917 | 1.609456167 |
+
+The old value-emitting prefix/contact/restitution owners and old small/limit
+solve owners are absent. Each of the five key/filtered-materializer owners runs
+8 times/environment step; small and fallback each run8. Every service is charged.
+The fused small owner includes physical formation, so its time is not GS-only.
+
+The pre-code RTX displaced-producer ceiling was2.067035 ms, before key/fallback
+costs and compact's0.352563 ms pre-existing solve deficit. Actual row-service
+exclusive retirement against the prior compact trace is only1.089366833/
+1.179004417 ms RTX/GB, while formation+solve exclusive work adds1.558681250/
+2.043888167 ms against compact GS. This complete cost explains the failure.
+Short traces have slightly different workloads; component intervals are not
+blindly summed into a prediction of separate whole timing.
+
+Original AOT/trace resources are118/112 registers RTX/GB,5760 shared bytes,
+zero spills/reported local memory; text82176/82304 bytes. Width43 changes exactly
+105 tile allocation/bound/address sites44→43, preserving all arithmetic, indices,
+full-warp fences, transactional fallback and final dead-tile du overlay. Shared
+memory falls to5632 bytes, registers stay118/112 and text becomes82048/82304.
+The stride44 four-address-per-bank pattern is a source fact, not a measured
+stall fraction. Its correction does not materially improve complete cost.
+No width43 node capture, further stride/MMA grid or transfer prototype is funded.
+
+This is a transfer no-go for the measured representation, not a theorem that
+all local formation is impossible. Already on G1's large eligible cohort,
+retired production does not pay for retained triangular W/J work, added keys,
+filtered fallback and the fused owner's heavier resources. No source-backed
+Franka/Kuka complete-owner budget justifies porting this losing boundary.
+
+### Physical-oracle provenance and exact closure pins
+
+Original native02 fails only the newly added FP64 geometric-J component gate in
+two saved world7410 states, on both cards. Diagnostic-only reruns demonstrate
+exactly the same candidate/original differences4.0260e-5/3.7645e-5 and tolerance
+ratios5.6129/2.6684. This is a pre-existing difference between independently
+reconstructed FP64 J/W and rounded productionZ, not a candidate-only defect.
+The inherited component gate is restored using originalZ saved before candidate
+sentinel poisoning, with unchanged rtol3e-5/atol3e-6. Independent physical J/H,
+cone, metadata and scalar/output gates remain; maximum H backward defect is
+4.2574e-8, below the unchanged2e-6 gate. Failed02/control evidence is preserved.
+Original native03 and width43 native01 pass all six groups/card. These finite8
+current/held, restitution, incoming/delayed, routing/rollback and graph controls
+are not a converged-manifold reference or full-population convergence proof.
+Preserved evidence includes the [RTX oracle control](</tmp/fpgs-g1-row-owned-packets-momentum-control-rtx-20260917-01.log>),
+[GB oracle control](</tmp/fpgs-g1-row-owned-packets-momentum-control-gb-20260917-01.log>),
+original native03 [RTX](</tmp/fpgs-g1-row-owned-packets-native-rtx-20260917-03.log>)/
+[GB](</tmp/fpgs-g1-row-owned-packets-native-gb-20260917-03.log>), and width43 native01
+[RTX](</tmp/fpgs-g1-row-owned-width43-native-rtx-20260917-01.log>)/
+[GB](</tmp/fpgs-g1-row-owned-width43-native-gb-20260917-01.log>).
+
+- Original runtime `7ea45204f07a845ea767517719310963aec65f47010f054603121e1af59f5826`;
+  width43 `fe7539cbf85a5e111773b4b50101425179ccd392e91cd831892aed2262eac985`.
+- Original tests `75c98556fb27fd1e9d35954613720e604948dab9f3ac8f91deab86675c48370f`;
+  width43 tests `28027e1714679499cb673a4051f0eeb8441e9daf671776467e43886ac3a38724`.
+- Original observer remains `dfb2fcd7016098199962bb841c4ed33363014fc1f92b05a1f1203e7fe7648e9d`;
+  width43's import-order-only observer is `929464ada458dcdab7d9b6a0084d77ffcebefdcd5e10ede3682c860ea8829b8b`.
+- Original report SHA `e9738aca26f80571f8428379c5bb6f79705c6ad840c11b856b24809cea441634`;
+  width43 report SHA `b3cb16526349b9d9790a98c0c7a292f83030c9088b49cfc677d28dfe1c8b8f6e`.
+
+Final [strict reader](</tmp/fpgs-register-packets-strict-IPUKfZ4S/read_packets.py>)
+SHA is `be03e7ac47b9c88b635923eb2f07724a8b093f747f37d207b645170b9df86d58`.
+Original outputs RTX `e5fdd9ade4b4aa649b16829cff8f634d3c2b3cc8074cdde3ad48795615795949`
+/GB `0642da8711a367c34a831e08db981db51729f6b364587c48098fb552fe029b7e`
+embed reader `08847b551cfa10b35920fd6c8634191d0abe108cb0c2dd341c08585a0b7474fb`.
+Two later edits only strengthen the replacement-count guard>0→==8 and rename
+an inherited GS comment to formation-and-solve. Reversing those edits reproduces
+the earlier reader hash exactly. Independent final-reader outputs
+[RTX](</tmp/fpgs-register-packets-node-review-ec8hASPb/candidate_gpu0.json>)
+`5ac994a815f532f2c887edc1b99572699bc39c49595825681efe52aac519e572` and
+[GB](</tmp/fpgs-register-packets-node-review-ec8hASPb/candidate_gpu1.json>)
+`45a976ba080aedb8fb8e6a99d3ba6c06e681ae1c2f58aa86b4fe8dcee61f1910`
+differ only in the embedded reader hash. Original outputs/failure records remain.
+
+### Comparison-label audit: historical status versus paired increments
+
+The first ca0d backend table is a **start-of-window baseline refresh**. The later
+Franka-compact/G1-corrected-limit backend table is a **current explicit-recipe
+FPGS-versus-MJ comparison**, using the same tree and shared collision settings
+within each pair. These tables describe status at different points, not a matched
+ca0d→current optimization experiment. In particular, shared G1 collision changes
+also change the MJ denominator; dividing two historical ratios does not measure
+an incremental solver gain.
+
+The **paired incremental** evidence remains separately identified: corrected
+limit medians1.051674571x RTX/1.032415334x GB, and Franka compact median1.053550705x
+RTX with GB whole flat. Their local baselines, repeats and artifacts are stated
+above; do not multiply such ratios across unrelated captures or call the current
+2.9155x G1/2.2298x Franka RTX backend ratios those increments. The new packet/
+width43 losses do not replace either accepted feature or their checkpoint. No
+four-times-across-tasks or end-to-end-training claim follows from this ledger.
