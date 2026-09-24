@@ -111,6 +111,7 @@ from .kernels import (
     update_shape_mappings_kernel,
     update_site_properties_kernel,
     update_solver_options_kernel,
+    update_tendon_limit_gains_kernel,
     update_tendon_properties_kernel,
     wake_changed_trees_kernel,
 )
@@ -2578,6 +2579,21 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 usd_attribute_name="mjc:solreflimit",
             )
         )
+        for name in ("tendon_limit_ke", "tendon_limit_kd"):
+            builder.add_custom_attribute(
+                ModelBuilder.CustomAttribute(
+                    name=name, frequency="mujoco:tendon", dtype=wp.float32, default=0.0, namespace="mujoco"
+                )
+            )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="tendon_limit_gains_enabled",
+                frequency="mujoco:tendon",
+                dtype=wp.bool,
+                default=False,
+                namespace="mujoco",
+            )
+        )
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
                 name="tendon_solimp_limit",
@@ -2947,6 +2963,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             "tendon_actuator_force_limited",
             "tendon_actuator_force_range",
             "tendon_solref_limit",
+            "tendon_limit_ke",
+            "tendon_limit_kd",
+            "tendon_limit_gains_enabled",
             "tendon_solimp_limit",
             "tendon_solref_friction",
             "tendon_solimp_friction",
@@ -4849,6 +4868,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 # factors; ``jnt_solimp`` was already written by
                 # ``_update_joint_dof_properties`` above.
                 self._update_solref_from_invweight0()
+                self._update_tendon_limit_gains()
             # Must be called last — mj_setConst/set_const_0 computes CONNECT anchor2
             # without accounting for Newton's dof_ref, so we overwrite with the
             # correctly computed values.
@@ -4880,6 +4900,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                         # ``jnt_solimp`` was already written by
                         # ``_update_joint_dof_properties`` above.
                         self._update_solref_from_invweight0()
+                        self._update_tendon_limit_gains()
                     # Must be called last — mj_setConst/set_const_0 computes CONNECT anchor2
                     # without accounting for Newton's dof_ref, so we overwrite with the
                     # correctly computed values.
@@ -9105,6 +9126,36 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         )
         self.mj_model.jnt_solref[:] = self.mjw_model.jnt_solref.numpy()[0]
 
+    def _update_tendon_limit_gains(self):
+        """Apply force gains using tendon inverse inertia refreshed by ``set_const_0``.
+
+        Native mode also reports equivalent force gains for readback. Force-gain
+        mode disables the limit at zero stiffness and supports zero damping.
+        """
+        if self.mjc_tendon_to_newton_tendon is None or self.mj_model.ntendon == 0:
+            return
+        if self.use_mujoco_cpu:
+            self.mjw_model.tendon_invweight0.assign(self.mj_model.tendon_invweight0.reshape(1, -1))
+        attrs = self.model.mujoco
+        wp.launch(
+            update_tendon_limit_gains_kernel,
+            dim=self.mjc_tendon_to_newton_tendon.shape,
+            inputs=[
+                self.mjc_tendon_to_newton_tendon,
+                attrs.tendon_limit_gains_enabled,
+                attrs.tendon_limit_ke,
+                attrs.tendon_limit_kd,
+                attrs.tendon_solref_limit,
+                attrs.tendon_range,
+                self.mjw_model.tendon_invweight0,
+                self.mjw_model.tendon_solimp_lim,
+            ],
+            outputs=[self.mjw_model.tendon_solref_lim, self.mjw_model.tendon_range],
+            device=self.model.device,
+        )
+        self.mj_model.tendon_solref_lim[:] = self.mjw_model.tendon_solref_lim.numpy()[0]
+        self.mj_model.tendon_range[:] = self.mjw_model.tendon_range.numpy()[0]
+
     def _update_pair_properties(self):
         """Update MuJoCo contact pair properties from Newton custom attributes.
 
@@ -9362,6 +9413,22 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             ],
             device=self.model.device,
         )
+
+        if self.use_mujoco_cpu:
+            for name in (
+                "tendon_stiffness",
+                "tendon_damping",
+                "tendon_frictionloss",
+                "tendon_range",
+                "tendon_margin",
+                "tendon_solref_lim",
+                "tendon_solimp_lim",
+                "tendon_solref_fri",
+                "tendon_solimp_fri",
+                "tendon_armature",
+                "tendon_actfrcrange",
+            ):
+                getattr(self.mj_model, name)[:] = getattr(self.mjw_model, name).numpy()[0]
 
     def _update_actuator_properties(self):
         """Update CTRL_DIRECT actuator properties in the MuJoCo model.
