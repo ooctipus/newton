@@ -32,7 +32,7 @@ from ...sim import (
     StateFlags,
 )
 from ...sim.articulation import eval_fk
-from ...sim.collide import _estimate_rigid_contact_max, _estimate_rigid_contact_max_per_world
+from ...sim.collide import CollisionPipeline, _estimate_rigid_contact_max, _estimate_rigid_contact_max_per_world
 from ...sim.contacts import GENERATION_SENTINEL as _GENERATION_SENTINEL
 from ...sim.graph_coloring import color_graph, plot_graph
 from ...utils import topological_sort
@@ -67,6 +67,7 @@ from .kernels import (
     apply_mjc_free_joint_f_to_body_f_kernel,
     apply_mjc_qfrc_kernel,
     build_ref_q_kernel,
+    clear_world_overflow_kernel,
     convert_mj_coords_to_warp_kernel,
     convert_newton_contacts_to_mjwarp_kernel,
     convert_qfrc_actuator_from_mj_kernel,
@@ -79,12 +80,12 @@ from .kernels import (
     eval_mujoco_coupling_effective_mass_block_kernel,
     eval_mujoco_coupling_effective_mass_kernel,
     eval_mujoco_coupling_gravity_acceleration_kernel,
+    project_sleep_collision_masks_kernel,
     recompute_jnt_eq_anchor1_kernel,
     repeat_array_kernel,
     reset_joint_state_kernel,
-    reset_sleeping_state_kernel,
     reset_world_buffers_kernel,
-    restore_sleeping_state_kernel,
+    select_sleep_trees_kernel,
     sync_qpos0_kernel,
     sync_site_xposes_kernel,
     sync_worldbody_geom_xposes_kernel,
@@ -113,7 +114,6 @@ from .kernels import (
     update_site_properties_kernel,
     update_solver_options_kernel,
     update_tendon_properties_kernel,
-    wake_changed_trees_kernel,
 )
 from .utils import solref_invalid_mask
 
@@ -495,6 +495,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         """Allow the tree to sleep."""
         INIT = 5
         """Initialize the tree asleep."""
+        ALWAYS = 6
+        """Disable a tree until explicitly re-enabled with :meth:`set_body_sleep_policy`. Runtime only."""
 
     # Class variables to cache the imported modules
     _mujoco = None
@@ -3751,6 +3753,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         update_data_interval: int = 1,
         save_to_mjcf: str | None = None,
         use_mujoco_contacts: bool = True,
+        collision_pipeline: CollisionPipeline | None = None,
         include_sites: bool = True,
         skip_visual_only_geoms: bool = True,
         deterministic: wp.DeterministicMode | None = None,
@@ -3793,7 +3796,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             magnetic: Global magnetic flux vector (x, y, z). If None, uses model custom attribute or MuJoCo's default (0, -0.5, 0).
             use_mujoco_cpu: If True, use the MuJoCo-C CPU backend instead of `mujoco_warp`.
             enable_multiccd: If True, enable multi-CCD contact generation (up to 4 contact points per geom pair instead of 1). Note: geom pairs where either geom has ``margin > 0`` always produce a single contact regardless of this flag.
-            enable_sleeping: Whether to enable MuJoCo Warp's sleeping optimization. If None, uses the model custom attribute or defaults to False. Sleeping requires the GPU backend, the Newton solver, MuJoCo contact handling, and a non-RK4 integrator.
+            enable_sleeping: Whether to enable MuJoCo Warp's sleeping optimization. If None, uses the model custom attribute or defaults to False. Sleeping requires the GPU backend, the Newton solver, and a non-RK4 integrator. Newton contacts also require collision_pipeline.
             nvmax: Maximum number of active degrees of freedom per world when sleeping is enabled. Must accommodate every initially awake degree of freedom. If None, allocates space for every degree of freedom, which is safe but provides no compact-solver memory savings.
             sleep_tolerance: Sleep velocity tolerance. If None, uses model custom attribute or MuJoCo default (0.001).
             disable_contacts: If True, disable contact computation in MuJoCo.
@@ -3801,6 +3804,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             update_data_interval: Frequency (in simulation steps) at which to update the MuJoCo Data object from the Newton state. If 0, Data is never updated after initialization.
             save_to_mjcf: Optional path to save the generated MJCF model file.
             use_mujoco_contacts: If True, use the MuJoCo contact solver. If False, use the Newton contact solver (newton contacts must be passed in through the step function in that case).
+            collision_pipeline: Optional Newton rigid collision pipeline, required for sleeping
+                with Newton contacts. The solver runs both collision passes during step and
+                overwrites the supplied Contacts buffer. Do not precompute contacts separately.
             include_sites: If ``True`` (default), Newton shapes marked with ``ShapeFlags.SITE`` are exported as MuJoCo sites. Sites are non-colliding reference points used for sensor attachment, debugging, or as frames of reference. If ``False``, sites are skipped during export. Defaults to ``True``.
             skip_visual_only_geoms: If ``True`` (default), geometries used only for visualization (i.e. not involved in collision) are excluded from the exported MuJoCo spec. This avoids mismatches with models that use explicit ``<contact>`` definitions for collision geometry.
             deterministic: Deterministic mode for MuJoCo Warp solver kernels. Pass a
@@ -3822,10 +3828,25 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         enable_sleeping = bool(enable_sleeping)
         if enable_sleeping and use_mujoco_cpu:
             raise ValueError("enable_sleeping=True requires the MuJoCo Warp GPU backend (use_mujoco_cpu=False).")
-        if enable_sleeping and not use_mujoco_contacts:
+        if enable_sleeping and not use_mujoco_contacts and collision_pipeline is None:
             raise ValueError(
-                "enable_sleeping=True requires use_mujoco_contacts=True so contacts can wake sleeping bodies."
+                "Newton contacts with sleeping require collision_pipeline so contacts can wake sleeping bodies."
             )
+        if collision_pipeline is not None:
+            if use_mujoco_cpu or use_mujoco_contacts or not enable_sleeping:
+                raise ValueError("collision_pipeline requires MJWarp sleeping with use_mujoco_contacts=False.")
+            if collision_pipeline.model is not model:
+                raise ValueError("collision_pipeline must use the solver model.")
+            if (
+                collision_pipeline._contact_matcher is not None
+                or collision_pipeline._speculative_enabled
+                or model.particle_count
+                or collision_pipeline.requires_grad
+            ):
+                raise ValueError(
+                    "Sleeping collision_pipeline requires rigid contacts without matching, gradients, or speculation."
+                )
+        self._collision_pipeline = collision_pipeline
         if njmax_nnz is not None:
             if isinstance(njmax_nnz, bool) or not isinstance(njmax_nnz, int | np.integer):
                 raise TypeError(f"njmax_nnz must be an integer or None, got {type(njmax_nnz).__name__}.")
@@ -3848,18 +3869,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         """Whether MuJoCo Warp sleeping is enabled."""
         self.nvmax = nvmax
         """Maximum number of active degrees of freedom allocated per world."""
-        self._sleep_awake_value = -(1 + int(mujoco.mjMINAWAKE))
         self._sleep_qpos: wp.array2d[wp.float32] | None = None
         self._sleep_qpos_treeid: wp.array[wp.int32] | None = None
         self._sleep_tree_changed: wp.array2d[wp.int32] | None = None
         self._initial_tree_asleep: wp.array[wp.int32] | None = None
-        self._initial_tree_awake: wp.array[wp.int32] | None = None
-        self._initial_body_awake: wp.array[wp.int32] | None = None
-        self._initial_body_awake_ind: wp.array[wp.int32] | None = None
-        self._initial_dof_awake_ind: wp.array[wp.int32] | None = None
-        self._initial_ntree_awake = 0
-        self._initial_nbody_awake = 0
-        self._initial_nv_awake = 0
         self._initial_model_sync = True
         self._deterministic = deterministic if deterministic is not None else wp.config.deterministic
         self._deterministic_max_records = 0
@@ -4160,6 +4173,13 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
 
         if self.mjw_model is not None:
             self.mjw_model.opt.run_collision_detection = use_mujoco_contacts
+        if collision_pipeline is not None:
+            self._collision_state = model.state()
+            self._collision_contacts = None
+            self._collision_state_in = None
+            self._shape_enabled = wp.zeros(model.shape_count, dtype=wp.bool, device=model.device)
+            self._shape_awake = wp.zeros_like(self._shape_enabled)
+            self._shape_awake_previous = wp.zeros_like(self._shape_enabled)
 
     @contextmanager
     def _scoped_deterministic_config(self):
@@ -4209,11 +4229,50 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 if self.update_data_interval > 0 and self._step % self.update_data_interval == 0:
                     self._update_mjc_data(self.mjw_data, self.model, state_in)
                 self.mjw_model.opt.timestep.fill_(dt)
-                if not self.mjw_model.opt.run_collision_detection:
+                if self._collision_pipeline is not None:
+                    self._collision_contacts = contacts
+                    self._collision_state_in = state_in
+                    self.mjw_model.callback.collision = self._collide_sleeping
+                elif not self.mjw_model.opt.run_collision_detection:
                     self._convert_contacts_to_mjwarp(self.model, state_in, contacts)
-                self._mujoco_warp_step()
+                try:
+                    self._mujoco_warp_step()
+                finally:
+                    if self._collision_pipeline is not None:
+                        self.mjw_model.callback.collision = None
+                        self._collision_contacts = None
+                        self._collision_state_in = None
                 self._update_newton_state(self.model, state_out, self.mjw_data, state_prev=state_in)
         self._step += 1
+
+    def _collide_sleeping(self, m, d, awake_prev=None) -> None:
+        """Project MJWarp activity into Newton collision masks at MJWarp's collision stage."""
+        if awake_prev is None:
+            self._update_newton_state(self.model, self._collision_state, d, state_prev=self._collision_state_in)
+        wp.launch(
+            project_sleep_collision_masks_kernel,
+            self.mjc_geom_to_newton_shape.shape,
+            inputs=[
+                self.mjc_geom_to_newton_shape,
+                self.model.shape_world,
+                m.geom_bodyid,
+                m.body_treeid,
+                m.tree_sleep_policy,
+                d.body_awake,
+                awake_prev,
+                int(self._mujoco.mjtSleepState.mjS_AWAKE),
+            ],
+            outputs=[self._shape_enabled, self._shape_awake, self._shape_awake_previous],
+            device=self.model.device,
+        )
+        self._collision_pipeline.collide(
+            self._collision_state,
+            self._collision_contacts,
+            shape_enabled=self._shape_enabled,
+            shape_awake=self._shape_awake,
+            shape_awake_previous=self._shape_awake_previous if awake_prev is not None else None,
+        )
+        self._convert_contacts_to_mjwarp(self.model, self._collision_state, self._collision_contacts)
 
     @override
     def reset(
@@ -4351,130 +4410,75 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self._restore_initial_sleeping_state(world_mask, clear_overflow=True)
 
     def _capture_initial_sleeping_state(self) -> None:
-        """Capture the template world's initial sleep bookkeeping."""
-        if not self.enable_sleeping or self.mjw_data is None:
-            return
-
-        d = self.mjw_data
-        device = self.model.device
+        """Keep only the initial cycle state; MJWarp owns all derived sleep bookkeeping."""
         self._initial_tree_asleep = wp.array(
-            d.tree_asleep.numpy()[0].copy(),
-            dtype=wp.int32,
-            device=device,
+            self.mjw_data.tree_asleep.numpy()[:1].copy(), dtype=wp.int32, device=self.model.device
         )
-        self._initial_tree_awake = wp.array(
-            d.tree_awake.numpy()[0].copy(),
-            dtype=wp.int32,
-            device=device,
-        )
-        self._initial_body_awake = wp.array(
-            d.body_awake.numpy()[0].copy(),
-            dtype=wp.int32,
-            device=device,
-        )
-        self._initial_body_awake_ind = wp.array(
-            d.body_awake_ind.numpy()[0].copy(),
-            dtype=wp.int32,
-            device=device,
-        )
-        self._initial_dof_awake_ind = wp.array(
-            d.dof_awake_ind.numpy()[0].copy(),
-            dtype=wp.int32,
-            device=device,
-        )
-        self._initial_ntree_awake = int(d.ntree_awake.numpy()[0])
-        self._initial_nbody_awake = int(d.nbody_awake.numpy()[0])
-        self._initial_nv_awake = int(d.nv_awake.numpy()[0])
 
-    def _restore_initial_sleeping_state(
-        self,
-        world_mask: wp.array[wp.bool] | None = None,
-        *,
-        clear_overflow: bool = False,
-    ) -> None:
-        """Restore the initial sleep state in selected MuJoCo Warp worlds."""
-        if not self.enable_sleeping or self.mjw_data is None:
-            return
-        if self._initial_tree_asleep is None:
-            raise RuntimeError("Initial MuJoCo Warp sleep state was not captured.")
+    def _restore_initial_sleeping_state(self, world_mask=None, *, clear_overflow=False) -> None:
+        """Restore selected worlds under their current policies."""
+        mask = world_mask[: self.mjw_data.nworld] if world_mask is not None else None
+        with wp.ScopedDevice(self.model.device):
+            self._mujoco_warp.reset_sleep(
+                self.mjw_model, self.mjw_data, world_mask=mask, initial_tree_asleep=self._initial_tree_asleep
+            )
+        if clear_overflow:
+            wp.launch(
+                clear_world_overflow_kernel,
+                self.mjw_data.nworld,
+                inputs=[mask, self.mjw_data.overflow],
+                device=self.model.device,
+            )
 
-        m = self.mjw_model
-        d = self.mjw_data
-        sleep_dim = max(m.nv, m.nbody, m.ntree)
-        if sleep_dim == 0:
-            return
+    def _wake_sleeping_worlds(self, world_mask=None, *, clear_overflow=False) -> None:
+        """Ask MJWarp to wake selected worlds while preserving permanently disabled trees."""
+        mask = world_mask[: self.mjw_data.nworld] if world_mask is not None else None
+        with wp.ScopedDevice(self.model.device):
+            self._mujoco_warp.wake_trees(self.mjw_model, self.mjw_data, world_mask=mask)
+        if clear_overflow:
+            wp.launch(
+                clear_world_overflow_kernel,
+                self.mjw_data.nworld,
+                inputs=[mask, self.mjw_data.overflow],
+                device=self.model.device,
+            )
+
+    def set_body_sleep_policy(self, body_ids: wp.array, policy: SleepPolicy) -> None:
+        """Change the runtime policy of trees containing the selected Newton bodies.
+
+        Select dynamic bodies using global Newton body indices. A six-slider partition can
+        contain six MuJoCo trees: select all six moving bodies to disable the partition.
+        Fixed bodies without a dynamic tree are ignored. ALWAYS removes trees from dynamics
+        and contacts until explicitly re-enabled; rendering remains the caller's responsibility.
+        Coordinates are preserved and disabled velocities are cleared in MJWarp. Re-enable
+        with ALLOWED or NEVER. INIT and AUTO are compiler policies and cannot be set at runtime.
+        Equality constraints connecting disabled and enabled trees must be disabled separately.
+        This method supports CUDA graph capture and requires ``enable_sleeping=True``.
+
+        Args:
+            body_ids: One-dimensional int32 array on the model device, containing valid body IDs.
+            policy: ALLOWED, NEVER, or ALWAYS.
+        """
+        if not self.enable_sleeping:
+            raise ValueError("set_body_sleep_policy requires enable_sleeping=True.")
+        if body_ids.ndim != 1 or body_ids.dtype != wp.int32 or body_ids.device != self.model.device:
+            raise ValueError("body_ids must be a one-dimensional int32 array on the model device.")
+        policies = {self.SleepPolicy.ALLOWED: 2, self.SleepPolicy.NEVER: 1, self.SleepPolicy.ALWAYS: 6}
+        if policy not in policies:
+            raise ValueError("Runtime sleep policy must be ALLOWED, NEVER, or ALWAYS.")
+        self._sleep_tree_changed.zero_()
         wp.launch(
-            restore_sleeping_state_kernel,
-            dim=(d.nworld, sleep_dim),
-            inputs=[
-                world_mask,
-                int(clear_overflow),
-                m.nv,
-                m.nbody,
-                m.ntree,
-                self._initial_ntree_awake,
-                self._initial_nbody_awake,
-                self._initial_nv_awake,
-                self._initial_tree_asleep,
-                self._initial_tree_awake,
-                self._initial_body_awake,
-                self._initial_body_awake_ind,
-                self._initial_dof_awake_ind,
-                d.tree_asleep,
-                d.tree_awake,
-                d.body_awake,
-                d.body_awake_ind,
-                d.dof_awake_ind,
-                d.ntree_awake,
-                d.nbody_awake,
-                d.nv_awake,
-                d.overflow,
-            ],
+            select_sleep_trees_kernel,
+            body_ids.size,
+            inputs=[body_ids, self._body_sleep_index],
+            outputs=[self._sleep_tree_changed],
             device=self.model.device,
         )
-
-    def _wake_sleeping_worlds(
-        self,
-        world_mask: wp.array[wp.bool] | None = None,
-        *,
-        clear_overflow: bool = False,
-    ) -> None:
-        """Wake all dynamic trees in the selected MuJoCo Warp worlds."""
-        if not self.enable_sleeping or self.mjw_data is None:
-            return
-
-        m = self.mjw_model
-        d = self.mjw_data
-        sleep_dim = max(m.nv, m.nbody, m.ntree)
-        if sleep_dim == 0:
-            return
-        wp.launch(
-            reset_sleeping_state_kernel,
-            dim=(d.nworld, sleep_dim),
-            inputs=[
-                world_mask,
-                int(clear_overflow),
-                m.nv,
-                m.nbody,
-                m.ntree,
-                self._sleep_awake_value,
-                int(self._mujoco.mjtSleepState.mjS_STATIC),
-                int(self._mujoco.mjtSleepState.mjS_AWAKE),
-                m.body_rootid,
-                m.body_mocapid,
-                m.body_treeid,
-                d.tree_asleep,
-                d.tree_awake,
-                d.body_awake,
-                d.body_awake_ind,
-                d.dof_awake_ind,
-                d.ntree_awake,
-                d.nbody_awake,
-                d.nv_awake,
-                d.overflow,
-            ],
-            device=self.model.device,
-        )
+        with wp.ScopedDevice(self.model.device):
+            self._mujoco_warp.set_sleep_policy(
+                self.mjw_model, self.mjw_data, self._sleep_tree_changed, policies[policy]
+            )
+        self._invalidate_contact_fast_path()
 
     def _validate_rne_postconstraint(self, state_out: State):
         """Reject state fields whose post-constraint RNE stage is disabled."""
@@ -4801,14 +4805,20 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self.mj_model.dof_simplenum[:] = 0
 
     @override
-    def notify_model_changed(self, flags: ModelFlags | int) -> None:
+    def notify_model_changed(self, flags: ModelFlags | int, *, world_mask: wp.array | None = None) -> None:
+        """Refresh properties, waking only selected worlds when a mask is supplied.
+
+        The mask follows :meth:`reset` and controls wake scope. Property arrays
+        are synchronized in full; callers must restrict their writes to the selected worlds.
+        """
+        world_mask = self._normalize_reset_world_mask(world_mask)
         if self.use_mujoco_cpu:
-            self._notify_model_changed(flags)
+            self._notify_model_changed(flags, world_mask)
         else:
             with self._scoped_mujoco_warp_execution():
-                self._notify_model_changed(flags)
+                self._notify_model_changed(flags, world_mask)
 
-    def _notify_model_changed(self, flags: ModelFlags | int) -> None:
+    def _notify_model_changed(self, flags: ModelFlags | int, world_mask=None) -> None:
         need_const_fixed = False
         need_const_0 = False
         need_length_range = False
@@ -4944,7 +4954,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             if flags and getattr(self, "enable_sleeping", False) and not getattr(self, "_initial_model_sync", False):
                 # MuJoCo Warp cannot infer that Newton-side property updates
                 # invalidate sleeping islands, so explicitly wake them.
-                self._wake_sleeping_worlds()
+                self._wake_sleeping_worlds(world_mask)
 
     def _validate_cone_shape_scales(self) -> None:
         """Reject resizing cones whose MuJoCo meshes were compiled at construction."""
@@ -5247,17 +5257,13 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 outputs=[qpos, self._sleep_tree_changed],
                 device=model.device,
             )
-            wp.launch(
-                wake_changed_trees_kernel,
-                dim=nworld,
-                inputs=[
+            with wp.ScopedDevice(self.model.device):
+                self._mujoco_warp.wake_trees(
+                    self.mjw_model,
+                    self.mjw_data,
                     self._sleep_tree_changed,
-                    self.mjw_model.ntree,
-                    self._sleep_awake_value,
-                ],
-                outputs=[self.mjw_data.tree_asleep],
-                device=model.device,
-            )
+                    world_mask=world_mask[:nworld] if world_mask is not None else None,
+                )
 
         if not is_mjwarp:
             mj_data.qpos[:] = qpos.numpy().flatten()[: len(mj_data.qpos)]
@@ -5586,6 +5592,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 mj_contact.geom,
                 mj_contact.efc_address,
                 mj_contact.worldid,
+                mj_contact.adhesion,
                 mj_data.efc.force,
                 self.mjw_model.geom_bodyid,
                 mj_data.xpos,
@@ -7681,7 +7688,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self.mj_model.tree_sleep_policy[policy_never] = mujoco.mjtSleepPolicy.mjSLEEP_AUTO_NEVER
             self.mj_model.tree_sleep_policy[policy_allowed | policy_init] = mujoco.mjtSleepPolicy.mjSLEEP_AUTO_ALLOWED
             try:
-                self.mjw_model = mujoco_warp.put_model(self.mj_model)
+                nworld = model.world_count if separate_worlds else 1
+                batch_sizes = {"tree_sleep_policy": nworld} if self.enable_sleeping else None
+                self.mjw_model = mujoco_warp.put_model(self.mj_model, batch_sizes=batch_sizes)
             finally:
                 # MuJoCo Warp consumes only the compiled runtime policy. Keep
                 # the authoring policy on the CPU model for inspection and MJCF export.
@@ -7770,6 +7779,13 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     body_to_newton_template[mjc_body] = newton_body % bodies_per_world
             mjc_body_to_newton_np = self._tile_world_mapping(body_to_newton_template, nworld, bodies_per_world)
             self.mjc_body_to_newton = wp.array(mjc_body_to_newton_np, dtype=wp.int32)
+            if self.enable_sleeping:
+                body_sleep_index = np.full((model.body_count, 2), -1, dtype=np.int32)
+                for worldid, mjbody in np.ndindex(mjc_body_to_newton_np.shape):
+                    bodyid = mjc_body_to_newton_np[worldid, mjbody]
+                    if bodyid >= 0:
+                        body_sleep_index[bodyid] = (worldid, self.mj_model.body_treeid[mjbody])
+                self._body_sleep_index = wp.array(body_sleep_index, dtype=wp.vec2i)
 
             # Common variables for mapping creation
             njnt = self.mj_model.njnt
@@ -8177,6 +8193,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             "geom_solimp",
             "geom_size",
             "geom_rbound",
+            "geom_aabb",
             "geom_pos",
             "geom_quat",
             "geom_friction",
@@ -9035,6 +9052,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self.model.shape_material_ke,
                 self.model.shape_material_kd,
                 self.model.shape_scale,
+                self.model.shape_type,
                 self.model.shape_transform,
                 self.mjc_geom_to_newton_shape,
                 self.mjw_model.geom_type,
@@ -9062,6 +9080,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self.mjw_model.geom_solmix,
                 self.mjw_model.geom_gap,
                 self.mjw_model.geom_margin,
+                self.mjw_model.geom_rbound,
+                self.mjw_model.geom_aabb,
             ],
             device=self.model.device,
         )

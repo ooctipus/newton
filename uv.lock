@@ -34,6 +34,9 @@ conflicts = [[
     { package = "newton", extra = "torch-cu13" },
 ]]
 
+[manifest]
+overrides = [{ name = "mujoco", specifier = "==3.12.0", index = "https://pypi.org/simple" }]
+
 [[package]]
 name = "absl-py"
 version = "2.4.0"
@@ -3340,8 +3343,8 @@ wheels = [
 
 [[package]]
 name = "mujoco-warp"
-version = "3.12.0"
-source = { registry = "https://pypi.org/simple" }
+version = "3.14.0"
+source = { git = "https://github.com/ooctipus/mujoco_warp.git?rev=4e7374ad18791248c102bcc0812ed5b5247608d7#4e7374ad18791248c102bcc0812ed5b5247608d7" }
 dependencies = [
     { name = "absl-py" },
     { name = "etils", version = "1.13.0", source = { registry = "https://pypi.org/simple" }, extra = ["epath"], marker = "python_full_version < '3.11' or (extra == 'extra-6-newton-torch-cu12' and extra == 'extra-6-newton-torch-cu13')" },
@@ -3351,10 +3354,6 @@ dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*' or (extra == 'extra-6-newton-torch-cu12' and extra == 'extra-6-newton-torch-cu13')" },
     { name = "numpy", version = "2.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' or (extra == 'extra-6-newton-torch-cu12' and extra == 'extra-6-newton-torch-cu13')" },
     { name = "warp-lang" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/b2/4f/41acd8a084dc8f140594fcca74f2dda61f89705505df20885bd6e65c0146/mujoco_warp-3.12.0.tar.gz", hash = "sha256:6937b83e9eb1632446a70104867d2b0c0ff028613ebc377eee992d30640d6554", size = 2085022, upload-time = "2026-08-20T11:58:15.742Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/47/24/d60f407b469be023566c8e149eb1598ff7d8f9b16332cdadc4fa45ebee3a/mujoco_warp-3.12.0-py3-none-any.whl", hash = "sha256:a0d5d5df854dbf49727cbe2463f8b1c44117cc979cf17ae91d81f291ae0a3b62", size = 2164496, upload-time = "2026-08-20T11:58:13.887Z" },
 ]
 
 [[package]]
@@ -3935,8 +3934,8 @@ requires-dist = [
     { name = "jupyter-server-proxy", marker = "extra == 'notebook'", specifier = ">=4.5.0" },
     { name = "jupyterlab", marker = "extra == 'notebook'", specifier = ">=4.5.7" },
     { name = "meshio", marker = "extra == 'importers'", specifier = ">=5.3.5" },
-    { name = "mujoco", marker = "extra == 'sim'", specifier = "~=3.12.0" },
-    { name = "mujoco-warp", marker = "extra == 'sim'", specifier = "~=3.12.0" },
+    { name = "mujoco", marker = "extra == 'sim'", specifier = "~=3.12.0", index = "https://pypi.org/simple" },
+    { name = "mujoco-warp", marker = "extra == 'sim'", git = "https://github.com/ooctipus/mujoco_warp.git?rev=4e7374ad18791248c102bcc0812ed5b5247608d7" },
     { name = "myst-parser", marker = "extra == 'docs'", specifier = ">=3.0.1" },
     { name = "nbsphinx", marker = "extra == 'docs'", specifier = ">=0.9.0" },
     { name = "newton", extras = ["examples"], marker = "extra == 'dev'" },

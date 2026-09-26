@@ -10,6 +10,7 @@ from typing import Any
 import warp as wp
 
 from ...core.types import vec5
+from ...geometry.types import GeoType
 from ...sim import BodyFlags, JointTargetMode, JointType
 from ...sim.contacts import contact_surface_point, contact_surface_separation
 from .constants import (
@@ -1448,6 +1449,7 @@ def create_convert_mjw_contacts_to_newton_kernel():
         mj_contact_geom: wp.array[wp.vec2i],
         mj_contact_efc_address: wp.array2d[int],
         mj_contact_worldid: wp.array[wp.int32],
+        mj_contact_adhesion: wp.array[float],
         mj_efc_force: wp.array2d[float],
         mj_geom_bodyid: wp.array[int],
         mj_xpos: wp.array2d[wp.vec3],
@@ -1515,6 +1517,7 @@ def create_convert_mjw_contacts_to_newton_kernel():
                 mj_contact_friction,
                 mj_contact_dim,
                 mj_contact_efc_address,
+                mj_contact_adhesion,
                 mj_efc_force,
                 njmax,
                 mj_nacon,
@@ -2426,6 +2429,7 @@ def update_geom_properties_kernel(
     shape_ke: wp.array[float],
     shape_kd: wp.array[float],
     shape_size: wp.array[wp.vec3f],
+    shape_type: wp.array[int],
     shape_transform: wp.array[wp.transform],
     mjc_geom_to_newton_shape: wp.array2d[wp.int32],
     geom_type: wp.array[int],
@@ -2452,15 +2456,16 @@ def update_geom_properties_kernel(
     geom_solmix: wp.array2d[float],
     geom_gap: wp.array2d[float],
     geom_margin: wp.array2d[float],
+    geom_rbound: wp.array2d[float],
+    geom_aabb: wp.array3d[wp.vec3],
 ):
     """Update MuJoCo geom properties from Newton shape properties.
 
     Iterates over MuJoCo geoms [world, geom], looks up Newton shape index,
     and copies shape properties to geom properties.
 
-    Note: geom_rbound (collision radius) is not updated here. MuJoCo computes
-    this internally based on the geometry, and Newton's shape_collision_radius
-    is not compatible with MuJoCo's bounding sphere calculation.
+    Primitive bounds follow the updated size. Mesh bounds remain those of the
+    compiled resource; changing mesh resources requires rebuilding the solver.
 
     Note: geom_gap is forwarded from shape_gap (MuJoCo 3.9 semantics:
     gap widens the detection envelope without affecting force generation).
@@ -2512,6 +2517,29 @@ def update_geom_properties_kernel(
 
     # update size
     geom_size[world, geom_idx] = shape_size[shape_idx]
+    size = shape_size[shape_idx]
+    kind = shape_type[shape_idx]
+    half_extent = wp.vec3(0.0)
+    radius = float(-1.0)
+    if kind == GeoType.SPHERE:
+        half_extent = wp.vec3(size[0])
+        radius = size[0]
+    elif kind == GeoType.BOX:
+        half_extent = size
+        radius = wp.length(size)
+    elif kind == GeoType.ELLIPSOID:
+        half_extent = size
+        radius = wp.max(size[0], wp.max(size[1], size[2]))
+    elif kind == GeoType.CAPSULE:
+        half_extent = wp.vec3(size[0], size[0], size[0] + size[1])
+        radius = size[0] + size[1]
+    elif kind == GeoType.CYLINDER:
+        half_extent = wp.vec3(size[0], size[0], size[1])
+        radius = wp.sqrt(size[0] * size[0] + size[1] * size[1])
+    if radius >= 0.0:
+        geom_rbound[world, geom_idx] = radius
+        geom_aabb[world, geom_idx, 0] = wp.vec3(0.0)
+        geom_aabb[world, geom_idx, 1] = half_extent
 
     # update position and orientation
 
@@ -3217,106 +3245,22 @@ def reset_world_buffers_kernel(
 
 
 @wp.kernel(enable_backward=False)
-def reset_sleeping_state_kernel(
-    world_mask: wp.array[wp.bool],
-    clear_overflow: int,
-    nv: int,
-    nbody: int,
-    ntree: int,
-    awake_value: int,
-    sleep_state_static: int,
-    sleep_state_awake: int,
-    body_rootid: wp.array[wp.int32],
-    body_mocapid: wp.array[wp.int32],
-    body_treeid: wp.array[wp.int32],
-    tree_asleep: wp.array2d[wp.int32],
-    tree_awake: wp.array2d[wp.int32],
-    body_awake: wp.array2d[wp.int32],
-    body_awake_ind: wp.array2d[wp.int32],
-    dof_awake_ind: wp.array2d[wp.int32],
-    ntree_awake: wp.array[wp.int32],
-    nbody_awake: wp.array[wp.int32],
-    nv_awake: wp.array[wp.int32],
-    overflow: wp.array[wp.int32],
-):
-    """Wake every tree and rebuild sleep bookkeeping in selected worlds."""
-    worldid, elemid = wp.tid()
-    if world_mask and not world_mask[worldid]:
-        return
-
-    if elemid < ntree:
-        tree_asleep[worldid, elemid] = awake_value
-        tree_awake[worldid, elemid] = 1
-
-    if elemid < nbody:
-        if body_treeid[elemid] < 0:
-            rootid = body_rootid[elemid]
-            if body_mocapid[rootid] < 0:
-                body_awake[worldid, elemid] = sleep_state_static
-            else:
-                body_awake[worldid, elemid] = sleep_state_awake
-        else:
-            body_awake[worldid, elemid] = sleep_state_awake
-        body_awake_ind[worldid, elemid] = elemid
-
-    if elemid < nv:
-        dof_awake_ind[worldid, elemid] = elemid
-
-    if elemid == 0:
-        ntree_awake[worldid] = ntree
-        nbody_awake[worldid] = nbody
-        nv_awake[worldid] = nv
-        if clear_overflow:
-            overflow[worldid] = 0
+def clear_world_overflow_kernel(world_mask: wp.array[wp.bool], overflow: wp.array[wp.int32]):
+    worldid = wp.tid()
+    if not world_mask or world_mask[worldid]:
+        overflow[worldid] = 0
 
 
 @wp.kernel(enable_backward=False)
-def restore_sleeping_state_kernel(
-    world_mask: wp.array[wp.bool],
-    clear_overflow: int,
-    nv: int,
-    nbody: int,
-    ntree: int,
-    initial_ntree_awake: int,
-    initial_nbody_awake: int,
-    initial_nv_awake: int,
-    initial_tree_asleep: wp.array[wp.int32],
-    initial_tree_awake: wp.array[wp.int32],
-    initial_body_awake: wp.array[wp.int32],
-    initial_body_awake_ind: wp.array[wp.int32],
-    initial_dof_awake_ind: wp.array[wp.int32],
-    tree_asleep: wp.array2d[wp.int32],
-    tree_awake: wp.array2d[wp.int32],
-    body_awake: wp.array2d[wp.int32],
-    body_awake_ind: wp.array2d[wp.int32],
-    dof_awake_ind: wp.array2d[wp.int32],
-    ntree_awake: wp.array[wp.int32],
-    nbody_awake: wp.array[wp.int32],
-    nv_awake: wp.array[wp.int32],
-    overflow: wp.array[wp.int32],
+def select_sleep_trees_kernel(
+    body_ids: wp.array[wp.int32], body_sleep_index: wp.array[wp.vec2i], tree_mask: wp.array2d[wp.int32]
 ):
-    """Restore the initial sleep bookkeeping in selected worlds."""
-    worldid, elemid = wp.tid()
-    if world_mask and not world_mask[worldid]:
-        return
-
-    if elemid < ntree:
-        tree_asleep[worldid, elemid] = initial_tree_asleep[elemid]
-        tree_awake[worldid, elemid] = initial_tree_awake[elemid]
-
-    if elemid < nbody:
-        body_awake[worldid, elemid] = initial_body_awake[elemid]
-        body_awake_ind[worldid, elemid] = initial_body_awake_ind[elemid]
-
-    if elemid < nv:
-        dof_awake_ind[worldid, elemid] = initial_dof_awake_ind[elemid]
-
-    if elemid == 0:
-        ntree_awake[worldid] = initial_ntree_awake
-        nbody_awake[worldid] = initial_nbody_awake
-        nv_awake[worldid] = initial_nv_awake
-        if clear_overflow:
-            overflow[worldid] = 0
+    i = wp.tid()
+    bodyid = body_ids[i]
+    if bodyid >= 0 and bodyid < body_sleep_index.shape[0]:
+        index = body_sleep_index[bodyid]
+        if index[0] >= 0 and index[1] >= 0:
+            wp.atomic_max(tree_mask, index[0], index[1], 1)
 
 
 @wp.kernel(enable_backward=False)
@@ -3338,38 +3282,6 @@ def copy_qpos_and_detect_tree_change_kernel(
         if treeid >= 0:
             wp.atomic_max(tree_changed, worldid, treeid, 1)
     qpos[worldid, i] = value
-
-
-@wp.kernel(enable_backward=False)
-def wake_changed_trees_kernel(
-    tree_changed: wp.array2d[wp.int32],
-    ntree: int,
-    awake_value: int,
-    tree_asleep: wp.array2d[wp.int32],
-):
-    """Wake edited trees and every tree in their sleeping-island cycles."""
-    # Negative values mean awake; non-negative values link the next tree in a
-    # sleeping-island cycle. The O(ntree) scan intentionally uses one walker
-    # per world because parallel walkers for overlapping edits could overwrite
-    # a link before a peer reads it.
-    worldid = wp.tid()
-    for treeid in range(ntree):
-        if tree_changed[worldid, treeid] == 0:
-            continue
-
-        asleep_value = tree_asleep[worldid, treeid]
-        if asleep_value < 0:
-            if awake_value < asleep_value:
-                tree_asleep[worldid, treeid] = awake_value
-            continue
-
-        current = treeid
-        for _step in range(ntree + 1):
-            next_tree = tree_asleep[worldid, current]
-            tree_asleep[worldid, current] = awake_value
-            current = next_tree
-            if current == treeid:
-                break
 
 
 @wp.kernel(enable_backward=False)
@@ -3398,3 +3310,35 @@ def reset_joint_state_kernel(
     if joint_qd and i < dofs_per_world:
         di = worldid * dofs_per_world + i
         joint_qd[di] = default_joint_qd[di]
+
+
+@wp.kernel(enable_backward=False)
+def project_sleep_collision_masks_kernel(
+    geom_to_shape: wp.array2d[wp.int32],
+    shape_world: wp.array[wp.int32],
+    geom_bodyid: wp.array[wp.int32],
+    body_treeid: wp.array[wp.int32],
+    tree_policy: wp.array2d[wp.int32],
+    body_awake: wp.array2d[wp.int32],
+    body_awake_previous: wp.array2d[wp.int32],
+    awake_value: int,
+    shape_enabled: wp.array[wp.bool],
+    shape_awake: wp.array[wp.bool],
+    shape_awake_previous: wp.array[wp.bool],
+):
+    worldid, geomid = wp.tid()
+    shapeid = geom_to_shape[worldid, geomid]
+    if shapeid < 0:
+        return
+    bodyid = geom_bodyid[geomid]
+    treeid = body_treeid[bodyid]
+    # Global static shapes appear in every world's mapping; only one world writes them.
+    if shape_world[shapeid] < 0 and worldid != 0:
+        return
+    enabled = bool(True)
+    if treeid >= 0:
+        enabled = tree_policy[worldid % tree_policy.shape[0], treeid] != 6
+    shape_enabled[shapeid] = enabled
+    shape_awake[shapeid] = enabled and body_awake[worldid, bodyid] == awake_value
+    if body_awake_previous:
+        shape_awake_previous[shapeid] = enabled and body_awake_previous[worldid, bodyid] == awake_value

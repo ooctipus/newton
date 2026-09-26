@@ -36,7 +36,7 @@ dependencies = [
 # Core simulation dependencies
 sim = [
     # MuJoCo simulation
-    "mujoco-warp~=3.12.0",  # MuJoCo, warp-accelerated
+    "mujoco-warp~=3.14.0",  # MuJoCo, warp-accelerated
     "mujoco~=3.12.0",       # MuJoCo physics engine
 ]
 
@@ -148,6 +148,7 @@ module-name = "newton"
 module-root = ""
 
 [[tool.uv.index]]
+name = "pypi"
 url = "https://pypi.org/simple"
 
 [[tool.uv.index]]
@@ -156,6 +157,8 @@ url = "https://pypi.nvidia.com/"
 explicit = true
 
 [tool.uv]
+# Keep the CPU compiler on the release tested with this MJWarp revision.
+override-dependencies = ["mujoco==3.12.0"]
 conflicts = [
     [
         { extra = "torch-cu12" },
@@ -164,6 +167,8 @@ conflicts = [
 ]
 
 [tool.uv.sources]
+mujoco = { index = "pypi" }
+mujoco-warp = { git = "https://github.com/ooctipus/mujoco_warp.git", rev = "4e7374ad18791248c102bcc0812ed5b5247608d7" }
 warp-lang = { index = "nvidia" }
 torch = [
     { index = "pytorch-cu128", extra = "torch-cu12" },

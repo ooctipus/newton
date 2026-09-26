@@ -251,6 +251,33 @@ def write_contact_speculative(
 
 
 @wp.kernel(enable_backward=False)
+def filter_sleeping_pairs(
+    shape_enabled: wp.array[wp.bool],
+    shape_awake: wp.array[wp.bool],
+    shape_awake_previous: wp.array[wp.bool],
+    pair_count: wp.array[wp.int32],
+    pairs: wp.array[wp.vec2i],
+):
+    i = wp.tid()
+    if i >= pair_count[0]:
+        return
+    pair = pairs[i]
+    a, b = pair[0], pair[1]
+    if a < 0 or b < 0:
+        return
+    keep = bool(True)
+    if shape_enabled:
+        keep = shape_enabled[a] and shape_enabled[b]
+    if shape_awake:
+        keep = keep and (shape_awake[a] or shape_awake[b])
+    if shape_awake_previous:
+        keep = keep and not (shape_awake_previous[a] or shape_awake_previous[b])
+    if not keep:
+        # NarrowPhase already treats negative pair indices as inactive work items.
+        pairs[i] = wp.vec2i(-1, -1)
+
+
+@wp.kernel(enable_backward=False)
 def compute_shape_aabbs(
     body_q: wp.array[wp.transform],
     shape_transform: wp.array[wp.transform],
@@ -263,6 +290,8 @@ def compute_shape_aabbs(
     shape_gap: wp.array[float],
     shape_collision_aabb_lower: wp.array[wp.vec3],
     shape_collision_aabb_upper: wp.array[wp.vec3],
+    shape_enabled: wp.array[wp.bool],
+    append: bool,
     # Fused counter arrays — zeroed by thread 0 to avoid separate kernel launches.
     contact_counters: wp.array[wp.int32],
     contact_generation: wp.array[wp.int32],
@@ -284,8 +313,9 @@ def compute_shape_aabbs(
     # Thread 0: zero contact counters, bump contact generation, and zero the
     # broad phase candidate-pair count in a single fused step.
     if shape_id == 0:
-        for c in range(num_contact_counters):
-            contact_counters[c] = 0
+        if not append:
+            for c in range(num_contact_counters):
+                contact_counters[c] = 0
         g = contact_generation[0]
         if g == 2147483647:
             g = 0
@@ -293,6 +323,11 @@ def compute_shape_aabbs(
             g = g + 1
         contact_generation[0] = g
         broad_phase_pair_count[0] = 0
+
+    if shape_enabled and not shape_enabled[shape_id]:
+        aabb_lower[shape_id] = wp.vec3(wp.inf)
+        aabb_upper[shape_id] = wp.vec3(-wp.inf)
+        return
 
     rigid_id = shape_body[shape_id]
     geo_type = shape_type[shape_id]
@@ -2142,6 +2177,9 @@ class CollisionPipeline:
         soft_contact_margin: float | None = None,
         soft_self_contact: bool = False,
         dt: float | None = None,
+        shape_enabled: wp.array | None = None,
+        shape_awake: wp.array | None = None,
+        shape_awake_previous: wp.array | None = None,
     ):
         """Run the collision pipeline using NarrowPhase.
 
@@ -2166,7 +2204,15 @@ class CollisionPipeline:
 
         Args:
             state: The current simulation state.
-            contacts: The contacts buffer to populate (will be cleared first).
+            contacts: The contacts buffer to populate, cleared unless appending a wake pass.
+            shape_enabled: Optional boolean array of shape ``(shape_count,)``. False excludes
+                a rigid shape from broad and narrow phase. This does not change rendering.
+            shape_awake: Optional boolean array of shape ``(shape_count,)``. A pair needs at
+                least one awake shape. Static shapes should be marked False.
+            shape_awake_previous: Optional previous awake mask. Appends only pairs that are
+                awake now but had neither shape awake in the preceding pass. Supply the same
+                state and enabled mask as the preceding pass. Masks support rigid contacts
+                without contact matching, gradients, particles, or speculative contacts.
             soft_contact_margin: Deprecated; set ``soft_contact_gap`` on the
                 :class:`CollisionPipeline` constructor instead. When not
                 ``None``, the value is still honored for this call and a
@@ -2182,6 +2228,25 @@ class CollisionPipeline:
                 this call. Ignored when speculative contacts are disabled. See
                 :ref:`Speculative contacts <speculative-contacts>`.
         """
+        append = shape_awake_previous is not None
+        masked = shape_enabled is not None or shape_awake is not None or append
+        if append and shape_awake is None:
+            raise ValueError("shape_awake_previous requires shape_awake.")
+        if masked and (
+            self._contact_matcher is not None
+            or self.model.particle_count
+            or self.requires_grad
+            or self._speculative_enabled
+        ):
+            raise ValueError(
+                "Collision activity masks require rigid contacts without matching, gradients, or speculation."
+            )
+        for mask in (shape_enabled, shape_awake, shape_awake_previous):
+            if mask is not None and (
+                mask.shape != (self.model.shape_count,) or mask.dtype != wp.bool or mask.device != self.device
+            ):
+                raise ValueError("Collision masks must be boolean shape_count arrays on the model device.")
+
         # Keep the buffer's full-surface capability marker in sync with this pipeline on every call.
         # collide() may be handed a Contacts created elsewhere (or by a flag-off pipeline); the edge/
         # face passes below would otherwise populate records while the marker stayed False, so
@@ -2193,7 +2258,7 @@ class CollisionPipeline:
         # Only call contacts.clear() if clear_buffers mode is enabled (debug path).
         # Skip the generation bump here since compute_shape_aabbs will bump it immediately
         # afterwards -- otherwise the generation would advance by 2 per collide() call.
-        if contacts.clear_buffers:
+        if contacts.clear_buffers and not append:
             contacts.clear(bump_generation=False)
 
         model = self.model
@@ -2246,6 +2311,8 @@ class CollisionPipeline:
                 model.shape_gap,
                 model.shape_collision_aabb_lower,
                 model.shape_collision_aabb_upper,
+                shape_enabled,
+                append,
                 contacts.contact_counters,
                 contacts.contact_generation,
                 self.broad_phase_pair_count,
@@ -2387,6 +2454,16 @@ class CollisionPipeline:
         writer_data.collision_update_dt = collision_update_dt
         writer_data.max_speculative_extension = max_speculative_extension
         # Run narrow phase with custom contact writer (writes directly to Contacts format)
+        if masked:
+            wp.launch(
+                filter_sleeping_pairs,
+                self.shape_pairs_max,
+                inputs=[shape_enabled, shape_awake, shape_awake_previous, self.broad_phase_pair_count],
+                outputs=[self.broad_phase_shape_pairs],
+                device=self.device,
+                record_tape=False,
+            )
+
         narrow_phase_extension_kwargs = {}
         if type(self.narrow_phase).launch_custom_write is NarrowPhase.launch_custom_write:
             narrow_phase_extension_kwargs.update(

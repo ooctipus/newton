@@ -730,9 +730,12 @@ Benchmark representative workloads before enabling it::
     )
 
 Sleeping is only supported by Newton's MuJoCo Warp GPU path. It requires
-``solver="newton"`` and ``use_mujoco_contacts=True`` so MuJoCo Warp's
-collision pipeline can wake sleeping bodies, and it does not support the RK4
-integrator. Unsupported combinations raise ``ValueError`` during solver
+``solver="newton"`` and does not support the RK4 integrator. Both native MuJoCo
+contacts and Newton rigid contacts support sleeping. With Newton contacts, pass
+``use_mujoco_contacts=False`` and ``collision_pipeline=pipeline`` to the solver.
+The solver owns collision timing and overwrites the supplied contacts during
+``step``; do not call ``pipeline.collide`` separately. This mode does not support
+contact matching, particles, gradients, or speculative contacts. Unsupported combinations raise ``ValueError`` during solver
 construction. When an imported MJCF contains
 ``<option><flag sleep="enable"/></option>``, leaving ``enable_sleeping`` as
 ``None`` honors that setting. An explicit constructor value takes precedence.
@@ -784,9 +787,53 @@ wake them; apply a force or set a nonzero velocity first. Newton-side
 joint-position edits wake only the affected sleeping trees.
 :meth:`~newton.solvers.SolverMuJoCo.reset` restores the initial sleep state in
 selected worlds, while
-:meth:`~newton.solvers.SolverMuJoCo.notify_model_changed` wakes all worlds
-after model-property updates. The sleeping path supports whole-step CUDA graph
+:meth:`~newton.solvers.SolverMuJoCo.notify_model_changed` wakes selected worlds
+when given ``world_mask`` (all worlds by default) after model-property updates.
+The mask limits waking; callers must restrict their property writes to those
+worlds because property synchronization still processes the complete arrays. The sleeping path supports whole-step CUDA graph
 capture.
+
+Fixed-capacity heterogeneous tasks can disable unused moving bodies at runtime::
+
+    pipeline = newton.CollisionPipeline(model)
+    solver = SolverMuJoCo(
+        model, enable_sleeping=True, use_mujoco_contacts=False, collision_pipeline=pipeline,
+    )
+    inactive_bodies = wp.array(inactive_body_ids, dtype=wp.int32, device=model.device)
+    solver.set_body_sleep_policy(inactive_bodies, SolverMuJoCo.SleepPolicy.ALWAYS)
+    # Re-enable explicitly; ALLOWED permits normal sleeping, NEVER keeps the tree awake.
+    solver.set_body_sleep_policy(inactive_bodies, SolverMuJoCo.SleepPolicy.ALLOWED)
+
+``ALWAYS`` is a runtime policy and cannot be authored in the CPU MuJoCo model.
+It survives reset, pose edits, force inputs, and property notifications. It
+preserves joint coordinates while clearing disabled DOF motion. Select every
+moving body in a partition: six sliders attached to a fixed base compile into
+six MuJoCo trees, even if Newton groups them into one articulation. Disable any
+equality constraints joining disabled trees to active trees separately.
+
+This changes active dynamics and contact generation while keeping the compiled
+body, joint, shape, and DOF layout fixed. It does not hide rendered geometry or
+mask task observations, actions, rewards, or target sampling. The task owns those
+masks and its partition/variant selections. Allocate ``nvmax`` for the largest
+simultaneously active world, including the robot; per-world policy does not make
+allocation ragged.
+
+For same-topology variants, write selected Newton body/joint/shape properties
+and call ``notify_model_changed`` with the corresponding flags and world mask,
+then reset the selected worlds. Primitive shape sizes refresh both MuJoCo
+bounding spheres and local AABBs. Mesh resources and mesh topology remain fixed
+at construction; this path does not provide runtime mesh-resource registration.
+The keyboard's cuboid collision shapes use the primitive update path. Variant
+parameter tables belong to the task rather than a second solver abstraction.
+
+Backend ownership is deliberately narrow: ``CollisionPipeline`` consumes generic
+shape activity masks; ``SolverMuJoCo`` maps Newton IDs and supplies contacts at
+MJWarp's collision callback; MJWarp owns policies, cycle traversal, wake/reset,
+and active-DOF compaction. A first contact pass wakes trees, followed by a second
+pass for newly awake pairs so support contacts exist in the same step. Do not
+introduce Newton sleep override tables, duplicate sleep-cycle kernels, or dormant
+contact replay caches. The architecture regression in ``test_mujoco_sleeping``
+guards these rejected patterns.
 
 See MuJoCo's `sleeping-islands documentation
 <https://mujoco.readthedocs.io/en/stable/programming/simulation.html#sleeping-islands>`_
