@@ -4846,13 +4846,19 @@ class TestMuJoCoSolverNewtonContacts(unittest.TestCase):
                 model,
                 use_mujoco_contacts=False,
                 nconmax=nconmax,
+                nccdmax=10,
                 njmax=njmax,
             )
         except ImportError as e:
             self.skipTest(f"MuJoCo or deps not installed. Skipping test: {e}")
 
         self.assertEqual(solver.mjw_data.naconmax, nconmax)
+        self.assertEqual(solver.mjw_data.naccdmax, 10)
         self.assertEqual(solver.mjw_data.njmax, njmax)
+
+        for capacity in (-1, nconmax + 1):
+            with self.subTest(nccdmax=capacity), self.assertRaisesRegex(ValueError, "na?ccdmax"):
+                SolverMuJoCo(model, use_mujoco_contacts=False, nconmax=nconmax, nccdmax=capacity)
 
     def test_explicit_nconmax_below_initial_contacts_is_increased(self):
         """Increase an explicit contact capacity below initial MuJoCo contacts."""

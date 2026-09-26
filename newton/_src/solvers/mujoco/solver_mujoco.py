@@ -3858,6 +3858,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         njmax: int | None = None,
         njmax_nnz: int | None = None,
         nconmax: int | None = None,
+        nccdmax: int | None = None,
         iterations: int | None = None,
         ls_iterations: int | None = None,
         ccd_iterations: int | None = None,
@@ -3909,6 +3910,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 is estimated automatically. An explicit value is preserved unless
                 it cannot hold the initial MuJoCo contacts; in that case, it is
                 increased with a warning.
+            nccdmax: Per-world capacity for GJK/EPA collision workspace. If None,
+                uses the contact capacity. Must be between zero and the resolved
+                nconmax. This changes workspace allocation, not contact storage
+                or CCD iterations; check MJWarp overflow when reducing it.
             iterations: Number of solver iterations. If None, uses model custom attribute or MuJoCo's default (100).
             ls_iterations: Number of line search iterations for the solver. If None, uses model custom attribute or MuJoCo's default (50).
             ccd_iterations: Maximum CCD iterations. If None, uses model custom attribute or MuJoCo's default (35).
@@ -4281,6 +4286,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 njmax=njmax,
                 njmax_nnz=njmax_nnz,
                 nconmax=nconmax,
+                nccdmax=nccdmax,
                 nvmax=nvmax,
                 iterations=iterations,
                 ls_iterations=ls_iterations,
@@ -5733,6 +5739,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         njmax: int | None = None,  # number of constraints per world
         njmax_nnz: int | None = None,
         nconmax: int | None = None,
+        nccdmax: int | None = None,
         nvmax: int | None = None,
         solver: int | str | None = None,
         integrator: int | str | None = None,
@@ -5776,6 +5783,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             njmax: Maximum number of constraints per world.
             njmax_nnz: Sparse constraint Jacobian nonzero capacity per world.
             nconmax: Maximum number of contacts.
+            nccdmax: Per-world GJK/EPA collision workspace capacity.
             nvmax: Maximum number of active degrees of freedom per world.
             solver: Constraint solver type ("cg" or "newton"). If None, uses model custom attribute or Newton's default ("newton").
             integrator: Integration method ("euler", "rk4", "implicit", "implicitfast"). If None, uses model custom attribute or Newton's default ("implicitfast").
@@ -8194,6 +8202,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self.mj_data,
                 nworld=nworld,
                 nconmax=nconmax,
+                nccdmax=nccdmax,
                 njmax=njmax,
                 njmax_nnz=njmax_nnz,
                 nvmax=nvmax,
