@@ -1,4 +1,4 @@
-"""Reuse the existing task/capture harness at 16K, selected clean Newton, RTX only."""
+"""Reuse the existing task/capture harness at 16K with pinned Newton and an explicit GPU."""
 import argparse
 import ast
 import json
@@ -22,7 +22,8 @@ def main():
     parser.add_argument('--newton', type=Path, required=True)
     parser.add_argument('--isaaclab', type=Path, required=True)
     parser.add_argument('--capacity-file', type=Path, default=ROOT / 'capacities.json')
-    parser.add_argument('--gpu-uuid', required=True, help='Explicitly admit the selected GPU0 UUID')
+    parser.add_argument('--gpu-index', type=int, default=0, help='Physical GPU index (default: 0)')
+    parser.add_argument('--gpu-uuid', required=True, help='Explicitly admit the selected physical GPU UUID')
     parser.add_argument('--commit', default=BASE)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--task', action='append')
@@ -40,6 +41,8 @@ def main():
     args.task = args.task or ORDER
     if min(args.num_envs, args.steps, args.profile_steps) < 1 or args.warmup_steps < 0:
         parser.error('Positive sample sizes and nonnegative warmup required')
+    if args.gpu_index < 0:
+        parser.error('Nonnegative GPU index required')
     args.check_overflow, args.mjwarp_linesearch_fix = True, False
     if any(task not in ORDER for task in args.task):
         parser.error('Select canonical non-Drawer tasks')
@@ -92,7 +95,8 @@ def main():
         steps=args.steps, profile_steps=args.profile_steps, repeats=1, seed=0, video=False), capacities=args.capacity,
         explicit_solver_attributes=args.solver_attr, allow_dirty_candidate=args.allow_dirty_candidate,
         capacity_scope='Historical 4K global storage scaled to worlds; unchanged per-world row storage. Not fresh demand calibration.',
-        stripped_research_options=stripped, sources=sources, drivers=files)
+        stripped_research_options=stripped, sources=sources, drivers=files,
+        gpu_selection=dict(index=args.gpu_index, uuid=args.gpu_uuid))
     if args.plan_only:
         print(json.dumps(plan, indent=2)); return
     owner.validate_output(args.output, [*roots.values(), TOOLS])
@@ -101,9 +105,9 @@ def main():
     capture._write_json(admission, dict(root=str(args.newton.resolve()), commit=args.commit,
         isaaclab=str(LAB), source=sources['newton'], allow_dirty_candidate=args.allow_dirty_candidate))
     files.update(owner.file_hashes([admission]))
-    devices = capture._gpus([0])
+    devices = capture._gpus([args.gpu_index])
     if devices[0]['uuid'] != args.gpu_uuid:
-        raise RuntimeError('GPU0 UUID does not match explicit admission')
+        raise RuntimeError(f'GPU{args.gpu_index} UUID does not match explicit admission')
     manifest = dict(status='running', plan=plan, gpus=devices,
                     runtime=owner.runtime_software(LAB, {'selected': args.newton}), tasks={})
     def save():
@@ -116,7 +120,7 @@ def main():
             owner.source_guard(capture, roots, sources, files)
             directory = args.output / task
             directory.mkdir()
-            runs = owner.make_batch(capture, args, {'fpgs': args.newton}, {0: {}}, devices,
+            runs = owner.make_batch(capture, args, {'fpgs': args.newton}, {args.gpu_index: {}}, devices,
                                     directory, 0, task, 'fpgs', drivers=files)
             entry['runs'] = runs
             for run in runs:

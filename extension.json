@@ -1,0 +1,2747 @@
+{
+  "schema_version": 1,
+  "study": "PR140 sparse dynamics: mixed articulation/free-body extension",
+  "status": "complete_single_capture_final20",
+  "source": {
+    "baseline_commit": "5238407d320823e71a5a4623c2c83c293d7b00fd",
+    "candidate_commit": "1472112114f70e288012731a7639d69228e258de",
+    "baseline_origin": "Recorded clean-main captures in results.json; not rerun with the extension",
+    "candidate_tree_clean": true,
+    "isaaclab_commit": "53ee6b44c2334341305dbdf385a3916c6b140799",
+    "isaaclab_source_diff_sha256": "cfd75b639b9f38b3b509853e8009a915c754fb4c4757c40d5264590ca5bca15a",
+    "initial_candidate_archive": "results.json",
+    "baseline_results_sha256": "04bed3c47540716baad9da1f88eff0ee7c229cba655cc43c6b92fcc716343388",
+    "capture_driver_sha256": {
+      "benchmark_extension.py": "12c6ab7519956c872a0a32c6cd54615c8cbc51e679af87f5dc85750a3da9c8fd",
+      "benchmark.py": "528dff0612a060d92a7b57858a1a795ce36c45464a285947e2c26e1b831929aa",
+      "capture_adapter.py": "fa09ab6b70fe037b07350af996dbb517ccb3c0674d49c508cb63d266de1a519f",
+      "launch_capture.py": "6c73630c9e1ce17670a15607314899df2db1bc993413425fbaaff3fe18004ac6"
+    }
+  },
+  "sampling": {
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "gpu_index": 0,
+    "num_envs": 16384,
+    "seed": 0,
+    "warmup_steps": 200,
+    "environment_timing_steps": 40,
+    "physics_profile_steps": 40,
+    "captures_per_task_per_revision": 1,
+    "cuda_graph": true,
+    "video": false,
+    "env_fps_scope": "Random-action environment transitions per second, 16384 / synchronized-boundary mean loop seconds; not training FPS",
+    "physics_scope": "Main physics CUDA graph per environment step over a separate 40-step profiling window; sensor graphs and eager environment/reset work excluded",
+    "workload": "20 native task recipes; solver features, substeps, iterations and capacities matched. SO101 Keyboard 736 ordinary rows on both arms; no Ant/Humanoid matrix-free override.",
+    "interpretation": "One final-head capture per task against recorded baseline; no confidence intervals or repeat qualification of small differences."
+  },
+  "rows": [
+    {
+      "task": "Franka lift",
+      "task_key": "franka",
+      "task_id": "Isaac-Lift-Franka",
+      "status": "complete",
+      "configuration_reference": "results.json: rows[task_key=franka].matched_configuration",
+      "matched_configuration_verified": true,
+      "baseline": {
+        "env_fps": 466574.3866145893,
+        "loop_ms": 35.115515274810605,
+        "main_physics_graph_ms": 16.77466985,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-first5/franka/round_01_franka_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "c0b54c3f06858fefc148ed52c2d4e3854f49d86b5ca868e249424dcd4432fdf4",
+          "capture_checks.json": "3997cb50173b0fca19c75d0236e7db41a83c2eb8be24bc94d8f51eba2a0dab89",
+          "capture_analysis.json": "7994a4f52bc7fbdf84b455b4bddf8fa6af8dc9a668a0c3b682125376285e751f",
+          "capture.log": "fb469682a543598cc44f5107cc4e62c7dffd7ff90cd60e2b8c14961af4684a2e"
+        }
+      },
+      "candidate": {
+        "env_fps": 475458.02940879075,
+        "loop_ms": 34.45940332603641,
+        "main_physics_graph_ms": 16.732506725,
+        "sensor_graph_ms": 0,
+        "sparse_active": false,
+        "sparse_representation": null,
+        "checks": {
+          "check_pass": true,
+          "complete": true,
+          "boundaries": [
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": null,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": null,
+              "factor_status_max": null
+            },
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": null,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": null,
+              "factor_status_max": null
+            }
+          ]
+        },
+        "state_finite": true,
+        "warning_matches": [],
+        "artifact_locator": "multi-candidate-mixed/final20/franka/franka/round_01_franka_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "8239843b2da578bbace91223b4b494b83440265f3d8dc90ad6e15aa339ea612e",
+          "capture_checks.json": "91d4a59954042b548f1d3b5e620fa9dee5fb056c41cd3f4ab0a00d169ce832f7",
+          "capture_analysis.json": "fdb5bcea9d6cbf78018f2bc8c0aea5ac5bb9b5b50727c1772565c5f122630a90",
+          "capture.log": "9916b5c7a603880b3e23c8973ac48d2d7e086aa37d72745be36e452c31f3a419"
+        }
+      },
+      "env_fps_gain": 1.0190401424704432,
+      "main_physics_graph_gain": 1.002519833142335
+    },
+    {
+      "task": "KukaAllegro lift",
+      "task_key": "kuka",
+      "task_id": "Isaac-Lift-KukaAllegro",
+      "status": "complete",
+      "configuration_reference": "results.json: rows[task_key=kuka].matched_configuration",
+      "matched_configuration_verified": true,
+      "baseline": {
+        "env_fps": 360294.1824684044,
+        "loop_ms": 45.47395100235008,
+        "main_physics_graph_ms": 26.423181374999995,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-first5/kuka/round_01_kuka_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "1e92a234a8c8868ba8961a30ea537f491bb808d5e1b9f546f159b2ef9fc5b85e",
+          "capture_checks.json": "758da0252461f8a459ad6514c229eb689f92fbef8abca160ba6a323d0f4240e6",
+          "capture_analysis.json": "29ac44c041839badbde5eb385d6668d859a3c8ce8f5821c3af39ad939341e06a",
+          "capture.log": "92900cc185653aa0e2dc5d6694f85386ec11c3118f209e91b0822ca7ee64033a"
+        }
+      },
+      "candidate": {
+        "env_fps": 375397.7348057039,
+        "loop_ms": 43.64437629992608,
+        "main_physics_graph_ms": 24.75108815,
+        "sensor_graph_ms": 0,
+        "sparse_active": true,
+        "sparse_representation": {
+          "dofs": 23,
+          "packed_factor_nnz": 180,
+          "max_row_support": 17,
+          "factor_warps_per_block": 4,
+          "factor_status_nonzero": 0,
+          "factor_status_max": 0,
+          "factor_kernel": "crba_sparse_factor_23_180_4",
+          "solve_kernel": "pgs_solve_sparse_192_29_17_64_6",
+          "selected_contact_producer": "populate_sparse_contact_response",
+          "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+          "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+          "double_buffer": false
+        },
+        "checks": {
+          "check_pass": true,
+          "complete": true,
+          "boundaries": [
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": 23,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": 0,
+              "factor_status_max": 0
+            },
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": 23,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": 0,
+              "factor_status_max": 0
+            }
+          ]
+        },
+        "state_finite": true,
+        "warning_matches": [],
+        "artifact_locator": "multi-candidate-mixed/final20/kuka/kuka/round_01_kuka_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "df94d22d39a9bfa9e69cc61d579acf49b56acb705c488ffbaa44256ba0ba9f0c",
+          "capture_checks.json": "7448ee2041e32521bf99e2654619c4309587e031ce3363c75a847ba21606ce15",
+          "capture_analysis.json": "34eaf4d6d1d58b85c9a219905386e8d5b4b9ef2bca036a760e52ce61aea89000",
+          "capture.log": "d90471c160ffe5e38d66a8c66ceb34203a7d3ba9d9ba1921f40e1445c6bb618d"
+        }
+      },
+      "env_fps_gain": 1.0419200560881219,
+      "main_physics_graph_gain": 1.0675563520628484
+    },
+    {
+      "task": "Allegro reorient",
+      "task_key": "allegro",
+      "task_id": "Isaac-Reorient-Cube-Allegro",
+      "status": "complete",
+      "configuration_reference": "results.json: rows[task_key=allegro].matched_configuration",
+      "matched_configuration_verified": true,
+      "baseline": {
+        "env_fps": 286290.8612042581,
+        "loop_ms": 57.228512049186975,
+        "main_physics_graph_ms": 49.481530675,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-first5/allegro/round_01_allegro_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "1f4ec0482c4a5ca07da4d059483cabb29b7e5d18eef9ddcdb3b0ead673b3e521",
+          "capture_checks.json": "3dfdb6dc3f5fba466a5c641dde200dc7f84636e222d8752e8502090667bcfdab",
+          "capture_analysis.json": "0ce0e2b4599a2d5a8a387c37a97ba05b7792d0a54bb8b4cd498282d88b59eff6",
+          "capture.log": "e8d65b6e60c3e55f58340692ce2186dea7349d74acb2e1d150430629e5ba75ca"
+        }
+      },
+      "candidate": {
+        "env_fps": 286994.2028350567,
+        "loop_ms": 57.08826115005649,
+        "main_physics_graph_ms": 49.3235134,
+        "sensor_graph_ms": 0,
+        "sparse_active": false,
+        "sparse_representation": null,
+        "checks": {
+          "check_pass": true,
+          "complete": true,
+          "boundaries": [
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": null,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": null,
+              "factor_status_max": null
+            },
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": null,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": null,
+              "factor_status_max": null
+            }
+          ]
+        },
+        "state_finite": true,
+        "warning_matches": [],
+        "artifact_locator": "multi-candidate-mixed/final20/allegro/allegro/round_01_allegro_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "47ef33eed4bf807fd5e7fc8c3a1fd314044ebb71efed3c7c9db020120228f280",
+          "capture_checks.json": "d7ad86212f76cdf461195cdd46ca42995bcc5220310799732a1c063edb5065ab",
+          "capture_analysis.json": "4fa53349dd33cc0da442a72c705a01df1a677a663f0fc0c78375482d2375987b",
+          "capture.log": "84108b424da2e40ca939d6e61ba20b98f970b03d544142f8e818e9bdf2155c4a"
+        }
+      },
+      "env_fps_gain": 1.002456737975638,
+      "main_physics_graph_gain": 1.0032036905748891
+    },
+    {
+      "task": "ANYmal-D flat",
+      "task_key": "anymald",
+      "task_id": "Isaac-Velocity-Flat-AnymalD",
+      "status": "complete",
+      "configuration_reference": "results.json: rows[task_key=anymald].matched_configuration",
+      "matched_configuration_verified": true,
+      "baseline": {
+        "env_fps": 535626.433039287,
+        "loop_ms": 30.58848292275798,
+        "main_physics_graph_ms": 22.4670491,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-first5/anymald/round_01_anymald_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "0a89c35aa04e19ed96f9c973f46dad0c2c114708b934ac7cd418e73dea224384",
+          "capture_checks.json": "e3f52b36a650b158493c2cf6ba194c2ad5102b77ea41aa177f52c723326e051a",
+          "capture_analysis.json": "478a26d47f41c3ef16ad6f36389af1f3aeacd3351c59f6e5a6b158cc030aef33",
+          "capture.log": "383482eea780917ca8cf52e4cfce58e6478541d845ca0208c10401d4439e5016"
+        }
+      },
+      "candidate": {
+        "env_fps": 632277.084290798,
+        "loop_ms": 25.91268987453077,
+        "main_physics_graph_ms": 17.2401044,
+        "sensor_graph_ms": 0,
+        "sparse_active": true,
+        "sparse_representation": {
+          "dofs": 18,
+          "packed_factor_nnz": 117,
+          "max_row_support": 12,
+          "factor_warps_per_block": 4,
+          "factor_status_nonzero": 0,
+          "factor_status_max": 0,
+          "factor_kernel": "crba_sparse_factor_18_117_4",
+          "solve_kernel": "pgs_solve_sparse_72_18_12_0_0",
+          "selected_contact_producer": "populate_sparse_contact_response",
+          "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+          "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+          "double_buffer": false
+        },
+        "checks": {
+          "check_pass": true,
+          "complete": true,
+          "boundaries": [
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": 18,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": 0,
+              "factor_status_max": 0
+            },
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": 18,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": 0,
+              "factor_status_max": 0
+            }
+          ]
+        },
+        "state_finite": true,
+        "warning_matches": [],
+        "artifact_locator": "multi-candidate-mixed/final20/anymald/anymald/round_01_anymald_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "824faed9c1d5ade1311b7fdcf90bb9c20e3c04429234c274ebf71f5a3b886a99",
+          "capture_checks.json": "e2749c4a091f8f8ffed4365ca3d206e26e7d8449f18b68d57886571fd56904c9",
+          "capture_analysis.json": "2b6af16803cb73daee2693047b3734695d19dcfcadc18ae37a77398740a7e6a1",
+          "capture.log": "63f1b6bc4d8e22827674b2e93db91f133f43a7539f3cb2b1e4043526c82c72b7"
+        }
+      },
+      "env_fps_gain": 1.1804441403369315,
+      "main_physics_graph_gain": 1.3031852115698326
+    },
+    {
+      "task": "G1 rough",
+      "task_key": "g1",
+      "task_id": "Isaac-Velocity-Rough-G1",
+      "status": "complete",
+      "configuration_reference": "results.json: rows[task_key=g1].matched_configuration",
+      "matched_configuration_verified": true,
+      "baseline": {
+        "env_fps": 279894.03150597686,
+        "loop_ms": 58.53643935115542,
+        "main_physics_graph_ms": 44.191172825,
+        "sensor_graph_ms": 1.04093225,
+        "artifact_locator": "baseline-first5/g1/round_01_g1_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "80aa79a5497274c66871fbfffb0ee96fd26f58ab7b015481101103f70f33040d",
+          "capture_checks.json": "d2a977060f055411c152d51f0ecad971dcab8bd5bba792de3e083f424474994f",
+          "capture_analysis.json": "ec16867c9533f0152b6794f7706b60e1c4a3069c4b0f654b154a38aac53456ed",
+          "capture.log": "777c524336b90343f8d1f27a8938b457cb355bfe4572415bda20ee35e09a6750"
+        }
+      },
+      "candidate": {
+        "env_fps": 363343.39019447623,
+        "loop_ms": 45.092329851468094,
+        "main_physics_graph_ms": 31.02169215,
+        "sensor_graph_ms": 1.0423456000000002,
+        "sparse_active": true,
+        "sparse_representation": {
+          "dofs": 43,
+          "packed_factor_nnz": 434,
+          "max_row_support": 18,
+          "factor_warps_per_block": 4,
+          "factor_status_nonzero": 0,
+          "factor_status_max": 0,
+          "factor_kernel": "crba_sparse_factor_43_434_4",
+          "solve_kernel": "pgs_solve_sparse_100_43_18_0_0",
+          "selected_contact_producer": "populate_sparse_contact_response",
+          "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+          "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+          "double_buffer": false
+        },
+        "checks": {
+          "check_pass": true,
+          "complete": true,
+          "boundaries": [
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": 43,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": 0,
+              "factor_status_max": 0
+            },
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": 43,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": 0,
+              "factor_status_max": 0
+            }
+          ]
+        },
+        "state_finite": true,
+        "warning_matches": [],
+        "artifact_locator": "multi-candidate-mixed/final20/g1/g1/round_01_g1_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "7dc3391063c584652d8987994a9f061232185465b272fedd6eaaba38930ffe5a",
+          "capture_checks.json": "576475c2f78f07c1f876d2687ff299e183f041dda350dbdfbbe8dedcb666b408",
+          "capture_analysis.json": "8df51b679bc49a189a32fa9c99bf8d550915df8aa5b3c288230220671f8afb17",
+          "capture.log": "7691ea46987c846a1d7557ec9f31c93dd58318d7cea43566f3a533b61d254f5a"
+        }
+      },
+      "env_fps_gain": 1.298146259995249,
+      "main_physics_graph_gain": 1.4245248973305926
+    },
+    {
+      "task": "SO101 Keyboard",
+      "task_key": "keyboard-so101",
+      "task_id": "IsaacContrib-Keyboard-SO101",
+      "status": "complete",
+      "configuration_reference": "results.json: rows[task_key=keyboard-so101].matched_configuration",
+      "matched_configuration_verified": true,
+      "baseline": {
+        "env_fps": 97340.95367280951,
+        "loop_ms": 168.31558950070757,
+        "main_physics_graph_ms": 119.17066467500001,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-keyboard736/keyboard-so101/round_01_keyboard-so101_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "7b79d731ab6ca1965b9d4afb2b3eb9849f26a1403282fae3318319f236793922",
+          "capture_checks.json": "1ea09fb3f6f8b46868e747532316326f98cb1f6213d54048aa84207563578307",
+          "capture_analysis.json": "9ce8372d4e0e0c0acfa7347fed2a13948804c7d3f54397ea2770cbc9004fc0b4",
+          "capture.log": "62d96eef550a2037fcb50d2440fe29f54ffa0da769a1699cff5fd5b4604fa741"
+        }
+      },
+      "candidate": {
+        "env_fps": 96815.4688711302,
+        "loop_ms": 169.2291551240487,
+        "main_physics_graph_ms": 119.667913325,
+        "sensor_graph_ms": 0,
+        "sparse_active": false,
+        "sparse_representation": null,
+        "checks": {
+          "check_pass": true,
+          "complete": true,
+          "boundaries": [
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": null,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": null,
+              "factor_status_max": null
+            },
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": null,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": null,
+              "factor_status_max": null
+            }
+          ]
+        },
+        "state_finite": true,
+        "warning_matches": [],
+        "artifact_locator": "multi-candidate-mixed/final20/keyboard-so101/keyboard-so101/round_01_keyboard-so101_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "1b4bfcc8a1a7e7e90d2749da03df95dc2e82fb2e4273135b1bb199a5a8185540",
+          "capture_checks.json": "bf86668c3c6ee8f01e217e3ec13aade04465ccc3dbe40bbed989685ee0717b20",
+          "capture_analysis.json": "85c2c72297a9b637814a8ec64fe765e4123454ef0f5fe960001b59096e12c4c6",
+          "capture.log": "b1152b9f3338d50a9a7c1ee479d885669c4fe39f2360181040bfbb25ac636600"
+        }
+      },
+      "env_fps_gain": 0.9946016061908987,
+      "main_physics_graph_gain": 0.9958447620904901
+    },
+    {
+      "task": "Ant",
+      "task_key": "ant",
+      "task_id": "Isaac-Ant",
+      "status": "complete",
+      "configuration_reference": "results.json: rows[task_key=ant].matched_configuration",
+      "matched_configuration_verified": true,
+      "baseline": {
+        "env_fps": 1640349.937296659,
+        "loop_ms": 9.988112674909644,
+        "main_physics_graph_ms": 4.766994575,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-rest15/ant/round_01_ant_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "b937dd13ff8aff51d96271bec036a19285923dba6dfbbef42a66e771198b2b17",
+          "capture_checks.json": "8c283c0480d643f4a9b5ef44ee4962d7080de6ae8fd067625ea7d877b0643c3c",
+          "capture_analysis.json": "179607dc3a20c5e4920ed07ee11ed8826c6bbb813060969247720003ed2ecb8f",
+          "capture.log": "40248e969390cecd7726a7e7a195c70925ae8bfb8b833057a27a4dc671f4e34d"
+        }
+      },
+      "candidate": {
+        "env_fps": 1585488.8790228567,
+        "loop_ms": 10.333721173810773,
+        "main_physics_graph_ms": 4.7624033,
+        "sensor_graph_ms": 0,
+        "sparse_active": false,
+        "sparse_representation": null,
+        "checks": {
+          "check_pass": true,
+          "complete": true,
+          "boundaries": [
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": null,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": null,
+              "factor_status_max": null
+            },
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": null,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": null,
+              "factor_status_max": null
+            }
+          ]
+        },
+        "state_finite": true,
+        "warning_matches": [],
+        "artifact_locator": "multi-candidate-mixed/final20/ant/ant/round_01_ant_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "b8038f2136630766d57d905bb0f4ae033461eae31e2acb2e72c5029ff3bf02e1",
+          "capture_checks.json": "088f8f6beba7c21896c61f985f0e890da392dd62748bdce18ba2c676c73d956b",
+          "capture_analysis.json": "df4db518dadb570d3613c53c826fad810cbb3745573ae592432306b17e164efd",
+          "capture.log": "276da22ce29d2fc249164ba274dd8e1fab15ec334af7b986eaab4b00338eb462"
+        }
+      },
+      "env_fps_gain": 0.9665552715146777,
+      "main_physics_graph_gain": 1.0009640668189526
+    },
+    {
+      "task": "ANYmal-D rough",
+      "task_key": "anymald-rough",
+      "task_id": "Isaac-Velocity-Rough-AnymalD",
+      "status": "complete",
+      "configuration_reference": "results.json: rows[task_key=anymald-rough].matched_configuration",
+      "matched_configuration_verified": true,
+      "baseline": {
+        "env_fps": 163410.01689487437,
+        "loop_ms": 100.26313142443541,
+        "main_physics_graph_ms": 91.267457575,
+        "sensor_graph_ms": 1.112536175,
+        "artifact_locator": "baseline-rest15/anymald-rough/round_01_anymald-rough_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "6b169f54819f24e7d20a877f2cb09c19ac89535f3665b8f291005a290efd7913",
+          "capture_checks.json": "4dd29cc30fae46ba6a927e0c261fa06dad5f167c83927d73ab0718186b27adfb",
+          "capture_analysis.json": "42c306267d49adbf3e88eca829ebc3405972a98e97542cffb7a67222c9862e16",
+          "capture.log": "f76aa3f2054251945fef61868c4784c5b414b945c1aa3cf200c0c89077bef608"
+        }
+      },
+      "candidate": {
+        "env_fps": 176418.7716342674,
+        "loop_ms": 92.86993582500145,
+        "main_physics_graph_ms": 83.415478475,
+        "sensor_graph_ms": 1.1068536,
+        "sparse_active": true,
+        "sparse_representation": {
+          "dofs": 18,
+          "packed_factor_nnz": 117,
+          "max_row_support": 12,
+          "factor_warps_per_block": 4,
+          "factor_status_nonzero": 0,
+          "factor_status_max": 0,
+          "factor_kernel": "crba_sparse_factor_18_117_4",
+          "solve_kernel": "pgs_solve_sparse_192_18_12_0_0",
+          "selected_contact_producer": "populate_sparse_contact_response",
+          "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+          "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+          "double_buffer": false
+        },
+        "checks": {
+          "check_pass": true,
+          "complete": true,
+          "boundaries": [
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": 18,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": 0,
+              "factor_status_max": 0
+            },
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": 18,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": 0,
+              "factor_status_max": 0
+            }
+          ]
+        },
+        "state_finite": true,
+        "warning_matches": [],
+        "artifact_locator": "multi-candidate-mixed/final20/anymald-rough/anymald-rough/round_01_anymald-rough_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "c1eeb28f994f19fda94bbb511d461940ed457ba69468efc63036531899fa15a9",
+          "capture_checks.json": "4260e00ee8791890c4ebbab9a5182cfabf7a1acf24fc879389c93f753062bff8",
+          "capture_analysis.json": "fe32baf1e7af2dddb5081229a33d597bbf912202b0614cdf1bdb85c8c316df41",
+          "capture.log": "13aff93e98bcaf8b748396a5b8dbb3d2ce6b5132649e067b1af6078f4f651c64"
+        }
+      },
+      "env_fps_gain": 1.079608061895997,
+      "main_physics_graph_gain": 1.0941309603870852
+    },
+    {
+      "task": "Cartpole",
+      "task_key": "cartpole",
+      "task_id": "Isaac-Cartpole",
+      "status": "complete",
+      "configuration_reference": "results.json: rows[task_key=cartpole].matched_configuration",
+      "matched_configuration_verified": true,
+      "baseline": {
+        "env_fps": 2594743.277569082,
+        "loop_ms": 6.314304826082663,
+        "main_physics_graph_ms": 0.47057297500000006,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-rest15/cartpole/round_01_cartpole_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "bc5236652f8aabea417134e51b60bc624f1948c6d9e1384cd90082e74aef56a8",
+          "capture_checks.json": "ae0da55b1c59ddded71737951b46fe5f41d52402b417ce92122151ab8423b08d",
+          "capture_analysis.json": "7fc4658038b3d28e7a2de90ee24bb09b276bbe15eb4c31b357359d612a0ca60a",
+          "capture.log": "8603cf16c8553346016696f0c289558c5dcb1901e40b88381ec812174af596ac"
+        }
+      },
+      "candidate": {
+        "env_fps": 2801590.0277653346,
+        "loop_ms": 5.848107623751275,
+        "main_physics_graph_ms": 0.46960327500000004,
+        "sensor_graph_ms": 0,
+        "sparse_active": false,
+        "sparse_representation": null,
+        "checks": {
+          "check_pass": true,
+          "complete": true,
+          "boundaries": [
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": null,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": null,
+              "factor_status_max": null
+            },
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": null,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": null,
+              "factor_status_max": null
+            }
+          ]
+        },
+        "state_finite": true,
+        "warning_matches": [],
+        "artifact_locator": "multi-candidate-mixed/final20/cartpole/cartpole/round_01_cartpole_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "37c14bef4512040edc341016bdec8ade1b47203cbbe6d3bd069a754c2768b86c",
+          "capture_checks.json": "7b026b8dfdfe960c7a0d42b1378c6b75e1452016a04a05e41ae450189341eda8",
+          "capture_analysis.json": "28cadaf37035ec070a0c8e9ebf1314cec0b43069dce3735d396db559ed749b35",
+          "capture.log": "d433a10ea9acd03b29384078879cd8f4e19b3fbd6d5e900c192f1e7a533f26b4"
+        }
+      },
+      "env_fps_gain": 1.079717616761701,
+      "main_physics_graph_gain": 1.0020649344917794
+    },
+    {
+      "task": "Cassie flat",
+      "task_key": "cassie-flat",
+      "task_id": "Isaac-Velocity-Flat-Cassie",
+      "status": "complete",
+      "configuration_reference": "results.json: rows[task_key=cassie-flat].matched_configuration",
+      "matched_configuration_verified": true,
+      "baseline": {
+        "env_fps": 795500.3270014791,
+        "loop_ms": 20.595843199407682,
+        "main_physics_graph_ms": 11.20907305,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-rest15/cassie-flat/round_01_cassie-flat_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "951a03a70daf0ee8d8b2a9f2d5f39fd78e27146fcef316c42523b60bf772d073",
+          "capture_checks.json": "083c623e4d1724937de445aa2de27f446ab17f1eb91c0a9675f21cc46c2671b6",
+          "capture_analysis.json": "a3c8a133975eea57d4a48e00939a70dac147689669718e21cbc3afdcbff86922",
+          "capture.log": "3c34bbdda7f69b5a3b0d6fc80c042e5779570b84a77a63e25705ff855b4eb4d4"
+        }
+      },
+      "candidate": {
+        "env_fps": 886354.3995106469,
+        "loop_ms": 18.484705450828187,
+        "main_physics_graph_ms": 8.792464675,
+        "sensor_graph_ms": 0,
+        "sparse_active": true,
+        "sparse_representation": {
+          "dofs": 18,
+          "packed_factor_nnz": 135,
+          "max_row_support": 18,
+          "factor_warps_per_block": 4,
+          "factor_status_nonzero": 0,
+          "factor_status_max": 0,
+          "factor_kernel": "crba_sparse_factor_18_135_4",
+          "solve_kernel": "pgs_solve_sparse_40_18_18_0_0",
+          "selected_contact_producer": "populate_sparse_contact_response",
+          "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+          "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+          "double_buffer": false
+        },
+        "checks": {
+          "check_pass": true,
+          "complete": true,
+          "boundaries": [
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": 18,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": 0,
+              "factor_status_max": 0
+            },
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": 18,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": 0,
+              "factor_status_max": 0
+            }
+          ]
+        },
+        "state_finite": true,
+        "warning_matches": [],
+        "artifact_locator": "multi-candidate-mixed/final20/cassie-flat/cassie-flat/round_01_cassie-flat_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "974a0ddb04b5113ba08ef186b3b82bfd9137b78be10fa2ff8b78e244d7dd9ee5",
+          "capture_checks.json": "e6adc9442d5a2f09685816fb52c5d2d24e029bcb150ae7ab9e32d347d2e4398c",
+          "capture_analysis.json": "142dd1d845cdd20ee4939491879c46bfafb10585dc6cd4314bf00c891c6b6e6a",
+          "capture.log": "d37a019e4edd2095f695e70c725fa8e54174d297747b50f0b902ffb8bda5dbd9"
+        }
+      },
+      "env_fps_gain": 1.1142099750626486,
+      "main_physics_graph_gain": 1.2748499384787122
+    },
+    {
+      "task": "Cassie rough",
+      "task_key": "cassie-rough",
+      "task_id": "Isaac-Velocity-Rough-Cassie",
+      "status": "complete",
+      "configuration_reference": "results.json: rows[task_key=cassie-rough].matched_configuration",
+      "matched_configuration_verified": true,
+      "baseline": {
+        "env_fps": 482383.520719103,
+        "loop_ms": 33.96467602287885,
+        "main_physics_graph_ms": 22.5371784,
+        "sensor_graph_ms": 1.0389858749999998,
+        "artifact_locator": "baseline-rest15/cassie-rough/round_01_cassie-rough_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "cd15129ba369b5986b46f65439d8e68009b638fc61f755115ba8cc4497a79d3f",
+          "capture_checks.json": "fda93fdd069b9d49d8a4b7bbae249dcf0cc5ff2334ce80647936ba73c4e2a10f",
+          "capture_analysis.json": "4216847d173ea2cf2a2115b57b23fab1d619c165b5a89f3e8a328c48105694ee",
+          "capture.log": "8224768cbe4e44f21108c2f3d55194d875b308ab1c9534e6d33337c1b6243c80"
+        }
+      },
+      "candidate": {
+        "env_fps": 531132.4566479796,
+        "loop_ms": 30.84729580150452,
+        "main_physics_graph_ms": 19.04721835,
+        "sensor_graph_ms": 1.035105775,
+        "sparse_active": true,
+        "sparse_representation": {
+          "dofs": 18,
+          "packed_factor_nnz": 135,
+          "max_row_support": 18,
+          "factor_warps_per_block": 4,
+          "factor_status_nonzero": 0,
+          "factor_status_max": 0,
+          "factor_kernel": "crba_sparse_factor_18_135_4",
+          "solve_kernel": "pgs_solve_sparse_80_18_18_0_0",
+          "selected_contact_producer": "populate_sparse_contact_response",
+          "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+          "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+          "double_buffer": false
+        },
+        "checks": {
+          "check_pass": true,
+          "complete": true,
+          "boundaries": [
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": 18,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": 0,
+              "factor_status_max": 0
+            },
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": 18,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": 0,
+              "factor_status_max": 0
+            }
+          ]
+        },
+        "state_finite": true,
+        "warning_matches": [],
+        "artifact_locator": "multi-candidate-mixed/final20/cassie-rough/cassie-rough/round_01_cassie-rough_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "abad8032fbbc38dd5eb73f6c6366ca4b7924b433cea1661f8227eee901223994",
+          "capture_checks.json": "aba1789034b3b1f010ea86cf9366703148382b39b45265bff66c983f65fe275b",
+          "capture_analysis.json": "737d681a89f98c9977bd9700be76821f0bb36ee78ba64f4a26da92877bfb17c1",
+          "capture.log": "07bcd4bb66e7cd4a3f74f189b3aa3d27028f37f92179710fdcd5caac6785d67b"
+        }
+      },
+      "env_fps_gain": 1.1010584604055402,
+      "main_physics_graph_gain": 1.183226757097579
+    },
+    {
+      "task": "Franka reach",
+      "task_key": "franka-reach",
+      "task_id": "Isaac-Reach-Franka",
+      "status": "complete",
+      "configuration_reference": "results.json: rows[task_key=franka-reach].matched_configuration",
+      "matched_configuration_verified": true,
+      "baseline": {
+        "env_fps": 1142545.6027718736,
+        "loop_ms": 14.339909024420194,
+        "main_physics_graph_ms": 10.620582924999999,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-rest15/franka-reach/round_01_franka-reach_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "4e4e5ce7ce6a7e55bcccc0dcb0d41cba8fe614693c5ce6ca41f31206e1158657",
+          "capture_checks.json": "25984a139d4d35fd7113142417cd50eb68b11c1dd2925e8d2144ac115b1c9b6c",
+          "capture_analysis.json": "0dd8e2054ff08ac16d04fce9d9c3355ac060a0e40579f1d12f9b16ce011f6a14",
+          "capture.log": "c466f3319623a169cc46e36146b1a63e9d813d732f866631f63d10c4d7b067bb"
+        }
+      },
+      "candidate": {
+        "env_fps": 1167116.2164043512,
+        "loop_ms": 14.03801932465285,
+        "main_physics_graph_ms": 10.546188225,
+        "sensor_graph_ms": 0,
+        "sparse_active": false,
+        "sparse_representation": null,
+        "checks": {
+          "check_pass": true,
+          "complete": true,
+          "boundaries": [
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": null,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": null,
+              "factor_status_max": null
+            },
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": null,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": null,
+              "factor_status_max": null
+            }
+          ]
+        },
+        "state_finite": true,
+        "warning_matches": [],
+        "artifact_locator": "multi-candidate-mixed/final20/franka-reach/franka-reach/round_01_franka-reach_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "8791f05bdce2cbf29a4e2676c8b52e2e74a008a2c22cc01f2d715e9fa1212b85",
+          "capture_checks.json": "fbd8f68983c56127ce629f096056ea1a57cfe6f997b72b013a0ff0b55937cc6c",
+          "capture_analysis.json": "b4880400d479bf2784b772c6caa3ae9714722dd71d1d007011291c832c331a1c",
+          "capture.log": "beb6f4ade3b1a7762b73e09b3c0cde3556679359773dfc521bae52d741d543aa"
+        }
+      },
+      "env_fps_gain": 1.021505149179926,
+      "main_physics_graph_gain": 1.0070541790467615
+    },
+    {
+      "task": "G1 flat",
+      "task_key": "g1-flat",
+      "task_id": "Isaac-Velocity-Flat-G1",
+      "status": "complete",
+      "configuration_reference": "results.json: rows[task_key=g1-flat].matched_configuration",
+      "matched_configuration_verified": true,
+      "baseline": {
+        "env_fps": 406128.71708253276,
+        "loop_ms": 40.34188992518466,
+        "main_physics_graph_ms": 27.3210127,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-rest15/g1-flat/round_01_g1-flat_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "610efea5dc51caf14684e3e18a0298647b820c27921e86aa63ba00f56e6c4365",
+          "capture_checks.json": "2001ce13f31fac07e2910d242857bbbaf6b33715873545dfe354ea3791094725",
+          "capture_analysis.json": "07fc2411ec6bd73e8732cea2c05b45b5314971c350cde9b3f4fac11c26a15f1d",
+          "capture.log": "7268ae22568153e75376dc8e958c7e08a5f760e34a4121444c7dc9ca4614cbd8"
+        }
+      },
+      "candidate": {
+        "env_fps": 566594.5287598241,
+        "loop_ms": 28.916622325778008,
+        "main_physics_graph_ms": 17.407841124999997,
+        "sensor_graph_ms": 0,
+        "sparse_active": true,
+        "sparse_representation": {
+          "dofs": 43,
+          "packed_factor_nnz": 434,
+          "max_row_support": 18,
+          "factor_warps_per_block": 4,
+          "factor_status_nonzero": 0,
+          "factor_status_max": 0,
+          "factor_kernel": "crba_sparse_factor_43_434_4",
+          "solve_kernel": "pgs_solve_sparse_56_43_18_0_0",
+          "selected_contact_producer": "populate_sparse_contact_response",
+          "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+          "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+          "double_buffer": false
+        },
+        "checks": {
+          "check_pass": true,
+          "complete": true,
+          "boundaries": [
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": 43,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": 0,
+              "factor_status_max": 0
+            },
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": 43,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": 0,
+              "factor_status_max": 0
+            }
+          ]
+        },
+        "state_finite": true,
+        "warning_matches": [],
+        "artifact_locator": "multi-candidate-mixed/final20/g1-flat/g1-flat/round_01_g1-flat_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "965d5347a89e1f29669fc0102313af89b3761067ce76c9d37bcd5bb0584aeef3",
+          "capture_checks.json": "c4679dd61b019acf0d216d5a4bd47073953e34c40fe5470220e313d0cd0aab55",
+          "capture_analysis.json": "7ff298d7417b1ad62fcae1242bf52f8ae1689b994a8e7ca8a25459a3191b9f19",
+          "capture.log": "3d0fa6c8ce13268fc73d6855c0cf2394cd66eea21cd7802902d0676c938bf81c"
+        }
+      },
+      "env_fps_gain": 1.3951107245752379,
+      "main_physics_graph_gain": 1.569465880565934
+    },
+    {
+      "task": "Go2 flat",
+      "task_key": "go2-flat",
+      "task_id": "Isaac-Velocity-Flat-UnitreeGo2",
+      "status": "complete",
+      "configuration_reference": "results.json: rows[task_key=go2-flat].matched_configuration",
+      "matched_configuration_verified": true,
+      "baseline": {
+        "env_fps": 783236.8433040346,
+        "loop_ms": 20.918321373756044,
+        "main_physics_graph_ms": 16.8792432,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-rest15/go2-flat/round_01_go2-flat_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "052c86f32aba98ea36b9751a575b43b5f985d38b2cc9e0cb34056410aa419138",
+          "capture_checks.json": "2cf6fe8b41de3fc157ba4df6aca6ee9003c1bcecadc6e8ebf83fbd6bd57da358",
+          "capture_analysis.json": "b225779a37f64b2de94faba313cba9884f99afa471cf65f94a3f1b1dc2a82ca7",
+          "capture.log": "a3592c66cf87aab3b990a32fcefd75c2476bcb800cd62118a03e7d806ad41fd3"
+        }
+      },
+      "candidate": {
+        "env_fps": 986486.4348318188,
+        "loop_ms": 16.608439225819893,
+        "main_physics_graph_ms": 12.558295825,
+        "sensor_graph_ms": 0,
+        "sparse_active": true,
+        "sparse_representation": {
+          "dofs": 18,
+          "packed_factor_nnz": 117,
+          "max_row_support": 12,
+          "factor_warps_per_block": 4,
+          "factor_status_nonzero": 0,
+          "factor_status_max": 0,
+          "factor_kernel": "crba_sparse_factor_18_117_4",
+          "solve_kernel": "pgs_solve_sparse_96_18_12_0_0",
+          "selected_contact_producer": "populate_sparse_contact_response",
+          "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+          "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+          "double_buffer": false
+        },
+        "checks": {
+          "check_pass": true,
+          "complete": true,
+          "boundaries": [
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": 18,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": 0,
+              "factor_status_max": 0
+            },
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": 18,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": 0,
+              "factor_status_max": 0
+            }
+          ]
+        },
+        "state_finite": true,
+        "warning_matches": [],
+        "artifact_locator": "multi-candidate-mixed/final20/go2-flat/go2-flat/round_01_go2-flat_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "673e3609615a19291b9c6548ca1e2b3efac19ff0da49b330bcb0f6d0f7de148b",
+          "capture_checks.json": "93d6dce980d86633f9b099f67ead4ea5bdc46ead2e45e607979a0177157cfcb5",
+          "capture_analysis.json": "7dc196cb158c76a0e5cf1ee60843abb06c46125f376e92145bde90c630a19913",
+          "capture.log": "e103c9f12a833f460ea89023165080275da8e8ccb3a6440b6abff1b409a70db9"
+        }
+      },
+      "env_fps_gain": 1.259499528482839,
+      "main_physics_graph_gain": 1.3440711570433166
+    },
+    {
+      "task": "Go2 rough",
+      "task_key": "go2-rough",
+      "task_id": "Isaac-Velocity-Rough-UnitreeGo2",
+      "status": "complete",
+      "configuration_reference": "results.json: rows[task_key=go2-rough].matched_configuration",
+      "matched_configuration_verified": true,
+      "baseline": {
+        "env_fps": 287158.1106601535,
+        "loop_ms": 57.055675573064946,
+        "main_physics_graph_ms": 49.6708943,
+        "sensor_graph_ms": 1.1467400250000002,
+        "artifact_locator": "baseline-rest15/go2-rough/round_01_go2-rough_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "07553abc47cf97c52bdf004cdf628d98138d13627e6dd52a01a7258a1552bd3c",
+          "capture_checks.json": "b208ffbe24f9fb4d907b290b4c8bb5c300ee2acc11ed54d8e9526445d0f8853e",
+          "capture_analysis.json": "b7b8c0c5f1969820e03d5cfcb59cc62f5219b35413ee4f47b9bf65222cd4f419",
+          "capture.log": "638d1fdda76bbb4c1e72bf8ef1333a5379043242b5f72345d4dd7171a38e9671"
+        }
+      },
+      "candidate": {
+        "env_fps": 332520.13920694194,
+        "loop_ms": 49.27220359968487,
+        "main_physics_graph_ms": 41.889254050000005,
+        "sensor_graph_ms": 1.1411747749999999,
+        "sparse_active": true,
+        "sparse_representation": {
+          "dofs": 18,
+          "packed_factor_nnz": 117,
+          "max_row_support": 12,
+          "factor_warps_per_block": 4,
+          "factor_status_nonzero": 0,
+          "factor_status_max": 0,
+          "factor_kernel": "crba_sparse_factor_18_117_4",
+          "solve_kernel": "pgs_solve_sparse_184_18_12_0_0",
+          "selected_contact_producer": "populate_sparse_contact_response",
+          "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+          "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+          "double_buffer": false
+        },
+        "checks": {
+          "check_pass": true,
+          "complete": true,
+          "boundaries": [
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": 18,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": 0,
+              "factor_status_max": 0
+            },
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": 18,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": 0,
+              "factor_status_max": 0
+            }
+          ]
+        },
+        "state_finite": true,
+        "warning_matches": [],
+        "artifact_locator": "multi-candidate-mixed/final20/go2-rough/go2-rough/round_01_go2-rough_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "fd35dbdbbdc76135a70643573bb17c16e8827a2bd9f2ae05077aa72d559feb18",
+          "capture_checks.json": "674a88b26807ccaa2055f8cf49b85e25870a431501545f456e075c8732b910d6",
+          "capture_analysis.json": "f346655dc277ffe9c360f0157407e28b75a741cd564037ac0ccb5925076912e5",
+          "capture.log": "605810f8d1c49f8b7bd691174fb449af0c3d3048b121f812dfa69c7f3744ef94"
+        }
+      },
+      "env_fps_gain": 1.1579688222718305,
+      "main_physics_graph_gain": 1.185766980732377
+    },
+    {
+      "task": "H1 flat",
+      "task_key": "h1-flat",
+      "task_id": "Isaac-Velocity-Flat-H1",
+      "status": "complete",
+      "configuration_reference": "results.json: rows[task_key=h1-flat].matched_configuration",
+      "matched_configuration_verified": true,
+      "baseline": {
+        "env_fps": 658204.1336714827,
+        "loop_ms": 24.891973723424602,
+        "main_physics_graph_ms": 13.309133924999998,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-rest15/h1-flat/round_01_h1-flat_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "59718c4fb65db1abe323fb4a3a9e17841e893dab398a32f590c76d9bfe80086b",
+          "capture_checks.json": "46096ef332982e03fe4c71ece791a5c6e7e763d43fc89d2b10cfcb63f05a1114",
+          "capture_analysis.json": "e076972c7a193b35528f654df8883a49eecbe5fc8ed3a3611e328631207ad71c",
+          "capture.log": "ecb5d77e9e167deb79a85bb5b16c845ed23a9590d4f3a157362ac771de5c0ac2"
+        }
+      },
+      "candidate": {
+        "env_fps": 768676.9951422106,
+        "loop_ms": 21.314544475171715,
+        "main_physics_graph_ms": 10.090237049999999,
+        "sensor_graph_ms": 0,
+        "sparse_active": true,
+        "sparse_representation": {
+          "dofs": 25,
+          "packed_factor_nnz": 194,
+          "max_row_support": 16,
+          "factor_warps_per_block": 4,
+          "factor_status_nonzero": 0,
+          "factor_status_max": 0,
+          "factor_kernel": "crba_sparse_factor_25_194_4",
+          "solve_kernel": "pgs_solve_sparse_48_25_16_0_0",
+          "selected_contact_producer": "populate_sparse_contact_response",
+          "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+          "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+          "double_buffer": false
+        },
+        "checks": {
+          "check_pass": true,
+          "complete": true,
+          "boundaries": [
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": 25,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": 0,
+              "factor_status_max": 0
+            },
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": 25,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": 0,
+              "factor_status_max": 0
+            }
+          ]
+        },
+        "state_finite": true,
+        "warning_matches": [],
+        "artifact_locator": "multi-candidate-mixed/final20/h1-flat/h1-flat/round_01_h1-flat_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "21a04bb43835256c4177add1527ff8f16f89d7338ee4e05b0a4ecc3015bd5b37",
+          "capture_checks.json": "98a3b5829eeffbf637dc51ab57ac3d73e66ec8a13cf9988e4c3470cb333decba",
+          "capture_analysis.json": "2e5878ccec9a26246f4185c1c713b57dd5b259adc8f4c61107ef08ecf48ccfd6",
+          "capture.log": "77f36ac2d3fcf2b2f5e86bff7e913418991016fec9dd1a1734dbd68d8b363609"
+        }
+      },
+      "env_fps_gain": 1.167839817192437,
+      "main_physics_graph_gain": 1.319011026108648
+    },
+    {
+      "task": "H1 rough",
+      "task_key": "h1-rough",
+      "task_id": "Isaac-Velocity-Rough-H1",
+      "status": "complete",
+      "configuration_reference": "results.json: rows[task_key=h1-rough].matched_configuration",
+      "matched_configuration_verified": true,
+      "baseline": {
+        "env_fps": 363384.8914258834,
+        "loop_ms": 45.0871799752349,
+        "main_physics_graph_ms": 31.971205849999997,
+        "sensor_graph_ms": 1.053788025,
+        "artifact_locator": "baseline-rest15/h1-rough/round_01_h1-rough_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "17bc9f09a6a3c8189e80600db6a042740690234420d0dd2f699f8899456524c9",
+          "capture_checks.json": "3fe413f938f7fa8940fca3f8edc58747bc3074b31eb0477ce3e1ba823ae63ff9",
+          "capture_analysis.json": "618375d047c18e1256aba6b742618bc27cfb983a6dd109d55ba9d9929a2579ee",
+          "capture.log": "cff238c849d1bb58e0da6771a7b3da380d1da49420132dd73c976765792ca30c"
+        }
+      },
+      "candidate": {
+        "env_fps": 400437.4419674815,
+        "loop_ms": 40.91525487601757,
+        "main_physics_graph_ms": 27.504094050000003,
+        "sensor_graph_ms": 1.052432925,
+        "sparse_active": true,
+        "sparse_representation": {
+          "dofs": 25,
+          "packed_factor_nnz": 194,
+          "max_row_support": 16,
+          "factor_warps_per_block": 4,
+          "factor_status_nonzero": 0,
+          "factor_status_max": 0,
+          "factor_kernel": "crba_sparse_factor_25_194_4",
+          "solve_kernel": "pgs_solve_sparse_88_25_16_0_0",
+          "selected_contact_producer": "populate_sparse_contact_response",
+          "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+          "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+          "double_buffer": false
+        },
+        "checks": {
+          "check_pass": true,
+          "complete": true,
+          "boundaries": [
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": 25,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": 0,
+              "factor_status_max": 0
+            },
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": 25,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": 0,
+              "factor_status_max": 0
+            }
+          ]
+        },
+        "state_finite": true,
+        "warning_matches": [],
+        "artifact_locator": "multi-candidate-mixed/final20/h1-rough/h1-rough/round_01_h1-rough_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "8eb0e2414297affcfeaf234c7c8300cdcee5be3554ee66552a5fa4ae3b6bffed",
+          "capture_checks.json": "c81fd1515b6bd25363c371b617ef7d4d1f9e32f0090bc6116aa514fedd3f0eea",
+          "capture_analysis.json": "ea2b716c112a93e727c97862ac821614ea519839784e9179f3b22f2d60df4b47",
+          "capture.log": "58c3230a8d6fdabda97609d4fc449f113035b0091e193578d7000f552fe925e6"
+        }
+      },
+      "env_fps_gain": 1.1019650277594313,
+      "main_physics_graph_gain": 1.1624162494455983
+    },
+    {
+      "task": "Humanoid",
+      "task_key": "humanoid",
+      "task_id": "Isaac-Humanoid",
+      "status": "complete",
+      "configuration_reference": "results.json: rows[task_key=humanoid].matched_configuration",
+      "matched_configuration_verified": true,
+      "baseline": {
+        "env_fps": 323338.44896480406,
+        "loop_ms": 50.67136324942113,
+        "main_physics_graph_ms": 42.508771,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-rest15/humanoid/round_01_humanoid_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "9905ea6758e51877d9c1ab39f00f6729dd90d46c7b06de482709411d7fc32254",
+          "capture_checks.json": "a64168de19ac3655a2d40f5e2113baa12f3d59d291ca3526e6b50e2020c76a7c",
+          "capture_analysis.json": "a3b0867278dbaac85e153c4030590ab5be92eb980e1d86f40458da5212481a8b",
+          "capture.log": "c27030c7ff5581b81fad27683bc6f5c2d92537023b3d4bb423e6243ddc0bf335"
+        }
+      },
+      "candidate": {
+        "env_fps": 324484.34674785245,
+        "loop_ms": 50.49242024833802,
+        "main_physics_graph_ms": 42.552073875000005,
+        "sensor_graph_ms": 0,
+        "sparse_active": false,
+        "sparse_representation": null,
+        "checks": {
+          "check_pass": true,
+          "complete": true,
+          "boundaries": [
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": null,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": null,
+              "factor_status_max": null
+            },
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": null,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": null,
+              "factor_status_max": null
+            }
+          ]
+        },
+        "state_finite": true,
+        "warning_matches": [],
+        "artifact_locator": "multi-candidate-mixed/final20/humanoid/humanoid/round_01_humanoid_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "7cb45f1ab0b0d3fcf305a64e5e40a4aa06a338f06229db3cd565c99b3b379489",
+          "capture_checks.json": "a96cb414e40f16c1ffa24bcb44c736e1686c66716a4e8f836c25a9e2b12133ed",
+          "capture_analysis.json": "c7249c39195f5e74d68f90695b45ae31cfea8d21a8c2c45b28105d44c4093583",
+          "capture.log": "90418735606e293ca841fa01ad11be63a3d7a3098d4816c179c85a31a2d443cb"
+        }
+      },
+      "env_fps_gain": 1.0035439576911347,
+      "main_physics_graph_gain": 0.9989823557101539
+    },
+    {
+      "task": "UR10 reach",
+      "task_key": "ur10-reach",
+      "task_id": "Isaac-Reach-UR10",
+      "status": "complete",
+      "configuration_reference": "results.json: rows[task_key=ur10-reach].matched_configuration",
+      "matched_configuration_verified": true,
+      "baseline": {
+        "env_fps": 1958658.8904980104,
+        "loop_ms": 8.364907273789868,
+        "main_physics_graph_ms": 5.1193614,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-rest15/ur10-reach/round_01_ur10-reach_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "53b3d4e0bbd7cc38cce500d1d4125932456682edb19e444e01c320a9e6c00803",
+          "capture_checks.json": "15a204f0a5e93a1699e936b433257f36224ed90a2ae457e12beab46bf19c3510",
+          "capture_analysis.json": "45c9516854c3b5976f56efb5bdac27c81e7a3f3c9a7690b7dc17f9d462facca8",
+          "capture.log": "037ebd9d670e6507faa56f4f908c17407c1d62651f8d2b9910ed4ebc1e801714"
+        }
+      },
+      "candidate": {
+        "env_fps": 1936843.3664446096,
+        "loop_ms": 8.459124926594086,
+        "main_physics_graph_ms": 5.124537849999999,
+        "sensor_graph_ms": 0,
+        "sparse_active": false,
+        "sparse_representation": null,
+        "checks": {
+          "check_pass": true,
+          "complete": true,
+          "boundaries": [
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": null,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": null,
+              "factor_status_max": null
+            },
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": null,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": null,
+              "factor_status_max": null
+            }
+          ]
+        },
+        "state_finite": true,
+        "warning_matches": [],
+        "artifact_locator": "multi-candidate-mixed/final20/ur10-reach/ur10-reach/round_01_ur10-reach_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "e75be6a63b60863ebbaa7ff55a8d093c9fe0b70c1aca8c6ed614e5ddb64b9666",
+          "capture_checks.json": "7a05132acdc1b16429f223ca0995df894829fa7552fcfa4465ebb9effcb2b020",
+          "capture_analysis.json": "c4acc0557fcdcf44ab09cbfca0cb7acb45f8b6ae0743335f7edbf922d26dd006",
+          "capture.log": "1cc3427a20ed43279155c92fc0f89b7d5c3769cd7ace7d6f7f312374ae107531"
+        }
+      },
+      "env_fps_gain": 0.9888620095315045,
+      "main_physics_graph_gain": 0.998989869886511
+    },
+    {
+      "task": "KukaAllegro reorient",
+      "task_key": "kuka-reorient",
+      "task_id": "Isaac-Reorient-KukaAllegro",
+      "status": "complete",
+      "configuration_reference": "results.json: rows[task_key=kuka-reorient].matched_configuration",
+      "matched_configuration_verified": true,
+      "baseline": {
+        "env_fps": 347020.13481145585,
+        "loop_ms": 47.213398752501234,
+        "main_physics_graph_ms": 26.5117063,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-rest15/kuka-reorient/round_01_kuka-reorient_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "dc3189b3a2b41542f328ba63434a3f5ab6668e2ab6387ec6c7d96ad743c6aa4b",
+          "capture_checks.json": "3c83d80a9be0b77b1215ac353819e12aadf9427e781e14341f8b782a3356df2a",
+          "capture_analysis.json": "902e4e611a1efb2917b8d54c0b203a0542e045b3b40490e441384edd95d646e8",
+          "capture.log": "8ccf00136a6f809e545d8e0b2595f6ff38409a01bfdc1135866eff27d8859920"
+        }
+      },
+      "candidate": {
+        "env_fps": 351743.0439610323,
+        "loop_ms": 46.57945702492725,
+        "main_physics_graph_ms": 24.76867565,
+        "sensor_graph_ms": 0,
+        "sparse_active": true,
+        "sparse_representation": {
+          "dofs": 23,
+          "packed_factor_nnz": 180,
+          "max_row_support": 17,
+          "factor_warps_per_block": 4,
+          "factor_status_nonzero": 0,
+          "factor_status_max": 0,
+          "factor_kernel": "crba_sparse_factor_23_180_4",
+          "solve_kernel": "pgs_solve_sparse_192_29_17_64_6",
+          "selected_contact_producer": "populate_sparse_contact_response",
+          "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+          "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+          "double_buffer": false
+        },
+        "checks": {
+          "check_pass": true,
+          "complete": true,
+          "boundaries": [
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": 23,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": 0,
+              "factor_status_max": 0
+            },
+            {
+              "passed": true,
+              "flags": {
+                "dense": false,
+                "matrix_free": false,
+                "propagation": false
+              },
+              "current_public_constraint_check": true,
+              "collision_check_passed": true,
+              "unsupported_collision_owners": [],
+              "sparse_mass_matrix_size": 23,
+              "watermarks_enabled": false,
+              "factor_status_nonzero": 0,
+              "factor_status_max": 0
+            }
+          ]
+        },
+        "state_finite": true,
+        "warning_matches": [],
+        "artifact_locator": "multi-candidate-mixed/final20/kuka-reorient/kuka-reorient/round_01_kuka-reorient_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "116bb53cc4b0808edcf0ecd568d387f0a2b1d54ab580078348d61de283624d4b",
+          "capture_checks.json": "bd90a15783bfb74f00d0896ec05caa7883c5d27d979391853c62dd710e0bc267",
+          "capture_analysis.json": "f6d0898da8a1d189f4bf7785f97e5c78beb6965e72e944a95a14669ddd16ab51",
+          "capture.log": "761d71472b5afc42d7037ab9e7a94605cd30b7db27f231c0c853ebdef76cdcef"
+        }
+      },
+      "env_fps_gain": 1.0136098994720941,
+      "main_physics_graph_gain": 1.0703723798006133
+    }
+  ],
+  "paired_extension": {
+    "scope": "Independent two-round prior-PR versus pre-finalization extension check, not clean-main or final147 repeats",
+    "prior_commit": "d5c2177d2507ed12e87d6dc628373639a8e5231b",
+    "prior_tree_clean": true,
+    "candidate_parent_commit": "d5c2177d2507ed12e87d6dc628373639a8e5231b",
+    "candidate_source_diff_sha256": "d1ab0802993eca2835bb858bd3c28f4f34adbdbbed818274d0f04b9f53cdac3d",
+    "candidate_tree_clean": false,
+    "finalization_note": "The pre-finalization runtime file hashes differ from final147. No exact source snapshot was retained, so these measurements are labeled separately rather than asserted to be exact-head repeats.",
+    "num_envs": 16384,
+    "warmup_steps": 200,
+    "environment_timing_steps": 40,
+    "physics_profile_steps": 40,
+    "cuda_graph": true,
+    "video": false,
+    "rounds": 2,
+    "total_accepted_captures": 24,
+    "statistic": "Median of two captures per arm; with two samples the median is their arithmetic mean. Per-round ratios and raw captures retained below; observed ranges are not confidence intervals.",
+    "rows": [
+      {
+        "task": "KukaAllegro lift",
+        "task_key": "kuka",
+        "gpu": "RTX PRO6000",
+        "gpu_index": 0,
+        "rounds": [
+          {
+            "round": 1,
+            "order": "prior_then_extension",
+            "prior": {
+              "env_fps": 358503.2132343243,
+              "loop_ms": 45.70112455112394,
+              "main_physics_graph_ms": 26.479398524999997,
+              "sensor_graph_ms": 0,
+              "sparse_active": false,
+              "sparse_representation": null,
+              "checks_pass": true,
+              "state_finite": true,
+              "artifact_locator": "multi-baseline/kuka/round_01_kuka_fpgs_gpu0",
+              "artifact_sha256": {
+                "capture.json": "da920ac4198821d940fd66732c77d98939798e32cdaf5c2cb9bce5d0257e96ce",
+                "capture_checks.json": "5e33936b223e565b2c291097020f4a7c534a57fe62003b93a75b0457ad85a97d",
+                "capture_analysis.json": "63b661fbc78677e6d2d82833b4f999e2c0294dd3a8f93273a870537ba8d45b7e",
+                "capture.log": "79f1252034a10d843cbd3e6bfe49f5ae741311a7bb30003191048877556a8f83"
+              }
+            },
+            "candidate": {
+              "env_fps": 369970.6379035883,
+              "loop_ms": 44.284595374483615,
+              "main_physics_graph_ms": 24.821351175,
+              "sensor_graph_ms": 0,
+              "sparse_active": true,
+              "sparse_representation": {
+                "dofs": 23,
+                "packed_factor_nnz": 180,
+                "max_row_support": 17,
+                "factor_warps_per_block": 4,
+                "factor_status_nonzero": 0,
+                "factor_status_max": 0,
+                "factor_kernel": "crba_sparse_factor_23_180_4",
+                "solve_kernel": "pgs_solve_sparse_192_29_17_64_6",
+                "selected_contact_producer": "populate_sparse_contact_response",
+                "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+                "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+                "double_buffer": false
+              },
+              "checks_pass": true,
+              "state_finite": true,
+              "artifact_locator": "multi-candidate-mixed/kuka-active/kuka/round_01_kuka_fpgs_gpu0",
+              "artifact_sha256": {
+                "capture.json": "095535949233ec561751f9ef97f2ca49e480cdc1a478884156136711b155f42c",
+                "capture_checks.json": "7db6d850ce912b908385fdd0ed017ff3aeba0e7ed8bcaa1432266f9ee1df4ccd",
+                "capture_analysis.json": "2f7c164210cd993ea9c3c4a260daaf1ad6b95a892525711c860fddaa3dd10748",
+                "capture.log": "32d51b7586329f6d01d25704b057670e3e64a793148dc6637903b5953626bd0f"
+              }
+            },
+            "env_fps_gain": 1.031986950872233,
+            "main_physics_graph_gain": 1.0667992382167324
+          },
+          {
+            "round": 2,
+            "order": "extension_then_prior",
+            "prior": {
+              "env_fps": 348342.6118753315,
+              "loop_ms": 47.03415385156404,
+              "main_physics_graph_ms": 26.794993024999997,
+              "sensor_graph_ms": 0,
+              "sparse_active": false,
+              "sparse_representation": null,
+              "checks_pass": true,
+              "state_finite": true,
+              "artifact_locator": "multi-candidate-mixed/repeat-reverse/kuka-old/kuka/round_01_kuka_fpgs_gpu0",
+              "artifact_sha256": {
+                "capture.json": "2fc65b178728740950913e2ea16d28143ffeafc6a51b5fa8accecc8823a96243",
+                "capture_checks.json": "233929e1a5819942a5b96ad66cb5fd1881b22dd74f3afbb836677b3c71b37f86",
+                "capture_analysis.json": "5d85bc6051db69c4ee69884dea68cafb76a68e1d00c106ea23ee7684ad286258",
+                "capture.log": "86772a036acb83e02402d8ea753684600a57dd1077c60c7428dc589a223bf120"
+              }
+            },
+            "candidate": {
+              "env_fps": 371813.6236540191,
+              "loop_ms": 44.06508787651546,
+              "main_physics_graph_ms": 25.021329125,
+              "sensor_graph_ms": 0,
+              "sparse_active": true,
+              "sparse_representation": {
+                "dofs": 23,
+                "packed_factor_nnz": 180,
+                "max_row_support": 17,
+                "factor_warps_per_block": 4,
+                "factor_status_nonzero": 0,
+                "factor_status_max": 0,
+                "factor_kernel": "crba_sparse_factor_23_180_4",
+                "solve_kernel": "pgs_solve_sparse_192_29_17_64_6",
+                "selected_contact_producer": "populate_sparse_contact_response",
+                "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+                "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+                "double_buffer": false
+              },
+              "checks_pass": true,
+              "state_finite": true,
+              "artifact_locator": "multi-candidate-mixed/repeat-reverse/kuka-candidate/kuka/round_01_kuka_fpgs_gpu0",
+              "artifact_sha256": {
+                "capture.json": "ec91e7614ff0cc3ccfc4bb21627e0eb18f960b8aa6fbad4a016c04c661eae5dd",
+                "capture_checks.json": "c0ccd51f6a7339940574488528d632d49997178d9b3461e4b789e8c6b6785330",
+                "capture_analysis.json": "29198a3fa90e9643f8e6e710ce102afdcae313ec1b12cf4ecd922b5c014da2cd",
+                "capture.log": "17fe0e4daacb96880bd8fd7f6888664922ad649644237236898a70262c60003d"
+              }
+            },
+            "env_fps_gain": 1.067379100283854,
+            "main_physics_graph_gain": 1.0708860784788543
+          }
+        ],
+        "median": {
+          "prior_main_physics_graph_ms": 26.637195774999995,
+          "candidate_main_physics_graph_ms": 24.92134015,
+          "main_physics_graph_gain": 1.0688508569231177,
+          "prior_env_fps": 353422.91255482787,
+          "candidate_env_fps": 370892.1307788037,
+          "env_fps_gain": 1.0494286521994123
+        },
+        "physics_gain_range": [
+          1.0667992382167324,
+          1.0708860784788543
+        ]
+      },
+      {
+        "task": "KukaAllegro lift",
+        "task_key": "kuka",
+        "gpu": "GB300",
+        "gpu_index": 1,
+        "rounds": [
+          {
+            "round": 1,
+            "order": "prior_then_extension",
+            "prior": {
+              "env_fps": 362006.65397062444,
+              "loop_ms": 45.258836599532515,
+              "main_physics_graph_ms": 26.035383200000002,
+              "sensor_graph_ms": 0,
+              "sparse_active": false,
+              "sparse_representation": null,
+              "checks_pass": true,
+              "state_finite": true,
+              "artifact_locator": "multi-baseline/kuka/round_01_kuka_fpgs_gpu1",
+              "artifact_sha256": {
+                "capture.json": "feece0222b39d9d8ab0a5825f78bbbe24a53133a1cafe3bfc0ff33865f31c66d",
+                "capture_checks.json": "8ef402232aa199afb67613157c5f4049407002703ed08af4c228c30c67362856",
+                "capture_analysis.json": "2a6c0d8475aa3768a28087759c762154bffd92faf6ac6000a06fc566b8e12d4d",
+                "capture.log": "1bc88acabade94b9ebf107405def07017f2b63f580d4a773143c0d143b02de6a"
+              }
+            },
+            "candidate": {
+              "env_fps": 375208.678349805,
+              "loop_ms": 43.666367398691364,
+              "main_physics_graph_ms": 24.4269686,
+              "sensor_graph_ms": 0,
+              "sparse_active": true,
+              "sparse_representation": {
+                "dofs": 23,
+                "packed_factor_nnz": 180,
+                "max_row_support": 17,
+                "factor_warps_per_block": 4,
+                "factor_status_nonzero": 0,
+                "factor_status_max": 0,
+                "factor_kernel": "crba_sparse_factor_23_180_4",
+                "solve_kernel": "pgs_solve_sparse_192_29_17_64_6",
+                "selected_contact_producer": "populate_sparse_contact_response",
+                "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+                "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+                "double_buffer": false
+              },
+              "checks_pass": true,
+              "state_finite": true,
+              "artifact_locator": "multi-candidate-mixed/kuka-active/kuka/round_01_kuka_fpgs_gpu1",
+              "artifact_sha256": {
+                "capture.json": "821677ec9e77e2822aef65828df95b731039e76588b4c8485578ac294d395abd",
+                "capture_checks.json": "c3e9a9cd7f252b28ade0f5320274bd56ed6082a571cb9c3aca9414a737beb2ce",
+                "capture_analysis.json": "791f42ee7d31b89073387837d0bbf6333f0756e804aadfbc90c631abdfcf5c60",
+                "capture.log": "e80c0b53e1dbe01290b8ae8b7390e0b0392f468ebf5084d073830509e4305530"
+              }
+            },
+            "env_fps_gain": 1.0364690102636949,
+            "main_physics_graph_gain": 1.0658458536684738
+          },
+          {
+            "round": 2,
+            "order": "extension_then_prior",
+            "prior": {
+              "env_fps": 358169.49486622575,
+              "loop_ms": 45.743705800850876,
+              "main_physics_graph_ms": 25.754794399999998,
+              "sensor_graph_ms": 0,
+              "sparse_active": false,
+              "sparse_representation": null,
+              "checks_pass": true,
+              "state_finite": true,
+              "artifact_locator": "multi-candidate-mixed/repeat-reverse/kuka-old/kuka/round_01_kuka_fpgs_gpu1",
+              "artifact_sha256": {
+                "capture.json": "b7c2d93eb94a05eabac93ced2215e8b39dc305f851e926377320fc02ff52cab5",
+                "capture_checks.json": "09b7b962c201c79de6aa65a13c8e2c88fd3597e6e6d71d46056f0f28eee0ecd2",
+                "capture_analysis.json": "5b6c41d2378476c66e4a9af7d068d7ff22075a6c33cb591cd35b179a90a56b65",
+                "capture.log": "4b38623ed41977fd142abd8c32622afe87a8e5cc29994eb190cf411d7b5febf6"
+              }
+            },
+            "candidate": {
+              "env_fps": 371879.72745313746,
+              "loop_ms": 44.0572550491197,
+              "main_physics_graph_ms": 24.273004425,
+              "sensor_graph_ms": 0,
+              "sparse_active": true,
+              "sparse_representation": {
+                "dofs": 23,
+                "packed_factor_nnz": 180,
+                "max_row_support": 17,
+                "factor_warps_per_block": 4,
+                "factor_status_nonzero": 0,
+                "factor_status_max": 0,
+                "factor_kernel": "crba_sparse_factor_23_180_4",
+                "solve_kernel": "pgs_solve_sparse_192_29_17_64_6",
+                "selected_contact_producer": "populate_sparse_contact_response",
+                "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+                "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+                "double_buffer": false
+              },
+              "checks_pass": true,
+              "state_finite": true,
+              "artifact_locator": "multi-candidate-mixed/repeat-reverse/kuka-candidate/kuka/round_01_kuka_fpgs_gpu1",
+              "artifact_sha256": {
+                "capture.json": "5a2f309d6ff6ba3e559a18f5a21639f4414e3b84bfa230f08d072375f4cf2e64",
+                "capture_checks.json": "d47ea554fe3964bcb9e029e9d5d40b543e55ffe7d2852fa808163ef9fe3b89f6",
+                "capture_analysis.json": "d638448b8c3aeebdd95d3d955a80311347cc9e6f9e78e325bd9b6d009ba412c0",
+                "capture.log": "ea2f71b4c47539d73cee5e99196951b3a220bc887ab5802d75c0db5b110d852b"
+              }
+            },
+            "env_fps_gain": 1.038278616083797,
+            "main_physics_graph_gain": 1.0610468300114437
+          }
+        ],
+        "median": {
+          "prior_main_physics_graph_ms": 25.8950888,
+          "candidate_main_physics_graph_ms": 24.3499865125,
+          "main_physics_graph_gain": 1.0634539278576942,
+          "prior_env_fps": 360088.0744184251,
+          "candidate_env_fps": 373544.20290147123,
+          "env_fps_gain": 1.0373689923077265
+        },
+        "physics_gain_range": [
+          1.0610468300114437,
+          1.0658458536684738
+        ]
+      },
+      {
+        "task": "Cassie flat",
+        "task_key": "cassie-flat",
+        "gpu": "RTX PRO6000",
+        "gpu_index": 0,
+        "rounds": [
+          {
+            "round": 1,
+            "order": "prior_then_extension",
+            "prior": {
+              "env_fps": 773462.9917969722,
+              "loop_ms": 21.182655374286696,
+              "main_physics_graph_ms": 11.2097451,
+              "sensor_graph_ms": 0,
+              "sparse_active": false,
+              "sparse_representation": null,
+              "checks_pass": true,
+              "state_finite": true,
+              "artifact_locator": "multi-baseline/cassie-flat/round_01_cassie-flat_fpgs_gpu0",
+              "artifact_sha256": {
+                "capture.json": "f17b201085d52ab89a7b5617fdd7638556e7e156fc52433f40543ad374ce42dc",
+                "capture_checks.json": "6bca543ae38941088cb810db73314a439f46ef51e9ca237c3ac76bfc2289be33",
+                "capture_analysis.json": "bb8fd6a8b50b67d478d1d4494de224f4da94925a8ecdf1245b2ac873726dae0e",
+                "capture.log": "4861f999bd2bb7c70c2ad9f83bd95389e04f06b710ab13e5fad2d2d769a55e5f"
+              }
+            },
+            "candidate": {
+              "env_fps": 831886.3193410793,
+              "loop_ms": 19.694998726481572,
+              "main_physics_graph_ms": 8.78811215,
+              "sensor_graph_ms": 0,
+              "sparse_active": true,
+              "sparse_representation": {
+                "dofs": 18,
+                "packed_factor_nnz": 135,
+                "max_row_support": 18,
+                "factor_warps_per_block": 4,
+                "factor_status_nonzero": 0,
+                "factor_status_max": 0,
+                "factor_kernel": "crba_sparse_factor_18_135_4",
+                "solve_kernel": "pgs_solve_sparse_40_18_18_0_0",
+                "selected_contact_producer": "populate_sparse_contact_response",
+                "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+                "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+                "double_buffer": false
+              },
+              "checks_pass": true,
+              "state_finite": true,
+              "artifact_locator": "multi-candidate-mixed/cassie-flat/cassie-flat/round_01_cassie-flat_fpgs_gpu0",
+              "artifact_sha256": {
+                "capture.json": "007e59f9af75eadd9239c155b76cdcc2d40cd3fd32703b3bb31420a0e7b8d138",
+                "capture_checks.json": "2b7c4b448902fa34b2c1bc03595f08994e944cd7541218e184d69b710b961143",
+                "capture_analysis.json": "b43b924e0544d3cd9727a444b89e5942078ba70f69944f940123981804434373",
+                "capture.log": "b9389189dfacc6c0b246a5fccbcb646119b2f0c51267e494bdc2a419c43b2099"
+              }
+            },
+            "env_fps_gain": 1.0755347420157404,
+            "main_physics_graph_gain": 1.275557811355423
+          },
+          {
+            "round": 2,
+            "order": "extension_then_prior",
+            "prior": {
+              "env_fps": 751572.9820987225,
+              "loop_ms": 21.799612799077295,
+              "main_physics_graph_ms": 11.218185524999999,
+              "sensor_graph_ms": 0,
+              "sparse_active": false,
+              "sparse_representation": null,
+              "checks_pass": true,
+              "state_finite": true,
+              "artifact_locator": "multi-candidate-mixed/repeat-reverse/cassie-flat-old/cassie-flat/round_01_cassie-flat_fpgs_gpu0",
+              "artifact_sha256": {
+                "capture.json": "e9e550ef6ce7aa1e11c05668d1b9b0c803c879625377e282dfb3d113b5ff3339",
+                "capture_checks.json": "542ae6c83066d152c36b340962c2c7a1d76990860ceef3e536136542f30d8272",
+                "capture_analysis.json": "085ead81ddaddb3ba121ec7a3fda34ef9a41109240a4e5567ad25ee7bc8fb950",
+                "capture.log": "f86214f3cb25bfa9da47eb2cb83f133af6bf1dafdd1ca14020d461ef499efffe"
+              }
+            },
+            "candidate": {
+              "env_fps": 863039.0445333577,
+              "loop_ms": 18.984077376080677,
+              "main_physics_graph_ms": 8.746084,
+              "sensor_graph_ms": 0,
+              "sparse_active": true,
+              "sparse_representation": {
+                "dofs": 18,
+                "packed_factor_nnz": 135,
+                "max_row_support": 18,
+                "factor_warps_per_block": 4,
+                "factor_status_nonzero": 0,
+                "factor_status_max": 0,
+                "factor_kernel": "crba_sparse_factor_18_135_4",
+                "solve_kernel": "pgs_solve_sparse_40_18_18_0_0",
+                "selected_contact_producer": "populate_sparse_contact_response",
+                "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+                "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+                "double_buffer": false
+              },
+              "checks_pass": true,
+              "state_finite": true,
+              "artifact_locator": "multi-candidate-mixed/repeat-reverse/cassie-flat-candidate/cassie-flat/round_01_cassie-flat_fpgs_gpu0",
+              "artifact_sha256": {
+                "capture.json": "d331fa7b090b619380ad3ab442d09590f97ef392e3d61d73e8dfec3c8a431c10",
+                "capture_checks.json": "723056aa19a8b46a370ab359304c16029f2c136da8bc95c2cac190f2e73e88f6",
+                "capture_analysis.json": "32b3f665c08f416150d607d6661774ddbdc4e7a0dccfe1ebccab2c296239c653",
+                "capture.log": "2b623f39a1f85d4863b14ad65d5e414126b02f9259908c161ebf6e9b0e50421a"
+              }
+            },
+            "env_fps_gain": 1.1483103638496597,
+            "main_physics_graph_gain": 1.282652387628566
+          }
+        ],
+        "median": {
+          "prior_main_physics_graph_ms": 11.2139653125,
+          "candidate_main_physics_graph_ms": 8.767098075,
+          "main_physics_graph_gain": 1.2790965969090062,
+          "prior_env_fps": 762517.9869478473,
+          "candidate_env_fps": 847462.6819372185,
+          "env_fps_gain": 1.111400250805075
+        },
+        "physics_gain_range": [
+          1.275557811355423,
+          1.282652387628566
+        ]
+      },
+      {
+        "task": "Cassie flat",
+        "task_key": "cassie-flat",
+        "gpu": "GB300",
+        "gpu_index": 1,
+        "rounds": [
+          {
+            "round": 1,
+            "order": "prior_then_extension",
+            "prior": {
+              "env_fps": 719686.9337024889,
+              "loop_ms": 22.765454300679266,
+              "main_physics_graph_ms": 12.6714096,
+              "sensor_graph_ms": 0,
+              "sparse_active": false,
+              "sparse_representation": null,
+              "checks_pass": true,
+              "state_finite": true,
+              "artifact_locator": "multi-baseline/cassie-flat/round_01_cassie-flat_fpgs_gpu1",
+              "artifact_sha256": {
+                "capture.json": "826e6e846a46fa88cbe63e677971e35755a2a1e8911f8790dd5df85a0d92005d",
+                "capture_checks.json": "239642642795dbe14033a46ce75aaa01899934e9d22071a4b182451bef60d46e",
+                "capture_analysis.json": "6487432d7664b3993d4f197114ca62ed7a12dc49cc93a8cd32e66e7b7ed4cd48",
+                "capture.log": "0bf0ee0efdf83d185eb26834dc518961c628d4cd16ff055804cd7fb946b9a089"
+              }
+            },
+            "candidate": {
+              "env_fps": 810835.0344990495,
+              "loop_ms": 20.20632965140976,
+              "main_physics_graph_ms": 9.43078085,
+              "sensor_graph_ms": 0,
+              "sparse_active": true,
+              "sparse_representation": {
+                "dofs": 18,
+                "packed_factor_nnz": 135,
+                "max_row_support": 18,
+                "factor_warps_per_block": 4,
+                "factor_status_nonzero": 0,
+                "factor_status_max": 0,
+                "factor_kernel": "crba_sparse_factor_18_135_4",
+                "solve_kernel": "pgs_solve_sparse_40_18_18_0_0",
+                "selected_contact_producer": "populate_sparse_contact_response",
+                "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+                "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+                "double_buffer": false
+              },
+              "checks_pass": true,
+              "state_finite": true,
+              "artifact_locator": "multi-candidate-mixed/cassie-flat/cassie-flat/round_01_cassie-flat_fpgs_gpu1",
+              "artifact_sha256": {
+                "capture.json": "eb45bc7175a76faa87a44e006477567e6eb6a63545abbb04de376f9f105e0ee2",
+                "capture_checks.json": "d8c46987629da455cee60a9e352125895d7927e5fc7424f7e9514878e6df0ea6",
+                "capture_analysis.json": "ebc069548f96de744a19b575fb114fda6395b91aca4f89f10997c5b33661cf72",
+                "capture.log": "b0c45edc22bc26d131dabb4aceb6b8c89d1b361be0dea161fa6468325e0a09bd"
+              }
+            },
+            "env_fps_gain": 1.126649653520374,
+            "main_physics_graph_gain": 1.343622527290516
+          },
+          {
+            "round": 2,
+            "order": "extension_then_prior",
+            "prior": {
+              "env_fps": 715369.1534886793,
+              "loop_ms": 22.902860600152053,
+              "main_physics_graph_ms": 12.6719977,
+              "sensor_graph_ms": 0,
+              "sparse_active": false,
+              "sparse_representation": null,
+              "checks_pass": true,
+              "state_finite": true,
+              "artifact_locator": "multi-candidate-mixed/repeat-reverse/cassie-flat-old/cassie-flat/round_01_cassie-flat_fpgs_gpu1",
+              "artifact_sha256": {
+                "capture.json": "9da58e0a89e9cd8000678e307f167ffe836ab5dbec166c1f8d8066cfb4e8dcc7",
+                "capture_checks.json": "2651925c7af9a162474b259033ae0774122cbbc149cb15fcf82487387b8eb16c",
+                "capture_analysis.json": "0894f74f2912513a24219f37407dd12af8eb760ec2f5110f49c8f7242919fa67",
+                "capture.log": "ee361c0293fee1fd71e3805d7deced99b82e206cb005c4fef1d4a624b7ff4f43"
+              }
+            },
+            "candidate": {
+              "env_fps": 817428.7177574997,
+              "loop_ms": 20.043337901006453,
+              "main_physics_graph_ms": 9.4190715,
+              "sensor_graph_ms": 0,
+              "sparse_active": true,
+              "sparse_representation": {
+                "dofs": 18,
+                "packed_factor_nnz": 135,
+                "max_row_support": 18,
+                "factor_warps_per_block": 4,
+                "factor_status_nonzero": 0,
+                "factor_status_max": 0,
+                "factor_kernel": "crba_sparse_factor_18_135_4",
+                "solve_kernel": "pgs_solve_sparse_40_18_18_0_0",
+                "selected_contact_producer": "populate_sparse_contact_response",
+                "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+                "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+                "double_buffer": false
+              },
+              "checks_pass": true,
+              "state_finite": true,
+              "artifact_locator": "multi-candidate-mixed/repeat-reverse/cassie-flat-candidate/cassie-flat/round_01_cassie-flat_fpgs_gpu1",
+              "artifact_sha256": {
+                "capture.json": "4c7dbbc5859cc0a2d0999506602d1177024c005e7ce4bd1912a816829e89139b",
+                "capture_checks.json": "ade3c2a6d1ec80ef94c40a250ab97b49b67e1efbead687cbe12d6a9f21ef14a2",
+                "capture_analysis.json": "849ce4b55b3fa1a8a68440146696bfc64d48d0fd56b9a1b7bea444c6e44bbb9f",
+                "capture.log": "d1be484176469ef7bcaa2952bc1493cce6c70f51614a9f6ea025c2840bfa5491"
+              }
+            },
+            "env_fps_gain": 1.1426669905615876,
+            "main_physics_graph_gain": 1.345355293247323
+          }
+        ],
+        "median": {
+          "prior_main_physics_graph_ms": 12.671703650000001,
+          "candidate_main_physics_graph_ms": 9.424926175,
+          "main_physics_graph_gain": 1.3444883720800076,
+          "prior_env_fps": 717528.0435955841,
+          "candidate_env_fps": 814131.8761282746,
+          "env_fps_gain": 1.1346342256514488
+        },
+        "physics_gain_range": [
+          1.343622527290516,
+          1.345355293247323
+        ]
+      },
+      {
+        "task": "G1 rough",
+        "task_key": "g1",
+        "gpu": "RTX PRO6000",
+        "gpu_index": 0,
+        "rounds": [
+          {
+            "round": 1,
+            "order": "prior_then_extension",
+            "prior": {
+              "env_fps": 363239.14157090295,
+              "loop_ms": 45.10527122474741,
+              "main_physics_graph_ms": 30.87208045,
+              "sensor_graph_ms": 1.04196505,
+              "sparse_active": true,
+              "sparse_representation": {
+                "dofs": 43,
+                "packed_factor_nnz": 434,
+                "max_row_support": 18,
+                "factor_warps_per_block": 4,
+                "factor_status_nonzero": 0,
+                "factor_status_max": 0,
+                "factor_kernel": "crba_sparse_factor_43_434_4",
+                "solve_kernel": "pgs_solve_sparse_100_43_18",
+                "selected_contact_producer": "populate_sparse_contact_response",
+                "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+                "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+                "double_buffer": false
+              },
+              "checks_pass": true,
+              "state_finite": true,
+              "artifact_locator": "multi-baseline/g1/round_01_g1_fpgs_gpu0",
+              "artifact_sha256": {
+                "capture.json": "c0b8520a814ad254118e19d3f33eee48f74970daeca48914b13626a281b4ae6d",
+                "capture_checks.json": "ba990ab4bc912cefa31dc4162ebe5ee1b67226c7ee9b2b034e6e788f582cd6c6",
+                "capture_analysis.json": "057eded1b1713441af17352e80c8735baf4cc90128c030a61da740908633464f",
+                "capture.log": "3e1ce2bf29742ebd5c3cb308639e664a314d2383e50f150c5d92b062677c4bae"
+              }
+            },
+            "candidate": {
+              "env_fps": 360119.98155892815,
+              "loop_ms": 45.495948125608265,
+              "main_physics_graph_ms": 30.920317700000002,
+              "sensor_graph_ms": 1.0408328249999999,
+              "sparse_active": true,
+              "sparse_representation": {
+                "dofs": 43,
+                "packed_factor_nnz": 434,
+                "max_row_support": 18,
+                "factor_warps_per_block": 4,
+                "factor_status_nonzero": 0,
+                "factor_status_max": 0,
+                "factor_kernel": "crba_sparse_factor_43_434_4",
+                "solve_kernel": "pgs_solve_sparse_100_43_18_0_0",
+                "selected_contact_producer": "populate_sparse_contact_response",
+                "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+                "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+                "double_buffer": false
+              },
+              "checks_pass": true,
+              "state_finite": true,
+              "artifact_locator": "multi-candidate-mixed/g1/g1/round_01_g1_fpgs_gpu0",
+              "artifact_sha256": {
+                "capture.json": "d42efbe93b2e0f891ef5301c4a8aea577071330fdef3b2e152a4e15019da4bff",
+                "capture_checks.json": "3173111f8b2b8e8cdf9bb54af09fbba00ecbe2d4c36a0a929d7253d1909470c9",
+                "capture_analysis.json": "9af42af8de4d779b58ab27885a8875e6ec4d3c2a64cfd2d7e40aea8f84f9a513",
+                "capture.log": "bd6ea3189520adc420cc9111b63902aa98ecbe7203d0c4e360ffd6aa14a6ca53"
+              }
+            },
+            "env_fps_gain": 0.9914129297892145,
+            "main_physics_graph_gain": 0.9984399497292357
+          },
+          {
+            "round": 2,
+            "order": "extension_then_prior",
+            "prior": {
+              "env_fps": 367760.36070632155,
+              "loop_ms": 44.55075029982254,
+              "main_physics_graph_ms": 30.903257375,
+              "sensor_graph_ms": 1.041833375,
+              "sparse_active": true,
+              "sparse_representation": {
+                "dofs": 43,
+                "packed_factor_nnz": 434,
+                "max_row_support": 18,
+                "factor_warps_per_block": 4,
+                "factor_status_nonzero": 0,
+                "factor_status_max": 0,
+                "factor_kernel": "crba_sparse_factor_43_434_4",
+                "solve_kernel": "pgs_solve_sparse_100_43_18",
+                "selected_contact_producer": "populate_sparse_contact_response",
+                "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+                "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+                "double_buffer": false
+              },
+              "checks_pass": true,
+              "state_finite": true,
+              "artifact_locator": "multi-candidate-mixed/repeat-reverse/g1-old/g1/round_01_g1_fpgs_gpu0",
+              "artifact_sha256": {
+                "capture.json": "72223d442d0056154dd6789ec1a3d91302cb6740594b8c1720ef00f2763895f3",
+                "capture_checks.json": "ee5d6ab1e73ac8580c53c3c766ec6dad2c2fd891ed18d04c22da668358dd7d43",
+                "capture_analysis.json": "ce49efd9693c8a7b285a771d4c766fd88fe3e44f66437522eae51cf9fbd55d7f",
+                "capture.log": "c5ef5d99f09501e23c4d51d3022734705acdd1a089d0b3c07777feea190172ae"
+              }
+            },
+            "candidate": {
+              "env_fps": 362274.13958583,
+              "loop_ms": 45.22541967453435,
+              "main_physics_graph_ms": 30.9839996,
+              "sensor_graph_ms": 1.041244675,
+              "sparse_active": true,
+              "sparse_representation": {
+                "dofs": 43,
+                "packed_factor_nnz": 434,
+                "max_row_support": 18,
+                "factor_warps_per_block": 4,
+                "factor_status_nonzero": 0,
+                "factor_status_max": 0,
+                "factor_kernel": "crba_sparse_factor_43_434_4",
+                "solve_kernel": "pgs_solve_sparse_100_43_18_0_0",
+                "selected_contact_producer": "populate_sparse_contact_response",
+                "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+                "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+                "double_buffer": false
+              },
+              "checks_pass": true,
+              "state_finite": true,
+              "artifact_locator": "multi-candidate-mixed/repeat-reverse/g1-candidate/g1/round_01_g1_fpgs_gpu0",
+              "artifact_sha256": {
+                "capture.json": "19b3b049432aa50fdf257f3374f52e23aa0d8cbb9074d38f634d9e50b759b9e3",
+                "capture_checks.json": "c1183f253cc81c5304757800398224082ac804bfb271ca984857e8b3b5db1a85",
+                "capture_analysis.json": "b963dd2262b5cc2909335638eb954422e1400de8292569824dfd3ff614bca871",
+                "capture.log": "2a77abce5c8ac4c887c19a2ddae5db9abb468c85d70172c9d40fbd2173de2d0e"
+              }
+            },
+            "env_fps_gain": 0.9850820759748149,
+            "main_physics_graph_gain": 0.9973940670655056
+          }
+        ],
+        "median": {
+          "prior_main_physics_graph_ms": 30.887668912499997,
+          "candidate_main_physics_graph_ms": 30.95215865,
+          "main_physics_graph_gain": 0.9979164704397765,
+          "prior_env_fps": 365499.7511386123,
+          "candidate_env_fps": 361197.06057237904,
+          "env_fps_gain": 0.9882279247719611
+        },
+        "physics_gain_range": [
+          0.9973940670655056,
+          0.9984399497292357
+        ]
+      },
+      {
+        "task": "G1 rough",
+        "task_key": "g1",
+        "gpu": "GB300",
+        "gpu_index": 1,
+        "rounds": [
+          {
+            "round": 1,
+            "order": "prior_then_extension",
+            "prior": {
+              "env_fps": 280180.73046564474,
+              "loop_ms": 58.47654109820724,
+              "main_physics_graph_ms": 44.430554375,
+              "sensor_graph_ms": 1.060323175,
+              "sparse_active": true,
+              "sparse_representation": {
+                "dofs": 43,
+                "packed_factor_nnz": 434,
+                "max_row_support": 18,
+                "factor_warps_per_block": 4,
+                "factor_status_nonzero": 0,
+                "factor_status_max": 0,
+                "factor_kernel": "crba_sparse_factor_43_434_4",
+                "solve_kernel": "pgs_solve_sparse_100_43_18",
+                "selected_contact_producer": "populate_sparse_contact_response",
+                "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+                "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+                "double_buffer": false
+              },
+              "checks_pass": true,
+              "state_finite": true,
+              "artifact_locator": "multi-baseline/g1/round_01_g1_fpgs_gpu1",
+              "artifact_sha256": {
+                "capture.json": "a0f35f14082facc27f345ff7c516b7a8ca7f9473db45ce4dff9ac8d83750f4fb",
+                "capture_checks.json": "58791c1a4c52cf842c0bd7fa8ec909ffd9e5b358af53d8c848297823dce9884b",
+                "capture_analysis.json": "ae34980ddbfdaa29e8a81900ea3f1bc0ae5301b77aa8cc33bc05fce3c0fbabf1",
+                "capture.log": "33e0baab8191aedc978df7938bfc88375656026e95e14b0276a1a06fd78b8241"
+              }
+            },
+            "candidate": {
+              "env_fps": 275496.6446429719,
+              "loop_ms": 59.4707787502557,
+              "main_physics_graph_ms": 44.984230125,
+              "sensor_graph_ms": 1.0625432000000001,
+              "sparse_active": true,
+              "sparse_representation": {
+                "dofs": 43,
+                "packed_factor_nnz": 434,
+                "max_row_support": 18,
+                "factor_warps_per_block": 4,
+                "factor_status_nonzero": 0,
+                "factor_status_max": 0,
+                "factor_kernel": "crba_sparse_factor_43_434_4",
+                "solve_kernel": "pgs_solve_sparse_100_43_18_0_0",
+                "selected_contact_producer": "populate_sparse_contact_response",
+                "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+                "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+                "double_buffer": false
+              },
+              "checks_pass": true,
+              "state_finite": true,
+              "artifact_locator": "multi-candidate-mixed/g1/g1/round_01_g1_fpgs_gpu1",
+              "artifact_sha256": {
+                "capture.json": "0a862ac552fff94e0fdbbbed1983962bdb5d98a9150672594a824c3e0efe589f",
+                "capture_checks.json": "1dcf1ab7c7c6567749e8a1ca8cedcf7dcf552cf03956f4a2886c6bf389d07a2d",
+                "capture_analysis.json": "c2220910777860293ab7eed82b45175a0aaf855db61e28d5c29c952d48765b61",
+                "capture.log": "9a16d37877e0593136db898898cbbb83281943fd1719980756e4b690baa13449"
+              }
+            },
+            "env_fps_gain": 0.9832819130177578,
+            "main_physics_graph_gain": 0.9876917811317104
+          },
+          {
+            "round": 2,
+            "order": "extension_then_prior",
+            "prior": {
+              "env_fps": 269719.7389289717,
+              "loop_ms": 60.744534549303346,
+              "main_physics_graph_ms": 44.133203925,
+              "sensor_graph_ms": 1.060808825,
+              "sparse_active": true,
+              "sparse_representation": {
+                "dofs": 43,
+                "packed_factor_nnz": 434,
+                "max_row_support": 18,
+                "factor_warps_per_block": 4,
+                "factor_status_nonzero": 0,
+                "factor_status_max": 0,
+                "factor_kernel": "crba_sparse_factor_43_434_4",
+                "solve_kernel": "pgs_solve_sparse_100_43_18",
+                "selected_contact_producer": "populate_sparse_contact_response",
+                "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+                "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+                "double_buffer": false
+              },
+              "checks_pass": true,
+              "state_finite": true,
+              "artifact_locator": "multi-candidate-mixed/repeat-reverse/g1-old/g1/round_01_g1_fpgs_gpu1",
+              "artifact_sha256": {
+                "capture.json": "813127e1ddb8cd78290596e83332c8bb9e9b77d404d601ff3f2dd803328f5fcf",
+                "capture_checks.json": "52e4a1fd20884fa63d632a184592b58454a7b87f188aedcc15e00d76c7634ce5",
+                "capture_analysis.json": "e0a613870a5aa04b007a0877131bdd89ff3c487d9d90acf5ccf2e4ee25a3ea32",
+                "capture.log": "92e25bcd8f8bb40c7330ed559364f878fea166f8aa0ba5e4d452a0830df322bd"
+              }
+            },
+            "candidate": {
+              "env_fps": 277215.1896671172,
+              "loop_ms": 59.102100500604145,
+              "main_physics_graph_ms": 44.943908,
+              "sensor_graph_ms": 1.06154395,
+              "sparse_active": true,
+              "sparse_representation": {
+                "dofs": 43,
+                "packed_factor_nnz": 434,
+                "max_row_support": 18,
+                "factor_warps_per_block": 4,
+                "factor_status_nonzero": 0,
+                "factor_status_max": 0,
+                "factor_kernel": "crba_sparse_factor_43_434_4",
+                "solve_kernel": "pgs_solve_sparse_100_43_18_0_0",
+                "selected_contact_producer": "populate_sparse_contact_response",
+                "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+                "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+                "double_buffer": false
+              },
+              "checks_pass": true,
+              "state_finite": true,
+              "artifact_locator": "multi-candidate-mixed/repeat-reverse/g1-candidate/g1/round_01_g1_fpgs_gpu1",
+              "artifact_sha256": {
+                "capture.json": "2343693f8f1340b5dfb1ddac9ed0fd5522fc1fdedd9107317bf78ca9cb4581d5",
+                "capture_checks.json": "fe25ef9db39019d4fcd6e24e9e71f60964b03d36d75ff7b9b2d00ec085023783",
+                "capture_analysis.json": "a7aaa83c8f59092fd4f4fdb0084ee54242bb8e186f7ad14d808addaaa61ad42a",
+                "capture.log": "0d8f120c41202eefef0f2e713a3c7a46bfee589a533ddd29bdc6bcd664aa9d7a"
+              }
+            },
+            "env_fps_gain": 1.027789774556023,
+            "main_physics_graph_gain": 0.9819618695597186
+          }
+        ],
+        "median": {
+          "prior_main_physics_graph_ms": 44.281879149999995,
+          "candidate_main_physics_graph_ms": 44.9640690625,
+          "main_physics_graph_gain": 0.9848281099392547,
+          "prior_env_fps": 274950.2346973082,
+          "candidate_env_fps": 276355.91715504456,
+          "env_fps_gain": 1.0051124977553987
+        },
+        "physics_gain_range": [
+          0.9819618695597186,
+          0.9876917811317104
+        ]
+      }
+    ],
+    "candidate_runtime_sha256": {
+      "solver_feather_pgs.py": "7b239a595c3418163b0d5df9d48e01dc8d3e25e71120346fd856558099a75793",
+      "sparse_contact.py": "011ab40a88eeb927eb94be3f7e46532abedfcbcc133f8d971ddd5394fd3adf17",
+      "sparse_pgs.py": "7be7d227750d500d0c12b691391ea1457145e6ed22155b03e508d8119c6714dd",
+      "sparse_mass_matrix.py": "22c4d3b5ff5fa1ac01ec471f43bdab615401e3bfe5adc1ab89160605f78af9e2"
+    }
+  },
+  "ordinary_row_storage": {
+    "task": "KukaAllegro lift",
+    "num_envs": 16384,
+    "rows_per_world": 192,
+    "units": "MiB = 2^20 bytes",
+    "prior_mib": 1392,
+    "candidate_mib": 492,
+    "reduction_mib": 900,
+    "reduction_percent": 64.65517241379311,
+    "prior_buffers": [
+      {
+        "name": "J_by_size + Y_by_size",
+        "shape": "2 × 16384 × 192 × (23 + 6)",
+        "element_bytes": 4,
+        "mib": 696
+      },
+      {
+        "name": "J_world + Y_world",
+        "shape": "2 × 16384 × 192 × 29",
+        "element_bytes": 4,
+        "mib": 696
+      }
+    ],
+    "candidate_buffers": [
+      {
+        "name": "_sparse_row_dof",
+        "shape": [
+          16384,
+          192,
+          17
+        ],
+        "element_bytes": 4,
+        "mib": 204
+      },
+      {
+        "name": "_sparse_row_factor",
+        "shape": [
+          16384,
+          192,
+          17
+        ],
+        "element_bytes": 4,
+        "mib": 204
+      },
+      {
+        "name": "_sparse_row_free_response",
+        "shape": [
+          16384,
+          192,
+          6
+        ],
+        "element_bytes": 4,
+        "mib": 72
+      },
+      {
+        "name": "_sparse_row_incident",
+        "shape": [
+          16384,
+          192
+        ],
+        "element_bytes": 4,
+        "mib": 12
+      }
+    ],
+    "scope": "Allocated large ordinary contact-row arrays only. Prior per-group and per-world arrays are separate (_jy_world_aliased=false). Excludes factors, native MF rows, velocity/mask buffers, row metadata, tiny dummy views and every other allocation. Not total process/peak VRAM or memory traffic.",
+    "evidence": [
+      "multi-baseline/kuka/round_01_kuka_fpgs_gpu0/capture.json",
+      "multi-candidate-mixed/kuka-active/kuka/round_01_kuka_fpgs_gpu0/capture_checks.json",
+      "multi-candidate-mixed/admission-kuka/admission.json"
+    ],
+    "free_response_shape_probe_sha256": "fdbdc12e6809ec6fa88cd1ae60af313642fe328270b8e3c47efe4cbfba3268e3",
+    "free_response_shape_note": "The recorded one-world constructor probe confirms [1,192,6]; full-size allocation computed with the checked 16384-world count and final source allocation expressions."
+  },
+  "kernel_activity_diagnosis": {
+    "task": "KukaAllegro lift",
+    "gpu": "GB300",
+    "prior_commit": "d5c2177d2507ed12e87d6dc628373639a8e5231b",
+    "candidate_commit": "1472112114f70e288012731a7639d69228e258de",
+    "num_envs": 16384,
+    "warmup_steps": 200,
+    "node_profile_steps": 5,
+    "cuda_graph": true,
+    "video": false,
+    "scope": "Summed GPU kernel activity per environment step; kernels can overlap. Not additive critical-path timing and not substituted for the 40-step graph qualification.",
+    "stages": [
+      {
+        "stage": "Ordinary row producer, response and clear",
+        "prior_ms": 4.639494,
+        "candidate_ms": 6.0698298
+      },
+      {
+        "stage": "PGS solve",
+        "prior_ms": 6.9601674,
+        "candidate_ms": 4.372121
+      },
+      {
+        "stage": "Factor, inverse and prediction",
+        "prior_ms": 1.5289538,
+        "candidate_ms": 0.7946368
+      },
+      {
+        "stage": "New standalone velocity decode",
+        "prior_ms": null,
+        "candidate_ms": 0.1954478,
+        "note": "Prior output work is inside other kernels, not zero"
+      }
+    ],
+    "conclusion": "Much of the large PGS saving is consumed by a slower sparse contact producer that recomputes joint-contact Jacobians across factor entries. Producer local memory is zero; this profile does not establish a spill bottleneck.",
+    "artifact_locators": [
+      "multi-candidate-mixed/profile-kuka-gb/old/kuka/round_01_kuka_fpgs_gpu1",
+      "multi-candidate-mixed/profile-kuka-gb/candidate/kuka/round_01_kuka_fpgs_gpu1"
+    ],
+    "artifact_sha256": [
+      {
+        "arm": "old",
+        "files": {
+          "multi-candidate-mixed/profile-kuka-gb/old/kuka/round_01_kuka_fpgs_gpu1/capture.json": "aebe1daf3ceb0559b1297be2ce4366a46cf73068efb9d71966e9a51b31c288f8",
+          "multi-candidate-mixed/profile-kuka-gb/old/kuka/round_01_kuka_fpgs_gpu1/capture_checks.json": "3d1310c3fd82c369b2b7281ee3f170efa306310b41c68792975603b9cdf6f886",
+          "multi-candidate-mixed/profile-kuka-gb/old/kuka/round_01_kuka_fpgs_gpu1/capture_analysis.json": "0559e5be1152ef296744c83e71927aa7771ca184fe7c3e68d31a4dc44d553821",
+          "multi-candidate-mixed/profile-kuka-gb/old/kuka/round_01_kuka_fpgs_gpu1/capture.log": "e975704dc13b3e543ea48beb0cd951a0de00bdda77c2b733e72ef4305401f3c0",
+          "benchmark_nodes.py": "8740f064864c51b06eedb111d2811a9a0703c9b5a0b1d8c9ad7251295e00c080"
+        }
+      },
+      {
+        "arm": "candidate",
+        "files": {
+          "multi-candidate-mixed/profile-kuka-gb/candidate/kuka/round_01_kuka_fpgs_gpu1/capture.json": "8afe6adb05c18e0b577f4559eb0d99f40162a58df637e4abb5532ee7697c7b7d",
+          "multi-candidate-mixed/profile-kuka-gb/candidate/kuka/round_01_kuka_fpgs_gpu1/capture_checks.json": "8adc28766ebc710b78f0b0b87d076f9b7e3f90c7f47ee82bc5da843a6332f33a",
+          "multi-candidate-mixed/profile-kuka-gb/candidate/kuka/round_01_kuka_fpgs_gpu1/capture_analysis.json": "96da51dc34bb5100ed8494ecf00baecde0dec778582807eff9d8819cb7aca3c9",
+          "multi-candidate-mixed/profile-kuka-gb/candidate/kuka/round_01_kuka_fpgs_gpu1/capture.log": "b1bed3e8bb4cdb75dd2241ebd48455b79605ea03d4975e03db8a712b20dd91e0",
+          "benchmark_nodes.py": "8740f064864c51b06eedb111d2811a9a0703c9b5a0b1d8c9ad7251295e00c080"
+        }
+      }
+    ]
+  },
+  "validation": {
+    "candidate_commit": "1472112114f70e288012731a7639d69228e258de",
+    "unit_tests_discovered": 76,
+    "unit_tests_passed": 75,
+    "unit_tests_skipped": 1,
+    "skip_reason": "Inherited obsolete drive-only warmstart fixture",
+    "all_pre_commit_hooks_passed": true,
+    "test_evidence": "Reported by the executing test agent from tool output on clean final147; no separate retained log file",
+    "coverage": [
+      "Independent physical-coordinate dense oracle for sparse factors, mixed factor/physical contact rows and PGS sweeps",
+      "Robot/object, object/object, static and self contact; endpoint and articulation ordering",
+      "Nonzero COM and rotated anisotropic inertia; multiple same-topology robots per world",
+      "Prescribed moving support; separate robot-only and free-only worlds",
+      "CUDA graph replay, partial reset, mass notification",
+      "Native MF type-4 stateless velocity limits and zero-MF-capacity ordinary free responses"
+    ],
+    "portable_adapter_cpu_checks": {
+      "help": true,
+      "full20_plan_only_gpu_indices": [
+        0,
+        1
+      ],
+      "negative_gpu_index_rejected": true,
+      "gpu_measurement_performed": false
+    },
+    "test_modules": [
+      "newton.tests.test_feather_pgs_sparse_mass_matrix",
+      "newton.tests.test_feather_pgs_sparse_contacts",
+      "newton.tests.test_feather_pgs_sparse_pgs",
+      "newton.tests.test_feather_pgs_sparse_solver",
+      "newton.tests.test_feather_pgs_contact_controls",
+      "newton.tests.test_feather_pgs_mimic",
+      "newton.tests.test_feather_pgs_connect",
+      "newton.tests.test_feather_pgs_springs",
+      "newton.tests.test_feather_pgs_preelim"
+    ],
+    "final20_captures_accepted": 20,
+    "final20_boundary_checks_passed": 40,
+    "final20_artifact_sha256_reverified": 80,
+    "artifact_verification_evidence": "Executing benchmark agent re-read and verified all 80 stored capture/check/analysis/log hashes after completion."
+  },
+  "limitations": [
+    "Current implementation supports one shared responding articulated topology/size, plus independent free6 bodies and prescribed endpoints; multiple same-topology articulations may share a world.",
+    "The 64-bit ancestry representation and single-topology group are unfinished representation work, not physical limitations. Unsupported native solver features retain the existing path rather than being disabled.",
+    "Accepted finite-state/constraint/sticky-row/full-log checks and collision boundary snapshots do not establish lifetime no-drop, numerical convergence over all workloads, or training equivalence.",
+    "Seed equality does not imply identical trajectories after floating-point reordering.",
+    "Full raw captures remain local; artifact locators are relative to the local sparse-results directory, not bundled downloadable files."
+  ],
+  "bundle_files_sha256": {
+    "README.md": "60a30dfaaa6adaa593ef342ffe5a3d1dc4e282d136dc4ecb3ef4c230c59db6c1",
+    "benchmark.py": "b199834dc22fdafc2c44627222fd76c9be53979563c9734b581253e73b912726",
+    "capture_adapter.py": "289f0589856cc771d2b039a3e72e5c7f3a5e19806a5ac42f6af7cab17d957ee6",
+    "launch_capture.py": "6c73630c9e1ce17670a15607314899df2db1bc993413425fbaaff3fe18004ac6",
+    "capacities.json": "11d0f9386aaaeac86e518cdc2508108be8effd7fc1cb15109d35bfaef73f6fb2",
+    "helpers/compare_backends.py": "469dff08a2ad7ebcc46675265ec3baa206b17edba1f11a5e37770f5803869986",
+    "helpers/checked_capture.py": "91f906b34416a91bf600db04b3249c24e6160597b11aecbcabc46d59db9e9620",
+    "helpers/nsys_checked.sh": "b42d86aa5151109b302ee8d244a95c015e76aa740b0fa5e8ba1d98c8a16038a4"
+  },
+  "bundle_adapter_changes": [
+    "Portable benchmark adds --gpu-index, default0 and nonnegative, with mandatory matching GPU UUID; no physics loop or retained-helper changes",
+    "Both device selections passed CPU-only full20 --plan-only against clean147; no new GPU capture was run with this portable adapter"
+  ],
+  "native20_completed": 20
+}
