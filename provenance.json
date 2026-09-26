@@ -1,0 +1,81 @@
+{
+  "stage": "complete_matched20_repeat_and_matrix_free_evidence",
+  "baseline_commit": "5238407d320823e71a5a4623c2c83c293d7b00fd",
+  "isaaclab_commit": "53ee6b44c2334341305dbdf385a3916c6b140799",
+  "isaaclab_source_diff_sha256": "cfd75b639b9f38b3b509853e8009a915c754fb4c4757c40d5264590ca5bca15a",
+  "helper_commit": "9233cffd6a4729c71a864e2ec2621c6d6d6de604",
+  "exact_capture_driver_copies": false,
+  "files_sha256": {
+    ".gitignore": "862263fa1f46c20f0d1e4dac5ffcc75abd55c08211b2c3864c5f8764b9d87793",
+    "README.md": "dd6801221f26a95a7e5bdd12814c9a28c19229e2c3296a7e38b8080de6ddde4a",
+    "results.md": "27e352e1758d69ac090ab64024ee32ec99eb374c00798b71e6e947eb5dfebd13",
+    "results.json": "04bed3c47540716baad9da1f88eff0ee7c229cba655cc43c6b92fcc716343388",
+    "benchmark.py": "a2a5f96138b19cd486d5e29f27c3ada61cca8e8658c3a10d706428db998e7459",
+    "capture_adapter.py": "289f0589856cc771d2b039a3e72e5c7f3a5e19806a5ac42f6af7cab17d957ee6",
+    "launch_capture.py": "6c73630c9e1ce17670a15607314899df2db1bc993413425fbaaff3fe18004ac6",
+    "helpers/compare_backends.py": "469dff08a2ad7ebcc46675265ec3baa206b17edba1f11a5e37770f5803869986",
+    "helpers/checked_capture.py": "91f906b34416a91bf600db04b3249c24e6160597b11aecbcabc46d59db9e9620",
+    "helpers/nsys_checked.sh": "b42d86aa5151109b302ee8d244a95c015e76aa740b0fa5e8ba1d98c8a16038a4",
+    "capacities.json": "11d0f9386aaaeac86e518cdc2508108be8effd7fc1cb15109d35bfaef73f6fb2",
+    "isaaclab.patch": "7d514d9d368a295f0525789725a1f7bec0423caf82bbda23621fe92aadedc6ee",
+    "LICENSE-Newton.md": "a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9",
+    "LICENSE-IsaacLab.txt": "6acf26ea8f8c42c454e30e9ad4206bd90d8fce85a54c011568faaf10c7ccab61"
+  },
+  "candidate_commit": "d5c2177d2507ed12e87d6dc628373639a8e5231b",
+  "capture_driver_sha256": {
+    "benchmark.py": "528dff0612a060d92a7b57858a1a795ce36c45464a285947e2c26e1b831929aa",
+    "capture_adapter.py": "fa09ab6b70fe037b07350af996dbb517ccb3c0674d49c508cb63d266de1a519f",
+    "launch_capture.py": "6c73630c9e1ce17670a15607314899df2db1bc993413425fbaaff3fe18004ac6"
+  },
+  "portable_adapter_changes": [
+    "Explicit Lab, Newton, capacity-file and GPU0 UUID inputs instead of machine-local absolute paths",
+    "Helpers resolve relative to bundled adapters",
+    "Reject dirty admission of clean-main commit",
+    "Remove stale absolute historical Franka blocker link; no workload or timing changes",
+    "Portable per-task capacity JSON encodes the accepted Keyboard736 retry; all other effective capacities unchanged"
+  ],
+  "validation": {
+    "reported_by": "root agent after running tests on candidate source",
+    "sparse_cpu_gpu_tests_passed": 22,
+    "scope": [
+      "43-DOF GPU oracle",
+      "32 full dense/sparse integration steps",
+      "CUDA graph replay",
+      "partial resets",
+      "inertial notification",
+      "sparse mass-matrix, contact-row, PGS and solver tests"
+    ],
+    "all_pre_commit_hooks_passed": true,
+    "broader_existing_feature_tests": {
+      "passed": 43,
+      "skipped": 1,
+      "skip_reason": "Inherited explicit skip: obsolete drive-only warmstart fixture"
+    },
+    "positive_load_fixture": {
+      "steps": 32,
+      "steps_with_positive_normal_load": 6,
+      "max_normal_impulse": 0.5316953,
+      "max_tangent_impulse": 0.4253562
+    },
+    "portable_full20_plan_only_passed": true,
+    "current_study_captures_accepted": 52,
+    "excluded_capacity_failure_attempts": 1,
+    "additional_balanced_capture_checks_passed": 8,
+    "matched_matrix_free_capture_checks_passed": 4
+  },
+  "software": {
+    "python": "3.12.14",
+    "warp": "1.17.0",
+    "torch": "2.11.0+cu130",
+    "mujoco": "3.12.0",
+    "mujoco_warp": "3.12.0",
+    "nsight_systems": "2025.6.3.541-256337736014v0",
+    "nvidia_driver": "610.43.03"
+  },
+  "initial_first5_capture_driver_sha256": {
+    "benchmark.py": "ebdbf13b0c63e90fd1f5dd15af1c2fa78cccc94d803074b633da330b4c56b504",
+    "capture_adapter.py": "ea14382c63f855e6bdc054cad8924404780f9cf5b4397efec06b6a437a2f5459",
+    "launch_capture.py": "6c73630c9e1ce17670a15607314899df2db1bc993413425fbaaff3fe18004ac6"
+  },
+  "capture_driver_revision_note": "capture_driver_sha256 refers to the later frozen driver used by the remaining baseline tasks, all final candidate tasks, repeats and MF supplements. The first five driver preceded CLI controls and sparse-storage metadata; retained timed/capture helpers were byte-identical, and all 20 effective configurations matched."
+}

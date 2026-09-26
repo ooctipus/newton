@@ -1,0 +1,97 @@
+diff --git a/source/isaaclab/isaaclab/terrains/terrain_importer.py b/source/isaaclab/isaaclab/terrains/terrain_importer.py
+index ec124b4ef..4949e88c0 100644
+--- a/source/isaaclab/isaaclab/terrains/terrain_importer.py
++++ b/source/isaaclab/isaaclab/terrains/terrain_importer.py
+@@ -197,8 +197,8 @@ class TerrainImporter:
+         Args:
+             name: The name of the imported terrain. This name is used to create the USD prim
+                 corresponding to the terrain.
+-            size: The visual size of the plane [m]. If None, the visual mesh covers the configured
+-                environment grid with a 100 m minimum. The collision plane remains infinite.
++            size: The visual size of the plane [m]. If None, the visual mesh extends 50 m beyond
++                each side of the configured environment grid. The collision plane remains infinite.
+ 
+         Raises:
+             ValueError: If a terrain with the same name already exists.
+@@ -262,11 +262,11 @@ class TerrainImporter:
+         )
+ 
+     def _compute_ground_plane_size(self) -> tuple[float, float]:
+-        """Compute a bounded visual plane size that covers the environment grid [m]."""
++        """Cover the environment grid with 50 m of visual walking room on each side [m]."""
+         num_rows = int(np.ceil(self.cfg.num_envs / np.sqrt(self.cfg.num_envs)))
+         num_cols = int(np.ceil(self.cfg.num_envs / num_rows))
+         spacing = self.cfg.env_spacing or 0.0
+-        return (max(100.0, (num_rows + 1) * spacing), max(100.0, (num_cols + 1) * spacing))
++        return ((num_rows - 1) * spacing + 100.0, (num_cols - 1) * spacing + 100.0)
+ 
+     def _is_heightfield_collider_requested(self, cfg: TerrainGeneratorCfg) -> bool:
+         """Check whether the generated terrain should be collided against as a heightfield.
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/contrib/keyboard/so101_env_cfg.py b/source/isaaclab_tasks/isaaclab_tasks/contrib/keyboard/so101_env_cfg.py
+index 02a07643d..e96cfdf10 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/contrib/keyboard/so101_env_cfg.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/contrib/keyboard/so101_env_cfg.py
+@@ -84,6 +84,17 @@ class SO101SceneCfg(InteractiveSceneCfg):
+ 
+     robot: ArticulationCfg = SO101_CFG.replace(
+         prim_path="{ENV_REGEX_NS}/Robot",
++        # Keep the task's historical reset-IK seed independent of shared asset defaults.
++        init_state=SO101_CFG.init_state.replace(
++            joint_pos={
++                "shoulder_pan": 0.0,
++                "shoulder_lift": 0.0,
++                "elbow_flex": 0.0,
++                "wrist_flex": 0.0,
++                "wrist_roll": 0.0,
++                "gripper": 0.0,
++            },
++        ),
+         spawn=SO101_CFG.spawn.replace(
+             variants={
+                 "Robot": "robot",
+diff --git a/source/isaaclab_tasks/changelog.d/so101-keyboard-reset-seed.rst b/source/isaaclab_tasks/changelog.d/so101-keyboard-reset-seed.rst
+new file mode 100644
+index 000000000..9ed23eae8
+--- /dev/null
++++ b/source/isaaclab_tasks/changelog.d/so101-keyboard-reset-seed.rst
+@@ -0,0 +1,6 @@
++Fixed
++^^^^^
++
++* Restored the SO101 Keyboard task's zero joint-position reset seed independently
++  of shared robot asset defaults. Other SO101 tasks retained their existing
++  defaults; reset IK budgets and randomization were unchanged.
+diff --git a/source/isaaclab_tasks/test/contrib/test_keyboard_env_cfg.py b/source/isaaclab_tasks/test/contrib/test_keyboard_env_cfg.py
+new file mode 100644
+index 000000000..cd2205e03
+--- /dev/null
++++ b/source/isaaclab_tasks/test/contrib/test_keyboard_env_cfg.py
+@@ -0,0 +1,28 @@
++# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
++# All rights reserved.
++#
++# SPDX-License-Identifier: BSD-3-Clause
++
++"""Tests for task-local SO101 keyboard reset defaults."""
++
++import pytest
++
++import isaaclab_tasks  # noqa: F401
++from isaaclab_tasks.utils import parse_env_cfg
++
++from isaaclab_assets.robots.so101 import SO101_CFG
++
++
++@pytest.mark.parametrize("physics", ("newton_mjwarp", "feather_pgs", "isaacsim_physx"))
++def test_keyboard_zero_joint_defaults_are_task_local(physics):
++    """Every backend uses the original zero pose without changing the shared asset."""
++    shared_joint_pos = SO101_CFG.init_state.joint_pos.copy()
++
++    cfg = parse_env_cfg("IsaacContrib-Keyboard-SO101", device="cpu", num_envs=1, overrides=[f"physics={physics}"])
++
++    assert cfg.scene.robot.init_state.joint_pos == dict.fromkeys(
++        ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"), 0.0
++    )
++    assert SO101_CFG.init_state.joint_pos == shared_joint_pos
++    cfg.scene.robot.init_state.joint_pos["shoulder_pan"] = 0.5
++    assert SO101_CFG.init_state.joint_pos == shared_joint_pos

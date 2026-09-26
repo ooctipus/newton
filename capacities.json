@@ -1,0 +1,121 @@
+{
+  "source_summary_sha256": "eccb841a68d99dc994d55b58ae1015600d5d4754241c54a080b33252e6f4d335",
+  "base_num_envs": 4096,
+  "accepted_adjustments": {"keyboard-so101": {"historical_dense_rows": 704, "matched_dense_rows": 736, "reason": "704-row main capture reported 705 requested rows and dropped-row flags; both 736-row retries passed."}},
+  "tasks": {
+    "franka": {
+      "capacity_overrides": []
+    },
+    "kuka": {
+      "capacity_overrides": [
+        "kuka:fpgs:rigid_contact_max=77824"
+      ]
+    },
+    "allegro": {
+      "capacity_overrides": [
+        "allegro:fpgs:rigid_contact_max=71680"
+      ]
+    },
+    "anymald": {
+      "capacity_overrides": [
+        "anymald:fpgs:rigid_contact_max=53248",
+        "anymald:fpgs:dense_max_constraints=72"
+      ]
+    },
+    "g1": {
+      "capacity_overrides": [
+        "g1:fpgs:rigid_contact_max=73728",
+        "g1:fpgs:dense_max_constraints=100",
+        "g1:fpgs:max_triangle_pairs=442368"
+      ]
+    },
+    "keyboard-so101": {
+      "capacity_overrides": [
+        "keyboard-so101:fpgs:rigid_contact_max=147456",
+        "keyboard-so101:fpgs:dense_max_constraints=736"
+      ]
+    },
+    "ant": {
+      "capacity_overrides": [
+        "ant:fpgs:rigid_contact_max=16896",
+        "ant:fpgs:dense_max_constraints=64"
+      ]
+    },
+    "anymald-rough": {
+      "capacity_overrides": [
+        "anymald-rough:fpgs:rigid_contact_max=141568",
+        "anymald-rough:fpgs:dense_max_constraints=192",
+        "anymald-rough:fpgs:max_triangle_pairs=2863104"
+      ]
+    },
+    "cartpole": {
+      "capacity_overrides": [
+        "cartpole:fpgs:rigid_contact_max=4096",
+        "cartpole:fpgs:dense_max_constraints=8"
+      ]
+    },
+    "cassie-flat": {
+      "capacity_overrides": [
+        "cassie-flat:fpgs:rigid_contact_max=20992",
+        "cassie-flat:fpgs:dense_max_constraints=40"
+      ]
+    },
+    "cassie-rough": {
+      "capacity_overrides": [
+        "cassie-rough:fpgs:rigid_contact_max=46592",
+        "cassie-rough:fpgs:dense_max_constraints=80",
+        "cassie-rough:fpgs:max_triangle_pairs=987136"
+      ]
+    },
+    "franka-reach": {
+      "capacity_overrides": [
+        "franka-reach:fpgs:rigid_contact_max=23552",
+        "franka-reach:fpgs:dense_max_constraints=64"
+      ]
+    },
+    "g1-flat": {
+      "capacity_overrides": [
+        "g1-flat:fpgs:rigid_contact_max=49152",
+        "g1-flat:fpgs:dense_max_constraints=56"
+      ]
+    },
+    "go2-flat": {
+      "capacity_overrides": [
+        "go2-flat:fpgs:rigid_contact_max=30208",
+        "go2-flat:fpgs:dense_max_constraints=96"
+      ]
+    },
+    "go2-rough": {
+      "capacity_overrides": [
+        "go2-rough:fpgs:rigid_contact_max=80384",
+        "go2-rough:fpgs:dense_max_constraints=184",
+        "go2-rough:fpgs:max_triangle_pairs=2056192"
+      ]
+    },
+    "h1-flat": {
+      "capacity_overrides": [
+        "h1-flat:fpgs:rigid_contact_max=25856",
+        "h1-flat:fpgs:dense_max_constraints=48"
+      ]
+    },
+    "h1-rough": {
+      "capacity_overrides": [
+        "h1-rough:fpgs:rigid_contact_max=59136",
+        "h1-rough:fpgs:dense_max_constraints=88",
+        "h1-rough:fpgs:max_triangle_pairs=864256"
+      ]
+    },
+    "humanoid": {
+      "capacity_overrides": [
+        "humanoid:fpgs:rigid_contact_max=24832",
+        "humanoid:fpgs:dense_max_constraints=128"
+      ]
+    },
+    "ur10-reach": {
+      "capacity_overrides": [
+        "ur10-reach:fpgs:rigid_contact_max=14848",
+        "ur10-reach:fpgs:dense_max_constraints=16"
+      ]
+    }
+  }
+}
