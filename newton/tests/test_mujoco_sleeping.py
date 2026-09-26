@@ -3,6 +3,7 @@
 
 """Tests for optional MuJoCo Warp sleeping support."""
 
+import inspect
 import unittest
 
 import numpy as np
@@ -10,6 +11,7 @@ import warp as wp
 
 import newton
 from newton import ModelFlags
+from newton._src.solvers.mujoco import kernels
 from newton.solvers import SolverMuJoCo
 
 
@@ -110,6 +112,172 @@ def _build_selective_wake_model() -> newton.Model:
 
 
 class TestMuJoCoSleeping(unittest.TestCase):
+    def test_sleep_ownership_stays_in_mjwarp(self):
+        """Reject duplicate Newton sleep transitions and dormant contact caches."""
+        for name in (
+            "reset_sleeping_state_kernel",
+            "restore_sleeping_state_kernel",
+            "wake_changed_trees_kernel",
+            "wake_contact_trees_kernel",
+        ):
+            self.assertFalse(hasattr(kernels, name), name)
+        source = inspect.getsource(SolverMuJoCo)
+        for name in ("_body_sleep_override", "dormant_contact"):
+            self.assertNotIn(name, source)
+
+    def test_policy_and_reset_use_model_device(self):
+        """Policy and reset methods work when the model is on a non-current GPU."""
+        if len(wp.get_cuda_devices()) < 2:
+            self.skipTest("Requires two CUDA devices")
+        with wp.ScopedDevice("cuda:1"):
+            model, solver, state, *_ = self._make_sim(enable_sleeping=True)
+        selected = wp.array([0], dtype=wp.int32, device=model.device)
+        solver.set_body_sleep_policy(selected, solver.SleepPolicy.ALWAYS)
+        solver.notify_model_changed(ModelFlags.BODY_INERTIAL_PROPERTIES)
+        solver.reset(state)
+        np.testing.assert_array_equal(solver.mjw_data.tree_awake.numpy(), [[0]])
+
+    def test_property_change_wakes_only_selected_world(self):
+        """Changing inertia in one world preserves ordinary sleep in its untouched neighbor."""
+        model, solver, state, state_out, control, contacts = self._make_sim(world_count=2, enable_sleeping=True)
+        self._sleep_all(solver, state, state_out, control, contacts)
+        np.testing.assert_array_equal(solver.mjw_data.tree_awake.numpy(), [[0], [0]])
+        untouched = solver.mjw_data.tree_asleep.numpy()[1].copy()
+        model.body_mass.assign([2.0, 1.0])
+        solver.notify_model_changed(
+            ModelFlags.BODY_INERTIAL_PROPERTIES, world_mask=wp.array([True, False, False], dtype=wp.bool)
+        )
+        np.testing.assert_array_equal(solver.mjw_data.tree_awake.numpy(), [[1], [0]])
+        np.testing.assert_array_equal(solver.mjw_data.tree_asleep.numpy()[1], untouched)
+        self.assertEqual(solver.mjw_model.body_mass.numpy()[0, 1], 2.0)
+
+    def test_partitioned_keyboard_capacity_and_captured_policy_changes(self):
+        """Run 6, 36, and 108 active sliders using the same eighteen six-key partitions."""
+        template = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        moving = []
+        for partition in range(18):
+            root = template.add_link()
+            joints = [template.add_joint_fixed(-1, root)]
+            for key in range(6):
+                body = template.add_link()
+                moving.append(body)
+                template.add_shape_box(body, hx=0.003, hy=0.004, hz=0.001)
+                joints.append(
+                    template.add_joint_prismatic(
+                        root,
+                        body,
+                        axis=(0.0, 0.0, 1.0),
+                        parent_xform=wp.transform(((partition * 6 + key) * 0.02, 0.0, 0.0), wp.quat_identity()),
+                    )
+                )
+            template.add_articulation(joints)
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        for world in range(3):
+            builder.add_world(template, xform=wp.transform((0.0, world * 0.2, 0.0), wp.quat_identity()))
+        model = builder.finalize()
+        pipeline = newton.CollisionPipeline(model, broad_phase="sap")
+        solver = SolverMuJoCo(model, enable_sleeping=True, use_mujoco_contacts=False, collision_pipeline=pipeline)
+        all_keys = wp.array([body + world * 126 for world in range(3) for body in moving], dtype=wp.int32)
+        active_keys = wp.array(
+            [body + world * 126 for world, count in enumerate((6, 36, 108)) for body in moving[:count]], dtype=wp.int32
+        )
+        state, state_out = model.state(), model.state()
+        contacts, control = pipeline.contacts(), model.control()
+        solver.set_body_sleep_policy(all_keys, solver.SleepPolicy.ALWAYS)
+        solver.set_body_sleep_policy(active_keys, solver.SleepPolicy.NEVER)
+        solver.step(state, state_out, control, contacts, 0.001)
+        with wp.ScopedCapture() as capture:
+            solver.set_body_sleep_policy(all_keys, solver.SleepPolicy.ALWAYS)
+            solver.set_body_sleep_policy(active_keys, solver.SleepPolicy.NEVER)
+            solver.step(state, state_out, control, contacts, 0.001)
+        wp.capture_launch(capture.graph)
+        np.testing.assert_array_equal(solver.mjw_data.nv_awake.numpy(), [6, 36, 108])
+        np.testing.assert_array_equal(solver.mjw_data.overflow.numpy(), 0)
+        self.assertEqual(solver.mjw_model.ntree, 108)
+
+        # Change physical parameters in one world through the existing property-update API.
+        unchanged_qpos = solver.mjw_data.qpos.numpy()[1:].copy()
+        scales = model.shape_scale.numpy()
+        scales[0] *= 2
+        model.shape_scale.assign(scales)
+        mask = wp.array([True, False, False, False], dtype=wp.bool)
+        solver.notify_model_changed(ModelFlags.SHAPE_PROPERTIES, world_mask=mask)
+        np.testing.assert_allclose(solver.mjw_model.geom_aabb.numpy()[0, 0, 1], scales[0])
+        np.testing.assert_allclose(solver.mjw_model.geom_rbound.numpy()[0, 0], np.linalg.norm(scales[0]))
+        np.testing.assert_array_equal(solver.mjw_data.nv_awake.numpy(), [6, 36, 108])
+        solver.reset(state, world_mask=mask)
+        np.testing.assert_array_equal(solver.mjw_data.nv_awake.numpy(), [6, 36, 108])
+        np.testing.assert_array_equal(solver.mjw_data.qpos.numpy()[1:], unchanged_qpos)
+        self.assertEqual(solver.mjw_data.nvmax, 108)
+        solver.set_body_sleep_policy(all_keys, solver.SleepPolicy.ALWAYS)
+        solver.step(state, state_out, control, contacts, 0.001)
+        np.testing.assert_array_equal(solver.mjw_data.nv_awake.numpy(), 0)
+        np.testing.assert_array_equal(solver.mjw_data.overflow.numpy(), 0)
+        self.assertEqual(contacts.rigid_contact_count.numpy()[0], 0)
+        self.assertTrue(np.isfinite(state_out.joint_q.numpy()).all())
+
+    def test_newton_contacts_wake_and_restore_support_in_same_step(self):
+        """A waking collision restores floor support without duplicating the first pass."""
+        for broad_phase in ("nxn", "sap", "explicit"):
+            with self.subTest(broad_phase=broad_phase):
+                builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+                for x in (0.0, -0.19):
+                    body = builder.add_link(xform=wp.transform((x, 0.0, 0.099), wp.quat_identity()))
+                    builder.add_shape_sphere(body=body, radius=0.1)
+                    builder.add_articulation([builder.add_joint_free(child=body)])
+                builder.add_ground_plane()
+                model = builder.finalize()
+                pipeline = newton.CollisionPipeline(model, broad_phase=broad_phase)
+                solver = SolverMuJoCo(
+                    model, enable_sleeping=True, use_mujoco_contacts=False, collision_pipeline=pipeline, iterations=2
+                )
+                state, state_out = model.state(), model.state()
+                contacts = pipeline.contacts()
+                solver._mujoco_warp.reset_sleep(
+                    solver.mjw_model,
+                    solver.mjw_data,
+                    initial_tree_asleep=wp.array([[0, -11]], dtype=wp.int32, device=model.device),
+                )
+                solver.step(state, state_out, model.control(), contacts, 0.001)
+                np.testing.assert_array_equal(solver.mjw_data.tree_awake.numpy(), [[1, 1]])
+                count = int(contacts.rigid_contact_count.numpy()[0])
+                pairs = list(
+                    zip(
+                        contacts.rigid_contact_shape0.numpy()[:count],
+                        contacts.rigid_contact_shape1.numpy()[:count],
+                        strict=True,
+                    )
+                )
+                self.assertEqual({tuple(sorted(pair)) for pair in pairs}, {(0, 1), (0, 2), (1, 2)})
+                self.assertEqual(len(pairs), 3)
+                solver.set_body_sleep_policy(
+                    wp.array([0], dtype=wp.int32, device=model.device), solver.SleepPolicy.ALWAYS
+                )
+                solver.step(state_out, state, model.control(), contacts, 0.001)
+                count = int(contacts.rigid_contact_count.numpy()[0])
+                self.assertNotIn(0, contacts.rigid_contact_shape0.numpy()[:count])
+                self.assertNotIn(0, contacts.rigid_contact_shape1.numpy()[:count])
+                np.testing.assert_array_equal(solver.mjw_data.tree_awake.numpy(), [[0, 1]])
+
+    def test_per_world_permanent_sleep_survives_reset_and_model_changes(self):
+        """Preserve disabled trees through resets, pose edits, and property notifications."""
+        model, solver, state, state_out, control, contacts = self._make_sim(world_count=2, enable_sleeping=True)
+        selected = wp.array([0], dtype=wp.int32, device=model.device)
+        solver.set_body_sleep_policy(selected, SolverMuJoCo.SleepPolicy.ALWAYS)
+        np.testing.assert_array_equal(solver.mjw_data.tree_awake.numpy(), [[0], [1]])
+        state.joint_qd.fill_(3.0)
+        state.joint_q.fill_(0.2)
+        solver.step(state, state_out, control, contacts, 0.01)
+        np.testing.assert_array_equal(solver.mjw_data.tree_awake.numpy(), [[0], [1]])
+        self.assertEqual(state_out.joint_qd.numpy()[0], 0.0)
+        self.assertAlmostEqual(state_out.joint_q.numpy()[0], 0.2)
+        solver.notify_model_changed(ModelFlags.BODY_INERTIAL_PROPERTIES)
+        solver.reset(state, flags=0)
+        np.testing.assert_array_equal(solver.mjw_data.tree_awake.numpy(), [[0], [1]])
+        self.assertEqual(solver.mjw_data.qvel.numpy()[0, 0], 0.0)
+        solver.set_body_sleep_policy(selected, SolverMuJoCo.SleepPolicy.ALLOWED)
+        np.testing.assert_array_equal(solver.mjw_data.tree_awake.numpy(), [[1], [1]])
+
     def _make_sim(self, *, world_count: int = 1, **solver_kwargs):
         model = _build_sleep_model(world_count)
         solver = SolverMuJoCo(
@@ -227,7 +395,7 @@ class TestMuJoCoSleeping(unittest.TestCase):
             ],
         )
         np.testing.assert_array_equal(
-            solver.mjw_model.tree_sleep_policy.numpy(),
+            solver.mjw_model.tree_sleep_policy.numpy()[0],
             [
                 mujoco_policy.mjSLEEP_AUTO_ALLOWED,
                 mujoco_policy.mjSLEEP_AUTO_NEVER,
