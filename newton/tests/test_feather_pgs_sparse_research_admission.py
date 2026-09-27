@@ -1,0 +1,240 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+"""Keep general sparse dynamics distinct from retained research representations."""
+
+import os
+import unittest
+from types import SimpleNamespace
+from unittest import mock
+
+import numpy as np
+import warp as wp
+
+import newton
+from newton._src.solvers.feather_pgs import solver_feather_pgs
+from newton.solvers import SolverFeatherPGS
+
+
+class _TopologyReached(Exception):
+    pass
+
+
+class _AdmissionProbe(SimpleNamespace):
+    @property
+    def _model_plan(self):
+        # Stop after admission, before any factor planning or device allocation.
+        raise _TopologyReached
+
+
+def _eligible_solver():
+    """Provide only the host fields needed before topology planning starts."""
+    return _AdmissionProbe(
+        _kernel_overrides={},
+        pgs_mode="matrix_free",
+        articulated_contact_response="immediate",
+        pgs_schedule="interleaved",
+        drive_mode="augmented",
+        _parallel_augmented_drive_topology=True,
+        friction_mode="current",
+        pgs_iterations=8,
+        pgs_velocity_iterations=0,
+        enable_joint_velocity_limits=False,
+        pgs_warmstart=False,
+        _mf_warmstart_enabled=False,
+        _debug_buffers_enabled=False,
+        _regularization_enabled=False,
+        _preelim_active=False,
+        _contact_torsion_enabled=False,
+        _friction_anchors_enabled=False,
+        contact_compliance=False,
+        _mimic_count=0,
+        _connect_count=0,
+        _has_loop_joints=False,
+        _sparse_diagonal_contact_solve=False,
+        grouped_dynamics=False,
+        _has_free_rigid_bodies=False,
+        mf_gs_parallel_rows=0,
+        mf_gs_incremental_rows=32,
+        mf_gs_response_block_rows=0,
+    )
+
+
+def _branched_model(branches, depth, device):
+    """Build equal-DOF trees with different widths, without loading task assets."""
+    scene = newton.ModelBuilder()
+    root = scene.add_link(mass=2.0, inertia=wp.mat33(np.eye(3)))
+    joints = [scene.add_joint_free(root)]
+    for branch in range(branches):
+        parent = root
+        for level in range(depth):
+            child = scene.add_link(mass=0.5, inertia=wp.mat33(np.eye(3) * 0.1))
+            joints.append(
+                scene.add_joint_revolute(
+                    parent,
+                    child,
+                    axis=newton.Axis.Y,
+                    parent_xform=wp.transform(wp.vec3(0.1, 0.1 * branch, -0.1), wp.quat_identity()),
+                    target_ke=20.0,
+                    target_kd=2.0,
+                    armature=0.1,
+                )
+            )
+            if level == depth - 1:
+                scene.add_shape_sphere(child, radius=0.04)
+            parent = child
+    scene.add_articulation(joints)
+    builder = newton.ModelBuilder()
+    builder.replicate(scene, 2)
+    return builder.finalize(device=device)
+
+
+class TestSparseResearchAdmission(unittest.TestCase):
+    def test_general_sparse_admission_reaches_topology(self):
+        """Keep ordinary eligible trees on the general sparse selection path."""
+        solver = _eligible_solver()
+        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
+        with mock.patch.dict(os.environ, {}, clear=True), self.assertRaises(_TopologyReached):
+            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+
+    def test_point_research_requests_keep_ownership(self):
+        """Do not replace buffers needed by an explicitly requested point-contact owner."""
+        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
+        for option in (
+            "LOCAL_ROW_PACKETS",
+            "ALLEGRO_KINETIC_ROWS",
+            "KUKA_JOINT_WORLD",
+            "SINGLE_FACTOR",
+            "SPARSE_FACTOR",
+            "KUKA_KINETIC_WORLD",
+            "FRANKA_KINETIC_STATE",
+            "INDEPENDENT_COMPONENTS",
+            "WORLD_SCAN_PUBLICATION",
+            "PAIRED_GENERAL_OVERLAP",
+        ):
+            with self.subTest(option=option), mock.patch.dict(os.environ, {f"FEATHER_PGS_{option}": "1"}, clear=True):
+                solver = _eligible_solver()
+                SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+                self.assertIsNone(solver._sparse_mass_matrix_size)
+
+    def test_inactive_point_request_does_not_block_patch_sparse(self):
+        """Keep general patch support when the requested point-only owner cannot run."""
+        solver = _eligible_solver()
+        solver._friction_anchors_enabled = True
+        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
+        with (
+            mock.patch.dict(os.environ, {"FEATHER_PGS_SPARSE_FACTOR": "1"}, clear=True),
+            self.assertRaises(_TopologyReached),
+        ):
+            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+
+    def test_contact_writer_requests_do_not_block_sparse(self):
+        """Allow general sparse producers to supersede optional canonical row writers."""
+        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
+        for option in ("ROWS_MASKED", "ROWS_NATIVE", "ROWS_FUSED"):
+            with (
+                self.subTest(option=option),
+                mock.patch.dict(os.environ, {f"FEATHER_PGS_{option}": "1"}, clear=True),
+                self.assertRaises(_TopologyReached),
+            ):
+                SolverFeatherPGS._setup_sparse_mass_matrix(_eligible_solver(), model)
+
+    def test_grouped_dynamics_keeps_existing_factor_owner(self):
+        """Preserve grouped dynamics before general sparse setup replaces dense factor buffers."""
+        solver = _eligible_solver()
+        solver.grouped_dynamics = True
+        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+        self.assertIsNone(solver._sparse_mass_matrix_size)
+
+    def test_multiblock_request_keeps_existing_owner(self):
+        """Leave explicit multiblock selection and its feature validation on the existing path."""
+        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
+        for patches in (False, True):
+            with (
+                self.subTest(patches=patches),
+                mock.patch.dict(os.environ, {"FEATHER_PGS_MF_MULTIBLOCK": "1"}, clear=True),
+            ):
+                solver = _eligible_solver()
+                solver._friction_anchors_enabled = patches
+                SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+                self.assertIsNone(solver._sparse_mass_matrix_size)
+
+    def test_implicit_gyro_only_reserves_worlds_with_free_bodies(self):
+        """Keep the alternative gyro owner without rejecting an inactive no-free-body request."""
+        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
+        with mock.patch.dict(os.environ, {"FEATHER_PGS_FREE_BODY_IMPLICIT_GYRO": "1"}, clear=True):
+            solver = _eligible_solver()
+            with self.assertRaises(_TopologyReached):
+                SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+            solver._has_free_rigid_bodies = True
+            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+            self.assertIsNone(solver._sparse_mass_matrix_size)
+
+    def test_explicit_schedules_keep_their_solve_budget(self):
+        """Do not silently replace a requested parallel or response-block solve."""
+        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
+        for name in ("mf_gs_parallel_rows", "mf_gs_response_block_rows"):
+            with self.subTest(name=name), mock.patch.dict(os.environ, {}, clear=True):
+                solver = _eligible_solver()
+                setattr(solver, name, 32)
+                SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+                self.assertIsNone(solver._sparse_mass_matrix_size)
+
+    def test_simple_world_request_only_reserves_point_free_bodies(self):
+        """Ignore the inactive simple-world request on articulated-only and patch scenes."""
+        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
+        with mock.patch.object(solver_feather_pgs, "_SIMPLE_WORLD_ZERO", True):
+            for free_bodies, patches in ((False, False), (False, True), (True, False), (True, True)):
+                with (
+                    self.subTest(free_bodies=free_bodies, patches=patches),
+                    mock.patch.dict(os.environ, {}, clear=True),
+                ):
+                    solver = _eligible_solver()
+                    solver._has_free_rigid_bodies = free_bodies
+                    solver._friction_anchors_enabled = patches
+                    if free_bodies and not patches:
+                        SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+                        self.assertIsNone(solver._sparse_mass_matrix_size)
+                    else:
+                        with self.assertRaises(_TopologyReached):
+                            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Sparse construction requires CUDA")
+    def test_branched_18_dof_trees_select_general_sparse(self):
+        """Admit both wide and deeper trees without activating a second representation."""
+        for branches, depth, nonzeros, support in ((4, 3, 117, 12), (2, 6, 135, 18)):
+            with self.subTest(branches=branches, depth=depth), mock.patch.dict(os.environ, {}, clear=True):
+                model = _branched_model(branches, depth, "cuda:0")
+                solver = SolverFeatherPGS(
+                    model,
+                    pgs_mode="matrix_free",
+                    drive_mode="augmented",
+                    articulated_contact_response="immediate",
+                    friction_anchor_beta=0.0,
+                    enable_joint_velocity_limits=False,
+                    pgs_warmstart=False,
+                    mf_warmstart=False,
+                    dense_max_constraints=40,
+                    grouped_dynamics=False,
+                    mf_gs_parallel_rows=0,
+                    mf_gs_response_block_rows=0,
+                    use_parallel_streams=True,
+                )
+                self.assertEqual(solver._sparse_mass_matrix_size, 18)
+                self.assertEqual(solver._sparse_mass_matrix_plan.nonzero_count, nonzeros)
+                self.assertEqual(solver._sparse_row_factor.shape[2], support)
+                self.assertEqual(solver.mf_gs_incremental_rows, 32)
+                self.assertIsNone(solver._pgs_solve_mf_gs_kernel)
+                self.assertEqual(solver._pgs_solve_mf_gs_incremental_kernels, [])
+                self.assertIsNone(solver._ink_sizes)
+                self.assertEqual(solver._ink_rows, 0)
+                for name in ("_fused_k1", "_grouped_tau_mass", "_grouped_mass"):
+                    self.assertFalse(getattr(solver, name), name)
+                for name in ("_sparse_factor", "_single_factor", "_kinetic_world", "_row_packets"):
+                    self.assertIsNone(getattr(solver, name), name)
+
+
+if __name__ == "__main__":
+    unittest.main()

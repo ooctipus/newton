@@ -4793,11 +4793,7 @@ def prepare_world_contact_rows(
     articulation_origin: wp.array[wp.vec3],
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
-    enable_friction: int,
-    contact_friction_gap_threshold: float,
     contact_friction_shared_anchor: int,
-    contact_friction_articulation_pairs_only: int,
-    is_free_rigid: wp.array[int],
     contact_friction_scale: float,
     contact_shared_anchor: int,
     pgs_beta: float,
@@ -4861,9 +4857,9 @@ def prepare_world_contact_rows(
         friction_mu = mu * contact_friction_scale
 
         tangent0, tangent1 = contact_tangent_basis(normal)
-        # Separately compiled gap arithmetic can disagree at the threshold.
-        # The allocator owns the extent; recomputing it can overwrite the next packet.
-        add_friction = contact_slots_needed[c] == 3
+        # Allocation owns the row extent; recomputing eligibility can cross a
+        # floating-point threshold and overwrite the following contact.
+        add_friction = contact_slots_needed[c] >= 3
 
         contact_anchor_world = 0.5 * (point_a_world + point_b_world)
         point_a_normal = point_a_world

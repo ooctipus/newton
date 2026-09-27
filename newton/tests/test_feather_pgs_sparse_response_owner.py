@@ -15,6 +15,7 @@ import warp as wp
 
 from newton._src.solvers.feather_pgs import kernels
 from newton._src.solvers.feather_pgs import solver_feather_pgs as implementation
+from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 
 
 def _launch_workers(capacity, enabled):
@@ -101,6 +102,7 @@ def _fixture(device, capacity=4353, shared_anchor=0):
         "body_q": array(body_q, wp.transform),
         "contact_friction_shared_anchor": 1,
         "contact_shared_anchor": shared_anchor,
+        "friction_patches": FrictionPatches(),
         "sparse_row_dof": wp.full((world_count, 15, 2), -777, dtype=int, device=device),
         "sparse_row_jy": wp.full((world_count, 15, 4), np.nan, dtype=float, device=device),
     }

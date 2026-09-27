@@ -227,6 +227,19 @@ from .response_block_sweep import (
 from .row_build import contact_row_prelude, populate_world_J_masked
 from .row_build_native import get_row_build_native_kernel
 from .row_build_rows import build_contact_rows
+from .sparse_contact import (
+    _get_sparse_contact_response_kernel,
+    apply_sparse_contact_restitution,
+    apply_sparse_factor_velocity,
+    apply_sparse_free_velocity,
+    build_sparse_joint_limit_rows,
+)
+from .sparse_mass_matrix import (
+    _get_crba_sparse_factor_kernel,
+    _SparseMassMatrixPlan,
+    solve_sparse_mass_matrix,
+)
+from .sparse_pgs import _get_pgs_solve_sparse_kernel
 
 
 def _reject_retired_experiments():
@@ -1274,6 +1287,15 @@ class SolverFeatherPGS(SolverBase):
     These modes preserve the selected solver formulation and iteration policy;
     they do not imply equivalence between different solver formulations.
 
+    Eligible CUDA worlds use leaf-first sparse mass factors and contact rows
+    in ``matrix_free`` mode. Articulations retain separate coordinate blocks;
+    independent free bodies keep their physical response, and prescribed
+    motion enters the existing contact targets. Branches reduce factor storage
+    and typical row support without changing PGS budgets. The current sparse
+    layout requires a common articulated topology with at most 64 DOFs per
+    articulation. Dense-factor chains and unsupported features retain the
+    existing representation. Selection uses topology and resources, not task names.
+
     """
 
     # The default configuration is conformance-tested against body-pair-reduced
@@ -1298,7 +1320,8 @@ class SolverFeatherPGS(SolverBase):
 
     # Test hook: pin a kernel implementation regardless of the size heuristic
     # (keys: cholesky_kernel, trisolve_kernel, hinv_jt_kernel, delassus_kernel).
-    _kernel_overrides: ClassVar[dict[str, str]] = {}
+    # sparse_mass_matrix=False retains the existing representation for comparisons.
+    _kernel_overrides: ClassVar[dict[str, str | bool]] = {}
 
     @classmethod
     def register_custom_attributes(cls, builder: ModelBuilder) -> None:
@@ -2848,6 +2871,7 @@ class SolverFeatherPGS(SolverBase):
             ) = _get_partitioned_inverse_dynamics_kernels(
                 self._compact_diagonal_mass_size, str(getattr(model.device, "arch", ""))
             )
+        self._setup_sparse_mass_matrix(model)
         self._allocate_buffers(model)
         self._allocate_world_buffers(model)
         # CONTACT row_parent belongs to ordinary friction/patch load linkage.
@@ -2865,9 +2889,14 @@ class SolverFeatherPGS(SolverBase):
             and not self._jy_world_aliased
             and not self._preelim_active
             and not self._sparse_diagonal_contact_solve
+            and self._sparse_mass_matrix_size is None
         )
         self._hinv_jt_tiled_writes_group = not self._hinv_jt_writes_world or self.pgs_warmstart
-        response_pair = None if self._sparse_diagonal_contact_solve else self._select_paired_response()
+        response_pair = (
+            None
+            if self._sparse_diagonal_contact_solve or self._sparse_mass_matrix_size is not None
+            else self._select_paired_response()
+        )
         self._paired_response_primary_size = response_pair[0] if response_pair is not None else None
         self._paired_response_secondary_size = response_pair[1] if response_pair is not None else None
         self._paired_response_secondary_groups = (
@@ -2990,12 +3019,20 @@ class SolverFeatherPGS(SolverBase):
             self._friction_anchors_enabled or self._contact_torsion_enabled or self.contact_compliance
         )
         self._row_packets = None
-        if self._point_contact_paths and os.environ.get("FEATHER_PGS_LOCAL_ROW_PACKETS") == "1":
+        if (
+            self._sparse_mass_matrix_size is None
+            and self._point_contact_paths
+            and os.environ.get("FEATHER_PGS_LOCAL_ROW_PACKETS") == "1"
+        ):
             from .franka_row_packets import create_owner  # noqa: PLC0415
 
             self._row_packets = create_owner(self)
         self._allegro_kinetic_rows = None
-        if self._point_contact_paths and os.environ.get("FEATHER_PGS_ALLEGRO_KINETIC_ROWS") == "1":
+        if (
+            self._sparse_mass_matrix_size is None
+            and self._point_contact_paths
+            and os.environ.get("FEATHER_PGS_ALLEGRO_KINETIC_ROWS") == "1"
+        ):
             from .allegro_kinetic_rows import create_owner as create_kinetic_rows_owner  # noqa: PLC0415
 
             self._allegro_kinetic_rows = create_kinetic_rows_owner(self)
@@ -3135,7 +3172,7 @@ class SolverFeatherPGS(SolverBase):
 
         self._simple_world_classifier = None
         self._resolved_simple_worlds = wp.empty(0, dtype=wp.int32, device=model.device)
-        if _SIMPLE_WORLD_ZERO and self._point_contact_paths:
+        if _SIMPLE_WORLD_ZERO and self._point_contact_paths and self._sparse_mass_matrix_size is None:
             from .simple_world import SimpleWorldClassifier  # noqa: PLC0415 - optional experimental dispatcher
 
             self._simple_world_classifier = SimpleWorldClassifier(self)
@@ -3153,26 +3190,38 @@ class SolverFeatherPGS(SolverBase):
 
         self._joint_world = None
         self._joint_world_active = False
-        if self._point_contact_paths and os.environ.get("FEATHER_PGS_KUKA_JOINT_WORLD") == "1":
+        if (
+            self._sparse_mass_matrix_size is None
+            and self._point_contact_paths
+            and os.environ.get("FEATHER_PGS_KUKA_JOINT_WORLD") == "1"
+        ):
             from .kuka_joint_owner import create_owner  # noqa: PLC0415
 
             self._joint_world = create_owner(self)
 
         self._world_scan_publication = None
-        if os.environ.get("FEATHER_PGS_WORLD_SCAN_PUBLICATION") == "1":
+        if self._sparse_mass_matrix_size is None and os.environ.get("FEATHER_PGS_WORLD_SCAN_PUBLICATION") == "1":
             from .world_scan_owner import create_owner as create_publication  # noqa: PLC0415
 
             self._world_scan_publication = create_publication(self)
 
         self._single_factor = None
         self._single_factor_active = False
-        if self._point_contact_paths and os.environ.get("FEATHER_PGS_SINGLE_FACTOR") == "1":
+        if (
+            self._sparse_mass_matrix_size is None
+            and self._point_contact_paths
+            and os.environ.get("FEATHER_PGS_SINGLE_FACTOR") == "1"
+        ):
             from .single_factor import create_owner as create_single_factor  # noqa: PLC0415
 
             self._single_factor = create_single_factor(self)
 
         self._sparse_factor = None
-        if self._point_contact_paths and os.environ.get("FEATHER_PGS_SPARSE_FACTOR") == "1":
+        if (
+            self._sparse_mass_matrix_size is None
+            and self._point_contact_paths
+            and os.environ.get("FEATHER_PGS_SPARSE_FACTOR") == "1"
+        ):
             from .sparse_factor import create_owner as create_sparse_factor  # noqa: PLC0415
 
             if (
@@ -3188,7 +3237,11 @@ class SolverFeatherPGS(SolverBase):
             self._sparse_factor = create_sparse_factor(self)
 
         self._kinetic_world = None
-        if self._point_contact_paths and os.environ.get("FEATHER_PGS_KUKA_KINETIC_WORLD") == "1":
+        if (
+            self._sparse_mass_matrix_size is None
+            and self._point_contact_paths
+            and os.environ.get("FEATHER_PGS_KUKA_KINETIC_WORLD") == "1"
+        ):
             from .kinetic_live_owner import create_owner as create_kinetic_owner  # noqa: PLC0415
 
             self._kinetic_world = create_kinetic_owner(self)
@@ -3199,7 +3252,11 @@ class SolverFeatherPGS(SolverBase):
             self._g1_kinetic_state = self._sparse_factor.kinetic_state
 
         self._franka_kinetic_state = None
-        if self._point_contact_paths and os.environ.get("FEATHER_PGS_FRANKA_KINETIC_STATE") == "1":
+        if (
+            self._sparse_mass_matrix_size is None
+            and self._point_contact_paths
+            and os.environ.get("FEATHER_PGS_FRANKA_KINETIC_STATE") == "1"
+        ):
             from .franka_kinetic_factor import get_kernel as get_geometric_factor  # noqa: PLC0415
             from .franka_kinetic_state import FrankaKineticState, supported  # noqa: PLC0415
 
@@ -3253,6 +3310,7 @@ class SolverFeatherPGS(SolverBase):
                 or self._local_internal_fast_path
                 or self._paired_factor_coordinates
                 or self._sparse_diagonal_contact_solve
+                or self._sparse_mass_matrix_size is not None
                 or self._independent_components is not None
                 or self._single_factor is not None
                 or self._sparse_factor is not None
@@ -4971,6 +5029,178 @@ class SolverFeatherPGS(SolverBase):
         self._diagonal_mass_sizes = frozenset(diagonal_mass_sizes)
         self._direct_diagonal_inertia_sizes = frozenset(direct_diagonal_inertia_sizes)
 
+    def _setup_sparse_mass_matrix(self, model: Model) -> None:
+        """Select sparse articulation factors with independent rigid-body response blocks."""
+        self._sparse_mass_matrix_size = None
+        if not (
+            self._kernel_overrides.get("sparse_mass_matrix", True)
+            and model.device.is_cuda
+            and not model.requires_grad
+            and self.pgs_mode == "matrix_free"
+            and self.articulated_contact_response == "immediate"
+            and self.pgs_schedule == "interleaved"
+            and self.drive_mode == "augmented"
+            and self._parallel_augmented_drive_topology
+            and self.friction_mode == "current"
+            and self.pgs_iterations > 0
+            and self.pgs_velocity_iterations == 0
+            and not self.enable_joint_velocity_limits
+            and not self.pgs_warmstart
+            and not self._mf_warmstart_enabled
+            and not self._debug_buffers_enabled
+            and not self._regularization_enabled
+            and not self._preelim_active
+            and not self._contact_torsion_enabled
+            and not self.contact_compliance
+            and not self._mimic_count
+            and not self._connect_count
+            and not self._has_loop_joints
+            and not self._sparse_diagonal_contact_solve
+        ):
+            return
+        # Decide ownership before omitting dense buffers. Explicit research
+        # recipes retain their own admission and fallback, including when their
+        # requested owner later declines the topology. They cannot acquire
+        # dense storage after this sparse allocation decision.
+        if (
+            self.grouped_dynamics
+            or os.environ.get("FEATHER_PGS_MF_MULTIBLOCK") == "1"
+            or (self._has_free_rigid_bodies and os.environ.get("FEATHER_PGS_FREE_BODY_IMPLICIT_GYRO") == "1")
+        ):
+            return
+        if not self._friction_anchors_enabled and (
+            self.mf_gs_parallel_rows > 0
+            or self.mf_gs_response_block_rows > 0
+            or (_SIMPLE_WORLD_ZERO and self._has_free_rigid_bodies)
+            or any(
+                os.environ.get(f"FEATHER_PGS_{option}") == "1"
+                for option in (
+                    "LOCAL_ROW_PACKETS",
+                    "ALLEGRO_KINETIC_ROWS",
+                    "KUKA_JOINT_WORLD",
+                    "SINGLE_FACTOR",
+                    "SPARSE_FACTOR",
+                    "KUKA_KINETIC_WORLD",
+                    "FRANKA_KINETIC_STATE",
+                    "INDEPENDENT_COMPONENTS",
+                    "WORLD_SCAN_PUBLICATION",
+                    "PAIRED_GENERAL_OVERLAP",
+                )
+            )
+        ):
+            return
+        response_dofs = self._model_plan.response_dof_count
+        free_rigid = self._model_plan.is_free_rigid != 0
+        articulated = np.flatnonzero((response_dofs > 0) & ~free_rigid)
+        sizes = np.unique(response_dofs[articulated])
+        if len(sizes) != 1:
+            return
+        size = int(sizes[0])
+        # A six-DOF articulated group cannot share the independent free-body factor view.
+        if self._has_free_rigid_bodies and (size == 6 or 6 not in self._free_body_inertia_sizes):
+            return
+        # The endpoint support uses one 64-bit ancestry mask, not a robot-specific DOF limit.
+        if size > 64 or size not in self._crba_source_dof_by_size or size in self._diagonal_mass_sizes:
+            return
+        articulated_counts = np.bincount(self._model_plan.articulation_world[articulated], minlength=self.world_count)
+        articulation_start = model.articulation_start.numpy()
+        joint_child = model.joint_child.numpy()
+        joint_ancestor = model.joint_ancestor.numpy()
+        joint_qd_start = model.joint_qd_start.numpy()
+        art = int(self.group_to_art[size].numpy()[0])
+        start = int(articulation_start[art])
+        end = int(self._model_plan.articulation_joint_end[art])
+        parents = joint_ancestor[start:end].astype(np.int32, copy=True)
+        parents = np.where(parents >= start, parents - start, -1)
+        plan = _SparseMassMatrixPlan.build(parents, np.diff(joint_qd_start[start : end + 1]))
+        if plan.dof_count != size or plan.nonzero_count >= size * (size + 1) // 2:
+            return
+
+        joint_masks = plan.joint_ancestor_mask
+        body_masks = np.zeros(model.body_count, dtype=np.uint64)
+        for articulation in articulated:
+            first = int(articulation_start[articulation])
+            last = int(self._model_plan.articulation_joint_end[articulation])
+            children = joint_child[first:last]
+            valid = children >= 0
+            body_masks[children[valid]] = joint_masks[valid]
+        shape_body = model.shape_body.numpy()
+        contact_masks = np.unique(body_masks[shape_body[shape_body >= 0]])
+        max_support = max((int(mask).bit_count() for mask in joint_masks), default=0)
+        for first in contact_masks:
+            for second in contact_masks:
+                max_support = max(max_support, int(first | second).bit_count())
+        if np.any(articulated_counts > 1):
+            # Different articulations have disjoint coordinate blocks, even
+            # when they share the same topology and local ancestor indices.
+            max_support = max(max_support, 2 * max(int(mask).bit_count() for mask in joint_masks))
+        if self._has_free_rigid_bodies:
+            max_support = max(max_support, max(int(mask).bit_count() for mask in joint_masks) + 6)
+        # Response groups need not coexist in every world. No row can contain
+        # more distinct coordinates than the largest world's response vector.
+        max_support = min(max_support, self.max_world_dofs)
+        if not max_support:
+            return
+        # Native kernels use static shared memory, as in the existing grouped CRBA path.
+        shared_limit = min(48 * 1024, int(model.device.max_shared_memory_per_block))
+        # Two worlds share a block: three float row arrays, row types, and velocity deltas.
+        mf_capacity = self.mf_max_constraints if self._has_free_rigid_bodies else 0
+        solve_shared_bytes = 8 * self.max_world_dofs + 26 * self.dense_max_constraints + 16 * mf_capacity
+        if solve_shared_bytes > shared_limit:
+            return
+        shared_bytes_per_warp = 4 * (2 * plan.nonzero_count + 6 * size)
+        self._sparse_factor_warps_per_block = min(
+            _CRBA_CHOLESKY_WARPS_PER_BLOCK,
+            shared_limit // shared_bytes_per_warp,
+        )
+        if self._sparse_factor_warps_per_block < 1:
+            return
+
+        self._sparse_mass_matrix_size = size
+        # The sparse producers overwrite every live value and retain factors by the mass mask.
+        self._double_buffer = False
+        self._local_internal_fast_path = False
+        self._sparse_mass_matrix_plan = plan
+        self._sparse_mass_matrix_indices = plan.to_device(model.device)
+        self._sparse_body_dof_mask = wp.array(body_masks, dtype=wp.uint64, device=model.device)
+        group_count = self.n_arts_by_size[size]
+        self._sparse_Linv = wp.zeros((group_count, plan.nonzero_count), dtype=wp.float32, device=model.device)
+        self._sparse_mass_matrix_status = wp.zeros(group_count, dtype=wp.int32, device=model.device)
+        self._sparse_mass_matrix_scratch = wp.empty((group_count, size), dtype=wp.float32, device=model.device)
+        shape = (self.world_count, self.dense_max_constraints, max_support)
+        self._sparse_row_dof = wp.empty(shape, dtype=wp.int32, device=model.device)
+        self._sparse_row_factor = wp.empty(shape, dtype=wp.float32, device=model.device)
+        # Ordinary contacts have at most one free endpoint; free/free rows retain
+        # their existing MF storage. Factor-coordinate responses alias the row.
+        free_shape = (*shape[:2], 6) if self._has_free_rigid_bodies else (1, 1, 1)
+        self._sparse_row_free_response = wp.empty(free_shape, dtype=wp.float32, device=model.device)
+        self._sparse_row_incident = wp.empty(shape[:2], dtype=wp.float32, device=model.device)
+        self._sparse_factor_velocity_delta = wp.empty(
+            (self.world_count, self.max_world_dofs), dtype=wp.float32, device=model.device
+        )
+        free_dof_mask = np.zeros((self.world_count, self.max_world_dofs), dtype=np.int32)
+        offsets = self.articulation_world_dof_offset.numpy()
+        for art in np.flatnonzero(free_rigid & (response_dofs > 0)):
+            world = self._model_plan.articulation_world[art]
+            offset = offsets[art]
+            free_dof_mask[world, offset : offset + response_dofs[art]] = 1
+        self._sparse_world_free_dof_mask = wp.array(free_dof_mask, dtype=wp.int32, device=model.device)
+        self._sparse_free_factor_dummy = wp.zeros((1, 6, 6), dtype=wp.float32, device=model.device)
+        self._crba_sparse_factor_kernel = _get_crba_sparse_factor_kernel(
+            size, plan.nonzero_count, warps_per_block=self._sparse_factor_warps_per_block
+        )
+        self._sparse_contact_lanes = 8
+        self._sparse_contact_response_kernel = _get_sparse_contact_response_kernel(
+            size, lanes_per_contact=self._sparse_contact_lanes
+        )
+        self._pgs_solve_sparse_kernel = _get_pgs_solve_sparse_kernel(
+            self.dense_max_constraints,
+            self.max_world_dofs,
+            max_support,
+            mf_max_constraints=mf_capacity,
+            free_row_dofs=6 if self._has_free_rigid_bodies else 0,
+        )
+
     def _build_body_maps(self, model):
         if not model.body_count or not model.articulation_count:
             self.body_to_joint = None
@@ -5475,8 +5705,10 @@ class SolverFeatherPGS(SolverBase):
 
             h_dim = size
             j_rows = max_constraints
-            compact_diagonal_mass = size == self._compact_diagonal_mass_size
-            sparse_response = self._sparse_diagonal_contact_solve and size == self._sparse_diagonal_response_size
+            compact_diagonal_mass = size in (self._compact_diagonal_mass_size, self._sparse_mass_matrix_size)
+            sparse_response = self._sparse_mass_matrix_size is not None or (
+                self._sparse_diagonal_contact_solve and size == self._sparse_diagonal_response_size
+            )
 
             if self._H_bufs is not None:
                 for buf_idx in range(2):
@@ -5502,7 +5734,11 @@ class SolverFeatherPGS(SolverBase):
                 requires_grad=requires_grad,
             )
             self.Hinv_by_size[size] = None
-            self.Linv_by_size[size] = None
+            self.Linv_by_size[size] = (
+                wp.zeros_like(self.L_by_size[size])
+                if self._sparse_mass_matrix_size is not None and self._has_free_rigid_bodies and size == 6
+                else None
+            )
 
             self.Y_by_size[size] = wp.zeros(
                 (1, 1, 1) if sparse_response else (n_arts, j_rows, h_dim),
@@ -5521,9 +5757,10 @@ class SolverFeatherPGS(SolverBase):
                 (n_arts, h_dim), dtype=wp.float32, device=device, requires_grad=requires_grad
             )
 
-            # Tau and qdd grouped buffers for tiled triangular solve [n_arts, h_dim, 1]
-            self.tau_by_size[size] = wp.zeros((n_arts, h_dim, 1), dtype=wp.float32, device=device)
-            self.qdd_by_size[size] = wp.zeros((n_arts, h_dim, 1), dtype=wp.float32, device=device)
+            if not compact_diagonal_mass:
+                # Grouped scratch belongs to the dense triangular solve, not the compact paths.
+                self.tau_by_size[size] = wp.zeros((n_arts, h_dim, 1), dtype=wp.float32, device=device)
+                self.qdd_by_size[size] = wp.zeros((n_arts, h_dim, 1), dtype=wp.float32, device=device)
 
         if self._H_bufs is not None:
             self.H_by_size = self._H_bufs[0]
@@ -5536,8 +5773,10 @@ class SolverFeatherPGS(SolverBase):
                 n_arts = self.n_arts_by_size[size]
                 h_dim = size
                 j_rows = max_constraints
-                compact_diagonal_mass = size == self._compact_diagonal_mass_size
-                sparse_response = self._sparse_diagonal_contact_solve and size == self._sparse_diagonal_response_size
+                compact_diagonal_mass = size in (self._compact_diagonal_mass_size, self._sparse_mass_matrix_size)
+                sparse_response = self._sparse_mass_matrix_size is not None or (
+                    self._sparse_diagonal_contact_solve and size == self._sparse_diagonal_response_size
+                )
                 self.H_by_size[size] = wp.zeros(
                     (1, 1, 1) if compact_diagonal_mass else (n_arts, h_dim, h_dim),
                     dtype=wp.float32,
@@ -5729,7 +5968,7 @@ class SolverFeatherPGS(SolverBase):
 
         # Matrix-free uses world-indexed J/Y for both dense and rigid phases.
         if self.pgs_mode == "matrix_free":
-            if self._sparse_diagonal_contact_solve:
+            if self._sparse_diagonal_contact_solve or self._sparse_mass_matrix_size is not None:
                 self.J_world = wp.zeros((1, 1, 1), dtype=wp.float32, device=device)
                 self.Y_world = wp.zeros((1, 1, 1), dtype=wp.float32, device=device)
             elif self._jy_world_aliased:
@@ -6486,8 +6725,10 @@ class SolverFeatherPGS(SolverBase):
         self._delassus_kernels_by_size = {}
 
         for size in self.size_groups:
-            compact_diagonal_mass = size == self._compact_diagonal_mass_size
-            sparse_response = self._sparse_diagonal_contact_solve and size == self._sparse_diagonal_response_size
+            compact_diagonal_mass = size in (self._compact_diagonal_mass_size, self._sparse_mass_matrix_size)
+            sparse_response = self._sparse_mass_matrix_size is not None or (
+                self._sparse_diagonal_contact_solve and size == self._sparse_diagonal_response_size
+            )
             use_diagonal_mass = self._execution_plan.use_diagonal_mass(size)
             use_tiled_cholesky = self._execution_plan.use_tiled_cholesky(size)
             fuse_crba_cholesky = bool(
@@ -6535,8 +6776,11 @@ class SolverFeatherPGS(SolverBase):
             )
             self._inverse_cholesky_lower_kernels_by_size[size] = (
                 _get_inverse_cholesky_register_kernel(size, device_arch, lower_only=True)
-                if self._paired_factor_coordinates
-                and size in (self._paired_response_primary_size, self._paired_response_secondary_size)
+                if (
+                    self._paired_factor_coordinates
+                    and size in (self._paired_response_primary_size, self._paired_response_secondary_size)
+                )
+                or (self._sparse_mass_matrix_size is not None and self._has_free_rigid_bodies and size == 6)
                 else None
             )
             self._triangular_solve_kernels_by_size[size] = (
@@ -6782,8 +7026,16 @@ class SolverFeatherPGS(SolverBase):
         )
         self._pgs_solve_mf_gs_kernel = None
         self._pgs_solve_mf_gs_incremental_kernel = None
+        self._pgs_solve_mf_gs_incremental_kernels = []
+        self._ink_sizes = None
+        self._ink_rows = 0
         self._rb_build_kernel = None
-        if self.grouped_dynamics and model.device.is_cuda and int(model.articulation_count) > 0:
+        if (
+            self.grouped_dynamics
+            and self._sparse_mass_matrix_size is None
+            and model.device.is_cuda
+            and int(model.articulation_count) > 0
+        ):
             self._grouped_topology = GroupedTopology(
                 model, self.articulation_joint_end.numpy(), model.device, body_X_com=self.body_X_com
             )
@@ -6844,6 +7096,7 @@ class SolverFeatherPGS(SolverBase):
         if (
             self.pgs_mode == "matrix_free"
             and not self._sparse_diagonal_contact_solve
+            and self._sparse_mass_matrix_size is None
             and hasattr(self, "mf_meta_packed")
             and self.world_count > 0
             and getattr(self, "max_world_dofs", 0) > 0
@@ -7964,6 +8217,80 @@ class SolverFeatherPGS(SolverBase):
             ):
                 raise RuntimeError("Sparse factor requires the complete original interleaved solve")
             self._sparse_factor.solve(dense_rhs, iterations, omega, int(friction_start_iteration))
+            return
+        if self._sparse_mass_matrix_size is not None:
+            if row_phase_override not in (None, 0) or defer_dense_response or soft_relax:
+                raise RuntimeError("sparse factor response requires the interleaved augmented-drive solve")
+            wp.launch_tiled(
+                self._pgs_solve_sparse_kernel,
+                dim=[(self.world_count + 1) // 2],
+                inputs=[
+                    self.world_count,
+                    self.constraint_count,
+                    dense_rhs,
+                    self.diag,
+                    self.impulses,
+                    self._sparse_row_dof,
+                    self._sparse_row_factor,
+                    self._sparse_row_free_response,
+                    self._sparse_row_incident,
+                    self.row_type,
+                    self.row_parent,
+                    self.row_mu,
+                    self._sparse_world_free_dof_mask,
+                    self.world_dof_indices,
+                    self.v_hat,
+                    self.mf_constraint_count,
+                    mf_meta,
+                    self.mf_impulses,
+                    self.mf_J_a,
+                    self.mf_J_b,
+                    self.mf_MiJt_a,
+                    self.mf_MiJt_b,
+                    self.mf_row_mu,
+                    iterations,
+                    omega,
+                    int(friction_start_iteration),
+                    int(iteration_offset),
+                ],
+                outputs=[self._sparse_factor_velocity_delta],
+                block_dim=64,
+                device=self.model.device,
+            )
+            indices = self._sparse_mass_matrix_indices
+            size = self._sparse_mass_matrix_size
+            wp.launch(
+                apply_sparse_factor_velocity,
+                dim=(self.n_arts_by_size[size], size),
+                inputs=[
+                    self.group_to_art[size],
+                    self.art_to_world,
+                    self.articulation_world_dof_offset,
+                    self.articulation_dof_start,
+                    indices.permutation,
+                    indices.lookup,
+                    self._sparse_Linv,
+                    self._sparse_factor_velocity_delta,
+                    self.v_hat,
+                ],
+                outputs=[self.v_out],
+                device=self.model.device,
+            )
+            if self._has_free_rigid_bodies:
+                wp.launch(
+                    apply_sparse_free_velocity,
+                    dim=(self.n_arts_by_size[6], 6),
+                    inputs=[
+                        self.group_to_art[6],
+                        self.art_to_world,
+                        self.articulation_world_dof_offset,
+                        self.articulation_dof_start,
+                        self._sparse_factor_velocity_delta,
+                        self.v_hat,
+                    ],
+                    outputs=[self.v_out],
+                    device=self.model.device,
+                )
             return
         if self._sparse_diagonal_contact_solve:
             if row_phase_override not in (None, 0):
@@ -9702,6 +10029,20 @@ class SolverFeatherPGS(SolverBase):
         dt: float,
         collide_done_event=None,
     ):
+        if self._sparse_mass_matrix_size is not None and (
+            self.pgs_mode != "matrix_free"
+            or self.pgs_schedule != "interleaved"
+            or self.articulated_contact_response != "immediate"
+            or self.drive_mode != "augmented"
+            or self.friction_mode != "current"
+            or self.pgs_warmstart
+            or self.pgs_debug
+            or self.pgs_velocity_iterations != 0
+            or self.enable_joint_velocity_limits
+            or self._contact_torsion_enabled
+            or self.contact_compliance
+        ):
+            raise RuntimeError("Reconstruct the solver after changing options incompatible with sparse mass factors")
         if self._contact_torsion_enabled:
             validate_torsion_step(self)
             if getattr(self, "_device_torsion", None) is not None:
@@ -9819,7 +10160,7 @@ class SolverFeatherPGS(SolverBase):
         with wp.ScopedTimer("S2_Cholesky", print=False, use_nvtx=self._nvtx, synchronize=False):
             for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
                 with ctx:
-                    if size == self._compact_diagonal_mass_size:
+                    if size in (self._compact_diagonal_mass_size, self._sparse_mass_matrix_size):
                         pass
                     elif self._execution_plan.use_diagonal_mass(size):
                         self._stage2_cholesky_diagonal(size)
@@ -9851,7 +10192,22 @@ class SolverFeatherPGS(SolverBase):
                         use_tiled = (self.trisolve_kernel == "tiled") or (
                             self.trisolve_kernel == "auto" and size > self.small_dof_threshold
                         )
-                        if size == self._compact_diagonal_mass_size:
+                        if size == self._sparse_mass_matrix_size:
+                            wp.launch(
+                                solve_sparse_mass_matrix,
+                                dim=self.n_arts_by_size[size] * 32,
+                                inputs=[
+                                    self.group_to_art[size],
+                                    self.articulation_dof_start,
+                                    self._sparse_mass_matrix_indices,
+                                    self._sparse_Linv,
+                                    state_aug.joint_tau,
+                                ],
+                                outputs=[self._sparse_mass_matrix_scratch, state_aug.joint_qdd],
+                                block_dim=128,
+                                device=model.device,
+                            )
+                        elif size == self._compact_diagonal_mass_size:
                             self._stage3_trisolve_compact_diagonal(size, state_aug)
                         elif self._execution_plan.use_diagonal_mass(size):
                             self._stage3_trisolve_diagonal(size, state_aug)
@@ -9884,7 +10240,7 @@ class SolverFeatherPGS(SolverBase):
             with wp.ScopedTimer("S4_HinvJt_Diag_RHS", print=False, use_nvtx=self._nvtx, synchronize=False):
                 for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
                     with ctx:
-                        if self._compact_contact_boundary:
+                        if self._compact_contact_boundary or self._sparse_mass_matrix_size is not None:
                             continue  # Contact owner and bounded limit prefix publish the complete response.
                         if self._sparse_diagonal_contact_solve and size == self._sparse_diagonal_response_size:
                             continue
@@ -10058,6 +10414,7 @@ class SolverFeatherPGS(SolverBase):
                     not self._jy_world_aliased
                     and not self._hinv_jt_writes_world
                     and not self._sparse_diagonal_contact_solve
+                    and self._sparse_mass_matrix_size is None
                 ):
                     for size in self.size_groups:
                         n_arts = self.n_arts_by_size[size]
@@ -11935,6 +12292,29 @@ class SolverFeatherPGS(SolverBase):
             if self._sparse_factor is not None:
                 self._sparse_factor.refresh(state_aug)
                 continue
+            if size == self._sparse_mass_matrix_size:
+                wp.launch(
+                    self._crba_sparse_factor_kernel,
+                    dim=n_arts * 32,
+                    inputs=[
+                        self.group_to_art[size],
+                        self.mass_update_mask,
+                        model.articulation_start,
+                        self.articulation_dof_start,
+                        model.joint_child,
+                        state_aug.joint_S_s,
+                        self.body_I_c,
+                        self.R_by_size[size],
+                        1,
+                        self._augmented_drive_row_by_dof,
+                        self.aug_row_K,
+                        self._sparse_mass_matrix_indices,
+                    ],
+                    outputs=[self._sparse_Linv, self._sparse_mass_matrix_status],
+                    block_dim=32 * self._sparse_factor_warps_per_block,
+                    device=model.device,
+                )
+                continue
             if size == self._compact_diagonal_mass_size:
                 if self._direct_compact_diagonal_inertia:
                     wp.launch(
@@ -12618,7 +12998,11 @@ class SolverFeatherPGS(SolverBase):
         propagation_first_rejected_slot = (
             self._propagation_first_rejected_slot if propagation_active else self._dummy_mf_slot_counter
         )
-        j_buffers_zeroed = self._row_packets is not None or self._allegro_kinetic_rows is not None
+        j_buffers_zeroed = (
+            self._sparse_mass_matrix_size is not None
+            or self._row_packets is not None
+            or self._allegro_kinetic_rows is not None
+        )
         if self._compact_contact_boundary:
             from .compact_contact import clear_limit_prefix  # noqa: PLC0415
 
@@ -12886,6 +13270,47 @@ class SolverFeatherPGS(SolverBase):
                 if size not in self._joint_limit_sizes or size in self._fused_diagonal_joint_limit_sizes:
                     continue
                 n_arts = self.n_arts_by_size[size]
+                if size == self._sparse_mass_matrix_size:
+                    indices = self._sparse_mass_matrix_indices
+                    wp.launch(
+                        build_sparse_joint_limit_rows,
+                        dim=n_arts * 32,
+                        inputs=[
+                            self.group_to_art[size],
+                            self.art_to_world,
+                            self.articulation_world_dof_offset,
+                            self.articulation_dof_start,
+                            self._joint_limit_q_index,
+                            model.joint_limit_lower,
+                            model.joint_limit_upper,
+                            state_in.joint_q,
+                            self.joint_limit_activation_gap,
+                            self.pgs_beta,
+                            self.pgs_cfm,
+                            indices.ancestor_mask,
+                            indices.inverse_permutation,
+                            indices.lookup,
+                            self._sparse_Linv,
+                            self.v_hat,
+                        ],
+                        outputs=[
+                            self.slot_counter,
+                            self.row_type,
+                            self.row_parent,
+                            self.row_mu,
+                            self.row_beta,
+                            self.row_cfm,
+                            self.phi,
+                            self.target_velocity,
+                            self._sparse_row_dof,
+                            self._sparse_row_factor,
+                            self._sparse_row_incident,
+                            self.diag,
+                        ],
+                        block_dim=128,
+                        device=model.device,
+                    )
+                    continue
                 warp_kernel = self._joint_limit_warp_kernels.get(size)
                 if warp_kernel is not None:
                     wp.launch_tiled(
@@ -13168,7 +13593,11 @@ class SolverFeatherPGS(SolverBase):
                 from .compact_contact import launch_contacts  # noqa: PLC0415
 
                 launch_contacts(self, state_in, state_aug, contacts, contact_build_threads)
-            elif self._compact_contact_jacobian or self._sparse_diagonal_contact_solve:
+            elif (
+                self._compact_contact_jacobian
+                or self._sparse_diagonal_contact_solve
+                or self._sparse_mass_matrix_size is not None
+            ):
                 wp.launch(
                     prepare_world_contact_rows,
                     dim=contact_build_threads,
@@ -13195,11 +13624,7 @@ class SolverFeatherPGS(SolverBase):
                         self.articulation_origin,
                         self.shape_material_mu,
                         self.shape_material_restitution,
-                        enable_friction_flag,
-                        self.contact_friction_gap_threshold,
                         int(self.contact_friction_shared_anchor),
-                        1 if self.contact_friction_articulation_pairs_only else 0,
-                        is_free_rigid,
                         self.contact_friction_scale,
                         int(self.contact_shared_anchor),
                         self.pgs_beta,
@@ -13221,6 +13646,62 @@ class SolverFeatherPGS(SolverBase):
                 )
                 contact_jacobian_workers = min(contacts.rigid_contact_max, _CONTACT_JACOBIAN_WORKER_CAP)
                 for size in self.size_groups:
+                    if self._sparse_mass_matrix_size is not None and size != self._sparse_mass_matrix_size:
+                        continue
+                    if size == self._sparse_mass_matrix_size:
+                        indices = self._sparse_mass_matrix_indices
+                        sparse_contact_workers = min(
+                            contact_build_threads, contact_jacobian_workers * 32 // self._sparse_contact_lanes
+                        )
+                        wp.launch(
+                            self._sparse_contact_response_kernel,
+                            dim=sparse_contact_workers * self._sparse_contact_lanes,
+                            inputs=[
+                                contacts.rigid_contact_count,
+                                sparse_contact_workers,
+                                contacts.rigid_contact_point0,
+                                contacts.rigid_contact_point1,
+                                contacts.rigid_contact_normal,
+                                contacts.rigid_contact_shape0,
+                                contacts.rigid_contact_shape1,
+                                contacts.rigid_contact_margin0,
+                                contacts.rigid_contact_margin1,
+                                self.contact_world,
+                                self.contact_slot,
+                                self.contact_art_a,
+                                self.contact_art_b,
+                                self.contact_path,
+                                self.contact_slots_needed,
+                                self.art_group_idx,
+                                self.articulation_response_dof_count,
+                                self.is_free_rigid,
+                                self.articulation_world_dof_offset,
+                                self.articulation_dof_start,
+                                self.articulation_origin,
+                                self._sparse_body_dof_mask,
+                                state_aug.joint_S_s,
+                                model.shape_body,
+                                state_in.body_q,
+                                int(self.contact_friction_shared_anchor),
+                                self._friction_patches.view,
+                                int(self.contact_shared_anchor),
+                                indices.permutation,
+                                indices.row_offsets,
+                                self._sparse_Linv,
+                                self.Linv_by_size[6] if self._has_free_rigid_bodies else self._sparse_free_factor_dummy,
+                                self.v_hat,
+                            ],
+                            outputs=[
+                                self._sparse_row_dof,
+                                self._sparse_row_factor,
+                                self._sparse_row_free_response,
+                                self._sparse_row_incident,
+                                self.diag,
+                            ],
+                            block_dim=128,
+                            device=model.device,
+                        )
+                        continue
                     if self._sparse_diagonal_contact_solve and size == self._sparse_diagonal_response_size:
                         continue
                     wp.launch(
@@ -15056,6 +15537,9 @@ class SolverFeatherPGS(SolverBase):
                 device=self.model.device,
             )
             return
+        if self._sparse_mass_matrix_size is not None:
+            # Sparse row producers write the complete diagonal; CFM is added below as usual.
+            return
         if self._paired_response_primary_size is not None:
             return
         self.diag.zero_()
@@ -15215,6 +15699,24 @@ class SolverFeatherPGS(SolverBase):
         if self._row_packets is not None or self._allegro_kinetic_rows is not None:
             return  # The current packet producer applies the same incident-velocity law.
         if matrix_free:
+            if self._sparse_mass_matrix_size is not None:
+                wp.launch(
+                    apply_sparse_contact_restitution,
+                    dim=(self.world_count, self.dense_max_constraints),
+                    inputs=[
+                        self.constraint_count,
+                        self.phi,
+                        self.row_type,
+                        self.target_velocity,
+                        self.row_restitution,
+                        self._sparse_row_incident,
+                        dt,
+                        self._effective_restitution_velocity_threshold,
+                    ],
+                    outputs=[self.rhs],
+                    device=self.model.device,
+                )
+                return
             if self._sparse_diagonal_contact_solve:
                 wp.launch(
                     apply_sparse_diagonal_contact_restitution_matrix_free,
