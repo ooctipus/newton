@@ -64,8 +64,14 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
                     self.assertNotIn("__shared__ float s_lam_mf", source)
                     self.assertNotIn("mf_impulses.data[off_mf + i] =", source)
                     self.assertIn("__shfl_sync(MASK, lane == 0 ? g_lam_mf[i] : 0.0f, 0)", source)
+                    self.assertIn(
+                        "if (mf_friction_radius == 0.0f && "
+                        "__shfl_sync(MASK, lane == 0 ? g_lam_mf[i] : 0.0f, 0) == 0.0f && "
+                        "__shfl_sync(MASK, lane == 0 ? g_lam_mf[i + 1] : 0.0f, 0) == 0.0f)",
+                        source,
+                    )
                     for line in source.splitlines():
-                        if re.search(r"g_lam_mf\[[^]]+\]\s*=", line):
+                        if re.search(r"g_lam_mf\[[^]]+\]\s*=(?!=)", line):
                             self.assertIn("if (lane == 0)", line)
 
     def test_limit_only_phase_does_not_stage_contact_prefix(self):

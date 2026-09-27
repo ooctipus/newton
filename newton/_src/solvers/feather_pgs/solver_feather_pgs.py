@@ -27071,7 +27071,7 @@ def _get_pgs_solve_mf_gs_kernel(
             "    volatile float* g_lam_mf = (volatile float*)(&mf_impulses.data[off_mf]);",
         )
         snippet = re.sub(
-            r"s_lam_mf\[([^\]]*)\](\s*=\s*[^;]+;)",
+            r"s_lam_mf\[([^\]]*)\](\s*=(?!=)\s*[^;]+;)",
             r"if (lane == 0) g_lam_mf[\1]\2",
             snippet,
         )
@@ -27523,8 +27523,8 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
     deferred dense response. Eligible worlds return early from the legacy kernel
     (``skip_incremental_rows``) and ineligible worlds return early here.
 
-    The warp builds the active response block ``A = J Y`` (full square, so a column is
-    one contiguous shared read per lane) and the residual vector ``r = rhs + J v`` once,
+    The warp stores the active response columns ``A[i, r] = J_r Y_i`` contiguously
+    and builds the residual vector ``r = rhs + J v`` once,
     compacts the rows this phase visits into an ordered list with pre-decoded
     projection kind, parent and sibling, and then performs each row update as one
     redundant scalar projection per lane plus ``r[lane] += A[i][lane] * delta``. The
@@ -27721,17 +27721,18 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
         n_vlim += __popc(vlim_mask);
     }}
 
-    // ── Response block A[i][r] = J_i . Y_r for rows below dense_hi ──
+    // Store each impulse's response contiguously: A[i][r] = J_r . Y_i.
+    // Pre-elimination preserves bilateral Y columns, so J Y need not be symmetric.
     {{
         const int n_pairs = n_rows_total * n_rows_total;
         for (int pidx = lane; pidx < n_pairs; pidx += 32) {{
             const int i = pidx / n_rows_total;
             const int r = pidx - i * n_rows_total;
-            const float* Ji = &J_world.data[jy_world_base + i * {D}];
-            const float* Yr = &Y_world.data[jy_world_base + r * {D}];
+            const float* Jr = &J_world.data[jy_world_base + r * {D}];
+            const float* Yi = &Y_world.data[jy_world_base + i * {D}];
             float a = 0.0f;
             #pragma unroll
-            for (int d = 0; d < {D}; ++d) a += Ji[d] * Yr[d];
+            for (int d = 0; d < {D}; ++d) a += Jr[d] * Yi[d];
             s_A[i * {AM} + r] = a;
         }}
     }}
@@ -27779,7 +27780,7 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
                             lambda_n += s_lam[patch_row];
                         const float radius = fmaxf(s_mu[i] * lambda_n, 0.0f);
                         const float2 pair = friction_pair_candidate(
-                            s_diag[i], s_A[i * {AM} + sib], s_diag[sib],
+                            s_diag[i], s_A[sib * {AM} + i], s_diag[sib],
                             residual, s_res[sib], old_impulse, s_lam[sib], radius, omega);
                         const float mag = sqrtf(pair.x * pair.x + pair.y * pair.y);
                         const float scale = mag > radius ? radius / mag : 1.0f;

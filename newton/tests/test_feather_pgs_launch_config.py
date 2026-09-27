@@ -198,6 +198,7 @@ def _build_heterogeneous_world_model():
 
 class TestFeatherPGSLaunchConfig(unittest.TestCase):
     def test_research_options_preserve_positional_solver_budget(self):
+        """Preserve main's positional budget while adding keyword-only research options."""
         parameters = inspect.signature(SolverFeatherPGS).parameters
         names = list(parameters)
         self.assertEqual(names[names.index("fuse_joint_velocity_limits") + 1], "pgs_iterations")

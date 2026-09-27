@@ -337,7 +337,7 @@ class TestIndependentComponents(unittest.TestCase):
                 components.get_prepare_kernel(size)
 
     def test_default_source_and_unchanged_sweep_law(self):
-        """Preserve accepted42 default source and each complete numerical sweep unchanged."""
+        """Preserve rebased point-contact source and each complete component sweep."""
         sources = []
         native = wp.func_native
 
@@ -351,10 +351,13 @@ class TestIndependentComponents(unittest.TestCase):
             baseline = solve_kernels(False)
             candidate = solve_kernels(True)
         self.assertEqual(len(sources), 4)
-        # Captured independently from clean accepted42f1492, before this experiment.
+        # Rebase onto 5238407d retains its 2x2 tangent projection and per-row
+        # regularization. These reviewed default-body captures replace the
+        # pre-rebase accepted42 scalar-friction oracle; the optional component
+        # path must still preserve each complete numerical sweep below.
         expected = (
-            "7ce07adf4cf5273c158df70a64e59e865c92d6d1ba7fc0ed51e98fe4f7c58c93",
-            "a7babcbe7a58a6e0dcbc693f7cb4d53ee1567ccf3ec62bb6119d6dfc54cc73a8",
+            "402633105dff627c7f65e41b0430fe280ae5f4006ce131a55a2d2792b9b4d7e5",
+            "133fe24577a4ab9f20ae585939f1d0f73564d2d1f379518df7f91087d1abdc48",
         )
         for index in range(2):
             self.assertEqual(hashlib.sha256(sources[index].encode()).hexdigest(), expected[index])

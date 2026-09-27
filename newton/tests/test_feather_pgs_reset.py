@@ -65,6 +65,7 @@ def _assert_worlds(test: unittest.TestCase, specs, reset_worlds: tuple[bool, boo
 
 class TestFeatherPGSReset(unittest.TestCase):
     def test_warmstart_clear_does_not_change_fk_cache_source(self):
+        """Keep cache-source bookkeeping in reset, independent of impulse clearing."""
         model = _build_two_world_free_model("cpu")
         solver = _make_solver(model, pgs_mode="split", dense_warmstart=True, mf_warmstart=True)
         state = model.state()

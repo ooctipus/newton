@@ -516,7 +516,6 @@ class TestFeatherPGSMFDenseSupportCUDA(unittest.TestCase):
                 friction_mode="coulomb_newton",
                 has_drive_rows=False,
                 has_dense_velocity_limit_rows=False,
-                stream_mf_impulses=True,
             )
         )
 
