@@ -2,6 +2,8 @@
 
 This supporting evidence bundle is separate from the solver implementation PR. The latest results are in [contact-projection.md](contact-projection.md), with unrounded measurements and capture hashes in [contact-projection.json](contact-projection.json): clean candidate `a25b4c45f86ae9ea4d3ff8fb538cb85ece7dcac7` against the recorded clean-main baseline, plus separately labeled incremental two-GPU controls. Environment FPS and physics time are reported together.
 
+[readiness.md](readiness.md) records the later `c3932311` cleanup, test qualification, inherited-failure classification, and three-task, two-GPU regression checks. These do not replace or relabel the earlier 20-task measurements.
+
 [extension.md](extension.md) and [extension.json](extension.json) preserve the prior `1472112114f70e288012731a7639d69228e258de` measurements. They are historical results, not measurements of the latest contact producer.
 
 [results.md](results.md) and [results.json](results.json) preserve the initial `d5c2177d2507ed12e87d6dc628373639a8e5231b` measurements, matched configurations, and supplemental controls. They are not results for the latest candidate. The retained helpers are byte-for-byte copies of the files used by the captures. The adapters have only portable path/GPU admission changes; original capture-driver hashes and portable-adapter hashes are recorded separately.
@@ -9,7 +11,7 @@ This supporting evidence bundle is separate from the solver implementation PR. T
 ## Source and scope
 
 - Clean Newton baseline: `5238407d320823e71a5a4623c2c83c293d7b00fd`.
-- Latest clean Newton candidate: `a25b4c45f86ae9ea4d3ff8fb538cb85ece7dcac7`.
+- Clean Newton candidate measured in the 20-task table: `a25b4c45f86ae9ea4d3ff8fb538cb85ece7dcac7`; later cleanup checked separately at `c39323114a8999eefd6d8ea0f30daa54fe7cd229`.
 - Isaac Lab: `53ee6b44c2334341305dbdf385a3916c6b140799`, publicly reachable at `ooctipus/IsaacLab` branch `ooctipus/fpgs-contact-reset-20260913`, plus the included `isaaclab.patch`.
 - Retained helpers: exact bytes from local Newton commit `9233cffd6a4729c71a864e2ec2621c6d6d6de604`. `compare_backends.py` was last changed at `020c213ed0b5c3c19f3d824104ed72c32a0cc27b`. At preparation time (September 26, 2026), both commits returned GitHub HTTP 422 (not publicly reachable), which is why their exact helper files are included. Existing public branch `ooctipus/fpgs-structural-progress-20260917` at `301b6688ea74a7372a007f03989664890f0d2540` has older, nonidentical Python helpers; it must not be silently substituted.
 - The three Isaac Lab profiling dependencies (`compare_gpus.py`, `run_profiled.py`, `analyze_nsys.py`) are clean, unchanged files at the Lab pin above. The optional MJWarp line-search helper is not needed for this FPGS-only comparison.
