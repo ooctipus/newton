@@ -2057,6 +2057,8 @@ class SolverFeatherPGS(SolverBase):
             raise ValueError("contact_friction_scale must be non-negative")
         if self.contact_friction_anchor_limit < 0:
             raise ValueError("contact_friction_anchor_limit must be non-negative")
+        # The deprecated input must not reach legacy point-row writers or scale their friction.
+        self.contact_friction_anchor_limit = 0
         self.enable_joint_limits = enable_joint_limits
         self.enable_bilateral_preelimination = bool(enable_bilateral_preelimination)
         self.bilateral_preelimination_include_mimics = bool(bilateral_preelimination_include_mimics)
@@ -10554,7 +10556,12 @@ class SolverFeatherPGS(SolverBase):
                             continue
                         if self._compact_contact_boundary and size == 6:
                             continue  # Complete contact stores; the next step clears only its limit prefix.
-                        if _SKIP_J_CLEAR and (_ROWS_MASKED or _ROWS_NATIVE) and size <= 32:
+                        if (
+                            _SKIP_J_CLEAR
+                            and self._point_contact_paths
+                            and (_ROWS_MASKED or _ROWS_NATIVE)
+                            and size <= 32
+                        ):
                             continue
                         wp.launch(
                             clear_grouped_jacobian_active_rows,
@@ -11597,6 +11604,7 @@ class SolverFeatherPGS(SolverBase):
                         device=model.device,
                     )
                     _report_grouped_check("tau", [state_aug.body_ft_s, state_aug.joint_tau], ref)
+                return
             elif self._tree_plan is not None:
                 for group, net_wrench in zip(self._tree_plan.groups, self._tree_net_wrenches, strict=True):
                     per_warp = 32 // group.lanes
@@ -13313,14 +13321,15 @@ class SolverFeatherPGS(SolverBase):
                             device=model.device,
                         )
             else:
+                check_rows = self._point_contact_paths and _CHECK_ROWS
                 masked_sizes = (
                     [int(sz) for sz in self.size_groups if sz <= 32]
-                    if (_ROWS_MASKED and not _ROWS_NATIVE and not _CHECK_ROWS)
+                    if (self._point_contact_paths and _ROWS_MASKED and not _ROWS_NATIVE and not check_rows)
                     else []
                 )
                 combined_done = False
                 for size in self.size_groups:
-                    masked = (_ROWS_MASKED or _ROWS_NATIVE) and size <= 32
+                    masked = self._point_contact_paths and (_ROWS_MASKED or _ROWS_NATIVE) and size <= 32
                     if masked_sizes and 1 <= len(masked_sizes) <= 2 and size in masked_sizes:
                         if combined_done:
                             continue
@@ -13499,7 +13508,7 @@ class SolverFeatherPGS(SolverBase):
                                 ref,
                             )
                         continue
-                    if (masked or _CHECK_ROWS) and _ROWS_NATIVE:
+                    if (masked or check_rows) and _ROWS_NATIVE:
                         kern = getattr(self, "_row_build_native_kernel", None)
                         if kern is None:
                             kern = get_row_build_native_kernel()
@@ -13515,7 +13524,7 @@ class SolverFeatherPGS(SolverBase):
                             self.target_velocity,
                             self.row_restitution,
                         ]
-                        if _CHECK_ROWS:
+                        if check_rows:
                             J_out = wp.clone(J_out)
                             meta_out = [wp.clone(a) for a in meta_out]
                         nblocks = min(int(contacts.rigid_contact_point0.shape[0]), 4 * _CONTACT_BUILD_THREAD_CAP)
@@ -13567,11 +13576,11 @@ class SolverFeatherPGS(SolverBase):
                             block_dim=32,
                             device=model.device,
                         )
-                        if _CHECK_ROWS:
+                        if check_rows:
                             self._rows_check = (size, J_out, meta_out)
-                        if masked and not _CHECK_ROWS:
+                        if masked and not check_rows:
                             continue
-                    elif masked or _CHECK_ROWS:
+                    elif masked or check_rows:
                         cap = int(contacts.rigid_contact_point0.shape[0])
                         pre = getattr(self, "_rows_prelude", None)
                         if pre is None or pre["flags"].shape[0] != cap:
@@ -13590,7 +13599,7 @@ class SolverFeatherPGS(SolverBase):
                             self.target_velocity,
                             self.row_restitution,
                         ]
-                        if _CHECK_ROWS:
+                        if check_rows:
                             J_out = wp.clone(J_out)
                             meta_out = [wp.clone(a) for a in meta_out]
                         rows_threads = min(cap, _ROWS_THREADS_X * _CONTACT_BUILD_THREAD_CAP)
@@ -13676,9 +13685,9 @@ class SolverFeatherPGS(SolverBase):
                             outputs=[J_out, J_out],
                             device=model.device,
                         )
-                        if _CHECK_ROWS:
+                        if check_rows:
                             self._rows_check = (size, J_out, meta_out)
-                        if masked and not _CHECK_ROWS:
+                        if masked and not check_rows:
                             continue
                     wp.launch(
                         populate_world_J_for_size,
@@ -13739,7 +13748,7 @@ class SolverFeatherPGS(SolverBase):
                         ],
                         device=model.device,
                     )
-                    if _CHECK_ROWS and getattr(self, "_rows_check", None) is not None and self._rows_check[0] == size:
+                    if check_rows and getattr(self, "_rows_check", None) is not None and self._rows_check[0] == size:
                         _, J_m, meta_m = self._rows_check
                         _report_grouped_check(f"rows_J_{size}", [J_m], [self.J_by_size[size]])
                         legacy_meta = [

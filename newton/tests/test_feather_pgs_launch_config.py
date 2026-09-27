@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import ast
 import inspect
+import textwrap
 import unittest
 from unittest import mock
 
@@ -216,6 +218,45 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         ):
             with self.subTest(name=name):
                 self.assertEqual(parameters[name].kind, inspect.Parameter.KEYWORD_ONLY)
+
+    def test_point_row_builders_preserve_main_contact_defaults(self):
+        """Admit legacy row switches only for explicit point friction, including debug dispatch."""
+        model = _build_chain_model(num_links=12, num_worlds=1)
+        source = textwrap.dedent(inspect.getsource(SolverFeatherPGS._stage4_build_rows))
+        assignments = {
+            node.targets[0].id: node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id in ("masked_sizes", "masked", "check_rows")
+        }
+        step = ast.parse(textwrap.dedent(inspect.getsource(SolverFeatherPGS.step)))
+        skip_clear = next(
+            node.test
+            for node in ast.walk(step)
+            if isinstance(node, ast.If) and "_SKIP_J_CLEAR" in ast.unparse(node.test)
+        )
+        for beta, allowed in ((None, False), (0.0, True)):
+            solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
+            self.assertEqual(solver._point_contact_paths, allowed)
+            for switch in ("_ROWS_MASKED", "_ROWS_NATIVE", "_CHECK_ROWS"):
+                with self.subTest(beta=beta, switch=switch):
+                    values = dict.fromkeys(("_ROWS_MASKED", "_ROWS_NATIVE", "_CHECK_ROWS"), False)
+                    values.update(self=solver, size=12, _SKIP_J_CLEAR=True)
+                    values[switch] = True
+                    # Execute the actual dispatch expressions without CUDA row launches.
+                    # Older code read the debug switch directly instead of gating it.
+                    values["check_rows"] = values["_CHECK_ROWS"]
+                    for node in sorted(assignments.values(), key=lambda node: node.lineno):
+                        exec(compile(ast.Module(body=[node], type_ignores=[]), "<row-dispatch>", "exec"), values)
+                    self.assertEqual(values["masked"], allowed and switch != "_CHECK_ROWS")
+                    self.assertEqual(bool(values["masked_sizes"]), allowed and switch == "_ROWS_MASKED")
+                    self.assertEqual(values["check_rows"], allowed and switch == "_CHECK_ROWS")
+                    self.assertEqual(
+                        eval(compile(ast.Expression(skip_clear), "<row-clear>", "eval"), values),
+                        allowed and switch != "_CHECK_ROWS",
+                    )
 
     def test_launch_geometry_kernels_use_dedicated_modules(self):
         """Keep custom-block-dimension kernels out of the general module."""

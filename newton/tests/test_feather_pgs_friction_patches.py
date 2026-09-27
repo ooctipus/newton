@@ -1025,6 +1025,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         model = builder.finalize(device="cpu")
         with self.assertWarns(DeprecationWarning):
             solver = newton.solvers.SolverFeatherPGS(model, contact_friction_anchor_limit=2)
+        self.assertEqual(solver.contact_friction_anchor_limit, 0)
         self.assertTrue(solver._friction_anchors_enabled)
         self.assertAlmostEqual(solver.friction_anchor_beta, 0.2)
         if wp.is_cuda_available():
@@ -1048,6 +1049,9 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         with self.assertWarns(DeprecationWarning):
             solver = newton.solvers.SolverFeatherPGS(model, contact_friction_anchor_limit=2, friction_anchor_beta=0.0)
         self.assertFalse(solver._friction_anchors_enabled)
+        self.assertEqual(solver.contact_friction_anchor_limit, 0)
+        with self.assertRaisesRegex(ValueError, "contact_friction_anchor_limit must be non-negative"):
+            newton.solvers.SolverFeatherPGS(model, contact_friction_anchor_limit=-1)
 
     def test_anchor_selection_respects_contact_gap_filters(self):
         """Keep filtered extreme points from removing friction from a loaded middle contact."""
