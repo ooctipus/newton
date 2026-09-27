@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Live model/descriptor regressions without captured inputs or a GPU."""
+"""Live model/descriptor regressions, with optional CUDA compilation checks."""
 
 import importlib
 import unittest
@@ -117,6 +117,29 @@ def live_solver(worlds=2):
 
 class TestKineticLiveBindings(unittest.TestCase):
     """Require package-local live bindings before testing their ownership."""
+
+    def test_compact_general_keeps_friction_helper(self):
+        """Retain the local tangent helper and compile every visible CUDA target."""
+        solver = importlib.import_module("newton._src.solvers.feather_pgs.solver_feather_pgs")
+        compact = importlib.import_module("newton._src.solvers.feather_pgs.kinetic_compact_coupled")
+        friction = importlib.import_module("newton._src.solvers.feather_pgs.friction")
+        original = solver._get_pgs_solve_mf_gs_kernel(
+            192,
+            64,
+            29,
+            "cpu",
+            has_drive_rows=False,
+            has_dense_velocity_limit_rows=False,
+            factor_coordinates=True,
+            independent_components=True,
+        )
+        kernel = compact.get_general_kernel(original)
+        cuda_source = kernel.compact_source.split("#else", 1)[0]
+        self.assertEqual(cuda_source.count(friction.FRICTION_PAIR_CUDA), 1)
+        self.assertGreater(cuda_source.count("friction_pair_candidate("), 0)
+        for device in wp.get_cuda_devices():
+            with self.subTest(device=str(device)):
+                kernel.module.load(device)
 
     def test_live_api_exists(self):
         """Require live plan and binding entry points without fixture imports."""

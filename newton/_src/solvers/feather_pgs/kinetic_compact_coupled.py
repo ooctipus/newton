@@ -249,8 +249,16 @@ def compact_source(original_kernel):
         "    for(int i=lane;i<m;i+=32)finite &= isfinite(s_lam[i]);\n    for(int i=lane;i<m_mf;i+=32)finite &= isfinite(s_lam_mf[i]);\n    if(!__all_sync(MASK,finite))",
     )
     dense += "\n    for(int i=lane;i<m_mf;i+=32)mf_impulses.data[off_mf+i]=s_lam_mf[i];\n"
+    # Extracting the recurrence above drops its function-local tangent helper.
     return (
-        "#if defined(__CUDA_ARCH__)\n" + original._T + dense + "\n#else\n" + original._T + cpu_source() + "\n#endif\n",
+        "#if defined(__CUDA_ARCH__)\n"
+        + original.FRICTION_PAIR_CUDA
+        + original._T
+        + dense
+        + "\n#else\n"
+        + original._T
+        + cpu_source()
+        + "\n#endif\n",
         baseline,
         mf_body,
     )

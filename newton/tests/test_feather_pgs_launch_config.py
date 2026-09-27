@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import inspect
 import unittest
 from unittest import mock
 
@@ -196,6 +197,25 @@ def _build_heterogeneous_world_model():
 
 
 class TestFeatherPGSLaunchConfig(unittest.TestCase):
+    def test_research_options_preserve_positional_solver_budget(self):
+        parameters = inspect.signature(SolverFeatherPGS).parameters
+        names = list(parameters)
+        self.assertEqual(names[names.index("fuse_joint_velocity_limits") + 1], "pgs_iterations")
+        for name in (
+            "mf_gs_incremental_rows",
+            "mf_gs_parallel_rows",
+            "mf_gs_parallel_sweeps",
+            "mf_gs_parallel_nesterov",
+            "mf_gs_parallel_tol",
+            "mf_gs_parallel_matrix_free",
+            "mf_gs_response_block_rows",
+            "mf_gs_response_block_lane_rows",
+            "grouped_dynamics",
+            "lazy_kinematics",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(parameters[name].kind, inspect.Parameter.KEYWORD_ONLY)
+
     def test_launch_geometry_kernels_use_dedicated_modules(self):
         """Keep custom-block-dimension kernels out of the general module."""
         expected_modules = {
