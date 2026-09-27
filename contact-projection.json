@@ -1,0 +1,2991 @@
+{
+  "bundle_sha256": {
+    "README.md": "a1ed68ef2bd4fe338f92706c9963c67d48b4a100440a1e7f9143b4e436d19ccc",
+    "benchmark.py": "b199834dc22fdafc2c44627222fd76c9be53979563c9734b581253e73b912726",
+    "capture_adapter.py": "289f0589856cc771d2b039a3e72e5c7f3a5e19806a5ac42f6af7cab17d957ee6",
+    "launch_capture.py": "6c73630c9e1ce17670a15607314899df2db1bc993413425fbaaff3fe18004ac6",
+    "capacities.json": "11d0f9386aaaeac86e518cdc2508108be8effd7fc1cb15109d35bfaef73f6fb2",
+    "isaaclab.patch": "7d514d9d368a295f0525789725a1f7bec0423caf82bbda23621fe92aadedc6ee",
+    "contact-projection.md": "0bf1d8ed772526303349a12e92c4ad76684d48498cbc14f2bda8849ff8d1158b",
+    "results.json": "04bed3c47540716baad9da1f88eff0ee7c229cba655cc43c6b92fcc716343388",
+    "extension.json": "a2e725976fb9beeae9175b386b59592d463a4490db62f89faf2c2b080210eead"
+  },
+  "title": "Sparse FPGS contact projection: final-head and incremental measurements",
+  "date": "2026-09-27",
+  "source": {
+    "baseline_commit": "5238407d320823e71a5a4623c2c83c293d7b00fd",
+    "candidate_commit": "a25b4c45f86ae9ea4d3ff8fb538cb85ece7dcac7",
+    "baseline_origin": "Recorded clean-main captures in results.json; not rerun for this contact projection follow-up",
+    "candidate_tree_clean": true,
+    "isaaclab_commit": "53ee6b44c2334341305dbdf385a3916c6b140799",
+    "isaaclab_source_diff_sha256": "cfd75b639b9f38b3b509853e8009a915c754fb4c4757c40d5264590ca5bca15a",
+    "initial_candidate_archive": "results.json",
+    "baseline_results_sha256": "04bed3c47540716baad9da1f88eff0ee7c229cba655cc43c6b92fcc716343388",
+    "capture_driver_sha256": {
+      "benchmark_extension.py": "12c6ab7519956c872a0a32c6cd54615c8cbc51e679af87f5dc85750a3da9c8fd",
+      "benchmark.py": "528dff0612a060d92a7b57858a1a795ce36c45464a285947e2c26e1b831929aa",
+      "capture_adapter.py": "fa09ab6b70fe037b07350af996dbb517ccb3c0674d49c508cb63d266de1a519f",
+      "launch_capture.py": "6c73630c9e1ce17670a15607314899df2db1bc993413425fbaaff3fe18004ac6"
+    },
+    "immediate_parent_commit": "1472112114f70e288012731a7639d69228e258de",
+    "prior_candidate_archive": "extension.json",
+    "final20_queue_sha256": "9579e8694c4e99c93258d5db6754965d397ba4f80ee62508ac06cb449d16b9c8"
+  },
+  "sampling": {
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "gpu_index": 0,
+    "num_envs": 16384,
+    "seed": 0,
+    "warmup_steps": 200,
+    "environment_timing_steps": 40,
+    "physics_profile_steps": 40,
+    "captures_per_task_per_revision": 1,
+    "cuda_graph": true,
+    "video": false,
+    "env_fps_scope": "Random-action environment transitions per second, 16384 / synchronized-boundary mean loop seconds; not training FPS",
+    "physics_scope": "Main physics CUDA graph per environment step over a separate 40-step profiling window; sensor graphs and eager environment/reset work excluded",
+    "workload": "20 native task recipes; solver features, substeps, iterations and capacities matched. SO101 Keyboard 736 ordinary rows on both arms; no Ant/Humanoid matrix-free override.",
+    "interpretation": "One final-head capture per task against recorded baseline; no confidence intervals or repeat qualification of small differences."
+  },
+  "implementation": {
+    "scope": "FPGS only; Isaac Lab, collision, solver budgets, task recipes and capacities unchanged",
+    "projection": "Build supported endpoint Jacobians once, then project normal and tangent directions together using the existing compact factor-row ABI; no global Jacobian staging or extra conversion launch",
+    "execution": "Eight lanes per contact, with a bounded worker grid and support-only packed-factor traversal; no robot-name dispatch",
+    "supported_features": "Several same-topology articulations per world, independent free bodies, prescribed contact endpoints; same-articulation endpoints combine before projection",
+    "remaining_limits": "One articulated topology group, at most 64 articulated response DOFs; unsupported features retain the existing path"
+  },
+  "ordinary_row_storage": {
+    "task": "KukaAllegro lift",
+    "num_envs": 16384,
+    "rows_per_world": 192,
+    "units": "MiB = 2^20 bytes",
+    "prior_mib": 1392,
+    "candidate_mib": 492,
+    "reduction_mib": 900,
+    "reduction_percent": 64.65517241379311,
+    "prior_buffers": [
+      {
+        "name": "J_by_size + Y_by_size",
+        "shape": "2 × 16384 × 192 × (23 + 6)",
+        "element_bytes": 4,
+        "mib": 696
+      },
+      {
+        "name": "J_world + Y_world",
+        "shape": "2 × 16384 × 192 × 29",
+        "element_bytes": 4,
+        "mib": 696
+      }
+    ],
+    "candidate_buffers": [
+      {
+        "name": "_sparse_row_dof",
+        "shape": [
+          16384,
+          192,
+          17
+        ],
+        "element_bytes": 4,
+        "mib": 204
+      },
+      {
+        "name": "_sparse_row_factor",
+        "shape": [
+          16384,
+          192,
+          17
+        ],
+        "element_bytes": 4,
+        "mib": 204
+      },
+      {
+        "name": "_sparse_row_free_response",
+        "shape": [
+          16384,
+          192,
+          6
+        ],
+        "element_bytes": 4,
+        "mib": 72
+      },
+      {
+        "name": "_sparse_row_incident",
+        "shape": [
+          16384,
+          192
+        ],
+        "element_bytes": 4,
+        "mib": 12
+      }
+    ],
+    "scope": "Allocated large ordinary contact-row arrays only. Prior per-group and per-world arrays are separate (_jy_world_aliased=false). Excludes factors, native MF rows, velocity/mask buffers, row metadata, tiny dummy views and every other allocation. Not total process/peak VRAM or memory traffic.",
+    "evidence": [
+      "multi-baseline/kuka/round_01_kuka_fpgs_gpu0/capture.json",
+      "multi-candidate-mixed/kuka-active/kuka/round_01_kuka_fpgs_gpu0/capture_checks.json",
+      "multi-candidate-mixed/admission-kuka/admission.json"
+    ],
+    "free_response_shape_probe_sha256": "fdbdc12e6809ec6fa88cd1ae60af313642fe328270b8e3c47efe4cbfba3268e3",
+    "free_response_shape_note": "The recorded one-world constructor probe confirms [1,192,6]; full-size allocation computed with the checked 16384-world count and final source allocation expressions."
+  },
+  "validation": {
+    "final_suite": {
+      "rtx": {
+        "discovered": 78,
+        "passed": 77,
+        "skipped": 1,
+        "failed": 0
+      },
+      "gb300": {
+        "discovered": 78,
+        "passed": 76,
+        "skipped": 1,
+        "failed": 1
+      },
+      "skip": "Inherited obsolete drive-only warm-start fixture",
+      "known_failure": {
+        "test": "test_feather_pgs_sparse_solver.TestFeatherPGSSparseSolver.test_two_articulations_share_contact_solve",
+        "reason": "Independent dense/sparse rollouts allocate joint-limit/contact bundles in different atomic orders; the comparison is order-sensitive",
+        "diagnostic": "Substituting only the parent scalar producer reproduces the first-step mismatch (maximum |dq| 0.089762628 versus 0.08976269). On 34 identical-input producer replays, compact indices match and maximum factor/incident/diagonal differences are 8.94e-8, 1.04e-7 and 2.38e-7",
+        "final_gb300_max_qd_difference": 0.02272791,
+        "status": "Not fixed; no tolerance or fixture changes; full GB300 suite is not a clean pass"
+      }
+    },
+    "direct_oracles": "CPU/CUDA dense-response comparisons include 8/16/32-lane groups, 3/6/43/64-DOF cases, bit 63, partial groups, 1/3 reserved rows, distinct anchors, same/different articulations, free metrics and coordinate offsets",
+    "precommit": "All hooks pass",
+    "independent_review": "Read-only source review found no concrete correctness or maintainability issue; reviewer did not run GPU jobs",
+    "limits": "Short random-action captures are not training-equivalence or convergence proof; collision boundary snapshots and sticky row warnings are not lifetime no-drop certification. Do not credit inactive-path timing variation to this PR.",
+    "final20": {
+      "captures": 20,
+      "boundary_checks": 40,
+      "all_checks_pass": true,
+      "graphs_on": true,
+      "video": false,
+      "sparse_active_count": 12,
+      "artifact_hashes": 80,
+      "artifact_hash_verification": "All 80 final-run artifact hashes verified independently; 520 total comparisons including source/driver/baseline/parent hashes",
+      "independent_hash_checks_total": 520
+    }
+  },
+  "producer_attribution": {
+    "task": "KukaAllegro lift",
+    "gpu": "NVIDIA GB300",
+    "num_envs": 16384,
+    "parent_commit": "1472112114f70e288012731a7639d69228e258de",
+    "candidate_commit": "a25b4c45f86ae9ea4d3ff8fb538cb85ece7dcac7",
+    "profile_steps": 5,
+    "kernel_calls": 40,
+    "kernel_calls_per_environment_step": 8,
+    "parent": {
+      "ms_per_environment_step": 5.6860928,
+      "kernel": "populate_sparse_contact_response_54d55138_cuda_kernel_forward",
+      "registers": 107,
+      "shared_bytes": 1024,
+      "local_bytes_per_thread": 0,
+      "grid_x": 768,
+      "block_x": 256,
+      "artifact_locator": "contact-projection/candidate/node-baseline/kuka/round_01_kuka_fpgs_gpu1/capture.sqlite",
+      "sha256": "baabf0d33cab18f98a6e0f679af51d4e87faba28d0976608bf4d20064db97f4c",
+      "workload": {
+        "ordinary_rows": [
+          546439,
+          546769
+        ],
+        "contacts": [
+          240721,
+          240677
+        ],
+        "native_mf_rows": [
+          980,
+          957
+        ]
+      }
+    },
+    "candidate": {
+      "ms_per_environment_step": 2.591417,
+      "kernel": "populate_sparse_contact_response_23_8_4_49839cfb_cuda_kernel_forward",
+      "registers": 89,
+      "shared_bytes": 6080,
+      "local_bytes_per_thread": 0,
+      "grid_x": 1024,
+      "block_x": 128,
+      "artifact_locator": "contact-projection/qualification/gpu1-node/kuka/round_01_kuka_fpgs_gpu1/capture.sqlite",
+      "sha256": "c33e9bf1a7792fe13f0cfbc6b44dbeb619a153fc25bbb390536ce5ab7d935741",
+      "workload": {
+        "ordinary_rows": [
+          546905,
+          548682
+        ],
+        "contacts": [
+          241057,
+          241529
+        ],
+        "native_mf_rows": [
+          1100,
+          1010
+        ]
+      }
+    },
+    "gain": 2.1942021681574215,
+    "query": "SELECT SUM(k.end-k.start)/5e6 AS ms_per_step, COUNT(*) AS calls FROM CUPTI_ACTIVITY_KIND_KERNEL AS k JOIN StringIds AS s ON k.shortName=s.id WHERE s.value LIKE 'populate_sparse_contact_response%' AND k.graphNodeId IS NOT NULL AND k.graphNodeId!=0",
+    "scope": "Summed contact-producer graph-node kernel activity in a separate five-step diagnostic capture; not whole-graph critical path or the 40-step headline physics measurement"
+  },
+  "incremental": {
+    "parent_commit": "1472112114f70e288012731a7639d69228e258de",
+    "candidate_commit": "a25b4c45f86ae9ea4d3ff8fb538cb85ece7dcac7",
+    "sampling": "16,384 environments; 200 warmup steps, 40 timed environment steps and 40 separate graph steps; graphs on, video off; one fresh capture per arm per GPU/task",
+    "order": "Initial147 baseline → 271 discovery → fresh147 controls → finala25 captures; RTX a25 values reused from the final20 sweep. This is not two interleaved ABBA repeats at a single candidate commit.",
+    "results": [
+      {
+        "task": "KukaAllegro lift",
+        "task_key": "kuka",
+        "gpu_index": 0,
+        "gpu": "RTX PRO6000",
+        "parent": {
+          "physics_ms": 25.043685399999998,
+          "loop_ms": 43.713576201116666,
+          "env_fps": 374803.46894110827,
+          "artifact_locator": "contact-projection/qualification/gpu0-control/kuka/round_01_kuka_fpgs_gpu0",
+          "artifact_sha256": {
+            "capture.json": "757822bf88ad986ac9a4976ebe7e430a9ded38801af22e1d83b019c0b639565e",
+            "capture_checks.json": "82296b66dc6777d7a5d9be89d9f82fc433f391cdf458d7facdd9d9eae7a084d1",
+            "capture_analysis.json": "ca167e5e4bac75222dec9eaa4fd0dee4d16ccf5953e17fcb58bd20a2d1076124",
+            "capture.log": "c58edd8ddab91966df8b5aa4dc705f0e1ab6bbcd5a41a0e909660cb1f4a8ab41"
+          },
+          "checks": {
+            "pass": true,
+            "complete": true,
+            "boundaries": 2,
+            "physics_budgets_modified": false,
+            "physics_work_modified": false,
+            "log_warnings": []
+          }
+        },
+        "candidate": {
+          "physics_ms": 22.44084995,
+          "loop_ms": 41.715444449801,
+          "env_fps": 392756.21334242215,
+          "artifact_locator": "contact-projection/final20/kuka/kuka/round_01_kuka_fpgs_gpu0",
+          "artifact_sha256": {
+            "capture.json": "1ada1d7d6b4fe82c0108e9f4b62264cc4a01b80fa8f8f05e868313967751f54a",
+            "capture_checks.json": "8906622c1d54d99e3edf0890e517b446827bfc6aa1355b7e7343e1f4e7beed82",
+            "capture_analysis.json": "d746f958022c7104a805f320ccc95fda67e7bc4bba124e15ddd72dc6fefd41d8",
+            "capture.log": "16671fd61c4a281ba8227b4219ff6e6e054480d3830b48c5d8e52011e46a8e29"
+          },
+          "checks": {
+            "pass": true,
+            "complete": true,
+            "boundaries": 2,
+            "physics_budgets_modified": false,
+            "physics_work_modified": false,
+            "log_warnings": []
+          }
+        },
+        "physics_gain": 1.1159864914118371,
+        "env_fps_gain": 1.0478990881595462
+      },
+      {
+        "task": "KukaAllegro lift",
+        "task_key": "kuka",
+        "gpu_index": 1,
+        "gpu": "GB300",
+        "parent": {
+          "physics_ms": 24.479629425,
+          "loop_ms": 43.4069652488688,
+          "env_fps": 377450.9437843497,
+          "artifact_locator": "contact-projection/qualification/gpu1-control/kuka/round_01_kuka_fpgs_gpu1",
+          "artifact_sha256": {
+            "capture.json": "2cead26d33b907e56c6ae0f3eebafbf81ffc46303d364ca396e7afe8411ef177",
+            "capture_checks.json": "cda5557e4ea9061d080bc0f4a33013362f36de28a68eceeb9bf4cfb655224618",
+            "capture_analysis.json": "55bad439b4548ad1c40e3b9e2b5a5af68eea888cbe67fcca0641355b848621f1",
+            "capture.log": "61aa12d259be5315188e291e36d7ad7531e13336fbb91009c24f2f982a432799"
+          },
+          "checks": {
+            "pass": true,
+            "complete": true,
+            "boundaries": 2,
+            "physics_budgets_modified": false,
+            "physics_work_modified": false,
+            "log_warnings": []
+          }
+        },
+        "candidate": {
+          "physics_ms": 21.17855375,
+          "loop_ms": 40.86865077260882,
+          "env_fps": 400894.07627278374,
+          "artifact_locator": "contact-projection/qualification/gpu1-candidate/kuka/round_01_kuka_fpgs_gpu1",
+          "artifact_sha256": {
+            "capture.json": "205f96c9100637b688b4325092005bc468ea76269d694ace577c861703dd84a7",
+            "capture_checks.json": "3810d07b92449f8302fdb65d02b3194730554cdd2d26d841f962d2a53dc6cefe",
+            "capture_analysis.json": "fb0b1947e00224386cc273695d6cac37d74089d41bc0ae16984eec2c1c1b99f0",
+            "capture.log": "9025f450eeae7802ced628de300fb708f955a4ffef26d00b5fc977bc793d415a"
+          },
+          "checks": {
+            "pass": true,
+            "complete": true,
+            "boundaries": 2,
+            "physics_budgets_modified": false,
+            "physics_work_modified": false,
+            "log_warnings": []
+          }
+        },
+        "physics_gain": 1.1558687960456224,
+        "env_fps_gain": 1.0621090843048144
+      },
+      {
+        "task": "G1 rough",
+        "task_key": "g1",
+        "gpu_index": 0,
+        "gpu": "RTX PRO6000",
+        "parent": {
+          "physics_ms": 30.998195350000003,
+          "loop_ms": 45.074820023728535,
+          "env_fps": 363484.535076902,
+          "artifact_locator": "contact-projection/qualification/gpu0-control/g1/round_01_g1_fpgs_gpu0",
+          "artifact_sha256": {
+            "capture.json": "3ea755f8c37053ed6f2ce5e2e0e64eaf0dcaf01fc154de0b8805eed25f84f048",
+            "capture_checks.json": "649273c339a3757ff665a26ad84e9beea0127ff328b85ad2ff96930bc95439eb",
+            "capture_analysis.json": "9eae40828a0d6f17d75e47980ef1f4f1b0be17b86322490f49f2b4a20f33748b",
+            "capture.log": "e8cbe9e6b8e3e91e751e917f92ef6aabcfaafd118f2cec5a8a1275ae73f76abe"
+          },
+          "checks": {
+            "pass": true,
+            "complete": true,
+            "boundaries": 2,
+            "physics_budgets_modified": false,
+            "physics_work_modified": false,
+            "log_warnings": []
+          }
+        },
+        "candidate": {
+          "physics_ms": 30.321195025,
+          "loop_ms": 44.94868087640498,
+          "env_fps": 364504.57901202823,
+          "artifact_locator": "contact-projection/final20/g1/g1/round_01_g1_fpgs_gpu0",
+          "artifact_sha256": {
+            "capture.json": "4867a8f3d24e91b767f6496662e5f78d313c36a416a1983269e4864ba498eabf",
+            "capture_checks.json": "7bcd26391387a25fd89212d339811afeede382d3270b28e8bdfa88424681f199",
+            "capture_analysis.json": "4f6e54fe106dc1d4e45c877bf81790fa101c3edc6b7887906ff0c22990c33768",
+            "capture.log": "23187a0f822aab401999f4d849075d001c1838845b278e09478d4919b09b2acb"
+          },
+          "checks": {
+            "pass": true,
+            "complete": true,
+            "boundaries": 2,
+            "physics_budgets_modified": false,
+            "physics_work_modified": false,
+            "log_warnings": []
+          }
+        },
+        "physics_gain": 1.0223276267456414,
+        "env_fps_gain": 1.0028062925288153
+      },
+      {
+        "task": "G1 rough",
+        "task_key": "g1",
+        "gpu_index": 1,
+        "gpu": "GB300",
+        "parent": {
+          "physics_ms": 44.99046085,
+          "loop_ms": 58.55759439873509,
+          "env_fps": 279792.9144499473,
+          "artifact_locator": "contact-projection/qualification/gpu1-control/g1/round_01_g1_fpgs_gpu1",
+          "artifact_sha256": {
+            "capture.json": "d1f0cca6fa8510e859533cdac2d53f431e2e4abde3266056899af8921f9abce4",
+            "capture_checks.json": "2d797ba93ae1b3b75704eafef78d6cc6555504567a7b265e467544b4641d3715",
+            "capture_analysis.json": "877668968c747769be5c3f27d70d61210f3c0051e1f2ece182c67604fc820a7a",
+            "capture.log": "96bf581131f6e76a30b23fe1ffd5546104ef08b66b07e3480ef86ee2a86c7e12"
+          },
+          "checks": {
+            "pass": true,
+            "complete": true,
+            "boundaries": 2,
+            "physics_budgets_modified": false,
+            "physics_work_modified": false,
+            "log_warnings": []
+          }
+        },
+        "candidate": {
+          "physics_ms": 43.6895934,
+          "loop_ms": 57.887834348366596,
+          "env_fps": 283030.1078703647,
+          "artifact_locator": "contact-projection/qualification/gpu1-candidate/g1/round_01_g1_fpgs_gpu1",
+          "artifact_sha256": {
+            "capture.json": "a8c844af136452b41a72587e88fc885e7d2b351d99f90b037d8f26256709a426",
+            "capture_checks.json": "0ec0eec68404e28411b460e14244d13dc1d69ba1eb9829043e052977caf3faed",
+            "capture_analysis.json": "81ccc7d271217c9c7e4513a2ebb58131591aa0cf87de1a208ccb081b85f77e25",
+            "capture.log": "6ff0804b16df4219b1c39295f3927cdde6b149ce663b781738c3e006e83c7d20"
+          },
+          "checks": {
+            "pass": true,
+            "complete": true,
+            "boundaries": 2,
+            "physics_budgets_modified": false,
+            "physics_work_modified": false,
+            "log_warnings": []
+          }
+        },
+        "physics_gain": 1.0297752244588296,
+        "env_fps_gain": 1.011569962115665
+      },
+      {
+        "task": "Cassie flat",
+        "task_key": "cassie-flat",
+        "gpu_index": 0,
+        "gpu": "RTX PRO6000",
+        "parent": {
+          "physics_ms": 8.801710374999999,
+          "loop_ms": 17.786839525797404,
+          "env_fps": 921130.4783088206,
+          "artifact_locator": "contact-projection/qualification/gpu0-control/cassie-flat/round_01_cassie-flat_fpgs_gpu0",
+          "artifact_sha256": {
+            "capture.json": "0d3919a3c7ccf903b4ec083b70d228132051b7b6434f6eb7f85e5ac7ebe82660",
+            "capture_checks.json": "c4bb2becf0527e8d3605b14871ba4b69d4ddbaaa58758e47e05e4b943783042b",
+            "capture_analysis.json": "e1857aa4b159df981d472027568abd845de3109e1bc36ccda70fb8ceccc93544",
+            "capture.log": "065af65c680fbb622cd42d2fc8b84e5faf3fffcd57129ae807b407c687aaac45"
+          },
+          "checks": {
+            "pass": true,
+            "complete": true,
+            "boundaries": 2,
+            "physics_budgets_modified": false,
+            "physics_work_modified": false,
+            "log_warnings": []
+          }
+        },
+        "candidate": {
+          "physics_ms": 8.372438599999999,
+          "loop_ms": 18.00468454894144,
+          "env_fps": 909985.3960486786,
+          "artifact_locator": "contact-projection/final20/cassie-flat/cassie-flat/round_01_cassie-flat_fpgs_gpu0",
+          "artifact_sha256": {
+            "capture.json": "39e5813fbb223c5298da5a8fe16248297f49f8a917ce0344cf82e4edd787a102",
+            "capture_checks.json": "8b228d2908c6d7a10c000a1e340778a24e82e1799cd6635805675cd675024b64",
+            "capture_analysis.json": "8497a366db937c27f45589fa74f62c9aea562e91173eafc71cd5431a1de836c8",
+            "capture.log": "e06b6e54277551d8c6933db3f2ce20632297f391ba6fdce36c93120a4828521c"
+          },
+          "checks": {
+            "pass": true,
+            "complete": true,
+            "boundaries": 2,
+            "physics_budgets_modified": false,
+            "physics_work_modified": false,
+            "log_warnings": []
+          }
+        },
+        "physics_gain": 1.0512720123143093,
+        "env_fps_gain": 0.9879006476035791
+      },
+      {
+        "task": "Cassie flat",
+        "task_key": "cassie-flat",
+        "gpu_index": 1,
+        "gpu": "GB300",
+        "parent": {
+          "physics_ms": 9.426752800000001,
+          "loop_ms": 19.396713451715186,
+          "env_fps": 844679.1793251561,
+          "artifact_locator": "contact-projection/qualification/gpu1-control/cassie-flat/round_01_cassie-flat_fpgs_gpu1",
+          "artifact_sha256": {
+            "capture.json": "a295b676e892a5e00071c9960debae978010dc5c4a355ead7813308037d5d65b",
+            "capture_checks.json": "ce266bcfacf9acc2fbf446a196adadf0804d02eb9346fd7f663a6d27fa97bb9f",
+            "capture_analysis.json": "68ebeeae106c4daaeee16d0031d465a14d66f7c4eeccca1753d4b070ef5f6c12",
+            "capture.log": "6d7de1b538acb8968ccda2f8479f814e0a797979e8a609bb1f08a742afea42f2"
+          },
+          "checks": {
+            "pass": true,
+            "complete": true,
+            "boundaries": 2,
+            "physics_budgets_modified": false,
+            "physics_work_modified": false,
+            "log_warnings": []
+          }
+        },
+        "candidate": {
+          "physics_ms": 9.17590655,
+          "loop_ms": 19.551507948199287,
+          "env_fps": 837991.6292599305,
+          "artifact_locator": "contact-projection/qualification/gpu1-candidate/cassie-flat/round_01_cassie-flat_fpgs_gpu1",
+          "artifact_sha256": {
+            "capture.json": "be671e3a16a350ab2ddd020a98f2be5db7fcea2d4c825a5fd5c2d425c3ab9e19",
+            "capture_checks.json": "879bbd6a70a3da64b33efc281c47a28468b1ac0e3ffc5472eacb9d2aabd8bcea",
+            "capture_analysis.json": "f954e79cef9f84bb679e048949df6b3098a793e08a809a0dcf5aec23a2ddd9ff",
+            "capture.log": "6bd56777440a985cabf601594b5a3796d6ebba72b3920b63596446743187dfdc"
+          },
+          "checks": {
+            "pass": true,
+            "complete": true,
+            "boundaries": 2,
+            "physics_budgets_modified": false,
+            "physics_work_modified": false,
+            "log_warnings": []
+          }
+        },
+        "physics_gain": 1.0273374896129472,
+        "env_fps_gain": 0.9920827336237071
+      }
+    ],
+    "interpretation": "Kuka physics improvement reproduces on both GPUs. Cassie physics improves but fresh-pair environment time is 1.2% worse on RTX and 0.8% worse on GB300; small loop differences are not repeat-qualified."
+  },
+  "discovery": {
+    "parent_commit": "1472112114f70e288012731a7639d69228e258de",
+    "candidate_commit": "271e5e9c29dee09456b3f8e0318ec4a9041cd91a",
+    "relation_to_final": "Runtime and tests are byte-identical to a25b4c45; the final consolidated commit changes only the SVG compared with this checkpoint. These are not captures made at a25.",
+    "parent": [
+      {
+        "task_key": "kuka",
+        "gpu_index": 0,
+        "physics_ms": 24.680317199999998,
+        "loop_ms": 43.322843601345085,
+        "env_fps": 378183.85493724403,
+        "artifact_locator": "contact-projection/baseline/kuka/round_01_kuka_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "5a6cc887e067c20b438e43c0d4322d6a77f8e539b6020169e1e49b8e882ede0e",
+          "capture_checks.json": "508dc1e0630a3195ed38ce29b8abeddc6673f004436ec03d76d50b2575e0cef0",
+          "capture_analysis.json": "33ff205f002ef412dfbe42858c142a98ebd7be5b52c7feccf1849ef31d825328",
+          "capture.log": "e3819ebb0b1273550b7203d2610bcc184b467e2a05f46f1d0c9685dd367c88f7"
+        },
+        "checks": {
+          "pass": true,
+          "complete": true,
+          "boundaries": 2,
+          "physics_budgets_modified": false,
+          "physics_work_modified": false,
+          "log_warnings": []
+        }
+      },
+      {
+        "task_key": "kuka",
+        "gpu_index": 1,
+        "physics_ms": 24.1761233,
+        "loop_ms": 44.403408450307325,
+        "env_fps": 368980.6835062141,
+        "artifact_locator": "contact-projection/baseline/kuka/round_01_kuka_fpgs_gpu1",
+        "artifact_sha256": {
+          "capture.json": "20722c77fb735768dee76246d465b775f578959d524d3a26c69233dc2c8eab11",
+          "capture_checks.json": "fd0be3a80486ccebe9ecb27d418f4aa40c954f122fa73861828b076f65933cae",
+          "capture_analysis.json": "1d6b05a100273c6ad57b640e82808419886a6263d88620b7be2e78c3749ba652",
+          "capture.log": "cff883e3526e4990e6f110e77607a63bbde52f22459d2b2c971e53f79f61a566"
+        },
+        "checks": {
+          "pass": true,
+          "complete": true,
+          "boundaries": 2,
+          "physics_budgets_modified": false,
+          "physics_work_modified": false,
+          "log_warnings": []
+        }
+      },
+      {
+        "task_key": "g1",
+        "gpu_index": 0,
+        "physics_ms": 30.920815175000005,
+        "loop_ms": 45.792095601791516,
+        "env_fps": 357791.00704356085,
+        "artifact_locator": "contact-projection/baseline/g1/round_01_g1_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "a79b8b79fe53f4c5761c0e77be02d60b9c78142122fd4f9e33dedccf0ac9eac2",
+          "capture_checks.json": "3bc549f6cabfc1b715ba9ed661ca88a5889a264992774661e6afd8f07b86a110",
+          "capture_analysis.json": "dc55500b4aa828cb5e0e0418dd72aefee6d880c635aef39c38e173052c230b1f",
+          "capture.log": "c7bd9602e916534868fe7226f8eeecb8faf86f1121bd3228ecae4c6ff271b921"
+        },
+        "checks": {
+          "pass": true,
+          "complete": true,
+          "boundaries": 2,
+          "physics_budgets_modified": false,
+          "physics_work_modified": false,
+          "log_warnings": []
+        }
+      },
+      {
+        "task_key": "g1",
+        "gpu_index": 1,
+        "physics_ms": 44.908747725,
+        "loop_ms": 59.45692712266464,
+        "env_fps": 275560.82685199036,
+        "artifact_locator": "contact-projection/baseline/g1/round_01_g1_fpgs_gpu1",
+        "artifact_sha256": {
+          "capture.json": "a978ab9e0cbe9fee61aaf6a4f499884b13e10e2e8a16aaefaf2c2af13af0d87e",
+          "capture_checks.json": "29da2847885271feff01f869a82284771774fe83165a2ef51bd3faa62801ffa1",
+          "capture_analysis.json": "6a1b6754c2f0b6753058566900f042ef55e4902dbf3ae7d79de2d2ef1acb49ba",
+          "capture.log": "85e9921690f196f26a387e72068413d2762bdf1ad494047ebbe6e7885a51743d"
+        },
+        "checks": {
+          "pass": true,
+          "complete": true,
+          "boundaries": 2,
+          "physics_budgets_modified": false,
+          "physics_work_modified": false,
+          "log_warnings": []
+        }
+      },
+      {
+        "task_key": "cassie-flat",
+        "gpu_index": 0,
+        "physics_ms": 8.774864574999999,
+        "loop_ms": 19.47613460069988,
+        "env_fps": 841234.6872675257,
+        "artifact_locator": "contact-projection/baseline/cassie-flat/round_01_cassie-flat_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "85ea001cf2e8b6a4fd9e2478b644259833af9e3923fff4bfb85c1b0b313188d8",
+          "capture_checks.json": "518fc08ce892b46022c8106a41274f11a4651e732b8d370efdadb1b3a931773a",
+          "capture_analysis.json": "c5a4d2c76f753193a3482a6c578f8c0b88470b6b8e476c1ae7ba685e7371245f",
+          "capture.log": "94697f0201ca0fe5966016b2c74a98d013f64548b651fe2f256f2a90ca2e7073"
+        },
+        "checks": {
+          "pass": true,
+          "complete": true,
+          "boundaries": 2,
+          "physics_budgets_modified": false,
+          "physics_work_modified": false,
+          "log_warnings": []
+        }
+      },
+      {
+        "task_key": "cassie-flat",
+        "gpu_index": 1,
+        "physics_ms": 9.440279125,
+        "loop_ms": 20.18998317362275,
+        "env_fps": 811491.5133463269,
+        "artifact_locator": "contact-projection/baseline/cassie-flat/round_01_cassie-flat_fpgs_gpu1",
+        "artifact_sha256": {
+          "capture.json": "d5a786e4b8aa896efd0b856cf8ed987dc7fea361524c2f04e1a3d0f4fa9b895f",
+          "capture_checks.json": "fb3702620c06498e3e2015d9b34d55d307056a7b3b73e9c6d0c18f7e018d3108",
+          "capture_analysis.json": "fdab0f6505c9d6ddfe99287e31d8e5bb853364b4426956f185f41aa3c5b76008",
+          "capture.log": "415d1bdaec41746e1991b77fb283820903bfee12da8980438c655c77b790b076"
+        },
+        "checks": {
+          "pass": true,
+          "complete": true,
+          "boundaries": 2,
+          "physics_budgets_modified": false,
+          "physics_work_modified": false,
+          "log_warnings": []
+        }
+      }
+    ],
+    "candidate": [
+      {
+        "task_key": "kuka",
+        "gpu_index": 0,
+        "physics_ms": 22.453529675000002,
+        "loop_ms": 41.7156363488175,
+        "env_fps": 392754.40659709444,
+        "artifact_locator": "contact-projection/candidate-lanes8/kuka/round_01_kuka_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "1e5a4a6df26a84993bc6ba96246778a1272fbcdcabc29406f05bb0921c0f65b6",
+          "capture_checks.json": "573d9f86f2ad55830ad0f95c8be6dcc596404e9bd48a460d6a28a659129f1250",
+          "capture_analysis.json": "8815471ce547322789d40f916d16b32f195c1f3eb032b11f33a53144328655d3",
+          "capture.log": "930162eed7d5398b61f5ee818addad39b7f481265affd314bbc1a5bfc7429b7d"
+        },
+        "checks": {
+          "pass": true,
+          "complete": true,
+          "boundaries": 2,
+          "physics_budgets_modified": false,
+          "physics_work_modified": false,
+          "log_warnings": []
+        }
+      },
+      {
+        "task_key": "kuka",
+        "gpu_index": 1,
+        "physics_ms": 21.07434125,
+        "loop_ms": 40.4401680250885,
+        "env_fps": 405141.7390213513,
+        "artifact_locator": "contact-projection/candidate-lanes8/kuka/round_01_kuka_fpgs_gpu1",
+        "artifact_sha256": {
+          "capture.json": "ca2a2dbf40f24fc7b60faba0331bb3ac7898c3e79d4ab197c346e77f854eb5ce",
+          "capture_checks.json": "017f9bd6328451ee89413bd6dd4df738eb7d6770c53e09076c440d54d7175d2a",
+          "capture_analysis.json": "166587789261a6f0dfd50dfa1e2de536a3500b04541e9443b04d276422092b82",
+          "capture.log": "6e9a8d94cee60508c4ad97654083c963833c6b60a492aa94e27ab94be0415409"
+        },
+        "checks": {
+          "pass": true,
+          "complete": true,
+          "boundaries": 2,
+          "physics_budgets_modified": false,
+          "physics_work_modified": false,
+          "log_warnings": []
+        }
+      },
+      {
+        "task_key": "g1",
+        "gpu_index": 0,
+        "physics_ms": 30.257546899999998,
+        "loop_ms": 45.39877155038994,
+        "env_fps": 360890.82238304033,
+        "artifact_locator": "contact-projection/candidate-lanes8/cross-family/g1/round_01_g1_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "e8efb02b7873655dd9f59c37ed2211dc818cdb912d34c7938053d211a6c88dd9",
+          "capture_checks.json": "a31ce311b43d7968a5fcd422ac7a18bd2dbdba03ae8a80ee8ded5921ec671147",
+          "capture_analysis.json": "8c4a67e453608479d22728a8ffb4baa85832db1774f6bbb5a7a068ee9503e788",
+          "capture.log": "5355e4d7f9b846653e9dd89ba5e3e9284c4b0a5f28816d3932d4e60b8cd198ae"
+        },
+        "checks": {
+          "pass": true,
+          "complete": true,
+          "boundaries": 2,
+          "physics_budgets_modified": false,
+          "physics_work_modified": false,
+          "log_warnings": []
+        }
+      },
+      {
+        "task_key": "g1",
+        "gpu_index": 1,
+        "physics_ms": 43.747857724999996,
+        "loop_ms": 57.884308599750504,
+        "env_fps": 283047.34730943333,
+        "artifact_locator": "contact-projection/candidate-lanes8/cross-family/g1/round_01_g1_fpgs_gpu1",
+        "artifact_sha256": {
+          "capture.json": "9771467c0f3b03567535cfe3b625117ab032774c9e1f3d7b3b31294eaab70271",
+          "capture_checks.json": "9f05723cc42f1ff59d24b30b3d7909b1f64663f7dc92b6e2a62412d60a39b086",
+          "capture_analysis.json": "caff640ccf5031bf6c62b7a69a04a8db142d0ef45bcbeb6d4fb5a8e68af7a4c1",
+          "capture.log": "f4b5e78907bca0eaf84e4a83784e68fae9d9a5b419b39e8ae40401807e1601b0"
+        },
+        "checks": {
+          "pass": true,
+          "complete": true,
+          "boundaries": 2,
+          "physics_budgets_modified": false,
+          "physics_work_modified": false,
+          "log_warnings": []
+        }
+      },
+      {
+        "task_key": "cassie-flat",
+        "gpu_index": 0,
+        "physics_ms": 8.36349725,
+        "loop_ms": 18.587728397687897,
+        "env_fps": 881441.7582106474,
+        "artifact_locator": "contact-projection/candidate-lanes8/cross-family/cassie-flat/round_01_cassie-flat_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "ee272aa9a9b8248bedf479a4fac80473a912a21b5e925da72e2348b485a9b427",
+          "capture_checks.json": "a8c3426db052269e402b167ee7722e858305a57336673ce4e5e4412cc2abec5c",
+          "capture_analysis.json": "76b7d12f9c4ee268fb78ba2efa5d5b1af17994ed5934071cef00b5002119095d",
+          "capture.log": "923d97706bb593bb7db4fd69d48e905a37889bd88aa45d6a001cf54c0a42fe6a"
+        },
+        "checks": {
+          "pass": true,
+          "complete": true,
+          "boundaries": 2,
+          "physics_budgets_modified": false,
+          "physics_work_modified": false,
+          "log_warnings": []
+        }
+      },
+      {
+        "task_key": "cassie-flat",
+        "gpu_index": 1,
+        "physics_ms": 9.166727999999999,
+        "loop_ms": 19.77721490256954,
+        "env_fps": 828428.0714303873,
+        "artifact_locator": "contact-projection/candidate-lanes8/cross-family/cassie-flat/round_01_cassie-flat_fpgs_gpu1",
+        "artifact_sha256": {
+          "capture.json": "f2586316860b18f7fc84756b0fb211a1e1c9eb5d6c33f59cbbe4f9f5da8c83d1",
+          "capture_checks.json": "a47793822ded500c41fa157bf8f4ff44c98d0ad97b703d0f6df230892a3d6645",
+          "capture_analysis.json": "c729cf3ba484f0b8757945ced25440b12ee4092e0a82e7d55fc7b8341243d89c",
+          "capture.log": "21e64ce427dd8e114a3838ccb44755576926c48f91a39470c1b98bd3f18e3f2c"
+        },
+        "checks": {
+          "pass": true,
+          "complete": true,
+          "boundaries": 2,
+          "physics_budgets_modified": false,
+          "physics_work_modified": false,
+          "log_warnings": []
+        }
+      }
+    ],
+    "interpretation": "Separate discovery captures, preceding the fresh parent/final qualification pair. Do not combine their gains with main-to-PR gains or call them randomized repeats."
+  },
+  "rows": [
+    {
+      "task": "Franka lift",
+      "task_key": "franka",
+      "task_id": "Isaac-Lift-Franka",
+      "baseline": {
+        "env_fps": 466574.3866145893,
+        "loop_ms": 35.115515274810605,
+        "main_physics_graph_ms": 16.77466985,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-first5/franka/round_01_franka_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "c0b54c3f06858fefc148ed52c2d4e3854f49d86b5ca868e249424dcd4432fdf4",
+          "capture_checks.json": "3997cb50173b0fca19c75d0236e7db41a83c2eb8be24bc94d8f51eba2a0dab89",
+          "capture_analysis.json": "7994a4f52bc7fbdf84b455b4bddf8fa6af8dc9a668a0c3b682125376285e751f",
+          "capture.log": "fb469682a543598cc44f5107cc4e62c7dffd7ff90cd60e2b8c14961af4684a2e"
+        }
+      },
+      "configuration_reference": "results.json: rows[task_key=franka].matched_configuration",
+      "candidate": {
+        "env_fps": 474243.261660828,
+        "loop_ms": 34.54767062503379,
+        "main_physics_graph_ms": 16.7370923,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "contact-projection/final20/franka/franka/round_01_franka_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "ebc7a99886fbf4a7179bacaa3d22907c3398d4e8a762182465790fc8e3be4c30",
+          "capture_checks.json": "0ebe06de38654c70e2d6e8f3db581260fc5645f4d9dfd8d647582375426efb1b",
+          "capture_analysis.json": "c880b2532a7e60bede3ab07d857c01b9071d94119798da906c97e5fff547d725",
+          "capture.log": "8634686a81b8d8a5df3dd99fb5357f5fdcf7467ea4a950be3399b3f4e661370d"
+        }
+      },
+      "env_fps_gain": 1.0164365538834723,
+      "physics_gain": 1.0022451659658946,
+      "sparse_active": false,
+      "sparse_representation": null,
+      "matched_configuration": {
+        "num_envs": 16384,
+        "sim_dt": 0.008333333333333333,
+        "env_decimation": 4,
+        "cuda_graph": true,
+        "model": {
+          "bodies": 212992,
+          "shapes": 81921,
+          "joints": 212992,
+          "joint_dofs": 344064,
+          "joint_coords": 376832,
+          "articulations": 49152,
+          "world_count": 16384,
+          "size_groups": [
+            9,
+            6
+          ],
+          "n_arts_by_size": {
+            "6": 16384,
+            "9": 16384
+          },
+          "num_substeps": 2,
+          "solver_dt": 0.004166666666666667,
+          "pgs_mode": "matrix_free",
+          "pgs_iterations": 8,
+          "dense_max_constraints": 192,
+          "mf_max_constraints": 64,
+          "rigid_contact_max": 4000000,
+          "_has_free_rigid_bodies": true
+        },
+        "capacities": {
+          "dense_max_constraints": 192,
+          "mf_max_constraints": 64,
+          "propagation_max_constraints": 192
+        },
+        "contact_law": {
+          "friction_anchor_beta": 0.2,
+          "contact_compliance": false,
+          "contact_torsion_radius": 0
+        }
+      },
+      "runtime_selection": {
+        "parallel_tree": null,
+        "articulated_contact_response": "immediate",
+        "use_parallel_streams": true,
+        "_sparse_diagonal_contact_solve": false,
+        "_paired_response_primary_size": null,
+        "_paired_response_secondary_size": null,
+        "_sparse_diagonal_response_size": null,
+        "_compact_diagonal_mass_size": null,
+        "_row_watermark": false,
+        "enable_contact_friction": true,
+        "enable_joint_limits": true,
+        "enable_joint_velocity_limits": false,
+        "update_mass_matrix_interval": 2,
+        "pgs_iterations": 8,
+        "pgs_inner_substeps": null,
+        "pgs_velocity_iterations": 0
+      },
+      "checks": {
+        "pass": true,
+        "complete": true,
+        "boundaries": 2,
+        "physics_budgets_modified": false,
+        "physics_work_modified": false,
+        "log_warnings": []
+      }
+    },
+    {
+      "task": "KukaAllegro lift",
+      "task_key": "kuka",
+      "task_id": "Isaac-Lift-KukaAllegro",
+      "baseline": {
+        "env_fps": 360294.1824684044,
+        "loop_ms": 45.47395100235008,
+        "main_physics_graph_ms": 26.423181374999995,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-first5/kuka/round_01_kuka_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "1e92a234a8c8868ba8961a30ea537f491bb808d5e1b9f546f159b2ef9fc5b85e",
+          "capture_checks.json": "758da0252461f8a459ad6514c229eb689f92fbef8abca160ba6a323d0f4240e6",
+          "capture_analysis.json": "29ac44c041839badbde5eb385d6668d859a3c8ce8f5821c3af39ad939341e06a",
+          "capture.log": "92900cc185653aa0e2dc5d6694f85386ec11c3118f209e91b0822ca7ee64033a"
+        }
+      },
+      "configuration_reference": "results.json: rows[task_key=kuka].matched_configuration",
+      "candidate": {
+        "env_fps": 392756.21334242215,
+        "loop_ms": 41.715444449801,
+        "main_physics_graph_ms": 22.44084995,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "contact-projection/final20/kuka/kuka/round_01_kuka_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "1ada1d7d6b4fe82c0108e9f4b62264cc4a01b80fa8f8f05e868313967751f54a",
+          "capture_checks.json": "8906622c1d54d99e3edf0890e517b446827bfc6aa1355b7e7343e1f4e7beed82",
+          "capture_analysis.json": "d746f958022c7104a805f320ccc95fda67e7bc4bba124e15ddd72dc6fefd41d8",
+          "capture.log": "16671fd61c4a281ba8227b4219ff6e6e054480d3830b48c5d8e52011e46a8e29"
+        }
+      },
+      "env_fps_gain": 1.0900986817261877,
+      "physics_gain": 1.1774590282397033,
+      "sparse_active": true,
+      "sparse_representation": {
+        "dofs": 23,
+        "packed_factor_nnz": 180,
+        "max_row_support": 17,
+        "factor_warps_per_block": 4,
+        "factor_status_nonzero": 0,
+        "factor_status_max": 0,
+        "factor_kernel": "crba_sparse_factor_23_180_4",
+        "solve_kernel": "pgs_solve_sparse_192_29_17_64_6",
+        "selected_contact_producer": "populate_sparse_contact_response",
+        "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+        "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+        "double_buffer": false
+      },
+      "matched_configuration": {
+        "num_envs": 16384,
+        "sim_dt": 0.008333333333333333,
+        "env_decimation": 4,
+        "cuda_graph": true,
+        "model": {
+          "bodies": 524288,
+          "shapes": 393217,
+          "joints": 524288,
+          "joint_dofs": 573440,
+          "joint_coords": 606208,
+          "articulations": 49152,
+          "world_count": 16384,
+          "size_groups": [
+            23,
+            6
+          ],
+          "n_arts_by_size": {
+            "6": 16384,
+            "23": 16384
+          },
+          "num_substeps": 2,
+          "solver_dt": 0.004166666666666667,
+          "pgs_mode": "matrix_free",
+          "pgs_iterations": 8,
+          "dense_max_constraints": 192,
+          "mf_max_constraints": 64,
+          "rigid_contact_max": 311296,
+          "_has_free_rigid_bodies": true
+        },
+        "capacities": {
+          "dense_max_constraints": 192,
+          "mf_max_constraints": 64,
+          "propagation_max_constraints": 192
+        },
+        "contact_law": {
+          "friction_anchor_beta": 0.2,
+          "contact_compliance": false,
+          "contact_torsion_radius": 0
+        }
+      },
+      "runtime_selection": {
+        "parallel_tree": null,
+        "articulated_contact_response": "immediate",
+        "use_parallel_streams": true,
+        "_sparse_diagonal_contact_solve": false,
+        "_paired_response_primary_size": null,
+        "_paired_response_secondary_size": null,
+        "_sparse_diagonal_response_size": null,
+        "_compact_diagonal_mass_size": null,
+        "_row_watermark": false,
+        "enable_contact_friction": true,
+        "enable_joint_limits": true,
+        "enable_joint_velocity_limits": false,
+        "update_mass_matrix_interval": 2,
+        "pgs_iterations": 8,
+        "pgs_inner_substeps": null,
+        "pgs_velocity_iterations": 0
+      },
+      "checks": {
+        "pass": true,
+        "complete": true,
+        "boundaries": 2,
+        "physics_budgets_modified": false,
+        "physics_work_modified": false,
+        "log_warnings": []
+      }
+    },
+    {
+      "task": "Allegro reorient",
+      "task_key": "allegro",
+      "task_id": "Isaac-Reorient-Cube-Allegro",
+      "baseline": {
+        "env_fps": 286290.8612042581,
+        "loop_ms": 57.228512049186975,
+        "main_physics_graph_ms": 49.481530675,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-first5/allegro/round_01_allegro_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "1f4ec0482c4a5ca07da4d059483cabb29b7e5d18eef9ddcdb3b0ead673b3e521",
+          "capture_checks.json": "3dfdb6dc3f5fba466a5c641dde200dc7f84636e222d8752e8502090667bcfdab",
+          "capture_analysis.json": "0ce0e2b4599a2d5a8a387c37a97ba05b7792d0a54bb8b4cd498282d88b59eff6",
+          "capture.log": "e8d65b6e60c3e55f58340692ce2186dea7349d74acb2e1d150430629e5ba75ca"
+        }
+      },
+      "configuration_reference": "results.json: rows[task_key=allegro].matched_configuration",
+      "candidate": {
+        "env_fps": 283602.1539227398,
+        "loop_ms": 57.77107040048576,
+        "main_physics_graph_ms": 49.4187284,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "contact-projection/final20/allegro/allegro/round_01_allegro_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "75d32dc3aece4db2423028d8011778515301e31c168bd4b13e9f09388f6ce422",
+          "capture_checks.json": "9758fd1b61d1ac4a5a22a2b3186a6a88f0b07eb1370b20f85845c1f78b12e1da",
+          "capture_analysis.json": "422e2234d684d00da164424471e37a1ca28efdc1fe7e91697599e35e12704e64",
+          "capture.log": "068a957f41b0dc5e3ce1aaafe8d5b299650c0bddc8fb5dd051451c5a40cd5405"
+        }
+      },
+      "env_fps_gain": 0.9906084767421198,
+      "physics_gain": 1.0012708193236313,
+      "sparse_active": false,
+      "sparse_representation": null,
+      "matched_configuration": {
+        "num_envs": 16384,
+        "sim_dt": 0.008333333333333333,
+        "env_decimation": 4,
+        "cuda_graph": true,
+        "model": {
+          "bodies": 360448,
+          "shapes": 311297,
+          "joints": 360448,
+          "joint_dofs": 360448,
+          "joint_coords": 376832,
+          "articulations": 32768,
+          "world_count": 16384,
+          "size_groups": [
+            16,
+            6
+          ],
+          "n_arts_by_size": {
+            "6": 16384,
+            "16": 16384
+          },
+          "num_substeps": 2,
+          "solver_dt": 0.004166666666666667,
+          "pgs_mode": "matrix_free",
+          "pgs_iterations": 12,
+          "dense_max_constraints": 192,
+          "mf_max_constraints": 64,
+          "rigid_contact_max": 286720,
+          "_has_free_rigid_bodies": true
+        },
+        "capacities": {
+          "dense_max_constraints": 192,
+          "mf_max_constraints": 64,
+          "propagation_max_constraints": 192
+        },
+        "contact_law": {
+          "friction_anchor_beta": 0.2,
+          "contact_compliance": false,
+          "contact_torsion_radius": 0
+        }
+      },
+      "runtime_selection": {
+        "parallel_tree": null,
+        "articulated_contact_response": "immediate",
+        "use_parallel_streams": true,
+        "_sparse_diagonal_contact_solve": false,
+        "_paired_response_primary_size": null,
+        "_paired_response_secondary_size": null,
+        "_sparse_diagonal_response_size": null,
+        "_compact_diagonal_mass_size": null,
+        "_row_watermark": false,
+        "enable_contact_friction": true,
+        "enable_joint_limits": true,
+        "enable_joint_velocity_limits": true,
+        "update_mass_matrix_interval": 2,
+        "pgs_iterations": 12,
+        "pgs_inner_substeps": null,
+        "pgs_velocity_iterations": 0
+      },
+      "checks": {
+        "pass": true,
+        "complete": true,
+        "boundaries": 2,
+        "physics_budgets_modified": false,
+        "physics_work_modified": false,
+        "log_warnings": []
+      }
+    },
+    {
+      "task": "ANYmal-D flat",
+      "task_key": "anymald",
+      "task_id": "Isaac-Velocity-Flat-AnymalD",
+      "baseline": {
+        "env_fps": 535626.433039287,
+        "loop_ms": 30.58848292275798,
+        "main_physics_graph_ms": 22.4670491,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-first5/anymald/round_01_anymald_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "0a89c35aa04e19ed96f9c973f46dad0c2c114708b934ac7cd418e73dea224384",
+          "capture_checks.json": "e3f52b36a650b158493c2cf6ba194c2ad5102b77ea41aa177f52c723326e051a",
+          "capture_analysis.json": "478a26d47f41c3ef16ad6f36389af1f3aeacd3351c59f6e5a6b158cc030aef33",
+          "capture.log": "383482eea780917ca8cf52e4cfce58e6478541d845ca0208c10401d4439e5016"
+        }
+      },
+      "configuration_reference": "results.json: rows[task_key=anymald].matched_configuration",
+      "candidate": {
+        "env_fps": 643163.467933095,
+        "loop_ms": 25.474083676817827,
+        "main_physics_graph_ms": 16.981545925,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "contact-projection/final20/anymald/anymald/round_01_anymald_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "d79706b9e78b203abb872a1f43cec67c899b2a5b87676cc3a967b8d420d8d64e",
+          "capture_checks.json": "0914045a8a40146f811160ad2efdd876766dbee35dc657cb14b2f902e3600e78",
+          "capture_analysis.json": "e7da3e476ed1d828b85ce8fd369e4d1ca51943e044b50cfe7b524b4373421009",
+          "capture.log": "15c1f88c82794724123db96798e1e895ab56c5686760e3d14e39db07d78ae4d3"
+        }
+      },
+      "env_fps_gain": 1.2007687228645796,
+      "physics_gain": 1.3230273144286775,
+      "sparse_active": true,
+      "sparse_representation": {
+        "dofs": 18,
+        "packed_factor_nnz": 117,
+        "max_row_support": 12,
+        "factor_warps_per_block": 4,
+        "factor_status_nonzero": 0,
+        "factor_status_max": 0,
+        "factor_kernel": "crba_sparse_factor_18_117_4",
+        "solve_kernel": "pgs_solve_sparse_72_18_12_0_0",
+        "selected_contact_producer": "populate_sparse_contact_response",
+        "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+        "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+        "double_buffer": false
+      },
+      "matched_configuration": {
+        "num_envs": 16384,
+        "sim_dt": 0.005,
+        "env_decimation": 4,
+        "cuda_graph": true,
+        "model": {
+          "bodies": 278528,
+          "shapes": 278529,
+          "joints": 278528,
+          "joint_dofs": 294912,
+          "joint_coords": 311296,
+          "articulations": 16384,
+          "world_count": 16384,
+          "size_groups": [
+            18
+          ],
+          "n_arts_by_size": {
+            "18": 16384
+          },
+          "num_substeps": 2,
+          "solver_dt": 0.0025,
+          "pgs_mode": "matrix_free",
+          "pgs_iterations": 8,
+          "dense_max_constraints": 72,
+          "mf_max_constraints": 32,
+          "rigid_contact_max": 212992,
+          "_has_free_rigid_bodies": false
+        },
+        "capacities": {
+          "dense_max_constraints": 72,
+          "mf_max_constraints": 32,
+          "propagation_max_constraints": 72
+        },
+        "contact_law": {
+          "friction_anchor_beta": 0.2,
+          "contact_compliance": false,
+          "contact_torsion_radius": 0
+        }
+      },
+      "runtime_selection": {
+        "parallel_tree": null,
+        "articulated_contact_response": "immediate",
+        "use_parallel_streams": true,
+        "_sparse_diagonal_contact_solve": false,
+        "_paired_response_primary_size": null,
+        "_paired_response_secondary_size": null,
+        "_sparse_diagonal_response_size": null,
+        "_compact_diagonal_mass_size": null,
+        "_row_watermark": false,
+        "enable_contact_friction": true,
+        "enable_joint_limits": true,
+        "enable_joint_velocity_limits": false,
+        "update_mass_matrix_interval": 2,
+        "pgs_iterations": 8,
+        "pgs_inner_substeps": null,
+        "pgs_velocity_iterations": 0
+      },
+      "checks": {
+        "pass": true,
+        "complete": true,
+        "boundaries": 2,
+        "physics_budgets_modified": false,
+        "physics_work_modified": false,
+        "log_warnings": []
+      }
+    },
+    {
+      "task": "G1 rough",
+      "task_key": "g1",
+      "task_id": "Isaac-Velocity-Rough-G1",
+      "baseline": {
+        "env_fps": 279894.03150597686,
+        "loop_ms": 58.53643935115542,
+        "main_physics_graph_ms": 44.191172825,
+        "sensor_graph_ms": 1.04093225,
+        "artifact_locator": "baseline-first5/g1/round_01_g1_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "80aa79a5497274c66871fbfffb0ee96fd26f58ab7b015481101103f70f33040d",
+          "capture_checks.json": "d2a977060f055411c152d51f0ecad971dcab8bd5bba792de3e083f424474994f",
+          "capture_analysis.json": "ec16867c9533f0152b6794f7706b60e1c4a3069c4b0f654b154a38aac53456ed",
+          "capture.log": "777c524336b90343f8d1f27a8938b457cb355bfe4572415bda20ee35e09a6750"
+        }
+      },
+      "configuration_reference": "results.json: rows[task_key=g1].matched_configuration",
+      "candidate": {
+        "env_fps": 364504.57901202823,
+        "loop_ms": 44.94868087640498,
+        "main_physics_graph_ms": 30.321195025,
+        "sensor_graph_ms": 1.043331725,
+        "artifact_locator": "contact-projection/final20/g1/g1/round_01_g1_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "4867a8f3d24e91b767f6496662e5f78d313c36a416a1983269e4864ba498eabf",
+          "capture_checks.json": "7bcd26391387a25fd89212d339811afeede382d3270b28e8bdfa88424681f199",
+          "capture_analysis.json": "4f6e54fe106dc1d4e45c877bf81790fa101c3edc6b7887906ff0c22990c33768",
+          "capture.log": "23187a0f822aab401999f4d849075d001c1838845b278e09478d4919b09b2acb"
+        }
+      },
+      "env_fps_gain": 1.302294933017336,
+      "physics_gain": 1.4574350644347667,
+      "sparse_active": true,
+      "sparse_representation": {
+        "dofs": 43,
+        "packed_factor_nnz": 434,
+        "max_row_support": 18,
+        "factor_warps_per_block": 4,
+        "factor_status_nonzero": 0,
+        "factor_status_max": 0,
+        "factor_kernel": "crba_sparse_factor_43_434_4",
+        "solve_kernel": "pgs_solve_sparse_100_43_18_0_0",
+        "selected_contact_producer": "populate_sparse_contact_response",
+        "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+        "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+        "double_buffer": false
+      },
+      "matched_configuration": {
+        "num_envs": 16384,
+        "sim_dt": 0.005,
+        "env_decimation": 4,
+        "cuda_graph": true,
+        "model": {
+          "bodies": 720896,
+          "shapes": 65537,
+          "joints": 720896,
+          "joint_dofs": 704512,
+          "joint_coords": 720896,
+          "articulations": 16384,
+          "world_count": 16384,
+          "size_groups": [
+            43
+          ],
+          "n_arts_by_size": {
+            "43": 16384
+          },
+          "num_substeps": 2,
+          "solver_dt": 0.0025,
+          "pgs_mode": "matrix_free",
+          "pgs_iterations": 8,
+          "dense_max_constraints": 100,
+          "mf_max_constraints": 32,
+          "rigid_contact_max": 294912,
+          "_has_free_rigid_bodies": false
+        },
+        "capacities": {
+          "dense_max_constraints": 100,
+          "mf_max_constraints": 32,
+          "propagation_max_constraints": 100
+        },
+        "contact_law": {
+          "friction_anchor_beta": 0.2,
+          "contact_compliance": false,
+          "contact_torsion_radius": 0
+        }
+      },
+      "runtime_selection": {
+        "parallel_tree": null,
+        "articulated_contact_response": "immediate",
+        "use_parallel_streams": true,
+        "_sparse_diagonal_contact_solve": false,
+        "_paired_response_primary_size": null,
+        "_paired_response_secondary_size": null,
+        "_sparse_diagonal_response_size": null,
+        "_compact_diagonal_mass_size": null,
+        "_row_watermark": false,
+        "enable_contact_friction": true,
+        "enable_joint_limits": true,
+        "enable_joint_velocity_limits": false,
+        "update_mass_matrix_interval": 2,
+        "pgs_iterations": 8,
+        "pgs_inner_substeps": null,
+        "pgs_velocity_iterations": 0
+      },
+      "checks": {
+        "pass": true,
+        "complete": true,
+        "boundaries": 2,
+        "physics_budgets_modified": false,
+        "physics_work_modified": false,
+        "log_warnings": []
+      }
+    },
+    {
+      "task": "SO101 Keyboard",
+      "task_key": "keyboard-so101",
+      "task_id": "IsaacContrib-Keyboard-SO101",
+      "baseline": {
+        "env_fps": 97340.95367280951,
+        "loop_ms": 168.31558950070757,
+        "main_physics_graph_ms": 119.17066467500001,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-keyboard736/keyboard-so101/round_01_keyboard-so101_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "7b79d731ab6ca1965b9d4afb2b3eb9849f26a1403282fae3318319f236793922",
+          "capture_checks.json": "1ea09fb3f6f8b46868e747532316326f98cb1f6213d54048aa84207563578307",
+          "capture_analysis.json": "9ce8372d4e0e0c0acfa7347fed2a13948804c7d3f54397ea2770cbc9004fc0b4",
+          "capture.log": "62d96eef550a2037fcb50d2440fe29f54ffa0da769a1699cff5fd5b4604fa741"
+        }
+      },
+      "configuration_reference": "results.json: rows[task_key=keyboard-so101].matched_configuration",
+      "candidate": {
+        "env_fps": 98013.24017065053,
+        "loop_ms": 167.1610893739853,
+        "main_physics_graph_ms": 120.23423082500001,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "contact-projection/final20/keyboard-so101/keyboard-so101/round_01_keyboard-so101_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "4d53910450b8ae03653aaf0539d60eae0e10f9a4bc9db00581cea6d3915f6a88",
+          "capture_checks.json": "36047c851a84655610aa07b1fb3259f4d7a228d05200a245369a0baa68e70afb",
+          "capture_analysis.json": "68d7dc0794ac816ae16002948dd2b929c1ad471a35da1970f9f29556b5270317",
+          "capture.log": "2040ce97db6741237cad40eb8bfa091d388e11401f95f4a5b9a9c241eddee4dc"
+        }
+      },
+      "env_fps_gain": 1.0069065123411547,
+      "physics_gain": 0.9911542150458964,
+      "sparse_active": false,
+      "sparse_representation": null,
+      "matched_configuration": {
+        "num_envs": 16384,
+        "sim_dt": 0.01,
+        "env_decimation": 4,
+        "cuda_graph": true,
+        "model": {
+          "bodies": 1900544,
+          "shapes": 2310145,
+          "joints": 1900544,
+          "joint_dofs": 1867776,
+          "joint_coords": 1867776,
+          "articulations": 32768,
+          "world_count": 16384,
+          "size_groups": [
+            108,
+            6
+          ],
+          "n_arts_by_size": {
+            "6": 16384,
+            "108": 16384
+          },
+          "num_substeps": 2,
+          "solver_dt": 0.005,
+          "pgs_mode": "matrix_free",
+          "pgs_iterations": 8,
+          "dense_max_constraints": 736,
+          "mf_max_constraints": 64,
+          "rigid_contact_max": 589824,
+          "_has_free_rigid_bodies": false
+        },
+        "capacities": {
+          "dense_max_constraints": 736,
+          "mf_max_constraints": 64,
+          "propagation_max_constraints": 736
+        },
+        "contact_law": {
+          "friction_anchor_beta": 0.2,
+          "contact_compliance": false,
+          "contact_torsion_radius": 0
+        }
+      },
+      "runtime_selection": {
+        "parallel_tree": null,
+        "articulated_contact_response": "immediate",
+        "use_parallel_streams": true,
+        "_sparse_diagonal_contact_solve": true,
+        "_paired_response_primary_size": null,
+        "_paired_response_secondary_size": null,
+        "_sparse_diagonal_response_size": 108,
+        "_compact_diagonal_mass_size": 108,
+        "_row_watermark": false,
+        "enable_contact_friction": true,
+        "enable_joint_limits": true,
+        "enable_joint_velocity_limits": false,
+        "update_mass_matrix_interval": 2,
+        "pgs_iterations": 8,
+        "pgs_inner_substeps": null,
+        "pgs_velocity_iterations": 0
+      },
+      "checks": {
+        "pass": true,
+        "complete": true,
+        "boundaries": 2,
+        "physics_budgets_modified": false,
+        "physics_work_modified": false,
+        "log_warnings": []
+      }
+    },
+    {
+      "task": "Ant",
+      "task_key": "ant",
+      "task_id": "Isaac-Ant",
+      "baseline": {
+        "env_fps": 1640349.937296659,
+        "loop_ms": 9.988112674909644,
+        "main_physics_graph_ms": 4.766994575,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-rest15/ant/round_01_ant_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "b937dd13ff8aff51d96271bec036a19285923dba6dfbbef42a66e771198b2b17",
+          "capture_checks.json": "8c283c0480d643f4a9b5ef44ee4962d7080de6ae8fd067625ea7d877b0643c3c",
+          "capture_analysis.json": "179607dc3a20c5e4920ed07ee11ed8826c6bbb813060969247720003ed2ecb8f",
+          "capture.log": "40248e969390cecd7726a7e7a195c70925ae8bfb8b833057a27a4dc671f4e34d"
+        }
+      },
+      "configuration_reference": "results.json: rows[task_key=ant].matched_configuration",
+      "candidate": {
+        "env_fps": 1664561.9196952484,
+        "loop_ms": 9.842829999979585,
+        "main_physics_graph_ms": 4.76442725,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "contact-projection/final20/ant/ant/round_01_ant_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "94dbb9cf7f2b0fdcc44031591c78d6ede13a210fa42982e243009fcb7775b68d",
+          "capture_checks.json": "2ea2d9ea046b8e2a2c8dcbc8311bb66f2bd47da3a88d8dd84fc1c30df492ef11",
+          "capture_analysis.json": "df2d94ded35fcea3606dca98e55c892db5c2efc86f7d5a2268793dd0cde6d6b9",
+          "capture.log": "24a996ee7e536c5613b05438c369b858fb9bab40dbd354d4775daa6dc2cf74a8"
+        }
+      },
+      "env_fps_gain": 1.0147602544116234,
+      "physics_gain": 1.0005388528075436,
+      "sparse_active": false,
+      "sparse_representation": null,
+      "matched_configuration": {
+        "num_envs": 16384,
+        "sim_dt": 0.008333333333333333,
+        "env_decimation": 2,
+        "cuda_graph": true,
+        "model": {
+          "bodies": 147456,
+          "shapes": 212993,
+          "joints": 147456,
+          "joint_dofs": 229376,
+          "joint_coords": 245760,
+          "articulations": 16384,
+          "world_count": 16384,
+          "size_groups": [
+            14
+          ],
+          "n_arts_by_size": {
+            "14": 16384
+          },
+          "num_substeps": 1,
+          "solver_dt": 0.008333333333333333,
+          "pgs_mode": "split",
+          "pgs_iterations": 8,
+          "dense_max_constraints": 64,
+          "mf_max_constraints": 512,
+          "rigid_contact_max": 67584,
+          "_has_free_rigid_bodies": false
+        },
+        "capacities": {
+          "dense_max_constraints": 64,
+          "mf_max_constraints": 512,
+          "propagation_max_constraints": 64
+        },
+        "contact_law": {
+          "friction_anchor_beta": 0.2,
+          "contact_compliance": false,
+          "contact_torsion_radius": 0
+        }
+      },
+      "runtime_selection": {
+        "parallel_tree": null,
+        "articulated_contact_response": "immediate",
+        "use_parallel_streams": true,
+        "_sparse_diagonal_contact_solve": false,
+        "_paired_response_primary_size": null,
+        "_paired_response_secondary_size": null,
+        "_sparse_diagonal_response_size": null,
+        "_compact_diagonal_mass_size": null,
+        "_row_watermark": false,
+        "enable_contact_friction": true,
+        "enable_joint_limits": true,
+        "enable_joint_velocity_limits": false,
+        "update_mass_matrix_interval": 1,
+        "pgs_iterations": 8,
+        "pgs_inner_substeps": null,
+        "pgs_velocity_iterations": 0
+      },
+      "checks": {
+        "pass": true,
+        "complete": true,
+        "boundaries": 2,
+        "physics_budgets_modified": false,
+        "physics_work_modified": false,
+        "log_warnings": []
+      }
+    },
+    {
+      "task": "ANYmal-D rough",
+      "task_key": "anymald-rough",
+      "task_id": "Isaac-Velocity-Rough-AnymalD",
+      "baseline": {
+        "env_fps": 163410.01689487437,
+        "loop_ms": 100.26313142443541,
+        "main_physics_graph_ms": 91.267457575,
+        "sensor_graph_ms": 1.112536175,
+        "artifact_locator": "baseline-rest15/anymald-rough/round_01_anymald-rough_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "6b169f54819f24e7d20a877f2cb09c19ac89535f3665b8f291005a290efd7913",
+          "capture_checks.json": "4dd29cc30fae46ba6a927e0c261fa06dad5f167c83927d73ab0718186b27adfb",
+          "capture_analysis.json": "42c306267d49adbf3e88eca829ebc3405972a98e97542cffb7a67222c9862e16",
+          "capture.log": "f76aa3f2054251945fef61868c4784c5b414b945c1aa3cf200c0c89077bef608"
+        }
+      },
+      "configuration_reference": "results.json: rows[task_key=anymald-rough].matched_configuration",
+      "candidate": {
+        "env_fps": 178574.82016662706,
+        "loop_ms": 91.74865742388647,
+        "main_physics_graph_ms": 82.63853137499999,
+        "sensor_graph_ms": 1.107384,
+        "artifact_locator": "contact-projection/final20/anymald-rough/anymald-rough/round_01_anymald-rough_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "f322ca2bfe09e65c549227f74e9b63be7c87b8ae2e1f351058a9c52ee66d3523",
+          "capture_checks.json": "b23f02d2df98706042d9e65ebf492b5ac82a3ebcf79cb13c9e2964f4767ddbfd",
+          "capture_analysis.json": "3a3ff4fe9c4d3213596ca8a37f565e9ad869499a221248feb8c8df74c73cc876",
+          "capture.log": "19e7aba7679b237a2419f01e7e6505b216a69f7ed40eb0ede6e7bf9b807bde81"
+        }
+      },
+      "env_fps_gain": 1.0928021645179107,
+      "physics_gain": 1.1044177099523147,
+      "sparse_active": true,
+      "sparse_representation": {
+        "dofs": 18,
+        "packed_factor_nnz": 117,
+        "max_row_support": 12,
+        "factor_warps_per_block": 4,
+        "factor_status_nonzero": 0,
+        "factor_status_max": 0,
+        "factor_kernel": "crba_sparse_factor_18_117_4",
+        "solve_kernel": "pgs_solve_sparse_192_18_12_0_0",
+        "selected_contact_producer": "populate_sparse_contact_response",
+        "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+        "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+        "double_buffer": false
+      },
+      "matched_configuration": {
+        "num_envs": 16384,
+        "sim_dt": 0.005,
+        "env_decimation": 4,
+        "cuda_graph": true,
+        "model": {
+          "bodies": 278528,
+          "shapes": 294913,
+          "joints": 278528,
+          "joint_dofs": 294912,
+          "joint_coords": 311296,
+          "articulations": 16384,
+          "world_count": 16384,
+          "size_groups": [
+            18
+          ],
+          "n_arts_by_size": {
+            "18": 16384
+          },
+          "num_substeps": 2,
+          "solver_dt": 0.0025,
+          "pgs_mode": "matrix_free",
+          "pgs_iterations": 8,
+          "dense_max_constraints": 192,
+          "mf_max_constraints": 32,
+          "rigid_contact_max": 566272,
+          "_has_free_rigid_bodies": false
+        },
+        "capacities": {
+          "dense_max_constraints": 192,
+          "mf_max_constraints": 32,
+          "propagation_max_constraints": 192
+        },
+        "contact_law": {
+          "friction_anchor_beta": 0.2,
+          "contact_compliance": false,
+          "contact_torsion_radius": 0
+        }
+      },
+      "runtime_selection": {
+        "parallel_tree": null,
+        "articulated_contact_response": "immediate",
+        "use_parallel_streams": true,
+        "_sparse_diagonal_contact_solve": false,
+        "_paired_response_primary_size": null,
+        "_paired_response_secondary_size": null,
+        "_sparse_diagonal_response_size": null,
+        "_compact_diagonal_mass_size": null,
+        "_row_watermark": false,
+        "enable_contact_friction": true,
+        "enable_joint_limits": true,
+        "enable_joint_velocity_limits": false,
+        "update_mass_matrix_interval": 2,
+        "pgs_iterations": 8,
+        "pgs_inner_substeps": null,
+        "pgs_velocity_iterations": 0
+      },
+      "checks": {
+        "pass": true,
+        "complete": true,
+        "boundaries": 2,
+        "physics_budgets_modified": false,
+        "physics_work_modified": false,
+        "log_warnings": []
+      }
+    },
+    {
+      "task": "Cartpole",
+      "task_key": "cartpole",
+      "task_id": "Isaac-Cartpole",
+      "baseline": {
+        "env_fps": 2594743.277569082,
+        "loop_ms": 6.314304826082663,
+        "main_physics_graph_ms": 0.47057297500000006,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-rest15/cartpole/round_01_cartpole_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "bc5236652f8aabea417134e51b60bc624f1948c6d9e1384cd90082e74aef56a8",
+          "capture_checks.json": "ae0da55b1c59ddded71737951b46fe5f41d52402b417ce92122151ab8423b08d",
+          "capture_analysis.json": "7fc4658038b3d28e7a2de90ee24bb09b276bbe15eb4c31b357359d612a0ca60a",
+          "capture.log": "8603cf16c8553346016696f0c289558c5dcb1901e40b88381ec812174af596ac"
+        }
+      },
+      "configuration_reference": "results.json: rows[task_key=cartpole].matched_configuration",
+      "candidate": {
+        "env_fps": 2806340.7074935907,
+        "loop_ms": 5.838207725901157,
+        "main_physics_graph_ms": 0.47193442500000005,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "contact-projection/final20/cartpole/cartpole/round_01_cartpole_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "af0ec26080915d0542af916c049d31f17bc9ecb00bd8f67a46103d9f2558d4ce",
+          "capture_checks.json": "585a5eb618f316a948faff956917a5950c56a82d92c37a212c76781a9e5880be",
+          "capture_analysis.json": "ddae10e1f550bf4a8efaa870e762cf4a98a49763e530bd1a64a2cd4ec2d8698f",
+          "capture.log": "9a66440cf41072fe5729c7a622eacf57f7e5cefdbd1f8c640b53f7565492ef63"
+        }
+      },
+      "env_fps_gain": 1.081548502988221,
+      "physics_gain": 0.9971151712443949,
+      "sparse_active": false,
+      "sparse_representation": null,
+      "matched_configuration": {
+        "num_envs": 16384,
+        "sim_dt": 0.008333333333333333,
+        "env_decimation": 2,
+        "cuda_graph": true,
+        "model": {
+          "bodies": 49152,
+          "shapes": 49153,
+          "joints": 49152,
+          "joint_dofs": 32768,
+          "joint_coords": 32768,
+          "articulations": 16384,
+          "world_count": 16384,
+          "size_groups": [
+            2
+          ],
+          "n_arts_by_size": {
+            "2": 16384
+          },
+          "num_substeps": 1,
+          "solver_dt": 0.008333333333333333,
+          "pgs_mode": "split",
+          "pgs_iterations": 4,
+          "dense_max_constraints": 8,
+          "mf_max_constraints": 64,
+          "rigid_contact_max": 16384,
+          "_has_free_rigid_bodies": false
+        },
+        "capacities": {
+          "dense_max_constraints": 8,
+          "mf_max_constraints": 64,
+          "propagation_max_constraints": 8
+        },
+        "contact_law": {
+          "friction_anchor_beta": 0.2,
+          "contact_compliance": false,
+          "contact_torsion_radius": 0
+        }
+      },
+      "runtime_selection": {
+        "parallel_tree": null,
+        "articulated_contact_response": "immediate",
+        "use_parallel_streams": true,
+        "_sparse_diagonal_contact_solve": false,
+        "_paired_response_primary_size": null,
+        "_paired_response_secondary_size": null,
+        "_sparse_diagonal_response_size": null,
+        "_compact_diagonal_mass_size": null,
+        "_row_watermark": false,
+        "enable_contact_friction": true,
+        "enable_joint_limits": true,
+        "enable_joint_velocity_limits": false,
+        "update_mass_matrix_interval": 1,
+        "pgs_iterations": 4,
+        "pgs_inner_substeps": null,
+        "pgs_velocity_iterations": 0
+      },
+      "checks": {
+        "pass": true,
+        "complete": true,
+        "boundaries": 2,
+        "physics_budgets_modified": false,
+        "physics_work_modified": false,
+        "log_warnings": []
+      }
+    },
+    {
+      "task": "Cassie flat",
+      "task_key": "cassie-flat",
+      "task_id": "Isaac-Velocity-Flat-Cassie",
+      "baseline": {
+        "env_fps": 795500.3270014791,
+        "loop_ms": 20.595843199407682,
+        "main_physics_graph_ms": 11.20907305,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-rest15/cassie-flat/round_01_cassie-flat_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "951a03a70daf0ee8d8b2a9f2d5f39fd78e27146fcef316c42523b60bf772d073",
+          "capture_checks.json": "083c623e4d1724937de445aa2de27f446ab17f1eb91c0a9675f21cc46c2671b6",
+          "capture_analysis.json": "a3c8a133975eea57d4a48e00939a70dac147689669718e21cbc3afdcbff86922",
+          "capture.log": "3c34bbdda7f69b5a3b0d6fc80c042e5779570b84a77a63e25705ff855b4eb4d4"
+        }
+      },
+      "configuration_reference": "results.json: rows[task_key=cassie-flat].matched_configuration",
+      "candidate": {
+        "env_fps": 909985.3960486786,
+        "loop_ms": 18.00468454894144,
+        "main_physics_graph_ms": 8.372438599999999,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "contact-projection/final20/cassie-flat/cassie-flat/round_01_cassie-flat_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "39e5813fbb223c5298da5a8fe16248297f49f8a917ce0344cf82e4edd787a102",
+          "capture_checks.json": "8b228d2908c6d7a10c000a1e340778a24e82e1799cd6635805675cd675024b64",
+          "capture_analysis.json": "8497a366db937c27f45589fa74f62c9aea562e91173eafc71cd5431a1de836c8",
+          "capture.log": "e06b6e54277551d8c6933db3f2ce20632297f391ba6fdce36c93120a4828521c"
+        }
+      },
+      "env_fps_gain": 1.1439158038799733,
+      "physics_gain": 1.3388062409917227,
+      "sparse_active": true,
+      "sparse_representation": {
+        "dofs": 18,
+        "packed_factor_nnz": 135,
+        "max_row_support": 18,
+        "factor_warps_per_block": 4,
+        "factor_status_nonzero": 0,
+        "factor_status_max": 0,
+        "factor_kernel": "crba_sparse_factor_18_135_4",
+        "solve_kernel": "pgs_solve_sparse_40_18_18_0_0",
+        "selected_contact_producer": "populate_sparse_contact_response",
+        "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+        "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+        "double_buffer": false
+      },
+      "matched_configuration": {
+        "num_envs": 16384,
+        "sim_dt": 0.005,
+        "env_decimation": 4,
+        "cuda_graph": true,
+        "model": {
+          "bodies": 212992,
+          "shapes": 49153,
+          "joints": 212992,
+          "joint_dofs": 294912,
+          "joint_coords": 311296,
+          "articulations": 16384,
+          "world_count": 16384,
+          "size_groups": [
+            18
+          ],
+          "n_arts_by_size": {
+            "18": 16384
+          },
+          "num_substeps": 2,
+          "solver_dt": 0.0025,
+          "pgs_mode": "matrix_free",
+          "pgs_iterations": 8,
+          "dense_max_constraints": 40,
+          "mf_max_constraints": 32,
+          "rigid_contact_max": 83968,
+          "_has_free_rigid_bodies": false
+        },
+        "capacities": {
+          "dense_max_constraints": 40,
+          "mf_max_constraints": 32,
+          "propagation_max_constraints": 40
+        },
+        "contact_law": {
+          "friction_anchor_beta": 0.2,
+          "contact_compliance": false,
+          "contact_torsion_radius": 0
+        }
+      },
+      "runtime_selection": {
+        "parallel_tree": null,
+        "articulated_contact_response": "immediate",
+        "use_parallel_streams": true,
+        "_sparse_diagonal_contact_solve": false,
+        "_paired_response_primary_size": null,
+        "_paired_response_secondary_size": null,
+        "_sparse_diagonal_response_size": null,
+        "_compact_diagonal_mass_size": null,
+        "_row_watermark": false,
+        "enable_contact_friction": true,
+        "enable_joint_limits": true,
+        "enable_joint_velocity_limits": false,
+        "update_mass_matrix_interval": 2,
+        "pgs_iterations": 8,
+        "pgs_inner_substeps": null,
+        "pgs_velocity_iterations": 0
+      },
+      "checks": {
+        "pass": true,
+        "complete": true,
+        "boundaries": 2,
+        "physics_budgets_modified": false,
+        "physics_work_modified": false,
+        "log_warnings": []
+      }
+    },
+    {
+      "task": "Cassie rough",
+      "task_key": "cassie-rough",
+      "task_id": "Isaac-Velocity-Rough-Cassie",
+      "baseline": {
+        "env_fps": 482383.520719103,
+        "loop_ms": 33.96467602287885,
+        "main_physics_graph_ms": 22.5371784,
+        "sensor_graph_ms": 1.0389858749999998,
+        "artifact_locator": "baseline-rest15/cassie-rough/round_01_cassie-rough_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "cd15129ba369b5986b46f65439d8e68009b638fc61f755115ba8cc4497a79d3f",
+          "capture_checks.json": "fda93fdd069b9d49d8a4b7bbae249dcf0cc5ff2334ce80647936ba73c4e2a10f",
+          "capture_analysis.json": "4216847d173ea2cf2a2115b57b23fab1d619c165b5a89f3e8a328c48105694ee",
+          "capture.log": "8224768cbe4e44f21108c2f3d55194d875b308ab1c9534e6d33337c1b6243c80"
+        }
+      },
+      "configuration_reference": "results.json: rows[task_key=cassie-rough].matched_configuration",
+      "candidate": {
+        "env_fps": 545879.931768263,
+        "loop_ms": 30.013926225365136,
+        "main_physics_graph_ms": 18.737917099999997,
+        "sensor_graph_ms": 1.036257775,
+        "artifact_locator": "contact-projection/final20/cassie-rough/cassie-rough/round_01_cassie-rough_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "c0b3207a3a19a0b7dbd108cb9c3385e4aad8b2f253d40e5ae0aba087914c1022",
+          "capture_checks.json": "52e929befa6a6c0d9579565759d5528b1eeb6787dda3869d2defa53aa80396c4",
+          "capture_analysis.json": "2aa0c96e2807f66a947cad610a9c8a2ad19ac85ebdb8dd76c0d8f02af99c449c",
+          "capture.log": "446b45350351684a0045b3aeb15a0f18a12f623387ebdcc4c31045789ad38792"
+        }
+      },
+      "env_fps_gain": 1.1316305560241862,
+      "physics_gain": 1.2027579308694882,
+      "sparse_active": true,
+      "sparse_representation": {
+        "dofs": 18,
+        "packed_factor_nnz": 135,
+        "max_row_support": 18,
+        "factor_warps_per_block": 4,
+        "factor_status_nonzero": 0,
+        "factor_status_max": 0,
+        "factor_kernel": "crba_sparse_factor_18_135_4",
+        "solve_kernel": "pgs_solve_sparse_80_18_18_0_0",
+        "selected_contact_producer": "populate_sparse_contact_response",
+        "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+        "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+        "double_buffer": false
+      },
+      "matched_configuration": {
+        "num_envs": 16384,
+        "sim_dt": 0.005,
+        "env_decimation": 4,
+        "cuda_graph": true,
+        "model": {
+          "bodies": 212992,
+          "shapes": 65537,
+          "joints": 212992,
+          "joint_dofs": 294912,
+          "joint_coords": 311296,
+          "articulations": 16384,
+          "world_count": 16384,
+          "size_groups": [
+            18
+          ],
+          "n_arts_by_size": {
+            "18": 16384
+          },
+          "num_substeps": 2,
+          "solver_dt": 0.0025,
+          "pgs_mode": "matrix_free",
+          "pgs_iterations": 8,
+          "dense_max_constraints": 80,
+          "mf_max_constraints": 32,
+          "rigid_contact_max": 186368,
+          "_has_free_rigid_bodies": false
+        },
+        "capacities": {
+          "dense_max_constraints": 80,
+          "mf_max_constraints": 32,
+          "propagation_max_constraints": 80
+        },
+        "contact_law": {
+          "friction_anchor_beta": 0.2,
+          "contact_compliance": false,
+          "contact_torsion_radius": 0
+        }
+      },
+      "runtime_selection": {
+        "parallel_tree": null,
+        "articulated_contact_response": "immediate",
+        "use_parallel_streams": true,
+        "_sparse_diagonal_contact_solve": false,
+        "_paired_response_primary_size": null,
+        "_paired_response_secondary_size": null,
+        "_sparse_diagonal_response_size": null,
+        "_compact_diagonal_mass_size": null,
+        "_row_watermark": false,
+        "enable_contact_friction": true,
+        "enable_joint_limits": true,
+        "enable_joint_velocity_limits": false,
+        "update_mass_matrix_interval": 2,
+        "pgs_iterations": 8,
+        "pgs_inner_substeps": null,
+        "pgs_velocity_iterations": 0
+      },
+      "checks": {
+        "pass": true,
+        "complete": true,
+        "boundaries": 2,
+        "physics_budgets_modified": false,
+        "physics_work_modified": false,
+        "log_warnings": []
+      }
+    },
+    {
+      "task": "Franka reach",
+      "task_key": "franka-reach",
+      "task_id": "Isaac-Reach-Franka",
+      "baseline": {
+        "env_fps": 1142545.6027718736,
+        "loop_ms": 14.339909024420194,
+        "main_physics_graph_ms": 10.620582924999999,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-rest15/franka-reach/round_01_franka-reach_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "4e4e5ce7ce6a7e55bcccc0dcb0d41cba8fe614693c5ce6ca41f31206e1158657",
+          "capture_checks.json": "25984a139d4d35fd7113142417cd50eb68b11c1dd2925e8d2144ac115b1c9b6c",
+          "capture_analysis.json": "0dd8e2054ff08ac16d04fce9d9c3355ac060a0e40579f1d12f9b16ce011f6a14",
+          "capture.log": "c466f3319623a169cc46e36146b1a63e9d813d732f866631f63d10c4d7b067bb"
+        }
+      },
+      "configuration_reference": "results.json: rows[task_key=franka-reach].matched_configuration",
+      "candidate": {
+        "env_fps": 1155846.8404155944,
+        "loop_ms": 14.174888425623067,
+        "main_physics_graph_ms": 10.549777275,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "contact-projection/final20/franka-reach/franka-reach/round_01_franka-reach_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "022de9a2802caec682580402efa27802f8d87ff0f329bbc27a5bc1ab5c02b3f5",
+          "capture_checks.json": "36dce40654d984bf2fab92b9d993111137914c14539da9d6f2cd4fdac4c9a95c",
+          "capture_analysis.json": "a5473ba06bfb05d27b71f8cd395976607aa201f356d142971a92254270c9d41a",
+          "capture.log": "6f30c86ccfd3be16fbbb0433946df23efed1f00c38cf70f96e42e76d47bc0b62"
+        }
+      },
+      "env_fps_gain": 1.011641756452829,
+      "physics_gain": 1.0067115777095872,
+      "sparse_active": false,
+      "sparse_representation": null,
+      "matched_configuration": {
+        "num_envs": 16384,
+        "sim_dt": 0.008333333333333333,
+        "env_decimation": 4,
+        "cuda_graph": true,
+        "model": {
+          "bodies": 180224,
+          "shapes": 65537,
+          "joints": 180224,
+          "joint_dofs": 147456,
+          "joint_coords": 147456,
+          "articulations": 16384,
+          "world_count": 16384,
+          "size_groups": [
+            9
+          ],
+          "n_arts_by_size": {
+            "9": 16384
+          },
+          "num_substeps": 2,
+          "solver_dt": 0.004166666666666667,
+          "pgs_mode": "matrix_free",
+          "pgs_iterations": 8,
+          "dense_max_constraints": 64,
+          "mf_max_constraints": 32,
+          "rigid_contact_max": 94208,
+          "_has_free_rigid_bodies": false
+        },
+        "capacities": {
+          "dense_max_constraints": 64,
+          "mf_max_constraints": 32,
+          "propagation_max_constraints": 64
+        },
+        "contact_law": {
+          "friction_anchor_beta": 0.2,
+          "contact_compliance": false,
+          "contact_torsion_radius": 0
+        }
+      },
+      "runtime_selection": {
+        "parallel_tree": null,
+        "articulated_contact_response": "immediate",
+        "use_parallel_streams": true,
+        "_sparse_diagonal_contact_solve": false,
+        "_paired_response_primary_size": null,
+        "_paired_response_secondary_size": null,
+        "_sparse_diagonal_response_size": null,
+        "_compact_diagonal_mass_size": null,
+        "_row_watermark": false,
+        "enable_contact_friction": true,
+        "enable_joint_limits": true,
+        "enable_joint_velocity_limits": true,
+        "update_mass_matrix_interval": 2,
+        "pgs_iterations": 8,
+        "pgs_inner_substeps": null,
+        "pgs_velocity_iterations": 0
+      },
+      "checks": {
+        "pass": true,
+        "complete": true,
+        "boundaries": 2,
+        "physics_budgets_modified": false,
+        "physics_work_modified": false,
+        "log_warnings": []
+      }
+    },
+    {
+      "task": "G1 flat",
+      "task_key": "g1-flat",
+      "task_id": "Isaac-Velocity-Flat-G1",
+      "baseline": {
+        "env_fps": 406128.71708253276,
+        "loop_ms": 40.34188992518466,
+        "main_physics_graph_ms": 27.3210127,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-rest15/g1-flat/round_01_g1-flat_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "610efea5dc51caf14684e3e18a0298647b820c27921e86aa63ba00f56e6c4365",
+          "capture_checks.json": "2001ce13f31fac07e2910d242857bbbaf6b33715873545dfe354ea3791094725",
+          "capture_analysis.json": "07fc2411ec6bd73e8732cea2c05b45b5314971c350cde9b3f4fac11c26a15f1d",
+          "capture.log": "7268ae22568153e75376dc8e958c7e08a5f760e34a4121444c7dc9ca4614cbd8"
+        }
+      },
+      "configuration_reference": "results.json: rows[task_key=g1-flat].matched_configuration",
+      "candidate": {
+        "env_fps": 574801.8707934548,
+        "loop_ms": 28.5037346475292,
+        "main_physics_graph_ms": 17.005198825,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "contact-projection/final20/g1-flat/g1-flat/round_01_g1-flat_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "cf0df76dfef5c255ec12d0d1dc06d8f4475bd49c33b3f6e6994ea72a89c77eb4",
+          "capture_checks.json": "57ff98da5695f808f4cc169e44d6c40c07f305bc2386586210f96031bd49410a",
+          "capture_analysis.json": "0c8475e8d5b260f3e54381c0dad15eb1f4fc3d9255959dcffed9976491f2a59b",
+          "capture.log": "c3defd53c2a78adcc9a46697de5912fcd6c44abe84e85d5d8da4fa356b56aa64"
+        }
+      },
+      "env_fps_gain": 1.4153194458215193,
+      "physics_gain": 1.6066270662965918,
+      "sparse_active": true,
+      "sparse_representation": {
+        "dofs": 43,
+        "packed_factor_nnz": 434,
+        "max_row_support": 18,
+        "factor_warps_per_block": 4,
+        "factor_status_nonzero": 0,
+        "factor_status_max": 0,
+        "factor_kernel": "crba_sparse_factor_43_434_4",
+        "solve_kernel": "pgs_solve_sparse_56_43_18_0_0",
+        "selected_contact_producer": "populate_sparse_contact_response",
+        "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+        "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+        "double_buffer": false
+      },
+      "matched_configuration": {
+        "num_envs": 16384,
+        "sim_dt": 0.005,
+        "env_decimation": 4,
+        "cuda_graph": true,
+        "model": {
+          "bodies": 720896,
+          "shapes": 49153,
+          "joints": 720896,
+          "joint_dofs": 704512,
+          "joint_coords": 720896,
+          "articulations": 16384,
+          "world_count": 16384,
+          "size_groups": [
+            43
+          ],
+          "n_arts_by_size": {
+            "43": 16384
+          },
+          "num_substeps": 2,
+          "solver_dt": 0.0025,
+          "pgs_mode": "matrix_free",
+          "pgs_iterations": 8,
+          "dense_max_constraints": 56,
+          "mf_max_constraints": 32,
+          "rigid_contact_max": 196608,
+          "_has_free_rigid_bodies": false
+        },
+        "capacities": {
+          "dense_max_constraints": 56,
+          "mf_max_constraints": 32,
+          "propagation_max_constraints": 56
+        },
+        "contact_law": {
+          "friction_anchor_beta": 0.2,
+          "contact_compliance": false,
+          "contact_torsion_radius": 0
+        }
+      },
+      "runtime_selection": {
+        "parallel_tree": null,
+        "articulated_contact_response": "immediate",
+        "use_parallel_streams": true,
+        "_sparse_diagonal_contact_solve": false,
+        "_paired_response_primary_size": null,
+        "_paired_response_secondary_size": null,
+        "_sparse_diagonal_response_size": null,
+        "_compact_diagonal_mass_size": null,
+        "_row_watermark": false,
+        "enable_contact_friction": true,
+        "enable_joint_limits": true,
+        "enable_joint_velocity_limits": false,
+        "update_mass_matrix_interval": 2,
+        "pgs_iterations": 8,
+        "pgs_inner_substeps": null,
+        "pgs_velocity_iterations": 0
+      },
+      "checks": {
+        "pass": true,
+        "complete": true,
+        "boundaries": 2,
+        "physics_budgets_modified": false,
+        "physics_work_modified": false,
+        "log_warnings": []
+      }
+    },
+    {
+      "task": "Go2 flat",
+      "task_key": "go2-flat",
+      "task_id": "Isaac-Velocity-Flat-UnitreeGo2",
+      "baseline": {
+        "env_fps": 783236.8433040346,
+        "loop_ms": 20.918321373756044,
+        "main_physics_graph_ms": 16.8792432,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-rest15/go2-flat/round_01_go2-flat_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "052c86f32aba98ea36b9751a575b43b5f985d38b2cc9e0cb34056410aa419138",
+          "capture_checks.json": "2cf6fe8b41de3fc157ba4df6aca6ee9003c1bcecadc6e8ebf83fbd6bd57da358",
+          "capture_analysis.json": "b225779a37f64b2de94faba313cba9884f99afa471cf65f94a3f1b1dc2a82ca7",
+          "capture.log": "a3592c66cf87aab3b990a32fcefd75c2476bcb800cd62118a03e7d806ad41fd3"
+        }
+      },
+      "configuration_reference": "results.json: rows[task_key=go2-flat].matched_configuration",
+      "candidate": {
+        "env_fps": 957394.3866184618,
+        "loop_ms": 17.113114750827663,
+        "main_physics_graph_ms": 12.50127645,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "contact-projection/final20/go2-flat/go2-flat/round_01_go2-flat_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "7669619a0b1d64a171cf76348ee0d133ea892786de3877b6003cab3df6066cc0",
+          "capture_checks.json": "898ec848ba54b3099dcc00e81380fdc398f2c00731a0d26ba7de037f1925aa1e",
+          "capture_analysis.json": "e2cbf6d05bab66e503a0eb0e8aac27a1da5a66aab58e8bb52651ea78b671fe43",
+          "capture.log": "4290b253d2cd06881af9fc02c4ccc7c7a8923474ccca036a8050e65f225ded7e"
+        }
+      },
+      "env_fps_gain": 1.2223561682565325,
+      "physics_gain": 1.3502015788155777,
+      "sparse_active": true,
+      "sparse_representation": {
+        "dofs": 18,
+        "packed_factor_nnz": 117,
+        "max_row_support": 12,
+        "factor_warps_per_block": 4,
+        "factor_status_nonzero": 0,
+        "factor_status_max": 0,
+        "factor_kernel": "crba_sparse_factor_18_117_4",
+        "solve_kernel": "pgs_solve_sparse_96_18_12_0_0",
+        "selected_contact_producer": "populate_sparse_contact_response",
+        "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+        "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+        "double_buffer": false
+      },
+      "matched_configuration": {
+        "num_envs": 16384,
+        "sim_dt": 0.005,
+        "env_decimation": 4,
+        "cuda_graph": true,
+        "model": {
+          "bodies": 311296,
+          "shapes": 442369,
+          "joints": 311296,
+          "joint_dofs": 294912,
+          "joint_coords": 311296,
+          "articulations": 16384,
+          "world_count": 16384,
+          "size_groups": [
+            18
+          ],
+          "n_arts_by_size": {
+            "18": 16384
+          },
+          "num_substeps": 2,
+          "solver_dt": 0.0025,
+          "pgs_mode": "matrix_free",
+          "pgs_iterations": 8,
+          "dense_max_constraints": 96,
+          "mf_max_constraints": 32,
+          "rigid_contact_max": 120832,
+          "_has_free_rigid_bodies": false
+        },
+        "capacities": {
+          "dense_max_constraints": 96,
+          "mf_max_constraints": 32,
+          "propagation_max_constraints": 96
+        },
+        "contact_law": {
+          "friction_anchor_beta": 0.2,
+          "contact_compliance": false,
+          "contact_torsion_radius": 0
+        }
+      },
+      "runtime_selection": {
+        "parallel_tree": null,
+        "articulated_contact_response": "immediate",
+        "use_parallel_streams": true,
+        "_sparse_diagonal_contact_solve": false,
+        "_paired_response_primary_size": null,
+        "_paired_response_secondary_size": null,
+        "_sparse_diagonal_response_size": null,
+        "_compact_diagonal_mass_size": null,
+        "_row_watermark": false,
+        "enable_contact_friction": true,
+        "enable_joint_limits": true,
+        "enable_joint_velocity_limits": false,
+        "update_mass_matrix_interval": 2,
+        "pgs_iterations": 8,
+        "pgs_inner_substeps": null,
+        "pgs_velocity_iterations": 0
+      },
+      "checks": {
+        "pass": true,
+        "complete": true,
+        "boundaries": 2,
+        "physics_budgets_modified": false,
+        "physics_work_modified": false,
+        "log_warnings": []
+      }
+    },
+    {
+      "task": "Go2 rough",
+      "task_key": "go2-rough",
+      "task_id": "Isaac-Velocity-Rough-UnitreeGo2",
+      "baseline": {
+        "env_fps": 287158.1106601535,
+        "loop_ms": 57.055675573064946,
+        "main_physics_graph_ms": 49.6708943,
+        "sensor_graph_ms": 1.1467400250000002,
+        "artifact_locator": "baseline-rest15/go2-rough/round_01_go2-rough_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "07553abc47cf97c52bdf004cdf628d98138d13627e6dd52a01a7258a1552bd3c",
+          "capture_checks.json": "b208ffbe24f9fb4d907b290b4c8bb5c300ee2acc11ed54d8e9526445d0f8853e",
+          "capture_analysis.json": "b7b8c0c5f1969820e03d5cfcb59cc62f5219b35413ee4f47b9bf65222cd4f419",
+          "capture.log": "638d1fdda76bbb4c1e72bf8ef1333a5379043242b5f72345d4dd7171a38e9671"
+        }
+      },
+      "configuration_reference": "results.json: rows[task_key=go2-rough].matched_configuration",
+      "candidate": {
+        "env_fps": 331480.1713949096,
+        "loop_ms": 49.42678752413485,
+        "main_physics_graph_ms": 41.450553975000005,
+        "sensor_graph_ms": 1.1391107,
+        "artifact_locator": "contact-projection/final20/go2-rough/go2-rough/round_01_go2-rough_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "f4ea6cf4a01f9418aeba07fc802889b6618c18a9665f83e2718730ffdcb0dd08",
+          "capture_checks.json": "8a54b4e946d46f9a6be9c3bda9a430af05c51804fdf53e7511ba9e769687c7d1",
+          "capture_analysis.json": "89027677ce45ca1affc5f2312316ef0629a527b6e719a5b1880b253c00746b12",
+          "capture.log": "67631516e481e66aeb46da22dd65bea3cdfe4452af4381eb9b049f0a0a884d49"
+        }
+      },
+      "env_fps_gain": 1.1543472362067826,
+      "physics_gain": 1.198316778346507,
+      "sparse_active": true,
+      "sparse_representation": {
+        "dofs": 18,
+        "packed_factor_nnz": 117,
+        "max_row_support": 12,
+        "factor_warps_per_block": 4,
+        "factor_status_nonzero": 0,
+        "factor_status_max": 0,
+        "factor_kernel": "crba_sparse_factor_18_117_4",
+        "solve_kernel": "pgs_solve_sparse_184_18_12_0_0",
+        "selected_contact_producer": "populate_sparse_contact_response",
+        "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+        "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+        "double_buffer": false
+      },
+      "matched_configuration": {
+        "num_envs": 16384,
+        "sim_dt": 0.005,
+        "env_decimation": 4,
+        "cuda_graph": true,
+        "model": {
+          "bodies": 311296,
+          "shapes": 458753,
+          "joints": 311296,
+          "joint_dofs": 294912,
+          "joint_coords": 311296,
+          "articulations": 16384,
+          "world_count": 16384,
+          "size_groups": [
+            18
+          ],
+          "n_arts_by_size": {
+            "18": 16384
+          },
+          "num_substeps": 2,
+          "solver_dt": 0.0025,
+          "pgs_mode": "matrix_free",
+          "pgs_iterations": 8,
+          "dense_max_constraints": 184,
+          "mf_max_constraints": 32,
+          "rigid_contact_max": 321536,
+          "_has_free_rigid_bodies": false
+        },
+        "capacities": {
+          "dense_max_constraints": 184,
+          "mf_max_constraints": 32,
+          "propagation_max_constraints": 184
+        },
+        "contact_law": {
+          "friction_anchor_beta": 0.2,
+          "contact_compliance": false,
+          "contact_torsion_radius": 0
+        }
+      },
+      "runtime_selection": {
+        "parallel_tree": null,
+        "articulated_contact_response": "immediate",
+        "use_parallel_streams": true,
+        "_sparse_diagonal_contact_solve": false,
+        "_paired_response_primary_size": null,
+        "_paired_response_secondary_size": null,
+        "_sparse_diagonal_response_size": null,
+        "_compact_diagonal_mass_size": null,
+        "_row_watermark": false,
+        "enable_contact_friction": true,
+        "enable_joint_limits": true,
+        "enable_joint_velocity_limits": false,
+        "update_mass_matrix_interval": 2,
+        "pgs_iterations": 8,
+        "pgs_inner_substeps": null,
+        "pgs_velocity_iterations": 0
+      },
+      "checks": {
+        "pass": true,
+        "complete": true,
+        "boundaries": 2,
+        "physics_budgets_modified": false,
+        "physics_work_modified": false,
+        "log_warnings": []
+      }
+    },
+    {
+      "task": "H1 flat",
+      "task_key": "h1-flat",
+      "task_id": "Isaac-Velocity-Flat-H1",
+      "baseline": {
+        "env_fps": 658204.1336714827,
+        "loop_ms": 24.891973723424602,
+        "main_physics_graph_ms": 13.309133924999998,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-rest15/h1-flat/round_01_h1-flat_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "59718c4fb65db1abe323fb4a3a9e17841e893dab398a32f590c76d9bfe80086b",
+          "capture_checks.json": "46096ef332982e03fe4c71ece791a5c6e7e763d43fc89d2b10cfcb63f05a1114",
+          "capture_analysis.json": "e076972c7a193b35528f654df8883a49eecbe5fc8ed3a3611e328631207ad71c",
+          "capture.log": "ecb5d77e9e167deb79a85bb5b16c845ed23a9590d4f3a157362ac771de5c0ac2"
+        }
+      },
+      "configuration_reference": "results.json: rows[task_key=h1-flat].matched_configuration",
+      "candidate": {
+        "env_fps": 806158.4433531835,
+        "loop_ms": 20.323548224405386,
+        "main_physics_graph_ms": 9.907270175,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "contact-projection/final20/h1-flat/h1-flat/round_01_h1-flat_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "40be1dc78a39ce83e0636d1604396feb2d0a791f6a2813bcc27023ac0cf14b44",
+          "capture_checks.json": "5850acc3b6117a71e9d0bd37f66f0369c4fe39825001909cd9b68b6f0a07134b",
+          "capture_analysis.json": "1412fc634c909b4770f8624421465f44f084c8ee0d67882562a1e9708c1146d2",
+          "capture.log": "3b8315bd3b1ac287b7684c390171c4daf8e5fe70c0f484fbf608ee49d87d75c5"
+        }
+      },
+      "env_fps_gain": 1.2247848381875197,
+      "physics_gain": 1.3433704431099758,
+      "sparse_active": true,
+      "sparse_representation": {
+        "dofs": 25,
+        "packed_factor_nnz": 194,
+        "max_row_support": 16,
+        "factor_warps_per_block": 4,
+        "factor_status_nonzero": 0,
+        "factor_status_max": 0,
+        "factor_kernel": "crba_sparse_factor_25_194_4",
+        "solve_kernel": "pgs_solve_sparse_48_25_16_0_0",
+        "selected_contact_producer": "populate_sparse_contact_response",
+        "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+        "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+        "double_buffer": false
+      },
+      "matched_configuration": {
+        "num_envs": 16384,
+        "sim_dt": 0.005,
+        "env_decimation": 4,
+        "cuda_graph": true,
+        "model": {
+          "bodies": 327680,
+          "shapes": 49153,
+          "joints": 327680,
+          "joint_dofs": 409600,
+          "joint_coords": 425984,
+          "articulations": 16384,
+          "world_count": 16384,
+          "size_groups": [
+            25
+          ],
+          "n_arts_by_size": {
+            "25": 16384
+          },
+          "num_substeps": 2,
+          "solver_dt": 0.0025,
+          "pgs_mode": "matrix_free",
+          "pgs_iterations": 8,
+          "dense_max_constraints": 48,
+          "mf_max_constraints": 32,
+          "rigid_contact_max": 103424,
+          "_has_free_rigid_bodies": false
+        },
+        "capacities": {
+          "dense_max_constraints": 48,
+          "mf_max_constraints": 32,
+          "propagation_max_constraints": 48
+        },
+        "contact_law": {
+          "friction_anchor_beta": 0.2,
+          "contact_compliance": false,
+          "contact_torsion_radius": 0
+        }
+      },
+      "runtime_selection": {
+        "parallel_tree": null,
+        "articulated_contact_response": "immediate",
+        "use_parallel_streams": true,
+        "_sparse_diagonal_contact_solve": false,
+        "_paired_response_primary_size": null,
+        "_paired_response_secondary_size": null,
+        "_sparse_diagonal_response_size": null,
+        "_compact_diagonal_mass_size": null,
+        "_row_watermark": false,
+        "enable_contact_friction": true,
+        "enable_joint_limits": true,
+        "enable_joint_velocity_limits": false,
+        "update_mass_matrix_interval": 2,
+        "pgs_iterations": 8,
+        "pgs_inner_substeps": null,
+        "pgs_velocity_iterations": 0
+      },
+      "checks": {
+        "pass": true,
+        "complete": true,
+        "boundaries": 2,
+        "physics_budgets_modified": false,
+        "physics_work_modified": false,
+        "log_warnings": []
+      }
+    },
+    {
+      "task": "H1 rough",
+      "task_key": "h1-rough",
+      "task_id": "Isaac-Velocity-Rough-H1",
+      "baseline": {
+        "env_fps": 363384.8914258834,
+        "loop_ms": 45.0871799752349,
+        "main_physics_graph_ms": 31.971205849999997,
+        "sensor_graph_ms": 1.053788025,
+        "artifact_locator": "baseline-rest15/h1-rough/round_01_h1-rough_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "17bc9f09a6a3c8189e80600db6a042740690234420d0dd2f699f8899456524c9",
+          "capture_checks.json": "3fe413f938f7fa8940fca3f8edc58747bc3074b31eb0477ce3e1ba823ae63ff9",
+          "capture_analysis.json": "618375d047c18e1256aba6b742618bc27cfb983a6dd109d55ba9d9929a2579ee",
+          "capture.log": "cff238c849d1bb58e0da6771a7b3da380d1da49420132dd73c976765792ca30c"
+        }
+      },
+      "configuration_reference": "results.json: rows[task_key=h1-rough].matched_configuration",
+      "candidate": {
+        "env_fps": 402126.75942458067,
+        "loop_ms": 40.74337162601296,
+        "main_physics_graph_ms": 27.309938775,
+        "sensor_graph_ms": 1.05269615,
+        "artifact_locator": "contact-projection/final20/h1-rough/h1-rough/round_01_h1-rough_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "83fd2d9a4bf8260a823eb5b709db1cb8bfce666db31156740dcfd5b68ba6c008",
+          "capture_checks.json": "fccbf276416e9c15e351ca28a32344c129c6cf5d6f86744a2fe39140ce2b8113",
+          "capture_analysis.json": "260d99b70c41c3623dcf4ec79f7b11195c70c4f6cf567d08fe374a97e904f71b",
+          "capture.log": "9a0cdc2dd33ccdc7207e0c85d1e28e8c812cd619328c74d4ea5d0765375a1727"
+        }
+      },
+      "env_fps_gain": 1.1066138656637,
+      "physics_gain": 1.1706802462430639,
+      "sparse_active": true,
+      "sparse_representation": {
+        "dofs": 25,
+        "packed_factor_nnz": 194,
+        "max_row_support": 16,
+        "factor_warps_per_block": 4,
+        "factor_status_nonzero": 0,
+        "factor_status_max": 0,
+        "factor_kernel": "crba_sparse_factor_25_194_4",
+        "solve_kernel": "pgs_solve_sparse_88_25_16_0_0",
+        "selected_contact_producer": "populate_sparse_contact_response",
+        "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+        "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+        "double_buffer": false
+      },
+      "matched_configuration": {
+        "num_envs": 16384,
+        "sim_dt": 0.005,
+        "env_decimation": 4,
+        "cuda_graph": true,
+        "model": {
+          "bodies": 327680,
+          "shapes": 65537,
+          "joints": 327680,
+          "joint_dofs": 409600,
+          "joint_coords": 425984,
+          "articulations": 16384,
+          "world_count": 16384,
+          "size_groups": [
+            25
+          ],
+          "n_arts_by_size": {
+            "25": 16384
+          },
+          "num_substeps": 2,
+          "solver_dt": 0.0025,
+          "pgs_mode": "matrix_free",
+          "pgs_iterations": 8,
+          "dense_max_constraints": 88,
+          "mf_max_constraints": 32,
+          "rigid_contact_max": 236544,
+          "_has_free_rigid_bodies": false
+        },
+        "capacities": {
+          "dense_max_constraints": 88,
+          "mf_max_constraints": 32,
+          "propagation_max_constraints": 88
+        },
+        "contact_law": {
+          "friction_anchor_beta": 0.2,
+          "contact_compliance": false,
+          "contact_torsion_radius": 0
+        }
+      },
+      "runtime_selection": {
+        "parallel_tree": null,
+        "articulated_contact_response": "immediate",
+        "use_parallel_streams": true,
+        "_sparse_diagonal_contact_solve": false,
+        "_paired_response_primary_size": null,
+        "_paired_response_secondary_size": null,
+        "_sparse_diagonal_response_size": null,
+        "_compact_diagonal_mass_size": null,
+        "_row_watermark": false,
+        "enable_contact_friction": true,
+        "enable_joint_limits": true,
+        "enable_joint_velocity_limits": false,
+        "update_mass_matrix_interval": 2,
+        "pgs_iterations": 8,
+        "pgs_inner_substeps": null,
+        "pgs_velocity_iterations": 0
+      },
+      "checks": {
+        "pass": true,
+        "complete": true,
+        "boundaries": 2,
+        "physics_budgets_modified": false,
+        "physics_work_modified": false,
+        "log_warnings": []
+      }
+    },
+    {
+      "task": "Humanoid",
+      "task_key": "humanoid",
+      "task_id": "Isaac-Humanoid",
+      "baseline": {
+        "env_fps": 323338.44896480406,
+        "loop_ms": 50.67136324942113,
+        "main_physics_graph_ms": 42.508771,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-rest15/humanoid/round_01_humanoid_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "9905ea6758e51877d9c1ab39f00f6729dd90d46c7b06de482709411d7fc32254",
+          "capture_checks.json": "a64168de19ac3655a2d40f5e2113baa12f3d59d291ca3526e6b50e2020c76a7c",
+          "capture_analysis.json": "a3b0867278dbaac85e153c4030590ab5be92eb980e1d86f40458da5212481a8b",
+          "capture.log": "c27030c7ff5581b81fad27683bc6f5c2d92537023b3d4bb423e6243ddc0bf335"
+        }
+      },
+      "configuration_reference": "results.json: rows[task_key=humanoid].matched_configuration",
+      "candidate": {
+        "env_fps": 322853.1492862232,
+        "loop_ms": 50.747530374792404,
+        "main_physics_graph_ms": 42.627759325,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "contact-projection/final20/humanoid/humanoid/round_01_humanoid_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "8024dfc1cadbc177b582f33d0c17638212fc386c09b8cfc0a5138a5bed871fa8",
+          "capture_checks.json": "edba8a318b62b1c71a289a048bc71654a6c0de44b5b23a35ef4481cf29502afb",
+          "capture_analysis.json": "d48cf7aef40f48aafe1b3d02f61bd36b6f8f9b15856d9dcca6061849bac37518",
+          "capture.log": "814929b5d81033667f02b856f04cabc6260fdaba76e00b128e97aa87c355ee24"
+        }
+      },
+      "env_fps_gain": 0.9984990969056277,
+      "physics_gain": 0.9972086657407251,
+      "sparse_active": false,
+      "sparse_representation": null,
+      "matched_configuration": {
+        "num_envs": 16384,
+        "sim_dt": 0.008333333333333333,
+        "env_decimation": 2,
+        "cuda_graph": true,
+        "model": {
+          "bodies": 262144,
+          "shapes": 311297,
+          "joints": 262144,
+          "joint_dofs": 442368,
+          "joint_coords": 458752,
+          "articulations": 16384,
+          "world_count": 16384,
+          "size_groups": [
+            27
+          ],
+          "n_arts_by_size": {
+            "27": 16384
+          },
+          "num_substeps": 2,
+          "solver_dt": 0.004166666666666667,
+          "pgs_mode": "split",
+          "pgs_iterations": 8,
+          "dense_max_constraints": 128,
+          "mf_max_constraints": 512,
+          "rigid_contact_max": 99328,
+          "_has_free_rigid_bodies": false
+        },
+        "capacities": {
+          "dense_max_constraints": 128,
+          "mf_max_constraints": 512,
+          "propagation_max_constraints": 128
+        },
+        "contact_law": {
+          "friction_anchor_beta": 0.2,
+          "contact_compliance": false,
+          "contact_torsion_radius": 0
+        }
+      },
+      "runtime_selection": {
+        "parallel_tree": null,
+        "articulated_contact_response": "immediate",
+        "use_parallel_streams": true,
+        "_sparse_diagonal_contact_solve": false,
+        "_paired_response_primary_size": null,
+        "_paired_response_secondary_size": null,
+        "_sparse_diagonal_response_size": null,
+        "_compact_diagonal_mass_size": null,
+        "_row_watermark": false,
+        "enable_contact_friction": true,
+        "enable_joint_limits": true,
+        "enable_joint_velocity_limits": false,
+        "update_mass_matrix_interval": 2,
+        "pgs_iterations": 8,
+        "pgs_inner_substeps": null,
+        "pgs_velocity_iterations": 0
+      },
+      "checks": {
+        "pass": true,
+        "complete": true,
+        "boundaries": 2,
+        "physics_budgets_modified": false,
+        "physics_work_modified": false,
+        "log_warnings": []
+      }
+    },
+    {
+      "task": "UR10 reach",
+      "task_key": "ur10-reach",
+      "task_id": "Isaac-Reach-UR10",
+      "baseline": {
+        "env_fps": 1958658.8904980104,
+        "loop_ms": 8.364907273789868,
+        "main_physics_graph_ms": 5.1193614,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-rest15/ur10-reach/round_01_ur10-reach_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "53b3d4e0bbd7cc38cce500d1d4125932456682edb19e444e01c320a9e6c00803",
+          "capture_checks.json": "15a204f0a5e93a1699e936b433257f36224ed90a2ae457e12beab46bf19c3510",
+          "capture_analysis.json": "45c9516854c3b5976f56efb5bdac27c81e7a3f3c9a7690b7dc17f9d462facca8",
+          "capture.log": "037ebd9d670e6507faa56f4f908c17407c1d62651f8d2b9910ed4ebc1e801714"
+        }
+      },
+      "configuration_reference": "results.json: rows[task_key=ur10-reach].matched_configuration",
+      "candidate": {
+        "env_fps": 1923288.9161299581,
+        "loop_ms": 8.518740924773738,
+        "main_physics_graph_ms": 5.124702025,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "contact-projection/final20/ur10-reach/ur10-reach/round_01_ur10-reach_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "b96932eee450246ec317b2e503d5ef681f9544f84f77b48cb095bddbfc8d243f",
+          "capture_checks.json": "357df96b470a4dfbfd080b9c08d4131763720b0d35c62857636a2ef0b4e44437",
+          "capture_analysis.json": "da1c62c0cbe864905bd41e1a92c9f34cd943fdae4fe28f1f365d024739a326b0",
+          "capture.log": "4c9ce580d27a56471e250f4c4f7cac3bc821316d452f2181eb55318a8b4f7b1f"
+        }
+      },
+      "env_fps_gain": 0.9819417385336253,
+      "physics_gain": 0.9989578662380862,
+      "sparse_active": false,
+      "sparse_representation": null,
+      "matched_configuration": {
+        "num_envs": 16384,
+        "sim_dt": 0.008333333333333333,
+        "env_decimation": 4,
+        "cuda_graph": true,
+        "model": {
+          "bodies": 131072,
+          "shapes": 245761,
+          "joints": 131072,
+          "joint_dofs": 98304,
+          "joint_coords": 98304,
+          "articulations": 16384,
+          "world_count": 16384,
+          "size_groups": [
+            6
+          ],
+          "n_arts_by_size": {
+            "6": 16384
+          },
+          "num_substeps": 2,
+          "solver_dt": 0.004166666666666667,
+          "pgs_mode": "matrix_free",
+          "pgs_iterations": 8,
+          "dense_max_constraints": 16,
+          "mf_max_constraints": 32,
+          "rigid_contact_max": 59392,
+          "_has_free_rigid_bodies": false
+        },
+        "capacities": {
+          "dense_max_constraints": 16,
+          "mf_max_constraints": 32,
+          "propagation_max_constraints": 16
+        },
+        "contact_law": {
+          "friction_anchor_beta": 0.2,
+          "contact_compliance": false,
+          "contact_torsion_radius": 0
+        }
+      },
+      "runtime_selection": {
+        "parallel_tree": null,
+        "articulated_contact_response": "immediate",
+        "use_parallel_streams": true,
+        "_sparse_diagonal_contact_solve": false,
+        "_paired_response_primary_size": null,
+        "_paired_response_secondary_size": null,
+        "_sparse_diagonal_response_size": null,
+        "_compact_diagonal_mass_size": null,
+        "_row_watermark": false,
+        "enable_contact_friction": true,
+        "enable_joint_limits": true,
+        "enable_joint_velocity_limits": true,
+        "update_mass_matrix_interval": 2,
+        "pgs_iterations": 8,
+        "pgs_inner_substeps": null,
+        "pgs_velocity_iterations": 0
+      },
+      "checks": {
+        "pass": true,
+        "complete": true,
+        "boundaries": 2,
+        "physics_budgets_modified": false,
+        "physics_work_modified": false,
+        "log_warnings": []
+      }
+    },
+    {
+      "task": "KukaAllegro reorient",
+      "task_key": "kuka-reorient",
+      "task_id": "Isaac-Reorient-KukaAllegro",
+      "baseline": {
+        "env_fps": 347020.13481145585,
+        "loop_ms": 47.213398752501234,
+        "main_physics_graph_ms": 26.5117063,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "baseline-rest15/kuka-reorient/round_01_kuka-reorient_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "dc3189b3a2b41542f328ba63434a3f5ab6668e2ab6387ec6c7d96ad743c6aa4b",
+          "capture_checks.json": "3c83d80a9be0b77b1215ac353819e12aadf9427e781e14341f8b782a3356df2a",
+          "capture_analysis.json": "902e4e611a1efb2917b8d54c0b203a0542e045b3b40490e441384edd95d646e8",
+          "capture.log": "8ccf00136a6f809e545d8e0b2595f6ff38409a01bfdc1135866eff27d8859920"
+        }
+      },
+      "configuration_reference": "results.json: rows[task_key=kuka-reorient].matched_configuration",
+      "candidate": {
+        "env_fps": 380738.94586419617,
+        "loop_ms": 43.032109475461766,
+        "main_physics_graph_ms": 22.452313699999998,
+        "sensor_graph_ms": 0,
+        "artifact_locator": "contact-projection/final20/kuka-reorient/kuka-reorient/round_01_kuka-reorient_fpgs_gpu0",
+        "artifact_sha256": {
+          "capture.json": "7e050935a0d2ecd93f6e3887cf11008bbf41429f23149818b0227159545e151e",
+          "capture_checks.json": "4a9dff82c2a727efc0f481a99139ffd5a4cd8e93f6944428021f7914a321cfa6",
+          "capture_analysis.json": "40f7f0bf0840ad7653b6b4760ca9a8b737af4e6bfed2064f64a4507ca0ae0688",
+          "capture.log": "6c6b87da1a15703eda679ba8b26fe6704efa51500e7c1aa66e1da7df0a05b87c"
+        }
+      },
+      "env_fps_gain": 1.0971667280086228,
+      "physics_gain": 1.1808006361500287,
+      "sparse_active": true,
+      "sparse_representation": {
+        "dofs": 23,
+        "packed_factor_nnz": 180,
+        "max_row_support": 17,
+        "factor_warps_per_block": 4,
+        "factor_status_nonzero": 0,
+        "factor_status_max": 0,
+        "factor_kernel": "crba_sparse_factor_23_180_4",
+        "solve_kernel": "pgs_solve_sparse_192_29_17_64_6",
+        "selected_contact_producer": "populate_sparse_contact_response",
+        "selected_joint_limit_producer": "build_sparse_joint_limit_rows",
+        "dispatch_evidence": "Selected runtime representation and source branch; not per-kernel tracing",
+        "double_buffer": false
+      },
+      "matched_configuration": {
+        "num_envs": 16384,
+        "sim_dt": 0.008333333333333333,
+        "env_decimation": 4,
+        "cuda_graph": true,
+        "model": {
+          "bodies": 524288,
+          "shapes": 393217,
+          "joints": 524288,
+          "joint_dofs": 573440,
+          "joint_coords": 606208,
+          "articulations": 49152,
+          "world_count": 16384,
+          "size_groups": [
+            23,
+            6
+          ],
+          "n_arts_by_size": {
+            "6": 16384,
+            "23": 16384
+          },
+          "num_substeps": 2,
+          "solver_dt": 0.004166666666666667,
+          "pgs_mode": "matrix_free",
+          "pgs_iterations": 8,
+          "dense_max_constraints": 192,
+          "mf_max_constraints": 64,
+          "rigid_contact_max": 311296,
+          "_has_free_rigid_bodies": true
+        },
+        "capacities": {
+          "dense_max_constraints": 192,
+          "mf_max_constraints": 64,
+          "propagation_max_constraints": 192
+        },
+        "contact_law": {
+          "friction_anchor_beta": 0.2,
+          "contact_compliance": false,
+          "contact_torsion_radius": 0
+        }
+      },
+      "runtime_selection": {
+        "parallel_tree": null,
+        "articulated_contact_response": "immediate",
+        "use_parallel_streams": true,
+        "_sparse_diagonal_contact_solve": false,
+        "_paired_response_primary_size": null,
+        "_paired_response_secondary_size": null,
+        "_sparse_diagonal_response_size": null,
+        "_compact_diagonal_mass_size": null,
+        "_row_watermark": false,
+        "enable_contact_friction": true,
+        "enable_joint_limits": true,
+        "enable_joint_velocity_limits": false,
+        "update_mass_matrix_interval": 2,
+        "pgs_iterations": 8,
+        "pgs_inner_substeps": null,
+        "pgs_velocity_iterations": 0
+      },
+      "checks": {
+        "pass": true,
+        "complete": true,
+        "boundaries": 2,
+        "physics_budgets_modified": false,
+        "physics_work_modified": false,
+        "log_warnings": []
+      }
+    }
+  ]
+}

@@ -1,13 +1,15 @@
 # Sparse FPGS benchmark evidence
 
-This supporting evidence bundle is separate from the solver implementation PR. The latest results are in [extension.md](extension.md), with unrounded measurements and capture hashes in [extension.json](extension.json): clean candidate `1472112114f70e288012731a7639d69228e258de` against the recorded clean-main baseline, plus a separately labeled two-GPU extension comparison.
+This supporting evidence bundle is separate from the solver implementation PR. The latest results are in [contact-projection.md](contact-projection.md), with unrounded measurements and capture hashes in [contact-projection.json](contact-projection.json): clean candidate `a25b4c45f86ae9ea4d3ff8fb538cb85ece7dcac7` against the recorded clean-main baseline, plus separately labeled incremental two-GPU controls. Environment FPS and physics time are reported together.
+
+[extension.md](extension.md) and [extension.json](extension.json) preserve the prior `1472112114f70e288012731a7639d69228e258de` measurements. They are historical results, not measurements of the latest contact producer.
 
 [results.md](results.md) and [results.json](results.json) preserve the initial `d5c2177d2507ed12e87d6dc628373639a8e5231b` measurements, matched configurations, and supplemental controls. They are not results for the latest candidate. The retained helpers are byte-for-byte copies of the files used by the captures. The adapters have only portable path/GPU admission changes; original capture-driver hashes and portable-adapter hashes are recorded separately.
 
 ## Source and scope
 
 - Clean Newton baseline: `5238407d320823e71a5a4623c2c83c293d7b00fd`.
-- Latest clean Newton candidate: `1472112114f70e288012731a7639d69228e258de`.
+- Latest clean Newton candidate: `a25b4c45f86ae9ea4d3ff8fb538cb85ece7dcac7`.
 - Isaac Lab: `53ee6b44c2334341305dbdf385a3916c6b140799`, publicly reachable at `ooctipus/IsaacLab` branch `ooctipus/fpgs-contact-reset-20260913`, plus the included `isaaclab.patch`.
 - Retained helpers: exact bytes from local Newton commit `9233cffd6a4729c71a864e2ec2621c6d6d6de604`. `compare_backends.py` was last changed at `020c213ed0b5c3c19f3d824104ed72c32a0cc27b`. At preparation time (September 26, 2026), both commits returned GitHub HTTP 422 (not publicly reachable), which is why their exact helper files are included. Existing public branch `ooctipus/fpgs-structural-progress-20260917` at `301b6688ea74a7372a007f03989664890f0d2540` has older, nonidentical Python helpers; it must not be silently substituted.
 - The three Isaac Lab profiling dependencies (`compare_gpus.py`, `run_profiled.py`, `analyze_nsys.py`) are clean, unchanged files at the Lab pin above. The optional MJWarp line-search helper is not needed for this FPGS-only comparison.
@@ -23,7 +25,7 @@ For the initial `d5c2177d` candidate, ANYmal-D flat and G1 rough additionally ha
 - `helpers/`: exact retained comparison/checking/launch files, including their original copyright notices.
 - `capacities.json`: compact historical 4K FPGS capacity inputs, with the accepted SO101 Keyboard row capacity updated to 736. The original input hash and 704-to-736 adjustment are retained explicitly. Global collision storage is scaled with the world count; per-world row storage is not. Drawer is excluded; the twentieth task is the existing KukaAllegro reorientation task, using KukaAllegro's capacity recipe.
 - `isaaclab.patch`: the pre-existing shared Lab changes and their untracked regression test/changelog. Neither Lab nor task physics was edited by this benchmark task.
-- `provenance.json`: original-bundle source and content hashes, plus validation results. Original-bundle hashes are preserved; both `README.md` and the portable `benchmark.py` have since changed. Their latest hashes and the new capture/source hashes are in `extension.json`. Original Newton and Isaac Lab license texts are included alongside the retained source notices.
+- `provenance.json`: original-bundle source and content hashes, plus validation results. Original-bundle hashes are preserved; both `README.md` and the portable `benchmark.py` have since changed. Their latest hashes and the new capture/source hashes are in `contact-projection.json`; the earlier bundle state is retained in `extension.json`. Original Newton and Isaac Lab license texts are included alongside the retained source notices.
 
 The first five baseline captures used an earlier thin-adapter revision, before the later CLI controls and sparse-storage observations were added. Their original adapter hashes are recorded separately. The retained timing/capture helpers and effective workload were unchanged. The original five captures do not contain the later storage observations; the direct clean-main storage examples therefore cite `repeat2-main`, paired with `candidate-checkpoint`, at the same clean commits and matched settings.
 
@@ -47,7 +49,7 @@ This compact bundle excludes environment dumps, credentials, asset blobs, full r
 
 ## Reproduction entry point
 
-Use existing local checkouts at the pins above, with `isaaclab.patch` applied to Lab, and the candidate at `1472112114f70e288012731a7639d69228e258de`. The environment was Python 3.12.14, Warp 1.17.0, Torch 2.11.0+cu130, MuJoCo/MuJoCo-Warp 3.12.0, Nsight Systems 2025.6.3.541, and NVIDIA driver 610.43.03. Reuse a compatible prepared Lab environment; the driver does not install or synchronize dependencies.
+Use existing local checkouts at the pins above, with `isaaclab.patch` applied to Lab, and the candidate at `a25b4c45f86ae9ea4d3ff8fb538cb85ece7dcac7`. The environment was Python 3.12.14, Warp 1.17.0, Torch 2.11.0+cu130, MuJoCo/MuJoCo-Warp 3.12.0, Nsight Systems 2025.6.3.541, and NVIDIA driver 610.43.03. Reuse a compatible prepared Lab environment; the driver does not install or synchronize dependencies.
 
 The single entry point is `benchmark.py`. For example, after setting `lab`, `newton`, `revision`, `rtx_uuid`, and `output` to explicit local values:
 
