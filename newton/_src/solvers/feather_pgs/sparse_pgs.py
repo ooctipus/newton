@@ -242,6 +242,19 @@ def _get_pgs_solve_sparse_kernel(
             const int sibling = friction ? parent + 2 : -1;
             const float denominator = diagonal[row];
             if (!friction && denominator <= 0.0f) continue;
+            const float old_impulse = impulse[row];
+            float old_sibling = 0.0f;
+            float radius = 0.0f;
+            if (friction) {{
+                float normal_load = impulse[parent];
+                for (int next = world_row_parent.data[offset + parent]; next >= 0 && next != parent;
+                     next = world_row_parent.data[offset + next])
+                    normal_load += impulse[next];
+                radius = fmaxf(world_row_mu.data[offset + row] * normal_load, 0.0f);
+                old_sibling = impulse[sibling];
+                // A zero-radius, zero-impulse pair cannot change the velocity.
+                if (radius == 0.0f && old_impulse == 0.0f && old_sibling == 0.0f) continue;
+            }}
 
             int indices[{Q}];
             float responses[{Q}];
@@ -280,16 +293,9 @@ def _get_pgs_solve_sparse_kernel(
                 cross += __shfl_down_sync(MASK, cross, shift);
             }}
             const float residual = __shfl_sync(MASK, dot, 0) + rhs[row];
-            const float old_impulse = impulse[row];
             float new_impulse = old_impulse;
             float sibling_change = 0.0f;
             if (friction) {{
-                float normal_load = impulse[parent];
-                for (int next = world_row_parent.data[offset + parent]; next >= 0 && next != parent;
-                     next = world_row_parent.data[offset + next])
-                    normal_load += impulse[next];
-                const float radius = fmaxf(world_row_mu.data[offset + row] * normal_load, 0.0f);
-                const float old_sibling = impulse[sibling];
                 float2 pair = make_float2(0.0f, 0.0f);
                 if (radius > 0.0f) {{
                     const float sibling_residual = __shfl_sync(MASK, sibling_dot, 0) + rhs[sibling];

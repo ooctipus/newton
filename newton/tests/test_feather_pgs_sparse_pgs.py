@@ -79,7 +79,7 @@ def _sweep(
     return velocity, impulses
 
 
-def _problem(dofs=43, support=18, seeded=False):
+def _problem(dofs=43, support=18, seeded=False, *, contact_activity=None):
     rng = np.random.default_rng(471)
     factor = np.tril(rng.normal(scale=0.04, size=(dofs, dofs))) + np.eye(dofs)
     indices = np.sort(rng.choice(dofs, support, replace=False))
@@ -105,6 +105,35 @@ def _problem(dofs=43, support=18, seeded=False):
     parents = np.array((-1, 4, 1, 1, 1, -1, 5, 5), dtype=np.int32)
     mu = np.array((0, 0, 0.6, 0.6, 0, 0, 0.4, 0.4), dtype=np.float64)
     impulses = np.array((0, 0.4, 0.02, -0.01, 0.3, 0.2, -0.03, 0.01)) if seeded else np.zeros(8)
+    if contact_activity is not None:
+        factor[:] = np.eye(dofs)
+        rows.fill(0.0)
+        rows[:3, :3] = np.eye(3)
+        initial.fill(0.0)
+        bias.fill(0.0)
+        bias[:3] = (0.25, 1.0, -0.25)
+        types[:] = PGS_CONSTRAINT_TYPE_CONTACT
+        types[1:3] = PGS_CONSTRAINT_TYPE_FRICTION
+        parents.fill(-1)
+        parents[1:3] = 0
+        mu.fill(0.0)
+        mu[1:3] = 0.6
+        impulses.fill(0.0)
+        if contact_activity == "late_activation":
+            # A later normal row activates the initially unloaded pair next sweep.
+            rows[3, :3] = (-1.0, 0.0, 1.0)
+            bias[3] = -1.0
+        elif contact_activity == "seeded_retraction":
+            # Zero load must retract both signs of old tangent impulses.
+            impulses[1:3] = (-0.25, 0.125)
+        elif contact_activity == "linked_load":
+            # The anchor stays unloaded, but a linked normal supplies friction.
+            rows[3, 2] = 1.0
+            bias[3] = -1.0
+            parents[0], parents[3] = 3, 0
+            impulses[3] = 0.5
+        else:
+            raise ValueError(f"Unknown contact activity: {contact_activity}")
     jacobian = rows @ factor.T
     response = np.linalg.solve(factor.T, rows.T).T
     incident = jacobian @ initial
@@ -398,20 +427,24 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
     def test_cuda_sparse_sweeps_match_reference(self):
-        """Match delayed and relaxed serial sweeps, including padding and zero-row worlds."""
+        """Preserve sweeps, zero-load retraction, linked loads and late contact activation."""
         device = wp.get_device("cuda:0")
-        for dofs, support in ((43, 18), (75, 39)):
-            for seeded, (friction_start, iteration_offset, omega) in product((False, True), _SWEEP_CASES):
+        cases = [(43, 18, None), (75, 39, None)]
+        cases.extend((3, 3, activity) for activity in ("late_activation", "seeded_retraction", "linked_load"))
+        for dofs, support, contact_activity in cases:
+            settings = product((False, True), _SWEEP_CASES) if contact_activity is None else [(False, (0, 0, 1.0))]
+            for seeded, (friction_start, iteration_offset, omega) in settings:
                 with self.subTest(
                     dofs=dofs,
                     support=support,
+                    contact_activity=contact_activity,
                     seeded=seeded,
                     friction_start=friction_start,
                     iteration_offset=iteration_offset,
                     omega=omega,
                 ):
                     _, indices, rows, initial, bias, types, parents, mu, impulses, _, _, incident, diag = _problem(
-                        dofs, support, seeded
+                        dofs, support, seeded, contact_activity=contact_activity
                     )
                     expected, expected_impulses = _sweep(
                         rows,
@@ -427,6 +460,13 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                         iteration_offset=iteration_offset,
                         omega=omega,
                     )
+                    if contact_activity == "seeded_retraction":
+                        np.testing.assert_array_equal(expected_impulses[1:3], 0.0)
+                        np.testing.assert_allclose(expected[1:3], -impulses[1:3], atol=1.0e-12)
+                    elif contact_activity is not None:
+                        self.assertGreater(np.linalg.norm(expected_impulses[1:3]), 0.0)
+                        if contact_activity == "linked_load":
+                            self.assertEqual(expected_impulses[0], 0.0)
                     worlds, capacity = 3, 10
                     row_dof = np.full((worlds, capacity, support), -1, dtype=np.int32)
                     row_dof[:, :8] = indices
