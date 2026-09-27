@@ -710,8 +710,8 @@ class TestShapeColors(unittest.TestCase):
         np.testing.assert_array_equal(get_flags(0.5, 1.0), [1, 1])
         np.testing.assert_array_equal(get_flags(0.5, 0.4), [1, 0])
 
-    def test_viewer_gl_rebuilds_opacity_dependent_caches(self):
-        """Rebuild all shape caches after an opacity pass transition."""
+    def test_viewer_gl_refreshes_shapes_without_clearing_markers(self):
+        """Refresh shape caches while preserving markers and interaction state."""
 
         class FakeMeshInstancer:
             pass
@@ -723,6 +723,10 @@ class TestShapeColors(unittest.TestCase):
             "/layers/solverA/model/shapes/shape_0": FakeMeshInstancer(),
             "/layers/solverB/model/shapes/shape_0": FakeMeshInstancer(),
         }
+        marker = viewer.objects["/Visuals/Typing/mesh"] = object()
+        camera = viewer.camera = object()
+        picking = viewer.picking = object()
+        viewer.set_model = Mock(side_effect=AssertionError("Shape refresh must preserve the viewer model"))
         viewer._shape_instances = {"stale": object()}
         viewer._gaussian_instances = [object()]
         viewer._sdf_isomesh_instances = {0: object()}
@@ -738,13 +742,16 @@ class TestShapeColors(unittest.TestCase):
         viewer._rebuild_gl_shape_caches = Mock()
 
         with patch("newton._src.viewer.gl.opengl.MeshInstancerGL", FakeMeshInstancer):
-            viewer._rebuild_shape_batches_for_opacity_groups()
+            viewer.refresh_shapes()
 
         viewer._populate_shapes.assert_called_once_with()
         viewer._rebuild_gl_shape_caches.assert_called_once_with()
         self.assertTrue(viewer.model_changed)
         self.assertNotIn("/layers/solverA/model/shapes/shape_0", viewer.objects)
         self.assertIn("/layers/solverB/model/shapes/shape_0", viewer.objects)
+        self.assertIs(viewer.objects["/Visuals/Typing/mesh"], marker)
+        self.assertIs(viewer.camera, camera)
+        self.assertIs(viewer.picking, picking)
 
     @staticmethod
     def _make_transparency_renderer(oit_supported: bool):
