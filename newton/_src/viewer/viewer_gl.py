@@ -858,8 +858,14 @@ class ViewerGL(ViewerBase):
         current_mask[rendered_shapes] = opacities[rendered_shapes] < OPAQUE_OPACITY_THRESHOLD
         return bool(np.any(current_mask != self._shape_transparent_mask))
 
-    def _rebuild_shape_batches_for_opacity_groups(self):
-        """Rebuild shape batches after opacity changes move shapes between render passes."""
+    def refresh_shapes(self) -> None:
+        """Rebuild render batches after in-place shape geometry or visibility changes.
+
+        Call between frames after changing the current model's shape sources,
+        dimensions, flags, or opacity groups. Reuse geometry resources and preserve
+        camera state, markers, visible worlds, and picking buffers. Topology changes
+        require :meth:`set_model` instead.
+        """
         from .gl.opengl import MeshInstancerGL  # noqa: PLC0415
 
         shape_prefix = self._qualify("/model/shapes/")
@@ -1853,12 +1859,12 @@ class ViewerGL(ViewerBase):
         if self.model_changed:
             if self._shape_batches_have_transparency:
                 if self._shape_opacity_groups_changed():
-                    self._rebuild_shape_batches_for_opacity_groups()
+                    self.refresh_shapes()
                     return self.log_state(state)
                 self._sync_shape_opacities_from_model()
         elif not use_packed_cuda:
             if self._shape_opacity_groups_changed():
-                self._rebuild_shape_batches_for_opacity_groups()
+                self.refresh_shapes()
                 return self.log_state(state)
             self._sync_shape_opacities_from_model()
 
@@ -1898,7 +1904,7 @@ class ViewerGL(ViewerBase):
             if opacity_check_enabled:
                 opacity_flags = self._shape_opacity_update_flags_host.numpy()
                 if int(opacity_flags[1]) != 0:
-                    self._rebuild_shape_batches_for_opacity_groups()
+                    self.refresh_shapes()
                     return self.log_state(state)
                 if int(opacity_flags[0]) != 0:
                     self._sync_shape_opacities_from_model()
