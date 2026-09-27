@@ -1,0 +1,1 @@
+Add `CollisionPipeline(broad_phase_output_max=...)` to size explicit broad-phase output and dependent narrow-phase candidate buffers independently of the complete input pair list. The default is unchanged; retain overflow verification when calibrating a smaller capacity and rebuild the pipeline and captured graphs when changing it.

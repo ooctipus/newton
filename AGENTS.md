@@ -66,6 +66,26 @@ uvx --with virtualenv asv run --launch-method spawn main^!
 - Follow `changelog/README.md`: add a Towncrier fragment for user-facing changes instead of editing `CHANGELOG.md` directly. A `.skip` reason is optional for changes without user-facing impact.
 - Preview fragments with `uvx --from towncrier==25.8.0 towncrier build --draft --version X.Y.Z --date YYYY-MM-DD`.
 
+## FPGS large-gain workstream
+
+For the ongoing FPGS optimization study, follow
+`reports/fpgs/CROSS_TASK_20260911.md` before choosing an experiment. Preserve
+the inherited handoff and fixed per-task performance references.
+
+- Benchmark representative tasks before specializing the architecture. RTX PRO
+  6000 is primary; run paired RTX/GB300 batches with one job per device.
+- Leave Isaac Lab code and task timestep/substep/iteration allowances unchanged.
+  Newton solver algorithms and representations may change.
+- Prioritize structural whole-physics savings. Count screening, conversion,
+  fallback and publication costs; do not substitute component speedups or
+  resolved-world percentages for task-level progress.
+- Validate numerical convergence and physical behavior, not bit identity,
+  unchanged contact counts or unnecessary per-operation formal certificates.
+- Timebox a theory-versus-measurement mismatch, diagnose its cause, and allow a
+  targeted corrective experiment. Do not reject an algorithm solely because
+  its first mapping is slow, or repeatedly tune a failed mapping without new
+  evidence. Record measured gain, diagnosed loss and unvalidated ideas separately.
+
 ## Examples
 
 - Follow the `Example` class format.

@@ -1,0 +1,616 @@
+{
+  "schema": 1,
+  "audit_date": "2026-09-12",
+  "acceptance_scope": "Observed capacity and line-search flags only; no physical equivalence, trajectory convergence or speed claim",
+  "capacity_and_line_search_pass": true,
+  "physical_equivalence_accepted": false,
+  "performance_accepted": false,
+  "reserve_definition": "100 * (allocated / observed_high_water - 1), not percent of capacity unused",
+  "input_sha256": {
+    "/tmp/mj-native-allegro16384-cap112-ncon22-seed1-20260912-01/manifest.json": "32c035d9d20b8c50017f754964222bc77724ec16ba552b1c472843291400c5fd",
+    "/tmp/mj-native-allegro16384-cap112-ncon22-seed1-20260912-01/gpu0/audit.json": "771fbca52f10d296ea32338d96507d25cea692941c7ce7f68caf34f47aa11ee3",
+    "/tmp/mj-native-allegro16384-cap112-ncon22-seed1-20260912-01/gpu0/capture.json": "1de9ac01ca1465ba33804badcb1d470a2057ed976a985ac840fd62711419ab2e",
+    "/tmp/mj-native-allegro16384-cap112-ncon22-seed1-20260912-01/gpu0/audit.collision.json": "b607be10933456c1dc1faf5557b86d34fb3f5bc66bd48d5a627f39c1387660c0",
+    "/tmp/mj-native-allegro16384-cap112-ncon22-seed1-20260912-01/gpu0/audit.native_collision.json": "b5a16f05af0e48b2aefe23b2ca7df21ec436987535b0a004fd427b4c2fd2dd79",
+    "/tmp/mj-native-allegro16384-cap112-ncon22-seed1-20260912-01/gpu1/audit.json": "1541489659e4cc5e6b44572e7485458b9d3d8e5c361621a4d9fe4cd10a474079",
+    "/tmp/mj-native-allegro16384-cap112-ncon22-seed1-20260912-01/gpu1/capture.json": "d2095b3a3e8395d16491cb2e3f645c9f468ae27cf1531dfca162ad806fe645dd",
+    "/tmp/mj-native-allegro16384-cap112-ncon22-seed1-20260912-01/gpu1/audit.collision.json": "b607be10933456c1dc1faf5557b86d34fb3f5bc66bd48d5a627f39c1387660c0",
+    "/tmp/mj-native-allegro16384-cap112-ncon22-seed1-20260912-01/gpu1/audit.native_collision.json": "32137149dc3b74229786e9f79da3312f21f40a57e842d81ca9508febd6de73e8",
+    "/tmp/mj-elliptic-anymald16384-cap32-seed1-20260912-01/manifest.json": "3b1b69a2bcd582eedf1a327afd6bef99edeeb756c220f377a20bc82bde532f0e",
+    "/tmp/mj-elliptic-anymald16384-cap32-seed1-20260912-01/gpu0/audit.json": "2e3960a6b5678eef2093080b488c938d8e1759febf00ea4b037e71a28c992c31",
+    "/tmp/mj-elliptic-anymald16384-cap32-seed1-20260912-01/gpu0/capture.json": "a51c44d5a5a7c17ef394e18b7a7b6ac7972351b7b4ccd8606a7d552baf107f01",
+    "/tmp/mj-elliptic-anymald16384-cap32-seed1-20260912-01/gpu0/audit.collision.json": "215d7840a47f563ba3ac2859363856c82afa8033839ef7ff4d9a988650a40759",
+    "/tmp/mj-elliptic-anymald16384-cap32-seed1-20260912-01/gpu1/audit.json": "d96b7139a1ca09bc73a62859c25930e85f6f3feed691261365068b00de8021d6",
+    "/tmp/mj-elliptic-anymald16384-cap32-seed1-20260912-01/gpu1/capture.json": "a4c579404afe81ee7c5dd837744acea24daffa979b736dc6c8b400129e2c12b7",
+    "/tmp/mj-elliptic-anymald16384-cap32-seed1-20260912-01/gpu1/audit.collision.json": "fcfc32a2e0bd417f98ac5c7ee587d288e176cb88e775c98b03eefcaecf470297"
+  },
+  "runs": [
+    {
+      "task": "allegro_native",
+      "gpu": {
+        "index": 0,
+        "uuid": "GPU-883586b6-3100-0610-81e5-3b4c26f45639",
+        "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+        "driver": "610.43.03",
+        "pci_bus_id": "00000004:01:00.0"
+      },
+      "sources": {
+        "isaaclab": {
+          "commit": "1d8feb82d17dbfab8f0772de56f84deae2cb7974",
+          "clean": true
+        },
+        "newton": {
+          "commit": "5c31305dbba402928c76229670087f6642ef50e6",
+          "clean": true
+        },
+        "owner": {
+          "commit": "35b19928df46465137ecc2cf92da4e6f8a8bd17b",
+          "clean": true
+        }
+      },
+      "settings": {
+        "seed": 1,
+        "worlds": 16384,
+        "warmup_steps": 200,
+        "steps": 1000,
+        "repeats": 3,
+        "profile_steps": 40,
+        "solver": 2,
+        "cone": 1,
+        "newton_iterations": 100,
+        "line_search_iterations": 50,
+        "line_search_control": "corrected",
+        "stable_friction_delta": true,
+        "solver_attributes": [
+          "njmax=112",
+          "nconmax=22"
+        ],
+        "decimation": 4,
+        "substeps": 2,
+        "sim_dt": 0.008333333333333333,
+        "solver_dt": 0.004166666666666667
+      },
+      "horizon": {
+        "batch_solves": 25920,
+        "world_solves": 424673280
+      },
+      "rows": {
+        "allocated": 112,
+        "observed_high_water": 73,
+        "unused_slots": 39,
+        "reserve_over_observed_percent": 53.42465753424656
+      },
+      "contacts": {
+        "allocated": 360448,
+        "observed_high_water": 153295,
+        "unused_slots": 207153,
+        "reserve_over_observed_percent": 135.13356600019569
+      },
+      "actual_layout": {
+        "njmax": 112,
+        "naconmax": 360448,
+        "nvmax": 22,
+        "nvmax_pad": 32,
+        "njmax_pad": 112,
+        "njmax_nnz": 2464
+      },
+      "newton_public_contact_capacity": 360448,
+      "solve_flags": {
+        "ls_exhausted_solves": 0,
+        "outer_exhausted_solves": 0,
+        "nefc_over_capacity_solves": 0,
+        "nonfinite_solves": 0,
+        "other_solve_overflow_solves": 0,
+        "nacon_over_capacity_solves": 0,
+        "public_overflow_mask": 0
+      },
+      "peak_outer_iterations": 34,
+      "guards": {
+        "metadata_matches_command": true,
+        "boundary_state_finite": true,
+        "solve_source": true,
+        "collision_source": true,
+        "collision_ownership_restored": true,
+        "source_and_gpu_idle": true,
+        "observed_capacity": true,
+        "independent_stored_force_gradient_finite_in_bounds": true,
+        "native_counter_source_and_ownership": true
+      },
+      "native_collision": {
+        "pairs": {
+          "allocated": 360448,
+          "observed_high_water": 271440,
+          "unused_slots": 89008,
+          "reserve_over_observed_percent": 32.79104037724727
+        },
+        "naccdmax_recorded": 360448,
+        "contacts_backing_first_dimension": 360448,
+        "contact_efc_address_shape": [
+          360448,
+          4
+        ],
+        "transient_pair_capacities": {
+          "collision_pair": 360448,
+          "collision_pairid": 360448,
+          "collision_worldid": 360448
+        },
+        "transient_capacity_scope": "Exact pinned create_collision_context source, not intercepted array observations",
+        "raw_counter_overflow_calls": 0,
+        "negative_counter_calls": 0,
+        "measurement_scope": "Native ncollision/raw nacon at every original solve; no sleeping/incremental pass"
+      },
+      "newton_collision": null
+    },
+    {
+      "task": "allegro_native",
+      "gpu": {
+        "index": 1,
+        "uuid": "GPU-ebfac9e8-02d5-d8a9-3bfc-bac64c62ffd4",
+        "name": "NVIDIA GB300",
+        "driver": "610.43.03",
+        "pci_bus_id": "00000009:06:00.0"
+      },
+      "sources": {
+        "isaaclab": {
+          "commit": "1d8feb82d17dbfab8f0772de56f84deae2cb7974",
+          "clean": true
+        },
+        "newton": {
+          "commit": "5c31305dbba402928c76229670087f6642ef50e6",
+          "clean": true
+        },
+        "owner": {
+          "commit": "35b19928df46465137ecc2cf92da4e6f8a8bd17b",
+          "clean": true
+        }
+      },
+      "settings": {
+        "seed": 1,
+        "worlds": 16384,
+        "warmup_steps": 200,
+        "steps": 1000,
+        "repeats": 3,
+        "profile_steps": 40,
+        "solver": 2,
+        "cone": 1,
+        "newton_iterations": 100,
+        "line_search_iterations": 50,
+        "line_search_control": "corrected",
+        "stable_friction_delta": true,
+        "solver_attributes": [
+          "njmax=112",
+          "nconmax=22"
+        ],
+        "decimation": 4,
+        "substeps": 2,
+        "sim_dt": 0.008333333333333333,
+        "solver_dt": 0.004166666666666667
+      },
+      "horizon": {
+        "batch_solves": 25920,
+        "world_solves": 424673280
+      },
+      "rows": {
+        "allocated": 112,
+        "observed_high_water": 82,
+        "unused_slots": 30,
+        "reserve_over_observed_percent": 36.585365853658544
+      },
+      "contacts": {
+        "allocated": 360448,
+        "observed_high_water": 153328,
+        "unused_slots": 207120,
+        "reserve_over_observed_percent": 135.0829594072837
+      },
+      "actual_layout": {
+        "njmax": 112,
+        "naconmax": 360448,
+        "nvmax": 22,
+        "nvmax_pad": 32,
+        "njmax_pad": 112,
+        "njmax_nnz": 2464
+      },
+      "newton_public_contact_capacity": 360448,
+      "solve_flags": {
+        "ls_exhausted_solves": 0,
+        "outer_exhausted_solves": 0,
+        "nefc_over_capacity_solves": 0,
+        "nonfinite_solves": 0,
+        "other_solve_overflow_solves": 0,
+        "nacon_over_capacity_solves": 0,
+        "public_overflow_mask": 0
+      },
+      "peak_outer_iterations": 40,
+      "guards": {
+        "metadata_matches_command": true,
+        "boundary_state_finite": true,
+        "solve_source": true,
+        "collision_source": true,
+        "collision_ownership_restored": true,
+        "source_and_gpu_idle": true,
+        "observed_capacity": true,
+        "independent_stored_force_gradient_finite_in_bounds": true,
+        "native_counter_source_and_ownership": true
+      },
+      "native_collision": {
+        "pairs": {
+          "allocated": 360448,
+          "observed_high_water": 271457,
+          "unused_slots": 88991,
+          "reserve_over_observed_percent": 32.78272433571432
+        },
+        "naccdmax_recorded": 360448,
+        "contacts_backing_first_dimension": 360448,
+        "contact_efc_address_shape": [
+          360448,
+          4
+        ],
+        "transient_pair_capacities": {
+          "collision_pair": 360448,
+          "collision_pairid": 360448,
+          "collision_worldid": 360448
+        },
+        "transient_capacity_scope": "Exact pinned create_collision_context source, not intercepted array observations",
+        "raw_counter_overflow_calls": 0,
+        "negative_counter_calls": 0,
+        "measurement_scope": "Native ncollision/raw nacon at every original solve; no sleeping/incremental pass"
+      },
+      "newton_collision": null
+    },
+    {
+      "task": "anymald_external",
+      "gpu": {
+        "index": 0,
+        "uuid": "GPU-883586b6-3100-0610-81e5-3b4c26f45639",
+        "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+        "driver": "610.43.03",
+        "pci_bus_id": "00000004:01:00.0"
+      },
+      "sources": {
+        "isaaclab": {
+          "commit": "1d8feb82d17dbfab8f0772de56f84deae2cb7974",
+          "clean": true
+        },
+        "newton": {
+          "commit": "5c31305dbba402928c76229670087f6642ef50e6",
+          "clean": true
+        },
+        "owner": {
+          "commit": "35b19928df46465137ecc2cf92da4e6f8a8bd17b",
+          "clean": true
+        }
+      },
+      "settings": {
+        "seed": 1,
+        "worlds": 16384,
+        "warmup_steps": 200,
+        "steps": 1000,
+        "repeats": 3,
+        "profile_steps": 40,
+        "solver": 2,
+        "cone": 1,
+        "newton_iterations": 100,
+        "line_search_iterations": 50,
+        "line_search_control": "corrected",
+        "stable_friction_delta": false,
+        "solver_attributes": [
+          "njmax=32",
+          "nconmax=9"
+        ],
+        "decimation": 4,
+        "substeps": 2,
+        "sim_dt": 0.005,
+        "solver_dt": 0.0025
+      },
+      "horizon": {
+        "batch_solves": 25920,
+        "world_solves": 424673280,
+        "collision_calls": 12960
+      },
+      "rows": {
+        "allocated": 32,
+        "observed_high_water": 24,
+        "unused_slots": 8,
+        "reserve_over_observed_percent": 33.33333333333333
+      },
+      "contacts": {
+        "allocated": 147456,
+        "observed_high_water": 119614,
+        "unused_slots": 27842,
+        "reserve_over_observed_percent": 23.27653953550588
+      },
+      "actual_layout": {
+        "njmax": 32,
+        "naconmax": 147456,
+        "nvmax": 18,
+        "nvmax_pad": 32,
+        "njmax_pad": 32,
+        "njmax_nnz": 576
+      },
+      "newton_public_contact_capacity": 147456,
+      "solve_flags": {
+        "ls_exhausted_solves": 0,
+        "outer_exhausted_solves": 0,
+        "nefc_over_capacity_solves": 0,
+        "nonfinite_solves": 0,
+        "other_solve_overflow_solves": 0,
+        "nacon_over_capacity_solves": 0,
+        "public_overflow_mask": 0
+      },
+      "peak_outer_iterations": 26,
+      "guards": {
+        "metadata_matches_command": true,
+        "boundary_state_finite": true,
+        "solve_source": true,
+        "collision_source": true,
+        "collision_ownership_restored": true,
+        "source_and_gpu_idle": true,
+        "observed_capacity": true,
+        "independent_stored_force_gradient_finite_in_bounds": true
+      },
+      "native_collision": null,
+      "newton_collision": {
+        "pipeline_contact_capacity": 147456,
+        "full_explicit_pair_count": 2244608,
+        "broad_phase_output_max": 294912,
+        "verify_buffers": true,
+        "narrow_sticky_flags": {
+          "broad_phase": false,
+          "split_query": false,
+          "gjk": false,
+          "split_gjk": false,
+          "split_manifold": false,
+          "mesh": false,
+          "triangle": false,
+          "mesh_plane": false,
+          "mesh_mesh": false,
+          "sdf_sdf": false,
+          "contacts": false,
+          "reduction_hash_load": false,
+          "reduction_hash_insert": false
+        },
+        "queues": {
+          "rigid_contacts": {
+            "allocated": 147456,
+            "observed_high_water": 119614,
+            "unused_slots": 27842,
+            "reserve_over_observed_percent": 23.27653953550588,
+            "overflow_calls": 0
+          },
+          "soft_contacts": {
+            "allocated": 0,
+            "observed_high_water": 0,
+            "unused_slots": 0,
+            "reserve_over_observed_percent": null,
+            "overflow_calls": 0
+          },
+          "broad_phase_pairs": {
+            "allocated": 294912,
+            "observed_high_water": 218169,
+            "unused_slots": 76743,
+            "reserve_over_observed_percent": 35.17594158656821,
+            "overflow_calls": 0
+          },
+          "gjk_candidate_pairs": {
+            "allocated": 294912,
+            "observed_high_water": 123006,
+            "unused_slots": 171906,
+            "reserve_over_observed_percent": 139.75415833373984,
+            "overflow_calls": 0
+          },
+          "split_gjk_work": {
+            "allocated": 294912,
+            "observed_high_water": 122955,
+            "unused_slots": 171957,
+            "reserve_over_observed_percent": 139.8536049774308,
+            "overflow_calls": 0
+          },
+          "split_manifold_work": {
+            "allocated": 294912,
+            "observed_high_water": 175,
+            "unused_slots": 294737,
+            "reserve_over_observed_percent": 168421.14285714284,
+            "overflow_calls": 0
+          },
+          "sdf_sdf_pairs": {
+            "allocated": 0,
+            "observed_high_water": 0,
+            "unused_slots": 0,
+            "reserve_over_observed_percent": null,
+            "overflow_calls": 0
+          },
+          "split_query_results": {
+            "allocated": 294912,
+            "observed_high_water": 123006,
+            "unused_slots": 171906,
+            "reserve_over_observed_percent": 139.75415833373984,
+            "overflow_calls": 0
+          }
+        },
+        "measurement_scope": "All observed collision calls including warmup/capture/replay; diagnostic overhead"
+      }
+    },
+    {
+      "task": "anymald_external",
+      "gpu": {
+        "index": 1,
+        "uuid": "GPU-ebfac9e8-02d5-d8a9-3bfc-bac64c62ffd4",
+        "name": "NVIDIA GB300",
+        "driver": "610.43.03",
+        "pci_bus_id": "00000009:06:00.0"
+      },
+      "sources": {
+        "isaaclab": {
+          "commit": "1d8feb82d17dbfab8f0772de56f84deae2cb7974",
+          "clean": true
+        },
+        "newton": {
+          "commit": "5c31305dbba402928c76229670087f6642ef50e6",
+          "clean": true
+        },
+        "owner": {
+          "commit": "35b19928df46465137ecc2cf92da4e6f8a8bd17b",
+          "clean": true
+        }
+      },
+      "settings": {
+        "seed": 1,
+        "worlds": 16384,
+        "warmup_steps": 200,
+        "steps": 1000,
+        "repeats": 3,
+        "profile_steps": 40,
+        "solver": 2,
+        "cone": 1,
+        "newton_iterations": 100,
+        "line_search_iterations": 50,
+        "line_search_control": "corrected",
+        "stable_friction_delta": false,
+        "solver_attributes": [
+          "njmax=32",
+          "nconmax=9"
+        ],
+        "decimation": 4,
+        "substeps": 2,
+        "sim_dt": 0.005,
+        "solver_dt": 0.0025
+      },
+      "horizon": {
+        "batch_solves": 25920,
+        "world_solves": 424673280,
+        "collision_calls": 12960
+      },
+      "rows": {
+        "allocated": 32,
+        "observed_high_water": 25,
+        "unused_slots": 7,
+        "reserve_over_observed_percent": 28.000000000000004
+      },
+      "contacts": {
+        "allocated": 147456,
+        "observed_high_water": 119615,
+        "unused_slots": 27841,
+        "reserve_over_observed_percent": 23.275508924465992
+      },
+      "actual_layout": {
+        "njmax": 32,
+        "naconmax": 147456,
+        "nvmax": 18,
+        "nvmax_pad": 32,
+        "njmax_pad": 32,
+        "njmax_nnz": 576
+      },
+      "newton_public_contact_capacity": 147456,
+      "solve_flags": {
+        "ls_exhausted_solves": 0,
+        "outer_exhausted_solves": 0,
+        "nefc_over_capacity_solves": 0,
+        "nonfinite_solves": 0,
+        "other_solve_overflow_solves": 0,
+        "nacon_over_capacity_solves": 0,
+        "public_overflow_mask": 0
+      },
+      "peak_outer_iterations": 30,
+      "guards": {
+        "metadata_matches_command": true,
+        "boundary_state_finite": true,
+        "solve_source": true,
+        "collision_source": true,
+        "collision_ownership_restored": true,
+        "source_and_gpu_idle": true,
+        "observed_capacity": true,
+        "independent_stored_force_gradient_finite_in_bounds": true
+      },
+      "native_collision": null,
+      "newton_collision": {
+        "pipeline_contact_capacity": 147456,
+        "full_explicit_pair_count": 2244608,
+        "broad_phase_output_max": 294912,
+        "verify_buffers": true,
+        "narrow_sticky_flags": {
+          "broad_phase": false,
+          "split_query": false,
+          "gjk": false,
+          "split_gjk": false,
+          "split_manifold": false,
+          "mesh": false,
+          "triangle": false,
+          "mesh_plane": false,
+          "mesh_mesh": false,
+          "sdf_sdf": false,
+          "contacts": false,
+          "reduction_hash_load": false,
+          "reduction_hash_insert": false
+        },
+        "queues": {
+          "rigid_contacts": {
+            "allocated": 147456,
+            "observed_high_water": 119615,
+            "unused_slots": 27841,
+            "reserve_over_observed_percent": 23.275508924465992,
+            "overflow_calls": 0
+          },
+          "soft_contacts": {
+            "allocated": 0,
+            "observed_high_water": 0,
+            "unused_slots": 0,
+            "reserve_over_observed_percent": null,
+            "overflow_calls": 0
+          },
+          "broad_phase_pairs": {
+            "allocated": 294912,
+            "observed_high_water": 217794,
+            "unused_slots": 77118,
+            "reserve_over_observed_percent": 35.408688944599035,
+            "overflow_calls": 0
+          },
+          "gjk_candidate_pairs": {
+            "allocated": 294912,
+            "observed_high_water": 123108,
+            "unused_slots": 171804,
+            "reserve_over_observed_percent": 139.55551223316115,
+            "overflow_calls": 0
+          },
+          "split_gjk_work": {
+            "allocated": 294912,
+            "observed_high_water": 123058,
+            "unused_slots": 171854,
+            "reserve_over_observed_percent": 139.65284662516862,
+            "overflow_calls": 0
+          },
+          "split_manifold_work": {
+            "allocated": 294912,
+            "observed_high_water": 195,
+            "unused_slots": 294717,
+            "reserve_over_observed_percent": 151136.9230769231,
+            "overflow_calls": 0
+          },
+          "sdf_sdf_pairs": {
+            "allocated": 0,
+            "observed_high_water": 0,
+            "unused_slots": 0,
+            "reserve_over_observed_percent": null,
+            "overflow_calls": 0
+          },
+          "split_query_results": {
+            "allocated": 294912,
+            "observed_high_water": 123108,
+            "unused_slots": 171804,
+            "reserve_over_observed_percent": 139.55551223316115,
+            "overflow_calls": 0
+          }
+        },
+        "measurement_scope": "All observed collision calls including warmup/capture/replay; diagnostic overhead"
+      }
+    }
+  ],
+  "verified_pinned_source_count": 26,
+  "key_verified_source_sha256": {
+    "/home/octi/Projects/IsaacLab.wt/fpgs-opt-20260910/.venv/lib/python3.12/site-packages/mujoco_warp/_src/solver.py": "509b43da297dc6e49efeacdbb59df675213e84afbdb26770471a5ba1855a24b3",
+    "/tmp/fpgs-native-collision-watermark-CoTCex/native_watermark.py": "d25ead8d66110c99bfcf9a3fe56764006ff826ceb1d15b7f0a61f86c496e9d26",
+    "/home/octi/Projects/IsaacLab.wt/fpgs-opt-20260910/.venv/lib/python3.12/site-packages/mujoco_warp/_src/collision_driver.py": "6a50bbed06fc73ebf88921987f5ffdab5c5da307ff65930d7e9fa92baa8e5810",
+    "/home/octi/Projects/IsaacLab.wt/fpgs-opt-20260910/.venv/lib/python3.12/site-packages/mujoco_warp/_src/collision_core.py": "70efc41cee57876474cba322bf9a93c9119a7578c5de3828be5937c26df9dade",
+    "/tmp/fpgs-elliptic-capacity-7FnMBG/check_capacity.py": "584868797fb505b919118aaa72a11a37e634e716a6c778232f694ebba3c67286",
+    "/tmp/fpgs-native-collision-watermark-CoTCex/check_native_capacity.py": "f7946f07fe587a7318d65ac5f3a0ee7e30ae15f9cc03fbc5fa0eb1f22da8f76e"
+  }
+}

@@ -4,21 +4,113 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import warp as wp
 
 import newton
 from newton import Heightfield
+from newton._src.geometry.heightfield_features import HeightfieldFeatureContext, flat_seam_query_allowed
 from newton._src.utils import is_graph_capture_allocation_enabled
+from newton._src.utils.heightfield import HeightfieldData, get_triangle_shape_from_heightfield
 from newton.solvers import SolverMuJoCo
 from newton.tests.unittest_utils import assert_np_equal
 
 _cuda_available = wp.is_cuda_available()
 
 
+def _flat_feature_kernel():
+    """Exercise current feature ownership without requiring a collision rollout."""
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def evaluate(
+        heights: wp.array[HeightfieldData],
+        elevations: wp.array[float],
+        triangles: wp.array[int],
+        points: wp.array[wp.vec3],
+        allowed: wp.array[int],
+    ):
+        i = wp.tid()
+        context = HeightfieldFeatureContext()
+        context.heightfield = heights[0]
+        context.elevations = elevations
+        context.triangle = triangles[i]
+        geom, _ = get_triangle_shape_from_heightfield(heights[0], elevations, wp.transform_identity(), triangles[i])
+        allowed[i] = int(flat_seam_query_allowed(geom, points[i], wp.normalize(wp.vec3(-1.0, 0.0, 1.0)), context))
+
+    return evaluate
+
+
 class TestHeightfield(unittest.TestCase):
     """Test suite for heightfield support."""
+
+    @unittest.skipUnless(
+        os.environ.get("NEWTON_HEIGHTFIELD_WELD_FLAT_SEAMS") == "1", "Experimental current-flat feature gate"
+    )
+    def test_flat_internal_seam_has_no_oblique_contact(self):
+        """A continuous flat top has no lateral obstacle at a triangulation seam."""
+        for finite in (False, True):
+            for reduce in (False, True):
+                with self.subTest(finite=finite, reduce=reduce):
+                    builder = newton.ModelBuilder()
+                    cfg = builder.ShapeConfig(margin=0.0025, gap=0.02)
+                    terrain = Heightfield(np.zeros((21, 21), np.float32), nrow=21, ncol=21, hx=1.2, hy=1.2)
+                    builder.add_shape_heightfield(heightfield=terrain, cfg=cfg)
+                    body = builder.add_body(xform=wp.transform((0.015, 0.0, 0.03), wp.quat_identity()))
+                    builder.add_shape_box(body=body, hx=0.1, hy=0.08, hz=0.025, cfg=cfg)
+                    model = builder.finalize(device="cpu")
+                    with patch.dict(
+                        os.environ,
+                        {
+                            "NEWTON_HEIGHTFIELD_CELL_REJECT": "1",
+                            "NEWTON_HEIGHTFIELD_FINITE_QUERY": str(int(finite)),
+                        },
+                    ):
+                        pipeline = newton.CollisionPipeline(
+                            model,
+                            broad_phase="nxn",
+                            reduce_contacts=reduce,
+                            rigid_contact_max=100,
+                            max_triangle_pairs=128,
+                        )
+                    contacts = pipeline.contacts()
+                    pipeline.collide(model.state(), contacts)
+                    pipeline.narrow_phase.check_buffer_capacity()
+                    count = int(contacts.rigid_contact_count.numpy()[0])
+                    self.assertGreater(count, 0)
+                    self.assertLess(count, 100)
+                    normals = contacts.rigid_contact_normal.numpy()[:count]
+                    self.assertGreater(float(normals[:, 2].min()), 0.99999)
+
+    def test_flat_seam_feature_preserves_border_and_current_crease(self):
+        """Only complete flat internal fans/edges disappear; current terrain remains authoritative."""
+        builder = newton.ModelBuilder()
+        terrain = Heightfield(
+            np.zeros((21, 21), np.float32),
+            nrow=21,
+            ncol=21,
+            hx=1.2,
+            hy=1.2,
+            min_z=0.0,
+            max_z=1.0,
+        )
+        builder.add_shape_heightfield(heightfield=terrain)
+        model = builder.finalize(device="cpu")
+        triangles = wp.array([420, 420, 438, 420], dtype=int, device="cpu")
+        points = wp.array(
+            [(0.12, 0.06, 0.0), (0.12, 0.12, 0.0), (0.12, 0.06, 0.0), (0.03, 0.01, 0.0)], dtype=wp.vec3, device="cpu"
+        )
+        allowed = wp.empty(4, dtype=int, device="cpu")
+        kernel = _flat_feature_kernel()
+        inputs = [model.heightfield_data, model.heightfield_elevations, triangles, points, allowed]
+        wp.launch(kernel, dim=4, inputs=inputs, device="cpu")
+        np.testing.assert_array_equal(allowed.numpy(), [0, 0, 1, 1])
+        elevations = model.heightfield_elevations.numpy()
+        elevations[11 * 21 + 12] = 0.1
+        model.heightfield_elevations.assign(elevations)
+        wp.launch(kernel, dim=4, inputs=inputs, device="cpu")
+        np.testing.assert_array_equal(allowed.numpy(), [1, 1, 1, 1])
 
     def test_heightfield_creation(self):
         """Test creating a Heightfield with auto-normalization."""

@@ -391,6 +391,7 @@ def convert_newton_contacts_to_mjwarp_kernel(
     # Model:
     geom_bodyid: wp.array[int],
     body_weldid: wp.array[int],
+    body_dofnum: wp.array[int],
     body_invweight0: wp.array2d[wp.vec2],
     geom_condim: wp.array[int],
     geom_priority: wp.array[int],
@@ -506,11 +507,16 @@ def convert_newton_contacts_to_mjwarp_kernel(
         # A body is "immovable" in three cases:
         #  1. body < 0 → static shape (no body)
         #  2. BodyFlags.KINEMATIC → kinematic body (e.g. armature=1e10)
-        #  3. body_weldid == 0 → fixed root body (worldbody)
+        #  3. its welded ancestor has no DOFs, including fixed mocap roots
+        # Use the welded ancestor: a fixed child can still have dynamic response.
         # Pairs where both sides are immovable produce degenerate efc_D values
         # in MuJoCo's solver, so we skip them.
-        a_immovable = body_a < 0 or (body_flags[body_a] & BodyFlags.KINEMATIC) != 0 or body_weldid[mj_body_a] == 0
-        b_immovable = body_b < 0 or (body_flags[body_b] & BodyFlags.KINEMATIC) != 0 or body_weldid[mj_body_b] == 0
+        a_immovable = (
+            body_a < 0 or (body_flags[body_a] & BodyFlags.KINEMATIC) != 0 or body_dofnum[body_weldid[mj_body_a]] == 0
+        )
+        b_immovable = (
+            body_b < 0 or (body_flags[body_b] & BodyFlags.KINEMATIC) != 0 or body_dofnum[body_weldid[mj_body_b]] == 0
+        )
 
         if a_immovable and b_immovable:
             tid_to_cid[tid] = -1
@@ -750,9 +756,25 @@ def _snapshot_nacon_count(
     last_nacon_count: wp.array[wp.int32],
     contact_generation: wp.array[wp.int32],
     last_contact_generation: wp.array[wp.int32],
+    rigid_contact_count: wp.array[wp.int32],
+    rigid_contact_max: int,
+    naconmax: int,
+    contact_capacity_status: wp.array[wp.int32],
 ):
     last_nacon_count[0] = nacon[0]
     last_contact_generation[0] = contact_generation[0]
+    # Observe the raw prefix, not the converter's clamped/filtered output.
+    # This existing dim=1 launch also runs after cached or zero-grid conversion.
+    count = rigid_contact_count[0]
+    flags = int(0)
+    if count < 0:
+        flags = flags | 1
+    if count > rigid_contact_max:
+        flags = flags | 2
+    if count > naconmax:
+        flags = flags | 4
+    if flags != 0:
+        wp.atomic_or(contact_capacity_status, 0, flags)
 
 
 @wp.kernel

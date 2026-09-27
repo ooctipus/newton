@@ -242,7 +242,30 @@ def test_mixed_arm_and_spinning_bodies(test, device):
 
 
 class TestFeatherPGSGyroscopic(unittest.TestCase):
-    pass
+    def test_private_predictor_gyro_does_not_repeat_transport(self):
+        """Apply the same gyro law to a private, already transported predictor."""
+        from newton._src.solvers.feather_pgs import kernels  # noqa: PLC0415
+
+        model, state, output = _model("cpu", np.diag([0.001, 0.02, 0.0205]), (20.0, 4.0, 10.0))
+        solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0)
+        dt = 1.0 / 240.0
+        solver.step(state, output, model.control(), None, dt)
+        qd = solver._debug_stage3_qd_work
+        explicit = qd.numpy() + dt * solver._debug_stage3_joint_qdd.numpy()
+        solver.v_hat.assign(explicit)
+        solver._stage3_correct_free_root_velocity(state, qd, dt)
+        expected = solver.v_hat.numpy().copy()
+        self.assertGreater(np.max(np.abs(expected[3:] - explicit[3:])), 1.0e-4)
+        solver.v_hat.assign(explicit)
+        wp.launch(
+            kernels.apply_free_root_transport_to_predictor,
+            dim=solver._free_root_joint_count,
+            inputs=[solver._free_root_joint_indices, model.joint_qd_start, solver._kinematic_joint_mask, qd, dt],
+            outputs=[solver.v_hat],
+            device=model.device,
+        )
+        solver._stage3_correct_free_root_velocity(state, qd, dt, apply_transport=False)
+        np.testing.assert_array_equal(solver.v_hat.numpy(), expected)
 
 
 for _device in get_test_devices():

@@ -1,0 +1,1 @@
+Add the default-off experimental ``FEATHER_PGS_SPARSE_CONTACT_DIRECT=1`` selector to give each allocated contact an independent sparse-response worker while preserving the existing response arithmetic and capacity bounds.

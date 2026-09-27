@@ -104,6 +104,7 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
                 0,
                 0,
                 patches,
+                wp.empty(0, dtype=wp.int32, device=device),
             ],
             outputs=[
                 contact_world,
@@ -122,6 +123,7 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
                 wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
                 wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
                 wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
+                wp.zeros(4, dtype=wp.int32, device=device),
             ],
             device=device,
         )
@@ -250,6 +252,7 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
                 0,
                 0,
                 FrictionPatches(),
+                wp.empty(0, dtype=wp.int32, device=device),
             ],
             outputs=[
                 wp.zeros((capacity,), dtype=wp.int32, device=device),
@@ -268,6 +271,7 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
                 wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
                 wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
                 wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
+                wp.zeros(4, dtype=wp.int32, device=device),
             ],
             device=device,
         )

@@ -3,8 +3,11 @@
 
 """Tests for passive joint springs and passive damping in SolverFeatherPGS."""
 
+import os
 import unittest
+from unittest.mock import patch
 
+import numpy as np
 import warp as wp
 
 import newton
@@ -82,6 +85,43 @@ class TestFeatherPGSSprings(unittest.TestCase):
         qd_undamped = abs(float(undamped.joint_qd.numpy()[0]))
         self.assertGreater(qd_undamped, 4.0, "undamped joint should keep coasting")
         self.assertLess(qd_damped, 0.2 * qd_undamped)
+
+    @patch.dict(os.environ, {"FEATHER_PGS_GROUP_LANES": "16"})
+    def test_grouped_passive_damping_uses_unscaled_velocity(self):
+        """Keep passive damping on the input velocity while motion uses the prescale."""
+        for damping, velocity in ((0.2, 10.0), (0.0, 10.0), (0.2, 1.0)):
+            with self.subTest(damping=damping, velocity=velocity):
+                builder = _build_hinge(spring_k=0.0, spring_ref=0.0, damping=damping)
+                builder.joint_velocity_limit[0] = 2.0
+                model = builder.finalize()
+                control = model.control()
+                results = []
+                for grouped in (False, True):
+                    solver = newton.solvers.SolverFeatherPGS(
+                        model,
+                        pgs_mode="matrix_free",
+                        pgs_iterations=8,
+                        dense_max_constraints=32,
+                        enable_joint_velocity_limits=True,
+                        fuse_joint_velocity_limits=False,
+                        drive_mode="augmented",
+                        use_parallel_streams=True,
+                        grouped_dynamics=grouped,
+                    )
+                    self.assertEqual(solver._fused_k1, grouped)
+                    state_in, state_out = model.state(), model.state()
+                    state_in.joint_qd.fill_(velocity)
+                    solver.step(state_in, state_out, control, None, 0.001)
+                    solver.check_constraint_capacity()
+                    np.testing.assert_allclose(state_in.joint_qd.numpy(), [velocity], atol=1e-6)
+                    np.testing.assert_allclose(solver.qd_work.numpy(), [min(velocity, 2.0)], atol=1e-6)
+                    # Z-axis gravity and centripetal forces exert no hinge torque.
+                    np.testing.assert_allclose(
+                        solver._last_debug_state_aug.joint_tau.numpy(), [-damping * velocity], atol=2e-5
+                    )
+                    results.append((state_out.joint_q.numpy(), state_out.joint_qd.numpy()))
+                for original, fused in zip(results[0], results[1], strict=True):
+                    np.testing.assert_allclose(fused, original, rtol=2e-5, atol=2e-6)
 
 
 if __name__ == "__main__":

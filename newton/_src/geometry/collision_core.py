@@ -281,6 +281,7 @@ def create_compute_gjk_mpr_contacts(
     support_func: Any = None,
     use_precomputed_center: bool = False,
     penetration_refiner: Any = None,
+    query_filter: Any = None,
 ):
     """
     Factory function to create a compute_gjk_mpr_contacts function with a specific writer function.
@@ -291,6 +292,7 @@ def create_compute_gjk_mpr_contacts(
         support_func: Support mapping function (defaults to support_map)
         use_precomputed_center: Whether the geometry data supplies a cached center.
         penetration_refiner: Optional physical-proxy result refinement function.
+        query_filter: Optional predicate for nonnegative-distance query witnesses.
 
     Returns:
         A compute_gjk_mpr_contacts function with the writer function baked in
@@ -313,6 +315,7 @@ def create_compute_gjk_mpr_contacts(
         margin_b: float,
         writer_data: Any,
         sort_sub_key: int = 0,
+        query_context: Any = 0,
     ):
         """
         Compute contacts between two shapes using GJK/MPR algorithm and write them.
@@ -331,6 +334,7 @@ def create_compute_gjk_mpr_contacts(
             margin_b: Per-shape margin offset for shape B (signed distance padding)
             writer_data: Data structure for contact writer
             sort_sub_key: Sub-key for deterministic contact sorting (e.g. triangle/edge index)
+            query_context: Current geometry metadata for the optional query filter.
         """
         data_provider = SupportMapDataProvider()
 
@@ -371,6 +375,7 @@ def create_compute_gjk_mpr_contacts(
                     post_process_contact,
                     use_precomputed_center,
                     penetration_refiner,
+                    query_filter,
                 )
             )(
                 shape_a_data,
@@ -387,6 +392,7 @@ def create_compute_gjk_mpr_contacts(
                 or type_b == GeoType.ELLIPSOID,
                 writer_data,
                 contact_template,
+                query_context,
             )
         else:
             wp.static(
@@ -396,6 +402,7 @@ def create_compute_gjk_mpr_contacts(
                     post_process_contact,
                     use_precomputed_center,
                     penetration_refiner,
+                    query_filter,
                 )
             )(
                 shape_a_data,
@@ -408,6 +415,7 @@ def create_compute_gjk_mpr_contacts(
                 rigid_gap + radius_eff_a + radius_eff_b + margin_a + margin_b,
                 writer_data,
                 contact_template,
+                query_context,
             )
 
     return compute_gjk_mpr_contacts

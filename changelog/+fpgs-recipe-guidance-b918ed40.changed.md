@@ -1,0 +1,1 @@
+Document workload tradeoffs, publication requirements, specialized-path incompatibilities, and terrain-path selection for FPGS execution options. Existing defaults and explicit option semantics remain unchanged.

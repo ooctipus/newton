@@ -1,0 +1,1 @@
+Add the default-off experimental `FEATHER_PGS_COMPACT_CONTACT_BOUNDARY=1` representation producer for FeatherPGS's admitted dense-six plus independent-diagonal contact-triple path, preserving original allocation, scheduling, RHS, solve budgets, and fallback for other modes.

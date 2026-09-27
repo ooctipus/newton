@@ -1,0 +1,1 @@
+Add an experimental, default-off register-resident row-state layout for the CUDA 64-row-capacity FeatherPGS tiled-row solver, enabled with `FEATHER_PGS_DENSE_ROW_BUDGETS=1` and `FEATHER_PGS_DENSE_ROW_REGISTERS=1`, while preserving its existing sweep order and projection.

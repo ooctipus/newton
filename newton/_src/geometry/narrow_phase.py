@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Any
 
 import warp as wp
@@ -57,6 +58,8 @@ from ..geometry.contact_reduction_global import (
 )
 from ..geometry.contact_sort import ContactSorter
 from ..geometry.flags import ShapeFlags
+from ..geometry.heightfield_cells import heightfield_cell_overlaps_kernel
+from ..geometry.heightfield_features import WELD_FLAT_SEAMS, HeightfieldFeatureContext, flat_seam_query_allowed
 from ..geometry.mpr import create_solve_mpr, create_support_map_function
 from ..geometry.sdf_contact import (
     MESH_SDF_BLOCK_DIM,
@@ -259,6 +262,14 @@ def create_prepare_convex_pair(external_aabb: bool, speculative: bool = False):
             ):
                 return False, result
 
+        else:
+            # Bounding-sphere reject for non-plane pairs: AABB overlap admits many pairs whose hulls cannot come
+            # within the gap (elongated finger links next to each other); GJK on those is wasted work.
+            reject_radius = (
+                shape_collision_radius[shape_a] + shape_collision_radius[shape_b] + rigid_gap + margin_a + margin_b
+            )
+            if wp.length_sq(pos_a - pos_b) > reject_radius * reject_radius:
+                return False, result
         if is_infinite_plane_a:
             geom_a, pos_a = convert_infinite_plane_to_cube(geom_a, quat_a, pos_a, pos_b, bsphere_radius_b + rigid_gap)
         if is_infinite_plane_b:
@@ -1623,6 +1634,7 @@ def narrow_phase_find_mesh_triangle_overlaps_kernel(
     shape_pairs_mesh: wp.array[wp.vec2i],
     shape_pairs_mesh_count: wp.array[int],
     total_num_threads: int,
+    reject_heightfield_cells: bool,
     # outputs
     triangle_pairs: wp.array[wp.vec3i],  # (shape_a, shape_b, triangle_idx)
     triangle_pairs_count: wp.array[int],
@@ -1670,7 +1682,7 @@ def narrow_phase_find_mesh_triangle_overlaps_kernel(
                 triangle_pairs,
                 triangle_pairs_count,
                 # Plane local AABBs are not bounds for arbitrary plane extents.
-                type_b != GeoType.PLANE,
+                reject_heightfield_cells and type_b != GeoType.PLANE,
             )
             continue
 
@@ -1805,10 +1817,18 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(writer_func: Any):
             gap_b = shape_gap[shape_b]
             gap_sum = gap_a + gap_b
 
+            feature_context = HeightfieldFeatureContext()
+            if wp.static(WELD_FLAT_SEAMS):
+                feature_context.elevations = heightfield_elevations
+                feature_context.triangle = tri_idx
+                if type_a == GeoType.HFIELD:
+                    feature_context.heightfield = heightfield_data[shape_heightfield_index[shape_a]]
+
             wp.static(
                 create_compute_gjk_mpr_contacts(
                     writer_func,
                     penetration_refiner=create_triangle_prism_penetration_refiner(support_map),
+                    query_filter=flat_seam_query_allowed if WELD_FLAT_SEAMS else None,
                 )
             )(
                 shape_data_a,
@@ -1824,6 +1844,7 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(writer_func: Any):
                 margin_offset_b,
                 writer_data,
                 (tri_idx << 1) | 1,
+                feature_context,
             )
 
     return narrow_phase_process_mesh_triangle_contacts_kernel
@@ -2189,33 +2210,40 @@ def verify_narrow_phase_buffers(
     reduction_ht_capacity: int,
     reduction_ht_insert_failures: wp.array[int],
     reduction_ht_warn_load_percent: int,
+    capacity_status: wp.array[int],
 ):
-    """Check for buffer overflows in the collision pipeline."""
+    """Check buffers and retain warning history across subsequent collision calls."""
+    flags = capacity_status[0]
     if broad_phase_count[0] > max_broad_phase:
+        flags = flags | 1
         wp.printf(
             "Warning: Broad phase pair buffer overflowed %d > %d.\n",
             broad_phase_count[0],
             max_broad_phase,
         )
     if max_split_query >= 0 and split_query_count[0] > max_split_query:
+        flags = flags | 2
         wp.printf(
             "Warning: Split query-result buffer overflowed %d > %d.\n",
             split_query_count[0],
             max_split_query,
         )
     if gjk_count[0] > max_gjk:
+        flags = flags | 4
         wp.printf(
             "Warning: GJK candidate pair buffer overflowed %d > %d.\n",
             gjk_count[0],
             max_gjk,
         )
     if max_split_gjk >= 0 and split_gjk_count[0] > max_split_gjk:
+        flags = flags | 8
         wp.printf(
             "Warning: Split GJK work-item buffer overflowed %d > %d.\n",
             split_gjk_count[0],
             max_split_gjk,
         )
     if max_split_manifold >= 0 and split_manifold_count[0] > max_split_manifold:
+        flags = flags | 16
         wp.printf(
             "Warning: Split manifold work-item buffer overflowed %d > %d.\n",
             split_manifold_count[0],
@@ -2223,6 +2251,7 @@ def verify_narrow_phase_buffers(
         )
     if mesh_count:
         if mesh_count[0] > max_mesh:
+            flags = flags | 32
             wp.printf(
                 "Warning: Mesh-convex shape pair buffer overflowed %d > %d.\n",
                 mesh_count[0],
@@ -2230,6 +2259,7 @@ def verify_narrow_phase_buffers(
             )
     if triangle_count:
         if triangle_count[0] > max_triangle:
+            flags = flags | 64
             wp.printf(
                 "Warning: Triangle pair buffer overflowed %d > %d.\n",
                 triangle_count[0],
@@ -2237,6 +2267,7 @@ def verify_narrow_phase_buffers(
             )
     if mesh_plane_count:
         if mesh_plane_count[0] > max_mesh_plane:
+            flags = flags | 128
             wp.printf(
                 "Warning: Mesh-plane shape pair buffer overflowed %d > %d.\n",
                 mesh_plane_count[0],
@@ -2244,6 +2275,7 @@ def verify_narrow_phase_buffers(
             )
     if mesh_mesh_count:
         if mesh_mesh_count[0] > max_mesh_mesh:
+            flags = flags | 256
             wp.printf(
                 "Warning: Mesh-mesh shape pair buffer overflowed %d > %d.\n",
                 mesh_mesh_count[0],
@@ -2251,12 +2283,14 @@ def verify_narrow_phase_buffers(
             )
     if sdf_sdf_count:
         if sdf_sdf_count[0] > max_sdf_sdf:
+            flags = flags | 512
             wp.printf(
                 "Warning: SDF-SDF shape pair buffer overflowed %d > %d.\n",
                 sdf_sdf_count[0],
                 max_sdf_sdf,
             )
     if contact_count[0] > max_contacts:
+        flags = flags | 1024
         wp.printf(
             "Warning: Contact buffer overflowed %d > %d.\n",
             contact_count[0],
@@ -2265,6 +2299,7 @@ def verify_narrow_phase_buffers(
     if reduction_ht_capacity > 0:
         reduction_ht_active_count = reduction_ht_active_slots[reduction_ht_capacity]
         if reduction_ht_active_count * 100 >= reduction_ht_capacity * reduction_ht_warn_load_percent:
+            flags = flags | 2048
             wp.printf(
                 "Warning: Contact reduction hashtable fill ratio exceeded %d%% (%d / %d). "
                 "Increase contact_reduction_hashtable_size_factor or max_triangle_pairs.\n",
@@ -2273,11 +2308,13 @@ def verify_narrow_phase_buffers(
                 reduction_ht_capacity,
             )
         if reduction_ht_insert_failures[0] > 0:
+            flags = flags | 4096
             wp.printf(
                 "Warning: Contact reduction hashtable insert failures %d. "
                 "Increase contact_reduction_hashtable_size_factor or max_triangle_pairs.\n",
                 reduction_ht_insert_failures[0],
             )
+    capacity_status[0] = flags
 
 
 class NarrowPhase:
@@ -2288,6 +2325,51 @@ class NarrowPhase:
     pairs. It owns the intermediate counters and pair buffers used while
     processing candidate pairs, then writes final contacts through a configurable
     contact writer function.
+
+    Heightfield-only scenes reject cells wholly below the convex contact search
+    envelope before triangle queries and pack independent pairs across lanes by
+    default. This uses current elevations, scaled bounds and contact/speculative
+    gaps without changing the solver or buffer capacities. Set
+    ``NEWTON_HEIGHTFIELD_CELL_REJECT=0`` before construction to retain the
+    unculled tiled midphase, or ``NEWTON_NARROW_PHASE_PACKED_HEIGHTFIELD_PAIRS=0`` to
+    disable only the packed mapping. Mixed triangle-mesh and heightfield scenes
+    retain the upstream tiled midphase and its cell rejection. Contact ordering
+    and redundant manifold point selection may change.
+    Rejection pays when many XY-overlapping cells lie below bodies; profile the
+    opt-out for densely touching terrain where these extra bound tests rarely reject.
+    Prefer this default for capsule/cylinder terrain contacts; finite-query
+    manifold changes target box/convex geometry and need workload validation.
+
+    ``NEWTON_HEIGHTFIELD_FINITE_QUERY=1`` is a separate experimental finite-box
+    query/manifold owner for non-speculative heightfield scenes. It preserves
+    the compacted triangle stream, generic fallback, reducer and capacities,
+    but may choose different physically supported manifold points. Construction
+    through CollisionPipeline binds immutable convex hull bounds; refitting a
+    bound convex hull requires rebuilding this experimental pipeline.
+
+    Experimental ``NEWTON_HEIGHTFIELD_GEOMETRIC_CULL=1`` additionally rejects
+    separated cuboid triangles inside the existing cell append owner. It
+    requires finite query, cell rejection and the stock nonpredictive global
+    reducer. Current scale, poses, heights, gaps and scaled reducer threshold
+    remain live; unsupported geometry and custom writers retain the old path.
+
+    Experimental ``NEWTON_HEIGHTFIELD_PAIR_CSR=1`` groups stock-writer-admitted
+    raw witnesses by shape pair and publishes at most four for supported
+    heightfield/box and heightfield/convex pairs. Selection prioritizes active
+    witnesses and then the nearest positive separation intervals. This changes
+    the contact manifold; it does not promise an equivalent pointwise Coulomb
+    system. Unsupported pairs retain the original global reduction and export.
+    Admission requires geometric culling, stock contact writing, no triangle
+    meshes, speculative contacts, deterministic mode or hydroelastic SDFs, and
+    internal CollisionPipeline construction with unique explicit or generated
+    NxN pairs. Raw-pool and membership failures remain sticky capacity errors.
+
+    Experimental ``NEWTON_HEIGHTFIELD_PAIR_CSR_SHELL=1`` additionally permits
+    finite-query positive-clearance face witnesses after pair-CSR admission.
+    Without admitted CSR, direct and reduced finite queries retain their
+    conservative generic fallback. Both options are disabled by default and
+    are read during pipeline construction; geometry limitations and immutable
+    hull binding requirements of the finite query continue to apply.
     """
 
     def __init__(
@@ -2384,8 +2466,10 @@ class NarrowPhase:
                 backing array, and checks the global contact reducer hashtable
                 fill/failure counters when reduction is enabled, printing
                 ``wp.printf`` warnings on overflow or critical hashtable load.
-                Users who want a programmatic overflow hook can disable this and
-                read those counters themselves.  Overhead is one extra kernel
+                These warnings are also latched for :meth:`buffer_capacity_status`
+                and :meth:`check_buffer_capacity`, including during graph replay.
+                The hash-load warning does not necessarily indicate lost work.
+                Overhead is one extra kernel
                 launch per collision pass (roughly a few µs of launch latency on
                 CUDA; the kernel body is a handful of scalar comparisons on one
                 thread).  Disable in hot loops or CUDA graph capture once buffer
@@ -2399,6 +2483,11 @@ class NarrowPhase:
             contact_writer_supports_speculative: Whether a custom contact writer performs exact speculative-contact
                 admission. Required when ``speculative`` and ``contact_writer_warp_func`` are both provided.
         """
+        if os.environ.get("NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD", "0") != "0":
+            raise ValueError(
+                "NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD is retired; unset it or set it to 0. "
+                "Use the original experiment checkpoint to reproduce that exporter."
+            )
         self.max_candidate_pairs = max_candidate_pairs
         self.max_triangle_pairs = max_triangle_pairs
         if max_mesh_mesh_pairs is not None and max_mesh_mesh_pairs < 0:
@@ -2417,9 +2506,62 @@ class NarrowPhase:
         self.reduce_contacts = reduce_contacts
         self.has_meshes = has_meshes
         self.has_heightfields = has_heightfields
-        # Heightfields enumerate cells serially per pair; the mesh BVH's tiled
-        # dimension otherwise leaves every lane but one idle for these queries.
-        self._heightfield_packed_pairs = has_heightfields and not has_meshes
+        # Mixed mesh/heightfield scenes retain the original full midphase;
+        # heightfield-only rejection adds no buffers or cached geometry.
+        cell_reject = os.environ.get("NEWTON_HEIGHTFIELD_CELL_REJECT", "1")
+        if cell_reject not in ("0", "1"):
+            raise ValueError("NEWTON_HEIGHTFIELD_CELL_REJECT must be 0 or 1")
+        self._heightfield_cell_reject_requested = cell_reject == "1"
+        self._heightfield_cell_reject = self._heightfield_cell_reject_requested and has_heightfields and not has_meshes
+        packed_pairs = os.environ.get("NEWTON_NARROW_PHASE_PACKED_HEIGHTFIELD_PAIRS", "1")
+        if packed_pairs not in ("0", "1"):
+            raise ValueError("NEWTON_NARROW_PHASE_PACKED_HEIGHTFIELD_PAIRS must be 0 or 1")
+        self._heightfield_packed_pairs = packed_pairs == "1" and self._heightfield_cell_reject
+        finite_query = os.environ.get("NEWTON_HEIGHTFIELD_FINITE_QUERY", "0")
+        if finite_query not in ("0", "1"):
+            raise ValueError("NEWTON_HEIGHTFIELD_FINITE_QUERY must be 0 or 1")
+        self._heightfield_finite_query = finite_query == "1" and has_heightfields and not has_meshes and not speculative
+        geometric_cull = os.environ.get("NEWTON_HEIGHTFIELD_GEOMETRIC_CULL", "0")
+        if geometric_cull not in ("0", "1"):
+            raise ValueError("NEWTON_HEIGHTFIELD_GEOMETRIC_CULL must be 0 or 1")
+        geometric_writer_supported = contact_writer_warp_func is None
+        if geometric_cull == "1" and not geometric_writer_supported:
+            from ..sim.collide import write_contact as stock_contact_writer  # noqa: PLC0415
+
+            geometric_writer_supported = contact_writer_warp_func is stock_contact_writer
+        self._heightfield_geometric_cull = (
+            geometric_cull == "1"
+            and self._heightfield_cell_reject
+            and self._heightfield_finite_query
+            and reduce_contacts
+            and geometric_writer_supported
+        )
+        pair_csr = os.environ.get("NEWTON_HEIGHTFIELD_PAIR_CSR", "0")
+        if pair_csr not in ("0", "1"):
+            raise ValueError("NEWTON_HEIGHTFIELD_PAIR_CSR must be 0 or 1")
+        pair_csr_writer_supported = False
+        if pair_csr == "1" and contact_writer_warp_func is not None:
+            from ..sim.collide import write_contact as pair_csr_stock_writer  # noqa: PLC0415
+
+            pair_csr_writer_supported = contact_writer_warp_func is pair_csr_stock_writer
+        self._heightfield_pair_csr_requested = (
+            pair_csr == "1"
+            and self._heightfield_geometric_cull
+            and not has_meshes
+            and not speculative
+            and not deterministic
+            and hydroelastic_sdf is None
+            and pair_csr_writer_supported
+        )
+        self._heightfield_pair_csr = False
+        pair_csr_shell = os.environ.get("NEWTON_HEIGHTFIELD_PAIR_CSR_SHELL", "0")
+        if pair_csr_shell not in ("0", "1"):
+            raise ValueError("NEWTON_HEIGHTFIELD_PAIR_CSR_SHELL must be 0 or 1")
+        self._heightfield_pair_csr_shell_requested = pair_csr_shell == "1"
+        self._heightfield_pair_csr_shell = False
+        self._pair_csr = None
+        self._finite_bounds = None
+        self._finite_source = None
         self.mesh_sdf_texture_only = mesh_sdf_texture_only
         self.has_generic_convex_pairs = has_generic_convex_pairs
         self.sdf_texture_paired_samples = sdf_texture_paired_samples
@@ -2460,6 +2602,8 @@ class NarrowPhase:
             writer_func = _write_contact_simple_speculative if speculative else write_contact_simple
         else:
             writer_func = contact_writer_warp_func
+        # Retain the resolved writer for optional typed support successors.
+        self._convex_writer_func = writer_func
 
         # CPU kernels currently observe ``wp.block_dim() == 1`` regardless
         # of the plain ``wp.launch(..., block_dim=N)`` parameter (Warp
@@ -2493,6 +2637,10 @@ class NarrowPhase:
         if candidate_pair_work_estimate < 0:
             raise ValueError("candidate_pair_work_estimate must be non-negative or None")
         self.split_gjk_mpr = device_obj.is_cuda and has_generic_convex_pairs and split_gjk_mpr
+        self._use_lean_gjk_mpr = use_lean_gjk_mpr
+        self._coherent_cache = None
+        self._coherent_query_kernels = None
+        self._cells_owner = None
         # Create the appropriate kernel variants
         # Primitive kernel handles lightweight primitives and routes remaining pairs
         self.primitive_kernel = create_narrow_phase_primitive_kernel(
@@ -2541,6 +2689,13 @@ class NarrowPhase:
             self.mesh_triangle_contacts_kernel = create_narrow_phase_process_mesh_triangle_contacts_kernel(writer_func)
         else:
             self.mesh_triangle_contacts_kernel = None
+        if self._heightfield_finite_query:
+            from .heightfield_finite import create_query_kernel, marked_fallback  # noqa: PLC0415
+
+            self._finite_direct = create_query_kernel(writer_func)
+            self._finite_reducer = create_query_kernel(write_contact_to_reducer)
+            self._finite_direct_fallback = marked_fallback(self.mesh_triangle_contacts_kernel)
+            self._finite_reducer_fallback = marked_fallback(mesh_triangle_contacts_to_reducer_kernel)
 
         # Create mesh-specific kernels only when has_meshes=True
         if has_meshes:
@@ -2637,6 +2792,8 @@ class NarrowPhase:
             n += 2 if mesh_weight_idx is not None else 0  # mesh-plane vertices, mesh-mesh edges
             c = wp.zeros(n, dtype=wp.int32, device=device)
             self._counter_array = c
+            # Separate storage: per-frame counter resets must not erase history.
+            self._buffer_capacity_status = wp.zeros(1, dtype=wp.int32, device=device)
 
             self.gjk_candidate_pairs_count = c[gjk_idx : gjk_idx + 1]
             self.split_gjk_work_count = c[split_gjk_idx : split_gjk_idx + 1] if self.split_gjk_mpr else None
@@ -2822,6 +2979,9 @@ class NarrowPhase:
             shape_collision_aabb_lower: Local-space AABB lower bounds for each shape (for voxel binning)
             shape_collision_aabb_upper: Local-space AABB upper bounds for each shape (for voxel binning)
             shape_voxel_resolution: Voxel grid resolution for each shape (for voxel binning)
+            shape_heightfield_index: Per-shape heightfield index; required when ``has_heightfields`` is True.
+            heightfield_data: Heightfield descriptors; required when ``has_heightfields`` is True.
+            heightfield_elevations: Current packed elevations; required when ``has_heightfields`` is True.
             mesh_edge_indices: Packed array of mesh edge vertex pairs for all shapes.
             mesh_edge_centers: Packed precomputed mesh edge centers [m].
             mesh_edge_halves: Packed precomputed mesh edge half-vectors [m].
@@ -2833,7 +2993,18 @@ class NarrowPhase:
             max_speculative_extension: Maximum speculative clearance [m].
             writer_data: Custom struct instance for contact writing (type must match the custom writer function)
             device: Device to launch on
+
+        Raises:
+            ValueError: If a heightfield pipeline omits a required heightfield array.
         """
+        if self.has_heightfields:
+            for name, value in (
+                ("shape_heightfield_index", shape_heightfield_index),
+                ("heightfield_data", heightfield_data),
+                ("heightfield_elevations", heightfield_elevations),
+            ):
+                if value is None:
+                    raise ValueError(f"Heightfield NarrowPhase requires {name}")
         if device is None:
             device = self.device if self.device is not None else candidate_pair.device
         if shape_mesh_properties is None:
@@ -2927,41 +3098,87 @@ class NarrowPhase:
                     shape_collision_aabb_lower,
                     shape_collision_aabb_upper,
                 ]
-                wp.launch(
-                    kernel=self.narrow_phase_mpr_kernel,
-                    dim=self.total_num_threads,
-                    inputs=[
+                if self._coherent_cache is not None:
+                    from .coherent_convex_rejection import _PairInputs  # noqa: PLC0415
+
+                    self._coherent_cache.begin()
+                    pair_inputs = _PairInputs()
+                    for name, value in zip(
+                        (
+                            "shape_types",
+                            "shape_data",
+                            "shape_transform",
+                            "shape_source",
+                            "shape_gap",
+                            "shape_collision_radius",
+                            "shape_aabb_lower",
+                            "shape_aabb_upper",
+                            "shape_collision_aabb_lower",
+                            "shape_collision_aabb_upper",
+                        ),
+                        common_inputs,
+                        strict=True,
+                    ):
+                        setattr(pair_inputs, name, value)
+                    coherent_inputs = [
                         convex_pairs,
                         convex_pair_count,
-                        *common_inputs,
+                        pair_inputs,
+                        self._coherent_cache.data,
                         self.total_num_threads,
                         self.split_query_results,
                         self.split_gjk_work_items,
                         self.split_gjk_work_count,
                         self.split_manifold_work_items,
                         self.split_manifold_work_count,
-                    ],
-                    device=device,
-                    block_dim=self.block_dim,
-                    record_tape=False,
-                )
-                wp.launch(
-                    kernel=self.narrow_phase_gjk_kernel,
-                    dim=self.total_num_threads,
-                    inputs=[
-                        convex_pairs,
-                        *common_inputs,
-                        self.total_num_threads,
-                        self.split_query_results,
-                        self.split_gjk_work_items,
-                        self.split_gjk_work_count,
-                        self.split_manifold_work_items,
-                        self.split_manifold_work_count,
-                    ],
-                    device=device,
-                    block_dim=self.block_dim,
-                    record_tape=False,
-                )
+                    ]
+                    if self._cells_owner is not None:
+                        coherent_inputs.append(self._cells_owner.data)
+                    for coherent_kernel in self._coherent_query_kernels:
+                        wp.launch(
+                            kernel=coherent_kernel,
+                            dim=self.total_num_threads,
+                            inputs=coherent_inputs,
+                            device=device,
+                            block_dim=self.block_dim,
+                            record_tape=False,
+                        )
+                else:
+                    wp.launch(
+                        kernel=self.narrow_phase_mpr_kernel,
+                        dim=self.total_num_threads,
+                        inputs=[
+                            convex_pairs,
+                            convex_pair_count,
+                            *common_inputs,
+                            self.total_num_threads,
+                            self.split_query_results,
+                            self.split_gjk_work_items,
+                            self.split_gjk_work_count,
+                            self.split_manifold_work_items,
+                            self.split_manifold_work_count,
+                        ],
+                        device=device,
+                        block_dim=self.block_dim,
+                        record_tape=False,
+                    )
+                    wp.launch(
+                        kernel=self.narrow_phase_gjk_kernel,
+                        dim=self.total_num_threads,
+                        inputs=[
+                            convex_pairs,
+                            *common_inputs,
+                            self.total_num_threads,
+                            self.split_query_results,
+                            self.split_gjk_work_items,
+                            self.split_gjk_work_count,
+                            self.split_manifold_work_items,
+                            self.split_manifold_work_count,
+                        ],
+                        device=device,
+                        block_dim=self.block_dim,
+                        record_tape=False,
+                    )
                 wp.launch(
                     kernel=self.narrow_phase_manifold_kernel,
                     dim=self.total_num_threads,
@@ -2973,6 +3190,7 @@ class NarrowPhase:
                         self.split_query_results,
                         self.split_manifold_work_items,
                         self.split_manifold_work_count,
+                        *([self._cells_owner.data] if self._cells_owner is not None else []),
                     ],
                     device=device,
                     block_dim=self.block_dim,
@@ -3028,13 +3246,34 @@ class NarrowPhase:
                     record_tape=False,
                 )
 
-            # Pure heightfield scenes need scalar cell queries, not tiled BVH
-            # traversal. Mixed mesh scenes retain the existing shared midphase.
-            if self._heightfield_packed_pairs:
-                midphase_kernel = narrow_phase_find_heightfield_triangle_overlaps_kernel
-                midphase_dim = self.total_num_threads
+            # Keep main's mixed-mesh inputs and plane-safe terrain query. The
+            # research routes extend only the heightfield-only midphase.
+            second_dim = self.tile_size_mesh_convex if ENABLE_TILE_BVH_QUERY else 1
+            midphase_workers = self.num_tile_blocks
+            midphase_kernel = narrow_phase_find_mesh_triangle_overlaps_kernel
+            midphase_inputs = [
+                shape_types,
+                shape_transform,
+                shape_source,
+                shape_gap,
+                shape_data,
+                shape_collision_radius,
+                shape_collision_aabb_lower,
+                shape_collision_aabb_upper,
+                shape_heightfield_index,
+                heightfield_data,
+                heightfield_elevations,
+                self.shape_pairs_mesh,
+                self.shape_pairs_mesh_count,
+                midphase_workers,
+                self._heightfield_cell_reject_requested,
+            ]
+            if self._heightfield_cell_reject:
+                midphase_kernel = heightfield_cell_overlaps_kernel
+                if self._heightfield_packed_pairs:
+                    midphase_workers = self.total_num_threads
+                    second_dim = 1
                 midphase_inputs = [
-                    shape_types,
                     shape_transform,
                     shape_gap,
                     shape_data,
@@ -3045,36 +3284,26 @@ class NarrowPhase:
                     heightfield_elevations,
                     self.shape_pairs_mesh,
                     self.shape_pairs_mesh_count,
-                    self.total_num_threads,
+                    midphase_workers,
                 ]
-            else:
-                midphase_kernel = narrow_phase_find_mesh_triangle_overlaps_kernel
-                second_dim = self.tile_size_mesh_convex if ENABLE_TILE_BVH_QUERY else 1
-                midphase_dim = [self.num_tile_blocks, second_dim]
-                midphase_inputs = [
-                    shape_types,
-                    shape_transform,
-                    shape_source,
-                    shape_gap,
-                    shape_data,
-                    shape_collision_radius,
-                    shape_collision_aabb_lower,
-                    shape_collision_aabb_upper,
-                    shape_heightfield_index,
-                    heightfield_data,
-                    heightfield_elevations,
-                    self.shape_pairs_mesh,
-                    self.shape_pairs_mesh_count,
-                    self.num_tile_blocks,
-                ]
+                if self._heightfield_geometric_cull:
+                    from .heightfield_geometric import heightfield_geometric_overlaps_kernel  # noqa: PLC0415
+
+                    if self._finite_bounds is None:
+                        raise RuntimeError("Geometric cull requires CollisionPipeline finite model binding")
+                    midphase_kernel = heightfield_geometric_overlaps_kernel
+                    midphase_inputs.extend([shape_types, shape_source, self._finite_bounds, self._finite_source])
+                else:
+                    midphase_inputs.insert(-1, shape_types)
+            midphase_outputs = [self.triangle_pairs, self.triangle_pairs_count]
+            if self._heightfield_pair_csr:
+                midphase_kernel = self._pair_csr.midphase
+                midphase_outputs.append(self._pair_csr.triangle_pair)
             wp.launch(
                 kernel=midphase_kernel,
-                dim=midphase_dim,
+                dim=[midphase_workers, second_dim],
                 inputs=midphase_inputs,
-                outputs=[
-                    self.triangle_pairs,
-                    self.triangle_pairs_count,
-                ],
+                outputs=midphase_outputs,
                 device=device,
                 block_dim=self.tile_size_mesh_convex,
                 record_tape=False,
@@ -3124,46 +3353,76 @@ class NarrowPhase:
                     )
 
                 # Mesh/heightfield-triangle contacts → same global reducer
+                triangle_inputs = [
+                    shape_types,
+                    shape_data,
+                    shape_transform,
+                    shape_source,
+                    shape_gap,
+                    shape_heightfield_index,
+                    heightfield_data,
+                    heightfield_elevations,
+                    self.triangle_pairs,
+                    self.triangle_pairs_count,
+                    self._pair_csr.data if self._heightfield_pair_csr else reducer_data,
+                    self.total_num_threads,
+                ]
+                if self._heightfield_finite_query:
+                    if self._finite_bounds is None:
+                        raise RuntimeError("Finite query requires CollisionPipeline model binding")
+                    wp.launch(
+                        kernel=self._pair_csr.finite if self._heightfield_pair_csr else self._finite_reducer,
+                        dim=self.total_num_threads,
+                        inputs=[*triangle_inputs, self._finite_bounds, self._finite_source],
+                        device=device,
+                        block_dim=self.mesh_triangle_block_dim,
+                        record_tape=False,
+                    )
                 wp.launch(
-                    kernel=mesh_triangle_contacts_to_reducer_kernel,
+                    kernel=self._pair_csr.generic
+                    if self._heightfield_pair_csr
+                    else self._finite_reducer_fallback
+                    if self._heightfield_finite_query
+                    else mesh_triangle_contacts_to_reducer_kernel,
                     dim=self.total_num_threads,
-                    inputs=[
-                        shape_types,
-                        shape_data,
-                        shape_transform,
-                        shape_source,
-                        shape_gap,
-                        shape_heightfield_index,
-                        heightfield_data,
-                        heightfield_elevations,
-                        self.triangle_pairs,
-                        self.triangle_pairs_count,
-                        reducer_data,
-                        self.total_num_threads,
-                    ],
+                    inputs=triangle_inputs,
                     device=device,
                     block_dim=self.mesh_triangle_block_dim,
                     record_tape=False,
                 )
             else:
                 # Direct contact processing without reduction
+                triangle_inputs = [
+                    shape_types,
+                    shape_data,
+                    shape_transform,
+                    shape_source,
+                    shape_gap,
+                    shape_heightfield_index,
+                    heightfield_data,
+                    heightfield_elevations,
+                    self.triangle_pairs,
+                    self.triangle_pairs_count,
+                    writer_data,
+                    self.total_num_threads,
+                ]
+                if self._heightfield_finite_query:
+                    if self._finite_bounds is None:
+                        raise RuntimeError("Finite query requires CollisionPipeline model binding")
+                    wp.launch(
+                        kernel=self._finite_direct,
+                        dim=self.total_num_threads,
+                        inputs=[*triangle_inputs, self._finite_bounds, self._finite_source],
+                        device=device,
+                        block_dim=self.mesh_triangle_block_dim,
+                        record_tape=False,
+                    )
                 wp.launch(
-                    kernel=self.mesh_triangle_contacts_kernel,
+                    kernel=self._finite_direct_fallback
+                    if self._heightfield_finite_query
+                    else self.mesh_triangle_contacts_kernel,
                     dim=self.total_num_threads,
-                    inputs=[
-                        shape_types,
-                        shape_data,
-                        shape_transform,
-                        shape_source,
-                        shape_gap,
-                        shape_heightfield_index,
-                        heightfield_data,
-                        heightfield_elevations,
-                        self.triangle_pairs,
-                        self.triangle_pairs_count,
-                        writer_data,
-                        self.total_num_threads,
-                    ],
+                    inputs=triangle_inputs,
                     device=device,
                     block_dim=self.mesh_triangle_block_dim,
                     record_tape=False,
@@ -3172,7 +3431,33 @@ class NarrowPhase:
             # Register mesh-plane/mesh-triangle contacts in hashtable BEFORE mesh-mesh.
             # Mesh-mesh does inline hashtable registration in its kernel.
             if self.reduce_contacts:
-                if self.speculative:
+                if self._heightfield_pair_csr:
+                    from .heightfield_pair_csr import reduce_fallback_contacts  # noqa: PLC0415
+
+                    self._pair_csr.build(
+                        self.shape_pairs_mesh,
+                        self.shape_pairs_mesh_count,
+                        shape_types,
+                        shape_data,
+                        shape_gap,
+                        self.total_num_threads,
+                    )
+                    wp.launch(
+                        kernel=reduce_fallback_contacts,
+                        dim=self.total_num_threads,
+                        inputs=[
+                            self._pair_csr.data,
+                            shape_transform,
+                            shape_collision_aabb_lower,
+                            shape_collision_aabb_upper,
+                            shape_voxel_resolution,
+                            self.total_num_threads,
+                        ],
+                        device=device,
+                        block_dim=self.block_dim,
+                        record_tape=False,
+                    )
+                elif self.speculative:
                     wp.launch(
                         kernel=reduce_buffered_contacts_speculative_kernel,
                         dim=self.total_num_threads,
@@ -3333,26 +3618,47 @@ class NarrowPhase:
                     1,
                     EXPORT_REDUCED_CONTACTS_THREAD_BUDGET_MULTIPLIER * self.total_num_threads // effective_block_dim,
                 )
+                export_inputs = [
+                    self.global_contact_reducer.hashtable.keys,
+                    self.global_contact_reducer.ht_values,
+                    self.global_contact_reducer.hashtable.active_slots,
+                    self.global_contact_reducer.position_depth,
+                    self.global_contact_reducer.normal,
+                    self.global_contact_reducer.shape_pairs,
+                    self.global_contact_reducer.contact_fingerprints,
+                    self.global_contact_reducer.exported_flags,
+                    shape_types,
+                    shape_data,
+                    shape_gap,
+                    writer_data,
+                    export_num_blocks,
+                    int(self.block_dim > 1),
+                    int(self.global_contact_reducer.deterministic),
+                ]
+                if self._heightfield_pair_csr:
+                    wp.launch_tiled(
+                        kernel=self._pair_csr.export_kernel,
+                        dim=export_num_blocks,
+                        inputs=[
+                            self._pair_csr.data,
+                            self.shape_pairs_mesh_count,
+                            shape_types,
+                            shape_data,
+                            shape_gap,
+                            writer_data,
+                            export_num_blocks,
+                            int(self.block_dim > 1),
+                        ],
+                        device=device,
+                        block_dim=EXPORT_REDUCED_CONTACTS_BLOCK_DIM,
+                        record_tape=False,
+                    )
                 wp.launch_tiled(
-                    kernel=self.export_reduced_contacts_kernel,
+                    kernel=self._pair_csr.fallback_export
+                    if self._heightfield_pair_csr
+                    else self.export_reduced_contacts_kernel,
                     dim=export_num_blocks,
-                    inputs=[
-                        self.global_contact_reducer.hashtable.keys,
-                        self.global_contact_reducer.ht_values,
-                        self.global_contact_reducer.hashtable.active_slots,
-                        self.global_contact_reducer.position_depth,
-                        self.global_contact_reducer.normal,
-                        self.global_contact_reducer.shape_pairs,
-                        self.global_contact_reducer.contact_fingerprints,
-                        self.global_contact_reducer.exported_flags,
-                        shape_types,
-                        shape_data,
-                        shape_gap,
-                        writer_data,
-                        export_num_blocks,
-                        int(self.block_dim > 1),
-                        int(self.global_contact_reducer.deterministic),
-                    ],
+                    inputs=export_inputs,
                     device=device,
                     block_dim=EXPORT_REDUCED_CONTACTS_BLOCK_DIM,
                     record_tape=False,
@@ -3425,10 +3731,67 @@ class NarrowPhase:
                     reduction_ht_capacity,
                     reduction_ht_insert_failures,
                     HASHTABLE_WARN_LOAD_PERCENT,
+                    self._buffer_capacity_status,
                 ],
                 device=device,
                 record_tape=False,
             )
+
+    def buffer_capacity_status(self, *, clear: bool = False) -> dict[str, bool]:
+        """Read sticky flags from the existing narrow-phase buffer verifier.
+
+        Keep ``verify_buffers=True`` for the entire observed run. Call outside
+        graph capture on the execution stream or after joining it. Flags survive
+        later clean calls and graph replays. Clearing acknowledges prior warnings;
+        it does not repair results, resize buffers, or recapture graphs.
+
+        This covers :func:`verify_narrow_phase_buffers` and the optional pair-CSR
+        raw-witness/membership guard: not soft contacts, hydroelastic internal
+        storage, or post-narrow-phase owners such as body pair reduction/contact
+        matching. ``reduction_hash_load`` is a load warning,
+        not proof that contacts were lost. Other flags identify exceeded buffers
+        or failed reducer insertions. No flag is an estimate of required capacity.
+        """
+        if not self.verify_buffers:
+            raise RuntimeError("Narrow-phase capacity status requires verify_buffers=True throughout the run")
+        if self._buffer_capacity_status.device.is_capturing:
+            raise RuntimeError("Narrow-phase capacity status must be read outside CUDA graph capture")
+        mask = int(self._buffer_capacity_status.numpy()[0])
+        names = (
+            "broad_phase",
+            "split_query",
+            "gjk",
+            "split_gjk",
+            "split_manifold",
+            "mesh",
+            "triangle",
+            "mesh_plane",
+            "mesh_mesh",
+            "sdf_sdf",
+            "contacts",
+            "reduction_hash_load",
+            "reduction_hash_insert",
+        )
+        result = {name: bool(mask & (1 << bit)) for bit, name in enumerate(names)}
+        if self._heightfield_pair_csr:
+            result["heightfield_pair_csr_raw_or_membership"] = int(self._pair_csr.status.numpy()[0]) != 0
+        if clear:
+            self._buffer_capacity_status.zero_()
+            if self._heightfield_pair_csr:
+                self._pair_csr.status.zero_()
+        return result
+
+    def check_buffer_capacity(self) -> None:
+        """Raise at a safe host boundary if any narrow-phase verification flag is set.
+
+        This adds no device work beyond the enabled verifier. An error does not
+        automatically abort a captured graph; discard affected results and correct
+        the allocation before rebuilding and recapturing. Hash-load warnings may
+        precede actual loss, so inspect the named condition before sizing storage.
+        """
+        failed = [name for name, flagged in self.buffer_capacity_status().items() if flagged]
+        if failed:
+            raise RuntimeError("Narrow-phase buffer verification failed: " + ", ".join(failed))
 
     def launch(
         self,
