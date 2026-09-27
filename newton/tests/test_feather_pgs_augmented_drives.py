@@ -2,21 +2,245 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import warp as wp
 
+import newton
 from newton._src.sim.enums import JointType
 from newton._src.solvers.feather_pgs.kernels import (
     eval_rigid_tau,
     eval_rigid_tau_add,
     eval_rigid_tau_and_augmented_drives,
+    populate_physx_drive_J_for_size,
     prepare_augmented_joint_drives,
 )
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _prepare_augmented_joint_drives_by_dof
 
 
+def _mixed_target_model(coord_layout, device):
+    """Place scalar drives before and after free/ball joints in two worlds."""
+    with patch.object(newton, "use_coord_layout_targets", coord_layout):
+        scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        for joint_kind in ("revolute", "free", "ball", "revolute"):
+            body = scene.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+            joint = getattr(scene, f"add_joint_{joint_kind}")(parent=-1, child=body)
+            scene.add_articulation([joint])
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        builder.replicate(scene, 2)
+        model = builder.finalize(device=device)
+    joints = np.flatnonzero(model.joint_type.numpy() == int(JointType.REVOLUTE))
+    dofs = model.joint_qd_start.numpy()[joints]
+    coords = model.joint_q_start.numpy()[joints]
+    targets = model.joint_target_q_start.numpy()[joints]
+    state, control = model.state(), model.control()
+    q, qd = state.joint_q.numpy().copy(), state.joint_qd.numpy().copy()
+    q[coords], qd[dofs] = [0.04, 0.05, 0.06, 0.07], [0.06, -0.05, 0.04, -0.03]
+    state.joint_q.assign(q)
+    state.joint_qd.assign(qd)
+    target_q, target_qd = control.joint_target_q.numpy().copy(), control.joint_target_qd.numpy().copy()
+    target_q[targets], target_qd[dofs] = [0.2, -0.3, 0.4, -0.5], [0.12, -0.07, 0.03, -0.11]
+    control.joint_target_q.assign(target_q)
+    control.joint_target_qd.assign(target_qd)
+    ke, kd = np.zeros(model.joint_dof_count), np.zeros(model.joint_dof_count)
+    ke[dofs], kd[dofs] = 20.0, 3.0
+    model.joint_target_ke.assign(ke)
+    model.joint_target_kd.assign(kd)
+    model.joint_effort_limit.fill_(100.0)
+    return model, state, control, joints, dofs, coords, targets
+
+
 class TestFeatherPGSAugmentedDrives(unittest.TestCase):
+    @unittest.skipUnless(wp.get_device().is_cuda, "Matrix-free solver dispatch requires CUDA")
+    def test_mixed_joint_target_layout_trajectories(self):
+        """Match public solver trajectories across both target layouts and drive dispatches."""
+        for drive_mode, parallel_streams in (("augmented", False), ("augmented", True), ("physx_pgs", False)):
+            with self.subTest(drive_mode=drive_mode, parallel_streams=parallel_streams):
+                trajectories = []
+                for coord_layout in (False, True):
+                    model, state, control, _joints, dofs, coords, targets = _mixed_target_model(
+                        coord_layout, wp.get_device()
+                    )
+                    solver = newton.solvers.SolverFeatherPGS(
+                        model,
+                        pgs_mode="matrix_free",
+                        drive_mode=drive_mode,
+                        use_parallel_streams=parallel_streams,
+                        enable_joint_limits=False,
+                        dense_max_constraints=16,
+                        mf_max_constraints=16,
+                        pgs_iterations=8,
+                    )
+                    self.assertEqual(solver._parallel_augmented_drive_topology, parallel_streams)
+                    initial_qd = state.joint_qd.numpy()[dofs].copy()
+                    position_error = control.joint_target_q.numpy()[targets] - state.joint_q.numpy()[coords]
+                    following = model.state()
+                    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+                    history = []
+                    for step in range(3):
+                        state.clear_forces()
+                        solver.step(state, following, control, None, 0.01)
+                        state, following = following, state
+                        q, qd = state.joint_q.numpy(), state.joint_qd.numpy()
+                        if step == 0:
+                            self.assertTrue(np.all((qd[dofs] - initial_qd) * position_error > 0.0))
+                        history.append(np.concatenate((q, qd)))
+                    trajectories.append(history)
+                np.testing.assert_allclose(trajectories[0], trajectories[1], rtol=0.0, atol=2e-6)
+
+    def test_mixed_joint_position_target_layouts(self):
+        """Keep distinct world targets aligned after free and ball coordinates."""
+        device, dt = wp.get_device(), 0.01
+        for coord_layout in (False, True):
+            model, state, control, joints, dofs, coords, targets = _mixed_target_model(coord_layout, device)
+            starts = model.joint_qd_start.numpy()
+            counts = wp.array(np.diff(starts), dtype=int, device=device)
+            max_dofs = 6
+            row_count = model.articulation_count * max_dofs
+            expected = np.zeros(model.joint_dof_count)
+            expected[dofs] = 20.0 * (
+                control.joint_target_q.numpy()[targets]
+                - state.joint_q.numpy()[coords]
+                - dt * state.joint_qd.numpy()[dofs]
+            ) + 3.0 * (control.joint_target_qd.numpy()[dofs] - state.joint_qd.numpy()[dofs])
+            for path in ("generic", "combined", "per_dof"):
+                with self.subTest(coord_layout=coord_layout, path=path):
+                    row_counts = wp.zeros(model.articulation_count, dtype=int, device=device)
+                    row_indices = wp.zeros(row_count, dtype=int, device=device)
+                    row_K = wp.zeros(row_count, dtype=float, device=device)
+                    tau = wp.zeros(model.joint_dof_count, dtype=float, device=device)
+                    gains = [
+                        model.joint_target_ke,
+                        model.joint_target_kd,
+                        control.joint_target_q,
+                        control.joint_target_qd,
+                        model.joint_effort_limit,
+                    ]
+                    if path == "per_dof":
+                        rows = np.full(model.joint_dof_count, -1, dtype=np.int32)
+                        q_indices = np.zeros(model.joint_dof_count, dtype=np.int32)
+                        target_indices = np.zeros(model.joint_dof_count, dtype=np.int32)
+                        rows[dofs], q_indices[dofs] = joints * max_dofs, coords
+                        target_indices[dofs] = targets
+                        wp.launch(
+                            _prepare_augmented_joint_drives_by_dof,
+                            dim=model.joint_dof_count,
+                            inputs=[
+                                wp.array(rows, dtype=int, device=device),
+                                wp.array(q_indices, dtype=int, device=device),
+                                wp.array(target_indices, dtype=int, device=device),
+                                state.joint_q,
+                                state.joint_qd,
+                                *gains,
+                                dt,
+                            ],
+                            outputs=[row_K, tau],
+                            device=device,
+                        )
+                    elif path == "generic":
+                        wp.launch(
+                            prepare_augmented_joint_drives,
+                            dim=model.articulation_count,
+                            inputs=[
+                                model.articulation_start,
+                                counts,
+                                model.joint_type,
+                                model.joint_qd_start,
+                                model.joint_q_start,
+                                model.joint_target_q_start,
+                                model.joint_dof_dim,
+                                state.joint_q,
+                                state.joint_qd,
+                                *gains,
+                                max_dofs,
+                                dt,
+                            ],
+                            outputs=[row_counts, row_indices, row_K, tau],
+                            device=device,
+                        )
+                    else:
+                        zeros = wp.zeros(model.joint_dof_count, dtype=float, device=device)
+                        body_forces = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=device)
+                        wp.launch(
+                            eval_rigid_tau_and_augmented_drives,
+                            dim=model.articulation_count,
+                            inputs=[
+                                model.articulation_start,
+                                wp.array(model.articulation_start.numpy()[1:], dtype=int, device=device),
+                                counts,
+                                model.joint_type,
+                                model.joint_parent,
+                                model.joint_child,
+                                model.joint_articulation,
+                                model.joint_qd_start,
+                                model.joint_q_start,
+                                model.joint_target_q_start,
+                                model.joint_dof_dim,
+                                control.joint_f,
+                                state.joint_q,
+                                state.joint_qd,
+                                zeros,
+                                zeros,
+                                zeros,
+                                wp.zeros(model.joint_dof_count, dtype=wp.spatial_vector, device=device),
+                                body_forces,
+                                body_forces,
+                                model.body_flags,
+                                state.body_q,
+                                model.body_com,
+                                wp.zeros(model.articulation_count, dtype=wp.vec3, device=device),
+                                *gains,
+                                max_dofs,
+                                dt,
+                            ],
+                            outputs=[wp.zeros_like(body_forces), row_counts, row_indices, row_K, tau],
+                            device=device,
+                        )
+                    np.testing.assert_allclose(tau.numpy(), expected, rtol=0, atol=2e-6)
+
+    def test_physx_drive_position_target_layouts(self):
+        """Read position coordinates and DOF velocities independently in drive rows."""
+        device = wp.get_device()
+        for coord_layout in (False, True):
+            with self.subTest(coord_layout=coord_layout):
+                model, state, control, joints, dofs, coords, targets = _mixed_target_model(coord_layout, device)
+                slots = np.full(model.joint_dof_count, -1, dtype=np.int32)
+                slots[dofs] = [0, 1, 0, 1]
+                fields = [wp.zeros((2, 2), dtype=int if i < 2 else float, device=device) for i in range(12)]
+                wp.launch(
+                    populate_physx_drive_J_for_size,
+                    dim=len(joints),
+                    inputs=[
+                        model.articulation_start,
+                        wp.array(model.joint_qd_start.numpy()[:-1], dtype=int, device=device),
+                        model.joint_type,
+                        model.joint_q_start,
+                        model.joint_target_q_start,
+                        model.joint_qd_start,
+                        model.joint_dof_dim,
+                        model.joint_target_ke,
+                        model.joint_target_kd,
+                        model.joint_effort_limit,
+                        state.joint_q,
+                        control.joint_target_q,
+                        control.joint_target_qd,
+                        model.joint_velocity_limit,
+                        0,
+                        wp.array(np.repeat([0, 1], 4), dtype=int, device=device),
+                        wp.array(slots, dtype=int, device=device),
+                        wp.array(joints, dtype=int, device=device),
+                    ],
+                    outputs=[wp.zeros((4, 2, 1), dtype=float, device=device), *fields],
+                    device=device,
+                )
+                np.testing.assert_allclose(
+                    fields[9].numpy().ravel(),
+                    control.joint_target_q.numpy()[targets] - state.joint_q.numpy()[coords],
+                    atol=1e-7,
+                )
+                np.testing.assert_array_equal(fields[6].numpy().ravel(), control.joint_target_qd.numpy()[dofs])
+
     def test_split_augmented_drive_pipeline_matches_combined_kernel(self):
         """Match combined drive forces and clear articulations without active drives."""
         device = wp.get_device()
@@ -117,6 +341,7 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                 joint_articulation,
                 joint_start,
                 joint_start,
+                joint_start,
                 joint_dof_dim,
                 joint_f,
                 joint_q,
@@ -168,6 +393,7 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                 joint_type,
                 joint_start,
                 joint_start,
+                joint_start,
                 joint_dof_dim,
                 joint_q,
                 joint_qd,
@@ -193,6 +419,7 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
             _prepare_augmented_joint_drives_by_dof,
             dim=2,
             inputs=[
+                wp.array([0, 1], dtype=wp.int32, device=device),
                 wp.array([0, 1], dtype=wp.int32, device=device),
                 wp.array([0, 1], dtype=wp.int32, device=device),
                 joint_q,
@@ -255,6 +482,7 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                 articulation_start,
                 articulation_dof_count,
                 joint_type,
+                joint_start,
                 joint_start,
                 joint_start,
                 joint_dof_dim,

@@ -81,7 +81,6 @@ from .contact_reduction import (
 )
 from .heightfield_features import WELD_FLAT_SEAMS, HeightfieldFeatureContext, flat_seam_query_allowed
 from .support_function import (
-    GeoTypeEx,
     create_triangle_prism_penetration_refiner,
     extract_shape_data,
     support_map,
@@ -2378,14 +2377,8 @@ def mesh_triangle_contacts_to_reducer_kernel(
         else:
             quat_a = wp.quat_identity()
 
-        # Back-face culling: skip when the convex center is behind the
-        # triangle face. TRIANGLE_PRISM (heightfields) handles this
-        # through its extruded support function.
-        if shape_data_a.shape_type == int(GeoTypeEx.TRIANGLE):
-            face_normal = wp.cross(shape_data_a.scale, shape_data_a.auxiliary)
-            center_dist = wp.dot(face_normal, pos_b - pos_a)
-            if center_dist < 0.0:
-                continue
+        # Mesh midphase already applies topology-aware back-face admission.
+        # Repeating a center-only test would discard closed-surface overlaps.
 
         # Extract margin offset for shape A (signed distance padding)
         margin_offset_a = shape_data[shape_a][3]

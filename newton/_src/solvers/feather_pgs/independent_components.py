@@ -117,13 +117,16 @@ def get_prepare_kernel(primary_size=23):
                 && wp::isfinite(diag.value) && diag.value > 0.0f && wp::isfinite(rhs.value)
                 && wp::isfinite(mu) && mu >= 0.0f;
             if (type == 2) {
-                const int p = tp >> 16;
+                const int encoded_parent = static_cast<unsigned int>(tp) >> 16;
+                const int p = encoded_parent == 65535 ? -1 : encoded_parent;
                 if (p < 0 || p + 2 >= mf || (row != p + 1 && row != p + 2)) valid = 0;
                 else {
                     const int base = (world * F + p) * 4 + 3;
                     const int t1 = data.mf_meta.data[base + 4], t2 = data.mf_meta.data[base + 8];
                     valid &= (data.mf_meta.data[base] & 65535) == 0
-                        && (t1 & 65535) == 2 && (t2 & 65535) == 2 && (t1 >> 16) == p && (t2 >> 16) == p;
+                        && (t1 & 65535) == 2 && (t2 & 65535) == 2
+                        && static_cast<int>(static_cast<unsigned int>(t1) >> 16) == p
+                        && static_cast<int>(static_cast<unsigned int>(t2) >> 16) == p;
                 }
             }
             for (int d = 0; d < 6; ++d) {

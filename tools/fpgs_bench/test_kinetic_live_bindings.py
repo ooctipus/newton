@@ -101,6 +101,7 @@ def live_solver(worlds=2):
             mf_gs_incremental_rows=0,
             update_mass_matrix_interval=2,
             use_parallel_streams=False,
+            friction_anchor_beta=0.0,
         )
     solver._compute_world_response_dof_mapping(solver.model)
     # Allocate the original response29 buffers for the explicit CPU ABI arm.

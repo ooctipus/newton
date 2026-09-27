@@ -103,7 +103,7 @@ class LiveBindings:
         self.prefix_count = wp.zeros(worlds, dtype=int, device=device)
         self.propagation_counter = wp.zeros(worlds, dtype=int, device=device)
         self.propagation_count = wp.zeros(worlds, dtype=int, device=device)
-        self.propagation_dropped = wp.zeros(worlds, dtype=int, device=device)
+        self.first_rejected_propagation = wp.empty(worlds, dtype=int, device=device)
         self.limit_slot = solver.rigid_velocity_limit_slot
         self.limit_sign = solver.rigid_velocity_limit_sign
         if self.limit_slot is None:
@@ -499,7 +499,7 @@ class LiveBindings:
             dropped_propagation=solver._row_dropped_propagation,
             first_rejected_dense=solver._dense_first_rejected_slot,
             first_rejected_mf=solver._mf_first_rejected_slot,
-            first_rejected_propagation=wp.empty(worlds, dtype=int, device=device),
+            first_rejected_propagation=self.first_rejected_propagation,
             prefix_count=self.prefix_count,
         )
         body_has_response = solver.body_has_response_dofs

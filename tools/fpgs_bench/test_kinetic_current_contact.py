@@ -252,8 +252,14 @@ class TestKineticCurrentContact(unittest.TestCase):
     def test_current_rows_match_original_and_zero_never_builds_response(self):
         self.compare_current_rows()
 
-    def test_raw_neighbor_friction_and_shared_anchor(self):
+    def test_ignored_legacy_friction_limit_and_shared_anchor(self):
         self.compare_current_rows(friction_limit=1, shared_anchor=True)
+        call = contact_call(True, friction_limit=1, shared_anchor=True)[-1]
+        self.assertEqual(call.rows.settings.friction_anchor_limit, 0)
+        call.zero.launch()
+        call.solve.setup()
+        call.solve.allocate()
+        np.testing.assert_array_equal(call.rows.raw.slots_needed.numpy()[:3], [3, 3, 3])
 
     def test_complete_invalid_prefix_and_grow_repair(self):
         """Complete incidence failures may not leak stale ZERO or row slots."""

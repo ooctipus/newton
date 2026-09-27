@@ -285,6 +285,28 @@ TRANSACTION_CORRECTIONS = {
     "kinetic_compact_coupled/get_general_kernel/closure/kinetic_compact_native": "a8a17dd80e7777c998ef027f270d5158a17873b6bd7d924c452c3f057868bb02",
 }
 
+# The runtime-sized admission predicate now decodes unsigned 16-bit parents.
+# Its fixed-64-row kinetic clones are numerically unchanged. Pin the corrected
+# strings, then reverse only these two edits to preserve the original oracle.
+QUALIFIER_PARENT_DECODE = {
+    "kinetic_compact_coupled/get_qualify_kernel/closure/qualify": "bb51171cd981c27c1d1a441ac982659d8bacb8c47b980f47b7c10e404d1ebc21",
+    "kinetic_hybrid/get_qualify_kernel/closure/qualify": "bb51171cd981c27c1d1a441ac982659d8bacb8c47b980f47b7c10e404d1ebc21",
+    "kinetic_solve/get_qualify_kernel/closure/qualify": "e7d7f4f78ae8aef5a0288f6144b6dad755a4cb3c4421fa5cbe98b88b7b25888e",
+}
+QUALIFIER_PARENT_EDITS = (
+    (
+        "const int p = tp >> 16;",
+        "const int encoded_parent = static_cast<unsigned int>(tp) >> 16;\n"
+        "                const int p = encoded_parent == 65535 ? -1 : encoded_parent;",
+    ),
+    (
+        "&& (t1 & 65535) == 2 && (t2 & 65535) == 2 && (t1 >> 16) == p && (t2 >> 16) == p;",
+        "&& (t1 & 65535) == 2 && (t2 & 65535) == 2\n"
+        "                        && static_cast<int>(static_cast<unsigned int>(t1) >> 16) == p\n"
+        "                        && static_cast<int>(static_cast<unsigned int>(t2) >> 16) == p;",
+    ),
+)
+
 # One register-only current-world gravity view precedes both original force
 # consumers. Keep the original 244 records after reversing only that assignment.
 WORLD_GRAVITY_PYTHON = {
@@ -333,6 +355,13 @@ def source_oracle():
             value = modules["kinetic_solve"].recover_impulse_transactions(value)
         elif any(marker in value for marker in ("IMPULSE_READ_COMPLETE", "SIBLING_READ_COMPLETE", "UNUSED_OWN_STORE")):
             raise ValueError("Transaction correction outside its declared owner: " + label)
+        if label in QUALIFIER_PARENT_DECODE:
+            if digest(value) != QUALIFIER_PARENT_DECODE[label]:
+                raise ValueError("Unexpected qualifier parent-decode changes: " + label)
+            for old, new in QUALIFIER_PARENT_EDITS:
+                if value.count(new) != 1:
+                    raise ValueError("Ambiguous qualifier parent-decode recovery: " + label)
+                value = value.replace(new, old)
         return digest(value)
 
     def inspect_owner(label, obj):
@@ -436,7 +465,7 @@ class TestKineticNativePort(unittest.TestCase):
                 self.assertIsNotNone(importlib.import_module(PACKAGE + name))
 
     def test_frozen_native_and_descriptor_oracle(self):
-        """Undo only explicit transaction edits, then recover every frozen record."""
+        """Undo only reviewed corrections, then recover every frozen record."""
         actual = source_oracle()
         expectations = EXPECTED | WORLD_GRAVITY_ADDED
         self.assertEqual(set(actual), set(expectations))

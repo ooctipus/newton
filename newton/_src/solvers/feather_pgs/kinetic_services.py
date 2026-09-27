@@ -267,6 +267,8 @@ def bind_mf(rows, *, v_out=None, selector=None):
         "world_row_type": out.row_type,
         "world_row_parent": out.row_parent,
         "world_row_mu": out.row_mu,
+        "world_torsion_group": zeros((1, 1), int),
+        "contact_torsion_radius": 0.0,
         "mf_constraint_count": state.mf_count,
         "mf_contact_rows_end": mf.contact_end,
         "mf_meta": mf.meta,

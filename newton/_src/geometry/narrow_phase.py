@@ -1623,6 +1623,7 @@ def narrow_phase_find_mesh_triangle_overlaps_kernel(
     shape_types: wp.array[int],
     shape_transform: wp.array[wp.transform],
     shape_source: wp.array[wp.uint64],
+    shape_mesh_properties: wp.array[wp.int32],
     shape_gap: wp.array[float],  # Per-shape contact gaps
     shape_data: wp.array[wp.vec4],  # Shape data (scale xyz, margin w)
     shape_collision_radius: wp.array[float],
@@ -1733,6 +1734,7 @@ def narrow_phase_find_mesh_triangle_overlaps_kernel(
             shape_types,
             shape_data,
             shape_source,
+            shape_mesh_properties,
             contact_threshold,
             triangle_pairs,
             triangle_pairs_count,
@@ -3255,6 +3257,7 @@ class NarrowPhase:
                 shape_types,
                 shape_transform,
                 shape_source,
+                shape_mesh_properties,
                 shape_gap,
                 shape_data,
                 shape_collision_radius,
