@@ -64,6 +64,29 @@ def _assert_worlds(test: unittest.TestCase, specs, reset_worlds: tuple[bool, boo
 
 
 class TestFeatherPGSReset(unittest.TestCase):
+    def test_warmstart_clear_does_not_change_fk_cache_source(self):
+        model = _build_two_world_free_model("cpu")
+        solver = _make_solver(model, pgs_mode="split", dense_warmstart=True, mf_warmstart=True)
+        state = model.state()
+        # Exercise the host cache bookkeeping even when CUDA execution is unavailable.
+        solver._fk_id_cache_enabled = True
+        solver._fk_id_cache_source_state = state
+        solver._fk_id_cache_valid = wp.ones(model.articulation_count, dtype=wp.int32, device=model.device)
+        specs = _history_specs(solver)
+        _poison(specs)
+        solver._clear_warmstart_history(None)
+        _assert_worlds(self, specs, (True, True))
+        self.assertIs(solver._fk_id_cache_source_state, state)
+        np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), [1, 1])
+
+        mask = wp.array((True, False), dtype=wp.bool, device=model.device)
+        solver.reset(state, mask)
+        np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), [0, 1])
+        other_state = model.state()
+        solver.reset(other_state, mask)
+        self.assertIs(solver._fk_id_cache_source_state, other_state)
+        np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), [0, 0])
+
     def test_model_changes_invalidate_impulses_without_clearing_overflow(self):
         """Invalidate changed-model impulses while retaining invalid-transition status."""
         model = _build_two_world_free_model("cpu")

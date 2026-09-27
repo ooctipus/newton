@@ -3588,13 +3588,6 @@ class SolverFeatherPGS(SolverBase):
         if self.world_count == 0:
             return
         prev_mf_impulses = self._ws_prev_mf_impulses
-        if (
-            self._fk_id_cache_enabled
-            and self._fk_id_cache_source_state is not None
-            and state is not self._fk_id_cache_source_state
-        ):
-            self._fk_id_cache_valid.zero_()
-            self._fk_id_cache_source_state = state
         if not self.pgs_warmstart and prev_mf_impulses is None:
             return
 
