@@ -225,6 +225,8 @@ class TestSingleFactorCUDA(unittest.TestCase):
             "world_row_type": self.array(kinds),
             "world_row_parent": self.array(parents),
             "world_row_mu": self.array(np.full((4, 100), 0.6, np.float32)),
+            "world_torsion_group": self.array(np.full((1, 1), -1, np.int32)),
+            "contact_torsion_radius": 0.0,
             "mf_constraint_count": self.array(np.zeros(4, np.int32)),
             "mf_contact_rows_end": self.array(np.zeros(4, np.int32)),
             "mf_meta": self.array(np.zeros((4, 4), np.int32)),
