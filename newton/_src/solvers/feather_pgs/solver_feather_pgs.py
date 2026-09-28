@@ -228,11 +228,13 @@ from .row_build import contact_row_prelude, populate_world_J_masked
 from .row_build_native import get_row_build_native_kernel
 from .row_build_rows import build_contact_rows
 from .sparse_contact import (
+    SparseContactRows,
     _get_sparse_contact_response_kernel,
     apply_sparse_contact_restitution,
     apply_sparse_factor_velocity,
     apply_sparse_free_velocity,
     build_sparse_joint_limit_rows,
+    finalize_sparse_joint_limit_rows,
 )
 from .sparse_mass_matrix import (
     _get_crba_sparse_factor_kernel,
@@ -5032,6 +5034,7 @@ class SolverFeatherPGS(SolverBase):
     def _setup_sparse_mass_matrix(self, model: Model) -> None:
         """Select sparse articulation factors with independent rigid-body response blocks."""
         self._sparse_mass_matrix_size = None
+        self._sparse_prepare_contacts = False
         if not (
             self._kernel_overrides.get("sparse_mass_matrix", True)
             and model.device.is_cuda
@@ -5166,6 +5169,7 @@ class SolverFeatherPGS(SolverBase):
             return
 
         self._sparse_mass_matrix_size = size
+        self._sparse_prepare_contacts = bool(self._kernel_overrides.get("sparse_prepare_contacts", True))
         # The sparse producers overwrite every live value and retain factors by the mass mask.
         self._double_buffer = False
         self._local_internal_fast_path = False
@@ -5200,7 +5204,7 @@ class SolverFeatherPGS(SolverBase):
         )
         self._sparse_contact_lanes = 8
         self._sparse_contact_response_kernel = _get_sparse_contact_response_kernel(
-            size, lanes_per_contact=self._sparse_contact_lanes
+            size, lanes_per_contact=self._sparse_contact_lanes, prepare_rows=self._sparse_prepare_contacts
         )
         self._pgs_solve_sparse_kernel = _get_pgs_solve_sparse_kernel(
             self.dense_max_constraints,
@@ -12951,6 +12955,28 @@ class SolverFeatherPGS(SolverBase):
             self.contact_slots_needed.zero_()
         model = self.model
         max_constraints = self.dense_max_constraints
+        if self._sparse_mass_matrix_size is not None:
+            rows = SparseContactRows()
+            rows.body_velocity = state_aug.body_v_s
+            rows.prescribed_articulation = self._prescribed_articulation
+            rows.material_friction = self.shape_material_mu
+            rows.material_restitution = self.shape_material_restitution
+            rows.beta = self.pgs_beta
+            rows.cfm = self.pgs_cfm
+            rows.friction_scale = self.contact_friction_scale
+            rows.friction_beta = self.friction_anchor_beta
+            rows.speculative_scale = self.contact_speculative_scale
+            rows.restitution_velocity_threshold = self._effective_restitution_velocity_threshold
+            rows.type = self.row_type
+            rows.parent = self.row_parent
+            rows.mu = self.row_mu
+            rows.beta_row = self.row_beta
+            rows.cfm_row = self.row_cfm
+            rows.phi = self.phi
+            rows.target_velocity = self.target_velocity
+            rows.restitution = self.row_restitution
+            rows.rhs = self.rhs
+            self._sparse_contact_rows = rows
         mf_active = self._has_free_rigid_bodies
         propagation_active = self._propagation_contacts_enabled()
         if self._has_prescribed_response:
@@ -13608,52 +13634,53 @@ class SolverFeatherPGS(SolverBase):
                 or self._sparse_diagonal_contact_solve
                 or self._sparse_mass_matrix_size is not None
             ):
-                wp.launch(
-                    prepare_world_contact_rows,
-                    dim=contact_build_threads,
-                    inputs=[
-                        contacts.rigid_contact_count,
-                        contact_build_threads,
-                        contacts.rigid_contact_point0,
-                        contacts.rigid_contact_point1,
-                        contacts.rigid_contact_normal,
-                        contacts.rigid_contact_shape0,
-                        contacts.rigid_contact_shape1,
-                        contacts.rigid_contact_margin0,
-                        contacts.rigid_contact_margin1,
-                        self.contact_world,
-                        self.contact_slot,
-                        self.contact_art_a,
-                        self.contact_art_b,
-                        self.contact_path,
-                        self.contact_slots_needed,
-                        model.shape_body,
-                        state_in.body_q,
-                        state_aug.body_v_s,
-                        self._prescribed_articulation,
-                        self.articulation_origin,
-                        self.shape_material_mu,
-                        self.shape_material_restitution,
-                        int(self.contact_friction_shared_anchor),
-                        self.contact_friction_scale,
-                        int(self.contact_shared_anchor),
-                        self.pgs_beta,
-                        self.pgs_cfm,
-                        self._friction_patches.view,
-                        self.friction_anchor_beta,
-                    ],
-                    outputs=[
-                        self.row_type,
-                        self.row_parent,
-                        self.row_mu,
-                        self.row_beta,
-                        self.row_cfm,
-                        self.phi,
-                        self.target_velocity,
-                        self.row_restitution,
-                    ],
-                    device=model.device,
-                )
+                if not self._sparse_prepare_contacts:
+                    wp.launch(
+                        prepare_world_contact_rows,
+                        dim=contact_build_threads,
+                        inputs=[
+                            contacts.rigid_contact_count,
+                            contact_build_threads,
+                            contacts.rigid_contact_point0,
+                            contacts.rigid_contact_point1,
+                            contacts.rigid_contact_normal,
+                            contacts.rigid_contact_shape0,
+                            contacts.rigid_contact_shape1,
+                            contacts.rigid_contact_margin0,
+                            contacts.rigid_contact_margin1,
+                            self.contact_world,
+                            self.contact_slot,
+                            self.contact_art_a,
+                            self.contact_art_b,
+                            self.contact_path,
+                            self.contact_slots_needed,
+                            model.shape_body,
+                            state_in.body_q,
+                            state_aug.body_v_s,
+                            self._prescribed_articulation,
+                            self.articulation_origin,
+                            self.shape_material_mu,
+                            self.shape_material_restitution,
+                            int(self.contact_friction_shared_anchor),
+                            self.contact_friction_scale,
+                            int(self.contact_shared_anchor),
+                            self.pgs_beta,
+                            self.pgs_cfm,
+                            self._friction_patches.view,
+                            self.friction_anchor_beta,
+                        ],
+                        outputs=[
+                            self.row_type,
+                            self.row_parent,
+                            self.row_mu,
+                            self.row_beta,
+                            self.row_cfm,
+                            self.phi,
+                            self.target_velocity,
+                            self.row_restitution,
+                        ],
+                        device=model.device,
+                    )
                 contact_jacobian_workers = min(contacts.rigid_contact_max, _CONTACT_JACOBIAN_WORKER_CAP)
                 for size in self.size_groups:
                     if self._sparse_mass_matrix_size is not None and size != self._sparse_mass_matrix_size:
@@ -13700,6 +13727,8 @@ class SolverFeatherPGS(SolverBase):
                                 self._sparse_Linv,
                                 self.Linv_by_size[6] if self._has_free_rigid_bodies else self._sparse_free_factor_dummy,
                                 self.v_hat,
+                                self._sparse_contact_rows,
+                                dt,
                             ],
                             outputs=[
                                 self._sparse_row_dof,
@@ -14701,6 +14730,14 @@ class SolverFeatherPGS(SolverBase):
             outputs=[self.constraint_count, self._constraint_capacity_status],
             device=model.device,
         )
+        if self._sparse_prepare_contacts:
+            wp.launch(
+                finalize_sparse_joint_limit_rows,
+                dim=self.world_count,
+                inputs=[self.dense_phase_bounds, self.constraint_count, self._sparse_contact_rows, dt],
+                outputs=[self.diag],
+                device=model.device,
+            )
         if self._allegro_kinetic_rows is not None:
             self._allegro_kinetic_rows.finish_rows()
         if getattr(self, "_wr_world_contacts", None) is not None:
@@ -15405,6 +15442,8 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage4_finalize_world_diag_cfm(self):
+        if self._sparse_prepare_contacts:
+            return  # Contact and limit producers add CFM exactly once.
         if self._sparse_factor is not None:
             return
         if self._row_packets is not None:
@@ -15548,7 +15587,7 @@ class SolverFeatherPGS(SolverBase):
             )
             return
         if self._sparse_mass_matrix_size is not None:
-            # Sparse row producers write the complete diagonal; CFM is added below as usual.
+            # Sparse producers write the diagonal; unfused controls add CFM separately.
             return
         if self._paired_response_primary_size is not None:
             return
@@ -15617,6 +15656,8 @@ class SolverFeatherPGS(SolverBase):
         joint_limit_speculative_scale: float = 1.0,
         output=None,
     ):
+        if self._sparse_prepare_contacts:
+            return  # The admitted sparse path has a single position pass.
         if self._row_packets is not None or self._allegro_kinetic_rows is not None:
             if (
                 output is not None
@@ -15701,6 +15742,8 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage4_apply_world_contact_restitution(self, dt: float, *, matrix_free: bool) -> None:
         """Replace geometric contact bias for impacts selected from ``v_hat``."""
+        if self._sparse_prepare_contacts:
+            return  # The sparse contact producer uses its projected incident velocity.
         if self._sparse_factor is not None:
             if not matrix_free:
                 raise RuntimeError("Sparse factor excludes non-matrix-free restitution")

@@ -10,21 +10,52 @@ import warp as wp
 from .friction_patches import FrictionPatches
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     contact_restitution_fires,
     contact_tangent_basis,
+    mixed_contact_restitution,
+    prescribed_relative_contact_target,
 )
+
+
+@wp.struct
+class SparseContactRows:
+    """Material, prescribed motion and final row data for sparse preparation."""
+
+    body_velocity: wp.array[wp.spatial_vector]
+    prescribed_articulation: wp.array[int]
+    material_friction: wp.array[float]
+    material_restitution: wp.array[float]
+    beta: float
+    cfm: float
+    friction_scale: float
+    friction_beta: float
+    speculative_scale: float
+    restitution_velocity_threshold: float
+    type: wp.array2d[int]
+    parent: wp.array2d[int]
+    mu: wp.array2d[float]
+    beta_row: wp.array2d[float]
+    cfm_row: wp.array2d[float]
+    phi: wp.array2d[float]
+    target_velocity: wp.array2d[float]
+    restitution: wp.array2d[float]
+    rhs: wp.array2d[float]
 
 
 @cache
 def _get_sparse_contact_response_kernel(
-    dof_count: int, *, lanes_per_contact: int = 8, warps_per_block: int = 4
+    dof_count: int, *, lanes_per_contact: int = 8, warps_per_block: int = 4, prepare_rows: bool = False
 ) -> wp.Kernel:
     """Project contact rows with a lane group per contact and no global Jacobian.
 
     Contact directions share endpoint geometry, support and inverse-factor
     loads. Each endpoint Jacobian is evaluated once in shared scratch. Free
     bodies retain their physical coordinates and existing mass metric.
+
+    With ``prepare_rows``, the geometry also produces metadata, diagonal CFM,
+    bias and restitution. The caller must not run those separate row passes.
 
     All input/output arrays must be contiguous for the native flat accesses.
     Launch total_num_workers * lanes_per_contact threads in blocks of
@@ -249,7 +280,7 @@ def _get_sparse_contact_response_kernel(
 #endif
         if (lane == 0) {
             row_incident.data[row_offset + row] = incident.c[row];
-            diagonal.data[row_offset + row] = norm.c[row];
+            diagonal.data[row_offset + row] = norm.c[row] + cfm;
         }
     }
 """
@@ -287,6 +318,7 @@ def _get_sparse_contact_response_kernel(
         inverse_factor: wp.array2d[float],
         free_inverse_factor: wp.array3d[float],
         v_hat: wp.array[float],
+        cfm: float,
         row_dof: wp.array3d[int],
         row_factor: wp.array3d[float],
         row_free_response: wp.array3d[float],
@@ -328,6 +360,8 @@ def _get_sparse_contact_response_kernel(
         inverse_factor: wp.array2d[float],
         free_inverse_factor: wp.array3d[float],
         v_hat: wp.array[float],
+        rows: SparseContactRows,
+        dt: float,
         row_dof: wp.array3d[int],
         row_factor: wp.array3d[float],
         row_free_response: wp.array3d[float],
@@ -352,6 +386,9 @@ def _get_sparse_contact_response_kernel(
             angular_a = wp.mat33(0.0)
             angular_b = wp.mat33(0.0)
             directions = wp.mat33(0.0)
+            cfm = float(0.0)
+            if wp.static(prepare_rows):
+                cfm = rows.cfm
             if tid % lanes == 0:
                 normal = -contact_normal[c]
                 point_a = contact_point0[c] - contact_thickness0[c] * normal
@@ -360,6 +397,22 @@ def _get_sparse_contact_response_kernel(
                     point_a = wp.transform_point(body_q[body_a], contact_point0[c]) - contact_thickness0[c] * normal
                 if body_b >= 0:
                     point_b = wp.transform_point(body_q[body_b], contact_point1[c]) + contact_thickness1[c] * normal
+                gap = wp.dot(normal, point_a - point_b)
+                mu = float(0.0)
+                restitution = float(0.0)
+                if wp.static(prepare_rows):
+                    materials = int(0)
+                    if contact_shape0[c] >= 0:
+                        mu += rows.material_friction[contact_shape0[c]]
+                        materials += 1
+                    if contact_shape1[c] >= 0:
+                        mu += rows.material_friction[contact_shape1[c]]
+                        materials += 1
+                    if materials > 0:
+                        mu /= float(materials)
+                    restitution = mixed_contact_restitution(
+                        contact_shape0[c], contact_shape1[c], rows.material_restitution
+                    )
                 midpoint = 0.5 * (point_a + point_b)
                 if contact_shared_anchor != 0:
                     point_a = midpoint
@@ -399,6 +452,47 @@ def _get_sparse_contact_response_kernel(
                         angular_a[row, axis] = wrench_a[axis]
                         angular_b[row, axis] = wrench_b[axis]
                         directions[row, axis] = direction[axis]
+                    if wp.static(prepare_rows):
+                        world = contact_world[c]
+                        slot = contact_slot[c] + row
+                        target = prescribed_relative_contact_target(
+                            body_a,
+                            art_a,
+                            body_b,
+                            art_b,
+                            anchor_a,
+                            anchor_b,
+                            direction,
+                            rows.prescribed_articulation,
+                            articulation_origin,
+                            rows.body_velocity,
+                        )
+                        beta = rows.beta
+                        phi = gap
+                        friction = mu
+                        row_restitution = restitution
+                        row_type = PGS_CONSTRAINT_TYPE_CONTACT
+                        parent = int(-1)
+                        if row > 0:
+                            beta = rows.friction_beta
+                            phi = friction_patches.phi[c][row - 1]
+                            friction *= rows.friction_scale
+                            row_restitution = 0.0
+                            row_type = PGS_CONSTRAINT_TYPE_FRICTION
+                            parent = contact_slot[c]
+                        inv_dt = 1.0 / dt
+                        bias = beta * phi * inv_dt
+                        if row == 0 and phi > 0.0:
+                            bias = rows.speculative_scale * phi * inv_dt
+                        rows.type[world, slot] = row_type
+                        rows.parent[world, slot] = parent
+                        rows.mu[world, slot] = friction
+                        rows.beta_row[world, slot] = beta
+                        rows.cfm_row[world, slot] = rows.cfm
+                        rows.phi[world, slot] = phi
+                        rows.target_velocity[world, slot] = target
+                        rows.restitution[world, slot] = row_restitution
+                        rows.rhs[world, slot] = -target + bias
             project_native(
                 tid,
                 body_a,
@@ -423,16 +517,50 @@ def _get_sparse_contact_response_kernel(
                 inverse_factor,
                 free_inverse_factor,
                 v_hat,
+                cfm,
                 row_dof,
                 row_factor,
                 row_free_response,
                 row_incident,
                 diagonal,
             )
+            if wp.static(prepare_rows):
+                if tid % lanes == 0:
+                    world = contact_world[c]
+                    slot = contact_slot[c]
+                    target = rows.target_velocity[world, slot]
+                    relative_incident = row_incident[world, slot] - target
+                    restitution = rows.restitution[world, slot]
+                    if restitution > 0.0 and contact_restitution_fires(
+                        rows.phi[world, slot], relative_incident, dt, rows.restitution_velocity_threshold
+                    ):
+                        rows.rhs[world, slot] = -target + restitution * relative_incident
 
     contact_kernel.__name__ = f"populate_sparse_contact_response_{n}_{lanes}_{warps}"
+    if prepare_rows:
+        contact_kernel.__name__ += "_prepared"
     contact_kernel.__qualname__ = contact_kernel.__name__
     return wp.kernel(enable_backward=False, module="unique")(contact_kernel)
+
+
+@wp.kernel(enable_backward=False)
+def finalize_sparse_joint_limit_rows(
+    phase_bounds: wp.array2d[int],
+    constraint_count: wp.array[int],
+    rows: SparseContactRows,
+    dt: float,
+    diagonal: wp.array2d[float],
+):
+    """Finish only the joint-limit prefix; contacts are already complete."""
+    world = wp.tid()
+    for row in range(wp.min(phase_bounds[world, 1], constraint_count[world])):
+        phi = rows.phi[world, row]
+        inv_dt = 1.0 / dt
+        bias = phi * inv_dt
+        if phi < 0.0:
+            bias = rows.beta_row[world, row] * phi * inv_dt
+        diagonal[world, row] += rows.cfm_row[world, row]
+        rows.rhs[world, row] = -rows.target_velocity[world, row] + bias
 
 
 @wp.func_native(
