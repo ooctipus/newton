@@ -66,15 +66,8 @@ def _get_sparse_contact_response_kernel(
         raise ValueError("Invalid sparse contact dimensions or lane group")
     groups = warps * 32 // lanes
     scratch_size = max(n, 6) + 6
-    snippet = """
-#if defined(__CUDA_ARCH__)
-    const int lane = tid & ($LANES - 1);
-    const int stride = $LANES;
-    const int group = threadIdx.x / $LANES;
-    const unsigned MASK = (0xffffffffu >> (32 - $LANES))
-        << ((threadIdx.x & 31) & ~($LANES - 1));
-    __shared__ float storage[$STORAGE];
-    float* jacobian = storage + group * $SCRATCH;
+    geometry_size = 27 if prepare_rows else 0
+    geometry_cuda = """
     auto angular_a_shared = angular_a;
     auto angular_b_shared = angular_b;
     auto directions_shared = directions;
@@ -88,14 +81,62 @@ def _get_sparse_contact_response_kernel(
             directions_shared.data[row][k] = __shfl_sync(MASK, directions.data[row][k], 0, $LANES);
         }
     }
+"""
+    geometry_cpu = """
+    const auto angular_a_shared = angular_a;
+    const auto angular_b_shared = angular_b;
+    const auto directions_shared = directions;
+"""
+    geometry_dot = """
+        const auto& angular_wrenches = side == 0 ? angular_a_shared : angular_b_shared;
+        const auto direction = wp::vec3(directions_shared.data[row][0],
+            directions_shared.data[row][1], directions_shared.data[row][2]);
+        const auto angular_wrench = wp::vec3(angular_wrenches.data[row][0],
+            angular_wrenches.data[row][1], angular_wrenches.data[row][2]);
+"""
+    if prepare_rows:
+        # Geometry is shared by the contact, not live in every lane throughout
+        # the factor contraction. Volatile reads prevent loop-invariant loads
+        # from restoring the entire matrix triplet to lane registers.
+        geometry_copy = """
+#pragma unroll
+        for (int row = 0; row < 3; ++row) {
+            if (row >= row_count) continue;
+#pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                geometry[row * 9 + k] = directions.data[row][k];
+                geometry[row * 9 + 3 + k] = angular_a.data[row][k];
+                geometry[row * 9 + 6 + k] = angular_b.data[row][k];
+            }
+        }
+"""
+        geometry_cuda = (
+            "volatile float* geometry = jacobian + $GEOMETRY;\n"
+            "if (lane == 0) {\n" + geometry_copy + "}\n__syncwarp(MASK);\n"
+        )
+        geometry_cpu = "float geometry[27];\n" + geometry_copy
+        geometry_dot = """
+        const int angular_offset = row * 9 + 3 + side * 3;
+        const auto direction = wp::vec3(geometry[row * 9], geometry[row * 9 + 1], geometry[row * 9 + 2]);
+        const auto angular_wrench = wp::vec3(geometry[angular_offset],
+            geometry[angular_offset + 1], geometry[angular_offset + 2]);
+"""
+    snippet = """
+#if defined(__CUDA_ARCH__)
+    const int lane = tid & ($LANES - 1);
+    const int stride = $LANES;
+    const int group = threadIdx.x / $LANES;
+    const unsigned MASK = (0xffffffffu >> (32 - $LANES))
+        << ((threadIdx.x & 31) & ~($LANES - 1));
+    __shared__ float storage[$STORAGE];
+    float* jacobian = storage + group * $SCRATCH;
+    $GEOMETRY_CUDA
 #else
     if ((tid & ($LANES - 1)) != 0) return;
     const int lane = 0;
     const int stride = 1;
     float jacobian[$SCRATCH];
-    const auto angular_a_shared = angular_a;
-    const auto angular_b_shared = angular_b;
-    const auto directions_shared = directions;
+    $GEOMETRY_CPU
 #endif
     float* free_factor = jacobian + $JACOBIAN;
     const auto bit_count = [](unsigned long long mask) {
@@ -116,13 +157,10 @@ def _get_sparse_contact_response_kernel(
         return column;
 #endif
     };
-    const auto jacobian_value = [&](const auto& motion, const auto& angular_wrenches, int row) {
+    const auto jacobian_value = [&](const auto& motion, int side, int row) {
         const auto linear = wp::vec3(motion.c[0], motion.c[1], motion.c[2]);
         const auto angular = wp::vec3(motion.c[3], motion.c[4], motion.c[5]);
-        const auto direction = wp::vec3(directions_shared.data[row][0],
-            directions_shared.data[row][1], directions_shared.data[row][2]);
-        const auto angular_wrench = wp::vec3(angular_wrenches.data[row][0],
-            angular_wrenches.data[row][1], angular_wrenches.data[row][2]);
+        $GEOMETRY_DOT
         return wp::dot(direction, linear) + wp::dot(angular_wrench, angular);
     };
     unsigned long long mask_a = 0, mask_b = 0;
@@ -154,8 +192,8 @@ def _get_sparse_contact_response_kernel(
                 for (int row = 0; row < 3; ++row) {
                     if (row >= row_count) continue;
                     float value = 0.0f;
-                    if (art == art_a) value += jacobian_value(motion, angular_a_shared, row);
-                    if (art == art_b) value -= jacobian_value(motion, angular_b_shared, row);
+                    if (art == art_a) value += jacobian_value(motion, 0, row);
+                    if (art == art_b) value -= jacobian_value(motion, 1, row);
                     jacobian[row * $PLANE + node] = value;
                     incident.c[row] += value * velocity;
                 }
@@ -217,9 +255,9 @@ def _get_sparse_contact_response_kernel(
                     if (row >= row_count) continue;
                     float value = 0.0f;
                     if (art == art_a && (mask_a & bit) != 0)
-                        value += jacobian_value(motion, angular_a_shared, row);
+                        value += jacobian_value(motion, 0, row);
                     if (art == art_b && (mask_b & bit) != 0)
-                        value -= jacobian_value(motion, angular_b_shared, row);
+                        value -= jacobian_value(motion, 1, row);
                     jacobian[row * $PLANE + node] = value;
                     incident.c[row] += value * velocity;
                 }
@@ -285,9 +323,13 @@ def _get_sparse_contact_response_kernel(
     }
 """
     snippet = (
-        snippet.replace("$STORAGE", str(groups * 3 * scratch_size))
+        snippet.replace("$GEOMETRY_CUDA", geometry_cuda)
+        .replace("$GEOMETRY_CPU", geometry_cpu)
+        .replace("$GEOMETRY_DOT", geometry_dot)
+        .replace("$GEOMETRY", str(3 * scratch_size))
+        .replace("$STORAGE", str(groups * (3 * scratch_size + geometry_size)))
         .replace("$LANES", str(lanes))
-        .replace("$SCRATCH", str(3 * scratch_size))
+        .replace("$SCRATCH", str(3 * scratch_size + geometry_size))
         .replace("$PLANE", str(scratch_size))
         .replace("$JACOBIAN", str(max(n, 6)))
         .replace("$N", str(n))
@@ -369,6 +411,7 @@ def _get_sparse_contact_response_kernel(
         diagonal: wp.array2d[float],
     ):
         tid = wp.tid()
+        lane = tid % lanes
         worker = tid // lanes
         total_contacts = wp.min(contact_count[0], contact_point0.shape[0])
         for c in range(worker, total_contacts, total_num_workers):
@@ -383,13 +426,18 @@ def _get_sparse_contact_response_kernel(
                 body_b = shape_body[contact_shape1[c]]
             art_a = contact_art_a[c]
             art_b = contact_art_b[c]
-            angular_a = wp.mat33(0.0)
-            angular_b = wp.mat33(0.0)
-            directions = wp.mat33(0.0)
+            normal = wp.vec3(0.0)
+            point_a = wp.vec3(0.0)
+            point_b = wp.vec3(0.0)
+            friction_point_a = wp.vec3(0.0)
+            friction_point_b = wp.vec3(0.0)
+            tangent0 = wp.vec3(0.0)
+            tangent1 = wp.vec3(0.0)
+            gap = float(0.0)
             cfm = float(0.0)
             if wp.static(prepare_rows):
                 cfm = rows.cfm
-            if tid % lanes == 0:
+            if wp.static(prepare_rows) or lane == 0:
                 normal = -contact_normal[c]
                 point_a = contact_point0[c] - contact_thickness0[c] * normal
                 point_b = contact_point1[c] + contact_thickness1[c] * normal
@@ -398,9 +446,46 @@ def _get_sparse_contact_response_kernel(
                 if body_b >= 0:
                     point_b = wp.transform_point(body_q[body_b], contact_point1[c]) + contact_thickness1[c] * normal
                 gap = wp.dot(normal, point_a - point_b)
-                mu = float(0.0)
-                restitution = float(0.0)
-                if wp.static(prepare_rows):
+                midpoint = 0.5 * (point_a + point_b)
+                if contact_shared_anchor != 0:
+                    point_a = midpoint
+                    point_b = midpoint
+                friction_point_a = point_a
+                friction_point_b = point_b
+                if row_count > 1:
+                    tangent0, tangent1 = contact_tangent_basis(normal)
+                    if contact_friction_shared_anchor != 0:
+                        friction_point_a = midpoint
+                        friction_point_b = midpoint
+                    if friction_patches.enabled != 0:
+                        friction_point_a = friction_patches.point_a[c]
+                        friction_point_b = friction_patches.point_b[c]
+            if wp.static(prepare_rows):
+                if lane < row_count:
+                    world = contact_world[c]
+                    slot = contact_slot[c] + lane
+                    direction = normal
+                    anchor_a = point_a
+                    anchor_b = point_b
+                    if lane != 0:
+                        direction = tangent0
+                        if lane == 2:
+                            direction = tangent1
+                        anchor_a = friction_point_a
+                        anchor_b = friction_point_b
+                    target = prescribed_relative_contact_target(
+                        body_a,
+                        art_a,
+                        body_b,
+                        art_b,
+                        anchor_a,
+                        anchor_b,
+                        direction,
+                        rows.prescribed_articulation,
+                        articulation_origin,
+                        rows.body_velocity,
+                    )
+                    mu = float(0.0)
                     materials = int(0)
                     if contact_shape0[c] >= 0:
                         mu += rows.material_friction[contact_shape0[c]]
@@ -410,25 +495,40 @@ def _get_sparse_contact_response_kernel(
                         materials += 1
                     if materials > 0:
                         mu /= float(materials)
-                    restitution = mixed_contact_restitution(
-                        contact_shape0[c], contact_shape1[c], rows.material_restitution
-                    )
-                midpoint = 0.5 * (point_a + point_b)
-                if contact_shared_anchor != 0:
-                    point_a = midpoint
-                    point_b = midpoint
-                friction_point_a = point_a
-                friction_point_b = point_b
-                tangent0 = wp.vec3(0.0)
-                tangent1 = wp.vec3(0.0)
-                if row_count > 1:
-                    tangent0, tangent1 = contact_tangent_basis(normal)
-                    if contact_friction_shared_anchor != 0:
-                        friction_point_a = midpoint
-                        friction_point_b = midpoint
-                    if friction_patches.enabled != 0:
-                        friction_point_a = friction_patches.point_a[c]
-                        friction_point_b = friction_patches.point_b[c]
+                    beta = rows.beta
+                    phi = gap
+                    row_type = PGS_CONSTRAINT_TYPE_CONTACT
+                    parent = int(-1)
+                    restitution = float(0.0)
+                    if lane == 0:
+                        restitution = mixed_contact_restitution(
+                            contact_shape0[c], contact_shape1[c], rows.material_restitution
+                        )
+                    else:
+                        beta = rows.friction_beta
+                        phi = friction_patches.phi[c][lane - 1]
+                        mu *= rows.friction_scale
+                        row_type = PGS_CONSTRAINT_TYPE_FRICTION
+                        parent = contact_slot[c]
+                    inv_dt = 1.0 / dt
+                    bias = beta * phi * inv_dt
+                    if lane == 0 and phi > 0.0:
+                        bias = rows.speculative_scale * phi * inv_dt
+                    rows.type[world, slot] = row_type
+                    rows.parent[world, slot] = parent
+                    rows.mu[world, slot] = mu
+                    rows.beta_row[world, slot] = beta
+                    rows.cfm_row[world, slot] = rows.cfm
+                    rows.phi[world, slot] = phi
+                    rows.target_velocity[world, slot] = target
+                    rows.restitution[world, slot] = restitution
+                    rows.rhs[world, slot] = -target + bias
+
+            # Keep response matrices out of the metadata writers' live state.
+            angular_a = wp.mat33(0.0)
+            angular_b = wp.mat33(0.0)
+            directions = wp.mat33(0.0)
+            if lane == 0:
                 for row in range(3):
                     if row >= row_count:
                         continue
@@ -452,47 +552,6 @@ def _get_sparse_contact_response_kernel(
                         angular_a[row, axis] = wrench_a[axis]
                         angular_b[row, axis] = wrench_b[axis]
                         directions[row, axis] = direction[axis]
-                    if wp.static(prepare_rows):
-                        world = contact_world[c]
-                        slot = contact_slot[c] + row
-                        target = prescribed_relative_contact_target(
-                            body_a,
-                            art_a,
-                            body_b,
-                            art_b,
-                            anchor_a,
-                            anchor_b,
-                            direction,
-                            rows.prescribed_articulation,
-                            articulation_origin,
-                            rows.body_velocity,
-                        )
-                        beta = rows.beta
-                        phi = gap
-                        friction = mu
-                        row_restitution = restitution
-                        row_type = PGS_CONSTRAINT_TYPE_CONTACT
-                        parent = int(-1)
-                        if row > 0:
-                            beta = rows.friction_beta
-                            phi = friction_patches.phi[c][row - 1]
-                            friction *= rows.friction_scale
-                            row_restitution = 0.0
-                            row_type = PGS_CONSTRAINT_TYPE_FRICTION
-                            parent = contact_slot[c]
-                        inv_dt = 1.0 / dt
-                        bias = beta * phi * inv_dt
-                        if row == 0 and phi > 0.0:
-                            bias = rows.speculative_scale * phi * inv_dt
-                        rows.type[world, slot] = row_type
-                        rows.parent[world, slot] = parent
-                        rows.mu[world, slot] = friction
-                        rows.beta_row[world, slot] = beta
-                        rows.cfm_row[world, slot] = rows.cfm
-                        rows.phi[world, slot] = phi
-                        rows.target_velocity[world, slot] = target
-                        rows.restitution[world, slot] = row_restitution
-                        rows.rhs[world, slot] = -target + bias
             project_native(
                 tid,
                 body_a,
@@ -525,7 +584,7 @@ def _get_sparse_contact_response_kernel(
                 diagonal,
             )
             if wp.static(prepare_rows):
-                if tid % lanes == 0:
+                if lane == 0:
                     world = contact_world[c]
                     slot = contact_slot[c]
                     target = rows.target_velocity[world, slot]
