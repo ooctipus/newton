@@ -35,12 +35,29 @@ def _sweep(
     friction_start=0,
     iteration_offset=0,
     omega=1.0,
+    active_rows=False,
+    iterations=8,
 ):
     velocity, impulses = velocity.copy(), impulses.copy()
-    for iteration in range(8):
+    active_rows = (
+        active_rows
+        and np.isfinite(omega)
+        and omega >= 0
+        and not np.any((types == PGS_CONSTRAINT_TYPE_CONTACT) & (parents >= 0))
+    )
+    for iteration in range(iterations):
+        selected = np.ones(len(types), dtype=bool)
+        if active_rows:
+            unilateral = np.isin(types, (PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_JOINT_LIMIT))
+            selected[unilateral] = (impulses[unilateral] != 0) | ((jacobian @ velocity + bias)[unilateral] < 0)
+            for row in np.flatnonzero(types == PGS_CONSTRAINT_TYPE_FRICTION):
+                parent = parents[row]
+                selected[row] = selected[parent] or np.any(impulses[parent + 1 : parent + 3] != 0)
         for row, kind in enumerate(types):
             if kind == PGS_CONSTRAINT_TYPE_FRICTION and iteration_offset + iteration < friction_start:
                 impulses[row] = 0.0
+                continue
+            if not selected[row]:
                 continue
             if kind == PGS_CONSTRAINT_TYPE_FRICTION and row != parents[row] + 1:
                 continue
@@ -123,6 +140,16 @@ def _problem(dofs=43, support=18, seeded=False, *, contact_activity=None):
             # A later normal row activates the initially unloaded pair next sweep.
             rows[3, :3] = (-1.0, 0.0, 1.0)
             bias[3] = -1.0
+        elif contact_activity == "deferred_activation":
+            # An earlier normal makes a later zero normal eligible only next sweep.
+            rows[0, 0], rows[3, 0] = -1.0, 1.0
+            bias[0], bias[3] = -1.0, 0.25
+        elif contact_activity == "near_singular":
+            rows[2, 1:3] = (1.0, 0.001)
+            bias[:3] = (-1.0, -1.0, 0.25)
+        elif contact_activity == "negative_omega":
+            # Negative relaxation changes zero normals with positive residuals.
+            mu.fill(0.0)
         elif contact_activity == "seeded_retraction":
             # Zero load must retract both signs of old tangent impulses.
             impulses[1:3] = (-0.25, 0.125)
@@ -286,7 +313,16 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
             ):
                 self._check_cuda_mixed_sweeps(include_mf, friction_start, iteration_offset, omega)
 
-    def _check_cuda_mixed_sweeps(self, include_mf, friction_start, iteration_offset, omega):
+    @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
+    def test_cuda_active_rows_preserve_mixed_fallback(self):
+        """Retain the exact schedule when physical free response or MF rows are present."""
+        for include_mf, (friction_start, iteration_offset, omega) in product((False, True), _SWEEP_CASES):
+            with self.subTest(
+                include_mf=include_mf, friction_start=friction_start, iteration_offset=iteration_offset, omega=omega
+            ):
+                self._check_cuda_mixed_sweeps(include_mf, friction_start, iteration_offset, omega, active_rows=True)
+
+    def _check_cuda_mixed_sweeps(self, include_mf, friction_start, iteration_offset, omega, *, active_rows=False):
         """Compare physical output while independently toggling the native free/free family."""
         factor, z, r, jacobian, response, initial, bias, types, parents, mu, diagonal = _mixed_problem()
         count = 14 if include_mf else 8
@@ -346,7 +382,12 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
         delta = wp.full((worlds, 21), float("nan"), device=device)
         wp.launch_tiled(
             _get_pgs_solve_sparse_kernel(
-                capacity, 21, support, mf_max_constraints=mf_capacity if include_mf else 0, free_row_dofs=6
+                capacity,
+                21,
+                support,
+                mf_max_constraints=mf_capacity if include_mf else 0,
+                free_row_dofs=6,
+                active_rows=active_rows,
             ),
             dim=[2],
             inputs=[
@@ -428,11 +469,41 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
     def test_cuda_sparse_sweeps_match_reference(self):
         """Preserve sweeps, zero-load retraction, linked loads and late contact activation."""
+        self._check_cuda_sparse_sweeps(active_rows=False)
+
+    def test_active_rows_defer_new_violation_to_next_sweep(self):
+        """Distinguish sweep-start eligibility from immediate ordered activation."""
+        _, _, rows, initial, bias, types, parents, mu, impulses, _, _, incident, diag = _problem(
+            3, 3, contact_activity="deferred_activation"
+        )
+        args = (rows, rows, np.zeros_like(initial), incident + bias, diag, types, parents, mu, impulses)
+        _, exact = _sweep(*args, iterations=1)
+        _, deferred = _sweep(*args, active_rows=True, iterations=1)
+        _, next_sweep = _sweep(*args, active_rows=True, iterations=2)
+        self.assertGreater(exact[3], 0.0)
+        self.assertEqual(deferred[3], 0.0)
+        self.assertGreater(next_sweep[3], 0.0)
+        exact = _sweep(*args, omega=-0.5)
+        fallback = _sweep(*args, omega=-0.5, active_rows=True)
+        np.testing.assert_array_equal(fallback[0], exact[0])
+        np.testing.assert_array_equal(fallback[1], exact[1])
+
+    @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
+    def test_cuda_active_sweeps_match_reference(self):
+        """Match independent eligibility, seeded retraction, delayed friction and linked fallback."""
+        self._check_cuda_sparse_sweeps(active_rows=True)
+
+    def _check_cuda_sparse_sweeps(self, *, active_rows):
+        """Compare each schedule with its own physical recurrence without weakening the exact control."""
         device = wp.get_device("cuda:0")
         cases = [(43, 18, None), (75, 39, None)]
         cases.extend((3, 3, activity) for activity in ("late_activation", "seeded_retraction", "linked_load"))
+        if active_rows:
+            cases.extend((3, 3, activity) for activity in ("deferred_activation", "near_singular", "negative_omega"))
         for dofs, support, contact_activity in cases:
             settings = product((False, True), _SWEEP_CASES) if contact_activity is None else [(False, (0, 0, 1.0))]
+            if contact_activity == "negative_omega":
+                settings = [(False, (0, 0, -0.5))]
             for seeded, (friction_start, iteration_offset, omega) in settings:
                 with self.subTest(
                     dofs=dofs,
@@ -446,6 +517,18 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                     _, indices, rows, initial, bias, types, parents, mu, impulses, _, _, incident, diag = _problem(
                         dofs, support, seeded, contact_activity=contact_activity
                     )
+                    if active_rows and contact_activity is None:
+                        parents[types == PGS_CONSTRAINT_TYPE_CONTACT] = -1
+                    offset = 30 if active_rows and dofs == 75 else 0
+                    if offset:
+                        # Cross a bitset word boundary and retain an incomplete final word.
+                        rows = np.pad(rows, ((offset, 0), (0, 0)))
+                        bias, incident = np.pad(bias, (offset, 0), constant_values=1.0), np.pad(incident, (offset, 0))
+                        diag, impulses = np.pad(diag, (offset, 0), constant_values=1.0), np.pad(impulses, (offset, 0))
+                        types = np.pad(types, (offset, 0), constant_values=PGS_CONSTRAINT_TYPE_CONTACT)
+                        parents = np.pad(np.where(parents >= 0, parents + offset, -1), (offset, 0), constant_values=-1)
+                        mu = np.pad(mu, (offset, 0))
+                    count = len(types)
                     expected, expected_impulses = _sweep(
                         rows,
                         rows,
@@ -459,35 +542,38 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                         friction_start=friction_start,
                         iteration_offset=iteration_offset,
                         omega=omega,
+                        active_rows=active_rows,
                     )
                     if contact_activity == "seeded_retraction":
                         np.testing.assert_array_equal(expected_impulses[1:3], 0.0)
                         np.testing.assert_allclose(expected[1:3], -impulses[1:3], atol=1.0e-12)
+                    elif contact_activity == "negative_omega":
+                        self.assertGreater(expected_impulses[0], 0.0)
                     elif contact_activity is not None:
                         self.assertGreater(np.linalg.norm(expected_impulses[1:3]), 0.0)
                         if contact_activity == "linked_load":
                             self.assertEqual(expected_impulses[0], 0.0)
-                    worlds, capacity = 3, 10
+                    worlds, capacity = 3, count + 2
                     row_dof = np.full((worlds, capacity, support), -1, dtype=np.int32)
-                    row_dof[:, :8] = indices
-                    row_dof[:, 0, 1:] = -1
+                    row_dof[:, :count] = indices
+                    row_dof[:, offset, 1:] = -1
                     row_factor = np.zeros((worlds, capacity, support), dtype=np.float32)
-                    row_factor[:, :8] = rows[:, indices]
+                    row_factor[:, :count] = rows[:, indices]
 
                     def padded(array, dtype=np.float32, shape=(worlds, capacity)):
                         result = np.zeros(shape, dtype=dtype)
-                        result[:, :8] = array
+                        result[:, : len(array)] = array
                         return wp.array(result, device=device)
 
                     actual_impulses = padded(impulses)
                     delta = wp.full((worlds, dofs), float("nan"), device=device)
-                    kernel = _get_pgs_solve_sparse_kernel(capacity, dofs, support)
+                    kernel = _get_pgs_solve_sparse_kernel(capacity, dofs, support, active_rows=active_rows)
                     wp.launch_tiled(
                         kernel,
                         dim=[2],
                         inputs=[
                             worlds,
-                            wp.array([8, 0, 8], dtype=int, device=device),
+                            wp.array([count, 0, count], dtype=int, device=device),
                             padded(bias),
                             padded(diag),
                             actual_impulses,
@@ -524,7 +610,7 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                     for world in (0, 2):
                         np.testing.assert_allclose(actual[world], expected, atol=2.0e-5, rtol=2.0e-4)
                         np.testing.assert_allclose(
-                            result_impulses[world, :8], expected_impulses, atol=2.0e-5, rtol=2.0e-4
+                            result_impulses[world, :count], expected_impulses, atol=2.0e-5, rtol=2.0e-4
                         )
 
 

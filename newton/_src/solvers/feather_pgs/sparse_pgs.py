@@ -24,6 +24,7 @@ def _get_pgs_solve_sparse_kernel(
     *,
     mf_max_constraints: int = 0,
     free_row_dofs: int = 0,
+    active_rows: bool = False,
 ) -> wp.Kernel:
     """Build a CUDA sweep over factored articulations and physical free bodies.
 
@@ -39,6 +40,9 @@ def _get_pgs_solve_sparse_kernel(
     velocity-limit rows. Seeded patch impulses retain the ordinary delta semantics.
     Independent free-body rows follow the articulated rows in every sweep,
     retaining their own response, capacity, friction law, and impulse buffer.
+    ``active_rows`` selects point-contact normal/limit rows at sweep entry,
+    then retains their ordered GS updates. Newly violated zero rows wait until
+    the next sweep; mixed responses and linked patches retain the full sweep.
 
     Launch with ``ceil(world_count / 2)`` tiles and 64 threads per tile.
     """
@@ -53,6 +57,81 @@ def _get_pgs_solve_sparse_kernel(
     friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
     limit_type = int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
     velocity_limit_type = int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
+    active_rows = bool(active_rows) and F == 0 and P == 0
+    active_storage = active_initialize = active_scan = ""
+    row_loop = "        for (int row = 0; row < count; ++row) {"
+    row_loop_end = "        }"
+    if active_rows:
+        words = (M + 31) // 32
+        active_storage = f"""
+    __shared__ unsigned normal_words_storage[{W * words}];
+    __shared__ unsigned selected_words_storage[{W * words}];
+    unsigned* normal_words = normal_words_storage + slot * {words};
+    unsigned* selected_words = selected_words_storage + slot * {words};
+"""
+        active_initialize = f"""
+    bool linked = false;
+    for (int row = lane; row < count; row += 32)
+        if (type[row] == {contact_type} && world_row_parent.data[offset + row] >= 0) linked = true;
+    const bool select_active = __ballot_sync(MASK, linked) == 0u && isfinite(omega) && omega >= 0.0f;
+"""
+        active_scan = f"""
+        for (int first = 0; first < count; first += 32) {{
+            const int row = first + lane;
+            bool selected = false;
+            if (row < count) {{
+                const int kind = static_cast<int>(type[row]);
+                if (kind != {friction_type}) {{
+                    selected = !select_active || (kind != {contact_type} && kind != {limit_type})
+                        || impulse[row] != 0.0f;
+                    if (!selected && diagonal[row] > 0.0f) {{
+                        float dot = 0.0f;
+                        // Delta starts at zero even when the impulse buffer is seeded.
+                        if (iteration != 0) {{
+                            #pragma unroll
+                            for (int entry = 0; entry < {S}; ++entry) {{
+                                const int index = row_dof.data[row_base + row * {S} + entry];
+                                if (index >= 0)
+                                    dot += row_factor.data[row_base + row * {S} + entry] * delta[index];
+                            }}
+                        }}
+                        const float residual = dot + rhs[row];
+                        selected = residual < 0.0f || !isfinite(residual);
+                    }}
+                }} else if (select_active && global_iteration < friction_start_iteration) {{
+                    // The active list visits only first tangents; clear both delayed rows here.
+                    impulse[row] = 0.0f;
+                }}
+            }}
+            const unsigned mask = __ballot_sync(MASK, selected);
+            if (lane == 0) normal_words[first / 32] = mask;
+        }}
+        __syncwarp(MASK);
+        for (int first = 0; first < count; first += 32) {{
+            const int row = first + lane;
+            bool selected = false;
+            if (row < count) {{
+                selected = !select_active || ((normal_words[first / 32] >> lane) & 1u) != 0u;
+                if (select_active && type[row] == {friction_type}
+                    && global_iteration >= friction_start_iteration) {{
+                    const int parent = world_row_parent.data[offset + row];
+                    selected = row == parent + 1 && (
+                        ((normal_words[parent / 32] >> (parent & 31)) & 1u) != 0u
+                        || impulse[row] != 0.0f || impulse[parent + 2] != 0.0f);
+                }}
+            }}
+            const unsigned mask = __ballot_sync(MASK, selected);
+            if (lane == 0) selected_words[first / 32] = mask;
+        }}
+        __syncwarp(MASK);
+"""
+        row_loop = """
+        for (int word = 0; word < (count + 31) / 32; ++word) {
+            unsigned pending = selected_words[word];
+            while (pending != 0u) {
+                const int row = word * 32 + __ffs(pending) - 1;
+                pending &= pending - 1u;"""
+        row_loop_end = "            }\n        }"
     mf_storage = mf_initialize = mf_sweep = mf_writeback = ""
     if F:
         mf_storage = f"""
@@ -215,6 +294,7 @@ def _get_pgs_solve_sparse_kernel(
     float* diagonal = diagonal_storage + slot * {M};
     unsigned char* type = type_storage + slot * {M};
 {mf_storage}
+{active_storage}
 
     for (int d = lane; d < {D}; d += 32) delta[d] = 0.0f;
     for (int i = lane; i < count; i += 32) {{
@@ -225,11 +305,13 @@ def _get_pgs_solve_sparse_kernel(
     }}
 {mf_initialize}
     __syncwarp(MASK);
+{active_initialize}
 
     for (int iteration = 0; iteration < iterations; ++iteration) {{
         const int global_iteration = iteration_offset + iteration;
         int changed = 0;
-        for (int row = 0; row < count; ++row) {{
+{active_scan}
+{row_loop}
             const int row_type = static_cast<int>(type[row]);
             const bool friction = row_type == {friction_type};
             if (friction && global_iteration < friction_start_iteration) {{
@@ -329,7 +411,7 @@ def _get_pgs_solve_sparse_kernel(
                 }}
             }}
             __syncwarp(MASK);
-        }}
+{row_loop_end}
 {mf_sweep}
         if (global_iteration >= friction_start_iteration && __ballot_sync(MASK, changed != 0) == 0u) break;
     }}
@@ -436,6 +518,7 @@ def _get_pgs_solve_sparse_kernel(
                 factor_velocity_delta,
             )
 
-    solve.__name__ = f"pgs_solve_sparse_{M}_{D}_{S}_{F}_{P}"
+    suffix = "_active" if active_rows else ""
+    solve.__name__ = f"pgs_solve_sparse_{M}_{D}_{S}_{F}_{P}{suffix}"
     solve.__qualname__ = solve.__name__
     return wp.kernel(enable_backward=False, module="unique")(solve)

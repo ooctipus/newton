@@ -5145,7 +5145,16 @@ class SolverFeatherPGS(SolverBase):
         shared_limit = min(48 * 1024, int(model.device.max_shared_memory_per_block))
         # Two worlds share a block: three float row arrays, row types, and velocity deltas.
         mf_capacity = self.mf_max_constraints if self._has_free_rigid_bodies else 0
+        active_rows = (
+            self._kernel_overrides.get("sparse_active_contacts", True)
+            and not self._has_free_rigid_bodies
+            and not self._friction_anchors_enabled
+        )
         solve_shared_bytes = 8 * self.max_world_dofs + 26 * self.dense_max_constraints + 16 * mf_capacity
+        if active_rows:
+            # Two row bitsets per world, with aligned unsigned-word storage.
+            solve_shared_bytes += 16 * ((self.dense_max_constraints + 31) // 32)
+            solve_shared_bytes = (solve_shared_bytes + 3) // 4 * 4
         if solve_shared_bytes > shared_limit:
             return
         shared_bytes_per_warp = 4 * (2 * plan.nonzero_count + 6 * size)
@@ -5199,6 +5208,7 @@ class SolverFeatherPGS(SolverBase):
             max_support,
             mf_max_constraints=mf_capacity,
             free_row_dofs=6 if self._has_free_rigid_bodies else 0,
+            active_rows=active_rows,
         )
 
     def _build_body_maps(self, model):
