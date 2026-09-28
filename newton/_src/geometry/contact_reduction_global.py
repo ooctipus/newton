@@ -104,8 +104,8 @@ PAIRS_PER_KEY = VALUES_PER_KEY * (VALUES_PER_KEY - 1) // 2
 EXPORT_REDUCED_CONTACTS_BLOCK_DIM = 32
 EXPORT_REDUCED_CONTACTS_THREAD_BUDGET_MULTIPLIER = 4
 
-# Preserve slot-level parallelism below one full clear launch; larger active
-# sets have enough entry-level work to favor coalesced slot-major stores.
+# Preserve slot-level parallelism for small active sets; larger sets
+# favor coalesced slot-major stores.
 CLEAR_ACTIVE_ENTRY_PARALLEL_THRESHOLD = 1024
 
 # Open-addressed linear probing gets expensive at high load and failed inserts
@@ -1090,8 +1090,8 @@ class GlobalContactReducer:
         later-scheduled blocks (or even later-issued warps/lanes under
         independent thread scheduling), causing some entries to be skipped.
         """
-        # Use fixed thread count for efficient GPU utilization
-        num_threads = min(1024, self.hashtable.capacity)
+        # Match HashTable.clear_active's grid-stride launch.
+        num_threads = min(65536, self.hashtable.capacity)
 
         wp.launch(
             _clear_active_kernel,

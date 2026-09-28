@@ -513,9 +513,8 @@ def test_clear_active(test, device):
     test.assertEqual(get_contact_count(reducer), 1)
 
 
-def test_clear_active_coalesced(test, device):
+def test_clear_active_coalesced(test, device, active_count=CLEAR_ACTIVE_ENTRY_PARALLEL_THRESHOLD):
     """Verify the coalesced branch resets directly seeded active entries."""
-    active_count = CLEAR_ACTIVE_ENTRY_PARALLEL_THRESHOLD
     reducer = GlobalContactReducer(
         capacity=4 * active_count,
         device=device,
@@ -1484,10 +1483,11 @@ def test_deterministic_identical_across_runs(test, device):
 
     num_runs = 5
     all_contact_sets = []
+    reducer = GlobalContactReducer(capacity=500, device=device, deterministic=True)
+    reducer_data = reducer.get_data_struct()
 
     for _ in range(num_runs):
-        reducer = GlobalContactReducer(capacity=500, device=device, deterministic=True)
-        reducer_data = reducer.get_data_struct()
+        reducer.clear_active()
 
         @wp.kernel(enable_backward=False)
         def store_contacts_det_kernel(reducer_data: GlobalContactReducerData):
@@ -1572,6 +1572,13 @@ add_function_test(TestGlobalContactReducer, "test_clear", test_clear, devices=de
 add_function_test(TestGlobalContactReducer, "test_stress_many_contacts", test_stress_many_contacts, devices=devices)
 add_function_test(TestGlobalContactReducer, "test_clear_active", test_clear_active, devices=devices)
 add_function_test(TestGlobalContactReducer, "test_clear_active_coalesced", test_clear_active_coalesced, devices=devices)
+add_function_test(
+    TestGlobalContactReducer,
+    "test_clear_active_grid_stride",
+    test_clear_active_coalesced,
+    devices=devices,
+    active_count=65537,
+)
 add_function_test(
     TestGlobalContactReducer,
     "test_export_reduced_contacts_kernel",
