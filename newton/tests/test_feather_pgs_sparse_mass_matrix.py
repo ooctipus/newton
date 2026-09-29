@@ -66,29 +66,6 @@ class TestSparseMassMatrix(unittest.TestCase):
         plan = _SparseMassMatrixPlan.build([-1, 0, 0], [6, 3, 3])
         self.assertIsNone(_SparseRowSupportPlan.build(plan, plan.joint_ancestor_mask, max_row_dofs=9))
 
-    def test_branch_groups_follow_factor_structure(self):
-        """Separate sibling subtrees without splitting nested or multi-DOF joints."""
-        for branch_count in (2, 3, 4):
-            for root_dofs in (0, 6):
-                parents = [-1]
-                counts = [root_dofs]
-                for _ in range(branch_count):
-                    first = len(parents)
-                    parents.extend((0, first))
-                    counts.extend((2, 1))
-                plan = _SparseMassMatrixPlan.build(parents, counts)
-                groups = np.asarray(plan.branch_groups())
-                self.assertEqual(len(groups), plan.dof_count)
-                self.assertEqual(set(groups[groups >= 0]), set(range(branch_count)))
-                self.assertEqual(np.count_nonzero(groups == -1), root_dofs)
-                structural = (plan.lookup >= 0) | (plan.lookup.T >= 0)
-                for a in range(branch_count):
-                    self.assertEqual(np.count_nonzero(groups == a), 3)
-                    for b in range(a):
-                        self.assertFalse(np.any(structural[np.ix_(groups == a, groups == b)]))
-        for parents, counts in (([-1, 0, 1], [6, 1, 1]), ([-1, 0, 0, 0, 0, 0], [6, 1, 1, 1, 1, 1])):
-            self.assertEqual(_SparseMassMatrixPlan.build(parents, counts).branch_groups(), ())
-
     def test_factor_schedules_follow_dependencies(self):
         """Cover each packed factor entry once and schedule independent branch pivots together."""
         for parents, counts in [([2, -1, 1, 2, -1, 4], [2, 3, 0, 1, 1, 2]), _branched_humanoid_topology()]:

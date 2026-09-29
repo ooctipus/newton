@@ -38,7 +38,6 @@ def _sweep(
     omega=1.0,
     active_rows=False,
     iterations=8,
-    selected_rows=None,
 ):
     velocity, impulses = velocity.copy(), impulses.copy()
     active_rows = (
@@ -49,9 +48,7 @@ def _sweep(
     )
     for iteration in range(iterations):
         selected = np.ones(len(types), dtype=bool)
-        if selected_rows is not None:
-            selected = selected_rows.copy()
-        elif active_rows:
+        if active_rows:
             unilateral = np.isin(types, (PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_JOINT_LIMIT))
             selected[unilateral] = (impulses[unilateral] != 0) | ((jacobian @ velocity + bias)[unilateral] < 0)
             for row in np.flatnonzero(types == PGS_CONSTRAINT_TYPE_FRICTION):
@@ -97,71 +94,6 @@ def _sweep(
                     value = max(value, 0.0)
             velocity += response[row] * (value - old)
             impulses[row] = value
-    return velocity, impulses
-
-
-def _branch_problem(branch_count, separator_size, *, offset=0, branch_dofs=3):
-    """Build coupled contact triplets and limits on independent tree branches."""
-    rng = np.random.default_rng(474)
-    groups = np.array([-1] * separator_size + [branch for branch in range(branch_count) for _ in range(branch_dofs)])
-    count, dofs = offset + 7 * branch_count, len(groups)
-    rows = np.zeros((count, dofs))
-    types = np.full(count, PGS_CONSTRAINT_TYPE_JOINT_LIMIT, dtype=np.int32)
-    parents = np.full(count, -1, dtype=np.int32)
-    mu = np.zeros(count)
-    bias = np.full(count, 1.0)
-    owners = np.arange(count) % branch_count
-    for row in range(offset):
-        rows[row, separator_size + branch_dofs * owners[row]] = 1.0
-    for branch in range(branch_count):
-        first = offset + 7 * branch
-        support = np.r_[np.arange(separator_size), np.flatnonzero(groups == branch)]
-        rows[first : first + 7, support] = rng.normal(scale=0.4, size=(7, len(support)))
-        rows[first : first + 7, :separator_size] *= 0.15
-        bias[first : first + 7] = (-0.1, -0.3, 0.06, -0.03, 0.15, -0.08, 0.04)
-        owners[first : first + 7] = branch
-        for normal in (first + 1, first + 4):
-            types[normal : normal + 3] = (
-                PGS_CONSTRAINT_TYPE_CONTACT,
-                PGS_CONSTRAINT_TYPE_FRICTION,
-                PGS_CONSTRAINT_TYPE_FRICTION,
-            )
-            parents[normal + 1 : normal + 3] = normal
-            mu[normal + 1 : normal + 3] = 0.6
-    return rows, bias, types, parents, mu, owners, tuple(int(group) for group in groups)
-
-
-def _branch_sweep(
-    rows, bias, diagonal, types, parents, mu, owners, groups, *, friction_start=0, iteration_offset=0, omega=1.0
-):
-    """Freeze global eligibility, sweep each branch locally, and sum response increments."""
-    velocity, impulses = np.zeros(rows.shape[1]), np.zeros(len(rows))
-    for iteration in range(8):
-        selected = (impulses != 0) | (rows @ velocity + bias < 0)
-        for row in np.flatnonzero(types == PGS_CONSTRAINT_TYPE_FRICTION):
-            parent = parents[row]
-            selected[row] = selected[parent] or np.any(impulses[parent + 1 : parent + 3] != 0)
-        start, result = velocity.copy(), velocity.copy()
-        for branch in range(1 if iteration == 0 else max(groups) + 1):
-            admitted = np.ones(len(rows), dtype=bool) if iteration == 0 else owners == branch
-            local, impulses = _sweep(
-                rows,
-                rows,
-                start,
-                bias,
-                diagonal,
-                types,
-                parents,
-                mu,
-                impulses,
-                friction_start=friction_start,
-                iteration_offset=iteration_offset + iteration,
-                omega=omega,
-                iterations=1,
-                selected_rows=selected & admitted,
-            )
-            result += local - start
-        velocity = result
     return velocity, impulses
 
 
@@ -292,206 +224,6 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
         for options in ({"mf_max_constraints": 1}, {"free_row_dofs": 1}):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 _get_pgs_solve_sparse_kernel(16, 6, 4, use_support_table=True, **options)
-
-    def test_branch_groups_require_supported_factor_coordinates(self):
-        """Admit contiguous branch groups and reject unsupported solver layouts."""
-        _get_pgs_solve_sparse_kernel(16, 6, 4, active_rows=True, branch_groups=(-1, -1, 0, 0, 1, 1))
-        for groups, options in (
-            ((-1, 0, 0), {}),
-            ((-1, -1, 0, 0, 2, 2), {}),
-            ((-2, -1, 0, 0, 1, 1), {}),
-            ((-1, -1, 0, 0, 1, 1), {"active_rows": False}),
-            ((-1, -1, 0, 0, 1, 1), {"free_row_dofs": 1}),
-        ):
-            with self.subTest(groups=groups, options=options), self.assertRaises(ValueError):
-                _get_pgs_solve_sparse_kernel(16, 6, 4, **{"active_rows": True, **options}, branch_groups=groups)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
-    def test_cuda_branch_sweeps_match_reference_and_fallback(self):
-        """Match branch-local recurrence, serial fallbacks, empty worlds and graph replay."""
-        for branches, separator, offset, branch_dofs, settings in (
-            (2, 2, 0, 3, _SWEEP_CASES[0]),
-            (3, 2, 0, 3, _SWEEP_CASES[1]),
-            (4, 6, 30, 3, _SWEEP_CASES[2]),
-            (4, 6, 0, 9, _SWEEP_CASES[0]),
-            (2, 0, 0, 3, _SWEEP_CASES[0]),
-        ):
-            with self.subTest(
-                branches=branches, separator=separator, offset=offset, branch_dofs=branch_dofs, settings=settings
-            ):
-                self._check_cuda_branch_sweeps(branches, separator, offset, branch_dofs, settings)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
-    def test_cuda_branch_support_tables(self):
-        """Classify branches and serial fallbacks using shared support indices."""
-        self._check_cuda_branch_sweeps(2, 2, 0, 3, _SWEEP_CASES[0], use_support_table=True)
-
-    def _check_cuda_branch_sweeps(self, branches, separator, offset, branch_dofs, settings, *, use_support_table=False):
-        """Compare the new schedule with frozen global eligibility and exact local projection."""
-        rows, bias, types, parents, mu, owners, groups = _branch_problem(
-            branches, separator, offset=offset, branch_dofs=branch_dofs
-        )
-        cases = ["branch", "empty"]
-        if branches == 2 and separator:
-            cases += ["root_only", "cross_branch", "seeded", "linked"]
-        worlds, count, dofs = len(cases), len(rows), rows.shape[1]
-        capacity, support = count + 2, min(dofs, separator + branch_dofs + int("cross_branch" in cases))
-        friction_start, iteration_offset, omega = settings
-        settings = {"friction_start": friction_start, "iteration_offset": iteration_offset, "omega": omega}
-        packed_dof = np.full((worlds, capacity, support), -1, dtype=np.int32)
-        packed_rows = np.zeros((worlds, capacity, support), dtype=np.float32)
-        counts = np.full(worlds, count, dtype=np.int32)
-        biases, diagonals, incidents, coefficients, seeds, row_types, row_parents = [], [], [], [], [], [], []
-        expected = []
-        for world, case in enumerate(cases):
-            z, parent, seed = rows.copy(), parents.copy(), np.zeros(count)
-            if case == "root_only":
-                z[0] = 0.0
-                z[0, 0] = 1.0
-            elif case == "cross_branch":
-                z[0, separator + branch_dofs] = 0.5
-            elif case == "seeded":
-                seed[1:4] = (0.4, -0.08, 0.04)
-            elif case == "linked":
-                parent[1], parent[4] = 4, 1
-            elif case == "empty":
-                counts[world] = 0
-            incident = z @ np.linspace(-0.1, 0.1, dofs)
-            diagonal = np.sum(z * z, axis=1) + 1.0e-6
-            for row in range(count):
-                indices = np.flatnonzero(z[row])
-                packed_dof[world, row, : len(indices)] = indices
-                packed_rows[world, row, : len(indices)] = z[row, indices]
-            if case == "empty":
-                result = np.zeros(dofs), seed
-            elif case == "branch":
-                result = _branch_sweep(z, bias + incident, diagonal, types, parent, mu, owners, groups, **settings)
-                if separator == 0:
-                    serial = _sweep(
-                        z,
-                        z,
-                        np.zeros(dofs),
-                        bias + incident,
-                        diagonal,
-                        types,
-                        parent,
-                        mu,
-                        seed,
-                        active_rows=True,
-                        **settings,
-                    )
-                    np.testing.assert_allclose(result[0], serial[0], atol=2.0e-6, rtol=2.0e-5)
-                    np.testing.assert_allclose(result[1], serial[1], atol=2.0e-6, rtol=2.0e-5)
-            else:
-                result = _sweep(
-                    z,
-                    z,
-                    np.zeros(dofs),
-                    bias + incident,
-                    diagonal,
-                    types,
-                    parent,
-                    mu,
-                    seed,
-                    active_rows=True,
-                    **settings,
-                )
-            expected.append(result)
-            biases.append(bias)
-            diagonals.append(diagonal)
-            incidents.append(incident)
-            coefficients.append(z)
-            seeds.append(seed)
-            row_types.append(types)
-            row_parents.append(parent)
-
-        device = "cuda:0"
-
-        def array(value, dtype=float):
-            return wp.array(value, dtype=dtype, device=device)
-
-        def padded(value, dtype=float):
-            return array(np.pad(np.asarray(value), ((0, 0), (0, capacity - count))), dtype)
-
-        initial_impulses = padded(seeds)
-        impulses = wp.clone(initial_impulses)
-        delta = wp.full((worlds, dofs), float("nan"), device=device)
-        row_support = _SparseRowSupport()
-        packed_indices = array(packed_dof, int)
-        if use_support_table:
-            unique, row_class = np.unique(packed_dof.reshape(-1, support), axis=0, return_inverse=True)
-            row_support.enabled = 1
-            row_support.class_dof = array(unique, int)
-            row_support.row_class = array(row_class.reshape(worlds, capacity), int)
-            packed_indices = wp.full((1, 1, 1), -9, dtype=int, device=device)
-        kernel = _get_pgs_solve_sparse_kernel(
-            capacity, dofs, support, active_rows=True, branch_groups=groups, use_support_table=use_support_table
-        )
-        inputs = [
-            worlds,
-            array(counts, int),
-            padded(biases),
-            padded(diagonals),
-            impulses,
-            packed_indices,
-            array(packed_rows),
-            wp.zeros((worlds, capacity, 12), device=device),
-            padded(incidents),
-            padded(row_types, int),
-            padded(row_parents, int),
-            padded(np.tile(mu, (worlds, 1))),
-            wp.zeros((worlds, dofs), dtype=int, device=device),
-            array(np.arange(worlds * dofs).reshape(worlds, dofs), int),
-            wp.zeros(worlds * dofs, device=device),
-            wp.zeros(worlds, dtype=int, device=device),
-            wp.zeros((worlds, 4), dtype=int, device=device),
-            wp.zeros((worlds, 1), device=device),
-            *[wp.zeros((worlds, 1, 6), device=device) for _ in range(4)],
-            wp.zeros((worlds, 1), device=device),
-            8,
-            omega,
-            friction_start,
-            iteration_offset,
-        ]
-
-        def launch():
-            wp.copy(impulses, initial_impulses)
-            wp.launch_tiled(
-                kernel, dim=[worlds], inputs=inputs, outputs=[delta, row_support], block_dim=32, device=device
-            )
-
-        launch()
-        actual, actual_impulses = delta.numpy(), impulses.numpy()
-        if use_support_table:
-            np.testing.assert_array_equal(packed_indices.numpy(), -9)
-        for world, case in enumerate(cases):
-            with self.subTest(case=case):
-                np.testing.assert_allclose(actual[world], expected[world][0], atol=3.0e-5, rtol=3.0e-4)
-                np.testing.assert_allclose(actual_impulses[world, :count], expected[world][1], atol=3.0e-5, rtol=3.0e-4)
-                if case == "empty":
-                    np.testing.assert_array_equal(actual[world], 0.0)
-                    continue
-                np.testing.assert_allclose(
-                    actual[world],
-                    coefficients[world].T @ (actual_impulses[world, :count] - seeds[world]),
-                    atol=3.0e-5,
-                    rtol=3.0e-4,
-                )
-                for first in np.flatnonzero(types == PGS_CONSTRAINT_TYPE_CONTACT):
-                    load, linked = actual_impulses[world, first], row_parents[world][first]
-                    while linked >= 0 and linked != first:
-                        load += actual_impulses[world, linked]
-                        linked = row_parents[world][linked]
-                    self.assertLessEqual(
-                        np.linalg.norm(actual_impulses[world, first + 1 : first + 3]),
-                        max(mu[first + 1] * load, 0.0) + 3.0e-6,
-                    )
-        with wp.ScopedCapture(device=device) as capture:
-            launch()
-        for _ in range(2):
-            wp.capture_launch(capture.graph)
-            np.testing.assert_array_equal(delta.numpy(), actual)
-            np.testing.assert_array_equal(impulses.numpy(), actual_impulses)
 
     @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
     def test_cuda_free_velocity_limit_is_stateless(self):
@@ -772,7 +504,7 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
     def test_cuda_support_table_sweeps(self):
-        """Preserve serial recurrence, active scans and seeded retractions without per-row DOF arrays."""
+        """Match packed-index sweeps and graph replay for limits, seeded impulses and contact fallback."""
         for active_rows in (False, True):
             self._check_cuda_sparse_sweeps(active_rows=active_rows, use_support_table=True)
 
@@ -804,7 +536,7 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                     )
                     if active_rows and contact_activity is None:
                         parents[types == PGS_CONSTRAINT_TYPE_CONTACT] = -1
-                    offset = 30 if active_rows and dofs == 75 else 0
+                    offset = 30 if active_rows and (dofs == 75 or (use_support_table and dofs == 43)) else 0
                     if offset:
                         # Cross a bitset word boundary and retain an incomplete final word.
                         rows = np.pad(rows, ((offset, 0), (0, 0)))
@@ -850,7 +582,8 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                         result[:, : len(array)] = array
                         return wp.array(result, device=device)
 
-                    actual_impulses = padded(impulses)
+                    initial_impulses = padded(impulses)
+                    actual_impulses = wp.clone(initial_impulses)
                     delta = wp.full((worlds, dofs), float("nan"), device=device)
                     row_support = _SparseRowSupport()
                     packed_indices = wp.array(row_dof, device=device)
@@ -863,10 +596,9 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                     kernel = _get_pgs_solve_sparse_kernel(
                         capacity, dofs, support, active_rows=active_rows, use_support_table=use_support_table
                     )
-                    wp.launch_tiled(
-                        kernel,
-                        dim=[2],
-                        inputs=[
+                    launch_args = {
+                        "dim": [2],
+                        "inputs": [
                             worlds,
                             wp.array([count, 0, count], dtype=int, device=device),
                             padded(bias),
@@ -895,10 +627,11 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                             friction_start,
                             iteration_offset,
                         ],
-                        outputs=[delta, row_support],
-                        block_dim=64,
-                        device=device,
-                    )
+                        "outputs": [delta, row_support],
+                        "block_dim": 64,
+                        "device": device,
+                    }
+                    wp.launch_tiled(kernel, **launch_args)
                     actual = delta.numpy()
                     if use_support_table:
                         np.testing.assert_array_equal(packed_indices.numpy(), -9)
@@ -909,6 +642,23 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                         np.testing.assert_allclose(
                             result_impulses[world, :count], expected_impulses, atol=2.0e-5, rtol=2.0e-4
                         )
+                    if use_support_table:
+                        packed_kernel = _get_pgs_solve_sparse_kernel(capacity, dofs, support, active_rows=active_rows)
+                        wp.copy(actual_impulses, initial_impulses)
+                        launch_args["inputs"][5] = wp.array(row_dof, device=device)
+                        launch_args["outputs"][1] = _SparseRowSupport()
+                        wp.launch_tiled(packed_kernel, **launch_args)
+                        np.testing.assert_array_equal(delta.numpy(), actual)
+                        np.testing.assert_array_equal(actual_impulses.numpy(), result_impulses)
+                        launch_args["inputs"][5] = packed_indices
+                        launch_args["outputs"][1] = row_support
+                        with wp.ScopedCapture(device=device) as capture:
+                            wp.copy(actual_impulses, initial_impulses)
+                            wp.launch_tiled(kernel, **launch_args)
+                        for _ in range(2):
+                            wp.capture_launch(capture.graph)
+                            np.testing.assert_array_equal(delta.numpy(), actual)
+                            np.testing.assert_array_equal(actual_impulses.numpy(), result_impulses)
 
 
 if __name__ == "__main__":

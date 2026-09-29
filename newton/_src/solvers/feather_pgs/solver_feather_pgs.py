@@ -5037,8 +5037,6 @@ class SolverFeatherPGS(SolverBase):
         """Select sparse articulation factors with independent rigid-body response blocks."""
         self._sparse_mass_matrix_size = None
         self._sparse_prepare_contacts = False
-        self._sparse_branch_groups = ()
-        self._sparse_branch_count = 0
         self._sparse_row_support = _SparseRowSupport()
         if not (
             self._kernel_overrides.get("sparse_mass_matrix", True)
@@ -5237,26 +5235,6 @@ class SolverFeatherPGS(SolverBase):
             prepare_rows=self._sparse_prepare_contacts,
             use_support_table=use_support_table,
         )
-        # Experimental block-Jacobi between branches changes finite-sweep
-        # convergence. Keep it opt-in while qualifying loaded trajectories.
-        if (
-            os.environ.get("FEATHER_PGS_SPARSE_BRANCH_SWEEPS") == "1"
-            and active_rows
-            and self._sparse_prepare_contacts
-            and not self._has_free_rigid_bodies
-            and np.all(articulated_counts == 1)
-            and size == self.max_world_dofs
-            and np.all(offsets[articulated] == 0)
-        ):
-            groups = plan.branch_groups()
-            # Four private response vectors, one shared vector, row state and
-            # six bitsets. Include the launch tile and alignment conservatively.
-            branch_shared_bytes = (
-                20 * size + 13 * self.dense_max_constraints + 24 * ((self.dense_max_constraints + 31) // 32) + 276
-            )
-            if groups and branch_shared_bytes <= shared_limit:
-                self._sparse_branch_groups = groups
-                self._sparse_branch_count = max(groups) + 1
         self._pgs_solve_sparse_kernel = _get_pgs_solve_sparse_kernel(
             self.dense_max_constraints,
             self.max_world_dofs,
@@ -5264,7 +5242,6 @@ class SolverFeatherPGS(SolverBase):
             mf_max_constraints=mf_capacity,
             free_row_dofs=6 if self._has_free_rigid_bodies else 0,
             active_rows=active_rows,
-            branch_groups=self._sparse_branch_groups,
             use_support_table=use_support_table,
         )
 
@@ -8290,7 +8267,7 @@ class SolverFeatherPGS(SolverBase):
                 raise RuntimeError("sparse factor response requires the interleaved augmented-drive solve")
             wp.launch_tiled(
                 self._pgs_solve_sparse_kernel,
-                dim=[self.world_count if self._sparse_branch_count else (self.world_count + 1) // 2],
+                dim=[(self.world_count + 1) // 2],
                 inputs=[
                     self.world_count,
                     self.constraint_count,
@@ -8321,7 +8298,7 @@ class SolverFeatherPGS(SolverBase):
                     int(iteration_offset),
                 ],
                 outputs=[self._sparse_factor_velocity_delta, self._sparse_row_support],
-                block_dim=32 if self._sparse_branch_count else 64,
+                block_dim=64,
                 device=self.model.device,
             )
             indices = self._sparse_mass_matrix_indices
