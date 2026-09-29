@@ -1,0 +1,1 @@
+Add experimental `SensorContact.replicate(model)` to expand prepared body or shape sensor bindings on the device for exact-size homogeneous model replicas, preserving local counterpart columns and avoiding runtime topology readbacks.

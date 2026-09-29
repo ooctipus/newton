@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import copy
 import re
 import warnings
+from functools import cached_property
 from typing import Any, Literal
 
 import numpy as np
@@ -194,6 +196,34 @@ def expand_body_to_shape_kernel(
         shape_to_col[tid] = col
 
 
+@wp.kernel(enable_backward=False)
+def _replicate_contact_bindings(
+    source_rows: wp.array[wp.int32],
+    source_columns: wp.array[wp.int32],
+    source_indices: wp.array[wp.int32],
+    source_kinds: wp.array[wp.int32],
+    entity_stride: int,
+    rows: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    indices: wp.array[wp.int32],
+    kinds: wp.array[wp.int32],
+):
+    i = wp.tid()
+    if i < rows.shape[0]:
+        world = i // source_rows.shape[0]
+        shape = i % source_rows.shape[0]
+        row = source_rows[shape]
+        if row >= 0:
+            row += world * source_indices.shape[0]
+        rows[i] = row
+        columns[i] = source_columns[shape]
+    if i < indices.shape[0]:
+        world = i // source_indices.shape[0]
+        row = i % source_indices.shape[0]
+        indices[i] = source_indices[row] + world * entity_stride
+        kinds[i] = source_kinds[row]
+
+
 def _check_index_bounds(indices: list[int], count: int, param_name: str, entity_name: str) -> None:
     """Raise IndexError if any index is out of range [0, count)."""
     for index in indices:
@@ -360,16 +390,34 @@ class SensorContact:
         ValueError: If the configuration of sensing/counterpart objects is invalid.
     """
 
-    sensing_indices: list[int]
-    """Body or shape index per sensing object, matching the row of output arrays. For ``list[int]`` inputs the caller's
-    order is preserved; for string patterns the order follows ascending body/shape index."""
+    @cached_property
+    def sensing_indices(self) -> list[int]:
+        """Body or shape indices in output row order, preserving explicit input order.
+
+        String patterns use ascending entity indices. Ordinary construction stores
+        this list immediately; :meth:`replicate` materializes it on first host access.
+        """
+        source = self._replication_source
+        stride = source._model.body_count if self.sensing_type == "body" else source._model.shape_count
+        return [index + world * stride for world in range(self._model.world_count) for index in source.sensing_indices]
 
     sensing_type: Literal["body", "shape"]
     """Whether :attr:`sensing_indices` contains body indices (``"body"``) or shape indices (``"shape"``)."""
 
-    counterpart_indices: list[list[int]]
-    """Counterpart body or shape indices per sensing object. ``counterpart_indices[i]`` lists the counterparts for row
-    ``i``. Global counterparts appear first, followed by per-world locals in ascending index order."""
+    @cached_property
+    def counterpart_indices(self) -> list[list[int]]:
+        """Counterpart indices per output row, with globals before ascending local indices.
+
+        Replicated sensors materialize these lists on first host access. Their
+        single-world prototypes have no global entities.
+        """
+        source = self._replication_source
+        stride = source._model.body_count if self.counterpart_type == "body" else source._model.shape_count
+        result = []
+        for world in range(self._model.world_count):
+            columns = [index + world * stride for index in source.counterpart_indices[0]]
+            result.extend([columns] * source._sensing_indices.shape[0])
+        return result
 
     counterpart_type: Literal["body", "shape"] | None
     """Whether :attr:`counterpart_indices` contains body indices (``"body"``) or shape indices (``"shape"``).
@@ -636,23 +684,7 @@ class SensorContact:
                 device=self.device,
             )
 
-        if measure_total:
-            self.total_force = wp.zeros(n_rows, dtype=wp.vec3, device=self.device)
-            self.total_force_friction = wp.zeros(n_rows, dtype=wp.vec3, device=self.device)
-        else:
-            self.total_force = None
-            self.total_force_friction = None
-
-        if max_readings > 0:
-            self.force_matrix = wp.zeros((n_rows, max_readings), dtype=wp.vec3, device=self.device)
-            self.force_matrix_friction = wp.zeros((n_rows, max_readings), dtype=wp.vec3, device=self.device)
-            self.position_matrix = wp.zeros((n_rows, max_readings), dtype=wp.vec3, device=self.device)
-            self._position_weight = wp.zeros((n_rows, max_readings), dtype=wp.float32, device=self.device)
-        else:
-            self.force_matrix = None
-            self.force_matrix_friction = None
-            self.position_matrix = None
-            self._position_weight = None
+        self._allocate_outputs(n_rows, max_readings, measure_total)
 
         self.sensing_type = "body" if sensing_is_body else "shape"
         self.counterpart_type = "body" if counterpart_is_body else ("shape" if counterpart_indices else None)
@@ -679,7 +711,97 @@ class SensorContact:
         self._sensing_indices = wp.array(sensing_indices_ordered, dtype=wp.int32, device=self.device)
         sensing_kind = _SENSING_KIND_BODY if sensing_is_body else _SENSING_KIND_SHAPE
         self._sensing_kinds = wp.full(n_rows, sensing_kind, dtype=wp.int32, device=self.device)
+
+    def _allocate_outputs(self, n_rows: int, max_readings: int, measure_total: bool) -> None:
+        if measure_total:
+            self.total_force = wp.zeros(n_rows, dtype=wp.vec3, device=self.device)
+            self.total_force_friction = wp.zeros(n_rows, dtype=wp.vec3, device=self.device)
+        else:
+            self.total_force = None
+            self.total_force_friction = None
+
+        if max_readings > 0:
+            self.force_matrix = wp.zeros((n_rows, max_readings), dtype=wp.vec3, device=self.device)
+            self.force_matrix_friction = wp.zeros((n_rows, max_readings), dtype=wp.vec3, device=self.device)
+            self.position_matrix = wp.zeros((n_rows, max_readings), dtype=wp.vec3, device=self.device)
+            self._position_weight = wp.zeros((n_rows, max_readings), dtype=wp.float32, device=self.device)
+        else:
+            self.force_matrix = None
+            self.force_matrix_friction = None
+            self.position_matrix = None
+            self._position_weight = None
+
         self.sensing_transforms = wp.zeros(n_rows, dtype=wp.transform, device=self.device)
+
+    def replicate(self, model: Model) -> SensorContact:
+        """Replicate prepared bindings into a fresh exact-size model on device.
+
+        .. experimental::
+
+            This method requires a direct :meth:`Model.replicate` result from
+            this sensor's single explicit local-world model.
+
+        Rows are world-major and preserve the prototype's sensing order. Local
+        counterpart columns repeat unchanged within each world. All readings and
+        transforms start at zero and have independent storage; force accumulation
+        uses the same :meth:`update` implementation as ordinary construction.
+        The prototype's model topology and sensor bindings must remain unchanged
+        while replicas exist. Updating its readings is allowed.
+
+        No labels, world boundaries, or index arrays are read back from the device.
+        Public Python index lists are built only when explicitly inspected.
+
+        Args:
+            model: A fresh model produced by ``self``'s model's ``replicate`` method.
+
+        Returns:
+            A new sensor with independent bindings and zeroed output arrays.
+
+        Raises:
+            ValueError: If the model is not a direct replica of this sensor's
+                single explicit local-world model.
+        """
+        source = self._model
+        if (
+            source.world_count != 1
+            or source._has_global_entities is not False
+            or model._replication_source is not source
+        ):
+            raise ValueError(
+                "SensorContact.replicate requires a direct replica of its single explicit local-world model"
+            )
+        result = copy.copy(self)
+        result._model = model
+        result._replication_source = self
+        result.__dict__.pop("sensing_indices", None)
+        result.__dict__.pop("counterpart_indices", None)
+        n_rows = self._sensing_indices.shape[0] * model.world_count
+        result._sensing_shape_to_row = wp.empty(model.shape_count, dtype=wp.int32, device=self.device)
+        result._counterpart_shape_to_col = wp.empty_like(result._sensing_shape_to_row)
+        result._sensing_indices = wp.empty(n_rows, dtype=wp.int32, device=self.device)
+        result._sensing_kinds = wp.empty_like(result._sensing_indices)
+        wp.launch(
+            _replicate_contact_bindings,
+            dim=max(model.shape_count, n_rows),
+            inputs=[
+                self._sensing_shape_to_row,
+                self._counterpart_shape_to_col,
+                self._sensing_indices,
+                self._sensing_kinds,
+                source.body_count if self.sensing_type == "body" else source.shape_count,
+            ],
+            outputs=[
+                result._sensing_shape_to_row,
+                result._counterpart_shape_to_col,
+                result._sensing_indices,
+                result._sensing_kinds,
+            ],
+            device=self.device,
+        )
+        result._allocate_outputs(
+            n_rows, 0 if self.force_matrix is None else self.force_matrix.shape[1], self.total_force is not None
+        )
+        return result
 
     def update(self, state: State | None, contacts: Contacts):
         """Update the contact sensor readings based on the provided state and contacts.

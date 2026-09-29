@@ -3,6 +3,7 @@
 
 import types
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import warp as wp
@@ -708,6 +709,117 @@ class TestSensorContact(unittest.TestCase):
         np.testing.assert_allclose(friction[0], expected_friction, atol=1e-5)
         # Verify orthogonality
         self.assertAlmostEqual(np.dot(friction[0], n), 0.0, places=5)
+
+
+class TestSensorContactReplication(unittest.TestCase):
+    def _prototype(self):
+        """Build one explicit world with multiple shapes and a local plane."""
+        builder = newton.ModelBuilder()
+        builder.begin_world()
+        a = builder.add_body(label="a", xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()))
+        b = builder.add_body(label="b", xform=wp.transform((0.0, 0.0, 2.0), wp.quat_identity()))
+        builder.add_shape_box(a, hx=0.1, hy=0.1, hz=0.1, label="a0")
+        builder.add_shape_box(a, hx=0.1, hy=0.1, hz=0.1, label="a1")
+        builder.add_shape_box(b, hx=0.1, hy=0.1, hz=0.1, label="b0")
+        builder.add_shape_box(-1, hx=1.0, hy=1.0, hz=0.1, label="plane")
+        builder.end_world()
+        return builder.finalize()
+
+    def test_replicated_bindings_match_ordinary_construction(self):
+        """Expand ordered sensing and local counterpart maps without host reconstruction."""
+        source = self._prototype()
+        model = source.replicate(3)
+        for sensing in ("body", "shape"):
+            for counterpart, total in ((None, True), ("body", True), ("shape", True), ("shape", False)):
+                with self.subTest(sensing=sensing, counterpart=counterpart, total=total):
+                    ids = [1, 0] if sensing == "body" else [2, 0]
+                    stride = source.body_count if sensing == "body" else source.shape_count
+                    sensing_parameter = "sensing_bodies" if sensing == "body" else "sensing_shapes"
+                    kwargs = {sensing_parameter: ids, "measure_total": total}
+                    if counterpart is not None:
+                        kwargs["counterpart_bodies" if counterpart == "body" else "counterpart_shapes"] = "*"
+                    sensor = SensorContact(source, **kwargs)
+                    expected_kwargs = {**kwargs, sensing_parameter: [i + w * stride for w in range(3) for i in ids]}
+                    expected = SensorContact(model, **expected_kwargs)
+                    if sensor.total_force is not None:
+                        sensor.total_force.fill_(wp.vec3(7.0))
+                    with (
+                        patch.object(wp.array, "numpy", side_effect=AssertionError("device readback")),
+                        patch.object(wp.array, "list", side_effect=AssertionError("device readback")),
+                        patch(
+                            "newton._src.sensors.sensor_contact.match_labels", side_effect=AssertionError("label scan")
+                        ),
+                    ):
+                        replica = sensor.replicate(model)
+                        self.assertNotIn("sensing_indices", replica.__dict__)
+                        self.assertNotIn("counterpart_indices", replica.__dict__)
+                        self.assertEqual(replica.sensing_indices, expected.sensing_indices)
+                        self.assertEqual(replica.counterpart_indices, expected.counterpart_indices)
+                    for name, value in expected.__dict__.items():
+                        if isinstance(value, wp.array):
+                            actual = getattr(replica, name)
+                            np.testing.assert_array_equal(actual.numpy(), value.numpy(), err_msg=name)
+                            self.assertNotEqual(actual.ptr, getattr(sensor, name).ptr, name)
+                    if sensor.total_force is not None:
+                        np.testing.assert_array_equal(sensor.total_force.numpy(), 7.0)
+
+                    pairs = [(shape + 4 * w, other + 4 * w) for w in range(3) for shape, other in ((0, 2), (1, 3))]
+                    contacts = create_contacts(model.device, pairs, naconmax=8)
+                    contacts.force.assign(np.array([(3, 4, 12, 0, 0, 0), (0, 0, 5, 0, 0, 0)] * 3 + [(0,) * 6] * 2))
+                    state = model.state()
+                    for poses in (state, None):
+                        replica.update(poses, contacts)
+                        expected.update(poses, contacts)
+                        for name in (
+                            "total_force",
+                            "total_force_friction",
+                            "force_matrix",
+                            "force_matrix_friction",
+                            "position_matrix",
+                            "sensing_transforms",
+                        ):
+                            actual = getattr(replica, name)
+                            if actual is not None:
+                                np.testing.assert_array_equal(
+                                    actual.numpy(), getattr(expected, name).numpy(), err_msg=name
+                                )
+                    if total:
+                        force_a = [3, 4, 17] if sensing == "body" else [3, 4, 12]
+                        np.testing.assert_array_equal(replica.total_force.numpy(), [[-3, -4, -12], force_a] * 3)
+                        np.testing.assert_array_equal(
+                            replica.total_force_friction.numpy(), [[-3, -4, 0], [3, 4, 0]] * 3
+                        )
+
+    def test_replication_rejects_unrelated_models_and_multiple_source_worlds(self):
+        """Reject matching counts without verified source lineage and unsupported source layouts."""
+        source = self._prototype()
+        sensor = SensorContact(source, sensing_bodies=[1, 0])
+        for target in (source, self._prototype().replicate(2)):
+            with self.assertRaisesRegex(ValueError, "direct replica"):
+                sensor.replicate(target)
+        multiple = source.replicate(2)
+        with self.assertRaisesRegex(ValueError, "single explicit"):
+            SensorContact(multiple, sensing_bodies="*").replicate(multiple)
+
+    def test_replicated_sensor_update_captures_and_reads_new_contacts(self):
+        """Reuse captured force accumulation after changing contact count and force data."""
+        source = self._prototype()
+        if not source.device.is_cuda:
+            self.skipTest("CUDA graph test")
+        model = source.replicate(2)
+        sensor = SensorContact(source, sensing_bodies=[1, 0]).replicate(model)
+        expected = SensorContact(model, sensing_bodies=[1, 0, 3, 2])
+        contacts = create_contacts(model.device, [(0, 2), (4, 6)], naconmax=4, forces=[3.0, 5.0])
+        sensor.update(None, contacts)
+        with wp.ScopedCapture(device=model.device) as capture:
+            sensor.update(None, contacts)
+        for count in (2, 0, 1):
+            contacts.rigid_contact_count.fill_(count)
+            contacts.force.fill_(wp.spatial_vector(1.0, 2.0, 3.0, 0.0, 0.0, 0.0))
+            wp.capture_launch(capture.graph)
+            expected.update(None, contacts)
+            np.testing.assert_array_equal(sensor.total_force.numpy(), expected.total_force.numpy())
+            np.testing.assert_array_equal(sensor.total_force_friction.numpy(), expected.total_force_friction.numpy())
 
 
 class TestSensorContactMuJoCo(unittest.TestCase):

@@ -11,6 +11,7 @@ import sys
 import warnings
 from collections.abc import Iterable
 from contextlib import contextmanager
+from copy import copy
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any
 
@@ -83,6 +84,7 @@ from .kernels import (
     project_sleep_collision_masks_kernel,
     recompute_jnt_eq_anchor1_kernel,
     repeat_array_kernel,
+    replicate_solver_indices_kernel,
     reset_joint_state_kernel,
     reset_world_buffers_kernel,
     select_sleep_trees_kernel,
@@ -3819,6 +3821,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 ``wp.config.deterministic``.
         """
         super().__init__(model)
+        # Population-dependent buffers declare their index stride at allocation.
+        # Unlisted solver buffers are independent copies with unchanged shape.
+        self._replication_offsets: dict[str, int] = {}
 
         # Import and cache MuJoCo modules (only happens once per class)
         mujoco, _ = self.import_mujoco()
@@ -4174,6 +4179,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         if not use_mujoco_cpu and not use_mujoco_contacts:
             self._contact_tid_to_cid = wp.full(self.mjw_data.naconmax, -1, dtype=wp.int32, device=self.device)
         self._initial_model_sync = False
+        self._replication_pristine = True
         self.update_data_interval = update_data_interval
         self._step = 0
 
@@ -4186,6 +4192,232 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self._shape_enabled = wp.zeros(model.shape_count, dtype=wp.bool, device=model.device)
             self._shape_awake = wp.zeros_like(self._shape_enabled)
             self._shape_awake_previous = wp.zeros_like(self._shape_enabled)
+
+    def replicate(self, world_count: int) -> SolverMuJoCo:
+        """Create an independent homogeneous population from this pristine solver.
+
+        .. experimental::
+
+            This method and its restrictions may change.
+
+        Prepare one local rigid world with the normal constructor, then call
+        ``replicate(N)`` to allocate exactly ``N`` worlds. The returned solver
+        owns its new :attr:`model`; obtain states and controls from that model.
+        Topology, collision exclusions, mesh resources and derived MuJoCo
+        parameters are reused without conversion, compilation or recomputation.
+        Population arrays and index mappings are copied and rebased on device.
+
+        Only an unstepped, unmodified single-world MJWarp solver using native
+        contacts is supported, on the same CUDA device. The source must meet
+        :meth:`Model.replicate` restrictions and must not contain cone shapes.
+        Do not directly mutate source model, data or solver buffers after
+        preparation. Public reset/property-update operations invalidate it.
+        This creates fresh episodes; it does not migrate running simulations.
+        Allocation and graph capture are separate operations.
+
+        Args:
+            world_count: Positive number of worlds in the new population.
+
+        Returns:
+            A fresh solver owning its independently mutable replicated model.
+        """
+        if self.use_mujoco_cpu or not self.model.device.is_cuda or not self._use_mujoco_contacts:
+            raise ValueError("replicate requires the native-contact MuJoCo Warp CUDA backend.")
+        if self.model.world_count != 1 or self._step != 0 or not self._replication_pristine:
+            raise ValueError("replicate requires an unstepped, unmodified single-world solver.")
+        if self._cone_shape_indices.size:
+            raise ValueError("replicate does not yet support cone shapes.")
+        if self._pipeline_contacts is not None:
+            raise ValueError("replicate does not support solver-owned Newton contacts.")
+
+        result = copy(self)
+        with wp.ScopedDevice(self.model.device):
+            result.model = self.model.replicate(world_count)
+            result.mj_model = copy(self.mj_model)
+            result.mj_data = self._mujoco.MjData(result.mj_model)
+            self._mujoco.mj_copyData(result.mj_data, result.mj_model, self.mj_data)
+            result.mjw_model = self._mujoco_warp.replicate_model(self.mjw_model, world_count)
+            result.mjw_data = self._mujoco_warp.replicate_data(self.mjw_data, world_count)
+            for name, source in vars(self).items():
+                if isinstance(source, wp.array):
+                    if name in self._replication_offsets:
+                        shape = (source.shape[0] * world_count, *source.shape[1:])
+                        target = wp.empty(shape, dtype=source.dtype, device=source.device)
+                        if target.size:
+                            offset = self._replication_offsets[name]
+                            if offset:
+                                source_flat, target_flat = (
+                                    source.view(wp.int32).flatten(),
+                                    target.view(wp.int32).flatten(),
+                                )
+                                wp.launch(
+                                    replicate_solver_indices_kernel,
+                                    target_flat.size,
+                                    inputs=[source_flat, offset, source_flat.size // source.size],
+                                    outputs=[target_flat],
+                                    device=source.device,
+                                )
+                            else:
+                                wp.launch(
+                                    repeat_array_kernel,
+                                    target.size,
+                                    inputs=[source.flatten(), source.size],
+                                    outputs=[target.flatten()],
+                                    device=source.device,
+                                )
+                        setattr(result, name, target)
+                    else:
+                        setattr(result, name, wp.clone(source))
+                elif isinstance(source, np.ndarray):
+                    setattr(result, name, source.copy())
+                elif isinstance(source, dict):
+                    setattr(result, name, {key: copy(value) for key, value in source.items()})
+                elif (
+                    name not in ("model", "mj_model", "mj_data", "mjw_model", "mjw_data", "_replication_source_solver")
+                    and source is not None
+                    and not isinstance(source, (str, int, float))
+                ):
+                    raise TypeError(f"replicate does not support solver state {name!r} ({type(source).__name__}).")
+
+        # Keep CPU-only edit-detection snapshots as views. Materialize them only
+        # if a later property notification needs to compare per-world gains.
+        for name in ("_joint_limit_ke_snapshot", "_joint_limit_kd_snapshot", "_solreflimit_mode_snapshot"):
+            snapshot = getattr(result, name)
+            if snapshot is not None:
+                setattr(result, name, np.broadcast_to(snapshot, (world_count, *snapshot.shape)))
+        result._total_loop_joint_coords *= world_count
+        result._total_loop_joint_dofs *= world_count
+        result._viewer = None
+        result._replication_source_solver = getattr(self, "_replication_source_solver", self)
+        if result._deterministic != wp.DeterministicMode.NOT_GUARANTEED:
+            result._deterministic_max_records = _mujoco_warp_deterministic_max_records(result.mj_model, result.mjw_data)
+            result._set_mujoco_warp_module_options()
+        return result
+
+    def copy_worlds_from(
+        self,
+        source: SolverMuJoCo,
+        source_worlds: Iterable[int],
+        target_worlds: Iterable[int],
+        *,
+        states: Iterable[tuple[State, State]] = (),
+        controls: Iterable[tuple[Control, Control]] = (),
+    ) -> wp.array:
+        """Copy continuing worlds from another population of the same prototype.
+
+        .. experimental::
+
+            This native-contact MJWarp operation preserves complete per-world
+            physical state, including mutable model properties, controls, time,
+            actuator history, sleeping state, warm starts and contacts. Both
+            solvers must be distinct replicas of the same prepared solver, on
+            the same device and at the same ``update_data_interval`` phase.
+            Their immutable topology and scalar solver options must be unchanged.
+
+        Supply unique host world-index sequences of equal length. Each tuple in
+        ``states`` and ``controls`` is ``(source_object, destination_object)``;
+        include every live state buffer and control used by the application.
+        Actor identities, task history and policy buffers remain caller-owned.
+        Model, state, control and solver array storage must be contiguous; layouts
+        are validated before any destination physics is modified.
+        World-map planning and cached CPU joint-limit edit history remain
+        host-side; physical arrays are transferred only on the device.
+        No forward pass, reset, model notification or CPU physics conversion is
+        performed. Existing destination array pointers remain stable for graphs.
+
+        The returned device int32[1] status follows ``mujoco_warp.copy_worlds``:
+        zero succeeds; bits 1/2/4 indicate invalid indices, invalid input contact
+        state, or insufficient destination contact capacity. Check it before
+        publishing or stepping this population. Failed device transfers leave
+        destination physics arrays unchanged. Host metadata is private to this
+        destination, so discard the destination if status is nonzero.
+        """
+        from ...sim.model_replication import _copy_world_arrays, _world_copy_arrays  # noqa: PLC0415
+
+        prepared = getattr(source, "_replication_source_solver", None)
+        if source is self or prepared is None or getattr(self, "_replication_source_solver", None) is not prepared:
+            raise ValueError("World transfer requires distinct replicas of the same prepared solver")
+        if (
+            self.use_mujoco_cpu
+            or source.use_mujoco_cpu
+            or not self._use_mujoco_contacts
+            or not source._use_mujoco_contacts
+            or self.model.device != source.model.device
+        ):
+            raise ValueError("World transfer requires same-device native-contact MuJoCo Warp solvers")
+        interval = self.update_data_interval
+        if interval != source.update_data_interval or (
+            interval > 0 and self._step % interval != source._step % interval
+        ):
+            raise ValueError("World transfer requires a common update_data_interval phase")
+        if self.model.device.is_capturing:
+            raise RuntimeError("Solver world-transfer planning occurs outside graph capture")
+        source_worlds, target_worlds = tuple(source_worlds), tuple(target_worlds)
+        for ids, count in ((source_worlds, source.model.world_count), (target_worlds, self.model.world_count)):
+            if any(isinstance(i, (bool, np.bool_)) or not isinstance(i, (int, np.integer)) for i in ids):
+                raise ValueError("World indices must be integers")
+            if len(set(ids)) != len(ids) or any(i < 0 or i >= count for i in ids):
+                raise ValueError("World indices must be unique and in range")
+        if len(source_worlds) != len(target_worlds):
+            raise ValueError("Source and target world-index sequences must have equal length")
+        states, controls = tuple(states), tuple(controls)
+        if not states or not controls:
+            raise ValueError("World transfer requires the live state and control pairs")
+        arrays = _world_copy_arrays(source.model, self.model, states, controls)
+        # Zero-offset solver buffers contain world-local mutable data. Nonzero
+        # offsets describe immutable topology mappings already correct in the
+        # destination; their global Newton ids must not be copied from a source.
+        for name, offset in self._replication_offsets.items():
+            if offset:
+                continue
+            src, dst = getattr(source, name), getattr(self, name)
+            if src is None and dst is None:
+                continue
+            if (
+                src is None
+                or dst is None
+                or src.dtype != dst.dtype
+                or src.size * self.model.world_count != dst.size * source.model.world_count
+            ):
+                raise ValueError(f"Incompatible solver world-transfer storage: {name}")
+            if not src.is_contiguous or not dst.is_contiguous:
+                raise ValueError(f"World-transfer solver storage must be contiguous: {name}")
+            arrays.append((src, dst, None, src.size // source.model.world_count))
+        snapshots = {}
+        for name in ("_joint_limit_ke_snapshot", "_joint_limit_kd_snapshot", "_solreflimit_mode_snapshot"):
+            src, dst = getattr(source, name), getattr(self, name)
+            if src is None and dst is None:
+                continue
+            if src is None or dst is None:
+                raise ValueError(f"Incompatible joint-limit edit history: {name}")
+            if (
+                src.ndim > 1
+                and dst.ndim > 1
+                and src.shape[0] == source.model.world_count
+                and dst.shape[0] == self.model.world_count
+                and not src.flags.writeable
+                and not dst.flags.writeable
+                and src.strides[0] == dst.strides[0] == 0
+                and src.dtype == dst.dtype
+                and np.array_equal(src[0], dst[0])
+            ):
+                # Every row already has the same edit history. Preserve the
+                # compact read-only views until a property update changes it.
+                continue
+            src = src.reshape(source.model.world_count, -1)
+            dst = dst.reshape(self.model.world_count, -1).copy()
+            dst[list(target_worlds)] = src[list(source_worlds)]
+            snapshots[name] = dst
+        source_ids = wp.array(source_worlds, dtype=wp.int32, device=self.model.device)
+        target_ids = wp.array(target_worlds, dtype=wp.int32, device=self.model.device)
+        status = self._mujoco_warp.copy_worlds(
+            source.mjw_model, source.mjw_data, self.mjw_model, self.mjw_data, source_ids, target_ids
+        )
+        _copy_world_arrays(arrays, source_ids, target_ids, status)
+        for name, value in snapshots.items():
+            setattr(self, name, value)
+        self._replication_pristine = False
+        return status
 
     @contextmanager
     def _scoped_deterministic_config(self):
@@ -4337,6 +4569,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         """
         if state is None:
             raise ValueError("'state' argument is required.")
+        self._replication_pristine = False
 
         world_mask = self._normalize_reset_world_mask(world_mask)
         world_count = self.model.world_count
@@ -4472,6 +4705,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         policies = {self.SleepPolicy.ALLOWED: 2, self.SleepPolicy.NEVER: 1, self.SleepPolicy.ALWAYS: 6}
         if policy not in policies:
             raise ValueError("Runtime sleep policy must be ALLOWED, NEVER, or ALWAYS.")
+        self._replication_pristine = False
         self._sleep_tree_changed.zero_()
         wp.launch(
             select_sleep_trees_kernel,
@@ -4817,6 +5051,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         The mask follows :meth:`reset` and controls wake scope. Property arrays
         are synchronized in full; callers must restrict their writes to the selected worlds.
         """
+        if not self._initial_model_sync:
+            self._replication_pristine = False
         world_mask = self._normalize_reset_world_mask(world_mask)
         if self.use_mujoco_cpu:
             self._notify_model_changed(flags, world_mask)
@@ -7742,6 +7978,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
 
             # Create mjc_geom_to_newton_shape: MuJoCo[world, geom] -> Newton shape
             self.mjc_geom_to_newton_shape = wp.full((nworld, self.mj_model.ngeom), -1, dtype=wp.int32)
+            self._replication_offsets["mjc_geom_to_newton_shape"] = self._shapes_per_world
 
             if self.mjw_model.geom_pos.size:
                 wp.launch(
@@ -7787,6 +8024,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     body_to_newton_template[mjc_body] = newton_body % bodies_per_world
             mjc_body_to_newton_np = self._tile_world_mapping(body_to_newton_template, nworld, bodies_per_world)
             self.mjc_body_to_newton = wp.array(mjc_body_to_newton_np, dtype=wp.int32)
+            self._replication_offsets["mjc_body_to_newton"] = bodies_per_world
             if self.enable_sleeping:
                 body_sleep_index = np.full((model.body_count, 2), -1, dtype=np.int32)
                 for worldid, mjbody in np.ndindex(mjc_body_to_newton_np.shape):
@@ -7794,6 +8032,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     if bodyid >= 0:
                         body_sleep_index[bodyid] = (worldid, self.mj_model.body_treeid[mjbody])
                 self._body_sleep_index = wp.array(body_sleep_index, dtype=wp.vec2i)
+                self._replication_offsets["_body_sleep_index"] = 1
 
             # Common variables for mapping creation
             njnt = self.mj_model.njnt
@@ -7807,6 +8046,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             dof_counts = joint_dof_dim[:, 0] + joint_dof_dim[:, 1]
             newton_dof_to_body_np = np.repeat(joint_child, dof_counts)
             self.newton_dof_to_body = wp.array(newton_dof_to_body_np, dtype=wp.int32)
+            self._replication_offsets["newton_dof_to_body"] = bodies_per_world
 
             # Map each Newton body to the qd_start of its free/DISTANCE joint (or -1).
             # Use selected_joints as the template and tile offsets across worlds.
@@ -7825,6 +8065,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 body_free_qd_start_np[body_indices] = qd_starts
 
             self.body_free_qd_start = wp.array(body_free_qd_start_np, dtype=wp.int32)
+            self._replication_offsets["body_free_qd_start"] = dofs_per_world
 
             # Create mjc_mocap_to_newton_jnt: MuJoCo[world, mocap] -> Newton joint index.
             # These mocap bodies are Newton roots attached to world by a
@@ -7850,6 +8091,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     mocap_to_newton_jnt_template, nworld, joints_per_world
                 )
                 self.mjc_mocap_to_newton_jnt = wp.array(mjc_mocap_to_newton_jnt_np, dtype=wp.int32)
+                self._replication_offsets["mjc_mocap_to_newton_jnt"] = joints_per_world
             else:
                 self.mjc_mocap_to_newton_jnt = None
 
@@ -7870,6 +8112,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                             break
             mjc_jnt_to_newton_jnt_np = self._tile_world_mapping(jnt_to_newton_jnt_template, nworld, joints_per_world)
             self.mjc_jnt_to_newton_jnt = wp.array(mjc_jnt_to_newton_jnt_np, dtype=wp.int32)
+            self._replication_offsets["mjc_jnt_to_newton_jnt"] = joints_per_world
 
             # Create mjc_jnt_to_newton_dof: MuJoCo[world, joint] -> Newton DOF start
             # joint_mjc_dof_start[template_joint] -> mjc_dof_start
@@ -7880,6 +8123,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     jnt_to_newton_dof_template[mjc_jnt] = template_dof
             mjc_jnt_to_newton_dof_np = self._tile_world_mapping(jnt_to_newton_dof_template, nworld, dofs_per_world)
             self.mjc_jnt_to_newton_dof = wp.array(mjc_jnt_to_newton_dof_np, dtype=wp.int32)
+            self._replication_offsets["mjc_jnt_to_newton_dof"] = dofs_per_world
 
             # Create mjc_dof_to_newton_dof: MuJoCo[world, dof] -> Newton DOF
             nv = self.mj_model.nv  # Number of DOFs in MuJoCo
@@ -7896,6 +8140,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                         dof_to_newton_dof_template[mjc_dof] = template_newton_dof
             mjc_dof_to_newton_dof_np = self._tile_world_mapping(dof_to_newton_dof_template, nworld, dofs_per_world)
             self.mjc_dof_to_newton_dof = wp.array(mjc_dof_to_newton_dof_np, dtype=wp.int32)
+            self._replication_offsets["mjc_dof_to_newton_dof"] = dofs_per_world
 
             # Create mjc_eq_to_newton_eq: MuJoCo[world, eq] -> Newton equality constraint
             # selected_constraints[idx] is the Newton template constraint index
@@ -7912,6 +8157,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 mjc_eq_to_newton_jnt_np[:, mjc_eq] = world_offsets * joints_per_world + template_jnt
             self.mjc_eq_to_newton_eq = wp.array(mjc_eq_to_newton_eq_np, dtype=wp.int32)
             self.mjc_eq_to_newton_jnt = wp.array(mjc_eq_to_newton_jnt_np, dtype=wp.int32)
+            self._replication_offsets["mjc_eq_to_newton_eq"] = eq_constraints_per_world
+            self._replication_offsets["mjc_eq_to_newton_jnt"] = joints_per_world
 
             # Build jnt_eq_anchor1 and jnt_eq_anchor1_has_axis_offset per [world, eq]
             # for joint-synthesized CONNECT constraints.
@@ -7923,6 +8170,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 jnt_eq_anchor1_has_axis_offset_np[:, mjc_eq_id] = int(has_offset)
             self.jnt_eq_anchor1 = wp.array(jnt_eq_anchor1_np, dtype=wp.vec3)
             self.jnt_eq_anchor1_has_axis_offset = wp.array(jnt_eq_anchor1_has_axis_offset_np, dtype=wp.int32)
+            self._replication_offsets["jnt_eq_anchor1"] = 0
+            self._replication_offsets["jnt_eq_anchor1_has_axis_offset"] = 0
 
             # Ensure no eq is claimed by both the regular and joint-connect paths.
             assert not np.any((mjc_eq_to_newton_eq_np >= 0) & (mjc_eq_to_newton_jnt_np >= 0)), (
@@ -7940,6 +8189,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 template_mimic = newton_mimic % mimic_per_world if mimic_per_world > 0 else newton_mimic
                 mjc_eq_to_newton_mimic_np[:, mjc_eq] = world_offsets * mimic_per_world + template_mimic
             self.mjc_eq_to_newton_mimic = wp.array(mjc_eq_to_newton_mimic_np, dtype=wp.int32)
+            self._replication_offsets["mjc_eq_to_newton_mimic"] = mimic_per_world
 
             mjc_eq_to_newton_joint_mimic_np = np.full((nworld, neq), -1, dtype=np.int32)
             for mjc_eq, newton_joint in mjc_eq_to_newton_joint_mimic_dict.items():
@@ -7950,6 +8200,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 mjc_eq_to_newton_joint_mimic_np,
                 dtype=wp.int32,
             )
+            self._replication_offsets["mjc_eq_to_newton_joint_mimic"] = joints_per_world
 
             # Create mjc_tendon_to_newton_tendon: MuJoCo[world, tendon] -> Newton tendon
             # selected_tendons[idx] is the Newton template tendon index
@@ -7968,6 +8219,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     template_tendon = newton_tendon % tendons_per_world if tendons_per_world > 0 else newton_tendon
                     mjc_tendon_to_newton_tendon_np[:, mjc_tendon] = world_offsets * tendons_per_world + template_tendon
                 self.mjc_tendon_to_newton_tendon = wp.array(mjc_tendon_to_newton_tendon_np, dtype=wp.int32)
+                self._replication_offsets["mjc_tendon_to_newton_tendon"] = tendons_per_world
 
             if separate_worlds:
                 nworld = model.world_count
@@ -8093,6 +8345,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     dtype=wp.int32,
                     device=self.model.device,
                 )
+                self._replication_offsets["_sleep_qpos"] = 0
+                self._replication_offsets["_sleep_tree_changed"] = 0
 
             if not self.use_mujoco_cpu:
                 if self._deterministic != wp.DeterministicMode.NOT_GUARANTEED:
@@ -8885,6 +9139,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self.connect_constraint_q_rel, self.connect_constraint_t_rel = (
                 SolverMuJoCo._compute_connect_constraint_rel_xform_at_qref(self.model, ref_body_q)
             )
+            self._replication_offsets["connect_constraint_q_rel"] = 0
+            self._replication_offsets["connect_constraint_t_rel"] = 0
             if self.has_jnt_connect_constraints:
                 self.jnt_connect_constraint_q_rel, self.jnt_connect_constraint_t_rel = (
                     SolverMuJoCo._compute_jnt_connect_constraint_rel_xform_at_qref(
@@ -8894,6 +9150,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                         ref_body_q,
                     )
                 )
+                self._replication_offsets["jnt_connect_constraint_q_rel"] = 0
+                self._replication_offsets["jnt_connect_constraint_t_rel"] = 0
         # connect_constraint_q_rel is guaranteed non-None when update_anchors
         # is True because _convert_to_mjc calls notify_model_changed(ALL),
         # which includes JOINT_DOF_PROPERTIES and therefore always computes
@@ -9166,6 +9424,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         joint_limit_ke_np = self.model.joint_limit_ke.numpy()
         joint_limit_kd_np = self.model.joint_limit_kd.numpy()
         solref_mode_np = joint_limit_solref_mode.numpy() if joint_limit_solref_mode is not None else None
+        for name in ("_joint_limit_ke_snapshot", "_joint_limit_kd_snapshot", "_solreflimit_mode_snapshot"):
+            snapshot = getattr(self, name)
+            if snapshot is not None and snapshot.ndim > 1:
+                setattr(self, name, snapshot.reshape(-1))
 
         if (
             solref_mode_np is not None

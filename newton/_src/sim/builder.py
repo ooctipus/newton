@@ -13955,6 +13955,18 @@ class ModelBuilder:
             m.joint_dof_world_start = wp.array(self.joint_dof_world_start, dtype=wp.int32)
             m.joint_coord_world_start = wp.array(self.joint_coord_world_start, dtype=wp.int32)
             m.joint_constraint_world_start = wp.array(self.joint_constraint_world_start, dtype=wp.int32)
+            # Preserve this finalized layout invariant so prepared replication
+            # can reject global entities without reading device arrays back.
+            m._has_global_entities = any(
+                starts[0] != 0 or starts[-2] != starts[-1]
+                for starts in (
+                    self.particle_world_start,
+                    self.body_world_start,
+                    self.shape_world_start,
+                    self.joint_world_start,
+                    self.articulation_world_start,
+                )
+            ) or any(world < 0 for world in self.constraint_mimic_world)
 
             # ---------------------
             # counts
