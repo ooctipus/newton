@@ -293,6 +293,184 @@ def test_plain_replication_fallback_releases_source_plan(test, device):
     np.testing.assert_array_equal(next_replica.body_mass.numpy(), np.tile(original, 4))
 
 
+def test_world_transfer_packed_bytes(test, device):
+    """Preserve exact mixed-type rows and reference rebasing with a bounded launch count."""
+    records, expected, snapshots = [], [], []
+    source_indices, target_indices = [2, 0], [1, 4]
+    for dtype, scalar, components, width in (
+        (wp.float32, np.float32, (), 1),
+        (wp.float64, np.float64, (), 3),
+        (wp.uint64, np.uint64, (), 1),
+        (wp.uint16, np.uint16, (), 3),
+        (wp.uint8, np.uint8, (), 3),
+        (wp.bool, np.bool_, (), 3),
+        (wp.vec3, np.float32, (3,), 1),
+        (wp.quat, np.float32, (4,), 3),
+        (wp.transform, np.float32, (7,), 1),
+        (wp.mat33, np.float32, (3, 3), 1),
+        (wp.mat33d, np.float64, (3, 3), 1),
+    ):
+        shape = (3 * width, *components)
+        count = int(np.prod(shape))
+        if scalar in (np.float32, np.float64):
+            bits = (
+                [0, 0x80000000, 0x7FC00042, 0xFF800000, 0x3F800000]
+                if scalar == np.float32
+                else [0, 2**63, 0x7FF8000000000042, 0xFFF0000000000000, 0x3FF0000000000000]
+            )
+            values = np.resize(np.array(bits, dtype=np.uint32 if scalar == np.float32 else np.uint64), count).view(
+                scalar
+            )
+        else:
+            values = (np.arange(count) % 2).astype(scalar) if scalar == np.bool_ else np.arange(count).astype(scalar)
+        src = wp.array(values.reshape(shape), dtype=dtype, device=device)
+        dst = wp.zeros((5 * width,), dtype=dtype, device=device)
+        if scalar != np.bool_:
+            dst.fill_(dtype(7))
+        before = dst.numpy().copy()
+        wanted = before.view(np.uint8).reshape(5, -1).copy()
+        wanted[target_indices] = src.numpy().view(np.uint8).reshape(3, -1)[source_indices]
+        records.append((src, dst, None, width))
+        expected.append(wanted)
+        snapshots.append((src.numpy().copy(), before))
+    source_refs = wp.array([-1, 2, 4, 7, -1, 1], dtype=int, device=device)
+    target_refs = wp.full(10, -7, dtype=int, device=device)
+    records.append((source_refs, target_refs, 11, 2))
+    reference_expected = target_refs.numpy().reshape(5, 2).copy()
+    for source, target in zip(source_indices, target_indices, strict=True):
+        row = source_refs.numpy().reshape(3, 2)[source].copy()
+        row[row >= 0] += (target - source) * 11
+        reference_expected[target] = row
+    # Strided index vectors are supported by the existing transfer contract.
+    source_ids = wp.array([2, -1, 0, -1], dtype=int, device=device)[::2]
+    target_ids = wp.array([1, -1, 4, -1], dtype=int, device=device)[::2]
+    for code in (1, 2, 4, 0):
+        status = wp.array([code], dtype=int, device=device)
+        mjwarp_owners = object()
+        status._world_copy_storage = mjwarp_owners
+        with (
+            mock.patch.object(wp, "launch", wraps=wp.launch) as launch,
+            mock.patch.object(wp.array, "numpy", side_effect=AssertionError("device readback")),
+        ):
+            model_replication._copy_world_arrays(records, source_ids, target_ids, status)
+        test.assertIs(status._world_copy_storage, mjwarp_owners)
+        test.assertLessEqual(launch.call_count, 3, "Plain rows must not launch once per field")
+        for index, ((src, dst, _, _), (source_before, target_before)) in enumerate(
+            zip(records[:-1], snapshots, strict=True)
+        ):
+            np.testing.assert_array_equal(src.numpy().view(np.uint8), source_before.view(np.uint8))
+            wanted = expected[index] if code == 0 else target_before.view(np.uint8).reshape(5, -1)
+            np.testing.assert_array_equal(dst.numpy().view(np.uint8).reshape(5, -1), wanted)
+        np.testing.assert_array_equal(target_refs.numpy().reshape(5, 2), reference_expected if code == 0 else -7)
+    with mock.patch.object(wp, "launch", side_effect=AssertionError("empty transfer launched")):
+        model_replication._copy_world_arrays(records, source_ids[:0], target_ids[:0], status)
+
+
+def test_world_transfer_alias_order(test, device):
+    """Preserve ordered writes when live control/state fields alias destination storage."""
+    a = wp.array(np.arange(6, dtype=np.float32), device=device)
+    b = wp.array(np.arange(6, dtype=np.float32) + 100, device=device)
+    target = wp.zeros(10, device=device)
+    source_ids = wp.array([2, 0], dtype=int, device=device)
+    target_ids = wp.array([1, 4], dtype=int, device=device)
+    status = wp.zeros(1, dtype=int, device=device)
+    with mock.patch.object(wp, "launch", wraps=wp.launch) as launch:
+        model_replication._copy_world_arrays(
+            [(a, target, None, 2), (b, target, None, 2)], source_ids, target_ids, status
+        )
+    test.assertEqual(launch.call_count, 2, "Overlapping destinations require the existing ordered path")
+    expected = np.zeros((5, 2), dtype=np.float32)
+    expected[[1, 4]] = [[104, 105], [100, 101]]
+    np.testing.assert_array_equal(target.numpy().reshape(5, 2), expected)
+
+
+def test_world_transfer_alias_dependencies(test, device):
+    """Preserve cross-field read-after-write dependencies across plain and reference rows."""
+    ids = wp.array([2, 0], dtype=int, device=device)
+    target_ids = wp.array([0, 2], dtype=int, device=device)
+    for first_offset, second_offset in ((None, None), (None, 3), (3, None)):
+        a = wp.array([-1, 2, 3, 4, 5, 6], dtype=int, device=device)
+        b = wp.array([10, 11, 12, 13, 14, 15], dtype=int, device=device)
+        c = wp.full(6, 23, dtype=int, device=device)
+        wanted_b, wanted_c = b.numpy().reshape(3, 2).copy(), c.numpy().reshape(3, 2).copy()
+        for source, target, offset in (
+            (a.numpy().reshape(3, 2), wanted_b, first_offset),
+            (wanted_b, wanted_c, second_offset),
+        ):
+            values = source[[2, 0]].copy()
+            if offset is not None:
+                delta = np.array([-2, 2])[:, None] * offset
+                values = np.where(values >= 0, values + delta, values)
+            target[[0, 2]] = values
+        model_replication._copy_world_arrays(
+            [(a, b, first_offset, 2), (b, c, second_offset, 2)],
+            ids,
+            target_ids,
+            wp.zeros(1, dtype=int, device=device),
+        )
+        np.testing.assert_array_equal(b.numpy().reshape(3, 2), wanted_b)
+        np.testing.assert_array_equal(c.numpy().reshape(3, 2), wanted_c)
+
+
+def test_world_transfer_packed_graph_lifetime(test, device):
+    """Replay live raw pointers with status gating after the caller drops temporary arrays."""
+
+    def record():
+        source = wp.array(np.arange(9, dtype=np.float32), device=device)
+        target = wp.zeros(15, device=device)
+        source_ids = wp.array([2, 0], dtype=int, device=device)
+        target_ids = wp.array([1, 4], dtype=int, device=device)
+        status = wp.zeros(1, dtype=int, device=device)
+        rows = [(source, target, None, 3)]
+        model_replication._copy_world_arrays(rows, source_ids, target_ids, status)
+        with wp.ScopedCapture(device=device) as capture:
+            model_replication._copy_world_arrays(rows, source_ids, target_ids, status)
+        return capture.graph, status, weakref.ref(source), weakref.ref(target)
+
+    graph, status, source_ref, target_ref = record()
+    gc.collect()
+    test.assertIsNotNone(source_ref())
+    test.assertIsNotNone(target_ref())
+    source_ref().fill_(17.0)
+    target_ref().fill_(5.0)
+    wp.capture_launch(graph)
+    expected = np.full((5, 3), 5.0, dtype=np.float32)
+    expected[[1, 4]] = 17.0
+    np.testing.assert_array_equal(target_ref().numpy().reshape(5, 3), expected)
+    status.fill_(1)
+    source_ref().fill_(27.0)
+    wp.capture_launch(graph)
+    np.testing.assert_array_equal(target_ref().numpy().reshape(5, 3), expected)
+
+
+def test_world_transfer_packed_lifetime(test, device):
+    """Retain asynchronous raw-pointer dependencies on status without a model or count cache."""
+
+    def transfer():
+        src = wp.array(np.arange(9, dtype=np.float32), device=device)
+        dst = wp.zeros(15, device=device)
+        status = wp.zeros(1, dtype=int, device=device)
+        model_replication._copy_world_arrays(
+            [(src, dst, None, 3)],
+            wp.array([2, 0], dtype=int, device=device),
+            wp.array([1, 4], dtype=int, device=device),
+            status,
+        )
+        return status, weakref.ref(src), weakref.ref(dst)
+
+    status, source_ref, target_ref = transfer()
+    gc.collect()
+    test.assertIsNotNone(source_ref())
+    test.assertIsNotNone(target_ref())
+    expected = np.zeros((5, 3), dtype=np.float32)
+    expected[[1, 4]] = np.array([[6, 7, 8], [0, 1, 2]])
+    np.testing.assert_array_equal(target_ref().numpy().reshape(5, 3), expected)
+    del status
+    gc.collect()
+    test.assertIsNone(source_ref())
+    test.assertIsNone(target_ref())
+
+
 class TestModelReplication(unittest.TestCase):
     def test_transfer_layout_validation_precedes_device_work(self):
         """Reject a strided registered world field before launching any transfer kernel."""
@@ -475,8 +653,21 @@ class TestModelReplication(unittest.TestCase):
 
 
 for device in get_test_devices():
+    for function in (
+        test_world_transfer_packed_bytes,
+        test_world_transfer_packed_lifetime,
+        test_world_transfer_alias_order,
+        test_world_transfer_alias_dependencies,
+    ):
+        add_function_test(TestModelReplication, function.__name__, function, devices=[device])
     add_function_test(TestModelReplication, "test_prepared_replication", test_prepared_replication, devices=[device])
     if device.is_cuda:
+        add_function_test(
+            TestModelReplication,
+            "test_world_transfer_packed_graph_lifetime",
+            test_world_transfer_packed_graph_lifetime,
+            devices=[device],
+        )
         for function in (
             test_plain_replication_storage,
             test_plain_replication_lifetime,
