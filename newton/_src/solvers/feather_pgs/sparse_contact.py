@@ -17,6 +17,7 @@ from .kernels import (
     mixed_contact_restitution,
     prescribed_relative_contact_target,
 )
+from .sparse_mass_matrix import _SparseRowSupport
 
 
 @wp.struct
@@ -46,7 +47,12 @@ class SparseContactRows:
 
 @cache
 def _get_sparse_contact_response_kernel(
-    dof_count: int, *, lanes_per_contact: int = 8, warps_per_block: int = 4, prepare_rows: bool = False
+    dof_count: int,
+    *,
+    lanes_per_contact: int = 8,
+    warps_per_block: int = 4,
+    prepare_rows: bool = False,
+    use_support_table: bool = False,
 ) -> wp.Kernel:
     """Project contact rows with a lane group per contact and no global Jacobian.
 
@@ -57,6 +63,10 @@ def _get_sparse_contact_response_kernel(
     With ``prepare_rows``, the geometry also produces solver metadata, diagonal
     CFM, bias and restitution. Only normal rows retain the scratch metadata
     needed by restitution; the caller must not run separate row passes.
+
+    ``use_support_table`` publishes one topology class per row instead of
+    repeating its DOF indices. The caller admits one factored articulation
+    per world, at offset zero, with no physical free-body response.
 
     All input/output arrays must be contiguous for the native flat accesses.
     Launch total_num_workers * lanes_per_contact threads in blocks of
@@ -167,8 +177,8 @@ def _get_sparse_contact_response_kernel(
     unsigned long long mask_a = 0, mask_b = 0;
     if (body_a >= 0 && art_a >= 0) mask_a = body_dof_mask.data[body_a];
     if (body_b >= 0 && art_b >= 0) mask_b = body_dof_mask.data[body_b];
-    const int row_offset = world * row_dof.shape[1] + slot;
-    const int support_capacity = row_dof.shape[2];
+    const int row_offset = world * row_factor.shape[1] + slot;
+    const int support_capacity = row_factor.shape[2];
     int count = 0;
     auto norm = wp::vec3(0.0f);
     auto incident = wp::vec3(0.0f);
@@ -234,7 +244,7 @@ def _get_sparse_contact_response_kernel(
                     if (row >= row_count) continue;
                     const int response_offset = (row_offset + row) * support_capacity;
                     const float value = jacobian[row * $PLANE + node];
-                    row_dof.data[response_offset + count + node] = offset + node;
+                    if (!$SUPPORT_TABLE) row_dof.data[response_offset + count + node] = offset + node;
                     row_factor.data[response_offset + count + node] = value;
                     row_free_response.data[(row_offset + row) * row_free_response.shape[2] + count + node] = response.c[row];
                     norm.c[row] += value * response.c[row];
@@ -291,7 +301,7 @@ def _get_sparse_contact_response_kernel(
                 for (int row = 0; row < 3; ++row) {
                     if (row >= row_count) continue;
                     const int response_offset = (row_offset + row) * support_capacity;
-                    row_dof.data[response_offset + index] = offset + node;
+                    if (!$SUPPORT_TABLE) row_dof.data[response_offset + index] = offset + node;
                     row_factor.data[response_offset + index] = value.c[row];
                     norm.c[row] += value.c[row] * value.c[row];
                 }
@@ -308,7 +318,7 @@ def _get_sparse_contact_response_kernel(
         if (row >= row_count) continue;
         const int response_offset = (row_offset + row) * support_capacity;
         for (int index = count + lane; index < support_capacity; index += stride) {
-            row_dof.data[response_offset + index] = -1;
+            if (!$SUPPORT_TABLE) row_dof.data[response_offset + index] = -1;
             row_factor.data[response_offset + index] = 0.0f;
         }
 #if defined(__CUDA_ARCH__)
@@ -318,6 +328,14 @@ def _get_sparse_contact_response_kernel(
         }
 #endif
         if (lane == 0) {
+            if ($SUPPORT_TABLE) {
+                const int class_a = mask_a != 0ull && art_a >= 0 && articulation_response_dof_count.data[art_a] > 0
+                    ? support.body_class.data[body_a] : 0;
+                const int class_b = mask_b != 0ull && art_b >= 0 && articulation_response_dof_count.data[art_b] > 0
+                    ? support.body_class.data[body_b] : 0;
+                support.row_class.data[row_offset + row] = support.pair_class.data[
+                    class_a * support.pair_class.shape[1] + class_b];
+            }
             row_incident.data[row_offset + row] = incident.c[row];
             diagonal.data[row_offset + row] = norm.c[row] + cfm;
         }
@@ -334,6 +352,7 @@ def _get_sparse_contact_response_kernel(
         .replace("$PLANE", str(scratch_size))
         .replace("$JACOBIAN", str(max(n, 6)))
         .replace("$N", str(n))
+        .replace("$SUPPORT_TABLE", str(bool(use_support_table)).lower())
     )
 
     @wp.func_native(snippet)
@@ -367,6 +386,7 @@ def _get_sparse_contact_response_kernel(
         row_free_response: wp.array3d[float],
         row_incident: wp.array2d[float],
         diagonal: wp.array2d[float],
+        support: _SparseRowSupport,
     ): ...
 
     def contact_kernel(
@@ -410,6 +430,7 @@ def _get_sparse_contact_response_kernel(
         row_free_response: wp.array3d[float],
         row_incident: wp.array2d[float],
         diagonal: wp.array2d[float],
+        support: _SparseRowSupport,
     ):
         tid = wp.tid()
         lane = tid % lanes
@@ -583,6 +604,7 @@ def _get_sparse_contact_response_kernel(
                 row_free_response,
                 row_incident,
                 diagonal,
+                support,
             )
             if wp.static(prepare_rows):
                 if lane == 0:
@@ -599,6 +621,8 @@ def _get_sparse_contact_response_kernel(
     contact_kernel.__name__ = f"populate_sparse_contact_response_{n}_{lanes}_{warps}"
     if prepare_rows:
         contact_kernel.__name__ += "_prepared"
+    if use_support_table:
+        contact_kernel.__name__ += "_support_table"
     contact_kernel.__qualname__ = contact_kernel.__name__
     return wp.kernel(enable_backward=False, module="unique")(contact_kernel)
 
@@ -650,7 +674,7 @@ def finalize_sparse_joint_limit_rows(
     const int start = articulation_dof_start.data[art];
     const int dofs = inverse_permutation.shape[0];
     const int capacity = row_type.shape[1];
-    const int support_capacity = row_dof.shape[2];
+    const int support_capacity = row_factor.shape[2];
     const int factor_base = group * inverse_factor.shape[1];
     for (int base = 0; base < 2 * dofs; base += width) {
         const int candidate = base + lane;
@@ -708,19 +732,22 @@ def finalize_sparse_joint_limit_rows(
                 const int index = bit_count(support_mask & (bit - 1ull));
                 const int entry = factor_lookup.data[node * dofs + column];
                 const float value = entry >= 0 ? sign * inverse_factor.data[factor_base + entry] : 0.0f;
-                row_dof.data[response_offset + index] = articulation_world_dof_offset.data[art] + node;
+                if (!support.enabled)
+                    row_dof.data[response_offset + index] = articulation_world_dof_offset.data[art] + node;
                 row_factor.data[response_offset + index] = value;
                 norm += value * value;
             }
             const int support_count = bit_count(support_mask);
             for (int index = support_count + lane; index < support_capacity; index += width) {
-                row_dof.data[response_offset + index] = -1;
+                if (!support.enabled) row_dof.data[response_offset + index] = -1;
                 row_factor.data[response_offset + index] = 0.0f;
             }
 #if defined(__CUDA_ARCH__)
             for (int shift = 16; shift > 0; shift >>= 1) norm += __shfl_down_sync(MASK, norm, shift);
 #endif
             if (lane == 0) {
+                if (support.enabled)
+                    support.row_class.data[row_offset] = support.limit_class.data[selected_dof];
                 row_incident.data[row_offset] = sign * v_hat.data[start + selected_dof];
                 diagonal.data[row_offset] = norm;
                 row_type.data[row_offset] = $LIMIT_TYPE;
@@ -767,6 +794,7 @@ def _build_sparse_joint_limit_rows(
     row_factor: wp.array3d[float],
     row_incident: wp.array2d[float],
     diagonal: wp.array2d[float],
+    support: _SparseRowSupport,
 ): ...
 
 
@@ -800,6 +828,7 @@ def build_sparse_joint_limit_rows(
     row_factor: wp.array3d[float],
     row_incident: wp.array2d[float],
     diagonal: wp.array2d[float],
+    support: _SparseRowSupport,
 ):
     """Build ordered limit rows and sparse responses with one warp per articulation.
 
@@ -837,6 +866,7 @@ def build_sparse_joint_limit_rows(
         row_factor,
         row_incident,
         diagonal,
+        support,
     )
 
 

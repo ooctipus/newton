@@ -9,6 +9,7 @@ import warp as wp
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import (
     _get_crba_sparse_factor_kernel,
     _SparseMassMatrixPlan,
+    _SparseRowSupportPlan,
     solve_sparse_mass_matrix,
 )
 
@@ -35,6 +36,36 @@ def _branched_humanoid_topology():
 
 
 class TestSparseMassMatrix(unittest.TestCase):
+    def test_row_support_catalogue(self):
+        """Preserve ordered endpoint unions and full multi-DOF limit support."""
+        for parents, counts in (([-1, 0, 0, 1], [3, 2, 1, 0]), ([-1], [64])):
+            plan = _SparseMassMatrixPlan.build(parents, counts)
+            body_masks = np.concatenate((np.zeros(1, dtype=np.uint64), plan.joint_ancestor_mask))
+            support = _SparseRowSupportPlan.build(plan, body_masks, max_row_dofs=plan.dof_count)
+            self.assertIsNotNone(support)
+            self.assertEqual(support.body_class[0], 0)
+            for first, first_mask in enumerate(body_masks):
+                for second, second_mask in enumerate(body_masks):
+                    index = support.pair_class[support.body_class[first], support.body_class[second]]
+                    mask = int(first_mask | second_mask)
+                    expected = [dof for dof in range(plan.dof_count) if mask & (1 << dof)]
+                    expected += [-1] * (plan.dof_count - len(expected))
+                    np.testing.assert_array_equal(support.class_dof[index], expected)
+            for dof, mask in enumerate(plan.ancestor_mask):
+                expected = [i for i in range(plan.dof_count) if int(mask) & (1 << i)]
+                expected += [-1] * (plan.dof_count - len(expected))
+                np.testing.assert_array_equal(support.class_dof[support.limit_class[dof]], expected)
+        plan = _SparseMassMatrixPlan.build([-1, 0, 0, 1], [3, 2, 1, 0])
+        support = _SparseRowSupportPlan.build(plan, plan.joint_ancestor_mask, max_row_dofs=6)
+        np.testing.assert_array_equal(support.class_dof[support.limit_class[0]], [3, 4, 5, -1, -1, -1])
+        # Structurally zero coefficients inside a joint block must retain their slots.
+        np.testing.assert_array_equal(np.flatnonzero(plan.lookup[:, plan.inverse_permutation[0]] >= 0), [5])
+
+    def test_row_support_rejects_oversized_union(self):
+        """Decline a catalogue that would truncate a non-colliding body's union."""
+        plan = _SparseMassMatrixPlan.build([-1, 0, 0], [6, 3, 3])
+        self.assertIsNone(_SparseRowSupportPlan.build(plan, plan.joint_ancestor_mask, max_row_dofs=9))
+
     def test_branch_groups_follow_factor_structure(self):
         """Separate sibling subtrees without splitting nested or multi-DOF joints."""
         for branch_count in (2, 3, 4):

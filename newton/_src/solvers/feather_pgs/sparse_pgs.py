@@ -14,6 +14,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
+from .sparse_mass_matrix import _SparseRowSupport
 
 
 @cache
@@ -26,6 +27,7 @@ def _get_pgs_solve_sparse_kernel(
     free_row_dofs: int = 0,
     active_rows: bool = False,
     branch_groups: tuple[int, ...] = (),
+    use_support_table: bool = False,
 ) -> wp.Kernel:
     """Build a CUDA sweep over factored articulations and physical free bodies.
 
@@ -45,6 +47,10 @@ def _get_pgs_solve_sparse_kernel(
     then retains their ordered GS updates. Newly violated zero rows wait until
     the next sweep; mixed responses and linked patches retain the full sweep.
 
+    ``use_support_table`` reads identical padded indices from a shared
+    topology table. It requires a single factored articulation per world,
+    at offset zero, with no physical free-body response.
+
     ``branch_groups`` experimentally partitions factor DOFs into two to four
     branches, with -1 identifying the shared separator. Its first sweep stays
     serial; later sweeps retain each branch's own separator response and combine
@@ -62,6 +68,13 @@ def _get_pgs_solve_sparse_kernel(
     P = int(free_row_dofs)
     if M <= 0 or D <= 0 or S <= 0 or S > D or F < 0 or P < 0 or P > S:
         raise ValueError("sparse PGS requires positive capacities and max_row_dofs <= max_world_dofs")
+    if use_support_table and (F or P or D > 64):
+        raise ValueError("sparse support tables require at most 64 factored DOFs and no free rows")
+    index_read = (
+        f"support.class_dof.data[support.row_class.data[offset + row] * {S} + entry]"
+        if use_support_table
+        else f"row_dof.data[row_base + row * {S} + entry]"
+    )
     parallel_branches = bool(branch_groups)
     if parallel_branches:
         groups = set(branch_groups)
@@ -121,7 +134,7 @@ def _get_pgs_solve_sparse_kernel(
                         if (iteration != 0) {{
                             #pragma unroll
                             for (int entry = 0; entry < {S}; ++entry) {{
-                                const int index = row_dof.data[row_base + row * {S} + entry];
+                                const int index = {index_read};
                                 if (index >= 0)
                                     dot += row_factor.data[row_base + row * {S} + entry] * {scan_delta}[index];
                             }}
@@ -371,7 +384,7 @@ def _get_pgs_solve_sparse_kernel(
             #pragma unroll
             for (int q = 0; q < {Q}; ++q) {{
                 const int entry = lane + q * {L};
-                const int index = entry < {S} ? row_dof.data[row_base + row * {S} + entry] : -1;
+                const int index = entry < {S} ? {index_read} : -1;
                 const float value = index >= 0 ? row_factor.data[row_base + row * {S} + entry] : 0.0f;
                 const float sibling_value = friction && index >= 0
                     ? row_factor.data[row_base + sibling * {S} + entry] : 0.0f;
@@ -488,7 +501,7 @@ def _get_pgs_solve_sparse_kernel(
                 atomicOr(&serial_flags, 3);
             #pragma unroll
             for (int entry = 0; entry < {S}; ++entry) {{
-                const int index = row_dof.data[row_base + row * {S} + entry];
+                const int index = {index_read};
                 if (index >= 0) {{
                     const int next = sparse_pgs_branch_group(index);
                     if (next >= 0) {{
@@ -601,6 +614,7 @@ def _get_pgs_solve_sparse_kernel(
         friction_start_iteration: int,
         iteration_offset: int,
         factor_velocity_delta: wp.array2d[float],
+        support: _SparseRowSupport,
     ): ...
 
     def solve(
@@ -632,6 +646,7 @@ def _get_pgs_solve_sparse_kernel(
         friction_start_iteration: int,
         iteration_offset: int,
         factor_velocity_delta: wp.array2d[float],
+        support: _SparseRowSupport,
     ):
         block, lane = wp.tid()
         world = block * W + lane // 32
@@ -665,11 +680,14 @@ def _get_pgs_solve_sparse_kernel(
                 friction_start_iteration,
                 iteration_offset,
                 factor_velocity_delta,
+                support,
             )
 
     suffix = "_active" if active_rows else ""
     if parallel_branches:
         suffix += "_branches"
+    if use_support_table:
+        suffix += "_support_table"
     solve.__name__ = f"pgs_solve_sparse_{M}_{D}_{S}_{F}_{P}{suffix}"
     solve.__qualname__ = solve.__name__
     return wp.kernel(enable_backward=False, module="unique")(solve)

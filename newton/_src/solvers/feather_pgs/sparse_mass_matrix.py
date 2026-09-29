@@ -35,6 +35,66 @@ class _SparseMassMatrixIndices:
     factor_level_entries: wp.array[int]
 
 
+@wp.struct
+class _SparseRowSupport:
+    """Model-owned support patterns and each live row's pattern index."""
+
+    enabled: int
+    body_class: wp.array[int]
+    pair_class: wp.array2d[int]
+    class_dof: wp.array2d[int]
+    row_class: wp.array2d[int]
+    limit_class: wp.array[int]
+
+
+@dataclass(frozen=True, eq=False)
+class _SparseRowSupportPlan:
+    """Reuse structural endpoint unions without per-row index vectors.
+
+    Coordinates belong to one responding articulation at world offset zero.
+    All joint-block entries remain present, even when a coefficient is zero.
+    """
+
+    body_class: np.ndarray
+    pair_class: np.ndarray
+    class_dof: np.ndarray
+    limit_class: np.ndarray
+
+    @classmethod
+    def build(cls, mass_plan, body_masks, *, max_row_dofs: int) -> "_SparseRowSupportPlan | None":
+        """Enumerate all endpoint unions and limit supports, or decline their width."""
+        body_masks = np.asarray(body_masks, dtype=np.uint64)
+        if body_masks.ndim != 1 or not 1 <= max_row_dofs <= mass_plan.dof_count:
+            raise ValueError("Sparse row supports require one-dimensional masks and a valid row width")
+        classes = np.unique(np.concatenate((np.zeros(1, dtype=np.uint64), body_masks)))
+        pairs = classes[:, None] | classes[None, :]
+        masks = np.unique(np.concatenate((pairs.ravel(), mass_plan.ancestor_mask)))
+        if any(int(mask).bit_count() > max_row_dofs for mask in masks):
+            return None
+        if any(int(mask) >> mass_plan.dof_count for mask in masks):
+            raise ValueError("Sparse row support exceeds the articulation coordinate range")
+        class_dof = np.full((len(masks), max_row_dofs), -1, dtype=np.int32)
+        for index, mask in enumerate(masks):
+            entries = [dof for dof in range(mass_plan.dof_count) if int(mask) & (1 << dof)]
+            class_dof[index, : len(entries)] = entries
+        return cls(
+            body_class=np.searchsorted(classes, body_masks).astype(np.int32),
+            pair_class=np.searchsorted(masks, pairs).astype(np.int32),
+            class_dof=class_dof,
+            # CSC factor support omits structural zeros inside multi-DOF joints.
+            limit_class=np.searchsorted(masks, mass_plan.ancestor_mask).astype(np.int32),
+        )
+
+    def to_device(self, world_count: int, max_constraints: int, device) -> _SparseRowSupport:
+        """Upload the catalogue and allocate only one support index per row."""
+        support = _SparseRowSupport()
+        support.enabled = 1
+        for name in ("body_class", "pair_class", "class_dof", "limit_class"):
+            setattr(support, name, wp.array(getattr(self, name), dtype=int, device=device))
+        support.row_class = wp.empty((world_count, max_constraints), dtype=int, device=device)
+        return support
+
+
 @dataclass(frozen=True, eq=False)
 class _SparseMassMatrixPlan:
     """Immutable sparsity for one articulation topology, independent of pose.

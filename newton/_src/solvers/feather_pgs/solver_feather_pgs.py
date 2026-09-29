@@ -239,6 +239,8 @@ from .sparse_contact import (
 from .sparse_mass_matrix import (
     _get_crba_sparse_factor_kernel,
     _SparseMassMatrixPlan,
+    _SparseRowSupport,
+    _SparseRowSupportPlan,
     solve_sparse_mass_matrix,
 )
 from .sparse_pgs import _get_pgs_solve_sparse_kernel
@@ -5037,6 +5039,7 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_prepare_contacts = False
         self._sparse_branch_groups = ()
         self._sparse_branch_count = 0
+        self._sparse_row_support = _SparseRowSupport()
         if not (
             self._kernel_overrides.get("sparse_mass_matrix", True)
             and model.device.is_cuda
@@ -5183,7 +5186,31 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_mass_matrix_status = wp.zeros(group_count, dtype=wp.int32, device=model.device)
         self._sparse_mass_matrix_scratch = wp.empty((group_count, size), dtype=wp.float32, device=model.device)
         shape = (self.world_count, self.dense_max_constraints, max_support)
-        self._sparse_row_dof = wp.empty(shape, dtype=wp.int32, device=model.device)
+        offsets = self.articulation_world_dof_offset.numpy()
+        if (
+            self._kernel_overrides.get("sparse_row_support", True)
+            and self._sparse_prepare_contacts
+            and not self._has_free_rigid_bodies
+            and np.all(articulated_counts == 1)
+            and size == self.max_world_dofs
+            and np.all(offsets[articulated] == 0)
+        ):
+            support_plan = _SparseRowSupportPlan.build(plan, body_masks, max_row_dofs=max_support)
+            if support_plan is not None:
+                table_bytes = sum(
+                    getattr(support_plan, name).nbytes
+                    for name in ("body_class", "pair_class", "class_dof", "limit_class")
+                )
+                table_bytes += 4 * self.world_count * self.dense_max_constraints
+                # Small batches with many support patterns can favor direct indices.
+                if table_bytes < 4 * int(np.prod(shape)):
+                    self._sparse_row_support = support_plan.to_device(
+                        self.world_count, self.dense_max_constraints, model.device
+                    )
+        # Unsupported mixed worlds retain explicit row indices and their existing kernels.
+        use_support_table = bool(self._sparse_row_support.enabled)
+        index_shape = (1, 1, 1) if use_support_table else shape
+        self._sparse_row_dof = wp.empty(index_shape, dtype=wp.int32, device=model.device)
         self._sparse_row_factor = wp.empty(shape, dtype=wp.float32, device=model.device)
         # Ordinary contacts have at most one free endpoint; free/free rows retain
         # their existing MF storage. Factor-coordinate responses alias the row.
@@ -5194,7 +5221,6 @@ class SolverFeatherPGS(SolverBase):
             (self.world_count, self.max_world_dofs), dtype=wp.float32, device=model.device
         )
         free_dof_mask = np.zeros((self.world_count, self.max_world_dofs), dtype=np.int32)
-        offsets = self.articulation_world_dof_offset.numpy()
         for art in np.flatnonzero(free_rigid & (response_dofs > 0)):
             world = self._model_plan.articulation_world[art]
             offset = offsets[art]
@@ -5206,7 +5232,10 @@ class SolverFeatherPGS(SolverBase):
         )
         self._sparse_contact_lanes = 8
         self._sparse_contact_response_kernel = _get_sparse_contact_response_kernel(
-            size, lanes_per_contact=self._sparse_contact_lanes, prepare_rows=self._sparse_prepare_contacts
+            size,
+            lanes_per_contact=self._sparse_contact_lanes,
+            prepare_rows=self._sparse_prepare_contacts,
+            use_support_table=use_support_table,
         )
         # Experimental block-Jacobi between branches changes finite-sweep
         # convergence. Keep it opt-in while qualifying loaded trajectories.
@@ -5236,6 +5265,7 @@ class SolverFeatherPGS(SolverBase):
             free_row_dofs=6 if self._has_free_rigid_bodies else 0,
             active_rows=active_rows,
             branch_groups=self._sparse_branch_groups,
+            use_support_table=use_support_table,
         )
 
     def _build_body_maps(self, model):
@@ -8290,7 +8320,7 @@ class SolverFeatherPGS(SolverBase):
                     int(friction_start_iteration),
                     int(iteration_offset),
                 ],
-                outputs=[self._sparse_factor_velocity_delta],
+                outputs=[self._sparse_factor_velocity_delta, self._sparse_row_support],
                 block_dim=32 if self._sparse_branch_count else 64,
                 device=self.model.device,
             )
@@ -13365,6 +13395,7 @@ class SolverFeatherPGS(SolverBase):
                             self._sparse_row_factor,
                             self._sparse_row_incident,
                             self.diag,
+                            self._sparse_row_support,
                         ],
                         block_dim=128,
                         device=model.device,
@@ -13759,6 +13790,7 @@ class SolverFeatherPGS(SolverBase):
                                 self._sparse_row_free_response,
                                 self._sparse_row_incident,
                                 self.diag,
+                                self._sparse_row_support,
                             ],
                             block_dim=128,
                             device=model.device,

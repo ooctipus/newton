@@ -16,6 +16,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
+from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
 from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel
 
 _SWEEP_CASES = ((0, 0, 1.0), (3, 1, 0.7), (3, 4, 1.2))
@@ -284,6 +285,14 @@ def _mixed_problem():
 
 
 class TestFeatherPGSSparsePGS(unittest.TestCase):
+    def test_support_table_factory(self):
+        """Build the same ordered solver with shared topology indices."""
+        kernel = _get_pgs_solve_sparse_kernel(16, 6, 4, active_rows=True, use_support_table=True)
+        self.assertIn("support_table", kernel.key)
+        for options in ({"mf_max_constraints": 1}, {"free_row_dofs": 1}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                _get_pgs_solve_sparse_kernel(16, 6, 4, use_support_table=True, **options)
+
     def test_branch_groups_require_supported_factor_coordinates(self):
         """Admit contiguous branch groups and reject unsupported solver layouts."""
         _get_pgs_solve_sparse_kernel(16, 6, 4, active_rows=True, branch_groups=(-1, -1, 0, 0, 1, 1))
@@ -312,7 +321,12 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
             ):
                 self._check_cuda_branch_sweeps(branches, separator, offset, branch_dofs, settings)
 
-    def _check_cuda_branch_sweeps(self, branches, separator, offset, branch_dofs, settings):
+    @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
+    def test_cuda_branch_support_tables(self):
+        """Classify branches and serial fallbacks using shared support indices."""
+        self._check_cuda_branch_sweeps(2, 2, 0, 3, _SWEEP_CASES[0], use_support_table=True)
+
+    def _check_cuda_branch_sweeps(self, branches, separator, offset, branch_dofs, settings, *, use_support_table=False):
         """Compare the new schedule with frozen global eligibility and exact local projection."""
         rows, bias, types, parents, mu, owners, groups = _branch_problem(
             branches, separator, offset=offset, branch_dofs=branch_dofs
@@ -402,14 +416,24 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
         initial_impulses = padded(seeds)
         impulses = wp.clone(initial_impulses)
         delta = wp.full((worlds, dofs), float("nan"), device=device)
-        kernel = _get_pgs_solve_sparse_kernel(capacity, dofs, support, active_rows=True, branch_groups=groups)
+        row_support = _SparseRowSupport()
+        packed_indices = array(packed_dof, int)
+        if use_support_table:
+            unique, row_class = np.unique(packed_dof.reshape(-1, support), axis=0, return_inverse=True)
+            row_support.enabled = 1
+            row_support.class_dof = array(unique, int)
+            row_support.row_class = array(row_class.reshape(worlds, capacity), int)
+            packed_indices = wp.full((1, 1, 1), -9, dtype=int, device=device)
+        kernel = _get_pgs_solve_sparse_kernel(
+            capacity, dofs, support, active_rows=True, branch_groups=groups, use_support_table=use_support_table
+        )
         inputs = [
             worlds,
             array(counts, int),
             padded(biases),
             padded(diagonals),
             impulses,
-            array(packed_dof, int),
+            packed_indices,
             array(packed_rows),
             wp.zeros((worlds, capacity, 12), device=device),
             padded(incidents),
@@ -432,10 +456,14 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
 
         def launch():
             wp.copy(impulses, initial_impulses)
-            wp.launch_tiled(kernel, dim=[worlds], inputs=inputs, outputs=[delta], block_dim=32, device=device)
+            wp.launch_tiled(
+                kernel, dim=[worlds], inputs=inputs, outputs=[delta, row_support], block_dim=32, device=device
+            )
 
         launch()
         actual, actual_impulses = delta.numpy(), impulses.numpy()
+        if use_support_table:
+            np.testing.assert_array_equal(packed_indices.numpy(), -9)
         for world, case in enumerate(cases):
             with self.subTest(case=case):
                 np.testing.assert_allclose(actual[world], expected[world][0], atol=3.0e-5, rtol=3.0e-4)
@@ -515,7 +543,7 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                 0,
                 0,
             ],
-            outputs=[delta],
+            outputs=[delta, _SparseRowSupport()],
             block_dim=64,
             device=device,
         )
@@ -668,7 +696,7 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                 friction_start,
                 iteration_offset,
             ],
-            outputs=[delta],
+            outputs=[delta, _SparseRowSupport()],
             block_dim=64,
             device=device,
         )
@@ -742,7 +770,13 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
         """Match independent eligibility, seeded retraction, delayed friction and linked fallback."""
         self._check_cuda_sparse_sweeps(active_rows=True)
 
-    def _check_cuda_sparse_sweeps(self, *, active_rows):
+    @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
+    def test_cuda_support_table_sweeps(self):
+        """Preserve serial recurrence, active scans and seeded retractions without per-row DOF arrays."""
+        for active_rows in (False, True):
+            self._check_cuda_sparse_sweeps(active_rows=active_rows, use_support_table=True)
+
+    def _check_cuda_sparse_sweeps(self, *, active_rows, use_support_table=False):
         """Compare each schedule with its own physical recurrence without weakening the exact control."""
         device = wp.get_device("cuda:0")
         cases = [(43, 18, None), (75, 39, None)]
@@ -750,6 +784,8 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
         if active_rows:
             cases.extend((3, 3, activity) for activity in ("deferred_activation", "near_singular", "negative_omega"))
         for dofs, support, contact_activity in cases:
+            if use_support_table and dofs > 64:
+                continue
             settings = product((False, True), _SWEEP_CASES) if contact_activity is None else [(False, (0, 0, 1.0))]
             if contact_activity == "negative_omega":
                 settings = [(False, (0, 0, -0.5))]
@@ -816,7 +852,17 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
 
                     actual_impulses = padded(impulses)
                     delta = wp.full((worlds, dofs), float("nan"), device=device)
-                    kernel = _get_pgs_solve_sparse_kernel(capacity, dofs, support, active_rows=active_rows)
+                    row_support = _SparseRowSupport()
+                    packed_indices = wp.array(row_dof, device=device)
+                    if use_support_table:
+                        unique, row_class = np.unique(row_dof.reshape(-1, support), axis=0, return_inverse=True)
+                        row_support.enabled = 1
+                        row_support.class_dof = wp.array(unique, dtype=int, device=device)
+                        row_support.row_class = wp.array(row_class.reshape(worlds, capacity), dtype=int, device=device)
+                        packed_indices = wp.full((1, 1, 1), -9, dtype=int, device=device)
+                    kernel = _get_pgs_solve_sparse_kernel(
+                        capacity, dofs, support, active_rows=active_rows, use_support_table=use_support_table
+                    )
                     wp.launch_tiled(
                         kernel,
                         dim=[2],
@@ -826,7 +872,7 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                             padded(bias),
                             padded(diag),
                             actual_impulses,
-                            wp.array(row_dof, device=device),
+                            packed_indices,
                             wp.array(row_factor, device=device),
                             wp.zeros((worlds, capacity, 12), device=device),
                             padded(incident),
@@ -849,11 +895,13 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                             friction_start,
                             iteration_offset,
                         ],
-                        outputs=[delta],
+                        outputs=[delta, row_support],
                         block_dim=64,
                         device=device,
                     )
                     actual = delta.numpy()
+                    if use_support_table:
+                        np.testing.assert_array_equal(packed_indices.numpy(), -9)
                     result_impulses = actual_impulses.numpy()
                     np.testing.assert_array_equal(actual[1], 0.0)
                     for world in (0, 2):

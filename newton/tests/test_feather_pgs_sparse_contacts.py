@@ -26,7 +26,11 @@ from newton._src.solvers.feather_pgs.sparse_contact import (
     build_sparse_joint_limit_rows,
     finalize_sparse_joint_limit_rows,
 )
-from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseMassMatrixPlan
+from newton._src.solvers.feather_pgs.sparse_mass_matrix import (
+    _SparseMassMatrixPlan,
+    _SparseRowSupport,
+    _SparseRowSupportPlan,
+)
 
 
 def _array(value, dtype=float):
@@ -201,7 +205,7 @@ class TestSparseContacts(unittest.TestCase):
                 SparseContactRows(),
                 0.01,
             ],
-            outputs=[row_dof, row_factor, row_free_response, incident, diagonal],
+            outputs=[row_dof, row_factor, row_free_response, incident, diagonal, _SparseRowSupport()],
             block_dim=128,
             device=device,
         )
@@ -306,6 +310,20 @@ class TestSparseContacts(unittest.TestCase):
         """Match solver rows, diagonal CFM and restitution RHS to canonical preparation."""
         self._check_contact_response("cpu", 1, prepare_rows=True)
 
+    def test_support_table_contact_response(self):
+        """Retain self contacts, fixed endpoints and prescribed motion with shared support indices."""
+        for prepare_rows in (False, True):
+            self._check_contact_response("cpu", 1, prepare_rows=prepare_rows, use_support_table=True)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "cooperative contact construction requires CUDA")
+    def test_support_table_contact_response_cuda(self):
+        """Use the same padded topology support across contact lane widths and partial launches."""
+        for lanes in (8, 16, 32):
+            for prepare_rows in (False, True):
+                self._check_contact_response(
+                    "cuda:0", 2, lanes=lanes, prepare_rows=prepare_rows, use_support_table=True
+                )
+
     @unittest.skipUnless(wp.is_cuda_available(), "cooperative contact preparation requires CUDA")
     def test_contact_preparation_cuda(self):
         """Preserve prepared rows across lane groups, partial launches and grid strides."""
@@ -314,7 +332,7 @@ class TestSparseContacts(unittest.TestCase):
                 with self.subTest(workers=workers, lanes=lanes):
                     self._check_contact_response("cuda:0", workers, lanes=lanes, prepare_rows=True)
 
-    def _check_contact_response(self, device, workers, *, lanes=8, prepare_rows=False):
+    def _check_contact_response(self, device, workers, *, lanes=8, prepare_rows=False, use_support_table=False):
         """Match dense contact rows for static, same-articulation, and fixed endpoints."""
 
         def array(value, dtype=float):
@@ -353,11 +371,17 @@ class TestSparseContacts(unittest.TestCase):
             with self.subTest(shared=shared, friction_shared=friction_shared, patch=patch):
                 f["patches"].enabled = patch
                 dense = full((1, 9, 6), 0.0)
-                row_dof = full((1, 9, 6), -9, int)
+                row_dof = full((1, 1, 1) if use_support_table else (1, 9, 6), -9, int)
                 row_factor = full((1, 9, 6), -9.0)
                 incident = full((1, 9), -9.0)
                 diagonal = full((1, 9), -9.0)
                 rows = SparseContactRows()
+                support = _SparseRowSupport()
+                if use_support_table:
+                    support_plan = _SparseRowSupportPlan.build(p, p.joint_ancestor_mask, max_row_dofs=6)
+                    self.assertIsNotNone(support_plan)
+                    support = support_plan.to_device(1, 9, device)
+                    support.row_class.fill_(-9)
                 if prepare_rows:
                     velocity = np.zeros((4, 6), dtype=np.float32)
                     velocity[0, :3] = -0.2 * f["normal"].numpy()[0]
@@ -405,7 +429,9 @@ class TestSparseContacts(unittest.TestCase):
                     normal_jacobian = dense.numpy()[0, 0]
                     f["velocity"] = array(-1.7 * normal_jacobian / np.dot(normal_jacobian, normal_jacobian))
                 wp.launch(
-                    _get_sparse_contact_response_kernel(6, lanes_per_contact=lanes, prepare_rows=prepare_rows),
+                    _get_sparse_contact_response_kernel(
+                        6, lanes_per_contact=lanes, prepare_rows=prepare_rows, use_support_table=use_support_table
+                    ),
                     dim=workers * lanes,
                     inputs=[
                         f["count"],
@@ -438,15 +464,23 @@ class TestSparseContacts(unittest.TestCase):
                         rows,
                         0.01,
                     ],
-                    outputs=[row_dof, row_factor, full((1, 9, 12), -9.0), incident, diagonal],
+                    outputs=[row_dof, row_factor, full((1, 9, 12), -9.0), incident, diagonal, support],
                     block_dim=128,
                     device=device,
                 )
                 jacobian = dense.numpy()[0, :7]
                 expected = jacobian[:, p.permutation] @ f["inverse"].T
                 actual = np.zeros_like(expected)
+                dof_values = row_dof.numpy()
+                if use_support_table:
+                    np.testing.assert_array_equal(dof_values, -9)
+                    classes = support.row_class.numpy()
+                    self.assertTrue(np.all(classes[0, :7] >= 0))
+                    np.testing.assert_array_equal(classes[0, 7:], -9)
+                    dof_values = np.full((1, 9, 6), -9, dtype=np.int32)
+                    dof_values[0, :7] = support_plan.class_dof[classes[0, :7]]
                 for row in range(7):
-                    dofs = row_dof.numpy()[0, row]
+                    dofs = dof_values[0, row]
                     valid = dofs >= 0
                     self.assertEqual(len(set(dofs[valid])), int(np.count_nonzero(valid)))
                     actual[row, dofs[valid]] = row_factor.numpy()[0, row, valid]
@@ -460,7 +494,7 @@ class TestSparseContacts(unittest.TestCase):
                     rtol=3.0e-6,
                     atol=2.0e-6,
                 )
-                np.testing.assert_array_equal(row_dof.numpy()[0, 7:], -9)
+                np.testing.assert_array_equal(dof_values[0, 7:], -9)
                 np.testing.assert_array_equal(row_factor.numpy()[0, 7:], -9.0)
                 if prepare_rows:
                     reference = [full((1, 9), -9, int) for _ in range(2)] + [full((1, 9), -9.0) for _ in range(6)]
@@ -714,7 +748,21 @@ class TestSparseContacts(unittest.TestCase):
                         f["packed"],
                         f["velocity"],
                     ],
-                    outputs=[count, row_type, parent, mu, beta, cfm, phi, target, dof, factor, incident, diagonal],
+                    outputs=[
+                        count,
+                        row_type,
+                        parent,
+                        mu,
+                        beta,
+                        cfm,
+                        phi,
+                        target,
+                        dof,
+                        factor,
+                        incident,
+                        diagonal,
+                        _SparseRowSupport(),
+                    ],
                     block_dim=128,
                     device="cpu",
                 )
@@ -734,7 +782,7 @@ class TestSparseContacts(unittest.TestCase):
                     )
                     self.assertAlmostEqual(float(diagonal.numpy()[0, row]), float(expected @ expected), places=6)
 
-    def _check_joint_limit_parallel_scan(self, device, capacity):
+    def _check_joint_limit_parallel_scan(self, device, capacity, *, use_support_table=False):
         plan = _SparseMassMatrixPlan.build([-1, 0, 0], [2, 31, 31])
         dofs, worlds = plan.dof_count, 3
         rng = np.random.default_rng(923)
@@ -772,8 +820,14 @@ class TestSparseContacts(unittest.TestCase):
         counter = array(initial_count, int)
         row_type, parent = [full((worlds, capacity), -9, int) for _ in range(2)]
         mu, beta, cfm, phi, target, incident, diagonal = [full((worlds, capacity), -9.0) for _ in range(7)]
-        row_dof = full((worlds, capacity, 34), -9, int)
+        row_dof = full((1, 1, 1) if use_support_table else (worlds, capacity, 34), -9, int)
         row_factor = full((worlds, capacity, 34), -9.0)
+        support = _SparseRowSupport()
+        if use_support_table:
+            support_plan = _SparseRowSupportPlan.build(plan, np.zeros(0, dtype=np.uint64), max_row_dofs=34)
+            self.assertIsNotNone(support_plan)
+            support = support_plan.to_device(worlds, capacity, device)
+            support.row_class.fill_(-9)
         outputs = [counter, row_type, parent, mu, beta, cfm, phi, target, row_dof, row_factor, incident, diagonal]
         wp.launch(
             build_sparse_joint_limit_rows,
@@ -796,11 +850,17 @@ class TestSparseContacts(unittest.TestCase):
                 array(packed),
                 array(velocity),
             ],
-            outputs=outputs,
+            outputs=[*outputs, support],
             block_dim=128,
             device=device,
         )
         actual = [value.numpy() for value in outputs]
+        if use_support_table:
+            np.testing.assert_array_equal(actual[8], -9)
+            classes = support.row_class.numpy()
+            actual[8] = np.full((worlds, capacity, 34), -9, dtype=np.int32)
+            selected = classes >= 0
+            actual[8][selected] = support_plan.class_dof[classes[selected]]
         for group, art in enumerate(group_to_art):
             world = art_to_world[art]
             first = initial_count[world]
@@ -840,6 +900,17 @@ class TestSparseContacts(unittest.TestCase):
         for capacity in (8, 140):
             with self.subTest(capacity=capacity):
                 self._check_joint_limit_parallel_scan("cpu", capacity)
+
+    def test_support_table_joint_limits(self):
+        """Keep full multi-DOF ancestor blocks and limit overflow demand without row-index storage."""
+        for capacity in (8, 140):
+            self._check_joint_limit_parallel_scan("cpu", capacity, use_support_table=True)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "cooperative limit construction requires CUDA")
+    def test_support_table_joint_limits_cuda(self):
+        """Publish topology classes for wide limits while leaving unused rows and index dummy untouched."""
+        for capacity in (8, 140):
+            self._check_joint_limit_parallel_scan("cuda:0", capacity, use_support_table=True)
 
     @unittest.skipUnless(wp.is_cuda_available(), "cooperative limit construction requires CUDA")
     def test_joint_limit_parallel_scan_cuda(self):

@@ -151,10 +151,40 @@ def _step(case):
 
 @unittest.skipUnless(wp.is_cuda_available(), "Sparse integrated solve requires CUDA")
 class TestFeatherPGSSparseSolver(unittest.TestCase):
+    def test_shared_row_support_matches_explicit_indices(self):
+        """Remove per-world indices while preserving contacts, limits and reset behavior."""
+        with mock.patch.dict(SolverFeatherPGS._kernel_overrides, {"sparse_row_support": False}):
+            explicit = _case(True)
+        shared = _case(True)
+        self.assertFalse(explicit[1]._sparse_row_support.enabled)
+        self.assertTrue(shared[1]._sparse_row_support.enabled)
+        self.assertEqual(shared[1]._sparse_row_dof.shape, (1, 1, 1))
+        for step in range(8):
+            for case in (explicit, shared):
+                if step == 4:
+                    model, solver, state, *_ = case
+                    q = state.joint_q.numpy()
+                    q[2] += 0.002
+                    state.joint_q.assign(q)
+                    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+                    solver.reset(state, wp.array([True, False], dtype=bool, device=model.device))
+                _step(case)
+            self.assert_states_close(explicit[2], shared[2])
+            self.assert_sparse_state(shared)
+            counts = explicit[1].constraint_count.numpy()
+            np.testing.assert_array_equal(counts, shared[1].constraint_count.numpy())
+            support = shared[1]._sparse_row_support
+            classes, indices = support.row_class.numpy(), support.class_dof.numpy()
+            for world, count in enumerate(counts):
+                np.testing.assert_array_equal(
+                    indices[classes[world, :count]], explicit[1]._sparse_row_dof.numpy()[world, :count]
+                )
+
     def test_heterogeneous_worlds_do_not_invent_joint_support(self):
         """Admit a robot-only world and a separate free-only world without oversized row support."""
         dense, sparse = _case(False, heterogeneous=True), _case(True, heterogeneous=True)
         self.assertEqual(sparse[1]._sparse_mass_matrix_size, 9)
+        self.assertFalse(sparse[1]._sparse_row_support.enabled)
         np.testing.assert_array_equal(sparse[1].world_dof_count.numpy(), [9, 6])
         self.assertLessEqual(sparse[1]._sparse_row_dof.shape[2], sparse[1].max_world_dofs)
         for _ in range(4):
@@ -280,9 +310,12 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         plan = solver._sparse_mass_matrix_plan
         size = plan.dof_count
         row_dof, values = solver._sparse_row_dof.numpy(), solver._sparse_row_factor.numpy()
+        shared = solver._sparse_row_support
+        if shared.enabled:
+            row_dof = shared.class_dof.numpy()[shared.row_class.numpy()[world, :count]][None, :, :]
         z = np.zeros((count, solver.max_world_dofs))
         for row in range(count):
-            support = row_dof[world, row]
+            support = row_dof[0 if shared.enabled else world, row]
             valid = support >= 0
             self.assertTrue(np.all(support[valid] < solver.max_world_dofs))
             self.assertEqual(len(set(support[valid])), int(valid.sum()))
