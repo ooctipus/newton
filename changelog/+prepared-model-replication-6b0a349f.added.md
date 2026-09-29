@@ -1,0 +1,1 @@
+Add experimental `Model.replicate()` to create exact-sized homogeneous rigid populations from a finalized one-world prototype, repeating prepared numeric topology on the device without builder reconstruction or device readback while sharing read-only geometry resources. Fuse plain CUDA array copies into aligned allocations while preserving independent mutable array regions.

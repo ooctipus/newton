@@ -221,6 +221,18 @@ overhead.
 Requested solver observables may add nontrivial cost to the solver step itself.
 Request only the kinds consumed by the application and reuse the allocation.
 
+For changing homogeneous population sizes, prepare a contact sensor on the
+single-world prototype before cloning. The experimental
+:meth:`~newton.sensors.SensorContact.replicate` method expands its prepared
+bindings into a direct :meth:`~newton.Model.replicate` result on the device.
+It preserves the prototype's sensing order within each world and allocates
+independent, zeroed readings. Body and shape sensors, with or without local
+counterparts, use the existing force accumulation implementation. Native index
+arrays require no readback; Python index lists are materialized only on explicit
+host inspection. Keep prototype topology and sensor bindings unchanged while
+replicas exist, and provide contacts with the ``force`` attribute as usual.
+
+
 See Also
 --------
 
