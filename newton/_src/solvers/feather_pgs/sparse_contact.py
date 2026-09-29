@@ -54,8 +54,9 @@ def _get_sparse_contact_response_kernel(
     loads. Each endpoint Jacobian is evaluated once in shared scratch. Free
     bodies retain their physical coordinates and existing mass metric.
 
-    With ``prepare_rows``, the geometry also produces metadata, diagonal CFM,
-    bias and restitution. The caller must not run those separate row passes.
+    With ``prepare_rows``, the geometry also produces solver metadata, diagonal
+    CFM, bias and restitution. Only normal rows retain the scratch metadata
+    needed by restitution; the caller must not run separate row passes.
 
     All input/output arrays must be contiguous for the native flat accesses.
     Launch total_num_workers * lanes_per_contact threads in blocks of
@@ -517,11 +518,12 @@ def _get_sparse_contact_response_kernel(
                     rows.type[world, slot] = row_type
                     rows.parent[world, slot] = parent
                     rows.mu[world, slot] = mu
-                    rows.beta_row[world, slot] = beta
-                    rows.cfm_row[world, slot] = rows.cfm
-                    rows.phi[world, slot] = phi
-                    rows.target_velocity[world, slot] = target
-                    rows.restitution[world, slot] = restitution
+                    # Bias and CFM are already applied; only normal restitution
+                    # consumes row metadata after the response projection.
+                    if lane == 0:
+                        rows.phi[world, slot] = phi
+                        rows.target_velocity[world, slot] = target
+                        rows.restitution[world, slot] = restitution
                     rows.rhs[world, slot] = -target + bias
 
             # Keep response matrices out of the metadata writers' live state.

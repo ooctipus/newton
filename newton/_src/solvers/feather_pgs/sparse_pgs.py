@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Serial PGS over ancestor-sparse, mass-whitened constraint rows."""
+"""Ordered PGS over ancestor-sparse, mass-whitened constraint rows."""
 
 from functools import cache
 
@@ -25,6 +25,7 @@ def _get_pgs_solve_sparse_kernel(
     mf_max_constraints: int = 0,
     free_row_dofs: int = 0,
     active_rows: bool = False,
+    branch_groups: tuple[int, ...] = (),
 ) -> wp.Kernel:
     """Build a CUDA sweep over factored articulations and physical free bodies.
 
@@ -44,15 +45,42 @@ def _get_pgs_solve_sparse_kernel(
     then retains their ordered GS updates. Newly violated zero rows wait until
     the next sweep; mixed responses and linked patches retain the full sweep.
 
-    Launch with ``ceil(world_count / 2)`` tiles and 64 threads per tile.
+    ``branch_groups`` experimentally partitions factor DOFs into two to four
+    branches, with -1 identifying the shared separator. Its first sweep stays
+    serial; later sweeps retain each branch's own separator response and combine
+    branch increments at sweep boundaries. This changes finite-iteration
+    convergence, not the contact law. Separator-only, cross-branch, seeded and
+    linked-patch worlds retain serial sweeps. This mode requires active rows,
+    no free bodies, and at most 64 factor DOFs. A point contact's normal and
+    tangent rows must belong to the same branch, as in the sparse row producer.
+
+    Launch the default with ``ceil(world_count / 2)`` tiles and 64 threads per
+    tile. Branch sweeps use one 32-thread tile per world.
     """
     M, D, S = int(max_constraints), int(max_world_dofs), int(max_row_dofs)
     F = int(mf_max_constraints)
     P = int(free_row_dofs)
     if M <= 0 or D <= 0 or S <= 0 or S > D or F < 0 or P < 0 or P > S:
         raise ValueError("sparse PGS requires positive capacities and max_row_dofs <= max_world_dofs")
-    W = 2
-    Q = (S + 31) // 32
+    parallel_branches = bool(branch_groups)
+    if parallel_branches:
+        groups = set(branch_groups)
+        branch_count = int(max(groups)) + 1
+        if (
+            len(branch_groups) != D
+            or D > 64
+            or not 2 <= branch_count <= 4
+            or groups - {-1} != set(range(branch_count))
+            or min(groups) < -1
+            or any(int(group) != group for group in branch_groups)
+            or not active_rows
+            or F
+            or P
+        ):
+            raise ValueError("branch sweeps require two to four factor-coordinate groups and no free rows")
+    W = 1 if parallel_branches else 2
+    L = 8 if parallel_branches else 32
+    Q = (S + L - 1) // L
     contact_type = int(PGS_CONSTRAINT_TYPE_CONTACT)
     friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
     limit_type = int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
@@ -63,6 +91,9 @@ def _get_pgs_solve_sparse_kernel(
     row_loop_end = "        }"
     if active_rows:
         words = (M + 31) // 32
+        scan_lane = "thread" if parallel_branches else "lane"
+        scan_mask = "FULL_MASK" if parallel_branches else "MASK"
+        scan_delta = "global_delta" if parallel_branches else "delta"
         active_storage = f"""
     __shared__ unsigned normal_words_storage[{W * words}];
     __shared__ unsigned selected_words_storage[{W * words}];
@@ -77,7 +108,7 @@ def _get_pgs_solve_sparse_kernel(
 """
         active_scan = f"""
         for (int first = 0; first < count; first += 32) {{
-            const int row = first + lane;
+            const int row = first + {scan_lane};
             bool selected = false;
             if (row < count) {{
                 const int kind = static_cast<int>(type[row]);
@@ -92,7 +123,7 @@ def _get_pgs_solve_sparse_kernel(
                             for (int entry = 0; entry < {S}; ++entry) {{
                                 const int index = row_dof.data[row_base + row * {S} + entry];
                                 if (index >= 0)
-                                    dot += row_factor.data[row_base + row * {S} + entry] * delta[index];
+                                    dot += row_factor.data[row_base + row * {S} + entry] * {scan_delta}[index];
                             }}
                         }}
                         const float residual = dot + rhs[row];
@@ -103,15 +134,15 @@ def _get_pgs_solve_sparse_kernel(
                     impulse[row] = 0.0f;
                 }}
             }}
-            const unsigned mask = __ballot_sync(MASK, selected);
-            if (lane == 0) normal_words[first / 32] = mask;
+            const unsigned mask = __ballot_sync({scan_mask}, selected);
+            if ({scan_lane} == 0) normal_words[first / 32] = mask;
         }}
-        __syncwarp(MASK);
+        __syncwarp({scan_mask});
         for (int first = 0; first < count; first += 32) {{
-            const int row = first + lane;
+            const int row = first + {scan_lane};
             bool selected = false;
             if (row < count) {{
-                selected = !select_active || ((normal_words[first / 32] >> lane) & 1u) != 0u;
+                selected = !select_active || ((normal_words[first / 32] >> {scan_lane}) & 1u) != 0u;
                 if (select_active && type[row] == {friction_type}
                     && global_iteration >= friction_start_iteration) {{
                     const int parent = world_row_parent.data[offset + row];
@@ -120,10 +151,10 @@ def _get_pgs_solve_sparse_kernel(
                         || impulse[row] != 0.0f || impulse[parent + 2] != 0.0f);
                 }}
             }}
-            const unsigned mask = __ballot_sync(MASK, selected);
-            if (lane == 0) selected_words[first / 32] = mask;
+            const unsigned mask = __ballot_sync({scan_mask}, selected);
+            if ({scan_lane} == 0) selected_words[first / 32] = mask;
         }}
-        __syncwarp(MASK);
+        __syncwarp({scan_mask});
 """
         row_loop = """
         for (int word = 0; word < (count + 31) / 32; ++word) {
@@ -273,10 +304,7 @@ def _get_pgs_solve_sparse_kernel(
         mf_writeback = """
     for (int i = lane; i < mf_count; i += 32) mf_impulses.data[mf_offset + i] = mf_impulse[i];
 """
-    snippet = (
-        "#if defined(__CUDA_ARCH__)\n"
-        + FRICTION_PAIR_CUDA
-        + f"""
+    setup = f"""
     __shared__ float delta_storage[{W * D}];
     __shared__ float impulse_storage[{W * M}];
     __shared__ float rhs_storage[{W * M}];
@@ -306,12 +334,8 @@ def _get_pgs_solve_sparse_kernel(
 {mf_initialize}
     __syncwarp(MASK);
 {active_initialize}
-
-    for (int iteration = 0; iteration < iterations; ++iteration) {{
-        const int global_iteration = iteration_offset + iteration;
-        int changed = 0;
-{active_scan}
-{row_loop}
+"""
+    row_update = f"""
             const int row_type = static_cast<int>(type[row]);
             const bool friction = row_type == {friction_type};
             if (friction && global_iteration < friction_start_iteration) {{
@@ -346,7 +370,7 @@ def _get_pgs_solve_sparse_kernel(
             float cross = 0.0f;
             #pragma unroll
             for (int q = 0; q < {Q}; ++q) {{
-                const int entry = lane + q * 32;
+                const int entry = lane + q * {L};
                 const int index = entry < {S} ? row_dof.data[row_base + row * {S} + entry] : -1;
                 const float value = index >= 0 ? row_factor.data[row_base + row * {S} + entry] : 0.0f;
                 const float sibling_value = friction && index >= 0
@@ -369,19 +393,19 @@ def _get_pgs_solve_sparse_kernel(
                     cross += value * sibling_response;
                 }}
             }}
-            for (int shift = 16; shift > 0; shift >>= 1) {{
-                dot += __shfl_down_sync(MASK, dot, shift);
-                sibling_dot += __shfl_down_sync(MASK, sibling_dot, shift);
-                cross += __shfl_down_sync(MASK, cross, shift);
+            for (int shift = {L // 2}; shift > 0; shift >>= 1) {{
+                dot += __shfl_down_sync(MASK, dot, shift, {L});
+                sibling_dot += __shfl_down_sync(MASK, sibling_dot, shift, {L});
+                cross += __shfl_down_sync(MASK, cross, shift, {L});
             }}
-            const float residual = __shfl_sync(MASK, dot, 0) + rhs[row];
+            const float residual = __shfl_sync(MASK, dot, 0, {L}) + rhs[row];
             float new_impulse = old_impulse;
             float sibling_change = 0.0f;
             if (friction) {{
                 float2 pair = make_float2(0.0f, 0.0f);
                 if (radius > 0.0f) {{
-                    const float sibling_residual = __shfl_sync(MASK, sibling_dot, 0) + rhs[sibling];
-                    pair = friction_pair_candidate(denominator, __shfl_sync(MASK, cross, 0),
+                    const float sibling_residual = __shfl_sync(MASK, sibling_dot, 0, {L}) + rhs[sibling];
+                    pair = friction_pair_candidate(denominator, __shfl_sync(MASK, cross, 0, {L}),
                         diagonal[sibling], residual, sibling_residual, old_impulse, old_sibling, radius, omega);
                 }}
                 const float magnitude = sqrtf(pair.x * pair.x + pair.y * pair.y);
@@ -411,13 +435,138 @@ def _get_pgs_solve_sparse_kernel(
                 }}
             }}
             __syncwarp(MASK);
-{row_loop_end}
-{mf_sweep}
+"""
+    sweep_start = ""
+    sweep_finish = """
         if (global_iteration >= friction_start_iteration && __ballot_sync(MASK, changed != 0) == 0u) break;
-    }}
+"""
+    writeback = f"""
     for (int d = lane; d < {D}; d += 32) factor_velocity_delta.data[world * {D} + d] = delta[d];
     for (int i = lane; i < count; i += 32) world_impulses.data[offset + i] = impulse[i];
 {mf_writeback}
+"""
+    branch_lookup = ""
+    if parallel_branches:
+        # Literal masks avoid a dynamically indexed per-thread topology table.
+        masks = [sum(1 << dof for dof, group in enumerate(branch_groups) if group == b) for b in range(branch_count)]
+        membership = "".join(f"(bit & {mask}ull) != 0ull ? {b} : " for b, mask in enumerate(masks)) + "-1"
+        branch_lookup = f"""
+    const auto sparse_pgs_branch_group = [](int index) {{
+        const unsigned long long bit = 1ull << index;
+        return {membership};
+    }};
+"""
+        setup = f"""
+    constexpr unsigned FULL_MASK = 0xffffffffu;
+    const int thread = threadIdx.x;
+    const int lane = thread & 7;
+    const int branch = thread >> 3;
+    const unsigned MASK = 0xffu << (branch * 8);
+    const int offset = world * {M};
+    const int row_base = offset * {S};
+    const int count = min(world_constraint_count.data[world], {M});
+    __shared__ float delta_storage[{4 * D}], global_delta[{D}];
+    __shared__ float impulse[{M}], rhs[{M}], diagonal[{M}];
+    __shared__ unsigned char type[{M}];
+    __shared__ unsigned normal_words[{words}], selected_words[{words}], owner_words[{4 * words}];
+    __shared__ int serial_flags, branch_changed[4];
+    float* delta = delta_storage + branch * {D};
+    if (thread == 0) serial_flags = 0;
+    for (int d = lane; d < {D}; d += 8) delta[d] = 0.0f;
+    for (int d = thread; d < {D}; d += 32) global_delta[d] = 0.0f;
+    __syncwarp(FULL_MASK);
+    for (int first = 0; first < count; first += 32) {{
+        const int row = first + thread;
+        int group = -1;
+        if (row < count) {{
+            impulse[row] = world_impulses.data[offset + row];
+            rhs[row] = rhs_bias.data[offset + row] + row_incident.data[offset + row];
+            diagonal[row] = world_diag.data[offset + row];
+            type[row] = static_cast<unsigned char>(world_row_type.data[offset + row]);
+            if (impulse[row] != 0.0f) atomicOr(&serial_flags, 1);
+            if (type[row] == {contact_type} && world_row_parent.data[offset + row] >= 0)
+                atomicOr(&serial_flags, 3);
+            #pragma unroll
+            for (int entry = 0; entry < {S}; ++entry) {{
+                const int index = row_dof.data[row_base + row * {S} + entry];
+                if (index >= 0) {{
+                    const int next = sparse_pgs_branch_group(index);
+                    if (next >= 0) {{
+                        if (group >= 0 && group != next) atomicOr(&serial_flags, 1);
+                        group = next;
+                    }}
+                }}
+            }}
+            // Separator-only and cross-branch rows retain the complete serial recurrence.
+            if (group < 0) atomicOr(&serial_flags, 1);
+        }}
+        #pragma unroll
+        for (int b = 0; b < 4; ++b) {{
+            const unsigned mask = __ballot_sync(FULL_MASK, row < count && group == b);
+            if (thread == 0) owner_words[b * {words} + first / 32] = mask;
+        }}
+    }}
+    __syncwarp(FULL_MASK);
+    const bool select_active = (serial_flags & 2) == 0 && isfinite(omega) && omega >= 0.0f;
+"""
+        # Every call starts from zero delta, including phased calls with an iteration offset.
+        sweep_start = "        const bool serial_sweep = serial_flags != 0 || iteration == 0;"
+        row_loop = f"""
+        for (int word = 0; word < (count + 31) / 32; ++word) {{
+            unsigned pending = selected_words[word] & (serial_sweep
+                ? (branch == 0 ? 0xffffffffu : 0u) : owner_words[branch * {words} + word]);
+            while (pending != 0u) {{
+                const int row = word * 32 + __ffs(pending) - 1;
+                pending &= pending - 1u;
+"""
+        row_loop_end = "            }\n        }"
+        sweep_finish = f"""
+        if (lane == 0) branch_changed[branch] = changed;
+        __syncwarp(FULL_MASK);
+        for (int d = thread; d < {D}; d += 32) {{
+            float value = global_delta[d];
+            const int group = sparse_pgs_branch_group(d);
+            if (serial_sweep) value = delta_storage[d];
+            else if (group >= 0) value = delta_storage[group * {D} + d];
+            else {{
+                const float previous = value;
+                #pragma unroll
+                for (int b = 0; b < 4; ++b)
+                    value += delta_storage[b * {D} + d] - previous;
+            }}
+            global_delta[d] = value;
+        }}
+        __syncwarp(FULL_MASK);
+        for (int d = lane; d < {D}; d += 8) delta[d] = global_delta[d];
+        bool any_changed = false;
+        #pragma unroll
+        for (int b = 0; b < 4; ++b) any_changed |= branch_changed[b] != 0;
+        __syncwarp(FULL_MASK);
+        if (global_iteration >= friction_start_iteration && !any_changed) break;
+"""
+        writeback = f"""
+    for (int d = thread; d < {D}; d += 32)
+        factor_velocity_delta.data[world * {D} + d] = global_delta[d];
+    for (int row = thread; row < count; row += 32) world_impulses.data[offset + row] = impulse[row];
+"""
+    snippet = (
+        "#if defined(__CUDA_ARCH__)\n"
+        + FRICTION_PAIR_CUDA
+        + branch_lookup
+        + setup
+        + f"""
+    for (int iteration = 0; iteration < iterations; ++iteration) {{
+        const int global_iteration = iteration_offset + iteration;
+        int changed = 0;
+{sweep_start}
+{active_scan}
+{row_loop}
+{row_update}
+{row_loop_end}
+{mf_sweep}
+{sweep_finish}
+    }}
+{writeback}
 #endif
 """
     )
@@ -519,6 +668,8 @@ def _get_pgs_solve_sparse_kernel(
             )
 
     suffix = "_active" if active_rows else ""
+    if parallel_branches:
+        suffix += "_branches"
     solve.__name__ = f"pgs_solve_sparse_{M}_{D}_{S}_{F}_{P}{suffix}"
     solve.__qualname__ = solve.__name__
     return wp.kernel(enable_backward=False, module="unique")(solve)

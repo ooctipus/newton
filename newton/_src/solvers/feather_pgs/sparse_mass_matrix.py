@@ -206,6 +206,31 @@ class _SparseMassMatrixPlan:
                 mask |= int(self.joint_ancestor_mask[joint])
         return np.asarray([dof for dof in range(self.dof_count) if mask & (1 << dof)], dtype=np.int32)
 
+    def branch_groups(self) -> tuple[int, ...]:
+        """Partition factor coordinates after removing their shared ancestors.
+
+        Return -1 for separator coordinates and contiguous branch indices for
+        the remaining connected components. The four-subgroup sweep currently
+        supports two to four components; other topologies retain serial PGS.
+        This is structural admission, not a convergence or speed guarantee.
+        """
+        adjacency = (self.lookup >= 0) | (self.lookup.T >= 0)
+        separator = np.all(adjacency, axis=1)
+        remaining = set(np.flatnonzero(~separator))
+        groups = [-1] * self.dof_count
+        group_count = 0
+        while remaining:
+            pending = [min(remaining)]
+            while pending:
+                coordinate = pending.pop()
+                if coordinate not in remaining:
+                    continue
+                remaining.remove(coordinate)
+                groups[coordinate] = group_count
+                pending.extend(remaining.intersection(np.flatnonzero(adjacency[coordinate])))
+            group_count += 1
+        return tuple(groups) if 2 <= group_count <= 4 else ()
+
     def to_device(self, device) -> _SparseMassMatrixIndices:
         """Upload the topology once; all per-step values remain caller-owned."""
         indices = _SparseMassMatrixIndices()
