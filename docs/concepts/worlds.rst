@@ -26,6 +26,57 @@ Lastly, world-based grouping also enables selectively operating on only the enti
    At present time, although the :class:`~newton.ModelBuilder` and :class:`~newton.Model` objects support instantiating worlds with different disparate entities, not all solvers are able to simulate them.
    Moreover, the selection API still operates under the assumption of model homogeneity, but this is expected to also support heterogeneous simulations in the near future.
 
+Prepared World Replication
+--------------------------
+
+.. experimental::
+
+   :meth:`~newton.Model.replicate` and :meth:`~newton.solvers.SolverMuJoCo.replicate`
+   expand an already prepared single rigid world. Their supported layouts and
+   interfaces may change without the normal deprecation period.
+
+Use :meth:`~newton.Model.replicate` when replacing a homogeneous population with
+an exact number of copies of the same prototype. Finalize the prototype once;
+replication copies its numeric arrays and rebases entity indices on the device.
+It repeats existing collision pairs and articulation traversal data instead of
+calling the builder or discovering topology again. Geometry resources remain
+owned by the read-only prototype. Host labels and lookup metadata, allocation,
+and a spatial BVH for the new population still require setup.
+
+For native-contact MJWarp simulation, prepare a one-world solver once and use
+its replication method to expand both Newton and the solver together:
+
+.. code-block:: python
+
+   from newton.solvers import SolverMuJoCo
+
+   # prototype is finalized with one explicit local world and no global entities.
+   prepared = SolverMuJoCo(prototype, use_mujoco_contacts=True)
+   population = prepared.replicate(4096)
+   model = population.model
+   state_0, state_1, control = model.state(), model.state(), model.control()
+
+Keep ``prepared`` unstepped and unmodified. The replica owns mutable state and
+properties independently, including initialized inertia, solver constants,
+sleeping state, and contact buffers. Cloning does not compile MuJoCo again,
+reconstruct exclusions, call ``notify_model_changed``, or read GPU arrays back
+to the host. Unsupported features raise; there is no implicit reconstruction
+fallback. See the method documentation for the current restrictions.
+
+Replication creates fresh buffers; a graph captured against another population
+cannot simply be replayed against them. Keep the current population and graph
+when its size is unchanged. Retire a replaced population only after its GPU
+work and graph references have finished. This API does not migrate running
+episodes, change the distribution of logical environments, or implement a
+multi-model scheduler. Other solvers may consume a replicated Newton model,
+but their solver-specific preparation is not yet replicated.
+
+``scripts/benchmark_model_rebuild.py`` compares this path with ordinary
+construction using ``--construction-mode replicate`` or ``rebuild``. It reports
+prototype preparation separately from population cloning, state allocation,
+warmup, reset, graph recording, instantiation/update, replay, and retirement.
+
+
 .. _World assignment:
 
 World Assignment

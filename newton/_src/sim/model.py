@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterable, Iterator
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, replace
 from enum import IntEnum
+from functools import cached_property
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, SupportsIndex
 
 import numpy as np
@@ -61,15 +62,34 @@ class _ShapeCollisionFilterPairs(AbstractSet[tuple[int, int]]):
     """Read-only set view over sorted, unique packed filter-pair codes."""
 
     def __init__(self, packed: np.ndarray):
-        self._packed = packed
+        self._packed_data = packed
+        self._prototype: _ShapeCollisionFilterPairs | None = None
+        self._repeat_count = 1
+        self._shape_stride = 0
         self._pairs_array: np.ndarray | None = None
+
+    def repeat(self, count: int, shape_stride: int) -> _ShapeCollisionFilterPairs:
+        """Represent disjoint copies without materializing population-sized host pairs."""
+        result = _ShapeCollisionFilterPairs(np.empty(0, dtype=np.int64))
+        result._packed_data = None
+        result._prototype = self
+        result._repeat_count = count
+        result._shape_stride = shape_stride
+        return result
+
+    @property
+    def _packed(self) -> np.ndarray:
+        if self._packed_data is None:
+            offsets = np.arange(self._repeat_count, dtype=np.int64) * self._shape_stride
+            self._packed_data = (self._prototype._packed[None, :] + ((offsets << 32) + offsets)[:, None]).reshape(-1)
+        return self._packed_data
 
     @classmethod
     def _from_iterable(cls, iterable: Iterable[tuple[int, int]]) -> frozenset[tuple[int, int]]:
         return frozenset(iterable)
 
     def __bool__(self) -> bool:
-        return self._packed.shape[0] > 0
+        return len(self) > 0
 
     def __contains__(self, pair: object) -> bool:
         if not isinstance(pair, tuple) or len(pair) != 2:
@@ -86,9 +106,18 @@ class _ShapeCollisionFilterPairs(AbstractSet[tuple[int, int]]):
         return iter(map(tuple, self.pairs_array().tolist()))
 
     def __len__(self) -> int:
+        if self._prototype is not None:
+            return len(self._prototype) * self._repeat_count
         return self._packed.shape[0]
 
     def _contains_code(self, code: int) -> bool:
+        if self._prototype is not None:
+            shape_a, shape_b = code >> 32, code & 0xFFFFFFFF
+            if self._shape_stride == 0 or shape_a < 0 or shape_b >= self._repeat_count * self._shape_stride:
+                return False
+            world_a, local_a = divmod(shape_a, self._shape_stride)
+            world_b, local_b = divmod(shape_b, self._shape_stride)
+            return world_a == world_b and self._prototype._contains_code((local_a << 32) | local_b)
         index = int(np.searchsorted(self._packed, code))
         return bool(index < self._packed.shape[0] and self._packed[index] == code)
 
@@ -1304,6 +1333,63 @@ class Model:
         self.actuators: list[Actuator] = []
         """List of actuator instances for this model."""
 
+        self._replication_source: Model | None = None
+        self._has_global_entities: bool | None = None
+
+    def replicate(self, world_count: int) -> Model:
+        """Create an exact-sized homogeneous model from this prepared world.
+
+        .. experimental::
+
+            This operation currently supports one explicit local rigid world on
+            the same device, without global entities, particles, muscles, rods,
+            Gaussian or heightfield geometry, Newton actuators, nonempty custom
+            frequencies, or gradient tracking. Unsupported layouts raise instead of rebuilding.
+
+        Entity arrays and precomputed topology are repeated on the device. Mesh
+        resources are shared; mutable per-world model arrays are independent.
+        CUDA arrays may occupy disjoint regions of a shared allocation; keeping
+        an extracted array alive also retains that allocation.
+        Labels and the lazy body-to-shape map remain host metadata. Labels and poses
+        are copied unchanged; worlds are distinguished by their world indices.
+        The prototype and its geometry must remain read-only while replicas
+        exist. Arbitrary in-place Warp array edits are not tracked.
+
+        This constructs a new Model; it does not resize existing states, solvers,
+        or captured graphs. Allocation and spatial-BVH construction are outside
+        CUDA graph capture.
+
+        Args:
+            world_count: Positive number of worlds in the returned model.
+
+        Returns:
+            A fresh model retaining this prototype's geometry resources.
+        """
+        from .model_replication import replicate_model  # noqa: PLC0415
+
+        return replicate_model(self, world_count)
+
+    @cached_property
+    def body_shapes(self) -> dict[int, list[int]]:
+        """Map each body to its attached shapes, materializing replicas on first host access.
+
+        Builder-finalized models already store this dictionary. Prepared
+        replicas derive it from their retained prototype only when requested.
+        """
+        source = self._replication_source
+        if source is None:
+            raise AttributeError("body_shapes has no prepared source")
+        mapping = {}
+        source_shapes = source.body_shapes
+        for world in range(self.world_count):
+            body_offset, shape_offset = world * source.body_count, world * source.shape_count
+            for body, shapes in source_shapes.items():
+                if body >= 0:
+                    mapping[body + body_offset] = [shape + shape_offset for shape in shapes]
+                else:
+                    mapping.setdefault(body, []).extend(shape + shape_offset for shape in shapes)
+        return mapping
+
     def _set_shape_collision_filter_packed(self, packed: np.ndarray) -> None:
         """Install the canonical filter store: sorted unique packed pair codes."""
         self._shape_collision_filter_pairs = _ShapeCollisionFilterPairs(packed)
@@ -1506,11 +1592,8 @@ class Model:
         """
         from ..geometry.bvh import (  # noqa: PLC0415
             SHAPE_BOUNDS_BLOCK_DIM,
-            compute_bvh_group_roots,
             compute_enabled_shapes,
-            compute_shape_bvh_bounds_launch,
             compute_shape_local_bounds,
-            compute_shape_world_transforms_launch,
         )
 
         if self.shape_count == 0:
@@ -1518,7 +1601,6 @@ class Model:
 
         device = self.device
         shape_count = self.shape_count
-        world_count_total = self.world_count + 1
 
         self.bvh_shape_bounds = wp.empty((shape_count, 2), dtype=wp.vec3f, ndim=2, device=device)
         wp.launch_tiled(
@@ -1549,6 +1631,19 @@ class Model:
             device=device,
         )
         self.bvh_shape_count_enabled = int(num_enabled.numpy()[0])
+        self._build_shape_bvh(state, bvh_constructor=bvh_constructor)
+
+    def _build_shape_bvh(self, state: State | Model, *, bvh_constructor: str | None = None) -> None:
+        """Build a spatial tree from prepared shape bounds and enabled indices."""
+        from ..geometry.bvh import (  # noqa: PLC0415
+            compute_bvh_group_roots,
+            compute_shape_bvh_bounds_launch,
+            compute_shape_world_transforms_launch,
+        )
+
+        device = self.device
+        shape_count = self.shape_count
+        world_count_total = self.world_count + 1
         self.bvh_shape_world_transforms = wp.empty(shape_count, dtype=wp.transformf, device=device)
 
         if self.bvh_shape_count_enabled == 0:
@@ -1559,13 +1654,15 @@ class Model:
 
         compute_shape_world_transforms_launch(self, state)
 
-        lowers = wp.zeros(self.bvh_shape_count_enabled, dtype=wp.vec3f, device=device)
-        uppers = wp.zeros(self.bvh_shape_count_enabled, dtype=wp.vec3f, device=device)
-        groups = wp.zeros(self.bvh_shape_count_enabled, dtype=wp.int32, device=device)
+        # Every enabled shape has a valid world index; the bounds kernel writes
+        # every output before the tree reads it.
+        lowers = wp.empty(self.bvh_shape_count_enabled, dtype=wp.vec3f, device=device)
+        uppers = wp.empty(self.bvh_shape_count_enabled, dtype=wp.vec3f, device=device)
+        groups = wp.empty(self.bvh_shape_count_enabled, dtype=wp.int32, device=device)
         compute_shape_bvh_bounds_launch(self, lowers, uppers, groups)
         self.bvh_shapes = wp.Bvh(lowers, uppers, constructor=bvh_constructor, groups=groups)
 
-        self.bvh_shapes_group_roots = wp.zeros(world_count_total, dtype=wp.int32, device=device)
+        self.bvh_shapes_group_roots = wp.empty(world_count_total, dtype=wp.int32, device=device)
         wp.launch(
             kernel=compute_bvh_group_roots,
             dim=world_count_total,

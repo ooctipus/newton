@@ -37,6 +37,18 @@ vec11 = wp.types.vector(length=11, dtype=wp.float32)
 
 
 # Utility functions
+@wp.kernel(enable_backward=False)
+def replicate_solver_indices_kernel(
+    source: wp.array[wp.int32], offset: int, components: int, target: wp.array[wp.int32]
+):
+    i = wp.tid()
+    world = i // source.shape[0]
+    value = source[i % source.shape[0]]
+    if i % components == 0 and value >= 0:
+        value += world * offset
+    target[i] = value
+
+
 @wp.func
 def safe_div(x: float, y: float) -> float:
     return x / wp.where(y != 0.0, y, MJ_MINVAL)
