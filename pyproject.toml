@@ -168,7 +168,7 @@ conflicts = [
 
 [tool.uv.sources]
 mujoco = { index = "pypi" }
-mujoco-warp = { git = "https://github.com/ooctipus/mujoco_warp.git", rev = "160a5d8e5c6df2a5533b8dd01f1118e68432d031" }
+mujoco-warp = { git = "https://github.com/ooctipus/mujoco_warp.git", rev = "bf267ea4002957ab6b8c6d1666260f88c9e4e34d" }
 warp-lang = { index = "nvidia" }
 torch = [
     { index = "pytorch-cu128", extra = "torch-cu12" },

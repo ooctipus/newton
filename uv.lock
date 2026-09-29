@@ -3344,7 +3344,7 @@ wheels = [
 [[package]]
 name = "mujoco-warp"
 version = "3.14.0"
-source = { git = "https://github.com/ooctipus/mujoco_warp.git?rev=160a5d8e5c6df2a5533b8dd01f1118e68432d031#160a5d8e5c6df2a5533b8dd01f1118e68432d031" }
+source = { git = "https://github.com/ooctipus/mujoco_warp.git?rev=bf267ea4002957ab6b8c6d1666260f88c9e4e34d#bf267ea4002957ab6b8c6d1666260f88c9e4e34d" }
 dependencies = [
     { name = "absl-py" },
     { name = "etils", version = "1.13.0", source = { registry = "https://pypi.org/simple" }, extra = ["epath"], marker = "python_full_version < '3.11' or (extra == 'extra-6-newton-torch-cu12' and extra == 'extra-6-newton-torch-cu13')" },
@@ -3935,7 +3935,7 @@ requires-dist = [
     { name = "jupyterlab", marker = "extra == 'notebook'", specifier = ">=4.5.7" },
     { name = "meshio", marker = "extra == 'importers'", specifier = ">=5.3.5" },
     { name = "mujoco", marker = "extra == 'sim'", specifier = "~=3.12.0", index = "https://pypi.org/simple" },
-    { name = "mujoco-warp", marker = "extra == 'sim'", git = "https://github.com/ooctipus/mujoco_warp.git?rev=160a5d8e5c6df2a5533b8dd01f1118e68432d031" },
+    { name = "mujoco-warp", marker = "extra == 'sim'", git = "https://github.com/ooctipus/mujoco_warp.git?rev=bf267ea4002957ab6b8c6d1666260f88c9e4e34d" },
     { name = "myst-parser", marker = "extra == 'docs'", specifier = ">=3.0.1" },
     { name = "nbsphinx", marker = "extra == 'docs'", specifier = ">=0.9.0" },
     { name = "newton", extras = ["examples"], marker = "extra == 'dev'" },
