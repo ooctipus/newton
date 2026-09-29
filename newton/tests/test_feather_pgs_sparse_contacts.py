@@ -309,9 +309,10 @@ class TestSparseContacts(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "cooperative contact preparation requires CUDA")
     def test_contact_preparation_cuda(self):
         """Preserve prepared rows across lane groups, partial launches and grid strides."""
-        for workers in (1, 2, 5):
-            with self.subTest(workers=workers):
-                self._check_contact_response("cuda:0", workers, prepare_rows=True)
+        for lanes in (8, 16, 32):
+            for workers in (1, 2, 5) if lanes == 8 else (2,):
+                with self.subTest(workers=workers, lanes=lanes):
+                    self._check_contact_response("cuda:0", workers, lanes=lanes, prepare_rows=True)
 
     def _check_contact_response(self, device, workers, *, lanes=8, prepare_rows=False):
         """Match dense contact rows for static, same-articulation, and fixed endpoints."""

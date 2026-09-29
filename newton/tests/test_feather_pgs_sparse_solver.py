@@ -9,7 +9,11 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_JOINT_LIMIT
+from newton._src.solvers.feather_pgs.kernels import (
+    PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
+)
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_feather_pgs_propagation_free_root_warp import _build_model as _build_chain
 
@@ -166,6 +170,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         self.assertEqual(sparse[1]._sparse_mass_matrix_size, 9)
         self.assertTrue(sparse[1]._has_prescribed_response)
         targets_seen = [False, False]
+        tangent_target_seen = False
         for step in range(8):
             if step == 4:
                 for model, solver, state, *_ in (dense, sparse):
@@ -177,18 +182,33 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             for case in (dense, sparse):
                 _step(case)
             self.assert_states_close(dense[2], sparse[2])
-            for family, (counter, target) in enumerate(
+            for family, (counter, target, row_type, rhs) in enumerate(
                 (
-                    ("constraint_count", "target_velocity"),
-                    ("mf_constraint_count", "mf_target_velocity"),
+                    ("constraint_count", "target_velocity", "row_type", "rhs"),
+                    ("mf_constraint_count", "mf_target_velocity", "mf_row_type", "mf_rhs"),
                 )
             ):
                 counts = getattr(sparse[1], counter).numpy()
+                np.testing.assert_array_equal(counts, getattr(dense[1], counter).numpy())
                 for world, count in enumerate(counts):
+                    kinds = getattr(sparse[1], row_type).numpy()[world, :count]
+                    np.testing.assert_array_equal(kinds, getattr(dense[1], row_type).numpy()[world, :count])
+                    np.testing.assert_allclose(
+                        getattr(sparse[1], rhs).numpy()[world, :count],
+                        getattr(dense[1], rhs).numpy()[world, :count],
+                        atol=2.0e-5,
+                        rtol=2.0e-5,
+                    )
                     actual = getattr(sparse[1], target).numpy()[world, :count]
                     expected = getattr(dense[1], target).numpy()[world, :count]
-                    np.testing.assert_allclose(actual, expected, atol=2.0e-5, rtol=2.0e-5)
-                    targets_seen[family] |= bool(np.any(np.abs(actual) > 0.01))
+                    live_metadata = np.ones(count, dtype=bool)
+                    if family == 0 and sparse[1]._sparse_prepare_contacts:
+                        # Prepared tangents consume prescribed targets directly
+                        # in RHS; only normals retain restitution metadata.
+                        live_metadata = kinds != PGS_CONSTRAINT_TYPE_FRICTION
+                        tangent_target_seen |= bool(np.any(np.abs(expected[~live_metadata]) > 0.01))
+                    np.testing.assert_allclose(actual[live_metadata], expected[live_metadata], atol=2.0e-5, rtol=2.0e-5)
+                    targets_seen[family] |= bool(np.any(np.abs(actual[live_metadata]) > 0.01))
             prescribed_bodies = np.flatnonzero(sparse[1]._body_prescribed.numpy())
             np.testing.assert_allclose(
                 sparse[2].body_qd.numpy()[prescribed_bodies],
@@ -196,6 +216,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
                 atol=1.0e-6,
             )
         self.assertEqual(targets_seen, [True, True], "Exercise prescribed targets on both contact families")
+        self.assertTrue(tangent_target_seen, "Exercise prescribed tangential motion in prepared RHS")
         self.assert_sparse_state(sparse)
 
     def assert_states_close(self, first, second):

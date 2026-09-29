@@ -526,34 +526,33 @@ def _get_sparse_contact_response_kernel(
                         rows.restitution[world, slot] = restitution
                     rows.rhs[world, slot] = -target + bias
 
-            # Keep response matrices out of the metadata writers' live state.
+            # Fixed component constructors avoid materializing dynamically
+            # indexed matrices in local memory during geometry assembly.
             angular_a = wp.mat33(0.0)
             angular_b = wp.mat33(0.0)
             directions = wp.mat33(0.0)
             if lane == 0:
-                for row in range(3):
-                    if row >= row_count:
-                        continue
-                    direction = normal
-                    anchor_a = point_a
-                    anchor_b = point_b
-                    if row != 0:
-                        direction = tangent0
-                        if row == 2:
-                            direction = tangent1
-                        anchor_a = friction_point_a
-                        anchor_b = friction_point_b
-                    # J = [direction, (point - origin) x direction] dot motion.
-                    wrench_a = wp.vec3(0.0)
-                    wrench_b = wp.vec3(0.0)
-                    if art_a >= 0 and articulation_response_dof_count[art_a] > 0:
-                        wrench_a = wp.cross(anchor_a - articulation_origin[art_a], direction)
-                    if art_b >= 0 and articulation_response_dof_count[art_b] > 0:
-                        wrench_b = wp.cross(anchor_b - articulation_origin[art_b], direction)
-                    for axis in range(3):
-                        angular_a[row, axis] = wrench_a[axis]
-                        angular_b[row, axis] = wrench_b[axis]
-                        directions[row, axis] = direction[axis]
+                normal_a = wp.vec3(0.0)
+                normal_b = wp.vec3(0.0)
+                tangent0_a = wp.vec3(0.0)
+                tangent1_a = wp.vec3(0.0)
+                tangent0_b = wp.vec3(0.0)
+                tangent1_b = wp.vec3(0.0)
+                if art_a >= 0 and articulation_response_dof_count[art_a] > 0:
+                    normal_a = wp.cross(point_a - articulation_origin[art_a], normal)
+                    if row_count > 1:
+                        friction_arm_a = friction_point_a - articulation_origin[art_a]
+                        tangent0_a = wp.cross(friction_arm_a, tangent0)
+                        tangent1_a = wp.cross(friction_arm_a, tangent1)
+                if art_b >= 0 and articulation_response_dof_count[art_b] > 0:
+                    normal_b = wp.cross(point_b - articulation_origin[art_b], normal)
+                    if row_count > 1:
+                        friction_arm_b = friction_point_b - articulation_origin[art_b]
+                        tangent0_b = wp.cross(friction_arm_b, tangent0)
+                        tangent1_b = wp.cross(friction_arm_b, tangent1)
+                angular_a = wp.matrix_from_rows(normal_a, tangent0_a, tangent1_a)
+                angular_b = wp.matrix_from_rows(normal_b, tangent0_b, tangent1_b)
+                directions = wp.matrix_from_rows(normal, tangent0, tangent1)
             project_native(
                 tid,
                 body_a,
