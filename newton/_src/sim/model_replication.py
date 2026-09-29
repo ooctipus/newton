@@ -321,15 +321,106 @@ def _world_copy_arrays(source: Model, target: Model, states=(), controls=()):
     return result
 
 
+@wp.struct
+class _WorldCopyField:
+    source: wp.uint64
+    target: wp.uint64
+    width: int
+    start: wp.int64
+    unit: int
+
+
+@wp.kernel(module="unique", enable_backward=False)
+def _copy_world_packed(
+    fields: wp.array[_WorldCopyField], source_ids: wp.array[int], target_ids: wp.array[int], status: wp.array[int]
+):
+    actor, block = wp.tid()
+    if status[0] != 0:
+        return
+    column = wp.int64(block) * wp.int64(4)
+    lo, hi = int(0), fields.shape[0]
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if column < fields[mid].start:
+            hi = mid
+        else:
+            lo = mid
+    field = fields[lo]
+    local = int(column - field.start)
+    rowbytes = wp.uint64(field.width) * wp.uint64(field.unit)
+    src = field.source + wp.uint64(source_ids[actor]) * rowbytes
+    dst = field.target + wp.uint64(target_ids[actor]) * rowbytes
+    if field.unit == 4:
+        source_words = wp.array(ptr=src, shape=(field.width,), dtype=wp.uint32)
+        target_words = wp.array(ptr=dst, shape=(field.width,), dtype=wp.uint32)
+        for component in range(4):
+            if local + component < field.width:
+                target_words[local + component] = source_words[local + component]
+    else:
+        source_bytes = wp.array(ptr=src, shape=(field.width,), dtype=wp.uint8)
+        target_bytes = wp.array(ptr=dst, shape=(field.width,), dtype=wp.uint8)
+        for component in range(4):
+            if local + component < field.width:
+                target_bytes[local + component] = source_bytes[local + component]
+
+
 def _copy_world_arrays(arrays, source_ids, target_ids, status):
     """Copy previously validated rows; failed solver transfer leaves them untouched."""
     if not source_ids.size:
         return
-    # Prepare every dtype before the first launch, compiling the complete set once.
-    kernels = {
-        src.dtype: _copy_world_value_kernel(src.dtype) for src, _, offset, _ in arrays if offset is None and src.size
-    }
+    # Preserve read/write dependencies across aliased fields; otherwise group canonical plain rows.
+    spans = sorted(
+        (value.ptr, value.ptr + value.size * value.strides[-1], write)
+        for src, dst, _, _ in arrays
+        for write, value in ((False, src), (True, dst))
+        if value.size
+    )
+    read_end, write_end, overlap = 0, 0, False
+    for start, end, write in spans:
+        if start < write_end or (write and start < read_end):
+            overlap = True
+            break
+        if write:
+            write_end = max(write_end, end)
+        else:
+            read_end = max(read_end, end)
+    records, ordinary, descriptors, total = [], [], [], 0
     for src, dst, offset, width in arrays:
+        if not src.size:
+            continue
+        rowbytes = width * src.strides[-1]
+        unit = 4 if rowbytes % 4 == 0 and src.ptr % 4 == 0 and dst.ptr % 4 == 0 else 1
+        if (
+            overlap
+            or offset is not None
+            or any(
+                value.device != status.device or not value.is_contiguous or value.requires_grad for value in (src, dst)
+            )
+            or rowbytes // unit >= 2**31 - 4
+        ):
+            ordinary.append((src, dst, offset, width))
+        else:
+            descriptors.append((src.ptr, dst.ptr, rowbytes // unit, total, unit))
+            total += ((rowbytes // unit + 3) // 4) * 4
+            records.append((src, dst, offset, width))
+    if source_ids.size * (total // 4) >= 2**31:
+        ordinary.extend(records)
+    elif records:
+        # Public struct layout and kernel-local views avoid per-field Python array wrappers.
+        host = wp.array(np.array(descriptors, dtype=_WorldCopyField.numpy_dtype()), dtype=_WorldCopyField, device="cpu")
+        fields = host.to(status.device)
+        wp.launch(
+            _copy_world_packed,
+            (source_ids.size, total // 4),
+            [fields, source_ids, target_ids, status],
+            device=status.device,
+        )
+        # Ordinary graphs do not retain raw pointers or upload storage; status does.
+        status._newton_world_copy_storage = (host, fields, source_ids, target_ids, tuple(records))
+    kernels = {
+        src.dtype: _copy_world_value_kernel(src.dtype) for src, _, offset, _ in ordinary if offset is None and src.size
+    }
+    for src, dst, offset, width in ordinary:
         if not src.size:
             continue
         if offset is None:
