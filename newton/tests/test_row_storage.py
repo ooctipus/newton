@@ -612,6 +612,22 @@ class NativeStorageTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 rows.fill(rows.arrays["empty"], 0, count=invalid)
 
+    def test_suffix_memory_operations_validate_start_and_count_before_launch(self):
+        """Reject invalid row intervals even for empty fields without recording writes."""
+        rows, _, _, _ = self.create()
+        for start in (-1, 258, True, 0.5):
+            with self.subTest(start=start), self.assertRaises(ValueError):
+                rows.zero(start=start)
+            with self.subTest(start=start), self.assertRaises(ValueError):
+                rows.fill(rows.arrays["empty"], 0, start=start)
+        for count in (FakeArray([0], dtype=float), FakeArray([0, 1], dtype=int)):
+            with self.assertRaises(ValueError):
+                rows.zero(count=count)
+        before = self.wp.calls.get("launch", 0)
+        rows.zero(start=257)
+        rows.fill(rows.arrays["q"], 0, start=257)
+        self.assertEqual(self.wp.calls.get("launch", 0), before)
+
     def test_closed_owner_rejects_operations_even_for_empty_arrays(self):
         """Verify closed owner rejects operations even for empty arrays."""
         rows, source, _, _ = self.create()
@@ -619,6 +635,7 @@ class NativeStorageTests(unittest.TestCase):
         actions = (
             lambda: rows.copy(source.empty, source.empty),
             lambda: rows.fill(source.empty, 0),
+            rows.zero,
             lambda: rows.prepare_fill(source.empty, 0),
             lambda: rows.lookup(source.empty),
             lambda: rows.resize_backing(0, streams=(11,)),
@@ -647,6 +664,47 @@ class NativeStorageTests(unittest.TestCase):
             with self.subTest(alignment=alignment), self.assertRaisesRegex(ValueError, "alignment"):
                 storage.RowStorage(3, count, fields=(storage.FieldSpec("x", (), real_wp.float32, alignment=alignment),))
             self.assertEqual(self.wp.calls, before)
+
+    def test_same_granule_resize_checks_liveness_without_republishing_readiness(self):
+        """Same granule resize checks liveness without republishing readiness."""
+        rows, _, _, _ = self.create(initial=1)
+        self.wp.events.clear()
+        rows.resize_backing(20, streams=(11,))
+        self.assertIn("read", self.wp.events)
+        self.assertNotIn("fill", self.wp.events)
+        self.assertNotIn("synchronize", self.wp.events)
+        self.assertEqual(rows.ready_rows, 128)
+        rows.count._values[0] = 21
+        with self.assertRaisesRegex(RuntimeError, "live"):
+            rows.resize_backing(20, streams=(11,))
+
+    def test_borrowed_maintenance_requires_the_current_backing_scope(self):
+        """Borrowed maintenance requires the current backing scope."""
+        rows, _, owner, driver = self.create(initial=1)
+        with self.assertRaisesRegex(RuntimeError, "maintenance"):
+            rows.resize_backing(20)
+        before = driver.calls.get("cuStreamSynchronize", 0)
+        with owner.maintenance(streams=(11,)):
+            rows.resize_backing(20)
+            rows.resize_backing(257)
+            rows.resize_backing(0)
+        self.assertEqual(driver.calls["cuStreamSynchronize"] - before, 1)
+        self.assertEqual(rows.ready_rows, 0)
+
+    def test_joined_batch_count_avoids_duplicate_readback_but_preserves_retirement_checks(self):
+        """Joined batch count avoids duplicate readback but preserves retirement checks."""
+        rows, _, owner, _ = self.create(initial=1)
+        with self.assertRaisesRegex(ValueError, "joined"):
+            rows.resize_backing(20, streams=(11,), live_count=0)
+        with self.assertRaisesRegex(RuntimeError, "maintenance"):
+            rows.resize_backing(20, live_count=0)
+        with owner.maintenance(streams=(11,)):
+            self.wp.events.clear()
+            rows.resize_backing(20, live_count=10)
+            self.assertNotIn("read", self.wp.events)
+            for live in (-1, 21, rows.ready_rows + 1):
+                with self.subTest(live=live), self.assertRaisesRegex(RuntimeError, "live|invalid"):
+                    rows.resize_backing(20, live_count=live)
 
 
 class RowStorageGPU(unittest.TestCase):
@@ -847,6 +905,33 @@ class RowStorageGPU(unittest.TestCase):
                         with backing.maintenance(streams=(stream,)):
                             backing.close()
                         self.assertEqual(backing.memory_report()["physical_retained_bytes"], 0)
+
+    def test_suffix_fills_preserve_prior_rows_for_word_and_byte_fields(self):
+        """Suffix fills preserve prior rows for word and byte fields."""
+        wp = real_wp
+        with wp.ScopedDevice("cuda:0"):
+            count = wp.array([7], dtype=int)
+            specs = (
+                storage.FieldSpec("q", (3,), wp.float32),
+                storage.FieldSpec("flag", (3,), wp.bool),
+                storage.FieldSpec("basis", (2,), wp.vec3),
+                storage.FieldSpec("time", (), wp.float32, False),
+            )
+            rows = storage.RowStorage(7, count, fields=specs)
+            for array in rows.arrays.values():
+                rows.fill(array, 1)
+            rows.zero(start=4)
+            for array in rows.arrays.values():
+                expected = np.ones_like(array.numpy())
+                expected[4:] = 0
+                np.testing.assert_array_equal(array.numpy(), expected)
+                rows.fill(array, 1)
+                rows.fill(array, 0, start=6)
+                expected[...] = 1
+                expected[6:] = 0
+                np.testing.assert_array_equal(array.numpy(), expected)
+            array = None
+            rows.close(streams=(wp.get_stream().cuda_stream,))
 
 
 if __name__ == "__main__":

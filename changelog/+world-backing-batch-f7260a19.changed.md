@@ -1,0 +1,1 @@
+Batch experimental native-world backing service across all prototypes, reclaim shrinking ranges before growth, and initialize only newly mapped scratch rows. Replace scalar prototype service with `MuJoCoWorlds.resize_backing(rows, streams=...)`, where `rows` contains one target per prototype.

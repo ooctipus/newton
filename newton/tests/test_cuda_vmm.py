@@ -658,6 +658,27 @@ class BackingTests(unittest.TestCase):
                 self.fail("closed owner cannot enter maintenance")
         self.assertTrue(self.assert_ledger(owner, driver)["closed"])
 
+    def test_failed_region_growth_preserves_other_regions_and_global_handle_ownership(self):
+        """Failed region growth preserves other regions and global handle ownership."""
+        owner, driver = self.make_owner()
+        unit = driver.granularity
+        first, second = owner.reserve(2 * unit), owner.reserve(2 * unit)
+        with owner.maintenance(streams=(0,)):
+            owner.map(first, 0, 2 * unit)
+            original = dict(driver.mappings)
+            driver.fail("cuMemSetAccess", after=2)
+            driver.fail("cuMemUnmap")
+            with self.assertRaisesRegex(ExceptionGroup, "rollback"):
+                owner.map(second, 0, 2 * unit)
+            self.assertEqual(owner.mapped_ranges(first), ((0, 2 * unit),))
+            self.assertEqual(owner.mapped_ranges(second), ((unit, unit),))
+            for address, handle in original.items():
+                self.assertEqual(driver.mappings[address], handle)
+            self.assertEqual(self.assert_ledger(owner, driver)["mapped_bytes"], 3 * unit)
+            owner.release(second)
+            self.assertEqual(owner.mapped_ranges(first), ((0, 2 * unit),))
+            self.assertEqual(self.assert_ledger(owner, driver)["mapped_bytes"], 2 * unit)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -103,7 +103,7 @@ class WorldDirectoryData:
     """Experimental GPU identity, slot and membership arrays owned by WorldDirectory."""
 
     prototype: wp.array[int]
-    slot: wp.array[int]
+    slot: wp.array[int]  # prototype-local row; global slot arrays use starts[prototype] + slot
     generation: wp.array[wp.uint64]
     free_ids: wp.array[int]
     id_count: wp.array[int]
@@ -131,7 +131,7 @@ class WorldTransaction:
     initialized: wp.array[wp.uint64]  # acknowledged batch sequence, per request
     status: wp.array[int]
     destination_id: wp.array[int]
-    destination_slot: wp.array[int]
+    destination_slot: wp.array[int]  # prototype-local row, including before publication
     observed_generation: wp.array[wp.uint64]
     claims: wp.array[int]  # one ticket counter per prototype, followed by the ID counter
     dirty: wp.array[int]  # any successfully published lifetime change in this batch
@@ -423,21 +423,20 @@ def _publish_compaction(d: WorldDirectoryData, t: WorldTransaction, moves: World
 
 
 @wp.kernel
-def _check_shrink(d: WorldDirectoryData, prototype: int, first_removed: int, capacity: int, failure: wp.array[int]):
+def _check_shrink(d: WorldDirectoryData, ends: wp.array[int], failure: wp.array[int]):
     slot = wp.tid()
-    if slot >= first_removed and slot < capacity:
-        if d.slot_state[d.starts[prototype] + slot] == LIVE:
-            wp.atomic_max(failure, 0, 1)
+    prototype = d.slot_prototype[slot]
+    if slot - d.starts[prototype] >= ends[prototype] and d.slot_state[slot] == LIVE:
+        wp.atomic_max(failure, 0, 1)
 
 
 @wp.kernel
-def _publish_capacity(d: WorldDirectoryData, prototype: int, ready_end: int, capacity: int):
+def _publish_capacity(d: WorldDirectoryData, ends: wp.array[int]):
     slot = wp.tid()
-    if slot < ready_end and slot < capacity:
-        index = d.starts[prototype] + slot
-        if d.slot_state[index] != LIVE:
-            d.slot_state[index] = READY
-            d.slot_rank[index] = -1
+    prototype = d.slot_prototype[slot]
+    if slot - d.starts[prototype] < ends[prototype] and d.slot_state[slot] != LIVE:
+        d.slot_state[slot] = READY
+        d.slot_rank[slot] = -1
 
 
 def _validate_arrays(record, schema, capacity, device, scalars=()):
@@ -519,13 +518,12 @@ def _finish_moves(d: WorldDirectoryData, t: WorldTransaction):
 
 
 @wp.kernel
-def _withdraw_ready(d: WorldDirectoryData, prototype: int, ready_end: int, capacity: int):
+def _withdraw_ready(d: WorldDirectoryData, ends: wp.array[int]):
     slot = wp.tid()
-    if slot >= ready_end and slot < capacity:
-        index = d.starts[prototype] + slot
-        if d.slot_state[index] == READY:
-            d.slot_state[index] = UNBACKED
-            d.slot_rank[index] = -1
+    prototype = d.slot_prototype[slot]
+    if slot - d.starts[prototype] >= ends[prototype] and d.slot_state[slot] == READY:
+        d.slot_state[slot] = UNBACKED
+        d.slot_rank[slot] = -1
 
 
 class WorldDirectory:
@@ -590,6 +588,7 @@ class WorldDirectory:
         for name in ("sources", "destinations", "copied"):
             setattr(self.moves, name, wp.zeros(len(slot_limits), dtype=int, device=self.device))
         self._capacity_failure = wp.zeros(1, dtype=int, device=self.device)
+        self._capacity_ends = wp.zeros(len(slot_limits), dtype=int, device=self.device)
         self._rebuild(conditional=False)
 
     def _ensure_open(self):
@@ -662,36 +661,34 @@ class WorldDirectory:
         self._rebuild(conditional=False)
         wp.launch(_finish_moves, 1, [self.d, self.t], device=self.device)
 
-    def _capacity_args(self, prototype, end):
+    def _capacity_args(self, ends):
         self._ensure_open()
-        if (
-            type(prototype) is not int
-            or not 0 <= prototype < len(self.slot_limits)
-            or type(end) is not int
-            or not 0 <= end <= self.slot_limits[prototype]
+        ends = tuple(ends)
+        if len(ends) != len(self.slot_limits) or any(
+            type(end) is not int or not 0 <= end <= capacity
+            for end, capacity in zip(ends, self.slot_limits, strict=True)
         ):
             raise ValueError("Ready prefix is outside the prepared slot limits")
         if self.t.phase.numpy()[0] != IDLE:
             raise RuntimeError("Capacity service cannot interrupt an open transaction")
+        self._capacity_ends.assign(np.asarray(ends, dtype=np.int32))
 
-    def withdraw_ready(self, prototype: int, end: int):
-        """Cold joined service: withdraw a tail before domain storage is retired."""
-        self._capacity_args(prototype, end)
-        capacity = self.slot_limits[prototype]
+    def withdraw_ready(self, ends: tuple[int, ...]):
+        """Withdraw every requested tail together before domain storage is retired."""
+        self._capacity_args(ends)
         self._capacity_failure.zero_()
         wp.launch(
-            _check_shrink, capacity, [self.d, prototype, end, capacity, self._capacity_failure], device=self.device
+            _check_shrink, self.slot_capacity, [self.d, self._capacity_ends, self._capacity_failure], device=self.device
         )
         if self._capacity_failure.numpy()[0]:
             raise RuntimeError("Cannot withdraw a range containing live worlds; compact or destroy them first")
-        wp.launch(_withdraw_ready, capacity, [self.d, prototype, end, capacity], device=self.device)
+        wp.launch(_withdraw_ready, self.slot_capacity, [self.d, self._capacity_ends], device=self.device)
         self._rebuild(conditional=False)
 
-    def publish_ready(self, prototype: int, end: int):
-        """Cold joined service: caller certifies every domain field in this prefix is usable."""
-        self._capacity_args(prototype, end)
-        capacity = self.slot_limits[prototype]
-        wp.launch(_publish_capacity, capacity, [self.d, prototype, end, capacity], device=self.device)
+    def publish_ready(self, ends: tuple[int, ...]):
+        """Publish jointly usable prefixes with one membership rebuild for the batch."""
+        self._capacity_args(ends)
+        wp.launch(_publish_capacity, self.slot_capacity, [self.d, self._capacity_ends], device=self.device)
         self._rebuild(conditional=False)
 
     def retain_graph(self, graph, *buffers):
@@ -720,4 +717,5 @@ class WorldDirectory:
                 getattr(record, name).capacity for record in (self.d, self.t, self.moves) for name in record._cls.vars
             )
             + self._capacity_failure.capacity
+            + self._capacity_ends.capacity
         }
