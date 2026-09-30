@@ -18,3 +18,4 @@
    api/newton_usd
    api/newton_utils
    api/newton_viewer
+   api/newton_worlds

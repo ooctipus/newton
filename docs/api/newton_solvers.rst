@@ -34,6 +34,7 @@ https://newton-physics.github.io/newton/stable/solvers/index.html.
    :toctree: _generated
    :nosignatures:
 
+   MuJoCoWorlds
    SolverBase
    SolverFeatherstone
    SolverImplicitMPM

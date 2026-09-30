@@ -20,6 +20,7 @@ newton
 - :doc:`newton.usd <newton_usd>`
 - :doc:`newton.utils <newton_utils>`
 - :doc:`newton.viewer <newton_viewer>`
+- :doc:`newton.worlds <newton_worlds>`
 
 .. rubric:: Classes
 
@@ -77,6 +78,6 @@ newton
    * - ``MAXVAL``
      - ``10000000000.0``
    * - ``__version__``
-     - ``1.7.0.dev0``
+     - ``1.6.0rc1``
    * - ``use_coord_layout_targets``
      - ``True``
