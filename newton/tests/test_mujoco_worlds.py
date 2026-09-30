@@ -723,6 +723,169 @@ class TestMuJoCoWorlds(unittest.TestCase):
                 gc.collect()
                 population.close(streams=(wp.get_stream(device).cuda_stream,))
 
+    @unittest.skipUnless(
+        os.environ.get("NEWTON_TEST_CUDA_UUID"), "Set an explicit CUDA UUID for native population tests"
+    )
+    def test_equal_sequence_skips_lifecycle_after_compaction(self):
+        """Skip transaction scratch on repeats while preserving advancement and every error path."""
+        import mujoco
+        import mujoco_warp as mjw
+
+        wp.init()
+        device = wp.get_device("cuda:0")
+        assert wp.get_cuda_device_count() == 1
+        self.assertEqual(device.uuid, os.environ["NEWTON_TEST_CUDA_UUID"])
+        graph = None
+        with wp.ScopedDevice(device):
+            prepared = [_prototype(keys, mujoco, mjw) for keys in (6, 108)]
+            population = MuJoCoWorlds(prepared, capacities=(8, 8), id_capacity=6, command_capacity=6)
+            commands, results = create_world_commands(6, device=device), create_world_results(6, device=device)
+            permit, calls = wp.zeros(1, dtype=int, device=device), wp.zeros(2, dtype=int, device=device)
+            initialized_calls = calls[1:]
+            offset = wp.zeros(6, dtype=float, device=device)
+
+            def validate(command, transaction):
+                wp.launch(_record_control, 1, [calls], device=device)
+
+            def payload(group, requests, destinations, count, status, transaction, sequence):
+                wp.launch(
+                    _initialize_payload,
+                    6,
+                    [
+                        requests,
+                        destinations,
+                        count,
+                        status,
+                        transaction,
+                        sequence,
+                        offset,
+                        group.data.qpos,
+                        group.data.mocap_pos,
+                    ],
+                    device=device,
+                )
+                wp.launch(_record_control, 1, [initialized_calls], device=device)
+
+            def replay():
+                wp.capture_launch(graph)
+                wp.synchronize_stream(wp.get_stream(device))
+
+            try:
+                wp.load_module(module=__name__, device=device)
+                graph = population.capture(
+                    commands,
+                    results,
+                    permit=permit,
+                    validate=validate,
+                    initialize=payload,
+                    retain=(calls, offset, initialized_calls),
+                )
+                executable = int(graph.graph_exec.value)
+                commands.sequence.fill_(1)
+                commands.count.fill_(6)
+                commands.op.fill_(int(WorldOperation.CREATE))
+                commands.prototype.assign(np.array([0, 0, 0, 1, 1, 1], dtype=np.int32))
+                replay()
+                np.testing.assert_array_equal(results.status.numpy(), np.zeros(6, dtype=np.int32))
+                d = population.directory.d
+                prototypes, slots, generations = d.prototype.numpy(), d.slot.numpy(), d.generation.numpy()
+                victim = min(np.flatnonzero(prototypes == 0), key=lambda identity: slots[identity])
+                commands.sequence.fill_(2)
+                commands.count.fill_(1)
+                commands.op.fill_(int(WorldOperation.DESTROY))
+                commands.id.fill_(int(victim))
+                commands.generation.fill_(int(generations[victim]))
+                replay()
+                assert results.status.numpy()[0] == 0
+                assert population.prototypes[0].move_count.numpy()[0] > 0
+                assert population.directory.t.phase.numpy()[0] == int(WorldPhase.IDLE)
+                np.testing.assert_array_equal(calls.numpy(), [2, 4])
+                counts = d.active_count.numpy()
+                saved = [
+                    {name: getattr(_prefix(group.data, int(n)), name).numpy() for name in ("qpos", "qvel", "time")}
+                    for group, n in zip(population.prototypes, counts, strict=True)
+                ]
+                handles = {name: getattr(d, name).numpy() for name in ("prototype", "slot", "generation")}
+                # Deliberately stale transfer metadata must never be consumed when the branch is skipped.
+                for group in population.prototypes:
+                    group.initialization_count.fill_(3)
+                    group.move_count.fill_(3)
+                    group.source_ids.fill_(-1)
+                    group.destination_ids.fill_(-1)
+                    group.move_sources.fill_(-1)
+                    group.move_destinations.fill_(-1)
+                commands.op.fill_(int(WorldOperation.RESET))
+                commands.id.fill_(-1)
+                for _ in range(3):
+                    replay()
+                    np.testing.assert_array_equal(calls.numpy(), [2, 4])
+                    assert population._lifecycle_needed.numpy()[0] == 0
+                    for name, value in handles.items():
+                        np.testing.assert_array_equal(getattr(d, name).numpy(), value)
+                    for group, n, old in zip(population.prototypes, counts, saved, strict=True):
+                        for name, value in old.items():
+                            np.testing.assert_array_equal(getattr(_prefix(group.data, int(n)), name).numpy(), value)
+                permit.fill_(1)
+                replay()
+                np.testing.assert_array_equal(calls.numpy(), [2, 4])
+                for group, n, old in zip(population.prototypes, counts, saved, strict=True):
+                    assert np.all(_prefix(group.data, int(n)).time.numpy() > old["time"])
+                    assert not group.updates.errors.numpy()[: len(group.bindings)].any()
+                permit.zero_()
+                commands.sequence.fill_(3)
+                commands.count.zero_()
+                replay()
+                np.testing.assert_array_equal(calls.numpy(), [3, 6])
+                for group in population.prototypes:
+                    assert group.initialization_count.numpy()[0] == 0
+                    assert group.move_count.numpy()[0] == 0
+                current_prototypes, current_generations = d.prototype.numpy(), d.generation.numpy()
+                survivor = int(np.flatnonzero(current_prototypes == 0)[0])
+                commands.sequence.fill_(4)
+                commands.count.fill_(1)
+                commands.op.fill_(int(WorldOperation.RESET))
+                commands.id.fill_(survivor)
+                commands.generation.fill_(int(current_generations[survivor]))
+                commands.prototype.fill_(1)
+                replay()
+                assert results.status.numpy()[0] == 0
+                assert d.prototype.numpy()[survivor] == 1
+                assert d.generation.numpy()[survivor] == current_generations[survivor] + 1
+                np.testing.assert_array_equal(calls.numpy(), [4, 8])
+                # A failed individual request has no batch error, but its permit must remain blocked.
+                commands.sequence.fill_(5)
+                commands.generation.fill_(int(d.generation.numpy()[survivor]) - 1)
+                replay()
+                assert results.status.numpy()[0] != 0
+                assert d.flags.numpy()[2] == 0 and d.flags.numpy()[1] == 0
+                np.testing.assert_array_equal(calls.numpy(), [5, 10])
+                failed_times = [group.data.time.numpy().copy() for group in population.prototypes]
+                permit.fill_(1)
+                for _ in range(2):
+                    replay()
+                    np.testing.assert_array_equal(calls.numpy(), [5, 10])
+                    assert population._lifecycle_needed.numpy()[0] == 0
+                    for group, value in zip(population.prototypes, failed_times, strict=True):
+                        np.testing.assert_array_equal(group.data.time.numpy(), value)
+                permit.zero_()
+                # Stale-sequence and repeated-error frames retain the previous complete error path.
+                commands.sequence.fill_(1)
+                replay()
+                np.testing.assert_array_equal(calls.numpy(), [6, 12])
+                assert population._lifecycle_needed.numpy()[0] == 1
+                assert d.flags.numpy()[1] == 0
+                replay()
+                np.testing.assert_array_equal(calls.numpy(), [7, 14])
+                assert int(graph.graph_exec.value) == executable
+                self.assertEqual(population.memory_report()["health_metadata_bytes"], 12)
+            except BaseException as error:
+                traceback.clear_frames(error.__traceback__)
+                raise
+            finally:
+                graph = None
+                gc.collect()
+                population.close(streams=(wp.get_stream(device).cuda_stream,))
+
     def _trace(self, population, prepared, defaults, mjw):
         """Run independent lifetime-aware oracle rows and compare physical/derived fields."""
         device = population.device
