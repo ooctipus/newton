@@ -223,9 +223,12 @@ have explicit independent W/C/D count sources. Fixed worker grids remain fixed.
 `RowStorage` receives `FieldSpec(name, inner_shape, dtype, packed, alignment)` and
 one authoritative count. It has no native schema or defaults. Packed rows share
 a reservation; optional dense fields remain ordinary Warp arrays. Natural scalar
-alignment is the default. Native world and CCD fields explicitly request 16-byte
-alignment because aligned tile consumers require it. Candidate/contact fields use
-scalar alignment. Field payload and padding are reported separately.
+alignment is the default. Native world and CCD packing conservatively requests
+16-byte alignment; blocked Cholesky matrix consumers specifically require it.
+Candidate/contact fields use scalar alignment. A packed field element starts at
+`reservation_base + field_offset + row * row_bytes`; its typed view is strided
+across rows, while each field's inner row stays contiguous. Field payload and
+padding are reported separately.
 
 `RowTransfer` validates source/destination indices, readiness, duplicates and
 unsupported overlap before writing. Its GPU status must be successful before the
@@ -275,7 +278,7 @@ contact budgets, actions, reset cadence and complete maintenance cost.
 ### Joined backing service
 
 `MuJoCoWorlds.resize_backing(rows, streams=...)` accepts one target prefix per
-prototype and excludes new submissions until it returns. The existing native
+prototype. The caller must exclude new submissions until it returns. The native
 composition root owns the W/C/D service order; the mechanical owners and file
 tree remain unchanged. It validates and withdraws the whole directory batch,
 joins consumers once, returns all safe shrinking ranges before any growth, then
