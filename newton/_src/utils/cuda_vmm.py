@@ -330,11 +330,19 @@ class CudaBacking:
         del self._pins[region.address]
         del self._pages[region.address]
 
-    def trim(self):
-        """Release all currently unmapped physical handles back to CUDA."""
+    def trim(self, *, keep_bytes: int = 0):
+        """Release spare handles, retaining the requested reserve when available.
+
+        The reserve rounds up to whole allocation granules and never allocates
+        missing handles. Mapped backing and virtual reservations are untouched.
+        Failed releases remain owned and retryable above the retained reserve.
+        """
         self._check(maintenance=True)
+        if type(keep_bytes) is not int or keep_bytes < 0:
+            raise ValueError("Retained spare bytes must be a nonnegative integer")
+        keep_count = (keep_bytes + self.granularity_bytes - 1) // self.granularity_bytes
         errors = []
-        for index in range(len(self._free) - 1, -1, -1):
+        for index in range(len(self._free) - 1, keep_count - 1, -1):
             handle = self._free[index]
             try:
                 self._driver("cuMemRelease", handle)

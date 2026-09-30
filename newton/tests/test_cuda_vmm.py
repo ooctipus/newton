@@ -618,6 +618,61 @@ class BackingTests(unittest.TestCase):
             owner.trim()
         self.assertEqual(self.assert_ledger(owner, driver)["physical_retained_bytes"], 0)
 
+    def test_trim_preserves_rounded_reserve_and_mapped_backing(self):
+        """A spare cap never touches live maps or creates missing reserve."""
+        owner, driver = self.make_owner(granules=6)
+        unit = driver.granularity
+        region = owner.reserve(6 * unit)
+        with owner.maintenance(streams=(0,)):
+            owner.map(region, 0, 6 * unit)
+            owner.unmap(region, 2 * unit, 4 * unit)
+            mappings, reservations = dict(driver.mappings), dict(driver.reservations)
+            creates = driver.calls["cuMemCreate"]
+            owner.trim(keep_bytes=unit + 1)
+            report = self.assert_ledger(owner, driver)
+            self.assertEqual(report["spare_bytes"], 2 * unit)
+            self.assertEqual(report["mapped_bytes"], 2 * unit)
+            self.assertEqual(driver.mappings, mappings)
+            self.assertEqual(driver.reservations, reservations)
+            releases = driver.calls["cuMemRelease"]
+            owner.trim(keep_bytes=100 * unit)
+            self.assertEqual(driver.calls["cuMemRelease"], releases)
+            self.assertEqual(driver.calls["cuMemCreate"], creates)
+            owner.map(region, 2 * unit, 2 * unit)
+            self.assertEqual(driver.calls["cuMemCreate"], creates)
+            self.assertEqual(self.assert_ledger(owner, driver)["spare_bytes"], 0)
+
+    def test_trim_invalid_reserve_does_not_release_handles(self):
+        """Reject ambiguous units and negative budgets before driver mutation."""
+        owner, driver = self.make_owner()
+        region = owner.reserve(driver.granularity)
+        with owner.maintenance(streams=(0,)):
+            owner.map(region, 0, driver.granularity)
+            owner.unmap(region, 0, driver.granularity)
+            for value in (-1, True, False, 1.0, "1", None):
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    owner.trim(keep_bytes=value)
+            self.assertEqual(driver.calls["cuMemRelease"], 0)
+            self.assertEqual(self.assert_ledger(owner, driver)["spare_bytes"], driver.granularity)
+
+    def test_trim_failure_retains_reserve_and_failed_surplus_for_retry(self):
+        """Partial release faults preserve both the reserve and failed ownership."""
+        owner, driver = self.make_owner(granules=5)
+        unit = driver.granularity
+        region = owner.reserve(5 * unit)
+        with owner.maintenance(streams=(0,)):
+            owner.map(region, 0, 5 * unit)
+            owner.unmap(region, 0, 5 * unit)
+            driver.fail("cuMemRelease")
+            with self.assertRaises(ExceptionGroup):
+                owner.trim(keep_bytes=2 * unit)
+            self.assertEqual(self.assert_ledger(owner, driver)["spare_bytes"], 3 * unit)
+            self.assertEqual(driver.calls["cuMemRelease"], 3)
+            owner.trim(keep_bytes=2 * unit)
+            self.assertEqual(self.assert_ledger(owner, driver)["spare_bytes"], 2 * unit)
+            owner.trim()
+            self.assertEqual(self.assert_ledger(owner, driver)["physical_retained_bytes"], 0)
+
     def test_close_retries_surviving_resources_after_each_retirement_failure(self):
         """Verify close retries surviving resources after each retirement failure."""
         for operation in ("cuMemUnmap", "cuMemAddressFree", "cuMemRelease"):

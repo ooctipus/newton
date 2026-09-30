@@ -244,7 +244,7 @@ class _MuJoCoPrototype:
         self.operations.append({"operation": "copy", "domain": domain, "field": field.name})
 
     def record_physics(self):
-        """Capture this prototype's updater and conditional native step on the current stream."""
+        """Record conditional native physics and poses on the current stream."""
         import mujoco_warp as mjw
 
         if self.workspace.observer is not None:
@@ -726,18 +726,24 @@ class MuJoCoWorlds:
         self._graph = weakref.ref(graph)
         return graph
 
-    def resize_backing(self, rows: tuple[int, ...], *, streams):
+    def resize_backing(self, rows: tuple[int, ...], *, streams, spare_bytes: int | None = None):
         """Join once, service all W/C/D prefixes, then publish one coherent ready set.
 
         The caller excludes new submissions until return. Contact/CCD scratch has
         no persistent lifetime after all consumers join. A clean budget rejection
         republishes the safely backed partial result; driver failures quarantine
         the complete population, including graphs held by external callers.
+        If specified, ``spare_bytes`` retains up to its granule-rounded amount
+        of available unmapped backing, without allocating reserve. ``None``
+        preserves all spare handles. Trimming after successful service uses the
+        same maintenance scope and adds no stream synchronization.
         """
         with wp.ScopedDevice(self.device):
             self._ensure_open()
             if self.backing is None:
                 raise RuntimeError("This population has fixed backing")
+            if spare_bytes is not None and (type(spare_bytes) is not int or spare_bytes < 0):
+                raise ValueError("Retained spare bytes must be a nonnegative integer or None")
             rows = tuple(rows)
             if len(rows) != len(self.prototypes) or any(
                 type(n) is not int
@@ -778,6 +784,8 @@ class MuJoCoWorlds:
                                 )
                     self.directory.publish_ready(tuple(group.ready_worlds for group in self.prototypes))
                     wp.synchronize_stream(wp.get_stream(self.device))
+                    if spare_bytes is not None:
+                        self.backing.trim(keep_bytes=spare_bytes)
                 except MemoryError:
                     if not budget_rejected:
                         self._service_failed = True

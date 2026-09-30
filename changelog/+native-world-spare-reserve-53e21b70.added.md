@@ -1,0 +1,1 @@
+Add optional granule-rounded spare backing reserves to `CudaBacking.trim` and `MuJoCoWorlds.resize_backing`, reusing the existing joined maintenance scope while preserving retain-all population defaults.
