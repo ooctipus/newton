@@ -79,7 +79,12 @@ class WorldPhase(IntEnum):
 
 @wp.struct
 class WorldCommands:
-    """Experimental caller-owned command arrays and monotonically increasing batch sequence."""
+    """Experimental caller-owned command arrays and increasing positive batch sequence.
+
+    CREATE ignores input id/generation and allocates a handle. RESET and DESTROY
+    validate the supplied handle. Count selects the request prefix. Equal-sequence
+    replays do not reconsume commands; retry rejected requests with a new sequence.
+    """
 
     sequence: wp.array[wp.uint64]
     count: wp.array[int]
@@ -91,7 +96,11 @@ class WorldCommands:
 
 @wp.struct
 class WorldResults:
-    """Experimental per-request status, assigned identity and generation arrays."""
+    """Experimental status and handles indexed by request ordinal, not world ID.
+
+    Only consumed requests refresh these arrays. Batch rejection can leave old
+    results intact; callers must also inspect WorldDirectoryData.flags.
+    """
 
     status: wp.array[int]
     id: wp.array[int]
@@ -100,7 +109,12 @@ class WorldResults:
 
 @wp.struct
 class WorldDirectoryData:
-    """Experimental GPU identity, slot and membership arrays owned by WorldDirectory."""
+    """Experimental GPU identity, slot and membership arrays owned by WorldDirectory.
+
+    active_count counts live rows; free_count counts free admissible rows, not
+    the total backed prefix reported by mechanical RowStorage.ready_count.
+    flags contains consume, advancement-permitted and batch-error values.
+    """
 
     prototype: wp.array[int]
     slot: wp.array[int]  # prototype-local row; global slot arrays use starts[prototype] + slot
@@ -116,7 +130,7 @@ class WorldDirectoryData:
     active: wp.array[int]
     ready: wp.array[int]
     active_count: wp.array[int]
-    ready_count: wp.array[int]
+    free_count: wp.array[int]
     demand: wp.array[int]
     sequence: wp.array[wp.uint64]
     flags: wp.array[int]  # consume, advancement permitted, batch error
@@ -249,7 +263,7 @@ def _admit(d: WorldDirectoryData, c: WorldCommands, t: WorldTransaction, directo
             t.destination_id[i] = identity
         if status == OK:
             ticket = wp.atomic_add(t.claims, prototype, 1)
-            available = d.ready_count[prototype]
+            available = d.free_count[prototype]
             if ticket >= available:
                 status = NO_SLOTS
                 wp.atomic_add(d.demand, prototype, 1)
@@ -269,7 +283,7 @@ def _group_starts(d: WorldDirectoryData, t: WorldTransaction, prototypes: int):
     total = int(0)
     t.group_starts[0] = 0
     for prototype in range(prototypes):
-        total += wp.min(t.claims[prototype], d.ready_count[prototype])
+        total += wp.min(t.claims[prototype], d.free_count[prototype])
         t.group_starts[prototype + 1] = total
 
 
@@ -328,7 +342,7 @@ def _clear_membership(d: WorldDirectoryData, t: WorldTransaction, prototypes: in
     if conditional == 0 or (d.flags[0] != 0 and t.dirty[0] != 0):
         if i < prototypes:
             d.active_count[i] = 0
-            d.ready_count[i] = 0
+            d.free_count[i] = 0
         if i == 0:
             d.id_count[0] = 0
 
@@ -350,7 +364,7 @@ def _rebuild(d: WorldDirectoryData, t: WorldTransaction, directory_capacity: int
             d.active[d.starts[prototype] + rank] = local_slot
             d.slot_rank[i] = rank
         elif d.slot_state[i] == READY:
-            rank = wp.atomic_add(d.ready_count, prototype, 1)
+            rank = wp.atomic_add(d.free_count, prototype, 1)
             d.ready[d.starts[prototype] + rank] = local_slot
             d.slot_rank[i] = -1
 
@@ -569,7 +583,7 @@ class WorldDirectory:
             setattr(d, name, wp.full(self.slot_capacity, -1, dtype=int, device=self.device))
         for name in ("active", "ready"):
             setattr(d, name, wp.zeros(self.slot_capacity, dtype=int, device=self.device))
-        for name in ("active_count", "ready_count", "demand"):
+        for name in ("active_count", "free_count", "demand"):
             setattr(d, name, wp.zeros(len(slot_limits), dtype=int, device=self.device))
         d.sequence = wp.zeros(1, dtype=wp.uint64, device=self.device)
         d.flags = wp.zeros(3, dtype=int, device=self.device)
