@@ -1009,6 +1009,55 @@ for a fixed-root articulation after constructing the solver, call
 synchronize the updated fixed-root poses into MuJoCo.
 
 
+Prepared variant constants
+--------------------------
+
+.. experimental::
+
+   ``SolverMuJoCo.prepare_model_constants`` and the ``constant_variant_ids`` and
+   ``root_poses_only`` notification parameters may change without notice.
+
+Applications that repeatedly select immutable scalar-joint variants can prepare
+their reference constants once. The application owns authored properties and
+variant IDs; the solver owns one compact constants row per variant. During cold
+preparation, ``prepare_model_constants(count, apply_variant, world_index=0)`` calls
+``apply_variant(id)`` for every ID. That callback must install the variant in the
+representative world and perform an ordinary eager model notification. Preparation
+leaves the final variant installed; restore the desired assignments afterward.
+Choose a representative world whose fixed roots are near the origin to reduce
+float32 cancellation during preparation; ``world_index=0`` does not guarantee
+that placement in a centered environment grid.
+
+After writing registered properties, call ``notify_model_changed`` with the complete
+``BODY_INERTIAL_PROPERTIES | JOINT_PROPERTIES | JOINT_DOF_PROPERTIES | SHAPE_PROPERTIES``
+flags and ``constant_variant_ids``. The IDs are an int32 or int64 Warp array with
+one valid registered ID per native world. A supplied ``world_mask`` restricts
+constant replacement and waking; unselected worlds' authored properties and IDs
+must remain unchanged. The ID values are a caller-owned device-input precondition.
+
+The bank replaces reference inertia calculations, subtree mass accumulation and
+body-inertia diagonalization. It does not cache live state: native current-pose
+restoration, joint-limit parameter conversion, shape/site synchronization and
+sleep transitions retain their normal ordering. Fixed world-root ``joint_X_p``
+edits may use ``root_poses_only=True`` with exactly ``JOINT_PROPERTIES``. Internal
+joint frames must not use that exemption. Every ordinary nonzero model notification
+invalidates the bank; native array descriptors must not be replaced while registered.
+
+The initial scope requires native MJWarp contacts, scalar hinge/slide joints and
+joint actuator transmissions. Kinematic locking armature, equality constraints,
+tendons, flex, cameras, lights and active actuator damping-ratio conversion are
+excluded. ``model_constants_bytes`` reports bank storage and
+``model_constants_prepare_seconds`` includes completion of the cold device copies.
+Cached notifications run outside CUDA graph capture.
+
+These reference constants are invariant under rigid root placement in the admitted
+uncoupled trees. Recomputing them at distant float32 world origins can introduce
+cancellation error. Qualification therefore also compares against independent
+double-precision reference calculations, retaining MJWarp's documented zero-trace
+regularization; cached values need not reproduce the less accurate distant-origin
+rounding of eager refresh.
+
+
 .. _mujoco-code-pointers:
 
 Code pointers

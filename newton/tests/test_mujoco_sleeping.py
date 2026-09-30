@@ -3,8 +3,13 @@
 
 """Tests for optional MuJoCo Warp sleeping support."""
 
+import ast
 import inspect
+import textwrap
+import types
 import unittest
+from contextlib import nullcontext
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -13,6 +18,230 @@ import newton
 from newton import ModelFlags
 from newton._src.solvers.mujoco import kernels
 from newton.solvers import SolverMuJoCo
+
+
+class TestPreparedModelConstants(unittest.TestCase):
+    """Exercise bank ownership and notification contracts without a CUDA device."""
+
+    def _solver(self):
+        solver = object.__new__(SolverMuJoCo)
+        device = wp.get_device("cpu")
+        solver.model = types.SimpleNamespace(
+            device=device,
+            body_flags=wp.array([0, 0], dtype=wp.int32, device=device),
+            joint_parent=wp.array([-1, -1], dtype=wp.int32, device=device),
+            joint_type=wp.array([int(newton.JointType.FIXED)] * 2, dtype=wp.int32, device=device),
+        )
+
+        def array(shape):
+            return wp.zeros(shape, dtype=wp.float32, device=device)
+
+        solver.mjw_model = types.SimpleNamespace(
+            stat=types.SimpleNamespace(meaninertia=array((2,))),
+            dof_invweight0=array((2, 1)),
+            body_invweight0=array((2, 2)),
+            actuator_acc0=array((2, 1)),
+            body_subtreemass=array((2, 2)),
+            body_inertia=array((2, 2)),
+            body_iquat=array((2, 2)),
+            neq=0,
+            ntendon=0,
+            nflex=0,
+            ncam=0,
+            nlight=0,
+            nu=1,
+            jnt_type=wp.array([3], dtype=wp.int32, device=device),
+            actuator_trntype=wp.array([0], dtype=wp.int32, device=device),
+            actuator_biastype=wp.array([1], dtype=wp.int32, device=device),
+            actuator_biasprm=array((2, 1, 10)),
+            actuator_gainprm=array((2, 1, 10)),
+        )
+        solver.mjw_data = types.SimpleNamespace(nworld=2)
+        solver.mjc_mocap_to_newton_jnt = wp.array([[0], [1]], dtype=wp.int32, device=device)
+        solver._mujoco = types.SimpleNamespace(
+            mjMINVAL=1e-15,
+            mjtJoint=types.SimpleNamespace(mjJNT_HINGE=3, mjJNT_SLIDE=2),
+            mjtTrn=types.SimpleNamespace(mjTRN_JOINT=0),
+            mjtBias=types.SimpleNamespace(mjBIAS_AFFINE=1),
+        )
+        solver._mujoco_warp = types.SimpleNamespace(restore_const_state=mock.Mock())
+        solver._model_constants = None
+        solver._model_constants_prepare_seconds = 0.0
+        solver._preparing_model_constants = False
+        solver._constant_roots_validated = False
+        solver._has_dampratio_actuators = False
+        solver._initial_model_sync = False
+        solver.use_mujoco_cpu = False
+        solver._use_mujoco_contacts = True
+        return solver
+
+    def _prepare(self, solver, *, fail_at=None):
+        outputs = [solver.mjw_model.stat.meaninertia]
+        outputs.extend(
+            getattr(solver.mjw_model, name)
+            for name in (
+                "dof_invweight0",
+                "body_invweight0",
+                "actuator_acc0",
+                "body_subtreemass",
+                "body_inertia",
+                "body_iquat",
+            )
+        )
+
+        def apply(variant):
+            if variant == fail_at:
+                raise RuntimeError("Authored variant failed")
+            for field, output in enumerate(outputs):
+                output.fill_(10 * variant + field + 1)
+
+        solver.prepare_model_constants(3, apply)
+        return outputs
+
+    def test_registered_rows_are_immutable_and_masked(self):
+        """Keep independent registered rows and preserve unselected worlds for both ID dtypes."""
+        for dtype in (wp.int32, wp.int64):
+            with self.subTest(dtype=dtype):
+                solver = self._solver()
+                outputs = self._prepare(solver)
+                for output in outputs:
+                    output.fill_(-1)
+                solver._restore_model_constants(
+                    wp.array([1, 0], dtype=dtype, device="cpu"),
+                    wp.array([True, False, False], dtype=wp.bool, device="cpu"),
+                )
+                for field, output in enumerate(outputs):
+                    np.testing.assert_array_equal(output.numpy()[0], 11 + field)
+                    np.testing.assert_array_equal(output.numpy()[1], -1)
+                solver._mujoco_warp.restore_const_state.assert_called_once_with(solver.mjw_model, solver.mjw_data)
+                self.assertGreater(solver.model_constants_bytes, 0)
+                self.assertGreater(solver.model_constants_prepare_seconds, 0)
+
+    def test_failed_preparation_never_publishes_partial_bank(self):
+        """Invalidate the old registration before a failed replacement preparation."""
+        solver = self._solver()
+        self._prepare(solver)
+        with self.assertRaisesRegex(RuntimeError, "Authored variant failed"):
+            self._prepare(solver, fail_at=1)
+        self.assertEqual(solver.model_constants_bytes, 0)
+        self.assertFalse(solver._preparing_model_constants)
+
+    def test_generic_edit_invalidates_but_root_placement_preserves_bank(self):
+        """Reject reuse after ordinary property edits and retain the explicit root-only path."""
+        solver = self._solver()
+        self._prepare(solver)
+        with (
+            mock.patch.object(solver, "_normalize_reset_world_mask", side_effect=lambda mask: mask),
+            mock.patch.object(solver, "_scoped_mujoco_warp_execution", side_effect=nullcontext),
+            mock.patch.object(solver, "_notify_model_changed"),
+        ):
+            solver.notify_model_changed(ModelFlags.JOINT_PROPERTIES, root_poses_only=True)
+            self.assertGreater(solver.model_constants_bytes, 0)
+            solver.notify_model_changed(ModelFlags.SHAPE_PROPERTIES)
+            self.assertEqual(solver.model_constants_bytes, 0)
+            flags = (
+                ModelFlags.BODY_INERTIAL_PROPERTIES
+                | ModelFlags.JOINT_PROPERTIES
+                | ModelFlags.JOINT_DOF_PROPERTIES
+                | ModelFlags.SHAPE_PROPERTIES
+            )
+            with self.assertRaisesRegex(RuntimeError, "invalidated"):
+                solver.notify_model_changed(flags, constant_variant_ids=wp.array([0, 0], dtype=wp.int64, device="cpu"))
+
+    def test_reject_unsupported_scope_and_root_mutation(self):
+        """Reject features whose reference constants cannot use this scalar-joint bank."""
+        for name in ("neq", "ntendon", "nflex", "ncam", "nlight"):
+            solver = self._solver()
+            setattr(solver.mjw_model, name, 1)
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "exclude"):
+                self._prepare(solver)
+        solver = self._solver()
+        solver.model.body_flags.assign([int(newton.BodyFlags.KINEMATIC), 0])
+        with self.assertRaisesRegex(ValueError, "kinematic"):
+            self._prepare(solver)
+        solver = self._solver()
+        solver._has_dampratio_actuators = True
+        with self.assertRaisesRegex(ValueError, "dampratio"):
+            self._prepare(solver)
+        solver = self._solver()
+        solver.model.joint_parent.assign([-1, 0])
+        with self.assertRaisesRegex(ValueError, "fixed world-root"):
+            solver.notify_model_changed(ModelFlags.JOINT_PROPERTIES, root_poses_only=True)
+        with self.assertRaisesRegex(ValueError, "only JOINT_PROPERTIES"):
+            solver.notify_model_changed(ModelFlags.BODY_PROPERTIES, root_poses_only=True)
+
+    def test_dampratio_admission_matches_native_tolerance_and_bias_type(self):
+        """Reject active near-equal affine gains while admitting non-affine positive bias."""
+        solver = self._solver()
+        bias = solver.mjw_model.actuator_biasprm.numpy().copy()
+        bias[..., 1], bias[..., 2] = 5e-16, 1.0
+        solver.mjw_model.actuator_biasprm.assign(bias)
+        with self.assertRaisesRegex(ValueError, "dampratio"):
+            self._prepare(solver)
+        solver.mjw_model.actuator_biastype.assign([0])
+        self._prepare(solver)
+
+    def test_preparation_rejects_new_dampratio_before_eager_conversion(self):
+        """Reject freshly uploaded positive damping ratios before native conversion hides them."""
+        solver = self._solver()
+        solver._preparing_model_constants = True
+        solver.has_connect_constraints = solver.has_jnt_connect_constraints = False
+
+        def upload():
+            bias = solver.mjw_model.actuator_biasprm.numpy().copy()
+            bias[..., 2] = 1.0
+            solver.mjw_model.actuator_biasprm.assign(bias)
+
+        with (
+            mock.patch.object(solver, "_update_joint_dof_properties", side_effect=upload),
+            mock.patch.object(solver, "_invalidate_contact_fast_path"),
+            mock.patch.object(solver, "_set_const_0_with_physical_meaninertia") as convert,
+            self.assertRaisesRegex(ValueError, "dampratio"),
+        ):
+            solver._notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
+        convert.assert_not_called()
+
+    def test_reject_malformed_ids_before_notification(self):
+        """Reject float or matrix variant IDs before any model properties are synchronized."""
+        solver = self._solver()
+        self._prepare(solver)
+        flags = (
+            ModelFlags.BODY_INERTIAL_PROPERTIES
+            | ModelFlags.JOINT_PROPERTIES
+            | ModelFlags.JOINT_DOF_PROPERTIES
+            | ModelFlags.SHAPE_PROPERTIES
+        )
+        for ids in (wp.zeros(2, dtype=float, device="cpu"), wp.zeros((1, 2), dtype=int, device="cpu")):
+            with (
+                self.subTest(shape=ids.shape, dtype=ids.dtype),
+                mock.patch.object(solver, "_notify_model_changed") as notify,
+                self.assertRaisesRegex(ValueError, "full native-world"),
+            ):
+                solver.notify_model_changed(flags, constant_variant_ids=ids)
+            notify.assert_not_called()
+
+    def test_current_pose_restore_has_one_engine_owner(self):
+        """Reject duplicated current-state pipelines or host readback in the cached restore boundary."""
+        tree = ast.parse(textwrap.dedent(inspect.getsource(SolverMuJoCo._restore_model_constants)))
+        calls = [
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        ]
+        self.assertEqual(calls.count("restore_const_state"), 1)
+        forbidden = {
+            "kinematics",
+            "com_pos",
+            "camlight",
+            "flex",
+            "tendon",
+            "crb",
+            "tendon_armature",
+            "factor_m",
+            "transmission",
+            "numpy",
+        }
+        self.assertFalse(forbidden.intersection(calls), "MJWarp alone owns the state-refresh pipeline.")
 
 
 def _build_sleep_model(world_count: int = 1, *, register_custom_attributes: bool = False) -> newton.Model:
