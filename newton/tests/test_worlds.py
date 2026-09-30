@@ -102,6 +102,12 @@ class WorldArchitectureTests(unittest.TestCase):
         self.assertEqual([int(value) for value in worlds.WorldOperation], [0, 1, 2, 3])
         self.assertEqual(worlds.WorldStatus.INITIALIZATION_MISSING, 11)
 
+    def test_directory_free_count_is_canonical_without_readiness_alias(self):
+        """Keep free admission slots distinct from mechanically backed row prefixes."""
+        self.assertIn("free_count", worlds.WorldDirectoryData.vars)
+        self.assertNotIn("ready_count", worlds.WorldDirectoryData.vars)
+        self.assertFalse(hasattr(worlds.WorldDirectoryData(), "ready_count"))
+
     def test_capacity_service_is_batched_without_legacy_scalar_aliases(self):
         """Forbid directory rebuilds inside per-prototype native service loops."""
         tree = ast.parse((self.root / "_src/solvers/mujoco/worlds.py").read_text())
@@ -212,7 +218,7 @@ class WorldDirectoryCPUTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "live worlds"):
             self.directory.withdraw_ready((0, 0))
         np.testing.assert_array_equal(self.directory.d.slot_state.numpy(), before)
-        np.testing.assert_array_equal(self.directory.d.ready_count.numpy(), [2, 1])
+        np.testing.assert_array_equal(self.directory.d.free_count.numpy(), [2, 1])
         for ends in ((1,), (2, 3), (True, 1), (-1, 0)):
             with self.subTest(ends=ends), self.assertRaises(ValueError):
                 self.directory.publish_ready(ends)

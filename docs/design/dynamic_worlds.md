@@ -42,7 +42,7 @@ The array's virtual base stays fixed. Physical backing may be returned and mappe
 again only after all readers join. Moving a world between prototypes changes its
 row and generation, not the pointer recorded for either prototype's arrays.
 Compaction can move continuing rows without changing their identities or
-generations. A failed replacement preserves the old lifetime and blocks mandatory
+generations. A failed replacement preserves the old lifetime and blocks physical
 advancement; ready capacity and live population are separate quantities.
 
 ## Level 1 Ownership and the composition root
@@ -115,6 +115,12 @@ del graph
 worlds.close(streams=(stream.cuda_stream,))
 ```
 
+`memory_budget_bytes=None` selects fixed backing for the full prepared capacities.
+With VMM, `initial_rows=None` also backs every prototype to its full capacity. Set
+both the physical budget and explicit initial rows (including zero for unused
+prototypes) to start with a smaller physical population. Contact/CCD limits default
+to each one-world template quota multiplied by that prototype's virtual capacity.
+
 The experimental native runtime requires Python 3.11+, CUDA, and the pinned
 MJWarp prepared-workspace API. Generic world directory records remain usable
 without importing a native engine. CUDA graph preparation compiles one small
@@ -132,10 +138,11 @@ select the toolkit, or `NEWTON_CUDA_GRAPH_LIBRARY` selects a prepared library.
 
 `permit` is a device scalar that suppresses physical advancement without suppressing
 valid resets. `refresh_kinematics=True` updates body, geometry and site poses after
-a reset-only frame or the final native substep. Failed mandatory requests gate both
-advancement and pose refresh. Per-prototype branches update their own poses before
-the common graph join. Setting `refresh_kinematics=False` is explicit and useful for
-physics-only measurements; derived transforms then describe the last refresh.
+a reset-only frame or the final native substep. Any failed request gates both
+advancement and pose refresh; there is no optional-request mode. Per-prototype
+branches update their own poses before the common graph join. Setting
+`refresh_kinematics=False` is explicit and useful for physics-only measurements;
+derived transforms then describe the last refresh.
 
 The directory is the only lifetime authority. `WorldCommands` carries operation,
 identity, expected generation and target prototype; `WorldResults` carries status
@@ -189,7 +196,19 @@ The sole directory records are `WorldDirectoryData`, `WorldTransaction` and
 `WorldCompaction`. Caller-owned `WorldCommands` contains a monotonically increasing
 batch sequence, operation, identity, expected generation and target prototype.
 `WorldResults` returns status, identity and generation. Operation/status/phase
-values have canonical public enums in `newton.worlds`.
+values have canonical public enums in `newton.worlds`. `CREATE` ignores input
+identity/generation and returns an allocated handle; `RESET` and `DESTROY` validate
+the supplied handle. Reset keeps the identity and increments its generation, even
+within the same prototype. Destroy retires that identity and also increments its
+generation. Results are indexed by request ordinal, not world ID; accept a new
+handle only from a successful create/reset result.
+
+Start with a positive sequence. A new sequence consumes the batch even if some
+requests fail; retry with a higher sequence. Equal-sequence replays retain the
+previous permit and may advance physics again, but ignore lifecycle-buffer edits.
+A stale sequence or invalid batch count may leave result arrays unchanged: check
+`directory.d.flags[2]` (batch error) and `flags[1]` (advancement permit), not only
+per-request status. Results beyond the consumed request count are not refreshed.
 
 ```text
 begin -> caller validation -> admit -> full defaults + caller payload -> publish
@@ -202,10 +221,12 @@ health + ready capacity + transaction permit -> native step -> pose refresh
 ```
 
 Admission reserves destination tickets without exposing incomplete rows. Failed
-requests do not invalidate independent successful requests, but a mandatory failed
-request disables the batch's physics permit. Replaying the same accepted sequence
-does not apply the lifecycle command again. Reused IDs increment their generation;
-stale references and generation exhaustion are rejected.
+requests do not invalidate independent successful requests, but any failed
+request disables the batch's physics permit. Admission uses the pre-batch free
+IDs and rows; resources retired by this batch become available to later batches.
+Resource contention does not promise request-order winners. Replaying the same
+accepted sequence does not apply the lifecycle command again. Reused IDs increment
+their generation; stale references and generation exhaustion are rejected.
 
 Compaction copies complete native Data rows in the correctness baseline. It does
 not copy transient contact/CCD queues. Structural zeros in partly written fields
@@ -226,6 +247,13 @@ over separate executable graphs. CUDA node scalar arguments and launch extents
 have explicit independent W/C/D count sources. Fixed worker grids remain fixed.
 
 ## Level 4 Storage and failure boundaries
+
+`WorldDirectoryData.active_count[p]` counts live worlds, while its
+`free_count[p]` counts free rows available for admission and excludes live rows.
+In contrast, each `RowStorage.ready_count` is a physically backed prefix length,
+and the native group's `ready_worlds` is its jointly usable W/C/D prefix, both
+including live rows. Keep free-slot admission counts distinct from backed
+prefix lengths; the directory has no `ready_count` alias.
 
 `RowStorage` receives `FieldSpec(name, inner_shape, dtype, packed, alignment)` and
 one authoritative count. It has no native schema or defaults. Packed rows share

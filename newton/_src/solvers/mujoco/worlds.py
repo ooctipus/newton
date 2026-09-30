@@ -311,10 +311,12 @@ class MuJoCoWorlds:
         capacities: Virtual world row limits, one per prototype.
         id_capacity: Prepared maximum simultaneous logical identities.
         command_capacity: Maximum lifecycle requests in one captured batch.
-        contact_capacities: Optional candidate/contact virtual row limits.
-        ccd_capacities: Optional CCD scratch virtual row limits.
-        memory_budget_bytes: Physical VMM budget; None selects fixed backing.
-        initial_rows: Initially backed world rows per prototype.
+        contact_capacities: Candidate/contact virtual row limits; defaults to
+            each template quota multiplied by its world capacity.
+        ccd_capacities: CCD virtual row limits, with the same quota-based default.
+        memory_budget_bytes: Physical VMM budget; None fully backs all capacities.
+        initial_rows: Initially backed VMM world rows; None backs every capacity.
+            Set an explicit budget and initial rows for partial physical backing.
 
     Native Data arrays are authoritative. No dense Newton State or replicated
     model is created. The caller warms each native program on separate one-world
@@ -556,7 +558,7 @@ class MuJoCoWorlds:
 
         Returns:
             One bound Warp graph. The caller owns submissions and must destroy this
-            graph before closing the population. A failed mandatory reset suppresses
+            graph before closing the population. Any failed request suppresses
             both physical advancement and pose refresh.
         """
 
