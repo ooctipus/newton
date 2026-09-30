@@ -36,12 +36,13 @@ wp.set_module_options({"enable_backward": False})
 
 
 @wp.kernel
-def _guard_health(d: WorldDirectoryData, t: WorldTransaction, healthy: wp.array[int]):
+def _guard_health(d: WorldDirectoryData, t: WorldTransaction, healthy: wp.array[int], lifecycle: wp.array[int]):
     if healthy[0] == 0:
         d.flags[0] = 0
         d.flags[1] = 0
         d.flags[2] = PHASE_INVALID
         t.phase[0] = IDLE
+    lifecycle[0] = wp.int32(d.flags[0] != 0 or d.flags[2] != 0)
 
 
 @wp.kernel
@@ -377,7 +378,7 @@ class MuJoCoWorlds:
             raise ValueError("MuJoCoWorlds currently requires a CUDA device")
         self.device, self.backing, self.directory = device, None, None
         self.prototypes = []
-        self._healthy = self._always_permit = None
+        self._healthy = self._always_permit = self._lifecycle_needed = None
         self._closed, self._service_failed, self._capture_attempted = False, False, False
         self._graph = None
         try:
@@ -392,6 +393,7 @@ class MuJoCoWorlds:
                 )
                 self._healthy = wp.ones(1, dtype=int, device=device)
                 self._always_permit = wp.ones(1, dtype=int, device=device)
+                self._lifecycle_needed = wp.zeros(1, dtype=int, device=device)
                 start = 0
                 for prototype, ((model, template), capacity, initial, contact_cap, ccd_cap) in enumerate(
                     zip(prepared, capacities, initial_rows, contact_capacities, ccd_capacities, strict=True)
@@ -542,6 +544,16 @@ class MuJoCoWorlds:
         and payload writes after the default Data copy. The initializer explicitly
         acknowledges successful requests in WorldTransaction.initialized; missing
         acknowledgements or failed base copies cannot publish a replacement.
+        Recording callbacks must use prepared storage and record allocation-free
+        operations. Validation and initialization record transaction work, not
+        per-frame side effects. Healthy repeated sequences skip that work and
+        transfers; new batches and existing batch-error paths retain the complete
+        lifecycle. Initialization/move counts and acknowledgements describe their
+        transaction stage, not current-frame activity.
+
+        Callers may observe this population's directory, but must submit mutations
+        through this captured lifecycle and resize_backing. Independently invoking
+        the owned directory's mutating methods bypasses native state ownership.
 
         Args:
             commands: Caller-owned lifecycle buffers with increasing batch sequence.
@@ -598,72 +610,90 @@ class MuJoCoWorlds:
                     group.updates = DeviceGraphUpdates(
                         group.rows.count, maximum=group.rows.capacity, capacity_nodes=512 * substeps
                     )
-                # Native programs were warmed on separate Data. Loading only this
-                # root avoids compiling every unrelated imported Newton solver.
+                # Warmed native programs use separate Data. Load lifecycle and row
+                # transfer kernels before conditional capture, avoiding unrelated solvers.
                 wp.load_module(module=__name__, device=self.device)
+                wp.load_module(module=RowStorage.__module__, device=self.device)
                 with wp.ScopedCapture(
                     device=self.device, force_module_load=False, capture_mode=wp.CaptureMode.THREAD_LOCAL
                 ) as capture:
                     self.directory.begin(commands)
-                    wp.launch(_guard_health, 1, [self.directory.d, self.directory.t, self._healthy], device=self.device)
-                    if validate is not None:
-                        validate(commands, self.directory.t)
-                    self.directory.admit(commands)
-                    for prototype, group in enumerate(self.prototypes):
-                        wp.launch(
-                            _initialization_ids,
-                            self.directory.command_capacity,
-                            [
-                                self.directory.d,
-                                self.directory.t,
-                                prototype,
-                                group.request_ids,
-                                group.source_ids,
-                                group.destination_ids,
-                                group.initialization_count,
-                            ],
-                            device=self.device,
-                        )
-                        group.initialization.record(group.source_ids, group.destination_ids, group.initialization_count)
-                        if initialize is not None:
-                            initialize(
-                                group,
-                                group.request_ids,
-                                group.destination_ids,
-                                group.initialization_count,
-                                group.initialization.status,
-                                self.directory.t,
-                                self.directory.d.sequence,
+                    wp.launch(
+                        _guard_health,
+                        1,
+                        [self.directory.d, self.directory.t, self._healthy, self._lifecycle_needed],
+                        device=self.device,
+                    )
+
+                    def record_lifecycle():
+                        if validate is not None:
+                            validate(commands, self.directory.t)
+                        self.directory.admit(commands)
+                        for prototype, group in enumerate(self.prototypes):
+                            wp.launch(
+                                _initialization_ids,
+                                self.directory.command_capacity,
+                                [
+                                    self.directory.d,
+                                    self.directory.t,
+                                    prototype,
+                                    group.request_ids,
+                                    group.source_ids,
+                                    group.destination_ids,
+                                    group.initialization_count,
+                                ],
+                                device=self.device,
                             )
-                        wp.launch(
-                            _acknowledge_initialization,
-                            self.directory.command_capacity,
-                            [
-                                self.directory.d,
-                                self.directory.t,
-                                prototype,
-                                group.initialization.status,
-                                int(initialize is not None),
-                            ],
-                            device=self.device,
-                        )
-                    self.directory.publish(commands, results)
-                    self.directory.plan_moves()
-                    for prototype, group in enumerate(self.prototypes):
-                        wp.launch(
-                            _relocation_count,
-                            1,
-                            [self.directory.t, self.directory.moves, prototype, self._healthy, group.move_count],
-                            device=self.device,
-                        )
-                        group.relocation.record(group.move_sources, group.move_destinations, group.move_count)
-                        wp.launch(
-                            _acknowledge_moves,
-                            1,
-                            [self.directory.t, self.directory.moves, prototype, self._healthy, group.relocation.status],
-                            device=self.device,
-                        )
-                    self.directory.publish_moves()
+                            group.initialization.record(
+                                group.source_ids, group.destination_ids, group.initialization_count
+                            )
+                            if initialize is not None:
+                                initialize(
+                                    group,
+                                    group.request_ids,
+                                    group.destination_ids,
+                                    group.initialization_count,
+                                    group.initialization.status,
+                                    self.directory.t,
+                                    self.directory.d.sequence,
+                                )
+                            wp.launch(
+                                _acknowledge_initialization,
+                                self.directory.command_capacity,
+                                [
+                                    self.directory.d,
+                                    self.directory.t,
+                                    prototype,
+                                    group.initialization.status,
+                                    int(initialize is not None),
+                                ],
+                                device=self.device,
+                            )
+                        self.directory.publish(commands, results)
+                        self.directory.plan_moves()
+                        for prototype, group in enumerate(self.prototypes):
+                            wp.launch(
+                                _relocation_count,
+                                1,
+                                [self.directory.t, self.directory.moves, prototype, self._healthy, group.move_count],
+                                device=self.device,
+                            )
+                            group.relocation.record(group.move_sources, group.move_destinations, group.move_count)
+                            wp.launch(
+                                _acknowledge_moves,
+                                1,
+                                [
+                                    self.directory.t,
+                                    self.directory.moves,
+                                    prototype,
+                                    self._healthy,
+                                    group.relocation.status,
+                                ],
+                                device=self.device,
+                            )
+                        self.directory.publish_moves()
+
+                    wp.capture_if(self._lifecycle_needed, on_true=record_lifecycle)
                     # Every updater must finish and be checked before any prototype
                     # enters its conditional program, including native solver loops.
                     capture_parallel([group.updates.capture_update for group in self.prototypes])
@@ -816,7 +846,9 @@ class MuJoCoWorlds:
             "directory": self.directory.memory_report(),
             "groups": [],
             "shared_backing": self.backing.memory_report() if self.backing is not None else None,
-            "health_metadata_bytes": self._healthy.capacity + self._always_permit.capacity,
+            "health_metadata_bytes": (
+                self._healthy.capacity + self._always_permit.capacity + self._lifecycle_needed.capacity
+            ),
             "scope": "Single-owner native array ledger; external fixture/oracle/JIT/graph/driver memory excluded",
         }
         for group in self.prototypes:
