@@ -6,6 +6,7 @@
 import gc
 import json
 import os
+import sys
 import traceback
 import unittest
 from contextlib import nullcontext
@@ -17,6 +18,7 @@ from unittest.mock import patch
 import numpy as np
 import warp as wp
 
+from newton._src.solvers.mujoco import worlds as native
 from newton._src.solvers.mujoco.worlds import _MuJoCoPrototype
 from newton._src.utils import row_storage as storage
 from newton._src.utils.cuda_vmm import CudaBacking
@@ -214,6 +216,132 @@ class MuJoCoWorldsHostTests(unittest.TestCase):
                     self.assertEqual(publications, [(1,)])
                 elif failure != "directory_publication":
                     self.assertEqual(publications, [])
+
+
+class NativeObserverTests(unittest.TestCase):
+    def group(self):
+        self.native, self.wp = native, wp
+        calls = []
+
+        def owner(name):
+            return SimpleNamespace(
+                count=object(),
+                ready_count=object(),
+                capacity=17,
+                fill=lambda *args, **kwargs: calls.append((name, "fill", args, kwargs)),
+                copy=lambda *args, **kwargs: calls.append((name, "copy", args, kwargs)),
+                lookup=lambda array: SimpleNamespace(name="field"),
+            )
+
+        group = _MuJoCoPrototype(
+            model=object(),
+            rows=owner("world"),
+            contacts=owner("candidate"),
+            ccd=owner("ccd"),
+            workspace=SimpleNamespace(observer=None),
+        )
+        group.updates = SimpleNamespace(capture_tail=lambda: 123, capture_update=lambda: calls.append("update"))
+        kernel = SimpleNamespace(
+            key="named_counts",
+            func=SimpleNamespace(__module__="test", __qualname__="named_counts"),
+            adj=SimpleNamespace(
+                kernel_dim=2,
+                args=[
+                    SimpleNamespace(label="unrelated", type=wp.int32),
+                    SimpleNamespace(label="world_count", type=wp.int32),
+                    SimpleNamespace(label="contact_cap", type=wp.int32),
+                    SimpleNamespace(label="ccd_cap", type=wp.int32),
+                ],
+            ),
+        )
+        return group, kernel, calls
+
+    def test_explicit_named_count_sources_and_fixed_worker_grid(self):
+        """Verify explicit named count sources and fixed worker grid."""
+        group, kernel, _ = self.group()
+        group.observe_launch(kernel, (17, 17), "world", parameters={"world_count": "world", "contact_cap": "candidate"})
+        binding = group.bindings[-1]
+        self.assertIs(binding.extent_source, group.rows.count)
+        self.assertEqual([parameter.index for parameter in binding.parameters], [2, 3])
+        self.assertIs(binding.parameters[0].source, group.rows.count)
+        self.assertIs(binding.parameters[1].source, group.contacts.ready_count)
+        group.observe_launch(kernel, (17, 17), "candidate")
+        self.assertIs(group.bindings[-1].extent_source, group.contacts.ready_count)
+        group.observe_launch(
+            kernel, (17, 17), None, extent_axis=None, parameters={"contact_cap": "candidate", "ccd_cap": "ccd"}
+        )
+        binding = group.bindings[-1]
+        self.assertIsNone(binding.extent_axis)
+        self.assertIsNone(binding.extent_source)
+        self.assertIs(binding.parameters[1].source, group.ccd.ready_count)
+        self.assertNotIn(
+            1, [parameter.index for parameter in binding.parameters], "Equal integer shapes confer no count semantics"
+        )
+
+    def test_unknown_domains_labels_types_and_inconsistent_axes_fail_before_binding(self):
+        """Verify unknown domains labels types and inconsistent axes fail before binding."""
+        group, kernel, _ = self.group()
+        cases = [
+            ("unknown", 0, {}),
+            (None, 0, {}),
+            ("world", None, {}),
+            ("world", 1, {}),
+            ("world", 0, {"missing": "world"}),
+            ("world", 0, {"world_count": "unknown"}),
+        ]
+        for domain, axis, parameters in cases:
+            with self.subTest(domain=domain, axis=axis, parameters=parameters), self.assertRaises(ValueError):
+                group.observe_launch(kernel, (17, 17), domain, axis, parameters)
+        kernel.adj.args[1].type = self.wp.int64
+        with self.assertRaisesRegex(ValueError, "int32"):
+            group.observe_launch(kernel, (17, 17), "world", parameters={"world_count": "world"})
+        self.assertEqual(group.bindings, [])
+
+    def test_zero_extent_claims_no_previous_node_and_memory_domain_is_explicit(self):
+        """Verify zero extent claims no previous node and memory domain is explicit."""
+        group, kernel, calls = self.group()
+        group.observe_launch(kernel, (0, 17), "world")
+        self.assertEqual(group.bindings, [])
+        array, source = object(), object()
+        group.fill(array, 1, "world")
+        group.fill(array, 0, "candidate")
+        group.copy(array, source, "ccd")
+        self.assertIs(calls[0][3]["count"], group.rows.count)
+        self.assertIs(calls[1][3]["count"], group.contacts.ready_count)
+        self.assertIs(calls[2][3]["count"], group.ccd.ready_count)
+        for function, arguments in ((group.fill, (array, 0, "unknown")), (group.copy, (array, source, "unknown"))):
+            with self.assertRaises(ValueError):
+                function(*arguments)
+
+    def test_recording_scope_clears_observer_on_failure_and_keeps_controls_inside_if(self):
+        """Verify recording scope clears observer on failure and keeps controls inside if."""
+        group, _, calls = self.group()
+        group.substeps = 2
+        group.before_step = lambda group: calls.append("control")
+
+        def step(*args, **kwargs):
+            self.assertIs(group.workspace.observer, group)
+            calls.append("step")
+
+        with patch.dict(
+            sys.modules,
+            {"mujoco_warp": SimpleNamespace(step=step, kinematics=lambda *args, **kwargs: calls.append("poses"))},
+        ):
+            with patch.object(self.native.wp, "capture_if", side_effect=lambda condition, on_true: on_true()):
+                group.record_physics()
+            self.assertEqual(calls, ["update", "control", "step", "step", "poses"])
+            self.assertIsNone(group.workspace.observer)
+            self.assertIsNone(group.before_step)
+            calls.clear()
+            group.before_step = lambda group: calls.append("control")
+            with patch.object(self.native.wp, "capture_if", return_value=None):
+                group.record_physics()
+            self.assertEqual(calls, ["update"], "The disabled native IF must also suppress control writes")
+            with patch.object(self.native.wp, "capture_if", side_effect=RuntimeError("capture failed")):
+                with self.assertRaisesRegex(RuntimeError, "capture failed"):
+                    group.record_physics()
+            self.assertIsNone(group.workspace.observer)
+            self.assertIsNone(group.before_step)
 
 
 @wp.kernel
