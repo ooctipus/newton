@@ -47,8 +47,9 @@ def capture_parallel(branches, *, stream=None):
 
     This changes the dependency frontier of one real Warp-managed CUDA capture;
     it creates neither streams nor executable graphs. Callbacks must restore the
-    same parent capture and use independent writable memory. Read-only inputs may
-    be shared. Their resources must remain owned by the final graph. Nested Warp
+    same parent capture without cross-branch ordering dependencies. Mutable storage
+    must be disjoint, except for race-free atomic reductions consumed only after
+    the join. Resources must remain owned by the final graph. Nested Warp
     conditionals and nested calls are supported; APIC serialization is not.
 
     All CUDA queries/edits happen during preparation. After any callback or CUDA

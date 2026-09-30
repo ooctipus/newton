@@ -83,50 +83,46 @@ class MuJoCoWorldsHostTests(unittest.TestCase):
         np.testing.assert_array_equal(healthy.numpy(), [0])
 
     def test_graph_updates_and_global_guards_precede_every_native_condition(self):
-        """Keep updater ownership in the composition root, outside prototype programs."""
+        """Keep complete updater and guard phases before every conditional program."""
         prototype = ast.parse(textwrap.dedent(inspect.getsource(_MuJoCoPrototype.record_physics)))
         self.assertFalse(
-            any(
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "capture_update"
-                for node in ast.walk(prototype)
-            )
+            any(isinstance(node, ast.Attribute) and node.attr == "capture_update" for node in ast.walk(prototype))
         )
         capture = ast.parse(textwrap.dedent(inspect.getsource(MuJoCoWorlds.capture)))
-        loops = [node for node in ast.walk(capture) if isinstance(node, ast.For)]
-
-        def contains(loop, name):
-            return any(
-                isinstance(node, ast.Call)
-                and (
-                    (isinstance(node.func, ast.Attribute) and node.func.attr == name)
-                    or (isinstance(node.func, ast.Name) and node.func.id == name)
-                    or (
-                        isinstance(node.func, ast.Attribute)
-                        and node.func.attr == "launch"
-                        and node.args
-                        and isinstance(node.args[0], ast.Name)
-                        and node.args[0].id == name
-                    )
-                )
-                for node in ast.walk(loop)
-            )
-
-        stages = []
-        for name in ("capture_update", "_guard_graph_updates", "_execution_conditions"):
-            matches = [loop for loop in loops if contains(loop, name)]
-            self.assertEqual(len(matches), 1, f"One complete prototype loop must own {name}")
-            stages.append(matches[0])
-        self.assertLess(stages[0].end_lineno, stages[1].lineno)
-        self.assertLess(stages[1].end_lineno, stages[2].lineno)
-        physics = [
+        scopes = [
             node
             for node in ast.walk(capture)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "capture_parallel"
+            if isinstance(node, ast.With)
+            and any(
+                isinstance(item.context_expr, ast.Call)
+                and isinstance(item.context_expr.func, ast.Attribute)
+                and item.context_expr.func.attr == "ScopedCapture"
+                for item in node.items
+            )
         ]
-        self.assertEqual(len(physics), 1)
-        self.assertLess(stages[2].end_lineno, physics[0].lineno)
+        self.assertEqual(len(scopes), 1)
+        stages = []
+        for name in ("capture_update", "_guard_graph_updates", "_execution_conditions", "record_physics"):
+            matches = [
+                index
+                for index, statement in enumerate(scopes[0].body)
+                if any(
+                    (isinstance(node, ast.Attribute) and node.attr == name)
+                    or (isinstance(node, ast.Name) and node.id == name)
+                    for node in ast.walk(statement)
+                )
+            ]
+            self.assertEqual(len(matches), 1, f"One complete capture phase must own {name}")
+            statement = scopes[0].body[matches[0]]
+            if name == "_execution_conditions":
+                self.assertIsInstance(statement, ast.For)
+            else:
+                self.assertIsInstance(statement, ast.Expr)
+                self.assertIsInstance(statement.value, ast.Call)
+                self.assertIsInstance(statement.value.func, ast.Name)
+                self.assertEqual(statement.value.func.id, "capture_parallel")
+            stages.append(matches[0])
+        self.assertEqual(stages, sorted(set(stages)), "Execution phases must be distinct and ordered")
 
     def test_all_safe_shrinks_precede_growth_with_one_shared_backing_budget(self):
         """Reuse a later prototype's backing without exceeding a full physical budget."""

@@ -664,15 +664,16 @@ class MuJoCoWorlds:
                     self.directory.publish_moves()
                     # Every updater must finish and be checked before any prototype
                     # enters its conditional program, including native solver loops.
-                    for group in self.prototypes:
-                        group.updates.capture_update()
-                    for group in self.prototypes:
-                        wp.launch(
+                    capture_parallel([group.updates.capture_update for group in self.prototypes])
+                    capture_parallel(
+                        lambda group=group: wp.launch(
                             _guard_graph_updates,
                             group.updates.capacity_nodes,
                             [group.updates.errors, group.updates.binding_count, self._healthy, self.directory.d.flags],
                             device=self.device,
                         )
+                        for group in self.prototypes
+                    )
                     for prototype, group in enumerate(self.prototypes):
                         wp.launch(
                             _execution_conditions,
