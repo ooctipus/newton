@@ -75,7 +75,7 @@ extern "C" int capture_tail(void *stream, void **node, void **graph) {
     const CUgraphNode *dependencies;
     size_t count;
     CUgraph captured;
-    CUresult error = cuStreamGetCaptureInfo(reinterpret_cast<CUstream>(stream), &status, nullptr, &captured,
+    CUresult error = cuStreamGetCaptureInfo_v3(reinterpret_cast<CUstream>(stream), &status, nullptr, &captured,
                                            &dependencies, nullptr, &count);
     if (error) return int(error);
     if (status != CU_STREAM_CAPTURE_STATUS_ACTIVE || count != 1) return -100;
