@@ -212,8 +212,15 @@ not copy transient contact/CCD queues. Structural zeros in partly written fields
 are part of initialization: reducing relocation to intuitive position/velocity
 fields failed a VMM regrowth test and is intentionally not the implementation.
 
+The composition root records all GPU count updaters, then checks every updater's
+error buffer before computing any prototype's execution conditions. An error
+latches the existing runtime health and directory error flags, suppressing all
+physics, pose refresh and later raw replays without a host readback. Prototype
+recording must not launch its own updater or validate only its local error buffer:
+a healthy prototype must not run concurrently with an unchecked failing updater.
+
 Native steps of different prototypes form independent branches of one graph.
-Each branch has one GPU count updater, a physics permit and an optional pose
+Each branch has a physics permit and an optional pose
 refresh; all branches join before replay completion. This removes host iteration
 over separate executable graphs. CUDA node scalar arguments and launch extents
 have explicit independent W/C/D count sources. Fixed worker grids remain fixed.

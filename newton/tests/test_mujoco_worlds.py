@@ -3,10 +3,13 @@
 
 """Qualify the public native population against independent dense physics."""
 
+import ast
 import gc
+import inspect
 import json
 import os
 import sys
+import textwrap
 import traceback
 import unittest
 from contextlib import nullcontext
@@ -21,6 +24,7 @@ import warp as wp
 from newton._src.solvers.mujoco import worlds as native
 from newton._src.solvers.mujoco.worlds import _MuJoCoPrototype
 from newton._src.utils import row_storage as storage
+from newton._src.utils.cuda_graph import DeviceGraphUpdates
 from newton._src.utils.cuda_vmm import CudaBacking
 from newton.solvers import MuJoCoWorlds
 from newton.tests.test_cuda_vmm import FakeDriver
@@ -60,6 +64,69 @@ _POSE = ("xpos", "xquat", "xmat", "geom_xpos", "geom_xmat", "site_xpos", "site_x
 
 class MuJoCoWorldsHostTests(unittest.TestCase):
     """Check joined service admission and failure publication without CUDA."""
+
+    def test_graph_update_error_latches_health_and_ignores_unused_entries(self):
+        """Reject active updater errors before physics and keep the quarantine sticky."""
+        healthy = wp.ones(1, dtype=int, device="cpu")
+        flags = wp.array([1, 1, 0], dtype=int, device="cpu")
+        count = wp.array([2], dtype=int, device="cpu")
+        errors = wp.array([0, 0, -1], dtype=int, device="cpu")
+        wp.launch(native._guard_graph_updates, 3, [errors, count, healthy, flags], device="cpu")
+        np.testing.assert_array_equal(healthy.numpy(), [1])
+        np.testing.assert_array_equal(flags.numpy(), [1, 1, 0])
+        errors.assign(np.array([0, -1, 0], dtype=np.int32))
+        wp.launch(native._guard_graph_updates, 3, [errors, count, healthy, flags], device="cpu")
+        np.testing.assert_array_equal(healthy.numpy(), [0])
+        np.testing.assert_array_equal(flags.numpy(), [1, 0, int(WorldStatus.PHASE_INVALID)])
+        errors.zero_()
+        wp.launch(native._guard_graph_updates, 3, [errors, count, healthy, flags], device="cpu")
+        np.testing.assert_array_equal(healthy.numpy(), [0])
+
+    def test_graph_updates_and_global_guards_precede_every_native_condition(self):
+        """Keep updater ownership in the composition root, outside prototype programs."""
+        prototype = ast.parse(textwrap.dedent(inspect.getsource(_MuJoCoPrototype.record_physics)))
+        self.assertFalse(
+            any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "capture_update"
+                for node in ast.walk(prototype)
+            )
+        )
+        capture = ast.parse(textwrap.dedent(inspect.getsource(MuJoCoWorlds.capture)))
+        loops = [node for node in ast.walk(capture) if isinstance(node, ast.For)]
+
+        def contains(loop, name):
+            return any(
+                isinstance(node, ast.Call)
+                and (
+                    (isinstance(node.func, ast.Attribute) and node.func.attr == name)
+                    or (isinstance(node.func, ast.Name) and node.func.id == name)
+                    or (
+                        isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "launch"
+                        and node.args
+                        and isinstance(node.args[0], ast.Name)
+                        and node.args[0].id == name
+                    )
+                )
+                for node in ast.walk(loop)
+            )
+
+        stages = []
+        for name in ("capture_update", "_guard_graph_updates", "_execution_conditions"):
+            matches = [loop for loop in loops if contains(loop, name)]
+            self.assertEqual(len(matches), 1, f"One complete prototype loop must own {name}")
+            stages.append(matches[0])
+        self.assertLess(stages[0].end_lineno, stages[1].lineno)
+        self.assertLess(stages[1].end_lineno, stages[2].lineno)
+        physics = [
+            node
+            for node in ast.walk(capture)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "capture_parallel"
+        ]
+        self.assertEqual(len(physics), 1)
+        self.assertLess(stages[2].end_lineno, physics[0].lineno)
 
     def test_all_safe_shrinks_precede_growth_with_one_shared_backing_budget(self):
         """Reuse a later prototype's backing without exceeding a full physical budget."""
@@ -329,19 +396,25 @@ class NativeObserverTests(unittest.TestCase):
         ):
             with patch.object(self.native.wp, "capture_if", side_effect=lambda condition, on_true: on_true()):
                 group.record_physics()
-            self.assertEqual(calls, ["update", "control", "step", "step", "poses"])
+            self.assertEqual(calls, ["control", "step", "step", "poses"])
             self.assertIsNone(group.workspace.observer)
             self.assertIsNone(group.before_step)
             calls.clear()
             group.before_step = lambda group: calls.append("control")
             with patch.object(self.native.wp, "capture_if", return_value=None):
                 group.record_physics()
-            self.assertEqual(calls, ["update"], "The disabled native IF must also suppress control writes")
+            self.assertEqual(calls, [], "The disabled native IF must also suppress control writes")
             with patch.object(self.native.wp, "capture_if", side_effect=RuntimeError("capture failed")):
                 with self.assertRaisesRegex(RuntimeError, "capture failed"):
                     group.record_physics()
             self.assertIsNone(group.workspace.observer)
             self.assertIsNone(group.before_step)
+
+
+@wp.kernel
+def _inject_graph_update_error(errors: wp.array[int], enabled: wp.array[int]):
+    if enabled[0] != 0:
+        errors[0] = -777
 
 
 @wp.kernel
@@ -511,6 +584,83 @@ class TestMuJoCoWorlds(unittest.TestCase):
                 Path(output).write_text(
                     json.dumps({"passed": True, "gpu_uuid": device.uuid, "cases": reports}, indent=2) + "\n"
                 )
+
+    @unittest.skipUnless(
+        os.environ.get("NEWTON_TEST_CUDA_UUID"), "Set an explicit CUDA UUID for native population tests"
+    )
+    def test_graph_update_error_quarantines_all_native_domains(self):
+        """A bounded updater error blocks every prototype and every later raw replay."""
+        import mujoco
+        import mujoco_warp as mjw
+
+        wp.init()
+        device = wp.get_device("cuda:0")
+        self.assertEqual(wp.get_cuda_device_count(), 1)
+        self.assertEqual(device.uuid, os.environ["NEWTON_TEST_CUDA_UUID"])
+        self.assertEqual(os.environ.get("CUDA_VISIBLE_DEVICES"), device.uuid)
+        with wp.ScopedDevice(device):
+            prepared = [_prototype(keys, mujoco, mjw) for keys in (6, 108)]
+            population = MuJoCoWorlds(prepared, capacities=(4, 4), id_capacity=4, command_capacity=4)
+            commands, results = create_world_commands(4, device=device), create_world_results(4, device=device)
+            permit, injected = wp.zeros(1, dtype=int, device=device), wp.zeros(1, dtype=int, device=device)
+            calls = [wp.zeros(2, dtype=int, device=device) for _ in prepared]
+            by_group = {id(group): calls[p] for p, group in enumerate(population.prototypes)}
+            original, recorded = DeviceGraphUpdates.capture_update, []
+
+            def inject(updater, stream=None):
+                original(updater, stream=stream)
+                recorded.append(updater)
+                if len(recorded) == 2:
+                    wp.launch(_inject_graph_update_error, 1, [updater.errors, injected], device=device)
+
+            def before_step(group):
+                wp.launch(_record_control, 1, [by_group[id(group)]], device=device)
+
+            graph = None
+            try:
+                wp.load_module(module=__name__, device=device)
+                with patch.object(DeviceGraphUpdates, "capture_update", inject):
+                    graph = population.capture(
+                        commands, results, permit=permit, before_step=before_step, retain=(injected, *calls)
+                    )
+                graph_id = int(graph.graph_exec.value)
+                commands.sequence.fill_(1)
+                commands.count.fill_(4)
+                commands.op.fill_(_CREATE)
+                commands.prototype.assign(np.array([0, 0, 1, 1], dtype=np.int32))
+                wp.capture_launch(graph)
+                wp.synchronize_stream(wp.get_stream(device))
+                np.testing.assert_array_equal(results.status.numpy(), [0, 0, 0, 0])
+                saved = [
+                    {name: getattr(_prefix(group.data, 2), name).numpy() for name in ("qpos", "qvel", "time")}
+                    for group in population.prototypes
+                ]
+                permit.fill_(1)
+                commands.count.zero_()
+                for sequence, injection_enabled in ((2, 1), (3, 0)):
+                    commands.sequence.fill_(sequence)
+                    injected.fill_(injection_enabled)
+                    wp.capture_launch(graph)
+                    wp.synchronize_stream(wp.get_stream(device))
+                    self.assertEqual(population._healthy.numpy()[0], 0)
+                    self.assertEqual(population.directory.d.flags.numpy()[2], int(WorldStatus.PHASE_INVALID))
+                    self.assertEqual(int(graph.graph_exec.value), graph_id)
+                    for p, group in enumerate(population.prototypes):
+                        np.testing.assert_array_equal(calls[p].numpy(), [0, 0])
+                        self.assertEqual(group.condition.numpy()[0], 0)
+                        self.assertEqual(group.poses_condition.numpy()[0], 0)
+                        self.assertEqual(group.move_count.numpy()[0], 0)
+                        errors = group.updates.errors.numpy()[: len(group.bindings)]
+                        self.assertEqual(np.count_nonzero(errors), int(p == 1 and injection_enabled))
+                        for name, value in saved[p].items():
+                            np.testing.assert_array_equal(getattr(_prefix(group.data, 2), name).numpy(), value)
+            except BaseException as error:
+                traceback.clear_frames(error.__traceback__)
+                raise
+            finally:
+                graph = None
+                gc.collect()
+                population.close(streams=(wp.get_stream(device).cuda_stream,))
 
     def _trace(self, population, prepared, defaults, mjw):
         """Run independent lifetime-aware oracle rows and compare physical/derived fields."""

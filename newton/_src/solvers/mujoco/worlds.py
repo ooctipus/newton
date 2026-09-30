@@ -45,6 +45,15 @@ def _guard_health(d: WorldDirectoryData, t: WorldTransaction, healthy: wp.array[
 
 
 @wp.kernel
+def _guard_graph_updates(errors: wp.array[int], count: wp.array[int], healthy: wp.array[int], flags: wp.array[int]):
+    index = wp.tid()
+    if index < count[0] and errors[index] != 0:
+        wp.atomic_min(healthy, 0, 0)
+        wp.atomic_min(flags, 1, 0)
+        wp.atomic_max(flags, 2, PHASE_INVALID)
+
+
+@wp.kernel
 def _initialization_ids(
     d: WorldDirectoryData,
     t: WorldTransaction,
@@ -240,7 +249,6 @@ class _MuJoCoPrototype:
 
         if self.workspace.observer is not None:
             raise RuntimeError("Native workspace already has a recording observer")
-        self.updates.capture_update()
         self.workspace.observer = self
 
         def step():
@@ -654,6 +662,17 @@ class MuJoCoWorlds:
                             device=self.device,
                         )
                     self.directory.publish_moves()
+                    # Every updater must finish and be checked before any prototype
+                    # enters its conditional program, including native solver loops.
+                    for group in self.prototypes:
+                        group.updates.capture_update()
+                    for group in self.prototypes:
+                        wp.launch(
+                            _guard_graph_updates,
+                            group.updates.capacity_nodes,
+                            [group.updates.errors, group.updates.binding_count, self._healthy, self.directory.d.flags],
+                            device=self.device,
+                        )
                     for prototype, group in enumerate(self.prototypes):
                         wp.launch(
                             _execution_conditions,
