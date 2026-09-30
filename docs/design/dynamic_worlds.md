@@ -127,7 +127,12 @@ without importing a native engine. CUDA graph preparation compiles one small
 bridge into the Warp cache, outside the package source; `CUDACXX`/`CUDA_HOME`
 select the toolkit, or `NEWTON_CUDA_GRAPH_LIBRARY` selects a prepared library.
 
-`capture` has preparation-only hooks with caller-owned payload buffers:
+`capture` has preparation-only hooks with caller-owned payload buffers. These
+hooks record allocation-free GPU operations using storage prepared before capture.
+`validate` and `initialize` record transaction work, not per-frame callbacks:
+healthy equal-sequence replays may skip that work. Initialization/move counts,
+request lists and acknowledgements are transaction scratch, not current-frame
+activity signals; consume them only within their recorded lifecycle stage.
 
 - `validate(commands, transaction)` rejects invalid payloads before admission.
 - `initialize(group, requests, destinations, count, base_status, transaction,
@@ -143,6 +148,13 @@ advancement and pose refresh; there is no optional-request mode. Per-prototype
 branches update their own poses before the common graph join. Setting
 `refresh_kinematics=False` is explicit and useful for physics-only measurements;
 derived transforms then describe the last refresh.
+
+The directory owned by `MuJoCoWorlds` may be observed, but its mutations belong to
+the native composition root. Submit lifecycle commands through its captured graph
+and change backing through `resize_backing`; do not call the owned directory's
+mutating lifecycle methods or edit its membership arrays independently. A standalone
+`WorldDirectory` remains available to other domain composition roots that own the
+complete initialization, relocation and publication sequence.
 
 The directory is the only lifetime authority. `WorldCommands` carries operation,
 identity, expected generation and target prototype; `WorldResults` carries status
