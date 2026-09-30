@@ -259,12 +259,23 @@ The caller must exclude concurrent submissions during this maintenance boundary.
 
 ## Qualification and admitted scope
 
+Prepared workspaces reject isolated free-body implicit solves when
+`body_freeadr.size > 0` unless all `ACTUATION | SPRING | DAMPER` stages are disabled;
+this does not reject every free joint.
+
 The native feature boundary is the prepared MJWarp workspace: native NxN contacts,
 sleeping articulated rigid bodies, Newton solver, implicit-fast integration and
 pyramidal cones. Cameras/lights, sensors, flex, tendons, actuator history, fluid,
 SDF and energy computation are rejected until their native programs have explicit
 count and memory semantics. Python 3.11+, Warp 1.17 and the pinned MJWarp branch
 are the tested stack. CUDA graph bindings are validated during preparation.
+
+Prepared execution also excludes static-only models, enabled ball limits, contact
+surface velocity/passive adhesion, requested postconstraint inverse dynamics,
+dense full Jacobians wider than 50 padded DOFs, and derivative-enabled
+gathered/sparse inertia factorization. Each rejected branch lacks complete
+prepared count semantics; disabling a feature so its branch is not executed
+remains allowed. The exact admission predicates belong to MJWarp's workspace.
 
 The production numerical test uses independent dense native worlds with six and
 108 sliders, mocap bodies and nonempty sites. It covers create, step, retype,
