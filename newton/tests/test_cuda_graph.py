@@ -373,6 +373,21 @@ class ParallelCaptureTests(unittest.TestCase):
         self.assertEqual(self.dependencies, (21, 22, 31))
         self.assertEqual(self.set_calls, [(11,), (11,), (21, 22, 31)])
 
+        observations.clear()
+
+        def first_guard():
+            observations.append(self.dependencies)
+            self.dependencies = (41,)
+
+        def second_guard():
+            observations.append(self.dependencies)
+            self.dependencies = (42,)
+
+        self.bridge.capture_parallel([first_guard, second_guard])
+        self.assertEqual(observations, [(21, 22, 31), (21, 22, 31)])
+        self.assertEqual(self.dependencies, (41, 42))
+        self.assertEqual(self.set_calls[-3:], [(21, 22, 31), (21, 22, 31), (41, 42)])
+
     def test_empty_prefix_empty_branches_and_noop_callbacks(self):
         """Verify empty prefix empty branches and noop callbacks."""
         for prefix in ((), (11, 12)):
