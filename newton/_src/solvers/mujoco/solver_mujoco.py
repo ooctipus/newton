@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import importlib.metadata as importlib_metadata
 import math
+import operator
 import os
 import re
 import sys
+import time
 import warnings
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from copy import copy
 from enum import IntEnum
@@ -134,6 +136,13 @@ else:
 
 AttributeAssignment = Model.AttributeAssignment
 AttributeFrequency = Model.AttributeFrequency
+
+
+@wp.kernel
+def _copy_model_constants(ids: wp.array[Any], mask: wp.array[wp.bool], bank: wp.array2d[Any], output: wp.array2d[Any]):
+    world, column = wp.tid()
+    if not mask or mask[world]:
+        output[world, column] = bank[ids[world], column]
 
 
 def _required_specifier(package: str, requirements: Iterable[str]) -> str | None:
@@ -4016,6 +4025,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self._sleep_tree_changed: wp.array2d[wp.int32] | None = None
         self._initial_tree_asleep: wp.array[wp.int32] | None = None
         self._initial_model_sync = True
+        self._model_constants = None
+        self._model_constants_prepare_seconds = 0.0
+        self._preparing_model_constants = False
+        self._constant_roots_validated = False
         self._deterministic = deterministic if deterministic is not None else wp.config.deterministic
         self._deterministic_max_records = 0
         if not use_mujoco_cpu:
@@ -5153,23 +5166,192 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self.mj_model.body_simple[changed_bodies] = 0
         self.mj_model.dof_simplenum[:] = 0
 
+    @property
+    def model_constants_bytes(self) -> int:
+        """Bytes held by the experimental prepared invariant-constants bank."""
+        return sum(bank.capacity for bank, _ in self._model_constants) if self._model_constants is not None else 0
+
+    @property
+    def model_constants_prepare_seconds(self) -> float:
+        """Wall time [s] of the last successful invariant-bank preparation."""
+        return self._model_constants_prepare_seconds
+
+    def _validate_constant_roots(self) -> None:
+        if self._constant_roots_validated:
+            return
+        mapping = self.mjc_mocap_to_newton_jnt
+        if mapping is None or mapping.size == 0:
+            self._constant_roots_validated = True
+            return
+        ids = mapping.numpy().reshape(-1)
+        if np.any(ids < 0):
+            raise ValueError("Prepared constant roots require mapped fixed world-root joints.")
+        if np.any(self.model.joint_parent.numpy()[ids] != -1) or np.any(
+            self.model.joint_type.numpy()[ids] != int(JointType.FIXED)
+        ):
+            raise ValueError("Prepared constant roots require fixed world-root joints.")
+        self._constant_roots_validated = True
+
+    def _validate_constant_scope(self) -> None:
+        m = self.mjw_model
+        if self.use_mujoco_cpu or not self._use_mujoco_contacts:
+            raise ValueError("Prepared constants require native MuJoCo Warp contacts.")
+        if any(getattr(m, name) for name in ("neq", "ntendon", "nflex", "ncam", "nlight")):
+            raise ValueError("Prepared constants exclude equality constraints, tendons, flex, cameras and lights.")
+        if np.any((self.model.body_flags.numpy() & int(BodyFlags.KINEMATIC)) != 0):
+            raise ValueError("Prepared constants exclude kinematic locking armature.")
+        if np.any(
+            ~np.isin(
+                m.jnt_type.numpy(), (int(self._mujoco.mjtJoint.mjJNT_HINGE), int(self._mujoco.mjtJoint.mjJNT_SLIDE))
+            )
+        ):
+            raise ValueError("Prepared constants require scalar hinge/slide joints.")
+        if np.any(m.actuator_trntype.numpy() != int(self._mujoco.mjtTrn.mjTRN_JOINT)):
+            raise ValueError("Prepared constants require joint actuator transmissions.")
+        if self._has_dampratio_actuators:
+            raise ValueError("Prepared constants exclude actuator dampratio conversion.")
+        bias, gain = m.actuator_biasprm.numpy(), m.actuator_gainprm.numpy()
+        affine = m.actuator_biastype.numpy() == int(self._mujoco.mjtBias.mjBIAS_AFFINE)
+        if m.nu and np.any(
+            affine & (bias[..., 2] > 0) & (np.abs(gain[..., 0] + bias[..., 1]) <= self._mujoco.mjMINVAL)
+        ):
+            raise ValueError("Prepared constants exclude actuator dampratio conversion.")
+        self._validate_constant_roots()
+
+    def prepare_model_constants(
+        self, variant_count: int, apply_variant: Callable[[int], None], *, world_index: int = 0
+    ) -> None:
+        """Prepare a compact bank of invariant constants for immutable scalar-joint variants.
+
+        This method is experimental. Outside graph capture, ``apply_variant(id)`` must install each
+        registered variant in ``world_index`` and perform an ordinary eager notification. Preparation
+        leaves those authored properties installed; the caller restores its desired assignments afterward.
+        The bank is published only after every callback succeeds. It contains no current physical state.
+
+        Generic model notifications invalidate the bank. Later cached notifications certify that all
+        authored properties match their registered IDs; direct edits that violate that contract are invalid.
+        Fixed world-root placement may change through ``root_poses_only=True`` notifications. Other
+        articulations, materials, solver settings, topology and reference coordinates must remain registered.
+        Native array descriptors must not be replaced while the bank is registered.
+
+        Args:
+            variant_count: Number of immutable variants, with IDs in ``[0, variant_count)``.
+            apply_variant: Preparation-only callback installing and eagerly synchronizing one variant.
+            world_index: Representative native world whose constants are retained for each variant.
+        """
+        count, world = operator.index(variant_count), operator.index(world_index)
+        if isinstance(variant_count, bool) or count < 1 or count > np.iinfo(np.int32).max:
+            raise ValueError("variant_count must be a positive int32 integer.")
+        if isinstance(world_index, bool) or not 0 <= world < self.mjw_data.nworld:
+            raise ValueError("world_index must name an existing native world.")
+        if not callable(apply_variant) or self._preparing_model_constants:
+            raise ValueError("Preparation requires a callable and cannot be nested.")
+        if self.model.device.is_cuda and wp.get_stream(self.model.device).is_capturing:
+            raise RuntimeError("Prepare model constants outside graph capture.")
+        self._model_constants = None
+        self._validate_constant_scope()
+        m = self.mjw_model
+        outputs = (
+            m.stat.meaninertia,
+            m.dof_invweight0,
+            m.body_invweight0,
+            m.actuator_acc0,
+            m.body_subtreemass,
+            m.body_inertia,
+            m.body_iquat,
+        )
+        if any(array.shape[0] != self.mjw_data.nworld for array in outputs):
+            raise ValueError("Prepared constants require independent native constant rows for every world.")
+        started = time.perf_counter()
+        banks = tuple(
+            wp.empty((count, *output.shape[1:]), dtype=output.dtype, device=output.device) for output in outputs
+        )
+        self._preparing_model_constants = True
+        try:
+            for variant in range(count):
+                apply_variant(variant)
+                self._validate_constant_scope()
+                for bank, output in zip(banks, outputs, strict=True):
+                    wp.copy(bank[variant : variant + 1], output[world : world + 1])
+            if self.model.device.is_cuda:
+                wp.synchronize_stream(wp.get_stream(self.model.device))
+            self._model_constants = tuple(
+                (
+                    bank.reshape((count, bank.size // count)),
+                    output.reshape((output.shape[0], output.size // output.shape[0])),
+                )
+                for bank, output in zip(banks, outputs, strict=True)
+            )
+            self._model_constants_prepare_seconds = time.perf_counter() - started
+        finally:
+            self._preparing_model_constants = False
+
+    def _restore_model_constants(self, variant_ids: wp.array, world_mask: wp.array | None) -> None:
+        """Select prepared model constants, then restore the native current-pose state."""
+        for bank, output in self._model_constants:
+            wp.launch(_copy_model_constants, output.shape, inputs=[variant_ids, world_mask, bank], outputs=[output])
+        self._mujoco_warp.restore_const_state(self.mjw_model, self.mjw_data)
+
     @override
-    def notify_model_changed(self, flags: ModelFlags | int, *, world_mask: wp.array | None = None) -> None:
+    def notify_model_changed(
+        self,
+        flags: ModelFlags | int,
+        *,
+        world_mask: wp.array | None = None,
+        constant_variant_ids: wp.array | None = None,
+        root_poses_only: bool = False,
+    ) -> None:
         """Refresh properties, waking only selected worlds when a mask is supplied.
 
         The mask follows :meth:`reset` and controls wake scope. Property arrays
         are synchronized in full; callers must restrict their writes to the selected worlds.
+
+        Experimental ``constant_variant_ids`` selects the prepared invariant bank: a full native-world
+        int32 or int64 device array identifying each world's immutable registered variant. Only selected worlds'
+        constants change. IDs must be in ``[0, variant_count)``; the caller owns this device-input precondition.
+        ``root_poses_only`` preserves the bank for edits confined to fixed world-root
+        ``joint_X_p`` transforms, and requires exactly ``JOINT_PROPERTIES``. It must not be used for internal
+        joint frames. Every ordinary nonzero notification invalidates the bank, even after a failed edit.
         """
+        if root_poses_only:
+            if flags != ModelFlags.JOINT_PROPERTIES or constant_variant_ids is not None:
+                raise ValueError("root_poses_only requires only JOINT_PROPERTIES and no variant IDs.")
+            self._validate_constant_roots()
+        elif constant_variant_ids is not None:
+            if self.model.device.is_cuda and wp.get_stream(self.model.device).is_capturing:
+                raise RuntimeError("Cached model notifications must run outside graph capture.")
+            required = (
+                ModelFlags.BODY_INERTIAL_PROPERTIES
+                | ModelFlags.JOINT_PROPERTIES
+                | ModelFlags.JOINT_DOF_PROPERTIES
+                | ModelFlags.SHAPE_PROPERTIES
+            )
+            if flags != required:
+                raise ValueError("Cached variants require the complete body, joint, DOF and shape notification.")
+            if self._model_constants is None:
+                raise RuntimeError("Model constants are not prepared or were invalidated by a generic model edit.")
+            ids = constant_variant_ids
+            if (
+                ids.dtype not in (wp.int32, wp.int64)
+                or ids.shape != (self.mjw_data.nworld,)
+                or ids.device != self.model.device
+            ):
+                raise ValueError(
+                    "constant_variant_ids must be a full native-world int32/int64 array on the model device."
+                )
+        elif flags:
+            self._model_constants = None
+            self._constant_roots_validated = False
         if not self._initial_model_sync:
             self._replication_pristine = False
         world_mask = self._normalize_reset_world_mask(world_mask)
         if self.use_mujoco_cpu:
-            self._notify_model_changed(flags, world_mask)
+            self._notify_model_changed(flags, world_mask, constant_variant_ids)
         else:
             with self._scoped_mujoco_warp_execution():
-                self._notify_model_changed(flags, world_mask)
+                self._notify_model_changed(flags, world_mask, constant_variant_ids)
 
-    def _notify_model_changed(self, flags: ModelFlags | int, world_mask=None) -> None:
+    def _notify_model_changed(self, flags: ModelFlags | int, world_mask=None, constant_variant_ids=None) -> None:
         need_const_fixed = False
         need_const_0 = False
 
@@ -5177,7 +5359,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self._validate_cone_shape_scales()
 
         if flags & ModelFlags.BODY_INERTIAL_PROPERTIES:
-            self._update_model_inertial_properties()
+            self._update_model_inertial_properties(update_inertia=constant_variant_ids is None)
             # set_const_fixed / set_const_0 (called below) recompute MuJoCo
             # constants that feed into contact solver parameters (invweight0,
             # subtreemass, etc.).  Cached MJWarp contact fields written by
@@ -5228,6 +5410,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         # ``dof_invweight0`` factors or the source joint-limit data, so it also
         # captures every case that needs ``jnt_solref`` to be re-scaled.
         need_solref_update = need_const_0
+        if getattr(self, "_preparing_model_constants", False) and need_const_0:
+            # Check freshly authored gains before set_const_0 converts a positive dampratio in place.
+            self._validate_constant_scope()
 
         if self.use_mujoco_cpu:
             if flags & ModelFlags.BODY_INERTIAL_PROPERTIES:
@@ -5278,10 +5463,13 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 with wp.ScopedDevice(self.model.device):
                     # Keep the compiled actuator_lengthrange: MuJoCo computes it by simulation at compile
                     # time, and mujoco_warp.set_length_range() would overwrite muscle ranges with limits * gear.
-                    if need_const_fixed:
+                    if need_const_fixed and constant_variant_ids is None:
                         self._mujoco_warp.set_const_fixed(self.mjw_model, self.mjw_data)
                     if need_const_0:
-                        self._set_const_0_with_physical_meaninertia()
+                        if constant_variant_ids is None:
+                            self._set_const_0_with_physical_meaninertia()
+                        else:
+                            self._restore_model_constants(constant_variant_ids, world_mask)
                     if need_solref_update:
                         # ``set_const_0`` refreshes ``dof_invweight0`` and
                         # ``jnt_solimp`` was already written by
@@ -7950,6 +8138,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             and actuator.biasprm[2] > 0.0
         ]
 
+        self._has_dampratio_actuators = bool(dampratio_actuators)
         self.mj_model = spec.compile()
         # Keep the compiled qM layout, but restore the physical COM and derived constants.
         for body_id, body, body_ipos in full_inertia_bodies:
@@ -8718,7 +8907,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             device=self.model.device,
         )
 
-    def _update_model_inertial_properties(self):
+    def _update_model_inertial_properties(self, *, update_inertia: bool = True):
         if self.model.body_count == 0:
             return
 
@@ -8747,6 +8936,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             device=self.model.device,
         )
 
+        if not update_inertia:
+            return
         wp.launch(
             update_body_inertia_kernel,
             dim=(nworld, nbody),
