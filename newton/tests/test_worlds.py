@@ -102,6 +102,22 @@ class WorldArchitectureTests(unittest.TestCase):
         self.assertEqual([int(value) for value in worlds.WorldOperation], [0, 1, 2, 3])
         self.assertEqual(worlds.WorldStatus.INITIALIZATION_MISSING, 11)
 
+    def test_capacity_service_is_batched_without_legacy_scalar_aliases(self):
+        """Forbid directory rebuilds inside per-prototype native service loops."""
+        tree = ast.parse((self.root / "_src/solvers/mujoco/worlds.py").read_text())
+        owner = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "MuJoCoWorlds")
+        resize = next(
+            node for node in owner.body if isinstance(node, ast.FunctionDef) and node.name == "resize_backing"
+        )
+        self.assertEqual([arg.arg for arg in resize.args.args], ["self", "rows"])
+        for method in owner.body:
+            if not isinstance(method, ast.FunctionDef):
+                continue
+            for loop in (node for node in ast.walk(method) if isinstance(node, (ast.For, ast.While))):
+                for call in (node for node in ast.walk(loop) if isinstance(node, ast.Call)):
+                    if isinstance(call.func, ast.Attribute):
+                        self.assertNotIn(call.func.attr, ("publish_ready", "withdraw_ready"), method.name)
+
     def test_public_import_does_not_initialize_optional_backend_or_cuda_runtime(self):
         """Verify importing world contracts keeps optional engines and CUDA uninitialized."""
         source = """
@@ -126,8 +142,7 @@ class WorldDirectoryCPUTests(unittest.TestCase):
         self.commands = worlds.create_world_commands(4, device="cpu")
         self.results = worlds.create_world_results(4, device="cpu")
         self.sequence = 0
-        self.directory.publish_ready(0, 2)
-        self.directory.publish_ready(1, 2)
+        self.directory.publish_ready((2, 2))
 
     def tearDown(self):
         self.directory.close(streams=())
@@ -189,6 +204,31 @@ class WorldDirectoryCPUTests(unittest.TestCase):
         self.assertEqual(self.directory.d.generation.numpy()[identity], 1)
         np.testing.assert_array_equal(self.directory.d.active_count.numpy(), [1, 0])
 
+    def test_failed_batch_withdrawal_preserves_every_prototype(self):
+        """Validate the entire withdrawal before changing any other ready prefix."""
+        result, _ = self.submit([(worlds.WorldOperation.CREATE, -1, 0, 1)])
+        self.assertEqual(result[0], worlds.WorldStatus.OK)
+        before = self.directory.d.slot_state.numpy().copy()
+        with self.assertRaisesRegex(RuntimeError, "live worlds"):
+            self.directory.withdraw_ready((0, 0))
+        np.testing.assert_array_equal(self.directory.d.slot_state.numpy(), before)
+        np.testing.assert_array_equal(self.directory.d.ready_count.numpy(), [2, 1])
+        for ends in ((1,), (2, 3), (True, 1), (-1, 0)):
+            with self.subTest(ends=ends), self.assertRaises(ValueError):
+                self.directory.publish_ready(ends)
+        np.testing.assert_array_equal(self.directory.d.slot_state.numpy(), before)
+
+    def test_admitted_and_published_slots_are_prototype_local(self):
+        """Keep local row indices distinct from global slot metadata for later prototypes."""
+        result, identities = self.submit([(worlds.WorldOperation.CREATE, -1, 0, 1)])
+        self.assertEqual(result[0], worlds.WorldStatus.OK)
+        identity = int(identities[0])
+        destination = int(self.directory.t.destination_slot.numpy()[0])
+        self.assertEqual(destination, 1)
+        self.assertEqual(int(self.directory.d.slot.numpy()[identity]), destination)
+        self.assertEqual(int(self.directory.d.slot_id.numpy()[2 + destination]), identity)
+        self.assertEqual(int(self.directory.d.slot_id.numpy()[destination]), -1)
+
     def test_acknowledged_compaction_preserves_identity_and_allows_tail_retirement(self):
         """Verify acknowledged row moves retain generation and release the unused tail."""
         result, ids = self.submit([(worlds.WorldOperation.CREATE, -1, 0, 0)])
@@ -201,9 +241,9 @@ class WorldDirectoryCPUTests(unittest.TestCase):
         self.directory.publish_moves()
         self.assertEqual(self.directory.d.slot.numpy()[identity], 0)
         self.assertEqual(self.directory.d.generation.numpy()[identity], 1)
-        self.directory.withdraw_ready(0, 1)
+        self.directory.withdraw_ready((1, 2))
         with self.assertRaisesRegex(RuntimeError, "live worlds"):
-            self.directory.withdraw_ready(0, 0)
+            self.directory.withdraw_ready((0, 2))
 
 
 if __name__ == "__main__":
