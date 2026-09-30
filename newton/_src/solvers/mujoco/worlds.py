@@ -473,8 +473,10 @@ class MuJoCoWorlds:
                                 arrays[name] = array
                     group.contacts.prepare_fill(group.contacts.arrays["contact.efc_address"], -1)
                     for owner in (group.contacts, group.ccd):
-                        for name, array in owner.arrays.items():
-                            owner.fill(array, -1 if name == "contact.efc_address" else 0, count=owner.ready_count)
+                        owner.zero(count=owner.ready_count)
+                    group.contacts.fill(
+                        group.contacts.arrays["contact.efc_address"], -1, count=group.contacts.ready_count
+                    )
                     group.data = _replace_data(
                         template, arrays, nworld=capacity, naconmax=contact_cap, naccdmax=ccd_cap
                     )
@@ -493,8 +495,8 @@ class MuJoCoWorlds:
                     group.move_count = wp.zeros(1, dtype=int, device=device)
                     group.condition = wp.zeros(1, dtype=int, device=device)
                     group.poses_condition = wp.zeros(1, dtype=int, device=device)
-                    self.directory.publish_ready(prototype, group.ready_worlds)
                     start = end
+                self.directory.publish_ready(tuple(group.ready_worlds for group in self.prototypes))
         except BaseException as failure:
             traceback.clear_frames(failure.__traceback__)
             arrays = scratch = world_sources = array = owner = None
@@ -705,69 +707,78 @@ class MuJoCoWorlds:
         self._graph = weakref.ref(graph)
         return graph
 
-    def resize_backing(self, prototype, rows, *, streams):
-        """Join all readers, service W/C/D, and publish the jointly usable prefix.
+    def resize_backing(self, rows: tuple[int, ...], *, streams):
+        """Join once, service all W/C/D prefixes, then publish one coherent ready set.
 
         The caller excludes new submissions until return. Contact/CCD scratch has
-        no persistent row lifetime only after all consumers join this boundary.
+        no persistent lifetime after all consumers join. A clean budget rejection
+        republishes the safely backed partial result; driver failures quarantine
+        the complete population, including graphs held by external callers.
         """
         with wp.ScopedDevice(self.device):
             self._ensure_open()
             if self.backing is None:
                 raise RuntimeError("This population has fixed backing")
-            if type(prototype) is not int or not 0 <= prototype < len(self.prototypes):
-                raise ValueError("Unknown prototype")
-            group = self.prototypes[prototype]
-            if (
-                type(rows) is not int
-                or not 0 <= rows <= group.rows.capacity
-                or rows * group.contact_quota > group.contacts.capacity
-                or rows * group.ccd_quota > group.ccd.capacity
+            rows = tuple(rows)
+            if len(rows) != len(self.prototypes) or any(
+                type(n) is not int
+                or not 0 <= n <= group.rows.capacity
+                or n * group.contact_quota > group.contacts.capacity
+                or n * group.ccd_quota > group.ccd.capacity
+                for n, group in zip(rows, self.prototypes, strict=True)
             ):
-                raise ValueError("Requested worlds exceed prepared W/C/D capacity")
+                raise ValueError("Requested worlds exceed prepared W/C/D capacities")
             with self.backing.maintenance(streams=streams):
-                self.directory.withdraw_ready(prototype, rows)
-                wp.synchronize_stream(wp.get_stream(self.device))
-            budget_rejected = False
-            try:
-                for owner, target in (
-                    (group.rows, rows),
-                    (group.contacts, rows * group.contact_quota),
-                    (group.ccd, rows * group.ccd_quota),
-                ):
-                    old_ready = owner.ready_rows
-                    try:
-                        owner.resize_backing(target, streams=streams)
-                    except MemoryError:
-                        budget_rejected = not owner.service_failed
-                        raise
-                    if owner is not group.rows and owner.ready_rows > old_ready:
-                        # Joined scratch has no retained semantic values. Reestablish
-                        # native constructor zeros after physical blocks change owner.
-                        for name, array in owner.arrays.items():
-                            owner.fill(array, -1 if name == "contact.efc_address" else 0, count=owner.ready_count)
-                self.directory.publish_ready(prototype, group.ready_worlds)
-                wp.synchronize_stream(wp.get_stream(self.device))
-            except MemoryError:
-                if not budget_rejected:
-                    self._service_failed = True
-                    self._healthy.fill_(0)
-                    wp.synchronize_stream(wp.get_stream(self.device))
-                    raise
+                self.directory.withdraw_ready(rows)
+                live_counts = self.directory.d.active_count.numpy()
+                budget_rejected = False
                 try:
-                    self.directory.publish_ready(prototype, group.ready_worlds)
+                    services = [
+                        (group, owner, target, int(live_counts[prototype]) if owner is group.rows else 0)
+                        for prototype, (group, n) in enumerate(zip(self.prototypes, rows, strict=True))
+                        for owner, target in (
+                            (group.rows, n),
+                            (group.contacts, n * group.contact_quota),
+                            (group.ccd, n * group.ccd_quota),
+                        )
+                    ]
+                    # Return every safely retired range before acquiring shared backing.
+                    services.sort(key=lambda entry: entry[2] >= entry[1].ready_rows)
+                    for group, owner, target, live_count in services:
+                        old_ready = owner.ready_rows
+                        try:
+                            owner.resize_backing(target, live_count=live_count)
+                        except MemoryError:
+                            budget_rejected = not owner.service_failed
+                            raise
+                        if owner is not group.rows and owner.ready_rows > old_ready:
+                            owner.zero(count=owner.ready_count, start=old_ready)
+                            if owner is group.contacts:
+                                owner.fill(
+                                    owner.arrays["contact.efc_address"], -1, count=owner.ready_count, start=old_ready
+                                )
+                    self.directory.publish_ready(tuple(group.ready_worlds for group in self.prototypes))
                     wp.synchronize_stream(wp.get_stream(self.device))
+                except MemoryError:
+                    if not budget_rejected:
+                        self._service_failed = True
+                        self._healthy.fill_(0)
+                        wp.synchronize_stream(wp.get_stream(self.device))
+                        raise
+                    try:
+                        self.directory.publish_ready(tuple(group.ready_worlds for group in self.prototypes))
+                        wp.synchronize_stream(wp.get_stream(self.device))
+                    except BaseException:
+                        self._service_failed = True
+                        self._healthy.fill_(0)
+                        wp.synchronize_stream(wp.get_stream(self.device))
+                        raise
+                    raise
                 except BaseException:
                     self._service_failed = True
                     self._healthy.fill_(0)
                     wp.synchronize_stream(wp.get_stream(self.device))
                     raise
-                raise
-            except BaseException:
-                self._service_failed = True
-                self._healthy.fill_(0)
-                wp.synchronize_stream(wp.get_stream(self.device))
-                raise
 
     def memory_report(self):
         """Report backing, native arrays and metadata by their authoritative owner."""

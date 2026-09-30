@@ -109,7 +109,7 @@ graph = worlds.capture(commands, results, substeps=2)
 wp.capture_launch(graph)
 
 # Cold capacity service joins all readers before changing physical mappings.
-worlds.resize_backing(prototype=0, rows=ready_rows, streams=(stream.cuda_stream,))
+worlds.resize_backing(tuple(ready_rows_per_prototype), streams=(stream.cuda_stream,))
 # Drop every graph borrower before closing storage.
 del graph
 worlds.close(streams=(stream.cuda_stream,))
@@ -271,3 +271,27 @@ controllers, task reset distributions, render bindings or solver-independent
 query manifests. Those are callers or later concrete compositions. Numerical
 parity alone does not establish a performance win: compare matched native options,
 contact budgets, actions, reset cadence and complete maintenance cost.
+
+### Joined backing service
+
+`MuJoCoWorlds.resize_backing(rows, streams=...)` accepts one target prefix per
+prototype and excludes new submissions until it returns. The existing native
+composition root owns the W/C/D service order; the mechanical owners and file
+tree remain unchanged. It validates and withdraws the whole directory batch,
+joins consumers once, returns all safe shrinking ranges before any growth, then
+publishes jointly backed prefixes with one final directory rebuild. One joined
+active-count readback supplies row liveness checks. Same-granule requests still
+validate liveness but do not republish readiness or synchronize each row store.
+
+Newly mapped contact and CCD suffixes are initialized by one packed-row clear
+per owner plus the explicit contact-address sentinel fill. Existing prefixes
+remain untouched. `CudaBacking` retains one authoritative page ledger, partitioned
+by reservation; no second mapping cache or memory-accounting owner exists.
+A clean budget rejection may preserve and publish safe partial progress. Driver,
+initialization or readiness-publication failures quarantine the whole native
+population so an externally retained graph cannot access retired storage.
+
+Both `WorldDirectoryData.slot[id]` and `WorldTransaction.destination_slot[request]`
+are prototype-local rows. Only slot metadata arrays such as `slot_id` and
+`slot_state` use `starts[prototype] + local_row`. Reset payloads write directly to
+the local admitted destination before publication.

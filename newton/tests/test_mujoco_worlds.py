@@ -8,13 +8,21 @@ import json
 import os
 import traceback
 import unittest
+from contextlib import nullcontext
 from dataclasses import fields, is_dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import warp as wp
 
+from newton._src.solvers.mujoco.worlds import _MuJoCoPrototype
+from newton._src.utils import row_storage as storage
+from newton._src.utils.cuda_vmm import CudaBacking
 from newton.solvers import MuJoCoWorlds
+from newton.tests.test_cuda_vmm import FakeDriver
+from newton.tests.test_row_storage import FakeArray, FakeWarp
 from newton.worlds import (
     WorldCommands,
     WorldOperation,
@@ -46,6 +54,166 @@ _STATE = (
     "body_awake",
 )
 _POSE = ("xpos", "xquat", "xmat", "geom_xpos", "geom_xmat", "site_xpos", "site_xmat")
+
+
+class MuJoCoWorldsHostTests(unittest.TestCase):
+    """Check joined service admission and failure publication without CUDA."""
+
+    def test_all_safe_shrinks_precede_growth_with_one_shared_backing_budget(self):
+        """Reuse a later prototype's backing without exceeding a full physical budget."""
+
+        fake, driver = FakeWarp(), FakeDriver()
+        backing = CudaBacking(3 * driver.granularity, driver=driver)
+        population = object.__new__(MuJoCoWorlds)
+        population._closed = population._service_failed = False
+        population.device, population.backing = "cpu", backing
+        population._healthy = SimpleNamespace(fill_=lambda value: self.fail("healthy batch quarantined"))
+        publications, withdrawals = [], []
+        population.directory = SimpleNamespace(
+            withdraw_ready=withdrawals.append,
+            publish_ready=publications.append,
+            d=SimpleNamespace(active_count=SimpleNamespace(numpy=lambda: np.zeros(2, dtype=int))),
+        )
+        population.prototypes = []
+        with (
+            patch.object(storage, "wp", fake),
+            patch("newton._src.solvers.mujoco.worlds.wp.get_stream", return_value=SimpleNamespace(cuda_stream=11)),
+            patch("newton._src.solvers.mujoco.worlds.wp.synchronize_stream"),
+        ):
+            try:
+                for initial in (0, 1):
+                    group = _MuJoCoPrototype(None, contact_quota=1, ccd_quota=1)
+                    population.prototypes.append(group)
+                    for name in ("rows", "contacts", "ccd"):
+                        fields = (storage.FieldSpec("contact.efc_address" if name == "contacts" else "value", (), int),)
+                        owner = storage.RowStorage(
+                            257, FakeArray([0], dtype=int), fields=fields, backing=backing, initial_rows=initial
+                        )
+                        setattr(group, name, owner)
+                self.assertEqual(backing.memory_report()["physical_retained_bytes"], backing.budget_bytes)
+                creates = driver.calls["cuMemCreate"]
+                joins = driver.calls["cuStreamSynchronize"]
+                population.resize_backing((1, 0), streams=(11,))
+                self.assertEqual(driver.calls["cuMemCreate"], creates)
+                self.assertEqual(driver.calls["cuStreamSynchronize"] - joins, 1)
+                self.assertEqual(withdrawals, [(1, 0)])
+                self.assertEqual(publications, [(256, 0)])
+                self.assertEqual(backing.memory_report()["mapped_bytes"], backing.budget_bytes)
+            finally:
+                for group in population.prototypes:
+                    for name in ("rows", "contacts", "ccd"):
+                        owner = getattr(group, name, None)
+                        if owner is not None:
+                            owner.close(streams=(11,))
+                with backing.maintenance(streams=(11,)):
+                    backing.close()
+        self.assertEqual(backing.memory_report()["physical_retained_bytes"], 0)
+
+    def test_partial_batch_budget_failure_publishes_only_jointly_backed_prefixes(self):
+        """Partial batch budget failure publishes only jointly backed prefixes."""
+        population = object.__new__(MuJoCoWorlds)
+        population._closed = population._service_failed = False
+        population.device = "cpu"
+        population.backing = SimpleNamespace(maintenance=lambda **kwargs: nullcontext())
+        health, publications, withdrawals = [1], [], []
+        population._healthy = SimpleNamespace(fill_=lambda value, health=health: health.__setitem__(0, value))
+        population.directory = SimpleNamespace(
+            withdraw_ready=withdrawals.append,
+            publish_ready=publications.append,
+            d=SimpleNamespace(active_count=SimpleNamespace(numpy=lambda: np.zeros(2, dtype=int))),
+        )
+        population.prototypes = []
+        for p in range(2):
+            group = _MuJoCoPrototype(None, contact_quota=1, ccd_quota=1)
+            for name in ("rows", "contacts", "ccd"):
+                owner = SimpleNamespace(
+                    ready_rows=1,
+                    capacity=4,
+                    service_failed=False,
+                    arrays={"contact.efc_address": object()},
+                    ready_count=object(),
+                    zero=lambda **kwargs: None,
+                    fill=lambda *args, **kwargs: None,
+                )
+
+                def resize(target, *, live_count, owner=owner, p=p, name=name):
+                    if p == 1 and name == "contacts":
+                        raise MemoryError("budget rejected before mutation")
+                    owner.ready_rows = target
+
+                owner.resize_backing = resize
+                setattr(group, name, owner)
+            population.prototypes.append(group)
+        with (
+            patch("newton._src.solvers.mujoco.worlds.wp.get_stream", return_value=SimpleNamespace(cuda_stream=0)),
+            patch("newton._src.solvers.mujoco.worlds.wp.synchronize_stream"),
+        ):
+            with self.assertRaisesRegex(MemoryError, "budget"):
+                population.resize_backing((2, 2), streams=(0,))
+        self.assertEqual(withdrawals, [(2, 2)])
+        self.assertEqual(publications, [(2, 1)])
+        self.assertEqual(population.prototypes[1].rows.ready_rows, 2)
+        self.assertFalse(population._service_failed)
+        self.assertEqual(health, [1])
+
+    def test_only_healthy_storage_budget_rejection_is_retryable(self):
+        """Only healthy storage budget rejection is retryable."""
+        for failure in ("budget", "storage_publication", "directory_publication", "scratch_fill"):
+            with self.subTest(failure=failure):
+                population = object.__new__(MuJoCoWorlds)
+                population._closed = population._service_failed = False
+                population.device = "cpu"
+                population.backing = SimpleNamespace(maintenance=lambda **kwargs: nullcontext())
+                health, publications = [1], []
+                population._healthy = SimpleNamespace(fill_=lambda value, health=health: health.__setitem__(0, value))
+
+                def publish(rows, publications=publications, failure=failure):
+                    publications.append(rows)
+                    if failure == "directory_publication":
+                        raise MemoryError("directory publication")
+
+                population.directory = SimpleNamespace(
+                    withdraw_ready=lambda *args: None,
+                    publish_ready=publish,
+                    d=SimpleNamespace(active_count=SimpleNamespace(numpy=lambda: np.zeros(1, dtype=int))),
+                )
+                group = _MuJoCoPrototype(None, contact_quota=2, ccd_quota=1)
+                for name, ready, capacity in (("rows", 1, 4), ("contacts", 2, 8), ("ccd", 1, 4)):
+                    owner = SimpleNamespace(
+                        ready_rows=ready,
+                        capacity=capacity,
+                        service_failed=False,
+                        arrays={"contact.efc_address": object()},
+                        ready_count=object(),
+                    )
+
+                    def resize(target, *, live_count, owner=owner, name=name, failure=failure):
+                        if name == "rows" and failure in ("budget", "storage_publication"):
+                            owner.service_failed = failure == "storage_publication"
+                            raise MemoryError(failure)
+                        owner.ready_rows = target
+
+                    def fill(*args, failure=failure, **kwargs):
+                        if failure == "scratch_fill":
+                            raise MemoryError("scratch initialization")
+
+                    owner.resize_backing, owner.fill, owner.zero = resize, fill, fill
+                    setattr(group, name, owner)
+                population.prototypes = [group]
+                with (
+                    patch(
+                        "newton._src.solvers.mujoco.worlds.wp.get_stream", return_value=SimpleNamespace(cuda_stream=0)
+                    ),
+                    patch("newton._src.solvers.mujoco.worlds.wp.synchronize_stream"),
+                ):
+                    with self.assertRaises(MemoryError):
+                        population.resize_backing((2,), streams=(0,))
+                self.assertEqual(population._service_failed, failure != "budget")
+                self.assertEqual(health[0], int(failure == "budget"))
+                if failure == "budget":
+                    self.assertEqual(publications, [(1,)])
+                elif failure != "directory_publication":
+                    self.assertEqual(publications, [])
 
 
 @wp.kernel
@@ -309,9 +477,11 @@ class TestMuJoCoWorlds(unittest.TestCase):
             elif case == "invalid":
                 requests = [(0, _RESET, *labels[0], 0)]
             if population.backing is not None:
-                for p, count in enumerate(population.directory.d.active_count.numpy()):
-                    incoming = sum(op in (_CREATE, _RESET) and target == p for _, op, _, _, target in requests)
-                    population.resize_backing(p, int(count) + incoming, streams=(wp.get_stream(device).cuda_stream,))
+                targets = tuple(
+                    int(count) + sum(op in (_CREATE, _RESET) and target == p for _, op, _, _, target in requests)
+                    for p, count in enumerate(population.directory.d.active_count.numpy())
+                )
+                population.resize_backing(targets, streams=(wp.get_stream(device).cuda_stream,))
             do_step = case in ("step", "delete", "invalid", "empty")
             permit.fill_(int(do_step))
             commands.sequence.fill_(sequence)

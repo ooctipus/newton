@@ -68,7 +68,7 @@ class CudaBacking:
         self._lock = threading.RLock()
         self._regions: dict[int, Region] = {}
         self._pins: dict[int, int] = {}
-        self._pages: dict[int, int] = {}
+        self._pages: dict[int, dict[int, int]] = {}
         self._handles: set[int] = set()
         self._free: list[int] = []
         self._maintenance_thread = None
@@ -221,6 +221,7 @@ class CudaBacking:
             region = Region(address.value, size, nbytes)
             self._regions[region.address] = region
             self._pins[region.address] = 0
+            self._pages[region.address] = {}
             return region
 
     def pin(self, region: Region):
@@ -248,7 +249,8 @@ class CudaBacking:
         """
         self._check(maintenance=True)
         addresses = self._range(region, offset, nbytes)
-        if any(address in self._pages for address in addresses):
+        pages = self._pages[region.address]
+        if any(address in pages for address in addresses):
             raise ValueError("Map range overlaps an existing mapping")
         unit = self.granularity_bytes
         new_count = max(0, len(addresses) - len(self._free))
@@ -268,7 +270,7 @@ class CudaBacking:
                 acquired.append(handle)
             for address, handle in zip(addresses, acquired, strict=True):
                 self._driver("cuMemMap", address, unit, 0, handle, 0)
-                self._pages[address] = handle
+                pages[address] = handle
                 mapped.append(address)
                 self._driver("cuMemSetAccess", address, unit, ct.byref(self._access), 1)
         except Exception as failure:
@@ -276,10 +278,10 @@ class CudaBacking:
             for address in reversed(mapped):
                 try:
                     self._driver("cuMemUnmap", address, unit)
-                    del self._pages[address]
+                    del pages[address]
                 except Exception as error:
                     cleanup_errors.append(error)
-            still_mapped = set(self._pages.values())
+            still_mapped = set(pages.values())
             for handle in acquired:
                 if handle in still_mapped:
                     continue
@@ -307,11 +309,12 @@ class CudaBacking:
         """
         self._check(maintenance=True)
         addresses = self._range(region, offset, nbytes)
-        if any(address not in self._pages for address in addresses):
+        pages = self._pages[region.address]
+        if any(address not in pages for address in addresses):
             raise ValueError("Unmap range contains an unmapped granule")
         for address in addresses:
             self._driver("cuMemUnmap", address, self.granularity_bytes)
-            self._free.append(self._pages.pop(address))
+            self._free.append(pages.pop(address))
 
     def release(self, region: Region):
         """Release one unpinned reservation, retaining its backing in the pool."""
@@ -319,13 +322,13 @@ class CudaBacking:
         self._validate_region(region)
         if self._pins[region.address]:
             raise RuntimeError("Cannot release a region retained by external views or graphs")
-        end = region.address + region.size_bytes
-        addresses = tuple(address for address in self._pages if region.address <= address < end)
+        addresses = tuple(self._pages[region.address])
         for address in addresses:
             self.unmap(region, address - region.address, self.granularity_bytes)
         self._driver("cuMemAddressFree", region.address, region.size_bytes)
         del self._regions[region.address]
         del self._pins[region.address]
+        del self._pages[region.address]
 
     def trim(self):
         """Release all currently unmapped physical handles back to CUDA."""
@@ -350,8 +353,7 @@ class CudaBacking:
         """
         with self._lock:
             self._validate_region(region)
-            end = region.address + region.size_bytes
-            addresses = sorted(address for address in self._pages if region.address <= address < end)
+            addresses = sorted(self._pages[region.address])
             ranges = []
             for address in addresses:
                 offset = address - region.address
@@ -369,8 +371,10 @@ class CudaBacking:
         tables are separate from this physical payload budget.
         """
         with self._lock:
-            free, mapped = set(self._free), set(self._pages.values())
-            assert len(free) == len(self._free) and len(mapped) == len(self._pages)
+            mapped_count = sum(len(pages) for pages in self._pages.values())
+            free = set(self._free)
+            mapped = {handle for pages in self._pages.values() for handle in pages.values()}
+            assert len(free) == len(self._free) and len(mapped) == mapped_count
             assert not free.intersection(mapped) and free.union(mapped) == self._handles
             unit = self.granularity_bytes
             return {
@@ -378,7 +382,7 @@ class CudaBacking:
                 "granularity_bytes": unit,
                 "virtual_reserved_bytes": sum(region.size_bytes for region in self._regions.values()),
                 "physical_retained_bytes": len(self._handles) * unit,
-                "mapped_bytes": len(self._pages) * unit,
+                "mapped_bytes": mapped_count * unit,
                 "spare_bytes": len(self._free) * unit,
                 "regions": len(self._regions),
                 "pins": sum(self._pins.values()),

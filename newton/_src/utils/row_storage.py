@@ -11,6 +11,7 @@ import math
 import sys
 import traceback
 import weakref
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import numpy as np
@@ -29,9 +30,11 @@ def _copy_rows(count: wp.array[int], dst: wp.array2d[wp.uint32], src: wp.array2d
 
 
 @wp.kernel
-def _fill_rows(count: wp.array[int], dst: wp.array2d[wp.uint32], pattern: wp.array[wp.uint32], workers: int):
-    index = wp.int64(wp.tid())
+def _fill_rows(
+    count: wp.array[int], dst: wp.array2d[wp.uint32], pattern: wp.array[wp.uint32], workers: int, start: int
+):
     width = wp.int64(dst.shape[1])
+    index = wp.int64(start) * width + wp.int64(wp.tid())
     total = wp.int64(count[0]) * width
     while index < total:
         row, column = index // width, index % width
@@ -51,13 +54,23 @@ def _copy_bytes(count: wp.array[int], dst: wp.array2d[wp.uint8], src: wp.array2d
 
 
 @wp.kernel
-def _fill_bytes(count: wp.array[int], dst: wp.array2d[wp.uint8], pattern: wp.array[wp.uint8], workers: int):
-    index = wp.int64(wp.tid())
+def _fill_bytes(count: wp.array[int], dst: wp.array2d[wp.uint8], pattern: wp.array[wp.uint8], workers: int, start: int):
     width = wp.int64(dst.shape[1])
+    index = wp.int64(start) * width + wp.int64(wp.tid())
     total = wp.int64(count[0]) * width
     while index < total:
         row, column = index // width, index % width
         dst[row, column] = pattern[column % wp.int64(pattern.shape[0])]
+        index += wp.int64(workers)
+
+
+@wp.kernel
+def _zero_rows(count: wp.array[int], dst: wp.array2d[wp.uint32], workers: int, start: int):
+    width = wp.int64(dst.shape[1])
+    index = wp.int64(start) * width + wp.int64(wp.tid())
+    total = wp.int64(count[0]) * width
+    while index < total:
+        dst[index // width, index % width] = wp.uint32(0)
         index += wp.int64(workers)
 
 
@@ -263,6 +276,7 @@ class RowStorage:
         self.specifications, self.arrays, self.fields, self._by_array, self._patterns = specifications, {}, {}, {}, {}
         self._graphs, self._transfers = weakref.WeakSet(), weakref.WeakSet()
         self._closed, self._service_failed, self.region, self._storage = False, False, None, None
+        self._packed_words = None
         self.ready_rows, self.ready_count = 0, None
         array = None
         current_stream = wp.get_stream(self.device).cuda_stream
@@ -335,6 +349,13 @@ class RowStorage:
                 self.fields[name] = descriptor
                 self._by_array[_array_key(array)] = descriptor
                 words = descriptor = None
+            if self.row_bytes:
+                self._packed_words = wp.array(
+                    ptr=address, shape=(capacity, self.row_bytes // 4), dtype=wp.uint32, device=self.device
+                )
+                self._packed_words.row_field_owner = next(
+                    field.array for field in self.fields.values() if field.offset is not None
+                )
             self._publish_ready(self.ready_rows)
         except BaseException as failure:
             self._closed = True
@@ -343,6 +364,7 @@ class RowStorage:
                 if backing is not None:
                     with backing.maintenance(streams=(current_stream,)):
                         array = None
+                        self._packed_words = None
                         self.arrays.clear()
                         self.fields.clear()
                         self._by_array.clear()
@@ -352,6 +374,7 @@ class RowStorage:
                 else:
                     wp.synchronize_stream(wp.get_stream(self.device))
                     array = None
+                    self._packed_words = None
                     self.arrays.clear()
                     self.fields.clear()
                     self._by_array.clear()
@@ -447,8 +470,8 @@ class RowStorage:
             self._patterns[key] = pattern
         return pattern
 
-    def fill(self, array, value, *, count=None):
-        """Record a typed live-prefix fill; its pattern must exist before capture."""
+    def fill(self, array, value, *, count=None, start=0):
+        """Fill rows in [start, count); its typed pattern must exist before capture."""
         self._ensure_open()
         field = self.lookup(array)
         if field is None:
@@ -462,35 +485,72 @@ class RowStorage:
             or count.device != self.device
         ):
             raise ValueError("Fill count must be one contiguous int32 scalar on the storage device")
-        if not array.size:
+        if type(start) is not int or not 0 <= start <= self.capacity:
+            raise ValueError("Fill start must be within the prepared row capacity")
+        if not array.size or start == self.capacity:
             return
         pattern = self.prepare_fill(array, value)
-        workers = min(65536, self.capacity * field.words.shape[1])
+        workers = min(65536, (self.capacity - start) * field.words.shape[1])
         kernel = _fill_rows if field.words.dtype == wp.uint32 else _fill_bytes
-        wp.launch(kernel, workers, [count, field.words, pattern, workers], device=self.device)
+        wp.launch(kernel, workers, [count, field.words, pattern, workers, start], device=self.device)
+
+    def zero(self, *, count=None, start=0):
+        """Zero a row suffix, fusing packed fields and preserving earlier rows."""
+        self._ensure_open()
+        count = self.count if count is None else count
+        if (
+            not isinstance(count, wp.array)
+            or count.dtype != wp.int32
+            or count.shape != (1,)
+            or not count.is_contiguous
+            or count.device != self.device
+        ):
+            raise ValueError("Zero count must be one contiguous int32 scalar on the storage device")
+        if type(start) is not int or not 0 <= start <= self.capacity:
+            raise ValueError("Zero start must be within the prepared row capacity")
+        if start == self.capacity:
+            return
+        if self._packed_words is not None:
+            workers = min(65536, (self.capacity - start) * (self.row_bytes // 4))
+            wp.launch(_zero_rows, workers, [count, self._packed_words, workers, start], device=self.device)
+        for field in self.fields.values():
+            if field.offset is None and field.row_bytes:
+                self.fill(field.array, 0, count=count, start=start)
 
     def _rounded_bytes(self, rows):
         granularity = self.backing.granularity_bytes
         return min(self.region.size_bytes, (rows * self.row_bytes + granularity - 1) // granularity * granularity)
 
-    def _publish_ready(self, rows):
+    def _publish_ready(self, rows, *, synchronize=True):
         self.ready_count.fill_(rows)
-        wp.synchronize_stream(wp.get_stream(self.device))
+        if synchronize:
+            wp.synchronize_stream(wp.get_stream(self.device))
         self.ready_rows = rows
 
     def prepare_transfer(self, source, *, fields):
         """Prepare typed row transfers between owned, compatible row domains."""
         return RowTransfer(source, self, fields)
 
-    def resize_backing(self, rows, *, streams):
-        """Join consumers, reject live retirement, and change the ready row prefix."""
+    def resize_backing(self, rows, *, streams=None, live_count=None):
+        """Service readiness inside a joined scope or after joining the supplied streams.
+
+        A composition owner may supply the protected count from its single joined
+        batch readback. This requires an already active backing maintenance scope;
+        no submissions may occur between that readback and completing the batch.
+        Joined growth publications are ordered on the current stream; the caller
+        joins that stream before allowing submissions on other streams.
+        """
         self._ensure_open()
         if self.backing is None:
             raise RuntimeError("Backing service requires an open VMM row owner")
         if type(rows) is not int or not 0 <= rows <= self.capacity:
             raise ValueError("Requested rows exceed prepared capacity")
-        with self.backing.maintenance(streams=streams):
-            live = int(self.count.numpy()[0])
+        if live_count is not None and (streams is not None or type(live_count) is not int):
+            raise ValueError("A joined protected count requires active maintenance and an integer")
+        if streams is None:
+            self.backing._check(maintenance=True)
+        with self.backing.maintenance(streams=streams) if streams is not None else nullcontext():
+            live = int(self.count.numpy()[0]) if live_count is None else live_count
             if not 0 <= live <= self.ready_rows or rows < live:
                 raise RuntimeError("Cannot retire live rows or service an invalid live count")
             ranges = self.backing.mapped_ranges(self.region)
@@ -500,6 +560,8 @@ class RowStorage:
                 raise RuntimeError("Row backing is not a contiguous prefix; retire this owner")
             old = ranges[0][1] if ranges else 0
             new = self._rounded_bytes(rows)
+            if new == old:
+                return
             clean_budget_rejection = False
             try:
                 if new < old:
@@ -513,7 +575,7 @@ class RowStorage:
                         raise
                 elif new < old:
                     self.backing.unmap(self.region, new, old - new)
-                self._publish_ready(min(self.capacity, new // self.row_bytes))
+                self._publish_ready(min(self.capacity, new // self.row_bytes), synchronize=streams is not None)
             except BaseException as failure:
                 if clean_budget_rejection:
                     raise
@@ -570,6 +632,7 @@ class RowStorage:
             with self.backing.maintenance(streams=streams):
                 self._publish_ready(0)
                 self._closed = True
+                self._packed_words = None
                 self.arrays.clear()
                 self.fields.clear()
                 self._by_array.clear()
@@ -582,6 +645,7 @@ class RowStorage:
             wp.synchronize_device(self.device)
             self._publish_ready(0)
             self._closed = True
+            self._packed_words = None
             self.arrays.clear()
             self.fields.clear()
             self._by_array.clear()
