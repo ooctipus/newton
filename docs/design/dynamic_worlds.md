@@ -301,6 +301,18 @@ A clean budget rejection may preserve and publish safe partial progress. Driver,
 initialization or readiness-publication failures quarantine the whole native
 population so an externally retained graph cannot access retired storage.
 
+An optional `spare_bytes` argument trims unused physical handles inside that same
+joined service scope after successful readiness publication. `None` preserves
+the existing retain-all behavior; zero releases all spare handles. A positive
+reserve rounds up to the CUDA allocation granularity and never allocates handles
+to fill an undersized reserve. It changes neither mapped ranges nor virtual
+addresses, so captured graphs remain valid. The mechanical
+`CudaBacking.trim(keep_bytes=...)` operation owns release and retry accounting;
+no task-level per-reset synchronization or second allocator is introduced.
+Release errors retain ownership of failed handles and quarantine the population
+through the existing service failure path. No spare-reserve policy is selected
+by default; callers should measure maintenance cost and subsequent regrowth.
+
 Both `WorldDirectoryData.slot[id]` and `WorldTransaction.destination_slot[request]`
 are prototype-local rows. Only slot metadata arrays such as `slot_id` and
 `slot_state` use `starts[prototype] + local_row`. Reset payloads write directly to

@@ -12,7 +12,7 @@ import sys
 import textwrap
 import traceback
 import unittest
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import fields, is_dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -224,6 +224,71 @@ class MuJoCoWorldsHostTests(unittest.TestCase):
         self.assertEqual(population.prototypes[1].rows.ready_rows, 2)
         self.assertFalse(population._service_failed)
         self.assertEqual(health, [1])
+
+    def test_optional_spare_trim_reuses_service_barrier_and_failure_quarantine(self):
+        """Trim runs after ready publication with no second successful-path join."""
+        for spare, fail in ((None, False), (0, False), (123, False), (123, True)):
+            with self.subTest(spare=spare, fail=fail):
+                population = object.__new__(MuJoCoWorlds)
+                population._closed = population._service_failed = False
+                population.device = "cpu"
+                events, health = [], [1]
+
+                @contextmanager
+                def maintenance(*, streams, events=events):
+                    self.assertEqual(streams, (11,))
+                    events.append("join")
+                    yield
+                    events.append("leave")
+
+                def trim(*, keep_bytes, spare=spare, fail=fail, events=events):
+                    self.assertEqual(keep_bytes, spare)
+                    events.append("trim")
+                    if fail:
+                        raise RuntimeError("release failed")
+
+                population.backing = SimpleNamespace(maintenance=maintenance, trim=trim)
+                population._healthy = SimpleNamespace(fill_=lambda value, health=health: health.__setitem__(0, value))
+                population.directory = SimpleNamespace(
+                    withdraw_ready=lambda rows, events=events: events.append("withdraw"),
+                    publish_ready=lambda rows, events=events: events.append("publish"),
+                    d=SimpleNamespace(active_count=SimpleNamespace(numpy=lambda: np.ones(1, dtype=int))),
+                )
+                group = _MuJoCoPrototype(None, contact_quota=1, ccd_quota=1)
+                for name in ("rows", "contacts", "ccd"):
+                    owner = SimpleNamespace(ready_rows=1, capacity=4, service_failed=False)
+                    owner.resize_backing = lambda target, *, live_count, events=events: events.append("resize")
+                    setattr(group, name, owner)
+                population.prototypes = (group,)
+                with (
+                    patch("newton._src.solvers.mujoco.worlds.wp.get_stream", return_value=object()),
+                    patch(
+                        "newton._src.solvers.mujoco.worlds.wp.synchronize_stream",
+                        side_effect=lambda stream, events=events: events.append("sync"),
+                    ),
+                ):
+                    if fail:
+                        with self.assertRaisesRegex(RuntimeError, "release failed"):
+                            population.resize_backing((1,), streams=(11,), spare_bytes=spare)
+                    else:
+                        population.resize_backing((1,), streams=(11,), spare_bytes=spare)
+                self.assertEqual(events.count("join"), 1)
+                self.assertEqual(events.count("sync"), 2 if fail else 1)
+                self.assertEqual(events.count("trim"), int(spare is not None))
+                if spare is not None:
+                    self.assertLess(events.index("publish"), events.index("trim"))
+                self.assertEqual(population._service_failed, fail)
+                self.assertEqual(health[0], int(not fail))
+
+    def test_invalid_spare_limit_is_rejected_before_maintenance(self):
+        """Bad optional reserve arguments cannot withdraw ready populations."""
+        population = object.__new__(MuJoCoWorlds)
+        population._closed = population._service_failed = False
+        population.device = "cpu"
+        population.backing = object()
+        for value in (-1, True, False, 1.0, "1"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                population.resize_backing((), streams=(11,), spare_bytes=value)
 
     def test_only_healthy_storage_budget_rejection_is_retryable(self):
         """Only healthy storage budget rejection is retryable."""
