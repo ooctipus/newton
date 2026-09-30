@@ -1056,6 +1056,10 @@ cancellation error. Qualification therefore also compares against independent
 double-precision reference calculations, retaining MJWarp's documented zero-trace
 regularization; cached values need not reproduce the less accurate distant-origin
 rounding of eager refresh.
+Small float32 constant differences can affect iterative-solver acceleration and
+warm-start histories even when joint positions and velocities remain within a
+comparison's limits. This API does not promise identical solver histories to eager
+refresh or bounded trajectory differences for arbitrary workloads.
 
 
 .. _mujoco-code-pointers:
