@@ -14,6 +14,12 @@ The consuming application owns prototype preparation, controls, initialization p
 - MJWarp owns `StepBindings` and the prepared native workspace. One shared bindings record borrows the world, candidate and CCD storage domains and owns the stage-binding ledger. Newton does not duplicate that ledger or failure state.
 - Native MJWarp `Data` is the authoritative physical state. There is no dense Newton `State` mirror.
 
+MJWarp declares native scratch element types and dimensions. GPU Components supplies
+`StridedLayout`, packing, binding and descriptor validation for both fixed scratch
+and growable `FieldStorage`. The workspace is a passive record; MJWarp's preparation,
+validation and reporting functions operate on it. Solver alignment requirements
+remain beside the solver. Ordinary `mjw.step(model, data)` still needs no workspace.
+
 The former `newton.worlds` namespace and Newton's generic allocator, directory and graph implementations are removed. Import each standalone concept directly; there are no compatibility aliases.
 
 ## Public native operations
@@ -91,6 +97,12 @@ def before_step(population):
 `apply_controls`, `controls` and `control_width` are application-provided. The kernel must use the declared leading world axis. `world` is bounded by the live count; `candidate` and `ccd` use their accessible prefixes. A fixed worker grid explicitly uses `domain=None, extent_axis=None` and guards its own accesses. Named int32 count arguments require explicit `parameter_domains`; an integer's value or an array's shape conveys no domain semantics. All external arrays belong in `capture(retain=...)`.
 
 Callbacks run while preparing the graph. `before_step` records controls once before the ordered substeps; `after_substep` records consumers after each native substep. Optional final kinematics refresh also covers valid reset-only frames. Each prototype's conditional program may run on a separate captured branch, while updater completion and global error guards precede every native condition.
+
+`record_launch()` delegates to `mjw.launch_step_kernel`, which resolves native count
+domains and calls the atomic `gpu_components.graph.launch` operation. Newton does
+not emit a raw Warp kernel and separately notify a binding recorder. Graph resource
+retention and preparation invalidation use the shared graph operations; managed
+storage still owns its weak close guards and physical readiness.
 
 ## Resize backing and retire
 

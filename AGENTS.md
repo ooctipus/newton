@@ -7,6 +7,7 @@ For reviews, also read and apply the [review guidelines](REVIEW_GUIDELINES.rst) 
 
 - Generic instance relations, typed storage, byte backing and graph updates belong to the standalone `gpu-components` package. Newton imports its public concept operations and passive records; do not restore `newton.worlds`, generic owner files, aliases or method-forwarding facades.
 - Native MJWarp stage binding has one `StepBindings` record shared with the workspace. Do not duplicate its count declarations, binding/operation lists or failure latch in Newton. Native population recording composes physics and application callbacks; the MJWarp stage operation owns launch binding.
+- Application recording delegates atomically to `mujoco_warp.launch_step_kernel`; never reconstruct a raw Warp launch followed by separate binding. Native workspaces are passive scratch records, with validation and reporting at MJWarp's operation boundary.
 
 - Use the cloner's prototype/occurrence/instance relations as the architectural reference: resolve names and paths to integer IDs before entering numeric relation APIs. Do not accept `int | str` identities or repeat symbolic resolution downstream.
 - Keep lifetime validity, physical readiness and task participation with their respective owners. Public world records describe numeric relations and the domain publication protocol; allocation and scheduling scratch stays private.
