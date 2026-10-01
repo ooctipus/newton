@@ -332,9 +332,11 @@ batch sequence, operation, identity, expected generation and target prototype.
 values have canonical public enums in `newton.worlds`. `CREATE` ignores input
 identity/generation and returns an allocated handle; `RESET` and `DESTROY` validate
 the supplied handle. Reset keeps the identity and increments its generation, even
-within the same prototype. Destroy retires that identity and also increments its
-generation. Results are indexed by request ordinal, not world ID; accept a new
-handle only from a successful create/reset result.
+within the same prototype. Destroy retires that identity and increments its
+generation unless it is already `UINT64_MAX`; terminal destruction leaves a dead,
+nonreusable tombstone at that generation. Generations never wrap. Results are
+indexed by request ordinal, not world ID; accept a new handle only from a
+successful create/reset result.
 
 Start with a positive sequence. A new sequence consumes the batch even if some
 requests fail; retry only the rejected requests with a higher sequence. Equal-sequence replays retain the
@@ -360,7 +362,8 @@ request disables the batch's physics permit. Admission uses the pre-batch free
 IDs and rows; resources retired by this batch become available to later batches.
 Resource contention does not promise request-order winners. Replaying the same
 accepted sequence does not apply the lifecycle command again. Reused IDs increment
-their generation; stale references and generation exhaustion are rejected.
+their generation. Stale references and resets at generation exhaustion are
+rejected; terminal identities remain destroyable but cannot be reused.
 
 Compaction copies complete native Data rows in the correctness baseline. It does
 not copy transient contact/CCD queues. Lifecycle publication invalidates their
@@ -452,10 +455,11 @@ Standalone directory closure joins exactly its supplied streams. Borrowed metada
 remains alive while Python references retain it; closure retires submission rights.
 
 Graph preparation has one graph-wide failure boundary. Pure declaration errors
-can be corrected before emission. Once a CUDA node is emitted or irreversibly
-marked, a preparation failure invalidates the graph for every updater owner,
-including a healthy peer. Catching the exception cannot make that program safe
-to instantiate. Preparation callbacks are released on success and failure;
+remain correctable before that operation mutates the captured program, including
+binding validation after capture. Failure during node emission or after
+irreversible marking invalidates the graph for every updater owner, including a
+healthy peer. Catching that exception cannot make the program safe to instantiate.
+Preparation callbacks are released on success and failure;
 captured execution retains explicit resource owners, not arbitrary task closures.
 
 ## Level 5 A second domain without a generic backend interface
