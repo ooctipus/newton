@@ -16,11 +16,16 @@ class TestFeatherPGSFusedResponse(unittest.TestCase):
     def test_exact_response_and_padding(self):
         """Preserve exact response, diagonal shifts, mappings, and inactive bytes."""
         device = wp.get_device("cuda:0")
-        for dofs, capacity, threads in ((14, 64, 64), (27, 64, 64), (4, 5, 32), (2, 65, 64)):
+        for dofs, capacity, threads in ((14, 64, 64), (27, 64, 64), (128, 32, 64), (4, 5, 32), (2, 65, 64)):
             with self.subTest(dofs=dofs, capacity=capacity, threads=threads):
                 self._check_case(device, dofs, capacity, threads)
 
-    def _check_case(self, device, dofs, capacity, threads):
+    @unittest.skipUnless(wp.is_cuda_available(), "Fused tiled response requires CUDA")
+    def test_full_capacity_graph_count_transitions(self):
+        """Overwrite newly active and zero-response rows when a captured C128 graph changes counts."""
+        self._check_case(wp.get_device("cuda:0"), 27, 128, 64, count_transitions=True)
+
+    def _check_case(self, device, dofs, capacity, threads, *, count_transitions=False):
         """Use power-of-two factors so the complete reference is exactly representable."""
         counts = np.array(
             sorted(
@@ -101,6 +106,30 @@ class TestFeatherPGSFusedResponse(unittest.TestCase):
                 wp.capture_launch(graph, stream=stream)
                 for actual, expected in zip(arrays[6:], (expected_c, expected_diag, expected_y), strict=True):
                     self.assertEqual(actual.numpy().tobytes(), expected.tobytes())
+            if count_transitions:
+                # Keep output buffers intact across large/empty/small transitions.
+                # The zero-response phase must overwrite old nonzero matrix entries.
+                for phase, next_counts in enumerate((capacity - counts, np.roll(counts, 3), counts)):
+                    next_jacobians = rng.integers(-2, 3, jacobians.shape).astype(np.float32)
+                    if phase == 1:
+                        next_jacobians.fill(0)
+                    for group in range(worlds):
+                        world = art_to_world[group_to_art[group]]
+                        count = int(next_counts[world])
+                        next_jacobians[group, count:] = 0
+                        stop = (count + chunk - 1) // chunk * chunk
+                        if stop:
+                            j = next_jacobians[group, :stop]
+                            y = j / 4
+                            c = j @ y.T
+                            expected_y[group, :stop] = y
+                            expected_c[world, :stop, :stop] = c
+                            expected_diag[world, :count] = np.diag(c)[:count] + cfm[world, :count]
+                    arrays[1].assign(next_jacobians)
+                    arrays[4].assign(next_counts)
+                    wp.capture_launch(graph, stream=stream)
+                    for actual, expected in zip(arrays[6:], (expected_c, expected_diag, expected_y), strict=True):
+                        self.assertEqual(actual.numpy().tobytes(), expected.tobytes())
 
 
 if __name__ == "__main__":

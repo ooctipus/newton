@@ -16,6 +16,7 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _DENSE_META_MAX_PARENT,
     _DENSE_META_ROW_TYPE_MASK,
     _estimate_cholesky_shared_memory,
+    _estimate_hinv_jt_shared_memory,
     _FeatherPGSExecutionPlan,
     _select_hinv_jt_chunk_size,
     _use_resident_mfgs_metadata,
@@ -452,27 +453,48 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 tile_threads=64,
             )
 
-    def test_hinv_fusion_requires_full_working_set_to_fit(self):
-        fitting = _FeatherPGSExecutionPlan.build(
-            [23],
-            max_constraints=64,
-            max_shared_memory=101376,
-            cholesky_kernel="auto",
-            hinv_jt_kernel="auto",
-            small_dof_threshold=12,
-            tile_threads=64,
-        )
-        oversized = _FeatherPGSExecutionPlan.build(
-            [23],
-            max_constraints=384,
-            max_shared_memory=101376,
-            cholesky_kernel="auto",
-            hinv_jt_kernel="auto",
-            small_dof_threshold=12,
-            tile_threads=64,
-        )
-        self.assertTrue(fitting.use_fused_hinv_jt(23))
-        self.assertFalse(oversized.use_fused_hinv_jt(23))
+    def test_hinv_fused_estimate_counts_streamed_tiles(self):
+        """Count four response tiles, including the second Jacobian chunk, in fused storage."""
+        # The 27-DOF, 16-row fused launch reports 11,120 bytes: one 2,928-byte
+        # factor, four 1,728-byte response tiles, a 1,024-byte product and
+        # 256 bytes of Warp scratch. Capacity does not enlarge divisible chunks.
+        for capacity, threads, expected in (
+            (128, 64, 11120),
+            (384, 64, 11120),
+            (128, 128, 11376),
+            (15, 64, 10624),
+            (17, 64, 11712),
+            (1, 64, 3648),
+        ):
+            with self.subTest(capacity=capacity, threads=threads):
+                self.assertEqual(
+                    _estimate_hinv_jt_shared_memory(27, capacity, fused=True, tile_threads=threads), expected
+                )
+        self.assertEqual(_estimate_hinv_jt_shared_memory(27, 32, fused=False, tile_threads=64), 13552)
+
+    def test_hinv_fusion_uses_streamed_working_set(self):
+        """Admit fitting streamed fusion and preserve resource fallback at exact boundaries."""
+        for dofs, capacity, shared_memory, expected in (
+            (27, 128, 101376, True),
+            (23, 384, 101376, True),
+            (27, 128, 11119, False),
+            (27, 128, 11120, True),
+            (27, 17, 11120, False),
+            (27, 17, 11712, True),
+            (130, 128, 101376, False),
+        ):
+            with self.subTest(dofs=dofs, capacity=capacity, shared_memory=shared_memory):
+                plan = _FeatherPGSExecutionPlan.build(
+                    [dofs],
+                    max_constraints=capacity,
+                    max_shared_memory=shared_memory,
+                    cholesky_kernel="auto",
+                    hinv_jt_kernel="auto",
+                    small_dof_threshold=12,
+                    tile_threads=64,
+                )
+                self.assertTrue(plan.use_tiled_hinv_jt(dofs))
+                self.assertEqual(plan.use_fused_hinv_jt(dofs), expected)
 
     def test_cholesky_execution_plan_respects_shared_memory(self):
         """Fall back for oversized auto tiles and reject forced invalid launches."""
@@ -873,6 +895,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "tiled launch-config step test requires CUDA")
     def test_non_default_tile_threads_compiles_and_steps(self):
+        """Compile and step streamed fusion with a wide reservation and non-default block size."""
         model = _build_chain_model()
         forced = {"cholesky_kernel": "tiled", "trisolve_kernel": "tiled", "hinv_jt_kernel": "tiled"}
         with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", forced):
@@ -885,7 +908,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 dense_max_constraints=384,
             )
         self.assertTrue(all(solver._execution_plan.use_tiled_hinv_jt(size) for size in solver.size_groups))
-        self.assertFalse(any(solver._execution_plan.use_fused_hinv_jt(size) for size in solver.size_groups))
+        self.assertTrue(all(solver._execution_plan.use_fused_hinv_jt(size) for size in solver.size_groups))
         state_0, state_1 = model.state(), model.state()
         control = model.control()
         for _ in range(5):

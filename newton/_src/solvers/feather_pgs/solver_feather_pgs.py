@@ -1055,6 +1055,13 @@ def _select_mfgs_storage(
 
 
 _HINV_JT_MAX_CHUNK_SIZE = 32
+_FUSED_ROW_CHUNK = 16
+
+
+def _fused_response_chunk_size(max_constraints: int) -> int:
+    """Select the streamed fused response width or its nondivisible fallback."""
+    chunk = min(int(max_constraints), _FUSED_ROW_CHUNK)
+    return int(max_constraints) if int(max_constraints) % chunk else chunk
 
 
 def _align_shared_memory(size: int) -> int:
@@ -1071,8 +1078,11 @@ def _estimate_cholesky_shared_memory(n_dofs: int) -> int:
 
 def _estimate_hinv_jt_shared_memory(n_dofs: int, constraint_count: int, *, fused: bool, tile_threads: int) -> int:
     """Estimate the complete tiled H-inverse shared-memory footprint [B]."""
+    if fused:
+        constraint_count = _fused_response_chunk_size(constraint_count)
     footprint = _align_shared_memory(4 * n_dofs * n_dofs)
-    footprint += 3 * _align_shared_memory(4 * n_dofs * constraint_count)
+    # Fusion holds J_i, Z_i, X_i and J_j; the unfused solve has three tiles.
+    footprint += (4 if fused else 3) * _align_shared_memory(4 * n_dofs * constraint_count)
     if fused:
         footprint += _align_shared_memory(4 * constraint_count * constraint_count)
     return footprint + 4 * tile_threads
@@ -17412,10 +17422,6 @@ def _get_hinv_jt_kernel(
     return wp.kernel(enable_backward=False, module="unique")(hinv_jt_tiled_template)
 
 
-_FUSED_ROW_CHUNK = 16
-"""Row chunk for the fused dense response kernel; must divide ``dense_max_constraints``."""
-
-
 @cache
 def _get_hinv_jt_fused_kernel(
     n_dofs: int, max_constraints: int, device_arch: str, tile_threads: int = 64
@@ -17429,9 +17435,7 @@ def _get_hinv_jt_fused_kernel(
     Jacobians, so the extra rows inside the last chunk are zero and never read.
     """
     TILE_DOF_LOCAL = wp.constant(int(n_dofs))
-    chunk = min(int(max_constraints), _FUSED_ROW_CHUNK)
-    if int(max_constraints) % chunk != 0:
-        chunk = int(max_constraints)
+    chunk = _fused_response_chunk_size(max_constraints)
     TILE_CHUNK_LOCAL = wp.constant(chunk)
 
     def hinv_jt_tiled_fused_template(
