@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Sphinx extension to document Warp `@wp.func` functions.
+"""Sphinx extension to document Warp functions and structured records.
 
 This extension registers a custom *autodoc* documenter that recognises
 `warp.types.Function` objects (created by the :pyfunc:`warp.func` decorator),
@@ -9,9 +9,9 @@ unwraps them to their original Python function (stored in the ``.func``
 attribute) and then delegates all further processing to the standard
 :class:`sphinx.ext.autodoc.FunctionDocumenter`.
 
-With this in place, *autosummary* and *autodoc* treat Warp kernels exactly like
-regular Python functions: the original signature and docstring are used and
-`__all__` filtering works as expected.
+Warp structs are documented from their Python ``.cls`` definition through the
+ordinary ``autoclass`` directive. Field annotations and source docstrings remain
+with that definition; no parallel field schema or modified Warp metadata is needed.
 """
 
 from __future__ import annotations
@@ -19,12 +19,10 @@ from __future__ import annotations
 import inspect
 from typing import Any
 
-from sphinx.ext.autodoc import FunctionDocumenter
+from sphinx.ext.autodoc import AttributeDocumenter, ClassDocumenter, FunctionDocumenter
 
-# NOTE: We do **not** import warp at module import time. Doing so would require
-# CUDA and other heavy deps during the Sphinx build. Instead, detection of a
-# Warp function is performed purely via *duck typing* (checking attributes and
-# class name) so the extension is safe even when Warp cannot be imported.
+# Detect Warp wrappers without importing Warp, so loading this extension does
+# not add runtime dependencies to Sphinx projects that do not document them.
 
 
 class WarpFunctionDocumenter(FunctionDocumenter):
@@ -80,15 +78,48 @@ class WarpFunctionDocumenter(FunctionDocumenter):
         super().add_directive_header(sig)
 
 
+class WarpClassDocumenter(ClassDocumenter):
+    """Use a Warp struct's Python definition for ordinary ``autoclass`` processing."""
+
+    priority = ClassDocumenter.priority + 10
+
+    @staticmethod
+    def _looks_like_warp_struct(obj: Any) -> bool:
+        return type(obj).__name__ == "Struct" and inspect.isclass(getattr(obj, "cls", None))
+
+    @classmethod
+    def can_document_member(cls, member, member_name, isattr, parent):
+        return cls._looks_like_warp_struct(member) or super().can_document_member(member, member_name, isattr, parent)
+
+    def import_object(self, raiseerror: bool = False) -> bool:
+        imported = super().import_object(raiseerror)
+        if imported and self._looks_like_warp_struct(self.object):
+            self.object = self.object.cls
+            self.doc_as_attr = self.objpath[-1] != self.object.__name__
+        return imported
+
+
+class WarpAttributeDocumenter(AttributeDocumenter):
+    """Find field comments on the Python definition without modifying Warp metadata."""
+
+    def update_annotations(self, parent: Any) -> None:
+        if WarpClassDocumenter._looks_like_warp_struct(parent):
+            self.parent = parent.cls
+        else:
+            super().update_annotations(parent)
+
+
 # ----------------------------------------------------------------------------
 # Sphinx extension entry point
 # ----------------------------------------------------------------------------
 
 
 def setup(app):  # type: ignore[override]
-    """Register the :class:`WarpFunctionDocumenter` with *app*."""
+    """Register Warp functions and class definitions with *app*."""
 
     app.add_autodocumenter(WarpFunctionDocumenter, override=True)
+    app.add_autodocumenter(WarpClassDocumenter, override=True)
+    app.add_autodocumenter(WarpAttributeDocumenter, override=True)
     # Declare the extension safe for parallel reading/writing
     return {
         "parallel_read_safe": True,

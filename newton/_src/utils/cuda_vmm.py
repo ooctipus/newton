@@ -140,14 +140,17 @@ class MemoryBacking:
 
     @property
     def budget_bytes(self):
+        """Maximum physical bytes held by mapped and spare allocation handles."""
         return self._budget_bytes
 
     @property
     def granularity_bytes(self):
+        """CUDA physical allocation and mapping granularity in bytes."""
         return self._granularity_bytes
 
     @property
     def device_uuid(self):
+        """UUID of the CUDA device verified when this owner was constructed."""
         return self._device_uuid
 
     def _check(self, maintenance=False):
@@ -235,6 +238,7 @@ class MemoryBacking:
             self._references[reservation.address] += 1
 
     def release_reference(self, reservation: VirtualReservation):
+        """Release one borrowed VA reference without unmapping or requiring a current CUDA context."""
         # A Python view deleter can run without a current CUDA context. Decrement
         # metadata only; actual CUDA retirement still requires maintenance.
         with self._lock:

@@ -433,6 +433,7 @@ class FieldStorage:
             raise RuntimeError("Field backing service failed; retire this owner before further replay")
 
     def lookup(self, array):
+        """Return the registered field descriptor for an exact array view, or ``None``."""
         self._ensure_open()
         if not isinstance(array, wp.array) or array.device != self.device:
             raise ValueError("Lookup requires an array on the storage device")
@@ -651,6 +652,7 @@ class FieldStorage:
                 raise
 
     def retain_graph(self, graph, *owners):
+        """Retain this storage and additional owners until graph retirement; return the graph."""
         self._ensure_open()
         if graph.device != self.device:
             raise ValueError("Graph and field storage must share a device")
@@ -907,6 +909,7 @@ class FieldTransfer:
         return graph
 
     def memory_report(self):
+        """Report owned transfer descriptors and validation bytes, excluding both field stores."""
         return {
             "fields": list(self.nonempty_field_names),
             "source_capacity": self.source.capacity,

@@ -92,7 +92,7 @@ extensions = [
     "sphinx_design",
     "sphinx_tabs.tabs",
     "autodoc_filter",
-    "autodoc_wpfunc",
+    "autodoc_warp",
     "experimental",
 ]
 
