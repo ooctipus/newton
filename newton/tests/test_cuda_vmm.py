@@ -9,12 +9,14 @@ CUDA ordering or hardware behavior; GPU remapping probes cover those separately.
 """
 
 import ctypes as ct
+import inspect
 import threading
 import unittest
 import uuid
 from collections import Counter
+from unittest.mock import patch
 
-from newton._src.utils.cuda_vmm import CudaBacking, Region
+from newton._src.utils.cuda_vmm import MemoryBacking, VirtualReservation
 
 FAKE_UUID = "GPU-00000000-0000-0000-0000-000000000001"
 
@@ -143,7 +145,8 @@ class BackingTests(unittest.TestCase):
 
     def make_owner(self, granules=4, *, budget=None):
         driver = FakeDriver()
-        owner = CudaBacking(granules * driver.granularity if budget is None else budget, driver=driver)
+        with patch.object(MemoryBacking, "_load_driver", return_value=driver):
+            owner = MemoryBacking(granules * driver.granularity if budget is None else budget)
         self.owners.append((owner, driver))
         return owner, driver
 
@@ -156,7 +159,7 @@ class BackingTests(unittest.TestCase):
         self.assertEqual(report["physical_retained_bytes"], len(driver.handles) * driver.granularity)
         self.assertEqual(report["mapped_bytes"], len(driver.mappings) * driver.granularity)
         self.assertEqual(report["spare_bytes"], len(driver.handles - mapped_handles) * driver.granularity)
-        self.assertEqual(report["regions"], len(driver.reservations))
+        self.assertEqual(report["reservations"], len(driver.reservations))
         self.assertLessEqual(report["physical_retained_bytes"], report["budget_bytes"])
         return report
 
@@ -172,12 +175,42 @@ class BackingTests(unittest.TestCase):
             with self.subTest(field=field):
                 driver = FakeDriver()
                 setattr(driver, field, value)
-                with self.assertRaises(RuntimeError):
-                    CudaBacking(4096, expected_uuid=FAKE_UUID, driver=driver)
+                with patch.object(MemoryBacking, "_load_driver", return_value=driver), self.assertRaises(RuntimeError):
+                    MemoryBacking(4096, expected_uuid=FAKE_UUID)
                 self.assertFalse(driver.reservations or driver.handles or driver.mappings)
         for value in (-1, 1.5, "4096"):
             with self.subTest(budget=value), self.assertRaises(ValueError):
-                CudaBacking(value, driver=FakeDriver())
+                MemoryBacking(value)
+
+    def test_public_constructor_has_no_test_driver_abi(self):
+        """Fault injection patches the private loader instead of expanding the public contract."""
+        expected = {"budget_bytes", "device_ordinal", "expected_uuid"}
+        self.assertEqual(set(inspect.signature(MemoryBacking).parameters), expected)
+        with patch.object(MemoryBacking, "_load_driver") as load_driver, self.assertRaises(TypeError):
+            MemoryBacking(4096, driver=FakeDriver())
+        load_driver.assert_not_called()
+
+    def test_boolean_bytes_and_device_indices_fail_before_driver_mutation(self):
+        """Keep booleans outside numeric allocation and device-index contracts."""
+        for value in (True, False):
+            driver = FakeDriver()
+            with patch.object(MemoryBacking, "_load_driver", return_value=driver):
+                with self.subTest(budget=value), self.assertRaises(ValueError):
+                    MemoryBacking(value)
+                with self.subTest(device=value), self.assertRaises(ValueError):
+                    MemoryBacking(4096, device_ordinal=value)
+            self.assertFalse(driver.calls)
+        owner, driver = self.make_owner()
+        for value in (True, False):
+            with self.subTest(reservation=value), self.assertRaises(ValueError):
+                owner.reserve(value)
+        reservation = owner.reserve(driver.granularity)
+        with owner.maintenance(streams=(0,)):
+            for offset, size in ((False, driver.granularity), (True, driver.granularity), (0, False), (0, True)):
+                with self.subTest(offset=offset, size=size), self.assertRaises(ValueError):
+                    owner.map(reservation, offset, size)
+        self.assertEqual(driver.calls["cuMemCreate"], 0)
+        self.assertEqual(driver.calls["cuMemMap"], 0)
 
     def test_reservation_rounds_size_without_consuming_physical_budget(self):
         """Verify reservation rounds size without consuming physical budget."""
@@ -197,19 +230,20 @@ class BackingTests(unittest.TestCase):
         driver.fail("cuMemAddressReserve")
         with self.assertRaisesRegex(RuntimeError, "cuMemAddressReserve"):
             owner.reserve(1)
-        self.assertEqual(self.assert_ledger(owner, driver)["regions"], 0)
+        self.assertEqual(self.assert_ledger(owner, driver)["reservations"], 0)
         owner.reserve(1)
-        self.assertEqual(self.assert_ledger(owner, driver)["regions"], 1)
+        self.assertEqual(self.assert_ledger(owner, driver)["reservations"], 1)
 
     def test_size_limits_and_read_only_properties_prevent_silent_reconfiguration(self):
         """Verify size limits and read only properties prevent silent reconfiguration."""
         maximum = (1 << (8 * ct.sizeof(ct.c_size_t))) - 1
         driver = FakeDriver()
-        with self.assertRaises(ValueError):
-            CudaBacking(maximum + 1, driver=driver)
-        for ordinal in (-1, 2**31, 1.5, "0"):
-            with self.subTest(ordinal=ordinal), self.assertRaises(ValueError):
-                CudaBacking(4096, device_ordinal=ordinal, driver=driver)
+        with patch.object(MemoryBacking, "_load_driver", return_value=driver):
+            with self.assertRaises(ValueError):
+                MemoryBacking(maximum + 1)
+            for ordinal in (-1, 2**31, 1.5, "0"):
+                with self.subTest(ordinal=ordinal), self.assertRaises(ValueError):
+                    MemoryBacking(4096, device_ordinal=ordinal)
         self.assertEqual(driver.calls, {})
         owner, driver = self.make_owner()
         for size in (maximum, maximum + 1):
@@ -249,7 +283,7 @@ class BackingTests(unittest.TestCase):
         for operation in (
             lambda: owner.map(region, 0, region.size_bytes),
             lambda: owner.unmap(region, 0, region.size_bytes),
-            lambda: owner.release(region),
+            lambda: owner.release_reservation(region),
             owner.trim,
             owner.close,
         ):
@@ -353,10 +387,10 @@ class BackingTests(unittest.TestCase):
         owner, driver = self.make_owner()
         unit = driver.granularity
         region = owner.reserve(2 * unit)
-        clone = Region(region.address, region.size_bytes, region.requested_bytes)
+        clone = VirtualReservation(region.address, region.size_bytes, region.requested_bytes)
         for malformed in (clone, None, {}, region.address):
             with self.subTest(region=malformed), self.assertRaises(ValueError):
-                owner.pin(malformed)
+                owner.acquire_reference(malformed)
         with owner.maintenance(streams=(0,)):
             for offset, size in (
                 (-unit, unit),
@@ -403,7 +437,7 @@ class BackingTests(unittest.TestCase):
             owner.unmap(region, unit, unit)
             self.assertEqual(owner.mapped_ranges(region), ((0, unit), (2 * unit, unit), (4 * unit, 2 * unit)))
             self.assertEqual(snapshot, expected)
-            owner.release(region)
+            owner.release_reservation(region)
         for invalid in (region, None):
             with self.subTest(region=invalid), self.assertRaises(ValueError):
                 owner.mapped_ranges(invalid)
@@ -427,29 +461,29 @@ class BackingTests(unittest.TestCase):
             owner.map(second, 0, 2 * unit)
             self.assertEqual(driver.handles, handles)
             self.assertEqual(driver.calls["cuMemCreate"], 2)
-            owner.release(first)
+            owner.release_reservation(first)
         self.assert_ledger(owner, driver)
 
-    def test_pins_retain_addresses_but_allow_remapping_and_context_free_unpin(self):
-        """Verify pins retain addresses but allow remapping and context free unpin."""
+    def test_references_retain_addresses_but_allow_remapping_and_context_free_release(self):
+        """Verify references retain addresses but allow remapping and context-free release."""
         owner, driver = self.make_owner()
         unit = driver.granularity
         region = owner.reserve(unit)
-        owner.pin(region)
-        owner.pin(region)
+        owner.acquire_reference(region)
+        owner.acquire_reference(region)
         with owner.maintenance(streams=(0,)):
             owner.map(region, 0, unit)
             owner.unmap(region, 0, unit)
             owner.map(region, 0, unit)
-            for operation in (lambda: owner.release(region), owner.close):
+            for operation in (lambda: owner.release_reservation(region), owner.close):
                 with self.assertRaisesRegex(RuntimeError, "retain"):
                     operation()
-        self.assertEqual(owner.memory_report()["pins"], 2)
+        self.assertEqual(owner.memory_report()["references"], 2)
         driver.context = None
-        owner.unpin(region)
-        owner.unpin(region)
-        with self.assertRaisesRegex(RuntimeError, "no pin"):
-            owner.unpin(region)
+        owner.release_reference(region)
+        owner.release_reference(region)
+        with self.assertRaisesRegex(RuntimeError, "no reference"):
+            owner.release_reference(region)
         driver.context = 0xCAFE
         self.assert_ledger(owner, driver)
 
@@ -521,8 +555,41 @@ class BackingTests(unittest.TestCase):
             owner.map(region, 0, 2 * unit)
         self.assert_ledger(owner, driver)
 
+    def test_interrupted_mapping_rolls_back_acquired_handles(self):
+        """Interrupted preparation must not orphan an acquired but unmapped handle."""
+        for operation in ("cuMemCreate", "cuMemMap", "cuMemSetAccess"):
+            with self.subTest(operation=operation):
+                owner, driver = self.make_owner()
+                region = owner.reserve(3 * driver.granularity)
+                driver.failures[(operation, 2)] = KeyboardInterrupt("interrupted mapping")
+                with owner.maintenance(streams=(0,)):
+                    with self.assertRaisesRegex(KeyboardInterrupt, "interrupted mapping"):
+                        owner.map(region, 0, region.size_bytes)
+                    self.assertEqual(self.assert_ledger(owner, driver)["physical_retained_bytes"], 0)
+                    owner.map(region, 0, region.size_bytes)
+                self.assert_ledger(owner, driver)
+
+    def test_interrupted_rollback_retains_surviving_resources_for_close(self):
+        """A second interruption must preserve both the original error and ownership."""
+        for operation in ("cuMemUnmap", "cuMemRelease"):
+            with self.subTest(operation=operation):
+                owner, driver = self.make_owner()
+                region = owner.reserve(3 * driver.granularity)
+                driver.fail("cuMemSetAccess", after=2)
+                driver.failures[(operation, 1)] = KeyboardInterrupt("interrupted rollback")
+                with owner.maintenance(streams=(0,)):
+                    with self.assertRaisesRegex(BaseExceptionGroup, "rollback") as caught:
+                        owner.map(region, 0, region.size_bytes)
+                    self.assertIsInstance(caught.exception.exceptions[0], RuntimeError)
+                    self.assertIsInstance(caught.exception.exceptions[1], KeyboardInterrupt)
+                    report = self.assert_ledger(owner, driver)
+                    self.assertEqual(report["physical_retained_bytes"], driver.granularity)
+                    owner.close()
+                self.assertTrue(self.assert_ledger(owner, driver)["closed"])
+                self.assertFalse(driver.reservations or driver.handles or driver.mappings)
+
     def test_failed_rollback_release_keeps_surviving_handle_as_spare(self):
-        """Verify failed rollback release keeps surviving handle as spare."""
+        """Verify failed rollback release_reservation keeps surviving handle as spare."""
         owner, driver = self.make_owner()
         unit = driver.granularity
         region = owner.reserve(2 * unit)
@@ -579,7 +646,7 @@ class BackingTests(unittest.TestCase):
         self.assertEqual(self.assert_ledger(owner, driver)["spare_bytes"], 3 * unit)
 
     def test_release_retries_after_partial_unmap_or_address_free_failure(self):
-        """Verify release retries after partial unmap or address free failure."""
+        """Verify reservation release retries after partial unmap or address free failure."""
         for operation in ("cuMemUnmap", "cuMemAddressFree"):
             with self.subTest(operation=operation):
                 owner, driver = self.make_owner()
@@ -589,16 +656,16 @@ class BackingTests(unittest.TestCase):
                     owner.map(region, 0, 3 * unit)
                     driver.fail(operation, after=2 if operation == "cuMemUnmap" else 1)
                     with self.assertRaisesRegex(RuntimeError, operation):
-                        owner.release(region)
-                    self.assertEqual(self.assert_ledger(owner, driver)["regions"], 1)
-                    owner.release(region)
+                        owner.release_reservation(region)
+                    self.assertEqual(self.assert_ledger(owner, driver)["reservations"], 1)
+                    owner.release_reservation(region)
                     report = self.assert_ledger(owner, driver)
-                    self.assertEqual(report["regions"], 0)
+                    self.assertEqual(report["reservations"], 0)
                     self.assertEqual(report["spare_bytes"], 3 * unit)
                     with self.assertRaises(ValueError):
-                        owner.release(region)
+                        owner.release_reservation(region)
                     with self.assertRaises(ValueError):
-                        owner.pin(region)
+                        owner.acquire_reference(region)
 
     def test_trim_releases_independent_handles_and_retains_failed_ones(self):
         """Verify trim releases independent handles and retains failed ones."""
@@ -703,7 +770,7 @@ class BackingTests(unittest.TestCase):
         self.assertEqual(len(driver.history), operations)
         for operation in (
             lambda: owner.reserve(1),
-            lambda: owner.pin(region),
+            lambda: owner.acquire_reference(region),
             lambda: owner.map(region, 0, region.size_bytes),
         ):
             with self.subTest(operation=operation), self.assertRaisesRegex(RuntimeError, "closed"):
@@ -730,7 +797,7 @@ class BackingTests(unittest.TestCase):
             for address, handle in original.items():
                 self.assertEqual(driver.mappings[address], handle)
             self.assertEqual(self.assert_ledger(owner, driver)["mapped_bytes"], 3 * unit)
-            owner.release(second)
+            owner.release_reservation(second)
             self.assertEqual(owner.mapped_ranges(first), ((0, 2 * unit),))
             self.assertEqual(self.assert_ledger(owner, driver)["mapped_bytes"], 2 * unit)
 

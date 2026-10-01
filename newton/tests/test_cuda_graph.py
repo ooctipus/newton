@@ -6,6 +6,7 @@
 import ctypes as ct
 import tempfile
 import unittest
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -14,7 +15,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.utils import cuda_graph as bridge
-from newton._src.utils.cuda_graph import DeviceGraphUpdates, Int32Parameter, KernelBinding
+from newton._src.utils.cuda_graph import DeviceGraphUpdates, GraphKernelBinding, KernelParameterBinding
 
 
 class DeviceGraphTests(unittest.TestCase):
@@ -41,28 +42,29 @@ class DeviceGraphTests(unittest.TestCase):
         def __init__(self):
             self.calls, self.nodes = [], {11: 100, 12: 200}
             self.tail, self.prepare_failure, self.upload_failure = 11, None, 0
+            self.update_failure, self.tail_failure = 0, 0
 
         def binding_size(self):
             return 128
 
-        def capture_tail(self, stream, node, graph):
+        def get_last_kernel_node(self, stream, node, graph):
             self.calls.append(("tail", stream))
             node._obj.value, graph._obj.value = self.tail, self.nodes[self.tail]
-            return 0
+            return self.tail_failure
 
         def validate_node_owner(self, node, graph):
             self.calls.append(("validate", node))
             return 0 if self.nodes.get(node) == graph else -112
 
-        def prepare_binding(self, node, rank, axis, extent, scalars, sources, maxima, count, output):
+        def prepare_binding(self, node, launch_rank, axis, extent, scalars, sources, maxima, count, output):
             self.calls.append(("prepare", node))
             return -999 if node == self.prepare_failure else 0
 
         def launch_update(self, *args):
             self.calls.append(("update", args[0]))
-            return 0
+            return self.update_failure
 
-        def instantiate_upload(self, graph, stream, flags, executable):
+        def instantiate_and_upload(self, graph, stream, flags, executable):
             self.calls.append(("instantiate", graph, stream, flags))
             if not self.upload_failure:
                 executable._obj.value = 900
@@ -74,24 +76,26 @@ class DeviceGraphTests(unittest.TestCase):
         self.device = SimpleNamespace(is_cuda=True, captures={}, arch=120)
         self.stream = self.Stream()
         self.stream.device, self.stream.cuda_stream = self.device, 5
-        self.count = SimpleNamespace(shape=(1,), dtype=bridge.wp.int32, device=self.device, is_contiguous=True, ptr=10)
+        self.enable_count = SimpleNamespace(
+            shape=(1,), dtype=bridge.wp.int32, device=self.device, is_contiguous=True, ptr=10
+        )
         self.library = self.Library()
         self.addCleanup(patch.stopall)
         patch.object(bridge.DeviceGraphUpdates, "_load_library", return_value=self.library).start()
         patch.object(bridge.wp, "zeros", side_effect=self.Array).start()
         patch.object(bridge.wp, "get_stream", return_value=self.stream).start()
-        self.owner = bridge.DeviceGraphUpdates(self.count, maximum=31, capacity_nodes=4)
+        self.owner = bridge.DeviceGraphUpdates(self.enable_count, enable_count_maximum=31, binding_capacity=4)
         self.graph = self.Graph()
         self.graph.device, self.graph.graph_exec, self.graph.graph = self.device, None, 100
 
     def capture(self, *, child=False):
         self.device.captures[self.stream] = self.graph
-        self.owner.capture_update()
-        first = self.owner.capture_tail()
-        nodes = [self.bridge.KernelBinding(first, rank=2)]
+        self.owner.record_update()
+        first = self.owner.register_last_kernel_node()
+        nodes = [self.bridge.GraphKernelBinding(first, launch_rank=2)]
         if child:
             self.graph.graph, self.library.tail = 200, 12
-            nodes.append(self.bridge.KernelBinding(self.owner.capture_tail(), rank=1))
+            nodes.append(self.bridge.GraphKernelBinding(self.owner.register_last_kernel_node(), launch_rank=1))
             self.graph.graph = 100
         self.device.captures.clear()
         return nodes
@@ -100,53 +104,85 @@ class DeviceGraphTests(unittest.TestCase):
         """Verify descriptor validation precedes allocation."""
         for field, value in (("shape", (2,)), ("dtype", self.bridge.wp.float32), ("is_contiguous", False)):
             with self.subTest(field=field):
-                bad = SimpleNamespace(**vars(self.count))
+                bad = SimpleNamespace(**vars(self.enable_count))
                 setattr(bad, field, value)
                 with self.assertRaises(ValueError):
-                    self.bridge.DeviceGraphUpdates(bad, maximum=31, capacity_nodes=4)
-        for capacity in (0, -1, True, 1.5):
+                    self.bridge.DeviceGraphUpdates(bad, enable_count_maximum=31, binding_capacity=4)
+        for capacity in (0, -1, True, 1.5, 2**31):
             with self.assertRaises(ValueError):
-                self.bridge.DeviceGraphUpdates(self.count, maximum=31, capacity_nodes=capacity)
+                self.bridge.DeviceGraphUpdates(self.enable_count, enable_count_maximum=31, binding_capacity=capacity)
 
     def test_same_graph_conditional_children_bind_and_retain_one_owner(self):
         """Verify same graph conditional children bind and retain one owner."""
         bindings = self.capture(child=True)
         self.owner.bind(self.graph, bindings)
         self.assertEqual(self.owner.binding_count.assigned, 2)
-        self.assertIn(self.owner, self.graph.world_owners)
-        self.assertIn(self.count, self.graph.world_owners)
-        self.owner.instantiate_upload(self.graph)
+        self.assertIn(self.owner, self.graph._resource_owners)
+        self.assertIn(self.enable_count, self.graph._resource_owners)
+        self.owner.instantiate_and_upload(self.graph)
         self.assertEqual(self.graph.graph_exec.value, 900)
         with self.assertRaises(RuntimeError):
-            self.owner.instantiate_upload(self.graph)
+            self.owner.instantiate_and_upload(self.graph)
+
+    def test_binding_cannot_omit_a_registered_consumer(self):
+        """A missing binding must not leave a registered consumer at its captured extent."""
+        bindings = self.capture(child=True)
+        with self.assertRaisesRegex(ValueError, "every node registered"):
+            self.owner.bind(self.graph, bindings[:1])
+        self.assertIsNone(self.owner._graph)
+        self.assertFalse(any(call[0] == "prepare" for call in self.library.calls))
+        self.owner.bind(self.graph, bindings)
+        self.owner.instantiate_and_upload(self.graph)
+        self.assertEqual(self.graph.graph_exec.value, 900)
+
+    def test_unbound_peer_is_retained_and_prevents_graph_publication(self):
+        """An emitted updater retains its buffers and blocks publication until fully bound."""
+        bindings = self.capture()
+        other = self.bridge.DeviceGraphUpdates(self.enable_count, enable_count_maximum=31, binding_capacity=4)
+        self.device.captures[self.stream] = self.graph
+        other.record_update()
+        self.library.tail = 12
+        node = other.register_last_kernel_node()
+        self.device.captures.clear()
+        retained = weakref.ref(other)
+        del other
+        self.assertIsNotNone(retained())
+        self.owner.bind(self.graph, bindings)
+        with self.assertRaisesRegex(RuntimeError, "Every recorded updater"):
+            self.owner.instantiate_and_upload(self.graph)
+        self.assertFalse(any(call[0] == "instantiate" for call in self.library.calls))
+        self.assertFalse(self.owner._instantiation_attempted)
+        retained().bind(self.graph, [self.bridge.GraphKernelBinding(node, 1)])
+        self.owner.instantiate_and_upload(self.graph)
+        self.assertEqual(self.graph.graph_exec.value, 900)
 
     def test_all_explicit_stream_entrypoints_reject_foreign_device(self):
         """Verify all explicit stream entrypoints reject foreign device."""
         foreign = self.Stream()
         foreign.device, foreign.cuda_stream = object(), 99
-        for method in (self.owner.capture_tail, self.owner.capture_update):
+        for method in (self.owner.register_last_kernel_node, self.owner.record_update):
             with self.assertRaises(ValueError):
                 method(stream=foreign)
         self.assertEqual(self.library.calls, [])
         self.owner.bind(self.graph, self.capture())
         with self.assertRaises(ValueError):
-            self.owner.instantiate_upload(self.graph, stream=foreign)
+            self.owner.instantiate_and_upload(self.graph, stream=foreign)
         self.assertFalse(any(call[0] == "instantiate" for call in self.library.calls))
 
     def test_capture_must_be_managed_ordered_and_recorded_once(self):
         """Verify capture must be managed ordered and recorded once."""
         with self.assertRaises(RuntimeError):
-            self.owner.capture_update()
+            self.owner.record_update()
         self.device.captures[self.stream] = self.graph
         with self.assertRaises(RuntimeError):
-            self.owner.capture_tail()
-        self.owner.capture_update()
+            self.owner.register_last_kernel_node()
+        self.owner.record_update()
         with self.assertRaises(RuntimeError):
-            self.owner.capture_update()
+            self.owner.record_update()
         other = self.Graph()
         self.device.captures[self.stream] = other
         with self.assertRaises(RuntimeError):
-            self.owner.capture_tail()
+            self.owner.register_last_kernel_node()
 
     def test_foreign_graph_and_unrecorded_nodes_fail_before_marking(self):
         """Verify foreign graph and unrecorded nodes fail before marking."""
@@ -156,7 +192,20 @@ class DeviceGraphTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.owner.bind(other, bindings)
         with self.assertRaises(ValueError):
-            self.owner.bind(self.graph, [self.bridge.KernelBinding(999, rank=1)])
+            self.owner.bind(self.graph, [self.bridge.GraphKernelBinding(999, launch_rank=1)])
+        self.assertFalse(any(call[0] == "prepare" for call in self.library.calls))
+
+    def test_malformed_bindings_never_claim_nodes_or_mark_the_graph(self):
+        """Reject nonbinding descriptors and nonnumeric node identities before mutation."""
+        self.capture()
+        for descriptor in (None, {"node": 11}, SimpleNamespace(node=11)):
+            with self.subTest(descriptor=descriptor), self.assertRaises(TypeError):
+                self.owner.bind(self.graph, [descriptor])
+        for node in (True, "11", [], None):
+            with self.subTest(node=node), self.assertRaises(ValueError):
+                self.owner.bind(self.graph, [self.bridge.GraphKernelBinding(node, 1)])
+        self.assertIsNone(self.owner._graph)
+        self.assertFalse(hasattr(self.graph, "device_node_owners"))
         self.assertFalse(any(call[0] == "prepare" for call in self.library.calls))
 
     def test_native_node_ownership_is_rechecked_before_irreversible_marking(self):
@@ -169,14 +218,23 @@ class DeviceGraphTests(unittest.TestCase):
         self.assertFalse(any(call[0] == "prepare" for call in self.library.calls))
 
     def test_duplicate_scalar_indices_rank_types_and_duplicate_nodes_rejected(self):
-        """Verify duplicate scalar indices rank types and duplicate nodes rejected."""
+        """Verify duplicate scalar indices launch_rank types and duplicate nodes rejected."""
         bindings = self.capture()
         for binding in (
-            self.bridge.KernelBinding(11, 2, parameters=(self.bridge.Int32Parameter(1, self.count, 31),) * 2),
-            self.bridge.KernelBinding(11, True),
-            self.bridge.KernelBinding(11, 2, extent_axis=True),
-            self.bridge.KernelBinding(11, 2, parameters=(self.bridge.Int32Parameter(True, self.count, 31),)),
-            self.bridge.KernelBinding(11, 2, parameters=(self.bridge.Int32Parameter(0, self.count, 31),)),
+            self.bridge.GraphKernelBinding(
+                11, 2, parameters=(self.bridge.KernelParameterBinding(1, self.enable_count, 31),) * 2
+            ),
+            self.bridge.GraphKernelBinding(11, True),
+            self.bridge.GraphKernelBinding(11, 2, extent_axis=True),
+            self.bridge.GraphKernelBinding(
+                11, 2, parameters=(self.bridge.KernelParameterBinding(True, self.enable_count, 31),)
+            ),
+            self.bridge.GraphKernelBinding(
+                11, 2, parameters=(self.bridge.KernelParameterBinding(0, self.enable_count, 31),)
+            ),
+            self.bridge.GraphKernelBinding(
+                11, 2, parameters=(self.bridge.KernelParameterBinding(2**31, self.enable_count, 31),)
+            ),
         ):
             with self.subTest(binding=binding), self.assertRaises(ValueError):
                 self.owner.bind(self.graph, [binding])
@@ -187,13 +245,13 @@ class DeviceGraphTests(unittest.TestCase):
     def test_independent_parameter_sources_are_validated_and_retained(self):
         """Verify independent parameter sources are validated and retained."""
         self.capture()
-        contact_count = SimpleNamespace(**{**vars(self.count), "ptr": 88})
-        ccd_count = SimpleNamespace(**{**vars(self.count), "ptr": 99})
-        parameter = self.bridge.Int32Parameter(2, ccd_count, 127)
-        binding = self.bridge.KernelBinding(11, 2, extent_source=contact_count, parameters=(parameter,))
+        contact_count = SimpleNamespace(**{**vars(self.enable_count), "ptr": 88})
+        ccd_count = SimpleNamespace(**{**vars(self.enable_count), "ptr": 99})
+        parameter = self.bridge.KernelParameterBinding(2, ccd_count, 127)
+        binding = self.bridge.GraphKernelBinding(11, 2, extent_source=contact_count, parameters=(parameter,))
         self.owner.bind(self.graph, [binding])
-        self.assertIn(contact_count, self.graph.world_owners)
-        self.assertIn(ccd_count, self.graph.world_owners)
+        self.assertIn(contact_count, self.graph._resource_owners)
+        self.assertIn(ccd_count, self.graph._resource_owners)
 
     def test_parameter_sources_and_limits_fail_before_node_marking(self):
         """Verify parameter sources and limits fail before node marking."""
@@ -205,45 +263,45 @@ class DeviceGraphTests(unittest.TestCase):
             ("device", object()),
             ("is_contiguous", False),
         ):
-            source = SimpleNamespace(**vars(self.count))
+            source = SimpleNamespace(**vars(self.enable_count))
             setattr(source, field, value)
             for binding in (
-                self.bridge.KernelBinding(11, 2, extent_source=source),
-                self.bridge.KernelBinding(11, 2, parameters=(self.bridge.Int32Parameter(1, source, 31),)),
+                self.bridge.GraphKernelBinding(11, 2, extent_source=source),
+                self.bridge.GraphKernelBinding(11, 2, parameters=(self.bridge.KernelParameterBinding(1, source, 31),)),
             ):
                 with self.subTest(field=field), self.assertRaises(ValueError):
                     self.owner.bind(self.graph, [binding])
         for maximum in (-1, True, 2**31, 1.5):
-            with self.subTest(maximum=maximum), self.assertRaises(ValueError):
+            with self.subTest(enable_count_maximum=maximum), self.assertRaises(ValueError):
                 self.owner.bind(
                     self.graph,
                     [
-                        self.bridge.KernelBinding(
-                            11, 2, parameters=(self.bridge.Int32Parameter(1, self.count, maximum),)
+                        self.bridge.GraphKernelBinding(
+                            11, 2, parameters=(self.bridge.KernelParameterBinding(1, self.enable_count, maximum),)
                         )
                     ],
                 )
         with self.assertRaises(ValueError):
-            self.owner.bind(self.graph, [self.bridge.KernelBinding(11, 2, extent_axis=None, extent_source=self.count)])
+            self.owner.bind(
+                self.graph, [self.bridge.GraphKernelBinding(11, 2, extent_axis=None, extent_source=self.enable_count)]
+            )
         self.assertFalse(any(call[0] == "prepare" for call in self.library.calls))
 
     def test_enable_count_requires_an_explicit_int32_limit(self):
         """Verify enable count requires an explicit int32 limit."""
         for maximum in (0, -1, True, 2**31, 1.5):
-            with self.subTest(maximum=maximum), self.assertRaises(ValueError):
-                self.bridge.DeviceGraphUpdates(self.count, maximum=maximum, capacity_nodes=4)
+            with self.subTest(enable_count_maximum=maximum), self.assertRaises(ValueError):
+                self.bridge.DeviceGraphUpdates(self.enable_count, enable_count_maximum=maximum, binding_capacity=4)
 
-    def test_two_updaters_cannot_claim_the_same_node_even_after_failed_preparation(self):
-        """Verify two updaters cannot claim the same node even after failed preparation."""
+    def test_two_updaters_cannot_claim_the_same_node(self):
+        """One device-update node has exactly one owner even within a shared graph."""
         bindings = self.capture()
-        other = self.bridge.DeviceGraphUpdates(self.count, maximum=31, capacity_nodes=4)
+        other = self.bridge.DeviceGraphUpdates(self.enable_count, enable_count_maximum=31, binding_capacity=4)
         self.device.captures[self.stream] = self.graph
-        other.capture_update()
-        other.capture_tail()
+        other.record_update()
+        other.register_last_kernel_node()
         self.device.captures.clear()
-        self.library.prepare_failure = 11
-        with self.assertRaisesRegex(RuntimeError, "prepare binding"):
-            self.owner.bind(self.graph, bindings)
+        self.owner.bind(self.graph, bindings)
         self.assertIs(self.graph.device_node_owners[11], self.owner)
         with self.assertRaisesRegex(ValueError, "already has"):
             other.bind(self.graph, bindings)
@@ -256,21 +314,91 @@ class DeviceGraphTests(unittest.TestCase):
         self.library.prepare_failure = 12
         with self.assertRaisesRegex(RuntimeError, "prepare binding 1"):
             self.owner.bind(self.graph, bindings)
-        self.assertIn(self.owner, self.graph.world_owners)
+        self.assertIn(self.owner, self.graph._resource_owners)
         with self.assertRaises(RuntimeError):
-            self.owner.instantiate_upload(self.graph)
+            self.owner.instantiate_and_upload(self.graph)
         with self.assertRaises(RuntimeError):
             self.owner.bind(self.graph, bindings)
+
+    def test_failed_peer_binding_prevents_publication_by_successfully_bound_owner(self):
+        """A partially prepared graph cannot be published through a healthy peer updater."""
+        bindings = self.capture()
+        other = self.bridge.DeviceGraphUpdates(self.enable_count, enable_count_maximum=31, binding_capacity=4)
+        self.device.captures[self.stream] = self.graph
+        other.record_update()
+        self.library.tail = 12
+        node = other.register_last_kernel_node()
+        self.device.captures.clear()
+        self.owner.bind(self.graph, bindings)
+        self.library.prepare_failure = 12
+        with self.assertRaisesRegex(RuntimeError, "prepare binding"):
+            other.bind(self.graph, [self.bridge.GraphKernelBinding(node, 1)])
+        with self.assertRaisesRegex(RuntimeError, "failed.*preparation"):
+            self.owner.instantiate_and_upload(self.graph)
+        self.assertFalse(any(call[0] == "instantiate" for call in self.library.calls))
+
+    def test_failed_update_emission_prevents_further_work_through_another_owner(self):
+        """A caught CUDA failure may already have emitted work into this shared graph."""
+        self.device.captures[self.stream] = self.graph
+        self.library.update_failure = 999
+        with self.assertRaisesRegex(RuntimeError, "record GPU updates"):
+            self.owner.record_update()
+        other = self.bridge.DeviceGraphUpdates(self.enable_count, enable_count_maximum=31, binding_capacity=4)
+        self.library.update_failure = 0
+        with self.assertRaisesRegex(RuntimeError, "failed.*preparation"):
+            other.record_update()
+        self.assertEqual(sum(call[0] == "update" for call in self.library.calls), 1)
+
+    def test_failed_emitted_node_association_quarantines_the_shared_graph(self):
+        """Reject publication after a caught failure to associate an already emitted node."""
+        self.device.captures[self.stream] = self.graph
+        self.owner.record_update()
+        self.library.tail_failure = 999
+        with self.assertRaisesRegex(RuntimeError, "capture kernel tail"):
+            self.owner.register_last_kernel_node()
+        with self.assertRaisesRegex(RuntimeError, "failed.*preparation"):
+            self.owner.bind(self.graph, [])
+
+    def test_descriptor_publication_failure_quarantines_after_irreversible_node_marking(self):
+        """Failed uploads cannot leave a marked graph appearing healthy to peers."""
+        bindings = self.capture()
+        with patch.object(self.owner.bindings, "assign", side_effect=KeyboardInterrupt("interrupted upload")):
+            with self.assertRaisesRegex(KeyboardInterrupt, "interrupted upload"):
+                self.owner.bind(self.graph, bindings)
+        self.assertTrue(self.graph._preparation_failed)
+        self.assertEqual(sum(call[0] == "prepare" for call in self.library.calls), 1)
+        self.assertIn(self.owner, self.graph._resource_owners)
+        with self.assertRaisesRegex(RuntimeError, "failed preparation"):
+            self.owner.instantiate_and_upload(self.graph)
+
+    def test_failed_instantiation_cannot_be_retried_through_a_peer(self):
+        """An executable failure belongs to the shared graph, not the chosen uploader."""
+        bindings = self.capture()
+        other = self.bridge.DeviceGraphUpdates(self.enable_count, enable_count_maximum=31, binding_capacity=4)
+        self.device.captures[self.stream] = self.graph
+        other.record_update()
+        self.library.tail = 12
+        node = other.register_last_kernel_node()
+        self.device.captures.clear()
+        self.owner.bind(self.graph, bindings)
+        other.bind(self.graph, [self.bridge.GraphKernelBinding(node, 1)])
+        self.library.upload_failure = 999
+        with self.assertRaisesRegex(RuntimeError, "instantiate/upload"):
+            self.owner.instantiate_and_upload(self.graph)
+        self.library.upload_failure = 0
+        with self.assertRaisesRegex(RuntimeError, "failed preparation"):
+            other.instantiate_and_upload(self.graph)
+        self.assertEqual(sum(call[0] == "instantiate" for call in self.library.calls), 1)
 
     def test_failed_instantiation_does_not_allow_another_attempt(self):
         """Verify failed instantiation does not allow another attempt."""
         self.owner.bind(self.graph, self.capture())
         self.library.upload_failure = 999
         with self.assertRaisesRegex(RuntimeError, "instantiate/upload"):
-            self.owner.instantiate_upload(self.graph)
+            self.owner.instantiate_and_upload(self.graph)
         self.assertIsNone(self.graph.graph_exec)
         with self.assertRaises(RuntimeError):
-            self.owner.instantiate_upload(self.graph)
+            self.owner.instantiate_and_upload(self.graph)
         self.assertEqual(sum(call[0] == "instantiate" for call in self.library.calls), 1)
 
     def test_invalid_flags_do_not_consume_the_one_instantiation_attempt(self):
@@ -278,9 +406,9 @@ class DeviceGraphTests(unittest.TestCase):
         self.owner.bind(self.graph, self.capture())
         for flags in (-1, 2**64, True, 1.5):
             with self.assertRaises(ValueError):
-                self.owner.instantiate_upload(self.graph, flags=flags)
+                self.owner.instantiate_and_upload(self.graph, flags=flags)
         self.assertFalse(self.owner._instantiation_attempted)
-        self.owner.instantiate_upload(self.graph)
+        self.owner.instantiate_and_upload(self.graph)
 
     def test_compiler_diagnostic_preserves_stderr_and_removes_partial_artifact(self):
         """Verify compiler diagnostic preserves stderr and removes partial artifact."""
@@ -447,7 +575,7 @@ class ParallelCaptureTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "depends on a sibling"):
             self.bridge.capture_parallel([first, second])
-        self.assertTrue(self.graph._parallel_capture_failed)
+        self.assertTrue(self.graph._preparation_failed)
 
     def test_callback_failure_quarantines_all_later_binding_and_instantiation(self):
         """Verify callback failure quarantines all later binding and instantiation."""
@@ -458,18 +586,18 @@ class ParallelCaptureTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ArithmeticError, "branch failed"):
             self.bridge.capture_parallel([fail])
-        self.assertTrue(self.graph._parallel_capture_failed)
-        with self.assertRaisesRegex(RuntimeError, "failed parallel"):
+        self.assertTrue(self.graph._preparation_failed)
+        with self.assertRaisesRegex(RuntimeError, "failed preparation"):
             self.bridge.capture_parallel([])
         owner = object.__new__(self.bridge.DeviceGraphUpdates)
-        for operation in (lambda: owner.bind(self.graph, []), lambda: owner.instantiate_upload(self.graph)):
-            with self.assertRaisesRegex(RuntimeError, "failed parallel"):
+        for operation in (lambda: owner.bind(self.graph, []), lambda: owner.instantiate_and_upload(self.graph)):
+            with self.assertRaisesRegex(RuntimeError, "failed preparation"):
                 operation()
 
     def test_native_parent_change_and_python_owner_change_are_rejected(self):
         """Verify native parent change and python owner change are rejected."""
         for changed in ("native", "python"):
-            self.graph._parallel_capture_failed = False
+            self.graph._preparation_failed = False
             self.native = 100
             self.device.captures[self.stream] = self.graph
 
@@ -481,7 +609,7 @@ class ParallelCaptureTests(unittest.TestCase):
 
             with self.subTest(changed=changed), self.assertRaises(RuntimeError):
                 self.bridge.capture_parallel([callback])
-            self.assertTrue(self.graph._parallel_capture_failed)
+            self.assertTrue(self.graph._preparation_failed)
 
     def test_caught_inner_failure_cannot_publish_successful_outer_join(self):
         """Verify caught inner failure cannot publish successful outer join."""
@@ -495,30 +623,30 @@ class ParallelCaptureTests(unittest.TestCase):
             except ArithmeticError:
                 pass
 
-        with self.assertRaisesRegex(RuntimeError, "failed parallel"):
+        with self.assertRaisesRegex(RuntimeError, "failed preparation"):
             self.bridge.capture_parallel([catch])
-        self.assertTrue(self.graph._parallel_capture_failed)
+        self.assertTrue(self.graph._preparation_failed)
 
     def test_missing_active_capture_identity_mismatch_and_null_graph(self):
         """Verify missing active capture identity mismatch and null graph."""
         for attribute, value in (("status", 0), ("identity", 99), ("native", 0)):
             original = getattr(self, attribute)
             setattr(self, attribute, value)
-            self.graph._parallel_capture_failed = False
+            self.graph._preparation_failed = False
             with self.subTest(attribute=attribute), self.assertRaisesRegex(RuntimeError, "ownership disagree"):
                 self.bridge.capture_parallel([])
-            self.assertTrue(self.graph._parallel_capture_failed)
+            self.assertTrue(self.graph._preparation_failed)
             setattr(self, attribute, original)
         self.assertEqual(self.set_calls, [])
 
     def test_query_and_edit_driver_failures_remain_failed(self):
         """Verify query and edit driver failures remain failed."""
         for attribute in ("get_failure", "set_failure"):
-            self.graph._parallel_capture_failed = False
+            self.graph._preparation_failed = False
             setattr(self, attribute, 999)
             with self.subTest(attribute=attribute), self.assertRaisesRegex(RuntimeError, "999"):
                 self.bridge.capture_parallel([lambda: None])
-            self.assertTrue(self.graph._parallel_capture_failed)
+            self.assertTrue(self.graph._preparation_failed)
             setattr(self, attribute, 0)
 
     def test_invalid_preconditions_do_not_edit_graph(self):
@@ -658,13 +786,13 @@ class DeviceGraphGPU(unittest.TestCase):
             other = wp.empty(capacity, dtype=int)
             wp.launch(_lean_grid, (1, 128, 128), [output])
             wp.launch(_capped_grid, 1, [other], max_blocks=2)
-            updater = DeviceGraphUpdates(count, maximum=capacity, capacity_nodes=2)
+            updater = DeviceGraphUpdates(count, enable_count_maximum=capacity, binding_capacity=2)
             with wp.ScopedCapture(capture_mode=wp.CaptureMode.THREAD_LOCAL) as capture:
-                updater.capture_update()
+                updater.record_update()
                 wp.launch(_lean_grid, (capacity, 128, 128), [output])
-                first = KernelBinding(updater.capture_tail(), rank=3)
+                first = GraphKernelBinding(updater.register_last_kernel_node(), launch_rank=3)
                 wp.launch(_capped_grid, capacity, [other], max_blocks=2)
-                second = KernelBinding(updater.capture_tail(), rank=1)
+                second = GraphKernelBinding(updater.register_last_kernel_node(), launch_rank=1)
             graph = capture.graph
             driver = ct.CDLL("libcuda.so.1")
             driver.cuGraphKernelNodeGetParams.argtypes = [ct.c_void_p, ct.POINTER(Parameters)]
@@ -676,8 +804,8 @@ class DeviceGraphGPU(unittest.TestCase):
             self.assertGreater(grids[0][1], 1, "The test must exercise a captured grid with multiple Y blocks")
             self.assertEqual(grids[1], (2, 1, 1))
             updater.bind(graph, [first, second])
-            updater.instantiate_upload(graph)
-            graph.world_owners += (output, other)
+            updater.instantiate_and_upload(graph)
+            graph._resource_owners += (output, other)
             identity = graph.graph_exec.value
             for live in (4096, 1, 1023, 1024, 1025, 3073, 0, 4096, -1, 4097):
                 with self.subTest(live=live):
@@ -708,48 +836,53 @@ class DeviceGraphGPU(unittest.TestCase):
             wp.launch(_count_workers, 16, [127, 511, 16, workers])
             for array in (worlds, candidates, workers):
                 array.fill_(-1)
-            updater = DeviceGraphUpdates(count, maximum=31, capacity_nodes=3)
+            updater = DeviceGraphUpdates(count, enable_count_maximum=31, binding_capacity=3)
             bindings = []
             with wp.ScopedCapture(capture_mode=wp.CaptureMode.THREAD_LOCAL) as capture:
-                updater.capture_update()
+                updater.record_update()
                 wp.launch(_count_worlds, 31, [31, 127, 511, worlds])
                 bindings.append(
-                    KernelBinding(
-                        updater.capture_tail(),
-                        rank=1,
+                    GraphKernelBinding(
+                        updater.register_last_kernel_node(),
+                        launch_rank=1,
                         parameters=(
-                            Int32Parameter(1, count, 31),
-                            Int32Parameter(2, contacts, 127),
-                            Int32Parameter(3, ccd, 511),
+                            KernelParameterBinding(1, count, 31),
+                            KernelParameterBinding(2, contacts, 127),
+                            KernelParameterBinding(3, ccd, 511),
                         ),
                     )
                 )
                 wp.launch(_count_contacts, 127, [511, candidates])
                 bindings.append(
-                    KernelBinding(
-                        updater.capture_tail(),
-                        rank=1,
+                    GraphKernelBinding(
+                        updater.register_last_kernel_node(),
+                        launch_rank=1,
                         extent_source=contacts,
-                        parameters=(Int32Parameter(1, ccd, 511),),
+                        parameters=(KernelParameterBinding(1, ccd, 511),),
                     )
                 )
                 wp.launch(_count_workers, 16, [127, 511, 16, workers])
                 bindings.append(
-                    KernelBinding(
-                        updater.capture_tail(),
-                        rank=1,
+                    GraphKernelBinding(
+                        updater.register_last_kernel_node(),
+                        launch_rank=1,
                         extent_axis=None,
-                        parameters=(Int32Parameter(1, contacts, 127), Int32Parameter(2, ccd, 511)),
+                        parameters=(KernelParameterBinding(1, contacts, 127), KernelParameterBinding(2, ccd, 511)),
                     )
                 )
             graph = capture.graph
             updater.bind(graph, bindings)
-            updater.instantiate_upload(graph)
-            graph.world_owners += (worlds, candidates, workers)
+            updater.instantiate_and_upload(graph)
+            graph._resource_owners += (worlds, candidates, workers)
             identity = graph.graph_exec.value
             expected = [np.full(n, -1, np.int32) for n in (31, 127, 127)]
             for live, cap, ccd_cap in (
                 (0, 0, 0),
+                (0, 7, 2),  # Disabled parameter changes are applied on the next active replay.
+                (0, 127, 511),
+                (1, 127, 511),
+                (0, 127, 511),
+                (1, 127, 511),
                 (1, 7, 2),
                 (3, 0, 2),
                 (5, 17, 300),
@@ -760,6 +893,11 @@ class DeviceGraphGPU(unittest.TestCase):
                 (4, -1, 2),
                 (-1, 10, 2),
                 (7, 33, 4),
+                (0, -1, 2),  # Zero work still validates every source on every replay.
+                (0, -1, 2),
+                (0, 127, 512),
+                (0, 127, 512),
+                (1, 127, 511),
                 (0, 0, 0),
             ):
                 with self.subTest(worlds=live, contacts=cap, ccd=ccd_cap):
