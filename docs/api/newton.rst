@@ -22,7 +22,6 @@ newton
 - :doc:`newton.usd <newton_usd>`
 - :doc:`newton.utils <newton_utils>`
 - :doc:`newton.viewer <newton_viewer>`
-- :doc:`newton.worlds <newton_worlds>`
 
 .. rubric:: Classes
 

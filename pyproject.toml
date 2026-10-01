@@ -38,6 +38,7 @@ sim = [
     # MuJoCo simulation
     "mujoco-warp~=3.16.0",  # MuJoCo, warp-accelerated
     "mujoco~=3.16.0",       # MuJoCo physics engine
+    "gpu-components>=0.1.0",  # optional growable-memory composition
 ]
 
 # Optional ONNX policy inference for neural actuators and RL policy examples.
@@ -165,7 +166,9 @@ conflicts = [
 ]
 
 [tool.uv.sources]
-mujoco-warp = { git = "https://github.com/ooctipus/mujoco_warp.git", rev = "e67ac18ebb2ceb528e70f17fa0e00344ace0026f" }
+# Development checkouts for the unpublished component extraction.
+gpu-components = { path = "../../gpu-components", editable = true }
+mujoco-warp = { path = "../../mujoco_warp.wt/dynamic-worlds-workspace", editable = true }
 warp-lang = { index = "nvidia" }
 torch = [
     { index = "pytorch-cu128", extra = "torch-cu12" },
