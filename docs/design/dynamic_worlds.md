@@ -314,6 +314,13 @@ newton/tests/test_mujoco_worlds.py        independent dense physics and pose ora
 newton/tests/test_world_runtime_composition.py  independent generated-work consumer
 ```
 
+Documentation has its own composition root: `docs/conf.py` loads
+`docs/_ext/autodoc_warp.py`. It reads Warp's underlying Python definitions so public
+record fields retain their source annotations and descriptions. It neither copies
+the field schema nor changes Warp metadata; runtime modules never import it.
+Documentation gates require supported owner operations and record fields to remain
+visible in the generated reference.
+
 The native root uses the existing one-world preparation path. It does not derive
 from `SolverBase`: a changing native population has no matching dense Newton
 `State`, and exposing a fabricated state would hide its real ownership. The
