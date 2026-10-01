@@ -22,6 +22,7 @@ Use :class:`newton.solvers.MuJoCoWorlds` for the concrete native physics runtime
    :toctree: _generated
    :nosignatures:
 
+   WorldBatch
    WorldCommands
    WorldCompaction
    WorldDirectory
@@ -40,3 +41,5 @@ Use :class:`newton.solvers.MuJoCoWorlds` for the concrete native physics runtime
 
    create_world_commands
    create_world_results
+   world_handle_at
+   world_location

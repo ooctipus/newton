@@ -12,6 +12,7 @@ Use :class:`newton.solvers.MuJoCoWorlds` for the concrete native physics runtime
 """
 
 from ._src.sim.worlds import (
+    WorldBatch,
     WorldCommands,
     WorldCompaction,
     WorldDirectory,
@@ -23,9 +24,12 @@ from ._src.sim.worlds import (
     WorldTransaction,
     create_world_commands,
     create_world_results,
+    world_handle_at,
+    world_location,
 )
 
 __all__ = [
+    "WorldBatch",
     "WorldCommands",
     "WorldCompaction",
     "WorldDirectory",
@@ -37,4 +41,6 @@ __all__ = [
     "WorldTransaction",
     "create_world_commands",
     "create_world_results",
+    "world_handle_at",
+    "world_location",
 ]

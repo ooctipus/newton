@@ -11,8 +11,12 @@ import sys
 import traceback
 import weakref
 from dataclasses import dataclass, field, fields, is_dataclass, replace
+from typing import TYPE_CHECKING
 
 import warp as wp
+
+if TYPE_CHECKING:
+    import mujoco_warp
 
 from ...sim.worlds import (
     ADMITTED,
@@ -20,6 +24,7 @@ from ...sim.worlds import (
     MOVING,
     OK,
     PHASE_INVALID,
+    WorldBatch,
     WorldCommands,
     WorldCompaction,
     WorldDirectory,
@@ -36,27 +41,27 @@ wp.set_module_options({"enable_backward": False})
 
 
 @wp.kernel
-def _guard_health(d: WorldDirectoryData, t: WorldTransaction, healthy: wp.array[int], lifecycle: wp.array[int]):
+def _guard_health(batch: WorldBatch, t: WorldTransaction, healthy: wp.array[int], lifecycle: wp.array[int]):
     if healthy[0] == 0:
-        d.flags[0] = 0
-        d.flags[1] = 0
-        d.flags[2] = PHASE_INVALID
+        batch.consumed[0] = 0
+        batch.advance[0] = 0
+        batch.status[0] = PHASE_INVALID
         t.phase[0] = IDLE
-    lifecycle[0] = wp.int32(d.flags[0] != 0 or d.flags[2] != 0)
+    lifecycle[0] = wp.int32(batch.consumed[0] != 0 or batch.status[0] != 0)
 
 
 @wp.kernel
-def _guard_graph_updates(errors: wp.array[int], count: wp.array[int], healthy: wp.array[int], flags: wp.array[int]):
+def _guard_graph_updates(errors: wp.array[int], count: wp.array[int], healthy: wp.array[int], batch: WorldBatch):
     index = wp.tid()
     if index < count[0] and errors[index] != 0:
         wp.atomic_min(healthy, 0, 0)
-        wp.atomic_min(flags, 1, 0)
-        wp.atomic_max(flags, 2, PHASE_INVALID)
+        wp.atomic_min(batch.advance, 0, 0)
+        wp.atomic_max(batch.status, 0, PHASE_INVALID)
 
 
 @wp.kernel
 def _initialization_ids(
-    d: WorldDirectoryData,
+    batch: WorldBatch,
     t: WorldTransaction,
     prototype: int,
     requests: wp.array[int],
@@ -66,7 +71,7 @@ def _initialization_ids(
 ):
     ordinal = wp.tid()
     accepted = int(0)
-    if d.flags[0] != 0 and t.phase[0] == ADMITTED:
+    if batch.consumed[0] != 0 and t.phase[0] == ADMITTED:
         accepted = t.group_starts[prototype + 1] - t.group_starts[prototype]
     if ordinal == 0:
         count[0] = accepted
@@ -79,10 +84,10 @@ def _initialization_ids(
 
 @wp.kernel
 def _acknowledge_initialization(
-    d: WorldDirectoryData, t: WorldTransaction, prototype: int, status: wp.array[int], caller_ack: int
+    batch: WorldBatch, t: WorldTransaction, prototype: int, status: wp.array[int], caller_ack: int
 ):
     ordinal = wp.tid()
-    if d.flags[0] == 0 or t.phase[0] != ADMITTED:
+    if batch.consumed[0] == 0 or t.phase[0] != ADMITTED:
         return
     start = t.group_starts[prototype]
     if ordinal < t.group_starts[prototype + 1] - start:
@@ -90,7 +95,7 @@ def _acknowledge_initialization(
         if status[0] != 0:
             t.initialized[request] = wp.uint64(0)
         elif caller_ack == 0 and t.status[request] == OK:
-            t.initialized[request] = d.sequence[0]
+            t.initialized[request] = batch.sequence[0]
 
 
 @wp.kernel
@@ -99,7 +104,7 @@ def _relocation_count(
 ):
     count[0] = 0
     if healthy[0] != 0 and t.phase[0] == MOVING:
-        count[0] = moves.sources[prototype]
+        count[0] = moves.count[prototype]
 
 
 @wp.kernel
@@ -107,12 +112,13 @@ def _acknowledge_moves(
     t: WorldTransaction, moves: WorldCompaction, prototype: int, healthy: wp.array[int], status: wp.array[int]
 ):
     if healthy[0] != 0 and t.phase[0] == MOVING and status[0] == 0:
-        moves.copied[prototype] = moves.sources[prototype]
+        moves.copied[prototype] = moves.count[prototype]
 
 
 @wp.kernel
 def _execution_conditions(
     d: WorldDirectoryData,
+    batch: WorldBatch,
     prototype: int,
     world_ready: wp.array[int],
     contact_ready: wp.array[int],
@@ -127,7 +133,7 @@ def _execution_conditions(
     count = d.active_count[prototype]
     ready = wp.int32(
         healthy[0] != 0
-        and d.flags[1] != 0
+        and batch.advance[0] != 0
         and count > 0
         and count <= world_ready[0]
         and count * contact_quota <= contact_ready[0]
@@ -137,11 +143,116 @@ def _execution_conditions(
     poses[0] = ready
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class MuJoCoWorldPrototype:
+    """Borrow native fields and bounded recording from one prepared prototype.
+
+    .. experimental::
+        This type and its attributes are experimental. Instances are supplied by
+        :attr:`MuJoCoWorlds.prototypes` and its preparation callbacks; callers do
+        not construct or retire them. Views are invalid after their population
+        closes. Native Model is immutable; Data contains authoritative physics
+        state. Callers own their control and observation semantics.
+
+    Counts are GPU int32 scalars. World count includes live rows; readiness is
+    physically backed capacity, including live rows. Actual contacts are counted
+    by ``data.nacon``. Neither readiness nor capacity creates a logical world.
+    """
+
+    _index: int
+    _owner: "_MuJoCoPrototype" = field(repr=False, compare=False)
+
+    def _borrow(self):
+        if self._owner.data is None:
+            raise RuntimeError("The prototype's population is closed")
+        return self._owner
+
+    @property
+    def index(self) -> int:
+        """Return the stable integer prototype index used by world commands."""
+        return self._index
+
+    @property
+    def model(self) -> "mujoco_warp.Model":
+        """Return the immutable prepared native Model."""
+        return self._borrow().model
+
+    @property
+    def data(self) -> "mujoco_warp.Data":
+        """Return authoritative native Data; world rows are prototype-local."""
+        return self._borrow().data
+
+    @property
+    def world_capacity(self) -> int:
+        """Return the prepared virtual world-row limit."""
+        return self._borrow().rows.capacity
+
+    @property
+    def contact_capacity(self) -> int:
+        """Return the prepared candidate/contact-row limit."""
+        return self._borrow().contacts.capacity
+
+    @property
+    def ccd_capacity(self) -> int:
+        """Return the prepared CCD scratch-row limit."""
+        return self._borrow().ccd.capacity
+
+    @property
+    def world_count(self) -> wp.array[wp.int32]:
+        """Borrow the directory's authoritative live world count; do not write it."""
+        return self._borrow().rows.count
+
+    @property
+    def world_ready_count(self) -> wp.array[wp.int32]:
+        """Borrow backed world readiness; only population service may write it."""
+        return self._borrow().rows.ready_count
+
+    @property
+    def contact_ready_count(self) -> wp.array[wp.int32]:
+        """Borrow backed contact readiness; only population service may write it."""
+        return self._borrow().contacts.ready_count
+
+    @property
+    def ccd_ready_count(self) -> wp.array[wp.int32]:
+        """Borrow backed CCD readiness; only population service may write it."""
+        return self._borrow().ccd.ready_count
+
+    @property
+    def ready_worlds(self) -> int:
+        """Return the last joined W/C/D ready prefix without a device readback."""
+        return self._borrow().ready_worlds
+
+    def record_launch(
+        self, kernel, dim, *, inputs=(), outputs=(), domain, extent_axis=0, parameters=None, block_dim=0, tiled=False
+    ):
+        """Record an application kernel and its count binding as one operation.
+
+        Call only inside ``before_step`` or ``after_substep``. ``domain`` is
+        ``world``, ``candidate`` or ``ccd``; ``None`` with ``extent_axis=None``
+        preserves a fixed worker grid. Named int32 ``parameters`` map kernel
+        argument names to those same domains. World bounds use the live count;
+        candidate/CCD bounds use their ready prefixes. Fixed worker kernels must
+        guard their own accesses. All external arrays belong in capture's retain.
+        ``tiled=True`` selects Warp's tiled launch with an explicit block size.
+        """
+        owner = self._borrow()
+        if owner.workspace.observer is not owner or owner.updates is None:
+            raise RuntimeError("Record application launches inside a prototype physics callback")
+        if not wp.get_stream(owner.data.qpos.device).is_capturing:
+            raise RuntimeError("Application recording requires the active population graph capture")
+        if type(tiled) is not bool or (tiled and (type(block_dim) is not int or block_dim < 1)):
+            raise ValueError("Tiled recording requires an explicit positive block dimension")
+        launch = wp.launch_tiled if tiled else wp.launch
+        launch(kernel, dim=dim, inputs=inputs, outputs=outputs, block_dim=block_dim, device=owner.data.qpos.device)
+        owner.observe_launch(kernel, dim, domain, extent_axis=extent_axis, parameters=parameters)
+
+
 @dataclass
 class _MuJoCoPrototype:
     """One topology's immutable model and authoritative native fields/program."""
 
     model: object
+    view: MuJoCoWorldPrototype | None = None
     data: object = None
     defaults: RowStorage | None = None
     rows: RowStorage | None = None
@@ -248,25 +359,27 @@ class _MuJoCoPrototype:
         """Record conditional native physics and poses on the current stream."""
         import mujoco_warp as mjw
 
-        if self.workspace.observer is not None:
+        if self.workspace.observer is not None and self.workspace.observer is not self:
             raise RuntimeError("Native workspace already has a recording observer")
         self.workspace.observer = self
 
         def step():
             if self.before_step is not None:
-                self.before_step(self)
+                self.before_step(self.view)
             for _ in range(self.substeps):
                 mjw.step(self.model, self.data, workspace=self.workspace)
                 if self.after_substep is not None:
-                    self.after_substep(self)
+                    self.after_substep(self.view)
+
+        def step_and_poses():
+            wp.capture_if(self.condition, on_true=step)
+            mjw.kinematics(self.model, self.data, workspace=self.workspace)
 
         try:
-            wp.capture_if(self.condition, on_true=step)
             if self.refresh_kinematics:
-                wp.capture_if(
-                    self.poses_condition,
-                    on_true=lambda: mjw.kinematics(self.model, self.data, workspace=self.workspace),
-                )
+                wp.capture_if(self.poses_condition, on_true=step_and_poses)
+            else:
+                wp.capture_if(self.condition, on_true=step)
         finally:
             self.workspace.observer = None
             self.before_step = None
@@ -283,6 +396,13 @@ def _data_arrays(value, prefix=""):
             yield name, item, shape[0] if shape else None
         elif is_dataclass(item):
             yield from _data_arrays(item, name + ".")
+        elif isinstance(item, (tuple, list)):
+            for index, child in enumerate(item):
+                child_name = f"{name}[{index}]"
+                if isinstance(child, wp.array):
+                    yield child_name, child, None
+                elif is_dataclass(child):
+                    yield from _data_arrays(child, child_name + ".")
 
 
 def _replace_data(source, arrays, prefix="", **metadata):
@@ -377,7 +497,7 @@ class MuJoCoWorlds:
         if not device.is_cuda:
             raise ValueError("MuJoCoWorlds currently requires a CUDA device")
         self.device, self.backing, self.directory = device, None, None
-        self.prototypes = []
+        self._prototypes, self._views = [], ()
         self._healthy = self._always_permit = self._lifecycle_needed = None
         self._closed, self._service_failed, self._capture_attempted = False, False, False
         self._graph = None
@@ -399,7 +519,7 @@ class MuJoCoWorlds:
                     zip(prepared, capacities, initial_rows, contact_capacities, ccd_capacities, strict=True)
                 ):
                     group = _MuJoCoPrototype(model, contact_quota=template.naconmax, ccd_quota=template.naccdmax)
-                    self.prototypes.append(group)
+                    self._prototypes.append(group)
                     # Native tiled solver consumers require 16-byte field starts and row strides.
                     # Candidate/contact fields use scalar loads and their declared natural alignment.
                     arrays, world_fields, contact_fields = {}, [], []
@@ -458,7 +578,7 @@ class MuJoCoWorlds:
                             group.global_arrays[name] = scratch[spec.name]
                         else:
                             raise ValueError(f"Unknown native workspace domain: {spec.domain}")
-                    live_count = self.directory.d.active_count[prototype : prototype + 1]
+                    live_count = self.directory.data.active_count[prototype : prototype + 1]
                     group.rows = RowStorage(
                         capacity, live_count, fields=tuple(world_fields), backing=backing, initial_rows=initial
                     )
@@ -494,7 +614,9 @@ class MuJoCoWorlds:
                     )
                     group.rows.prepare_fill(group.data.island_dofadr, model.nv)
                     group.rows.prepare_fill(scratch["island_can_sleep"], 1)
-                    group.workspace = mjw.make_step_workspace(model, group.data, live_count=live_count, arrays=scratch)
+                    group.workspace = mjw.make_step_workspace(
+                        model, group.data, live_count=live_count, arrays=scratch, observer=group
+                    )
                     group.initialization = group.rows.prepare_transfer(group.defaults, fields=data_field_names)
                     group.relocation = group.rows.prepare_transfer(group.rows, fields=data_field_names)
                     group.request_ids = wp.zeros(command_capacity, dtype=int, device=device)
@@ -502,23 +624,31 @@ class MuJoCoWorlds:
                     group.destination_ids = wp.zeros(command_capacity, dtype=int, device=device)
                     group.initialization_count = wp.zeros(1, dtype=int, device=device)
                     end = start + capacity
-                    group.move_sources = self.directory.moves.source[start:end]
-                    group.move_destinations = self.directory.moves.destination[start:end]
+                    group.move_sources = self.directory.compaction.source[start:end]
+                    group.move_destinations = self.directory.compaction.destination[start:end]
                     group.move_count = wp.zeros(1, dtype=int, device=device)
                     group.condition = wp.zeros(1, dtype=int, device=device)
                     group.poses_condition = wp.zeros(1, dtype=int, device=device)
+                    group.view = MuJoCoWorldPrototype(prototype, group)
                     start = end
-                self.directory.publish_ready(tuple(group.ready_worlds for group in self.prototypes))
+                self._views = tuple(group.view for group in self._prototypes)
+                self.directory.publish_ready(tuple(group.ready_worlds for group in self._prototypes))
         except BaseException as failure:
             traceback.clear_frames(failure.__traceback__)
             arrays = scratch = world_sources = array = owner = None
             try:
-                self.close(streams=(wp.get_stream(device).cuda_stream,))
+                self.close(streams=(wp.get_stream(device),))
             except BaseException as cleanup:
                 raise BaseExceptionGroup(
                     "Native population construction and cleanup failed", [failure, cleanup]
                 ) from failure
             raise
+
+    @property
+    def prototypes(self) -> tuple[MuJoCoWorldPrototype, ...]:
+        """Return supported borrowed prototype views in command-index order."""
+        self._ensure_open()
+        return self._views
 
     def _ensure_open(self):
         if self._closed or self._service_failed:
@@ -540,6 +670,7 @@ class MuJoCoWorlds:
     ):
         """Capture once, retaining caller buffers and all native owners.
 
+        Callbacks receive supported :class:`MuJoCoWorldPrototype` views.
         Optional preparation callbacks record payload validation before admission
         and payload writes after the default Data copy. The initializer explicitly
         acknowledges successful requests in WorldTransaction.initialized; missing
@@ -559,12 +690,15 @@ class MuJoCoWorlds:
             commands: Caller-owned lifecycle buffers with increasing batch sequence.
             results: Caller-owned per-request results.
             permit: Optional GPU int32 scalar permitting physics advancement.
-            validate: Preparation callback recording payload validation.
-            initialize: Preparation callback recording payload writes and acknowledgement.
+            validate: Preparation callback ``(commands, transaction)`` recording
+                payload validation.
+            initialize: Preparation callback ``(prototype, request_ids, destination_rows,
+                count, copy_status, transaction, sequence)`` recording payload writes
+                and acknowledgement. Array arguments are borrowed GPU buffers.
             retain: External buffers borrowed by any recorded callback kernels.
             substeps: Ordered native steps per graph replay.
-            before_step: Callback recording controls once before ordered native steps.
-            after_substep: Callback recording contact consumers after each native step.
+            before_step: Callback ``(prototype)`` recording controls once before ordered native steps.
+            after_substep: Callback ``(prototype)`` recording contact consumers after each native step.
             refresh_kinematics: Refresh body, geometry and site transforms after valid
                 reset-only frames or after the final substep, independently of permit.
 
@@ -604,7 +738,8 @@ class MuJoCoWorlds:
             self._capture_attempted = True
             graph = None
             try:
-                for group in self.prototypes:
+                for group in self._prototypes:
+                    group.workspace.observer = None
                     group.substeps, group.before_step = substeps, before_step
                     group.after_substep, group.refresh_kinematics = after_substep, refresh_kinematics
                     group.updates = DeviceGraphUpdates(
@@ -621,21 +756,21 @@ class MuJoCoWorlds:
                     wp.launch(
                         _guard_health,
                         1,
-                        [self.directory.d, self.directory.t, self._healthy, self._lifecycle_needed],
+                        [self.directory.batch, self.directory.transaction, self._healthy, self._lifecycle_needed],
                         device=self.device,
                     )
 
                     def record_lifecycle():
                         if validate is not None:
-                            validate(commands, self.directory.t)
+                            validate(commands, self.directory.transaction)
                         self.directory.admit(commands)
-                        for prototype, group in enumerate(self.prototypes):
+                        for prototype, group in enumerate(self._prototypes):
                             wp.launch(
                                 _initialization_ids,
                                 self.directory.command_capacity,
                                 [
-                                    self.directory.d,
-                                    self.directory.t,
+                                    self.directory.batch,
+                                    self.directory.transaction,
                                     prototype,
                                     group.request_ids,
                                     group.source_ids,
@@ -649,20 +784,20 @@ class MuJoCoWorlds:
                             )
                             if initialize is not None:
                                 initialize(
-                                    group,
+                                    group.view,
                                     group.request_ids,
                                     group.destination_ids,
                                     group.initialization_count,
                                     group.initialization.status,
-                                    self.directory.t,
-                                    self.directory.d.sequence,
+                                    self.directory.transaction,
+                                    self.directory.batch.sequence,
                                 )
                             wp.launch(
                                 _acknowledge_initialization,
                                 self.directory.command_capacity,
                                 [
-                                    self.directory.d,
-                                    self.directory.t,
+                                    self.directory.batch,
+                                    self.directory.transaction,
                                     prototype,
                                     group.initialization.status,
                                     int(initialize is not None),
@@ -671,11 +806,17 @@ class MuJoCoWorlds:
                             )
                         self.directory.publish(commands, results)
                         self.directory.plan_moves()
-                        for prototype, group in enumerate(self.prototypes):
+                        for prototype, group in enumerate(self._prototypes):
                             wp.launch(
                                 _relocation_count,
                                 1,
-                                [self.directory.t, self.directory.moves, prototype, self._healthy, group.move_count],
+                                [
+                                    self.directory.transaction,
+                                    self.directory.compaction,
+                                    prototype,
+                                    self._healthy,
+                                    group.move_count,
+                                ],
                                 device=self.device,
                             )
                             group.relocation.record(group.move_sources, group.move_destinations, group.move_count)
@@ -683,8 +824,8 @@ class MuJoCoWorlds:
                                 _acknowledge_moves,
                                 1,
                                 [
-                                    self.directory.t,
-                                    self.directory.moves,
+                                    self.directory.transaction,
+                                    self.directory.compaction,
                                     prototype,
                                     self._healthy,
                                     group.relocation.status,
@@ -696,22 +837,23 @@ class MuJoCoWorlds:
                     wp.capture_if(self._lifecycle_needed, on_true=record_lifecycle)
                     # Every updater must finish and be checked before any prototype
                     # enters its conditional program, including native solver loops.
-                    capture_parallel([group.updates.capture_update for group in self.prototypes])
+                    capture_parallel([group.updates.capture_update for group in self._prototypes])
                     capture_parallel(
                         lambda group=group: wp.launch(
                             _guard_graph_updates,
                             group.updates.capacity_nodes,
-                            [group.updates.errors, group.updates.binding_count, self._healthy, self.directory.d.flags],
+                            [group.updates.errors, group.updates.binding_count, self._healthy, self.directory.batch],
                             device=self.device,
                         )
-                        for group in self.prototypes
+                        for group in self._prototypes
                     )
-                    for prototype, group in enumerate(self.prototypes):
+                    for prototype, group in enumerate(self._prototypes):
                         wp.launch(
                             _execution_conditions,
                             1,
                             [
-                                self.directory.d,
+                                self.directory.data,
+                                self.directory.batch,
                                 prototype,
                                 group.rows.ready_count,
                                 group.contacts.ready_count,
@@ -725,13 +867,13 @@ class MuJoCoWorlds:
                             ],
                             device=self.device,
                         )
-                    capture_parallel([group.record_physics for group in self.prototypes])
+                    capture_parallel([group.record_physics for group in self._prototypes])
                 graph = capture.graph
                 del capture
-                for group in self.prototypes:
+                for group in self._prototypes:
                     group.updates.bind(graph, group.bindings)
                 self._retain_graph(graph, commands, results, permit, *retain)
-                self.prototypes[0].updates.instantiate_upload(graph)
+                self._prototypes[0].updates.instantiate_upload(graph)
                 return graph
             except BaseException as failure:
                 # This root cannot silently retry partially marked CUDA graph nodes.
@@ -749,7 +891,7 @@ class MuJoCoWorlds:
         if previous is not None and previous is not graph:
             raise RuntimeError("Native population already belongs to another graph")
         self.directory.retain_graph(graph, self, *buffers)
-        for group in self.prototypes:
+        for group in self._prototypes:
             group.initialization.retain_graph(
                 graph, group.request_ids, group.source_ids, group.destination_ids, group.initialization_count
             )
@@ -759,7 +901,7 @@ class MuJoCoWorlds:
         self._graph = weakref.ref(graph)
         return graph
 
-    def resize_backing(self, rows: tuple[int, ...], *, streams, spare_bytes: int | None = None):
+    def resize_backing(self, rows: tuple[int, ...], *, streams: tuple[wp.Stream, ...], spare_bytes: int | None = None):
         """Join once, service all W/C/D prefixes, then publish one coherent ready set.
 
         The caller excludes new submissions until return. Contact/CCD scratch has
@@ -778,22 +920,27 @@ class MuJoCoWorlds:
             if spare_bytes is not None and (type(spare_bytes) is not int or spare_bytes < 0):
                 raise ValueError("Retained spare bytes must be a nonnegative integer or None")
             rows = tuple(rows)
-            if len(rows) != len(self.prototypes) or any(
+            if len(rows) != len(self._prototypes) or any(
                 type(n) is not int
                 or not 0 <= n <= group.rows.capacity
                 or n * group.contact_quota > group.contacts.capacity
                 or n * group.ccd_quota > group.ccd.capacity
-                for n, group in zip(rows, self.prototypes, strict=True)
+                for n, group in zip(rows, self._prototypes, strict=True)
             ):
                 raise ValueError("Requested worlds exceed prepared W/C/D capacities")
-            with self.backing.maintenance(streams=streams):
+            streams = tuple(streams)
+            if not streams or any(
+                not isinstance(stream, wp.Stream) or stream.device != self.device for stream in streams
+            ):
+                raise ValueError("Backing service requires existing Warp streams on the population device")
+            with self.backing.maintenance(streams=tuple(stream.cuda_stream for stream in streams)):
                 self.directory.withdraw_ready(rows)
-                live_counts = self.directory.d.active_count.numpy()
+                live_counts = self.directory.data.active_count.numpy()
                 budget_rejected = False
                 try:
                     services = [
                         (group, owner, target, int(live_counts[prototype]) if owner is group.rows else 0)
-                        for prototype, (group, n) in enumerate(zip(self.prototypes, rows, strict=True))
+                        for prototype, (group, n) in enumerate(zip(self._prototypes, rows, strict=True))
                         for owner, target in (
                             (group.rows, n),
                             (group.contacts, n * group.contact_quota),
@@ -815,7 +962,7 @@ class MuJoCoWorlds:
                                 owner.fill(
                                     owner.arrays["contact.efc_address"], -1, count=owner.ready_count, start=old_ready
                                 )
-                    self.directory.publish_ready(tuple(group.ready_worlds for group in self.prototypes))
+                    self.directory.publish_ready(tuple(group.ready_worlds for group in self._prototypes))
                     wp.synchronize_stream(wp.get_stream(self.device))
                     if spare_bytes is not None:
                         self.backing.trim(keep_bytes=spare_bytes)
@@ -826,7 +973,7 @@ class MuJoCoWorlds:
                         wp.synchronize_stream(wp.get_stream(self.device))
                         raise
                     try:
-                        self.directory.publish_ready(tuple(group.ready_worlds for group in self.prototypes))
+                        self.directory.publish_ready(tuple(group.ready_worlds for group in self._prototypes))
                         wp.synchronize_stream(wp.get_stream(self.device))
                     except BaseException:
                         self._service_failed = True
@@ -851,12 +998,13 @@ class MuJoCoWorlds:
             ),
             "scope": "Single-owner native array ledger; external fixture/oracle/JIT/graph/driver memory excluded",
         }
-        for group in self.prototypes:
+        seen_models = set()
+        for group in self._prototypes:
             globals_report = [{"field": name, "bytes": array.capacity} for name, array in group.global_arrays.items()]
-            model_arrays, seen = [], set()
+            model_arrays = []
             for name, array, _ in _data_arrays(group.model):
-                if array.size and array.ptr not in seen:
-                    seen.add(array.ptr)
+                if array.size and array.ptr not in seen_models:
+                    seen_models.add(array.ptr)
                     model_arrays.append({"field": name, "bytes": array.capacity})
             result["groups"].append(
                 {
@@ -894,8 +1042,12 @@ class MuJoCoWorlds:
             )
         return result
 
-    def close(self, *, streams):
+    def close(self, *, streams: tuple[wp.Stream, ...]):
         """Join consumers and close owned storage after every graph borrower is gone."""
+        streams = tuple(streams)
+        if not streams or any(not isinstance(stream, wp.Stream) or stream.device != self.device for stream in streams):
+            raise ValueError("Retirement requires existing Warp streams on the population device")
+        raw_streams = tuple(stream.cuda_stream for stream in streams)
         with wp.ScopedDevice(self.device):
             graph = self._graph() if self._graph is not None else None
             if graph is not None:
@@ -903,14 +1055,17 @@ class MuJoCoWorlds:
             self._closed = True
             if self.directory is not None:
                 self.directory.close(streams=streams)
-            for group in self.prototypes:
+            for group in self._prototypes:
                 group.initialization = group.relocation = None
+                if group.workspace is not None:
+                    group.workspace.observer = None
                 group.workspace = group.data = None
-            for group in self.prototypes:
+            for group in self._prototypes:
                 for owner in (group.rows, group.contacts, group.ccd, group.defaults):
                     if owner is not None:
-                        owner.close(streams=streams)
-            self.prototypes.clear()
+                        owner.close(streams=raw_streams)
+            self._prototypes.clear()
+            self._views = ()
             if self.backing is not None:
-                with self.backing.maintenance(streams=streams):
+                with self.backing.maintenance(streams=raw_streams):
                     self.backing.close()
