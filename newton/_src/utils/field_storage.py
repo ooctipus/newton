@@ -515,13 +515,13 @@ class FieldStorage:
         field = self.lookup(array)
         if field is None:
             raise ValueError("Row fill requires an owned field")
-        key = array.dtype, repr(value), field.transfer_view.dtype
+        one = wp.full(1, value, dtype=array.dtype, device="cpu")
+        raw = one.numpy().tobytes()
+        key = array.dtype, raw, field.transfer_view.dtype
         pattern = self._patterns.get(key)
         if pattern is None:
             if self.device.is_capturing:
                 raise RuntimeError("Fill pattern must be prepared before graph capture")
-            one = wp.full(1, value, dtype=array.dtype, device="cpu")
-            raw = one.numpy().tobytes()
             dtype = np.uint32 if field.transfer_view.dtype == wp.uint32 else np.uint8
             unit_bytes = np.dtype(dtype).itemsize
             # Whole transfer words must preserve the typed element's byte period,
