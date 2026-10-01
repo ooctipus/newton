@@ -287,6 +287,8 @@ class DeviceGraphTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "cuda_graph.cu"
             source.write_text("// fixture\n")
+            compiler = Path(directory) / "nvcc"
+            compiler.touch()
             outputs = []
 
             def fail(command, **kwargs):
@@ -298,9 +300,11 @@ class DeviceGraphTests(unittest.TestCase):
                 )
 
             with (
+                patch.dict(self.bridge.os.environ, {"CUDACXX": str(compiler)}),
                 patch.object(self.bridge, "__file__", str(source.with_suffix(".py"))),
                 patch.object(self.bridge.subprocess, "run", side_effect=fail),
             ):
+                self.bridge.os.environ.pop("NEWTON_CUDA_GRAPH_LIBRARY", None)
                 with self.assertRaisesRegex(RuntimeError, "missing cuda.h") as raised:
                     self.original_load_library(self.owner, None)
             self.assertIn("compiler stdout", str(raised.exception))
@@ -321,6 +325,7 @@ class ParallelCaptureTests(unittest.TestCase):
         self.device.captures[self.stream] = self.graph
         self.native, self.identity, self.status, self.dependencies = 100, 7, 1, (11,)
         self.set_calls, self.get_failure, self.set_failure = [], 0, 0
+        self.nodes, self.edges = {11}, set()
 
         class Function:
             def __init__(self, implementation):
@@ -347,8 +352,28 @@ class ParallelCaptureTests(unittest.TestCase):
             self.dependencies = self.set_calls[-1]
             return 0
 
+        def get_nodes(graph, nodes, count):
+            self.assertEqual(graph, self.native)
+            self.nodes.update(self.dependencies)
+            count._obj.value = len(self.nodes)
+            if nodes is not None:
+                for index, node in enumerate(sorted(self.nodes)):
+                    nodes[index] = node
+            return 0
+
+        def get_edges(graph, sources, targets, count):
+            self.assertEqual(graph, self.native)
+            count._obj.value = len(self.edges)
+            if sources is not None:
+                for index, (source, target) in enumerate(sorted(self.edges)):
+                    sources[index], targets[index] = source, target
+            return 0
+
         self.library = SimpleNamespace(
-            cuStreamGetCaptureInfo_v2=Function(get_info), cuStreamUpdateCaptureDependencies=Function(set_dependencies)
+            cuStreamGetCaptureInfo_v2=Function(get_info),
+            cuStreamUpdateCaptureDependencies=Function(set_dependencies),
+            cuGraphGetNodes=Function(get_nodes),
+            cuGraphGetEdges=Function(get_edges),
         )
         self.addCleanup(patch.stopall)
         patch.object(bridge.ct, "CDLL", return_value=self.library).start()
@@ -409,6 +434,20 @@ class ParallelCaptureTests(unittest.TestCase):
         self.bridge.capture_parallel([lambda: self.bridge.capture_parallel([leaf(21), leaf(22)]), leaf(31)])
         self.assertEqual(self.dependencies, (21, 22, 31))
         self.assertIn((21, 22), self.set_calls)
+
+    def test_conditional_resume_cannot_introduce_cross_branch_dependencies(self):
+        """Reject a sibling edge even when branch values and final joins are correct."""
+
+        def first():
+            self.dependencies = (21,)
+
+        def second():
+            self.dependencies = (31,)
+            self.edges.add((21, 31))
+
+        with self.assertRaisesRegex(RuntimeError, "depends on a sibling"):
+            self.bridge.capture_parallel([first, second])
+        self.assertTrue(self.graph._parallel_capture_failed)
 
     def test_callback_failure_quarantines_all_later_binding_and_instantiation(self):
         """Verify callback failure quarantines all later binding and instantiation."""
@@ -502,6 +541,23 @@ def _lean_grid(output: wp.array3d[wp.uint8]):
     output[world, row, column] = wp.uint8(world % 251)
 
 
+@wp.kernel
+def _branch_begin(condition: wp.array[int], value: wp.array[int]):
+    condition[0] = 1
+    value[0] = 1
+
+
+@wp.kernel
+def _branch_once(condition: wp.array[int], value: wp.array[int]):
+    value[0] += 2
+    condition[0] = 0
+
+
+@wp.kernel
+def _branch_end(value: wp.array[int]):
+    value[0] += 4
+
+
 @wp.kernel(grid_stride=True)
 def _capped_grid(output: wp.array[int]):
     index = wp.tid()
@@ -534,6 +590,49 @@ class DeviceGraphGPU(unittest.TestCase):
         wp.init()
         if not wp.get_cuda_devices():
             raise unittest.SkipTest("Device-updated graphs require CUDA")
+
+    def test_conditional_branches_require_independent_parent_edges(self):
+        """Admit enclosed conditional programs and reject Warp sibling-frontier leaks."""
+        with wp.ScopedDevice("cuda:0"):
+            wp.load_module(module=__name__, device="cuda:0")
+            conditions = [wp.zeros(1, dtype=int) for _ in range(2)]
+            values = [wp.zeros(1, dtype=int) for _ in range(2)]
+            always = wp.ones(1, dtype=int)
+
+            def body(index):
+                wp.launch(_branch_begin, 1, [conditions[index], values[index]])
+                wp.capture_while(
+                    conditions[index], lambda: wp.launch(_branch_once, 1, [conditions[index], values[index]])
+                )
+                wp.launch(_branch_end, 1, [values[index]])
+
+            def branch(index, layout):
+                if layout == "direct":
+                    body(index)
+                elif layout == "two_parent_ifs":
+                    wp.capture_if(always, on_true=lambda: body(index))
+                    wp.capture_if(always, on_true=lambda: wp.launch(_branch_end, 1, [values[index]]))
+                else:
+
+                    def enclosed():
+                        wp.capture_if(always, on_true=lambda: body(index))
+                        wp.launch(_branch_end, 1, [values[index]])
+
+                    wp.capture_if(always, on_true=enclosed)
+
+            for layout in ("direct", "two_parent_ifs"):
+                with self.subTest(layout=layout), self.assertRaisesRegex(RuntimeError, "depends on a sibling"):
+                    with wp.ScopedCapture() as capture:
+                        bridge.capture_parallel(
+                            [lambda layout=layout: branch(0, layout), lambda layout=layout: branch(1, layout)]
+                        )
+
+            with wp.ScopedCapture() as capture:
+                bridge.capture_parallel([lambda: branch(0, "enclosed"), lambda: branch(1, "enclosed")])
+            for _ in range(3):
+                wp.capture_launch(capture.graph)
+            for value in values:
+                np.testing.assert_array_equal(value.numpy(), [11])
 
     def test_large_lean_grid_and_capped_grid_stride_keep_one_graph(self):
         """Verify all items of a large 3D grid and capped loops under changing GPU counts."""
