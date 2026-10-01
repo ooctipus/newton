@@ -49,8 +49,11 @@ def capture_parallel(branches, *, stream=None):
     it creates neither streams nor executable graphs. Callbacks must restore the
     same parent capture without cross-branch ordering dependencies. Mutable storage
     must be disjoint, except for race-free atomic reductions consumed only after
-    the join. Resources must remain owned by the final graph. Nested Warp
-    conditionals and nested calls are supported; APIC serialization is not.
+    the join. Resources must remain owned by the final graph. Nested calls are
+    supported. Put a branch's complete conditional program inside one outer
+    conditional: Warp can otherwise resume its parent with older sibling leaves.
+    The parent DAG is checked and cross-branch dependencies are rejected before
+    instantiation. APIC serialization is not supported.
 
     All CUDA queries/edits happen during preparation. After any callback or CUDA
     failure the caller must discard the capture, even if it catches the exception.
@@ -79,6 +82,8 @@ def capture_parallel(branches, *, stream=None):
         ct.POINTER(ct.c_size_t),
     ]
     library.cuStreamUpdateCaptureDependencies.argtypes = [pointer, ct.POINTER(pointer), ct.c_size_t, ct.c_uint]
+    library.cuGraphGetNodes.argtypes = [pointer, ct.POINTER(pointer), ct.POINTER(ct.c_size_t)]
+    library.cuGraphGetEdges.argtypes = [pointer, ct.POINTER(pointer), ct.POINTER(pointer), ct.POINTER(ct.c_size_t)]
 
     def frontier():
         if getattr(owner, "_parallel_capture_failed", False):
@@ -111,15 +116,42 @@ def capture_parallel(branches, *, stream=None):
             "set parallel capture frontier",
         )
 
+    def graph_nodes(graph):
+        count = ct.c_size_t()
+        _check(library.cuGraphGetNodes(graph, None, ct.byref(count)), "query parallel graph node count")
+        if count.value == 0:
+            return set()
+        nodes = (pointer * count.value)()
+        _check(library.cuGraphGetNodes(graph, nodes, ct.byref(count)), "query parallel graph nodes")
+        return set(nodes[: count.value])
+
+    def check_siblings(graph, previous, current):
+        if not previous or not current:
+            return
+        count = ct.c_size_t()
+        _check(library.cuGraphGetEdges(graph, None, None, ct.byref(count)), "query parallel graph edge count")
+        if count.value == 0:
+            return
+        sources, targets = (pointer * count.value)(), (pointer * count.value)()
+        _check(library.cuGraphGetEdges(graph, sources, targets, ct.byref(count)), "query parallel graph edges")
+        if any(sources[i] in previous and targets[i] in current for i in range(count.value)):
+            raise RuntimeError("Parallel callback depends on a sibling; enclose its conditional stages in one branch")
+
     try:
         parent, prefix = frontier()
-        joined = set()
+        joined, previous = set(), set()
+        known = graph_nodes(parent)
         for branch in branches:
             replace(prefix)
             branch()
             current, tails = frontier()
             if current != parent:
                 raise RuntimeError("Parallel callback did not restore its parent CUDA graph")
+            nodes = graph_nodes(parent)
+            created = nodes - known
+            check_siblings(parent, previous, created)
+            previous.update(created)
+            known = nodes
             # Warp resumes a conditional's parent with all parent leaf nodes;
             # retaining those older leaves in the union is a valid explicit join.
             joined.update(tails)

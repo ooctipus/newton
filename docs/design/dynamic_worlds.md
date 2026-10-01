@@ -47,6 +47,75 @@ advancement; ready capacity and live population are separate quantities.
 
 ## Level 1 Ownership and the composition root
 
+The boundary standard is the cloner's composition algebra: asset prototypes,
+ordered asset occurrences inside world prototypes, and instances of those world
+prototypes. A relation taking `prototype_id: int | str` crosses two boundaries.
+A path utility must first resolve names to integer IDs; the numeric relation then
+consumes those IDs without interpreting names. Repeated asset occurrences remain
+distinct even when they reference the same asset prototype.
+
+For example, the user's Banana/Franka plan has asset prototype IDs `0, 1`,
+world contents `[0,1, 0,1,1, 0,0,1, 1]` and offsets `[0,2,5,8,9]`.
+World prototype 1 contains two distinct Franka occurrences. A path utility maps
+`"Franka"` to asset prototype 1; numeric occurrence queries preserve both
+occurrences, while an explicitly unique-world query returns that world once.
+Accepting `1 | "Franka"` in the relation itself would mix name resolution with
+the algebra. That is the boundary breach this implementation must prevent.
+
+The task's concrete equivalent is preparation followed by numeric binding:
+
+```python
+# Before: the numeric owner also interpreted a symbolic selector.
+# selection = selections.resolve(NewtonSelectorCfg(BODY, ".*/Robot.*"))
+
+# After: separate symbolic query and numeric relation; managers retain selection.
+query = NewtonSelectorCfg(BODY, ".*/Robot.*")
+ids = query_selection_ids(selections.model, query)  # selection_paths.py
+selection = selections.bind(BODY, ids)             # newton_selection.py
+```
+
+The authored environment configuration retains `query`; the manager's copy owns
+the bound `selection`. Numeric bindings neither serialize paths nor re-run name
+resolution. `static_counts`, policy `width` and current `active_counts()` describe
+different relations and are never interchangeable.
+
+The same rule applies here. A world lifetime `(id, generation)` maps to exactly
+one `(prototype, local_row)`; the inverse returns that lifetime. An actor's
+participation mask is a task fact, not part of lifetime validity. Backing readiness
+is a storage fact, not a second definition of identity. Each owner exposes the
+relations necessary to compose these facts, without importing the other owner's
+policy or duplicating its authority.
+
+The implementation boundary is:
+
+```text
+Authoring/path utility  -> integer prototype-local entity selections
+WorldDirectory         -> lifetime, placement, membership and transactions
+MuJoCoWorlds           -> native physics composition and prepared recording
+RowStorage/CudaBacking -> typed rows / physical allocation and retirement
+Task                   -> actor handles, participation and episode intent
+```
+
+The public directory separates numeric membership (`data`), named batch outcomes
+(`batch`), domain initialization (`transaction`) and relocation (`compaction`).
+Allocation tickets, conflict counters and rebuild scratch are private. The native
+root exposes a borrowed prototype recording interface, not its private storage
+and graph-owner record. Task selection binding accepts integer IDs; path matching
+is a separate preparation utility. Native scalar conversion maps are prepared
+once by the scalar-task owner and borrowed by both selection and reset payloads.
+
+Completeness is scoped to a prepared prototype set. For every live handle,
+`world_handle_at(data, *world_location(data, id, generation)[:2])` returns the
+same ID and generation. Prototype memberships partition the live population;
+compaction preserves handles and state; successful reset invalidates the old
+generation; failed replacement preserves it. Ordered occurrence queries preserve
+multiplicity. Every supported array states its index domain and writer, and every
+operation states when its results are valid. These laws are architecture and
+behavior gates; passing a keyboard benchmark alone does not establish them.
+
+The file tree below remains the owner map. This cleanup adds no backend factory,
+compatibility aliases, generic query manager or second lifetime directory.
+
 The production composition root is `newton.solvers.MuJoCoWorlds`. It composes
 `newton.worlds.WorldDirectory`, mechanical `RowStorage` and `CudaBacking` owners,
 prepared graph updates, and native MJWarp programs. Native Data is authoritative:
@@ -109,10 +178,10 @@ graph = worlds.capture(commands, results, substeps=2)
 wp.capture_launch(graph)
 
 # Cold capacity service joins all readers before changing physical mappings.
-worlds.resize_backing(tuple(ready_rows_per_prototype), streams=(stream.cuda_stream,))
+worlds.resize_backing(tuple(ready_rows_per_prototype), streams=(stream,))
 # Drop every graph borrower before closing storage.
 del graph
-worlds.close(streams=(stream.cuda_stream,))
+worlds.close(streams=(stream,))
 ```
 
 `memory_budget_bytes=None` selects fixed backing for the full prepared capacities.
@@ -140,6 +209,15 @@ activity signals; consume them only within their recorded lifecycle stage.
 - `before_step(group)` records controls once before the ordered native substeps.
 - `after_substep(group)` records contact consumers and diagnostics after each step.
 - `retain=(...)` keeps all external arrays used by those recorded kernels alive.
+
+`group` is a supported `newton.solvers.MuJoCoWorldPrototype` borrowed view. Its
+integer `index` identifies the prepared prototype; `model` and `data` expose the
+native schema. Live counts, physical ready prefixes and virtual capacities have
+separate attributes. Application physics callbacks use `group.record_launch(...)`
+to launch and bind a kernel's count semantics together. Private row stores,
+transfers, updater bindings and retirement methods are not part of this view.
+Initializer kernels instead use their explicit admitted request/destination list;
+they must not treat a newly admitted row as a published live row.
 
 `permit` is a device scalar that suppresses physical advancement without suppressing
 valid resets. `refresh_kinematics=True` updates body, geometry and site poses after
@@ -204,8 +282,10 @@ second lifecycle map.
 
 ## Level 3 A complete transaction
 
-The sole directory records are `WorldDirectoryData`, `WorldTransaction` and
-`WorldCompaction`. Caller-owned `WorldCommands` contains a monotonically increasing
+The public directory records are `WorldDirectoryData`, `WorldBatch`,
+`WorldTransaction` and `WorldCompaction`, accessed as `data`, `batch`,
+`transaction` and `compaction`. Private allocation scratch is not exported.
+Caller-owned `WorldCommands` contains a monotonically increasing
 batch sequence, operation, identity, expected generation and target prototype.
 `WorldResults` returns status, identity and generation. Operation/status/phase
 values have canonical public enums in `newton.worlds`. `CREATE` ignores input
@@ -219,8 +299,9 @@ Start with a positive sequence. A new sequence consumes the batch even if some
 requests fail; retry with a higher sequence. Equal-sequence replays retain the
 previous permit and may advance physics again, but ignore lifecycle-buffer edits.
 A stale sequence or invalid batch count may leave result arrays unchanged: check
-`directory.d.flags[2]` (batch error) and `flags[1]` (advancement permit), not only
-per-request status. Results beyond the consumed request count are not refreshed.
+`directory.batch.consumed`, `batch.status` (batch error) and `batch.advance`
+(advancement permit), not only per-request status. Results beyond the consumed
+request count are not refreshed.
 
 ```text
 begin -> caller validation -> admit -> full defaults + caller payload -> publish
@@ -247,14 +328,16 @@ fields failed a VMM regrowth test and is intentionally not the implementation.
 
 The composition root records all GPU count updaters, then checks every updater's
 error buffer before computing any prototype's execution conditions. An error
-latches the existing runtime health and directory error flags, suppressing all
+latches the existing runtime health and named directory batch error, suppressing all
 physics, pose refresh and later raw replays without a host readback. Prototype
 recording must not launch its own updater or validate only its local error buffer:
 a healthy prototype must not run concurrently with an unchecked failing updater.
 
 Native steps of different prototypes form independent branches of one graph.
-Each branch has a physics permit and an optional pose
-refresh; all branches join before replay completion. This removes host iteration
+Each complete branch encloses its physics permit and optional pose refresh under
+one outer conditional. Preparation checks the parent DAG and rejects accidental
+sibling dependencies after Warp conditional resume. All branches join before
+replay completion. This removes host iteration
 over separate executable graphs. CUDA node scalar arguments and launch extents
 have explicit independent W/C/D count sources. Fixed worker grids remain fixed.
 
@@ -296,6 +379,10 @@ rejection leaves a recoverable ready prefix. Unexpected driver or publication
 failure quarantines the runtime with a GPU health latch: replaying a retained
 raw graph cannot initialize, relocate, advance or refresh unsafe physical rows.
 The caller must exclude concurrent submissions during this maintenance boundary.
+Both `resize_backing` and `close` accept actual same-device Warp `Stream` objects;
+conversion to driver handles belongs exclusively to the internal backing boundary.
+Standalone directory closure joins exactly its supplied streams. Borrowed metadata
+remains alive while Python references retain it; closure retires submission rights.
 
 ## Qualification and admitted scope
 
@@ -309,6 +396,8 @@ pyramidal cones. Cameras/lights, sensors, flex, tendons, actuator history, fluid
 SDF and energy computation are rejected until their native programs have explicit
 count and memory semantics. Python 3.11+, Warp 1.17 and the pinned MJWarp branch
 are the tested stack. CUDA graph bindings are validated during preparation.
+Fixed MJWarp workspaces supply neither a live count nor a launch observer. Dynamic
+workspaces supply both; admission and recording reject an incomplete pairing.
 
 Prepared execution also excludes static-only models, enabled ball limits, contact
 surface velocity/passive adhesion, requested postconstraint inverse dynamics,
@@ -365,6 +454,6 @@ through the existing service failure path. No spare-reserve policy is selected
 by default; callers should measure maintenance cost and subsequent regrowth.
 
 Both `WorldDirectoryData.slot[id]` and `WorldTransaction.destination_slot[request]`
-are prototype-local rows. Only slot metadata arrays such as `slot_id` and
-`slot_state` use `starts[prototype] + local_row`. Reset payloads write directly to
+are prototype-local rows. Slot metadata arrays such as `slot_id` and `slot_rank`
+use `starts[prototype] + local_row`. Reset payloads write directly to
 the local admitted destination before publication.
