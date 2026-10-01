@@ -137,7 +137,6 @@ from . import (  # noqa: E402
     usd,
     utils,
     viewer,
-    worlds,
 )
 
 __all__ += [
@@ -152,5 +151,4 @@ __all__ += [
     "usd",
     "utils",
     "viewer",
-    "worlds",
 ]

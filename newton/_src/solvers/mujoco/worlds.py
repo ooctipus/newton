@@ -18,51 +18,50 @@ import warp as wp
 if TYPE_CHECKING:
     import mujoco_warp
 
-from ...sim.worlds import (
-    ADMITTED,
-    IDLE,
-    MOVING,
-    OK,
-    PHASE_INVALID,
-    WorldBatchResult,
-    WorldCommands,
-    WorldCompaction,
-    WorldDirectory,
-    WorldDirectoryData,
-    WorldResults,
-    WorldTransaction,
-    _validate_arrays,
+from gpu_components import backing as backing_ops
+from gpu_components import directory as directory_ops
+from gpu_components import fields as field_ops
+from gpu_components import graph as graph_ops
+from gpu_components.directory_data import (
+    InstanceBatchResult,
+    InstanceCommands,
+    InstanceCompaction,
+    InstanceDirectoryData,
+    InstancePhase,
+    InstanceResults,
+    InstanceStatus,
+    InstanceTransaction,
 )
-from ...utils.cuda_graph import DeviceGraphUpdates, GraphKernelBinding, KernelParameterBinding, capture_parallel
-from ...utils.cuda_vmm import MemoryBacking
-from ...utils.field_storage import FieldSpec, FieldStorage
+from gpu_components.field_data import FieldSpec, FieldStorage
 
 wp.set_module_options({"enable_backward": False})
 
 
 @wp.kernel
-def _guard_health(batch: WorldBatchResult, t: WorldTransaction, healthy: wp.array[int], lifecycle: wp.array[int]):
+def _guard_health(batch: InstanceBatchResult, t: InstanceTransaction, healthy: wp.array[int], lifecycle: wp.array[int]):
     if healthy[0] == 0:
         batch.consumed[0] = 0
         batch.advance_allowed[0] = 0
-        batch.status[0] = PHASE_INVALID
-        t.phase[0] = IDLE
+        batch.status[0] = int(InstanceStatus.PHASE_INVALID)
+        t.phase[0] = int(InstancePhase.IDLE)
     lifecycle[0] = wp.int32(batch.consumed[0] != 0 or batch.status[0] != 0)
 
 
 @wp.kernel
-def _guard_graph_updates(errors: wp.array[int], count: wp.array[int], healthy: wp.array[int], batch: WorldBatchResult):
+def _guard_graph_updates(
+    errors: wp.array[int], count: wp.array[int], healthy: wp.array[int], batch: InstanceBatchResult
+):
     index = wp.tid()
     if index < count[0] and errors[index] != 0:
         wp.atomic_min(healthy, 0, 0)
         wp.atomic_min(batch.advance_allowed, 0, 0)
-        wp.atomic_max(batch.status, 0, PHASE_INVALID)
+        wp.atomic_max(batch.status, 0, int(InstanceStatus.PHASE_INVALID))
 
 
 @wp.kernel
 def _initialization_ids(
-    batch: WorldBatchResult,
-    t: WorldTransaction,
+    batch: InstanceBatchResult,
+    t: InstanceTransaction,
     prototype: int,
     requests: wp.array[int],
     sources: wp.array[int],
@@ -71,7 +70,7 @@ def _initialization_ids(
 ):
     ordinal = wp.tid()
     accepted = int(0)
-    if batch.consumed[0] != 0 and t.phase[0] == ADMITTED:
+    if batch.consumed[0] != 0 and t.phase[0] == int(InstancePhase.ADMITTED):
         accepted = t.request_starts[prototype + 1] - t.request_starts[prototype]
     if ordinal == 0:
         count[0] = accepted
@@ -84,41 +83,41 @@ def _initialization_ids(
 
 @wp.kernel
 def _acknowledge_initialization(
-    batch: WorldBatchResult, t: WorldTransaction, prototype: int, status: wp.array[int], caller_ack: int
+    batch: InstanceBatchResult, t: InstanceTransaction, prototype: int, status: wp.array[int], caller_ack: int
 ):
     ordinal = wp.tid()
-    if batch.consumed[0] == 0 or t.phase[0] != ADMITTED:
+    if batch.consumed[0] == 0 or t.phase[0] != int(InstancePhase.ADMITTED):
         return
     start = t.request_starts[prototype]
     if ordinal < t.request_starts[prototype + 1] - start:
         request = t.admitted_requests[start + ordinal]
         if status[0] != 0:
             t.initialized_sequence[request] = wp.uint64(0)
-        elif caller_ack == 0 and t.status[request] == OK:
+        elif caller_ack == 0 and t.status[request] == int(InstanceStatus.OK):
             t.initialized_sequence[request] = batch.sequence[0]
 
 
 @wp.kernel
 def _relocation_count(
-    t: WorldTransaction, moves: WorldCompaction, prototype: int, healthy: wp.array[int], count: wp.array[int]
+    t: InstanceTransaction, moves: InstanceCompaction, prototype: int, healthy: wp.array[int], count: wp.array[int]
 ):
     count[0] = 0
-    if healthy[0] != 0 and t.phase[0] == MOVING:
+    if healthy[0] != 0 and t.phase[0] == int(InstancePhase.MOVING):
         count[0] = moves.count[prototype]
 
 
 @wp.kernel
 def _acknowledge_moves(
-    t: WorldTransaction, moves: WorldCompaction, prototype: int, healthy: wp.array[int], status: wp.array[int]
+    t: InstanceTransaction, moves: InstanceCompaction, prototype: int, healthy: wp.array[int], status: wp.array[int]
 ):
-    if healthy[0] != 0 and t.phase[0] == MOVING and status[0] == 0:
+    if healthy[0] != 0 and t.phase[0] == int(InstancePhase.MOVING) and status[0] == 0:
         moves.copied_count[prototype] = moves.count[prototype]
 
 
 @wp.kernel
 def _execution_conditions(
-    d: WorldDirectoryData,
-    batch: WorldBatchResult,
+    d: InstanceDirectoryData,
+    batch: InstanceBatchResult,
     prototype: int,
     world_ready: wp.array[int],
     contact_ready: wp.array[int],
@@ -259,20 +258,24 @@ class MuJoCoWorldPopulation:
         Invalid count declarations fail before emission. Any failure after emission
         invalidates the population program, even when the callback catches it.
         """
+        import mujoco_warp as mjw
+
         owner = self._borrow()
-        if owner.workspace.recorder is not owner or owner.updates is None:
+        if owner.workspace.bindings is not owner.step_bindings or owner.step_bindings.updates is None:
             raise RuntimeError("Record application launches inside a prototype physics callback")
         if not wp.get_stream(owner.data.qpos.device).is_capturing:
             raise RuntimeError("Application recording requires the active population graph capture")
         if type(tiled) is not bool or (tiled and (type(block_dim) is not int or block_dim < 1)):
             raise ValueError("Tiled recording requires an explicit positive block dimension")
-        owner._launch_sources(kernel, domain, extent_axis, parameter_domains)
+        mjw.validate_step_launch(owner.step_bindings, kernel, domain, extent_axis, parameter_domains)
         launch = wp.launch_tiled if tiled else wp.launch
         try:
             launch(kernel, dim=dim, inputs=inputs, outputs=outputs, block_dim=block_dim, device=owner.data.qpos.device)
-            owner.bind_launch(kernel, dim, domain, extent_axis=extent_axis, parameter_domains=parameter_domains)
+            mjw.bind_step_launch(
+                owner.step_bindings, kernel, dim, domain, extent_axis=extent_axis, parameter_domains=parameter_domains
+            )
         except BaseException:
-            owner.recording_failed = True
+            owner.step_bindings.recording_failed = True
             raise
 
 
@@ -296,7 +299,7 @@ class _MuJoCoWorldPopulation:
     refresh_kinematics: bool = True
     initialization_transfer: object = None
     compaction_transfer: object = None
-    updates: DeviceGraphUpdates | None = None
+    step_bindings: object = None
     request_indices: object = None
     source_rows: object = None
     destination_rows: object = None
@@ -306,9 +309,6 @@ class _MuJoCoWorldPopulation:
     move_count: object = None
     step_condition: object = None
     kinematics_condition: object = None
-    recording_failed: bool = False
-    bindings: list = field(default_factory=list)
-    operations: list = field(default_factory=list)
     global_arrays: dict = field(default_factory=dict)
     empty_fields: dict = field(default_factory=dict)
 
@@ -320,95 +320,15 @@ class _MuJoCoWorldPopulation:
             self.ccd_storage.ready_rows // self.ccd_quota,
         )
 
-    def _launch_sources(self, kernel, extent_domain, extent_axis, parameter_domains):
-        """Validate declarations and resolve their count owners before application emission."""
-        if self.recording_failed:
-            raise RuntimeError("The population program has a failed recording")
-        owners = {"world": self.world_storage, "candidate": self.contact_storage, "ccd": self.ccd_storage}
-        if extent_domain is not None and extent_domain not in owners:
-            raise ValueError(f"Unknown native launch domain: {extent_domain}")
-        if extent_domain is None and extent_axis is not None:
-            raise ValueError("A fixed worker grid must explicitly omit its dynamic axis")
-        if extent_domain is not None and (type(extent_axis) is not int or extent_axis != 0):
-            raise ValueError("Prepared native row domains require explicit leading axis zero")
-        if parameter_domains is not None and len(parameter_domains) > 4:
-            raise ValueError("Prepared kernels support at most four int32 count parameters")
-        sources = {
-            name: (owner.protected_count if name == "world" else owner.ready_count, owner.capacity)
-            for name, owner in owners.items()
-        }
-        labels = {argument.label: (index + 1, argument.type) for index, argument in enumerate(kernel.adj.args)}
-        scalars = []
-        for name, domain in (parameter_domains or {}).items():
-            if name not in labels or domain not in sources:
-                raise ValueError(f"Unknown native count parameter or domain: {name} -> {domain}")
-            index, dtype = labels[name]
-            if dtype not in (int, wp.int32):
-                raise ValueError(f"Native count parameter must be int32: {name}")
-            scalars.append(KernelParameterBinding(index, *sources[domain]))
-        extent = sources[extent_domain][0] if extent_domain is not None else None
-        return extent, tuple(scalars)
-
-    def bind_launch(self, kernel, dim, extent_domain, extent_axis=0, parameter_domains=None):
-        """Bind an emitted native node; any failure forbids publishing this program."""
-        try:
-            extent, scalars = self._launch_sources(kernel, extent_domain, extent_axis, parameter_domains)
-            dimensions = (dim,) if isinstance(dim, int) else tuple(dim)
-            if not all(dimensions):
-                return
-            binding = GraphKernelBinding(
-                self.updates.register_last_kernel_node(),
-                launch_rank=kernel.adj.kernel_dim,
-                extent_axis=extent_axis,
-                extent_source=extent,
-                parameters=scalars,
-            )
-            self.bindings.append(binding)
-            self.operations.append(
-                {
-                    "operation": "launch",
-                    "kernel": kernel.key,
-                    "module": kernel.func.__module__,
-                    "function": kernel.func.__qualname__,
-                    "dim": list(dimensions),
-                    "extent_domain": extent_domain,
-                    "extent_axis": extent_axis,
-                    "parameter_domains": dict(parameter_domains or {}),
-                    "launch_rank": binding.launch_rank,
-                    "node": binding.node,
-                }
-            )
-        except BaseException:
-            self.recording_failed = True
-            raise
-
-    def fill(self, array, value, domain):
-        """Record a native-declared bounded fill without inferring an array domain."""
-        if domain not in ("world", "candidate", "ccd"):
-            raise ValueError(f"Unknown native fill domain: {domain}")
-        owner = {"world": self.world_storage, "candidate": self.contact_storage, "ccd": self.ccd_storage}[domain]
-        owner.fill(array, value, count=owner.protected_count if domain == "world" else owner.ready_count)
-        self.operations.append({"operation": "fill", "domain": domain, "field": owner.lookup(array).name})
-        return array
-
-    def copy(self, destination, source, domain):
-        """Record a native-declared bounded copy; FieldStorage validates typed ownership."""
-        if domain not in ("world", "candidate", "ccd"):
-            raise ValueError(f"Unknown native copy domain: {domain}")
-        owner = {"world": self.world_storage, "candidate": self.contact_storage, "ccd": self.ccd_storage}[domain]
-        owner.copy(destination, source, count=owner.protected_count if domain == "world" else owner.ready_count)
-        field = owner.lookup(destination) or owner.lookup(source)
-        self.operations.append({"operation": "copy", "domain": domain, "field": field.name})
-
     def record_physics(self):
         """Record conditional native physics and poses on the current stream."""
         import mujoco_warp as mjw
 
-        if self.recording_failed:
+        if self.step_bindings.recording_failed:
             raise RuntimeError("The population program has a failed recording")
-        if self.workspace.recorder is not None and self.workspace.recorder is not self:
-            raise RuntimeError("Native workspace already has a recorder")
-        self.workspace.recorder = self
+        if self.workspace.bindings is not None and self.workspace.bindings is not self.step_bindings:
+            raise RuntimeError("Native workspace already has step bindings")
+        self.workspace.bindings = self.step_bindings
 
         def step():
             if self.before_step is not None:
@@ -427,13 +347,13 @@ class _MuJoCoWorldPopulation:
                 wp.capture_if(self.kinematics_condition, on_true=step_and_poses)
             else:
                 wp.capture_if(self.step_condition, on_true=step)
-            if self.recording_failed:
+            if self.step_bindings.recording_failed:
                 raise RuntimeError("The population program has a failed recording")
         except BaseException:
-            self.recording_failed = True
+            self.step_bindings.recording_failed = True
             raise
         finally:
-            self.workspace.recorder = None
+            self.workspace.bindings = None
             self.before_step = None
             self.after_substep = None
 
@@ -573,11 +493,11 @@ class MuJoCoWorlds:
         try:
             with wp.ScopedDevice(device):
                 if memory_budget_bytes is not None:
-                    self._backing = MemoryBacking(
+                    self._backing = backing_ops.prepare(
                         memory_budget_bytes, device_ordinal=device.ordinal, expected_uuid=device.uuid
                     )
                 backing = self._backing
-                self._directory = WorldDirectory(
+                self._directory = directory_ops.allocate(
                     world_capacities, id_capacity=id_capacity, command_capacity=command_capacity, device=device
                 )
                 self._healthy = wp.ones(1, dtype=int, device=device)
@@ -626,11 +546,16 @@ class MuJoCoWorlds:
                             if name in ("nacon", "ncollision"):
                                 arrays[name].zero_()
                     data_field_names = tuple(spec.name for spec in world_fields)
-                    group.default_storage = FieldStorage(
+                    group.default_storage = field_ops.allocate(
                         1, wp.ones(1, dtype=int, device=device), fields=tuple(world_fields)
                     )
                     for name, array in world_sources.items():
-                        group.default_storage.copy(group.default_storage.arrays[name], array)
+                        field_ops.copy(
+                            group.default_storage,
+                            group.default_storage.arrays[name],
+                            array,
+                            count=group.default_storage.protected_count,
+                        )
                     specs = mjw.step_workspace_layout(
                         model, template, world_capacity=capacity, contact_capacity=contact_cap, ccd_capacity=ccd_cap
                     )
@@ -659,17 +584,17 @@ class MuJoCoWorlds:
                         else:
                             raise ValueError(f"Unknown native workspace domain: {spec.capacity_domain}")
                     live_count = self._directory.data.live_count[prototype : prototype + 1]
-                    group.world_storage = FieldStorage(
+                    group.world_storage = field_ops.allocate(
                         capacity, live_count, fields=tuple(world_fields), backing=backing, initial_ready_count=initial
                     )
-                    group.contact_storage = FieldStorage(
+                    group.contact_storage = field_ops.allocate(
                         contact_cap,
                         wp.zeros(1, dtype=int, device=device),
                         fields=tuple(contact_fields),
                         backing=backing,
                         initial_ready_count=initial * group.contact_quota if backing else None,
                     )
-                    group.ccd_storage = FieldStorage(
+                    group.ccd_storage = field_ops.allocate(
                         ccd_cap,
                         wp.zeros(1, dtype=int, device=device),
                         fields=tuple(ccd_fields),
@@ -678,30 +603,38 @@ class MuJoCoWorlds:
                     )
                     for owner in (group.world_storage, group.contact_storage, group.ccd_storage):
                         for name, array in owner.arrays.items():
-                            owner.prepare_fill(array, 0)
+                            field_ops.prepare_fill(owner, array, 0)
                             if name.startswith("workspace."):
                                 scratch[name.removeprefix("workspace.")] = array
                             else:
                                 arrays[name] = array
-                    group.contact_storage.prepare_fill(group.contact_storage.arrays["contact.efc_address"], -1)
+                    field_ops.prepare_fill(
+                        group.contact_storage, group.contact_storage.arrays["contact.efc_address"], -1
+                    )
                     for owner in (group.contact_storage, group.ccd_storage):
-                        owner.zero(count=owner.ready_count)
-                    group.contact_storage.fill(
-                        group.contact_storage.arrays["contact.efc_address"], -1, count=group.contact_storage.ready_count
+                        field_ops.zero(owner, count=owner.ready_count)
+                    field_ops.fill(
+                        group.contact_storage,
+                        group.contact_storage.arrays["contact.efc_address"],
+                        -1,
+                        count=group.contact_storage.ready_count,
                     )
                     group.data = _replace_data(
                         template, arrays, nworld=capacity, naconmax=contact_cap, naccdmax=ccd_cap
                     )
-                    group.world_storage.prepare_fill(group.data.island_dofadr, model.nv)
-                    group.world_storage.prepare_fill(scratch["island_can_sleep"], 1)
+                    field_ops.prepare_fill(group.world_storage, group.data.island_dofadr, model.nv)
+                    field_ops.prepare_fill(group.world_storage, scratch["island_can_sleep"], 1)
+                    group.step_bindings = mjw.StepBindings(
+                        group.world_storage, group.contact_storage, group.ccd_storage
+                    )
                     group.workspace = mjw.make_step_workspace(
-                        model, group.data, world_live_count=live_count, arrays=scratch, recorder=group
+                        model, group.data, arrays=scratch, bindings=group.step_bindings
                     )
-                    group.initialization_transfer = group.world_storage.prepare_transfer(
-                        group.default_storage, fields=data_field_names
+                    group.initialization_transfer = field_ops.prepare_transfer(
+                        group.default_storage, group.world_storage, data_field_names
                     )
-                    group.compaction_transfer = group.world_storage.prepare_transfer(
-                        group.world_storage, fields=data_field_names
+                    group.compaction_transfer = field_ops.prepare_transfer(
+                        group.world_storage, group.world_storage, data_field_names
                     )
                     group.request_indices = wp.zeros(command_capacity, dtype=int, device=device)
                     group.source_rows = wp.zeros(command_capacity, dtype=int, device=device)
@@ -716,7 +649,9 @@ class MuJoCoWorlds:
                     group.view = MuJoCoWorldPopulation(prototype, group)
                     start = end
                 self._views = tuple(group.view for group in self._populations)
-                self._directory.publish_ready_slots(tuple(group.world_ready_capacity for group in self._populations))
+                directory_ops.publish_admissible_slots(
+                    self._directory, tuple(group.world_ready_capacity for group in self._populations)
+                )
         except BaseException as failure:
             traceback.clear_frames(failure.__traceback__)
             arrays = scratch = world_sources = array = owner = None
@@ -729,7 +664,7 @@ class MuJoCoWorlds:
             raise
 
     @property
-    def directory(self) -> WorldDirectoryData:
+    def directory(self) -> InstanceDirectoryData:
         """Borrow published numeric relations without lifecycle mutation operations.
 
         Callers must not write these arrays. Submit commands through the captured
@@ -739,7 +674,7 @@ class MuJoCoWorlds:
         return self._directory.data
 
     @property
-    def batch_result(self) -> WorldBatchResult:
+    def batch_result(self) -> InstanceBatchResult:
         """Borrow outcomes, including failure diagnostics after quarantine or close."""
         return self._directory.batch_result
 
@@ -755,8 +690,8 @@ class MuJoCoWorlds:
 
     def capture(
         self,
-        commands: WorldCommands,
-        results: WorldResults,
+        commands: InstanceCommands,
+        results: InstanceResults,
         *,
         permit=None,
         validate=None,
@@ -791,10 +726,10 @@ class MuJoCoWorlds:
             permit: Optional GPU int32 scalar permitting physics advancement.
             validate: Preparation callback ``(commands, request_status, consumed)``.
                 Guard the read-only consumed scalar before reading requests. Only
-                replace existing OK request_status values with payload rejection.
+                replace existing int(InstanceStatus.OK) request_status values with payload rejection.
             initialize: Preparation callback ``(population, request_indices, destination_rows,
                 count, copy_status, initialized_sequence, sequence)``. Write only the
-                admitted prefix when copy_status is OK; acknowledge initialized_sequence
+                admitted prefix when copy_status is int(InstanceStatus.OK); acknowledge initialized_sequence
                 only after complete payload writes. Other arrays are borrowed read-only.
             retain: External buffers borrowed by any recorded callback kernels.
             substeps: Ordered native steps per graph replay.
@@ -823,10 +758,7 @@ class MuJoCoWorlds:
             if type(refresh_kinematics) is not bool:
                 raise TypeError("refresh_kinematics must be a boolean")
             retain = tuple(retain)
-            _validate_arrays(
-                commands, WorldCommands, self._directory.command_capacity, self.device, ("sequence", "count")
-            )
-            _validate_arrays(results, WorldResults, self._directory.command_capacity, self.device)
+            directory_ops.validate_buffers(self._directory, commands, results)
             permit = self._always_permit if permit is None else permit
             if (
                 not isinstance(permit, wp.array)
@@ -840,10 +772,10 @@ class MuJoCoWorlds:
             graph = None
             try:
                 for group in self._populations:
-                    group.workspace.recorder = None
+                    group.workspace.bindings = None
                     group.substeps, group.before_step = substeps, before_step
                     group.after_substep, group.refresh_kinematics = after_substep, refresh_kinematics
-                    group.updates = DeviceGraphUpdates(
+                    group.step_bindings.updates = graph_ops.prepare_updates(
                         group.world_storage.protected_count,
                         enable_count_maximum=group.world_storage.capacity,
                         binding_capacity=512 * substeps,
@@ -851,11 +783,11 @@ class MuJoCoWorlds:
                 # Warmed native programs use separate Data. Load lifecycle and row
                 # transfer kernels before conditional capture, avoiding unrelated solvers.
                 wp.load_module(module=__name__, device=self.device)
-                wp.load_module(module=FieldStorage.__module__, device=self.device)
+                wp.load_module(module=field_ops.__name__, device=self.device)
                 with wp.ScopedCapture(
                     device=self.device, force_module_load=False, capture_mode=wp.CaptureMode.THREAD_LOCAL
                 ) as capture:
-                    self._directory.begin(commands)
+                    directory_ops.begin(self._directory, commands)
                     wp.launch(
                         _guard_health,
                         1,
@@ -873,7 +805,7 @@ class MuJoCoWorlds:
                             validate(
                                 commands, self._directory.transaction.status, self._directory.batch_result.consumed
                             )
-                        self._directory.admit(commands)
+                        directory_ops.admit(self._directory, commands)
                         for prototype, group in enumerate(self._populations):
                             wp.launch(
                                 _initialization_ids,
@@ -889,8 +821,11 @@ class MuJoCoWorlds:
                                 ],
                                 device=self.device,
                             )
-                            group.initialization_transfer.record(
-                                group.source_rows, group.destination_rows, group.initialization_count
+                            field_ops.transfer(
+                                group.initialization_transfer,
+                                group.source_rows,
+                                group.destination_rows,
+                                group.initialization_count,
                             )
                             if initialize is not None:
                                 initialize(
@@ -914,8 +849,8 @@ class MuJoCoWorlds:
                                 ],
                                 device=self.device,
                             )
-                        self._directory.publish(commands, results)
-                        self._directory.plan_compaction()
+                        directory_ops.publish(self._directory, commands, results)
+                        directory_ops.plan_compaction(self._directory)
                         for prototype, group in enumerate(self._populations):
                             wp.launch(
                                 _relocation_count,
@@ -929,8 +864,11 @@ class MuJoCoWorlds:
                                 ],
                                 device=self.device,
                             )
-                            group.compaction_transfer.record(
-                                group.move_source_rows, group.move_destination_rows, group.move_count
+                            field_ops.transfer(
+                                group.compaction_transfer,
+                                group.move_source_rows,
+                                group.move_destination_rows,
+                                group.move_count,
                             )
                             wp.launch(
                                 _acknowledge_moves,
@@ -944,19 +882,24 @@ class MuJoCoWorlds:
                                 ],
                                 device=self.device,
                             )
-                        self._directory.publish_compaction()
+                        directory_ops.publish_compaction(self._directory)
 
                     wp.capture_if(self._lifecycle_needed, on_true=record_lifecycle)
                     # Every updater must finish and be checked before any prototype
                     # enters its conditional program, including native solver loops.
-                    capture_parallel([group.updates.record_update for group in self._populations])
-                    capture_parallel(
+                    graph_ops.capture_parallel(
+                        [
+                            lambda group=group: graph_ops.record_update(group.step_bindings.updates)
+                            for group in self._populations
+                        ]
+                    )
+                    graph_ops.capture_parallel(
                         lambda group=group: wp.launch(
                             _guard_graph_updates,
-                            group.updates.binding_capacity,
+                            group.step_bindings.updates.binding_capacity,
                             [
-                                group.updates.errors,
-                                group.updates.binding_count,
+                                group.step_bindings.updates.errors,
+                                group.step_bindings.updates.binding_count,
                                 self._healthy,
                                 self._directory.batch_result,
                             ],
@@ -986,13 +929,13 @@ class MuJoCoWorlds:
                             ],
                             device=self.device,
                         )
-                    capture_parallel([group.record_physics for group in self._populations])
+                    graph_ops.capture_parallel([group.record_physics for group in self._populations])
                 graph = capture.graph
                 del capture
                 for group in self._populations:
-                    group.updates.bind(graph, group.bindings)
+                    graph_ops.bind(group.step_bindings.updates, graph, group.step_bindings.bindings)
                 self._retain_graph(graph, commands, results, permit, *retain)
-                self._populations[0].updates.instantiate_and_upload(graph)
+                graph_ops.instantiate_and_upload(self._populations[0].step_bindings.updates, graph)
                 return graph
             except BaseException as failure:
                 # This root cannot silently retry partially marked CUDA graph nodes.
@@ -1012,7 +955,7 @@ class MuJoCoWorlds:
                 # Earlier recording failures may leave sibling populations unvisited.
                 # Only explicit graph retention owns callback resources after preparation.
                 for group in self._populations:
-                    group.workspace.recorder = None
+                    group.workspace.bindings = None
                     group.before_step = group.after_substep = None
 
     def _retain_graph(self, graph, *buffers):
@@ -1021,16 +964,21 @@ class MuJoCoWorlds:
         previous = self._graph() if self._graph is not None else None
         if previous is not None and previous is not graph:
             raise RuntimeError("Native population already belongs to another graph")
-        self._directory.retain_graph(graph, self, *buffers)
+        directory_ops.retain_graph(self._directory, graph, self, *buffers)
         for group in self._populations:
-            group.initialization_transfer.retain_graph(
-                graph, group.request_indices, group.source_rows, group.destination_rows, group.initialization_count
+            field_ops.retain_transfer_graph(
+                group.initialization_transfer,
+                graph,
+                group.request_indices,
+                group.source_rows,
+                group.destination_rows,
+                group.initialization_count,
             )
-            group.compaction_transfer.retain_graph(
-                graph, group.move_source_rows, group.move_destination_rows, group.move_count
+            field_ops.retain_transfer_graph(
+                group.compaction_transfer, graph, group.move_source_rows, group.move_destination_rows, group.move_count
             )
             for owner in (group.world_storage, group.contact_storage, group.ccd_storage):
-                owner.retain_graph(graph, group.workspace, group.step_condition, group.kinematics_condition)
+                field_ops.retain_graph(owner, graph, group.workspace, group.step_condition, group.kinematics_condition)
         self._graph = weakref.ref(graph)
         return graph
 
@@ -1068,8 +1016,8 @@ class MuJoCoWorlds:
                 not isinstance(stream, wp.Stream) or stream.device != self.device for stream in streams
             ):
                 raise ValueError("Backing service requires existing Warp streams on the population device")
-            with self._backing.maintenance(streams=tuple(stream.cuda_stream for stream in streams)):
-                self._directory.withdraw_ready_slots(world_ready_capacities)
+            with backing_ops.maintenance(self._backing, streams=tuple(stream.cuda_stream for stream in streams)):
+                directory_ops.withdraw_admissible_slots(self._directory, world_ready_capacities)
                 live_counts = self._directory.data.live_count.numpy()
                 budget_rejected = False
                 try:
@@ -1089,29 +1037,33 @@ class MuJoCoWorlds:
                     for group, owner, target, live_count in services:
                         old_ready = owner.ready_rows
                         try:
-                            owner.resize_backing(target, protected_count_host=live_count)
+                            field_ops.resize_backing(owner, target, protected_count_host=live_count)
                         except MemoryError:
                             budget_rejected = not owner.service_failed
                             raise
                         if owner is not group.world_storage and owner.ready_rows > old_ready:
-                            owner.zero(count=owner.ready_count, start=old_ready)
+                            field_ops.zero(owner, count=owner.ready_count, start=old_ready)
                             if owner is group.contact_storage:
-                                owner.fill(
-                                    owner.arrays["contact.efc_address"], -1, count=owner.ready_count, start=old_ready
+                                field_ops.fill(
+                                    owner,
+                                    owner.arrays["contact.efc_address"],
+                                    -1,
+                                    count=owner.ready_count,
+                                    start=old_ready,
                                 )
-                    self._directory.publish_ready_slots(
-                        tuple(group.world_ready_capacity for group in self._populations)
+                    directory_ops.publish_admissible_slots(
+                        self._directory, tuple(group.world_ready_capacity for group in self._populations)
                     )
                     wp.synchronize_stream(wp.get_stream(self.device))
                     if spare_bytes is not None:
-                        self._backing.trim(keep_bytes=spare_bytes)
+                        backing_ops.trim(self._backing, keep_bytes=spare_bytes)
                 except MemoryError as failure:
                     if not budget_rejected:
                         self._quarantine_service(failure)
                         raise
                     try:
-                        self._directory.publish_ready_slots(
-                            tuple(group.world_ready_capacity for group in self._populations)
+                        directory_ops.publish_admissible_slots(
+                            self._directory, tuple(group.world_ready_capacity for group in self._populations)
                         )
                         wp.synchronize_stream(wp.get_stream(self.device))
                     except BaseException as failure:
@@ -1139,9 +1091,9 @@ class MuJoCoWorlds:
         Remaining storage and backing owners report their own retained resources.
         """
         result = {
-            "directory": self._directory.memory_report(),
+            "directory": directory_ops.memory_report(self._directory),
             "populations": [],
-            "shared_backing": self._backing.memory_report() if self._backing is not None else None,
+            "shared_backing": backing_ops.memory_report(self._backing) if self._backing is not None else None,
             "control_metadata_bytes": (
                 self._healthy.capacity + self._always_permit.capacity + self._lifecycle_needed.capacity
             ),
@@ -1157,23 +1109,25 @@ class MuJoCoWorlds:
                     model_arrays.append({"field": name, "bytes": array.capacity})
             result["populations"].append(
                 {
-                    "world_storage": group.world_storage.memory_report(),
-                    "contact_storage": group.contact_storage.memory_report(),
-                    "ccd_storage": group.ccd_storage.memory_report(),
-                    "default_storage": group.default_storage.memory_report(),
+                    "world_storage": field_ops.memory_report(group.world_storage),
+                    "contact_storage": field_ops.memory_report(group.contact_storage),
+                    "ccd_storage": field_ops.memory_report(group.ccd_storage),
+                    "default_storage": field_ops.memory_report(group.default_storage),
                     "workspace_borrowed": group.workspace.memory_report() if group.workspace is not None else None,
-                    "initialization": group.initialization_transfer.memory_report()
+                    "initialization": field_ops.transfer_memory_report(group.initialization_transfer)
                     if group.initialization_transfer is not None
                     else None,
-                    "compaction": group.compaction_transfer.memory_report()
+                    "compaction": field_ops.transfer_memory_report(group.compaction_transfer)
                     if group.compaction_transfer is not None
                     else None,
                     "retired_subowners": [
                         name
-                        for name in ("workspace", "initialization_transfer", "compaction_transfer")
+                        for name in ("workspace", "initialization_transfer", "compaction_transfer", "step_bindings")
                         if getattr(group, name) is None
                     ],
-                    "graph_updates": group.updates.memory_report() if group.updates is not None else None,
+                    "graph_updates": graph_ops.memory_report(group.step_bindings.updates)
+                    if group.step_bindings is not None and group.step_bindings.updates is not None
+                    else None,
                     "execution_metadata_bytes": sum(
                         array.capacity
                         for array in (
@@ -1214,18 +1168,18 @@ class MuJoCoWorlds:
                 raise RuntimeError("Destroy the native population graph before closing its owners")
             self._closed = True
             if self._directory is not None:
-                self._directory.close(streams=streams)
+                directory_ops.close(self._directory, streams=streams)
             for group in self._populations:
                 group.initialization_transfer = group.compaction_transfer = None
                 if group.workspace is not None:
-                    group.workspace.recorder = None
-                group.workspace = group.data = None
+                    group.workspace.bindings = None
+                group.workspace = group.data = group.step_bindings = None
             for group in self._populations:
                 for owner in (group.world_storage, group.contact_storage, group.ccd_storage, group.default_storage):
                     if owner is not None:
-                        owner.close(streams=raw_streams)
+                        field_ops.close(owner, streams=raw_streams)
             self._populations.clear()
             self._views = ()
             if self._backing is not None:
-                with self._backing.maintenance(streams=raw_streams):
-                    self._backing.close()
+                with backing_ops.maintenance(self._backing, streams=raw_streams):
+                    backing_ops.close(self._backing)

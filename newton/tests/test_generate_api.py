@@ -1,23 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-import io
 import tempfile
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest import mock
-
-from newton import worlds
-
-try:
-    from sphinx import addnodes
-    from sphinx.application import Sphinx
-    from sphinx.pycode import ModuleAnalyzer
-except ModuleNotFoundError as exc:
-    if exc.name != "sphinx":
-        raise
-    Sphinx = None
 
 try:
     from docs import generate_api
@@ -115,87 +103,6 @@ class TestGenerateApiDeprecatedSymbols(unittest.TestCase):
             self.assertIn("Do not rely on this value", page)
             self.assertNotIn("``-1``", page)
             self.assertNotIn("``-2``", page)
-
-
-@unittest.skipUnless(generate_api is not None, "requires the docs/ package (source checkout only)")
-@unittest.skipUnless(Sphinx is not None, "requires the docs Sphinx dependency")
-class TestWarpAutodoc(unittest.TestCase):
-    def test_struct_fields_render_with_source_docs_and_types(self):
-        """Build real autosummary templates; fields must retain their single source of documentation."""
-        root = Path(__file__).resolve().parents[2]
-        records = (
-            "WorldCommands",
-            "WorldResults",
-            "WorldBatchResult",
-            "WorldDirectoryData",
-            "WorldTransaction",
-            "WorldCompaction",
-        )
-        snapshots = {name: vars(getattr(worlds, name)).copy() for name in records}
-        with tempfile.TemporaryDirectory() as tmp:
-            source = Path(tmp) / "source"
-            source.mkdir()
-            (source / "conf.py").write_text(
-                f"import sys\nsys.path.insert(0, {str(root / 'docs/_ext')!r})\n"
-                "extensions = ['sphinx.ext.autodoc', 'sphinx.ext.autosummary', 'autodoc_filter', 'autodoc_warp']\n"
-                f"templates_path = [{str(root / 'docs/_templates')!r}]\n"
-                "autodoc_inherit_docstrings = False\nautosummary_generate = True\nhtml_theme = 'alabaster'\n"
-            )
-            (source / "index.rst").write_text(
-                "Warp API\n========\n\n.. autosummary::\n   :toctree: generated\n"
-                "   :template: autosummary/class.rst\n\n"
-                + "\n".join(f"   newton.worlds.{name}" for name in (*records, "FieldSpec", "WorldDirectory"))
-                + "\n\n.. autosummary::\n   :toctree: generated\n\n   newton.worlds.world_location\n"
-            )
-            warnings = io.StringIO()
-            app = Sphinx(
-                str(source),
-                str(source),
-                str(Path(tmp) / "html"),
-                str(Path(tmp) / "doctrees"),
-                buildername="html",
-                status=io.StringIO(),
-                warning=warnings,
-                freshenv=True,
-                warningiserror=True,
-            )
-            app.build(force_all=True)
-            self.assertEqual(app.statuscode, 0, warnings.getvalue())
-            for name in records:
-                record = getattr(worlds, name)
-                page = f"generated/newton.worlds.{name}"
-                descriptions = {
-                    node[0]["ids"][0]: (node[0].astext(), node[1].astext())
-                    for node in app.env.get_doctree(page).findall(addnodes.desc)
-                    if node[0].get("ids")
-                }
-                self.assertEqual(
-                    set(descriptions),
-                    {f"newton.worlds.{name}", *(f"newton.worlds.{name}.{field}" for field in record.vars)},
-                )
-                source_docs = ModuleAnalyzer.for_module(record.cls.__module__).find_attr_docs()
-                html = (Path(tmp) / "html" / f"{page}.html").read_text()
-                for field in record.vars:
-                    key = f"newton.worlds.{name}.{field}"
-                    with self.subTest(field=key):
-                        self.assertIn(f'id="{key}"', html)
-                        signature, description = descriptions[key]
-                        self.assertIn("wp.array", signature)
-                        expected = " ".join(source_docs[(record.cls.__qualname__, field)])
-                        self.assertEqual(" ".join(description.split()), " ".join(expected.split()))
-                # Sphinx must not attach annotations or other documentation state to Warp's wrapper.
-                self.assertEqual(vars(record).keys(), snapshots[name].keys())
-                for key, value in snapshots[name].items():
-                    self.assertIs(vars(record)[key], value)
-            ordinary = app.env.get_doctree("generated/newton.worlds.WorldDirectory").astext()
-            self.assertIn("begin(commands:", ordinary)
-            self.assertIn("Record batch validation", ordinary)
-            fields = app.env.get_doctree("generated/newton.worlds.FieldSpec").astext()
-            self.assertIn("alignment_bytes", fields)
-            function = app.env.get_doctree("generated/newton.worlds.world_location").astext()
-            self.assertIn("identity", function)
-            self.assertIn("Resolve a live handle", function)
-            self.assertFalse((root / "docs/_ext/autodoc_wpfunc.py").exists())
 
 
 if __name__ == "__main__":

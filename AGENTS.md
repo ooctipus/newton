@@ -5,6 +5,9 @@ For reviews, also read and apply the [review guidelines](REVIEW_GUIDELINES.rst) 
 
 ## Dynamic world boundaries
 
+- Generic instance relations, typed storage, byte backing and graph updates belong to the standalone `gpu-components` package. Newton imports its public concept operations and passive records; do not restore `newton.worlds`, generic owner files, aliases or method-forwarding facades.
+- Native MJWarp stage binding has one `StepBindings` record shared with the workspace. Do not duplicate its count declarations, binding/operation lists or failure latch in Newton. Native population recording composes physics and application callbacks; the MJWarp stage operation owns launch binding.
+
 - Use the cloner's prototype/occurrence/instance relations as the architectural reference: resolve names and paths to integer IDs before entering numeric relation APIs. Do not accept `int | str` identities or repeat symbolic resolution downstream.
 - Keep lifetime validity, physical readiness and task participation with their respective owners. Public world records describe numeric relations and the domain publication protocol; allocation and scheduling scratch stays private.
 - Physics callbacks consume the supported population recording interface. They must not borrow private field-storage owners or separately notify a graph updater after launching application kernels.
@@ -25,6 +28,7 @@ For reviews, also read and apply the [review guidelines](REVIEW_GUIDELINES.rst) 
 - Document every supported public owner method and property so the API documentation filter cannot silently hide operations; gate this without asserting incidental prose or inherited members.
 - Verify decorated Warp records in rendered Sphinx pages: every field needs its source description and type, and compiler metadata must not appear as public record members.
 - A homogeneous world prototype must broadcast each nonempty batched Model parameter from one row. Compaction relocates live Data, not immutable Model parameters; reject slot-dependent model batches before allocation.
+- After graph retirement and consumer joins, invalidate borrowed native views and detach owned program metadata; invalid views must not prolong update-table buffers. Preserve only documented diagnostics and retryable resource ledgers.
 
 ## Workflow
 
