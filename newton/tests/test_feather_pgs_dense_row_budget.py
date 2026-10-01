@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Exercise exact active-storage budgets for the existing dense C64 PGS solve."""
+"""Exercise active-storage budgets while retaining the dense solve's full capacity."""
 
 import unittest
 from types import SimpleNamespace
@@ -16,26 +16,35 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS,
 class TestFeatherPGSDenseRowBudgetFactory(unittest.TestCase):
     def test_create_distinct_budgets(self):
         """Create three disjoint storage budgets without changing the launch signature."""
-        baseline = _get_pgs_solve_tiled_row_kernel(64, 120)
-        kernels = [
-            _get_pgs_solve_tiled_row_kernel(64, 120, row_budget=budget, min_rows=minimum)
-            for budget, minimum in ((16, 0), (32, 16), (64, 32))
-        ]
-        self.assertEqual(len({kernel.key for kernel in [baseline, *kernels]}), 4)
-        labels = [argument.label for argument in baseline.adj.args]
-        for kernel in kernels:
-            self.assertEqual([argument.label for argument in kernel.adj.args], labels)
+        for capacity in (64, 128):
+            with self.subTest(capacity=capacity):
+                baseline = _get_pgs_solve_tiled_row_kernel(capacity, 120)
+                kernels = [
+                    _get_pgs_solve_tiled_row_kernel(capacity, 120, row_budget=budget, min_rows=minimum)
+                    for budget, minimum in ((16, 0), (32, 16), (capacity, 32))
+                ]
+                self.assertEqual(len({kernel.key for kernel in [baseline, *kernels]}), 4)
+                labels = [argument.label for argument in baseline.adj.args]
+                for kernel in kernels:
+                    self.assertEqual([argument.label for argument in kernel.adj.args], labels)
 
     def test_reject_unsupported_budget_shapes(self):
         """Reject unsupported capacity and budget combinations before compilation."""
-        for capacity, budget, minimum in ((32, 16, 0), (64, 8, 0), (64, 32, 32), (64, 16, -1)):
+        for capacity, budget, minimum in (
+            (32, 16, 0),
+            (64, 8, 0),
+            (64, 32, 32),
+            (64, 16, -1),
+            (128, 64, 0),
+            (128, 32, 32),
+        ):
             with self.subTest(capacity=capacity, budget=budget, minimum=minimum):
                 with self.assertRaises(ValueError):
                     _get_pgs_solve_tiled_row_kernel(capacity, 120, row_budget=budget, min_rows=minimum)
 
     def test_default_capacity_names(self):
         """Retain the default kernel identity for previously supported capacities."""
-        for capacity in (32, 64, 96):
+        for capacity in (32, 64, 96, 128):
             self.assertEqual(_get_pgs_solve_tiled_row_kernel(capacity, 120).key, f"pgs_solve_tiled_row_{capacity}")
 
     def test_dispatch_preserves_arguments(self):
@@ -81,21 +90,21 @@ class TestFeatherPGSDenseRowBudgetFactory(unittest.TestCase):
                 )
 
 
-def _dense_fixture():
+def _dense_fixture(capacity=64):
     """Cover every active size, cross-budget triples and readable padding fallback."""
     rng = np.random.default_rng(278)
-    counts = np.array([*range(65), 16, 32, 3], dtype=np.int32)
+    counts = np.array([*range(capacity + 1), 16, 32, 3], dtype=np.int32)
     worlds = len(counts)
-    factors = rng.normal(size=(worlds, 64, 8)).astype(np.float32) * 0.06
-    matrix = factors @ factors.transpose(0, 2, 1) + np.eye(64, dtype=np.float32)[None]
+    factors = rng.normal(size=(worlds, capacity, 8)).astype(np.float32) * 0.06
+    matrix = factors @ factors.transpose(0, 2, 1) + np.eye(capacity, dtype=np.float32)[None]
     diag = np.diagonal(matrix, axis1=1, axis2=2).copy() + np.float32(0.03)
-    rhs = rng.uniform(-0.7, 0.7, size=(worlds, 64)).astype(np.float32)
-    impulses = rng.uniform(0.05, 0.4, size=(worlds, 64)).astype(np.float32)
-    types = np.tile(np.array([0, 1, 3, 4, 5, 6, 1, 0], dtype=np.int32), (worlds, 8))
-    parents = np.full((worlds, 64), -1, dtype=np.int32)
-    mu = np.full((worlds, 64), 0.35, dtype=np.float32)
+    rhs = rng.uniform(-0.7, 0.7, size=(worlds, capacity)).astype(np.float32)
+    impulses = rng.uniform(0.05, 0.4, size=(worlds, capacity)).astype(np.float32)
+    types = np.tile(np.array([0, 1, 3, 4, 5, 6, 1, 0], dtype=np.int32), (worlds, capacity // 8))
+    parents = np.full((worlds, capacity), -1, dtype=np.int32)
+    mu = np.full((worlds, capacity), 0.35, dtype=np.float32)
     for world, count in enumerate(counts):
-        for normal in (0, 7, 14, 23, 30, 39, 46, 55, 61):
+        for normal in (0, 7, 14, 23, 30, 39, 46, 55, 61, 70, 78, 87, 94, 103, 110, 119, 125):
             if normal + 2 < count:
                 types[world, normal] = 0
                 types[world, normal + 1 : normal + 3] = 2
@@ -103,9 +112,9 @@ def _dense_fixture():
                 rhs[world, normal] = -0.5
         if count and world % 3 == 0:
             diag[world, count // 2] = 0.0 if world % 2 else -1.0
-    # Original C64 metadata can legally reference capacity padding. A reduced
+    # Original metadata can legally reference capacity padding. A reduced
     # storage budget must return this whole world to the full-capacity kernel.
-    for world, row, parent in ((65, 15, 14), (66, 31, 30), (67, 1, 10)):
+    for world, row, parent in ((capacity + 1, 15, 14), (capacity + 2, 31, 30), (capacity + 3, 1, 10)):
         types[world, row] = 2
         parents[world, row] = parent
         diag[world, row] = 1.0
@@ -116,18 +125,36 @@ def _dense_fixture():
 
 @unittest.skipUnless(wp.is_cuda_available(), "Native dense row budgets require CUDA")
 class TestFeatherPGSDenseRowBudget(unittest.TestCase):
-    def _compare(self, *, iterations, omega, friction_start, iteration_offset, graph=False, nan_diag=False):
+    def _compare(
+        self,
+        *,
+        iterations,
+        omega,
+        friction_start,
+        iteration_offset,
+        capacity=64,
+        graph=False,
+        nan_diag=False,
+        change_counts=False,
+    ):
         """Compare both budget partitions against the default factory byte for byte."""
         device = wp.get_device("cuda:0")
-        arrays = list(_dense_fixture())
+        arrays = list(_dense_fixture(capacity))
+        # Keep the shared C64 fixture unchanged for its existing consumers, but
+        # do not numerically compare rows whose tangent sibling lies beyond m:
+        # the reference only initializes the active matrix triangle. Admission
+        # for those metadata cases is checked independently below.
+        for world, active in ((capacity + 1, 16), (capacity + 2, 32)):
+            arrays[5][world] = arrays[5][active]
+            arrays[6][world] = arrays[6][active]
         if nan_diag:
             # NaN does not take the baseline's denom <= 0 early continue. The
             # malformed but in-capacity parent must still use full-budget storage.
-            arrays[1][67, 1] = np.nan
+            arrays[1][capacity + 3, 1] = np.nan
         values = [wp.array(value, device=device) for value in arrays]
         snapshots = [value.numpy() for value in values]
         counts, diag, matrix, rhs, initial, types, parents, mu = values
-        original = _get_pgs_solve_tiled_row_kernel(64, device.arch)
+        original = _get_pgs_solve_tiled_row_kernel(capacity, device.arch)
         reference = wp.clone(initial)
 
         def launch(kernel, impulses):
@@ -154,11 +181,11 @@ class TestFeatherPGSDenseRowBudget(unittest.TestCase):
 
         launch(original, reference)
         expected = reference.numpy()
-        for partition in (((32, 0), (64, 32)), ((16, 0), (32, 16), (64, 32))):
+        for partition in (((32, 0), (capacity, 32)), ((16, 0), (32, 16), (capacity, 32))):
             with self.subTest(partition=partition, graph=graph):
                 result = wp.clone(initial)
                 kernels = [
-                    _get_pgs_solve_tiled_row_kernel(64, device.arch, row_budget=budget, min_rows=minimum)
+                    _get_pgs_solve_tiled_row_kernel(capacity, device.arch, row_budget=budget, min_rows=minimum)
                     for budget, minimum in partition
                 ]
                 # Compile before capture, then restore the original warm impulses.
@@ -171,26 +198,110 @@ class TestFeatherPGSDenseRowBudget(unittest.TestCase):
                             launch(kernel, result)
                     wp.capture_launch(capture.graph)
                 np.testing.assert_array_equal(result.numpy().view(np.uint32), expected.view(np.uint32))
+                if change_counts:
+                    # Replay the same graph as worlds enter/leave each owner,
+                    # including the rows above the failed 96-row capacity.
+                    for changed in (np.full_like(arrays[0], capacity), np.zeros_like(arrays[0]), arrays[0]):
+                        counts.assign(changed)
+                        wp.copy(reference, initial)
+                        wp.copy(result, initial)
+                        launch(original, reference)
+                        wp.capture_launch(capture.graph)
+                        np.testing.assert_array_equal(result.numpy().view(np.uint32), reference.numpy().view(np.uint32))
                 for before, value in zip(snapshots, values, strict=True):
                     self.assertEqual(before.tobytes(), value.numpy().tobytes())
         # The zero-row world and normal capacity tails remain exactly unchanged.
         self.assertEqual(expected[0].tobytes(), arrays[4][0].tobytes())
-        for world, count in enumerate(arrays[0][:65]):
+        for world, count in enumerate(arrays[0][: capacity + 1]):
             self.assertEqual(expected[world, count:].tobytes(), arrays[4][world, count:].tobytes())
 
     def test_all_counts_and_projection_phases(self):
         """Preserve every count, row projector, warm state and delayed-friction phase."""
-        for iterations, omega, delay, offset in ((0, 1.0, 0, 0), (1, 0.8, 0, 0), (8, 1.0, 2, 0), (3, 1.2, 2, 3)):
-            with self.subTest(iterations=iterations, omega=omega, delay=delay, offset=offset):
-                self._compare(iterations=iterations, omega=omega, friction_start=delay, iteration_offset=offset)
+        for capacity in (64, 128):
+            for iterations, omega, delay, offset in ((0, 1.0, 0, 0), (1, 0.8, 0, 0), (8, 1.0, 2, 0), (3, 1.2, 2, 3)):
+                with self.subTest(capacity=capacity, iterations=iterations, omega=omega, delay=delay, offset=offset):
+                    self._compare(
+                        capacity=capacity,
+                        iterations=iterations,
+                        omega=omega,
+                        friction_start=delay,
+                        iteration_offset=offset,
+                    )
 
     def test_graph_preserves_full_capacity(self):
         """Preserve all capacity padding when the disjoint kernels run in a graph."""
-        self._compare(iterations=8, omega=1.0, friction_start=2, iteration_offset=0, graph=True)
+        for capacity in (64, 128):
+            with self.subTest(capacity=capacity):
+                self._compare(
+                    capacity=capacity,
+                    iterations=8,
+                    omega=1.0,
+                    friction_start=2,
+                    iteration_offset=0,
+                    graph=True,
+                    change_counts=True,
+                )
 
     def test_nan_diagonal_preserves_fallback(self):
         """Mirror the baseline NaN denominator branch before reducing row storage."""
-        self._compare(iterations=2, omega=1.0, friction_start=0, iteration_offset=0, nan_diag=True)
+        for capacity in (64, 128):
+            with self.subTest(capacity=capacity):
+                self._compare(
+                    capacity=capacity, iterations=2, omega=1.0, friction_start=0, iteration_offset=0, nan_diag=True
+                )
+
+    def test_padding_dependencies_decline_small_storage(self):
+        """Keep padding-dependent friction and normal chains on full storage."""
+        device = wp.get_device("cuda:0")
+        for capacity in (64, 128):
+            for denominator in (1.0, 0.0, -1.0, np.nan):
+                with self.subTest(capacity=capacity, denominator=denominator):
+                    arrays = list(_dense_fixture(capacity))
+                    # The first tangent references a sibling outside the active
+                    # prefix; it still needs full storage for any denominator.
+                    for world, row in ((capacity + 1, 15), (capacity + 2, 31)):
+                        arrays[1][world, row] = denominator
+                    # A valid active tangent pair can depend on a normal impulse
+                    # stored in padding through its patch-normal chain.
+                    world = capacity + 3
+                    arrays[5][world, :3] = (0, 2, 2)
+                    arrays[6][world, :3] = (10, 0, 0)
+                    arrays[6][world, 10] = -1
+                    values = [wp.array(value, device=device) for value in arrays]
+                    counts, diag, matrix, rhs, initial, types, parents, mu = values
+                    for budget, minimum in ((16, 0), (32, 0), (32, 16)):
+                        result = wp.clone(initial)
+                        kernel = _get_pgs_solve_tiled_row_kernel(
+                            capacity, device.arch, row_budget=budget, min_rows=minimum
+                        )
+                        wp.launch_tiled(
+                            kernel,
+                            dim=[len(arrays[0])],
+                            inputs=[counts, diag, matrix, rhs, result, 2, 1.0, types, parents, mu, 0, 0],
+                            block_dim=32,
+                            device=device,
+                        )
+                        np.testing.assert_array_equal(result.numpy()[capacity + 1 :], arrays[4][capacity + 1 :])
+
+                    # Unlike an out-of-prefix tangent sibling, this chain reads
+                    # defined matrix entries, so compare its full-owner output.
+                    expected = wp.clone(initial)
+                    result = wp.clone(initial)
+                    for target, kernel in (
+                        (expected, _get_pgs_solve_tiled_row_kernel(capacity, device.arch)),
+                        (
+                            result,
+                            _get_pgs_solve_tiled_row_kernel(capacity, device.arch, row_budget=capacity, min_rows=32),
+                        ),
+                    ):
+                        wp.launch_tiled(
+                            kernel,
+                            dim=[len(arrays[0])],
+                            inputs=[counts, diag, matrix, rhs, target, 2, 1.0, types, parents, mu, 0, 0],
+                            block_dim=32,
+                            device=device,
+                        )
+                    np.testing.assert_allclose(result.numpy()[world], expected.numpy()[world], rtol=1e-6, atol=1e-7)
 
 
 if __name__ == "__main__":

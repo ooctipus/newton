@@ -1279,12 +1279,19 @@ class SolverFeatherPGS(SolverBase):
     first-order; accurate rotational trajectories still require a suitable
     simulation timestep.
 
-    Experimental performance modes are disabled by default. Set
+    CUDA ``tiled_row`` batches with 128-row capacity and at least 1024 worlds
+    use smaller temporary row storage for eligible worlds, retaining the full
+    capacity for all other worlds. Set ``FEATHER_PGS_DENSE_ROW_BUDGETS=0`` before
+    construction to disable this selection, or ``=1`` to select it for smaller
+    CUDA batches with 64- or 128-row capacity.
+
+    Additional experimental performance modes are disabled by default. Set
     ``FEATHER_PGS_DENSE_ROW_BUDGETS=1`` and
     ``FEATHER_PGS_DENSE_ROW_REGISTERS=1`` before construction to retain row
     state in registers in the CUDA, 64-row-capacity ``tiled_row`` path.
-    Other capacities, CPU execution and other sweep mappings retain their
-    existing implementation. Set ``FEATHER_PGS_REGISTER_WHITENING=1`` before
+    The register mode retains its existing 64-row restriction. CPU execution
+    and other sweep mappings retain their existing implementation. Set
+    ``FEATHER_PGS_REGISTER_WHITENING=1`` before
     importing Newton to enable register whitening for the measured 18-DOF,
     32/48-row matrix-free world-row layouts on CUDA architectures 103/120.
     Unsupported whitening configurations retain the existing implementation.
@@ -6944,18 +6951,24 @@ class SolverFeatherPGS(SolverBase):
                 self._pgs_solve_tiled_row_kernel = _get_pgs_solve_tiled_row_kernel(
                     self.dense_max_constraints, device_arch
                 )
-                # Experimental storage layout; keep unmeasured hardware and small
-                # batches on the existing route unless explicitly requested.
+                # Large C128 batches benefit from small-world storage without
+                # reducing capacity. Avoid extra launches for small batches.
+                row_budgets = os.environ.get("FEATHER_PGS_DENSE_ROW_BUDGETS")
                 if (
                     model.device.is_cuda
-                    and self.dense_max_constraints == 64
-                    and os.environ.get("FEATHER_PGS_DENSE_ROW_BUDGETS") == "1"
+                    and self.dense_max_constraints in (64, 128)
+                    and (
+                        row_budgets == "1"
+                        or (row_budgets is None and self.dense_max_constraints == 128 and self.world_count >= 1024)
+                    )
                 ):
                     self._pgs_solve_tiled_row_budgets = tuple(
-                        _get_pgs_solve_tiled_row_kernel(64, device_arch, row_budget=budget, min_rows=minimum)
-                        for budget, minimum in ((32, 0), (64, 32))
+                        _get_pgs_solve_tiled_row_kernel(
+                            self.dense_max_constraints, device_arch, row_budget=budget, min_rows=minimum
+                        )
+                        for budget, minimum in ((32, 0), (self.dense_max_constraints, 32))
                     )
-                    if os.environ.get("FEATHER_PGS_DENSE_ROW_REGISTERS") == "1":
+                    if self.dense_max_constraints == 64 and os.environ.get("FEATHER_PGS_DENSE_ROW_REGISTERS") == "1":
                         self._pgs_solve_tiled_row_register_kernels = tuple(
                             get_dense_row_state_kernel(device_arch, 2, row_budget=budget) for budget in (32, 64)
                         )
@@ -18674,14 +18687,18 @@ def _get_pgs_solve_tiled_row_kernel(
     Shared memory footprint drops from M*M to M*(M+1)/2 floats.
     Uses symmetry in dot: C(i,j) = L(i,j) if j<=i else L(j,i).
 
-    Experimental C64 budgets change only local storage, not global strides or
+    C64/C128 budgets change only local storage, not global strides or
     the 32-lane GS reduction. Small budgets own ``min_rows < m <= row_budget``;
     the full-budget fallback also owns small worlds whose friction metadata
     reads outside the active prefix. A missing budget retains the original path.
     """
     if row_budget is not None:
-        if max_constraints != 64 or row_budget not in (16, 32, 64) or not 0 <= min_rows < row_budget:
-            raise ValueError("Dense row budgets require C64, budget 16/32/64, and 0 <= min_rows < budget")
+        if (
+            max_constraints not in (64, 128)
+            or row_budget not in (16, 32, max_constraints)
+            or not 0 <= min_rows < row_budget
+        ):
+            raise ValueError("Dense row budgets require C64/C128, budget 16/32/capacity, and 0 <= min_rows < budget")
     elif min_rows != 0:
         raise ValueError("min_rows requires an explicit row_budget")
     TILE_M = max_constraints if row_budget is None else row_budget
@@ -18763,12 +18780,16 @@ def _get_pgs_solve_tiled_row_kernel(
         admission_code += """
     bool unsupported = false;
     if (m <= 32) {
-        // Match the original denominator branch, including its NaN behavior.
-        if (lane < m && !(world_diag.data[world * ROW_STRIDE + lane] <= 0.0f) &&
-            world_row_type.data[world * ROW_STRIDE + lane] == 2) {
+        if (lane < m) {
             const int p = world_row_parent.data[world * ROW_STRIDE + lane];
-            // Bound p before adding, so malformed integer metadata cannot overflow.
-            unsupported = p < 0 || p > m - 3 || (lane != p + 1 && lane != p + 2);
+            // Normal rows can link additional patch normals. Keep every link
+            // inside the staged prefix, including links reached transitively.
+            unsupported = p >= m;
+            if (world_row_type.data[world * ROW_STRIDE + lane] == 2) {
+                // Friction still projects when its diagonal is nonpositive.
+                // Bound p before adding to avoid integer overflow.
+                unsupported = p < 0 || p > m - 3 || (lane != p + 1 && lane != p + 2);
+            }
         }
         unsupported = __ballot_sync(MASK, unsupported) != 0u;
     }
