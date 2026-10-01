@@ -463,6 +463,24 @@ class _SampleWorlds:
 
 
 class RuntimeCompositionArchitectureTests(unittest.TestCase):
+    def test_public_owner_operations_are_documented(self):
+        """Keep supported operations visible to the public API documentation filter."""
+        owners = (
+            worlds.WorldDirectory,
+            worlds.FieldStorage,
+            worlds.FieldTransfer,
+            worlds.MemoryBacking,
+            worlds.DeviceGraphUpdates,
+        )
+        for owner in owners:
+            for name, member in vars(owner).items():
+                if name.startswith("_") or not (
+                    callable(member) or isinstance(member, (property, staticmethod, classmethod))
+                ):
+                    continue
+                with self.subTest(owner=owner.__name__, member=name):
+                    self.assertTrue((member.__doc__ or "").strip(), "Public operations must have docstrings")
+
     def test_generated_work_uses_its_own_count_and_capacity(self):
         """Execute the independent compute stages with dense CPU arrays before capture."""
         for primitives in (2, 5):

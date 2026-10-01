@@ -462,6 +462,7 @@ class DeviceGraphUpdates:
         graph.graph_exec = executable
 
     def memory_report(self):
+        """Report owned binding and update buffers, excluding graph storage and borrowed counts."""
         return {
             "binding_capacity": self.binding_capacity,
             "binding_stride_bytes": self.binding_stride_bytes,
