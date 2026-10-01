@@ -34,9 +34,10 @@ __global__ void update_nodes(const Binding *bindings, const int *binding_count, 
         valid = valid && parameters[arg] >= 0 && parameters[arg] <= binding.scalar_maxima[arg];
     }
     auto node = reinterpret_cast<cudaGraphDeviceNode_t>(binding.node);
-    if (!valid) {
+    // Disabled nodes need no bounds or parameter writes; the next active replay writes them all.
+    if (!valid || live == 0 || extent == 0) {
         cudaError_t error = cudaGraphKernelNodeSetEnabled(node, false);
-        errors[i] = error == cudaSuccess ? -1 : int(error);
+        errors[i] = error == cudaSuccess ? (valid ? 0 : -1) : int(error);
         return;
     }
     cudaError_t error = cudaSuccess;
@@ -63,14 +64,14 @@ __global__ void update_nodes(const Binding *bindings, const int *binding_count, 
     }
     for (int arg = 0; arg < binding.scalar_count && error == cudaSuccess; ++arg)
         error = cudaGraphKernelNodeSetParam(node, binding.scalar_offsets[arg], parameters[arg]);
-    if (error == cudaSuccess) error = cudaGraphKernelNodeSetEnabled(node, live > 0 && extent > 0);
+    if (error == cudaSuccess) error = cudaGraphKernelNodeSetEnabled(node, true);
     else cudaGraphKernelNodeSetEnabled(node, false);  // Preserve the original error; caller quarantines failed work.
     errors[i] = int(error);
 }
 
 extern "C" size_t binding_size() { return sizeof(Binding); }
 
-extern "C" int capture_tail(void *stream, void **node, void **graph) {
+extern "C" int get_last_kernel_node(void *stream, void **node, void **graph) {
     CUstreamCaptureStatus status;
     const CUgraphNode *dependencies;
     size_t count;
@@ -116,7 +117,7 @@ extern "C" int prepare_binding(void *handle, int rank, int axis, void *extent_co
         return -103;
     if (!params.kernelParams || !params.kernelParams[0]) return -104;
     std::memcpy(binding.bounds, params.kernelParams[0], binding.bounds_size);
-    binding.shape_offset = axis < 0 ? -1 : axis * sizeof(int);
+    binding.shape_offset = axis < 0 ? -1 : axis * int(sizeof(int));
     binding.extent_count = static_cast<const int *>(extent_count);
     if (axis >= 0) {
         if (!extent_count) return -114;
@@ -164,7 +165,7 @@ extern "C" int launch_update(void *stream, void *bindings, void *binding_count, 
     return int(cudaGetLastError());
 }
 
-extern "C" int instantiate_upload(void *graph, void *stream, unsigned long long flags, void **executable) {
+extern "C" int instantiate_and_upload(void *graph, void *stream, unsigned long long flags, void **executable) {
     CUgraphExec exec;
     CUresult error = cuGraphInstantiateWithFlags(&exec, reinterpret_cast<CUgraph>(graph), flags);
     if (error) return int(error);
