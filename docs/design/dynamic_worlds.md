@@ -23,8 +23,11 @@ while running:
     write_gpu_create_reset_destroy_requests()
     replay(graph)  # initialize, publish, compact, run live native worlds
 
-# At an explicitly joined cold boundary, when physical capacity needs to change:
-map_or_unmap_backing_then_publish_ready_rows()
+# Cold capacity service excludes new submissions until completion:
+join_all_readers()
+withdraw_reclaimable_ready_prefixes()
+map_or_unmap_backing()
+publish_certified_ready_prefixes()
 ```
 
 ```text
@@ -447,7 +450,7 @@ Its budget counts mapped and retained physical blocks. Immutable models, dense
 metadata, graph storage and caller data are separate ledger entries rather than
 unreported free memory.
 
-`resize_backing` first withdraws the unused directory tail, joins all readers,
+`resize_backing` first joins all readers, withdraws the unused directory tail,
 services W/C/D and publishes their minimum usable world prefix. A normal budget
 rejection leaves a recoverable ready prefix. Unexpected driver or publication
 failure quarantines the runtime with a GPU health latch: replaying a retained
