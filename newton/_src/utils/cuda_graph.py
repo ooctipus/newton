@@ -3,7 +3,7 @@
 
 """Prepare exact CUDA kernel-node bindings for GPU-controlled Warp launch extents.
 
-The caller proves the semantic world axis and scalar arguments. This owner handles
+The caller proves the semantic extent axis and scalar arguments. This owner handles
 CUDA argument layout and graph resources, never infers semantics from numeric
 values or kernel names. Preparation is host-side; replay updates run on the GPU.
 """
@@ -22,19 +22,23 @@ import warp as wp
 
 
 @dataclass(frozen=True)
-class Int32Parameter:
-    index: int  # CUDA indices include the launch-bounds argument at zero.
+class KernelParameterBinding:
+    """Bind one contiguous device int32 source to an explicit scalar argument slot."""
+
+    argument_index: int  # Positive CUDA argument index; zero is reserved for Warp launch bounds.
     source: wp.array
     maximum: int
 
 
 @dataclass(frozen=True)
-class KernelBinding:
+class GraphKernelBinding:
+    """Bind a captured kernel node to explicit launch and scalar-argument sources."""
+
     node: int
-    rank: int
+    launch_rank: int
     extent_axis: int | None = 0
     extent_source: wp.array | None = None
-    parameters: tuple[Int32Parameter, ...] = ()
+    parameters: tuple[KernelParameterBinding, ...] = ()
 
 
 def _check(status, operation):
@@ -67,8 +71,8 @@ def capture_parallel(branches, *, stream=None):
     owner = device.captures.get(stream) if device.is_cuda else None
     if owner is None or owner.device != device:
         raise RuntimeError("Parallel branches require a Warp-managed CUDA graph capture")
-    if getattr(owner, "_parallel_capture_failed", False):
-        raise RuntimeError("Discard this failed parallel capture")
+    if getattr(owner, "_preparation_failed", False):
+        raise RuntimeError("Discard this graph after failed preparation")
     if getattr(owner, "apic", False):
         raise ValueError("Parallel dependency editing is not supported by APIC serialization")
     library = ct.CDLL("libcuda.so.1")
@@ -86,8 +90,8 @@ def capture_parallel(branches, *, stream=None):
     library.cuGraphGetEdges.argtypes = [pointer, ct.POINTER(pointer), ct.POINTER(pointer), ct.POINTER(ct.c_size_t)]
 
     def frontier():
-        if getattr(owner, "_parallel_capture_failed", False):
-            raise RuntimeError("Discard this failed parallel capture")
+        if getattr(owner, "_preparation_failed", False):
+            raise RuntimeError("Discard this graph after failed preparation")
         if device.captures.get(stream) is not owner:
             raise RuntimeError("Parallel callback changed the Warp capture owner")
         status, identity, graph = ct.c_int(), ct.c_uint64(), pointer()
@@ -157,12 +161,12 @@ def capture_parallel(branches, *, stream=None):
             joined.update(tails)
         replace(tuple(sorted(joined)) if branches else prefix)
     except BaseException:
-        owner._parallel_capture_failed = True
+        owner._preparation_failed = True
         raise
 
 
 class DeviceGraphUpdates:
-    """Own one prepared descriptor table and its count input; bind once to one graph.
+    """Own one prepared descriptor table and borrow its enable-count input; bind once to one graph.
 
     Enable counts, launch extents and scalar parameters have explicit independent
     sources. Omitting an extent axis preserves a grid-stride kernel's worker grid.
@@ -170,31 +174,35 @@ class DeviceGraphUpdates:
     CUDA blocks, and four int32 scalar parameters per kernel. Unsupported bindings
     fail during preparation. Invalid sources disable their nodes and report errors;
     the caller owns domain-wide validation and gates unbound work too.
+    Irreversible preparation failures quarantine the shared graph, including its
+    other updater owners. Discard it; catching the exception does not permit replay.
+    Every registered consumer and recorded updater must be bound before instantiation.
     """
 
-    def __init__(self, count, *, maximum: int, capacity_nodes: int, library=None):
+    def __init__(self, enable_count, *, enable_count_maximum: int, binding_capacity: int, library=None):
         if (
-            count.shape != (1,)
-            or count.dtype != wp.int32
-            or not count.device.is_cuda
-            or not count.is_contiguous
-            or not getattr(count, "ptr", None)
+            getattr(enable_count, "shape", None) != (1,)
+            or getattr(enable_count, "dtype", None) != wp.int32
+            or not enable_count.device.is_cuda
+            or not enable_count.is_contiguous
+            or not getattr(enable_count, "ptr", None)
         ):
             raise ValueError("Count must be one contiguous CUDA int32 scalar")
-        if type(maximum) is not int or not 1 <= maximum < 2**31:
+        if type(enable_count_maximum) is not int or not 1 <= enable_count_maximum < 2**31:
             raise ValueError("Prepared enable-count maximum must be positive int32")
-        if type(capacity_nodes) is not int or capacity_nodes < 1:
-            raise ValueError("Descriptor capacity must be positive")
-        self.count, self.maximum, self.device, self.capacity_nodes = count, maximum, count.device, capacity_nodes
+        if type(binding_capacity) is not int or not 1 <= binding_capacity < 2**31:
+            raise ValueError("Descriptor capacity must be positive int32")
+        self.enable_count, self.enable_count_maximum = enable_count, enable_count_maximum
+        self.device, self.binding_capacity = enable_count.device, binding_capacity
         self._graph = None
         self._capture_owner = None
         self._captured_nodes = {}
         self._instantiation_attempted = False
         self._library = self._load_library(library)
-        self.binding_bytes = self._library.binding_size()
-        self.bindings = wp.zeros(capacity_nodes * self.binding_bytes, dtype=wp.uint8, device=self.device)
+        self.binding_stride_bytes = self._library.binding_size()
+        self.bindings = wp.zeros(binding_capacity * self.binding_stride_bytes, dtype=wp.uint8, device=self.device)
         self.binding_count = wp.zeros(1, dtype=int, device=self.device)
-        self.errors = wp.zeros(capacity_nodes, dtype=int, device=self.device)
+        self.errors = wp.zeros(binding_capacity, dtype=int, device=self.device)
 
     def _load_library(self, library):
         source = Path(__file__).with_suffix(".cu")
@@ -217,7 +225,7 @@ class DeviceGraphUpdates:
                     compiler = os.environ.get("CUDACXX") or shutil.which("nvcc") or str(toolkit / "bin" / "nvcc")
                     if not Path(compiler).is_file():
                         raise RuntimeError(
-                            "MuJoCoWorlds needs a CUDA toolkit to prepare its graph bridge; provide nvcc "
+                            "Device graph updates need a CUDA toolkit to prepare its graph bridge; provide nvcc "
                             "through CUDACXX/CUDA_HOME or a prepared NEWTON_CUDA_GRAPH_LIBRARY"
                         )
                     temporary = cache / f"{fingerprint}.{os.getpid()}.tmp.so"
@@ -247,7 +255,7 @@ class DeviceGraphUpdates:
         lib = ct.CDLL(str(Path(library).resolve()))
         pointer = ct.c_void_p
         lib.binding_size.restype = ct.c_size_t
-        lib.capture_tail.argtypes = [pointer, ct.POINTER(pointer), ct.POINTER(pointer)]
+        lib.get_last_kernel_node.argtypes = [pointer, ct.POINTER(pointer), ct.POINTER(pointer)]
         lib.validate_node_owner.argtypes = [pointer, pointer]
         lib.prepare_binding.argtypes = [
             pointer,
@@ -261,58 +269,73 @@ class DeviceGraphUpdates:
             pointer,
         ]
         lib.launch_update.argtypes = [pointer, pointer, pointer, pointer, ct.c_int, pointer, ct.c_int]
-        lib.instantiate_upload.argtypes = [pointer, pointer, ct.c_uint64, ct.POINTER(pointer)]
+        lib.instantiate_and_upload.argtypes = [pointer, pointer, ct.c_uint64, ct.POINTER(pointer)]
         return lib
 
-    def capture_tail(self, stream=None) -> int:
-        """Get the exact just-recorded kernel node, including inside a conditional body."""
+    def register_last_kernel_node(self, stream=None) -> int:
+        """Retrieve and register the emitted kernel node, including in a conditional body."""
         stream = wp.get_stream(self.device) if stream is None else stream
         if stream.device != self.device:
             raise ValueError("Capture stream must use the count device")
         owner = self.device.captures.get(stream)
-        if getattr(owner, "_parallel_capture_failed", False):
-            raise RuntimeError("Discard this failed parallel capture")
+        if getattr(owner, "_preparation_failed", False):
+            raise RuntimeError("Discard this graph after failed preparation")
         if self._capture_owner is None or self._capture_owner() is not owner or owner is None:
             raise RuntimeError("Capture nodes only after this owner's updater in the same Warp graph")
         if self._graph is not None:
             raise RuntimeError("Cannot add nodes after binding preparation")
         node, graph = ct.c_void_p(), ct.c_void_p()
-        _check(self._library.capture_tail(stream.cuda_stream, ct.byref(node), ct.byref(graph)), "capture kernel tail")
-        self._captured_nodes[node.value] = graph.value
+        try:
+            _check(
+                self._library.get_last_kernel_node(stream.cuda_stream, ct.byref(node), ct.byref(graph)),
+                "capture kernel tail",
+            )
+            self._captured_nodes[node.value] = graph.value
+        except BaseException:
+            owner._preparation_failed = True
+            raise
         return node.value
 
-    def capture_update(self, stream=None):
+    def record_update(self, stream=None):
         """Record the GPU updater before its bound consumers; allocate nothing during capture."""
         stream = wp.get_stream(self.device) if stream is None else stream
         if stream.device != self.device:
             raise ValueError("Update stream must use the count device")
         owner = self.device.captures.get(stream)
-        if getattr(owner, "_parallel_capture_failed", False):
-            raise RuntimeError("Discard this failed parallel capture")
+        if getattr(owner, "_preparation_failed", False):
+            raise RuntimeError("Discard this graph after failed preparation")
         if owner is None:
             raise RuntimeError("Record updates inside a Warp-managed graph capture")
         if self._capture_owner is not None:
             raise RuntimeError("Record this owner's updater exactly once")
-        _check(
-            self._library.launch_update(
-                stream.cuda_stream,
-                self.bindings.ptr,
-                self.binding_count.ptr,
-                self.count.ptr,
-                self.maximum,
-                self.errors.ptr,
-                self.capacity_nodes,
-            ),
-            "record GPU updates",
-        )
-        # Warp retains this same Graph object while swapping its native handle for
-        # conditional bodies. Retain identity, not the changing capture ID/handle.
-        self._capture_owner = weakref.ref(owner)
+        # The emitted updater already borrows these arrays, even before its
+        # consumers are bound. The graph's resource list also records every
+        # updater that must finish preparation before publication.
+        owner._resource_owners = (*getattr(owner, "_resource_owners", ()), self, self.enable_count)
+        try:
+            _check(
+                self._library.launch_update(
+                    stream.cuda_stream,
+                    self.bindings.ptr,
+                    self.binding_count.ptr,
+                    self.enable_count.ptr,
+                    self.enable_count_maximum,
+                    self.errors.ptr,
+                    self.binding_capacity,
+                ),
+                "record GPU updates",
+            )
+            # Warp retains this Graph object while swapping its native handle for
+            # conditional bodies. Retain identity, not a changing capture handle.
+            self._capture_owner = weakref.ref(owner)
+        except BaseException:
+            owner._preparation_failed = True
+            raise
 
     def bind(self, graph, bindings):
         """Mark and bind exact semantic nodes before first instantiation; discard graph if this fails."""
-        if getattr(graph, "_parallel_capture_failed", False):
-            raise RuntimeError("Discard this failed parallel capture")
+        if getattr(graph, "_preparation_failed", False):
+            raise RuntimeError("Discard this graph after failed preparation")
         bindings = tuple(bindings)
         if self._graph is not None or graph.graph_exec is not None:
             raise RuntimeError("Bindings require a fresh graph and can be prepared only once")
@@ -320,29 +343,35 @@ class DeviceGraphUpdates:
             raise ValueError("Graph and count must share a device")
         if self._capture_owner is None or self._capture_owner() is not graph:
             raise ValueError("Bindings must belong to the graph that captured this owner's updater")
-        if not 1 <= len(bindings) <= self.capacity_nodes or len({b.node for b in bindings}) != len(bindings):
+        if any(not isinstance(binding, GraphKernelBinding) for binding in bindings):
+            raise TypeError("Bindings must be GraphKernelBinding descriptors")
+        if any(type(binding.node) is not int for binding in bindings):
+            raise ValueError("Kernel nodes must be integer CUDA handles")
+        if not 1 <= len(bindings) <= self.binding_capacity or len({b.node for b in bindings}) != len(bindings):
             raise ValueError("Bindings must fit capacity and identify distinct nodes")
+        if {binding.node for binding in bindings} != self._captured_nodes.keys():
+            raise ValueError("Bindings must cover every node registered by this updater exactly once")
         claims = getattr(graph, "device_node_owners", {})
         if any(binding.node in claims for binding in bindings):
             raise ValueError("A CUDA node already has a device update owner")
         for binding in bindings:
-            if type(binding.node) is not int or binding.node not in self._captured_nodes:
-                raise ValueError("Bindings must use exact nodes recorded by this owner's capture_tail")
-            if type(binding.rank) is not int or not 1 <= binding.rank <= 4:
+            if type(binding.launch_rank) is not int or not 1 <= binding.launch_rank <= 4:
                 raise ValueError("Invalid Warp launch rank")
             if binding.extent_axis is not None and (
-                type(binding.extent_axis) is not int or not 0 <= binding.extent_axis < binding.rank
+                type(binding.extent_axis) is not int or not 0 <= binding.extent_axis < binding.launch_rank
             ):
                 raise ValueError("Invalid Warp launch extent axis")
             if binding.extent_axis is None and binding.extent_source is not None:
                 raise ValueError("An unchanged launch cannot supply an extent source")
             if binding.extent_source is not None:
                 self._validate_source(binding.extent_source)
-            if len(binding.parameters) > 4 or any(not isinstance(p, Int32Parameter) for p in binding.parameters):
+            if len(binding.parameters) > 4 or any(
+                not isinstance(p, KernelParameterBinding) for p in binding.parameters
+            ):
                 raise ValueError("Only up to four explicit int32 count parameters are supported")
-            indices = [p.index for p in binding.parameters]
-            if any(type(i) is not int or i < 1 for i in indices) or len(set(indices)) != len(indices):
-                raise ValueError("Scalar parameter indices must be distinct positive integers")
+            indices = [p.argument_index for p in binding.parameters]
+            if any(type(i) is not int or not 1 <= i < 2**31 for i in indices) or len(set(indices)) != len(indices):
+                raise ValueError("Scalar parameter indices must be distinct positive int32 values")
             for parameter in binding.parameters:
                 if type(parameter.maximum) is not int or not 0 <= parameter.maximum < 2**31:
                     raise ValueError("Scalar parameter maximum must be nonnegative int32")
@@ -351,39 +380,43 @@ class DeviceGraphUpdates:
                 self._library.validate_node_owner(binding.node, self._captured_nodes[binding.node]),
                 "validate captured node owner",
             )
-        host = ct.create_string_buffer(self.capacity_nodes * self.binding_bytes)
+        host = ct.create_string_buffer(self.binding_capacity * self.binding_stride_bytes)
         # Marking nodes is irreversible, so retain preparation ownership even if a
         # later binding fails; this owner cannot be reused with another graph.
-        self._graph = weakref.ref(graph)
-        graph.device_node_owners = claims
-        claims.update((binding.node, self) for binding in bindings)
-        sources = tuple(p.source for binding in bindings for p in binding.parameters)
-        sources += tuple(binding.extent_source for binding in bindings if binding.extent_source is not None)
-        graph.world_owners = (*getattr(graph, "world_owners", ()), self, self.count, *sources)
-        for ordinal, binding in enumerate(bindings):
-            parameters = binding.parameters
-            scalars = (ct.c_int * len(parameters))(*(p.index for p in parameters))
-            pointers = (ct.c_void_p * len(parameters))(*(p.source.ptr for p in parameters))
-            maxima = (ct.c_int * len(parameters))(*(p.maximum for p in parameters))
-            axis = -1 if binding.extent_axis is None else binding.extent_axis
-            extent = binding.extent_source if binding.extent_source is not None else self.count
-            _check(
-                self._library.prepare_binding(
-                    binding.node,
-                    binding.rank,
-                    axis,
-                    extent.ptr,
-                    scalars,
-                    pointers,
-                    maxima,
-                    len(parameters),
-                    ct.byref(host, ordinal * self.binding_bytes),
-                ),
-                f"prepare binding {ordinal}",
-            )
-        self.bindings.assign(np.frombuffer(host.raw, dtype=np.uint8))
-        self.binding_count.fill_(len(bindings))
-        self.prepared_bindings = bindings
+        try:
+            self._graph = weakref.ref(graph)
+            graph.device_node_owners = claims
+            claims.update((binding.node, self) for binding in bindings)
+            sources = tuple(p.source for binding in bindings for p in binding.parameters)
+            sources += tuple(binding.extent_source for binding in bindings if binding.extent_source is not None)
+            graph._resource_owners = (*getattr(graph, "_resource_owners", ()), *sources)
+            for ordinal, binding in enumerate(bindings):
+                parameters = binding.parameters
+                scalars = (ct.c_int * len(parameters))(*(p.argument_index for p in parameters))
+                pointers = (ct.c_void_p * len(parameters))(*(p.source.ptr for p in parameters))
+                maxima = (ct.c_int * len(parameters))(*(p.maximum for p in parameters))
+                axis = -1 if binding.extent_axis is None else binding.extent_axis
+                extent = binding.extent_source if binding.extent_source is not None else self.enable_count
+                _check(
+                    self._library.prepare_binding(
+                        binding.node,
+                        binding.launch_rank,
+                        axis,
+                        extent.ptr,
+                        scalars,
+                        pointers,
+                        maxima,
+                        len(parameters),
+                        ct.byref(host, ordinal * self.binding_stride_bytes),
+                    ),
+                    f"prepare binding {ordinal}",
+                )
+            self.bindings.assign(np.frombuffer(host.raw, dtype=np.uint8))
+            self.binding_count.fill_(len(bindings))
+            self.prepared_bindings = bindings
+        except BaseException:
+            graph._preparation_failed = True
+            raise
 
     def _validate_source(self, source):
         if (
@@ -395,12 +428,18 @@ class DeviceGraphUpdates:
         ):
             raise ValueError("Each count source must be one contiguous int32 scalar on the binding device")
 
-    def instantiate_upload(self, graph, *, stream=None, flags=1):
+    def instantiate_and_upload(self, graph, *, stream=None, flags=1):
         """Instantiate once and upload explicitly; flags=1 matches Warp AutoFreeOnLaunch."""
-        if getattr(graph, "_parallel_capture_failed", False):
-            raise RuntimeError("Discard this failed parallel capture")
+        if getattr(graph, "_preparation_failed", False):
+            raise RuntimeError("Discard this graph after failed preparation")
         if self._graph is None or self._graph() is not graph or not hasattr(self, "prepared_bindings"):
             raise RuntimeError("Graph must have a successful binding preparation")
+        for owner in getattr(graph, "_resource_owners", ()):
+            if isinstance(owner, DeviceGraphUpdates) and owner._capture_owner is not None:
+                if owner._capture_owner() is graph and (
+                    owner._graph is None or owner._graph() is not graph or not hasattr(owner, "prepared_bindings")
+                ):
+                    raise RuntimeError("Every recorded updater must finish binding before graph instantiation")
         if graph.graph_exec is not None or self._instantiation_attempted:
             raise RuntimeError("A graph with device-updatable nodes can be instantiated only once")
         stream = wp.get_stream(self.device) if stream is None else stream
@@ -410,19 +449,23 @@ class DeviceGraphUpdates:
             raise ValueError("Instantiation flags must be an unsigned 64-bit integer")
         executable = ct.c_void_p()
         self._instantiation_attempted = True
-        _check(
-            self._library.instantiate_upload(graph.graph, stream.cuda_stream, flags, ct.byref(executable)),
-            "instantiate/upload graph",
-        )
+        try:
+            _check(
+                self._library.instantiate_and_upload(graph.graph, stream.cuda_stream, flags, ct.byref(executable)),
+                "instantiate/upload graph",
+            )
+        except BaseException:
+            graph._preparation_failed = True
+            raise
         # The experiment bridges a missing public Warp explicit-instantiation API.
         # Normal Warp Graph destruction owns both returned CUDA handles.
         graph.graph_exec = executable
 
     def memory_report(self):
         return {
-            "binding_capacity": self.capacity_nodes,
-            "binding_bytes": self.binding_bytes,
-            "enable_count_maximum": self.maximum,
+            "binding_capacity": self.binding_capacity,
+            "binding_stride_bytes": self.binding_stride_bytes,
+            "enable_count_maximum": self.enable_count_maximum,
             "prepared_nodes": len(getattr(self, "prepared_bindings", ())),
             "device_payload_bytes": self.bindings.capacity + self.binding_count.capacity + self.errors.capacity,
             "scope": "update table only; graph execution storage, modules and count owner excluded",

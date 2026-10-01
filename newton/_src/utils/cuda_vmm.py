@@ -5,7 +5,7 @@
 
 This owner knows bytes and CUDA dependencies, never worlds, tensors or kernels.
 The caller stops submissions before entering maintenance and joins every stream
-that can reference these regions. Pins retain virtual addresses across remaps;
+that can reference these reservations. References retain virtual addresses across remaps;
 they do not authorize touching an unmapped range.
 """
 
@@ -42,43 +42,43 @@ class _Access(ct.Structure):
 
 
 @dataclass(frozen=True)
-class Region:
+class VirtualReservation:
+    """Describe stable virtual bytes; physical mappings belong to MemoryBacking."""
+
     address: int
     size_bytes: int
     requested_bytes: int
 
 
-class CudaBacking:
+class MemoryBacking:
     """Own VMM reservations and handles in the already-current CUDA context.
 
-    ``driver`` is an optional callable(name, *ctypes_arguments) for failure tests;
-    it must raise on CUDA failures, exactly as the real driver binding does.
     No method pushes, sets, retains or creates a CUDA context. The caller owns
     that context and must keep it alive until this backing owner is closed.
     """
 
-    def __init__(self, budget_bytes: int, *, device_ordinal: int = 0, expected_uuid: str | None = None, driver=None):
+    def __init__(self, budget_bytes: int, *, device_ordinal: int = 0, expected_uuid: str | None = None):
         if sys.version_info < (3, 11):
             raise RuntimeError("Experimental CUDA backing requires Python 3.11 or newer")
-        if not isinstance(budget_bytes, int) or not 0 <= budget_bytes <= _MAX_SIZE:
+        if type(budget_bytes) is not int or not 0 <= budget_bytes <= _MAX_SIZE:
             raise ValueError("budget_bytes must fit a nonnegative CUDA size_t")
-        if not isinstance(device_ordinal, int) or not 0 <= device_ordinal < 2**31:
+        if type(device_ordinal) is not int or not 0 <= device_ordinal < 2**31:
             raise ValueError("device_ordinal must fit a nonnegative CUDA device index")
         self._budget_bytes = budget_bytes
         self._lock = threading.RLock()
-        self._regions: dict[int, Region] = {}
-        self._pins: dict[int, int] = {}
+        self._reservations: dict[int, VirtualReservation] = {}
+        self._references: dict[int, int] = {}
         self._pages: dict[int, dict[int, int]] = {}
         self._handles: set[int] = set()
         self._free: list[int] = []
         self._maintenance_thread = None
         self._closed = False
-        self._driver = driver if driver is not None else self._load_driver()
+        self._driver = self._load_driver()
         self._driver("cuInit", 0)
         context, device, current_device = ct.c_void_p(), ct.c_int(), ct.c_int()
         self._driver("cuCtxGetCurrent", ct.byref(context))
         if not context.value:
-            raise RuntimeError("CudaBacking requires an already-current CUDA context")
+            raise RuntimeError("MemoryBacking requires an already-current CUDA context")
         self._context = context.value
         context_id = ct.c_uint64()
         self._driver("cuCtxGetId", context, ct.byref(context_id))
@@ -152,11 +152,11 @@ class CudaBacking:
 
     def _check(self, maintenance=False):
         if self._closed:
-            raise RuntimeError("CudaBacking is closed")
+            raise RuntimeError("MemoryBacking is closed")
         context = ct.c_void_p()
         self._driver("cuCtxGetCurrent", ct.byref(context))
         if context.value != self._context:
-            raise RuntimeError("CudaBacking requires its original CUDA context to be current")
+            raise RuntimeError("MemoryBacking requires its original CUDA context to be current")
         context_id = ct.c_uint64()
         self._driver("cuCtxGetId", context, ct.byref(context_id))
         if context_id.value != self._context_id:
@@ -164,18 +164,21 @@ class CudaBacking:
         if maintenance and self._maintenance_thread != threading.get_ident():
             raise RuntimeError("Mapping and retirement require an explicit maintenance scope")
 
-    def _validate_region(self, region):
-        if not isinstance(region, Region) or self._regions.get(region.address) is not region:
-            raise ValueError("Region is foreign or has already been released")
+    def _validate_reservation(self, reservation):
+        if (
+            not isinstance(reservation, VirtualReservation)
+            or self._reservations.get(reservation.address) is not reservation
+        ):
+            raise ValueError("VirtualReservation is foreign or has already been released")
 
-    def _range(self, region, offset, nbytes):
-        self._validate_region(region)
-        if not isinstance(offset, int) or not isinstance(nbytes, int):
+    def _range(self, reservation, offset, nbytes):
+        self._validate_reservation(reservation)
+        if type(offset) is not int or type(nbytes) is not int:
             raise ValueError("Mapping offsets and sizes must be integers")
         unit = self.granularity_bytes
-        if offset < 0 or nbytes <= 0 or offset % unit or nbytes % unit or offset + nbytes > region.size_bytes:
-            raise ValueError("Range must be positive, granule aligned and contained in its region")
-        return range(region.address + offset, region.address + offset + nbytes, unit)
+        if offset < 0 or nbytes <= 0 or offset % unit or nbytes % unit or offset + nbytes > reservation.size_bytes:
+            raise ValueError("Range must be positive, granule aligned and contained in its reservation")
+        return range(reservation.address + offset, reservation.address + offset + nbytes, unit)
 
     @contextmanager
     def maintenance(self, *, streams=(), events=()):
@@ -206,11 +209,11 @@ class CudaBacking:
             finally:
                 self._maintenance_thread = None
 
-    def reserve(self, nbytes: int) -> Region:
+    def reserve(self, nbytes: int) -> VirtualReservation:
         """Reserve virtual bytes only; this operation consumes no physical budget."""
         with self._lock:
             self._check()
-            if not isinstance(nbytes, int) or not 0 < nbytes <= _MAX_SIZE:
+            if type(nbytes) is not int or not 0 < nbytes <= _MAX_SIZE:
                 raise ValueError("Reservation size must fit a positive CUDA size_t")
             unit = self.granularity_bytes
             size = ((nbytes + unit - 1) // unit) * unit
@@ -218,29 +221,29 @@ class CudaBacking:
                 raise ValueError("Rounded reservation size exceeds CUDA size_t")
             address = ct.c_uint64()
             self._driver("cuMemAddressReserve", ct.byref(address), size, unit, 0, 0)
-            region = Region(address.value, size, nbytes)
-            self._regions[region.address] = region
-            self._pins[region.address] = 0
-            self._pages[region.address] = {}
-            return region
+            reservation = VirtualReservation(address.value, size, nbytes)
+            self._reservations[reservation.address] = reservation
+            self._references[reservation.address] = 0
+            self._pages[reservation.address] = {}
+            return reservation
 
-    def pin(self, region: Region):
+    def acquire_reference(self, reservation: VirtualReservation):
         """Retain the VA while an external view or graph can still refer to it."""
         with self._lock:
             self._check()
-            self._validate_region(region)
-            self._pins[region.address] += 1
+            self._validate_reservation(reservation)
+            self._references[reservation.address] += 1
 
-    def unpin(self, region: Region):
+    def release_reference(self, reservation: VirtualReservation):
         # A Python view deleter can run without a current CUDA context. Decrement
         # metadata only; actual CUDA retirement still requires maintenance.
         with self._lock:
-            self._validate_region(region)
-            if self._pins[region.address] == 0:
-                raise RuntimeError("Region has no pin to release")
-            self._pins[region.address] -= 1
+            self._validate_reservation(reservation)
+            if self._references[reservation.address] == 0:
+                raise RuntimeError("VirtualReservation has no reference to release")
+            self._references[reservation.address] -= 1
 
-    def map(self, region: Region, offset: int, nbytes: int):
+    def map(self, reservation: VirtualReservation, offset: int, nbytes: int):
         """Back an entirely unmapped range, rolling back on allocation/map failure.
 
         Physical memory is uninitialized. The caller initializes new state before
@@ -248,8 +251,8 @@ class CudaBacking:
         errors and the ledger continues to own every surviving map and handle.
         """
         self._check(maintenance=True)
-        addresses = self._range(region, offset, nbytes)
-        pages = self._pages[region.address]
+        addresses = self._range(reservation, offset, nbytes)
+        pages = self._pages[reservation.address]
         if any(address in pages for address in addresses):
             raise ValueError("Map range overlaps an existing mapping")
         unit = self.granularity_bytes
@@ -273,13 +276,13 @@ class CudaBacking:
                 pages[address] = handle
                 mapped.append(address)
                 self._driver("cuMemSetAccess", address, unit, ct.byref(self._access), 1)
-        except Exception as failure:
+        except BaseException as failure:
             cleanup_errors = []
             for address in reversed(mapped):
                 try:
                     self._driver("cuMemUnmap", address, unit)
                     del pages[address]
-                except Exception as error:
+                except BaseException as error:
                     cleanup_errors.append(error)
             still_mapped = set(pages.values())
             for handle in acquired:
@@ -290,16 +293,16 @@ class CudaBacking:
                         self._driver("cuMemRelease", handle)
                         self._handles.remove(handle)
                         continue
-                    except Exception as error:
+                    except BaseException as error:
                         cleanup_errors.append(error)
                 self._free.append(handle)
             if cleanup_errors:
-                raise ExceptionGroup(
+                raise BaseExceptionGroup(
                     "Mapping failed and rollback was incomplete", [failure, *cleanup_errors]
                 ) from failure
             raise
 
-    def unmap(self, region: Region, offset: int, nbytes: int):
+    def unmap(self, reservation: VirtualReservation, offset: int, nbytes: int):
         """Return mapped granules to the shared physical pool; retain the VA.
 
         A driver error can leave a partially unmapped range. Completed operations
@@ -308,27 +311,27 @@ class CudaBacking:
         or retry within maintenance before publishing those ranges as ready again.
         """
         self._check(maintenance=True)
-        addresses = self._range(region, offset, nbytes)
-        pages = self._pages[region.address]
+        addresses = self._range(reservation, offset, nbytes)
+        pages = self._pages[reservation.address]
         if any(address not in pages for address in addresses):
             raise ValueError("Unmap range contains an unmapped granule")
         for address in addresses:
             self._driver("cuMemUnmap", address, self.granularity_bytes)
             self._free.append(pages.pop(address))
 
-    def release(self, region: Region):
-        """Release one unpinned reservation, retaining its backing in the pool."""
+    def release_reservation(self, reservation: VirtualReservation):
+        """Release one unreferenced reservation, retaining its backing in the pool."""
         self._check(maintenance=True)
-        self._validate_region(region)
-        if self._pins[region.address]:
-            raise RuntimeError("Cannot release a region retained by external views or graphs")
-        addresses = tuple(self._pages[region.address])
+        self._validate_reservation(reservation)
+        if self._references[reservation.address]:
+            raise RuntimeError("Cannot release a reservation retained by external views or graphs")
+        addresses = tuple(self._pages[reservation.address])
         for address in addresses:
-            self.unmap(region, address - region.address, self.granularity_bytes)
-        self._driver("cuMemAddressFree", region.address, region.size_bytes)
-        del self._regions[region.address]
-        del self._pins[region.address]
-        del self._pages[region.address]
+            self.unmap(reservation, address - reservation.address, self.granularity_bytes)
+        self._driver("cuMemAddressFree", reservation.address, reservation.size_bytes)
+        del self._reservations[reservation.address]
+        del self._references[reservation.address]
+        del self._pages[reservation.address]
 
     def trim(self, *, keep_bytes: int = 0):
         """Release spare handles, retaining the requested reserve when available.
@@ -353,18 +356,18 @@ class CudaBacking:
         if errors:
             raise ExceptionGroup("Some spare CUDA handles could not be released", errors)
 
-    def mapped_ranges(self, region: Region) -> tuple[tuple[int, int], ...]:
+    def mapped_ranges(self, reservation: VirtualReservation) -> tuple[tuple[int, int], ...]:
         """Return coalesced (byte offset, size) mappings from the owner's ledger.
 
         This host query does not imply initialized contents, successfully granted
         access after a failed transaction, or eligibility for simulation work.
         """
         with self._lock:
-            self._validate_region(region)
-            addresses = sorted(self._pages[region.address])
+            self._validate_reservation(reservation)
+            addresses = sorted(self._pages[reservation.address])
             ranges = []
             for address in addresses:
-                offset = address - region.address
+                offset = address - reservation.address
                 if ranges and ranges[-1][0] + ranges[-1][1] == offset:
                     start, size = ranges[-1]
                     ranges[-1] = (start, size + self.granularity_bytes)
@@ -388,17 +391,17 @@ class CudaBacking:
             return {
                 "budget_bytes": self.budget_bytes,
                 "granularity_bytes": unit,
-                "virtual_reserved_bytes": sum(region.size_bytes for region in self._regions.values()),
+                "virtual_reserved_bytes": sum(reservation.size_bytes for reservation in self._reservations.values()),
                 "physical_retained_bytes": len(self._handles) * unit,
                 "mapped_bytes": mapped_count * unit,
                 "spare_bytes": len(self._free) * unit,
-                "regions": len(self._regions),
-                "pins": sum(self._pins.values()),
+                "reservations": len(self._reservations),
+                "references": sum(self._references.values()),
                 "closed": self._closed,
             }
 
     def close(self):
-        """Retire all reservations and handles after views/graphs release their pins.
+        """Retire all reservations and handles after views/graphs release their references.
 
         Must run inside maintenance. Idempotent after successful closure. Driver
         errors preserve remaining ownership so a later maintenance scope can retry.
@@ -406,12 +409,12 @@ class CudaBacking:
         if self._closed:
             return
         self._check(maintenance=True)
-        if any(self._pins.values()):
-            raise RuntimeError("Cannot close backing while external views or graphs retain regions")
+        if any(self._references.values()):
+            raise RuntimeError("Cannot close backing while external views or graphs retain reservations")
         errors = []
-        for region in tuple(self._regions.values()):
+        for reservation in tuple(self._reservations.values()):
             try:
-                self.release(region)
+                self.release_reservation(reservation)
             except Exception as error:
                 errors.append(error)
         try:
