@@ -739,6 +739,30 @@ class FieldStorageTests(unittest.TestCase):
         rows.fill(rows.arrays["q"], -1.5)
         self.wp.device.is_capturing = False
 
+    def test_fill_pattern_identity_uses_typed_bytes_not_value_repr(self):
+        """Distinct vector bytes cannot alias; equivalent typed values share capture-ready storage."""
+        rows = storage.FieldStorage(
+            2, FakeArray([2], dtype=int), fields=(storage.FieldSpec("value", (), real_wp.vec3d),)
+        )
+        self.rows.append(rows)
+        first = np.array([1.000000001, 2.0, 3.0], dtype=np.float64)
+        second = np.array([1.000000002, 2.0, 3.0], dtype=np.float64)
+        with np.printoptions(precision=8):
+            self.assertEqual(repr(first), repr(second))
+        with patch.object(self.wp, "full", side_effect=real_wp.full):
+            a = rows.prepare_fill(rows.arrays["value"], first)
+            b = rows.prepare_fill(rows.arrays["value"], second)
+            self.assertEqual(a.numpy().tobytes(), first.tobytes())
+            self.assertEqual(b.numpy().tobytes(), second.tobytes())
+            self.assertIsNot(a, b)
+            allocations = self.wp.calls.get("array", 0)
+            self.wp.device.is_capturing = True
+            self.assertNotEqual(repr(first), repr(tuple(first)))
+            self.assertIs(rows.prepare_fill(rows.arrays["value"], tuple(first)), a)
+            self.assertIs(rows.prepare_fill(rows.arrays["value"], list(second)), b)
+            self.assertEqual(self.wp.calls.get("array", 0), allocations)
+            self.wp.device.is_capturing = False
+
     def test_fill_validates_explicit_count_and_overrides_live_count(self):
         """Verify fill validates explicit count and overrides live count."""
         rows, _, _, _ = self.create()
@@ -883,6 +907,35 @@ class FieldStorageGPU(unittest.TestCase):
         real_wp.init()
         if not real_wp.get_cuda_devices():
             raise unittest.SkipTest("Field storage requires CUDA")
+
+    def test_fill_replay_distinguishes_equal_repr_vectors_and_reuses_equivalent_values(self):
+        """Capture keeps distinct typed vectors and reuses patterns without device allocation."""
+        wp = real_wp
+        first = np.array([1.000000001, 2.0, 3.0], dtype=np.float64)
+        second = np.array([1.000000002, 2.0, 3.0], dtype=np.float64)
+        with np.printoptions(precision=8):
+            self.assertEqual(repr(first), repr(second))
+        with wp.ScopedDevice("cuda:0"):
+            count = wp.array([3], dtype=int)
+            fields = tuple(storage.FieldSpec(name, (), wp.vec3d) for name in ("first", "second"))
+            rows = storage.FieldStorage(3, count, fields=fields)
+            a = rows.prepare_fill(rows.arrays["first"], first)
+            b = rows.prepare_fill(rows.arrays["second"], second)
+            self.assertIsNot(a, b)
+            wp.load_module(module=storage.__name__)
+            with wp.ScopedCapture(capture_mode=wp.CaptureMode.THREAD_LOCAL) as capture:
+                self.assertIs(rows.prepare_fill(rows.arrays["first"], list(first)), a)
+                self.assertIs(rows.prepare_fill(rows.arrays["second"], tuple(second)), b)
+                rows.fill(rows.arrays["first"], list(first))
+                rows.fill(rows.arrays["second"], tuple(second))
+            graph = rows.retain_graph(capture.graph)
+            capture.graph = None
+            wp.capture_launch(graph)
+            for name, expected in (("first", first), ("second", second)):
+                self.assertEqual(rows.arrays[name].numpy().tobytes(), np.tile(expected, (3, 1)).tobytes())
+            graph = a = b = None
+            gc.collect()
+            rows.close(streams=(wp.get_stream().cuda_stream,))
 
     def test_explicit_alignment_supports_vectorized_tiles_after_unmap_and_regrow(self):
         """Verify explicit alignment supports vectorized tiles after unmap and regrow."""
