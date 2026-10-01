@@ -14,6 +14,13 @@ The consuming application owns prototype preparation, controls, initialization p
 - MJWarp owns `StepBindings` and the prepared native workspace. One shared bindings record borrows the world, candidate and CCD storage domains and owns the stage-binding ledger. Newton does not duplicate that ledger or failure state.
 - Native MJWarp `Data` is the authoritative physical state. There is no dense Newton `State` mirror.
 
+`mjw.array_fields(model_or_data)` yields native paths, borrowed arrays and their declared
+dimensions. `mjw.replace_arrays(template, arrays)` binds replacement arrays without copying
+payload or assigning readiness. MJWarp owns this representation; Newton consumes its
+`nworld`/`naconmax` axes to allocate storage, then changes scalar capacities explicitly with
+`dataclasses.replace`. Numerical extents never determine capacity domains, and an array
+appearing at two native paths does not acquire a second allocation owner.
+
 MJWarp declares native scratch element types and dimensions. GPU Components supplies
 `StridedLayout`, packing, binding and descriptor validation for both fixed scratch
 and growable `FieldStorage`. The workspace is a passive record; MJWarp's preparation,

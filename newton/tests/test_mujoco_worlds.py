@@ -80,6 +80,16 @@ class MuJoCoWorldsHostTests(unittest.TestCase):
             self.assertFalse((root / name).exists(), name)
         self.assertNotIn("worlds", newton.__all__)
         source = ast.parse(inspect.getsource(native))
+        self.assertFalse({"_data_arrays", "_replace_data"} & vars(native).keys())
+        self.assertFalse(
+            any(
+                isinstance(node, ast.ImportFrom)
+                and node.module == "dataclasses"
+                and {item.name for item in node.names} & {"fields", "is_dataclass"}
+                for node in ast.walk(source)
+            ),
+            "MJWarp owns enumeration and rebinding of its native records",
+        )
         generic_imports = [
             node
             for node in ast.walk(source)
@@ -164,7 +174,6 @@ assert 'worlds' not in newton.__all__
         )
         template = SimpleNamespace(nworld=1, qpos=model.qpos0, naconmax=1, naccdmax=1)
         with (
-            patch.dict(sys.modules, {"mujoco_warp": SimpleNamespace()}),
             patch.object(directory_ops, "allocate", side_effect=AssertionError("Unexpected directory allocation")),
             patch.object(field_ops, "allocate", side_effect=AssertionError("Unexpected field allocation")),
             patch.object(backing_ops, "prepare", side_effect=AssertionError("Unexpected virtual allocation")),
@@ -1153,6 +1162,7 @@ class PopulationRecorderTests(unittest.TestCase):
 
     def test_model_array_walk_includes_tuple_arrays_and_nested_tile_descriptors(self):
         """Account tuple-held model arrays without interpreting their shapes as world domains."""
+        import mujoco_warp as mjw
 
         @dataclass
         class Tile:
@@ -1165,7 +1175,7 @@ class PopulationRecorderTests(unittest.TestCase):
 
         first, second = wp.zeros(3, dtype=int, device="cpu"), wp.zeros(5, dtype=float, device="cpu")
         model = Model((first,), (Tile(second),))
-        fields = list(native._data_arrays(model))
+        fields = list(mjw.array_fields(model))
         self.assertEqual([name for name, _, _ in fields], ["body_tree[0]", "M_tiles[0].elements"])
         self.assertIs(fields[0][1], first)
         self.assertIs(fields[1][1], second)
@@ -1220,39 +1230,6 @@ class PopulationRecorderTests(unittest.TestCase):
             0,
             "Shared immutable model allocations must be counted once across populations",
         )
-
-    def test_array_discovery_and_rebinding_have_the_same_recursive_domain(self):
-        """Replace every discovered nested array without changing source containers or topology metadata."""
-
-        @dataclass
-        class Leaf:
-            values: wp.array[float]
-            label: int = 9
-
-        @dataclass
-        class Data:
-            nworld: int
-            nested: tuple
-            empty: list
-
-        original = wp.zeros(2, dtype=float, device="cpu")
-        source = Data(1, (Leaf(original), [original, (Leaf(original),)]), [])
-        expected = {"nested[0].values", "nested[1][0]", "nested[1][1][0].values"}
-        self.assertEqual({name for name, _, _ in native._data_arrays(source)}, expected)
-        replacements = {name: wp.ones(3, dtype=float, device="cpu") for name in expected}
-        replaced = native._replace_data(source, replacements, nworld=3)
-        self.assertEqual(replaced.nworld, 3)
-        self.assertEqual(source.nworld, 1)
-        self.assertIsInstance(replaced.nested, tuple)
-        self.assertIsInstance(replaced.nested[1], list)
-        self.assertEqual(replaced.empty, [])
-        for name, array, _ in native._data_arrays(replaced):
-            self.assertIs(array, replacements[name], name)
-        for _, array, _ in native._data_arrays(source):
-            self.assertIs(array, original)
-        self.assertEqual(replaced.nested[0].label, 9)
-        with self.assertRaisesRegex(ValueError, "unknown native array fields"):
-            native._replace_data(source, {"nested[2]": original})
 
     def test_recording_scope_clears_recorder_on_failure_and_keeps_controls_inside_if(self):
         """Verify recording scope clears recorder on failure and keeps controls inside if."""

@@ -10,7 +10,7 @@ Native Data is authoritative; this root owns no dense Newton State mirror.
 import sys
 import traceback
 import weakref
-from dataclasses import dataclass, field, fields, is_dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 import warp as wp
@@ -361,44 +361,6 @@ class _MuJoCoWorldPopulation:
             self.after_substep = None
 
 
-def _data_arrays(value, prefix="", axis=None):
-    """Walk declared array fields; only schema annotations identify capacity axes."""
-    if isinstance(value, wp.array):
-        yield prefix, value, axis
-    elif is_dataclass(value):
-        for descriptor in fields(value):
-            name = f"{prefix}.{descriptor.name}" if prefix else descriptor.name
-            shape = getattr(descriptor.type, "shape", ())
-            yield from _data_arrays(getattr(value, descriptor.name), name, shape[0] if shape else None)
-    elif isinstance(value, (tuple, list)):
-        for index, child in enumerate(value):
-            yield from _data_arrays(child, f"{prefix}[{index}]")
-
-
-def _replace_data(source, arrays, prefix="", **metadata):
-    """Rebind the same dataclass/tuple/list paths discovered by _data_arrays."""
-    if not prefix:
-        unknown = set(arrays) - {name for name, _, _ in _data_arrays(source)}
-        if unknown:
-            raise ValueError(f"Cannot bind unknown native array fields: {sorted(unknown)}")
-    if prefix in arrays:
-        return arrays[prefix]
-    if is_dataclass(source):
-        values = {
-            descriptor.name: _replace_data(
-                getattr(source, descriptor.name),
-                arrays,
-                f"{prefix}.{descriptor.name}" if prefix else descriptor.name,
-            )
-            for descriptor in fields(source)
-        }
-        values.update(metadata)
-        return replace(source, **values)
-    if isinstance(source, (tuple, list)):
-        return type(source)(_replace_data(child, arrays, f"{prefix}[{index}]") for index, child in enumerate(source))
-    return source
-
-
 class MuJoCoWorlds:
     """Run changing homogeneous populations of prepared MuJoCo world prototypes.
 
@@ -473,8 +435,8 @@ class MuJoCoWorlds:
         ):
             if template.nworld != 1 or template.qpos.device != device or model.qpos0.device != device:
                 raise ValueError("Native defaults must have one world on the model/population device")
-            for name, array, axis in _data_arrays(model):
-                if axis == "*" and array.size and array.shape[0] != 1:
+            for name, array, shape in mjw.array_fields(model):
+                if shape and shape[0] == "*" and array.size and array.shape[0] != 1:
                     raise ValueError(f"Prototype model parameters require one broadcast row: {name}")
             if type(initial) is not int or not 0 <= initial <= capacity:
                 raise ValueError("Initial world rows exceed capacity")
@@ -523,7 +485,8 @@ class MuJoCoWorlds:
                     # Candidate/contact fields use scalar loads and their declared natural alignment.
                     arrays, world_fields, contact_fields = {}, [], []
                     world_sources = {}
-                    for name, array, axis in _data_arrays(template):
+                    for name, array, shape in mjw.array_fields(template):
+                        axis = shape[0] if shape else None
                         if axis == "nworld":
                             if array.shape[0] == 0 and not array.size:
                                 arrays[name] = array
@@ -622,8 +585,8 @@ class MuJoCoWorlds:
                         -1,
                         count=group.contact_storage.ready_count,
                     )
-                    group.data = _replace_data(
-                        template, arrays, nworld=capacity, naconmax=contact_cap, naccdmax=ccd_cap
+                    group.data = replace(
+                        mjw.replace_arrays(template, arrays), nworld=capacity, naconmax=contact_cap, naccdmax=ccd_cap
                     )
                     field_ops.prepare_fill(group.world_storage, group.data.island_dofadr, model.nv)
                     field_ops.prepare_fill(group.world_storage, scratch["island_can_sleep"], 1)
@@ -1108,7 +1071,7 @@ class MuJoCoWorlds:
         for group in self._populations:
             globals_report = [{"field": name, "bytes": array.capacity} for name, array in group.global_arrays.items()]
             model_arrays = []
-            for name, array, _ in _data_arrays(group.model):
+            for name, array, _ in mjw.array_fields(group.model):
                 if array.size and array.ptr not in seen_models:
                     seen_models.add(array.ptr)
                     model_arrays.append({"field": name, "bytes": array.capacity})
