@@ -34,7 +34,7 @@ from gpu_components.directory_data import (
     InstanceStatus,
 )
 from gpu_components.field_data import FieldStorage
-from gpu_components.graph_data import GraphUpdateTable
+from gpu_components.graph_data import GraphKernelBinding, GraphUpdateTable
 
 import newton.solvers
 from newton._src.solvers.mujoco import worlds as native
@@ -111,6 +111,12 @@ class MuJoCoWorldsHostTests(unittest.TestCase):
         keywords = {item.arg: item.value for item in workspace_calls[0].keywords}
         self.assertEqual(ast.unparse(keywords["bindings"]), "group.step_bindings")
         self.assertFalse({"world_live_count", "recorder", "observer"} & keywords.keys())
+        record_source = ast.parse(textwrap.dedent(inspect.getsource(MuJoCoWorldPopulation.record_launch)))
+        calls = [ast.unparse(node.func) for node in ast.walk(record_source) if isinstance(node, ast.Call)]
+        self.assertEqual(calls.count("mjw.launch_step_kernel"), 1)
+        self.assertFalse(
+            {"wp.launch", "wp.launch_tiled", "mjw.bind_step_launch", "mjw.validate_step_launch"} & set(calls)
+        )
 
     def test_base_import_does_not_require_optional_native_components(self):
         """Base Newton must import even when standalone components and physics backends are unavailable."""
@@ -283,7 +289,7 @@ assert 'worlds' not in newton.__all__
                 raise RuntimeError("retirement failed")
 
         for name in ("workspace", "initialization_transfer", "compaction_transfer"):
-            setattr(group, name, SimpleNamespace(bindings=group, field_names=("qpos",), memory_report=lambda: {}))
+            setattr(group, name, SimpleNamespace(bindings=group, field_names=("qpos",)))
         for name in (
             "request_indices",
             "source_rows",
@@ -301,6 +307,7 @@ assert 'worlds' not in newton.__all__
             patch.object(field_ops, "close", side_effect=close_storage),
             patch.object(field_ops, "memory_report", side_effect=lambda owner: {"owner": owner.name}),
             patch.object(field_ops, "transfer_memory_report", return_value={}),
+            patch("mujoco_warp.step_workspace_memory_report", return_value={}),
         ):
             self.assertEqual(population.memory_report()["populations"][0]["retired_subowners"], [])
             with self.assertRaisesRegex(RuntimeError, "retirement failed"):
@@ -853,14 +860,32 @@ assert 'worlds' not in newton.__all__
 
 class PopulationRecorderTests(unittest.TestCase):
     def setUp(self):
-        """Replace native node association while keeping real stage declaration validation."""
+        """Mock the generic atomic launch boundary; retain real native declaration validation."""
         self.stream = Mock(is_capturing=True)
-        graph = Mock(device=wp.get_device("cpu"), _resource_owners=(), _preparation_failed=False)
-        capture = patch.dict(wp.get_device("cpu").captures, {self.stream: graph, None: graph})
+
+        class Capture:
+            pass
+
+        self.graph = Capture()
+        self.graph.device = wp.get_device("cpu")
+        capture = patch.object(graph_ops, "current_capture", return_value=self.graph)
         capture.start()
         self.addCleanup(capture.stop)
-        patcher = patch.object(graph_ops, "register_last_kernel_node", return_value=123)
-        self.association = patcher.start()
+
+        def emit(updates, kernel, dim, **kwargs):
+            dimensions = (dim,) if isinstance(dim, int) else dim
+            if not all(dimensions):
+                return None
+            return GraphKernelBinding(
+                123,
+                launch_rank=kernel.adj.kernel_dim,
+                extent_axis=kwargs["extent_axis"],
+                extent_source=kwargs["extent_source"],
+                parameters=kwargs["parameters"],
+            )
+
+        patcher = patch.object(graph_ops, "launch", side_effect=emit)
+        self.launch = patcher.start()
         self.addCleanup(patcher.stop)
 
     def group(self):
@@ -972,28 +997,42 @@ class PopulationRecorderTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "closed"):
             _ = view.data
 
-    def test_public_recording_combines_launch_and_binding_and_rejects_wrong_scope(self):
-        """Bind every application launch and reject recording outside its captured callback."""
-        group, kernel, calls = self.group()
+    def test_public_recording_delegates_atomic_native_launch_and_rejects_wrong_scope(self):
+        """Translate application names once and leave count resolution and emission with MJWarp."""
+        import mujoco_warp as mjw
+
+        group, kernel, _ = self.group()
         view = group.view
         group.workspace.bindings = group.step_bindings
-        self.association.side_effect = lambda *args, **kwargs: calls.append("bind") or 123
         with (
             patch.object(native.wp, "get_stream", return_value=self.stream),
-            patch.object(native.wp, "launch", side_effect=lambda *args, **kwargs: calls.append("launch")),
-            patch.object(native.wp, "launch_tiled", side_effect=lambda *args, **kwargs: calls.append("tiled")),
+            patch.object(mjw, "launch_step_kernel", wraps=mjw.launch_step_kernel) as native_launch,
+            patch.object(native.wp, "launch", side_effect=AssertionError("Newton bypassed atomic emission")),
+            patch.object(native.wp, "launch_tiled", side_effect=AssertionError("Newton bypassed atomic emission")),
         ):
             view.record_launch(kernel, (17, 17), domain="world", parameter_domains={"world_live_count": "world"})
-            self.assertEqual(calls, ["launch", "bind"])
+            native_launch.assert_called_once_with(
+                group.step_bindings,
+                kernel,
+                (17, 17),
+                inputs=(),
+                outputs=(),
+                extent_domain="world",
+                extent_axis=0,
+                parameter_domains={"world_live_count": "world"},
+                block_dim=0,
+                tiled=False,
+                device="cpu",
+            )
             self.assertIs(group.step_bindings.bindings[-1].extent_source, view.world_live_count)
             view.record_launch(kernel, (17, 17), domain="candidate", tiled=True, block_dim=32)
-            self.assertEqual(calls[-2:], ["tiled", "bind"])
             self.assertIs(group.step_bindings.bindings[-1].extent_source, view.contact_storage_ready_count)
-            before = list(calls)
+            self.assertTrue(self.launch.call_args.kwargs["tiled"])
+            self.assertEqual(self.launch.call_args.kwargs["block_dim"], 32)
             group.workspace.bindings = None
             with self.assertRaisesRegex(RuntimeError, "callback"):
                 view.record_launch(kernel, (17, 17), domain="world")
-            self.assertEqual(calls, before)
+            self.assertEqual(native_launch.call_count, 2)
         group.workspace.bindings = group.step_bindings
         with patch.object(native.wp, "get_stream", return_value=Mock(is_capturing=False)):
             with self.assertRaisesRegex(RuntimeError, "capture"):
@@ -1039,7 +1078,6 @@ class PopulationRecorderTests(unittest.TestCase):
         group.workspace.bindings = group.step_bindings
         with (
             patch.object(native.wp, "get_stream", return_value=self.stream),
-            patch.object(native.wp, "launch") as launch,
         ):
             for dim in ((0, 17), (17, 17)):
                 for options in (
@@ -1053,33 +1091,27 @@ class PopulationRecorderTests(unittest.TestCase):
                 ):
                     with self.subTest(dim=dim, options=options), self.assertRaises(ValueError):
                         group.view.record_launch(kernel, dim, **options)
-            launch.assert_not_called()
+            self.launch.assert_not_called()
             self.assertFalse(
                 group.step_bindings.recording_failed, "A preflight rejection emits nothing and may be corrected"
             )
             group.view.record_launch(kernel, (17, 17), domain="world")
-            launch.assert_called_once()
+            self.launch.assert_called_once()
         self.assertEqual(calls, [])
         self.assertEqual(len(group.step_bindings.bindings), 1)
 
-    def test_caught_post_emission_errors_still_invalidate_the_entire_population_program(self):
-        """The composition root cannot publish a graph whose callback swallowed a binding failure."""
+    def test_caught_atomic_emission_errors_still_invalidate_the_entire_population_program(self):
+        """A swallowed error from native emission prevents the composition root from publication."""
         import mujoco_warp as mjw
 
-        for failure in ("launch", "association", "native_schema"):
-            with self.subTest(failure=failure):
+        for error in (KeyboardInterrupt("emission"), ValueError("node association")):
+            with self.subTest(error=type(error).__name__):
                 group, kernel, _ = self.group()
-                self.association.side_effect = None
-                launch = Mock(side_effect=KeyboardInterrupt("emission") if failure == "launch" else None)
-                if failure == "association":
-                    self.association.side_effect = ValueError("node association")
+                self.launch.side_effect = error
 
-                def callback(view, group=group, kernel=kernel, failure=failure):
+                def callback(view, kernel=kernel):
                     try:
-                        if failure == "native_schema":
-                            mjw.bind_step_launch(group.step_bindings, kernel, (17, 17), "unknown")
-                        else:
-                            view.record_launch(kernel, (17, 17), domain="world")
+                        view.record_launch(kernel, (17, 17), domain="world")
                     except BaseException:
                         pass
 
@@ -1089,7 +1121,6 @@ class PopulationRecorderTests(unittest.TestCase):
                     patch.object(mjw, "kinematics"),
                     patch.object(native.wp, "capture_if", side_effect=lambda condition, on_true: on_true()),
                     patch.object(native.wp, "get_stream", return_value=self.stream),
-                    patch.object(native.wp, "launch", launch),
                     self.assertRaisesRegex(RuntimeError, "failed recording"),
                 ):
                     group.record_physics()
@@ -1107,18 +1138,17 @@ class PopulationRecorderTests(unittest.TestCase):
         kernel.adj.args = [SimpleNamespace(label=f"count_{index}", type=wp.int32) for index in range(5)]
         with (
             patch.object(native.wp, "get_stream", return_value=self.stream),
-            patch.object(native.wp, "launch") as launch,
         ):
             with self.assertRaisesRegex(ValueError, "at most four"):
                 group.view.record_launch(
                     kernel, 17, domain="world", parameter_domains={f"count_{index}": "world" for index in range(5)}
                 )
-            launch.assert_not_called()
+            self.launch.assert_not_called()
             self.assertFalse(group.step_bindings.recording_failed)
             group.view.record_launch(
                 kernel, 17, domain="world", parameter_domains={f"count_{index}": "world" for index in range(4)}
             )
-            launch.assert_called_once()
+            self.launch.assert_called_once()
         self.assertEqual(len(group.step_bindings.bindings[0].parameters), 4)
 
     def test_model_array_walk_includes_tuple_arrays_and_nested_tile_descriptors(self):
@@ -1141,7 +1171,7 @@ class PopulationRecorderTests(unittest.TestCase):
         self.assertIs(fields[1][1], second)
 
         scalar = wp.zeros(1, dtype=int, device="cpu")
-        storage = SimpleNamespace(memory_report=lambda: {}, protected_count=scalar, field_names=())
+        storage = SimpleNamespace(protected_count=scalar, field_names=())
         group = SimpleNamespace(
             model=model,
             world_storage=storage,
@@ -1176,6 +1206,7 @@ class PopulationRecorderTests(unittest.TestCase):
             patch.object(directory_ops, "memory_report", return_value={}),
             patch.object(field_ops, "memory_report", return_value={}),
             patch.object(field_ops, "transfer_memory_report", return_value={}),
+            patch("mujoco_warp.step_workspace_memory_report", return_value={}),
         ):
             report = population.memory_report()
         self.assertFalse({"groups", "health_metadata_bytes"} & report.keys())
@@ -1293,6 +1324,15 @@ def _initialize_payload(
 
 
 @wp.kernel
+def _record_convex_work(nccd: wp.array[int], nacon: wp.array[int], observed: wp.array[int]):
+    for pair in range(nccd.shape[0]):
+        if nccd[pair] > 0:
+            observed[0] = 1
+    if nacon[0] > 0:
+        observed[1] = 1
+
+
+@wp.kernel
 def _record_control(calls: wp.array[int]):
     calls[0] += 1
 
@@ -1347,18 +1387,25 @@ def _array(data, path):
     return data
 
 
-def _prototype(keys, mujoco, mjw):
-    """Prepare an asset-independent slider keyboard, mocap body and nonempty sites."""
+def _prototype(keys, mujoco, mjw, *, convex=False):
+    """Prepare slider keys with primitive or convex floor contacts, mocap and sites."""
+    key_geom = (
+        '<geom type="box" size="0.009 0.009 0.009" mass="0.01"/>'
+        if convex
+        else '<geom type="sphere" size="0.009" mass="0.01"/>'
+    )
+    floor_geom = '<geom type="box" size="2 2 0.1" pos="0 0 -0.1"/>' if convex else '<geom type="plane" size="2 2 0.1"/>'
+    height = 0.008 if convex else 0.011
     bodies = "".join(
-        f'<body name="key_{i}" pos="{(i % 6) * 0.025} {(i // 6) * 0.025} 0.011">'
+        f'<body name="key_{i}" pos="{(i % 6) * 0.025} {(i // 6) * 0.025} {height}">'
         '<joint type="slide" axis="0 0 1" limited="true" range="-0.006 0.015" damping="0.1"/>'
-        '<geom type="sphere" size="0.009" mass="0.01"/><site size="0.001" pos="0 0 0.009"/></body>'
+        f'{key_geom}<site size="0.001" pos="0 0 0.009"/></body>'
         for i in range(keys)
     )
     xml = (
         '<mujoco><option timestep="0.005" solver="Newton" integrator="implicitfast" cone="pyramidal" '
         'jacobian="sparse" iterations="30" ls_iterations="10"><flag sleep="enable" multiccd="disable"/></option>'
-        '<worldbody><geom type="plane" size="2 2 0.1"/>'
+        f"<worldbody>{floor_geom}"
         + bodies
         + '<body name="cursor" mocap="true" pos="1 0 1"><geom type="sphere" size="0.01" contype="0" '
         'conaffinity="0"/><site name="cursor_tip" size="0.001"/></body></worldbody></mujoco>'
@@ -1436,6 +1483,53 @@ class TestMuJoCoWorlds(unittest.TestCase):
                 Path(output).write_text(
                     json.dumps({"passed": True, "gpu_uuid": device.uuid, "cases": reports}, indent=2) + "\n"
                 )
+
+    @unittest.skipUnless(
+        os.environ.get("NEWTON_TEST_CUDA_UUID"), "Set an explicit CUDA UUID for native population tests"
+    )
+    def test_convex_scratch_survives_switch_compaction_and_regrowth(self):
+        """Exercise real box-box contacts through the borrowed scratch under fixed and VMM ownership."""
+        import mujoco
+        import mujoco_warp as mjw
+
+        wp.init()
+        device = wp.get_device("cuda:0")
+        self.assertEqual(wp.get_cuda_device_count(), 1)
+        self.assertEqual(device.uuid, os.environ["NEWTON_TEST_CUDA_UUID"])
+        self.assertEqual(os.environ.get("CUDA_VISIBLE_DEVICES"), device.uuid)
+        with wp.ScopedDevice(device):
+            prepared = [_prototype(keys, mujoco, mjw, convex=True) for keys in (2, 3)]
+            for model, data in prepared:
+                self.assertFalse(model.opt.disableflags & mjw.DisableBit.NATIVECCD)
+                self.assertGreater(int(data.nacon.numpy()[0]), 0, "The fixture must generate real convex contacts")
+            default_storage = [
+                {name: array.numpy()[0].copy() for name, array in _world_fields(data)} for _, data in prepared
+            ]
+            wp.load_module(module=__name__, device=device)
+            for storage in os.environ.get("NEWTON_TEST_STORAGE", "fixed,vmm").split(","):
+                with self.subTest(storage=storage):
+                    population = MuJoCoWorlds(
+                        prepared,
+                        world_capacities=(8, 8),
+                        id_capacity=4,
+                        command_capacity=4,
+                        memory_budget_bytes=64 * 1024**2 if storage == "vmm" else None,
+                        initial_world_ready_capacities=(0, 0) if storage == "vmm" else None,
+                    )
+                    graph = None
+                    try:
+                        report, graph = self._trace(population, prepared, default_storage, mjw, require_convex=True)
+                        self.assertEqual((report["graph_captures"], report["graph_recaptures"]), (1, 0))
+                    except BaseException as error:
+                        traceback.clear_frames(error.__traceback__)
+                        raise
+                    finally:
+                        graph = None  # noqa: F841 - Drop executable ownership before explicit storage close.
+                        gc.collect()
+                        population.close(streams=(wp.get_stream(device),))
+                    if population._backing is not None:
+                        ledger = backing_ops.memory_report(population._backing)
+                        self.assertEqual((ledger["mapped_bytes"], ledger["physical_retained_bytes"]), (0, 0))
 
     @unittest.skipUnless(
         os.environ.get("NEWTON_TEST_CUDA_UUID"), "Set an explicit CUDA UUID for native population tests"
@@ -1806,7 +1900,7 @@ class TestMuJoCoWorlds(unittest.TestCase):
                 gc.collect()
                 population.close(streams=(wp.get_stream(device),))
 
-    def _trace(self, population, prepared, default_storage, mjw):
+    def _trace(self, population, prepared, default_storage, mjw, *, require_convex=False):
         """Run independent lifetime-aware oracle rows and compare physical/derived fields."""
         device = population.device
         commands = directory_ops.allocate_commands(4, device=device)
@@ -1814,6 +1908,7 @@ class TestMuJoCoWorlds(unittest.TestCase):
         valid, offset = wp.ones(4, dtype=int, device=device), wp.zeros(4, dtype=float, device=device)
         permit = wp.zeros(1, dtype=int, device=device)
         counters = [(wp.zeros(2, dtype=int, device=device), wp.zeros(1, dtype=int, device=device)) for _ in range(2)]
+        convex_observed = [wp.zeros(2, dtype=int, device=device) for _ in prepared] if require_convex else []
         oracle = [mjw.replicate_data(data, 8) for _, data in prepared]
 
         def validate(c, request_status, consumed):
@@ -1848,17 +1943,38 @@ class TestMuJoCoWorlds(unittest.TestCase):
                 _record_substep, group.world_capacity, inputs=[group.data.overflow, sticky, calls], domain="world"
             )
 
-        graph = population.capture(
-            commands,
-            results,
-            permit=permit,
-            validate=validate,
-            initialize=initialize,
-            substeps=2,
-            before_step=before_step,
-            after_substep=after_substep,
-            retain=(valid, offset, permit, *(array for pair in counters for array in pair)),
-        )
+        probe = nullcontext()
+        if require_convex:
+            from mujoco_warp._src import collision_driver
+
+            narrowphase = collision_driver.convex_narrowphase
+            groups = {id(group.step_bindings): group.view for group in population._populations}
+
+            def record_convex_pass(*args, **kwargs):
+                narrowphase(*args, **kwargs)
+                group = groups[id(kwargs["bindings"])]
+                # Sleeping's incremental pass clears nccd again; sample before the next pass.
+                group.record_launch(
+                    _record_convex_work,
+                    1,
+                    inputs=[kwargs["scratch"].nccd, group.data.nacon, convex_observed[group.prototype_index]],
+                    domain=None,
+                    extent_axis=None,
+                )
+
+            probe = patch.object(collision_driver, "convex_narrowphase", side_effect=record_convex_pass)
+        with probe:
+            graph = population.capture(
+                commands,
+                results,
+                permit=permit,
+                validate=validate,
+                initialize=initialize,
+                substeps=2,
+                before_step=before_step,
+                after_substep=after_substep,
+                retain=(valid, offset, permit, *(array for pair in counters for array in pair), *convex_observed),
+            )
         graph_id = int(graph.graph_exec.value)
         addresses = [(group.data.qpos.ptr, group.data.site_xpos.ptr) for group in population.populations]
         for group in population.populations:
@@ -2009,6 +2125,10 @@ class TestMuJoCoWorlds(unittest.TestCase):
             previous = after
             self.assertEqual(graph_id, int(graph.graph_exec.value))
             self.assertEqual(addresses, [(g.data.qpos.ptr, g.data.site_xpos.ptr) for g in population.populations])
+        for prototype, observed in enumerate(convex_observed):
+            ccd, contacts = observed.numpy()
+            self.assertTrue(ccd, f"Prototype {prototype} must execute convex CCD during a collision pass")
+            self.assertTrue(contacts, f"Prototype {prototype} must produce contacts during a collision pass")
         # Rejected counts never expose their prefix to payload callbacks or mutate live state.
         before_results = results.status.numpy().copy()
         before_directory = {

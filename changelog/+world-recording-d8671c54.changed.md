@@ -1,0 +1,1 @@
+Route `MuJoCoWorldPopulation.record_launch` through MJWarp's atomic launch-and-binding operation and use its passive prepared workspace. Application callbacks keep the same public interface; scratch layout and graph resource ownership are supplied by GPU Components.

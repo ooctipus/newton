@@ -267,16 +267,19 @@ class MuJoCoWorldPopulation:
             raise RuntimeError("Application recording requires the active population graph capture")
         if type(tiled) is not bool or (tiled and (type(block_dim) is not int or block_dim < 1)):
             raise ValueError("Tiled recording requires an explicit positive block dimension")
-        mjw.validate_step_launch(owner.step_bindings, kernel, domain, extent_axis, parameter_domains)
-        launch = wp.launch_tiled if tiled else wp.launch
-        try:
-            launch(kernel, dim=dim, inputs=inputs, outputs=outputs, block_dim=block_dim, device=owner.data.qpos.device)
-            mjw.bind_step_launch(
-                owner.step_bindings, kernel, dim, domain, extent_axis=extent_axis, parameter_domains=parameter_domains
-            )
-        except BaseException:
-            owner.step_bindings.recording_failed = True
-            raise
+        mjw.launch_step_kernel(
+            owner.step_bindings,
+            kernel,
+            dim,
+            inputs=inputs,
+            outputs=outputs,
+            extent_domain=domain,
+            extent_axis=extent_axis,
+            parameter_domains=parameter_domains,
+            block_dim=block_dim,
+            tiled=tiled,
+            device=owner.data.qpos.device,
+        )
 
 
 @dataclass
@@ -1090,6 +1093,8 @@ class MuJoCoWorlds:
         are named explicitly and their reports are None, never a fabricated zero.
         Remaining storage and backing owners report their own retained resources.
         """
+        import mujoco_warp as mjw
+
         result = {
             "directory": directory_ops.memory_report(self._directory),
             "populations": [],
@@ -1113,7 +1118,9 @@ class MuJoCoWorlds:
                     "contact_storage": field_ops.memory_report(group.contact_storage),
                     "ccd_storage": field_ops.memory_report(group.ccd_storage),
                     "default_storage": field_ops.memory_report(group.default_storage),
-                    "workspace_borrowed": group.workspace.memory_report() if group.workspace is not None else None,
+                    "workspace_borrowed": mjw.step_workspace_memory_report(group.workspace)
+                    if group.workspace is not None
+                    else None,
                     "initialization": field_ops.transfer_memory_report(group.initialization_transfer)
                     if group.initialization_transfer is not None
                     else None,
