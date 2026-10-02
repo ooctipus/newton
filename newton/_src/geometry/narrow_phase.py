@@ -2349,11 +2349,14 @@ class NarrowPhase:
     through CollisionPipeline binds immutable convex hull bounds; refitting a
     bound convex hull requires rebuilding this experimental pipeline.
 
-    Experimental ``NEWTON_HEIGHTFIELD_GEOMETRIC_CULL=1`` additionally rejects
-    separated cuboid triangles inside the existing cell append owner. It
-    requires finite query, cell rejection and the stock nonpredictive global
-    reducer. Current scale, poses, heights, gaps and scaled reducer threshold
-    remain live; unsupported geometry and custom writers retain the old path.
+    Experimental, default-off ``NEWTON_HEIGHTFIELD_GEOMETRIC_CULL=1`` additionally
+    rejects separated triangles using enclosing boxes for spheres, capsules,
+    regular cylinders and supported cuboids inside the existing cell append
+    owner. It requires cell rejection and the stock nonpredictive global
+    reducer, independently of the finite-query option. Surviving triangles use
+    the selected original generic or finite contact query. Current scale, poses,
+    heights, gaps and scaled reducer threshold remain live; unsupported geometry
+    and custom writers retain the old path.
 
     Experimental ``NEWTON_HEIGHTFIELD_PAIR_CSR=1`` groups stock-writer-admitted
     raw witnesses by shape pair and publishes at most four for supported
@@ -2534,7 +2537,7 @@ class NarrowPhase:
         self._heightfield_geometric_cull = (
             geometric_cull == "1"
             and self._heightfield_cell_reject
-            and self._heightfield_finite_query
+            and not speculative
             and reduce_contacts
             and geometric_writer_supported
         )
@@ -2549,6 +2552,7 @@ class NarrowPhase:
         self._heightfield_pair_csr_requested = (
             pair_csr == "1"
             and self._heightfield_geometric_cull
+            and self._heightfield_finite_query
             and not has_meshes
             and not speculative
             and not deterministic

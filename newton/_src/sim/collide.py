@@ -2177,7 +2177,9 @@ class CollisionPipeline:
             )
             self.hydroelastic_sdf = self.narrow_phase.hydroelastic_sdf
 
-        if getattr(self.narrow_phase, "_heightfield_finite_query", False):
+        if getattr(self.narrow_phase, "_heightfield_finite_query", False) or getattr(
+            self.narrow_phase, "_heightfield_geometric_cull", False
+        ):
             from ..geometry.heightfield_finite import bind_model  # noqa: PLC0415
 
             bind_model(self.narrow_phase, model)

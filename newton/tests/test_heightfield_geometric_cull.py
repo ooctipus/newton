@@ -80,7 +80,7 @@ def snapshot(owner, state, contacts):
 
 class TestHeightfieldGeometricCull(unittest.TestCase):
     def test_constructor_admission(self):
-        """Require explicit finite, nonpredictive, stock-reducer admission."""
+        """Require nonpredictive stock reduction independently of the finite query."""
         flags = {
             "NEWTON_HEIGHTFIELD_CELL_REJECT": "1",
             "NEWTON_HEIGHTFIELD_FINITE_QUERY": "1",
@@ -104,7 +104,10 @@ class TestHeightfieldGeometricCull(unittest.TestCase):
             self.assertFalse(create(reduce_contacts=False)._heightfield_geometric_cull)
             # A known callable but nonstock writer must not inherit this proof.
             self.assertFalse(create(contact_writer_warp_func=write_contact_simple)._heightfield_geometric_cull)
-        for flag in flags:
+        with patch.dict(os.environ, {**flags, "NEWTON_HEIGHTFIELD_FINITE_QUERY": "0"}):
+            self.assertTrue(create()._heightfield_geometric_cull)
+            self.assertFalse(create(speculative=True)._heightfield_geometric_cull)
+        for flag in ("NEWTON_HEIGHTFIELD_CELL_REJECT", "NEWTON_HEIGHTFIELD_GEOMETRIC_CULL"):
             with patch.dict(os.environ, {**flags, flag: "0"}):
                 self.assertFalse(create()._heightfield_geometric_cull)
         with patch.dict(os.environ, {**flags, "NEWTON_HEIGHTFIELD_GEOMETRIC_CULL": "yes"}):

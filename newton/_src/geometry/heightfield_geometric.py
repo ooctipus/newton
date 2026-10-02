@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Experimental cuboid separation inside the existing heightfield append owner."""
+"""Experimental enclosing-box separation inside the existing heightfield append owner."""
 
 import warp as wp
 
@@ -56,14 +56,33 @@ def _prepare_pair(
     bound_source: wp.array[wp.uint64],
 ) -> PairProjection:
     result = PairProjection()
-    if types[a] != GeoType.HFIELD or (types[b] != GeoType.BOX and types[b] != GeoType.CONVEX_MESH):
+    if types[a] != GeoType.HFIELD:
         return result
     scale = wp.vec3(data[b][0], data[b][1], data[b][2])
-    half = wp.cw_mul(bounds[b, 1], scale)
-    local_center = wp.cw_mul(bounds[b, 0], scale)
-    if bound_source[b] != sources[b] or not _finite3(scale) or not _finite3(half) or not _finite3(local_center):
+    if not _finite3(scale):
         return result
-    if scale[0] <= 0.0 or scale[1] <= 0.0 or scale[2] <= 0.0 or half[0] <= 0.0 or half[1] <= 0.0 or half[2] <= 0.0:
+    half = wp.vec3(0.0)
+    local_center = wp.vec3(0.0)
+    kind = types[b]
+    if kind == GeoType.BOX or kind == GeoType.CONVEX_MESH:
+        if bound_source[b] != sources[b] or scale[0] <= 0.0 or scale[1] <= 0.0 or scale[2] <= 0.0:
+            return result
+        half = wp.cw_mul(bounds[b, 1], scale)
+        local_center = wp.cw_mul(bounds[b, 0], scale)
+    elif kind == GeoType.SPHERE:
+        half = wp.vec3(scale[0])
+    elif kind == GeoType.CAPSULE:
+        if scale[1] < 0.0:
+            return result
+        half = wp.vec3(scale[0], scale[0], scale[0] + scale[1])
+    elif kind == GeoType.CYLINDER:
+        # Barrel cylinders need a wider enclosing box; retain their original query.
+        if scale[2] != 0.0:
+            return result
+        half = wp.vec3(scale[0], scale[0], scale[1])
+    else:
+        return result
+    if not _finite3(half) or not _finite3(local_center) or half[0] <= 0.0 or half[1] <= 0.0 or half[2] <= 0.0:
         return result
     if not _finite3(lower[a]) or not _finite3(upper[a]) or not _finite3(lower[b]) or not _finite3(upper[b]):
         return result
@@ -111,6 +130,7 @@ def _prepare_pair(
         + wp.abs(hfd.max_z - hfd.min_z)
         + wp.abs(shell)
     )
+    # Also cover the 0.1 mm support radius retained by sphere/capsule queries.
     padding = 0.001 + (64.0 * 1.1920928955078125e-7) * coordinate_scale
     result.threshold = wp.max(shell, beta) + 2.0 * padding
     if not _finite3(result.center) or not wp.isfinite(result.threshold) or result.threshold < 0.0:
