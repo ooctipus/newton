@@ -151,7 +151,7 @@ def _execution_conditions(
 
 @dataclass(frozen=True, slots=True, eq=False)
 class MuJoCoWorldPopulation:
-    """Borrow state, capacities and recording for one homogeneous world population.
+    """Borrow state and capacities for one homogeneous world population.
 
     .. experimental::
         This type and its attributes are experimental. Instances are supplied by
@@ -233,69 +233,6 @@ class MuJoCoWorldPopulation:
         """Return the last joined W/C/D ready prefix without a device readback."""
         return self._borrow().world_ready_capacity
 
-    def record_launch(
-        self,
-        kernel,
-        dim,
-        *,
-        inputs=(),
-        outputs=(),
-        domain,
-        extent_axis=0,
-        parameter_domains=None,
-        block_dim=0,
-        tiled=False,
-    ):
-        """Record an application kernel and its count binding as one operation.
-
-        Call only inside ``before_step`` or ``after_substep``. ``domain`` is
-        ``world``, ``candidate`` or ``ccd``; ``None`` with ``extent_axis=None``
-        preserves a fixed worker grid. Named int32 ``parameter_domains`` map kernel
-        argument names to those same domains. World bounds use the live count;
-        candidate/CCD bounds use their ready prefixes. Fixed worker kernels must
-        guard their own accesses. All external arrays belong in capture's retain.
-        ``tiled=True`` selects Warp's tiled launch with an explicit block size.
-        Invalid count declarations fail before emission. Any failure after emission
-        invalidates the population program, even when the callback catches it.
-        """
-        import mujoco_warp as mjw
-
-        owner = self._borrow()
-        if (
-            owner.workspace.bindings is not owner.step_bindings
-            or owner.step_bindings.updates is None
-            or owner.application_launches is None
-        ):
-            raise RuntimeError("Record application launches inside a prototype physics callback")
-        if not wp.get_stream(owner.data.qpos.device).is_capturing:
-            raise RuntimeError("Application recording requires the active population graph capture")
-        if type(tiled) is not bool or (tiled and (type(block_dim) is not int or block_dim < 1)):
-            raise ValueError("Tiled recording requires an explicit positive block dimension")
-        source, parameters = mjw.resolve_step_counts(
-            owner.step_bindings, kernel, domain, extent_axis, parameter_domains
-        )
-        graph = graph_ops.current_capture(device=owner.data.qpos.device)
-        start = wp.capture_launch_count(graph)
-        try:
-            if tiled:
-                wp.launch_tiled(
-                    kernel, dim, inputs=inputs, outputs=outputs, block_dim=block_dim, device=owner.data.qpos.device
-                )
-            else:
-                wp.launch(
-                    kernel, dim, inputs=inputs, outputs=outputs, block_dim=block_dim, device=owner.data.qpos.device
-                )
-            dimensions = (dim,) if isinstance(dim, int) else tuple(dim)
-            emitted = wp.capture_launch_count(graph) - start
-            if emitted != int(all(dimensions)):
-                raise RuntimeError("Application launch must emit exactly one recorded kernel, or none for zero work")
-            if emitted:
-                owner.application_launches.append((start, kernel, extent_axis, source, parameters))
-        except BaseException:
-            owner.step_bindings.recording_failed = True
-            graph_ops.invalidate(graph)
-            raise
-
 
 @dataclass
 class _MuJoCoWorldPopulation:
@@ -318,7 +255,7 @@ class _MuJoCoWorldPopulation:
     initialization_transfer: object = None
     compaction_transfer: object = None
     step_bindings: object = None
-    application_launches: list | None = None
+    application_ranges: list[tuple[int, int]] | None = None
     request_indices: object = None
     source_rows: object = None
     destination_rows: object = None
@@ -354,19 +291,16 @@ class _MuJoCoWorldPopulation:
                 return
             graph = graph_ops.current_capture(device=self.data.qpos.device)
             start = wp.capture_launch_count(graph)
-            declared = len(self.application_launches)
             callback(self.view)
-            indices = [item[0] for item in self.application_launches[declared:]]
-            if indices != list(range(start, wp.capture_launch_count(graph))):
-                graph_ops.invalidate(graph)
-                raise RuntimeError(
-                    "Physics callbacks must declare every emitted kernel through population.record_launch"
-                )
+            end = wp.capture_launch_count(graph)
+            if end != start:
+                self.application_ranges.append((start, end))
 
         def step():
             record_callback(self.before_step)
             for _ in range(self.substeps):
-                mjw.step(self.model, self.data, workspace=self.workspace)
+                mjw.validate_step_workspace(self.workspace, self.model, self.data)
+                mjw.step(self.model, self.data, scratch=self.workspace.scratch)
                 record_callback(self.after_substep)
             mjw.validate_step_workspace(self.workspace, self.model, self.data)
 
@@ -695,6 +629,7 @@ class MuJoCoWorlds:
         substeps=1,
         before_step=None,
         after_substep=None,
+        application_bindings=None,
         refresh_kinematics=True,
     ):
         """Capture once, retaining caller buffers and all native owners.
@@ -730,6 +665,14 @@ class MuJoCoWorlds:
             substeps: Ordered native steps per graph replay.
             before_step: Callback ``(population)`` recording controls once before ordered native steps.
             after_substep: Callback ``(population)`` recording contact consumers after each native step.
+            application_bindings: Preparation operation ``(population, launches)`` returning
+                ``(extents, parameters, fixed)`` for :func:`gpu_components.graph.adopt_launches`.
+                Launches are the exact records emitted by this population's callbacks, in recording
+                order. Check expected kernel identities and declare every local record index;
+                repeated kernels may use different count sources. Required for nonempty callback
+                work. The operation runs after capture and is never retained by the graph.
+                Application and lifecycle callback fills/copies are currently rejected: their
+                storage admission is not established by numerical launch-count declarations.
             refresh_kinematics: Refresh body, geometry and site transforms after valid
                 reset-only frames or after the final substep, independently of permit.
 
@@ -747,7 +690,7 @@ class MuJoCoWorlds:
                 raise RuntimeError("Each native population prepares exactly one graph")
             if any(
                 callback is not None and not callable(callback)
-                for callback in (validate, initialize, before_step, after_substep)
+                for callback in (validate, initialize, before_step, after_substep, application_bindings)
             ):
                 raise TypeError("Payload recording callbacks must be callable")
             if type(substeps) is not int or not 1 <= substeps < 2**31 // 512:
@@ -767,12 +710,12 @@ class MuJoCoWorlds:
                 raise ValueError("Native step permit must be one contiguous int32 scalar on the population device")
             self._capture_attempted = True
             graph = None
-            application_launches = [[] for _ in self._populations]
+            application_ranges = [[] for _ in self._populations]
             population_ranges = [None] * len(self._populations)
             try:
-                for group, declarations in zip(self._populations, application_launches, strict=True):
+                for group, ranges in zip(self._populations, application_ranges, strict=True):
                     group.workspace.bindings = None
-                    group.application_launches = declarations
+                    group.application_ranges = ranges
                     group.substeps, group.before_step = substeps, before_step
                     group.after_substep, group.refresh_kinematics = after_substep, refresh_kinematics
                     group.step_bindings.updates = graph_ops.prepare_updates(
@@ -789,6 +732,7 @@ class MuJoCoWorlds:
                     force_module_load=False,
                     capture_mode=wp.CaptureMode.THREAD_LOCAL,
                     record_launches=True,
+                    record_memory_operations=True,
                 ) as capture:
                     directory_ops.begin(self._directory, commands)
                     wp.launch(
@@ -948,32 +892,39 @@ class MuJoCoWorlds:
                 graph = capture.graph
                 del capture
                 launches = wp.capture_get_launches(graph)
-                for group, (start, end), declarations in zip(
-                    self._populations, population_ranges, application_launches, strict=True
+                memory_launches = {id(operation.launch) for operation in wp.capture_get_memory_operations(graph)}
+                population_records = {
+                    id(launches[index]) for start, end in population_ranges for index in range(start, end)
+                }
+                if memory_launches - population_records:
+                    raise NotImplementedError("Lifecycle fills/copies require explicit storage admission")
+                for group, (start, end), ranges in zip(
+                    self._populations, population_ranges, application_ranges, strict=True
                 ):
-                    application_indices = set()
-                    for index, kernel, axis, source, parameters in declarations:
-                        if (
-                            not start <= index < end
-                            or index in application_indices
-                            or launches[index].kernel is not kernel
-                        ):
-                            raise RuntimeError(
-                                "Application launch must belong exactly once to its population record range"
-                            )
-                        application_indices.add(index)
-                        group.step_bindings.bindings.append(
-                            graph_ops.adopt_launch(
+                    indices = tuple(index for lo, hi in ranges for index in range(lo, hi))
+                    if any(not start <= index < end for index in indices) or len(set(indices)) != len(indices):
+                        raise RuntimeError("Application records must belong exactly once to their population range")
+                    application_indices = set(indices)
+                    if indices:
+                        if application_bindings is None:
+                            raise ValueError("Physics callbacks emitting kernels require application_bindings")
+                        records = tuple(launches[index] for index in indices)
+                        if any(id(record) in memory_launches for record in records):
+                            raise NotImplementedError("Application fills/copies require explicit storage admission")
+                        extents, parameters, fixed = application_bindings(group.view, records)
+                        group.step_bindings.bindings.extend(
+                            graph_ops.adopt_launches(
                                 group.step_bindings.updates,
                                 graph,
-                                launches[index],
-                                extent_axis=axis,
-                                extent_source=source,
+                                records,
+                                extents=extents,
                                 parameters=parameters,
+                                fixed=fixed,
                             )
                         )
+                    group.workspace.bindings = group.step_bindings
                     mjw.bind_step_program(
-                        group.step_bindings,
+                        group.workspace,
                         graph,
                         tuple(launches[index] for index in range(start, end) if index not in application_indices),
                     )
@@ -983,6 +934,8 @@ class MuJoCoWorlds:
                 return graph
             except BaseException as failure:
                 # This root cannot silently retry partially marked CUDA graph nodes.
+                if graph is not None:
+                    graph_ops.invalidate(graph)
                 try:
                     self._healthy.fill_(0)
                     wp.synchronize_stream(wp.get_stream(self.device))
@@ -1001,7 +954,7 @@ class MuJoCoWorlds:
                 for group in self._populations:
                     group.workspace.bindings = None
                     group.before_step = group.after_substep = None
-                    group.application_launches = None
+                    group.application_ranges = None
 
     def _retain_graph(self, graph, *buffers):
         """Retain explicit borrowers on the population's single captured graph."""
