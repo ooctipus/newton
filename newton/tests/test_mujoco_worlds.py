@@ -34,7 +34,7 @@ from gpu_components.directory_data import (
     InstanceStatus,
 )
 from gpu_components.field_data import FieldStorage
-from gpu_components.graph_data import GraphKernelBinding, GraphUpdateTable
+from gpu_components.graph_data import GraphUpdateTable
 
 import newton.solvers
 from newton._src.solvers.mujoco import worlds as native
@@ -79,6 +79,7 @@ class MuJoCoWorldsHostTests(unittest.TestCase):
         ):
             self.assertFalse((root / name).exists(), name)
         self.assertNotIn("worlds", newton.__all__)
+        self.assertNotIn("_KERNEL_CACHE", inspect.getsource(newton.solvers.SolverMuJoCo._prepare_generated_kernels))
         source = ast.parse(inspect.getsource(native))
         self.assertFalse({"_data_arrays", "_replace_data"} & vars(native).keys())
         self.assertFalse(
@@ -123,10 +124,13 @@ class MuJoCoWorldsHostTests(unittest.TestCase):
         self.assertFalse({"world_live_count", "recorder", "observer"} & keywords.keys())
         record_source = ast.parse(textwrap.dedent(inspect.getsource(MuJoCoWorldPopulation.record_launch)))
         calls = [ast.unparse(node.func) for node in ast.walk(record_source) if isinstance(node, ast.Call)]
-        self.assertEqual(calls.count("mjw.launch_step_kernel"), 1)
-        self.assertFalse(
-            {"wp.launch", "wp.launch_tiled", "mjw.bind_step_launch", "mjw.validate_step_launch"} & set(calls)
-        )
+        self.assertEqual(calls.count("mjw.resolve_step_counts"), 1)
+        self.assertTrue({"wp.launch", "wp.launch_tiled", "wp.capture_launch_count"} <= set(calls))
+        self.assertFalse({"mjw.launch_step_kernel", "mjw.bind_step_launch", "graph_ops.launch"} & set(calls))
+        capture_source = inspect.getsource(MuJoCoWorlds.capture)
+        self.assertIn("record_launches=True", capture_source)
+        self.assertIn("mjw.bind_step_program", capture_source)
+        self.assertIn("group.application_launches = None", capture_source)
 
     def test_base_import_does_not_require_optional_native_components(self):
         """Base Newton must import even when standalone components and physics backends are unavailable."""
@@ -516,7 +520,7 @@ assert 'worlds' not in newton.__all__
         ]
         self.assertEqual(len(scopes), 1)
         stages = []
-        for name in ("record_update", "_guard_graph_updates", "_execution_conditions", "record_physics"):
+        for name in ("record_update", "_guard_graph_updates", "_execution_conditions", "record_population"):
             matches = [
                 index
                 for index, statement in enumerate(scopes[0].body)
@@ -538,6 +542,22 @@ assert 'worlds' not in newton.__all__
                 self.assertEqual(statement.value.func.value.id, "graph_ops")
             stages.append(matches[0])
         self.assertEqual(stages, sorted(set(stages)), "Execution phases must be distinct and ordered")
+
+    def test_population_capture_ranges_use_explicit_branches_not_operand_inference(self):
+        """A branch owns its exact emitted range even when kernels, shapes and task arrays are shared."""
+        capture = ast.parse(textwrap.dedent(inspect.getsource(MuJoCoWorlds.capture)))
+        branch = next(
+            node for node in ast.walk(capture) if isinstance(node, ast.FunctionDef) and node.name == "record_population"
+        )
+        calls = [ast.unparse(node.func) for node in ast.walk(branch) if isinstance(node, ast.Call)]
+        self.assertEqual(calls.count("wp.capture_launch_count"), 2)
+        self.assertEqual(calls.count("group.record_physics"), 1)
+        self.assertFalse(
+            any(
+                isinstance(node, ast.Attribute) and node.attr in ("kernel", "shape", "arrays")
+                for node in ast.walk(branch)
+            )
+        )
 
     def test_all_safe_shrinks_precede_growth_with_one_shared_backing_budget(self):
         """Return every safe prefix before any growth consumes the shared byte budget."""
@@ -869,8 +889,9 @@ assert 'worlds' not in newton.__all__
 
 class PopulationRecorderTests(unittest.TestCase):
     def setUp(self):
-        """Mock the generic atomic launch boundary; retain real native declaration validation."""
+        """Mock emitted Warp records while retaining native count declaration validation."""
         self.stream = Mock(is_capturing=True)
+        self.records = []
 
         class Capture:
             pass
@@ -881,21 +902,21 @@ class PopulationRecorderTests(unittest.TestCase):
         capture.start()
         self.addCleanup(capture.stop)
 
-        def emit(updates, kernel, dim, **kwargs):
+        def emit(kernel, dim, **kwargs):
             dimensions = (dim,) if isinstance(dim, int) else dim
             if not all(dimensions):
                 return None
-            return GraphKernelBinding(
-                123,
-                launch_rank=kernel.adj.kernel_dim,
-                extent_axis=kwargs["extent_axis"],
-                extent_source=kwargs["extent_source"],
-                parameters=kwargs["parameters"],
-            )
+            self.records.append(SimpleNamespace(kernel=kernel, dim=dim))
 
-        patcher = patch.object(graph_ops, "launch", side_effect=emit)
+        patcher = patch.object(native.wp, "launch", side_effect=emit)
         self.launch = patcher.start()
         self.addCleanup(patcher.stop)
+        tiled = patch.object(native.wp, "launch_tiled", side_effect=emit)
+        self.launch_tiled = tiled.start()
+        self.addCleanup(tiled.stop)
+        count = patch.object(native.wp, "capture_launch_count", side_effect=lambda graph: len(self.records))
+        count.start()
+        self.addCleanup(count.stop)
 
     def group(self):
         import mujoco_warp as mjw
@@ -930,6 +951,7 @@ class PopulationRecorderTests(unittest.TestCase):
             contact_storage=owner("candidate"),
             ccd_storage=owner("ccd"),
             workspace=SimpleNamespace(bindings=None),
+            application_launches=[],
         )
         group.view = MuJoCoWorldPopulation(3, group)
         updates = GraphUpdateTable(
@@ -1006,8 +1028,8 @@ class PopulationRecorderTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "closed"):
             _ = view.data
 
-    def test_public_recording_delegates_atomic_native_launch_and_rejects_wrong_scope(self):
-        """Translate application names once and leave count resolution and emission with MJWarp."""
+    def test_public_recording_declares_exact_warp_records_and_rejects_wrong_scope(self):
+        """Resolve application names once and associate numeric counts with its exact emitted record."""
         import mujoco_warp as mjw
 
         group, kernel, _ = self.group()
@@ -1015,33 +1037,24 @@ class PopulationRecorderTests(unittest.TestCase):
         group.workspace.bindings = group.step_bindings
         with (
             patch.object(native.wp, "get_stream", return_value=self.stream),
-            patch.object(mjw, "launch_step_kernel", wraps=mjw.launch_step_kernel) as native_launch,
-            patch.object(native.wp, "launch", side_effect=AssertionError("Newton bypassed atomic emission")),
-            patch.object(native.wp, "launch_tiled", side_effect=AssertionError("Newton bypassed atomic emission")),
+            patch.object(mjw, "resolve_step_counts", wraps=mjw.resolve_step_counts) as resolve,
         ):
             view.record_launch(kernel, (17, 17), domain="world", parameter_domains={"world_live_count": "world"})
-            native_launch.assert_called_once_with(
-                group.step_bindings,
-                kernel,
-                (17, 17),
-                inputs=(),
-                outputs=(),
-                extent_domain="world",
-                extent_axis=0,
-                parameter_domains={"world_live_count": "world"},
-                block_dim=0,
-                tiled=False,
-                device="cpu",
-            )
-            self.assertIs(group.step_bindings.bindings[-1].extent_source, view.world_live_count)
+            resolve.assert_called_once_with(group.step_bindings, kernel, "world", 0, {"world_live_count": "world"})
+            index, actual_kernel, axis, source, parameters = group.application_launches[-1]
+            self.assertEqual((index, axis), (0, 0))
+            self.assertIs(actual_kernel, self.records[index].kernel)
+            self.assertIs(source, view.world_live_count)
+            self.assertEqual(parameters[0].argument_index, 2)
             view.record_launch(kernel, (17, 17), domain="candidate", tiled=True, block_dim=32)
-            self.assertIs(group.step_bindings.bindings[-1].extent_source, view.contact_storage_ready_count)
-            self.assertTrue(self.launch.call_args.kwargs["tiled"])
-            self.assertEqual(self.launch.call_args.kwargs["block_dim"], 32)
+            self.assertEqual(group.application_launches[-1][0], 1)
+            self.assertIs(group.application_launches[-1][3], view.contact_storage_ready_count)
+            self.assertEqual(self.launch_tiled.call_args.kwargs["block_dim"], 32)
+            self.assertEqual(group.step_bindings.bindings, [], "Only postcapture adoption owns final bindings")
             group.workspace.bindings = None
             with self.assertRaisesRegex(RuntimeError, "callback"):
                 view.record_launch(kernel, (17, 17), domain="world")
-            self.assertEqual(native_launch.call_count, 2)
+            self.assertEqual(resolve.call_count, 2)
         group.workspace.bindings = group.step_bindings
         with patch.object(native.wp, "get_stream", return_value=Mock(is_capturing=False)):
             with self.assertRaisesRegex(RuntimeError, "capture"):
@@ -1107,9 +1120,10 @@ class PopulationRecorderTests(unittest.TestCase):
             group.view.record_launch(kernel, (17, 17), domain="world")
             self.launch.assert_called_once()
         self.assertEqual(calls, [])
-        self.assertEqual(len(group.step_bindings.bindings), 1)
+        self.assertEqual(len(group.application_launches), 1)
+        self.assertEqual(group.step_bindings.bindings, [])
 
-    def test_caught_atomic_emission_errors_still_invalidate_the_entire_population_program(self):
+    def test_caught_emission_errors_still_invalidate_the_entire_population_program(self):
         """A swallowed error from native emission prevents the composition root from publication."""
         import mujoco_warp as mjw
 
@@ -1158,7 +1172,62 @@ class PopulationRecorderTests(unittest.TestCase):
                 kernel, 17, domain="world", parameter_domains={f"count_{index}": "world" for index in range(4)}
             )
             self.launch.assert_called_once()
-        self.assertEqual(len(group.step_bindings.bindings[0].parameters), 4)
+        self.assertEqual(len(group.application_launches[0][-1]), 4)
+
+    def test_equal_kernels_and_shapes_keep_distinct_population_declarations(self):
+        """Equal launches retain distinct exact indices and native count owners; empty work owns no record."""
+        first, kernel, _ = self.group()
+        second, _, _ = self.group()
+        with patch.object(native.wp, "get_stream", return_value=self.stream):
+            for group in (first, second):
+                group.workspace.bindings = group.step_bindings
+                group.view.record_launch(kernel, (0, 17), domain="world")
+                self.assertEqual(group.application_launches, [])
+                group.view.record_launch(kernel, (17, 17), domain="world")
+        self.assertEqual([group.application_launches[0][0] for group in (first, second)], [0, 1])
+        for group in (first, second):
+            self.assertIs(group.application_launches[0][3], group.world_storage.protected_count)
+            self.assertEqual(group.step_bindings.bindings, [])
+
+    def test_unexpected_emission_count_invalidates_capture(self):
+        """A callback cannot silently claim another emitted node or omit its own dynamic declaration."""
+        for emitted in (0, 2):
+            with self.subTest(emitted=emitted):
+                group, kernel, _ = self.group()
+                group.workspace.bindings = group.step_bindings
+                self.launch.side_effect = lambda *args, emitted=emitted, **kwargs: self.records.extend(
+                    [object()] * emitted
+                )
+                with (
+                    patch.object(native.wp, "get_stream", return_value=self.stream),
+                    patch.object(graph_ops, "invalidate") as invalidate,
+                    self.assertRaisesRegex(RuntimeError, "exactly one"),
+                ):
+                    group.view.record_launch(kernel, (17, 17), domain="world")
+                invalidate.assert_called_once_with(self.graph)
+                self.assertTrue(group.step_bindings.recording_failed)
+                self.assertEqual(group.application_launches, [])
+
+    def test_callbacks_cannot_borrow_native_kernel_classification(self):
+        """A known physics kernel emitted by a callback still needs its explicit application declaration."""
+        import mujoco_warp as mjw
+        from mujoco_warp._src import sleep
+
+        for phase in ("before_step", "after_substep"):
+            with self.subTest(phase=phase):
+                group, _, _ = self.group()
+                setattr(group, phase, lambda view: wp.launch(sleep._wake_collision_kernel, 17))
+                with (
+                    patch.object(mjw, "step"),
+                    patch.object(mjw, "kinematics"),
+                    patch.object(native.wp, "capture_if", side_effect=lambda condition, on_true: on_true()),
+                    patch.object(graph_ops, "invalidate") as invalidate,
+                    self.assertRaisesRegex(RuntimeError, "declare every emitted kernel"),
+                ):
+                    group.record_physics()
+                invalidate.assert_called_once_with(self.graph)
+                self.assertTrue(group.step_bindings.recording_failed)
+                self.assertIsNone(group.workspace.bindings)
 
     def test_model_array_walk_includes_tuple_arrays_and_nested_tile_descriptors(self):
         """Account tuple-held model arrays without interpreting their shapes as world domains."""
@@ -1925,11 +1994,11 @@ class TestMuJoCoWorlds(unittest.TestCase):
             from mujoco_warp._src import collision_driver
 
             narrowphase = collision_driver.convex_narrowphase
-            groups = {id(group.step_bindings): group.view for group in population._populations}
+            groups = {id(group.workspace.convex): group.view for group in population._populations}
 
             def record_convex_pass(*args, **kwargs):
                 narrowphase(*args, **kwargs)
-                group = groups[id(kwargs["bindings"])]
+                group = groups[id(kwargs["scratch"])]
                 # Sleeping's incremental pass clears nccd again; sample before the next pass.
                 group.record_launch(
                     _record_convex_work,
