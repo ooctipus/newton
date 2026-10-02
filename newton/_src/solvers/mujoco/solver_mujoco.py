@@ -659,7 +659,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         # Recreate unique kernels so they inherit this solver's configuration.
         from mujoco_warp._src import warp_util
 
-        warp_util._KERNEL_CACHE.clear()
+        warp_util.clear_kernel_cache()
         SolverMuJoCo._generated_kernel_deterministic_options = options
 
     def _set_mujoco_warp_module_options(self) -> None:

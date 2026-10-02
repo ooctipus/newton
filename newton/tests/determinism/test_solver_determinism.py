@@ -308,34 +308,39 @@ class TestSolverDeterminismOptions(unittest.TestCase):
         set_module_options.assert_not_called()
 
     def test_mujoco_generated_kernel_cache_tracks_determinism(self):
-        from mujoco_warp._src import warp_util
+        """Recreate kernels for changed options without losing retained programs' factory identities."""
+        from mujoco_warp._src import forward, warp_util
 
         solver = object.__new__(newton.solvers.SolverMuJoCo)
         solver._deterministic = DETERMINISTIC_MODE
         solver._deterministic_max_records = 17
-        cache = warp_util._KERNEL_CACHE
-        saved_cache = cache.copy()
         saved_options = newton.solvers.SolverMuJoCo._generated_kernel_deterministic_options
-        sentinel = object()
 
         try:
-            cache.clear()
-            cache["sentinel"] = sentinel
+            factory = forward._next_time_builder
+            original = factory(0)
             newton.solvers.SolverMuJoCo._generated_kernel_deterministic_options = None
+            solver._prepare_generated_kernels()
+            with solver._scoped_deterministic_config():
+                first = factory(0)
+            self.assertIsNot(first, original)
+            options = wp.get_module_options(module=first.module)
+            self.assertEqual(options["deterministic"], DETERMINISTIC_MODE)
+            self.assertEqual(options["deterministic_max_records"], 17)
 
             solver._prepare_generated_kernels()
-            self.assertEqual(cache, {})
-
-            cache["sentinel"] = sentinel
-            solver._prepare_generated_kernels()
-            self.assertIs(cache["sentinel"], sentinel)
+            with solver._scoped_deterministic_config():
+                self.assertIs(factory(0), first)
 
             solver._deterministic_max_records += 1
             solver._prepare_generated_kernels()
-            self.assertEqual(cache, {})
+            with solver._scoped_deterministic_config():
+                changed = factory(0)
+            self.assertIsNot(changed, first)
+            self.assertEqual(wp.get_module_options(module=changed.module)["deterministic_max_records"], 18)
+            self.assertTrue({original, first, changed} <= set(warp_util.kernel_instances(factory)))
         finally:
-            cache.clear()
-            cache.update(saved_cache)
+            warp_util.clear_kernel_cache()
             newton.solvers.SolverMuJoCo._generated_kernel_deterministic_options = saved_options
 
     def test_current_solver_skips_module_option_checks(self):
