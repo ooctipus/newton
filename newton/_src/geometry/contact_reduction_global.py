@@ -52,6 +52,7 @@ See Also:
 
 from __future__ import annotations
 
+from functools import cache
 from typing import Any
 
 import warp as wp
@@ -84,6 +85,8 @@ from .support_function import (
     create_triangle_prism_penetration_refiner,
     extract_shape_data,
     support_map,
+    support_map_heightfield_cylinder,
+    support_map_heightfield_sphere,
 )
 from .types import GeoType
 
@@ -2307,113 +2310,164 @@ def create_export_reduced_contacts_kernel(writer_func: Any):
     return export_reduced_contacts_kernel
 
 
-@wp.kernel(enable_backward=False, module="unique")
-def mesh_triangle_contacts_to_reducer_kernel(
-    shape_types: wp.array[int],
-    shape_data: wp.array[wp.vec4],
-    shape_transform: wp.array[wp.transform],
-    shape_source: wp.array[wp.uint64],
-    shape_gap: wp.array[float],
-    shape_heightfield_index: wp.array[wp.int32],
-    heightfield_data: wp.array[HeightfieldData],
-    heightfield_elevations: wp.array[wp.float32],
-    triangle_pairs: wp.array[wp.vec3i],
-    triangle_pairs_count: wp.array[int],
-    reducer_data: GlobalContactReducerData,
-    total_num_threads: int,
-):
-    """Process mesh/heightfield-triangle contacts and store them in GlobalContactReducer.
+@cache
+def create_mesh_triangle_contacts_to_reducer_kernel(primitive_type: int = 0, exclude_primitives: bool = False):
+    """Create the original query or a filtered heightfield primitive variant."""
+    if primitive_type not in (0, int(GeoType.SPHERE), int(GeoType.CYLINDER)):
+        raise ValueError("Only sphere and cylinder heightfield queries can be specialized")
+    if primitive_type and exclude_primitives:
+        raise ValueError("A typed query cannot also exclude primitive pairs")
+    query_support = support_map
+    if primitive_type == int(GeoType.SPHERE):
+        query_support = support_map_heightfield_sphere
+    elif primitive_type == int(GeoType.CYLINDER):
+        query_support = support_map_heightfield_cylinder
 
-    This kernel processes triangle pairs (mesh-or-hfield shape, convex-shape, triangle_index)
-    and computes contacts using GJK/MPR, storing results in the GlobalContactReducer for
-    subsequent reduction and export.
+    def mesh_triangle_contacts_to_reducer_kernel(
+        shape_types: wp.array[int],
+        shape_data: wp.array[wp.vec4],
+        shape_transform: wp.array[wp.transform],
+        shape_source: wp.array[wp.uint64],
+        shape_gap: wp.array[float],
+        shape_heightfield_index: wp.array[wp.int32],
+        heightfield_data: wp.array[HeightfieldData],
+        heightfield_elevations: wp.array[wp.float32],
+        triangle_pairs: wp.array[wp.vec3i],
+        triangle_pairs_count: wp.array[int],
+        reducer_data: GlobalContactReducerData,
+        total_num_threads: int,
+    ):
+        """Process mesh/heightfield-triangle contacts and store them in GlobalContactReducer.
 
-    Uses grid stride loop over triangle pairs.
-    """
-    tid = wp.tid()
+        This kernel processes triangle pairs (mesh-or-hfield shape, convex-shape, triangle_index)
+        and computes contacts using GJK/MPR, storing results in the GlobalContactReducer for
+        subsequent reduction and export.
 
-    num_triangle_pairs = triangle_pairs_count[0]
+        Uses grid stride loop over triangle pairs.
+        """
+        tid = wp.tid()
 
-    for i in range(tid, num_triangle_pairs, total_num_threads):
-        if i >= triangle_pairs.shape[0]:
-            break
+        num_triangle_pairs = triangle_pairs_count[0]
 
-        triple = triangle_pairs[i]
-        shape_a = triple[0]  # Mesh or heightfield shape
-        shape_b = triple[1]  # Convex shape
-        tri_idx = triple[2]
+        for i in range(tid, num_triangle_pairs, total_num_threads):
+            if i >= triangle_pairs.shape[0]:
+                break
 
-        type_a = shape_types[shape_a]
+            triple = triangle_pairs[i]
+            shape_a = triple[0]  # Mesh or heightfield shape
+            shape_b = triple[1]  # Convex shape
+            tri_idx = triple[2]
 
-        if type_a == GeoType.HFIELD:
-            # Heightfield triangle
-            hfd = heightfield_data[shape_heightfield_index[shape_a]]
-            X_ws_a = shape_transform[shape_a]
-            shape_data_a, v0_world = get_triangle_shape_from_heightfield(hfd, heightfield_elevations, X_ws_a, tri_idx)
-        else:
-            # Mesh triangle (mesh_id already validated by midphase)
-            mesh_id_a = shape_source[shape_a]
-            scale_data_a = shape_data[shape_a]
-            mesh_scale_a = wp.vec3(scale_data_a[0], scale_data_a[1], scale_data_a[2])
-            X_ws_a = shape_transform[shape_a]
-            shape_data_a, v0_world = get_triangle_shape_from_mesh(mesh_id_a, mesh_scale_a, X_ws_a, tri_idx)
+            type_a = shape_types[shape_a]
+            if wp.static(primitive_type != 0):
+                if type_a != GeoType.HFIELD or shape_types[shape_b] != primitive_type:
+                    continue
+                if wp.static(primitive_type == int(GeoType.CYLINDER)):
+                    if shape_data[shape_b][2] != 0.0:
+                        continue
+                type_a = wp.static(int(GeoType.HFIELD))
+            elif wp.static(exclude_primitives):
+                if type_a == GeoType.HFIELD and (
+                    shape_types[shape_b] == GeoType.SPHERE
+                    or (shape_types[shape_b] == GeoType.CYLINDER and shape_data[shape_b][2] == 0.0)
+                ):
+                    continue
 
-        # Extract shape B data
-        pos_b, quat_b, shape_data_b, _scale_b, margin_offset_b = extract_shape_data(
-            shape_b,
-            shape_transform,
-            shape_types,
-            shape_data,
-            shape_source,
-        )
+            if wp.static(primitive_type != 0):
+                hfd = heightfield_data[shape_heightfield_index[shape_a]]
+                X_ws_a = shape_transform[shape_a]
+                shape_data_a, v0_world = get_triangle_shape_from_heightfield(
+                    hfd, heightfield_elevations, X_ws_a, tri_idx
+                )
+            elif type_a == GeoType.HFIELD:
+                # Heightfield triangle
+                hfd = heightfield_data[shape_heightfield_index[shape_a]]
+                X_ws_a = shape_transform[shape_a]
+                shape_data_a, v0_world = get_triangle_shape_from_heightfield(
+                    hfd, heightfield_elevations, X_ws_a, tri_idx
+                )
+            else:
+                # Mesh triangle (mesh_id already validated by midphase)
+                mesh_id_a = shape_source[shape_a]
+                scale_data_a = shape_data[shape_a]
+                mesh_scale_a = wp.vec3(scale_data_a[0], scale_data_a[1], scale_data_a[2])
+                X_ws_a = shape_transform[shape_a]
+                shape_data_a, v0_world = get_triangle_shape_from_mesh(mesh_id_a, mesh_scale_a, X_ws_a, tri_idx)
 
-        # Triangle position is vertex A in world space.
-        # For heightfield prisms, edges are in heightfield-local space
-        # so we pass the heightfield rotation to let MPR/GJK work in
-        # that frame (where -Z is always the down axis).
-        pos_a = v0_world
-        if type_a == GeoType.HFIELD:
-            quat_a = wp.transform_get_rotation(shape_transform[shape_a])
-        else:
-            quat_a = wp.quat_identity()
-
-        # Mesh midphase already applies topology-aware back-face admission.
-        # Repeating a center-only test would discard closed-surface overlaps.
-
-        # Extract margin offset for shape A (signed distance padding)
-        margin_offset_a = shape_data[shape_a][3]
-
-        # Use additive per-shape contact gap for detection threshold
-        gap_a = shape_gap[shape_a]
-        gap_b = shape_gap[shape_b]
-        gap_sum = gap_a + gap_b
-
-        feature_context = HeightfieldFeatureContext()
-        if wp.static(WELD_FLAT_SEAMS):
-            feature_context.elevations = heightfield_elevations
-            feature_context.triangle = tri_idx
-            if type_a == GeoType.HFIELD:
-                feature_context.heightfield = heightfield_data[shape_heightfield_index[shape_a]]
-
-        wp.static(
-            create_compute_gjk_mpr_contacts(
-                write_contact_to_reducer,
-                penetration_refiner=create_triangle_prism_penetration_refiner(support_map),
-                query_filter=flat_seam_query_allowed if WELD_FLAT_SEAMS else None,
+            # Extract shape B data
+            pos_b, quat_b, shape_data_b, _scale_b, margin_offset_b = extract_shape_data(
+                shape_b,
+                shape_transform,
+                shape_types,
+                shape_data,
+                shape_source,
             )
-        )(
-            shape_data_a,
-            shape_data_b,
-            quat_a,
-            quat_b,
-            pos_a,
-            pos_b,
-            gap_sum,
-            shape_a,
-            shape_b,
-            margin_offset_a,
-            margin_offset_b,
-            reducer_data,
-            (tri_idx << 1) | 1,
-            feature_context,
-        )
+            if wp.static(primitive_type != 0):
+                # The current pair passed the exact type filter above. Keep
+                # that fact visible when compiling the shared query math.
+                shape_data_b.shape_type = wp.static(primitive_type)
+
+            # Triangle position is vertex A in world space.
+            # For heightfield prisms, edges are in heightfield-local space
+            # so we pass the heightfield rotation to let MPR/GJK work in
+            # that frame (where -Z is always the down axis).
+            pos_a = v0_world
+            if type_a == GeoType.HFIELD:
+                quat_a = wp.transform_get_rotation(shape_transform[shape_a])
+            else:
+                quat_a = wp.quat_identity()
+
+            # Mesh midphase already applies topology-aware back-face admission.
+            # Repeating a center-only test would discard closed-surface overlaps.
+
+            # Extract margin offset for shape A (signed distance padding)
+            margin_offset_a = shape_data[shape_a][3]
+
+            # Use additive per-shape contact gap for detection threshold
+            gap_a = shape_gap[shape_a]
+            gap_b = shape_gap[shape_b]
+            gap_sum = gap_a + gap_b
+
+            feature_context = HeightfieldFeatureContext()
+            if wp.static(WELD_FLAT_SEAMS):
+                feature_context.elevations = heightfield_elevations
+                feature_context.triangle = tri_idx
+                if type_a == GeoType.HFIELD:
+                    feature_context.heightfield = heightfield_data[shape_heightfield_index[shape_a]]
+
+            wp.static(
+                create_compute_gjk_mpr_contacts(
+                    write_contact_to_reducer,
+                    support_func=query_support,
+                    use_precomputed_center=primitive_type != 0,
+                    penetration_refiner=create_triangle_prism_penetration_refiner(query_support),
+                    query_filter=flat_seam_query_allowed if WELD_FLAT_SEAMS else None,
+                )
+            )(
+                shape_data_a,
+                shape_data_b,
+                quat_a,
+                quat_b,
+                pos_a,
+                pos_b,
+                gap_sum,
+                shape_a,
+                shape_b,
+                margin_offset_a,
+                margin_offset_b,
+                reducer_data,
+                (tri_idx << 1) | 1,
+                feature_context,
+            )
+
+    if primitive_type == int(GeoType.SPHERE):
+        mesh_triangle_contacts_to_reducer_kernel.__name__ = "heightfield_sphere_contacts_to_reducer_kernel"
+    elif primitive_type == int(GeoType.CYLINDER):
+        mesh_triangle_contacts_to_reducer_kernel.__name__ = "heightfield_cylinder_contacts_to_reducer_kernel"
+    elif exclude_primitives:
+        mesh_triangle_contacts_to_reducer_kernel.__name__ = "mesh_triangle_contacts_to_reducer_fallback_kernel"
+    mesh_triangle_contacts_to_reducer_kernel.__qualname__ = mesh_triangle_contacts_to_reducer_kernel.__name__
+    return wp.kernel(mesh_triangle_contacts_to_reducer_kernel, enable_backward=False, module="unique")
+
+
+mesh_triangle_contacts_to_reducer_kernel = create_mesh_triangle_contacts_to_reducer_kernel()

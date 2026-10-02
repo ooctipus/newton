@@ -51,6 +51,7 @@ from ..geometry.contact_reduction_global import (
     HASHTABLE_WARN_LOAD_PERCENT,
     GlobalContactReducer,
     create_export_reduced_contacts_kernel,
+    create_mesh_triangle_contacts_to_reducer_kernel,
     mesh_triangle_contacts_to_reducer_kernel,
     reduce_buffered_contacts_kernel,
     reduce_buffered_contacts_speculative_kernel,
@@ -2358,6 +2359,13 @@ class NarrowPhase:
     heights, gaps and scaled reducer threshold remain live; unsupported geometry
     and custom writers retain the old path.
 
+    Experimental, default-off ``NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY=1`` splits
+    heightfield/sphere and heightfield/regular-cylinder queries into typed kernels with
+    the original support, GJK/MPR and manifold math. Other current pair types
+    retain the generic query, including barrel cylinders. Admission requires stock buffered contact writing
+    without finite queries, deterministic mode, speculative contacts or
+    hydroelastic SDFs; no geometry is cached by this option.
+
     Experimental ``NEWTON_HEIGHTFIELD_PAIR_CSR=1`` groups stock-writer-admitted
     raw witnesses by shape pair and publishes at most four for supported
     heightfield/box and heightfield/convex pairs. Selection prioritizes active
@@ -2566,6 +2574,32 @@ class NarrowPhase:
         self._heightfield_pair_csr_shell_requested = pair_csr_shell == "1"
         self._heightfield_pair_csr_shell = False
         self._pair_csr = None
+        primitive_query = os.environ.get("NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY", "0")
+        if primitive_query not in ("0", "1"):
+            raise ValueError("NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY must be 0 or 1")
+        primitive_writer_supported = contact_writer_warp_func is None
+        if primitive_query == "1" and not primitive_writer_supported:
+            from ..sim.collide import write_contact as primitive_stock_writer  # noqa: PLC0415
+
+            primitive_writer_supported = contact_writer_warp_func is primitive_stock_writer
+        self._heightfield_primitive_query = (
+            primitive_query == "1"
+            and has_heightfields
+            and reduce_contacts
+            and not self._heightfield_finite_query
+            and not self._heightfield_pair_csr_requested
+            and not speculative
+            and not deterministic
+            and hydroelastic_sdf is None
+            and primitive_writer_supported
+        )
+        self._heightfield_primitive_kernels = ()
+        if self._heightfield_primitive_query:
+            self._heightfield_primitive_kernels = (
+                create_mesh_triangle_contacts_to_reducer_kernel(int(GeoType.SPHERE)),
+                create_mesh_triangle_contacts_to_reducer_kernel(int(GeoType.CYLINDER)),
+                create_mesh_triangle_contacts_to_reducer_kernel(exclude_primitives=True),
+            )
         self._finite_bounds = None
         self._finite_source = None
         self.mesh_sdf_texture_only = mesh_sdf_texture_only
@@ -3385,18 +3419,29 @@ class NarrowPhase:
                         block_dim=self.mesh_triangle_block_dim,
                         record_tape=False,
                     )
-                wp.launch(
-                    kernel=self._pair_csr.generic
-                    if self._heightfield_pair_csr
-                    else self._finite_reducer_fallback
-                    if self._heightfield_finite_query
-                    else mesh_triangle_contacts_to_reducer_kernel,
-                    dim=self.total_num_threads,
-                    inputs=triangle_inputs,
-                    device=device,
-                    block_dim=self.mesh_triangle_block_dim,
-                    record_tape=False,
-                )
+                if self._heightfield_primitive_query:
+                    for kernel in self._heightfield_primitive_kernels:
+                        wp.launch(
+                            kernel=kernel,
+                            dim=self.total_num_threads,
+                            inputs=triangle_inputs,
+                            device=device,
+                            block_dim=self.mesh_triangle_block_dim,
+                            record_tape=False,
+                        )
+                else:
+                    wp.launch(
+                        kernel=self._pair_csr.generic
+                        if self._heightfield_pair_csr
+                        else self._finite_reducer_fallback
+                        if self._heightfield_finite_query
+                        else mesh_triangle_contacts_to_reducer_kernel,
+                        dim=self.total_num_threads,
+                        inputs=triangle_inputs,
+                        device=device,
+                        block_dim=self.mesh_triangle_block_dim,
+                        record_tape=False,
+                    )
             else:
                 # Direct contact processing without reduction
                 triangle_inputs = [

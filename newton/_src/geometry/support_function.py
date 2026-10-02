@@ -132,6 +132,106 @@ def _support_map_box(geom: GenericShapeData, direction: wp.vec3) -> wp.vec3:
 
 
 @wp.func
+def _support_map_triangle(geom: GenericShapeData, direction: wp.vec3) -> wp.vec3:
+    """Return the original triangle or downward-prism support point."""
+    result = wp.vec3(0.0, 0.0, 0.0)
+    # Triangle vertices: a at origin, b at scale, c at auxiliary
+    tri_a = wp.vec3(0.0, 0.0, 0.0)
+    tri_b = geom.scale
+    tri_c = geom.auxiliary
+
+    # Compute dot products with direction for each vertex
+    dot_a = wp.dot(tri_a, direction)
+    dot_b = wp.dot(tri_b, direction)
+    dot_c = wp.dot(tri_c, direction)
+
+    # Find the vertex with maximum dot product (furthest in the direction)
+    if dot_a >= dot_b and dot_a >= dot_c:
+        result = tri_a
+    elif dot_b >= dot_c:
+        result = tri_b
+    else:
+        result = tri_c
+
+    # TRIANGLE_PRISM: extrude 1 m along -Z to form a solid prism so
+    # that GJK/MPR naturally resolves shapes on the back side.
+    # The support function is queried in the heightfield's local
+    # frame (orientation_a = heightfield rotation), where -Z is
+    # always the heightfield's down direction.
+    if geom.shape_type == GeoTypeEx.TRIANGLE_PRISM:
+        if direction[2] < 0.0:
+            result = result + wp.vec3(0.0, 0.0, -TRIANGLE_PRISM_EXTRUSION)
+    return result
+
+
+@wp.func
+def _support_map_sphere(geom: GenericShapeData, direction: wp.vec3) -> wp.vec3:
+    """Return the original sphere support point."""
+    eps = 1.0e-12
+    result = wp.vec3(0.0, 0.0, 0.0)
+    radius = geom.scale[0]
+    dir_len_sq = wp.length_sq(direction)
+    if dir_len_sq > eps:
+        n = direction * _support_rsqrt_rn(dir_len_sq)
+    else:
+        n = wp.vec3(1.0, 0.0, 0.0)
+    result = n * radius
+    return result
+
+
+@wp.func
+def _support_map_cylinder(geom: GenericShapeData, direction: wp.vec3) -> wp.vec3:
+    """Return the original regular or barrel cylinder support point."""
+    eps = 1.0e-12
+    result = wp.vec3(0.0, 0.0, 0.0)
+    radius = geom.scale[0]
+    half_height = geom.scale[1]
+    barrel_radius = geom.scale[2]
+
+    dir_xy = wp.vec3(direction[0], direction[1], 0.0)
+    dir_xy_len_sq = wp.length_sq(dir_xy)
+
+    if barrel_radius == 0.0:
+        # Keep the regular-cylinder path unchanged.
+        if dir_xy_len_sq > eps:
+            n_xy = dir_xy * _support_rsqrt_rn(dir_xy_len_sq)
+            lateral_point = wp.vec3(n_xy[0] * radius, n_xy[1] * radius, 0.0)
+        else:
+            lateral_point = wp.vec3(radius, 0.0, 0.0)
+
+        if direction[2] > 0.0:
+            result = wp.vec3(lateral_point[0], lateral_point[1], half_height)
+        elif direction[2] < 0.0:
+            result = wp.vec3(lateral_point[0], lateral_point[1], -half_height)
+        else:
+            result = lateral_point
+    else:
+        if dir_xy_len_sq > eps:
+            dir_xy_len = wp.sqrt(dir_xy_len_sq)
+            n_xy = dir_xy / dir_xy_len
+        else:
+            dir_xy_len = 0.0
+            n_xy = wp.vec3(1.0, 0.0, 0.0)
+
+        direction_len = wp.sqrt(dir_xy_len_sq + direction[2] * direction[2])
+        support_z = 0.0
+        if direction_len > eps:
+            support_z = wp.clamp(barrel_radius * direction[2] / direction_len, -half_height, half_height)
+
+        barrel_radius_sq = barrel_radius * barrel_radius
+        half_height_sq = half_height * half_height
+        support_z_sq = support_z * support_z
+        end_offset = wp.sqrt(barrel_radius_sq - half_height_sq)
+        support_offset = wp.sqrt(wp.max(barrel_radius_sq - support_z_sq, 0.0))
+        offset_sum = support_offset + end_offset
+        support_radius = radius
+        if offset_sum > eps:
+            support_radius += (half_height_sq - support_z_sq) / offset_sum
+        result = wp.vec3(n_xy[0] * support_radius, n_xy[1] * support_radius, support_z)
+    return result
+
+
+@wp.func
 def support_map(geom: GenericShapeData, direction: wp.vec3, data_provider: SupportMapDataProvider) -> wp.vec3:
     """
     Return the support point of a primitive in its local frame.
@@ -174,32 +274,8 @@ def support_map(geom: GenericShapeData, direction: wp.vec3, data_provider: Suppo
         result = wp.cw_mul(mesh.points[best_idx], mesh_scale)
 
     elif geom.shape_type == GeoTypeEx.TRIANGLE or geom.shape_type == GeoTypeEx.TRIANGLE_PRISM:
-        # Triangle vertices: a at origin, b at scale, c at auxiliary
-        tri_a = wp.vec3(0.0, 0.0, 0.0)
-        tri_b = geom.scale
-        tri_c = geom.auxiliary
+        result = _support_map_triangle(geom, direction)
 
-        # Compute dot products with direction for each vertex
-        dot_a = wp.dot(tri_a, direction)
-        dot_b = wp.dot(tri_b, direction)
-        dot_c = wp.dot(tri_c, direction)
-
-        # Find the vertex with maximum dot product (furthest in the direction)
-        if dot_a >= dot_b and dot_a >= dot_c:
-            result = tri_a
-        elif dot_b >= dot_c:
-            result = tri_b
-        else:
-            result = tri_c
-
-        # TRIANGLE_PRISM: extrude 1 m along -Z to form a solid prism so
-        # that GJK/MPR naturally resolves shapes on the back side.
-        # The support function is queried in the heightfield's local
-        # frame (orientation_a = heightfield rotation), where -Z is
-        # always the heightfield's down direction.
-        if geom.shape_type == GeoTypeEx.TRIANGLE_PRISM:
-            if direction[2] < 0.0:
-                result = result + wp.vec3(0.0, 0.0, -TRIANGLE_PRISM_EXTRUSION)
     elif geom.shape_type == GeoType.BOX:
         # Use a relative deadband so near-zero direction components
         # (from solver rotation drift ~1e-7) cannot flip the sign
@@ -210,13 +286,7 @@ def support_map(geom: GenericShapeData, direction: wp.vec3, data_provider: Suppo
         result = _support_map_box(geom, direction)
 
     elif geom.shape_type == GeoType.SPHERE:
-        radius = geom.scale[0]
-        dir_len_sq = wp.length_sq(direction)
-        if dir_len_sq > eps:
-            n = direction * _support_rsqrt_rn(dir_len_sq)
-        else:
-            n = wp.vec3(1.0, 0.0, 0.0)
-        result = n * radius
+        result = _support_map_sphere(geom, direction)
 
     elif geom.shape_type == GeoType.CAPSULE:
         radius = geom.scale[0]
@@ -263,50 +333,7 @@ def support_map(geom: GenericShapeData, direction: wp.vec3, data_provider: Suppo
             result = wp.vec3(a, 0.0, 0.0)
 
     elif geom.shape_type == GeoType.CYLINDER:
-        radius = geom.scale[0]
-        half_height = geom.scale[1]
-        barrel_radius = geom.scale[2]
-
-        dir_xy = wp.vec3(direction[0], direction[1], 0.0)
-        dir_xy_len_sq = wp.length_sq(dir_xy)
-
-        if barrel_radius == 0.0:
-            # Keep the regular-cylinder path unchanged.
-            if dir_xy_len_sq > eps:
-                n_xy = dir_xy * _support_rsqrt_rn(dir_xy_len_sq)
-                lateral_point = wp.vec3(n_xy[0] * radius, n_xy[1] * radius, 0.0)
-            else:
-                lateral_point = wp.vec3(radius, 0.0, 0.0)
-
-            if direction[2] > 0.0:
-                result = wp.vec3(lateral_point[0], lateral_point[1], half_height)
-            elif direction[2] < 0.0:
-                result = wp.vec3(lateral_point[0], lateral_point[1], -half_height)
-            else:
-                result = lateral_point
-        else:
-            if dir_xy_len_sq > eps:
-                dir_xy_len = wp.sqrt(dir_xy_len_sq)
-                n_xy = dir_xy / dir_xy_len
-            else:
-                dir_xy_len = 0.0
-                n_xy = wp.vec3(1.0, 0.0, 0.0)
-
-            direction_len = wp.sqrt(dir_xy_len_sq + direction[2] * direction[2])
-            support_z = 0.0
-            if direction_len > eps:
-                support_z = wp.clamp(barrel_radius * direction[2] / direction_len, -half_height, half_height)
-
-            barrel_radius_sq = barrel_radius * barrel_radius
-            half_height_sq = half_height * half_height
-            support_z_sq = support_z * support_z
-            end_offset = wp.sqrt(barrel_radius_sq - half_height_sq)
-            support_offset = wp.sqrt(wp.max(barrel_radius_sq - support_z_sq, 0.0))
-            offset_sum = support_offset + end_offset
-            support_radius = radius
-            if offset_sum > eps:
-                support_radius += (half_height_sq - support_z_sq) / offset_sum
-            result = wp.vec3(n_xy[0] * support_radius, n_xy[1] * support_radius, support_z)
+        result = _support_map_cylinder(geom, direction)
 
     elif geom.shape_type == GeoType.CONE:
         radius = geom.scale[0]
@@ -350,6 +377,32 @@ def support_map(geom: GenericShapeData, direction: wp.vec3, data_provider: Suppo
         # Unhandled type: return origin
         result = wp.vec3(0.0, 0.0, 0.0)
 
+    return result
+
+
+@wp.func
+def support_map_heightfield_sphere(
+    geom: GenericShapeData, direction: wp.vec3, data_provider: SupportMapDataProvider
+) -> wp.vec3:
+    """Restrict support dispatch to an admitted heightfield prism/sphere pair."""
+    result = wp.vec3(0.0, 0.0, 0.0)
+    if geom.shape_type == GeoTypeEx.TRIANGLE_PRISM:
+        result = _support_map_triangle(geom, direction)
+    elif geom.shape_type == GeoType.SPHERE:
+        result = _support_map_sphere(geom, direction)
+    return result
+
+
+@wp.func
+def support_map_heightfield_cylinder(
+    geom: GenericShapeData, direction: wp.vec3, data_provider: SupportMapDataProvider
+) -> wp.vec3:
+    """Restrict support dispatch to an admitted heightfield prism/cylinder pair."""
+    result = wp.vec3(0.0, 0.0, 0.0)
+    if geom.shape_type == GeoTypeEx.TRIANGLE_PRISM:
+        result = _support_map_triangle(geom, direction)
+    elif geom.shape_type == GeoType.CYLINDER:
+        result = _support_map_cylinder(geom, direction)
     return result
 
 
