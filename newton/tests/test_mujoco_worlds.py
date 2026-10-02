@@ -14,7 +14,7 @@ import textwrap
 import traceback
 import unittest
 import weakref
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, fields, is_dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -122,15 +122,13 @@ class MuJoCoWorldsHostTests(unittest.TestCase):
         keywords = {item.arg: item.value for item in workspace_calls[0].keywords}
         self.assertEqual(ast.unparse(keywords["bindings"]), "group.step_bindings")
         self.assertFalse({"world_live_count", "recorder", "observer"} & keywords.keys())
-        record_source = ast.parse(textwrap.dedent(inspect.getsource(MuJoCoWorldPopulation.record_launch)))
-        calls = [ast.unparse(node.func) for node in ast.walk(record_source) if isinstance(node, ast.Call)]
-        self.assertEqual(calls.count("mjw.resolve_step_counts"), 1)
-        self.assertTrue({"wp.launch", "wp.launch_tiled", "wp.capture_launch_count"} <= set(calls))
-        self.assertFalse({"mjw.launch_step_kernel", "mjw.bind_step_launch", "graph_ops.launch"} & set(calls))
+        self.assertNotIn("record_launch", MuJoCoWorldPopulation.__dict__)
         capture_source = inspect.getsource(MuJoCoWorlds.capture)
         self.assertIn("record_launches=True", capture_source)
+        self.assertIn("record_memory_operations=True", capture_source)
         self.assertIn("mjw.bind_step_program", capture_source)
-        self.assertIn("group.application_launches = None", capture_source)
+        self.assertIn("graph_ops.adopt_launches", capture_source)
+        self.assertIn("group.application_ranges = None", capture_source)
 
     def test_base_import_does_not_require_optional_native_components(self):
         """Base Newton must import even when standalone components and physics backends are unavailable."""
@@ -892,6 +890,7 @@ class PopulationRecorderTests(unittest.TestCase):
         """Mock emitted Warp records while retaining native count declaration validation."""
         self.stream = Mock(is_capturing=True)
         self.records = []
+        self.memory_operations = []
 
         class Capture:
             pass
@@ -902,7 +901,7 @@ class PopulationRecorderTests(unittest.TestCase):
         capture.start()
         self.addCleanup(capture.stop)
 
-        def emit(kernel, dim, **kwargs):
+        def emit(kernel, dim, *args, **kwargs):
             dimensions = (dim,) if isinstance(dim, int) else dim
             if not all(dimensions):
                 return None
@@ -946,12 +945,12 @@ class PopulationRecorderTests(unittest.TestCase):
             model=object(),
             contact_quota=2,
             ccd_quota=4,
-            data=SimpleNamespace(qpos=SimpleNamespace(device="cpu")),
+            data=SimpleNamespace(qpos=SimpleNamespace(device="cpu"), nacon=None, ncollision=None),
             world_storage=owner("world"),
             contact_storage=owner("candidate"),
             ccd_storage=owner("ccd"),
-            workspace=SimpleNamespace(bindings=None),
-            application_launches=[],
+            workspace=SimpleNamespace(bindings=None, scratch=object()),
+            application_ranges=[],
         )
         group.view = MuJoCoWorldPopulation(3, group)
         updates = GraphUpdateTable(
@@ -1028,37 +1027,177 @@ class PopulationRecorderTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "closed"):
             _ = view.data
 
-    def test_public_recording_declares_exact_warp_records_and_rejects_wrong_scope(self):
-        """Resolve application names once and associate numeric counts with its exact emitted record."""
+    def _capture(self, group, **callbacks):
+        """Run the real composition root with CPU records and mocked native graph mechanics."""
         import mujoco_warp as mjw
 
+        population = object.__new__(MuJoCoWorlds)
+        population.device = wp.get_device("cpu")
+        population._closed = population._service_failed = population._capture_attempted = False
+        population._directory = directory_ops.allocate((17,), id_capacity=17, command_capacity=17, device="cpu")
+        population._healthy = population._always_permit = population._lifecycle_needed = wp.ones(
+            1, dtype=int, device="cpu"
+        )
+        population._populations = [group]
+        population._retain_graph = Mock()
+        commands = directory_ops.allocate_commands(17, device="cpu")
+        results = directory_ops.allocate_results(17, device="cpu")
+        self.records.clear()
+        self.native_kernel = object()
+        self.native_records = []
+        self.adopted = []
+
+        def native_bind(workspace, graph, records):
+            self.assertIs(workspace, group.workspace)
+            self.native_records.extend(records)
+
+        def application_bind(updates, graph, records, **relations):
+            self.adopted.append((records, relations))
+            return ()
+
+        def capture_if(condition, on_true):
+            if on_true.__name__ == "record_lifecycle":
+                if callbacks.get("validate") is not None:
+                    callbacks["validate"](
+                        commands, population._directory.transaction.status, population._directory.batch_result.consumed
+                    )
+                if callbacks.get("initialize") is not None:
+                    callbacks["initialize"](group.view, None, None, None, None, None, None)
+            else:
+                on_true()
+
+        with ExitStack() as stack:
+            for target, name, options in (
+                (native.wp, "load_module", {}),
+                (native.wp, "get_stream", {"return_value": self.stream}),
+                (native.wp, "synchronize_stream", {}),
+                (native.wp, "capture_if", {"side_effect": capture_if}),
+                (native.wp, "capture_get_launches", {"side_effect": lambda graph: tuple(self.records)}),
+                (
+                    native.wp,
+                    "capture_get_memory_operations",
+                    {"side_effect": lambda graph: tuple(self.memory_operations)},
+                ),
+                (graph_ops, "prepare_updates", {"return_value": group.step_bindings.updates}),
+                (graph_ops, "capture_parallel", {"side_effect": lambda branches: [branch() for branch in branches]}),
+                (graph_ops, "record_update", {}),
+                (graph_ops, "adopt_launches", {"side_effect": application_bind}),
+                (graph_ops, "bind", {}),
+                (graph_ops, "instantiate_and_upload", {}),
+                (graph_ops, "invalidate", {}),
+                (directory_ops, "begin", {}),
+                (mjw, "step", {"side_effect": lambda *args, **kwargs: wp.launch(self.native_kernel, 17)}),
+                (mjw, "kinematics", {}),
+                (mjw, "validate_step_workspace", {}),
+                (mjw, "bind_step_program", {"side_effect": native_bind}),
+            ):
+                stack.enter_context(patch.object(target, name, **options))
+            stack.enter_context(
+                patch.object(native.wp, "ScopedCapture", return_value=nullcontext(SimpleNamespace(graph=self.graph)))
+            )
+            return population.capture(commands, results, **callbacks)
+
+    def test_application_compiler_receives_only_exact_callback_records(self):
+        """The same kernel can bind two call sites to different numeric populations."""
         group, kernel, _ = self.group()
-        view = group.view
-        group.workspace.bindings = group.step_bindings
-        with (
-            patch.object(native.wp, "get_stream", return_value=self.stream),
-            patch.object(mjw, "resolve_step_counts", wraps=mjw.resolve_step_counts) as resolve,
-        ):
-            view.record_launch(kernel, (17, 17), domain="world", parameter_domains={"world_live_count": "world"})
-            resolve.assert_called_once_with(group.step_bindings, kernel, "world", 0, {"world_live_count": "world"})
-            index, actual_kernel, axis, source, parameters = group.application_launches[-1]
-            self.assertEqual((index, axis), (0, 0))
-            self.assertIs(actual_kernel, self.records[index].kernel)
-            self.assertIs(source, view.world_live_count)
-            self.assertEqual(parameters[0].argument_index, 2)
-            view.record_launch(kernel, (17, 17), domain="candidate", tiled=True, block_dim=32)
-            self.assertEqual(group.application_launches[-1][0], 1)
-            self.assertIs(group.application_launches[-1][3], view.contact_storage_ready_count)
-            self.assertEqual(self.launch_tiled.call_args.kwargs["block_dim"], 32)
-            self.assertEqual(group.step_bindings.bindings, [], "Only postcapture adoption owns final bindings")
-            group.workspace.bindings = None
-            with self.assertRaisesRegex(RuntimeError, "callback"):
-                view.record_launch(kernel, (17, 17), domain="world")
-            self.assertEqual(resolve.call_count, 2)
-        group.workspace.bindings = group.step_bindings
-        with patch.object(native.wp, "get_stream", return_value=Mock(is_capturing=False)):
-            with self.assertRaisesRegex(RuntimeError, "capture"):
-                view.record_launch(kernel, (17, 17), domain="world")
+
+        def callback(population):
+            wp.launch(kernel, 17)
+            wp.launch(kernel, 17)
+
+        def compile_application(population, records):
+            self.assertIs(population, group.view)
+            self.assertEqual(len(records), 2)
+            self.assertTrue(all(record.kernel is kernel for record in records))
+            return ((0, 0, population.world_live_count), (1, 0, population.contact_storage_ready_count)), (), ()
+
+        self._capture(group, before_step=callback, application_bindings=compile_application)
+        records, relations = self.adopted[0]
+        self.assertIs(relations["extents"][0][2], group.world_storage.protected_count)
+        self.assertIs(relations["extents"][1][2], group.contact_storage.ready_count)
+        self.assertTrue(all(record.kernel is self.native_kernel for record in self.native_records))
+        self.assertTrue(all(any(record is candidate for candidate in self.records) for record in records))
+        self.assertIsNone(group.application_ranges)
+
+    def test_known_native_kernel_in_callback_still_requires_application_compiler(self):
+        """A physics catalog identity does not authorize application-owned records."""
+        from mujoco_warp._src import sleep
+
+        group, _, _ = self.group()
+        with self.assertRaisesRegex(ValueError, "require application_bindings"):
+            self._capture(group, before_step=lambda population: wp.launch(sleep._wake_collision_kernel, 17))
+        self.assertEqual(self.adopted, [])
+        self.assertIsNone(group.application_ranges)
+
+    def test_application_compiler_rejects_wrong_kernel_identity(self):
+        """Application count declarations are supplied after checking exact code identity."""
+        group, kernel, _ = self.group()
+
+        def compile_application(population, records):
+            if any(record.kernel is not kernel for record in records):
+                raise ValueError("Unexpected application kernel")
+            return (), (), tuple(range(len(records)))
+
+        with self.assertRaisesRegex(ValueError, "Unexpected application kernel"):
+            self._capture(
+                group, before_step=lambda population: wp.launch(object(), 17), application_bindings=compile_application
+            )
+        self.assertEqual(self.adopted, [])
+        self.assertIsNone(group.application_ranges)
+
+    def test_application_memory_operations_require_storage_admission(self):
+        """Count declarations alone cannot authorize full-capacity fills into unbacked storage."""
+        group, kernel, _ = self.group()
+
+        def callback(population):
+            wp.launch(kernel, 17)
+            self.memory_operations.append(SimpleNamespace(launch=self.records[-1]))
+
+        compiler = Mock(return_value=((), (), (0,)))
+        with self.assertRaisesRegex(NotImplementedError, "storage admission"):
+            self._capture(group, before_step=callback, application_bindings=compiler)
+        compiler.assert_not_called()
+        self.assertEqual(self.adopted, [])
+
+    def test_lifecycle_memory_operations_require_storage_admission(self):
+        """Initializer/validator arrays do not inherit native population storage permissions."""
+        for phase in ("initialize", "validate"):
+            with self.subTest(phase=phase):
+                group, kernel, _ = self.group()
+                self.memory_operations.clear()
+
+                def callback(*args, kernel=kernel):
+                    wp.launch(kernel, 17)
+                    self.memory_operations.append(SimpleNamespace(launch=self.records[-1]))
+
+                with self.assertRaisesRegex(NotImplementedError, "Lifecycle fills/copies"):
+                    self._capture(group, **{phase: callback})
+                self.assertEqual(self.adopted, [])
+
+    def test_plain_callback_launches_keep_exact_intervals_and_numeric_sources(self):
+        """Repeated kernels and equal capacities do not merge application ownership."""
+        import mujoco_warp as mjw
+
+        first, kernel, _ = self.group()
+        second, _, _ = self.group()
+        for group in (first, second):
+            group.before_step = lambda view: wp.launch(kernel, (0, 17))
+            group.after_substep = lambda view: wp.launch_tiled(kernel, (17, 17), block_dim=32)
+            group.substeps = 2
+            with (
+                patch.object(mjw, "step", side_effect=lambda *a, **k: wp.launch(object(), 17)),
+                patch.object(mjw, "kinematics"),
+                patch.object(mjw, "validate_step_workspace"),
+                patch.object(native.wp, "capture_if", side_effect=lambda condition, on_true: on_true()),
+            ):
+                group.record_physics()
+        self.assertEqual(first.application_ranges, [(1, 2), (3, 4)])
+        self.assertEqual(second.application_ranges, [(5, 6), (7, 8)])
+        for group in (first, second):
+            self.assertEqual(group.step_bindings.bindings, [])
+            self.assertIsNone(group.before_step)
+            self.assertIsNone(group.after_substep)
+        self.assertTrue(all(self.records[index].kernel is kernel for index in (1, 3, 5, 7)))
 
     def test_physics_and_pose_refresh_share_one_parent_child_scope(self):
         """Contain nested physics conditionals so pose recording cannot depend on earlier siblings."""
@@ -1106,7 +1245,7 @@ class PopulationRecorderTests(unittest.TestCase):
         ):
             group.record_physics()
         self.assertEqual(condition_depths, [0, 1])
-        self.assertEqual(calls, ["control", "step", "after", "validate", "poses"])
+        self.assertEqual(calls, ["control", "validate", "step", "after", "validate", "poses"])
 
     def test_final_callback_validation_failure_rejects_before_pose_recording(self):
         """Reject changed prepared descriptors after the last callback, with or without pose refresh."""
@@ -1115,7 +1254,7 @@ class PopulationRecorderTests(unittest.TestCase):
                 group, _, calls = self.group()
                 group.refresh_kinematics = refresh
                 group.after_substep = lambda view, calls=calls: calls.append("after")
-                validate = Mock(side_effect=ValueError("prepared descriptors changed"))
+                validate = Mock(side_effect=[None, ValueError("prepared descriptors changed")])
                 poses = Mock()
                 with (
                     patch.dict(
@@ -1131,146 +1270,36 @@ class PopulationRecorderTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "prepared descriptors changed"):
                         group.record_physics()
                 self.assertEqual(calls, ["after"])
-                validate.assert_called_once_with(group.workspace, group.model, group.data)
+                self.assertEqual(validate.call_count, 2)
+                validate.assert_called_with(group.workspace, group.model, group.data)
                 poses.assert_not_called()
                 self.assertTrue(group.step_bindings.recording_failed)
                 self.assertIsNone(group.workspace.bindings)
 
-    def test_application_count_schema_is_validated_before_emission_even_for_empty_launches(self):
-        """An invalid declaration cannot leave an unbound kernel in an otherwise usable graph."""
-        group, kernel, calls = self.group()
-        group.workspace.bindings = group.step_bindings
-        with (
-            patch.object(native.wp, "get_stream", return_value=self.stream),
-        ):
-            for dim in ((0, 17), (17, 17)):
-                for options in (
-                    {"domain": "unknown"},
-                    {"domain": "world", "extent_axis": 1},
-                    {"domain": "world", "extent_axis": False},
-                    {"domain": "world", "extent_axis": 0.0},
-                    {"domain": None},
-                    {"domain": "world", "parameter_domains": {"missing": "world"}},
-                    {"domain": "world", "parameter_domains": {"world_live_count": "unknown"}},
-                ):
-                    with self.subTest(dim=dim, options=options), self.assertRaises(ValueError):
-                        group.view.record_launch(kernel, dim, **options)
-            self.launch.assert_not_called()
-            self.assertFalse(
-                group.step_bindings.recording_failed, "A preflight rejection emits nothing and may be corrected"
-            )
-            group.view.record_launch(kernel, (17, 17), domain="world")
-            self.launch.assert_called_once()
-        self.assertEqual(calls, [])
-        self.assertEqual(len(group.application_launches), 1)
-        self.assertEqual(group.step_bindings.bindings, [])
-
-    def test_caught_emission_errors_still_invalidate_the_entire_population_program(self):
-        """A swallowed error from native emission prevents the composition root from publication."""
+    def test_unhandled_callback_error_rejects_recording_and_releases_callbacks(self):
+        """A callback failure cannot leave a retryable or partially usable population program."""
         import mujoco_warp as mjw
 
-        for error in (KeyboardInterrupt("emission"), ValueError("node association")):
-            with self.subTest(error=type(error).__name__):
-                group, kernel, _ = self.group()
-                self.launch.side_effect = error
-
-                def callback(view, kernel=kernel):
-                    try:
-                        view.record_launch(kernel, (17, 17), domain="world")
-                    except BaseException:
-                        pass
-
-                group.before_step = callback
-                with (
-                    patch.object(mjw, "step"),
-                    patch.object(mjw, "kinematics"),
-                    patch.object(mjw, "validate_step_workspace"),
-                    patch.object(native.wp, "capture_if", side_effect=lambda condition, on_true: on_true()),
-                    patch.object(native.wp, "get_stream", return_value=self.stream),
-                    self.assertRaisesRegex(RuntimeError, "failed recording"),
-                ):
-                    group.record_physics()
-                self.assertTrue(group.step_bindings.recording_failed)
-                self.assertIsNone(group.workspace.bindings)
-                self.assertIsNone(group.before_step)
-                with self.assertRaisesRegex(RuntimeError, "failed recording"):
-                    group.record_physics()
-                self.assertEqual(group.step_bindings.bindings, [])
-
-    def test_count_parameter_limit_is_correctable_before_emission(self):
-        """A callback may catch an unsupported count declaration and record a valid replacement."""
         group, kernel, _ = self.group()
-        group.workspace.bindings = group.step_bindings
-        kernel.adj.args = [SimpleNamespace(label=f"count_{index}", type=wp.int32) for index in range(5)]
+
+        def callback(view):
+            wp.launch(kernel, 17)
+            raise ValueError("callback failed")
+
+        group.before_step = callback
         with (
-            patch.object(native.wp, "get_stream", return_value=self.stream),
+            patch.object(mjw, "step"),
+            patch.object(mjw, "kinematics"),
+            patch.object(mjw, "validate_step_workspace"),
+            patch.object(native.wp, "capture_if", side_effect=lambda condition, on_true: on_true()),
+            self.assertRaisesRegex(ValueError, "callback failed"),
         ):
-            with self.assertRaisesRegex(ValueError, "at most four"):
-                group.view.record_launch(
-                    kernel, 17, domain="world", parameter_domains={f"count_{index}": "world" for index in range(5)}
-                )
-            self.launch.assert_not_called()
-            self.assertFalse(group.step_bindings.recording_failed)
-            group.view.record_launch(
-                kernel, 17, domain="world", parameter_domains={f"count_{index}": "world" for index in range(4)}
-            )
-            self.launch.assert_called_once()
-        self.assertEqual(len(group.application_launches[0][-1]), 4)
-
-    def test_equal_kernels_and_shapes_keep_distinct_population_declarations(self):
-        """Equal launches retain distinct exact indices and native count owners; empty work owns no record."""
-        first, kernel, _ = self.group()
-        second, _, _ = self.group()
-        with patch.object(native.wp, "get_stream", return_value=self.stream):
-            for group in (first, second):
-                group.workspace.bindings = group.step_bindings
-                group.view.record_launch(kernel, (0, 17), domain="world")
-                self.assertEqual(group.application_launches, [])
-                group.view.record_launch(kernel, (17, 17), domain="world")
-        self.assertEqual([group.application_launches[0][0] for group in (first, second)], [0, 1])
-        for group in (first, second):
-            self.assertIs(group.application_launches[0][3], group.world_storage.protected_count)
-            self.assertEqual(group.step_bindings.bindings, [])
-
-    def test_unexpected_emission_count_invalidates_capture(self):
-        """A callback cannot silently claim another emitted node or omit its own dynamic declaration."""
-        for emitted in (0, 2):
-            with self.subTest(emitted=emitted):
-                group, kernel, _ = self.group()
-                group.workspace.bindings = group.step_bindings
-                self.launch.side_effect = lambda *args, emitted=emitted, **kwargs: self.records.extend(
-                    [object()] * emitted
-                )
-                with (
-                    patch.object(native.wp, "get_stream", return_value=self.stream),
-                    patch.object(graph_ops, "invalidate") as invalidate,
-                    self.assertRaisesRegex(RuntimeError, "exactly one"),
-                ):
-                    group.view.record_launch(kernel, (17, 17), domain="world")
-                invalidate.assert_called_once_with(self.graph)
-                self.assertTrue(group.step_bindings.recording_failed)
-                self.assertEqual(group.application_launches, [])
-
-    def test_callbacks_cannot_borrow_native_kernel_classification(self):
-        """A known physics kernel emitted by a callback still needs its explicit application declaration."""
-        import mujoco_warp as mjw
-        from mujoco_warp._src import sleep
-
-        for phase in ("before_step", "after_substep"):
-            with self.subTest(phase=phase):
-                group, _, _ = self.group()
-                setattr(group, phase, lambda view: wp.launch(sleep._wake_collision_kernel, 17))
-                with (
-                    patch.object(mjw, "step"),
-                    patch.object(mjw, "kinematics"),
-                    patch.object(native.wp, "capture_if", side_effect=lambda condition, on_true: on_true()),
-                    patch.object(graph_ops, "invalidate") as invalidate,
-                    self.assertRaisesRegex(RuntimeError, "declare every emitted kernel"),
-                ):
-                    group.record_physics()
-                invalidate.assert_called_once_with(self.graph)
-                self.assertTrue(group.step_bindings.recording_failed)
-                self.assertIsNone(group.workspace.bindings)
+            group.record_physics()
+        self.assertTrue(group.step_bindings.recording_failed)
+        self.assertIsNone(group.workspace.bindings)
+        self.assertIsNone(group.before_step)
+        with self.assertRaisesRegex(RuntimeError, "failed recording"):
+            group.record_physics()
 
     def test_model_array_walk_includes_tuple_arrays_and_nested_tile_descriptors(self):
         """Account tuple-held model arrays without interpreting their shapes as world domains."""
@@ -1516,7 +1545,7 @@ def _prototype(keys, mujoco, mjw, *, convex=False):
             raise AssertionError(f"Nonfinite prepared template state: {keys} keys, {name}")
     warm = mjw.replicate_data(data, 1)
     workspace = mjw.make_step_workspace(model, warm)
-    mjw.step(model, warm, workspace=workspace)
+    mjw.step(model, warm, scratch=workspace.scratch)
     mjw.kinematics(model, warm)
     wp.synchronize_stream(wp.get_stream())
     return model, data
@@ -1661,9 +1690,12 @@ class TestMuJoCoWorlds(unittest.TestCase):
                     self.buffers = buffers
 
                 def before_step(self, group):
-                    group.record_launch(
-                        _record_control, 1, inputs=[self.buffers[group.prototype_index]], domain=None, extent_axis=None
-                    )
+                    wp.launch(_record_control, 1, inputs=[self.buffers[group.prototype_index]])
+
+                def application_bindings(self, group, launches):
+                    if any(record.kernel is not _record_control for record in launches):
+                        raise ValueError("Unexpected control kernel")
+                    return (), (), tuple(range(len(launches)))
 
             task = Task(calls)
             task_reference, array_references = weakref.ref(task), [weakref.ref(array) for array in calls]
@@ -1673,7 +1705,12 @@ class TestMuJoCoWorlds(unittest.TestCase):
                 wp.load_module(module=__name__, device=device)
                 with patch.object(graph_ops, "record_update", inject):
                     graph = population.capture(
-                        commands, results, permit=permit, before_step=task.before_step, retain=(injected, *calls)
+                        commands,
+                        results,
+                        permit=permit,
+                        before_step=task.before_step,
+                        application_bindings=task.application_bindings,
+                        retain=(injected, *calls),
                     )
                 del task, calls
                 gc.collect()
@@ -2028,36 +2065,45 @@ class TestMuJoCoWorlds(unittest.TestCase):
             )
 
         def before_step(group):
-            group.record_launch(
-                _record_control, 1, inputs=[counters[group.prototype_index][0]], domain=None, extent_axis=None
-            )
+            wp.launch(_record_control, 1, inputs=[counters[group.prototype_index][0]])
 
         def after_substep(group):
             calls, sticky = counters[group.prototype_index]
-            group.record_launch(
-                _record_substep, group.world_capacity, inputs=[group.data.overflow, sticky, calls], domain="world"
-            )
+            wp.launch(_record_substep, group.world_capacity, inputs=[group.data.overflow, sticky, calls])
 
-        probe = nullcontext()
+        def application_bindings(group, launches):
+            extents, fixed = [], []
+            for index, record in enumerate(launches):
+                if record.kernel is _record_control:
+                    fixed.append(index)
+                elif record.kernel is _record_substep:
+                    extents.append((index, 0, group.world_live_count))
+                else:
+                    raise ValueError("Unexpected dynamics-test callback kernel")
+            return tuple(extents), (), tuple(fixed)
+
+        probe = ExitStack()
         if require_convex:
-            from mujoco_warp._src import collision_driver
+            from mujoco_warp._src import collision_driver, step_program
 
             narrowphase = collision_driver.convex_narrowphase
-            groups = {id(group.workspace.convex): group.view for group in population._populations}
+            groups = {
+                id(group.workspace.scratch.forward.position.collision.convex): group.view
+                for group in population._populations
+            }
 
             def record_convex_pass(*args, **kwargs):
                 narrowphase(*args, **kwargs)
                 group = groups[id(kwargs["scratch"])]
                 # Sleeping's incremental pass clears nccd again; sample before the next pass.
-                group.record_launch(
+                wp.launch(
                     _record_convex_work,
                     1,
                     inputs=[kwargs["scratch"].nccd, group.data.nacon, convex_observed[group.prototype_index]],
-                    domain=None,
-                    extent_axis=None,
                 )
 
-            probe = patch.object(collision_driver, "convex_narrowphase", side_effect=record_convex_pass)
+            probe.enter_context(patch.object(collision_driver, "convex_narrowphase", side_effect=record_convex_pass))
+            probe.enter_context(patch.dict(step_program._KERNEL_DOMAINS, {_record_convex_work: (None, ())}))
         with probe:
             graph = population.capture(
                 commands,
@@ -2068,6 +2114,7 @@ class TestMuJoCoWorlds(unittest.TestCase):
                 substeps=2,
                 before_step=before_step,
                 after_substep=after_substep,
+                application_bindings=application_bindings,
                 retain=(valid, offset, permit, *(array for pair in counters for array in pair), *convex_observed),
             )
         graph_id = int(graph.graph_exec.value)

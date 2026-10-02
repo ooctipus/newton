@@ -1,0 +1,1 @@
+Experimental MuJoCoWorlds callbacks now use ordinary Warp launches. Supply application_bindings to declare exact captured records and numeric count sources; MuJoCoWorldPopulation.record_launch was removed. Prepared native execution borrows explicit stage scratch.
