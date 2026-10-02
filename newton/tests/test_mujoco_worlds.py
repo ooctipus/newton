@@ -1078,21 +1078,63 @@ class PopulationRecorderTests(unittest.TestCase):
             self.assertEqual(depth[0], 2)
             calls.append("control")
 
-        def poses(*args, **kwargs):
+        def poses(model, data):
+            self.assertIs(model, group.model)
+            self.assertIs(data, group.data)
             self.assertEqual(depth[0], 1)
             calls.append("poses")
 
+        def validate(workspace, model, data):
+            self.assertIs(workspace, group.workspace)
+            self.assertIs(model, group.model)
+            self.assertIs(data, group.data)
+            self.assertEqual(depth[0], 2)
+            calls.append("validate")
+
         group.before_step = before
+        group.after_substep = lambda view: calls.append("after")
         with (
             patch.dict(
                 sys.modules,
-                {"mujoco_warp": SimpleNamespace(step=lambda *a, **k: calls.append("step"), kinematics=poses)},
+                {
+                    "mujoco_warp": SimpleNamespace(
+                        step=lambda *a, **k: calls.append("step"), kinematics=poses, validate_step_workspace=validate
+                    )
+                },
             ),
             patch.object(native.wp, "capture_if", side_effect=conditional),
         ):
             group.record_physics()
         self.assertEqual(condition_depths, [0, 1])
-        self.assertEqual(calls, ["control", "step", "poses"])
+        self.assertEqual(calls, ["control", "step", "after", "validate", "poses"])
+
+    def test_final_callback_validation_failure_rejects_before_pose_recording(self):
+        """Reject changed prepared descriptors after the last callback, with or without pose refresh."""
+        for refresh in (True, False):
+            with self.subTest(refresh=refresh):
+                group, _, calls = self.group()
+                group.refresh_kinematics = refresh
+                group.after_substep = lambda view, calls=calls: calls.append("after")
+                validate = Mock(side_effect=ValueError("prepared descriptors changed"))
+                poses = Mock()
+                with (
+                    patch.dict(
+                        sys.modules,
+                        {
+                            "mujoco_warp": SimpleNamespace(
+                                step=Mock(), kinematics=poses, validate_step_workspace=validate
+                            )
+                        },
+                    ),
+                    patch.object(native.wp, "capture_if", side_effect=lambda condition, on_true: on_true()),
+                ):
+                    with self.assertRaisesRegex(ValueError, "prepared descriptors changed"):
+                        group.record_physics()
+                self.assertEqual(calls, ["after"])
+                validate.assert_called_once_with(group.workspace, group.model, group.data)
+                poses.assert_not_called()
+                self.assertTrue(group.step_bindings.recording_failed)
+                self.assertIsNone(group.workspace.bindings)
 
     def test_application_count_schema_is_validated_before_emission_even_for_empty_launches(self):
         """An invalid declaration cannot leave an unbound kernel in an otherwise usable graph."""
@@ -1142,6 +1184,7 @@ class PopulationRecorderTests(unittest.TestCase):
                 with (
                     patch.object(mjw, "step"),
                     patch.object(mjw, "kinematics"),
+                    patch.object(mjw, "validate_step_workspace"),
                     patch.object(native.wp, "capture_if", side_effect=lambda condition, on_true: on_true()),
                     patch.object(native.wp, "get_stream", return_value=self.stream),
                     self.assertRaisesRegex(RuntimeError, "failed recording"),
@@ -1312,7 +1355,13 @@ class PopulationRecorderTests(unittest.TestCase):
 
         with patch.dict(
             sys.modules,
-            {"mujoco_warp": SimpleNamespace(step=step, kinematics=lambda *args, **kwargs: calls.append("poses"))},
+            {
+                "mujoco_warp": SimpleNamespace(
+                    step=step,
+                    kinematics=lambda *args, **kwargs: calls.append("poses"),
+                    validate_step_workspace=Mock(),
+                )
+            },
         ):
             with patch.object(self.native.wp, "capture_if", side_effect=lambda step_condition, on_true: on_true()):
                 group.record_physics()
@@ -1468,7 +1517,7 @@ def _prototype(keys, mujoco, mjw, *, convex=False):
     warm = mjw.replicate_data(data, 1)
     workspace = mjw.make_step_workspace(model, warm)
     mjw.step(model, warm, workspace=workspace)
-    mjw.kinematics(model, warm, workspace=workspace)
+    mjw.kinematics(model, warm)
     wp.synchronize_stream(wp.get_stream())
     return model, data
 
