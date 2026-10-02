@@ -12,6 +12,7 @@ import warp as wp
 
 import newton
 from newton._src.geometry import support_function as support
+from newton._src.geometry.contact_reduction_global import decode_oct
 from newton._src.geometry.narrow_phase import NarrowPhase, write_contact_simple
 from newton.tests.test_heightfield_packed_pairs import logical
 from newton.tests.test_heightfield_primitive_cull import primitive_model
@@ -179,7 +180,11 @@ class TestHeightfieldPrimitiveQuery(unittest.TestCase):
         self.assertEqual(before.keys(), after.keys())
         for key in before:
             np.testing.assert_allclose(before[key][:4], after[key][:4], rtol=2e-6, atol=2e-4)
-            np.testing.assert_allclose(before[key][4:], after[key][4:], rtol=2e-6, atol=2e-4)
+            # Octahedral coordinates are not an isotropic direction metric. Use the
+            # physical 3D normal limit from TestHeightfieldCellReject instead.
+            old_normal = np.asarray(decode_oct(wp.vec2(*before[key][4:])))
+            new_normal = np.asarray(decode_oct(wp.vec2(*after[key][4:])))
+            self.assertLess(float(np.linalg.norm(old_normal - new_normal)), 2e-3)
         observations = []
         for owner, contacts in ((old, old_contacts), (new, new_contacts)):
             count = int(contacts.rigid_contact_count.numpy()[0])
@@ -195,16 +200,29 @@ class TestHeightfieldPrimitiveQuery(unittest.TestCase):
             self.assertTrue(np.isfinite(d).all() and np.isfinite(p).all() and np.isfinite(normals).all())
             np.testing.assert_allclose(np.linalg.norm(normals, axis=1), 1.0, atol=2e-5)
             self.assertLess(float(d.min()), 0.005)
-            pairs = set(
-                zip(
+            shape_pairs = np.column_stack(
+                (
                     contacts.rigid_contact_shape0.numpy()[:count],
                     contacts.rigid_contact_shape1.numpy()[:count],
-                    strict=True,
                 )
             )
-            observations.append((float(d.min()), pairs))
+            pairs = set(map(tuple, shape_pairs.tolist()))
+            observations.append((float(d.min()), pairs, d, p, normals, shape_pairs))
         self.assertAlmostEqual(observations[0][0], observations[1][0], delta=2e-4)
         self.assertEqual(observations[0][1], observations[1][1])
+        # Match public geometry in both directions without imposing reduction row order.
+        for source, target in (observations, observations[::-1]):
+            for pair in source[1]:
+                src = np.all(source[5] == pair, axis=1)
+                dst = np.all(target[5] == pair, axis=1)
+                error = np.maximum.reduce(
+                    (
+                        np.abs(source[2][src][:, None] - target[2][dst][None, :]) / 2e-4,
+                        np.linalg.norm(source[3][src][:, None] - target[3][dst][None, :], axis=2) / 2e-4,
+                        np.linalg.norm(source[4][src][:, None] - target[4][dst][None, :], axis=2) / 2e-3,
+                    )
+                )
+                self.assertLess(float(np.max(np.min(error, axis=1))), 1.0)
 
     def check_loaded_geometry(self, device):
         """Retain separated and deep contacts across slopes, borders and fallback types."""

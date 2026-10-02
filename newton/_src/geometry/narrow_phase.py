@@ -2360,11 +2360,11 @@ class NarrowPhase:
     and custom writers retain the old path.
 
     Experimental, default-off ``NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY=1`` splits
-    heightfield/sphere and heightfield/regular-cylinder queries into typed kernels with
-    the original support, GJK/MPR and manifold math. Other current pair types
-    retain the generic query, including barrel cylinders. Admission requires stock buffered contact writing
-    without finite queries, deterministic mode, speculative contacts or
-    hydroelastic SDFs; no geometry is cached by this option.
+    heightfield/sphere and heightfield/regular-cylinder queries into typed kernels
+    with the original support, GJK/MPR and manifold math. Other current pair types
+    retain the generic query, including barrel cylinders. Admission requires stock
+    buffered contact writing without finite queries, deterministic mode,
+    speculative contacts or hydroelastic SDFs; no geometry is cached by this option.
 
     Experimental ``NEWTON_HEIGHTFIELD_PAIR_CSR=1`` groups stock-writer-admitted
     raw witnesses by shape pair and publishes at most four for supported
