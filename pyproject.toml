@@ -166,9 +166,9 @@ conflicts = [
 
 [tool.uv.sources]
 # Development checkouts for the unpublished component extraction.
-gpu-components = { path = "../../gpu-components", editable = true }
-mujoco-warp = { path = "../../mujoco_warp.wt/dynamic-worlds-workspace", editable = true }
-warp-lang = { index = "nvidia" }
+gpu-components = { path = "../../gpu-components.wt/warp-capture", editable = true }
+mujoco-warp = { path = "../../mujoco_warp.wt/capture-launches", editable = true }
+warp-lang = { path = "../../warp.wt/capture-launches", editable = true }
 torch = [
     { index = "pytorch-cu128", extra = "torch-cu12" },
     { index = "pytorch-cu130", extra = "torch-cu13" },

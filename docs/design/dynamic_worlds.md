@@ -35,7 +35,7 @@ The former `newton.worlds` namespace and Newton's generic allocator, directory a
 
 The `directory` property exposes borrowed `InstanceDirectoryData`, not the mutable directory owner. `batch_result` exposes the outcome and advancement permission. Both remain readable after quarantine or closure; reading metadata does not authorize replay or certify physical readiness.
 
-`populations` returns `MuJoCoWorldPopulation` views. A view exposes its numeric prototype index, immutable model, authoritative Data, reserved capacities, live count, accessible-prefix counts and joint world readiness. Its `record_launch()` operation records an application kernel and its declared count binding inside a preparation callback. It exposes no backing-service or retirement authority.
+`populations` returns `MuJoCoWorldPopulation` views. A view exposes its numeric prototype index, immutable model, authoritative Data, reserved capacities, live count, accessible-prefix counts and joint world readiness. Applications record ordinary Warp kernels; a separate preparation operation binds their exact captured records to numeric count sources. It exposes no backing-service or retirement authority.
 
 A handle is `(instance_id, generation)`. A slot is a prototype-local storage position. Compaction may move a handle to another slot without changing its generation. Symbolic names and scene paths must be resolved outside this numeric relation API.
 
@@ -89,27 +89,32 @@ Every consumed lifecycle batch invalidates transient contact indices. Until nati
 
 ## Record controls and observations
 
-Application callbacks receive a borrowed population view and declare their launch domains through `record_launch()`:
+Application callbacks use ordinary Warp launches. Count semantics belong to a separate preparation operation:
 
 ```python
 def before_step(population):
-    population.record_launch(
-        apply_controls,
-        (population.world_capacity, control_width),
+    wp.launch(
+        apply_controls, (population.world_capacity, control_width),
         inputs=(population.data.ctrl, controls),
-        domain="world",
     )
+
+
+def application_bindings(population, launches):
+    if any(record.kernel is not apply_controls for record in launches):
+        raise ValueError("Unexpected application kernel")
+    extents = tuple((index, 0, population.world_live_count) for index in range(len(launches)))
+    return extents, (), ()
+
+
+graph = runtime.capture(
+    commands, results, before_step=before_step,
+    application_bindings=application_bindings, retain=(controls,),
+)
 ```
 
-`apply_controls`, `controls` and `control_width` are application-provided. The kernel must use the declared leading world axis. `world` is bounded by the live count; `candidate` and `ccd` use their accessible prefixes. A fixed worker grid explicitly uses `domain=None, extent_axis=None` and guards its own accesses. Named int32 count arguments require explicit `parameter_domains`; an integer's value or an array's shape conveys no domain semantics. All external arrays belong in `capture(retain=...)`.
+`application_bindings` receives exactly this population's callback records, in recording order. It returns the numeric `extents`, `parameters`, and `fixed` relations accepted by `gpu_components.graph.adopt_launches`. Every record needs an explicit declaration. Repeated uses of the same kernel may have different count sources; kernel identity and shape never imply ownership. Scalar bindings use `KernelParameterBinding` with explicit int32 argument slots. Fixed records are declared by local index and must guard their own accesses. Application fills/copies are rejected until their storage admission is explicit.
 
-Callbacks run while preparing the graph. `before_step` records controls once before the ordered substeps; `after_substep` records consumers after each native substep. Optional final kinematics refresh also covers valid reset-only frames. Each prototype's conditional program may run on a separate captured branch, while updater completion and global error guards precede every native condition.
-
-`record_launch()` delegates to `mjw.launch_step_kernel`, which resolves native count
-domains and calls the atomic `gpu_components.graph.launch` operation. Newton does
-not emit a raw Warp kernel and separately notify a binding recorder. Graph resource
-retention and preparation invalidation use the shared graph operations; managed
-storage still owns its weak close guards and physical readiness.
+`before_step` records controls once; `after_substep` records consumers after each native substep. Preparation validates native descriptors before each step and after the final callback. Optional final kinematics also covers valid reset-only frames. Updater completion and global error guards precede every prototype's conditional program. Compilation operations and numerical callbacks are released after preparation; only explicit data buffers and numeric bindings remain retained.
 
 ## Resize backing and retire
 
