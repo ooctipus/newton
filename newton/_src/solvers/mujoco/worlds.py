@@ -368,10 +368,11 @@ class _MuJoCoWorldPopulation:
             for _ in range(self.substeps):
                 mjw.step(self.model, self.data, workspace=self.workspace)
                 record_callback(self.after_substep)
+            mjw.validate_step_workspace(self.workspace, self.model, self.data)
 
         def step_and_poses():
             wp.capture_if(self.step_condition, on_true=step)
-            mjw.kinematics(self.model, self.data, workspace=self.workspace)
+            mjw.kinematics(self.model, self.data)
 
         try:
             if self.refresh_kinematics:
