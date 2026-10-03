@@ -4335,6 +4335,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         are validated before any destination physics is modified.
         World-map planning and cached CPU joint-limit edit history remain
         host-side; physical arrays are transferred only on the device.
+        Nonempty transfers withdraw any prepared joint-limit reference entry:
+        copied edit history requires ordinary refresh on subsequent notifications.
         No forward pass, reset, model notification or CPU physics conversion is
         performed. Existing destination array pointers remain stable for graphs.
 
@@ -4423,6 +4425,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             snapshots[name] = dst
         source_ids = wp.array(source_worlds, dtype=wp.int32, device=self.model.device)
         target_ids = wp.array(target_worlds, dtype=wp.int32, device=self.model.device)
+        if source_worlds and self._model_constants is not None:
+            # A transfer can replace the edit history certified during bank preparation.
+            self._model_constants = tuple(
+                (bank, output) for bank, output in self._model_constants if output.ptr != self.mjw_model.jnt_solref.ptr
+            )
         status = self._mujoco_warp.copy_worlds(
             source.mjw_model, source.mjw_data, self.mjw_model, self.mjw_data, source_ids, target_ids
         )
