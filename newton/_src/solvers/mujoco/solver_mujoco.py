@@ -9662,10 +9662,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             and joint_limit_solref is not None
             and not self._raw_solreflimit_validated
         ):
-            mode_np = joint_limit_solref_mode.numpy()
-            raw_np = joint_limit_solref.numpy()
-            raw_mask = mode_np == SOLREF_MODE_RAW
+            raw_mask = solref_mode_np == SOLREF_MODE_RAW
             if np.any(raw_mask):
+                raw_np = joint_limit_solref.numpy()
                 # ``(0, 0)`` is the MuJoCo inherit-default sentinel, not a
                 # misconfiguration; flag only a single zero or mixed signs.
                 invalid = solref_invalid_mask(raw_np[raw_mask])
@@ -9758,7 +9757,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             outputs=[self.mjw_model.jnt_solref],
             device=self.model.device,
         )
-        self.mj_model.jnt_solref[:] = self.mjw_model.jnt_solref.numpy()[0]
+        self.mj_model.jnt_solref[:] = self.mjw_model.jnt_solref[:1].numpy()[0]
 
     def _update_pair_properties(self):
         """Update MuJoCo contact pair properties from Newton custom attributes.

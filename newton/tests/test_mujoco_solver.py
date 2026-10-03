@@ -11999,6 +11999,41 @@ class TestMuJoCoSolverInvweightScaledSolref(unittest.TestCase):
         factor = dof_invweight0 * (1.0 - dmax) if dof_invweight0 > 0.0 and dmax < 1.0 else 1.0
         return _expected_positive_limit_solref(ke, kd, factor)
 
+    def test_solref_notification_reads_only_required_host_values(self):
+        """Read no unused RAW values during force-mode refresh and mirror only world zero."""
+        template = newton.ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(template)
+        link = template.add_link(mass=2.0, inertia=wp.mat33(np.eye(3) * 0.5))
+        joint = template.add_joint_revolute(
+            parent=-1, child=link, limit_lower=-1.0, limit_upper=1.0, limit_ke=2500.0, limit_kd=100.0
+        )
+        template.add_articulation([joint])
+        builder = newton.ModelBuilder()
+        builder.replicate(template, 3)
+        model = builder.finalize()
+        solver = SolverMuJoCo(model, iterations=1, disable_contacts=True)
+        model.joint_limit_ke.assign(np.array([2500.0, 5000.0, 10000.0], dtype=np.float32))
+        solver._raw_solreflimit_validated = False
+        readbacks = []
+        original_numpy = wp.array.numpy
+
+        def record_readback(array, *args, **kwargs):
+            readbacks.append((array.ptr, array.shape))
+            return original_numpy(array, *args, **kwargs)
+
+        with patch.object(wp.array, "numpy", record_readback):
+            solver._update_solref_from_invweight0()
+        mode, raw, output = model.mujoco.solreflimit_mode, model.mujoco.solreflimit, solver.mjw_model.jnt_solref
+        self.assertEqual([shape for ptr, shape in readbacks if ptr == mode.ptr], [mode.shape])
+        self.assertEqual([shape for ptr, shape in readbacks if ptr == raw.ptr], [])
+        self.assertEqual([shape for ptr, shape in readbacks if ptr == output.ptr], [(1, *output.shape[1:])])
+        values = output.numpy()
+        np.testing.assert_array_equal(solver.mj_model.jnt_solref, values[0])
+        for world, ke in enumerate((2500.0, 5000.0, 10000.0)):
+            np.testing.assert_allclose(
+                values[world, 0], self._expected_solref_from_solver(solver, ke, 100.0, None), rtol=1e-5, atol=1e-6
+            )
+
     def test_cpu_and_warp_joint_limit_solref_cases_match(self):
         """CPU and Warp backends must agree for each joint-limit ``solref`` branch."""
         cases = (
