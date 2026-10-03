@@ -27,6 +27,11 @@ and growable `FieldStorage`. The workspace is a passive record; MJWarp's prepara
 validation and reporting functions operate on it. Solver alignment requirements
 remain beside the solver. Ordinary `mjw.step(model, data)` still needs no workspace.
 
+Newton supplies concrete capacity `Data`. MJWarp workspace preparation owns a
+borrowed execution descriptor with symbolic count identities and the same arrays;
+validation checks both descriptors. This projection does not own another physical
+state or certify that every reserved row is backed.
+
 The former `newton.worlds` namespace and Newton's generic allocator, directory and graph implementations are removed. Import each standalone concept directly; there are no compatibility aliases.
 
 ## Public native operations
@@ -115,6 +120,28 @@ graph = runtime.capture(
 `application_bindings` receives exactly this population's callback records, in recording order. It returns the numeric `extents`, `parameters`, and `fixed` relations accepted by `gpu_components.graph.adopt_launches`. Every record needs an explicit declaration. Repeated uses of the same kernel may have different count sources; kernel identity and shape never imply ownership. Scalar bindings use `KernelParameterBinding` with explicit int32 argument slots. Fixed records are declared by local index and must guard their own accesses. Application fills/copies are rejected until their storage admission is explicit.
 
 `before_step` records controls once; `after_substep` records consumers after each native substep. Preparation validates native descriptors before each step and after the final callback. Optional final kinematics also covers valid reset-only frames. Updater completion and global error guards precede every prototype's conditional program. Compilation operations and numerical callbacks are released after preparation; only explicit data buffers and numeric bindings remain retained.
+
+## Borrow live state and export
+
+Population views borrow live arrays; they are not snapshots. A consumer must use
+the current directory placement and wait for the producing work. A generation
+identifies a lifetime, but does not preserve its slot across compaction. The
+application must keep the accessed ranges valid and exclude conflicting replay,
+reset, compaction or retirement until that consumer completes. Include every
+consumer stream when joining maintenance or closure. Retaining Python references
+or a graph alone does not establish this ordering.
+
+A renderer may instead consume an application-owned snapshot: copy only admitted,
+accessible rows after their producer completes, and release the live borrow once
+the copy finishes. Rendering can then proceed independently from the snapshot.
+The application owns its layout and any conversion from physics state.
+
+Raw array `.numpy()` and MJWarp `get_data_into` copy complete array descriptors,
+even when they subsequently select one world. Concrete capacity metadata does not
+prove that these full ranges are physically backed. Such readback is unsupported
+for partially backed population arrays; first copy the required live range into
+an accessible, caller-owned snapshot. No raw foreign-pointer consumer acquires
+readiness, initialization or retirement guarantees merely by receiving a pointer.
 
 ## Resize backing and retire
 
