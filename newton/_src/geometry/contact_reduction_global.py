@@ -890,6 +890,21 @@ def _zero_active_count_kernel(
     ht_active_slots[ht_capacity] = 0
 
 
+@wp.kernel(enable_backward=False)
+def _reset_after_export_kernel(
+    ht_active_slots: wp.array[wp.int32],
+    ht_capacity: int,
+    contact_count: wp.array[wp.int32],
+    ht_insert_failures: wp.array[wp.int32],
+    buffer_overflows: wp.array[wp.int32],
+):
+    """Reset counters after the preceding export retired all active entries."""
+    ht_active_slots[ht_capacity] = 0
+    contact_count[0] = 0
+    ht_insert_failures[0] = 0
+    buffer_overflows[0] = 0
+
+
 class GlobalContactReducer:
     """Global contact reduction using hashtable-based tracking.
 
@@ -1131,6 +1146,31 @@ class GlobalContactReducer:
             dim=1,
             inputs=[self.hashtable.active_slots, self.hashtable.capacity],
             device=self.device,
+        )
+
+    def reset_after_export(self):
+        """Reset counters after an explicitly destructive export.
+
+        Every active key and winner slot must already have been retired by
+        ``create_export_reduced_contacts_kernel(clear_after_export=True)``.
+        Call at the next collision boundary, after consumers have inspected the
+        previous active count and overflow evidence. Raw payload and exported
+        flags remain untouched; the next contact allocations initialize flags.
+        """
+        if self.store_hydroelastic_data or self.enable_contact_reclamation:
+            raise ValueError("Counter-only reset requires a non-hydroelastic reducer without contact reclamation")
+        wp.launch(
+            _reset_after_export_kernel,
+            dim=1,
+            inputs=[
+                self.hashtable.active_slots,
+                self.hashtable.capacity,
+                self.contact_count,
+                self.ht_insert_failures,
+                self.buffer_overflows,
+            ],
+            device=self.device,
+            record_tape=False,
         )
 
     def get_data_struct(self) -> GlobalContactReducerData:
@@ -2145,7 +2185,7 @@ def _roundoff_duplicate_bit_for_slot_pair(
     return 1 << slot_b
 
 
-def create_export_reduced_contacts_kernel(writer_func: Any):
+def create_export_reduced_contacts_kernel(writer_func: Any, *, clear_after_export: bool = False):
     """Create a tiled kernel that exports globally reduced contacts.
 
     One thread block processes each active hashtable entry. Its first 21 lanes
@@ -2153,9 +2193,19 @@ def create_export_reduced_contacts_kernel(writer_func: Any):
     lower-fingerprint representative for roundoff-equivalent geometry. CUDA
     lanes export the seven surviving slots concurrently in fast mode; CPU and
     deterministic paths stream them serially from lane zero.
+
+    Args:
+        writer_func: Writer for contacts selected by the reducer.
+        clear_after_export: Explicitly retire consumed keys and winner slots.
+            This destructive option preserves raw payload, active indices/count
+            and failure counters until the next collision resets them. Callers
+            must finish reduction before export and must not reuse its winners.
+            Standalone export remains nondestructive by default.
     """
     exported_ids_vec = wp.types.vector(length=VALUES_PER_KEY, dtype=wp.int32)
     _module = f"export_reduced_contacts_{writer_func.__name__}"
+    if clear_after_export:
+        _module += "_cleanup"
 
     @wp.func
     def export_contact_id(
@@ -2306,6 +2356,23 @@ def create_export_reduced_contacts_kernel(writer_func: Any):
             # Clear cooperatively so lane 0 finishes exporting before any warp
             # can reuse the shared tile for the next active entry.
             wp.tile_scatter_masked(duplicate_bits, lane, int(0), True)
+
+            if wp.static(clear_after_export):
+                # The tile barrier above finishes all reads of this entry.
+                # Other entries deduplicate through raw payload/flags, which
+                # remain live. Keep counts and failures for later inspection.
+                if parallel_pairs != 0:
+                    if lane < wp.static(VALUES_PER_KEY):
+                        value_idx = lane * ht_capacity + entry_idx
+                        if ht_values[value_idx] != wp.uint64(0):
+                            ht_values[value_idx] = wp.uint64(0)
+                elif lane == 0:
+                    for slot in range(wp.static(VALUES_PER_KEY)):
+                        value_idx = slot * ht_capacity + entry_idx
+                        if ht_values[value_idx] != wp.uint64(0):
+                            ht_values[value_idx] = wp.uint64(0)
+                if lane == 0:
+                    ht_keys[entry_idx] = HASHTABLE_EMPTY_KEY
 
     return export_reduced_contacts_kernel
 

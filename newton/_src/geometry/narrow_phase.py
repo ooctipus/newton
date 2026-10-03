@@ -2373,6 +2373,12 @@ class NarrowPhase:
     its geometry and writer restrictions. Scratch results and GJK indices use
     44 bytes per triangle capacity; only the queue counter is reset per call.
 
+    Experimental, default-off ``NEWTON_REDUCER_EXPORT_CLEANUP=1`` retires consumed
+    winner slots and keys during stock buffered export, then resets only counters
+    at the next collision. Active counts and failure evidence remain available
+    through verification. Custom writers, deterministic, speculative, hydroelastic,
+    finite-query and pair-CSR routes retain the original clear/export lifecycle.
+
     Experimental ``NEWTON_HEIGHTFIELD_PAIR_CSR=1`` groups stock-writer-admitted
     raw witnesses by shape pair and publishes at most four for supported
     heightfield/box and heightfield/convex pairs. Selection prioritizes active
@@ -2614,6 +2620,25 @@ class NarrowPhase:
         self._heightfield_cylinder_split_kernels = (
             create_heightfield_cylinder_split_kernels() if self._heightfield_cylinder_split else ()
         )
+        export_cleanup = os.environ.get("NEWTON_REDUCER_EXPORT_CLEANUP", "0")
+        if export_cleanup not in ("0", "1"):
+            raise ValueError("NEWTON_REDUCER_EXPORT_CLEANUP must be 0 or 1")
+        cleanup_writer_supported = contact_writer_warp_func is None
+        if export_cleanup == "1" and not cleanup_writer_supported:
+            from ..sim.collide import write_contact as cleanup_stock_writer  # noqa: PLC0415
+
+            cleanup_writer_supported = contact_writer_warp_func is cleanup_stock_writer
+        self._reducer_export_cleanup = (
+            export_cleanup == "1"
+            and reduce_contacts
+            and (has_meshes or has_heightfields)
+            and cleanup_writer_supported
+            and not deterministic
+            and not speculative
+            and hydroelastic_sdf is None
+            and not self._heightfield_finite_query
+            and not self._heightfield_pair_csr_requested
+        )
         self._finite_bounds = None
         self._finite_source = None
         self.mesh_sdf_texture_only = mesh_sdf_texture_only
@@ -2810,7 +2835,9 @@ class NarrowPhase:
         if self.reduce_contacts and (has_meshes or has_heightfields):
             # Global contact reducer uses hardcoded BETA_THRESHOLD (0.1mm) same as shared-memory reduction
             # Slot layout: NUM_SPATIAL_DIRECTIONS spatial + 1 max-depth = VALUES_PER_KEY slots per key
-            self.export_reduced_contacts_kernel = create_export_reduced_contacts_kernel(writer_func)
+            self.export_reduced_contacts_kernel = create_export_reduced_contacts_kernel(
+                writer_func, clear_after_export=self._reducer_export_cleanup
+            )
             # Global contact reducer for all mesh contact types
             self.global_contact_reducer = GlobalContactReducer(
                 max_triangle_pairs,
@@ -3385,7 +3412,13 @@ class NarrowPhase:
             if self.reduce_contacts:
                 # Unified global reduction for all mesh contact types.
                 assert self.global_contact_reducer is not None
-                self.global_contact_reducer.clear_active()
+                if self._reducer_export_cleanup:
+                    # The preceding stock export retired its entries. The first
+                    # call uses the constructor's cleared table; no host state
+                    # or device-count read is needed during graph capture.
+                    self.global_contact_reducer.reset_after_export()
+                else:
+                    self.global_contact_reducer.clear_active()
                 reducer_data = self.global_contact_reducer.get_data_struct()
 
                 # Mesh-plane contacts → global reducer (meshes only)
