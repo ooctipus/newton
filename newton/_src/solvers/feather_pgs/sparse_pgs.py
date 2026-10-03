@@ -7,7 +7,7 @@ from functools import cache
 
 import warp as wp
 
-from .friction import FRICTION_PAIR_CUDA
+from .friction import FRICTION_PAIR_CACHED_CUDA, FRICTION_PAIR_CUDA
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -27,6 +27,7 @@ def _get_pgs_solve_sparse_kernel(
     free_row_dofs: int = 0,
     active_rows: bool = False,
     use_support_table: bool = False,
+    contact_triplets: bool = False,
 ) -> wp.Kernel:
     """Build a CUDA sweep over factored articulations and physical free bodies.
 
@@ -50,6 +51,11 @@ def _get_pgs_solve_sparse_kernel(
     topology table. It requires a single factored articulation per world,
     at offset zero, with no physical free-body response.
 
+    ``contact_triplets`` optionally retains tangent metrics within this call
+    and publishes an admitted normal/tangent transaction once. It requires
+    active rows and support tables; unsupported owners retain the ordinary
+    sweep. Runtime metadata guards retain the ordinary update for other rows.
+
     Launch with ``ceil(world_count / 2)`` tiles and 64 threads per tile.
     """
     M, D, S = int(max_constraints), int(max_world_dofs), int(max_row_dofs)
@@ -71,6 +77,7 @@ def _get_pgs_solve_sparse_kernel(
     limit_type = int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
     velocity_limit_type = int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
     active_rows = bool(active_rows) and F == 0 and P == 0
+    contact_triplets = bool(contact_triplets) and active_rows and use_support_table and M >= 3
     active_storage = active_initialize = active_scan = ""
     row_loop = "        for (int row = 0; row < count; ++row) {"
     row_loop_end = "        }"
@@ -421,6 +428,28 @@ def _get_pgs_solve_sparse_kernel(
     sweep_finish = """
         if (global_iteration >= friction_start_iteration && __ballot_sync(MASK, changed != 0) == 0u) break;
 """
+    friction_source = FRICTION_PAIR_CUDA
+    if contact_triplets:
+        triplet_setup, triplet_update = _contact_triplet_code(M, S, Q, contact_type, friction_type)
+        setup += triplet_setup
+        active_scan += "\n        int consumed_tangent = -1;\n"
+        row_update = row_update.replace(
+            "            int indices[",
+            "            const int metric_slot = friction ? contact_metric_slot(parent) : -1;\n"
+            "            const bool metric_ready = metric_slot >= 0\n"
+            "                && ((metric_ready_words[metric_slot / 32] >> (metric_slot & 31)) & 1u) != 0u;\n"
+            "            int indices[",
+            1,
+        ).replace("cross += value * sibling_response;", "if (!metric_ready) cross += value * sibling_response;")
+        row_update = row_update.replace(
+            "cross += __shfl_down_sync(MASK, cross, shift, 32);",
+            "if (!metric_ready) cross += __shfl_down_sync(MASK, cross, shift, 32);",
+        ).replace(
+            "pair = friction_pair_candidate(denominator,",
+            "pair = friction_pair_cached(metric_slot, denominator,",
+        )
+        row_update = triplet_update + row_update
+        friction_source = FRICTION_PAIR_CACHED_CUDA
     writeback = f"""
     for (int d = lane; d < {D}; d += 32) factor_velocity_delta.data[world * {D} + d] = delta[d];
     for (int i = lane; i < count; i += 32) world_impulses.data[offset + i] = impulse[i];
@@ -428,7 +457,7 @@ def _get_pgs_solve_sparse_kernel(
 """
     snippet = (
         "#if defined(__CUDA_ARCH__)\n"
-        + FRICTION_PAIR_CUDA
+        + friction_source
         + setup
         + f"""
     for (int iteration = 0; iteration < iterations; ++iteration) {{
@@ -548,6 +577,151 @@ def _get_pgs_solve_sparse_kernel(
     suffix = "_active" if active_rows else ""
     if use_support_table:
         suffix += "_support_table"
+    if contact_triplets:
+        suffix += "_contact_triplets"
     solve.__name__ = f"pgs_solve_sparse_{M}_{D}_{S}_{F}_{P}{suffix}"
     solve.__qualname__ = solve.__name__
     return wp.kernel(enable_backward=False, module="unique")(solve)
+
+
+def _contact_triplet_code(M: int, S: int, Q: int, contact_type: int, friction_type: int) -> tuple[str, str]:
+    """Native additions for one-call metrics and ordered register-held updates."""
+    pairs = M // 3
+    ready_words = (pairs + 31) // 32
+    setup = f"""
+    __shared__ float metric_storage[{2 * pairs * 5}];
+    __shared__ unsigned metric_ready_storage[{2 * ready_words}];
+    float* metrics = metric_storage + slot * {pairs * 5};
+    unsigned* metric_ready_words = metric_ready_storage + slot * {ready_words};
+    for (int word = lane; word < {ready_words}; word += 32) metric_ready_words[word] = 0u;
+    __syncwarp(MASK);
+    const auto contact_metric_slot = [&](int normal) {{
+        if (!select_active || normal < 0 || normal + 2 >= count
+            || type[normal] != {contact_type}
+            || type[normal + 1] != {friction_type} || type[normal + 2] != {friction_type}
+            || world_row_parent.data[offset + normal] >= 0
+            || world_row_parent.data[offset + normal + 1] != normal
+            || world_row_parent.data[offset + normal + 2] != normal
+            || support.row_class.data[offset + normal + 1]
+                != support.row_class.data[offset + normal + 2]) return -1;
+        // Full, disjoint three-row records make normal/3 injective even when
+        // another row kind precedes a contact or a triplet crosses a mask word.
+        return normal / 3;
+    }};
+    const auto friction_pair_cached = [&](int id, float a, float c, float d,
+        float r0, float r1, float old0, float old1, float radius, float relaxation) {{
+        FrictionPairMetric metric;
+        const bool ready = id >= 0 && ((metric_ready_words[id / 32] >> (id & 31)) & 1u) != 0u;
+        if (ready) {{
+            metric = FrictionPairMetric{{metrics[id * 5], metrics[id * 5 + 1], metrics[id * 5 + 2],
+                metrics[id * 5 + 3], metrics[id * 5 + 4]}};
+        }} else {{
+            metric = friction_pair_metric(a, c, d);
+            if (id >= 0 && lane == 0) {{
+                metrics[id * 5] = metric.scale;
+                metrics[id * 5 + 1] = metric.largest;
+                metrics[id * 5 + 2] = metric.smallest;
+                metrics[id * 5 + 3] = metric.vx;
+                metrics[id * 5 + 4] = metric.vy;
+                metric_ready_words[id / 32] |= 1u << (id & 31);
+            }}
+            __syncwarp(MASK);
+        }}
+        return friction_pair_from_metric(metric, r0, r1, old0, old1, radius, relaxation);
+    }};
+"""
+    update = f"""
+            if (row == consumed_tangent) continue;
+            const int triplet_slot = contact_metric_slot(row);
+            const bool fuse = triplet_slot >= 0 && global_iteration >= friction_start_iteration
+                && isfinite(diagonal[row]) && diagonal[row] > 0.0f
+                && support.row_class.data[offset + row] == support.row_class.data[offset + row + 1]
+                && ((selected_words[(row + 1) / 32] >> ((row + 1) & 31)) & 1u) != 0u;
+            if (fuse) {{
+                const int tangent = row + 1, sibling = row + 2;
+                int indices[{Q}];
+                float velocities[{Q}], normal_responses[{Q}];
+                float tangent_responses[{Q}], sibling_responses[{Q}];
+                float normal_dot = 0.0f;
+                #pragma unroll
+                for (int q = 0; q < {Q}; ++q) {{
+                    const int entry = lane + q * 32;
+                    const int index = entry < {S}
+                        ? support.class_dof.data[support.row_class.data[offset + row] * {S} + entry] : -1;
+                    indices[q] = index;
+                    normal_responses[q] = index >= 0 ? row_factor.data[row_base + row * {S} + entry] : 0.0f;
+                    velocities[q] = index >= 0 ? delta[index] : 0.0f;
+                    if (index >= 0) normal_dot += normal_responses[q] * velocities[q];
+                }}
+                for (int shift = 16; shift > 0; shift >>= 1)
+                    normal_dot += __shfl_down_sync(MASK, normal_dot, shift, 32);
+                const float normal_residual = __shfl_sync(MASK, normal_dot, 0, 32) + rhs[row];
+                const float old_normal = impulse[row];
+                const float new_normal = fmaxf(old_normal - omega * normal_residual / diagonal[row], 0.0f);
+                const float normal_change = new_normal - old_normal;
+                const float radius = fmaxf(world_row_mu.data[offset + tangent] * new_normal, 0.0f);
+                const float old_tangent = impulse[tangent], old_sibling = impulse[sibling];
+                float tangent_change = 0.0f, sibling_change = 0.0f;
+                if (lane == 0) impulse[row] = new_normal;
+                #pragma unroll
+                for (int q = 0; q < {Q}; ++q)
+                    if (indices[q] >= 0 && normal_change != 0.0f)
+                        velocities[q] += normal_responses[q] * normal_change;
+                if (!(radius == 0.0f && old_tangent == 0.0f && old_sibling == 0.0f)) {{
+                    const bool ready = ((metric_ready_words[triplet_slot / 32] >> (triplet_slot & 31)) & 1u) != 0u;
+                    float dot = 0.0f, sibling_dot = 0.0f, cross = 0.0f;
+                    #pragma unroll
+                    for (int q = 0; q < {Q}; ++q) {{
+                        const int entry = lane + q * 32;
+                        const int index = indices[q];
+                        const float value = index >= 0 ? row_factor.data[row_base + tangent * {S} + entry] : 0.0f;
+                        const float sibling_value = index >= 0
+                            ? row_factor.data[row_base + sibling * {S} + entry] : 0.0f;
+                        tangent_responses[q] = value;
+                        sibling_responses[q] = sibling_value;
+                        if (index >= 0) {{
+                            // Use the actual post-normal coordinate, preserving
+                            // the original rounding and sibling-then-first order.
+                            dot += value * velocities[q];
+                            sibling_dot += sibling_value * velocities[q];
+                            if (!ready) cross += value * sibling_value;
+                        }}
+                    }}
+                    for (int shift = 16; shift > 0; shift >>= 1) {{
+                        dot += __shfl_down_sync(MASK, dot, shift, 32);
+                        sibling_dot += __shfl_down_sync(MASK, sibling_dot, shift, 32);
+                        if (!ready) cross += __shfl_down_sync(MASK, cross, shift, 32);
+                    }}
+                    const float residual = __shfl_sync(MASK, dot, 0, 32) + rhs[tangent];
+                    float2 pair = make_float2(0.0f, 0.0f);
+                    if (radius > 0.0f) {{
+                        const float sibling_residual = __shfl_sync(MASK, sibling_dot, 0, 32) + rhs[sibling];
+                        pair = friction_pair_cached(triplet_slot, diagonal[tangent], __shfl_sync(MASK, cross, 0, 32),
+                            diagonal[sibling], residual, sibling_residual, old_tangent, old_sibling, radius, omega);
+                    }}
+                    const float magnitude = sqrtf(pair.x * pair.x + pair.y * pair.y);
+                    const float scale = magnitude > radius ? radius / magnitude : 1.0f;
+                    const float new_tangent = pair.x * scale, new_sibling = pair.y * scale;
+                    tangent_change = new_tangent - old_tangent;
+                    sibling_change = new_sibling - old_sibling;
+                    if (lane == 0) {{ impulse[tangent] = new_tangent; impulse[sibling] = new_sibling; }}
+                    #pragma unroll
+                    for (int q = 0; q < {Q}; ++q) {{
+                        if (indices[q] >= 0) {{
+                            if (sibling_change != 0.0f) velocities[q] += sibling_responses[q] * sibling_change;
+                            if (tangent_change != 0.0f) velocities[q] += tangent_responses[q] * tangent_change;
+                        }}
+                    }}
+                }}
+                if (normal_change != 0.0f || tangent_change != 0.0f || sibling_change != 0.0f) {{
+                    changed = 1;
+                    #pragma unroll
+                    for (int q = 0; q < {Q}; ++q)
+                        if (indices[q] >= 0) delta[indices[q]] = velocities[q];
+                }}
+                consumed_tangent = tangent;
+                __syncwarp(MASK);
+                continue;
+            }}
+"""
+    return setup, update

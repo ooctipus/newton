@@ -1317,6 +1317,16 @@ class SolverFeatherPGS(SolverBase):
     articulation. Dense-factor chains and unsupported features retain the
     existing representation. Selection uses topology and resources, not task names.
 
+    The experimental sparse contact-triplet mode is disabled by default. Set
+    ``FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1`` before construction to cache tangent
+    metrics within each solve and retain admitted normal/tangent updates in
+    registers. It requires the active sparse sweep, one articulated coordinate
+    block per world, support tables, and no physical free-body response. Shared
+    memory limits retain the ordinary sparse owner; unsupported row metadata,
+    linked contacts, delayed friction, and negative relaxation retain ordinary
+    row updates. The mode preserves the selected ordered sweeps and friction
+    law. This feature is experimental and may change without notice.
+
     """
 
     # The default configuration is conformance-tested against body-pair-reduced
@@ -5055,6 +5065,7 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_mass_matrix_size = None
         self._sparse_prepare_contacts = False
         self._sparse_row_support = _SparseRowSupport()
+        self._sparse_contact_triplets = False
         if not (
             self._kernel_overrides.get("sparse_mass_matrix", True)
             and model.device.is_cuda
@@ -5224,6 +5235,18 @@ class SolverFeatherPGS(SolverBase):
                     )
         # Unsupported mixed worlds retain explicit row indices and their existing kernels.
         use_support_table = bool(self._sparse_row_support.enabled)
+        # The opt-in transaction retains five tangent-metric scalars per full
+        # triplet, reset for each solve. Larger capacities keep the ordinary
+        # sparse owner when this extra shared storage exceeds its launch bound.
+        triplet_capacity = self.dense_max_constraints // 3
+        triplet_shared_bytes = 40 * triplet_capacity + 8 * ((triplet_capacity + 31) // 32)
+        self._sparse_contact_triplets = bool(
+            os.environ.get("FEATHER_PGS_SPARSE_CONTACT_TRIPLETS", "0") == "1"
+            and active_rows
+            and use_support_table
+            and triplet_capacity > 0
+            and solve_shared_bytes + triplet_shared_bytes <= shared_limit
+        )
         index_shape = (1, 1, 1) if use_support_table else shape
         self._sparse_row_dof = wp.empty(index_shape, dtype=wp.int32, device=model.device)
         self._sparse_row_factor = wp.empty(shape, dtype=wp.float32, device=model.device)
@@ -5260,6 +5283,7 @@ class SolverFeatherPGS(SolverBase):
             free_row_dofs=6 if self._has_free_rigid_bodies else 0,
             active_rows=active_rows,
             use_support_table=use_support_table,
+            contact_triplets=self._sparse_contact_triplets,
         )
 
     def _build_body_maps(self, model):

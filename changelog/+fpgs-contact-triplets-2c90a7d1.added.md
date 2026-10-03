@@ -1,0 +1,1 @@
+Add the experimental, default-off `FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1` mode for eligible sparse FPGS solves. Reuse each contact's friction metric within a solve and combine ordered normal and tangent updates, retaining the existing iteration budget and fallback for unsupported rows or resource limits.

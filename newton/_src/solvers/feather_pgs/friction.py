@@ -117,12 +117,9 @@ def friction_pair_candidate(
 
 
 # Native kernels use the same bounded solve as the Warp function above.
-FRICTION_PAIR_CUDA = """
-    const auto friction_pair_candidate = [](
-        float a, float c, float d, float r0, float r1,
-        float old0, float old1, float radius, float omega) {
-        if (radius <= 0.0f) return make_float2(0.0f, 0.0f);
-        float scale = fmaxf(fmaxf(a, d), 1.0e-20f);
+# Keep the metric and changing-state expressions shared by native owners. The
+# ordinary owner still expands to the original complete native function.
+_FRICTION_PAIR_METRIC_CUDA = """        float scale = fmaxf(fmaxf(a, d), 1.0e-20f);
         a /= scale; c /= scale; d /= scale;
         float largest = 0.5f * (a + d + sqrtf((a-d)*(a-d) + 4.0f*c*c));
         float smallest = largest > 0.0f ? fmaxf((a*d-c*c) / largest, 0.0f) : 0.0f;
@@ -131,7 +128,8 @@ FRICTION_PAIR_CUDA = """
         float norm = sqrtf(vx*vx + vy*vy);
         if (norm > 0.0f) { vx /= norm; vy /= norm; }
         else { vx = 1.0f; vy = 0.0f; }
-        float r0_rotated = (vx*r0 + vy*r1) / scale;
+"""
+_FRICTION_PAIR_STATE_CUDA = """        float r0_rotated = (vx*r0 + vy*r1) / scale;
         float r1_rotated = (-vy*r0 + vx*r1) / scale;
         float result0 = old0, result1 = old1;
         bool sticking = false;
@@ -197,5 +195,41 @@ FRICTION_PAIR_CUDA = """
             result1 = old1 + vy*(x-old_x) + vx*(y-old_y);
         }
         return make_float2(old0 + omega*(result0-old0), old1 + omega*(result1-old1));
+"""
+FRICTION_PAIR_CUDA = (
+    """
+    const auto friction_pair_candidate = [](
+        float a, float c, float d, float r0, float r1,
+        float old0, float old1, float radius, float omega) {
+        if (radius <= 0.0f) return make_float2(0.0f, 0.0f);
+"""
+    + _FRICTION_PAIR_METRIC_CUDA
+    + _FRICTION_PAIR_STATE_CUDA
+    + """    };
+"""
+)
+
+# A sparse sweep can retain this metric while residuals, impulses, and radius
+# change. Both entries use exactly the same bounded root and relaxation body.
+FRICTION_PAIR_CACHED_CUDA = (
+    """
+    struct FrictionPairMetric { float scale, largest, smallest, vx, vy; };
+    const auto friction_pair_metric = [](float a, float c, float d) {
+"""
+    + _FRICTION_PAIR_METRIC_CUDA
+    + """
+        return FrictionPairMetric{scale, largest, smallest, vx, vy};
+    };
+    const auto friction_pair_from_metric = [](
+        FrictionPairMetric metric, float r0, float r1,
+        float old0, float old1, float radius, float omega) {
+        if (radius <= 0.0f) return make_float2(0.0f, 0.0f);
+        const float scale = metric.scale;
+        const float largest = metric.largest, smallest = metric.smallest;
+        const float vx = metric.vx, vy = metric.vy;
+"""
+    + _FRICTION_PAIR_STATE_CUDA
+    + """
     };
 """
+)
