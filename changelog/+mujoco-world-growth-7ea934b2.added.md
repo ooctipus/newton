@@ -1,0 +1,1 @@
+Add ordered backing growth to experimental `MuJoCoWorlds`, joining historical address reuse without releasing backing, and parallel prototype initialization and compaction under the existing captured lifecycle.

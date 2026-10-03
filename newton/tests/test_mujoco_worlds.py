@@ -18,7 +18,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, fields, is_dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, PropertyMock, patch
 
 import numpy as np
 import warp as wp
@@ -543,6 +543,48 @@ assert 'worlds' not in newton.__all__
             stages.append(matches[0])
         self.assertEqual(stages, sorted(set(stages)), "Execution phases must be distinct and ordered")
 
+    def test_lifecycle_branches_join_before_shared_publication(self):
+        """Disjoint initialization and relocation join before changing shared lifetime relations."""
+        capture = ast.parse(textwrap.dedent(inspect.getsource(MuJoCoWorlds.capture)))
+        lifecycle = next(
+            node for node in ast.walk(capture) if isinstance(node, ast.FunctionDef) and node.name == "record_lifecycle"
+        )
+        stages = []
+        for statement in lifecycle.body:
+            if not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call):
+                continue
+            call = statement.value
+            name = ast.unparse(call.func)
+            if name == "graph_ops.capture_parallel":
+                names = {node.id for node in ast.walk(call) if isinstance(node, ast.Name)}
+                stages.append("initialize" if "record_initialization" in names else "compact")
+            elif name.startswith("directory_ops."):
+                stages.append(name)
+        self.assertEqual(
+            stages,
+            [
+                "directory_ops.admit",
+                "initialize",
+                "directory_ops.publish",
+                "directory_ops.plan_compaction",
+                "compact",
+                "directory_ops.publish_compaction",
+            ],
+        )
+        for branch_name in ("record_initialization", "record_compaction"):
+            branch = next(
+                node for node in lifecycle.body if isinstance(node, ast.FunctionDef) and node.name == branch_name
+            )
+            self.assertFalse(
+                any(
+                    isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "directory_ops"
+                    for node in ast.walk(branch)
+                ),
+                "A parallel prototype branch cannot mutate the shared lifetime directory",
+            )
+
     def test_population_capture_ranges_use_explicit_branches_not_operand_inference(self):
         """A branch owns its exact emitted range even when kernels, shapes and task arrays are shared."""
         capture = ast.parse(textwrap.dedent(inspect.getsource(MuJoCoWorlds.capture)))
@@ -558,6 +600,254 @@ assert 'worlds' not in newton.__all__
                 for node in ast.walk(branch)
             )
         )
+
+    def _growth_fixture(self):
+        """Prepare host-only ownership records; mocked operations track publication ordering."""
+        population = object.__new__(MuJoCoWorlds)
+        population._closed = population._service_failed = False
+        population.device, population._backing = "cpu", object()
+        population._healthy = Mock()
+        population._directory = object()
+        group = _MuJoCoWorldPopulation(None, contact_quota=2, ccd_quota=3)
+        for name, quota in (("world_storage", 1), ("contact_storage", 2), ("ccd_storage", 3)):
+            setattr(
+                group,
+                name,
+                SimpleNamespace(
+                    name=name,
+                    ready_rows=quota,
+                    capacity=4 * quota,
+                    ready_count=object(),
+                    service_failed=False,
+                    arrays={"contact.efc_address": object()},
+                ),
+            )
+        population._populations = (group,)
+        return population, group
+
+    def test_fresh_growth_maps_all_domains_before_ordered_initialization_and_admission(self):
+        """Never publish half a W/C/D mapping plan or expose uninitialized contact scratch."""
+        population, group = self._growth_fixture()
+        current = Mock(spec=wp.Stream, device="cpu", cuda_stream=11)
+        reader = Mock(spec=wp.Stream, device="cpu", cuda_stream=12)
+        events = []
+        current.wait_stream.side_effect = lambda stream: events.append("wait")
+
+        def ready(owner, target):
+            events.append(("ready", owner.name, target))
+            owner.ready_rows = target
+
+        with (
+            patch.object(field_ops, "can_map_backing_without_join", return_value=True, create=True),
+            patch.object(field_ops, "map_backing", side_effect=lambda owner, n: events.append(("map", owner.name, n))),
+            patch.object(field_ops, "publish_ready", side_effect=ready),
+            patch.object(
+                field_ops, "zero", side_effect=lambda owner, **kw: events.append(("zero", owner.name, kw["start"]))
+            ),
+            patch.object(
+                field_ops,
+                "fill",
+                side_effect=lambda owner, *args, **kw: events.append(("fill", owner.name, kw["start"])),
+            ),
+            patch.object(directory_ops, "publish_admissible_slots", side_effect=lambda *args: events.append("admit")),
+            patch.object(native.wp, "get_stream", return_value=current),
+            patch.object(native.wp, "launch", side_effect=lambda *args, **kw: events.append("guard")),
+            patch.object(native.wp, "synchronize_stream", side_effect=AssertionError("Fresh growth joined readers")),
+            patch.object(backing_ops, "maintenance", side_effect=AssertionError("Fresh growth entered maintenance")),
+        ):
+            population.grow_backing((2,), streams=(current, reader))
+        self.assertEqual(
+            events,
+            [
+                "wait",
+                ("map", "world_storage", 2),
+                ("map", "contact_storage", 4),
+                ("map", "ccd_storage", 6),
+                ("ready", "world_storage", 2),
+                ("ready", "contact_storage", 4),
+                ("zero", "contact_storage", 2),
+                ("fill", "contact_storage", 2),
+                ("ready", "ccd_storage", 6),
+                ("zero", "ccd_storage", 3),
+                "admit",
+                "guard",
+            ],
+        )
+        self.assertEqual(group.world_ready_capacity, 2)
+
+    def test_growth_during_capture_rejects_before_service_or_quarantine(self):
+        """Reject a known unsupported call without poisoning healthy population ownership."""
+        population, group = self._growth_fixture()
+        current = Mock(spec=wp.Stream, device="cpu", cuda_stream=11)
+        reader = Mock(spec=wp.Stream, device="cpu", cuda_stream=12)
+        with (
+            patch.object(type(wp.get_device("cpu")), "is_capturing", new_callable=PropertyMock, return_value=True),
+            patch.object(native.wp, "get_stream", return_value=current),
+            patch.object(native.wp, "synchronize_stream") as synchronize,
+            patch.object(
+                field_ops,
+                "can_map_backing_without_join",
+                side_effect=RuntimeError("Mapping requires execution outside graph capture"),
+            ) as query,
+            self.assertRaisesRegex(RuntimeError, "outside graph capture"),
+        ):
+            population.grow_backing((2,), streams=(current, reader))
+        current.wait_stream.assert_not_called()
+        synchronize.assert_not_called()
+        query.assert_not_called()
+        self.assertFalse(population._service_failed)
+        self.assertEqual(group.world_ready_capacity, 1)
+        population._healthy.fill_.assert_not_called()
+
+    def test_historical_growth_uses_joined_service_before_any_mapping(self):
+        """Historical growth adds only mappings and joins publication before returning."""
+        population, group = self._growth_fixture()
+        streams = (Mock(spec=wp.Stream, device="cpu", cuda_stream=11),)
+        events = []
+
+        @contextmanager
+        def maintenance(backing, **kwargs):
+            self.assertIs(backing, population._backing)
+            self.assertEqual(kwargs, {"streams": (11,)})
+            events.append("join")
+            yield
+            events.append("leave")
+
+        def ready(owner, target):
+            events.append("ready")
+            owner.ready_rows = target
+
+        with (
+            patch.object(field_ops, "can_map_backing_without_join", side_effect=(True, False, True), create=True),
+            patch.object(field_ops, "map_backing", side_effect=lambda *args: events.append("map")),
+            patch.object(field_ops, "publish_ready", side_effect=ready),
+            patch.object(field_ops, "zero", side_effect=lambda *args, **kwargs: events.append("initialize")),
+            patch.object(field_ops, "fill"),
+            patch.object(backing_ops, "maintenance", side_effect=maintenance),
+            patch.object(population, "resize_backing", side_effect=AssertionError("Growth cannot release backing")),
+            patch.object(directory_ops, "publish_admissible_slots", side_effect=lambda *args: events.append("admit")),
+            patch.object(native.wp, "get_stream", return_value=streams[0]),
+            patch.object(native.wp, "launch", side_effect=lambda *args, **kwargs: events.append("guard")),
+            patch.object(native.wp, "synchronize_stream", side_effect=lambda *args: events.append("publication_join")),
+        ):
+            population.grow_backing((2,), streams=streams)
+        self.assertEqual(
+            events,
+            [
+                "join",
+                "map",
+                "map",
+                "map",
+                "ready",
+                "ready",
+                "initialize",
+                "ready",
+                "initialize",
+                "admit",
+                "guard",
+                "publication_join",
+                "leave",
+            ],
+        )
+        self.assertEqual(group.world_ready_capacity, 2)
+        for targets in ((0,), (True,), (5,), (), (1, 1)):
+            with self.subTest(targets=targets), self.assertRaises(ValueError):
+                population.grow_backing(targets, streams=streams)
+
+    def test_historical_growth_completion_failure_quarantines_retained_mappings(self):
+        """A failed completion fence cannot leave the populated graph replayable."""
+        population, _ = self._growth_fixture()
+        current = Mock(spec=wp.Stream, device="cpu", cuda_stream=11)
+        with (
+            patch.object(field_ops, "can_map_backing_without_join", return_value=False),
+            patch.object(field_ops, "map_backing") as mapping,
+            patch.object(field_ops, "publish_ready"),
+            patch.object(field_ops, "zero"),
+            patch.object(field_ops, "fill"),
+            patch.object(backing_ops, "maintenance", return_value=nullcontext()),
+            patch.object(directory_ops, "publish_admissible_slots"),
+            patch.object(native.wp, "get_stream", return_value=current),
+            patch.object(native.wp, "launch"),
+            patch.object(native.wp, "synchronize_stream", side_effect=[RuntimeError("completion"), None]),
+            self.assertRaisesRegex(RuntimeError, "completion"),
+        ):
+            population.grow_backing((2,), streams=(current,))
+        self.assertEqual(mapping.call_count, 3)
+        self.assertTrue(population._service_failed)
+        population._healthy.fill_.assert_called_once_with(0)
+
+    def test_growth_budget_rejection_keeps_every_readiness_prefix_unchanged(self):
+        """Completed mappings survive budget rejection as headroom, never as premature readiness."""
+        population, group = self._growth_fixture()
+        current = Mock(spec=wp.Stream, device="cpu", cuda_stream=11)
+        mapped = []
+
+        def mapping(owner, target):
+            if owner is group.contact_storage:
+                raise MemoryError("budget")
+            mapped.append((owner.name, target))
+
+        with (
+            patch.object(field_ops, "can_map_backing_without_join", return_value=True, create=True),
+            patch.object(field_ops, "map_backing", side_effect=mapping),
+            patch.object(field_ops, "publish_ready", side_effect=AssertionError("Readiness changed on budget failure")),
+            patch.object(directory_ops, "publish_admissible_slots", side_effect=AssertionError("Admission changed")),
+            patch.object(native.wp, "get_stream", return_value=current),
+            patch.object(native.wp, "synchronize_stream", side_effect=AssertionError("Clean failure joined readers")),
+            self.assertRaisesRegex(MemoryError, "budget"),
+        ):
+            population.grow_backing((2,), streams=(current,))
+        self.assertEqual(mapped, [("world_storage", 2)])
+        self.assertEqual(group.world_ready_capacity, 1)
+        self.assertFalse(population._service_failed)
+        population._healthy.fill_.assert_not_called()
+
+    def test_growth_publication_and_mapping_errors_quarantine_existing_graphs(self):
+        """A failed ready write or incomplete driver rollback cannot leave retained replay healthy."""
+        for stage in ("preflight", "mapping", "ready", "zero", "admission"):
+            with self.subTest(stage=stage):
+                population, _ = self._growth_fixture()
+                current = Mock(spec=wp.Stream, device="cpu", cuda_stream=11)
+                failure = MemoryError("failed service")
+
+                def mapping(owner, target, stage=stage, failure=failure):
+                    if stage == "mapping":
+                        owner.service_failed = True
+                        raise failure
+
+                with (
+                    patch.object(
+                        field_ops,
+                        "can_map_backing_without_join",
+                        return_value=True,
+                        side_effect=failure if stage == "preflight" else None,
+                    ),
+                    patch.object(field_ops, "map_backing", side_effect=mapping),
+                    patch.object(field_ops, "publish_ready", side_effect=failure if stage == "ready" else None),
+                    patch.object(field_ops, "zero", side_effect=failure if stage == "zero" else None),
+                    patch.object(field_ops, "fill"),
+                    patch.object(
+                        directory_ops, "publish_admissible_slots", side_effect=failure if stage == "admission" else None
+                    ),
+                    patch.object(native.wp, "get_stream", return_value=current),
+                    patch.object(native.wp, "synchronize_stream") as synchronize,
+                    self.assertRaises(MemoryError) as caught,
+                ):
+                    population.grow_backing((2,), streams=(current,))
+                self.assertIs(caught.exception, failure)
+                self.assertTrue(population._service_failed)
+                population._healthy.fill_.assert_called_once_with(0)
+                synchronize.assert_called_once_with(current)
+
+    def test_bad_publication_receipt_latches_replay_health(self):
+        """A later valid receipt cannot heal a population whose directory service failed."""
+        status = wp.full(1, int(InstanceStatus.PHASE_INVALID), dtype=int, device="cpu")
+        healthy = wp.ones(1, dtype=int, device="cpu")
+        wp.launch(native._guard_backing_publication, 1, [status, healthy], device="cpu")
+        np.testing.assert_array_equal(healthy.numpy(), [0])
+        status.zero_()
+        wp.launch(native._guard_backing_publication, 1, [status, healthy], device="cpu")
+        np.testing.assert_array_equal(healthy.numpy(), [0])
 
     def test_all_safe_shrinks_precede_growth_with_one_shared_backing_budget(self):
         """Return every safe prefix before any growth consumes the shared byte budget."""
@@ -1017,6 +1307,7 @@ class PopulationRecorderTests(unittest.TestCase):
             "compaction_transfer",
             "close",
             "resize_backing",
+            "grow_backing",
             "bind_launch",
         ):
             self.assertFalse(hasattr(view, name), name)
@@ -1277,11 +1568,7 @@ class PopulationRecorderTests(unittest.TestCase):
         with (
             patch.dict(
                 sys.modules,
-                {
-                    "mujoco_warp": SimpleNamespace(
-                        step=step, kinematics=poses, validate_step_workspace=validate
-                    )
-                },
+                {"mujoco_warp": SimpleNamespace(step=step, kinematics=poses, validate_step_workspace=validate)},
             ),
             patch.object(native.wp, "capture_if", side_effect=conditional),
         ):
@@ -1595,6 +1882,51 @@ def _prototype(keys, mujoco, mjw, *, convex=False):
 
 class TestMuJoCoWorlds(unittest.TestCase):
     """Exercise a caller-controlled CUDA device; default CPU suites skip this gate."""
+
+    @unittest.skipUnless(
+        os.environ.get("NEWTON_TEST_CUDA_UUID"), "Set an explicit CUDA UUID for native population tests"
+    )
+    def test_growth_rejects_capture_on_another_stream_without_poisoning(self):
+        """Preserve a live capture and population when growth is attempted from another stream."""
+        import mujoco
+        import mujoco_warp as mjw
+
+        wp.init()
+        device = wp.get_device("cuda:0")
+        self.assertEqual(wp.get_cuda_device_count(), 1)
+        self.assertEqual(device.uuid, os.environ["NEWTON_TEST_CUDA_UUID"])
+        self.assertEqual(os.environ.get("CUDA_VISIBLE_DEVICES"), device.uuid)
+        with wp.ScopedDevice(device):
+            prepared = [_prototype(6, mujoco, mjw)]
+            population = MuJoCoWorlds(
+                prepared,
+                world_capacities=(4,),
+                id_capacity=1,
+                command_capacity=1,
+                memory_budget_bytes=64 * 1024**2,
+                initial_world_ready_capacities=(0,),
+            )
+            counter = wp.zeros(1, dtype=int, device=device)
+            capture_stream, service = wp.Stream(device), wp.Stream(device)
+            wp.load_module(module=__name__, device=device)
+            try:
+                with wp.ScopedCapture(stream=capture_stream, capture_mode=wp.CaptureMode.THREAD_LOCAL) as capture:
+                    wp.launch(_record_control, 1, [counter], stream=capture_stream)
+                    with wp.ScopedStream(service, sync_enter=False, sync_exit=False):
+                        self.assertFalse(service.is_capturing)
+                        self.assertTrue(device.is_capturing)
+                        with self.assertRaisesRegex(RuntimeError, "outside graph capture"):
+                            population.grow_backing((1,), streams=(service,))
+                    wp.launch(_record_control, 1, [counter], stream=capture_stream)
+                wp.capture_launch(capture.graph)
+                np.testing.assert_array_equal(counter.numpy(), [2])
+                self.assertFalse(population._service_failed)
+                np.testing.assert_array_equal(population._healthy.numpy(), [1])
+                self.assertEqual(population.populations[0].world_ready_capacity, 0)
+                population.grow_backing((1,), streams=(wp.get_stream(device),))
+                self.assertGreaterEqual(population.populations[0].world_ready_capacity, 1)
+            finally:
+                population.close(streams=(wp.get_stream(device),))
 
     @unittest.skipUnless(
         os.environ.get("NEWTON_TEST_CUDA_UUID"), "Set an explicit CUDA UUID for native population tests"
@@ -2144,7 +2476,9 @@ class TestMuJoCoWorlds(unittest.TestCase):
                         inputs=[kwargs["scratch"].nccd, group.data.nacon, convex_observed[group.prototype_index]],
                     )
 
-                probe.enter_context(patch.object(collision_driver, "convex_narrowphase", side_effect=record_convex_pass))
+                probe.enter_context(
+                    patch.object(collision_driver, "convex_narrowphase", side_effect=record_convex_pass)
+                )
             graph = population.capture(
                 commands,
                 results,
@@ -2208,7 +2542,17 @@ class TestMuJoCoWorlds(unittest.TestCase):
                     int(count) + sum(op in (_CREATE, _REPLACE) and target == p for _, op, _, _, target in requests)
                     for p, count in enumerate(population.directory.live_count.numpy())
                 )
-                population.resize_backing(targets, streams=(wp.get_stream(device),))
+                consumer = wp.get_stream(device)
+                if all(
+                    target >= group.world_ready_capacity
+                    for group, target in zip(population.populations, targets, strict=True)
+                ):
+                    service = wp.Stream(device)
+                    with wp.ScopedStream(service):
+                        population.grow_backing(targets, streams=(consumer,))
+                    consumer.wait_stream(service)
+                else:
+                    population.resize_backing(targets, streams=(consumer,))
             do_step = case in ("step", "delete", "invalid", "empty")
             permit.fill_(int(do_step))
             commands.sequence.fill_(sequence)

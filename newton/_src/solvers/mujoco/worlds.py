@@ -10,6 +10,7 @@ Native Data is authoritative; this root owns no dense Newton State mirror.
 import sys
 import traceback
 import weakref
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
@@ -45,6 +46,12 @@ def _guard_health(batch: InstanceBatchResult, t: InstanceTransaction, healthy: w
         batch.status[0] = int(InstanceStatus.PHASE_INVALID)
         t.phase[0] = int(InstancePhase.IDLE)
     lifecycle[0] = wp.int32(batch.consumed[0] != 0 or batch.status[0] != 0)
+
+
+@wp.kernel
+def _guard_backing_publication(status: wp.array[int], healthy: wp.array[int]):
+    if status[0] != int(InstanceStatus.OK):
+        healthy[0] = 0
 
 
 @wp.kernel
@@ -230,7 +237,7 @@ class MuJoCoWorldPopulation:
 
     @property
     def world_ready_capacity(self) -> int:
-        """Return the last joined W/C/D ready prefix without a device readback."""
+        """Return the published W/C/D prefix; consumers must follow backing-service stream ordering."""
         return self._borrow().world_ready_capacity
 
 
@@ -648,8 +655,8 @@ class MuJoCoWorlds:
         transaction stage, not current-frame activity.
 
         Callers may observe this population's directory, but must submit mutations
-        through this captured lifecycle and resize_backing. Independently invoking
-        the owned directory's mutating methods bypasses native state ownership.
+        through this captured lifecycle and the backing-service operations.
+        Independently invoking the owned directory's mutating methods bypasses native state ownership.
 
         Args:
             commands: Caller-owned lifecycle buffers with increasing batch sequence.
@@ -754,7 +761,8 @@ class MuJoCoWorlds:
                                 commands, self._directory.transaction.status, self._directory.batch_result.consumed
                             )
                         directory_ops.admit(self._directory, commands)
-                        for prototype, group in enumerate(self._populations):
+
+                        def record_initialization(prototype, group):
                             wp.launch(
                                 _initialization_ids,
                                 self._directory.command_capacity,
@@ -797,9 +805,15 @@ class MuJoCoWorlds:
                                 ],
                                 device=self.device,
                             )
+
+                        graph_ops.capture_parallel(
+                            lambda prototype=prototype, group=group: record_initialization(prototype, group)
+                            for prototype, group in enumerate(self._populations)
+                        )
                         directory_ops.publish(self._directory, commands, results)
                         directory_ops.plan_compaction(self._directory)
-                        for prototype, group in enumerate(self._populations):
+
+                        def record_compaction(prototype, group):
                             wp.launch(
                                 _relocation_count,
                                 1,
@@ -830,6 +844,11 @@ class MuJoCoWorlds:
                                 ],
                                 device=self.device,
                             )
+
+                        graph_ops.capture_parallel(
+                            lambda prototype=prototype, group=group: record_compaction(prototype, group)
+                            for prototype, group in enumerate(self._populations)
+                        )
                         directory_ops.publish_compaction(self._directory)
 
                     wp.capture_if(self._lifecycle_needed, on_true=record_lifecycle)
@@ -982,6 +1001,108 @@ class MuJoCoWorlds:
                 field_ops.retain_graph(owner, graph, group.workspace, group.step_condition, group.kinematics_condition)
         self._graph = weakref.ref(graph)
         return graph
+
+    def grow_backing(self, world_ready_capacities: tuple[int, ...], *, streams: tuple[wp.Stream, ...]):
+        """Grow coherent W/C/D prefixes, joining only for historical address reuse.
+
+        Service requires no active capture on this device. The caller excludes
+        new submissions during service. Fresh suffix mapping
+        leaves earlier admitted accesses untouched. Ready counts, contact/CCD
+        initialization and directory admission are queued on the current stream
+        after the supplied reader streams. Subsequent consumers must use this
+        stream or wait for it; return does not certify GPU completion. World Data
+        still initializes through the captured admission protocol before going live.
+
+        All mappings precede readiness publication. A clean budget failure leaves
+        readiness unchanged and retains any newly mapped headroom for a retry.
+        Other service failures quarantine the population. Directory publication
+        errors latch device health, suppressing every later graph replay. Growth
+        that reuses historical addresses joins readers and publication; it still
+        only adds mappings, preserving any existing limit on unmapped spares.
+        Shrinking and spare trimming remain explicit resize_backing operations.
+        """
+        with wp.ScopedDevice(self.device):
+            self._ensure_open()
+            if wp.get_device(self.device).is_capturing:
+                raise RuntimeError("Backing growth requires execution outside graph capture")
+            if self._backing is None:
+                raise RuntimeError("This population has fixed backing")
+            world_ready_capacities = tuple(world_ready_capacities)
+            if len(world_ready_capacities) != len(self._populations) or any(
+                type(n) is not int
+                or not group.world_ready_capacity <= n <= group.world_storage.capacity
+                or n * group.contact_quota > group.contact_storage.capacity
+                or n * group.ccd_quota > group.ccd_storage.capacity
+                for n, group in zip(world_ready_capacities, self._populations, strict=True)
+            ):
+                raise ValueError("Growth must preserve ready worlds and fit prepared W/C/D capacities")
+            streams = tuple(streams)
+            if not streams or any(
+                not isinstance(stream, wp.Stream) or stream.device != self.device for stream in streams
+            ):
+                raise ValueError("Backing service requires existing Warp streams on the population device")
+            services = [
+                (group, owner, target)
+                for group, n in zip(self._populations, world_ready_capacities, strict=True)
+                for owner, target in (
+                    (group.world_storage, n),
+                    (group.contact_storage, n * group.contact_quota),
+                    (group.ccd_storage, n * group.ccd_quota),
+                )
+                if target > owner.ready_rows
+            ]
+            if not services:
+                return
+            current = wp.get_stream(self.device)
+            try:
+                for stream in streams:
+                    if stream.cuda_stream != current.cuda_stream:
+                        current.wait_stream(stream)
+                fresh = all(
+                    tuple(field_ops.can_map_backing_without_join(owner, target) for _, owner, target in services)
+                )
+            except BaseException as failure:
+                self._quarantine_service(failure)
+                raise
+            budget_rejected = False
+            try:
+                with (
+                    nullcontext()
+                    if fresh
+                    else backing_ops.maintenance(self._backing, streams=tuple(stream.cuda_stream for stream in streams))
+                ):
+                    for _, owner, target in services:
+                        try:
+                            field_ops.map_backing(owner, target)
+                        except MemoryError:
+                            budget_rejected = not owner.service_failed
+                            raise
+                    for group, owner, target in services:
+                        old_ready = owner.ready_rows
+                        field_ops.publish_ready(owner, target)
+                        if owner is not group.world_storage:
+                            field_ops.zero(owner, count=owner.ready_count, start=old_ready)
+                            if owner is group.contact_storage:
+                                field_ops.fill(
+                                    owner,
+                                    owner.arrays["contact.efc_address"],
+                                    -1,
+                                    count=owner.ready_count,
+                                    start=old_ready,
+                                )
+                    status = directory_ops.publish_admissible_slots(
+                        self._directory, tuple(group.world_ready_capacity for group in self._populations)
+                    )
+                    wp.launch(_guard_backing_publication, 1, [status, self._healthy], device=self.device)
+                    if not fresh:
+                        wp.synchronize_stream(current)
+            except MemoryError as failure:
+                if not budget_rejected:
+                    self._quarantine_service(failure)
+                raise
+            except BaseException as failure:
+                self._quarantine_service(failure)
+                raise
 
     def resize_backing(
         self, world_ready_capacities: tuple[int, ...], *, streams: tuple[wp.Stream, ...], spare_bytes: int | None = None
