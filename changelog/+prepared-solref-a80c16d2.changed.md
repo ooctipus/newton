@@ -1,0 +1,1 @@
+Prepare joint-limit solver references alongside immutable model constants when every initial world and variant has identical gain and mode edit history without RAW modes. Other banks retain ordinary refresh and validation; later generic edits still invalidate registration and detect gain-mode transitions. Existing callers require no changes.

@@ -32,6 +32,7 @@ For reviews, also read and apply the [review guidelines](REVIEW_GUIDELINES.rst) 
 - Reject unsafe copy aliasing before launch. Exact self-copy can do no work; disjoint packed fields remain valid even when their enclosing address spans overlap.
 - Key typed fill patterns by canonical element bytes, never display representations. Equivalent typed values share prepared patterns; distinct bytes remain distinct, including during capture.
 - Numerical parity must reject nonfinite state explicitly. Include allocation reuse and poisoned scratch in first-write regressions; matching NaNs are not evidence of correct dynamics.
+- Omit a generic derived-property refresh only when the prepared bank proves its edit provenance remains unchanged. Keep that certificate in the existing bank relation; do not add a mirrored cache flag or bypass later generic invalidation and mode transitions.
 - Keep test-only fault injection out of public constructors. Patch private driver loaders in tests instead of exporting a fake-driver callback ABI.
 - Document every supported public owner method and property so the API documentation filter cannot silently hide operations; gate this without asserting incidental prose or inherited members.
 - Verify decorated Warp records in rendered Sphinx pages: every field needs its source description and type, and compiler metadata must not appear as public record members.
