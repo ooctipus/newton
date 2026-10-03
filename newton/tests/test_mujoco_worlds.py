@@ -119,9 +119,11 @@ class MuJoCoWorldsHostTests(unittest.TestCase):
             and node.func.attr == "make_step_workspace"
         ]
         self.assertEqual(len(workspace_calls), 1)
+        self.assertEqual(ast.unparse(workspace_calls[0].args[1]), "group.data")
         keywords = {item.arg: item.value for item in workspace_calls[0].keywords}
         self.assertEqual(ast.unparse(keywords["bindings"]), "group.step_bindings")
         self.assertFalse({"world_live_count", "recorder", "observer"} & keywords.keys())
+        self.assertNotIn("CountParameter", inspect.getsource(native), "MJWarp owns its prepared execution projection")
         self.assertNotIn("record_launch", MuJoCoWorldPopulation.__dict__)
         capture_source = inspect.getsource(MuJoCoWorlds.capture)
         self.assertIn("record_launches=True", capture_source)
@@ -897,6 +899,7 @@ class PopulationRecorderTests(unittest.TestCase):
 
         self.graph = Capture()
         self.graph.device = wp.get_device("cpu")
+        self.graph.graph_exec = None
         capture = patch.object(graph_ops, "current_capture", return_value=self.graph)
         capture.start()
         self.addCleanup(capture.stop)
@@ -952,6 +955,8 @@ class PopulationRecorderTests(unittest.TestCase):
             workspace=SimpleNamespace(bindings=None, scratch=object()),
             application_ranges=[],
         )
+        group.workspace.data = group.data
+        group.workspace.execution_data = SimpleNamespace(qpos=group.data.qpos)
         group.view = MuJoCoWorldPopulation(3, group)
         updates = GraphUpdateTable(
             enable_count=group.world_storage.protected_count,
@@ -1027,7 +1032,7 @@ class PopulationRecorderTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "closed"):
             _ = view.data
 
-    def _capture(self, group, **callbacks):
+    def _capture(self, group, *, publication=None, **callbacks):
         """Run the real composition root with CPU records and mocked native graph mechanics."""
         import mujoco_warp as mjw
 
@@ -1040,12 +1045,14 @@ class PopulationRecorderTests(unittest.TestCase):
         )
         population._populations = [group]
         population._retain_graph = Mock()
+        self.population = population
         commands = directory_ops.allocate_commands(17, device="cpu")
         results = directory_ops.allocate_results(17, device="cpu")
         self.records.clear()
         self.native_kernel = object()
         self.native_records = []
         self.adopted = []
+        self.invalidations = []
 
         def native_bind(workspace, graph, records):
             self.assertIs(workspace, group.workspace)
@@ -1054,6 +1061,12 @@ class PopulationRecorderTests(unittest.TestCase):
         def application_bind(updates, graph, records, **relations):
             self.adopted.append((records, relations))
             return ()
+
+        def invalidate(graph):
+            if graph.graph_exec is not None:
+                raise RuntimeError("Cannot invalidate an instantiated graph")
+            self.invalidations.append(graph)
+            graph._preparation_failed = True
 
         def capture_if(condition, on_true):
             if on_true.__name__ == "record_lifecycle":
@@ -1083,8 +1096,8 @@ class PopulationRecorderTests(unittest.TestCase):
                 (graph_ops, "record_update", {}),
                 (graph_ops, "adopt_launches", {"side_effect": application_bind}),
                 (graph_ops, "bind", {}),
-                (graph_ops, "instantiate_and_upload", {}),
-                (graph_ops, "invalidate", {}),
+                (graph_ops, "instantiate_and_upload", {"side_effect": publication}),
+                (graph_ops, "invalidate", {"side_effect": invalidate}),
                 (directory_ops, "begin", {}),
                 (mjw, "step", {"side_effect": lambda *args, **kwargs: wp.launch(self.native_kernel, 17)}),
                 (mjw, "kinematics", {}),
@@ -1096,6 +1109,29 @@ class PopulationRecorderTests(unittest.TestCase):
                 patch.object(native.wp, "ScopedCapture", return_value=nullcontext(SimpleNamespace(graph=self.graph)))
             )
             return population.capture(commands, results, **callbacks)
+
+    def test_publication_failure_preserves_created_execution_ownership_and_quarantines(self):
+        """Preserve publication errors and quarantine without invalidating a retained executable."""
+        for created in (False, True):
+            with self.subTest(created=created):
+                group, _, _ = self.group()
+                failure = RuntimeError("completion failed" if created else "instantiation failed")
+                executable = object() if created else None
+
+                def publication(updates, graph, executable=executable, failure=failure):
+                    graph.graph_exec = executable
+                    graph._preparation_failed = True
+                    raise failure
+
+                with self.assertRaises(RuntimeError) as caught:
+                    self._capture(group, publication=publication)
+                self.assertIs(caught.exception, failure)
+                self.assertIs(self.graph.graph_exec, executable)
+                self.assertEqual(self.invalidations, [] if created else [self.graph])
+                np.testing.assert_array_equal(self.population._healthy.numpy(), [0])
+                self.assertIsNone(group.workspace.bindings)
+                self.assertIsNone(group.before_step)
+                self.assertIsNone(group.after_substep)
 
     def test_application_compiler_receives_only_exact_callback_records(self):
         """The same kernel can bind two call sites to different numeric populations."""
@@ -1219,9 +1255,15 @@ class PopulationRecorderTests(unittest.TestCase):
 
         def poses(model, data):
             self.assertIs(model, group.model)
-            self.assertIs(data, group.data)
+            self.assertIs(data, group.workspace.execution_data)
             self.assertEqual(depth[0], 1)
             calls.append("poses")
+
+        def step(model, data, *, scratch):
+            self.assertIs(model, group.model)
+            self.assertIs(data, group.workspace.execution_data)
+            self.assertIs(scratch, group.workspace.scratch)
+            calls.append("step")
 
         def validate(workspace, model, data):
             self.assertIs(workspace, group.workspace)
@@ -1237,7 +1279,7 @@ class PopulationRecorderTests(unittest.TestCase):
                 sys.modules,
                 {
                     "mujoco_warp": SimpleNamespace(
-                        step=lambda *a, **k: calls.append("step"), kinematics=poses, validate_step_workspace=validate
+                        step=step, kinematics=poses, validate_step_workspace=validate
                     )
                 },
             ),
@@ -2082,29 +2124,27 @@ class TestMuJoCoWorlds(unittest.TestCase):
                     raise ValueError("Unexpected dynamics-test callback kernel")
             return tuple(extents), (), tuple(fixed)
 
-        probe = ExitStack()
-        if require_convex:
-            from mujoco_warp._src import collision_driver, step_program
+        with ExitStack() as probe:
+            if require_convex:
+                from mujoco_warp._src import collision_driver
 
-            narrowphase = collision_driver.convex_narrowphase
-            groups = {
-                id(group.workspace.scratch.forward.position.collision.convex): group.view
-                for group in population._populations
-            }
+                narrowphase = collision_driver.convex_narrowphase
+                groups = {
+                    id(group.workspace.scratch.forward.position.collision.convex): group.view
+                    for group in population._populations
+                }
 
-            def record_convex_pass(*args, **kwargs):
-                narrowphase(*args, **kwargs)
-                group = groups[id(kwargs["scratch"])]
-                # Sleeping's incremental pass clears nccd again; sample before the next pass.
-                wp.launch(
-                    _record_convex_work,
-                    1,
-                    inputs=[kwargs["scratch"].nccd, group.data.nacon, convex_observed[group.prototype_index]],
-                )
+                def record_convex_pass(*args, **kwargs):
+                    narrowphase(*args, **kwargs)
+                    group = groups[id(kwargs["scratch"])]
+                    # Sleeping's incremental pass clears nccd again; sample before the next pass.
+                    wp.launch(
+                        _record_convex_work,
+                        1,
+                        inputs=[kwargs["scratch"].nccd, group.data.nacon, convex_observed[group.prototype_index]],
+                    )
 
-            probe.enter_context(patch.object(collision_driver, "convex_narrowphase", side_effect=record_convex_pass))
-            probe.enter_context(patch.dict(step_program._KERNEL_DOMAINS, {_record_convex_work: (None, ())}))
-        with probe:
+                probe.enter_context(patch.object(collision_driver, "convex_narrowphase", side_effect=record_convex_pass))
             graph = population.capture(
                 commands,
                 results,

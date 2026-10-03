@@ -285,6 +285,7 @@ class _MuJoCoWorldPopulation:
         if self.workspace.bindings is not None and self.workspace.bindings is not self.step_bindings:
             raise RuntimeError("Native workspace already has step bindings")
         self.workspace.bindings = self.step_bindings
+        data = self.workspace.execution_data
 
         def record_callback(callback):
             if callback is None:
@@ -300,13 +301,13 @@ class _MuJoCoWorldPopulation:
             record_callback(self.before_step)
             for _ in range(self.substeps):
                 mjw.validate_step_workspace(self.workspace, self.model, self.data)
-                mjw.step(self.model, self.data, scratch=self.workspace.scratch)
+                mjw.step(self.model, data, scratch=self.workspace.scratch)
                 record_callback(self.after_substep)
             mjw.validate_step_workspace(self.workspace, self.model, self.data)
 
         def step_and_poses():
             wp.capture_if(self.step_condition, on_true=step)
-            mjw.kinematics(self.model, self.data)
+            mjw.kinematics(self.model, data)
 
         try:
             if self.refresh_kinematics:
@@ -934,7 +935,9 @@ class MuJoCoWorlds:
                 return graph
             except BaseException as failure:
                 # This root cannot silently retry partially marked CUDA graph nodes.
-                if graph is not None:
+                # Failed finalization already poisons any executable it created;
+                # preserve that ownership while quarantining the population.
+                if graph is not None and graph.graph_exec is None:
                     graph_ops.invalidate(graph)
                 try:
                     self._healthy.fill_(0)
