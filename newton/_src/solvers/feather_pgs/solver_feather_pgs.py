@@ -5239,7 +5239,8 @@ class SolverFeatherPGS(SolverBase):
         # triplet, reset for each solve. Larger capacities keep the ordinary
         # sparse owner when this extra shared storage exceeds its launch bound.
         triplet_capacity = self.dense_max_constraints // 3
-        triplet_shared_bytes = 40 * triplet_capacity + 8 * ((triplet_capacity + 31) // 32)
+        # Warp reserves another 256 bytes for its tiled launch base.
+        triplet_shared_bytes = 256 + 40 * triplet_capacity + 8 * ((triplet_capacity + 31) // 32)
         self._sparse_contact_triplets = bool(
             os.environ.get("FEATHER_PGS_SPARSE_CONTACT_TRIPLETS", "0") == "1"
             and active_rows

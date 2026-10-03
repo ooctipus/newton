@@ -230,6 +230,7 @@ class TestSparseContactTriplets(unittest.TestCase):
             ("1", 40, {}, True),
             ("1", 40, {"sparse_active_contacts": False}, False),
             ("1", 40, {"sparse_row_support": False}, False),
+            ("1", 1227, {}, False),
             ("1", 1500, {}, False),
         )
         for flag, capacity, overrides, selected in cases:
