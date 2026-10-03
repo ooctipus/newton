@@ -26,6 +26,7 @@ from gpu_components import backing as backing_ops
 from gpu_components import directory as directory_ops
 from gpu_components import fields as field_ops
 from gpu_components import graph as graph_ops
+from gpu_components.backing_data import VirtualReservation
 from gpu_components.directory_data import (
     InstanceBatchResult,
     InstanceCommands,
@@ -850,7 +851,7 @@ assert 'worlds' not in newton.__all__
         np.testing.assert_array_equal(healthy.numpy(), [0])
 
     def test_all_safe_shrinks_precede_growth_with_one_shared_backing_budget(self):
-        """Return every safe prefix before any growth consumes the shared byte budget."""
+        """Return mapped but unpublished headroom before another group consumes the shared budget."""
         population = object.__new__(MuJoCoWorlds)
         population._closed = population._service_failed = False
         population.device, population._backing = "cpu", object()
@@ -859,9 +860,12 @@ assert 'worlds' not in newton.__all__
             data=SimpleNamespace(live_count=SimpleNamespace(numpy=lambda: np.zeros(2)))
         )
         population._populations = []
+        mapped = {}
         for prototype, initial in enumerate((0, 1)):
             group = _MuJoCoWorldPopulation(None, contact_quota=1, ccd_quota=1)
             for name in ("world_storage", "contact_storage", "ccd_storage"):
+                reservation = VirtualReservation(16 * (len(mapped) + 1), 2, 2)
+                mapped[reservation] = initial
                 setattr(
                     group,
                     name,
@@ -869,7 +873,10 @@ assert 'worlds' not in newton.__all__
                         prototype=prototype,
                         name=name,
                         capacity=2,
-                        ready_rows=initial,
+                        ready_rows=0,
+                        row_stride_bytes=1,
+                        backing=population._backing,
+                        reservation=reservation,
                         ready_count=object(),
                         service_failed=False,
                         arrays={"contact.efc_address": object()},
@@ -879,13 +886,19 @@ assert 'worlds' not in newton.__all__
         retained, calls = [3], []
 
         def resize(owner, target, *, protected_count_host):
-            retained[0] += target - owner.ready_rows
+            retained[0] += target - mapped[owner.reservation]
             self.assertLessEqual(retained[0], 3, "Growth ran before the donor's safe ranges were returned")
             calls.append((owner.prototype, owner.name, target))
+            mapped[owner.reservation] = target
             owner.ready_rows = target
 
         with (
             patch.object(backing_ops, "maintenance", return_value=nullcontext()) as join,
+            patch.object(
+                backing_ops,
+                "mapped_ranges",
+                side_effect=lambda backing, reservation: ((0, mapped[reservation]),) if mapped[reservation] else (),
+            ),
             patch.object(field_ops, "resize_backing", side_effect=resize),
             patch.object(field_ops, "zero"),
             patch.object(field_ops, "fill"),
@@ -913,9 +926,12 @@ assert 'worlds' not in newton.__all__
             data=SimpleNamespace(live_count=SimpleNamespace(numpy=lambda: np.zeros(2, dtype=int))),
         )
         population._populations = []
+        mapped = {}
         for p in range(2):
             group = _MuJoCoWorldPopulation(None, contact_quota=1, ccd_quota=1)
             for name in ("world_storage", "contact_storage", "ccd_storage"):
+                reservation = VirtualReservation(16 * (len(mapped) + 1), 4, 4)
+                mapped[reservation] = ((0, 1),)
                 owner = SimpleNamespace(
                     prototype=p,
                     kind=name,
@@ -924,6 +940,9 @@ assert 'worlds' not in newton.__all__
                     service_failed=False,
                     arrays={"contact.efc_address": object()},
                     ready_count=object(),
+                    row_stride_bytes=1,
+                    backing=population._backing,
+                    reservation=reservation,
                 )
 
                 setattr(group, name, owner)
@@ -936,6 +955,7 @@ assert 'worlds' not in newton.__all__
 
         with (
             patch.object(backing_ops, "maintenance", return_value=nullcontext()),
+            patch.object(backing_ops, "mapped_ranges", side_effect=lambda backing, reservation: mapped[reservation]),
             patch.object(field_ops, "resize_backing", side_effect=resize),
             patch.object(field_ops, "zero"),
             patch.object(field_ops, "fill"),
@@ -986,12 +1006,27 @@ assert 'worlds' not in newton.__all__
                     data=SimpleNamespace(live_count=SimpleNamespace(numpy=lambda: np.ones(1, dtype=int))),
                 )
                 group = _MuJoCoWorldPopulation(None, contact_quota=1, ccd_quota=1)
+                mapped = {}
                 for name in ("world_storage", "contact_storage", "ccd_storage"):
-                    owner = SimpleNamespace(ready_rows=1, capacity=4, service_failed=False)
+                    reservation = VirtualReservation(16 * (len(mapped) + 1), 4, 4)
+                    mapped[reservation] = ((0, 1),)
+                    owner = SimpleNamespace(
+                        ready_rows=1,
+                        capacity=4,
+                        service_failed=False,
+                        row_stride_bytes=1,
+                        backing=population._backing,
+                        reservation=reservation,
+                    )
                     setattr(group, name, owner)
                 population._populations = (group,)
                 with (
                     patch.object(backing_ops, "maintenance", side_effect=maintenance),
+                    patch.object(
+                        backing_ops,
+                        "mapped_ranges",
+                        side_effect=lambda backing, reservation, mapped=mapped: mapped[reservation],
+                    ),
                     patch.object(backing_ops, "trim", side_effect=trim),
                     patch.object(
                         field_ops,
@@ -1067,11 +1102,14 @@ assert 'worlds' not in newton.__all__
                     data=SimpleNamespace(live_count=SimpleNamespace(numpy=lambda: np.zeros(1, dtype=int))),
                 )
                 group = _MuJoCoWorldPopulation(None, contact_quota=2, ccd_quota=1)
+                mapped = {}
                 for name, ready, capacity in (
                     ("world_storage", 1, 4),
                     ("contact_storage", 2, 8),
                     ("ccd_storage", 1, 4),
                 ):
+                    reservation = VirtualReservation(16 * (len(mapped) + 1), capacity, capacity)
+                    mapped[reservation] = ((0, ready),)
                     owner = SimpleNamespace(
                         kind=name,
                         ready_rows=ready,
@@ -1079,6 +1117,9 @@ assert 'worlds' not in newton.__all__
                         service_failed=False,
                         arrays={"contact.efc_address": object()},
                         ready_count=object(),
+                        row_stride_bytes=1,
+                        backing=population._backing,
+                        reservation=reservation,
                     )
 
                     setattr(group, name, owner)
@@ -1096,6 +1137,11 @@ assert 'worlds' not in newton.__all__
 
                 with (
                     patch.object(backing_ops, "maintenance", return_value=nullcontext()),
+                    patch.object(
+                        backing_ops,
+                        "mapped_ranges",
+                        side_effect=lambda backing, reservation, mapped=mapped: mapped[reservation],
+                    ),
                     patch.object(field_ops, "resize_backing", side_effect=resize),
                     patch.object(field_ops, "fill", side_effect=fill),
                     patch.object(field_ops, "zero", side_effect=fill),
@@ -1140,6 +1186,9 @@ assert 'worlds' not in newton.__all__
                         ready_rows=1,
                         capacity=2,
                         service_failed=stage == "storage_publication",
+                        row_stride_bytes=1,
+                        backing=population._backing,
+                        reservation=VirtualReservation(16, 2, 2),
                     )
                     population._populations = [
                         SimpleNamespace(
@@ -1153,6 +1202,7 @@ assert 'worlds' not in newton.__all__
                     ]
                     with (
                         patch.object(backing_ops, "maintenance", return_value=nullcontext()),
+                        patch.object(backing_ops, "mapped_ranges", return_value=((0, 1),)),
                         patch.object(field_ops, "resize_backing", side_effect=original),
                         patch.object(directory_ops, "withdraw_admissible_slots"),
                         patch.object(directory_ops, "publish_admissible_slots", side_effect=publication),

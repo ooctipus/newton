@@ -1110,9 +1110,11 @@ class MuJoCoWorlds:
         """Join once, service all W/C/D prefixes, then publish one coherent ready set.
 
         The caller excludes new submissions until return. Contact/CCD scratch has
-        no persistent lifetime after all consumers join. A clean budget rejection
-        republishes the safely backed partial result; driver failures quarantine
-        the complete population, including graphs held by external callers.
+        no persistent lifetime after all consumers join. Reclaim mapped ranges,
+        including unpublished growth headroom, before acquiring shared backing.
+        A clean budget rejection republishes the safely backed partial result;
+        driver failures quarantine the complete population, including graphs
+        held by external callers.
         If specified, ``spare_bytes`` retains up to its granule-rounded amount
         of available unmapped backing, without allocating reserve. ``None``
         preserves all spare handles. Trimming after successful service uses the
@@ -1154,8 +1156,16 @@ class MuJoCoWorlds:
                             (group.ccd_storage, n * group.ccd_quota),
                         )
                     ]
-                    # Return every safely retired range before acquiring shared backing.
-                    services.sort(key=lambda entry: entry[2] >= entry[1].ready_rows)
+                    # Clean failed growth may retain mapped bytes beyond the published ready prefix.
+                    services.sort(
+                        key=lambda entry: (
+                            entry[1].reservation is None
+                            or all(
+                                offset + size <= entry[2] * entry[1].row_stride_bytes
+                                for offset, size in backing_ops.mapped_ranges(entry[1].backing, entry[1].reservation)
+                            )
+                        )
+                    )
                     for group, owner, target, live_count in services:
                         old_ready = owner.ready_rows
                         try:
