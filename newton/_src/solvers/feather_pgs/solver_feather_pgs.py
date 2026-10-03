@@ -243,7 +243,7 @@ from .sparse_mass_matrix import (
     _SparseRowSupportPlan,
     solve_sparse_mass_matrix,
 )
-from .sparse_pgs import _get_pgs_solve_sparse_kernel
+from .sparse_pgs import _SPARSE_CONTACT_METRIC_CACHE_SIZE, _get_pgs_solve_sparse_kernel
 
 
 def _reject_retired_experiments():
@@ -1324,8 +1324,10 @@ class SolverFeatherPGS(SolverBase):
     block per world, support tables, and no physical free-body response. Shared
     memory limits retain the ordinary sparse owner; unsupported row metadata,
     linked contacts, delayed friction, and negative relaxation retain ordinary
-    row updates. The mode preserves the selected ordered sweeps and friction
-    law. This feature is experimental and may change without notice.
+    row updates. At most twelve used tangent pairs per world retain metrics;
+    additional pairs recompute their metrics without limiting solved rows.
+    The mode preserves the selected ordered sweeps and friction law. This
+    feature is experimental and may change without notice.
 
     """
 
@@ -5235,12 +5237,14 @@ class SolverFeatherPGS(SolverBase):
                     )
         # Unsupported mixed worlds retain explicit row indices and their existing kernels.
         use_support_table = bool(self._sparse_row_support.enabled)
-        # The opt-in transaction retains five tangent-metric scalars per full
-        # triplet, reset for each solve. Larger capacities keep the ordinary
-        # sparse owner when this extra shared storage exceeds its launch bound.
+        # The opt-in transaction retains a bounded set of five-scalar tangent
+        # metrics, with one signed-byte map entry per possible full triplet.
+        # Larger capacities keep the ordinary sparse owner at its launch bound.
         triplet_capacity = self.dense_max_constraints // 3
-        # Warp reserves another 256 bytes for its tiled launch base.
-        triplet_shared_bytes = 256 + 40 * triplet_capacity + 8 * ((triplet_capacity + 31) // 32)
+        metric_cache_size = min(_SPARSE_CONTACT_METRIC_CACHE_SIZE, triplet_capacity)
+        # Include Warp's tiled base and align the two maps before their counters.
+        metric_map_bytes = (2 * triplet_capacity + 3) // 4 * 4
+        triplet_shared_bytes = 256 + 40 * metric_cache_size + metric_map_bytes + 8
         self._sparse_contact_triplets = bool(
             os.environ.get("FEATHER_PGS_SPARSE_CONTACT_TRIPLETS", "0") == "1"
             and active_rows

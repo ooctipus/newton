@@ -231,8 +231,8 @@ class TestSparseContactTriplets(unittest.TestCase):
             ("1", 40, {}, False),  # The tiny batch's support table costs more than explicit indices.
             ("1", 192, {"sparse_active_contacts": False}, False),
             ("1", 192, {"sparse_row_support": False}, False),
-            ("1", 1227, {}, False),
-            ("1", 1500, {}, False),
+            ("1", 1776, {}, True),
+            ("1", 1777, {}, False),
         )
         for flag, capacity, overrides, selected in cases:
             with (
@@ -296,6 +296,76 @@ class TestSparseContactTriplets(unittest.TestCase):
                 candidate.launch()
                 result = candidate.result()
                 assert_output(self, data, *result, physical=physical, reference=control.result())
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Requires root-owned CUDA lease")
+    def test_saturated_metric_cache_preserves_uncached_pairs_cuda(self):
+        """Solve more distinct active pairs than the compact cache can retain."""
+        pairs = 17
+        dofs = pairs * 3
+        indices = np.arange(dofs, dtype=np.int32).reshape(pairs, 3)
+        z = np.zeros((dofs, dofs), dtype=np.float32)
+        bias = np.zeros(dofs, dtype=np.float32)
+        kinds = np.tile(np.array([CONTACT, FRICTION, FRICTION], np.int32), pairs)
+        parents = np.full(dofs, -1, dtype=np.int32)
+        mu = np.zeros(dofs, dtype=np.float32)
+        for pair in range(pairs):
+            row = pair * 3
+            z[row, row] = 1.0 + 0.01 * pair
+            z[row + 1, row : row + 3] = (0.11, 0.6 + 0.08 * pair, 0.13)
+            z[row + 2, row : row + 3] = (-0.07, 0.19, 1.8 - 0.05 * pair)
+            bias[row : row + 3] = (-0.2 - 0.01 * pair, 0.4, 0.7 - 0.02 * pair)
+            parents[row + 1 : row + 3] = row
+            mu[row + 1 : row + 3] = 0.4 + 0.005 * pair
+        diag = np.sum(z * z, axis=1) + 0.01
+        initial = np.zeros(dofs, dtype=np.float32)
+        velocity, impulses = _sweep(
+            z,
+            z,
+            initial,
+            bias,
+            diag,
+            kinds,
+            parents,
+            mu,
+            initial,
+            active_rows=True,
+            iterations=8,
+        )
+        self.assertEqual(np.count_nonzero(impulses[::3] > 0), pairs)
+
+        def padded(values):
+            result = np.zeros((3, 192, *values.shape[1:]), dtype=values.dtype)
+            result[:, :dofs] = values
+            return result
+
+        data = {
+            "world_constraint_count": np.array([dofs, 0, dofs], np.int32),
+            "rhs_bias": padded(bias),
+            "diagonal": padded(diag),
+            "initial_impulses": padded(initial),
+            "row_factor": padded(np.stack([z[row, indices[row // 3]] for row in range(dofs)])),
+            "row_incident": padded(initial),
+            "row_type": padded(kinds),
+            "row_parent": padded(parents),
+            "row_mu": padded(mu),
+            "support_row_class": padded(np.repeat(np.arange(pairs, dtype=np.int32), 3)),
+            "support_class_dof": indices,
+            "iterations": np.array(8),
+            "omega": np.array(1.0),
+            "friction_start_iteration": np.array(0),
+            "iteration_offset": np.array(0),
+            "reference_factor_delta": np.zeros((3, dofs), dtype=np.float32),
+        }
+        physical = {
+            "factor": np.eye(dofs),
+            "initial": initial,
+            "expected_velocity": velocity,
+            "expected_impulse": impulses,
+        }
+        control, candidate = DeviceSolve(data, candidate=False), DeviceSolve(data, candidate=True)
+        control.launch()
+        candidate.launch()
+        assert_output(self, data, *candidate.result(), physical=physical, reference=control.result())
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires root-owned CUDA lease")
     def test_finite_fallback_and_distinct_live_worlds_cuda(self):

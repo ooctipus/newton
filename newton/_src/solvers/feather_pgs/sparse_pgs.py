@@ -16,6 +16,8 @@ from .kernels import (
 )
 from .sparse_mass_matrix import _SparseRowSupport
 
+_SPARSE_CONTACT_METRIC_CACHE_SIZE = 12
+
 
 @cache
 def _get_pgs_solve_sparse_kernel(
@@ -54,7 +56,8 @@ def _get_pgs_solve_sparse_kernel(
     ``contact_triplets`` optionally retains tangent metrics within this call
     and publishes an admitted normal/tangent transaction once. It requires
     active rows and support tables; unsupported owners retain the ordinary
-    sweep. Runtime metadata guards retain the ordinary update for other rows.
+    sweep. The bounded metric cache recomputes uncached pairs when full;
+    runtime metadata guards retain the ordinary update for other rows.
 
     Launch with ``ceil(world_count / 2)`` tiles and 64 threads per tile.
     """
@@ -436,8 +439,7 @@ def _get_pgs_solve_sparse_kernel(
         row_update = row_update.replace(
             "            int indices[",
             "            const int metric_slot = friction ? contact_metric_slot(parent) : -1;\n"
-            "            const bool metric_ready = metric_slot >= 0\n"
-            "                && ((metric_ready_words[metric_slot / 32] >> (metric_slot & 31)) & 1u) != 0u;\n"
+            "            const bool metric_ready = metric_slot >= 0 && metric_map[metric_slot] >= 0;\n"
             "            int indices[",
             1,
         ).replace("cross += value * sibling_response;", "if (!metric_ready) cross += value * sibling_response;")
@@ -587,13 +589,16 @@ def _get_pgs_solve_sparse_kernel(
 def _contact_triplet_code(M: int, S: int, Q: int, contact_type: int, friction_type: int) -> tuple[str, str]:
     """Native additions for one-call metrics and ordered register-held updates."""
     pairs = M // 3
-    ready_words = (pairs + 31) // 32
+    cache_size = min(_SPARSE_CONTACT_METRIC_CACHE_SIZE, pairs)
     setup = f"""
-    __shared__ float metric_storage[{2 * pairs * 5}];
-    __shared__ unsigned metric_ready_storage[{2 * ready_words}];
-    float* metrics = metric_storage + slot * {pairs * 5};
-    unsigned* metric_ready_words = metric_ready_storage + slot * {ready_words};
-    for (int word = lane; word < {ready_words}; word += 32) metric_ready_words[word] = 0u;
+    __shared__ float metric_storage[{2 * cache_size * 5}];
+    __shared__ signed char metric_map_storage[{2 * pairs}];
+    __shared__ int metric_count_storage[2];
+    float* metrics = metric_storage + slot * {cache_size * 5};
+    signed char* metric_map = metric_map_storage + slot * {pairs};
+    int* metric_count = metric_count_storage + slot;
+    for (int id = lane; id < {pairs}; id += 32) metric_map[id] = -1;
+    if (lane == 0) *metric_count = 0;
     __syncwarp(MASK);
     const auto contact_metric_slot = [&](int normal) {{
         if (!select_active || normal < 0 || normal + 2 >= count
@@ -611,19 +616,23 @@ def _contact_triplet_code(M: int, S: int, Q: int, contact_type: int, friction_ty
     const auto friction_pair_cached = [&](int id, float a, float c, float d,
         float r0, float r1, float old0, float old1, float radius, float relaxation) {{
         FrictionPairMetric metric;
-        const bool ready = id >= 0 && ((metric_ready_words[id / 32] >> (id & 31)) & 1u) != 0u;
-        if (ready) {{
-            metric = FrictionPairMetric{{metrics[id * 5], metrics[id * 5 + 1], metrics[id * 5 + 2],
-                metrics[id * 5 + 3], metrics[id * 5 + 4]}};
+        const int cached = id >= 0 ? metric_map[id] : -1;
+        if (cached >= 0) {{
+            metric = FrictionPairMetric{{metrics[cached * 5], metrics[cached * 5 + 1], metrics[cached * 5 + 2],
+                metrics[cached * 5 + 3], metrics[cached * 5 + 4]}};
         }} else {{
             metric = friction_pair_metric(a, c, d);
-            if (id >= 0 && lane == 0) {{
-                metrics[id * 5] = metric.scale;
-                metrics[id * 5 + 1] = metric.largest;
-                metrics[id * 5 + 2] = metric.smallest;
-                metrics[id * 5 + 3] = metric.vx;
-                metrics[id * 5 + 4] = metric.vy;
-                metric_ready_words[id / 32] |= 1u << (id & 31);
+            if (id >= 0 && lane == 0 && *metric_count < {cache_size}) {{
+                // One warp owns this world's ordered visits. A full cache
+                // leaves the map unset, retaining exact recomputation.
+                const int entry = *metric_count;
+                metrics[entry * 5] = metric.scale;
+                metrics[entry * 5 + 1] = metric.largest;
+                metrics[entry * 5 + 2] = metric.smallest;
+                metrics[entry * 5 + 3] = metric.vx;
+                metrics[entry * 5 + 4] = metric.vy;
+                metric_map[id] = static_cast<signed char>(entry);
+                *metric_count = entry + 1;
             }}
             __syncwarp(MASK);
         }}
@@ -668,7 +677,7 @@ def _contact_triplet_code(M: int, S: int, Q: int, contact_type: int, friction_ty
                     if (indices[q] >= 0 && normal_change != 0.0f)
                         velocities[q] += normal_responses[q] * normal_change;
                 if (!(radius == 0.0f && old_tangent == 0.0f && old_sibling == 0.0f)) {{
-                    const bool ready = ((metric_ready_words[triplet_slot / 32] >> (triplet_slot & 31)) & 1u) != 0u;
+                    const bool ready = metric_map[triplet_slot] >= 0;
                     float dot = 0.0f, sibling_dot = 0.0f, cross = 0.0f;
                     #pragma unroll
                     for (int q = 0; q < {Q}; ++q) {{
