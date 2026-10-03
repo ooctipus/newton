@@ -168,11 +168,10 @@ conflicts = [
 ]
 
 [tool.uv.sources]
-# Development checkouts for the unpublished component extraction.
-gpu-components = { path = "../../gpu-components.wt/warp-capture", editable = true }
+# The application selects the custom Warp build for prepared execution.
+gpu-components = { git = "https://github.com/ooctipus/gpu-components.git", rev = "846288b15c32f4b45271597b169d4c241b0681c8" }
 mujoco = { index = "pypi" }
-mujoco-warp = { path = "../../mujoco_warp.wt/capture-launches", editable = true }
-warp-lang = { path = "../../warp.wt/capture-launches", editable = true }
+mujoco-warp = { git = "https://github.com/ooctipus/mujoco_warp.git", rev = "822fc39c5424eb17e9b1eccf6eb7d3279f6353b1" }
 torch = [
     { index = "pytorch-cu128", extra = "torch-cu12" },
     { index = "pytorch-cu130", extra = "torch-cu13" },
