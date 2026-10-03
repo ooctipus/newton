@@ -240,6 +240,50 @@ class TestPreparedModelConstants(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "invalidated"):
                     solver.notify_model_changed(flags, constant_variant_ids=ids)
 
+    def test_world_transfer_withdraws_prepared_solref_before_mutation(self):
+        """Keep ordinary constants while withdrawing a certificate before transferred history can replace it."""
+        for case in ("empty", "success", "failure"):
+            with self.subTest(case=case):
+                source, target = self._solver(), self._solver()
+                prototype = object()
+                for solver in (source, target):
+                    solver._replication_source_solver = prototype
+                    solver.model.world_count = 2
+                    solver.update_data_interval = solver._step = 0
+                    solver._replication_offsets = {}
+                self._prepare(target)
+                source._joint_limit_ke_snapshot[0] += 1.0
+                source._solreflimit_mode_snapshot[0] = SOLREF_MODE_MJCF_DEFAULT
+                registered = tuple((bank.ptr, output.ptr) for bank, output in target._model_constants)
+
+                def copy(*args, target=target, case=case):
+                    self.assertEqual(
+                        any(output.ptr == target.mjw_model.jnt_solref.ptr for _, output in target._model_constants),
+                        case == "empty",
+                    )
+                    if case == "failure":
+                        raise RuntimeError("Transfer failed")
+                    return wp.zeros(1, dtype=wp.int32, device="cpu")
+
+                target._mujoco_warp.copy_worlds = copy
+                with (
+                    mock.patch("newton._src.sim.model_replication._world_copy_arrays", return_value=[]),
+                    mock.patch("newton._src.sim.model_replication._copy_world_arrays"),
+                    self.assertRaisesRegex(RuntimeError, "Transfer failed") if case == "failure" else nullcontext(),
+                ):
+                    ids = [] if case == "empty" else [0]
+                    target.copy_worlds_from(source, ids, ids, states=((None, None),), controls=((None, None),))
+                remaining = tuple((bank.ptr, output.ptr) for bank, output in target._model_constants)
+                expected = (
+                    registered
+                    if case == "empty"
+                    else tuple(pair for pair in registered if pair[1] != target.mjw_model.jnt_solref.ptr)
+                )
+                self.assertEqual(remaining, expected)
+                if case == "success":
+                    self.assertEqual(target._joint_limit_ke_snapshot.reshape(-1)[0], source._joint_limit_ke_snapshot[0])
+                    self.assertEqual(target._solreflimit_mode_snapshot.reshape(-1)[0], SOLREF_MODE_MJCF_DEFAULT)
+
     def test_generic_edit_invalidates_but_root_placement_preserves_bank(self):
         """Reject reuse after ordinary property edits and retain the explicit root-only path."""
         solver = self._solver()
