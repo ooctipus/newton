@@ -60,6 +60,7 @@ from ..geometry.contact_reduction_global import (
 from ..geometry.contact_sort import ContactSorter
 from ..geometry.flags import ShapeFlags
 from ..geometry.heightfield_cells import heightfield_cell_overlaps_kernel
+from ..geometry.heightfield_cylinder import create_heightfield_cylinder_split_kernels
 from ..geometry.heightfield_features import WELD_FLAT_SEAMS, HeightfieldFeatureContext, flat_seam_query_allowed
 from ..geometry.mpr import create_solve_mpr, create_support_map_function
 from ..geometry.sdf_contact import (
@@ -2366,6 +2367,12 @@ class NarrowPhase:
     buffered contact writing without finite queries, deterministic mode,
     speculative contacts or hydroelastic SDFs; no geometry is cached by this option.
 
+    Experimental, default-off ``NEWTON_HEIGHTFIELD_CYLINDER_SPLIT=1`` additionally
+    separates the admitted regular-cylinder query into MPR, queued GJK and
+    manifold/write passes. It requires the primitive query option and preserves
+    its geometry and writer restrictions. Scratch results and GJK indices use
+    44 bytes per triangle capacity; only the queue counter is reset per call.
+
     Experimental ``NEWTON_HEIGHTFIELD_PAIR_CSR=1`` groups stock-writer-admitted
     raw witnesses by shape pair and publishes at most four for supported
     heightfield/box and heightfield/convex pairs. Selection prioritizes active
@@ -2600,6 +2607,13 @@ class NarrowPhase:
                 create_mesh_triangle_contacts_to_reducer_kernel(int(GeoType.CYLINDER)),
                 create_mesh_triangle_contacts_to_reducer_kernel(exclude_primitives=True),
             )
+        cylinder_split = os.environ.get("NEWTON_HEIGHTFIELD_CYLINDER_SPLIT", "0")
+        if cylinder_split not in ("0", "1"):
+            raise ValueError("NEWTON_HEIGHTFIELD_CYLINDER_SPLIT must be 0 or 1")
+        self._heightfield_cylinder_split = cylinder_split == "1" and self._heightfield_primitive_query
+        self._heightfield_cylinder_split_kernels = (
+            create_heightfield_cylinder_split_kernels() if self._heightfield_cylinder_split else ()
+        )
         self._finite_bounds = None
         self._finite_source = None
         self.mesh_sdf_texture_only = mesh_sdf_texture_only
@@ -2822,6 +2836,8 @@ class NarrowPhase:
             n += 1
             split_gjk_idx = n if self.split_gjk_mpr else None
             n += 2 if self.split_gjk_mpr else 0
+            cylinder_gjk_idx = n if self._heightfield_cylinder_split else None
+            n += 1 if self._heightfield_cylinder_split else 0
             sdf_sdf_idx = n
             n += 1
             mesh_like_idx = n if has_mesh_like else None
@@ -2838,6 +2854,9 @@ class NarrowPhase:
             self.gjk_candidate_pairs_count = c[gjk_idx : gjk_idx + 1]
             self.split_gjk_work_count = c[split_gjk_idx : split_gjk_idx + 1] if self.split_gjk_mpr else None
             self.split_manifold_work_count = c[split_gjk_idx + 1 : split_gjk_idx + 2] if self.split_gjk_mpr else None
+            self._heightfield_cylinder_gjk_count = (
+                c[cylinder_gjk_idx : cylinder_gjk_idx + 1] if self._heightfield_cylinder_split else None
+            )
             self.shape_pairs_sdf_sdf_count = c[sdf_sdf_idx : sdf_sdf_idx + 1]
             self.shape_pairs_mesh_count = c[mesh_like_idx : mesh_like_idx + 1] if has_mesh_like else None
             self.triangle_pairs_count = c[mesh_like_idx + 1 : mesh_like_idx + 2] if has_mesh_like else None
@@ -2869,6 +2888,18 @@ class NarrowPhase:
             )
             self.triangle_pairs = (
                 wp.zeros(max_triangle_pairs, dtype=wp.vec3i, device=device) if has_meshes or has_heightfields else None
+            )
+            # Every current admitted slot is written by MPR or GJK before the
+            # write pass. Full input capacity bounds both arrays without clears.
+            self._heightfield_cylinder_query_results = (
+                wp.empty(max_triangle_pairs, dtype=ConvexQueryResult, device=device)
+                if self._heightfield_cylinder_split
+                else None
+            )
+            self._heightfield_cylinder_gjk_indices = (
+                wp.empty(max_triangle_pairs, dtype=wp.int32, device=device)
+                if self._heightfield_cylinder_split
+                else None
             )
             self.shape_pairs_mesh_plane = (
                 wp.zeros(self.max_mesh_plane_pairs, dtype=wp.vec2i, device=device) if has_meshes else None
@@ -3420,15 +3451,26 @@ class NarrowPhase:
                         record_tape=False,
                     )
                 if self._heightfield_primitive_query:
-                    for kernel in self._heightfield_primitive_kernels:
-                        wp.launch(
-                            kernel=kernel,
-                            dim=self.total_num_threads,
-                            inputs=triangle_inputs,
-                            device=device,
-                            block_dim=self.mesh_triangle_block_dim,
-                            record_tape=False,
-                        )
+                    for primitive_index, primitive_kernel in enumerate(self._heightfield_primitive_kernels):
+                        kernels = (primitive_kernel,)
+                        inputs = triangle_inputs
+                        if self._heightfield_cylinder_split and primitive_index == 1:
+                            kernels = self._heightfield_cylinder_split_kernels
+                            inputs = [
+                                *triangle_inputs,
+                                self._heightfield_cylinder_query_results,
+                                self._heightfield_cylinder_gjk_indices,
+                                self._heightfield_cylinder_gjk_count,
+                            ]
+                        for kernel in kernels:
+                            wp.launch(
+                                kernel=kernel,
+                                dim=self.total_num_threads,
+                                inputs=inputs,
+                                device=device,
+                                block_dim=self.mesh_triangle_block_dim,
+                                record_tape=False,
+                            )
                 else:
                     wp.launch(
                         kernel=self._pair_csr.generic
