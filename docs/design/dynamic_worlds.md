@@ -36,7 +36,7 @@ The former `newton.worlds` namespace and Newton's generic allocator, directory a
 
 ## Public native operations
 
-`MuJoCoWorlds` constructs the concrete physics composition from immutable one-world Model/Data pairs. `capture()` prepares its single executable, `resize_backing()` performs joined memory maintenance, `memory_report()` reports each owner's retained bytes, and `close()` retires resources after graph borrowers are gone.
+`MuJoCoWorlds` constructs the concrete physics composition from immutable one-world Model/Data pairs. `capture()` prepares its single executable, `grow_backing()` admits more physical capacity, `resize_backing()` performs joined memory maintenance including shrinkage, `memory_report()` reports each owner's retained bytes, and `close()` retires resources after graph borrowers are gone.
 
 The `directory` property exposes borrowed `InstanceDirectoryData`, not the mutable directory owner. `batch_result` exposes the outcome and advancement permission. Both remain readable after quarantine or closure; reading metadata does not authorize replay or certify physical readiness.
 
@@ -87,6 +87,20 @@ operation = int(InstanceOperation.REPLACE)
 ```
 
 Newton records validation, admission, complete default-state transfer, optional domain initialization, lifetime publication and same-prototype compaction. It relocates every retained world field, including solver history. Validation receives only command inputs, rejection statuses and the accepted-prefix flag. Initialization receives only its admitted indices, destination rows, copy outcome, sequence and acknowledgement output. A callback acknowledges a destination only after its complete payload is ready.
+
+These operations run on the GPU inside the prepared graph. A reset that fits the
+already accessible prefixes needs no host allocation, model reconstruction or
+graph capture. Physical capacity service is a separate operation, not a required
+stage of every reset. Applications decide where they consume the GPU outcome;
+the runtime does not require a CPU demand calculation before submission.
+
+Prototype initialization branches access disjoint destination rows and join
+before lifetime publication. Compaction copies likewise branch by prototype and
+join before placement publication. After successful compaction, live rows form a
+dense prefix. Admission can then select the next free rows directly rather than
+choosing distant free slots that require avoidable relocation. This does not make
+request-to-row assignment deterministic or remove copies needed to fill holes
+left by departing lifetimes.
 
 Independent requests may succeed even when another request denies physics advancement. Inspect per-request results together with the batch outcome. Equal-sequence replay does not consume edited commands. Retry a rejected batch with a fresh sequence. Terminal generations reject replacement but remain destroyable without wrapping; their dead identities are never reused.
 
@@ -145,6 +159,30 @@ readiness, initialization or retirement guarantees merely by receiving a pointer
 
 ## Resize backing and retire
 
+For monotone growth, use `grow_backing()`. It maps fresh suffixes, then queues
+accessible-count updates, contact/CCD scratch initialization and directory
+admission in that order on the current stream. Subsequent consumers must be ordered after that publication.
+The caller excludes concurrent submissions and supplies every consumer stream.
+
+```python
+runtime.grow_backing(
+    larger_world_ready_capacities,
+    streams=consumer_streams,
+)
+```
+
+Fresh suffix mapping does not need to wait for readers of disjoint existing
+storage. Reusing a previously mapped virtual range is different: `grow_backing()`
+uses joined maintenance when historical address reuse requires it, completing
+publication before returning. Both paths only add mappings: growth never releases
+backing and preserves any existing cap on unmapped spares. CUDA mapping
+is still a host driver operation and may itself stall; this API does not promise
+asynchronous driver execution. Field readiness certifies accessible addresses;
+the later directory publication admits destinations, and captured initialization
+completes their world payloads before they become live instances. A clean mapping
+budget failure leaves readiness unchanged and retains any newly mapped headroom
+for a later retry.
+
 The application must exclude new submissions and supply every consumer stream. `resize_backing()` joins them, withdraws inadmissible tails, returns all safe ranges before any growth, services world/contact/CCD storage, and publishes only coherent accessible prefixes. It cannot retire a live tail; compact or destroy those instances first.
 
 ```python
@@ -155,7 +193,7 @@ runtime.resize_backing(
 )
 ```
 
-`spare_bytes=None` keeps all reusable spare handles. A nonnegative value trims available unmapped backing after successful service; it does not preallocate reserve. A clean budget rejection can leave a safely backed partial result and be retried. Driver, initialization or publication failure quarantines dependent execution and preserves surviving resources for diagnostics and retirement.
+`spare_bytes=None` keeps all reusable spare handles. A nonnegative value trims available unmapped backing after successful service; it does not preallocate reserve. Unlike fresh growth, a clean budget rejection during joined resize can leave a safely backed partial ready result and be retried. Driver, initialization or publication failure quarantines dependent execution and preserves surviving resources for diagnostics and retirement.
 
 Destroy every graph reference and join consumers before closing the runtime. Closure remains retryable after partial resource retirement. Reports identify retired subowners explicitly rather than fabricating zero usage for resources still owned elsewhere.
 
