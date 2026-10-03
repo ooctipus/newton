@@ -5234,6 +5234,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         articulations, materials, solver settings, topology and reference coordinates must remain registered.
         Native array descriptors must not be replaced while the bank is registered.
 
+        Joint-limit solver references are also prepared when every initial world and registered
+        variant has the same gain and mode edit history, without authored RAW modes. Otherwise
+        notifications retain ordinary gain-change detection and RAW-value validation.
+
         Args:
             variant_count: Number of immutable variants, with IDs in ``[0, variant_count)``.
             apply_variant: Preparation-only callback installing and eagerly synchronizing one variant.
@@ -5251,6 +5255,23 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self._model_constants = None
         self._validate_constant_scope()
         m = self.mjw_model
+        history_names = ("_joint_limit_ke_snapshot", "_joint_limit_kd_snapshot", "_solreflimit_mode_snapshot")
+        history = tuple(
+            None if getattr(self, name) is None else getattr(self, name).reshape(-1).copy() for name in history_names
+        )
+        cache_solref = (
+            m.jnt_solref.shape[0] == self.mjw_data.nworld
+            and bool(m.jnt_solref.size)
+            and all(
+                value is None
+                or (
+                    value.size % self.mjw_data.nworld == 0
+                    and np.all(value.reshape(self.mjw_data.nworld, -1) == value.reshape(self.mjw_data.nworld, -1)[0])
+                )
+                for value in history
+            )
+        )
+        cache_solref = cache_solref and (history[2] is None or not np.any(history[2] == SOLREF_MODE_RAW))
         outputs = (
             m.stat.meaninertia,
             m.dof_invweight0,
@@ -5260,6 +5281,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             m.body_inertia,
             m.body_iquat,
         )
+        if cache_solref:
+            outputs += (m.jnt_solref,)
         if any(array.shape[0] != self.mjw_data.nworld for array in outputs):
             raise ValueError("Prepared constants require independent native constant rows for every world.")
         started = time.perf_counter()
@@ -5271,8 +5294,18 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             for variant in range(count):
                 apply_variant(variant)
                 self._validate_constant_scope()
+                cache_solref = cache_solref and all(
+                    (
+                        getattr(self, name) is None
+                        if baseline is None
+                        else getattr(self, name) is not None
+                        and np.array_equal(getattr(self, name).reshape(-1), baseline)
+                    )
+                    for name, baseline in zip(history_names, history, strict=True)
+                )
                 for bank, output in zip(banks, outputs, strict=True):
-                    wp.copy(bank[variant : variant + 1], output[world : world + 1])
+                    if output.size:
+                        wp.copy(bank[variant : variant + 1], output[world : world + 1])
             if self.model.device.is_cuda:
                 wp.synchronize_stream(wp.get_stream(self.model.device))
             self._model_constants = tuple(
@@ -5281,6 +5314,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     output.reshape((output.shape[0], output.size // output.shape[0])),
                 )
                 for bank, output in zip(banks, outputs, strict=True)
+                if output is not m.jnt_solref or cache_solref
             )
             self._model_constants_prepare_seconds = time.perf_counter() - started
         finally:
@@ -5474,7 +5508,15 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                         # ``set_const_0`` refreshes ``dof_invweight0`` and
                         # ``jnt_solimp`` was already written by
                         # ``_update_joint_dof_properties`` above.
-                        self._update_solref_from_invweight0()
+                        if (
+                            constant_variant_ids is not None
+                            and self.mjw_model.jnt_solref.size
+                            and any(output.ptr == self.mjw_model.jnt_solref.ptr for _, output in self._model_constants)
+                        ):
+                            # Registered gain/mode provenance is unchanged; preserve its device edit history.
+                            self._raw_solreflimit_validated = True
+                        else:
+                            self._update_solref_from_invweight0()
                         self._update_tendon_limit_gains()
                     # MuJoCo constant recomputation overwrites per-world CONNECT anchors, so restore them last.
                     self._notify_connect_constraints_changed(

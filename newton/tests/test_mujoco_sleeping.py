@@ -17,6 +17,7 @@ import warp as wp
 import newton
 from newton import ModelFlags
 from newton._src.solvers.mujoco import kernels
+from newton._src.solvers.mujoco.solver_mujoco import SOLREF_MODE_FORCE_SPACE, SOLREF_MODE_MJCF_DEFAULT, SOLREF_MODE_RAW
 from newton.solvers import SolverMuJoCo
 
 
@@ -44,6 +45,7 @@ class TestPreparedModelConstants(unittest.TestCase):
             body_subtreemass=array((2, 2)),
             body_inertia=array((2, 2)),
             body_iquat=array((2, 2)),
+            jnt_solref=array((2, 1, 2)),
             neq=0,
             ntendon=0,
             nflex=0,
@@ -71,6 +73,9 @@ class TestPreparedModelConstants(unittest.TestCase):
         solver._constant_roots_validated = False
         solver._has_dampratio_actuators = False
         solver._initial_model_sync = False
+        solver._joint_limit_ke_snapshot = np.full(2, 1000.0, dtype=np.float32)
+        solver._joint_limit_kd_snapshot = np.full(2, 10.0, dtype=np.float32)
+        solver._solreflimit_mode_snapshot = np.full(2, SOLREF_MODE_FORCE_SPACE, dtype=np.int32)
         solver.use_mujoco_cpu = False
         solver._use_mujoco_contacts = True
         return solver
@@ -86,6 +91,7 @@ class TestPreparedModelConstants(unittest.TestCase):
                 "body_subtreemass",
                 "body_inertia",
                 "body_iquat",
+                "jnt_solref",
             )
         )
 
@@ -106,10 +112,11 @@ class TestPreparedModelConstants(unittest.TestCase):
                 outputs = self._prepare(solver)
                 for output in outputs:
                     output.fill_(-1)
-                solver._restore_model_constants(
-                    wp.array([1, 0], dtype=dtype, device="cpu"),
-                    wp.array([True, False, False], dtype=wp.bool, device="cpu"),
-                )
+                with wp.ScopedDevice(solver.model.device):
+                    solver._restore_model_constants(
+                        wp.array([1, 0], dtype=dtype, device="cpu"),
+                        wp.array([True, False, False], dtype=wp.bool, device="cpu"),
+                    )
                 for field, output in enumerate(outputs):
                     np.testing.assert_array_equal(output.numpy()[0], 11 + field)
                     np.testing.assert_array_equal(output.numpy()[1], -1)
@@ -125,6 +132,113 @@ class TestPreparedModelConstants(unittest.TestCase):
             self._prepare(solver, fail_at=1)
         self.assertEqual(solver.model_constants_bytes, 0)
         self.assertFalse(solver._preparing_model_constants)
+
+    def test_solref_bank_requires_unchanged_uniform_edit_history(self):
+        """Exclude changing, nonuniform or RAW provenance without rejecting the ordinary constant bank."""
+        for case in (
+            "uniform",
+            "varying_gain",
+            "varying_mode",
+            "nonuniform_gain",
+            "nonuniform_mode",
+            "raw",
+            "broadcast",
+        ):
+            with self.subTest(case=case):
+                solver = self._solver()
+                if case == "nonuniform_gain":
+                    solver._joint_limit_ke_snapshot[1] += 1.0
+                elif case == "nonuniform_mode":
+                    solver._solreflimit_mode_snapshot[1] = SOLREF_MODE_MJCF_DEFAULT
+                elif case == "raw":
+                    solver._solreflimit_mode_snapshot[:] = SOLREF_MODE_RAW
+                elif case == "broadcast":
+                    solver.mjw_model.jnt_solref = wp.zeros((1, 1, 2), dtype=wp.float32, device="cpu")
+
+                def apply(variant, case=case, solver=solver):
+                    if case == "varying_gain":
+                        solver._joint_limit_ke_snapshot[0] += variant
+                    elif case == "varying_mode":
+                        solver._solreflimit_mode_snapshot[0] = SOLREF_MODE_MJCF_DEFAULT
+                    solver.mjw_model.jnt_solref.fill_(float(variant))
+
+                solver.prepare_model_constants(2, apply)
+                contains_solref = any(
+                    output.ptr == solver.mjw_model.jnt_solref.ptr for _, output in solver._model_constants
+                )
+                self.assertEqual(contains_solref, case == "uniform")
+                self.assertGreater(solver.model_constants_bytes, 0)
+
+    def test_cached_solref_preserves_later_generic_gain_detection(self):
+        """Restore selected references without gain readbacks, then honor a later generic edit."""
+        for mode, edit in (
+            (SOLREF_MODE_FORCE_SPACE, "gain"),
+            (SOLREF_MODE_MJCF_DEFAULT, "gain"),
+            (SOLREF_MODE_MJCF_DEFAULT, "mode"),
+        ):
+            with self.subTest(mode=mode, edit=edit):
+                model = _build_sleep_model(2, register_custom_attributes=True)
+                model.joint_limit_ke.fill_(1000.0)
+                model.joint_limit_kd.fill_(10.0)
+                model.mujoco.solreflimit_mode.fill_(mode)
+                solver = SolverMuJoCo(model, use_mujoco_contacts=True, iterations=1)
+                flags = (
+                    ModelFlags.BODY_INERTIAL_PROPERTIES
+                    | ModelFlags.JOINT_PROPERTIES
+                    | ModelFlags.JOINT_DOF_PROPERTIES
+                    | ModelFlags.SHAPE_PROPERTIES
+                )
+
+                def apply(variant, model=model, solver=solver, flags=flags):
+                    inertia = model.body_inertia.numpy().copy()
+                    inverse = model.body_inv_inertia.numpy().copy()
+                    inertia[0] = np.eye(3) * (1.0 + variant)
+                    inverse[0] = np.eye(3) / (1.0 + variant)
+                    model.body_inertia.assign(inertia)
+                    model.body_inv_inertia.assign(inverse)
+                    solver.notify_model_changed(flags)
+
+                solver.prepare_model_constants(2, apply)
+                snapshots = tuple(
+                    getattr(solver, name).copy()
+                    for name in ("_joint_limit_ke_snapshot", "_joint_limit_kd_snapshot", "_solreflimit_mode_snapshot")
+                )
+                ids = wp.array([1, 0], dtype=wp.int32, device=model.device)
+                mask = wp.array([True, False, False], dtype=wp.bool, device=model.device)
+                expected = solver.mjw_model.jnt_solref.numpy().copy()
+                original_numpy = wp.array.numpy
+                gain_pointers = {model.joint_limit_ke.ptr, model.joint_limit_kd.ptr, model.mujoco.solreflimit_mode.ptr}
+
+                def reject_gain_readback(
+                    array, *args, gain_pointers=gain_pointers, original_numpy=original_numpy, **kwargs
+                ):
+                    self.assertNotIn(array.ptr, gain_pointers)
+                    return original_numpy(array, *args, **kwargs)
+
+                with (
+                    mock.patch.object(wp.array, "numpy", reject_gain_readback),
+                    mock.patch.object(solver, "_update_solref_from_invweight0", side_effect=AssertionError("Uncached")),
+                ):
+                    solver.notify_model_changed(flags, world_mask=mask, constant_variant_ids=ids)
+                np.testing.assert_array_equal(solver.mjw_model.jnt_solref.numpy(), expected)
+                np.testing.assert_array_equal(solver.mj_model.jnt_solref, expected[0])
+                for name, value in zip(
+                    ("_joint_limit_ke_snapshot", "_joint_limit_kd_snapshot", "_solreflimit_mode_snapshot"),
+                    snapshots,
+                    strict=True,
+                ):
+                    np.testing.assert_array_equal(getattr(solver, name), value)
+                if edit == "gain":
+                    model.joint_limit_ke.assign(np.array([2000.0, 1000.0], dtype=np.float32))
+                    expected_mode = SOLREF_MODE_FORCE_SPACE
+                else:
+                    model.mujoco.solreflimit_mode.assign(np.array([SOLREF_MODE_RAW, mode], dtype=np.int32))
+                    expected_mode = SOLREF_MODE_RAW
+                solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
+                self.assertIsNone(solver._model_constants)
+                np.testing.assert_array_equal(model.mujoco.solreflimit_mode.numpy(), [expected_mode, mode])
+                with self.assertRaisesRegex(RuntimeError, "invalidated"):
+                    solver.notify_model_changed(flags, constant_variant_ids=ids)
 
     def test_generic_edit_invalidates_but_root_placement_preserves_bank(self):
         """Reject reuse after ordinary property edits and retain the explicit root-only path."""
