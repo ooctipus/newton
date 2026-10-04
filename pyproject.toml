@@ -167,7 +167,7 @@ conflicts = [
 [tool.uv.sources]
 # The application selects the custom Warp build for prepared execution.
 gpu-components = { git = "https://github.com/ooctipus/gpu-components.git", rev = "338fa9b34f25ca60bc4a3713d79b1115baf68372" }
-mujoco-warp = { git = "https://github.com/ooctipus/mujoco_warp.git", rev = "be0072dd0f0bf43e9459757a854aa5957de971d6" }
+mujoco-warp = { git = "https://github.com/ooctipus/mujoco_warp.git", rev = "cdcf95c6effdc053bb5df6394477ffae12c55d77" }
 torch = [
     { index = "pytorch-cu128", extra = "torch-cu12" },
     { index = "pytorch-cu130", extra = "torch-cu13" },

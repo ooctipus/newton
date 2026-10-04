@@ -9,6 +9,7 @@ import time
 import unittest
 import warnings
 import xml.etree.ElementTree as ET
+from dataclasses import fields
 from unittest.mock import patch
 
 import numpy as np  # For numerical operations and random values
@@ -34,7 +35,7 @@ from newton._src.solvers.mujoco.equality import _add_equality_constraint
 from newton._src.solvers.mujoco.kernels import convert_solref
 from newton._src.solvers.mujoco.utils import MJC_OBJ_BODY, MJC_OBJ_JOINT, MjcEqualityTargetKind
 from newton.examples import get_asset
-from newton.solvers import SolverMuJoCo
+from newton.solvers import MuJoCoModelMapping, SolverMuJoCo
 from newton.tests.unittest_utils import USD_AVAILABLE, assert_np_equal
 
 
@@ -68,6 +69,50 @@ def _expected_positive_limit_solref(ke: float, kd: float, factor: float) -> np.n
         [2.0 / direct_damping, direct_damping / (2.0 * math.sqrt(direct_stiffness))],
         dtype=np.float64,
     )
+
+
+class TestMuJoCoModelMapping(unittest.TestCase):
+    def test_preparation_publishes_numeric_correspondence_without_task_restrictions(self):
+        """Publish scalar offsets while preserving unsupported nonlinear topology explicitly."""
+        builder = newton.ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(builder)
+        builder.begin_world()
+        root = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        link = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        fixed = builder.add_joint_fixed(-1, root)
+        hinge = builder.add_joint_revolute(root, link, target_ke=2.0, target_kd=1.0)
+        builder.add_articulation([fixed, hinge])
+        free_body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        builder.add_articulation([builder.add_joint_free(free_body)])
+        builder.end_world()
+        model = builder.finalize("cpu")
+        model.mujoco.dof_ref.fill_(0.25)
+        modes = model.joint_target_mode.numpy()
+        modes[0] = int(newton.JointTargetMode.POSITION_VELOCITY)
+        model.joint_target_mode.assign(modes)
+        solver = SolverMuJoCo(model, use_mujoco_cpu=True)
+        mapping = solver.model_mapping
+        self.assertIsInstance(mapping, MuJoCoModelMapping)
+        self.assertIs(mapping.newton_model, model)
+        self.assertIs(mapping.mujoco_model, solver.mjw_model)
+        coordinates = mapping.newton_coord_by_mujoco_qpos[0]
+        np.testing.assert_array_equal(coordinates[coordinates >= 0], [0])
+        self.assertEqual(np.count_nonzero(coordinates == -1), 7)
+        np.testing.assert_array_equal(mapping.qpos_references[0, coordinates >= 0], [0.25])
+        np.testing.assert_array_equal(mapping.newton_joint_by_mujoco_mocap, [[fixed]])
+        positions, velocities = mapping.newton_target_by_position_actuator, mapping.newton_dof_by_velocity_actuator
+        np.testing.assert_array_equal(positions[positions >= 0], [0])
+        np.testing.assert_array_equal(velocities[velocities >= 0], [0])
+        np.testing.assert_array_equal(mapping.position_references[0, positions >= 0], [0.25])
+        self.assertFalse(
+            any(callable(value) for name, value in vars(MuJoCoModelMapping).items() if not name.startswith("__"))
+        )
+        for definition in fields(mapping):
+            value = getattr(mapping, definition.name)
+            if isinstance(value, np.ndarray):
+                self.assertFalse(value.flags.writeable, definition.name)
+        solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
+        self.assertIsNone(solver.model_mapping)
 
 
 class TestMuJoCoSolver(unittest.TestCase):

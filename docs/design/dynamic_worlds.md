@@ -1,17 +1,18 @@
 # Growable-memory native world populations
 
-`newton.solvers.MuJoCoWorlds` composes homogeneous MJWarp prototypes into a changing set of world instances. Each prototype keeps its topology, geometry, inertia and solver constants. A replacement initializes another prototype's instance and publishes a new lifetime; it does not rewrite an articulation's topology in place.
+`newton.solvers.mujoco_worlds_prepare` composes homogeneous MJWarp prototypes into a changing set of world instances. Its result is a passive `MuJoCoWorlds` record. Each prototype keeps its topology, geometry, inertia and solver constants. A replacement initializes another prototype's instance and publishes a new lifetime; it does not rewrite an articulation's topology in place.
 
 This API is experimental. It requires CUDA and Python 3.11 or newer. Install Newton's optional `sim` dependencies, including the Apache-2.0 `gpu-components` package. Importing base Newton does not load this optional composition.
 
 ## Ownership
 
-The consuming application owns prototype preparation, controls, initialization payloads, observations, reset policy, graph submission and maintenance scheduling. Newton's `MuJoCoWorlds` owns the native population composition:
+The consuming application owns prototype preparation, controls, initialization payloads, observations, reset policy, graph submission and maintenance scheduling. Newton's MuJoCo world operations own the native population composition:
 
 - The standalone `gpu_components.directory` operations own numeric identities, generations, placement and admission. Their records live in `gpu_components.directory_data`.
 - `gpu_components.fields` owns typed allocations and transfer operations. `gpu_components.backing` owns virtual reservations and physical byte mappings. These components have no simulation knowledge.
 - `gpu_components.graph` binds declared counts to captured CUDA kernel nodes. It does not infer field domains or choose physics stages.
-- MJWarp owns `StepBindings` and the prepared native workspace. One shared bindings record borrows the world, candidate and CCD storage domains and owns the stage-binding ledger. Newton does not duplicate that ledger or failure state.
+- MJWarp owns numerical layouts, defaults, alignment requirements and passive numerical operands such as `StepWork`, `SolverContext` and `CollisionContext`. Numerical stages receive these operands directly. MJWarp has no GPU Components dependency or storage, readiness, graph-binding or publication manager.
+- Newton owns the admitted feature subset, lifecycle ordering and one update table and binding ledger per population. It records native and application work, then supplies exact launch/count relations to GPU Components.
 - Native MJWarp `Data` is the authoritative physical state. There is no dense Newton `State` mirror.
 
 `mjw.array_fields(model_or_data)` yields native paths, borrowed arrays and their declared
@@ -21,26 +22,39 @@ payload or assigning readiness. MJWarp owns this representation; Newton consumes
 `dataclasses.replace`. Numerical extents never determine capacity domains, and an array
 appearing at two native paths does not acquire a second allocation owner.
 
-MJWarp declares native scratch element types and dimensions. GPU Components supplies
-`StridedLayout`, packing, binding and descriptor validation for both fixed scratch
-and growable `FieldStorage`. The workspace is a passive record; MJWarp's preparation,
-validation and reporting functions operate on it. Solver alignment requirements
-remain beside the solver. Ordinary `mjw.step(model, data)` still needs no workspace.
+Each numerical stage declares its work layout beside its equations. The same
+declaration drives ordinary allocation and externally supplied arrays.
+`mjw.step_work_layout(model, data)` composes these declarations; `mjw.make_step_work`
+allocates ordinary arrays or binds complete supplied arrays. Field names resolve
+only during preparation. `mjw.step(model, data, work=work)` consumes typed operands;
+omitting `work` prepares ordinary native work. Solver alignment and Data defaults
+remain in MJWarp, while typed packing and accessible-range checks belong to GPU
+Components. There is no discovery run or second native field catalog.
 
-Newton supplies concrete capacity `Data`. MJWarp workspace preparation owns a
-borrowed execution descriptor with symbolic count identities and the same arrays;
-validation checks both descriptors. This projection does not own another physical
-state or certify that every reserved row is backed.
+Newton constructs concrete capacity `Data` and a shallow execution projection
+using the same arrays and three distinct Warp `CountParameter` identities for
+worlds, contact candidates and CCD work. Equal bounds never establish count
+meaning. MJWarp's `metadata_signature` and numerical layout validation check both
+descriptors and native work; Newton also freezes its storage/count bindings. This
+projection owns no second physical state and does not certify backing readiness.
+
+Newton-to-MuJoCo conversion publishes `SolverMuJoCo.model_mapping`, a passive
+`MuJoCoModelMapping` containing read-only numeric correspondences and reference
+offsets. Scalar affine coordinates have explicit IDs; unsupported nonlinear
+coordinate entries are `-1`. Tasks select from this relation and retain their own
+scalar-joint, actuator-uniqueness and root-frame restrictions. They do not decode
+private solver mappings. Names and paths resolve before numeric binding; Newton
+selection domains use `Model.AttributeFrequency` identities.
 
 The former `newton.worlds` namespace and Newton's generic allocator, directory and graph implementations are removed. Import each standalone concept directly; there are no compatibility aliases.
 
 ## Public native operations
 
-`MuJoCoWorlds` constructs the concrete physics composition from immutable one-world Model/Data pairs. `capture()` prepares its single executable, `grow_backing()` admits more physical capacity, `resize_backing()` performs joined memory maintenance including shrinkage, `memory_report()` reports each owner's retained bytes, and `close()` retires resources after graph borrowers are gone.
+`mujoco_worlds_prepare` constructs the concrete physics composition from immutable one-world Model/Data pairs. `mujoco_worlds_capture` prepares its single executable, `mujoco_worlds_grow_backing` admits more physical capacity, `mujoco_worlds_resize_backing` performs joined memory maintenance including shrinkage, `mujoco_worlds_memory_report` reports each owner's retained bytes, and `mujoco_worlds_close` retires resources after graph borrowers are gone. Every operation takes the passive record as its first argument; the record has no forwarding methods or allocation constructor.
 
-The `directory` property exposes borrowed `InstanceDirectoryData`, not the mutable directory owner. `batch_result` exposes the outcome and advancement permission. Both remain readable after quarantine or closure; reading metadata does not authorize replay or certify physical readiness.
+The `directory` field contains borrowed `InstanceDirectoryData`. `batch_result` contains the outcome and advancement permission. Both remain readable after quarantine or closure; reading metadata does not authorize replay or certify physical readiness. Call `mujoco_worlds_validate(runtime)` before preparing consumers of an open runtime.
 
-`populations` returns `MuJoCoWorldPopulation` views. A view exposes its numeric prototype index, immutable model, authoritative Data, reserved capacities, live count, accessible-prefix counts and joint world readiness. Applications record ordinary Warp kernels; a separate preparation operation binds their exact captured records to numeric count sources. It exposes no backing-service or retirement authority.
+`populations` contains passive `MuJoCoWorldPopulation` records with their numeric prototype index, immutable model, authoritative Data, reserved capacities, live count and accessible-prefix counts. Call `mujoco_world_population_validate(population)` before preparing consumers; it rejects retired or replaced descriptors. `mujoco_world_population_ready_capacity(population)` queries the jointly backed world/contact/CCD prefix in world units. It does not certify completion of queued GPU initialization. Applications record ordinary Warp kernels; a separate preparation operation binds their exact captured records to numeric count sources. Borrowed records confer no backing-service or retirement authority.
 
 A handle is `(instance_id, generation)`. A slot is a prototype-local storage position. Compaction may move a handle to another slot without changing its generation. Symbolic names and scene paths must be resolved outside this numeric relation API.
 
@@ -51,9 +65,15 @@ The following integration fragment assumes `prepared` contains warmed one-world 
 ```python
 from gpu_components import directory
 from gpu_components.directory_data import InstanceOperation
-from newton.solvers import MuJoCoWorlds
+from newton.solvers import (
+    mujoco_worlds_capture,
+    mujoco_worlds_close,
+    mujoco_worlds_grow_backing,
+    mujoco_worlds_prepare,
+    mujoco_worlds_resize_backing,
+)
 
-runtime = MuJoCoWorlds(
+runtime = mujoco_worlds_prepare(
     prepared,
     world_capacities=world_capacities,
     id_capacity=id_capacity,
@@ -63,14 +83,14 @@ runtime = MuJoCoWorlds(
 )
 commands = directory.allocate_commands(command_capacity, device=runtime.device)
 results = directory.allocate_results(command_capacity, device=runtime.device)
-graph = runtime.capture(commands, results, substeps=substeps, retain=application_buffers)
+graph = mujoco_worlds_capture(runtime, commands, results, substeps=substeps, retain=application_buffers)
 ```
 
 Omitting `memory_budget_bytes` selects fixed backing. Both paths use the same instance protocol and native solver program. With virtual backing, reserved capacity is not physically committed capacity. The byte budget includes mapped and reusable spare physical backing. Initial prefixes must be backed before they are admitted.
 
-Preparation validates Model batch parameters, complete Data and scratch layouts, storage alignment, buffers and launch declarations before publication. Every nonempty batched immutable Model parameter must broadcast from one row: moving Data must not change a world's constants. Unsupported MJWarp feature combinations are rejected by its prepared workspace admission.
+Preparation validates Model batch parameters, complete Data and numerical work layouts, storage alignment, buffers and launch declarations before publication. Every nonempty batched immutable Model parameter must broadcast from one row: moving Data must not change a world's constants. Newton's composition admits the qualified feature subset listed below; MJWarp validates its numerical array contracts independently.
 
-A captured graph retains the exact directory, storage, transfer, workspace, binding and explicitly supplied application resources. Preparation callbacks are released afterward. Each runtime prepares one graph; a failed irreversible recording invalidates that preparation rather than silently retrying partially marked nodes.
+A captured graph retains the exact directory, storage, transfer, native work, binding and explicitly supplied application resources. Preparation callbacks are released afterward. Each runtime prepares one graph; a failed irreversible recording invalidates that preparation rather than silently retrying partially marked nodes.
 
 ## Replace a world
 
@@ -125,8 +145,9 @@ def application_bindings(population, launches):
     return extents, (), ()
 
 
-graph = runtime.capture(
-    commands, results, before_step=before_step,
+# Use this call instead of the earlier capture when controls are required.
+graph = mujoco_worlds_capture(
+    runtime, commands, results, before_step=before_step,
     application_bindings=application_bindings, retain=(controls,),
 )
 ```
@@ -159,20 +180,20 @@ readiness, initialization or retirement guarantees merely by receiving a pointer
 
 ## Resize backing and retire
 
-For monotone growth, use `grow_backing()`. It maps fresh suffixes, then queues
+For monotone growth, use `mujoco_worlds_grow_backing`. It maps fresh suffixes, then queues
 accessible-count updates, contact/CCD scratch initialization and directory
 admission in that order on the current stream. Subsequent consumers must be ordered after that publication.
 The caller excludes concurrent submissions and supplies every consumer stream.
 
 ```python
-runtime.grow_backing(
-    larger_world_ready_capacities,
+mujoco_worlds_grow_backing(
+    runtime, larger_world_ready_capacities,
     streams=consumer_streams,
 )
 ```
 
 Fresh suffix mapping does not need to wait for readers of disjoint existing
-storage. Reusing a previously mapped virtual range is different: `grow_backing()`
+storage. Reusing a previously mapped virtual range is different: `mujoco_worlds_grow_backing`
 uses joined maintenance when historical address reuse requires it, completing
 publication before returning. Both paths only add mappings: growth never releases
 backing and preserves any existing cap on unmapped spares. CUDA mapping
@@ -183,11 +204,11 @@ completes their world payloads before they become live instances. A clean mappin
 budget failure leaves readiness unchanged and retains any newly mapped headroom
 for a later retry.
 
-The application must exclude new submissions and supply every consumer stream. `resize_backing()` joins them, withdraws inadmissible tails, returns all safe ranges before any growth, services world/contact/CCD storage, and publishes only coherent accessible prefixes. It cannot retire a live tail; compact or destroy those instances first.
+The application must exclude new submissions and supply every consumer stream. `mujoco_worlds_resize_backing` joins them, withdraws inadmissible tails, returns all safe ranges before any growth, services world/contact/CCD storage, and publishes only coherent accessible prefixes. It cannot retire a live tail; compact or destroy those instances first.
 
 ```python
-runtime.resize_backing(
-    requested_world_ready_capacities,
+mujoco_worlds_resize_backing(
+    runtime, requested_world_ready_capacities,
     streams=consumer_streams,
     spare_bytes=0,
 )
@@ -197,8 +218,32 @@ runtime.resize_backing(
 
 Destroy every graph reference and join consumers before closing the runtime. Closure remains retryable after partial resource retirement. Reports identify retired subowners explicitly rather than fabricating zero usage for resources still owned elsewhere.
 
+```python
+graph = None  # Drop every other retained graph reference as well.
+mujoco_worlds_close(runtime, streams=consumer_streams)
+```
+
 ## Qualification and limits
 
 The standalone package owns generic relation-oracle, byte-ledger, graph, transfer and failure tests. Newton's `test_mujoco_worlds` covers native composition, retained state, finite dense-physics parity, partial sleep, contact invalidation, failure quarantine and preparation lifetimes. It also rejects duplicate generic implementations and duplicate native binding authorities.
 
-The prepared native path currently admits the keyboard-oriented MJWarp feature subset enforced by `step_workspace_layout`; it is not a universal adapter for all MJWarp options or every Newton solver. Host VMM maintenance is outside graph replay. Existing mapped capacity and dynamic counts can be reused without rebuilding the graph, but a new immutable topology or an unsupported native branch requires new preparation. Task observations and learning buffers remain application-owned.
+Newton's `_validate_prototype` currently requires native NxN contacts, sleeping,
+enabled islands, graph conditionals, the Newton solver, implicit-fast integration, pyramidal cones
+and disabled multi-CCD. At least one dynamic tree is required. Flex, tendons,
+sensors, cameras, lights, equality constraints, body transmissions, heightfields,
+activation/history state, SDF, fluids, callbacks and energy computation are
+excluded. The composition also excludes enabled ball-joint limits, contact
+surface velocity, postconstraint inverse dynamics, passive adhesion, dense full
+Jacobians above 50 padded DOFs and unsupported implicit factorization/free-body
+branches. These are qualification limits of this changing-world program; native
+numerical layout and alignment requirements remain enforced in MJWarp.
+
+External Newton collision is a future composition path. Its contact production,
+state conversion and invalidation ordering would need explicit qualification at
+the Newton boundary; it should not add collision policy to generic memory or graph
+components, or silently widen this native-contact path.
+
+Host VMM maintenance is outside graph replay. Existing mapped capacity and dynamic
+counts can be reused without rebuilding the graph, but a new immutable topology or
+an unsupported native branch requires new preparation. Task observations and
+learning buffers remain application-owned.
