@@ -333,23 +333,45 @@ def _get_pgs_solve_sparse_kernel(
     __syncwarp(MASK);
 {active_initialize}
 """
-    velocity_filter = velocity_update = ""
-    impulse_change = "new_impulse - old_impulse"
+    velocity_filter = velocity_sweep = ""
     if velocity_limits:
         # Storage puts velocity rows before contacts, but their original law
-        # owns the final pass of each iteration. Keep the same ordinary order.
-        row_loop = """
-        for (int row_phase = 0; row_phase < 2; ++row_phase) {
-            for (int row = 0; row < count; ++row) {"""
-        row_loop_end = "            }\n        }"
+        # owns the final pass. Scalar rows need only one residual reduction.
         velocity_filter = f"""
-            if ((row_type == {velocity_limit_type}) != (row_phase == 1)) continue;
+            if (row_type == {velocity_limit_type}) continue;
 """
-        velocity_update = f""" else if (row_type == {velocity_limit_type}) {{
-                // Report the current correction, without undoing earlier ones.
-                new_impulse = residual < 0.0f ? -residual / denominator : 0.0f;
-            }}"""
-        impulse_change = f"row_type == {velocity_limit_type} ? new_impulse : new_impulse - old_impulse"
+        velocity_sweep = f"""
+        for (int row = 0; row < count; ++row) {{
+            if (type[row] != {velocity_limit_type}) continue;
+            const float denominator = diagonal[row];
+            if (denominator <= 0.0f) continue;
+            int indices[{Q}];
+            float responses[{Q}];
+            float dot = 0.0f;
+            #pragma unroll
+            for (int q = 0; q < {Q}; ++q) {{
+                const int entry = lane + q * 32;
+                const int index = entry < {S} ? {index_read} : -1;
+                const float response = index >= 0 ? row_factor.data[row_base + row * {S} + entry] : 0.0f;
+                indices[q] = index;
+                responses[q] = response;
+                if (index >= 0) dot += response * delta[index];
+            }}
+            for (int shift = 16; shift > 0; shift >>= 1)
+                dot += __shfl_down_sync(MASK, dot, shift, 32);
+            const float residual = __shfl_sync(MASK, dot, 0, 32) + rhs[row];
+            // Limits report this correction without undoing earlier ones.
+            const float correction = residual < 0.0f ? -residual / denominator : 0.0f;
+            if (lane == 0) impulse[row] = correction;
+            if (correction != 0.0f) {{
+                changed = 1;
+                #pragma unroll
+                for (int q = 0; q < {Q}; ++q)
+                    if (indices[q] >= 0) delta[indices[q]] += responses[q] * correction;
+            }}
+            __syncwarp(MASK);
+        }}
+"""
     row_update = f"""
             const int row_type = static_cast<int>(type[row]);
 {velocity_filter}
@@ -430,12 +452,12 @@ def _get_pgs_solve_sparse_kernel(
                 const float new_sibling = pair.y * scale;
                 sibling_change = new_sibling - old_sibling;
                 if (lane == 0) impulse[sibling] = new_sibling;
-            }}{velocity_update} else {{
+            }} else {{
                 new_impulse = old_impulse - omega * residual / denominator;
                 if (row_type == {contact_type} || row_type == {limit_type})
                     new_impulse = fmaxf(new_impulse, 0.0f);
             }}
-            const float change = {impulse_change};
+            const float change = new_impulse - old_impulse;
             if (lane == 0) impulse[row] = new_impulse;
             if (change != 0.0f || sibling_change != 0.0f) {{
                 changed = 1;
@@ -494,6 +516,7 @@ def _get_pgs_solve_sparse_kernel(
 {row_update}
 {row_loop_end}
 {mf_sweep}
+{velocity_sweep}
 {sweep_finish}
     }}
 {writeback}
