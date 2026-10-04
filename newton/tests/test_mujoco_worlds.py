@@ -26,7 +26,6 @@ from gpu_components import backing as backing_ops
 from gpu_components import directory as directory_ops
 from gpu_components import fields as field_ops
 from gpu_components import graph as graph_ops
-from gpu_components import scratch as scratch_ops
 from gpu_components.backing_data import VirtualReservation
 from gpu_components.directory_data import (
     InstanceBatchResult,
@@ -370,6 +369,9 @@ assert 'worlds' not in newton.__all__
             for _ in range(2)
         ]
 
+        for group in population._populations:
+            group.workspace.bindings = group.step_bindings
+
         class Task:
             def before(self, population):
                 raise AssertionError("Physics recording must not be reached")
@@ -394,7 +396,7 @@ assert 'worlds' not in newton.__all__
         gc.collect()
         self.assertIsNone(task_reference())
         for group in population._populations:
-            self.assertIsNone(group.workspace.bindings)
+            self.assertIs(group.workspace.bindings, group.step_bindings)
             self.assertIsNone(group.before_step)
             self.assertIsNone(group.after_substep)
         self.assertTrue(population._capture_attempted)
@@ -415,6 +417,7 @@ assert 'worlds' not in newton.__all__
             step_bindings=SimpleNamespace(updates=None),
             world_storage=SimpleNamespace(protected_count=scalar, capacity=2),
         )
+        group.workspace.bindings = group.step_bindings
         population._populations = [group]
         with (
             patch.object(graph_ops, "prepare_updates", side_effect=original),
@@ -426,7 +429,7 @@ assert 'worlds' not in newton.__all__
                 before_step=Mock(),
             )
         self.assertEqual(caught.exception.exceptions, (original, cleanup))
-        self.assertIsNone(group.workspace.bindings)
+        self.assertIs(group.workspace.bindings, group.step_bindings)
         self.assertIsNone(group.before_step)
         frames = []
         traceback_value = original.__traceback__
@@ -676,68 +679,6 @@ assert 'worlds' not in newton.__all__
             ],
         )
         self.assertEqual(group.world_ready_capacity, 2)
-
-    def test_scratch_storage_follows_its_domain_and_a_failed_scratch_service_publishes_nothing_beyond_it(self):
-        """A world scratch storage is mapped, grown and shrunk with the world storage; its failure cannot outrun it."""
-        population, group = self._growth_fixture()
-        scratch = SimpleNamespace(
-            name="world_scratch", ready_rows=1, capacity=4, ready_count=object(), service_failed=False, arrays={}
-        )
-        group.scratch_storages["world"] = scratch
-        self.assertEqual([owner.name for _, owner, _ in group.domains(2)][:2], ["world_storage", "world_scratch"])
-        events = []
-        current = Mock(spec=wp.Stream, device="cpu", cuda_stream=11)
-
-        def map_backing(owner, target):
-            events.append(("map", owner.name, target))
-            if owner is scratch:
-                raise MemoryError("scratch budget")
-
-        with (
-            patch.object(field_ops, "can_map_backing_without_join", return_value=True, create=True),
-            patch.object(field_ops, "map_backing", side_effect=map_backing),
-            patch.object(field_ops, "publish_ready", side_effect=lambda owner, n: events.append(("ready", owner.name))),
-            patch.object(directory_ops, "publish_admissible_slots", side_effect=lambda *args: events.append("admit")),
-            patch.object(native.wp, "get_stream", return_value=current),
-            patch.object(native.wp, "launch"),
-            patch.object(native.wp, "synchronize_stream"),
-            self.assertRaisesRegex(MemoryError, "scratch budget"),
-        ):
-            population.grow_backing((2,), streams=(current,))
-        self.assertEqual(events, [("map", "world_storage", 2), ("map", "world_scratch", 2)])
-        self.assertFalse(population._service_failed)
-        population._healthy.fill_.assert_not_called()
-        # Resize: the world storage grows but its scratch is refused by the budget; admission follows the minimum.
-        population._directory = SimpleNamespace(
-            data=SimpleNamespace(live_count=SimpleNamespace(numpy=lambda: np.zeros(1, dtype=int)))
-        )
-        for owner in (*group.storages,):
-            owner.row_stride_bytes, owner.backing, owner.reservation = 1, population._backing, None
-        publications = []
-
-        def resize(owner, target, *, protected_count_host):
-            if owner is scratch:
-                raise MemoryError("scratch budget")
-            owner.ready_rows = target
-
-        with (
-            patch.object(backing_ops, "maintenance", return_value=nullcontext()),
-            patch.object(backing_ops, "mapped_ranges", return_value=()),
-            patch.object(field_ops, "resize_backing", side_effect=resize),
-            patch.object(field_ops, "zero"),
-            patch.object(field_ops, "fill"),
-            patch.object(directory_ops, "withdraw_admissible_slots"),
-            patch.object(
-                directory_ops, "publish_admissible_slots", side_effect=lambda owner, ends: publications.append(ends)
-            ),
-            patch.object(native.wp, "get_stream", return_value=SimpleNamespace(cuda_stream=11)),
-            patch.object(native.wp, "synchronize_stream"),
-            self.assertRaisesRegex(MemoryError, "scratch budget"),
-        ):
-            population.resize_backing((3,), streams=(Mock(spec=wp.Stream, device="cpu", cuda_stream=11),))
-        self.assertEqual((group.world_storage.ready_rows, scratch.ready_rows), (3, 1))
-        self.assertEqual(publications, [(1,)], "Admission is the minimum readiness over the domain and its scratch")
-        self.assertFalse(population._service_failed)
 
     def test_growth_during_capture_rejects_before_service_or_quarantine(self):
         """Reject a known unsupported call without poisoning healthy population ownership."""
@@ -1355,7 +1296,7 @@ class PopulationRecorderTests(unittest.TestCase):
             world_storage=owner("world"),
             contact_storage=owner("candidate"),
             ccd_storage=owner("ccd"),
-            workspace=SimpleNamespace(bindings=None, scratch=object()),
+            workspace=SimpleNamespace(bindings=None),
             application_ranges=[],
         )
         group.workspace.data = group.data
@@ -1376,6 +1317,7 @@ class PopulationRecorderTests(unittest.TestCase):
         group.step_bindings = mjw.StepBindings(
             group.world_storage, group.contact_storage, group.ccd_storage, updates=updates
         )
+        group.workspace.bindings = group.step_bindings
         kernel = SimpleNamespace(
             key="named_counts",
             func=SimpleNamespace(__module__="test", __qualname__="named_counts"),
@@ -1448,7 +1390,7 @@ class PopulationRecorderTests(unittest.TestCase):
             1, dtype=int, device="cpu"
         )
         population._populations = [group]
-        population._retain_graph = population._prepare_scratch_columns = Mock()
+        population._retain_graph = Mock()
         self.population = population
         commands = directory_ops.allocate_commands(17, device="cpu")
         results = directory_ops.allocate_results(17, device="cpu")
@@ -1533,7 +1475,7 @@ class PopulationRecorderTests(unittest.TestCase):
                 self.assertIs(self.graph.graph_exec, executable)
                 self.assertEqual(self.invalidations, [] if created else [self.graph])
                 np.testing.assert_array_equal(self.population._healthy.numpy(), [0])
-                self.assertIsNone(group.workspace.bindings)
+                self.assertIs(group.workspace.bindings, group.step_bindings)
                 self.assertIsNone(group.before_step)
                 self.assertIsNone(group.after_substep)
 
@@ -1663,10 +1605,9 @@ class PopulationRecorderTests(unittest.TestCase):
             self.assertEqual(depth[0], 1)
             calls.append("poses")
 
-        def step(model, data, *, scratch):
+        def step(model, data):
             self.assertIs(model, group.model)
             self.assertIs(data, group.workspace.execution_data)
-            self.assertIs(scratch, group.workspace.scratch)
             calls.append("step")
 
         def validate(workspace, model, data):
@@ -1716,7 +1657,7 @@ class PopulationRecorderTests(unittest.TestCase):
                 validate.assert_called_with(group.workspace, group.model, group.data)
                 poses.assert_not_called()
                 self.assertTrue(group.step_bindings.recording_failed)
-                self.assertIsNone(group.workspace.bindings)
+                self.assertIs(group.workspace.bindings, group.step_bindings)
 
     def test_unhandled_callback_error_rejects_recording_and_releases_callbacks(self):
         """A callback failure cannot leave a retryable or partially usable population program."""
@@ -1738,7 +1679,7 @@ class PopulationRecorderTests(unittest.TestCase):
         ):
             group.record_physics()
         self.assertTrue(group.step_bindings.recording_failed)
-        self.assertIsNone(group.workspace.bindings)
+        self.assertIs(group.workspace.bindings, group.step_bindings)
         self.assertIsNone(group.before_step)
         with self.assertRaisesRegex(RuntimeError, "failed recording"):
             group.record_physics()
@@ -1775,8 +1716,6 @@ class PopulationRecorderTests(unittest.TestCase):
             initialization_transfer=storage,
             compaction_transfer=storage,
             step_bindings=None,
-            scratch_storages={},
-            scratch_arrays=(),
             global_arrays={},
             empty_fields=[],
             world_ready_capacity=0,
@@ -1839,7 +1778,7 @@ class PopulationRecorderTests(unittest.TestCase):
             with patch.object(self.native.wp, "capture_if", side_effect=lambda step_condition, on_true: on_true()):
                 group.record_physics()
             self.assertEqual(calls, ["control", "step", "step", "poses"])
-            self.assertIsNone(group.workspace.bindings)
+            self.assertIs(group.workspace.bindings, group.step_bindings)
             self.assertIsNone(group.before_step)
             calls.clear()
             group.before_step = lambda group: calls.append("control")
@@ -1849,7 +1788,7 @@ class PopulationRecorderTests(unittest.TestCase):
             with patch.object(self.native.wp, "capture_if", side_effect=RuntimeError("capture failed")):
                 with self.assertRaisesRegex(RuntimeError, "capture failed"):
                     group.record_physics()
-            self.assertIsNone(group.workspace.bindings)
+            self.assertIs(group.workspace.bindings, group.step_bindings)
             self.assertIsNone(group.before_step)
 
 
@@ -1988,8 +1927,7 @@ def _prototype(keys, mujoco, mjw, *, convex=False):
         if not np.isfinite(getattr(data, name).numpy()).all():
             raise AssertionError(f"Nonfinite prepared template state: {keys} keys, {name}")
     warm = mjw.replicate_data(data, 1)
-    workspace = mjw.make_step_workspace(model, warm)
-    mjw.step(model, warm, scratch=workspace.scratch)
+    mjw.step(model, warm)
     mjw.kinematics(model, warm)
     wp.synchronize_stream(wp.get_stream())
     return model, data
@@ -2047,7 +1985,7 @@ class TestMuJoCoWorlds(unittest.TestCase):
         os.environ.get("NEWTON_TEST_CUDA_UUID"), "Set an explicit CUDA UUID for native population tests"
     )
     def test_scratch_columns_come_from_one_discarded_recording(self):
-        """Programs name their scratch while recording; the discovery graph dies and columns follow the world domain."""
+        """Discover before allocation, keep one owner per domain, and prepare only the complete relation."""
         import mujoco
         import mujoco_warp as mjw
 
@@ -2059,89 +1997,65 @@ class TestMuJoCoWorlds(unittest.TestCase):
             wp.load_module(module=__name__, device=device)
             for storage in ("fixed", "vmm"):
                 with self.subTest(storage=storage):
-                    population = MuJoCoWorlds(
-                        prepared,
-                        world_capacities=(4,),
-                        id_capacity=2,
-                        command_capacity=2,
-                        memory_budget_bytes=64 * 1024**2 if storage == "vmm" else None,
-                        initial_world_ready_capacities=(0,) if storage == "vmm" else None,
-                    )
-                    commands = directory_ops.allocate_commands(2, device=device)
-                    results = directory_ops.allocate_results(2, device=device)
-                    discarded, invalidate = [], graph_ops.invalidate
-                    group = population._populations[0]
-                    freeze, prepare = scratch_ops.freeze, scratch_ops.prepare
+                    discarded, invalidate, allocate = [], graph_ops.invalidate, field_ops.allocate
 
-                    def discard(graph, discarded=discarded, invalidate=invalidate, group=group):
+                    def discard(graph, discarded=discarded, invalidate=invalidate):
                         discarded.append(weakref.ref(graph))
                         invalidate(graph)
-                        # The discovery recording pinned nothing on the binding.
-                        self.assertIsNone(group.step_bindings._recording_binding)
 
-                    def validate(group=group):
-                        # The composition detaches the binding between recordings; validation needs it attached.
-                        group.workspace.bindings = group.step_bindings
-                        try:
-                            mjw.validate_step_workspace(group.workspace, group.model, group.data)
-                        finally:
-                            group.workspace.bindings = None
+                    def allocate_after_discovery(*args, discarded=discarded, allocate=allocate, **kwargs):
+                        self.assertEqual(len(discarded), 1, "Discovery precedes every final field allocation")
+                        self.assertIsNone(discarded[0](), "Discarded recording must release its temporary owners")
+                        return allocate(*args, **kwargs)
 
-                    def after_freeze(registry, freeze=freeze):
-                        freeze(registry)
-                        with self.assertRaisesRegex(RuntimeError, "Finalize"):
-                            validate()
-
-                    def after_prepare(registry, columns, prepare=prepare):
-                        prepare(registry, columns)
-                        with self.assertRaisesRegex(RuntimeError, "Finalize"):
-                            validate()
-
-                    graph = registry = columns = original = None
+                    with (
+                        patch.object(graph_ops, "invalidate", discard),
+                        patch.object(field_ops, "allocate", allocate_after_discovery),
+                    ):
+                        population = MuJoCoWorlds(
+                            prepared,
+                            world_capacities=(4,),
+                            id_capacity=2,
+                            command_capacity=2,
+                            memory_budget_bytes=64 * 1024**2 if storage == "vmm" else None,
+                            initial_world_ready_capacities=(0,) if storage == "vmm" else None,
+                        )
+                    commands = directory_ops.allocate_commands(2, device=device)
+                    results = directory_ops.allocate_results(2, device=device)
+                    group = population._populations[0]
+                    graph = registry = original = column = None
                     try:
-                        # Plain replacements: a Mock would record the call and keep the graph alive.
-                        with (
-                            patch.object(graph_ops, "invalidate", discard),
-                            patch.object(scratch_ops, "freeze", after_freeze),
-                            patch.object(scratch_ops, "prepare", after_prepare),
-                        ):
-                            graph = population.capture(commands, results)
-                        registry, world = group.scratch_registry, group.world_storage
-                        validate()
+                        workspace = group.workspace
+                        registry = workspace.execution_data.scratch
+                        self.assertEqual((registry.state, registry.temporaries), ("prepared", {}))
+                        self.assertIsNone(group.step_bindings._recording_binding)
+                        domains = (
+                            (workspace.execution_data.nworld, group.world_storage),
+                            (workspace.execution_data.naconmax, group.contact_storage),
+                            (workspace.execution_data.naccdmax, group.ccd_storage),
+                        )
+                        for name, declaration in registry.declarations.items():
+                            column = registry.columns[name]
+                            owner = next((owner for count, owner in domains if declaration.shape[0] is count), None)
+                            if owner is None:
+                                self.assertTrue(any(column is array for array in group.step_bindings.fixed_arrays))
+                            else:
+                                self.assertIs(column, owner.arrays["scratch." + name])
+                        for transfer in (group.initialization_transfer, group.compaction_transfer):
+                            self.assertFalse(any(name.startswith("scratch.") for name in transfer.field_names))
+                        graph = population.capture(commands, results)
+                        self.assertEqual(len(discarded), 1, "Final recording does not rediscover fields")
+                        mjw.validate_step_workspace(workspace, group.model, group.data)
                         name = next(iter(registry.declarations))
                         original = registry.columns[name]
-                        registry.columns[name] = wp.zeros_like(original)
-                        with self.assertRaisesRegex(ValueError, "scratch relation changed"):
-                            validate()
+                        registry.columns[name] = wp.empty_like(original)
+                        with self.assertRaises(ValueError):
+                            mjw.validate_step_workspace(workspace, group.model, group.data)
                         registry.columns[name] = original
-                        validate()
-                        self.assertEqual(len(discarded), 1, "Exactly one discovery recording is discarded")
-                        self.assertIsNone(discarded[0](), "The discovery graph must not outlive preparation")
-                        self.assertEqual((registry.state, registry.temporaries), ("prepared", {}))
-                        self.assertEqual(set(group.scratch_storages), {"world"})
-                        columns = group.scratch_storages["world"]
-                        # Every stage of this program names its temporaries; count-free ones are fixed arrays.
-                        self.assertEqual(
-                            set(registry.declarations),
-                            {
-                                f"implicit.{n}"
-                                for n in ("qDeriv", "qLD", "qLDiagInv", "actuator_vel", "qacc", "island_can_sleep")
-                            }
-                            | {"position.awake_prev", "constraint.efc_nnz", "island.parent", "island.efc_tree"}
-                            | {"transmission.moment_nnz", "broadphase.awake_changed", "solver.nsolving"},
-                        )
-                        plain = {n for n, d in registry.declarations.items() if isinstance(d.shape[0], int)}
-                        self.assertEqual(set(columns.arrays), set(registry.declarations) - plain)
-                        self.assertEqual(len(group.scratch_arrays), len(plain))
-                        self.assertEqual(columns.capacity, world.capacity)
-                        self.assertIs(columns.protected_count, world.protected_count)
-                        self.assertEqual(columns.ready_rows, world.ready_rows)
-                        self.assertEqual(group.step_bindings.extra_storages, (columns,))
-                        self.assertIn("world", population.memory_report()["populations"][0]["scratch_storages"])
+                        mjw.validate_step_workspace(workspace, group.model, group.data)
                         if storage == "vmm":
                             self.assertEqual(population.populations[0].world_ready_capacity, 0)
                             population.grow_backing((2,), streams=(wp.get_stream(device),))
-                            self.assertEqual((world.ready_rows, columns.ready_rows), (2, 2))
                             self.assertEqual(population.populations[0].world_ready_capacity, 2)
                         commands.sequence.fill_(1)
                         commands.count.fill_(1)
@@ -2156,10 +2070,106 @@ class TestMuJoCoWorlds(unittest.TestCase):
                         self.assertEqual(population._healthy.numpy()[0], 1)
                         self.assertGreater(float(_prefix(group.data, 1).time.numpy()[0]), 0.0)
                     finally:
-                        # Column views held here would block the VMM reservation release at close.
-                        graph = registry = columns = original = None
+                        graph = registry = original = column = workspace = domains = transfer = None
                         gc.collect()
                         population.close(streams=(wp.get_stream(device),))
+
+    @unittest.skipUnless(
+        os.environ.get("NEWTON_TEST_CUDA_UUID"), "Set an explicit CUDA UUID for native population tests"
+    )
+    def test_partial_backing_budget_rejection_preserves_replay_and_recovers(self):
+        """Reject real mapping after one domain grows, retaining coherent readiness and dense physics parity."""
+        import mujoco
+        import mujoco_warp as mjw
+
+        wp.init()
+        device = wp.get_device("cuda:0")
+        self.assertEqual(device.uuid, os.environ["NEWTON_TEST_CUDA_UUID"])
+        with wp.ScopedDevice(device):
+            prepared = [_prototype(6, mujoco, mjw, convex=True)]
+            budget, capacity = 32 * 1024**2, 128
+            population = MuJoCoWorlds(
+                prepared,
+                world_capacities=(capacity,),
+                id_capacity=2,
+                command_capacity=2,
+                memory_budget_bytes=budget,
+                initial_world_ready_capacities=(1,),
+            )
+            graph = None
+            try:
+                group = population._populations[0]
+                owners = (group.world_storage, group.contact_storage, group.ccd_storage)
+                quotas = (1, group.contact_quota, group.ccd_quota)
+                granule = population._backing.granularity_bytes
+
+                def mapped_bytes(n):
+                    return tuple(
+                        (n * quota * owner.row_stride_bytes + granule - 1) // granule * granule
+                        for owner, quota in zip(owners, quotas, strict=True)
+                    )
+
+                initial = mapped_bytes(1)
+                target = next(
+                    (
+                        n
+                        for n in range(2, capacity + 1)
+                        if initial[0] < mapped_bytes(n)[0] <= budget - sum(initial[1:])
+                        and sum(mapped_bytes(n)) > budget
+                    ),
+                    None,
+                )
+                self.assertIsNotNone(target, "Fixture must fit world growth but reject a later domain on real budget")
+                commands = directory_ops.allocate_commands(2, device=device)
+                results = directory_ops.allocate_results(2, device=device)
+                graph = population.capture(commands, results)
+                oracle = mjw.replicate_data(prepared[0][1], 1)
+
+                def replay(sequence, *, create=False):
+                    commands.sequence.fill_(sequence)
+                    commands.count.fill_(int(create))
+                    commands.operation.fill_(_CREATE)
+                    commands.prototype.zero_()
+                    wp.capture_launch(graph)
+                    mjw.step(group.model, oracle)
+                    mjw.kinematics(group.model, oracle)
+                    for name in (*_STATE, *_POSE):
+                        np.testing.assert_allclose(
+                            getattr(_prefix(group.data, 1), name).numpy(),
+                            getattr(oracle, name).numpy(),
+                            rtol=2e-5,
+                            atol=2e-6,
+                            equal_nan=False,
+                            err_msg=f"sequence {sequence}: {name}",
+                        )
+                    np.testing.assert_array_equal(population._healthy.numpy(), [1])
+
+                replay(1, create=True)
+                ready_before = tuple(int(owner.ready_count.numpy()[0]) for owner in owners)
+                free_before = population.directory.free_slot_count.numpy().copy()
+                bytes_before = backing_ops.memory_report(population._backing)["mapped_bytes"]
+                with self.assertRaises(MemoryError):
+                    population.grow_backing((target,), streams=(wp.get_stream(device),))
+                self.assertGreater(backing_ops.memory_report(population._backing)["mapped_bytes"], bytes_before)
+                self.assertEqual(tuple(int(owner.ready_count.numpy()[0]) for owner in owners), ready_before)
+                np.testing.assert_array_equal(population.directory.free_slot_count.numpy(), free_before)
+                self.assertFalse(population._service_failed)
+                self.assertFalse(any(owner.service_failed for owner in owners))
+                replay(2)
+
+                # Return unpublished headroom to the same pool, then admit a feasible retry.
+                population.resize_backing((1,), streams=(wp.get_stream(device),))
+                retry = max(2, group.world_ready_capacity + 1)
+                self.assertLessEqual(retry, capacity)
+                self.assertLessEqual(sum(mapped_bytes(retry)), budget)
+                population.grow_backing((retry,), streams=(wp.get_stream(device),))
+                self.assertEqual(group.world_ready_capacity, retry)
+                np.testing.assert_array_equal(population.directory.free_slot_count.numpy(), [retry - 1])
+                replay(3)
+            finally:
+                graph = None
+                gc.collect()
+                population.close(streams=(wp.get_stream(device),))
 
     @unittest.skipUnless(
         os.environ.get("NEWTON_TEST_CUDA_UUID"), "Set an explicit CUDA UUID for native population tests"
@@ -2694,16 +2704,20 @@ class TestMuJoCoWorlds(unittest.TestCase):
                 from mujoco_warp._src import collision_driver
 
                 narrowphase = collision_driver.convex_narrowphase
-                groups = {id(group.workspace.scratch.collision.convex): group.view for group in population._populations}
+                groups = {id(group.workspace.execution_data): group.view for group in population._populations}
 
-                def record_convex_pass(*args, **kwargs):
-                    narrowphase(*args, **kwargs)
-                    group = groups[id(kwargs["scratch"])]
+                def record_convex_pass(model, data, *args, **kwargs):
+                    narrowphase(model, data, *args, **kwargs)
+                    group = groups[id(data)]
                     # Sleeping's incremental pass clears nccd again; sample before the next pass.
                     wp.launch(
                         _record_convex_work,
                         1,
-                        inputs=[kwargs["scratch"].nccd, group.data.nacon, convex_observed[group.prototype_index]],
+                        inputs=[
+                            data.scratch.columns["convex.nccd"],
+                            group.data.nacon,
+                            convex_observed[group.prototype_index],
+                        ],
                     )
 
                 probe.enter_context(
@@ -2734,7 +2748,7 @@ class TestMuJoCoWorlds(unittest.TestCase):
             owner = population._populations[group.prototype_index]
             self.assertIsNone(owner.before_step)
             self.assertIsNone(owner.after_substep)
-            self.assertIsNone(owner.workspace.bindings)
+            self.assertIs(owner.workspace.bindings, owner.step_bindings)
             self.assertFalse(hasattr(group, "world_storage"))
             self.assertFalse(hasattr(group, "updates"))
         labels, previous, expected_calls = {}, {}, np.zeros((2, 2), dtype=np.int32)
