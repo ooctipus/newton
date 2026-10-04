@@ -235,6 +235,7 @@ from .sparse_contact import (
     apply_sparse_free_velocity,
     build_sparse_joint_limit_rows,
     build_sparse_joint_velocity_limit_rows,
+    build_sparse_mimic_rows,
     finalize_sparse_joint_limit_rows,
 )
 from .sparse_mass_matrix import (
@@ -1317,6 +1318,17 @@ class SolverFeatherPGS(SolverBase):
     layout requires a common articulated topology with at most 64 DOFs per
     articulation. Dense-factor chains and unsupported features retain the
     existing representation. Selection uses topology and resources, not task names.
+
+    The experimental sparse velocity-limit mode is disabled by default. Set
+    ``FEATHER_PGS_SPARSE_VELOCITY_LIMITS=1`` before construction to use
+    factor-coordinate responses for compatible ``matrix_free`` CUDA models,
+    including serial chains and same-articulation mimic couplings. It preserves
+    ordered PGS sweeps and the final, stateless speed-limit projection in each
+    sweep. It requires augmented drives and current friction; warm starts,
+    friction anchors, independent free bodies, prescribed motion and loop-closure
+    constraints retain the existing representation. Selection also follows the
+    topology and resource limits above. This feature is experimental and may
+    change without notice.
 
     The experimental sparse contact-triplet mode is disabled by default. Set
     ``FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1`` before construction to cache tangent
@@ -5117,7 +5129,7 @@ class SolverFeatherPGS(SolverBase):
             and not self._preelim_active
             and not self._contact_torsion_enabled
             and not self.contact_compliance
-            and not self._mimic_count
+            and (not self._mimic_count or velocity_candidate)
             and not self._connect_count
             and not self._has_loop_joints
             and not self._sparse_diagonal_contact_solve
@@ -5206,6 +5218,16 @@ class SolverFeatherPGS(SolverBase):
         for first in contact_masks:
             for second in contact_masks:
                 max_support = max(max_support, int(first | second).bit_count())
+        if self._mimic_count:
+            # Coefficients and enable bits stay live, so retain both endpoint
+            # supports even when a coupling is initially disabled or zero.
+            mimic_indices = self._mimic_art_list.numpy()
+            mimic_arts = np.repeat(np.arange(model.articulation_count), np.diff(self._mimic_art_start_np))
+            starts = self._model_plan.articulation_dof_start[mimic_arts]
+            first_dofs = self._mimic_dof0.numpy()[mimic_indices] - starts
+            second_dofs = self._mimic_dof1.numpy()[mimic_indices] - starts
+            masks = plan.ancestor_mask[first_dofs] | plan.ancestor_mask[second_dofs]
+            max_support = max(max_support, max((int(mask).bit_count() for mask in masks), default=0))
         if np.any(articulated_counts > 1):
             # Different articulations have disjoint coordinate blocks, even
             # when they share the same topology and local ancestor indices.
@@ -5265,6 +5287,7 @@ class SolverFeatherPGS(SolverBase):
             self._kernel_overrides.get("sparse_row_support", True)
             and self._sparse_prepare_contacts
             and not self._has_free_rigid_bodies
+            and not self._mimic_count
             and np.all(articulated_counts == 1)
             and size == self.max_world_dofs
             and np.all(offsets[articulated] == 0)
@@ -13316,6 +13339,51 @@ class SolverFeatherPGS(SolverBase):
                 if size not in self._mimic_sizes:
                     continue
                 n_arts = self.n_arts_by_size[size]
+                if self._sparse_velocity_limits and size == self._sparse_mass_matrix_size:
+                    indices = self._sparse_mass_matrix_indices
+                    wp.launch(
+                        build_sparse_mimic_rows,
+                        dim=n_arts * 32,
+                        inputs=[
+                            self.group_to_art[size],
+                            self.art_to_world,
+                            self.articulation_world_dof_offset,
+                            self.articulation_dof_start,
+                            self.mimic_slot,
+                            self._mimic_art_start,
+                            self._mimic_art_list,
+                            self._mimic_dof0,
+                            self._mimic_dof1,
+                            self._mimic_q0,
+                            self._mimic_q1,
+                            model.constraint_mimic_coef0,
+                            model.constraint_mimic_coef1,
+                            state_in.joint_q,
+                            self.pgs_beta,
+                            self.pgs_cfm,
+                            indices.ancestor_mask,
+                            indices.inverse_permutation,
+                            indices.lookup,
+                            self._sparse_Linv,
+                            self.v_hat,
+                        ],
+                        outputs=[
+                            self.row_type,
+                            self.row_parent,
+                            self.row_mu,
+                            self.row_beta,
+                            self.row_cfm,
+                            self.phi,
+                            self.target_velocity,
+                            self._sparse_row_dof,
+                            self._sparse_row_factor,
+                            self._sparse_row_incident,
+                            self.diag,
+                        ],
+                        block_dim=128,
+                        device=model.device,
+                    )
+                    continue
                 wp.launch(
                     populate_mimic_J_for_size,
                     dim=n_arts,
