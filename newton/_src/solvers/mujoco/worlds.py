@@ -1019,8 +1019,11 @@ class MuJoCoWorlds:
         names, shapes and count domains and is thrown away before anything runs.
         The world domain then gets one storage for its columns, sharing the world
         storage's capacity, live count and ready prefix; count-free temporaries
-        are plain fixed arrays. Prepared registries answer the real recording by name.
+        are plain fixed arrays. The workspace is finalized on the complete relation,
+        and prepared registries answer the real recording by name.
         """
+        import mujoco_warp as mjw
+
         with wp.ScopedCapture(
             device=self.device,
             force_module_load=False,
@@ -1063,6 +1066,7 @@ class MuJoCoWorlds:
             scratch_ops.prepare(registry, columns)
             group.step_bindings.extra_storages = tuple(group.scratch_storages.values())
             group.step_bindings.extra_fixed_arrays = group.scratch_arrays
+            mjw.finalize_step_workspace(group.workspace)
 
     def _retain_graph(self, graph, *buffers):
         """Retain explicit borrowers on the population's single captured graph."""
