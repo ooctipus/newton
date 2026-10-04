@@ -107,20 +107,23 @@ def _make_floating_state(model):
     return state
 
 
-def _run_floating_trajectory(model, solver, num_steps, *, reset_each_step):
+def _run_floating_trajectory(model, solver, num_steps, *, invalidate_fk_each_step):
     state_0 = _make_floating_state(model)
     state_1 = model.state()
     contacts = model.contacts()
     control = model.control()
     history = {name: [] for name in ("joint_q", "joint_qd", "body_q", "body_qd")}
+    mass_masks = []
     for _ in range(num_steps):
-        if reset_each_step:
-            solver.reset(state_0)
+        if invalidate_fk_each_step:
+            # A reset also refreshes mass factors; isolate FK/ID reuse instead.
+            solver._fk_id_cache_valid.zero_()
         solver.step(state_0, state_1, control, contacts, DT)
+        mass_masks.append(solver.mass_update_mask.numpy().copy())
         state_0, state_1 = state_1, state_0
         for name, values in history.items():
             values.append(getattr(state_0, name).numpy().copy())
-    return {name: np.stack(values) for name, values in history.items()}
+    return {name: np.stack(values) for name, values in history.items()}, np.stack(mass_masks)
 
 
 def _make_initial_state(model):
@@ -146,21 +149,24 @@ def _run_trajectory(model, solver, num_steps):
     return np.stack(joint_q_history)
 
 
-def _run_state_trajectory(model, solver, num_steps, *, reset_each_step):
+def _run_state_trajectory(model, solver, num_steps, *, invalidate_fk_each_step):
     state_0 = _make_initial_state(model)
     state_1 = model.state()
     contacts = model.contacts()
     control = model.control()
     history = {name: [] for name in ("joint_q", "joint_qd", "body_q", "body_qd")}
+    mass_masks = []
     for _ in range(num_steps):
-        if reset_each_step:
-            solver.reset(state_0)
+        if invalidate_fk_each_step:
+            # A reset also refreshes mass factors; isolate FK/ID reuse instead.
+            solver._fk_id_cache_valid.zero_()
         model.collide(state_0, contacts)
         solver.step(state_0, state_1, control, contacts, DT)
+        mass_masks.append(solver.mass_update_mask.numpy().copy())
         state_0, state_1 = state_1, state_0
         for name, values in history.items():
             values.append(getattr(state_0, name).numpy().copy())
-    return {name: np.stack(values) for name, values in history.items()}
+    return {name: np.stack(values) for name, values in history.items()}, np.stack(mass_masks)
 
 
 class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
@@ -213,10 +219,15 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
     def test_cached_fk_id_matches_forced_recomputation(self):
         """Match forced recomputation across cached fixed-base steps."""
         trajectories = []
-        for reset_each_step in (False, True):
+        for invalidate_fk_each_step in (False, True):
             model = _build_model("cuda:0", ground=False)
             solver = SolverFeatherPGS(model, update_mass_matrix_interval=2)
-            trajectories.append(_run_state_trajectory(model, solver, num_steps=20, reset_each_step=reset_each_step))
+            trajectory, mass_masks = _run_state_trajectory(
+                model, solver, num_steps=20, invalidate_fk_each_step=invalidate_fk_each_step
+            )
+            trajectories.append(trajectory)
+            expected = np.broadcast_to((np.arange(20) % 2 == 0)[:, None], mass_masks.shape)
+            np.testing.assert_array_equal(mass_masks, expected)
 
         for name in trajectories[0]:
             np.testing.assert_allclose(
@@ -227,10 +238,15 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
     def test_cached_fk_id_matches_forced_recomputation_for_floating_base(self):
         """Match forced recomputation across cached floating-base steps."""
         trajectories = []
-        for reset_each_step in (False, True):
+        for invalidate_fk_each_step in (False, True):
             model = _build_floating_model("cuda:0")
             solver = SolverFeatherPGS(model, update_mass_matrix_interval=2)
-            trajectories.append(_run_floating_trajectory(model, solver, num_steps=20, reset_each_step=reset_each_step))
+            trajectory, mass_masks = _run_floating_trajectory(
+                model, solver, num_steps=20, invalidate_fk_each_step=invalidate_fk_each_step
+            )
+            trajectories.append(trajectory)
+            expected = np.broadcast_to((np.arange(20) % 2 == 0)[:, None], mass_masks.shape)
+            np.testing.assert_array_equal(mass_masks, expected)
 
         for name in trajectories[0]:
             np.testing.assert_allclose(
