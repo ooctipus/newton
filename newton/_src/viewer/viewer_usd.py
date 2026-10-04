@@ -334,6 +334,8 @@ class ViewerUSD(ViewerBase):
             self._ensure_scopes_for_path(self.stage, self._get_path(name))
 
             mesh_prim = UsdGeom.Mesh.Define(self.stage, self._get_path(name))
+            # Triangle meshes must not inherit USD's smooth-subdivision default.
+            mesh_prim.GetSubdivisionSchemeAttr().Set(UsdGeom.Tokens.none)
 
             if not dynamic:
                 # Static mesh topology is authored once.

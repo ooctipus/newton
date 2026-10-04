@@ -556,7 +556,7 @@ class TestViewerUSD(unittest.TestCase):
         self.assertEqual(list(face_indices.Get(1)), [0, 1, 2, 0, 2, 3])
 
     def test_log_mesh_dynamic_clears_stale_normals(self):
-        """Clear normals when a later dynamic mesh update omits them."""
+        """Preserve polygonal shading when a later dynamic mesh update clears normals."""
         viewer = self._make_viewer()
         points = wp.array(
             [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
@@ -571,6 +571,7 @@ class TestViewerUSD(unittest.TestCase):
         viewer.log_mesh("/dynamic_mesh", points, indices, normals=None, dynamic=True)
 
         mesh = UsdGeom.Mesh.Get(viewer.stage, viewer._get_path("/dynamic_mesh"))
+        self.assertEqual(mesh.GetSubdivisionSchemeAttr().Get(), UsdGeom.Tokens.none)
         self.assertEqual(len(mesh.GetNormalsAttr().Get(0)), 3)
         self.assertEqual(list(mesh.GetNormalsAttr().Get(1)), [])
 
