@@ -5,6 +5,7 @@
 
 import unittest
 from contextlib import ExitStack
+from dataclasses import fields
 from unittest.mock import patch
 
 import numpy as np
@@ -85,6 +86,14 @@ class TestMuJoCoReplication(unittest.TestCase):
                         stack.enter_context(patch.object(owner, name, side_effect=AssertionError(name)))
                     actual = source.replicate(3)
                 self.assertEqual(actual.model.world_count, 3)
+                self.assertIs(actual.model_mapping.newton_model, actual.model)
+                self.assertIs(actual.model_mapping.mujoco_model, actual.mjw_model)
+                for definition in fields(reference.model_mapping):
+                    expected = getattr(reference.model_mapping, definition.name)
+                    if isinstance(expected, np.ndarray):
+                        received = getattr(actual.model_mapping, definition.name)
+                        np.testing.assert_array_equal(received, expected, err_msg=definition.name)
+                        self.assertFalse(received.flags.writeable, definition.name)
                 for name, expected in vars(reference).items():
                     if not isinstance(expected, wp.array):
                         continue

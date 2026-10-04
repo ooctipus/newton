@@ -9,8 +9,20 @@ if TYPE_CHECKING:
     from .featherstone import SolverFeatherstone
     from .implicit_mpm import SolverImplicitMPM
     from .kamino import SolverKamino
-    from .mujoco.solver_mujoco import SolverMuJoCo
-    from .mujoco.worlds import MuJoCoWorldPopulation, MuJoCoWorlds
+    from .mujoco.solver_mujoco import MuJoCoModelMapping, SolverMuJoCo
+    from .mujoco.worlds import (
+        MuJoCoWorldPopulation,
+        MuJoCoWorlds,
+        mujoco_world_population_ready_capacity,
+        mujoco_world_population_validate,
+        mujoco_worlds_capture,
+        mujoco_worlds_close,
+        mujoco_worlds_grow_backing,
+        mujoco_worlds_memory_report,
+        mujoco_worlds_prepare,
+        mujoco_worlds_resize_backing,
+        mujoco_worlds_validate,
+    )
     from .semi_implicit import SolverSemiImplicit
     from .solver import SolverBase
     from .steel import SolverSteel
@@ -19,6 +31,7 @@ if TYPE_CHECKING:
     from .xpbd import SolverXPBD
 
 __all__ = [
+    "MuJoCoModelMapping",
     "MuJoCoWorldPopulation",
     "MuJoCoWorlds",
     "SolverBase",
@@ -32,6 +45,15 @@ __all__ = [
     "SolverVBD",
     "SolverXPBD",
     "mujoco",
+    "mujoco_world_population_ready_capacity",
+    "mujoco_world_population_validate",
+    "mujoco_worlds_capture",
+    "mujoco_worlds_close",
+    "mujoco_worlds_grow_backing",
+    "mujoco_worlds_memory_report",
+    "mujoco_worlds_prepare",
+    "mujoco_worlds_resize_backing",
+    "mujoco_worlds_validate",
     "style3d",
 ]
 
@@ -47,6 +69,16 @@ _LAZY_IMPORTS: dict[str, tuple[str, str | None]] = {
     "SolverMuJoCo": (".mujoco.solver_mujoco", "SolverMuJoCo"),
     "MuJoCoWorldPopulation": (".mujoco.worlds", "MuJoCoWorldPopulation"),
     "MuJoCoWorlds": (".mujoco.worlds", "MuJoCoWorlds"),
+    "MuJoCoModelMapping": (".mujoco.solver_mujoco", "MuJoCoModelMapping"),
+    "mujoco_world_population_ready_capacity": (".mujoco.worlds", "mujoco_world_population_ready_capacity"),
+    "mujoco_world_population_validate": (".mujoco.worlds", "mujoco_world_population_validate"),
+    "mujoco_worlds_capture": (".mujoco.worlds", "mujoco_worlds_capture"),
+    "mujoco_worlds_close": (".mujoco.worlds", "mujoco_worlds_close"),
+    "mujoco_worlds_grow_backing": (".mujoco.worlds", "mujoco_worlds_grow_backing"),
+    "mujoco_worlds_memory_report": (".mujoco.worlds", "mujoco_worlds_memory_report"),
+    "mujoco_worlds_prepare": (".mujoco.worlds", "mujoco_worlds_prepare"),
+    "mujoco_worlds_resize_backing": (".mujoco.worlds", "mujoco_worlds_resize_backing"),
+    "mujoco_worlds_validate": (".mujoco.worlds", "mujoco_worlds_validate"),
     "SolverSemiImplicit": (".semi_implicit", "SolverSemiImplicit"),
     "SolverSteel": (".steel", "SolverSteel"),
     "SolverStyle3D": (".style3d.solver_style3d", "SolverStyle3D"),

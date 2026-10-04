@@ -33,6 +33,30 @@ section at the bottom collects the most useful anchor points.
    GPU-resident analogues.
 
 
+Prepared numeric correspondence
+-------------------------------
+
+``SolverMuJoCo.model_mapping`` exposes an experimental, passive
+:class:`~newton.solvers.MuJoCoModelMapping` produced during conversion. It retains
+the exact Newton and native model endpoints and read-only integer relations for
+coordinates, DOFs, bodies, mocap roots and actuator inputs. Consumers select
+columns from these relations rather than decoding the solver's internal actuator
+encoding or reconstructing conversion from native names.
+
+Coordinate mappings describe only scalar affine conversions. A ``-1`` entry
+marks an unsupported or absent correspondence; a DOF identity alone does not
+describe the frame conversion of a free or ball joint. Scalar reference offsets
+use Newton coordinates plus the recorded offset on native writes. Actuator
+position, velocity and direct-control inputs have separate numeric relations.
+The consumer remains responsible for its supported joint and reset-frame policy.
+
+This is a preparation snapshot for immutable prototypes. Model notifications
+invalidate the solver's published snapshot; previously borrowed records must not
+be used after modifying either model endpoint. State stepping does not change
+the topology correspondence. Solver replication publishes a record with the new
+model endpoints and rebased world IDs.
+
+
 Joint types
 -----------
 
