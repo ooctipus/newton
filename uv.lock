@@ -1968,7 +1968,7 @@ wheels = [
 [[package]]
 name = "gpu-components"
 version = "0.1.0"
-source = { git = "https://github.com/ooctipus/gpu-components.git?rev=846288b15c32f4b45271597b169d4c241b0681c8#846288b15c32f4b45271597b169d4c241b0681c8" }
+source = { git = "https://github.com/ooctipus/gpu-components.git?rev=338fa9b34f25ca60bc4a3713d79b1115baf68372#338fa9b34f25ca60bc4a3713d79b1115baf68372" }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' or (extra == 'extra-6-newton-torch-cu12' and extra == 'extra-6-newton-torch-cu13')" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*' or (extra == 'extra-6-newton-torch-cu12' and extra == 'extra-6-newton-torch-cu13')" },
@@ -3511,7 +3511,7 @@ wheels = [
 [[package]]
 name = "mujoco-warp"
 version = "3.14.0"
-source = { git = "https://github.com/ooctipus/mujoco_warp.git?rev=822fc39c5424eb17e9b1eccf6eb7d3279f6353b1#822fc39c5424eb17e9b1eccf6eb7d3279f6353b1" }
+source = { git = "https://github.com/ooctipus/mujoco_warp.git?rev=be0072dd0f0bf43e9459757a854aa5957de971d6#be0072dd0f0bf43e9459757a854aa5957de971d6" }
 dependencies = [
     { name = "absl-py" },
     { name = "etils", version = "1.13.0", source = { registry = "https://pypi.org/simple" }, extra = ["epath"], marker = "python_full_version < '3.11' or (extra == 'extra-6-newton-torch-cu12' and extra == 'extra-6-newton-torch-cu13')" },
@@ -4155,14 +4155,14 @@ requires-dist = [
     { name = "fast-simplification", marker = "extra == 'importers'", specifier = ">=0.1.11" },
     { name = "gitpython", marker = "extra == 'docs'", specifier = ">=3.1.58" },
     { name = "gitpython", marker = "extra == 'examples'", specifier = ">=3.1.58" },
-    { name = "gpu-components", marker = "extra == 'sim'", git = "https://github.com/ooctipus/gpu-components.git?rev=846288b15c32f4b45271597b169d4c241b0681c8" },
+    { name = "gpu-components", marker = "extra == 'sim'", git = "https://github.com/ooctipus/gpu-components.git?rev=338fa9b34f25ca60bc4a3713d79b1115baf68372" },
     { name = "imgui-bundle", marker = "extra == 'examples'", specifier = ">=1.92.0" },
     { name = "ipykernel", marker = "extra == 'docs'", specifier = ">=6.0.0,<7.0.0" },
     { name = "jupyter-server-proxy", marker = "extra == 'notebook'", specifier = ">=4.5.0" },
     { name = "jupyterlab", marker = "extra == 'notebook'", specifier = ">=4.5.7" },
     { name = "meshio", marker = "extra == 'importers'", specifier = ">=5.3.5" },
     { name = "mujoco", marker = "extra == 'sim'", specifier = "~=3.14.0" },
-    { name = "mujoco-warp", marker = "extra == 'sim'", git = "https://github.com/ooctipus/mujoco_warp.git?rev=822fc39c5424eb17e9b1eccf6eb7d3279f6353b1" },
+    { name = "mujoco-warp", marker = "extra == 'sim'", git = "https://github.com/ooctipus/mujoco_warp.git?rev=be0072dd0f0bf43e9459757a854aa5957de971d6" },
     { name = "myst-parser", marker = "extra == 'docs'", specifier = ">=3.0.1" },
     { name = "nbsphinx", marker = "extra == 'docs'", specifier = ">=0.9.0" },
     { name = "newton", extras = ["examples"], marker = "extra == 'dev'" },
