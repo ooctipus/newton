@@ -263,9 +263,6 @@ class _MuJoCoWorldPopulation:
     initialization_transfer: object = None
     compaction_transfer: object = None
     step_bindings: object = None
-    scratch_registry: object = None
-    scratch_storages: dict = field(default_factory=dict)
-    scratch_arrays: tuple = ()
     application_ranges: list[tuple[int, int]] | None = None
     request_indices: object = None
     source_rows: object = None
@@ -279,41 +276,22 @@ class _MuJoCoWorldPopulation:
     global_arrays: dict = field(default_factory=dict)
     empty_fields: dict = field(default_factory=dict)
 
-    def domains(self, worlds: int):
-        """Each storage with its row target for ``worlds`` ready worlds; scratch columns follow their domain."""
-        for domain, owner, rows in (
-            ("world", self.world_storage, worlds),
-            ("contact", self.contact_storage, worlds * self.contact_quota),
-            ("ccd", self.ccd_storage, worlds * self.ccd_quota),
-        ):
-            yield domain, owner, rows
-            scratch = self.scratch_storages.get(domain)
-            if scratch is not None:
-                yield domain, scratch, rows
-
-    @property
-    def storages(self):
-        """Every capacity-domain storage this population owns, scratch columns included."""
-        return tuple(owner for _, owner, _ in self.domains(1))
-
     @property
     def world_ready_capacity(self):
-        return min(owner.ready_rows // rows for _, owner, rows in self.domains(1))
+        return min(
+            self.world_storage.ready_rows,
+            self.contact_storage.ready_rows // self.contact_quota,
+            self.ccd_storage.ready_rows // self.ccd_quota,
+        )
 
-    def record_physics(self, *, gated=True):
-        """Record conditional native physics and poses on the current stream.
-
-        ``gated=False`` records the same program without its conditional nodes,
-        for a recording that is discarded: allocation during scratch discovery is
-        a graph operation, and CUDA refuses it inside a conditional body.
-        """
+    def record_physics(self):
+        """Record conditional native physics and poses on the current stream."""
         import mujoco_warp as mjw
 
         if self.step_bindings.recording_failed:
             raise RuntimeError("The population program has a failed recording")
-        if self.workspace.bindings is not None and self.workspace.bindings is not self.step_bindings:
+        if self.workspace.bindings is not self.step_bindings:
             raise RuntimeError("Native workspace already has step bindings")
-        self.workspace.bindings = self.step_bindings
         data = self.workspace.execution_data
 
         def record_callback(callback):
@@ -330,32 +308,25 @@ class _MuJoCoWorldPopulation:
             record_callback(self.before_step)
             for _ in range(self.substeps):
                 mjw.validate_step_workspace(self.workspace, self.model, self.data)
-                mjw.step(self.model, data, scratch=self.workspace.scratch)
+                mjw.step(self.model, data)
                 record_callback(self.after_substep)
             mjw.validate_step_workspace(self.workspace, self.model, self.data)
 
-        def guard(condition, on_true):
-            if gated:
-                wp.capture_if(condition, on_true=on_true)
-            else:
-                on_true()
-
         def step_and_poses():
-            guard(self.step_condition, step)
+            wp.capture_if(self.step_condition, on_true=step)
             mjw.kinematics(self.model, data)
 
         try:
             if self.refresh_kinematics:
-                guard(self.kinematics_condition, step_and_poses)
+                wp.capture_if(self.kinematics_condition, step_and_poses)
             else:
-                guard(self.step_condition, step)
+                wp.capture_if(self.step_condition, step)
             if self.step_bindings.recording_failed:
                 raise RuntimeError("The population program has a failed recording")
         except BaseException:
             self.step_bindings.recording_failed = True
             raise
         finally:
-            self.workspace.bindings = None
             self.before_step = None
             self.after_substep = None
 
@@ -386,7 +357,7 @@ class MuJoCoWorlds:
 
     Native Data arrays are authoritative. No dense Newton State or replicated
     model is created. The caller warms each native program on separate one-world
-    Data before capture, and owns reset policy, command buffers and observations.
+    Data before construction, and owns reset policy, command buffers and observations.
     """
 
     def __init__(
@@ -480,6 +451,9 @@ class MuJoCoWorlds:
                 ):
                     group = _MuJoCoWorldPopulation(model, contact_quota=template.naconmax, ccd_quota=template.naccdmax)
                     self._populations.append(group)
+                    registry, count_parameters = mjw.discover_step_scratch(
+                        model, template, world_capacity=capacity, contact_capacity=contact_cap, ccd_capacity=ccd_cap
+                    )
                     # Native tiled solver consumers require 16-byte field offsets and row strides.
                     # Candidate/contact fields use scalar loads and their declared natural alignment.
                     arrays, world_fields, contact_fields = {}, [], []
@@ -521,33 +495,12 @@ class MuJoCoWorlds:
                             array,
                             count=group.default_storage.protected_count,
                         )
-                    specs = mjw.step_workspace_layout(
-                        model, template, world_capacity=capacity, contact_capacity=contact_cap, ccd_capacity=ccd_cap
-                    )
-                    ccd_fields, scratch = [], {}
-                    for spec in specs:
-                        name = "workspace." + spec.name
-                        if spec.capacity_domain == "world":
-                            if spec.shape[0] == 0:
-                                # Optional solver branches use an absent-array sentinel,
-                                # not a capacity-sized field with unspecified values.
-                                scratch[spec.name] = wp.empty(spec.shape, dtype=spec.dtype, device=device)
-                                group.empty_fields[name] = {"shape": list(spec.shape), "dtype": str(spec.dtype)}
-                            else:
-                                world_fields.append(
-                                    FieldSpec(
-                                        name, spec.shape[1:], spec.dtype, packed=len(spec.shape) > 1, alignment_bytes=16
-                                    )
-                                )
-                        elif spec.capacity_domain == "candidate":
-                            contact_fields.append(FieldSpec(name, spec.shape[1:], spec.dtype))
-                        elif spec.capacity_domain == "ccd":
-                            ccd_fields.append(FieldSpec(name, spec.shape[1:], spec.dtype, alignment_bytes=16))
-                        elif spec.capacity_domain == "global_counter":
-                            scratch[spec.name] = wp.zeros(spec.shape, dtype=spec.dtype, device=device)
-                            group.global_arrays[name] = scratch[spec.name]
-                        else:
-                            raise ValueError(f"Unknown native workspace domain: {spec.capacity_domain}")
+                    ccd_fields, columns = [], {}
+                    for count, specs in zip(count_parameters, (world_fields, contact_fields, ccd_fields), strict=True):
+                        specs.extend(
+                            replace(spec, name="scratch." + spec.name)
+                            for spec in scratch_ops.column_specs(registry, count)
+                        )
                     live_count = self._directory.data.live_count[prototype : prototype + 1]
                     group.world_storage = field_ops.allocate(
                         capacity, live_count, fields=tuple(world_fields), backing=backing, initial_ready_count=initial
@@ -563,14 +516,14 @@ class MuJoCoWorlds:
                         ccd_cap,
                         wp.zeros(1, dtype=int, device=device),
                         fields=tuple(ccd_fields),
-                        backing=backing,
-                        initial_ready_count=initial * group.ccd_quota if backing else None,
+                        backing=backing if ccd_fields else None,
+                        initial_ready_count=initial * group.ccd_quota if backing and ccd_fields else None,
                     )
                     for owner in (group.world_storage, group.contact_storage, group.ccd_storage):
                         for name, array in owner.arrays.items():
                             field_ops.prepare_fill(owner, array, 0)
-                            if name.startswith("workspace."):
-                                scratch[name.removeprefix("workspace.")] = array
+                            if name.startswith("scratch."):
+                                columns[name.removeprefix("scratch.")] = array
                             else:
                                 arrays[name] = array
                     field_ops.prepare_fill(
@@ -588,12 +541,26 @@ class MuJoCoWorlds:
                         mjw.replace_arrays(template, arrays), nworld=capacity, naconmax=contact_cap, naccdmax=ccd_cap
                     )
                     field_ops.prepare_fill(group.world_storage, group.data.island_dofadr, model.nv)
+                    plain = scratch_ops.plain_declarations(registry)
+                    for declaration in plain:
+                        array = wp.empty(
+                            scratch_ops.bounded_shape(declaration.shape), dtype=declaration.dtype, device=device
+                        )
+                        columns[declaration.name] = array
+                        group.global_arrays["scratch." + declaration.name] = array
+                    scratch_ops.prepare(registry, columns)
                     group.step_bindings = mjw.StepBindings(
-                        group.world_storage, group.contact_storage, group.ccd_storage
+                        group.world_storage,
+                        group.contact_storage,
+                        group.ccd_storage,
+                        fixed_arrays=tuple(columns[declaration.name] for declaration in plain),
                     )
-                    group.scratch_registry = scratch_ops.allocate_registry(device)
                     group.workspace = mjw.make_step_workspace(
-                        model, group.data, arrays=scratch, bindings=group.step_bindings, scratch=group.scratch_registry
+                        model,
+                        group.data,
+                        bindings=group.step_bindings,
+                        scratch=registry,
+                        count_parameters=count_parameters,
                     )
                     group.initialization_transfer = field_ops.prepare_transfer(
                         group.default_storage, group.world_storage, data_field_names
@@ -619,7 +586,7 @@ class MuJoCoWorlds:
                 )
         except BaseException as failure:
             traceback.clear_frames(failure.__traceback__)
-            arrays = scratch = world_sources = array = owner = None
+            arrays = columns = registry = world_sources = array = owner = None
             try:
                 self.close(streams=(wp.get_stream(device),))
             except BaseException as cleanup:
@@ -670,9 +637,7 @@ class MuJoCoWorlds:
     ):
         """Capture once, retaining caller buffers and all native owners.
 
-        One discarded recording precedes the capture: the native programs name
-        their scratch columns while recording, and that recording is where the
-        population learns them (see ``_prepare_scratch_columns``).
+        Scratch discovery and complete domain allocation happen during construction.
         Callbacks receive supported :class:`MuJoCoWorldPopulation` views.
         Optional preparation callbacks record payload validation before admission
         and payload writes after the default Data copy. The initializer explicitly
@@ -752,16 +717,13 @@ class MuJoCoWorlds:
             application_ranges = [[] for _ in self._populations]
             population_ranges = [None] * len(self._populations)
             try:
-                for group in self._populations:
-                    group.workspace.bindings = None
+                for group, ranges in zip(self._populations, application_ranges, strict=True):
                     group.substeps, group.refresh_kinematics = substeps, refresh_kinematics
                     group.step_bindings.updates = graph_ops.prepare_updates(
                         group.world_storage.protected_count,
                         enable_count_maximum=group.world_storage.capacity,
                         binding_capacity=512 * substeps,
                     )
-                self._prepare_scratch_columns()
-                for group, ranges in zip(self._populations, application_ranges, strict=True):
                     group.application_ranges = ranges
                     group.before_step, group.after_substep = before_step, after_substep
                 # Warmed native programs use separate Data. Load lifecycle and row
@@ -975,7 +937,6 @@ class MuJoCoWorlds:
                                 fixed=fixed,
                             )
                         )
-                    group.workspace.bindings = group.step_bindings
                     mjw.bind_step_program(
                         group.workspace,
                         graph,
@@ -1007,66 +968,8 @@ class MuJoCoWorlds:
                 # Earlier recording failures may leave sibling populations unvisited.
                 # Only explicit graph retention owns callback resources after preparation.
                 for group in self._populations:
-                    group.workspace.bindings = None
                     group.before_step = group.after_substep = None
                     group.application_ranges = None
-
-    def _prepare_scratch_columns(self):
-        """Discover each program's scratch columns in a discarded recording, then allocate them.
-
-        Numerical stages name their temporaries where they use them; nothing else
-        declares them. One recording with discovering registries collects the
-        names, shapes and count domains and is thrown away before anything runs.
-        The world domain then gets one storage for its columns, sharing the world
-        storage's capacity, live count and ready prefix; count-free temporaries
-        are plain fixed arrays. The workspace is finalized on the complete relation,
-        and prepared registries answer the real recording by name.
-        """
-        import mujoco_warp as mjw
-
-        with wp.ScopedCapture(
-            device=self.device,
-            force_module_load=False,
-            capture_mode=wp.CaptureMode.THREAD_LOCAL,
-            record_launches=True,
-            record_memory_operations=True,
-        ) as capture:
-            for group in self._populations:
-                group.record_physics(gated=False)
-        graph_ops.invalidate(capture.graph)
-        del capture
-        for group in self._populations:
-            registry, execution = group.scratch_registry, group.workspace.execution_data
-            scratch_ops.freeze(registry)
-            for count in (execution.naconmax, execution.naccdmax):
-                if scratch_ops.column_specs(registry, count):
-                    raise NotImplementedError(
-                        "Contact and CCD scratch columns need their domain's ready count as the admitted count; "
-                        "only world-domain scratch columns are prepared"
-                    )
-            columns = {}
-            specs = scratch_ops.column_specs(registry, execution.nworld)
-            if specs:
-                owner = group.world_storage
-                storage = field_ops.allocate(
-                    owner.capacity,
-                    owner.protected_count,
-                    fields=specs,
-                    backing=self._backing,
-                    initial_ready_count=owner.ready_rows if self._backing is not None else None,
-                )
-                group.scratch_storages["world"] = storage
-                columns.update(storage.arrays)
-            plain = scratch_ops.plain_declarations(registry)
-            group.scratch_arrays = tuple(
-                wp.empty(scratch_ops.bounded_shape(declaration.shape), dtype=declaration.dtype, device=self.device)
-                for declaration in plain
-            )
-            columns.update(zip((declaration.name for declaration in plain), group.scratch_arrays, strict=True))
-            scratch_ops.prepare(registry, columns)
-            group.step_bindings.extra_storages = tuple(group.scratch_storages.values())
-            group.step_bindings.extra_fixed_arrays = group.scratch_arrays
-            mjw.finalize_step_workspace(group.workspace)
 
     def _retain_graph(self, graph, *buffers):
         """Retain explicit borrowers on the population's single captured graph."""
@@ -1087,7 +990,7 @@ class MuJoCoWorlds:
             field_ops.retain_transfer_graph(
                 group.compaction_transfer, graph, group.move_source_rows, group.move_destination_rows, group.move_count
             )
-            for owner in group.storages:
+            for owner in (group.world_storage, group.contact_storage, group.ccd_storage):
                 field_ops.retain_graph(owner, graph, group.workspace, group.step_condition, group.kinematics_condition)
         self._graph = weakref.ref(graph)
         return graph
@@ -1134,7 +1037,11 @@ class MuJoCoWorlds:
             services = [
                 (group, owner, target)
                 for group, n in zip(self._populations, world_ready_capacities, strict=True)
-                for _, owner, target in group.domains(n)
+                for owner, target in (
+                    (group.world_storage, n),
+                    (group.contact_storage, n * group.contact_quota),
+                    (group.ccd_storage, n * group.ccd_quota),
+                )
                 if target > owner.ready_rows
             ]
             if not services:
@@ -1232,11 +1139,16 @@ class MuJoCoWorlds:
                 budget_rejected = False
                 try:
                     services = [
-                        (group, owner, target, int(live_counts[prototype]) if domain == "world" else 0)
+                        (group, owner, target, int(live_counts[prototype]) if owner is group.world_storage else 0)
                         for prototype, (group, n) in enumerate(
                             zip(self._populations, world_ready_capacities, strict=True)
                         )
-                        for domain, owner, target in group.domains(n)
+                        for owner, target in (
+                            (group.world_storage, n),
+                            (group.contact_storage, n * group.contact_quota),
+                            (group.ccd_storage, n * group.ccd_quota),
+                        )
+                        if owner.backing is not None
                     ]
                     # Clean failed growth may retain mapped bytes beyond the published ready prefix.
                     services.sort(
@@ -1331,10 +1243,6 @@ class MuJoCoWorlds:
                     "contact_storage": field_ops.memory_report(group.contact_storage),
                     "ccd_storage": field_ops.memory_report(group.ccd_storage),
                     "default_storage": field_ops.memory_report(group.default_storage),
-                    "scratch_storages": {
-                        domain: field_ops.memory_report(owner) for domain, owner in group.scratch_storages.items()
-                    },
-                    "scratch_arrays_bytes": sum(array.capacity for array in group.scratch_arrays),
                     "workspace_borrowed": mjw.step_workspace_memory_report(group.workspace)
                     if group.workspace is not None
                     else None,
@@ -1395,13 +1303,9 @@ class MuJoCoWorlds:
                 directory_ops.close(self._directory, streams=streams)
             for group in self._populations:
                 group.initialization_transfer = group.compaction_transfer = None
-                if group.workspace is not None:
-                    group.workspace.bindings = None
-                # The prepared registry holds the scratch column views; drop them before their storage closes.
-                group.workspace = group.data = group.step_bindings = group.scratch_registry = None
-                group.scratch_arrays = ()
+                group.workspace = group.data = group.step_bindings = None
             for group in self._populations:
-                for owner in (*group.storages, group.default_storage):
+                for owner in (group.world_storage, group.contact_storage, group.ccd_storage, group.default_storage):
                     if owner is not None:
                         field_ops.close(owner, streams=raw_streams)
             self._populations.clear()
