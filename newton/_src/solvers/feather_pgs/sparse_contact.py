@@ -901,51 +901,74 @@ def build_sparse_joint_limit_rows(
     const int capacity = row_type.shape[1];
     const int support_capacity = row_factor.shape[2];
     const int factor_base = group * inverse_factor.shape[1];
-    for (int candidate = 0; candidate < 2 * dofs; ++candidate) {
-        const int local_dof = candidate >> 1;
+    for (int local_dof = 0; local_dof < dofs; ++local_dof) {
         const int dof = start + local_dof;
-        const int side_index = 2 * dof + (candidate & 1);
-        const int row = velocity_limit_slot.data[side_index];
+        const int lower = velocity_limit_slot.data[2 * dof];
+        const int upper = velocity_limit_slot.data[2 * dof + 1];
         // The existing allocator owns eligibility, ordering and overflow demand.
-        if (row < 0 || row >= capacity) continue;
-        const float sign = velocity_limit_sign.data[side_index];
+        const bool write_lower = lower >= 0 && lower < capacity;
+        const bool write_upper = upper >= 0 && upper < capacity;
+        if (!write_lower && !write_upper) continue;
+        const float lower_sign = write_lower ? velocity_limit_sign.data[2 * dof] : 0.0f;
+        const float upper_sign = write_upper ? velocity_limit_sign.data[2 * dof + 1] : 0.0f;
         const int column = inverse_permutation.data[local_dof];
         const unsigned long long support_mask = dof_mask.data[local_dof];
-        const int row_offset = world * capacity + row;
-        const int response_offset = row_offset * support_capacity;
+        const int lower_offset = (world * capacity + lower) * support_capacity;
+        const int upper_offset = (world * capacity + upper) * support_capacity;
+        const int dof_offset = articulation_world_dof_offset.data[art];
         float norm = 0.0f;
         for (int node = lane; node < dofs; node += width) {
             const unsigned long long bit = 1ull << node;
             if ((support_mask & bit) == 0) continue;
             const int index = bit_count(support_mask & (bit - 1ull));
             const int entry = factor_lookup.data[node * dofs + column];
-            const float value = entry >= 0 ? sign * inverse_factor.data[factor_base + entry] : 0.0f;
-            if (!support.enabled)
-                row_dof.data[response_offset + index] = articulation_world_dof_offset.data[art] + node;
-            row_factor.data[response_offset + index] = value;
+            const float value = entry >= 0 ? inverse_factor.data[factor_base + entry] : 0.0f;
+            if (write_lower) {
+                if (!support.enabled) row_dof.data[lower_offset + index] = dof_offset + node;
+                row_factor.data[lower_offset + index] = entry >= 0 ? lower_sign * value : 0.0f;
+            }
+            if (write_upper) {
+                if (!support.enabled) row_dof.data[upper_offset + index] = dof_offset + node;
+                row_factor.data[upper_offset + index] = entry >= 0 ? upper_sign * value : 0.0f;
+            }
+            // Allocator-owned unit signs share the same squared column norm.
             norm += value * value;
         }
         const int support_count = bit_count(support_mask);
         for (int index = support_count + lane; index < support_capacity; index += width) {
-            if (!support.enabled) row_dof.data[response_offset + index] = -1;
-            row_factor.data[response_offset + index] = 0.0f;
+            if (write_lower) {
+                if (!support.enabled) row_dof.data[lower_offset + index] = -1;
+                row_factor.data[lower_offset + index] = 0.0f;
+            }
+            if (write_upper) {
+                if (!support.enabled) row_dof.data[upper_offset + index] = -1;
+                row_factor.data[upper_offset + index] = 0.0f;
+            }
         }
 #if defined(__CUDA_ARCH__)
         for (int shift = 16; shift > 0; shift >>= 1) norm += __shfl_down_sync(MASK, norm, shift);
 #endif
         if (lane == 0) {
-            if (support.enabled)
-                support.row_class.data[row_offset] = support.limit_class.data[local_dof];
-            row_incident.data[row_offset] = sign * v_hat.data[dof];
-            // The prefix finalizer adds CFM and forms RHS from target_velocity.
-            diagonal.data[row_offset] = norm;
-            row_type.data[row_offset] = $VELOCITY_LIMIT_TYPE;
-            row_parent.data[row_offset] = -1;
-            row_mu.data[row_offset] = 0.0f;
-            row_beta.data[row_offset] = 0.0f;
-            row_cfm.data[row_offset] = pgs_cfm;
-            phi.data[row_offset] = 0.0f;
-            target_velocity.data[row_offset] = -joint_velocity_limit.data[dof];
+            const float incident = v_hat.data[dof];
+            const float target = -joint_velocity_limit.data[dof];
+            for (int side = 0; side < 2; ++side) {
+                const int row = side == 0 ? lower : upper;
+                if (row < 0 || row >= capacity) continue;
+                const float sign = side == 0 ? lower_sign : upper_sign;
+                const int row_offset = world * capacity + row;
+                if (support.enabled)
+                    support.row_class.data[row_offset] = support.limit_class.data[local_dof];
+                row_incident.data[row_offset] = sign * incident;
+                // The prefix finalizer adds CFM and forms RHS from target_velocity.
+                diagonal.data[row_offset] = norm;
+                row_type.data[row_offset] = $VELOCITY_LIMIT_TYPE;
+                row_parent.data[row_offset] = -1;
+                row_mu.data[row_offset] = 0.0f;
+                row_beta.data[row_offset] = 0.0f;
+                row_cfm.data[row_offset] = pgs_cfm;
+                phi.data[row_offset] = 0.0f;
+                target_velocity.data[row_offset] = target;
+            }
         }
     }
 """.replace("$VELOCITY_LIMIT_TYPE", str(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT))

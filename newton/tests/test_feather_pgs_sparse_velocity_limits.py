@@ -76,7 +76,7 @@ class TestSparseVelocityLimitRows(unittest.TestCase):
     def _check_rows(self, device):
         """Project signed columns with permuted groups, empty worlds and bounded slots."""
         for counts in ((2, 2, 2), (2, 19, 19)):
-            for capacity, table in ((5, False), (9, False), (5, True), (9, True)):
+            for capacity, table in ((4, False), (5, False), (9, False), (4, True), (5, True), (9, True)):
                 with self.subTest(counts=counts, capacity=capacity, table=table):
                     plan = _SparseMassMatrixPlan.build([-1, 0, 0], counts)
                     dofs = plan.dof_count
@@ -101,6 +101,7 @@ class TestSparseVelocityLimitRows(unittest.TestCase):
                     velocity = rng.normal(size=2 * dofs).astype(np.float32)
                     live = []
                     # Articulation zero belongs to factor group one; articulation one stays empty.
+                    # Capacity four retains only the lower side of the middle DOF's pair.
                     for dof in (0, dofs // 2, dofs - 1):
                         for side, sign in enumerate((1.0, -1.0)):
                             row = 1 + len(live)
