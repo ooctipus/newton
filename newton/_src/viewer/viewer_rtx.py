@@ -1958,9 +1958,11 @@ void main() {
             if self._render_products is not None and self._window is not None and self._window.context is not None:
                 for _pname, product in self._render_products.items():
                     for frame in product.frames:
-                        if "LdrColor" in frame.render_vars:
+                        # OVRTX 0.5 uses RenderVar prim paths; older versions use source names.
+                        color = frame.render_vars.get("/Render/Vars/LdrColor", frame.render_vars.get("LdrColor"))
+                        if color is not None:
                             with wp.ScopedTimer("ViewerRTX::fb_map", active=PROFILE_ENABLED, use_nvtx=True):
-                                with frame.render_vars["LdrColor"].map(device=Device.CUDA) as mapping:
+                                with color.map(device=Device.CUDA) as mapping:
                                     pixels = wp.from_dlpack(mapping, dtype=wp.vec4ub)
                                     with wp.ScopedTimer(
                                         "ViewerRTX::blit_to_window", active=PROFILE_ENABLED, use_nvtx=True
@@ -2041,8 +2043,9 @@ void main() {
 
         for _pname, product in products.items():
             for frame in product.frames:
-                if "LdrColor" in frame.render_vars:
-                    with frame.render_vars["LdrColor"].map(device=Device.CPU) as mapping:
+                color = frame.render_vars.get("/Render/Vars/LdrColor", frame.render_vars.get("LdrColor"))
+                if color is not None:
+                    with color.map(device=Device.CPU) as mapping:
                         pixels = np.array(np.from_dlpack(mapping), copy=True)
                     return pixels
 

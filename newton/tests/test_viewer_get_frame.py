@@ -1,9 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 import ctypes
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -14,6 +17,7 @@ import newton
 import newton.viewer
 from newton._src.viewer.gl.opengl import RendererGL
 from newton._src.viewer.viewer_gl import ViewerGL
+from newton.viewer import ViewerRTX
 
 
 def _viewer_gl_unavailable_error_types(test: unittest.TestCase) -> tuple[type[BaseException], ...]:
@@ -514,6 +518,41 @@ class TestViewerGLGetFrame(unittest.TestCase):
             self.assertLess(np.abs(actual.astype(np.int16) - expected.astype(np.int16))[visible].mean(), 2.0)
         finally:
             viewer.close()
+
+
+class TestViewerRTXFrameOutput(unittest.TestCase):
+    def test_display_and_screenshot_support_ovrtx_render_var_keys(self):
+        """Display and save color output keyed by a source name or RenderVar prim path."""
+        from PIL import Image
+
+        pixels = np.arange(24, dtype=np.uint8).reshape(2, 3, 4)
+        device = SimpleNamespace(CPU="cpu", CUDA="cuda")
+        gpu_pixels = SimpleNamespace(device=SimpleNamespace(stream=SimpleNamespace(cuda_stream=0)))
+        for key in ("LdrColor", "/Render/Vars/LdrColor"):
+            with self.subTest(render_var_key=key), tempfile.TemporaryDirectory() as directory:
+                mapping = mock.MagicMock()
+                color = SimpleNamespace(map=mock.Mock(side_effect=[mapping, contextlib.nullcontext(pixels)]))
+                product = SimpleNamespace(frames=[SimpleNamespace(render_vars={key: color})])
+                viewer = ViewerRTX.__new__(ViewerRTX)
+                viewer._rtx = mock.Mock()
+                viewer._rtx.step.return_value = {"/Render/Product": product}
+                viewer._should_close = False
+                viewer._async = False
+                viewer._window = SimpleNamespace(context=object())
+                viewer._render_product_path = "/Render/Product"
+                viewer.fps = 60
+                viewer._blit_to_window = mock.Mock()
+                with (
+                    mock.patch.dict(sys.modules, {"ovrtx": SimpleNamespace(Device=device)}),
+                    mock.patch.object(wp, "from_dlpack", return_value=gpu_pixels),
+                ):
+                    viewer._render_and_display()
+                    viewer._blit_to_window.assert_called_once_with(gpu_pixels)
+                    screenshot = Path(directory) / "frame.png"
+                    viewer.save_screenshot(str(screenshot))
+                    with Image.open(screenshot) as image:
+                        np.testing.assert_array_equal(np.asarray(image), pixels)
+                self.assertEqual(color.map.call_args_list, [mock.call(device="cuda"), mock.call(device="cpu")])
 
 
 if __name__ == "__main__":
