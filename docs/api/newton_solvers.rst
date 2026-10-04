@@ -34,6 +34,7 @@ https://newton-physics.github.io/newton/stable/solvers/index.html.
    :toctree: _generated
    :nosignatures:
 
+   MuJoCoModelMapping
    MuJoCoWorldPopulation
    MuJoCoWorlds
    SolverBase
@@ -45,3 +46,19 @@ https://newton-physics.github.io/newton/stable/solvers/index.html.
    SolverStyle3D
    SolverVBD
    SolverXPBD
+
+.. rubric:: Functions
+
+.. autosummary::
+   :toctree: _generated
+   :signatures: long
+
+   mujoco_world_population_ready_capacity
+   mujoco_world_population_validate
+   mujoco_worlds_capture
+   mujoco_worlds_close
+   mujoco_worlds_grow_backing
+   mujoco_worlds_memory_report
+   mujoco_worlds_prepare
+   mujoco_worlds_resize_backing
+   mujoco_worlds_validate

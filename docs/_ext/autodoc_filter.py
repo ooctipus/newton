@@ -6,6 +6,8 @@ from __future__ import annotations
 import sys
 from typing import Any
 
+from sphinx.pycode import ModuleAnalyzer, PycodeError
+
 # NOTE: This file is *imported by Sphinx* when building the docs.
 # It must therefore avoid heavy third-party imports that might not be
 # available in the documentation environment.
@@ -16,7 +18,7 @@ from typing import Any
 
 
 def _should_skip_member(
-    app: Any,  # Sphinx application (unused)
+    app: Any,  # Sphinx application
     what: str,
     name: str,
     obj: Any,
@@ -56,6 +58,20 @@ def _should_skip_member(
     doc = getattr(obj, "__doc__", None)
 
     if not doc:
+        # Attribute documentation belongs to its declaration, not its default
+        # value (which may be None). Follow re-exports to the defining module.
+        if what == "class":
+            module = sys.modules.get(app.env.temp_data.get("autodoc:module", ""))
+            parent_cls = getattr(module, app.env.temp_data.get("autodoc:class", ""), None)
+            if isinstance(parent_cls, type):
+                try:
+                    attr_docs = ModuleAnalyzer.for_module(parent_cls.__module__).find_attr_docs()
+                except PycodeError:
+                    pass
+                else:
+                    if (parent_cls.__qualname__, name) in attr_docs:
+                        return None
+
         # Keep an undocumented callable **only** if it overrides a documented
         # attribute from a base-class.  This covers cases like ``step`` in
         # solver subclasses while still hiding brand-new helpers that have no

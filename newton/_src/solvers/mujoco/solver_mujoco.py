@@ -14,6 +14,7 @@ import warnings
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from copy import copy
+from dataclasses import dataclass, replace
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any
 
@@ -133,6 +134,47 @@ else:
 
 AttributeAssignment = Model.AttributeAssignment
 AttributeFrequency = Model.AttributeFrequency
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class MuJoCoModelMapping:
+    """Borrow immutable numeric correspondence from Newton-to-MuJoCo preparation.
+
+    .. experimental::
+
+        This preparation snapshot is valid for its exact, unmodified model endpoints.
+        World-indexed arrays contain absolute Newton IDs. Actuator indices are
+        template-local. Missing correspondences are ``-1``; nonlinear coordinates
+        deliberately have no scalar affine mapping. Consumers choose which joint,
+        actuator and root-frame semantics they support. Arrays are read-only.
+    """
+
+    newton_model: Model
+    """The exact authored Newton model."""
+    mujoco_model: MjWarpModel
+    """The exact prepared native model."""
+    newton_coord_by_mujoco_qpos: np.ndarray
+    """Scalar affine coordinate IDs, shape [world, native qpos]; otherwise -1."""
+    newton_dof_by_mujoco_dof: np.ndarray
+    """Topological DOF correspondence, shape [world, native DOF]; not a frame transform."""
+    newton_body_by_mujoco_body: np.ndarray
+    """Body IDs, shape [world, native body]; the native world body is -1."""
+    newton_joint_by_mujoco_mocap: np.ndarray
+    """Root-joint IDs, shape [world, native mocap body]."""
+    qpos_references: np.ndarray
+    """Offsets [m or rad] for supported scalar affine coordinates, shape [world, native qpos]."""
+    newton_target_by_position_actuator: np.ndarray
+    """Template position-target IDs, shape [native actuator]; otherwise -1."""
+    newton_dof_by_velocity_actuator: np.ndarray
+    """Template velocity-target DOF IDs, shape [native actuator]; otherwise -1."""
+    newton_control_by_direct_actuator: np.ndarray
+    """Template direct-control IDs, shape [native actuator]; otherwise -1."""
+    newton_joint_by_ball_actuator: np.ndarray
+    """Template ball-joint IDs requiring rotation, shape [native actuator]; otherwise -1."""
+    axis_by_actuator: np.ndarray
+    """Ball-axis indices, shape [native actuator]; scalar actuators use -1."""
+    position_references: np.ndarray
+    """Scalar position-target offsets [m or rad], shape [world, native actuator]."""
 
 
 @wp.kernel
@@ -3913,6 +3955,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             SolverMuJoCo._convert_mjw_contacts_to_newton_kernel = create_convert_mjw_contacts_to_newton_kernel()
 
         # --- New unified mappings: MuJoCo[world, entity] -> Newton[entity] ---
+        self.model_mapping: MuJoCoModelMapping | None = None
+        """Immutable preparation correspondence for consumers of the exact native model.
+
+        Reacquire from a freshly prepared solver after model edits. Scalar affine
+        entries do not certify support for nonlinear joints or task reset policy.
+        """
         self.mjc_body_to_newton: wp.array2d[wp.int32] | None = None
         """Mapping from MuJoCo [world, body] to Newton body index. Shape [nworld, nbody], dtype int32."""
         self.mjc_geom_to_newton_shape: wp.array2d[wp.int32] | None = None
@@ -4281,6 +4329,33 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                         setattr(result, name, target)
                     else:
                         setattr(result, name, wp.clone(source))
+                elif isinstance(source, MuJoCoModelMapping):
+                    rebased = []
+                    for values, stride in (
+                        (source.newton_coord_by_mujoco_qpos, self.model.joint_coord_count),
+                        (source.newton_dof_by_mujoco_dof, self.model.joint_dof_count),
+                        (source.newton_body_by_mujoco_body, self.model.body_count),
+                        (source.newton_joint_by_mujoco_mocap, self.model.joint_count),
+                    ):
+                        offsets = np.arange(world_count, dtype=np.int32)[:, None] * stride
+                        indices = np.where(values >= 0, values + offsets, -1)
+                        indices.flags.writeable = False
+                        rebased.append(indices)
+                    result.model_mapping = replace(
+                        source,
+                        newton_model=result.model,
+                        mujoco_model=result.mjw_model,
+                        newton_coord_by_mujoco_qpos=rebased[0],
+                        newton_dof_by_mujoco_dof=rebased[1],
+                        newton_body_by_mujoco_body=rebased[2],
+                        newton_joint_by_mujoco_mocap=rebased[3],
+                        qpos_references=np.broadcast_to(
+                            source.qpos_references, (world_count, source.qpos_references.shape[1])
+                        ),
+                        position_references=np.broadcast_to(
+                            source.position_references, (world_count, source.position_references.shape[1])
+                        ),
+                    )
                 elif isinstance(source, np.ndarray):
                     setattr(result, name, source.copy())
                 elif isinstance(source, dict):
@@ -4425,6 +4500,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             snapshots[name] = dst
         source_ids = wp.array(source_worlds, dtype=wp.int32, device=self.model.device)
         target_ids = wp.array(target_worlds, dtype=wp.int32, device=self.model.device)
+        if source_worlds:
+            self.model_mapping = None
         if source_worlds and self._model_constants is not None:
             # A transfer can replace the edit history certified during bank preparation.
             self._model_constants = tuple(
@@ -5276,6 +5353,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self._constant_roots_validated = False
         if not self._initial_model_sync:
             self._replication_pristine = False
+            if flags:
+                self.model_mapping = None
         world_mask = self._normalize_reset_world_mask(world_mask)
         if self.use_mujoco_cpu:
             self._notify_model_changed(flags, world_mask, constant_variant_ids)
@@ -8380,6 +8459,56 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             mjc_dof_to_newton_dof_np = self._tile_world_mapping(dof_to_newton_dof_template, nworld, dofs_per_world)
             self.mjc_dof_to_newton_dof = wp.array(mjc_dof_to_newton_dof_np, dtype=wp.int32)
             self._replication_offsets["mjc_dof_to_newton_dof"] = dofs_per_world
+
+            # Publish correspondence where conversion owns the source relations.
+            # A nonlinear joint has topological IDs but no scalar affine qpos map.
+            coordinate_ids = np.full((nworld, self.mj_model.nq), -1, dtype=np.int32)
+            qpos_references = np.zeros(coordinate_ids.shape, dtype=np.float32)
+            dof_ref = getattr(getattr(model, "mujoco", None), "dof_ref", None)
+            references = np.zeros(model.joint_dof_count, np.float32) if dof_ref is None else dof_ref.numpy()
+            for world, native_joint in np.ndindex(mjc_jnt_to_newton_jnt_np.shape):
+                joint = mjc_jnt_to_newton_jnt_np[world, native_joint]
+                if (
+                    joint >= 0
+                    and joint_q_start[joint + 1] - joint_q_start[joint] == 1
+                    and joint_qd_start[joint + 1] - joint_qd_start[joint] == 1
+                ):
+                    native_coord = self.mj_model.jnt_qposadr[native_joint]
+                    coordinate_ids[world, native_coord] = joint_q_start[joint]
+                    qpos_references[world, native_coord] = references[joint_qd_start[joint]]
+            actuator_count = len(mjc_actuator_ctrl_source_list)
+            position_targets = np.full(actuator_count, -1, dtype=np.int32)
+            velocity_dofs = np.full(actuator_count, -1, dtype=np.int32)
+            direct_controls = np.full(actuator_count, -1, dtype=np.int32)
+            position_references = np.zeros((nworld, actuator_count), dtype=np.float32)
+            for actuator, (source, index) in enumerate(
+                zip(mjc_actuator_ctrl_source_list, mjc_actuator_to_newton_idx_list, strict=True)
+            ):
+                if source == int(SolverMuJoCo.CtrlSource.CTRL_DIRECT):
+                    direct_controls[actuator] = index
+                elif source == int(SolverMuJoCo.CtrlSource.JOINT_TARGET):
+                    if index >= 0:
+                        position_targets[actuator] = mjc_actuator_to_target_q_idx_list[actuator]
+                        if mjc_actuator_to_target_q_axis_idx_list[actuator] < 0:
+                            position_references[:, actuator] = references[np.arange(nworld) * dofs_per_world + index]
+                    elif index <= -2:
+                        velocity_dofs[actuator] = -(index + 2)
+            mapping_arrays = (
+                coordinate_ids,
+                mjc_dof_to_newton_dof_np,
+                mjc_body_to_newton_np,
+                mjc_mocap_to_newton_jnt_np if nmocap else np.empty((nworld, 0), dtype=np.int32),
+                qpos_references,
+                position_targets,
+                velocity_dofs,
+                direct_controls,
+                np.asarray(mjc_actuator_to_newton_ball_jnt_list, dtype=np.int32),
+                np.asarray(mjc_actuator_to_target_q_axis_idx_list, dtype=np.int32),
+                position_references,
+            )
+            for values in mapping_arrays:
+                values.flags.writeable = False
+            self.model_mapping = MuJoCoModelMapping(model, self.mjw_model, *mapping_arrays)
 
             # Create mjc_eq_to_newton_eq: MuJoCo[world, eq] -> Newton equality constraint
             # selected_constraints[idx] is the Newton template constraint index

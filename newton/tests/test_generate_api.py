@@ -1,8 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib.util
+import sys
 import tempfile
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest import mock
@@ -17,6 +20,38 @@ except ModuleNotFoundError as exc:
     if exc.name != "docs":
         raise
     generate_api = None
+
+if generate_api is not None and importlib.util.find_spec("sphinx"):
+    from docs._ext import autodoc_filter
+else:
+    autodoc_filter = None
+
+
+@dataclass
+class _DocumentedDefaults:
+    """Source documentation survives a passive record's empty defaults."""
+
+    documented: object = None
+    """A documented public attribute."""
+    undocumented: object = None
+    _private: object = None
+    """An internal attribute."""
+
+
+@unittest.skipUnless(autodoc_filter is not None, "requires Sphinx and the docs/ package")
+class TestAutodocFilter(unittest.TestCase):
+    def test_documented_none_defaults_survive_public_reexport(self):
+        """Keep documented empty fields without exposing private or undocumented fields."""
+        public_module = ModuleType("documented_public_api")
+        public_module.Record = _DocumentedDefaults
+        app = SimpleNamespace(
+            env=SimpleNamespace(temp_data={"autodoc:module": public_module.__name__, "autodoc:class": "Record"})
+        )
+        with mock.patch.dict(sys.modules, {public_module.__name__: public_module}):
+            self.assertIsNone(autodoc_filter._should_skip_member(app, "class", "documented", None, False, {}))
+            self.assertTrue(autodoc_filter._should_skip_member(app, "class", "undocumented", None, False, {}))
+            self.assertTrue(autodoc_filter._should_skip_member(app, "class", "_private", None, False, {}))
+            self.assertTrue(autodoc_filter._should_skip_member(app, "class", "documented", None, True, {}))
 
 
 @unittest.skipUnless(generate_api is not None, "requires the docs/ package (source checkout only)")

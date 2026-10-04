@@ -3355,12 +3355,11 @@ wheels = [
 [[package]]
 name = "mujoco-warp"
 version = "3.14.0"
-source = { git = "https://github.com/ooctipus/mujoco_warp.git?rev=be0072dd0f0bf43e9459757a854aa5957de971d6#be0072dd0f0bf43e9459757a854aa5957de971d6" }
+source = { git = "https://github.com/ooctipus/mujoco_warp.git?rev=cdcf95c6effdc053bb5df6394477ffae12c55d77#cdcf95c6effdc053bb5df6394477ffae12c55d77" }
 dependencies = [
     { name = "absl-py" },
     { name = "etils", version = "1.13.0", source = { registry = "https://pypi.org/simple" }, extra = ["epath"], marker = "python_full_version < '3.11' or (extra == 'extra-6-newton-torch-cu12' and extra == 'extra-6-newton-torch-cu13')" },
     { name = "etils", version = "1.14.0", source = { registry = "https://pypi.org/simple" }, extra = ["epath"], marker = "python_full_version >= '3.11' or (extra == 'extra-6-newton-torch-cu12' and extra == 'extra-6-newton-torch-cu13')" },
-    { name = "gpu-components" },
     { name = "mujoco" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' or (extra == 'extra-6-newton-torch-cu12' and extra == 'extra-6-newton-torch-cu13')" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*' or (extra == 'extra-6-newton-torch-cu12' and extra == 'extra-6-newton-torch-cu13')" },
@@ -3954,7 +3953,7 @@ requires-dist = [
     { name = "jupyterlab", marker = "extra == 'notebook'", specifier = ">=4.5.7" },
     { name = "meshio", marker = "extra == 'importers'", specifier = ">=5.3.5" },
     { name = "mujoco", marker = "extra == 'sim'", specifier = "~=3.12.0", index = "https://pypi.org/simple" },
-    { name = "mujoco-warp", marker = "extra == 'sim'", git = "https://github.com/ooctipus/mujoco_warp.git?rev=be0072dd0f0bf43e9459757a854aa5957de971d6" },
+    { name = "mujoco-warp", marker = "extra == 'sim'", git = "https://github.com/ooctipus/mujoco_warp.git?rev=cdcf95c6effdc053bb5df6394477ffae12c55d77" },
     { name = "myst-parser", marker = "extra == 'docs'", specifier = ">=3.0.1" },
     { name = "nbsphinx", marker = "extra == 'docs'", specifier = ">=0.9.0" },
     { name = "newton", extras = ["examples"], marker = "extra == 'dev'" },
