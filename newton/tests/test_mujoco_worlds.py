@@ -1191,13 +1191,13 @@ assert 'worlds' not in newton.__all__
                         reservation=VirtualReservation(16, 2, 2),
                     )
                     population._populations = [
-                        SimpleNamespace(
+                        _MuJoCoWorldPopulation(
+                            None,
                             world_storage=owner,
                             contact_storage=owner,
                             ccd_storage=owner,
                             contact_quota=1,
                             ccd_quota=1,
-                            world_ready_capacity=1,
                         )
                     ]
                     with (
@@ -1385,7 +1385,7 @@ class PopulationRecorderTests(unittest.TestCase):
             1, dtype=int, device="cpu"
         )
         population._populations = [group]
-        population._retain_graph = Mock()
+        population._retain_graph = population._prepare_scratch_columns = Mock()
         self.population = population
         commands = directory_ops.allocate_commands(17, device="cpu")
         results = directory_ops.allocate_results(17, device="cpu")
@@ -1712,6 +1712,8 @@ class PopulationRecorderTests(unittest.TestCase):
             initialization_transfer=storage,
             compaction_transfer=storage,
             step_bindings=None,
+            scratch_storages={},
+            scratch_arrays=(),
             global_arrays={},
             empty_fields=[],
             world_ready_capacity=0,
@@ -1977,6 +1979,81 @@ class TestMuJoCoWorlds(unittest.TestCase):
                 self.assertGreaterEqual(population.populations[0].world_ready_capacity, 1)
             finally:
                 population.close(streams=(wp.get_stream(device),))
+
+    @unittest.skipUnless(
+        os.environ.get("NEWTON_TEST_CUDA_UUID"), "Set an explicit CUDA UUID for native population tests"
+    )
+    def test_scratch_columns_come_from_one_discarded_recording(self):
+        """Programs name their scratch while recording; the discovery graph dies and columns follow the world domain."""
+        import mujoco
+        import mujoco_warp as mjw
+
+        wp.init()
+        device = wp.get_device("cuda:0")
+        self.assertEqual(device.uuid, os.environ["NEWTON_TEST_CUDA_UUID"])
+        with wp.ScopedDevice(device):
+            prepared = [_prototype(6, mujoco, mjw)]
+            wp.load_module(module=__name__, device=device)
+            for storage in ("fixed", "vmm"):
+                with self.subTest(storage=storage):
+                    population = MuJoCoWorlds(
+                        prepared,
+                        world_capacities=(4,),
+                        id_capacity=2,
+                        command_capacity=2,
+                        memory_budget_bytes=64 * 1024**2 if storage == "vmm" else None,
+                        initial_world_ready_capacities=(0,) if storage == "vmm" else None,
+                    )
+                    commands = directory_ops.allocate_commands(2, device=device)
+                    results = directory_ops.allocate_results(2, device=device)
+                    discarded, invalidate = [], graph_ops.invalidate
+
+                    def discard(graph, discarded=discarded, invalidate=invalidate):
+                        discarded.append(weakref.ref(graph))
+                        invalidate(graph)
+
+                    graph = registry = columns = None
+                    try:
+                        # A plain replacement: a Mock would record the call and keep the graph alive.
+                        with patch.object(graph_ops, "invalidate", discard):
+                            graph = population.capture(commands, results)
+                        group = population._populations[0]
+                        registry, world = group.scratch_registry, group.world_storage
+                        self.assertEqual(len(discarded), 1, "Exactly one discovery recording is discarded")
+                        self.assertIsNone(discarded[0](), "The discovery graph must not outlive preparation")
+                        self.assertEqual((registry.state, registry.temporaries), ("prepared", {}))
+                        self.assertEqual(set(group.scratch_storages), {"world"})
+                        columns = group.scratch_storages["world"]
+                        self.assertEqual(sorted(registry.declarations), sorted(columns.arrays))
+                        self.assertTrue(all(name.startswith("implicit.") for name in registry.declarations))
+                        self.assertEqual(columns.capacity, world.capacity)
+                        self.assertIs(columns.protected_count, world.protected_count)
+                        self.assertEqual(columns.ready_rows, world.ready_rows)
+                        self.assertEqual(group.step_bindings.extra_storages, (columns,))
+                        self.assertEqual(group.scratch_arrays, ())
+                        self.assertIn("world", population.memory_report()["populations"][0]["scratch_storages"])
+                        if storage == "vmm":
+                            self.assertEqual(population.populations[0].world_ready_capacity, 0)
+                            population.grow_backing((2,), streams=(wp.get_stream(device),))
+                            self.assertEqual((world.ready_rows, columns.ready_rows), (2, 2))
+                            self.assertEqual(population.populations[0].world_ready_capacity, 2)
+                        commands.sequence.fill_(1)
+                        commands.count.fill_(1)
+                        commands.operation.fill_(_CREATE)
+                        commands.prototype.zero_()
+                        wp.capture_launch(graph)
+                        commands.sequence.fill_(2)
+                        commands.count.zero_()
+                        wp.capture_launch(graph)
+                        wp.synchronize_stream(wp.get_stream(device))
+                        np.testing.assert_array_equal(results.status.numpy()[:1], [_OK])
+                        self.assertEqual(population._healthy.numpy()[0], 1)
+                        self.assertGreater(float(_prefix(group.data, 1).time.numpy()[0]), 0.0)
+                    finally:
+                        # Column views held here would block the VMM reservation release at close.
+                        graph = registry = columns = None
+                        gc.collect()
+                        population.close(streams=(wp.get_stream(device),))
 
     @unittest.skipUnless(
         os.environ.get("NEWTON_TEST_CUDA_UUID"), "Set an explicit CUDA UUID for native population tests"
