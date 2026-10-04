@@ -12,6 +12,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
+    PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     contact_restitution_fires,
     contact_tangent_basis,
     mixed_contact_restitution,
@@ -635,7 +636,7 @@ def finalize_sparse_joint_limit_rows(
     dt: float,
     diagonal: wp.array2d[float],
 ):
-    """Finish only the joint-limit prefix; contacts are already complete."""
+    """Finish the position/velocity-limit prefix; contacts are already complete."""
     world = wp.tid()
     for row in range(wp.min(phase_bounds[world, 1], constraint_count[world])):
         phi = rows.phi[world, row]
@@ -855,6 +856,179 @@ def build_sparse_joint_limit_rows(
         inverse_factor,
         v_hat,
         slot_counter,
+        row_type,
+        row_parent,
+        row_mu,
+        row_beta,
+        row_cfm,
+        phi,
+        target_velocity,
+        row_dof,
+        row_factor,
+        row_incident,
+        diagonal,
+        support,
+    )
+
+
+@wp.func_native(
+    """
+    const int group = tid >> 5;
+    if (group >= group_to_art.shape[0]) return;
+#if defined(__CUDA_ARCH__)
+    constexpr unsigned MASK = 0xffffffffu;
+    const int lane = tid & 31;
+    const int width = 32;
+#else
+    if ((tid & 31) != 0) return;
+    const int lane = 0;
+    const int width = 1;
+#endif
+    const auto bit_count = [](unsigned long long mask) {
+#if defined(__CUDA_ARCH__)
+        return __popcll(mask);
+#else
+        int count = 0;
+        while (mask != 0) { mask &= mask - 1; ++count; }
+        return count;
+#endif
+    };
+    const int art = group_to_art.data[group];
+    const int world = art_to_world.data[art];
+    const int start = articulation_dof_start.data[art];
+    const int dofs = inverse_permutation.shape[0];
+    const int capacity = row_type.shape[1];
+    const int support_capacity = row_factor.shape[2];
+    const int factor_base = group * inverse_factor.shape[1];
+    for (int candidate = 0; candidate < 2 * dofs; ++candidate) {
+        const int local_dof = candidate >> 1;
+        const int dof = start + local_dof;
+        const int side_index = 2 * dof + (candidate & 1);
+        const int row = velocity_limit_slot.data[side_index];
+        // The existing allocator owns eligibility, ordering and overflow demand.
+        if (row < 0 || row >= capacity) continue;
+        const float sign = velocity_limit_sign.data[side_index];
+        const int column = inverse_permutation.data[local_dof];
+        const unsigned long long support_mask = dof_mask.data[local_dof];
+        const int row_offset = world * capacity + row;
+        const int response_offset = row_offset * support_capacity;
+        float norm = 0.0f;
+        for (int node = lane; node < dofs; node += width) {
+            const unsigned long long bit = 1ull << node;
+            if ((support_mask & bit) == 0) continue;
+            const int index = bit_count(support_mask & (bit - 1ull));
+            const int entry = factor_lookup.data[node * dofs + column];
+            const float value = entry >= 0 ? sign * inverse_factor.data[factor_base + entry] : 0.0f;
+            if (!support.enabled)
+                row_dof.data[response_offset + index] = articulation_world_dof_offset.data[art] + node;
+            row_factor.data[response_offset + index] = value;
+            norm += value * value;
+        }
+        const int support_count = bit_count(support_mask);
+        for (int index = support_count + lane; index < support_capacity; index += width) {
+            if (!support.enabled) row_dof.data[response_offset + index] = -1;
+            row_factor.data[response_offset + index] = 0.0f;
+        }
+#if defined(__CUDA_ARCH__)
+        for (int shift = 16; shift > 0; shift >>= 1) norm += __shfl_down_sync(MASK, norm, shift);
+#endif
+        if (lane == 0) {
+            if (support.enabled)
+                support.row_class.data[row_offset] = support.limit_class.data[local_dof];
+            row_incident.data[row_offset] = sign * v_hat.data[dof];
+            // The prefix finalizer adds CFM and forms RHS from target_velocity.
+            diagonal.data[row_offset] = norm;
+            row_type.data[row_offset] = $VELOCITY_LIMIT_TYPE;
+            row_parent.data[row_offset] = -1;
+            row_mu.data[row_offset] = 0.0f;
+            row_beta.data[row_offset] = 0.0f;
+            row_cfm.data[row_offset] = pgs_cfm;
+            phi.data[row_offset] = 0.0f;
+            target_velocity.data[row_offset] = -joint_velocity_limit.data[dof];
+        }
+    }
+""".replace("$VELOCITY_LIMIT_TYPE", str(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT))
+)
+def _build_sparse_joint_velocity_limit_rows(
+    tid: int,
+    group_to_art: wp.array[int],
+    art_to_world: wp.array[int],
+    articulation_world_dof_offset: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    joint_velocity_limit: wp.array[float],
+    velocity_limit_slot: wp.array[int],
+    velocity_limit_sign: wp.array[float],
+    pgs_cfm: float,
+    dof_mask: wp.array[wp.uint64],
+    inverse_permutation: wp.array[int],
+    factor_lookup: wp.array2d[int],
+    inverse_factor: wp.array2d[float],
+    v_hat: wp.array[float],
+    row_type: wp.array2d[int],
+    row_parent: wp.array2d[int],
+    row_mu: wp.array2d[float],
+    row_beta: wp.array2d[float],
+    row_cfm: wp.array2d[float],
+    phi: wp.array2d[float],
+    target_velocity: wp.array2d[float],
+    row_dof: wp.array3d[int],
+    row_factor: wp.array3d[float],
+    row_incident: wp.array2d[float],
+    diagonal: wp.array2d[float],
+    support: _SparseRowSupport,
+): ...
+
+
+@wp.kernel(enable_backward=False)
+def build_sparse_joint_velocity_limit_rows(
+    group_to_art: wp.array[int],
+    art_to_world: wp.array[int],
+    articulation_world_dof_offset: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    joint_velocity_limit: wp.array[float],
+    velocity_limit_slot: wp.array[int],
+    velocity_limit_sign: wp.array[float],
+    pgs_cfm: float,
+    dof_mask: wp.array[wp.uint64],
+    inverse_permutation: wp.array[int],
+    factor_lookup: wp.array2d[int],
+    inverse_factor: wp.array2d[float],
+    v_hat: wp.array[float],
+    row_type: wp.array2d[int],
+    row_parent: wp.array2d[int],
+    row_mu: wp.array2d[float],
+    row_beta: wp.array2d[float],
+    row_cfm: wp.array2d[float],
+    phi: wp.array2d[float],
+    target_velocity: wp.array2d[float],
+    row_dof: wp.array3d[int],
+    row_factor: wp.array3d[float],
+    row_incident: wp.array2d[float],
+    diagonal: wp.array2d[float],
+    support: _SparseRowSupport,
+):
+    """Project allocated signed velocity-limit rows through the mass factor.
+
+    Launch ``32 * group_count`` threads in blocks divisible by 32. The existing
+    allocator owns lower/upper slots, activation and capacity reporting. This
+    producer preserves even infinite limits and adds no position bias. Run
+    :func:`finalize_sparse_joint_limit_rows` once after building the prefix.
+    """
+    _build_sparse_joint_velocity_limit_rows(
+        wp.tid(),
+        group_to_art,
+        art_to_world,
+        articulation_world_dof_offset,
+        articulation_dof_start,
+        joint_velocity_limit,
+        velocity_limit_slot,
+        velocity_limit_sign,
+        pgs_cfm,
+        dof_mask,
+        inverse_permutation,
+        factor_lookup,
+        inverse_factor,
+        v_hat,
         row_type,
         row_parent,
         row_mu,

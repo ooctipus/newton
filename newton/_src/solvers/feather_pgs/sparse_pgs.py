@@ -30,6 +30,7 @@ def _get_pgs_solve_sparse_kernel(
     active_rows: bool = False,
     use_support_table: bool = False,
     contact_triplets: bool = False,
+    velocity_limits: bool = False,
 ) -> wp.Kernel:
     """Build a CUDA sweep over factored articulations and physical free bodies.
 
@@ -41,8 +42,11 @@ def _get_pgs_solve_sparse_kernel(
 
     This uses the existing interleaved row order and paired friction law,
     including linked patch normal loads. The caller admits only augmented
-    drives, immediate response, and no warm start, torsion or ordinary joint
-    velocity-limit rows. Seeded patch impulses retain the ordinary delta semantics.
+    drives, immediate response, and no warm start or torsion. ``velocity_limits``
+    adds a final articulated limit pass to each sweep, with stateless,
+    unrelaxed corrections accumulated in the factor delta. It requires full
+    ordered rows and no independent free-body response. Seeded patch impulses
+    retain the ordinary delta semantics.
     Independent free-body rows follow the articulated rows in every sweep,
     retaining their own response, capacity, friction law, and impulse buffer.
     ``active_rows`` selects point-contact normal/limit rows at sweep entry,
@@ -68,6 +72,8 @@ def _get_pgs_solve_sparse_kernel(
         raise ValueError("sparse PGS requires positive capacities and max_row_dofs <= max_world_dofs")
     if use_support_table and (F or P or D > 64):
         raise ValueError("sparse support tables require at most 64 factored DOFs and no free rows")
+    if velocity_limits and (F or P or active_rows or contact_triplets):
+        raise ValueError("sparse joint velocity limits require full articulated row sweeps")
     index_read = (
         f"support.class_dof.data[support.row_class.data[offset + row] * {S} + entry]"
         if use_support_table
@@ -327,8 +333,26 @@ def _get_pgs_solve_sparse_kernel(
     __syncwarp(MASK);
 {active_initialize}
 """
+    velocity_filter = velocity_update = ""
+    impulse_change = "new_impulse - old_impulse"
+    if velocity_limits:
+        # Storage puts velocity rows before contacts, but their original law
+        # owns the final pass of each iteration. Keep the same ordinary order.
+        row_loop = """
+        for (int row_phase = 0; row_phase < 2; ++row_phase) {
+            for (int row = 0; row < count; ++row) {"""
+        row_loop_end = "            }\n        }"
+        velocity_filter = f"""
+            if ((row_type == {velocity_limit_type}) != (row_phase == 1)) continue;
+"""
+        velocity_update = f""" else if (row_type == {velocity_limit_type}) {{
+                // Report the current correction, without undoing earlier ones.
+                new_impulse = residual < 0.0f ? -residual / denominator : 0.0f;
+            }}"""
+        impulse_change = f"row_type == {velocity_limit_type} ? new_impulse : new_impulse - old_impulse"
     row_update = f"""
             const int row_type = static_cast<int>(type[row]);
+{velocity_filter}
             const bool friction = row_type == {friction_type};
             if (friction && global_iteration < friction_start_iteration) {{
                 if (lane == 0) impulse[row] = 0.0f;
@@ -406,12 +430,12 @@ def _get_pgs_solve_sparse_kernel(
                 const float new_sibling = pair.y * scale;
                 sibling_change = new_sibling - old_sibling;
                 if (lane == 0) impulse[sibling] = new_sibling;
-            }} else {{
+            }}{velocity_update} else {{
                 new_impulse = old_impulse - omega * residual / denominator;
                 if (row_type == {contact_type} || row_type == {limit_type})
                     new_impulse = fmaxf(new_impulse, 0.0f);
             }}
-            const float change = new_impulse - old_impulse;
+            const float change = {impulse_change};
             if (lane == 0) impulse[row] = new_impulse;
             if (change != 0.0f || sibling_change != 0.0f) {{
                 changed = 1;
@@ -581,6 +605,8 @@ def _get_pgs_solve_sparse_kernel(
         suffix += "_support_table"
     if contact_triplets:
         suffix += "_contact_triplets"
+    if velocity_limits:
+        suffix += "_velocity_limits"
     solve.__name__ = f"pgs_solve_sparse_{M}_{D}_{S}_{F}_{P}{suffix}"
     solve.__qualname__ = solve.__name__
     return wp.kernel(enable_backward=False, module="unique")(solve)
