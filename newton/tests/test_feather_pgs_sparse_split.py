@@ -337,7 +337,7 @@ class TestSparseSplitPhysics(unittest.TestCase):
         flags = model.body_flags.numpy().copy()
         flags[0] |= int(newton.BodyFlags.KINEMATIC)
         model.body_flags.assign(flags)
-        with self.assertRaisesRegex(RuntimeError, "Sparse split response gained prescribed DOFs"):
+        with self.assertRaisesRegex(RuntimeError, "Sparse response gained prescribed DOFs"):
             solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
         np.testing.assert_array_equal(solver._kinematic_dof_mask_host, old_mask)
 
