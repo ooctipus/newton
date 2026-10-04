@@ -3475,6 +3475,11 @@ class SolverFeatherPGS(SolverBase):
                 dof_mask[dof_start:dof_end] = 1
                 armature[dof_start:dof_end] = 1.0e10
 
+        if getattr(self, "_sparse_split", False) and np.any(dof_mask):
+            raise RuntimeError(
+                "Sparse split response gained prescribed DOFs; reconstruct the solver and recapture its CUDA graph."
+            )
+
         if self._model_plan is not None:
             selected = np.nonzero(self._model_plan.prescribed_articulation != 0)[0]
             for articulation in selected:
@@ -5065,14 +5070,26 @@ class SolverFeatherPGS(SolverBase):
     def _setup_sparse_mass_matrix(self, model: Model) -> None:
         """Select sparse articulation factors with independent rigid-body response blocks."""
         self._sparse_mass_matrix_size = None
+        self._sparse_split = False
         self._sparse_prepare_contacts = False
         self._sparse_row_support = _SparseRowSupport()
         self._sparse_contact_triplets = False
+        # Reuse the factor representation without changing split's row law or
+        # state-cache lifecycle. Nonzero seeds need a factor-delta initialization
+        # that this cold owner deliberately does not provide.
+        split_candidate = (
+            self.pgs_mode == "split"
+            and os.environ.get("FEATHER_PGS_SPARSE_SPLIT", "0") == "1"
+            and self.pgs_kernel == "tiled_row"
+            and not self._has_free_rigid_bodies
+            and not self._friction_anchors_enabled
+            and self._kernel_overrides.get("sparse_prepare_contacts", True)
+        )
         if not (
             self._kernel_overrides.get("sparse_mass_matrix", True)
             and model.device.is_cuda
             and not model.requires_grad
-            and self.pgs_mode == "matrix_free"
+            and (self.pgs_mode == "matrix_free" or split_candidate)
             and self.articulated_contact_response == "immediate"
             and self.pgs_schedule == "interleaved"
             and self.drive_mode == "augmented"
@@ -5126,6 +5143,8 @@ class SolverFeatherPGS(SolverBase):
         ):
             return
         response_dofs = self._model_plan.response_dof_count
+        if split_candidate and (self._has_prescribed_response or np.any(self._kinematic_dof_mask_host)):
+            return
         free_rigid = self._model_plan.is_free_rigid != 0
         articulated = np.flatnonzero((response_dofs > 0) & ~free_rigid)
         sizes = np.unique(response_dofs[articulated])
@@ -5139,6 +5158,8 @@ class SolverFeatherPGS(SolverBase):
         if size > 64 or size not in self._crba_source_dof_by_size or size in self._diagonal_mass_sizes:
             return
         articulated_counts = np.bincount(self._model_plan.articulation_world[articulated], minlength=self.world_count)
+        if split_candidate and not np.all(articulated_counts == 1):
+            return
         articulation_start = model.articulation_start.numpy()
         joint_child = model.joint_child.numpy()
         joint_ancestor = model.joint_ancestor.numpy()
@@ -5151,6 +5172,9 @@ class SolverFeatherPGS(SolverBase):
         plan = _SparseMassMatrixPlan.build(parents, np.diff(joint_qd_start[start : end + 1]))
         if plan.dof_count != size or plan.nonzero_count >= size * (size + 1) // 2:
             return
+
+        if split_candidate:
+            self._compute_world_response_dof_mapping(model)
 
         joint_masks = plan.joint_ancestor_mask
         body_masks = np.zeros(model.body_count, dtype=np.uint64)
@@ -5183,10 +5207,13 @@ class SolverFeatherPGS(SolverBase):
         mf_capacity = self.mf_max_constraints if self._has_free_rigid_bodies else 0
         active_rows = (
             self._kernel_overrides.get("sparse_active_contacts", True)
+            and not split_candidate
             and not self._has_free_rigid_bodies
             and not self._friction_anchors_enabled
         )
         solve_shared_bytes = 8 * self.max_world_dofs + 26 * self.dense_max_constraints + 16 * mf_capacity
+        if split_candidate:
+            solve_shared_bytes += 256  # Warp's tiled launch base.
         if active_rows:
             # Two row bitsets per world, with aligned unsigned-word storage.
             solve_shared_bytes += 16 * ((self.dense_max_constraints + 31) // 32)
@@ -5202,6 +5229,7 @@ class SolverFeatherPGS(SolverBase):
             return
 
         self._sparse_mass_matrix_size = size
+        self._sparse_split = split_candidate
         self._sparse_prepare_contacts = bool(self._kernel_overrides.get("sparse_prepare_contacts", True))
         # The sparse producers overwrite every live value and retain factors by the mass mask.
         self._double_buffer = False
@@ -6045,7 +6073,7 @@ class SolverFeatherPGS(SolverBase):
         max_constraints = self.dense_max_constraints
 
         # Per-world constraint matrices and vectors. Matrix-free never assembles C.
-        if self.pgs_mode != "matrix_free":
+        if self.pgs_mode != "matrix_free" and not self._sparse_split:
             self.C = wp.zeros(
                 (self.world_count, max_constraints, max_constraints),
                 dtype=wp.float32,
@@ -6057,7 +6085,7 @@ class SolverFeatherPGS(SolverBase):
             # Kernel argument stand-in; the matrix-free routes never assemble C.
 
         # Matrix-free uses world-indexed J/Y for both dense and rigid phases.
-        if self.pgs_mode == "matrix_free":
+        if self.pgs_mode == "matrix_free" or self._sparse_split:
             if self._sparse_diagonal_contact_solve or self._sparse_mass_matrix_size is not None:
                 self.J_world = wp.zeros((1, 1, 1), dtype=wp.float32, device=device)
                 self.Y_world = wp.zeros((1, 1, 1), dtype=wp.float32, device=device)
@@ -6271,7 +6299,7 @@ class SolverFeatherPGS(SolverBase):
 
     def _allocate_mf_buffers(self, model):
         """Allocate buffers for matrix-free PGS path for free rigid body contacts."""
-        if not self._has_free_rigid_bodies and self.pgs_mode != "matrix_free":
+        if not self._has_free_rigid_bodies and self.pgs_mode != "matrix_free" and not self._sparse_split:
             return
 
         if not self._has_free_rigid_bodies:
@@ -10126,7 +10154,7 @@ class SolverFeatherPGS(SolverBase):
         collide_done_event=None,
     ):
         if self._sparse_mass_matrix_size is not None and (
-            self.pgs_mode != "matrix_free"
+            self.pgs_mode != ("split" if self._sparse_split else "matrix_free")
             or self.pgs_schedule != "interleaved"
             or self.articulated_contact_response != "immediate"
             or self.drive_mode != "augmented"
@@ -10137,6 +10165,10 @@ class SolverFeatherPGS(SolverBase):
             or self.enable_joint_velocity_limits
             or self._contact_torsion_enabled
             or self.contact_compliance
+            or (
+                self._sparse_split
+                and (self.pgs_kernel != "tiled_row" or self._friction_anchors_enabled or self._mf_warmstart_enabled)
+            )
         ):
             raise RuntimeError("Reconstruct the solver after changing options incompatible with sparse mass factors")
         if self._contact_torsion_enabled:
@@ -10331,7 +10363,7 @@ class SolverFeatherPGS(SolverBase):
             if self._contact_torsion_enabled:
                 prepare_torsion_rows(self, state_in, state_aug, contacts)
 
-        if self.pgs_mode == "matrix_free":
+        if self.pgs_mode == "matrix_free" or self._sparse_split:
             # Compute Y = H^-1 * J^T only (no Delassus C)
             with wp.ScopedTimer("S4_HinvJt_Diag_RHS", print=False, use_nvtx=self._nvtx, synchronize=False):
                 for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
@@ -10500,7 +10532,18 @@ class SolverFeatherPGS(SolverBase):
         if self.pgs_mode != "matrix_free":
             self._stage6_apply_contact_regularization()
 
-        if self.pgs_mode == "matrix_free":
+        if self._sparse_split:
+            # The sparse producers already published bias, incident velocity,
+            # CFM and restitution. Decode the accumulated factor delta once;
+            # the dense RHS accumulation and Y*lambda publication do not apply.
+            self._stage6_prepare_world_velocity()
+            self._launch_matrix_free_gs_solve(
+                dense_rhs=self.rhs,
+                mf_meta=self.mf_meta_packed,
+                iterations=self.pgs_iterations,
+                omega=self.pgs_omega,
+            )
+        elif self.pgs_mode == "matrix_free":
             with wp.ScopedTimer("S5_GatherJY", print=False, use_nvtx=self._nvtx, synchronize=False):
                 # Gather J/Y from per-size-group arrays into world-indexed arrays.
                 # Skipped when J_world/Y_world alias the group buffers (identity
