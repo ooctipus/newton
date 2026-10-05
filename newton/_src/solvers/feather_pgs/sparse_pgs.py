@@ -31,6 +31,7 @@ def _get_pgs_solve_sparse_kernel(
     use_support_table: bool = False,
     contact_triplets: bool = False,
     velocity_limits: bool = False,
+    lanes_per_world: int = 32,
 ) -> wp.Kernel:
     """Build a CUDA sweep over factored articulations and physical free bodies.
 
@@ -63,7 +64,10 @@ def _get_pgs_solve_sparse_kernel(
     sweep. The bounded metric cache recomputes uncached pairs when full;
     runtime metadata guards retain the ordinary update for other rows.
 
-    Launch with ``ceil(world_count / 2)`` tiles and 64 threads per tile.
+    Small complete articulated sweeps may use 8 or 16 lanes per world, as in
+    the local response/solve owner. Launch with ``ceil(world_count / (64 /
+    lanes_per_world))`` tiles and 64 threads per tile. Active-row bitsets and
+    independent free-body work retain whole warps.
     """
     M, D, S = int(max_constraints), int(max_world_dofs), int(max_row_dofs)
     F = int(mf_max_constraints)
@@ -74,13 +78,18 @@ def _get_pgs_solve_sparse_kernel(
         raise ValueError("sparse support tables require at most 64 factored DOFs and no free rows")
     if velocity_limits and (F or P or active_rows or contact_triplets):
         raise ValueError("sparse joint velocity limits require full articulated row sweeps")
+    L = int(lanes_per_world)
+    if L not in (8, 16, 32):
+        raise ValueError("sparse PGS requires 8, 16 or 32 lanes per world")
+    if L < 32 and (D > L or F or P or active_rows or contact_triplets):
+        raise ValueError("subwarp sparse PGS requires a small complete articulated sweep")
     index_read = (
         f"support.class_dof.data[support.row_class.data[offset + row] * {S} + entry]"
         if use_support_table
         else f"row_dof.data[row_base + row * {S} + entry]"
     )
-    W = 2
-    Q = (S + 31) // 32
+    W = 64 // L
+    Q = (S + L - 1) // L
     contact_type = int(PGS_CONSTRAINT_TYPE_CONTACT)
     friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
     limit_type = int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
@@ -308,9 +317,9 @@ def _get_pgs_solve_sparse_kernel(
     __shared__ float rhs_storage[{W * M}];
     __shared__ float diagonal_storage[{W * M}];
     __shared__ unsigned char type_storage[{W * M}];
-    constexpr unsigned MASK = 0xffffffffu;
-    const int lane = threadIdx.x & 31;
-    const int slot = threadIdx.x >> 5;
+    const unsigned MASK = {hex((1 << L) - 1)}u << (threadIdx.x & {32 - L});
+    const int lane = threadIdx.x & {L - 1};
+    const int slot = threadIdx.x / {L};
     const int offset = world * {M};
     const int row_base = offset * {S};
     const int count = min(world_constraint_count.data[world], {M});
@@ -322,8 +331,8 @@ def _get_pgs_solve_sparse_kernel(
 {mf_storage}
 {active_storage}
 
-    for (int d = lane; d < {D}; d += 32) delta[d] = 0.0f;
-    for (int i = lane; i < count; i += 32) {{
+    for (int d = lane; d < {D}; d += {L}) delta[d] = 0.0f;
+    for (int i = lane; i < count; i += {L}) {{
         impulse[i] = world_impulses.data[offset + i];
         rhs[i] = rhs_bias.data[offset + i] + row_incident.data[offset + i];
         diagonal[i] = world_diag.data[offset + i];
@@ -350,16 +359,16 @@ def _get_pgs_solve_sparse_kernel(
             float dot = 0.0f;
             #pragma unroll
             for (int q = 0; q < {Q}; ++q) {{
-                const int entry = lane + q * 32;
+                const int entry = lane + q * {L};
                 const int index = entry < {S} ? {index_read} : -1;
                 const float response = index >= 0 ? row_factor.data[row_base + row * {S} + entry] : 0.0f;
                 indices[q] = index;
                 responses[q] = response;
                 if (index >= 0) dot += response * delta[index];
             }}
-            for (int shift = 16; shift > 0; shift >>= 1)
-                dot += __shfl_down_sync(MASK, dot, shift, 32);
-            const float residual = __shfl_sync(MASK, dot, 0, 32) + rhs[row];
+            for (int shift = {L // 2}; shift > 0; shift >>= 1)
+                dot += __shfl_down_sync(MASK, dot, shift, {L});
+            const float residual = __shfl_sync(MASK, dot, 0, {L}) + rhs[row];
             // Limits report this correction without undoing earlier ones.
             const float correction = residual < 0.0f ? -residual / denominator : 0.0f;
             if (lane == 0) impulse[row] = correction;
@@ -408,7 +417,7 @@ def _get_pgs_solve_sparse_kernel(
             float cross = 0.0f;
             #pragma unroll
             for (int q = 0; q < {Q}; ++q) {{
-                const int entry = lane + q * 32;
+                const int entry = lane + q * {L};
                 const int index = entry < {S} ? {index_read} : -1;
                 const float value = index >= 0 ? row_factor.data[row_base + row * {S} + entry] : 0.0f;
                 const float sibling_value = friction && index >= 0
@@ -431,19 +440,19 @@ def _get_pgs_solve_sparse_kernel(
                     cross += value * sibling_response;
                 }}
             }}
-            for (int shift = 16; shift > 0; shift >>= 1) {{
-                dot += __shfl_down_sync(MASK, dot, shift, 32);
-                sibling_dot += __shfl_down_sync(MASK, sibling_dot, shift, 32);
-                cross += __shfl_down_sync(MASK, cross, shift, 32);
+            for (int shift = {L // 2}; shift > 0; shift >>= 1) {{
+                dot += __shfl_down_sync(MASK, dot, shift, {L});
+                sibling_dot += __shfl_down_sync(MASK, sibling_dot, shift, {L});
+                cross += __shfl_down_sync(MASK, cross, shift, {L});
             }}
-            const float residual = __shfl_sync(MASK, dot, 0, 32) + rhs[row];
+            const float residual = __shfl_sync(MASK, dot, 0, {L}) + rhs[row];
             float new_impulse = old_impulse;
             float sibling_change = 0.0f;
             if (friction) {{
                 float2 pair = make_float2(0.0f, 0.0f);
                 if (radius > 0.0f) {{
-                    const float sibling_residual = __shfl_sync(MASK, sibling_dot, 0, 32) + rhs[sibling];
-                    pair = friction_pair_candidate(denominator, __shfl_sync(MASK, cross, 0, 32),
+                    const float sibling_residual = __shfl_sync(MASK, sibling_dot, 0, {L}) + rhs[sibling];
+                    pair = friction_pair_candidate(denominator, __shfl_sync(MASK, cross, 0, {L}),
                         diagonal[sibling], residual, sibling_residual, old_impulse, old_sibling, radius, omega);
                 }}
                 const float magnitude = sqrtf(pair.x * pair.x + pair.y * pair.y);
@@ -499,8 +508,8 @@ def _get_pgs_solve_sparse_kernel(
         row_update = triplet_update + row_update
         friction_source = FRICTION_PAIR_CACHED_CUDA
     writeback = f"""
-    for (int d = lane; d < {D}; d += 32) factor_velocity_delta.data[world * {D} + d] = delta[d];
-    for (int i = lane; i < count; i += 32) world_impulses.data[offset + i] = impulse[i];
+    for (int d = lane; d < {D}; d += {L}) factor_velocity_delta.data[world * {D} + d] = delta[d];
+    for (int i = lane; i < count; i += {L}) world_impulses.data[offset + i] = impulse[i];
 {mf_writeback}
 """
     snippet = (
@@ -589,7 +598,7 @@ def _get_pgs_solve_sparse_kernel(
         support: _SparseRowSupport,
     ):
         block, lane = wp.tid()
-        world = block * W + lane // 32
+        world = block * W + lane // L
         if world < world_count:
             solve_native(
                 world,
@@ -630,6 +639,8 @@ def _get_pgs_solve_sparse_kernel(
         suffix += "_contact_triplets"
     if velocity_limits:
         suffix += "_velocity_limits"
+    if L != 32:
+        suffix += f"_lanes{L}"
     solve.__name__ = f"pgs_solve_sparse_{M}_{D}_{S}_{F}_{P}{suffix}"
     solve.__qualname__ = solve.__name__
     return wp.kernel(enable_backward=False, module="unique")(solve)

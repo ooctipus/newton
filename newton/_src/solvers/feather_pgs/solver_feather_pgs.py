@@ -5349,6 +5349,20 @@ class SolverFeatherPGS(SolverBase):
             prepare_rows=self._sparse_prepare_contacts,
             use_support_table=use_support_table,
         )
+        # Reuse the local solver's small-world packing without changing this
+        # owner's row representation, sweep policy or velocity-limit phase.
+        self._sparse_solve_lanes = 32
+        if (
+            os.environ.get("FEATHER_PGS_SPARSE_SMALL_WORLDS", "1") != "0"
+            and not active_rows
+            and not mf_capacity
+            and not self._has_free_rigid_bodies
+            and self.max_world_dofs <= 16
+            and self.dense_max_constraints <= 64
+        ):
+            lanes = 8 if self.max_world_dofs <= 8 else 16
+            if solve_shared_bytes * (32 // lanes) <= shared_limit:
+                self._sparse_solve_lanes = lanes
         self._pgs_solve_sparse_kernel = _get_pgs_solve_sparse_kernel(
             self.dense_max_constraints,
             self.max_world_dofs,
@@ -5359,6 +5373,7 @@ class SolverFeatherPGS(SolverBase):
             use_support_table=use_support_table,
             contact_triplets=self._sparse_contact_triplets,
             velocity_limits=self._sparse_velocity_limits,
+            lanes_per_world=self._sparse_solve_lanes,
         )
 
     def _build_body_maps(self, model):
@@ -8387,9 +8402,10 @@ class SolverFeatherPGS(SolverBase):
         if self._sparse_mass_matrix_size is not None:
             if row_phase_override not in (None, 0) or defer_dense_response or soft_relax:
                 raise RuntimeError("sparse factor response requires the interleaved augmented-drive solve")
+            worlds_per_block = 64 // self._sparse_solve_lanes
             wp.launch_tiled(
                 self._pgs_solve_sparse_kernel,
-                dim=[(self.world_count + 1) // 2],
+                dim=[(self.world_count + worlds_per_block - 1) // worlds_per_block],
                 inputs=[
                     self.world_count,
                     self.constraint_count,

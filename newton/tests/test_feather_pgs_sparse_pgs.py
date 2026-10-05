@@ -508,7 +508,13 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
         for active_rows in (False, True):
             self._check_cuda_sparse_sweeps(active_rows=active_rows, use_support_table=True)
 
-    def _check_cuda_sparse_sweeps(self, *, active_rows, use_support_table=False):
+    @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
+    def test_cuda_subwarp_sweeps_match_reference(self):
+        """Preserve linked friction, seeded retraction and delayed contact updates."""
+        for lanes in (8, 16):
+            self._check_cuda_sparse_sweeps(active_rows=False, use_support_table=True, lanes_per_world=lanes)
+
+    def _check_cuda_sparse_sweeps(self, *, active_rows, use_support_table=False, lanes_per_world=32):
         """Compare each schedule with its own physical recurrence without weakening the exact control."""
         device = wp.get_device("cuda:0")
         cases = [(43, 18, None), (75, 39, None)]
@@ -516,6 +522,8 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
         if active_rows:
             cases.extend((3, 3, activity) for activity in ("deferred_activation", "near_singular", "negative_omega"))
         for dofs, support, contact_activity in cases:
+            if lanes_per_world < 32 and dofs > lanes_per_world:
+                continue
             if use_support_table and dofs > 64:
                 continue
             settings = product((False, True), _SWEEP_CASES) if contact_activity is None else [(False, (0, 0, 1.0))]
@@ -594,7 +602,12 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                         row_support.row_class = wp.array(row_class.reshape(worlds, capacity), dtype=int, device=device)
                         packed_indices = wp.full((1, 1, 1), -9, dtype=int, device=device)
                     kernel = _get_pgs_solve_sparse_kernel(
-                        capacity, dofs, support, active_rows=active_rows, use_support_table=use_support_table
+                        capacity,
+                        dofs,
+                        support,
+                        active_rows=active_rows,
+                        use_support_table=use_support_table,
+                        lanes_per_world=lanes_per_world,
                     )
                     launch_args = {
                         "dim": [2],
@@ -643,7 +656,9 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                             result_impulses[world, :count], expected_impulses, atol=2.0e-5, rtol=2.0e-4
                         )
                     if use_support_table:
-                        packed_kernel = _get_pgs_solve_sparse_kernel(capacity, dofs, support, active_rows=active_rows)
+                        packed_kernel = _get_pgs_solve_sparse_kernel(
+                            capacity, dofs, support, active_rows=active_rows, lanes_per_world=lanes_per_world
+                        )
                         wp.copy(actual_impulses, initial_impulses)
                         launch_args["inputs"][5] = wp.array(row_dof, device=device)
                         launch_args["outputs"][1] = _SparseRowSupport()
