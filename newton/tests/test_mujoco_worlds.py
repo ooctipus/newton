@@ -36,6 +36,7 @@ from gpu_components.directory_data import (
 )
 from gpu_components.field_data import FieldStorage
 from gpu_components.graph_data import GraphUpdateTable
+from warp._src import capture_allocation
 
 import newton.solvers
 from newton._src.solvers.mujoco import worlds as native
@@ -85,17 +86,177 @@ def _population_view(group, prototype_index=0):
         group.data,
         group.world_storage.capacity,
         group.contact_storage.capacity,
-        group.ccd_storage.capacity,
+        wp.upper_bound(group.count_parameters[2]),
         group.world_storage.protected_count,
         group.world_storage.ready_count,
-        group.contact_storage.ready_count,
-        group.ccd_storage.ready_count,
+        group.contact_count,
+        group.ccd_count,
         weakref.ref(group),
     )
 
 
 class MuJoCoWorldsHostTests(unittest.TestCase):
     """Check joined service admission and failure publication without CUDA."""
+
+    def test_transient_slots_require_canonical_counts_and_native_ordering(self):
+        """Reuse compatible W/C/D and fixed slots only with exact operand-completion proofs."""
+        counts = tuple(wp.CountParameter(n) for n in (4, 8, 12))
+        scalar = wp.zeros(1, dtype=int, device="cpu")
+
+        def owner(capacity):
+            return SimpleNamespace(
+                capacity=capacity, ready_rows=capacity, device=scalar.device, protected_count=scalar, ready_count=scalar
+            )
+
+        group = _MuJoCoWorldPopulation(
+            None,
+            world_storage=owner(4),
+            contact_storage=owner(8),
+            contact_count=scalar,
+            ccd_count=scalar,
+            contact_quota=2,
+            ccd_quota=3,
+            count_parameters=counts,
+        )
+        worlds = MuJoCoWorlds(device=scalar.device, _populations=[group])
+        requests = tuple(
+            SimpleNamespace(index=i, shape=shape, dtype=wp.float32, strides=None, transient_region=region)
+            for i, (shape, region) in enumerate(
+                (
+                    ((counts[0], 2), 0),
+                    ((counts[0], 2), 0),
+                    ((counts[0], 2), 1),
+                    ((counts[0], 2), 1),
+                    ((counts[0], 2), 2),
+                    ((counts[1], 3), 0),
+                    ((counts[2], 2), 0),
+                    ((1,), 0),
+                    ((1,), 1),
+                    ((counts[1], 3), 0),
+                )
+            )
+        )
+        allocations = []
+
+        def allocate(capacity, protected_count, *, fields, **kwargs):
+            allocations.append(fields)
+            arrays = {
+                spec.name: wp.empty((capacity, *spec.inner_shape), dtype=spec.dtype, device="cpu") for spec in fields
+            }
+            return SimpleNamespace(
+                capacity=capacity,
+                protected_count=protected_count,
+                ready_count=scalar,
+                device=scalar.device,
+                ready_rows=capacity,
+                arrays=arrays,
+            )
+
+        with (
+            patch.object(wp, "capture_get_allocations", return_value=requests),
+            patch.object(wp, "capture_get_transient_regions", return_value=(0, 1, 2)),
+            patch.object(
+                wp,
+                "capture_allocation_order",
+                side_effect=lambda graph, pairs: tuple(
+                    (left.transient_region, right.transient_region) == (0, 1) or (left.index, right.index) == (5, 9)
+                    for left, right in pairs
+                ),
+            ) as order,
+            patch.object(field_ops, "allocate", side_effect=allocate),
+        ):
+            bindings = native._prepare_transient_storage(worlds, object(), [(0, 1, 2)])
+            self.assertEqual(order.call_count, 1, "Batch native dependency queries before allocating slots")
+            self.assertTrue(all(left.shape == right.shape for left, right in order.call_args.args[1]))
+            self.assertEqual(tuple(len(fields) for fields in allocations), (3, 1, 1))
+            for first, second in ((0, 2), (1, 3), (5, 9), (7, 8)):
+                self.assertEqual(bindings[first][1].ptr, bindings[second][1].ptr)
+                self.assertIsNot(bindings[first][1], bindings[second][1])
+            self.assertNotIn(bindings[4][1].ptr, (bindings[0][1].ptr, bindings[1][1].ptr))
+            self.assertEqual([owner.capacity for owner in group.transient_storages], [4, 8, 12])
+            signature = native._binding_signature(group)
+            column = group.transient_storages[0].arrays["0"]
+            group.transient_storages[0].arrays["0"] = wp.empty_like(column)
+            self.assertNotEqual(signature, native._binding_signature(group))
+            with self.assertRaisesRegex(ValueError, "Prepared storage or count descriptors changed"):
+                native._validate_population(group)
+            group.transient_storages[0].arrays["0"] = column
+            for shape, strides in (((wp.CountParameter(4), 2), None), ((2, counts[0]), None), ((counts[0], 2), (8, 4))):
+                requests[0].shape, requests[0].strides = shape, strides
+                with self.assertRaises(ValueError):
+                    native._prepare_transient_storage(worlds, object(), [(0, 1, 2)])
+            requests[0].shape, requests[0].strides = (counts[0], 2), None
+            with self.assertRaisesRegex(ValueError, "exact recorded native region"):
+                native._prepare_transient_storage(worlds, object(), [(0, 1)])
+            self.assertEqual(len(allocations), 3, "Reject invalid relations before allocating owners")
+            group.transient_storages, group.transient_arrays = (), ()
+            requests[0].shape, requests[1].shape = (0,), (counts[0], 0)
+            bindings = native._prepare_transient_storage(worlds, object(), [(0, 1, 2)])
+            self.assertEqual(bindings[0][1].shape, (0,))
+            self.assertEqual(bindings[1][1].shape, (4, 0))
+            self.assertEqual(bindings[0][1].capacity + bindings[1][1].capacity, 0)
+            self.assertIsNot(bindings[0][1], bindings[1][1])
+
+    def test_transient_readiness_limits_execution_without_changing_live_counts(self):
+        """Block physics until every scratch domain and published count fits its accessible prefix."""
+        directory = directory_ops.allocate((2,), id_capacity=2, command_capacity=2, device="cpu")
+        directory.data.live_count.fill_(2)
+        directory.batch_result.advance_allowed.fill_(1)
+        ready, enabled = (wp.full(1, n, dtype=int, device="cpu") for n in (2, 1))
+        scratch = tuple(wp.full(1, 2, dtype=int, device="cpu") for _ in range(3))
+        step, poses = (wp.zeros(1, dtype=int, device="cpu") for _ in range(2))
+        for domain in range(3):
+            for scratch_ready in (0, 1, 2):
+                scratch[domain].fill_(scratch_ready)
+                wp.launch(
+                    native._execution_conditions,
+                    1,
+                    [
+                        directory.data,
+                        directory.batch_result,
+                        0,
+                        ready,
+                        ready,
+                        *scratch,
+                        ready,
+                        ready,
+                        1,
+                        1,
+                        enabled,
+                        enabled,
+                        step,
+                        poses,
+                    ],
+                    device="cpu",
+                )
+                np.testing.assert_array_equal(step.numpy(), [int(scratch_ready == 2)])
+                np.testing.assert_array_equal(poses.numpy(), [int(scratch_ready == 2)])
+        np.testing.assert_array_equal(directory.data.live_count.numpy(), [2])
+
+    def test_published_candidate_and_ccd_counts_follow_all_actual_owners(self):
+        """Publish the minimum accessible prefix without allocating absent domain owners."""
+        group = _MuJoCoWorldPopulation(
+            None,
+            contact_quota=2,
+            ccd_quota=3,
+            count_parameters=tuple(wp.CountParameter(n) for n in (4, 8, 12)),
+            contact_count=wp.zeros(1, dtype=int, device="cpu"),
+            ccd_count=wp.zeros(1, dtype=int, device="cpu"),
+            world_storage=SimpleNamespace(ready_rows=4),
+            contact_storage=SimpleNamespace(ready_rows=7),
+        )
+        native._publish_native_counts(group)
+        np.testing.assert_array_equal(group.ccd_count.numpy(), [0])
+        self.assertEqual(native._world_ready_capacity(group), 0)
+        group.transient_storages = (None, SimpleNamespace(ready_rows=5), SimpleNamespace(ready_rows=4))
+        native._publish_native_counts(group)
+        np.testing.assert_array_equal(group.contact_count.numpy(), [5])
+        np.testing.assert_array_equal(group.ccd_count.numpy(), [4])
+        self.assertEqual(native._world_ready_capacity(group), 1)
+        group.transient_storages = (None, None, None)
+        native._publish_native_counts(group)
+        np.testing.assert_array_equal(group.contact_count.numpy(), [7])
+        np.testing.assert_array_equal(group.ccd_count.numpy(), [12])
 
     def test_generic_components_are_external_and_native_bindings_have_one_authority(self):
         """Reject retained generic owners, compatibility namespaces and duplicate stage ledgers."""
@@ -134,13 +295,38 @@ class MuJoCoWorldsHostTests(unittest.TestCase):
             body = ast.parse(textwrap.dedent(inspect.getsource(record))).body[0].body
             self.assertFalse(any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in body))
         self.assertTrue(
-            {"work", "execution_data", "updates", "bindings"} <= _MuJoCoWorldPopulation.__dataclass_fields__.keys()
+            {"execution_data", "updates", "bindings", "transient_storages", "transient_arrays"}
+            <= _MuJoCoWorldPopulation.__dataclass_fields__.keys()
         )
-        self.assertFalse({"workspace", "step_bindings"} & _MuJoCoWorldPopulation.__dataclass_fields__.keys())
-        for rejected in ("StepBindings", "make_step_workspace", "discover_step_scratch", "scratch_array"):
+        self.assertFalse(
+            {"work", "workspace", "step_bindings", "ccd_storage"} & _MuJoCoWorldPopulation.__dataclass_fields__.keys()
+        )
+        for rejected in (
+            "StepBindings",
+            "StepWork",
+            "step_work_layout",
+            "make_step_work",
+            "validate_step_work",
+            "make_step_workspace",
+            "discover_step_scratch",
+            "scratch_array",
+        ):
             self.assertNotIn(rejected, inspect.getsource(native))
-        self.assertIn("mjw.step_work_layout", inspect.getsource(native))
-        self.assertIn("mjw.make_step_work", inspect.getsource(native))
+        planner = inspect.getsource(native._prepare_transient_storage)
+        for forbidden in ("qacc", "qLD", "qLDiagInv", "actuator_vel", "mjw."):
+            self.assertNotIn(forbidden, planner, "Native transient shapes must have only their producer's authority")
+        physics = ast.parse(inspect.getsource(native._record_physics))
+        transient = next(
+            node
+            for node in ast.walk(physics)
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == "wp.capture_transient"
+        )
+        calls = {ast.unparse(node.func) for node in ast.walk(transient.args[0]) if isinstance(node, ast.Call)}
+        self.assertEqual(calls, {"mjw.step"}, "Application callbacks must stay outside the native transient contract")
+        self.assertEqual(
+            {keyword.arg: ast.literal_eval(keyword.value) for keyword in transient.keywords},
+            {"assume_nonescaping": True, "assume_no_indirect_access": True},
+        )
         capture_source = inspect.getsource(mujoco_worlds_capture)
         self.assertIn("record_launches=True", capture_source)
         self.assertIn("record_memory_operations=True", capture_source)
@@ -288,13 +474,25 @@ assert 'worlds' not in newton.__all__
         population.batch_result = population._directory.batch_result
         scalar = wp.zeros(1, dtype=int, device="cpu")
         population._healthy = population._always_permit = population._lifecycle_needed = scalar
-        group = _MuJoCoWorldPopulation(None, data=object(), contact_quota=1, ccd_quota=1)
-        for name in ("world_storage", "contact_storage", "ccd_storage", "default_storage"):
+        group = _MuJoCoWorldPopulation(
+            None,
+            data=object(),
+            contact_quota=1,
+            ccd_quota=1,
+            contact_count=scalar,
+            ccd_count=scalar,
+            count_parameters=tuple(wp.CountParameter(2) for _ in range(3)),
+        )
+        for name in ("world_storage", "contact_storage", "default_storage"):
             setattr(
                 group,
                 name,
                 SimpleNamespace(name=name, capacity=2, ready_rows=2, ready_count=scalar, protected_count=scalar),
             )
+        group.transient_storages = tuple(
+            SimpleNamespace(name=name, capacity=2, ready_rows=2, ready_count=scalar, protected_count=scalar)
+            for name in ("world_scratch", "candidate_scratch", "ccd_scratch")
+        )
         group.view = _population_view(group)
         population._populations, population.populations = [group], (group.view,)
         group.updates = GraphUpdateTable(
@@ -321,7 +519,7 @@ assert 'worlds' not in newton.__all__
             if owner is group.contact_storage and attempts.count(owner) == 1:
                 raise RuntimeError("retirement failed")
 
-        for name in ("work", "initialization_transfer", "compaction_transfer"):
+        for name in ("initialization_transfer", "compaction_transfer"):
             setattr(group, name, SimpleNamespace(bindings=group, field_names=("qpos",)))
         for name in (
             "request_indices",
@@ -354,18 +552,20 @@ assert 'worlds' not in newton.__all__
             report = mujoco_worlds_memory_report(population)["populations"][0]
             self.assertEqual(
                 report["retired_subowners"],
-                ["work", "initialization_transfer", "compaction_transfer", "updates"],
+                ["initialization_transfer", "compaction_transfer", "updates"],
             )
-            for name in ("work_borrowed", "initialization", "compaction", "compacted_fields", "graph_updates"):
+            for name in ("initialization", "compaction", "compacted_fields", "graph_updates"):
                 self.assertIsNone(report[name], name)
             self.assertEqual(report["contact_storage"], {"owner": "contact_storage"})
-            self.assertEqual(report["ccd_storage"], {"owner": "ccd_storage"})
-            self.assertNotIn(group.ccd_storage, attempts)
+            self.assertEqual(report["transient_storages"]["ccd"], {"owner": "ccd_scratch"})
+            self.assertEqual(report["transient_storages"]["world"], {"owner": "world_scratch"})
+            self.assertNotIn(group.transient_storages[2], attempts)
             with self.assertRaisesRegex(RuntimeError, "closed"):
                 mujoco_worlds_validate(population)
             mujoco_worlds_close(population, streams=(stream,))
         self.assertEqual(attempts.count(group.contact_storage), 2)
-        self.assertEqual(attempts.count(group.ccd_storage), 1)
+        self.assertEqual(attempts.count(group.transient_storages[2]), 1)
+        self.assertEqual(attempts.count(group.transient_storages[0]), 1)
         self.assertEqual(mujoco_worlds_memory_report(population)["populations"], [])
         self.assertIs(population.directory, relations)
 
@@ -382,8 +582,11 @@ assert 'worlds' not in newton.__all__
             _MuJoCoWorldPopulation(
                 None,
                 world_storage=storage,
+                transient_storages=(),
                 contact_storage=storage,
-                ccd_storage=storage,
+                count_parameters=tuple(wp.CountParameter(2) for _ in range(3)),
+                contact_count=scalar,
+                ccd_count=scalar,
             )
             for _ in range(2)
         ]
@@ -474,6 +677,10 @@ assert 'worlds' not in newton.__all__
                         ready,
                         ready,
                         ready,
+                        ready,
+                        ready,
+                        ready,
+                        ready,
                         1,
                         1,
                         health,
@@ -542,6 +749,10 @@ assert 'worlds' not in newton.__all__
             ]
             self.assertEqual(len(matches), 1, f"One complete capture phase must own {name}")
             statement = scopes[0].body[matches[0]]
+            if name == "record_update":
+                self.assertIsInstance(statement, ast.If)
+                self.assertEqual(ast.unparse(statement.test), "not discovering")
+                statement = statement.body[0]
             if name == "_execution_conditions":
                 self.assertIsInstance(statement, ast.For)
             else:
@@ -611,27 +822,39 @@ assert 'worlds' not in newton.__all__
             )
         )
 
-    def _growth_fixture(self):
+    def _growth_fixture(self, *, transient=False):
         """Prepare host-only ownership records; mocked operations track publication ordering."""
         population = MuJoCoWorlds()
         population._closed = population._service_failed = False
         population.device, population._backing = "cpu", object()
         population._healthy = Mock()
         population._directory = object()
-        group = _MuJoCoWorldPopulation(None, contact_quota=2, ccd_quota=3, data_defaults={"contact.efc_address": -1})
-        for name, quota in (("world_storage", 1), ("contact_storage", 2), ("ccd_storage", 3)):
-            setattr(
-                group,
-                name,
-                SimpleNamespace(
-                    name=name,
-                    ready_rows=quota,
-                    capacity=4 * quota,
-                    ready_count=object(),
-                    service_failed=False,
-                    arrays={"contact.efc_address": object()},
-                ),
+        group = _MuJoCoWorldPopulation(
+            None,
+            contact_quota=2,
+            ccd_quota=3,
+            contact_count=Mock(),
+            ccd_count=Mock(),
+            count_parameters=tuple(wp.CountParameter(n) for n in (4, 8, 12)),
+            data_defaults={"contact.efc_address": -1},
+        )
+
+        def storage(name, quota):
+            return SimpleNamespace(
+                name=name,
+                ready_rows=quota,
+                capacity=4 * quota,
+                ready_count=object(),
+                service_failed=False,
+                arrays={"contact.efc_address": object()},
             )
+
+        group.world_storage, group.contact_storage = storage("world_storage", 1), storage("contact_storage", 2)
+        group.transient_storages = (
+            storage("world_scratch", 1) if transient else None,
+            storage("candidate_scratch", 2) if transient else None,
+            storage("ccd_scratch", 3),
+        )
         population._populations = (group,)
         return population, group
 
@@ -672,17 +895,106 @@ assert 'worlds' not in newton.__all__
                 "wait",
                 ("map", "world_storage", 2),
                 ("map", "contact_storage", 4),
-                ("map", "ccd_storage", 6),
+                ("map", "ccd_scratch", 6),
                 ("ready", "world_storage", 2),
                 ("ready", "contact_storage", 4),
                 ("fill", "contact_storage", 2),
-                ("ready", "ccd_storage", 6),
-                ("fill", "ccd_storage", 3),
+                ("ready", "ccd_scratch", 6),
                 "admit",
                 "guard",
             ],
         )
         self.assertEqual(native._world_ready_capacity(group), 2)
+
+    def test_transient_growth_budget_failure_never_publishes_partial_readiness(self):
+        """Keep scratch in the shared mapping transaction and retry a clean budget rejection."""
+        population, group = self._growth_fixture(transient=True)
+        stream = Mock(spec=wp.Stream, device="cpu", cuda_stream=11)
+        mapped, published = [], []
+
+        def map_backing(owner, target):
+            mapped.append(owner.name)
+            if owner is group.transient_storages[0] and mapped.count(owner.name) == 1:
+                raise MemoryError("transient budget")
+
+        def ready(owner, target):
+            published.append(owner.name)
+            owner.ready_rows = target
+
+        with (
+            patch.object(field_ops, "can_map_backing_without_join", return_value=True),
+            patch.object(field_ops, "map_backing", side_effect=map_backing),
+            patch.object(field_ops, "publish_ready", side_effect=ready),
+            patch.object(field_ops, "fill") as fill,
+            patch.object(directory_ops, "publish_admissible_slots") as admit,
+            patch.object(native.wp, "get_stream", return_value=stream),
+            patch.object(native.wp, "launch"),
+            patch.object(native.wp, "synchronize_stream"),
+        ):
+            with self.assertRaisesRegex(MemoryError, "transient budget"):
+                mujoco_worlds_grow_backing(population, (2,), streams=(stream,))
+            self.assertEqual(published, [])
+            admit.assert_not_called()
+            self.assertFalse(population._service_failed)
+            self.assertEqual(native._world_ready_capacity(group), 1)
+            mujoco_worlds_grow_backing(population, (2,), streams=(stream,))
+            self.assertIn("world_scratch", published)
+            self.assertEqual(native._world_ready_capacity(group), 2)
+            self.assertTrue(all(call.args[0] is not group.transient_storages[0] for call in fill.call_args_list))
+            admit.assert_called_once_with(population._directory, (2,))
+
+    def test_transient_resize_joins_and_protects_live_prefix_without_state_initialization(self):
+        """Resize scratch with its live source while leaving initialization to the numerical stage."""
+        population, group = self._growth_fixture(transient=True)
+        population._directory = SimpleNamespace(data=SimpleNamespace(live_count=SimpleNamespace(numpy=lambda: [2])))
+        owners = tuple(owner for owner, _ in native._storage_domains(group))
+        for owner in owners:
+            owner.backing, owner.reservation = population._backing, None
+            owner.ready_rows = owner.capacity
+        stream = Mock(spec=wp.Stream, device="cpu", cuda_stream=11)
+        resized = []
+
+        def resize(owner, target, *, protected_count_host):
+            resized.append((owner.name, target, protected_count_host))
+            owner.ready_rows = target
+
+        with (
+            patch.object(backing_ops, "maintenance", return_value=nullcontext()) as maintenance,
+            patch.object(field_ops, "resize_backing", side_effect=resize),
+            patch.object(field_ops, "fill") as fill,
+            patch.object(directory_ops, "withdraw_admissible_slots") as withdraw,
+            patch.object(directory_ops, "publish_admissible_slots") as publish,
+            patch.object(native.wp, "get_stream", return_value=stream),
+            patch.object(native.wp, "synchronize_stream"),
+        ):
+            mujoco_worlds_resize_backing(population, (2,), streams=(stream,))
+        maintenance.assert_called_once()
+        withdraw.assert_called_once_with(population._directory, (2,))
+        self.assertIn(("world_scratch", 2, 2), resized)
+        fill.assert_not_called()
+        publish.assert_called_once_with(population._directory, (2,))
+
+    def test_failed_count_withdrawal_quarantines_before_resizing(self):
+        """Quarantine a partial C/D withdrawal and preserve its original publication failure."""
+        population, group = self._growth_fixture(transient=True)
+        population._directory = SimpleNamespace(data=SimpleNamespace(live_count=SimpleNamespace(numpy=lambda: [1])))
+        failure = RuntimeError("CCD withdrawal failed")
+        group.ccd_count.zero_.side_effect = failure
+        stream = Mock(spec=wp.Stream, device="cpu", cuda_stream=11)
+        with (
+            patch.object(backing_ops, "maintenance", return_value=nullcontext()),
+            patch.object(directory_ops, "withdraw_admissible_slots"),
+            patch.object(field_ops, "resize_backing") as resize,
+            patch.object(native.wp, "get_stream", return_value=stream),
+            patch.object(native.wp, "synchronize_stream"),
+            self.assertRaises(RuntimeError) as caught,
+        ):
+            mujoco_worlds_resize_backing(population, (2,), streams=(stream,))
+        self.assertIs(caught.exception, failure)
+        group.contact_count.zero_.assert_called_once()
+        resize.assert_not_called()
+        self.assertTrue(population._service_failed)
+        population._healthy.fill_.assert_called_once_with(0)
 
     def test_growth_during_capture_rejects_before_service_or_quarantine(self):
         """Reject a known unsupported call without poisoning healthy population ownership."""
@@ -752,7 +1064,6 @@ assert 'worlds' not in newton.__all__
                 "ready",
                 "initialize",
                 "ready",
-                "initialize",
                 "admit",
                 "guard",
                 "publication_join",
@@ -870,26 +1181,33 @@ assert 'worlds' not in newton.__all__
         population._populations = []
         mapped = {}
         for prototype, initial in enumerate((0, 1)):
-            group = _MuJoCoWorldPopulation(None, contact_quota=1, ccd_quota=1)
-            for name in ("world_storage", "contact_storage", "ccd_storage"):
+            group = _MuJoCoWorldPopulation(
+                None,
+                contact_quota=1,
+                ccd_quota=1,
+                contact_count=Mock(),
+                ccd_count=Mock(),
+                count_parameters=tuple(wp.CountParameter(4) for _ in range(3)),
+            )
+            for name in ("world_storage", "contact_storage", "ccd_scratch"):
                 reservation = VirtualReservation(16 * (len(mapped) + 1), 2, 2)
                 mapped[reservation] = initial
-                setattr(
-                    group,
-                    name,
-                    SimpleNamespace(
-                        prototype=prototype,
-                        name=name,
-                        capacity=2,
-                        ready_rows=0,
-                        row_stride_bytes=1,
-                        backing=population._backing,
-                        reservation=reservation,
-                        ready_count=object(),
-                        service_failed=False,
-                        arrays={"contact.efc_address": object()},
-                    ),
+                owner = SimpleNamespace(
+                    prototype=prototype,
+                    name=name,
+                    capacity=2,
+                    ready_rows=0,
+                    row_stride_bytes=1,
+                    backing=population._backing,
+                    reservation=reservation,
+                    ready_count=object(),
+                    service_failed=False,
+                    arrays={"contact.efc_address": object()},
                 )
+                if name == "ccd_scratch":
+                    group.transient_storages = (None, None, owner)
+                else:
+                    setattr(group, name, owner)
             population._populations.append(group)
         retained, calls = [3], []
 
@@ -939,8 +1257,15 @@ assert 'worlds' not in newton.__all__
         population._populations = []
         mapped = {}
         for p in range(2):
-            group = _MuJoCoWorldPopulation(None, contact_quota=1, ccd_quota=1)
-            for name in ("world_storage", "contact_storage", "ccd_storage"):
+            group = _MuJoCoWorldPopulation(
+                None,
+                contact_quota=1,
+                ccd_quota=1,
+                contact_count=Mock(),
+                ccd_count=Mock(),
+                count_parameters=tuple(wp.CountParameter(4) for _ in range(3)),
+            )
+            for name in ("world_storage", "contact_storage", "ccd_scratch"):
                 reservation = VirtualReservation(16 * (len(mapped) + 1), 4, 4)
                 mapped[reservation] = ((0, 1),)
                 owner = SimpleNamespace(
@@ -956,7 +1281,10 @@ assert 'worlds' not in newton.__all__
                     reservation=reservation,
                 )
 
-                setattr(group, name, owner)
+                if name == "ccd_scratch":
+                    group.transient_storages = (None, None, owner)
+                else:
+                    setattr(group, name, owner)
             population._populations.append(group)
 
         def resize(owner, target, *, protected_count_host):
@@ -1016,9 +1344,16 @@ assert 'worlds' not in newton.__all__
                 population._directory = SimpleNamespace(
                     data=SimpleNamespace(live_count=SimpleNamespace(numpy=lambda: np.ones(1, dtype=int))),
                 )
-                group = _MuJoCoWorldPopulation(None, contact_quota=1, ccd_quota=1)
+                group = _MuJoCoWorldPopulation(
+                    None,
+                    contact_quota=1,
+                    ccd_quota=1,
+                    contact_count=Mock(),
+                    ccd_count=Mock(),
+                    count_parameters=tuple(wp.CountParameter(4) for _ in range(3)),
+                )
                 mapped = {}
-                for name in ("world_storage", "contact_storage", "ccd_storage"):
+                for name in ("world_storage", "contact_storage", "ccd_scratch"):
                     reservation = VirtualReservation(16 * (len(mapped) + 1), 4, 4)
                     mapped[reservation] = ((0, 1),)
                     owner = SimpleNamespace(
@@ -1119,13 +1454,19 @@ assert 'worlds' not in newton.__all__
                     data=SimpleNamespace(live_count=SimpleNamespace(numpy=lambda: np.zeros(1, dtype=int))),
                 )
                 group = _MuJoCoWorldPopulation(
-                    None, contact_quota=2, ccd_quota=1, data_defaults={"contact.efc_address": -1}
+                    None,
+                    contact_quota=2,
+                    ccd_quota=1,
+                    data_defaults={"contact.efc_address": -1},
+                    contact_count=Mock(),
+                    ccd_count=Mock(),
+                    count_parameters=tuple(wp.CountParameter(n) for n in (4, 8, 4)),
                 )
                 mapped = {}
                 for name, ready, capacity in (
                     ("world_storage", 1, 4),
                     ("contact_storage", 2, 8),
-                    ("ccd_storage", 1, 4),
+                    ("ccd_scratch", 1, 4),
                 ):
                     reservation = VirtualReservation(16 * (len(mapped) + 1), capacity, capacity)
                     mapped[reservation] = ((0, ready),)
@@ -1141,7 +1482,10 @@ assert 'worlds' not in newton.__all__
                         reservation=reservation,
                     )
 
-                    setattr(group, name, owner)
+                    if name == "ccd_scratch":
+                        group.transient_storages = (None, None, owner)
+                    else:
+                        setattr(group, name, owner)
                 population._populations = [group]
 
                 def resize(owner, target, *, protected_count_host, failure=failure):
@@ -1216,7 +1560,10 @@ assert 'worlds' not in newton.__all__
                             None,
                             world_storage=owner,
                             contact_storage=owner,
-                            ccd_storage=owner,
+                            transient_storages=(None, None, owner),
+                            contact_count=Mock(),
+                            ccd_count=Mock(),
+                            count_parameters=tuple(wp.CountParameter(2) for _ in range(3)),
                             contact_quota=1,
                             ccd_quota=1,
                         )
@@ -1280,6 +1627,9 @@ class PopulationRecorderTests(unittest.TestCase):
         count = patch.object(native.wp, "capture_launch_count", side_effect=lambda graph: len(self.records))
         count.start()
         self.addCleanup(count.stop)
+        transient = patch.object(native.wp, "capture_transient", side_effect=lambda callback, **kwargs: callback())
+        transient.start()
+        self.addCleanup(transient.stop)
 
     def group(self):
 
@@ -1311,10 +1661,12 @@ class PopulationRecorderTests(unittest.TestCase):
             data=SimpleNamespace(qpos=SimpleNamespace(device="cpu"), nacon=None, ncollision=None),
             world_storage=owner("world"),
             contact_storage=owner("candidate"),
-            ccd_storage=owner("ccd"),
-            work=SimpleNamespace(),
+            transient_storages=(None, None, owner("ccd")),
+            count_parameters=tuple(wp.CountParameter(17) for _ in range(3)),
             application_ranges=[],
         )
+        group.contact_count = group.contact_storage.protected_count
+        group.ccd_count = group.transient_storages[2].protected_count
         group.execution_data = SimpleNamespace(qpos=group.data.qpos)
         group.view = _population_view(group, 3)
         updates = GraphUpdateTable(
@@ -1358,11 +1710,11 @@ class PopulationRecorderTests(unittest.TestCase):
         self.assertIs(view.data, group.data)
         self.assertIs(view.world_live_count, group.world_storage.protected_count)
         self.assertIs(view.world_storage_ready_count, group.world_storage.ready_count)
-        self.assertIs(view.contact_storage_ready_count, group.contact_storage.ready_count)
-        self.assertIs(view.ccd_storage_ready_count, group.ccd_storage.ready_count)
+        self.assertIs(view.contact_storage_ready_count, group.contact_count)
+        self.assertIs(view.ccd_storage_ready_count, group.ccd_count)
         self.assertEqual((view.world_capacity, view.contact_capacity, view.ccd_capacity), (17, 17, 17))
         self.assertEqual(mujoco_world_population_ready_capacity(view), 4)
-        group.ccd_storage.ready_rows = 8
+        group.transient_storages[2].ready_rows = 8
         self.assertEqual(mujoco_world_population_ready_capacity(view), 2, "Readiness must come from its existing owner")
         for name in (
             "world_storage",
@@ -1385,6 +1737,53 @@ class PopulationRecorderTests(unittest.TestCase):
         group.data = None
         with self.assertRaisesRegex(RuntimeError, "closed"):
             mujoco_world_population_validate(view)
+
+    def test_absent_ccd_scratch_still_freezes_the_published_scalar_descriptor(self):
+        """Reject same-object CCD count mutations even when no CCD array owns the scalar."""
+        group, _, _ = self.group()
+        group.transient_storages = (None, None, None)
+        group.storage_signature = native._binding_signature(group)[0:2]
+        population = MuJoCoWorlds(
+            device=wp.get_device("cpu"),
+            _directory=object(),
+            _backing=object(),
+            _populations=[group],
+            populations=(group.view,),
+        )
+        array = group.ccd_count
+        for attribute, changed in (
+            ("ptr", array.ptr + 4),
+            ("shape", (2,)),
+            ("strides", (8,)),
+            ("dtype", wp.uint32),
+            ("device", object()),
+        ):
+            previous = getattr(array, attribute)
+            try:
+                setattr(array, attribute, changed)
+                with self.assertRaisesRegex(ValueError, "count descriptors changed"):
+                    mujoco_world_population_validate(group.view)
+                for public_views in ((group.view,), (), (object(),)):
+                    population.populations = public_views
+                    for service in (mujoco_worlds_grow_backing, mujoco_worlds_resize_backing):
+                        with self.subTest(attribute=attribute, views=public_views, service=service.__name__):
+                            with self.assertRaisesRegex(ValueError, "count descriptors changed"):
+                                service(population, (1,), streams=())
+            finally:
+                setattr(array, attribute, previous)
+        mujoco_world_population_validate(group.view)
+
+    def test_public_count_validation_does_not_visit_private_scratch(self):
+        """Borrowed-count reads stay independent of the private scratch relation checked by service."""
+        group, _, _ = self.group()
+        group.storage_signature = native._binding_signature(group)[0:2]
+        population = MuJoCoWorlds(device=wp.get_device("cpu"), _directory=object(), _populations=[group])
+        with patch.object(native, "_binding_signature", side_effect=AssertionError("private storage inspected")):
+            mujoco_world_population_validate(group.view)
+            for service in (mujoco_worlds_grow_backing, mujoco_worlds_resize_backing):
+                with self.subTest(service=service.__name__):
+                    with self.assertRaisesRegex(AssertionError, "private storage inspected"):
+                        service(population, (1,), streams=())
 
     def test_borrowed_view_mutations_are_rejected_at_validation(self):
         """Plain records cannot turn replaced counts or prototype metadata into valid submission inputs."""
@@ -1476,6 +1875,13 @@ class PopulationRecorderTests(unittest.TestCase):
                 finally:
                     condition_stack.pop()
 
+        @contextmanager
+        def scoped_capture(**kwargs):
+            self.records.clear()
+            self.memory_operations.clear()
+            self.contact_invalidations.clear()
+            yield SimpleNamespace(graph=self.graph)
+
         with ExitStack() as stack:
             for target, name, options in (
                 (native.wp, "load_module", {}),
@@ -1483,6 +1889,7 @@ class PopulationRecorderTests(unittest.TestCase):
                 (native.wp, "synchronize_stream", {}),
                 (native.wp, "capture_if", {"side_effect": capture_if}),
                 (native.wp, "capture_get_launches", {"side_effect": lambda graph: tuple(self.records)}),
+                (native.wp, "capture_discovery_memory", {"return_value": {}}),
                 (
                     native.wp,
                     "capture_get_memory_operations",
@@ -1496,10 +1903,12 @@ class PopulationRecorderTests(unittest.TestCase):
                 (graph_ops, "instantiate_and_upload", {"side_effect": publication}),
                 (graph_ops, "invalidate", {"side_effect": invalidate}),
                 (directory_ops, "begin", {}),
+                (directory_ops, "publish_admissible_slots", {}),
                 (mjw, "step", {"side_effect": lambda *args, **kwargs: wp.launch(self.native_kernel, 17)}),
                 (mjw, "kinematics", {}),
                 (native, "_validate_population", {"side_effect": validate_population}),
                 (native, "_retain_graph", {}),
+                (native, "_prepare_transient_storage", {"return_value": ()}),
                 (
                     mjw,
                     "invalidate_contact_cache",
@@ -1508,9 +1917,7 @@ class PopulationRecorderTests(unittest.TestCase):
                 (native, "_bind_native_program", {"side_effect": native_bind}),
             ):
                 stack.enter_context(patch.object(target, name, **options))
-            stack.enter_context(
-                patch.object(native.wp, "ScopedCapture", return_value=nullcontext(SimpleNamespace(graph=self.graph)))
-            )
+            stack.enter_context(patch.object(native.wp, "ScopedCapture", side_effect=scoped_capture))
             return mujoco_worlds_capture(population, commands, results, **callbacks)
 
     def test_consumed_lifecycle_invalidates_contacts_independently_of_physics_permit(self):
@@ -1591,7 +1998,7 @@ class PopulationRecorderTests(unittest.TestCase):
         self._capture(group, before_step=callback, application_bindings=compile_application)
         records, relations = self.adopted[0]
         self.assertIs(relations["extents"][0][2], group.world_storage.protected_count)
-        self.assertIs(relations["extents"][1][2], group.contact_storage.ready_count)
+        self.assertIs(relations["extents"][1][2], group.contact_count)
         self.assertTrue(all(record.kernel is self.native_kernel for record in self.native_records))
         self.assertTrue(all(any(record is candidate for candidate in self.records) for record in records))
         self.assertIsNone(group.application_ranges)
@@ -1667,13 +2074,13 @@ class PopulationRecorderTests(unittest.TestCase):
                 patch.object(native, "_validate_population"),
                 patch.object(native.wp, "capture_if", side_effect=lambda condition, on_true: on_true()),
             ):
-                native._record_physics(group)
+                native._record_physics(group, [])
         self.assertEqual(first.application_ranges, [(1, 2), (3, 4)])
         self.assertEqual(second.application_ranges, [(5, 6), (7, 8)])
         for group in (first, second):
             self.assertEqual(group.bindings, [])
-            self.assertIsNone(group.before_step)
-            self.assertIsNone(group.after_substep)
+            self.assertIsNotNone(group.before_step)
+            self.assertIsNotNone(group.after_substep)
         self.assertTrue(all(self.records[index].kernel is kernel for index in (1, 3, 5, 7)))
 
     def test_physics_and_pose_refresh_share_one_parent_child_scope(self):
@@ -1700,10 +2107,9 @@ class PopulationRecorderTests(unittest.TestCase):
             self.assertEqual(depth[0], 1)
             calls.append("poses")
 
-        def step(model, data, *, work):
+        def step(model, data):
             self.assertIs(model, group.model)
             self.assertIs(data, group.execution_data)
-            self.assertIs(work, group.work)
             calls.append("step")
 
         def validate(owner):
@@ -1721,7 +2127,7 @@ class PopulationRecorderTests(unittest.TestCase):
             patch.object(native, "_validate_population", side_effect=validate),
             patch.object(native.wp, "capture_if", side_effect=conditional),
         ):
-            native._record_physics(group)
+            native._record_physics(group, [])
         self.assertEqual(condition_depths, [0, 1])
         self.assertEqual(calls, ["validate", "control", "validate", "step", "after", "validate", "poses"])
 
@@ -1743,7 +2149,7 @@ class PopulationRecorderTests(unittest.TestCase):
                     patch.object(native.wp, "capture_if", side_effect=lambda condition, on_true: on_true()),
                 ):
                     with self.assertRaisesRegex(ValueError, "prepared descriptors changed"):
-                        native._record_physics(group)
+                        native._record_physics(group, [])
                 self.assertEqual(calls, ["after"])
                 self.assertEqual(validate.call_count, 3)
                 validate.assert_called_with(group)
@@ -1768,11 +2174,11 @@ class PopulationRecorderTests(unittest.TestCase):
             patch.object(native.wp, "capture_if", side_effect=lambda condition, on_true: on_true()),
             self.assertRaisesRegex(ValueError, "callback failed"),
         ):
-            native._record_physics(group)
+            native._record_physics(group, [])
         self.assertTrue(group.recording_failed)
         self.assertIsNone(group.before_step)
         with self.assertRaisesRegex(RuntimeError, "failed recording"):
-            native._record_physics(group)
+            native._record_physics(group, [])
 
     def test_model_array_walk_includes_tuple_arrays_and_nested_tile_descriptors(self):
         """Account tuple-held model arrays without interpreting their shapes as world domains."""
@@ -1795,14 +2201,16 @@ class PopulationRecorderTests(unittest.TestCase):
         self.assertIs(fields[1][1], second)
 
         scalar = wp.zeros(1, dtype=int, device="cpu")
-        storage = SimpleNamespace(protected_count=scalar, field_names=(), ready_rows=0)
+        storage = SimpleNamespace(protected_count=scalar, field_names=(), ready_rows=0, capacity=1)
         group = SimpleNamespace(
             model=model,
             world_storage=storage,
+            transient_storages=(None, None, storage),
+            transient_arrays=(),
+            contact_count=scalar,
+            ccd_count=scalar,
             contact_storage=storage,
-            ccd_storage=storage,
             default_storage=storage,
-            work=storage,
             initialization_transfer=storage,
             compaction_transfer=storage,
             updates=None,
@@ -1867,17 +2275,17 @@ class PopulationRecorderTests(unittest.TestCase):
             ),
         ):
             with patch.object(self.native.wp, "capture_if", side_effect=lambda step_condition, on_true: on_true()):
-                native._record_physics(group)
+                native._record_physics(group, [])
             self.assertEqual(calls, ["control", "step", "step", "poses"])
-            self.assertIsNone(group.before_step)
+            self.assertIsNotNone(group.before_step)
             calls.clear()
             group.before_step = lambda group: calls.append("control")
             with patch.object(self.native.wp, "capture_if", return_value=None):
-                native._record_physics(group)
+                native._record_physics(group, [])
             self.assertEqual(calls, [], "The disabled native IF must also suppress control writes")
             with patch.object(self.native.wp, "capture_if", side_effect=RuntimeError("capture failed")):
                 with self.assertRaisesRegex(RuntimeError, "capture failed"):
-                    native._record_physics(group)
+                    native._record_physics(group, [])
             self.assertIsNone(group.before_step)
 
 
@@ -1983,6 +2391,24 @@ def _array(data, path):
     return data
 
 
+def _poison_transients(population):
+    """Poison every backed scratch domain and fixed slot before testing numerical first writes."""
+
+    def value(array):
+        scalar = getattr(array.dtype, "_wp_scalar_type_", array.dtype)
+        fill = float("nan") if scalar in (wp.float32, wp.float64) else 127
+        return array.dtype(fill) if scalar is not array.dtype else fill
+
+    for group in population._populations:
+        for storage in group.transient_storages:
+            if storage is not None:
+                for array in storage.arrays.values():
+                    field_ops.fill(storage, array, value(array), count=storage.ready_count)
+        for array in group.transient_arrays:
+            if array.size:
+                array.fill_(value(array))
+
+
 def _prototype(keys, mujoco, mjw, *, convex=False):
     """Prepare slider keys with primitive or convex floor contacts, mocap and sites."""
     key_geom = (
@@ -2028,6 +2454,64 @@ class TestMuJoCoWorlds(unittest.TestCase):
     @unittest.skipUnless(
         os.environ.get("NEWTON_TEST_CUDA_UUID"), "Set an explicit CUDA UUID for native population tests"
     )
+    def test_failed_discovery_releases_internal_borrows_without_clearing_caller_exceptions(self):
+        """Close a failed discovery with its traceback alive, preserving real external borrowers."""
+        import mujoco
+        import mujoco_warp as mjw
+
+        wp.init()
+        device = wp.get_device("cuda:0")
+        self.assertEqual(device.uuid, os.environ["NEWTON_TEST_CUDA_UUID"])
+        with wp.ScopedDevice(device):
+            prepared = [_prototype(6, mujoco, mjw, convex=True)]
+            original = capture_allocation._discovery_empty
+            for retain_external in (False, True):
+                with self.subTest(retain_external=retain_external):
+                    population = mujoco_worlds_prepare(
+                        prepared,
+                        world_capacities=(4,),
+                        id_capacity=1,
+                        command_capacity=1,
+                        memory_budget_bytes=64 * 1024**2,
+                        initial_world_ready_capacities=(1,),
+                    )
+                    external = population.populations[0].data.qpos if retain_external else None
+                    commands = directory_ops.allocate_commands(1, device=device)
+                    results = directory_ops.allocate_results(1, device=device)
+                    allocations, graph_reference = 0, None
+
+                    def fail(graph, *args, **kwargs):
+                        nonlocal allocations, graph_reference
+                        allocations += 1
+                        graph_reference = weakref.ref(graph)
+                        if allocations == 20:
+                            raise RuntimeError("injected native discovery allocation failure")
+                        return original(graph, *args, **kwargs)
+
+                    try:
+                        with patch.object(capture_allocation, "_discovery_empty", new=fail):
+                            mujoco_worlds_capture(population, commands, results)
+                    except RuntimeError as failure:
+                        self.assertEqual(str(failure), "injected native discovery allocation failure")
+                        self.assertIsNotNone(failure.__traceback__)
+                        self.assertEqual(allocations, 20)
+                        self.assertFalse(device.is_capturing)
+                        self.assertIsNone(graph_reference())
+                        if external is not None:
+                            with self.assertRaisesRegex(RuntimeError, "retained by external views"):
+                                mujoco_worlds_close(population, streams=(wp.get_stream(device),))
+                            external = None
+                        mujoco_worlds_close(population, streams=(wp.get_stream(device),))
+                        report = backing_ops.memory_report(population._backing)
+                        self.assertEqual(report["references"], 0)
+                        self.assertEqual(report["physical_retained_bytes"], 0)
+                        self.assertEqual(report["virtual_reserved_bytes"], 0)
+                    else:
+                        self.fail("Discovery did not reach the injected allocation failure")
+
+    @unittest.skipUnless(
+        os.environ.get("NEWTON_TEST_CUDA_UUID"), "Set an explicit CUDA UUID for native population tests"
+    )
     def test_growth_rejects_capture_on_another_stream_without_poisoning(self):
         """Preserve a live capture and population when growth is attempted from another stream."""
         import mujoco
@@ -2066,15 +2550,21 @@ class TestMuJoCoWorlds(unittest.TestCase):
                 np.testing.assert_array_equal(population._healthy.numpy(), [1])
                 self.assertEqual(mujoco_world_population_ready_capacity(population.populations[0]), 0)
                 mujoco_worlds_grow_backing(population, (1,), streams=(wp.get_stream(device),))
+                self.assertEqual(mujoco_world_population_ready_capacity(population.populations[0]), 0)
+                commands = directory_ops.allocate_commands(1, device=device)
+                results = directory_ops.allocate_results(1, device=device)
+                graph = mujoco_worlds_capture(population, commands, results)
                 self.assertGreaterEqual(mujoco_world_population_ready_capacity(population.populations[0]), 1)
+                del graph
+                gc.collect()
             finally:
                 mujoco_worlds_close(population, streams=(wp.get_stream(device),))
 
     @unittest.skipUnless(
         os.environ.get("NEWTON_TEST_CUDA_UUID"), "Set an explicit CUDA UUID for native population tests"
     )
-    def test_native_work_uses_declared_owners_and_rejects_descriptor_replacement(self):
-        """Prepare native operands without recording physics, then bind exact descriptors once."""
+    def test_discovered_scratch_uses_actual_owners_and_rejects_descriptor_replacement(self):
+        """Discover ordinary scratch into actual owners and freeze every substituted descriptor."""
         import mujoco
         import mujoco_warp as mjw
 
@@ -2103,35 +2593,29 @@ class TestMuJoCoWorlds(unittest.TestCase):
                     commands = directory_ops.allocate_commands(2, device=device)
                     results = directory_ops.allocate_results(2, device=device)
                     group = population._populations[0]
-                    graph = original_work = column = None
+                    graph = original = owner = None
                     try:
-                        layout = mjw.step_work_layout(group.model, group.execution_data)
-                        columns = {name: array for name, array, _ in mjw.array_fields(group.work)}
-                        self.assertEqual(columns.keys(), layout.keys())
-                        domains = tuple(
-                            zip(
-                                group.count_parameters,
-                                (group.world_storage, group.contact_storage, group.ccd_storage),
-                                strict=True,
-                            )
-                        )
-                        for name, (shape, _) in layout.items():
-                            column = columns[name]
-                            owner = next((owner for count, owner in domains if shape[0] is count), None)
-                            expected = (
-                                group.global_arrays["work." + name] if owner is None else owner.arrays["work." + name]
-                            )
-                            self.assertIs(column, expected)
-                        for transfer in (group.initialization_transfer, group.compaction_transfer):
-                            self.assertFalse(any(name.startswith("work.") for name in transfer.field_names))
+                        self.assertEqual(group.transient_storages, ())
+                        np.testing.assert_array_equal(group.ccd_count.numpy(), [0])
+                        self.assertEqual(mujoco_world_population_ready_capacity(group.view), 0)
                         graph = mujoco_worlds_capture(population, commands, results)
                         native._validate_population(group)
-                        name = next(iter(columns))
-                        original_work = group.work
-                        group.work = mjw.replace_arrays(group.work, {name: wp.empty_like(columns[name])})
+                        for domain, owner in enumerate(group.transient_storages):
+                            if owner is not None:
+                                self.assertEqual(owner.capacity, wp.upper_bound(group.count_parameters[domain]))
+                                self.assertIs(
+                                    owner.protected_count,
+                                    (group.world_storage.protected_count, group.contact_count, group.ccd_count)[domain],
+                                )
+                        for transfer in (group.initialization_transfer, group.compaction_transfer):
+                            self.assertFalse(any(name.startswith("work.") for name in transfer.field_names))
+                        owner = next(owner for owner in group.transient_storages if owner is not None and owner.arrays)
+                        name = next(iter(owner.arrays))
+                        original = owner.arrays[name]
+                        owner.arrays[name] = wp.empty_like(original)
                         with self.assertRaises(ValueError):
                             native._validate_population(group)
-                        group.work = original_work
+                        owner.arrays[name] = original
                         native._validate_population(group)
                         if storage == "vmm":
                             self.assertEqual(mujoco_world_population_ready_capacity(population.populations[0]), 0)
@@ -2150,9 +2634,103 @@ class TestMuJoCoWorlds(unittest.TestCase):
                         self.assertEqual(population._healthy.numpy()[0], 1)
                         self.assertGreater(float(_prefix(group.data, 1).time.numpy()[0]), 0.0)
                     finally:
-                        graph = original_work = column = columns = domains = transfer = None
+                        graph = original = owner = transfer = None
                         gc.collect()
                         mujoco_worlds_close(population, streams=(wp.get_stream(device),))
+
+    @unittest.skipUnless(
+        os.environ.get("NEWTON_TEST_CUDA_UUID"), "Set an explicit CUDA UUID for native population tests"
+    )
+    def test_transient_last_mapping_budget_rejection_recovers_without_publication(self):
+        """Exhaust real shared backing at scratch after mapping state, then reclaim and replay."""
+        import mujoco
+        import mujoco_warp as mjw
+
+        device = wp.get_device("cuda:0")
+        self.assertEqual(device.uuid, os.environ["NEWTON_TEST_CUDA_UUID"])
+        with wp.ScopedDevice(device):
+            prepared = [_prototype(6, mujoco, mjw, convex=True)]
+            settings = {
+                "world_capacities": (128,),
+                "id_capacity": 1,
+                "command_capacity": 1,
+                "initial_world_ready_capacities": (0,),
+            }
+            probe = mujoco_worlds_prepare(prepared, memory_budget_bytes=64 * 1024**2, **settings)
+            probe_commands = directory_ops.allocate_commands(1, device=device)
+            probe_results = directory_ops.allocate_results(1, device=device)
+            probe_graph = mujoco_worlds_capture(probe, probe_commands, probe_results, substeps=8)
+            group = probe._populations[0]
+            self.assertTrue(all(owner is not None for owner in group.transient_storages))
+            ccd_requests = tuple(
+                request
+                for request in wp.capture_get_allocations(probe_graph)
+                if request.shape
+                and request.shape[0] is group.count_parameters[2]
+                and all(wp.upper_bound(axis) for axis in request.shape)
+            )
+            for region in wp.capture_get_transient_regions(probe_graph):
+                self.assertLess(
+                    len(group.transient_storages[2].arrays),
+                    sum(request.transient_region == region.index for request in ccd_requests),
+                    "Native CCD scratch must reuse storage within each step, not only between steps",
+                )
+            granule = probe._backing.granularity_bytes
+            widths = tuple(
+                owner.row_stride_bytes * (1, group.contact_quota, group.ccd_quota)[domain]
+                for owner, domain in native._storage_domains(group)
+                if owner.backing is not None
+            )
+
+            def required(rows, widths=widths):
+                return sum((rows * width + granule - 1) // granule * granule for width in widths)
+
+            target = next(n for n in range(2, 129) if required(n, widths[:-1]) >= required(1))
+            budget = required(target, widths[:-1])
+            del probe_graph
+            gc.collect()
+            mujoco_worlds_close(probe, streams=(wp.get_stream(device),))
+            population = mujoco_worlds_prepare(prepared, memory_budget_bytes=budget, **settings)
+            graph = None
+            try:
+                commands = directory_ops.allocate_commands(1, device=device)
+                results = directory_ops.allocate_results(1, device=device)
+                graph = mujoco_worlds_capture(population, commands, results, substeps=8)
+                group = population._populations[0]
+                original_map = field_ops.map_backing
+                with patch.object(field_ops, "map_backing", wraps=original_map) as mapping:
+                    with self.assertRaises(MemoryError):
+                        mujoco_worlds_grow_backing(population, (target,), streams=(wp.get_stream(device),))
+                self.assertIs(mapping.call_args.args[0], group.transient_storages[2])
+                self.assertEqual(backing_ops.memory_report(population._backing)["mapped_bytes"], budget)
+                self.assertEqual(mujoco_world_population_ready_capacity(group.view), 0)
+                np.testing.assert_array_equal(population.directory.free_slot_count.numpy(), [0])
+                self.assertFalse(population._service_failed)
+                commands.sequence.fill_(1)
+                commands.count.zero_()
+                wp.capture_launch(graph)
+                np.testing.assert_array_equal(population.directory.live_count.numpy(), [0])
+                mujoco_worlds_resize_backing(population, (0,), streams=(wp.get_stream(device),))
+                mujoco_worlds_grow_backing(population, (1,), streams=(wp.get_stream(device),))
+                _poison_transients(population)
+                commands.sequence.fill_(2)
+                commands.count.fill_(1)
+                commands.operation.fill_(_CREATE)
+                commands.prototype.zero_()
+                wp.capture_launch(graph)
+                oracle = mjw.replicate_data(prepared[0][1], 1)
+                for _ in range(8):
+                    mjw.step(group.model, oracle)
+                mjw.kinematics(group.model, oracle)
+                np.testing.assert_array_equal(results.status.numpy(), [_OK])
+                for name in (*_STATE, *_POSE):
+                    actual, expected = getattr(_prefix(group.data, 1), name).numpy(), getattr(oracle, name).numpy()
+                    self.assertTrue(np.isfinite(actual).all(), name)
+                    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-6, equal_nan=False, err_msg=name)
+            finally:
+                graph = None
+                gc.collect()
+                mujoco_worlds_close(population, streams=(wp.get_stream(device),))
 
     @unittest.skipUnless(
         os.environ.get("NEWTON_TEST_CUDA_UUID"), "Set an explicit CUDA UUID for native population tests"
@@ -2179,8 +2757,12 @@ class TestMuJoCoWorlds(unittest.TestCase):
             graph = None
             try:
                 group = population._populations[0]
-                owners = (group.world_storage, group.contact_storage, group.ccd_storage)
-                quotas = (1, group.contact_quota, group.ccd_quota)
+                commands = directory_ops.allocate_commands(2, device=device)
+                results = directory_ops.allocate_results(2, device=device)
+                graph = mujoco_worlds_capture(population, commands, results)
+                domains = native._storage_domains(group)
+                owners = tuple(owner for owner, _ in domains)
+                quotas = tuple((1, group.contact_quota, group.ccd_quota)[domain] for _, domain in domains)
                 granule = population._backing.granularity_bytes
 
                 def mapped_bytes(n):
@@ -2200,9 +2782,6 @@ class TestMuJoCoWorlds(unittest.TestCase):
                     None,
                 )
                 self.assertIsNotNone(target, "Fixture must fit world growth but reject a later domain on real budget")
-                commands = directory_ops.allocate_commands(2, device=device)
-                results = directory_ops.allocate_results(2, device=device)
-                graph = mujoco_worlds_capture(population, commands, results)
                 oracle = mjw.replicate_data(prepared[0][1], 1)
 
                 def replay(sequence, *, create=False):
@@ -2789,18 +3368,27 @@ class TestMuJoCoWorlds(unittest.TestCase):
                 groups = {id(group.execution_data): group.view for group in population._populations}
 
                 def record_convex_pass(model, data, *args, **kwargs):
-                    narrowphase(model, data, *args, **kwargs)
                     group = groups[id(data)]
-                    # Sleeping's incremental pass clears nccd again; sample before the next pass.
-                    wp.launch(
-                        _record_convex_work,
-                        1,
-                        inputs=[
-                            kwargs["work"].nccd,
-                            group.data.nacon,
-                            convex_observed[group.prototype_index],
-                        ],
-                    )
+                    launch = wp.launch
+
+                    def observe_kernel(kernel, *launch_args, **launch_kwargs):
+                        launch(kernel, *launch_args, **launch_kwargs)
+                        parameters = [arg.label for arg in kernel.adj.args]
+                        if "nccd_in" in parameters:
+                            operands = (*launch_kwargs.get("inputs", ()), *launch_kwargs.get("outputs", ()))
+                            launch(
+                                _record_convex_work,
+                                1,
+                                inputs=[
+                                    operands[parameters.index("nccd_in")],
+                                    group.data.nacon,
+                                    convex_observed[group.prototype_index],
+                                ],
+                            )
+
+                    # Observe the exact local counter while its native activation is still live.
+                    with patch.object(wp, "launch", new=observe_kernel):
+                        narrowphase(model, data, *args, **kwargs)
 
                 probe.enter_context(
                     patch.object(collision_driver, "convex_narrowphase", side_effect=record_convex_pass)
@@ -2882,6 +3470,7 @@ class TestMuJoCoWorlds(unittest.TestCase):
                 else:
                     mujoco_worlds_resize_backing(population, targets, streams=(consumer,))
             do_step = case in ("step", "delete", "invalid", "empty")
+            _poison_transients(population)
             permit.fill_(int(do_step))
             commands.sequence.fill_(sequence)
             commands.count.fill_(len(requests))
