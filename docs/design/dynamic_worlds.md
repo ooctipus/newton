@@ -11,7 +11,7 @@ The consuming application owns prototype preparation, controls, initialization p
 - The standalone `gpu_components.directory` operations own numeric identities, generations, placement and admission. Their records live in `gpu_components.directory_data`.
 - `gpu_components.fields` owns typed allocations and transfer operations. `gpu_components.backing` owns virtual reservations and physical byte mappings. These components have no simulation knowledge.
 - `gpu_components.graph` binds declared counts to captured CUDA kernel nodes. It does not infer field domains or choose physics stages.
-- MJWarp owns numerical layouts, defaults, alignment requirements and passive numerical operands such as `StepWork`, `SolverContext` and `CollisionContext`. Numerical stages receive these operands directly. MJWarp has no GPU Components dependency or storage, readiness, graph-binding or publication manager.
+- MJWarp owns numerical Data, defaults, alignment requirements and ordinary local scratch allocations. Algorithm-local records such as `SolverContext` remain inside their numerical stages. MJWarp has no GPU Components dependency or storage, readiness, graph-binding or publication manager.
 - Newton owns the admitted feature subset, lifecycle ordering and one update table and binding ledger per population. It records native and application work, then supplies exact launch/count relations to GPU Components.
 - Native MJWarp `Data` is the authoritative physical state. There is no dense Newton `State` mirror.
 
@@ -22,21 +22,56 @@ payload or assigning readiness. MJWarp owns this representation; Newton consumes
 `dataclasses.replace`. Numerical extents never determine capacity domains, and an array
 appearing at two native paths does not acquire a second allocation owner.
 
-Each numerical stage declares its work layout beside its equations. The same
-declaration drives ordinary allocation and externally supplied arrays.
-`mjw.step_work_layout(model, data)` composes these declarations; `mjw.make_step_work`
-allocates ordinary arrays or binds complete supplied arrays. Field names resolve
-only during preparation. `mjw.step(model, data, work=work)` consumes typed operands;
-omitting `work` prepares ordinary native work. Solver alignment and Data defaults
-remain in MJWarp, while typed packing and accessible-range checks belong to GPU
-Components. There is no discovery run or second native field catalog.
+All numerical stages allocate their own temporary arrays at their point of use.
+There is no `StepWork`, external numerical-context injection, or parallel scratch
+layout catalog. Warp records ordinary allocations with their exact symbolic
+operands. Newton owns no second native shape or field catalog. Numerical alignment
+checks remain with MJWarp; typed packing and accessible-range checks belong to GPU
+Components.
+
+Capture performs two startup recordings. The first is non-executable discovery:
+Warp supplies distinct, unmapped CUDA virtual addresses without committing maximum
+temporary payloads. Newton packs compatible occurrences only when Warp proves
+that all earlier consumers complete before all later consumers. Each numerical
+substep has its own closed region inside the existing conditional and parallel
+program. The admitted numerical path promises no indirect access to temporary
+arrays, allowing proofs inside a region; unknown native operations refuse that
+finer reuse. Persistent callback outputs stay outside these contracts. Newton
+batches compatible allocation pairs into one native-order query, then substitutes
+distinct array views. Warp revalidates the final operands and DAG before executable
+publication. Only exact regions returned at native step call sites own these
+allocations. Unknown symbolic dimensions and explicit strides are rejected.
 
 Newton constructs concrete capacity `Data` and a shallow execution projection
 using the same arrays and three distinct Warp `CountParameter` identities for
 worlds, contact candidates and CCD work. Equal bounds never establish count
-meaning. MJWarp's `metadata_signature` and numerical layout validation check both
-descriptors and native work; Newton also freezes its storage/count bindings. This
-projection owns no second physical state and does not certify backing readiness.
+meaning. Nonempty dynamic requests must carry the exact leading count identity.
+Each domain with payload gets one private transient field storage; absent domains
+have no placeholder owner. Fixed native requests use dense graph-lifetime arrays;
+zero-element requests retain distinct empty descriptors and need no count domain.
+Names are only numeric slot labels in storage metadata.
+
+World scratch shares the directory's live-count source. Candidate and CCD owners
+share one authoritative admitted count per domain, published as the minimum of
+all corresponding owners' ready prefixes. CCD has no Data storage owner: before
+scratch discovery its count and the population's joint admission are zero. GPU
+execution guards check physical readiness independently. Joined shrink withdraws
+C/D counts before changing mappings; successful service or clean partial budget
+failure republishes only the resulting safe prefixes. Every scratch owner joins
+backing service and retirement. Scratch is never initialized, copied, or compacted
+as episode state: each numerical stage writes its temporaries before reading them.
+
+Discovery graph ownership is released after final recording; final arrays retain
+only their actual storage. The memory report exposes `discovery`, W/C/D
+`transient_storages`, `transient_fixed_bytes`, two startup recording passes and
+zero runtime recaptures. Dense fixed arrays and discovery graph/driver metadata
+are reported separately from the packed backing budget. MJWarp's
+`metadata_signature` and numerical layout checks validate Data; Newton freezes
+all storage, scratch and published scalar descriptors, including absent domains.
+Public borrowed-count validation checks only its canonical count relation; full
+private scratch validation belongs to preparation and backing service. Reading a
+joint selection does not rescan unrelated transient allocations.
+The execution projection owns no second physical state and does not certify readiness.
 
 Newton-to-MuJoCo conversion publishes `SolverMuJoCo.model_mapping`, a passive
 `MuJoCoModelMapping` containing read-only numeric correspondences and reference
@@ -54,7 +89,7 @@ The former `newton.worlds` namespace and Newton's generic allocator, directory a
 
 The `directory` field contains borrowed `InstanceDirectoryData`. `batch_result` contains the outcome and advancement permission. Both remain readable after quarantine or closure; reading metadata does not authorize replay or certify physical readiness. Call `mujoco_worlds_validate(runtime)` before preparing consumers of an open runtime.
 
-`populations` contains passive `MuJoCoWorldPopulation` records with their numeric prototype index, immutable model, authoritative Data, reserved capacities, live count and accessible-prefix counts. Call `mujoco_world_population_validate(population)` before preparing consumers; it rejects retired or replaced descriptors. `mujoco_world_population_ready_capacity(population)` queries the jointly backed world/contact/CCD prefix in world units. It does not certify completion of queued GPU initialization. Applications record ordinary Warp kernels; a separate preparation operation binds their exact captured records to numeric count sources. Borrowed records confer no backing-service or retirement authority.
+`populations` contains passive `MuJoCoWorldPopulation` records with their numeric prototype index, immutable model, authoritative Data, reserved capacities, live count and accessible-prefix counts. Call `mujoco_world_population_validate(population)` before preparing consumers; it rejects retired or replaced descriptors. `mujoco_world_population_ready_capacity(population)` queries the jointly backed world/contact/CCD/transient prefix in world units. It does not certify completion of queued GPU initialization. Applications record ordinary Warp kernels; a separate preparation operation binds their exact captured records to numeric count sources. Borrowed records confer no backing-service or retirement authority.
 
 A handle is `(instance_id, generation)`. A slot is a prototype-local storage position. Compaction may move a handle to another slot without changing its generation. Symbolic names and scene paths must be resolved outside this numeric relation API.
 
@@ -88,9 +123,9 @@ graph = mujoco_worlds_capture(runtime, commands, results, substeps=substeps, ret
 
 Omitting `memory_budget_bytes` selects fixed backing. Both paths use the same instance protocol and native solver program. With virtual backing, reserved capacity is not physically committed capacity. The byte budget includes mapped and reusable spare physical backing. Initial prefixes must be backed before they are admitted.
 
-Preparation validates Model batch parameters, complete Data and numerical work layouts, storage alignment, buffers and launch declarations before publication. Every nonempty batched immutable Model parameter must broadcast from one row: moving Data must not change a world's constants. Newton's composition admits the qualified feature subset listed below; MJWarp validates its numerical array contracts independently.
+Preparation validates Model batch parameters, Data descriptors, canonical typed allocation records, storage alignment, buffers and launch declarations before publication. Every nonempty batched immutable Model parameter must broadcast from one row: moving Data must not change a world's constants. Newton's composition admits the qualified feature subset listed below; MJWarp validates its numerical array contracts independently.
 
-A captured graph retains the exact directory, storage, transfer, native work, binding and explicitly supplied application resources. Preparation callbacks are released afterward. Each runtime prepares one graph; a failed irreversible recording invalidates that preparation rather than silently retrying partially marked nodes.
+A captured graph retains the exact directory, storage, transfer, discovered scratch, binding and explicitly supplied application resources. Callbacks run in both startup recordings and must reproduce their operations without host side effects or callback-owned allocations. They are released afterward. Each runtime publishes one executable; a failed irreversible recording invalidates that preparation rather than silently retrying partially marked nodes.
 
 ## Replace a world
 
@@ -181,8 +216,8 @@ readiness, initialization or retirement guarantees merely by receiving a pointer
 ## Resize backing and retire
 
 For monotone growth, use `mujoco_worlds_grow_backing`. It maps fresh suffixes, then queues
-accessible-count updates, contact/CCD scratch initialization and directory
-admission in that order on the current stream. Subsequent consumers must be ordered after that publication.
+storage-ready updates and contact Data initialization, then the jointly admitted
+C/D counts and directory admission on the current stream. Subsequent consumers must be ordered after that publication.
 The caller excludes concurrent submissions and supplies every consumer stream.
 
 ```python
@@ -204,7 +239,7 @@ completes their world payloads before they become live instances. A clean mappin
 budget failure leaves readiness unchanged and retains any newly mapped headroom
 for a later retry.
 
-The application must exclude new submissions and supply every consumer stream. `mujoco_worlds_resize_backing` joins them, withdraws inadmissible tails, returns all safe ranges before any growth, services world/contact/CCD storage, and publishes only coherent accessible prefixes. It cannot retire a live tail; compact or destroy those instances first.
+The application must exclude new submissions and supply every consumer stream. `mujoco_worlds_resize_backing` joins them, withdraws inadmissible tails, returns all safe ranges before any growth, services world/contact/CCD and transient storage, and publishes only coherent accessible prefixes. It cannot retire a live tail; compact or destroy those instances first.
 
 ```python
 mujoco_worlds_resize_backing(
