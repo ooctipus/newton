@@ -71,8 +71,8 @@ from .kernels import (
     apply_mjc_free_joint_f_to_body_f_kernel,
     apply_mjc_qfrc_kernel,
     build_ref_q_kernel,
-    compute_physical_meaninertia_kernel,
     clear_world_overflow_kernel,
+    compute_physical_meaninertia_kernel,
     convert_mj_coords_to_warp_kernel,
     convert_newton_contacts_to_mjwarp_kernel,
     convert_qfrc_actuator_from_mj_kernel,
@@ -465,6 +465,7 @@ _MJW_BATCHED_MODEL_FIELDS = (
     "geom_solimp",
     "geom_size",
     "geom_rbound",
+    "geom_aabb",
     "geom_pos",
     "geom_quat",
     "geom_friction",
@@ -4509,12 +4510,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 ):
                     raise TypeError(f"replicate does not support solver state {name!r} ({type(source).__name__}).")
 
-        # Keep CPU-only edit-detection snapshots as views. Materialize them only
-        # if a later property notification needs to compare per-world gains.
-        for name in ("_joint_limit_ke_snapshot", "_joint_limit_kd_snapshot", "_solreflimit_mode_snapshot"):
-            snapshot = getattr(result, name)
-            if snapshot is not None:
-                setattr(result, name, np.broadcast_to(snapshot, (world_count, *snapshot.shape)))
         result._total_loop_joint_coords *= world_count
         result._total_loop_joint_dofs *= world_count
         result._viewer = None
@@ -4550,8 +4545,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         Actor identities, task history and policy buffers remain caller-owned.
         Model, state, control and solver array storage must be contiguous; layouts
         are validated before any destination physics is modified.
-        World-map planning and cached CPU joint-limit edit history remain
-        host-side; physical arrays are transferred only on the device.
+        World-map planning remains host-side; physical arrays and joint-limit
+        edit history are transferred only on the device.
         Nonempty transfers withdraw any prepared joint-limit reference entry:
         copied edit history requires ordinary refresh on subsequent notifications.
         No forward pass, reset, model notification or CPU physics conversion is
@@ -4615,31 +4610,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             if not src.is_contiguous or not dst.is_contiguous:
                 raise ValueError(f"World-transfer solver storage must be contiguous: {name}")
             arrays.append((src, dst, None, src.size // source.model.world_count))
-        snapshots = {}
-        for name in ("_joint_limit_ke_snapshot", "_joint_limit_kd_snapshot", "_solreflimit_mode_snapshot"):
-            src, dst = getattr(source, name), getattr(self, name)
-            if src is None and dst is None:
-                continue
-            if src is None or dst is None:
-                raise ValueError(f"Incompatible joint-limit edit history: {name}")
-            if (
-                src.ndim > 1
-                and dst.ndim > 1
-                and src.shape[0] == source.model.world_count
-                and dst.shape[0] == self.model.world_count
-                and not src.flags.writeable
-                and not dst.flags.writeable
-                and src.strides[0] == dst.strides[0] == 0
-                and src.dtype == dst.dtype
-                and np.array_equal(src[0], dst[0])
-            ):
-                # Every row already has the same edit history. Preserve the
-                # compact read-only views until a property update changes it.
-                continue
-            src = src.reshape(source.model.world_count, -1)
-            dst = dst.reshape(self.model.world_count, -1).copy()
-            dst[list(target_worlds)] = src[list(source_worlds)]
-            snapshots[name] = dst
         source_ids = wp.array(source_worlds, dtype=wp.int32, device=self.model.device)
         target_ids = wp.array(target_worlds, dtype=wp.int32, device=self.model.device)
         if source_worlds:
@@ -4653,8 +4623,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             source.mjw_model, source.mjw_data, self.mjw_model, self.mjw_data, source_ids, target_ids
         )
         _copy_world_arrays(arrays, source_ids, target_ids, status)
-        for name, value in snapshots.items():
-            setattr(self, name, value)
         self._replication_pristine = False
         return status
 
@@ -5341,7 +5309,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         m = self.mjw_model
         history_names = ("_joint_limit_ke_snapshot", "_joint_limit_kd_snapshot", "_solreflimit_mode_snapshot")
         history = tuple(
-            None if getattr(self, name) is None else getattr(self, name).reshape(-1).copy() for name in history_names
+            None if getattr(self, name) is None else getattr(self, name).numpy().reshape(-1).copy()
+            for name in history_names
         )
         cache_solref = (
             m.jnt_solref.shape[0] == self.mjw_data.nworld
@@ -5383,7 +5352,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                         getattr(self, name) is None
                         if baseline is None
                         else getattr(self, name) is not None
-                        and np.array_equal(getattr(self, name).reshape(-1), baseline)
+                        and np.array_equal(getattr(self, name).numpy().reshape(-1), baseline)
                     )
                     for name, baseline in zip(history_names, history, strict=True)
                 )
@@ -8419,6 +8388,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 if hfield_src is not None:
                     shape_hfield_offset_np[shape_idx] = hfield_src.min_z * shape_scale_np[shape_idx][2]
             self._shape_hfield_offset = wp.array(shape_hfield_offset_np, dtype=wp.float32, device=model.device)
+            self._replication_offsets["_shape_hfield_offset"] = 0
 
             if self.mjw_model.geom_pos.size:
                 wp.launch(
@@ -8975,11 +8945,14 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         if not self.use_mujoco_cpu:
             self._notify_qpos_saved = wp.empty_like(self.mjw_data.qpos)
             self._notify_physical_meaninertia = wp.empty_like(self.mjw_model.stat.meaninertia)
+            self._replication_offsets["_notify_qpos_saved"] = 0
+            self._replication_offsets["_notify_physical_meaninertia"] = 0
             # Retain the imported gain baseline, then track edits on-device.
             for name in ("_joint_limit_ke_snapshot", "_joint_limit_kd_snapshot", "_solreflimit_mode_snapshot"):
                 snapshot = getattr(self, name)
                 if snapshot is not None:
                     setattr(self, name, wp.array(snapshot, device=self.model.device))
+                    self._replication_offsets[name] = 0
 
         if not (self.has_connect_constraints or self.has_jnt_connect_constraints):
             return
@@ -8989,6 +8962,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self._notify_ref_qd = wp.zeros(self.model.joint_dof_count, dtype=wp.float32, device=device)
         self._notify_ref_body_q = wp.zeros(self.model.body_count, dtype=wp.transform, device=device)
         self._notify_ref_body_qd = wp.zeros(self.model.body_count, dtype=wp.spatial_vector, device=device)
+        for name in ("_notify_ref_q", "_notify_ref_qd", "_notify_ref_body_q", "_notify_ref_body_qd"):
+            self._replication_offsets[name] = 0
 
         if self.has_connect_constraints:
             neq = self.model.mujoco.equality_constraint_count

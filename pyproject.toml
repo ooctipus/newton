@@ -156,7 +156,14 @@ name = "nvidia"
 url = "https://pypi.nvidia.com/"
 explicit = true
 
+[[tool.uv.index]]
+name = "mujoco"
+url = "https://py.mujoco.org/"
+explicit = true
+
 [tool.uv]
+# Current MJWarp uses discrete actuators and efm fields from this nightly.
+override-dependencies = ["mujoco==3.14.1.dev993205559"]
 conflicts = [
     [
         { extra = "torch-cu12" },
@@ -165,9 +172,10 @@ conflicts = [
 ]
 
 [tool.uv.sources]
+mujoco = { index = "mujoco" }
 # The application selects the custom Warp build for prepared execution.
-gpu-components = { git = "https://github.com/ooctipus/gpu-components.git", rev = "338fa9b34f25ca60bc4a3713d79b1115baf68372" }
-mujoco-warp = { git = "https://github.com/ooctipus/mujoco_warp.git", rev = "cdcf95c6effdc053bb5df6394477ffae12c55d77" }
+gpu-components = { git = "https://github.com/ooctipus/gpu-components.git", rev = "ec924032fafbe733931d14c2ddfc9f300049c574" }
+mujoco-warp = { git = "https://github.com/ooctipus/mujoco_warp.git", rev = "34e044b58f1292121e0a906a5e76d96993097341" }
 torch = [
     { index = "pytorch-cu128", extra = "torch-cu12" },
     { index = "pytorch-cu130", extra = "torch-cu13" },

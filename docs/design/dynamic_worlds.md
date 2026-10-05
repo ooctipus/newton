@@ -4,6 +4,8 @@
 
 This API is experimental. It requires CUDA and Python 3.11 or newer. Install Newton's optional `sim` dependencies, including the Apache-2.0 `gpu-components` package. Importing base Newton does not load this optional composition.
 
+The current integration build uses MuJoCo `3.14.1.dev993205559` from `https://py.mujoco.org/`, selected by the repository's uv source and override. MJWarp's current discrete-actuator and `efm` fields are absent from the MuJoCo 3.14.0 release. The application must also select the qualified custom Warp build for recorded counts and allocations.
+
 ## Ownership
 
 The consuming application owns prototype preparation, controls, initialization payloads, observations, reset policy, graph submission and maintenance scheduling. Newton's MuJoCo world operations own the native population composition:
