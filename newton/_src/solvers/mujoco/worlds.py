@@ -474,15 +474,23 @@ def mujoco_worlds_validate(worlds: MuJoCoWorlds) -> None:
         raise RuntimeError("Native population is closed or its backing service failed")
 
 
-def mujoco_world_population_validate(population: MuJoCoWorldPopulation) -> None:
-    """Validate experimental borrowed descriptors before preparing their consumers."""
+def _population_owner(population):
+    """Resolve the live owner of this exact borrowed population identity."""
     owner = population._owner()
     if owner is None or owner.data is None:
         raise RuntimeError("The prototype's population is closed")
-    if owner.view is not population or owner.data is not population.data or owner.model is not population.model:
-        raise ValueError("Borrowed native population descriptors changed")
+    if owner.view is not population:
+        raise ValueError("Borrowed native population identity changed")
     if population.prototype_index != owner.prototype_index or type(population.prototype_index) is not int:
         raise ValueError("Borrowed native prototype identity changed")
+    return owner
+
+
+def mujoco_world_population_validate(population: MuJoCoWorldPopulation) -> None:
+    """Validate experimental borrowed descriptors before preparing their consumers."""
+    owner = _population_owner(population)
+    if owner.data is not population.data or owner.model is not population.model:
+        raise ValueError("Borrowed native population descriptors changed")
     if (
         type(population.world_capacity) is not int
         or population.world_capacity != owner.world_storage.capacity
@@ -507,13 +515,12 @@ def _world_ready_capacity(group):
     if len(group.transient_storages) != 3:
         return 0
     quotas = (1, group.contact_quota, group.ccd_quota)
-    rows = [owner.ready_rows for owner, _ in _storage_domains(group)]
+    domains = _storage_domains(group)
+    rows = [owner.ready_rows for owner, _ in domains]
     for index, retirement in enumerate(group.retirements):
         if retirement.pending:
             rows[index] = min(rows[index], retirement.requested_rows)
-    return min(
-        (count // quotas[domain] for count, (_, domain) in zip(rows, _storage_domains(group), strict=True)), default=0
-    )
+    return min((count // quotas[domain] for count, (_, domain) in zip(rows, domains, strict=True)), default=0)
 
 
 def mujoco_world_population_ready_capacity(population: MuJoCoWorldPopulation) -> int:
@@ -522,9 +529,10 @@ def mujoco_world_population_ready_capacity(population: MuJoCoWorldPopulation) ->
     Follow backing-service stream ordering before using the reported capacity.
     Pending withdrawals conservatively limit the result to their requested prefix.
     This host query certifies neither GPU acceptance nor publication completion.
+    It checks the population lifetime and identity, not borrowed numerical
+    descriptors; validate those before preparing consumers with them.
     """
-    mujoco_world_population_validate(population)
-    return _world_ready_capacity(population._owner())
+    return _world_ready_capacity(_population_owner(population))
 
 
 def _record_physics(group, native_regions):

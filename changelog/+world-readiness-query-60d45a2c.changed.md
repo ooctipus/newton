@@ -1,0 +1,1 @@
+Separate experimental MuJoCo population readiness queries from numerical descriptor validation. Keep calling `mujoco_world_population_validate` before preparing consumers; readiness queries check population identity and lifetime and read the current storage and pending-withdrawal limits.
