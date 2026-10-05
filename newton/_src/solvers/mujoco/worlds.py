@@ -816,7 +816,7 @@ def mujoco_worlds_prepare(
                                 name,
                                 array.shape[1:],
                                 array.dtype,
-                                packed=array.ndim > 1,
+                                packed=axis == "naconmax" or array.ndim > 1,
                                 alignment_bytes=data_alignments.get(name),
                             )
                         )

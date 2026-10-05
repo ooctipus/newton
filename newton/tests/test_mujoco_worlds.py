@@ -3182,6 +3182,19 @@ class TestMuJoCoWorlds(unittest.TestCase):
             graph = None
             try:
                 group = population._populations[0]
+                # Contact columns follow candidate readiness even for scalar/vector elements;
+                # scalar world counters deliberately retain their separate dense layout.
+                contact = field_ops.memory_report(group.contact_storage)
+                self.assertGreater(contact["capacity"], contact["ready_rows"])
+                self.assertEqual(contact["dense_field_bytes"], 0)
+                self.assertLess(contact["mapped_packed_bytes"], contact["virtual_packed_bytes"])
+                for name, dtype in (("contact.dist", wp.float32), ("contact.pos", wp.vec3)):
+                    field = group.contact_storage.fields[name]
+                    self.assertEqual(field.array.ndim, 1)
+                    self.assertEqual(field.array.dtype, dtype)
+                    self.assertIsNotNone(field.packed_offset_bytes)
+                self.assertIsNone(group.world_storage.fields["time"].packed_offset_bytes)
+                del field
                 commands = directory_ops.allocate_commands(2, device=device)
                 results = directory_ops.allocate_results(2, device=device)
                 graph = mujoco_worlds_capture(population, commands, results)
