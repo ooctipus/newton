@@ -32,6 +32,7 @@ def _get_pgs_solve_sparse_kernel(
     contact_triplets: bool = False,
     velocity_limits: bool = False,
     lanes_per_world: int = 32,
+    local_factors: bool = False,
 ) -> wp.Kernel:
     """Build a CUDA sweep over factored articulations and physical free bodies.
 
@@ -68,6 +69,10 @@ def _get_pgs_solve_sparse_kernel(
     the local response/solve owner. Launch with ``ceil(world_count / (64 /
     lanes_per_world))`` tiles and 64 threads per tile. Active-row bitsets and
     independent free-body work retain whole warps.
+
+    ``local_factors`` retains small factor rows in private shared storage,
+    like the local response/solve owner. It expands sparse indices once per
+    call; it neither applies a second factor transform nor stores physical Y.
     """
     M, D, S = int(max_constraints), int(max_world_dofs), int(max_row_dofs)
     F = int(mf_max_constraints)
@@ -83,13 +88,36 @@ def _get_pgs_solve_sparse_kernel(
         raise ValueError("sparse PGS requires 8, 16 or 32 lanes per world")
     if L < 32 and (D > L or F or P or active_rows or contact_triplets):
         raise ValueError("subwarp sparse PGS requires a small complete articulated sweep")
+    if local_factors and (D > 16 or M > 64 or F or P or active_rows or contact_triplets):
+        raise ValueError("local factor storage requires a small complete articulated sweep")
     index_read = (
         f"support.class_dof.data[support.row_class.data[offset + row] * {S} + entry]"
         if use_support_table
         else f"row_dof.data[row_base + row * {S} + entry]"
     )
     W = 64 // L
-    Q = (S + L - 1) // L
+    row_width = D if local_factors else S
+    Q = (row_width + L - 1) // L
+    factor_read = f"row_factor.data[row_base + row * {S} + entry]"
+    sibling_read = f"row_factor.data[row_base + sibling * {S} + entry]"
+    factor_storage = factor_initialize = ""
+    if local_factors:
+        factor_storage = f"""
+    __shared__ float local_factor_storage[{W * M * D}];
+    float* local_factor = local_factor_storage + slot * {M * D};
+"""
+        factor_initialize = f"""
+    for (int i = lane; i < count * {D}; i += {L}) local_factor[i] = 0.0f;
+    __syncwarp(MASK);
+    for (int i = lane; i < count * {S}; i += {L}) {{
+        const int row = i / {S}, entry = i % {S};
+        const int index = {index_read};
+        if (index >= 0) local_factor[row * {D} + index] = {factor_read};
+    }}
+"""
+        index_read = "entry"
+        factor_read = f"local_factor[row * {D} + entry]"
+        sibling_read = f"local_factor[sibling * {D} + entry]"
     contact_type = int(PGS_CONSTRAINT_TYPE_CONTACT)
     friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
     limit_type = int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
@@ -330,6 +358,7 @@ def _get_pgs_solve_sparse_kernel(
     unsigned char* type = type_storage + slot * {M};
 {mf_storage}
 {active_storage}
+{factor_storage}
 
     for (int d = lane; d < {D}; d += {L}) delta[d] = 0.0f;
     for (int i = lane; i < count; i += {L}) {{
@@ -339,6 +368,7 @@ def _get_pgs_solve_sparse_kernel(
         type[i] = static_cast<unsigned char>(world_row_type.data[offset + i]);
     }}
 {mf_initialize}
+{factor_initialize}
     __syncwarp(MASK);
 {active_initialize}
 """
@@ -360,8 +390,8 @@ def _get_pgs_solve_sparse_kernel(
             #pragma unroll
             for (int q = 0; q < {Q}; ++q) {{
                 const int entry = lane + q * {L};
-                const int index = entry < {S} ? {index_read} : -1;
-                const float response = index >= 0 ? row_factor.data[row_base + row * {S} + entry] : 0.0f;
+                const int index = entry < {row_width} ? {index_read} : -1;
+                const float response = index >= 0 ? {factor_read} : 0.0f;
                 indices[q] = index;
                 responses[q] = response;
                 if (index >= 0) dot += response * delta[index];
@@ -418,10 +448,10 @@ def _get_pgs_solve_sparse_kernel(
             #pragma unroll
             for (int q = 0; q < {Q}; ++q) {{
                 const int entry = lane + q * {L};
-                const int index = entry < {S} ? {index_read} : -1;
-                const float value = index >= 0 ? row_factor.data[row_base + row * {S} + entry] : 0.0f;
+                const int index = entry < {row_width} ? {index_read} : -1;
+                const float value = index >= 0 ? {factor_read} : 0.0f;
                 const float sibling_value = friction && index >= 0
-                    ? row_factor.data[row_base + sibling * {S} + entry] : 0.0f;
+                    ? {sibling_read} : 0.0f;
                 float response = value;
                 float sibling_response = sibling_value;
                 if ({str(bool(P)).lower()} && index >= 0 && world_free_dof_mask.data[world * {D} + index] != 0) {{
@@ -641,6 +671,8 @@ def _get_pgs_solve_sparse_kernel(
         suffix += "_velocity_limits"
     if L != 32:
         suffix += f"_lanes{L}"
+    if local_factors:
+        suffix += "_local_factors"
     solve.__name__ = f"pgs_solve_sparse_{M}_{D}_{S}_{F}_{P}{suffix}"
     solve.__qualname__ = solve.__name__
     return wp.kernel(enable_backward=False, module="unique")(solve)

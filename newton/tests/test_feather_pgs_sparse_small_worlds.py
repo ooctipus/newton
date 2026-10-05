@@ -18,9 +18,9 @@ class TestSparseSmallWorlds(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_packed_worlds_preserve_physical_sweeps_and_replay(self):
         """Keep signed clamps and contacts isolated through empty/regrowing graph replay."""
-        for lanes in (8, 16):
+        for lanes, local_factors in ((8, False), (16, False), (8, True), (16, True)):
             for table in (False, True):
-                with self.subTest(lanes=lanes, table=table):
+                with self.subTest(lanes=lanes, table=table, local_factors=local_factors):
                     data, physical, factor = velocity._solve_data(-1.0, contact=True, iterations=8, omega=0.4)
                     expected, impulses = velocity._physical_sweep(*physical, iterations=8, omega=0.4)
                     count = len(impulses)
@@ -40,7 +40,7 @@ class TestSparseSmallWorlds(unittest.TestCase):
                     data["support_class_dof"] = indices[None]
                     data["reference_factor_delta"] = np.zeros((worlds, lanes), np.float32)
 
-                    def factory(capacity, dofs, width, *, _table=table, _lanes=lanes, **_kwargs):
+                    def factory(capacity, dofs, width, *, _table=table, _lanes=lanes, _local=local_factors, **_kwargs):
                         return _get_pgs_solve_sparse_kernel(
                             capacity,
                             dofs,
@@ -48,6 +48,7 @@ class TestSparseSmallWorlds(unittest.TestCase):
                             use_support_table=_table,
                             velocity_limits=True,
                             lanes_per_world=_lanes,
+                            local_factors=_local,
                         )
 
                     with mock.patch.object(fixtures, "factory", factory):

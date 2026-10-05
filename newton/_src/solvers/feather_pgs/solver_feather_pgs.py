@@ -5363,6 +5363,12 @@ class SolverFeatherPGS(SolverBase):
             lanes = 8 if self.max_world_dofs <= 8 else 16
             if solve_shared_bytes * (32 // lanes) <= shared_limit:
                 self._sparse_solve_lanes = lanes
+        local_factor_bytes = 4 * (64 // self._sparse_solve_lanes) * self.dense_max_constraints * self.max_world_dofs
+        self._sparse_local_factors = bool(
+            self._sparse_solve_lanes < 32
+            and os.environ.get("FEATHER_PGS_SPARSE_LOCAL_FACTORS", "1") != "0"
+            and solve_shared_bytes * (32 // self._sparse_solve_lanes) + local_factor_bytes <= shared_limit
+        )
         self._pgs_solve_sparse_kernel = _get_pgs_solve_sparse_kernel(
             self.dense_max_constraints,
             self.max_world_dofs,
@@ -5374,6 +5380,7 @@ class SolverFeatherPGS(SolverBase):
             contact_triplets=self._sparse_contact_triplets,
             velocity_limits=self._sparse_velocity_limits,
             lanes_per_world=self._sparse_solve_lanes,
+            local_factors=self._sparse_local_factors,
         )
 
     def _build_body_maps(self, model):

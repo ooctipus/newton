@@ -513,8 +513,13 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
         """Preserve linked friction, seeded retraction and delayed contact updates."""
         for lanes in (8, 16):
             self._check_cuda_sparse_sweeps(active_rows=False, use_support_table=True, lanes_per_world=lanes)
+            self._check_cuda_sparse_sweeps(
+                active_rows=False, use_support_table=True, lanes_per_world=lanes, local_factors=True
+            )
 
-    def _check_cuda_sparse_sweeps(self, *, active_rows, use_support_table=False, lanes_per_world=32):
+    def _check_cuda_sparse_sweeps(
+        self, *, active_rows, use_support_table=False, lanes_per_world=32, local_factors=False
+    ):
         """Compare each schedule with its own physical recurrence without weakening the exact control."""
         device = wp.get_device("cuda:0")
         cases = [(43, 18, None), (75, 39, None)]
@@ -608,6 +613,7 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                         active_rows=active_rows,
                         use_support_table=use_support_table,
                         lanes_per_world=lanes_per_world,
+                        local_factors=local_factors,
                     )
                     launch_args = {
                         "dim": [2],
@@ -657,7 +663,12 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                         )
                     if use_support_table:
                         packed_kernel = _get_pgs_solve_sparse_kernel(
-                            capacity, dofs, support, active_rows=active_rows, lanes_per_world=lanes_per_world
+                            capacity,
+                            dofs,
+                            support,
+                            active_rows=active_rows,
+                            lanes_per_world=lanes_per_world,
+                            local_factors=local_factors,
                         )
                         wp.copy(actual_impulses, initial_impulses)
                         launch_args["inputs"][5] = wp.array(row_dof, device=device)
