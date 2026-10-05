@@ -17,6 +17,7 @@ from .kernels import (
 from .sparse_mass_matrix import _SparseRowSupport
 
 _SPARSE_CONTACT_METRIC_CACHE_SIZE = 12
+_SPARSE_LOCAL_WORKSPACE_BYTES = 8 * 1024
 
 
 @cache

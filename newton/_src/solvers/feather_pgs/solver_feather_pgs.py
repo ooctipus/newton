@@ -245,7 +245,11 @@ from .sparse_mass_matrix import (
     _SparseRowSupportPlan,
     solve_sparse_mass_matrix,
 )
-from .sparse_pgs import _SPARSE_CONTACT_METRIC_CACHE_SIZE, _get_pgs_solve_sparse_kernel
+from .sparse_pgs import (
+    _SPARSE_CONTACT_METRIC_CACHE_SIZE,
+    _SPARSE_LOCAL_WORKSPACE_BYTES,
+    _get_pgs_solve_sparse_kernel,
+)
 
 
 def _reject_retired_experiments():
@@ -5364,10 +5368,13 @@ class SolverFeatherPGS(SolverBase):
             if solve_shared_bytes * (32 // lanes) <= shared_limit:
                 self._sparse_solve_lanes = lanes
         local_factor_bytes = 4 * (64 // self._sparse_solve_lanes) * self.dense_max_constraints * self.max_world_dofs
+        # Large resident workspaces regressed whole-step timing in measured
+        # small systems. Keep the global-row consumer when the cache is large.
         self._sparse_local_factors = bool(
             self._sparse_solve_lanes < 32
             and os.environ.get("FEATHER_PGS_SPARSE_LOCAL_FACTORS", "1") != "0"
-            and solve_shared_bytes * (32 // self._sparse_solve_lanes) + local_factor_bytes <= shared_limit
+            and solve_shared_bytes * (32 // self._sparse_solve_lanes) + local_factor_bytes
+            <= min(shared_limit, _SPARSE_LOCAL_WORKSPACE_BYTES)
         )
         self._pgs_solve_sparse_kernel = _get_pgs_solve_sparse_kernel(
             self.dense_max_constraints,
