@@ -1175,13 +1175,14 @@ def mujoco_worlds_capture(
                     def invalidate_contacts(group):
                         graph = graph_ops.current_capture(device=worlds.device)
                         start = wp.capture_launch_count(graph)
-                        wp.capture_if(
-                            worlds._directory.batch_result.consumed, lambda: mjw.invalidate_contact_cache(group.data)
-                        )
+                        mjw.invalidate_contact_cache(group.data)
                         invalidation_ranges.append((start, wp.capture_launch_count(graph)))
 
-                    graph_ops.capture_parallel(
-                        lambda group=group: invalidate_contacts(group) for group in worlds._populations
+                    wp.capture_if(
+                        worlds._directory.batch_result.consumed,
+                        lambda: graph_ops.capture_parallel(
+                            lambda group=group: invalidate_contacts(group) for group in worlds._populations
+                        ),
                     )
                     # Every updater must finish and be checked before any prototype
                     # enters its conditional program, including native solver loops.

@@ -2189,6 +2189,7 @@ class PopulationRecorderTests(unittest.TestCase):
         self.adopted = []
         self.invalidations = []
         self.contact_invalidations = []
+        self.conditional_recordings = []
         condition_stack = []
 
         def native_bind(owner, graph, records):
@@ -2206,6 +2207,7 @@ class PopulationRecorderTests(unittest.TestCase):
             graph._preparation_failed = True
 
         def capture_if(condition, on_true):
+            self.conditional_recordings.append(condition)
             if on_true.__name__ == "record_lifecycle":
                 if callbacks.get("validate") is not None:
                     callbacks["validate"](
@@ -2225,6 +2227,7 @@ class PopulationRecorderTests(unittest.TestCase):
             self.records.clear()
             self.memory_operations.clear()
             self.contact_invalidations.clear()
+            self.conditional_recordings.clear()
             yield SimpleNamespace(graph=self.graph)
 
         with ExitStack() as stack:
@@ -2268,11 +2271,14 @@ class PopulationRecorderTests(unittest.TestCase):
     def test_consumed_lifecycle_invalidates_contacts_independently_of_physics_permit(self):
         """Replaced placement invalidates contact indices even for reset-only and failed batches."""
         group, _, _ = self.group()
-        self._capture(group, permit=wp.zeros(1, dtype=int, device="cpu"))
-        self.assertEqual(len(self.contact_invalidations), 1)
-        data, condition = self.contact_invalidations[0]
-        self.assertIs(data, group.data)
-        self.assertIs(condition, self.population._directory.batch_result.consumed)
+        other, _, _ = self.group()
+        self._capture(group, extra_groups=(other,), permit=wp.zeros(1, dtype=int, device="cpu"))
+        consumed = self.population._directory.batch_result.consumed
+        self.assertEqual(len(self.contact_invalidations), 2)
+        for (data, condition), owner in zip(self.contact_invalidations, (group, other), strict=True):
+            self.assertIs(data, owner.data)
+            self.assertIs(condition, consumed)
+        self.assertEqual(sum(condition is consumed for condition in self.conditional_recordings), 1)
 
     def test_later_application_binding_cannot_mutate_an_already_bound_population(self):
         """Revalidate every population after the final callback compiler and before graph publication."""
@@ -3775,6 +3781,28 @@ class TestMuJoCoWorlds(unittest.TestCase):
                         self.assertLess(group.data.tree_asleep.numpy()[0, 0], 0)
                     else:
                         np.testing.assert_array_equal(group.data.tree_asleep.numpy()[0, :3], np.arange(3))
+                # Equal-sequence reset-only replay preserves the prior contact cache.
+                # Markers are never consumed by physics: advancement remains disabled.
+                permit.zero_()
+                for view in population.populations:
+                    view.data.nacon.fill_(7)
+                    view.data.ncollision.fill_(9)
+                wp.capture_launch(graph)
+                self.assertEqual(population.batch_result.consumed.numpy()[0], 0)
+                for view in population.populations:
+                    np.testing.assert_array_equal(view.data.nacon.numpy(), [7])
+                    np.testing.assert_array_equal(view.data.ncollision.numpy(), [9])
+                # Remove the large prototype's last world. Its disabled updater
+                # must not prevent invalidating stale placement-dependent counts.
+                commands.sequence.fill_(3)
+                commands.operation.fill_(_DESTROY)
+                commands.generation.fill_(int(d.generation.numpy()[victim]))
+                wp.capture_launch(graph)
+                self.assertEqual(results.status.numpy()[0], _OK)
+                np.testing.assert_array_equal(d.live_count.numpy(), [1, 0])
+                for view in population.populations:
+                    np.testing.assert_array_equal(view.data.nacon.numpy(), [0])
+                    np.testing.assert_array_equal(view.data.ncollision.numpy(), [0])
             except BaseException as error:
                 traceback.clear_frames(error.__traceback__)
                 raise

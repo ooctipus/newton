@@ -1,0 +1,1 @@
+Evaluate consumed-batch contact invalidation once across prepared MuJoCo populations while preserving parallel native clears, unchanged caches on repeated batches, and invalidation after a prototype loses its last world.
