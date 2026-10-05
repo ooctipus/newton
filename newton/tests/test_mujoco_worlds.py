@@ -2026,6 +2026,22 @@ class PopulationRecorderTests(unittest.TestCase):
         self.assertEqual(mujoco_world_population_ready_capacity(view), 4)
         group.transient_storages[2].ready_rows = 8
         self.assertEqual(mujoco_world_population_ready_capacity(view), 2, "Readiness must come from its existing owner")
+        group.retirements = tuple(
+            SimpleNamespace(pending=domain == 2, requested_rows=4) for _, domain in native._storage_domains(group)
+        )
+        self.assertEqual(mujoco_world_population_ready_capacity(view), 1, "Pending withdrawal limits host readiness")
+        group.retirements[-1].pending = False
+        self.assertEqual(mujoco_world_population_ready_capacity(view), 2)
+        with self.assertRaises(ValueError):
+            mujoco_world_population_ready_capacity(replace(view))
+        foreign, _, _ = self.group()
+        owner = view._owner
+        view._owner = weakref.ref(foreign)
+        try:
+            with self.assertRaises(ValueError):
+                mujoco_world_population_ready_capacity(view)
+        finally:
+            view._owner = owner
         for name in (
             "world_storage",
             "contact_storage",
@@ -2047,6 +2063,13 @@ class PopulationRecorderTests(unittest.TestCase):
         group.data = None
         with self.assertRaisesRegex(RuntimeError, "closed"):
             mujoco_world_population_validate(view)
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            mujoco_world_population_ready_capacity(view)
+        del group
+        gc.collect()
+        self.assertIsNone(view._owner())
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            mujoco_world_population_ready_capacity(view)
 
     def test_absent_ccd_scratch_still_freezes_the_published_scalar_descriptor(self):
         """Reject same-object CCD count mutations even when no CCD array owns the scalar."""
@@ -2088,6 +2111,12 @@ class PopulationRecorderTests(unittest.TestCase):
         group, _, _ = self.group()
         group.storage_signature = native._binding_signature(group)[0:2]
         population = MuJoCoWorlds(device=wp.get_device("cpu"), _directory=object(), _populations=[group])
+        with patch.object(
+            native, "_population_count_signature", side_effect=AssertionError("count descriptors inspected")
+        ):
+            self.assertEqual(mujoco_world_population_ready_capacity(group.view), 4)
+            with self.assertRaisesRegex(AssertionError, "count descriptors inspected"):
+                mujoco_world_population_validate(group.view)
         with patch.object(native, "_binding_signature", side_effect=AssertionError("private storage inspected")):
             mujoco_world_population_validate(group.view)
             for service in (mujoco_worlds_grow_backing, mujoco_worlds_resize_backing):
@@ -2117,6 +2146,11 @@ class PopulationRecorderTests(unittest.TestCase):
                 setattr(view, name, value)
                 with self.assertRaises(ValueError):
                     mujoco_world_population_validate(view)
+                if name == "prototype_index":
+                    with self.assertRaises(ValueError):
+                        mujoco_world_population_ready_capacity(view)
+                else:
+                    self.assertEqual(mujoco_world_population_ready_capacity(view), 4)
                 setattr(view, name, original)
                 mujoco_world_population_validate(view)
         group.storage_signature = native._binding_signature(group)[0:2]
@@ -2126,6 +2160,7 @@ class PopulationRecorderTests(unittest.TestCase):
             count.shape = (1, 1)
             with self.assertRaisesRegex(ValueError, "count descriptors changed"):
                 mujoco_world_population_validate(view)
+            self.assertEqual(mujoco_world_population_ready_capacity(view), 4)
         finally:
             count.shape = original_shape
         mujoco_world_population_validate(view)
