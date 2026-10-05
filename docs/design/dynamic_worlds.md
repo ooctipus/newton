@@ -241,6 +241,36 @@ completes their world payloads before they become live instances. A clean mappin
 budget failure leaves readiness unchanged and retains any newly mapped headroom
 for a later retry.
 
+To shrink while surviving worlds keep running, first withdraw the unused tail,
+then poll for its reclamation. Both calls are experimental:
+
+```python
+from newton.solvers import mujoco_worlds_withdraw_backing, mujoco_worlds_reclaim_backing
+
+mujoco_worlds_withdraw_backing(runtime, smaller_world_ready_capacities, streams=consumer_streams)
+# Continue submitting the existing graph on these streams over the surviving worlds.
+finished = mujoco_worlds_reclaim_backing(runtime)  # False means poll again later; never busy-wait.
+```
+
+Withdrawal enqueues the reader dependencies and validates that no live world lies
+in a removed tail. It then lowers directory admission, the candidate/CCD work
+counts and every persistent/transient storage prefix. Supplied streams wait for
+the complete publication on the GPU. The call does not wait on the CPU or read
+counts back. Exclude concurrent submissions while establishing these dependencies;
+new streams must wait for the service stream before accessing the population.
+
+Reclamation polls completion events and unmaps only completed, accepted tails.
+Surviving-prefix work can continue while those driver calls run. This avoids an
+explicit host wait for readers; CUDA unmapping still takes host time and may
+stall GPU work. Retired handles stay in the shared pool. Only one withdrawal
+batch can be pending, and growth/resizing wait until it resolves. Rejected
+withdrawals preserve storage readiness and disable further physics/service.
+A partial driver failure retains the remaining ranges for reclamation retry.
+
+`mujoco_worlds_cancel_backing_retirement(runtime)` polls the same dependencies but
+retains the mappings. It does not restore withdrawn readiness; later growth can
+republish retained capacity. Cancellation is rejected after any unmapping starts.
+
 The application must exclude new submissions and supply every consumer stream. `mujoco_worlds_resize_backing` joins them, withdraws inadmissible tails, returns all safe ranges before any growth, services world/contact/CCD and transient storage, and publishes only coherent accessible prefixes. It cannot retire a live tail; compact or destroy those instances first.
 
 ```python

@@ -46,13 +46,16 @@ from newton.solvers import (
     MuJoCoWorlds,
     mujoco_world_population_ready_capacity,
     mujoco_world_population_validate,
+    mujoco_worlds_cancel_backing_retirement,
     mujoco_worlds_capture,
     mujoco_worlds_close,
     mujoco_worlds_grow_backing,
     mujoco_worlds_memory_report,
     mujoco_worlds_prepare,
+    mujoco_worlds_reclaim_backing,
     mujoco_worlds_resize_backing,
     mujoco_worlds_validate,
+    mujoco_worlds_withdraw_backing,
 )
 
 _CREATE, _REPLACE, _DESTROY = (
@@ -858,6 +861,299 @@ assert 'worlds' not in newton.__all__
         population._populations = (group,)
         return population, group
 
+    def test_deferred_withdrawal_latches_each_receipt_before_releasing_consumers(self):
+        """Order the complete reader cut, directory receipt and W/C/D receipts without a host wait."""
+        population, group = self._growth_fixture(transient=True)
+        current = Mock(spec=wp.Stream, device="cpu", cuda_stream=11)
+        reader = Mock(spec=wp.Stream, device="cpu", cuda_stream=12)
+        publication = population._retirement_publication = SimpleNamespace(cuda_event=21)
+        receipt = object()
+        events = []
+        group.retirements = tuple(
+            SimpleNamespace(storage=owner, pending=False, requested_rows=0, reclaim_started=False, status=object())
+            for owner, _ in native._storage_domains(group)
+        )
+
+        def withdraw(retirement, target, *, streams, prerequisite):
+            self.assertEqual(streams, (current,))
+            self.assertIs(prerequisite, receipt)
+            retirement.pending, retirement.requested_rows = True, target
+            events.append(("withdraw", retirement.storage.name, target))
+            return retirement.status
+
+        with (
+            patch.object(native.wp, "get_stream", return_value=current),
+            patch.object(
+                native.wp,
+                "launch",
+                side_effect=lambda kernel, dim, args, **kw: events.append(
+                    ("counts" if kernel is native._withdraw_native_counts else "guard", args[0])
+                ),
+            ),
+            patch.object(native.wp, "synchronize_stream", side_effect=AssertionError("Withdrawal blocked the host")),
+            patch.object(backing_ops, "maintenance", side_effect=AssertionError("Withdrawal joined backing readers")),
+            patch.object(
+                backing_ops,
+                "record_event",
+                side_effect=lambda owner, event, *, stream: events.append(("record", stream, event)),
+            ),
+            patch.object(
+                backing_ops,
+                "wait_event",
+                side_effect=lambda owner, stream, event: events.append(("wait", stream, event)),
+            ),
+            patch.object(field_ops, "withdraw_backing", side_effect=withdraw),
+            patch.object(directory_ops, "withdraw_admissible_slots_async", return_value=receipt) as directory,
+        ):
+            mujoco_worlds_withdraw_backing(population, (0,), streams=(current, reader))
+        directory.assert_called_once_with(population._directory, (0,))
+        self.assertEqual(events[:2], [("record", 12, 21), ("wait", 11, 21)])
+        self.assertEqual(events[2], ("guard", receipt))
+        self.assertEqual(events[3], ("counts", receipt))
+        for offset, retirement in enumerate(group.retirements):
+            self.assertEqual(events[4 + 2 * offset], ("withdraw", retirement.storage.name, 0))
+            self.assertEqual(events[5 + 2 * offset], ("guard", retirement.status))
+        self.assertEqual(events[-2:], [("record", 11, publication.cuda_event), ("wait", 12, publication.cuda_event)])
+        self.assertTrue(population._retirement_pending)
+        self.assertEqual(
+            native._world_ready_capacity(group), 0, "Pending readiness must not expose the old larger host limit"
+        )
+        self.assertEqual(group.world_storage.ready_rows, 1, "The field owner updates host acceptance only when polled")
+
+    def test_candidate_and_ccd_withdrawal_follows_directory_acceptance(self):
+        """Lower shared transient protection only after the directory accepts the smaller world prefix."""
+        status = wp.zeros(1, dtype=int, device="cpu")
+        contacts = wp.full(1, 12, dtype=int, device="cpu")
+        ccd = wp.full(1, 18, dtype=int, device="cpu")
+        wp.launch(native._withdraw_native_counts, 1, [status, contacts, ccd, 4, 6], device="cpu")
+        np.testing.assert_array_equal(contacts.numpy(), [4])
+        np.testing.assert_array_equal(ccd.numpy(), [6])
+        status.fill_(int(InstanceStatus.INVALID))
+        wp.launch(native._withdraw_native_counts, 1, [status, contacts, ccd, 0, 0], device="cpu")
+        np.testing.assert_array_equal(contacts.numpy(), [4])
+        np.testing.assert_array_equal(ccd.numpy(), [6])
+
+    def test_pending_retirement_excludes_capacity_changes_and_capture(self):
+        """Keep one coherent retirement batch authoritative until reclamation or cancellation resolves it."""
+        population, _ = self._growth_fixture()
+        population._retirement_pending = True
+        stream = Mock(spec=wp.Stream, device="cpu", cuda_stream=11)
+        for operation in (
+            lambda: mujoco_worlds_grow_backing(population, (2,), streams=(stream,)),
+            lambda: mujoco_worlds_resize_backing(population, (1,), streams=(stream,)),
+            lambda: mujoco_worlds_withdraw_backing(population, (0,), streams=(stream,)),
+            lambda: mujoco_worlds_capture(population, None, None),
+        ):
+            with self.subTest(operation=operation), self.assertRaisesRegex(RuntimeError, "pending backing retirement"):
+                operation()
+
+    def test_retirement_services_reject_capture_on_another_stream(self):
+        """Reject physical service during any device capture before mutating withdrawal state."""
+        population, _ = self._growth_fixture()
+        stream = Mock(spec=wp.Stream, device="cpu", cuda_stream=11)
+        with (
+            patch.object(native.wp, "ScopedDevice", side_effect=lambda device: nullcontext()),
+            patch.object(native.wp, "get_device", return_value=SimpleNamespace(is_capturing=True)),
+        ):
+            for operation in (
+                lambda: mujoco_worlds_resize_backing(population, (1,), streams=(stream,)),
+                lambda: mujoco_worlds_withdraw_backing(population, (0,), streams=(stream,)),
+                lambda: mujoco_worlds_reclaim_backing(population),
+                lambda: mujoco_worlds_cancel_backing_retirement(population),
+            ):
+                with self.subTest(operation=operation), self.assertRaisesRegex(RuntimeError, "outside graph capture"):
+                    operation()
+        self.assertFalse(population._retirement_pending)
+
+    def test_reclamation_polls_every_field_and_preserves_retryable_unmap_failures(self):
+        """Reclaim completed tails independently while retaining unfinished or partially unmapped plans."""
+        population, group = self._growth_fixture(transient=True)
+        group.retirements = tuple(SimpleNamespace(pending=True, reclaim_started=False) for _ in range(5))
+        population._retirement_pending = True
+        population._retirement_streams = (object(),)
+        with (
+            patch.object(field_ops, "reclaim_backing", return_value=False) as operation,
+            patch.object(native.wp, "synchronize_stream", side_effect=AssertionError("Polling waited")),
+        ):
+            self.assertFalse(mujoco_worlds_reclaim_backing(population))
+        self.assertEqual(operation.call_count, 5)
+        failure = RuntimeError("retryable tail unmap")
+
+        def partially_complete(retirement):
+            retirement.reclaim_started = True
+            if retirement is group.retirements[1]:
+                raise failure
+            retirement.pending = False
+            return True
+
+        with patch.object(field_ops, "reclaim_backing", side_effect=partially_complete):
+            with self.assertRaises(RuntimeError) as caught:
+                mujoco_worlds_reclaim_backing(population)
+        self.assertIs(caught.exception, failure)
+        self.assertEqual([item.pending for item in group.retirements], [False, True, False, False, False])
+        self.assertTrue(population._retirement_pending)
+        self.assertFalse(population._service_failed, "A withdrawn tail failure must not disable surviving-prefix work")
+        with patch.object(field_ops, "cancel_retirement", side_effect=AssertionError("Partial cancellation")):
+            with self.assertRaisesRegex(RuntimeError, "any field reclamation"):
+                mujoco_worlds_cancel_backing_retirement(population)
+        with patch.object(field_ops, "reclaim_backing", side_effect=lambda plan: setattr(plan, "pending", False)):
+            self.assertTrue(mujoco_worlds_reclaim_backing(population))
+        self.assertFalse(population._retirement_pending)
+        self.assertEqual(population._retirement_streams, ())
+
+    def test_retirement_rejection_resolves_receipts_and_blocks_future_service(self):
+        """Drain every rejected receipt and preserve native quarantine after GPU validation fails."""
+        population, group = self._growth_fixture(transient=True)
+        group.retirements = tuple(SimpleNamespace(pending=True, reclaim_started=False) for _ in range(5))
+        population._retirement_pending = True
+
+        def rejected(plan):
+            plan.pending = False
+            raise RuntimeError("GPU rejected field withdrawal")
+
+        with patch.object(field_ops, "reclaim_backing", side_effect=rejected):
+            with self.assertRaises(BaseExceptionGroup) as caught:
+                mujoco_worlds_reclaim_backing(population)
+        self.assertEqual(len(caught.exception.exceptions), 5)
+        self.assertFalse(population._retirement_pending)
+        self.assertTrue(population._service_failed)
+
+    def test_withdrawal_preserves_submission_and_quarantine_failures(self):
+        """Retain a failed dependency cut and both original and quarantine errors."""
+        population, group = self._growth_fixture(transient=True)
+        current = Mock(spec=wp.Stream, device="cpu", cuda_stream=11)
+        population._retirement_publication = object()
+        group.retirements = tuple(SimpleNamespace(pending=False) for _ in range(5))
+        original, cleanup = RuntimeError("field submission failed"), KeyboardInterrupt("quarantine failed")
+        population._healthy.fill_.side_effect = cleanup
+        with (
+            patch.object(native.wp, "get_stream", return_value=current),
+            patch.object(native.wp, "launch"),
+            patch.object(native.wp, "synchronize_stream", side_effect=AssertionError("Failed withdrawal waited")),
+            patch.object(directory_ops, "withdraw_admissible_slots_async", return_value=object()),
+            patch.object(field_ops, "withdraw_backing", side_effect=original),
+        ):
+            with self.assertRaises(BaseExceptionGroup) as caught:
+                mujoco_worlds_withdraw_backing(population, (0,), streams=(current,))
+        self.assertEqual(caught.exception.exceptions, (original, cleanup))
+        self.assertTrue(population._retirement_pending)
+        self.assertTrue(population._service_failed)
+        self.assertIn(current, population._retirement_streams)
+        current.record_event.assert_not_called()
+
+    def test_failed_withdrawal_publishes_quarantine_before_returning(self):
+        """A failed final dependency cut cannot leave an existing graph ahead of the failure latch."""
+        population, group = self._growth_fixture(transient=True)
+        current = Mock(spec=wp.Stream, device="cpu", cuda_stream=11)
+        population._retirement_publication = object()
+        group.retirements = tuple(SimpleNamespace(pending=False) for _ in range(5))
+        failure = RuntimeError("field submission failed")
+        events = []
+        population._healthy.fill_.side_effect = lambda value: events.append(("health", value))
+        with (
+            patch.object(native.wp, "get_stream", return_value=current),
+            patch.object(native.wp, "launch"),
+            patch.object(native.wp, "synchronize_stream", side_effect=AssertionError("Unchecked completion")),
+            patch.object(
+                backing_ops,
+                "maintenance",
+                side_effect=lambda owner, *, streams: (events.append(("wait", streams)), nullcontext())[1],
+            ),
+            patch.object(directory_ops, "withdraw_admissible_slots_async", return_value=object()),
+            patch.object(field_ops, "withdraw_backing", side_effect=failure),
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                mujoco_worlds_withdraw_backing(population, (0,), streams=(current,))
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(events, [("health", 0), ("wait", (current.cuda_stream,))])
+        self.assertTrue(population._retirement_pending)
+        self.assertTrue(population._service_failed)
+
+    def test_native_dependency_errors_fail_closed_and_retain_pending_owners(self):
+        """Driver error codes at either dependency edge must never become successful retirement proofs."""
+        for api, occurrence, quarantine_fails in (
+            ("cuEventRecord", 1, False),
+            ("cuEventRecord", 2, False),
+            ("cuStreamWaitEvent", 1, False),
+            ("cuStreamWaitEvent", 2, False),
+            ("cuEventRecord", 1, True),
+        ):
+            with self.subTest(api=api, occurrence=occurrence, quarantine_fails=quarantine_fails):
+                calls, counts = [], {}
+
+                def submit(name, *args, scenario=(api, occurrence, quarantine_fails), calls=calls, counts=counts):
+                    api, occurrence, quarantine_fails = scenario
+                    calls.append((name, args))
+                    counts[name] = counts.get(name, 0) + 1
+                    fail = name == api and counts[name] == occurrence
+                    return 700 if fail or (name == "cuStreamSynchronize" and quarantine_fails) else 0
+
+                # Fault the driver loader, preserving the production preparation,
+                # context checks, event operations and return-code interpretation.
+                driver = SimpleNamespace(
+                    cuInit=lambda flags: 0,
+                    cuCtxGetCurrent=lambda out: setattr(out._obj, "value", 99) or 0,
+                    cuCtxGetId=lambda context, out: setattr(out._obj, "value", 1) or 0,
+                    cuCtxGetDevice=lambda out: setattr(out._obj, "value", 0) or 0,
+                    cuDeviceGet=lambda out, ordinal: setattr(out._obj, "value", ordinal) or 0,
+                    cuDeviceGetUuid_v2=lambda out, device: 0,
+                    cuMemGetAllocationGranularity=lambda out, prop, flags: setattr(out._obj, "value", 4096) or 0,
+                    cuStreamGetCtx=lambda stream, out: setattr(out._obj, "value", 99) or 0,
+                    cuStreamIsCapturing=lambda stream, out: setattr(out._obj, "value", 0) or 0,
+                    cuGetErrorName=lambda result, out: setattr(out._obj, "value", b"INJECTED_FAILURE") or 0,
+                    cuEventRecord=lambda *args: submit("cuEventRecord", *args),
+                    cuStreamWaitEvent=lambda *args: submit("cuStreamWaitEvent", *args),
+                    cuStreamSynchronize=lambda *args: submit("cuStreamSynchronize", *args),
+                )
+                population, group = self._growth_fixture(transient=True)
+                with patch.object(backing_ops, "_load_driver", return_value=driver):
+                    population._backing = backing_ops.prepare(4096)
+                population._retirement_publication = SimpleNamespace(cuda_event=21)
+                current = Mock(spec=wp.Stream, device="cpu", cuda_stream=11)
+                reader = Mock(spec=wp.Stream, device="cpu", cuda_stream=12)
+                group.retirements = tuple(SimpleNamespace(pending=False) for _ in range(5))
+                with (
+                    patch.object(native.wp, "get_stream", return_value=current),
+                    patch.object(native.wp, "launch"),
+                    patch.object(native.wp, "synchronize_stream", side_effect=AssertionError("Unchecked completion")),
+                    patch.object(directory_ops, "withdraw_admissible_slots_async", return_value=object()),
+                    patch.object(field_ops, "withdraw_backing", return_value=object()),
+                ):
+                    if quarantine_fails:
+                        with self.assertRaises(BaseExceptionGroup) as caught:
+                            mujoco_worlds_withdraw_backing(population, (0,), streams=(current, reader))
+                        self.assertIn(api, str(caught.exception.exceptions[0]))
+                        self.assertIn("cuStreamSynchronize", str(caught.exception.exceptions[1]))
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, f"{api}: 700"):
+                            mujoco_worlds_withdraw_backing(population, (0,), streams=(current, reader))
+                self.assertEqual(calls[-1], ("cuStreamSynchronize", (11,)))
+                self.assertTrue(population._retirement_pending)
+                self.assertTrue(population._service_failed)
+                population._healthy.fill_.assert_called_once_with(0)
+                current.wait_stream.assert_not_called()
+                current.record_event.assert_not_called()
+                reader.wait_event.assert_not_called()
+                # Polling after failed submission must not drop reader obligations.
+                for finish in (mujoco_worlds_reclaim_backing, mujoco_worlds_cancel_backing_retirement):
+                    with self.assertRaisesRegex(RuntimeError, "closing retained resources"):
+                        finish(population)
+                self.assertTrue(population._retirement_pending)
+                self.assertIn(reader, population._retirement_streams)
+                # A failed close join likewise cannot detach the retained owners.
+                population._graph = None
+                driver.cuStreamSynchronize = lambda stream: 700
+                with (
+                    patch.object(directory_ops, "close") as close_directory,
+                    patch.object(field_ops, "close") as close_field,
+                    self.assertRaisesRegex(RuntimeError, "cuStreamSynchronize: 700"),
+                ):
+                    mujoco_worlds_close(population, streams=(current, reader))
+                self.assertFalse(population._closed)
+                self.assertTrue(population._retirement_pending)
+                close_directory.assert_not_called()
+                close_field.assert_not_called()
+
     def test_fresh_growth_maps_all_domains_before_ordered_initialization_and_admission(self):
         """Never publish half a W/C/D mapping plan or expose uninitialized contact scratch."""
         population, group = self._growth_fixture()
@@ -1150,14 +1446,15 @@ assert 'worlds' not in newton.__all__
                         directory_ops, "publish_admissible_slots", side_effect=failure if stage == "admission" else None
                     ),
                     patch.object(native.wp, "get_stream", return_value=current),
-                    patch.object(native.wp, "synchronize_stream") as synchronize,
+                    patch.object(native.wp, "synchronize_stream", side_effect=AssertionError("Unchecked completion")),
+                    patch.object(backing_ops, "maintenance", return_value=nullcontext()) as maintenance,
                     self.assertRaises(MemoryError) as caught,
                 ):
                     mujoco_worlds_grow_backing(population, (2,), streams=(current,))
                 self.assertIs(caught.exception, failure)
                 self.assertTrue(population._service_failed)
                 population._healthy.fill_.assert_called_once_with(0)
-                synchronize.assert_called_once_with(current)
+                maintenance.assert_called_once_with(population._backing, streams=(current.cuda_stream,))
 
     def test_bad_publication_receipt_latches_replay_health(self):
         """A later valid receipt cannot heal a population whose directory service failed."""
@@ -1324,14 +1621,19 @@ assert 'worlds' not in newton.__all__
                 population = MuJoCoWorlds()
                 population._closed = population._service_failed = False
                 population.device = "cpu"
-                events, health = [], [1]
+                events, health, active_scope = [], [1], [False]
 
                 @contextmanager
-                def maintenance(backing, *, streams, events=events):
+                def maintenance(backing, *, streams, events=events, active_scope=active_scope):
                     self.assertEqual(streams, (11,))
+                    self.assertFalse(active_scope[0], "Quarantine must leave the failed maintenance scope first")
+                    active_scope[0] = True
                     events.append("join")
-                    yield
-                    events.append("leave")
+                    try:
+                        yield
+                    finally:
+                        active_scope[0] = False
+                        events.append("leave")
 
                 def trim(backing, *, keep_bytes, spare=spare, fail=fail, events=events):
                     self.assertEqual(keep_bytes, spare)
@@ -1389,7 +1691,9 @@ assert 'worlds' not in newton.__all__
                         "publish_admissible_slots",
                         side_effect=lambda *args, events=events: events.append("publish"),
                     ),
-                    patch("newton._src.solvers.mujoco.worlds.wp.get_stream", return_value=object()),
+                    patch(
+                        "newton._src.solvers.mujoco.worlds.wp.get_stream", return_value=SimpleNamespace(cuda_stream=11)
+                    ),
                     patch(
                         "newton._src.solvers.mujoco.worlds.wp.synchronize_stream",
                         side_effect=lambda stream, events=events: events.append("sync"),
@@ -1410,8 +1714,8 @@ assert 'worlds' not in newton.__all__
                             streams=(Mock(spec=wp.Stream, device=population.device, cuda_stream=11),),
                             spare_bytes=spare,
                         )
-                self.assertEqual(events.count("join"), 1)
-                self.assertEqual(events.count("sync"), 2 if fail else 1)
+                self.assertEqual(events.count("join"), 2 if fail else 1)
+                self.assertEqual(events.count("sync"), 1)
                 self.assertEqual(events.count("trim"), int(spare is not None))
                 if spare is not None:
                     self.assertLess(events.index("publish"), events.index("trim"))
@@ -1569,7 +1873,13 @@ assert 'worlds' not in newton.__all__
                         )
                     ]
                     with (
-                        patch.object(backing_ops, "maintenance", return_value=nullcontext()),
+                        patch.object(
+                            backing_ops,
+                            "maintenance",
+                            side_effect=[nullcontext(), interruption]
+                            if interrupted == "synchronize"
+                            else [nullcontext()],
+                        ),
                         patch.object(backing_ops, "mapped_ranges", return_value=((0, 1),)),
                         patch.object(field_ops, "resize_backing", side_effect=original),
                         patch.object(directory_ops, "withdraw_admissible_slots"),
@@ -1578,7 +1888,7 @@ assert 'worlds' not in newton.__all__
                         patch.object(
                             native.wp,
                             "synchronize_stream",
-                            side_effect=interruption if interrupted == "synchronize" else None,
+                            side_effect=AssertionError("Unchecked completion"),
                         ),
                         self.assertRaises(BaseExceptionGroup) as raised,
                     ):
@@ -2207,6 +2517,7 @@ class PopulationRecorderTests(unittest.TestCase):
             world_storage=storage,
             transient_storages=(None, None, storage),
             transient_arrays=(),
+            retirements=(),
             contact_count=scalar,
             ccd_count=scalar,
             contact_storage=storage,
@@ -2450,6 +2761,120 @@ def _prototype(keys, mujoco, mjw, *, convex=False):
 
 class TestMuJoCoWorlds(unittest.TestCase):
     """Exercise a caller-controlled CUDA device; default CPU suites skip this gate."""
+
+    @unittest.skipUnless(
+        os.environ.get("NEWTON_TEST_CUDA_UUID"), "Set an explicit CUDA UUID for native population tests"
+    )
+    def test_deferred_backing_retirement_preserves_live_worlds_and_rejects_occupied_tails(self):
+        """Keep one graph and surviving state through reclamation, cancellation and rejected withdrawal."""
+        import mujoco
+        import mujoco_warp as mjw
+
+        wp.init()
+        device = wp.get_device("cuda:0")
+        self.assertEqual(wp.get_cuda_device_count(), 1)
+        self.assertEqual(device.uuid, os.environ["NEWTON_TEST_CUDA_UUID"])
+        graph = None
+        with wp.ScopedDevice(device):
+            prepared = [_prototype(6, mujoco, mjw)]
+            population = mujoco_worlds_prepare(
+                prepared,
+                world_capacities=(64,),
+                id_capacity=4,
+                command_capacity=4,
+                memory_budget_bytes=64 * 1024**2,
+                initial_world_ready_capacities=(64,),
+            )
+            stream, reader = wp.get_stream(device), wp.Stream(device)
+            commands = directory_ops.allocate_commands(4, device=device)
+            results = directory_ops.allocate_results(4, device=device)
+            permit = wp.zeros(1, dtype=int, device=device)
+            try:
+                graph = mujoco_worlds_capture(population, commands, results, permit=permit, substeps=2)
+                graph_id = int(graph.graph_exec.value)
+                commands.sequence.fill_(1)
+                commands.count.fill_(4)
+                commands.operation.fill_(_CREATE)
+                commands.prototype.zero_()
+                wp.capture_launch(graph)
+                self.assertFalse(np.any(results.status.numpy()))
+                identities = population.directory.slot_id.numpy()[:4]
+                generations = population.directory.generation.numpy()
+                commands.sequence.fill_(2)
+                commands.count.fill_(3)
+                commands.operation.fill_(_DESTROY)
+                commands.instance_id.assign(np.array([*identities[1:], 0], dtype=np.int32))
+                commands.generation.assign(np.array([*generations[identities[1:]], 0], dtype=np.uint64))
+                wp.capture_launch(graph)
+                self.assertFalse(np.any(results.status.numpy()[:3]))
+                view = population.populations[0]
+                before = view.data.qpos[:1].numpy().copy()
+                group = population._populations[0]
+                self.assertEqual(len(group.retirements), len(native._storage_domains(group)))
+                self.assertTrue(any(owner is not None for owner in group.transient_storages))
+                full = backing_ops.memory_report(population._backing)
+                mujoco_worlds_withdraw_backing(population, (1,), streams=(stream, reader))
+                self.assertEqual(mujoco_world_population_ready_capacity(view), 1)
+                with self.assertRaisesRegex(RuntimeError, "pending backing retirement"):
+                    mujoco_worlds_grow_backing(population, (2,), streams=(stream,))
+                # The supplied reader stream already has the complete publication dependency.
+                with wp.ScopedStream(reader, sync_enter=False, sync_exit=False):
+                    wp.capture_launch(graph)
+                wp.synchronize_stream(reader)
+                self.assertTrue(mujoco_worlds_reclaim_backing(population))
+                np.testing.assert_array_equal(view.data.qpos[:1].numpy(), before)
+                shrunk = backing_ops.memory_report(population._backing)
+                self.assertEqual(shrunk["physical_retained_bytes"], full["physical_retained_bytes"])
+                self.assertLess(shrunk["mapped_bytes"], full["mapped_bytes"])
+                self.assertEqual(int(graph.graph_exec.value), graph_id)
+                reference = mjw.replicate_data(prepared[0][1], 1)
+                permit.fill_(1)
+                wp.capture_launch(graph)
+                for _ in range(2):
+                    mjw.step(prepared[0][0], reference)
+                for name in _STATE:
+                    array, expected_array = getattr(view.data, name), getattr(reference, name)
+                    if not array.size:
+                        self.assertEqual(expected_array.size, 0, name)
+                        continue
+                    actual, expected = array[:1].numpy(), expected_array.numpy()
+                    self.assertTrue(np.isfinite(actual).all(), name)
+                    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-6, err_msg=name)
+                del array, expected_array
+                permit.zero_()
+                before = view.data.qpos[:1].numpy().copy()
+                mujoco_worlds_grow_backing(population, (64,), streams=(stream, reader))
+                restored = backing_ops.memory_report(population._backing)
+                mujoco_worlds_withdraw_backing(population, (1,), streams=(stream, reader))
+                wp.synchronize_stream(stream)
+                self.assertTrue(mujoco_worlds_cancel_backing_retirement(population))
+                self.assertEqual(mujoco_world_population_ready_capacity(view), 1)
+                self.assertEqual(
+                    backing_ops.memory_report(population._backing)["mapped_bytes"], restored["mapped_bytes"]
+                )
+                # A live row makes the complete directory withdrawal fail, so no
+                # field readiness changes and later captured physics is denied.
+                readiness = (
+                    view.world_storage_ready_count,
+                    view.contact_storage_ready_count,
+                    view.ccd_storage_ready_count,
+                )
+                ready_before = [count.numpy().copy() for count in readiness]
+                mujoco_worlds_withdraw_backing(population, (0,), streams=(stream, reader))
+                wp.synchronize_stream(stream)
+                with self.assertRaises(BaseExceptionGroup):
+                    mujoco_worlds_reclaim_backing(population)
+                for expected, count in zip(ready_before, readiness, strict=True):
+                    np.testing.assert_array_equal(count.numpy(), expected)
+                self.assertEqual(int(population._healthy.numpy()[0]), 0)
+                permit.fill_(1)
+                wp.capture_launch(graph)
+                np.testing.assert_array_equal(view.data.qpos[:1].numpy(), before)
+            finally:
+                graph = None
+                gc.collect()
+                mujoco_worlds_close(population, streams=(stream, reader))
+            self.assertEqual(backing_ops.memory_report(population._backing)["physical_retained_bytes"], 0)
 
     @unittest.skipUnless(
         os.environ.get("NEWTON_TEST_CUDA_UUID"), "Set an explicit CUDA UUID for native population tests"
