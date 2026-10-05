@@ -1,0 +1,1 @@
+Preserve native population replication and world transfers with device-owned joint-limit edit history, graph-safe model-update scratch, and per-world heightfield offsets from current MuJoCo model updates.

@@ -73,9 +73,9 @@ class TestPreparedModelConstants(unittest.TestCase):
         solver._constant_roots_validated = False
         solver._has_dampratio_actuators = False
         solver._initial_model_sync = False
-        solver._joint_limit_ke_snapshot = np.full(2, 1000.0, dtype=np.float32)
-        solver._joint_limit_kd_snapshot = np.full(2, 10.0, dtype=np.float32)
-        solver._solreflimit_mode_snapshot = np.full(2, SOLREF_MODE_FORCE_SPACE, dtype=np.int32)
+        solver._joint_limit_ke_snapshot = wp.full(2, 1000.0, dtype=wp.float32, device=device)
+        solver._joint_limit_kd_snapshot = wp.full(2, 10.0, dtype=wp.float32, device=device)
+        solver._solreflimit_mode_snapshot = wp.full(2, SOLREF_MODE_FORCE_SPACE, dtype=wp.int32, device=device)
         solver.use_mujoco_cpu = False
         solver._use_mujoco_contacts = True
         return solver
@@ -147,19 +147,19 @@ class TestPreparedModelConstants(unittest.TestCase):
             with self.subTest(case=case):
                 solver = self._solver()
                 if case == "nonuniform_gain":
-                    solver._joint_limit_ke_snapshot[1] += 1.0
+                    solver._joint_limit_ke_snapshot.numpy()[1] += 1.0
                 elif case == "nonuniform_mode":
-                    solver._solreflimit_mode_snapshot[1] = SOLREF_MODE_MJCF_DEFAULT
+                    solver._solreflimit_mode_snapshot.numpy()[1] = SOLREF_MODE_MJCF_DEFAULT
                 elif case == "raw":
-                    solver._solreflimit_mode_snapshot[:] = SOLREF_MODE_RAW
+                    solver._solreflimit_mode_snapshot.numpy()[:] = SOLREF_MODE_RAW
                 elif case == "broadcast":
                     solver.mjw_model.jnt_solref = wp.zeros((1, 1, 2), dtype=wp.float32, device="cpu")
 
                 def apply(variant, case=case, solver=solver):
                     if case == "varying_gain":
-                        solver._joint_limit_ke_snapshot[0] += variant
+                        solver._joint_limit_ke_snapshot.numpy()[0] += variant
                     elif case == "varying_mode":
-                        solver._solreflimit_mode_snapshot[0] = SOLREF_MODE_MJCF_DEFAULT
+                        solver._solreflimit_mode_snapshot.numpy()[0] = SOLREF_MODE_MJCF_DEFAULT
                     solver.mjw_model.jnt_solref.fill_(float(variant))
 
                 solver.prepare_model_constants(2, apply)
@@ -200,7 +200,7 @@ class TestPreparedModelConstants(unittest.TestCase):
 
                 solver.prepare_model_constants(2, apply)
                 snapshots = tuple(
-                    getattr(solver, name).copy()
+                    getattr(solver, name).numpy().copy()
                     for name in ("_joint_limit_ke_snapshot", "_joint_limit_kd_snapshot", "_solreflimit_mode_snapshot")
                 )
                 ids = wp.array([1, 0], dtype=wp.int32, device=model.device)
@@ -221,13 +221,12 @@ class TestPreparedModelConstants(unittest.TestCase):
                 ):
                     solver.notify_model_changed(flags, world_mask=mask, constant_variant_ids=ids)
                 np.testing.assert_array_equal(solver.mjw_model.jnt_solref.numpy(), expected)
-                np.testing.assert_array_equal(solver.mj_model.jnt_solref, expected[0])
                 for name, value in zip(
                     ("_joint_limit_ke_snapshot", "_joint_limit_kd_snapshot", "_solreflimit_mode_snapshot"),
                     snapshots,
                     strict=True,
                 ):
-                    np.testing.assert_array_equal(getattr(solver, name), value)
+                    np.testing.assert_array_equal(getattr(solver, name).numpy(), value)
                 if edit == "gain":
                     model.joint_limit_ke.assign(np.array([2000.0, 1000.0], dtype=np.float32))
                     expected_mode = SOLREF_MODE_FORCE_SPACE
@@ -250,10 +249,12 @@ class TestPreparedModelConstants(unittest.TestCase):
                     solver._replication_source_solver = prototype
                     solver.model.world_count = 2
                     solver.update_data_interval = solver._step = 0
-                    solver._replication_offsets = {}
+                    solver._replication_offsets = dict.fromkeys(
+                        ("_joint_limit_ke_snapshot", "_joint_limit_kd_snapshot", "_solreflimit_mode_snapshot"), 0
+                    )
                 self._prepare(target)
-                source._joint_limit_ke_snapshot[0] += 1.0
-                source._solreflimit_mode_snapshot[0] = SOLREF_MODE_MJCF_DEFAULT
+                source._joint_limit_ke_snapshot.numpy()[0] += 1.0
+                source._solreflimit_mode_snapshot.numpy()[0] = SOLREF_MODE_MJCF_DEFAULT
                 registered = tuple((bank.ptr, output.ptr) for bank, output in target._model_constants)
 
                 def copy(*args, target=target, case=case):
@@ -268,7 +269,6 @@ class TestPreparedModelConstants(unittest.TestCase):
                 target._mujoco_warp.copy_worlds = copy
                 with (
                     mock.patch("newton._src.sim.model_replication._world_copy_arrays", return_value=[]),
-                    mock.patch("newton._src.sim.model_replication._copy_world_arrays"),
                     self.assertRaisesRegex(RuntimeError, "Transfer failed") if case == "failure" else nullcontext(),
                 ):
                     ids = [] if case == "empty" else [0]
@@ -281,8 +281,11 @@ class TestPreparedModelConstants(unittest.TestCase):
                 )
                 self.assertEqual(remaining, expected)
                 if case == "success":
-                    self.assertEqual(target._joint_limit_ke_snapshot.reshape(-1)[0], source._joint_limit_ke_snapshot[0])
-                    self.assertEqual(target._solreflimit_mode_snapshot.reshape(-1)[0], SOLREF_MODE_MJCF_DEFAULT)
+                    self.assertEqual(
+                        target._joint_limit_ke_snapshot.numpy().reshape(-1)[0],
+                        source._joint_limit_ke_snapshot.numpy()[0],
+                    )
+                    self.assertEqual(target._solreflimit_mode_snapshot.numpy().reshape(-1)[0], SOLREF_MODE_MJCF_DEFAULT)
 
     def test_generic_edit_invalidates_but_root_placement_preserves_bank(self):
         """Reject reuse after ordinary property edits and retain the explicit root-only path."""

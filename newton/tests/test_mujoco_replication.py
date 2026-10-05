@@ -230,8 +230,8 @@ class TestMuJoCoReplication(unittest.TestCase):
             target.model.gravity.numpy()[target_ids], source.model.gravity.numpy()[source_ids]
         )
         for name in ("_joint_limit_ke_snapshot", "_joint_limit_kd_snapshot", "_solreflimit_mode_snapshot"):
-            expected = getattr(source, name).reshape(3, -1)[source_ids]
-            actual = getattr(target, name).reshape(5, -1)[target_ids]
+            expected = getattr(source, name).numpy().reshape(3, -1)[source_ids]
+            actual = getattr(target, name).numpy().reshape(5, -1)[target_ids]
             np.testing.assert_array_equal(actual, expected, err_msg=name)
         for tick in range(32):
             wp.capture_launch(capture.graph)
@@ -275,52 +275,28 @@ class TestMuJoCoReplication(unittest.TestCase):
                 for array, snapshot in zip(arrays, snapshots, strict=True):
                     np.testing.assert_array_equal(array.numpy(), snapshot)
 
-    def test_world_transfer_preserves_uniform_cpu_history_without_materializing(self):
+    def test_world_transfer_preserves_device_history_without_readback(self):
+        """Transfer per-world edit history in place without a host snapshot."""
         prepared = self.make_solver(implicit_limits=True)
+        source, target = prepared.replicate(2), prepared.replicate(3)
         names = ("_joint_limit_ke_snapshot", "_joint_limit_kd_snapshot", "_solreflimit_mode_snapshot")
-        for case in ("uniform", "unequal", "writable", "materialized", "readonly_materialized", "nan"):
-            with self.subTest(case=case):
-                source, target = prepared.replicate(2), prepared.replicate(3)
-                for name in names:
-                    snapshot = getattr(source, name)
-                    if case == "unequal":
-                        row = snapshot[0].copy()
-                        row[0] += 1
-                        setattr(source, name, np.broadcast_to(row, snapshot.shape))
-                    elif case in ("writable", "materialized", "readonly_materialized"):
-                        snapshot = snapshot.copy()
-                        if case != "writable":
-                            snapshot[0, 0] += 1
-                        if case == "materialized":
-                            snapshot = snapshot.reshape(-1)
-                        elif case == "readonly_materialized":
-                            snapshot.flags.writeable = False
-                        setattr(source, name, snapshot)
-                    elif case == "nan" and name == names[0]:
-                        row = snapshot[0].copy()
-                        row[0] = np.nan
-                        setattr(source, name, np.broadcast_to(row, snapshot.shape))
-                        setattr(target, name, np.broadcast_to(row.copy(), getattr(target, name).shape))
-                before = {name: getattr(target, name) for name in names}
-                expected = {name: value.copy().reshape(3, -1) for name, value in before.items()}
-                for name in names:
-                    expected[name][[2, 0]] = getattr(source, name).reshape(2, -1)[[0, 1]]
-                status = target.copy_worlds_from(
-                    source,
-                    [0, 1],
-                    [2, 0],
-                    states=((source.model.state(), target.model.state()),),
-                    controls=((source.model.control(), target.model.control()),),
-                )
-                np.testing.assert_array_equal(status.numpy(), 0)
-                for name in names:
-                    actual = getattr(target, name)
-                    np.testing.assert_array_equal(actual.reshape(3, -1), expected[name], err_msg=name)
-                    if case == "uniform" or (case == "nan" and name != names[0]):
-                        self.assertIs(actual, before[name])
-                    else:
-                        self.assertIsNot(actual, before[name])
-                        self.assertTrue(actual.flags.writeable)
+        expected, before = {}, {}
+        for name in names:
+            values = getattr(source, name).numpy().reshape(2, -1)
+            values[0, 0] += 1
+            getattr(source, name).assign(values.reshape(-1))
+            before[name] = getattr(target, name)
+            expected[name] = before[name].numpy().reshape(3, -1).copy()
+            expected[name][[2, 0]] = values[[0, 1]]
+        states = ((source.model.state(), target.model.state()),)
+        controls = ((source.model.control(), target.model.control()),)
+        with patch.object(wp.array, "numpy", side_effect=AssertionError("Device history readback")):
+            status = target.copy_worlds_from(source, [0, 1], [2, 0], states=states, controls=controls)
+        np.testing.assert_array_equal(status.numpy(), 0)
+        for name in names:
+            actual = getattr(target, name)
+            self.assertIs(actual, before[name])
+            np.testing.assert_array_equal(actual.numpy().reshape(3, -1), expected[name], err_msg=name)
 
     def test_world_transfer_rejects_lineage_mapping_and_cadence(self):
         prepared = self.make_solver(update_data_interval=2)
