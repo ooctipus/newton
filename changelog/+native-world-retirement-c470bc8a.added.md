@@ -1,0 +1,1 @@
+Add experimental stream-ordered withdrawal, nonblocking reclamation and cancellation for native MuJoCo world backing, covering persistent fields and captured temporary storage while preserving continuing world state.

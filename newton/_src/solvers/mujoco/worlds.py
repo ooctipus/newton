@@ -35,7 +35,7 @@ from gpu_components.directory_data import (
     InstanceStatus,
     InstanceTransaction,
 )
-from gpu_components.field_data import FieldSpec, FieldStorage
+from gpu_components.field_data import FieldRetirement, FieldSpec, FieldStorage
 
 wp.set_module_options({"enable_backward": False})
 
@@ -54,6 +54,15 @@ def _guard_health(batch: InstanceBatchResult, t: InstanceTransaction, healthy: w
 def _guard_backing_publication(status: wp.array[int], healthy: wp.array[int]):
     if status[0] != int(InstanceStatus.OK):
         healthy[0] = 0
+
+
+@wp.kernel
+def _withdraw_native_counts(
+    status: wp.array[int], contact_count: wp.array[int], ccd_count: wp.array[int], contacts: int, ccd: int
+):
+    if status[0] == int(InstanceStatus.OK):
+        contact_count[0] = contacts
+        ccd_count[0] = ccd
 
 
 @wp.kernel
@@ -420,6 +429,7 @@ class _MuJoCoWorldPopulation:
     kinematics_condition: object = None
     global_arrays: dict = field(default_factory=dict)
     empty_fields: dict = field(default_factory=dict)
+    retirements: tuple[FieldRetirement, ...] = ()
 
 
 @dataclass(eq=False)
@@ -453,6 +463,9 @@ class MuJoCoWorlds:
     _graph: object = None
     _discovery_memory: dict | None = None
     _recording_passes: int = 0
+    _retirement_pending: bool = False
+    _retirement_publication: object = None
+    _retirement_streams: tuple = ()
 
 
 def mujoco_worlds_validate(worlds: MuJoCoWorlds) -> None:
@@ -494,14 +507,21 @@ def _world_ready_capacity(group):
     if len(group.transient_storages) != 3:
         return 0
     quotas = (1, group.contact_quota, group.ccd_quota)
-    return min((owner.ready_rows // quotas[domain] for owner, domain in _storage_domains(group)), default=0)
+    rows = [owner.ready_rows for owner, _ in _storage_domains(group)]
+    for index, retirement in enumerate(group.retirements):
+        if retirement.pending:
+            rows[index] = min(rows[index], retirement.requested_rows)
+    return min(
+        (count // quotas[domain] for count, (_, domain) in zip(rows, _storage_domains(group), strict=True)), default=0
+    )
 
 
 def mujoco_world_population_ready_capacity(population: MuJoCoWorldPopulation) -> int:
     """Return the jointly published state, contact, CCD and transient prefix in world units.
 
     Follow backing-service stream ordering before using the reported capacity.
-    This host query does not certify completion of queued GPU initialization.
+    Pending withdrawals conservatively limit the result to their requested prefix.
+    This host query certifies neither GPU acceptance nor publication completion.
     """
     mujoco_world_population_validate(population)
     return _world_ready_capacity(population._owner())
@@ -644,6 +664,8 @@ def _prepare_transient_storage(worlds, graph, native_regions):
                 arrays = tuple(storage.arrays.values())
             for request, slot in occurrences:
                 bindings[request.index] = (request, arrays[slot].view(request.dtype))
+        if worlds._backing is not None:
+            group.retirements = tuple(field_ops.prepare_retirement(owner) for owner, _ in _storage_domains(group))
         _publish_native_counts(group)
         group.storage_signature = _binding_signature(group)[0:2]
         group.binding_signature = _binding_signature(group)
@@ -746,6 +768,8 @@ def mujoco_worlds_prepare(
                     memory_budget_bytes, device_ordinal=device.ordinal, expected_uuid=device.uuid
                 )
             backing = worlds._backing
+            if backing is not None:
+                worlds._retirement_publication = wp.Event(device)
             worlds._directory = directory_ops.allocate(
                 world_capacities, id_capacity=id_capacity, command_capacity=command_capacity, device=device
             )
@@ -958,6 +982,8 @@ def mujoco_worlds_capture(
 
     with wp.ScopedDevice(worlds.device):
         mujoco_worlds_validate(worlds)
+        if worlds._retirement_pending:
+            raise RuntimeError("Resolve pending backing retirement before capturing")
         if worlds._capture_attempted:
             raise RuntimeError("Each native population prepares exactly one graph")
         if any(
@@ -1367,6 +1393,8 @@ def mujoco_worlds_grow_backing(worlds, world_ready_capacities: tuple[int, ...], 
             raise RuntimeError("Backing growth requires execution outside graph capture")
         if worlds._backing is None:
             raise RuntimeError("This population has fixed backing")
+        if worlds._retirement_pending:
+            raise RuntimeError("Resolve pending backing retirement before changing capacity")
         world_ready_capacities = tuple(world_ready_capacities)
         if len(world_ready_capacities) != len(worlds._populations) or any(
             type(n) is not int
@@ -1463,6 +1491,8 @@ def mujoco_worlds_resize_backing(
             raise RuntimeError("This population has fixed backing")
         if spare_bytes is not None and (type(spare_bytes) is not int or spare_bytes < 0):
             raise ValueError("Retained spare bytes must be a nonnegative integer or None")
+        if worlds._retirement_pending:
+            raise RuntimeError("Resolve pending backing retirement before changing capacity")
         world_ready_capacities = tuple(world_ready_capacities)
         if len(world_ready_capacities) != len(worlds._populations) or any(
             type(n) is not int
@@ -1477,73 +1507,220 @@ def mujoco_worlds_resize_backing(
             not isinstance(stream, wp.Stream) or stream.device != worlds.device for stream in streams
         ):
             raise ValueError("Backing service requires existing Warp streams on the population device")
-        with backing_ops.maintenance(worlds._backing, streams=tuple(stream.cuda_stream for stream in streams)):
-            directory_ops.withdraw_admissible_slots(worlds._directory, world_ready_capacities)
-            live_counts = worlds._directory.data.live_count.numpy()
-            budget_rejected = False
-            try:
-                for group in worlds._populations:
-                    group.contact_count.zero_()
-                    group.ccd_count.zero_()
-                services = [
-                    (
-                        group,
-                        owner,
-                        target,
-                        int(live_counts[prototype]) if domain == 0 else 0,
-                    )
-                    for prototype, (group, n) in enumerate(
-                        zip(worlds._populations, world_ready_capacities, strict=True)
-                    )
-                    for owner, domain in _storage_domains(group)
-                    for target in (n * (1, group.contact_quota, group.ccd_quota)[domain],)
-                    if owner.backing is not None
-                ]
-                # Clean failed growth may retain mapped bytes beyond the published ready prefix.
-                services.sort(
-                    key=lambda entry: (
-                        entry[1].reservation is None
-                        or all(
-                            offset + size <= entry[2] * entry[1].row_stride_bytes
-                            for offset, size in backing_ops.mapped_ranges(entry[1].backing, entry[1].reservation)
+        budget_rejected = False
+        try:
+            with backing_ops.maintenance(worlds._backing, streams=tuple(stream.cuda_stream for stream in streams)):
+                directory_ops.withdraw_admissible_slots(worlds._directory, world_ready_capacities)
+                live_counts = worlds._directory.data.live_count.numpy()
+                try:
+                    for group in worlds._populations:
+                        group.contact_count.zero_()
+                        group.ccd_count.zero_()
+                    services = [
+                        (
+                            group,
+                            owner,
+                            target,
+                            int(live_counts[prototype]) if domain == 0 else 0,
+                        )
+                        for prototype, (group, n) in enumerate(
+                            zip(worlds._populations, world_ready_capacities, strict=True)
+                        )
+                        for owner, domain in _storage_domains(group)
+                        for target in (n * (1, group.contact_quota, group.ccd_quota)[domain],)
+                        if owner.backing is not None
+                    ]
+                    # Clean failed growth may retain mapped bytes beyond the published ready prefix.
+                    services.sort(
+                        key=lambda entry: (
+                            entry[1].reservation is None
+                            or all(
+                                offset + size <= entry[2] * entry[1].row_stride_bytes
+                                for offset, size in backing_ops.mapped_ranges(entry[1].backing, entry[1].reservation)
+                            )
                         )
                     )
-                )
-                for group, owner, target, live_count in services:
-                    old_ready = owner.ready_rows
-                    try:
-                        field_ops.resize_backing(owner, target, protected_count_host=live_count)
-                    except MemoryError:
-                        budget_rejected = not owner.service_failed
-                        raise
-                    if owner is group.contact_storage and owner.ready_rows > old_ready:
-                        _initialize_ready_fields(group, owner, start=old_ready)
-                for group in worlds._populations:
-                    _publish_native_counts(group)
-                directory_ops.publish_admissible_slots(
-                    worlds._directory, tuple(_world_ready_capacity(group) for group in worlds._populations)
-                )
-                wp.synchronize_stream(wp.get_stream(worlds.device))
-                if spare_bytes is not None:
-                    backing_ops.trim(worlds._backing, keep_bytes=spare_bytes)
-            except MemoryError as failure:
-                if not budget_rejected:
-                    _quarantine_service(worlds, failure)
-                    raise
-                try:
+                    for group, owner, target, live_count in services:
+                        old_ready = owner.ready_rows
+                        try:
+                            field_ops.resize_backing(owner, target, protected_count_host=live_count)
+                        except MemoryError:
+                            budget_rejected = not owner.service_failed
+                            raise
+                        if owner is group.contact_storage and owner.ready_rows > old_ready:
+                            _initialize_ready_fields(group, owner, start=old_ready)
                     for group in worlds._populations:
                         _publish_native_counts(group)
                     directory_ops.publish_admissible_slots(
                         worlds._directory, tuple(_world_ready_capacity(group) for group in worlds._populations)
                     )
                     wp.synchronize_stream(wp.get_stream(worlds.device))
-                except BaseException as failure:
-                    _quarantine_service(worlds, failure)
+                    if spare_bytes is not None:
+                        backing_ops.trim(worlds._backing, keep_bytes=spare_bytes)
+                except MemoryError:
+                    if budget_rejected:
+                        budget_rejected = False
+                        for group in worlds._populations:
+                            _publish_native_counts(group)
+                        directory_ops.publish_admissible_slots(
+                            worlds._directory, tuple(_world_ready_capacity(group) for group in worlds._populations)
+                        )
+                        wp.synchronize_stream(wp.get_stream(worlds.device))
+                        budget_rejected = True
                     raise
-                raise
-            except BaseException as failure:
+        except MemoryError as failure:
+            if not budget_rejected:
                 _quarantine_service(worlds, failure)
-                raise
+            raise
+        except BaseException as failure:
+            _quarantine_service(worlds, failure)
+            raise
+
+
+def mujoco_worlds_withdraw_backing(
+    worlds: MuJoCoWorlds, world_ready_capacities: tuple[int, ...], *, streams: tuple[wp.Stream, ...]
+) -> None:
+    """Withdraw W/C/D tails in stream order, retaining their physical backing.
+
+    Experimental. Supply every prior reader stream and exclude concurrent
+    submissions while this call establishes their dependency cut. Directory
+    validation precedes field withdrawal; a rejected directory batch leaves
+    every field unchanged. Each receipt latches native health before later
+    physics can execute. Return certifies enqueueing, not GPU acceptance.
+
+    The current stream and supplied streams may subsequently run captured
+    physics over the surviving prefix. Other streams must wait for the
+    current stream. Successful submission performs no host synchronization
+    or device readback. Submission failure synchronizes quarantine before
+    returning its error, so existing graphs cannot outrun the health update.
+    Only one retirement batch may be pending. Growth, resizing and capture
+    require completing :func:`mujoco_worlds_reclaim_backing` or :func:`mujoco_worlds_cancel_backing_retirement`.
+    Cancellation retains mappings and does not restore withdrawn readiness.
+    """
+    with wp.ScopedDevice(worlds.device):
+        mujoco_worlds_validate(worlds)
+        if wp.get_device(worlds.device).is_capturing:
+            raise RuntimeError("Backing withdrawal requires execution outside graph capture")
+        if worlds._backing is None:
+            raise RuntimeError("This population has fixed backing")
+        if worlds._retirement_pending:
+            raise RuntimeError("Resolve pending backing retirement before another withdrawal")
+        for group in worlds._populations:
+            if group.view is not None:
+                if _binding_signature(group)[0:2] != group.storage_signature:
+                    raise ValueError("Prepared storage or count descriptors changed")
+                mujoco_world_population_validate(group.view)
+            if not group.retirements:
+                raise RuntimeError("Capture the complete native program before backing withdrawal")
+        targets = tuple(world_ready_capacities)
+        if len(targets) != len(worlds._populations) or any(
+            type(n) is not int or not 0 <= n <= _world_ready_capacity(group)
+            for n, group in zip(targets, worlds._populations, strict=True)
+        ):
+            raise ValueError("Withdrawal must preserve reserved storage and only reduce ready worlds")
+        streams = tuple(streams)
+        if not streams or any(
+            not isinstance(stream, wp.Stream) or stream.device != worlds.device for stream in streams
+        ):
+            raise ValueError("Backing withdrawal requires existing reader streams on the population device")
+        current = wp.get_stream(worlds.device)
+        worlds._retirement_streams = (current, *streams)
+        worlds._retirement_pending = True
+        try:
+            for stream in streams:
+                if stream.cuda_stream != current.cuda_stream:
+                    backing_ops.record_event(
+                        worlds._backing, worlds._retirement_publication.cuda_event, stream=stream.cuda_stream
+                    )
+                    backing_ops.wait_event(
+                        worlds._backing, current.cuda_stream, worlds._retirement_publication.cuda_event
+                    )
+            status = directory_ops.withdraw_admissible_slots_async(worlds._directory, targets)
+            wp.launch(_guard_backing_publication, 1, [status, worlds._healthy], device=worlds.device)
+            for group, target in zip(worlds._populations, targets, strict=True):
+                counts = (target, target * group.contact_quota, target * group.ccd_quota)
+                # C/D protected counts describe intended work, not persistent live rows.
+                # Lower them only after directory acceptance and before each storage check.
+                wp.launch(
+                    _withdraw_native_counts,
+                    1,
+                    [status, group.contact_count, group.ccd_count, *counts[1:]],
+                    device=worlds.device,
+                )
+                for retirement, (_, domain) in zip(group.retirements, _storage_domains(group), strict=True):
+                    receipt = field_ops.withdraw_backing(
+                        retirement, counts[domain], streams=(current,), prerequisite=status
+                    )
+                    wp.launch(_guard_backing_publication, 1, [receipt, worlds._healthy], device=worlds.device)
+            backing_ops.record_event(
+                worlds._backing, worlds._retirement_publication.cuda_event, stream=current.cuda_stream
+            )
+            for stream in streams:
+                if stream.cuda_stream != current.cuda_stream:
+                    backing_ops.wait_event(
+                        worlds._backing, stream.cuda_stream, worlds._retirement_publication.cuda_event
+                    )
+        except BaseException as failure:
+            _quarantine_service(worlds, failure)
+            raise
+
+
+def mujoco_worlds_reclaim_backing(worlds: MuJoCoWorlds) -> bool:
+    """Poll a withdrawal and unmap its tails after prior readers finish.
+
+    Experimental. Return False while any completion is pending, otherwise
+    True. No host wait is introduced. Surviving-prefix physics may continue
+    on the streams ordered by :func:`mujoco_worlds_withdraw_backing`. Reclaimed handles
+    remain in the shared physical pool. A partial unmap failure retains its
+    plan for retry and does not revoke safe surviving-prefix execution.
+    GPU rejection is reported after completion and disables future service.
+    """
+    return _finish_backing_retirement(worlds, cancel=False)
+
+
+def mujoco_worlds_cancel_backing_retirement(worlds: MuJoCoWorlds) -> bool:
+    """Poll completion and retain mappings without restoring withdrawn readiness.
+
+    Experimental. Return False until prior readers finish, otherwise True.
+    Cancellation cannot undo an unmap that has started; finish reclamation
+    in that case. Later :func:`mujoco_worlds_grow_backing` may republish retained capacity.
+    """
+    return _finish_backing_retirement(worlds, cancel=True)
+
+
+def _finish_backing_retirement(worlds, *, cancel):
+    with wp.ScopedDevice(worlds.device):
+        if wp.get_device(worlds.device).is_capturing:
+            raise RuntimeError("Backing retirement requires execution outside graph capture")
+        if worlds._closed:
+            raise RuntimeError("The native population is closed")
+        if worlds._service_failed:
+            raise RuntimeError("Failed backing service requires closing retained resources")
+        if worlds._backing is None:
+            raise RuntimeError("This population has fixed backing")
+        if not worlds._retirement_pending:
+            return True
+        retirements = tuple(retirement for group in worlds._populations for retirement in group.retirements)
+        if cancel and any(retirement.reclaim_started for retirement in retirements):
+            raise RuntimeError("Cannot cancel backing retirement after any field reclamation has started")
+        operation = field_ops.cancel_retirement if cancel else field_ops.reclaim_backing
+        failures = []
+        for retirement in retirements:
+            if retirement.pending:
+                try:
+                    operation(retirement)
+                except BaseException as failure:
+                    failures.append(failure)
+                    if not retirement.pending:
+                        worlds._service_failed = True
+        worlds._retirement_pending = any(retirement.pending for retirement in retirements)
+        if not worlds._retirement_pending:
+            worlds._retirement_streams = ()
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("Native backing retirement remains incomplete", failures)
+        return not worlds._retirement_pending
 
 
 def _quarantine_service(worlds, failure):
@@ -1551,7 +1728,12 @@ def _quarantine_service(worlds, failure):
     worlds._service_failed = True
     try:
         worlds._healthy.fill_(0)
-        wp.synchronize_stream(wp.get_stream(worlds.device))
+        current = wp.get_stream(worlds.device)
+        if worlds._backing is None:
+            wp.synchronize_stream(current)
+        else:
+            with backing_ops.maintenance(worlds._backing, streams=(current.cuda_stream,)):
+                pass
     except BaseException as cleanup:
         raise BaseExceptionGroup("Native backing service and quarantine failed", [failure, cleanup]) from failure
 
@@ -1572,6 +1754,7 @@ def mujoco_worlds_memory_report(worlds):
         "discovery": worlds._discovery_memory,
         "startup_recording_passes": worlds._recording_passes,
         "runtime_recaptures": 0,
+        "backing_retirement_pending": worlds._retirement_pending,
         "control_metadata_bytes": (
             worlds._healthy.capacity + worlds._always_permit.capacity + worlds._lifecycle_needed.capacity
         ),
@@ -1646,6 +1829,11 @@ def mujoco_worlds_close(worlds, *, streams: tuple[wp.Stream, ...]):
         graph = worlds._graph() if worlds._graph is not None else None
         if graph is not None:
             raise RuntimeError("Destroy the native population graph before closing its owners")
+        if worlds._retirement_pending:
+            with backing_ops.maintenance(
+                worlds._backing, streams=tuple(stream.cuda_stream for stream in worlds._retirement_streams)
+            ):
+                pass
         worlds._closed = True
         if worlds._directory is not None:
             directory_ops.close(worlds._directory, streams=streams)
@@ -1661,6 +1849,9 @@ def mujoco_worlds_close(worlds, *, streams: tuple[wp.Stream, ...]):
                 if owner is not None:
                     field_ops.close(owner, streams=raw_streams)
             group.transient_arrays = ()
+            group.retirements = ()
+        worlds._retirement_pending, worlds._retirement_streams = False, ()
+        worlds._retirement_publication = None
         worlds._populations.clear()
         worlds.populations = ()
         if worlds._backing is not None:
