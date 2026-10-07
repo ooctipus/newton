@@ -1,0 +1,1 @@
+Allow the opted-in sparse state cache with scalar tangents and either limit preparation mapping; enable cached state and parallel limits in the G1 flat benchmark recipe while retaining its numerical policy.

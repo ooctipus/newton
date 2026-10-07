@@ -31,8 +31,8 @@ def supported(solver):
         and owner is not None
         and sparse_factor.supported(solver)
         and owner.level_update
-        and owner.metric_tangents
-        and owner.parallel_limit_prefix
+        # State and held-operator generations do not depend on the row projector
+        # or the mapping used to prepare the joint-limit prefix.
         and not owner.packet_rows
         and not owner.block_contacts
         and solver._fk_id_cache_enabled

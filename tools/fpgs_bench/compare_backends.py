@@ -43,7 +43,16 @@ SOLVER_CAPACITIES = {
 ADDITIONAL_RECIPES = {
     "keyboard-so101": ("IsaacContrib-Keyboard-SO101", (), {}),
     "anymald-rough": ("Isaac-Velocity-Rough-AnymalD", (), {}),
-    "g1-flat": ("Isaac-Velocity-Flat-G1", (), {}),
+    "g1-flat": (
+        "Isaac-Velocity-Flat-G1",
+        ("grouped_dynamics=True",),
+        {
+            "FEATHER_PGS_SPARSE_FACTOR": "1",
+            "FEATHER_PGS_SPARSE_LEVEL_UPDATE": "1",
+            "FEATHER_PGS_SPARSE_PARALLEL_LIMITS": "1",
+            "FEATHER_PGS_G1_KINETIC_STATE": "1",
+        },
+    ),
     "h1-flat": ("Isaac-Velocity-Flat-H1", (), {}),
     "h1-rough": ("Isaac-Velocity-Rough-H1", (), {}),
     "go2-flat": ("Isaac-Velocity-Flat-UnitreeGo2", (), {}),
