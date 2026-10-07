@@ -17,8 +17,16 @@ from newton._src.solvers.feather_pgs.sparse_mass_matrix import (
 )
 
 
-def _inverse_kernel(dof_count, local_column_width):
-    """Exercise either temporary-storage mapping without a task-specific producer."""
+@wp.struct
+class _PaddedColumns:
+    index: wp.array2d[int]
+    inverse_nodes: wp.array2d[int]
+    inverse_count: wp.array[int]
+
+
+def _inverse_kernel(dof_count, local_column_width, column_layout):
+    """Exercise storage mappings without a task-specific producer."""
+    index_type = _SparseMassMatrixIndices if column_layout == "csc" else _PaddedColumns
     source = (
         """
 #if defined(__CUDA_ARCH__)
@@ -29,7 +37,7 @@ def _inverse_kernel(dof_count, local_column_width):
     if (lane == 0) bad = 0;
     __syncwarp();
     """
-        + _sparse_inverse_source(dof_count, local_column_width=local_column_width)
+        + _sparse_inverse_source(dof_count, local_column_width=local_column_width, column_layout=column_layout)
         + """
     __syncwarp();
     if (lane == 0) status.data[0] = bad;
@@ -40,14 +48,14 @@ def _inverse_kernel(dof_count, local_column_width):
     @wp.func_native(source)
     def native(
         tid: int,
-        indices: _SparseMassMatrixIndices,
+        indices: index_type,
         packed: wp.array[float],
         result: wp.array[float],
         status: wp.array[int],
     ): ...
 
     def kernel(
-        indices: _SparseMassMatrixIndices,
+        indices: index_type,
         packed: wp.array[float],
         result: wp.array[float],
         status: wp.array[int],
@@ -60,22 +68,31 @@ def _inverse_kernel(dof_count, local_column_width):
 class TestSparseSharedOperator(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "Require CUDA for local inverse storage")
     def test_inverse_storage_mappings_match_dense_solve(self):
-        """Check both inverse mappings on branched, reordered and scalar topologies."""
+        """Check all inverse mappings on branched, reordered and scalar topologies."""
         for parents, counts in [([-1], [1]), ([-1, 0, 0, 1], [6, 3, 2, 0]), ([2, -1, 1, 2, -1, 4], [2, 3, 0, 1, 1, 2])]:
             plan = _SparseMassMatrixPlan.build(parents, counts)
             rng = np.random.default_rng(1067)
             factor = np.zeros_like(plan.lookup, dtype=np.float32)
             factor[plan.entry_rows, plan.columns] = rng.normal(0, 0.1, plan.nonzero_count)
             factor[np.diag_indices(plan.dof_count)] += 2
-            indices = plan.to_device("cuda:0")
+            csc = plan.to_device("cuda:0")
+            local_width = int(np.max(np.diff(plan.column_offsets)))
+            nodes = np.full((plan.dof_count, local_width), -1, np.int32)
+            for col in range(plan.dof_count):
+                begin, end = plan.column_offsets[col : col + 2]
+                nodes[col, : end - begin] = plan.entry_rows[plan.column_entries[begin:end]]
+            padded = _PaddedColumns()
+            padded.index = csc.lookup
+            padded.inverse_nodes = wp.array(nodes, dtype=int, device="cuda:0")
+            padded.inverse_count = wp.array(np.diff(plan.column_offsets), dtype=int, device="cuda:0")
             packed = wp.array(factor[plan.entry_rows, plan.columns], dtype=float, device="cuda:0")
             expected = np.linalg.inv(factor)[plan.entry_rows, plan.columns]
-            for width in (0, int(np.max(np.diff(plan.column_offsets)))):
-                with self.subTest(parents=parents, counts=counts, local_column_width=width):
+            for width, layout, indices in [(0, "csc", csc), (local_width, "csc", csc), (local_width, "padded", padded)]:
+                with self.subTest(parents=parents, counts=counts, local_column_width=width, layout=layout):
                     result = wp.full(plan.nonzero_count, np.nan, dtype=float, device="cuda:0")
                     status = wp.full(1, -1, dtype=int, device="cuda:0")
                     wp.launch(
-                        _inverse_kernel(plan.dof_count, width),
+                        _inverse_kernel(plan.dof_count, width, layout),
                         dim=32,
                         block_dim=32,
                         inputs=[indices, packed, result, status],

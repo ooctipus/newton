@@ -22,7 +22,6 @@ from .sparse_mass_matrix import (
     _factor_update_schedule as _level_update_schedule,
 )
 from .sparse_mass_matrix import (
-    _SparseMassMatrixIndices,
     _SparseMassMatrixPlan,
     _SparseRowSupportPlan,
 )
@@ -30,7 +29,6 @@ from .sparse_mass_matrix import (
 
 @wp.struct
 class SparsePlan:
-    indices: _SparseMassMatrixIndices
     index: wp.array2d[int]
     row: wp.array[int]
     col: wp.array[int]
@@ -189,13 +187,8 @@ def make_plan(model, solver=None):
     if solver is None:
         return host
     plan = SparsePlan()
-    plan.indices = mass_plan.to_device(model.device)
-    shared_arrays = {"index": "lookup", "row": "entry_rows", "col": "columns", "dof_joint": "dof_joint"}
     for name, values in host.items():
-        if name in shared_arrays:
-            setattr(plan, name, getattr(plan.indices, shared_arrays[name]))
-        else:
-            setattr(plan, name, wp.array(values, dtype=wp.uint64 if name == "body_mask" else int, device=model.device))
+        setattr(plan, name, wp.array(values, dtype=wp.uint64 if name == "body_mask" else int, device=model.device))
     plan.group_to_art = solver.group_to_art[43]
     plan.art_to_world = solver.art_to_world
     plan.art_dof_start = solver.articulation_dof_start
@@ -271,7 +264,7 @@ def get_refresh_kernel(level_update=False, geometric=False):
         }
         __syncthreads();
     }
-    const auto& indices = p.indices;
+    const auto& indices = p;
     const int lane = threadIdx.x, stride = blockDim.x;
     const float* factor = a;
     float* inverse = d.W.data + group*434;
@@ -292,7 +285,7 @@ def get_refresh_kernel(level_update=False, geometric=False):
         source = source.replace("__shared__ float a[434], force[258];", "__shared__ float a[434];")
     if level_update:
         start = source.index("    for (int k = 0; k < 43; ++k) {")
-        end = source.index("    const auto& indices = p.indices;", start)
+        end = source.index("    const auto& indices = p;", start)
         source = (
             source[:start]
             + r"""
@@ -331,7 +324,9 @@ def get_refresh_kernel(level_update=False, geometric=False):
             + source[end:]
         )
 
-    source = source.replace("SPARSE_INVERSE_COLUMNS", _sparse_inverse_source(43, local_column_width=18))
+    source = source.replace(
+        "SPARSE_INVERSE_COLUMNS", _sparse_inverse_source(43, local_column_width=18, column_layout="padded")
+    )
 
     inertia_type = wp.array2d[float] if geometric else wp.array[wp.spatial_matrix]
 
