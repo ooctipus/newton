@@ -492,7 +492,8 @@ class SparseFactor:
         self.data.W = wp.empty((w, 434), dtype=float, device=device)
         self.data.valid = wp.zeros(w, dtype=int, device=device)
         self.data.status = wp.zeros(w, dtype=int, device=device)
-        self.parallel_limit_prefix = os.environ.get("FEATHER_PGS_SPARSE_PARALLEL_LIMITS") == "1" and c == 100
+        # Prefix emission reads capacity from its buffers and preserves overflow counts.
+        self.parallel_limit_prefix = os.environ.get("FEATHER_PGS_SPARSE_PARALLEL_LIMITS") == "1"
         self.data.Z = wp.empty((w, c, 18), dtype=float, device=device)
         self.data.support = wp.empty((w, c), dtype=int, device=device)
         self.data.incident = wp.empty((w, c), dtype=float, device=device)

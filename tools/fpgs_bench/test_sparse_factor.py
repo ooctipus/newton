@@ -439,12 +439,12 @@ class TestSparseParallelLimits(unittest.TestCase):
     device = "cpu"
 
     def test_parallel_limit_owner_admission(self):
-        """Require actual opt-in dispatch, original row storage and c100 admission."""
+        """Select the opted-in prefix independently of row capacity."""
         flags = {"FEATHER_PGS_SPARSE_PACKETS": "0", "FEATHER_PGS_SPARSE_PARALLEL_LIMITS": "1"}
         with patch.dict(os.environ, flags):
-            for capacity in (56, 100, 128):
+            for capacity in (7, 56, 100, 128):
                 o = fixture(self.device, capacity=capacity)["owner"]
-                self.assertEqual(o.parallel_limit_prefix, capacity == 100)
+                self.assertTrue(o.parallel_limit_prefix)
                 self.assertFalse(o.packet_rows)
                 self.assertEqual(o.data.W.shape, (1, 434))
                 self.assertEqual(o.data.Z.shape, (1, capacity, 18))
@@ -452,7 +452,7 @@ class TestSparseParallelLimits(unittest.TestCase):
                 self.assertEqual(o.data.support.shape, (1, capacity))
                 self.assertEqual(o.kernels.contacts.key, "sparse_factor_contact_triplet18")
                 self.assertEqual(o.kernels.solve.key, f"sparse_factor_gs43_s18_c{capacity}")
-                expected = "sparse_factor_parallel_limit_prefix43" if capacity == 100 else "build_limit_prefix"
+                expected = "sparse_factor_parallel_limit_prefix43"
                 self.assertEqual(o.kernels.prefix.key, expected)
         with patch.dict(os.environ, {**flags, "FEATHER_PGS_SPARSE_PACKETS": "1"}):
             with self.assertRaisesRegex(ValueError, "FEATHER_PGS_SPARSE_PACKETS.*retired"):
@@ -468,7 +468,7 @@ class TestSparseParallelLimits(unittest.TestCase):
         )
 
         flags = {"FEATHER_PGS_SPARSE_PACKETS": "0", "FEATHER_PGS_SPARSE_PARALLEL_LIMITS": "1"}
-        for capacity in (100, 7):
+        for capacity in (7, 56, 100, 128):
             with patch.dict(os.environ, flags):
                 f = fixture(self.device, capacity=capacity)
             s, o, m = f["solver"], f["owner"], f["model"]
