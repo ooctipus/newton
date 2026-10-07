@@ -17,10 +17,20 @@ import warp as wp
 
 from ...geometry.flags import ShapeFlags
 from ...sim import BodyFlags, JointType
+from .sparse_factorization import _sparse_inverse_source
+from .sparse_mass_matrix import (
+    _factor_update_schedule as _level_update_schedule,
+)
+from .sparse_mass_matrix import (
+    _SparseMassMatrixIndices,
+    _SparseMassMatrixPlan,
+    _SparseRowSupportPlan,
+)
 
 
 @wp.struct
 class SparsePlan:
+    indices: _SparseMassMatrixIndices
     index: wp.array2d[int]
     row: wp.array[int]
     col: wp.array[int]
@@ -55,55 +65,6 @@ class SparseData:
     Z: wp.array3d[float]
     support: wp.array2d[int]
     incident: wp.array2d[float]
-
-
-def _level_update_schedule(index):
-    """Compile exact right-looking Schur ownership for the admitted topology."""
-    if index.shape != (43, 43):
-        raise ValueError("Sparse level updates require the checked 43-coordinate pattern")
-    return _level_update_schedule_cached(tuple(index.ravel()))
-
-
-@cache
-def _level_update_schedule_cached(pattern):
-    """Share immutable exact-size schedule data across model notifications."""
-    index = np.asarray(pattern, dtype=np.int32).reshape(43, 43)
-    rows, cols = np.nonzero(index >= 0)
-    if len(rows) != 434 or not np.array_equal(index[rows, cols], np.arange(434)) or np.any(rows < cols):
-        raise ValueError("Sparse level updates require the checked packed lower triangle")
-    levels = np.zeros(43, np.int32)
-    for col in range(43):
-        previous = np.flatnonzero(index[col, :col] >= 0)
-        levels[col] = 0 if not len(previous) else 1 + max(levels[previous])
-    if np.any(np.diag(index) < 0) or max(levels) != 14:
-        raise ValueError("Sparse level dependency depth differs from the checked tree")
-    offsets, pivots, scales, entries, starts, terms = [(0, 0, 0)], [], [], [], [0], []
-    for level in range(15):
-        current = np.flatnonzero(levels == level)
-        pivots.extend(current)
-        scales.extend(np.flatnonzero((rows > cols) & (levels[cols] == level)))
-        for entry, (row, col) in enumerate(zip(rows, cols, strict=True)):
-            if levels[col] <= level:
-                continue
-            update = [(index[row, k], index[col, k]) for k in current if index[row, k] >= 0 and index[col, k] >= 0]
-            if update:
-                entries.append(entry)
-                terms.extend(update)
-                starts.append(len(terms))
-        offsets.append((len(pivots), len(scales), len(entries)))
-    if offsets[-1] != (43, 391, 1142) or len(terms) != 2242:
-        raise ValueError("Sparse level update work differs from the checked tree")
-    result = {
-        "level_offsets": np.asarray(offsets, dtype=np.int32),
-        "level_pivots": np.asarray(pivots, dtype=np.int32),
-        "level_scales": np.asarray(scales, dtype=np.int32),
-        "level_entries": np.asarray(entries, dtype=np.int32),
-        "level_term_offsets": np.asarray(starts, dtype=np.int32),
-        "level_terms": np.asarray(terms, dtype=np.int32),
-    }
-    for values in result.values():
-        values.setflags(write=False)
-    return result
 
 
 def make_plan(model, solver=None):
@@ -186,72 +147,55 @@ def make_plan(model, solver=None):
     collidable = (model.shape_flags.numpy() & int(ShapeFlags.COLLIDE_SHAPES)) != 0
     if np.any(~np.isin(shape_body[collidable & (shape_body >= 0)] % 44, [6, 13, 14])):
         raise ValueError("Sparse G1 only admits feet/torso collision participants")
-    owned = [list(range(int(qd[0, j]), int(qd[0, j]) + (6 if j == 0 else 0 if j in fixed else 1))) for j in range(44)]
-    ancestors = []
-    for j in range(44):
-        path, k = [], j
-        while k >= 0:
-            path.extend(owned[k])
-            k = int(expected_parent[k])
-        ancestors.append(sorted(path))
-    pattern = np.eye(43, dtype=bool)
-    dof_joint = np.empty(43, np.int32)
-    for j, dofs in enumerate(owned):
-        pattern[np.ix_(dofs, ancestors[j])] = True
-        pattern[np.ix_(ancestors[j], dofs)] = True
-        dof_joint[dofs] = j
-    pattern = pattern[::-1, ::-1]
-    rr, cc = np.nonzero(np.tril(pattern))
-    if len(rr) != 434:
-        raise ValueError("Unexpected G1 packed factor pattern")
-    index = np.full((43, 43), -1, np.int32)
-    index[rr, cc] = np.arange(434)
+    # The producer and row kernels still require the checked ABI above. The
+    # representation itself comes from the same planner as native sparse tasks.
+    mass_plan = _SparseMassMatrixPlan.build(
+        model.joint_ancestor.numpy()[:44], np.diff(model.joint_qd_start.numpy())[:44]
+    )
+    if not np.array_equal(mass_plan.permutation, np.arange(42, -1, -1)) or mass_plan.nonzero_count != 434:
+        raise ValueError("Sparse producer coordinate ABI differs from the checked tree")
     inverse_nodes = np.full((43, 18), -1, np.int32)
-    inverse_count = np.zeros(43, np.int32)
-    for k in range(43):
-        nodes = np.flatnonzero(np.tril(pattern)[:, k])
-        inverse_nodes[k, : len(nodes)] = nodes
-        inverse_count[k] = len(nodes)
-    templates = []
-
-    def add(support):
-        nodes = tuple(sorted(42 - d for d in support))
-        if len(nodes) > 18:
-            raise ValueError("Current endpoint union exceeds the proved 18 coordinates")
-        if nodes not in templates:
-            templates.append(nodes)
-        return templates.index(nodes)
-
-    limit_support = np.array([add(ancestors[dof_joint[d]]) for d in range(43)], np.int32)
-    endpoints = [set(), set(ancestors[6]), set(ancestors[13]), set(ancestors[14])]
-    pair_support = np.array([[add(a | b) for b in endpoints] for a in endpoints], np.int32)
-    support_nodes = np.full((len(templates), 18), -1, np.int32)
-    for i, nodes in enumerate(templates):
-        support_nodes[i, : len(nodes)] = nodes
-    masks = np.array([sum(1 << d for d in support) for support in ancestors], np.uint64)
-    tags = np.full(44, -1, np.int32)
-    tags[[6, 13, 14]] = [1, 2, 3]
+    inverse_count = np.diff(mass_plan.column_offsets).astype(np.int32)
+    for col in range(43):
+        begin, end = mass_plan.column_offsets[col : col + 2]
+        inverse_nodes[col, : end - begin] = mass_plan.entry_rows[mass_plan.column_entries[begin:end]]
+    body_masks = np.zeros(44, dtype=np.uint64)
+    body_masks[child[0]] = mass_plan.joint_ancestor_mask
+    # These are the endpoint classes admitted by the unchanged producer guard.
+    support = _SparseRowSupportPlan.build(mass_plan, body_masks, max_row_dofs=18, contact_bodies=[6, 13, 14])
+    if support is None or support.pair_class.shape != (4, 4):
+        raise ValueError("Current endpoint union exceeds the sparse producer ABI")
+    # Existing Jacobian consumers address mask bits in physical coordinates.
+    physical_masks = np.array(
+        [sum(1 << int(mass_plan.permutation[d]) for d in range(43) if int(mask) & (1 << d)) for mask in body_masks],
+        dtype=np.uint64,
+    )
     host = {
-        "index": index,
-        "row": rr.astype(np.int32),
-        "col": cc.astype(np.int32),
-        "source": np.maximum(42 - rr, 42 - cc).astype(np.int32),
+        "index": mass_plan.lookup,
+        "row": mass_plan.entry_rows,
+        "col": mass_plan.columns,
+        "source": mass_plan.permutation[mass_plan.columns],
         "inverse_nodes": inverse_nodes,
         "inverse_count": inverse_count,
-        "support_nodes": support_nodes,
-        "support_count": np.array([len(x) for x in templates], np.int32),
-        "limit_support": limit_support,
-        "pair_support": pair_support,
-        "body_mask": np.tile(masks, worlds),
-        "body_tag": np.tile(tags, worlds),
-        "dof_joint": dof_joint,
+        "support_nodes": support.class_dof,
+        "support_count": np.sum(support.class_dof >= 0, axis=1).astype(np.int32),
+        "limit_support": support.limit_class,
+        "pair_support": support.pair_class,
+        "body_mask": np.tile(physical_masks, worlds),
+        "body_tag": np.tile(support.body_class, worlds),
+        "dof_joint": mass_plan.dof_joint,
     }
     # Deeper physical DOF owns the composite inertia (same original source map).
     if solver is None:
         return host
     plan = SparsePlan()
+    plan.indices = mass_plan.to_device(model.device)
+    shared_arrays = {"index": "lookup", "row": "entry_rows", "col": "columns", "dof_joint": "dof_joint"}
     for name, values in host.items():
-        setattr(plan, name, wp.array(values, dtype=wp.uint64 if name == "body_mask" else int, device=model.device))
+        if name in shared_arrays:
+            setattr(plan, name, getattr(plan.indices, shared_arrays[name]))
+        else:
+            setattr(plan, name, wp.array(values, dtype=wp.uint64 if name == "body_mask" else int, device=model.device))
     plan.group_to_art = solver.group_to_art[43]
     plan.art_to_world = solver.art_to_world
     plan.art_dof_start = solver.articulation_dof_start
@@ -327,22 +271,11 @@ def get_refresh_kernel(level_update=False, geometric=False):
         }
         __syncthreads();
     }
-    for (int col = threadIdx.x; col < 43; col += blockDim.x) {
-        float values[18];
-        const int count = p.inverse_count.data[col];
-        for (int i = 0; i < count; ++i) {
-            const int row = p.inverse_nodes.data[col*18+i];
-            float value = i == 0 ? 1.0f : 0.0f;
-            for (int j = 0; j < i; ++j) {
-                const int prev = p.inverse_nodes.data[col*18+j];
-                value -= a[p.index.data[row*43+prev]] * values[j];
-            }
-            value /= a[p.index.data[row*43+row]];
-            values[i] = value;
-            if (!isfinite(value)) atomicExch(&bad, 1);
-            d.W.data[group*434+p.index.data[row*43+col]] = value;
-        }
-    }
+    const auto& indices = p.indices;
+    const int lane = threadIdx.x, stride = blockDim.x;
+    const float* factor = a;
+    float* inverse = d.W.data + group*434;
+    SPARSE_INVERSE_COLUMNS
     __syncthreads();
     if (threadIdx.x == 0) { if (bad) atomicOr(&d.status.data[world], 1); d.valid.data[world] = bad == 0; }
 #endif
@@ -359,7 +292,7 @@ def get_refresh_kernel(level_update=False, geometric=False):
         source = source.replace("__shared__ float a[434], force[258];", "__shared__ float a[434];")
     if level_update:
         start = source.index("    for (int k = 0; k < 43; ++k) {")
-        end = source.index("    for (int col = threadIdx.x; col < 43; col += blockDim.x) {", start)
+        end = source.index("    const auto& indices = p.indices;", start)
         source = (
             source[:start]
             + r"""
@@ -397,6 +330,8 @@ def get_refresh_kernel(level_update=False, geometric=False):
 """
             + source[end:]
         )
+
+    source = source.replace("SPARSE_INVERSE_COLUMNS", _sparse_inverse_source(43, local_column_width=18))
 
     inertia_type = wp.array2d[float] if geometric else wp.array[wp.spatial_matrix]
 

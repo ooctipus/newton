@@ -39,6 +39,7 @@ def make_solver(model, enabled, **overrides):
         "pgs_mode": "matrix_free" if model.device.is_cuda else "split",
         "pgs_iterations": 8,
         "dense_max_constraints": 100,
+        "friction_anchor_beta": 0.0,
         "enable_joint_limits": True,
         "joint_limit_activation_gap": 0.01,
         "update_mass_matrix_interval": 2,
@@ -49,7 +50,12 @@ def make_solver(model, enabled, **overrides):
         "double_buffer": False,
     }
     options.update(overrides)
-    with patch.dict(os.environ, {**ENV, "FEATHER_PGS_G1_KINETIC_STATE": str(int(enabled))}):
+    with (
+        patch.dict(os.environ, {**ENV, "FEATHER_PGS_G1_KINETIC_STATE": str(int(enabled))}),
+        patch.object(
+            SolverFeatherPGS, "_kernel_overrides", {**SolverFeatherPGS._kernel_overrides, "sparse_mass_matrix": False}
+        ),
+    ):
         return SolverFeatherPGS(model, **options)
 
 
@@ -474,11 +480,10 @@ class TestG1KineticStateCUDA(unittest.TestCase):
                     self.assertTrue(np.any(augmentation(solver)[0] > solver.R_by_size[43].numpy()[0]))
                     np.testing.assert_allclose(native.bias.numpy()[0], expected_bias, rtol=2e-5, atol=3e-5)
                     np.testing.assert_allclose(solver.v_hat.numpy(), expected_vhat, rtol=2e-5, atol=3e-5)
-                    if epoch != 1:
-                        held = physical_mass(model, state) + np.diag(augmentation(solver)[0])
-                        held_bytes = solver._sparse_factor.data.W.numpy().copy()
-                    else:
-                        np.testing.assert_array_equal(solver._sparse_factor.data.W.numpy(), held_bytes)
+                    # Every epoch teleports and resets the state. The current
+                    # reset contract requests a fresh factor for that world.
+                    np.testing.assert_array_equal(solver.mass_update_mask.numpy(), [1])
+                    held = physical_mass(model, state) + np.diag(augmentation(solver)[0])
                     W = unpack(solver._sparse_factor)
                     inverse = (W.T @ W)[::-1, ::-1]
                     self.assertLess(backward_error(held, inverse, np.eye(43)), 3e-6)
@@ -488,7 +493,9 @@ class TestG1KineticStateCUDA(unittest.TestCase):
                     defect = backward_error(held, accel, expected_tau)
                     self.assertLess(defect, 3e-6)
                     self.assertFalse(solver._force_mass_update)
-                    np.testing.assert_array_equal(solver._mass_update_requested.numpy(), [0])
+                    np.testing.assert_array_equal(
+                        solver._mass_update_requested.numpy(), np.zeros(model.articulation_count, np.int32)
+                    )
                     print(f"g1_kinetic_predict epoch={epoch} momentum={defect:.8g}", flush=True)
                 solver.v_out.assign(state.joint_qd.numpy() + np.linspace(0.1, -0.1, 43, dtype=np.float32))
                 solver._stage6_update_qdd(state, augmented, DT)
@@ -595,7 +602,9 @@ class TestG1KineticStateCUDA(unittest.TestCase):
                     solver.step(pair[source], pair[destination], control, contacts, DT)
                 solver.check_constraint_capacity()
                 self.assertFalse(solver._force_mass_update)
-                np.testing.assert_array_equal(solver._mass_update_requested.numpy(), [0])
+                np.testing.assert_array_equal(
+                    solver._mass_update_requested.numpy(), np.zeros(model.articulation_count, np.int32)
+                )
                 public_state(self, model, pair[destination])
             # Compare physical outputs, not packed W coefficients or retired qdd buffers.
             for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
@@ -611,8 +620,8 @@ class TestG1KineticStateCUDA(unittest.TestCase):
         np.testing.assert_array_equal(candidate.mass_update_mask.numpy(), np.zeros(5, np.int32))
         np.testing.assert_array_equal(candidate._sparse_factor.data.W.numpy(), held)
 
-        # Current-world cache repair is selective. The original device mass
-        # request, in contrast, is a scalar broadcast to every articulation.
+        # Reset requests are per articulation. Check selective geometry and
+        # factor repair while untouched worlds retain the held factor.
         reset_mask = wp.array([False, True, False, True, False], dtype=wp.bool, device=self.device)
         for solver, pair in zip(solvers, states, strict=True):
             q = pair[0].joint_q.numpy().reshape(5, 44)
@@ -621,11 +630,12 @@ class TestG1KineticStateCUDA(unittest.TestCase):
             solver.reset(pair[0], reset_mask)
             solver._step = 3
             solver._force_mass_update = False
-            solver._mass_update_requested.fill_(1)
+            np.testing.assert_array_equal(solver._mass_update_requested.numpy(), [0, 1, 0, 1, 0])
         np.testing.assert_array_equal(native.geometry_valid.numpy(), [1, 0, 1, 0, 1])
         np.testing.assert_array_equal(candidate._fk_id_cache_valid.numpy(), [1, 0, 1, 0, 1])
         complete_step(0, 1)
-        np.testing.assert_array_equal(candidate.mass_update_mask.numpy(), np.ones(5, np.int32))
+        np.testing.assert_array_equal(candidate.mass_update_mask.numpy(), [0, 1, 0, 1, 0])
+        np.testing.assert_array_equal(candidate._sparse_factor.data.W.numpy()[[0, 2, 4]], held[[0, 2, 4]])
 
         # Notification changes current COM, mass, full angular inertia and gravity;
         # the late requested refresh must be consumed despite a non-global step.
@@ -703,7 +713,9 @@ class TestG1KineticStateCUDA(unittest.TestCase):
             contacts.rigid_contact_count.fill_(contact_count)
             wp.capture_launch(captured.graph)
             candidate.check_constraint_capacity()
-            np.testing.assert_array_equal(candidate._mass_update_requested.numpy(), [0])
+            np.testing.assert_array_equal(
+                candidate._mass_update_requested.numpy(), np.zeros(model.articulation_count, np.int32)
+            )
             public_state(self, model, states[1][1])
         print(
             "g1_kinetic_complete "

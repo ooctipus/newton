@@ -13,6 +13,63 @@ from functools import cache
 import numpy as np
 import warp as wp
 
+from .sparse_factorization import _sparse_inverse_source
+
+
+def _factor_levels(index):
+    """Derive independent pivots from a packed lower triangular pattern."""
+    n = index.shape[0]
+    levels = np.zeros(n, dtype=np.int32)
+    for col in range(n):
+        previous = np.flatnonzero(index[col, :col] >= 0)
+        levels[col] = 0 if not len(previous) else 1 + int(np.max(levels[previous]))
+    return levels
+
+
+def _factor_update_schedule(index):
+    """Compile right-looking Schur updates for any packed lower pattern."""
+    index = np.asarray(index)
+    if index.ndim != 2 or index.shape[0] != index.shape[1] or not 1 <= len(index) <= 64:
+        raise ValueError("Sparse level updates require a square 1 to 64 coordinate pattern")
+    if not np.issubdtype(index.dtype, np.integer):
+        raise ValueError("Sparse level updates require integer packed indices")
+    return _factor_update_schedule_cached(len(index), tuple(index.ravel()))
+
+
+@cache
+def _factor_update_schedule_cached(n, pattern):
+    """Share immutable schedules across model notifications."""
+    index = np.asarray(pattern, dtype=np.int32).reshape(n, n)
+    rows, cols = np.nonzero(index >= 0)
+    if not np.array_equal(index[rows, cols], np.arange(len(rows))) or np.any(rows < cols) or np.any(np.diag(index) < 0):
+        raise ValueError("Sparse level updates require a packed lower triangle with every diagonal")
+    levels = _factor_levels(index)
+    offsets, pivots, scales, entries, starts, terms = [(0, 0, 0)], [], [], [], [0], []
+    for level in range(int(np.max(levels)) + 1):
+        current = np.flatnonzero(levels == level)
+        pivots.extend(current)
+        scales.extend(np.flatnonzero((rows > cols) & (levels[cols] == level)))
+        for entry, (row, col) in enumerate(zip(rows, cols, strict=True)):
+            if levels[col] <= level:
+                continue
+            update = [(index[row, k], index[col, k]) for k in current if index[row, k] >= 0 and index[col, k] >= 0]
+            if update:
+                entries.append(entry)
+                terms.extend(update)
+                starts.append(len(terms))
+        offsets.append((len(pivots), len(scales), len(entries)))
+    result = {
+        "level_offsets": np.asarray(offsets, dtype=np.int32),
+        "level_pivots": np.asarray(pivots, dtype=np.int32),
+        "level_scales": np.asarray(scales, dtype=np.int32),
+        "level_entries": np.asarray(entries, dtype=np.int32),
+        "level_term_offsets": np.asarray(starts, dtype=np.int32),
+        "level_terms": np.asarray(terms, dtype=np.int32).reshape(-1, 2),
+    }
+    for values in result.values():
+        values.setflags(write=False)
+    return result
+
 
 @wp.struct
 class _SparseMassMatrixIndices:
@@ -61,12 +118,33 @@ class _SparseRowSupportPlan:
     limit_class: np.ndarray
 
     @classmethod
-    def build(cls, mass_plan, body_masks, *, max_row_dofs: int) -> "_SparseRowSupportPlan | None":
-        """Enumerate all endpoint unions and limit supports, or decline their width."""
+    def build(cls, mass_plan, body_masks, *, max_row_dofs: int, contact_bodies=None) -> "_SparseRowSupportPlan | None":
+        """Enumerate collision endpoint unions and every limit support.
+
+        Without ``contact_bodies``, every body is a possible endpoint. Otherwise
+        bodies with an absent ancestry class receive -1 and cannot be used as
+        contacts without rebuilding the catalogue. Shape attachment is topology;
+        geometry, materials and live limit activation do not change this plan.
+        """
         body_masks = np.asarray(body_masks, dtype=np.uint64)
         if body_masks.ndim != 1 or not 1 <= max_row_dofs <= mass_plan.dof_count:
             raise ValueError("Sparse row supports require one-dimensional masks and a valid row width")
-        classes = np.unique(np.concatenate((np.zeros(1, dtype=np.uint64), body_masks)))
+        if any(int(mask) >> mass_plan.dof_count for mask in body_masks):
+            raise ValueError("Sparse row support exceeds the articulation coordinate range")
+        endpoint_masks = body_masks
+        if contact_bodies is not None:
+            endpoints = np.asarray(contact_bodies)
+            if endpoints.ndim != 1 or (
+                endpoints.size
+                and (
+                    not np.issubdtype(endpoints.dtype, np.integer)
+                    or np.any(endpoints < 0)
+                    or np.any(endpoints >= len(body_masks))
+                )
+            ):
+                raise ValueError("Sparse contact endpoints must be valid body indices")
+            endpoint_masks = body_masks[endpoints.astype(np.int64)]
+        classes = np.unique(np.concatenate((np.zeros(1, dtype=np.uint64), endpoint_masks)))
         pairs = classes[:, None] | classes[None, :]
         masks = np.unique(np.concatenate((pairs.ravel(), mass_plan.ancestor_mask)))
         if any(int(mask).bit_count() > max_row_dofs for mask in masks):
@@ -77,8 +155,12 @@ class _SparseRowSupportPlan:
         for index, mask in enumerate(masks):
             entries = [dof for dof in range(mass_plan.dof_count) if int(mask) & (1 << dof)]
             class_dof[index, : len(entries)] = entries
+        indices = np.searchsorted(classes, body_masks)
+        matched = (indices < len(classes)) & (classes[np.minimum(indices, len(classes) - 1)] == body_masks)
+        body_class = np.full(len(body_masks), -1, dtype=np.int32)
+        body_class[matched] = indices[matched]
         return cls(
-            body_class=np.searchsorted(classes, body_masks).astype(np.int32),
+            body_class=body_class,
             pair_class=np.searchsorted(masks, pairs).astype(np.int32),
             class_dof=class_dof,
             # CSC factor support omits structural zeros inside multi-DOF joints.
@@ -220,11 +302,7 @@ class _SparseMassMatrixPlan:
         # Reverse DFS places every descendant subtree in one contiguous row
         # interval. A pivot depends only on those earlier descendants; sibling
         # branches can therefore be factored at the same dependency level.
-        levels = np.zeros(n, dtype=np.int32)
-        for row in range(n):
-            first = row - (row_offsets[row + 1] - row_offsets[row]) + 1
-            if first < row:
-                levels[row] = 1 + int(np.max(levels[first:row]))
+        levels = _factor_levels(lookup)
         level_count = int(np.max(levels)) + 1
         level_columns = np.argsort(levels, kind="stable").astype(np.int32)
         level_offsets = np.concatenate(([0], np.cumsum(np.bincount(levels, minlength=level_count))))
@@ -400,24 +478,7 @@ def _get_crba_sparse_factor_kernel(dof_count: int, nonzero_count: int, *, warps_
         __syncwarp();
 #endif
     }}
-    // Each inverse column follows only its ancestor chain. In particular, a
-    // broad root row no longer scans every unrelated descendant for each RHS.
-    for (int col = lane; col < {n}; col += stride) {{
-        const int begin = indices.column_offsets.data[col];
-        const int end = indices.column_offsets.data[col + 1];
-        for (int position = begin; position < end; ++position) {{
-            const int target = indices.column_entries.data[position];
-            const int row = indices.entry_rows.data[target];
-            const int diagonal = indices.row_offsets.data[row + 1] - 1;
-            float value = row == col ? 1.0f : 0.0f;
-            for (int previous = begin; previous < position; ++previous) {{
-                const int other = indices.column_entries.data[previous];
-                const int factor_entry = diagonal - row + indices.entry_rows.data[other];
-                value -= factor[factor_entry] * inverse[other];
-            }}
-            inverse[target] = value / factor[diagonal];
-        }}
-    }}
+    {_sparse_inverse_source(n)}
 #if defined(__CUDA_ARCH__)
     __syncwarp();
 #endif

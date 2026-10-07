@@ -79,12 +79,18 @@ def fixture(device="cpu", *, capacity=100):
     m.joint_q.assign(q)
     state = m.state()
     newton.eval_fk(m, m.joint_q, m.joint_qd, state)
-    with patch.dict(os.environ, {"FEATHER_PGS_SPARSE_FACTOR": "0", "FEATHER_PGS_SINGLE_FACTOR": "0"}):
+    with (
+        patch.dict(os.environ, {"FEATHER_PGS_SPARSE_FACTOR": "0", "FEATHER_PGS_SINGLE_FACTOR": "0"}),
+        patch.object(
+            SolverFeatherPGS, "_kernel_overrides", {**SolverFeatherPGS._kernel_overrides, "sparse_mass_matrix": False}
+        ),
+    ):
         solver = SolverFeatherPGS(
             m,
             pgs_mode="split" if device == "cpu" else "matrix_free",
             pgs_iterations=8,
             dense_max_constraints=capacity,
+            friction_anchor_beta=0.0,
             enable_joint_limits=True,
             joint_limit_activation_gap=0.01,
             update_mass_matrix_interval=2,
@@ -544,10 +550,14 @@ class TestSparseParallelLimitsCUDA(TestSparseParallelLimits):
 class TestSparseFactorCUDA(unittest.TestCase):
     def test_complete_owner_two_steps_and_graph(self):
         """Exercise actual constructor and every retained original service."""
-        for capacity in (56, 100):
-            for parallel in (False, True):
-                with self.subTest(capacity=capacity, parallel=parallel):
-                    self._complete_owner_two_steps_and_graph(parallel, capacity)
+        # Compare the original ordered policy to its sparse implementation;
+        # automatic native admission would select a different friction policy.
+        overrides = {**SolverFeatherPGS._kernel_overrides, "sparse_mass_matrix": False}
+        with patch.object(SolverFeatherPGS, "_kernel_overrides", overrides):
+            for capacity in (56, 100):
+                for parallel in (False, True):
+                    with self.subTest(capacity=capacity, parallel=parallel):
+                        self._complete_owner_two_steps_and_graph(parallel, capacity)
 
     def _complete_owner_two_steps_and_graph(self, parallel, capacity):
         """Retain the failed serial control and also exercise real async drives."""
@@ -559,6 +569,7 @@ class TestSparseFactorCUDA(unittest.TestCase):
             "pgs_mode": "matrix_free",
             "pgs_iterations": 8,
             "dense_max_constraints": capacity,
+            "friction_anchor_beta": 0.0,
             "enable_joint_limits": True,
             "joint_limit_activation_gap": 0.01,
             "update_mass_matrix_interval": 2,
