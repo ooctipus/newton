@@ -3086,6 +3086,7 @@ class SolverFeatherPGS(SolverBase):
             and (
                 os.environ.get("FEATHER_PGS_ALLEGRO_KINETIC_ROWS") == "1"
                 or os.environ.get("FEATHER_PGS_GENERATED_KEYED_ROWS") == "1"
+                or (_WR_ON and os.environ.get("FEATHER_PGS_GENERATED_KEYED_ROWS") != "0")
             )
         ):
             from .allegro_kinetic_rows import create_owner as create_kinetic_rows_owner  # noqa: PLC0415
@@ -7366,7 +7367,7 @@ class SolverFeatherPGS(SolverBase):
             self._pgs_solve_mf_gs_incremental_kernels = []
             self._ink_sizes = self._build_inkernel_response_meta() if (parallel_rows > 0 and _INK_ON) else None
             self._ink_rows = int(parallel_rows)
-            if _WR_ON and self._ink_sizes is not None:
+            if _WR_ON and self._ink_sizes is not None and self._allegro_kinetic_rows is None:
                 self._wr_world_contacts = wp.empty(
                     (self.world_count, int(self.dense_max_constraints)), dtype=wp.int32, device=model.device
                 )
@@ -7411,7 +7412,9 @@ class SolverFeatherPGS(SolverBase):
                             inkernel_response=self._ink_sizes,
                             has_drive_rows=has_drive_rows,
                             exact_row_sums=_MF_EXACT_ROWSUM,
-                            world_rows=bool(_WR_ON and self._ink_sizes is not None),
+                            world_rows=bool(
+                                _WR_ON and self._ink_sizes is not None and self._allegro_kinetic_rows is None
+                            ),
                         )
                     )
                     self._pgs_solve_mf_gs_incremental_kernels[-1]._fpgs_tier = tier_index
@@ -7433,7 +7436,9 @@ class SolverFeatherPGS(SolverBase):
                             inkernel_response=self._ink_sizes,
                             has_drive_rows=has_drive_rows,
                             exact_row_sums=_MF_EXACT_ROWSUM,
-                            world_rows=bool(_WR_ON and self._ink_sizes is not None),
+                            world_rows=bool(
+                                _WR_ON and self._ink_sizes is not None and self._allegro_kinetic_rows is None
+                            ),
                             lean_sweep=os.environ.get("FEATHER_PGS_SHADOW_VARIANT", "lean") == "lean",
                             bound_finger=os.environ.get("FEATHER_PGS_SHADOW_VARIANT", "lean") == "finger",
                         )

@@ -787,7 +787,8 @@ def create_owner(solver):
     """Admit one bounded complete numerical law; leave unsupported solvers ordinary."""
     from . import solver_feather_pgs as source  # noqa: PLC0415
 
-    direct = os.environ.get("FEATHER_PGS_GENERATED_KEYED_ROWS") == "1"
+    request = os.environ.get("FEATHER_PGS_GENERATED_KEYED_ROWS")
+    direct = request == "1" or (source._WR_ON and request != "0")
     supported = (
         solver.model.device.is_cuda
         and not solver.model.requires_grad
@@ -820,7 +821,9 @@ def create_owner(solver):
         and solver._contact_w == 1.0
         and not solver._debug_buffers_enabled
         and source._INK_ON
-        and not source._WR_ON
+        and (direct or not source._WR_ON)
+        and not source._WR_WARM
+        and not source._WR_CHECK
         and not source._INK_CHECK
         and not source._CHECK_ROWS
         and not source._CHECK_ROWS_FUSED

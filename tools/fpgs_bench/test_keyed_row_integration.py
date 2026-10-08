@@ -21,7 +21,11 @@ def make_case(enabled, capacity, free_count=0, *, exact=False, world_rows=False,
     model = _build_model(free_count=free_count) if model_factory is None else model_factory()
     with (
         patch.dict(
-            os.environ, {"FEATHER_PGS_GENERATED_KEYED_ROWS": str(int(enabled)), "FEATHER_PGS_ALLEGRO_KINETIC_ROWS": "0"}
+            os.environ,
+            {
+                "FEATHER_PGS_GENERATED_KEYED_ROWS": ("" if enabled is None else str(int(enabled))),
+                "FEATHER_PGS_ALLEGRO_KINETIC_ROWS": "0",
+            },
         ),
         patch.object(source, "_INK_ON", True),
         patch.object(source, "_MF_EXACT_ROWSUM", exact),
@@ -128,6 +132,13 @@ class TestKeyedRowIntegration(unittest.TestCase):
                     _step(ordinary)
                     _step(keyed)
                     self.compare(ordinary, keyed)
+
+    def test_generic_world_row_request_selects_keyed_inputs(self):
+        """Adopt admitted physical keys without naming a task or adding a caller flag."""
+        case = make_case(None, 32, exact=True, world_rows=True)
+        self.assertIsNotNone(case[1]._allegro_kinetic_rows)
+        self.assertIsNotNone(case[1]._allegro_kinetic_rows.layout)
+        self.assertIsNone(getattr(case[1], "_wr_world_contacts", None))
 
     def test_physical_reader_against_captured_allegro_operator(self):
         """Compare the physical reader with independent captured mass actions."""
