@@ -13,7 +13,7 @@ from functools import cache
 import numpy as np
 import warp as wp
 
-from .sparse_factorization import _sparse_inverse_source
+from .sparse_factorization import _sparse_cholesky_source, _sparse_inverse_source
 
 
 def _factor_levels(index):
@@ -436,48 +436,7 @@ def _get_crba_sparse_factor_kernel(dof_count: int, nonzero_count: int, *, warps_
 #if defined(__CUDA_ARCH__)
     __syncwarp();
 #endif
-    for (int level = 0; level < indices.factor_level_count; ++level) {{
-        const int level_begin = indices.factor_level_offsets.data[level];
-        const int level_end = indices.factor_level_offsets.data[level + 1];
-        for (int pivot = level_begin + lane; pivot < level_end; pivot += stride) {{
-            const int col = indices.factor_level_columns.data[pivot];
-            const int begin = indices.row_offsets.data[col];
-            const int diagonal = indices.row_offsets.data[col + 1] - 1;
-            float value = factor[diagonal];
-            for (int entry = begin; entry < diagonal; ++entry) value -= factor[entry] * factor[entry];
-            if (!(value > 0.0f) || !wp::isfinite(value)) {{
-#if defined(__CUDA_ARCH__)
-                atomicExch(status.data + group, 1);
-#else
-                status.data[group] = 1;
-#endif
-            }}
-            factor[diagonal] = sqrtf(value);
-        }}
-#if defined(__CUDA_ARCH__)
-        __syncwarp();
-#endif
-        const int entry_begin = indices.factor_level_entry_offsets.data[level];
-        const int entry_end = indices.factor_level_entry_offsets.data[level + 1];
-        for (int work = entry_begin + lane; work < entry_end; work += stride) {{
-            const int target = indices.factor_level_entries.data[work];
-            const int row = indices.entry_rows.data[target];
-            const int col = indices.columns.data[target];
-            const int begin = indices.row_offsets.data[col];
-            const int diagonal = indices.row_offsets.data[col + 1] - 1;
-            // Ancestor closure makes the column's whole prefix present in this
-            // row. Both prefixes are contiguous under the reversed DFS order.
-            const int row_begin = target - (diagonal - begin);
-            float value = factor[target];
-            for (int entry = begin; entry < diagonal; ++entry) {{
-                value -= factor[row_begin + entry - begin] * factor[entry];
-            }}
-            factor[target] = value / factor[diagonal];
-        }}
-#if defined(__CUDA_ARCH__)
-        __syncwarp();
-#endif
-    }}
+    {_sparse_cholesky_source(n, nnz, algorithm="left_looking")}
     {_sparse_inverse_source(n)}
 #if defined(__CUDA_ARCH__)
     __syncwarp();

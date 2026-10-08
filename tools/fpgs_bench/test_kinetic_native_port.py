@@ -42,7 +42,7 @@ EXPECTED = {
     "kinetic_compact_coupled/get_general_kernel/closure/kinetic_compact_native": "16ff8f0465a3398dcc83130e43fb9e7a79cea84684b7e170c64e7e9496e5b170",
     "kinetic_compact_coupled/get_general_kernel/closure/kinetic_original_arena_native": "a9111e7f9865153aca6159f29f514bfc647e471024c1cd4ead84cdbb7f55bd42",
     "kinetic_compact_coupled/get_general_kernel/compact_mf_source": "3efe747c8f1c330151ce566d9f6b2a9747f4ed82585e2eb2ba94c5c920041af7",
-    "kinetic_compact_coupled/get_general_kernel/compact_original_source": "1ea22a605c07900eb7365cf8c7a28b3dedc08de7ccefe3a0a7257c108882c649",
+    "kinetic_compact_coupled/get_general_kernel/compact_original_source": "00d3e701da6332c244f96550d924d14941244645e0cc2f02dc3822eb4032eaea",
     "kinetic_compact_coupled/get_general_kernel/compact_source": "16ff8f0465a3398dcc83130e43fb9e7a79cea84684b7e170c64e7e9496e5b170",
     "kinetic_compact_coupled/get_general_kernel/python": "244c5095a5a6bb25a6932132fad8faf30685137c5593b86183acd01eed4c7bc9",
     "kinetic_compact_coupled/get_materialize_kernel/closure/materialize": "39b8c87e2a4c010c763a30267ac8027ee0f52db003eabd68d90a2264d8881f90",
@@ -78,7 +78,7 @@ EXPECTED = {
     "kinetic_guard/get_finish_kernel/closure/_store_shift": "f6b6d8e1c6185c617ec49038d88ad61c4100dffc6c5c24048b2f6a577a8afc3f",
     "kinetic_guard/get_finish_kernel/closure/_sync": "7d87c36cf4126ba2d3101bb2728465b36b1a84119b6d9be8e2980a936f4c94b8",
     "kinetic_guard/get_finish_kernel/python": "610fd7c6065fb879f9023cb855acdbb272541455c46de3af373b3c1ddb523f6a",
-    "kinetic_guard/get_general_kernel/closure/pgs_solve_mf_gs_native": "1ea22a605c07900eb7365cf8c7a28b3dedc08de7ccefe3a0a7257c108882c649",
+    "kinetic_guard/get_general_kernel/closure/pgs_solve_mf_gs_native": "00d3e701da6332c244f96550d924d14941244645e0cc2f02dc3822eb4032eaea",
     "kinetic_guard/get_general_kernel/python": "6a49d242c3817c620a44cac77364c2921ba7299bc837b82cbe7fdc681544c28f",
     "kinetic_hybrid/HybridCoupledData/descriptor": "1a261fa76dc5207521c424ac6489a29c87c9b6a0448add39538ea356af28a078",
     "kinetic_hybrid/_CPU/literal": "e7e391d9a7653f4703a84d79da40cc7d4d42994990a9a0c1d821c601c5979316",
@@ -86,8 +86,8 @@ EXPECTED = {
     "kinetic_hybrid/_STORE/literal": "e14f17abb62d9ff7a51ebfcf30c9a45944f640da23eda23fb03a87f024903d80",
     "kinetic_hybrid/get_general_kernel/closure/_is_cpu": "599e3cf521417116b73f62d2c175b700d4631010feecc7a5658d7f0281c9a6ab",
     "kinetic_hybrid/get_general_kernel/closure/kinetic_hybrid_native": "1c1c41d6dc2d95ed009f2b7a4f55946a91a075f6d58469d6ca95b17f2d343a10",
-    "kinetic_hybrid/get_general_kernel/closure/pgs_solve_mf_gs_native": "1ea22a605c07900eb7365cf8c7a28b3dedc08de7ccefe3a0a7257c108882c649",
-    "kinetic_hybrid/get_general_kernel/hybrid_original_source": "1ea22a605c07900eb7365cf8c7a28b3dedc08de7ccefe3a0a7257c108882c649",
+    "kinetic_hybrid/get_general_kernel/closure/pgs_solve_mf_gs_native": "00d3e701da6332c244f96550d924d14941244645e0cc2f02dc3822eb4032eaea",
+    "kinetic_hybrid/get_general_kernel/hybrid_original_source": "00d3e701da6332c244f96550d924d14941244645e0cc2f02dc3822eb4032eaea",
     "kinetic_hybrid/get_general_kernel/hybrid_source": "1c1c41d6dc2d95ed009f2b7a4f55946a91a075f6d58469d6ca95b17f2d343a10",
     "kinetic_hybrid/get_general_kernel/python": "52c299afe9b78466e1fddd8e78958566340bc6ca06cf3c8fc56b1615fb93f341",
     "kinetic_hybrid/get_materialize_kernel/closure/materialize": "57cd055ea248b1c8739af80da633649e85b9f06ec7265d5ece0a758ed08939fa",
@@ -494,7 +494,7 @@ class TestKineticNativePort(unittest.TestCase):
             module.recover_impulse_transactions(corrected.replace("IMPULSE_READ_COMPLETE_0", "changed"))
 
     def test_composed_default_preserves_original_native_bytes(self):
-        """Keep the qualified Kuka ABI/body while retaining the optional branch."""
+        """Keep the retained Kuka ABI/body when retiring the unused dense experiment."""
         solver = importlib.import_module(PACKAGE + "solver_feather_pgs")
         original = solver._get_pgs_solve_mf_gs_kernel(
             192,
@@ -509,29 +509,9 @@ class TestKineticNativePort(unittest.TestCase):
         native = inspect.getclosurevars(original.func).nonlocals["pgs_solve_mf_gs_native"]
         self.assertEqual(
             hashlib.sha256(native.native_snippet.encode()).hexdigest(),
-            "1ea22a605c07900eb7365cf8c7a28b3dedc08de7ccefe3a0a7257c108882c649",
+            "00d3e701da6332c244f96550d924d14941244645e0cc2f02dc3822eb4032eaea",
         )
         self.assertEqual(original.key, "pgs_solve_mf_gs_192_64_29_current_drive0_densevlim0_factor_components")
-        optional = solver._get_pgs_solve_mf_gs_kernel(
-            100,
-            64,
-            43,
-            "cpu",
-            has_drive_rows=False,
-            has_dense_velocity_limit_rows=False,
-            single_factor_coordinates=True,
-        )
-        optional_native = inspect.getclosurevars(optional.func).nonlocals["pgs_solve_mf_gs_native"]
-        self.assertEqual(inspect.signature(original.func), inspect.signature(optional.func))
-        self.assertIn("_single_factor", optional.key)
-        self.assertIn("s_rhs_dense[i] += initial_jv", optional_native.native_snippet)
-        self.assertIn("s_v[d] = 0.0f", optional_native.native_snippet)
-        # Independently recorded from the accepted baf0 G1 single-factor body.
-        nonblank = "\n".join(line for line in optional_native.native_snippet.splitlines() if line.strip())
-        self.assertEqual(
-            hashlib.sha256(nonblank.encode()).hexdigest(),
-            "f6fd09a5b4efde69f992196aa88d0ab1f84fbbd6d015c2a4443486f72f104e34",
-        )
 
     def test_runtime_has_no_scratch_or_fixture_imports(self):
         """Reject external paths and capture-oracle imports in the runtime port."""

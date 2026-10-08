@@ -1,0 +1,1 @@
+Remove the unused experimental `FEATHER_PGS_SINGLE_FACTOR` route; unset this flag to use the supported solver dispatch. Share topology-generated sparse Cholesky operations between the native and cached factor producers.

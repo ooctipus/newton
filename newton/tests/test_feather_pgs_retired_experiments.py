@@ -11,6 +11,7 @@ import newton
 from newton._src.solvers.feather_pgs import sparse_factor
 
 RETIRED_FLAGS = (
+    "FEATHER_PGS_SINGLE_FACTOR",
     "FEATHER_PGS_BODY_BASIS_ROWS",
     "FEATHER_PGS_SPARSE_PACKETS",
     "FEATHER_PGS_SPARSE_PAIRED_GS",

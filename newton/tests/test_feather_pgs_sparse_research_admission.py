@@ -232,7 +232,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
                 self.assertEqual(solver._ink_rows, 0)
                 for name in ("_fused_k1", "_grouped_tau_mass", "_grouped_mass"):
                     self.assertFalse(getattr(solver, name), name)
-                for name in ("_sparse_factor", "_single_factor", "_kinetic_world", "_row_packets"):
+                for name in ("_sparse_factor", "_kinetic_world", "_row_packets"):
                     self.assertIsNone(getattr(solver, name), name)
 
 

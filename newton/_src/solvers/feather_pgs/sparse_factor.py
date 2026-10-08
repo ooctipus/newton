@@ -17,7 +17,7 @@ import warp as wp
 
 from ...geometry.flags import ShapeFlags
 from ...sim import BodyFlags, JointType
-from .sparse_factorization import _sparse_inverse_source
+from .sparse_factorization import _sparse_cholesky_source, _sparse_inverse_source
 from .sparse_mass_matrix import (
     _factor_update_schedule as _level_update_schedule,
 )
@@ -198,18 +198,26 @@ def make_plan(model, solver=None):
 
 
 @cache
-def get_refresh_kernel(level_update=False, geometric=False):
-    """Build the packed held inverse-whitener directly from current CRBA inputs."""
+def get_refresh_kernel(
+    *,
+    dof_count: int,
+    nonzero_count: int,
+    inverse_column_width: int,
+    level_count: int,
+    level_update: bool = False,
+    geometric: bool = False,
+):
+    """Bind current or cached reverse-ordered mass inputs to generated factors."""
     source = r"""
 #if defined(__CUDA_ARCH__)
     const int art = p.group_to_art.data[group];
     if (mask.data[art] == 0) return;
     const int world = p.art_to_world.data[art];
     const int ds = p.art_dof_start.data[art], js = p.art_joint_start.data[art];
-    __shared__ float a[434], force[258];
+    __shared__ float a[PACKED_COUNT], force[FORCE_COUNT];
     __shared__ int bad;
     if (threadIdx.x == 0) { bad = 0; d.valid.data[world] = 0; }
-    for (int col = threadIdx.x; col < 43; col += blockDim.x) {
+    for (int col = threadIdx.x; col < DOF_COUNT; col += blockDim.x) {
         const int body = p.joint_child.data[js + p.dof_joint.data[col]];
         const float* inertia = reinterpret_cast<const float*>(&I.data[body]);
         const float* screw = reinterpret_cast<const float*>(&S.data[ds + col]);
@@ -220,16 +228,16 @@ def get_refresh_kernel(level_update=False, geometric=False):
         }
     }
     __syncthreads();
-    for (int e = threadIdx.x; e < 434; e += blockDim.x) {
+    for (int e = threadIdx.x; e < PACKED_COUNT; e += blockDim.x) {
         const int row = p.row.data[e], col = p.col.data[e];
-        const int original_row = 42-row, original_col = 42-col;
+        const int original_row = LAST_DOF-row, original_col = LAST_DOF-col;
         const int src = p.source.data[e];
         const int projection = src == original_col ? original_row : original_col;
         const float* screw = reinterpret_cast<const float*>(&S.data[ds + projection]);
         float value = 0.0f;
         for (int k = 0; k < 6; ++k) value += screw[k] * force[6*src+k];
         if (row == col) {
-            value += R.data[group*43+original_row];
+            value += R.data[group*DOF_COUNT+original_row];
             int drive = drive_row.data[ds+original_row];
             if (drive < 0 && !parallel_drives) {
                 // Serial drive preparation compacts only its current rows.
@@ -244,30 +252,11 @@ def get_refresh_kernel(level_update=False, geometric=False):
         a[e] = value;
     }
     __syncthreads();
-    for (int k = 0; k < 43; ++k) {
-        const int diag = p.index.data[k*43+k];
-        if (threadIdx.x == 0) {
-            if (!(a[diag] > 0.0f) || !isfinite(a[diag])) bad = 1;
-            a[diag] = sqrtf(a[diag]);
-        }
-        __syncthreads();
-        for (int row = k+1+threadIdx.x; row < 43; row += blockDim.x) {
-            const int entry = p.index.data[row*43+k];
-            if (entry >= 0) a[entry] /= a[diag];
-        }
-        __syncthreads();
-        for (int e = threadIdx.x; e < 434; e += blockDim.x) {
-            const int row = p.row.data[e], col = p.col.data[e];
-            if (col <= k) continue;
-            const int x = p.index.data[row*43+k], y = p.index.data[col*43+k];
-            if (x >= 0 && y >= 0) a[e] -= a[x] * a[y];
-        }
-        __syncthreads();
-    }
     const auto& indices = p;
     const int lane = threadIdx.x, stride = blockDim.x;
-    const float* factor = a;
-    float* inverse = d.W.data + group*434;
+    float* factor = a;
+    SPARSE_CHOLESKY
+    float* inverse = d.W.data + group*PACKED_COUNT;
     SPARSE_INVERSE_COLUMNS
     __syncthreads();
     if (threadIdx.x == 0) { if (bad) atomicOr(&d.status.data[world], 1); d.valid.data[world] = bad == 0; }
@@ -276,56 +265,34 @@ def get_refresh_kernel(level_update=False, geometric=False):
     if geometric:
         # Only replace mass assembly. The held factor, inverse, R/K policy and
         # status publication below keep their original arithmetic and cadence.
-        start = source.index("    for (int col = threadIdx.x; col < 43; col += blockDim.x) {")
-        end = source.index("    for (int e = threadIdx.x; e < 434; e += blockDim.x) {", start)
+        start = source.index("    for (int col = threadIdx.x; col < DOF_COUNT; col += blockDim.x) {")
+        end = source.index("    for (int e = threadIdx.x; e < PACKED_COUNT; e += blockDim.x) {", start)
         source = source[:start] + source[end:]
         start = source.index("        const int src = p.source.data[e];")
         end = source.index("        if (row == col) {", start)
-        source = source[:start] + "        float value = I.data[group*434+e];\n" + source[end:]
-        source = source.replace("__shared__ float a[434], force[258];", "__shared__ float a[434];")
-    if level_update:
-        start = source.index("    for (int k = 0; k < 43; ++k) {")
-        end = source.index("    const auto& indices = p;", start)
-        source = (
-            source[:start]
-            + r"""
-    // Columns within a level are independent, but their ancestor Schur
-    // destinations overlap. One destination owner gathers this level only.
-    for (int level = 0; level < 15; ++level) {
-        const int begin = 3*level, end = 3*(level+1);
-        for (int task = p.level_offsets.data[begin]+threadIdx.x;
-             task < p.level_offsets.data[end]; task += blockDim.x) {
-            const int k = p.level_pivots.data[task];
-            const int diag = p.index.data[k*43+k];
-            if (!(a[diag] > 0.0f) || !isfinite(a[diag])) atomicExch(&bad, 1);
-            a[diag] = sqrtf(a[diag]);
-        }
-        __syncthreads();
-        for (int task = p.level_offsets.data[begin+1]+threadIdx.x;
-             task < p.level_offsets.data[end+1]; task += blockDim.x) {
-            const int entry = p.level_scales.data[task];
-            const int col = p.col.data[entry];
-            a[entry] /= a[p.index.data[col*43+col]];
-        }
-        __syncthreads();
-        for (int task = p.level_offsets.data[begin+2]+threadIdx.x;
-             task < p.level_offsets.data[end+2]; task += blockDim.x) {
-            const int entry = p.level_entries.data[task];
-            float value = a[entry];
-            for (int term = p.level_term_offsets.data[task];
-                 term < p.level_term_offsets.data[task+1]; ++term) {
-                value -= a[p.level_terms.data[2*term]] * a[p.level_terms.data[2*term+1]];
-            }
-            a[entry] = value;
-        }
-        __syncthreads();
-    }
-"""
-            + source[end:]
+        source = source[:start] + "        float value = I.data[group*PACKED_COUNT+e];\n" + source[end:]
+        source = source.replace(
+            "__shared__ float a[PACKED_COUNT], force[FORCE_COUNT];", "__shared__ float a[PACKED_COUNT];"
         )
-
+    for token, value in (
+        ("DOF_COUNT", dof_count),
+        ("LAST_DOF", dof_count - 1),
+        ("PACKED_COUNT", nonzero_count),
+        ("FORCE_COUNT", 6 * dof_count),
+    ):
+        source = source.replace(token, str(value))
     source = source.replace(
-        "SPARSE_INVERSE_COLUMNS", _sparse_inverse_source(43, local_column_width=18, column_layout="padded")
+        "SPARSE_CHOLESKY",
+        _sparse_cholesky_source(
+            dof_count,
+            nonzero_count,
+            algorithm="right_looking_levels" if level_update else "right_looking",
+            level_count=level_count,
+        ),
+    )
+    source = source.replace(
+        "SPARSE_INVERSE_COLUMNS",
+        _sparse_inverse_source(dof_count, local_column_width=inverse_column_width, column_layout="padded"),
     )
 
     inertia_type = wp.array2d[float] if geometric else wp.array[wp.spatial_matrix]
@@ -365,7 +332,9 @@ def get_refresh_kernel(level_update=False, geometric=False):
         native(group, p, d, mask, S, I, R, drive_row, K, drive_counts, drive_dofs, drive_stride, parallel_drives)
 
     refresh.__name__ = refresh.__qualname__ = (
-        "sparse_factor_level_update43_434" if level_update else "sparse_factor_refresh43_434"
+        f"sparse_factor_level_update{dof_count}_{nonzero_count}"
+        if level_update
+        else f"sparse_factor_refresh{dof_count}_{nonzero_count}"
     )
     if geometric:
         refresh.__name__ = refresh.__qualname__ = "g1_kinetic_" + refresh.__name__
@@ -413,10 +382,42 @@ def get_predictor_kernel():
 
 def supported(solver):
     """Require every replaced stage to dispatch through this complete owner."""
-    from .single_factor import supported as original_supported  # noqa: PLC0415
-
     return bool(
-        original_supported(solver)
+        solver.model.device.is_cuda
+        and not solver.model.requires_grad
+        and solver.world_count > 0
+        and solver.model.articulation_count == solver.world_count
+        and tuple(solver.size_groups) == (43,)
+        and solver.max_world_dofs == 43
+        and solver.n_arts_by_size[43] == solver.world_count
+        and solver.tile_threads >= 32
+        and solver.tile_threads % 32 == 0
+        and solver._execution_plan.use_tiled_hinv_jt(43)
+        and not solver._execution_plan.use_diagonal_mass(43)
+        and solver._is_one_solve_art_per_world
+        and not solver._has_free_rigid_bodies
+        and not solver._preelim_active
+        and not solver._regularization_enabled
+        and not solver._local_internal_fast_path
+        and not solver._paired_factor_coordinates
+        and not solver._sparse_diagonal_contact_solve
+        and not solver._mf_warmstart_enabled
+        and (solver._jy_world_aliased or solver._hinv_jt_writes_world)
+        and solver.pgs_mode == "matrix_free"
+        and solver.pgs_schedule == "interleaved"
+        and solver.pgs_iterations > 0
+        and solver.pgs_velocity_iterations == 0
+        and not solver.pgs_warmstart
+        and not solver.pgs_debug
+        and solver.drive_mode == "augmented"
+        and solver.friction_mode == "current"
+        and not solver.enable_joint_velocity_limits
+        and not solver.fuse_joint_velocity_limits
+        and solver.articulated_contact_response == "immediate"
+        and solver.mf_gs_response_block_rows == 0
+        and solver.mf_gs_incremental_rows == 0
+        and solver.mf_gs_parallel_rows == 0
+        and not solver._propagation_contacts_enabled()
         and solver._execution_plan.use_tiled_cholesky(43)
         and (
             solver.trisolve_kernel == "tiled" or (solver.trisolve_kernel == "auto" and 43 > solver.small_dof_threshold)
@@ -438,8 +439,6 @@ def create_owner(solver):
     from .solver_feather_pgs import _reject_retired_experiments  # noqa: PLC0415
 
     _reject_retired_experiments()
-    if os.environ.get("FEATHER_PGS_SINGLE_FACTOR") == "1":
-        raise ValueError("Sparse factor and single-factor owners are mutually exclusive")
     if not supported(solver):
         return None
     try:
@@ -485,8 +484,15 @@ class SparseFactor:
         if self.metric_tangents and self.block_contacts:
             raise ValueError("Sparse metric tangents and contact-block rows are mutually exclusive")
         self.level_update = os.environ.get("FEATHER_PGS_SPARSE_LEVEL_UPDATE") == "1"
+        schedule = _level_update_schedule(host["index"])
+        self.factor_parameters = {
+            "dof_count": host["index"].shape[0],
+            "nonzero_count": len(host["row"]),
+            "inverse_column_width": host["inverse_nodes"].shape[1],
+            "level_count": len(schedule["level_offsets"]) - 1,
+        }
         if self.level_update:
-            for name, values in _level_update_schedule(host["index"]).items():
+            for name, values in schedule.items():
                 setattr(plan, name, wp.array(values, dtype=int, device=solver.model.device))
         self.data = SparseData()
         self.data.W = wp.empty((w, 434), dtype=float, device=device)
@@ -499,7 +505,7 @@ class SparseFactor:
         self.data.incident = wp.empty((w, c), dtype=float, device=device)
         self.kernels = SimpleNamespace(
             prefix=get_parallel_limit_kernel() if self.parallel_limit_prefix else build_limit_prefix,
-            refresh=get_refresh_kernel(self.level_update),
+            refresh=get_refresh_kernel(**self.factor_parameters, level_update=self.level_update),
             predictor=get_predictor_kernel(),
             contacts=get_contact_kernel(
                 dof_count=host["index"].shape[0],
@@ -535,7 +541,9 @@ class SparseFactor:
 
         if kinetic_supported(self.solver):
             self.kinetic_state = G1KineticState(self)
-            self.kernels.refresh = get_refresh_kernel(self.level_update, geometric=True)
+            self.kernels.refresh = get_refresh_kernel(
+                **self.factor_parameters, level_update=self.level_update, geometric=True
+            )
 
     def begin(self):
         """Reject changed execution ownership before any retired buffer is read."""

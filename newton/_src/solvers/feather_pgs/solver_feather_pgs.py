@@ -255,6 +255,7 @@ from .sparse_pgs import (
 def _reject_retired_experiments():
     """Reject obsolete recipes before they silently select a different owner."""
     for flag in (
+        "FEATHER_PGS_SINGLE_FACTOR",
         "FEATHER_PGS_BODY_BASIS_ROWS",
         "FEATHER_PGS_SPARSE_PACKETS",
         "FEATHER_PGS_SPARSE_PAIRED_GS",
@@ -3255,17 +3256,6 @@ class SolverFeatherPGS(SolverBase):
 
             self._world_scan_publication = create_publication(self)
 
-        self._single_factor = None
-        self._single_factor_active = False
-        if (
-            self._sparse_mass_matrix_size is None
-            and self._point_contact_paths
-            and os.environ.get("FEATHER_PGS_SINGLE_FACTOR") == "1"
-        ):
-            from .single_factor import create_owner as create_single_factor  # noqa: PLC0415
-
-            self._single_factor = create_single_factor(self)
-
         self._sparse_factor = None
         if (
             self._sparse_mass_matrix_size is None
@@ -3325,7 +3315,6 @@ class SolverFeatherPGS(SolverBase):
                 model.requires_grad
                 or self.L_by_size.get(6) is None
                 or self._sparse_factor is not None
-                or self._single_factor is not None
                 or self._kinetic_world is not None
                 or self._franka_kinetic_state is not None
                 or self._joint_world is not None
@@ -3362,7 +3351,6 @@ class SolverFeatherPGS(SolverBase):
                 or self._sparse_diagonal_contact_solve
                 or self._sparse_mass_matrix_size is not None
                 or self._independent_components is not None
-                or self._single_factor is not None
                 or self._sparse_factor is not None
                 or self._joint_world is not None
                 or self._kinetic_world is not None
@@ -8536,15 +8524,11 @@ class SolverFeatherPGS(SolverBase):
                 device=self.model.device,
             )
             return
-        mf_gs_kernel = self._single_factor.solve_kernel if self._single_factor_active else self._pgs_solve_mf_gs_kernel
+        mf_gs_kernel = self._pgs_solve_mf_gs_kernel
         if mf_gs_kernel is None:
             raise RuntimeError("Matrix-free GS kernel is unavailable for this solver shape")
 
         def launch_row_phase(row_phase: int, phase_iterations: int, phase_iteration_offset: int) -> None:
-            if self._single_factor_active and (
-                row_phase != 0 or phase_iteration_offset != 0 or freeze_drive_rows or defer_dense_response or soft_relax
-            ):
-                raise RuntimeError("Single-factor response requires one complete interleaved position solve")
             if (
                 _FPGS_CAPTURE
                 and _FPGS_CAPTURE_STEP <= getattr(self, "_fpgs_step_n", -1) < _FPGS_CAPTURE_STEP + _FPGS_CAPTURE_COUNT
@@ -8878,8 +8862,6 @@ class SolverFeatherPGS(SolverBase):
                         block_dim=getattr(gs_kernel, "_fpgs_block_dim", 32),
                         device=self.model.device,
                     )
-                    if self._single_factor_active:
-                        self._single_factor.decode()
                     shadow = getattr(gs_kernel, "_fpgs_shadow", None)
                     if shadow is not None:
                         if getattr(self, "_shadow_scratch", None) is None:
@@ -10250,13 +10232,8 @@ class SolverFeatherPGS(SolverBase):
         if self.contact_compliance:
             # Reject incompatible contact preprocessing before it can mutate the stream.
             _contact_compliance.validate_step(self)
-        self._single_factor_active = False
         if self._sparse_factor is not None:
             self._sparse_factor.begin()
-        if self._single_factor is not None:
-            from .single_factor import supported as single_factor_supported  # noqa: PLC0415
-
-            self._single_factor_active = single_factor_supported(self)
         if contacts is not None and contacts.rigid_contact_max > self._max_contacts_alloc:
             raise ValueError(
                 "FeatherPGS contact capacity mismatch: received "
@@ -15174,9 +15151,6 @@ class SolverFeatherPGS(SolverBase):
     def _stage4_hinv_jt_tiled(self, size: int):
         if self._sparse_factor is not None:
             return
-        if self._single_factor_active:
-            self._single_factor.response()
-            return
         model = self.model
         n_arts = self.n_arts_by_size[size]
         hinv_jt_kernel = self._hinv_jt_kernels_by_size[size]
@@ -15844,8 +15818,6 @@ class SolverFeatherPGS(SolverBase):
     def _stage4_compute_matrix_free_diag(self):
         if self._sparse_factor is not None:
             return
-        if self._single_factor_active:
-            return  # Forward response already wrote every active world's diagonal.
         if self._row_packets is not None:
             self._row_packets.diagonal()
             return
@@ -26213,7 +26185,6 @@ def _get_pgs_solve_mf_gs_kernel(
     skip_incremental_rows: int = 0,
     skip_response_block: bool = False,
     independent_components: bool = False,
-    single_factor_coordinates: bool = False,
     dense_support_tiles: bool = False,
     stage_velocities: bool = False,
 ) -> "wp.Kernel":
@@ -26267,7 +26238,6 @@ def _get_pgs_solve_mf_gs_kernel(
     if dense_support_tiles and (
         friction_mode != "current"
         or factor_coordinates
-        or single_factor_coordinates
         or independent_components
         or skip_local_internal_worlds
         or skip_incremental_rows
@@ -26276,21 +26246,6 @@ def _get_pgs_solve_mf_gs_kernel(
         or local_internal_max_constraints
     ):
         raise ValueError("Dense support tiles require the ordinary current-friction phase-6 solve")
-    if single_factor_coordinates and (
-        friction_mode != "current"
-        or has_drive_rows
-        or has_dense_velocity_limit_rows
-        or fuse_vel_limits
-        or skip_local_internal_worlds
-        or factor_coordinates
-        or contact_torsion
-        or local_internal_max_constraints
-        or skip_incremental_rows
-        or skip_response_block
-        or independent_components
-        or not shared_metadata
-    ):
-        raise ValueError("Single-factor coordinates require the cold single-articulation dense solve")
     if factor_coordinates and (
         friction_mode != "current"
         or has_drive_rows
@@ -26307,8 +26262,7 @@ def _get_pgs_solve_mf_gs_kernel(
     D = max_world_dofs
 
     def dense_j_read(base: str, dof: str) -> str:
-        source = "Y_world" if single_factor_coordinates else "J_world"
-        return f"{source}.data[{base} + {dof}]"
+        return f"J_world.data[{base} + {dof}]"
 
     factor_fallback_skip = "    if (m_mf == 0) return;" if factor_coordinates else ""
 
@@ -27408,23 +27362,6 @@ def _get_pgs_solve_mf_gs_kernel(
     if (row_phase == 5 && dense_lo == dense_hi && mf_contact_end == m_mf) return;"""
     )
 
-    kinetic_initialization = ""
-    if single_factor_coordinates:
-        kinetic_initialization = f"""
-    // Offset coordinates preserve physical J and avoid transforming v_hat.
-    for (int i = dense_lo; i < dense_hi; ++i) {{
-        float initial_jv = 0.0f;
-        for (int d = lane; d < {D}; d += 32)
-            initial_jv += J_world.data[jy_world_base + i * {D} + d] * s_v[d];
-        for (int shift = 16; shift > 0; shift >>= 1)
-            initial_jv += __shfl_down_sync(MASK, initial_jv, shift);
-        if (lane == 0) s_rhs_dense[i] += initial_jv;
-    }}
-    __syncwarp();
-    for (int d = lane; d < {D}; d += 32) s_v[d] = 0.0f;
-    __syncwarp();
-"""
-
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const unsigned MASK = 0xFFFFFFFF;
@@ -27504,7 +27441,7 @@ def _get_pgs_solve_mf_gs_kernel(
         int global_dof = world_dof_indices.data[dof_map_base + d];
         s_v[d] = global_dof >= 0 ? v_out.data[global_dof] : 0.0f;
     }}
-    __syncwarp();{kinetic_initialization}
+    __syncwarp();
 
     // ═══════════════════════════════════════════════════════
     // SOLVE PHASE
@@ -28333,8 +28270,6 @@ def _get_pgs_solve_mf_gs_kernel(
         name += "_torsion"
     if factor_coordinates:
         name += "_factor"
-    if single_factor_coordinates:
-        name += "_single_factor"
     if skip_incremental_rows > 0:
         name += f"_skipinc{int(skip_incremental_rows)}"
     if skip_response_block:
