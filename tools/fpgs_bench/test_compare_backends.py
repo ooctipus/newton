@@ -118,16 +118,36 @@ class TestArgumentsAndHelpers(unittest.TestCase):
 
     def test_keyboard_recipe_defaults_and_copy_isolation(self):
         """Add the SO101 typing task without changing any Lab recipe or nested flag map."""
-        original = {"ant": ("Isaac-Ant", (), {"FEATHER_PGS_EXISTING": "1"})}
+        original = {"cartpole": ("Isaac-Cartpole", (), {"FEATHER_PGS_EXISTING": "1"})}
         capture = SimpleNamespace(RECIPES=original)
         before = copy.deepcopy(original)
         recipes = driver.recipe_map(capture)
         self.assertEqual(recipes["keyboard-so101"], ("IsaacContrib-Keyboard-SO101", (), {}))
-        self.assertEqual(recipes["ant"], before["ant"])
+        self.assertEqual(recipes["cartpole"], before["cartpole"])
         self.assertIs(capture.RECIPES, original)
         self.assertEqual(capture.RECIPES, before)
-        recipes["ant"][2]["FEATHER_PGS_EXISTING"] = "modified-copy"
+        recipes["cartpole"][2]["FEATHER_PGS_EXISTING"] = "modified-copy"
         self.assertEqual(capture.RECIPES, before)
+
+    def test_grouped_sparse_overlay_preserves_physical_recipe(self):
+        """Override implementation choices without changing task budgets or Lab metadata."""
+        original = {
+            "ant": (
+                "Isaac-Ant",
+                ("grouped_dynamics=False", "pgs_iterations=7", "dense_max_constraints=48"),
+                {"FEATHER_PGS_EXISTING": "1"},
+            ),
+            "cartpole": ("Isaac-Cartpole", ("grouped_dynamics=False",), {}),
+        }
+        before = copy.deepcopy(original)
+        with patch.object(driver, "GROUPED_SPARSE_TASKS", frozenset({"ant"}), create=True):
+            recipes = driver.recipe_map(SimpleNamespace(RECIPES=original))
+        task, attributes, flags = recipes["ant"]
+        self.assertEqual(task, "Isaac-Ant")
+        self.assertEqual(attributes, ("pgs_iterations=7", "dense_max_constraints=48", "grouped_dynamics=True"))
+        self.assertEqual(flags, {"FEATHER_PGS_EXISTING": "1", "FEATHER_PGS_SPARSE_GROUPED_DYNAMICS": "1"})
+        self.assertEqual(recipes["cartpole"], before["cartpole"])
+        self.assertEqual(original, before)
 
     def test_keyboard_recipe_conflict_is_rejected(self):
         """Accept an identical Lab alias and reject conflicting task configuration."""
@@ -1031,10 +1051,14 @@ class TestCompleteDriver(unittest.TestCase):
                     env.get("FEATHER_PGS_REGISTER_WHITENING"),
                     "1" if env["GPU"] == "GPU-0" else None,
                 )
+                grouped_ant = command[4] == "Isaac-Ant" and "ant" in driver.GROUPED_SPARSE_TASKS
                 self.assertEqual(
                     "--solver-attr" in command,
-                    command[4] == "Isaac-Velocity-Flat-AnymalD",
+                    command[4] == "Isaac-Velocity-Flat-AnymalD" or grouped_ant,
                 )
+                self.assertEqual(env.get("FEATHER_PGS_SPARSE_GROUPED_DYNAMICS"), "1" if grouped_ant else None)
+                if grouped_ant:
+                    self.assertEqual(command.count("grouped_dynamics=True"), 1)
         manifest = json.loads((self.output / "manifest.json").read_text())
         self.assertEqual(manifest["status"], "complete")
         self.assertTrue(manifest["hostname"])

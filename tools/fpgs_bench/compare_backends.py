@@ -53,20 +53,21 @@ ADDITIONAL_RECIPES = {
             "FEATHER_PGS_G1_KINETIC_STATE": "1",
         },
     ),
-    "h1-flat": (
-        "Isaac-Velocity-Flat-H1",
-        ("grouped_dynamics=True",),
-        {"FEATHER_PGS_SPARSE_GROUPED_DYNAMICS": "1"},
-    ),
+    "h1-flat": ("Isaac-Velocity-Flat-H1", (), {}),
     "h1-rough": ("Isaac-Velocity-Rough-H1", (), {}),
     "go2-flat": ("Isaac-Velocity-Flat-UnitreeGo2", (), {}),
-    "go2-rough": ("Isaac-Velocity-Rough-UnitreeGo2", (), {}),
+    "go2-rough": ("Isaac-Velocity-Rough-UnitreeGo2", ("dense_max_constraints=192",), {}),
     "cassie-flat": ("Isaac-Velocity-Flat-Cassie", (), {}),
     "cassie-rough": ("Isaac-Velocity-Rough-Cassie", (), {}),
     "franka-reach": ("Isaac-Reach-Franka", (), {}),
     "ur10-reach": ("Isaac-Reach-UR10", (), {}),
     "franka-drawer": ("Isaac-Open-Drawer-Franka", (), {}),
 }
+# Measured recipe choices compose the existing grouped producer with sparse
+# storage. Keep implementation selection separate from task physics metadata.
+GROUPED_SPARSE_TASKS = frozenset(
+    {"ant", "anymald-rough", "cassie-flat", "cassie-rough", "go2-flat", "go2-rough", "h1-flat", "h1-rough", "humanoid"}
+)
 HARNESS_RELATIVE = Path("scripts/benchmarks/fpgs_profile")
 FLAG_PREFIXES = ("FEATHER_", "NEWTON_", "FPGS_PROBE_")
 HELPERS = (
@@ -99,12 +100,20 @@ def load_capture(isaaclab: Path) -> ModuleType:
 
 
 def recipe_map(capture: ModuleType) -> dict:
-    """Merge Newton-only aliases without mutating Lab recipes or accepting conflicts."""
+    """Merge aliases and implementation choices without mutating Lab recipes."""
     recipes = copy.deepcopy(capture.RECIPES)
     for name, recipe in ADDITIONAL_RECIPES.items():
         if name in recipes and recipes[name] != recipe:
             raise ValueError(f"Conflicting Isaac Lab recipe for Newton benchmark alias {name!r}")
         recipes[name] = copy.deepcopy(recipe)
+    for name in GROUPED_SPARSE_TASKS & recipes.keys():
+        task, attributes, flags = recipes[name]
+        attributes = tuple(value for value in attributes if not value.startswith("grouped_dynamics="))
+        recipes[name] = (
+            task,
+            (*attributes, "grouped_dynamics=True"),
+            {**flags, "FEATHER_PGS_SPARSE_GROUPED_DYNAMICS": "1"},
+        )
     return recipes
 
 
