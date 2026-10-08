@@ -56,7 +56,7 @@ ADDITIONAL_RECIPES = {
     "h1-flat": ("Isaac-Velocity-Flat-H1", (), {}),
     "h1-rough": ("Isaac-Velocity-Rough-H1", (), {}),
     "go2-flat": ("Isaac-Velocity-Flat-UnitreeGo2", (), {}),
-    "go2-rough": ("Isaac-Velocity-Rough-UnitreeGo2", ("dense_max_constraints=192",), {}),
+    "go2-rough": ("Isaac-Velocity-Rough-UnitreeGo2", ("dense_max_constraints=256",), {}),
     "cassie-flat": ("Isaac-Velocity-Flat-Cassie", (), {}),
     "cassie-rough": ("Isaac-Velocity-Rough-Cassie", (), {}),
     "franka-reach": ("Isaac-Reach-Franka", (), {}),

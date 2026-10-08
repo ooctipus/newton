@@ -149,6 +149,15 @@ class TestArgumentsAndHelpers(unittest.TestCase):
         self.assertEqual(recipes["cartpole"], before["cartpole"])
         self.assertEqual(original, before)
 
+    def test_go2_rough_capacity_covers_observed_request(self):
+        """Retain all 195 rows observed in the checked 16K-world task replay."""
+        task, attributes, _ = driver.recipe_map(SimpleNamespace(RECIPES={}))["go2-rough"]
+        values = dict(attribute.split("=", 1) for attribute in attributes)
+        self.assertEqual(task, "Isaac-Velocity-Rough-UnitreeGo2")
+        self.assertGreaterEqual(int(values["dense_max_constraints"]), 195)
+        self.assertNotIn("pgs_iterations", values)
+        self.assertNotIn("num_substeps", values)
+
     def test_keyboard_recipe_conflict_is_rejected(self):
         """Accept an identical Lab alias and reject conflicting task configuration."""
         expected = ("IsaacContrib-Keyboard-SO101", (), {})
