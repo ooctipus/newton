@@ -10,10 +10,6 @@ location avoids overwriting another lane's still-live subtree terms.
 """
 
 import functools
-import hashlib
-import inspect
-import linecache
-import textwrap
 
 import warp as wp
 
@@ -91,20 +87,16 @@ def _store_axis(address: wp.uint64, dof: int, axis: wp.spatial_vector): ...
 
 
 def scan_source(motion):
-    """Change addressing/padding only, retaining all four original scan rounds."""
-    source = original._paired_scan(
-        original.world_scan_publication._MOTION_SCAN if motion else original.world_scan_publication._POSE_SCAN
+    """Bind the common scan to interleaved slots without rewriting CUDA source."""
+    return original.scan_source(
+        motion,
+        cuda_width=16,
+        cpu_width=16,
+        pose_stride=19,
+        motion_offset=7,
+        motion_stride=19,
+        acceleration_offset=6,
     )
-    replace = original._replace
-    source = replace(source, "[32]", "[16]", 6 if motion else 4)
-    source = replace(source, "lane<32", "lane<16", 4)
-    if motion:
-        source = replace(source, "reinterpret_cast<float*>(address)+224", "reinterpret_cast<float*>(address)+7")
-        source = replace(source, "6*lane", "19*lane", 6)
-        source = replace(source, "s[192+", "s[6+", 2)
-    else:
-        source = replace(source, "7*lane", "19*lane", 4)
-    return source
 
 
 @wp.func_native(scan_source(False))
@@ -160,16 +152,8 @@ def _collect(
 
 @functools.cache
 def get_state_kernel(finish):
-    """Bind the original state law to compact helpers; preserve its five arguments."""
-    terms = textwrap.dedent(inspect.getsource(original._primary_terms.func))
-    terms = original._replace(terms, "def _primary_terms(", "def _compact_primary_terms(")
-    source = original.state_source()
-    source = original._replace(source, '"franka_kinetic_finish13_h81_p16"', '"franka_kinetic_finish13_h81_c376_p16"')
-    source = original._replace(source, '"franka_kinetic_repair13_h81_p16"', '"franka_kinetic_repair13_h81_c376_p16"')
-    source = terms + "\n_primary_terms = _compact_primary_terms\n" + source
-    filename = f"<franka-compact-workspace-{hashlib.sha256(source.encode()).hexdigest()}>"
-    linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)
+    """Bind shared state arithmetic to the compact workspace without source edits."""
     namespace = dict(original.__dict__)
     namespace.update(globals())
-    exec(compile(source, filename, "exec"), namespace)
-    return namespace["_factory"](finish)
+    namespace["_primary_terms"] = original.make_primary_terms(_store_terms)
+    return original.make_state_kernel(finish, namespace, suffix="_c376")

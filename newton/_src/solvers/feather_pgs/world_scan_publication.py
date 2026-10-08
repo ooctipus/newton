@@ -18,6 +18,7 @@ import numpy as np
 import warp as wp
 
 from . import kernels, kuka_joint_world
+from .cached_state_scan import scan_source
 
 
 @wp.struct
@@ -151,96 +152,14 @@ def _store_origin(address: wp.uint64, root: int, origin: wp.vec3): ...
 def _load_origin(address: wp.uint64, root: int) -> wp.vec3: ...
 
 
-_POSE_SCAN = r"""
-    float* s=reinterpret_cast<float*>(address);
-#if defined(__CUDA_ARCH__)
-    const int lane=threadIdx.x&31;
-    wp::transform value;
-    for(int k=0;k<7;++k)value[k]=s[7*lane+k];
-    int parent=plan.body_parent.data[world*32+lane];
-    for(int round=0;round<4;++round) {
-        const int source=parent>=0?parent:lane;
-        wp::transform ancestor;
-        for(int k=0;k<7;++k)ancestor[k]=__shfl_sync(0xffffffffu,value[k],source);
-        const int next=__shfl_sync(0xffffffffu,parent,source);
-        if(parent>=0)value=wp::transform_multiply(ancestor,value);
-        parent=parent>=0?next:-1;
-    }
-    for(int k=0;k<7;++k)s[7*lane+k]=value[k];
-    __syncwarp(0xffffffffu);
-#else
-    wp::transform value[32],previous[32];
-    int parent[32],next[32];
-    for(int lane=0;lane<32;++lane) {
-        parent[lane]=plan.body_parent.data[world*32+lane];
-        for(int k=0;k<7;++k)value[lane][k]=s[7*lane+k];
-    }
-    for(int round=0;round<4;++round) {
-        for(int lane=0;lane<32;++lane) {
-            previous[lane]=value[lane];
-            next[lane]=parent[lane]>=0?parent[parent[lane]]:-1;
-        }
-        for(int lane=0;lane<32;++lane) {
-            if(parent[lane]>=0)value[lane]=wp::transform_multiply(previous[parent[lane]],previous[lane]);
-            parent[lane]=next[lane];
-        }
-    }
-    for(int lane=0;lane<32;++lane)for(int k=0;k<7;++k)s[7*lane+k]=value[lane][k];
-#endif
-"""
+_POSE_SCAN = scan_source(False)
 
 
 @wp.func_native(_POSE_SCAN)
 def _scan_poses(address: wp.uint64, world: int, plan: kuka_joint_world.JointWorldPlan): ...
 
 
-_MOTION_SCAN = r"""
-    float* s=reinterpret_cast<float*>(address)+224;
-#if defined(__CUDA_ARCH__)
-    const int lane=threadIdx.x&31;
-    float v[6],a[6];
-    for(int k=0;k<6;++k){v[k]=s[6*lane+k];a[k]=0.0f;}
-    int parent=plan.body_parent.data[world*32+lane];
-    for(int round=0;round<4;++round) {
-        const int source=parent>=0?parent:lane;
-        float pv[6],pa[6];
-        for(int k=0;k<6;++k){pv[k]=__shfl_sync(0xffffffffu,v[k],source);pa[k]=__shfl_sync(0xffffffffu,a[k],source);}
-        const int next=__shfl_sync(0xffffffffu,parent,source);
-        if(parent>=0) {
-            const wp::vec3 p_lin(pv[0],pv[1],pv[2]),p_ang(pv[3],pv[4],pv[5]);
-            const wp::vec3 c_lin(v[0],v[1],v[2]),c_ang(v[3],v[4],v[5]);
-            const wp::vec3 c0=wp::cross(p_ang,c_lin),c1=wp::cross(p_lin,c_ang),c2=wp::cross(p_ang,c_ang);
-            for(int k=0;k<3;++k){a[k]=pa[k]+a[k]+(c0[k]+c1[k]);a[k+3]=pa[k+3]+a[k+3]+c2[k];}
-            for(int k=0;k<6;++k)v[k]=pv[k]+v[k];
-        }
-        parent=parent>=0?next:-1;
-    }
-    for(int k=0;k<6;++k){s[6*lane+k]=v[k];s[192+6*lane+k]=a[k];}
-    __syncwarp(0xffffffffu);
-#else
-    float v[32][6],a[32][6]={},old_v[32][6],old_a[32][6];
-    int parent[32],next[32];
-    for(int lane=0;lane<32;++lane){parent[lane]=plan.body_parent.data[world*32+lane];for(int k=0;k<6;++k)v[lane][k]=s[6*lane+k];}
-    for(int round=0;round<4;++round) {
-        for(int lane=0;lane<32;++lane) {
-            next[lane]=parent[lane]>=0?parent[parent[lane]]:-1;
-            for(int k=0;k<6;++k){old_v[lane][k]=v[lane][k];old_a[lane][k]=a[lane][k];}
-        }
-        for(int lane=0;lane<32;++lane) {
-            if(parent[lane]>=0) {
-                const float* pv=old_v[parent[lane]];const float* pa=old_a[parent[lane]];const float* cv=old_v[lane];
-                const wp::vec3 p_lin(pv[0],pv[1],pv[2]),p_ang(pv[3],pv[4],pv[5]);
-                const wp::vec3 c_lin(cv[0],cv[1],cv[2]),c_ang(cv[3],cv[4],cv[5]);
-                const wp::vec3 c0=wp::cross(p_ang,c_lin),c1=wp::cross(p_lin,c_ang),c2=wp::cross(p_ang,c_ang);
-                for(int k=0;k<3;++k){a[lane][k]=pa[k]+old_a[lane][k]+(c0[k]+c1[k]);a[lane][k+3]=pa[k+3]+old_a[lane][k+3]+c2[k];}
-                for(int k=0;k<6;++k)v[lane][k]=pv[k]+cv[k];
-            }
-            parent[lane]=next[lane];
-        }
-    }
-    for(int lane=0;lane<32;++lane)for(int k=0;k<6;++k){s[6*lane+k]=v[lane][k];s[192+6*lane+k]=a[lane][k];}
-#endif
-"""
+_MOTION_SCAN = scan_source(True)
 
 
 @wp.func_native(_MOTION_SCAN)

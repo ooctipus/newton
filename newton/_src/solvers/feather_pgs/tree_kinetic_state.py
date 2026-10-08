@@ -5,15 +5,13 @@
 """Generated current/next tree moments, bias and fused state publication."""
 
 import functools
-import hashlib
-import linecache
 from types import SimpleNamespace
 
 import warp as wp
 
-from . import kernels, kuka_joint_world, sparse_factor, tree_chain_scan
+from . import kinetic_state, sparse_factor, tree_chain_scan
+from .cached_state import StateOperands, StateStages, make_body_terms, make_state_kernel
 from .tree_kinetic_layout import G1_LAYOUT, TreeLayout
-from .world_scan_publication import PublicationData
 
 
 @wp.struct
@@ -427,46 +425,15 @@ def get_helpers(layout: TreeLayout = G1_LAYOUT, chain_scan: bool = False, body_v
         refresh: int,
     ): ...
 
-    @wp.func
-    def _body_terms(
-        address: wp.uint64,
-        body: int,
-        local: int,
-        group: int,
-        pose: wp.transform,
-        pose_com: wp.transform,
-        origin: wp.vec3,
-        velocity: wp.spatial_vector,
-        acceleration: wp.spatial_vector,
-        data: PublicationData,
-        cache: KineticData,
-        refresh: int,
-    ):
-        radius = wp.transform_get_translation(pose_com) - origin
-        rotation = wp.transform_get_rotation(pose_com)
-        mass = data.body_mass[body]
-        inertia_local = data.body_inertia[body]
-        linear, omega = wp.spatial_top(velocity), wp.spatial_bottom(velocity)
-        a, alpha = wp.spatial_top(acceleration), wp.spatial_bottom(acceleration)
-        inertia = wp.mat33()
-        momentum, acceleration_force = wp.vec3(), wp.vec3()
-        if refresh != 0:
-            matrix = wp.quat_to_matrix(rotation)
-            inertia = matrix * inertia_local * wp.transpose(matrix)
-            momentum, acceleration_force = inertia * omega, inertia * alpha
-        else:
-            momentum = wp.quat_rotate(rotation, inertia_local * wp.quat_rotate_inv(rotation, omega))
-            acceleration_force = wp.quat_rotate(rotation, inertia_local * wp.quat_rotate_inv(rotation, alpha))
-        force = mass * (
-            a + wp.cross(alpha, radius) + wp.cross(omega, linear + wp.cross(omega, radius)) - data.gravity[0]
-        )
-        torque = acceleration_force + wp.cross(omega, momentum) + wp.cross(radius, force)
-        public_radius = wp.transform_point(pose, data.body_com[body]) - origin
-        data.body_qd[body] = wp.spatial_vector(linear + wp.cross(omega, public_radius), omega)
-        if wp.static(body_velocity):
-            data.body_v_s[body] = velocity
-        cache.com_offset[group, local] = radius
-        _store_terms(address, local, mass, radius, inertia, wp.spatial_vector(force, torque), refresh)
+    _body_terms = make_body_terms(
+        "address: wp.uint64, body: int, local: int, world: int, pose: wp.transform, pose_com: wp.transform, origin: wp.vec3, velocity: wp.spatial_vector, acceleration: wp.spatial_vector, data: PublicationData, cache: KineticData, refresh: int",
+        dict(globals(), _store_terms=_store_terms, _inertia_action=kinetic_state._inertia_action),
+        refresh="refresh",
+        cache="cache",
+        com_offset="radius",
+        body_velocity=body_velocity,
+        store="_store_terms(address, local, mass, radius, inertia_com, wrench, refresh)",
+    )
 
     @wp.func_native(collect_source)
     def _collect(
@@ -501,173 +468,124 @@ def get_state_kernel(
     _store_origin, _load_origin, _store_axis = h._store_origin, h._load_origin, h._store_axis
     _body_terms = h._body_terms
     bodies, dofs, free_root = layout.bodies, layout.dofs, layout.root_dofs == 6
-    source = "\n".join(
-        kuka_joint_world.operation_source(name)
-        for name in ("update_qdd_from_velocity", "remove_free_root_transport_from_qdd", "integrate_generalized_joints")
+    operands = StateOperands(
+        bodies,
+        dofs,
+        "js + local",
+        "ds + local",
+        "if wp.static(free_root) and lane == 0",
+        "plan.root_slot[group]",
     )
-    filename = f"<tree-kinetic-generalized-{hashlib.sha256(source.encode()).hexdigest()}>"
-    linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)
-    namespace = dict(kernels.__dict__)
-    exec(compile(source, filename, "exec"), namespace)
-    update_qdd = namespace["_light_update_qdd_from_velocity"]
-    remove_transport = namespace["_light_remove_free_root_transport_from_qdd"]
-    integrate = namespace["_light_integrate_generalized_joints"]
-
-    def state(
-        p: sparse_factor.SparsePlan,
-        plan: plan_type,
-        data: PublicationData,
-        cache: KineticData,
-        requests: wp.array[int],
-        global_refresh: int,
+    stages = StateStages(
+        setup="""
+group, logical_lane = wp.tid()
+lanes = _lanes()
+lane, stride = lanes[0], lanes[1]
+if stride == 1 and logical_lane != 0:
+    return
+art = p.group_to_art[group]
+ds, js = p.art_dof_start[art], p.art_joint_start[art]
+refresh = int(global_refresh != 0)
+if not wp.static(finish):
+    refresh = int(refresh != 0 or requests[art] != 0)
+    if (
+        cache.current_valid[art] != 0
+        and _same_source(cache, group, data.joint_q, data.joint_qd) != 0
+        and (
+            refresh == 0
+            or (
+                cache.geometry_valid[group] != 0 and cache.geometry_generation[group] == cache.generation[group]
+            )
+        )
     ):
-        group, logical_lane = wp.tid()
-        lanes = _lanes()
-        lane, stride = lanes[0], lanes[1]
-        if stride == 1 and logical_lane != 0:
-            return
-        art = p.group_to_art[group]
-        ds, js = p.art_dof_start[art], p.art_joint_start[art]
-        refresh = int(global_refresh != 0)
-        if not wp.static(finish):
-            refresh = int(refresh != 0 or requests[art] != 0)
-            if (
-                cache.current_valid[art] != 0
-                and _same_source(cache, group, data.joint_q, data.joint_qd) != 0
-                and (
-                    refresh == 0
-                    or (
-                        cache.geometry_valid[group] != 0 and cache.geometry_generation[group] == cache.generation[group]
-                    )
-                )
-            ):
-                return
-        if lane == 0:
-            cache.current_valid[art] = 0
-        address = _storage()
-        q = data.joint_q
-        qd = data.joint_qd
-        if wp.static(finish):
-            for local in range(lane, dofs, stride):
-                update_qdd(
-                    ds + local, data.joint_qd, data.kinematic_dof_mask, 1.0 / data.dt, data.v_out, data.joint_qdd
-                )
-            _sync()
-            if wp.static(free_root) and lane == 0:
-                remove_transport(
-                    plan.root_slot[group],
-                    data.free_root_joint_indices,
-                    data.joint_qd_start,
-                    data.kinematic_joint_mask,
-                    data.joint_qd,
-                    data.joint_qdd,
-                )
-            _sync()
-            for local in range(lane, bodies, stride):
-                integrate(
-                    js + local,
-                    data.joint_type,
-                    data.joint_parent,
-                    data.joint_child,
-                    data.joint_q_start,
-                    data.joint_qd_start,
-                    data.kinematic_joint_mask,
-                    data.joint_dof_dim,
-                    data.body_com,
-                    data.joint_X_c,
-                    data.joint_q,
-                    data.joint_qd,
-                    data.joint_qdd,
-                    data.dt,
-                    data.angular_damping,
-                    data.joint_q_new,
-                    data.joint_qd_new,
-                )
-            _sync()
-            q = data.joint_q_new
-            qd = data.joint_qd_new
-        for local in range(lane, bodies, stride):
-            joint = js + local
-            transform = kernels.jcalc_transform(
-                data.joint_type[joint],
-                data.joint_axis,
-                data.joint_qd_start[joint],
-                data.joint_dof_dim[joint, 0],
-                data.joint_dof_dim[joint, 1],
-                q,
-                data.joint_q_start[joint],
-            )
-            relative = data.joint_X_p[joint] * transform * wp.transform_inverse(data.joint_X_c[joint])
-            if local == 0:
-                _store_origin(address, 1, wp.transform_get_translation(relative))
-                relative = wp.transform(wp.vec3(), wp.transform_get_rotation(relative))
-            _store_pose(address, local, relative)
-        _sync()
-        scan_poses(address, plan)
-        if lane == 0:
-            root_body = data.joint_child[js]
-            origin = wp.transform_point(_load_pose(address, 0), data.body_com[root_body])
-            _store_origin(address, 0, origin)
-            data.articulation_origin[art] = origin + _load_origin(address, 1)
-        _sync()
-        origin = _load_origin(address, 0)
-        shift = _load_origin(address, 1)
-        for local in range(lane, bodies, stride):
-            joint = js + local
-            parent = plan.parent[local]
-            anchor = data.joint_X_p[joint]
-            if parent >= 0:
-                anchor = _load_pose(address, parent) * anchor
-            else:
-                anchor = wp.transform(wp.transform_get_translation(anchor) - shift, wp.transform_get_rotation(anchor))
-            anchor = wp.transform(wp.transform_get_translation(anchor) - origin, wp.transform_get_rotation(anchor))
-            velocity = kernels.jcalc_motion(
-                data.joint_type[joint],
-                data.joint_axis,
-                data.joint_dof_dim[joint, 0],
-                data.joint_dof_dim[joint, 1],
-                anchor,
-                qd,
-                data.joint_qd_start[joint],
-                data.joint_S_s,
-            )
-            start = data.joint_qd_start[joint]
-            count = data.joint_dof_dim[joint, 0] + data.joint_dof_dim[joint, 1]
-            for k in range(count):
-                _store_axis(address, start - ds + k, data.joint_S_s[start + k])
-            _store_motion(address, local, velocity)
-        _sync()
-        scan_motion(address, plan)
-        for local in range(lane, bodies, stride):
-            body = data.joint_child[js + local]
-            pose = _load_pose(address, local)
-            data.body_q[body] = wp.transform(
-                wp.transform_get_translation(pose) + shift, wp.transform_get_rotation(pose)
-            )
-            _body_terms(
-                address,
-                body,
-                local,
-                group,
-                pose,
-                pose * data.body_X_com[body],
-                origin,
-                _load_motion(address, local, 0),
-                _load_motion(address, local, 1),
-                data,
-                cache,
-                refresh,
-            )
-        _sync()
-        collect(address, group, p, plan, cache, refresh)
-        if lane == 0:
-            _stamp_source(cache, group, q, qd)
-        _release(address)
-
-    state.__name__ = state.__qualname__ = f"tree_kinetic_finish{bodies}" if finish else f"tree_kinetic_repair{bodies}"
+        return
+if lane == 0:
+    cache.current_valid[art] = 0
+""",
+        relative="""
+if local == 0:
+    _store_origin(address, 1, wp.transform_get_translation(relative))
+    relative = wp.transform(wp.vec3(), wp.transform_get_rotation(relative))
+""",
+        poses="""
+scan_poses(address, plan)
+if lane == 0:
+    root_body = data.joint_child[js]
+    origin = wp.transform_point(_load_pose(address, 0), data.body_com[root_body])
+    _store_origin(address, 0, origin)
+    data.articulation_origin[art] = origin + _load_origin(address, 1)
+_sync()
+origin = _load_origin(address, 0)
+shift = _load_origin(address, 1)
+""",
+        motion="""
+for local in range(lane, bodies, stride):
+    joint = js + local
+    parent = plan.parent[local]
+    anchor = data.joint_X_p[joint]
+    if parent >= 0:
+        anchor = _load_pose(address, parent) * anchor
+    else:
+        anchor = wp.transform(wp.transform_get_translation(anchor) - shift, wp.transform_get_rotation(anchor))
+    anchor = wp.transform(wp.transform_get_translation(anchor) - origin, wp.transform_get_rotation(anchor))
+    velocity = kernels.jcalc_motion(
+        data.joint_type[joint],
+        data.joint_axis,
+        data.joint_dof_dim[joint, 0],
+        data.joint_dof_dim[joint, 1],
+        anchor,
+        qd,
+        data.joint_qd_start[joint],
+        data.joint_S_s,
+    )
+    start = data.joint_qd_start[joint]
+    count = data.joint_dof_dim[joint, 0] + data.joint_dof_dim[joint, 1]
+    for k in range(count):
+        _store_axis(address, start - ds + k, data.joint_S_s[start + k])
+    _store_motion(address, local, velocity)
+_sync()
+scan_motion(address, plan)
+""",
+        bodies="""
+for local in range(lane, bodies, stride):
+    body = data.joint_child[js + local]
+    pose = _load_pose(address, local)
+    data.body_q[body] = wp.transform(
+        wp.transform_get_translation(pose) + shift, wp.transform_get_rotation(pose)
+    )
+    _body_terms(
+        address,
+        body,
+        local,
+        group,
+        pose,
+        pose * data.body_X_com[body],
+        origin,
+        _load_motion(address, local, 0),
+        _load_motion(address, local, 1),
+        data,
+        cache,
+        refresh,
+    )
+_sync()
+""",
+        collect="""
+collect(address, group, p, plan, cache, refresh)
+if lane == 0:
+    _stamp_source(cache, group, q, qd)
+""",
+    )
+    name = f"tree_kinetic_finish{bodies}" if finish else f"tree_kinetic_repair{bodies}"
     if chain_scan:
-        state.__name__ = state.__qualname__ = state.__name__ + "_chain"
-    return wp.kernel(module="unique", enable_backward=False)(state)
+        name += "_chain"
+    return make_state_kernel(
+        name,
+        "p: sparse_factor.SparsePlan, plan: plan_type, data: PublicationData, cache: KineticData, requests: wp.array[int], global_refresh: int",
+        operands,
+        stages,
+        dict(globals(), **locals()),
+        finish=finish,
+    )
 
 
 @functools.cache

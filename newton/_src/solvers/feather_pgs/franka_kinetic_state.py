@@ -5,11 +5,8 @@
 
 import functools
 import hashlib
-import inspect
-import linecache
 import math
 import os
-import textwrap
 
 import numpy as np
 import warp as wp
@@ -18,10 +15,12 @@ from ...sim import ModelFlags
 from . import (  # noqa: F401 - names in the checked generated state factory
     kernels,
     kinetic_state,
-    kuka_joint_world,
     world_scan_owner,
     world_scan_publication,
 )
+from .cached_state import make_body_terms
+from .cached_state_forest import make_forest_state
+from .cached_state_scan import scan_source
 
 PublicationData = world_scan_publication.PublicationData
 
@@ -140,24 +139,11 @@ def _sync(): ...
 def _storage() -> wp.uint64: ...
 
 
-def _paired_scan(source):
-    """Keep the original parent-jump arithmetic, with independent CUDA half-warps."""
-    cuda, cpu = source.split("#else\n", 1)
-    original = "const int lane=threadIdx.x&31;"
-    if cuda.count(original) != 1 or cuda.count(",source);") != cuda.count("__shfl_sync"):
-        raise RuntimeError("Original world scan lane/shuffle seam changed")
-    cuda = cuda.replace(original, "const int lane=threadIdx.x&15; const unsigned mask=0xffffu<<(threadIdx.x&16);")
-    cuda = cuda.replace("__shfl_sync(0xffffffffu,", "__shfl_sync(mask,")
-    cuda = cuda.replace(",source);", ",source,16);")
-    cuda = cuda.replace("__syncwarp(0xffffffffu);", "__syncwarp(mask);")
-    return cuda + "#else\n" + cpu
-
-
-@wp.func_native(_paired_scan(world_scan_publication._POSE_SCAN))
+@wp.func_native(scan_source(False, cuda_width=16))
 def _scan_poses(address: wp.uint64, world: int, plan: KineticPlan): ...
 
 
-@wp.func_native(_paired_scan(world_scan_publication._MOTION_SCAN))
+@wp.func_native(scan_source(True, cuda_width=16))
 def _scan_motion(address: wp.uint64, world: int, plan: KineticPlan): ...
 
 
@@ -196,41 +182,19 @@ def _store_terms(
 ): ...
 
 
-@wp.func
-def _primary_terms(
-    address: wp.uint64,
-    local: int,
-    world: int,
-    body: int,
-    pose: wp.transform,
-    pose_com: wp.transform,
-    origin: wp.vec3,
-    velocity: wp.spatial_vector,
-    acceleration: wp.spatial_vector,
-    data: PublicationData,
-    cache: KineticData,
-    refresh: int,
-):
-    radius = wp.transform_get_translation(pose_com) - origin
-    rotation = wp.transform_get_rotation(pose_com)
-    mass, inertia_local = data.body_mass[body], data.body_inertia[body]
-    linear, omega = wp.spatial_top(velocity), wp.spatial_bottom(velocity)
-    a, alpha = wp.spatial_top(acceleration), wp.spatial_bottom(acceleration)
-    inertia = wp.mat33()
-    momentum, acceleration_force = wp.vec3(), wp.vec3()
-    if refresh != 0:
-        matrix = wp.quat_to_matrix(rotation)
-        inertia = matrix * inertia_local * wp.transpose(matrix)
-        momentum, acceleration_force = inertia * omega, inertia * alpha
-    else:
-        momentum = wp.quat_rotate(rotation, inertia_local * wp.quat_rotate_inv(rotation, omega))
-        acceleration_force = wp.quat_rotate(rotation, inertia_local * wp.quat_rotate_inv(rotation, alpha))
-    force = mass * (a + wp.cross(alpha, radius) + wp.cross(omega, linear + wp.cross(omega, radius)) - data.gravity[0])
-    torque = acceleration_force + wp.cross(omega, momentum) + wp.cross(radius, force)
-    public_radius = wp.transform_point(pose, data.body_com[body]) - origin
-    data.body_qd[body] = wp.spatial_vector(linear + wp.cross(omega, public_radius), omega)
-    cache.com_offset[world, local] = public_radius
-    _store_terms(address, local, mass, radius, inertia, wp.spatial_vector(force, torque), refresh)
+def make_primary_terms(store_terms):
+    """Bind body arithmetic to the selected scratch layout and public COM offset."""
+    return make_body_terms(
+        "address: wp.uint64, local: int, world: int, body: int, pose: wp.transform, pose_com: wp.transform, origin: wp.vec3, velocity: wp.spatial_vector, acceleration: wp.spatial_vector, data: PublicationData, cache: KineticData, refresh: int",
+        dict(globals(), _store_terms=store_terms, _inertia_action=kinetic_state._inertia_action),
+        refresh="refresh",
+        cache="cache",
+        com_offset="public_radius",
+        store="_store_terms(address, local, mass, radius, inertia_com, wrench, refresh)",
+    )
+
+
+_primary_terms = make_primary_terms(_store_terms)
 
 
 @wp.func_native(r"""
@@ -306,132 +270,63 @@ def _replace(source, old, new, count=1):
     return source.replace(old, new)
 
 
-def state_source():
-    """Retain the checked original integration/free-body law, replacing primary ownership."""
-    source = textwrap.dedent(inspect.getsource(kinetic_state._get_kernel))
-    source = source.removeprefix("@functools.cache\n")
-    source = _replace(source, "def _get_kernel(arch, finish):", "def _factory(finish):")
-    source = _replace(source, "    checked_source()\n", "")
-    source = _replace(source, '    @wp.kernel(module="unique", enable_backward=False)\n', "")
-    source = _replace(
-        source,
-        "        world, logical_lane = wp.tid()\n",
-        """        group, logical_lane = wp.tid()
-        world = _world(group)
-        if world >= plan.body_ids.shape[0]:
+def make_state_kernel(finish, namespace, *, suffix=""):
+    """Bind the shared forest law to explicit storage helpers and cache lifetime."""
+    name = f"franka_kinetic_{'finish' if finish else 'repair'}13_h81{suffix}_p16"
+    return make_forest_state(
+        name,
+        namespace,
+        finish=finish,
+        primary_bodies=11,
+        free_roots=2,
+        dofs=21,
+        signature="plan: KineticPlan, data: PublicationData, cache: KineticData, requests: wp.array[int], global_refresh: int",
+        setup="""
+group, logical_lane = wp.tid()
+world = _world(group)
+if world >= plan.body_ids.shape[0]:
+    return
+lanes = _lane()
+lane, stride = lanes[0], lanes[1]
+if stride == 1 and logical_lane != 0:
+    return
+refresh = int(global_refresh != 0)
+if not wp.static(finish):
+    valid = int(1)
+    for root in range(3):
+        art = plan.arts[world, root]
+        refresh = int(refresh != 0 or requests[art] != 0)
+        valid = valid & cache.current_valid[art]
+    if valid != 0 and _same_source(cache, world, data.joint_q, data.joint_qd) != 0:
+        if refresh == 0 or (cache.geometry_valid[world] != 0 and cache.geometry_generation[world] == cache.generation[world]):
             return
 """,
-    )
-    source = _replace(
-        source,
-        "        schedule: KineticSchedule,\n        current: CurrentKineticCache,\n        geometric: GeometricCache,",
-        "        cache: KineticData,\n        requests: wp.array[int],\n        global_refresh: int,",
-    )
-    source = _replace(
-        source,
-        "        if _admit(world, int(wp.static(finish)), plan, data, schedule, current, geometric) == 0:\n            return\n        data.gravity = _world_gravity(data.gravity, world)\n",
-        """        refresh = int(global_refresh != 0)
-        if not wp.static(finish):
-            valid = int(1)
-            for root in range(3):
-                art = plan.arts[world, root]
-                refresh = int(refresh != 0 or requests[art] != 0)
-                valid = valid & cache.current_valid[art]
-            if valid != 0 and _same_source(cache, world, data.joint_q, data.joint_qd) != 0:
-                if refresh == 0 or (cache.geometry_valid[world] != 0 and cache.geometry_generation[world] == cache.generation[world]):
-                    return
+        joint_motion="""
+local_dof = plan.body_local_dof[world, local]
+velocity = kernels.jcalc_motion(
+    data.joint_type[joint], data.joint_axis,
+    data.joint_dof_dim[joint, 0], data.joint_dof_dim[joint, 1],
+    anchor_local, qd, data.joint_qd_start[joint], data.joint_S_s,
+)
+if local < $PRIMARY_BODIES and local_dof >= 0:
+    axis = data.joint_S_s[data.joint_qd_start[joint]]
+    _store_axis(address, local_dof, axis)
 """,
+        origin_publication="    data.articulation_origin[data.body_to_articulation[body]] = origin + _load_shift(address, root)",
+        terms_args="        cache,\n        refresh,",
+        cache="cache",
+        free_com_offset="wp.transform_point(pose, data.body_com[body]) - origin",
+        collect="_collect(address, world, plan, data, cache, refresh)",
+        valid="success != 0 and cache.status[world] == 0",
+        stamp="if lane == 0:\n    _stamp_source(cache, world, q, qd)\n",
+        padded=True,
     )
-    source = source.replace("range(lane, 35, stride)", "range(lane, 21, stride)")
-    # Only pose/motion scans use padding; physical accesses retain all13 bodies.
-    source = source.replace("range(lane, 32, stride)", "range(lane, 13, stride)")
-    source = (
-        source.replace("local >= 30", "local >= 11")
-        .replace("local < 30", "local < 11")
-        .replace("local == 30", "local == 11")
-    )
-    source = source.replace("local - 29", "local - 10").replace("29 + root", "10 + root")
-    source = source.replace("current.", "cache.")
-    source = _replace(
-        source,
-        "        _scan_poses(address, world, plan)",
-        """        for padding in range(lane, _scan_width(), stride):
-            if padding >= 13:
-                _store_pose(address, padding, wp.transform_identity())
-        _sync()
-        _scan_poses(address, world, plan)""",
-    )
-    source = _replace(
-        source,
-        "            cache.origin[world, root] = origin + _load_shift(address, root)\n            if root > 0:\n                data.articulation_origin[data.body_to_articulation[body]] = cache.origin[world, root]",
-        "            data.articulation_origin[data.body_to_articulation[body]] = origin + _load_shift(address, root)",
-    )
-    first = source.index("            if local < 11:\n                if local_dof >= 0:")
-    end = source.index("            _store_motion(address, local, velocity)", first)
-    source = (
-        source[:first]
-        + """            velocity = kernels.jcalc_motion(
-                data.joint_type[joint], data.joint_axis,
-                data.joint_dof_dim[joint, 0], data.joint_dof_dim[joint, 1],
-                anchor_local, qd, data.joint_qd_start[joint], data.joint_S_s,
-            )
-            if local < 11 and local_dof >= 0:
-                axis = data.joint_S_s[data.joint_qd_start[joint]]
-                _store_axis(address, local_dof, axis)
-"""
-        + source[end:]
-    )
-    source = _replace(
-        source,
-        "        _scan_motion(address, world, plan)",
-        """        for padding in range(lane, _scan_width(), stride):
-            if padding >= 13:
-                _store_motion(address, padding, wp.spatial_vector())
-        _sync()
-        _scan_motion(address, world, plan)""",
-    )
-    source = _replace(
-        source,
-        "                    schedule,\n                    current,",
-        "                    cache,\n                    refresh,",
-    )
-    source = _replace(
-        source,
-        "        success = _collect(address, world, plan, data, schedule, current, geometric)",
-        "        success = _collect(address, world, plan, data, cache, refresh)",
-    )
-    source = _replace(
-        source,
-        "                cache.com_offset[world, local] = wp.transform_get_translation(pose_com) - origin",
-        "                cache.com_offset[world, local] = wp.transform_point(pose, data.body_com[body]) - origin",
-    )
-    source = _replace(
-        source, "                root > 0 and success != 0", "                success != 0 and cache.status[world] == 0"
-    )
-    source = _replace(
-        source,
-        "        _release(address)",
-        "        if lane == 0:\n            _stamp_source(cache, world, q, qd)\n        _release(address)",
-    )
-    source = _replace(
-        source,
-        "    return kinetic_state",
-        """    name = "franka_kinetic_finish13_h81_p16" if finish else "franka_kinetic_repair13_h81_p16"
-    kinetic_state.__name__ = name
-    kinetic_state.__qualname__ = name
-    return wp.kernel(module="unique", enable_backward=False)(kinetic_state)""",
-    )
-    return source
 
 
 @functools.cache
 def get_state_kernel(finish):
-    source = state_source()
-    filename = f"<franka-kinetic-state-{hashlib.sha256(source.encode()).hexdigest()}>"
-    linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)
-    namespace = dict(globals())
-    exec(compile(source, filename, "exec"), namespace)
-    return namespace["_factory"](finish)
+    """Construct a paired-world state kernel without inspecting another owner."""
+    return make_state_kernel(finish, globals())
 
 
 @wp.func_native(r"""

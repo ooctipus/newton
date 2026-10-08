@@ -50,8 +50,8 @@ PINNED = {
     },
     "world_scan_publication.py": {
         "PublicationData": "fcf16576d1e626ccdb95ea13d55bbe84ec55a221d50705f1b03179e5f62d8452",
-        "_POSE_SCAN": "bc948784b3102bfcbd74e5fd5d662cbcd5d9ab22f74ed28aa51778befb73bf69",
-        "_MOTION_SCAN": "e5229c09e4ce980400c34e2a652be97ec4f4225f088ef86a332596425f1cc1db",
+        "_POSE_SCAN": "6528a482804fa69088920e695a4d87f7f517bbb95cfce5c013f40041fc291317",
+        "_MOTION_SCAN": "671291e49542ba1649414552ec76e7070d542842dfb2da21c93a74affbb9248c",
         "_release": "58af3211560e7d4d26ca0b40e25d635e5ede62aec31568d600430a159fcb2715",
         "_sync": "7d41b3345db71397d0e001eaa2c2829f9c1dd3971b55b8e44b8400c0803ff55e",
         "_lane": "2612cc789289f0770732f9d03fb5575e8f29004133291745a61b5ab210c63636",
@@ -102,12 +102,12 @@ PINNED = {
         "_release": "58af3211560e7d4d26ca0b40e25d635e5ede62aec31568d600430a159fcb2715",
     },
     "kinetic_state.py": {
-        "_get_kernel": "7fc019e179269f7b16f819f0e3fd4fc74d2eca3f29ed956d312e15f0a9d22f9e",
+        "_get_kernel": "778f494967f88266050fccae1b53725f169ecf1447d807129a09cceed1ce30a0",
         "_world_gravity": "faffbf54ec341a09a0d99b459e6efe0956cc7b19026f6574c1bd3c99dc89806f",
         "_admit": "dad7435af0211e5b06822534a1003187a90f54ea997e4b20d5a52e123c85fe87",
         "_collect": "2c197cfa06bc5bbfeff5aa381ab6a7f594f61642a8b9bda765c4174e7dc1d6f6",
         "_COLLECT": "8409f401ce8985e5990e322896d36a57adee6185c5fb1f26c4f58ec7030e2b9b",
-        "_primary_terms": "d5f756e1fbc8dfb12015ab0315a2aa74e11af9ff25c5f33402dbda939c78bba8",
+        "_primary_terms": "6b62b2c97692764bfc59feb026fdcd6482990a821a9882c9d409c2c4b0705374",
     },
     "kinetic_solve.py": {
         "_T": "03521fc92b11e045c58334667f9d55afbb9bd5b353ff4f5ecc0607def94db291",
@@ -133,6 +133,27 @@ PINNED = {
         "get_qualify_kernel": "f524aab764befe22c841faf9b1b0e52a5cc3a8e47d7d0316ecc0179d99c8a7be",
         "get_materialize_kernel": "8deeca3844d44e771c2d7f69b8a0dc6481c096f8b2c23fa94f5926f457d2369c",
         "get_general_kernel": "a8bbe6aa75c6dd8064f3b60cbdcc6d8ea8d6d72946b5afe3082fb157a1e1bf2f",
+    },
+    "cached_state.py": {
+        "_INTEGRATION": "33f3c5af040aa39de98421346673484f257af0bd542d68b4098137e204c65457",
+        "_RELATIVE": "7f1820f6cfaabfdf6ddaf55726577cc2246e01d41022daf1159f74ef1837a8f0",
+        "_BODY_TERMS": "ef664e8ed9bf3772cecfcdcec9e58ebcc92c7a11cbd4d33c32b15d5356622ed4",
+        "generalized_operations": "243b23e904bda78216977a582b6a448b02ff1bcc2f40e03a3c025ebb601691db",
+        "make_state_kernel": "8332bec15de106b47a9b5e3b8ded7bc988d70507a2ed4901c7565a1e57f08274",
+        "make_body_terms": "00234de7e281fefae0c7c9830117848a1ec0c25466bbd1a767c455e0b9a1bba0",
+    },
+    "cached_state_forest.py": {
+        "_RELATIVE": "b291f1964566690e5bc7ad5fc7f79a1352c0cdbb227760fff3ffe1fec303b500",
+        "_ORIGINS": "13c17885220eeebd65f6212f43e76c23c7ae5a019ba024e25be5dbc674e282bf",
+        "_MOTION": "5ea5b1019cb1d988f4fd3dd05137f70a3074cc9ffcef574d73791a214c29e2b8",
+        "_BODIES": "792cc984b7c272c708953feeb47a8780492f88e7f695ae07ab6286c75e6d87ef",
+        "_COLLECT": "476792fbbf181045c9ec22114b77221fd0eb9f43ae6038f19a05cb53011ee656",
+        "make_forest_state": "be5424d94f2586b384d07768f3fa70b8d58e50b8b7967896cd64ffecc372aa22",
+    },
+    "cached_state_scan.py": {
+        "_POSE_SCAN_TEMPLATE": "77022694a55763e5d496d9088c43646b138a3eb54091bdf62a54be9c6a81626a",
+        "_MOTION_SCAN_TEMPLATE": "9827d2152eca7894e159c788f8f368550f9b394345f6a802223e92657eb730dc",
+        "scan_source": "18e8b2533f9b3e5412d7e3c4d95e987a96eacb941fd0abebba0a68de687d580c",
     },
 }
 
