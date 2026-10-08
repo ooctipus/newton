@@ -71,12 +71,13 @@ class ParallelRowInputs:
     metadata may already exist; deferred contacts must not read stale fields.
     """
 
-    stage: str
+    stage: str | None
     arguments: tuple[RowArgument, ...]
     row_type: str
     rhs: str
     parent: str
     mu: str
+    physical_row: str | None = None
 
 
 def make_row_kernel(name, snippet, signature, arguments=(), *, dispatch, groups=1, lanes=32):

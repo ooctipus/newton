@@ -3083,7 +3083,10 @@ class SolverFeatherPGS(SolverBase):
         if (
             self._sparse_mass_matrix_size is None
             and self._point_contact_paths
-            and os.environ.get("FEATHER_PGS_ALLEGRO_KINETIC_ROWS") == "1"
+            and (
+                os.environ.get("FEATHER_PGS_ALLEGRO_KINETIC_ROWS") == "1"
+                or os.environ.get("FEATHER_PGS_GENERATED_KEYED_ROWS") == "1"
+            )
         ):
             from .allegro_kinetic_rows import create_owner as create_kinetic_rows_owner  # noqa: PLC0415
 
@@ -7373,7 +7376,7 @@ class SolverFeatherPGS(SolverBase):
                 if self._allegro_kinetic_rows is not None:
                     from .allegro_kinetic_rows import get_parallel_factory  # noqa: PLC0415
 
-                    parallel_factory = get_parallel_factory(parallel_factory)
+                    parallel_factory = get_parallel_factory(parallel_factory, self._allegro_kinetic_rows.layout)
                 tiers = [(min(32, parallel_rows), 0)]
                 if parallel_rows > 32:
                     tiers.append((min(64, parallel_rows), 32))
@@ -28805,6 +28808,7 @@ def _get_pgs_solve_parallel_kernel(
         else ""
     )
     WR_CHECK = 1 if (WR and _WR_CHECK) else 0
+    operands = row_inputs(NA, NB, OA, OB, D, M_D) if row_inputs is not None else None
     whitening_mode = _parallel_register_whitening_mode(
         enabled=_REGISTER_WHITENING,
         device_arch=device_arch,
@@ -28812,7 +28816,7 @@ def _get_pgs_solve_parallel_kernel(
         max_world_dofs=D,
         matrix_free=bool(MF),
         inkernel_response=(NA, NB, OA, OB) if INK else None,
-        world_rows=bool(WR),
+        world_rows=bool(WR or (operands is not None and operands.physical_row is not None)),
         exact_row_sums=bool(EXACT),
         has_drive_rows=has_drive_rows,
         has_dense_velocity_limit_rows=has_dense_velocity_limit_rows,
@@ -28823,6 +28827,36 @@ def _get_pgs_solve_parallel_kernel(
     )
     register_whitening = whitening_mode != 0
     whitening_overlay = whitening_mode == 2
+    input_read = f"""
+            const float* Jg = &ink_J_a.data[((size_t)ink_ga * {M_D} + i) * {NA}];
+            #pragma unroll
+            for (int d = 0; d < {NA}; ++d) Zi[(ink_oa + d) * ZS] = Jg[d];
+            if ({NB} > 0 && ink_gb >= 0) {{
+                constexpr int NB_ = {NB} > 0 ? {NB} : 1;
+                const float* Jgb = &ink_J_b.data[((size_t)ink_gb * {M_D} + i) * NB_];
+                #pragma unroll
+                for (int d = 0; d < NB_; ++d) Zi[(ink_ob + d) * ZS] = Jgb[d];
+            }}
+"""
+    input_arguments = ()
+    input_row_type = "world_row_type.data[off_dense + i]"
+    input_rhs = "rhs_bias.data[off_dense + i]"
+    input_parent = "world_row_parent.data[off_dense + i]"
+    input_mu = "world_row_mu.data[off_dense + i]"
+    if row_inputs is not None:
+        if WR or ZG or INK_CHECK or not INK or not MF or HD or LEAN or BF or STOP:
+            raise ValueError("generated factor rows require the ordinary matrix-free parallel law")
+        if operands.stage is not None and (EXACT or register_whitening):
+            raise ValueError("preprojected row staging does not implement exact row sums or register whitening")
+        if operands.physical_row is not None:
+            input_read = operands.physical_row
+        input_arguments = operands.arguments
+        input_row_type, input_rhs, input_parent, input_mu = (
+            operands.row_type,
+            operands.rhs,
+            operands.parent,
+            operands.mu,
+        )
     ink_stage = f"""    // In-kernel response in whitened coordinates: Z_i = L^-1 J_i^T per row (forward substitution in place with the
     // Cholesky factors staged in shared memory). A = Z^T Z, so the sweep needs neither J nor Y = H^-1 J^T; the
     // velocity update is recovered at the end with one backward substitution on the accumulated D-vector.
@@ -28885,15 +28919,7 @@ def _get_pgs_solve_parallel_kernel(
 {wr_build}
 #endif
         if (!built) {{
-            const float* Jg = &ink_J_a.data[((size_t)ink_ga * {M_D} + i) * {NA}];
-            #pragma unroll
-            for (int d = 0; d < {NA}; ++d) Zi[(ink_oa + d) * ZS] = Jg[d];
-            if ({NB} > 0 && ink_gb >= 0) {{
-                constexpr int NB_ = {NB} > 0 ? {NB} : 1;
-                const float* Jgb = &ink_J_b.data[((size_t)ink_gb * {M_D} + i) * NB_];
-                #pragma unroll
-                for (int d = 0; d < NB_; ++d) Zi[(ink_ob + d) * ZS] = Jgb[d];
-            }}
+{input_read}
         }}
 #if {WR_CHECK}
         {{   // debug: publish the in-kernel J row and bias so the launch site can compare them with the producers
@@ -28984,23 +29010,8 @@ def _get_pgs_solve_parallel_kernel(
             ink_stage += f"    SYNC();\n    if (lane < n_rows) {{ const int i = lane;\n{publication}\n    }}\n"
         else:
             ink_stage = ink_stage.replace(old_publish, publication)
-    input_arguments = ()
-    input_row_type = "world_row_type.data[off_dense + i]"
-    input_rhs = "rhs_bias.data[off_dense + i]"
-    input_parent = "world_row_parent.data[off_dense + i]"
-    input_mu = "world_row_mu.data[off_dense + i]"
-    if row_inputs is not None:
-        if register_whitening or WR or ZG or INK_CHECK or not INK or not MF or HD or EXACT or LEAN or BF or STOP:
-            raise ValueError("generated factor rows require the ordinary matrix-free parallel law")
-        operands = row_inputs(NA, NB, OA, OB, D, M_D)
+    if row_inputs is not None and operands.stage is not None:
         ink_stage = operands.stage
-        input_arguments = operands.arguments
-        input_row_type, input_rhs, input_parent, input_mu = (
-            operands.row_type,
-            operands.rhs,
-            operands.parent,
-            operands.mu,
-        )
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const unsigned MASK = 0xFFFFFFFF;
