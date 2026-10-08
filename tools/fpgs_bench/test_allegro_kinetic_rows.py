@@ -68,6 +68,14 @@ def fixture(snapshot, device):
     solver.diag = wp.zeros_like(solver.rhs)
     solver.row_w = wp.zeros_like(solver.rhs)
     solver._contact_w = 1.0
+    solver._joint_limit_q_index_host = solver._joint_limit_q_index.numpy()
+    world_indices = snapshot["solver_world_dof_indices"]
+    offsets = [
+        int(np.flatnonzero(world_indices[world] == start)[0])
+        for world, start in zip(snapshot["solver_art_to_world"], snapshot["solver_articulation_dof_start"], strict=True)
+    ]
+    solver.articulation_world_dof_offset = wp.array(offsets, dtype=int, device=device)
+    solver.mf_gs_parallel_rows = 128  # The four replay tiers below preserve the captured policy.
     solver._reference_J = np.concatenate((snapshot["J_16"], snapshot["J_6"]), axis=2).astype(np.float64)
     state = SimpleNamespace(body_q=array("state_body_q", wp.transform), joint_q=array("state_joint_q"))
     aug = SimpleNamespace(

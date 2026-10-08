@@ -139,96 +139,6 @@ class KineticRows:
     contact: ContactInput
 
 
-@cache
-def get_prefix_kernel():
-    """Reserve stable position and signed velocity prefixes without dense e_i rows."""
-    source = r"""
-    const int first = p.starts.data[world * 2];
-    const int second = p.starts.data[world * 2 + 1];
-    const int M = p.kind.shape[1];
-#if defined(__CUDA_ARCH__)
-    const int lane = threadIdx.x;
-    for (int k = lane; k < 44; k += 32) {
-#else
-    for (int k = 0; k < 44; ++k) {
-#endif
-        const int dof = k / 2 < 16 ? first + k / 2 : second + k / 2 - 16;
-        p.velocity_slots.data[dof * 2 + k % 2] = -1;
-        p.velocity_signs.data[dof * 2 + k % 2] = 0.0f;
-    }
-    int base = 0;
-    for (int phase = 0; phase < 2; ++phase) {
-#if !defined(__CUDA_ARCH__)
-        int phase_count = 0;
-        for (int lane = 0; lane < 32; ++lane) {
-#endif
-        const int d = lane / 2, side = lane & 1, dof = first + d;
-        const float sign = side == 0 ? 1.0f : -1.0f;
-        bool active = false;
-        float phi = 0.0f, target = 0.0f;
-        if (phase == 0) {
-            const int qi = p.q_index.data[dof];
-            if (qi >= 0) {
-                const float bound = side == 0 ? p.lower.data[dof] : p.upper.data[dof];
-                const float q = p.q.data[qi];
-                phi = side == 0 ? q - bound : bound - q;
-                active = isfinite(bound) && (side == 0 ? q <= bound + p.gap : q >= bound - p.gap);
-            }
-        } else {
-            const float limit = p.velocity_limit.data[dof];
-            active = !(limit <= 0.0f) && !(p.activation > 0.0f && fabsf(p.vhat.data[dof]) < p.activation * limit);
-            target = -limit;
-        }
-#if defined(__CUDA_ARCH__)
-        const unsigned mask = __ballot_sync(0xffffffffu, active);
-        const int phase_count = __popc(mask);
-        const int rank = __popc(mask & (lane == 0 ? 0u : ((1u << lane) - 1u)));
-#else
-        const int rank = phase_count;
-        phase_count += active;
-#endif
-        const int slot = base + rank;
-        if (active && slot < M) {
-            const int at = world * M + slot;
-            z.rowkeys.data[at] = ~(d * 2 + side);
-            p.kind.data[at] = phase == 0 ? 3 : 4;
-            p.parent.data[at] = -1; p.mu.data[at] = 0.0f;
-            p.beta.data[at] = phase == 0 ? p.pgs_beta : 0.0f;
-            p.cfm.data[at] = p.pgs_cfm;
-            p.phi.data[at] = phi; p.target.data[at] = target;
-            p.restitution.data[at] = 0.0f;
-            p.rhs.data[at] = phase == 1 ? -target : ((phi < 0.0f ? p.pgs_beta : 1.0f) * phi / p.dt);
-            if (phase == 1) {
-                p.velocity_slots.data[dof * 2 + side] = slot;
-                p.velocity_signs.data[dof * 2 + side] = sign;
-            }
-        }
-#if !defined(__CUDA_ARCH__)
-        }
-#endif
-        base += phase_count;
-#if defined(__CUDA_ARCH__)
-        if (lane == 0)
-#endif
-        p.bounds.data[world * 2 + phase] = base;
-    }
-#if defined(__CUDA_ARCH__)
-    if (lane == 0)
-#endif
-    p.counts.data[world] = base;
-"""
-
-    @wp.func_native(source)
-    def native(world: int, logical_lane: int, p: PrefixInput, z: KineticRows): ...
-
-    @wp.kernel(module="unique", enable_backward=False)
-    def allegro_kinetic_limit_prefix(p: PrefixInput, z: KineticRows):
-        world, lane = wp.tid()
-        native(world, lane, p, z)
-
-    return allegro_kinetic_limit_prefix
-
-
 @wp.kernel(enable_backward=False)
 def scatter_contact_keys(data: ContactInput, z: KineticRows):
     """Emit only the original allocated raw contact ID and row direction."""
@@ -670,6 +580,7 @@ class AllegroKineticRows:
             body_map = np.full(1, -1, dtype=np.int32)
         else:
             groups, starts, body_map = topology_plan(solver)
+        self.prefix_layout = self.layout if direct else direct_topology_plan(solver)[0]
         dev, worlds, capacity = solver.model.device, solver.world_count, solver.dense_max_constraints
         self.data, self.maps, self.prefix = KineticRows(), MapInput(), PrefixInput()
         self.data.rowkeys = wp.empty((worlds, capacity), dtype=int, device=dev)
@@ -699,7 +610,7 @@ class AllegroKineticRows:
             raise RuntimeError("Allegro kinetic topology changed; reconstruct the solver before notification")
         if self.layout is None:
             topology_plan(self.solver)
-        elif direct_topology_plan(self.solver)[0] != self.layout:
+        if direct_topology_plan(self.solver)[0] != self.prefix_layout:
             raise RuntimeError("Keyed row topology changed; reconstruct the solver")
 
     def begin_rows(self, state_in, state_aug, dt):
@@ -749,7 +660,7 @@ class AllegroKineticRows:
         self.data.maps, self.data.prefix = m, p
         if self.layout is None:
             wp.launch_tiled(get_map_kernel(), dim=[s.world_count], inputs=[m], block_dim=32, device=s.model.device)
-        prefix = get_prefix_kernel() if self.layout is None else prefix_kernel(self.layout, PrefixInput, KineticRows)
+        prefix = prefix_kernel(self.prefix_layout, PrefixInput, KineticRows)
         wp.launch_tiled(prefix, dim=[s.world_count], inputs=[p, self.data], block_dim=32, device=s.model.device)
 
     def produce_contacts(self, state_in, state_aug, contacts, dt):

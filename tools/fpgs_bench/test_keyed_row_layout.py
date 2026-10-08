@@ -33,10 +33,16 @@ class TestKeyedRowLayout(unittest.TestCase):
 
     def test_prefix_laws_order_and_capacity(self):
         """Preserve unary laws, row order and bounded storage."""
-        for na, nb, oa, ob, velocity in [(18, 0, 0, 0, False), (9, 6, 6, 0, True), (3, 0, 0, 0, True)]:
+        for na, nb, oa, ob, velocity, position_mask, velocity_mask in [
+            (18, 0, 0, 0, False, (1 << 18) - 1, 0),
+            (9, 6, 6, 0, True, (1 << 15) - 1, (1 << 15) - 1),
+            (3, 0, 0, 0, True, 7, 7),
+            (9, 6, 6, 0, True, 0b101010101010100, 0b110011001100000),
+            (18, 0, 0, 0, False, 0, 0),
+        ]:
             with self.subTest(layout=(na, nb, oa, ob, velocity)):
                 d, worlds, capacity = na + nb, 3, 17
-                layout = KeyedLayout(na, nb, oa, ob, 16, velocity, (1 << (na + nb)) - 1)
+                layout = KeyedLayout(na, nb, oa, ob, 16, velocity, velocity_mask, position_mask=position_mask)
                 p, z = rows.PrefixInput(), rows.KineticRows()
                 starts = np.array([[w * d, w * d + na] for w in range(worlds)], np.int32)
                 q = np.linspace(-0.4, 0.4, worlds * d, dtype=np.float32)
@@ -73,12 +79,32 @@ class TestKeyedRowLayout(unittest.TestCase):
                             for side in (0, 1):
                                 sign = 1.0 if side == 0 else -1.0
                                 phi = sign * q[dof] + 0.2 if phase == 0 else 0.0
-                                active = phi <= 0.1 if phase == 0 else velocity and abs(v[dof]) >= 1.4
+                                active = (
+                                    (bool(position_mask & (1 << coordinate)) and phi <= 0.1)
+                                    if phase == 0
+                                    else (velocity and bool(velocity_mask & (1 << coordinate)) and abs(v[dof]) >= 1.4)
+                                )
                                 if active:
                                     rhs = (0.05 if phi < 0 else 1.0) * phi / 0.01 if phase == 0 else 2.0
                                     expected.append((~(2 * coordinate + side), 3 + phase, phi, rhs))
                         self.assertEqual(p.bounds.numpy()[world, phase], len(expected))
                     self.assertEqual(p.counts.numpy()[world], len(expected))
+                    if velocity:
+                        slots, signs = p.velocity_slots.numpy(), p.velocity_signs.numpy()
+                        for coordinate in range(d):
+                            primary = oa <= coordinate < oa + na
+                            dof = starts[world, 0 if primary else 1] + coordinate - (oa if primary else ob)
+                            for side in (0, 1):
+                                matching = [
+                                    i
+                                    for i, row in enumerate(expected[:capacity])
+                                    if row[0] == ~(2 * coordinate + side) and row[1] == 4
+                                ]
+                                slot = matching[0] if matching else -1
+                                self.assertEqual(slots[dof * 2 + side], slot)
+                                self.assertEqual(
+                                    signs[dof * 2 + side], (1.0 if side == 0 else -1.0) if slot >= 0 else 0.0
+                                )
                     for row, (key, kind, phi, rhs) in enumerate(expected[:capacity]):
                         self.assertEqual(z.rowkeys.numpy()[world, row], key)
                         self.assertEqual(p.kind.numpy()[world, row], kind)
