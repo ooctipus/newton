@@ -136,7 +136,7 @@ def prefix_kernel(layout, prefix_type, rows_type):
     }
 #endif
     int base = 0;
-    const int coordinates[] = {$COORDINATES};
+    $COORDINATE_DECL
     for (int phase = 0; phase < 2; ++phase) {
         for (int chunk = 0; chunk < $CANDIDATES; chunk += 32) {
 #if !defined(__CUDA_ARCH__)
@@ -144,7 +144,7 @@ def prefix_kernel(layout, prefix_type, rows_type):
             for (int lane = 0; lane < 32; ++lane) {
 #endif
             const int candidate = chunk + lane, side = candidate & 1;
-            const int d = candidate < $CANDIDATES ? coordinates[candidate / 2] : 0;
+            const int d = candidate < $CANDIDATES ? $COORDINATE_INDEX : 0;
             const int dof = p.starts.data[world * 2 + ($PRIMARY ? 0 : 1)] + $LOCAL;
             const float sign = side == 0 ? 1.0f : -1.0f;
             bool active = false;
@@ -208,11 +208,20 @@ def prefix_kernel(layout, prefix_type, rows_type):
 #endif
     p.counts.data[world] = base;
 """
+    coordinates = layout.limit_coordinates
+    consecutive = bool(coordinates) and coordinates == tuple(range(coordinates[0], coordinates[-1] + 1))
+    # A dynamically indexed local array survives CUDA compilation even when
+    # its values form an interval. Emit the equivalent arithmetic directly.
+    coordinate_decl = (
+        "" if consecutive else "const int coordinates[] = {" + (", ".join(map(str, coordinates)) or "0") + "};"
+    )
+    coordinate_index = f"candidate / 2 + {coordinates[0]}" if consecutive else "coordinates[candidate / 2]"
     for key, value in {
         "$VELOCITY": int(layout.velocity_limits),
         "$DOUBLE": 2 * layout.dofs,
         "$CANDIDATES": 2 * len(layout.limit_coordinates),
-        "$COORDINATES": ", ".join(map(str, layout.limit_coordinates)) or "0",
+        "$COORDINATE_DECL": coordinate_decl,
+        "$COORDINATE_INDEX": coordinate_index,
         "$POSITION": f"{layout.position_eligibility}u",
         "$PRIMARY": layout.primary_test("d"),
         "$LOCAL": layout.local("d"),

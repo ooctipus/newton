@@ -35,6 +35,7 @@ class TestKeyedRowLayout(unittest.TestCase):
         """Preserve unary laws, row order and bounded storage."""
         for na, nb, oa, ob, velocity, position_mask, velocity_mask in [
             (18, 0, 0, 0, False, (1 << 18) - 1, 0),
+            (18, 0, 0, 0, False, ((1 << 12) - 1) << 6, 0),
             (9, 6, 6, 0, True, (1 << 15) - 1, (1 << 15) - 1),
             (3, 0, 0, 0, True, 7, 7),
             (9, 6, 6, 0, True, 0b101010101010100, 0b110011001100000),
