@@ -20,6 +20,7 @@ from .kernels import (
     prescribed_relative_contact_target,
 )
 from .sparse_mass_matrix import _SparseRowSupport
+from .sparse_row_projection import _sparse_contact_projection_source
 
 
 @wp.struct
@@ -282,22 +283,7 @@ def _get_sparse_contact_response_kernel(
             for (int node = lane; node < $N; node += stride) {
                 const unsigned long long bit = 1ull << node;
                 if ((mask & bit) == 0) continue;
-                auto value = wp::vec3(0.0f);
-                const int begin = factor_row_offsets.data[node];
-                const int first = node - (factor_row_offsets.data[node + 1] - begin) + 1;
-                // Reverse DFS packs this row's columns into [first, node].
-                // Visit only supporting columns, including bit 63 without a shift by 64.
-                unsigned long long pending = mask & (~0ull << first) & (~0ull >> (63 - node));
-                while (pending != 0) {
-                    const int column = first_bit(pending);
-                    const int entry = begin + column - first;
-                    const float factor = inverse_factor.data[factor_base + entry];
-#pragma unroll
-                    for (int row = 0; row < 3; ++row) {
-                        if (row < row_count) value.c[row] += factor * jacobian[row * $PLANE + column];
-                    }
-                    pending &= pending - 1;
-                }
+                $SPARSE_PROJECTION
                 const int index = count + bit_count(mask & (bit - 1ull));
 #pragma unroll
                 for (int row = 0; row < 3; ++row) {
@@ -344,7 +330,11 @@ def _get_sparse_contact_response_kernel(
     }
 """
     snippet = (
-        snippet.replace("$GEOMETRY_CUDA", geometry_cuda)
+        snippet.replace(
+            "$SPARSE_PROJECTION",
+            _sparse_contact_projection_source("shared_mask", dof_count=n, scratch_stride=scratch_size),
+        )
+        .replace("$GEOMETRY_CUDA", geometry_cuda)
         .replace("$GEOMETRY_CPU", geometry_cpu)
         .replace("$GEOMETRY_DOT", geometry_dot)
         .replace("$GEOMETRY", str(3 * scratch_size))

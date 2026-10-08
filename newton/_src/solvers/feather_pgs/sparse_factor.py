@@ -501,7 +501,11 @@ class SparseFactor:
             prefix=get_parallel_limit_kernel() if self.parallel_limit_prefix else build_limit_prefix,
             refresh=get_refresh_kernel(self.level_update),
             predictor=get_predictor_kernel(),
-            contacts=get_contact_kernel(),
+            contacts=get_contact_kernel(
+                dof_count=host["index"].shape[0],
+                support_width=self.data.Z.shape[2],
+                factor_stride=self.data.W.shape[1],
+            ),
             solve=get_solve_kernel(c, self.block_contacts, metric_tangents=self.metric_tangents),
         )
         if self.spectral_tangents:

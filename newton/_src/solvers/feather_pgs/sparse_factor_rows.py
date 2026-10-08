@@ -9,6 +9,7 @@ import warp as wp
 
 from .kernels import contact_restitution_fires
 from .sparse_factor import SparseData, SparsePlan
+from .sparse_row_projection import _sparse_contact_projection_source
 
 
 @cache
@@ -253,7 +254,7 @@ def apply_restitution(
 
 
 @cache
-def get_contact_kernel():
+def get_contact_kernel(*, dof_count: int, support_width: int, factor_stride: int):
     """Hoist current contact geometry and apply W to three sparse directions."""
     source = r"""
 #if defined(__CUDA_ARCH__)
@@ -290,8 +291,8 @@ def get_contact_kernel():
         t0 = wp::normalize(t0);
         const wp::vec3 t1 = wp::normalize(wp::cross(normal,t0));
         float jn=0.0f, jt0=0.0f, jt1=0.0f;
-        const int node = lane < length ? p.support_nodes.data[tpl*18+lane] : -1;
-        const int dof = 42-node;
+        const int node = lane < length ? p.support_nodes.data[tpl*$SUPPORT+lane] : -1;
+        const int dof = $DOF_LAST-node;
         if (lane < length) {
             const wp::spatial_vector screw = S.data[start+dof];
             const wp::vec3 lin(screw[0],screw[1],screw[2]), ang(screw[3],screw[4],screw[5]);
@@ -307,20 +308,13 @@ def get_contact_kernel():
                 jn -= wp::dot(normal,vn); jt0 -= wp::dot(t0,vt); jt1 -= wp::dot(t1,vt);
             }
         }
-        float zn=0.0f, zt0=0.0f, zt1=0.0f;
-        for (int k=0; k<length; ++k) {
-            const float x=__shfl_sync(0xffffffff,jn,k), y=__shfl_sync(0xffffffff,jt0,k), z=__shfl_sync(0xffffffff,jt1,k);
-            if (lane < length) {
-                const int col=p.support_nodes.data[tpl*18+k], e=p.index.data[node*43+col];
-                if (e >= 0) { const float a=d.W.data[group*434+e]; zn+=a*x; zt0+=a*y; zt1+=a*z; }
-            }
-        }
+        $SPARSE_PROJECTION
         const int directions=needed.data[c];
         for (int r=0; r<directions && r<3; ++r) {
             const int row=row0+r;
             if (row>=capacity) break;
             const float z=r==0?zn:(r==1?zt0:zt1), j=r==0?jn:(r==1?jt0:jt1);
-            if (lane<18) d.Z.data[(w*capacity+row)*18+lane]=z;
+            if (lane<$SUPPORT) d.Z.data[(w*capacity+row)*$SUPPORT+lane]=z;
             float norm=z*z, incident=lane<length?j*vhat.data[start+dof]:0.0f;
             for (int shift=16;shift>0;shift>>=1) { norm+=__shfl_down_sync(0xffffffff,norm,shift); incident+=__shfl_down_sync(0xffffffff,incident,shift); }
             if (lane==0) { d.support.data[w*capacity+row]=tpl; d.incident.data[w*capacity+row]=incident; diagonal.data[w*capacity+row]=norm+cfm.data[w*capacity+row]; }
@@ -328,6 +322,15 @@ def get_contact_kernel():
     }
 #endif
 """
+
+    source = source.replace(
+        "$SPARSE_PROJECTION",
+        _sparse_contact_projection_source(
+            "warp_catalogue", dof_count=dof_count, support_width=support_width, factor_stride=factor_stride
+        ),
+    )
+
+    source = source.replace("$SUPPORT", str(support_width)).replace("$DOF_LAST", str(dof_count - 1))
 
     @wp.func_native(source)
     def native(
@@ -422,7 +425,7 @@ def get_contact_kernel():
             diagonal,
         )
 
-    contacts.__name__ = contacts.__qualname__ = "sparse_factor_contact_triplet18"
+    contacts.__name__ = contacts.__qualname__ = f"sparse_factor_contact_triplet{support_width}"
     return wp.kernel(enable_backward=False, module="unique")(contacts)
 
 
