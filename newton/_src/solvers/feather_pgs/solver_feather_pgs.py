@@ -227,6 +227,7 @@ from .response_block_sweep import (
 from .row_build import contact_row_prelude, populate_world_J_masked
 from .row_build_native import get_row_build_native_kernel
 from .row_build_rows import build_contact_rows
+from .row_inputs import make_row_kernel
 from .sparse_contact import (
     SparseContactRows,
     _get_sparse_contact_response_kernel,
@@ -24303,6 +24304,7 @@ def _get_pgs_solve_local_owned_kernel(
     mf_max_constraints: int = 0,
     local_mf_max_constraints: int = 0,
     dense_response_matrix: bool = False,
+    row_inputs=None,
 ) -> "wp.Kernel":
     """Fuse response construction and PGS for one local articulation or pair."""
     del device_arch
@@ -24417,12 +24419,15 @@ def _get_pgs_solve_local_owned_kernel(
         s_v[local_dof] = v_out.data[dof];
     }}"""
     )
+    primary_read = f"J_group.data[group_j_base + row * {dofs} + i]"
+    secondary_read = f"secondary_J_group.data[secondary_group_j_base + row * {paired_dofs} + i]"
+    if row_inputs is not None:
+        primary_read, secondary_read = row_inputs.read(dofs, paired_dofs)
     pair_response = (
         f"""
         float secondary_response[{paired_dofs}];
         for (int i = 0; i < {paired_dofs}; ++i) {{
-            const float jacobian = secondary_J_group.data[
-                secondary_group_j_base + row * {paired_dofs} + i];
+            const float jacobian = {secondary_read};
             s_J[row * {total_dofs} + {dofs} + i] = jacobian;
             if (jacobian != 0.0f) active = 1;
         }}
@@ -25082,7 +25087,7 @@ def _get_pgs_solve_local_owned_kernel(
         float response[{dofs}];
         int active = 0;
         for (int i = 0; i < {dofs}; ++i) {{
-            const float jacobian = J_group.data[group_j_base + row * {dofs} + i];
+            const float jacobian = {primary_read};
             s_J[row * {total_dofs} + i] = jacobian;
             if (jacobian != 0.0f) active = 1;
         }}
@@ -25155,8 +25160,7 @@ def _get_pgs_solve_local_owned_kernel(
         snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
     snippet = snippet.replace("__syncwarp();", "__syncwarp(MASK);")
 
-    @wp.func_native(snippet)
-    def pgs_solve_local_internal_native(
+    def pgs_solve_local_internal_signature(
         candidate: int,
         candidate_articulations: wp.array[int],
         candidate_secondary_articulations: wp.array[int],
@@ -25194,163 +25198,6 @@ def _get_pgs_solve_local_owned_kernel(
         v_out: wp.array[float],
     ): ...
 
-    def pgs_solve_local_internal_template(
-        candidate_articulations: wp.array[int],
-        candidate_secondary_articulations: wp.array[int],
-        expected_owner: int,
-        articulation_group_index: wp.array[int],
-        articulation_world: wp.array[int],
-        articulation_dof_start: wp.array[int],
-        local_solve_owner: wp.array[int],
-        world_constraint_count: wp.array[int],
-        L_group: wp.array3d[float],
-        J_group: wp.array3d[float],
-        secondary_L_group: wp.array3d[float],
-        secondary_J_group: wp.array3d[float],
-        rhs_bias: wp.array2d[float],
-        world_row_type: wp.array2d[int],
-        world_row_parent: wp.array2d[int],
-        world_row_mu: wp.array2d[float],
-        mf_constraint_count: wp.array[int],
-        mf_meta: wp.array2d[int],
-        mf_impulses: wp.array2d[float],
-        mf_J_a: wp.array3d[float],
-        mf_J_b: wp.array3d[float],
-        mf_MiJt_a: wp.array3d[float],
-        mf_MiJt_b: wp.array3d[float],
-        mf_row_mu: wp.array2d[float],
-        regularize: int,
-        world_row_w: wp.array2d[float],
-        mf_row_w: wp.array2d[float],
-        iterations: int,
-        omega: float,
-        friction_start_iteration: int,
-        iteration_offset: int,
-        world_diag: wp.array2d[float],
-        world_impulses: wp.array2d[float],
-        v_out: wp.array[float],
-    ):
-        candidate, lane = wp.tid()
-        candidate = candidate * groups_per_block + lane // lanes_per_world
-        pgs_solve_local_internal_native(
-            candidate,
-            candidate_articulations,
-            candidate_secondary_articulations,
-            expected_owner,
-            articulation_group_index,
-            articulation_world,
-            articulation_dof_start,
-            local_solve_owner,
-            world_constraint_count,
-            L_group,
-            J_group,
-            secondary_L_group,
-            secondary_J_group,
-            rhs_bias,
-            world_row_type,
-            world_row_parent,
-            world_row_mu,
-            mf_constraint_count,
-            mf_meta,
-            mf_impulses,
-            mf_J_a,
-            mf_J_b,
-            mf_MiJt_a,
-            mf_MiJt_b,
-            mf_row_mu,
-            regularize,
-            world_row_w,
-            mf_row_w,
-            iterations,
-            omega,
-            friction_start_iteration,
-            iteration_offset,
-            world_diag,
-            world_impulses,
-            v_out,
-        )
-
-    def pgs_solve_local_internal_queue_template(
-        candidate_articulations: wp.array[int],
-        candidate_secondary_articulations: wp.array[int],
-        active_candidate_count: wp.array[int],
-        candidate_grid_stride: int,
-        expected_owner: int,
-        articulation_group_index: wp.array[int],
-        articulation_world: wp.array[int],
-        articulation_dof_start: wp.array[int],
-        local_solve_owner: wp.array[int],
-        world_constraint_count: wp.array[int],
-        L_group: wp.array3d[float],
-        J_group: wp.array3d[float],
-        secondary_L_group: wp.array3d[float],
-        secondary_J_group: wp.array3d[float],
-        rhs_bias: wp.array2d[float],
-        world_row_type: wp.array2d[int],
-        world_row_parent: wp.array2d[int],
-        world_row_mu: wp.array2d[float],
-        mf_constraint_count: wp.array[int],
-        mf_meta: wp.array2d[int],
-        mf_impulses: wp.array2d[float],
-        mf_J_a: wp.array3d[float],
-        mf_J_b: wp.array3d[float],
-        mf_MiJt_a: wp.array3d[float],
-        mf_MiJt_b: wp.array3d[float],
-        mf_row_mu: wp.array2d[float],
-        regularize: int,
-        world_row_w: wp.array2d[float],
-        mf_row_w: wp.array2d[float],
-        iterations: int,
-        omega: float,
-        friction_start_iteration: int,
-        iteration_offset: int,
-        world_diag: wp.array2d[float],
-        world_impulses: wp.array2d[float],
-        v_out: wp.array[float],
-    ):
-        candidate, lane = wp.tid()
-        candidate_count = active_candidate_count[0]
-        candidate = candidate * groups_per_block + lane // lanes_per_world
-        while candidate < candidate_count:
-            pgs_solve_local_internal_native(
-                candidate,
-                candidate_articulations,
-                candidate_secondary_articulations,
-                expected_owner,
-                articulation_group_index,
-                articulation_world,
-                articulation_dof_start,
-                local_solve_owner,
-                world_constraint_count,
-                L_group,
-                J_group,
-                secondary_L_group,
-                secondary_J_group,
-                rhs_bias,
-                world_row_type,
-                world_row_parent,
-                world_row_mu,
-                mf_constraint_count,
-                mf_meta,
-                mf_impulses,
-                mf_J_a,
-                mf_J_b,
-                mf_MiJt_a,
-                mf_MiJt_b,
-                mf_row_mu,
-                regularize,
-                world_row_w,
-                mf_row_w,
-                iterations,
-                omega,
-                friction_start_iteration,
-                iteration_offset,
-                world_diag,
-                world_impulses,
-                v_out,
-            )
-            candidate += candidate_grid_stride
-
     name = f"pgs_solve_local_internal_{max_rows}_{local_rows}_{dofs}_{paired_dofs}"
     if warps_per_block != 1:
         name += f"_w{warps_per_block}"
@@ -25362,13 +25209,19 @@ def _get_pgs_solve_local_owned_kernel(
         name += f"_mf{local_mf_rows}"
     if dense_response_matrix:
         name += "_denseamat"
-    template = pgs_solve_local_internal_template
+    if row_inputs is not None:
+        name = name.replace("pgs_solve_local_internal_", "pgs_solve_local_packet_", 1)
     if persistent_queue:
         name += "_queue"
-        template = pgs_solve_local_internal_queue_template
-    template.__name__ = name
-    template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(template)
+    return make_row_kernel(
+        name,
+        snippet,
+        pgs_solve_local_internal_signature,
+        () if row_inputs is None else row_inputs.arguments,
+        dispatch="local_queue" if persistent_queue else "local",
+        groups=groups_per_block,
+        lanes=lanes_per_world,
+    )
 
 
 @cache
@@ -28856,6 +28709,7 @@ def _get_pgs_solve_parallel_kernel(
     world_rows: bool = False,
     lean_sweep: bool = False,
     bound_finger: bool = False,
+    row_inputs=None,
 ) -> "wp.Kernel":
     """Scaled parallel projection (Jacobi with per-row step scaling and Nesterov momentum) for dense-row worlds.
 
@@ -29130,6 +28984,23 @@ def _get_pgs_solve_parallel_kernel(
             ink_stage += f"    SYNC();\n    if (lane < n_rows) {{ const int i = lane;\n{publication}\n    }}\n"
         else:
             ink_stage = ink_stage.replace(old_publish, publication)
+    input_arguments = ()
+    input_row_type = "world_row_type.data[off_dense + i]"
+    input_rhs = "rhs_bias.data[off_dense + i]"
+    input_parent = "world_row_parent.data[off_dense + i]"
+    input_mu = "world_row_mu.data[off_dense + i]"
+    if row_inputs is not None:
+        if register_whitening or WR or ZG or INK_CHECK or not INK or not MF or HD or EXACT or LEAN or BF or STOP:
+            raise ValueError("generated factor rows require the ordinary matrix-free parallel law")
+        operands = row_inputs(NA, NB, OA, OB, D, M_D)
+        ink_stage = operands.stage
+        input_arguments = operands.arguments
+        input_row_type, input_rhs, input_parent, input_mu = (
+            operands.row_type,
+            operands.rhs,
+            operands.parent,
+            operands.mu,
+        )
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const unsigned MASK = 0xFFFFFFFF;
@@ -29215,10 +29086,10 @@ def _get_pgs_solve_parallel_kernel(
     for (int i = lane; i < n_rows; i += NT) {{
         const float l0 = world_impulses.data[off_dense + i];
         s_lam0[i] = l0; s_x[i] = l0; s_y[i] = l0;
-        s_rhs[i] = rhs_bias.data[off_dense + i];
-        const int row_type = world_row_type.data[off_dense + i] & {ROW_TYPE_MASK};
-        s_parent[i] = world_row_parent.data[off_dense + i];
-        s_mu[i] = world_row_mu.data[off_dense + i];
+        s_rhs[i] = {input_rhs};
+        const int row_type = {input_row_type} & {ROW_TYPE_MASK};
+        s_parent[i] = {input_parent};
+        s_mu[i] = {input_mu};
         // in-kernel response: the diagonal is formed below (J_i . Y_i + cfm_i); admit provisionally here.
         const float diag = {INK} ? 1.0f : world_diag.data[off_dense + i];
         int kind = 2;
@@ -29674,8 +29545,7 @@ def _get_pgs_solve_parallel_kernel(
         )
         snippet = snippet.replace(reconstruct, reloaded)
 
-    @wp.func_native(snippet)
-    def pgs_solve_parallel_native(
+    def pgs_solve_parallel_signature(
         world: int,
         rb_class: wp.array[int],
         # Dense
@@ -29777,215 +29647,6 @@ def _get_pgs_solve_parallel_kernel(
         v_out: wp.array[float],
     ): ...
 
-    def pgs_solve_parallel_template(
-        general_world_count: wp.array[int],
-        general_worlds: wp.array[int],
-        general_world_grid_stride: int,
-        use_general_world_queue: int,
-        rb_class: wp.array[int],
-        # Dense
-        world_constraint_count: wp.array[int],
-        dense_phase_bounds: wp.array2d[int],
-        local_solve_owner: wp.array[int],
-        world_dof_indices: wp.array2d[int],
-        world_deferred_dof_mask: wp.array2d[int],
-        rhs_bias: wp.array2d[float],
-        world_diag: wp.array2d[float],
-        world_row_w: wp.array2d[float],
-        world_impulses: wp.array2d[float],
-        J_world: wp.array3d[float],
-        Y_world: wp.array3d[float],
-        world_row_type: wp.array2d[int],
-        world_row_parent: wp.array2d[int],
-        world_row_mu: wp.array2d[float],
-        world_torsion_group: wp.array2d[int],
-        contact_torsion_radius: float,
-        world_drive_target_vel_bias: wp.array2d[float],
-        world_drive_vel_multiplier: wp.array2d[float],
-        world_drive_impulse_multiplier: wp.array2d[float],
-        world_drive_max_impulse: wp.array2d[float],
-        world_drive_vel_limit: wp.array2d[float],
-        # MF
-        mf_constraint_count: wp.array[int],
-        mf_contact_rows_end: wp.array[int],
-        mf_meta: wp.array2d[int],
-        mf_impulses: wp.array2d[float],
-        mf_J_a: wp.array3d[float],
-        mf_J_b: wp.array3d[float],
-        mf_MiJt_a: wp.array3d[float],
-        mf_MiJt_b: wp.array3d[float],
-        mf_row_mu: wp.array2d[float],
-        mf_row_w: wp.array2d[float],
-        # Shared
-        iterations: int,
-        omega: float,
-        regularize: int,
-        row_phase: int,
-        friction_start_iteration: int,
-        iteration_offset: int,
-        freeze_drive_rows: int,
-        defer_dense_response: int,
-        # In-kernel response (dummies when disabled)
-        ink_meta: wp.array[int],
-        ink_L_a: wp.array3d[float],
-        ink_L_b: wp.array3d[float],
-        ink_J_a: wp.array3d[float],
-        ink_J_b: wp.array3d[float],
-        world_row_cfm: wp.array2d[float],
-        # World rows (dummies when disabled)
-        world_contacts: wp.array2d[int],
-        world_contact_counts: wp.array[int],
-        contact_count: wp.array[int],
-        contact_slot: wp.array[int],
-        contact_slots_needed: wp.array[int],
-        contact_art_a: wp.array[int],
-        contact_art_b: wp.array[int],
-        contact_shape0: wp.array[int],
-        contact_shape1: wp.array[int],
-        contact_point0: wp.array[wp.vec3],
-        contact_point1: wp.array[wp.vec3],
-        contact_normal: wp.array[wp.vec3],
-        contact_thickness0: wp.array[float],
-        contact_thickness1: wp.array[float],
-        shape_body: wp.array[int],
-        body_q: wp.array[wp.transform],
-        body_v_s: wp.array[wp.spatial_vector],
-        joint_S_s: wp.array[wp.spatial_vector],
-        art_dof_start: wp.array[int],
-        articulation_origin: wp.array[wp.vec3],
-        articulation_response_dof_count: wp.array[int],
-        body_response_dof_mask: wp.array[wp.uint32],
-        shape_material_mu: wp.array[float],
-        shape_material_restitution: wp.array[float],
-        is_free_rigid: wp.array[int],
-        prescribed_articulation: wp.array[int],
-        wr_friction_pairs_only: int,
-        wr_friction_anchor_limit: int,
-        wr_friction_scale: float,
-        wr_shared_anchor: int,
-        wr_friction_shared_anchor: int,
-        pgs_beta: float,
-        wr_bias_scale: float,
-        wr_speculative_scale: float,
-        wr_inv_dt: float,
-        wr_dt: float,
-        wr_restitution_threshold: float,
-        wr_pgs_cfm: float,
-        # In-kernel warm start table (dummies when disabled)
-        ww_count: wp.array[int],
-        ww_shape0: wp.array2d[int],
-        ww_shape1: wp.array2d[int],
-        ww_point: wp.array2d[wp.vec3],
-        ww_lam: wp.array2d[wp.vec3],
-        ww_decay: float,
-        # Output
-        v_out: wp.array[float],
-    ):
-        candidate, _lane = wp.tid()
-        general_index = candidate
-        general_count = general_world_count[0]
-        if use_general_world_queue == 0:
-            general_count = candidate + 1
-        while general_index < general_count:
-            world = candidate
-            if use_general_world_queue != 0:
-                world = general_worlds[general_index]
-            pgs_solve_parallel_native(
-                world,
-                rb_class,
-                world_constraint_count,
-                dense_phase_bounds,
-                local_solve_owner,
-                world_dof_indices,
-                world_deferred_dof_mask,
-                rhs_bias,
-                world_diag,
-                world_row_w,
-                world_impulses,
-                J_world,
-                Y_world,
-                world_row_type,
-                world_row_parent,
-                world_row_mu,
-                world_torsion_group,
-                contact_torsion_radius,
-                world_drive_target_vel_bias,
-                world_drive_vel_multiplier,
-                world_drive_impulse_multiplier,
-                world_drive_max_impulse,
-                world_drive_vel_limit,
-                mf_constraint_count,
-                mf_contact_rows_end,
-                mf_meta,
-                mf_impulses,
-                mf_J_a,
-                mf_J_b,
-                mf_MiJt_a,
-                mf_MiJt_b,
-                mf_row_mu,
-                mf_row_w,
-                iterations,
-                omega,
-                regularize,
-                row_phase,
-                friction_start_iteration,
-                iteration_offset,
-                freeze_drive_rows,
-                defer_dense_response,
-                ink_meta,
-                ink_L_a,
-                ink_L_b,
-                ink_J_a,
-                ink_J_b,
-                world_row_cfm,
-                world_contacts,
-                world_contact_counts,
-                contact_count,
-                contact_slot,
-                contact_slots_needed,
-                contact_art_a,
-                contact_art_b,
-                contact_shape0,
-                contact_shape1,
-                contact_point0,
-                contact_point1,
-                contact_normal,
-                contact_thickness0,
-                contact_thickness1,
-                shape_body,
-                body_q,
-                body_v_s,
-                joint_S_s,
-                art_dof_start,
-                articulation_origin,
-                articulation_response_dof_count,
-                body_response_dof_mask,
-                shape_material_mu,
-                shape_material_restitution,
-                is_free_rigid,
-                prescribed_articulation,
-                wr_friction_pairs_only,
-                wr_friction_anchor_limit,
-                wr_friction_scale,
-                wr_shared_anchor,
-                wr_friction_shared_anchor,
-                pgs_beta,
-                wr_bias_scale,
-                wr_speculative_scale,
-                wr_inv_dt,
-                wr_dt,
-                wr_restitution_threshold,
-                wr_pgs_cfm,
-                ww_count,
-                ww_shape0,
-                ww_shape1,
-                ww_point,
-                ww_lam,
-                ww_decay,
-                v_out,
-            )
-            general_index += general_world_grid_stride
-
     name = f"pgs_solve_parallel_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_rows{AM}_min{MIN_ROWS}_sweeps{NSWEEPS}_nes{NESTEROV}_tol{TOL:g}_nt{NT}_rs5_mf{MF}c"
     if INK:
         name += f"_ink{NA}_{NB}_o{OA}_{OB}" + ("chk" if INK_CHECK else "")
@@ -30000,9 +29661,10 @@ def _get_pgs_solve_parallel_kernel(
     )
     if skip_local_internal_worlds:
         name += "_local_fallback"
-    pgs_solve_parallel_template.__name__ = name
-    pgs_solve_parallel_template.__qualname__ = name
-    kernel = wp.kernel(enable_backward=False, module="unique")(pgs_solve_parallel_template)
+    if row_inputs is not None:
+        name = name.replace("pgs_solve_parallel_", "pgs_solve_kinetic_keyed_parallel_", 1)
+    kernel = make_row_kernel(name, snippet, pgs_solve_parallel_signature, input_arguments, dispatch="parallel")
+    kernel._fpgs_kinetic_rows = row_inputs is not None
     kernel._fpgs_block_dim = NT  # two warps per world above 32 rows
     kernel._fpgs_extra_inputs = True  # takes the in-kernel response inputs after defer_dense_response
     kernel._fpgs_world_rows = bool(WR)

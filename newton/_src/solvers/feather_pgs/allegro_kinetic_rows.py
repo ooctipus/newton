@@ -3,18 +3,14 @@
 
 """Experimental current-motion maps and typed Allegro kinetic rows."""
 
-import ast
-import hashlib
-import inspect
-import linecache
-import textwrap
-from functools import cache
+from functools import cache, partial
 
 import numpy as np
 import warp as wp
 
 from ...sim import JointType, ModelFlags
 from .franka_contact_packet import ContactInput, bind
+from .row_inputs import ParallelRowInputs, RowArgument
 
 
 @wp.struct
@@ -496,66 +492,23 @@ def get_ink_stage(na, nb, oa, ob, dofs, capacity):
 """
 
 
+def get_parallel_inputs(na, nb, oa, ob, dofs, capacity):
+    """Bind factor-coordinate staging and deferred contact metadata explicitly."""
+    key = "kinetic_rows.rowkeys.data[off_dense + i]"
+    return ParallelRowInputs(
+        stage=get_ink_stage(na, nb, oa, ob, dofs, capacity),
+        arguments=(RowArgument("kinetic_rows", KineticRows, after="world_row_cfm"),),
+        row_type=f"({key} >= 0 ? (({key} & 3) == 0 ? 0 : 2) : world_row_type.data[off_dense + i])",
+        rhs=f"{key} < 0 ? rhs_bias.data[off_dense + i] : 0",
+        parent=f"{key} < 0 ? world_row_parent.data[off_dense + i] : 0",
+        mu=f"{key} < 0 ? world_row_mu.data[off_dense + i] : 0",
+    )
+
+
 @cache
 def get_parallel_factory(original):
-    """Extend only the opted-in native ABI; keep the original factory untouched."""
-    tree = ast.parse(textwrap.dedent(inspect.getsource(original)))
-    factory = tree.body[0]
-    factory.name = "kinetic_parallel_factory"
-    factory.decorator_list = []
-    signatures, calls = 0, 0
-    for node in ast.walk(factory):
-        if isinstance(node, ast.FunctionDef) and node is not factory:
-            names = [arg.arg for arg in node.args.args]
-            if "world_row_cfm" in names:
-                node.args.args.insert(
-                    names.index("world_row_cfm") + 1,
-                    ast.arg(arg="kinetic_rows", annotation=ast.Name(id="KineticRows", ctx=ast.Load())),
-                )
-                signatures += 1
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "pgs_solve_parallel_native"
-        ):
-            names = [arg.id if isinstance(arg, ast.Name) else None for arg in node.args]
-            node.args.insert(names.index("world_row_cfm") + 1, ast.Name(id="kinetic_rows", ctx=ast.Load()))
-            calls += 1
-    if (signatures, calls) != (2, 1):
-        raise RuntimeError("Original parallel native signature seam changed")
-    insertion = next(
-        i
-        for i, node in enumerate(factory.body)
-        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "snippet" for t in node.targets)
-    )
-    factory.body[insertion:insertion] = ast.parse(
-        "if register_whitening or WR or ZG or INK_CHECK or not INK or not MF or HD or EXACT or LEAN or BF or STOP:\n"
-        "    raise ValueError('Kinetic rows require the ordinary 16+6 matrix-free parallel law')\n"
-        "ink_stage = get_ink_stage(NA, NB, OA, OB, D, M_D)"
-    ).body
-    final_return = next(i for i, node in enumerate(factory.body) if isinstance(node, ast.Return))
-    factory.body[final_return:final_return] = ast.parse("kernel._fpgs_kinetic_rows = True").body
-    for node in ast.walk(factory):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            node.value = node.value.replace("pgs_solve_parallel_", "pgs_solve_kinetic_keyed_parallel_")
-            node.value = node.value.replace(
-                "const int row_type = world_row_type.data[off_dense + i] & ",
-                "const int row_type = (kinetic_rows.rowkeys.data[off_dense + i] >= 0 ? ((kinetic_rows.rowkeys.data[off_dense + i] & 3) == 0 ? 0 : 2) : world_row_type.data[off_dense + i]) & ",
-            )
-            # Contact metadata is produced by the row lane below, not an earlier global pass.
-            for field, source in (("s_rhs", "rhs_bias"), ("s_parent", "world_row_parent"), ("s_mu", "world_row_mu")):
-                node.value = node.value.replace(
-                    f"{field}[i] = {source}.data[off_dense + i];",
-                    f"{field}[i] = kinetic_rows.rowkeys.data[off_dense + i] < 0 ? {source}.data[off_dense + i] : 0;",
-                )
-    namespace = dict(original.__globals__)
-    namespace.update(KineticRows=KineticRows, get_ink_stage=get_ink_stage)
-    ast.fix_missing_locations(tree)
-    generated = ast.unparse(tree) + "\n"
-    filename = f"<allegro-kinetic-parallel-{hashlib.sha256(generated.encode()).hexdigest()}>"
-    linecache.cache[filename] = (len(generated), None, generated.splitlines(keepends=True), filename)
-    exec(compile(generated, filename, "exec"), namespace)
-    return namespace[factory.name]
+    """Use the shared parallel factory with an explicit row-input provider."""
+    return partial(original, row_inputs=get_parallel_inputs)
 
 
 def topology_plan(solver):

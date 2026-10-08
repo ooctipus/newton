@@ -3,18 +3,14 @@
 
 """Experimental complete local prefix and current-contact packet ownership."""
 
-import ast
-import hashlib
-import inspect
-import linecache
-import textwrap
-from functools import cache
+from functools import cache, partial
 
 import numpy as np
 import warp as wp
 
 from ...sim import ModelFlags
 from .kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
+from .row_inputs import CompactLocalRows, RowArgument
 
 
 @wp.struct
@@ -181,82 +177,16 @@ def get_prefix_kernel():
     return prefix
 
 
-def _adapt_local_snippet(snippet, dofs, paired_dofs):
-    """Replace only current row reads; retain the original held response and GS."""
-    if dofs != 9 or paired_dofs not in (0, 6):
-        raise ValueError("Private row packets support the existing 9 and 9+6 local owners")
-    primary = f"J_group.data[group_j_base + row * {dofs} + i]"
-    replacement = """(packets.row_contact.data[world * 40 + row] >= 0
-                ? packets.jacobian.data[(world * 40 + row) * 15 + i]
-                : ((prefix.dofs.data[(world * 20 + row) * 2] == i
-                        ? prefix.weights.data[(world * 20 + row) * 2] : 0.0f)
-                   + (prefix.dofs.data[(world * 20 + row) * 2 + 1] == i
-                        ? prefix.weights.data[(world * 20 + row) * 2 + 1] : 0.0f)))"""
-    if snippet.count(primary) != 1:
-        raise RuntimeError("Original local primary row-read seam changed")
-    snippet = snippet.replace(primary, replacement)
-    if paired_dofs:
-        secondary = f"secondary_J_group.data[\n                secondary_group_j_base + row * {paired_dofs} + i]"
-        if snippet.count(secondary) != 1:
-            raise RuntimeError("Original local secondary row-read seam changed")
-        snippet = snippet.replace(
-            secondary,
-            "(packets.row_contact.data[world * 40 + row] >= 0 "
-            "? packets.jacobian.data[(world * 40 + row) * 15 + 9 + i] : 0.0f)",
-        )
-    return snippet
-
-
 @cache
 def get_local_factory():
-    """Append the two private row operands to the existing native local ABI."""
+    """Bind today's producer layout to the shared local row-input interface."""
     from . import solver_feather_pgs as solver  # noqa: PLC0415 - avoid constructor import cycles
     from .franka_contact_packet import ContactPacketData  # noqa: PLC0415
 
-    original = inspect.getsource(solver._get_pgs_solve_local_owned_kernel)
-    tree = ast.parse(textwrap.dedent(original))
-    factory = tree.body[0]
-    factory.name = "packet_local_factory"
-    factory.decorator_list = []
-    native_calls = 0
-    signatures = 0
-    for node in ast.walk(factory):
-        if isinstance(node, ast.FunctionDef) and node is not factory:
-            if any(arg.arg == "v_out" for arg in node.args.args):
-                node.args.args += [
-                    ast.arg(arg="prefix", annotation=ast.Name(id="PrefixData", ctx=ast.Load())),
-                    ast.arg(arg="packets", annotation=ast.Name(id="ContactPacketData", ctx=ast.Load())),
-                ]
-                signatures += 1
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "pgs_solve_local_internal_native"
-        ):
-            node.args += [ast.Name(id="prefix", ctx=ast.Load()), ast.Name(id="packets", ctx=ast.Load())]
-            native_calls += 1
-    if (signatures, native_calls) != (3, 2):
-        raise RuntimeError("Original local native/template signature count changed")
-    insertion = next(
-        i
-        for i, node in enumerate(factory.body)
-        if isinstance(node, ast.FunctionDef) and node.name == "pgs_solve_local_internal_native"
+    inputs = CompactLocalRows(
+        9, 6, 40, 20, 2, (RowArgument("prefix", PrefixData), RowArgument("packets", ContactPacketData))
     )
-    factory.body[insertion:insertion] = ast.parse("snippet = _adapt_local_snippet(snippet, dofs, paired_dofs)").body
-    # Separate cache/module names; no change to the original callable/globals.
-    for node in ast.walk(factory):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            node.value = node.value.replace("pgs_solve_local_internal_", "pgs_solve_local_packet_")
-    namespace = dict(solver.__dict__)
-    namespace.update(
-        PrefixData=PrefixData, ContactPacketData=ContactPacketData, _adapt_local_snippet=_adapt_local_snippet
-    )
-    ast.fix_missing_locations(tree)
-    generated = ast.unparse(tree) + "\n"
-    filename = f"<franka-row-packet-{hashlib.sha256(generated.encode()).hexdigest()}>"
-    linecache.cache[filename] = (len(generated), None, generated.splitlines(keepends=True), filename)
-    exec(compile(generated, filename, "exec"), namespace)
-    return namespace[factory.name]
+    return partial(solver._get_pgs_solve_local_owned_kernel, row_inputs=inputs)
 
 
 def validate_prefix_topology(groups, worlds, starts, mimic_start, mimic_list, mimic_dof0, mimic_dof1, mimic_world=None):
