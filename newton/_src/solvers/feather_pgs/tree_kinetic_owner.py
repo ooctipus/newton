@@ -11,7 +11,7 @@ import numpy as np
 import warp as wp
 
 from . import world_scan_owner
-from .tree_kinetic_plan import make_plan
+from .tree_kinetic_plan import cooperative_block_dim, make_plan
 from .world_scan_publication import PublicationData
 
 _PLAN_FIELDS = (
@@ -100,6 +100,7 @@ class TreeKineticState:
             except ValueError:
                 # Unsupported packing preserves the complete original owner.
                 pass
+        self.block_dim = cooperative_block_dim(self.layout, chain_host)
         if chain_host is None:
             self.plan = native.KineticPlan()
         else:
@@ -242,7 +243,7 @@ class TreeKineticState:
                 self.solver._mass_update_requested,
                 int(global_refresh),
             ],
-            block_dim=64,
+            block_dim=self.block_dim,
             device=self.solver.model.device,
         )
 
@@ -267,7 +268,7 @@ class TreeKineticState:
             self.predictor_kernel,
             dim=[solver.world_count],
             inputs=[self.sparse.plan, self.sparse.data, self.plan, self.data, force],
-            block_dim=64,
+            block_dim=self.block_dim,
             device=solver.model.device,
         )
 
@@ -293,6 +294,6 @@ class TreeKineticState:
                 self.solver._mass_update_requested,
                 int(next_refresh),
             ],
-            block_dim=64,
+            block_dim=self.block_dim,
             device=self.solver.model.device,
         )

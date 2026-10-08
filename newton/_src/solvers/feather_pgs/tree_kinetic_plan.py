@@ -10,6 +10,13 @@ from .sparse_mass_matrix import _SparseMassMatrixPlan
 from .tree_kinetic_layout import TreeLayout
 
 
+def cooperative_block_dim(layout, chain_plan=None):
+    """Cover all one-body lanes and occupied packed-chain lanes."""
+    if layout.bodies > 32 or (chain_plan is not None and np.any(chain_plan["meta"][32:, 0] >= 0)):
+        return 64
+    return 32
+
+
 def make_plan(model, operator):
     """Check the tree, scalar laws and packed operator before allocating caches."""
     worlds = int(model.world_count)

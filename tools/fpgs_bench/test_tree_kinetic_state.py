@@ -13,14 +13,34 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseMassMatrixPlan
+from newton._src.solvers.feather_pgs.tree_chain_scan import make_plan
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_kinetic_owner import TreeKineticState
+from newton._src.solvers.feather_pgs.tree_kinetic_plan import cooperative_block_dim
 from newton._src.solvers.feather_pgs.tree_kinetic_sparse import TreeSparseOperator
 from newton.tests import test_feather_pgs_sparse_split as split
 from tools.fpgs_bench.test_g1_kinetic_state import physical_mass, public_state
 
 
 class TestTreeLayout(unittest.TestCase):
+    def test_complete_cooperative_lane_coverage(self):
+        """Keep every body and padded chain lane inside the selected block."""
+
+        small = TreeLayout(7, 11, 60, 11, 3, 6, tuple(range(11)))
+        self.assertEqual(cooperative_block_dim(small), 32)
+        self.assertEqual(cooperative_block_dim(small, make_plan([-1, 0, 0, 1, 2, 1, 4])), 32)
+        parents = [-1]
+        for _ in range(10):
+            parent = 0
+            for _ in range(3):
+                parents.append(parent)
+                parent = len(parents) - 1
+        padded = TreeLayout(31, 36, 666, 36, 3, 6, tuple(range(36)))
+        self.assertEqual(cooperative_block_dim(padded), 32)
+        self.assertEqual(cooperative_block_dim(padded, make_plan(parents)), 64)
+        large = TreeLayout(44, 43, 434, 18, 10, 6, tuple(range(43)))
+        self.assertEqual(cooperative_block_dim(large), 64)
+
     def test_root_only_and_large_tree_scratch_do_not_alias_live_axes(self):
         """Keep the temporary projected inertia clear of live joint screws."""
         for bodies, dofs in ((1, 6), (7, 12), (44, 43), (59, 64)):
