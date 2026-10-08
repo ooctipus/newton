@@ -495,6 +495,8 @@ class TestKineticNativePort(unittest.TestCase):
 
     def test_composed_default_preserves_original_native_bytes(self):
         """Keep the retained Kuka ABI/body when retiring the unused dense experiment."""
+        source = importlib.import_module(PACKAGE + "kinetic_source")
+        source.checked_definitions("solver_feather_pgs.py", ("_get_pgs_solve_mf_gs_kernel",))
         solver = importlib.import_module(PACKAGE + "solver_feather_pgs")
         original = solver._get_pgs_solve_mf_gs_kernel(
             192,
