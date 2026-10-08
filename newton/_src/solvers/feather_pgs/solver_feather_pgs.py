@@ -5144,7 +5144,7 @@ class SolverFeatherPGS(SolverBase):
         # requested owner later declines the topology. They cannot acquire
         # dense storage after this sparse allocation decision.
         if (
-            self.grouped_dynamics
+            (self.grouped_dynamics and os.environ.get("FEATHER_PGS_SPARSE_GROUPED_DYNAMICS", "0") != "1")
             or os.environ.get("FEATHER_PGS_MF_MULTIBLOCK") == "1"
             or (self._has_free_rigid_bodies and os.environ.get("FEATHER_PGS_FREE_BODY_IMPLICIT_GYRO") == "1")
         ):
@@ -7225,23 +7225,21 @@ class SolverFeatherPGS(SolverBase):
         self._ink_sizes = None
         self._ink_rows = 0
         self._rb_build_kernel = None
-        if (
-            self.grouped_dynamics
-            and self._sparse_mass_matrix_size is None
-            and model.device.is_cuda
-            and int(model.articulation_count) > 0
-        ):
+        if self.grouped_dynamics and model.device.is_cuda and int(model.articulation_count) > 0:
             self._grouped_topology = GroupedTopology(
                 model, self.articulation_joint_end.numpy(), model.device, body_X_com=self.body_X_com
             )
             self._body_fs_scratch = wp.zeros(int(model.body_count), dtype=wp.spatial_vector, device=model.device)
             self._grouped_kernels = {}
             self._grouped_dummy_diag = wp.zeros((1, 1), dtype=wp.float32, device=model.device)
+            # Grouped tau and publication do not consume the factor representation.
+            # The mass-writing fusions below require dense factor storage.
             # Fused inverse dynamics + composite inertia + CRBA + Cholesky: every size group must
             # use the compact-terms composite path and the lower-schedule CRBA, none may be a
             # free-body-inertia group.
             self._grouped_tau_mass = bool(
-                self._parallel_composite_inertia
+                self._sparse_mass_matrix_size is None
+                and self._parallel_composite_inertia
                 and self._composite_articulation_count == int(model.articulation_count)
                 and all(
                     size in self._crba_source_dof_by_size
@@ -7261,7 +7259,8 @@ class SolverFeatherPGS(SolverBase):
             # Fused world-dynamics kernel (K1): one launch per size group from the joint state.
             topo = self._grouped_topology
             self._fused_k1 = bool(
-                not _FUSED_K1_OFF
+                self._sparse_mass_matrix_size is None
+                and not _FUSED_K1_OFF
                 and topo.template_count > 0
                 and template_supported(topo.tpl_type_host)
                 and self._async_augmented_drives

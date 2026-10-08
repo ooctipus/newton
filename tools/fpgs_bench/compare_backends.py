@@ -53,7 +53,11 @@ ADDITIONAL_RECIPES = {
             "FEATHER_PGS_G1_KINETIC_STATE": "1",
         },
     ),
-    "h1-flat": ("Isaac-Velocity-Flat-H1", (), {}),
+    "h1-flat": (
+        "Isaac-Velocity-Flat-H1",
+        ("grouped_dynamics=True",),
+        {"FEATHER_PGS_SPARSE_GROUPED_DYNAMICS": "1"},
+    ),
     "h1-rough": ("Isaac-Velocity-Rough-H1", (), {}),
     "go2-flat": ("Isaac-Velocity-Flat-UnitreeGo2", (), {}),
     "go2-rough": ("Isaac-Velocity-Rough-UnitreeGo2", (), {}),
