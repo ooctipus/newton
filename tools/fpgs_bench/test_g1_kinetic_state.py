@@ -405,7 +405,7 @@ class TestG1KineticStateCPU(unittest.TestCase):
                     _step=step,
                     update_mass_matrix_interval=2,
                     _force_mass_update=force,
-                    _g1_kinetic_state=object(),
+                    _tree_kinetic_state=SimpleNamespace(sparse=SimpleNamespace(refresh=calls.append)),
                     _mass_update_requested=wp.array(requested, dtype=int, device="cpu"),
                     mass_update_mask=wp.zeros(3, dtype=int, device="cpu"),
                 )

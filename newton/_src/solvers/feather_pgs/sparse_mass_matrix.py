@@ -372,7 +372,9 @@ class _SparseMassMatrixPlan:
 
 
 @cache
-def _get_crba_sparse_factor_kernel(dof_count: int, nonzero_count: int, *, warps_per_block: int = 4) -> wp.Kernel:
+def _get_crba_sparse_factor_kernel(
+    dof_count: int, nonzero_count: int, *, warps_per_block: int = 4, geometric: bool = False
+) -> wp.Kernel:
     """Assemble CRBA and produce packed Linv, one warp per articulation.
 
     Launch ``group_count * 32`` threads with ``warps_per_block * 32`` threads per
@@ -383,6 +385,32 @@ def _get_crba_sparse_factor_kernel(dof_count: int, nonzero_count: int, *, warps_
     n, nnz, warps = int(dof_count), int(nonzero_count), int(warps_per_block)
     if not 1 <= n <= 64 or not n <= nnz <= n * (n + 1) // 2 or not 1 <= warps <= 32:
         raise ValueError("Invalid sparse factor dimensions or warp count")
+    force_storage_cuda = (
+        ""
+        if geometric
+        else f"""    __shared__ float forces[{warps * n * 6}];
+    float* force = forces + warp * {n * 6};"""
+    )
+    force_storage_cpu = "" if geometric else f"""    float force[{n * 6}];"""
+    prepare_mass = (
+        ""
+        if geometric
+        else f"""    for (int physical = lane; physical < {n}; physical += stride) {{
+        const int joint = articulation_start.data[art] + indices.dof_joint.data[physical];
+        const auto value = wp::mul(body_I_c.data[joint_child.data[joint]], joint_S_s.data[start + physical]);
+        for (int k = 0; k < 6; ++k) force[physical * 6 + k] = value.c[k];
+    }}
+"""
+    )
+    read_mass = (
+        "        float value = body_I_c.data[group * " + str(nnz) + "+entry];"
+        if geometric
+        else """        const auto motion = joint_S_s.data[start + physical_row];
+        float value = 0.0f;
+        for (int k = 0; k < 6; ++k) value += motion.c[k] * force[physical_col * 6 + k];
+"""
+    )
+    mass_input_type = wp.array2d[float] if geometric else wp.array[wp.spatial_matrix]
     snippet = f"""
     const int group = tid >> 5;
     if (group >= group_to_art.shape[0]) return;
@@ -394,24 +422,20 @@ def _get_crba_sparse_factor_kernel(dof_count: int, nonzero_count: int, *, warps_
     const int warp = threadIdx.x >> 5;
     __shared__ float factors[{warps * nnz}];
     __shared__ float inverses[{warps * nnz}];
-    __shared__ float forces[{warps * n * 6}];
+{force_storage_cuda}
     float* factor = factors + warp * {nnz};
     float* inverse = inverses + warp * {nnz};
-    float* force = forces + warp * {n * 6};
+
 #else
     if ((tid & 31) != 0) return;
     const int lane = 0;
     const int stride = 1;
     float factor[{nnz}];
     float inverse[{nnz}];
-    float force[{n * 6}];
+{force_storage_cpu}
 #endif
     const int start = articulation_dof_start.data[art];
-    for (int physical = lane; physical < {n}; physical += stride) {{
-        const int joint = articulation_start.data[art] + indices.dof_joint.data[physical];
-        const auto value = wp::mul(body_I_c.data[joint_child.data[joint]], joint_S_s.data[start + physical]);
-        for (int k = 0; k < 6; ++k) force[physical * 6 + k] = value.c[k];
-    }}
+{prepare_mass}
     if (lane == 0) status.data[group] = 0;
 #if defined(__CUDA_ARCH__)
     __syncwarp();
@@ -421,9 +445,7 @@ def _get_crba_sparse_factor_kernel(dof_count: int, nonzero_count: int, *, warps_
         const int col = indices.columns.data[entry];
         const int physical_row = indices.permutation.data[row];
         const int physical_col = indices.permutation.data[col];
-        const auto motion = joint_S_s.data[start + physical_row];
-        float value = 0.0f;
-        for (int k = 0; k < 6; ++k) value += motion.c[k] * force[physical_col * 6 + k];
+{read_mass}
         if (row == col) {{
             value += R_group.data[group * {n} + physical_row];
             if (fused_augmented_drive != 0) {{
@@ -456,7 +478,7 @@ def _get_crba_sparse_factor_kernel(dof_count: int, nonzero_count: int, *, warps_
         articulation_dof_start: wp.array[int],
         joint_child: wp.array[int],
         joint_S_s: wp.array[wp.spatial_vector],
-        body_I_c: wp.array[wp.spatial_matrix],
+        body_I_c: mass_input_type,
         R_group: wp.array2d[float],
         fused_augmented_drive: int,
         drive_row_by_dof: wp.array[int],
@@ -473,7 +495,7 @@ def _get_crba_sparse_factor_kernel(dof_count: int, nonzero_count: int, *, warps_
         articulation_dof_start: wp.array[int],
         joint_child: wp.array[int],
         joint_S_s: wp.array[wp.spatial_vector],
-        body_I_c: wp.array[wp.spatial_matrix],
+        body_I_c: mass_input_type,
         R_group: wp.array2d[float],
         fused_augmented_drive: int,
         drive_row_by_dof: wp.array[int],
@@ -501,6 +523,8 @@ def _get_crba_sparse_factor_kernel(dof_count: int, nonzero_count: int, *, warps_
         )
 
     factor_kernel.__name__ = f"crba_sparse_factor_{n}_{nnz}_{warps}"
+    if geometric:
+        factor_kernel.__name__ = "cached_" + factor_kernel.__name__
     factor_kernel.__qualname__ = factor_kernel.__name__
     return wp.kernel(enable_backward=False, module="unique")(factor_kernel)
 

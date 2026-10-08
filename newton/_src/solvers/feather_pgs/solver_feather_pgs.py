@@ -3291,10 +3291,17 @@ class SolverFeatherPGS(SolverBase):
 
             self._kinetic_world = create_kinetic_owner(self)
 
-        self._g1_kinetic_state = None
+        self._tree_kinetic_state = None
         if self._sparse_factor is not None and os.environ.get("FEATHER_PGS_G1_KINETIC_STATE") == "1":
             self._sparse_factor.install_kinetic_state()
-            self._g1_kinetic_state = self._sparse_factor.kinetic_state
+            self._tree_kinetic_state = self._sparse_factor.kinetic_state
+
+        # Preserve the existing capture marker for the original sparse consumer.
+        self._g1_kinetic_state = self._tree_kinetic_state
+        if self._tree_kinetic_state is None and os.environ.get("FEATHER_PGS_TREE_KINETIC_STATE", "0") == "1":
+            from .tree_kinetic_sparse import create_owner as create_tree_kinetic_state  # noqa: PLC0415
+
+            self._tree_kinetic_state = create_tree_kinetic_state(self)
 
         self._franka_kinetic_state = None
         if (
@@ -3550,6 +3557,9 @@ class SolverFeatherPGS(SolverBase):
             franka_kinetic.validate_model(flags)
         if getattr(self, "_sparse_factor", None) is not None:
             self._sparse_factor.validate_notification(flags)
+        tree_kinetic = getattr(self, "_tree_kinetic_state", None)
+        if tree_kinetic is not None and self._sparse_factor is None:
+            tree_kinetic.validate_model()
         kinetic = getattr(self, "_kinetic_world", None)
         joint_world = getattr(self, "_joint_world", None)
         publication = getattr(self, "_world_scan_publication", None)
@@ -3570,7 +3580,7 @@ class SolverFeatherPGS(SolverBase):
             publication.validate_notification(flags, plan_snapshot=plan_snapshot)
         if kinetic is not None:
             kinetic.invalidate_model_changed(flags)
-        g1_kinetic = getattr(self, "_g1_kinetic_state", None)
+        g1_kinetic = getattr(self, "_tree_kinetic_state", None)
         if g1_kinetic is not None and flags & (
             ModelFlags.JOINT_PROPERTIES
             | ModelFlags.JOINT_DOF_PROPERTIES
@@ -3657,8 +3667,8 @@ class SolverFeatherPGS(SolverBase):
 
         if getattr(self, "_kinetic_world", None) is not None:
             self._kinetic_world.reset(state, world_mask)
-        if getattr(self, "_g1_kinetic_state", None) is not None:
-            self._g1_kinetic_state.invalidate(world_mask)
+        if getattr(self, "_tree_kinetic_state", None) is not None:
+            self._tree_kinetic_state.invalidate(world_mask)
         if getattr(self, "_franka_kinetic_state", None) is not None:
             self._franka_kinetic_state.invalidate(world_mask)
 
@@ -10361,8 +10371,8 @@ class SolverFeatherPGS(SolverBase):
         with wp.ScopedTimer("S3_Trisolve_Vhat", print=False, use_nvtx=self._nvtx, synchronize=False):
             if inverse_dynamics_ready is not None:
                 wp.get_stream(model.device).wait_event(inverse_dynamics_ready)
-            if self._g1_kinetic_state is not None:
-                self._g1_kinetic_state.predict(state_in, state_aug, control, stage3_qd, dt)
+            if self._tree_kinetic_state is not None:
+                self._tree_kinetic_state.predict(state_in, state_aug, control, stage3_qd, dt)
                 self._stage3_correct_free_root_velocity(state_in, stage3_qd, dt, apply_transport=False)
                 self._clamp_rigid_velocity_limits(self.v_hat)
             elif self._franka_kinetic_state is not None:
@@ -11653,8 +11663,8 @@ class SolverFeatherPGS(SolverBase):
             stage3_qd = state_in.joint_qd
 
         refresh_composite = (self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update
-        if getattr(self, "_g1_kinetic_state", None) is not None:
-            self._g1_kinetic_state.begin(state_in, state_aug, stage3_qd, self._last_step_dt, refresh_composite)
+        if getattr(self, "_tree_kinetic_state", None) is not None:
+            self._tree_kinetic_state.begin(state_in, state_aug, stage3_qd, self._last_step_dt, refresh_composite)
             return None, stage3_qd
         if self._franka_kinetic_state is not None:
             self._franka_kinetic_state.begin(state_in, state_aug, self._last_step_dt, refresh_composite)
@@ -12243,9 +12253,9 @@ class SolverFeatherPGS(SolverBase):
         drive_rows_ready: wp.Event | None,
     ) -> wp.Event | None:
         """Complete ``joint_tau`` through async inverse dynamics or the fused fallback."""
-        if getattr(self, "_g1_kinetic_state", None) is not None:
+        if getattr(self, "_tree_kinetic_state", None) is not None:
             if drive_rows_ready is None:
-                raise RuntimeError("G1 kinetic state requires asynchronous augmented-drive preparation")
+                raise RuntimeError("Tree kinetic state requires asynchronous augmented-drive preparation")
             # joint_tau currently holds only u0. Current external/control/bias
             # contributions are added by the retained-W predictor after waiting.
             return drive_rows_ready
@@ -12378,10 +12388,10 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
-        if getattr(self, "_g1_kinetic_state", None) is not None:
+        if getattr(self, "_tree_kinetic_state", None) is not None:
             if drive_rows_ready is not None:
                 wp.get_stream(model.device).wait_event(drive_rows_ready)
-            self._sparse_factor.refresh(state_aug)
+            self._tree_kinetic_state.sparse.refresh(state_aug)
             # Consume requests just like the common tail. Leaving either set
             # changes the held-factor cadence on subsequent captured steps.
             self._mass_update_requested.zero_()
@@ -16606,7 +16616,7 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage6_update_qdd(self, state_in: State, state_aug: State, dt: float):
-        if getattr(self, "_g1_kinetic_state", None) is not None:
+        if getattr(self, "_tree_kinetic_state", None) is not None:
             return  # finish owns conversion, free-root transport and integration
         if self._franka_kinetic_state is not None:
             return
@@ -16628,9 +16638,9 @@ class SolverFeatherPGS(SolverBase):
             self._fk_id_cache_source_state = state_out
             return
 
-        if getattr(self, "_g1_kinetic_state", None) is not None:
+        if getattr(self, "_tree_kinetic_state", None) is not None:
             next_refresh = ((self._step + 1) % self.update_mass_matrix_interval) == 0
-            self._g1_kinetic_state.finish(state_in, state_aug, state_out, dt, next_refresh)
+            self._tree_kinetic_state.finish(state_in, state_aug, state_out, dt, next_refresh)
             self._fk_id_cache_source_state = state_out
             return
 
