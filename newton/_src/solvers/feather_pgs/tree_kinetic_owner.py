@@ -48,7 +48,7 @@ def _invalidate(
 class TreeKineticState:
     """Own one current cache with device state-bank tags and a separate held W."""
 
-    def __init__(self, sparse_owner, *, admission=None):
+    def __init__(self, sparse_owner, *, admission=None, chain_scan_default=None):
         from . import tree_kinetic_state as native  # noqa: PLC0415
 
         self.sparse = sparse_owner
@@ -87,9 +87,9 @@ class TreeKineticState:
             root_slot[group] = root_lookup.get(start, -1)
             for dof in range(self.layout.root_dofs, dofs):
                 q_index[group, dof] = q_starts[start + host["dof_joint"][dof]]
-        self.chain_scan_requested = (
-            os.environ.get("FEATHER_PGS_TREE_CHAIN_SCAN", os.environ.get("FEATHER_PGS_G1_CHAIN_SCAN", "0")) == "1"
-        )
+        if chain_scan_default is None:
+            chain_scan_default = os.environ.get("FEATHER_PGS_G1_CHAIN_SCAN", "0") == "1"
+        self.chain_scan_requested = os.environ.get("FEATHER_PGS_TREE_CHAIN_SCAN", str(int(chain_scan_default))) == "1"
         self.chain_scan = False
         chain_host = None
         if self.chain_scan_requested:

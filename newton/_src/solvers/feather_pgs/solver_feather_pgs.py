@@ -3298,7 +3298,7 @@ class SolverFeatherPGS(SolverBase):
 
         # Preserve the existing capture marker for the original sparse consumer.
         self._g1_kinetic_state = self._tree_kinetic_state
-        if self._tree_kinetic_state is None and os.environ.get("FEATHER_PGS_TREE_KINETIC_STATE", "0") == "1":
+        if self._tree_kinetic_state is None and os.environ.get("FEATHER_PGS_TREE_KINETIC_STATE", "1") == "1":
             from .tree_kinetic_sparse import create_owner as create_tree_kinetic_state  # noqa: PLC0415
 
             self._tree_kinetic_state = create_tree_kinetic_state(self)

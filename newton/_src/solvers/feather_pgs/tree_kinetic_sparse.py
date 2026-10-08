@@ -112,7 +112,7 @@ def create_owner(solver):
         return None
     operator = TreeSparseOperator(solver)
     try:
-        owner = TreeKineticState(operator, admission=supported)
+        owner = TreeKineticState(operator, admission=supported, chain_scan_default=True)
     except ValueError:
         return None
     operator.kinetic_state = owner

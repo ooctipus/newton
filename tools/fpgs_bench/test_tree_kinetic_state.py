@@ -159,6 +159,24 @@ class TestTreePhysicalCPU(unittest.TestCase):
 
 
 class TestTreePhysicalCUDA(TestTreePhysicalCPU):
+    def test_default_admission_and_velocity_fallback(self):
+        """Select complete native trees without requiring an environment opt-in."""
+        if not wp.get_cuda_devices():
+            self.skipTest("No leased CUDA device")
+        with patch.dict(os.environ):
+            os.environ.pop("FEATHER_PGS_TREE_KINETIC_STATE", None)
+            os.environ.pop("FEATHER_PGS_TREE_CHAIN_SCAN", None)
+            os.environ["FEATHER_PGS_G1_CHAIN_SCAN"] = "0"
+            case = split._case(True, floating=True, branches=3, depth=2, device="cuda:0")
+            self.assertIsNotNone(case[1]._tree_kinetic_state)
+            self.assertTrue(case[1]._tree_kinetic_state.chain_scan)
+            self.assertEqual(case[1]._tree_kinetic_state.block_dim, 32)
+            ordinary = split._solver(case[0], True, pgs_mode="matrix_free", enable_joint_velocity_limits=True)
+            self.assertIsNone(ordinary._tree_kinetic_state)
+            os.environ["FEATHER_PGS_TREE_KINETIC_STATE"] = "0"
+            explicit = split._solver(case[0], True)
+            self.assertIsNone(explicit._tree_kinetic_state)
+
     def test_physical_cache(self):
         """Check non-G1 geometry and force actions on the explicitly leased GPU."""
         if not wp.get_cuda_devices():
