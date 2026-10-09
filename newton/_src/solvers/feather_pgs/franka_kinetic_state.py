@@ -15,6 +15,8 @@ import warp as wp
 from ...sim import ModelFlags
 from . import (  # noqa: F401 - names in the checked generated state factory
     cached_force,
+    cached_state_binding,
+    forest_kinetic_plan,
     kernels,
     kinetic_state,
     response_operator,
@@ -462,109 +464,8 @@ def get_predictor_kernel():
 
 
 def build_plan(solver):
-    """Build complete physical IDs, rejecting omissions and changed scalar topology."""
-    model, worlds = solver.model, int(solver.world_count)
-    art_world = solver.art_to_world.numpy()
-    starts, ends = model.articulation_start.numpy(), solver.articulation_joint_end.numpy()
-    dof_starts = solver.articulation_dof_start.numpy()
-    counts = np.diff(np.r_[dof_starts, model.joint_dof_count])
-    responses = solver.articulation_response_dof_count.numpy()
-    prescribed = solver._prescribed_articulation.numpy()
-    types, parents, children = model.joint_type.numpy(), model.joint_parent.numpy(), model.joint_child.numpy()
-    qstarts, dstarts = model.joint_q_start.numpy(), model.joint_qd_start.numpy()
-    dimensions = model.joint_dof_dim.numpy()
-    body_art, masks = solver.body_to_articulation.numpy(), solver.body_response_dof_mask.numpy()
-    group9, group6 = solver.group_to_art[9].numpy(), solver.group_to_art[6].numpy()
-    primary = {int(a): g for g, a in enumerate(group9)}
-    secondary = {int(a): g for g, a in enumerate(group6)}
-    roots = {int(j): k for k, j in enumerate(solver._free_root_joint_indices.numpy())}
-    fields = {
-        name: np.full((worlds, width), -1, np.int32)
-        for name, width in (
-            ("body_ids", 32),
-            ("body_parent", 32),
-            ("joint_ids", 32),
-            ("dof_ids", 21),
-            ("root_slots", 2),
-            ("arts", 3),
-            ("body_local_dof", 32),
-            ("q_index", 9),
-        )
-    }
-    fields.update(primary_group=np.full(worlds, -1, np.int32), secondary_group=np.full(worlds, -1, np.int32))
-    expected_parent = np.array([-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 8], np.int32)
-    dof_body = np.array([1, 2, 3, 4, 5, 6, 7, 9, 10], np.int32)
-    if len(art_world) != 3 * worlds or model.body_count != 13 * worlds or model.joint_dof_count != 21 * worlds:
-        raise ValueError("Franka kinetic requires exact 13-body/21-coordinate/three-articulation worlds")
-    by_world = [[] for _ in range(worlds)]
-    for art, world in enumerate(art_world):
-        if not 0 <= world < worlds:
-            raise ValueError("Franka articulation outside complete world ownership")
-        by_world[int(world)].append(art)
-    for world, arts in enumerate(by_world):
-        a = [art for art in arts if art in primary]
-        b = [art for art in arts if art in secondary]
-        c = [art for art in arts if prescribed[art] != 0]
-        if len(arts) != 3 or (len(a), len(b), len(c)) != (1, 1, 1):
-            raise ValueError("Franka kinetic requires primary9/free6/prescribed6")
-        ordered = [a[0], b[0], c[0]]
-        if len(set(ordered)) != 3 or list(counts[ordered]) != [9, 6, 6] or list(responses[ordered]) != [9, 6, 0]:
-            raise ValueError("Franka kinetic physical and response coordinates do not match")
-        if list(ends[ordered] - starts[ordered]) != [11, 1, 1]:
-            raise ValueError("Franka kinetic requires all11 primary joints and both free roots")
-        joints = np.concatenate([np.arange(starts[art], ends[art]) for art in ordered])
-        bodies = children[joints]
-        if (
-            np.any(bodies < 0)
-            or len(np.unique(bodies)) != 13
-            or not np.array_equal(body_art[bodies], np.repeat(ordered, [11, 1, 1]))
-        ):
-            raise ValueError("Franka joint/body ownership mismatch")
-        lookup = {int(body): i for i, body in enumerate(bodies)}
-        parent = np.array([lookup.get(int(parents[joint]), -1) for joint in joints], np.int32)
-        if not np.array_equal(parent[:11], expected_parent) or np.any(parents[joints[11:]] >= 0):
-            raise ValueError("Franka kinetic requires the checked primary tree and independent free roots")
-        if np.any((parents[joints] >= 0) & (parent < 0)):
-            raise ValueError("Franka kinetic parent escapes its world")
-        # Existing enum: PRISMATIC0, REVOLUTE1, FIXED3, FREE4.
-        if list(types[joints]) != [3, 1, 1, 1, 1, 1, 1, 1, 3, 0, 0, 4, 4]:
-            raise ValueError("Franka kinetic supports the exact fixed/revolute/prismatic/free joint laws")
-        dofs = np.concatenate([np.arange(dof_starts[art], dof_starts[art] + counts[art]) for art in ordered])
-        ancestor_mask = np.zeros(11, np.uint32)
-        for local in range(11):
-            own = -1
-            if local in dof_body:
-                own = int(np.flatnonzero(dof_body == local)[0])
-                if dstarts[joints[local]] != dofs[own] or dimensions[joints[local]].sum() != 1:
-                    raise ValueError("Franka scalar coordinate mapping changed")
-                fields["body_local_dof"][world, local] = own
-                fields["q_index"][world, own] = qstarts[joints[local]]
-            elif dimensions[joints[local]].sum() != 0:
-                raise ValueError("Franka weld gained physical coordinates")
-            inherited = int(ancestor_mask[parent[local]]) if parent[local] >= 0 else 0
-            ancestor_mask[local] = inherited | (1 << own if own >= 0 else 0)
-        if not np.array_equal(masks[bodies[:11]], ancestor_mask) or masks[bodies[11]] != 63:
-            raise ValueError("Franka kinetic must preserve original ancestor response masks")
-        fields["arts"][world] = ordered
-        fields["body_ids"][world, :13], fields["joint_ids"][world, :13] = bodies, joints
-        fields["body_parent"][world, :13], fields["dof_ids"][world] = parent, dofs
-        fields["primary_group"][world], fields["secondary_group"][world] = primary[a[0]], secondary[b[0]]
-        fields["root_slots"][world] = [roots[int(j)] for j in joints[11:]]
-    if (
-        len(np.unique(fields["body_ids"][:, :13])) != model.body_count
-        or len(np.unique(fields["dof_ids"])) != model.joint_dof_count
-    ):
-        raise ValueError("Franka kinetic must cover every public body and physical coordinate exactly once")
-    fields["dof_body"] = dof_body
-    fields["source"] = solver._crba_source_dof_by_size[9].numpy().astype(np.int32)
-    expected = np.full((9, 9), -1, np.int32)
-    for row in range(9):
-        for col in range(9):
-            if row == col or row < 7 or col < 7:
-                expected[row, col] = max(row, col)
-    if not np.array_equal(fields["source"], expected):
-        raise ValueError("Franka kinetic CRBA source schedule changed")
-    return fields
+    """Bind topology-derived ownership to the retained 9+6 operator layout."""
+    return forest_kinetic_plan.build_plan(solver)
 
 
 def supported(solver):
@@ -640,15 +541,6 @@ def _plan_dimensions(solver):
         solver.n_arts_by_size.get(9),
         solver.n_arts_by_size.get(6),
     )
-
-
-@wp.kernel
-def _invalidate(world_mask: wp.array[wp.bool], plan: KineticPlan, cache: KineticData):
-    world = wp.tid()
-    if not world_mask or world_mask[world]:
-        for root in range(3):
-            cache.current_valid[plan.arts[world, root]] = 0
-        cache.geometry_valid[world] = 0
 
 
 class FrankaKineticState:
@@ -808,17 +700,14 @@ class FrankaKineticState:
         # notification adds no validation and scales with the environment count.
 
     def invalidate(self, world_mask=None):
-        if world_mask is not None and (
-            world_mask.dtype != wp.bool
-            or world_mask.shape != (self.solver.world_count,)
-            or world_mask.device != self.solver.model.device
-        ):
-            raise ValueError("Franka kinetic reset requires the original per-world bool mask")
-        wp.launch(
-            _invalidate,
-            dim=self.solver.world_count,
-            inputs=[world_mask, self.plan, self.data],
-            device=self.solver.model.device,
+        """Invalidate current state for every owned articulation in selected worlds."""
+        cached_state_binding.invalidate(
+            self.solver.world_count,
+            world_mask,
+            self.plan.arts,
+            self.solver.art_to_world,
+            self.data.current_valid,
+            self.data.geometry_valid,
         )
 
     def _validate_call(self, state, state_aug, dt):
@@ -834,30 +723,8 @@ class FrankaKineticState:
                 raise RuntimeError("Franka kinetic state requires contiguous same-device input")
 
     def _publication(self, state_in, state_aug, state_out, dt):
-        solver, model = self.solver, self.solver.model
-        data = PublicationData()
-        for name in world_scan_owner.MODEL_FIELDS:
-            setattr(data, name, getattr(model, name))
-        for name, source in world_scan_owner.SOLVER_FIELDS.items():
-            setattr(data, name, getattr(solver, source))
-        data.joint_q, data.joint_qd = state_in.joint_q, state_in.joint_qd
-        data.joint_q_new, data.joint_qd_new = state_out.joint_q, state_out.joint_qd
-        data.joint_qdd = state_aug.joint_qdd
-        data.body_q, data.body_qd = state_out.body_q, state_out.body_qd
-        for name in world_scan_owner.CACHE_FIELDS:
-            if name == "articulation_origin":
-                value = solver.articulation_origin
-            elif name == "body_inertia_terms":
-                value = solver._body_inertia_terms
-            else:
-                value = getattr(state_aug, name)
-            setattr(data, name, value)
-        data.dt, data.angular_damping = dt, solver.angular_damping
-        # The original free finalizer materializes I_s for is_free_rigid even on
-        # held steps. Primary full I_s/terms are intentionally not produced.
-        data.materialize_all_body_inertia = 0
-        data.materialize_body_inertia_terms = 0
-        return data
+        """Bind live current and next-state publication descriptors."""
+        return cached_state_binding.publication(self.solver, state_in, state_aug, state_out, dt)
 
     def _launch_count(self):
         """Use two independent CUDA worlds per CTA; retain serial CPU ownership."""
@@ -909,11 +776,7 @@ class FrankaKineticState:
     def finish(self, state_in, state_aug, state_out, dt, next_refresh):
         self._validate_call(state_in, state_aug, dt)
         self._validate_call(state_out, state_aug, dt)
-        if any(
-            a.ptr < b.ptr + b.capacity and b.ptr < a.ptr + a.capacity
-            for a in (state_in.joint_q, state_in.joint_qd)
-            for b in (state_out.joint_q, state_out.joint_qd)
-        ):
+        if not cached_state_binding.disjoint_states(state_in, state_out):
             raise RuntimeError("Franka kinetic integration requires disjoint generalized state banks")
         wp.launch_tiled(
             self.finish_kernel,

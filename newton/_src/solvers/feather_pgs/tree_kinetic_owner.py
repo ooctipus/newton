@@ -10,9 +10,8 @@ import os
 import numpy as np
 import warp as wp
 
-from . import world_scan_owner
+from . import cached_state_binding, world_scan_owner
 from .tree_kinetic_plan import cooperative_block_dim, make_plan
-from .world_scan_publication import PublicationData
 
 _PLAN_FIELDS = (
     *world_scan_owner.PLAN_FIELDS,
@@ -28,21 +27,6 @@ def _fingerprint(array):
         return None
     values = array.numpy()
     return values.shape, values.dtype.str, hashlib.sha256(values.tobytes()).digest()
-
-
-@wp.kernel
-def _invalidate(
-    world_mask: wp.array[wp.bool],
-    group_to_art: wp.array[int],
-    art_to_world: wp.array[int],
-    current_valid: wp.array[int],
-    geometry_valid: wp.array[int],
-):
-    group = wp.tid()
-    art = group_to_art[group]
-    if not world_mask or world_mask[art_to_world[art]]:
-        current_valid[art] = 0
-        geometry_valid[group] = 0
 
 
 class TreeKineticState:
@@ -62,6 +46,7 @@ class TreeKineticState:
         host = sparse_owner.host
         self.layout, parent, depth = make_plan(model, sparse_owner)
         self.group_count = sparse_owner.plan.group_to_art.size
+        self._cache_to_art = sparse_owner.plan.group_to_art.reshape((self.group_count, 1))
         bodies, dofs = self.layout.bodies, self.layout.dofs
         jump = np.empty((self.layout.rounds, bodies), np.int32)
         jump[0] = parent
@@ -192,24 +177,14 @@ class TreeKineticState:
                 raise RuntimeError(f"Tree kinetic static {name} mapping changed; reconstruct and recapture")
 
     def invalidate(self, world_mask=None):
-        """Invalidate only current geometry/bias, never silently rebuild held W."""
-        if world_mask is not None and (
-            world_mask.dtype != wp.bool
-            or world_mask.shape != (self.solver.world_count,)
-            or world_mask.device != self.solver.model.device
-        ):
-            raise ValueError("Tree kinetic reset requires the original per-world bool mask")
-        wp.launch(
-            _invalidate,
-            dim=self.group_count,
-            inputs=[
-                world_mask,
-                self.sparse.plan.group_to_art,
-                self.sparse.plan.art_to_world,
-                self.data.current_valid,
-                self.data.geometry_valid,
-            ],
-            device=self.solver.model.device,
+        """Invalidate current state for every owned articulation in selected worlds."""
+        cached_state_binding.invalidate(
+            self.solver.world_count,
+            world_mask,
+            self._cache_to_art,
+            self.sparse.plan.art_to_world,
+            self.data.current_valid,
+            self.data.geometry_valid,
         )
 
     def _validate_call(self, state, state_aug, dt):
@@ -227,29 +202,8 @@ class TreeKineticState:
                 raise RuntimeError("Tree kinetic state requires contiguous same-device state arrays")
 
     def _publication(self, state_in, state_aug, state_out, dt):
-        """Rebind current descriptors each call; no cached numeric model pointers."""
-        solver, model = self.solver, self.solver.model
-        data = PublicationData()
-        for name in world_scan_owner.MODEL_FIELDS:
-            setattr(data, name, getattr(model, name))
-        for name, source in world_scan_owner.SOLVER_FIELDS.items():
-            setattr(data, name, getattr(solver, source))
-        data.joint_q, data.joint_qd = state_in.joint_q, state_in.joint_qd
-        data.joint_q_new, data.joint_qd_new = state_out.joint_q, state_out.joint_qd
-        data.joint_qdd = state_aug.joint_qdd
-        data.body_q, data.body_qd = state_out.body_q, state_out.body_qd
-        for name in world_scan_owner.CACHE_FIELDS:
-            if name == "articulation_origin":
-                value = solver.articulation_origin
-            elif name == "body_inertia_terms":
-                value = solver._body_inertia_terms
-            else:
-                value = getattr(state_aug, name)
-            setattr(data, name, value)
-        data.dt, data.angular_damping = dt, solver.angular_damping
-        data.materialize_all_body_inertia = 0
-        data.materialize_body_inertia_terms = 0
-        return data
+        """Bind live current and next-state publication descriptors."""
+        return cached_state_binding.publication(self.solver, state_in, state_aug, state_out, dt)
 
     def begin(self, state_in, state_aug, stage3_qd, dt, global_refresh):
         """Repair current caches or late-request geometry before any factor read."""
@@ -330,11 +284,7 @@ class TreeKineticState:
         """Integrate once, publish complete public state and construct next bias."""
         self._validate_call(state_in, state_aug, dt)
         self._validate_call(state_out, state_aug, dt)
-        # Integration across threads requires separate generalized input/output
-        # arrays. Reject overlap before any publication or source-state write.
-        inputs = (state_in.joint_q, state_in.joint_qd)
-        outputs = (state_out.joint_q, state_out.joint_qd)
-        if any(a.ptr < b.ptr + b.capacity and b.ptr < a.ptr + a.capacity for a in inputs for b in outputs):
+        if not cached_state_binding.disjoint_states(state_in, state_out):
             raise RuntimeError("Tree kinetic integration requires non-overlapping generalized state banks")
         data = self._publication(state_in, state_aug, state_out, dt)
         wp.launch_tiled(
