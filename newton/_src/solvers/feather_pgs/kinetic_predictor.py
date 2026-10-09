@@ -7,10 +7,12 @@
 """Current Kuka forcing and held kinetic action; no rows or state integration."""
 
 import functools
+from string import Template
 
 import numpy as np
 import warp as wp
 
+from . import cached_force
 from .kinetic_types import (
     CurrentForceInput,
     CurrentKineticCache,
@@ -136,7 +138,17 @@ def _release(address: wp.uint64): ...
 def _lane() -> wp.vec2i: ...
 
 
-_PREDICTOR = r"""
+_FORCE = cached_force.ForceOperands(
+    q="inputs.joint_q.data",
+    state_qd="inputs.joint_qd.data",
+    predictor_qd="inputs.predictor_qd.data",
+    stiffness="inputs.joint_spring_stiffness.data",
+    reference="inputs.joint_spring_ref.data",
+    damping="inputs.joint_damping.data",
+    dt="inputs.dt",
+)
+
+_PREDICTOR = Template(r"""
     float* s = reinterpret_cast<float*>(address);
 #if defined(__CUDA_ARCH__)
     const int lane=threadIdx.x&31, stride=32;
@@ -162,9 +174,7 @@ _PREDICTOR = r"""
             for(int k=0;k<3;++k) good=good&&isfinite(r[k]);
             bool nonzero=false;for(int k=0;k<6;++k)nonzero=nonzero||f[k]!=0.0f;
             if(nonzero){
-                const wp::vec3 force(f[0],f[1],f[2]);
-                const wp::vec3 moment=wp::vec3(f[3],f[4],f[5])+wp::cross(r,force);
-                for(int k=0;k<3;++k){v[k]=force[k];v[k+3]=moment[k];}
+                $SHIFT
             }
         }
         for(int k=0;k<6;++k)s[b*6+k]=v[k];
@@ -211,9 +221,9 @@ _PREDICTOR = r"""
         const int d=plan.dof_ids.data[world*35+i];
         const auto axis=current.axes.data[world*23+i];
         float ext=0.0f;
-        for(int k=0;k<6;++k){good=good&&isfinite(axis[k]);if(external)ext+=axis[k]*s[b*6+k];}
+        $PROJECT
         const float q=inputs.joint_q.data[plan.q_index.data[world*23+i]],qd=inputs.joint_qd.data[d];
-        const float passive=inputs.joint_spring_stiffness.data[d]*(inputs.joint_spring_ref.data[d]-q)-inputs.joint_damping.data[d]*qd;
+        const float passive=$PASSIVE;
         float u0=0.0f;
         if(inputs.drive_row_by_dof.data[d]>=0) {
             const float ke=inputs.joint_target_ke.data[d],kd=inputs.joint_target_kd.data[d];
@@ -233,7 +243,7 @@ _PREDICTOR = r"""
     for(int i=lane;i<6;i+=stride) {
         const auto axis=current.free_axes.data[world*6+i],bias=current.free_bias.data[world];
         float value=0.0f;
-        for(int k=0;k<6;++k){good=good&&isfinite(axis[k])&&isfinite(bias[k]);value-=axis[k]*(bias[k]-s[30*6+k]);}
+        $PROJECT_FREE
         value+=inputs.joint_f.data[plan.dof_ids.data[world*35+23+i]];
         s[192+23+i]=value;good=good&&isfinite(value);
     }
@@ -290,7 +300,7 @@ _PREDICTOR = r"""
         const int d=plan.dof_ids.data[world*35+i];
         float a=i<29?s[262+i]:0.0f;
         if(inputs.kinematic_dof.data[d]!=0)a=0.0f;
-        s[262+i]=a;s[297+i]=inputs.predictor_qd.data[d]+inputs.dt*a;
+        s[262+i]=a;s[297+i]=$VELOCITY;
         good=good&&isfinite(a)&&isfinite(s[297+i]);
     }
 #if defined(__CUDA_ARCH__)
@@ -300,9 +310,7 @@ _PREDICTOR = r"""
         const int joint=inputs.free_root_joints.data[plan.root_slots.data[world*2+root]];
         if(inputs.kinematic_joint.data[joint]!=0)continue;
         const int d=inputs.joint_qd_start.data[joint],off=root==0?23:29;
-        const wp::vec3 v(inputs.predictor_qd.data[d],inputs.predictor_qd.data[d+1],inputs.predictor_qd.data[d+2]);
-        const wp::vec3 w(inputs.predictor_qd.data[d+3],inputs.predictor_qd.data[d+4],inputs.predictor_qd.data[d+5]);
-        const auto c=wp::cross(w,v);for(int k=0;k<3;++k)s[297+off+k]+=c[k]*inputs.dt;
+        $TRANSPORT
     }
 #if defined(__CUDA_ARCH__)
     __syncwarp(0xffffffffu);
@@ -333,7 +341,18 @@ _PREDICTOR = r"""
     for(int i=lane;i<35;i+=stride){const int d=plan.dof_ids.data[world*35+i];output.joint_qdd.data[d]=s[262+i];output.v_hat.data[d]=s[297+i];}
     for(int b=lane;b<32;b+=stride){wp::spatial_vector v;for(int k=0;k<6;++k)v[k]=s[332+b*6+k];output.endpoint_twists.data[plan.body_ids.data[world*32+b]]=v;}
     if(lane==0)output.status.data[world]=0;
-"""
+""").substitute(
+    SHIFT=cached_force.shift_wrench("f", "r", "v[k]", "v[k+3]"),
+    PROJECT=cached_force.project_wrench(
+        "axis", "s[b*6+k]", "ext", active="external", validate="good=good&&isfinite(axis[k]);"
+    ),
+    PASSIVE=_FORCE.passive("plan.q_index.data[world*23+i]", "d"),
+    PROJECT_FREE=cached_force.project_wrench(
+        "axis", "s[30*6+k]", "value", bias="bias", validate="good=good&&isfinite(axis[k])&&isfinite(bias[k]);"
+    ),
+    VELOCITY=_FORCE.velocity("d", "a"),
+    TRANSPORT=_FORCE.transport("d", "s[297+off+k]"),
+)
 
 
 @wp.func_native(_PREDICTOR)

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import warp as wp
 
-from . import kinetic_state, sparse_factor, tree_chain_scan
+from . import cached_force, kinetic_state, sparse_factor, tree_chain_scan
 from .cached_state import StateOperands, StateStages, make_body_terms, make_state_kernel
 from .tree_kinetic_layout import G1_LAYOUT, TreeLayout
 
@@ -232,6 +232,16 @@ $REDUCE
     }
 """
 
+_FORCE = cached_force.ForceOperands(
+    q="f.joint_q.data",
+    state_qd="f.joint_qd.data",
+    predictor_qd="f.predictor_qd.data",
+    stiffness="f.stiffness.data",
+    reference="f.reference.data",
+    damping="f.damping.data",
+    dt="f.dt",
+)
+
 _PREDICT = r"""    $PHYSICAL_DECL
 
     const int art=p.group_to_art.data[group],world=p.art_to_world.data[art];
@@ -251,9 +261,7 @@ _PREDICT = r"""    $PHYSICAL_DECL
     for(int local=lane;local<$BODIES;local+=stride) {
         const int body=p.joint_child.data[js+local];
         const auto input=f.body_f.data[body];
-        const wp::vec3 force(input[0],input[1],input[2]);
-        const wp::vec3 torque=wp::vec3(input[3],input[4],input[5])+wp::cross(cache.com_offset.data[group*$BODIES+local],force);
-        for(int k=0;k<3;++k){s[6*local+k]=force[k];s[6*local+3+k]=torque[k];}
+        $SHIFT
         bool active=false;for(int k=0;k<6;++k)active|=input[k]!=0.0f;
         if(active) {
 #if defined(__CUDA_ARCH__)
@@ -270,8 +278,8 @@ $REDUCE
     for(int i=lane;i<$DOFS;i+=stride) {
         const int dof=ds+i,body=p.dof_joint.data[i];
         float value=-cache.bias.data[group*$DOFS+i]+f.joint_f.data[dof]+f.u0.data[dof];
-        if(nonzero)for(int k=0;k<6;++k)value+=f.S.data[dof][k]*s[6*body+k];
-        if(i>=$ROOT_DOFS)value+=f.stiffness.data[dof]*(f.reference.data[dof]-f.joint_q.data[plan.q_index.data[group*$DOFS+i]])-f.damping.data[dof]*f.joint_qd.data[dof];
+        if(nonzero){$PROJECT}
+        if(i>=$ROOT_DOFS)value+=$PASSIVE;
         s[$SIX_BODIES+i]=value;
     }
 #if defined(__CUDA_ARCH__)
@@ -297,7 +305,7 @@ $REDUCE
         const int dof=ds+$PHYSICAL_INDEX;
         const bool valid=cache.current_valid.data[art]&&d.valid.data[world]&&!d.status.data[world]&&!cache.status.data[group]&&wp::isfinite(value);
         f.qdd.data[dof]=valid?value:NAN;
-        f.vhat.data[dof]=f.predictor_qd.data[dof]+f.dt*f.qdd.data[dof];
+        f.vhat.data[dof]=$VELOCITY;
         if(!valid) {
 #if defined(__CUDA_ARCH__)
             atomicOr(&cache.status.data[group],4);
@@ -310,10 +318,7 @@ $REDUCE
     __syncthreads();
 #endif
     if($FREE_ROOT&&lane==0) {
-        const wp::vec3 v(f.predictor_qd.data[ds],f.predictor_qd.data[ds+1],f.predictor_qd.data[ds+2]);
-        const wp::vec3 w(f.predictor_qd.data[ds+3],f.predictor_qd.data[ds+4],f.predictor_qd.data[ds+5]);
-        const wp::vec3 transport=f.dt*wp::cross(w,v);
-        for(int k=0;k<3;++k)f.vhat.data[ds+k]+=transport[k];
+        $TRANSPORT
     }
 """
 
@@ -599,7 +604,20 @@ def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = G1_LA
     )
     if chain_scan:
         reduction = "if(nonzero) {\n" + reduction + "}\n"
-    source = layout.render(_PREDICT.replace("$REDUCE", reduction))
+    operations = {
+        "SHIFT": cached_force.shift_wrench(
+            "input", "cache.com_offset.data[group*$BODIES+local]", "s[6*local+k]", "s[6*local+3+k]"
+        ),
+        "PROJECT": cached_force.project_wrench("f.S.data[dof]", "s[6*body+k]", "value"),
+        "PASSIVE": _FORCE.passive("plan.q_index.data[group*$DOFS+i]", "dof"),
+        "VELOCITY": _FORCE.velocity("dof", "f.qdd.data[dof]"),
+        "TRANSPORT": _FORCE.transport("ds", "f.vhat.data[ds+k]"),
+        "REDUCE": reduction,
+    }
+    source = _PREDICT
+    for name, operation in operations.items():
+        source = source.replace("$" + name, operation)
+    source = layout.render(source)
 
     @wp.func_native(source)
     def native(

@@ -7,12 +7,14 @@ import functools
 import hashlib
 import math
 import os
+from string import Template
 
 import numpy as np
 import warp as wp
 
 from ...sim import ModelFlags
 from . import (  # noqa: F401 - names in the checked generated state factory
+    cached_force,
     kernels,
     kinetic_state,
     world_scan_owner,
@@ -340,7 +342,17 @@ def get_state_kernel(finish):
 def _force_storage() -> wp.uint64: ...
 
 
-@wp.func_native(r"""
+_FORCE = cached_force.ForceOperands(
+    q="f.joint_q.data",
+    state_qd="f.joint_qd.data",
+    predictor_qd="f.predictor_qd.data",
+    stiffness="f.stiffness.data",
+    reference="f.reference.data",
+    damping="f.damping.data",
+    dt="f.dt",
+)
+
+_PREDICT = Template(r"""
     float* s=reinterpret_cast<float*>(address);
 #if defined(__CUDA_ARCH__)
     const int lane=threadIdx.x&15,stride=16;
@@ -355,9 +367,7 @@ def _force_storage() -> wp.uint64: ...
         float v[6]={};
         if(b<12&&(f.body_flags.data[body]&2)==0) {
             const auto external=f.body_f.data[body];const auto r=cache.com_offset.data[world*13+b];
-            const wp::vec3 force(external[0],external[1],external[2]);
-            const wp::vec3 torque=wp::vec3(external[3],external[4],external[5])+wp::cross(r,force);
-            for(int k=0;k<3;++k){v[k]=force[k];v[k+3]=torque[k];}
+            $SHIFT
         }
         for(int k=0;k<6;++k){s[6*b+k]=v[k];good&=wp::isfinite(v[k]);}
     }
@@ -374,12 +384,11 @@ def _force_storage() -> wp.uint64: ...
         float tau=f.joint_f.data[dof]+f.u0.data[dof];
         if(i<9) {
             const auto axis=f.S.data[dof];const int body=plan.dof_body.data[i];
-            float ext=0.0f;for(int k=0;k<6;++k)ext+=axis[k]*s[6*body+k];
-            const float q=f.joint_q.data[plan.q_index.data[world*9+i]],qd=f.joint_qd.data[dof];
-            tau+=-cache.bias.data[world*9+i]+ext+f.stiffness.data[dof]*(f.reference.data[dof]-q)-f.damping.data[dof]*qd;
+            float ext=0.0f;$PROJECT
+            tau+=-cache.bias.data[world*9+i]+ext+$PASSIVE;
         } else {
             const auto axis=f.S.data[dof],bias=cache.free_bias.data[world];
-            for(int k=0;k<6;++k)tau-=axis[k]*(bias[k]-s[6*11+k]);
+            $PROJECT_FREE
         }
         s[78+i]=tau;good&=wp::isfinite(tau);
     }
@@ -411,7 +420,7 @@ def _force_storage() -> wp.uint64: ...
         const int dof=plan.dof_ids.data[world*21+i];
         const float acceleration=i<15&&f.kinematic_dof.data[dof]==0?s[93+i]:0.0f;
         f.qdd.data[dof]=acceleration;
-        f.vhat.data[dof]=f.predictor_qd.data[dof]+acceleration*f.dt;
+        f.vhat.data[dof]=$VELOCITY;
     }
 #if defined(__CUDA_ARCH__)
     __syncwarp(mask);
@@ -420,11 +429,19 @@ def _force_storage() -> wp.uint64: ...
         const int joint=plan.joint_ids.data[world*32+11+root];
         if(f.kinematic_joint.data[joint]!=0)continue;
         const int d=plan.dof_ids.data[world*21+9+6*root];
-        const wp::vec3 v(f.predictor_qd.data[d],f.predictor_qd.data[d+1],f.predictor_qd.data[d+2]);
-        const wp::vec3 w(f.predictor_qd.data[d+3],f.predictor_qd.data[d+4],f.predictor_qd.data[d+5]);
-        const auto c=wp::cross(w,v);for(int k=0;k<3;++k)f.vhat.data[d+k]+=c[k]*f.dt;
+        $TRANSPORT
     }
-""")
+""").substitute(
+    SHIFT=cached_force.shift_wrench("external", "r", "v[k]", "v[k+3]"),
+    PROJECT=cached_force.project_wrench("axis", "s[6*body+k]", "ext"),
+    PASSIVE=_FORCE.passive("plan.q_index.data[world*9+i]", "dof"),
+    PROJECT_FREE=cached_force.project_wrench("axis", "s[6*11+k]", "tau", bias="bias"),
+    VELOCITY=_FORCE.velocity("dof", "acceleration"),
+    TRANSPORT=_FORCE.transport("d", "f.vhat.data[d+k]"),
+)
+
+
+@wp.func_native(_PREDICT)
 def _predict(address: wp.uint64, world: int, plan: KineticPlan, cache: KineticData, f: ForceInput): ...
 
 
