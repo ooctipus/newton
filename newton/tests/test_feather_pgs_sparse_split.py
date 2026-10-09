@@ -328,18 +328,36 @@ class TestSparseSplitPhysics(unittest.TestCase):
                 self.assertGreater(contact_count, 0)
 
     def test_prescribed_dof_notification_requires_reconstruction(self):
-        """Reject a newly prescribed response before publishing incompatible cached masks."""
-        case = _case(True)
-        model, solver, *_ = case
-        self.assertTrue(solver._sparse_split)
-        _step(case)
-        old_mask = solver._kinematic_dof_mask_host.copy()
-        flags = model.body_flags.numpy().copy()
-        flags[0] |= int(newton.BodyFlags.KINEMATIC)
-        model.body_flags.assign(flags)
-        with self.assertRaisesRegex(RuntimeError, "Sparse response gained prescribed DOFs"):
-            solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
-        np.testing.assert_array_equal(solver._kinematic_dof_mask_host, old_mask)
+        """Reject prescribed response before changing either owner's masks or cache."""
+        for cached in (True, False):
+            with self.subTest(cached=cached):
+                with mock.patch.dict(os.environ, {"FEATHER_PGS_TREE_KINETIC_STATE": str(int(cached))}):
+                    case = _case(True)
+                model, solver, *_ = case
+                self.assertTrue(solver._sparse_split)
+                _step(case)
+                owner = solver._tree_kinetic_state
+                self.assertEqual(owner is not None, cached)
+                old_host = solver._kinematic_dof_mask_host.copy()
+                old_device = solver._kinematic_dof_mask.numpy().copy()
+                names = ("current_valid", "geometry_valid", "generation", "geometry_generation", "status")
+                old_cache = {name: getattr(owner.data, name).numpy().copy() for name in names} if owner else {}
+                flags = model.body_flags.numpy().copy()
+                flags[0] |= int(newton.BodyFlags.KINEMATIC)
+                model.body_flags.assign(flags)
+                error = ValueError if cached else RuntimeError
+                message = (
+                    "Cached trees exclude gradients, particles and prescribed bodies"
+                    if cached
+                    else "Sparse response gained prescribed DOFs; reconstruct the solver and recapture its CUDA graph."
+                )
+                with self.assertRaises(error) as raised:
+                    solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
+                self.assertEqual(str(raised.exception), message)
+                np.testing.assert_array_equal(solver._kinematic_dof_mask_host, old_host)
+                np.testing.assert_array_equal(solver._kinematic_dof_mask.numpy(), old_device)
+                for name, values in old_cache.items():
+                    np.testing.assert_array_equal(getattr(owner.data, name).numpy(), values)
 
     def test_unsupported_actual_models_and_seeded_modes_fall_back(self):
         """Keep dense allocation for mixed, prescribed and carried-impulse recipes."""

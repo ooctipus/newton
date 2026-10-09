@@ -19,7 +19,12 @@ def supported(solver):
         and not solver.model.requires_grad
         and not solver.model.particle_count
         and not solver._has_free_rigid_bodies
-        and not solver._mimic_count
+        and (
+            not solver._mimic_count
+            or (
+                solver._sparse_velocity_limits and solver._mimic_valid_np is not None and np.all(solver._mimic_valid_np)
+            )
+        )
         and not solver._connect_count
         and not solver._has_loop_joints
         and not solver._has_prescribed_response
