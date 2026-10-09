@@ -53,6 +53,8 @@ class TreeKineticState:
 
         self.sparse = sparse_owner
         self.solver = solver = sparse_owner.solver
+        self.motion_velocity = bool(solver.enable_joint_velocity_limits)
+        self._motion_binding = None
         model, device, worlds = solver.model, solver.model.device, solver.world_count
         # Direct construction is also used by CPU physical representation tests.
         # Production admission remains CUDA-only through supported().
@@ -139,7 +141,11 @@ class TreeKineticState:
         self.status = self.data.status
         body_velocity = getattr(sparse_owner, "requires_body_velocity", False)
         self.repair_kernel = native.get_state_kernel(
-            False, self.chain_scan, layout=self.layout, body_velocity=body_velocity
+            False,
+            self.chain_scan,
+            layout=self.layout,
+            body_velocity=body_velocity,
+            motion_velocity=self.motion_velocity,
         )
         self.finish_kernel = native.get_state_kernel(
             True, self.chain_scan, layout=self.layout, body_velocity=body_velocity
@@ -194,6 +200,8 @@ class TreeKineticState:
             raise RuntimeError("Tree kinetic state excludes gradient/alternate augmented ownership")
         if self.admission is not None and not self.admission(self.solver):
             raise RuntimeError("Tree kinetic configuration changed; reconstruct and recapture")
+        if bool(self.solver.enable_joint_velocity_limits) != self.motion_velocity:
+            raise RuntimeError("Tree kinetic motion-velocity contract changed; reconstruct and recapture")
         if dt is None or not math.isfinite(dt) or dt <= 0:
             raise ValueError("Tree kinetic state requires a positive finite step duration")
         for name in ("joint_q", "joint_qd", "body_q", "body_qd", "body_f"):
@@ -229,29 +237,58 @@ class TreeKineticState:
     def begin(self, state_in, state_aug, stage3_qd, dt, global_refresh):
         """Repair current caches or late-request geometry before any factor read."""
         self._validate_call(state_in, state_aug, dt)
-        if stage3_qd.ptr != state_in.joint_qd.ptr:
-            raise RuntimeError("Tree kinetic state excludes alternate prescaled predictor velocity")
+        binding = self._validate_motion(state_in, state_aug, stage3_qd)
         data = self._publication(state_in, state_aug, state_in, dt)
+        arguments = [
+            self.sparse.plan,
+            self.plan,
+            data,
+            self.data,
+            self.solver._mass_update_requested,
+            int(global_refresh),
+        ]
+        if self.motion_velocity:
+            arguments.append(stage3_qd)
         wp.launch_tiled(
             self.repair_kernel,
             dim=[self.solver.world_count],
-            inputs=[
-                self.sparse.plan,
-                self.plan,
-                data,
-                self.data,
-                self.solver._mass_update_requested,
-                int(global_refresh),
-            ],
+            inputs=arguments,
             block_dim=self.block_dim,
             device=self.solver.model.device,
         )
+        self._motion_binding = binding
+
+    def _validate_motion(self, state, state_aug, velocity):
+        """Reject invalid working descriptors before changing current-cache validity."""
+        raw = state.joint_qd
+        if (
+            not isinstance(velocity, wp.array)
+            or velocity.device != raw.device
+            or velocity.dtype != raw.dtype
+            or velocity.shape != raw.shape
+            or not velocity.is_contiguous
+        ):
+            raise RuntimeError("Tree kinetic motion velocity requires a matching contiguous state-vector descriptor")
+        if not self.motion_velocity and velocity.ptr != raw.ptr:
+            raise RuntimeError("Tree kinetic state excludes alternate prescaled predictor velocity")
+
+        def overlaps(array):
+            return velocity.ptr < array.ptr + array.capacity and array.ptr < velocity.ptr + velocity.capacity
+
+        if (velocity.ptr != raw.ptr and overlaps(raw)) or any(
+            overlaps(array) for array in (state.joint_q, state_aug.joint_qdd, self.solver.v_hat, self.solver.v_out)
+        ):
+            raise RuntimeError("Tree kinetic motion velocity overlaps state coordinates or response outputs")
+        return state.joint_q.ptr, raw.ptr, velocity.ptr
 
     def predict(self, state_in, state_aug, control, stage3_qd, dt):
         """Apply live force buckets through held W with original root transport."""
         from .tree_kinetic_state import ForceInput  # noqa: PLC0415
 
         self._validate_call(state_in, state_aug, dt)
+        binding = self._validate_motion(state_in, state_aug, stage3_qd)
+        if self.motion_velocity and binding != self._motion_binding:
+            raise RuntimeError("Tree kinetic predictor motion velocity differs from the current-cache binding")
         solver = self.solver
         force = ForceInput()
         force.joint_q, force.joint_qd = state_in.joint_q, state_in.joint_qd

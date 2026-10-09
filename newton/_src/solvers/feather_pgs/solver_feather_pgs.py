@@ -2476,14 +2476,14 @@ class SolverFeatherPGS(SolverBase):
         # _stage1_crba call; gates the per-step H memsets (see _stage1_crba).
         self._mass_update_global_flag = True
         self._last_step_dt = None
-        self._fk_id_cache_enabled = bool(
+        self._fk_id_cache_available = bool(
             model.device.is_cuda
             and model.articulation_count
             and model.joint_count
             and not model.requires_grad
-            and not enable_joint_velocity_limits
             and not _FK_ID_CACHE_OFF
         )
+        self._fk_id_cache_enabled = self._fk_id_cache_available and not enable_joint_velocity_limits
         # Split's dense/MF execution exposed a cross-replay lifetime conflict
         # when stage 7 published next-step dynamics over active solve scratch.
         # Matrix-free concludes those readers before its validated in-place

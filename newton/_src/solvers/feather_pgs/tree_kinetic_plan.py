@@ -50,13 +50,16 @@ def make_plan(model, operator):
         or np.any(parent[1:] >= np.arange(1, bodies))
     ):
         raise ValueError("Cached trees require one uniform parent-first topology")
-    types = model.joint_type.numpy().reshape(worlds, bodies)
-    if not np.all(types == types[0]) or types[0, 0] not in (int(JointType.FREE), int(JointType.FIXED)):
-        raise ValueError("Cached trees require a free or fixed root")
-    if not np.all(np.isin(types[:, 1:], [int(JointType.FIXED), int(JointType.REVOLUTE), int(JointType.PRISMATIC)])):
-        raise ValueError("Cached trees require scalar or fixed descendant joints")
     qd = model.joint_qd_start.numpy()
     counts = np.diff(qd).reshape(worlds, bodies)
+    types = model.joint_type.numpy().reshape(worlds, bodies)
+    locked_root = types[0, 0] == int(JointType.D6) and np.all(counts[:, 0] == 0)
+    if not np.all(types == types[0]) or (
+        types[0, 0] not in (int(JointType.FREE), int(JointType.FIXED)) and not locked_root
+    ):
+        raise ValueError("Cached trees require a free, fixed or zero-coordinate D6 root")
+    if not np.all(np.isin(types[:, 1:], [int(JointType.FIXED), int(JointType.REVOLUTE), int(JointType.PRISMATIC)])):
+        raise ValueError("Cached trees require scalar or fixed descendant joints")
     if not np.all(counts == counts[0]) or not np.all(
         qd[:-1].reshape(worlds, bodies) - np.arange(worlds)[:, None] * dofs == qd[:bodies]
     ):

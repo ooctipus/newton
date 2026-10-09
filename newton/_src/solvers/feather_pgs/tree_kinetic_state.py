@@ -5,6 +5,7 @@
 """Generated current/next tree moments, bias and fused state publication."""
 
 import functools
+from textwrap import indent
 from types import SimpleNamespace
 
 import warp as wp
@@ -93,6 +94,21 @@ def _same_source(cache: KineticData, group: int, q: wp.array[float], qd: wp.arra
     "cache.source_q.data[group]=reinterpret_cast<uint64_t>(q.data);cache.source_qd.data[group]=reinterpret_cast<uint64_t>(qd.data);"
 )
 def _stamp_source(cache: KineticData, group: int, q: wp.array[float], qd: wp.array[float]): ...
+
+
+@wp.func_native(r"""
+    if(state_qd.data==motion_qd.data)return 0;
+    int different=0;
+#if defined(__CUDA_ARCH__)
+    for(int i=threadIdx.x;i<count;i+=blockDim.x)
+        different|=state_qd.data[start+i]!=motion_qd.data[start+i];
+    return __syncthreads_or(different);
+#else
+    for(int i=0;i<count;++i)different|=state_qd.data[start+i]!=motion_qd.data[start+i];
+    return different;
+#endif
+""")
+def _different_motion(state_qd: wp.array[float], motion_qd: wp.array[float], start: int, count: int) -> int: ...
 
 
 @wp.func_native("float* s=reinterpret_cast<float*>(address);for(int k=0;k<7;++k)s[7*body+k]=pose[k];")
@@ -455,9 +471,16 @@ def get_helpers(layout: TreeLayout = G1_LAYOUT, chain_scan: bool = False, body_v
 
 @functools.cache
 def get_state_kernel(
-    finish: bool, chain_scan: bool = False, *, layout: TreeLayout = G1_LAYOUT, body_velocity: bool = False
+    finish: bool,
+    chain_scan: bool = False,
+    *,
+    layout: TreeLayout = G1_LAYOUT,
+    body_velocity: bool = False,
+    motion_velocity: bool = False,
 ):
     """Build complete repair/finish using original generalized integration laws."""
+    if finish and motion_velocity:
+        raise ValueError("Alternate motion velocity is a repair-only contract")
     h = get_helpers(layout, chain_scan, body_velocity)
     plan_type = h.plan_type
     scan_poses, scan_motion, collect = h._scan_poses, h._scan_motion, h._collect
@@ -473,8 +496,19 @@ def get_state_kernel(
         "if wp.static(free_root) and lane == 0",
         "plan.root_slot[group]",
     )
+    motion_setup = "motion_changed = _different_motion(data.joint_qd, motion_qd, ds, dofs)\n" if motion_velocity else ""
+    motion_reuse = "        and motion_changed == 0\n" if motion_velocity else ""
+    motion_bind = "qd = motion_qd" if motion_velocity else ""
+    stamp = "_stamp_source(cache, group, q, qd)"
+    if motion_velocity:
+        # An override source must not be reused when a later begin returns to
+        # ordinary motion, even if no finish occurred between the two calls.
+        stamp = """if motion_changed == 0:
+    _stamp_source(cache, group, q, data.joint_qd)
+else:
+    _stamp_source(cache, group, q, qd)"""
     stages = StateStages(
-        setup="""
+        setup=f"""
 group, logical_lane = wp.tid()
 lanes = _lanes()
 lane, stride = lanes[0], lanes[1]
@@ -482,12 +516,14 @@ if stride == 1 and logical_lane != 0:
     return
 art = p.group_to_art[group]
 ds, js = p.art_dof_start[art], p.art_joint_start[art]
+{motion_setup}\
 refresh = int(global_refresh != 0)
 if not wp.static(finish):
     refresh = int(refresh != 0 or requests[art] != 0)
     if (
         cache.current_valid[art] != 0
         and _same_source(cache, group, data.joint_q, data.joint_qd) != 0
+{motion_reuse}\
         and (
             refresh == 0
             or (
@@ -504,7 +540,7 @@ if local == 0:
     _store_origin(address, 1, wp.transform_get_translation(relative))
     relative = wp.transform(wp.vec3(), wp.transform_get_rotation(relative))
 """,
-        poses="""
+        poses=f"""
 scan_poses(address, plan)
 if lane == 0:
     root_body = data.joint_child[js]
@@ -514,6 +550,7 @@ if lane == 0:
 _sync()
 origin = _load_origin(address, 0)
 shift = _load_origin(address, 1)
+{motion_bind}
 """,
         motion="""
 for local in range(lane, bodies, stride):
@@ -569,15 +606,19 @@ _sync()
         collect="""
 collect(address, group, p, plan, cache, refresh)
 if lane == 0:
-    _stamp_source(cache, group, q, qd)
-""",
+"""
+        + indent(stamp, "    "),
     )
     name = f"tree_kinetic_finish{bodies}" if finish else f"tree_kinetic_repair{bodies}"
     if chain_scan:
         name += "_chain"
+    signature = "p: sparse_factor.SparsePlan, plan: plan_type, data: PublicationData, cache: KineticData, requests: wp.array[int], global_refresh: int"
+    if motion_velocity:
+        name += "_motion"
+        signature += ", motion_qd: wp.array[float]"
     return make_state_kernel(
         name,
-        "p: sparse_factor.SparsePlan, plan: plan_type, data: PublicationData, cache: KineticData, requests: wp.array[int], global_refresh: int",
+        signature,
         operands,
         stages,
         dict(globals(), **locals()),

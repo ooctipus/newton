@@ -23,14 +23,13 @@ def supported(solver):
         and not solver._connect_count
         and not solver._has_loop_joints
         and not solver._has_prescribed_response
-        and solver._fk_id_cache_enabled
+        and solver._fk_id_cache_available
         and (solver.pgs_mode == "matrix_free" or solver._sparse_split)
         and solver._async_augmented_drives
         and solver._parallel_augmented_drive_topology
         and solver._articulation_dynamics_stream is not None
         and not solver.lazy_kinematics
         and not solver._fused_k1
-        and not solver.enable_joint_velocity_limits
         and not solver._debug_buffers_enabled
         and not solver._double_buffer
         and getattr(solver, "_world_scan_publication", None) is None
@@ -116,6 +115,8 @@ def create_owner(solver):
     except ValueError:
         return None
     operator.kinetic_state = owner
+    # Only the complete tree owner can cache a distinct prescaled motion input.
+    solver._fk_id_cache_enabled = True
     # The complete sparse solve concludes before finish publishes the next
     # S/velocity cache. It has no late dense/MF scratch readers, which require
     # the ordinary split path's separate kinematics snapshot.
