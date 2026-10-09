@@ -9,10 +9,12 @@ ancestor pattern. Neither assembly nor factorization allocates a dense H.
 
 from dataclasses import dataclass
 from functools import cache
+from string import Template
 
 import numpy as np
 import warp as wp
 
+from . import response_operator
 from .sparse_factorization import _sparse_cholesky_source, _sparse_inverse_source
 
 
@@ -529,7 +531,20 @@ def _get_crba_sparse_factor_kernel(
     return wp.kernel(enable_backward=False, module="unique")(factor_kernel)
 
 
-@wp.func_native("""
+_RESPONSE = response_operator.SparseInverseFactor(
+    "Linv_group.data+base",
+    response_operator.CompressedSupport(
+        "indices.row_offsets.data",
+        "indices.columns.data",
+        "indices.column_offsets.data",
+        "indices.column_entries.data",
+        "indices.entry_rows.data",
+    ),
+)
+
+
+@wp.func_native(
+    Template("""
     const int group = tid >> 5;
     if (group >= group_to_art.shape[0]) return;
 #if defined(__CUDA_ARCH__)
@@ -544,24 +559,21 @@ def _get_crba_sparse_factor_kernel(
     const int base = group * indices.nonzero_count;
     const int start = articulation_dof_start.data[group_to_art.data[group]];
     for (int row = lane; row < n; row += stride) {
-        float value = 0.0f;
-        for (int entry = indices.row_offsets.data[row]; entry < indices.row_offsets.data[row + 1]; ++entry)
-            value += Linv_group.data[base + entry] * tau.data[start + indices.permutation.data[indices.columns.data[entry]]];
+        $FORWARD_ACTION
         scratch.data[group * n + row] = value;
     }
 #if defined(__CUDA_ARCH__)
     __syncwarp();
 #endif
     for (int col = lane; col < n; col += stride) {
-        float value = 0.0f;
-        for (int position = indices.column_offsets.data[col]; position < indices.column_offsets.data[col + 1]; ++position) {
-            const int entry = indices.column_entries.data[position];
-            const int row = indices.entry_rows.data[entry];
-            value += Linv_group.data[base + entry] * scratch.data[group * n + row];
-        }
+        $TRANSPOSE_ACTION
         qdd.data[start + indices.permutation.data[col]] = value;
     }
-""")
+""").substitute(
+        FORWARD_ACTION=_RESPONSE.forward("row", "tau.data[start+indices.permutation.data[$index]]"),
+        TRANSPOSE_ACTION=_RESPONSE.transpose("col", "scratch.data[group*n+$index]"),
+    )
+)
 def _solve_native(
     tid: int,
     group_to_art: wp.array[int],

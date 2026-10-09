@@ -12,7 +12,7 @@ from string import Template
 import numpy as np
 import warp as wp
 
-from . import cached_force
+from . import cached_force, response_operator
 from .kinetic_types import (
     CurrentForceInput,
     CurrentKineticCache,
@@ -258,31 +258,25 @@ _PREDICTOR = Template(r"""
     const float* w6=held.inverse6.data+sg*36;
     bool good6=true;
     for(int i=lane;i<29;i+=stride) {
-        float value=0.0f;
-        if(i<7) {
-            for(int k=0;k<=i;++k){const float a=t[40+i*(i+1)/2+k];good=good&&isfinite(a);value+=a*s[192+k];}
-            for(int f=0;f<4;++f)for(int k=0;k<4;++k){const float a=t[68+f*28+i*4+k];good=good&&isfinite(a);value+=a*s[192+7+f*4+k];}
-        } else if(i<23) {
-            const int f=(i-7)/4,row=(i-7)%4;
-            for(int k=0;k<=row;++k){const float a=t[f*10+row*(row+1)/2+k];good=good&&isfinite(a);value+=a*s[192+7+f*4+k];}
+        if(i<23) {
+            $BLOCK_FORWARD
+            s[227+i]=value;good=good&&isfinite(value);
         } else {
-            const int row=i-23;
-            for(int k=0;k<=row;++k){const float a=w6[row*6+k];good6=good6&&isfinite(a);value+=a*s[192+23+k];}
+            $FREE_FORWARD
+            s[227+i]=value;good6=good6&&isfinite(value);
         }
-        s[227+i]=value;if(i<23)good=good&&isfinite(value);else good6=good6&&isfinite(value);
     }
 #if defined(__CUDA_ARCH__)
     __syncwarp(0xffffffffu);
 #endif
     for(int i=lane;i<29;i+=stride) {
-        float value=0.0f;
-        if(i<7)for(int k=i;k<7;++k)value+=t[40+k*(k+1)/2+i]*s[227+k];
-        else if(i<23) {
-            const int f=(i-7)/4,col=(i-7)%4;
-            for(int k=col;k<4;++k)value+=t[f*10+k*(k+1)/2+col]*s[227+7+f*4+k];
-            for(int k=0;k<7;++k)value+=t[68+f*28+k*4+col]*s[227+k];
-        } else for(int k=i-23;k<6;++k)value+=w6[k*6+i-23]*s[227+23+k];
-        s[262+i]=value;if(i<23)good=good&&isfinite(value);else good6=good6&&isfinite(value);
+        if(i<23) {
+            $BLOCK_TRANSPOSE
+            s[262+i]=value;good=good&&isfinite(value);
+        } else {
+            $FREE_TRANSPOSE
+            s[262+i]=value;good6=good6&&isfinite(value);
+        }
     }
 #if defined(__CUDA_ARCH__)
     good=__all_sync(0xffffffffu,good);good6=__all_sync(0xffffffffu,good6);
@@ -290,8 +284,8 @@ _PREDICTOR = Template(r"""
 #endif
     if(!good6&&lane==0) {
         const float* l=held.lower6.data+sg*36;float x[6];
-        for(int i=0;i<6;++i){float v=s[192+23+i];for(int k=0;k<i;++k)v-=l[i*6+k]*x[k];x[i]=l[i*6+i]!=0.0f?v/l[i*6+i]:0.0f;}
-        for(int i=5;i>=0;--i){float v=x[i];for(int k=i+1;k<6;++k)v-=l[k*6+i]*x[k];x[i]=l[i*6+i]!=0.0f?v/l[i*6+i]:0.0f;s[262+23+i]=x[i];}
+        $FALLBACK_FORWARD
+        $FALLBACK_TRANSPOSE
     }
 #if defined(__CUDA_ARCH__)
     __syncwarp(0xffffffffu);
@@ -352,6 +346,18 @@ _PREDICTOR = Template(r"""
     ),
     VELOCITY=_FORCE.velocity("d", "a"),
     TRANSPORT=_FORCE.transport("d", "s[297+off+k]"),
+    BLOCK_FORWARD=response_operator.BlockArrowInverse(7, 4, 4, "t").forward(
+        "i", "s[192+$index]", check="good=good&&isfinite(a);"
+    ),
+    BLOCK_TRANSPOSE=response_operator.BlockArrowInverse(7, 4, 4, "t").transpose("i", "s[227+$index]"),
+    FREE_FORWARD=response_operator.DenseLowerInverse(6, "w6").forward(
+        "i-23", "s[192+23+$index]", check="good6=good6&&isfinite(a);"
+    ),
+    FREE_TRANSPOSE=response_operator.DenseLowerInverse(6, "w6").transpose("i-23", "s[227+23+$index]"),
+    FALLBACK_FORWARD=response_operator.CholeskySolve(6, "l").forward("s[192+23+$index]", "x[$index]"),
+    FALLBACK_TRANSPOSE=response_operator.CholeskySolve(6, "l").transpose(
+        "x[$index]", "x[$index]", post_row="s[262+23+row]=x[row];"
+    ),
 )
 
 

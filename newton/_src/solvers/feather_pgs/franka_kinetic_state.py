@@ -17,6 +17,7 @@ from . import (  # noqa: F401 - names in the checked generated state factory
     cached_force,
     kernels,
     kinetic_state,
+    response_operator,
     world_scan_owner,
     world_scan_publication,
 )
@@ -401,16 +402,8 @@ _PREDICT = Template(r"""
         const int group=family==0?plan.primary_group.data[world]:plan.secondary_group.data[world];
         const float* l=family==0?f.lower9.data+group*81:f.lower6.data+group*36;
         float* x=s+93+offset;
-        for(int row=0;row<n;++row) {
-            float value=s[78+offset+row];
-            for(int k=0;k<row;++k)value-=l[row*n+k]*x[k];
-            const float diagonal=l[row*n+row];x[row]=diagonal!=0.0f?value/diagonal:0.0f;
-        }
-        for(int row=n-1;row>=0;--row) {
-            float value=x[row];for(int k=row+1;k<n;++k)value-=l[k*n+row]*x[k];
-            const float diagonal=l[row*n+row];x[row]=diagonal!=0.0f?value/diagonal:0.0f;
-            good&=wp::isfinite(x[row]);
-        }
+        $FORWARD_ACTION
+        $TRANSPOSE_ACTION
     }
 #if defined(__CUDA_ARCH__)
     good=__all_sync(mask,good);__syncwarp(mask);
@@ -438,6 +431,10 @@ _PREDICT = Template(r"""
     PROJECT_FREE=cached_force.project_wrench("axis", "s[6*11+k]", "tau", bias="bias"),
     VELOCITY=_FORCE.velocity("dof", "acceleration"),
     TRANSPORT=_FORCE.transport("d", "f.vhat.data[d+k]"),
+    FORWARD_ACTION=response_operator.CholeskySolve("n", "l").forward("s[78+offset+$index]", "x[$index]"),
+    TRANSPOSE_ACTION=response_operator.CholeskySolve("n", "l").transpose(
+        "x[$index]", "x[$index]", post_row="good&=wp::isfinite(x[row]);"
+    ),
 )
 
 

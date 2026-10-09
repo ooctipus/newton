@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import warp as wp
 
-from . import cached_force, kinetic_state, sparse_factor, tree_chain_scan
+from . import cached_force, kinetic_state, response_operator, sparse_factor, tree_chain_scan
 from .cached_state import StateOperands, StateStages, make_body_terms, make_state_kernel
 from .tree_kinetic_layout import G1_LAYOUT, TreeLayout
 
@@ -286,22 +286,14 @@ $REDUCE
     __syncthreads();
 #endif
     for(int row=lane;row<$DOFS;row+=stride) {
-        float value=0.0f;
-        for(int col=0;col<=row;++col) {
-            const int entry=p.index.data[row*$DOFS+col];
-            if(entry>=0)value+=d.W.data[group*$NNZ+entry]*s[$SIX_BODIES+$PHYSICAL_INDEX];
-        }
+        $FORWARD_ACTION
         s[$WHITE+row]=value;
     }
 #if defined(__CUDA_ARCH__)
     __syncthreads();
 #endif
     for(int col=lane;col<$DOFS;col+=stride) {
-        float value=0.0f;
-        for(int k=0;k<p.inverse_count.data[col];++k) {
-            const int row=p.inverse_nodes.data[col*$INVERSE_WIDTH+k];
-            value+=d.W.data[group*$NNZ+p.index.data[row*$DOFS+col]]*s[$WHITE+row];
-        }
+        $TRANSPOSE_ACTION
         const int dof=ds+$PHYSICAL_INDEX;
         const bool valid=cache.current_valid.data[art]&&d.valid.data[world]&&!d.status.data[world]&&!cache.status.data[group]&&wp::isfinite(value);
         f.qdd.data[dof]=valid?value:NAN;
@@ -604,6 +596,17 @@ def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = G1_LA
     )
     if chain_scan:
         reduction = "if(nonzero) {\n" + reduction + "}\n"
+    response = response_operator.SparseInverseFactor(
+        "d.W.data+group*$NNZ",
+        response_operator.IndexedSupport(
+            "$DOFS", "p.index.data", "p.inverse_count.data", "p.inverse_nodes.data", "$INVERSE_WIDTH"
+        ),
+    )
+    physical = (
+        f"{layout.dofs - 1}-$index"
+        if layout.permutation == tuple(range(layout.dofs - 1, -1, -1))
+        else "physical[$index]"
+    )
     operations = {
         "SHIFT": cached_force.shift_wrench(
             "input", "cache.com_offset.data[group*$BODIES+local]", "s[6*local+k]", "s[6*local+3+k]"
@@ -613,6 +616,8 @@ def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = G1_LA
         "VELOCITY": _FORCE.velocity("dof", "f.qdd.data[dof]"),
         "TRANSPORT": _FORCE.transport("ds", "f.vhat.data[ds+k]"),
         "REDUCE": reduction,
+        "FORWARD_ACTION": response.forward("row", f"s[$SIX_BODIES+{physical}]"),
+        "TRANSPOSE_ACTION": response.transpose("col", "s[$WHITE+$index]"),
     }
     source = _PREDICT
     for name, operation in operations.items():
