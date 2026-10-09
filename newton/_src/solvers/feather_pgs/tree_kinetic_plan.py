@@ -19,29 +19,30 @@ def cooperative_block_dim(layout, chain_plan=None):
 
 def make_plan(model, operator):
     """Check the tree, scalar laws and packed operator before allocating caches."""
-    worlds = int(model.world_count)
-    if worlds < 1 or model.articulation_count != worlds or model.joint_count != model.body_count:
-        raise ValueError("Cached trees require one complete articulation per world")
-    if model.joint_count % worlds or model.joint_dof_count % worlds:
+    worlds, arts = int(model.world_count), int(model.articulation_count)
+    if worlds < 1 or arts < 1 or model.joint_count != model.body_count:
+        raise ValueError("Cached trees require complete articulation and body ownership")
+    if model.joint_count % arts or model.joint_dof_count % arts:
         raise ValueError("Cached trees require uniform body and coordinate counts")
-    bodies, dofs = model.joint_count // worlds, model.joint_dof_count // worlds
+    bodies, dofs = model.joint_count // arts, model.joint_dof_count // arts
     if not 1 <= bodies <= 64 or not 1 <= dofs <= 64:
         raise ValueError("Cached trees require at most 64 bodies and coordinates")
     if model.requires_grad or model.particle_count or np.any(model.body_flags.numpy() & int(BodyFlags.KINEMATIC)):
         raise ValueError("Cached trees exclude gradients, particles and prescribed bodies")
     starts = model.articulation_start.numpy()
-    if not np.array_equal(starts, np.arange(worlds + 1) * bodies):
+    if not np.array_equal(starts, np.arange(arts + 1) * bodies):
         raise ValueError("Cached trees require contiguous uniform articulation joints")
     group = operator.plan.group_to_art.numpy()
-    if not np.array_equal(group, np.arange(worlds)) or not np.array_equal(
-        operator.plan.art_to_world.numpy(), np.arange(worlds)
-    ):
-        raise ValueError("Cached tree groups must follow their complete world order")
+    art_world = operator.plan.art_to_world.numpy()
+    if not np.array_equal(np.sort(group), np.arange(arts)):
+        raise ValueError("Cached tree groups must cover every articulation exactly once")
+    if art_world.shape != (arts,) or np.any(art_world < 0) or np.any(art_world >= worlds):
+        raise ValueError("Cached tree articulations require valid world ownership")
     child = model.joint_child.numpy()
     if not np.array_equal(np.sort(child), np.arange(model.body_count)):
         raise ValueError("Cached tree publication requires every body exactly once")
-    ancestors = model.joint_ancestor.numpy().reshape(worlds, bodies)
-    local = np.where(ancestors >= 0, ancestors - np.arange(worlds)[:, None] * bodies, -1)
+    ancestors = model.joint_ancestor.numpy().reshape(arts, bodies)
+    local = np.where(ancestors >= 0, ancestors - np.arange(arts)[:, None] * bodies, -1)
     parent = local[0].astype(np.int32)
     if (
         not np.all(local == parent)
@@ -51,8 +52,8 @@ def make_plan(model, operator):
     ):
         raise ValueError("Cached trees require one uniform parent-first topology")
     qd = model.joint_qd_start.numpy()
-    counts = np.diff(qd).reshape(worlds, bodies)
-    types = model.joint_type.numpy().reshape(worlds, bodies)
+    counts = np.diff(qd).reshape(arts, bodies)
+    types = model.joint_type.numpy().reshape(arts, bodies)
     locked_root = types[0, 0] == int(JointType.D6) and np.all(counts[:, 0] == 0)
     if not np.all(types == types[0]) or (
         types[0, 0] not in (int(JointType.FREE), int(JointType.FIXED)) and not locked_root
@@ -61,7 +62,7 @@ def make_plan(model, operator):
     if not np.all(np.isin(types[:, 1:], [int(JointType.FIXED), int(JointType.REVOLUTE), int(JointType.PRISMATIC)])):
         raise ValueError("Cached trees require scalar or fixed descendant joints")
     if not np.all(counts == counts[0]) or not np.all(
-        qd[:-1].reshape(worlds, bodies) - np.arange(worlds)[:, None] * dofs == qd[:bodies]
+        qd[:-1].reshape(arts, bodies) - np.arange(arts)[:, None] * dofs == qd[:bodies]
     ):
         raise ValueError("Cached trees require uniform coordinate indexing")
     mass = _SparseMassMatrixPlan.build(parent, counts[0])

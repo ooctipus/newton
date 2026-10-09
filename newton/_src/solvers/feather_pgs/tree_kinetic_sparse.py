@@ -77,7 +77,7 @@ class TreeSparseOperator:
         self.data.W = solver._sparse_Linv
         # The native factor publishes status instead of a second validity bit.
         # Initial and reset mass requests are consumed before any prediction.
-        self.data.valid = wp.ones(solver.world_count, dtype=int, device=device)
+        self.data.valid = wp.ones(self.plan.group_to_art.size, dtype=int, device=device)
         self.data.status = solver._sparse_mass_matrix_status
         self.refresh_kernel = _get_crba_sparse_factor_kernel(
             n, mass.nonzero_count, warps_per_block=solver._sparse_factor_warps_per_block, geometric=True

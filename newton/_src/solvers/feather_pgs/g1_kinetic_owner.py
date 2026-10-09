@@ -3,6 +3,8 @@
 
 """Admission for the existing sparse representation using shared tree state."""
 
+import numpy as np
+
 from . import sparse_factor
 from .tree_kinetic_owner import TreeKineticState
 
@@ -42,4 +44,9 @@ class G1KineticState(TreeKineticState):
     """Keep the existing sparse representation's production admission."""
 
     def __init__(self, sparse_owner):
+        worlds = sparse_owner.solver.world_count
+        if not np.array_equal(sparse_owner.plan.group_to_art.numpy(), np.arange(worlds)) or not np.array_equal(
+            sparse_owner.plan.art_to_world.numpy(), np.arange(worlds)
+        ):
+            raise ValueError("Packed G1 cache requires its original group/world order")
         super().__init__(sparse_owner, admission=supported if sparse_owner.solver.model.device.is_cuda else None)

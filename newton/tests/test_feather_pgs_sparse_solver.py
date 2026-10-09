@@ -13,6 +13,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
+    PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_feather_pgs_propagation_free_root_warp import _build_model as _build_chain
@@ -364,9 +365,13 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
                 self._sparse_rows_physical(solver, world, count)[1] if sparse else arrays["J_world"][world, :count]
             )
             bundles = []
-            for row in np.flatnonzero(arrays["row_type"][world, :count] == PGS_CONSTRAINT_TYPE_JOINT_LIMIT):
+            prefix = np.isin(
+                arrays["row_type"][world, :count],
+                [PGS_CONSTRAINT_TYPE_JOINT_LIMIT, PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT],
+            )
+            for row in np.flatnonzero(prefix):
                 dof = int(np.argmax(np.abs(jacobian[row])))
-                bundles.append(((0, dof, int(np.sign(jacobian[row, dof]))), [row]))
+                bundles.append(((0, int(arrays["row_type"][world, row]), dof, int(np.sign(jacobian[row, dof]))), [row]))
             active = [
                 c for c in range(int(contacts.rigid_contact_count.numpy()[0])) if worlds[c] == world and slots[c] >= 0
             ]

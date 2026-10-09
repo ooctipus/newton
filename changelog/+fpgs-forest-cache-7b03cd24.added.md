@@ -1,0 +1,1 @@
+Extend FeatherPGS cached tree dynamics and publication to worlds containing multiple complete articulations with the same scalar-joint topology, retaining their existing sparse contact solver and held mass factors.

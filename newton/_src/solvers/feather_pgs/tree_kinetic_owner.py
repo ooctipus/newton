@@ -55,12 +55,13 @@ class TreeKineticState:
         self.solver = solver = sparse_owner.solver
         self.motion_velocity = bool(solver.enable_joint_velocity_limits)
         self._motion_binding = None
-        model, device, worlds = solver.model, solver.model.device, solver.world_count
+        model, device = solver.model, solver.model.device
         # Direct construction is also used by CPU physical representation tests.
         # Production admission remains CUDA-only through supported().
         self.admission = admission
         host = sparse_owner.host
         self.layout, parent, depth = make_plan(model, sparse_owner)
+        self.group_count = sparse_owner.plan.group_to_art.size
         bodies, dofs = self.layout.bodies, self.layout.dofs
         jump = np.empty((self.layout.rounds, bodies), np.int32)
         jump[0] = parent
@@ -80,8 +81,8 @@ class TreeKineticState:
         free_roots = solver._free_root_joint_indices
         free_roots = free_roots.numpy() if free_roots is not None else []
         root_lookup = {int(joint): slot for slot, joint in enumerate(free_roots)}
-        root_slot = np.empty(worlds, np.int32)
-        q_index = np.full((worlds, dofs), -1, np.int32)
+        root_slot = np.empty(self.group_count, np.int32)
+        q_index = np.full((self.group_count, dofs), -1, np.int32)
         for group, art in enumerate(group_to_art):
             start = int(starts[art])
             if self.layout.root_dofs and start not in root_lookup:
@@ -124,16 +125,17 @@ class TreeKineticState:
         ):
             setattr(self.plan, name, wp.array(values, dtype=int, device=device))
         self.data = native.KineticData()
-        self.data.bias = wp.empty((worlds, dofs), dtype=float, device=device)
-        self.data.com_offset = wp.empty((worlds, bodies), dtype=wp.vec3, device=device)
-        self.data.geometric = wp.empty((worlds, self.layout.entries), dtype=float, device=device)
+        groups = self.group_count
+        self.data.bias = wp.empty((groups, dofs), dtype=float, device=device)
+        self.data.com_offset = wp.empty((groups, bodies), dtype=wp.vec3, device=device)
+        self.data.geometric = wp.empty((groups, self.layout.entries), dtype=float, device=device)
         self.data.current_valid = solver._fk_id_cache_valid
-        self.data.geometry_valid = wp.zeros(worlds, dtype=int, device=device)
-        self.data.generation = wp.zeros(worlds, dtype=wp.int64, device=device)
-        self.data.geometry_generation = wp.full(worlds, -1, dtype=wp.int64, device=device)
-        self.data.source_q = wp.zeros(worlds, dtype=wp.uint64, device=device)
-        self.data.source_qd = wp.zeros(worlds, dtype=wp.uint64, device=device)
-        self.data.status = wp.zeros(worlds, dtype=int, device=device)
+        self.data.geometry_valid = wp.zeros(groups, dtype=int, device=device)
+        self.data.generation = wp.zeros(groups, dtype=wp.int64, device=device)
+        self.data.geometry_generation = wp.full(groups, -1, dtype=wp.int64, device=device)
+        self.data.source_q = wp.zeros(groups, dtype=wp.uint64, device=device)
+        self.data.source_qd = wp.zeros(groups, dtype=wp.uint64, device=device)
+        self.data.status = wp.zeros(groups, dtype=int, device=device)
         self.data.current_valid.zero_()
         self.bias = self.data.bias
         self.geometric = self.data.geometric
@@ -152,6 +154,7 @@ class TreeKineticState:
         )
         self.predictor_kernel = native.get_predictor_kernel(self.chain_scan, layout=self.layout)
         self._model_plan = {name: _fingerprint(getattr(model, name)) for name in _PLAN_FIELDS}
+        self._plan_dimensions = self._dimensions()
         self._mapping_plan = {
             "group_to_art": _fingerprint(sparse_owner.plan.group_to_art),
             "art_to_world": _fingerprint(sparse_owner.plan.art_to_world),
@@ -159,8 +162,22 @@ class TreeKineticState:
             "free_root_joint_indices": _fingerprint(solver._free_root_joint_indices),
         }
 
+    def _dimensions(self):
+        model = self.solver.model
+        return (
+            self.solver.world_count,
+            model.world_count,
+            model.articulation_count,
+            model.body_count,
+            model.joint_count,
+            model.joint_coord_count,
+            model.joint_dof_count,
+        )
+
     def validate_model(self):
         """Reject changed baked ownership before notification invalidates any state."""
+        if self._dimensions() != self._plan_dimensions:
+            raise RuntimeError("Tree kinetic dimensions changed; reconstruct and recapture")
         make_plan(self.solver.model, self.sparse)
         for name, expected in self._model_plan.items():
             if _fingerprint(getattr(self.solver.model, name)) != expected:
@@ -184,7 +201,7 @@ class TreeKineticState:
             raise ValueError("Tree kinetic reset requires the original per-world bool mask")
         wp.launch(
             _invalidate,
-            dim=self.solver.world_count,
+            dim=self.group_count,
             inputs=[
                 world_mask,
                 self.sparse.plan.group_to_art,
@@ -251,7 +268,7 @@ class TreeKineticState:
             arguments.append(stage3_qd)
         wp.launch_tiled(
             self.repair_kernel,
-            dim=[self.solver.world_count],
+            dim=[self.group_count],
             inputs=arguments,
             block_dim=self.block_dim,
             device=self.solver.model.device,
@@ -303,7 +320,7 @@ class TreeKineticState:
         force.dt = dt
         wp.launch_tiled(
             self.predictor_kernel,
-            dim=[solver.world_count],
+            dim=[self.group_count],
             inputs=[self.sparse.plan, self.sparse.data, self.plan, self.data, force],
             block_dim=self.block_dim,
             device=solver.model.device,
@@ -322,7 +339,7 @@ class TreeKineticState:
         data = self._publication(state_in, state_aug, state_out, dt)
         wp.launch_tiled(
             self.finish_kernel,
-            dim=[self.solver.world_count],
+            dim=[self.group_count],
             inputs=[
                 self.sparse.plan,
                 self.plan,

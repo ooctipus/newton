@@ -28,6 +28,8 @@ class KineticPlan:
 
 @wp.struct
 class KineticData:
+    # Geometry, forces and source tags follow factor groups. Current validity
+    # follows articulation IDs shared with the ordinary FK/ID cache.
     bias: wp.array2d[float]
     com_offset: wp.array2d[wp.vec3]
     geometric: wp.array2d[float]
@@ -260,7 +262,7 @@ _FORCE = cached_force.ForceOperands(
 
 _PREDICT = r"""    $PHYSICAL_DECL
 
-    const int art=p.group_to_art.data[group],world=p.art_to_world.data[art];
+    const int art=p.group_to_art.data[group];
     const int ds=p.art_dof_start.data[art],js=p.art_joint_start.data[art];
 #if defined(__CUDA_ARCH__)
     const int lane=threadIdx.x,stride=blockDim.x;
@@ -311,7 +313,7 @@ $REDUCE
     for(int col=lane;col<$DOFS;col+=stride) {
         $TRANSPOSE_ACTION
         const int dof=ds+$PHYSICAL_INDEX;
-        const bool valid=cache.current_valid.data[art]&&d.valid.data[world]&&!d.status.data[world]&&!cache.status.data[group]&&wp::isfinite(value);
+        const bool valid=cache.current_valid.data[art]&&d.valid.data[group]&&!d.status.data[group]&&!cache.status.data[group]&&wp::isfinite(value);
         f.qdd.data[dof]=valid?value:NAN;
         f.vhat.data[dof]=$VELOCITY;
         if(!valid) {
