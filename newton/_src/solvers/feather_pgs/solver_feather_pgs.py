@@ -3318,6 +3318,11 @@ class SolverFeatherPGS(SolverBase):
                     str(model.device.arch), warps_per_block=_CRBA_CHOLESKY_WARPS_PER_BLOCK
                 )
 
+        if self._tree_kinetic_state is None and os.environ.get("FEATHER_PGS_MIXED_TREE_KINETIC_STATE", "0") == "1":
+            from .mixed_tree_kinetic import create_owner as create_mixed_tree_cache  # noqa: PLC0415
+
+            self._tree_kinetic_state = create_mixed_tree_cache(self)
+
         self._free_body_gyro_kernel = None
         if os.environ.get("FEATHER_PGS_FREE_BODY_IMPLICIT_GYRO") == "1" and self._has_free_rigid_bodies:
             # A predictor experiment independent of contact scheduling. The

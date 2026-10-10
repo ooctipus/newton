@@ -32,7 +32,7 @@ def _fingerprint(array):
 class TreeKineticState:
     """Own one current cache with device state-bank tags and a separate held W."""
 
-    def __init__(self, sparse_owner, *, admission=None, chain_scan_default=None):
+    def __init__(self, sparse_owner, *, admission=None, chain_scan_default=None, complete=True, response="sparse"):
         from . import tree_kinetic_state as native  # noqa: PLC0415
 
         self.sparse = sparse_owner
@@ -43,8 +43,9 @@ class TreeKineticState:
         # Direct construction is also used by CPU physical representation tests.
         # Production admission remains CUDA-only through supported().
         self.admission = admission
+        self.complete = complete
         host = sparse_owner.host
-        self.layout, parent, depth = make_plan(model, sparse_owner)
+        self.layout, parent, depth = make_plan(model, sparse_owner, complete=complete)
         self.group_count = sparse_owner.plan.group_to_art.size
         self._cache_to_art = sparse_owner.plan.group_to_art.reshape((self.group_count, 1))
         bodies, dofs = self.layout.bodies, self.layout.dofs
@@ -137,7 +138,7 @@ class TreeKineticState:
         self.finish_kernel = native.get_state_kernel(
             True, self.chain_scan, layout=self.layout, body_velocity=body_velocity
         )
-        self.predictor_kernel = native.get_predictor_kernel(self.chain_scan, layout=self.layout)
+        self.predictor_kernel = native.get_predictor_kernel(self.chain_scan, layout=self.layout, response=response)
         self._model_plan = {name: _fingerprint(getattr(model, name)) for name in _PLAN_FIELDS}
         self._plan_dimensions = self._dimensions()
         self._mapping_plan = {
@@ -163,7 +164,7 @@ class TreeKineticState:
         """Reject changed baked ownership before notification invalidates any state."""
         if self._dimensions() != self._plan_dimensions:
             raise RuntimeError("Tree kinetic dimensions changed; reconstruct and recapture")
-        make_plan(self.solver.model, self.sparse)
+        make_plan(self.solver.model, self.sparse, complete=self.complete)
         for name, expected in self._model_plan.items():
             if _fingerprint(getattr(self.solver.model, name)) != expected:
                 raise RuntimeError(f"Tree kinetic static {name} changed; reconstruct and recapture")

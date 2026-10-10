@@ -43,6 +43,14 @@ class KineticData:
 
 
 @wp.struct
+class HeldResponse:
+    lower: wp.array3d[float]
+    inverse: wp.array[float]
+    valid: wp.array[int]
+    status: wp.array[int]
+
+
+@wp.struct
 class ForceInput:
     joint_q: wp.array[float]
     joint_qd: wp.array[float]
@@ -303,16 +311,10 @@ $REDUCE
 #if defined(__CUDA_ARCH__)
     __syncthreads();
 #endif
-    for(int row=lane;row<$DOFS;row+=stride) {
-        $FORWARD_ACTION
-        s[$WHITE+row]=value;
-    }
-#if defined(__CUDA_ARCH__)
-    __syncthreads();
-#endif
+    $FORWARD_STAGE
     for(int col=lane;col<$DOFS;col+=stride) {
         $TRANSPOSE_ACTION
-        const int dof=ds+$PHYSICAL_INDEX;
+        const int dof=ds+$RESPONSE_PHYSICAL;
         const bool valid=cache.current_valid.data[art]&&d.valid.data[group]&&!d.status.data[group]&&!cache.status.data[group]&&wp::isfinite(value);
         f.qdd.data[dof]=valid?value:NAN;
         f.vhat.data[dof]=$VELOCITY;
@@ -629,7 +631,7 @@ if lane == 0:
 
 
 @functools.cache
-def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = G1_LAYOUT):
+def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = G1_LAYOUT, response="sparse"):
     """Apply current external/control force and both unchanged W actions."""
     plan_type = tree_chain_scan.ChainPlan if chain_scan else KineticPlan
     reduction = (
@@ -639,7 +641,7 @@ def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = G1_LA
     )
     if chain_scan:
         reduction = "if(nonzero) {\n" + reduction + "}\n"
-    response = response_operator.SparseInverseFactor(
+    inverse = response_operator.SparseInverseFactor(
         "d.W.data+group*$NNZ",
         response_operator.IndexedSupport(
             "$DOFS", "p.index.data", "p.inverse_count.data", "p.inverse_nodes.data", "$INVERSE_WIDTH"
@@ -659,9 +661,41 @@ def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = G1_LA
         "VELOCITY": _FORCE.velocity("dof", "f.qdd.data[dof]"),
         "TRANSPORT": _FORCE.transport("ds", "f.vhat.data[ds+k]"),
         "REDUCE": reduction,
-        "FORWARD_ACTION": response.forward("row", f"s[$SIX_BODIES+{physical}]"),
-        "TRANSPOSE_ACTION": response.transpose("col", "s[$WHITE+$index]"),
+        "TRANSPOSE_ACTION": inverse.transpose("col", "s[$WHITE+$index]"),
+        "RESPONSE_PHYSICAL": "$PHYSICAL_INDEX",
     }
+    forward = inverse.forward("row", f"s[$SIX_BODIES+{physical}]")
+    operations["FORWARD_STAGE"] = (
+        """for(int row=lane;row<$DOFS;row+=stride) {
+        """
+        + forward
+        + """
+        s[$WHITE+row]=value;
+    }
+#if defined(__CUDA_ARCH__)
+    __syncthreads();
+#endif
+"""
+    )
+    data_type = sparse_factor.SparseData
+    if response == "cholesky":
+        held = response_operator.CholeskySolve(layout.dofs, f"d.lower.data+group*{layout.dofs**2}")
+        operations["FORWARD_STAGE"] = (
+            "if(lane==0){\n"
+            + held.forward("s[$SIX_BODIES+$index]", "s[$WHITE+$index]")
+            + held.transpose("s[$WHITE+$index]", "s[$WHITE+$index]")
+            + "\n}\n#if defined(__CUDA_ARCH__)\n__syncthreads();\n#endif\n"
+        )
+        operations["TRANSPOSE_ACTION"] = "float value=s[$WHITE+col];"
+        operations["RESPONSE_PHYSICAL"] = "col"
+        data_type = HeldResponse
+    elif response == "diagonal":
+        operations["FORWARD_STAGE"] = ""
+        operations["TRANSPOSE_ACTION"] = "float value=d.inverse.data[ds+col]*s[$SIX_BODIES+col];"
+        operations["RESPONSE_PHYSICAL"] = "col"
+        data_type = HeldResponse
+    elif response != "sparse":
+        raise ValueError("Unknown held tree response representation")
     source = _PREDICT
     for name, operation in operations.items():
         source = source.replace("$" + name, operation)
@@ -671,19 +705,19 @@ def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = G1_LA
     def native(
         group: int,
         p: sparse_factor.SparsePlan,
-        d: sparse_factor.SparseData,
+        d: data_type,
         plan: plan_type,
         cache: KineticData,
         f: ForceInput,
     ): ...
 
-    def predict(
-        p: sparse_factor.SparsePlan, d: sparse_factor.SparseData, plan: plan_type, cache: KineticData, f: ForceInput
-    ):
+    def predict(p: sparse_factor.SparsePlan, d: data_type, plan: plan_type, cache: KineticData, f: ForceInput):
         group, _ = wp.tid()
         native(group, p, d, plan, cache, f)
 
     predict.__name__ = predict.__qualname__ = f"tree_kinetic_predict{layout.dofs}"
     if chain_scan:
         predict.__name__ = predict.__qualname__ = predict.__name__ + "_chain"
+    if response != "sparse":
+        predict.__name__ = predict.__qualname__ = predict.__name__ + "_" + response
     return wp.kernel(module="unique", enable_backward=False)(predict)

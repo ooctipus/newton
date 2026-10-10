@@ -10,7 +10,7 @@ from functools import cache
 
 
 @cache
-def _factory():
+def _factory(geometric_index=()):
     # Keep the original default factory and its ABI untouched. This explicit
     # source seam changes only assembly input, not R/K or factor arithmetic.
     from . import solver_feather_pgs as original  # noqa: PLC0415
@@ -30,9 +30,16 @@ def _factory():
     )
     begin = source.index("        const int source_code =")
     end = source.index("        if (row == col)", begin)
-    source = (
-        source[:begin] + "        float value = geometric.data[group * {matrix_elements} + element];\n" + source[end:]
-    )
+    assembly = "        float value = geometric.data[group * {matrix_elements} + element];\n"
+    if geometric_index:
+        initializer = "{{" + ",".join(map(str, geometric_index)) + "}}"
+        entries = max(geometric_index) + 1
+        assembly = (
+            f"        constexpr int geometry_index[{len(geometric_index)}]={initializer};\n"
+            "        const int geometry_entry=geometry_index[element];\n"
+            f"        float value = geometry_entry < 0 ? 0.0f : geometric.data[group * {entries} + geometry_entry];\n"
+        )
+    source = source[:begin] + assembly + source[end:]
     argument = "        L_group: wp.array3d[float],"
     if source.count(argument) != 2:
         raise ValueError("Original native/kernel factor signatures changed")
@@ -50,6 +57,8 @@ def _factory():
 
 
 @cache
-def get_kernel(device_arch: str, *, warps_per_block: int = 4):
-    """Return only the admitted nine-DOF specialization, retaining original L9."""
-    return _factory()(9, device_arch, warps_per_block=warps_per_block)
+def get_kernel(device_arch: str, *, warps_per_block: int = 4, size: int = 9, geometric_index=()):
+    """Bind admitted physical geometry to the retained Cholesky arithmetic."""
+    if geometric_index and (len(geometric_index) != size * size or min(geometric_index) < -1):
+        raise ValueError("Geometric factor requires a complete physical matrix index")
+    return _factory(geometric_index)(size, device_arch, warps_per_block=warps_per_block)
