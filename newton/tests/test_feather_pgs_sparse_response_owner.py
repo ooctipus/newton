@@ -36,6 +36,9 @@ def _launch_workers(capacity, enabled):
     values = {
         "contacts": SimpleNamespace(rigid_contact_max=capacity),
         "contact_jacobian_workers": min(capacity, implementation._CONTACT_JACOBIAN_WORKER_CAP),
+        "contact_build_threads": min(
+            capacity, implementation._CONTACT_BUILD_THREAD_CAP * implementation._CONTACT_THREADS_X
+        ),
     }
     with mock.patch.object(implementation, "_SPARSE_CONTACT_DIRECT", enabled, create=True):
         if dimension.id != "contact_jacobian_workers":
@@ -155,6 +158,11 @@ def _expected(values, active_count):
                 if dof < 0:
                     continue
                 point = anchor if host["contact_shared_anchor"] or row > 0 else points[side]
+                if row > 0 and values["friction_patches"].enabled:
+                    patch_points = (
+                        values["friction_patches"].point_a if side == 0 else values["friction_patches"].point_b
+                    )
+                    point = patch_points.numpy()[contact].astype(np.float64)
                 motion = host["joint_S_s"][dof].astype(np.float64)
                 velocity = motion[:3] + np.cross(motion[3:], point)
                 coefficients[side] = (1.0 if side == 0 else -1.0) * np.dot(direction, velocity)
@@ -172,9 +180,9 @@ def _expected(values, active_count):
 
 class TestSparseResponseOwner(unittest.TestCase):
     def test_actual_host_launch_selection(self):
-        """Give scalar contacts direct owners only when the experiment is selected."""
-        for capacity in (0, 1, 4096, 4353, 147456):
-            self.assertEqual(_launch_workers(capacity, False), min(capacity, 4096))
+        """Expose scalar parallelism while bounding work for mostly unused capacity."""
+        for capacity in (0, 1, 4096, 4353, 65536, 65569, 147456, 25231360):
+            self.assertEqual(_launch_workers(capacity, False), min(capacity, 65536))
             self.assertEqual(_launch_workers(capacity, True), capacity)
 
     def test_cpu_mixed_complete_prefix(self):
@@ -205,11 +213,23 @@ class TestSparseResponseOwner(unittest.TestCase):
         _launch(empty, _launch_workers(0, True), "cpu")
         self.assertEqual(empty["sparse_row_dof"].numpy().size, 0)
 
+    def test_cpu_persistent_tangent_anchors(self):
+        """Changing worker ownership must retain patch-specific tangent geometry."""
+        values = _fixture("cpu", capacity=73)
+        patches = values["friction_patches"]
+        patches.enabled = 1
+        patches.point_a = wp.array(np.tile((0.23, -0.17, 0.41), (73, 1)), dtype=wp.vec3, device="cpu")
+        patches.point_b = wp.array(np.tile((-0.12, 0.27, 0.32), (73, 1)), dtype=wp.vec3, device="cpu")
+        expected = _expected(values, 73)
+        _launch(values, _launch_workers(73, False), "cpu")
+        np.testing.assert_array_equal(values["sparse_row_dof"].numpy(), expected[0])
+        np.testing.assert_allclose(values["sparse_row_jy"].numpy(), expected[1], rtol=2e-6, atol=2e-7)
+
     @unittest.skipUnless(wp.is_cuda_available(), "actual CUDA graph replay requires CUDA")
     def test_cuda_graph_actual_prefix_transitions(self):
         """Replay both ownership graphs over full, empty and truncated active prefixes."""
         device = wp.get_device("cuda:0")
-        values = _fixture(device)
+        values = _fixture(device, capacity=65569)
         capacity = len(values["contact_slot"])
         owners = (values["sparse_row_dof"].ptr, values["sparse_row_jy"].ptr)
         for enabled in (False, True):
@@ -217,7 +237,7 @@ class TestSparseResponseOwner(unittest.TestCase):
             _launch(values, workers, device)
             with wp.ScopedCapture(device=device) as capture:
                 _launch(values, workers, device)
-            for raw_count in (capacity, 0, 4097, capacity + 1, capacity):
+            for raw_count in (capacity, 0, 65537, capacity + 1, capacity):
                 values["contact_count"].assign(np.array([raw_count], dtype=np.int32))
                 expected = _expected(values, raw_count)
                 for graph in (False, True, True):

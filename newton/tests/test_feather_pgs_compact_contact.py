@@ -588,6 +588,7 @@ class TestCompactContact(unittest.TestCase):
                             model,
                             pgs_mode="matrix_free",
                             pgs_iterations=8,
+                            friction_anchor_beta=0.0,
                             update_mass_matrix_interval=2,
                             use_parallel_streams=True,
                             enable_joint_limits=True,

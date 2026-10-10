@@ -14056,10 +14056,12 @@ class SolverFeatherPGS(SolverBase):
                         device=model.device,
                     )
                 if self._sparse_diagonal_contact_solve:
-                    # The compact dense builder has 32 lanes per worker; this
-                    # scalar builder needs independent contact owners instead.
+                    # The dense builder has 32 lanes per worker. Give the scalar
+                    # builder the contact-build thread budget; its live-prefix
+                    # stride covers larger counts without visiting unused slots.
+                    # Retain the explicit full-capacity experiment for replay.
                     sparse_contact_response_workers = (
-                        contacts.rigid_contact_max if _SPARSE_CONTACT_DIRECT else contact_jacobian_workers
+                        contacts.rigid_contact_max if _SPARSE_CONTACT_DIRECT else contact_build_threads
                     )
                     wp.launch(
                         populate_sparse_diagonal_contact_response,
