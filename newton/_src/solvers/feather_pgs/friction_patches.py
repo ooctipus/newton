@@ -670,11 +670,17 @@ def _store_history(
         previous_q[c] = q[c]
     if c >= frame.valid.shape[0]:
         return
-    normal = frame.normal[c]
-    if frame.valid[c] != 0 and frame.body_a[c] >= 0:
-        normal = wp.transform_vector(wp.transform_inverse(q[frame.body_a[c]]), normal)
+    # Pair searches need the complete sorted index, but only live anchors own
+    # geometric history. Retire stale validity and reset ownership before exit.
     prev.keys[c] = frame.keys[c]
     prev.indices[c] = frame.indices[c]
+    prev.valid[c] = frame.valid[c]
+    previous_world[c] = -1
+    if frame.valid[c] == 0:
+        return
+    normal = frame.normal[c]
+    if frame.body_a[c] >= 0:
+        normal = wp.transform_vector(wp.transform_inverse(q[frame.body_a[c]]), normal)
     prev.normal[c] = normal
     prev.displacement[c] = frame.displacement[c]
     prev.mu[c] = frame.mu[c]
@@ -687,16 +693,14 @@ def _store_history(
     prev.anchor_b[c] = frame.anchor_b[c]
     prev.surface_a[c] = frame.surface_a[c]
     prev.surface_b[c] = frame.surface_b[c]
-    prev.valid[c] = frame.valid[c]
     prev.tangent_impulse[c] = frame.tangent_impulse[c]
     world = int(-1)
-    if frame.valid[c] != 0:
-        if frame.body_a[c] >= 0:
-            world = body_world[frame.body_a[c]]
-        if world < 0 and frame.body_b[c] >= 0:
-            world = body_world[frame.body_b[c]]
-        # The solver maps the default, unpartitioned world (-1) to world zero.
-        world = wp.max(world, 0)
+    if frame.body_a[c] >= 0:
+        world = body_world[frame.body_a[c]]
+    if world < 0 and frame.body_b[c] >= 0:
+        world = body_world[frame.body_b[c]]
+    # The solver maps the default, unpartitioned world (-1) to world zero.
+    world = wp.max(world, 0)
     previous_world[c] = world
 
 
