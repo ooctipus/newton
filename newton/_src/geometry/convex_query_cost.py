@@ -101,30 +101,10 @@ def _primitive_empty(output: wp.array[wp.vec4]):
     output[row] = wp.vec4(float(row), 0.0, 0.0, 0.0)
 
 
-def _preparation_primitive(device, count, launch_ns):
-    from .narrow_phase import ConvexPairQueryData, create_prepare_convex_pair  # noqa: PLC0415
-
-    prepare = create_prepare_convex_pair(True, False)
-
-    @wp.kernel(module="unique", enable_backward=False)
-    def prepare_queries(inputs: _PairInputs, output: wp.array[ConvexPairQueryData]):
-        row = wp.tid()
-        _valid, query = prepare(
-            wp.vec2i(2 * row, 2 * row + 1),
-            inputs.shape_types,
-            inputs.shape_data,
-            inputs.shape_transform,
-            inputs.shape_source,
-            inputs.shape_gap,
-            inputs.shape_collision_radius,
-            inputs.shape_aabb_lower,
-            inputs.shape_aabb_upper,
-            inputs.shape_collision_aabb_lower,
-            inputs.shape_collision_aabb_upper,
-        )
-        # Retaining all prepared fields budgets geometry loads and cache writes
-        # independently of the much larger query-arithmetic intercept.
-        output[row] = query
+def _classification_primitive(device, count, launch_ns):
+    from .coherent_convex import _ConvexQueryCache  # noqa: PLC0415
+    from .coherent_convex_rejection import _create_rejection_query_kernels  # noqa: PLC0415
+    from .collision_convex import ConvexQueryResult  # noqa: PLC0415
 
     poses = np.zeros((2 * count, 7), dtype=np.float32)
     poses[:, 6] = 1
@@ -141,9 +121,36 @@ def _preparation_primitive(device, count, launch_ns):
     inputs.shape_aabb_upper = wp.full(2 * count, wp.vec3(3.0), dtype=wp.vec3, device=device)
     inputs.shape_collision_aabb_lower = wp.full(2 * count, wp.vec3(-0.5), dtype=wp.vec3, device=device)
     inputs.shape_collision_aabb_upper = wp.full(2 * count, wp.vec3(0.5), dtype=wp.vec3, device=device)
-    output = wp.empty(count, dtype=ConvexPairQueryData, device=device)
-    elapsed = _measure(lambda: wp.launch(prepare_queries, count, [inputs, output], device=device), device)
-    return max(0.0, elapsed - launch_ns) / count
+    pairs = np.arange(2 * count, dtype=np.int32).reshape(count, 2)
+    pair_array = wp.array(pairs, dtype=wp.vec2i, device=device)
+    pair_count = wp.array([count], dtype=int, device=device)
+    cache = _ConvexQueryCache(
+        pairs=pairs,
+        shape_types=inputs.shape_types.numpy(),
+        shape_world=np.zeros(2 * count, dtype=np.int32),
+        world_count=1,
+        query_capacity=count,
+        device=device,
+    )
+    buffers = [
+        wp.empty(count, dtype=ConvexQueryResult, device=device),
+        wp.empty(count, dtype=int, device=device),
+        wp.zeros(1, dtype=int, device=device),
+        wp.empty(count, dtype=int, device=device),
+        wp.zeros(1, dtype=int, device=device),
+    ]
+    classify = _create_rejection_query_kernels()[0]
+
+    def action():
+        cache.begin()
+        wp.launch(
+            classify, count, [pair_array, pair_count, inputs, cache.data, count, *buffers], device=device, block_dim=128
+        )
+
+    # No cached axes: measure actual preparation, lookup and queue traffic.
+    # Retain preparation in registers exactly as the production classifier does.
+    elapsed = _measure(action, device)
+    return max(0.0, elapsed - 2 * launch_ns) / count
 
 
 def _nonnegative_fit(features, durations):
@@ -177,11 +184,11 @@ class _QueryCostModel:
     launch_ns: float
     calibration_seconds: float
     measurements: tuple
-    prepare_ns: float = 0.0
+    classify_ns: float = 0.0
 
     def coefficients(self, slots):
-        # Preparation/retained writes and lookup have independent measurements.
-        # The lookup scales with search depth.
+        # The classifier primitive includes preparation, base lookup and queue
+        # traffic. Only additional lookup depth is charged separately.
         lookup = self.lookup_ns * max(1.0, np.log2(max(2, slots)) / 13.0)
         return np.array(
             [
@@ -190,7 +197,7 @@ class _QueryCostModel:
                 self.vertex_ns,
                 self.screen_base_ns,
                 self.screen_vertex_ns,
-                lookup + self.prepare_ns,
+                self.classify_ns + lookup - self.lookup_ns,
                 self.launch_ns,
             ],
             dtype=np.float32,
@@ -283,10 +290,10 @@ def _calibrate_query_cost(device):
             records.append({"vertices": vertices, "screen_ns": elapsed})
         query = _nonnegative_fit(features, durations)
         screen = _nonnegative_fit(screen_features, screen_durations)
-        prepare_ns = _preparation_primitive(device, count, launch_ns)
-        records.append({"prepare_ns_per_pair": prepare_ns})
+        classify_ns = _classification_primitive(device, count, launch_ns)
+        records.append({"classify_ns_per_pair": classify_ns})
     model = _QueryCostModel(
-        *query, *screen, lookup_ns, launch_ns, time.monotonic() - start, tuple(records), prepare_ns=prepare_ns
+        *query, *screen, lookup_ns, launch_ns, time.monotonic() - start, tuple(records), classify_ns=classify_ns
     )
     if not np.isfinite(model.coefficients(count)).all() or model.support_ns + model.vertex_ns <= 0:
         raise RuntimeError("Independent collision primitives produced an invalid cost model")
