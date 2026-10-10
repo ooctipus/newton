@@ -3314,8 +3314,10 @@ class SolverFeatherPGS(SolverBase):
 
             if supported(self):
                 self._franka_kinetic_state = FrankaKineticState(self)
-                self._franka_kinetic_factor9 = get_geometric_factor(
-                    str(model.device.arch), warps_per_block=_CRBA_CHOLESKY_WARPS_PER_BLOCK
+                self._franka_kinetic_factor = get_geometric_factor(
+                    str(model.device.arch),
+                    warps_per_block=_CRBA_CHOLESKY_WARPS_PER_BLOCK,
+                    size=self._franka_kinetic_state.layout.primary_dofs,
                 )
 
         if self._tree_kinetic_state is None and os.environ.get("FEATHER_PGS_MIXED_TREE_KINETIC_STATE", "0") == "1":
@@ -12412,7 +12414,8 @@ class SolverFeatherPGS(SolverBase):
                 raise RuntimeError("Franka kinetic factor requires current augmented-drive coefficients")
             wp.get_stream(model.device).wait_event(drive_rows_ready)
             for size in self.size_groups:
-                kernel = self._franka_kinetic_factor9 if size == 9 else self._crba_cholesky_warp_kernels_by_size[size]
+                primary = size == self._franka_kinetic_state.layout.primary_dofs
+                kernel = self._franka_kinetic_factor if primary else self._crba_cholesky_warp_kernels_by_size[size]
                 inputs = [
                     self.n_arts_by_size[size],
                     model.articulation_start,
@@ -12423,13 +12426,17 @@ class SolverFeatherPGS(SolverBase):
                     state_aug.body_I_s,
                     self.group_to_art[size],
                     self.R_by_size[size],
-                    self._crba_dof_joint_offset_by_size[size],
-                    self._crba_lower_schedule_by_size[size],
+                    self._franka_kinetic_state.factor_offsets
+                    if self._franka_kinetic_state.same_width
+                    else self._crba_dof_joint_offset_by_size[size],
+                    self._franka_kinetic_state.factor_schedule
+                    if self._franka_kinetic_state.same_width
+                    else self._crba_lower_schedule_by_size[size],
                     1,
                     self._augmented_drive_row_by_dof,
                     self.aug_row_K,
                 ]
-                if size == 9:
+                if primary:
                     inputs.append(self._franka_kinetic_state.data.geometric)
                 wp.launch(
                     kernel,
@@ -12867,7 +12874,7 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage2_cholesky_loop(self, size: int):
-        if self._crba_cholesky_warp_kernels_by_size[size] is not None:
+        if self._franka_kinetic_state is not None or self._crba_cholesky_warp_kernels_by_size[size] is not None:
             return
         model = self.model
         n_arts = self.n_arts_by_size[size]

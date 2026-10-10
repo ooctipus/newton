@@ -1,0 +1,1 @@
+Derive scalar-forest cache dimensions and compact scratch lifetimes from topology for up to nine coupled primary coordinates with dynamic and prescribed free roots, retaining the original Cholesky factors and contact law. Independent diagonal layouts keep their existing producer.

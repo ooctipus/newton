@@ -26,6 +26,7 @@ from . import (  # noqa: F401 - names in the checked generated state factory
 from .cached_state import make_body_terms
 from .cached_state_forest import make_forest_state
 from .cached_state_scan import scan_source
+from .forest_kinetic_layout import DEFAULT_LAYOUT, from_solver
 
 PublicationData = world_scan_publication.PublicationData
 
@@ -202,7 +203,32 @@ def make_primary_terms(store_terms):
 _primary_terms = make_primary_terms(_store_terms)
 
 
-@wp.func_native(r"""
+def free_geometry_source(layout):
+    """Produce current free geometry when scalar and free factors share a width."""
+    if layout.primary_dofs != 6:
+        return ""
+    return Template(r"""
+    if(refresh) {
+        const int body=plan.body_ids.data[world*32+$BODY];
+        const auto rotation=data.body_q.data[body].q;
+        const auto inertia=data.body_inertia.data[body];
+        const float mass=data.body_mass.data[body];
+        const int first=plan.dof_ids.data[world*$DOFS+6];
+        for(int e=lane;e<36;e+=stride) {
+            const auto a=data.joint_S_s.data[first+e/6],b=data.joint_S_s.data[first+e%6];
+            const wp::vec3 wa=wp::quat_rotate_inv(rotation,wp::vec3(a[3],a[4],a[5]));
+            const wp::vec3 wb=wp::quat_rotate_inv(rotation,wp::vec3(b[3],b[4],b[5]));
+            const float value=mass*(a[0]*b[0]+a[1]*b[1]+a[2]*b[2])+wp::dot(wa,wp::mul(inertia,wb));
+            cache.geometric.data[plan.secondary_group.data[world]*36+e]=value;
+            good&=wp::isfinite(value);
+        }
+    }
+""").substitute(BODY=layout.primary_bodies, DOFS=layout.physical_dofs)
+
+
+def collect_source(layout=DEFAULT_LAYOUT):
+    """Bind reduction and projection extents while preserving the original arithmetic."""
+    return Template(r"""
     float* s=reinterpret_cast<float*>(address);
 #if defined(__CUDA_ARCH__)
     const int lane=threadIdx.x&15,stride=16;
@@ -210,12 +236,12 @@ _primary_terms = make_primary_terms(_store_terms)
 #else
     const int lane=0,stride=1;
 #endif
-    // Each component owns its complete eleven-body subtree reduction.
+    // Each component owns its complete primary subtree reduction.
     // No atomics, prefix subtraction, or spatial matrix materialization.
     for(int component=lane;component<(refresh?19:6);component+=stride) {
         const int width=component<6?6:13;
         float* base=s+(component<6?686+component:752+component-6);
-        for(int body=10;body>0;--body) {
+        for(int body=$PRIMARY_LAST;body>0;--body) {
             const int parent=plan.body_parent.data[world*32+body];
             base[width*parent]+=base[width*body];
         }
@@ -224,11 +250,11 @@ _primary_terms = make_primary_terms(_store_terms)
     __syncwarp(mask);
 #endif
     bool good=true;
-    for(int dof=lane;dof<9;dof+=stride) {
+    for(int dof=lane;dof<$N;dof+=stride) {
         const int body=plan.dof_body.data[dof];
         const float* axis=s+632+6*dof;
         float bias=0.0f;for(int k=0;k<6;++k)bias+=axis[k]*s[686+6*body+k];
-        cache.bias.data[world*9+dof]=bias;good&=wp::isfinite(bias);
+        cache.bias.data[world*$N+dof]=bias;good&=wp::isfinite(bias);
         if(refresh) {
             const float* t=s+752+13*body;
             const wp::vec3 l(axis[0],axis[1],axis[2]),w(axis[3],axis[4],axis[5]),h(t[1],t[2],t[3]);
@@ -241,13 +267,14 @@ _primary_terms = make_primary_terms(_store_terms)
 #if defined(__CUDA_ARCH__)
     __syncwarp(mask);
 #endif
-    if(refresh)for(int e=lane;e<81;e+=stride) {
-        const int row=e/9,col=e%9,src=plan.source.data[e];
+    if(refresh)for(int e=lane;e<$N2;e+=stride) {
+        const int row=e/$N,col=e%$N,src=plan.source.data[e];
         float value=0.0f;
         if(src>=0){const int projection=src==col?row:col;for(int k=0;k<6;++k)value+=s[632+6*projection+k]*s[6*src+k];}
-        cache.geometric.data[plan.primary_group.data[world]*81+e]=value;good&=wp::isfinite(value);
+        cache.geometric.data[plan.primary_group.data[world]*$N2+e]=value;good&=wp::isfinite(value);
     }
-    for(int local=lane;local<13;local+=stride) {
+    $FREE_GEOMETRY
+    for(int local=lane;local<$BODIES;local+=stride) {
         const int body=plan.body_ids.data[world*32+local];
         const auto q=data.body_q.data[body];const auto qd=data.body_qd.data[body];
         for(int k=0;k<7;++k)good&=wp::isfinite(q[k]);
@@ -263,7 +290,16 @@ _primary_terms = make_primary_terms(_store_terms)
         if(refresh)cache.geometry_generation.data[world]=cache.generation.data[world];
     }
     return good?1:0;
-""")
+""").substitute(
+        PRIMARY_LAST=layout.primary_bodies - 1,
+        N=layout.primary_dofs,
+        N2=layout.primary_dofs**2,
+        BODIES=layout.bodies,
+        FREE_GEOMETRY=free_geometry_source(layout),
+    )
+
+
+@wp.func_native(collect_source())
 def _collect(
     address: wp.uint64, world: int, plan: KineticPlan, data: PublicationData, cache: KineticData, refresh: int
 ) -> int: ...
@@ -275,16 +311,17 @@ def _replace(source, old, new, count=1):
     return source.replace(old, new)
 
 
-def make_state_kernel(finish, namespace, *, suffix=""):
+def make_state_kernel(finish, namespace, *, suffix="", layout=DEFAULT_LAYOUT):
     """Bind the shared forest law to explicit storage helpers and cache lifetime."""
-    name = f"franka_kinetic_{'finish' if finish else 'repair'}13_h81{suffix}_p16"
+    prefix = "franka_kinetic" if layout == DEFAULT_LAYOUT else "scalar_forest"
+    name = f"{prefix}_{'finish' if finish else 'repair'}{layout.bodies}_h{layout.primary_dofs**2}{suffix}_p16"
     return make_forest_state(
         name,
         namespace,
         finish=finish,
-        primary_bodies=11,
+        primary_bodies=layout.primary_bodies,
         free_roots=2,
-        dofs=21,
+        dofs=layout.physical_dofs,
         signature="plan: KineticPlan, data: PublicationData, cache: KineticData, requests: wp.array[int], global_refresh: int",
         setup="""
 group, logical_lane = wp.tid()
@@ -334,17 +371,6 @@ def get_state_kernel(finish):
     return make_state_kernel(finish, globals())
 
 
-@wp.func_native(r"""
-#if defined(__CUDA_ARCH__)
-    __shared__ float values[2*120];
-    return reinterpret_cast<uint64_t>(values+120*((threadIdx.x&31)>>4));
-#else
-    return reinterpret_cast<uint64_t>(malloc(120*sizeof(float)));
-#endif
-""")
-def _force_storage() -> wp.uint64: ...
-
-
 _FORCE = cached_force.ForceOperands(
     q="f.joint_q.data",
     state_qd="f.joint_qd.data",
@@ -355,7 +381,10 @@ _FORCE = cached_force.ForceOperands(
     dt="f.dt",
 )
 
-_PREDICT = Template(r"""
+
+def predictor_source(layout=DEFAULT_LAYOUT):
+    """Bind force extents and original held-factor actions to the complete layout."""
+    return Template(r"""
     float* s=reinterpret_cast<float*>(address);
 #if defined(__CUDA_ARCH__)
     const int lane=threadIdx.x&15,stride=16;
@@ -365,11 +394,11 @@ _PREDICT = Template(r"""
 #endif
     bool good=wp::isfinite(f.dt)&&f.dt>0.0f&&cache.status.data[world]==0;
     for(int root=0;root<3;++root)good&=cache.current_valid.data[plan.arts.data[world*3+root]]!=0;
-    for(int b=lane;b<13;b+=stride) {
+    for(int b=lane;b<$BODIES;b+=stride) {
         const int body=plan.body_ids.data[world*32+b];
         float v[6]={};
-        if(b<12&&(f.body_flags.data[body]&2)==0) {
-            const auto external=f.body_f.data[body];const auto r=cache.com_offset.data[world*13+b];
+        if(b<$DYNAMIC_BODIES&&(f.body_flags.data[body]&2)==0) {
+            const auto external=f.body_f.data[body];const auto r=cache.com_offset.data[world*$BODIES+b];
             $SHIFT
         }
         for(int k=0;k<6;++k){s[6*b+k]=v[k];good&=wp::isfinite(v[k]);}
@@ -378,32 +407,32 @@ _PREDICT = Template(r"""
     __syncwarp(mask);
 #endif
     for(int component=lane;component<6;component+=stride)
-        for(int b=10;b>0;--b)s[6*plan.body_parent.data[world*32+b]+component]+=s[6*b+component];
+        for(int b=$PRIMARY_LAST;b>0;--b)s[6*plan.body_parent.data[world*32+b]+component]+=s[6*b+component];
 #if defined(__CUDA_ARCH__)
     __syncwarp(mask);
 #endif
-    for(int i=lane;i<15;i+=stride) {
-        const int dof=plan.dof_ids.data[world*21+i];
+    for(int i=lane;i<$RESPONSE;i+=stride) {
+        const int dof=plan.dof_ids.data[world*$PHYSICAL+i];
         float tau=f.joint_f.data[dof]+f.u0.data[dof];
-        if(i<9) {
+        if(i<$N) {
             const auto axis=f.S.data[dof];const int body=plan.dof_body.data[i];
             float ext=0.0f;$PROJECT
-            tau+=-cache.bias.data[world*9+i]+ext+$PASSIVE;
+            tau+=-cache.bias.data[world*$N+i]+ext+$PASSIVE;
         } else {
             const auto axis=f.S.data[dof],bias=cache.free_bias.data[world];
             $PROJECT_FREE
         }
-        s[78+i]=tau;good&=wp::isfinite(tau);
+        s[$TORQUE+i]=tau;good&=wp::isfinite(tau);
     }
 #if defined(__CUDA_ARCH__)
     __syncwarp(mask);
 #endif
     // Two independent original held-L triangular actions; no new factor or inverse.
     for(int family=lane;family<2;family+=stride) {
-        const int n=family==0?9:6,offset=family==0?0:9;
+        const int n=family==0?$N:6,offset=family==0?0:$N;
         const int group=family==0?plan.primary_group.data[world]:plan.secondary_group.data[world];
-        const float* l=family==0?f.lower9.data+group*81:f.lower6.data+group*36;
-        float* x=s+93+offset;
+        const float* l=family==0?f.lower9.data+group*$N2:f.lower6.data+group*36;
+        float* x=s+$ACCELERATION+offset;
         $FORWARD_ACTION
         $TRANSPOSE_ACTION
     }
@@ -411,9 +440,9 @@ _PREDICT = Template(r"""
     good=__all_sync(mask,good);__syncwarp(mask);
 #endif
     if(!good){if(lane==0)cache.status.data[world]|=2;return;}
-    for(int i=lane;i<21;i+=stride) {
-        const int dof=plan.dof_ids.data[world*21+i];
-        const float acceleration=i<15&&f.kinematic_dof.data[dof]==0?s[93+i]:0.0f;
+    for(int i=lane;i<$PHYSICAL;i+=stride) {
+        const int dof=plan.dof_ids.data[world*$PHYSICAL+i];
+        const float acceleration=i<$RESPONSE&&f.kinematic_dof.data[dof]==0?s[$ACCELERATION+i]:0.0f;
         f.qdd.data[dof]=acceleration;
         f.vhat.data[dof]=$VELOCITY;
     }
@@ -421,31 +450,58 @@ _PREDICT = Template(r"""
     __syncwarp(mask);
 #endif
     for(int root=lane;root<2;root+=stride) {
-        const int joint=plan.joint_ids.data[world*32+11+root];
+        const int joint=plan.joint_ids.data[world*32+$PRIMARY_BODIES+root];
         if(f.kinematic_joint.data[joint]!=0)continue;
-        const int d=plan.dof_ids.data[world*21+9+6*root];
+        const int d=plan.dof_ids.data[world*$PHYSICAL+$N+6*root];
         $TRANSPORT
     }
 """).substitute(
-    SHIFT=cached_force.shift_wrench("external", "r", "v[k]", "v[k+3]"),
-    PROJECT=cached_force.project_wrench("axis", "s[6*body+k]", "ext"),
-    PASSIVE=_FORCE.passive("plan.q_index.data[world*9+i]", "dof"),
-    PROJECT_FREE=cached_force.project_wrench("axis", "s[6*11+k]", "tau", bias="bias"),
-    VELOCITY=_FORCE.velocity("dof", "acceleration"),
-    TRANSPORT=_FORCE.transport("d", "f.vhat.data[d+k]"),
-    FORWARD_ACTION=response_operator.CholeskySolve("n", "l").forward("s[78+offset+$index]", "x[$index]"),
-    TRANSPOSE_ACTION=response_operator.CholeskySolve("n", "l").transpose(
-        "x[$index]", "x[$index]", post_row="good&=wp::isfinite(x[row]);"
-    ),
-)
+        BODIES=layout.bodies,
+        DYNAMIC_BODIES=layout.primary_bodies + 1,
+        PRIMARY_LAST=layout.primary_bodies - 1,
+        PRIMARY_BODIES=layout.primary_bodies,
+        RESPONSE=layout.response_dofs,
+        PHYSICAL=layout.physical_dofs,
+        N=layout.primary_dofs,
+        N2=layout.primary_dofs**2,
+        TORQUE=layout.torque,
+        ACCELERATION=layout.acceleration,
+        SHIFT=cached_force.shift_wrench("external", "r", "v[k]", "v[k+3]"),
+        PROJECT=cached_force.project_wrench("axis", "s[6*body+k]", "ext"),
+        PASSIVE=_FORCE.passive(f"plan.q_index.data[world*{layout.primary_dofs}+i]", "dof"),
+        PROJECT_FREE=cached_force.project_wrench("axis", f"s[6*{layout.primary_bodies}+k]", "tau", bias="bias"),
+        VELOCITY=_FORCE.velocity("dof", "acceleration"),
+        TRANSPORT=_FORCE.transport("d", "f.vhat.data[d+k]"),
+        FORWARD_ACTION=response_operator.CholeskySolve("n", "l").forward(
+            f"s[{layout.torque}+offset+$index]", "x[$index]"
+        ),
+        TRANSPOSE_ACTION=response_operator.CholeskySolve("n", "l").transpose(
+            "x[$index]", "x[$index]", post_row="good&=wp::isfinite(x[row]);"
+        ),
+    )
 
 
-@wp.func_native(_PREDICT)
-def _predict(address: wp.uint64, world: int, plan: KineticPlan, cache: KineticData, f: ForceInput): ...
+def get_predictor_kernel(layout=None):
+    return _get_predictor_kernel(DEFAULT_LAYOUT if layout is None else layout)
 
 
 @functools.cache
-def get_predictor_kernel():
+def _get_predictor_kernel(layout):
+    storage_source = f"""
+#if defined(__CUDA_ARCH__)
+        __shared__ float values[2*{layout.force_floats}];
+        return reinterpret_cast<uint64_t>(values+{layout.force_floats}*((threadIdx.x&31)>>4));
+#else
+        return reinterpret_cast<uint64_t>(malloc({layout.force_floats}*sizeof(float)));
+#endif
+    """
+
+    @wp.func_native(storage_source)
+    def force_storage() -> wp.uint64: ...
+
+    @wp.func_native(predictor_source(layout))
+    def predict(address: wp.uint64, world: int, plan: KineticPlan, cache: KineticData, f: ForceInput): ...
+
     def predictor(plan: KineticPlan, cache: KineticData, force: ForceInput):
         group, logical_lane = wp.tid()
         world = _world(group)
@@ -454,17 +510,21 @@ def get_predictor_kernel():
         lanes = _lane()
         if lanes[1] == 1 and logical_lane != 0:
             return
-        address = _force_storage()
-        _predict(address, world, plan, cache, force)
+        address = force_storage()
+        predict(address, world, plan, cache, force)
         _release(address)
 
-    predictor.__name__ = "franka_kinetic_current_force_held9_6_p16"
+    predictor.__name__ = (
+        "franka_kinetic_current_force_held9_6_p16"
+        if layout == DEFAULT_LAYOUT
+        else f"scalar_forest_current_force_held{layout.primary_dofs}_6_b{layout.bodies}_p16"
+    )
     predictor.__qualname__ = predictor.__name__
     return wp.kernel(module="unique", enable_backward=False)(predictor)
 
 
 def build_plan(solver):
-    """Bind topology-derived ownership to the retained 9+6 operator layout."""
+    """Bind topology-derived ownership to complete physical and response dimensions."""
     return forest_kinetic_plan.build_plan(solver)
 
 
@@ -472,11 +532,14 @@ def supported(solver):
     """Require the unchanged immediate matrix-free publication and factor consumers."""
     from . import solver_feather_pgs as source  # noqa: PLC0415
 
+    try:
+        layout = from_solver(solver)
+    except ValueError:
+        return False
     return bool(
         solver.model.device.is_cuda
         and not solver.model.requires_grad
         and not solver.model.particle_count
-        and solver.size_groups == [9, 6]
         and solver.pgs_mode == "matrix_free"
         and solver.articulated_contact_response == "immediate"
         and solver.drive_mode == "augmented"
@@ -492,8 +555,18 @@ def supported(solver):
         and solver._parallel_augmented_drive_topology
         and solver._articulation_dynamics_stream is not None
         and not solver._debug_buffers_enabled
-        and solver._crba_cholesky_warp_kernels_by_size.get(9) is not None
-        and solver._crba_cholesky_warp_kernels_by_size.get(6) is not None
+        and (
+            (
+                layout.primary_dofs == 6
+                and solver.cholesky_kernel == "auto"
+                and solver.L_by_size.get(6) is not None
+                and solver._compact_diagonal_mass_size != 6
+            )
+            or (
+                solver._crba_cholesky_warp_kernels_by_size.get(layout.primary_dofs) is not None
+                and solver._crba_cholesky_warp_kernels_by_size.get(6) is not None
+            )
+        )
         and all(
             getattr(solver, name, None) is None
             for name in (
@@ -538,8 +611,9 @@ def _plan_dimensions(solver):
         solver.model.articulation_count,
         solver.model.joint_coord_count,
         solver.model.joint_dof_count,
-        solver.n_arts_by_size.get(9),
-        solver.n_arts_by_size.get(6),
+        tuple(sorted(solver.n_arts_by_size.items())),
+        tuple(sorted(solver._crba_source_dof_by_size)),
+        tuple(solver.size_groups),
     )
 
 
@@ -551,16 +625,26 @@ class FrankaKineticState:
         model, device, worlds = solver.model, solver.model.device, int(solver.world_count)
         if model.requires_grad or model.particle_count:
             raise ValueError("Franka kinetic state excludes gradient and particle ownership")
-        self.host_plan = build_plan(solver)
+        self.layout = from_solver(solver)
+        n, bodies = self.layout.primary_dofs, self.layout.bodies
+        self.host_plan = forest_kinetic_plan.build_plan(solver, self.layout)
+        self.same_width = n == 6
+        if self.same_width:
+            # Geometric assembly does not read joint/source projection metadata.
+            # Keep its plain element schedule separate from ordinary CRBA tables.
+            self.factor_offsets = wp.zeros(n, dtype=int, device=device)
+            self.factor_schedule = wp.array(
+                [row * n + col for row in range(n) for col in range(row + 1)], dtype=int, device=device
+            )
         self.plan = KineticPlan()
         for name, value in self.host_plan.items():
             setattr(self.plan, name, wp.array(value, dtype=int, device=device))
         self.data = KineticData()
         for name, shape, dtype in (
-            ("bias", (worlds, 9), float),
-            ("com_offset", (worlds, 13), wp.vec3),
+            ("bias", (worlds, n), float),
+            ("com_offset", (worlds, bodies), wp.vec3),
             ("free_bias", worlds, wp.spatial_vector),
-            ("geometric", (solver.n_arts_by_size[9], 81), float),
+            ("geometric", (solver.n_arts_by_size[n], n * n), float),
             ("geometry_valid", worlds, int),
             ("generation", worlds, wp.int64),
             ("geometry_generation", worlds, wp.int64),
@@ -573,12 +657,17 @@ class FrankaKineticState:
         self.data.current_valid.zero_()
         self.geometry_valid, self.status = self.data.geometry_valid, self.data.status
         self.geometric, self.bias = self.data.geometric, self.data.bias
-        self.compact_workspace = os.environ.get("FEATHER_PGS_FRANKA_COMPACT_WORKSPACE", "0") == "1"
+        self.compact_workspace = (
+            self.layout != DEFAULT_LAYOUT or os.environ.get("FEATHER_PGS_FRANKA_COMPACT_WORKSPACE", "0") == "1"
+        )
         state_factory = get_state_kernel
         if self.compact_workspace:
             from .franka_compact_workspace import get_state_kernel as state_factory  # noqa: PLC0415
-        self.repair_kernel, self.finish_kernel = state_factory(False), state_factory(True)
-        self.predictor_kernel = get_predictor_kernel()
+
+            self.repair_kernel, self.finish_kernel = (state_factory(finish, self.layout) for finish in (False, True))
+        else:
+            self.repair_kernel, self.finish_kernel = state_factory(False), state_factory(True)
+        self.predictor_kernel = get_predictor_kernel(self.layout)
         fields = (*world_scan_owner.PLAN_FIELDS, "joint_axis", "joint_X_p", "joint_X_c")
         self._model_plan = {name: _fingerprint(getattr(model, name)) for name in fields}
         self._solver_plan = {
@@ -596,7 +685,8 @@ class FrankaKineticState:
         }
         self._group_plan = {
             (name, size): _fingerprint(getattr(solver, name)[size])
-            for name, size in (("group_to_art", 9), ("group_to_art", 6), ("_crba_source_dof_by_size", 9))
+            for name, size in (("group_to_art", n), ("group_to_art", 6), ("_crba_source_dof_by_size", n))
+            if size in getattr(solver, name)
         }
         self._plan_dimensions = _plan_dimensions(solver)
         self._device_proof = None
@@ -762,7 +852,7 @@ class FrankaKineticState:
         )
         force.u0 = state_aug.joint_tau
         force.S = state_aug.joint_S_s
-        force.lower9, force.lower6 = solver.L_by_size[9], solver.L_by_size[6]
+        force.lower9, force.lower6 = solver.L_by_size[self.layout.primary_dofs], solver.L_by_size[6]
         force.kinematic_dof, force.kinematic_joint = solver._kinematic_dof_mask, solver._kinematic_joint_mask
         force.qdd, force.vhat, force.dt = state_aug.joint_qdd, solver.v_hat, dt
         wp.launch_tiled(
