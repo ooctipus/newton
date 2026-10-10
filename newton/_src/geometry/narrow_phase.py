@@ -270,7 +270,15 @@ def create_prepare_convex_pair(external_aabb: bool, speculative: bool = False):
             reject_radius = (
                 shape_collision_radius[shape_a] + shape_collision_radius[shape_b] + rigid_gap + margin_a + margin_b
             )
-            if wp.length_sq(pos_a - pos_b) > reject_radius * reject_radius:
+            # Mesh radii enclose the scaled local AABB around its center,
+            # which need not coincide with the imported shape's origin.
+            center_a = pos_a
+            center_b = pos_b
+            if type_a == GeoType.CONVEX_MESH:
+                center_a += wp.quat_rotate(quat_a, geom_a.center)
+            if type_b == GeoType.CONVEX_MESH:
+                center_b += wp.quat_rotate(quat_b, geom_b.center)
+            if wp.length_sq(center_a - center_b) > reject_radius * reject_radius:
                 return False, result
         if is_infinite_plane_a:
             geom_a, pos_a = convert_infinite_plane_to_cube(geom_a, quat_a, pos_a, pos_b, bsphere_radius_b + rigid_gap)
