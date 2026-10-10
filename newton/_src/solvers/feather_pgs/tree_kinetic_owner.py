@@ -32,7 +32,16 @@ def _fingerprint(array):
 class TreeKineticState:
     """Own one current cache with device state-bank tags and a separate held W."""
 
-    def __init__(self, sparse_owner, *, admission=None, chain_scan_default=None, complete=True, response="sparse"):
+    def __init__(
+        self,
+        sparse_owner,
+        *,
+        admission=None,
+        chain_scan_default=None,
+        complete=True,
+        response="sparse",
+        copy_reuse=False,
+    ):
         from . import tree_kinetic_state as native  # noqa: PLC0415
 
         self.sparse = sparse_owner
@@ -46,6 +55,9 @@ class TreeKineticState:
         self.complete = complete
         host = sparse_owner.host
         self.layout, parent, depth = make_plan(model, sparse_owner, complete=complete)
+        if copy_reuse and (self.layout.root_dofs or self.motion_velocity):
+            raise ValueError("Copied-state reuse requires fixed scalar coordinates and ordinary motion")
+        self.copy_reuse = copy_reuse
         self.group_count = sparse_owner.plan.group_to_art.size
         self._cache_to_art = sparse_owner.plan.group_to_art.reshape((self.group_count, 1))
         bodies, dofs = self.layout.bodies, self.layout.dofs
@@ -121,6 +133,11 @@ class TreeKineticState:
         self.data.geometry_generation = wp.full(groups, -1, dtype=wp.int64, device=device)
         self.data.source_q = wp.zeros(groups, dtype=wp.uint64, device=device)
         self.data.source_qd = wp.zeros(groups, dtype=wp.uint64, device=device)
+        if copy_reuse:
+            self.data.snapshot_q = wp.empty((groups, dofs), dtype=float, device=device)
+            self.data.snapshot_qd = wp.empty((groups, dofs), dtype=float, device=device)
+            self.data.snapshot_body_q = wp.empty((groups, bodies), dtype=wp.transform, device=device)
+            self.data.snapshot_body_qd = wp.empty((groups, bodies), dtype=wp.spatial_vector, device=device)
         self.data.status = wp.zeros(groups, dtype=int, device=device)
         self.data.current_valid.zero_()
         self.bias = self.data.bias
@@ -134,9 +151,10 @@ class TreeKineticState:
             layout=self.layout,
             body_velocity=body_velocity,
             motion_velocity=self.motion_velocity,
+            copy_reuse=copy_reuse,
         )
         self.finish_kernel = native.get_state_kernel(
-            True, self.chain_scan, layout=self.layout, body_velocity=body_velocity
+            True, self.chain_scan, layout=self.layout, body_velocity=body_velocity, copy_reuse=copy_reuse
         )
         self.predictor_kernel = native.get_predictor_kernel(self.chain_scan, layout=self.layout, response=response)
         self._model_plan = {name: _fingerprint(getattr(model, name)) for name in _PLAN_FIELDS}

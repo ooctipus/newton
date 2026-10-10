@@ -124,6 +124,7 @@ class TestMixedTreeSteps(unittest.TestCase):
                         np.testing.assert_array_equal(solver.L_by_size[9].numpy(), held[0])
                         np.testing.assert_array_equal(solver._diagonal_inverse_mass.numpy(), held[1])
                 self.assert_pair(cases)
+            wp.synchronize()  # Finish auxiliary streams before replacing this fixture.
 
     def test_complete_graph_and_dynamic_masks(self):
         """Replay complete held-factor cycles under changing reset masks."""
@@ -134,6 +135,8 @@ class TestMixedTreeSteps(unittest.TestCase):
             for _ in range(4):
                 case = step(case)
             mask = wp.array([False] * 3, dtype=wp.bool, device=case[0].device)
+            # Finish asynchronous setup allocations before capturing parallel streams.
+            wp.synchronize()
             with wp.ScopedCapture(device=case[0].device) as capture:
                 case[1].seed_double_buffer_events()
                 case[1].reset(case[2], world_mask=mask)
@@ -147,6 +150,7 @@ class TestMixedTreeSteps(unittest.TestCase):
                 mask.assign(np.array(selected))
                 wp.capture_launch(graph)
             self.assert_pair(cases)
+        wp.synchronize()  # Keep fixture arrays alive until all captured streams finish.
 
 
 if __name__ == "__main__":

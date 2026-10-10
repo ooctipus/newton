@@ -227,13 +227,14 @@ class TestMixedTreeCache(unittest.TestCase):
             generation = [group.data.generation.numpy().copy() for group in owner.groups]
             owner.begin(bank, aug, bank.joint_qd, DT, False)
             for group, before in zip(owner.groups, generation, strict=False):
-                np.testing.assert_array_equal(group.data.generation.numpy(), before + 1)
+                np.testing.assert_array_equal(group.data.generation.numpy(), before)
             solver.mass_update_mask.zero_()
             owner.refresh(aug)
             for group in owner.groups:
                 value = solver._diagonal_inverse_mass if group.sparse.diagonal else solver.L_by_size[group.layout.dofs]
                 np.testing.assert_array_equal(value.numpy(), held[group.layout.dofs])
             if model.device.is_cuda:
+                wp.synchronize()  # Complete fixture allocations before graph capture.
                 with wp.ScopedCapture(device=device) as capture:
                     owner.invalidate(mask)
                     owner.begin(bank, aug, bank.joint_qd, DT, False)
@@ -247,6 +248,8 @@ class TestMixedTreeCache(unittest.TestCase):
                         group.data.generation.numpy() - before, 3 * (solver.art_to_world.numpy()[arts] == 1)
                     )
             np.testing.assert_array_equal(state.joint_qd.numpy(), raw)
+            if model.device.is_cuda:
+                wp.synchronize()  # Finish auxiliary streams before replacing this fixture.
 
     def test_ownership_change_rejected_before_invalidation(self):
         """Reject omitted, duplicated and rebound factor ownership without writes."""

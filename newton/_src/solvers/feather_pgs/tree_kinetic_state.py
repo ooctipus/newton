@@ -40,6 +40,10 @@ class KineticData:
     status: wp.array[int]
     source_q: wp.array[wp.uint64]
     source_qd: wp.array[wp.uint64]
+    snapshot_q: wp.array2d[float]
+    snapshot_qd: wp.array2d[float]
+    snapshot_body_q: wp.array2d[wp.transform]
+    snapshot_body_qd: wp.array2d[wp.spatial_vector]
 
 
 @wp.struct
@@ -104,6 +108,86 @@ def _same_source(cache: KineticData, group: int, q: wp.array[float], qd: wp.arra
     "cache.source_q.data[group]=reinterpret_cast<uint64_t>(q.data);cache.source_qd.data[group]=reinterpret_cast<uint64_t>(qd.data);"
 )
 def _stamp_source(cache: KineticData, group: int, q: wp.array[float], qd: wp.array[float]): ...
+
+
+@functools.cache
+def _copy_binding(dofs, bodies, plan_type):
+    """Compare fixed scalar coordinates on a changed bank inside its repair block."""
+    lanes = """
+#if defined(__CUDA_ARCH__)
+    const int lane=threadIdx.x,stride=blockDim.x;
+#else
+    const int lane=0,stride=1;
+#endif
+"""
+
+    match_source = (
+        lanes
+        + r"""
+    bool equal=true;
+    for(int local=lane;local<$DOFS;local+=stride) {
+        const int slot=group*$DOFS+local;
+        equal&=q.data[plan.q_index.data[slot]]==cache.snapshot_q.data[slot];
+        equal&=qd.data[first+local]==cache.snapshot_qd.data[slot];
+    }
+    for(int local=lane;local<$BODIES;local+=stride) {
+        const int slot=group*$BODIES+local,body=children.data[first_joint+local];
+        for(int k=0;k<7;++k)equal&=body_q.data[body][k]==cache.snapshot_body_q.data[slot][k];
+        for(int k=0;k<6;++k)equal&=body_qd.data[body][k]==cache.snapshot_body_qd.data[slot][k];
+    }
+#if defined(__CUDA_ARCH__)
+    return __syncthreads_and(equal);
+#else
+    return equal?1:0;
+#endif
+""".replace("$DOFS", str(dofs)).replace("$BODIES", str(bodies))
+    )
+
+    @wp.func_native(match_source)
+    def matches(
+        plan: plan_type,
+        cache: KineticData,
+        group: int,
+        first: int,
+        q: wp.array[float],
+        qd: wp.array[float],
+        children: wp.array[int],
+        first_joint: int,
+        body_q: wp.array[wp.transform],
+        body_qd: wp.array[wp.spatial_vector],
+    ) -> int: ...
+
+    store_source = (
+        lanes
+        + r"""
+    for(int local=lane;local<$DOFS;local+=stride) {
+        const int slot=group*$DOFS+local;
+        cache.snapshot_q.data[slot]=q.data[plan.q_index.data[slot]];
+        cache.snapshot_qd.data[slot]=qd.data[first+local];
+    }
+    for(int local=lane;local<$BODIES;local+=stride) {
+        const int slot=group*$BODIES+local,body=children.data[first_joint+local];
+        cache.snapshot_body_q.data[slot]=body_q.data[body];
+        cache.snapshot_body_qd.data[slot]=body_qd.data[body];
+    }
+""".replace("$DOFS", str(dofs)).replace("$BODIES", str(bodies))
+    )
+
+    @wp.func_native(store_source)
+    def store(
+        plan: plan_type,
+        cache: KineticData,
+        group: int,
+        first: int,
+        q: wp.array[float],
+        qd: wp.array[float],
+        children: wp.array[int],
+        first_joint: int,
+        body_q: wp.array[wp.transform],
+        body_qd: wp.array[wp.spatial_vector],
+    ): ...
+
+    return matches, store
 
 
 @wp.func_native(r"""
@@ -481,10 +565,13 @@ def get_state_kernel(
     layout: TreeLayout = G1_LAYOUT,
     body_velocity: bool = False,
     motion_velocity: bool = False,
+    copy_reuse: bool = False,
 ):
     """Build complete repair/finish using original generalized integration laws."""
     if finish and motion_velocity:
         raise ValueError("Alternate motion velocity is a repair-only contract")
+    if copy_reuse and (layout.root_dofs or motion_velocity):
+        raise ValueError("Copied-state reuse requires fixed scalar coordinates and ordinary motion")
     h = get_helpers(layout, chain_scan, body_velocity)
     plan_type = h.plan_type
     scan_poses, scan_motion, collect = h._scan_poses, h._scan_motion, h._collect
@@ -503,6 +590,16 @@ def get_state_kernel(
     motion_setup = "motion_changed = _different_motion(data.joint_qd, motion_qd, ds, dofs)\n" if motion_velocity else ""
     motion_reuse = "        and motion_changed == 0\n" if motion_velocity else ""
     motion_bind = "qd = motion_qd" if motion_velocity else ""
+    copy_setup, copy_store, copy_rebind = "", "", ""
+    if copy_reuse:
+        _copy_matches, _copy_store = _copy_binding(dofs, bodies, plan_type)
+        copy_setup = """    if cache.current_valid[art] != 0 and source_matches == 0:
+        source_matches = _copy_matches(plan, cache, group, ds, data.joint_q, data.joint_qd, data.joint_child, js, data.body_q, data.body_qd)
+"""
+        copy_rebind = """        if lane == 0:
+            _stamp_source(cache, group, data.joint_q, data.joint_qd)
+"""
+        copy_store = "_copy_store(plan, cache, group, ds, q, qd, data.joint_child, js, data.body_q, data.body_qd)\n"
     stamp = "_stamp_source(cache, group, q, qd)"
     if motion_velocity:
         # An override source must not be reused when a later begin returns to
@@ -524,9 +621,11 @@ ds, js = p.art_dof_start[art], p.art_joint_start[art]
 refresh = int(global_refresh != 0)
 if not wp.static(finish):
     refresh = int(refresh != 0 or requests[art] != 0)
+    source_matches = _same_source(cache, group, data.joint_q, data.joint_qd)
+{copy_setup}\
     if (
         cache.current_valid[art] != 0
-        and _same_source(cache, group, data.joint_q, data.joint_qd) != 0
+        and source_matches != 0
 {motion_reuse}\
         and (
             refresh == 0
@@ -535,6 +634,7 @@ if not wp.static(finish):
             )
         )
     ):
+{copy_rebind}\
         return
 if lane == 0:
     cache.current_valid[art] = 0
@@ -609,6 +709,9 @@ _sync()
 """,
         collect="""
 collect(address, group, p, plan, cache, refresh)
+"""
+        + copy_store
+        + """
 if lane == 0:
 """
         + indent(stamp, "    "),
@@ -616,6 +719,8 @@ if lane == 0:
     name = f"tree_kinetic_finish{bodies}" if finish else f"tree_kinetic_repair{bodies}"
     if chain_scan:
         name += "_chain"
+    if copy_reuse:
+        name += "_copies"
     signature = "p: sparse_factor.SparsePlan, plan: plan_type, data: PublicationData, cache: KineticData, requests: wp.array[int], global_refresh: int"
     if motion_velocity:
         name += "_motion"

@@ -169,6 +169,7 @@ class TreeHeldOperator:
             self.refresh_kernel = _diagonal_geometry
         else:
             self.data.lower = solver.L_by_size[size]
+            self.geometry_index = wp.array(physical_index.ravel(), dtype=int, device=device)
             self.refresh_kernel = geometric_factor(
                 str(device.arch), size=size, geometric_index=tuple(map(int, physical_index.ravel()))
             )
@@ -219,6 +220,7 @@ class TreeHeldOperator:
                     solver._augmented_drive_row_by_dof,
                     solver.aug_row_K,
                     self.kinetic_state.geometric,
+                    self.geometry_index,
                 ],
                 outputs=[solver.L_by_size[size]],
                 block_dim=128,
@@ -248,11 +250,13 @@ class MixedTreeKineticState:
                 chain_scan_default=False,
                 complete=False,
                 response="diagonal" if operator.diagonal else "cholesky",
+                copy_reuse=True,
             )
             operator.kinetic_state = group
             self.groups.append(group)
         # The existing solver lifecycle delegates factor refresh to this binding.
         self.sparse = self
+        self.copy_reuse = True
 
     def validate_model(self):
         """Reject ownership changes before any cache or notification mutation."""

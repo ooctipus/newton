@@ -3703,6 +3703,7 @@ class SolverFeatherPGS(SolverBase):
             self._fk_id_cache_enabled
             and self._fk_id_cache_source_state is not None
             and state is not self._fk_id_cache_source_state
+            and not getattr(getattr(self, "_tree_kinetic_state", None), "copy_reuse", False)
         ):
             self._fk_id_cache_valid.zero_()
             self._fk_id_cache_source_state = state
@@ -11628,7 +11629,10 @@ class SolverFeatherPGS(SolverBase):
             if _DEBUG_CACHE_MODE == "zero_even":
                 if self._step % 2 == 0:
                     self._fk_id_cache_valid.zero_()
-            elif _DEBUG_CACHE_MODE != "nozero":
+            elif _DEBUG_CACHE_MODE != "nozero" and not getattr(
+                getattr(self, "_tree_kinetic_state", None), "copy_reuse", False
+            ):
+                # Copy-aware owners validate changed state banks on the device.
                 if self._fk_id_cache_source_state is not None and state_in is not self._fk_id_cache_source_state:
                     self._fk_id_cache_valid.zero_()
             self._fk_id_cache_source_state = state_in

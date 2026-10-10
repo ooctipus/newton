@@ -32,11 +32,9 @@ def _factory(geometric_index=()):
     end = source.index("        if (row == col)", begin)
     assembly = "        float value = geometric.data[group * {matrix_elements} + element];\n"
     if geometric_index:
-        initializer = "{{" + ",".join(map(str, geometric_index)) + "}}"
         entries = max(geometric_index) + 1
         assembly = (
-            f"        constexpr int geometry_index[{len(geometric_index)}]={initializer};\n"
-            "        const int geometry_entry=geometry_index[element];\n"
+            "        const int geometry_entry=geometry_lookup.data[element];\n"
             f"        float value = geometry_entry < 0 ? 0.0f : geometric.data[group * {entries} + geometry_entry];\n"
         )
     source = source[:begin] + assembly + source[end:]
@@ -44,10 +42,15 @@ def _factory(geometric_index=()):
     if source.count(argument) != 2:
         raise ValueError("Original native/kernel factor signatures changed")
     source = source.replace(argument, "        geometric: wp.array2d[float],\n" + argument)
+    if geometric_index:
+        source = source.replace(argument, "        geometry_lookup: wp.array[int],\n" + argument)
     call = "            row_K,\n            L_group,"
     if source.count(call) != 1:
         raise ValueError("Original factor native call changed")
-    source = source.replace(call, "            row_K,\n            geometric,\n            L_group,")
+    lookup_argument = "            geometry_lookup,\n" if geometric_index else ""
+    source = source.replace(
+        call, "            row_K,\n            geometric,\n" + lookup_argument + "            L_group,"
+    )
     source = source.replace('name = f"crba_cholesky_warp', 'name = f"franka_kinetic_crba_cholesky_warp', 1)
     filename = "<franka-kinetic-geometric-factor>"
     linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)
