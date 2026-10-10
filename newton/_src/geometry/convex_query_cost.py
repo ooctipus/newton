@@ -101,6 +101,69 @@ def _primitive_empty(output: wp.array[wp.vec4]):
     output[row] = wp.vec4(float(row), 0.0, 0.0, 0.0)
 
 
+def _preparation_primitive(device, count, launch_ns):
+    from .narrow_phase import ConvexPairQueryData, create_prepare_convex_pair  # noqa: PLC0415
+
+    prepare = create_prepare_convex_pair(True, False)
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def prepare_queries(inputs: _PairInputs, output: wp.array[ConvexPairQueryData]):
+        row = wp.tid()
+        _valid, query = prepare(
+            wp.vec2i(2 * row, 2 * row + 1),
+            inputs.shape_types,
+            inputs.shape_data,
+            inputs.shape_transform,
+            inputs.shape_source,
+            inputs.shape_gap,
+            inputs.shape_collision_radius,
+            inputs.shape_aabb_lower,
+            inputs.shape_aabb_upper,
+            inputs.shape_collision_aabb_lower,
+            inputs.shape_collision_aabb_upper,
+        )
+        # Retaining all prepared fields budgets geometry loads and cache writes
+        # independently of the much larger query-arithmetic intercept.
+        output[row] = query
+
+    poses = np.zeros((2 * count, 7), dtype=np.float32)
+    poses[:, 6] = 1
+    poses[1::2, 0] = 1.2
+    inputs = _PairInputs()
+    inputs.shape_types = wp.full(2 * count, int(GeoType.CONVEX_MESH), dtype=int, device=device)
+    inputs.shape_data = wp.full(2 * count, wp.vec4(0.5, 0.4, 0.3, 0.0), dtype=wp.vec4, device=device)
+    inputs.shape_transform = wp.array(poses, dtype=wp.transform, device=device)
+    # Preparation packs the source pointer without dereferencing it.
+    inputs.shape_source = wp.zeros(2 * count, dtype=wp.uint64, device=device)
+    inputs.shape_gap = wp.full(2 * count, 0.01, dtype=float, device=device)
+    inputs.shape_collision_radius = wp.full(2 * count, 2.0, dtype=float, device=device)
+    inputs.shape_aabb_lower = wp.full(2 * count, wp.vec3(-3.0), dtype=wp.vec3, device=device)
+    inputs.shape_aabb_upper = wp.full(2 * count, wp.vec3(3.0), dtype=wp.vec3, device=device)
+    inputs.shape_collision_aabb_lower = wp.full(2 * count, wp.vec3(-0.5), dtype=wp.vec3, device=device)
+    inputs.shape_collision_aabb_upper = wp.full(2 * count, wp.vec3(0.5), dtype=wp.vec3, device=device)
+    output = wp.empty(count, dtype=ConvexPairQueryData, device=device)
+    elapsed = _measure(lambda: wp.launch(prepare_queries, count, [inputs, output], device=device), device)
+    return max(0.0, elapsed - launch_ns) / count
+
+
+def _nonnegative_fit(features, durations):
+    """Solve the tiny nonnegative fit by checking every possible active set."""
+    matrix, target = np.asarray(features), np.asarray(durations)
+    best, error = np.zeros(matrix.shape[1]), float(np.dot(target, target))
+    for mask in range(1, 1 << matrix.shape[1]):
+        active = [column for column in range(matrix.shape[1]) if mask & (1 << column)]
+        values = np.linalg.lstsq(matrix[:, active], target, rcond=None)[0]
+        if np.any(values < 0):
+            continue
+        candidate = np.zeros(matrix.shape[1])
+        candidate[active] = values
+        residual = matrix @ candidate - target
+        candidate_error = float(np.dot(residual, residual))
+        if candidate_error < error:
+            best, error = candidate, candidate_error
+    return best
+
+
 @dataclass(frozen=True)
 class _QueryCostModel:
     """Nanoseconds per pair, support call and visited vertex; independent primitives only."""
@@ -114,10 +177,11 @@ class _QueryCostModel:
     launch_ns: float
     calibration_seconds: float
     measurements: tuple
+    prepare_ns: float = 0.0
 
     def coefficients(self, slots):
-        # One extra preparation and retained cache writes are conservatively
-        # charged at one query intercept; the lookup scales with search depth.
+        # Preparation/retained writes and lookup have independent measurements.
+        # The lookup scales with search depth.
         lookup = self.lookup_ns * max(1.0, np.log2(max(2, slots)) / 13.0)
         return np.array(
             [
@@ -126,7 +190,7 @@ class _QueryCostModel:
                 self.vertex_ns,
                 self.screen_base_ns,
                 self.screen_vertex_ns,
-                lookup + self.query_base_ns,
+                lookup + self.prepare_ns,
                 self.launch_ns,
             ],
             dtype=np.float32,
@@ -217,9 +281,13 @@ def _calibrate_query_cost(device):
             screen_features.append([1, 2 * vertices])
             screen_durations.append(max(0.0, elapsed - launch_ns) / count)
             records.append({"vertices": vertices, "screen_ns": elapsed})
-        query = np.maximum(0.0, np.linalg.lstsq(features, durations, rcond=None)[0])
-        screen = np.maximum(0.0, np.linalg.lstsq(screen_features, screen_durations, rcond=None)[0])
-    model = _QueryCostModel(*query, *screen, lookup_ns, launch_ns, time.monotonic() - start, tuple(records))
+        query = _nonnegative_fit(features, durations)
+        screen = _nonnegative_fit(screen_features, screen_durations)
+        prepare_ns = _preparation_primitive(device, count, launch_ns)
+        records.append({"prepare_ns_per_pair": prepare_ns})
+    model = _QueryCostModel(
+        *query, *screen, lookup_ns, launch_ns, time.monotonic() - start, tuple(records), prepare_ns=prepare_ns
+    )
     if not np.isfinite(model.coefficients(count)).all() or model.support_ns + model.vertex_ns <= 0:
         raise RuntimeError("Independent collision primitives produced an invalid cost model")
     _DEVICE_MODELS[key] = model

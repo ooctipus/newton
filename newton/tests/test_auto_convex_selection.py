@@ -13,7 +13,7 @@ import warp as wp
 import newton
 from newton._src.geometry.coherent_convex import _ConvexQueryCache
 from newton._src.geometry.coherent_convex_rejection import _create_rejection_query_kernels
-from newton._src.geometry.convex_query_cost import _ConvexMethodChoice, _QueryCostModel
+from newton._src.geometry.convex_query_cost import _ConvexMethodChoice, _nonnegative_fit, _QueryCostModel
 from newton.tests.test_coherent_convex_rejection import _accepted, _box_inputs, _buffers, _original, _selector_model
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
@@ -128,6 +128,11 @@ def test_dense_pipeline_uses_ordinary(test, device):
 
 
 class TestAutoConvexSelection(unittest.TestCase):
+    def test_nonnegative_cost_fit(self):
+        # Constraining a negative slope requires refitting the intercept.
+        result = _nonnegative_fit([[1, 1], [1, 2], [1, 3]], [3, 2, 1])
+        np.testing.assert_allclose(result, [2, 0])
+
     def test_unsupported_auto_preserves_collision(self):
         """Fall back to ordinary collision on a CPU pipeline without losing contacts."""
         builder = newton.ModelBuilder()
