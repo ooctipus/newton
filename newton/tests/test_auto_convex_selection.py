@@ -39,17 +39,24 @@ def test_graph_choice_preserves_queries(test, device):
         owner = _ConvexMethodChoice(device=device, slots=n)
     owner.period = 2
 
-    def ordinary(buffers):
-        wp.launch(original[0], threads, [pair_array, count, *values, threads, *buffers], device=device, block_dim=128)
+    def ordinary(buffers, query_count=None):
+        wp.launch(
+            original[0],
+            threads,
+            [pair_array, count if query_count is None else query_count, *values, threads, *buffers],
+            device=device,
+            block_dim=128,
+        )
         wp.launch(original[1], threads, [pair_array, *values, threads, *buffers], device=device, block_dim=128)
 
-    def rejection():
+    def rejection(query_count, gjk_count):
         cache.begin()
+        rejection_buffers = [candidate[0], candidate[1], gjk_count, candidate[3], candidate[4]]
         for kernel in kernels:
             wp.launch(
                 kernel,
                 threads,
-                [pair_array, count, inputs, cache.data, threads, *candidate],
+                [pair_array, query_count, inputs, cache.data, threads, *rejection_buffers],
                 device=device,
                 block_dim=128,
             )
@@ -57,7 +64,9 @@ def test_graph_choice_preserves_queries(test, device):
     def run():
         for buffer in candidate:
             buffer.zero_()
-        owner.launch(pair_array, count, inputs, lambda: ordinary(candidate), rejection)
+        event = wp.get_stream(device).record_event()
+        owner.launch(pair_array, count, inputs, lambda query_count: ordinary(candidate, query_count), rejection)
+        wp.get_stream(device).wait_event(event)
 
     poses = values[2].numpy()
     run()  # Compile both branch factories before capture.

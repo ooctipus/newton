@@ -238,8 +238,11 @@ def _create_work_sampler():
         count_array: wp.array[int],
         inputs: _PairInputs,
         epoch: wp.array[int],
+        period: int,
         work: wp.array2d[float],
     ):
+        if epoch[0] % period != 0:
+            return
         row = wp.tid()
         for column in range(work.shape[1]):
             work[row, column] = 0.0
@@ -297,12 +300,6 @@ def _create_work_sampler():
 
 
 @wp.kernel(enable_backward=False)
-def _advance_choice(epoch: wp.array[int], probe: wp.array[int], period: int):
-    probe[0] = int(epoch[0] % period == 0)
-    epoch[0] += 1
-
-
-@wp.kernel(enable_backward=False)
 def _choose_method(
     work: wp.array2d[float],
     count_array: wp.array[int],
@@ -310,34 +307,43 @@ def _choose_method(
     choice: wp.array[int],
     estimates: wp.array[float],
     period: int,
+    epoch: wp.array[int],
+    ordinary_count: wp.array[int],
+    rejection_count: wp.array[int],
+    rejection_gjk_count: wp.array[int],
 ):
     count = wp.max(0, count_array[0])
-    samples = wp.min(count, work.shape[0])
-    total = float(0.0)
-    saving_sum = float(0.0)
-    saving_square = float(0.0)
-    for row in range(samples):
-        query = coefficients[0] * work[row, 4] + coefficients[1] * work[row, 0] + coefficients[2] * work[row, 1]
-        # Prepare/lookup traffic applies to all candidates. Certificate scans
-        # apply to eligible separated shapes; failed hints are budgeted too.
-        screen = coefficients[5] + work[row, 5] * coefficients[3] + work[row, 3] * coefficients[4]
-        saving = work[row, 2] * query - screen
-        total += query
-        saving_sum += saving
-        saving_square += saving * saving
-    denominator = float(wp.max(1, samples))
-    mean = saving_sum / denominator
-    variance = wp.max(0.0, saving_square / denominator - mean * mean)
-    uncertainty = 2.0 * wp.sqrt(variance / denominator)
-    ordinary_ns = total / denominator * float(count) + 2.0 * coefficients[6]
-    # Extra rejection launches, conditional dispatch and amortized probes.
-    overhead_ns = 6.0 * coefficients[6] + (total + 3.0 * coefficients[6]) / float(period)
-    saving_ns = (mean - uncertainty) * float(count) - overhead_ns
-    estimates[0] = ordinary_ns * 1.0e-6
-    estimates[1] = (ordinary_ns - saving_ns) * 1.0e-6
-    estimates[2] = uncertainty * float(count) * 1.0e-6
-    estimates[3] = float(count)
-    choice[0] = int(samples >= 32 and wp.isfinite(saving_ns) and saving_ns > 0.15 * ordinary_ns)
+    if epoch[0] % period == 0:
+        samples = wp.min(count, work.shape[0])
+        total = float(0.0)
+        saving_sum = float(0.0)
+        saving_square = float(0.0)
+        for row in range(samples):
+            query = coefficients[0] * work[row, 4] + coefficients[1] * work[row, 0] + coefficients[2] * work[row, 1]
+            # Prepare/lookup traffic applies to all candidates. Certificate scans
+            # apply to eligible separated shapes; failed hints are budgeted too.
+            screen = coefficients[5] + work[row, 5] * coefficients[3] + work[row, 3] * coefficients[4]
+            saving = work[row, 2] * query - screen
+            total += query
+            saving_sum += saving
+            saving_square += saving * saving
+        denominator = float(wp.max(1, samples))
+        mean = saving_sum / denominator
+        variance = wp.max(0.0, saving_square / denominator - mean * mean)
+        uncertainty = 2.0 * wp.sqrt(variance / denominator)
+        ordinary_ns = total / denominator * float(count) + 2.0 * coefficients[6]
+        # Extra rejection/empty-queue launches and amortized probes.
+        overhead_ns = 6.0 * coefficients[6] + (total + 3.0 * coefficients[6]) / float(period)
+        saving_ns = (mean - uncertainty) * float(count) - overhead_ns
+        estimates[0] = ordinary_ns * 1.0e-6
+        estimates[1] = (ordinary_ns - saving_ns) * 1.0e-6
+        estimates[2] = uncertainty * float(count) * 1.0e-6
+        estimates[3] = float(count)
+        choice[0] = int(samples >= 32 and wp.isfinite(saving_ns) and saving_ns > 0.15 * ordinary_ns)
+    epoch[0] += 1
+    ordinary_count[0] = wp.where(choice[0] == 0, count, 0)
+    rejection_count[0] = wp.where(choice[0] != 0, count, 0)
+    rejection_gjk_count[0] = 0
 
 
 class _ConvexMethodChoice:
@@ -348,7 +354,9 @@ class _ConvexMethodChoice:
         self.model = _calibrate_query_cost(self.device)
         self.period = 64
         self.epoch = wp.zeros(1, dtype=int, device=device)
-        self.probe = wp.zeros(1, dtype=int, device=device)
+        self.ordinary_count = wp.zeros(1, dtype=int, device=device)
+        self.rejection_count = wp.zeros(1, dtype=int, device=device)
+        self.rejection_gjk_count = wp.zeros(1, dtype=int, device=device)
         self.choice = wp.zeros(1, dtype=int, device=device)
         self.estimates = wp.zeros(4, dtype=float, device=device)
         self.work = wp.zeros((512, 6), dtype=float, device=device)
@@ -356,21 +364,33 @@ class _ConvexMethodChoice:
         self.sample = _create_work_sampler()
 
     def launch(self, pairs, count, inputs, ordinary, rejection):
-        wp.launch(_advance_choice, 1, [self.epoch, self.probe, self.period], device=self.device)
-
-        def observe():
-            wp.launch(
-                self.sample, self.work.shape[0], [pairs, count, inputs, self.epoch, self.work], device=self.device
-            )
-            wp.launch(
-                _choose_method,
-                1,
-                [self.work, count, self.coefficients, self.choice, self.estimates, self.period],
-                device=self.device,
-            )
-
-        wp.capture_if(self.probe, on_true=observe)
-        wp.capture_if(self.choice, on_true=rejection, on_false=ordinary)
+        # Empty work queues keep the parent capture and its cross-stream events
+        # intact. Native conditional graph capture pauses invalidate older events.
+        wp.launch(
+            self.sample,
+            self.work.shape[0],
+            [pairs, count, inputs, self.epoch, self.period, self.work],
+            device=self.device,
+        )
+        wp.launch(
+            _choose_method,
+            1,
+            [
+                self.work,
+                count,
+                self.coefficients,
+                self.choice,
+                self.estimates,
+                self.period,
+                self.epoch,
+                self.ordinary_count,
+                self.rejection_count,
+                self.rejection_gjk_count,
+            ],
+            device=self.device,
+        )
+        ordinary(self.ordinary_count)
+        rejection(self.rejection_count, self.rejection_gjk_count)
 
     def describe(self):
         """Read the latest estimate outside capture; sampling is not a timing fit."""

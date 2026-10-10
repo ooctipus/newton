@@ -2316,7 +2316,7 @@ class CollisionPipeline:
             )
             if coherent_convex == "auto":
                 self._convex_selection_reason = "unsupported_pipeline"
-                if unsupported or not wp.is_conditional_graph_supported():
+                if unsupported:
                     coherent_convex = "0"
                 else:
                     types = model.shape_type.numpy()

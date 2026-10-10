@@ -3241,7 +3241,10 @@ class NarrowPhase:
                     if self._cells_owner is not None:
                         coherent_inputs.append(self._cells_owner.data)
 
-                    def rejection():
+                    def rejection(query_count=None, gjk_count=None):
+                        if query_count is not None:
+                            coherent_inputs[1] = query_count
+                            coherent_inputs[7] = gjk_count
                         self._coherent_cache.begin()
                         for coherent_kernel in self._coherent_query_kernels:
                             wp.launch(
@@ -3253,13 +3256,13 @@ class NarrowPhase:
                                 record_tape=False,
                             )
 
-                def ordinary():
+                def ordinary(query_count=None):
                     wp.launch(
                         kernel=self.narrow_phase_mpr_kernel,
                         dim=self.total_num_threads,
                         inputs=[
                             convex_pairs,
-                            convex_pair_count,
+                            convex_pair_count if query_count is None else query_count,
                             *common_inputs,
                             self.total_num_threads,
                             self.split_query_results,

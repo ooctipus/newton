@@ -10,17 +10,18 @@ Eligible CUDA pipelines sample up to 512 queries every 64 collision calls.
 The sample counts support calls and visited vertices, estimates separable
 work, and subtracts screening, lookup, launch and amortized sampling costs.
 A sampling uncertainty bound and 15% query-stage margin favor ordinary
-queries when the estimated benefit is small. Native CUDA graph conditionals
-select the method during replay; no host synchronization is added to replay.
+queries when the estimated benefit is small. Device-side queue counts
+select the method during replay without host synchronization. Empty kernels
+are included in the cost estimate and measured overhead.
 Sampling never produces contacts. The existing current-geometry certificate
 and cold query/manifold implementations continue to own contact generation.
 
 Unsupported pipelines or models without eligible box/convex pairs take the
 ordinary route without allocating a selector or running its kernels.
 Existing explicit modes ``0`` and ``reject_only`` remain available.
-Auto mode currently excludes convex-cell acceleration and needs native
-conditional graph support. Eager execution synchronizes branch conditions;
-this initial implementation targets captured simulation.
+Auto mode currently excludes convex-cell acceleration. The same device-side
+selection works in eager execution and captured simulation. It preserves
+existing cross-stream capture events.
 
 Calibration runs once per process/device before capture. It uses synthetic
 convex shapes, support-query timings, bound scans and key lookups. Startup
