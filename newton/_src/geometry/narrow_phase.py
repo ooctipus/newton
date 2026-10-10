@@ -2726,6 +2726,7 @@ class NarrowPhase:
         self.split_gjk_mpr = device_obj.is_cuda and has_generic_convex_pairs and split_gjk_mpr
         self._use_lean_gjk_mpr = use_lean_gjk_mpr
         self._coherent_cache = None
+        self._convex_method_choice = None
         self._coherent_query_kernels = None
         self._cells_owner = None
         # Create the appropriate kernel variants
@@ -3207,7 +3208,6 @@ class NarrowPhase:
                 if self._coherent_cache is not None:
                     from .coherent_convex_rejection import _PairInputs  # noqa: PLC0415
 
-                    self._coherent_cache.begin()
                     pair_inputs = _PairInputs()
                     for name, value in zip(
                         (
@@ -3240,16 +3240,20 @@ class NarrowPhase:
                     ]
                     if self._cells_owner is not None:
                         coherent_inputs.append(self._cells_owner.data)
-                    for coherent_kernel in self._coherent_query_kernels:
-                        wp.launch(
-                            kernel=coherent_kernel,
-                            dim=self.total_num_threads,
-                            inputs=coherent_inputs,
-                            device=device,
-                            block_dim=self.block_dim,
-                            record_tape=False,
-                        )
-                else:
+
+                    def rejection():
+                        self._coherent_cache.begin()
+                        for coherent_kernel in self._coherent_query_kernels:
+                            wp.launch(
+                                kernel=coherent_kernel,
+                                dim=self.total_num_threads,
+                                inputs=coherent_inputs,
+                                device=device,
+                                block_dim=self.block_dim,
+                                record_tape=False,
+                            )
+
+                def ordinary():
                     wp.launch(
                         kernel=self.narrow_phase_mpr_kernel,
                         dim=self.total_num_threads,
@@ -3285,6 +3289,13 @@ class NarrowPhase:
                         block_dim=self.block_dim,
                         record_tape=False,
                     )
+
+                if self._convex_method_choice is not None:
+                    self._convex_method_choice.launch(convex_pairs, convex_pair_count, pair_inputs, ordinary, rejection)
+                elif self._coherent_cache is not None:
+                    rejection()
+                else:
+                    ordinary()
                 wp.launch(
                     kernel=self.narrow_phase_manifold_kernel,
                     dim=self.total_num_threads,

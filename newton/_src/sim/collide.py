@@ -1846,9 +1846,9 @@ class CollisionPipeline:
         self._convex_cells = None
         coherent_convex = os.environ.get("NEWTON_NARROW_PHASE_COHERENT_CONVEX", "0")
         coherent_stats = os.environ.get("NEWTON_NARROW_PHASE_COHERENT_STATS", "0")
-        if coherent_convex not in ("0", "reject_only") or coherent_stats not in ("0", "1"):
+        if coherent_convex not in ("0", "reject_only", "auto") or coherent_stats not in ("0", "1"):
             raise ValueError(
-                "NEWTON_NARROW_PHASE_COHERENT_CONVEX must be 0 or reject_only; COHERENT_STATS must be 0 or 1"
+                "NEWTON_NARROW_PHASE_COHERENT_CONVEX must be 0 or reject_only or auto; COHERENT_STATS must be 0 or 1"
             )
         if coherent_stats == "1" and coherent_convex == "0":
             raise ValueError("coherent convex diagnostics require NEWTON_NARROW_PHASE_COHERENT_CONVEX=reject_only")
@@ -2297,9 +2297,10 @@ class CollisionPipeline:
                 raise ValueError("Explicit pair shape IDs must be within model.shape_count")
             self.prepared_shape_indices = wp.array(pair_indices, dtype=wp.int32, device=device)
 
+        self._convex_selection_reason = "explicit_ordinary"
         # Built here (not in finalize) so models/tasks that never collide don't pay for it.
         if coherent_convex != "0":
-            if (
+            unsupported = (
                 using_expert_components
                 or self.broad_phase_mode != "explicit"
                 or self.shape_pairs_filtered is not getattr(model, "shape_contact_pairs", None)
@@ -2312,12 +2313,26 @@ class CollisionPipeline:
                 or self._speculative_enabled
                 or reduction_config.body_pairs
                 or requires_grad
-            ):
+            )
+            if coherent_convex == "auto":
+                self._convex_selection_reason = "unsupported_pipeline"
+                if unsupported or not wp.is_conditional_graph_supported():
+                    coherent_convex = "0"
+                else:
+                    types = model.shape_type.numpy()
+                    pairs = self.shape_pairs_filtered.numpy()
+                    supported = np.isin(types, (int(GeoType.BOX), int(GeoType.CONVEX_MESH)))
+                    eligible = int(np.count_nonzero(supported[pairs[:, 0]] & supported[pairs[:, 1]]))
+                    if eligible == 0:
+                        self._convex_selection_reason = "no_eligible_pairs"
+                        coherent_convex = "0"
+            elif unsupported:
                 raise ValueError(
                     "experimental coherent convex collision requires model-built unique explicit pairs, "
                     "the internal lean CUDA split pipeline, no mesh/heightfield/particle/hydroelastic or "
                     "speculative contacts, no body-pair reduction, and no gradients"
                 )
+        if coherent_convex != "0":
             from ..geometry.coherent_convex import _ConvexQueryCache  # noqa: PLC0415
             from ..geometry.coherent_convex_rejection import _create_rejection_query_kernels  # noqa: PLC0415
 
@@ -2332,6 +2347,12 @@ class CollisionPipeline:
             self.narrow_phase._coherent_query_kernels = _create_rejection_query_kernels(
                 diagnostics=coherent_stats == "1"
             )
+            self._convex_selection_reason = "explicit_rejection"
+            if coherent_convex == "auto":
+                from ..geometry.convex_query_cost import _ConvexMethodChoice  # noqa: PLC0415
+
+                self.narrow_phase._convex_method_choice = _ConvexMethodChoice(device=device, slots=eligible)
+                self._convex_selection_reason = "sampled_cost"
             if convex_cells == "1":
                 from ..geometry.convex_cells import _CellOwner  # noqa: PLC0415
                 from ..geometry.convex_cells_factories import coherent_kernels, manifold_kernel  # noqa: PLC0415
