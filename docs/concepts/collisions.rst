@@ -2378,6 +2378,13 @@ Performance
 - Use positive collision groups to reduce candidate pairs
 - Use world indices for parallel simulations (essential for RL with many environments)
 - Contact reduction is enabled by default for mesh-heavy scenes
+- Experimental ``CollisionPipeline(contact_export="auto")`` chooses compact
+  reduced-contact export on supported CUDA mesh/heightfield pipelines. Use
+  ``"tiled"`` to force the original mapping or ``"compact"`` to require
+  compact admission. Automatic compact export excludes deterministic,
+  speculative, hydroelastic and alternate heightfield export modes. Inspect
+  :meth:`~CollisionPipeline.get_collision_selection` outside graph capture.
+  Omitting this argument retains legacy environment selection.
 - Pass ``rigid_contact_max`` to :class:`~CollisionPipeline` to limit memory in complex scenes
 - Use :meth:`~ModelBuilder.approximate_meshes` to replace detailed visual meshes with convex hulls for collision
 - Use ``viewer.log_contacts(contacts, state)`` in the render loop to visualize contact points and normals for debugging

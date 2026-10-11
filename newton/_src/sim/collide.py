@@ -1578,6 +1578,7 @@ class CollisionPipeline:
         contact_reduction_hashtable_size_factor: float = 0.25,
         speculative_config: SpeculativeContactConfig | None = None,
         convex_collision: Literal["auto", "ordinary", "rejection", "convex_cells"] | None = None,
+        contact_export: Literal["auto", "tiled", "compact"] | None = None,
     ):
         """
         Initialize the CollisionPipeline (expert API).
@@ -1673,6 +1674,13 @@ class CollisionPipeline:
             convex_collision: Experimental per-instance convex query implementation. ``auto`` chooses
                 ordinary queries, rejection screening or convex cells; explicit choices
                 force a supported method. ``None`` retains the legacy environment selection.
+            contact_export: Experimental reduced-contact export mapping. ``auto`` selects compact
+                workers for supported CUDA mesh/heightfield reducers. ``tiled`` forces the original
+                mapping; ``compact`` requires admission. Automatic compact export excludes
+                deterministic, speculative, hydroelastic and alternate heightfield export modes.
+                Explicit choices override ``NEWTON_REDUCER_COMPACT_EXPORT``; ``None`` preserves it.
+                Cannot be combined with a prebuilt narrow phase; configure that instance directly.
+                This parameter may change without the normal deprecation period.
             narrow_phase: Optional prebuilt narrow phase instance. Must be
                 provided together with a broad phase instance for expert usage.
                 Its effective ``reduce_contacts`` state is authoritative for
@@ -1839,6 +1847,10 @@ class CollisionPipeline:
         shape_count = model.shape_count
         device = model.device
         using_expert_components = broad_phase_instance is not None or narrow_phase is not None
+        if contact_export not in (None, "auto", "tiled", "compact"):
+            raise ValueError(f"contact_export must be 'auto', 'tiled', 'compact' or None, got {contact_export!r}")
+        if contact_export is not None and narrow_phase is not None:
+            raise ValueError("contact_export cannot be used with a prebuilt narrow_phase; configure that instance")
         if broad_phase_output_max is not None:
             if (
                 isinstance(broad_phase_output_max, (bool, np.bool_))
@@ -2201,6 +2213,7 @@ class CollisionPipeline:
                 contact_reduction_hashtable_size_factor=contact_reduction_hashtable_size_factor,
                 speculative=self._speculative_enabled,
                 contact_writer_supports_speculative=self._speculative_enabled,
+                contact_export=contact_export,
             )
             self.hydroelastic_sdf = self.narrow_phase.hydroelastic_sdf
 
@@ -2526,6 +2539,14 @@ class CollisionPipeline:
         """
         owner = getattr(self.narrow_phase, "_convex_method_choice", None)
         result = {"requested": self.convex_collision, "reason": self._convex_selection_reason}
+        result["contact_export"] = {
+            "requested": self.narrow_phase.contact_export,
+            "method": "disabled"
+            if not self.narrow_phase.reduce_contacts
+            else "compact"
+            if self.narrow_phase._reducer_compact_export
+            else "tiled",
+        }
         if owner is not None:
             result.update(owner.describe())
             if result["method"] == "reject_only":

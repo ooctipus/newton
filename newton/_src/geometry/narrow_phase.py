@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Any
+from typing import Any, Literal
 
 import warp as wp
 
@@ -2437,6 +2437,7 @@ class NarrowPhase:
         contact_reduction_hashtable_size_factor: float = 0.25,
         speculative: bool = False,
         contact_writer_supports_speculative: bool = False,
+        contact_export: Literal["auto", "tiled", "compact"] | None = None,
     ) -> None:
         """
         Initialize NarrowPhase with pre-allocated buffers.
@@ -2452,6 +2453,9 @@ class NarrowPhase:
             reduce_contacts: Whether to reduce contacts for mesh-mesh and mesh-plane collisions.
                 When True, uses shared memory contact reduction to select representative contacts.
                 This improves performance and stability for meshes with many vertices. Defaults to True.
+            contact_export: Experimental reduced-contact export mapping. ``auto`` uses compact
+                workers for supported CUDA reducers; ``tiled`` retains cooperative export.
+                ``compact`` requires admission. ``None`` preserves the legacy environment choice.
             device: Device to allocate buffers on
             shape_aabb_lower: Optional external AABB lower bounds array (if provided, AABBs won't be computed internally)
             shape_aabb_upper: Optional external AABB upper bounds array (if provided, AABBs won't be computed internally)
@@ -2632,7 +2636,7 @@ class NarrowPhase:
         if export_cleanup not in ("0", "1"):
             raise ValueError("NEWTON_REDUCER_EXPORT_CLEANUP must be 0 or 1")
         cleanup_writer_supported = contact_writer_warp_func is None
-        if export_cleanup == "1" and not cleanup_writer_supported:
+        if not cleanup_writer_supported:
             from ..sim.collide import write_contact as cleanup_stock_writer  # noqa: PLC0415
 
             cleanup_writer_supported = contact_writer_warp_func is cleanup_stock_writer
@@ -2647,6 +2651,35 @@ class NarrowPhase:
             and not self._heightfield_finite_query
             and not self._heightfield_pair_csr_requested
         )
+        if contact_export not in (None, "auto", "tiled", "compact"):
+            raise ValueError(f"contact_export must be 'auto', 'tiled', 'compact' or None, got {contact_export!r}")
+        self.contact_export = contact_export
+        compact_supported = (
+            wp.get_device(device).is_cuda
+            and reduce_contacts
+            and (has_meshes or has_heightfields)
+            and not deterministic
+            and not self._heightfield_pair_csr_requested
+        )
+        if contact_export is None:
+            compact_export = os.environ.get("NEWTON_REDUCER_COMPACT_EXPORT", "0")
+            if compact_export not in ("0", "1"):
+                raise ValueError("NEWTON_REDUCER_COMPACT_EXPORT must be 0 or 1")
+            self._reducer_compact_export = compact_export == "1" and compact_supported
+        else:
+            compact_supported = (
+                compact_supported
+                and cleanup_writer_supported
+                and not speculative
+                and hydroelastic_sdf is None
+                and not self._heightfield_finite_query
+            )
+            if contact_export == "compact" and not compact_supported:
+                raise ValueError(
+                    "contact_export='compact' requires a CUDA mesh/heightfield reducer with a stock writer, "
+                    "without deterministic, speculative, hydroelastic or alternate heightfield export"
+                )
+            self._reducer_compact_export = contact_export != "tiled" and compact_supported
         self._finite_bounds = None
         self._finite_source = None
         self.mesh_sdf_texture_only = mesh_sdf_texture_only
@@ -2847,7 +2880,7 @@ class NarrowPhase:
             # Global contact reducer uses hardcoded BETA_THRESHOLD (0.1mm) same as shared-memory reduction
             # Slot layout: NUM_SPATIAL_DIRECTIONS spatial + 1 max-depth = VALUES_PER_KEY slots per key
             self.export_reduced_contacts_kernel = create_export_reduced_contacts_kernel(
-                writer_func, clear_after_export=self._reducer_export_cleanup
+                writer_func, clear_after_export=self._reducer_export_cleanup, compact=self._reducer_compact_export
             )
             # Global contact reducer for all mesh contact types
             self.global_contact_reducer = GlobalContactReducer(
@@ -3824,6 +3857,9 @@ class NarrowPhase:
                     1,
                     EXPORT_REDUCED_CONTACTS_THREAD_BUDGET_MULTIPLIER * self.total_num_threads // effective_block_dim,
                 )
+                if self._reducer_compact_export:
+                    # The compact kernel strides by threads rather than blocks.
+                    export_num_blocks = self.total_num_threads
                 export_inputs = [
                     self.global_contact_reducer.hashtable.keys,
                     self.global_contact_reducer.ht_values,
@@ -3859,14 +3895,15 @@ class NarrowPhase:
                         block_dim=EXPORT_REDUCED_CONTACTS_BLOCK_DIM,
                         record_tape=False,
                     )
-                wp.launch_tiled(
+                export_launch = wp.launch if self._reducer_compact_export else wp.launch_tiled
+                export_launch(
                     kernel=self._pair_csr.fallback_export
                     if self._heightfield_pair_csr
                     else self.export_reduced_contacts_kernel,
                     dim=export_num_blocks,
                     inputs=export_inputs,
                     device=device,
-                    block_dim=EXPORT_REDUCED_CONTACTS_BLOCK_DIM,
+                    block_dim=self.block_dim if self._reducer_compact_export else EXPORT_REDUCED_CONTACTS_BLOCK_DIM,
                     record_tape=False,
                 )
         if self.hydroelastic_sdf is not None:

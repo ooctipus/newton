@@ -2151,6 +2151,33 @@ def write_contact_to_reducer(
 
 
 @wp.func
+def _duplicate_bit_for_winners(
+    slot_a: int,
+    slot_b: int,
+    value_a: wp.uint64,
+    value_b: wp.uint64,
+    position_depth: wp.array[wp.vec4],
+    normal: wp.array[wp.vec2],
+    contact_fingerprints: wp.array[wp.int32],
+    deterministic: int,
+) -> int:
+    """Suppress a repeated ID or the existing roundoff-equivalent loser."""
+    if value_a == wp.uint64(0) or value_b == wp.uint64(0):
+        return 0
+
+    contact_a = unpack_contact_id(value_a, deterministic)
+    contact_b = unpack_contact_id(value_b, deterministic)
+    if contact_a == contact_b:
+        return 1 << slot_b
+    if not _contacts_are_numerically_equivalent(contact_a, contact_b, position_depth, normal):
+        return 0
+
+    if contact_fingerprints[contact_b] < contact_fingerprints[contact_a]:
+        return 1 << slot_a
+    return 1 << slot_b
+
+
+@wp.func
 def _roundoff_duplicate_bit_for_slot_pair(
     pair_idx: int,
     entry_idx: int,
@@ -2161,31 +2188,24 @@ def _roundoff_duplicate_bit_for_slot_pair(
     contact_fingerprints: wp.array[wp.int32],
     deterministic: int,
 ) -> int:
-    """Return the slot bit to suppress for one pair, or zero."""
+    """Return the suppression bit for one triangularly indexed slot pair."""
     slot_b = int(1)
     while pair_idx >= slot_b:
         pair_idx = pair_idx - slot_b
         slot_b = slot_b + 1
-    slot_a = pair_idx
-
-    value_a = ht_values[slot_a * ht_capacity + entry_idx]
-    value_b = ht_values[slot_b * ht_capacity + entry_idx]
-    if value_a == wp.uint64(0) or value_b == wp.uint64(0):
-        return 0
-
-    contact_a = unpack_contact_id(value_a, deterministic)
-    contact_b = unpack_contact_id(value_b, deterministic)
-    if contact_a == contact_b:
-        return 0
-    if not _contacts_are_numerically_equivalent(contact_a, contact_b, position_depth, normal):
-        return 0
-
-    if contact_fingerprints[contact_b] < contact_fingerprints[contact_a]:
-        return 1 << slot_a
-    return 1 << slot_b
+    return _duplicate_bit_for_winners(
+        pair_idx,
+        slot_b,
+        ht_values[pair_idx * ht_capacity + entry_idx],
+        ht_values[slot_b * ht_capacity + entry_idx],
+        position_depth,
+        normal,
+        contact_fingerprints,
+        deterministic,
+    )
 
 
-def create_export_reduced_contacts_kernel(writer_func: Any, *, clear_after_export: bool = False):
+def create_export_reduced_contacts_kernel(writer_func: Any, *, clear_after_export: bool = False, compact: bool = False):
     """Create a tiled kernel that exports globally reduced contacts.
 
     One thread block processes each active hashtable entry. Its first 21 lanes
@@ -2201,11 +2221,16 @@ def create_export_reduced_contacts_kernel(writer_func: Any, *, clear_after_expor
             and failure counters until the next collision resets them. Callers
             must finish reduction before export and must not reuse its winners.
             Standalone export remains nondestructive by default.
+        compact: Use one ordinary thread per active key, reusing its seven
+            winners locally. This experimental mapping requires ``wp.launch``
+            and a thread count in place of the tiled mapping's block count.
     """
     exported_ids_vec = wp.types.vector(length=VALUES_PER_KEY, dtype=wp.int32)
     _module = f"export_reduced_contacts_{writer_func.__name__}"
     if clear_after_export:
         _module += "_cleanup"
+    if compact:
+        _module += "_compact"
 
     @wp.func
     def export_contact_id(
@@ -2247,6 +2272,81 @@ def create_export_reduced_contacts_kernel(writer_func: Any, *, clear_after_expor
         contact_data.gap_sum = gap_sum
         contact_data.sort_sub_key = contact_fingerprints[contact_id]
         writer_func(contact_data, writer_data, -1)
+
+    if compact:
+        winner_values = wp.types.vector(length=VALUES_PER_KEY, dtype=wp.uint64)
+
+        @wp.kernel(enable_backward=False, module=_module)
+        def export_compact_contacts_kernel(
+            ht_keys: wp.array[wp.uint64],
+            ht_values: wp.array[wp.uint64],
+            ht_active_slots: wp.array[wp.int32],
+            position_depth: wp.array[wp.vec4],
+            normal: wp.array[wp.vec2],
+            shape_pairs: wp.array[wp.vec2i],
+            contact_fingerprints: wp.array[wp.int32],
+            exported_flags: wp.array[wp.int32],
+            shape_types: wp.array[int],
+            shape_data: wp.array[wp.vec4],
+            shape_gap: wp.array[float],
+            writer_data: Any,
+            total_num_threads: int,
+            parallel_pairs: int,
+            deterministic: int,
+        ):
+            tid = wp.tid()
+            ht_capacity = ht_keys.shape[0]
+            num_active = ht_active_slots[ht_capacity]
+            for active_idx in range(tid, num_active, total_num_threads):
+                entry_idx = ht_active_slots[active_idx]
+                values = winner_values()
+                for slot in range(wp.static(VALUES_PER_KEY)):
+                    values[slot] = ht_values[slot * ht_capacity + entry_idx]
+
+                duplicate_mask = int(0)
+                for slot_b in range(1, wp.static(VALUES_PER_KEY)):
+                    # An early continue keeps this fixed loop dynamic in Warp,
+                    # forcing the winner vector into local memory.
+                    if values[slot_b] != wp.uint64(0):
+                        for slot_a in range(slot_b):
+                            duplicate_mask = duplicate_mask | _duplicate_bit_for_winners(
+                                slot_a,
+                                slot_b,
+                                values[slot_a],
+                                values[slot_b],
+                                position_depth,
+                                normal,
+                                contact_fingerprints,
+                                deterministic,
+                            )
+
+                for slot in range(wp.static(VALUES_PER_KEY)):
+                    value = values[slot]
+                    if value != wp.uint64(0) and duplicate_mask & (1 << slot) == 0:
+                        contact_id = unpack_contact_id(value, deterministic)
+                        if contact_id != 0:
+                            export_contact_id(
+                                contact_id,
+                                position_depth,
+                                normal,
+                                shape_pairs,
+                                contact_fingerprints,
+                                exported_flags,
+                                shape_types,
+                                shape_data,
+                                shape_gap,
+                                writer_data,
+                            )
+
+                if wp.static(clear_after_export):
+                    # Active keys are unique; this thread has finished all
+                    # winner reads. Cross-key claims retain their raw payload.
+                    for slot in range(wp.static(VALUES_PER_KEY)):
+                        if values[slot] != wp.uint64(0):
+                            ht_values[slot * ht_capacity + entry_idx] = wp.uint64(0)
+                    ht_keys[entry_idx] = HASHTABLE_EMPTY_KEY
+
+        return export_compact_contacts_kernel
 
     @wp.kernel(enable_backward=False, module=_module)
     def export_reduced_contacts_kernel(
