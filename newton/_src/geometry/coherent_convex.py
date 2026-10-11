@@ -257,13 +257,15 @@ class _ConvexQueryCache:
         if np.any(pairs < 0) or np.any(pairs >= len(shape_types)) or np.any(pairs[:, 0] >= pairs[:, 1]):
             raise ValueError("coherent convex cache requires valid canonical shape IDs (a < b)")
         keys = (pairs[:, 0].astype(np.uint64) << np.uint64(32)) | pairs[:, 1].astype(np.uint64)
-        if len(np.unique(keys)) != len(keys):
+        # One sort validates duplicates and orders device lookup. Hashing packed
+        # keys can degrade badly on replicated explicit-pair patterns.
+        order = np.argsort(keys)
+        pairs, keys = pairs[order], keys[order]
+        if np.any(keys[1:] == keys[:-1]):
             raise ValueError("coherent convex cache requires unique ordered pairs")
         supported = np.isin(shape_types, [int(GeoType.BOX), int(GeoType.CONVEX_MESH)])
         selected = supported[pairs[:, 0]] & supported[pairs[:, 1]]
         pairs, keys = pairs[selected], keys[selected]
-        order = np.argsort(keys)
-        pairs, keys = pairs[order], keys[order]
         worlds_a, worlds_b = shape_world[pairs[:, 0]], shape_world[pairs[:, 1]]
         if np.any((worlds_a >= 0) & (worlds_b >= 0) & (worlds_a != worlds_b)):
             raise ValueError("coherent convex cache refuses cross-world pairs")

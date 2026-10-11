@@ -184,6 +184,21 @@ class TestConvexRejectionCache(unittest.TestCase):
         np.testing.assert_array_equal(cache.data.world.numpy(), [0, 0])
         np.testing.assert_array_equal(cache.data.keys.numpy(), [1, (1 << 32) | 2])
 
+        mixed = metadata | {
+            "pairs": np.array([[4, 5], [0, 3], [6, 7], [1, 2]], dtype=np.int32),
+            "shape_types": np.array([GeoType.BOX, GeoType.SPHERE, GeoType.SPHERE] + [GeoType.BOX] * 5),
+            "shape_world": np.array([0, 0, 0, -1, 1, 1, -1, -1]),
+            "world_count": 2,
+            "query_capacity": 4,
+        }
+        cache = _ConvexQueryCache(**mixed)
+        np.testing.assert_array_equal(cache.data.keys.numpy(), [3, (4 << 32) | 5, (6 << 32) | 7])
+        np.testing.assert_array_equal(cache.data.world.numpy(), [0, 1, 2])
+        with self.assertRaisesRegex(ValueError, "unique ordered pairs"):
+            _ConvexQueryCache(**(mixed | {"pairs": np.array([[1, 2], [1, 2]])}))
+        cache = _ConvexQueryCache(**(mixed | {"pairs": np.empty((0, 2), dtype=np.int32)}))
+        self.assertEqual(cache.data.keys.shape[0], 0)
+
     def test_graph_owned_cache_lease(self):
         """Keep one capture lineage and release it before another graph owns the cache."""
         cache = _ConvexQueryCache.__new__(_ConvexQueryCache)
