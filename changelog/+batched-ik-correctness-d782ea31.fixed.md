@@ -1,0 +1,1 @@
+Recompute analytic IK Jacobians at the retained configuration after rejected Levenberg–Marquardt steps, respect minimum damping after accepted steps, and preserve nonfinite residuals during sparse normal-equation reductions.

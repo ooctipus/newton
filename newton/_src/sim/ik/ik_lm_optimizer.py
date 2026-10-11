@@ -18,6 +18,15 @@ from ..model import Model
 from .ik_common import IKJacobianType, IKSolveResult, compute_costs, eval_fk_batched, fk_accum, mean_cost
 from .ik_objectives import IKObjective
 
+_LM_SPLIT_ROWS = 128
+
+
+def _lm_split_count(n_dofs: int, n_residuals: int, is_cuda: bool) -> int:
+    """Return the parallel row chunks for tall, narrow CUDA normal equations."""
+    return (
+        (n_residuals + _LM_SPLIT_ROWS - 1) // _LM_SPLIT_ROWS if is_cuda and n_dofs <= 32 and n_residuals >= 512 else 0
+    )
+
 
 @dataclass(slots=True)
 class BatchCtx:
@@ -62,7 +71,10 @@ def _lm_tiled_solve_fits(n_dofs: int, n_residuals: int, available_bytes: int | N
 
 
 def _lm_global_workspace_bytes(n_batch: int, n_dofs: int, n_residuals: int, available_shared_bytes: int | None) -> int:
-    """Return global workspace needed when the fused LM solve cannot launch [byte]."""
+    """Return global workspace for split reductions or oversized systems [byte]."""
+    split_count = _lm_split_count(n_dofs, n_residuals, available_shared_bytes is not None)
+    if split_count:
+        return 4 * n_batch * split_count * (n_dofs * n_dofs + n_dofs)
     if _lm_tiled_solve_fits(n_dofs, n_residuals, available_shared_bytes):
         return 0
     return 4 * (n_batch * (n_dofs * n_dofs + n_dofs) + n_dofs)
@@ -105,7 +117,7 @@ def _update_lm_state(
         for i in range(num_residuals):
             residuals_current[row, i] = residuals_proposed[row, i]
         costs[row] = costs_proposed[row]
-        lambda_values[row] = lambda_values[row] / lambda_factor
+        lambda_values[row] = wp.clamp(lambda_values[row] / lambda_factor, lambda_min, lambda_max)
     else:
         new_lambda = lambda_values[row] * lambda_factor
         lambda_values[row] = wp.clamp(new_lambda, lambda_min, lambda_max)
@@ -334,7 +346,13 @@ class IKOptimizerLM:
         self.lambda_values = wp.zeros(self.n_batch, dtype=wp.float32, device=device)
         self.accept_flags = wp.zeros(self.n_batch, dtype=wp.int32, device=device)
         self.pred_reduction = wp.zeros(self.n_batch, dtype=wp.float32, device=device)
-        if self.USE_TILED_SOLVE:
+        if self.USE_SPLIT_SOLVE:
+            self._lm_normal_matrix = wp.empty(
+                (self.n_batch, self.SPLIT_COUNT, self.n_dofs, self.n_dofs), dtype=wp.float32, device=device
+            )
+            self._lm_gradient = wp.empty((self.n_batch, self.SPLIT_COUNT, self.n_dofs), dtype=wp.float32, device=device)
+            self._lm_zero_diagonal = None
+        elif self.USE_TILED_SOLVE:
             self._lm_normal_matrix = None
             self._lm_gradient = None
             self._lm_zero_diagonal = None
@@ -537,6 +555,9 @@ class IKOptimizerLM:
         if not accumulate:
             ctx.jacobian_out.zero_()
 
+        # Trial residuals overwrite FK even when LM rejects the trial. Always
+        # linearize at the retained coordinates, not the last proposed pose.
+        self._fk_two_pass(self.model, ctx.joint_q, ctx.fk_body_q, ctx.fk_X_local, ctx.joint_q.shape[0])
         self._compute_motion_subspace(
             joint_q_in=ctx.joint_q,
             body_q=ctx.fk_body_q,
@@ -967,6 +988,67 @@ class IKOptimizerLM:
         _template.__qualname__ = f"_lm_solve_tiled_{C}_{R}"
         _lm_solve_tiled = wp.kernel(enable_backward=False, module="unique")(_template)
 
+        def _partial_template(
+            jacobians: wp.array3d[wp.float32],
+            residuals: wp.array3d[wp.float32],
+            normal_matrix: wp.array4d[wp.float32],
+            gradient: wp.array3d[wp.float32],
+        ):
+            row, chunk = wp.tid()
+            DOF = _Specialized.TILE_N_DOFS
+            ROWS = _Specialized.SPLIT_ROWS
+            J = wp.tile_load(jacobians[row], shape=(ROWS, DOF), offset=(chunk * ROWS, 0))
+            r = wp.tile_load(residuals[row], shape=(ROWS, 1), offset=(chunk * ROWS, 0))
+            Jt = wp.tile_transpose(J)
+            normal = wp.tile_zeros(shape=(DOF, DOF), dtype=wp.float32)
+            g2d = wp.tile_zeros(shape=(DOF, 1), dtype=wp.float32)
+            # Inactive contact rows are exactly zero. Keep NaNs on the ordinary
+            # arithmetic path so an invalid Jacobian can never masquerade as zero.
+            if wp.tile_sum(wp.tile_map(wp.abs, J))[0] != 0.0 or not wp.isfinite(wp.tile_sum(wp.tile_map(wp.abs, r))[0]):
+                normal = wp.tile_matmul(Jt, J)
+                g2d = wp.tile_matmul(Jt, r)
+            g = wp.tile_zeros(shape=(DOF,), dtype=wp.float32)
+            for i in range(DOF):
+                g[i] = g2d[i, 0]
+            wp.tile_store(normal_matrix[row, chunk], normal)
+            wp.tile_store(gradient[row, chunk], g)
+
+        _partial_template.__name__ = f"_lm_partial_normal_equations_{C}_{R}"
+        _partial_template.__qualname__ = _partial_template.__name__
+        _lm_partial_normal_equations = wp.kernel(enable_backward=False, module="unique")(_partial_template)
+
+        def _finish_template(
+            normal_matrix: wp.array4d[wp.float32],
+            gradient: wp.array3d[wp.float32],
+            lambda_values: wp.array[wp.float32],
+            dq_dof: wp.array2d[wp.float32],
+            pred_reduction_out: wp.array[wp.float32],
+        ):
+            row = wp.tid()
+            DOF = _Specialized.TILE_N_DOFS
+            normal = wp.tile_zeros(shape=(DOF, DOF), dtype=wp.float32)
+            g = wp.tile_zeros(shape=(DOF,), dtype=wp.float32)
+            for chunk in range(_Specialized.SPLIT_COUNT):
+                normal = wp.tile_map(wp.add, normal, wp.tile_load(normal_matrix[row, chunk], shape=(DOF, DOF)))
+                g = wp.tile_map(wp.add, g, wp.tile_load(gradient[row, chunk], shape=(DOF,)))
+            diag = wp.tile_zeros(shape=(DOF,), dtype=wp.float32)
+            for i in range(DOF):
+                diag[i] = lambda_values[row]
+            normal = wp.tile_diag_add(normal, diag)
+            delta = wp.tile_map(wp.neg, g)
+            wp.tile_cholesky_inplace(normal)
+            wp.tile_cholesky_solve_inplace(normal, delta)
+            wp.tile_store(dq_dof[row], delta)
+            lambda_delta = wp.tile_zeros(shape=(DOF,), dtype=wp.float32)
+            for i in range(DOF):
+                lambda_delta[i] = lambda_values[row] * delta[i]
+            diff = wp.tile_map(wp.sub, lambda_delta, g)
+            pred_reduction_out[row] = 0.5 * wp.tile_sum(wp.tile_map(wp.mul, delta, diff))[0]
+
+        _finish_template.__name__ = f"_lm_solve_partial_normal_equations_{C}_{R}"
+        _finish_template.__qualname__ = _finish_template.__name__
+        _lm_solve_partial_normal_equations = wp.kernel(enable_backward=False, module="unique")(_finish_template)
+
         # late-import jcalc_* helpers to avoid circular import error
         from ...sim.articulation import (  # noqa: PLC0415
             jcalc_motion_subspace,
@@ -1232,6 +1314,11 @@ class IKOptimizerLM:
             # Large Jacobians need several warps to use their shared-memory allocation.
             TILE_THREADS = wp.constant(256 if arch and C * R >= 4096 else 32)
             USE_TILED_SOLVE = use_tiled_solve
+            # Tall, narrow Jacobians otherwise consume nearly all shared memory
+            # in one block. Independent row chunks expose much more parallel work.
+            SPLIT_COUNT = wp.constant(_lm_split_count(C, R, bool(arch)))
+            SPLIT_ROWS = wp.constant(_LM_SPLIT_ROWS)
+            USE_SPLIT_SOLVE = SPLIT_COUNT > 0
 
             def _solve_normal_equations(
                 self,
@@ -1241,6 +1328,24 @@ class IKOptimizerLM:
                 dq: wp.array2d[wp.float32],
                 pred: wp.array[wp.float32],
             ) -> None:
+                if self.USE_SPLIT_SOLVE:
+                    wp.launch_tiled(
+                        _lm_partial_normal_equations,
+                        dim=(jac.shape[0], self.SPLIT_COUNT),
+                        inputs=[jac, res],
+                        outputs=[self._lm_normal_matrix, self._lm_gradient],
+                        block_dim=128,
+                        device=self.device,
+                    )
+                    wp.launch_tiled(
+                        _lm_solve_partial_normal_equations,
+                        dim=jac.shape[0],
+                        inputs=[self._lm_normal_matrix, self._lm_gradient, lam],
+                        outputs=[dq, pred],
+                        block_dim=32,
+                        device=self.device,
+                    )
+                    return
                 if self.USE_TILED_SOLVE:
                     wp.launch_tiled(
                         _lm_solve_tiled,

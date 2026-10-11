@@ -318,6 +318,28 @@ def test_solve_converges_without_restarting(test, device):
         test.assertLess(result.final_mean_cost, result.initial_mean_cost)
 
 
+def test_solve_respects_minimum_damping_after_accepted_steps(test, device):
+    with wp.ScopedDevice(device):
+        model = _build_two_link_planar(device)
+        initial = np.array([[0.2, 0.5]], dtype=np.float32)
+        target = np.array([[1.5, 1.0, 0.0]], dtype=np.float32)
+        objective = ik.IKObjectivePosition(1, wp.vec3(0.5, 0.0, 0.0), wp.array(target, dtype=wp.vec3))
+        solver = ik.IKSolver(
+            model, 1, [objective], lambda_initial=1.0, lambda_min=0.75, jacobian_mode=ik.IKJacobianType.ANALYTIC
+        )
+        expected = initial[0].astype(np.float64)
+        for damping in (1.0, 0.75):
+            a, b = expected
+            residual = np.array([np.cos(a) + np.cos(a + b), np.sin(a) + np.sin(a + b)]) - target[0, :2]
+            jacobian = np.array(
+                [[-np.sin(a) - np.sin(a + b), -np.sin(a + b)], [np.cos(a) + np.cos(a + b), np.cos(a + b)]]
+            )
+            expected += np.linalg.solve(jacobian.T @ jacobian + damping * np.eye(2), -jacobian.T @ residual)
+        q = wp.array(initial)
+        solver.solve(q, q, max_iterations=2, convergence_tolerance=None)
+        assert_np_equal(q.numpy(), expected[None], tol=1.0e-5)
+
+
 def test_solve_projection_uses_declared_intervals(test, device):
     with wp.ScopedDevice(device):
         n_problems = 1
@@ -354,6 +376,29 @@ def test_solve_projection_uses_declared_intervals(test, device):
         test.assertEqual(projected_at, [1, 2])
         test.assertAlmostEqual(result.final_mean_cost, result.initial_mean_cost, places=6)
         assert_np_equal(joint_q.numpy(), np.zeros_like(joint_q.numpy()), tol=0.0)
+
+
+def test_solve_rejected_step_relinearizes_at_retained_pose(test, device):
+    """Rejecting a trial must not leave its transforms in the next analytic Jacobian."""
+    with wp.ScopedDevice(device):
+        model = _build_two_link_planar(device)
+        initial = np.array([[0.08086459, -0.08343891]], dtype=np.float32)
+        target = np.array([[0.63854444, -0.26508057, 0.0]], dtype=np.float32)
+        objective = ik.IKObjectivePosition(1, wp.vec3(0.5, 0.0, 0.0), wp.array(target, dtype=wp.vec3))
+        solver = ik.IKSolver(model, 1, [objective], lambda_initial=1.0e-4, jacobian_mode=ik.IKJacobianType.ANALYTIC)
+        q_in = wp.array(initial)
+        q_out = wp.empty_like(q_in)
+        solver.solve(q_in, q_out, max_iterations=1, convergence_tolerance=None)
+        assert_np_equal(q_out.numpy(), initial, tol=0.0)
+
+        # The first trial is rejected. The next trial uses twice the damping
+        # and the unchanged pose. Derive its Jacobian from planar arm geometry.
+        a, b = initial[0].astype(np.float64)
+        residual = np.array([np.cos(a) + np.cos(a + b), np.sin(a) + np.sin(a + b)]) - target[0, :2]
+        jacobian = np.array([[-np.sin(a) - np.sin(a + b), -np.sin(a + b)], [np.cos(a) + np.cos(a + b), np.cos(a + b)]])
+        delta = np.linalg.solve(jacobian.T @ jacobian + 2.0e-4 * np.eye(2), -jacobian.T @ residual)
+        solver.solve(q_in, q_out, max_iterations=2, convergence_tolerance=None)
+        assert_np_equal(q_out.numpy(), initial + delta[None], tol=3.0e-3)
 
 
 def test_solve_active_prefix_ignores_padded_tail(test, device, mode: ik.IKJacobianType):
@@ -1098,6 +1143,13 @@ class TestIKModes(unittest.TestCase):
     pass
 
 
+add_function_test(
+    TestIKModes,
+    "test_solve_respects_minimum_damping_after_accepted_steps",
+    test_solve_respects_minimum_damping_after_accepted_steps,
+    cuda_devices,
+)
+
 # Planar REV-REV convergence
 add_function_test(TestIKModes, "test_convergence_autodiff", test_convergence_autodiff, devices)
 add_function_test(TestIKModes, "test_convergence_analytic", test_convergence_analytic, devices)
@@ -1107,6 +1159,12 @@ add_function_test(
 )
 add_function_test(
     TestIKModes, "test_solve_projection_uses_declared_intervals", test_solve_projection_uses_declared_intervals, devices
+)
+add_function_test(
+    TestIKModes,
+    "test_solve_rejected_step_relinearizes_at_retained_pose",
+    test_solve_rejected_step_relinearizes_at_retained_pose,
+    cuda_devices,
 )
 for mode in ik.IKJacobianType:
     add_function_test(

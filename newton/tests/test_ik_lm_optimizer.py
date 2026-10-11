@@ -38,18 +38,24 @@ def _build_revolute_chain(n_dofs: int, device: wp.Device) -> newton.Model:
     return builder.finalize(device=device, requires_grad=True)
 
 
-def test_lm_tiled_solve_matches_dense(test, device, n_dofs, n_residuals):
+def test_lm_tiled_solve_matches_dense(test, device, n_dofs, n_residuals, zero_blocks=False):
     """Wide articulation and tall contact systems must match a dense reference solve."""
     with wp.ScopedDevice(device):
         batch = 2
         rng = np.random.default_rng(42)
         jacobian_np = rng.normal(size=(batch, n_residuals, n_dofs)).astype(np.float32)
+        if zero_blocks:
+            jacobian_np[0, :256] = 0
+            jacobian_np[1] = 0
         residuals_np = rng.normal(size=(batch, n_residuals, 1)).astype(np.float32)
         lambda_np = np.array([0.1, 0.3], dtype=np.float32)
 
         optimizer_type = IKOptimizerLM._build_specialized((n_dofs, n_residuals, device.arch, True))
         optimizer = object.__new__(optimizer_type)
         optimizer.device = device
+        if optimizer.USE_SPLIT_SOLVE:
+            optimizer._lm_normal_matrix = wp.empty((batch, optimizer.SPLIT_COUNT, n_dofs, n_dofs), device=device)
+            optimizer._lm_gradient = wp.empty((batch, optimizer.SPLIT_COUNT, n_dofs), device=device)
         jacobian = wp.array(jacobian_np, dtype=wp.float32, device=device)
         residuals = wp.array(residuals_np, dtype=wp.float32, device=device)
         lambda_values = wp.array(lambda_np, dtype=wp.float32, device=device)
@@ -68,6 +74,14 @@ def test_lm_tiled_solve_matches_dense(test, device, n_dofs, n_residuals):
 
         assert_np_equal(delta.numpy(), expected_delta, tol=2.0e-4)
         assert_np_equal(predicted_reduction.numpy(), expected_reduction, tol=2.0e-4)
+
+        if zero_blocks:
+            # Zero Jacobian rows must not conceal an invalid residual.
+            residuals_np[1, 0, 0] = np.nan
+            residuals.assign(residuals_np)
+            optimizer._solve_normal_equations(jacobian, residuals, lambda_values, delta, predicted_reduction)
+            test.assertTrue(np.isnan(delta.numpy()[1]).all())
+            test.assertTrue(np.isnan(predicted_reduction.numpy()[1]))
 
 
 def test_lm_global_solve_matches_tiled(test, device):
@@ -106,6 +120,12 @@ def test_lm_global_solve_matches_tiled(test, device):
         assert_np_equal(outputs[1][1], outputs[0][1], tol=2.0e-4)
 
 
+def test_lm_split_specializations_keep_independent_residual_counts(test, device):
+    """Successive tall systems must use their own chunk counts and retain incomplete tail rows."""
+    for residuals in (651, 1267):
+        test_lm_tiled_solve_matches_dense(test, device, n_dofs=18, n_residuals=residuals, zero_blocks=residuals == 1267)
+
+
 def test_lm_oversized_global_solve_matches_dense_reference(test, device):
     """An automatically oversized LM system must use global memory and remain accurate."""
     with wp.ScopedDevice(device):
@@ -140,16 +160,18 @@ def test_lm_oversized_global_solve_matches_dense_reference(test, device):
         test.assertAlmostEqual(predicted_reduction.numpy()[0], expected_reduction, places=4)
 
 
-def test_lm_global_workspace_memory_estimate_matches_allocations(test, device):
+def test_lm_global_workspace_memory_estimate_matches_allocations(test, device, n_dofs=160):
     """The public estimate must include every fallback workspace allocation."""
     with wp.ScopedDevice(device):
         n_problems = 2
-        model = _build_revolute_chain(160, device)
+        model = _build_revolute_chain(n_dofs, device)
         targets = wp.zeros(n_problems, dtype=wp.vec3, device=device)
-        objective = ik.IKObjectivePosition(model.body_count - 1, wp.vec3(), targets)
-        estimate = ik.IKSolver.estimate_memory(model, n_problems, [objective], jacobian_mode=ik.IKJacobianType.ANALYTIC)
-        solver = ik.IKSolver(model, n_problems, [objective], jacobian_mode=ik.IKJacobianType.ANALYTIC)
-        test.assertFalse(solver._impl.USE_TILED_SOLVE)
+        objectives = [
+            ik.IKObjectivePosition(model.body_count - 1, wp.vec3(), targets) for _ in range(171 if n_dofs == 18 else 1)
+        ]
+        estimate = ik.IKSolver.estimate_memory(model, n_problems, objectives, jacobian_mode=ik.IKJacobianType.ANALYTIC)
+        solver = ik.IKSolver(model, n_problems, objectives, jacobian_mode=ik.IKJacobianType.ANALYTIC)
+        test.assertTrue(solver._impl.USE_SPLIT_SOLVE or not solver._impl.USE_TILED_SOLVE)
 
         arrays = {}
 
@@ -163,7 +185,7 @@ def test_lm_global_workspace_memory_estimate_matches_allocations(test, device):
                 for item in value:
                     add_arrays(item)
 
-        for owner in (solver, solver._impl, objective):
+        for owner in (solver, solver._impl, *objectives):
             for value in vars(owner).values():
                 add_arrays(value)
         arrays.pop((str(targets.device), targets.ptr))
@@ -197,11 +219,9 @@ add_function_test(
 )
 add_function_test(
     TestIKOptimizerLM,
-    "test_lm_tiled_solve_18_by_1267",
-    test_lm_tiled_solve_matches_dense,
+    "test_lm_split_specializations_keep_independent_residual_counts",
+    test_lm_split_specializations_keep_independent_residual_counts,
     cuda_devices[:1],
-    n_dofs=18,
-    n_residuals=1267,
 )
 add_function_test(
     TestIKOptimizerLM,
@@ -214,6 +234,13 @@ add_function_test(
     "test_lm_global_workspace_memory_estimate_matches_allocations",
     test_lm_global_workspace_memory_estimate_matches_allocations,
     cuda_devices[:1],
+)
+add_function_test(
+    TestIKOptimizerLM,
+    "test_lm_split_workspace_memory_estimate_matches_allocations",
+    test_lm_global_workspace_memory_estimate_matches_allocations,
+    cuda_devices[:1],
+    n_dofs=18,
 )
 add_function_test(
     TestIKOptimizerLM,
