@@ -3,6 +3,7 @@
 
 """Exercise public automatic choices and forced implementation contracts."""
 
+import os
 import unittest
 from unittest.mock import patch
 
@@ -11,7 +12,7 @@ import warp as wp
 
 import newton
 from newton.solvers import SolverFeatherPGS
-from newton.tests.test_feather_pgs_sparse_solver import _build_model
+from newton.tests.test_feather_pgs_sparse_solver import _build_model, _make_solver
 
 
 def _cpu_model():
@@ -22,6 +23,92 @@ def _cpu_model():
 
 
 class TestFeatherPGSPathSelection(unittest.TestCase):
+    def test_cached_dynamics_cpu_choices(self):
+        """Keep CPU auto ordinary and reject a forced unsupported cache."""
+        model = _cpu_model()
+        for choice in ("auto", "off"):
+            selected = SolverFeatherPGS(model, cached_dynamics=choice).get_path_selection()
+            self.assertEqual(selected["requested"]["cached_dynamics"], choice)
+            self.assertEqual(selected["cached_dynamics"], "off")
+            self.assertEqual(selected["publication"], "ordinary")
+        for choice in ("on", "typo"):
+            with self.subTest(choice=choice), self.assertRaisesRegex(ValueError, "cached_dynamics"):
+                SolverFeatherPGS(model, cached_dynamics=choice)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
+    def test_cached_dynamics_overrides_environment_and_dense_conflicts(self):
+        """Honor explicit cache choices and retain automatic dense kernel requests."""
+        model = _build_model()
+        for choice, legacy, expected in (("on", "0", True), ("off", "1", False), ("auto", "0", False)):
+            with self.subTest(choice=choice), patch.dict(os.environ, {"FEATHER_PGS_TREE_KINETIC_STATE": legacy}):
+                solver = _make_solver(model, True, cached_dynamics=choice)
+                selected = solver.get_path_selection()
+                self.assertEqual(solver._tree_kinetic_state is not None, expected)
+                self.assertEqual(selected["cached_dynamics"], "on" if expected else "off")
+                self.assertEqual(selected["publication"], "cached" if expected else "ordinary")
+        with self.assertRaisesRegex(ValueError, "cached_dynamics.*conflicts"):
+            _make_solver(model, False, cached_dynamics="on", trisolve_kernel="loop")
+        solver = _make_solver(model, False, cached_dynamics="auto", trisolve_kernel="loop")
+        self.assertEqual(solver.get_path_selection()["cached_dynamics"], "off")
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
+    def test_cached_dynamics_rejects_incomplete_held_layout(self):
+        """Fall back when factor dimensions fit a cache but physical ownership does not."""
+        world = newton.ModelBuilder()
+        joints = []
+        parent = -1
+        for index in range(5):
+            body = world.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+            if index in (0, 4):
+                joint = world.add_joint_fixed(parent, body)
+            else:
+                joint = world.add_joint_revolute(parent, body, armature=0.01)
+            joints.append(joint)
+            parent = body
+        world.add_articulation(joints)
+        body = world.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        world.add_articulation([world.add_joint_free(body)])
+        builder = newton.ModelBuilder()
+        builder.replicate(world, 2)
+        model = builder.finalize(device="cuda:0")
+        solver = _make_solver(model, False, cached_dynamics="auto", friction_anchor_beta=0.0)
+        self.assertEqual(solver.get_path_selection()["cached_dynamics"], "off")
+        with self.assertRaisesRegex(ValueError, "cached_dynamics"):
+            _make_solver(model, False, cached_dynamics="on", friction_anchor_beta=0.0)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
+    def test_cached_dynamics_contact_graph_and_reset(self):
+        """Preserve contacting states through graph replay and a partial-world reset."""
+        model = _build_model()
+        outputs = []
+        for choice in ("off", "on"):
+            solver = _make_solver(model, True, cached_dynamics=choice)
+            state, output = model.state(), model.state()
+            newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+            pipeline = newton.CollisionPipeline(model, convex_collision="ordinary")
+            contacts, control = pipeline.contacts(), model.control()
+
+            def step(pipeline=pipeline, state=state, contacts=contacts, solver=solver, output=output, control=control):
+                pipeline.collide(state, contacts)
+                solver.step(state, output, control, contacts, 1.0 / 400.0)
+                state.assign(output)
+
+            step()
+            with wp.ScopedCapture(device=model.device) as capture:
+                step()
+            for _ in range(8):
+                wp.capture_launch(capture.graph)
+            solver.reset(state, world_mask=wp.array([True, False], dtype=wp.bool, device=model.device))
+            for _ in range(8):
+                wp.capture_launch(capture.graph)
+            solver.check_constraint_capacity()
+            self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
+            outputs.append(
+                {name: getattr(state, name).numpy() for name in ("joint_q", "joint_qd", "body_q", "body_qd")}
+            )
+        for name in outputs[0]:
+            np.testing.assert_allclose(outputs[0][name], outputs[1][name], atol=3e-4, rtol=3e-4, err_msg=name)
+
     def test_scalar_overrides_reach_solver(self):
         """Honor public choices independently of private test overrides."""
         choices = {

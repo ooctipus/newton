@@ -594,6 +594,16 @@ def _fingerprint(array):
     return value.shape, value.dtype.str, hashlib.sha256(value.tobytes()).digest()
 
 
+def create_owner(solver):
+    """Keep ordinary publication when a candidate layout fails full ownership checks."""
+    if not supported(solver):
+        return None
+    try:
+        return FrankaKineticState(solver)
+    except ValueError:
+        return None
+
+
 @wp.kernel(module="unique", enable_backward=False)
 def _compare_proof_words(current: wp.array[wp.uint32], frozen: wp.array[wp.uint32], mismatch: wp.array[int], bit: int):
     index = wp.tid()

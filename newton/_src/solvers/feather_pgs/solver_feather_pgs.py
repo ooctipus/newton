@@ -1519,6 +1519,7 @@ class SolverFeatherPGS(SolverBase):
         hinv_jt_kernel: Literal["auto", "tiled", "par_row"] = "auto",
         delassus_kernel: Literal["auto", "tiled", "par_row_col"] = "auto",
         sparse_mass_matrix: Literal["auto", "on", "off"] = "auto",
+        cached_dynamics: Literal["auto", "on", "off"] = "auto",
     ):
         """
         Args:
@@ -1532,6 +1533,13 @@ class SolverFeatherPGS(SolverBase):
                 admission, ``on`` requires admission, and ``off`` retains the ordinary representation.
                 This option does not enable research packed-factor owners. Incompatible forced choices
                 raise ValueError; this experimental selector may change without notice.
+            cached_dynamics: Experimental paired cached prediction and next-state publication.
+                ``auto`` selects a qualified cache for the current topology, factor and row policy;
+                unsupported cases use ordinary prediction/publication. ``on`` requires admission;
+                ``off`` disables these paired caches. Explicit choices override legacy cache
+                environment settings; ``auto`` retains those settings when present. Mixed held
+                factors require ``on`` or their legacy opt-in. Explicit dense kernels disable auto
+                and conflict with ``on``. Factor refresh intervals and numerical budgets are unchanged.
             contact_torsion_radius: Experimental effective spin radius [m], zero disables.
                 Explicit material/footprint assumption: for uniform pressure on a disk
                 of radius R, the effective radius is 2*R/3. Does not consume the generic
@@ -2056,6 +2064,7 @@ class SolverFeatherPGS(SolverBase):
             "delassus_kernel": delassus_kernel,
             "pgs_kernel": pgs_kernel,
             "sparse_mass_matrix": sparse_mass_matrix,
+            "cached_dynamics": cached_dynamics,
         }
         choices = {
             "cholesky_kernel": ("auto", "tiled", "loop"),
@@ -2064,6 +2073,7 @@ class SolverFeatherPGS(SolverBase):
             "delassus_kernel": ("auto", "tiled", "par_row_col"),
             "pgs_kernel": ("auto", "loop", "tiled_row", "tiled_contact", "streaming"),
             "sparse_mass_matrix": ("auto", "on", "off"),
+            "cached_dynamics": ("auto", "on", "off"),
         }
         cpu_choices = {
             "cholesky_kernel": "loop",
@@ -2072,6 +2082,7 @@ class SolverFeatherPGS(SolverBase):
             "delassus_kernel": "par_row_col",
             "pgs_kernel": "loop",
             "sparse_mass_matrix": "off",
+            "cached_dynamics": "off",
         }
         if pgs_mode != "matrix_free" and enable_joint_limits and pgs_kernel in ("tiled_contact", "streaming"):
             raise ValueError(f"pgs_kernel={pgs_kernel!r} is contact-only and cannot solve joint-limit rows")
@@ -2085,12 +2096,15 @@ class SolverFeatherPGS(SolverBase):
                 if self._requested_kernel_choices[name] != "auto":
                     raise ValueError(f"{name} is unused in matrix_free mode; use 'auto' or pgs_mode='split'")
         self.sparse_mass_matrix = sparse_mass_matrix
+        self.cached_dynamics = cached_dynamics
         self._explicit_dense_kernels = any(
             self._requested_kernel_choices[name] != "auto"
             for name in ("cholesky_kernel", "trisolve_kernel", "hinv_jt_kernel", "delassus_kernel")
         )
         if sparse_mass_matrix == "on" and self._explicit_dense_kernels:
             raise ValueError("sparse_mass_matrix='on' conflicts with explicit dense kernel choices; use 'auto'")
+        if cached_dynamics == "on" and self._explicit_dense_kernels:
+            raise ValueError("cached_dynamics='on' conflicts with explicit dense kernel choices; use 'auto'")
         if pgs_kernel == "auto":
             pgs_kernel = "loop" if model.device.is_cpu else "tiled_row"
 
@@ -3351,49 +3365,9 @@ class SolverFeatherPGS(SolverBase):
                 raise ValueError("Sparse factor excludes canonical factor/row debug readers")
             self._sparse_factor = create_sparse_factor(self)
 
-        self._kinetic_world = None
-        if (
-            self._sparse_mass_matrix_size is None
-            and self._point_contact_paths
-            and os.environ.get("FEATHER_PGS_KUKA_KINETIC_WORLD") == "1"
-        ):
-            from .kinetic_live_owner import create_owner as create_kinetic_owner  # noqa: PLC0415
+        from .cached_dynamics import install as install_cached_dynamics  # noqa: PLC0415
 
-            self._kinetic_world = create_kinetic_owner(self)
-
-        self._tree_kinetic_state = None
-        if self._sparse_factor is not None and os.environ.get("FEATHER_PGS_G1_KINETIC_STATE") == "1":
-            self._sparse_factor.install_kinetic_state()
-            self._tree_kinetic_state = self._sparse_factor.kinetic_state
-
-        # Preserve the existing capture marker for the original sparse consumer.
-        self._g1_kinetic_state = self._tree_kinetic_state
-        if self._tree_kinetic_state is None and os.environ.get("FEATHER_PGS_TREE_KINETIC_STATE", "1") == "1":
-            from .tree_kinetic_sparse import create_owner as create_tree_kinetic_state  # noqa: PLC0415
-
-            self._tree_kinetic_state = create_tree_kinetic_state(self)
-
-        self._franka_kinetic_state = None
-        if (
-            self._sparse_mass_matrix_size is None
-            and self._point_contact_paths
-            and os.environ.get("FEATHER_PGS_FRANKA_KINETIC_STATE") == "1"
-        ):
-            from .franka_kinetic_factor import get_kernel as get_geometric_factor  # noqa: PLC0415
-            from .franka_kinetic_state import FrankaKineticState, supported  # noqa: PLC0415
-
-            if supported(self):
-                self._franka_kinetic_state = FrankaKineticState(self)
-                self._franka_kinetic_factor = get_geometric_factor(
-                    str(model.device.arch),
-                    warps_per_block=_CRBA_CHOLESKY_WARPS_PER_BLOCK,
-                    size=self._franka_kinetic_state.layout.primary_dofs,
-                )
-
-        if self._tree_kinetic_state is None and os.environ.get("FEATHER_PGS_MIXED_TREE_KINETIC_STATE", "0") == "1":
-            from .mixed_tree_kinetic import create_owner as create_mixed_tree_cache  # noqa: PLC0415
-
-            self._tree_kinetic_state = create_mixed_tree_cache(self)
+        install_cached_dynamics(self, factor_warps=_CRBA_CHOLESKY_WARPS_PER_BLOCK)
 
         if self._explicit_dense_kernels:
             for name in (
@@ -3537,6 +3511,9 @@ class SolverFeatherPGS(SolverBase):
         Recreate the solver to change them.
         """
         kernels = {}
+        cached = any(
+            owner is not None for owner in (self._tree_kinetic_state, self._franka_kinetic_state, self._kinetic_world)
+        )
         for size in self.size_groups:
             sparse = size == self._sparse_mass_matrix_size
             diagonal = self._execution_plan.use_diagonal_mass(size)
@@ -3572,6 +3549,12 @@ class SolverFeatherPGS(SolverBase):
         return {
             "requested": dict(self._requested_kernel_choices),
             "sparse_mass_matrix": "on" if self._sparse_mass_matrix_size is not None else "off",
+            "cached_dynamics": "on" if cached else "off",
+            "publication": "cached"
+            if cached
+            else "deferred"
+            if self.lazy_kinematics and self._fused_k1
+            else "ordinary",
             "pgs_kernel": "matrix_free" if self.pgs_mode == "matrix_free" else self.pgs_kernel,
             "kernel_plan_by_dof": kernels,
             "cached_prediction": "tree"
