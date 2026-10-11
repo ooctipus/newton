@@ -106,6 +106,14 @@ def edge_graph(vertices, faces):
 
 EPS, TINY, LOW = F(1, 2**23), F(1, 2**126), F(1, 2**60)
 DELTA = 8 * EPS
+_CELL_SCALE = math.lcm(8, DELTA.denominator)
+_CELL_BOUNDS = tuple(
+    (
+        i * _CELL_SCALE // 8 - _CELL_SCALE - int(DELTA * _CELL_SCALE),
+        (i + 1) * _CELL_SCALE // 8 - _CELL_SCALE + int(DELTA * _CELL_SCALE),
+    )
+    for i in range(16)
+)
 
 
 def _clip(poly, a, b, c):
@@ -123,6 +131,28 @@ def _clip(poly, a, b, c):
             out.append(cur)
         prev, fp = cur, fc
     return out
+
+
+def _covered_cells(poly):
+    """Yield fixed16 cells intersecting a counterclockwise convex region exactly."""
+    if not poly:
+        return
+    xmin, xmax = min(x for x, _ in poly) * _CELL_SCALE, max(x for x, _ in poly) * _CELL_SCALE
+    ymin, ymax = min(y for _, y in poly) * _CELL_SCALE, max(y for _, y in poly) * _CELL_SCALE
+    xs = [(i, lo, hi) for i, (lo, hi) in enumerate(_CELL_BOUNDS) if hi >= xmin and lo <= xmax]
+    ys = [(i, lo, hi) for i, (lo, hi) in enumerate(_CELL_BOUNDS) if hi >= ymin and lo <= ymax]
+    # A separating axis is a cell side or a polygon edge. Scale each edge
+    # once so all per-cell predicates use integers, including touching edges.
+    edges = []
+    for prev, cur in zip([poly[-1], *poly[:-1]], poly, strict=True):
+        a, b = prev[1] - cur[1], cur[0] - prev[0]
+        c = (prev[0] * cur[1] - cur[0] * prev[1]) * _CELL_SCALE
+        denominator = math.lcm(a.denominator, b.denominator, c.denominator)
+        edges.append(tuple(value.numerator * (denominator // value.denominator) for value in (a, b, c)))
+    for x, x0, x1 in xs:
+        for y, y0, y1 in ys:
+            if all(a * (x1 if a >= 0 else x0) + b * (y1 if b >= 0 else y0) + c >= 0 for a, b, c in edges):
+                yield x, y
 
 
 def build_masks(v, faces):
@@ -149,23 +179,8 @@ def build_masks(v, faces):
             if not poly:
                 continue
             polygons += 1
-            xmin, xmax = min(x for x, _ in poly), max(x for x, _ in poly)
-            ymin, ymax = min(y for _, y in poly), max(y for _, y in poly)
-            # Floating bounds only select a superset; one extra whole cell protects conversion.
-            ix0 = max(0, math.floor(float((xmin - DELTA + 1) * 8)) - 1)
-            ix1 = min(15, math.floor(float((xmax + DELTA + 1) * 8)) + 1)
-            iy0 = max(0, math.floor(float((ymin - DELTA + 1) * 8)) - 1)
-            iy1 = min(15, math.floor(float((ymax + DELTA + 1) * 8)) + 1)
-            for x in range(ix0, ix1 + 1):
-                for y in range(iy0, iy1 + 1):
-                    x0, x1 = F(x, 8) - 1 - DELTA, F(x + 1, 8) - 1 + DELTA
-                    y0, y1 = F(y, 8) - 1 - DELTA, F(y + 1, 8) - 1 + DELTA
-                    p = _clip(poly, 1, 0, -x0)
-                    p = _clip(p, -1, 0, x1)
-                    p = _clip(p, 0, 1, -y0)
-                    p = _clip(p, 0, -1, y1)
-                    if p:
-                        masks[face, x, y] |= np.uint64(1 << i)
+            for x, y in _covered_cells(poly):
+                masks[face, x, y] |= np.uint64(1 << i)
     if not np.all(masks != 0):
         raise ValueError("Direction-cell mask coverage must be nonempty")
     return masks, {"nonempty_vertex_face_cones": polygons, "sigma": float(sigma), "coordinate_l1_bound": float(bound)}

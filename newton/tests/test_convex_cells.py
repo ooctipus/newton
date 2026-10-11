@@ -6,6 +6,7 @@
 import hashlib
 import os
 import unittest
+from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -118,6 +119,44 @@ def support_check(
 
 
 class TestConvexCells(unittest.TestCase):
+    def test_cell_rectangle_intersections(self):
+        """Match exact clipping for touching, degenerate and oblique convex regions."""
+        from newton._src.geometry.convex_cells_build import DELTA, _clip, _covered_cells  # noqa: PLC0415
+
+        square = [
+            (Fraction(-1), Fraction(-1)),
+            (Fraction(1), Fraction(-1)),
+            (Fraction(1), Fraction(1)),
+            (Fraction(-1), Fraction(1)),
+        ]
+        regions = [
+            square,
+            [(Fraction(0), Fraction(0))],
+            [(Fraction(-1, 8), Fraction(0)), (Fraction(1, 8), Fraction(0))],
+            [(Fraction(0), Fraction(-1, 8)), (Fraction(0), Fraction(1, 8))],
+            [(Fraction(-1, 8), Fraction(-1, 8)), (Fraction(1, 8), Fraction(1, 8))],
+        ]
+        rng = np.random.default_rng(438)
+        for _ in range(12):
+            poly = square
+            for _ in range(8):
+                a, b = (int(v) for v in rng.integers(-9, 10, 2))
+                poly = _clip(poly, a, b, Fraction(int(rng.integers(0, 10)), 8))
+            if poly:
+                regions.append(poly)
+        regions.extend([[(x + DELTA, y - DELTA) for x, y in p] for p in regions[:5]])
+        for poly in regions:
+            expected = []
+            for x in range(16):
+                for y in range(16):
+                    clipped = _clip(poly, 1, 0, -(Fraction(x, 8) - 1 - DELTA))
+                    clipped = _clip(clipped, -1, 0, Fraction(x + 1, 8) - 1 + DELTA)
+                    clipped = _clip(clipped, 0, 1, -(Fraction(y, 8) - 1 - DELTA))
+                    clipped = _clip(clipped, 0, -1, Fraction(y + 1, 8) - 1 + DELTA)
+                    if clipped:
+                        expected.append((x, y))
+            self.assertEqual(list(_covered_cells(poly)), expected)
+
     def test_actual_constructor_writer_cpu(self):
         """Bind the resolved production writer before the cell manifold factory."""
         from newton._src.geometry.narrow_phase import NarrowPhase  # noqa: PLC0415
