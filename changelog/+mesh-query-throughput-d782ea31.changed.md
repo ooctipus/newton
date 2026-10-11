@@ -1,0 +1,1 @@
+Accelerate mesh collision queries with smaller CUDA blocks and conservative triangle culling. Opt into bounded triangle-candidate reuse with `CollisionPipeline(mesh_query_cache_margin=...)`; call `reset_mesh_query_cache()` after modifying the cached mesh geometry. Existing pipelines remain uncached by default.

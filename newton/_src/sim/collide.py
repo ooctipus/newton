@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 import warnings
 from typing import Literal
 
@@ -13,7 +14,7 @@ import warp as wp
 from ..core.reset import normalize_reset_world_mask
 from ..geometry.broad_phase_nxn import BroadPhaseAllPairs, BroadPhaseExplicit
 from ..geometry.broad_phase_sap import BroadPhaseSAP
-from ..geometry.collision_core import compute_tight_aabb_from_support
+from ..geometry.collision_core import MeshQueryCache, compute_tight_aabb_from_support
 from ..geometry.contact_data import (
     CONTACT_SORT_SUB_KEY_BITS,
     ContactData,
@@ -1275,6 +1276,7 @@ class CollisionPipeline:
         reduce_contacts: bool = True,
         rigid_contact_max: int | None = None,
         max_triangle_pairs: int = 1000000,
+        mesh_query_cache_margin: float = 0.0,
         shape_pairs_filtered: wp.array[wp.vec2i] | None = None,
         include_static_kinematic_pairs: bool = True,
         soft_contact_max: int | None = None,
@@ -1357,6 +1359,12 @@ class CollisionPipeline:
                 provided together with a broad phase instance for expert usage.
                 If its voxel-resolution table is omitted, use the model's table.
                 A supplied table must match the model's shape count and device.
+            mesh_query_cache_margin: Expansion distance [m] for reusing mesh triangle candidates.
+                Zero disables caching. Positive values enable it on CUDA when exactly one
+                mesh participates in collision. Shape motion and scaling remain dynamic;
+                exact overlap and contact calculations still run every step. Call
+                :meth:`reset_mesh_query_cache` after changing that mesh's points or indices.
+                Dense queries that exceed cache capacity use the full BVH query.
             shape_pairs_filtered: Precomputed shape pairs for EXPLICIT mode.
                 When broad_phase is "explicit", uses model.shape_contact_pairs if not provided. For
                 "nxn"/"sap" modes, ignored. The pair count and shape-type routing are used to size
@@ -1430,6 +1438,8 @@ class CollisionPipeline:
             :func:`newton.eval_rigid_contact_kinematics` may change
             without prior notice; see :meth:`collide`.
         """
+        if not math.isfinite(mesh_query_cache_margin) or mesh_query_cache_margin < 0.0:
+            raise ValueError("mesh_query_cache_margin must be finite and non-negative")
         if contact_matching not in ("disabled", "latest", "sticky"):
             raise ValueError(
                 f"contact_matching must be one of 'disabled', 'latest', 'sticky', got {contact_matching!r}"
@@ -1530,6 +1540,8 @@ class CollisionPipeline:
                 raise ValueError("Provide both broad_phase and narrow_phase for expert component construction")
             if sdf_hydroelastic_config is not None:
                 raise ValueError("sdf_hydroelastic_config cannot be used when narrow_phase is provided")
+            if mesh_query_cache_margin != 0.0:
+                raise ValueError("Configure mesh query caching on the supplied NarrowPhase instead")
             if contact_reduction_hashtable_size_factor != 0.25:
                 raise ValueError(
                     "contact_reduction_hashtable_size_factor cannot be used when narrow_phase is provided; "
@@ -1773,6 +1785,21 @@ class CollisionPipeline:
                 and has_generic_convex_pairs
                 and generic_convex_pair_work_estimate >= split_pair_count_threshold
             )
+            mesh_query_cache = None
+            if mesh_query_cache_margin > 0.0 and device.is_cuda and has_meshes and np.count_nonzero(mesh_mask) == 1:
+                mesh_query_cache = MeshQueryCache()
+                mesh_query_cache.mesh_shape = int(np.flatnonzero(mesh_mask)[0])
+                mesh_query_cache.margin = mesh_query_cache_margin
+                cached_shapes = np.flatnonzero(route_mask & ~mesh_mask & ~heightfield_mask)
+                slots = np.full(shape_count, -1, dtype=np.int32)
+                slots[cached_shapes] = np.arange(len(cached_shapes))
+                mesh_query_cache.shape_slots = wp.array(slots, dtype=int, device=device)
+                mesh_query_cache.lower = wp.empty(len(cached_shapes), dtype=wp.vec3, device=device)
+                mesh_query_cache.upper = wp.empty(len(cached_shapes), dtype=wp.vec3, device=device)
+                mesh_query_cache.counts = wp.full(len(cached_shapes), -1, dtype=int, device=device)
+                mesh_query_cache.triangles = wp.empty((len(cached_shapes), 128), dtype=int, device=device)
+                mesh_query_cache.sources = wp.zeros(len(cached_shapes), dtype=wp.uint64, device=device)
+
             # Initialize narrow phase with pre-allocated buffers
             # max_triangle_pairs is a conservative estimate for mesh collision triangle pairs
             # Pass write_contact as custom writer to write directly to final Contacts format
@@ -1804,6 +1831,7 @@ class CollisionPipeline:
                 split_gjk_mpr=split_gjk_mpr,
                 candidate_pair_work_estimate=candidate_pair_work_estimate,
                 mesh_sdf_identity_scale_only=mesh_sdf_identity_scale_only,
+                mesh_query_cache=mesh_query_cache,
                 mesh_sdf_texture_only=mesh_sdf_texture_only,
                 sdf_texture_paired_samples=model._sdf_texture_paired_samples,
                 deterministic=deterministic,
@@ -2228,6 +2256,16 @@ class CollisionPipeline:
             min_query_radius=self.soft_self_contact_rest_shape_exclusion_radius,
             min_distance_filtering_ref_pos=self.model.particle_q,
         )
+
+    def reset_mesh_query_cache(self) -> None:
+        """Invalidate saved candidates after mutating cached mesh geometry and refitting its BVH.
+
+        Moving shapes or changing their scale does not require invalidation: every
+        reuse checks current bounds in mesh coordinates. This operation is graph-safe.
+        """
+        cache = self.narrow_phase.mesh_query_cache
+        if cache.mesh_shape >= 0:
+            cache.counts.fill_(-1)
 
     def reset_contact_matching(self, world_mask: wp.array[wp.bool] | None = None) -> None:
         """Clear all or reset-selected previous-frame contact history.

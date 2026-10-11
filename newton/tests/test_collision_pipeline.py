@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
 import unittest
 import warnings
 from collections import Counter
@@ -143,6 +144,8 @@ class CollisionSetup:
 
         self.graph = None
         if wp.get_device(device).is_cuda:
+            # Release previous tests' textures before capture forbids their destruction.
+            gc.collect()
             with wp.ScopedCapture(device=device) as capture:
                 self.simulate()
             self.graph = capture.graph
@@ -3114,7 +3117,10 @@ def test_mesh_convex_midphase_queries_margin_shell(test, device):
         cfg=cfg,
     )
 
-    model = builder.finalize(device=device)
+    worlds = 4097 if device.is_cuda else 1
+    replicated = newton.ModelBuilder()
+    replicated.replicate(builder, worlds)
+    model = replicated.finalize(device=device)
     state = model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state)
 
@@ -3131,8 +3137,131 @@ def test_mesh_convex_midphase_queries_margin_shell(test, device):
             strict=True,
         )
     }
-    test.assertIn((0, 1), pairs)
-    test.assertIn((0, hull_shape), pairs)
+    # More independent queries than the fixed launch grid exercise its strided tail.
+    for world in range(worlds):
+        first = world * builder.shape_count
+        test.assertIn((first, first + 1), pairs)
+        test.assertIn((first, first + hull_shape), pairs)
+
+
+def test_mesh_plane_direct_contacts_cover_vertex_stride(test, device):
+    """A dense mesh must retain contacts beyond the first launch-width vertices."""
+    side = 367
+    x, y = np.meshgrid(np.linspace(-1.0, 1.0, side), np.linspace(-1.0, 1.0, side))
+    vertices = np.column_stack((x.ravel(), y.ravel(), np.full(x.size, -0.01))).astype(np.float32)
+    first = (np.arange(side - 1)[:, None] * side + np.arange(side - 1)[None, :]).ravel()
+    indices = np.concatenate(
+        (
+            np.column_stack((first, first + 1, first + side)),
+            np.column_stack((first + 1, first + side + 1, first + side)),
+        )
+    ).astype(np.int32)
+    builder = newton.ModelBuilder()
+    builder.add_shape_mesh(builder.add_body(), mesh=newton.Mesh(vertices, indices, compute_inertia=False))
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(
+        model, broad_phase="explicit", reduce_contacts=False, rigid_contact_max=len(vertices)
+    )
+    contacts = pipeline.contacts()
+    pipeline.collide(model.state(), contacts)
+    test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), len(vertices))
+
+
+add_function_test(
+    TestCollisionPipeline,
+    "test_mesh_plane_direct_contacts_cover_vertex_stride",
+    test_mesh_plane_direct_contacts_cover_vertex_stride,
+    devices=get_cuda_test_devices(),
+)
+
+
+def test_mesh_query_cache_preserves_contacts_through_motion_and_refit(test, device):
+    """Reuse bounded candidates without losing contacts at cache boundaries or after mesh edits."""
+    side = 81
+    x, y = np.meshgrid(np.linspace(-2.0, 2.0, side), np.linspace(-2.0, 2.0, side))
+    vertices = np.column_stack((x.ravel(), y.ravel(), np.zeros(x.size))).astype(np.float32)
+    first = (np.arange(side - 1)[:, None] * side + np.arange(side - 1)[None, :]).ravel()
+    indices = np.concatenate(
+        (
+            np.column_stack((first, first + 1, first + side)),
+            np.column_stack((first + 1, first + side + 1, first + side)),
+        )
+    ).astype(np.int32)
+    mesh = newton.Mesh(vertices, indices, compute_inertia=False)
+    builder = newton.ModelBuilder()
+    builder.add_shape_mesh(-1, mesh=mesh, scale=(1.5, 0.75, 1.0))
+    small = builder.add_body(xform=wp.transform(wp.vec3(-0.8, 0.0, 0.025)))
+    builder.add_shape_sphere(small, radius=0.03)
+    dense = builder.add_body(xform=wp.transform(wp.vec3(0.8, 0.0, 0.1)))
+    builder.add_shape_box(dense, hx=0.5, hy=0.5, hz=0.11)
+    model = builder.finalize(device=device)
+    state = model.state()
+    pipelines = [
+        newton.CollisionPipeline(
+            model,
+            broad_phase="explicit",
+            reduce_contacts=False,
+            rigid_contact_max=10000,
+            deterministic=True,
+            mesh_query_cache_margin=margin,
+        )
+        for margin in (0.0, 0.05)
+    ]
+    contacts = [pipeline.contacts() for pipeline in pipelines]
+
+    def compare():
+        snapshots = []
+        for pipeline, contact in zip(pipelines, contacts, strict=True):
+            pipeline.collide(state, contact)
+            count = int(contact.rigid_contact_count.numpy()[0])
+            values = np.column_stack(
+                [
+                    getattr(contact, name).numpy()[:count]
+                    for name in (
+                        "rigid_contact_shape0",
+                        "rigid_contact_shape1",
+                        "rigid_contact_point0",
+                        "rigid_contact_point1",
+                        "rigid_contact_normal",
+                        "rigid_contact_margin0",
+                        "rigid_contact_margin1",
+                    )
+                ]
+            )
+            order = np.lexsort(values.T[::-1]) if len(values) else np.empty(0, dtype=int)
+            snapshots.append(values[order])
+        np.testing.assert_allclose(snapshots[1], snapshots[0], atol=1.0e-6, rtol=0.0)
+        return len(snapshots[0])
+
+    test.assertGreater(compare(), 0)
+    # Repeated small moves reuse the sparse query; the large box exceeds the
+    # candidate cache capacity. Both must match exact uncached contacts.
+    for dx, z, angle in ((0.003, 0.025, 0.0), (0.3, 0.025, 0.2), (0.301, -0.005, 0.2)):
+        poses = state.body_q.numpy()
+        poses[small, :3] = (-0.8 + dx, 0.0, z)
+        poses[dense, 3:] = np.asarray(wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), angle))
+        state.body_q.assign(poses)
+        compare()
+    # Deformation requires an explicit invalidation after refitting the mesh BVH.
+    changed = vertices.copy()
+    changed[:, 2] = 0.02 * np.sin(changed[:, 0] * 5.0)
+    mesh.mesh.points.assign(changed)
+    mesh.mesh.refit()
+    pipelines[1].reset_mesh_query_cache()
+    compare()
+    with wp.ScopedCapture(device=device) as capture:
+        pipelines[1].collide(state, contacts[1])
+    wp.capture_launch(capture.graph)
+    compare()
+
+
+add_function_test(
+    TestCollisionPipeline,
+    "test_mesh_query_cache_preserves_contacts_through_motion_and_refit",
+    test_mesh_query_cache_preserves_contacts_through_motion_and_refit,
+    devices=get_cuda_test_devices(),
+)
 
 
 def test_rigid_mesh_contacts_export_surface_velocity(test, device):
@@ -4164,44 +4293,6 @@ add_function_test(
     check_output=False,
 )
 
-
-def test_mesh_query_tile_width_follows_geometry(test, device):
-    """Use wider CUDA query tiles only when heightfields are absent."""
-    mesh_builder = newton.ModelBuilder()
-    mesh_builder.add_shape_mesh(body=-1, mesh=newton.Mesh.create_box(0.5, compute_inertia=False))
-    mesh_model = mesh_builder.finalize(device=device)
-    mesh_pipeline = newton.CollisionPipeline(mesh_model, broad_phase="nxn")
-
-    heightfield_builder = newton.ModelBuilder()
-    heightfield_builder.add_shape_heightfield(
-        heightfield=newton.Heightfield(
-            data=np.zeros((3, 3), dtype=np.float32),
-            nrow=3,
-            ncol=3,
-            hx=1.0,
-            hy=1.0,
-            min_z=0.0,
-            max_z=0.0,
-        )
-    )
-    heightfield_model = heightfield_builder.finalize(device=device)
-    heightfield_pipeline = newton.CollisionPipeline(heightfield_model, broad_phase="nxn")
-
-    if wp.get_device(device).is_cpu:
-        test.assertEqual(mesh_pipeline.narrow_phase.tile_size_mesh_convex, 1)
-        test.assertEqual(heightfield_pipeline.narrow_phase.tile_size_mesh_convex, 1)
-    else:
-        test.assertEqual(mesh_pipeline.narrow_phase.tile_size_mesh_convex, 256)
-        test.assertEqual(heightfield_pipeline.narrow_phase.tile_size_mesh_convex, 128)
-
-
-add_function_test(
-    TestMeshConvexMidphase,
-    "test_mesh_query_tile_width_follows_geometry",
-    test_mesh_query_tile_width_follows_geometry,
-    devices=get_test_devices(),
-    check_output=False,
-)
 
 add_function_test(
     TestMeshConvexMidphase,

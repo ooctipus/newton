@@ -12,6 +12,7 @@ from ..core.types import MAXVAL, Devicelike
 from ..geometry.collision_convex import ConvexQueryResult, create_write_convex_query_result
 from ..geometry.collision_core import (
     ENABLE_TILE_BVH_QUERY,
+    MeshQueryCache,
     check_infinite_plane_bsphere_overlap,
     compute_bounding_sphere_from_aabb,
     compute_tight_aabb_from_support,
@@ -1521,6 +1522,7 @@ def narrow_phase_find_mesh_triangle_overlaps_kernel(
     shape_pairs_mesh: wp.array[wp.vec2i],
     shape_pairs_mesh_count: wp.array[int],
     total_num_threads: int,
+    mesh_query_cache: MeshQueryCache,
     # outputs
     triangle_pairs: wp.array[wp.vec3i],  # (shape_a, shape_b, triangle_idx)
     triangle_pairs_count: wp.array[int],
@@ -1618,6 +1620,7 @@ def narrow_phase_find_mesh_triangle_overlaps_kernel(
             shape_data,
             shape_source,
             contact_threshold,
+            mesh_query_cache,
             triangle_pairs,
             triangle_pairs_count,
         )
@@ -2240,6 +2243,7 @@ class NarrowPhase:
         sparse_gjk_pairs: bool | None = None,
         split_gjk_mpr: bool = False,
         candidate_pair_work_estimate: int | None = None,
+        mesh_query_cache: MeshQueryCache | None = None,
         mesh_sdf_texture_only: bool = False,
         mesh_sdf_identity_scale_only: bool = False,
         sdf_texture_paired_samples: bool = True,
@@ -2290,6 +2294,7 @@ class NarrowPhase:
                 convex processing is unnecessary.
             candidate_pair_work_estimate: Static upper bound on pairs that the
                 broad phase can emit. Defaults to ``max_candidate_pairs``.
+            mesh_query_cache: Optional immutable-mesh candidate cache supplied by the collision pipeline.
             mesh_sdf_texture_only: Whether every participating mesh SDF has a texture representation,
                 allowing BVH fallback branches to be removed from mesh/SDF kernels.
             mesh_sdf_identity_scale_only: Whether every participating texture SDF is queried with
@@ -2330,6 +2335,9 @@ class NarrowPhase:
             contact_writer_supports_speculative: Whether a custom contact writer performs exact speculative-contact
                 admission. Required when ``speculative`` and ``contact_writer_warp_func`` are both provided.
         """
+        self.mesh_query_cache = mesh_query_cache or MeshQueryCache()
+        if mesh_query_cache is None:
+            self.mesh_query_cache.mesh_shape = -1
         self.max_candidate_pairs = max_candidate_pairs
         self.max_triangle_pairs = max_triangle_pairs
         if max_mesh_mesh_pairs is not None and max_mesh_mesh_pairs < 0:
@@ -2404,9 +2412,9 @@ class NarrowPhase:
         # of the plain ``wp.launch(..., block_dim=N)`` parameter (Warp
         # GH-1413). Keep the mesh-convex midphase launch grid, tile shape,
         # and kernel-side ``wp.block_dim()`` in sync on CPU.
-        # Dense mesh queries benefit from wider cooperative result batches;
-        # heightfields only use lane zero and retain the leaner launch.
-        self.tile_size_mesh_convex = 1 if device_obj.is_cpu else (128 if has_heightfields else 256)
+        # Small query blocks distribute the many independent mesh pairs without
+        # tying a full eight-warp block to one BVH traversal.
+        self.tile_size_mesh_convex = 1 if device_obj.is_cpu else (128 if has_heightfields else 64)
         # Must match ``MESH_SDF_BLOCK_DIM`` in sdf_contact.py: the mesh-SDF
         # kernels assume ``wp.block_dim()`` equals that constant so the
         # tile-stack overflow margin (``STACK_CAPACITY = 2 *
@@ -2692,6 +2700,7 @@ class NarrowPhase:
         num_blocks = max(min_blocks, min(candidate_blocks, max_blocks_limit))
         self.total_num_threads = self.block_dim * num_blocks
         self.num_tile_blocks = num_blocks
+        self.num_mesh_convex_blocks = num_blocks * (4 if device_obj.is_cuda and not has_heightfields else 1)
         # Split-convex blocks distribute independent serial pair queries across
         # lanes. Use one warp while preserving the block distribution; lanes
         # grid-stride over larger block queues. That suits the accelerated
@@ -3039,7 +3048,7 @@ class NarrowPhase:
             second_dim = self.tile_size_mesh_convex if ENABLE_TILE_BVH_QUERY else 1
             wp.launch(
                 kernel=narrow_phase_find_mesh_triangle_overlaps_kernel,
-                dim=[self.num_tile_blocks, second_dim],
+                dim=[self.num_mesh_convex_blocks, second_dim],
                 inputs=[
                     shape_types,
                     shape_transform,
@@ -3054,7 +3063,8 @@ class NarrowPhase:
                     heightfield_elevations,
                     self.shape_pairs_mesh,
                     self.shape_pairs_mesh_count,
-                    self.num_tile_blocks,
+                    self.num_mesh_convex_blocks,
+                    self.mesh_query_cache,
                 ],
                 outputs=[
                     self.triangle_pairs,
