@@ -1008,8 +1008,9 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         model = builder.finalize(device="cpu")
         with self.assertRaisesRegex(ValueError, "Patch friction requires"):
             newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.2, friction_mode="bisection")
-        # CPU resolves every native kernel selector to the scalar loop, so only CUDA rejects them.
-        solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.2, pgs_kernel="tiled_contact")
+        with self.assertRaisesRegex(ValueError, "pgs_kernel.*requires CUDA"):
+            newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.2, pgs_kernel="tiled_contact")
+        solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.2, pgs_kernel="auto")
         self.assertEqual(solver.pgs_kernel, "loop")
         if wp.is_cuda_available():
             cuda_model = builder.finalize(device="cuda:0")
@@ -1041,7 +1042,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 )
             self.assertFalse(solver._friction_anchors_enabled)
         with self.assertWarns(DeprecationWarning):
-            solver = newton.solvers.SolverFeatherPGS(model, contact_friction_anchor_limit=2, pgs_kernel="tiled_contact")
+            solver = newton.solvers.SolverFeatherPGS(model, contact_friction_anchor_limit=2, pgs_kernel="auto")
         self.assertTrue(solver._friction_anchors_enabled)
         with self.assertWarns(DeprecationWarning):
             solver = newton.solvers.SolverFeatherPGS(model, contact_friction_anchor_limit=2, friction_anchor_beta=0.3)

@@ -453,8 +453,9 @@ class TestConvexCells(unittest.TestCase):
         }
         with patch.dict(os.environ, {**flags, "NEWTON_NARROW_PHASE_CONVEX_CELLS": "0"}):
             baseline = newton.CollisionPipeline(model, broad_phase="explicit")
-        with patch.dict(os.environ, {**flags, "NEWTON_NARROW_PHASE_CONVEX_CELLS": "1"}):
-            candidate = newton.CollisionPipeline(model, broad_phase="explicit")
+        with patch.dict(os.environ, {**flags, "NEWTON_NARROW_PHASE_CONVEX_CELLS": "0"}):
+            candidate = newton.CollisionPipeline(model, broad_phase="explicit", convex_collision="convex_cells")
+        self.assertEqual(candidate.get_collision_selection()["method"], "convex_cells")
         self.assertIsNotNone(candidate._convex_cells)
         self.assertIs(candidate.narrow_phase._cells_owner, candidate._convex_cells)
         self.assertIsNone(baseline._convex_cells)

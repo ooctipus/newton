@@ -1144,6 +1144,7 @@ class _FeatherPGSExecutionPlan:
         small_dof_threshold: int,
         tile_threads: int,
         diagonal_mass_sizes: frozenset[int] = frozenset(),
+        fuse_delassus: bool = True,
     ) -> "_FeatherPGSExecutionPlan":
         """Resolve H-inverse implementations from solver shape and device limits."""
         planned_diagonal_sizes = (
@@ -1189,7 +1190,7 @@ class _FeatherPGSExecutionPlan:
 
             tiled_sizes.add(size)
             chunk_sizes.append((size, chunk_size))
-            if (
+            if fuse_delassus and (
                 _estimate_hinv_jt_shared_memory(size, max_constraints, fused=True, tile_threads=tile_threads)
                 <= max_shared_memory
             ):
@@ -1474,7 +1475,7 @@ class SolverFeatherPGS(SolverBase):
         friction_mode: Literal["current", "bisection", "bisection_desaxce", "coulomb_newton"] = "current",
         mf_max_constraints: int = 512,
         # Dense-path PGS kernel (matrix_free solves through the fused MF-GS kernel)
-        pgs_kernel: str = "tiled_row",
+        pgs_kernel: str = "auto",
         pgs_chunk_size: int | None = None,
         # Parallelism options
         use_parallel_streams: bool = True,
@@ -1513,10 +1514,24 @@ class SolverFeatherPGS(SolverBase):
         contact_torsion_device: bool = False,
         contact_compliance: bool = False,
         parallel_tree: bool = False,
+        cholesky_kernel: Literal["auto", "tiled", "loop"] = "auto",
+        trisolve_kernel: Literal["auto", "tiled", "loop"] = "auto",
+        hinv_jt_kernel: Literal["auto", "tiled", "par_row"] = "auto",
+        delassus_kernel: Literal["auto", "tiled", "par_row_col"] = "auto",
+        sparse_mass_matrix: Literal["auto", "on", "off"] = "auto",
     ):
         """
         Args:
             model (Model): the model to be simulated.
+            cholesky_kernel: Factor kernel. ``auto`` uses topology, size and device resources.
+                Explicit choices override private test hooks and disable competing sparse/paired owners.
+            trisolve_kernel: Triangular solve kernel; ``auto`` selects by articulation size.
+            hinv_jt_kernel: Dense contact response kernel; ``auto`` selects by size and resources.
+            delassus_kernel: Dense Delassus assembly kernel; explicit choices require split mode.
+            sparse_mass_matrix: Experimental native sparse factors: ``auto`` retains topology/resource
+                admission, ``on`` requires admission, and ``off`` retains the ordinary representation.
+                This option does not enable research packed-factor owners. Incompatible forced choices
+                raise ValueError; this experimental selector may change without notice.
             contact_torsion_radius: Experimental effective spin radius [m], zero disables.
                 Explicit material/footprint assumption: for uniform pressure on a disk
                 of radius R, the effective radius is 2*R/3. Does not consume the generic
@@ -1958,9 +1973,9 @@ class SolverFeatherPGS(SolverBase):
                 Defaults to ``"current"``.
             mf_max_constraints (int, optional): Maximum number of matrix-free constraints per world.
                 Packed metadata in matrix-free mode supports at most 65535 rows. Defaults to 512.
-            pgs_kernel (str, optional): "loop", "tiled_row", or "tiled_contact" for the split-mode articulated
-                solve. Matrix-free mode uses its own dispatcher; CPU models use the scalar kernel suite
-                regardless of this selector. Defaults to "tiled_row".
+            pgs_kernel: Dense PGS implementation. ``auto`` uses ``loop`` on CPU and ``tiled_row`` on CUDA.
+                Explicit ``loop``, ``tiled_row``, ``tiled_contact`` and ``streaming`` require split mode
+                and a supported device. Matrix-free mode requires ``auto`` and owns its sweep dispatcher.
             pgs_chunk_size (int, optional): Chunk size (in contacts, i.e. groups of 3 constraint rows)
                 for the streaming PGS kernel. Controls how many block-rows of the Delassus matrix are
                 preloaded into shared memory at once. 1 = current streaming behavior (one block-row
@@ -2033,6 +2048,51 @@ class SolverFeatherPGS(SolverBase):
         self._compliant_prepared = False
         _reject_retired_experiments()
         super().__init__(model)
+
+        self._requested_kernel_choices = {
+            "cholesky_kernel": cholesky_kernel,
+            "trisolve_kernel": trisolve_kernel,
+            "hinv_jt_kernel": hinv_jt_kernel,
+            "delassus_kernel": delassus_kernel,
+            "pgs_kernel": pgs_kernel,
+            "sparse_mass_matrix": sparse_mass_matrix,
+        }
+        choices = {
+            "cholesky_kernel": ("auto", "tiled", "loop"),
+            "trisolve_kernel": ("auto", "tiled", "loop"),
+            "hinv_jt_kernel": ("auto", "tiled", "par_row"),
+            "delassus_kernel": ("auto", "tiled", "par_row_col"),
+            "pgs_kernel": ("auto", "loop", "tiled_row", "tiled_contact", "streaming"),
+            "sparse_mass_matrix": ("auto", "on", "off"),
+        }
+        cpu_choices = {
+            "cholesky_kernel": "loop",
+            "trisolve_kernel": "loop",
+            "hinv_jt_kernel": "par_row",
+            "delassus_kernel": "par_row_col",
+            "pgs_kernel": "loop",
+            "sparse_mass_matrix": "off",
+        }
+        if pgs_mode != "matrix_free" and enable_joint_limits and pgs_kernel in ("tiled_contact", "streaming"):
+            raise ValueError(f"pgs_kernel={pgs_kernel!r} is contact-only and cannot solve joint-limit rows")
+        for name, value in self._requested_kernel_choices.items():
+            if value not in choices[name]:
+                raise ValueError(f"{name} must be one of {choices[name]}, got {value!r}")
+            if model.device.is_cpu and value not in ("auto", cpu_choices[name]):
+                raise ValueError(f"{name}={value!r} requires CUDA; use 'auto' or {cpu_choices[name]!r}")
+        if pgs_mode == "matrix_free":
+            for name in ("pgs_kernel", "delassus_kernel"):
+                if self._requested_kernel_choices[name] != "auto":
+                    raise ValueError(f"{name} is unused in matrix_free mode; use 'auto' or pgs_mode='split'")
+        self.sparse_mass_matrix = sparse_mass_matrix
+        self._explicit_dense_kernels = any(
+            self._requested_kernel_choices[name] != "auto"
+            for name in ("cholesky_kernel", "trisolve_kernel", "hinv_jt_kernel", "delassus_kernel")
+        )
+        if sparse_mass_matrix == "on" and self._explicit_dense_kernels:
+            raise ValueError("sparse_mass_matrix='on' conflicts with explicit dense kernel choices; use 'auto'")
+        if pgs_kernel == "auto":
+            pgs_kernel = "loop" if model.device.is_cpu else "tiled_row"
 
         self.angular_damping = angular_damping
         self.update_mass_matrix_interval = update_mass_matrix_interval
@@ -2409,10 +2469,14 @@ class SolverFeatherPGS(SolverBase):
 
         # Kernel selection is automatic; _kernel_overrides is a test hook that pins
         # one implementation regardless of the articulation-size heuristic.
-        cholesky_kernel = self._kernel_overrides.get("cholesky_kernel", "auto")
-        trisolve_kernel = self._kernel_overrides.get("trisolve_kernel", "auto")
-        hinv_jt_kernel = self._kernel_overrides.get("hinv_jt_kernel", "auto")
-        delassus_kernel = self._kernel_overrides.get("delassus_kernel", "auto")
+        if cholesky_kernel == "auto":
+            cholesky_kernel = self._kernel_overrides.get("cholesky_kernel", "auto")
+        if trisolve_kernel == "auto":
+            trisolve_kernel = self._kernel_overrides.get("trisolve_kernel", "auto")
+        if hinv_jt_kernel == "auto":
+            hinv_jt_kernel = self._kernel_overrides.get("hinv_jt_kernel", "auto")
+        if delassus_kernel == "auto":
+            delassus_kernel = self._kernel_overrides.get("delassus_kernel", "auto")
         small_dof_threshold = _SMALL_DOF_THRESHOLD_DEFAULT
 
         valid_cholesky = {"tiled", "loop", "auto"}
@@ -2546,7 +2610,7 @@ class SolverFeatherPGS(SolverBase):
         # construction, so gate on the requested radius here.
         sparse_diagonal_pair = (
             None
-            if float(contact_torsion_radius) > 0.0
+            if float(contact_torsion_radius) > 0.0 or self._explicit_dense_kernels
             else self._select_sparse_diagonal_response_pair(factor_dense_contract=self._fused_diagonal_joint_limits)
         )
         self._sparse_diagonal_contact_solve = sparse_diagonal_pair is not None
@@ -2594,6 +2658,7 @@ class SolverFeatherPGS(SolverBase):
             hinv_jt_kernel=self.hinv_jt_kernel,
             small_dof_threshold=self.small_dof_threshold,
             tile_threads=self.tile_threads,
+            fuse_delassus=self.delassus_kernel == "auto",
             diagonal_mass_sizes=(
                 self._diagonal_mass_sizes
                 if self.cholesky_kernel == "auto" and self.trisolve_kernel == "auto"
@@ -2924,6 +2989,11 @@ class SolverFeatherPGS(SolverBase):
                 self._compact_diagonal_mass_size, str(getattr(model.device, "arch", ""))
             )
         self._setup_sparse_mass_matrix(model)
+        if sparse_mass_matrix == "on" and self._sparse_mass_matrix_size is None:
+            raise ValueError(
+                "sparse_mass_matrix='on' is unsupported by this topology, device, solver policy or research mode; "
+                "use 'auto' to allow the ordinary representation"
+            )
         self._allocate_buffers(model)
         self._allocate_world_buffers(model)
         # CONTACT row_parent belongs to ordinary friction/patch load linkage.
@@ -3325,6 +3395,21 @@ class SolverFeatherPGS(SolverBase):
 
             self._tree_kinetic_state = create_mixed_tree_cache(self)
 
+        if self._explicit_dense_kernels:
+            for name in (
+                "_sparse_factor",
+                "_tree_kinetic_state",
+                "_franka_kinetic_state",
+                "_kinetic_world",
+                "_joint_world",
+                "_single_factor",
+            ):
+                if getattr(self, name, None) is not None:
+                    raise ValueError(
+                        f"Explicit dense kernel choices conflict with active research owner {name}; "
+                        "disable that research mode or use automatic kernel choices"
+                    )
+
         self._free_body_gyro_kernel = None
         if os.environ.get("FEATHER_PGS_FREE_BODY_IMPLICIT_GYRO") == "1" and self._has_free_rigid_bodies:
             # A predictor experiment independent of contact scheduling. The
@@ -3442,6 +3527,61 @@ class SolverFeatherPGS(SolverBase):
                 dense_support_tiles=True,
                 stage_velocities=True,
             )
+
+    def get_path_selection(self) -> dict:
+        """Return requested choices, active cache and kernel plans without device synchronization.
+
+        Kernel plans describe ordinary stages per articulation DOF count. Cached
+        prediction can replace these stages; its owner is reported separately.
+        Automatic choices use topology and resource rules, not online timing.
+        Recreate the solver to change them.
+        """
+        kernels = {}
+        for size in self.size_groups:
+            sparse = size == self._sparse_mass_matrix_size
+            diagonal = self._execution_plan.use_diagonal_mass(size)
+            kernels[size] = {
+                "cholesky_kernel": "sparse"
+                if sparse
+                else "diagonal"
+                if diagonal
+                else "tiled"
+                if self._execution_plan.use_tiled_cholesky(size)
+                else "loop",
+                "trisolve_kernel": "sparse"
+                if sparse
+                else "diagonal"
+                if diagonal
+                else "tiled"
+                if self.trisolve_kernel == "tiled"
+                or (self.trisolve_kernel == "auto" and size > self.small_dof_threshold)
+                else "loop",
+                "hinv_jt_kernel": "sparse"
+                if sparse
+                else "diagonal"
+                if diagonal
+                else "tiled"
+                if self._execution_plan.use_tiled_hinv_jt(size)
+                else "par_row",
+                "delassus_kernel": None
+                if self.pgs_mode == "matrix_free"
+                else "par_row_col"
+                if self.delassus_kernel == "par_row_col"
+                else "tiled",
+            }
+        return {
+            "requested": dict(self._requested_kernel_choices),
+            "sparse_mass_matrix": "on" if self._sparse_mass_matrix_size is not None else "off",
+            "pgs_kernel": "matrix_free" if self.pgs_mode == "matrix_free" else self.pgs_kernel,
+            "kernel_plan_by_dof": kernels,
+            "cached_prediction": "tree"
+            if self._tree_kinetic_state is not None
+            else "held"
+            if self._franka_kinetic_state is not None
+            else "kinetic"
+            if self._kinetic_world is not None
+            else None,
+        }
 
     def prepare_contact_torsion_capture(self, state_in: State, state_out: State) -> None:
         """Prepare experimental torsion rollback buffers before CUDA graph capture.
@@ -5105,6 +5245,8 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_prepare_contacts = False
         self._sparse_row_support = _SparseRowSupport()
         self._sparse_contact_triplets = False
+        if getattr(self, "sparse_mass_matrix", "auto") == "off" or getattr(self, "_explicit_dense_kernels", False):
+            return
         # Reuse the factor representation without changing split's row law or
         # state-cache lifecycle. Nonzero seeds need a factor-delta initialization
         # that this cold owner deliberately does not provide.
@@ -5125,7 +5267,10 @@ class SolverFeatherPGS(SolverBase):
             and self._kernel_overrides.get("sparse_prepare_contacts", True)
         )
         if not (
-            self._kernel_overrides.get("sparse_mass_matrix", True)
+            (
+                getattr(self, "sparse_mass_matrix", "auto") == "on"
+                or self._kernel_overrides.get("sparse_mass_matrix", True)
+            )
             and model.device.is_cuda
             and not model.requires_grad
             and (self.pgs_mode == "matrix_free" or split_candidate)
@@ -5603,6 +5748,8 @@ class SolverFeatherPGS(SolverBase):
 
     def _select_paired_response(self) -> tuple[int, int, np.ndarray] | None:
         """Select one complete robot/free-body response pair per world."""
+        if self._explicit_dense_kernels:
+            return None
         if not self._hinv_jt_writes_world or self._hinv_jt_tiled_writes_group or 6 not in self.size_groups:
             return None
         if self._execution_plan.use_tiled_hinv_jt(6):

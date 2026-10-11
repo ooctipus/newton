@@ -100,16 +100,18 @@ def test_dense_pipeline_uses_ordinary(test, device):
     """An admitted dense scene uses the real calibrated model and ordinary contacts."""
     model = _selector_model(device)
     pipelines = []
-    for mode in ("0", "auto"):
+    for mode in ("ordinary", "auto", "rejection"):
         with patch.dict(
             os.environ,
             {
-                "NEWTON_NARROW_PHASE_COHERENT_CONVEX": mode,
+                "NEWTON_NARROW_PHASE_COHERENT_CONVEX": "0",
                 "NEWTON_NARROW_PHASE_COHERENT_STATS": "0",
                 "NEWTON_NARROW_PHASE_PAIR_SHAPE_PREP": "0",
             },
         ):
-            pipelines.append(newton.CollisionPipeline(model, broad_phase="explicit", rigid_contact_max=300000))
+            pipelines.append(
+                newton.CollisionPipeline(model, broad_phase="explicit", rigid_contact_max=300000, convex_collision=mode)
+            )
     state = model.state()
     counts = []
     for pipeline in pipelines:
@@ -120,6 +122,8 @@ def test_dense_pipeline_uses_ordinary(test, device):
         wp.capture_launch(capture.graph)
         counts.append(int(contacts.rigid_contact_count.numpy()[0]))
     test.assertEqual(counts[0], counts[1])
+    test.assertEqual(counts[0], counts[2])
+    test.assertEqual(pipelines[2].get_collision_selection()["method"], "rejection")
     test.assertGreater(counts[0], 0)
     owner = pipelines[1].narrow_phase._convex_method_choice
     test.assertIsNotNone(owner)
@@ -128,6 +132,25 @@ def test_dense_pipeline_uses_ordinary(test, device):
 
 
 class TestAutoConvexSelection(unittest.TestCase):
+    def test_public_collision_choice_overrides_environment(self):
+        """Keep explicit instance choices independent of legacy process settings."""
+        builder = newton.ModelBuilder()
+        body = builder.add_body()
+        builder.add_shape_box(body=body, hx=0.5, hy=0.5, hz=0.5)
+        builder.add_ground_plane()
+        model = builder.finalize(device="cpu")
+        with patch.dict(
+            os.environ, {"NEWTON_NARROW_PHASE_COHERENT_CONVEX": "reject_only", "NEWTON_NARROW_PHASE_CONVEX_CELLS": "1"}
+        ):
+            ordinary = newton.CollisionPipeline(model, convex_collision="ordinary")
+            automatic = newton.CollisionPipeline(model, convex_collision="auto")
+        self.assertEqual(ordinary.get_collision_selection()["method"], "ordinary")
+        self.assertEqual(automatic.get_collision_selection()["requested"], "auto")
+        self.assertEqual(automatic.get_collision_selection()["reason"], "unsupported_pipeline")
+        for choice in ("rejection", "convex_cells", "typo"):
+            with self.subTest(choice=choice), self.assertRaisesRegex(ValueError, "convex_collision"):
+                newton.CollisionPipeline(model, convex_collision=choice)
+
     def test_nonnegative_cost_fit(self):
         # Constraining a negative slope requires refitting the intercept.
         result = _nonnegative_fit([[1, 1], [1, 2], [1, 3]], [3, 2, 1])

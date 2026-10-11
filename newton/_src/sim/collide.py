@@ -1575,9 +1575,20 @@ class CollisionPipeline:
         verify_buffers: bool = True,
         contact_reduction_hashtable_size_factor: float = 0.25,
         speculative_config: SpeculativeContactConfig | None = None,
+        convex_collision: Literal["auto", "ordinary", "rejection", "convex_cells"] | None = None,
     ):
         """
         Initialize the CollisionPipeline (expert API).
+
+        ``convex_collision`` is an experimental per-instance implementation choice.
+        ``auto`` chooses ordinary or rejection-screened queries using independently
+        calibrated costs; unsupported pipelines use ordinary collision. Explicit
+        ``ordinary``, ``rejection`` and ``convex_cells`` force a supported method,
+        or raise ValueError. Convex cells are currently an explicit choice only.
+        These choices override the legacy coherent-convex/cells environment
+        variables. ``None`` preserves those environment settings for existing callers.
+        Inspect :meth:`get_collision_selection` outside graph capture. This
+        experimental parameter may change without the normal deprecation period.
 
         Experimental performance mode: setting the environment variable
         ``NEWTON_NARROW_PHASE_PAIR_SHAPE_PREP=1`` before construction prepares
@@ -1657,6 +1668,9 @@ class CollisionPipeline:
                 4-slot manifold. Stable multi-point box manifolds (no witness-
                 point teleports). Cannot be combined with a prebuilt
                 ``narrow_phase``. Defaults to False.
+            convex_collision: Experimental per-instance convex query implementation. ``auto`` chooses
+                ordinary or rejection queries; explicit ``ordinary``, ``rejection`` and ``convex_cells``
+                force a supported method. ``None`` retains the legacy environment selection.
             narrow_phase: Optional prebuilt narrow phase instance. Must be
                 provided together with a broad phase instance for expert usage.
                 Its effective ``reduce_contacts`` state is authoritative for
@@ -1841,10 +1855,21 @@ class CollisionPipeline:
         self._pair_shape_prep = pair_shape_prep == "1"
         self.prepared_shape_indices = None
         convex_cells = os.environ.get("NEWTON_NARROW_PHASE_CONVEX_CELLS", "0")
-        if convex_cells not in ("0", "1"):
-            raise ValueError("NEWTON_NARROW_PHASE_CONVEX_CELLS must be 0 or 1")
         self._convex_cells = None
         coherent_convex = os.environ.get("NEWTON_NARROW_PHASE_COHERENT_CONVEX", "0")
+        if convex_collision is not None:
+            methods = {
+                "auto": ("auto", "0"),
+                "ordinary": ("0", "0"),
+                "rejection": ("reject_only", "0"),
+                "convex_cells": ("reject_only", "1"),
+            }
+            if convex_collision not in methods:
+                raise ValueError(f"convex_collision must be one of {tuple(methods)}, got {convex_collision!r}")
+            coherent_convex, convex_cells = methods[convex_collision]
+        if convex_cells not in ("0", "1"):
+            raise ValueError("NEWTON_NARROW_PHASE_CONVEX_CELLS must be 0 or 1")
+        self.convex_collision = convex_collision
         coherent_stats = os.environ.get("NEWTON_NARROW_PHASE_COHERENT_STATS", "0")
         if coherent_convex not in ("0", "reject_only", "auto") or coherent_stats not in ("0", "1"):
             raise ValueError(
@@ -2328,7 +2353,7 @@ class CollisionPipeline:
                         coherent_convex = "0"
             elif unsupported:
                 raise ValueError(
-                    "experimental coherent convex collision requires model-built unique explicit pairs, "
+                    "experimental coherent convex_collision rejection/cells requires model-built unique explicit pairs, "
                     "the internal lean CUDA split pipeline, no mesh/heightfield/particle/hydroelastic or "
                     "speculative contacts, no body-pair reduction, and no gradients"
                 )
@@ -2360,9 +2385,12 @@ class CollisionPipeline:
                 owner = _CellOwner(model)
                 if owner.metadata["admitted_meshes"]:
                     self._convex_cells = owner
+                    self._convex_selection_reason = "explicit_cells"
                     self.narrow_phase._cells_owner = owner
                     self.narrow_phase._coherent_query_kernels = coherent_kernels(diagnostics=coherent_stats == "1")
                     self.narrow_phase.narrow_phase_manifold_kernel = manifold_kernel(self.narrow_phase)
+                elif convex_collision == "convex_cells":
+                    raise ValueError("convex_collision='convex_cells' requires at least one admitted convex mesh")
 
         # Built here (not in finalize) so models/tasks that never collide don't pay for it.
         # Host-side, so not graph-capture-safe -- construct the pipeline before any capture.
@@ -2481,6 +2509,27 @@ class CollisionPipeline:
         # concurrently by independent graph executables.
         self._body_pair_reduction_capture_tokens: set[object] = set()
         self._captured_contacts: Contacts | None = None
+
+    def get_collision_selection(self) -> dict:
+        """Read the requested and current convex method outside CUDA graph capture.
+
+        Automatic selection can change during replay. This reports the latest
+        observation, not the fraction of calls using each method.
+        """
+        owner = getattr(self.narrow_phase, "_convex_method_choice", None)
+        result = {"requested": self.convex_collision, "reason": self._convex_selection_reason}
+        if owner is not None:
+            result.update(owner.describe())
+            result["method"] = "rejection" if result["method"] == "reject_only" else "ordinary"
+        else:
+            result["method"] = (
+                "convex_cells"
+                if self._convex_cells is not None
+                else "rejection"
+                if getattr(self.narrow_phase, "_coherent_cache", None) is not None
+                else "ordinary"
+            )
+        return result
 
     def _acquire_contacts_graph_lease(self, token: object, contacts: Contacts, mode: str):
         """Register a graph-owned reducer writer lease (Contacts callback)."""

@@ -64,6 +64,10 @@ class TestFeatherPGSDenseConstructor(unittest.TestCase):
                             os.environ.pop(name, None)
                         else:
                             os.environ[name] = value
+                    if model.device.is_cpu and mode != "loop":
+                        with self.assertRaisesRegex(ValueError, "pgs_kernel.*requires CUDA"):
+                            newton.solvers.SolverFeatherPGS(model, pgs_kernel=mode)
+                        continue
                     solver = newton.solvers.SolverFeatherPGS(
                         model,
                         pgs_mode="split",
@@ -124,8 +128,8 @@ class TestFeatherPGSDenseConstructor(unittest.TestCase):
                 # No streams are borrowed from another solver or shadow object.
                 del solver
 
-    def test_cpu_constructor_retains_legacy_routes(self):
-        """Keep every CPU flag combination on the real constructor's legacy route."""
+    def test_cpu_constructor_rejects_forced_cuda_routes(self):
+        """Reject forced CUDA routes and retain the explicitly selected scalar route."""
         self._check_device(wp.get_device("cpu"))
 
     def test_cuda_constructor_selects_only_eligible_layouts(self):
