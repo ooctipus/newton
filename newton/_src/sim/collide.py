@@ -1593,6 +1593,13 @@ class CollisionPipeline:
         Inspect :meth:`get_collision_selection` outside graph capture. This
         experimental parameter may change without the normal deprecation period.
 
+        Reduced heightfield/convex queries also admit ``auto`` and ``convex_cells``.
+        Automatic CUDA selection samples support work during graph replay and
+        prices it with independent hardware primitives. It keeps the original
+        terrain contact law and falls back to vertex scans after geometry
+        invalidation. Deterministic, speculative and alternate terrain query
+        owners retain their original paths. ``ordinary`` forces vertex scans.
+
         Experimental performance mode: setting the environment variable
         ``NEWTON_NARROW_PHASE_PAIR_SHAPE_PREP=1`` before construction prepares
         geometry only for the fixed explicit pair list. In this opt-in mode,
@@ -2215,6 +2222,11 @@ class CollisionPipeline:
                 speculative=self._speculative_enabled,
                 contact_writer_supports_speculative=self._speculative_enabled,
                 contact_export=contact_export,
+                heightfield_primitive_query=True
+                if convex_collision in ("auto", "convex_cells")
+                and has_heightfields
+                and int(GeoType.CONVEX_MESH) in colliding_shape_types
+                else None,
             )
             self.hydroelastic_sdf = self.narrow_phase.hydroelastic_sdf
 
@@ -2338,6 +2350,14 @@ class CollisionPipeline:
                 raise ValueError("Explicit pair shape IDs must be within model.shape_count")
             self.prepared_shape_indices = wp.array(pair_indices, dtype=wp.int32, device=device)
 
+        terrain_supported = (
+            self.narrow_phase._heightfield_primitive_query
+            and not using_expert_components
+            and model.particle_count == 0
+            and self.hydroelastic_sdf is None
+            and not requires_grad
+        )
+        terrain_forced = convex_collision == "convex_cells" and terrain_supported
         self._convex_selection_reason = "explicit_ordinary"
         # Built here (not in finalize) so models/tasks that never collide don't pay for it.
         if coherent_convex != "0":
@@ -2367,6 +2387,8 @@ class CollisionPipeline:
                     if eligible == 0:
                         self._convex_selection_reason = "no_eligible_pairs"
                         coherent_convex = "0"
+            elif unsupported and terrain_forced:
+                coherent_convex = "0"
             elif unsupported:
                 raise ValueError(
                     "experimental coherent convex_collision rejection/cells requires model-built unique explicit pairs, "
@@ -2414,16 +2436,38 @@ class CollisionPipeline:
                 )
                 self._convex_selection_reason = "sampled_cost"
 
-        if getattr(self.narrow_phase, "_heightfield_convex_cells_requested", False):
+        terrain_requested = getattr(self.narrow_phase, "_heightfield_convex_cells_requested", False)
+        terrain_auto = convex_collision == "auto" and terrain_supported and device.is_cuda
+        if terrain_requested or terrain_forced or terrain_auto:
             from ..geometry.convex_cells import _CellOwner  # noqa: PLC0415
+            from ..geometry.heightfield_convex_cells import get_kernel as terrain_kernel  # noqa: PLC0415
 
             if convex_collision == "ordinary":
                 raise ValueError("Terrain convex cells conflict with convex_collision='ordinary'")
             owner = _CellOwner(model)
-            if not owner.metadata["admitted_meshes"]:
+            if not owner.metadata["admitted_meshes"] and (terrain_requested or terrain_forced):
                 raise ValueError("Terrain convex cells require at least one admitted convex mesh")
-            self._heightfield_convex_cells = owner
-            self.narrow_phase._heightfield_cell_owner = owner
+            if owner.metadata["admitted_meshes"]:
+                from ..geometry.contact_reduction_global import (  # noqa: PLC0415
+                    create_mesh_triangle_contacts_to_reducer_kernel,
+                )
+
+                choice = None
+                if terrain_auto and not terrain_requested:
+                    from ..geometry.heightfield_convex_cost import TerrainMethodChoice  # noqa: PLC0415
+
+                    choice = TerrainMethodChoice(owner)
+                self._heightfield_convex_cells = owner
+                self.narrow_phase._heightfield_cell_owner = owner
+                self.narrow_phase._heightfield_convex_cells_requested = True
+                self.narrow_phase._heightfield_method_choice = choice
+                self.narrow_phase._heightfield_convex_cell_kernel = terrain_kernel(conditional=choice is not None)
+                self.narrow_phase._heightfield_primitive_kernels = (
+                    *self.narrow_phase._heightfield_primitive_kernels[:2],
+                    create_mesh_triangle_contacts_to_reducer_kernel(
+                        exclude_primitives=True, exclude_heightfield_convex=True
+                    ),
+                )
 
         # Built here (not in finalize) so models/tasks that never collide don't pay for it.
         # Host-side, so not graph-capture-safe -- construct the pipeline before any capture.
@@ -2552,8 +2596,17 @@ class CollisionPipeline:
         owner = getattr(self.narrow_phase, "_convex_method_choice", None)
         result = {"requested": self.convex_collision, "reason": self._convex_selection_reason}
         if self._heightfield_convex_cells is not None:
+            choice = self.narrow_phase._heightfield_method_choice
+            terrain = (
+                choice.describe()
+                if choice is not None
+                else {
+                    "method": "ordinary" if self._heightfield_convex_cells.metadata["invalidated"] else "convex_cells",
+                    "reason": "explicit_cells",
+                }
+            )
             result["heightfield_support"] = {
-                "method": "convex_cells",
+                **terrain,
                 "admitted_meshes": len(self._heightfield_convex_cells.metadata["admitted_meshes"]),
             }
         result["contact_export"] = {
@@ -2576,6 +2629,9 @@ class CollisionPipeline:
                 if getattr(self.narrow_phase, "_coherent_cache", None) is not None
                 else "ordinary"
             )
+        if "heightfield_support" in result:
+            result["method"] = result["heightfield_support"]["method"]
+            result["reason"] = result["heightfield_support"]["reason"]
         return result
 
     def _acquire_contacts_graph_lease(self, token: object, contacts: Contacts, mode: str):

@@ -2438,6 +2438,7 @@ class NarrowPhase:
         speculative: bool = False,
         contact_writer_supports_speculative: bool = False,
         contact_export: Literal["auto", "tiled", "compact"] | None = None,
+        heightfield_primitive_query: bool | None = None,
     ) -> None:
         """
         Initialize NarrowPhase with pre-allocated buffers.
@@ -2456,6 +2457,8 @@ class NarrowPhase:
             contact_export: Experimental reduced-contact export mapping. ``auto`` uses compact
                 workers for supported CUDA reducers; ``tiled`` retains cooperative export.
                 ``compact`` requires admission. ``None`` preserves the legacy environment choice.
+            heightfield_primitive_query: Request typed reduced terrain queries subject to
+                writer and pipeline admission. ``None`` preserves the environment choice.
             device: Device to allocate buffers on
             shape_aabb_lower: Optional external AABB lower bounds array (if provided, AABBs won't be computed internally)
             shape_aabb_upper: Optional external AABB upper bounds array (if provided, AABBs won't be computed internally)
@@ -2600,6 +2603,10 @@ class NarrowPhase:
         self._heightfield_pair_csr_shell = False
         self._pair_csr = None
         primitive_query = os.environ.get("NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY", "0")
+        if heightfield_primitive_query is not None:
+            if not isinstance(heightfield_primitive_query, bool):
+                raise ValueError("heightfield_primitive_query must be a bool or None")
+            primitive_query = str(int(heightfield_primitive_query))
         if primitive_query not in ("0", "1"):
             raise ValueError("NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY must be 0 or 1")
         primitive_writer_supported = contact_writer_warp_func is None
@@ -2626,6 +2633,7 @@ class NarrowPhase:
         if self._heightfield_convex_cells_requested and not self._heightfield_primitive_query:
             raise ValueError("Terrain convex cells require the admitted reduced heightfield primitive-query owner")
         self._heightfield_cell_owner = None
+        self._heightfield_method_choice = None
         self._heightfield_convex_cell_kernel = None
         if self._heightfield_convex_cells_requested:
             from .heightfield_convex_cells import get_kernel  # noqa: PLC0415
@@ -3633,10 +3641,14 @@ class NarrowPhase:
                     if self._heightfield_convex_cell_kernel is not None:
                         if self._heightfield_cell_owner is None:
                             raise RuntimeError("Terrain convex cells require CollisionPipeline model binding")
+                        support_data = self._heightfield_cell_owner.data
+                        if self._heightfield_method_choice is not None:
+                            self._heightfield_method_choice.launch(triangle_inputs)
+                            support_data = self._heightfield_method_choice.data
                         wp.launch(
                             kernel=self._heightfield_convex_cell_kernel,
                             dim=self.total_num_threads,
-                            inputs=[*triangle_inputs, self._heightfield_cell_owner.data],
+                            inputs=[*triangle_inputs, support_data],
                             device=device,
                             block_dim=self.mesh_triangle_block_dim,
                             record_tape=False,

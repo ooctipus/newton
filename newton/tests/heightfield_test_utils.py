@@ -117,7 +117,7 @@ def cube_mesh():
     return newton.Mesh(vertices=vertices, indices=faces.ravel())
 
 
-def build_scene(case, enabled, device, *, reduce=True, make_solver=True):
+def build_scene(case, enabled, device, *, reduce=True, make_solver=True, hull_scale=1.0, terrain_resolution=21):
     """Bind one complete current model/state/collision/sensor owner, never saved rows."""
     terrain_q = wp.quat_from_axis_angle(wp.vec3(0, 1, 0), case.terrain_angle)
     body_q = terrain_q * wp.quat_from_axis_angle(wp.vec3(0, 1, 0), case.tilt)
@@ -129,7 +129,13 @@ def build_scene(case, enabled, device, *, reduce=True, make_solver=True):
     gravity = np.zeros(3) if case.kind == "impact" else np.array([0.0, 0.0, -9.81])
     builder = newton.ModelBuilder(gravity=tuple(gravity))
     cfg = builder.ShapeConfig(density=0.0, mu=case.mu, restitution=case.restitution, margin=MARGIN, gap=0.02)
-    terrain = newton.Heightfield(data=np.zeros((21, 21), dtype=np.float32), nrow=21, ncol=21, hx=1.2, hy=1.2)
+    terrain = newton.Heightfield(
+        data=np.zeros((terrain_resolution, terrain_resolution), dtype=np.float32),
+        nrow=terrain_resolution,
+        ncol=terrain_resolution,
+        hx=1.2,
+        hy=1.2,
+    )
     builder.add_shape_heightfield(
         heightfield=terrain,
         xform=wp.transform((0, 0, 0), terrain_q),
@@ -175,7 +181,7 @@ def build_scene(case, enabled, device, *, reduce=True, make_solver=True):
         builder.add_shape_convex_hull(
             body=foot,
             mesh=cube_mesh(),
-            scale=tuple(HALF),
+            scale=tuple(HALF * hull_scale),
             cfg=cfg,
             label="foot_contact",
         )
