@@ -12,6 +12,9 @@ import warp as wp
 
 from .coherent_convex import _plane_lower_bound
 from .coherent_convex_rejection import _PairInputs
+from .contact_data import ContactData
+from .convex_cell_cost import _calibrate_cell_cost, _support_saving
+from .convex_cells import _CellData
 from .mpr import create_solve_mpr, create_support_map_function
 from .simplex_solver import create_solve_closest_distance
 from .support_function import GenericShapeData, SupportMapDataProvider, support_map_lean, unpack_mesh_ptr
@@ -22,6 +25,8 @@ from .types import GeoType
 class _WorkCounter:
     values: wp.array2d[float]
     row: int
+    cells: _CellData
+    cell_costs: wp.array[float]
 
 
 @wp.func
@@ -35,7 +40,14 @@ def _vertex_count(geom: GenericShapeData) -> int:
 def _counted_support(geom: GenericShapeData, direction: wp.vec3, counter: _WorkCounter) -> wp.vec3:
     counter.values[counter.row, 0] += 1.0
     counter.values[counter.row, 1] += float(_vertex_count(geom))
+    if counter.cell_costs.shape[0] > 0:
+        counter.values[counter.row, 6] += _support_saving(geom, direction, counter.cells, counter.cell_costs)
     return support_map_lean(geom, direction, SupportMapDataProvider())
+
+
+@wp.func
+def _sample_contact(contact: ContactData, counter: _WorkCounter, index: int):
+    counter.values[counter.row, 7] += 1.0
 
 
 def _query_functions(*, count_work):
@@ -301,11 +313,16 @@ def _calibrate_query_cost(device):
     return model
 
 
-def _create_work_sampler():
+def _create_work_sampler(*, cells=False):
+    from .collision_convex import ConvexQueryResult, create_write_convex_query_result  # noqa: PLC0415
+    from .collision_core import post_process_minkowski_only  # noqa: PLC0415
     from .narrow_phase import create_prepare_convex_pair  # noqa: PLC0415
 
     prepare = create_prepare_convex_pair(True, False)
     mpr, gjk = _query_functions(count_work=True)
+    manifold = create_write_convex_query_result(
+        _counted_support, _sample_contact, post_process_minkowski_only, use_precomputed_center=True
+    )
 
     @wp.kernel(module="unique", enable_backward=False)
     def sample(
@@ -315,6 +332,8 @@ def _create_work_sampler():
         epoch: wp.array[int],
         period: int,
         work: wp.array2d[float],
+        cell_data: _CellData,
+        cell_costs: wp.array[float],
     ):
         if epoch[0] % period != 0:
             return
@@ -348,12 +367,17 @@ def _create_work_sampler():
         provider = _WorkCounter()
         provider.values = work
         provider.row = row
-        collision, _a, _b, normal, penetration = mpr(
+        if wp.static(cells):
+            provider.cells = cell_data
+            provider.cell_costs = cell_costs
+        collision, point_a, point_b, normal, penetration = mpr(
             query.geom_a, query.geom_b, query.relative_orientation_b, query.relative_position_b, query.enlarge, provider
         )
         gap = -penetration + query.enlarge
+        point_a -= normal * (0.5 * query.enlarge)
+        point_b += normal * (0.5 * query.enlarge)
         if not collision:
-            _separated, _a, _b, normal, gap = gjk(
+            _separated, point_a, point_b, normal, gap = gjk(
                 query.geom_a, query.geom_b, query.relative_orientation_b, query.relative_position_b, 0.0, provider
             )
         eligible = (query.type_a == int(GeoType.BOX) or query.type_a == int(GeoType.CONVEX_MESH)) and (
@@ -370,6 +394,57 @@ def _create_work_sampler():
                 )
                 if bound.valid != 0 and bound.lower > query.contact_threshold:
                     work[row, 2] = 1.0
+        if wp.static(cells):
+            bindings = float(
+                int(query.type_a == int(GeoType.CONVEX_MESH)) + int(query.type_b == int(GeoType.CONVEX_MESH))
+            )
+            query_saving = work[row, 6] - bindings * cell_costs[4]
+            work[row, 6] = (1.0 - work[row, 2]) * query_saving
+            if eligible and gap > query.contact_threshold:
+                work[row, 6] += _support_saving(query.geom_a, normal, cell_data, cell_costs, True)
+                work[row, 6] += _support_saving(
+                    query.geom_b, wp.quat_rotate_inv(query.relative_orientation_b, -normal), cell_data, cell_costs, True
+                )
+                work[row, 6] -= bindings * cell_costs[9]
+            if gap <= query.contact_threshold:
+                calls, vertices = work[row, 0], work[row, 1]
+                result = ConvexQueryResult()
+                result.point_a = point_a
+                result.point_b = point_b
+                result.normal = normal
+                result.signed_distance = gap
+                template = ContactData()
+                template.radius_eff_a = query.radius_eff_a
+                template.radius_eff_b = query.radius_eff_b
+                template.margin_a = query.margin_a
+                template.margin_b = query.margin_b
+                template.shape_a = query.shape_a
+                template.shape_b = query.shape_b
+                template.gap_sum = query.rigid_gap
+                skip = (
+                    query.type_a == GeoType.SPHERE
+                    or query.type_b == GeoType.SPHERE
+                    or query.type_a == GeoType.ELLIPSOID
+                    or query.type_b == GeoType.ELLIPSOID
+                )
+                manifold(
+                    query.geom_a,
+                    query.geom_b,
+                    query.orientation_a,
+                    query.orientation_b,
+                    query.position_a,
+                    query.position_b,
+                    query.relative_orientation_b,
+                    query.relative_position_b,
+                    result,
+                    provider,
+                    skip,
+                    provider,
+                    template,
+                )
+                work[row, 0] = calls
+                work[row, 1] = vertices
+                work[row, 6] -= bindings * cell_costs[4]
 
     return sample
 
@@ -386,6 +461,10 @@ def _choose_method(
     ordinary_count: wp.array[int],
     rejection_count: wp.array[int],
     rejection_gjk_count: wp.array[int],
+    cell_count: wp.array[int],
+    cell_gjk_count: wp.array[int],
+    cell_manifold_count: wp.array[int],
+    cell_valid: wp.array[int],
 ):
     count = wp.max(0, count_array[0])
     if epoch[0] % period == 0:
@@ -393,6 +472,8 @@ def _choose_method(
         total = float(0.0)
         saving_sum = float(0.0)
         saving_square = float(0.0)
+        cell_sum, cell_square = float(0.0), float(0.0)
+        delta_sum, delta_square = float(0.0), float(0.0)
         for row in range(samples):
             query = coefficients[0] * work[row, 4] + coefficients[1] * work[row, 0] + coefficients[2] * work[row, 1]
             # Prepare/lookup traffic applies to all candidates. Certificate scans
@@ -402,6 +483,13 @@ def _choose_method(
             total += query
             saving_sum += saving
             saving_square += saving * saving
+            if work.shape[1] > 6:
+                delta = work[row, 6]
+                cell_saving = saving + delta
+                cell_sum += cell_saving
+                cell_square += cell_saving * cell_saving
+                delta_sum += delta
+                delta_square += delta * delta
         denominator = float(wp.max(1, samples))
         mean = saving_sum / denominator
         variance = wp.max(0.0, saving_square / denominator - mean * mean)
@@ -415,16 +503,46 @@ def _choose_method(
         estimates[2] = uncertainty * float(count) * 1.0e-6
         estimates[3] = float(count)
         choice[0] = int(samples >= 32 and wp.isfinite(saving_ns) and saving_ns > 0.15 * ordinary_ns)
+        if cell_valid.shape[0] > 0:
+            cell_mean = cell_sum / denominator
+            cell_uncertainty = 2.0 * wp.sqrt(
+                wp.max(0.0, cell_square / denominator - cell_mean * cell_mean) / denominator
+            )
+            delta_mean = delta_sum / denominator
+            delta_uncertainty = 2.0 * wp.sqrt(
+                wp.max(0.0, delta_square / denominator - delta_mean * delta_mean) / denominator
+            )
+            # Three query kernels plus a second manifold owner. Shared publication
+            # work is unchanged; sampled manifold support savings are included.
+            cell_overhead = 4.0 * coefficients[6]
+            cell_saving_ns = (cell_mean - cell_uncertainty) * float(count) - overhead_ns - cell_overhead
+            beats_rejection = (delta_mean - delta_uncertainty) * float(count) > cell_overhead
+            estimates[4] = wp.max(0.0, ordinary_ns - cell_saving_ns) * 1.0e-6
+            estimates[5] = delta_uncertainty * float(count) * 1.0e-6
+            if (
+                cell_valid[0] != 0
+                and samples >= 32
+                and wp.isfinite(cell_saving_ns)
+                and cell_saving_ns > 0.15 * ordinary_ns
+            ):
+                if choice[0] == 0 or beats_rejection:
+                    choice[0] = 2
+    if cell_valid.shape[0] > 0:
+        if cell_valid[0] == 0 and choice[0] == 2:
+            choice[0] = 0
     epoch[0] += 1
     ordinary_count[0] = wp.where(choice[0] == 0, count, 0)
-    rejection_count[0] = wp.where(choice[0] != 0, count, 0)
+    rejection_count[0] = wp.where(choice[0] == 1, count, 0)
     rejection_gjk_count[0] = 0
+    cell_count[0] = wp.where(choice[0] == 2, count, 0)
+    cell_gjk_count[0] = 0
+    cell_manifold_count[0] = 0
 
 
 class _ConvexMethodChoice:
     """Periodically choose on device; graph replay never uses host task labels."""
 
-    def __init__(self, *, device, slots):
+    def __init__(self, *, device, slots, cells=None):
         self.device = wp.get_device(device)
         self.model = _calibrate_query_cost(self.device)
         self.period = 64
@@ -432,19 +550,29 @@ class _ConvexMethodChoice:
         self.ordinary_count = wp.zeros(1, dtype=int, device=device)
         self.rejection_count = wp.zeros(1, dtype=int, device=device)
         self.rejection_gjk_count = wp.zeros(1, dtype=int, device=device)
+        self.cell_count = wp.zeros(1, dtype=int, device=device)
+        self.cell_gjk_count = wp.zeros(1, dtype=int, device=device)
+        self.cell_manifold_count = wp.zeros(1, dtype=int, device=device)
+        self.cells = cells
+        self.cell_model = _calibrate_cell_cost(device) if cells is not None else None
+        self.cell_data = cells.data if cells is not None else _CellData()
+        self.cell_valid = cells.data.valid if cells is not None else wp.empty(0, dtype=int, device=device)
+        self.cell_costs = wp.array(
+            self.cell_model.coefficients() if cells is not None else [], dtype=float, device=device
+        )
         self.choice = wp.zeros(1, dtype=int, device=device)
-        self.estimates = wp.zeros(4, dtype=float, device=device)
-        self.work = wp.zeros((512, 6), dtype=float, device=device)
+        self.estimates = wp.zeros(6, dtype=float, device=device)
+        self.work = wp.zeros((512, 8 if cells is not None else 6), dtype=float, device=device)
         self.coefficients = wp.array(self.model.coefficients(slots), dtype=float, device=device)
-        self.sample = _create_work_sampler()
+        self.sample = _create_work_sampler(cells=cells is not None)
 
-    def launch(self, pairs, count, inputs, ordinary, rejection):
+    def launch(self, pairs, count, inputs, ordinary, rejection, cells=None):
         # Empty work queues keep the parent capture and its cross-stream events
         # intact. Native conditional graph capture pauses invalidate older events.
         wp.launch(
             self.sample,
             self.work.shape[0],
-            [pairs, count, inputs, self.epoch, self.period, self.work],
+            [pairs, count, inputs, self.epoch, self.period, self.work, self.cell_data, self.cell_costs],
             device=self.device,
         )
         wp.launch(
@@ -461,22 +589,30 @@ class _ConvexMethodChoice:
                 self.ordinary_count,
                 self.rejection_count,
                 self.rejection_gjk_count,
+                self.cell_count,
+                self.cell_gjk_count,
+                self.cell_manifold_count,
+                self.cell_valid,
             ],
             device=self.device,
         )
         ordinary(self.ordinary_count)
         rejection(self.rejection_count, self.rejection_gjk_count)
+        if cells is not None:
+            cells(self.cell_count, self.cell_gjk_count, self.cell_manifold_count)
 
     def describe(self):
         """Read the latest estimate outside capture; sampling is not a timing fit."""
         values = self.estimates.numpy().tolist()
         return {
-            "method": "reject_only" if self.choice.numpy()[0] else "ordinary",
+            "method": ("ordinary", "reject_only", "convex_cells")[self.choice.numpy()[0]],
             "query_ms": values[0],
             "rejection_ms": values[1],
             "uncertainty_ms": values[2],
             "candidates": int(values[3]),
             "period": self.period,
             "calibration_seconds": self.model.calibration_seconds,
+            "cells_ms": values[4] if self.cells is not None else None,
+            "cells_uncertainty_ms": values[5] if self.cells is not None else None,
             "source": "independent synthetic primitives and sampled support work",
         }

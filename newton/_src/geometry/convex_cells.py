@@ -3,6 +3,7 @@
 
 """Experimental immutable direction-cell candidates for original support queries."""
 
+import time
 from functools import cache
 from typing import Any
 
@@ -210,6 +211,7 @@ class _CellOwner:
     def __init__(self, model):
         from .convex_cells_build import build_masks  # noqa: PLC0415
 
+        start = time.monotonic()
         meshes = {mesh.id: mesh for mesh in model._mesh_keep_alive}
         pointers = np.unique(model.shape_source_ptr.numpy()[model.shape_type.numpy() == GeoType.CONVEX_MESH])
         ids, tables, norms = [], [], []
@@ -249,6 +251,7 @@ class _CellOwner:
         self.metadata["descriptor_bytes"] = sum(
             getattr(data, name).capacity for name in ("mesh_ids", "masks", "norm_one", "valid")
         )
+        self.metadata["construction_seconds"] = time.monotonic() - start
 
     def invalidate(self):
         """Disable descriptors before geometry edits while retaining graph pointers."""

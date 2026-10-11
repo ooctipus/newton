@@ -480,6 +480,7 @@ class TestConvexCells(unittest.TestCase):
 
         candidate.collide(state, right)
         compare()
+
         poses = state.body_q.numpy().copy()
         with wp.ScopedCapture(device=device) as captured:
             candidate.collide(state, right)
@@ -497,6 +498,60 @@ class TestConvexCells(unittest.TestCase):
         self.assertEqual(int(candidate._convex_cells.data.valid.numpy()[0]), 0)
         wp.capture_launch(captured.graph)
         compare()
+
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
+    def test_automatic_cells_admission_cuda(self):
+        """Admit cells through auto while preserving forced ordinary and rejection owners."""
+        world = newton.ModelBuilder()
+        hull = newton.Mesh(VERTICES, FACES.reshape(-1))
+        for i in range(168):
+            body = world.add_body(xform=wp.transform(wp.vec3(0.4 * float(i), 0, 0)))
+            world.add_shape_convex_hull(body, mesh=hull)
+        builder = newton.ModelBuilder()
+        builder.add_world(world)
+        builder.add_world(world, xform=wp.transform(wp.vec3(4000, 0, 0)))
+        model = builder.finalize(device="cuda:0")
+        with patch.dict(os.environ, {"NEWTON_NARROW_PHASE_PAIR_SHAPE_PREP": "0"}):
+            auto = newton.CollisionPipeline(model, broad_phase="explicit", convex_collision="auto")
+            rejection = newton.CollisionPipeline(model, broad_phase="explicit", convex_collision="rejection")
+            ordinary = newton.CollisionPipeline(model, broad_phase="explicit", convex_collision="ordinary")
+        self.assertIsNotNone(auto._convex_cells)
+        self.assertIsNone(rejection._convex_cells)
+        self.assertIsNone(ordinary._convex_cells)
+        owner = auto.narrow_phase._convex_method_choice
+        # An independent-machine fixture makes candidate visits cheaper than
+        # full scans. Exercise the real sampler and decision, not a task rule.
+        owner.coefficients.assign(np.array([0, 0, 100, 0, 0, 0, 1], np.float32))
+        owner.cell_costs.assign(np.array([0, 100, 0, 0, 0] * 2, np.float32))
+        state = model.state()
+        expected, actual = ordinary.contacts(), auto.contacts()
+        ordinary.collide(state, expected)
+        auto.collide(state, actual)
+        self.assertEqual(auto.get_collision_selection()["method"], "convex_cells")
+        reference_count = int(expected.rigid_contact_count.numpy()[0])
+        self.assertGreater(reference_count, 0)
+        owner.period = 1000000
+        with wp.ScopedCapture(device="cuda:0") as captured:
+            event = wp.get_stream().record_event()
+            auto.collide(state, actual)
+            wp.get_stream().wait_event(event)
+        # Queue transitions must not consume work left by another method.
+        for choice in (2, 1, 0, 2, 0, 1):
+            owner.choice.fill_(choice)
+            wp.capture_launch(captured.graph)
+            self.assertEqual(int(actual.rigid_contact_count.numpy()[0]), reference_count)
+            self.assertEqual(
+                auto.get_collision_selection()["method"], ("ordinary", "rejection", "convex_cells")[choice]
+            )
+            auto.narrow_phase.check_buffer_capacity()
+        auto.reset_contact_matching()
+        owner.choice.fill_(2)
+        wp.capture_launch(captured.graph)
+        self.assertEqual(int(actual.rigid_contact_count.numpy()[0]), reference_count)
+        auto.invalidate_convex_cells()
+        wp.capture_launch(captured.graph)
+        self.assertEqual(auto.get_collision_selection()["method"], "ordinary")
+        self.assertEqual(int(actual.rigid_contact_count.numpy()[0]), reference_count)
 
 
 if __name__ == "__main__":

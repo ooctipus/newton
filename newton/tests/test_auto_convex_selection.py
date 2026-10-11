@@ -132,6 +132,31 @@ def test_dense_pipeline_uses_ordinary(test, device):
 
 
 class TestAutoConvexSelection(unittest.TestCase):
+    def test_cell_cost_ignores_shared_output_overhead(self):
+        """Preserve the predicted method difference when both primitives share fixed work."""
+        from newton._src.geometry.convex_cell_cost import _fit_support_cost  # noqa: PLC0415
+
+        records = []
+        for calls in (1, 8, 32):
+            for vertices in (8, 32, 64):
+                candidates = calls * (1 + vertices / 16)
+                records.append(
+                    {
+                        "calls": calls,
+                        "vertices": vertices,
+                        "candidates": candidates,
+                        "scan_ns": 10 + calls + 2 * calls * vertices,
+                        "cell_ns": 12 + 3 * calls + candidates,
+                    }
+                )
+        costs, _ = _fit_support_cost(records)
+        for row in records:
+            row["scan_ns"] += 100
+            row["cell_ns"] += 100
+        shifted, _ = _fit_support_cost(records)
+        np.testing.assert_allclose(costs, [1, 2, 3, 1, 2], atol=1e-10)
+        np.testing.assert_allclose(shifted, costs, atol=1e-10)
+
     def test_public_collision_choice_overrides_environment(self):
         """Keep explicit instance choices independent of legacy process settings."""
         builder = newton.ModelBuilder()

@@ -1581,10 +1581,10 @@ class CollisionPipeline:
         Initialize the CollisionPipeline (expert API).
 
         ``convex_collision`` is an experimental per-instance implementation choice.
-        ``auto`` chooses ordinary or rejection-screened queries using independently
-        calibrated costs; unsupported pipelines use ordinary collision. Explicit
+        ``auto`` chooses ordinary queries, rejection screening or convex cells using
+        independently calibrated costs; unsupported pipelines use ordinary collision. Explicit
         ``ordinary``, ``rejection`` and ``convex_cells`` force a supported method,
-        or raise ValueError. Convex cells are currently an explicit choice only.
+        or raise ValueError. Cell tables are constructed before graph capture.
         These choices override the legacy coherent-convex/cells environment
         variables. ``None`` preserves those environment settings for existing callers.
         Inspect :meth:`get_collision_selection` outside graph capture. This
@@ -1669,7 +1669,7 @@ class CollisionPipeline:
                 point teleports). Cannot be combined with a prebuilt
                 ``narrow_phase``. Defaults to False.
             convex_collision: Experimental per-instance convex query implementation. ``auto`` chooses
-                ordinary or rejection queries; explicit ``ordinary``, ``rejection`` and ``convex_cells``
+                ordinary queries, rejection screening or convex cells; explicit choices
                 force a supported method. ``None`` retains the legacy environment selection.
             narrow_phase: Optional prebuilt narrow phase instance. Must be
                 provided together with a broad phase instance for expert usage.
@@ -2373,24 +2373,30 @@ class CollisionPipeline:
                 diagnostics=coherent_stats == "1"
             )
             self._convex_selection_reason = "explicit_rejection"
-            if coherent_convex == "auto":
-                from ..geometry.convex_query_cost import _ConvexMethodChoice  # noqa: PLC0415
-
-                self.narrow_phase._convex_method_choice = _ConvexMethodChoice(device=device, slots=eligible)
-                self._convex_selection_reason = "sampled_cost"
-            if convex_cells == "1":
+            if convex_cells == "1" or coherent_convex == "auto":
                 from ..geometry.convex_cells import _CellOwner  # noqa: PLC0415
                 from ..geometry.convex_cells_factories import coherent_kernels, manifold_kernel  # noqa: PLC0415
 
                 owner = _CellOwner(model)
                 if owner.metadata["admitted_meshes"]:
                     self._convex_cells = owner
-                    self._convex_selection_reason = "explicit_cells"
                     self.narrow_phase._cells_owner = owner
-                    self.narrow_phase._coherent_query_kernels = coherent_kernels(diagnostics=coherent_stats == "1")
-                    self.narrow_phase.narrow_phase_manifold_kernel = manifold_kernel(self.narrow_phase)
+                    if coherent_convex == "auto":
+                        self.narrow_phase._auto_cell_query_kernels = coherent_kernels(diagnostics=coherent_stats == "1")
+                        self.narrow_phase._auto_cell_manifold_kernel = manifold_kernel(self.narrow_phase)
+                    else:
+                        self._convex_selection_reason = "explicit_cells"
+                        self.narrow_phase._coherent_query_kernels = coherent_kernels(diagnostics=coherent_stats == "1")
+                        self.narrow_phase.narrow_phase_manifold_kernel = manifold_kernel(self.narrow_phase)
                 elif convex_collision == "convex_cells":
                     raise ValueError("convex_collision='convex_cells' requires at least one admitted convex mesh")
+            if coherent_convex == "auto":
+                from ..geometry.convex_query_cost import _ConvexMethodChoice  # noqa: PLC0415
+
+                self.narrow_phase._convex_method_choice = _ConvexMethodChoice(
+                    device=device, slots=eligible, cells=self._convex_cells
+                )
+                self._convex_selection_reason = "sampled_cost"
 
         # Built here (not in finalize) so models/tasks that never collide don't pay for it.
         # Host-side, so not graph-capture-safe -- construct the pipeline before any capture.
@@ -2520,7 +2526,8 @@ class CollisionPipeline:
         result = {"requested": self.convex_collision, "reason": self._convex_selection_reason}
         if owner is not None:
             result.update(owner.describe())
-            result["method"] = "rejection" if result["method"] == "reject_only" else "ordinary"
+            if result["method"] == "reject_only":
+                result["method"] = "rejection"
         else:
             result["method"] = (
                 "convex_cells"

@@ -2729,6 +2729,8 @@ class NarrowPhase:
         self._convex_method_choice = None
         self._coherent_query_kernels = None
         self._cells_owner = None
+        self._auto_cell_query_kernels = ()
+        self._auto_cell_manifold_kernel = None
         # Create the appropriate kernel variants
         # Primitive kernel handles lightweight primitives and routes remaining pairs
         self.primitive_kernel = create_narrow_phase_primitive_kernel(
@@ -3238,19 +3240,44 @@ class NarrowPhase:
                         self.split_manifold_work_items,
                         self.split_manifold_work_count,
                     ]
-                    if self._cells_owner is not None:
+                    if self._cells_owner is not None and self._convex_method_choice is None:
                         coherent_inputs.append(self._cells_owner.data)
 
                     def rejection(query_count=None, gjk_count=None):
                         if query_count is not None:
                             coherent_inputs[1] = query_count
                             coherent_inputs[7] = gjk_count
-                        self._coherent_cache.begin()
+                        if self._convex_method_choice is None:
+                            self._coherent_cache.begin()
                         for coherent_kernel in self._coherent_query_kernels:
                             wp.launch(
                                 kernel=coherent_kernel,
                                 dim=self.total_num_threads,
                                 inputs=coherent_inputs,
+                                device=device,
+                                block_dim=self.block_dim,
+                                record_tape=False,
+                            )
+
+                    def cells(query_count, gjk_count, manifold_count):
+                        cell_inputs = [
+                            convex_pairs,
+                            query_count,
+                            pair_inputs,
+                            self._coherent_cache.data,
+                            self.total_num_threads,
+                            self.split_query_results,
+                            self.split_gjk_work_items,
+                            gjk_count,
+                            self.split_manifold_work_items,
+                            manifold_count,
+                            self._cells_owner.data,
+                        ]
+                        for kernel in self._auto_cell_query_kernels:
+                            wp.launch(
+                                kernel,
+                                self.total_num_threads,
+                                cell_inputs,
                                 device=device,
                                 block_dim=self.block_dim,
                                 record_tape=False,
@@ -3294,7 +3321,15 @@ class NarrowPhase:
                     )
 
                 if self._convex_method_choice is not None:
-                    self._convex_method_choice.launch(convex_pairs, convex_pair_count, pair_inputs, ordinary, rejection)
+                    self._coherent_cache.begin()
+                    self._convex_method_choice.launch(
+                        convex_pairs,
+                        convex_pair_count,
+                        pair_inputs,
+                        ordinary,
+                        rejection,
+                        cells if self._cells_owner is not None else None,
+                    )
                 elif self._coherent_cache is not None:
                     rejection()
                 else:
@@ -3310,12 +3345,34 @@ class NarrowPhase:
                         self.split_query_results,
                         self.split_manifold_work_items,
                         self.split_manifold_work_count,
-                        *([self._cells_owner.data] if self._cells_owner is not None else []),
+                        *(
+                            [self._cells_owner.data]
+                            if self._cells_owner is not None and self._convex_method_choice is None
+                            else []
+                        ),
                     ],
                     device=device,
                     block_dim=self.block_dim,
                     record_tape=False,
                 )
+                if self._auto_cell_manifold_kernel is not None:
+                    wp.launch(
+                        self._auto_cell_manifold_kernel,
+                        self.total_num_threads,
+                        [
+                            convex_pairs,
+                            *common_inputs,
+                            writer_data,
+                            self.total_num_threads,
+                            self.split_query_results,
+                            self.split_manifold_work_items,
+                            self._convex_method_choice.cell_manifold_count,
+                            self._cells_owner.data,
+                        ],
+                        device=device,
+                        block_dim=self.block_dim,
+                        record_tape=False,
+                    )
             else:
                 wp.launch(
                     kernel=self.narrow_phase_kernel,

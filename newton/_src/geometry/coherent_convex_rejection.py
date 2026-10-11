@@ -149,6 +149,8 @@ def _create_rejection_query_kernels(*, diagnostics=False):
         manifold_work_items: wp.array[int],
         manifold_work_count: wp.array[int],
     ):
+        if candidate_pair_count[0] == 0:
+            return
         tid = wp.tid()
         count = wp.min(cache.unresolved_work_items.shape[0], cache.unresolved_work_count[0])
         for work_index in range(tid, count, total_num_threads):
@@ -199,6 +201,8 @@ def _create_rejection_query_kernels(*, diagnostics=False):
         manifold_work_items: wp.array[int],
         manifold_work_count: wp.array[int],
     ):
+        if candidate_pair_count[0] == 0:
+            return
         tid = wp.tid()
         count = wp.min(gjk_work_items.shape[0], gjk_work_count[0])
         for work_index in range(tid, count, total_num_threads):
