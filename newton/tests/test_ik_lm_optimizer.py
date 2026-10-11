@@ -38,12 +38,10 @@ def _build_revolute_chain(n_dofs: int, device: wp.Device) -> newton.Model:
     return builder.finalize(device=device, requires_grad=True)
 
 
-def test_lm_tiled_solve_75_by_126(test, device):
-    """The SMPL-sized LM system must launch and match a dense reference solve."""
+def test_lm_tiled_solve_matches_dense(test, device, n_dofs, n_residuals):
+    """Wide articulation and tall contact systems must match a dense reference solve."""
     with wp.ScopedDevice(device):
         batch = 2
-        n_dofs = 75
-        n_residuals = 126
         rng = np.random.default_rng(42)
         jacobian_np = rng.normal(size=(batch, n_residuals, n_dofs)).astype(np.float32)
         residuals_np = rng.normal(size=(batch, n_residuals, 1)).astype(np.float32)
@@ -192,8 +190,18 @@ cuda_devices = get_selected_cuda_test_devices()
 add_function_test(
     TestIKOptimizerLM,
     "test_lm_tiled_solve_75_by_126",
-    test_lm_tiled_solve_75_by_126,
+    test_lm_tiled_solve_matches_dense,
     cuda_devices,
+    n_dofs=75,
+    n_residuals=126,
+)
+add_function_test(
+    TestIKOptimizerLM,
+    "test_lm_tiled_solve_18_by_1267",
+    test_lm_tiled_solve_matches_dense,
+    cuda_devices[:1],
+    n_dofs=18,
+    n_residuals=1267,
 )
 add_function_test(
     TestIKOptimizerLM,

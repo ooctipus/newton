@@ -918,7 +918,7 @@ class IKOptimizerLM:
     @classmethod
     def _build_specialized(cls, key: tuple[int, int, str, bool]) -> type[IKOptimizerLM]:
         """Build a specialized LM optimizer with a device-compatible linear solve."""
-        C, R, _, use_tiled_solve = key
+        C, R, arch, use_tiled_solve = key
 
         def _template(
             jacobians: wp.array3d[wp.float32],  # (n_batch, n_residuals, n_dofs)
@@ -1229,7 +1229,8 @@ class IKOptimizerLM:
         class _Specialized(IKOptimizerLM):
             TILE_N_DOFS = wp.constant(C)
             TILE_N_RESIDUALS = wp.constant(R)
-            TILE_THREADS = wp.constant(32)
+            # Large Jacobians need several warps to use their shared-memory allocation.
+            TILE_THREADS = wp.constant(256 if arch and C * R >= 4096 else 32)
             USE_TILED_SOLVE = use_tiled_solve
 
             def _solve_normal_equations(

@@ -1070,8 +1070,33 @@ def mesh_vs_convex_midphase(
     aabb_upper = wp.vec3(0.0)
     center_in_bvh = wp.vec3(0.0)
     if wp.static(ENABLE_TILE_BVH_QUERY):
-        # All lanes query the same pair, so compute the bounds once per block.
-        if idx_in_thread_block == 0:
+        # Hull bounds are a vertex reduction. Share that work across the query
+        # block instead of making one lane perform six serial support scans.
+        if shape_type[non_mesh_shape] == GeoType.CONVEX_MESH:
+            hull = wp.mesh_get(shape_source_ptr[non_mesh_shape])
+            X_mesh_shape = wp.transform_multiply(wp.transform_inverse(X_mesh_ws), X_ws)
+            data = shape_data[non_mesh_shape]
+            scale = wp.vec3(data[0], data[1], data[2])
+            lo = wp.vec3(wp.inf)
+            hi = wp.vec3(-wp.inf)
+            for vertex in range(idx_in_thread_block, hull.points.shape[0], wp.block_dim()):
+                point = wp.transform_point(X_mesh_shape, wp.cw_mul(hull.points[vertex], scale))
+                lo = wp.min(lo, point)
+                hi = wp.max(hi, point)
+            lo = wp.vec3(wp.tile_min(wp.tile(lo[0]))[0], wp.tile_min(wp.tile(lo[1]))[0], wp.tile_min(wp.tile(lo[2]))[0])
+            hi = wp.vec3(wp.tile_max(wp.tile(hi[0]))[0], wp.tile_max(wp.tile(hi[1]))[0], wp.tile_max(wp.tile(hi[2]))[0])
+            mesh_data = shape_data[mesh_shape]
+            mesh_scale = wp.vec3(mesh_data[0], mesh_data[1], mesh_data[2])
+            aabb_lower, aabb_upper, inverse_scale = aabb_to_unscaled(lo, hi, mesh_scale)
+            margin = wp.vec3(
+                contact_threshold / wp.max(wp.abs(mesh_scale[0]), 1.0e-12),
+                contact_threshold / wp.max(wp.abs(mesh_scale[1]), 1.0e-12),
+                contact_threshold / wp.max(wp.abs(mesh_scale[2]), 1.0e-12),
+            )
+            aabb_lower -= margin
+            aabb_upper += margin
+            center_in_bvh = wp.cw_mul(wp.transform_get_translation(X_mesh_shape), inverse_scale)
+        elif idx_in_thread_block == 0:
             aabb_lower, aabb_upper, center_in_bvh = _compute_mesh_vs_convex_query_aabb(
                 mesh_shape,
                 non_mesh_shape,

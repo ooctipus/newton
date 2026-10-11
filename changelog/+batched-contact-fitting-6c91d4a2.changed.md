@@ -1,0 +1,1 @@
+Speed up large batched inverse-kinematics systems and convex-hull terrain queries by distributing Jacobian and hull-bound work across GPU blocks, with unchanged solver equations and collision geometry. No configuration changes are required.

@@ -3096,6 +3096,24 @@ def test_mesh_convex_midphase_queries_margin_shell(test, device):
     builder.add_articulation([joint])
     builder.add_shape_sphere(body=body, radius=radius, cfg=cfg)
 
+    # A shifted, rotated, nonuniformly scaled hull exercises the parallel
+    # vertex bounds as well as the primitive bound path above.
+    box = newton.Mesh.create_box(0.1, 0.07, 0.13, duplicate_vertices=False, compute_inertia=False)
+    vertices = box.vertices + np.array([0.17, -0.09, 0.05], dtype=np.float32)
+    scale = np.array([0.75, 1.5, 0.8], dtype=np.float32)
+    rotation = wp.quat_from_axis_angle(wp.normalize(wp.vec3(1.0, 2.0, 3.0)), 0.7)
+    rotated = np.array([wp.quat_rotate(rotation, wp.vec3(vertex * scale)) for vertex in vertices])
+    position = wp.vec3(-0.55, 0.0, surface_separation - float(rotated[:, 2].min()))
+    hull_body = builder.add_link(xform=wp.transform(position, rotation))
+    hull_joint = builder.add_joint_free(child=hull_body)
+    builder.add_articulation([hull_joint])
+    hull_shape = builder.add_shape_convex_hull(
+        body=hull_body,
+        mesh=newton.Mesh(vertices, box.indices, compute_inertia=False),
+        scale=scale,
+        cfg=cfg,
+    )
+
     model = builder.finalize(device=device)
     state = model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state)
@@ -3105,7 +3123,16 @@ def test_mesh_convex_midphase_queries_margin_shell(test, device):
     pipeline.collide(state, contacts)
 
     contact_count = int(contacts.rigid_contact_count.numpy()[0])
-    test.assertGreater(contact_count, 0)
+    pairs = {
+        tuple(sorted(pair))
+        for pair in zip(
+            contacts.rigid_contact_shape0.numpy()[:contact_count],
+            contacts.rigid_contact_shape1.numpy()[:contact_count],
+            strict=True,
+        )
+    }
+    test.assertIn((0, 1), pairs)
+    test.assertIn((0, hull_shape), pairs)
 
 
 def test_rigid_mesh_contacts_export_surface_velocity(test, device):
