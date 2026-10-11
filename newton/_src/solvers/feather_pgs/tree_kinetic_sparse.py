@@ -6,7 +6,7 @@
 import numpy as np
 import warp as wp
 
-from .sparse_factor import SparseData, SparsePlan
+from .sparse_factor import SparseData, bind_operator_plan, operator_metadata
 from .sparse_mass_matrix import _get_crba_sparse_factor_kernel
 from .tree_kinetic_owner import TreeKineticState
 
@@ -51,28 +51,8 @@ class TreeSparseOperator:
         self.requires_body_velocity = True
         mass = solver._sparse_mass_matrix_plan
         n, device = mass.dof_count, solver.model.device
-        counts = np.diff(mass.column_offsets).astype(np.int32)
-        nodes = np.full((n, int(counts.max())), -1, np.int32)
-        for col in range(n):
-            begin, end = mass.column_offsets[col : col + 2]
-            nodes[col, : end - begin] = mass.entry_rows[mass.column_entries[begin:end]]
-        self.host = {
-            "index": mass.lookup,
-            "row": mass.entry_rows,
-            "col": mass.columns,
-            "source": mass.permutation[mass.columns],
-            "inverse_nodes": nodes,
-            "inverse_count": counts,
-            "dof_joint": mass.dof_joint,
-        }
-        self.plan = SparsePlan()
-        for name, values in self.host.items():
-            setattr(self.plan, name, wp.array(values, dtype=int, device=device))
-        self.plan.group_to_art = solver.group_to_art[n]
-        self.plan.art_to_world = solver.art_to_world
-        self.plan.art_dof_start = solver.articulation_dof_start
-        self.plan.art_joint_start = solver.model.articulation_start
-        self.plan.joint_child = solver.model.joint_child
+        self.host = operator_metadata(mass)
+        self.plan = bind_operator_plan(solver, n, self.host)
         self.data = SparseData()
         self.data.W = solver._sparse_Linv
         # The native factor publishes status instead of a second validity bit.

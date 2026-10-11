@@ -8,7 +8,7 @@ import warp as wp
 
 from ...sim import JointType
 from .franka_kinetic_factor import get_kernel as geometric_factor
-from .sparse_factor import SparsePlan
+from .sparse_factor import bind_operator_plan, operator_metadata
 from .sparse_mass_matrix import _SparseMassMatrixPlan
 from .tree_kinetic_owner import TreeKineticState
 from .tree_kinetic_plan import make_plan
@@ -130,28 +130,8 @@ class TreeHeldOperator:
         mass = self.mass = _SparseMassMatrixPlan.build(parents, counts)
         if mass.dof_count != size:
             raise ValueError("Mixed tree physical and factor dimensions differ")
-        inverse_count = np.diff(mass.column_offsets).astype(np.int32)
-        nodes = np.full((size, int(inverse_count.max())), -1, np.int32)
-        for col in range(size):
-            begin, end = mass.column_offsets[col : col + 2]
-            nodes[col, : end - begin] = mass.entry_rows[mass.column_entries[begin:end]]
-        self.host = {
-            "index": mass.lookup,
-            "row": mass.entry_rows,
-            "col": mass.columns,
-            "source": mass.permutation[mass.columns],
-            "inverse_nodes": nodes,
-            "inverse_count": inverse_count,
-            "dof_joint": mass.dof_joint,
-        }
-        self.plan = SparsePlan()
-        for name, value in self.host.items():
-            setattr(self.plan, name, wp.array(value, dtype=int, device=device))
-        self.plan.group_to_art = solver.group_to_art[size]
-        self.plan.art_to_world = solver.art_to_world
-        self.plan.art_dof_start = solver.articulation_dof_start
-        self.plan.art_joint_start = model.articulation_start
-        self.plan.joint_child = model.joint_child
+        self.host = operator_metadata(mass)
+        self.plan = bind_operator_plan(solver, size, self.host)
         self.layout, _, _ = make_plan(model, self, complete=False)
         physical_index = np.full((size, size), -1, np.int32)
         for index, (row, col) in enumerate(zip(mass.entry_rows, mass.columns, strict=True)):

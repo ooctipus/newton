@@ -65,6 +65,41 @@ class SparseData:
     incident: wp.array2d[float]
 
 
+def operator_metadata(mass, *, inverse_column_width=None):
+    """Describe topology-derived factor coordinates for every cached tree adapter."""
+    counts = np.diff(mass.column_offsets).astype(np.int32)
+    width = int(counts.max()) if inverse_column_width is None else inverse_column_width
+    if width < int(counts.max()):
+        raise ValueError("Inverse-column storage does not cover the factor topology")
+    nodes = np.full((mass.dof_count, width), -1, np.int32)
+    for col in range(mass.dof_count):
+        begin, end = mass.column_offsets[col : col + 2]
+        nodes[col, : end - begin] = mass.entry_rows[mass.column_entries[begin:end]]
+    return {
+        "index": mass.lookup,
+        "row": mass.entry_rows,
+        "col": mass.columns,
+        "source": mass.permutation[mass.columns],
+        "inverse_nodes": nodes,
+        "inverse_count": counts,
+        "dof_joint": mass.dof_joint,
+    }
+
+
+def bind_operator_plan(solver, size, host):
+    """Bind factor metadata and articulation ownership without choosing a row law."""
+    model = solver.model
+    plan = SparsePlan()
+    for name, values in host.items():
+        setattr(plan, name, wp.array(values, dtype=wp.uint64 if name == "body_mask" else int, device=model.device))
+    plan.group_to_art = solver.group_to_art[size]
+    plan.art_to_world = solver.art_to_world
+    plan.art_dof_start = solver.articulation_dof_start
+    plan.art_joint_start = model.articulation_start
+    plan.joint_child = model.joint_child
+    return plan
+
+
 def make_plan(model, solver=None):
     """Prove the complete tree and possible dynamic endpoint support once."""
     worlds = int(model.world_count)
@@ -152,11 +187,6 @@ def make_plan(model, solver=None):
     )
     if not np.array_equal(mass_plan.permutation, np.arange(42, -1, -1)) or mass_plan.nonzero_count != 434:
         raise ValueError("Sparse producer coordinate ABI differs from the checked tree")
-    inverse_nodes = np.full((43, 18), -1, np.int32)
-    inverse_count = np.diff(mass_plan.column_offsets).astype(np.int32)
-    for col in range(43):
-        begin, end = mass_plan.column_offsets[col : col + 2]
-        inverse_nodes[col, : end - begin] = mass_plan.entry_rows[mass_plan.column_entries[begin:end]]
     body_masks = np.zeros(44, dtype=np.uint64)
     body_masks[child[0]] = mass_plan.joint_ancestor_mask
     # These are the endpoint classes admitted by the unchanged producer guard.
@@ -169,32 +199,18 @@ def make_plan(model, solver=None):
         dtype=np.uint64,
     )
     host = {
-        "index": mass_plan.lookup,
-        "row": mass_plan.entry_rows,
-        "col": mass_plan.columns,
-        "source": mass_plan.permutation[mass_plan.columns],
-        "inverse_nodes": inverse_nodes,
-        "inverse_count": inverse_count,
+        **operator_metadata(mass_plan, inverse_column_width=18),
         "support_nodes": support.class_dof,
         "support_count": np.sum(support.class_dof >= 0, axis=1).astype(np.int32),
         "limit_support": support.limit_class,
         "pair_support": support.pair_class,
         "body_mask": np.tile(physical_masks, worlds),
         "body_tag": np.tile(support.body_class, worlds),
-        "dof_joint": mass_plan.dof_joint,
     }
     # Deeper physical DOF owns the composite inertia (same original source map).
     if solver is None:
         return host
-    plan = SparsePlan()
-    for name, values in host.items():
-        setattr(plan, name, wp.array(values, dtype=wp.uint64 if name == "body_mask" else int, device=model.device))
-    plan.group_to_art = solver.group_to_art[43]
-    plan.art_to_world = solver.art_to_world
-    plan.art_dof_start = solver.articulation_dof_start
-    plan.art_joint_start = model.articulation_start
-    plan.joint_child = model.joint_child
-    return plan, host
+    return bind_operator_plan(solver, 43, host), host
 
 
 @cache
