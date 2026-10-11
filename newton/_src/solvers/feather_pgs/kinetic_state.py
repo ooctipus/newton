@@ -74,6 +74,7 @@ def checked_source():
             "integrate_generalized_joints",
             "jcalc_transform",
             "jcalc_motion",
+            "finalize_body_dynamics_values",
             "finalize_body_dynamics_body",
         ),
     )

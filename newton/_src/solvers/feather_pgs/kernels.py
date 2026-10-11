@@ -1231,6 +1231,67 @@ def eval_rigid_fk_kinematics(
 
 
 @wp.func
+def finalize_body_dynamics_values(
+    body: int,
+    articulation: int,
+    pose: wp.transform,
+    pose_com: wp.transform,
+    body_com: wp.array[wp.vec3],
+    body_mass: wp.array[float],
+    body_inertia: wp.array[wp.mat33],
+    is_free_rigid: wp.array[int],
+    origin: wp.vec3,
+    materialize_all_body_inertia: int,
+    materialize_body_inertia_terms: int,
+    gravity: wp.array[wp.vec3],
+    v_s: wp.spatial_vector,
+    a_s: wp.spatial_vector,
+    # outputs
+    body_I_s: wp.array[wp.spatial_matrix],
+    body_inertia_terms: wp.array2d[float],
+    body_f_s: wp.array[wp.spatial_vector],
+    body_qd: wp.array[wp.spatial_vector],
+):
+    """Build body dynamics and COM velocity from explicit current values."""
+    if articulation < 0:
+        com_world = wp.transform_point(pose, body_com[body])
+        v_com = wp.spatial_top(v_s) + wp.cross(wp.spatial_bottom(v_s), com_world)
+        body_qd[body] = wp.spatial_vector(v_com, wp.spatial_bottom(v_s))
+        return
+
+    X_sm = pose_com
+    X_sm_local = wp.transform(
+        wp.transform_get_translation(X_sm) - origin,
+        wp.transform_get_rotation(X_sm),
+    )
+    mass = body_mass[body]
+    com, inertia_origin = transform_com_inertia_terms(X_sm_local, mass, body_inertia[body])
+
+    write_body_inertia = materialize_all_body_inertia
+    if is_free_rigid[articulation] != 0:
+        write_body_inertia = 1
+    if write_body_inertia != 0:
+        body_I_s[body] = assemble_com_spatial_inertia(mass, com, inertia_origin)
+    if materialize_body_inertia_terms != 0:
+        body_inertia_terms[body, 0] = com[0]
+        body_inertia_terms[body, 1] = com[1]
+        body_inertia_terms[body, 2] = com[2]
+        for row in range(3):
+            for col in range(3):
+                body_inertia_terms[body, 3 + 3 * row + col] = inertia_origin[row, col]
+
+    coriolis = spatial_cross_dual(v_s, mul_com_spatial_inertia(mass, com, inertia_origin, v_s))
+    f_b_s = mul_com_spatial_inertia(mass, com, inertia_origin, a_s) + coriolis
+    f_g = mass * gravity[0]
+    body_f_s[body] = f_b_s - wp.spatial_vector(f_g, wp.cross(com, f_g))
+
+    com_world = wp.transform_point(pose, body_com[body])
+    com_rel = com_world - origin
+    v_com = wp.spatial_top(v_s) + wp.cross(wp.spatial_bottom(v_s), com_rel)
+    body_qd[body] = wp.spatial_vector(v_com, wp.spatial_bottom(v_s))
+
+
+@wp.func
 def finalize_body_dynamics_body(
     body: int,
     body_to_articulation: wp.array[int],
@@ -1252,47 +1313,35 @@ def finalize_body_dynamics_body(
     body_f_s: wp.array[wp.spatial_vector],
     body_qd: wp.array[wp.spatial_vector],
 ):
-    """Build one body's dynamics and publish its COM velocity."""
+    """Load current canonical values and publish one body's dynamics."""
     articulation = body_to_articulation[body]
-    v_s = body_v_s[body]
-    if articulation < 0:
-        com_world = wp.transform_point(body_q[body], body_com[body])
-        v_com = wp.spatial_top(v_s) + wp.cross(wp.spatial_bottom(v_s), com_world)
-        body_qd[body] = wp.spatial_vector(v_com, wp.spatial_bottom(v_s))
-        return
-
-    origin = articulation_origin[articulation]
-    X_sm = body_q_com[body]
-    X_sm_local = wp.transform(
-        wp.transform_get_translation(X_sm) - origin,
-        wp.transform_get_rotation(X_sm),
+    origin = wp.vec3(0.0)
+    pose_com = wp.transform_identity()
+    acceleration = wp.spatial_vector(wp.vec3(0.0), wp.vec3(0.0))
+    if articulation >= 0:
+        origin = articulation_origin[articulation]
+        pose_com = body_q_com[body]
+        acceleration = body_a_s[body]
+    finalize_body_dynamics_values(
+        body,
+        articulation,
+        body_q[body],
+        pose_com,
+        body_com,
+        body_mass,
+        body_inertia,
+        is_free_rigid,
+        origin,
+        materialize_all_body_inertia,
+        materialize_body_inertia_terms,
+        gravity,
+        body_v_s[body],
+        acceleration,
+        body_I_s,
+        body_inertia_terms,
+        body_f_s,
+        body_qd,
     )
-    mass = body_mass[body]
-    com, inertia_origin = transform_com_inertia_terms(X_sm_local, mass, body_inertia[body])
-
-    write_body_inertia = materialize_all_body_inertia
-    if is_free_rigid[articulation] != 0:
-        write_body_inertia = 1
-    if write_body_inertia != 0:
-        body_I_s[body] = assemble_com_spatial_inertia(mass, com, inertia_origin)
-    if materialize_body_inertia_terms != 0:
-        body_inertia_terms[body, 0] = com[0]
-        body_inertia_terms[body, 1] = com[1]
-        body_inertia_terms[body, 2] = com[2]
-        for row in range(3):
-            for col in range(3):
-                body_inertia_terms[body, 3 + 3 * row + col] = inertia_origin[row, col]
-
-    a_s = body_a_s[body]
-    coriolis = spatial_cross_dual(v_s, mul_com_spatial_inertia(mass, com, inertia_origin, v_s))
-    f_b_s = mul_com_spatial_inertia(mass, com, inertia_origin, a_s) + coriolis
-    f_g = mass * gravity[0]
-    body_f_s[body] = f_b_s - wp.spatial_vector(f_g, wp.cross(com, f_g))
-
-    com_world = wp.transform_point(body_q[body], body_com[body])
-    com_rel = com_world - origin
-    v_com = wp.spatial_top(v_s) + wp.cross(wp.spatial_bottom(v_s), com_rel)
-    body_qd[body] = wp.spatial_vector(v_com, wp.spatial_bottom(v_s))
 
 
 @wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)

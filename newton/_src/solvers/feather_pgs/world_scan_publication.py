@@ -7,12 +7,9 @@ One body per lane composes current transforms and twist/bias-acceleration
 segments. This owns no mass factor, constraint solve, or early-publication stream.
 """
 
-import ast
 import functools
 import hashlib
-import inspect
 import linecache
-import textwrap
 
 import numpy as np
 import warp as wp
@@ -166,55 +163,10 @@ _MOTION_SCAN = scan_source(True)
 def _scan_motion(address: wp.uint64, world: int, plan: kuka_joint_world.JointWorldPlan): ...
 
 
-def finalizer_source():
-    """Retain the original body law while replacing five canonical reloads with private values."""
-    source = textwrap.dedent(inspect.getsource(kernels.finalize_body_dynamics_body.func))
-    tree = ast.parse(source)
-    function = tree.body[0]
-    function.name = "_scan_finalize_body_values"
-    extra = (
-        ast.parse(
-            "def extra(pose: wp.transform, pose_com: wp.transform, origin_value: wp.vec3, "
-            "velocity: wp.spatial_vector, acceleration: wp.spatial_vector):\n    pass"
-        )
-        .body[0]
-        .args.args
-    )
-    function.args.args.extend(extra)
-    replacements = {
-        "body_q[body]": "pose",
-        "body_q_com[body]": "pose_com",
-        "articulation_origin[articulation]": "origin_value",
-        "body_v_s[body]": "velocity",
-        "body_a_s[body]": "acceleration",
-    }
-    counts = dict.fromkeys(replacements, 0)
-
-    class ReplaceValues(ast.NodeTransformer):
-        def visit_Subscript(self, node):
-            key = ast.unparse(node)
-            if key in replacements and isinstance(node.ctx, ast.Load):
-                counts[key] += 1
-                return ast.copy_location(ast.Name(id=replacements[key], ctx=ast.Load()), node)
-            return self.generic_visit(node)
-
-    tree = ReplaceValues().visit(tree)
-    if counts != {
-        "body_q[body]": 2,
-        "body_q_com[body]": 1,
-        "articulation_origin[articulation]": 1,
-        "body_v_s[body]": 1,
-        "body_a_s[body]": 1,
-    }:
-        raise RuntimeError("Original finalizer ownership changed; review the private value adapter")
-    ast.fix_missing_locations(tree)
-    return ast.unparse(tree) + "\n"
-
-
 @functools.cache
-def get_kernel(arch):
+def _publication_kernels(arch):
     """Compile the complete late generalized, pose, twist and dynamics owner."""
-    source = finalizer_source() + "\n".join(
+    source = "\n".join(
         kuka_joint_world.operation_source(name)
         for name in (
             "update_qdd_from_velocity",
@@ -229,52 +181,58 @@ def get_kernel(arch):
     update_qdd = namespace["_light_update_qdd_from_velocity"]
     remove_transport = namespace["_light_remove_free_root_transport_from_qdd"]
     integrate = namespace["_light_integrate_generalized_joints"]
-    finalize = namespace["_scan_finalize_body_values"]
+    finalize = kernels.finalize_body_dynamics_values
 
-    @wp.kernel(module="unique", enable_backward=False)
-    def world_scan_publication(plan: kuka_joint_world.JointWorldPlan, data: PublicationData):
-        world, logical_lane = wp.tid()
+    @wp.func
+    def publish_world(
+        world: int,
+        logical_lane: int,
+        plan: kuka_joint_world.JointWorldPlan,
+        data: PublicationData,
+        already_integrated: int,
+    ):
         lanes = _lane()
         lane, stride = lanes[0], lanes[1]
         if stride == 1 and logical_lane != 0:
             return
         address = _storage()
-        for local in range(lane, 35, stride):
-            dof = plan.dof_ids[world, local]
-            update_qdd(dof, data.joint_qd, data.kinematic_dof_mask, 1.0 / data.dt, data.v_out, data.joint_qdd)
-        _sync()
-        for root in range(lane, 2, stride):
-            remove_transport(
-                plan.root_slots[world, root],
-                data.free_root_joint_indices,
-                data.joint_qd_start,
-                data.kinematic_joint_mask,
-                data.joint_qd,
-                data.joint_qdd,
-            )
-        _sync()
-        for local in range(lane, 32, stride):
-            joint = plan.joint_ids[world, local]
-            integrate(
-                joint,
-                data.joint_type,
-                data.joint_parent,
-                data.joint_child,
-                data.joint_q_start,
-                data.joint_qd_start,
-                data.kinematic_joint_mask,
-                data.joint_dof_dim,
-                data.body_com,
-                data.joint_X_c,
-                data.joint_q,
-                data.joint_qd,
-                data.joint_qdd,
-                data.dt,
-                data.angular_damping,
-                data.joint_q_new,
-                data.joint_qd_new,
-            )
-        _sync()
+        if already_integrated == 0:
+            for local in range(lane, 35, stride):
+                dof = plan.dof_ids[world, local]
+                update_qdd(dof, data.joint_qd, data.kinematic_dof_mask, 1.0 / data.dt, data.v_out, data.joint_qdd)
+            _sync()
+            for root in range(lane, 2, stride):
+                remove_transport(
+                    plan.root_slots[world, root],
+                    data.free_root_joint_indices,
+                    data.joint_qd_start,
+                    data.kinematic_joint_mask,
+                    data.joint_qd,
+                    data.joint_qdd,
+                )
+            _sync()
+            for local in range(lane, 32, stride):
+                joint = plan.joint_ids[world, local]
+                integrate(
+                    joint,
+                    data.joint_type,
+                    data.joint_parent,
+                    data.joint_child,
+                    data.joint_q_start,
+                    data.joint_qd_start,
+                    data.kinematic_joint_mask,
+                    data.joint_dof_dim,
+                    data.body_com,
+                    data.joint_X_c,
+                    data.joint_q,
+                    data.joint_qd,
+                    data.joint_qdd,
+                    data.dt,
+                    data.angular_damping,
+                    data.joint_q_new,
+                    data.joint_qd_new,
+                )
+            _sync()
         for local in range(lane, 32, stride):
             joint = plan.joint_ids[world, local]
             transform = kernels.jcalc_transform(
@@ -342,28 +300,23 @@ def get_kernel(arch):
             data.body_a_s[body] = acceleration
             finalize(
                 body,
-                data.body_to_articulation,
-                data.body_q,
-                data.body_q_com,
+                data.body_to_articulation[body],
+                pose,
+                pose_com,
                 data.body_com,
                 data.body_mass,
                 data.body_inertia,
                 data.is_free_rigid,
-                data.articulation_origin,
+                origin,
                 data.materialize_all_body_inertia,
                 data.materialize_body_inertia_terms,
                 data.gravity,
-                data.body_v_s,
-                data.body_a_s,
+                velocity,
+                acceleration,
                 data.body_I_s,
                 data.body_inertia_terms,
                 data.body_f_s,
                 data.body_qd,
-                pose,
-                pose_com,
-                origin,
-                velocity,
-                acceleration,
             )
         _sync()
         for root in range(lane, 3, stride):
@@ -373,47 +326,31 @@ def get_kernel(arch):
             data.fk_id_cache_valid[data.body_to_articulation[plan.body_ids[world, root_lane]]] = 1
         _release(address)
 
-    return world_scan_publication
+    @wp.kernel(module="unique", enable_backward=False)
+    def world_scan_publication(plan: kuka_joint_world.JointWorldPlan, data: PublicationData):
+        world, logical_lane = wp.tid()
+        publish_world(world, logical_lane, plan, data, 0)
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def world_scan_publication_resolved(
+        plan: kuka_joint_world.JointWorldPlan, data: PublicationData, resolved: wp.array[int]
+    ):
+        world, logical_lane = wp.tid()
+        publish_world(world, logical_lane, plan, data, resolved[world])
+
+    return world_scan_publication, world_scan_publication_resolved
 
 
-def _resolved_source(source):
-    """Guard only generalized work already published by the current light owner."""
-    signature = "    def world_scan_publication(plan: kuka_joint_world.JointWorldPlan, data: PublicationData):\n"
-    first = "        for local in range(lane, 35, stride):\n"
-    body = (
-        "        for local in range(lane, 32, stride):\n"
-        "            joint = plan.joint_ids[world, local]\n"
-        "            transform = kernels.jcalc_transform(\n"
-    )
-    for seam in (signature, first, body, "def get_kernel(arch):\n", "    return world_scan_publication\n"):
-        if source.count(seam) != 1:
-            raise ValueError("Original publication ownership seam changed; review resolved composition")
-    start, end = source.index(first), source.index(body)
-    generalized = source[start:end]
-    if start >= end or generalized.count("        _sync()\n") != 3:
-        raise ValueError("Original generalized publication boundaries changed")
-    result = source[:start] + "        if resolved[world] == 0:\n" + textwrap.indent(generalized, "    ") + source[end:]
-    result = result.replace("def get_kernel(arch):\n", "def _get_resolved_factory(arch):\n")
-    result = result.replace(
-        signature,
-        "    def world_scan_publication_resolved(\n"
-        "        plan: kuka_joint_world.JointWorldPlan, data: PublicationData, resolved: wp.array[int]\n"
-        "    ):\n",
-    )
-    return result.replace("    return world_scan_publication\n", "    return world_scan_publication_resolved\n")
+def get_kernel(arch):
+    """Return the standalone generalized and body publication owner."""
+    return _publication_kernels(arch)[0]
 
 
-@functools.cache
 def get_resolved_kernel(arch):
-    """Return the late body owner with a current light-resolved generalized skip.
+    """Publish bodies and integrate only worlds not handled by the current light owner.
 
     The caller must pass the current light owner's resolved array only after that
     invocation has integrated selected worlds. Ordinary ZERO classification does
     not establish this ownership and must use the standalone kernel instead.
     """
-    source = _resolved_source(inspect.getsource(get_kernel))
-    filename = f"<world-scan-resolved-{hashlib.sha256(source.encode()).hexdigest()}>"
-    linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)
-    namespace = dict(globals())
-    exec(compile(source, filename, "exec"), namespace)
-    return namespace["_get_resolved_factory"](arch)
+    return _publication_kernels(arch)[1]

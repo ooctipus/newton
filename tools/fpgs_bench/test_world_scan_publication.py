@@ -8,10 +8,7 @@ current numeric model data. This is matched-equation publication, not a replay
 of recorded trajectories or a contact/convergence certificate.
 """
 
-import ast
 import copy
-import inspect
-import textwrap
 import unittest
 from types import SimpleNamespace
 
@@ -363,27 +360,6 @@ def check_outputs(test, candidate, reference):
 
 
 class TestWorldScanPublication(unittest.TestCase):
-    def test_original_finalizer_statement_recovery(self):
-        """Recover every original finalizer statement after restoring only its private input reads."""
-        original_ast = ast.parse(textwrap.dedent(inspect.getsource(kernels.finalize_body_dynamics_body.func))).body[0]
-        adapted = ast.parse(scan.finalizer_source()).body[0]
-        replacements = {
-            "pose": "body_q[body]",
-            "pose_com": "body_q_com[body]",
-            "origin_value": "articulation_origin[articulation]",
-            "velocity": "body_v_s[body]",
-            "acceleration": "body_a_s[body]",
-        }
-
-        class Restore(ast.NodeTransformer):
-            def visit_Name(self, node):
-                if node.id in replacements:
-                    return ast.parse(replacements[node.id], mode="eval").body
-                return node
-
-        restored = Restore().visit(ast.Module(body=adapted.body, type_ignores=[]))
-        self.assertEqual(ast.dump(restored), ast.dump(ast.Module(body=original_ast.body, type_ignores=[])))
-
     def test_actual_plan_global35_and_depth_guard(self):
         """Cover both free roots and reject unsupported depth before native dispatch."""
         self.assertTrue(callable(scan.get_kernel))

@@ -53,7 +53,8 @@ PINNED = {
         "integrate_generalized_joints": "2418badf5019fb3b34eb3042e57835bda787a238c5227ff857ed950bed2d3a66",
         "jcalc_transform": "84d09399dec35112103e5b4bf315e81eddf5199a65075219d66a1f03df7e0996",
         "jcalc_motion": "15c927d5066b05e650fb66f1a28ccefbe8288218caba86a57d06da21e13bf608",
-        "finalize_body_dynamics_body": "fada293f8bbe51006f1b426b66658e6d7f0a9966b72667349c41714108c48657",
+        "finalize_body_dynamics_values": "eb0862fab868f5d0bfcfcf3b78161fc4b96cc23a35744ecd8439e6e0fb9867ff",
+        "finalize_body_dynamics_body": "16a2637f627c9b13948079cc96e8bc6d09fb7958f49f3f34c0a9a77672823d63",
     },
     "world_scan_publication.py": {
         "PublicationData": "fcf16576d1e626ccdb95ea13d55bbe84ec55a221d50705f1b03179e5f62d8452",
