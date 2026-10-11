@@ -9,9 +9,20 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import small_cholesky
+from newton._src.solvers.feather_pgs.kinetic_source import checked_definitions
 
 
 class TestSmallCholesky(unittest.TestCase):
+    def test_retained_free_refresh_admission(self):
+        """Admit the shared factor through the retained free-body refresh guard."""
+        checked_definitions(
+            "solver_feather_pgs.py",
+            ("_get_crba_cholesky_warp_kernel", "_get_inverse_cholesky_register_kernel", "_get_cholesky_kernel"),
+        )
+        checked_definitions(
+            "small_cholesky.py", ("_FACTOR", "_FORCE_INIT", "_COMPOSITE_INPUT", "_INPUTS", "get_kernel")
+        )
+
     def test_reject_unaddressable_inputs(self):
         """Reject schedules and launch shapes outside the packed factor contract."""
         for size, options in (

@@ -16,10 +16,17 @@ import hashlib
 from pathlib import Path
 
 PINNED = {
+    "small_cholesky.py": {
+        "_FACTOR": "5d79f0480c1169dc55f13a27e2f78051dea24c8644a6de019f1e9866a78e8f8b",
+        "_FORCE_INIT": "4e1883323ae63f673815d3f0e6aa1ef93365e126a1b6817f4cb2986e3c4faa3c",
+        "_COMPOSITE_INPUT": "1ec974e47efd2095efa91bca708d53d96e78051dff51faddb44159efd9ba5b9d",
+        "_INPUTS": "10b6aa85102d13efe7831ef5742108f1c689e04542dbb6bedcf9f3340e5f3ed4",
+        "get_kernel": "9f15442b962d54b4a71384b9710bf3b497a78df1bdfb82fa1d0be4f6f24e468a",
+    },
     "solver_feather_pgs.py": {
         "_get_pgs_solve_paired_factor_kernel": "51d610d20431d6740391c41df6fcdacf97d771add94eeb47724335276f3a9d54",
         "_get_pgs_solve_mf_gs_kernel": "7e3d01ba60a02ee946bfd84635cc6b400f243ea8f4ebbbf832d16fe2008bbca4",
-        "_get_crba_cholesky_warp_kernel": "d55ef23699f3c177c5bfc3da86397487de9014244f19a70fbcfe94f26dad17d6",
+        "_get_crba_cholesky_warp_kernel": "f507209b4a71155f75aa86a783241723e1370c41a0c262744c020bfc224969de",
         "_get_inverse_cholesky_register_kernel": "f1f2c60767d69d8006fb074c768877b921579954b7d36bc1efee9366212234d3",
         "_get_cholesky_kernel": "c262785fdd51c25f94c3c67ab4bb4cbe0fa95f16b61adcb788fbd16de10a4689",
         "_get_pack_mf_meta_kernel": "353265897c2af4cb85fc0e284b25bb9a862f67b54b74edd2e7b472a331c55a81",

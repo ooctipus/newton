@@ -233,6 +233,7 @@ def bind_free_refresh(bundle, publication, requested, *, R_group=None):
         "solver_feather_pgs.py",
         ("_get_crba_cholesky_warp_kernel", "_get_inverse_cholesky_register_kernel", "_get_cholesky_kernel"),
     )
+    checked_definitions("small_cholesky.py", ("_FACTOR", "_FORCE_INIT", "_COMPOSITE_INPUT", "_INPUTS", "get_kernel"))
     host, plan = bundle["host"], bundle["host"]["plan"]
     snapshot = host["snapshot"]
     device = wp.get_device(bundle["launch"]["device"])
