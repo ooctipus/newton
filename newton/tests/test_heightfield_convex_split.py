@@ -101,9 +101,12 @@ class TestHeightfieldConvexSplit(unittest.TestCase):
                 choice.choice.assign(np.array([cells], np.int32))
             reference.collide(state, before)
             wp.capture_launch(capture.graph)
-            checker.assert_current_contacts(reference, actual, state, before, after)
             if empty:
+                self.assertFalse(checker.raw_contacts(reference))
+                self.assertFalse(checker.raw_contacts(actual))
                 self.assertEqual(int(actual.narrow_phase._heightfield_convex_gjk_count.numpy()[0]), 0)
+            else:
+                checker.assert_current_contacts(reference, actual, state, before, after)
         reference.invalidate_convex_cells()
         actual.invalidate_convex_cells()
         reference.collide(state, before)
