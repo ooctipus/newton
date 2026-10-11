@@ -284,6 +284,8 @@ def create_compute_gjk_mpr_contacts(
     use_precomputed_center: bool = False,
     penetration_refiner: Any = None,
     query_filter: Any = None,
+    *,
+    external_support_data: bool = False,
 ):
     """
     Factory function to create a compute_gjk_mpr_contacts function with a specific writer function.
@@ -295,6 +297,7 @@ def create_compute_gjk_mpr_contacts(
         use_precomputed_center: Whether the geometry data supplies a cached center.
         penetration_refiner: Optional physical-proxy result refinement function.
         query_filter: Optional predicate for nonnegative-distance query witnesses.
+        external_support_data: Whether the caller supplies the support provider.
 
     Returns:
         A compute_gjk_mpr_contacts function with the writer function baked in
@@ -318,6 +321,7 @@ def create_compute_gjk_mpr_contacts(
         writer_data: Any,
         sort_sub_key: int = 0,
         query_context: Any = 0,
+        support_data: Any = 0,
     ):
         """
         Compute contacts between two shapes using GJK/MPR algorithm and write them.
@@ -337,8 +341,12 @@ def create_compute_gjk_mpr_contacts(
             writer_data: Data structure for contact writer
             sort_sub_key: Sub-key for deterministic contact sorting (e.g. triangle/edge index)
             query_context: Current geometry metadata for the optional query filter.
+            support_data: Provider bound by a factory with external support data.
         """
-        data_provider = SupportMapDataProvider()
+        if wp.static(external_support_data):
+            data_provider = support_data
+        else:
+            data_provider = SupportMapDataProvider()
 
         if shape_a_data.shape_type == int(GeoTypeEx.TRIANGLE):
             face_normal = wp.quat_rotate(rot_a, wp.cross(shape_a_data.scale, shape_a_data.auxiliary))

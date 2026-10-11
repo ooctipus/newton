@@ -2619,11 +2619,25 @@ class NarrowPhase:
             and primitive_writer_supported
         )
         self._heightfield_primitive_kernels = ()
+        heightfield_cells = os.environ.get("NEWTON_HEIGHTFIELD_CONVEX_CELLS", "0")
+        if heightfield_cells not in ("0", "1"):
+            raise ValueError("NEWTON_HEIGHTFIELD_CONVEX_CELLS must be 0 or 1")
+        self._heightfield_convex_cells_requested = heightfield_cells == "1"
+        if self._heightfield_convex_cells_requested and not self._heightfield_primitive_query:
+            raise ValueError("Terrain convex cells require the admitted reduced heightfield primitive-query owner")
+        self._heightfield_cell_owner = None
+        self._heightfield_convex_cell_kernel = None
+        if self._heightfield_convex_cells_requested:
+            from .heightfield_convex_cells import get_kernel  # noqa: PLC0415
+
+            self._heightfield_convex_cell_kernel = get_kernel()
         if self._heightfield_primitive_query:
             self._heightfield_primitive_kernels = (
                 create_mesh_triangle_contacts_to_reducer_kernel(int(GeoType.SPHERE)),
                 create_mesh_triangle_contacts_to_reducer_kernel(int(GeoType.CYLINDER)),
-                create_mesh_triangle_contacts_to_reducer_kernel(exclude_primitives=True),
+                create_mesh_triangle_contacts_to_reducer_kernel(
+                    exclude_primitives=True, exclude_heightfield_convex=self._heightfield_convex_cells_requested
+                ),
             )
         cylinder_split = os.environ.get("NEWTON_HEIGHTFIELD_CYLINDER_SPLIT", "0")
         if cylinder_split not in ("0", "1"):
@@ -3616,6 +3630,17 @@ class NarrowPhase:
                                 block_dim=self.mesh_triangle_block_dim,
                                 record_tape=False,
                             )
+                    if self._heightfield_convex_cell_kernel is not None:
+                        if self._heightfield_cell_owner is None:
+                            raise RuntimeError("Terrain convex cells require CollisionPipeline model binding")
+                        wp.launch(
+                            kernel=self._heightfield_convex_cell_kernel,
+                            dim=self.total_num_threads,
+                            inputs=[*triangle_inputs, self._heightfield_cell_owner.data],
+                            device=device,
+                            block_dim=self.mesh_triangle_block_dim,
+                            record_tape=False,
+                        )
                 else:
                     wp.launch(
                         kernel=self._pair_csr.generic

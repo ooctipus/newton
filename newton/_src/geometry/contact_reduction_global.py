@@ -2478,7 +2478,9 @@ def create_export_reduced_contacts_kernel(writer_func: Any, *, clear_after_expor
 
 
 @cache
-def create_mesh_triangle_contacts_to_reducer_kernel(primitive_type: int = 0, exclude_primitives: bool = False):
+def create_mesh_triangle_contacts_to_reducer_kernel(
+    primitive_type: int = 0, exclude_primitives: bool = False, *, exclude_heightfield_convex: bool = False
+):
     """Create the original query or a filtered heightfield primitive variant."""
     if primitive_type not in (0, int(GeoType.SPHERE), int(GeoType.CYLINDER)):
         raise ValueError("Only sphere and cylinder heightfield queries can be specialized")
@@ -2526,6 +2528,9 @@ def create_mesh_triangle_contacts_to_reducer_kernel(primitive_type: int = 0, exc
             tri_idx = triple[2]
 
             type_a = shape_types[shape_a]
+            if wp.static(exclude_heightfield_convex):
+                if type_a == GeoType.HFIELD and shape_types[shape_b] == GeoType.CONVEX_MESH:
+                    continue
             if wp.static(primitive_type != 0):
                 if type_a != GeoType.HFIELD or shape_types[shape_b] != primitive_type:
                     continue
@@ -2633,6 +2638,8 @@ def create_mesh_triangle_contacts_to_reducer_kernel(primitive_type: int = 0, exc
         mesh_triangle_contacts_to_reducer_kernel.__name__ = "heightfield_cylinder_contacts_to_reducer_kernel"
     elif exclude_primitives:
         mesh_triangle_contacts_to_reducer_kernel.__name__ = "mesh_triangle_contacts_to_reducer_fallback_kernel"
+    if exclude_heightfield_convex:
+        mesh_triangle_contacts_to_reducer_kernel.__name__ += "_without_hfield_convex"
     mesh_triangle_contacts_to_reducer_kernel.__qualname__ = mesh_triangle_contacts_to_reducer_kernel.__name__
     return wp.kernel(mesh_triangle_contacts_to_reducer_kernel, enable_backward=False, module="unique")
 

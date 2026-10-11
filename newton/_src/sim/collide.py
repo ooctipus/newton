@@ -1870,6 +1870,7 @@ class CollisionPipeline:
         self.prepared_shape_indices = None
         convex_cells = os.environ.get("NEWTON_NARROW_PHASE_CONVEX_CELLS", "0")
         self._convex_cells = None
+        self._heightfield_convex_cells = None
         coherent_convex = os.environ.get("NEWTON_NARROW_PHASE_COHERENT_CONVEX", "0")
         if convex_collision is not None:
             methods = {
@@ -2413,6 +2414,17 @@ class CollisionPipeline:
                 )
                 self._convex_selection_reason = "sampled_cost"
 
+        if getattr(self.narrow_phase, "_heightfield_convex_cells_requested", False):
+            from ..geometry.convex_cells import _CellOwner  # noqa: PLC0415
+
+            if convex_collision == "ordinary":
+                raise ValueError("Terrain convex cells conflict with convex_collision='ordinary'")
+            owner = _CellOwner(model)
+            if not owner.metadata["admitted_meshes"]:
+                raise ValueError("Terrain convex cells require at least one admitted convex mesh")
+            self._heightfield_convex_cells = owner
+            self.narrow_phase._heightfield_cell_owner = owner
+
         # Built here (not in finalize) so models/tasks that never collide don't pay for it.
         # Host-side, so not graph-capture-safe -- construct the pipeline before any capture.
         self.soft_rigid_contact_pairs = _build_soft_particle_rigid_contact_pairs(model)
@@ -2539,6 +2551,11 @@ class CollisionPipeline:
         """
         owner = getattr(self.narrow_phase, "_convex_method_choice", None)
         result = {"requested": self.convex_collision, "reason": self._convex_selection_reason}
+        if self._heightfield_convex_cells is not None:
+            result["heightfield_support"] = {
+                "method": "convex_cells",
+                "admitted_meshes": len(self._heightfield_convex_cells.metadata["admitted_meshes"]),
+            }
         result["contact_export"] = {
             "requested": self.narrow_phase.contact_export,
             "method": "disabled"
@@ -2593,6 +2610,10 @@ class CollisionPipeline:
                 raise RuntimeError("Cell geometry invalidation must occur outside capture")
             self._convex_cells.invalidate()
             self.narrow_phase._coherent_cache.reset()
+        if self._heightfield_convex_cells is not None:
+            if self.model.device.is_capturing:
+                raise RuntimeError("Cell geometry invalidation must occur outside capture")
+            self._heightfield_convex_cells.invalidate()
 
     def refresh_body_pair_reduction_groups(self):
         """Rebuild material-equivalence reduction groups from current materials.
