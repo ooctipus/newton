@@ -3,9 +3,7 @@
 
 """Check the experimental finite triangle/cuboid query and complete dispatch."""
 
-import inspect
 import os
-import textwrap
 import unittest
 from unittest.mock import patch
 
@@ -14,9 +12,6 @@ import warp as wp
 
 import newton
 from newton._src.geometry import heightfield_finite as finite
-from newton._src.geometry.contact_reduction_global import mesh_triangle_contacts_to_reducer_kernel
-from newton._src.geometry.narrow_phase import create_narrow_phase_process_mesh_triangle_contacts_kernel
-from newton._src.sim.collide import write_contact
 
 
 @wp.kernel(enable_backward=False)
@@ -128,21 +123,6 @@ class TestHeightfieldFinite(unittest.TestCase):
         ):
             result = self.run_query(e1, e2, center, half=(0.01, 0.01, 0.01))
             self.assertEqual(result[0], -1)
-
-    def test_original_fallback_recovery(self):
-        """Recover every original fallback statement after removing only the marker skip."""
-        originals = (
-            mesh_triangle_contacts_to_reducer_kernel,
-            create_narrow_phase_process_mesh_triangle_contacts_kernel(write_contact),
-        )
-        for original in originals:
-            marked = finite.marked_fallback(original)
-            before = textwrap.dedent(inspect.getsource(original.func)).splitlines()
-            while before[0].startswith("@"):
-                before.pop(0)
-            after = inspect.getsource(marked.func).replace("_finite_fallback(", "(", 1)
-            after = after.replace("        if tri_idx < 0:\n            continue\n", "", 1)
-            self.assertEqual(after, "\n".join(before) + "\n")
 
     def test_complete_marker_lifetime(self):
         """Run real contacts through analytical plus retained fallback on a changing prefix."""

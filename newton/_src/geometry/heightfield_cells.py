@@ -3,6 +3,8 @@
 
 """Conservative current-height rejection before heightfield triangle emission."""
 
+import functools
+
 import warp as wp
 
 from ..utils.heightfield import HeightfieldData
@@ -36,84 +38,97 @@ def _cell_is_above(
     return lower_z > top + padding + (16.0 * 1.1920928955078125e-7) * wp.abs(top)
 
 
-@wp.func
-def _heightfield_cell_midphase(
-    hfield_shape: int,
-    other_shape: int,
-    hfd: HeightfieldData,
-    shape_transform: wp.array[wp.transform],
-    shape_collision_aabb_lower: wp.array[wp.vec3],
-    shape_collision_aabb_upper: wp.array[wp.vec3],
-    shape_data: wp.array[wp.vec4],
-    shape_gap: wp.array[float],
-    elevations: wp.array[float],
-    triangle_pairs: wp.array[wp.vec3i],
-    triangle_pairs_count: wp.array[int],
-    reject_cells: bool = True,
-):
-    """Keep the original scaled AABB, XY range and surviving triangle emission law."""
-    X_hfield_ws = shape_transform[hfield_shape]
-    X_other_ws = shape_transform[other_shape]
-    X_other_in_hfield = wp.transform_multiply(wp.transform_inverse(X_hfield_ws), X_other_ws)
-    other_pos = wp.transform_get_translation(X_other_in_hfield)
-    other_rot = wp.transform_get_rotation(X_other_in_hfield)
-    local_lo = shape_collision_aabb_lower[other_shape]
-    local_hi = shape_collision_aabb_upper[other_shape]
-    local_center = 0.5 * (local_lo + local_hi)
-    local_half = 0.5 * (local_hi - local_lo)
-    center_in_hfield = wp.quat_rotate(other_rot, local_center) + other_pos
-    r0 = wp.quat_rotate(other_rot, wp.vec3(1.0, 0.0, 0.0))
-    r1 = wp.quat_rotate(other_rot, wp.vec3(0.0, 1.0, 0.0))
-    r2 = wp.quat_rotate(other_rot, wp.vec3(0.0, 0.0, 1.0))
-    half_in_hfield = wp.vec3(
-        wp.abs(r0[0]) * local_half[0] + wp.abs(r1[0]) * local_half[1] + wp.abs(r2[0]) * local_half[2],
-        wp.abs(r0[1]) * local_half[0] + wp.abs(r1[1]) * local_half[1] + wp.abs(r2[1]) * local_half[2],
-        wp.abs(r0[2]) * local_half[0] + wp.abs(r1[2]) * local_half[1] + wp.abs(r2[2]) * local_half[2],
-    )
-    gap_sum = shape_gap[hfield_shape] + shape_gap[other_shape]
-    margin_sum = shape_data[hfield_shape][3] + shape_data[other_shape][3]
-    contact_threshold = gap_sum + margin_sum
-    threshold_vec = wp.vec3(contact_threshold, contact_threshold, contact_threshold)
-    aabb_lower = center_in_hfield - half_in_hfield - threshold_vec
-    aabb_upper = center_in_hfield + half_in_hfield + threshold_vec
-    dx = 2.0 * hfd.hx / wp.float32(hfd.ncol - 1)
-    dy = 2.0 * hfd.hy / wp.float32(hfd.nrow - 1)
-    col_min_f = (aabb_lower[0] + hfd.hx) / dx
-    col_max_f = (aabb_upper[0] + hfd.hx) / dx
-    row_min_f = (aabb_lower[1] + hfd.hy) / dy
-    row_max_f = (aabb_upper[1] + hfd.hy) / dy
-    col_min = wp.max(wp.int32(wp.floor(col_min_f)), 0)
-    col_max = wp.min(wp.int32(wp.floor(col_max_f)), hfd.ncol - 2)
-    row_min = wp.max(wp.int32(wp.floor(row_min_f)), 0)
-    row_max = wp.min(wp.int32(wp.floor(row_max_f)), hfd.nrow - 2)
-    cols = hfd.ncol - 1
+@functools.cache
+def create_cell_midphase(tagged: bool = False):
+    """Share current-height rejection with optional triangle ownership tags."""
 
-    # Include current world-coordinate cancellation, transformed extent and height
-    # reconstruction roundoff. The additional 0.2 mm also exceeds the original
-    # MPR query inflation; it can only retain extra candidates. No below-cell cull.
-    scale = (
-        1.0
-        + _abs_sum(wp.transform_get_translation(X_hfield_ws))
-        + _abs_sum(wp.transform_get_translation(X_other_ws))
-        + _abs_sum(local_center)
-        + _abs_sum(local_half)
-        + _abs_sum(center_in_hfield)
-        + _abs_sum(half_in_hfield)
-        + wp.abs(hfd.min_z)
-        + wp.abs(hfd.max_z - hfd.min_z)
-        + wp.abs(contact_threshold)
-    )
-    padding = 0.0002 + (64.0 * 1.1920928955078125e-7) * scale
-    can_reject = reject_cells and wp.isfinite(aabb_lower[2]) and wp.isfinite(padding)
-    for r in range(row_min, row_max + 1):
-        for c in range(col_min, col_max + 1):
-            if can_reject and _cell_is_above(aabb_lower[2], padding, hfd, elevations, r, c):
-                continue
-            for tri_sub in range(2):
-                tri_idx = (r * cols + c) * 2 + tri_sub
-                out_idx = wp.atomic_add(triangle_pairs_count, 0, 1)
-                if out_idx < triangle_pairs.shape[0]:
-                    triangle_pairs[out_idx] = wp.vec3i(hfield_shape, other_shape, tri_idx)
+    @wp.func
+    def _heightfield_cell_midphase(
+        hfield_shape: int,
+        other_shape: int,
+        hfd: HeightfieldData,
+        shape_transform: wp.array[wp.transform],
+        shape_collision_aabb_lower: wp.array[wp.vec3],
+        shape_collision_aabb_upper: wp.array[wp.vec3],
+        shape_data: wp.array[wp.vec4],
+        shape_gap: wp.array[float],
+        elevations: wp.array[float],
+        triangle_pairs: wp.array[wp.vec3i],
+        triangle_pairs_count: wp.array[int],
+        pair_tags: wp.array[int],
+        pair_index: int,
+        reject_cells: bool = True,
+    ):
+        """Keep the original scaled AABB, XY range and surviving triangle emission law."""
+        X_hfield_ws = shape_transform[hfield_shape]
+        X_other_ws = shape_transform[other_shape]
+        X_other_in_hfield = wp.transform_multiply(wp.transform_inverse(X_hfield_ws), X_other_ws)
+        other_pos = wp.transform_get_translation(X_other_in_hfield)
+        other_rot = wp.transform_get_rotation(X_other_in_hfield)
+        local_lo = shape_collision_aabb_lower[other_shape]
+        local_hi = shape_collision_aabb_upper[other_shape]
+        local_center = 0.5 * (local_lo + local_hi)
+        local_half = 0.5 * (local_hi - local_lo)
+        center_in_hfield = wp.quat_rotate(other_rot, local_center) + other_pos
+        r0 = wp.quat_rotate(other_rot, wp.vec3(1.0, 0.0, 0.0))
+        r1 = wp.quat_rotate(other_rot, wp.vec3(0.0, 1.0, 0.0))
+        r2 = wp.quat_rotate(other_rot, wp.vec3(0.0, 0.0, 1.0))
+        half_in_hfield = wp.vec3(
+            wp.abs(r0[0]) * local_half[0] + wp.abs(r1[0]) * local_half[1] + wp.abs(r2[0]) * local_half[2],
+            wp.abs(r0[1]) * local_half[0] + wp.abs(r1[1]) * local_half[1] + wp.abs(r2[1]) * local_half[2],
+            wp.abs(r0[2]) * local_half[0] + wp.abs(r1[2]) * local_half[1] + wp.abs(r2[2]) * local_half[2],
+        )
+        gap_sum = shape_gap[hfield_shape] + shape_gap[other_shape]
+        margin_sum = shape_data[hfield_shape][3] + shape_data[other_shape][3]
+        contact_threshold = gap_sum + margin_sum
+        threshold_vec = wp.vec3(contact_threshold, contact_threshold, contact_threshold)
+        aabb_lower = center_in_hfield - half_in_hfield - threshold_vec
+        aabb_upper = center_in_hfield + half_in_hfield + threshold_vec
+        dx = 2.0 * hfd.hx / wp.float32(hfd.ncol - 1)
+        dy = 2.0 * hfd.hy / wp.float32(hfd.nrow - 1)
+        col_min_f = (aabb_lower[0] + hfd.hx) / dx
+        col_max_f = (aabb_upper[0] + hfd.hx) / dx
+        row_min_f = (aabb_lower[1] + hfd.hy) / dy
+        row_max_f = (aabb_upper[1] + hfd.hy) / dy
+        col_min = wp.max(wp.int32(wp.floor(col_min_f)), 0)
+        col_max = wp.min(wp.int32(wp.floor(col_max_f)), hfd.ncol - 2)
+        row_min = wp.max(wp.int32(wp.floor(row_min_f)), 0)
+        row_max = wp.min(wp.int32(wp.floor(row_max_f)), hfd.nrow - 2)
+        cols = hfd.ncol - 1
+
+        # Include current world-coordinate cancellation, transformed extent and height
+        # reconstruction roundoff. The additional 0.2 mm also exceeds the original
+        # MPR query inflation; it can only retain extra candidates. No below-cell cull.
+        scale = (
+            1.0
+            + _abs_sum(wp.transform_get_translation(X_hfield_ws))
+            + _abs_sum(wp.transform_get_translation(X_other_ws))
+            + _abs_sum(local_center)
+            + _abs_sum(local_half)
+            + _abs_sum(center_in_hfield)
+            + _abs_sum(half_in_hfield)
+            + wp.abs(hfd.min_z)
+            + wp.abs(hfd.max_z - hfd.min_z)
+            + wp.abs(contact_threshold)
+        )
+        padding = 0.0002 + (64.0 * 1.1920928955078125e-7) * scale
+        can_reject = reject_cells and wp.isfinite(aabb_lower[2]) and wp.isfinite(padding)
+        for r in range(row_min, row_max + 1):
+            for c in range(col_min, col_max + 1):
+                if can_reject and _cell_is_above(aabb_lower[2], padding, hfd, elevations, r, c):
+                    continue
+                for tri_sub in range(2):
+                    tri_idx = (r * cols + c) * 2 + tri_sub
+                    out_idx = wp.atomic_add(triangle_pairs_count, 0, 1)
+                    if out_idx < triangle_pairs.shape[0]:
+                        triangle_pairs[out_idx] = wp.vec3i(hfield_shape, other_shape, tri_idx)
+                        if wp.static(tagged):
+                            pair_tags[out_idx] = pair_index
+
+    return _heightfield_cell_midphase
+
+
+_heightfield_cell_midphase = create_cell_midphase()
 
 
 @wp.kernel(enable_backward=False, module="unique")
@@ -152,6 +167,8 @@ def heightfield_cell_overlaps_kernel(
             heightfield_elevations,
             triangle_pairs,
             triangle_pairs_count,
+            triangle_pairs_count,  # Unused tag storage in the untagged specialization.
+            -1,
             # A plane's cached local AABB does not bound its full surface.
             shape_types[pair[1]] != GeoType.PLANE,
         )

@@ -2479,7 +2479,15 @@ def create_export_reduced_contacts_kernel(writer_func: Any, *, clear_after_expor
 
 @cache
 def create_mesh_triangle_contacts_to_reducer_kernel(
-    primitive_type: int = 0, exclude_primitives: bool = False, *, exclude_heightfield_convex: bool = False
+    primitive_type: int = 0,
+    exclude_primitives: bool = False,
+    *,
+    exclude_heightfield_convex: bool = False,
+    skip_marked: bool = False,
+    writer_func=write_contact_to_reducer,
+    writer_binding=None,
+    writer_data_type=GlobalContactReducerData,
+    kernel_name=None,
 ):
     """Create the original query or a filtered heightfield primitive variant."""
     if primitive_type not in (0, int(GeoType.SPHERE), int(GeoType.CYLINDER)):
@@ -2503,7 +2511,7 @@ def create_mesh_triangle_contacts_to_reducer_kernel(
         heightfield_elevations: wp.array[wp.float32],
         triangle_pairs: wp.array[wp.vec3i],
         triangle_pairs_count: wp.array[int],
-        reducer_data: GlobalContactReducerData,
+        reducer_data: writer_data_type,
         total_num_threads: int,
     ):
         """Process mesh/heightfield-triangle contacts and store them in GlobalContactReducer.
@@ -2522,10 +2530,16 @@ def create_mesh_triangle_contacts_to_reducer_kernel(
             if i >= triangle_pairs.shape[0]:
                 break
 
+            local_writer = reducer_data
+            if wp.static(writer_binding is not None):
+                local_writer = wp.static(writer_binding)(reducer_data, i)
             triple = triangle_pairs[i]
             shape_a = triple[0]  # Mesh or heightfield shape
             shape_b = triple[1]  # Convex shape
             tri_idx = triple[2]
+            if wp.static(skip_marked):
+                if tri_idx < 0:
+                    continue
 
             type_a = shape_types[shape_a]
             if wp.static(exclude_heightfield_convex):
@@ -2609,7 +2623,7 @@ def create_mesh_triangle_contacts_to_reducer_kernel(
 
             wp.static(
                 create_compute_gjk_mpr_contacts(
-                    write_contact_to_reducer,
+                    writer_func,
                     support_func=query_support,
                     use_precomputed_center=primitive_type != 0,
                     penetration_refiner=create_triangle_prism_penetration_refiner(query_support),
@@ -2627,7 +2641,7 @@ def create_mesh_triangle_contacts_to_reducer_kernel(
                 shape_b,
                 margin_offset_a,
                 margin_offset_b,
-                reducer_data,
+                local_writer,
                 (tri_idx << 1) | 1,
                 feature_context,
             )
@@ -2640,7 +2654,12 @@ def create_mesh_triangle_contacts_to_reducer_kernel(
         mesh_triangle_contacts_to_reducer_kernel.__name__ = "mesh_triangle_contacts_to_reducer_fallback_kernel"
     if exclude_heightfield_convex:
         mesh_triangle_contacts_to_reducer_kernel.__name__ += "_without_hfield_convex"
+    if skip_marked:
+        mesh_triangle_contacts_to_reducer_kernel.__name__ += "_finite_fallback"
+    if kernel_name is not None:
+        mesh_triangle_contacts_to_reducer_kernel.__name__ = kernel_name
     mesh_triangle_contacts_to_reducer_kernel.__qualname__ = mesh_triangle_contacts_to_reducer_kernel.__name__
+    mesh_triangle_contacts_to_reducer_kernel.__annotations__["reducer_data"] = writer_data_type
     return wp.kernel(mesh_triangle_contacts_to_reducer_kernel, enable_backward=False, module="unique")
 
 

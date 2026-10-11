@@ -10,9 +10,6 @@ original generic query, writer and reducer.
 """
 
 import functools
-import inspect
-import linecache
-import textwrap
 from typing import Any
 
 import numpy as np
@@ -247,7 +244,9 @@ def bind_model(narrow, model):
 
 
 @functools.cache
-def create_query_kernel(writer_func, shell_support: bool = False):
+def create_query_kernel(
+    writer_func, shell_support: bool = False, *, writer_binding=None, writer_data_type=Any, kernel_name=None
+):
     """Create the analytical writer for the same global triangle stream."""
 
     def heightfield_finite_contacts(
@@ -261,7 +260,7 @@ def create_query_kernel(writer_func, shell_support: bool = False):
         heightfield_elevations: wp.array[float],
         triangle_pairs: wp.array[wp.vec3i],
         triangle_pairs_count: wp.array[int],
-        writer_data: Any,
+        writer_data: writer_data_type,
         total_num_threads: int,
         bounds: wp.array2d[wp.vec3],
         bound_source: wp.array[wp.uint64],
@@ -269,6 +268,9 @@ def create_query_kernel(writer_func, shell_support: bool = False):
         for i in range(wp.tid(), triangle_pairs_count[0], total_num_threads):
             if i >= triangle_pairs.shape[0]:
                 break
+            local_writer = writer_data
+            if wp.static(writer_binding is not None):
+                local_writer = wp.static(writer_binding)(writer_data, i)
             triple = triangle_pairs[i]
             a, b, tri_idx = triple[0], triple[1], triple[2]
             if tri_idx < 0 or shape_types[a] != GeoType.HFIELD:
@@ -347,33 +349,13 @@ def create_query_kernel(writer_func, shell_support: bool = False):
                 contact.sort_sub_key = (((tri_idx << 1) | 1) << 3) | k
                 # Axial/Minkowski postprocessing is identity for this admitted
                 # HFIELD + BOX/CONVEX family; both effective radii remain zero.
-                wp.static(writer_func)(contact, writer_data, -1)
+                wp.static(writer_func)(contact, local_writer, -1)
             triangle_pairs[i] = wp.vec3i(a, b, ~tri_idx)
 
     if shell_support:
         heightfield_finite_contacts.__name__ = heightfield_finite_contacts.__qualname__ = (
             "heightfield_finite_shell_contacts"
         )
+    if kernel_name is not None:
+        heightfield_finite_contacts.__name__ = heightfield_finite_contacts.__qualname__ = kernel_name
     return wp.kernel(heightfield_finite_contacts, enable_backward=False, module="unique")
-
-
-@functools.cache
-def marked_fallback(kernel):
-    """Clone the original complete query with only a handled-entry skip inserted."""
-    source = textwrap.dedent(inspect.getsource(kernel.func))
-    lines = source.splitlines()
-    while lines[0].startswith("@"):
-        lines.pop(0)
-    source = "\n".join(lines) + "\n"
-    old = "        tri_idx = triple[2]"
-    if source.count(old) != 1:
-        raise RuntimeError("Original triangle query entry changed")
-    source = source.replace(old, old + "\n        if tri_idx < 0:\n            continue", 1)
-    name = kernel.func.__name__ + "_finite_fallback"
-    source = source.replace("def " + kernel.func.__name__ + "(", "def " + name + "(", 1)
-    filename = f"<heightfield_finite_{name}>"
-    linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
-    namespace = dict(kernel.func.__globals__)
-    namespace.update(inspect.getclosurevars(kernel.func).nonlocals)
-    exec(compile(source, filename, "exec"), namespace)
-    return wp.kernel(namespace[name], enable_backward=False, module="unique")

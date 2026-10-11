@@ -3,11 +3,13 @@
 
 """Experimental enclosing-box separation inside the existing heightfield append owner."""
 
+import functools
+
 import warp as wp
 
 from ..utils.heightfield import HeightfieldData
 from .contact_reduction_global import BETA_THRESHOLD
-from .heightfield_cells import _abs_sum, _cell_is_above, _heightfield_cell_midphase
+from .heightfield_cells import _abs_sum, _cell_is_above, create_cell_midphase
 from .types import GeoType
 
 Axes = wp.types.matrix(shape=(9, 3), dtype=wp.float32)
@@ -195,113 +197,262 @@ def _triangle_is_separated(pair: PairProjection, v0: wp.vec3, v1: wp.vec3, v2: w
     return False
 
 
-@wp.func
-def _geometric_midphase(
-    a: int,
-    b: int,
-    hfd: HeightfieldData,
-    pair: PairProjection,
-    transforms: wp.array[wp.transform],
-    lower: wp.array[wp.vec3],
-    upper: wp.array[wp.vec3],
-    data: wp.array[wp.vec4],
-    gaps: wp.array[float],
-    elevations: wp.array[float],
-    triples: wp.array[wp.vec3i],
-    count: wp.array[int],
-):
-    # Preserve the original range construction and its existing current-height
-    # cull. Only the additional triangle rejection precedes the same append.
-    xa, xb = transforms[a], transforms[b]
-    relative = wp.transform_multiply(wp.transform_inverse(xa), xb)
-    position, rotation = wp.transform_get_translation(relative), wp.transform_get_rotation(relative)
-    center_local, half_local = 0.5 * (lower[b] + upper[b]), 0.5 * (upper[b] - lower[b])
-    center = wp.quat_rotate(rotation, center_local) + position
-    r0 = wp.quat_rotate(rotation, wp.vec3(1.0, 0.0, 0.0))
-    r1 = wp.quat_rotate(rotation, wp.vec3(0.0, 1.0, 0.0))
-    r2 = wp.quat_rotate(rotation, wp.vec3(0.0, 0.0, 1.0))
-    half = wp.vec3(
-        wp.abs(r0[0]) * half_local[0] + wp.abs(r1[0]) * half_local[1] + wp.abs(r2[0]) * half_local[2],
-        wp.abs(r0[1]) * half_local[0] + wp.abs(r1[1]) * half_local[1] + wp.abs(r2[1]) * half_local[2],
-        wp.abs(r0[2]) * half_local[0] + wp.abs(r1[2]) * half_local[1] + wp.abs(r2[2]) * half_local[2],
-    )
-    shell = (gaps[a] + gaps[b]) + (data[a][3] + data[b][3])
-    lo, hi = center - half - wp.vec3(shell), center + half + wp.vec3(shell)
-    dx, dy = 2.0 * hfd.hx / wp.float32(hfd.ncol - 1), 2.0 * hfd.hy / wp.float32(hfd.nrow - 1)
-    cmin = wp.max(wp.int32(wp.floor((lo[0] + hfd.hx) / dx)), 0)
-    cmax = wp.min(wp.int32(wp.floor((hi[0] + hfd.hx) / dx)), hfd.ncol - 2)
-    rmin = wp.max(wp.int32(wp.floor((lo[1] + hfd.hy) / dy)), 0)
-    rmax = wp.min(wp.int32(wp.floor((hi[1] + hfd.hy) / dy)), hfd.nrow - 2)
-    coordinate_scale = (
-        1.0
-        + _abs_sum(wp.transform_get_translation(xa))
-        + _abs_sum(wp.transform_get_translation(xb))
-        + _abs_sum(center_local)
-        + _abs_sum(half_local)
-        + _abs_sum(center)
-        + _abs_sum(half)
-        + wp.abs(hfd.min_z)
-        + wp.abs(hfd.max_z - hfd.min_z)
-        + wp.abs(shell)
-    )
-    padding = 0.0002 + (64.0 * 1.1920928955078125e-7) * coordinate_scale
-    can_reject = wp.isfinite(lo[2]) and wp.isfinite(padding)
-    height_range = hfd.max_z - hfd.min_z
-    for r in range(rmin, rmax + 1):
-        for c in range(cmin, cmax + 1):
-            if can_reject and _cell_is_above(lo[2], padding, hfd, elevations, r, c):
-                continue
-            index = hfd.data_offset + r * hfd.ncol + c
-            x0, y0 = -hfd.hx + wp.float32(c) * dx, -hfd.hy + wp.float32(r) * dy
-            v0 = wp.vec3(x0, y0, hfd.min_z + elevations[index] * height_range)
-            v10 = wp.vec3(x0 + dx, y0, hfd.min_z + elevations[index + 1] * height_range)
-            v11 = wp.vec3(x0 + dx, y0 + dy, hfd.min_z + elevations[index + hfd.ncol + 1] * height_range)
-            v01 = wp.vec3(x0, y0 + dy, hfd.min_z + elevations[index + hfd.ncol] * height_range)
-            for sub in range(2):
-                v1, v2 = v10, v11
-                if sub == 1:
-                    v1, v2 = v11, v01
-                if _triangle_is_separated(pair, v0, v1, v2):
-                    continue
-                tri = (r * (hfd.ncol - 1) + c) * 2 + sub
-                out = wp.atomic_add(count, 0, 1)
-                if out < triples.shape[0]:
-                    triples[out] = wp.vec3i(a, b, tri)
+@functools.cache
+def create_geometric_midphase(tagged: bool = False):
+    """Share geometric triangle rejection with optional ownership tags."""
 
-
-@wp.kernel(enable_backward=False, module="unique")
-def heightfield_geometric_overlaps_kernel(
-    transforms: wp.array[wp.transform],
-    gaps: wp.array[float],
-    data: wp.array[wp.vec4],
-    lower: wp.array[wp.vec3],
-    upper: wp.array[wp.vec3],
-    heightfield_index: wp.array[int],
-    heightfield: wp.array[HeightfieldData],
-    elevations: wp.array[float],
-    pairs: wp.array[wp.vec2i],
-    pair_count: wp.array[int],
-    total_num_threads: int,
-    types: wp.array[int],
-    sources: wp.array[wp.uint64],
-    bounds: wp.array2d[wp.vec3],
-    bound_source: wp.array[wp.uint64],
-    triples: wp.array[wp.vec3i],
-    count: wp.array[int],
-):
-    """Compact surviving triangles directly in the original pair/stride owner."""
-    tid, j = wp.tid()
-    if j != 0:
-        return
-    for i in range(tid, pair_count[0], total_num_threads):
-        a, b = pairs[i][0], pairs[i][1]
-        hfd = heightfield[heightfield_index[a]]
-        projection = _prepare_pair(
-            a, b, hfd, types, transforms, data, sources, gaps, lower, upper, bounds, bound_source
+    @wp.func
+    def _geometric_midphase(
+        a: int,
+        b: int,
+        hfd: HeightfieldData,
+        pair: PairProjection,
+        transforms: wp.array[wp.transform],
+        lower: wp.array[wp.vec3],
+        upper: wp.array[wp.vec3],
+        data: wp.array[wp.vec4],
+        gaps: wp.array[float],
+        elevations: wp.array[float],
+        triples: wp.array[wp.vec3i],
+        count: wp.array[int],
+        pair_tags: wp.array[int],
+        pair_index: int,
+    ):
+        # Preserve the original range construction and its existing current-height
+        # cull. Only the additional triangle rejection precedes the same append.
+        xa, xb = transforms[a], transforms[b]
+        relative = wp.transform_multiply(wp.transform_inverse(xa), xb)
+        position, rotation = wp.transform_get_translation(relative), wp.transform_get_rotation(relative)
+        center_local, half_local = 0.5 * (lower[b] + upper[b]), 0.5 * (upper[b] - lower[b])
+        center = wp.quat_rotate(rotation, center_local) + position
+        r0 = wp.quat_rotate(rotation, wp.vec3(1.0, 0.0, 0.0))
+        r1 = wp.quat_rotate(rotation, wp.vec3(0.0, 1.0, 0.0))
+        r2 = wp.quat_rotate(rotation, wp.vec3(0.0, 0.0, 1.0))
+        half = wp.vec3(
+            wp.abs(r0[0]) * half_local[0] + wp.abs(r1[0]) * half_local[1] + wp.abs(r2[0]) * half_local[2],
+            wp.abs(r0[1]) * half_local[0] + wp.abs(r1[1]) * half_local[1] + wp.abs(r2[1]) * half_local[2],
+            wp.abs(r0[2]) * half_local[0] + wp.abs(r1[2]) * half_local[1] + wp.abs(r2[2]) * half_local[2],
         )
-        if projection.enabled:
-            _geometric_midphase(a, b, hfd, projection, transforms, lower, upper, data, gaps, elevations, triples, count)
-        else:
-            _heightfield_cell_midphase(
-                a, b, hfd, transforms, lower, upper, data, gaps, elevations, triples, count, types[b] != GeoType.PLANE
+        shell = (gaps[a] + gaps[b]) + (data[a][3] + data[b][3])
+        lo, hi = center - half - wp.vec3(shell), center + half + wp.vec3(shell)
+        dx, dy = 2.0 * hfd.hx / wp.float32(hfd.ncol - 1), 2.0 * hfd.hy / wp.float32(hfd.nrow - 1)
+        cmin = wp.max(wp.int32(wp.floor((lo[0] + hfd.hx) / dx)), 0)
+        cmax = wp.min(wp.int32(wp.floor((hi[0] + hfd.hx) / dx)), hfd.ncol - 2)
+        rmin = wp.max(wp.int32(wp.floor((lo[1] + hfd.hy) / dy)), 0)
+        rmax = wp.min(wp.int32(wp.floor((hi[1] + hfd.hy) / dy)), hfd.nrow - 2)
+        coordinate_scale = (
+            1.0
+            + _abs_sum(wp.transform_get_translation(xa))
+            + _abs_sum(wp.transform_get_translation(xb))
+            + _abs_sum(center_local)
+            + _abs_sum(half_local)
+            + _abs_sum(center)
+            + _abs_sum(half)
+            + wp.abs(hfd.min_z)
+            + wp.abs(hfd.max_z - hfd.min_z)
+            + wp.abs(shell)
+        )
+        padding = 0.0002 + (64.0 * 1.1920928955078125e-7) * coordinate_scale
+        can_reject = wp.isfinite(lo[2]) and wp.isfinite(padding)
+        height_range = hfd.max_z - hfd.min_z
+        for r in range(rmin, rmax + 1):
+            for c in range(cmin, cmax + 1):
+                if can_reject and _cell_is_above(lo[2], padding, hfd, elevations, r, c):
+                    continue
+                index = hfd.data_offset + r * hfd.ncol + c
+                x0, y0 = -hfd.hx + wp.float32(c) * dx, -hfd.hy + wp.float32(r) * dy
+                v0 = wp.vec3(x0, y0, hfd.min_z + elevations[index] * height_range)
+                v10 = wp.vec3(x0 + dx, y0, hfd.min_z + elevations[index + 1] * height_range)
+                v11 = wp.vec3(x0 + dx, y0 + dy, hfd.min_z + elevations[index + hfd.ncol + 1] * height_range)
+                v01 = wp.vec3(x0, y0 + dy, hfd.min_z + elevations[index + hfd.ncol] * height_range)
+                for sub in range(2):
+                    v1, v2 = v10, v11
+                    if sub == 1:
+                        v1, v2 = v11, v01
+                    if _triangle_is_separated(pair, v0, v1, v2):
+                        continue
+                    tri = (r * (hfd.ncol - 1) + c) * 2 + sub
+                    out = wp.atomic_add(count, 0, 1)
+                    if out < triples.shape[0]:
+                        triples[out] = wp.vec3i(a, b, tri)
+                        if wp.static(tagged):
+                            pair_tags[out] = pair_index
+
+    return _geometric_midphase
+
+
+@functools.cache
+def create_geometric_overlaps_kernel(tagged: bool = False):
+    """Bind tagged or untagged storage to the same pair traversal and queries."""
+    geometric = create_geometric_midphase(tagged)
+    cell = create_cell_midphase(tagged)
+
+    @wp.func
+    def overlaps(
+        tid: int,
+        j: int,
+        transforms: wp.array[wp.transform],
+        gaps: wp.array[float],
+        data: wp.array[wp.vec4],
+        lower: wp.array[wp.vec3],
+        upper: wp.array[wp.vec3],
+        heightfield_index: wp.array[int],
+        heightfield: wp.array[HeightfieldData],
+        elevations: wp.array[float],
+        pairs: wp.array[wp.vec2i],
+        pair_count: wp.array[int],
+        total_num_threads: int,
+        types: wp.array[int],
+        sources: wp.array[wp.uint64],
+        bounds: wp.array2d[wp.vec3],
+        bound_source: wp.array[wp.uint64],
+        triples: wp.array[wp.vec3i],
+        count: wp.array[int],
+        pair_tags: wp.array[int],
+    ):
+        """Compact surviving triangles directly in the original pair/stride owner."""
+        if j != 0:
+            return
+        active_pairs = pair_count[0]
+        if wp.static(tagged):
+            active_pairs = wp.min(active_pairs, pairs.shape[0])
+        for i in range(tid, active_pairs, total_num_threads):
+            a, b = pairs[i][0], pairs[i][1]
+            hfd = heightfield[heightfield_index[a]]
+            projection = _prepare_pair(
+                a, b, hfd, types, transforms, data, sources, gaps, lower, upper, bounds, bound_source
             )
+            if projection.enabled:
+                wp.static(geometric)(
+                    a,
+                    b,
+                    hfd,
+                    projection,
+                    transforms,
+                    lower,
+                    upper,
+                    data,
+                    gaps,
+                    elevations,
+                    triples,
+                    count,
+                    pair_tags,
+                    i,
+                )
+            else:
+                wp.static(cell)(
+                    a,
+                    b,
+                    hfd,
+                    transforms,
+                    lower,
+                    upper,
+                    data,
+                    gaps,
+                    elevations,
+                    triples,
+                    count,
+                    pair_tags,
+                    i,
+                    types[b] != GeoType.PLANE,
+                )
+
+    if tagged:
+
+        def heightfield_pair_csr_overlaps(
+            transforms: wp.array[wp.transform],
+            gaps: wp.array[float],
+            data: wp.array[wp.vec4],
+            lower: wp.array[wp.vec3],
+            upper: wp.array[wp.vec3],
+            heightfield_index: wp.array[int],
+            heightfield: wp.array[HeightfieldData],
+            elevations: wp.array[float],
+            pairs: wp.array[wp.vec2i],
+            pair_count: wp.array[int],
+            total_num_threads: int,
+            types: wp.array[int],
+            sources: wp.array[wp.uint64],
+            bounds: wp.array2d[wp.vec3],
+            bound_source: wp.array[wp.uint64],
+            triples: wp.array[wp.vec3i],
+            count: wp.array[int],
+            pair_tags: wp.array[int],
+        ):
+            tid, j = wp.tid()
+            overlaps(
+                tid,
+                j,
+                transforms,
+                gaps,
+                data,
+                lower,
+                upper,
+                heightfield_index,
+                heightfield,
+                elevations,
+                pairs,
+                pair_count,
+                total_num_threads,
+                types,
+                sources,
+                bounds,
+                bound_source,
+                triples,
+                count,
+                pair_tags,
+            )
+
+        kernel = heightfield_pair_csr_overlaps
+    else:
+
+        def heightfield_geometric_overlaps_kernel(
+            transforms: wp.array[wp.transform],
+            gaps: wp.array[float],
+            data: wp.array[wp.vec4],
+            lower: wp.array[wp.vec3],
+            upper: wp.array[wp.vec3],
+            heightfield_index: wp.array[int],
+            heightfield: wp.array[HeightfieldData],
+            elevations: wp.array[float],
+            pairs: wp.array[wp.vec2i],
+            pair_count: wp.array[int],
+            total_num_threads: int,
+            types: wp.array[int],
+            sources: wp.array[wp.uint64],
+            bounds: wp.array2d[wp.vec3],
+            bound_source: wp.array[wp.uint64],
+            triples: wp.array[wp.vec3i],
+            count: wp.array[int],
+        ):
+            tid, j = wp.tid()
+            overlaps(
+                tid,
+                j,
+                transforms,
+                gaps,
+                data,
+                lower,
+                upper,
+                heightfield_index,
+                heightfield,
+                elevations,
+                pairs,
+                pair_count,
+                total_num_threads,
+                types,
+                sources,
+                bounds,
+                bound_source,
+                triples,
+                count,
+                count,  # No tag access is compiled in this specialization.
+            )
+
+        kernel = heightfield_geometric_overlaps_kernel
+
+    kernel.__qualname__ = kernel.__name__
+    return wp.kernel(kernel, enable_backward=False, module="unique")
+
+
+heightfield_geometric_overlaps_kernel = create_geometric_overlaps_kernel()

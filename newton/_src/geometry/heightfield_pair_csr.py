@@ -10,9 +10,6 @@ not from the old reducer's winners. No pair-local candidate cap is imposed.
 """
 
 import functools
-import inspect
-import linecache
-import textwrap
 from typing import Any
 
 import numpy as np
@@ -25,8 +22,8 @@ from .contact_reduction_global import (
     GlobalContactReducerData,
     compute_effective_radius,
     create_export_reduced_contacts_kernel,
+    create_mesh_triangle_contacts_to_reducer_kernel,
     export_contact_to_buffer,
-    mesh_triangle_contacts_to_reducer_kernel,
     reduce_contact_in_hashtable,
     unpack_contact,
 )
@@ -138,6 +135,13 @@ class PairCSRData:
     separation: wp.array[wp.vec2]
     status: wp.array[int]
     pair_index: int
+
+
+@wp.func
+def _bind_pair(data: PairCSRData, index: int) -> PairCSRData:
+    local = data
+    local.pair_index = data.triangle_pair[index]
+    return local
 
 
 @wp.func
@@ -370,117 +374,26 @@ def create_export_kernel(writer_func):
     return export_heightfield_pair_csr
 
 
-def _clone(original, name, replacements, extra, *, kernel=False):
-    """Change only checked producer ownership seams in existing source."""
-    function = original.func
-    source = textwrap.dedent(inspect.getsource(function))
-    source = source[source.index("def ") :]
-    # Factory keys can rename __name__ without changing the source definition.
-    source_name = source[4 : source.index("(")]
-    if not source_name.isidentifier():
-        raise RuntimeError(f"Pair-CSR definition seam changed: {name}")
-    source = source.replace("def " + source_name + "(", "def " + name + "(", 1)
-    for before, after in replacements:
-        if source.count(before) != 1:
-            raise RuntimeError(f"Pair-CSR source seam changed: {name}: {before!r}")
-        source = source.replace(before, after, 1)
-    namespace = dict(function.__globals__)
-    namespace.update(inspect.getclosurevars(function).nonlocals)
-    namespace.update(extra)
-    filename = f"<heightfield_pair_csr_{name}>"
-    linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
-    exec(compile(source, filename, "exec"), namespace)
-    if kernel:
-        return wp.kernel(namespace[name], enable_backward=False, module="unique")
-    return wp.func(namespace[name])
-
-
 @functools.cache
 def get_query_kernels(shell_support: bool = False):
     """Tag the original packed triangle stream and both disjoint query routes."""
-    from .heightfield_cells import _heightfield_cell_midphase  # noqa: PLC0415
-    from .heightfield_finite import create_query_kernel, marked_fallback  # noqa: PLC0415
-    from .heightfield_geometric import _geometric_midphase, heightfield_geometric_overlaps_kernel  # noqa: PLC0415
+    from .heightfield_finite import create_query_kernel  # noqa: PLC0415
+    from .heightfield_geometric import create_geometric_overlaps_kernel  # noqa: PLC0415
 
-    geometric = _clone(
-        _geometric_midphase,
-        "pair_csr_geometric_midphase",
-        [
-            (
-                "    count: wp.array[int],",
-                "    count: wp.array[int],\n    pair_tags: wp.array[int],\n    pair_index: int,",
-            ),
-            (
-                "triples[out] = wp.vec3i(a, b, tri)",
-                "triples[out] = wp.vec3i(a, b, tri)\n                    pair_tags[out] = pair_index",
-            ),
-        ],
-        {},
+    midphase = create_geometric_overlaps_kernel(tagged=True)
+    finite = create_query_kernel(
+        _write_pair,
+        shell_support,
+        writer_binding=_bind_pair,
+        writer_data_type=PairCSRData,
+        kernel_name="heightfield_pair_csr_shell_contacts" if shell_support else "heightfield_pair_csr_finite_contacts",
     )
-    cell = _clone(
-        _heightfield_cell_midphase,
-        "pair_csr_cell_midphase",
-        [
-            (
-                "    triangle_pairs_count: wp.array[int],",
-                "    triangle_pairs_count: wp.array[int],\n    pair_tags: wp.array[int],\n    pair_index: int,",
-            ),
-            (
-                "triangle_pairs[out_idx] = wp.vec3i(hfield_shape, other_shape, tri_idx)",
-                "triangle_pairs[out_idx] = wp.vec3i(hfield_shape, other_shape, tri_idx)\n                    pair_tags[out_idx] = pair_index",
-            ),
-        ],
-        {},
-    )
-    midphase = _clone(
-        heightfield_geometric_overlaps_kernel,
-        "heightfield_pair_csr_overlaps",
-        [
-            ("    count: wp.array[int],", "    count: wp.array[int],\n    pair_tags: wp.array[int],"),
-            (
-                "range(tid, pair_count[0], total_num_threads)",
-                "range(tid, wp.min(pair_count[0], pairs.shape[0]), total_num_threads)",
-            ),
-            (
-                "_geometric_midphase(a, b, hfd, projection, transforms, lower, upper, data, gaps, elevations, triples, count)",
-                "_geometric_midphase(a, b, hfd, projection, transforms, lower, upper, data, gaps, elevations, triples, count, pair_tags, i)",
-            ),
-            (
-                "a, b, hfd, transforms, lower, upper, data, gaps, elevations, triples, count, types[b] != GeoType.PLANE",
-                "a, b, hfd, transforms, lower, upper, data, gaps, elevations, triples, count, pair_tags, i, types[b] != GeoType.PLANE",
-            ),
-        ],
-        {"_geometric_midphase": geometric, "_heightfield_cell_midphase": cell},
-        kernel=True,
-    )
-    finite = _clone(
-        create_query_kernel(_write_pair, shell_support),
-        "heightfield_pair_csr_shell_contacts" if shell_support else "heightfield_pair_csr_finite_contacts",
-        [
-            ("    writer_data: Any,", "    writer_data: PairCSRData,"),
-            (
-                "        triple = triangle_pairs[i]",
-                "        local_writer = writer_data\n        local_writer.pair_index = writer_data.triangle_pair[i]\n        triple = triangle_pairs[i]",
-            ),
-            ("wp.static(writer_func)(contact, writer_data, -1)", "wp.static(writer_func)(contact, local_writer, -1)"),
-        ],
-        {"PairCSRData": PairCSRData},
-        kernel=True,
-    )
-    generic = _clone(
-        marked_fallback(mesh_triangle_contacts_to_reducer_kernel),
-        "heightfield_pair_csr_generic_contacts",
-        [
-            ("    reducer_data: GlobalContactReducerData,", "    reducer_data: PairCSRData,"),
-            (
-                "        triple = triangle_pairs[i]",
-                "        local_writer = reducer_data\n        local_writer.pair_index = reducer_data.triangle_pair[i]\n        triple = triangle_pairs[i]",
-            ),
-            ("                write_contact_to_reducer,", "                _write_pair,"),
-            ("            reducer_data,", "            local_writer,"),
-        ],
-        {"PairCSRData": PairCSRData, "_write_pair": _write_pair},
-        kernel=True,
+    generic = create_mesh_triangle_contacts_to_reducer_kernel(
+        skip_marked=True,
+        writer_func=_write_pair,
+        writer_binding=_bind_pair,
+        writer_data_type=PairCSRData,
+        kernel_name="heightfield_pair_csr_generic_contacts",
     )
     return midphase, finite, generic
 

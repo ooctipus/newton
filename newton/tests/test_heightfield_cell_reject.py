@@ -33,6 +33,7 @@ def _create_heightfield_midphase(*, upstream_default):
         shape_types: wp.array[int],
         shape_transform: wp.array[wp.transform],
         shape_source: wp.array[wp.uint64],
+        shape_mesh_properties: wp.array[wp.int32],
         shape_gap: wp.array[float],
         shape_data: wp.array[wp.vec4],
         shape_collision_radius: wp.array[float],
@@ -712,7 +713,7 @@ class TestHeightfieldCellRejectResearch(unittest.TestCase):
         def function(module, name):
             return next(
                 n
-                for n in ast.parse(inspect.getsource(module)).body
+                for n in ast.walk(ast.parse(inspect.getsource(module)))
                 if isinstance(n, ast.FunctionDef) and n.name == name
             )
 
@@ -731,6 +732,8 @@ class TestHeightfieldCellRejectResearch(unittest.TestCase):
         self.assertEqual(bounds(old), bounds(new))
         old_emit = old.body[-1].body[0].body[-1]
         new_emit = new.body[-1].body[0].body[-1]
+        # The optional ownership tag follows the original bounded append.
+        new_emit.body[-1].body.pop()
         self.assertEqual(ast.dump(old_emit), ast.dump(new_emit))
 
 

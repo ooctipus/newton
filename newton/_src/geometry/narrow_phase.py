@@ -1751,10 +1751,10 @@ def narrow_phase_find_mesh_triangle_overlaps_kernel(
         )
 
 
-def create_narrow_phase_process_mesh_triangle_contacts_kernel(writer_func: Any):
-    _module = f"narrow_phase_mesh_tri_{writer_func.__name__}"
+def create_narrow_phase_process_mesh_triangle_contacts_kernel(writer_func: Any, *, skip_marked: bool = False):
+    suffix = "_finite_fallback" if skip_marked else ""
+    _module = f"narrow_phase_mesh_tri_{writer_func.__name__}{suffix}"
 
-    @wp.kernel(enable_backward=False, module=_module)
     def narrow_phase_process_mesh_triangle_contacts_kernel(
         shape_types: wp.array[int],
         shape_data: wp.array[wp.vec4],
@@ -1784,6 +1784,9 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(writer_func: Any):
             shape_a = triple[0]
             shape_b = triple[1]
             tri_idx = triple[2]
+            if wp.static(skip_marked):
+                if tri_idx < 0:
+                    continue
 
             type_a = shape_types[shape_a]
 
@@ -1859,7 +1862,10 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(writer_func: Any):
                 feature_context,
             )
 
-    return narrow_phase_process_mesh_triangle_contacts_kernel
+    name = "narrow_phase_process_mesh_triangle_contacts_kernel" + suffix
+    narrow_phase_process_mesh_triangle_contacts_kernel.__name__ = name
+    narrow_phase_process_mesh_triangle_contacts_kernel.__qualname__ = name
+    return wp.kernel(narrow_phase_process_mesh_triangle_contacts_kernel, enable_backward=False, module=_module)
 
 
 @wp.kernel(enable_backward=False)
@@ -2847,12 +2853,14 @@ class NarrowPhase:
         else:
             self.mesh_triangle_contacts_kernel = None
         if self._heightfield_finite_query:
-            from .heightfield_finite import create_query_kernel, marked_fallback  # noqa: PLC0415
+            from .heightfield_finite import create_query_kernel  # noqa: PLC0415
 
             self._finite_direct = create_query_kernel(writer_func)
             self._finite_reducer = create_query_kernel(write_contact_to_reducer)
-            self._finite_direct_fallback = marked_fallback(self.mesh_triangle_contacts_kernel)
-            self._finite_reducer_fallback = marked_fallback(mesh_triangle_contacts_to_reducer_kernel)
+            self._finite_direct_fallback = create_narrow_phase_process_mesh_triangle_contacts_kernel(
+                writer_func, skip_marked=True
+            )
+            self._finite_reducer_fallback = create_mesh_triangle_contacts_to_reducer_kernel(skip_marked=True)
 
         # Create mesh-specific kernels only when has_meshes=True
         if has_meshes:
