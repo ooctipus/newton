@@ -100,13 +100,13 @@ def _pair_requires_generic_convex_narrow_phase(
     return (type_a, type_b) not in _ANALYTIC_PRIMITIVE_PAIRS
 
 
-def _generic_convex_pair_requirements(
+def _count_generic_convex_pairs(
     model: Model,
     *,
     broad_phase_mode: str,
     shape_pairs_filtered: wp.array[wp.vec2i] | None,
-) -> list[bool] | None:
-    """Collect generic-convex requirements for possible shape-type pairs."""
+) -> int | None:
+    """Count generic-convex routes without per-pair Python work or a boolean list."""
     shape_types_array = getattr(model, "shape_type", None)
     if shape_types_array is None:
         return None
@@ -117,21 +117,27 @@ def _generic_convex_pair_requirements(
             return None
         pairs = shape_pairs_filtered.numpy()
         if pairs.size == 0:
-            return []
-        requirements = []
-        for shape_a, shape_b in pairs.reshape(-1, 2):
-            type_a = int(shape_types[shape_a])
-            type_b = int(shape_types[shape_b])
-            requirements.append(_pair_requires_generic_convex_narrow_phase(type_a, type_b))
-        return requirements
+            return 0
+        types, shape_type_index = np.unique(shape_types, return_inverse=True)
+        routed = np.array(
+            [[_pair_requires_generic_convex_narrow_phase(int(a), int(b)) for b in types] for a in types],
+            dtype=bool,
+        )
+        count = 0
+        pairs = pairs.reshape(-1, 2)
+        # Bound temporary gathers independently of the replicated world count.
+        for begin in range(0, len(pairs), 65536):
+            block = pairs[begin : begin + 65536]
+            count += int(np.count_nonzero(routed[shape_type_index[block[:, 0]], shape_type_index[block[:, 1]]]))
+        return count
 
     colliding_types = shape_types[_shape_collide_mask(model, len(shape_types))]
     unique_types = np.unique(colliding_types)
-    return [
+    return sum(
         _pair_requires_generic_convex_narrow_phase(int(type_a), int(type_b))
         for index, type_a in enumerate(unique_types)
         for type_b in unique_types[index:]
-    ]
+    )
 
 
 def _has_generic_convex_pairs(
@@ -141,12 +147,12 @@ def _has_generic_convex_pairs(
     shape_pairs_filtered: wp.array[wp.vec2i] | None,
 ) -> bool:
     """Conservatively prove whether any broad-phase pair can reach GJK/MPR."""
-    requirements = _generic_convex_pair_requirements(
+    count = _count_generic_convex_pairs(
         model,
         broad_phase_mode=broad_phase_mode,
         shape_pairs_filtered=shape_pairs_filtered,
     )
-    return True if requirements is None else any(requirements)
+    return True if count is None else count > 0
 
 
 @wp.struct
@@ -1104,16 +1110,12 @@ def _compute_generic_convex_pair_work_estimate(
 
     shape_types = shape_types_array.numpy()
     if broad_phase_mode == "explicit":
-        requirements = _generic_convex_pair_requirements(
+        count = _count_generic_convex_pairs(
             model,
             broad_phase_mode=broad_phase_mode,
             shape_pairs_filtered=shape_pairs_filtered,
         )
-        return (
-            candidate_pair_work_estimate
-            if requirements is None
-            else min(candidate_pair_work_estimate, sum(requirements))
-        )
+        return candidate_pair_work_estimate if count is None else min(candidate_pair_work_estimate, count)
 
     colliding_mask = _shape_collide_mask(model, len(shape_types))
     generic_pair_bound = 0

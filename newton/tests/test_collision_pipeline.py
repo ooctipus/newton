@@ -47,6 +47,8 @@ from newton._src.sim.collide import (
     _compute_per_world_shape_pairs_max,
     _count_soft_particle_rigid_contact_pairs,
     _estimate_rigid_contact_max,
+    _has_generic_convex_pairs,
+    _pair_requires_generic_convex_narrow_phase,
     write_contact,
 )
 from newton._src.utils.heightfield import HeightfieldData
@@ -2233,6 +2235,27 @@ class TestShapePairsMaxScaling(unittest.TestCase):
         )
 
         self.assertEqual(estimate, 1)
+
+    def test_explicit_routing_counts_all_types_and_repeated_pairs(self):
+        """Preserve every scalar route across reversed, repeated and empty pair lists."""
+        types = np.array([int(value) for value in GeoType] + [-1, 999], dtype=np.int32)
+        model = self._make_model(num_worlds=1, shapes_per_world=len(types))
+        model.shape_type = wp.array(types, dtype=wp.int32, device="cpu")
+        base = np.array([(a, b) for a in range(len(types)) for b in range(len(types))], dtype=np.int32)
+        repeats = 65536 // len(base) + 1
+        pairs = np.tile(base, (repeats, 1))
+        expected = repeats * sum(
+            _pair_requires_generic_convex_narrow_phase(int(types[a]), int(types[b])) for a, b in base
+        )
+        for values, count in ((pairs, expected), (pairs[:0], 0)):
+            pair_array = wp.array(values, dtype=wp.vec2i, device="cpu")
+            options = {"broad_phase_mode": "explicit", "shape_pairs_filtered": pair_array}
+            self.assertEqual(_has_generic_convex_pairs(model, **options), count > 0)
+            for bound in (len(values), count // 2):
+                self.assertEqual(
+                    _compute_generic_convex_pair_work_estimate(model, candidate_pair_work_estimate=bound, **options),
+                    min(count, bound),
+                )
 
     def test_mesh_work_buffers_use_category_bounds(self):
         """Size mesh work buffers from exact routed shape categories."""
