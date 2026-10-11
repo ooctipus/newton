@@ -44,6 +44,7 @@ from ..semi_implicit.kernels_particle import (
 )
 from ..solver import SolverBase
 from . import contact_compliance as _contact_compliance
+from .body_mapping import build_body_maps
 from .contact_torsion import (
     configure_contact_torsion,
     prepare_torsion_rows,
@@ -5555,58 +5556,22 @@ class SolverFeatherPGS(SolverBase):
         articulation_dof_start = self._model_plan.articulation_dof_start
         response_dof_count = self._model_plan.response_dof_count
 
-        body_to_joint = [-1] * model.body_count
-        body_to_articulation = [-1] * model.body_count
-
-        articulation_joint_end = self._model_plan.articulation_joint_end
-
-        for articulation in range(model.articulation_count):
-            joint_start = articulation_start[articulation]
-            # Tree prefix only: a trailing loop joint must not steal its child's inbound
-            # tree joint, or every ancestor walk from that body follows the loop.
-            joint_end = articulation_joint_end[articulation]
-
-            for joint_index in range(joint_start, joint_end):
-                child = joint_child[joint_index]
-                if child < 0:
-                    continue
-
-                body_to_joint[child] = joint_index
-                body_to_articulation[child] = articulation
-
-        body_has_response_dofs = np.zeros(model.body_count, dtype=np.int32)
-        body_response_dof_mask = np.zeros(model.body_count, dtype=np.uint32)
-        body_single_response_dof = np.full(model.body_count, -1, dtype=np.int32)
-        for body, joint in enumerate(body_to_joint):
-            articulation = body_to_articulation[body]
-            if joint < 0 or articulation < 0:
-                continue
-            response_start = int(articulation_dof_start[articulation])
-            response_end = response_start + int(response_dof_count[articulation])
-            ancestor_joint = joint
-            visited_joints: set[int] = set()
-            response_dofs = []
-            while ancestor_joint >= 0:
-                if ancestor_joint in visited_joints:
-                    raise ValueError(
-                        "SolverFeatherPGS: cyclic joint ancestry while building body response maps "
-                        f"(body {body}, articulation {articulation}, joint {ancestor_joint})."
-                    )
-                visited_joints.add(ancestor_joint)
-                joint_dof_start = int(joint_qd_start[ancestor_joint])
-                joint_dof_end = int(joint_qd_start[ancestor_joint + 1])
-                overlap_start = max(joint_dof_start, response_start)
-                overlap_end = min(joint_dof_end, response_end)
-                if overlap_start < overlap_end:
-                    body_has_response_dofs[body] = 1
-                    for global_dof in range(overlap_start, overlap_end):
-                        response_dofs.append(global_dof)
-                        local_dof = global_dof - response_start
-                        if local_dof < 32:
-                            body_response_dof_mask[body] |= np.uint32(1 << local_dof)
-                ancestor_joint = int(joint_ancestor[ancestor_joint])
-            if len(response_dofs) == 1:
-                body_single_response_dof[body] = response_dofs[0]
+        (
+            body_to_joint,
+            body_to_articulation,
+            body_has_response_dofs,
+            body_response_dof_mask,
+            body_single_response_dof,
+        ) = build_body_maps(
+            model.body_count,
+            joint_child,
+            joint_ancestor,
+            joint_qd_start,
+            articulation_start,
+            self._model_plan.articulation_joint_end,
+            articulation_dof_start,
+            response_dof_count,
+        )
 
         device = model.device
         self.body_to_joint = wp.array(body_to_joint, dtype=wp.int32, device=device)
