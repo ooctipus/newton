@@ -39,6 +39,8 @@ class TestHeightfieldConvexSplit(unittest.TestCase):
         actual, ordinary = split_pipeline(scene.model, True), split_pipeline(scene.model, False)
         self.assertEqual(len(actual.narrow_phase._heightfield_convex_split_kernels), 3)
         self.assertFalse(ordinary.narrow_phase._heightfield_convex_split_kernels)
+        self.assertEqual(actual.get_collision_selection()["heightfield_support"]["query_schedule"], "split")
+        self.assertEqual(ordinary.get_collision_selection()["heightfield_support"]["query_schedule"], "fused")
         self.assertEqual(
             len(actual.narrow_phase._heightfield_convex_query_results), len(actual.narrow_phase.triangle_pairs)
         )

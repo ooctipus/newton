@@ -2439,6 +2439,7 @@ class NarrowPhase:
         contact_writer_supports_speculative: bool = False,
         contact_export: Literal["auto", "tiled", "compact"] | None = None,
         heightfield_primitive_query: bool | None = None,
+        heightfield_convex_split: bool | None = None,
     ) -> None:
         """
         Initialize NarrowPhase with pre-allocated buffers.
@@ -2459,6 +2460,8 @@ class NarrowPhase:
                 ``compact`` requires admission. ``None`` preserves the legacy environment choice.
             heightfield_primitive_query: Request typed reduced terrain queries subject to
                 writer and pipeline admission. ``None`` preserves the environment choice.
+            heightfield_convex_split: Request staged convex terrain queries within the
+                admitted typed owner. ``None`` preserves the environment choice.
             device: Device to allocate buffers on
             shape_aabb_lower: Optional external AABB lower bounds array (if provided, AABBs won't be computed internally)
             shape_aabb_upper: Optional external AABB upper bounds array (if provided, AABBs won't be computed internally)
@@ -2655,6 +2658,10 @@ class NarrowPhase:
             create_heightfield_cylinder_split_kernels() if self._heightfield_cylinder_split else ()
         )
         convex_split = os.environ.get("NEWTON_HEIGHTFIELD_CONVEX_SPLIT", "0")
+        if heightfield_convex_split is not None:
+            if not isinstance(heightfield_convex_split, bool):
+                raise ValueError("heightfield_convex_split must be a bool or None")
+            convex_split = str(int(heightfield_convex_split))
         if convex_split not in ("0", "1"):
             raise ValueError("NEWTON_HEIGHTFIELD_CONVEX_SPLIT must be 0 or 1")
         self._heightfield_convex_split = convex_split == "1" and self._heightfield_primitive_query

@@ -1681,6 +1681,8 @@ class CollisionPipeline:
             convex_collision: Experimental per-instance convex query implementation. ``auto`` chooses
                 ordinary queries, rejection screening or convex cells; explicit choices
                 force a supported method. ``None`` retains the legacy environment selection.
+                Supported bulk CUDA terrain queries use staged MPR/GJK publication when
+                their scratch fits the memory budget. Small models retain fused queries.
             contact_export: Experimental reduced-contact export mapping. ``auto`` selects compact
                 workers for supported CUDA mesh/heightfield reducers. ``tiled`` forces the original
                 mapping; ``compact`` requires admission. Automatic compact export excludes
@@ -2193,6 +2195,18 @@ class CollisionPipeline:
             # the candidate-pair bound (N*(N-1)/2 per world) is orders of
             # magnitude larger than the neighbor-budget contact estimate and
             # allocating sorter scratch at that size burns multi-GB of VRAM.
+            terrain_split = None
+            if "NEWTON_HEIGHTFIELD_CONVEX_SPLIT" not in os.environ:
+                # Staging trades extra scratch/launches for lower query register
+                # pressure. Keep small batches and tight allocations fused.
+                terrain_split = (
+                    convex_collision in ("auto", "convex_cells")
+                    and has_heightfields
+                    and int(GeoType.CONVEX_MESH) in colliding_shape_types
+                    and device.is_cuda
+                    and model.world_count >= 1024
+                    and 44 * max_triangle_pairs + 4 <= device.free_memory // 8
+                )
             self.narrow_phase = NarrowPhase(
                 max_candidate_pairs=self.shape_pairs_max,
                 max_triangle_pairs=max_triangle_pairs,
@@ -2222,6 +2236,7 @@ class CollisionPipeline:
                 speculative=self._speculative_enabled,
                 contact_writer_supports_speculative=self._speculative_enabled,
                 contact_export=contact_export,
+                heightfield_convex_split=terrain_split,
                 heightfield_primitive_query=True
                 if convex_collision in ("auto", "convex_cells")
                 and has_heightfields
@@ -2622,6 +2637,7 @@ class CollisionPipeline:
             result["heightfield_support"] = {
                 **terrain,
                 "admitted_meshes": len(self._heightfield_convex_cells.metadata["admitted_meshes"]),
+                "query_schedule": "split" if self.narrow_phase._heightfield_convex_split_kernels else "fused",
             }
         result["contact_export"] = {
             "requested": self.narrow_phase.contact_export,
