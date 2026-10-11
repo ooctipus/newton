@@ -13,6 +13,7 @@ import warp as wp
 import newton
 from newton._src.geometry.contact_reduction_global import decode_oct
 from newton._src.geometry.narrow_phase import NarrowPhase, write_contact_simple
+from newton._src.geometry.support_function import SupportMapDataProvider
 from newton.tests import test_heightfield_primitive_query as primitive
 from newton.tests.test_heightfield_primitive_cull import primitive_model
 
@@ -165,6 +166,7 @@ class TestHeightfieldCylinderSplit(unittest.TestCase):
                         owner._heightfield_cylinder_query_results,
                         owner._heightfield_cylinder_gjk_indices,
                         owner._heightfield_cylinder_gjk_count,
+                        SupportMapDataProvider(),
                     ]
                     for kernel in owner._heightfield_cylinder_split_kernels:
                         launch(kernel, dim=128, inputs=inputs, device=device, block_dim=128)

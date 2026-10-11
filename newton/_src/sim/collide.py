@@ -2462,6 +2462,20 @@ class CollisionPipeline:
                 self.narrow_phase._heightfield_convex_cells_requested = True
                 self.narrow_phase._heightfield_method_choice = choice
                 self.narrow_phase._heightfield_convex_cell_kernel = terrain_kernel(conditional=choice is not None)
+                if self.narrow_phase._heightfield_convex_split:
+                    from ..geometry.convex_cells import _CellData  # noqa: PLC0415
+                    from ..geometry.heightfield_convex_cells import (  # noqa: PLC0415
+                        TerrainSupportData,
+                        support_heightfield_cells,
+                        support_selected,
+                    )
+                    from ..geometry.heightfield_split import create_heightfield_split_kernels  # noqa: PLC0415
+
+                    self.narrow_phase._heightfield_convex_split_kernels = create_heightfield_split_kernels(
+                        int(GeoType.CONVEX_MESH),
+                        support_selected if choice is not None else support_heightfield_cells,
+                        TerrainSupportData if choice is not None else _CellData,
+                    )
                 self.narrow_phase._heightfield_primitive_kernels = (
                     *self.narrow_phase._heightfield_primitive_kernels[:2],
                     create_mesh_triangle_contacts_to_reducer_kernel(

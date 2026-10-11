@@ -2654,6 +2654,11 @@ class NarrowPhase:
         self._heightfield_cylinder_split_kernels = (
             create_heightfield_cylinder_split_kernels() if self._heightfield_cylinder_split else ()
         )
+        convex_split = os.environ.get("NEWTON_HEIGHTFIELD_CONVEX_SPLIT", "0")
+        if convex_split not in ("0", "1"):
+            raise ValueError("NEWTON_HEIGHTFIELD_CONVEX_SPLIT must be 0 or 1")
+        self._heightfield_convex_split = convex_split == "1" and self._heightfield_primitive_query
+        self._heightfield_convex_split_kernels = ()
         export_cleanup = os.environ.get("NEWTON_REDUCER_EXPORT_CLEANUP", "0")
         if export_cleanup not in ("0", "1"):
             raise ValueError("NEWTON_REDUCER_EXPORT_CLEANUP must be 0 or 1")
@@ -2931,6 +2936,8 @@ class NarrowPhase:
             n += 2 if self.split_gjk_mpr else 0
             cylinder_gjk_idx = n if self._heightfield_cylinder_split else None
             n += 1 if self._heightfield_cylinder_split else 0
+            convex_gjk_idx = n if self._heightfield_convex_split else None
+            n += 1 if self._heightfield_convex_split else 0
             sdf_sdf_idx = n
             n += 1
             mesh_like_idx = n if has_mesh_like else None
@@ -2949,6 +2956,9 @@ class NarrowPhase:
             self.split_manifold_work_count = c[split_gjk_idx + 1 : split_gjk_idx + 2] if self.split_gjk_mpr else None
             self._heightfield_cylinder_gjk_count = (
                 c[cylinder_gjk_idx : cylinder_gjk_idx + 1] if self._heightfield_cylinder_split else None
+            )
+            self._heightfield_convex_gjk_count = (
+                c[convex_gjk_idx : convex_gjk_idx + 1] if self._heightfield_convex_split else None
             )
             self.shape_pairs_sdf_sdf_count = c[sdf_sdf_idx : sdf_sdf_idx + 1]
             self.shape_pairs_mesh_count = c[mesh_like_idx : mesh_like_idx + 1] if has_mesh_like else None
@@ -2993,6 +3003,14 @@ class NarrowPhase:
                 wp.empty(max_triangle_pairs, dtype=wp.int32, device=device)
                 if self._heightfield_cylinder_split
                 else None
+            )
+            self._heightfield_convex_query_results = (
+                wp.empty(max_triangle_pairs, dtype=ConvexQueryResult, device=device)
+                if self._heightfield_convex_split
+                else None
+            )
+            self._heightfield_convex_gjk_indices = (
+                wp.empty(max_triangle_pairs, dtype=wp.int32, device=device) if self._heightfield_convex_split else None
             )
             self.shape_pairs_mesh_plane = (
                 wp.zeros(self.max_mesh_plane_pairs, dtype=wp.vec2i, device=device) if has_meshes else None
@@ -3628,6 +3646,7 @@ class NarrowPhase:
                                 self._heightfield_cylinder_query_results,
                                 self._heightfield_cylinder_gjk_indices,
                                 self._heightfield_cylinder_gjk_count,
+                                SupportMapDataProvider(),
                             ]
                         for kernel in kernels:
                             wp.launch(
@@ -3645,14 +3664,25 @@ class NarrowPhase:
                         if self._heightfield_method_choice is not None:
                             self._heightfield_method_choice.launch(triangle_inputs)
                             support_data = self._heightfield_method_choice.data
-                        wp.launch(
-                            kernel=self._heightfield_convex_cell_kernel,
-                            dim=self.total_num_threads,
-                            inputs=[*triangle_inputs, support_data],
-                            device=device,
-                            block_dim=self.mesh_triangle_block_dim,
-                            record_tape=False,
-                        )
+                        kernels = self._heightfield_convex_split_kernels or (self._heightfield_convex_cell_kernel,)
+                        inputs = [*triangle_inputs, support_data]
+                        if self._heightfield_convex_split_kernels:
+                            inputs = [
+                                *triangle_inputs,
+                                self._heightfield_convex_query_results,
+                                self._heightfield_convex_gjk_indices,
+                                self._heightfield_convex_gjk_count,
+                                support_data,
+                            ]
+                        for kernel in kernels:
+                            wp.launch(
+                                kernel=kernel,
+                                dim=self.total_num_threads,
+                                inputs=inputs,
+                                device=device,
+                                block_dim=self.mesh_triangle_block_dim,
+                                record_tape=False,
+                            )
                 else:
                     wp.launch(
                         kernel=self._pair_csr.generic
