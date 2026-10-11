@@ -1326,16 +1326,21 @@ class SolverFeatherPGS(SolverBase):
     articulation. Dense-factor chains and unsupported features retain the
     existing representation. Selection uses topology and resources, not task names.
 
-    The experimental sparse velocity-limit mode is disabled by default. Set
-    ``FEATHER_PGS_SPARSE_VELOCITY_LIMITS=1`` before construction to use
-    factor-coordinate responses for compatible ``matrix_free`` CUDA models,
+    Automatic sparse selection includes factor-coordinate velocity-limit
+    responses for compatible ``matrix_free`` CUDA models,
     including serial chains and same-articulation mimic couplings. It preserves
     ordered PGS sweeps and the final, stateless speed-limit projection in each
     sweep. It requires augmented drives and current friction; warm starts,
     friction anchors, independent free bodies, prescribed motion and loop-closure
     constraints retain the existing representation. Selection also follows the
-    topology and resource limits above. This feature is experimental and may
-    change without notice.
+    topology and resource limits above. Compatible split sweeps and grouped
+    dynamics also compose with automatic sparse factors. Set
+    ``sparse_mass_matrix="off"`` to retain ordinary factors. Legacy
+    ``FEATHER_PGS_SPARSE_VELOCITY_LIMITS=0``, ``FEATHER_PGS_SPARSE_SPLIT=0`` and
+    ``FEATHER_PGS_SPARSE_GROUPED_DYNAMICS=0`` disable their respective automatic
+    compositions; explicit ``sparse_mass_matrix="on"`` overrides those optional
+    gates while retaining physical and resource admission. This feature is
+    experimental and may change without notice.
 
     The experimental sparse contact-triplet mode is disabled by default. Set
     ``FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1`` before construction to cache tangent
@@ -1531,6 +1536,8 @@ class SolverFeatherPGS(SolverBase):
             delassus_kernel: Dense Delassus assembly kernel; explicit choices require split mode.
             sparse_mass_matrix: Experimental native sparse factors: ``auto`` retains topology/resource
                 admission, ``on`` requires admission, and ``off`` retains the ordinary representation.
+                Compatible split sweeps, velocity limits and grouped dynamics compose automatically.
+                Legacy sparse-composition opt-outs apply to ``auto``; ``on`` overrides those gates.
                 This option does not enable research packed-factor owners. Incompatible forced choices
                 raise ValueError; this experimental selector may change without notice.
             cached_dynamics: Experimental paired cached prediction and next-state publication.
@@ -5228,14 +5235,15 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_prepare_contacts = False
         self._sparse_row_support = _SparseRowSupport()
         self._sparse_contact_triplets = False
-        if getattr(self, "sparse_mass_matrix", "auto") == "off" or getattr(self, "_explicit_dense_kernels", False):
+        sparse_choice = getattr(self, "sparse_mass_matrix", "auto")
+        if sparse_choice == "off" or getattr(self, "_explicit_dense_kernels", False):
             return
         # Reuse the factor representation without changing split's row law or
         # state-cache lifecycle. Nonzero seeds need a factor-delta initialization
         # that this cold owner deliberately does not provide.
         split_candidate = (
             self.pgs_mode == "split"
-            and os.environ.get("FEATHER_PGS_SPARSE_SPLIT", "0") == "1"
+            and (sparse_choice == "on" or os.environ.get("FEATHER_PGS_SPARSE_SPLIT", "1") == "1")
             and self.pgs_kernel == "tiled_row"
             and not self._has_free_rigid_bodies
             and not self._friction_anchors_enabled
@@ -5244,16 +5252,13 @@ class SolverFeatherPGS(SolverBase):
         velocity_candidate = (
             self.pgs_mode == "matrix_free"
             and self.enable_joint_velocity_limits
-            and os.environ.get("FEATHER_PGS_SPARSE_VELOCITY_LIMITS", "0") == "1"
+            and (sparse_choice == "on" or os.environ.get("FEATHER_PGS_SPARSE_VELOCITY_LIMITS", "1") == "1")
             and not self._has_free_rigid_bodies
             and not self._friction_anchors_enabled
             and self._kernel_overrides.get("sparse_prepare_contacts", True)
         )
         if not (
-            (
-                getattr(self, "sparse_mass_matrix", "auto") == "on"
-                or self._kernel_overrides.get("sparse_mass_matrix", True)
-            )
+            (sparse_choice == "on" or self._kernel_overrides.get("sparse_mass_matrix", True))
             and model.device.is_cuda
             and not model.requires_grad
             and (self.pgs_mode == "matrix_free" or split_candidate)
@@ -5283,7 +5288,11 @@ class SolverFeatherPGS(SolverBase):
         # requested owner later declines the topology. They cannot acquire
         # dense storage after this sparse allocation decision.
         if (
-            (self.grouped_dynamics and os.environ.get("FEATHER_PGS_SPARSE_GROUPED_DYNAMICS", "0") != "1")
+            (
+                self.grouped_dynamics
+                and sparse_choice != "on"
+                and os.environ.get("FEATHER_PGS_SPARSE_GROUPED_DYNAMICS", "1") != "1"
+            )
             or os.environ.get("FEATHER_PGS_MF_MULTIBLOCK") == "1"
             or (self._has_free_rigid_bodies and os.environ.get("FEATHER_PGS_FREE_BODY_IMPLICIT_GYRO") == "1")
         ):

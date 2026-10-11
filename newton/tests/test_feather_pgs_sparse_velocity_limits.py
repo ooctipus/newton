@@ -31,16 +31,18 @@ from newton.tests.test_feather_pgs_sparse_research_admission import _eligible_so
 
 
 class TestSparseVelocityLimitAdmission(unittest.TestCase):
-    def test_enabled_velocity_owner_reaches_topology(self):
+    def test_auto_and_enabled_velocity_owner_reach_topology(self):
         """Admit the unchanged augmented matrix-free recipe before planning its factor."""
         solver = _eligible_solver()
         solver.enable_joint_velocity_limits = True
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        with (
-            mock.patch.dict(os.environ, {"FEATHER_PGS_SPARSE_VELOCITY_LIMITS": "1"}, clear=True),
-            self.assertRaises(_TopologyReached),
-        ):
-            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+        for environment in ({}, {"FEATHER_PGS_SPARSE_VELOCITY_LIMITS": "1"}):
+            with (
+                self.subTest(environment=environment),
+                mock.patch.dict(os.environ, environment, clear=True),
+                self.assertRaises(_TopologyReached),
+            ):
+                SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
         self.assertEqual(solver.pgs_mode, "matrix_free")
 
     def test_default_and_unsupported_recipes_keep_existing_owner(self):

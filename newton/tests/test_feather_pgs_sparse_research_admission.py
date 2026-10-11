@@ -139,12 +139,14 @@ class TestSparseResearchAdmission(unittest.TestCase):
             ):
                 SolverFeatherPGS._setup_sparse_mass_matrix(_eligible_solver(), model)
 
-    def test_grouped_dynamics_keeps_existing_factor_owner(self):
-        """Preserve grouped dynamics before general sparse setup replaces dense factor buffers."""
+    def test_grouped_dynamics_auto_and_legacy_opt_out(self):
+        """Compose grouped dynamics automatically while retaining its explicit opt-out."""
         solver = _eligible_solver()
         solver.grouped_dynamics = True
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        with mock.patch.dict(os.environ, {}, clear=True):
+        with mock.patch.dict(os.environ, {}, clear=True), self.assertRaises(_TopologyReached):
+            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+        with mock.patch.dict(os.environ, {"FEATHER_PGS_SPARSE_GROUPED_DYNAMICS": "0"}, clear=True):
             SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
         self.assertIsNone(solver._sparse_mass_matrix_size)
 

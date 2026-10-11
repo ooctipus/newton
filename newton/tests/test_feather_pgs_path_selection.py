@@ -23,6 +23,38 @@ def _cpu_model():
 
 
 class TestFeatherPGSPathSelection(unittest.TestCase):
+    @unittest.skipUnless(wp.is_cuda_available(), "Sparse admission requires CUDA")
+    def test_sparse_auto_composes_existing_execution_choices(self):
+        """Select qualified split, velocity-limit and grouped paths without private switches."""
+        model = _build_model()
+        flags = (
+            "FEATHER_PGS_SPARSE_SPLIT",
+            "FEATHER_PGS_SPARSE_VELOCITY_LIMITS",
+            "FEATHER_PGS_SPARSE_GROUPED_DYNAMICS",
+        )
+        cases = (
+            {"pgs_mode": "split"},
+            {"enable_joint_velocity_limits": True},
+            {"grouped_dynamics": True},
+        )
+        with patch.dict(os.environ):
+            for name in flags:
+                os.environ.pop(name, None)
+            for options in cases:
+                with self.subTest(options=options):
+                    solver = _make_solver(model, True, friction_anchor_beta=0.0, **options)
+                    self.assertEqual(solver.get_path_selection()["sparse_mass_matrix"], "on")
+                    disabled = _make_solver(model, True, sparse_mass_matrix="off", friction_anchor_beta=0.0, **options)
+                    self.assertEqual(disabled.get_path_selection()["sparse_mass_matrix"], "off")
+            for name in flags:
+                os.environ[name] = "0"
+            for options in cases:
+                with self.subTest(legacy_disabled=options):
+                    ordinary = _make_solver(model, True, friction_anchor_beta=0.0, **options)
+                    self.assertEqual(ordinary.get_path_selection()["sparse_mass_matrix"], "off")
+                    forced = _make_solver(model, True, sparse_mass_matrix="on", friction_anchor_beta=0.0, **options)
+                    self.assertEqual(forced.get_path_selection()["sparse_mass_matrix"], "on")
+
     def test_cached_dynamics_cpu_choices(self):
         """Keep CPU auto ordinary and reject a forced unsupported cache."""
         model = _cpu_model()

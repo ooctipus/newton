@@ -148,15 +148,17 @@ def _step(case):
 
 
 class TestSparseSplitAdmission(unittest.TestCase):
-    def test_opt_in_reaches_topology_without_changing_mode(self):
+    def test_auto_and_opt_in_reach_topology_without_changing_mode(self):
         """Admit the split recipe before choosing its topology-derived representation."""
         solver = _probe()
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        with (
-            mock.patch.dict(os.environ, {"FEATHER_PGS_SPARSE_SPLIT": "1"}, clear=True),
-            self.assertRaises(_TopologyReached),
-        ):
-            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+        for environment in ({}, {"FEATHER_PGS_SPARSE_SPLIT": "1"}):
+            with (
+                self.subTest(environment=environment),
+                mock.patch.dict(os.environ, environment, clear=True),
+                self.assertRaises(_TopologyReached),
+            ):
+                SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
         self.assertEqual(solver.pgs_mode, "split")
 
     def test_default_and_unsupported_recipes_keep_dense_storage(self):
