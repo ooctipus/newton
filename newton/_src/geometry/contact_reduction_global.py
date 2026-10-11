@@ -2530,9 +2530,9 @@ def create_mesh_triangle_contacts_to_reducer_kernel(
             if i >= triangle_pairs.shape[0]:
                 break
 
-            local_writer = reducer_data
+            # Preserve the original argument in the unbound specialization.
             if wp.static(writer_binding is not None):
-                local_writer = wp.static(writer_binding)(reducer_data, i)
+                reducer_data = wp.static(writer_binding)(reducer_data, i)
             triple = triangle_pairs[i]
             shape_a = triple[0]  # Mesh or heightfield shape
             shape_b = triple[1]  # Convex shape
@@ -2641,7 +2641,7 @@ def create_mesh_triangle_contacts_to_reducer_kernel(
                 shape_b,
                 margin_offset_a,
                 margin_offset_b,
-                local_writer,
+                reducer_data,
                 (tri_idx << 1) | 1,
                 feature_context,
             )

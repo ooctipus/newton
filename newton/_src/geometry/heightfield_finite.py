@@ -268,9 +268,8 @@ def create_query_kernel(
         for i in range(wp.tid(), triangle_pairs_count[0], total_num_threads):
             if i >= triangle_pairs.shape[0]:
                 break
-            local_writer = writer_data
             if wp.static(writer_binding is not None):
-                local_writer = wp.static(writer_binding)(writer_data, i)
+                writer_data = wp.static(writer_binding)(writer_data, i)
             triple = triangle_pairs[i]
             a, b, tri_idx = triple[0], triple[1], triple[2]
             if tri_idx < 0 or shape_types[a] != GeoType.HFIELD:
@@ -349,7 +348,7 @@ def create_query_kernel(
                 contact.sort_sub_key = (((tri_idx << 1) | 1) << 3) | k
                 # Axial/Minkowski postprocessing is identity for this admitted
                 # HFIELD + BOX/CONVEX family; both effective radii remain zero.
-                wp.static(writer_func)(contact, local_writer, -1)
+                wp.static(writer_func)(contact, writer_data, -1)
             triangle_pairs[i] = wp.vec3i(a, b, ~tri_idx)
 
     if shell_support:
