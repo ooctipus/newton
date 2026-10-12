@@ -59,6 +59,11 @@ def allocate_hybrid(worlds, mf_impulses, mf_contact_end, device):
 def _pin():
     """Check only the retained representation and original kernel factories."""
     checked_definitions(
+        "paired_factor_source.py",
+        ("_KINETIC_ENTRY", "_KINETIC_EXIT", "_KINETIC_ALIASES", "_physical_entry", "_physical_exit", "get_source"),
+    )
+    checked_definitions("component_qualification.py", ("_PHYSICAL_PUBLISH", "get_source"))
+    checked_definitions(
         "kinetic_solve.py",
         (
             "_T",
@@ -77,43 +82,10 @@ def _pin():
 
 
 def qualify_source():
-    """Emit both ownership decisions during the existing predicate visits."""
-    _pin()
-    source = original.qualifier_source()
-    replace = original.replace_once
-    source = replace(
-        source,
-        "if (tid == 0) solve.selector.data[world] = mf_count == 0 ? 0 : wp::max(mf_count, 1);",
-        "if (tid == 0) { solve.selector.data[world] = mf_count == 0 ? 0 : wp::max(mf_count, 1); hybrid.eligible.data[world] = 0; }",
-    )
-    source = replace(source, "if (tid == 0) accepted = 1;", "if (tid == 0) accepted = 3;")
-    source = replace(source, "int valid = 1;", "int valid = 1, independent = 1, hybrid_route = 1;")
-    source = replace(
-        source,
-        "if (d >= so && d < so + 6) valid &= j == 0.0f && y == 0.0f;",
-        "if (d >= so && d < so + 6) independent &= j == 0.0f && y == 0.0f;",
-    )
-    source = replace(
-        source,
-        "const int tp = mf.meta.data[r * 4 + 3], type = tp & 65535;",
-        "const int tp = mf.meta.data[r * 4 + 3], type = tp & 65535;\n            hybrid_route &= (a == so) != (b == so);",
-    )
-    source = replace(
-        source,
-        "if (!valid) atomicExch(&accepted, 0);",
-        "const int keep = valid ? ((independent ? 1 : 0) | (hybrid_route ? 2 : 0)) : 0;\n        if (keep != 3) atomicAnd(&accepted, keep);",
-    )
-    source = replace(
-        source,
-        "accepted = valid;",
-        "accepted = valid ? ((independent ? 1 : 0) | (hybrid_route ? 2 : 0)) : 0;",
-    )
-    source = replace(
-        source,
-        "if (accepted) {\n            if (tid == 0) solve.selector.data[world] = -1;\n        }",
-        "if (tid == 0) {\n            if (accepted & 1) solve.selector.data[world] = -1;\n            else if ((accepted & 2) && m > 0 && state.resolved.data[world] == 0) hybrid.eligible.data[world] = 1;\n        }",
-    )
-    return source
+    """Emit independent and coupled ownership during the shared predicate visits."""
+    from .component_qualification import get_source  # noqa: PLC0415
+
+    return get_source("hybrid")
 
 
 @functools.cache

@@ -168,15 +168,21 @@ def device_contact_call(source, device):
             inputs=limit_args,
             device=device,
         )
-        for counter, cap, family, count in (
-            (allocation.dense_counter, 192, 0, state.dense_count),
-            (allocation.mf_counter, 64, 1, state.mf_count),
-            (allocation.propagation_counter, 192, 2, allocation.propagation_count),
+        for counter, cap, family, first_rejected, count in (
+            (allocation.dense_counter, 192, 0, allocation.first_rejected_dense, state.dense_count),
+            (allocation.mf_counter, 64, 1, allocation.first_rejected_mf, state.mf_count),
+            (
+                allocation.propagation_counter,
+                192,
+                2,
+                allocation.first_rejected_propagation,
+                allocation.propagation_count,
+            ),
         ):
             wp.launch(
                 kernels.finalize_constraint_counts_with_status,
                 dim=worlds,
-                inputs=[counter, cap, family, count, state.capacity_status],
+                inputs=[counter, cap, family, first_rejected, count, state.capacity_status],
                 device=device,
             )
         out.global_status.zero_()

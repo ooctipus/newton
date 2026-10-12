@@ -30,7 +30,12 @@ SOURCE_PINS = {
     "kinetic_hybrid": "0e7794cbbed06905f9cdc039e37c5ae9e30643b93b432783148548b3c9ba5265",
     "kinetic_compact_coupled": "84a6bd0479dd68c47b59381ef0cc23c0b4b921c9b6dfda7c05a4148c943b88d9",
 }
+# Native/descriptor baseline reviewed against qualified Newton 9f17ebed.
+# The preceding oracle predated the six-fence transaction and current CPU law;
+# its stale records failed before the shared-source refactor. Preserve all 250
+# current records, including the unchanged native bodies of the new factories.
 EXPECTED = {
+    "kinetic_solve/FRICTION_PAIR_CUDA/literal": "c6d3cbfc5b5c11df5ad85f5af0f6d20e3293fe31b929d58e9f2cd32f822c2465",
     "kinetic_allocate/AllocationData/descriptor": "c84add405b81f44f7fa533419523012d9adffe07da53c1a5edbc024d0eb53f04",
     "kinetic_allocate/initialize_count/python": "9f967b9f1bf4eb3f28a27d5c9945b793a8e11c0cf6683880e7b05c2b6c04d6a9",
     "kinetic_compact_coupled/_SIX_BRIDGE/literal": "f7669f8e6de34f78ec50765c7134b278f5f04c9df5556597d8d7ff567cb50de7",
@@ -39,12 +44,12 @@ EXPECTED = {
     "kinetic_compact_coupled/_arena/python": "6a4624196742eb065cfbe561ea98c3d2b5835f6210877c5a66fd1946ec2fc158",
     "kinetic_compact_coupled/get_general_kernel/closure/_arena": "b893e043cf040a4ba1d2d3b61f987a3be70e859ac590918a9716d919453a6081",
     "kinetic_compact_coupled/get_general_kernel/closure/_is_cpu": "599e3cf521417116b73f62d2c175b700d4631010feecc7a5658d7f0281c9a6ab",
-    "kinetic_compact_coupled/get_general_kernel/closure/kinetic_compact_native": "16ff8f0465a3398dcc83130e43fb9e7a79cea84684b7e170c64e7e9496e5b170",
-    "kinetic_compact_coupled/get_general_kernel/closure/kinetic_original_arena_native": "a9111e7f9865153aca6159f29f514bfc647e471024c1cd4ead84cdbb7f55bd42",
-    "kinetic_compact_coupled/get_general_kernel/compact_mf_source": "3efe747c8f1c330151ce566d9f6b2a9747f4ed82585e2eb2ba94c5c920041af7",
+    "kinetic_compact_coupled/get_general_kernel/closure/kinetic_compact_native": "82a94c7d855f8689b088d9962d30c1c0de535a4c89835fa1d1204b081b9733ea",
+    "kinetic_compact_coupled/get_general_kernel/closure/kinetic_original_arena_native": "8963b592c49eabea3681347df4f400b3722c08846bcc222258c2ce7b3ce1bcad",
+    "kinetic_compact_coupled/get_general_kernel/compact_mf_source": "41a9f38896357adfcc1d17380d559a1f2fd06af43dbd9c3f8b7bb9acb89319a1",
     "kinetic_compact_coupled/get_general_kernel/compact_original_source": "00d3e701da6332c244f96550d924d14941244645e0cc2f02dc3822eb4032eaea",
-    "kinetic_compact_coupled/get_general_kernel/compact_source": "16ff8f0465a3398dcc83130e43fb9e7a79cea84684b7e170c64e7e9496e5b170",
-    "kinetic_compact_coupled/get_general_kernel/python": "244c5095a5a6bb25a6932132fad8faf30685137c5593b86183acd01eed4c7bc9",
+    "kinetic_compact_coupled/get_general_kernel/compact_source": "82a94c7d855f8689b088d9962d30c1c0de535a4c89835fa1d1204b081b9733ea",
+    "kinetic_compact_coupled/get_general_kernel/python": "655c406f17f0027cfc34ead3f2f361df8513c611fa242c5b3b3b2122fe0c374d",
     "kinetic_compact_coupled/get_materialize_kernel/closure/materialize": "39b8c87e2a4c010c763a30267ac8027ee0f52db003eabd68d90a2264d8881f90",
     "kinetic_compact_coupled/get_materialize_kernel/python": "ef4f17b1a2ed3d0b2976c606e948623516d15d6a3d463aab6a4024daac559218",
     "kinetic_compact_coupled/get_qualify_kernel/closure/qualify": "7d97f5185d4ab899d9feb20d2b3803879a41cbcec01b7ccf9edd81d7894d1222",
@@ -79,26 +84,26 @@ EXPECTED = {
     "kinetic_guard/get_finish_kernel/closure/_sync": "7d87c36cf4126ba2d3101bb2728465b36b1a84119b6d9be8e2980a936f4c94b8",
     "kinetic_guard/get_finish_kernel/python": "610fd7c6065fb879f9023cb855acdbb272541455c46de3af373b3c1ddb523f6a",
     "kinetic_guard/get_general_kernel/closure/pgs_solve_mf_gs_native": "00d3e701da6332c244f96550d924d14941244645e0cc2f02dc3822eb4032eaea",
-    "kinetic_guard/get_general_kernel/python": "6a49d242c3817c620a44cac77364c2921ba7299bc837b82cbe7fdc681544c28f",
+    "kinetic_guard/get_general_kernel/python": "2c298a208583659a52c2d5c639f61526a0116535d5454632fa73d682165d176f",
     "kinetic_hybrid/HybridCoupledData/descriptor": "1a261fa76dc5207521c424ac6489a29c87c9b6a0448add39538ea356af28a078",
-    "kinetic_hybrid/_CPU/literal": "e7e391d9a7653f4703a84d79da40cc7d4d42994990a9a0c1d821c601c5979316",
+    "kinetic_hybrid/_CPU/literal": "2700160add075b99e651912cb6ffb04057248af06d6f4fb38d6a2c6985d279c3",
     "kinetic_hybrid/_STAGE/literal": "aff1df90537aaa5df4193cd57dd4dcb5ab286022d763bace028f1bd6999cbe58",
     "kinetic_hybrid/_STORE/literal": "e14f17abb62d9ff7a51ebfcf30c9a45944f640da23eda23fb03a87f024903d80",
     "kinetic_hybrid/get_general_kernel/closure/_is_cpu": "599e3cf521417116b73f62d2c175b700d4631010feecc7a5658d7f0281c9a6ab",
-    "kinetic_hybrid/get_general_kernel/closure/kinetic_hybrid_native": "1c1c41d6dc2d95ed009f2b7a4f55946a91a075f6d58469d6ca95b17f2d343a10",
+    "kinetic_hybrid/get_general_kernel/closure/kinetic_hybrid_native": "06c5822b557296a74542cb5d25337882dcd6f34215046c06659c8ef5ed0632b8",
     "kinetic_hybrid/get_general_kernel/closure/pgs_solve_mf_gs_native": "00d3e701da6332c244f96550d924d14941244645e0cc2f02dc3822eb4032eaea",
     "kinetic_hybrid/get_general_kernel/hybrid_original_source": "00d3e701da6332c244f96550d924d14941244645e0cc2f02dc3822eb4032eaea",
-    "kinetic_hybrid/get_general_kernel/hybrid_source": "1c1c41d6dc2d95ed009f2b7a4f55946a91a075f6d58469d6ca95b17f2d343a10",
-    "kinetic_hybrid/get_general_kernel/python": "52c299afe9b78466e1fddd8e78958566340bc6ca06cf3c8fc56b1615fb93f341",
+    "kinetic_hybrid/get_general_kernel/hybrid_source": "06c5822b557296a74542cb5d25337882dcd6f34215046c06659c8ef5ed0632b8",
+    "kinetic_hybrid/get_general_kernel/python": "f82574bd803f1db8910478a0f02a540187fe652ed3fb72d8defd3b83a7289c5d",
     "kinetic_hybrid/get_materialize_kernel/closure/materialize": "57cd055ea248b1c8739af80da633649e85b9f06ec7265d5ece0a758ed08939fa",
     "kinetic_hybrid/get_materialize_kernel/python": "986dc418dda29758beddfeb923c254aac30e07ca141394b704d6311aa7f915ff",
     "kinetic_hybrid/get_qualify_kernel/closure/qualify": "7d97f5185d4ab899d9feb20d2b3803879a41cbcec01b7ccf9edd81d7894d1222",
     "kinetic_hybrid/get_qualify_kernel/python": "93f78eabfb407def2a88c019ee429010c62478d315a50217a65cb4fa6a080907",
-    "kinetic_predictor/_PREDICTOR/literal": "ffeb2009102fa3de150a2af22f0693b1353922e4b53553ec5a7998b7b7b458bc",
+    "kinetic_predictor/_PREDICTOR/literal": "13d6cbcd96a369970b93cf8c67a74be196de93e6013d11aabc5a53cf2c54078d",
     "kinetic_predictor/_REFRESH/literal": "90552164c723a31cd61e8df44bb32fb7db1725730d6932d78a2e28e24bcaa2c3",
     "kinetic_predictor/_lane/native": "2db4bbd288242f40f695e7037bdd3cab38371ad0d68f70239daea714962341bc",
     "kinetic_predictor/_lane/python": "6761c643149a8fe1ea3f751f1422e46082d0e24e952a4c25c9bcb28121c60fe7",
-    "kinetic_predictor/_predictor/native": "ffeb2009102fa3de150a2af22f0693b1353922e4b53553ec5a7998b7b7b458bc",
+    "kinetic_predictor/_predictor/native": "13d6cbcd96a369970b93cf8c67a74be196de93e6013d11aabc5a53cf2c54078d",
     "kinetic_predictor/_predictor/python": "fd95064cd0dbb8d3f7943a76b3a7be65a821d70b7aca6c1391cbccb1826e0490",
     "kinetic_predictor/_refresh/native": "90552164c723a31cd61e8df44bb32fb7db1725730d6932d78a2e28e24bcaa2c3",
     "kinetic_predictor/_refresh/python": "d8856d3fe09c21ceb796074c4ee4dc2656daa0000d5970877c2eef6797d44e3a",
@@ -107,7 +112,7 @@ EXPECTED = {
     "kinetic_predictor/_storage/native": "16ba5f092581c9ab89e6150d7895056014f1c132a18ddea932c4eb457426000c",
     "kinetic_predictor/_storage/python": "eebb16155ea5699e4df622f0dbf3d5f8544921d837dd93939a10f31d01184a8f",
     "kinetic_predictor/get_predictor_kernel/closure/_lane": "2db4bbd288242f40f695e7037bdd3cab38371ad0d68f70239daea714962341bc",
-    "kinetic_predictor/get_predictor_kernel/closure/_predictor": "ffeb2009102fa3de150a2af22f0693b1353922e4b53553ec5a7998b7b7b458bc",
+    "kinetic_predictor/get_predictor_kernel/closure/_predictor": "13d6cbcd96a369970b93cf8c67a74be196de93e6013d11aabc5a53cf2c54078d",
     "kinetic_predictor/get_predictor_kernel/closure/_release": "96d0c7b488b5de3c7a420bb13b10d305441a12979033ae4fa36b78557e6ac20a",
     "kinetic_predictor/get_predictor_kernel/closure/_storage": "16ba5f092581c9ab89e6150d7895056014f1c132a18ddea932c4eb457426000c",
     "kinetic_predictor/get_predictor_kernel/python": "762d18e85a1654968985a7646d9fcf63521ece1178c250d7ba9b4c686913f0a4",
@@ -166,7 +171,7 @@ EXPECTED = {
     "kinetic_services/_float_bits/python": "bca3253f08e7efc0368987bff01b4286668b5ef8daaac53912facf036804d543",
     "kinetic_services/pack_mf_cpu_reference/closure/_float_bits": "854a457d7e3955344693370f032abb1add448f7c52042c4e8ecf120510734c20",
     "kinetic_services/pack_mf_cpu_reference/python": "e7076395f0b311afd78fe0bb330c154e9dac74e6a94170ca1eb8743480477a1f",
-    "kinetic_solve/_CPU/literal": "d8f5071fb7e648b80a026a0936c3b43f65b59522bd0ea7bf4261603a6609a290",
+    "kinetic_solve/_CPU/literal": "db1a082c2e6a53043591d0ac38723f1fa2b4d76d88611202ff1d19b60b91e793",
     "kinetic_solve/_GUARD/literal": "b62ed92e42aa5b04767b9944501d354a09accde5192731dffb05553ddbb8d9a4",
     "kinetic_solve/_MATERIALIZE/literal": "0a3a38107753704f472302a27eb4b2a526cbd7bc2cbb735be06f3129b0c7ca74",
     "kinetic_solve/_T/literal": "db6d306dd00115c6a983f4bf90d94729d357100b28879129c38940d33a58abc3",
@@ -177,7 +182,7 @@ EXPECTED = {
     "kinetic_solve/get_qualify_kernel/closure/qualify": "011a127fa8c23309e6834cb97de74810ef4269e4a2ff09f31bc2661167807804",
     "kinetic_solve/get_qualify_kernel/python": "bb9aa7500f70fb08a2e8d7010e5fe910bc7deef679f92f5dc34139917d1ce905",
     "kinetic_solve/get_solve_kernel/closure/_is_cpu": "599e3cf521417116b73f62d2c175b700d4631010feecc7a5658d7f0281c9a6ab",
-    "kinetic_solve/get_solve_kernel/closure/solve_native": "0f62f5a52492f06c812cfe63c404efb1693a40bff2ea70cbb35b53edbca9fe09",
+    "kinetic_solve/get_solve_kernel/closure/solve_native": "f5e8c695fa54b90e58021e6eee90748829b357d6714e78457c0d32ed0eb39228",
     "kinetic_solve/get_solve_kernel/python": "d3a3bc9bce45db1951a465d751185491581f59cc8a8f3df1815f74913684f28c",
     "kinetic_solve_types/KineticMFData/descriptor": "1a4ef04213dd238c35a6b19b480269ae605fdc10fe39d28ecea5909264d6c3c6",
     "kinetic_solve_types/KineticSolveData/descriptor": "a5cedb9dba99514998eddfb15a9035a95160852c40542531e6a95fae2641772b",
@@ -280,9 +285,9 @@ MODULES = (*SOURCE_PINS, "kinetic_source")
 # Separately proven eleven-edit transaction correction. The original 244
 # expectations above remain unchanged after exact reversal of only these edits.
 TRANSACTION_CORRECTIONS = {
-    "kinetic_solve/get_solve_kernel/closure/solve_native": "cbfe46962815812393fcb6e11c3c09b72c70037223ed71b31bdfc1821891e615",
-    "kinetic_compact_coupled/get_general_kernel/compact_source": "a8a17dd80e7777c998ef027f270d5158a17873b6bd7d924c452c3f057868bb02",
-    "kinetic_compact_coupled/get_general_kernel/closure/kinetic_compact_native": "a8a17dd80e7777c998ef027f270d5158a17873b6bd7d924c452c3f057868bb02",
+    "kinetic_solve/get_solve_kernel/closure/solve_native": "b9bcd4e746bab772b66821d921a0a48358257173c4fc9437386be007c9a15487",
+    "kinetic_compact_coupled/get_general_kernel/compact_source": "37441d9cfb9a88eff531fdae61cb0b36f05f7a88d04bbf38d657919081beda4a",
+    "kinetic_compact_coupled/get_general_kernel/closure/kinetic_compact_native": "37441d9cfb9a88eff531fdae61cb0b36f05f7a88d04bbf38d657919081beda4a",
 }
 
 # The runtime-sized admission predicate now decodes unsigned 16-bit parents.
@@ -476,18 +481,18 @@ class TestKineticNativePort(unittest.TestCase):
     def test_impulse_transaction_correction(self):
         """Require the separately proven correction and byte-exact undo."""
         module = importlib.import_module(PACKAGE + "kinetic_solve")
-        # Exact edit log extracted independently from the paired-GPU-passed
-        # transaction adapter 1940286e7c86effb, not regenerated from this helper.
+        # Exact six-fence edit log captured from qualified Newton 9f17ebed
+        # before replacing source extraction with the shared recurrence factory.
         self.assertEqual(
             hashlib.sha256(repr(module._impulse_transaction_edits()).encode()).hexdigest(),
-            "fdcabd747dd84c9549e0d344d11b95e1fe8909df4ade79ba457bfa515e654913",
+            "1872b3cd66c4b761c9a526ea7a32f2d3cb68cc305378f13d03bca5ce522abf0d",
         )
         corrected = module.cuda_recurrence()
         original = module.recover_impulse_transactions(corrected)
         self.assertEqual(module.repair_impulse_transactions(original), corrected)
-        self.assertEqual(corrected.count("SIBLING_READ_COMPLETE"), 3)
-        self.assertEqual(corrected.count("IMPULSE_READ_COMPLETE_"), 5)
-        self.assertEqual(corrected.count("UNUSED_OWN_STORE_"), 3)
+        self.assertEqual(corrected.count("SIBLING_READ_COMPLETE"), 0)
+        self.assertEqual(corrected.count("IMPULSE_READ_COMPLETE_"), 6)
+        self.assertEqual(corrected.count("UNUSED_OWN_STORE_"), 0)
         with self.assertRaises(ValueError):
             module.repair_impulse_transactions(corrected)
         with self.assertRaises(ValueError):

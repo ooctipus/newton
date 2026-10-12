@@ -16,6 +16,18 @@ import hashlib
 from pathlib import Path
 
 PINNED = {
+    "paired_factor_source.py": {
+        "_KINETIC_ENTRY": "da56d0dccf7e1e8c073f7f8056919568b6acd71e7f47be9857b6bf577375ad4b",
+        "_KINETIC_EXIT": "6a895fdf453c4b04cbaeb40e27208d660ac0d9db96afc4ef3b12fc35597a126a",
+        "_KINETIC_ALIASES": "9441f2d4adb4aa4871e2f9e889c436064d60fdf3909dc6d1c10d9368c385c2df",
+        "_physical_entry": "57b685e553d3b34f3a7958019b33e39d48308ac71faefeaddcda895f48f65bfb",
+        "_physical_exit": "ee488b1935af525104f25aca4904ef3b26409ba9ec19baff61edef6d71966101",
+        "get_source": "b4d0a4cb89f2fed72a72bb8934e3909ba31b0ed2241e621a2cf820a2d7f233eb",
+    },
+    "component_qualification.py": {
+        "_PHYSICAL_PUBLISH": "d7129ba2edd6a8ebf30e104f99bc690be0ba8895de53eb4590a59cf3af235e87",
+        "get_source": "5501780af8a2bb768c981245ce7ec0a110f8623bc5b2dd4ef44ebad4d7c3f2f2",
+    },
     "small_cholesky.py": {
         "_FACTOR": "5d79f0480c1169dc55f13a27e2f78051dea24c8644a6de019f1e9866a78e8f8b",
         "_FORCE_INIT": "4e1883323ae63f673815d3f0e6aa1ef93365e126a1b6817f4cb2986e3c4faa3c",
@@ -24,7 +36,7 @@ PINNED = {
         "get_kernel": "9f15442b962d54b4a71384b9710bf3b497a78df1bdfb82fa1d0be4f6f24e468a",
     },
     "solver_feather_pgs.py": {
-        "_get_pgs_solve_paired_factor_kernel": "51d610d20431d6740391c41df6fcdacf97d771add94eeb47724335276f3a9d54",
+        "_get_pgs_solve_paired_factor_kernel": "e417ffcc1bd6dbae775e3fdd6943033bc27af1f46b1ec4ca28e1c7677d8d2bd6",
         "_get_pgs_solve_mf_gs_kernel": "7e3d01ba60a02ee946bfd84635cc6b400f243ea8f4ebbbf832d16fe2008bbca4",
         "_get_crba_cholesky_warp_kernel": "f507209b4a71155f75aa86a783241723e1370c41a0c262744c020bfc224969de",
         "_get_inverse_cholesky_register_kernel": "f1f2c60767d69d8006fb074c768877b921579954b7d36bc1efee9366212234d3",
@@ -32,7 +44,7 @@ PINNED = {
         "_get_pack_mf_meta_kernel": "353265897c2af4cb85fc0e284b25bb9a862f67b54b74edd2e7b472a331c55a81",
     },
     "independent_components.py": {
-        "get_prepare_kernel": "fae7569fd7afe321acc869cfbc391e5a1f446d0f4ff9cdd5473395d004bc92d3"
+        "get_prepare_kernel": "c60d23b924e8dbcdd21e039d9ede28c2f7bb3a415d961c36f25469608f8e62b6"
     },
     "kernels.py": {
         # Rebased adapters preserve monotone reservations and bind patch-aware kernels
@@ -125,8 +137,8 @@ PINNED = {
         "_impulse_transaction_edits": "5faa4439ad7e21d3e40bc06a6c7b54c59268ed278759264b898242e895b087b8",
         "recover_impulse_transactions": "3ba7137b8926c79662569883af2fae919af7dd9cf6fee9a6c2065e982021dd7a",
         "repair_impulse_transactions": "35fcc73dac25cabdd80259d4a76e2ecea2f08e7ec980822be8f18f8b893aed15",
-        "cuda_recurrence": "233adaed2ac7bacea5e2b448dbf3346fd31b5db766aaade5d494802ae970c9bf",
-        "qualifier_source": "f6675585c6856aae3d5e6e5bb11f89e486705c41b308585c2769a8c6bfa87940",
+        "cuda_recurrence": "ae9837209311b6f9e45b21723c65c3cbc568ce83e867c0c1acd9d9b6bf4a6fc8",
+        "qualifier_source": "0e819d404f934e350e79e8fd22b854802ed14be007ab0e2b485354236d8c4822",
         "get_solve_kernel": "41401d6224f9e227e9509ff5f9b6343c1e7a3df33bf63b7590fecad5d0ca492e",
         "get_qualify_kernel": "e56490f1a74e258497378048176ee62dc658815ac0e5ad9a915cfad0ec3d04cb",
         "get_materialize_kernel": "60d020f8de5d16ebca4fc0fa1f22e073efd78ddda9df5247cb94d8b0f76b6717",
@@ -136,7 +148,7 @@ PINNED = {
         "_CPU": "c6f703863beb4837065c56bb4188a645a342e33c792308cefdb8eeb472168f84",
         "_STAGE": "d16346c926d401515e157795d0bd348e8f8114b635d6fe0b35b5e2739c83a4e0",
         "_STORE": "7abc04f9023ba89d1a529090ce8130f89a534ba0f577464bb0c5fc2c5c9c91ec",
-        "qualify_source": "cca6d14635c015abab271628cb6cb6a5c0b7ccc5c15c7f616b266f66d26ec1aa",
+        "qualify_source": "9ca4cbbd9b648ca81f1dd97cf5c7adcb35ca33de3d49c0f2958c396c66c35fcc",
         "general_source": "1647884f80ae7da11bf1dd2fa29cef11835d6b825062cad4328e3651a8066b85",
         "get_qualify_kernel": "f524aab764befe22c841faf9b1b0e52a5cc3a8e47d7d0316ecc0179d99c8a7be",
         "get_materialize_kernel": "8deeca3844d44e771c2d7f69b8a0dc6481c096f8b2c23fa94f5926f457d2369c",

@@ -10,16 +10,13 @@ The CUDA path orders shared-impulse publication with warp fences. Both CPU
 and CUDA use the current solver's paired tangent projection.
 """
 
-import ast
 import functools
-import re
 
 import warp as wp
 
 from .friction import FRICTION_PAIR_CUDA
 from .kinetic_rows_types import DenseRowOutput, RowState
 from .kinetic_solve_types import KineticMFData, KineticSolveData
-from .kinetic_source import checked_definitions
 from .kinetic_types import HeldKineticOperator, KineticPlan
 
 
@@ -31,21 +28,6 @@ from .kinetic_types import HeldKineticOperator, KineticPlan
 #endif
 """)
 def _is_cpu() -> bool: ...
-
-
-def snippet(filename, function, values=None):
-    """Recover one literal original native body under exact source identity."""
-    target = checked_definitions(filename, (function,))[function]
-    item = next(
-        node
-        for node in target.body
-        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "snippet" for t in node.targets)
-    )
-    return eval(
-        compile(ast.Expression(item.value), filename, "eval"),
-        {"__builtins__": {"str": str, "bool": bool}},
-        values or {},
-    )
 
 
 def replace_once(source, old, new):
@@ -131,84 +113,10 @@ _GUARD = r"""
 
 
 def cuda_recurrence():
-    """Original offset recurrence with the explicit shared-transaction repair."""
-    checked_definitions(
-        "kinetic_solve.py",
-        ("_impulse_transaction_edits", "recover_impulse_transactions", "repair_impulse_transactions"),
-    )
-    original = snippet(
-        "solver_feather_pgs.py",
-        "_get_pgs_solve_paired_factor_kernel",
-        dict(  # noqa: C408 - preserve the checked original source-construction AST
-            W=2,
-            M=192,
-            D=29,
-            P=23,
-            S=6,
-            contact_type=0,
-            friction_type=2,
-            joint_limit_type=3,
-            joint_velocity_limit_type=4,
-            contact_triples=True,
-        ),
-    )
-    body = original.split("#if defined(__CUDA_ARCH__)\n", 1)[1].rsplit("#endif", 1)[0]
-    body = replace_once(
-        body,
-        "    if (m > 192) m = 192;\n    if (m == 0 || world_mf_constraint_count.data[world] != 0) return;",
-        "    if (m < 0 || m > 192) { if(lane==0) solve.status.data[world]=1; return; }",
-    )
-    begin = body.index("    const int global_dof =")
-    end = body.index("    __syncwarp(MASK);", begin)
-    body = (
-        body[:begin]
-        + r"""
-    const int primary_lane=lane-primary_offset,secondary_lane=lane-secondary_offset;
-    const int physical_dof=(primary_lane>=0&&primary_lane<23)?primary_lane:
-        ((secondary_lane>=0&&secondary_lane<6)?23+secondary_lane:-1);
-    const int global_dof=physical_dof>=0?plan.dof_ids.data[world*35+physical_dof]:-1;
-    float factor_velocity=0.0f;
-"""
-        + body[end:]
-    )
-    begin = body.index("    float physical_output = 0.0f;")
-    end = body.index("    for (int i = lane; i < m; i += 32) world_impulses", begin)
-    body = (
-        body[:begin]
-        + r"""
-    float physical_output=0.0f;
-    for(int k=0;k<23;++k){const float du=__shfl_sync(MASK,factor_velocity,primary_offset+k);
-        if(primary_lane>=0&&primary_lane<23)physical_output+=t(k,primary_lane)*du;}
-    for(int k=0;k<6;++k){const float du=__shfl_sync(MASK,factor_velocity,secondary_offset+k);
-        if(secondary_lane>=0&&secondary_lane<=k&&secondary_lane<6)
-            physical_output+=held.inverse6.data[secondary_group*36+k*6+secondary_lane]*du;}
-    const bool finite=global_dof<0||isfinite(physical_output+state.v_hat.data[global_dof]);
-    if(!__all_sync(MASK,finite)){if(lane==0)solve.status.data[world]=2;return;}
-    if(global_dof>=0&&(!split_component||(primary_lane>=0&&primary_lane<23)))
-        v_out.data[global_dof]=state.v_hat.data[global_dof]+physical_output;
-    if(lane==0)solve.status.data[world]=0;
-"""
-        + body[end:]
-    )
-    aliases = r"""
-    auto world_constraint_count=state.dense_count;
-    auto dense_phase_bounds=rows.phase_bounds;
-    auto world_impulses=rows.impulses;
-    auto rhs_bias=rows.r0;
-    auto world_diag=rows.diag;
-    auto world_row_type=rows.row_type;
-    auto world_row_parent=rows.row_parent;
-    auto world_row_mu=rows.row_mu;
-    auto factor_rows=rows.response;
-    auto primary_group_by_world=plan.primary_group;
-    auto secondary_group_by_world=plan.secondary_group;
-    auto primary_offset_by_world=state.primary_offset;
-    auto secondary_offset_by_world=state.secondary_offset;
-    auto v_out=solve.v_out;
-    const int iterations=solve.iterations,iteration_offset=solve.iteration_offset,friction_start_iteration=solve.friction_start_iteration;
-    const float omega=solve.omega;
-"""
-    return FRICTION_PAIR_CUDA + repair_impulse_transactions(aliases + body)
+    """Build the common paired recurrence with explicit held-coordinate entry and exit."""
+    from .paired_factor_source import get_source  # noqa: PLC0415
+
+    return get_source(192, 29, 23, 6, contact_triples=True, kinetic=True)
 
 
 _CPU = (
@@ -302,48 +210,10 @@ def get_solve_kernel(arch):
 
 
 def qualifier_source():
-    """Retain original row/MF predicate; substitute directly held T and Z."""
-    source = snippet("independent_components.py", "get_prepare_kernel")
-    source = re.sub(r"\bmf\b", "mf_count", source)
-    source = replace_once(
-        source,
-        "|| group < 0 || group >= data.L.shape[0]) continue;",
-        ") continue;\n        if (held.valid.data[world]==0 || held.generation.data[world]!=state.held_generation.data[world] || rows.status.data[world]!=0 || rows.global_status.data[0]!=0) { if(tid==0) solve.status.data[world]=1; continue; }",
-    )
-    source = replace_once(
-        source,
-        "for (int k = tid; k < 23 * 23; k += nt)",
-        "for (int k = tid; k < 180; k += nt)",
-    )
-    source = replace_once(source, "data.L.data[group * 23 * 23 + k]", "held.T.data[world * 180 + k]")
-    begin = source.index("            for (int row = warp; row < m; row += nw)")
-    end = source.index("            if (tid == 0) data.selector.data[world] = -1;", begin)
-    source = source[:begin] + source[end:]
-    source = source.replace("data.world_count", "state.dense_count.shape[0]")
-    names = {
-        "counts": "state.dense_count",
-        "mf_counts": "state.mf_count",
-        "primary_offset": "state.primary_offset",
-        "secondary_offset": "state.secondary_offset",
-        "primary_group": "plan.primary_group",
-        "selector": "solve.selector",
-        "J": "rows.physical_J",
-        "Y": "rows.response",
-        "rhs": "rows.rhs",
-        "diag": "rows.diag",
-        "mu": "rows.row_mu",
-        "row_type": "rows.row_type",
-        "row_parent": "rows.row_parent",
-        "mf_meta": "mf.meta",
-        "mf_mu": "mf.mu",
-        "mf_J_a": "mf.J_a",
-        "mf_J_b": "mf.J_b",
-        "mf_MiJt_a": "mf.MiJt_a",
-        "mf_MiJt_b": "mf.MiJt_b",
-    }
-    for old, new in sorted(names.items(), key=lambda item: -len(item[0])):
-        source = source.replace("data." + old + ".", new + ".")
-    return source
+    """Qualify current held rows through the shared component predicates."""
+    from .component_qualification import get_source  # noqa: PLC0415
+
+    return get_source("kinetic")
 
 
 @functools.cache
