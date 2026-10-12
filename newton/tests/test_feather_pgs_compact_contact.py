@@ -577,9 +577,10 @@ class TestCompactContact(unittest.TestCase):
         for device in devices:
             model = build_solver_fixture(device)
             solvers = []
-            for enabled in (False, True):
+            for enabled, ordered in ((False, False), (True, False), (True, True)):
                 with (
                     mock.patch.object(solver_module, "_COMPACT_CONTACT_BOUNDARY", enabled),
+                    mock.patch.object(solver_module, "_COMPACT_CONTACT_ORDERING", ordered),
                     mock.patch.object(solver_module, "_PRISMATIC_PUBLICATION", True),
                     mock.patch.object(solver_module, "_SPARSE_CONTACT_DIRECT", True),
                 ):
@@ -598,20 +599,27 @@ class TestCompactContact(unittest.TestCase):
                     )
             self.assertFalse(solvers[0]._compact_contact_boundary)
             self.assertTrue(solvers[1]._compact_contact_boundary)
+            self.assertIsNone(solvers[0]._compact_contact_order)
+            self.assertIsNone(solvers[1]._compact_contact_order)
+            self.assertIsNotNone(solvers[2]._compact_contact_order)
             self.assertLessEqual(solvers[1]._dense_internal_max_rows, 12)
             states = [[model.state(), model.state()] for _ in solvers]
             controls = [model.control() for _ in solvers]
             contacts = [newton.Contacts(model.rigid_contact_max, 0, device=device) for _ in solvers]
-            for index in range(2):
+            for index in range(len(solvers)):
                 state = states[index][0]
                 newton.eval_fk(model, state.joint_q, state.joint_qd, state)
                 install_contacts(model, state, contacts[index])
 
             def compare(states=states, solvers=solvers):
-                for field in ("joint_q", "joint_qd", "body_q", "body_qd"):
-                    np.testing.assert_allclose(
-                        getattr(states[1][0], field).numpy(), getattr(states[0][0], field).numpy(), rtol=3e-5, atol=5e-6
-                    )
+                for pair in states[1:]:
+                    for field in ("joint_q", "joint_qd", "body_q", "body_qd"):
+                        np.testing.assert_allclose(
+                            getattr(pair[0], field).numpy(),
+                            getattr(states[0][0], field).numpy(),
+                            rtol=3e-5,
+                            atol=5e-6,
+                        )
                 for solver in solvers:
                     solver.check_constraint_capacity()
                     self.assertGreater(int(np.sum(solver.constraint_count.numpy())), 0)

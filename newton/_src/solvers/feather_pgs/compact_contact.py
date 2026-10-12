@@ -164,10 +164,8 @@ def clear_contact_response(
             Y[group, row, dof] = 0.0
 
 
-@wp.kernel
-def produce_contacts(data: ContactBoundaryData):
-    """Publish one allocated contact after the current-contact dense zero owner."""
-    contact = wp.tid()
+@wp.func
+def _produce_contact(data: ContactBoundaryData, contact: int):
     if contact >= wp.min(data.count[0], data.point0.shape[0]):
         return
     slot = data.slot[contact]
@@ -313,6 +311,60 @@ def produce_contacts(data: ContactBoundaryData):
 
 
 @wp.kernel
+def produce_contacts(data: ContactBoundaryData):
+    """Publish contacts in their original collision order."""
+    _produce_contact(data, wp.tid())
+
+
+@wp.kernel
+def _produce_ordered_contacts(data: ContactBoundaryData, order: wp.array[int]):
+    _produce_contact(data, order[wp.tid()])
+
+
+@wp.kernel
+def _build_contact_order(
+    data: ContactBoundaryData, sentinel: wp.uint32, keys: wp.array[wp.uint32], order: wp.array[int]
+):
+    contact = wp.tid()
+    key = sentinel
+    if contact < wp.min(data.count[0], data.point0.shape[0]):
+        if data.path[contact] == 0 and data.slot[contact] >= 0:
+            key = wp.uint32(data.world[contact] * data.J.shape[1] + data.slot[contact])
+    keys[contact] = key
+    order[contact] = contact
+
+
+class _ContactOrder:
+    """Own contact scheduling scratch for eager steps and captured graphs."""
+
+    def __init__(self, capacity: int, worlds: int, rows: int, device):
+        if capacity < 1 or not 0 < worlds * rows < (1 << 31):
+            raise ValueError("contact ordering requires positive capacity and a signed 31-bit row range")
+        self.capacity = capacity
+        self.bits = (worlds * rows).bit_length()
+        self.device = device
+        # Warp's radix sort uses the second half of both arrays as scratch.
+        self.keys = wp.empty(2 * capacity, dtype=wp.uint32, device=device)
+        self.order = wp.empty(2 * capacity, dtype=int, device=device)
+
+    def launch(self, data: ContactBoundaryData, capacity: int):
+        """Schedule allocated rows without changing their identities or solver order."""
+        if not 0 <= capacity <= self.capacity:
+            raise ValueError("contact ordering scratch is smaller than the contact capacity")
+        if capacity == 0:
+            return
+        wp.launch(
+            _build_contact_order,
+            dim=capacity,
+            inputs=[data, wp.uint32((1 << self.bits) - 1), self.keys, self.order],
+            device=self.device,
+        )
+        with wp.ScopedDevice(self.device):
+            wp.utils.radix_sort_pairs(self.keys, self.order, capacity, end_bit=self.bits)
+        wp.launch(_produce_ordered_contacts, dim=capacity, inputs=[data, self.order], device=self.device)
+
+
+@wp.kernel
 def produce_limit_response(
     bounds: wp.array2d[int],
     counts: wp.array[int],
@@ -406,7 +458,10 @@ def launch_contacts(solver, state_in, state_aug, contacts, workers):
         block_dim=256,
         device=solver.model.device,
     )
-    wp.launch(produce_contacts, dim=contacts.rigid_contact_max, inputs=[data], device=solver.model.device)
+    if solver._compact_contact_order is None:
+        wp.launch(produce_contacts, dim=contacts.rigid_contact_max, inputs=[data], device=solver.model.device)
+    else:
+        solver._compact_contact_order.launch(data, contacts.rigid_contact_max)
     # These original kernels encode schedule links into the freshly published
     # sparse DOF slots. Never overwrite those fields after this point.
     wp.launch(

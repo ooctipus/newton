@@ -286,6 +286,7 @@ _FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
 _PRISMATIC_PUBLICATION = os.environ.get("FEATHER_PGS_PRISMATIC_PUBLICATION", "0") == "1"
 _PRISMATIC_LINEAR_STATE = os.environ.get("FEATHER_PGS_PRISMATIC_LINEAR_STATE", "0") == "1"
 _COMPACT_CONTACT_BOUNDARY = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_BOUNDARY", "0") == "1"
+_COMPACT_CONTACT_ORDERING = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_ORDERING", "0") == "1"
 _DEBUG_CACHE = os.environ.get("FEATHER_PGS_DEBUG_CACHE") == "1"
 _DEBUG_CACHE_MODE = os.environ.get("FEATHER_PGS_DEBUG_CACHE_MODE", "")
 _DEBUG_DELAY = int(os.environ.get("FEATHER_PGS_DEBUG_DELAY", "0"))
@@ -2653,7 +2654,7 @@ class SolverFeatherPGS(SolverBase):
             and not self._friction_anchors_enabled
         )
         self._sparse_diagonal_speculative_contact_batches = bool(
-            self._sparse_diagonal_contact_triples and self._sparse_diagonal_dense_size + 2 <= 8
+            self._sparse_diagonal_contact_triples and self._sparse_diagonal_dense_size + 2 <= 16
         )
         self._sparse_diagonal_dense_offsets = wp.array(
             sparse_diagonal_pair[2] if sparse_diagonal_pair is not None else np.zeros(1, dtype=np.int32),
@@ -3335,6 +3336,18 @@ class SolverFeatherPGS(SolverBase):
             from .compact_contact import supported  # noqa: PLC0415
 
             self._compact_contact_boundary = supported(self)
+
+        self._compact_contact_order = None
+        if (
+            self._compact_contact_boundary
+            and _COMPACT_CONTACT_ORDERING
+            and 0 < self.world_count * self.dense_max_constraints < (1 << 31)
+        ):
+            from .compact_contact import _ContactOrder  # noqa: PLC0415
+
+            self._compact_contact_order = _ContactOrder(
+                self._max_contacts_alloc, self.world_count, self.dense_max_constraints, model.device
+            )
 
         self._joint_world = None
         self._joint_world_active = False
@@ -25291,7 +25304,7 @@ def _get_build_independent_sparse_contact_groups_kernel(
     serial_schedule = (
         f"""
     // Compact the remaining contacts in original row order. The solve may
-    // inspect four normals concurrently, but any active batch is still
+    // inspect up to four normals concurrently, but any active batch is still
     // applied through this serial list in exact GS order.
     if (lane == 0) {{
         int serial_count = 0;
@@ -25444,8 +25457,16 @@ def _get_pgs_solve_sparse_diagonal_kernel(
     D = int(max_world_dofs)
     P = int(dense_dofs)
     S = (M + 2) // 3
-    if speculative_contact_batches and (not contact_triples or P + 2 > 8):
-        raise ValueError("speculative contact batches require an eight-lane sparse contact triple")
+    if speculative_contact_batches and (not contact_triples or P + 2 > 16):
+        raise ValueError("speculative contact batches require contact triples with at most 16 response entries")
+    batch_lanes = 8 if P + 2 <= 8 else 16
+    batch_shift = 3 if batch_lanes == 8 else 4
+    batch_contacts = 32 // batch_lanes
+    batch_reduction = "\n".join(
+        f"                    candidate_sum += __shfl_down_sync(candidate_mask, candidate_sum, {offset}, {batch_lanes});"
+        for offset in (8, 4, 2, 1)
+        if offset < batch_lanes
+    )
     elems_per_lane = (D + 31) // 32
 
     limit_declarations = []
@@ -25640,9 +25661,9 @@ def _get_pgs_solve_sparse_diagonal_kernel(
             if (serial_row >= contact_start) {{
                 int contact_index = (serial_row - contact_start) / 3;
                 contact_component = (serial_row - contact_start) % 3;
-                if (contact_component == 0 && (contact_index & 3) == 0) {{
-                    const int batch_group = lane >> 3;
-                    const int batch_lane = lane & 7;
+                if (contact_component == 0 && (contact_index & {batch_contacts - 1}) == 0) {{
+                    const int batch_group = lane >> {batch_shift};
+                    const int batch_lane = lane & {batch_lanes - 1};
                     const int candidate_index = contact_index + batch_group;
                     const bool candidate_valid = candidate_index < serial_contact_count;
                     const int candidate_normal = candidate_valid
@@ -25662,11 +25683,9 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                     if (candidate_coord < 0) candidate_jacobian = 0.0f;
                     float candidate_sum = candidate_coord >= 0
                         ? candidate_jacobian * s_v[candidate_coord] : 0.0f;
-                    const unsigned candidate_mask = 0xffu << (batch_group * 8);
-                    candidate_sum += __shfl_down_sync(candidate_mask, candidate_sum, 4, 8);
-                    candidate_sum += __shfl_down_sync(candidate_mask, candidate_sum, 2, 8);
-                    candidate_sum += __shfl_down_sync(candidate_mask, candidate_sum, 1, 8);
-                    const float candidate_velocity = __shfl_sync(candidate_mask, candidate_sum, 0, 8);
+                    const unsigned candidate_mask = {(1 << batch_lanes) - 1:#x}u << (batch_group * {batch_lanes});
+{batch_reduction}
+                    const float candidate_velocity = __shfl_sync(candidate_mask, candidate_sum, 0, {batch_lanes});
                     bool candidate_noop = !candidate_valid;
                     if (candidate_valid) {{
                         const float old_impulse = s_lambda[candidate_normal];
@@ -25690,11 +25709,11 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                     const unsigned noop_lanes = __ballot_sync(MASK, candidate_noop);
                     if (noop_lanes == MASK) {{
                         const int remaining_contacts = serial_contact_count - contact_index;
-                        const int batch_contacts = remaining_contacts < 4 ? remaining_contacts : 4;
+                        const int batch_contacts = remaining_contacts < {batch_contacts} ? remaining_contacts : {batch_contacts};
                         serial_row += batch_contacts * 3 - 1;
                         continue;
                     }}
-                    const int first_active_contact = (__ffs((int)(~noop_lanes)) - 1) >> 3;
+                    const int first_active_contact = (__ffs((int)(~noop_lanes)) - 1) >> {batch_shift};
                     serial_row += first_active_contact * 3;
                     contact_index += first_active_contact;
                 }}
