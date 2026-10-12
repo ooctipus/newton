@@ -108,7 +108,7 @@ class TestHeightfieldCylinderSplit(unittest.TestCase):
         self.check_loaded_cylinder("cpu")
 
     def check_direct_queries(self, device):
-        """Retain far callbacks and compact only failed MPR queries into bounded fresh storage."""
+        """Exercise far queries without storing them, and bound the failed-MPR queue."""
         model = primitive_model(device, "cylinder")
         state = model.state()
         reference, actual = split_pipeline(model, False), split_pipeline(model, True)
@@ -128,8 +128,8 @@ class TestHeightfieldCylinderSplit(unittest.TestCase):
         owner = actual.narrow_phase
         checker = primitive.TestHeightfieldPrimitiveQuery()
         seen_mpr = seen_gjk = seen_far = False
-        # All terrain triangles include loaded cells and far cells that broad phase
-        # would omit. The latter must still publish one callback when queried.
+        # Include far cells that broad phase would omit, so rejection is tested
+        # after querying rather than hidden by broad-phase admission.
         triangles = np.column_stack((np.zeros(512, np.int32), np.ones(512, np.int32), np.arange(512)))
         for margin_sum in (0.0, 5e-5, 1e-4, 0.002):
             data = common[1].numpy().copy()
@@ -181,14 +181,16 @@ class TestHeightfieldCylinderSplit(unittest.TestCase):
                     seen_gjk |= n > 0
                     seen_mpr |= n < len(eligible)
                     threshold = float(common[4].numpy().sum()) + margin_sum
-                    far = {key: value for key, value in expected.items() if value[3] > threshold + 1e-3}
-                    seen_far |= bool(far)
-                    for key in far:
-                        self.assertEqual(key[2] & 7, 0, "A far query must retain its original single-contact key")
-        self.assertTrue(seen_mpr and seen_gjk and seen_far, "Exercise MPR, GJK and retained far callbacks")
+                    queries = owner._heightfield_cylinder_query_results.numpy()
+                    seen_far |= bool(np.any(queries["signed_distance"][eligible] > threshold + 1e-3))
+                    self.assertFalse(
+                        any(value[3] > threshold + 1e-3 for value in expected.values()),
+                        "Clearly separated witnesses must not consume raw contact storage",
+                    )
+        self.assertTrue(seen_mpr and seen_gjk and seen_far, "Exercise MPR, GJK and rejected far witnesses")
 
     def test_direct_queries_cpu(self):
-        """Compare fixed triangle queries including far callbacks and margin-dependent inflation."""
+        """Compare fixed queries, far rejection and margin-dependent inflation."""
         self.check_direct_queries("cpu")
 
     def collide_and_check_route(self, owner, state, contacts, fallback):
@@ -286,7 +288,7 @@ class TestHeightfieldCylinderSplit(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_direct_queries_cuda(self):
-        """Preserve far CUDA callbacks and bounded partial work queues."""
+        """Reject far CUDA witnesses and retain bounded partial work queues."""
         self.check_direct_queries("cuda:0")
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")

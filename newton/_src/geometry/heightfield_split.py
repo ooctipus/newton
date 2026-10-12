@@ -289,7 +289,8 @@ def create_heightfield_split_kernels(shape_type, support_func, data_type, *, pre
                 ):
                     continue
 
-            # The buffered reducer needs far single witnesses too; no gap cutoff.
+            # Preserve the shared single-witness callback. The raw writer screens
+            # clearly separated contacts before allocating reducer storage.
             skip_multi_contact = result.signed_distance > query.contact_threshold
             if wp.static(not ENABLE_MULTI_CONTACT):
                 skip_multi_contact = True

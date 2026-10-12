@@ -2116,7 +2116,7 @@ def write_contact_to_reducer(
     reducer_data: GlobalContactReducerData,
     output_index: int,  # Unused, kept for API compatibility with write_contact_simple
 ):
-    """Writer function that stores contacts in GlobalContactReducer for reduction.
+    """Store contacts within the query gap in GlobalContactReducer for reduction.
 
     This follows the same signature as write_contact_simple in narrow_phase.py,
     so it can be used with create_compute_gjk_mpr_contacts and other contact
@@ -2130,6 +2130,28 @@ def write_contact_to_reducer(
         reducer_data: GlobalContactReducerData struct with all reducer arrays
         output_index: Unused, kept for API compatibility
     """
+    # The final writer subtracts the two reconstructed world points to test
+    # this same separation. Retain its near-threshold inputs, including normal
+    # packing and world-coordinate roundoff, but avoid allocating clearly far
+    # witnesses. The query's gap includes any speculative search extension.
+    separation = contact_data.contact_distance - contact_data.margin_a - contact_data.margin_b
+    excess = separation - contact_data.gap_sum
+    if excess > 0.0:
+        center = contact_data.contact_point_center
+        scale = (
+            1.0
+            + wp.max(wp.abs(center[0]), wp.max(wp.abs(center[1]), wp.abs(center[2])))
+            + wp.abs(contact_data.contact_distance)
+            + wp.abs(contact_data.radius_eff_a)
+            + wp.abs(contact_data.radius_eff_b)
+            + wp.abs(contact_data.margin_a)
+            + wp.abs(contact_data.margin_b)
+            + wp.abs(contact_data.gap_sum)
+        )
+        # A conservative 32-float-epsilon allowance; the final writer still checks admission.
+        if excess > 3.814697265625e-6 * scale and wp.length_sq(contact_data.contact_normal_a_to_b) > 0.0:
+            return
+
     # Extract contact info from ContactData
     position = contact_data.contact_point_center
     normal = contact_data.contact_normal_a_to_b
