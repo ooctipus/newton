@@ -2833,8 +2833,9 @@ def reset_friction_anchor_history(
     prev_valid[c] = 0
 
 
-@wp.kernel
-def compute_contact_linear_force_from_impulses(
+@wp.func
+def _contact_linear_force(
+    c: int,
     contact_count: wp.array[wp.int32],
     contact_normal: wp.array[wp.vec3],
     contact_world: wp.array[wp.int32],
@@ -2858,7 +2859,6 @@ def compute_contact_linear_force_from_impulses(
     rigid_contact_force: wp.array[wp.vec3],
 ):
     """Convert solved FeatherPGS contact impulses into world-frame forces."""
-    c = wp.tid()
     total_contacts = contact_count[0]
     if c >= total_contacts:
         return
@@ -2927,19 +2927,85 @@ def compute_contact_linear_force_from_impulses(
 
 
 @wp.kernel
-def pack_contact_linear_force_as_spatial(
+def compute_contact_linear_force_from_impulses(
+    contact_count: wp.array[wp.int32],
+    contact_normal: wp.array[wp.vec3],
+    contact_world: wp.array[wp.int32],
+    contact_slot: wp.array[wp.int32],
+    contact_path: wp.array[wp.int32],
+    world_impulses: wp.array2d[wp.float32],
+    mf_impulses: wp.array2d[wp.float32],
+    propagation_impulses: wp.array2d[wp.float32],
+    world_constraint_count: wp.array[wp.int32],
+    mf_constraint_count: wp.array[wp.int32],
+    propagation_constraint_count: wp.array[wp.int32],
+    world_row_type: wp.array2d[wp.int32],
+    world_row_parent: wp.array2d[wp.int32],
+    mf_row_type: wp.array2d[wp.int32],
+    mf_row_parent: wp.array2d[wp.int32],
+    propagation_row_type: wp.array2d[wp.int32],
+    propagation_row_parent: wp.array2d[wp.int32],
+    enable_friction: int,
+    inv_dt: float,
+    # outputs
+    rigid_contact_force: wp.array[wp.vec3],
+):
+    "Convert solved FeatherPGS contact impulses into world-frame forces."
+    _contact_linear_force(
+        wp.tid(),
+        contact_count,
+        contact_normal,
+        contact_world,
+        contact_slot,
+        contact_path,
+        world_impulses,
+        mf_impulses,
+        propagation_impulses,
+        world_constraint_count,
+        mf_constraint_count,
+        propagation_constraint_count,
+        world_row_type,
+        world_row_parent,
+        mf_row_type,
+        mf_row_parent,
+        propagation_row_type,
+        propagation_row_parent,
+        enable_friction,
+        inv_dt,
+        rigid_contact_force,
+    )
+
+
+@wp.func
+def _pack_contact_linear_force(
+    c: int,
     contact_count: wp.array[wp.int32],
     rigid_contact_force: wp.array[wp.vec3],
     # outputs
     contact_force: wp.array[wp.spatial_vector],
 ):
     """Pack linear contact forces into Newton's spatial-force contact buffer."""
-    c = wp.tid()
     total_contacts = contact_count[0]
     if c >= total_contacts:
         return
 
     contact_force[c] = wp.spatial_vector(rigid_contact_force[c], wp.vec3(0.0))
+
+
+@wp.kernel
+def pack_contact_linear_force_as_spatial(
+    contact_count: wp.array[wp.int32],
+    rigid_contact_force: wp.array[wp.vec3],
+    # outputs
+    contact_force: wp.array[wp.spatial_vector],
+):
+    "Pack linear contact forces into Newton's spatial-force contact buffer."
+    _pack_contact_linear_force(
+        wp.tid(),
+        contact_count,
+        rigid_contact_force,
+        contact_force,
+    )
 
 
 @wp.func

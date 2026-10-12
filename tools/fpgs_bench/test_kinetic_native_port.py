@@ -33,7 +33,8 @@ SOURCE_PINS = {
 # Native/descriptor baseline reviewed against qualified Newton 9f17ebed.
 # The preceding oracle predated the six-fence transaction and current CPU law;
 # its stale records failed before the shared-source refactor. Preserve all 250
-# current records, including the unchanged native bodies of the new factories.
+# current records. The two force wrappers now call shared checked Warp functions;
+# their reviewed bodies change while the other 248 records remain unchanged.
 EXPECTED = {
     "kinetic_solve/FRICTION_PAIR_CUDA/literal": "c6d3cbfc5b5c11df5ad85f5af0f6d20e3293fe31b929d58e9f2cd32f822c2465",
     "kinetic_allocate/AllocationData/descriptor": "c84add405b81f44f7fa533419523012d9adffe07da53c1a5edbc024d0eb53f04",
@@ -121,8 +122,8 @@ EXPECTED = {
     "kinetic_predictor/get_refresh_kernel/closure/_release": "96d0c7b488b5de3c7a420bb13b10d305441a12979033ae4fa36b78557e6ac20a",
     "kinetic_predictor/get_refresh_kernel/closure/_storage": "16ba5f092581c9ab89e6150d7895056014f1c132a18ddea932c4eb457426000c",
     "kinetic_predictor/get_refresh_kernel/python": "fedc9ba0d541f63bf0245337ed855fc305d452fc5b22a2d2ded0d6c73c0fd04c",
-    "kinetic_public_force/compute_contact_linear_force_from_impulses/python": "5a3d9383ccab6da3d3b9c2c24ad1fb9da6b483d336db8d5f0a89740e9d23fcaa",
-    "kinetic_public_force/pack_contact_linear_force_as_spatial/python": "1bfe0e1b52c1b2aa418bd03a95aebf5126e6e59bb6721cde0dc4643d5b3d1228",
+    "kinetic_public_force/compute_contact_linear_force_from_impulses/python": "738e0977c3b1fcd5a7f3b7cbd2addc95d9b7f4cd6cd1008aa7f8387ab047ddce",
+    "kinetic_public_force/pack_contact_linear_force_as_spatial/python": "85d05ea96c83ae9681970cdc944fb6ac4d420b0ba3c7a17f6c38e262a9347b22",
     "kinetic_rows/_COMMON/literal": "73fab0b706a6b20478b3d572e837631f32da4b07f9d98329674712b4f5f2da19",
     "kinetic_rows/_CONTACT/literal": "56376571280ce53586a306aa016045a8cd079d44f8f22d486ca16a8de554e3ce",
     "kinetic_rows/_PREFIX/literal": "1a5d74343cffc408f40c9965fdc5fcd6934f4ad209e9b1e48b5647f65b1c6f97",
@@ -281,7 +282,7 @@ EXPECTED = {
     "kinetic_zero/get_kernel/closure/_publish": "5af3acfd523a1d30dbf24064c3639ef731bf0d45c34d7cc23c3fc976c5a0e140",
     "kinetic_zero/get_kernel/python": "f6431fc39447f39af55ee85709111f73d01de1cd0e9072d410fc8c53bddd5104",
 }
-MODULES = (*SOURCE_PINS, "kinetic_source")
+MODULES = (*SOURCE_PINS, "kinetic_source", "contact_force")
 # Separately proven eleven-edit transaction correction. The original 244
 # expectations above remain unchanged after exact reversal of only these edits.
 TRANSACTION_CORRECTIONS = {

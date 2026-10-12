@@ -8,12 +8,8 @@ Nonzero status preserves every output byte. Current raw identities and original
 row metadata/impulses remain unchanged inputs, including discarded path=-1.
 """
 
-import ast
 import functools
-import hashlib
 import inspect
-import linecache
-import textwrap
 from types import SimpleNamespace
 
 import warp as wp
@@ -27,42 +23,15 @@ NAMES = (
 )
 
 
-def guarded_source(name):
-    """Append frame flag and early return; all original statements remain AST-exact."""
-    if name not in NAMES:
-        raise ValueError("Only original public contact force kernels are allowed")
-    checked_definitions("kernels.py", (name,))
-    tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(original, name).func)))
-    function = tree.body[0]
-    function.name = "guarded_" + name
-    function.args.args.append(ast.arg(arg="frame_status", annotation=ast.parse("wp.array[int]", mode="eval").body))
-    function.decorator_list = (
-        ast.parse('@wp.kernel(module="unique", enable_backward=False)\ndef f():\n    pass\n').body[0].decorator_list
-    )
-    position = int(
-        isinstance(function.body[0], ast.Expr)
-        and isinstance(function.body[0].value, ast.Constant)
-        and isinstance(function.body[0].value.value, str)
-    )
-    function.body.insert(position, ast.parse("if frame_status[0] != 0:\n    return\n").body[0])
-    ast.fix_missing_locations(tree)
-    return ast.unparse(tree) + "\n"
-
-
 @functools.cache
 def get_kernel(name):
-    """Compile source-pinned original conversion or packing with frame guard."""
-    source = guarded_source(name)
-    filename = f"<kinetic-public-force-{hashlib.sha256(source.encode()).hexdigest()}>"
-    linecache.cache[filename] = (
-        len(source),
-        None,
-        source.splitlines(keepends=True),
-        filename,
-    )
-    namespace = dict(original.__dict__)
-    exec(compile(source, filename, "exec"), namespace)
-    return namespace["guarded_" + name]
+    """Bind an explicit guarded wrapper to the checked shared force law."""
+    from .contact_force import get_kernel as shared_kernel  # noqa: PLC0415
+
+    if name not in NAMES:
+        raise ValueError("Only original public contact force kernels are allowed")
+    checked_definitions("kernels.py", (*NAMES, "_contact_linear_force", "_pack_contact_linear_force"))
+    return shared_kernel(name)
 
 
 def _overlaps(a, b):
