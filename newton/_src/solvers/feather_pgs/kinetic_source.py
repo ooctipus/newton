@@ -94,7 +94,7 @@ PINNED = {
     },
     "kuka_joint_world.py": {
         "JointWorldPlan": "270ea3dbfb1d19f8cea4b2d96eb543ba7337b08c7f49c4018bd75a274d8c6a8d",
-        "_TWISTS": "bc6b882ec3b4a74aa4697ee282e1ca7fc31a0cb88946660ca6885acc4514d2e4",
+        "_TWISTS": "52394a8f739880c26884067834de9393e2b0f4f6da305b1ed38d4f5e4bf0c408",
         "_LIMITS": "1a402624e4030408efd39a7a1db85e03e08d91414381dc321c639cd9b62f7011",
         "_STORAGE": "99b0ce220a59a611ca8d8aa8ed6724d2d3a3bcc802e3408b6aa533600ceb9a89",
         "_limits": "ea79facce6db721b0beeaa40d1ced586fbac97a6fdd44ba92e548f1aa00f671a",
@@ -104,17 +104,19 @@ PINNED = {
         "_lane": "07615c6d1dd5c43e7ad93a39b56a48e25b87498da0fb5c66403f5910c4b74745",
         "_body_twist": "5837c1ce0a3f402897e71aff09076f14880e2422111160df4264fa9ddef334be",
         "_body_valid": "be8cc8904be29e7a421895f91a51fa463612c244e00bd33a4481730683e7de71",
-        "normal_source": "039367da360aa4f9da3338a2c101156b9f327dbd01e0e3cafb1e25e9637f61b2",
+        "normal_source": "bc99413529d25a106471a8ee1250a4ed18a39be1b63f7697afcb52bd00ec38b6",
         "operation_source": "0ea35321bbd3b2f7ed8dac4c7a8edd04b7004887cf7f51aa55c23cd6f1bb0240",
+        "_TWIST_PRODUCER": "e0b95d53727d39f634cf092c7b6d81c146a8be1a2c0cfc8b43efd283a78f06e3",
     },
     "simple_world.py": {
         "_SimpleWorldInput": "041b2334d5fd449d41a0d5f560b101942a4fd6932b8b38f9e07440a310c792ec",
         "_SimpleRawContacts": "93968df80ab45e14da99a8f1f5ab946b9214c9c2117f963102416491918f9c29",
-        "_check_normal": "2313727eeb147afcd77733d3e90ba345bf6bce0a2a93e14d9e9ed4a376fcd4e5",
-        "_endpoint_speed": "66ab54b792a395c3543450ac37a036563a419a045adc35c8bcc6d67f9d0cffe3",
+        "_check_normal": "32a55038b911d18571ff35cec34b5bc37966d5ab5d74663c2d301732ec0cc2e9",
+        "_endpoint_speed": "cf5eeed04958a2377b205b7bf4082729424911c47a9c359a435505f70a2c0b2a",
         "_finite3": "124a1b71c2f27d2e97d8261b2d8efda24591636e76f3607eb0d43b2ee934b227",
         "_finite6": "18d59e5041cf29be3fdf8bd1912bbf87bb7ac25227201ab347bd546dc7bfb6f7",
         "_passes": "45dffb35395ccfff2fefc32c3ec08245f40caacc0778e25aef7d588b81c7c8bd",
+        "_normal_functions": "4b249d1a006c3510c2fd04d41c6c0fefd30c03446186de3cc0a4f5ff9d12616c",
     },
     "raw_world_contacts.py": {
         "RawWorldContacts": "6a19f35b7f14600ccf9c56a821d1cc43a832361d5a57dee9ccdb915daba2c6c4",
@@ -184,6 +186,20 @@ PINNED = {
         "_POSE_SCAN_TEMPLATE": "77022694a55763e5d496d9088c43646b138a3eb54091bdf62a54be9c6a81626a",
         "_MOTION_SCAN_TEMPLATE": "9827d2152eca7894e159c788f8f368550f9b394345f6a802223e92657eb730dc",
         "scan_source": "18e8b2533f9b3e5412d7e3c4d95e987a96eacb941fd0abebba0a68de687d580c",
+    },
+    "contact_normal.py": {
+        "_ENDPOINT": "1b4fd9ec8f1d47ec32e4710d41fc73806e028aa762e8bb61cfae106fcb75092b",
+        "_OWNERSHIP": "2dc5b3ceee2241a6c5429bd3ad45c8083b9dc93b0d01c611f0da9cf67819e37a",
+        "_GEOMETRY": "b1ac0b20a3f5e4969b3fdbefca87aded766d7c2988e84c56192ecc750c516768",
+        "_NORMAL": "b45153f88805c944304f40383aa4d9e4209a6944addb4b0baec3aff266c2fd14",
+        "get_source": "ef918ff2e9ba669ff022a6effc43813a11c2dc5f9822ecd5cd08bc8591404323",
+        "bind": "a7765296b5b9f1ec8a82e3fe724f7c3f3cb8e19ef85ae5eb57d327209f0d596e",
+    },
+    "body_validation.py": {
+        "_PRESCRIBED": "d7663acb7de92486ba72d8a4d5f7a2c5301a99d3134f71407ee277db1cd10f9f",
+        "_FREE": "8762eec1647003ef05ce924e1c27b7cd83970c3cb4f7faef08503b9867fe15f1",
+        "_VALIDATION": "d21c270703aea141df92685d4d69ae9d9158ad34ed0a13d6ac5c5ae3f9f3e71c",
+        "get_source": "14dce3fc0e8017e050e26483f302632279ed8ebeacf2cff0e7b767c1ca35e85f",
     },
 }
 

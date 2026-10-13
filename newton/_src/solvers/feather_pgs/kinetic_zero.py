@@ -8,13 +8,12 @@ factor action, endpoint contraction, generalized integration or row work occurs.
 """
 
 import functools
-import hashlib
-import linecache
 from types import SimpleNamespace
 
 import numpy as np
 import warp as wp
 
+from . import body_validation, contact_normal
 from . import kuka_joint_world as light
 from . import raw_world_contacts as raw_world
 from . import simple_world as simple
@@ -29,6 +28,7 @@ def load_source():
         "kuka_joint_world.py",
         (
             "JointWorldPlan",
+            "_TWIST_PRODUCER",
             "_TWISTS",
             "_LIMITS",
             "_STORAGE",
@@ -43,20 +43,6 @@ def load_source():
             "operation_source",
         ),
     )
-    tail = light._TWISTS[light._TWISTS.index("    for(int b=lane;b<32;b+=stride) {") :]
-    prescribed = "for(int k=0;k<6;++k) s[96+b*6+k]=data.body_v_s.data[body][k];"
-    free = """            if(b>=30) {
-                const int first=data.articulation_dof_start.data[art];
-                for(int k=0;k<6;++k) {
-                    float value=0.0f;
-                    for(int d=0;d<6;++d) value+=data.joint_S_s.data[first+d][k]*data.v_hat.data[first+d];
-                    s[96+b*6+k]=value;
-                }
-            }
-"""
-    if tail.count(prescribed) != 1 or tail.count(free) != 1:
-        raise ValueError("Original twist producer/validation seams changed")
-    tail = tail.replace(prescribed, "/* prescribed twist already produced */").replace(free, "")
     prefix = r"""
     float* s=reinterpret_cast<float*>(address);
 #if defined(__CUDA_ARCH__)
@@ -71,7 +57,7 @@ def load_source():
         for(int k=0;k<6;++k) s[96+b*6+k]=state.endpoint_twists.data[body][k];
     }
 """
-    return prefix + tail
+    return prefix + body_validation.get_source(produce_twists=False)
 
 
 @wp.func_native(load_source())
@@ -114,18 +100,9 @@ def _publish(address: wp.uint64, world: int, good: bool, invalid: int, state: Ro
 @functools.cache
 def get_kernel(arch):
     """One warp/world, same current ZERO numerical law and complete raw CSR."""
-    source = light.normal_source()
-    filename = f"<kinetic-zero-normal-{hashlib.sha256(source.encode()).hexdigest()}>"
-    linecache.cache[filename] = (
-        len(source),
-        None,
-        source.splitlines(keepends=True),
-        filename,
-    )
     namespace = dict(simple.__dict__)
     namespace.update(light.__dict__)
-    exec(compile(source, filename, "exec"), namespace)
-    check_normal = namespace["_light_check_normal"]
+    _, check_normal = contact_normal.bind("light", namespace)
 
     @wp.kernel(module="unique", enable_backward=False)
     def kinetic_zero(
@@ -160,6 +137,7 @@ def bind_zero(rows, mf, *, buckets=None):
         "kuka_joint_world.py",
         (
             "JointWorldPlan",
+            "_TWIST_PRODUCER",
             "_TWISTS",
             "_LIMITS",
             "_STORAGE",
@@ -179,6 +157,7 @@ def bind_zero(rows, mf, *, buckets=None):
         (
             "_SimpleWorldInput",
             "_SimpleRawContacts",
+            "_normal_functions",
             "_check_normal",
             "_endpoint_speed",
             "_finite3",

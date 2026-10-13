@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import warp as wp
 
-from . import kernels, kinetic_allocate, kinetic_rows, kinetic_rows_triplet, kinetic_zero
+from . import contact_normal, kernels, kinetic_allocate, kinetic_rows, kinetic_rows_triplet, kinetic_zero
 from . import kuka_joint_world as light
 from . import simple_world as simple
 from .kinetic_rows_types import ArmMap, DenseRowOutput, PrefixInput, RawRowInput, RowSettings, RowState
@@ -188,6 +188,7 @@ def _normal():
         (
             "_SimpleWorldInput",
             "_SimpleRawContacts",
+            "_normal_functions",
             "_check_normal",
             "_endpoint_speed",
             "_finite3",
@@ -195,44 +196,9 @@ def _normal():
             "_passes",
         ),
     )
-    source = light.normal_source()
-    source = source.replace("address: wp.uint64, plan: JointWorldPlan", "cache: ContactGeometry, state: RowState")
-    source = source.replace("_body_twist(address, plan.body_lane[body])", "state.endpoint_twists[body]")
-    source = _replace(
-        source,
-        "        twist = state.endpoint_twists[body]",
-        "        twist = state.endpoint_twists[body]\n"
-        "        if data.prescribed_articulation[art] == 0 and (data.body_has_response_dofs[body] == 0 or (data.body_flags[body] & 2) != 0):\n"
-        "            twist = wp.spatial_vector()",
-    )
-    # The normal checker is already called only after the immutable world-ready
-    # proof validates every body. Its original endpoint speed/MF override stays.
-    source = source.replace("_body_valid(address, plan.body_lane[body_a])", "True")
-    source = source.replace("_body_valid(address, plan.body_lane[body_b])", "True")
-    source = source.replace("plan.body_ids.shape[0]", "cache.ready.shape[0]")
-    source = source.replace(
-        "def _light_check_normal(c: int, raw: _SimpleRawContacts, data: _SimpleWorldInput, cache: ContactGeometry, state: RowState):",
-        "def _light_check_normal(c: int, raw: RawRowInput, data: _SimpleWorldInput, cache: ContactGeometry, state: RowState, separation: wp.vec3, lever_a: wp.vec3, lever_b: wp.vec3):",
-    )
-    begin = source.index("    shape_a = raw.shape0[c]", source.index("def _light_check_normal"))
-    end = source.index("    responds_a = False", begin)
-    source = (
-        source[:begin]
-        + (
-            "    shape_a, shape_b = raw.shape0[c], raw.shape1[c]\n"
-            "    body_a, body_b = cache.bodies[c, 0], cache.bodies[c, 1]\n"
-            "    art_a, art_b = raw.art_a[c], raw.art_b[c]\n"
-            "    world = raw.world[c]\n"
-        )
-        + source[end:]
-    )
-    begin = source.index("    translation_a = wp.vec3", source.index("def _light_check_normal"))
-    end = source.index("    compatible_a =", begin)
-    source = source[:begin] + "    phi = wp.dot(n, separation)\n" + source[end:]
-    source = source.replace(", data, address, plan)", ", data, cache, state)")
     namespace = dict(simple.__dict__)
     namespace.update(globals())
-    return _compile(source, "_light_check_normal", namespace)
+    return contact_normal.bind("current", namespace)[1]
 
 
 @functools.cache
