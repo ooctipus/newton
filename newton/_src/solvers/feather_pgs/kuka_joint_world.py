@@ -7,18 +7,15 @@ The inverse inputs are held lower factors W=L^-1, never physical H^-1.
 This module deliberately contains no constraint-row or GS shared panel.
 """
 
-import ast
 import functools
 import hashlib
-import inspect
 import linecache
-import textwrap
 from dataclasses import dataclass
 
 import numpy as np
 import warp as wp
 
-from . import body_validation, contact_normal, kernels, simple_world
+from . import body_validation, contact_normal, generalized_operation_source, kernels, simple_world
 
 
 @wp.struct
@@ -521,22 +518,8 @@ def normal_source():
 
 
 def operation_source(name):
-    """Keep the complete original generalized operation with an explicit physical index."""
-    tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(kernels, name).func)))
-    function = tree.body[0]
-    function.name = "_light_" + name
-    function.decorator_list = ast.parse("@wp.func\ndef placeholder():\n    pass").body[0].decorator_list
-    function.args.args.insert(0, ast.arg(arg="physical_index", annotation=ast.Name(id="int", ctx=ast.Load())))
-
-    class Index(ast.NodeTransformer):
-        def visit_Call(self, node):
-            if ast.unparse(node.func) == "wp.tid":
-                return ast.copy_location(ast.Name(id="physical_index", ctx=ast.Load()), node)
-            return self.generic_visit(node)
-
-    tree = Index().visit(tree)
-    ast.fix_missing_locations(tree)
-    return ast.unparse(tree) + "\n"
+    """Bind the shared generalized law to an explicit physical index."""
+    return generalized_operation_source.get_source(name, indexed=True)
 
 
 _FINISH = r"""

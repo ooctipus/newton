@@ -97,13 +97,14 @@ PINNED = {
         "populate_rigid_velocity_limit_rows": "d71b12578c40b4c805740822c8b4de0e2b231cfeeb4a54910171fd937f1982cf",
         "compute_mf_world_dof_offsets": "ebfa6171449f73873897da65972c2e1f01bc707386733a27121a086081f9dccc",
         "compute_mf_effective_mass_and_rhs": "1e819d242097c4722c3db16512c7c9838d86dbc2a3b83f63f7dfdf391694c641",
-        "update_qdd_from_velocity": "d27c217ecec55796dea417dc5ec87ee576050e0a72ab2455aaca546ae293fb6c",
-        "remove_free_root_transport_from_qdd": "ad0c81fd9713f999e434a13dd43bcb396f733c94cb655ef94f4f72c5023c6f21",
-        "integrate_generalized_joints": "2418badf5019fb3b34eb3042e57835bda787a238c5227ff857ed950bed2d3a66",
+        "update_qdd_from_velocity": "045dba05cf4ddc02334847e2bab7e0c6b612652c0ceb760e0baf6e5750db8973",
+        "remove_free_root_transport_from_qdd": "8c06274bd44b63eae718c0c091a27451f6c3d50b6cd924d7d2c0ab7feb505a4a",
+        "integrate_generalized_joints": "16584fed6c0cc19f1a03fff563a375e8ae7e2c273627fdad69103fa86a8cf0cf",
         "jcalc_transform": "84d09399dec35112103e5b4bf315e81eddf5199a65075219d66a1f03df7e0996",
         "jcalc_motion": "15c927d5066b05e650fb66f1a28ccefbe8288218caba86a57d06da21e13bf608",
         "finalize_body_dynamics_values": "eb0862fab868f5d0bfcfcf3b78161fc4b96cc23a35744ecd8439e6e0fb9867ff",
         "finalize_body_dynamics_body": "16a2637f627c9b13948079cc96e8bc6d09fb7958f49f3f34c0a9a77672823d63",
+        "apply_free_root_velocity_corrections": "07238d97ed844f6ee6a638d07da37d5118adfb18ee5bee1a42e350e4995a2ff5",
     },
     "world_scan_publication.py": {
         "PublicationData": "fcf16576d1e626ccdb95ea13d55bbe84ec55a221d50705f1b03179e5f62d8452",
@@ -132,7 +133,7 @@ PINNED = {
         "_body_twist": "5837c1ce0a3f402897e71aff09076f14880e2422111160df4264fa9ddef334be",
         "_body_valid": "be8cc8904be29e7a421895f91a51fa463612c244e00bd33a4481730683e7de71",
         "normal_source": "bc99413529d25a106471a8ee1250a4ed18a39be1b63f7697afcb52bd00ec38b6",
-        "operation_source": "0ea35321bbd3b2f7ed8dac4c7a8edd04b7004887cf7f51aa55c23cd6f1bb0240",
+        "operation_source": "b0a22d3d7723d47bea33786ef6c8a6b4dd47bbf4ce3ce27c7ee76eacad725485",
         "_TWIST_PRODUCER": "e0b95d53727d39f634cf092c7b6d81c146a8be1a2c0cfc8b43efd283a78f06e3",
     },
     "simple_world.py": {
@@ -262,6 +263,11 @@ PINNED = {
         "_AFTER_MF": "9eb479c02ff7b970db8d8db730dc3ba780b8660d608fbf2ef2bba682396f6490",
         "_STORE_MF": "fc59072d93cc2d1f3b13f81fe35c4254dcca8bb578f453705cdedc7c62d177e7",
         "get_source": "9a66807e1bbce49afada1a7e127e728797cdfa62cd92157763a613762c766c0b",
+    },
+    "generalized_operation_source.py": {
+        "_OPERATIONS": "eadf04cb59878728bb62cfc1fd92e6098158c7368050a814c3f7b915f7fe0160",
+        "get_source": "6db226cb27744585892db72e450f2972b23d258d1931099dd2f750f9d929b76b",
+        "bind": "2ed1b88838ffa62efab7826fd71ef7088696225c15dacf960e907946411af4c1",
     },
 }
 
