@@ -9,14 +9,13 @@ held response construction remains after ZERO and authoritative allocation.
 """
 
 import functools
-import inspect
-import linecache
-import textwrap
 from types import SimpleNamespace
 
 import warp as wp
 
 from . import (
+    allocation_count_source,
+    contact_allocation_source,
     contact_geometry_source,
     contact_normal,
     kernels,
@@ -50,19 +49,6 @@ def allocate(worlds, capacity, device):
     value.rejected = wp.empty(worlds, dtype=int, device=device)
     value.prefix_count = wp.empty(worlds, dtype=int, device=device)
     return value
-
-
-def _replace(source, old, new):
-    if source.count(old) != 1:
-        raise ValueError("Current-contact original source seam changed: " + old[:90])
-    return source.replace(old, new)
-
-
-def _compile(source, name, namespace):
-    filename = "<kinetic-current-contact-" + name + ">"
-    linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)
-    exec(compile(source, filename, "exec"), namespace)
-    return namespace[name]
 
 
 @wp.func_native(r"""
@@ -251,92 +237,20 @@ def get_raw_kernel(arch):
 
 @functools.cache
 def get_finalize_kernel(arch):
-    source = textwrap.dedent(inspect.getsource(kinetic_allocate.initialize_count.func))
-    source = _replace(source, "@wp.kernel", '@wp.kernel(module="unique", enable_backward=False)')
-    source = _replace(source, "def initialize_count(", "def kinetic_contact_finalize(")
-    source = _replace(
-        source, "    allocation: AllocationData,", "    allocation: AllocationData,\n    cache: ContactGeometry,"
-    )
-    begin, end = source.index("    count = int(0)"), source.index("    allocation.dense_counter")
-    source = (
-        source[:begin]
-        + (
-            "    selected = cache.rejected[world] == 0 and state.raw_invalid[0] == 0\n"
-            "    state.resolved[world] = int(selected)\n"
-            "    count = int(0)\n"
-            "    if not selected:\n"
-            "        index = wp.atomic_add(state.active_count, 0, 1)\n"
-            "        state.active_worlds[index] = world\n"
-            "        count = cache.prefix_count[world]\n"
-        )
-        + source[end:]
-    )
     namespace = dict(kinetic_allocate.__dict__)
     namespace.update(globals())
-    return _compile(source, "kinetic_contact_finalize", namespace)
+    return allocation_count_source.bind(namespace, cached_geometry=True)
 
 
 @functools.cache
 def get_allocate_kernel(arch):
-    """Reuse current routing and monotone reservations with cached contact geometry."""
-    checked_definitions("kernels.py", ("_allocate_world_contact_slot", "allocate_world_contact_slots"))
-    helper = textwrap.dedent(inspect.getsource(kernels._allocate_world_contact_slot.func))
-    helper = _replace(helper, "def _allocate_world_contact_slot(", "def _current_contact_slot(")
-    helper = _replace(
-        helper,
-        "    capacity_status: wp.array[int],",
-        "    capacity_status: wp.array[int],\n    cache: ContactGeometry,",
-    )
-    begin, end = helper.index("    # Get bodies and articulations"), helper.index("    a_has_dofs")
-    helper = (
-        helper[:begin]
-        + (
-            "    body_a, body_b = cache.bodies[c, 0], cache.bodies[c, 1]\n"
-            "    art_a, art_b = contact_art_a[c], contact_art_b[c]\n"
-        )
-        + helper[end:]
-    )
-    begin, end = helper.index("    # Determine world"), helper.index("    # Compute phi")
-    helper = helper[:begin] + "    world = contact_world[c]\n" + helper[end:]
-    begin, end = helper.index("    # Compute phi"), helper.index("    # Use the same eligibility")
-    helper = helper[:begin] + "    phi = cache.values[c, 15]\n" + helper[end:]
-    source = textwrap.dedent(inspect.getsource(kernels.allocate_world_contact_slots.func))
-    source = _replace(source, "@wp.kernel", '@wp.kernel(module="unique", enable_backward=False)')
-    source = _replace(source, "def allocate_world_contact_slots(", "def kinetic_contact_allocate(")
-    source = _replace(
-        source,
-        "    capacity_status: wp.array[int],",
-        "    capacity_status: wp.array[int],\n    cache: ContactGeometry,",
-    )
-    source = _replace(
-        source, "    if total_contacts > capacity:", "    if total_contacts > capacity or capacity_status[3] != 0:"
-    )
-    begin, end = source.index("            shape_a = contact_shape0[c]"), source.index("            if same_world")
-    source = (
-        source[:begin]
-        + (
-            "            art_a, art_b = contact_art_a[c], contact_art_b[c]\n"
-            "            world = contact_world[c]\n"
-            "            same_world = True\n"
-        )
-        + source[end:]
-    )
-    source = _replace(source, "        _allocate_world_contact_slot(", "        _current_contact_slot(")
-    source = _replace(
-        source, "            capacity_status,\n        )", "            capacity_status,\n            cache,\n        )"
-    )
-    # Only successfully admitted dense contacts produce row staging. This uses
-    # the original native prelude; rank, next, material and basis arithmetic are
-    # not separately rewritten into Python/Warp expressions.
-    source += "\n        if contact_path[c] == 0 and contact_slot[c] >= 0:\n            _stage_row(c, total_contacts, cache, raw, settings)\n"
-    source = _replace(
-        source,
-        "    cache: ContactGeometry,\n):",
-        "    cache: ContactGeometry,\n    raw: RawRowInput,\n    settings: RowSettings,\n):",
+    """Bind original routing and monotone reservations to current cached geometry."""
+    checked_definitions(
+        "kernels.py", ("_contact_allocator", "_allocate_world_contact_slot", "allocate_world_contact_slots")
     )
     namespace = dict(kernels.__dict__)
     namespace.update(globals())
-    return _compile(helper + "\n" + source, "kinetic_contact_allocate", namespace)
+    return contact_allocation_source.bind(namespace, cached_geometry=True)[1]
 
 
 def _stage_source():

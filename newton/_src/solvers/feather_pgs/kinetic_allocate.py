@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import numpy as np
 import warp as wp
 
+from . import allocation_count_source
 from . import kernels as original
 from . import solver_feather_pgs as solver
 from .friction_patches import FrictionPatches
@@ -40,52 +41,16 @@ class AllocationData:
     prefix_count: wp.array[int]
 
 
-@wp.kernel
-def initialize_count(
-    plan: KineticPlan,
-    prefix: PrefixInput,
-    raw: RawRowInput,
-    state: RowState,
-    settings: RowSettings,
-    allocation: AllocationData,
-):
-    """Charge current scalar-limit scan and initialize every allocation output."""
-    world = wp.tid()
-    count = int(0)
-    if state.resolved[world] == 0:
-        for code in range(46):
-            dof = plan.dof_ids[world, code // 2]
-            qi = prefix.q_index[dof]
-            if qi >= 0:
-                q = prefix.q[qi]
-                bound = prefix.lower[dof]
-                active = wp.isfinite(bound) and q <= bound + settings.activation_gap
-                if (code & 1) != 0:
-                    bound = prefix.upper[dof]
-                    active = wp.isfinite(bound) and q >= bound - settings.activation_gap
-                if active:
-                    count += 1
-    allocation.dense_counter[world] = count
-    allocation.prefix_count[world] = count
-    allocation.mf_counter[world] = 0
-    allocation.propagation_counter[world] = 0
-    allocation.propagation_count[world] = 0
-    allocation.dense_contact_flag[world] = 0
-    allocation.dropped_dense[world] = 0
-    allocation.dropped_mf[world] = 0
-    allocation.dropped_propagation[world] = 0
-    allocation.first_rejected_dense[world] = 2147483647
-    allocation.first_rejected_mf[world] = 2147483647
-    allocation.first_rejected_propagation[world] = 2147483647
-    state.dense_count[world] = 0
-    state.mf_count[world] = 0
-    if world == 0:
-        for family in range(4):
-            state.capacity_status[family] = 0
-        if raw.count[0] < 0 or raw.count[0] > raw.shape0.shape[0]:
-            state.raw_invalid[0] = 1
-        if state.raw_invalid[0] != 0:
-            state.capacity_status[3] = 1
+initialize_count = allocation_count_source.bind(
+    globals()
+    | {
+        "KineticPlan": KineticPlan,
+        "PrefixInput": PrefixInput,
+        "RawRowInput": RawRowInput,
+        "RowState": RowState,
+        "RowSettings": RowSettings,
+    }
+)
 
 
 def bind_allocation(rows, mf):
@@ -93,6 +58,7 @@ def bind_allocation(rows, mf):
     checked_definitions(
         "kernels.py",
         (
+            "_contact_allocator",
             "_allocate_world_contact_slot",
             "allocate_world_contact_slots",
             "allocate_rigid_velocity_limit_slots",

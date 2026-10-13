@@ -16,6 +16,22 @@ import hashlib
 from pathlib import Path
 
 PINNED = {
+    "allocation_count_source.py": {
+        "_SCAN": "f323e929a00d5f65691b4240310a95665ce745a0bb9aa23b200609b537d2ff40",
+        "_INITIALIZE": "00606fef8f4f5cba6bb6dfd7f8a90cea40c5c9585caa39f62aee61b4a977210e",
+        "get_source": "db7f431a8fad785908909e573a860c04fc9350ad3c4caf6f612ea2b94e2119de",
+        "bind": "a5ee7f4c2c21845d5368d9b8e8f088a6b458b22d5f1480fb180cedf54271fbde",
+    },
+    "contact_allocation_source.py": {
+        "_BODIES": "b5476950d4d9abe81ea03201ffe8ac92ad46c5bc72e66a9fd85c104138e1db6b",
+        "_WORLD": "f4d0d3bb212a2554312f3c6c100461fe6dd9f256d5a182c8b34014c9367020c1",
+        "_PHI": "0075baa843e40e3c7c0ec4ddd26b14b397c47a73f011c2d414e403a275166c6a",
+        "_RESOLVED": "54b6f3f3cd95fea186492a4144c1ce41aabebef2bf77e820afeefa580e6c95de",
+        "_HELPER": "adb4b579ac2cb68406804ce53256dcccabf5aaa18ffa0942551b050096f08cf4",
+        "_KERNEL": "55c3009578f93abf574ab1f76474eabc3e0cc2a7837b99eda5b31c486d216872",
+        "get_source": "2a3f4729b68993d69e34e669d3cd8b0d417cdc8827baddd7ca46e8461b29d59f",
+        "bind": "a9a3bc8bc1df49bbfb47c0a67c267a250bcac66a75210abf338cc0eb84252b1f",
+    },
     "contact_geometry_source.py": {
         "_TRAVERSAL": "cb890e6ce2c0bd03bb710bc0a4bc5372cf563c4f9a8262daa0ba8a2d0fe4e53d",
         "_GEOMETRY": "fe0713e3b226fd7a47c6525c1f1648f838bb60ef6a9b05ff29cbdb4adb47a2af",
@@ -63,10 +79,11 @@ PINNED = {
         "get_prepare_kernel": "c60d23b924e8dbcdd21e039d9ede28c2f7bb3a415d961c36f25469608f8e62b6"
     },
     "kernels.py": {
+        "_contact_allocator": "691354a0e712447d8ed88bb4021cc75b720b2c9a597689b4661730b8423a1a09",
         # Rebased adapters preserve monotone reservations and bind patch-aware kernels
         # only with point-friction inputs; these pins do not admit patch ownership.
-        "_allocate_world_contact_slot": "8d51b7c5e3ca68be40e1bbd78bab1734627dd3e8a862f7163d0387bea1c3d276",
-        "allocate_world_contact_slots": "3ca7caafc11ed992faa94158be743dfef301e48c4735b8345f9fc52252e191cc",
+        "_allocate_world_contact_slot": "0e908992c5b8a236538cd9f07c7d92a4205df1d5e07fedcf81f51699285d7722",
+        "allocate_world_contact_slots": "fc7bd52682bb252393da31ce2bc307bd40ce5a9db13101b4c3dad6171aeda789",
         "allocate_rigid_velocity_limit_slots": "0c85ccc6a10fb4a59099870574929fe80c8a8b21480a3d91d02f6671c2d195fa",
         "finalize_constraint_counts_with_status": "9d45d0c596ab5919f1e7a40882cbbaeceb693db358c800db67835aef8ba3b3e0",
         "compute_contact_linear_force_from_impulses": "222aca7ac6ffa8ced2cb523b77ee4d2b88bb9f95fedebae17b616b1245b4791a",
