@@ -11,12 +11,8 @@ dispatches. It does not add a row scan, solve launch, or response panel. Origina
 MF0/independent ownership and the complete caller stream joins remain unchanged.
 """
 
-import ast
-import copy
 import functools
-import hashlib
 import inspect
-import linecache
 import re
 
 import warp as wp
@@ -28,6 +24,7 @@ from .kinetic_rows_types import DenseRowOutput, RowState
 from .kinetic_solve_types import KineticMFData, KineticSolveData
 from .kinetic_source import checked_definitions
 from .kinetic_types import HeldKineticOperator, KineticPlan
+from .mf_dispatch import make_dispatch, make_native
 
 
 @wp.struct
@@ -58,6 +55,10 @@ def allocate_hybrid(worlds, mf_impulses, mf_contact_end, device):
 
 def _pin():
     """Check only the retained representation and original kernel factories."""
+    checked_definitions(
+        "mf_dispatch.py",
+        ("_NATIVE_ARGUMENTS", "_QUEUE_ARGUMENTS", "_compile", "_signature", "make_native", "make_dispatch"),
+    )
     checked_definitions(
         "paired_factor_source.py",
         ("_KINETIC_ENTRY", "_KINETIC_EXIT", "_KINETIC_ALIASES", "_physical_entry", "_physical_exit", "get_source"),
@@ -415,30 +416,11 @@ _CPU = (
 )
 
 
-def _emit(tree, function, namespace, label):
-    """Compile inspectable generated Python while keeping source files frozen."""
-    ast.fix_missing_locations(tree)
-    source = ast.unparse(tree) + "\n"
-    filename = "<kinetic-hybrid-" + label + "-" + hashlib.sha256(source.encode()).hexdigest() + ">"
-    linecache.cache[filename] = (
-        len(source),
-        None,
-        source.splitlines(keepends=True),
-        filename,
-    )
-    namespace["__name__"] = __name__
-    exec(compile(source, filename, "exec"), namespace)
-    return namespace[function.name], source
-
-
 @functools.cache
 def get_general_kernel(original_kernel):
-    """Replace only the existing guarded general dispatch with two owners."""
+    """Bind guarded general dispatch to mutually exclusive shared owners."""
     source, baseline, edits = general_source(original_kernel)
     source = source.rsplit("#endif", 1)[0] + "#else\n" + original._T + _CPU + "\n#endif\n"
-    old_native = inspect.getclosurevars(original_kernel.func).nonlocals["pgs_solve_mf_gs_native"]
-    tree, function, namespace = guards._tree(old_native)
-    function.name = "kinetic_hybrid_native"
     extra = {
         "plan": KineticPlan,
         "held": HeldKineticOperator,
@@ -447,73 +429,30 @@ def get_general_kernel(original_kernel):
         "solve": KineticSolveData,
         "hybrid": HybridCoupledData,
     }
-    for name, annotation in extra.items():
-        function.args.args.append(ast.arg(arg=name, annotation=ast.Name(id=annotation.__name__)))
-        namespace[annotation.__name__] = annotation
-    native_function, _ = _emit(tree, function, namespace, "native")
-    new_native = wp.func_native(source)(native_function)
-    guarded = guards.get_general_kernel(original_kernel)
-    tree, function, namespace = guards._tree(guarded)
-    before = ast.dump(function, include_attributes=False)
-    old_name = function.name
-    function.name = old_name + "_hybrid"
-    public_extra = {
-        **dict(list(extra.items())[:4]),
-        "mf": KineticMFData,
-        "solve": KineticSolveData,
-        "hybrid": HybridCoupledData,
-    }
-    for name, annotation in public_extra.items():
-        function.args.args.append(ast.arg(arg=name, annotation=ast.Name(id=annotation.__name__)))
-        namespace[annotation.__name__] = annotation
-    call = next(
-        node
-        for node in ast.walk(function)
-        if isinstance(node, ast.Expr)
-        and isinstance(node.value, ast.Call)
-        and isinstance(node.value.func, ast.Name)
-        and node.value.func.id == "pgs_solve_mf_gs_native"
+    new_native = make_native(source, name="kinetic_hybrid_native", extra=extra)
+    function = make_dispatch(
+        original_kernel.mf_native,
+        policy="hybrid",
+        extra={
+            "guard": guards.BoundaryGuard,
+            "plan": KineticPlan,
+            "held": HeldKineticOperator,
+            "state": RowState,
+            "rows": DenseRowOutput,
+            "mf": KineticMFData,
+            "solve": KineticSolveData,
+            "hybrid": HybridCoupledData,
+        },
+        bindings={
+            "_guard_world_check": guards._guard_world_check,
+            "kinetic_hybrid_native": new_native,
+            "_is_cpu": original._is_cpu,
+        },
+        native_extra=tuple(extra),
     )
-    parent = next(node for node in ast.walk(function) if call in getattr(node, "body", []))
-    branch = ast.If(
-        test=ast.parse("hybrid.eligible[world] != 0", mode="eval").body,
-        body=[
-            ast.Expr(
-                value=ast.Call(
-                    func=ast.Name(id="kinetic_hybrid_native"),
-                    args=call.value.args + [ast.Name(id=name) for name in extra],
-                    keywords=[],
-                )
-            )
-        ],
-        orelse=[call],
-    )
-    parent.body[parent.body.index(call)] = branch
-    cpu_guard = ast.parse("if _is_cpu() and _lane != 0:\n    return\n").body[0]
-    function.body.insert(1, cpu_guard)
-    recovered = copy.deepcopy(function)
-    del recovered.body[1]
-    target = next(
-        node
-        for node in ast.walk(recovered)
-        if isinstance(node, ast.If) and ast.dump(node.test) == ast.dump(branch.test)
-    )
-    parent = next(node for node in ast.walk(recovered) if target in getattr(node, "body", []))
-    parent.body[parent.body.index(target)] = target.orelse[0]
-    recovered.name = old_name
-    del recovered.args.args[-len(public_extra) :]
-    if ast.dump(recovered, include_attributes=False) != before:
-        raise RuntimeError("Dispatch removal failed exact guarded source recovery")
-    namespace.update(kinetic_hybrid_native=new_native, _is_cpu=original._is_cpu)
-    function, python_source = _emit(tree, function, namespace, "dispatch")
     result = wp.kernel(function, module="unique", enable_backward=False)
-    result.hybrid_source, result.hybrid_original_source, result.hybrid_edits = (
-        source,
-        baseline,
-        edits,
-    )
-    result.hybrid_dispatch_source = python_source
-    result.hybrid_recovered_ast = before
+    result.hybrid_source, result.hybrid_original_source, result.hybrid_edits = source, baseline, edits
+    result.hybrid_dispatch_source = function.mf_dispatch_source
     return result
 
 

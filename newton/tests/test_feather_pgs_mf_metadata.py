@@ -116,14 +116,15 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
                     mf_max_constraints=65535,
                     local_mf_max_constraints=3,
                 ),
-                "pgs_solve_local_internal_native",
+                "native",
                 "parent_mf",
                 "packed_type_parent",
             ),
         )
         for kernel, native_name, name, word in kernels:
             with self.subTest(kernel=kernel.key):
-                source = inspect.getclosurevars(kernel.func).nonlocals[native_name].native_snippet
+                closure = inspect.getclosurevars(kernel.func)
+                source = (closure.globals | closure.nonlocals)[native_name].native_snippet
                 result = wp.zeros(len(parents), dtype=int, device="cpu")
                 wp.launch(
                     _parent_decoder(source, name=name, packed=word),
@@ -168,13 +169,14 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
                 fpgs._get_pgs_solve_local_owned_kernel(
                     8, 8, 23, "cpu", paired_dof_count=6, mf_max_constraints=65535, local_mf_max_constraints=3
                 ),
-                "pgs_solve_local_internal_native",
+                "native",
                 "mf_meta.data[mf_meta_offset + parent_mf * 4 + 3]",
             ),
         )
         for kernel, native_name, word in cases:
             with self.subTest(kernel=kernel.key):
-                source = inspect.getclosurevars(kernel.func).nonlocals[native_name].native_snippet
+                closure = inspect.getclosurevars(kernel.func)
+                source = (closure.globals | closure.nonlocals)[native_name].native_snippet
                 # Dense-row links use a different, unpacked array.
                 start = source.index(word)
                 start = source.rfind("int patch_row", 0, start)

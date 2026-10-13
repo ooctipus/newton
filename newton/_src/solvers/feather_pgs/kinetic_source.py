@@ -16,6 +16,14 @@ import hashlib
 from pathlib import Path
 
 PINNED = {
+    "mf_dispatch.py": {
+        "_NATIVE_ARGUMENTS": "795a55f6b5227fce9bba9d2df228dc0560ba344eb9e4da0227cb17684d59d28f",
+        "_QUEUE_ARGUMENTS": "a3dce18c710b83d8747e3b4306183bcdf73a1cccf5c03913816ae1492dc9e947",
+        "_compile": "ddcb24a52a1cf1d26c9609c818a5eaf69d480eff7374b640a1c0dbdddd697d43",
+        "_signature": "902b3486f6499d0bad23cc6bb54c50aa6705ff9155c1f5493667e071c496ce81",
+        "make_native": "a5d5100996cc1be1d8af2265552cfce787bdfa14c75409faf59f6c31324debfa",
+        "make_dispatch": "7eb96a89eb255af78aa4e9e044f4b292d9957de5c49a8a390ee4a7dd6b9e3735",
+    },
     "paired_factor_source.py": {
         "_KINETIC_ENTRY": "da56d0dccf7e1e8c073f7f8056919568b6acd71e7f47be9857b6bf577375ad4b",
         "_KINETIC_EXIT": "6a895fdf453c4b04cbaeb40e27208d660ac0d9db96afc4ef3b12fc35597a126a",
@@ -37,7 +45,7 @@ PINNED = {
     },
     "solver_feather_pgs.py": {
         "_get_pgs_solve_paired_factor_kernel": "e417ffcc1bd6dbae775e3fdd6943033bc27af1f46b1ec4ca28e1c7677d8d2bd6",
-        "_get_pgs_solve_mf_gs_kernel": "7e3d01ba60a02ee946bfd84635cc6b400f243ea8f4ebbbf832d16fe2008bbca4",
+        "_get_pgs_solve_mf_gs_kernel": "6fae700b63982a3d474a90243c27932be7d1ff654d3245495b62665302e07ef5",
         "_get_crba_cholesky_warp_kernel": "f507209b4a71155f75aa86a783241723e1370c41a0c262744c020bfc224969de",
         "_get_inverse_cholesky_register_kernel": "f1f2c60767d69d8006fb074c768877b921579954b7d36bc1efee9366212234d3",
         "_get_cholesky_kernel": "c262785fdd51c25f94c3c67ab4bb4cbe0fa95f16b61adcb788fbd16de10a4689",
@@ -154,7 +162,7 @@ PINNED = {
         "general_source": "1647884f80ae7da11bf1dd2fa29cef11835d6b825062cad4328e3651a8066b85",
         "get_qualify_kernel": "f524aab764befe22c841faf9b1b0e52a5cc3a8e47d7d0316ecc0179d99c8a7be",
         "get_materialize_kernel": "8deeca3844d44e771c2d7f69b8a0dc6481c096f8b2c23fa94f5926f457d2369c",
-        "get_general_kernel": "a8bbe6aa75c6dd8064f3b60cbdcc6d8ea8d6d72946b5afe3082fb157a1e1bf2f",
+        "get_general_kernel": "1d173139e1fbd5e5c3f955629eb09c2e1fb3d71dd306bd0cdb18a817b2388ebc",
     },
     "cached_state.py": {
         "_INTEGRATION": "33f3c5af040aa39de98421346673484f257af0bd542d68b4098137e204c65457",

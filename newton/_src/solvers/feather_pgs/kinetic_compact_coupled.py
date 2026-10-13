@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Preserve the checked original host/source-construction expressions.
-# ruff: noqa: RUF005
 
 """One compact dense/current-MF recurrence with a shared fallback arena.
 
@@ -12,10 +11,7 @@ original sweep. Qualification, dispatch count, unsupported fallback arithmetic,
 and the caller's stream joins are unchanged. Snapshot conversion is host-only.
 """
 
-import ast
-import copy
 import functools
-import inspect
 import re
 
 import warp as wp
@@ -27,6 +23,7 @@ from .kinetic_rows_types import DenseRowOutput, RowState
 from .kinetic_solve_types import KineticMFData, KineticSolveData
 from .kinetic_source import checked_definitions
 from .kinetic_types import HeldKineticOperator, KineticPlan
+from .mf_dispatch import make_dispatch, make_native
 
 HybridCoupledData = hybrid_source.HybridCoupledData
 allocate_hybrid = hybrid_source.allocate_hybrid
@@ -280,23 +277,11 @@ def cpu_source():
     return source
 
 
-def _native(old_native, source, name, extra):
-    """Add private-only arguments to a checked native descriptor."""
-    tree, function, namespace = guards._tree(old_native)
-    function.name = name
-    for field, annotation in extra.items():
-        function.args.args.append(ast.arg(arg=field, annotation=ast.Name(id=annotation.__name__)))
-        namespace[annotation.__name__] = annotation
-    function, _ = hybrid_source._emit(tree, function, namespace, name)
-    return wp.func_native(source)(function)
-
-
 @functools.cache
 def get_general_kernel(original_kernel):
-    """Replace one existing dispatch with mutually exclusive arena owners."""
+    """Bind one guarded queue dispatch to mutually exclusive arena owners."""
     source, baseline, mf_body = compact_source(original_kernel)
     fallback, fallback_edits = fallback_source(baseline)
-    old_native = inspect.getclosurevars(original_kernel.func).nonlocals["pgs_solve_mf_gs_native"]
     extra = {
         "plan": KineticPlan,
         "held": HeldKineticOperator,
@@ -306,87 +291,34 @@ def get_general_kernel(original_kernel):
         "hybrid": HybridCoupledData,
         "arena_address": wp.uint64,
     }
-    compact_native = _native(old_native, source, "kinetic_compact_native", extra)
-    fallback_native = _native(
-        old_native,
-        fallback,
-        "kinetic_original_arena_native",
-        {"arena_address": wp.uint64},
+    compact_native = make_native(source, name="kinetic_compact_native", extra=extra)
+    fallback_native = make_native(fallback, name="kinetic_original_arena_native", extra={"arena_address": wp.uint64})
+    function = make_dispatch(
+        original_kernel.mf_native,
+        policy="compact",
+        extra={
+            "guard": guards.BoundaryGuard,
+            "plan": KineticPlan,
+            "held": HeldKineticOperator,
+            "state": RowState,
+            "rows": DenseRowOutput,
+            "mf": KineticMFData,
+            "solve": KineticSolveData,
+            "hybrid": HybridCoupledData,
+        },
+        bindings={
+            "_guard_world_check": guards._guard_world_check,
+            "kinetic_compact_native": compact_native,
+            "kinetic_original_arena_native": fallback_native,
+            "_arena": _arena,
+            "_is_cpu": original._is_cpu,
+        },
+        native_extra=tuple(extra),
     )
-    guarded = guards.get_general_kernel(original_kernel)
-    tree, function, namespace = guards._tree(guarded)
-    before = ast.dump(function, include_attributes=False)
-    old_name = function.name
-    function.name += "_compact"
-    public_extra = {
-        "plan": KineticPlan,
-        "held": HeldKineticOperator,
-        "state": RowState,
-        "rows": DenseRowOutput,
-        "mf": KineticMFData,
-        "solve": KineticSolveData,
-        "hybrid": HybridCoupledData,
-    }
-    for name, annotation in public_extra.items():
-        function.args.args.append(ast.arg(arg=name, annotation=ast.Name(id=annotation.__name__)))
-        namespace[annotation.__name__] = annotation
-    call = next(
-        n
-        for n in ast.walk(function)
-        if isinstance(n, ast.Expr)
-        and isinstance(n.value, ast.Call)
-        and isinstance(n.value.func, ast.Name)
-        and n.value.func.id == "pgs_solve_mf_gs_native"
-    )
-    parent = next(n for n in ast.walk(function) if call in getattr(n, "body", []))
-    old_call = copy.deepcopy(call)
-    branch = ast.If(
-        test=ast.parse("hybrid.eligible[world] != 0", mode="eval").body,
-        body=[
-            ast.Expr(
-                value=ast.Call(
-                    func=ast.Name(id="kinetic_compact_native"),
-                    args=call.value.args + [ast.Name(id=n) for n in extra],
-                    keywords=[],
-                )
-            )
-        ],
-        orelse=[
-            ast.Expr(
-                value=ast.Call(
-                    func=ast.Name(id="kinetic_original_arena_native"),
-                    args=call.value.args + [ast.Name(id="arena_address")],
-                    keywords=[],
-                )
-            )
-        ],
-    )
-    index = parent.body.index(call)
-    assignment = ast.parse("arena_address = _arena()\n").body[0]
-    parent.body[index : index + 1] = [assignment, branch]
-    cpu_guard = ast.parse("if _is_cpu() and _lane != 0:\n    return\n").body[0]
-    function.body.insert(1, cpu_guard)
-    recovered = copy.deepcopy(function)
-    del recovered.body[1]
-    target = next(n for n in ast.walk(recovered) if isinstance(n, ast.If) and ast.dump(n.test) == ast.dump(branch.test))
-    parent = next(n for n in ast.walk(recovered) if target in getattr(n, "body", []))
-    index = parent.body.index(target)
-    parent.body[index - 1 : index + 1] = [old_call]
-    recovered.name = old_name
-    del recovered.args.args[-len(public_extra) :]
-    if ast.dump(recovered, include_attributes=False) != before:
-        raise RuntimeError("Exact original dispatch recovery failed")
-    namespace.update(
-        kinetic_compact_native=compact_native,
-        kinetic_original_arena_native=fallback_native,
-        _arena=_arena,
-        _is_cpu=original._is_cpu,
-    )
-    function, dispatch = hybrid_source._emit(tree, function, namespace, "compact-dispatch")
     result = wp.kernel(function, module="unique", enable_backward=False)
     result.compact_source, result.compact_original_source = source, baseline
     result.compact_mf_source, result.compact_fallback_edits = mf_body, fallback_edits
-    result.compact_dispatch_source = dispatch
+    result.compact_dispatch_source = function.mf_dispatch_source
     return result
 
 

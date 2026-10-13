@@ -10,18 +10,13 @@ checks live statuses itself before original admission or generalized writes.
 No numerical value, including a finite seeded v_out, authorizes publication.
 """
 
-import ast
-import copy
 import functools
-import hashlib
-import inspect
-import linecache
-import textwrap
 
 import warp as wp
 
 from . import kinetic_state
 from .kinetic_source import checked_definitions
+from .mf_dispatch import make_dispatch
 
 
 @wp.struct
@@ -150,82 +145,23 @@ def check_guard(guard, device):
     wp.launch(_check, dim=guard.error.shape[0], inputs=[guard], device=device)
 
 
-def _tree(kernel):
-    """Recover the original function body including its closure bindings."""
-    tree = ast.parse(textwrap.dedent(inspect.getsource(kernel.func)))
-    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef))
-    function.decorator_list = []
-    namespace = dict(kernel.func.__globals__)
-    closure = inspect.getclosurevars(kernel.func)
-    namespace.update(closure.globals)
-    namespace.update(closure.nonlocals)
-    return tree, function, namespace
-
-
-def _compile(kernel, kind):
-    """Inject one guard seam and prove its removal recovers original AST."""
-    tree, function, namespace = _tree(kernel)
-    original = ast.dump(function, include_attributes=False)
-    name = function.name
-    function.name = name + "_boundary_guarded"
-    function.args.args.append(ast.arg(arg="guard", annotation=ast.Name(id="BoundaryGuard")))
-    if kind == "general":
-        calls = [
-            node
-            for node in ast.walk(function)
-            if isinstance(node, ast.Expr)
-            and isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Name)
-            and node.value.func.id == "pgs_solve_mf_gs_native"
-        ]
-        if len(calls) != 1:
-            raise RuntimeError("Original general native call seam changed")
-        call = calls[0]
-        owner = next(node for node in ast.walk(function) if call in getattr(node, "body", []))
-        index = owner.body.index(call)
-        injected = ast.If(
-            test=ast.parse("_guard_world_check(world, guard) == 0", mode="eval").body,
-            body=[call],
-            orelse=[],
-        )
-        owner.body[index] = injected
-        recovery = copy.deepcopy(function)
-        target = next(
-            node
-            for node in ast.walk(recovery)
-            if isinstance(node, ast.If) and ast.dump(node.test) == ast.dump(injected.test)
-        )
-        parent = next(node for node in ast.walk(recovery) if target in getattr(node, "body", []))
-        parent.body[parent.body.index(target)] = target.body[0]
-    else:
-        raise ValueError("Unknown checked adapter kind")
-    recovery.name = name
-    recovery.args.args.pop()
-    if ast.dump(recovery, include_attributes=False) != original:
-        raise RuntimeError("Guard removal did not recover exact original arithmetic")
-    ast.fix_missing_locations(tree)
-    source = ast.unparse(tree) + "\n"
-    filename = "<kinetic-guard-" + hashlib.sha256(source.encode()).hexdigest() + ">"
-    linecache.cache[filename] = (
-        len(source),
-        None,
-        source.splitlines(keepends=True),
-        filename,
-    )
-    namespace.update(BoundaryGuard=BoundaryGuard, _guard_world_check=_guard_world_check)
-    exec(compile(source, filename, "exec"), namespace)
-    result = wp.kernel(namespace[function.name], module="unique", enable_backward=False)
-    result.guard_source = source
-    result.guard_original_ast = original
-    result.guard_recovered_ast = ast.dump(recovery, include_attributes=False)
-    return result
-
-
 @functools.cache
 def get_general_kernel(original_kernel):
     """Original general ABI plus BoundaryGuard last; guard each queued world."""
     checked_definitions("solver_feather_pgs.py", ("_get_pgs_solve_mf_gs_kernel",))
-    return _compile(original_kernel, "general")
+    checked_definitions(
+        "mf_dispatch.py",
+        ("_NATIVE_ARGUMENTS", "_QUEUE_ARGUMENTS", "_compile", "_signature", "make_native", "make_dispatch"),
+    )
+    if not hasattr(original_kernel, "mf_native"):
+        raise ValueError("Guard requires the original matrix-free queue contract")
+    function = make_dispatch(
+        original_kernel.mf_native,
+        policy="guard",
+        extra={"guard": BoundaryGuard},
+        bindings={"_guard_world_check": _guard_world_check},
+    )
+    return wp.kernel(function, module="unique", enable_backward=False)
 
 
 @functools.cache

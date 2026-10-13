@@ -27473,161 +27473,10 @@ def _get_pgs_solve_mf_gs_kernel(
             1,
         )
 
-    @wp.func_native(snippet)
-    def pgs_solve_mf_gs_native(
-        world: int,
-        rb_class: wp.array[int],
-        # Dense
-        world_constraint_count: wp.array[int],
-        dense_phase_bounds: wp.array2d[int],
-        local_solve_owner: wp.array[int],
-        world_dof_indices: wp.array2d[int],
-        world_deferred_dof_mask: wp.array2d[int],
-        rhs_bias: wp.array2d[float],
-        world_diag: wp.array2d[float],
-        world_row_w: wp.array2d[float],
-        world_impulses: wp.array2d[float],
-        J_world: wp.array3d[float],
-        Y_world: wp.array3d[float],
-        world_row_type: wp.array2d[int],
-        world_row_parent: wp.array2d[int],
-        world_row_mu: wp.array2d[float],
-        world_torsion_group: wp.array2d[int],
-        contact_torsion_radius: float,
-        world_drive_target_vel_bias: wp.array2d[float],
-        world_drive_vel_multiplier: wp.array2d[float],
-        world_drive_impulse_multiplier: wp.array2d[float],
-        world_drive_max_impulse: wp.array2d[float],
-        world_drive_vel_limit: wp.array2d[float],
-        # MF
-        mf_constraint_count: wp.array[int],
-        mf_contact_rows_end: wp.array[int],
-        mf_meta: wp.array2d[int],
-        mf_impulses: wp.array2d[float],
-        mf_J_a: wp.array3d[float],
-        mf_J_b: wp.array3d[float],
-        mf_MiJt_a: wp.array3d[float],
-        mf_MiJt_b: wp.array3d[float],
-        mf_row_mu: wp.array2d[float],
-        mf_row_w: wp.array2d[float],
-        # Shared
-        iterations: int,
-        omega: float,
-        regularize: int,
-        row_phase: int,
-        friction_start_iteration: int,
-        iteration_offset: int,
-        freeze_drive_rows: int,
-        defer_dense_response: int,
-        # Output
-        v_out: wp.array[float],
-    ): ...
+    from .mf_dispatch import make_dispatch, make_native  # noqa: PLC0415
 
-    def pgs_solve_mf_gs_template(
-        general_world_count: wp.array[int],
-        general_worlds: wp.array[int],
-        general_world_grid_stride: int,
-        use_general_world_queue: int,
-        rb_class: wp.array[int],
-        # Dense
-        world_constraint_count: wp.array[int],
-        dense_phase_bounds: wp.array2d[int],
-        local_solve_owner: wp.array[int],
-        world_dof_indices: wp.array2d[int],
-        world_deferred_dof_mask: wp.array2d[int],
-        rhs_bias: wp.array2d[float],
-        world_diag: wp.array2d[float],
-        world_row_w: wp.array2d[float],
-        world_impulses: wp.array2d[float],
-        J_world: wp.array3d[float],
-        Y_world: wp.array3d[float],
-        world_row_type: wp.array2d[int],
-        world_row_parent: wp.array2d[int],
-        world_row_mu: wp.array2d[float],
-        world_torsion_group: wp.array2d[int],
-        contact_torsion_radius: float,
-        world_drive_target_vel_bias: wp.array2d[float],
-        world_drive_vel_multiplier: wp.array2d[float],
-        world_drive_impulse_multiplier: wp.array2d[float],
-        world_drive_max_impulse: wp.array2d[float],
-        world_drive_vel_limit: wp.array2d[float],
-        # MF
-        mf_constraint_count: wp.array[int],
-        mf_contact_rows_end: wp.array[int],
-        mf_meta: wp.array2d[int],
-        mf_impulses: wp.array2d[float],
-        mf_J_a: wp.array3d[float],
-        mf_J_b: wp.array3d[float],
-        mf_MiJt_a: wp.array3d[float],
-        mf_MiJt_b: wp.array3d[float],
-        mf_row_mu: wp.array2d[float],
-        mf_row_w: wp.array2d[float],
-        # Shared
-        iterations: int,
-        omega: float,
-        regularize: int,
-        row_phase: int,
-        friction_start_iteration: int,
-        iteration_offset: int,
-        freeze_drive_rows: int,
-        defer_dense_response: int,
-        # Output
-        v_out: wp.array[float],
-    ):
-        candidate, _lane = wp.tid()
-        general_index = candidate
-        general_count = general_world_count[0]
-        if use_general_world_queue == 0:
-            general_count = candidate + 1
-        while general_index < general_count:
-            world = candidate
-            if use_general_world_queue != 0:
-                world = general_worlds[general_index]
-            pgs_solve_mf_gs_native(
-                world,
-                rb_class,
-                world_constraint_count,
-                dense_phase_bounds,
-                local_solve_owner,
-                world_dof_indices,
-                world_deferred_dof_mask,
-                rhs_bias,
-                world_diag,
-                world_row_w,
-                world_impulses,
-                J_world,
-                Y_world,
-                world_row_type,
-                world_row_parent,
-                world_row_mu,
-                world_torsion_group,
-                contact_torsion_radius,
-                world_drive_target_vel_bias,
-                world_drive_vel_multiplier,
-                world_drive_impulse_multiplier,
-                world_drive_max_impulse,
-                world_drive_vel_limit,
-                mf_constraint_count,
-                mf_contact_rows_end,
-                mf_meta,
-                mf_impulses,
-                mf_J_a,
-                mf_J_b,
-                mf_MiJt_a,
-                mf_MiJt_b,
-                mf_row_mu,
-                mf_row_w,
-                iterations,
-                omega,
-                regularize,
-                row_phase,
-                friction_start_iteration,
-                iteration_offset,
-                freeze_drive_rows,
-                defer_dense_response,
-                v_out,
-            )
-            general_index += general_world_grid_stride
+    pgs_solve_mf_gs_native = make_native(snippet)
+    pgs_solve_mf_gs_template = make_dispatch(pgs_solve_mf_gs_native)
 
     if dense_support_tiles:
         # Only forwarding declarations are duplicated. Both native entry points
@@ -27818,7 +27667,10 @@ def _get_pgs_solve_mf_gs_kernel(
         name += "_stage_tiles"
     pgs_solve_mf_gs_template.__name__ = name
     pgs_solve_mf_gs_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)
+    result = wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)
+    if not dense_support_tiles:
+        result.mf_native = pgs_solve_mf_gs_native
+    return result
 
 
 @cache
