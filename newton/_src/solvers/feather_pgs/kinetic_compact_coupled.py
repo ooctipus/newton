@@ -12,13 +12,15 @@ and the caller's stream joins are unchanged. Snapshot conversion is host-only.
 """
 
 import functools
-import re
 
 import warp as wp
 
+from . import compact_recurrence_source as recurrence_source
 from . import kinetic_guard as guards
 from . import kinetic_hybrid as hybrid_source
 from . import kinetic_solve as original
+from .compact_recurrence_source import get_source as compact_recurrence
+from .kinetic_coupled_cpu import get_source as coupled_cpu_source
 from .kinetic_rows_types import DenseRowOutput, RowState
 from .kinetic_solve_types import KineticMFData, KineticSolveData
 from .kinetic_source import checked_definitions
@@ -30,6 +32,8 @@ allocate_hybrid = hybrid_source.allocate_hybrid
 get_qualify_kernel = hybrid_source.get_qualify_kernel
 
 ARENA_FLOATS = 1053
+# Preserve the checked view alias; the shared factory owns its definition.
+_VIEWS = recurrence_source._VIEWS
 
 
 def _pin():
@@ -138,115 +142,21 @@ def get_materialize_kernel(arch):
 
 
 def fallback_source(baseline):
-    """Replace only old shared declarations with exact nonoverlapping views."""
-    source, changes, offset = baseline, [], 0
-    declarations = list(re.finditer(r"__shared__\s+(float|int)\s+(\w+)\[(\d+)\];", baseline))
-    if len(declarations) != 7:
-        raise RuntimeError("Original shared inventory changed")
-    for match in declarations:
-        dtype, name, count = match.groups()
-        replacement = f"{dtype}* {name}=reinterpret_cast<{dtype}*>(arena_address)+{offset};"
-        source = original.replace_once(source, match.group(0), replacement)
-        changes.append((match.group(0), replacement))
-        offset += int(count)
-    if offset != ARENA_FLOATS:
-        raise RuntimeError("Original arena size changed")
-    recovered = source
-    for before, after in reversed(changes):
-        recovered = original.replace_once(recovered, after, before)
-    if recovered != baseline:
-        raise RuntimeError("Fallback arithmetic recovery failed")
-    return source, changes
-
-
-_VIEWS = r"""
-    float* arena=reinterpret_cast<float*>(arena_address);
-    float* s_lam=arena; float* s_rhs=arena+192; float* s_diag=arena+384;
-    unsigned char* s_type=reinterpret_cast<unsigned char*>(arena+576);
-    float* s_contact_mu=arena+624; float* s_lam_mf=arena+688;
-    float* s_v=arena+752; float* hybrid_base=arena+781;
-"""
+    """Bind the original fallback law to exact nonoverlapping arena views."""
+    if baseline != hybrid_source._fixed_source().native:
+        raise ValueError("Compact fallback requires the retained physical recipe")
+    source = hybrid_source._fixed_source(shared_arena=True)
+    if source.arena_floats != ARENA_FLOATS:
+        raise ValueError("Compact arena size differs from the physical fallback")
+    return source.native, []
 
 
 def compact_source(original_kernel):
-    """Compose unchanged dense triple law and exact current MF/vlim blocks."""
+    """Compose shared dense and current-MF source through explicit bindings."""
     _pin()
-    old_hybrid, baseline, _ = hybrid_source.general_source(original_kernel)
-    mf_begin = old_hybrid.index("        // ── Phase 2: MF constraints")
-    mf_end = old_hybrid.index("        if (global_iter >= friction_start_iteration)", mf_begin)
-    mf_body = old_hybrid[mf_begin:mf_end]
-    # The complete dense law comes from the already accepted offset owner.
-    dense = original.cuda_recurrence()
-    dense = dense[dense.index("    __shared__ float s_lam_storage") :]
-    dense = re.sub(r"    __shared__ [^;]+;\n", "", dense)
-    dense = original.replace_once(dense, "    const int world_slot = threadIdx.x >> 5;\n", "")
-    begin = dense.index("    float* s_lam =")
-    end = dense.index("    int contact_start =", begin)
-    dense = dense[:begin] + _VIEWS + dense[end:]
-    for name, value in {
-        "primary_group_by_world": "plan.primary_group",
-        "secondary_group_by_world": "plan.secondary_group",
-        "primary_offset_by_world": "state.primary_offset",
-        "secondary_offset_by_world": "state.secondary_offset",
-        "factor_rows": "rows.response",
-    }.items():
-        dense = dense.replace(name + ".data", value + ".data")
-    dense = dense.replace("rhs_bias.data[off + i]", "rows.r0.data[off + i]")
-    # A response and a residual coincide on primary Z but not free physical Y.
-    # Keep every update factor unchanged; replace only residual multiplication.
-    for factor, row in (
-        ("row_factor", "i"),
-        ("normal_factor", "normal"),
-        ("tangent1_factor", "tangent1"),
-        ("tangent2_factor", "tangent2"),
-    ):
-        dense = dense.replace(f"{factor} * factor_velocity", f"dense_j({row}, {factor}) * factor_velocity")
-    start = dense.index("    const int primary_lane=")
-    dense = (
-        dense[:start]
-        + r"""
-    const int po=primary_offset,so=secondary_offset;
-    const bool split_component=false;
-    const int m_mf=mf_constraint_count.data[world];
-    int mf_contact_end=mf_contact_rows_end.data[world];
-    const int off_mf=world*64,off_meta=off_mf*4,mf6_base=off_mf*6;
-    if(m_mf<0||m_mf>64||mf_contact_end<0||mf_contact_end>m_mf){if(lane==0)solve.status.data[world]=1;return;}
-    for(int i=lane;i<m_mf;i+=32)s_lam_mf[i]=mf_impulses.data[off_mf+i];
-    if(lane<6)hybrid_base[lane]=state.v_hat.data[plan.dof_ids.data[world*35+23+lane]];
-    auto dense_j=[&](int row,float y){return lane>=po&&lane<po+23?y:J_world.data[(world*192+row)*29+lane];};
-"""
-        + dense[start:]
-    )
-    seam = "        const unsigned changed = __ballot_sync(MASK, iteration_changed != 0);"
-    dense = original.replace_once(
-        dense,
-        seam,
-        r"""
-        // Only six physical increments cross this phase boundary; primary du
-        // stays in registers. The original MF and rigid-limit source is exact.
-        if(lane>=so&&lane<so+6)s_v[lane]=factor_velocity;
-        __syncwarp(MASK);
-"""
-        + mf_body
-        + r"""
-        __syncwarp(MASK);
-        if(lane>=so&&lane<so+6)factor_velocity=s_v[lane];
-"""
-        + seam,
-    )
-    begin = dense.index("    for(int k=0;k<6;++k){const float du=")
-    end = dense.index("    const bool finite=", begin)
-    dense = (
-        dense[:begin] + "    if(secondary_lane>=0&&secondary_lane<6)physical_output=factor_velocity;\n" + dense[end:]
-    )
-    dense = original.replace_once(dense, "    const bool finite=", "    bool finite=")
-    dense = original.replace_once(
-        dense,
-        "    if(!__all_sync(MASK,finite))",
-        "    for(int i=lane;i<m;i+=32)finite &= isfinite(s_lam[i]);\n    for(int i=lane;i<m_mf;i+=32)finite &= isfinite(s_lam_mf[i]);\n    if(!__all_sync(MASK,finite))",
-    )
-    dense += "\n    for(int i=lane;i<m_mf;i+=32)mf_impulses.data[off_mf+i]=s_lam_mf[i];\n"
-    # Extracting the recurrence above drops its function-local tangent helper.
+    _, baseline, _ = hybrid_source.general_source(original_kernel)
+    mf_body = hybrid_source._fixed_source(held=True).mf_phase
+    dense = compact_recurrence(mf_body)
     return (
         "#if defined(__CUDA_ARCH__)\n"
         + original.FRICTION_PAIR_CUDA
@@ -262,19 +172,8 @@ def compact_source(original_kernel):
 
 
 def cpu_source():
-    """Keep the predecessor scalar law, consume the six converted columns."""
-    source = hybrid_source._CPU
-    begin = source.index("        for (int col = 0; col < 6; ++col) {")
-    end = source.index("    for (int r = 0; r < n;", begin)
-    source = (
-        source[:begin]
-        + r"""
-        for(int col=0;col<6;++col){const float y=rows.response.data[(world*192+r)*29+so+col];ys[r*6+col]=y;good &= isfinite(y);}
-    }
-"""
-        + source[end:]
-    )
-    return source
+    """Use the common scalar law with the six already converted columns."""
+    return coupled_cpu_source(converted_secondary=True)
 
 
 @functools.cache

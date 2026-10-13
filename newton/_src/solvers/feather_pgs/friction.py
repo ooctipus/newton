@@ -3,6 +3,8 @@
 
 """Solve the tangential friction block at a fixed normal load."""
 
+from string import Template
+
 import warp as wp
 
 
@@ -119,17 +121,18 @@ def friction_pair_candidate(
 # Native kernels use the same bounded solve as the Warp function above.
 # Keep the metric and changing-state expressions shared by native owners. The
 # ordinary owner still expands to the original complete native function.
-_FRICTION_PAIR_METRIC_CUDA = """        float scale = fmaxf(fmaxf(a, d), 1.0e-20f);
+_PAIR_METRIC = Template(r"""        float scale = ${max_call}(${max_call}(a, d), 1.0e-20f);
         a /= scale; c /= scale; d /= scale;
         float largest = 0.5f * (a + d + sqrtf((a-d)*(a-d) + 4.0f*c*c));
-        float smallest = largest > 0.0f ? fmaxf((a*d-c*c) / largest, 0.0f) : 0.0f;
+        float smallest = largest > 0.0f ? ${max_call}((a*d-c*c) / largest, 0.0f) : 0.0f;
         float vx = c, vy = largest-a;
         if (a >= d) { vx = largest-d; vy = c; }
         float norm = sqrtf(vx*vx + vy*vy);
         if (norm > 0.0f) { vx /= norm; vy /= norm; }
         else { vx = 1.0f; vy = 0.0f; }
-"""
-_FRICTION_PAIR_STATE_CUDA = """        float r0_rotated = (vx*r0 + vy*r1) / scale;
+""")
+_FRICTION_PAIR_METRIC_CUDA = _PAIR_METRIC.substitute(max_call="fmaxf")
+_PAIR_STATE = Template(r"""        float r0_rotated = (vx*r0 + vy*r1) / scale;
         float r1_rotated = (-vy*r0 + vx*r1) / scale;
         float result0 = old0, result1 = old1;
         bool sticking = false;
@@ -147,7 +150,7 @@ _FRICTION_PAIR_STATE_CUDA = """        float r0_rotated = (vx*r0 + vy*r1) / scal
                 && radius-old_norm <= 2.0e-7f*radius
                 && r0*old0+r1*old1 <= 0.0f
                 && fabsf(r0*old1-r1*old0) <= 2.0e-7f*old_norm*residual_norm) {
-                return make_float2(old0, old1);
+                return ${pair_call}(old0, old1);
             }
             float old_x = vx*old0 + vy*old1;
             float old_y = -vy*old0 + vx*old1;
@@ -157,7 +160,7 @@ _FRICTION_PAIR_STATE_CUDA = """        float r0_rotated = (vx*r0 + vy*r1) / scal
             float lo = 0.0f;
             float hi = sqrtf(b0*b0 + b1*b1) / radius;
             if (hi > 0.0f) {
-                lo = fmaxf(fmaxf(hi-largest, fabsf(b1)/radius-smallest), 0.0f);
+                lo = ${max_call}(${max_call}(hi-largest, fabsf(b1)/radius-smallest), 0.0f);
                 float alpha = lo;
                 bool converged = false;
                 for (int iteration = 0; iteration < 8; ++iteration) {
@@ -194,20 +197,30 @@ _FRICTION_PAIR_STATE_CUDA = """        float r0_rotated = (vx*r0 + vy*r1) / scal
             result0 = old0 + vx*(x-old_x) - vy*(y-old_y);
             result1 = old1 + vy*(x-old_x) + vx*(y-old_y);
         }
-        return make_float2(old0 + omega*(result0-old0), old1 + omega*(result1-old1));
-"""
-FRICTION_PAIR_CUDA = (
-    """
+        return ${pair_call}(old0 + omega*(result0-old0), old1 + omega*(result1-old1));
+""")
+_FRICTION_PAIR_STATE_CUDA = _PAIR_STATE.substitute(max_call="fmaxf", pair_call="make_float2")
+_PAIR_ENTRY = Template(r"""
     const auto friction_pair_candidate = [](
         float a, float c, float d, float r0, float r1,
         float old0, float old1, float radius, float omega) {
-        if (radius <= 0.0f) return make_float2(0.0f, 0.0f);
+        if (radius <= 0.0f) return ${pair_call}(0.0f, 0.0f);
+""")
+
+
+def get_pair_source(*, cpu=False):
+    """Bind backend intrinsics around one unchanged bounded friction law."""
+    bindings = {"max_call": "wp::max" if cpu else "fmaxf", "pair_call": "wp::vec2" if cpu else "make_float2"}
+    return (
+        _PAIR_ENTRY.substitute(bindings)
+        + _PAIR_METRIC.substitute(bindings)
+        + _PAIR_STATE.substitute(bindings)
+        + r"""    };
 """
-    + _FRICTION_PAIR_METRIC_CUDA
-    + _FRICTION_PAIR_STATE_CUDA
-    + """    };
-"""
-)
+    )
+
+
+FRICTION_PAIR_CUDA = get_pair_source()
 
 # A sparse sweep can retain this metric while residuals, impulses, and radius
 # change. Both entries use exactly the same bounded root and relaxation body.

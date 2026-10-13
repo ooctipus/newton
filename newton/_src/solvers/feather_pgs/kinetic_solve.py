@@ -3,8 +3,8 @@
 
 """Original dense-eight recurrence in offset kinetic coordinates.
 
-The CUDA recurrence and independent-component metadata predicates are recovered
-from pinned original source. Only representation entry/exit and held-operator
+Shared numerical factories supply the CUDA recurrence and independent-component
+metadata predicates. Only representation entry/exit and held-operator
 qualification change. No canonical L23 or physical Y is built for private rows.
 The CUDA path orders shared-impulse publication with warp fences. Both CPU
 and CUDA use the current solver's paired tangent projection.
@@ -14,10 +14,13 @@ import functools
 
 import warp as wp
 
-from .friction import FRICTION_PAIR_CUDA
+from .friction import get_pair_source
 from .kinetic_rows_types import DenseRowOutput, RowState
 from .kinetic_solve_types import KineticMFData, KineticSolveData
 from .kinetic_types import HeldKineticOperator, KineticPlan
+
+# Retain the checked source view for the compact owner.
+FRICTION_PAIR_CUDA = get_pair_source()
 
 
 @wp.func_native(r"""
@@ -28,12 +31,6 @@ from .kinetic_types import HeldKineticOperator, KineticPlan
 #endif
 """)
 def _is_cpu() -> bool: ...
-
-
-def replace_once(source, old, new):
-    if source.count(old) != 1:
-        raise RuntimeError("Original source seam no longer unique: " + old[:80])
-    return source.replace(old, new)
 
 
 def _impulse_transaction_edits():
@@ -120,7 +117,7 @@ def cuda_recurrence():
 
 
 _CPU = (
-    FRICTION_PAIR_CUDA.replace("make_float2(", "wp::vec2(").replace("fmaxf(", "wp::max(")
+    get_pair_source(cpu=True)
     + r"""
     const int m=state.dense_count.data[world];
     if(m<0||m>192){solve.status.data[world]=1;return;}

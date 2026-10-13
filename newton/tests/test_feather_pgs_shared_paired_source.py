@@ -6,12 +6,73 @@
 import hashlib
 import inspect
 import unittest
+from unittest import mock
 
-from newton._src.solvers.feather_pgs import component_qualification, kinetic_hybrid, kinetic_solve, paired_factor_source
-from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_paired_factor_kernel
+from newton._src.solvers.feather_pgs import (
+    component_qualification,
+    friction,
+    kinetic_compact_coupled,
+    kinetic_hybrid,
+    kinetic_solve,
+    paired_factor_source,
+)
+from newton._src.solvers.feather_pgs.solver_feather_pgs import (
+    _get_pgs_solve_mf_gs_kernel,
+    _get_pgs_solve_paired_factor_kernel,
+)
 
 
 class TestSharedPairedSource(unittest.TestCase):
+    def test_compact_owner_does_not_rewrite_sibling_source(self):
+        """Preserve compact and fallback bodies through direct policy binding."""
+        kernel = _get_pgs_solve_mf_gs_kernel(
+            192,
+            64,
+            29,
+            "cpu",
+            has_drive_rows=False,
+            has_dense_velocity_limit_rows=False,
+            factor_coordinates=True,
+            independent_components=True,
+        )
+        with (
+            mock.patch.object(kinetic_solve, "cuda_recurrence", side_effect=AssertionError("sibling source")),
+            mock.patch.object(
+                kinetic_solve, "replace_once", side_effect=AssertionError("source rewriting"), create=True
+            ),
+        ):
+            source, baseline, mf_phase = kinetic_compact_coupled.compact_source(kernel)
+            fallback, _ = kinetic_compact_coupled.fallback_source(baseline)
+        self.assertEqual(
+            hashlib.sha256(source.encode()).hexdigest(),
+            "37441d9cfb9a88eff531fdae61cb0b36f05f7a88d04bbf38d657919081beda4a",
+        )
+        self.assertEqual(
+            hashlib.sha256(fallback.encode()).hexdigest(),
+            "8963b592c49eabea3681347df4f400b3722c08846bcc222258c2ce7b3ce1bcad",
+        )
+        self.assertIn(mf_phase, source)
+
+    def test_scalar_owners_share_secondary_response_policy(self):
+        """Preserve both existing CPU bodies, including converted free columns."""
+        from newton._src.solvers.feather_pgs import kinetic_coupled_cpu  # noqa: PLC0415
+
+        for converted, expected in (
+            (False, "2700160add075b99e651912cb6ffb04057248af06d6f4fb38d6a2c6985d279c3"),
+            (True, "191c1da9cfdbd4dbaa82c25dcdf85532caabe67a13bc57990b759965eb5cff8c"),
+        ):
+            with self.subTest(converted=converted):
+                source = kinetic_coupled_cpu.get_source(converted_secondary=converted)
+                self.assertEqual(hashlib.sha256(source.encode()).hexdigest(), expected)
+
+    def test_pair_intrinsics_preserve_cpu_law(self):
+        """Share the bounded friction helper with explicit backend intrinsics."""
+        self.assertEqual(
+            hashlib.sha256(friction.get_pair_source(cpu=True).encode()).hexdigest(),
+            "238560e12935fbc0a3a6fa16ade522b170194422b93a59b10a716423dcce2c57",
+        )
+        self.assertEqual(friction.get_pair_source(), friction.FRICTION_PAIR_CUDA)
+
     def test_physical_bodies_preserve_qualified_source(self):
         """Preserve complete native bodies from qualified Newton 9f17ebed."""
         cases = (

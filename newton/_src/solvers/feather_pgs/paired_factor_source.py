@@ -3,6 +3,8 @@
 
 """Share the paired GS recurrence through explicit representation entry and exit."""
 
+from string import Template
+
 from .friction import FRICTION_PAIR_CUDA
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -11,28 +13,54 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
 
-_KINETIC_ENTRY = r"""
-    const int primary_lane=lane-primary_offset,secondary_lane=lane-secondary_offset;
+_KINETIC_ENTRY_BODY = r"""    const int primary_lane=lane-primary_offset,secondary_lane=lane-secondary_offset;
     const int physical_dof=(primary_lane>=0&&primary_lane<23)?primary_lane:
         ((secondary_lane>=0&&secondary_lane<6)?23+secondary_lane:-1);
     const int global_dof=physical_dof>=0?plan.dof_ids.data[world*35+physical_dof]:-1;
     float factor_velocity=0.0f;
 """
 
+_KINETIC_ENTRY = "\n" + _KINETIC_ENTRY_BODY
 
-_KINETIC_EXIT = r"""
+
+_KINETIC_SECONDARY = r"""    for(int k=0;k<6;++k){const float du=__shfl_sync(MASK,factor_velocity,secondary_offset+k);
+        if(secondary_lane>=0&&secondary_lane<=k&&secondary_lane<6)
+            physical_output+=held.inverse6.data[secondary_group*36+k*6+secondary_lane]*du;}
+"""
+
+_KINETIC_EXIT_BODY = Template(r"""
     float physical_output=0.0f;
     for(int k=0;k<23;++k){const float du=__shfl_sync(MASK,factor_velocity,primary_offset+k);
         if(primary_lane>=0&&primary_lane<23)physical_output+=t(k,primary_lane)*du;}
-    for(int k=0;k<6;++k){const float du=__shfl_sync(MASK,factor_velocity,secondary_offset+k);
-        if(secondary_lane>=0&&secondary_lane<=k&&secondary_lane<6)
-            physical_output+=held.inverse6.data[secondary_group*36+k*6+secondary_lane]*du;}
-    const bool finite=global_dof<0||isfinite(physical_output+state.v_hat.data[global_dof]);
-    if(!__all_sync(MASK,finite)){if(lane==0)solve.status.data[world]=2;return;}
+${secondary_response}    ${finite_decl} finite=global_dof<0||isfinite(physical_output+state.v_hat.data[global_dof]);
+${finite_rows}    if(!__all_sync(MASK,finite)){if(lane==0)solve.status.data[world]=2;return;}
     if(global_dof>=0&&(!split_component||(primary_lane>=0&&primary_lane<23)))
         v_out.data[global_dof]=state.v_hat.data[global_dof]+physical_output;
     if(lane==0)solve.status.data[world]=0;
-"""
+""")
+
+
+def _kinetic_exit(compact=False):
+    """Publish primary held coordinates and the selected free-column representation."""
+    secondary = (
+        "    if(secondary_lane>=0&&secondary_lane<6)physical_output=factor_velocity;\n"
+        if compact
+        else _KINETIC_SECONDARY
+    )
+    rows = (
+        (
+            "    for(int i=lane;i<m;i+=32)finite &= isfinite(s_lam[i]);\n"
+            "    for(int i=lane;i<m_mf;i+=32)finite &= isfinite(s_lam_mf[i]);\n"
+        )
+        if compact
+        else ""
+    )
+    return _KINETIC_EXIT_BODY.substitute(
+        secondary_response=secondary, finite_decl="bool" if compact else "const bool", finite_rows=rows
+    )
+
+
+_KINETIC_EXIT = _kinetic_exit()
 
 
 _KINETIC_ALIASES = r"""
@@ -104,7 +132,21 @@ def _physical_exit(P, S, independent_components):
 """
 
 
-def get_source(M, D, P, S, *, contact_triples=False, independent_components=False, kinetic=False):
+def get_source(
+    M,
+    D,
+    P,
+    S,
+    *,
+    contact_triples=False,
+    independent_components=False,
+    kinetic=False,
+    compact=False,
+    compact_views="",
+    compact_entry="",
+    compact_sweep="",
+    compact_store="",
+):
     """Build physical or held-coordinate source without recovering a sibling definition."""
     if M <= 0 or P <= 0 or S <= 0 or P + S != D or D > 32:
         raise ValueError("paired factor source requires positive capacity and two components spanning at most 32 DOFs")
@@ -112,6 +154,10 @@ def get_source(M, D, P, S, *, contact_triples=False, independent_components=Fals
         raise ValueError("independent paired source requires the 23+6 pair")
     if kinetic and (M, D, P, S, contact_triples, independent_components) != (192, 29, 23, 6, True, False):
         raise ValueError("held kinetic source requires the 192-row 23+6 contact-triple contract")
+    if compact and (not kinetic or not all((compact_views, compact_entry, compact_sweep, compact_store))):
+        raise ValueError("Compact recurrence requires the held-coordinate contract and complete storage/phase bindings")
+    if not compact and any((compact_views, compact_entry, compact_sweep, compact_store)):
+        raise ValueError("Compact bindings require the compact representation")
     W = 2
     contact_type = int(PGS_CONSTRAINT_TYPE_CONTACT)
     friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
@@ -120,7 +166,8 @@ def get_source(M, D, P, S, *, contact_triples=False, independent_components=Fals
     fences = [""] * 6
     if kinetic:
         row_guard = "    if (m < 0 || m > 192) { if(lane==0) solve.status.data[world]=1; return; }"
-        entry, exit_code = _KINETIC_ENTRY, _KINETIC_EXIT
+        entry = "\n" + compact_entry + _KINETIC_ENTRY_BODY if compact else _KINETIC_ENTRY
+        exit_code = _kinetic_exit(compact)
         for index, indentation in enumerate(
             (
                 "                ",
@@ -142,34 +189,56 @@ def get_source(M, D, P, S, *, contact_triples=False, independent_components=Fals
         )
         entry = _physical_entry(D, P, S, independent_components)
         exit_code = _physical_exit(P, S, independent_components)
-    body = f"""    __shared__ float s_lam_storage[{W * M}];
+    storage = (
+        ""
+        if compact
+        else f"""    __shared__ float s_lam_storage[{W * M}];
     __shared__ float s_rhs_storage[{W * M}];
     __shared__ float s_diag_storage[{W * M}];
     __shared__ unsigned char s_type_storage[{W * M}];
     __shared__ float s_contact_mu_storage[{W * ((M + 2) // 3)}];
-    constexpr unsigned MASK = 0xffffffffu;
-    const int lane = threadIdx.x & 31;
-    const int world_slot = threadIdx.x >> 5;
+"""
+    )
+    views = (
+        compact_views
+        if compact
+        else f"""    float* s_lam = &s_lam_storage[world_slot * {M}];
+    float* s_rhs = &s_rhs_storage[world_slot * {M}];
+    float* s_diag = &s_diag_storage[world_slot * {M}];
+    unsigned char* s_type = &s_type_storage[world_slot * {M}];
+    float* s_contact_mu = &s_contact_mu_storage[world_slot * {((M + 2) // 3)}];
 
+"""
+    )
+    world_slot = "" if compact else "    const int world_slot = threadIdx.x >> 5;\n"
+    primary_group_by_world = "plan.primary_group" if compact else "primary_group_by_world"
+    secondary_group_by_world = "plan.secondary_group" if compact else "secondary_group_by_world"
+    primary_offset_by_world = "state.primary_offset" if compact else "primary_offset_by_world"
+    secondary_offset_by_world = "state.secondary_offset" if compact else "secondary_offset_by_world"
+    factor_rows = "rows.response" if compact else "factor_rows"
+    rhs_bias = "rows.r0" if compact else "rhs_bias"
+
+    def product(factor, row):
+        if compact:
+            return f"dense_j({row}, {factor}) * factor_velocity"
+        return f"{factor} * factor_velocity"
+
+    body = f"""{storage}    constexpr unsigned MASK = 0xffffffffu;
+    const int lane = threadIdx.x & 31;
+{world_slot}
     int m = world_constraint_count.data[world];
 {row_guard}
 
     const int off = world * {M};
     const int row_base = off * {D};
     const int dof_map_base = world * {D};
-    const int primary_group = primary_group_by_world.data[world];
-    const int secondary_group = secondary_group_by_world.data[world];
-    const int primary_offset = primary_offset_by_world.data[world];
-    const int secondary_offset = secondary_offset_by_world.data[world];
+    const int primary_group = {primary_group_by_world}.data[world];
+    const int secondary_group = {secondary_group_by_world}.data[world];
+    const int primary_offset = {primary_offset_by_world}.data[world];
+    const int secondary_offset = {secondary_offset_by_world}.data[world];
     const int primary_matrix_base = primary_group * {P * P};
     const int secondary_matrix_base = secondary_group * {S * S};
-    float* s_lam = &s_lam_storage[world_slot * {M}];
-    float* s_rhs = &s_rhs_storage[world_slot * {M}];
-    float* s_diag = &s_diag_storage[world_slot * {M}];
-    unsigned char* s_type = &s_type_storage[world_slot * {M}];
-    float* s_contact_mu = &s_contact_mu_storage[world_slot * {((M + 2) // 3)}];
-
-    int contact_start = dense_phase_bounds.data[world * 2 + 1];
+{views}    int contact_start = dense_phase_bounds.data[world * 2 + 1];
     if (contact_start < 0) contact_start = 0;
     if (contact_start > m) contact_start = m;
     const bool triple_layout = {str(bool(contact_triples)).lower()}
@@ -178,7 +247,7 @@ def get_source(M, D, P, S, *, contact_triples=False, independent_components=Fals
 
     for (int i = lane; i < m; i += 32) {{
         s_lam[i] = world_impulses.data[off + i];
-        s_rhs[i] = rhs_bias.data[off + i];
+        s_rhs[i] = {rhs_bias}.data[off + i];
         s_diag[i] = world_diag.data[off + i];
         if (!triple_layout || i < contact_start)
             s_type[i] = static_cast<unsigned char>(world_row_type.data[off + i]);
@@ -200,10 +269,10 @@ def get_source(M, D, P, S, *, contact_triples=False, independent_components=Fals
             // parent, sibling, and friction metadata for every contact row.
             for (int i = 0; i < contact_start; ++i) {{
                 const float row_factor = lane < {D}
-                    ? factor_rows.data[row_base + i * {D} + lane] : 0.0f;
+                    ? {factor_rows}.data[row_base + i * {D} + lane] : 0.0f;
                 const float denom = s_diag[i];
                 if (denom <= 0.0f) continue;
-                float sum = lane < {D} ? row_factor * factor_velocity : 0.0f;
+                float sum = lane < {D} ? {product("row_factor", "i")} : 0.0f;
                 sum += __shfl_down_sync(MASK, sum, 16);
                 sum += __shfl_down_sync(MASK, sum, 8);
                 sum += __shfl_down_sync(MASK, sum, 4);
@@ -229,8 +298,8 @@ def get_source(M, D, P, S, *, contact_triples=False, independent_components=Fals
                 const int tangent1 = normal + 1;
                 const int tangent2 = normal + 2;
                 const float normal_factor = lane < {D}
-                    ? factor_rows.data[row_base + normal * {D} + lane] : 0.0f;
-                float normal_sum = lane < {D} ? normal_factor * factor_velocity : 0.0f;
+                    ? {factor_rows}.data[row_base + normal * {D} + lane] : 0.0f;
+                float normal_sum = lane < {D} ? {product("normal_factor", "normal")} : 0.0f;
                 normal_sum += __shfl_down_sync(MASK, normal_sum, 16);
                 normal_sum += __shfl_down_sync(MASK, normal_sum, 8);
                 normal_sum += __shfl_down_sync(MASK, normal_sum, 4);
@@ -252,9 +321,9 @@ def get_source(M, D, P, S, *, contact_triples=False, independent_components=Fals
                 __syncwarp(MASK);
 
                 const float tangent1_factor = lane < {D}
-                    ? factor_rows.data[row_base + tangent1 * {D} + lane] : 0.0f;
+                    ? {factor_rows}.data[row_base + tangent1 * {D} + lane] : 0.0f;
                 const float tangent2_factor = lane < {D}
-                    ? factor_rows.data[row_base + tangent2 * {D} + lane] : 0.0f;
+                    ? {factor_rows}.data[row_base + tangent2 * {D} + lane] : 0.0f;
                 // Patch normal load: normal rows link the region's next normal (circular list, -1 ends a
                 // point contact). Solve both tangents together on the friction disk at that load.
                 float lambda_n = s_lam[normal];
@@ -277,8 +346,8 @@ def get_source(M, D, P, S, *, contact_triples=False, independent_components=Fals
                 }}
                 float2 pair = make_float2(0.0f, 0.0f);
                 if (radius > 0.0f) {{
-                    float tangent1_sum = lane < {D} ? tangent1_factor * factor_velocity : 0.0f;
-                    float tangent2_sum = lane < {D} ? tangent2_factor * factor_velocity : 0.0f;
+                    float tangent1_sum = lane < {D} ? {product("tangent1_factor", "tangent1")} : 0.0f;
+                    float tangent2_sum = lane < {D} ? {product("tangent2_factor", "tangent2")} : 0.0f;
                     float cross_sum = lane < {D} ? tangent1_factor * tangent2_factor : 0.0f;
                     for (int offset = 16; offset > 0; offset >>= 1) {{
                         tangent1_sum += __shfl_down_sync(MASK, tangent1_sum, offset);
@@ -310,12 +379,12 @@ def get_source(M, D, P, S, *, contact_triples=False, independent_components=Fals
                 __syncwarp(MASK);
             }}
         }} else {{
-        float prefetched_factor = lane < {D} ? factor_rows.data[row_base + lane] : 0.0f;
+        float prefetched_factor = lane < {D} ? {factor_rows}.data[row_base + lane] : 0.0f;
 
         for (int i = 0; i < m; ++i) {{
             const float row_factor = prefetched_factor;
             if (i + 1 < m && lane < {D})
-                prefetched_factor = factor_rows.data[row_base + (i + 1) * {D} + lane];
+                prefetched_factor = {factor_rows}.data[row_base + (i + 1) * {D} + lane];
 
             const int row_type = static_cast<int>(s_type[i]);
             if (row_type == {friction_type} && global_iter < friction_start_iteration) {{
@@ -335,12 +404,12 @@ def get_source(M, D, P, S, *, contact_triples=False, independent_components=Fals
                     continue;
                 }}
                 sibling = parent + 2;
-                sibling_factor = lane < {D} ? factor_rows.data[row_base + sibling * {D} + lane] : 0.0f;
+                sibling_factor = lane < {D} ? {factor_rows}.data[row_base + sibling * {D} + lane] : 0.0f;
             }}
 
             const float denom = s_diag[i];
             if (denom <= 0.0f && row_type != {friction_type}) continue;
-            float sum = lane < {D} ? row_factor * factor_velocity : 0.0f;
+            float sum = lane < {D} ? {product("row_factor", "i")} : 0.0f;
             sum += __shfl_down_sync(MASK, sum, 16);
             sum += __shfl_down_sync(MASK, sum, 8);
             sum += __shfl_down_sync(MASK, sum, 4);
@@ -410,12 +479,14 @@ def get_source(M, D, P, S, *, contact_triples=False, independent_components=Fals
         }}
         }}
 
-        const unsigned changed = __ballot_sync(MASK, iteration_changed != 0);
+{compact_sweep}        const unsigned changed = __ballot_sync(MASK, iteration_changed != 0);
         if (global_iter >= friction_start_iteration && changed == 0u) break;
     }}
 
 {exit_code}    for (int i = lane; i < m; i += 32) world_impulses.data[off + i] = s_lam[i];
 """
+    if compact:
+        return body + compact_store
     if kinetic:
         return FRICTION_PAIR_CUDA + _KINETIC_ALIASES + body
     return "\n#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA + "\n" + body + "#endif\n"

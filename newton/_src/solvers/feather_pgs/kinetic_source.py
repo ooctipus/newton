@@ -49,12 +49,16 @@ PINNED = {
         "make_dispatch": "7eb96a89eb255af78aa4e9e044f4b292d9957de5c49a8a390ee4a7dd6b9e3735",
     },
     "paired_factor_source.py": {
-        "_KINETIC_ENTRY": "da56d0dccf7e1e8c073f7f8056919568b6acd71e7f47be9857b6bf577375ad4b",
-        "_KINETIC_EXIT": "6a895fdf453c4b04cbaeb40e27208d660ac0d9db96afc4ef3b12fc35597a126a",
+        "_KINETIC_ENTRY": "d0e3e87dc2c8d00b76b6d77003e117c9cc452045fadbc216369e7f2c5718b899",
+        "_KINETIC_EXIT": "4ccdec0cefd6437e876a13c06f0155ee7b93b4faae9f82080d3e5d6772d41e32",
         "_KINETIC_ALIASES": "9441f2d4adb4aa4871e2f9e889c436064d60fdf3909dc6d1c10d9368c385c2df",
         "_physical_entry": "57b685e553d3b34f3a7958019b33e39d48308ac71faefeaddcda895f48f65bfb",
         "_physical_exit": "ee488b1935af525104f25aca4904ef3b26409ba9ec19baff61edef6d71966101",
-        "get_source": "b4d0a4cb89f2fed72a72bb8934e3909ba31b0ed2241e621a2cf820a2d7f233eb",
+        "get_source": "da56e5193e9af377a0b3cf5ac24755d835bef03bbb64bd5d4afd4fd1f689c3ca",
+        "_KINETIC_ENTRY_BODY": "64bbd2738a33325cebf65b1c64776a1ea5337b2b463fd4784212ce2113554c89",
+        "_KINETIC_SECONDARY": "e7f9cfe7e20fb64ca205ae7f784ba58c5f6e7a66453915d59ac60b295827b183",
+        "_KINETIC_EXIT_BODY": "c1891557a94ce2dcb4fa10c33e87cd1c048bf6517f8f8094b9ce547850219eba",
+        "_kinetic_exit": "5af90ae1908e02ff8b1a0e25b76fb861092e474b9e1f875e5f44e4fbab68cc39",
     },
     "component_qualification.py": {
         "_PHYSICAL_PUBLISH": "d7129ba2edd6a8ebf30e104f99bc690be0ba8895de53eb4590a59cf3af235e87",
@@ -168,7 +172,7 @@ PINNED = {
     "kinetic_solve.py": {
         "_T": "03521fc92b11e045c58334667f9d55afbb9bd5b353ff4f5ecc0607def94db291",
         "_GUARD": "d05f161e7bd5d18f9a6a7de858fc6a1a1b77889b64498012a73bcc6ecf9d1cc0",
-        "_CPU": "92408205c5c4295a291eb1ccd0b3b7a3a18538d0dac4b3f4949ee90aeff695d0",
+        "_CPU": "f984dc08e6af402afb0993bf9b1354214a62128cdd312e141f0565f1a41b9847",
         "_MATERIALIZE": "b76940135f6894f838e35be11ca2a88abc8365d1d610e49e5f29d3bb77eff2e3",
         "_impulse_transaction_edits": "5faa4439ad7e21d3e40bc06a6c7b54c59268ed278759264b898242e895b087b8",
         "recover_impulse_transactions": "3ba7137b8926c79662569883af2fae919af7dd9cf6fee9a6c2065e982021dd7a",
@@ -181,7 +185,7 @@ PINNED = {
     },
     "kinetic_hybrid.py": {
         "HybridCoupledData": "1a261fa76dc5207521c424ac6489a29c87c9b6a0448add39538ea356af28a078",
-        "_CPU": "c6f703863beb4837065c56bb4188a645a342e33c792308cefdb8eeb472168f84",
+        "_CPU": "f55f226460c174c7bf8cd5cb835b2fb07fe9df24e3688b4778e326de3656ae81",
         "_STAGE": "d16346c926d401515e157795d0bd348e8f8114b635d6fe0b35b5e2739c83a4e0",
         "_STORE": "7abc04f9023ba89d1a529090ce8130f89a534ba0f577464bb0c5fc2c5c9c91ec",
         "qualify_source": "9ca4cbbd9b648ca81f1dd97cf5c7adcb35ca33de3d49c0f2958c396c66c35fcc",
@@ -238,6 +242,26 @@ PINNED = {
         "_validate_dense_metadata_encoding": "cea9368fd58e2b11dc023931bf20d59ed17e512bd07213bf4377bdb7d45f42e7",
         "_validate_mf_metadata_encoding": "5cba2a7fd0f6f44fe2fb7bd0a39611d4b65560a746c83cbcba36a51083fb7b42",
         "_mf_parent_expression": "183030b9f3be65dccaeab30bf33698c73c5cc65ef1f34a124ec72ff7ae7b3a62",
+    },
+    "friction.py": {
+        "_PAIR_METRIC": "6c95081e6eade8668d063255732c8a07699f06b58cd7e5cf09d8d65ff992c380",
+        "_PAIR_STATE": "85834499a0c68b509e6067bdfefd201214a28b89215002c7fbf00a014ca33f11",
+        "_PAIR_ENTRY": "cd37230c9ccc55c127edbed5c7eff31a2201b8e1e49143f3cf14be1769298928",
+        "get_pair_source": "3f987616ed963d7f1328bb651454a2316d4a34daa767e6eb955cae115f9c467a",
+    },
+    "kinetic_coupled_cpu.py": {
+        "_HELD_SECONDARY": "a063c50e7d03497600316c8e93b8d236f32f0ce35cc0b5064c5c37e53d84ed90",
+        "_CONVERTED_SECONDARY": "dc0e950528d41df7582a7530240601437fbb496f03ee7d201d17fb21c17d967e",
+        "_BODY": "a6b96648591db6f802f4b784006ebabc31e367158f6ebe2d9a2dc9ca5aeaafa8",
+        "get_source": "4193e07bf42918d7bdfe9fd6ddaae0d0e98f06c4928f6ab9dc51fb535b225987",
+    },
+    "compact_recurrence_source.py": {
+        "_VIEWS": "d13e05e37d8ff9d5ed05c3d4ab23db479acedfe72d3997cdc616114c91e3894b",
+        "_ENTRY": "ef3aa07eaf07e5208791ff8dce0fba4bef123db9da06eecf434de09a0799e69e",
+        "_BEFORE_MF": "c6098c11f6c7e1e59f36945999ecae249df2641684880be6322621d0a4b4c993",
+        "_AFTER_MF": "9eb479c02ff7b970db8d8db730dc3ba780b8660d608fbf2ef2bba682396f6490",
+        "_STORE_MF": "fc59072d93cc2d1f3b13f81fe35c4254dcca8bb578f453705cdedc7c62d177e7",
+        "get_source": "9a66807e1bbce49afada1a7e127e728797cdfa62cd92157763a613762c766c0b",
     },
 }
 
