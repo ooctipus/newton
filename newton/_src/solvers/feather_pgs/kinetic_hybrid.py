@@ -13,13 +13,11 @@ MF0/independent ownership and the complete caller stream joins remain unchanged.
 
 import functools
 import inspect
-import re
 
 import warp as wp
 
 from . import kinetic_guard as guards
 from . import kinetic_solve as original
-from . import solver_feather_pgs as solver
 from .kinetic_rows_types import DenseRowOutput, RowState
 from .kinetic_solve_types import KineticMFData, KineticSolveData
 from .kinetic_source import checked_definitions
@@ -55,6 +53,19 @@ def allocate_hybrid(worlds, mf_impulses, mf_contact_end, device):
 
 def _pin():
     """Check only the retained representation and original kernel factories."""
+    checked_definitions("mf_gs_source.py", ("GeneratedSource", "get_source"))
+    checked_definitions(
+        "row_metadata.py",
+        (
+            "_DENSE_META_ROW_TYPE_BITS",
+            "_DENSE_META_ROW_TYPE_MASK",
+            "_DENSE_META_MAX_PARENT",
+            "_MF_META_MAX_CAPACITY",
+            "_validate_dense_metadata_encoding",
+            "_validate_mf_metadata_encoding",
+            "_mf_parent_expression",
+        ),
+    )
     checked_definitions(
         "mf_dispatch.py",
         ("_NATIVE_ARGUMENTS", "_QUEUE_ARGUMENTS", "_compile", "_signature", "make_native", "make_dispatch"),
@@ -212,12 +223,11 @@ _STORE = r"""
 """
 
 
-def general_source(original_kernel):
-    """Recover the exact generic recurrence and change only its representation."""
-    _pin()
-    native = inspect.getclosurevars(original_kernel.func).nonlocals["pgs_solve_mf_gs_native"]
-    baseline = native.native_snippet
-    expected = solver._get_pgs_solve_mf_gs_kernel(
+def _fixed_source(*, held=False, cpu=False, shared_arena=False):
+    """Build the admitted recipe directly from common numerical source."""
+    from .mf_gs_source import get_source  # noqa: PLC0415
+
+    return get_source(
         192,
         64,
         29,
@@ -226,55 +236,19 @@ def general_source(original_kernel):
         has_dense_velocity_limit_rows=False,
         factor_coordinates=True,
         independent_components=True,
+        held_policy=(original._T, _STAGE, _STORE) if held else None,
+        shared_arena=shared_arena,
+        cpu_body=original._T + _CPU if cpu else "",
     )
-    expected_native = inspect.getclosurevars(expected.func).nonlocals["pgs_solve_mf_gs_native"]
-    if baseline != expected_native.native_snippet:
+
+
+def general_source(original_kernel):
+    """Check the retained recipe and bind explicit held-coordinate policies."""
+    _pin()
+    expected = _fixed_source().native
+    if original_kernel.mf_native.native_snippet != expected:
         raise ValueError("Hybrid requires the exact original fixed generic recipe")
-    source, edits = baseline, []
-
-    def change(old, new, count=1):
-        nonlocal source
-        if source.count(old) != count:
-            raise RuntimeError("General source seam changed: " + old[:90])
-        source = source.replace(old, new)
-        edits.append((old, new, count))
-
-    for array, function in (("J_world", "hybrid_j"), ("Y_world", "hybrid_y")):
-        for expression in sorted(set(re.findall(r"\b" + array + r"\.data\[([^\]]+)\]", source))):
-            old = array + ".data[" + expression + "]"
-            change(old, function + "(" + expression + ")", source.count(old))
-    change("    int lane = threadIdx.x;", "    int lane = threadIdx.x;\n" + original._T)
-    change("    if (m_mf == 0) return;", "    if (m_mf == 0) return;\n" + _STAGE)
-    change(
-        "s_rhs_dense[i] = rhs_bias.data[off_dense + i];",
-        "s_rhs_dense[i] = rows.r0.data[off_dense + i];",
-    )
-    old = "s_v[d] = global_dof >= 0 && (!split_component || (d >= component_offset && d < component_offset + 6)) ? v_out.data[global_dof] : 0.0f;"
-    change(old, "s_v[d] = 0.0f;")
-    # MF reads physical free velocities, never the held dense inverse action.
-    for expression, base in (
-        ("dof_a + lane", "lane"),
-        ("dof_b + lane - 6", "lane - 6"),
-    ):
-        old = "* s_v[" + expression + "]"
-        change(
-            old,
-            "* (s_v[" + expression + "] + hybrid_base[" + base + "])",
-            source.count(old),
-        )
-    old = """    for (int d = lane; d < 29; d += 32) {
-        int global_dof = world_dof_indices.data[dof_map_base + d];
-        if (global_dof >= 0 && (!split_component || (d >= component_offset && d < component_offset + 6))) v_out.data[global_dof] = s_v[d];
-    }"""
-    change(old, _STORE)
-    recovered = source
-    for old, new, count in reversed(edits):
-        if recovered.count(new) != count:
-            raise RuntimeError("Ambiguous reverse source seam")
-        recovered = recovered.replace(new, old)
-    if recovered != baseline:
-        raise RuntimeError("Representation removal did not recover exact original")
-    return source, baseline, edits
+    return _fixed_source(held=True).native, expected, []
 
 
 _CPU = (
@@ -420,7 +394,7 @@ _CPU = (
 def get_general_kernel(original_kernel):
     """Bind guarded general dispatch to mutually exclusive shared owners."""
     source, baseline, edits = general_source(original_kernel)
-    source = source.rsplit("#endif", 1)[0] + "#else\n" + original._T + _CPU + "\n#endif\n"
+    source = _fixed_source(held=True, cpu=True).native
     extra = {
         "plan": KineticPlan,
         "held": HeldKineticOperator,

@@ -69,7 +69,7 @@ PINNED = {
     },
     "solver_feather_pgs.py": {
         "_get_pgs_solve_paired_factor_kernel": "e417ffcc1bd6dbae775e3fdd6943033bc27af1f46b1ec4ca28e1c7677d8d2bd6",
-        "_get_pgs_solve_mf_gs_kernel": "6fae700b63982a3d474a90243c27932be7d1ff654d3245495b62665302e07ef5",
+        "_get_pgs_solve_mf_gs_kernel": "35602b2592d4131f24f31518c17ccd5275684b81502311ee2faaabf1e10d9dd5",
         "_get_crba_cholesky_warp_kernel": "f507209b4a71155f75aa86a783241723e1370c41a0c262744c020bfc224969de",
         "_get_inverse_cholesky_register_kernel": "f1f2c60767d69d8006fb074c768877b921579954b7d36bc1efee9366212234d3",
         "_get_cholesky_kernel": "c262785fdd51c25f94c3c67ab4bb4cbe0fa95f16b61adcb788fbd16de10a4689",
@@ -80,8 +80,6 @@ PINNED = {
     },
     "kernels.py": {
         "_contact_allocator": "691354a0e712447d8ed88bb4021cc75b720b2c9a597689b4661730b8423a1a09",
-        # Rebased adapters preserve monotone reservations and bind patch-aware kernels
-        # only with point-friction inputs; these pins do not admit patch ownership.
         "_allocate_world_contact_slot": "0e908992c5b8a236538cd9f07c7d92a4205df1d5e07fedcf81f51699285d7722",
         "allocate_world_contact_slots": "fc7bd52682bb252393da31ce2bc307bd40ce5a9db13101b4c3dad6171aeda789",
         "allocate_rigid_velocity_limit_slots": "0c85ccc6a10fb4a59099870574929fe80c8a8b21480a3d91d02f6671c2d195fa",
@@ -187,10 +185,11 @@ PINNED = {
         "_STAGE": "d16346c926d401515e157795d0bd348e8f8114b635d6fe0b35b5e2739c83a4e0",
         "_STORE": "7abc04f9023ba89d1a529090ce8130f89a534ba0f577464bb0c5fc2c5c9c91ec",
         "qualify_source": "9ca4cbbd9b648ca81f1dd97cf5c7adcb35ca33de3d49c0f2958c396c66c35fcc",
-        "general_source": "1647884f80ae7da11bf1dd2fa29cef11835d6b825062cad4328e3651a8066b85",
+        "general_source": "12dc88d4e7a753063ef1d279adbdecd1caaeeade0790c59f140fdf018eac519e",
         "get_qualify_kernel": "f524aab764befe22c841faf9b1b0e52a5cc3a8e47d7d0316ecc0179d99c8a7be",
         "get_materialize_kernel": "8deeca3844d44e771c2d7f69b8a0dc6481c096f8b2c23fa94f5926f457d2369c",
-        "get_general_kernel": "1d173139e1fbd5e5c3f955629eb09c2e1fb3d71dd306bd0cdb18a817b2388ebc",
+        "get_general_kernel": "6f30f0f656fd0484b4633f4a873612e9468c84ebe3d319c81882fd65d88b1ac2",
+        "_fixed_source": "31b86b191c1c517ccbb36bb13cac5e2e8c097ed364c080d0ba74af511f2f69ec",
     },
     "cached_state.py": {
         "_INTEGRATION": "33f3c5af040aa39de98421346673484f257af0bd542d68b4098137e204c65457",
@@ -226,6 +225,19 @@ PINNED = {
         "_FREE": "8762eec1647003ef05ce924e1c27b7cd83970c3cb4f7faef08503b9867fe15f1",
         "_VALIDATION": "d21c270703aea141df92685d4d69ae9d9158ad34ed0a13d6ac5c5ae3f9f3e71c",
         "get_source": "14dce3fc0e8017e050e26483f302632279ed8ebeacf2cff0e7b767c1ca35e85f",
+    },
+    "mf_gs_source.py": {
+        "GeneratedSource": "e7ab064517dd2cdfee617fb913870e0bb880abfc0836853b58ca3a5928f13447",
+        "get_source": "4722e11f7da73a5e1cbfb7dbd237658085faccef2db9e399013cf17ba618c6a2",
+    },
+    "row_metadata.py": {
+        "_DENSE_META_ROW_TYPE_BITS": "79f563eb47c41c43a1cec63cfe314f58b65e63352b7bc4fcec1e786dc52db61e",
+        "_DENSE_META_ROW_TYPE_MASK": "1fb8afd3532aa05d0456dfc05907c938e658ac18978f196b3a18c25735fae445",
+        "_DENSE_META_MAX_PARENT": "f0353f388c94e472cc50bbd521a7881bdae80811fcbed5ef678cf25d374078a7",
+        "_MF_META_MAX_CAPACITY": "c0469c6b148f38bd136f0d1ccda93d11a9e8145a9d0daecd42a4e0ea32c734b2",
+        "_validate_dense_metadata_encoding": "cea9368fd58e2b11dc023931bf20d59ed17e512bd07213bf4377bdb7d45f42e7",
+        "_validate_mf_metadata_encoding": "5cba2a7fd0f6f44fe2fb7bd0a39611d4b65560a746c83cbcba36a51083fb7b42",
+        "_mf_parent_expression": "183030b9f3be65dccaeab30bf33698c73c5cc65ef1f34a124ec72ff7ae7b3a62",
     },
 }
 
