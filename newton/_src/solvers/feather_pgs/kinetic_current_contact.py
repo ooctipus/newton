@@ -16,7 +16,15 @@ from types import SimpleNamespace
 
 import warp as wp
 
-from . import contact_normal, kernels, kinetic_allocate, kinetic_rows, kinetic_rows_triplet, kinetic_zero
+from . import (
+    contact_geometry_source,
+    contact_normal,
+    kernels,
+    kinetic_allocate,
+    kinetic_rows,
+    kinetic_rows_triplet,
+    kinetic_zero,
+)
 from . import kuka_joint_world as light
 from . import simple_world as simple
 from .kinetic_rows_types import ArmMap, DenseRowOutput, PrefixInput, RawRowInput, RowSettings, RowState
@@ -332,39 +340,7 @@ def get_allocate_kernel(arch):
 
 
 def _stage_source():
-    source = kinetic_rows_triplet._PRELUDE
-    begin, end = (
-        source.index("        if(lane==0){\n            const auto n="),
-        source.index("        sync();const int nr="),
-    )
-    source = source[begin:end]
-    source = _replace(source, "        if(lane==0){", "        {")
-    source = _replace(
-        source,
-        "            const auto xa=(ba>=0?wp::transform_point(raw.body_q.data[ba],raw.point0.data[c]):raw.point0.data[c])-n*raw.margin0.data[c];",
-        "            const auto xa=wp::vec3(s[67],s[68],s[69]);",
-    )
-    source = _replace(
-        source,
-        "            const auto xb=(bb>=0?wp::transform_point(raw.body_q.data[bb],raw.point1.data[c]):raw.point1.data[c])+n*raw.margin1.data[c];",
-        "            const auto xb=wp::vec3(s[70],s[71],s[72]);",
-    )
-    source = _replace(
-        source,
-        "            for(int k=0;k<3;++k){s[64+k]=n[k];s[67+k]=xa[k];s[70+k]=xb[k];s[73+k]=t0[k];s[76+k]=t1[k];}",
-        "            for(int k=0;k<3;++k){s[73+k]=t0[k];s[76+k]=t1[k];}",
-    )
-    source = _replace(source, "const float phi=wp::dot(n,xa-xb);", "const float phi=s[79];")
-    # Address row-local metadata with its original indices; pointer arithmetic
-    # remains within the actual allocated row (no before-object pointer).
-    import re  # noqa: PLC0415 -- source adaptation only
-
-    source = re.sub(r"s\[(\d+)([+\]])", lambda match: f"s[{int(match[1]) - 64}{match[2]}", source)
-    return (
-        "    float* s=cache.values.data+c*20;\n"
-        "    const int sa=raw.shape0.data[c],sb=raw.shape1.data[c];\n"
-        "    const int aa=raw.art_a.data[c],ab=raw.art_b.data[c];\n" + source
-    )
+    return contact_geometry_source.get_stage_source()
 
 
 @wp.func_native(_stage_source())
@@ -372,20 +348,9 @@ def _stage_row(c: int, count: int, cache: ContactGeometry, raw: RawRowInput, set
 
 
 def _contact_source():
-    source = kinetic_rows_triplet._PRELUDE
-    source = _replace(
-        source,
-        "        const int ba=sa>=0?raw.shape_body.data[sa]:-1,bb=sb>=0?raw.shape_body.data[sb]:-1;",
-        "        const int ba=cache.bodies.data[c*2],bb=cache.bodies.data[c*2+1];",
+    return (
+        contact_geometry_source.get_prelude(kinetic_rows._COMMON, cached_geometry=True) + kinetic_rows_triplet._TRIPLET
     )
-    begin, end = (
-        source.index("        if(lane==0){\n            const auto n="),
-        source.index("        sync();const int nr="),
-    )
-    source = (
-        source[:begin] + "        for(int k=lane;k<20;k+=stride)s[64+k]=cache.values.data[c*20+k];\n" + source[end:]
-    )
-    return source + kinetic_rows_triplet._TRIPLET
 
 
 @wp.func_native(_contact_source())

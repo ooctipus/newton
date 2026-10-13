@@ -14,6 +14,7 @@ import inspect
 
 import warp as wp
 
+from . import contact_geometry_source
 from . import kinetic_rows as original
 from .kinetic_rows_types import (
     ArmMap,
@@ -25,12 +26,9 @@ from .kinetic_rows_types import (
 from .kinetic_source import checked_definitions
 from .kinetic_types import CurrentKineticCache, HeldKineticOperator, KineticPlan
 
-checked_definitions("kinetic_rows.py", ("_CONTACT", "_t", "_lane", "_release"))
+checked_definitions("kinetic_rows.py", ("_COMMON", "_CONTACT", "_t", "_lane", "_release"))
 
-_MARKER = "        for(int component=0;component<nr;++component){"
-if original._CONTACT.count(_MARKER) != 1:
-    raise RuntimeError("Original contact direction-loop seam changed")
-_PRELUDE = original._CONTACT.split(_MARKER)[0]
+_PRELUDE = contact_geometry_source.get_prelude(original._COMMON)
 
 
 # Existing prelude uses s[64:84]. J is component-major s[96:189], Z s[192:285].

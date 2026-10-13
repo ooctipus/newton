@@ -16,6 +16,14 @@ import hashlib
 from pathlib import Path
 
 PINNED = {
+    "contact_geometry_source.py": {
+        "_TRAVERSAL": "cb890e6ce2c0bd03bb710bc0a4bc5372cf563c4f9a8262daa0ba8a2d0fe4e53d",
+        "_GEOMETRY": "fe0713e3b226fd7a47c6525c1f1648f838bb60ef6a9b05ff29cbdb4adb47a2af",
+        "_check": "b4e5d25f276c6385a72478f47330d687ddc4f59987625ae53961f1011d773ff3",
+        "get_geometry_source": "92c8ac5ce8c8aa4c6fcaf7d9cb1a35279f307eb9fb7350046ce291206b862cd1",
+        "get_prelude": "9e29b02be9aa05dc5384587ac5f7807bc3766129c15fe5db1d66b68270fa40db",
+        "get_stage_source": "7b073a856cb21f13120e53b25d10741215524a9391427c5baf86d01e3a7f682e",
+    },
     "mf_dispatch.py": {
         "_NATIVE_ARGUMENTS": "795a55f6b5227fce9bba9d2df228dc0560ba344eb9e4da0227cb17684d59d28f",
         "_QUEUE_ARGUMENTS": "a3dce18c710b83d8747e3b4306183bcdf73a1cccf5c03913816ae1492dc9e947",
@@ -128,7 +136,8 @@ PINNED = {
         "validate_raw_world_contacts": "a26ca8b7ba1500e57584909ed34b1ec6e2d6d9e14f07351fea59e7073a1a4eb8",
     },
     "kinetic_rows.py": {
-        "_CONTACT": "714f5417831f89d2cd36413150e95156620ba7e5b78fedbab8e48210cef1f5c3",
+        "_COMMON": "f46f089322434993a28cb07f076ad5c49a0698caba5797d706e6e3b8a6136fa3",
+        "_CONTACT": "492e73fdab5f9875525c8f3e2752459c4b7d3b655e63ff6b26d5c7fbc27bc61d",
         "_t": "bac2d4805d420caba82de9e39ed1d5a3c33014f5c4fbbab9ce2d26bf6ade53ec",
         "_lane": "2612cc789289f0770732f9d03fb5575e8f29004133291745a61b5ab210c63636",
         "_release": "58af3211560e7d4d26ca0b40e25d635e5ede62aec31568d600430a159fcb2715",
