@@ -124,7 +124,7 @@ PINNED = {
         "_release": "58af3211560e7d4d26ca0b40e25d635e5ede62aec31568d600430a159fcb2715",
     },
     "kinetic_state.py": {
-        "_get_kernel": "778f494967f88266050fccae1b53725f169ecf1447d807129a09cceed1ce30a0",
+        "_get_kernel": "b1804a99bdb0277de1c38e520b036970de88ded39f639c0bf8e21b2a6cdf0c01",
         "_world_gravity": "faffbf54ec341a09a0d99b459e6efe0956cc7b19026f6574c1bd3c99dc89806f",
         "_admit": "dad7435af0211e5b06822534a1003187a90f54ea997e4b20d5a52e123c85fe87",
         "_collect": "2c197cfa06bc5bbfeff5aa381ab6a7f594f61642a8b9bda765c4174e7dc1d6f6",

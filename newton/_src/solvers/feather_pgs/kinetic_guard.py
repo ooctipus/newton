@@ -197,28 +197,6 @@ def _compile(kernel, kind):
         )
         parent = next(node for node in ast.walk(recovery) if target in getattr(node, "body", []))
         parent.body[parent.body.index(target)] = target.body[0]
-    elif kind == "finish":
-        targets = [
-            (index, node)
-            for index, node in enumerate(function.body)
-            if isinstance(node, ast.If)
-            and any(isinstance(item, ast.Name) and item.id == "_admit" for item in ast.walk(node.test))
-        ]
-        if len(targets) != 1:
-            raise RuntimeError("Original finish admission seam changed")
-        index, _ = targets[0]
-        injected = ast.parse(
-            "if _guard_world_check(world, guard) != 0:\n"
-            "    if lane == 0:\n"
-            "        current.valid[world] = 0\n"
-            "        if schedule.geometry_requested[world] != 0:\n"
-            "            geometric.valid[world] = 0\n"
-            "        schedule.status[world] = 3\n"
-            "    return\n"
-        ).body[0]
-        function.body.insert(index, injected)
-        recovery = copy.deepcopy(function)
-        del recovery.body[index]
     else:
         raise ValueError("Unknown checked adapter kind")
     recovery.name = name
@@ -254,4 +232,4 @@ def get_general_kernel(original_kernel):
 def get_finish_kernel(arch):
     """Original five-argument next-state finish plus BoundaryGuard last."""
     checked_definitions("kinetic_state.py", ("_get_kernel", "_admit", "_collect", "_COLLECT", "_primary_terms"))
-    return _compile(kinetic_state.get_finish_kernel(arch), "finish")
+    return kinetic_state.get_guarded_finish_kernel(arch)

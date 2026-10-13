@@ -390,6 +390,10 @@ def source_oracle():
             for node in ast.walk(tree):
                 if isinstance(node, ast.FunctionDef):
                     node.decorator_list = []
+            if label == "kinetic_guard/get_finish_kernel":
+                # The shared state factory preserves the dispatch body and ABI;
+                # the retired wrapper contributed only this generated name.
+                tree.body[0].name = "kinetic_state_boundary_guarded"
             if label == "kinetic_allocate/initialize_count":
                 allocation_before_rebase(tree.body[0])
             if label in WORLD_GRAVITY_PYTHON:

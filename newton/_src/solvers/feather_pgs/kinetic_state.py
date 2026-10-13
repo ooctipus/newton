@@ -370,23 +370,48 @@ def _collect(
 
 
 @functools.cache
-def _get_kernel(arch, finish):
+def _get_kernel(arch, finish, entry="plain"):
     """Bind the complete forest to compact moments and guarded cache lifetime."""
     checked_source()
+    signature = "plan: KineticPlan, data: PublicationData, schedule: KineticSchedule, current: CurrentKineticCache, geometric: GeometricCache"
+    namespace = globals()
+    entry_setup = ""
+    if entry == "repair" and not finish:
+        signature += ", repair: wp.array[int]"
+        entry_setup = "if repair[world] == 0:\n    return\n"
+    elif entry == "guarded_finish" and finish:
+        from .kinetic_guard import BoundaryGuard, _guard_world_check  # noqa: PLC0415
+
+        signature += ", guard: BoundaryGuard"
+        namespace = dict(namespace, BoundaryGuard=BoundaryGuard, _guard_world_check=_guard_world_check)
+        entry_setup = """
+if _guard_world_check(world, guard) != 0:
+    if lane == 0:
+        current.valid[world] = 0
+        if schedule.geometry_requested[world] != 0:
+            geometric.valid[world] = 0
+        schedule.status[world] = 3
+    return
+"""
+    elif entry != "plain":
+        raise ValueError("Entry policy does not match the state operation")
     return make_forest_state(
         "kinetic_state",
-        globals(),
+        namespace,
         finish=finish,
         primary_bodies=30,
         free_roots=2,
         dofs=35,
-        signature="plan: KineticPlan, data: PublicationData, schedule: KineticSchedule, current: CurrentKineticCache, geometric: GeometricCache",
+        signature=signature,
         setup="""
 world, logical_lane = wp.tid()
 lanes = _lane()
 lane, stride = lanes[0], lanes[1]
 if stride == 1 and logical_lane != 0:
     return
+"""
+        + entry_setup
+        + """
 if _admit(world, int(wp.static(finish)), plan, data, schedule, current, geometric) == 0:
     return
 data.gravity = _world_gravity(data.gravity, world)
@@ -436,3 +461,13 @@ def get_construct_kernel(arch):
 def get_finish_kernel(arch):
     """Advance all35 physical DOFs and publish complete next private/public state."""
     return _get_kernel(arch, True)
+
+
+def get_repair_kernel(arch):
+    """Construct only explicitly requested worlds before reading their plans."""
+    return _get_kernel(arch, False, "repair")
+
+
+def get_guarded_finish_kernel(arch):
+    """Publish next state only after the complete world's boundary checks pass."""
+    return _get_kernel(arch, True, "guarded_finish")

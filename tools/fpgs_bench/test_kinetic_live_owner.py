@@ -4,6 +4,10 @@
 
 """Exercise device lifecycle decisions without captured state or CUDA work."""
 
+import ast
+import hashlib
+import inspect
+import textwrap
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -14,6 +18,38 @@ import warp as wp
 
 class TestKineticLiveOwner(unittest.TestCase):
     """Check state generations, repair, and held-only canonical conversion."""
+
+    def test_state_factory_owns_entry_policies(self):
+        """Bind repair and guarded finish without rewriting generated kernels."""
+        from newton._src.solvers.feather_pgs import kinetic_guard, kinetic_live_owner, kinetic_state
+
+        for arch in ("cpu", "120"):
+            with self.subTest(arch=arch):
+                self.assertIs(kinetic_live_owner.get_repair_kernel(arch), kinetic_state.get_repair_kernel(arch))
+                self.assertIs(kinetic_guard.get_finish_kernel(arch), kinetic_state.get_guarded_finish_kernel(arch))
+
+    def test_state_entry_arithmetic_and_abi_match_retained_source(self):
+        """Match complete entry ASTs captured from e553a984 before retirement."""
+        from newton._src.solvers.feather_pgs import kinetic_state
+
+        factories = (
+            (kinetic_state.get_construct_kernel, "1356babcbae87d8ea29c87e7c98642a377d1f8ede48f24c7c7370bb1b3bedf45"),
+            (kinetic_state.get_finish_kernel, "1356babcbae87d8ea29c87e7c98642a377d1f8ede48f24c7c7370bb1b3bedf45"),
+            (
+                kinetic_state.get_guarded_finish_kernel,
+                "9cbdfee66b0f279c4c68d59b788999896fc8d212ac85e1fd9985f198793860f4",
+            ),
+            (kinetic_state.get_repair_kernel, "def82c11f94629d2fb00d4282e1f3889241f2b909f8044802679e728ac613bde"),
+        )
+        for arch in ("cpu", "120"):
+            for factory, expected in factories:
+                with self.subTest(arch=arch, factory=factory.__name__):
+                    kernel = factory(arch)
+                    node = ast.parse(textwrap.dedent(inspect.getsource(kernel.func))).body[0]
+                    node.name = "state_entry"
+                    node.decorator_list = []
+                    digest = hashlib.sha256(ast.dump(node, include_attributes=False).encode()).hexdigest()
+                    self.assertEqual(digest, expected)
 
     def test_pingpong_first_capture_allocates_no_device_storage(self):
         """Bind the two actual states and both call directions from eager storage."""
@@ -244,7 +280,7 @@ class TestKineticLiveOwner(unittest.TestCase):
         from newton._src.solvers.feather_pgs import kinetic_state, kinetic_types
 
         kernel = owner.get_repair_kernel("None")
-        self.assertEqual(kernel.repair_original_ast, kernel.repair_recovered_ast)
+        self.assertIs(kernel, kinetic_state.get_repair_kernel("None"))
         wp.launch_tiled(
             kernel,
             dim=[3],

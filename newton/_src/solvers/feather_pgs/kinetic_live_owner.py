@@ -8,14 +8,8 @@ Unsupported cold calls remain original. A change of contract after admission
 requires eager held-factor demotion, or recapture before any private writes.
 """
 
-import ast
-import copy
 import functools
-import hashlib
-import inspect
-import linecache
 import math
-import textwrap
 from types import SimpleNamespace
 
 import numpy as np
@@ -231,45 +225,10 @@ def get_demotion_kernel():
 
 @functools.cache
 def get_repair_kernel(arch):
-    """Add a world-uniform entry guard and recover the original constructor AST."""
+    """Bind the shared constructor's world-uniform repair entry policy."""
     from . import kinetic_state  # noqa: PLC0415
 
-    original_kernel = kinetic_state.get_construct_kernel(arch)
-    function = ast.parse(textwrap.dedent(inspect.getsource(original_kernel.func))).body[0]
-    function.decorator_list = []
-    original_ast = ast.dump(function, include_attributes=False)
-    original_name = function.name
-    function.name += "_live_repair"
-    function.args.args.append(ast.arg(arg="repair", annotation=ast.parse("wp.array[int]", mode="eval").body))
-    candidates = [
-        index
-        for index, node in enumerate(function.body)
-        if isinstance(node, ast.If)
-        and any(isinstance(item, ast.Name) and item.id == "_admit" for item in ast.walk(node.test))
-    ]
-    if len(candidates) != 1:
-        raise RuntimeError("Kinetic constructor admission seam changed")
-    index = candidates[0]
-    function.body.insert(index, ast.parse("if repair[world] == 0:\n    return\n").body[0])
-    recovered = copy.deepcopy(function)
-    del recovered.body[index]
-    recovered.name = original_name
-    recovered.args.args.pop()
-    if ast.dump(recovered, include_attributes=False) != original_ast:
-        raise RuntimeError("Repair guard altered original constructor arithmetic")
-    tree = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
-    source = ast.unparse(tree) + "\n"
-    filename = "<kinetic-live-repair-" + hashlib.sha256(source.encode()).hexdigest() + ">"
-    linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)
-    namespace = dict(original_kernel.func.__globals__)
-    closure = inspect.getclosurevars(original_kernel.func)
-    namespace.update(closure.globals)
-    namespace.update(closure.nonlocals)
-    exec(compile(source, filename, "exec"), namespace)  # Exact AST recovery is checked above.
-    result = wp.kernel(namespace[function.name], module="unique", enable_backward=False)
-    result.repair_original_ast = original_ast
-    result.repair_recovered_ast = ast.dump(recovered, include_attributes=False)
-    return result
+    return kinetic_state.get_repair_kernel(arch)
 
 
 def _disjoint_states(state_in, state_out):
