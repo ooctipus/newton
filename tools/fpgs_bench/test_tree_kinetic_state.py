@@ -159,8 +159,8 @@ class TestTreePhysicalCPU(unittest.TestCase):
 
 
 class TestTreePhysicalCUDA(TestTreePhysicalCPU):
-    def test_default_admission_and_velocity_fallback(self):
-        """Select complete native trees without requiring an environment opt-in."""
+    def test_default_admission_and_motion_velocity(self):
+        """Select native trees and their explicit prescaled-velocity contract."""
         if not wp.get_cuda_devices():
             self.skipTest("No leased CUDA device")
         with patch.dict(os.environ):
@@ -171,8 +171,12 @@ class TestTreePhysicalCUDA(TestTreePhysicalCPU):
             self.assertIsNotNone(case[1]._tree_kinetic_state)
             self.assertTrue(case[1]._tree_kinetic_state.chain_scan)
             self.assertEqual(case[1]._tree_kinetic_state.block_dim, 32)
-            ordinary = split._solver(case[0], True, pgs_mode="matrix_free", enable_joint_velocity_limits=True)
-            self.assertIsNone(ordinary._tree_kinetic_state)
+            ordinary = split._solver(
+                case[0], True, pgs_mode="matrix_free", pgs_kernel="auto", enable_joint_velocity_limits=True
+            )
+            self.assertIsNotNone(ordinary._tree_kinetic_state)
+            self.assertTrue(ordinary._tree_kinetic_state.motion_velocity)
+            self.assertTrue(ordinary._fk_id_cache_enabled)
             os.environ["FEATHER_PGS_TREE_KINETIC_STATE"] = "0"
             explicit = split._solver(case[0], True)
             self.assertIsNone(explicit._tree_kinetic_state)

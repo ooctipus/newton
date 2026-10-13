@@ -116,6 +116,8 @@ def _solver(model, enabled, **overrides):
         "double_buffer": False,
         "update_mass_matrix_interval": 2,
     }
+    if overrides.get("pgs_mode") == "matrix_free" and "pgs_kernel" not in overrides:
+        options["pgs_kernel"] = "auto"
     options.update(overrides)
     with mock.patch.dict(os.environ, {"FEATHER_PGS_SPARSE_SPLIT": str(int(enabled))}):
         return SolverFeatherPGS(model, **options)

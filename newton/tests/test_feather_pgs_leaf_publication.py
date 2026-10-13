@@ -151,7 +151,7 @@ def _solver(model, *, enabled, mode="split", velocity_limits=False):
     solver = SolverFeatherPGS(
         model,
         pgs_mode=mode,
-        pgs_kernel="loop",
+        pgs_kernel="auto" if mode == "matrix_free" else "loop",
         pgs_iterations=8,
         update_mass_matrix_interval=2,
         use_parallel_streams=False,
