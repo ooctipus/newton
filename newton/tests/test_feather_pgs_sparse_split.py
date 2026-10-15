@@ -168,7 +168,6 @@ class TestSparseSplitAdmission(unittest.TestCase):
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
         cases = (
             ("default", {}, "0"),
-            ("warmstart", {"pgs_warmstart": True}, "1"),
             ("patches", {"_friction_anchors_enabled": True}, "1"),
             ("velocity_limits", {"enable_joint_velocity_limits": True}, "1"),
             ("free_response", {"_has_free_rigid_bodies": True}, "1"),
@@ -364,15 +363,18 @@ class TestSparseSplitPhysics(unittest.TestCase):
                     np.testing.assert_array_equal(getattr(owner.data, name).numpy(), values)
 
     def test_unsupported_actual_models_and_seeded_modes_fall_back(self):
-        """Keep dense allocation for mixed, prescribed and carried-impulse recipes."""
+        """Keep dense allocation for mixed and prescribed recipes; carried impulses are admitted."""
         model = _model()
-        for overrides in ({"pgs_warmstart": True}, {"friction_anchor_beta": 0.2}):
-            with self.subTest(overrides=overrides):
-                solver = _solver(model, True, **overrides)
-                self.assertFalse(solver._sparse_split)
-                self.assertIsNone(solver._sparse_mass_matrix_size)
-                self.assertIsNotNone(solver.C)
-                self.assertEqual(solver.pgs_mode, "split")
+        solver = _solver(model, True, friction_anchor_beta=0.2)
+        self.assertFalse(solver._sparse_split)
+        self.assertIsNone(solver._sparse_mass_matrix_size)
+        self.assertIsNotNone(solver.C)
+        self.assertEqual(solver.pgs_mode, "split")
+        # Warm start seeds the sparse factor delta from the carried impulses (no free bodies here).
+        warm = _solver(model, True, pgs_warmstart=True)
+        self.assertTrue(warm._sparse_split)
+        self.assertIsNotNone(warm._sparse_mass_matrix_size)
+        self.assertTrue(warm._pgs_solve_sparse_kernel.key.endswith("_warm_start"))
         with self.assertRaises(NotImplementedError):
             _solver(model, True, enable_joint_velocity_limits=True)
         for kwargs in ({"free_count": 1}, {"robot_count": 2}, {"prescribed": True}):

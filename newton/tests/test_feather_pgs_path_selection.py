@@ -57,7 +57,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         cases = (
             ({"sparse_mass_matrix": "off"}, "Explicit"),
             ({"trisolve_kernel": "loop"}, "explicit dense"),
-            ({"pgs_warmstart": True}, "warm"),
             ({"dense_max_constraints": 2048}, "shared memory"),
         )
         for options, expected in cases:
@@ -142,8 +141,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(solver.get_path_selection()["cached_dynamics"], "off")
 
     @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
-    def test_cached_dynamics_rejects_incomplete_held_layout(self):
-        """Fall back when factor dimensions fit a cache but physical ownership does not."""
+    def test_cached_dynamics_mixed_layout_is_opt_in_and_unsupported_roots_reject(self):
+        """A fixed arm with a free body is cached only on request; a revolute world root is rejected."""
         world = newton.ModelBuilder()
         joints = []
         parent = -1
@@ -163,6 +162,23 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         model = builder.finalize(device="cuda:0")
         solver = _make_solver(model, False, cached_dynamics="auto", friction_anchor_beta=0.0)
         self.assertEqual(solver.get_path_selection()["cached_dynamics"], "off")
+        # The generic mixed-tree owner now covers fixed arms with free rigid bodies on request.
+        solver = _make_solver(model, False, cached_dynamics="on", friction_anchor_beta=0.0)
+        self.assertEqual(solver.get_path_selection()["cached_dynamics"], "on")
+        self.assertEqual(solver.get_path_selection()["cached_prediction"], "tree")
+        # Cached trees require a fixed or free root; a revolute joint at the world is rejected.
+        world = newton.ModelBuilder()
+        joints, parent = [], -1
+        for _ in range(3):
+            body = world.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+            joints.append(world.add_joint_revolute(parent, body, armature=0.01))
+            parent = body
+        world.add_articulation(joints)
+        body = world.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        world.add_articulation([world.add_joint_free(body)])
+        builder = newton.ModelBuilder()
+        builder.replicate(world, 2)
+        model = builder.finalize(device="cuda:0")
         with self.assertRaisesRegex(ValueError, "cached_dynamics"):
             _make_solver(model, False, cached_dynamics="on", friction_anchor_beta=0.0)
 

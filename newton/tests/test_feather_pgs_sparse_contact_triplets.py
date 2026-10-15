@@ -162,6 +162,8 @@ class DeviceSolve:
             zeros((self.worlds, 1)),
             int(data["iterations"]),
             float(data["omega"]),
+            0.0,
+            0.0,
             int(data["friction_start_iteration"]),
             int(data["iteration_offset"]),
         ]
