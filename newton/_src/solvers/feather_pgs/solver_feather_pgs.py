@@ -5052,8 +5052,14 @@ class SolverFeatherPGS(SolverBase):
                 not self.enable_joint_velocity_limits or velocity_candidate,
                 "Velocity-limit policy or legacy options do not admit the sparse velocity-row composition.",
             ),
-            (not self.pgs_warmstart, "PGS warm starting requires the ordinary factor/row composition."),
-            (not self._mf_warmstart_enabled, "Matrix-free warm starting requires ordinary factors."),
+            (
+                not self.pgs_warmstart or not self._has_free_rigid_bodies,
+                "PGS warm starting with free rigid bodies requires the ordinary factor/row composition.",
+            ),
+            (
+                not self._mf_warmstart_enabled or not self._has_free_rigid_bodies,
+                "Matrix-free warm starting requires ordinary factors.",
+            ),
             (not self._debug_buffers_enabled, "Debug row snapshots require ordinary factors."),
             (not self._regularization_enabled, "Contact regularization requires ordinary factors."),
             (not self._preelim_active, "Bilateral pre-elimination requires ordinary factors."),
@@ -5356,6 +5362,7 @@ class SolverFeatherPGS(SolverBase):
     def _build_body_maps(self, model):
         if not model.body_count or not model.articulation_count:
             self.body_to_joint = None
+            warm_start=self.pgs_warmstart,
             self.body_to_articulation = None
             self.body_has_response_dofs = None
             self.body_response_dof_mask = None
@@ -10158,17 +10165,14 @@ class SolverFeatherPGS(SolverBase):
             or self.articulated_contact_response != "immediate"
             or self.drive_mode != "augmented"
             or self.friction_mode != "current"
-            or self.pgs_warmstart
+            or (self.pgs_warmstart and self._has_free_rigid_bodies)
             or self.pgs_debug
             or self.pgs_velocity_iterations != 0
             or self.enable_joint_velocity_limits != self._sparse_velocity_limits
             or self._contact_torsion_enabled
             or self.contact_compliance
-            or (
-                self._sparse_split
-                and (self.pgs_kernel != "tiled_row" or self._friction_anchors_enabled or self._mf_warmstart_enabled)
-            )
-            or (self._sparse_velocity_limits and (self._friction_anchors_enabled or self._mf_warmstart_enabled))
+            or (self._sparse_split and (self.pgs_kernel != "tiled_row" or self._friction_anchors_enabled))
+            or (self._sparse_velocity_limits and self._friction_anchors_enabled)
         ):
             raise RuntimeError("Reconstruct the solver after changing options incompatible with sparse mass factors")
         if self._contact_torsion_enabled:

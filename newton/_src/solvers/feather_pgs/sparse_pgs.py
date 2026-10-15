@@ -34,6 +34,7 @@ def _get_pgs_solve_sparse_kernel(
     velocity_limits: bool = False,
     lanes_per_world: int = 32,
     local_factors: bool = False,
+    warm_start: bool = False,
 ) -> wp.Kernel:
     """Build a CUDA sweep over factored articulations and physical free bodies.
 
@@ -74,6 +75,12 @@ def _get_pgs_solve_sparse_kernel(
     ``local_factors`` retains small factor rows in private shared storage,
     like the local response/solve owner. It expands sparse indices once per
     call; it neither applies a second factor transform nor stores physical Y.
+
+    ``warm_start`` seeds the factor delta with the response of the impulses
+    already stored in the row buffer before the first sweep, so carried
+    contact impulses act on the velocity exactly as the ordinary route
+    installs them in ``v_out``. Velocity-limit rows stay stateless. It
+    requires no independent free-body rows.
     """
     M, D, S = int(max_constraints), int(max_world_dofs), int(max_row_dofs)
     F = int(mf_max_constraints)
@@ -91,6 +98,8 @@ def _get_pgs_solve_sparse_kernel(
         raise ValueError("subwarp sparse PGS requires a small complete articulated sweep")
     if local_factors and (D > 16 or M > 64 or F or P or active_rows or contact_triplets):
         raise ValueError("local factor storage requires a small complete articulated sweep")
+    if warm_start and F:
+        raise ValueError("sparse warm starting requires no independent free-body rows")
     index_read = (
         f"support.class_dof.data[support.row_class.data[offset + row] * {S} + entry]"
         if use_support_table
@@ -153,8 +162,9 @@ def _get_pgs_solve_sparse_kernel(
                         || impulse[row] != 0.0f;
                     if (!selected && diagonal[row] > 0.0f) {{
                         float dot = 0.0f;
-                        // Delta starts at zero even when the impulse buffer is seeded.
-                        if (iteration != 0) {{
+                        // Delta starts at zero even when the impulse buffer is seeded,
+                        // unless warm starting seeded it before the first sweep.
+                        if (iteration != 0 || {str(bool(warm_start)).lower()}) {{
                             #pragma unroll
                             for (int entry = 0; entry < {S}; ++entry) {{
                                 const int index = {index_read};
@@ -372,6 +382,30 @@ def _get_pgs_solve_sparse_kernel(
 {factor_initialize}
     __syncwarp(MASK);
 {active_initialize}
+"""
+    if warm_start:
+        # Carried impulses already sit in the row buffer; give the factor delta their
+        # response so the first residual sees them, as the ordinary route installs them
+        # in v_out. Rows own unique indices and lanes own disjoint entries, so one row's
+        # updates never collide; rows are serialized by the warp barrier.
+        setup += f"""
+    for (int row = 0; row < count; ++row) {{
+        const float seed = impulse[row];
+        if (seed != 0.0f && type[row] != {velocity_limit_type}) {{
+            #pragma unroll
+            for (int q = 0; q < {Q}; ++q) {{
+                const int entry = lane + q * {L};
+                const int index = entry < {row_width} ? {index_read} : -1;
+                if (index >= 0) {{
+                    float response = {factor_read};
+                    if ({str(bool(P)).lower()} && world_free_dof_mask.data[world * {D} + index] != 0)
+                        response = row_free_response.data[(offset + row) * row_free_response.shape[2] + entry];
+                    delta[index] += response * seed;
+                }}
+            }}
+        }}
+        __syncwarp(MASK);
+    }}
 """
     velocity_filter = velocity_sweep = ""
     if velocity_limits:
@@ -677,6 +711,8 @@ def _get_pgs_solve_sparse_kernel(
         suffix += f"_lanes{L}"
     if local_factors:
         suffix += "_local_factors"
+    if warm_start:
+        suffix += "_warm_start"
     solve.__name__ = f"pgs_solve_sparse_{M}_{D}_{S}_{F}_{P}{suffix}"
     solve.__qualname__ = solve.__name__
     return wp.kernel(enable_backward=False, module="unique")(solve)

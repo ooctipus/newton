@@ -1,0 +1,1 @@
+Admit `pgs_warmstart=True` on FeatherPGS native sparse factors for articulations without free rigid bodies. The sparse sweep seeds its factor delta with the response of the carried contact impulses before the first sweep, matching the ordinary route's warm-started velocity.
