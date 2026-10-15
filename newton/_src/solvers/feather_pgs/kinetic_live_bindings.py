@@ -17,6 +17,7 @@ import warp as wp
 
 from . import kernels, kuka_joint_owner, raw_world_contacts, simple_world, world_scan_owner
 from .kinetic_live_plan import validate_gravity
+from .kinetic_rows_types import RowState
 
 
 def _struct(cls, **fields):
@@ -52,6 +53,33 @@ def _disjoint_states(state_in, state_out):
     return not any(
         a.ptr < b.ptr + b.capacity and b.ptr < a.ptr + a.capacity for a in sources for b in outputs if a.size and b.size
     )
+
+
+@wp.kernel
+def _activate_all(state: RowState):
+    world = wp.tid()
+    state.resolved[world] = 0
+    state.active_worlds[world] = world
+    if world == 0:
+        state.active_count[0] = state.active_worlds.shape[0]
+
+
+def solve_contacts(solver, call, state_in, contacts):
+    """Run contact handling independently of held dynamics lifetime/publication."""
+    solver._build_friction_patches(state_in, contacts)
+    call.zero.launch()
+    solve = call.solve
+    try:
+        solve.setup()
+        solve.allocate()
+        solve.build_rows()
+        solve.prepare_mf()
+        solve.qualify()
+        solve.materialize()
+        solve.solve()
+    finally:
+        solve.join()
+    solver._finalize_constraint_status(contacts)
 
 
 class LiveBindings:
@@ -111,7 +139,7 @@ class LiveBindings:
             self.limit_sign = wp.zeros(12 * worlds, dtype=float, device=device)
         self._calls = {}
         self.current_contact = None
-        if os.environ.get("FEATHER_PGS_KUKA_CURRENT_CONTACT", "0") == "1":
+        if not solver._friction_anchors_enabled and os.environ.get("FEATHER_PGS_KUKA_CURRENT_CONTACT", "0") == "1":
             from . import kinetic_current_contact  # noqa: PLC0415 -- default-off experimental owner
 
             self.current_contact = kinetic_current_contact.allocate(worlds, solver._max_contacts_alloc, device)
@@ -306,6 +334,7 @@ class LiveBindings:
             solver,
             call.rows,
             current,
+            contacts=contacts,
             selector=self.selector,
             identity=self.identity,
             world_count=self.world_count,
@@ -414,7 +443,7 @@ class LiveBindings:
         }.items():
             value = getattr(solver, source)
             setattr(settings, name, int(value) if isinstance(value, bool) else value)
-        # Live admission excludes patches; upstream point friction does not thin anchors.
+        # Patch selection is owned by the shared patch view, not legacy thinning.
         settings.friction_anchor_limit = 0
         settings.dt, settings.bias_scale, settings.joint_limit_speculative_scale = float(dt), 1.0, 1.0
         settings.contact_w = solver._contact_w
@@ -439,7 +468,9 @@ class LiveBindings:
         row_kernels = [
             kinetic_rows.get_arm_kernel(arch),
             kinetic_rows.get_prefix_kernel(arch),
-            kinetic_rows_triplet.get_contact_kernel(arch),
+            kinetic_rows_triplet.get_patch_contact_kernel(arch)
+            if solver._friction_anchors_enabled
+            else kinetic_rows_triplet.get_contact_kernel(arch),
             kinetic_rows.get_validate_kernel(arch),
         ]
         arguments = [
@@ -448,6 +479,8 @@ class LiveBindings:
             [call.plan, call.slots.current, call.slots.held, raw, state, settings, self.arm, out],
             [state, settings, out],
         ]
+        if solver._friction_anchors_enabled:
+            arguments[2].extend([solver._friction_patches.view, solver.friction_anchor_beta])
 
         def launch():
             out.global_status.zero_()
@@ -667,6 +700,10 @@ class LiveBindings:
             )
 
         def classify():
+            if self.solver._friction_anchors_enabled:
+                # A normal-only feasibility proof does not cover stored stiction.
+                wp.launch(_activate_all, dim=self.worlds, inputs=[rows.state], device=self.device)
+                return
             rows.state.active_count.zero_()
             wp.launch_tiled(kernel, dim=[self.worlds], block_dim=32, inputs=args, device=self.device)
 
@@ -817,8 +854,12 @@ class LiveBindings:
         row_kernels = {
             "qualify": compact.get_qualify_kernel(str(device.arch)),
             "materialize": compact.get_materialize_kernel(str(device.arch)),
-            "offset_eight": native.get_solve_kernel(str(device.arch)),
-            "general": compact.get_general_kernel(services.general),
+            "offset_eight": native.get_solve_kernel(
+                str(device.arch), contact_triples=not self.solver._friction_anchors_enabled
+            ),
+            "general": compact.get_general_kernel(
+                services.general, contact_triples=not self.solver._friction_anchors_enabled
+            ),
         }
         dimensions = {
             "qualify": (workers, 128),

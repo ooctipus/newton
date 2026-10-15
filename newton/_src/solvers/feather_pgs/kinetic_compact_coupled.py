@@ -151,12 +151,12 @@ def fallback_source(baseline):
     return source.native, []
 
 
-def compact_source(original_kernel):
+def compact_source(original_kernel, *, contact_triples=True):
     """Compose shared dense and current-MF source through explicit bindings."""
     _pin()
     _, baseline, _ = hybrid_source.general_source(original_kernel)
     mf_body = hybrid_source._fixed_source(held=True).mf_phase
-    dense = compact_recurrence(mf_body)
+    dense = compact_recurrence(mf_body, contact_triples=contact_triples)
     return (
         "#if defined(__CUDA_ARCH__)\n"
         + original.FRICTION_PAIR_CUDA
@@ -177,9 +177,9 @@ def cpu_source():
 
 
 @functools.cache
-def get_general_kernel(original_kernel):
+def get_general_kernel(original_kernel, *, contact_triples=True):
     """Bind one guarded queue dispatch to mutually exclusive arena owners."""
-    source, baseline, mf_body = compact_source(original_kernel)
+    source, baseline, mf_body = compact_source(original_kernel, contact_triples=contact_triples)
     fallback, fallback_edits = fallback_source(baseline)
     extra = {
         "plan": KineticPlan,

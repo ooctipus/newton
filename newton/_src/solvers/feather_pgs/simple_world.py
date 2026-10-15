@@ -297,8 +297,8 @@ def finalize_simple_worlds(scratch: _SimpleWorldScratch):
     scratch.resolved[world] = value
 
 
-def _supported(solver) -> bool:
-    """Match the original fixed recipe, not arbitrary unnotified topology mutation."""
+def _supports_policy(solver) -> bool:
+    """Check the shared fixed recipe before selecting factor storage."""
     exact = {
         "pgs_mode": "matrix_free",
         "drive_mode": "augmented",
@@ -307,8 +307,6 @@ def _supported(solver) -> bool:
         "pgs_iterations": 8,
         "pgs_velocity_iterations": 0,
         "max_world_dofs": 29,
-        "_paired_response_primary_size": 23,
-        "_paired_response_secondary_size": 6,
         "_mimic_count": 0,
         "_connect_count": 0,
         "_preelim_count": 0,
@@ -344,7 +342,7 @@ def _supported(solver) -> bool:
     )
     if any(getattr(solver, name, None) is not False for name in false):
         return False
-    if not getattr(solver, "enable_joint_limits", False) or not getattr(solver, "_paired_factor_coordinates", False):
+    if not getattr(solver, "enable_joint_limits", False):
         return False
     if getattr(solver, "size_groups", None) != [23, 6] or getattr(solver, "_joint_limit_sizes", None) != frozenset(
         {23}
@@ -363,6 +361,16 @@ def _supported(solver) -> bool:
         "rigid_body_max_angular_velocity",
     )
     return all(getattr(solver, name, None) is not None for name in required)
+
+
+def _supported(solver) -> bool:
+    """Match the fixed recipe and its selected factor-coordinate storage."""
+    return (
+        _supports_policy(solver)
+        and getattr(solver, "_paired_response_primary_size", None) == 23
+        and getattr(solver, "_paired_response_secondary_size", None) == 6
+        and getattr(solver, "_paired_factor_coordinates", False)
+    )
 
 
 class SimpleWorldClassifier:

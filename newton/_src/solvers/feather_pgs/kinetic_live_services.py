@@ -3,9 +3,10 @@
 
 """Bind retained current matrix-free services to existing live solver storage.
 
-Only argument ownership changes: the original inverse, row, RHS, packing and
-consumer kernels keep their launch order and capacities. No snapshot or large
-allocation is involved; the live controller owns admission and fork/join.
+The original inverse, row, RHS, packing and consumer kernels keep their
+capacities. Shared patch links are finalized before metadata packing, as in the
+ordinary row pipeline. No snapshot or large allocation is involved; the live
+controller owns admission and fork/join.
 """
 
 import inspect
@@ -24,6 +25,7 @@ def bind_mf(
     rows,
     publication,
     *,
+    contacts,
     selector,
     identity,
     world_count,
@@ -308,6 +310,7 @@ def bind_mf(
             inputs=mf.mass_args,
             device=device,
         )
+        solver._link_friction_patches(contacts)
         if device.is_cuda:
             wp.launch_tiled(mf.pack, dim=[worlds], inputs=mf.pack_args, block_dim=32, device=device)
         else:

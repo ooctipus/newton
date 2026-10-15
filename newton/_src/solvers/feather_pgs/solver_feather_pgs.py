@@ -43,8 +43,10 @@ from ..semi_implicit.kernels_particle import (
 )
 from ..solver import SolverBase
 from . import contact_compliance as _contact_compliance
+from . import execution_plan as _execution_plan
 from . import row_metadata as _row_metadata
 from .body_mapping import build_body_maps
+from .configuration import resolve_kernel_choices
 from .contact_torsion import (
     configure_contact_torsion,
     prepare_torsion_rows,
@@ -391,7 +393,6 @@ def _report_grouped_check(name: str, outputs, reference) -> None:
 _FPGS_SYNC_TIMINGS = os.environ.get("FEATHER_PGS_SYNC_TIMINGS", "0").lower() in {"1", "true", "yes", "on"}
 _FPGS_SYNC_TIMINGS_START = int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_START", "20"))
 _FPGS_SYNC_TIMINGS_COUNT = max(int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_COUNT", "1")), 0)
-_MFGS_RESIDENT_METADATA_MAX_BYTES = 4096
 _SMALL_DOF_THRESHOLD_DEFAULT = 12
 # Beyond this guard, the relaxation weight is too close to zero to be a
 # useful float32 PGS update and the assembled split path risks overflow when
@@ -399,7 +400,6 @@ _SMALL_DOF_THRESHOLD_DEFAULT = 12
 _MAX_CONTACT_REGULARIZATION = 1.0e6
 
 
-_MFGS_TILE_SHARED_STORAGE_BYTES = 128
 _PROPAGATION_DENSE_INTERNAL_ROW_RESERVE = 16
 # Per-world preset of the first rejected row slot: no reservation was rejected.
 _ROW_SLOT_UNBOUNDED = 2**31 - 1
@@ -981,225 +981,19 @@ _validate_mf_metadata_encoding = _row_metadata._validate_mf_metadata_encoding
 _mf_parent_expression = _row_metadata._mf_parent_expression
 
 
-def _use_resident_mfgs_metadata(
-    max_constraints: int,
-    mf_max_constraints: int,
-    max_world_dofs: int,
-    max_shared_memory: int,
-    *,
-    has_drive_rows: bool,
-    fuse_vel_limits: bool,
-) -> bool:
-    """Select resident MF-GS metadata for compact solver shapes.
-
-    Resident row metadata removes repeated global loads across PGS iterations,
-    but larger shapes lose more throughput from the resulting occupancy drop.
-    Keep at most one 4-KiB metadata working set resident and stream larger sets.
-    """
-    metadata_arrays = 4 + 4 * int(has_drive_rows) + int(fuse_vel_limits)
-    metadata_bytes = 4 * max_constraints * metadata_arrays
-    base_shared_bytes = 4 * (max_world_dofs + max_constraints + mf_max_constraints)
-    total_shared_bytes = _MFGS_TILE_SHARED_STORAGE_BYTES + base_shared_bytes + metadata_bytes
-    return metadata_bytes <= _MFGS_RESIDENT_METADATA_MAX_BYTES and total_shared_bytes <= max_shared_memory
-
-
-def _select_mfgs_storage(
-    max_constraints: int,
-    mf_max_constraints: int,
-    max_world_dofs: int,
-    max_shared_memory: int,
-    *,
-    has_drive_rows: bool,
-    fuse_vel_limits: bool,
-) -> tuple[bool, bool]:
-    """Select metadata and impulse storage without changing row capacity or order.
-
-    Stream MF impulses only when they cannot fit alongside the shared world
-    velocity and dense state. This is a construction-time capacity fallback,
-    not a claim that global storage is faster for resident-sized workloads.
-    """
-    shared_metadata = _use_resident_mfgs_metadata(
-        max_constraints,
-        mf_max_constraints,
-        max_world_dofs,
-        max_shared_memory,
-        has_drive_rows=has_drive_rows,
-        fuse_vel_limits=fuse_vel_limits,
-    )
-    metadata_arrays = (4 + 4 * int(has_drive_rows) + int(fuse_vel_limits)) if shared_metadata else 0
-    fixed_bytes = _MFGS_TILE_SHARED_STORAGE_BYTES + 4 * (max_world_dofs + max_constraints * (1 + metadata_arrays))
-    if fixed_bytes > max_shared_memory:
-        raise ValueError(
-            f"MF-GS world velocity and dense state require {fixed_bytes} bytes of shared memory "
-            f"even with streamed MF impulses, but the device exposes {max_shared_memory} bytes"
-        )
-    return shared_metadata, fixed_bytes + 4 * mf_max_constraints > max_shared_memory
-
-
-_HINV_JT_MAX_CHUNK_SIZE = 32
-_FUSED_ROW_CHUNK = 16
-
-
-def _fused_response_chunk_size(max_constraints: int) -> int:
-    """Select the streamed fused response width or its nondivisible fallback."""
-    chunk = min(int(max_constraints), _FUSED_ROW_CHUNK)
-    return int(max_constraints) if int(max_constraints) % chunk else chunk
-
-
-def _align_shared_memory(size: int) -> int:
-    """Align a shared-memory allocation to Warp's 16-byte tile boundary."""
-    return (size + 15) // 16 * 16
-
-
-def _estimate_cholesky_shared_memory(n_dofs: int) -> int:
-    """Estimate the complete tiled Cholesky shared-memory footprint [B]."""
-    matrix_bytes = _align_shared_memory(4 * n_dofs * n_dofs)
-    vector_bytes = _align_shared_memory(4 * n_dofs)
-    return 3 * matrix_bytes + vector_bytes
-
-
-def _estimate_hinv_jt_shared_memory(n_dofs: int, constraint_count: int, *, fused: bool, tile_threads: int) -> int:
-    """Estimate the complete tiled H-inverse shared-memory footprint [B]."""
-    if fused:
-        constraint_count = _fused_response_chunk_size(constraint_count)
-    footprint = _align_shared_memory(4 * n_dofs * n_dofs)
-    # Fusion holds J_i, Z_i, X_i and J_j; the unfused solve has three tiles.
-    footprint += (4 if fused else 3) * _align_shared_memory(4 * n_dofs * constraint_count)
-    if fused:
-        footprint += _align_shared_memory(4 * constraint_count * constraint_count)
-    return footprint + 4 * tile_threads
-
-
-def _select_hinv_jt_chunk_size(
-    n_dofs: int, max_constraints: int, max_shared_memory: int, tile_threads: int
-) -> int | None:
-    """Select a validated H-inverse chunk from articulation and device resources.
-
-    Keep response tiles at 32 rows or fewer. Larger tiles waste triangular-solve
-    work on the partially occupied tail common to per-world constraint systems;
-    inactive follow-on chunks return before loading the factor.
-    """
-    if n_dofs <= 0 or max_constraints <= 0:
-        return None
-    candidates = (_HINV_JT_MAX_CHUNK_SIZE, 16, 8, 4, 2, 1)
-    tried: set[int] = set()
-    for candidate in candidates:
-        chunk_size = min(candidate, max_constraints)
-        if chunk_size in tried:
-            continue
-        tried.add(chunk_size)
-        if (
-            _estimate_hinv_jt_shared_memory(n_dofs, chunk_size, fused=False, tile_threads=tile_threads)
-            <= max_shared_memory
-        ):
-            return chunk_size
-    return None
-
-
-@dataclass(frozen=True)
-class _FeatherPGSExecutionPlan:
-    """Immutable device-resource choices for one solver shape."""
-
-    diagonal_mass_sizes: frozenset[int]
-    cholesky_tiled_sizes: frozenset[int]
-    hinv_jt_tiled_sizes: frozenset[int]
-    hinv_jt_chunk_sizes: tuple[tuple[int, int], ...]
-    hinv_jt_fused_sizes: frozenset[int]
-
-    @classmethod
-    def build(
-        cls,
-        size_groups: list[int],
-        *,
-        max_constraints: int,
-        max_shared_memory: int,
-        cholesky_kernel: str,
-        hinv_jt_kernel: str,
-        small_dof_threshold: int,
-        tile_threads: int,
-        diagonal_mass_sizes: frozenset[int] = frozenset(),
-        fuse_delassus: bool = True,
-    ) -> "_FeatherPGSExecutionPlan":
-        """Resolve H-inverse implementations from solver shape and device limits."""
-        planned_diagonal_sizes = (
-            frozenset(size for size in size_groups if size in diagonal_mass_sizes)
-            if hinv_jt_kernel == "auto"
-            else frozenset()
-        )
-        cholesky_tiled_sizes: set[int] = set()
-        tiled_sizes: set[int] = set()
-        chunk_sizes: list[tuple[int, int]] = []
-        fused_sizes: set[int] = set()
-        for size in size_groups:
-            if size in planned_diagonal_sizes:
-                continue
-            cholesky_requested = cholesky_kernel == "tiled" or (
-                cholesky_kernel == "auto" and size > small_dof_threshold
-            )
-            if cholesky_requested:
-                required = _estimate_cholesky_shared_memory(size)
-                if required <= max_shared_memory:
-                    cholesky_tiled_sizes.add(size)
-                elif cholesky_kernel == "tiled":
-                    raise ValueError(
-                        f"cholesky_kernel='tiled' requires {required} bytes of shared memory for DOF size {size}, "
-                        f"but the device exposes {max_shared_memory} bytes; use cholesky_kernel='auto' or 'loop'."
-                    )
-
-            if max_constraints <= 0:
-                continue
-            requested = hinv_jt_kernel == "tiled" or (hinv_jt_kernel == "auto" and size > small_dof_threshold)
-            if not requested:
-                continue
-            chunk_size = _select_hinv_jt_chunk_size(size, max_constraints, max_shared_memory, tile_threads)
-            if chunk_size is None:
-                if hinv_jt_kernel == "tiled":
-                    required = _estimate_hinv_jt_shared_memory(size, 1, fused=False, tile_threads=tile_threads)
-                    raise ValueError(
-                        f"hinv_jt_kernel='tiled' requires at least {required} "
-                        f"bytes of shared memory for DOF size {size}, but the device exposes "
-                        f"{max_shared_memory} bytes; use hinv_jt_kernel='auto' or 'par_row'."
-                    )
-                continue
-
-            tiled_sizes.add(size)
-            chunk_sizes.append((size, chunk_size))
-            if fuse_delassus and (
-                _estimate_hinv_jt_shared_memory(size, max_constraints, fused=True, tile_threads=tile_threads)
-                <= max_shared_memory
-            ):
-                fused_sizes.add(size)
-
-        return cls(
-            planned_diagonal_sizes,
-            frozenset(cholesky_tiled_sizes),
-            frozenset(tiled_sizes),
-            tuple(chunk_sizes),
-            frozenset(fused_sizes),
-        )
-
-    def use_diagonal_mass(self, size: int) -> bool:
-        """Return whether an articulation group has diagonal generalized inertia."""
-        return size in self.diagonal_mass_sizes
-
-    def use_tiled_cholesky(self, size: int) -> bool:
-        """Return whether an articulation group uses tiled Cholesky."""
-        return size in self.cholesky_tiled_sizes
-
-    def hinv_jt_chunk_size(self, size: int) -> int | None:
-        """Return the tiled H-inverse chunk size for a response group."""
-        for planned_size, chunk_size in self.hinv_jt_chunk_sizes:
-            if planned_size == size:
-                return chunk_size
-        return None
-
-    def use_tiled_hinv_jt(self, size: int) -> bool:
-        """Return whether a response group uses tiled H-inverse application."""
-        return size in self.hinv_jt_tiled_sizes
-
-    def use_fused_hinv_jt(self, size: int) -> bool:
-        """Return whether a response group may fuse H-inverse and Delassus."""
-        return size in self.hinv_jt_fused_sizes
+# Retain internal imports while launch-resource policy has one implementation.
+_MFGS_RESIDENT_METADATA_MAX_BYTES = _execution_plan._MFGS_RESIDENT_METADATA_MAX_BYTES
+_MFGS_TILE_SHARED_STORAGE_BYTES = _execution_plan._MFGS_TILE_SHARED_STORAGE_BYTES
+_HINV_JT_MAX_CHUNK_SIZE = _execution_plan._HINV_JT_MAX_CHUNK_SIZE
+_FUSED_ROW_CHUNK = _execution_plan._FUSED_ROW_CHUNK
+_use_resident_mfgs_metadata = _execution_plan._use_resident_mfgs_metadata
+_select_mfgs_storage = _execution_plan._select_mfgs_storage
+_fused_response_chunk_size = _execution_plan._fused_response_chunk_size
+_align_shared_memory = _execution_plan._align_shared_memory
+_estimate_cholesky_shared_memory = _execution_plan._estimate_cholesky_shared_memory
+_estimate_hinv_jt_shared_memory = _execution_plan._estimate_hinv_jt_shared_memory
+_select_hinv_jt_chunk_size = _execution_plan._select_hinv_jt_chunk_size
+_FeatherPGSExecutionPlan = _execution_plan._FeatherPGSExecutionPlan
 
 
 class SolverFeatherPGS(SolverBase):
@@ -2047,47 +1841,20 @@ class SolverFeatherPGS(SolverBase):
             "sparse_mass_matrix": sparse_mass_matrix,
             "cached_dynamics": cached_dynamics,
         }
-        choices = {
-            "cholesky_kernel": ("auto", "tiled", "loop"),
-            "trisolve_kernel": ("auto", "tiled", "loop"),
-            "hinv_jt_kernel": ("auto", "tiled", "par_row"),
-            "delassus_kernel": ("auto", "tiled", "par_row_col"),
-            "pgs_kernel": ("auto", "loop", "tiled_row", "tiled_contact", "streaming"),
-            "sparse_mass_matrix": ("auto", "on", "off"),
-            "cached_dynamics": ("auto", "on", "off"),
-        }
-        cpu_choices = {
-            "cholesky_kernel": "loop",
-            "trisolve_kernel": "loop",
-            "hinv_jt_kernel": "par_row",
-            "delassus_kernel": "par_row_col",
-            "pgs_kernel": "loop",
-            "sparse_mass_matrix": "off",
-            "cached_dynamics": "off",
-        }
-        if pgs_mode != "matrix_free" and enable_joint_limits and pgs_kernel in ("tiled_contact", "streaming"):
-            raise ValueError(f"pgs_kernel={pgs_kernel!r} is contact-only and cannot solve joint-limit rows")
-        for name, value in self._requested_kernel_choices.items():
-            if value not in choices[name]:
-                raise ValueError(f"{name} must be one of {choices[name]}, got {value!r}")
-            if model.device.is_cpu and value not in ("auto", cpu_choices[name]):
-                raise ValueError(f"{name}={value!r} requires CUDA; use 'auto' or {cpu_choices[name]!r}")
-        if pgs_mode == "matrix_free":
-            for name in ("pgs_kernel", "delassus_kernel"):
-                if self._requested_kernel_choices[name] != "auto":
-                    raise ValueError(f"{name} is unused in matrix_free mode; use 'auto' or pgs_mode='split'")
+        kernel_choices, self._explicit_dense_kernels, self._kernel_choice_reasons = resolve_kernel_choices(
+            self._requested_kernel_choices,
+            self._kernel_overrides,
+            is_cpu=model.device.is_cpu,
+            pgs_mode=pgs_mode,
+            enable_joint_limits=enable_joint_limits,
+        )
+        cholesky_kernel = kernel_choices["cholesky_kernel"]
+        trisolve_kernel = kernel_choices["trisolve_kernel"]
+        hinv_jt_kernel = kernel_choices["hinv_jt_kernel"]
+        delassus_kernel = kernel_choices["delassus_kernel"]
+        pgs_kernel = kernel_choices["pgs_kernel"]
         self.sparse_mass_matrix = sparse_mass_matrix
         self.cached_dynamics = cached_dynamics
-        self._explicit_dense_kernels = any(
-            self._requested_kernel_choices[name] != "auto"
-            for name in ("cholesky_kernel", "trisolve_kernel", "hinv_jt_kernel", "delassus_kernel")
-        )
-        if sparse_mass_matrix == "on" and self._explicit_dense_kernels:
-            raise ValueError("sparse_mass_matrix='on' conflicts with explicit dense kernel choices; use 'auto'")
-        if cached_dynamics == "on" and self._explicit_dense_kernels:
-            raise ValueError("cached_dynamics='on' conflicts with explicit dense kernel choices; use 'auto'")
-        if pgs_kernel == "auto":
-            pgs_kernel = "loop" if model.device.is_cpu else "tiled_row"
 
         self.angular_damping = angular_damping
         self.update_mass_matrix_interval = update_mass_matrix_interval
@@ -2098,9 +1865,7 @@ class SolverFeatherPGS(SolverBase):
         self.contact_friction_anchor_limit = int(contact_friction_anchor_limit)
         self.contact_friction_articulation_pairs_only = bool(contact_friction_articulation_pairs_only)
         self.contact_friction_scale = float(contact_friction_scale)
-        # Native tiled kernels are CUDA-only and every CPU selector resolves to
-        # the scalar suite below, so validate against the kernel that will run.
-        effective_pgs_kernel = "loop" if model.device.is_cpu else pgs_kernel
+        effective_pgs_kernel = pgs_kernel
         if friction_anchor_beta is None:
             # An explicit point algorithm remains a valid way to select point
             # friction. The ordinary constructor enables persistent patches.
@@ -2462,53 +2227,7 @@ class SolverFeatherPGS(SolverBase):
         # ``True`` and ``pgs_mode == "matrix_free"``.
         self._pgs_ncp_residual_log: list[np.ndarray] = []
 
-        # Kernel selection is automatic; _kernel_overrides is a test hook that pins
-        # one implementation regardless of the articulation-size heuristic.
-        if cholesky_kernel == "auto":
-            cholesky_kernel = self._kernel_overrides.get("cholesky_kernel", "auto")
-        if trisolve_kernel == "auto":
-            trisolve_kernel = self._kernel_overrides.get("trisolve_kernel", "auto")
-        if hinv_jt_kernel == "auto":
-            hinv_jt_kernel = self._kernel_overrides.get("hinv_jt_kernel", "auto")
-        if delassus_kernel == "auto":
-            delassus_kernel = self._kernel_overrides.get("delassus_kernel", "auto")
         small_dof_threshold = _SMALL_DOF_THRESHOLD_DEFAULT
-
-        valid_cholesky = {"tiled", "loop", "auto"}
-        if cholesky_kernel not in valid_cholesky:
-            raise ValueError(f"cholesky_kernel must be one of {sorted(valid_cholesky)}")
-
-        valid_trisolve = {"tiled", "loop", "auto"}
-        if trisolve_kernel not in valid_trisolve:
-            raise ValueError(f"trisolve_kernel must be one of {sorted(valid_trisolve)}")
-
-        valid_hinv_jt = {"tiled", "par_row", "auto"}
-        if hinv_jt_kernel not in valid_hinv_jt:
-            raise ValueError(f"hinv_jt_kernel must be one of {sorted(valid_hinv_jt)}")
-
-        valid_delassus = {"tiled", "par_row_col", "auto"}
-        if delassus_kernel not in valid_delassus:
-            raise ValueError(f"delassus_kernel must be one of {sorted(valid_delassus)}")
-
-        valid_pgs = {"loop", "tiled_row", "tiled_contact", "streaming"}
-        if pgs_kernel not in valid_pgs:
-            raise ValueError(f"pgs_kernel must be one of {sorted(valid_pgs)}")
-
-        if self.pgs_mode != "matrix_free" and self.enable_joint_limits and pgs_kernel in ("tiled_contact", "streaming"):
-            raise ValueError(
-                f"pgs_kernel={pgs_kernel!r} is contact-only and cannot solve joint-limit rows; "
-                "use pgs_kernel='loop' or 'tiled_row', or pgs_mode='matrix_free'"
-            )
-
-        # Native tiled kernels are CUDA-only. Resolve the complete scalar
-        # suite here so CPU callers cannot accidentally launch silent no-op
-        # native bodies through otherwise valid public selectors.
-        if model.device.is_cpu:
-            cholesky_kernel = "loop"
-            trisolve_kernel = "loop"
-            hinv_jt_kernel = "par_row"
-            delassus_kernel = "par_row_col"
-            pgs_kernel = "loop"
 
         self.serial_kernel_block_dim = int(serial_kernel_block_dim)
         if self.serial_kernel_block_dim <= 0 or self.serial_kernel_block_dim % 32 != 0:
@@ -2983,6 +2702,7 @@ class SolverFeatherPGS(SolverBase):
             ) = _get_partitioned_inverse_dynamics_kernels(
                 self._compact_diagonal_mass_size, str(getattr(model.device, "arch", ""))
             )
+        self._row_watermark = bool(row_watermark)
         self._setup_sparse_mass_matrix(model)
         if sparse_mass_matrix == "on" and self._sparse_mass_matrix_size is None:
             raise ValueError(
@@ -3182,7 +2902,6 @@ class SolverFeatherPGS(SolverBase):
         # capture. The warning path tracks only current-step dropped rows and a
         # three-family one-shot flag; row_watermark additionally accumulates
         # whole-run high-water telemetry for explicit readback.
-        self._row_watermark = bool(row_watermark)
         self._track_row_capacity = (
             self._row_watermark
             or self.warn_constraint_overflow
@@ -3496,14 +3215,17 @@ class SolverFeatherPGS(SolverBase):
             )
 
     def get_path_selection(self) -> dict:
-        """Return requested choices, active cache and kernel plans without device synchronization.
+        """Return requested choices, active plans and selection reasons without device synchronization.
 
         Kernel plans describe ordinary stages per articulation DOF count. Cached
         prediction can replace these stages; its owner is reported separately.
         Automatic choices use topology and resource rules, not online timing.
-        Recreate the solver to change them.
+        Recreate the solver to change them. The ``reasons`` mapping explains
+        construction-time admission and fallbacks; it does not predict dynamic
+        per-world branches. Ordinary kernel plans can be superseded by a cache.
         """
         kernels = {}
+        kernel_reasons = {}
         cached = any(
             owner is not None for owner in (self._tree_kinetic_state, self._franka_kinetic_state, self._kinetic_world)
         )
@@ -3539,6 +3261,25 @@ class SolverFeatherPGS(SolverBase):
                 if self.delassus_kernel == "par_row_col"
                 else "tiled",
             }
+            reasons = self._execution_plan.selection_reasons(size)
+            reasons["trisolve_kernel"] = (
+                f"Automatic DOF threshold is {self.small_dof_threshold}; selected {kernels[size]['trisolve_kernel']}."
+                if self.trisolve_kernel == "auto"
+                else f"Selected {kernels[size]['trisolve_kernel']}."
+            )
+            reasons["delassus_kernel"] = (
+                "Matrix-free mode does not materialize the Delassus operator."
+                if self.pgs_mode == "matrix_free"
+                else f"Selected {kernels[size]['delassus_kernel']} Delassus construction."
+            )
+            for name in ("cholesky_kernel", "trisolve_kernel", "hinv_jt_kernel"):
+                if sparse:
+                    reasons[name] = self._sparse_selection_reason
+                elif diagonal:
+                    reasons[name] = "Independent-coordinate topology uses diagonal generalized inertia."
+            kernel_reasons[size] = {
+                name: f"{self._kernel_choice_reasons[name]} {reason}" for name, reason in reasons.items()
+            }
         return {
             "requested": dict(self._requested_kernel_choices),
             "sparse_mass_matrix": "on" if self._sparse_mass_matrix_size is not None else "off",
@@ -3557,6 +3298,19 @@ class SolverFeatherPGS(SolverBase):
             else "kinetic"
             if self._kinetic_world is not None
             else None,
+            "reasons": {
+                "sparse_mass_matrix": self._sparse_selection_reason,
+                "cached_dynamics": self._cached_dynamics_selection_reason,
+                "publication": "Paired cache owns next-state publication."
+                if cached
+                else "Fused current dynamics permits deferred kinematics publication."
+                if self.lazy_kinematics and self._fused_k1
+                else "Ordinary state publication remains active.",
+                "pgs_kernel": "Matrix-free mode owns the iteration kernel; split PGS selection is unused."
+                if self.pgs_mode == "matrix_free"
+                else self._kernel_choice_reasons["pgs_kernel"],
+                "kernel_plan_by_dof": kernel_reasons,
+            },
         }
 
     def prepare_contact_torsion_capture(self, state_in: State, state_out: State) -> None:
@@ -5216,13 +4970,18 @@ class SolverFeatherPGS(SolverBase):
     def _setup_sparse_mass_matrix(self, model: Model) -> None:
         """Select sparse articulation factors with independent rigid-body response blocks."""
         self._sparse_mass_matrix_size = None
+        self._kinetic_world_plan = None
         self._sparse_split = False
         self._sparse_velocity_limits = False
         self._sparse_prepare_contacts = False
         self._sparse_row_support = _SparseRowSupport()
         self._sparse_contact_triplets = False
         sparse_choice = getattr(self, "sparse_mass_matrix", "auto")
-        if sparse_choice == "off" or getattr(self, "_explicit_dense_kernels", False):
+        if sparse_choice == "off":
+            self._sparse_selection_reason = "Explicit sparse_mass_matrix='off' retains ordinary factors."
+            return
+        if getattr(self, "_explicit_dense_kernels", False):
+            self._sparse_selection_reason = "An explicit dense kernel choice owns factor and response construction."
             return
         # Reuse the factor representation without changing split's row law or
         # state-cache lifecycle. Nonzero seeds need a factor-delta initialization
@@ -5243,32 +5002,46 @@ class SolverFeatherPGS(SolverBase):
             and not self._friction_anchors_enabled
             and self._kernel_overrides.get("sparse_prepare_contacts", True)
         )
-        if not (
-            (sparse_choice == "on" or self._kernel_overrides.get("sparse_mass_matrix", True))
-            and model.device.is_cuda
-            and not model.requires_grad
-            and (self.pgs_mode == "matrix_free" or split_candidate)
-            and self.articulated_contact_response == "immediate"
-            and self.pgs_schedule == "interleaved"
-            and self.drive_mode == "augmented"
-            and self._parallel_augmented_drive_topology
-            and self.friction_mode == "current"
-            and self.pgs_iterations > 0
-            and self.pgs_velocity_iterations == 0
-            and (not self.enable_joint_velocity_limits or velocity_candidate)
-            and not self.pgs_warmstart
-            and not self._mf_warmstart_enabled
-            and not self._debug_buffers_enabled
-            and not self._regularization_enabled
-            and not self._preelim_active
-            and not self._contact_torsion_enabled
-            and not self.contact_compliance
-            and (not self._mimic_count or velocity_candidate)
-            and not self._connect_count
-            and not self._has_loop_joints
-            and not self._sparse_diagonal_contact_solve
+        for supported, reason in (
+            (
+                sparse_choice == "on" or self._kernel_overrides.get("sparse_mass_matrix", True),
+                "Private sparse_mass_matrix override disables native sparse factors.",
+            ),
+            (model.device.is_cuda, "CPU uses ordinary factors; native sparse factors require CUDA."),
+            (not model.requires_grad, "Gradient recording requires ordinary factors."),
+            (
+                self.pgs_mode == "matrix_free" or split_candidate,
+                "Solver policy or legacy options do not admit the sparse split-row composition.",
+            ),
+            (self.articulated_contact_response == "immediate", "Sparse factors require immediate contact response."),
+            (self.pgs_schedule == "interleaved", "Sparse factors require the interleaved row schedule."),
+            (self.drive_mode == "augmented", "Sparse factors require augmented drives."),
+            (self._parallel_augmented_drive_topology, "Drive topology is not supported by native sparse factors."),
+            (self.friction_mode == "current", "Sparse factors require the current friction policy."),
+            (self.pgs_iterations > 0, "Native sparse solving requires a positive iteration budget."),
+            (self.pgs_velocity_iterations == 0, "Separate velocity iterations retain ordinary factors."),
+            (
+                not self.enable_joint_velocity_limits or velocity_candidate,
+                "Velocity-limit policy or legacy options do not admit the sparse velocity-row composition.",
+            ),
+            (not self.pgs_warmstart, "PGS warm starting requires the ordinary factor/row composition."),
+            (not self._mf_warmstart_enabled, "Matrix-free warm starting requires ordinary factors."),
+            (not self._debug_buffers_enabled, "Debug row snapshots require ordinary factors."),
+            (not self._regularization_enabled, "Contact regularization requires ordinary factors."),
+            (not self._preelim_active, "Bilateral pre-elimination requires ordinary factors."),
+            (not self._contact_torsion_enabled, "Contact torsion requires ordinary factors."),
+            (not self.contact_compliance, "Contact compliance requires ordinary factors."),
+            (not self._mimic_count or velocity_candidate, "Mimic rows require the sparse velocity-row composition."),
+            (not self._connect_count, "Connect rows require ordinary factors."),
+            (not self._has_loop_joints, "Loop-joint topology requires ordinary factors."),
+            (
+                not self._sparse_diagonal_contact_solve,
+                "The independent-coordinate contact owner already owns response.",
+            ),
         ):
-            return
+            if not supported:
+                self._sparse_selection_reason = reason
+                return
         # Decide ownership before omitting dense buffers. Explicit research
         # recipes retain their own admission and fallback, including when their
         # requested owner later declines the topology. They cannot acquire
@@ -5282,6 +5055,12 @@ class SolverFeatherPGS(SolverBase):
             or os.environ.get("FEATHER_PGS_MF_MULTIBLOCK") == "1"
             or (self._has_free_rigid_bodies and os.environ.get("FEATHER_PGS_FREE_BODY_IMPLICIT_GYRO") == "1")
         ):
+            self._sparse_selection_reason = "A legacy grouped, multiblock or free-body option retains ordinary factors."
+            return
+        from .cached_dynamics import reserve_native_patch_factors  # noqa: PLC0415
+
+        if reserve_native_patch_factors(self):
+            self._sparse_selection_reason = "A compatible native patch-dynamics cache reserves its factor buffers."
             return
         if not self._friction_anchors_enabled and (
             self.mf_gs_parallel_rows > 0
@@ -5303,26 +5082,34 @@ class SolverFeatherPGS(SolverBase):
                 )
             )
         ):
+            self._sparse_selection_reason = "A competing response or publication owner reserves the ordinary buffers."
             return
         response_dofs = self._model_plan.response_dof_count
         if (split_candidate or velocity_candidate) and (
             self._has_prescribed_response or np.any(self._kinematic_dof_mask_host)
         ):
+            self._sparse_selection_reason = "Sparse split/velocity rows do not support prescribed-coordinate topology."
             return
         free_rigid = self._model_plan.is_free_rigid != 0
         articulated = np.flatnonzero((response_dofs > 0) & ~free_rigid)
         sizes = np.unique(response_dofs[articulated])
         if len(sizes) != 1:
+            self._sparse_selection_reason = "Native sparse factors require one articulated response DOF size."
             return
         size = int(sizes[0])
         # A six-DOF articulated group cannot share the independent free-body factor view.
         if self._has_free_rigid_bodies and (size == 6 or 6 not in self._free_body_inertia_sizes):
+            self._sparse_selection_reason = "Free-body response cannot share this articulated factor layout."
             return
         # The endpoint support uses one 64-bit ancestry mask, not a robot-specific DOF limit.
         if size > 64 or size not in self._crba_source_dof_by_size or size in self._diagonal_mass_sizes:
+            self._sparse_selection_reason = (
+                "Articulated topology needs at most 64 response DOFs, a CRBA mapping and non-diagonal inertia."
+            )
             return
         articulated_counts = np.bincount(self._model_plan.articulation_world[articulated], minlength=self.world_count)
         if split_candidate and not np.all(articulated_counts == 1):
+            self._sparse_selection_reason = "Sparse split rows require exactly one articulation per world."
             return
         articulation_start = model.articulation_start.numpy()
         joint_child = model.joint_child.numpy()
@@ -5337,6 +5124,7 @@ class SolverFeatherPGS(SolverBase):
         # Velocity rows can benefit from factor-coordinate response even for a
         # serial chain; this owner does not require zeros in the mass factor.
         if plan.dof_count != size or (not velocity_candidate and plan.nonzero_count >= size * (size + 1) // 2):
+            self._sparse_selection_reason = "Topology has no usable sparse factor layout for this row policy."
             return
 
         if split_candidate:
@@ -5376,6 +5164,7 @@ class SolverFeatherPGS(SolverBase):
         # more distinct coordinates than the largest world's response vector.
         max_support = min(max_support, self.max_world_dofs)
         if not max_support:
+            self._sparse_selection_reason = "Topology has no responsive row support."
             return
         # Native kernels use static shared memory, as in the existing grouped CRBA path.
         shared_limit = min(48 * 1024, int(model.device.max_shared_memory_per_block))
@@ -5396,6 +5185,10 @@ class SolverFeatherPGS(SolverBase):
             solve_shared_bytes += 16 * ((self.dense_max_constraints + 31) // 32)
             solve_shared_bytes = (solve_shared_bytes + 3) // 4 * 4
         if solve_shared_bytes > shared_limit:
+            self._sparse_selection_reason = (
+                f"Row capacity needs {solve_shared_bytes} bytes of shared memory for sparse solving; "
+                f"limit is {shared_limit}."
+            )
             return
         shared_bytes_per_warp = 4 * (2 * plan.nonzero_count + 6 * size)
         self._sparse_factor_warps_per_block = min(
@@ -5403,8 +5196,16 @@ class SolverFeatherPGS(SolverBase):
             shared_limit // shared_bytes_per_warp,
         )
         if self._sparse_factor_warps_per_block < 1:
+            self._sparse_selection_reason = (
+                f"One sparse factor warp needs {shared_bytes_per_warp} bytes of shared memory; limit is {shared_limit}."
+            )
             return
 
+        source = "Explicit sparse_mass_matrix='on'" if sparse_choice == "on" else "Automatic sparse selection"
+        self._sparse_selection_reason = (
+            f"{source}: {size}-DOF topology and row policy admitted; "
+            f"solve uses {solve_shared_bytes}/{shared_limit} bytes of shared memory."
+        )
         self._sparse_mass_matrix_size = size
         self._sparse_split = split_candidate
         self._sparse_velocity_limits = velocity_candidate
@@ -11105,33 +10906,7 @@ class SolverFeatherPGS(SolverBase):
         # the MF carry below).
         if self._friction_anchors_enabled:
             with wp.ScopedTimer("S7_Friction_Patch_Carry", print=False, use_nvtx=self._nvtx, synchronize=False):
-                if contacts is not None:
-                    for route, parents, mu, impulses, _decay in self._patch_row_arrays():
-                        wp.launch(
-                            finish_patch_impulses,
-                            dim=contacts.rigid_contact_max,
-                            inputs=[
-                                contacts.rigid_contact_count,
-                                self._friction_patches.current,
-                                state_in.body_q,
-                                state_out.body_q,
-                                state_out.body_qd,
-                                model.body_com,
-                                self.contact_world,
-                                self.contact_slot,
-                                self.contact_path,
-                                self.contact_slots_needed,
-                                route,
-                                parents,
-                                mu,
-                                impulses,
-                                dt,
-                            ],
-                            device=model.device,
-                        )
-                    self._friction_patches.store(state_in)
-                else:
-                    self._friction_patches.previous.valid.zero_()
+                self._finish_friction_patches(state_in, state_out, contacts, dt)
 
         if self.pgs_warmstart and self._ws_prev_dense_impulses is not None:
             with wp.ScopedTimer("S7_Dense_Warmstart_Carry", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
@@ -13190,6 +12965,76 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
+    def _build_friction_patches(self, state_in, contacts):
+        """Construct the shared contact law independently of the dynamics owner."""
+        if self._friction_anchors_enabled and contacts is not None:
+            self._friction_patches.build(
+                self.model,
+                state_in,
+                contacts,
+                body_to_articulation=self.body_to_articulation,
+                is_free_rigid=self.is_free_rigid if self.is_free_rigid is not None else self._dummy_is_free_rigid,
+                contact_gap_gate=self.contact_gap_gate,
+                same_articulation_gap_gate=self.same_articulation_contact_gap_gate,
+                articulation_pair_gap_gate=self.articulation_pair_contact_gap_gate,
+                friction_gap=self.contact_friction_gap_threshold,
+                friction_articulation_pairs_only=self.contact_friction_articulation_pairs_only,
+            )
+
+    def _link_friction_patches(self, contacts):
+        """Link shared normal loads before any consumer packs row metadata."""
+        if self._friction_anchors_enabled and contacts is not None:
+            for route, parents, mu, _impulses, _decay in self._patch_row_arrays():
+                if parents is not None:
+                    wp.launch(
+                        link_patch_rows,
+                        dim=contacts.rigid_contact_max,
+                        inputs=[
+                            contacts.rigid_contact_count,
+                            self._friction_patches.view,
+                            self.contact_world,
+                            self.contact_slot,
+                            self.contact_path,
+                            self.contact_slots_needed,
+                            route,
+                            parents,
+                            mu,
+                        ],
+                        device=self.model.device,
+                    )
+
+    def _finish_friction_patches(self, state_in, state_out, contacts, dt):
+        """Publish persistent patch history from the integrated public state."""
+        if not self._friction_anchors_enabled:
+            return
+        if contacts is None:
+            self._friction_patches.previous.valid.zero_()
+            return
+        for route, parents, mu, impulses, _decay in self._patch_row_arrays():
+            wp.launch(
+                finish_patch_impulses,
+                dim=contacts.rigid_contact_max,
+                inputs=[
+                    contacts.rigid_contact_count,
+                    self._friction_patches.current,
+                    state_in.body_q,
+                    state_out.body_q,
+                    state_out.body_qd,
+                    self.model.body_com,
+                    self.contact_world,
+                    self.contact_slot,
+                    self.contact_path,
+                    self.contact_slots_needed,
+                    route,
+                    parents,
+                    mu,
+                    impulses,
+                    dt,
+                ],
+                device=self.model.device,
+            )
+        self._friction_patches.store(state_in)
+
     def _patch_row_arrays(self):
         """Yield possible contact routes and their configured warm-start decay."""
         # With only free response bodies, the allocator routes every responsive
@@ -13918,19 +13763,7 @@ class SolverFeatherPGS(SolverBase):
             enable_friction_flag = 1 if self.enable_contact_friction else 0
             contact_build_threads = min(contacts.rigid_contact_max, _CONTACT_BUILD_THREAD_CAP * _CONTACT_THREADS_X)
 
-            if self._friction_anchors_enabled:
-                self._friction_patches.build(
-                    model,
-                    state_in,
-                    contacts,
-                    body_to_articulation=self.body_to_articulation,
-                    is_free_rigid=is_free_rigid,
-                    contact_gap_gate=self.contact_gap_gate,
-                    same_articulation_gap_gate=self.same_articulation_contact_gap_gate,
-                    articulation_pair_gap_gate=self.articulation_pair_contact_gap_gate,
-                    friction_gap=self.contact_friction_gap_threshold,
-                    friction_articulation_pairs_only=self.contact_friction_articulation_pairs_only,
-                )
+            self._build_friction_patches(state_in, contacts)
 
             wp.launch(
                 allocate_world_contact_slots,
@@ -15009,25 +14842,7 @@ class SolverFeatherPGS(SolverBase):
                         device=model.device,
                     )
 
-        if self._friction_anchors_enabled and contacts is not None:
-            for route, parents, mu, _impulses, _decay in self._patch_row_arrays():
-                if parents is not None:
-                    wp.launch(
-                        link_patch_rows,
-                        dim=contacts.rigid_contact_max,
-                        inputs=[
-                            contacts.rigid_contact_count,
-                            self._friction_patches.view,
-                            self.contact_world,
-                            self.contact_slot,
-                            self.contact_path,
-                            self.contact_slots_needed,
-                            route,
-                            parents,
-                            mu,
-                        ],
-                        device=model.device,
-                    )
+        self._link_friction_patches(contacts)
 
         # Rigid-body velocity limits are matrix-free rows, not post-solve
         # clamps, in the MF path. Allocate after contacts so they occupy the

@@ -76,7 +76,7 @@ def model_fixture(device="cpu", *, variant=0, worlds=3, reordered=False, primary
     return model
 
 
-def make_solver(model, *, enabled=False, permuted=False):
+def make_solver(model, *, enabled=False, permuted=False, friction_anchor_beta=0.0):
     """Keep the retained Cholesky recipe; use a response-ABI shim only on CPU."""
     original_plan = _FeatherPGSModelPlan.build
     original_groups = SolverFeatherPGS._setup_size_grouping
@@ -125,7 +125,7 @@ def make_solver(model, *, enabled=False, permuted=False):
             double_buffer=True,
             use_parallel_streams=model.device.is_cuda,
             angular_damping=0.05,
-            friction_anchor_beta=0.0,
+            friction_anchor_beta=friction_anchor_beta,
         )
     if not model.device.is_cuda:
         solver._compute_world_response_dof_mapping(model)

@@ -35,7 +35,7 @@ def bound_call(worlds=2):
     return solver, owner, first, second, control, contacts, call
 
 
-def live_model(worlds=2):
+def live_model(worlds=2, *, device="cpu", shapes=False):
     """Construct the exact supported topology from public live builder inputs."""
     template = newton.ModelBuilder()
     bodies, joints = [], []
@@ -44,6 +44,8 @@ def live_model(worlds=2):
             mass=1.0, inertia=wp.mat33(np.eye(3, dtype=np.float32)), com=wp.vec3(0.01, -0.02, 0.03)
         )
         bodies.append(body)
+        if shapes:
+            template.add_shape_sphere(body=body, radius=0.02)
         parent = -1 if PARENTS[local] < 0 else bodies[PARENTS[local]]
         kwargs = {
             "parent": parent,
@@ -67,12 +69,14 @@ def live_model(worlds=2):
     for prescribed in (False, True):
         body = template.add_link(mass=1.0, inertia=wp.mat33(np.eye(3, dtype=np.float32)), is_kinematic=prescribed)
         template.add_articulation([template.add_joint_free(body)])
+        if shapes:
+            template.add_shape_sphere(body=body, radius=0.02)
     builder = newton.ModelBuilder()
     builder.replicate(template, worlds, spacing=(2.0, 2.0, 0.0))
-    model = builder.finalize(device="cpu")
+    model = builder.finalize(device=device)
     model.rigid_contact_max = 256
-    model.rigid_body_max_linear_velocity = wp.full(model.body_count, float("inf"), dtype=float, device="cpu")
-    model.rigid_body_max_angular_velocity = wp.full(model.body_count, float("inf"), dtype=float, device="cpu")
+    model.rigid_body_max_linear_velocity = wp.full(model.body_count, float("inf"), dtype=float, device=device)
+    model.rigid_body_max_angular_velocity = wp.full(model.body_count, float("inf"), dtype=float, device=device)
     return model
 
 

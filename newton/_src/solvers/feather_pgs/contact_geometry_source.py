@@ -62,7 +62,7 @@ _GEOMETRY = r"""        ${entry}
             if(limit>0){for(int look=1;look<=8;++look){const int prev=c-look;if(prev<0)break;if(raw.shape0.data[prev]!=sa||raw.shape1.data[prev]!=sb)break;++rank;}
                 if(c+1<count&&raw.shape0.data[c+1]==sa&&raw.shape1.data[c+1]==sb)next=1;}
             bool friction=settings.enable_friction!=0&&(!filter||phi<=settings.friction_gap_threshold);
-            if(limit>0&&rank>=limit)friction=false;
+            if(limit>0&&rank>=limit)friction=false;${patch_friction}
             s[${slot15}]=phi;s[${slot16}]=mu;s[${slot17}]=e;s[${slot18}]=mu*settings.friction_scale*((limit>0&&(rank>0||next))?0.5f:1.0f);s[${slot19}]=friction?3.0f:1.0f;
         }
 """
@@ -75,7 +75,7 @@ def _check():
     )
 
 
-def get_geometry_source(*, staging=False):
+def get_geometry_source(*, staging=False, patches=False):
     """Retain material arithmetic; choose warp scratch or one admitted cache row."""
     _check()
     offset = 0 if staging else 64
@@ -95,10 +95,11 @@ def get_geometry_source(*, staging=False):
         point_b=point_b,
         stores=stores,
         phi="s[15]" if staging else "wp::dot(n,xa-xb)",
+        patch_friction="\n            friction=friction&&patches.weight.data[c]>0.0f;" if patches else "",
     )
 
 
-def get_prelude(common, *, cached_geometry=False):
+def get_prelude(common, *, cached_geometry=False, patches=False):
     """Bind original traversal to recomputed or already staged contact geometry."""
     _check()
     bodies = (
@@ -109,7 +110,7 @@ def get_prelude(common, *, cached_geometry=False):
     geometry = (
         "        for(int k=lane;k<20;k+=stride)s[64+k]=cache.values.data[c*20+k];\n"
         if cached_geometry
-        else get_geometry_source()
+        else get_geometry_source(patches=patches)
     )
     return common + Template(_TRAVERSAL).substitute(bodies=bodies, geometry=geometry)
 

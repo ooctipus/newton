@@ -430,6 +430,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             tile_threads=64,
         )
         self.assertFalse(fallback.use_tiled_hinv_jt(160))
+        self.assertIn("shared memory", fallback.selection_reasons(160)["hinv_jt_kernel"])
 
         zero_capacity = _FeatherPGSExecutionPlan.build(
             [23],
@@ -441,6 +442,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             tile_threads=64,
         )
         self.assertFalse(zero_capacity.use_tiled_hinv_jt(23))
+        self.assertIn("zero row capacity", zero_capacity.selection_reasons(23)["hinv_jt_kernel"])
 
         with self.assertRaisesRegex(ValueError, "hinv_jt_kernel='tiled'"):
             _FeatherPGSExecutionPlan.build(
@@ -510,6 +512,8 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         )
         self.assertTrue(automatic.use_tiled_cholesky(23))
         self.assertFalse(automatic.use_tiled_cholesky(108))
+        self.assertIn("140400", automatic.selection_reasons(108)["cholesky_kernel"])
+        self.assertIn("101376", automatic.selection_reasons(108)["cholesky_kernel"])
 
         with self.assertRaisesRegex(ValueError, "cholesky_kernel='tiled'.*140400.*101376"):
             _FeatherPGSExecutionPlan.build(

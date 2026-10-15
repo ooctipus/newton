@@ -359,6 +359,8 @@ class TestKineticLiveOwner(unittest.TestCase):
 
         solver = SimpleNamespace(
             model=SimpleNamespace(particle_count=0),
+            dense_max_constraints=192,
+            mf_max_constraints=64,
             _fk_id_cache_enabled=True,
             update_mass_matrix_interval=2,
             _parallel_augmented_drive_topology=True,

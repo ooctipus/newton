@@ -109,11 +109,11 @@ _GUARD = r"""
 """
 
 
-def cuda_recurrence():
+def cuda_recurrence(*, contact_triples=True):
     """Build the common paired recurrence with explicit held-coordinate entry and exit."""
     from .paired_factor_source import get_source  # noqa: PLC0415
 
-    return get_source(192, 29, 23, 6, contact_triples=True, kinetic=True)
+    return get_source(192, 29, 23, 6, contact_triples=contact_triples, kinetic=True)
 
 
 _CPU = (
@@ -163,9 +163,17 @@ _CPU = (
 
 
 @functools.cache
-def get_solve_kernel(arch):
+def get_solve_kernel(arch, *, contact_triples=True):
     """Original two-warp CTA; ceil(active-capacity/2) tiles, block_dim64."""
-    source = _GUARD + _T + "\n#if defined(__CUDA_ARCH__)\n" + cuda_recurrence() + "\n#else\n" + _CPU + "\n#endif\n"
+    source = (
+        _GUARD
+        + _T
+        + "\n#if defined(__CUDA_ARCH__)\n"
+        + cuda_recurrence(contact_triples=contact_triples)
+        + "\n#else\n"
+        + _CPU
+        + "\n#endif\n"
+    )
 
     @wp.func_native(source)
     def solve_native(

@@ -11,11 +11,13 @@ retain their original equations and all 29 coefficients remain published.
 
 import functools
 import inspect
+from string import Template
 
 import warp as wp
 
 from . import contact_geometry_source
 from . import kinetic_rows as original
+from .friction_patches import FrictionPatches
 from .kinetic_rows_types import (
     ArmMap,
     DenseRowOutput,
@@ -44,7 +46,7 @@ _PRELUDE = contact_geometry_source.get_prelude(original._COMMON)
 def _storage() -> wp.uint64: ...
 
 
-_TRIPLET = r"""
+_TRIPLET_TEMPLATE = Template(r"""
         const auto normal=wp::vec3(s[64],s[65],s[66]);
         const auto tangent0=wp::vec3(s[73],s[74],s[75]);
         const auto tangent1=wp::vec3(s[76],s[77],s[78]);
@@ -54,13 +56,13 @@ _TRIPLET = r"""
         const bool shared_t=shared||settings.friction_shared_anchor!=0;
         const auto midpoint=(shared||shared_t)?(raw_a+raw_b)*0.5f:wp::vec3(0.0f);
         const auto xa=shared?midpoint:raw_a,xb=shared?midpoint:raw_b;
-        const auto xta=shared_t?midpoint:raw_a,xtb=shared_t?midpoint:raw_b;
+        ${tangent_anchors}
         const auto moment=wp::cross(xa-xb,normal);
         const auto moment0=nr==3?wp::cross(xta-xtb,tangent0):wp::vec3(0.0f);
         const auto moment1=nr==3?wp::cross(xta-xtb,tangent1):wp::vec3(0.0f);
         const unsigned support=(primary_a?ma:0u)|(primary_b?mb:0u);
         const bool has_free=(la==30&&(ma&63u)!=0u)||(lb==30&&(mb&63u)!=0u);
-        const bool distinct_t=nr==3&&shared!=shared_t;
+        const bool distinct_t=${distinct_t};
         auto projected=[&](const wp::vec3& nvalue,const wp::vec3& tvalue){
             return wp::vec3(wp::dot(normal,nvalue),nr==3?wp::dot(tangent0,tvalue):0.0f,
                             nr==3?wp::dot(tangent1,tvalue):0.0f);
@@ -159,13 +161,13 @@ _TRIPLET = r"""
                 float diag=settings.cfm;
                 for(int d=0;d<29;++d){const float z=s[192+component*32+d];diag+=z*z;
                     if(d>=23&&s[96+component*32+d]!=0.0f)wp::atomic_max(&out.secondary_nonzero.data[world],1);}
-                const float phi=component==0?s[79]:0.0f,e=component==0?s[81]:0.0f;
-                float bias=component==0?(phi<=0.0f?settings.bias_scale*settings.beta:settings.contact_speculative_scale)*phi/settings.dt:0.0f;
+                const float phi=component==0?s[79]:${tangent_phi},e=component==0?s[81]:0.0f;
+                float bias=component==0?(phi<=0.0f?settings.bias_scale*settings.beta:settings.contact_speculative_scale)*phi/settings.dt:${tangent_bias};
                 if(e>0.0f&&relative_value < -settings.restitution_velocity_threshold &&
                    (phi<=1.0e-6f||phi+settings.dt*relative_value<=1.0e-6f))bias=e*relative_value;
                 out.r0.data[id]=relative_value+bias;out.rhs.data[id]=known_value+bias;out.diag.data[id]=diag;
                 out.row_type.data[id]=component==0?0:2;out.row_parent.data[id]=component==0?-1:slot;
-                out.row_mu.data[id]=component==0?s[80]:s[82];out.row_beta.data[id]=component==0?settings.beta:0.0f;
+                out.row_mu.data[id]=component==0?s[80]:s[82];out.row_beta.data[id]=component==0?settings.beta:${tangent_beta};
                 out.row_cfm.data[id]=settings.cfm;out.phi.data[id]=phi;out.target_velocity.data[id]=-known_value;out.row_restitution.data[id]=e;
                 if(out.row_w.shape[0]>1)out.row_w.data[id]=1.0f;
                 if(!isfinite(relative_value)||!isfinite(bias)||!isfinite(diag)||!isfinite(out.row_mu.data[id]))wp::atomic_max(&out.status.data[world],3);
@@ -174,7 +176,25 @@ _TRIPLET = r"""
         }
         sync();
     }
-"""
+""")
+
+
+def contact_body(*, patches=False):
+    """Share support-aware three-direction arithmetic across point and patch rows."""
+    return _TRIPLET_TEMPLATE.substitute(
+        tangent_anchors=(
+            "const auto xta=nr==3?patches.point_a.data[c]:raw_a,xtb=nr==3?patches.point_b.data[c]:raw_b;"
+            if patches
+            else "const auto xta=shared_t?midpoint:raw_a,xtb=shared_t?midpoint:raw_b;"
+        ),
+        distinct_t="nr==3" if patches else "nr==3&&shared!=shared_t",
+        tangent_phi="patches.phi.data[c][component-1]" if patches else "0.0f",
+        tangent_bias="settings.bias_scale*anchor_beta*phi/settings.dt" if patches else "0.0f",
+        tangent_beta="anchor_beta" if patches else "0.0f",
+    )
+
+
+_TRIPLET = contact_body()
 _CONTACT = _PRELUDE + _TRIPLET
 
 
@@ -217,6 +237,51 @@ def get_contact_kernel(arch):
         original._release(address)
 
     return kinetic_contact_triplet
+
+
+@functools.cache
+def get_patch_contact_kernel(arch):
+    """Use shared patch anchors while producing all admitted directions together."""
+    source = contact_geometry_source.get_prelude(original._COMMON, patches=True) + contact_body(patches=True)
+
+    @wp.func_native(source)
+    def patch_contact(
+        address: wp.uint64,
+        worker: int,
+        plan: KineticPlan,
+        current: CurrentKineticCache,
+        held: HeldKineticOperator,
+        raw: RawRowInput,
+        state: RowState,
+        settings: RowSettings,
+        arm: ArmMap,
+        out: DenseRowOutput,
+        patches: FrictionPatches,
+        anchor_beta: float,
+    ): ...
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def kinetic_patch_contact_rows(
+        plan: KineticPlan,
+        current: CurrentKineticCache,
+        held: HeldKineticOperator,
+        raw: RawRowInput,
+        state: RowState,
+        settings: RowSettings,
+        arm: ArmMap,
+        out: DenseRowOutput,
+        patches: FrictionPatches,
+        anchor_beta: float,
+    ):
+        worker, logical = wp.tid()
+        lanes = original._lane()
+        if lanes[1] == 1 and logical != 0:
+            return
+        address = _storage()
+        patch_contact(address, worker, plan, current, held, raw, state, settings, arm, out, patches, anchor_beta)
+        original._release(address)
+
+    return kinetic_patch_contact_rows
 
 
 def install(rows):

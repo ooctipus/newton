@@ -42,7 +42,7 @@ _STORE_MF = r"""
 """
 
 
-def get_source(mf_phase):
+def get_source(mf_phase, *, contact_triples=True):
     """Keep dense, current-MF and rigid-limit ownership in their original order."""
     if not mf_phase:
         raise ValueError("Compact recurrence requires the complete current-MF phase")
@@ -51,7 +51,7 @@ def get_source(mf_phase):
         29,
         23,
         6,
-        contact_triples=True,
+        contact_triples=contact_triples,
         kinetic=True,
         compact=True,
         compact_views=_VIEWS,

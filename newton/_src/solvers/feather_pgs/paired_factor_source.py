@@ -152,8 +152,8 @@ def get_source(
         raise ValueError("paired factor source requires positive capacity and two components spanning at most 32 DOFs")
     if independent_components and (P, S) != (23, 6):
         raise ValueError("independent paired source requires the 23+6 pair")
-    if kinetic and (M, D, P, S, contact_triples, independent_components) != (192, 29, 23, 6, True, False):
-        raise ValueError("held kinetic source requires the 192-row 23+6 contact-triple contract")
+    if kinetic and (M, D, P, S, independent_components) != (192, 29, 23, 6, False):
+        raise ValueError("held kinetic source requires the 192-row 23+6 contract")
     if compact and (not kinetic or not all((compact_views, compact_entry, compact_sweep, compact_store))):
         raise ValueError("Compact recurrence requires the held-coordinate contract and complete storage/phase bindings")
     if not compact and any((compact_views, compact_entry, compact_sweep, compact_store)):

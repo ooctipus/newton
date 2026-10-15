@@ -245,12 +245,14 @@ def _disjoint_states(state_in, state_out):
     )
 
 
-def supported(solver):
+def supported(solver, *, planning=False):
     """Admit only the measured fixed recipe, without reading live values back."""
     from . import simple_world, solver_feather_pgs  # noqa: PLC0415
 
     return (
-        simple_world._supported(solver)
+        (simple_world._supports_policy(solver) if planning else simple_world._supported(solver))
+        and solver.dense_max_constraints == 192
+        and solver.mf_max_constraints == 64
         and not solver.model.particle_count
         and solver._fk_id_cache_enabled
         and solver.update_mass_matrix_interval == 2
@@ -259,15 +261,28 @@ def supported(solver):
         # Predictor endpoint twists must describe the same v_hat consumed by
         # ZERO. The admitted matrix-free slot recipe bypasses radial clamping.
         and (
-            not solver._has_root_free
+            planning  # Matrix-free construction allocates the rigid-limit slots below.
+            or not solver._has_root_free
             or not solver._has_rigid_body_velocity_limits
             or getattr(solver, "rigid_velocity_limit_slot", None) is not None
         )
     )
 
 
+def plan_before_factor_storage(solver):
+    """Prove compatible policy/topology before sparse selection omits native buffers."""
+    if not supported(solver, planning=True):
+        return None
+    from .kinetic_live_plan import build_live_plan  # noqa: PLC0415
+
+    try:
+        return build_live_plan(solver)
+    except ValueError:
+        return None
+
+
 class KineticWorldOwner:
-    """Own one admitted physical call and state-associated device generations."""
+    """Own held dynamics and state generations; compose contact handling separately."""
 
     def __init__(self, solver, host_plan):
         from . import kinetic_live_bindings, kinetic_types  # noqa: PLC0415
@@ -441,7 +456,21 @@ class KineticWorldOwner:
         self.last_output = None
 
     def try_step(self, state_in, state_out, state_aug, control, contacts, dt, collide_done_event=None):
-        """Replace one supported call before any original producer is launched."""
+        """Compose admitted native dynamics with the contact pipeline."""
+        from .kinetic_live_bindings import solve_contacts  # noqa: PLC0415
+
+        call = self.begin(state_in, state_out, state_aug, control, contacts, dt)
+        if call is None:
+            return False
+        if collide_done_event is not None:
+            wp.get_stream(self.device).wait_event(collide_done_event)
+        solve_contacts(self.solver, call, state_in, contacts)
+        self.finish(call, state_out)
+        self.solver._finish_friction_patches(state_in, state_out, contacts, dt)
+        return True
+
+    def begin(self, state_in, state_out, state_aug, control, contacts, dt):
+        """Refresh/reuse native factors and publish a current velocity predictor."""
         solver = self.solver
         admissible = (
             supported(solver)
@@ -458,13 +487,13 @@ class KineticWorldOwner:
         if not admissible:
             if self.last_private:
                 self._demote()
-            return False
+            return None
         self._check_slot_capacity(state_in, state_out)
         global_refresh = int(solver._step % 2 == 0 or solver._force_mass_update)
         if not self.last_private and self.ever_admitted and not global_refresh:
-            return False
+            return None
         if not self.ever_admitted and not global_refresh:
-            return False
+            return None
         if self.last_dt is not None and abs(self.last_dt - dt) > 1e-8:
             self.reset(None)
         self.last_dt = dt
@@ -555,21 +584,11 @@ class KineticWorldOwner:
         wp.copy(solver._debug_stage3_qd_work, state_in.joint_qd)
         wp.copy(solver._debug_stage3_joint_qdd, state_aug.joint_qdd)
         wp.copy(solver._debug_stage3_v_hat, solver.v_hat)
-        if collide_done_event is not None:
-            wp.get_stream(self.device).wait_event(collide_done_event)
-        call.zero.launch()
-        solve = call.solve
-        try:
-            solve.setup()
-            solve.allocate()
-            solve.build_rows()
-            solve.prepare_mf()
-            solve.qualify()
-            solve.materialize()
-            solve.solve()
-        finally:
-            solve.join()
-        solver._finalize_constraint_status(contacts)
+        return call
+
+    def finish(self, call, state_out):
+        """Integrate the solved velocity and publish the next cached generation."""
+        slots, solver = call.slots, self.solver
         call.finish_launch()
         wp.launch(
             _publish_bank_generation,
@@ -585,14 +604,13 @@ class KineticWorldOwner:
         wp.launch(
             _finish_status,
             dim=self.worlds,
-            inputs=[slots.next_schedule.status, solve.guard.frame_status],
+            inputs=[slots.next_schedule.status, call.solve.guard.frame_status],
             device=self.device,
         )
         self.ever_admitted = self.last_private = True
         self.last_output = state_out
         solver._joint_world_active = False
         solver._fk_id_cache_source_state = state_out
-        return True
 
     def update_contacts(self, contacts):
         """Export only when the real public API calls, never by a baked phase."""
@@ -611,8 +629,10 @@ def create_owner(solver):
         return None
     from . import kinetic_live_plan  # noqa: PLC0415
 
-    try:
-        host_plan = kinetic_live_plan.build_plan(solver)
-    except ValueError:
-        return None
+    host_plan = getattr(solver, "_kinetic_world_plan", None)
+    if host_plan is None:
+        try:
+            host_plan = kinetic_live_plan.build_plan(solver)
+        except ValueError:
+            return None
     return KineticWorldOwner(solver, host_plan)

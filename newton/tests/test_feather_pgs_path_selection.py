@@ -23,6 +23,64 @@ def _cpu_model():
 
 
 class TestFeatherPGSPathSelection(unittest.TestCase):
+    def test_cpu_selection_reasons_are_detached_and_host_only(self):
+        """Explain CPU fallbacks without synchronizing or exposing mutable solver state."""
+        solver = SolverFeatherPGS(_cpu_model())
+        with patch.object(wp, "synchronize", side_effect=AssertionError("unexpected synchronization")):
+            with patch.object(wp.array, "numpy", side_effect=AssertionError("unexpected device read")):
+                selected = solver.get_path_selection()
+        self.assertIn("CPU", selected["reasons"]["sparse_mass_matrix"])
+        self.assertIn("CPU", selected["reasons"]["cached_dynamics"])
+        self.assertIn("CPU", selected["reasons"]["kernel_plan_by_dof"][1]["cholesky_kernel"])
+        selected["reasons"]["kernel_plan_by_dof"][1]["cholesky_kernel"] = "edited"
+        self.assertNotEqual(solver.get_path_selection()["reasons"], selected["reasons"])
+
+    def test_private_override_validation_and_cpu_precedence(self):
+        """Validate effective overrides while preserving explicit choices and CPU fallbacks."""
+        model = _cpu_model()
+        with patch.dict(SolverFeatherPGS._kernel_overrides, {"cholesky_kernel": "invalid"}):
+            with self.assertRaisesRegex(ValueError, "cholesky_kernel"):
+                SolverFeatherPGS(model)
+            explicit = SolverFeatherPGS(model, cholesky_kernel="loop").get_path_selection()
+            self.assertIn("Explicit", explicit["reasons"]["kernel_plan_by_dof"][1]["cholesky_kernel"])
+        with patch.dict(SolverFeatherPGS._kernel_overrides, {"cholesky_kernel": "tiled"}):
+            solver = SolverFeatherPGS(model)
+            self.assertEqual(solver.cholesky_kernel, "loop")
+            reason = solver.get_path_selection()["reasons"]["kernel_plan_by_dof"][1]["cholesky_kernel"]
+            self.assertIn("CPU", reason)
+            self.assertIn("override", reason)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Sparse admission requires CUDA")
+    def test_sparse_selection_reasons_distinguish_policy_capacity_and_override(self):
+        """Explain the actual sparse rejection while retaining the dense fallback."""
+        model = _build_model()
+        cases = (
+            ({"sparse_mass_matrix": "off"}, "Explicit"),
+            ({"trisolve_kernel": "loop"}, "explicit dense"),
+            ({"pgs_warmstart": True}, "warm"),
+            ({"dense_max_constraints": 2048}, "shared memory"),
+        )
+        for options, expected in cases:
+            with self.subTest(options=options):
+                selected = _make_solver(model, True, **options).get_path_selection()
+                self.assertEqual(selected["sparse_mass_matrix"], "off")
+                self.assertIn(expected, selected["reasons"]["sparse_mass_matrix"])
+        selected = _make_solver(model, True).get_path_selection()
+        self.assertEqual(selected["sparse_mass_matrix"], "on")
+        self.assertIn("topology", selected["reasons"]["sparse_mass_matrix"])
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
+    def test_cache_selection_reports_environment_and_explicit_precedence(self):
+        """Retain construction-time cache decisions after environment overrides change."""
+        model = _build_model()
+        with patch.dict(os.environ, {"FEATHER_PGS_TREE_KINETIC_STATE": "0"}):
+            disabled = _make_solver(model, True)
+            forced = _make_solver(model, True, cached_dynamics="on")
+        self.assertEqual(disabled.get_path_selection()["cached_dynamics"], "off")
+        self.assertIn("FEATHER_PGS_TREE_KINETIC_STATE", disabled.get_path_selection()["reasons"]["cached_dynamics"])
+        self.assertEqual(forced.get_path_selection()["cached_dynamics"], "on")
+        self.assertIn("Explicit", forced.get_path_selection()["reasons"]["cached_dynamics"])
+
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse admission requires CUDA")
     def test_sparse_auto_composes_existing_execution_choices(self):
         """Select qualified split, velocity-limit and grouped paths without private switches."""
