@@ -331,6 +331,54 @@ class TestHeightfieldCylinderContact(unittest.TestCase):
         """Rest upright and lying cylinders on flat and sloped terrain through both queries on CPU."""
         self.check_resting("cpu")
 
+    def test_rough_terrain_support_cpu(self):
+        """A long lying cylinder over small random cells rests on both queries without sinking or drifting."""
+        rng = np.random.default_rng(3)
+        builder = newton.ModelBuilder()
+        cfg = builder.ShapeConfig(margin=0.001, gap=0.002, mu=0.8)
+        # A shallow channel along x keeps the cylinder from rolling away; millimetre noise
+        # still splits its contact line across cells.
+        grid = np.linspace(-0.4, 0.4, 17, dtype=np.float32)
+        heights = (0.1 * np.abs(grid)[:, None] + 0.0 * grid[None, :]).astype(np.float32)
+        heights += rng.uniform(-0.002, 0.002, size=(17, 17)).astype(np.float32)
+        terrain = newton.Heightfield(data=heights, nrow=17, ncol=17, hx=0.4, hy=0.4)
+        builder.add_shape_heightfield(heightfield=terrain, cfg=cfg)
+        q = _quat_from_to(np.array([0.0, 0.0, 1.0]), np.array([1.0, 0.0, 0.0]))
+        body = builder.add_body(
+            xform=wp.transform(wp.vec3(0.01, 0.02, 0.05), wp.quat(*[float(x) for x in q])), mass=1.0
+        )
+        builder.add_shape_cylinder(body, radius=0.025, half_height=0.12, cfg=cfg)
+        model = builder.finalize(device="cpu")
+        outcomes = []
+        for analytic in ("0", "1"):
+            env = {
+                **FLAGS,
+                "NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY": "1",
+                "NEWTON_HEIGHTFIELD_ANALYTIC_PRIMITIVES": analytic,
+            }
+            with patch.dict(os.environ, env):
+                owner = newton.CollisionPipeline(
+                    model, reduce_contacts=True, rigid_contact_max=4096, max_triangle_pairs=4096
+                )
+            solver = newton.solvers.SolverXPBD(model, iterations=10)
+            state, next_state = model.state(), model.state()
+            contacts, control = owner.contacts(), model.control()
+            for _ in range(300):
+                state.clear_forces()
+                owner.collide(state, contacts)
+                solver.step(state, next_state, control, contacts, 0.002)
+                state, next_state = next_state, state
+            pose, velocity = state.body_q.numpy()[0], state.body_qd.numpy()[0]
+            self.assertTrue(np.isfinite(pose).all() and np.isfinite(velocity).all())
+            # Rolls into the channel bottom, rests one radius above the surface and stays
+            # put (it still rocks slowly in the channel at this point).
+            self.assertAlmostEqual(float(pose[2]), 0.025 + 0.1 * abs(float(pose[1])), delta=0.008)
+            self.assertLess(abs(float(pose[1])), 0.03)
+            self.assertLess(float(np.abs(velocity[:3]).max()), 0.1)
+            self.assertLess(float(np.abs(velocity[3:]).max()), 1.5)
+            outcomes.append(pose.copy())
+        np.testing.assert_allclose(outcomes[0][:3], outcomes[1][:3], atol=0.002, rtol=0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
