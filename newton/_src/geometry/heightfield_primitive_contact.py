@@ -45,6 +45,20 @@ def analytic_primitives_default() -> bool:
     return value == "1"
 
 
+def analytic_convex_default() -> bool:
+    """Return whether heightfield convex-hull pairs use the closed-form row by default.
+
+    Off by default: the row is complete and validated, but on Go2 rough (hull
+    calves near terrain) it measured +1.85% against the generic query,
+    independent of kernel count and polygon size, and the per-pair cost has
+    not been located. ``NEWTON_HEIGHTFIELD_ANALYTIC_CONVEX=1`` enables it.
+    """
+    value = os.environ.get("NEWTON_HEIGHTFIELD_ANALYTIC_CONVEX", "0")
+    if value not in ("0", "1"):
+        raise ValueError("NEWTON_HEIGHTFIELD_ANALYTIC_CONVEX must be 0 or 1")
+    return value == "1"
+
+
 @wp.func
 def _closest_segment_segment(p0: wp.vec3, p1: wp.vec3, q0: wp.vec3, q1: wp.vec3) -> tuple[float, float]:
     """Parameters of the closest points between two segments (Ericson 5.1.9)."""

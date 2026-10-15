@@ -285,6 +285,13 @@ class TestHeightfieldConvexContact(unittest.TestCase):
         # In the pipeline the row runs inside the generic fallback scan (no sixth kernel).
         fallback = create_mesh_triangle_contacts_to_reducer_kernel(exclude_primitives=True, analytic=True)
         self.assertTrue(fallback.key.endswith("fallback_kernel_analytic_convex"))
+        # Opt-in: by default the fallback keeps the generic query for hulls.
+        with patch.dict(os.environ, {"NEWTON_HEIGHTFIELD_ANALYTIC_CONVEX": "0"}):
+            default = create_mesh_triangle_contacts_to_reducer_kernel(exclude_primitives=True)
+        self.assertTrue(default.key.endswith("mesh_triangle_contacts_to_reducer_fallback_kernel"))
+        with patch.dict(os.environ, {"NEWTON_HEIGHTFIELD_ANALYTIC_CONVEX": "1"}):
+            enabled = create_mesh_triangle_contacts_to_reducer_kernel(exclude_primitives=True)
+        self.assertIs(enabled, fallback)
         without = create_mesh_triangle_contacts_to_reducer_kernel(
             exclude_primitives=True, exclude_heightfield_convex=True, analytic=True
         )
@@ -317,6 +324,7 @@ class TestHeightfieldConvexContact(unittest.TestCase):
                         **FLAGS,
                         "NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY": "1",
                         "NEWTON_HEIGHTFIELD_ANALYTIC_PRIMITIVES": analytic,
+                        "NEWTON_HEIGHTFIELD_ANALYTIC_CONVEX": analytic,
                     }
                     with patch.dict(os.environ, env):
                         owner = newton.CollisionPipeline(

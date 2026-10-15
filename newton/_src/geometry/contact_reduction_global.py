@@ -81,7 +81,11 @@ from .contact_reduction import (
     project_point_to_plane,
 )
 from .heightfield_features import WELD_FLAT_SEAMS, HeightfieldFeatureContext, flat_seam_query_allowed
-from .heightfield_primitive_contact import ANALYTIC_PRIMITIVE_QUERIES, analytic_primitives_default
+from .heightfield_primitive_contact import (
+    ANALYTIC_PRIMITIVE_QUERIES,
+    analytic_convex_default,
+    analytic_primitives_default,
+)
 from .support_function import (
     create_triangle_prism_penetration_refiner,
     extract_shape_data,
@@ -2522,8 +2526,11 @@ def create_mesh_triangle_contacts_to_reducer_kernel(
             fallback that still serves heightfield convex pairs, for those
             pairs inside the same kernel (every typed kernel is one more scan
             of the whole candidate list, so convex hulls do not get their own).
-            ``None`` reads ``NEWTON_HEIGHTFIELD_ANALYTIC_PRIMITIVES`` (default on).
+            ``None`` reads ``NEWTON_HEIGHTFIELD_ANALYTIC_PRIMITIVES`` (default on)
+            and, for the convex row, ``NEWTON_HEIGHTFIELD_ANALYTIC_CONVEX``
+            (default off); an explicit ``True`` enables both.
     """
+    analytic_convex = analytic if analytic is not None else analytic_convex_default()
     if analytic is None:
         analytic = analytic_primitives_default()
     analytic = bool(analytic)
@@ -2538,7 +2545,9 @@ def create_mesh_triangle_contacts_to_reducer_kernel(
         writer_data_type=writer_data_type,
         kernel_name=kernel_name,
         analytic=analytic and primitive_type in ANALYTIC_PRIMITIVE_QUERIES,
-        analytic_convex=analytic and convex_in_fallback and int(GeoType.CONVEX_MESH) in ANALYTIC_PRIMITIVE_QUERIES,
+        analytic_convex=bool(analytic_convex)
+        and convex_in_fallback
+        and int(GeoType.CONVEX_MESH) in ANALYTIC_PRIMITIVE_QUERIES,
     )
 
 
