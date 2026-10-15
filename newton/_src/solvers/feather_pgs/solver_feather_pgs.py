@@ -280,6 +280,7 @@ _GROUPED_FK_OFF = os.environ.get("FEATHER_PGS_GROUPED_FK") == "0"
 _GROUPED_TAU_MASS_ON = os.environ.get("FEATHER_PGS_GROUPED_TAU_MASS") == "1"
 _GROUPED_MASS_ON = os.environ.get("FEATHER_PGS_GROUPED_MASS") == "1"
 _FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
+_FK_ID_CACHE_SNAPSHOT = os.environ.get("FEATHER_PGS_FK_CACHE_SNAPSHOT") == "1"
 # Experimental Stage 7 producer partition, leaving all solve/mass budgets intact.
 _PRISMATIC_PUBLICATION = os.environ.get("FEATHER_PGS_PRISMATIC_PUBLICATION", "0") == "1"
 _PRISMATIC_LINEAR_STATE = os.environ.get("FEATHER_PGS_PRISMATIC_LINEAR_STATE", "0") == "1"
@@ -2262,11 +2263,12 @@ class SolverFeatherPGS(SolverBase):
             and not _FK_ID_CACHE_OFF
         )
         self._fk_id_cache_enabled = self._fk_id_cache_available and not enable_joint_velocity_limits
-        # Split's dense/MF execution exposed a cross-replay lifetime conflict
-        # when stage 7 published next-step dynamics over active solve scratch.
-        # Matrix-free concludes those readers before its validated in-place
-        # publication and keeps the zero-copy path.
-        self._fk_id_cache_uses_snapshot = self._fk_id_cache_enabled and self.pgs_mode == "split"
+        # Stage 7 publishes next-step dynamics in place; the snapshot copy of
+        # the whole FK/ID cache every substep is retained only as an opt-in
+        # bisection aid (FEATHER_PGS_FK_CACHE_SNAPSHOT=1).
+        self._fk_id_cache_uses_snapshot = (
+            self._fk_id_cache_enabled and self.pgs_mode == "split" and _FK_ID_CACHE_SNAPSHOT
+        )
         self._fk_id_cache_source_state = None
         self._fk_id_cache_valid = wp.zeros(model.articulation_count, dtype=wp.int32, device=model.device)
         self._fk_id_cache = None
