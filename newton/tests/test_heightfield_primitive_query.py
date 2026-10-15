@@ -233,7 +233,8 @@ class TestHeightfieldPrimitiveQuery(unittest.TestCase):
             for kind in ("sphere", "cylinder")
             for options in ({}, {"slope": True}, {"border": True}, {"deep": True})
         ]
-        cases += [("cylinder", {"barrel": True, "slope": True}), ("capsule", {"slope": True})]
+        # Capsules now have their own typed closed-form query; see test_heightfield_capsule_contact.
+        cases += [("cylinder", {"barrel": True, "slope": True})]
         for kind, options in cases:
             with self.subTest(device=device, kind=kind, options=options):
                 model = primitive_model(device, kind, **options)
@@ -266,9 +267,9 @@ class TestHeightfieldPrimitiveQuery(unittest.TestCase):
 
         with patch.object(wp, "launch", side_effect=observe):
             owner.collide(state, contacts)
-        self.assertEqual([index for index, count in allocations], [0, 1, 2])
-        self.assertEqual([count for index, count in allocations[:2]], [0, 0])
-        self.assertGreater(allocations[2][1], 0)
+        self.assertEqual([index for index, count in allocations], [0, 1, 2, 3])
+        self.assertEqual([count for index, count in allocations if index != 3], [0, 0, 0])
+        self.assertGreater(allocations[3][1], 0)
 
     def test_loaded_geometry_cpu(self):
         """Compare real typed and generic terrain contacts and capsule fallback on CPU."""
@@ -377,10 +378,14 @@ class TestHeightfieldPrimitiveQuery(unittest.TestCase):
                     state.body_q.assign(current)
                     current_types = types.copy()
                     if epoch == 1:
-                        current_types[1] = int(newton.GeoType.CAPSULE)
+                        # A barrel cylinder stays on the generic fallback in both pipelines.
+                        current_types[1] = int(newton.GeoType.CYLINDER)
                     model.shape_type.assign(current_types)
                     current_scale = scale.copy()
                     current_scale[1, :2] *= 0.9
+                    if epoch == 1:
+                        current_scale[1, 1] = 0.05
+                        current_scale[1, 2] = 0.2
                     if kind == "cylinder" and epoch == 2:
                         current_scale[1, 2] = 0.2
                     model.shape_scale.assign(current_scale)

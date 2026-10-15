@@ -253,7 +253,9 @@ class TestHeightfieldCylinderSplit(unittest.TestCase):
                 kinds, dimensions = types.copy(), scales.copy()
                 dimensions[1, :2] *= 0.9
                 if epoch == 1:
-                    kinds[1] = int(newton.GeoType.CAPSULE)
+                    # A box stays on the generic fallback (capsules now have a typed query).
+                    kinds[1] = int(newton.GeoType.BOX)
+                    dimensions[1, 2] = 0.02
                 if epoch == 2:
                     dimensions[1, 2] = 0.2
                 model.shape_type.assign(kinds)
@@ -273,7 +275,7 @@ class TestHeightfieldCylinderSplit(unittest.TestCase):
                     self.assertEqual(int(actual.narrow_phase._heightfield_cylinder_gjk_count.numpy()[0]), 0)
 
     def test_lifecycle_cpu(self):
-        """Refresh current geometry after empty, barrel and capsule fallback frames."""
+        """Refresh current geometry after empty, barrel and box fallback frames."""
         self.check_lifecycle("cpu")
 
     def test_loaded_support_cpu(self):

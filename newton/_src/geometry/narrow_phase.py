@@ -2649,9 +2649,12 @@ class NarrowPhase:
 
             self._heightfield_convex_cell_kernel = get_kernel()
         if self._heightfield_primitive_query:
+            # Index 1 is the cylinder query (the cylinder split replaces it); the
+            # generic fallback comes last and excludes every typed primitive.
             self._heightfield_primitive_kernels = (
                 create_mesh_triangle_contacts_to_reducer_kernel(int(GeoType.SPHERE)),
                 create_mesh_triangle_contacts_to_reducer_kernel(int(GeoType.CYLINDER)),
+                create_mesh_triangle_contacts_to_reducer_kernel(int(GeoType.CAPSULE)),
                 create_mesh_triangle_contacts_to_reducer_kernel(
                     exclude_primitives=True, exclude_heightfield_convex=self._heightfield_convex_cells_requested
                 ),

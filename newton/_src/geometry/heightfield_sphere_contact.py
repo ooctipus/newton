@@ -22,7 +22,6 @@ reducer, export and solver see the same contacts.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import warp as wp
@@ -39,14 +38,6 @@ PROXY_RADIUS = 1.0e-4
 
 _ADMISSION_SLACK = 1.0e-4
 """Separation beyond the query threshold at which a pair is dropped without consulting the writer."""
-
-
-def analytic_sphere_default() -> bool:
-    """Return whether the typed sphere query uses the closed-form contact by default."""
-    value = os.environ.get("NEWTON_HEIGHTFIELD_SPHERE_ANALYTIC", "1")
-    if value not in ("0", "1"):
-        raise ValueError("NEWTON_HEIGHTFIELD_SPHERE_ANALYTIC must be 0 or 1")
-    return value == "1"
 
 
 @wp.func
@@ -101,6 +92,46 @@ def _closest_point_on_prism_sides(
     return best, best_sq
 
 
+@wp.func
+def prism_normal(e1: wp.vec3, e2: wp.vec3) -> wp.vec3:
+    """Unit top-face normal with positive Z, or zero for a degenerate cell."""
+    n = wp.cross(e1, e2)
+    n_sq = wp.length_sq(n)
+    if n_sq < 1.0e-24:
+        return wp.vec3(0.0)
+    n = n / wp.sqrt(n_sq)
+    if n[2] < 0.0:
+        n = -n
+    return n
+
+
+@wp.func
+def point_prism_query(c: wp.vec3, e1: wp.vec3, e2: wp.vec3, n: wp.vec3, reach: float) -> tuple[wp.vec3, wp.vec3, float]:
+    """Nearest prism point, outward direction and signed distance of a point.
+
+    Inside the prism the direction is the top-face normal and the distance is
+    the (negative) plane depth, as the triangle-prism penetration refiner
+    reports; outside it is the nearest point among the top triangle, the
+    side walls and, within ``reach``, the bottom face.
+    """
+    s = wp.dot(c, n)
+    projected = c - s * n
+    top = closest_point_on_triangle(projected, wp.vec3(0.0), e1, e2)
+    on_face = wp.length_sq(projected - top) < 1.0e-10
+    if s < 0.0 and n[2] > 0.0:
+        if -s <= TRIANGLE_PRISM_EXTRUSION * n[2] and _xy_inside_triangle(c, e1, e2):
+            return projected, n, s
+    best = top
+    best_sq = wp.length_sq(c - top)
+    if not (s >= 0.0 and on_face):
+        best, best_sq = _closest_point_on_prism_sides(c, e1, e2, best, best_sq, reach)
+    d = wp.sqrt(best_sq)
+    direction = n
+    if d > 1.0e-12:
+        direction = (c - best) / d
+    return best, direction, d
+
+
 def create_sphere_prism_contacts(writer_func: Any, query_filter: Any = None):
     """Create the closed-form sphere-vs-prism query with the signature of ``compute_gjk_mpr_contacts``.
 
@@ -130,48 +161,17 @@ def create_sphere_prism_contacts(writer_func: Any, query_filter: Any = None):
     ):
         e1 = shape_a_data.scale
         e2 = shape_a_data.auxiliary
-        n = wp.cross(e1, e2)
-        n_sq = wp.length_sq(n)
-        if n_sq < 1.0e-24:
+        n = prism_normal(e1, e2)
+        if n[2] == 0.0:
             return
-        n = n / wp.sqrt(n_sq)
-        if n[2] < 0.0:
-            n = -n
 
         radius = shape_b_data.scale[0]
         threshold = rigid_gap + radius + margin_a + margin_b
         # Sphere center in the triangle-origin heightfield-local frame.
         c = wp.quat_rotate_inv(rot_a, pos_b_adjusted - pos_a_adjusted)
-        s = wp.dot(c, n)
-        projected = c - s * n
-        top = closest_point_on_triangle(projected, wp.vec3(0.0), e1, e2)
-        on_face = wp.length_sq(projected - top) < 1.0e-10
-
-        inside = False
-        if s < 0.0 and n[2] > 0.0:
-            inside = -s <= TRIANGLE_PRISM_EXTRUSION * n[2] and _xy_inside_triangle(c, e1, e2)
-
-        normal = n
-        point_b = c - n * PROXY_RADIUS
-        point_a = point_b
-        signed_distance = float(0.0)
-        if inside:
-            # Penetration: the top-face normal and plane depth of the refiner.
-            point_a = point_b + (PROXY_RADIUS - s) * n
-            signed_distance = s - PROXY_RADIUS
-        else:
-            best = top
-            best_sq = wp.length_sq(c - top)
-            if not (s >= 0.0 and on_face):
-                best, best_sq = _closest_point_on_prism_sides(
-                    c, e1, e2, best, best_sq, threshold + PROXY_RADIUS + _ADMISSION_SLACK
-                )
-            d = wp.sqrt(best_sq)
-            if d > 1.0e-12:
-                normal = (c - best) / d
-            point_a = best
-            point_b = c - normal * PROXY_RADIUS
-            signed_distance = d - PROXY_RADIUS
+        point_a, normal, d = point_prism_query(c, e1, e2, n, threshold + PROXY_RADIUS + _ADMISSION_SLACK)
+        point_b = c - normal * PROXY_RADIUS
+        signed_distance = d - PROXY_RADIUS
 
         if signed_distance > threshold + _ADMISSION_SLACK:
             return

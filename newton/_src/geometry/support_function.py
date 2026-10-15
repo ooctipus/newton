@@ -394,6 +394,19 @@ def support_map_heightfield_sphere(
 
 
 @wp.func
+def support_map_heightfield_capsule(
+    geom: GenericShapeData, direction: wp.vec3, data_provider: SupportMapDataProvider
+) -> wp.vec3:
+    """Restrict support dispatch to an admitted heightfield prism/capsule pair."""
+    result = wp.vec3(0.0, 0.0, 0.0)
+    if geom.shape_type == GeoTypeEx.TRIANGLE_PRISM:
+        result = _support_map_triangle(geom, direction)
+    elif geom.shape_type == GeoType.CAPSULE:
+        result = support_map(geom, direction, data_provider)
+    return result
+
+
+@wp.func
 def support_map_heightfield_cylinder(
     geom: GenericShapeData, direction: wp.vec3, data_provider: SupportMapDataProvider
 ) -> wp.vec3:

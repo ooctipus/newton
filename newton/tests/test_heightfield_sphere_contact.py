@@ -431,19 +431,19 @@ class TestHeightfieldSphereContact(unittest.TestCase):
 
     def test_kernel_selection(self):
         """Select the analytic query by default and keep the generic one behind the opt-out."""
-        analytic = create_mesh_triangle_contacts_to_reducer_kernel(int(newton.GeoType.SPHERE), analytic_sphere=True)
-        generic = create_mesh_triangle_contacts_to_reducer_kernel(int(newton.GeoType.SPHERE), analytic_sphere=False)
+        analytic = create_mesh_triangle_contacts_to_reducer_kernel(int(newton.GeoType.SPHERE), analytic=True)
+        generic = create_mesh_triangle_contacts_to_reducer_kernel(int(newton.GeoType.SPHERE), analytic=False)
         self.assertIsNot(analytic, generic)
         self.assertTrue(analytic.key.endswith("_analytic"))
-        with patch.dict(os.environ, {"NEWTON_HEIGHTFIELD_SPHERE_ANALYTIC": "1"}):
+        with patch.dict(os.environ, {"NEWTON_HEIGHTFIELD_ANALYTIC_PRIMITIVES": "1"}):
             self.assertIs(create_mesh_triangle_contacts_to_reducer_kernel(int(newton.GeoType.SPHERE)), analytic)
-        with patch.dict(os.environ, {"NEWTON_HEIGHTFIELD_SPHERE_ANALYTIC": "0"}):
+        with patch.dict(os.environ, {"NEWTON_HEIGHTFIELD_ANALYTIC_PRIMITIVES": "0"}):
             self.assertIs(create_mesh_triangle_contacts_to_reducer_kernel(int(newton.GeoType.SPHERE)), generic)
-        with patch.dict(os.environ, {"NEWTON_HEIGHTFIELD_SPHERE_ANALYTIC": "yes"}):
+        with patch.dict(os.environ, {"NEWTON_HEIGHTFIELD_ANALYTIC_PRIMITIVES": "yes"}):
             with self.assertRaises(ValueError):
                 create_mesh_triangle_contacts_to_reducer_kernel(int(newton.GeoType.SPHERE))
         # The cylinder query ignores the flag.
-        cylinder = create_mesh_triangle_contacts_to_reducer_kernel(int(newton.GeoType.CYLINDER), analytic_sphere=True)
+        cylinder = create_mesh_triangle_contacts_to_reducer_kernel(int(newton.GeoType.CYLINDER), analytic=True)
         self.assertIs(cylinder, create_mesh_triangle_contacts_to_reducer_kernel(int(newton.GeoType.CYLINDER)))
 
     def check_loaded_terrain(self, device):
@@ -457,7 +457,7 @@ class TestHeightfieldSphereContact(unittest.TestCase):
                     env = {
                         **FLAGS,
                         "NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY": "1",
-                        "NEWTON_HEIGHTFIELD_SPHERE_ANALYTIC": analytic,
+                        "NEWTON_HEIGHTFIELD_ANALYTIC_PRIMITIVES": analytic,
                     }
                     with patch.dict(os.environ, env):
                         owners.append(
