@@ -88,6 +88,7 @@ def make_solver(model, *, enabled=False, permuted=False):
             os.environ,
             {
                 "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": str(int(enabled)),
+                "FEATHER_PGS_FRANKA_KINETIC_STATE": "0",
                 "FEATHER_PGS_LOCAL_ROW_PACKETS": "0",
                 "FEATHER_PGS_SPARSE_FACTOR": "0",
                 "FEATHER_PGS_TREE_KINETIC_STATE": "0",

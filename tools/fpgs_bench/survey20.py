@@ -24,7 +24,7 @@ def flags(*names):
 
 RECIPES = {
     "franka": (
-        flags("SIMPLE_WORLD_ZERO", "LOCAL_ROW_PACKETS"),
+        flags("SIMPLE_WORLD_ZERO", "LOCAL_ROW_PACKETS", "FRANKA_KINETIC_STATE", "FRANKA_COMPACT_WORKSPACE"),
         {"rigid_contact_max": 8192},
     ),
     "kuka": (

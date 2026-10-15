@@ -64,6 +64,7 @@ def _build(device, worlds=4):
 def _rollout(model, *, owner, steps=120):
     env = {
         "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": str(int(owner)),
+        "FEATHER_PGS_FRANKA_KINETIC_STATE": "0",
         "FEATHER_PGS_TREE_KINETIC_STATE": "0",
         "FEATHER_PGS_WORLD_SCAN_PUBLICATION": "0",
         "FEATHER_PGS_LOCAL_ROW_PACKETS": "0",

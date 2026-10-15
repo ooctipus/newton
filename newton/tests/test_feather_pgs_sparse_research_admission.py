@@ -107,6 +107,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
             "SINGLE_FACTOR",
             "SPARSE_FACTOR",
             "KUKA_KINETIC_WORLD",
+            "FRANKA_KINETIC_STATE",
             "INDEPENDENT_COMPONENTS",
             "WORLD_SCAN_PUBLICATION",
             "PAIRED_GENERAL_OVERLAP",

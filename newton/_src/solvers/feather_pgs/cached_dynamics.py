@@ -21,6 +21,7 @@ def install(solver, *, factor_warps: int) -> None:
     solver._kinetic_world = None
     solver._tree_kinetic_state = None
     solver._g1_kinetic_state = None
+    solver._franka_kinetic_state = None
     choice = solver.cached_dynamics
     if choice == "off":
         solver._cached_dynamics_selection_reason = "Explicit cached_dynamics='off' retains ordinary dynamics."
@@ -64,6 +65,25 @@ def install(solver, *, factor_warps: int) -> None:
 
         solver._tree_kinetic_state = create_owner(solver)
 
+    # Held Cholesky dynamics publishes complete body state for the ordinary
+    # patch-friction row pipeline. Its cache does not own contact rows or history.
+    if (
+        solver._sparse_mass_matrix_size is None
+        and not solver._contact_torsion_enabled
+        and not solver.contact_compliance
+        and enabled("FRANKA_KINETIC_STATE")
+    ):
+        from .franka_kinetic_factor import get_kernel  # noqa: PLC0415
+        from .franka_kinetic_state import create_owner  # noqa: PLC0415
+
+        solver._franka_kinetic_state = create_owner(solver)
+        if solver._franka_kinetic_state is not None:
+            solver._franka_kinetic_factor = get_kernel(
+                str(solver.model.device.arch),
+                warps_per_block=factor_warps,
+                size=solver._franka_kinetic_state.layout.primary_dofs,
+            )
+
     # Mixed held factors have physical coverage but no established performance
     # benefit. Retain explicit admission until their cost ranking justifies auto.
     if solver._tree_kinetic_state is None and enabled("MIXED_TREE_KINETIC_STATE", default=False):
@@ -75,6 +95,7 @@ def install(solver, *, factor_warps: int) -> None:
         name
         for name, owner in (
             ("tree", solver._tree_kinetic_state),
+            ("held Cholesky", solver._franka_kinetic_state),
             ("kinetic", solver._kinetic_world),
         )
         if owner is not None
