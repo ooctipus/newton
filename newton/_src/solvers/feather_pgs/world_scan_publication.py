@@ -8,8 +8,6 @@ segments. This owns no mass factor, constraint solve, or early-publication strea
 """
 
 import functools
-import hashlib
-import linecache
 
 import numpy as np
 import warp as wp
@@ -166,21 +164,9 @@ def _scan_motion(address: wp.uint64, world: int, plan: kuka_joint_world.JointWor
 @functools.cache
 def _publication_kernels(arch):
     """Compile the complete late generalized, pose, twist and dynamics owner."""
-    source = "\n".join(
-        kuka_joint_world.operation_source(name)
-        for name in (
-            "update_qdd_from_velocity",
-            "remove_free_root_transport_from_qdd",
-            "integrate_generalized_joints",
-        )
-    )
-    filename = f"<world-scan-publication-{hashlib.sha256(source.encode()).hexdigest()}>"
-    linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)
-    namespace = dict(kernels.__dict__)
-    exec(compile(source, filename, "exec"), namespace)
-    update_qdd = namespace["_light_update_qdd_from_velocity"]
-    remove_transport = namespace["_light_remove_free_root_transport_from_qdd"]
-    integrate = namespace["_light_integrate_generalized_joints"]
+    update_qdd = kernels._light_update_qdd_from_velocity
+    remove_transport = kernels._light_remove_free_root_transport_from_qdd
+    integrate = kernels._light_integrate_generalized_joints
     finalize = kernels.finalize_body_dynamics_values
 
     @wp.func

@@ -97,14 +97,14 @@ PINNED = {
         "populate_rigid_velocity_limit_rows": "d71b12578c40b4c805740822c8b4de0e2b231cfeeb4a54910171fd937f1982cf",
         "compute_mf_world_dof_offsets": "ebfa6171449f73873897da65972c2e1f01bc707386733a27121a086081f9dccc",
         "compute_mf_effective_mass_and_rhs": "1e819d242097c4722c3db16512c7c9838d86dbc2a3b83f63f7dfdf391694c641",
-        "update_qdd_from_velocity": "045dba05cf4ddc02334847e2bab7e0c6b612652c0ceb760e0baf6e5750db8973",
-        "remove_free_root_transport_from_qdd": "8c06274bd44b63eae718c0c091a27451f6c3d50b6cd924d7d2c0ab7feb505a4a",
-        "integrate_generalized_joints": "16584fed6c0cc19f1a03fff563a375e8ae7e2c273627fdad69103fa86a8cf0cf",
+        "update_qdd_from_velocity": "96efbd84731f509e3472bb3446fa3088583b4f29bbf27aad2df03a5a12a64ef9",
+        "remove_free_root_transport_from_qdd": "bfd6fc295724f3ef7f48070251b4001d72286ce78bdf0714ab485a4cea780bd0",
+        "integrate_generalized_joints": "f8018cdc85df8944041886f723b299fe6a50f24fea9a730308fc5675420a4e58",
         "jcalc_transform": "84d09399dec35112103e5b4bf315e81eddf5199a65075219d66a1f03df7e0996",
         "jcalc_motion": "15c927d5066b05e650fb66f1a28ccefbe8288218caba86a57d06da21e13bf608",
         "finalize_body_dynamics_values": "eb0862fab868f5d0bfcfcf3b78161fc4b96cc23a35744ecd8439e6e0fb9867ff",
         "finalize_body_dynamics_body": "16a2637f627c9b13948079cc96e8bc6d09fb7958f49f3f34c0a9a77672823d63",
-        "apply_free_root_velocity_corrections": "07238d97ed844f6ee6a638d07da37d5118adfb18ee5bee1a42e350e4995a2ff5",
+        "apply_free_root_velocity_corrections": "4d3cf47567345444363054a392cfc1676663f35e7f86cd30ce8fb0c42657c09f",
     },
     "world_scan_publication.py": {
         "PublicationData": "fcf16576d1e626ccdb95ea13d55bbe84ec55a221d50705f1b03179e5f62d8452",
@@ -133,7 +133,6 @@ PINNED = {
         "_body_twist": "5837c1ce0a3f402897e71aff09076f14880e2422111160df4264fa9ddef334be",
         "_body_valid": "be8cc8904be29e7a421895f91a51fa463612c244e00bd33a4481730683e7de71",
         "normal_source": "bc99413529d25a106471a8ee1250a4ed18a39be1b63f7697afcb52bd00ec38b6",
-        "operation_source": "b0a22d3d7723d47bea33786ef6c8a6b4dd47bbf4ce3ce27c7ee76eacad725485",
         "_TWIST_PRODUCER": "e0b95d53727d39f634cf092c7b6d81c146a8be1a2c0cfc8b43efd283a78f06e3",
     },
     "simple_world.py": {
@@ -200,7 +199,7 @@ PINNED = {
         "_INTEGRATION": "33f3c5af040aa39de98421346673484f257af0bd542d68b4098137e204c65457",
         "_RELATIVE": "7f1820f6cfaabfdf6ddaf55726577cc2246e01d41022daf1159f74ef1837a8f0",
         "_BODY_TERMS": "ef664e8ed9bf3772cecfcdcec9e58ebcc92c7a11cbd4d33c32b15d5356622ed4",
-        "generalized_operations": "243b23e904bda78216977a582b6a448b02ff1bcc2f40e03a3c025ebb601691db",
+        "generalized_operations": "7bd9892a8e09ca51b5775d7552c7f6ef1b3e0d38d99d5242ec36f07f0a733fbc",
         "make_state_kernel": "8332bec15de106b47a9b5e3b8ded7bc988d70507a2ed4901c7565a1e57f08274",
         "make_body_terms": "00234de7e281fefae0c7c9830117848a1ec0c25466bbd1a767c455e0b9a1bba0",
     },
@@ -263,11 +262,6 @@ PINNED = {
         "_AFTER_MF": "9eb479c02ff7b970db8d8db730dc3ba780b8660d608fbf2ef2bba682396f6490",
         "_STORE_MF": "fc59072d93cc2d1f3b13f81fe35c4254dcca8bb578f453705cdedc7c62d177e7",
         "get_source": "74babbb9bbe61380ab1a054f8688af853c6e10eda7500bccdfa58ad5ba93d77c",
-    },
-    "generalized_operation_source.py": {
-        "_OPERATIONS": "eadf04cb59878728bb62cfc1fd92e6098158c7368050a814c3f7b915f7fe0160",
-        "get_source": "6db226cb27744585892db72e450f2972b23d258d1931099dd2f750f9d929b76b",
-        "bind": "2ed1b88838ffa62efab7826fd71ef7088696225c15dacf960e907946411af4c1",
     },
 }
 

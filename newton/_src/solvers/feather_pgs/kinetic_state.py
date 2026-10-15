@@ -65,7 +65,6 @@ def checked_source():
             "_load_origin",
         ),
     )
-    checked_definitions("kuka_joint_world.py", ("operation_source",))
     checked_definitions(
         "kernels.py",
         (

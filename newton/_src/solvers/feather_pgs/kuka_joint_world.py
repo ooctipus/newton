@@ -15,7 +15,7 @@ from dataclasses import dataclass
 import numpy as np
 import warp as wp
 
-from . import body_validation, contact_normal, generalized_operation_source, kernels, simple_world
+from . import body_validation, contact_normal, kernels, simple_world
 
 
 @wp.struct
@@ -517,11 +517,6 @@ def normal_source():
     return contact_normal.get_source("light")
 
 
-def operation_source(name):
-    """Bind the shared generalized law to an explicit physical index."""
-    return generalized_operation_source.get_source(name, indexed=True)
-
-
 _FINISH = r"""
     float* s=reinterpret_cast<float*>(address);
 #if defined(__CUDA_ARCH__)
@@ -566,15 +561,7 @@ def get_kernel(arch):
     """One warp per current world, no dynamic row-panel reservation."""
     from .raw_world_contacts import RawWorldContacts  # noqa: PLC0415
 
-    source = normal_source() + "\n".join(
-        operation_source(name)
-        for name in (
-            "apply_free_root_velocity_corrections",
-            "update_qdd_from_velocity",
-            "remove_free_root_transport_from_qdd",
-            "integrate_generalized_joints",
-        )
-    )
+    source = normal_source()
     filename = f"<light-joint-world-{hashlib.sha256(source.encode()).hexdigest()}>"
     linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)
     namespace = dict(kernels.__dict__)

@@ -3,10 +3,7 @@
 
 """Independent current-world publication and lifecycle controls for the light owner."""
 
-import ast
-import inspect
 import os
-import textwrap
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -158,32 +155,6 @@ class TestKukaJointOwner(unittest.TestCase):
             patch.object(light, "bind_plan", side_effect=ValueError("unsupported topology")),
         ):
             self.assertIsNone(owner.create_owner(solver))
-
-    def test_original_publication_statement_identity(self):
-        """Recover every original equation and guard the queue before any mapped read."""
-        for name in owner.PUBLICATION_WIDTH:
-            source = ast.parse(textwrap.dedent(inspect.getsource(getattr(kernels, name).func))).body[0]
-            adapted = ast.parse(owner.publication_source(name)).body[0]
-
-            class Restore(ast.NodeTransformer):
-                def visit_Name(self, node):
-                    if node.id == "mapped_index":
-                        return ast.Call(
-                            func=ast.Attribute(value=ast.Name(id="wp", ctx=ast.Load()), attr="tid", ctx=ast.Load()),
-                            args=[],
-                            keywords=[],
-                        )
-                    return node
-
-            restored = Restore().visit(ast.Module(body=adapted.body[-len(source.body) :], type_ignores=[]))
-            self.assertEqual(ast.dump(restored), ast.dump(ast.Module(body=source.body, type_ignores=[])))
-            prelude = adapted.body[: -len(source.body)]
-            self.assertIsInstance(prelude[2], ast.If)
-            self.assertIsInstance(prelude[2].body[0], ast.Return)
-            self.assertLess(
-                owner.publication_source(name).index("if slot >= active_count[0]"),
-                owner.publication_source(name).index("world = active_worlds[slot]"),
-            )
 
     def test_actual_current512_zero_partial_all_and_reentry(self):
         """Preserve current physical35 publication across queue withdrawal and reentry."""

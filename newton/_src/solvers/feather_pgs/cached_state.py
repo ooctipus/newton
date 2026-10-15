@@ -9,7 +9,6 @@ from or edited out of another producer. Integration and joint transforms share
 one definition; mappings, operators and cache policies remain with their owners.
 """
 
-import functools
 import hashlib
 import linecache
 from dataclasses import dataclass
@@ -18,7 +17,7 @@ from textwrap import dedent, indent
 
 import warp as wp
 
-from . import kernels, kuka_joint_world
+from . import kernels
 from .world_scan_publication import PublicationData
 
 
@@ -65,18 +64,12 @@ def _compile(source, namespace, label):
     return namespace
 
 
-@functools.cache
 def generalized_operations():
     """Bind the retained integration laws once for every cached state mapping."""
-    source = "\n".join(
-        kuka_joint_world.operation_source(name)
-        for name in ("update_qdd_from_velocity", "remove_free_root_transport_from_qdd", "integrate_generalized_joints")
-    )
-    namespace = _compile(source, dict(kernels.__dict__), "generalized")
     return {
-        "update_qdd": namespace["_light_update_qdd_from_velocity"],
-        "remove_transport": namespace["_light_remove_free_root_transport_from_qdd"],
-        "integrate": namespace["_light_integrate_generalized_joints"],
+        "update_qdd": kernels._light_update_qdd_from_velocity,
+        "remove_transport": kernels._light_remove_free_root_transport_from_qdd,
+        "integrate": kernels._light_integrate_generalized_joints,
     }
 
 

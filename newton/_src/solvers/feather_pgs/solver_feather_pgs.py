@@ -17983,9 +17983,14 @@ def _get_paired_hinv_jt_kernel(
     warps_per_block: int = 4,
     *,
     factor_coordinates: bool = False,
+    active_list: bool = False,
 ) -> "wp.Kernel":
-    """Build a response kernel with one warp per row and one pair per block."""
-    del device_arch
+    """Build a response kernel with one warp per row and one pair per block.
+
+    ``active_list`` launches one block per entry of a compact world list instead of
+    one block per primary group; CPU devices run the same law serially.
+    """
+    cpu = str(device_arch) == "cpu"
     total_dofs = primary_dofs + secondary_dofs
     if total_dofs > 32:
         raise ValueError("paired warp response requires at most 32 total DOFs")
@@ -18064,6 +18069,63 @@ def _get_paired_hinv_jt_kernel(
         response_value = "factor_world ? z : y"
         diagonal_value = "factor_world ? z * z : j * y"
 
+    if factor_coordinates:
+        cpu_action = f"""
+        for (int d = 0; d < {primary_dofs}; ++d)
+            for (int k = 0; k <= d; ++k)
+                z[d] += primary_Linv.data[primary_group * {primary_dofs * primary_dofs} + d * {primary_dofs} + k] * j[k];
+        for (int d = 0; d < {secondary_dofs}; ++d)
+            for (int k = 0; k <= d; ++k)
+                z[{primary_dofs} + d] += secondary_Linv.data[secondary_group * {secondary_dofs * secondary_dofs}
+                    + d * {secondary_dofs} + k] * j[{primary_dofs} + k];
+        if (!factor_world) {{
+            for (int d = 0; d < {primary_dofs}; ++d)
+                for (int k = d; k < {primary_dofs}; ++k)
+                    y[d] += primary_Linv.data[primary_group * {primary_dofs * primary_dofs} + k * {primary_dofs} + d] * z[k];
+            for (int d = 0; d < {secondary_dofs}; ++d)
+                for (int k = d; k < {secondary_dofs}; ++k)
+                    y[{primary_dofs} + d] += secondary_Linv.data[secondary_group * {secondary_dofs * secondary_dofs}
+                        + k * {secondary_dofs} + d] * z[{primary_dofs} + k];
+        }}"""
+    else:
+        cpu_action = f"""
+        for (int d = 0; d < {primary_dofs}; ++d)
+            for (int k = 0; k < {primary_dofs}; ++k)
+                y[d] += primary_Hinv.data[primary_group * {primary_dofs * primary_dofs} + d * {primary_dofs} + k] * j[k];
+        for (int d = 0; d < {secondary_dofs}; ++d)
+            for (int k = 0; k < {secondary_dofs}; ++k)
+                y[{primary_dofs} + d] += secondary_Hinv.data[secondary_group * {secondary_dofs * secondary_dofs}
+                    + d * {secondary_dofs} + k] * j[{primary_dofs} + k];"""
+    cpu_response = f"""
+    const int secondary_group = secondary_group_by_primary.data[primary_group];
+    const int primary_art = primary_group_to_art.data[primary_group];
+    const int secondary_art = secondary_group_to_art.data[secondary_group];
+    const int world = art_to_world.data[primary_art];
+    const int m = wp::min(world_constraint_count.data[world], {max_constraints});
+    const int po = articulation_world_dof_offset.data[primary_art];
+    const int so = articulation_world_dof_offset.data[secondary_art];
+    const bool factor_world = {"world_mf_constraint_count.data[world] == 0" if factor_coordinates else "false"};
+    for (int row = 0; row < m; ++row) {{
+        float j[{total_dofs}], z[{total_dofs}], y[{total_dofs}];
+        for (int d = 0; d < {total_dofs}; ++d) {{
+            j[d] = d < {primary_dofs} ? primary_J.data[(primary_group * {max_constraints} + row) * {primary_dofs} + d]
+                : secondary_J.data[(secondary_group * {max_constraints} + row) * {secondary_dofs} + d - {primary_dofs}];
+            z[d] = 0.0f;
+            y[d] = 0.0f;
+        }}
+{cpu_action}
+        float diagonal = 0.0f;
+        for (int d = 0; d < {total_dofs}; ++d) {{
+            const int coord = d < {primary_dofs} ? po + d : so + d - {primary_dofs};
+            const int index = (world * {max_constraints} + row) * {max_world_dofs} + coord;
+            J_world.data[index] = j[d];
+            Y_world.data[index] = factor_world ? z[d] : y[d];
+            diagonal += factor_world ? z[d] * z[d] : j[d] * y[d];
+        }}
+        world_diag.data[world * {max_constraints} + row] = diagonal
+            + world_row_cfm.data[world * {max_constraints} + row];
+    }}"""
+
     snippet = f"""
 #if defined(__CUDA_ARCH__)
 {hinv_shared}
@@ -18079,6 +18141,7 @@ def _get_paired_hinv_jt_kernel(
 {factor_world_declaration}
     int n_constraints = world_constraint_count.data[world];
     if (n_constraints > {max_constraints}) n_constraints = {max_constraints};
+    if (n_constraints <= 0) return;
     const int primary_offset = articulation_world_dof_offset.data[primary_art];
     const int secondary_offset = articulation_world_dof_offset.data[secondary_art];
 {hinv_load}
@@ -18119,6 +18182,8 @@ def _get_paired_hinv_jt_kernel(
             world_diag.data[diag_index] = diagonal + world_row_cfm.data[diag_index];
         }}
     }}
+#else
+{cpu_response}
 #endif
 """
 
@@ -18163,7 +18228,60 @@ def _get_paired_hinv_jt_kernel(
         Y_world: wp.array3d[float],
         world_diag: wp.array2d[float],
     ):
-        primary_group, _lane = wp.tid()
+        primary_group, lane = wp.tid()
+        if wp.static(cpu):
+            if lane != 0:
+                return
+        paired_hinv_jt_native(
+            primary_group,
+            primary_Hinv,
+            primary_Linv,
+            primary_J,
+            primary_group_to_art,
+            secondary_Hinv,
+            secondary_Linv,
+            secondary_J,
+            secondary_group_to_art,
+            secondary_group_by_primary,
+            art_to_world,
+            articulation_world_dof_offset,
+            world_constraint_count,
+            world_mf_constraint_count,
+            world_row_cfm,
+            J_world,
+            Y_world,
+            world_diag,
+        )
+
+    def paired_hinv_jt_active_template(
+        primary_Hinv: wp.array3d[float],
+        primary_Linv: wp.array3d[float],
+        primary_J: wp.array3d[float],
+        primary_group_to_art: wp.array[int],
+        secondary_Hinv: wp.array3d[float],
+        secondary_Linv: wp.array3d[float],
+        secondary_J: wp.array3d[float],
+        secondary_group_to_art: wp.array[int],
+        secondary_group_by_primary: wp.array[int],
+        art_to_world: wp.array[int],
+        articulation_world_dof_offset: wp.array[int],
+        world_constraint_count: wp.array[int],
+        world_mf_constraint_count: wp.array[int],
+        world_row_cfm: wp.array2d[float],
+        J_world: wp.array3d[float],
+        Y_world: wp.array3d[float],
+        world_diag: wp.array2d[float],
+        active_worlds: wp.array[int],
+        active_count: wp.array[int],
+        primary_group_by_world: wp.array[int],
+    ):
+        active_index, lane = wp.tid()
+        if wp.static(cpu):
+            if lane != 0:
+                return
+        if active_index >= active_count[0]:
+            return
+        primary_group = primary_group_by_world[active_worlds[active_index]]
         paired_hinv_jt_native(
             primary_group,
             primary_Hinv,
@@ -18186,12 +18304,14 @@ def _get_paired_hinv_jt_kernel(
         )
 
     block_dim = 32 * warps_per_block
-    name = f"paired_hinv_jt_{primary_dofs}_{secondary_dofs}_{max_constraints}_bd{block_dim}"
+    template = paired_hinv_jt_active_template if active_list else paired_hinv_jt_template
+    name = f"paired_hinv_jt_{'active_' if active_list else ''}{primary_dofs}_{secondary_dofs}_{max_constraints}"
+    name += f"_bd{block_dim}"
     if factor_coordinates:
         name += "_factor"
-    paired_hinv_jt_template.__name__ = name
-    paired_hinv_jt_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(paired_hinv_jt_template)
+    template.__name__ = name
+    template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(template)
 
 
 @cache

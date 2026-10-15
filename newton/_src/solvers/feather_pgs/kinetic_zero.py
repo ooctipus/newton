@@ -40,7 +40,6 @@ def load_source():
             "_body_twist",
             "_body_valid",
             "normal_source",
-            "operation_source",
         ),
     )
     prefix = r"""
@@ -149,7 +148,6 @@ def bind_zero(rows, mf, *, buckets=None):
             "_body_twist",
             "_body_valid",
             "normal_source",
-            "operation_source",
         ),
     )
     checked_definitions(

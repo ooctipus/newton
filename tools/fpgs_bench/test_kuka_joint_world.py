@@ -5,9 +5,7 @@
 
 import ast
 import hashlib
-import inspect
 import json
-import textwrap
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -454,18 +452,6 @@ class TestKukaJointWorld(unittest.TestCase):
         )
         self.assertIs(neutral.body[0].value.value, True)
         self.assertNotIn("scratch", light.normal_source())
-        for name in ("update_qdd_from_velocity", "remove_free_root_transport_from_qdd", "integrate_generalized_joints"):
-            source = ast.parse(textwrap.dedent(inspect.getsource(getattr(kernels, name).func))).body[0]
-            adapted = ast.parse(light.operation_source(name)).body[0]
-
-            class Restore(ast.NodeTransformer):
-                def visit_Name(self, node):
-                    if node.id == "physical_index":
-                        return ast.parse("wp.tid()", mode="eval").body
-                    return node
-
-            actual = Restore().visit(ast.Module(body=adapted.body, type_ignores=[]))
-            self.assertEqual(ast.dump(actual), ast.dump(ast.Module(body=source.body, type_ignores=[])))
 
     @unittest.skipUnless(wp.is_cuda_available(), "Actual CUDA device required")
     def test_actual_native_cuda(self):

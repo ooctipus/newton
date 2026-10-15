@@ -120,18 +120,6 @@ class TestKukaActiveResponse(unittest.TestCase):
         module = importlib.import_module("newton._src.solvers.feather_pgs.kuka_active_response")
         self.assertTrue(callable(module.get_response_kernel))
 
-    def test_original_cuda_source_recovery(self):
-        """Recover every original CUDA statement after removing only the empty guard."""
-        module = importlib.import_module("newton._src.solvers.feather_pgs.kuka_active_response")
-
-        original, adapted = module.response_sources("cpu")
-        recovered = adapted.replace(module._CPU_RESPONSE, "").replace(module._EMPTY_GUARD, "")
-        self.assertEqual(original, recovered)
-        self.assertLess(adapted.index(module._EMPTY_GUARD), adapted.index("for (int element = threadIdx.x"))
-        with patch.object(module, "_FACTORY_SHA256", "unreviewed"):
-            with self.assertRaisesRegex(RuntimeError, "factory changed"):
-                module.response_sources("cpu")
-
     def test_current_rows_and_nonidentity_fp64_action(self):
         """Preserve direct Z, mixed physical Y, diagonal CFM and current group maps."""
         solver, owner = fixture()
@@ -184,7 +172,7 @@ class TestKukaActiveResponse(unittest.TestCase):
         self.assertEqual(launch.call_args.kwargs["dim"], [solver.world_count])
         self.assertEqual(launch.call_args.kwargs["block_dim"], 128)
         for field, value in (
-            ("dense_max_constraints", 193),
+            ("_paired_response_secondary_size", None),
             ("max_world_dofs", 28),
             ("_paired_factor_coordinates", False),
         ):

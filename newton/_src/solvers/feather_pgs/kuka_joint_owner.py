@@ -3,13 +3,6 @@
 
 """Private lifecycle for the default-off joint-world Kuka experiment."""
 
-import ast
-import functools
-import hashlib
-import inspect
-import linecache
-import textwrap
-
 import numpy as np
 import warp as wp
 
@@ -24,56 +17,111 @@ PUBLICATION_WIDTH = {
 }
 
 
-def publication_source(name: str) -> str:
-    """Retain original generalized equations and change only active index ownership."""
-    width, field = PUBLICATION_WIDTH[name]
-    tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(kernels, name).func)))
-    function = tree.body[0]
-    function.name = f"active_joint_world_{name}"
-    function.decorator_list = ast.parse('@wp.kernel(module="unique")\ndef kernel():\n    pass').body[0].decorator_list
-    extras = (
-        ast.parse(
-            "def extra(plan: JointWorldPlan, active_worlds: wp.array[int], active_count: wp.array[int]):\n    pass"
-        )
-        .body[0]
-        .args.args
+@wp.kernel(module="unique")
+def active_joint_world_update_qdd_from_velocity(
+    joint_qd: wp.array[float],
+    kinematic_dof_mask: wp.array[int],
+    inv_dt: float,
+    v_new: wp.array[float],
+    joint_qdd: wp.array[float],
+    plan: kuka_joint_world.JointWorldPlan,
+    active_worlds: wp.array[int],
+    active_count: wp.array[int],
+):
+    linear = wp.tid()
+    slot = linear // 35
+    if slot >= active_count[0]:
+        return
+    world = active_worlds[slot]
+    kernels._light_update_qdd_from_velocity(
+        plan.dof_ids[world, linear % 35], joint_qd, kinematic_dof_mask, inv_dt, v_new, joint_qdd
     )
-    function.args.args.extend(extras)
 
-    class Index(ast.NodeTransformer):
-        def visit_Call(self, node):
-            if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "wp"
-                and node.func.attr == "tid"
-            ):
-                return ast.copy_location(ast.Name(id="mapped_index", ctx=ast.Load()), node)
-            return self.generic_visit(node)
 
-    function = Index().visit(function)
-    function.body = (
-        ast.parse(
-            f"linear = wp.tid()\nslot = linear // {width}\n"
-            "if slot >= active_count[0]:\n    return\n"
-            f"world = active_worlds[slot]\nmapped_index = plan.{field}[world, linear % {width}]\n"
-        ).body
-        + function.body
+@wp.kernel(module="unique")
+def active_joint_world_remove_free_root_transport_from_qdd(
+    free_root_joint_indices: wp.array[int],
+    joint_qd_start: wp.array[int],
+    kinematic_joint_mask: wp.array[int],
+    joint_qd: wp.array[float],
+    joint_qdd: wp.array[float],
+    plan: kuka_joint_world.JointWorldPlan,
+    active_worlds: wp.array[int],
+    active_count: wp.array[int],
+):
+    linear = wp.tid()
+    slot = linear // 2
+    if slot >= active_count[0]:
+        return
+    world = active_worlds[slot]
+    kernels._light_remove_free_root_transport_from_qdd(
+        plan.root_slots[world, linear % 2],
+        free_root_joint_indices,
+        joint_qd_start,
+        kinematic_joint_mask,
+        joint_qd,
+        joint_qdd,
     )
-    ast.fix_missing_locations(tree)
-    return ast.unparse(tree) + "\n"
 
 
-@functools.cache
+@wp.kernel(module="unique")
+def active_joint_world_integrate_generalized_joints(
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    kinematic_joint_mask: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    body_com: wp.array[wp.vec3],
+    joint_X_c: wp.array[wp.transform],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    joint_qdd: wp.array[float],
+    dt: float,
+    angular_damping: float,
+    joint_q_new: wp.array[float],
+    joint_qd_new: wp.array[float],
+    plan: kuka_joint_world.JointWorldPlan,
+    active_worlds: wp.array[int],
+    active_count: wp.array[int],
+):
+    linear = wp.tid()
+    slot = linear // 32
+    if slot >= active_count[0]:
+        return
+    world = active_worlds[slot]
+    kernels._light_integrate_generalized_joints(
+        plan.joint_ids[world, linear % 32],
+        joint_type,
+        joint_parent,
+        joint_child,
+        joint_q_start,
+        joint_qd_start,
+        kinematic_joint_mask,
+        joint_dof_dim,
+        body_com,
+        joint_X_c,
+        joint_q,
+        joint_qd,
+        joint_qdd,
+        dt,
+        angular_damping,
+        joint_q_new,
+        joint_qd_new,
+    )
+
+
+_PUBLICATION_KERNELS = {
+    "update_qdd_from_velocity": active_joint_world_update_qdd_from_velocity,
+    "remove_free_root_transport_from_qdd": active_joint_world_remove_free_root_transport_from_qdd,
+    "integrate_generalized_joints": active_joint_world_integrate_generalized_joints,
+}
+
+
 def get_publication_kernel(name: str):
-    """Compile the original operation with a compact current-world prefix."""
-    source = publication_source(name)
-    filename = f"<active-joint-world-{hashlib.sha256(source.encode()).hexdigest()}>"
-    linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)
-    namespace = dict(kernels.__dict__)
-    namespace["JointWorldPlan"] = kuka_joint_world.JointWorldPlan
-    exec(compile(source, filename, "exec"), namespace)
-    return namespace[f"active_joint_world_{name}"]
+    """Return the shared generalized law launched over a compact current-world prefix."""
+    return _PUBLICATION_KERNELS[name]
 
 
 def raw_inputs(solver, contacts):
