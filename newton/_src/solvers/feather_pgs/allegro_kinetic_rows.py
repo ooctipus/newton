@@ -698,8 +698,9 @@ def create_owner(solver):
     """Admit one bounded complete numerical law; leave unsupported solvers ordinary."""
     from . import solver_feather_pgs as source  # noqa: PLC0415
 
-    request = os.environ.get("FEATHER_PGS_GENERATED_KEYED_ROWS")
-    direct = request == "1" or (source._WR_ON and request != "0")
+    # The topology-generated layout is the default; FEATHER_PGS_GENERATED_KEYED_ROWS=0 retains
+    # the original fixed 16+6 producer for comparison.
+    direct = os.environ.get("FEATHER_PGS_GENERATED_KEYED_ROWS") != "0"
     supported = (
         solver.model.device.is_cuda
         and not solver.model.requires_grad
