@@ -22,6 +22,9 @@ FLAGS = {
     "NEWTON_HEIGHTFIELD_GEOMETRIC_CULL": "1",
     "NEWTON_HEIGHTFIELD_FINITE_QUERY": "0",
     "NEWTON_HEIGHTFIELD_PAIR_CSR": "0",
+    # This module checks the typed GJK/MPR queries against the generic one; the
+    # closed-form rows have their own tests (test_heightfield_*_contact).
+    "NEWTON_HEIGHTFIELD_ANALYTIC_PRIMITIVES": "0",
 }
 
 

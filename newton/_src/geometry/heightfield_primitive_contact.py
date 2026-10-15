@@ -18,6 +18,7 @@ only place a new primitive has to be registered.
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Any
 
@@ -342,8 +343,259 @@ def create_capsule_prism_contacts(writer_func: Any, query_filter: Any = None):
     return capsule_prism_contacts
 
 
+@wp.func
+def _clip_xy_segment(p0: wp.vec3, p1: wp.vec3, e1: wp.vec3, e2: wp.vec3) -> tuple[float, float]:
+    """Parameter range of a segment whose vertical projection lies over the cell triangle.
+
+    The prism walls are vertical, so clipping in the xy plane is exact. Returns
+    ``t_enter > t_exit`` when the segment misses the footprint.
+    """
+    d = p1 - p0
+    t_enter = float(0.0)
+    t_exit = float(1.0)
+    orientation = e1[0] * e2[1] - e1[1] * e2[0]
+    for k in range(3):
+        ax = float(0.0)
+        ay = float(0.0)
+        bx = e1[0]
+        by = e1[1]
+        if k == 1:
+            ax = e1[0]
+            ay = e1[1]
+            bx = e2[0]
+            by = e2[1]
+        elif k == 2:
+            ax = e2[0]
+            ay = e2[1]
+            bx = 0.0
+            by = 0.0
+        # Inward side of edge a->b for a counter-clockwise triangle (flipped otherwise).
+        nx = -(by - ay)
+        ny = bx - ax
+        if orientation < 0.0:
+            nx = -nx
+            ny = -ny
+        num = (p0[0] - ax) * nx + (p0[1] - ay) * ny
+        den = d[0] * nx + d[1] * ny
+        if wp.abs(den) < 1.0e-20:
+            if num < 0.0:
+                return 1.0, 0.0
+        else:
+            t = -num / den
+            if den < 0.0:
+                t_exit = wp.min(t_exit, t)
+            else:
+                t_enter = wp.max(t_enter, t)
+    return t_enter, t_exit
+
+
+_AXIAL_TOLERANCE = math.sin(2.0 * math.pi / 180.0)
+"""Axis-to-face alignment within two degrees selects the flat-cap or rolling manifolds (matches the axial post-processing)."""
+
+
+def create_cylinder_prism_contacts(writer_func: Any, query_filter: Any = None):
+    """Create the closed-form cylinder-vs-prism query with the signature of ``compute_gjk_mpr_contacts``.
+
+    The contact set of a flat-capped cylinder against a cell is one of three
+    manifolds, selected by the angle between the axis and the top-face
+    normal: a cap resting on the face (four rim points), the side line of a
+    rolling cylinder (two points, which already lie in the plane the axial
+    post-processing projects onto), or the single lowest rim point of a
+    tilted cylinder. Every candidate surface point is resolved against the
+    prism by the shared point query, so cell boundaries and penetration keep
+    the sphere semantics.
+    """
+    has_query_filter = query_filter is not None
+
+    @wp.func
+    def write_surface_point(
+        p: wp.vec3,
+        e1: wp.vec3,
+        e2: wp.vec3,
+        n: wp.vec3,
+        reach: float,
+        threshold: float,
+        rot_a: wp.quat,
+        pos_a: wp.vec3,
+        prism: GenericShapeData,
+        margin_a: float,
+        margin_b: float,
+        shape_a: int,
+        shape_b: int,
+        rigid_gap: float,
+        sort_sub_key: int,
+        writer_data: Any,
+        query_context: Any,
+    ):
+        point_a, normal, d = point_prism_query(p, e1, e2, n, reach)
+        if d > threshold + _ADMISSION_SLACK:
+            return
+        if wp.static(has_query_filter):
+            if d >= 0.0 and not query_filter(prism, point_a, normal, query_context):
+                return
+        contact = ContactData()
+        contact.radius_eff_a = 0.0
+        contact.radius_eff_b = 0.0
+        contact.margin_a = margin_a
+        contact.margin_b = margin_b
+        contact.shape_a = shape_a
+        contact.shape_b = shape_b
+        contact.gap_sum = rigid_gap
+        contact.sort_sub_key = sort_sub_key
+        contact.contact_point_center = wp.quat_rotate(rot_a, 0.5 * (point_a + p)) + pos_a
+        contact.contact_normal_a_to_b = wp.quat_rotate(rot_a, normal)
+        contact.contact_distance = d
+        writer_func(contact, writer_data, -1)
+
+    @wp.func
+    def cylinder_prism_contacts(
+        shape_a_data: GenericShapeData,
+        shape_b_data: GenericShapeData,
+        rot_a: wp.quat,
+        rot_b: wp.quat,
+        pos_a_adjusted: wp.vec3,
+        pos_b_adjusted: wp.vec3,
+        rigid_gap: float,
+        shape_a: int,
+        shape_b: int,
+        margin_a: float,
+        margin_b: float,
+        writer_data: Any,
+        sort_sub_key: int = 0,
+        query_context: Any = 0,
+    ):
+        e1 = shape_a_data.scale
+        e2 = shape_a_data.auxiliary
+        n = prism_normal(e1, e2)
+        if n[2] == 0.0:
+            return
+        radius = shape_b_data.scale[0]
+        half_height = shape_b_data.scale[1]
+        threshold = rigid_gap + margin_a + margin_b
+        reach = threshold + _ADMISSION_SLACK
+        # Cylinder center and unit axis in the triangle-origin heightfield-local frame.
+        c = wp.quat_rotate_inv(rot_a, pos_b_adjusted - pos_a_adjusted)
+        axis = wp.quat_rotate_inv(rot_a, wp.quat_rotate(rot_b, wp.vec3(0.0, 0.0, 1.0)))
+        along = wp.dot(axis, n)
+        # Unit direction of steepest descent on the cap plane (toward -n), when defined.
+        lateral = n - along * axis
+        lateral_length = wp.length(lateral)
+        if lateral_length > 1.0e-6:
+            lateral = lateral / lateral_length
+        else:
+            lateral = wp.vec3(0.0)
+            if wp.abs(axis[0]) < 0.9:
+                lateral = wp.normalize(wp.cross(axis, wp.vec3(1.0, 0.0, 0.0)))
+            else:
+                lateral = wp.normalize(wp.cross(axis, wp.vec3(0.0, 1.0, 0.0)))
+        key = sort_sub_key << 3
+
+        if wp.abs(along) < wp.static(_AXIAL_TOLERANCE):
+            # Rolling: the side line nearest the face, clipped to the cell footprint.
+            base = c - radius * lateral
+            line0 = base - half_height * axis
+            line1 = base + half_height * axis
+            t_enter, t_exit = _clip_xy_segment(line0, line1, e1, e2)
+            if t_enter > t_exit:
+                return
+            for end in range(2):
+                t = t_enter
+                if end == 1:
+                    t = t_exit
+                write_surface_point(
+                    line0 + t * (line1 - line0),
+                    e1,
+                    e2,
+                    n,
+                    reach,
+                    threshold,
+                    rot_a,
+                    pos_a_adjusted,
+                    shape_a_data,
+                    margin_a,
+                    margin_b,
+                    shape_a,
+                    shape_b,
+                    rigid_gap,
+                    key | end,
+                    writer_data,
+                    query_context,
+                )
+            return
+
+        # The lower cap faces the terrain.
+        cap_sign = 1.0
+        if along > 0.0:
+            cap_sign = -1.0
+        cap = c + cap_sign * half_height * axis
+        if wp.abs(along) > wp.static(math.sqrt(1.0 - _AXIAL_TOLERANCE * _AXIAL_TOLERANCE)):
+            # Flat cap: four rim points, two along the descent direction and two across it,
+            # each pulled back along its radius to the farthest cap point over the cell.
+            across = wp.cross(axis, lateral)
+            for corner in range(4):
+                direction = lateral
+                if corner == 1:
+                    direction = -lateral
+                elif corner == 2:
+                    direction = across
+                elif corner == 3:
+                    direction = -across
+                rim = cap + radius * direction
+                t_enter, t_exit = _clip_xy_segment(cap, rim, e1, e2)
+                if t_enter > t_exit:
+                    continue
+                write_surface_point(
+                    cap + t_exit * (rim - cap),
+                    e1,
+                    e2,
+                    n,
+                    reach,
+                    threshold,
+                    rot_a,
+                    pos_a_adjusted,
+                    shape_a_data,
+                    margin_a,
+                    margin_b,
+                    shape_a,
+                    shape_b,
+                    rigid_gap,
+                    key | corner,
+                    writer_data,
+                    query_context,
+                )
+            return
+
+        # Tilted: the lowest rim point, pulled back along its radius to the cell.
+        rim = cap - radius * lateral
+        t_enter, t_exit = _clip_xy_segment(cap, rim, e1, e2)
+        if t_enter > t_exit:
+            return
+        write_surface_point(
+            cap + t_exit * (rim - cap),
+            e1,
+            e2,
+            n,
+            reach,
+            threshold,
+            rot_a,
+            pos_a_adjusted,
+            shape_a_data,
+            margin_a,
+            margin_b,
+            shape_a,
+            shape_b,
+            rigid_gap,
+            key,
+            writer_data,
+            query_context,
+        )
+
+    return cylinder_prism_contacts
+
+
 ANALYTIC_PRIMITIVE_QUERIES = {
     int(GeoType.SPHERE): create_sphere_prism_contacts,
     int(GeoType.CAPSULE): create_capsule_prism_contacts,
+    int(GeoType.CYLINDER): create_cylinder_prism_contacts,
 }
 """Primitive types with a closed-form heightfield-cell query, by factory."""

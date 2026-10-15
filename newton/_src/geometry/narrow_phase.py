@@ -62,6 +62,7 @@ from ..geometry.flags import ShapeFlags
 from ..geometry.heightfield_cells import heightfield_cell_overlaps_kernel
 from ..geometry.heightfield_cylinder import create_heightfield_cylinder_split_kernels
 from ..geometry.heightfield_features import WELD_FLAT_SEAMS, HeightfieldFeatureContext, flat_seam_query_allowed
+from ..geometry.heightfield_primitive_contact import ANALYTIC_PRIMITIVE_QUERIES, analytic_primitives_default
 from ..geometry.mpr import create_solve_mpr, create_support_map_function
 from ..geometry.sdf_contact import (
     MESH_SDF_BLOCK_DIM,
@@ -2662,7 +2663,15 @@ class NarrowPhase:
         cylinder_split = os.environ.get("NEWTON_HEIGHTFIELD_CYLINDER_SPLIT", "0")
         if cylinder_split not in ("0", "1"):
             raise ValueError("NEWTON_HEIGHTFIELD_CYLINDER_SPLIT must be 0 or 1")
-        self._heightfield_cylinder_split = cylinder_split == "1" and self._heightfield_primitive_query
+        # The closed-form cylinder row replaces the GJK split of the typed cylinder query.
+        analytic_cylinder = (
+            self._heightfield_primitive_query
+            and analytic_primitives_default()
+            and int(GeoType.CYLINDER) in ANALYTIC_PRIMITIVE_QUERIES
+        )
+        self._heightfield_cylinder_split = (
+            cylinder_split == "1" and self._heightfield_primitive_query and not analytic_cylinder
+        )
         self._heightfield_cylinder_split_kernels = (
             create_heightfield_cylinder_split_kernels() if self._heightfield_cylinder_split else ()
         )
