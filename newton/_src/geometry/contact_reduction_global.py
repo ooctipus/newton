@@ -86,6 +86,7 @@ from .support_function import (
     create_triangle_prism_penetration_refiner,
     extract_shape_data,
     support_map,
+    support_map_heightfield_box,
     support_map_heightfield_capsule,
     support_map_heightfield_cylinder,
     support_map_heightfield_sphere,
@@ -2539,6 +2540,7 @@ HEIGHTFIELD_PRIMITIVE_SUPPORTS = {
     int(GeoType.SPHERE): support_map_heightfield_sphere,
     int(GeoType.CAPSULE): support_map_heightfield_capsule,
     int(GeoType.CYLINDER): support_map_heightfield_cylinder,
+    int(GeoType.BOX): support_map_heightfield_box,
 }
 """Typed heightfield primitive queries: each type owns a reduced support dispatch."""
 
@@ -2546,7 +2548,7 @@ HEIGHTFIELD_PRIMITIVE_SUPPORTS = {
 @wp.func
 def heightfield_typed_primitive(shape_type: int, shape_scale: wp.vec4) -> bool:
     """Whether a heightfield pair with this convex shape is owned by a typed primitive query."""
-    if shape_type == GeoType.SPHERE or shape_type == GeoType.CAPSULE:
+    if shape_type == GeoType.SPHERE or shape_type == GeoType.CAPSULE or shape_type == GeoType.BOX:
         return True
     return shape_type == GeoType.CYLINDER and shape_scale[2] == 0.0
 
@@ -2565,7 +2567,7 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
     analytic: bool = False,
 ):
     if primitive_type not in (0, *HEIGHTFIELD_PRIMITIVE_SUPPORTS):
-        raise ValueError("Only sphere, capsule and cylinder heightfield queries can be specialized")
+        raise ValueError("Only sphere, capsule, cylinder and box heightfield queries can be specialized")
     if primitive_type and exclude_primitives:
         raise ValueError("A typed query cannot also exclude primitive pairs")
     query_support = HEIGHTFIELD_PRIMITIVE_SUPPORTS.get(primitive_type, support_map)
@@ -2722,6 +2724,8 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
         mesh_triangle_contacts_to_reducer_kernel.__name__ = "heightfield_capsule_contacts_to_reducer_kernel"
     elif primitive_type == int(GeoType.CYLINDER):
         mesh_triangle_contacts_to_reducer_kernel.__name__ = "heightfield_cylinder_contacts_to_reducer_kernel"
+    elif primitive_type == int(GeoType.BOX):
+        mesh_triangle_contacts_to_reducer_kernel.__name__ = "heightfield_box_contacts_to_reducer_kernel"
     if analytic:
         mesh_triangle_contacts_to_reducer_kernel.__name__ += "_analytic"
     elif exclude_primitives:

@@ -270,9 +270,9 @@ class TestHeightfieldPrimitiveQuery(unittest.TestCase):
 
         with patch.object(wp, "launch", side_effect=observe):
             owner.collide(state, contacts)
-        self.assertEqual([index for index, count in allocations], [0, 1, 2, 3])
-        self.assertEqual([count for index, count in allocations if index != 3], [0, 0, 0])
-        self.assertGreater(allocations[3][1], 0)
+        self.assertEqual([index for index, count in allocations], [0, 1, 2, 3, 4])
+        self.assertEqual([count for index, count in allocations if index != 4], [0, 0, 0, 0])
+        self.assertGreater(allocations[4][1], 0)
 
     def test_loaded_geometry_cpu(self):
         """Compare real typed and generic terrain contacts and capsule fallback on CPU."""

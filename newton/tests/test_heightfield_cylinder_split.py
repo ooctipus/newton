@@ -10,7 +10,6 @@ from unittest.mock import patch
 import numpy as np
 import warp as wp
 
-import newton
 from newton._src.geometry.contact_reduction_global import decode_oct
 from newton._src.geometry.narrow_phase import NarrowPhase, write_contact_simple
 from newton._src.geometry.support_function import SupportMapDataProvider
@@ -253,9 +252,9 @@ class TestHeightfieldCylinderSplit(unittest.TestCase):
                 kinds, dimensions = types.copy(), scales.copy()
                 dimensions[1, :2] *= 0.9
                 if epoch == 1:
-                    # A box stays on the generic fallback (capsules now have a typed query).
-                    kinds[1] = int(newton.GeoType.BOX)
-                    dimensions[1, 2] = 0.02
+                    # Every primitive now has a typed query; only a barrel cylinder stays on
+                    # the generic fallback.
+                    dimensions[1, 2] = 0.2
                 if epoch == 2:
                     dimensions[1, 2] = 0.2
                 model.shape_type.assign(kinds)
@@ -275,7 +274,7 @@ class TestHeightfieldCylinderSplit(unittest.TestCase):
                     self.assertEqual(int(actual.narrow_phase._heightfield_cylinder_gjk_count.numpy()[0]), 0)
 
     def test_lifecycle_cpu(self):
-        """Refresh current geometry after empty, barrel and box fallback frames."""
+        """Refresh current geometry after empty, barrel fallback frames."""
         self.check_lifecycle("cpu")
 
     def test_loaded_support_cpu(self):

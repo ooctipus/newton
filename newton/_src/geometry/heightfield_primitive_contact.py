@@ -593,9 +593,193 @@ def create_cylinder_prism_contacts(writer_func: Any, query_filter: Any = None):
     return cylinder_prism_contacts
 
 
+_Polygon = wp.types.matrix(shape=(8, 3), dtype=wp.float32)
+
+
+@wp.func
+def _clip_polygon_xy(points: _Polygon, count: int, e1: wp.vec3, e2: wp.vec3) -> tuple[_Polygon, int]:
+    """Sutherland-Hodgman clip of a convex polygon against the cell footprint in the xy plane.
+
+    A box face has four vertices; clipping against a triangle yields at most
+    seven. Points keep their z so they stay on the box face.
+    """
+    orientation = e1[0] * e2[1] - e1[1] * e2[0]
+    current = points
+    current_count = count
+    for k in range(3):
+        ax = float(0.0)
+        ay = float(0.0)
+        bx = e1[0]
+        by = e1[1]
+        if k == 1:
+            ax = e1[0]
+            ay = e1[1]
+            bx = e2[0]
+            by = e2[1]
+        elif k == 2:
+            ax = e2[0]
+            ay = e2[1]
+            bx = 0.0
+            by = 0.0
+        nx = -(by - ay)
+        ny = bx - ax
+        if orientation < 0.0:
+            nx = -nx
+            ny = -ny
+        output = _Polygon()
+        output_count = int(0)
+        if current_count == 0:
+            return output, 0
+        previous = wp.vec3(current[current_count - 1, 0], current[current_count - 1, 1], current[current_count - 1, 2])
+        previous_inside = (previous[0] - ax) * nx + (previous[1] - ay) * ny >= 0.0
+        for i in range(current_count):
+            point = wp.vec3(current[i, 0], current[i, 1], current[i, 2])
+            inside = (point[0] - ax) * nx + (point[1] - ay) * ny >= 0.0
+            if inside != previous_inside:
+                dp = (previous[0] - ax) * nx + (previous[1] - ay) * ny
+                dc = (point[0] - ax) * nx + (point[1] - ay) * ny
+                t = dp / (dp - dc)
+                crossing = previous + t * (point - previous)
+                if output_count < 8:
+                    output[output_count, 0] = crossing[0]
+                    output[output_count, 1] = crossing[1]
+                    output[output_count, 2] = crossing[2]
+                    output_count += 1
+            if inside and output_count < 8:
+                output[output_count, 0] = point[0]
+                output[output_count, 1] = point[1]
+                output[output_count, 2] = point[2]
+                output_count += 1
+            previous = point
+            previous_inside = inside
+        current = output
+        current_count = output_count
+    return current, current_count
+
+
+def create_box_prism_contacts(writer_func: Any, query_filter: Any = None):
+    """Create the closed-form box-vs-prism query with the signature of ``compute_gjk_mpr_contacts``.
+
+    The box face most opposed to the cell's face normal is the one touching
+    the terrain whether the box rests flat (four points), on an edge (that
+    face contains the edge) or on a corner (it contains the corner). Its
+    polygon is clipped to the cell footprint and every clipped vertex is
+    resolved against the prism by the shared point query, so a face covering
+    a small cell contributes that cell's triangle and penetration keeps the
+    plane depth.
+    """
+    has_query_filter = query_filter is not None
+
+    @wp.func
+    def box_prism_contacts(
+        shape_a_data: GenericShapeData,
+        shape_b_data: GenericShapeData,
+        rot_a: wp.quat,
+        rot_b: wp.quat,
+        pos_a_adjusted: wp.vec3,
+        pos_b_adjusted: wp.vec3,
+        rigid_gap: float,
+        shape_a: int,
+        shape_b: int,
+        margin_a: float,
+        margin_b: float,
+        writer_data: Any,
+        sort_sub_key: int = 0,
+        query_context: Any = 0,
+    ):
+        e1 = shape_a_data.scale
+        e2 = shape_a_data.auxiliary
+        n = prism_normal(e1, e2)
+        if n[2] == 0.0:
+            return
+        half = shape_b_data.scale
+        threshold = rigid_gap + margin_a + margin_b
+        reach = threshold + _ADMISSION_SLACK
+        # Box center and axes in the triangle-origin heightfield-local frame.
+        relative = wp.quat_inverse(rot_a) * rot_b
+        c = wp.quat_rotate_inv(rot_a, pos_b_adjusted - pos_a_adjusted)
+        u0 = wp.quat_rotate(relative, wp.vec3(1.0, 0.0, 0.0))
+        u1 = wp.quat_rotate(relative, wp.vec3(0.0, 1.0, 0.0))
+        u2 = wp.quat_rotate(relative, wp.vec3(0.0, 0.0, 1.0))
+        # The face most opposed to the terrain normal.
+        d0 = wp.dot(u0, n)
+        d1 = wp.dot(u1, n)
+        d2 = wp.dot(u2, n)
+        face_axis = u2
+        face_sign = -1.0
+        span_a = u0 * half[0]
+        span_b = u1 * half[1]
+        face_half = half[2]
+        if wp.abs(d0) >= wp.abs(d1) and wp.abs(d0) >= wp.abs(d2):
+            face_axis = u0
+            span_a = u1 * half[1]
+            span_b = u2 * half[2]
+            face_half = half[0]
+            if d0 > 0.0:
+                face_sign = -1.0
+            else:
+                face_sign = 1.0
+        elif wp.abs(d1) >= wp.abs(d2):
+            face_axis = u1
+            span_a = u2 * half[2]
+            span_b = u0 * half[0]
+            face_half = half[1]
+            if d1 > 0.0:
+                face_sign = -1.0
+            else:
+                face_sign = 1.0
+        else:
+            if d2 > 0.0:
+                face_sign = -1.0
+            else:
+                face_sign = 1.0
+        center = c + face_sign * face_half * face_axis
+        polygon = _Polygon()
+        for corner in range(4):
+            sa = 1.0
+            sb = 1.0
+            if corner == 1:
+                sb = -1.0
+            elif corner == 2:
+                sa = -1.0
+                sb = -1.0
+            elif corner == 3:
+                sa = -1.0
+            vertex = center + sa * span_a + sb * span_b
+            polygon[corner, 0] = vertex[0]
+            polygon[corner, 1] = vertex[1]
+            polygon[corner, 2] = vertex[2]
+        clipped, count = _clip_polygon_xy(polygon, 4, e1, e2)
+        key = sort_sub_key << 3
+        for i in range(count):
+            p = wp.vec3(clipped[i, 0], clipped[i, 1], clipped[i, 2])
+            point_a, normal, d = point_prism_query(p, e1, e2, n, reach)
+            if d > threshold + _ADMISSION_SLACK:
+                continue
+            if wp.static(has_query_filter):
+                if d >= 0.0 and not query_filter(shape_a_data, point_a, normal, query_context):
+                    continue
+            contact = ContactData()
+            contact.radius_eff_a = 0.0
+            contact.radius_eff_b = 0.0
+            contact.margin_a = margin_a
+            contact.margin_b = margin_b
+            contact.shape_a = shape_a
+            contact.shape_b = shape_b
+            contact.gap_sum = rigid_gap
+            contact.sort_sub_key = key | i
+            contact.contact_point_center = wp.quat_rotate(rot_a, 0.5 * (point_a + p)) + pos_a_adjusted
+            contact.contact_normal_a_to_b = wp.quat_rotate(rot_a, normal)
+            contact.contact_distance = d
+            writer_func(contact, writer_data, -1)
+
+    return box_prism_contacts
+
+
 ANALYTIC_PRIMITIVE_QUERIES = {
     int(GeoType.SPHERE): create_sphere_prism_contacts,
     int(GeoType.CAPSULE): create_capsule_prism_contacts,
     int(GeoType.CYLINDER): create_cylinder_prism_contacts,
+    int(GeoType.BOX): create_box_prism_contacts,
 }
 """Primitive types with a closed-form heightfield-cell query, by factory."""
