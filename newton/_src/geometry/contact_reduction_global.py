@@ -81,6 +81,7 @@ from .contact_reduction import (
     project_point_to_plane,
 )
 from .heightfield_features import WELD_FLAT_SEAMS, HeightfieldFeatureContext, flat_seam_query_allowed
+from .heightfield_sphere_contact import analytic_sphere_default, create_sphere_prism_contacts
 from .support_function import (
     create_triangle_prism_penetration_refiner,
     extract_shape_data,
@@ -2499,7 +2500,6 @@ def create_export_reduced_contacts_kernel(writer_func: Any, *, clear_after_expor
     return export_reduced_contacts_kernel
 
 
-@cache
 def create_mesh_triangle_contacts_to_reducer_kernel(
     primitive_type: int = 0,
     exclude_primitives: bool = False,
@@ -2510,8 +2510,43 @@ def create_mesh_triangle_contacts_to_reducer_kernel(
     writer_binding=None,
     writer_data_type=GlobalContactReducerData,
     kernel_name=None,
+    analytic_sphere: bool | None = None,
 ):
-    """Create the original query or a filtered heightfield primitive variant."""
+    """Create the original query or a filtered heightfield primitive variant.
+
+    Args:
+        analytic_sphere: Use the closed-form sphere-vs-prism contact for the
+            typed sphere query. ``None`` reads ``NEWTON_HEIGHTFIELD_SPHERE_ANALYTIC``
+            (default on).
+    """
+    if analytic_sphere is None:
+        analytic_sphere = analytic_sphere_default()
+    return _create_mesh_triangle_contacts_to_reducer_kernel(
+        primitive_type,
+        exclude_primitives,
+        exclude_heightfield_convex=exclude_heightfield_convex,
+        skip_marked=skip_marked,
+        writer_func=writer_func,
+        writer_binding=writer_binding,
+        writer_data_type=writer_data_type,
+        kernel_name=kernel_name,
+        analytic_sphere=bool(analytic_sphere) and primitive_type == int(GeoType.SPHERE),
+    )
+
+
+@cache
+def _create_mesh_triangle_contacts_to_reducer_kernel(
+    primitive_type: int = 0,
+    exclude_primitives: bool = False,
+    *,
+    exclude_heightfield_convex: bool = False,
+    skip_marked: bool = False,
+    writer_func=write_contact_to_reducer,
+    writer_binding=None,
+    writer_data_type=GlobalContactReducerData,
+    kernel_name=None,
+    analytic_sphere: bool = False,
+):
     if primitive_type not in (0, int(GeoType.SPHERE), int(GeoType.CYLINDER)):
         raise ValueError("Only sphere and cylinder heightfield queries can be specialized")
     if primitive_type and exclude_primitives:
@@ -2521,6 +2556,17 @@ def create_mesh_triangle_contacts_to_reducer_kernel(
         query_support = support_map_heightfield_sphere
     elif primitive_type == int(GeoType.CYLINDER):
         query_support = support_map_heightfield_cylinder
+    query_filter = flat_seam_query_allowed if WELD_FLAT_SEAMS else None
+    if analytic_sphere:
+        pair_query = create_sphere_prism_contacts(writer_func, query_filter=query_filter)
+    else:
+        pair_query = create_compute_gjk_mpr_contacts(
+            writer_func,
+            support_func=query_support,
+            use_precomputed_center=primitive_type != 0,
+            penetration_refiner=create_triangle_prism_penetration_refiner(query_support),
+            query_filter=query_filter,
+        )
 
     def mesh_triangle_contacts_to_reducer_kernel(
         shape_types: wp.array[int],
@@ -2643,15 +2689,7 @@ def create_mesh_triangle_contacts_to_reducer_kernel(
                 if type_a == GeoType.HFIELD:
                     feature_context.heightfield = heightfield_data[shape_heightfield_index[shape_a]]
 
-            wp.static(
-                create_compute_gjk_mpr_contacts(
-                    writer_func,
-                    support_func=query_support,
-                    use_precomputed_center=primitive_type != 0,
-                    penetration_refiner=create_triangle_prism_penetration_refiner(query_support),
-                    query_filter=flat_seam_query_allowed if WELD_FLAT_SEAMS else None,
-                )
-            )(
+            wp.static(pair_query)(
                 shape_data_a,
                 shape_data_b,
                 quat_a,
@@ -2670,6 +2708,8 @@ def create_mesh_triangle_contacts_to_reducer_kernel(
 
     if primitive_type == int(GeoType.SPHERE):
         mesh_triangle_contacts_to_reducer_kernel.__name__ = "heightfield_sphere_contacts_to_reducer_kernel"
+        if analytic_sphere:
+            mesh_triangle_contacts_to_reducer_kernel.__name__ += "_analytic"
     elif primitive_type == int(GeoType.CYLINDER):
         mesh_triangle_contacts_to_reducer_kernel.__name__ = "heightfield_cylinder_contacts_to_reducer_kernel"
     elif exclude_primitives:
