@@ -282,6 +282,13 @@ class TestHeightfieldConvexContact(unittest.TestCase):
         generic = create_mesh_triangle_contacts_to_reducer_kernel(int(newton.GeoType.CONVEX_MESH), analytic=False)
         self.assertIsNot(analytic, generic)
         self.assertTrue(analytic.key.endswith("convex_contacts_to_reducer_kernel_analytic"))
+        # In the pipeline the row runs inside the generic fallback scan (no sixth kernel).
+        fallback = create_mesh_triangle_contacts_to_reducer_kernel(exclude_primitives=True, analytic=True)
+        self.assertTrue(fallback.key.endswith("fallback_kernel_analytic_convex"))
+        without = create_mesh_triangle_contacts_to_reducer_kernel(
+            exclude_primitives=True, exclude_heightfield_convex=True, analytic=True
+        )
+        self.assertTrue(without.key.endswith("fallback_kernel_without_hfield_convex"))
 
     def check_resting(self, device):
         """A foot hull settles sole-down at the same height and place through both queries, also over small cells."""

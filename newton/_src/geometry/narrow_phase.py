@@ -2657,15 +2657,13 @@ class NarrowPhase:
                 create_mesh_triangle_contacts_to_reducer_kernel(int(GeoType.CYLINDER)),
                 create_mesh_triangle_contacts_to_reducer_kernel(int(GeoType.CAPSULE)),
                 create_mesh_triangle_contacts_to_reducer_kernel(int(GeoType.BOX)),
-                # Convex hulls get a typed query unless the opt-in convex-cells owner takes them;
-                # the generic fallback then serves only barrel cylinders.
-                *(
-                    ()
-                    if self._heightfield_convex_cells_requested
-                    else (create_mesh_triangle_contacts_to_reducer_kernel(int(GeoType.CONVEX_MESH)),)
-                ),
+                # Convex hulls stay in the fallback scan (a typed kernel is one more
+                # pass over every candidate pair: Go2 rough +2%); with the closed-form
+                # row on, the fallback runs that row for them. The opt-in convex-cells
+                # owner takes them out of the fallback entirely.
                 create_mesh_triangle_contacts_to_reducer_kernel(
-                    exclude_primitives=True, exclude_heightfield_convex=True
+                    exclude_primitives=True,
+                    exclude_heightfield_convex=self._heightfield_convex_cells_requested,
                 ),
             )
         cylinder_split = os.environ.get("NEWTON_HEIGHTFIELD_CYLINDER_SPLIT", "0")

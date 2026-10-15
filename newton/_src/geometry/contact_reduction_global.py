@@ -2518,11 +2518,16 @@ def create_mesh_triangle_contacts_to_reducer_kernel(
 
     Args:
         analytic: Use the closed-form cell contact of ``ANALYTIC_PRIMITIVE_QUERIES``
-            for a typed primitive query that has one. ``None`` reads
-            ``NEWTON_HEIGHTFIELD_ANALYTIC_PRIMITIVES`` (default on).
+            for a typed primitive query that has one, or, in the generic
+            fallback that still serves heightfield convex pairs, for those
+            pairs inside the same kernel (every typed kernel is one more scan
+            of the whole candidate list, so convex hulls do not get their own).
+            ``None`` reads ``NEWTON_HEIGHTFIELD_ANALYTIC_PRIMITIVES`` (default on).
     """
     if analytic is None:
         analytic = analytic_primitives_default()
+    analytic = bool(analytic)
+    convex_in_fallback = exclude_primitives and not exclude_heightfield_convex
     return _create_mesh_triangle_contacts_to_reducer_kernel(
         primitive_type,
         exclude_primitives,
@@ -2532,7 +2537,8 @@ def create_mesh_triangle_contacts_to_reducer_kernel(
         writer_binding=writer_binding,
         writer_data_type=writer_data_type,
         kernel_name=kernel_name,
-        analytic=bool(analytic) and primitive_type in ANALYTIC_PRIMITIVE_QUERIES,
+        analytic=analytic and primitive_type in ANALYTIC_PRIMITIVE_QUERIES,
+        analytic_convex=analytic and convex_in_fallback and int(GeoType.CONVEX_MESH) in ANALYTIC_PRIMITIVE_QUERIES,
     )
 
 
@@ -2566,6 +2572,7 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
     writer_data_type=GlobalContactReducerData,
     kernel_name=None,
     analytic: bool = False,
+    analytic_convex: bool = False,
 ):
     if primitive_type not in (0, *HEIGHTFIELD_PRIMITIVE_SUPPORTS):
         raise ValueError("Only sphere, capsule, cylinder, box and convex-mesh heightfield queries can be specialized")
@@ -2583,6 +2590,13 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
             penetration_refiner=create_triangle_prism_penetration_refiner(query_support),
             query_filter=query_filter,
         )
+    # The fallback keeps heightfield convex pairs in its own scan; with the
+    # closed-form row on, those pairs take the row here instead of GJK/MPR.
+    convex_query = (
+        ANALYTIC_PRIMITIVE_QUERIES[int(GeoType.CONVEX_MESH)](writer_func, query_filter=query_filter)
+        if analytic_convex
+        else pair_query
+    )
 
     def mesh_triangle_contacts_to_reducer_kernel(
         shape_types: wp.array[int],
@@ -2702,6 +2716,25 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
                 if type_a == GeoType.HFIELD:
                     feature_context.heightfield = heightfield_data[shape_heightfield_index[shape_a]]
 
+            if wp.static(analytic_convex):
+                if type_a == GeoType.HFIELD and shape_data_b.shape_type == GeoType.CONVEX_MESH:
+                    wp.static(convex_query)(
+                        shape_data_a,
+                        shape_data_b,
+                        quat_a,
+                        quat_b,
+                        pos_a,
+                        pos_b,
+                        gap_sum,
+                        shape_a,
+                        shape_b,
+                        margin_offset_a,
+                        margin_offset_b,
+                        reducer_data,
+                        (tri_idx << 1) | 1,
+                        feature_context,
+                    )
+                    continue
             wp.static(pair_query)(
                 shape_data_a,
                 shape_data_b,
@@ -2735,6 +2768,8 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
         mesh_triangle_contacts_to_reducer_kernel.__name__ = "mesh_triangle_contacts_to_reducer_fallback_kernel"
     if exclude_heightfield_convex:
         mesh_triangle_contacts_to_reducer_kernel.__name__ += "_without_hfield_convex"
+    if analytic_convex:
+        mesh_triangle_contacts_to_reducer_kernel.__name__ += "_analytic_convex"
     if skip_marked:
         mesh_triangle_contacts_to_reducer_kernel.__name__ += "_finite_fallback"
     if kernel_name is not None:
