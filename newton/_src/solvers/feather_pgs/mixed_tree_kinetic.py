@@ -55,7 +55,6 @@ def supported(solver):
         and solver.drive_mode == "augmented"
         and solver.pgs_velocity_iterations == 0
         and not solver.enable_joint_velocity_limits
-        and not solver._has_free_rigid_bodies
         and not solver._has_prescribed_response
         and not solver._mimic_count
         and not solver._connect_count
@@ -125,8 +124,14 @@ class TreeHeldOperator:
         ancestors = model.joint_ancestor.numpy()[first:end]
         parents = np.where(ancestors < 0, -1, ancestors - first)
         counts = np.diff(model.joint_qd_start.numpy())[first:end]
-        if counts[0] != 0 or model.joint_type.numpy()[first] not in (int(JointType.FIXED), int(JointType.D6)):
-            raise ValueError("Mixed held tree groups require fixed roots")
+        root_type = model.joint_type.numpy()[first]
+        fixed_root = counts[0] == 0 and root_type in (int(JointType.FIXED), int(JointType.D6))
+        # A free rigid body is a one-body tree on a free root: its six coordinates
+        # share the held Cholesky action and the generic free-root transport.
+        free_root = counts[0] == 6 and root_type == int(JointType.FREE)
+        if not (fixed_root or free_root):
+            raise ValueError("Mixed held tree groups require fixed or free roots")
+        self.free_root = bool(free_root)
         mass = self.mass = _SparseMassMatrixPlan.build(parents, counts)
         if mass.dof_count != size:
             raise ValueError("Mixed tree physical and factor dimensions differ")
@@ -230,13 +235,14 @@ class MixedTreeKineticState:
                 chain_scan_default=False,
                 complete=False,
                 response="diagonal" if operator.diagonal else "cholesky",
-                copy_reuse=True,
+                # Copied-state reuse requires fixed scalar coordinates.
+                copy_reuse=not operator.free_root,
             )
             operator.kinetic_state = group
             self.groups.append(group)
         # The existing solver lifecycle delegates factor refresh to this binding.
         self.sparse = self
-        self.copy_reuse = True
+        self.copy_reuse = all(group.copy_reuse for group in self.groups)
 
     def validate_model(self):
         """Reject ownership changes before any cache or notification mutation."""

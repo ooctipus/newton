@@ -526,14 +526,45 @@ def get_helpers(layout: TreeLayout = G1_LAYOUT, chain_scan: bool = False, body_v
         refresh: int,
     ): ...
 
+    from . import kernels  # noqa: PLC0415
+
+    store = "_store_terms(address, local, mass, radius, inertia_com, wrench, refresh)"
+    if layout.bodies == 1 and layout.root_dofs == 6:
+        # A root-only free body is a free rigid body: the matrix-free contact
+        # path reads its spatial inertia and bias wrench every substep, so
+        # publish them through the ordinary free-rigid finalization.
+        store += """
+if data.is_free_rigid[data.body_to_articulation[body]] != 0:
+    data.body_q_com[body] = pose_com
+    data.body_a_s[body] = acceleration
+    kernels.finalize_body_dynamics_values(
+        body,
+        data.body_to_articulation[body],
+        pose,
+        pose_com,
+        data.body_com,
+        data.body_mass,
+        data.body_inertia,
+        data.is_free_rigid,
+        origin,
+        0,
+        0,
+        data.gravity,
+        velocity,
+        acceleration,
+        data.body_I_s,
+        data.body_inertia_terms,
+        data.body_f_s,
+        data.body_qd,
+    )"""
     _body_terms = make_body_terms(
         "address: wp.uint64, body: int, local: int, world: int, pose: wp.transform, pose_com: wp.transform, origin: wp.vec3, velocity: wp.spatial_vector, acceleration: wp.spatial_vector, data: PublicationData, cache: KineticData, refresh: int",
-        dict(globals(), _store_terms=_store_terms, _inertia_action=kinetic_state._inertia_action),
+        dict(globals(), _store_terms=_store_terms, _inertia_action=kinetic_state._inertia_action, kernels=kernels),
         refresh="refresh",
         cache="cache",
         com_offset="radius",
         body_velocity=body_velocity,
-        store="_store_terms(address, local, mass, radius, inertia_com, wrench, refresh)",
+        store=store,
     )
 
     @wp.func_native(collect_source)
