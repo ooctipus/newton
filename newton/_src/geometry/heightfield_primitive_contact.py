@@ -28,11 +28,12 @@ from .contact_data import ContactData
 from .heightfield_sphere_contact import (
     _ADMISSION_SLACK,
     PROXY_RADIUS,
+    _xy_inside_triangle,
     create_sphere_prism_contacts,
     point_prism_query,
     prism_normal,
 )
-from .support_function import TRIANGLE_PRISM_EXTRUSION, GenericShapeData
+from .support_function import TRIANGLE_PRISM_EXTRUSION, GenericShapeData, unpack_mesh_ptr
 from .types import GeoType
 
 
@@ -657,6 +658,20 @@ def _clip_polygon_xy(points: _Polygon, count: int, e1: wp.vec3, e2: wp.vec3) -> 
     return current, current_count
 
 
+@wp.func
+def _footprint_point_query(p: wp.vec3, n: wp.vec3) -> tuple[wp.vec3, wp.vec3, float]:
+    """Plane projection, normal and signed distance of a point known to lie over the cell.
+
+    Vertices produced by :func:`_clip_polygon_xy` are inside the footprint by
+    construction, often exactly on its boundary; the general point query may
+    classify such a boundary point as outside and answer with a side wall,
+    which turns a resting face contact into a lateral push. The clipped
+    polygon always belongs to the top face, so its depth is the plane depth.
+    """
+    s = wp.dot(p, n)
+    return p - s * n, n, s
+
+
 def create_box_prism_contacts(writer_func: Any, query_filter: Any = None):
     """Create the closed-form box-vs-prism query with the signature of ``compute_gjk_mpr_contacts``.
 
@@ -694,7 +709,6 @@ def create_box_prism_contacts(writer_func: Any, query_filter: Any = None):
             return
         half = shape_b_data.scale
         threshold = rigid_gap + margin_a + margin_b
-        reach = threshold + _ADMISSION_SLACK
         # Box center and axes in the triangle-origin heightfield-local frame.
         relative = wp.quat_inverse(rot_a) * rot_b
         c = wp.quat_rotate_inv(rot_a, pos_b_adjusted - pos_a_adjusted)
@@ -753,7 +767,7 @@ def create_box_prism_contacts(writer_func: Any, query_filter: Any = None):
         key = sort_sub_key << 3
         for i in range(count):
             p = wp.vec3(clipped[i, 0], clipped[i, 1], clipped[i, 2])
-            point_a, normal, d = point_prism_query(p, e1, e2, n, reach)
+            point_a, normal, d = _footprint_point_query(p, n)
             if d > threshold + _ADMISSION_SLACK:
                 continue
             if wp.static(has_query_filter):
@@ -776,10 +790,156 @@ def create_box_prism_contacts(writer_func: Any, query_filter: Any = None):
     return box_prism_contacts
 
 
+_BAND_ABSOLUTE = 1.0e-3
+_BAND_RELATIVE = 0.01
+_SUPPORT_DIRECTIONS = 8
+
+
+def create_convex_prism_contacts(writer_func: Any, query_filter: Any = None):
+    """Create the closed-form convex-hull-vs-prism query with the signature of ``compute_gjk_mpr_contacts``.
+
+    The hull vertices within admission distance of the cell plane (and never
+    fewer than those within a small band of the lowest one) form the touching
+    feature: a face when the hull rests flat, an edge or a single vertex
+    otherwise. Up to eight of them, the extremes along eight fixed in-plane
+    directions, are taken in that angular order, which is a convex polygon in
+    the cell's xy plane by construction. Like the box row the polygon is then
+    clipped to the cell footprint and every clipped vertex is resolved at its
+    plane depth, so a face covering several small cells gives each cell its
+    own support points. No face or edge tables are needed, only the hull
+    points the support function already reads.
+    """
+    has_query_filter = query_filter is not None
+
+    @wp.func
+    def convex_prism_contacts(
+        shape_a_data: GenericShapeData,
+        shape_b_data: GenericShapeData,
+        rot_a: wp.quat,
+        rot_b: wp.quat,
+        pos_a_adjusted: wp.vec3,
+        pos_b_adjusted: wp.vec3,
+        rigid_gap: float,
+        shape_a: int,
+        shape_b: int,
+        margin_a: float,
+        margin_b: float,
+        writer_data: Any,
+        sort_sub_key: int = 0,
+        query_context: Any = 0,
+    ):
+        e1 = shape_a_data.scale
+        e2 = shape_a_data.auxiliary
+        n = prism_normal(e1, e2)
+        if n[2] == 0.0:
+            return
+        threshold = rigid_gap + margin_a + margin_b
+        mesh = wp.mesh_get(unpack_mesh_ptr(shape_b_data.auxiliary))
+        count = mesh.points.shape[0]
+        if count == 0:
+            return
+        relative = wp.quat_inverse(rot_a) * rot_b
+        c = wp.quat_rotate_inv(rot_a, pos_b_adjusted - pos_a_adjusted)
+        scale = shape_b_data.scale
+        # Heights along the cell normal as one dot product per vertex in the
+        # mesh frame: dot(c + R(s*p), n) = dot(c, n) + dot(p, s*(R^T n)).
+        height_axis = wp.cw_mul(wp.quat_rotate_inv(relative, n), scale)
+        height_base = wp.dot(c, n)
+        lowest = float(1.0e30)
+        highest = float(-1.0e30)
+        lowest_index = int(0)
+        for i in range(count):
+            h = height_base + wp.dot(mesh.points[i], height_axis)
+            if h < lowest:
+                lowest = h
+                lowest_index = i
+            highest = wp.max(highest, h)
+        if lowest - threshold - _ADMISSION_SLACK > 0.0 and lowest > 0.0:
+            # The whole hull is farther from the plane than the admission threshold.
+            # (Points over neighbouring cells can only be farther from this prism.)
+            return
+        band = lowest + wp.max(_BAND_ABSOLUTE, _BAND_RELATIVE * (highest - lowest))
+        limit = wp.max(band, threshold + _ADMISSION_SLACK)
+        # The touching polygon: extreme touching vertices along eight in-plane
+        # directions, visited in angular order so they arrive counter-clockwise.
+        chosen = wp.vector(length=8, dtype=wp.int32)
+        selected = int(0)
+        lowest_chosen = int(0)
+        for k in range(_SUPPORT_DIRECTIONS):
+            angle = float(k) * (wp.pi / float(_SUPPORT_DIRECTIONS)) * 2.0
+            direction = wp.cw_mul(wp.quat_rotate_inv(relative, wp.vec3(wp.cos(angle), wp.sin(angle), 0.0)), scale)
+            best = int(-1)
+            best_value = float(-1.0e30)
+            for i in range(count):
+                if height_base + wp.dot(mesh.points[i], height_axis) <= limit:
+                    value = wp.dot(mesh.points[i], direction)
+                    if value > best_value:
+                        best_value = value
+                        best = i
+            if best < 0:
+                continue
+            duplicate = int(0)
+            for j in range(selected):
+                if chosen[j] == best:
+                    duplicate = 1
+            if duplicate == 0:
+                chosen[selected] = best
+                selected += 1
+                if best == lowest_index:
+                    lowest_chosen = 1
+        points = _Polygon()
+        for j in range(selected):
+            p = c + wp.quat_rotate(relative, wp.cw_mul(mesh.points[chosen[j]], scale))
+            points[j, 0] = p[0]
+            points[j, 1] = p[1]
+            points[j, 2] = p[2]
+        clipped, clipped_count = _clip_polygon_xy(points, selected, e1, e2)
+        # A hull resting on a vertex may project that vertex inside the
+        # touching polygon, where no direction selects it; the cell over it
+        # still has to report its exact depth, so it goes first and the
+        # polygon fills the remaining slots of the eight-point budget.
+        if lowest_chosen == 0:
+            p = c + wp.quat_rotate(relative, wp.cw_mul(mesh.points[lowest_index], scale))
+            if _xy_inside_triangle(p, e1, e2):
+                clipped_count = wp.min(clipped_count, 7)
+                for i in range(clipped_count, 0, -1):
+                    for k in range(3):
+                        clipped[i, k] = clipped[i - 1, k]
+                clipped[0, 0] = p[0]
+                clipped[0, 1] = p[1]
+                clipped[0, 2] = p[2]
+                clipped_count += 1
+        key = sort_sub_key << 3
+        for i in range(clipped_count):
+            p = wp.vec3(clipped[i, 0], clipped[i, 1], clipped[i, 2])
+            point_a, normal, d = _footprint_point_query(p, n)
+            if d > threshold + _ADMISSION_SLACK:
+                continue
+            if wp.static(has_query_filter):
+                if d >= 0.0 and not query_filter(shape_a_data, point_a, normal, query_context):
+                    continue
+            contact = ContactData()
+            contact.radius_eff_a = 0.0
+            contact.radius_eff_b = 0.0
+            contact.margin_a = margin_a
+            contact.margin_b = margin_b
+            contact.shape_a = shape_a
+            contact.shape_b = shape_b
+            contact.gap_sum = rigid_gap
+            contact.sort_sub_key = key | i
+            contact.contact_point_center = wp.quat_rotate(rot_a, 0.5 * (point_a + p)) + pos_a_adjusted
+            contact.contact_normal_a_to_b = wp.quat_rotate(rot_a, normal)
+            contact.contact_distance = d
+            writer_func(contact, writer_data, -1)
+
+    return convex_prism_contacts
+
+
 ANALYTIC_PRIMITIVE_QUERIES = {
     int(GeoType.SPHERE): create_sphere_prism_contacts,
     int(GeoType.CAPSULE): create_capsule_prism_contacts,
     int(GeoType.CYLINDER): create_cylinder_prism_contacts,
     int(GeoType.BOX): create_box_prism_contacts,
+    int(GeoType.CONVEX_MESH): create_convex_prism_contacts,
 }
 """Primitive types with a closed-form heightfield-cell query, by factory."""

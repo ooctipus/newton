@@ -2541,6 +2541,7 @@ HEIGHTFIELD_PRIMITIVE_SUPPORTS = {
     int(GeoType.CAPSULE): support_map_heightfield_capsule,
     int(GeoType.CYLINDER): support_map_heightfield_cylinder,
     int(GeoType.BOX): support_map_heightfield_box,
+    int(GeoType.CONVEX_MESH): support_map,
 }
 """Typed heightfield primitive queries: each type owns a reduced support dispatch."""
 
@@ -2567,7 +2568,7 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
     analytic: bool = False,
 ):
     if primitive_type not in (0, *HEIGHTFIELD_PRIMITIVE_SUPPORTS):
-        raise ValueError("Only sphere, capsule, cylinder and box heightfield queries can be specialized")
+        raise ValueError("Only sphere, capsule, cylinder, box and convex-mesh heightfield queries can be specialized")
     if primitive_type and exclude_primitives:
         raise ValueError("A typed query cannot also exclude primitive pairs")
     query_support = HEIGHTFIELD_PRIMITIVE_SUPPORTS.get(primitive_type, support_map)
@@ -2726,6 +2727,8 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
         mesh_triangle_contacts_to_reducer_kernel.__name__ = "heightfield_cylinder_contacts_to_reducer_kernel"
     elif primitive_type == int(GeoType.BOX):
         mesh_triangle_contacts_to_reducer_kernel.__name__ = "heightfield_box_contacts_to_reducer_kernel"
+    elif primitive_type == int(GeoType.CONVEX_MESH):
+        mesh_triangle_contacts_to_reducer_kernel.__name__ = "heightfield_convex_contacts_to_reducer_kernel"
     if analytic:
         mesh_triangle_contacts_to_reducer_kernel.__name__ += "_analytic"
     elif exclude_primitives:

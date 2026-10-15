@@ -2657,8 +2657,15 @@ class NarrowPhase:
                 create_mesh_triangle_contacts_to_reducer_kernel(int(GeoType.CYLINDER)),
                 create_mesh_triangle_contacts_to_reducer_kernel(int(GeoType.CAPSULE)),
                 create_mesh_triangle_contacts_to_reducer_kernel(int(GeoType.BOX)),
+                # Convex hulls get a typed query unless the opt-in convex-cells owner takes them;
+                # the generic fallback then serves only barrel cylinders.
+                *(
+                    ()
+                    if self._heightfield_convex_cells_requested
+                    else (create_mesh_triangle_contacts_to_reducer_kernel(int(GeoType.CONVEX_MESH)),)
+                ),
                 create_mesh_triangle_contacts_to_reducer_kernel(
-                    exclude_primitives=True, exclude_heightfield_convex=self._heightfield_convex_cells_requested
+                    exclude_primitives=True, exclude_heightfield_convex=True
                 ),
             )
         cylinder_split = os.environ.get("NEWTON_HEIGHTFIELD_CYLINDER_SPLIT", "0")
