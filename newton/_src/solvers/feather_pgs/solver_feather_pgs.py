@@ -508,13 +508,31 @@ def _accumulate_row_capacity_telemetry(
 
 
 @wp.kernel
-def _clear_dense_row_state(slot_counter: wp.array[int], contact_world: wp.array[int], dropped: wp.array2d[int]):
-    """Clear allocation state and row-loss counters together."""
-    world = wp.tid()
-    slot_counter[world] = 0
-    contact_world[world] = 0
-    for family in range(3):
-        dropped[family, world] = 0
+def _clear_dense_row_state(
+    slot_counter: wp.array[int],
+    contact_world: wp.array[int],
+    dropped: wp.array2d[int],
+    dense_first_rejected_slot: wp.array[int],
+    has_free_rigid: int,
+    mf_slot_counter: wp.array[int],
+    mf_first_rejected_slot: wp.array[int],
+    mf_constraint_count: wp.array[int],
+    mf_impulses: wp.array2d[float],
+):
+    """Clear allocation state, row-loss counters and free-body row state in one launch."""
+    world, column = wp.tid()
+    if column == 0:
+        slot_counter[world] = 0
+        contact_world[world] = 0
+        for family in range(3):
+            dropped[family, world] = 0
+        dense_first_rejected_slot[world] = _ROW_SLOT_UNBOUNDED
+        if has_free_rigid != 0:
+            mf_slot_counter[world] = 0
+            mf_first_rejected_slot[world] = _ROW_SLOT_UNBOUNDED
+            mf_constraint_count[world] = 0
+    if has_free_rigid != 0:
+        mf_impulses[world, column] = 0.0
 
 
 @wp.kernel
@@ -2891,6 +2909,7 @@ class SolverFeatherPGS(SolverBase):
         self._dummy_contact_impulses = wp.zeros((1, 1), dtype=wp.float32, device=model.device)
         self._dummy_is_free_rigid = wp.zeros((1,), dtype=wp.int32, device=model.device)
         self._dummy_mf_slot_counter = wp.zeros((self.world_count,), dtype=wp.int32, device=model.device)
+        self._dummy_mf_impulses = wp.zeros((1, 1), dtype=wp.float32, device=model.device)
         self._dummy_contact_count = wp.zeros((1,), dtype=wp.int32, device=model.device)
         self._dummy_contact_row_type = wp.zeros((1, 1), dtype=wp.int32, device=model.device)
         # Dedicated row-type sink for reset(): reset_world_warmstart_buffers
@@ -13135,29 +13154,26 @@ class SolverFeatherPGS(SolverBase):
         if self._has_prescribed_response:
             self.mf_target_velocity.zero_()
 
-        # Zero world-level buffers (only arrays that require it)
+        # One launch clears the world-level allocation state and, with free rigid bodies, the
+        # matrix-free counters and impulses (PGS reads mf_impulses before its first write; the
+        # warm-start seed pass re-gathers after build_mf_contact_rows). Other row buffers are
+        # fully overwritten by their producers.
         wp.launch(
             _clear_dense_row_state,
-            dim=self.world_count,
-            inputs=[self.slot_counter, self.dense_contact_world_flag, self._row_dropped_all],
+            dim=(self.world_count, self.mf_impulses.shape[1] if mf_active else 1),
+            inputs=[
+                self.slot_counter,
+                self.dense_contact_world_flag,
+                self._row_dropped_all,
+                self._dense_first_rejected_slot,
+                1 if mf_active else 0,
+                self.mf_slot_counter if mf_active else self._dummy_mf_slot_counter,
+                self._mf_first_rejected_slot if mf_active else self._dummy_mf_slot_counter,
+                self.mf_constraint_count if mf_active else self._dummy_mf_slot_counter,
+                self.mf_impulses if mf_active else self._dummy_mf_impulses,
+            ],
             device=model.device,
         )
-        self._dense_first_rejected_slot.fill_(_ROW_SLOT_UNBOUNDED)
-
-        if mf_active:
-            self.mf_slot_counter.zero_()  # atomic-add counter
-            self._mf_first_rejected_slot.fill_(_ROW_SLOT_UNBOUNDED)
-            self.mf_constraint_count.zero_()  # finalize only runs when contacts exist
-            # Zero unconditionally here. When warm-start is OFF this is the
-            # original behavior (bit-identical). When ON this also guarantees a
-            # clean buffer on steps where the contact block is skipped (no
-            # contacts this frame); the seed pass after build_mf_contact_rows
-            # re-memsets and gathers when contacts ARE present, and the carry
-            # itself lives in _ws_prev_mf_impulses, so this zero is harmless.
-            self.mf_impulses.zero_()  # PGS reads before first write
-            # mf_J_a/b, mf_MiJt_a/b: writers cover all used slots, readers gated by body >= 0
-            # mf_body_a/b, mf_row_type, mf_row_parent, mf_row_mu, mf_phi: unconditionally overwritten
-            # constraint_count: fully overwritten by finalize_world_constraint_counts
         if propagation_active:
             self.propagation_slot_counter.zero_()
             self._propagation_first_rejected_slot.fill_(_ROW_SLOT_UNBOUNDED)
