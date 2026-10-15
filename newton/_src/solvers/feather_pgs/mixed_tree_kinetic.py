@@ -7,7 +7,7 @@ import numpy as np
 import warp as wp
 
 from ...sim import JointType
-from .franka_kinetic_factor import get_kernel as geometric_factor
+from . import small_cholesky
 from .sparse_factor import bind_operator_plan, operator_metadata
 from .sparse_mass_matrix import _SparseMassMatrixPlan
 from .tree_kinetic_owner import TreeKineticState
@@ -71,7 +71,6 @@ def supported(solver):
             for name in (
                 "_sparse_factor",
                 "_kinetic_world",
-                "_franka_kinetic_state",
                 "_joint_world",
                 "_world_scan_publication",
                 "_prismatic_publication",
@@ -155,8 +154,8 @@ class TreeHeldOperator:
         else:
             self.data.lower = solver.L_by_size[size]
             self.geometry_index = wp.array(physical_index.ravel(), dtype=int, device=device)
-            self.refresh_kernel = geometric_factor(
-                str(device.arch), size=size, geometric_index=tuple(map(int, physical_index.ravel()))
+            self.refresh_kernel = small_cholesky.get_kernel(
+                size, geometric=True, geometric_index=tuple(map(int, physical_index.ravel()))
             )
             self.factor_offsets = wp.zeros(size, dtype=int, device=device)
             self.factor_schedule = wp.array(

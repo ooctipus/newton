@@ -159,7 +159,7 @@ def get_kernel(size: int, *, warps_per_block: int = 4, geometric: bool = False, 
         FORCE_INIT="" if geometric else _FORCE_INIT.substitute(DOFS=size),
         MASS_INPUT=mass_input,
     )
-    name = f"{'franka_kinetic_' if geometric else ''}crba_cholesky_warp{warps_per_block}_{size}"
+    name = f"{'geometric_' if geometric else ''}crba_cholesky_warp{warps_per_block}_{size}"
     signature = ",\n    ".join(inputs)
     arguments = ", ".join(item.split(":")[0] for item in inputs)
     # Author both ABIs directly; never inspect or rewrite a producer's Python.
