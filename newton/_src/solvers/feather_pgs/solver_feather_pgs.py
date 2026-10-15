@@ -282,10 +282,14 @@ _GROUPED_TAU_MASS_ON = os.environ.get("FEATHER_PGS_GROUPED_TAU_MASS") == "1"
 _GROUPED_MASS_ON = os.environ.get("FEATHER_PGS_GROUPED_MASS") == "1"
 _FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
 _FK_ID_CACHE_SNAPSHOT = os.environ.get("FEATHER_PGS_FK_CACHE_SNAPSHOT") == "1"
-# The general route publishes each articulation in one launch per size group
-# (impulses, acceleration, integration, kinematics and body dynamics).
-# FEATHER_PGS_FUSED_PUBLISH=0 restores the separate launches.
-_FUSED_PUBLISH = os.environ.get("FEATHER_PGS_FUSED_PUBLISH", "1") != "0"
+# FEATHER_PGS_FUSED_PUBLISH=1 publishes each articulation of the general route
+# in one launch per size group (impulses, acceleration, integration,
+# kinematics and body dynamics). Bit-identical, but one thread per
+# articulation serializes work the separate launches spread over DOFs,
+# joints and bodies: measured +16.5% on Cartpole and +13.5% on Franka
+# cabinet at 16,384 worlds, flat on Humanoid and Ant. Kept opt-in until a
+# lane-parallel mapping is measured.
+_FUSED_PUBLISH = os.environ.get("FEATHER_PGS_FUSED_PUBLISH", "0") == "1"
 # Experimental Stage 7 producer partition, leaving all solve/mass budgets intact.
 _PRISMATIC_PUBLICATION = os.environ.get("FEATHER_PGS_PRISMATIC_PUBLICATION", "0") == "1"
 _PRISMATIC_LINEAR_STATE = os.environ.get("FEATHER_PGS_PRISMATIC_LINEAR_STATE", "0") == "1"
