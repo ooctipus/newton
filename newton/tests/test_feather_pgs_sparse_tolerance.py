@@ -75,7 +75,7 @@ def _build(device, worlds=8):
 
 @unittest.skipUnless(wp.is_cuda_available(), "Native sparse factors are a CUDA path")
 class TestFeatherPGSSparseTolerance(unittest.TestCase):
-    def _rollout(self, iterations, *, tolerance=0.0, steps=12, dt=0.005):
+    def _rollout(self, iterations, *, tolerance=0.0, relative_tolerance=0.0, steps=12, dt=0.005):
         device = wp.get_device("cuda:0")
         model, contacts = _build(device)
         solver = SolverFeatherPGS(
@@ -84,6 +84,7 @@ class TestFeatherPGSSparseTolerance(unittest.TestCase):
             sparse_mass_matrix="on",
             pgs_iterations=iterations,
             pgs_change_tolerance=tolerance,
+            pgs_relative_change_tolerance=relative_tolerance,
             friction_anchor_beta=0.0,
         )
         self.assertIsNotNone(solver._sparse_mass_matrix_size)
@@ -106,8 +107,12 @@ class TestFeatherPGSSparseTolerance(unittest.TestCase):
         np.testing.assert_array_equal(exact, again)
         loose, _ = self._rollout(8, tolerance=1.0e-4)
         self.assertLess(float(np.abs(loose - exact).max()), 1.0e-2)
+        relative, _ = self._rollout(8, relative_tolerance=1.0e-2)
+        self.assertLess(float(np.abs(relative - exact).max()), 1.0e-2)
         with self.assertRaises(ValueError):
             self._rollout(8, tolerance=-1.0)
+        with self.assertRaises(ValueError):
+            self._rollout(8, relative_tolerance=1.0)
 
 
 if __name__ == "__main__":

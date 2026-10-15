@@ -1260,6 +1260,7 @@ class SolverFeatherPGS(SolverBase):
         pgs_cfm: float = 1.0e-6,
         pgs_omega: float = 1.0,
         pgs_change_tolerance: float = 0.0,
+        pgs_relative_change_tolerance: float = 0.0,
         pgs_contact_regularization: float = 0.0,
         pgs_velocity_drive_mode: Literal["active", "freeze"] = "freeze",
         dense_max_constraints: int = 32,
@@ -1650,6 +1651,10 @@ class SolverFeatherPGS(SolverBase):
             pgs_change_tolerance (float, optional): Native sparse sweeps stop early once no impulse in a
                 world changes by more than this absolute amount in a sweep. Zero keeps the exact
                 stationary-sweep exit. Defaults to 0.0.
+            pgs_relative_change_tolerance (float, optional): Unit-free companion of
+                ``pgs_change_tolerance``: a row's change is also small when it is within this
+                fraction of the row's (normal) impulse after the update. Velocity-limit rows use
+                the absolute tolerance only. Defaults to 0.0.
             pgs_contact_regularization (float, optional): Dimensionless regularizer ``g`` of contact
                 rows on every route (matrix-free, dense, propagation). Each position iteration moves a
                 row's impulse toward the hard solution with weight ``1/(1+g)`` and toward zero with
@@ -2026,6 +2031,11 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_change_tolerance = float(pgs_change_tolerance)
         if not (np.isfinite(self.pgs_change_tolerance) and self.pgs_change_tolerance >= 0.0):
             raise ValueError(f"pgs_change_tolerance must be finite and non-negative, got {pgs_change_tolerance!r}")
+        self.pgs_relative_change_tolerance = float(pgs_relative_change_tolerance)
+        if not (np.isfinite(self.pgs_relative_change_tolerance) and 0.0 <= self.pgs_relative_change_tolerance < 1.0):
+            raise ValueError(
+                f"pgs_relative_change_tolerance must be finite in [0, 1), got {pgs_relative_change_tolerance!r}"
+            )
         self.pgs_velocity_iterations = max(int(pgs_velocity_iterations), 0)
         self.enable_restitution = bool(enable_restitution)
         threshold_error = "restitution_velocity_threshold must be finite and non-negative"
@@ -8398,6 +8408,7 @@ class SolverFeatherPGS(SolverBase):
                     iterations,
                     omega,
                     self.pgs_change_tolerance,
+                    self.pgs_relative_change_tolerance,
                     int(friction_start_iteration),
                     int(iteration_offset),
                 ],

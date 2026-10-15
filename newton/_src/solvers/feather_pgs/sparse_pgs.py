@@ -336,7 +336,8 @@ def _get_pgs_solve_sparse_kernel(
             const float change = kind == {velocity_limit_type} ? new_impulse : new_impulse - old_impulse;
             if (lane == 0) mf_impulse[row] = new_impulse;
             if (change != 0.0f || sibling_change != 0.0f) {{
-                if (!(fabsf(change) <= change_tolerance && fabsf(sibling_change) <= change_tolerance)) changed = 1;
+                if (!(fabsf(change) <= change_tolerance + relative_change_tolerance * fabsf(new_impulse)
+                      && fabsf(sibling_change) <= change_tolerance + relative_change_tolerance * fabsf(new_impulse))) changed = 1;
                 if (index >= 0) {{
                     float value = delta[index];
                     if (sibling_change != 0.0f) value += sibling_right * sibling_change;
@@ -534,7 +535,8 @@ def _get_pgs_solve_sparse_kernel(
             const float change = new_impulse - old_impulse;
             if (lane == 0) impulse[row] = new_impulse;
             if (change != 0.0f || sibling_change != 0.0f) {{
-                if (!(fabsf(change) <= change_tolerance && fabsf(sibling_change) <= change_tolerance)) changed = 1;
+                if (!(fabsf(change) <= change_tolerance + relative_change_tolerance * fabsf(new_impulse)
+                      && fabsf(sibling_change) <= change_tolerance + relative_change_tolerance * fabsf(new_impulse))) changed = 1;
                 #pragma unroll
                 for (int q = 0; q < {Q}; ++q) {{
                     if (indices[q] >= 0) {{
@@ -626,6 +628,7 @@ def _get_pgs_solve_sparse_kernel(
         iterations: int,
         omega: float,
         change_tolerance: float,
+        relative_change_tolerance: float,
         friction_start_iteration: int,
         iteration_offset: int,
         factor_velocity_delta: wp.array2d[float],
@@ -659,6 +662,7 @@ def _get_pgs_solve_sparse_kernel(
         iterations: int,
         omega: float,
         change_tolerance: float,
+        relative_change_tolerance: float,
         friction_start_iteration: int,
         iteration_offset: int,
         factor_velocity_delta: wp.array2d[float],
@@ -694,6 +698,7 @@ def _get_pgs_solve_sparse_kernel(
                 iterations,
                 omega,
                 change_tolerance,
+                relative_change_tolerance,
                 friction_start_iteration,
                 iteration_offset,
                 factor_velocity_delta,
@@ -855,8 +860,9 @@ def _contact_triplet_code(M: int, S: int, Q: int, contact_type: int, friction_ty
                     }}
                 }}
                 if (normal_change != 0.0f || tangent_change != 0.0f || sibling_change != 0.0f) {{
-                    if (!(fabsf(normal_change) <= change_tolerance && fabsf(tangent_change) <= change_tolerance
-                          && fabsf(sibling_change) <= change_tolerance)) changed = 1;
+                    if (!(fabsf(normal_change) <= change_tolerance + relative_change_tolerance * fabsf(new_normal)
+                          && fabsf(tangent_change) <= change_tolerance + relative_change_tolerance * fabsf(new_normal)
+                          && fabsf(sibling_change) <= change_tolerance + relative_change_tolerance * fabsf(new_normal))) changed = 1;
                     #pragma unroll
                     for (int q = 0; q < {Q}; ++q)
                         if (indices[q] >= 0) delta[indices[q]] = velocities[q];

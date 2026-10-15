@@ -1,0 +1,1 @@
+Add `pgs_relative_change_tolerance` to FeatherPGS: a unit-free early-exit criterion for native sparse sweeps (a row's change is small when within this fraction of its impulse), complementing the absolute `pgs_change_tolerance`.
