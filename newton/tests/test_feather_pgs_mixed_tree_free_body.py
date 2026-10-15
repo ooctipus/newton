@@ -17,8 +17,12 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 DT = 1.0 / 240.0
 
 
-def _build(device, worlds=4):
-    """Per world: a fixed-base three-joint arm over a free box resting on the ground."""
+def _build(device, worlds=4, mimic=False):
+    """Per world: a fixed-base three-joint arm over a free box resting on the ground.
+
+    With ``mimic`` the third arm joint follows the second through a mimic row,
+    as a gripper finger follows its leader.
+    """
     scene = newton.ModelBuilder()
     cfg = scene.default_shape_cfg.copy()
     cfg.mu = 0.6
@@ -51,6 +55,8 @@ def _build(device, worlds=4):
         parent = body
     scene.add_shape_capsule(parent, radius=0.03, half_height=0.1, cfg=cfg)
     scene.add_articulation(joints)
+    if mimic:
+        scene.add_constraint_mimic(joint0=joints[3], joint1=joints[2], coef0=0.0, coef1=1.0)
     box = scene.add_body(xform=wp.transform(wp.vec3(0.15, 0.05, 0.06), wp.quat_identity()), mass=0.5)
     scene.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
     builder = newton.ModelBuilder()
@@ -61,7 +67,7 @@ def _build(device, worlds=4):
     return model
 
 
-def _rollout(model, *, owner, steps=120):
+def _rollout(model, *, owner, steps=120, swing_joint=0):
     env = {
         "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": str(int(owner)),
         "FEATHER_PGS_FRANKA_KINETIC_STATE": "0",
@@ -92,17 +98,20 @@ def _rollout(model, *, owner, steps=120):
     qd = np.zeros(model.joint_dof_count, dtype=np.float32)
     types = model.joint_type.numpy()
     qd_start = model.joint_qd_start.numpy()
-    for joint in np.flatnonzero(types == int(newton.JointType.REVOLUTE))[::3]:
+    for joint in np.flatnonzero(types == int(newton.JointType.REVOLUTE))[swing_joint::3]:
         qd[qd_start[joint]] = 1.5
     states[0].joint_qd.assign(qd)
     trajectory = []
+    joint_trajectory = []
     for _ in range(steps):
         pipeline.collide(states[0], contacts)
         states[0].clear_forces()
         solver.step(states[0], states[1], control, contacts, DT)
         states.reverse()
         trajectory.append(states[0].body_q.numpy().copy())
+        joint_trajectory.append(states[0].joint_q.numpy().copy())
     wp.synchronize_device(model.device)
+    solver.joint_q_trajectory = np.array(joint_trajectory)
     return solver, state_owner, np.array(trajectory), states[0].body_qd.numpy().copy()
 
 
@@ -129,6 +138,23 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         self.assertTrue(np.all(final[:, 4, 2] > 0.04))
         self.assertTrue(np.all(final[:, 1, 2] > 0.2))
         self.assertEqual(int(owner.groups[0].status.numpy().sum()), 0)
+
+    def test_mimic_rows_compose_with_the_mixed_owner(self):
+        """Mimic rows are ordinary matrix-free rows over the held factors: the owner admits them and tracks the plain route."""
+        model = _build(wp.get_device("cuda:0"), mimic=True)
+        plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False, swing_joint=1)
+        self.assertIsNone(plain_owner)
+        self.assertEqual(int(plain_solver._mimic_count), model.world_count)
+        owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, swing_joint=1)
+        self.assertIsInstance(owner, MixedTreeKineticState)
+        self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
+        np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
+        # The follower joint tracks its leader under the cached route.
+        q = owner_solver.joint_q_trajectory.reshape(len(cached), model.world_count, -1)
+        self.assertGreater(float(np.abs(q[:, :, 1]).max()), 0.02)
+        self.assertLess(float(np.abs(q[:, :, 2] - q[:, :, 1]).max()), 0.02)
 
 
 if __name__ == "__main__":

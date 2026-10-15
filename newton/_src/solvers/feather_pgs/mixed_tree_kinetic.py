@@ -56,7 +56,9 @@ def supported(solver):
         and solver.pgs_velocity_iterations == 0
         and not solver.enable_joint_velocity_limits
         and not solver._has_prescribed_response
-        and not solver._mimic_count
+        # Mimic rows are ordinary matrix-free rows over the held factors this
+        # owner refreshes, as they are for the Franka held owner; they need
+        # nothing from the predictor itself.
         and not solver._connect_count
         and not solver._has_loop_joints
         and not solver.lazy_kinematics
