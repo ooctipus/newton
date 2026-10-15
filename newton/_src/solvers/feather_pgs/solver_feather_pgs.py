@@ -154,6 +154,7 @@ from .kernels import (
     finalize_body_dynamics,
     finalize_constraint_counts_with_status,
     finalize_world_diag_cfm,
+    finish_articulation_general,
     flatten_propagation_joint_S,
     flush_propagation_free_body_qd_to_vout,
     gather_dense_warmstart,
@@ -281,6 +282,10 @@ _GROUPED_TAU_MASS_ON = os.environ.get("FEATHER_PGS_GROUPED_TAU_MASS") == "1"
 _GROUPED_MASS_ON = os.environ.get("FEATHER_PGS_GROUPED_MASS") == "1"
 _FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
 _FK_ID_CACHE_SNAPSHOT = os.environ.get("FEATHER_PGS_FK_CACHE_SNAPSHOT") == "1"
+# The general route publishes each articulation in one launch per size group
+# (impulses, acceleration, integration, kinematics and body dynamics).
+# FEATHER_PGS_FUSED_PUBLISH=0 restores the separate launches.
+_FUSED_PUBLISH = os.environ.get("FEATHER_PGS_FUSED_PUBLISH", "1") != "0"
 # Experimental Stage 7 producer partition, leaving all solve/mass budgets intact.
 _PRISMATIC_PUBLICATION = os.environ.get("FEATHER_PGS_PRISMATIC_PUBLICATION", "0") == "1"
 _PRISMATIC_LINEAR_STATE = os.environ.get("FEATHER_PGS_PRISMATIC_LINEAR_STATE", "0") == "1"
@@ -5357,12 +5362,12 @@ class SolverFeatherPGS(SolverBase):
             velocity_limits=self._sparse_velocity_limits,
             lanes_per_world=self._sparse_solve_lanes,
             local_factors=self._sparse_local_factors,
+            warm_start=self.pgs_warmstart,
         )
 
     def _build_body_maps(self, model):
         if not model.body_count or not model.articulation_count:
             self.body_to_joint = None
-            warm_start=self.pgs_warmstart,
             self.body_to_articulation = None
             self.body_has_response_dofs = None
             self.body_response_dof_mask = None
@@ -10902,9 +10907,13 @@ class SolverFeatherPGS(SolverBase):
                     friction_start_iteration=self._contact_friction_start_iteration(self.pgs_iterations),
                 )
 
-            self._stage6_prepare_world_velocity()
-            for size in self.size_groups:
-                self._stage6_apply_impulses_world(size)
+            if self._fused_publication_admitted():
+                # The fused publication applies the impulses itself.
+                self._fused_publication_apply = True
+            else:
+                self._stage6_prepare_world_velocity()
+                for size in self.size_groups:
+                    self._stage6_apply_impulses_world(size)
 
             if self.pgs_mode == "split" and self._has_free_rigid_bodies:
                 self._stage6b_mf_pgs(state_aug, dt)
@@ -10925,6 +10934,8 @@ class SolverFeatherPGS(SolverBase):
                 self._joint_world.finish_active(state_in, state_aug, state_out, dt)
             elif self.pgs_mode == "matrix_free" and self.pgs_velocity_iterations > 0:
                 self._stage6_write_final_velocity(state_in, state_aug, state_out, dt)
+            elif self._fused_publication_admitted():
+                self._stage7_finish_general(state_in, state_aug, state_out, dt)
             else:
                 self._stage6_update_qdd(state_in, state_aug, dt)
                 self._stage6_integrate(state_in, state_aug, state_out, dt)
@@ -16693,6 +16704,132 @@ class SolverFeatherPGS(SolverBase):
         """Publish body poses and CoM velocities of ``state`` (used with ``lazy_kinematics``)."""
         if self._fused_k1 and self.lazy_kinematics:
             self._stage7_update_kinematics(state, self._last_debug_state_aug, force=True)
+
+    def _fused_publication_admitted(self) -> bool:
+        """Admit the one-launch-per-size-group publication of the general route.
+
+        The fused kernel reproduces the separate apply-impulses, acceleration,
+        free-root transport, integration, kinematics and body-dynamics launches
+        for complete articulations. Owners with their own finish, prismatic
+        publication, free rigid bodies, velocity-limit clamps and trailing
+        loop-closing joints keep the separate launches.
+        """
+        admitted = getattr(self, "_fused_publication", None)
+        if admitted is not None:
+            return admitted
+        model = self.model
+        admitted = bool(
+            _FUSED_PUBLISH
+            and self._fk_id_cache_enabled
+            and model.joint_count
+            and model.articulation_count
+            and not (self._fused_k1 and self.lazy_kinematics)
+            and self._prismatic_publication is None
+            and getattr(self, "_tree_kinetic_state", None) is None
+            and self._franka_kinetic_state is None
+            and self._world_scan_publication is None
+            and self._joint_world is None
+            and not (self.pgs_mode == "matrix_free" and self.pgs_velocity_iterations > 0)
+            and not self._has_free_rigid_bodies
+            and not (self._has_root_free and self._has_rigid_body_velocity_limits)
+            and model.particle_count == 0
+        )
+        if admitted:
+            # Every joint and body must belong to the size groups' articulations.
+            starts = model.articulation_start.numpy()
+            ends = self.articulation_joint_end.numpy()
+            grouped = sum(int(self.n_arts_by_size[size]) for size in self.size_groups)
+            admitted = bool(
+                np.array_equal(ends, starts[1:])
+                and int(starts[-1]) == model.joint_count
+                and grouped == model.articulation_count
+                and int(np.sum(ends - starts[:-1])) == model.body_count
+            )
+        self._fused_publication = admitted
+        self._fused_publication_apply = False
+        return admitted
+
+    def _stage7_finish_general(self, state_in: State, state_aug: State, state_out: State, dt: float) -> None:
+        """Apply impulses, integrate and publish every articulation in one launch per size group."""
+        model = self.model
+        cache = self._fk_id_cache
+        body_q_com = cache.body_q_com if cache is not None else state_aug.body_q_com
+        articulation_origin = cache.articulation_origin if cache is not None else self.articulation_origin
+        joint_S_s = cache.joint_S_s if cache is not None else state_aug.joint_S_s
+        body_I_s = cache.body_I_s if cache is not None else state_aug.body_I_s
+        body_inertia_terms = cache.body_inertia_terms if cache is not None else self._body_inertia_terms
+        body_v_s = cache.body_v_s if cache is not None else state_aug.body_v_s
+        body_f_s = cache.body_f_s if cache is not None else state_aug.body_f_s
+        body_a_s = cache.body_a_s if cache is not None else state_aug.body_a_s
+        next_refresh = ((self._step + 1) % self.update_mass_matrix_interval) == 0
+        parallel_next_refresh = next_refresh and self._global_inertia_stream is not None
+        # Dense and split compositions leave the impulses to this kernel; the
+        # matrix-free sweep has already produced v_out.
+        apply_impulses = int(self._fused_publication_apply)
+        self._fused_publication_apply = False
+        for size in self.size_groups:
+            n_arts = self.n_arts_by_size[size]
+            wp.launch(
+                finish_articulation_general,
+                dim=int(n_arts),
+                inputs=[
+                    self.group_to_art[size],
+                    self.art_to_world,
+                    self.articulation_dof_start,
+                    size,
+                    n_arts,
+                    apply_impulses,
+                    self.constraint_count,
+                    self.Y_by_size[size],
+                    self.impulses,
+                    self.v_hat,
+                    state_in.joint_qd,
+                    self._kinematic_dof_mask,
+                    self._kinematic_joint_mask,
+                    dt,
+                    1.0 / dt,
+                    self.angular_damping,
+                    model.articulation_start,
+                    self.articulation_joint_end,
+                    model.joint_type,
+                    model.joint_parent,
+                    model.joint_child,
+                    model.joint_q_start,
+                    model.joint_qd_start,
+                    model.joint_dof_dim,
+                    state_in.joint_q,
+                    model.joint_X_p,
+                    model.joint_X_c,
+                    self.body_X_com,
+                    model.joint_axis,
+                    model.body_com,
+                    model.body_mass,
+                    model.body_inertia,
+                    self.is_free_rigid,
+                    int(next_refresh and not parallel_next_refresh),
+                    int(parallel_next_refresh),
+                    model.gravity,
+                ],
+                outputs=[
+                    self.v_out,
+                    state_aug.joint_qdd,
+                    state_out.joint_q,
+                    state_out.joint_qd,
+                    state_out.body_q,
+                    body_q_com,
+                    articulation_origin,
+                    joint_S_s,
+                    body_v_s,
+                    body_a_s,
+                    self._fk_id_cache_valid,
+                    body_I_s,
+                    body_inertia_terms,
+                    body_f_s,
+                    state_out.body_qd,
+                ],
+                device=model.device,
+            )
+        self._fk_id_cache_source_state = state_out
 
     def _stage7_update_kinematics(self, state_out: State, state_aug: State, force: bool = False) -> None:
         """Publish kinematics and prepare reusable inverse dynamics for the next step."""

@@ -1,0 +1,1 @@
+Publish each FeatherPGS articulation of the general route in one launch per size group: impulse application, acceleration, free-root transport, joint integration, forward kinematics and body dynamics run in one kernel with bit-identical results. `FEATHER_PGS_FUSED_PUBLISH=0` restores the separate launches.
