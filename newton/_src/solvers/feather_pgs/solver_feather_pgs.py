@@ -3113,6 +3113,9 @@ class SolverFeatherPGS(SolverBase):
         from .cached_dynamics import install as install_cached_dynamics  # noqa: PLC0415
 
         install_cached_dynamics(self, factor_warps=_CRBA_CHOLESKY_WARPS_PER_BLOCK)
+        # Decide the fused publication now: its host checks must not run inside
+        # a later graph capture of the first step.
+        self._fused_publication_admitted()
 
         if self._explicit_dense_kernels:
             for name in (

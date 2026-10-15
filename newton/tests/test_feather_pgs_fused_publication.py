@@ -51,7 +51,8 @@ def _rollout(model, fused, *, steps=48, dt=1.0 / 240.0, graph=False, **solver_kw
     device = model.device
     with patch.object(solver_module, "_FUSED_PUBLISH", fused):
         solver = SolverFeatherPGS(model, pgs_iterations=6, **solver_kwargs)
-        admitted = solver._fused_publication_admitted()
+    # Admission is decided at construction; the first step may be a graph capture.
+    admitted = solver._fused_publication
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
     states = [model.state() for _ in range(2)]
