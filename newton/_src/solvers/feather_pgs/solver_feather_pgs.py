@@ -1232,6 +1232,7 @@ class SolverFeatherPGS(SolverBase):
         pgs_beta: float = 0.2,
         pgs_cfm: float = 1.0e-6,
         pgs_omega: float = 1.0,
+        pgs_change_tolerance: float = 0.0,
         pgs_contact_regularization: float = 0.0,
         pgs_velocity_drive_mode: Literal["active", "freeze"] = "freeze",
         dense_max_constraints: int = 32,
@@ -1619,6 +1620,9 @@ class SolverFeatherPGS(SolverBase):
                 mimic and connect rows. Defaults to 0.2.
             pgs_cfm (float, optional): Compliance/regularization added to the Delassus diagonal. Defaults to 1.0e-6.
             pgs_omega (float, optional): Successive over-relaxation factor for the PGS sweep. Defaults to 1.0.
+            pgs_change_tolerance (float, optional): Native sparse sweeps stop early once no impulse in a
+                world changes by more than this absolute amount in a sweep. Zero keeps the exact
+                stationary-sweep exit. Defaults to 0.0.
             pgs_contact_regularization (float, optional): Dimensionless regularizer ``g`` of contact
                 rows on every route (matrix-free, dense, propagation). Each position iteration moves a
                 row's impulse toward the hard solution with weight ``1/(1+g)`` and toward zero with
@@ -1992,6 +1996,9 @@ class SolverFeatherPGS(SolverBase):
         self._regularization_enabled = self._contact_w < 1.0
         self.pgs_cfm = pgs_cfm
         self.pgs_omega = pgs_omega
+        self.pgs_change_tolerance = float(pgs_change_tolerance)
+        if not (np.isfinite(self.pgs_change_tolerance) and self.pgs_change_tolerance >= 0.0):
+            raise ValueError(f"pgs_change_tolerance must be finite and non-negative, got {pgs_change_tolerance!r}")
         self.pgs_velocity_iterations = max(int(pgs_velocity_iterations), 0)
         self.enable_restitution = bool(enable_restitution)
         threshold_error = "restitution_velocity_threshold must be finite and non-negative"
@@ -8352,6 +8359,7 @@ class SolverFeatherPGS(SolverBase):
                     self.mf_row_mu,
                     iterations,
                     omega,
+                    self.pgs_change_tolerance,
                     int(friction_start_iteration),
                     int(iteration_offset),
                 ],
