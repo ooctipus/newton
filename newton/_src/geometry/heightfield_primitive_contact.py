@@ -861,31 +861,44 @@ def create_convex_prism_contacts(writer_func: Any, query_filter: Any = None):
         band = lowest + wp.max(_BAND_ABSOLUTE, _BAND_RELATIVE * (highest - lowest))
         limit = wp.max(band, threshold + _ADMISSION_SLACK)
         # The touching polygon: extreme touching vertices along eight in-plane
-        # directions, visited in angular order so they arrive counter-clockwise.
+        # directions, taken in angular order so they arrive counter-clockwise.
+        # One pass over the vertices with eight running maxima; the directions
+        # are expressed in the mesh frame so each extreme is one dot product.
+        directions = _Polygon()
+        for k in range(_SUPPORT_DIRECTIONS):
+            angle = float(k) * (wp.pi / float(_SUPPORT_DIRECTIONS)) * 2.0
+            direction = wp.cw_mul(wp.quat_rotate_inv(relative, wp.vec3(wp.cos(angle), wp.sin(angle), 0.0)), scale)
+            directions[k, 0] = direction[0]
+            directions[k, 1] = direction[1]
+            directions[k, 2] = direction[2]
+        best = wp.vector(length=8, dtype=wp.int32)
+        best_value = wp.vector(length=8, dtype=wp.float32)
+        for k in range(_SUPPORT_DIRECTIONS):
+            best[k] = -1
+            best_value[k] = -1.0e30
+        for i in range(count):
+            vertex = mesh.points[i]
+            if height_base + wp.dot(vertex, height_axis) <= limit:
+                for k in range(_SUPPORT_DIRECTIONS):
+                    value = vertex[0] * directions[k, 0] + vertex[1] * directions[k, 1] + vertex[2] * directions[k, 2]
+                    if value > best_value[k]:
+                        best_value[k] = value
+                        best[k] = i
         chosen = wp.vector(length=8, dtype=wp.int32)
         selected = int(0)
         lowest_chosen = int(0)
         for k in range(_SUPPORT_DIRECTIONS):
-            angle = float(k) * (wp.pi / float(_SUPPORT_DIRECTIONS)) * 2.0
-            direction = wp.cw_mul(wp.quat_rotate_inv(relative, wp.vec3(wp.cos(angle), wp.sin(angle), 0.0)), scale)
-            best = int(-1)
-            best_value = float(-1.0e30)
-            for i in range(count):
-                if height_base + wp.dot(mesh.points[i], height_axis) <= limit:
-                    value = wp.dot(mesh.points[i], direction)
-                    if value > best_value:
-                        best_value = value
-                        best = i
-            if best < 0:
+            index = best[k]
+            if index < 0:
                 continue
             duplicate = int(0)
             for j in range(selected):
-                if chosen[j] == best:
+                if chosen[j] == index:
                     duplicate = 1
             if duplicate == 0:
-                chosen[selected] = best
+                chosen[selected] = index
                 selected += 1
-                if best == lowest_index:
+                if index == lowest_index:
                     lowest_chosen = 1
         points = _Polygon()
         for j in range(selected):
