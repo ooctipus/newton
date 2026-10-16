@@ -100,7 +100,6 @@ class TestSparseResearchAdmission(unittest.TestCase):
         """Do not replace buffers needed by an explicitly requested point-contact owner."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
         for option in (
-            "ALLEGRO_KINETIC_ROWS",
             "SINGLE_FACTOR",
             "SPARSE_FACTOR",
         ):
@@ -108,6 +107,16 @@ class TestSparseResearchAdmission(unittest.TestCase):
                 solver = _eligible_solver()
                 SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
                 self.assertIsNone(solver._sparse_mass_matrix_size)
+
+    def test_free_rigid_bodies_keep_the_dense_route(self):
+        """A world pairing an articulation with free rigid bodies declines the sparse route."""
+        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            solver = _eligible_solver()
+            solver._has_free_rigid_bodies = True
+            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+            self.assertIsNone(solver._sparse_mass_matrix_size)
+            self.assertIn("free rigid bodies", solver._sparse_selection_reason)
 
     def test_inactive_point_request_does_not_block_patch_sparse(self):
         """Keep general patch support when the requested point-only owner cannot run."""

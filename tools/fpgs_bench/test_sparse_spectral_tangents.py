@@ -20,6 +20,8 @@ from tools.fpgs_bench import test_spectral_gs_control as policy_tests
 from tools.fpgs_bench.test_sparse_contact_block import full_rows, simple_case
 from tools.fpgs_bench.test_sparse_factor import fixture, unpack
 
+DIMS = {"dof_count": 43, "support_width": 18, "inverse_width": 18, "nonzero_count": 434}
+
 ENV = {**metric.METRIC_ENV, "FEATHER_PGS_SPARSE_SPECTRAL_TANGENTS": "1"}
 
 
@@ -100,7 +102,7 @@ def check_native(test, f, *, iterations=8, omega=1.0, friction_start=0, scalar=F
 class TestSparseSpectralTangents(unittest.TestCase):
     def test_factory(self):
         """Require the separately keyed root-free native owner."""
-        self.assertEqual(get_solve_kernel().key, "sparse_spectral_tangent43_s18_c100")
+        self.assertEqual(get_solve_kernel(**DIMS).key, "sparse_spectral_tangent43_s18_c100")
 
     def test_owner_and_source(self):
         """Keep default ownership unchanged and retire only the metric proposal."""

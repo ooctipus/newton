@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Default-off ancestor-sparse inverse-whitener for the checked G1 tree.
+"""Ancestor-sparse inverse-whitener for one identical rooted tree per world.
 
 The held operator, current rows and solver have one representation owner.
 Neither a dense canonical factor nor physical response rows are produced on
@@ -48,6 +48,8 @@ class SparsePlan:
     body_mask: wp.array[wp.uint64]
     body_tag: wp.array[int]
     dof_joint: wp.array[int]
+    physical: wp.array[int]
+    sparse: wp.array[int]
     group_to_art: wp.array[int]
     art_to_world: wp.array[int]
     art_dof_start: wp.array[int]
@@ -83,6 +85,8 @@ def operator_metadata(mass, *, inverse_column_width=None):
         "inverse_nodes": nodes,
         "inverse_count": counts,
         "dof_joint": mass.dof_joint,
+        "physical": mass.permutation,
+        "sparse": mass.inverse_permutation,
     }
 
 
@@ -105,105 +109,67 @@ def bind_operator_plan(solver, size, host, *, group_to_art=None):
 
 
 def make_plan(model, solver=None):
-    """Prove the complete tree and possible dynamic endpoint support once."""
+    """Plan one identical rooted tree per world from the model's topology.
+
+    Every world holds the same tree in body order: a six-coordinate free root
+    and at most one coordinate per further joint, no kinematic bodies, at most
+    64 coordinates (the endpoint masks are 64-bit words) and contact supports
+    of at most 32 coordinates (one lane per support node). Contact endpoints
+    are the bodies that carry collidable shapes.
+    """
     worlds = int(model.world_count)
-    if worlds <= 0 or (model.joint_count, model.joint_dof_count, model.body_count) != (
-        44 * worlds,
-        43 * worlds,
-        44 * worlds,
+    if worlds <= 0 or model.joint_count % worlds or model.body_count % worlds or model.joint_dof_count % worlds:
+        raise ValueError("Packed sparse tree requires identical worlds")
+    joints, bodies, size = model.joint_count // worlds, model.body_count // worlds, model.joint_dof_count // worlds
+    if joints != bodies or not 7 <= size <= 64:
+        raise ValueError("Packed sparse tree requires one body per joint and 7 to 64 coordinates per world")
+    parent = model.joint_parent.numpy().reshape(worlds, joints)
+    child = model.joint_child.numpy().reshape(worlds, joints)
+    types = model.joint_type.numpy().reshape(worlds, joints)
+    qd = model.joint_qd_start.numpy()[:-1].reshape(worlds, joints)
+    tree_parent = parent[0]
+    offset = np.arange(worlds)[:, None] * bodies
+    if (
+        tree_parent[0] != -1
+        or np.any(tree_parent[1:] < 0)
+        or np.any(tree_parent[1:] >= np.arange(1, joints))
+        or not np.array_equal(child, offset + np.arange(joints))
+        or not np.array_equal(parent, np.where(tree_parent < 0, -1, offset + tree_parent))
     ):
-        raise ValueError("Packed sparse tree requires one complete 44-body/43-DOF tree per world")
-    parent = model.joint_parent.numpy().reshape(worlds, 44)
-    child = model.joint_child.numpy().reshape(worlds, 44)
-    types = model.joint_type.numpy().reshape(worlds, 44)
-    qd = model.joint_qd_start.numpy()[:-1].reshape(worlds, 44)
-    expected_parent = np.array(
-        [
-            -1,
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            0,
-            0,
-            8,
-            9,
-            10,
-            11,
-            12,
-            0,
-            14,
-            14,
-            14,
-            17,
-            18,
-            19,
-            20,
-            21,
-            22,
-            23,
-            22,
-            25,
-            22,
-            27,
-            28,
-            14,
-            14,
-            31,
-            32,
-            33,
-            34,
-            35,
-            36,
-            37,
-            36,
-            39,
-            36,
-            41,
-            42,
-        ]
-    )
-    offset = np.arange(worlds)[:, None] * 44
-    if not np.array_equal(child, offset + np.arange(44)) or not np.array_equal(
-        parent, np.where(expected_parent < 0, -1, offset + expected_parent)
-    ):
-        raise ValueError("Packed sparse tree body topology differs from the checked tree")
+        raise ValueError("Packed sparse tree requires one rooted tree per world in body order, identical across worlds")
     if not np.all(types == types[0]) or types[0, 0] != int(JointType.FREE):
         raise ValueError("Packed sparse tree requires a free root and identical joint types")
-    fixed = {7, 15, 16, 22, 30, 36}
-    for j in range(1, 44):
-        if types[0, j] != int(JointType.FIXED if j in fixed else JointType.REVOLUTE):
-            raise ValueError("Packed sparse tree only supports the checked fixed/revolute tree")
-    if not np.all(qd - np.arange(worlds)[:, None] * 43 == qd[0]):
+    counts = np.diff(model.joint_qd_start.numpy())[:joints]
+    if counts[0] != 6 or np.any(counts[1:] > 1):
+        raise ValueError("Packed sparse tree requires a six-coordinate free root and at most one coordinate per joint")
+    if not np.all(qd - np.arange(worlds)[:, None] * size == qd[0]):
         raise ValueError("Packed sparse tree requires identical DOF order")
     if np.any(model.body_flags.numpy() & int(BodyFlags.KINEMATIC)):
         raise ValueError("Packed sparse tree excludes prescribed/kinematic bodies")
     shape_body = model.shape_body.numpy()
     collidable = (model.shape_flags.numpy() & int(ShapeFlags.COLLIDE_SHAPES)) != 0
-    if np.any(~np.isin(shape_body[collidable & (shape_body >= 0)] % 44, [6, 13, 14])):
-        raise ValueError("Packed sparse tree only admits feet/torso collision participants")
-    # The producer and row kernels still require the checked ABI above. The
-    # representation itself comes from the same planner as native sparse tasks.
-    mass_plan = _SparseMassMatrixPlan.build(
-        model.joint_ancestor.numpy()[:44], np.diff(model.joint_qd_start.numpy())[:44]
-    )
-    if not np.array_equal(mass_plan.permutation, np.arange(42, -1, -1)) or mass_plan.nonzero_count != 434:
-        raise ValueError("Sparse producer coordinate ABI differs from the checked tree")
-    body_masks = np.zeros(44, dtype=np.uint64)
+    contact_bodies = np.unique(shape_body[collidable & (shape_body >= 0)] % bodies)
+    # The representation comes from the same planner as the native sparse route.
+    mass_plan = _SparseMassMatrixPlan.build(model.joint_ancestor.numpy()[:joints], counts)
+    body_masks = np.zeros(bodies, dtype=np.uint64)
     body_masks[child[0]] = mass_plan.joint_ancestor_mask
-    # These are the endpoint classes admitted by the unchanged producer guard.
-    support = _SparseRowSupportPlan.build(mass_plan, body_masks, max_row_dofs=18, contact_bodies=[6, 13, 14])
-    if support is None or support.pair_class.shape != (4, 4):
-        raise ValueError("Current endpoint union exceeds the sparse producer ABI")
-    # Existing Jacobian consumers address mask bits in physical coordinates.
+    classes = np.unique(np.concatenate((np.zeros(1, np.uint64), body_masks[contact_bodies])))
+    pairs = classes[:, None] | classes[None, :]
+    max_row_dofs = max(int(mask).bit_count() for mask in np.concatenate((pairs.ravel(), mass_plan.ancestor_mask)))
+    if max_row_dofs > 32:
+        raise ValueError("Packed sparse tree contact supports exceed one lane per coordinate")
+    support = _SparseRowSupportPlan.build(
+        mass_plan, body_masks, max_row_dofs=max_row_dofs, contact_bodies=contact_bodies
+    )
+    if support is None:
+        raise ValueError("Packed sparse tree endpoint union exceeds the planned support width")
+    # Jacobian consumers address mask bits in physical coordinates.
     physical_masks = np.array(
-        [sum(1 << int(mass_plan.permutation[d]) for d in range(43) if int(mask) & (1 << d)) for mask in body_masks],
+        [sum(1 << int(mass_plan.permutation[d]) for d in range(size) if int(mask) & (1 << d)) for mask in body_masks],
         dtype=np.uint64,
     )
     host = {
-        **operator_metadata(mass_plan, inverse_column_width=18),
+        **operator_metadata(mass_plan),
         "support_nodes": support.class_dof,
         "support_count": np.sum(support.class_dof >= 0, axis=1).astype(np.int32),
         "limit_support": support.limit_class,
@@ -211,10 +177,9 @@ def make_plan(model, solver=None):
         "body_mask": np.tile(physical_masks, worlds),
         "body_tag": np.tile(support.body_class, worlds),
     }
-    # Deeper physical DOF owns the composite inertia (same original source map).
     if solver is None:
         return host
-    return bind_operator_plan(solver, 43, host), host
+    return bind_operator_plan(solver, size, host), host
 
 
 @cache
@@ -250,7 +215,7 @@ def get_refresh_kernel(
     __syncthreads();
     for (int e = threadIdx.x; e < PACKED_COUNT; e += blockDim.x) {
         const int row = p.row.data[e], col = p.col.data[e];
-        const int original_row = LAST_DOF-row, original_col = LAST_DOF-col;
+        const int original_row = p.physical.data[row], original_col = p.physical.data[col];
         const int src = p.source.data[e];
         const int projection = src == original_col ? original_row : original_col;
         const float* screw = reinterpret_cast<const float*>(&S.data[ds + projection]);
@@ -296,7 +261,6 @@ def get_refresh_kernel(
         )
     for token, value in (
         ("DOF_COUNT", dof_count),
-        ("LAST_DOF", dof_count - 1),
         ("PACKED_COUNT", nonzero_count),
         ("FORCE_COUNT", 6 * dof_count),
     ):
@@ -362,32 +326,38 @@ def get_refresh_kernel(
 
 
 @cache
-def get_predictor_kernel():
+def get_predictor_kernel(*, dof_count: int, nonzero_count: int, inverse_column_width: int):
     """Apply both sparse current-force actions without grouped intermediates."""
     source = r"""
 #if defined(__CUDA_ARCH__)
     const int art = p.group_to_art.data[group], world = p.art_to_world.data[art];
     const int start = p.art_dof_start.data[art];
-    __shared__ float whitened[43];
-    for (int row = threadIdx.x; row < 43; row += blockDim.x) {
+    __shared__ float whitened[DOF_COUNT];
+    for (int row = threadIdx.x; row < DOF_COUNT; row += blockDim.x) {
         float value = 0.0f;
         for (int col = 0; col <= row; ++col) {
-            const int entry = p.index.data[row*43+col];
-            if (entry >= 0) value += d.W.data[group*434+entry] * tau.data[start+42-col];
+            const int entry = p.index.data[row*DOF_COUNT+col];
+            if (entry >= 0) value += d.W.data[group*PACKED_COUNT+entry] * tau.data[start+p.physical.data[col]];
         }
         whitened[row] = value;
     }
     __syncthreads();
-    for (int col = threadIdx.x; col < 43; col += blockDim.x) {
+    for (int col = threadIdx.x; col < DOF_COUNT; col += blockDim.x) {
         float value = 0.0f;
         for (int k = 0; k < p.inverse_count.data[col]; ++k) {
-            const int row = p.inverse_nodes.data[col*18+k];
-            value += d.W.data[group*434+p.index.data[row*43+col]] * whitened[row];
+            const int row = p.inverse_nodes.data[col*INVERSE_WIDTH+k];
+            value += d.W.data[group*PACKED_COUNT+p.index.data[row*DOF_COUNT+col]] * whitened[row];
         }
-        qdd.data[start+42-col] = d.valid.data[world] && !d.status.data[world] ? value : NAN;
+        qdd.data[start+p.physical.data[col]] = d.valid.data[world] && !d.status.data[world] ? value : NAN;
     }
 #endif
 """
+    for token, value in (
+        ("DOF_COUNT", dof_count),
+        ("PACKED_COUNT", nonzero_count),
+        ("INVERSE_WIDTH", inverse_column_width),
+    ):
+        source = source.replace(token, str(value))
 
     @wp.func_native(source)
     def native(group: int, p: SparsePlan, d: SparseData, tau: wp.array[float], qdd: wp.array[float]): ...
@@ -396,24 +366,28 @@ def get_predictor_kernel():
         group, _ = wp.tid()
         native(group, p, d, tau, qdd)
 
-    predictor.__name__ = predictor.__qualname__ = "sparse_factor_predict43"
+    predictor.__name__ = predictor.__qualname__ = f"sparse_factor_predict{dof_count}"
     return wp.kernel(enable_backward=False, module="unique")(predictor)
 
 
 def supported(solver):
     """Require every replaced stage to dispatch through this complete owner."""
+    size = getattr(solver, "max_world_dofs", None)
+    if size is None:
+        return False
+    size = int(size)
     return bool(
         solver.model.device.is_cuda
         and not solver.model.requires_grad
         and solver.world_count > 0
         and solver.model.articulation_count == solver.world_count
-        and tuple(solver.size_groups) == (43,)
-        and solver.max_world_dofs == 43
-        and solver.n_arts_by_size[43] == solver.world_count
+        and 7 <= size <= 64
+        and tuple(solver.size_groups) == (size,)
+        and solver.n_arts_by_size[size] == solver.world_count
         and solver.tile_threads >= 32
         and solver.tile_threads % 32 == 0
-        and solver._execution_plan.use_tiled_hinv_jt(43)
-        and not solver._execution_plan.use_diagonal_mass(43)
+        and solver._execution_plan.use_tiled_hinv_jt(size)
+        and not solver._execution_plan.use_diagonal_mass(size)
         and solver._is_one_solve_art_per_world
         and not solver._has_free_rigid_bodies
         and not solver._preelim_active
@@ -438,9 +412,10 @@ def supported(solver):
         and solver.mf_gs_incremental_rows == 0
         and solver.mf_gs_parallel_rows == 0
         and not solver._propagation_contacts_enabled()
-        and solver._execution_plan.use_tiled_cholesky(43)
+        and solver._execution_plan.use_tiled_cholesky(size)
         and (
-            solver.trisolve_kernel == "tiled" or (solver.trisolve_kernel == "auto" and 43 > solver.small_dof_threshold)
+            solver.trisolve_kernel == "tiled"
+            or (solver.trisolve_kernel == "auto" and size > solver.small_dof_threshold)
         )
         and not solver._mimic_count
         and not solver._connect_count
@@ -512,39 +487,55 @@ class SparseFactor:
         if self.level_update:
             for name, values in schedule.items():
                 setattr(plan, name, wp.array(values, dtype=int, device=solver.model.device))
+        self.size = host["index"].shape[0]
+        self.support_width = host["support_nodes"].shape[1]
         self.data = SparseData()
-        self.data.W = wp.empty((w, 434), dtype=float, device=device)
+        self.data.W = wp.empty((w, self.factor_parameters["nonzero_count"]), dtype=float, device=device)
         self.data.valid = wp.zeros(w, dtype=int, device=device)
         self.data.status = wp.zeros(w, dtype=int, device=device)
         # Prefix emission reads capacity from its buffers and preserves overflow counts.
         self.parallel_limit_prefix = os.environ.get("FEATHER_PGS_SPARSE_PARALLEL_LIMITS") == "1"
-        self.data.Z = wp.empty((w, c, 18), dtype=float, device=device)
+        self.data.Z = wp.empty((w, c, self.support_width), dtype=float, device=device)
         self.data.support = wp.empty((w, c), dtype=int, device=device)
         self.data.incident = wp.empty((w, c), dtype=float, device=device)
+        dimensions = {
+            "dof_count": self.size,
+            "support_width": self.support_width,
+            "inverse_width": self.factor_parameters["inverse_column_width"],
+            "nonzero_count": self.factor_parameters["nonzero_count"],
+        }
         self.kernels = SimpleNamespace(
-            prefix=get_parallel_limit_kernel() if self.parallel_limit_prefix else build_limit_prefix,
+            prefix=get_parallel_limit_kernel(
+                dof_count=self.size, support_width=self.support_width, nonzero_count=dimensions["nonzero_count"]
+            )
+            if self.parallel_limit_prefix
+            else build_limit_prefix,
             refresh=get_refresh_kernel(**self.factor_parameters, level_update=self.level_update),
-            predictor=get_predictor_kernel(),
+            predictor=get_predictor_kernel(
+                dof_count=self.size,
+                nonzero_count=dimensions["nonzero_count"],
+                inverse_column_width=dimensions["inverse_width"],
+            ),
             contacts=get_contact_kernel(
-                dof_count=host["index"].shape[0],
-                support_width=self.data.Z.shape[2],
+                dof_count=self.size,
+                support_width=self.support_width,
                 factor_stride=self.data.W.shape[1],
             ),
-            solve=get_solve_kernel(c, self.block_contacts, metric_tangents=self.metric_tangents),
+            solve=get_solve_kernel(c, self.block_contacts, metric_tangents=self.metric_tangents, **dimensions),
         )
         if self.spectral_tangents:
             from .sparse_spectral_tangents import get_solve_kernel as spectral_solve  # noqa: PLC0415
 
-            self.kernels.solve = spectral_solve()
+            self.kernels.solve = spectral_solve(**dimensions)
         if self.limit_jacobi:
             from .sparse_limit_jacobi import get_solve_kernel as limit_solve  # noqa: PLC0415
 
-            self.kernels.solve = limit_solve()
+            self.kernels.solve = limit_solve(**dimensions)
         # Drop canonical matrix/row storage only after complete constructor admission.
         # Dummy shapes make accidental readers fail visibly, not reinterpret packed W/Z.
         dummy = wp.empty((1, 1, 1), dtype=float, device=device)
         for name in ("H_by_size", "L_by_size", "J_by_size", "Y_by_size", "tau_by_size", "qdd_by_size"):
-            getattr(solver, name)[43] = dummy
+            getattr(solver, name)[self.size] = dummy
         solver.J_world = dummy
         solver.Y_world = dummy
         solver._H_bufs = None
@@ -620,7 +611,7 @@ class SparseFactor:
                 s.mass_update_mask,
                 state_aug.joint_S_s,
                 s.body_I_c if self.kinetic_state is None else self.kinetic_state.geometric,
-                s.R_by_size[43],
+                s.R_by_size[self.size],
                 s._augmented_drive_row_by_dof,
                 s.aug_row_K,
                 s.aug_row_counts,
@@ -669,6 +660,8 @@ class SparseFactor:
                 s.joint_limit_activation_gap,
                 s.pgs_beta,
                 s.pgs_cfm,
+                self.size,
+                self.support_width,
                 s.slot_counter,
                 s.row_type,
                 s.row_parent,

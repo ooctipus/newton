@@ -4,8 +4,10 @@
 """Portable source/ABI checks for the experimental sparse solve factories.
 
 The native-body digests were recorded from the measured checkpoint
-301b6688ea74a7372a007f03989664890f0d2540 before replacing Python-source cloning.
-They protect this refactor, not numerical correctness or future solver changes.
+301b6688ea74a7372a007f03989664890f0d2540 before replacing Python-source cloning,
+and re-recorded when the bodies took their coordinate count, support width and
+physical-coordinate permutation from the plan instead of the checked tree's
+constants. They protect those refactors, not numerical correctness.
 No robot asset, local capture, CUDA device, or external checkout is required.
 """
 
@@ -16,6 +18,9 @@ from newton._src.solvers.feather_pgs import sparse_factor_rows as rows
 from newton._src.solvers.feather_pgs import sparse_limit_jacobi as limits
 from newton._src.solvers.feather_pgs import sparse_spectral_tangents as spectral
 
+# The checked 44-body, 43-coordinate tree the digests were recorded on.
+DIMS = {"dof_count": 43, "support_width": 18, "inverse_width": 18, "nonzero_count": 434}
+
 
 class TestSparseSolveFactory(unittest.TestCase):
     def test_frozen_native_body_and_abi(self):
@@ -24,37 +29,37 @@ class TestSparseSolveFactory(unittest.TestCase):
             (
                 {"capacity": 64},
                 "sparse_factor_gs43_s18_c64",
-                "e9c44b0a52c30e6348df6da65a0a9306952df5ad13bfdde5cab4524f9b44b62b",
+                "645b782269a17d487f0b2e2bd6df5b69b2310f76e54f99c659162a3d2a8aab16",
             ),
             (
                 {"capacity": 100},
                 "sparse_factor_gs43_s18_c100",
-                "d376d30ba6ba55702e9a525c913a92fed719d94caa569984a1dccb387d8d3f6e",
+                "17e7c055a41eb989dd04f79b0d48b7d5c9e6dc89bfdd1ac8238cad155cbc7332",
             ),
             (
                 {"capacity": 100, "block_contacts": True},
                 "sparse_contact_block43_s18_c100",
-                "e3a2506911816209214141fd10c9397587363982bbd47c35945ba69a9b010e73",
+                "acbfb8d619d246b9e5272c8eedd2a6a3c5924e0e97ae944058b413f5dba44b7b",
             ),
             (
                 {"capacity": 100, "metric_tangents": True},
                 "sparse_metric_tangent43_s18_c100",
-                "eda6abf58c026c3abf9ebe6196c7790ed90444a0e5ce99f061d09fbd8a364352",
+                "a72bf0587e4dd63eb3ae70a9026cb5d3e96598aa0827efb2d568f451625176f9",
             ),
             (
                 {"capacity": 100, "metric_tangents": True, "spectral_tangents": True},
                 "sparse_spectral_tangent43_s18_c100",
-                "552a94ec451f352c3e1834fda6fd5cde05740c3c6901ea0dd696d1850fcd3eac",
+                "ba1b84b3262acfd978b666edc2a33d65633c49cd749794d774c156345bf64d03",
             ),
             (
                 {"capacity": 100, "metric_tangents": True, "spectral_tangents": True, "limit_jacobi": True},
                 "sparse_spectral_limit_jacobi43_s18_c100",
-                "1df79d9479ba37d562f3367f232de272ed3e7a8b05bb6e18b8f230369936dc6f",
+                "d3fdb24a86b79e532de12f6fe540a2478f5159981a4ca79823b52bd3ffc83b96",
             ),
         )
         for options, key, digest in cases:
             with self.subTest(key=key):
-                kernel = rows.get_solve_kernel(**options)
+                kernel = rows.get_solve_kernel(**options, **DIMS)
                 native = next(
                     cell.cell_contents
                     for cell in kernel.func.__closure__
@@ -74,12 +79,12 @@ class TestSparseSolveFactory(unittest.TestCase):
     def test_wrappers_share_explicit_factory(self):
         """Make retained entry points use a single cached, explicit factory."""
         self.assertIs(
-            spectral.get_solve_kernel(),
-            rows.get_solve_kernel(100, metric_tangents=True, spectral_tangents=True),
+            spectral.get_solve_kernel(**DIMS),
+            rows.get_solve_kernel(100, metric_tangents=True, spectral_tangents=True, **DIMS),
         )
         self.assertIs(
-            limits.get_solve_kernel(),
-            rows.get_solve_kernel(100, metric_tangents=True, spectral_tangents=True, limit_jacobi=True),
+            limits.get_solve_kernel(**DIMS),
+            rows.get_solve_kernel(100, metric_tangents=True, spectral_tangents=True, limit_jacobi=True, **DIMS),
         )
 
     def test_reject_inconsistent_modes(self):
@@ -92,9 +97,9 @@ class TestSparseSolveFactory(unittest.TestCase):
         )
         for options in cases:
             with self.subTest(options=options), self.assertRaises(ValueError):
-                rows.get_solve_kernel(100, **options)
+                rows.get_solve_kernel(100, **options, **DIMS)
         with self.assertRaises(ValueError):
-            rows.get_solve_kernel(64, metric_tangents=True, spectral_tangents=True)
+            rows.get_solve_kernel(64, metric_tangents=True, spectral_tangents=True, **DIMS)
 
 
 if __name__ == "__main__":

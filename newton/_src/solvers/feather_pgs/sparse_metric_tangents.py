@@ -4,7 +4,7 @@
 """Native fused scalar-normal and proximal metric-disk tangent transactions."""
 
 
-def get_fragments(capacity: int):
+def get_fragments(capacity: int, *, support_width: int = 18, dof_count: int = 43):
     """Return guarded contact updates for the existing sparse GS owner."""
     if capacity != 100:
         raise ValueError("Metric tangent shared storage is qualified only for capacity100")
@@ -23,8 +23,8 @@ def get_fragments(capacity: int):
                 const float friction=mu.data[base+row+1];
                 if(isfinite(friction) && friction>=0.0f && friction==mu.data[base+row+2]) {
                     const int tpl=d.support.data[base+row],length=p.support_count.data[tpl];
-                    const int node=lane<length?p.support_nodes.data[tpl*18+lane]:-1;
-                    const float z0=lane<length?d.Z.data[(base+row)*18+lane]:0.0f;
+                    const int node=lane<length?p.support_nodes.data[tpl*SUPPORT_WIDTH+lane]:-1;
+                    const float z0=lane<length?d.Z.data[(base+row)*SUPPORT_WIDTH+lane]:0.0f;
                     float r0=lane<length?z0*du[node]:0.0f;
                     for(int shift=16;shift>0;shift>>=1)r0+=__shfl_down_sync(0xffffffff,r0,shift);
                     r0=__shfl_sync(0xffffffff,r0,0)+d.incident.data[base+row]+rhs.data[base+row];
@@ -40,9 +40,9 @@ def get_fragments(capacity: int):
                         // residuals nor the self-block cache. Old tangents still
                         // contribute their complete removal to the combined du.
                         const float z1=lane<length && (radius>0.0f || old1!=0.0f)
-                            ?d.Z.data[(base+row+1)*18+lane]:0.0f;
+                            ?d.Z.data[(base+row+1)*SUPPORT_WIDTH+lane]:0.0f;
                         const float z2=lane<length && (radius>0.0f || old2!=0.0f)
-                            ?d.Z.data[(base+row+2)*18+lane]:0.0f;
+                            ?d.Z.data[(base+row+2)*SUPPORT_WIDTH+lane]:0.0f;
                         int accepted=radius==0.0f;
                         float next1=0.0f,next2=0.0f;
                         if(radius>0.0f) {
@@ -143,4 +143,5 @@ def get_fragments(capacity: int):
                 }
             }
 """
-    return setup, update
+    del dof_count
+    return setup, update.replace("SUPPORT_WIDTH", str(support_width))

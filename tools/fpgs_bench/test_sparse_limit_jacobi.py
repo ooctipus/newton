@@ -18,6 +18,16 @@ from tools.fpgs_bench import test_sparse_metric_tangents as metric
 from tools.fpgs_bench.test_sparse_contact_block import full_rows
 from tools.fpgs_bench.test_sparse_factor import fixture, unpack
 
+DIMS = {"dof_count": 43, "support_width": 18, "inverse_width": 18, "nonzero_count": 434}
+
+
+def _sized(fragment):
+    """The limit fragment with the checked tree's sizes substituted."""
+    for token, value in (("PREFIX_CAPACITY", 86), ("SUPPORT_WIDTH", 18), ("DOF_COUNT", 43)):
+        fragment = fragment.replace(token, str(value))
+    return fragment
+
+
 ENV = {
     **metric.METRIC_ENV,
     "FEATHER_PGS_SPARSE_SPECTRAL_TANGENTS": "1",
@@ -29,7 +39,7 @@ def check_native(test, f, *, iterations=8, omega=1.0, friction_start=0, fallback
     """Compare the native translation and complete momentum publication."""
     s, owner = f["solver"], f["owner"]
     test.assertTrue(owner.limit_jacobi)
-    test.assertIs(owner.kernels.solve, jacobi.get_solve_kernel())
+    test.assertIs(owner.kernels.solve, jacobi.get_solve_kernel(**DIMS))
     count = int(s.constraint_count.numpy()[0])
     z, templates = full_rows(owner, count)
     diagonal, rhs, types, parents, mu, incoming = (
@@ -151,19 +161,19 @@ def seed_limits(f, count, *, contacts=False, incoming=False, ascending=False, si
 class TestSparseLimitJacobi(unittest.TestCase):
     def test_factory(self):
         """Require a separate factory and leave the old spectral owner intact."""
-        self.assertEqual(jacobi.get_solve_kernel().key, "sparse_spectral_limit_jacobi43_s18_c100")
-        self.assertIs(jacobi.get_solve_kernel(), jacobi.get_solve_kernel())
+        self.assertEqual(jacobi.get_solve_kernel(**DIMS).key, "sparse_spectral_limit_jacobi43_s18_c100")
+        self.assertIs(jacobi.get_solve_kernel(**DIMS), jacobi.get_solve_kernel(**DIMS))
 
     def test_owner_and_unchanged_contact_source(self):
         """Keep off-mode ownership and the exact original contact fragment."""
         with patch.dict(os.environ, ENV):
             owner = fixture("cpu")["owner"]
         self.assertTrue(owner.limit_jacobi)
-        self.assertIs(owner.kernels.solve, jacobi.get_solve_kernel())
+        self.assertIs(owner.kernels.solve, jacobi.get_solve_kernel(**DIMS))
         with patch.dict(os.environ, {**ENV, "FEATHER_PGS_SPARSE_LIMIT_JACOBI": "0"}):
             ordinary = fixture("cpu")["owner"]
         self.assertFalse(ordinary.limit_jacobi)
-        self.assertIs(ordinary.kernels.solve, spectral.get_solve_kernel())
+        self.assertIs(ordinary.kernels.solve, spectral.get_solve_kernel(**DIMS))
         for flags in (
             {"FEATHER_PGS_SPARSE_LIMIT_JACOBI": "bad"},
             {"FEATHER_PGS_SPARSE_SPECTRAL_TANGENTS": "0"},
@@ -174,9 +184,9 @@ class TestSparseLimitJacobi(unittest.TestCase):
                     fixture("cpu")
         setup, update = jacobi.get_fragments(100)
         old_setup, old_update = spectral.get_fragments(100)
-        self.assertEqual(setup, old_setup + jacobi._SETUP)
-        self.assertEqual(update, jacobi._UPDATE + old_update)
-        self.assertEqual(jacobi.SCRATCH_BYTES, 516)
+        self.assertEqual(setup, old_setup + _sized(jacobi._SETUP))
+        self.assertEqual(update, _sized(jacobi._UPDATE) + old_update)
+        self.assertEqual(jacobi.scratch_bytes(43), 516)
         self.assertNotIn("d.W.data", setup + update)
         self.assertNotIn("limit_column", setup + update)
         self.assertIn("__shared__ float limit_step[43]", setup)

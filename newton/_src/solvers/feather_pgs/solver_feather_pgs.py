@@ -5041,16 +5041,17 @@ class SolverFeatherPGS(SolverBase):
         if not self._friction_anchors_enabled and (
             self.mf_gs_parallel_rows > 0
             or self.mf_gs_response_block_rows > 0
-            or any(
-                os.environ.get(f"FEATHER_PGS_{option}") == "1"
-                for option in (
-                    "ALLEGRO_KINETIC_ROWS",
-                    "SINGLE_FACTOR",
-                    "SPARSE_FACTOR",
-                )
-            )
+            or any(os.environ.get(f"FEATHER_PGS_{option}") == "1" for option in ("SINGLE_FACTOR", "SPARSE_FACTOR"))
         ):
             self._sparse_selection_reason = "A competing response or publication owner reserves the ordinary buffers."
+            return
+        if not self._friction_anchors_enabled and self._has_free_rigid_bodies:
+            # A world that pairs an articulation with free rigid bodies is served
+            # by the held-tree owner and the paired response on the dense route
+            # (measured: Kuka lift 12.7 ms there against 15.5 on sparse factors).
+            self._sparse_selection_reason = (
+                "Worlds with free rigid bodies keep the dense route for the held-tree owner and paired response."
+            )
             return
         response_dofs = self._model_plan.response_dof_count
         if (split_candidate or velocity_candidate) and (

@@ -497,6 +497,8 @@ class TestSparseParallelLimits(unittest.TestCase):
                     s.joint_limit_activation_gap,
                     s.pgs_beta,
                     s.pgs_cfm,
+                    43,
+                    18,
                     s.slot_counter,
                     s.row_type,
                     s.row_parent,
@@ -514,7 +516,13 @@ class TestSparseParallelLimits(unittest.TestCase):
                 expected = [output.numpy().copy() for output in outputs]
                 for output in outputs:
                     output.fill_(-777)
-                wp.launch_tiled(get_parallel_limit_kernel(), dim=[1], inputs=args, block_dim=32, device=self.device)
+                wp.launch_tiled(
+                    get_parallel_limit_kernel(dof_count=43, support_width=18, nonzero_count=434),
+                    dim=[1],
+                    inputs=args,
+                    block_dim=32,
+                    device=self.device,
+                )
                 for output, reference in zip(outputs, expected, strict=True):
                     np.testing.assert_allclose(output.numpy(), reference, rtol=3e-5, atol=3e-6)
                 self.assertEqual(int(s.slot_counter.numpy()[0]), 74 if enabled else 0)

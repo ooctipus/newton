@@ -13,8 +13,8 @@ from .sparse_row_projection import _sparse_contact_projection_source
 
 
 @cache
-def get_parallel_limit_kernel():
-    """Emit original global rows with three stable active-candidate ballots."""
+def get_parallel_limit_kernel(*, dof_count: int, support_width: int, nonzero_count: int):
+    """Emit the lower/upper limit candidates in order with stable active-candidate ballots."""
     source = r"""
     const int art=p.group_to_art.data[group], world=p.art_to_world.data[art];
     const int start=p.art_dof_start.data[art], capacity=row_type.shape[1], base=world*capacity;
@@ -23,14 +23,14 @@ def get_parallel_limit_kernel():
         const int local=candidate/2, tpl=p.limit_support.data[local], at=base+row;
         const float sign=(candidate&1)?-1.0f:1.0f;
         float norm=0.0f;
-        for(int k=0;k<18;++k) {
-            const int node=p.support_nodes.data[tpl*18+k];
+        for(int k=0;k<SUPPORT_WIDTH;++k) {
+            const int node=p.support_nodes.data[tpl*SUPPORT_WIDTH+k];
             float z=0.0f;
             if(node>=0) {
-                const int entry=p.index.data[node*43+42-local];
-                if(entry>=0)z=sign*d.W.data[group*434+entry];
+                const int entry=p.index.data[node*DOF_COUNT+p.sparse.data[local]];
+                if(entry>=0)z=sign*d.W.data[group*PACKED_COUNT+entry];
             }
-            d.Z.data[at*18+k]=z;norm+=z*z;
+            d.Z.data[at*SUPPORT_WIDTH+k]=z;norm+=z*z;
         }
         d.support.data[at]=tpl; d.incident.data[at]=sign*vhat.data[start+local];
         diagonal.data[at]=norm+cfm;
@@ -41,10 +41,10 @@ def get_parallel_limit_kernel():
     int count=0;
 #if defined(__CUDA_ARCH__)
     const int lane=threadIdx.x&31;
-    for(int batch=0;batch<3;++batch) {
+    for(int batch=0;batch<CANDIDATE_BATCHES;++batch) {
         const int candidate=batch*32+lane, local=candidate/2, side=candidate&1;
         bool active=false;float value=0.0f;
-        if(enabled && candidate<86) {
+        if(enabled && candidate<CANDIDATE_COUNT) {
             const int dof=start+local, qi=limit_q.data[dof];
             if(qi>=0) {
                 const float bound=side?upper.data[dof]:lower.data[dof], position=q.data[qi];
@@ -61,7 +61,7 @@ def get_parallel_limit_kernel():
         phase.data[world*phase.shape[1]]=count;phase.data[world*phase.shape[1]+1]=count;
     }
 #else
-    if(enabled)for(int candidate=0;candidate<86;++candidate) {
+    if(enabled)for(int candidate=0;candidate<CANDIDATE_COUNT;++candidate) {
         const int local=candidate/2,side=candidate&1,dof=start+local,qi=limit_q.data[dof];
         if(qi<0)continue;
         const float bound=side?upper.data[dof]:lower.data[dof],position=q.data[qi];
@@ -72,6 +72,14 @@ def get_parallel_limit_kernel():
     phase.data[world*phase.shape[1]]=count;phase.data[world*phase.shape[1]+1]=count;
 #endif
 """
+    for token, value in (
+        ("SUPPORT_WIDTH", support_width),
+        ("DOF_COUNT", dof_count),
+        ("PACKED_COUNT", nonzero_count),
+        ("CANDIDATE_BATCHES", (2 * dof_count + 31) // 32),
+        ("CANDIDATE_COUNT", 2 * dof_count),
+    ):
+        source = source.replace(token, str(value))
 
     @wp.func_native(source)
     def native(
@@ -87,6 +95,8 @@ def get_parallel_limit_kernel():
         gap: float,
         beta: float,
         cfm: float,
+        dof_count: int,
+        support_width: int,
         counter: wp.array[int],
         row_type: wp.array2d[int],
         parent: wp.array2d[int],
@@ -111,6 +121,8 @@ def get_parallel_limit_kernel():
         gap: float,
         beta: float,
         cfm: float,
+        dof_count: int,
+        support_width: int,
         counter: wp.array[int],
         row_type: wp.array2d[int],
         parent: wp.array2d[int],
@@ -136,6 +148,8 @@ def get_parallel_limit_kernel():
             gap,
             beta,
             cfm,
+            dof_count,
+            support_width,
             counter,
             row_type,
             parent,
@@ -148,7 +162,7 @@ def get_parallel_limit_kernel():
             phase,
         )
 
-    prefix.__name__ = prefix.__qualname__ = "sparse_factor_parallel_limit_prefix43"
+    prefix.__name__ = prefix.__qualname__ = f"sparse_factor_parallel_limit_prefix{dof_count}"
     return wp.kernel(enable_backward=False, module="unique")(prefix)
 
 
@@ -165,6 +179,8 @@ def build_limit_prefix(
     gap: float,
     beta: float,
     cfm: float,
+    dof_count: int,
+    support_width: int,
     counter: wp.array[int],
     row_type: wp.array2d[int],
     parent: wp.array2d[int],
@@ -183,7 +199,7 @@ def build_limit_prefix(
     start = p.art_dof_start[art]
     count = int(0)
     if enabled != 0:
-        for candidate in range(86):
+        for candidate in range(2 * dof_count):
             local = candidate // 2
             side = candidate % 2
             dof = start + local
@@ -208,11 +224,11 @@ def build_limit_prefix(
             template = p.limit_support[local]
             d.support[world, row] = template
             norm = float(0.0)
-            for k in range(18):
+            for k in range(support_width):
                 node = p.support_nodes[template, k]
                 z = float(0.0)
                 if node >= 0:
-                    entry = p.index[node, 42 - local]
+                    entry = p.index[node, p.sparse[local]]
                     if entry >= 0:
                         z = sign * d.W[group, entry]
                 d.Z[world, row, k] = z
@@ -292,7 +308,7 @@ def get_contact_kernel(*, dof_count: int, support_width: int, factor_stride: int
         const wp::vec3 t1 = wp::normalize(wp::cross(normal,t0));
         float jn=0.0f, jt0=0.0f, jt1=0.0f;
         const int node = lane < length ? p.support_nodes.data[tpl*$SUPPORT+lane] : -1;
-        const int dof = $DOF_LAST-node;
+        const int dof = p.physical.data[node];
         if (lane < length) {
             const wp::spatial_vector screw = S.data[start+dof];
             const wp::vec3 lin(screw[0],screw[1],screw[2]), ang(screw[3],screw[4],screw[5]);
@@ -330,7 +346,7 @@ def get_contact_kernel(*, dof_count: int, support_width: int, factor_stride: int
         ),
     )
 
-    source = source.replace("$SUPPORT", str(support_width)).replace("$DOF_LAST", str(dof_count - 1))
+    source = source.replace("$SUPPORT", str(support_width))
 
     @wp.func_native(source)
     def native(
@@ -429,7 +445,7 @@ def get_contact_kernel(*, dof_count: int, support_width: int, factor_stride: int
     return wp.kernel(enable_backward=False, module="unique")(contacts)
 
 
-def _contact_block_fragments(capacity: int):
+def _contact_block_fragments(capacity: int, *, support_width: int):
     """Local sticking corrections; retain original scalar transactions on rejection."""
     setup = r"""
     __shared__ float contact_cross[BLOCK_CAPACITY];
@@ -447,8 +463,8 @@ def _contact_block_fragments(capacity: int):
                 const float friction=mu.data[base+row+1];
                 if(isfinite(friction) && friction>=0.0f && friction==mu.data[base+row+2]) {
                     const int tpl=d.support.data[base+row], length=p.support_count.data[tpl];
-                    const int node=lane<length?p.support_nodes.data[tpl*18+lane]:-1;
-                    const float z0=lane<length?d.Z.data[(base+row)*18+lane]:0.0f;
+                    const int node=lane<length?p.support_nodes.data[tpl*SUPPORT_WIDTH+lane]:-1;
+                    const float z0=lane<length?d.Z.data[(base+row)*SUPPORT_WIDTH+lane]:0.0f;
                     float r0=lane<length?z0*du[node]:0.0f;
                     for(int shift=16;shift>0;shift>>=1)r0+=__shfl_down_sync(0xffffffff,r0,shift);
                     r0=__shfl_sync(0xffffffff,r0,0)+d.incident.data[base+row]+rhs.data[base+row];
@@ -458,8 +474,8 @@ def _contact_block_fragments(capacity: int):
                         row+=2;
                         continue;
                     }
-                    const float z1=lane<length?d.Z.data[(base+row+1)*18+lane]:0.0f;
-                    const float z2=lane<length?d.Z.data[(base+row+2)*18+lane]:0.0f;
+                    const float z1=lane<length?d.Z.data[(base+row+1)*SUPPORT_WIDTH+lane]:0.0f;
+                    const float z2=lane<length?d.Z.data[(base+row+2)*SUPPORT_WIDTH+lane]:0.0f;
                     // An open contact never consumes the self block. Build it
                     // only on its first non-open visit in this solver call.
                     const int word=row/32;
@@ -532,7 +548,7 @@ def _contact_block_fragments(capacity: int):
                 }
             }
 """
-    return setup, update
+    return setup, update.replace("SUPPORT_WIDTH", str(support_width))
 
 
 @cache
@@ -540,6 +556,10 @@ def get_solve_kernel(
     capacity: int,
     block_contacts: bool = False,
     *,
+    dof_count: int,
+    support_width: int,
+    inverse_width: int,
+    nonzero_count: int,
     metric_tangents: bool = False,
     spectral_tangents: bool = False,
     limit_jacobi: bool = False,
@@ -570,8 +590,8 @@ def get_solve_kernel(
         }}
     }}
     if(__ballot_sync(0xffffffff,bad)) {{if(lane==0)atomicOr(&d.status.data[world],4);return;}}
-    __shared__ float du[43], lam[{capacity}];
-    for(int k=lane;k<43;k+=32) du[k]=0.0f;
+    __shared__ float du[{dof_count}], lam[{capacity}];
+    for(int k=lane;k<{dof_count};k+=32) du[k]=0.0f;
     for(int r=lane;r<count;r+=32) lam[r]=impulses.data[base+r];
     __syncwarp();
     for(int iteration=0;iteration<iterations;++iteration) {{
@@ -582,8 +602,8 @@ def get_solve_kernel(
             const float denom=diagonal.data[base+row];
             if(!(denom>0.0f))continue;
             const int tpl=d.support.data[base+row], length=p.support_count.data[tpl];
-            const int node=lane<length?p.support_nodes.data[tpl*18+lane]:-1;
-            const float z=lane<length?d.Z.data[(base+row)*18+lane]:0.0f;
+            const int node=lane<length?p.support_nodes.data[tpl*{support_width}+lane]:-1;
+            const float z=lane<length?d.Z.data[(base+row)*{support_width}+lane]:0.0f;
             float dot=lane<length?z*du[node]:0.0f;
             for(int s=16;s>0;s>>=1)dot+=__shfl_down_sync(0xffffffff,dot,s);
             dot=__shfl_sync(0xffffffff,dot,0);
@@ -609,7 +629,7 @@ def get_solve_kernel(
             __syncwarp();
             if(sibling_delta!=0.0f) {{
                 const int st=d.support.data[base+sibling], sn=p.support_count.data[st];
-                if(lane<sn)du[p.support_nodes.data[st*18+lane]]+=d.Z.data[(base+sibling)*18+lane]*sibling_delta;
+                if(lane<sn)du[p.support_nodes.data[st*{support_width}+lane]]+=d.Z.data[(base+sibling)*{support_width}+lane]*sibling_delta;
                 changed=1;
             }}
             __syncwarp();
@@ -619,10 +639,11 @@ def get_solve_kernel(
         if(iteration>=friction_start && __ballot_sync(0xffffffff,changed)!=0u)continue;
         if(iteration>=friction_start)break;
     }}
-    for(int col=lane;col<43;col+=32) {{
+    for(int col=lane;col<{dof_count};col+=32) {{
         float value=0.0f;
-        for(int k=0;k<p.inverse_count.data[col];++k) {{ const int row=p.inverse_nodes.data[col*18+k];value+=d.W.data[group*434+p.index.data[row*43+col]]*du[row]; }}
-        vout.data[start+42-col]=vhat.data[start+42-col]+value;
+        for(int k=0;k<p.inverse_count.data[col];++k) {{ const int row=p.inverse_nodes.data[col*{inverse_width}+k];value+=d.W.data[group*{nonzero_count}+p.index.data[row*{dof_count}+col]]*du[row]; }}
+        const int physical=start+p.physical.data[col];
+        vout.data[physical]=vhat.data[physical]+value;
     }}
     for(int r=lane;r<count;r+=32)impulses.data[base+r]=lam[r];
 #endif
@@ -638,9 +659,9 @@ def get_solve_kernel(
             from .sparse_metric_tangents import get_fragments  # noqa: PLC0415
 
         if metric_tangents:
-            setup, update = get_fragments(capacity)
+            setup, update = get_fragments(capacity, support_width=support_width, dof_count=dof_count)
         else:
-            setup, update = _contact_block_fragments(capacity)
+            setup, update = _contact_block_fragments(capacity, support_width=support_width)
         setup_anchor = "    for(int iteration=0;iteration<iterations;++iteration) {"
         update_anchor = "            if(type==2 && iteration<friction_start)"
         assert source.count(setup_anchor) == source.count(update_anchor) == 1
@@ -649,7 +670,7 @@ def get_solve_kernel(
 
     if spectral_tangents:
         name = "sparse_spectral_limit_jacobi" if limit_jacobi else "sparse_spectral_tangent"
-        return _make_cfm_solve_kernel(source, f"{name}43_s18_c{capacity}")
+        return _make_cfm_solve_kernel(source, f"{name}{dof_count}_s{support_width}_c{capacity}")
 
     @wp.func_native(source)
     def native(
@@ -708,7 +729,7 @@ def get_solve_kernel(
     name = (
         "sparse_metric_tangent" if metric_tangents else "sparse_contact_block" if block_contacts else "sparse_factor_gs"
     )
-    solve.__name__ = solve.__qualname__ = f"{name}43_s18_c{capacity}"
+    solve.__name__ = solve.__qualname__ = f"{name}{dof_count}_s{support_width}_c{capacity}"
     return wp.kernel(enable_backward=False, module="unique")(solve)
 
 

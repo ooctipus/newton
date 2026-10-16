@@ -20,9 +20,9 @@ def _replace(source, before, after, count=1):
     return source.replace(before, after)
 
 
-def get_fragments(capacity: int):
+def get_fragments(capacity: int, *, support_width: int = 18, dof_count: int = 43):
     """Keep the original fused transaction around a root-free local proposal."""
-    setup, update = sparse_metric_tangents.get_fragments(capacity)
+    setup, update = sparse_metric_tangents.get_fragments(capacity, support_width=support_width, dof_count=dof_count)
     update = _replace(
         update,
         "                                    contact_cross[row+2]=a12;contact_ready[word]|=bit;",
@@ -62,6 +62,14 @@ def get_fragments(capacity: int):
 
 
 @functools.cache
-def get_solve_kernel():
+def get_solve_kernel(*, dof_count: int, support_width: int, inverse_width: int, nonzero_count: int):
     """Select the explicit CFM-aware spectral owner from the shared factory."""
-    return sparse_factor_rows.get_solve_kernel(100, metric_tangents=True, spectral_tangents=True)
+    return sparse_factor_rows.get_solve_kernel(
+        100,
+        dof_count=dof_count,
+        support_width=support_width,
+        inverse_width=inverse_width,
+        nonzero_count=nonzero_count,
+        metric_tangents=True,
+        spectral_tangents=True,
+    )
