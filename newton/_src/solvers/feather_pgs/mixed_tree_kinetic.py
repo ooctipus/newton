@@ -95,9 +95,19 @@ def supported(solver):
         # Every family refreshes through the geometric small Cholesky (one lane
         # per factor row, up to 32 coordinates) into the solver's dense factor
         # of the same shape; a diagonal-mass size keeps its compact inverse.
+        # The solver's own factor stage must be fused into its CRBA stage for
+        # the size (warp or tiled kernel), which the owner's refresh replaces;
+        # otherwise stage 2 would refactor the held L from an unbuilt H.
         and all(
             size == solver._compact_diagonal_mass_size
-            or (1 <= size <= 32 and not solver._execution_plan.use_diagonal_mass(size))
+            or (
+                1 <= size <= 32
+                and not solver._execution_plan.use_diagonal_mass(size)
+                and (
+                    solver._crba_cholesky_warp_kernels_by_size.get(size) is not None
+                    or solver._crba_cholesky_kernels_by_size.get(size) is not None
+                )
+            )
             for size in solver.size_groups
         )
     )
