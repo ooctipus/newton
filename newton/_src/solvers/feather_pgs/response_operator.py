@@ -60,6 +60,61 @@ class CholeskySolve:
 
 
 @dataclass(frozen=True)
+class LaneCholeskySolve:
+    """Apply L^-1 and L^-T with one lane per coordinate and one shuffle per step.
+
+    The same law as :class:`CholeskySolve` (zero diagonal produces zero), with
+    the dependency chain shared across the lanes of one warp group: at step
+    ``k`` the lane holding row ``k`` finalizes its coordinate, every lane reads
+    it through a shuffle and subtracts its own ``L[i, k]`` term. The forward
+    pass runs rows upward, the transposed pass downward. ``size`` is a
+    compile-time constant of at most the group's lane count; the caller
+    supplies the lane variable, the group's shuffle mask and shuffle width
+    suffix, and scratch index bases for the right-hand side and the output.
+    Lanes past ``size`` take part in every shuffle and write nothing.
+    """
+
+    size: int
+    lower: str
+
+    def solve(
+        self, rhs_base: str, output_base: str, *, lane: str = "lane", mask: str = "$MASK", shuffle: str = "$SHFL"
+    ):
+        n = self.size
+        # Each lane's factor row (forward) and column (transposed) are loaded
+        # into registers before the loops so the per-step chain is a shuffle
+        # and a multiply-add, not a global load. Indices are static after
+        # unrolling; an idle lane loads row 0 and writes nothing.
+        return f"""{{
+            const float* Lr={self.lower};
+            const int i={lane};
+            const bool active=i<{n};
+            const int ic=active?i:0;
+            float row[{n}],col[{n}];
+            #pragma unroll
+            for(int k=0;k<{n};++k){{row[k]=Lr[ic*{n}+k];col[k]=Lr[k*{n}+ic];}}
+            const float diagonal=Lr[ic*{n}+ic];
+            float value=active?s[{rhs_base}+i]:0.0f;
+            float x=0.0f;
+            #pragma unroll
+            for(int k=0;k<{n};++k){{
+                if(i==k)x=diagonal!=0.0f?value/diagonal:0.0f;
+                const float xk=__shfl_sync({mask},x,k{shuffle});
+                if(active&&i>k)value-=row[k]*xk;
+            }}
+            value=x;
+            float z=0.0f;
+            #pragma unroll
+            for(int k={n}-1;k>=0;--k){{
+                if(i==k)z=diagonal!=0.0f?value/diagonal:0.0f;
+                const float zk=__shfl_sync({mask},z,k{shuffle});
+                if(active&&i<k)value-=col[k]*zk;
+            }}
+            if(active)s[{output_base}+i]=z;
+        }}"""
+
+
+@dataclass(frozen=True)
 class DenseLowerInverse:
     """Apply an existing row-major lower inverse factor without refactoring it."""
 

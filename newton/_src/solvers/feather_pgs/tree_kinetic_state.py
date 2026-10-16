@@ -1014,46 +1014,61 @@ def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFER
 """
     )
     data_type = sparse_factor.SparseData
-    if response == "cholesky" and not layout.forest:
-        held = response_operator.CholeskySolve(layout.dofs, f"d.lower.data+group*{layout.dofs**2}")
-        operations["FORWARD_STAGE"] = (
-            "if(lane==0){\n"
-            + held.forward("s[$SIX_BODIES+$index]", "s[$WHITE+$index]")
-            + held.transpose("s[$WHITE+$index]", "s[$WHITE+$index]")
-            + "\n}\n#if defined(__CUDA_ARCH__)\n$SYNC;\n#endif\n"
-        )
-        operations["TRANSPOSE_ACTION"] = "float value=s[$WHITE+col];"
-        operations["RESPONSE_PHYSICAL"] = "col"
-        data_type = HeldResponse
-    elif response == "cholesky":
-        # One held factor family per root, each applied by its own lane over
-        # the root's coordinate slice; a prescribed root (family 0) responds
-        # with zero.
+    if response == "cholesky":
+        # Held factor families applied in physical coordinates. On CUDA every
+        # family of at most one warp of coordinates is solved lane-parallel
+        # (one lane per row, one shuffle per step); larger families and the
+        # CPU twin keep the serial one-lane law. A prescribed root (family 0)
+        # responds with zero and a diagonal-mass root (negative family) with
+        # its stored inverse. FEATHER_PGS_TREE_SERIAL_SOLVE=1 keeps the serial
+        # form on CUDA for comparison.
+        serial_only = os.environ.get("FEATHER_PGS_TREE_SERIAL_SOLVE") == "1"
         roots = len(layout.roots)
-        stages = []
-        for r, (offset, family) in enumerate(zip(layout.root_offsets, layout.root_families, strict=True)):
+        if not layout.forest:
+            families = [(0, layout.dofs, f"d.lower.data+group*{layout.dofs**2}", layout.dofs)]
+        else:
+            families = []
+            for r, (offset, family) in enumerate(zip(layout.root_offsets, layout.root_families, strict=True)):
+                lower = "d.lower" if r == 0 else f"d.lower{r}"
+                pointer = f"{lower}.data+d.factor_index.data[group*{roots}+{r}]*{family * family}"
+                families.append((offset, family, pointer, layout.root_coordinates[r] if family == 0 else abs(family)))
+        serial, parallel = [], []
+        for offset, family, pointer, width in families:
             if family == 0:
-                width = layout.root_coordinates[r]
-                stages.append(f"if(lane=={r}){{for(int k=0;k<{width};++k)s[$WHITE+{offset}+k]=0.0f;}}")
+                serial.append(f"if(lane==0){{for(int k=0;k<{width};++k)s[$WHITE+{offset}+k]=0.0f;}}")
+                parallel.append(f"if(lane<{width})s[$WHITE+{offset}+lane]=0.0f;")
                 continue
             if family < 0:
-                # A diagonal-mass root: the compact inverse over its slice.
-                stages.append(
-                    f"if(lane=={r}){{for(int k=0;k<{-family};++k)"
+                serial.append(
+                    f"if(lane==0){{for(int k=0;k<{width};++k)"
                     f"s[$WHITE+{offset}+k]=d.inverse.data[ds+{offset}+k]*s[$SIX_BODIES+{offset}+k];}}"
                 )
+                parallel.append(
+                    f"if(lane<{width})s[$WHITE+{offset}+lane]=d.inverse.data[ds+{offset}+lane]*s[$SIX_BODIES+{offset}+lane];"
+                )
                 continue
-            lower = "d.lower" if r == 0 else f"d.lower{r}"
-            held = response_operator.CholeskySolve(
-                family, f"{lower}.data+d.factor_index.data[group*{roots}+{r}]*{family * family}"
-            )
-            stages.append(
-                f"if(lane=={r}){{\n"
+            held = response_operator.CholeskySolve(family, pointer)
+            serial.append(
+                "if(lane==0){\n"
                 + held.forward(f"s[$SIX_BODIES+{offset}+$index]", f"s[$WHITE+{offset}+$index]")
                 + held.transpose(f"s[$WHITE+{offset}+$index]", f"s[$WHITE+{offset}+$index]")
                 + "\n}"
             )
-        operations["FORWARD_STAGE"] = "\n".join(stages) + "\n#if defined(__CUDA_ARCH__)\n$SYNC;\n#endif\n"
+            if family <= min(32, layout.lanes) and not serial_only:
+                parallel.append(
+                    response_operator.LaneCholeskySolve(family, pointer).solve(
+                        f"$SIX_BODIES+{offset}", f"$WHITE+{offset}"
+                    )
+                )
+            else:
+                parallel.append(serial[-1])
+        operations["FORWARD_STAGE"] = (
+            "#if defined(__CUDA_ARCH__)\n"
+            + "\n".join(parallel)
+            + "\n#else\n"
+            + "\n".join(serial)
+            + "\n#endif\n#if defined(__CUDA_ARCH__)\n$SYNC;\n#endif\n"
+        )
         operations["TRANSPOSE_ACTION"] = "float value=s[$WHITE+col];"
         operations["RESPONSE_PHYSICAL"] = "col"
         data_type = HeldResponse

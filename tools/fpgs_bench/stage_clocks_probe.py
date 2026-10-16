@@ -126,8 +126,7 @@ for kind in ("kuka", "franka"):
         flush=True,
     )
     if clocks is None:
-        print("no stage clocks (owner not installed or instrumentation off)")
-        continue
+        print("no stage clocks (owner not installed or instrumentation off); stepping for the profiler only")
     groups = [g for g in getattr(owner, "groups", [])]
     print(
         "groups:",
@@ -162,6 +161,8 @@ for kind in ("kuka", "franka"):
         states.reverse()
     wp.synchronize_device("cuda:0")
     print(f"step wall {1e3 * (time.perf_counter() - t0) / 5:.3f} ms per step ({WORLDS} worlds)")
+    if clocks is None:
+        continue
     for step in range(3):
         pipeline.collide(states[0], contacts)
         states[0].clear_forces()
