@@ -564,21 +564,26 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         self.assert_sparse_state(graph)
 
     def test_unsupported_configurations_keep_existing_path(self):
-        """Reject full-support chains, torsion, velocity limits, and warm starts."""
+        """Reject full-support chains, torsion, velocity limits and oversized dense rows."""
         chain = _build_chain("cuda:0", base_z=1.2, contact_sphere="deep", ground=False)
         self.assertIsNone(_make_solver(chain, True)._sparse_mass_matrix_size)
         model = _build_model()
         for options in (
             {"contact_torsion_radius": 0.01},
             {"enable_joint_velocity_limits": True},
-            {"pgs_warmstart": True},
-            {"mf_warmstart": True},
             {"dense_max_constraints": 2048},
         ):
             with self.subTest(options=options):
                 solver = _make_solver(model, True, **options)
                 self.assertIsNone(solver._sparse_mass_matrix_size)
                 self.assertGreater(solver.J_by_size[9].size, 1)
+
+    def test_warm_starts_are_admitted(self):
+        """Warm starts seed the sparse sweeps from carried impulses on models without free rigid bodies."""
+        model = _build_model()
+        for options in ({"pgs_warmstart": True}, {"mf_warmstart": True}):
+            with self.subTest(options=options):
+                self.assertEqual(_make_solver(model, True, **options)._sparse_mass_matrix_size, 9)
 
 
 if __name__ == "__main__":
