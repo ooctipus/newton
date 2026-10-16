@@ -98,8 +98,25 @@ class TreeLayout:
                 "ALL": "__syncthreads_and(",
                 "ANY": "__syncthreads_or(",
             }
+        pred = 6 * self.bodies + 2 * self.dofs
+        total = self.origin_offset + 6
+        if self.pack > 1:
+            scratch = {
+                "PRED_SCRATCH_DECL": f"__shared__ float s_all[{pred * self.pack}];__shared__ int nonzero_all[{self.pack}];"
+                f"float* s=s_all+{threads['SUB']}*{pred};int& nonzero=nonzero_all[{threads['SUB']}];",
+                "STATE_SCRATCH_DECL": f"__shared__ float values[{total * self.pack}];"
+                f"return reinterpret_cast<uint64_t>(values+{threads['SUB']}*{total});",
+            }
+        else:
+            # One tree per block keeps the original direct declarations (a
+            # pointer into a per-block array costs a measurable few percent).
+            scratch = {
+                "PRED_SCRATCH_DECL": f"__shared__ float s[{pred}];__shared__ int nonzero;",
+                "STATE_SCRATCH_DECL": f"__shared__ float values[{total}];return reinterpret_cast<uint64_t>(values);",
+            }
         values = {
             **threads,
+            **scratch,
             "LANES": self.lanes,
             "PACK": self.pack,
             "BODIES": self.bodies,

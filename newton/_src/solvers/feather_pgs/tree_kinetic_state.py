@@ -394,10 +394,7 @@ _PREDICT = r"""    $PHYSICAL_DECL
     const int ds=p.art_dof_start.data[art],js=p.art_joint_start.data[art];
 #if defined(__CUDA_ARCH__)
     const int lane=$LANE,stride=$STRIDE;
-    __shared__ float s_all[$PRED_SCRATCH*$PACK];
-    __shared__ int nonzero_all[$PACK];
-    float* s=s_all+$SUB*$PRED_SCRATCH;
-    int& nonzero=nonzero_all[$SUB];
+    $PRED_SCRATCH_DECL
 #else
     const int lane=0,stride=1;
     float s[$PRED_SCRATCH];int nonzero=0;
@@ -487,8 +484,7 @@ _EXTERNAL_REDUCE = r"""    if(nonzero)for(int level=$LAST_PARENT;level>=0;--leve
 
 _STORAGE_SOURCE = r"""
 #if defined(__CUDA_ARCH__)
-    __shared__ float values[$TOTAL*$PACK];
-    return reinterpret_cast<uint64_t>(values+$SUB*$TOTAL);
+    $STATE_SCRATCH_DECL
 #else
     return reinterpret_cast<uint64_t>(malloc($TOTAL*sizeof(float)));
 #endif
