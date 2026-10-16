@@ -34,6 +34,9 @@ def make_case(*, free=False):
     data.q, data.v_hat = a([0.0]), a([0.0] * width)
     data.body_to_articulation = a([0, 1], wp.int32)
     data.art_to_world = a([0, 0], wp.int32)
+    data.free_bodies = wp.array([0] if free else [], dtype=wp.int32, device=device)
+    data.predicted_twist = a(np.zeros((2, 6)), wp.spatial_vector)
+    data.use_published = 0
     data.articulation_dof_start = a([0, width], wp.int32)
     data.articulation_response_dof_count = a([width, 0], wp.int32)
     data.prescribed_articulation = a([0, 1], wp.int32)
@@ -234,9 +237,10 @@ class TestResolvedWorlds(unittest.TestCase):
             self.assertNotIn(token, source)
 
 
-def _rollout(model, *, classifier, steps=90):
+def _rollout(model, *, classifier, steps=90, published=True):
     """Swing the arms and toss the boxes; return the solver, poses and the per-step resolved masks."""
     env = {
+        "FEATHER_PGS_PREDICTED_TWISTS": str(int(published)),
         "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": "1",
         "FEATHER_PGS_TREE_KINETIC_STATE": "0",
         "FEATHER_PGS_RESOLVED_WORLDS": str(int(classifier)),
@@ -296,6 +300,20 @@ class TestResolvedWorldsCUDA(unittest.TestCase):
         self.assertTrue(np.isfinite(poses).all())
         np.testing.assert_allclose(poses[:, :, :3], plain[:, :, :3], atol=1.0e-5, rtol=0.0)
         np.testing.assert_allclose(poses[:, :, 3:], plain[:, :, 3:], atol=1.0e-5, rtol=0.0)
+
+    def test_published_twists_match_the_body_pass(self):
+        """The predictor's published twists decide the same worlds as the classifier's own body pass."""
+        model = _build(wp.get_device("cuda:0"), worlds=6)
+        own_solver, own_poses, own_masks = _rollout(model, classifier=True, published=False)
+        solver, poses, masks = _rollout(model, classifier=True)
+        self.assertFalse(own_solver._resolved_worlds_owner.published)
+        self.assertTrue(solver._resolved_worlds_owner.published)
+        self.assertGreater(int(masks.sum()), 0)
+        # The published twist sums the same axis terms in tree order; a residual within
+        # rounding of the margin may decide differently on a handful of steps.
+        self.assertGreater(float(np.mean(masks == own_masks)), 0.995)
+        np.testing.assert_allclose(poses[:, :, :3], own_poses[:, :, :3], atol=1.0e-5, rtol=0.0)
+        np.testing.assert_allclose(poses[:, :, 3:], own_poses[:, :, 3:], atol=1.0e-5, rtol=0.0)
 
 
 def _walkers(device, worlds=4):

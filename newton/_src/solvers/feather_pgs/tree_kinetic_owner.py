@@ -110,6 +110,16 @@ class TreeKineticState:
             children.extend(np.flatnonzero(parent == body)[::-1].tolist())
             offsets.append(len(children))
         dfs_order, dfs_end = dfs_intervals(parent)
+        # Each body's DOF range: the plan's dof_joint is contiguous per body.
+        dof_joint_host = np.asarray(host["dof_joint"], dtype=np.int64)
+        body_dof_start = np.zeros(bodies, np.int32)
+        body_dof_count = np.zeros(bodies, np.int32)
+        for dof, body in enumerate(dof_joint_host):
+            if body_dof_count[body] == 0:
+                body_dof_start[body] = dof
+            elif body_dof_start[body] + body_dof_count[body] != dof:
+                raise ValueError("Tree kinetic state requires each body's coordinates to be contiguous")
+            body_dof_count[body] += 1
         if len(children) != bodies - len(self.layout.roots):
             raise ValueError("Tree kinetic state requires every true parent edge")
 
@@ -171,6 +181,20 @@ class TreeKineticState:
             )
         arts = getattr(sparse_owner, "forest_arts", None)
         arts = np.asarray(arts, np.int32) if arts is not None else group_to_art.reshape(-1, 1).astype(np.int32)
+        # Predicted body twists for the resolved-world classifier: the predictor
+        # publishes them for warp-sized plans (the chain plan keeps its own scans);
+        # FEATHER_PGS_PREDICTED_TWISTS=0 leaves the classifier to its own kernel.
+        self.publishes_twists = (
+            chain_host is None
+            and self.layout.lanes <= 32
+            and os.environ.get("FEATHER_PGS_PREDICTED_TWISTS", "1") == "1"
+        )
+        self._no_twists = wp.zeros(1, dtype=wp.spatial_vector, device=device)
+        if self.publishes_twists:
+            if getattr(solver, "_predicted_twist", None) is None:
+                solver._predicted_twist = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=device)
+                solver._predicted_twist_arts_host = np.zeros(model.articulation_count, np.int32)
+            solver._predicted_twist_arts_host[np.asarray(arts, np.int64).reshape(-1)] = 1
         free = [r for r, c in enumerate(self.layout.root_coordinates) if c == 6]
         free_root_local = root_locals[free] if free else np.zeros(1, np.int32)
         free_root_dof = (
@@ -202,6 +226,8 @@ class TreeKineticState:
             for name, values in (
                 ("dfs_order", dfs_order),
                 ("dfs_end", dfs_end),
+                ("body_dof_start", body_dof_start),
+                ("body_dof_count", body_dof_count),
                 ("arts", arts),
                 ("root_of", root_of),
                 ("root_local", root_locals),
@@ -299,6 +325,11 @@ class TreeKineticState:
         force.kinematic_joint, force.qdd, force.vhat = solver._kinematic_joint_mask, solver.joint_qdd, solver.v_hat
         force.dt = 1.0 / 240.0
         force.stage_clocks = cached_state_binding.stage_clocks(solver)
+        twists = getattr(solver, "_predicted_twist", None)
+        force.predicted_twist = self._no_twists if twists is None else twists
+        # Publish only when the classifier, built after this owner, consumes them.
+        consumer = getattr(solver, "_resolved_worlds_owner", None)
+        force.publish_twists = int(self.publishes_twists and consumer is not None and consumer.published)
         predict_arguments = [self.sparse.plan, self.sparse.data, self.plan, self.data, force]
         base = self.layout
         timings = {}
@@ -473,6 +504,11 @@ class TreeKineticState:
         force.qdd, force.vhat = state_aug.joint_qdd, solver.v_hat
         force.dt = dt
         force.stage_clocks = cached_state_binding.stage_clocks(solver)
+        twists = getattr(solver, "_predicted_twist", None)
+        force.predicted_twist = self._no_twists if twists is None else twists
+        # Publish only when the classifier, built after this owner, consumes them.
+        consumer = getattr(solver, "_resolved_worlds_owner", None)
+        force.publish_twists = int(self.publishes_twists and consumer is not None and consumer.published)
         wp.launch_tiled(
             self.predictor_kernel,
             dim=[self.launch_count],

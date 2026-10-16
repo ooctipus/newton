@@ -107,7 +107,7 @@ def build(kind):
 
 FINISH = ("update_qdd", "root transport", "integrate joints", "relative", "poses", "motion", "bodies", "collect")
 COLLECT = ("reduce", "bias projection", "geometric")
-PREDICT = ("forces", "reduce+assemble", "held solve", "publish", "transport")
+PREDICT = ("forces", "reduce+assemble", "held solve", "publish", "transport+twists")
 
 for kind in ("kuka", "franka"):
     model = build(kind)
@@ -174,9 +174,13 @@ for kind in ("kuka", "franka"):
             f" step +{step}: finish {np.median(c[:, :8].sum(axis=1)):,.0f}  collect [reduce {np.median(c[:, 13]):,.0f} bias {np.median(c[:, 14]):,.0f} geometric {np.median(c[:, 15]):,.0f}]  predict {np.median(c[:, 8:13].sum(axis=1)):,.0f}"
         )
     fin, pre, col = c[:, :8], c[:, 8:13], c[:, 13:16]
+    body0, free, motion = c[:, 16:19], c[:, 19:22], c[:, 22:25]
     for name, block, labels in (
         ("finish", fin, FINISH),
         ("collect sub-stages", col, COLLECT),
+        ("body terms, lane of body 0", body0, ("math", "publish", "store")),
+        ("body terms, free body lane", free, ("math", "publish", "store+finalize")),
+        ("joint motion, lane of body 0", motion, ("anchor", "jcalc_motion", "axis/motion stores")),
         ("predict", pre, PREDICT),
     ):
         med = np.median(block, axis=0)

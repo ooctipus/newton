@@ -215,6 +215,7 @@ def make_state_kernel(name, signature, operands, stages, namespace, *, finish):
 
 
 _BODY_TERMS = """
+$CLOCKB0
 radius = wp.transform_get_translation(pose_com) - origin
 rotation = wp.transform_get_rotation(pose_com)
 mass = data.body_mass[body]
@@ -236,23 +237,41 @@ velocity_com = linear + wp.cross(omega, radius)
 force = mass * (a + wp.cross(alpha, radius) + wp.cross(omega, velocity_com) - data.gravity[0])
 torque = angular_acceleration_force + wp.cross(omega, angular_momentum) + wp.cross(radius, force)
 wrench = wp.spatial_vector(force, torque)
+$CLOCKB1
 public_radius = wp.transform_point(pose, data.body_com[body]) - origin
 data.body_qd[body] = wp.spatial_vector(linear + wp.cross(omega, public_radius), omega)
 $VELOCITY
 $CACHE.com_offset[world, local] = $COM_OFFSET
+$CLOCKB2
 $STORE
+$CLOCKB3
 """
 
 
 def make_body_terms(signature, namespace, *, refresh, cache, com_offset, store, body_velocity=False):
     """Share body bias/moment arithmetic while retaining each publication contract."""
+    clocked = os.environ.get("FEATHER_PGS_STAGE_CLOCKS") == "1"
+    clocks = {f"CLOCKB{k}": (f"clock_b{k} = _clock()" if clocked else "pass") for k in range(4)}
+    if clocked:
+        clocks["CLOCKB3"] = (
+            "clock_b3 = _clock()\n"
+            "if data.stage_clocks.shape[0] > world:\n"
+            "    column = int(-1)\n"
+            "    if local == 0:\n        column = 16\n"
+            "    elif data.is_free_rigid[data.body_to_articulation[body]] != 0:\n        column = 19\n"
+            "    if column >= 0:\n"
+            "        data.stage_clocks[world, column] = clock_b1 - clock_b0\n"
+            "        data.stage_clocks[world, column + 1] = clock_b2 - clock_b1\n"
+            "        data.stage_clocks[world, column + 2] = clock_b3 - clock_b2"
+        )
     body = Template(_BODY_TERMS).substitute(
         REFRESH=refresh,
         CACHE=cache,
         COM_OFFSET=com_offset,
         STORE=store,
         VELOCITY="data.body_v_s[body] = velocity" if body_velocity else "",
+        **clocks,
     )
     source = "def _primary_terms(" + signature + "):\n" + indent(body.strip(), "    ") + "\n"
-    bindings = dict(namespace, wp=wp, PublicationData=PublicationData)
+    bindings = dict(namespace, wp=wp, PublicationData=PublicationData, _clock=_clock)
     return wp.func(_compile(source, bindings, "body-terms")["_primary_terms"])

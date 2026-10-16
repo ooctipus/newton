@@ -35,6 +35,9 @@ class KineticPlan:
     # lane past its subtree: every subtree is the lane interval [lane, dfs_end).
     dfs_order: wp.array[int]
     dfs_end: wp.array[int]
+    # Each local body's first local DOF and DOF count (its joint's coordinates).
+    body_dof_start: wp.array[int]
+    body_dof_count: wp.array[int]
     # Forest groups: the articulation of each root, each body's root index,
     # each root's local body, each free root's local body and coordinate
     # offset, and whether a coordinate takes passive springs.
@@ -98,6 +101,8 @@ class ForceInput:
     vhat: wp.array[float]
     dt: float
     stage_clocks: wp.array2d[wp.int64]
+    predicted_twist: wp.array[wp.spatial_vector]
+    publish_twists: int
 
 
 _LANES_SOURCE = r"""
@@ -553,7 +558,7 @@ $CLOCK3    for(int col=lane;col<$DOFS;col+=stride) {
 #endif
 $CLOCK4    // A prescribed (kinematic) free root keeps its given velocity: no transport.
     $TRANSPORT_BLOCK
-$CLOCK5"""
+$TWIST_BLOCK$CLOCK5"""
 
 _LEVEL_REDUCE = r"""    for(int level=$LAST_PARENT;level>=0;--level) {
         for(int body=lane;body<$BODIES;body+=stride)if(plan.depth.data[body]==level) {
@@ -608,6 +613,42 @@ _INTERVAL_REDUCE = (
     + _LEVEL_REDUCE
     + "#endif\n"
 )
+
+
+# Predicted body twists for the resolved-world classifier, published by the
+# predictor from the tree it already holds: each lane sums its body's own
+# axes against the final predictor velocity, then pointer-jumps up the tree
+# through shuffles (velocities at a common origin add). Warp-sized plans only.
+_TWIST_BLOCK = r"""
+#if defined(__CUDA_ARCH__)
+    if(f.publish_twists!=0) {
+        $SYNC;
+        float tw[6]={};
+        if(lane<$BODIES) {
+            const int first=ds+plan.body_dof_start.data[lane],count=plan.body_dof_count.data[lane];
+            for(int d=0;d<count;++d) {
+                const wp::spatial_vector axis=f.S.data[first+d];
+                const float speed=f.vhat.data[first+d];
+                for(int k=0;k<6;++k)tw[k]+=axis[k]*speed;
+            }
+        }
+        int twist_parent=lane<$BODIES?plan.parent.data[lane]:-1;
+        for(int round=0;round<$ROUNDS;++round) {
+            const int source=twist_parent>=0?twist_parent:lane;
+            float ptw[6];
+            for(int k=0;k<6;++k)ptw[k]=__shfl_sync($MASK,tw[k],source$SHFL);
+            const int next=__shfl_sync($MASK,twist_parent,source$SHFL);
+            if(twist_parent>=0)for(int k=0;k<6;++k)tw[k]+=ptw[k];
+            twist_parent=twist_parent>=0?next:-1;
+        }
+        if(lane<$BODIES) {
+            wp::spatial_vector twist;
+            for(int k=0;k<6;++k)twist[k]=tw[k];
+            f.predicted_twist.data[p.joint_child.data[js+lane]]=twist;
+        }
+    }
+#endif
+"""
 
 _EXTERNAL_REDUCE = r"""    if(nonzero)for(int level=$LAST_PARENT;level>=0;--level) {
         for(int local=lane;local<$BODIES;local+=stride)if(plan.depth.data[local]==level) {
@@ -1141,6 +1182,7 @@ def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFER
         data_type = HeldResponse
     elif response != "sparse":
         raise ValueError("Unknown held tree response representation")
+    operations["TWIST_BLOCK"] = _TWIST_BLOCK if (layout.lanes <= 32 and not chain_scan) else ""
     source = _PREDICT
     clocked = os.environ.get("FEATHER_PGS_STAGE_CLOCKS") == "1"
     for k in range(6):

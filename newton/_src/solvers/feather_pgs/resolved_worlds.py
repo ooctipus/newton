@@ -18,6 +18,7 @@ response mask.
 import math
 import os
 
+import numpy as np
 import warp as wp
 
 from .kernels import contact_restitution_fires, mixed_contact_restitution
@@ -50,6 +51,10 @@ class ResolvedWorldInput:
     max_linear_velocity: wp.array[float]
     max_angular_velocity: wp.array[float]
     max_depenetration_velocity: wp.array[float]
+    free_bodies: wp.array[int]
+    # Predictor body twists published by the held-tree owner (use_published != 0).
+    predicted_twist: wp.array[wp.spatial_vector]
+    use_published: int
     dt: float
     beta: float
     speculative_scale: float
@@ -265,6 +270,58 @@ def build_predicted_body_twists(data: ResolvedWorldInput, scratch: ResolvedWorld
         wp.atomic_max(scratch.rejected, world, 1)
 
 
+@wp.kernel(enable_backward=False)
+def check_free_bodies(data: ResolvedWorldInput, scratch: ResolvedWorldScratch):
+    """A free rigid body's predictor must sit inside its velocity caps, or its world keeps its rows."""
+    index = wp.tid()
+    body = data.free_bodies[index]
+    if body < 0 or body >= data.body_to_articulation.shape[0]:
+        wp.atomic_max(scratch.global_invalid, 0, 1)
+        return
+    art = data.body_to_articulation[body]
+    if art < 0 or art >= data.art_to_world.shape[0]:
+        wp.atomic_max(scratch.global_invalid, 0, 1)
+        return
+    world = data.art_to_world[art]
+    if world < 0 or world >= scratch.resolved.shape[0]:
+        wp.atomic_max(scratch.global_invalid, 0, 1)
+        return
+    if scratch.rejected[world] != 0 or data.prescribed_articulation[art] != 0:
+        return
+    if data.body_has_response_dofs[body] == 0 or (data.body_flags[body] & 2) != 0:
+        return
+    start = data.articulation_dof_start[art]
+    count = data.articulation_response_dof_count[art]
+    valid = count == 6 and start >= 0 and start + 6 <= data.v_hat.shape[0]
+    valid = valid and body < data.max_linear_velocity.shape[0] and body < data.max_angular_velocity.shape[0]
+    if valid:
+        for k in range(6):
+            limit = data.max_linear_velocity[body]
+            if k >= 3:
+                limit = data.max_angular_velocity[body]
+            valid = valid and not wp.isnan(limit)
+            if wp.isfinite(limit) and limit > 0.0:
+                valid = valid and wp.abs(data.v_hat[start + k]) <= limit
+    if not valid:
+        wp.atomic_max(scratch.rejected, world, 1)
+
+
+@wp.func
+def _body_twist(body: int, art: int, data: ResolvedWorldInput, scratch: ResolvedWorldScratch):
+    """The endpoint body's predicted twist about its articulation origin.
+
+    Published by the held-tree predictor when every responding articulation
+    is tree-owned; otherwise the classifier's own body pass wrote it.
+    """
+    if data.use_published == 0:
+        return scratch.body_twist[body]
+    if data.prescribed_articulation[art] != 0:
+        return data.body_v_s[body]
+    if data.body_has_response_dofs[body] != 0 and (data.body_flags[body] & 2) == 0:
+        return data.predicted_twist[body]
+    return wp.spatial_vector()
+
+
 @wp.func
 def _endpoint_speed(
     body: int,
@@ -272,12 +329,11 @@ def _endpoint_speed(
     mf: bool,
     lever: wp.vec3,
     normal: wp.vec3,
+    twist: wp.spatial_vector,
     data: ResolvedWorldInput,
-    scratch: ResolvedWorldScratch,
 ):
     value = float(0.0)
     if body >= 0 and art >= 0:
-        twist = scratch.body_twist[body]
         if mf and data.prescribed_articulation[art] == 0 and data.articulation_response_dof_count[art] > 0:
             start = data.articulation_dof_start[art]
             twist = wp.spatial_vector(
@@ -345,10 +401,20 @@ def _check_normal(c: int, raw: RawContacts, data: ResolvedWorldInput, scratch: R
     if scratch.rejected[world] != 0:
         return
     valid = True
-    if body_a >= 0:
-        valid = valid and scratch.body_valid[body_a] != 0
-    if body_b >= 0:
-        valid = valid and scratch.body_valid[body_b] != 0
+    twist_a = wp.spatial_vector()
+    twist_b = wp.spatial_vector()
+    if body_a >= 0 and art_a >= 0:
+        twist_a = _body_twist(body_a, art_a, data, scratch)
+        if data.use_published != 0:
+            valid = valid and _finite6(twist_a)
+        else:
+            valid = valid and scratch.body_valid[body_a] != 0
+    if body_b >= 0 and art_b >= 0:
+        twist_b = _body_twist(body_b, art_b, data, scratch)
+        if data.use_published != 0:
+            valid = valid and _finite6(twist_b)
+        else:
+            valid = valid and scratch.body_valid[body_b] != 0
     n = -raw.normal[c]
     valid = valid and _finite3(n) and wp.dot(n, n) > 0.0
     valid = valid and _finite3(raw.point0[c]) and _finite3(raw.point1[c])
@@ -396,8 +462,8 @@ def _check_normal(c: int, raw: RawContacts, data: ResolvedWorldInput, scratch: R
     if art_b >= 0:
         compatible_b = compatible_b or data.is_free_rigid[art_b] != 0
     mf = compatible_a and compatible_b
-    speed_a = _endpoint_speed(body_a, art_a, mf, lever_a, n, data, scratch)
-    speed_b = _endpoint_speed(body_b, art_b, mf, lever_b, n, data, scratch)
+    speed_a = _endpoint_speed(body_a, art_a, mf, lever_a, n, twist_a, data)
+    speed_b = _endpoint_speed(body_b, art_b, mf, lever_b, n, twist_b, data)
     incident = speed_a - speed_b
     bias = data.speculative_scale * phi / data.dt
     if phi < 0.0:
@@ -551,6 +617,19 @@ class ResolvedWorlds:
         self.scratch.global_invalid = wp.zeros(1, dtype=wp.int32, device=device)
         # A model without rigid velocity or depenetration limits bounds nothing.
         self.unbounded = wp.full(solver.model.body_count, float("inf"), dtype=wp.float32, device=device)
+        # Predicted body twists: published by the held-tree predictor when every
+        # responding, non-prescribed articulation is tree-owned; otherwise the
+        # classifier's own body pass builds them.
+        twists = getattr(solver, "_predicted_twist", None)
+        flags = getattr(solver, "_predicted_twist_arts_host", None)
+        self.twists = twists if twists is not None else wp.zeros(1, dtype=wp.spatial_vector, device=device)
+        self.published = False
+        if twists is not None and flags is not None:
+            responding = solver.articulation_response_dof_count.numpy() > 0
+            prescribed = solver._prescribed_articulation.numpy() != 0
+            self.published = bool(np.all(flags[responding & ~prescribed] != 0))
+        free = solver.free_rigid_body_indices
+        self.free_bodies = free if free is not None else wp.zeros(0, dtype=wp.int32, device=device)
 
     def classify(self, state_in, state_aug, contacts, dt: float) -> None:
         """Refresh the decision after the current predictor and collision completion."""
@@ -594,22 +673,31 @@ class ResolvedWorlds:
         data.restitution_threshold = solver._effective_restitution_velocity_threshold
         data.shared_anchor = int(solver.contact_shared_anchor)
         data.absolute_margin, data.relative_margin = self.absolute_margin, self.relative_margin
+        data.predicted_twist, data.use_published, data.free_bodies = self.twists, int(self.published), self.free_bodies
         raw = RawContacts()
         raw.count = contacts.rigid_contact_count
         for name in ("shape0", "shape1", "point0", "point1", "normal", "margin0", "margin1"):
             setattr(raw, name, getattr(contacts, "rigid_contact_" + name))
         raw.shape_body, raw.shape_mu = solver.model.shape_body, solver.shape_material_mu
         raw.shape_restitution = solver.shape_material_restitution
-        launch(data, raw, self.scratch, contacts.rigid_contact_max, solver.model.device)
+        launch(data, raw, self.scratch, contacts.rigid_contact_max, solver.model.device, published=self.published)
 
 
-def launch(data, raw, scratch, contact_capacity, device, *, enabled=1):
-    """Run the five decision launches in stream order on ``device``."""
+def launch(data, raw, scratch, contact_capacity, device, *, enabled=1, published=False):
+    """Run the decision launches in stream order on ``device``.
+
+    With published twists the body pass is replaced by the free bodies'
+    velocity-cap check; otherwise the body pass builds the twists itself.
+    """
     worlds = scratch.resolved.shape[0]
-    bodies = scratch.body_valid.shape[0]
     wp.launch(reset_world_decisions, dim=worlds, inputs=[enabled, data, scratch], device=device)
     wp.launch(check_world_limits, dim=(worlds, LANES), inputs=[data, scratch], device=device)
-    wp.launch(build_predicted_body_twists, dim=bodies, inputs=[data, scratch], device=device)
+    if published:
+        if data.free_bodies.shape[0] > 0:
+            wp.launch(check_free_bodies, dim=data.free_bodies.shape[0], inputs=[data, scratch], device=device)
+    else:
+        bodies = scratch.body_valid.shape[0]
+        wp.launch(build_predicted_body_twists, dim=bodies, inputs=[data, scratch], device=device)
     threads = max(1, min(int(contact_capacity), 65536))
     wp.launch(check_raw_contact_normals, dim=threads, inputs=[threads, raw, data, scratch], device=device)
     wp.launch(finalize_resolved_worlds, dim=worlds, inputs=[scratch], device=device)
