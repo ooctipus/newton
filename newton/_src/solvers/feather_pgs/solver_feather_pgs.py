@@ -7613,6 +7613,26 @@ class SolverFeatherPGS(SolverBase):
         )
         self._global_inertia_stream = wp.Stream(model.device) if self._compact_inertia_refresh else None
         self._articulation_dynamics_stream = wp.Stream(model.device) if self._async_augmented_drives else None
+        # With independent components the paired factor sweep and the general
+        # matrix-free sweep touch disjoint coordinates of a split world, so
+        # they fork after response preparation and join before publication.
+        paired_overlap = bool(
+            self._paired_components is not None
+            and self.use_parallel_streams
+            and model.device.is_cuda
+            and not model.requires_grad
+            and self._paired_factor_solve_kernel is not None
+            and not self.pgs_debug
+            and not self._mf_warmstart_enabled
+            and not getattr(self, "_pgs_solve_mf_gs_incremental_kernels", ())
+            and getattr(self, "_rb_build_kernel", None) is None
+            and not (
+                _FPGS_CAPTURE or _GROUPED_CHECK or _DEBUG_CACHE_CMP or _INK_CHECK or _WR_CHECK or _FPGS_SYNC_TIMINGS
+            )
+        )
+        self._paired_general_solve_stream = wp.Stream(model.device) if paired_overlap else None
+        self._paired_general_ready = wp.Event(model.device) if paired_overlap else None
+        self._paired_general_done = wp.Event(model.device) if paired_overlap else None
 
     def _init_double_buffer_stream(self):
         """Create a CUDA stream for mass-matrix and active-Jacobian maintenance."""
@@ -8504,6 +8524,12 @@ class SolverFeatherPGS(SolverBase):
                 if row_phase != 0 or soft_relax or defer_dense_response:
                     raise RuntimeError("Paired components require the physical interleaved solve")
                 components.prepare(self, dense_rhs, mf_meta)
+            factor_stream = self._paired_general_solve_stream
+            if factor_stream is not None:
+                if row_phase != 0 or soft_relax or defer_dense_response:
+                    raise RuntimeError("Paired/general overlap requires the physical interleaved solve")
+                wp.get_stream(self.model.device).record_event(self._paired_general_ready)
+                factor_stream.wait_event(self._paired_general_ready)
             if factor_kernel is not None:
                 if row_phase != 0:
                     raise RuntimeError("paired factor-coordinate solve only supports the interleaved row phase")
@@ -8555,9 +8581,11 @@ class SolverFeatherPGS(SolverBase):
                             outputs=[self.v_out],
                             block_dim=64,
                             device=self.model.device,
+                            stream=factor_stream,
                         )
 
-                launch_factor_solve()
+                if factor_stream is None:
+                    launch_factor_solve()
             with self._sync_timed(f"mfgs_phase{row_phase}_iters{phase_iterations}"):
                 mf_gs_inputs = [
                     self._local_general_world_count,
@@ -8715,6 +8743,12 @@ class SolverFeatherPGS(SolverBase):
                         _report_grouped_check("ink_Y_diag", [self.Y_world, self.diag], ink_ref)
                     else:
                         _report_grouped_check("ink_diag", [self.diag], ink_ref[1:])
+            if factor_stream is not None:
+                # Queue the scarce general tail first; the independent paired
+                # grid shares only the pre-solve ready dependency with it.
+                launch_factor_solve()
+                factor_stream.record_event(self._paired_general_done)
+                wp.get_stream(self.model.device).wait_event(self._paired_general_done)
             local_done_events = []
             if launch_local:
                 if local_stream is not None:
