@@ -34,6 +34,7 @@ def make_case(*, free=False):
     data.q, data.v_hat = a([0.0]), a([0.0] * width)
     data.body_to_articulation = a([0, 1], wp.int32)
     data.art_to_world = a([0, 0], wp.int32)
+    data.free_bodies = wp.array([0] if free else [], dtype=wp.int32, device=device)
     data.articulation_dof_start = a([0, width], wp.int32)
     data.articulation_response_dof_count = a([width, 0], wp.int32)
     data.prescribed_articulation = a([0, 1], wp.int32)
@@ -64,13 +65,11 @@ def make_case(*, free=False):
     for name in ("rejected", "resolved", "checked_limits", "checked_normals", "global_invalid"):
         setattr(scratch, name, a([0], wp.int32))
     scratch.minimum_residual = a([0])
-    scratch.body_twist = a(np.zeros((2, 6)), wp.spatial_vector)
-    scratch.body_valid = a([0, 0], wp.int32)
     return data, raw, scratch
 
 
 def evaluate(data, raw, scratch, *, enabled=1):
-    """Execute the same five kernels on CPU, without initializing CUDA."""
+    """Execute the same decision launches on CPU, without initializing CUDA."""
     rw.launch(data, raw, scratch, 1, "cpu", enabled=enabled)
     return int(scratch.resolved.numpy()[0])
 
@@ -82,7 +81,7 @@ class TestResolvedWorlds(unittest.TestCase):
         self.assertEqual(evaluate(data, raw, scratch), 1)
         data.v_hat.assign([-2.0])
         self.assertEqual(evaluate(data, raw, scratch), 0)
-        np.testing.assert_array_equal(scratch.body_twist.numpy()[0], [-2, 0, 0, 0, 0, 0])
+        self.assertAlmostEqual(float(scratch.minimum_residual.numpy()[0]), -1.0, places=6)
         self.assertEqual(int(scratch.checked_normals.numpy()[0]), 1)
 
     def test_position_limits_both_sides_and_speculative_bias(self):
