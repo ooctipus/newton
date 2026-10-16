@@ -192,11 +192,13 @@ def _kinematic_free_joints(model):
 
 def _rollout(model, *, owner, steps=120, swing_joint=0, pgs_mode="matrix_free", rows=None, attrs=None, swing_stride=3):
     env = {
-        "FEATHER_PGS_TREE_FOREST": str(int(getattr(_rollout, "forest", False))),
         "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": str(int(owner)),
         "FEATHER_PGS_TREE_KINETIC_STATE": "0",
-        "FEATHER_PGS_WORLD_SCAN_PUBLICATION": "0",
     }
+    # ``_rollout.forest``: False/True pins the group form; None takes the owner's default rule.
+    forest = getattr(_rollout, "forest", False)
+    if forest is not None:
+        env["FEATHER_PGS_TREE_FOREST"] = str(int(forest))
     with patch.dict(os.environ, env):
         solver = SolverFeatherPGS(
             model,
@@ -325,6 +327,21 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
         np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
         np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
+
+    def test_forest_is_the_default_without_a_diagonal_family(self):
+        """Unset, the forest is taken where every family is held or prescribed, not where one is diagonal."""
+        _rollout.forest = None
+        try:
+            _solver, owner, _cached, _qd = _rollout(
+                _build(wp.get_device("cuda:0"), prescribed=True), owner=True, steps=2
+            )
+            self.assertEqual(len(owner.groups), 1)
+            self.assertEqual(owner.groups[0].layout.root_families, (3, 6, 0))
+            _solver, owner, _cached, _qd = _rollout(_build(wp.get_device("cuda:0"), cabinet=True), owner=True, steps=2)
+            self.assertEqual(len(owner.groups), 2)
+            self.assertTrue(any(group.layout.dofs == _solver._compact_diagonal_mass_size for group in owner.groups))
+        finally:
+            _rollout.forest = False
 
     def test_free_root_trees_above_twelve_coordinates_are_owned(self):
         """An 18-coordinate free-root walker (a quadruped's class) gets a held family and tracks the ordinary route."""

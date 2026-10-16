@@ -306,8 +306,25 @@ class PrescribedRootOperator:
 
 def forest_supported(solver):
     """Whether every world is one forest of consecutive articulations with held or zero families."""
+    return forest_families(solver) is not None
+
+
+def forest_default(solver):
+    """Whether the forest is the default group: supported, with no diagonal-mass family.
+
+    Measured on Franka lift (9+6+prescribed) the forest beats per-size groups
+    by 10% and on Kuka lift (23+6+prescribed) by 1%; on Franka cabinet, whose
+    drawer is a diagonal-mass family the per-size owner applies in a two-lane
+    block, the forest spends the whole group on it and loses 5%.
+    """
+    families = forest_families(solver)
+    return families is not None and solver._compact_diagonal_mass_size not in families
+
+
+def forest_families(solver):
+    """The per-root family sizes of the forest (0 for a prescribed root), or ``None``."""
     if not supported(solver):
-        return False
+        return None
     model = solver.model
     worlds = int(solver.world_count)
     art_world = solver.art_to_world.numpy()
@@ -315,24 +332,24 @@ def forest_supported(solver):
     counts = np.diff([*solver.articulation_dof_start.numpy().tolist(), model.joint_dof_count])
     per_world = [np.flatnonzero(art_world == w) for w in range(worlds)]
     if not per_world or any(len(a) != len(per_world[0]) or len(a) == 0 for a in per_world):
-        return False
+        return None
     if len(per_world[0]) > 4 or len(per_world[0]) < 2:
-        return False
+        return None
     signature = [(int(counts[a]), int(prescribed[a])) for a in per_world[0]]
     for arts in per_world:
         if np.any(np.diff(arts) != 1) or [(int(counts[a]), int(prescribed[a])) for a in arts] != signature:
-            return False
+            return None
     families = [0 if pres else size for size, pres in signature]
     for size in sorted({f for f in families if f}):
         if size == solver._compact_diagonal_mass_size:
             if solver._diagonal_inverse_mass is None:
-                return False
+                return None
         elif not 1 <= size <= 32 or solver._execution_plan.use_diagonal_mass(size):
-            return False
+            return None
         group = solver.group_to_art[size].numpy()
         if len(group) != worlds or not np.array_equal(art_world[group], np.arange(worlds)):
-            return False
-    return True
+            return None
+    return families
 
 
 class ForestHeldOperator:
@@ -510,7 +527,8 @@ class MixedTreeKineticState:
         self._dimensions = (solver.model.joint_count, solver.model.body_count, solver.model.articulation_count)
         # The coverage proof's inputs, compared on the device on notification.
         self._proof = DeviceProof(list(self._coverage_arrays()), solver.model.device)
-        if os.environ.get("FEATHER_PGS_TREE_FOREST", "0") == "1" and forest_supported(solver):
+        forest = os.environ.get("FEATHER_PGS_TREE_FOREST", "1" if forest_default(solver) else "0") == "1"
+        if forest and forest_supported(solver):
             operators = [ForestHeldOperator(solver)]
         else:
             operators = [TreeHeldOperator(solver, size) for size in solver.size_groups]

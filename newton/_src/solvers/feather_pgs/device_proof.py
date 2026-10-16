@@ -55,48 +55,64 @@ def _mix(word: wp.uint32, index: int) -> wp.uint32:
 
 
 @wp.func
-def _slot_sums(current: wp.array[wp.uint32], size: int, index: int, slot: int, sums: wp.array[wp.uint32]):
-    if index < size:
+def _slot_sums(
+    current: wp.array[wp.uint32], size: int, thread: int, threads: int, slot: int, sums: wp.array[wp.uint32]
+):
+    """Sum this thread's strided words of one array, then add once to each of its two sums."""
+    if thread >= size:
+        return
+    first = wp.uint32(0)
+    second = wp.uint32(0)
+    index = thread
+    while index < size:
         value = _mix(current[index], index)
-        wp.atomic_add(sums, 2 * slot, value)
-        wp.atomic_add(sums, 2 * slot + 1, _mix(value, index + 1))
+        first += value
+        second += _mix(value, index + 1)
+        index += threads
+    wp.atomic_add(sums, 2 * slot, first)
+    wp.atomic_add(sums, 2 * slot + 1, second)
+
+
+# Words summed per thread before its one atomic per sum: the position-sensitive
+# word hashes commute, so the stride only bounds atomic traffic.
+_WORDS_PER_THREAD = 32
 
 
 @wp.kernel(module="unique", enable_backward=False)
-def _checksum_words(words: ProofWords, sums: wp.array[wp.uint32]):
-    """One thread per word of the largest array; every slot is summed at that index."""
+def _checksum_words(words: ProofWords, threads: int, sums: wp.array[wp.uint32]):
+    """Each thread sums a stride of every array; two atomics per array per thread."""
     index = wp.tid()
-    _slot_sums(words.c0, words.sizes[0], index, 0, sums)
+    _slot_sums(words.c0, words.sizes[0], index, threads, 0, sums)
     if words.count > 1:
-        _slot_sums(words.c1, words.sizes[1], index, 1, sums)
+        _slot_sums(words.c1, words.sizes[1], index, threads, 1, sums)
     if words.count > 2:
-        _slot_sums(words.c2, words.sizes[2], index, 2, sums)
+        _slot_sums(words.c2, words.sizes[2], index, threads, 2, sums)
     if words.count > 3:
-        _slot_sums(words.c3, words.sizes[3], index, 3, sums)
+        _slot_sums(words.c3, words.sizes[3], index, threads, 3, sums)
     if words.count > 4:
-        _slot_sums(words.c4, words.sizes[4], index, 4, sums)
+        _slot_sums(words.c4, words.sizes[4], index, threads, 4, sums)
     if words.count > 5:
-        _slot_sums(words.c5, words.sizes[5], index, 5, sums)
+        _slot_sums(words.c5, words.sizes[5], index, threads, 5, sums)
     if words.count > 6:
-        _slot_sums(words.c6, words.sizes[6], index, 6, sums)
+        _slot_sums(words.c6, words.sizes[6], index, threads, 6, sums)
     if words.count > 7:
-        _slot_sums(words.c7, words.sizes[7], index, 7, sums)
+        _slot_sums(words.c7, words.sizes[7], index, threads, 7, sums)
     if words.count > 8:
-        _slot_sums(words.c8, words.sizes[8], index, 8, sums)
+        _slot_sums(words.c8, words.sizes[8], index, threads, 8, sums)
     if words.count > 9:
-        _slot_sums(words.c9, words.sizes[9], index, 9, sums)
+        _slot_sums(words.c9, words.sizes[9], index, threads, 9, sums)
     if words.count > 10:
-        _slot_sums(words.c10, words.sizes[10], index, 10, sums)
+        _slot_sums(words.c10, words.sizes[10], index, threads, 10, sums)
     if words.count > 11:
-        _slot_sums(words.c11, words.sizes[11], index, 11, sums)
+        _slot_sums(words.c11, words.sizes[11], index, threads, 11, sums)
     if words.count > 12:
-        _slot_sums(words.c12, words.sizes[12], index, 12, sums)
+        _slot_sums(words.c12, words.sizes[12], index, threads, 12, sums)
     if words.count > 13:
-        _slot_sums(words.c13, words.sizes[13], index, 13, sums)
+        _slot_sums(words.c13, words.sizes[13], index, threads, 13, sums)
     if words.count > 14:
-        _slot_sums(words.c14, words.sizes[14], index, 14, sums)
+        _slot_sums(words.c14, words.sizes[14], index, threads, 14, sums)
     if words.count > 15:
-        _slot_sums(words.c15, words.sizes[15], index, 15, sums)
+        _slot_sums(words.c15, words.sizes[15], index, threads, 15, sums)
 
 
 def fingerprint(array):
@@ -130,7 +146,7 @@ class DeviceProof:
         if views:
             self._sums = wp.zeros(2 * _SLOTS, dtype=wp.uint32, device=device)
             self._sizes = wp.array([view.shape[0] for view in views], dtype=int, device=device)
-            self._largest = max(view.shape[0] for view in views)
+            self._threads = -(-max(view.shape[0] for view in views) // _WORDS_PER_THREAD)
             self._frozen = self._checksums(views)
 
     @staticmethod
@@ -152,7 +168,7 @@ class DeviceProof:
         for slot in range(_SLOTS):
             setattr(words, f"c{slot}", views[min(slot, len(views) - 1)])
         self._sums.zero_()
-        wp.launch(_checksum_words, dim=self._largest, inputs=[words, self._sums], device=self.device)
+        wp.launch(_checksum_words, dim=self._threads, inputs=[words, self._threads, self._sums], device=self.device)
         return self._sums.numpy()[: 2 * len(views)].tolist()
 
     def validate(self, current, what):
