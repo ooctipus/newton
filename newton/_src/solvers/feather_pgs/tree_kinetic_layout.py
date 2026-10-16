@@ -144,6 +144,8 @@ class TreeLayout:
             "LANES": self.lanes,
             # Warp-shuffle scans: the shuffle width of a packed group (a full warp needs none).
             "SHFL": f",{self.lanes}" if self.lanes < 32 else "",
+            # Window sums of 1, 2, 4, ... lanes a lane group can hold (interval reductions).
+            "WINDOWS": self.lanes.bit_length() if self.lanes <= 32 else 6,
             "PACK": self.pack,
             "BODIES": self.bodies,
             "DOFS": self.dofs,

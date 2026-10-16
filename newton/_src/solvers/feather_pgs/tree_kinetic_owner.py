@@ -35,6 +35,37 @@ _MAPPING_FIELDS = ("group_to_art", "art_to_world", "art_dof_start", "free_root_j
 _fingerprint = fingerprint
 
 
+def dfs_intervals(parent):
+    """Depth-first order of a parent-first forest and, per position, the end of its subtree.
+
+    Children are visited in increasing local index; roots (parent -1) in
+    increasing local index. Returns ``order`` (position to body) and ``end``
+    (position to one past the subtree's last position), so the subtree of the
+    body at position ``p`` is exactly the interval ``[p, end[p])``.
+    """
+    parent = np.asarray(parent, dtype=np.int64)
+    count = int(parent.size)
+    children = [[] for _ in range(count)]
+    for body in range(count):
+        if parent[body] >= 0:
+            children[int(parent[body])].append(body)
+    order, end = [], np.zeros(count, np.int32)
+    stack = [(root, False) for root in range(count - 1, -1, -1) if parent[root] < 0]
+    starts = {}
+    while stack:
+        body, done = stack.pop()
+        if done:
+            end[starts[body]] = len(order)
+            continue
+        starts[body] = len(order)
+        order.append(body)
+        stack.append((body, True))
+        stack.extend((child, False) for child in reversed(children[body]))
+    if len(order) != count:
+        raise ValueError("Tree kinetic state requires a parent-first forest")
+    return np.asarray(order, np.int32), end
+
+
 class TreeKineticState:
     """Own one current cache with device state-bank tags and a separate held W."""
 
@@ -66,7 +97,7 @@ class TreeKineticState:
         self.copy_reuse = copy_reuse
         self.group_count = sparse_owner.plan.group_to_art.size
         if os.environ.get("FEATHER_PGS_STAGE_CLOCKS") == "1":
-            solver._stage_clocks = wp.zeros((self.group_count, 16), dtype=wp.int64, device=solver.model.device)
+            solver._stage_clocks = wp.zeros((self.group_count, 28), dtype=wp.int64, device=solver.model.device)
         self._cache_to_art = sparse_owner.plan.group_to_art.reshape((self.group_count, 1))
         bodies, dofs = self.layout.bodies, self.layout.dofs
         jump = np.empty((self.layout.rounds, bodies), np.int32)
@@ -78,6 +109,7 @@ class TreeKineticState:
         for body in range(bodies):
             children.extend(np.flatnonzero(parent == body)[::-1].tolist())
             offsets.append(len(children))
+        dfs_order, dfs_end = dfs_intervals(parent)
         if len(children) != bodies - len(self.layout.roots):
             raise ValueError("Tree kinetic state requires every true parent edge")
 
@@ -168,6 +200,8 @@ class TreeKineticState:
         if chain_host is None:
             # Chain-scan plans keep their own struct; forests are kinetic plans only.
             for name, values in (
+                ("dfs_order", dfs_order),
+                ("dfs_end", dfs_end),
                 ("arts", arts),
                 ("root_of", root_of),
                 ("root_local", root_locals),

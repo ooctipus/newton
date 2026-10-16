@@ -31,6 +31,10 @@ class KineticPlan:
     children: wp.array[int]
     q_index: wp.array[int]
     root_slot: wp.array[int]
+    # Depth-first order of the local bodies and, per lane of that order, the
+    # lane past its subtree: every subtree is the lane interval [lane, dfs_end).
+    dfs_order: wp.array[int]
+    dfs_end: wp.array[int]
     # Forest groups: the articulation of each root, each body's root index,
     # each root's local body, each free root's local body and coordinate
     # offset, and whether a coordinate takes passive springs.
@@ -565,6 +569,46 @@ _LEVEL_REDUCE = r"""    for(int level=$LAST_PARENT;level>=0;--level) {
     }
 """
 
+# Subtree sums for warp-sized layouts: lanes walk the bodies in depth-first
+# order, so a subtree is a lane interval. Each lane builds the sums of the
+# 1, 2, 4, ... lanes starting at itself (shuffle-down, zero past the group),
+# then assembles its interval from the binary digits of its length: one
+# shuffle per digit, additions only, no barrier and no cancellation. The
+# CPU twin keeps the depth-level loop.
+_INTERVAL_REDUCE = (
+    r"""
+#if defined(__CUDA_ARCH__)
+    {
+    const int dfs_body=lane<$BODIES?plan.dfs_order.data[lane]:-1;
+    const int dfs_len=lane<$BODIES?plan.dfs_end.data[lane]-lane:0;
+    const int dfs_count=refresh?19:6;
+    for(int c=0;c<19;++c) {
+        if(c>=dfs_count)break;
+        const int slot=c<6?$WRENCH+6*dfs_body+c:$MOMENT+13*dfs_body+(c-6);
+        float w[$WINDOWS];
+        w[0]=dfs_body>=0?s[slot]:0.0f;
+        #pragma unroll
+        for(int b=1;b<$WINDOWS;++b){
+            const float t=__shfl_down_sync($MASK,w[b-1],1<<(b-1)$SHFL);
+            w[b]=w[b-1]+(lane+(1<<(b-1))<$LANES?t:0.0f);
+        }
+        float sum=0.0f;
+        int offset=lane;
+        #pragma unroll
+        for(int b=$WINDOWS-1;b>=0;--b){
+            const float t=__shfl_sync($MASK,w[b],offset$SHFL);
+            if((dfs_len>>b)&1){sum+=t;offset+=1<<b;}
+        }
+        if(dfs_body>=0)s[slot]=sum;
+    }
+    $SYNC;
+    }
+#else
+"""
+    + _LEVEL_REDUCE
+    + "#endif\n"
+)
+
 _EXTERNAL_REDUCE = r"""    if(nonzero)for(int level=$LAST_PARENT;level>=0;--level) {
         for(int local=lane;local<$BODIES;local+=stride)if(plan.depth.data[local]==level) {
             for(int pos=plan.children_offsets.data[local];pos<plan.children_offsets.data[local+1];++pos) {
@@ -611,8 +655,13 @@ def get_helpers(layout: TreeLayout = REFERENCE_LAYOUT, chain_scan: bool = False,
     )
     pose_source = layout.render(tree_chain_scan._POSE if chain_scan else _POSE_SHFL if register_scan else _POSE)
     motion_source = layout.render(tree_chain_scan._MOTION if chain_scan else _MOTION_SHFL if register_scan else _MOTION)
+    interval_reduce = (
+        not chain_scan and layout.lanes <= 32 and os.environ.get("FEATHER_PGS_TREE_LEVEL_REDUCE", "0") != "1"
+    )
     reduction = (
-        tree_chain_scan.reduction_source(moments=True, layout=layout) if chain_scan else layout.render(_LEVEL_REDUCE)
+        tree_chain_scan.reduction_source(moments=True, layout=layout)
+        if chain_scan
+        else layout.render(_INTERVAL_REDUCE if interval_reduce else _LEVEL_REDUCE)
     )
     collect_text = _COLLECT.replace("$REDUCE", reduction)
     clocked = os.environ.get("FEATHER_PGS_STAGE_CLOCKS") == "1"
@@ -788,6 +837,15 @@ def get_state_kernel(
             _stamp_source(cache, group, data.joint_q, data.joint_qd)
 """
         copy_store = "_copy_store(plan, cache, group, ds, q, qd, data.joint_child, js, data.body_q, data.body_qd)\n"
+    motion_clock = ["pass"] * 4
+    if os.environ.get("FEATHER_PGS_STAGE_CLOCKS") == "1":
+        motion_clock = [f"clock_m{k} = _clock()" for k in range(4)]
+        motion_clock[3] += (
+            "\n    if local == 0 and data.stage_clocks.shape[0] > group:\n"
+            "        data.stage_clocks[group, 22] = clock_m1 - clock_m0\n"
+            "        data.stage_clocks[group, 23] = clock_m2 - clock_m1\n"
+            "        data.stage_clocks[group, 24] = clock_m3 - clock_m2"
+        )
     stamp = "_stamp_source(cache, group, q, qd)"
     if motion_velocity:
         # An override source must not be reused when a later begin returns to
@@ -868,8 +926,9 @@ origin = _load_origin(address, 0)
 shift = _load_origin(address, 1)
 {motion_bind}
 """,
-        motion="""
+        motion=f"""
 for local in range(lane, bodies, stride):
+    {motion_clock[0]}
     joint = js + local
     parent = plan.parent[local]
     if wp.static(forest):
@@ -881,6 +940,7 @@ for local in range(lane, bodies, stride):
     else:
         anchor = wp.transform(wp.transform_get_translation(anchor) - shift, wp.transform_get_rotation(anchor))
     anchor = wp.transform(wp.transform_get_translation(anchor) - origin, wp.transform_get_rotation(anchor))
+    {motion_clock[1]}
     velocity = kernels.jcalc_motion(
         data.joint_type[joint],
         data.joint_axis,
@@ -891,11 +951,13 @@ for local in range(lane, bodies, stride):
         data.joint_qd_start[joint],
         data.joint_S_s,
     )
+    {motion_clock[2]}
     start = data.joint_qd_start[joint]
     count = data.joint_dof_dim[joint, 0] + data.joint_dof_dim[joint, 1]
     for k in range(count):
         _store_axis(address, start - ds + k, data.joint_S_s[start + k])
     _store_motion(address, local, velocity)
+    {motion_clock[3]}
 _sync()
 scan_motion(address, plan)
 """,
