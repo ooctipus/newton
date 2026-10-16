@@ -28,7 +28,7 @@ $FORCE_POINTER
 $FORCE_INIT
     for (int schedule_index = lane; schedule_index < $LOWER; schedule_index += 32) {
         const int packed = lower_schedule.data[schedule_index];
-        const int element = packed & 255;
+        const int element = $ELEMENT;
         const int row = element / $DOFS;
         const int col = element - row * $DOFS;
 $MASS_INPUT
@@ -142,8 +142,12 @@ def get_kernel(
     group to the geometry row it reads.
     """
     size, warps_per_block = int(size), int(warps_per_block)
-    if not 1 <= size <= 16 or not 1 <= warps_per_block <= 32:
-        raise ValueError("Small Cholesky requires 1..16 DOFs and 1..32 warps per block")
+    # The composite schedule packs the element, its source and its projection
+    # into one byte each; the geometric schedule is a plain element list, so a
+    # geometric factor reaches the 32 coordinates one lane per row can write.
+    limit = 32 if geometric_index else 16
+    if not 1 <= size <= limit or not 1 <= warps_per_block <= 32:
+        raise ValueError(f"Small Cholesky requires 1..{limit} DOFs and 1..32 warps per block")
     if geometric_index and (not geometric or len(geometric_index) != size * size or min(geometric_index) < -1):
         raise ValueError("Geometric factor requires a complete physical matrix index")
     if (geometric_stride or geometric_group) and not geometric_index:
@@ -173,6 +177,9 @@ def get_kernel(
     snippet = _FACTOR.substitute(
         DOFS=size,
         ELEMENTS=elements,
+        # A packed composite schedule keeps the element in its low byte; a
+        # geometric schedule above sixteen coordinates is a plain element list.
+        ELEMENT="packed & 255" if size <= 16 else "packed & 1023",
         FACTOR_STORAGE=warps_per_block * elements,
         LOWER=size * (size + 1) // 2,
         FORCE_STORAGE="" if geometric else f"    __shared__ float forces[{warps_per_block * size * 6}];",

@@ -17,17 +17,55 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 DT = 1.0 / 240.0
 
 
-def _build(device, worlds=4, mimic=False, prescribed=False, shoulder=False):
+def _add_quadruped(scene, cfg):
+    """A free-root trunk with four three-joint legs: 13 bodies, 18 coordinates (a quadruped's class)."""
+    stance = wp.transform(wp.vec3(-0.8, 0.0, 0.42), wp.quat_identity())
+    trunk = scene.add_link(xform=stance, mass=6.0, inertia=wp.mat33(np.eye(3) * 0.2), lock_inertia=True)
+    scene.add_shape_box(trunk, hx=0.25, hy=0.12, hz=0.05, cfg=cfg)
+    joints = [scene.add_joint_free(child=trunk, parent_xform=stance)]
+    for sx, sy in ((1, 1), (1, -1), (-1, 1), (-1, -1)):
+        parent = trunk
+        for link in range(3):
+            body = scene.add_link(
+                mass=0.6 - 0.1 * link, inertia=wp.mat33(np.eye(3) * (0.01 - 0.002 * link)), lock_inertia=True
+            )
+            if link == 0:
+                origin, axis = wp.vec3(0.2 * sx, 0.12 * sy, 0.0), newton.Axis.X
+            else:
+                origin, axis = wp.vec3(0.0, 0.0, -0.18), newton.Axis.Y
+            joints.append(
+                scene.add_joint_revolute(
+                    parent=parent,
+                    child=body,
+                    axis=axis,
+                    parent_xform=wp.transform(origin, wp.quat_identity()),
+                    target_ke=40.0,
+                    target_kd=3.0,
+                    limit_lower=-1.5,
+                    limit_upper=1.5,
+                )
+            )
+            if link:
+                scene.add_shape_capsule(parent, radius=0.02, half_height=0.08, cfg=cfg)
+            parent = body
+        scene.add_shape_sphere(parent, radius=0.03, cfg=cfg)
+    scene.add_articulation(joints)
+
+
+def _build(device, worlds=4, mimic=False, prescribed=False, shoulder=False, quadruped=False):
     """Per world: a fixed-base three-joint arm over a free box resting on the ground.
 
     With ``mimic`` the third arm joint follows the second through a mimic row,
     as a gripper finger follows its leader. With ``prescribed`` a kinematic
     free body (a moving tray) sits beside the box, as a goal marker or
-    conveyor does in manipulation scenes.
+    conveyor does in manipulation scenes. With ``quadruped`` a free-root
+    18-coordinate walker stands beside them.
     """
     scene = newton.ModelBuilder()
     cfg = scene.default_shape_cfg.copy()
     cfg.mu = 0.6
+    if quadruped:
+        _add_quadruped(scene, cfg)
     # Cached trees require a fixed (or free) root: a base link welded to the world.
     parent = scene.add_link(mass=2.0, inertia=wp.mat33(np.eye(3) * 0.1), lock_inertia=True)
     joints = [
@@ -85,7 +123,8 @@ def _build(device, worlds=4, mimic=False, prescribed=False, shoulder=False):
     builder.replicate(scene, worlds, spacing=(3.0, 3.0, 0.0))
     builder.add_ground_plane()
     model = builder.finalize(device=device)
-    model.rigid_contact_max = 256
+    # The walker's thirteen shapes multiply the candidate pairs per world.
+    model.rigid_contact_max = 2048 if quadruped else 256
     return model
 
 
@@ -102,7 +141,7 @@ def _kinematic_free_joints(model):
     return model.joint_q_start.numpy()[joints], model.joint_qd_start.numpy()[joints]
 
 
-def _rollout(model, *, owner, steps=120, swing_joint=0, pgs_mode="matrix_free"):
+def _rollout(model, *, owner, steps=120, swing_joint=0, pgs_mode="matrix_free", rows=None):
     env = {
         "FEATHER_PGS_TREE_FOREST": str(int(getattr(_rollout, "forest", False))),
         "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": str(int(owner)),
@@ -119,6 +158,7 @@ def _rollout(model, *, owner, steps=120, swing_joint=0, pgs_mode="matrix_free"):
             enable_joint_limits=True,
             update_mass_matrix_interval=2,
             friction_anchor_beta=0.0,
+            **({} if rows is None else {"dense_max_constraints": rows}),
         )
     state_owner = getattr(solver, "_tree_kinetic_state", None)
     pipeline = newton.CollisionPipeline(model)
@@ -234,6 +274,29 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
         np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
         np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
+
+    def test_free_root_trees_above_twelve_coordinates_are_owned(self):
+        """An 18-coordinate free-root walker (a quadruped's class) gets a held family and tracks the ordinary route."""
+        model = _build(wp.get_device("cuda:0"), quadruped=True)
+        # The walker's contact and limit rows need the row budget the quadruped recipes set.
+        plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False, rows=256)
+        self.assertIsNone(plain_owner)
+        self.assertIsNone(plain_solver._sparse_mass_matrix_size)
+        self.assertIn(18, plain_solver.size_groups)
+        self.assertFalse(plain_solver.constraint_capacity_status()["dense"])
+        _owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, rows=256)
+        self.assertIsInstance(owner, MixedTreeKineticState)
+        self.assertEqual(sorted(group.layout.dofs for group in owner.groups), [3, 6, 18])
+        self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
+        # Same physics through both routes; the walker's twenty-odd contact rows
+        # per world accumulate a little more factor-order noise than the arm scenes.
+        np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=3.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=3.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached_qd, plain_qd, atol=3.0e-3, rtol=0.0)
+        # The walker stands: its trunk stays above its resting height after the rollout.
+        final = cached[-1].reshape(model.world_count, -1, 7)
+        self.assertTrue(np.all(final[:, 0, 2] > 0.2))
+        self.assertEqual(int(sum(int(group.status.numpy().sum()) for group in owner.groups)), 0)
 
     def test_mimic_rows_compose_with_the_mixed_owner(self):
         """Mimic rows are ordinary matrix-free rows over the held factors: the owner admits them and tracks the plain route."""

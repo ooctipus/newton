@@ -70,7 +70,8 @@ def supported(solver):
         # Franka held owner; they need nothing from the predictor itself.
         and not solver._connect_count
         and not solver._has_loop_joints
-        and not solver.lazy_kinematics
+        # lazy_kinematics only acts with the fused world-dynamics kernel,
+        # which is excluded below; the owner publishes its own kinematics.
         and not solver._fused_k1
         and solver._fk_id_cache_available
         and solver._async_augmented_drives
@@ -88,9 +89,12 @@ def supported(solver):
                 "_prismatic_publication",
             )
         )
+        # Every family refreshes through the geometric small Cholesky (one lane
+        # per factor row, up to 32 coordinates) into the solver's dense factor
+        # of the same shape; a diagonal-mass size keeps its compact inverse.
         and all(
             size == solver._compact_diagonal_mass_size
-            or (1 <= size <= 12 and solver._crba_cholesky_warp_kernels_by_size.get(size) is not None)
+            or (1 <= size <= 32 and not solver._execution_plan.use_diagonal_mass(size))
             for size in solver.size_groups
         )
     )
