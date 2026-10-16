@@ -36,7 +36,7 @@ def _rollout(model, *, serial, steps=90):
         "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": "1",
         "FEATHER_PGS_TREE_KINETIC_STATE": "0",
         "FEATHER_PGS_RESOLVED_WORLDS": "0",
-        "FEATHER_PGS_TREE_SERIAL_SOLVE": str(int(serial)),
+        "FEATHER_PGS_TREE_REFERENCE": str(int(serial)),
     }
     with patch.dict(os.environ, env):
         solver = SolverFeatherPGS(

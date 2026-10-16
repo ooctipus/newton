@@ -79,7 +79,7 @@ def _rollout(model, *, level_loop, steps=60):
         "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": "1",
         "FEATHER_PGS_TREE_KINETIC_STATE": "0",
         "FEATHER_PGS_RESOLVED_WORLDS": "0",
-        "FEATHER_PGS_TREE_LEVEL_REDUCE": str(int(level_loop)),
+        "FEATHER_PGS_TREE_REFERENCE": str(int(level_loop)),
     }
     with patch.dict(os.environ, env):
         solver = SolverFeatherPGS(

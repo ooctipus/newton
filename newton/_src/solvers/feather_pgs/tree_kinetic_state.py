@@ -691,14 +691,10 @@ def get_helpers(layout: TreeLayout = REFERENCE_LAYOUT, chain_scan: bool = False,
     plan_type = tree_chain_scan.ChainPlan if chain_scan else KineticPlan
     # A warp-sized layout scans in registers through shuffles; two-warp layouts
     # keep the shared-memory jump table.
-    register_scan = (
-        not chain_scan and layout.lanes <= 32 and os.environ.get("FEATHER_PGS_TREE_SHUFFLE_SCAN", "1") == "1"
-    )
+    register_scan = not chain_scan and layout.lanes <= 32 and os.environ.get("FEATHER_PGS_TREE_REFERENCE") != "1"
     pose_source = layout.render(tree_chain_scan._POSE if chain_scan else _POSE_SHFL if register_scan else _POSE)
     motion_source = layout.render(tree_chain_scan._MOTION if chain_scan else _MOTION_SHFL if register_scan else _MOTION)
-    interval_reduce = (
-        not chain_scan and layout.lanes <= 32 and os.environ.get("FEATHER_PGS_TREE_LEVEL_REDUCE", "0") != "1"
-    )
+    interval_reduce = not chain_scan and layout.lanes <= 32 and os.environ.get("FEATHER_PGS_TREE_REFERENCE") != "1"
     reduction = (
         tree_chain_scan.reduction_source(moments=True, layout=layout)
         if chain_scan
@@ -1123,9 +1119,9 @@ def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFER
         # (one lane per row, one shuffle per step); larger families and the
         # CPU twin keep the serial one-lane law. A prescribed root (family 0)
         # responds with zero and a diagonal-mass root (negative family) with
-        # its stored inverse. FEATHER_PGS_TREE_SERIAL_SOLVE=1 keeps the serial
-        # form on CUDA for comparison.
-        serial_only = os.environ.get("FEATHER_PGS_TREE_SERIAL_SOLVE") == "1"
+        # its stored inverse. FEATHER_PGS_TREE_REFERENCE=1 keeps the serial
+        # form on CUDA for comparison (with the level reduction and shared-memory scans).
+        serial_only = os.environ.get("FEATHER_PGS_TREE_REFERENCE") == "1"
         roots = len(layout.roots)
         if not layout.forest:
             families = [(0, layout.dofs, f"d.lower.data+group*{layout.dofs**2}", layout.dofs)]
