@@ -86,13 +86,18 @@ class TreeKineticState:
         root_lookup = {int(joint): slot for slot, joint in enumerate(free_roots)}
         root_slot = np.empty(self.group_count, np.int32)
         q_index = np.full((self.group_count, dofs), -1, np.int32)
+        # Coordinate of each DOF: the joint's first coordinate plus the DOF's
+        # offset within its joint (one coordinate per DOF; a ball joint's
+        # quaternion is never a spring coordinate, its stiffness is zero).
+        dof_joint = np.asarray(host["dof_joint"], dtype=np.int64)
+        dof_offset = np.arange(dofs) - np.array([np.flatnonzero(dof_joint == dof_joint[d])[0] for d in range(dofs)])
         for group, art in enumerate(group_to_art):
             start = int(starts[art])
             if self.layout.root_dofs and start not in root_lookup:
                 raise ValueError("Tree kinetic state is missing a free-root transport slot")
             root_slot[group] = root_lookup.get(start, -1)
             for dof in range(self.layout.root_dofs, dofs):
-                q_index[group, dof] = q_starts[start + host["dof_joint"][dof]]
+                q_index[group, dof] = q_starts[start + dof_joint[dof]] + dof_offset[dof]
         if chain_scan_default is None:
             chain_scan_default = os.environ.get("FEATHER_PGS_G1_CHAIN_SCAN", "0") == "1"
         self.chain_scan_requested = os.environ.get("FEATHER_PGS_TREE_CHAIN_SCAN", str(int(chain_scan_default))) == "1"

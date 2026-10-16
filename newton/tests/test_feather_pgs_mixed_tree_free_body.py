@@ -17,7 +17,7 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 DT = 1.0 / 240.0
 
 
-def _build(device, worlds=4, mimic=False, prescribed=False):
+def _build(device, worlds=4, mimic=False, prescribed=False, shoulder=False):
     """Per world: a fixed-base three-joint arm over a free box resting on the ground.
 
     With ``mimic`` the third arm joint follows the second through a mimic row,
@@ -42,18 +42,35 @@ def _build(device, worlds=4, mimic=False, prescribed=False):
             com=wp.vec3(0.0, 0.0, -0.05),
             lock_inertia=True,
         )
-        joints.append(
-            scene.add_joint_revolute(
-                parent=parent,
-                child=body,
-                axis=newton.Axis.Y if link != 1 else newton.Axis.X,
-                parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.3 if link == 0 else -0.2), wp.quat_identity()),
-                target_ke=30.0,
-                target_kd=2.0,
-                limit_lower=-1.5,
-                limit_upper=1.5,
+        parent_xform = wp.transform(wp.vec3(0.0, 0.0, 0.3 if link == 0 else -0.2), wp.quat_identity())
+        if shoulder and link == 1:
+            # A two-coordinate D6 joint (a shoulder or hip): the descendant
+            # joint class that humanoid-type robots carry.
+            dof = newton.ModelBuilder.JointDofConfig
+            joints.append(
+                scene.add_joint_d6(
+                    parent=parent,
+                    child=body,
+                    angular_axes=[
+                        dof(axis=newton.Axis.X, target_ke=30.0, target_kd=2.0, limit_lower=-1.5, limit_upper=1.5),
+                        dof(axis=newton.Axis.Y, target_ke=30.0, target_kd=2.0, limit_lower=-1.5, limit_upper=1.5),
+                    ],
+                    parent_xform=parent_xform,
+                )
             )
-        )
+        else:
+            joints.append(
+                scene.add_joint_revolute(
+                    parent=parent,
+                    child=body,
+                    axis=newton.Axis.Y if link != 1 else newton.Axis.X,
+                    parent_xform=parent_xform,
+                    target_ke=30.0,
+                    target_kd=2.0,
+                    limit_lower=-1.5,
+                    limit_upper=1.5,
+                )
+            )
         parent = body
     scene.add_shape_capsule(parent, radius=0.03, half_height=0.1, cfg=cfg)
     scene.add_articulation(joints)
@@ -182,6 +199,19 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
         final = cached[-1].reshape(model.world_count, -1, 7)
         self.assertTrue(np.all(final[:, 4, 2] > 0.04))
+
+    def test_multi_coordinate_descendant_joints_are_owned(self):
+        """An arm with a two-coordinate D6 shoulder (Humanoid's joint class) is owned and tracks the ordinary route."""
+        model = _build(wp.get_device("cuda:0"), shoulder=True)
+        _plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False)
+        self.assertIsNone(plain_owner)
+        _owner_solver, owner, cached, cached_qd = _rollout(model, owner=True)
+        self.assertIsInstance(owner, MixedTreeKineticState)
+        self.assertEqual(sorted(group.layout.dofs for group in owner.groups), [4, 6])
+        self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
+        np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
 
     def test_mimic_rows_compose_with_the_mixed_owner(self):
         """Mimic rows are ordinary matrix-free rows over the held factors: the owner admits them and tracks the plain route."""

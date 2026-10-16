@@ -110,8 +110,18 @@ def make_plan(model, operator, *, complete=True):
         types[0, 0] not in (int(JointType.FREE), int(JointType.FIXED)) and not locked_root
     ):
         raise ValueError("Cached trees require a free, fixed or zero-coordinate D6 root")
-    if not np.all(np.isin(types[:, 1:], [int(JointType.FIXED), int(JointType.REVOLUTE), int(JointType.PRISMATIC)])):
-        raise ValueError("Cached trees require scalar or fixed descendant joints")
+    # Descendants may carry one or several coordinates: the motion scan stores
+    # one axis per coordinate through jcalc_motion and the integrator handles
+    # every joint type; the mass plan takes per-body coordinate counts.
+    descendants = (
+        int(JointType.FIXED),
+        int(JointType.REVOLUTE),
+        int(JointType.PRISMATIC),
+        int(JointType.D6),
+        int(JointType.BALL),
+    )
+    if not np.all(np.isin(types[:, 1:], descendants)):
+        raise ValueError("Cached trees require fixed, scalar, D6 or ball descendant joints")
     if not np.all(counts == counts[0]) or not np.all(
         qd[joints] - qd[starts[group, None]] == qd[joints[0]] - qd[starts[group[0]]]
     ):
