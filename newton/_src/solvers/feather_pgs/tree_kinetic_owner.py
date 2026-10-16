@@ -10,8 +10,16 @@ import os
 import numpy as np
 import warp as wp
 
+from ...sim import ModelFlags
 from . import cached_state_binding, world_scan_owner
 from .tree_kinetic_plan import cooperative_block_dim, make_plan
+
+_NUMERIC_FLAGS = int(
+    ModelFlags.JOINT_DOF_PROPERTIES
+    | ModelFlags.BODY_INERTIAL_PROPERTIES
+    | ModelFlags.SHAPE_PROPERTIES
+    | ModelFlags.MODEL_PROPERTIES
+)
 
 _PLAN_FIELDS = (
     *world_scan_owner.PLAN_FIELDS,
@@ -178,8 +186,17 @@ class TreeKineticState:
             model.joint_dof_count,
         )
 
-    def validate_model(self):
-        """Reject changed baked ownership before notification invalidates any state."""
+    def validate_model(self, flags=None):
+        """Reject changed baked ownership before notification invalidates any state.
+
+        Numeric notifications (joint DOF, inertial, shape and model properties)
+        change values the caches refresh from, never parents, axes, anchors or
+        body membership, so they skip the topology fingerprints, which read
+        every plan array back to the host; Isaac Lab issues such notifications
+        on every reset.
+        """
+        if flags is not None and int(flags) != 0 and int(flags) & ~_NUMERIC_FLAGS == 0:
+            return
         if self._dimensions() != self._plan_dimensions:
             raise RuntimeError("Tree kinetic dimensions changed; reconstruct and recapture")
         make_plan(self.solver.model, self.sparse, complete=self.complete)

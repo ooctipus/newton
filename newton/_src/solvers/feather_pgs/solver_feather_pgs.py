@@ -3486,7 +3486,7 @@ class SolverFeatherPGS(SolverBase):
             self._sparse_factor.validate_notification(flags)
         tree_kinetic = getattr(self, "_tree_kinetic_state", None)
         if tree_kinetic is not None and self._sparse_factor is None:
-            tree_kinetic.validate_model()
+            tree_kinetic.validate_model(flags)
         kinetic = getattr(self, "_kinetic_world", None)
         joint_world = getattr(self, "_joint_world", None)
         publication = getattr(self, "_world_scan_publication", None)

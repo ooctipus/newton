@@ -10,7 +10,7 @@ from ...sim import JointType
 from .franka_kinetic_factor import get_kernel as geometric_factor
 from .sparse_factor import bind_operator_plan, operator_metadata
 from .sparse_mass_matrix import _SparseMassMatrixPlan
-from .tree_kinetic_owner import TreeKineticState
+from .tree_kinetic_owner import _NUMERIC_FLAGS, TreeKineticState
 from .tree_kinetic_plan import make_plan
 from .tree_kinetic_state import HeldResponse
 
@@ -302,8 +302,11 @@ class MixedTreeKineticState:
         self.sparse = self
         self.copy_reuse = all(group.copy_reuse for group in self.groups)
 
-    def validate_model(self):
+    def validate_model(self, flags=None):
         """Reject ownership changes before any cache or notification mutation."""
+        if flags is not None and int(flags) != 0 and int(flags) & ~_NUMERIC_FLAGS == 0:
+            # Numeric notifications cannot change ownership; see TreeKineticState.
+            return
         if _coverage(self.solver) != self.coverage:
             raise RuntimeError("Mixed tree factor groups changed; reconstruct and recapture")
         for group in self.groups:
@@ -314,7 +317,7 @@ class MixedTreeKineticState:
             )
             if not np.array_equal(group.sparse.plan.group_to_art.numpy(), expected):
                 raise RuntimeError("Mixed tree factor mapping changed; reconstruct and recapture")
-            group.validate_model()
+            group.validate_model(flags)
 
     def invalidate(self, world_mask=None):
         """Invalidate all component caches for selected worlds."""
