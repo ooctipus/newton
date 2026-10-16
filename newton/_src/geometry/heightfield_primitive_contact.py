@@ -48,12 +48,11 @@ def analytic_primitives_default() -> bool:
 def analytic_convex_default() -> bool:
     """Return whether heightfield convex-hull pairs use the closed-form row by default.
 
-    Off by default: the row is complete and validated, but on Go2 rough (hull
-    calves near terrain) it measured +1.85% against the generic query,
-    independent of kernel count and polygon size, and the per-pair cost has
-    not been located. ``NEWTON_HEIGHTFIELD_ANALYTIC_CONVEX=1`` enables it.
+    On by default, like the other rows; ``NEWTON_HEIGHTFIELD_ANALYTIC_CONVEX=0``
+    keeps hulls on the generic query. (Measured neutral on Go2 rough once the
+    per-cell manifolds were capped at four points.)
     """
-    value = os.environ.get("NEWTON_HEIGHTFIELD_ANALYTIC_CONVEX", "0")
+    value = os.environ.get("NEWTON_HEIGHTFIELD_ANALYTIC_CONVEX", "1")
     if value not in ("0", "1"):
         raise ValueError("NEWTON_HEIGHTFIELD_ANALYTIC_CONVEX must be 0 or 1")
     return value == "1"
@@ -686,6 +685,39 @@ def _footprint_point_query(p: wp.vec3, n: wp.vec3) -> tuple[wp.vec3, wp.vec3, fl
     return p - s * n, n, s
 
 
+_MAX_SUPPORT = 4
+
+
+@wp.func
+def _deepest_support(points: _Polygon, count: int, n: wp.vec3) -> tuple[_Polygon, int]:
+    """Keep the ``_MAX_SUPPORT`` deepest points along the cell normal.
+
+    A convex face on a plane needs at most four support points. Clipping a
+    face that crosses a cell yields up to seven (box) or eight (hull)
+    vertices, and every extra one is a contact row the solver visits: Go2
+    rough measured +2% with the full clipped polygon.
+    """
+    if count <= _MAX_SUPPORT:
+        return points, count
+    kept = _Polygon()
+    taken = wp.vector(length=8, dtype=wp.int32)
+    for i in range(8):
+        taken[i] = 0
+    for slot in range(_MAX_SUPPORT):
+        best = int(-1)
+        best_depth = float(1.0e30)
+        for i in range(count):
+            if taken[i] == 0:
+                depth = points[i, 0] * n[0] + points[i, 1] * n[1] + points[i, 2] * n[2]
+                if depth < best_depth:
+                    best_depth = depth
+                    best = i
+        taken[best] = 1
+        for k in range(3):
+            kept[slot, k] = points[best, k]
+    return kept, _MAX_SUPPORT
+
+
 def create_box_prism_contacts(writer_func: Any, query_filter: Any = None):
     """Create the closed-form box-vs-prism query with the signature of ``compute_gjk_mpr_contacts``.
 
@@ -778,37 +810,9 @@ def create_box_prism_contacts(writer_func: Any, query_filter: Any = None):
             polygon[corner, 1] = vertex[1]
             polygon[corner, 2] = vertex[2]
         clipped, count = _clip_polygon_xy(polygon, 4, e1, e2)
-        # A face on a plane needs at most four support points; a face crossing
-        # a cell yields up to seven clipped vertices, and every extra one is a
-        # contact row the solver has to visit (Go2 rough +2% with all seven).
-        # Keep the four deepest.
-        keep = wp.vector(length=4, dtype=wp.int32)
-        kept = int(0)
-        if count > 4:
-            for slot in range(4):
-                best = int(-1)
-                best_depth = float(1.0e30)
-                for i in range(count):
-                    taken = int(0)
-                    for j in range(kept):
-                        if keep[j] == i:
-                            taken = 1
-                    if taken == 0:
-                        depth = clipped[i, 0] * n[0] + clipped[i, 1] * n[1] + clipped[i, 2] * n[2]
-                        if depth < best_depth:
-                            best_depth = depth
-                            best = i
-                keep[slot] = best
-                kept += 1
+        clipped, count = _deepest_support(clipped, count, n)
         key = sort_sub_key << 3
         for i in range(count):
-            if count > 4:
-                selected = int(0)
-                for j in range(kept):
-                    if keep[j] == i:
-                        selected = 1
-                if selected == 0:
-                    continue
             p = wp.vec3(clipped[i, 0], clipped[i, 1], clipped[i, 2])
             point_a, normal, d = _footprint_point_query(p, n)
             if d > threshold + _ADMISSION_SLACK:
@@ -965,6 +969,7 @@ def create_convex_prism_contacts(writer_func: Any, query_filter: Any = None):
                 clipped[0, 1] = p[1]
                 clipped[0, 2] = p[2]
                 clipped_count += 1
+        clipped, clipped_count = _deepest_support(clipped, clipped_count, n)
         key = sort_sub_key << 3
         for i in range(clipped_count):
             p = wp.vec3(clipped[i, 0], clipped[i, 1], clipped[i, 2])
