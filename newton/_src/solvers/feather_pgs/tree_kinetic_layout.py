@@ -16,10 +16,18 @@ class TreeLayout:
     max_depth: int
     root_dofs: int
     permutation: tuple[int, ...]
+    # Threads per tree. Small trees share a 32-thread block (two 16-lane
+    # trees, eight 4-lane trees, ...) with warp-level barriers; 0 selects the
+    # unpacked default of one tree per block.
+    lanes: int = 0
 
     def __post_init__(self):
         if not (1 <= self.bodies <= 64 and 1 <= self.dofs <= 64 and 0 <= self.max_depth < self.bodies):
             raise ValueError("Cached trees require at most 64 bodies and coordinates")
+        if self.lanes == 0:
+            object.__setattr__(self, "lanes", 64 if self.bodies > 32 else 32)
+        if self.lanes not in (4, 8, 16, 32, 64) or self.lanes < self.bodies or (self.lanes == 64) != (self.bodies > 32):
+            raise ValueError("Cached tree lanes must be a power of two covering every body")
         if self.root_dofs not in (0, 6) or self.root_dofs > self.dofs:
             raise ValueError("Cached trees require a fixed or free root")
         if sorted(self.permutation) != list(range(self.dofs)):
@@ -51,6 +59,16 @@ class TreeLayout:
     def rounds(self):
         return max(1, self.max_depth.bit_length())
 
+    @property
+    def pack(self):
+        """Trees per 32-thread block."""
+        return 32 // self.lanes if self.lanes < 32 else 1
+
+    @property
+    def block(self):
+        """Threads per block."""
+        return 64 if self.lanes == 64 else 32
+
     def render(self, source):
         """Resolve named layout operands; never search for source statements."""
         reverse = self.permutation == tuple(range(self.dofs - 1, -1, -1))
@@ -58,7 +76,32 @@ class TreeLayout:
         def physical(index):
             return f"{self.dofs - 1}-{index}" if reverse else f"physical[{index}]"
 
+        if self.lanes < 32:
+            base = 31 & ~(self.lanes - 1)
+            mask = f"((0xffffffffu>>(32-{self.lanes}))<<(threadIdx.x&{base}))"
+            threads = {
+                "LANE": f"(threadIdx.x&{self.lanes - 1})",
+                "STRIDE": str(self.lanes),
+                "SUB": f"(threadIdx.x/{self.lanes})",
+                "MASK": mask,
+                "SYNC": f"__syncwarp({mask})",
+                "ALL": f"__all_sync({mask},",
+                "ANY": f"__any_sync({mask},",
+            }
+        else:
+            threads = {
+                "LANE": "threadIdx.x",
+                "STRIDE": "blockDim.x",
+                "SUB": "0",
+                "MASK": "0xffffffffu",
+                "SYNC": "__syncthreads()",
+                "ALL": "__syncthreads_and(",
+                "ANY": "__syncthreads_or(",
+            }
         values = {
+            **threads,
+            "LANES": self.lanes,
+            "PACK": self.pack,
             "BODIES": self.bodies,
             "DOFS": self.dofs,
             "NNZ": self.entries,

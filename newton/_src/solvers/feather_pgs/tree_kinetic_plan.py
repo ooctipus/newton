@@ -3,6 +3,8 @@
 
 """Structural admission for complete uniform cached articulation trees."""
 
+import os
+
 import numpy as np
 
 from ...sim import BodyFlags, JointType
@@ -15,6 +17,20 @@ def cooperative_block_dim(layout, chain_plan=None):
     if layout.bodies > 32 or (chain_plan is not None and np.any(chain_plan["meta"][32:, 0] >= 0)):
         return 64
     return 32
+
+
+def lanes_for(bodies, groups, device):
+    """Threads per tree: the smallest power of two covering the bodies, so small
+    trees share a block (``FEATHER_PGS_TREE_LANE_PACK=0`` keeps one tree per block).
+
+    The group count must divide into whole blocks; the pack halves until it does.
+    """
+    if bodies > 32 or not device.is_cuda or os.environ.get("FEATHER_PGS_TREE_LANE_PACK", "1") != "1":
+        return 0
+    lanes = max(4, 1 << (bodies - 1).bit_length())
+    while lanes < 32 and groups % (32 // lanes):
+        lanes *= 2
+    return lanes
 
 
 def make_plan(model, operator, *, complete=True):
@@ -101,5 +117,6 @@ def make_plan(model, operator, *, complete=True):
         int(depth.max()),
         int(counts[0, 0]),
         tuple(map(int, mass.permutation)),
+        lanes_for(bodies, len(group), model.device),
     )
     return layout, parent, depth

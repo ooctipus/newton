@@ -3,6 +3,7 @@
 
 """Admission and live bindings for complete tree current/next kinetic state."""
 
+import dataclasses
 import math
 import os
 
@@ -105,7 +106,13 @@ class TreeKineticState:
             except ValueError:
                 # Unsupported packing preserves the complete original owner.
                 pass
+        if chain_host is not None and self.layout.pack > 1:
+            # Packed chain scans address threads directly; keep one tree per block.
+            self.layout = dataclasses.replace(self.layout, lanes=0)
         self.block_dim = cooperative_block_dim(self.layout, chain_host)
+        if self.group_count % self.layout.pack:
+            raise ValueError("Tree kinetic lane packing requires whole blocks of trees")
+        self.launch_count = self.group_count // self.layout.pack
         if chain_host is None:
             self.plan = native.KineticPlan()
         else:
@@ -256,7 +263,7 @@ class TreeKineticState:
             arguments.append(stage3_qd)
         wp.launch_tiled(
             self.repair_kernel,
-            dim=[self.group_count],
+            dim=[self.launch_count],
             inputs=arguments,
             block_dim=self.block_dim,
             device=self.solver.model.device,
@@ -309,7 +316,7 @@ class TreeKineticState:
         force.dt = dt
         wp.launch_tiled(
             self.predictor_kernel,
-            dim=[self.group_count],
+            dim=[self.launch_count],
             inputs=[self.sparse.plan, self.sparse.data, self.plan, self.data, force],
             block_dim=self.block_dim,
             device=solver.model.device,
@@ -324,7 +331,7 @@ class TreeKineticState:
         data = self._publication(state_in, state_aug, state_out, dt)
         wp.launch_tiled(
             self.finish_kernel,
-            dim=[self.group_count],
+            dim=[self.launch_count],
             inputs=[
                 self.sparse.plan,
                 self.plan,

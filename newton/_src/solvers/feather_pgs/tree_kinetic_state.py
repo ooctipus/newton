@@ -73,22 +73,72 @@ class ForceInput:
     dt: float
 
 
-@wp.func_native(r"""
+_LANES_SOURCE = r"""
 #if defined(__CUDA_ARCH__)
-    return wp::vec_t<2,int>(threadIdx.x,blockDim.x);
+    return wp::vec_t<3,int>($LANE,$STRIDE,$SUB);
 #else
-    return wp::vec_t<2,int>(0,1);
+    return wp::vec_t<3,int>(0,1,0);
 #endif
-""")
-def _lanes() -> wp.vec2i: ...
+"""
 
-
-@wp.func_native(r"""
+_SYNC_SOURCE = r"""
 #if defined(__CUDA_ARCH__)
-    __syncthreads();
+    $SYNC;
 #endif
-""")
-def _sync(): ...
+"""
+
+_SUB_SOURCE = r"""
+#if defined(__CUDA_ARCH__)
+    return $SUB;
+#else
+    return 0;
+#endif
+"""
+
+_THREADS = r"""
+#if defined(__CUDA_ARCH__)
+    const int lane=$LANE,stride=$STRIDE;
+#else
+    const int lane=0,stride=1;
+#endif
+"""
+
+
+_DIFFERENT_MOTION_SOURCE = r"""
+    if(state_qd.data==motion_qd.data)return 0;
+    int different=0;
+#if defined(__CUDA_ARCH__)
+    for(int i=$LANE;i<count;i+=$STRIDE)
+        different|=state_qd.data[start+i]!=motion_qd.data[start+i];
+    return $ANY different);
+#else
+    for(int i=0;i<count;++i)different|=state_qd.data[start+i]!=motion_qd.data[start+i];
+    return different;
+#endif
+"""
+
+
+@functools.cache
+def _thread_helpers(layout):
+    """Lane, barrier and sub-tree natives for one tree layout."""
+    lanes_source = layout.render(_LANES_SOURCE)
+    sync_source = layout.render(_SYNC_SOURCE)
+    sub_source = layout.render(_SUB_SOURCE)
+    motion_source = layout.render(_DIFFERENT_MOTION_SOURCE)
+
+    @wp.func_native(lanes_source)
+    def _lanes() -> wp.vec3i: ...
+
+    @wp.func_native(sync_source)
+    def _sync(): ...
+
+    @wp.func_native(sub_source)
+    def _sub() -> int: ...
+
+    @wp.func_native(motion_source)
+    def _different_motion(state_qd: wp.array[float], motion_qd: wp.array[float], start: int, count: int) -> int: ...
+
+    return _lanes, _sync, _sub, _different_motion
 
 
 @wp.func_native(r"""
@@ -112,15 +162,9 @@ def _stamp_source(cache: KineticData, group: int, q: wp.array[float], qd: wp.arr
 
 
 @functools.cache
-def _copy_binding(dofs, bodies, plan_type):
+def _copy_binding(dofs, bodies, plan_type, layout):
     """Compare fixed scalar coordinates on a changed bank inside its repair block."""
-    lanes = """
-#if defined(__CUDA_ARCH__)
-    const int lane=threadIdx.x,stride=blockDim.x;
-#else
-    const int lane=0,stride=1;
-#endif
-"""
+    lanes = layout.render(_THREADS)
 
     match_source = (
         lanes
@@ -137,12 +181,13 @@ def _copy_binding(dofs, bodies, plan_type):
         for(int k=0;k<6;++k)equal&=body_qd.data[body][k]==cache.snapshot_body_qd.data[slot][k];
     }
 #if defined(__CUDA_ARCH__)
-    return __syncthreads_and(equal);
+    return $ALL equal);
 #else
     return equal?1:0;
 #endif
 """.replace("$DOFS", str(dofs)).replace("$BODIES", str(bodies))
     )
+    match_source = layout.render(match_source)
 
     @wp.func_native(match_source)
     def matches(
@@ -191,21 +236,6 @@ def _copy_binding(dofs, bodies, plan_type):
     return matches, store
 
 
-@wp.func_native(r"""
-    if(state_qd.data==motion_qd.data)return 0;
-    int different=0;
-#if defined(__CUDA_ARCH__)
-    for(int i=threadIdx.x;i<count;i+=blockDim.x)
-        different|=state_qd.data[start+i]!=motion_qd.data[start+i];
-    return __syncthreads_or(different);
-#else
-    for(int i=0;i<count;++i)different|=state_qd.data[start+i]!=motion_qd.data[start+i];
-    return different;
-#endif
-""")
-def _different_motion(state_qd: wp.array[float], motion_qd: wp.array[float], start: int, count: int) -> int: ...
-
-
 @wp.func_native("float* s=reinterpret_cast<float*>(address);for(int k=0;k<7;++k)s[7*body+k]=pose[k];")
 def _store_pose(address: wp.uint64, body: int, pose: wp.transform): ...
 
@@ -219,17 +249,17 @@ def _load_pose(address: wp.uint64, body: int) -> wp.transform: ...
 _POSE = r"""
     float* s=reinterpret_cast<float*>(address);
 #if defined(__CUDA_ARCH__)
-    const int body=threadIdx.x;
+    const int body=$LANE;
     wp::transform value;
     if(body<$BODIES)for(int k=0;k<7;++k)value[k]=s[7*body+k];
     for(int round=0;round<$ROUNDS;++round) {
         const int parent=body<$BODIES?p.jump.data[round*$BODIES+body]:-1;
         wp::transform ancestor;
         if(parent>=0)for(int k=0;k<7;++k)ancestor[k]=s[7*parent+k];
-        __syncthreads();
+        $SYNC;
         if(parent>=0)value=wp::transform_multiply(ancestor,value);
         if(body<$BODIES)for(int k=0;k<7;++k)s[7*body+k]=value[k];
-        __syncthreads();
+        $SYNC;
     }
 #else
     wp::transform old[$BODIES];
@@ -247,15 +277,15 @@ _POSE = r"""
 _MOTION = r"""
     float* s=reinterpret_cast<float*>(address)+$MOTION;
 #if defined(__CUDA_ARCH__)
-    const int body=threadIdx.x;
+    const int body=$LANE;
     float v[6]={},a[6]={};
     if(body<$BODIES)for(int k=0;k<6;++k){v[k]=s[6*body+k];s[$SIX_BODIES+6*body+k]=0.0f;}
-    __syncthreads();
+    $SYNC;
     for(int round=0;round<$ROUNDS;++round) {
         const int parent=body<$BODIES?p.jump.data[round*$BODIES+body]:-1;
         float pv[6],pa[6];
         if(parent>=0)for(int k=0;k<6;++k){pv[k]=s[6*parent+k];pa[k]=s[$SIX_BODIES+6*parent+k];}
-        __syncthreads();
+        $SYNC;
         if(parent>=0) {
             const wp::vec3 pl(pv[0],pv[1],pv[2]),pw(pv[3],pv[4],pv[5]);
             const wp::vec3 vl(v[0],v[1],v[2]),vw(v[3],v[4],v[5]);
@@ -264,7 +294,7 @@ _MOTION = r"""
             for(int k=0;k<6;++k)v[k]=pv[k]+v[k];
         }
         if(body<$BODIES)for(int k=0;k<6;++k){s[6*body+k]=v[k];s[$SIX_BODIES+6*body+k]=a[k];}
-        __syncthreads();
+        $SYNC;
     }
 #else
     float ov[$BODIES][6],oa[$BODIES][6];
@@ -289,7 +319,7 @@ _COLLECT = r"""    $PHYSICAL_DECL
 
     float* s=reinterpret_cast<float*>(address);
 #if defined(__CUDA_ARCH__)
-    const int lane=threadIdx.x,stride=blockDim.x;
+    const int lane=$LANE,stride=$STRIDE;
 #else
     const int lane=0,stride=1;
 #endif
@@ -316,7 +346,7 @@ $REDUCE
         }
     }
 #if defined(__CUDA_ARCH__)
-    __syncthreads();
+    $SYNC;
 #endif
     if(refresh)for(int e=lane;e<$NNZ;e+=stride) {
         const int row=$PHYSICAL_ROW,col=$PHYSICAL_COL,src=p.source.data[e];
@@ -333,7 +363,7 @@ $REDUCE
         }
     }
 #if defined(__CUDA_ARCH__)
-    __syncthreads();
+    $SYNC;
 #endif
     if(lane==0) {
         cache.generation.data[group]+=1;
@@ -358,16 +388,18 @@ _PREDICT = r"""    $PHYSICAL_DECL
     const int art=p.group_to_art.data[group];
     const int ds=p.art_dof_start.data[art],js=p.art_joint_start.data[art];
 #if defined(__CUDA_ARCH__)
-    const int lane=threadIdx.x,stride=blockDim.x;
-    __shared__ float s[$PRED_SCRATCH];
-    __shared__ int nonzero;
+    const int lane=$LANE,stride=$STRIDE;
+    __shared__ float s_all[$PRED_SCRATCH*$PACK];
+    __shared__ int nonzero_all[$PACK];
+    float* s=s_all+$SUB*$PRED_SCRATCH;
+    int& nonzero=nonzero_all[$SUB];
 #else
     const int lane=0,stride=1;
     float s[$PRED_SCRATCH];int nonzero=0;
 #endif
     if(lane==0)nonzero=0;
 #if defined(__CUDA_ARCH__)
-    __syncthreads();
+    $SYNC;
 #endif
     for(int local=lane;local<$BODIES;local+=stride) {
         const int body=p.joint_child.data[js+local];
@@ -383,7 +415,7 @@ _PREDICT = r"""    $PHYSICAL_DECL
         }
     }
 #if defined(__CUDA_ARCH__)
-    __syncthreads();
+    $SYNC;
 #endif
 $REDUCE
     for(int i=lane;i<$DOFS;i+=stride) {
@@ -394,7 +426,7 @@ $REDUCE
         s[$SIX_BODIES+i]=value;
     }
 #if defined(__CUDA_ARCH__)
-    __syncthreads();
+    $SYNC;
 #endif
     $FORWARD_STAGE
     for(int col=lane;col<$DOFS;col+=stride) {
@@ -412,7 +444,7 @@ $REDUCE
         }
     }
 #if defined(__CUDA_ARCH__)
-    __syncthreads();
+    $SYNC;
 #endif
     // A prescribed (kinematic) free root keeps its given velocity: no transport.
     if($FREE_ROOT&&lane==0&&f.kinematic_joint.data[js]==0) {
@@ -429,7 +461,7 @@ _LEVEL_REDUCE = r"""    for(int level=$LAST_PARENT;level>=0;--level) {
             }
         }
 #if defined(__CUDA_ARCH__)
-        __syncthreads();
+        $SYNC;
 #endif
     }
 """
@@ -442,7 +474,7 @@ _EXTERNAL_REDUCE = r"""    if(nonzero)for(int level=$LAST_PARENT;level>=0;--leve
             }
         }
 #if defined(__CUDA_ARCH__)
-        __syncthreads();
+        $SYNC;
 #endif
     }
 """
@@ -450,8 +482,8 @@ _EXTERNAL_REDUCE = r"""    if(nonzero)for(int level=$LAST_PARENT;level>=0;--leve
 
 _STORAGE_SOURCE = r"""
 #if defined(__CUDA_ARCH__)
-    __shared__ float values[$TOTAL];
-    return reinterpret_cast<uint64_t>(values);
+    __shared__ float values[$TOTAL*$PACK];
+    return reinterpret_cast<uint64_t>(values+$SUB*$TOTAL);
 #else
     return reinterpret_cast<uint64_t>(malloc($TOTAL*sizeof(float)));
 #endif
@@ -607,6 +639,8 @@ def get_state_kernel(
         raise ValueError("Copied-state reuse requires fixed scalar coordinates and ordinary motion")
     h = get_helpers(layout, chain_scan, body_velocity)
     plan_type = h.plan_type
+    _lanes, _sync, _sub, _different_motion = _thread_helpers(layout)
+    pack = layout.pack
     scan_poses, scan_motion, collect = h._scan_poses, h._scan_motion, h._collect
     _storage, _store_motion, _load_motion = h._storage, h._store_motion, h._load_motion
     _store_origin, _load_origin, _store_axis = h._store_origin, h._load_origin, h._store_axis
@@ -625,7 +659,7 @@ def get_state_kernel(
     motion_bind = "qd = motion_qd" if motion_velocity else ""
     copy_setup, copy_store, copy_rebind = "", "", ""
     if copy_reuse:
-        _copy_matches, _copy_store = _copy_binding(dofs, bodies, plan_type)
+        _copy_matches, _copy_store = _copy_binding(dofs, bodies, plan_type, layout)
         copy_setup = """    if cache.current_valid[art] != 0 and source_matches == 0:
         source_matches = _copy_matches(plan, cache, group, ds, data.joint_q, data.joint_qd, data.joint_child, js, data.body_q, data.body_qd)
 """
@@ -643,11 +677,12 @@ else:
     _stamp_source(cache, group, q, qd)"""
     stages = StateStages(
         setup=f"""
-group, logical_lane = wp.tid()
+block, logical_lane = wp.tid()
 lanes = _lanes()
 lane, stride = lanes[0], lanes[1]
 if stride == 1 and logical_lane != 0:
     return
+group = block * wp.static(pack) + lanes[2]
 art = p.group_to_art[group]
 ds, js = p.art_dof_start[art], p.art_joint_start[art]
 {motion_setup}\
@@ -750,6 +785,8 @@ if lane == 0:
         + indent(stamp, "    "),
     )
     name = f"tree_kinetic_finish{bodies}" if finish else f"tree_kinetic_repair{bodies}"
+    if layout.pack > 1:
+        name += f"_l{layout.lanes}"
     if chain_scan:
         name += "_chain"
     if copy_reuse:
@@ -811,7 +848,7 @@ def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = G1_LA
         s[$WHITE+row]=value;
     }
 #if defined(__CUDA_ARCH__)
-    __syncthreads();
+    $SYNC;
 #endif
 """
     )
@@ -822,7 +859,7 @@ def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = G1_LA
             "if(lane==0){\n"
             + held.forward("s[$SIX_BODIES+$index]", "s[$WHITE+$index]")
             + held.transpose("s[$WHITE+$index]", "s[$WHITE+$index]")
-            + "\n}\n#if defined(__CUDA_ARCH__)\n__syncthreads();\n#endif\n"
+            + "\n}\n#if defined(__CUDA_ARCH__)\n$SYNC;\n#endif\n"
         )
         operations["TRANSPOSE_ACTION"] = "float value=s[$WHITE+col];"
         operations["RESPONSE_PHYSICAL"] = "col"
@@ -849,11 +886,17 @@ def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = G1_LA
         f: ForceInput,
     ): ...
 
+    _, _, _sub, _ = _thread_helpers(layout)
+    pack = layout.pack
+
     def predict(p: sparse_factor.SparsePlan, d: data_type, plan: plan_type, cache: KineticData, f: ForceInput):
-        group, _ = wp.tid()
+        block, _ = wp.tid()
+        group = block * wp.static(pack) + _sub()
         native(group, p, d, plan, cache, f)
 
     predict.__name__ = predict.__qualname__ = f"tree_kinetic_predict{layout.dofs}"
+    if layout.pack > 1:
+        predict.__name__ = predict.__qualname__ = predict.__name__ + f"_l{layout.lanes}"
     if chain_scan:
         predict.__name__ = predict.__qualname__ = predict.__name__ + "_chain"
     if response != "sparse":
