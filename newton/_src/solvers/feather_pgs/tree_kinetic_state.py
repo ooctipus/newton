@@ -67,6 +67,7 @@ class ForceInput:
     damping: wp.array[float]
     u0: wp.array[float]
     S: wp.array[wp.spatial_vector]
+    kinematic_joint: wp.array[int]
     qdd: wp.array[float]
     vhat: wp.array[float]
     dt: float
@@ -413,7 +414,8 @@ $REDUCE
 #if defined(__CUDA_ARCH__)
     __syncthreads();
 #endif
-    if($FREE_ROOT&&lane==0) {
+    // A prescribed (kinematic) free root keeps its given velocity: no transport.
+    if($FREE_ROOT&&lane==0&&f.kinematic_joint.data[js]==0) {
         $TRANSPORT
     }
 """

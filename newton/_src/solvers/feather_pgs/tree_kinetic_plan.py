@@ -22,8 +22,8 @@ def make_plan(model, operator, *, complete=True):
     worlds, arts = int(model.world_count), int(model.articulation_count)
     if worlds < 1 or arts < 1 or model.joint_count != model.body_count:
         raise ValueError("Cached trees require complete articulation and body ownership")
-    if model.requires_grad or model.particle_count or np.any(model.body_flags.numpy() & int(BodyFlags.KINEMATIC)):
-        raise ValueError("Cached trees exclude gradients, particles and prescribed bodies")
+    if model.requires_grad or model.particle_count:
+        raise ValueError("Cached trees exclude gradients and particles")
     starts = model.articulation_start.numpy()
     group = operator.plan.group_to_art.numpy()
     art_world = operator.plan.art_to_world.numpy()
@@ -74,6 +74,17 @@ def make_plan(model, operator, *, complete=True):
         qd[joints] - qd[starts[group, None]] == qd[joints[0]] - qd[starts[group[0]]]
     ):
         raise ValueError("Cached trees require uniform coordinate indexing")
+    # Kinematic bodies: a prescribed group owns whole free bodies whose six
+    # coordinates are all kinematic; any other group must be fully dynamic.
+    # (A welded kinematic base of a fixed-root tree carries no coordinate.)
+    kinematic = model.body_flags.numpy()[child[joints]] & int(BodyFlags.KINEMATIC)
+    coordinate_bodies = counts > 0
+    prescribed = bool(getattr(operator, "prescribed", False))
+    if prescribed:
+        if bodies != 1 or dofs != 6 or not np.all(kinematic[:, 0]):
+            raise ValueError("Prescribed cached roots must be single kinematic free bodies")
+    elif np.any(kinematic & coordinate_bodies):
+        raise ValueError("Cached trees exclude kinematic bodies with coordinates")
     mass = _SparseMassMatrixPlan.build(parent, counts[0])
     if not np.array_equal(mass.lookup, operator.host["index"]) or not np.array_equal(
         mass.dof_joint, operator.host["dof_joint"]

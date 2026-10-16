@@ -55,10 +55,10 @@ def supported(solver):
         and solver.drive_mode == "augmented"
         and solver.pgs_velocity_iterations == 0
         and not solver.enable_joint_velocity_limits
-        and not solver._has_prescribed_response
-        # Mimic rows are ordinary matrix-free rows over the held factors this
-        # owner refreshes, as they are for the Franka held owner; they need
-        # nothing from the predictor itself.
+        # Prescribed (kinematic) free bodies are owned as zero-response roots;
+        # see PrescribedRootOperator. Mimic rows are ordinary matrix-free rows
+        # over the held factors this owner refreshes, as they are for the
+        # Franka held owner; they need nothing from the predictor itself.
         and not solver._connect_count
         and not solver._has_loop_joints
         and not solver.lazy_kinematics
@@ -87,12 +87,18 @@ def supported(solver):
     )
 
 
+def _prescribed_articulations(solver):
+    """Articulations whose response the solver prescribes (kinematic free bodies)."""
+    return np.flatnonzero(solver._prescribed_articulation.numpy() != 0).astype(np.int32)
+
+
 def _coverage(solver):
     """Prove complete disjoint articulation and physical coordinate ownership."""
     model = solver.model
-    if len(solver.size_groups) < 2 or model.joint_count != model.body_count:
+    prescribed = _prescribed_articulations(solver)
+    if len(solver.size_groups) + (1 if prescribed.size else 0) < 2 or model.joint_count != model.body_count:
         raise ValueError("Mixed tree cache requires multiple complete factor groups")
-    arts = np.concatenate([solver.group_to_art[size].numpy() for size in solver.size_groups])
+    arts = np.concatenate([solver.group_to_art[size].numpy() for size in solver.size_groups] + [prescribed])
     if not np.array_equal(np.sort(arts), np.arange(model.articulation_count)):
         raise ValueError("Mixed tree factors must cover every articulation exactly once")
     starts = model.articulation_start.numpy()
@@ -108,9 +114,16 @@ def _coverage(solver):
             raise ValueError("Mixed tree factor size disagrees with its physical coordinates")
         if solver.n_arts_by_size[size] != len(group):
             raise ValueError("Mixed tree factor count disagrees with its group map")
+    if prescribed.size and np.any(qd[starts[prescribed + 1]] - qd[starts[prescribed]] != 6):
+        raise ValueError("Prescribed cached roots must be six-coordinate free bodies")
     if not np.array_equal(np.sort(model.joint_child.numpy()), np.arange(model.body_count)):
         raise ValueError("Mixed tree cache must publish every body exactly once")
-    return tuple(solver.size_groups), tuple(sorted(solver.n_arts_by_size.items())), solver._compact_diagonal_mass_size
+    return (
+        tuple(solver.size_groups),
+        tuple(sorted(solver.n_arts_by_size.items())),
+        solver._compact_diagonal_mass_size,
+        int(prescribed.size),
+    )
 
 
 class TreeHeldOperator:
@@ -222,6 +235,47 @@ class TreeHeldOperator:
             self.data.lower = self.solver.L_by_size[self.size]
 
 
+class PrescribedRootOperator:
+    """Own prescribed free bodies as zero-response roots of the same tree law.
+
+    A kinematic free body has six prescribed coordinates and no factor. With a
+    diagonal response whose inverse is zero, the shared predictor yields zero
+    acceleration and the prescribed velocity, the free-root transport is
+    skipped on kinematic roots, and the shared finish integrates the pose and
+    publishes the body exactly as it does for a dynamic free body. This is
+    the generic form of the free-root slots the Franka and Kuka owners keep.
+    """
+
+    prescribed = True
+
+    def __init__(self, solver):
+        self.solver, self.size = solver, 6
+        self.requires_body_velocity = True
+        device = solver.model.device
+        arts = _prescribed_articulations(solver)
+        if not arts.size:
+            raise ValueError("No prescribed articulations to own")
+        self.free_root = True
+        self.diagonal = True
+        self.mass = mass = _SparseMassMatrixPlan.build(np.array([-1], np.int32), np.array([6], np.int32))
+        self.host = operator_metadata(mass)
+        self.group_to_art = wp.array(arts, dtype=int, device=device)
+        self.plan = bind_operator_plan(solver, 6, self.host, group_to_art=self.group_to_art)
+        self.layout, _, _ = make_plan(solver.model, self, complete=False)
+        self.data = HeldResponse()
+        self.data.valid = wp.ones(len(arts), dtype=int, device=device)
+        self.data.status = wp.zeros(len(arts), dtype=int, device=device)
+        # Zero inverse mass: the prescribed coordinates never respond.
+        self.data.inverse = wp.zeros(solver.model.joint_dof_count, dtype=float, device=device)
+        self.kinetic_state = None
+
+    def refresh(self, state_aug):
+        """Prescribed roots hold no factor; nothing to refresh."""
+
+    def bind_response(self):
+        """The zero inverse is owned here and never rebinds."""
+
+
 class MixedTreeKineticState:
     """Compose disjoint factor-group caches with complete public-state coverage."""
 
@@ -229,6 +283,8 @@ class MixedTreeKineticState:
         self.solver = solver
         self.coverage = _coverage(solver)
         operators = [TreeHeldOperator(solver, size) for size in solver.size_groups]
+        if self.coverage[-1]:
+            operators.append(PrescribedRootOperator(solver))
         self.groups = []
         for operator in operators:
             group = TreeKineticState(
@@ -251,9 +307,12 @@ class MixedTreeKineticState:
         if _coverage(self.solver) != self.coverage:
             raise RuntimeError("Mixed tree factor groups changed; reconstruct and recapture")
         for group in self.groups:
-            if not np.array_equal(
-                group.sparse.plan.group_to_art.numpy(), self.solver.group_to_art[group.layout.dofs].numpy()
-            ):
+            expected = (
+                _prescribed_articulations(self.solver)
+                if getattr(group.sparse, "prescribed", False)
+                else self.solver.group_to_art[group.layout.dofs].numpy()
+            )
+            if not np.array_equal(group.sparse.plan.group_to_art.numpy(), expected):
                 raise RuntimeError("Mixed tree factor mapping changed; reconstruct and recapture")
             group.validate_model()
 

@@ -17,11 +17,13 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 DT = 1.0 / 240.0
 
 
-def _build(device, worlds=4, mimic=False):
+def _build(device, worlds=4, mimic=False, prescribed=False):
     """Per world: a fixed-base three-joint arm over a free box resting on the ground.
 
     With ``mimic`` the third arm joint follows the second through a mimic row,
-    as a gripper finger follows its leader.
+    as a gripper finger follows its leader. With ``prescribed`` a kinematic
+    free body (a moving tray) sits beside the box, as a goal marker or
+    conveyor does in manipulation scenes.
     """
     scene = newton.ModelBuilder()
     cfg = scene.default_shape_cfg.copy()
@@ -59,12 +61,28 @@ def _build(device, worlds=4, mimic=False):
         scene.add_constraint_mimic(joint0=joints[3], joint1=joints[2], coef0=0.0, coef1=1.0)
     box = scene.add_body(xform=wp.transform(wp.vec3(0.15, 0.05, 0.06), wp.quat_identity()), mass=0.5)
     scene.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+    if prescribed:
+        tray = scene.add_body(xform=wp.transform(wp.vec3(-0.4, 0.0, 0.03), wp.quat_identity()), is_kinematic=True)
+        scene.add_shape_box(tray, hx=0.08, hy=0.08, hz=0.03, cfg=cfg)
     builder = newton.ModelBuilder()
     builder.replicate(scene, worlds, spacing=(3.0, 3.0, 0.0))
     builder.add_ground_plane()
     model = builder.finalize(device=device)
     model.rigid_contact_max = 256
     return model
+
+
+TRAY_VELOCITY = 0.25
+
+
+def _kinematic_free_joints(model):
+    """Coordinate and velocity starts of free joints whose body is kinematic."""
+    types, flags = model.joint_type.numpy(), model.body_flags.numpy()
+    child = model.joint_child.numpy()
+    joints = np.flatnonzero(
+        (types == int(newton.JointType.FREE)) & (flags[child] & int(newton.BodyFlags.KINEMATIC) != 0)
+    )
+    return model.joint_q_start.numpy()[joints], model.joint_qd_start.numpy()[joints]
 
 
 def _rollout(model, *, owner, steps=120, swing_joint=0):
@@ -100,10 +118,21 @@ def _rollout(model, *, owner, steps=120, swing_joint=0):
     qd_start = model.joint_qd_start.numpy()
     for joint in np.flatnonzero(types == int(newton.JointType.REVOLUTE))[swing_joint::3]:
         qd[qd_start[joint]] = 1.5
+    # Prescribed trays glide along +x at a constant speed.
+    # The solver holds a kinematic joint's coordinates, so the tray pose is
+    # advanced externally each step (as Isaac Lab writes kinematic targets)
+    # and its velocity is given.
+    tray_q, tray_qd = _kinematic_free_joints(model)
+    for start in tray_qd:
+        qd[start] = TRAY_VELOCITY
     states[0].joint_qd.assign(qd)
     trajectory = []
     joint_trajectory = []
     for _ in range(steps):
+        if len(tray_q):
+            q = states[0].joint_q.numpy()
+            q[tray_q] += TRAY_VELOCITY * DT
+            states[0].joint_q.assign(q)
         pipeline.collide(states[0], contacts)
         states[0].clear_forces()
         solver.step(states[0], states[1], control, contacts, DT)
@@ -155,6 +184,33 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         q = owner_solver.joint_q_trajectory.reshape(len(cached), model.world_count, -1)
         self.assertGreater(float(np.abs(q[:, :, 1]).max()), 0.02)
         self.assertLess(float(np.abs(q[:, :, 2] - q[:, :, 1]).max()), 0.02)
+
+    def test_prescribed_free_roots_are_owned(self):
+        """A kinematic free body per world is owned as a zero-response root and glides at its prescribed speed."""
+        model = _build(wp.get_device("cuda:0"), prescribed=True)
+        plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False)
+        self.assertIsNone(plain_owner)
+        self.assertTrue(plain_solver._has_prescribed_response)
+        _owner_solver, owner, cached, cached_qd = _rollout(model, owner=True)
+        self.assertIsInstance(owner, MixedTreeKineticState)
+        self.assertEqual(sorted(group.layout.dofs for group in owner.groups), [3, 6, 6])
+        self.assertTrue(any(getattr(group.sparse, "prescribed", False) for group in owner.groups))
+        self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
+        np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
+        # The tray is the last body of every world: the published pose follows
+        # the externally advanced coordinates (v*t over the rollout) and stays level.
+        first = cached[0].reshape(model.world_count, -1, 7)
+        final = cached[-1].reshape(model.world_count, -1, 7)
+        self.assertEqual(final.shape[1], 6)
+        np.testing.assert_allclose(
+            final[:, 5, 0] - first[:, 5, 0], TRAY_VELOCITY * (len(cached) - 1) * DT, atol=2.0e-3, rtol=0.0
+        )
+        np.testing.assert_allclose(final[:, 5, 2], 0.03, atol=1.0e-4, rtol=0.0)
+        tray_qd = cached_qd.reshape(model.world_count, -1, 6)[:, 5]
+        self.assertGreater(float(np.abs(tray_qd).max()), 0.9 * TRAY_VELOCITY)
+        self.assertEqual(int(sum(int(group.status.numpy().sum()) for group in owner.groups)), 0)
 
 
 if __name__ == "__main__":

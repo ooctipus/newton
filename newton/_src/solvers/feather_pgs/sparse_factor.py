@@ -86,13 +86,17 @@ def operator_metadata(mass, *, inverse_column_width=None):
     }
 
 
-def bind_operator_plan(solver, size, host):
-    """Bind factor metadata and articulation ownership without choosing a row law."""
+def bind_operator_plan(solver, size, host, *, group_to_art=None):
+    """Bind factor metadata and articulation ownership without choosing a row law.
+
+    ``group_to_art`` names the owned articulations explicitly; by default they
+    are the solver's factor group of ``size`` coordinates.
+    """
     model = solver.model
     plan = SparsePlan()
     for name, values in host.items():
         setattr(plan, name, wp.array(values, dtype=wp.uint64 if name == "body_mask" else int, device=model.device))
-    plan.group_to_art = solver.group_to_art[size]
+    plan.group_to_art = solver.group_to_art[size] if group_to_art is None else group_to_art
     plan.art_to_world = solver.art_to_world
     plan.art_dof_start = solver.articulation_dof_start
     plan.art_joint_start = model.articulation_start

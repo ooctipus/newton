@@ -289,6 +289,7 @@ class TreeKineticState:
         force.reference = solver._passive_spring_ref
         force.damping = solver._passive_joint_damping
         force.u0, force.S = state_aug.joint_tau, state_aug.joint_S_s
+        force.kinematic_joint = solver._kinematic_joint_mask
         force.qdd, force.vhat = state_aug.joint_qdd, solver.v_hat
         force.dt = dt
         wp.launch_tiled(

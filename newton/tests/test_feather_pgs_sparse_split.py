@@ -348,9 +348,13 @@ class TestSparseSplitPhysics(unittest.TestCase):
                 flags = model.body_flags.numpy().copy()
                 flags[0] |= int(newton.BodyFlags.KINEMATIC)
                 model.body_flags.assign(flags)
-                error = ValueError if cached else RuntimeError
+                # A cached owner rejects the changed body flags before any mask or
+                # cache mutation (prescribed free roots are owned since the mixed
+                # owner learned them, so the plan no longer rejects kinematic
+                # bodies outright); the ordinary route rejects the gained DOFs.
+                error = RuntimeError
                 message = (
-                    "Cached trees exclude gradients, particles and prescribed bodies"
+                    "Tree kinetic static body_flags changed; reconstruct and recapture"
                     if cached
                     else "Sparse response gained prescribed DOFs; reconstruct the solver and recapture its CUDA graph."
                 )
