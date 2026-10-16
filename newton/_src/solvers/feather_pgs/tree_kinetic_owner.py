@@ -207,26 +207,44 @@ class TreeKineticState:
             return
         import time  # noqa: PLC0415
 
+        from .tree_kinetic_state import ForceInput  # noqa: PLC0415
+
         model, device, solver = self.solver.model, self.solver.model.device, self.solver
         probe_in, probe_out = model.state(), model.state()
         data = self._publication(probe_in, solver, probe_out, 1.0 / 240.0)
-        arguments = [self.sparse.plan, self.plan, data, self.data, solver._mass_update_requested, 1]
+        # Steady state: finish without a geometry refresh, then predict (repair
+        # exits early on an unchanged bank and refresh is periodic).
+        finish_arguments = [self.sparse.plan, self.plan, data, self.data, solver._mass_update_requested, 0]
+        force = ForceInput()
+        force.joint_q, force.joint_qd, force.predictor_qd = probe_in.joint_q, probe_in.joint_qd, probe_in.joint_qd
+        force.joint_f, force.body_f, force.body_flags = model.control().joint_f, probe_in.body_f, model.body_flags
+        force.stiffness, force.reference = solver._passive_spring_stiffness, solver._passive_spring_ref
+        force.damping, force.u0, force.S = solver._passive_joint_damping, solver.joint_tau, solver.joint_S_s
+        force.kinematic_joint, force.qdd, force.vhat = solver._kinematic_joint_mask, solver.joint_qdd, solver.v_hat
+        force.dt = 1.0 / 240.0
+        predict_arguments = [self.sparse.plan, self.sparse.data, self.plan, self.data, force]
         base = self.layout
         timings = {}
         for lanes in candidates:
             self.layout = dataclasses.replace(base, lanes=lanes)
             self._bind_kernels()
+            launches = (
+                (self.finish_kernel, finish_arguments),
+                (self.predictor_kernel, predict_arguments),
+            )
+            # One warm pass populates the caches the timed launches read.
+            for kernel, arguments in launches:
+                wp.launch_tiled(
+                    kernel, dim=[self.launch_count], inputs=arguments, block_dim=self.block_dim, device=device
+                )
             best = math.inf
-            for _ in range(4):
+            for _ in range(6):
                 wp.synchronize_device(device)
                 started = time.perf_counter()
-                wp.launch_tiled(
-                    self.finish_kernel,
-                    dim=[self.launch_count],
-                    inputs=arguments,
-                    block_dim=self.block_dim,
-                    device=device,
-                )
+                for kernel, arguments in launches:
+                    wp.launch_tiled(
+                        kernel, dim=[self.launch_count], inputs=arguments, block_dim=self.block_dim, device=device
+                    )
                 wp.synchronize_device(device)
                 best = min(best, time.perf_counter() - started)
             timings[lanes] = best
