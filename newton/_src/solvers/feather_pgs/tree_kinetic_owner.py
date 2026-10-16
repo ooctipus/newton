@@ -75,7 +75,7 @@ class TreeKineticState:
         for body in range(bodies):
             children.extend(np.flatnonzero(parent == body)[::-1].tolist())
             offsets.append(len(children))
-        if len(children) != bodies - 1:
+        if len(children) != bodies - len(self.layout.roots):
             raise ValueError("Tree kinetic state requires every true parent edge")
 
         group_to_art = sparse_owner.plan.group_to_art.numpy()
@@ -127,6 +127,31 @@ class TreeKineticState:
             self.plan.chain_levels = chain_host["levels"]
             self.plan.chain_width = int(chain_host["widths"].max())
             self.chain_scan = True
+        # Forest metadata (a single tree is the one-root case of the same arrays).
+        root_locals = np.asarray(self.layout.roots, np.int32)
+        root_of = np.zeros(bodies, np.int32)
+        for local in range(1, bodies):
+            root_of[local] = (
+                root_of[parent[local]] if parent[local] >= 0 else int(np.flatnonzero(root_locals == local)[0])
+            )
+        arts = getattr(sparse_owner, "forest_arts", None)
+        arts = np.asarray(arts, np.int32) if arts is not None else group_to_art.reshape(-1, 1).astype(np.int32)
+        free = [r for r, c in enumerate(self.layout.root_coordinates) if c == 6]
+        free_root_local = root_locals[free] if free else np.zeros(1, np.int32)
+        free_root_dof = (
+            np.asarray([self.layout.root_offsets[r] for r in free], np.int32) if free else np.zeros(1, np.int32)
+        )
+        dof_passive = np.ones(dofs, np.int32)
+        for r, c in enumerate(self.layout.root_coordinates):
+            dof_passive[self.layout.root_offsets[r] : self.layout.root_offsets[r] + c] = 0
+        if self.layout.forest:
+            root_slot = np.full((self.group_count, max(1, len(free))), -1, np.int32)
+            for group in range(self.group_count):
+                for k, r in enumerate(free):
+                    root_slot[group, k] = root_lookup.get(int(starts[arts[group, r]]), -1)
+                    if root_slot[group, k] < 0:
+                        raise ValueError("Tree kinetic state is missing a free-root transport slot")
+            root_slot = root_slot.reshape(-1)
         for name, values in (
             ("parent", parent),
             ("depth", depth),
@@ -137,6 +162,19 @@ class TreeKineticState:
             ("root_slot", root_slot),
         ):
             setattr(self.plan, name, wp.array(values, dtype=int, device=device))
+        if chain_host is None:
+            # Chain-scan plans keep their own struct; forests are kinetic plans only.
+            for name, values in (
+                ("arts", arts),
+                ("root_of", root_of),
+                ("root_local", root_locals),
+                ("free_root_local", free_root_local),
+                ("free_root_dof", free_root_dof),
+                ("dof_passive", dof_passive),
+            ):
+                setattr(self.plan, name, wp.array(values, dtype=int, device=device))
+        elif self.layout.forest:
+            raise ValueError("Forest groups do not use the packed chain scan")
         self.data = native.KineticData()
         groups = self.group_count
         self.data.bias = wp.empty((groups, dofs), dtype=float, device=device)

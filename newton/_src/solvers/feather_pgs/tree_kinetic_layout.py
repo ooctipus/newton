@@ -20,10 +20,26 @@ class TreeLayout:
     # trees, eight 4-lane trees, ...) with warp-level barriers; 0 selects the
     # unpacked default of one tree per block.
     lanes: int = 0
+    # A forest: local body index of every root (one tree: (0,)), each root's
+    # coordinate count (0 fixed, 6 free), its coordinate offset within the
+    # group, its factor family size (0 for a prescribed root) and whether the
+    # whole group is one articulation.
+    roots: tuple[int, ...] = (0,)
+    root_coordinates: tuple[int, ...] = ()
+    root_offsets: tuple[int, ...] = (0,)
+    root_families: tuple[int, ...] = ()
 
     def __post_init__(self):
         if not (1 <= self.bodies <= 64 and 1 <= self.dofs <= 64 and 0 <= self.max_depth < self.bodies):
             raise ValueError("Cached trees require at most 64 bodies and coordinates")
+        if not self.root_coordinates:
+            object.__setattr__(self, "root_coordinates", (self.root_dofs,))
+        if not self.root_families:
+            object.__setattr__(self, "root_families", (self.dofs,))
+        if not (len(self.roots) == len(self.root_coordinates) == len(self.root_offsets) == len(self.root_families)):
+            raise ValueError("Cached forest roots need one coordinate count, offset and family each")
+        if self.roots[0] != 0 or any(c not in (0, 6) for c in self.root_coordinates):
+            raise ValueError("Cached forest roots start at body 0 and are fixed or free")
         if self.lanes == 0:
             object.__setattr__(self, "lanes", 64 if self.bodies > 32 else 32)
         if self.lanes not in (4, 8, 16, 32, 64) or self.lanes < self.bodies or (self.lanes == 64) != (self.bodies > 32):
@@ -58,6 +74,14 @@ class TreeLayout:
     @property
     def rounds(self):
         return max(1, self.max_depth.bit_length())
+
+    @property
+    def forest(self):
+        return len(self.roots) > 1
+
+    @property
+    def free_roots(self):
+        return sum(1 for c in self.root_coordinates if c == 6)
 
     @property
     def pack(self):
@@ -99,7 +123,7 @@ class TreeLayout:
                 "ANY": "__syncthreads_or(",
             }
         pred = 6 * self.bodies + 2 * self.dofs
-        total = self.origin_offset + 6
+        total = self.origin_offset + 6 * len(self.roots)
         if self.pack > 1:
             scratch = {
                 "PRED_SCRATCH_DECL": f"__shared__ float s_all[{pred * self.pack}];__shared__ int nonzero_all[{self.pack}];"
@@ -133,7 +157,17 @@ class TreeLayout:
             "WRENCH": self.wrench_offset,
             "MOMENT": self.moment_offset,
             "ORIGIN": self.origin_offset,
-            "TOTAL": self.origin_offset + 6,
+            "TOTAL": self.origin_offset + 6 * len(self.roots),
+            "ROOT_COUNT": len(self.roots),
+            "FREE_ROOTS": self.free_roots,
+            # Passive springs act on no root coordinate.
+            "SPRING_GUARD": f"i>={self.root_dofs}" if not self.forest else "plan.dof_passive.data[i]!=0",
+            "CURRENT_VALID": (
+                "cache.current_valid.data[p.group_to_art.data[group]]=cache.status.data[group]==0;"
+                if not self.forest
+                else f"for(int r=0;r<{len(self.roots)};++r)"
+                f"cache.current_valid.data[plan.arts.data[group*{len(self.roots)}+r]]=cache.status.data[group]==0;"
+            ),
             "WHITE": 6 * self.bodies + self.dofs,
             "PRED_SCRATCH": 6 * self.bodies + 2 * self.dofs,
             "PHYSICAL_DECL": ""

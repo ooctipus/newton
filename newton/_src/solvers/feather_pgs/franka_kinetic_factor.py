@@ -9,9 +9,22 @@ from . import small_cholesky
 
 
 @cache
-def get_kernel(device_arch: str, *, warps_per_block: int = 4, size: int = 9, geometric_index=()):
+def get_kernel(
+    device_arch: str,
+    *,
+    warps_per_block: int = 4,
+    size: int = 9,
+    geometric_index=(),
+    geometric_stride: int = 0,
+    geometric_group: bool = False,
+):
     """Bind admitted physical geometry to the retained Cholesky arithmetic."""
     del device_arch
     return small_cholesky.get_kernel(
-        size, warps_per_block=warps_per_block, geometric=True, geometric_index=geometric_index
+        size,
+        warps_per_block=warps_per_block,
+        geometric=True,
+        geometric_index=geometric_index,
+        geometric_stride=geometric_stride,
+        geometric_group=geometric_group,
     )

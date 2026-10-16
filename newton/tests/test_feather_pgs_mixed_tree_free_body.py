@@ -104,6 +104,7 @@ def _kinematic_free_joints(model):
 
 def _rollout(model, *, owner, steps=120, swing_joint=0, pgs_mode="matrix_free"):
     env = {
+        "FEATHER_PGS_TREE_FOREST": str(int(getattr(_rollout, "forest", False))),
         "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": str(int(owner)),
         "FEATHER_PGS_FRANKA_KINETIC_STATE": "0",
         "FEATHER_PGS_TREE_KINETIC_STATE": "0",
@@ -208,6 +209,27 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         _owner_solver, owner, cached, cached_qd = _rollout(model, owner=True)
         self.assertIsInstance(owner, MixedTreeKineticState)
         self.assertEqual(sorted(group.layout.dofs for group in owner.groups), [4, 6])
+        self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
+        np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
+
+    def test_forest_group_owns_the_whole_world(self):
+        """With FEATHER_PGS_TREE_FOREST=1 one group owns the arm, the box and the tray of each world."""
+        model = _build(wp.get_device("cuda:0"), prescribed=True)
+        _plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False)
+        self.assertIsNone(plain_owner)
+        _rollout.forest = True
+        try:
+            _owner_solver, owner, cached, cached_qd = _rollout(model, owner=True)
+        finally:
+            _rollout.forest = False
+        self.assertIsInstance(owner, MixedTreeKineticState)
+        self.assertEqual(len(owner.groups), 1)
+        layout = owner.groups[0].layout
+        self.assertEqual(layout.roots, (0, 4, 5))
+        self.assertEqual(layout.root_coordinates, (0, 6, 6))
+        self.assertEqual(layout.root_families, (3, 6, 0))
         self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
         np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
         np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)

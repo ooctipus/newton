@@ -122,18 +122,34 @@ _INPUTS = (
 
 
 @cache
-def get_kernel(size: int, *, warps_per_block: int = 4, geometric: bool = False, geometric_index=()):
+def get_kernel(
+    size: int,
+    *,
+    warps_per_block: int = 4,
+    geometric: bool = False,
+    geometric_index=(),
+    geometric_stride: int = 0,
+    geometric_group: bool = False,
+):
     """Bind composite-body or geometric mass to the same factor stages.
 
     The packed schedule addresses matrices of at most sixteen coordinates.
     Geometric entries are physical lower-triangle values before regularization
     and augmented drives. An index of -1 denotes an absent geometric entry.
+    ``geometric_stride`` is the geometry row length when the indexed block is a
+    slice of a larger row (a forest of trees sharing one geometry record);
+    ``geometric_group`` adds a ``geometry_group`` input mapping each factor
+    group to the geometry row it reads.
     """
     size, warps_per_block = int(size), int(warps_per_block)
     if not 1 <= size <= 16 or not 1 <= warps_per_block <= 32:
         raise ValueError("Small Cholesky requires 1..16 DOFs and 1..32 warps per block")
     if geometric_index and (not geometric or len(geometric_index) != size * size or min(geometric_index) < -1):
         raise ValueError("Geometric factor requires a complete physical matrix index")
+    if (geometric_stride or geometric_group) and not geometric_index:
+        raise ValueError("Geometry rows and groups require a physical matrix index")
+    if geometric_stride and geometric_stride <= max(geometric_index):
+        raise ValueError("Geometry stride must cover every indexed entry")
     elements = size * size
     inputs = list(_INPUTS)
     if geometric:
@@ -141,10 +157,15 @@ def get_kernel(size: int, *, warps_per_block: int = 4, geometric: bool = False, 
         mass_input = f"        float value = geometric.data[group * {elements} + element];"
         if geometric_index:
             inputs.append("geometry_lookup: wp.array[int]")
+            row = "group"
+            if geometric_group:
+                inputs.append("geometry_group: wp.array[int]")
+                row = "geometry_group.data[group]"
+            stride = geometric_stride or max(geometric_index) + 1
             mass_input = (
                 "        const int geometry_entry=geometry_lookup.data[element];\n"
                 "        float value = geometry_entry < 0 ? 0.0f : "
-                f"geometric.data[group * {max(geometric_index) + 1} + geometry_entry];"
+                f"geometric.data[{row} * {stride} + geometry_entry];"
             )
     else:
         mass_input = _COMPOSITE_INPUT

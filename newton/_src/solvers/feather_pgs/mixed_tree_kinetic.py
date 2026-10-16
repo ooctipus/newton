@@ -3,6 +3,8 @@
 
 """Compose complete tree caches over retained heterogeneous factor groups."""
 
+import os
+
 import numpy as np
 import warp as wp
 
@@ -283,6 +285,155 @@ class PrescribedRootOperator:
         """The zero inverse is owned here and never rebinds."""
 
 
+def forest_supported(solver):
+    """Whether every world is one forest of consecutive articulations with held or zero families."""
+    if not supported(solver):
+        return False
+    model = solver.model
+    worlds = int(solver.world_count)
+    art_world = solver.art_to_world.numpy()
+    prescribed = solver._prescribed_articulation.numpy()
+    counts = np.diff([*solver.articulation_dof_start.numpy().tolist(), model.joint_dof_count])
+    per_world = [np.flatnonzero(art_world == w) for w in range(worlds)]
+    if not per_world or any(len(a) != len(per_world[0]) or len(a) == 0 for a in per_world):
+        return False
+    if len(per_world[0]) > 4 or len(per_world[0]) < 2:
+        return False
+    signature = [(int(counts[a]), int(prescribed[a])) for a in per_world[0]]
+    for arts in per_world:
+        if np.any(np.diff(arts) != 1) or [(int(counts[a]), int(prescribed[a])) for a in arts] != signature:
+            return False
+    families = [0 if pres else size for size, pres in signature]
+    for size in sorted({f for f in families if f}):
+        if size == solver._compact_diagonal_mass_size or solver._crba_cholesky_warp_kernels_by_size.get(size) is None:
+            return False
+        group = solver.group_to_art[size].numpy()
+        if len(group) != worlds or not np.array_equal(art_world[group], np.arange(worlds)):
+            return False
+    return True
+
+
+class ForestHeldOperator:
+    """Own every articulation of a world as one group: shared scratch, one launch per phase.
+
+    Each root keeps its own held factor family (the solver's dense factor
+    for its size, refreshed from the forest's geometry) or responds with zero
+    when prescribed. This is the generic form of the per-world forest the
+    Franka owner was written around: roots, families and offsets come from
+    the topology.
+    """
+
+    def __init__(self, solver):
+        self.solver = solver
+        self.requires_body_velocity = True
+        self.free_root = True
+        self.diagonal = False
+        model, device = solver.model, solver.model.device
+        worlds = int(solver.world_count)
+        art_world = solver.art_to_world.numpy()
+        prescribed = solver._prescribed_articulation.numpy()
+        counts = np.diff([*solver.articulation_dof_start.numpy().tolist(), model.joint_dof_count])
+        arts = np.stack([np.flatnonzero(art_world == w) for w in range(worlds)]).astype(np.int32)
+        self.forest_arts = arts
+        self.root_families = tuple(0 if prescribed[a] else int(counts[a]) for a in arts[0])
+        starts = model.articulation_start.numpy()
+        first, end = int(starts[arts[0, 0]]), int(starts[arts[0, -1] + 1])
+        ancestors = model.joint_ancestor.numpy()[first:end]
+        parents = np.where(ancestors < 0, -1, ancestors - first)
+        joint_counts = np.diff(model.joint_qd_start.numpy())[first:end]
+        self.mass = mass = _SparseMassMatrixPlan.build(parents, joint_counts)
+        self.host = operator_metadata(mass)
+        self.group_to_art = wp.array(arts[:, 0].copy(), dtype=int, device=device)
+        self.plan = bind_operator_plan(solver, 0, self.host, group_to_art=self.group_to_art)
+        self.size = mass.dof_count
+        self.layout, _, _ = make_plan(model, self, complete=False)
+        # Physical (row, col) -> forest entry, for each root family's refresh.
+        physical_index = np.full((self.size, self.size), -1, np.int32)
+        for index, (row, col) in enumerate(zip(mass.entry_rows, mass.columns, strict=True)):
+            a, b = mass.permutation[row], mass.permutation[col]
+            physical_index[a, b] = physical_index[b, a] = index
+        self.data = HeldResponse()
+        self.data.valid = wp.ones(worlds, dtype=int, device=device)
+        self.data.status = wp.zeros(worlds, dtype=int, device=device)
+        self.data.inverse = wp.zeros(model.joint_dof_count, dtype=float, device=device)
+        factor_index = np.zeros((worlds, len(self.root_families)), np.int32)
+        self.families = []
+        for r, family in enumerate(self.root_families):
+            if family == 0:
+                continue
+            group = solver.group_to_art[family].numpy()
+            position = {int(a): g for g, a in enumerate(group)}
+            factor_index[:, r] = [position[int(a)] for a in arts[:, r]]
+            offset = self.layout.root_offsets[r]
+            block = physical_index[offset : offset + family, offset : offset + family]
+            # The family's factor groups read this root's block of their
+            # world's geometry record (one record per forest group).
+            self.families.append(
+                (
+                    r,
+                    family,
+                    geometric_factor(
+                        str(device.arch),
+                        size=family,
+                        geometric_index=tuple(map(int, block.ravel())),
+                        geometric_stride=self.layout.entries,
+                        geometric_group=True,
+                    ),
+                    wp.zeros(family, dtype=int, device=device),
+                    wp.array(
+                        [row * family + col for row in range(family) for col in range(row + 1)],
+                        dtype=int,
+                        device=device,
+                    ),
+                    wp.array(block.ravel().astype(np.int32), dtype=int, device=device),
+                    wp.array(art_world[group].astype(np.int32), dtype=int, device=device),
+                )
+            )
+            setattr(self.data, "lower" if r == 0 else f"lower{r}", solver.L_by_size[family])
+        for r, family in enumerate(self.root_families):
+            if family == 0 and r > 0:
+                setattr(self.data, f"lower{r}", self.data.lower)
+        self.data.factor_index = wp.array(factor_index, dtype=int, device=device)
+        self.kinetic_state = None
+
+    def refresh(self, state_aug):
+        """Refresh every root family's dense factor from the forest geometry."""
+        solver = self.solver
+        for _r, family, kernel, offsets, schedule, geometry_index, geometry_group in self.families:
+            wp.launch(
+                kernel,
+                dim=solver.n_arts_by_size[family] * 32,
+                inputs=[
+                    solver.n_arts_by_size[family],
+                    solver.model.articulation_start,
+                    solver.articulation_dof_start,
+                    solver.mass_update_mask,
+                    solver.model.joint_child,
+                    state_aug.joint_S_s,
+                    state_aug.body_I_s,
+                    solver.group_to_art[family],
+                    solver.R_by_size[family],
+                    offsets,
+                    schedule,
+                    1,
+                    solver._augmented_drive_row_by_dof,
+                    solver.aug_row_K,
+                    self.kinetic_state.geometric,
+                    geometry_index,
+                    geometry_group,
+                ],
+                outputs=[solver.L_by_size[family]],
+                block_dim=128,
+                device=solver.model.device,
+            )
+
+    def bind_response(self):
+        """Rebind the solver's held factors before a launch or capture."""
+        for r, family in enumerate(self.root_families):
+            if family:
+                setattr(self.data, "lower" if r == 0 else f"lower{r}", self.solver.L_by_size[family])
+
+
 class MixedTreeKineticState:
     """Compose disjoint factor-group caches with complete public-state coverage."""
 
@@ -292,9 +443,12 @@ class MixedTreeKineticState:
         self._dimensions = (solver.model.joint_count, solver.model.body_count, solver.model.articulation_count)
         # The coverage proof's inputs, compared on the device on notification.
         self._proof = DeviceProof(list(self._coverage_arrays()), solver.model.device)
-        operators = [TreeHeldOperator(solver, size) for size in solver.size_groups]
-        if self.coverage[-1]:
-            operators.append(PrescribedRootOperator(solver))
+        if os.environ.get("FEATHER_PGS_TREE_FOREST", "0") == "1" and forest_supported(solver):
+            operators = [ForestHeldOperator(solver)]
+        else:
+            operators = [TreeHeldOperator(solver, size) for size in solver.size_groups]
+            if self.coverage[-1]:
+                operators.append(PrescribedRootOperator(solver))
         self.groups = []
         for operator in operators:
             group = TreeKineticState(

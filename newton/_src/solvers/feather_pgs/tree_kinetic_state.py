@@ -24,6 +24,15 @@ class KineticPlan:
     children: wp.array[int]
     q_index: wp.array[int]
     root_slot: wp.array[int]
+    # Forest groups: the articulation of each root, each body's root index,
+    # each root's local body, each free root's local body and coordinate
+    # offset, and whether a coordinate takes passive springs.
+    arts: wp.array2d[int]
+    root_of: wp.array[int]
+    root_local: wp.array[int]
+    free_root_local: wp.array[int]
+    free_root_dof: wp.array[int]
+    dof_passive: wp.array[int]
 
 
 @wp.struct
@@ -52,6 +61,11 @@ class HeldResponse:
     inverse: wp.array[float]
     valid: wp.array[int]
     status: wp.array[int]
+    # Forest groups: one held factor family per root and each root's index in it.
+    lower1: wp.array3d[float]
+    lower2: wp.array3d[float]
+    lower3: wp.array3d[float]
+    factor_index: wp.array2d[int]
 
 
 @wp.struct
@@ -372,7 +386,7 @@ $REDUCE
 #endif
     if(lane==0) {
         cache.generation.data[group]+=1;
-        cache.current_valid.data[p.group_to_art.data[group]]=cache.status.data[group]==0;
+        $CURRENT_VALID
         cache.geometry_valid.data[group]=refresh&&cache.status.data[group]==0;
         if(refresh)cache.geometry_generation.data[group]=cache.generation.data[group];
     }
@@ -424,7 +438,7 @@ $REDUCE
         const int dof=ds+i,body=p.dof_joint.data[i];
         float value=-cache.bias.data[group*$DOFS+i]+f.joint_f.data[dof]+f.u0.data[dof];
         if(nonzero){$PROJECT}
-        if(i>=$ROOT_DOFS)value+=$PASSIVE;
+        if($SPRING_GUARD)value+=$PASSIVE;
         s[$SIX_BODIES+i]=value;
     }
 #if defined(__CUDA_ARCH__)
@@ -449,9 +463,7 @@ $REDUCE
     $SYNC;
 #endif
     // A prescribed (kinematic) free root keeps its given velocity: no transport.
-    if($FREE_ROOT&&lane==0&&f.kinematic_joint.data[js]==0) {
-        $TRANSPORT
-    }
+    $TRANSPORT_BLOCK
 """
 
 _LEVEL_REDUCE = r"""    for(int level=$LAST_PARENT;level>=0;--level) {
@@ -564,10 +576,11 @@ def get_helpers(layout: TreeLayout = REFERENCE_LAYOUT, chain_scan: bool = False,
     from . import kernels  # noqa: PLC0415
 
     store = "_store_terms(address, local, mass, radius, inertia_com, wrench, refresh)"
-    if layout.bodies == 1 and layout.root_dofs == 6:
-        # A root-only free body is a free rigid body: the matrix-free contact
-        # path reads its spatial inertia and bias wrench every substep, so
-        # publish them through the ordinary free-rigid finalization.
+    if (layout.bodies == 1 and layout.root_dofs == 6) or layout.free_roots > 0:
+        # A root-only free body is a free rigid body (in a forest, every free
+        # root is one): the matrix-free contact path reads its spatial inertia
+        # and bias wrench every substep, so publish them through the ordinary
+        # free-rigid finalization; the runtime free-rigid test skips tree bodies.
         store += """
 if data.is_free_rigid[data.body_to_articulation[body]] != 0:
     data.body_q_com[body] = pose_com
@@ -652,9 +665,10 @@ def get_state_kernel(
         dofs,
         "js + local",
         "ds + local",
-        "if wp.static(free_root) and lane == 0",
-        "plan.root_slot[group]",
+        "if wp.static(free_root) and lane == 0" if not layout.forest else "if lane < wp.static(free_roots)",
+        "plan.root_slot[group]" if not layout.forest else "plan.root_slot[group * wp.static(free_roots) + lane]",
     )
+    roots, free_roots, forest = len(layout.roots), layout.free_roots, layout.forest
     motion_setup = "motion_changed = _different_motion(data.joint_qd, motion_qd, ds, dofs)\n" if motion_velocity else ""
     motion_reuse = "        and motion_changed == 0\n" if motion_velocity else ""
     motion_bind = "qd = motion_qd" if motion_velocity else ""
@@ -688,12 +702,19 @@ art = p.group_to_art[group]
 ds, js = p.art_dof_start[art], p.art_joint_start[art]
 {motion_setup}\
 refresh = int(global_refresh != 0)
+valid = cache.current_valid[art]
+if wp.static(forest):
+    for root in range(1, wp.static(roots)):
+        valid = wp.min(valid, cache.current_valid[plan.arts[group, root]])
 if not wp.static(finish):
     refresh = int(refresh != 0 or requests[art] != 0)
+    if wp.static(forest):
+        for root in range(1, wp.static(roots)):
+            refresh = int(refresh != 0 or requests[plan.arts[group, root]] != 0)
     source_matches = _same_source(cache, group, data.joint_q, data.joint_qd)
 {copy_setup}\
     if (
-        cache.current_valid[art] != 0
+        valid != 0
         and source_matches != 0
 {motion_reuse}\
         and (
@@ -707,19 +728,35 @@ if not wp.static(finish):
         return
 if lane == 0:
     cache.current_valid[art] = 0
+    if wp.static(forest):
+        for root in range(1, wp.static(roots)):
+            cache.current_valid[plan.arts[group, root]] = 0
 """,
         relative="""
-if local == 0:
-    _store_origin(address, 1, wp.transform_get_translation(relative))
-    relative = wp.transform(wp.vec3(), wp.transform_get_rotation(relative))
+if wp.static(not forest):
+    if local == 0:
+        _store_origin(address, 1, wp.transform_get_translation(relative))
+        relative = wp.transform(wp.vec3(), wp.transform_get_rotation(relative))
+else:
+    if plan.parent[local] < 0:
+        _store_origin(address, 2 * plan.root_of[local] + 1, wp.transform_get_translation(relative))
+        relative = wp.transform(wp.vec3(), wp.transform_get_rotation(relative))
 """,
         poses=f"""
 scan_poses(address, plan)
-if lane == 0:
-    root_body = data.joint_child[js]
-    origin = wp.transform_point(_load_pose(address, 0), data.body_com[root_body])
-    _store_origin(address, 0, origin)
-    data.articulation_origin[art] = origin + _load_origin(address, 1)
+if wp.static(not forest):
+    if lane == 0:
+        root_body = data.joint_child[js]
+        origin = wp.transform_point(_load_pose(address, 0), data.body_com[root_body])
+        _store_origin(address, 0, origin)
+        data.articulation_origin[art] = origin + _load_origin(address, 1)
+else:
+    for root in range(lane, wp.static(roots), stride):
+        root_local = plan.root_local[root]
+        root_body = data.joint_child[js + root_local]
+        origin = wp.transform_point(_load_pose(address, root_local), data.body_com[root_body])
+        _store_origin(address, 2 * root, origin)
+        data.articulation_origin[plan.arts[group, root]] = origin + _load_origin(address, 2 * root + 1)
 _sync()
 origin = _load_origin(address, 0)
 shift = _load_origin(address, 1)
@@ -729,6 +766,9 @@ shift = _load_origin(address, 1)
 for local in range(lane, bodies, stride):
     joint = js + local
     parent = plan.parent[local]
+    if wp.static(forest):
+        origin = _load_origin(address, 2 * plan.root_of[local])
+        shift = _load_origin(address, 2 * plan.root_of[local] + 1)
     anchor = data.joint_X_p[joint]
     if parent >= 0:
         anchor = _load_pose(address, parent) * anchor
@@ -756,6 +796,9 @@ scan_motion(address, plan)
         bodies="""
 for local in range(lane, bodies, stride):
     body = data.joint_child[js + local]
+    if wp.static(forest):
+        origin = _load_origin(address, 2 * plan.root_of[local])
+        shift = _load_origin(address, 2 * plan.root_of[local] + 1)
     pose = _load_pose(address, local)
     data.body_q[body] = wp.transform(
         wp.transform_get_translation(pose) + shift, wp.transform_get_rotation(pose)
@@ -786,6 +829,8 @@ if lane == 0:
         + indent(stamp, "    "),
     )
     name = f"tree_kinetic_finish{bodies}" if finish else f"tree_kinetic_repair{bodies}"
+    if layout.forest:
+        name += f"_forest{roots}"
     if layout.pack > 1:
         name += f"_l{layout.lanes}"
     if chain_scan:
@@ -835,7 +880,16 @@ def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFER
         "PROJECT": cached_force.project_wrench("f.S.data[dof]", "s[6*body+k]", "value"),
         "PASSIVE": _FORCE.passive("plan.q_index.data[group*$DOFS+i]", "dof"),
         "VELOCITY": _FORCE.velocity("dof", "f.qdd.data[dof]"),
-        "TRANSPORT": _FORCE.transport("ds", "f.vhat.data[ds+k]"),
+        "TRANSPORT_BLOCK": (
+            "if($FREE_ROOT&&lane==0&&f.kinematic_joint.data[js]==0) {\n        "
+            + _FORCE.transport("ds", "f.vhat.data[ds+k]")
+            + "\n    }"
+            if not layout.forest
+            else "if(lane<$FREE_ROOTS&&f.kinematic_joint.data[js+plan.free_root_local.data[lane]]==0) {\n"
+            "        const int rd=ds+plan.free_root_dof.data[lane];\n        "
+            + _FORCE.transport("rd", "f.vhat.data[rd+k]")
+            + "\n    }"
+        ),
         "REDUCE": reduction,
         "TRANSPOSE_ACTION": inverse.transpose("col", "s[$WHITE+$index]"),
         "RESPONSE_PHYSICAL": "$PHYSICAL_INDEX",
@@ -854,7 +908,7 @@ def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFER
 """
     )
     data_type = sparse_factor.SparseData
-    if response == "cholesky":
+    if response == "cholesky" and not layout.forest:
         held = response_operator.CholeskySolve(layout.dofs, f"d.lower.data+group*{layout.dofs**2}")
         operations["FORWARD_STAGE"] = (
             "if(lane==0){\n"
@@ -862,6 +916,31 @@ def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFER
             + held.transpose("s[$WHITE+$index]", "s[$WHITE+$index]")
             + "\n}\n#if defined(__CUDA_ARCH__)\n$SYNC;\n#endif\n"
         )
+        operations["TRANSPOSE_ACTION"] = "float value=s[$WHITE+col];"
+        operations["RESPONSE_PHYSICAL"] = "col"
+        data_type = HeldResponse
+    elif response == "cholesky":
+        # One held factor family per root, each applied by its own lane over
+        # the root's coordinate slice; a prescribed root (family 0) responds
+        # with zero.
+        roots = len(layout.roots)
+        stages = []
+        for r, (offset, family) in enumerate(zip(layout.root_offsets, layout.root_families, strict=True)):
+            if family == 0:
+                width = layout.root_coordinates[r]
+                stages.append(f"if(lane=={r}){{for(int k=0;k<{width};++k)s[$WHITE+{offset}+k]=0.0f;}}")
+                continue
+            lower = "d.lower" if r == 0 else f"d.lower{r}"
+            held = response_operator.CholeskySolve(
+                family, f"{lower}.data+d.factor_index.data[group*{roots}+{r}]*{family * family}"
+            )
+            stages.append(
+                f"if(lane=={r}){{\n"
+                + held.forward(f"s[$SIX_BODIES+{offset}+$index]", f"s[$WHITE+{offset}+$index]")
+                + held.transpose(f"s[$WHITE+{offset}+$index]", f"s[$WHITE+{offset}+$index]")
+                + "\n}"
+            )
+        operations["FORWARD_STAGE"] = "\n".join(stages) + "\n#if defined(__CUDA_ARCH__)\n$SYNC;\n#endif\n"
         operations["TRANSPOSE_ACTION"] = "float value=s[$WHITE+col];"
         operations["RESPONSE_PHYSICAL"] = "col"
         data_type = HeldResponse
@@ -896,6 +975,8 @@ def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFER
         native(group, p, d, plan, cache, f)
 
     predict.__name__ = predict.__qualname__ = f"tree_kinetic_predict{layout.dofs}"
+    if layout.forest:
+        predict.__name__ = predict.__qualname__ = predict.__name__ + f"_forest{len(layout.roots)}"
     if layout.pack > 1:
         predict.__name__ = predict.__qualname__ = predict.__name__ + f"_l{layout.lanes}"
     if chain_scan:

@@ -80,8 +80,25 @@ def make_plan(model, operator, *, complete=True):
     if complete and not np.array_equal(np.sort(group), np.arange(arts)):
         raise ValueError("Cached tree groups must cover every articulation exactly once")
     counts_by_art = np.diff(starts)
-    bodies = int(counts_by_art[group[0]])
-    if not 1 <= bodies <= 64 or not np.all(counts_by_art[group] == bodies):
+    # A forest group owns several consecutive articulations of one world; the
+    # operator names them and the group map holds the first of each.
+    forest = getattr(operator, "forest_arts", None)
+    forest = None if forest is None else np.asarray(forest, np.int64)
+    if forest is not None:
+        if forest.ndim != 2 or forest.shape[0] != len(group) or not np.array_equal(forest[:, 0], group):
+            raise ValueError("Cached forest groups must start at their group articulation")
+        if np.any(starts[forest[:, 1:]] != starts[forest[:, :-1] + 1]):
+            raise ValueError("Cached forest articulations must be consecutive")
+        bodies = int(np.sum(counts_by_art[forest[0]]))
+        if np.any(np.sum(counts_by_art[forest], axis=1) != bodies) or np.any(
+            counts_by_art[forest] != counts_by_art[forest[0]][None, :]
+        ):
+            raise ValueError("Cached forest groups require uniform tree sizes")
+        root_locals = tuple(int(v) for v in np.concatenate(([0], np.cumsum(counts_by_art[forest[0]])[:-1])))
+    else:
+        bodies = int(counts_by_art[group[0]])
+        root_locals = (0,)
+    if not 1 <= bodies <= 64 or not np.all(counts_by_art[group] == counts_by_art[group[0]]):
         raise ValueError("Cached tree groups require uniform body counts up to 64")
     joints = starts[group, None] + np.arange(bodies)
     qd = model.joint_qd_start.numpy()
@@ -97,19 +114,26 @@ def make_plan(model, operator, *, complete=True):
     ancestors = model.joint_ancestor.numpy()[joints]
     local = np.where(ancestors >= 0, ancestors - starts[group, None], -1)
     parent = local[0].astype(np.int32)
+    is_root = np.zeros(bodies, bool)
+    is_root[list(root_locals)] = True
     if (
         not np.all(local == parent)
-        or parent[0] != -1
-        or np.any(parent[1:] < 0)
+        or np.any(parent[is_root] != -1)
+        or np.any(parent[~is_root] < 0)
         or np.any(parent[1:] >= np.arange(1, bodies))
     ):
         raise ValueError("Cached trees require one uniform parent-first topology")
     types = model.joint_type.numpy()[joints]
-    locked_root = types[0, 0] == int(JointType.D6) and np.all(counts[:, 0] == 0)
-    if not np.all(types == types[0]) or (
-        types[0, 0] not in (int(JointType.FREE), int(JointType.FIXED)) and not locked_root
-    ):
-        raise ValueError("Cached trees require a free, fixed or zero-coordinate D6 root")
+    if not np.all(types == types[0]):
+        raise ValueError("Cached trees require one uniform parent-first topology")
+    root_coordinates = []
+    for root in root_locals:
+        locked_root = types[0, root] == int(JointType.D6) and np.all(counts[:, root] == 0)
+        if types[0, root] not in (int(JointType.FREE), int(JointType.FIXED)) and not locked_root:
+            raise ValueError("Cached trees require a free, fixed or zero-coordinate D6 root")
+        root_coordinates.append(int(counts[0, root]))
+    non_root = np.ones(bodies, bool)
+    non_root[list(root_locals)] = False
     # Descendants may carry one or several coordinates: the motion scan stores
     # one axis per coordinate through jcalc_motion and the integrator handles
     # every joint type; the mass plan takes per-body coordinate counts.
@@ -120,7 +144,7 @@ def make_plan(model, operator, *, complete=True):
         int(JointType.D6),
         int(JointType.BALL),
     )
-    if not np.all(np.isin(types[:, 1:], descendants)):
+    if not np.all(np.isin(types[:, non_root], descendants)):
         raise ValueError("Cached trees require fixed, scalar, D6 or ball descendant joints")
     if not np.all(counts == counts[0]) or not np.all(
         qd[joints] - qd[starts[group, None]] == qd[joints[0]] - qd[starts[group[0]]]
@@ -135,6 +159,17 @@ def make_plan(model, operator, *, complete=True):
     if prescribed:
         if bodies != 1 or dofs != 6 or not np.all(kinematic[:, 0]):
             raise ValueError("Prescribed cached roots must be single kinematic free bodies")
+    elif forest is not None:
+        # A forest may carry prescribed free roots (a zero family); every other
+        # coordinate body is dynamic.
+        families = np.asarray(operator.root_families, np.int64)
+        for r, root in enumerate(root_locals):
+            if families[r] == 0 and not np.all(kinematic[:, root]):
+                raise ValueError("A zero-family forest root must be a kinematic free body")
+            if families[r] != 0 and np.any(kinematic[:, root]):
+                raise ValueError("A dynamic forest root must not be kinematic")
+        if np.any(kinematic[:, non_root] & coordinate_bodies[:, non_root]):
+            raise ValueError("Cached trees exclude kinematic bodies with coordinates")
     elif np.any(kinematic & coordinate_bodies):
         raise ValueError("Cached trees exclude kinematic bodies with coordinates")
     mass = _SparseMassMatrixPlan.build(parent, counts[0])
@@ -145,6 +180,7 @@ def make_plan(model, operator, *, complete=True):
     depth = np.zeros(bodies, np.int32)
     for body in range(1, bodies):
         depth[body] = depth[parent[body]] + 1
+    offsets = tuple(int(v) for v in np.cumsum(np.concatenate(([0], counts[0])))[list(root_locals)])
     layout = TreeLayout(
         bodies,
         dofs,
@@ -154,5 +190,9 @@ def make_plan(model, operator, *, complete=True):
         int(counts[0, 0]),
         tuple(map(int, mass.permutation)),
         lanes_for(bodies, len(group), model.device),
+        roots=root_locals,
+        root_coordinates=tuple(root_coordinates),
+        root_offsets=offsets,
+        root_families=tuple(int(v) for v in getattr(operator, "root_families", ())) or (dofs,),
     )
     return layout, parent, depth
