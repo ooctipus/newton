@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Admission for the existing sparse representation using shared tree state."""
+"""Admission of the packed sparse factor's tree state (one heavy chain per world)."""
 
 import numpy as np
 
@@ -40,13 +40,13 @@ def supported(solver):
     )
 
 
-class G1KineticState(TreeKineticState):
-    """Keep the existing sparse representation's production admission."""
+class PackedTreeState(TreeKineticState):
+    """The packed sparse factor's tree state, admitted in its original group/world order."""
 
     def __init__(self, sparse_owner):
         worlds = sparse_owner.solver.world_count
         if not np.array_equal(sparse_owner.plan.group_to_art.numpy(), np.arange(worlds)) or not np.array_equal(
             sparse_owner.plan.art_to_world.numpy(), np.arange(worlds)
         ):
-            raise ValueError("Packed G1 cache requires its original group/world order")
+            raise ValueError("Packed tree cache requires its original group/world order")
         super().__init__(sparse_owner, admission=supported if sparse_owner.solver.model.device.is_cuda else None)

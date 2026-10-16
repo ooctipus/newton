@@ -13,7 +13,7 @@ import numpy as np
 import warp as wp
 
 from newton import JointType
-from newton._src.solvers.feather_pgs import allegro_kinetic_rows as rows
+from newton._src.solvers.feather_pgs import keyed_rows as rows
 from newton._src.solvers.feather_pgs.kernels import compute_world_contact_bias
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_parallel_kernel
 
@@ -88,7 +88,7 @@ def fixture(snapshot, device):
             dtype = wp.vec3 if name.endswith(("point0", "point1", "normal")) else None
             setattr(contact, name, array(key, dtype))
     contact.rigid_contact_max = len(snapshot["contact_rigid_contact_point0"])
-    owner = rows.AllegroKineticRows(solver)
+    owner = rows.KeyedRows(solver)
     return solver, state, aug, contact, owner
 
 
@@ -250,7 +250,7 @@ def launch_parallel(calls, worlds, device):
         wp.launch_tiled(kernel, dim=[worlds], inputs=arguments, block_dim=kernel._fpgs_block_dim, device=device)
 
 
-class TestAllegroKineticRowsCPU(unittest.TestCase):
+class TestKeyedRowsCPU(unittest.TestCase):
     def test_unsupported_moving_joint_kind(self):
         """Reject a moving type absent from the original velocity-limit allocator."""
         with np.load(next(captures())) as snapshot:
@@ -260,7 +260,7 @@ class TestAllegroKineticRowsCPU(unittest.TestCase):
             types[moving[0]] = int(JointType.BALL)
             solver.model.joint_type.assign(types)
             with self.assertRaisesRegex(ValueError, "velocity-limit"):
-                rows.topology_plan(solver)
+                rows.direct_topology_plan(solver)
 
     def test_module_contract(self):
         """Expose the complete typed-row owner and direct kinetic consumer."""
@@ -385,7 +385,7 @@ class TestAllegroKineticRowsCPU(unittest.TestCase):
                 self.assertEqual(len(calls), 4)
 
 
-class TestAllegroKineticRowsCUDA(unittest.TestCase):
+class TestKeyedRowsCUDA(unittest.TestCase):
     def setUp(self):
         """Require a real visible CUDA device for the explicit native selectors."""
         if not wp.is_cuda_available():

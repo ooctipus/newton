@@ -11,7 +11,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import allegro_kinetic_rows as rows
+from newton._src.solvers.feather_pgs import keyed_rows as rows
 from newton._src.solvers.feather_pgs import solver_feather_pgs as source
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton.tests.test_feather_pgs_sparse_solver import STATE_FIELDS, _build_model, _make_solver, _step
@@ -75,9 +75,9 @@ class TestKeyedRowIntegration(unittest.TestCase):
             for capacity in (8, 32):
                 with self.subTest(free_count=free_count, capacity=capacity):
                     ordinary, keyed = make_case(False, capacity, free_count), make_case(True, capacity, free_count)
-                    self.assertIsNone(ordinary[1]._allegro_kinetic_rows)
-                    self.assertIsNotNone(keyed[1]._allegro_kinetic_rows)
-                    self.assertEqual(keyed[1]._allegro_kinetic_rows.layout.primary, 9)
+                    self.assertIsNone(ordinary[1]._keyed_rows)
+                    self.assertIsNotNone(keyed[1]._keyed_rows)
+                    self.assertEqual(keyed[1]._keyed_rows.layout.primary, 9)
                     seen = False
                     for _ in range(8):
                         _step(ordinary)
@@ -89,7 +89,7 @@ class TestKeyedRowIntegration(unittest.TestCase):
     def test_held_factor_graph_and_masked_reset(self):
         """Preserve held factors and masked reset inside CUDA graphs."""
         ordinary, keyed = make_case(False, 32), make_case(True, 32)
-        self.assertIsNotNone(keyed[1]._allegro_kinetic_rows)
+        self.assertIsNotNone(keyed[1]._keyed_rows)
         for case in (ordinary, keyed):
             _step(case)
         with wp.ScopedCapture("cuda:0") as capture:
@@ -124,8 +124,8 @@ class TestKeyedRowIntegration(unittest.TestCase):
             with self.subTest(capacity=capacity):
                 ordinary = make_case(False, capacity, exact=True, world_rows=True, model_factory=model_factory)
                 keyed = make_case(True, capacity, exact=True, world_rows=True, model_factory=model_factory)
-                self.assertIsNotNone(keyed[1]._allegro_kinetic_rows)
-                self.assertEqual(keyed[1]._allegro_kinetic_rows.layout.primary, 18)
+                self.assertIsNotNone(keyed[1]._keyed_rows)
+                self.assertEqual(keyed[1]._keyed_rows.layout.primary, 18)
                 for kernel in keyed[1]._pgs_solve_mf_gs_incremental_kernels:
                     self.assertIn("_rw", kernel.key)
                 for _ in range(8):
@@ -136,18 +136,18 @@ class TestKeyedRowIntegration(unittest.TestCase):
     def test_generic_world_row_request_selects_keyed_inputs(self):
         """Adopt admitted physical keys without naming a task or adding a caller flag."""
         case = make_case(None, 32, exact=True, world_rows=True)
-        self.assertIsNotNone(case[1]._allegro_kinetic_rows)
-        self.assertIsNotNone(case[1]._allegro_kinetic_rows.layout)
+        self.assertIsNotNone(case[1]._keyed_rows)
+        self.assertIsNotNone(case[1]._keyed_rows.layout)
         self.assertIsNone(getattr(case[1], "_wr_world_contacts", None))
 
     def test_physical_reader_against_captured_allegro_operator(self):
         """Compare the physical reader with independent captured mass actions."""
-        from tools.fpgs_bench import test_allegro_kinetic_rows as capture  # noqa: PLC0415
+        from tools.fpgs_bench import test_keyed_rows as capture  # noqa: PLC0415
 
         original = rows.get_parallel_factory
         layout = KeyedLayout(16, 6, 0, 16, 128, True, (1 << 16) - 1)
         with patch.object(rows, "get_parallel_factory", lambda factory: original(factory, layout)):
-            test = capture.TestAllegroKineticRowsCUDA()
+            test = capture.TestKeyedRowsCUDA()
             test.setUp()
             test.test_native_parallel_matched_current_inputs()
 

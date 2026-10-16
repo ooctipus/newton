@@ -16,7 +16,7 @@ from newton._src.solvers.feather_pgs import franka_kinetic_state, kinetic_state
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _FeatherPGSModelPlan
 from tools.fpgs_bench import test_franka_kinetic_state as forest
 from tools.fpgs_bench import test_world_scan_publication as publication
-from tools.fpgs_bench.test_g1_kinetic_state import physical_mass, public_reference, public_state
+from tools.fpgs_bench.test_packed_tree_state import physical_mass, public_reference, public_state
 
 
 def forest_model(device, worlds=5):

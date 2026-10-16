@@ -8,7 +8,7 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import allegro_kinetic_rows as rows
+from newton._src.solvers.feather_pgs import keyed_rows as rows
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout, prefix_kernel
 
 

@@ -13,7 +13,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs.franka_kinetic_state import FrankaKineticState, build_plan, supported
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS, _FeatherPGSModelPlan
-from tools.fpgs_bench.test_g1_kinetic_state import physical_mass, public_state
+from tools.fpgs_bench.test_packed_tree_state import physical_mass, public_state
 
 DT = 1.0 / 240.0
 

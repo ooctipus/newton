@@ -568,11 +568,11 @@ class TestSparseFactorCUDA(unittest.TestCase):
             original = SolverFeatherPGS(m, **options)
         flags = {"FEATHER_PGS_SPARSE_FACTOR": "1", "FEATHER_PGS_SINGLE_FACTOR": "0"}
         if capacity == 56:
-            flags.update(FEATHER_PGS_SPARSE_LEVEL_UPDATE="1", FEATHER_PGS_G1_KINETIC_STATE="1")
+            flags.update(FEATHER_PGS_SPARSE_LEVEL_UPDATE="1", FEATHER_PGS_PACKED_TREE_KINETIC_STATE="1")
         with patch.dict(os.environ, flags):
             candidate = SolverFeatherPGS(m, **options, grouped_dynamics=capacity == 56)
         self.assertIsNotNone(candidate._sparse_factor)
-        self.assertIsNone(candidate._g1_kinetic_state)
+        self.assertIsNone(candidate._packed_tree_state)
         if os.environ.get("FEATHER_PGS_SPARSE_PARALLEL_LIMITS") == "1":
             self.assertEqual(candidate._sparse_factor.parallel_limit_prefix, capacity == 100)
             expected = "sparse_factor_parallel_limit_prefix43" if capacity == 100 else "build_limit_prefix"

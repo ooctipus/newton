@@ -2910,19 +2910,28 @@ class SolverFeatherPGS(SolverBase):
             from .franka_row_packets import create_owner  # noqa: PLC0415
 
             self._row_packets = create_owner(self)
-        self._allegro_kinetic_rows = None
+        self._keyed_rows = None
         if (
             self._sparse_mass_matrix_size is None
             and self._point_contact_paths
             and (
-                os.environ.get("FEATHER_PGS_ALLEGRO_KINETIC_ROWS") == "1"
+                # Keyed rows are on wherever world rows are; FEATHER_PGS_KEYED_ROWS=0 opts
+                # out. The earlier robot-named and "generated" flags remain as aliases.
+                os.environ.get("FEATHER_PGS_KEYED_ROWS") == "1"
+                or os.environ.get("FEATHER_PGS_ALLEGRO_KINETIC_ROWS") == "1"
                 or os.environ.get("FEATHER_PGS_GENERATED_KEYED_ROWS") == "1"
-                or (_WR_ON and os.environ.get("FEATHER_PGS_GENERATED_KEYED_ROWS") != "0")
+                or (
+                    _WR_ON
+                    and os.environ.get(
+                        "FEATHER_PGS_KEYED_ROWS", os.environ.get("FEATHER_PGS_GENERATED_KEYED_ROWS", "1")
+                    )
+                    != "0"
+                )
             )
         ):
-            from .allegro_kinetic_rows import create_owner as create_kinetic_rows_owner  # noqa: PLC0415
+            from .keyed_rows import create_owner as create_kinetic_rows_owner  # noqa: PLC0415
 
-            self._allegro_kinetic_rows = create_kinetic_rows_owner(self)
+            self._keyed_rows = create_kinetic_rows_owner(self)
         self._init_tiled_kernels(model)
         self._init_size_group_streams(model)
         self._dummy_contact_impulses = wp.zeros((1, 1), dtype=wp.float32, device=model.device)
@@ -3499,23 +3508,23 @@ class SolverFeatherPGS(SolverBase):
             kinetic.validate_notification(flags, plan_snapshot=plan_snapshot)
         if self._row_packets is not None:
             self._row_packets.validate_notification(flags)
-        if self._allegro_kinetic_rows is not None:
-            self._allegro_kinetic_rows.validate_notification(flags)
+        if self._keyed_rows is not None:
+            self._keyed_rows.validate_notification(flags)
         if joint_world is not None:
             joint_world.validate_notification(flags, plan_snapshot=plan_snapshot)
         if publication is not None:
             publication.validate_notification(flags, plan_snapshot=plan_snapshot)
         if kinetic is not None:
             kinetic.invalidate_model_changed(flags)
-        g1_kinetic = getattr(self, "_tree_kinetic_state", None)
-        if g1_kinetic is not None and flags & (
+        tree_cache = getattr(self, "_tree_kinetic_state", None)
+        if tree_cache is not None and flags & (
             ModelFlags.JOINT_PROPERTIES
             | ModelFlags.JOINT_DOF_PROPERTIES
             | ModelFlags.BODY_PROPERTIES
             | ModelFlags.BODY_INERTIAL_PROPERTIES
             | ModelFlags.MODEL_PROPERTIES
         ):
-            g1_kinetic.invalidate()
+            tree_cache.invalidate()
         if franka_kinetic is not None:
             franka_kinetic.invalidate(None)
         if self._fk_id_cache_enabled and flags & (
@@ -7332,17 +7341,17 @@ class SolverFeatherPGS(SolverBase):
             self._pgs_solve_mf_gs_incremental_kernels = []
             self._ink_sizes = self._build_inkernel_response_meta() if (parallel_rows > 0 and _INK_ON) else None
             self._ink_rows = int(parallel_rows)
-            if _WR_ON and self._ink_sizes is not None and self._allegro_kinetic_rows is None:
+            if _WR_ON and self._ink_sizes is not None and self._keyed_rows is None:
                 self._wr_world_contacts = wp.empty(
                     (self.world_count, int(self.dense_max_constraints)), dtype=wp.int32, device=model.device
                 )
                 self._wr_world_contact_counts = wp.zeros(self.world_count, dtype=wp.int32, device=model.device)
             if parallel_rows > 0:
                 parallel_factory = _get_pgs_solve_parallel_kernel
-                if self._allegro_kinetic_rows is not None:
-                    from .allegro_kinetic_rows import get_parallel_factory  # noqa: PLC0415
+                if self._keyed_rows is not None:
+                    from .keyed_rows import get_parallel_factory  # noqa: PLC0415
 
-                    parallel_factory = get_parallel_factory(parallel_factory, self._allegro_kinetic_rows.layout)
+                    parallel_factory = get_parallel_factory(parallel_factory, self._keyed_rows.layout)
                 tiers = [(min(32, parallel_rows), 0)]
                 if parallel_rows > 32:
                     tiers.append((min(64, parallel_rows), 32))
@@ -7377,9 +7386,7 @@ class SolverFeatherPGS(SolverBase):
                             inkernel_response=self._ink_sizes,
                             has_drive_rows=has_drive_rows,
                             exact_row_sums=_MF_EXACT_ROWSUM,
-                            world_rows=bool(
-                                _WR_ON and self._ink_sizes is not None and self._allegro_kinetic_rows is None
-                            ),
+                            world_rows=bool(_WR_ON and self._ink_sizes is not None and self._keyed_rows is None),
                         )
                     )
                     self._pgs_solve_mf_gs_incremental_kernels[-1]._fpgs_tier = tier_index
@@ -7401,9 +7408,7 @@ class SolverFeatherPGS(SolverBase):
                             inkernel_response=self._ink_sizes,
                             has_drive_rows=has_drive_rows,
                             exact_row_sums=_MF_EXACT_ROWSUM,
-                            world_rows=bool(
-                                _WR_ON and self._ink_sizes is not None and self._allegro_kinetic_rows is None
-                            ),
+                            world_rows=bool(_WR_ON and self._ink_sizes is not None and self._keyed_rows is None),
                             lean_sweep=os.environ.get("FEATHER_PGS_SHADOW_VARIANT", "lean") == "lean",
                             bound_finger=os.environ.get("FEATHER_PGS_SHADOW_VARIANT", "lean") == "finger",
                         )
@@ -8815,7 +8820,7 @@ class SolverFeatherPGS(SolverBase):
                     if getattr(gs_kernel, "_fpgs_extra_inputs", False):
                         inputs = inputs + self._inkernel_response_inputs()
                         if getattr(gs_kernel, "_fpgs_kinetic_rows", False):
-                            inputs = [*inputs, self._allegro_kinetic_rows.data]
+                            inputs = [*inputs, self._keyed_rows.data]
                         inputs = inputs + self._world_rows_inputs()
                     launch_kernel = gs_kernel
                     outputs = [self.v_out]
@@ -11041,13 +11046,13 @@ class SolverFeatherPGS(SolverBase):
         # the Cholesky kernels never read H when mass_update_mask is 0.
         if self._memset_stream is not None:
             with wp.ScopedTimer("DB_Memset", print=False, use_nvtx=self._nvtx, synchronize=False):
-                if self._row_packets is None and self._allegro_kinetic_rows is None:
+                if self._row_packets is None and self._keyed_rows is None:
                     wp.copy(self._j_active_counts[self._buf_idx], self.constraint_count)
                 with wp.ScopedStream(self._memset_stream):
                     for size in self.size_groups:
                         if self._mass_update_global_flag:
                             self._H_bufs[self._buf_idx][size].zero_()
-                        if self._row_packets is not None or self._allegro_kinetic_rows is not None:
+                        if self._row_packets is not None or self._keyed_rows is not None:
                             continue  # Private J is current; general active rows are cleared before materialization.
                         if self._sparse_diagonal_contact_solve and size == self._sparse_diagonal_response_size:
                             # Sparse response owns no dense J; its buffer is a one-float placeholder.
@@ -13237,9 +13242,7 @@ class SolverFeatherPGS(SolverBase):
             self._propagation_first_rejected_slot if propagation_active else self._dummy_mf_slot_counter
         )
         j_buffers_zeroed = (
-            self._sparse_mass_matrix_size is not None
-            or self._row_packets is not None
-            or self._allegro_kinetic_rows is not None
+            self._sparse_mass_matrix_size is not None or self._row_packets is not None or self._keyed_rows is not None
         )
         if self._compact_contact_boundary:
             from .compact_contact import clear_limit_prefix  # noqa: PLC0415
@@ -13257,8 +13260,8 @@ class SolverFeatherPGS(SolverBase):
             self._capture_state_in = state_in
         if self._row_packets is not None:
             self._row_packets.prepare_prefix(state_in, dt)
-        if self._allegro_kinetic_rows is not None:
-            self._allegro_kinetic_rows.begin_rows(state_in, state_aug, dt)
+        if self._keyed_rows is not None:
+            self._keyed_rows.begin_rows(state_in, state_aug, dt)
 
         drive_active = self.drive_mode == "physx_pgs" and self.drive_slot is not None
         if drive_active:
@@ -13543,7 +13546,7 @@ class SolverFeatherPGS(SolverBase):
             self.enable_joint_limits
             and self._joint_limit_sizes
             and self._row_packets is None
-            and self._allegro_kinetic_rows is None
+            and self._keyed_rows is None
         ):
             if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
                 for size in self.size_groups:
@@ -13668,7 +13671,7 @@ class SolverFeatherPGS(SolverBase):
         # Unconditional: the phase-3 boundary must include position-limit
         # rows and remain valid when that family is disabled (when it is just
         # the current watermark at the start of the velocity-limit segment).
-        if self._row_packets is None and self._allegro_kinetic_rows is None:
+        if self._row_packets is None and self._keyed_rows is None:
             wp.launch(
                 snapshot_dense_phase_bound,
                 dim=self.world_count,
@@ -13685,11 +13688,7 @@ class SolverFeatherPGS(SolverBase):
         # positional-limit rows — physx-deep-dive §7) is enforced by the GS
         # phase schedule, which visits velocity-limit rows in a dedicated
         # final pass regardless of slot order.
-        if (
-            self.enable_joint_velocity_limits
-            and self.velocity_limit_slot is not None
-            and self._allegro_kinetic_rows is None
-        ):
+        if self.enable_joint_velocity_limits and self.velocity_limit_slot is not None and self._keyed_rows is None:
             wp.launch(
                 allocate_joint_velocity_limit_slots,
                 dim=model.articulation_count,
@@ -13717,7 +13716,7 @@ class SolverFeatherPGS(SolverBase):
             )
 
         # Unconditional phase-5 boundary snapshot; dense contact rows start here.
-        if self._row_packets is None and self._allegro_kinetic_rows is None:
+        if self._row_packets is None and self._keyed_rows is None:
             wp.launch(
                 snapshot_dense_phase_bound,
                 dim=self.world_count,
@@ -13735,11 +13734,7 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
-        if (
-            self.enable_joint_velocity_limits
-            and self.velocity_limit_slot is not None
-            and self._allegro_kinetic_rows is None
-        ):
+        if self.enable_joint_velocity_limits and self.velocity_limit_slot is not None and self._keyed_rows is None:
             if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
                 for size in self.size_groups:
                     self.J_by_size[size].zero_()
@@ -13897,8 +13892,8 @@ class SolverFeatherPGS(SolverBase):
 
             if self._row_packets is not None:
                 self._row_packets.produce_contacts(state_in, state_aug, contacts, dt)
-            elif self._allegro_kinetic_rows is not None:
-                self._allegro_kinetic_rows.produce_contacts(state_in, state_aug, contacts, dt)
+            elif self._keyed_rows is not None:
+                self._keyed_rows.produce_contacts(state_in, state_aug, contacts, dt)
             elif self._compact_contact_boundary:
                 from .compact_contact import launch_contacts  # noqa: PLC0415
 
@@ -14997,8 +14992,8 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[self.diag],
                 device=model.device,
             )
-        if self._allegro_kinetic_rows is not None:
-            self._allegro_kinetic_rows.finish_rows()
+        if self._keyed_rows is not None:
+            self._keyed_rows.finish_rows()
         if getattr(self, "_wr_world_contacts", None) is not None:
             # World rows: per-world contact lists for the sweep kernel (contacts are dense-routed and have slots now).
             self._wr_world_contact_counts.zero_()
@@ -15912,7 +15907,7 @@ class SolverFeatherPGS(SolverBase):
     ):
         if self._sparse_prepare_contacts:
             return  # The admitted sparse path has a single position pass.
-        if self._row_packets is not None or self._allegro_kinetic_rows is not None:
+        if self._row_packets is not None or self._keyed_rows is not None:
             if (
                 output is not None
                 or preserve_unreached_speculative
@@ -16003,7 +15998,7 @@ class SolverFeatherPGS(SolverBase):
                 raise RuntimeError("Sparse factor excludes non-matrix-free restitution")
             self._sparse_factor.restitution(dt)
             return
-        if self._row_packets is not None or self._allegro_kinetic_rows is not None:
+        if self._row_packets is not None or self._keyed_rows is not None:
             return  # The current packet producer applies the same incident-velocity law.
         if matrix_free:
             if self._sparse_mass_matrix_size is not None:

@@ -17,7 +17,7 @@ from newton._src.solvers.feather_pgs.tree_kinetic_owner import TreeKineticState
 from newton._src.solvers.feather_pgs.tree_kinetic_plan import make_plan
 from newton._src.solvers.feather_pgs.tree_kinetic_sparse import TreeSparseOperator
 from newton.tests import test_feather_pgs_sparse_solver as native
-from tools.fpgs_bench.test_g1_kinetic_state import physical_mass, public_state
+from tools.fpgs_bench.test_packed_tree_state import physical_mass, public_state
 from tools.fpgs_bench.test_tree_locked_root import locked_roots
 
 

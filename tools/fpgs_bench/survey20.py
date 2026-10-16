@@ -55,7 +55,7 @@ RECIPES = {
             "SPARSE_PARALLEL_LIMITS",
             "SPARSE_LEVEL_UPDATE",
             "SPARSE_METRIC_TANGENTS",
-            "G1_KINETIC_STATE",
+            "PACKED_TREE_KINETIC_STATE",
             "G1_CHAIN_SCAN",
             "SPARSE_SPECTRAL_TANGENTS",
             "SPARSE_LIMIT_JACOBI",

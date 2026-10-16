@@ -11,7 +11,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_JOINT_LIMIT
 from tools.fpgs_bench.test_cholesky_forest_cache import DT, build_plan, make_solver, model_fixture
-from tools.fpgs_bench.test_g1_kinetic_state import physical_mass, public_state
+from tools.fpgs_bench.test_packed_tree_state import physical_mass, public_state
 
 
 def make_case(enabled, variant, primary=9, *, friction_anchor_beta=0.0):

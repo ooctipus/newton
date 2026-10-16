@@ -51,7 +51,7 @@ def make_solver(model, enabled, **overrides):
     }
     options.update(overrides)
     with (
-        patch.dict(os.environ, {**ENV, "FEATHER_PGS_G1_KINETIC_STATE": str(int(enabled))}),
+        patch.dict(os.environ, {**ENV, "FEATHER_PGS_PACKED_TREE_KINETIC_STATE": str(int(enabled))}),
         patch.object(
             SolverFeatherPGS, "_kernel_overrides", {**SolverFeatherPGS._kernel_overrides, "sparse_mass_matrix": False}
         ),
@@ -188,13 +188,13 @@ def stage_predict(solver, state, output, control):
     solver._stage1_crba(augmented, inertia, drives)
     if ready is not None:
         wp.get_stream(solver.model.device).wait_event(ready)
-    if solver._g1_kinetic_state is None:
+    if solver._packed_tree_state is None:
         solver._stage3_zero_qdd(augmented)
         solver._sparse_factor.predict(augmented)
         solver._stage3_compute_v_hat(state, augmented, DT, velocity)
         solver._clamp_rigid_velocity_limits(solver.v_hat)
     else:
-        solver._g1_kinetic_state.predict(state, augmented, control, velocity, DT)
+        solver._packed_tree_state.predict(state, augmented, control, velocity, DT)
         solver._clamp_rigid_velocity_limits(solver.v_hat)
     return augmented, velocity
 
@@ -249,18 +249,18 @@ def solve_quality(test, case, held, *, jacobian=None):
 
 def direct_geometry(test, device):
     """Compare the new representation against independent physical kinetic energy."""
-    module = importlib.import_module("newton._src.solvers.feather_pgs.g1_kinetic_state")
-    with patch.dict(os.environ, {**ENV, "FEATHER_PGS_G1_KINETIC_STATE": "0"}):
+    module = importlib.import_module("newton._src.solvers.feather_pgs.packed_tree_owner")
+    with patch.dict(os.environ, {**ENV, "FEATHER_PGS_PACKED_TREE_KINETIC_STATE": "0"}):
         case = fixture(device)
     solver, model, state, sparse = (case[name] for name in ("solver", "model", "state", "owner"))
     set_anchor(model)
     rotated_input(model, state)
     if model.device.is_cuda:
         solver = make_solver(model, True)
-        sparse, owner = solver._sparse_factor, solver._g1_kinetic_state
+        sparse, owner = solver._sparse_factor, solver._packed_tree_state
         test.assertIsNotNone(owner)
     else:
-        owner = module.G1KineticState(sparse)
+        owner = module.PackedTreeState(sparse)
     augmented = solver._prepare_augmented_state(state, model.state(), model.control())
     owner.begin(state, augmented, state.joint_qd, DT, True)
     current = physical_mass(model, state)
@@ -331,12 +331,12 @@ def multiworld_fixture(device):
     return model, contacts
 
 
-class TestG1KineticStateCPU(unittest.TestCase):
+class TestPackedTreeStateCPU(unittest.TestCase):
     def test_owner_api(self):
         """Require the bounded complete-owner API before any cache retirement."""
-        module = importlib.import_module("newton._src.solvers.feather_pgs.g1_kinetic_state")
+        module = importlib.import_module("newton._src.solvers.feather_pgs.packed_tree_owner")
         for name in ("begin", "predict", "finish", "invalidate", "validate_model"):
-            self.assertTrue(callable(getattr(module.G1KineticState, name)))
+            self.assertTrue(callable(getattr(module.PackedTreeState, name)))
 
     def test_physical_geometry_and_invalidation(self):
         """Run the representation oracle on CPU without claiming CPU production admission."""
@@ -365,8 +365,8 @@ class TestG1KineticStateCPU(unittest.TestCase):
         )
         np.testing.assert_allclose(translated["body_q"][:, 3:], reference["body_q"][:, 3:], atol=3e-12, rtol=0)
         np.testing.assert_allclose(translated["body_qd"], reference["body_qd"], atol=3e-12, rtol=0)
-        module = importlib.import_module("newton._src.solvers.feather_pgs.g1_kinetic_state")
-        owner = module.G1KineticState(case["owner"])
+        module = importlib.import_module("newton._src.solvers.feather_pgs.packed_tree_owner")
+        owner = module.PackedTreeState(case["owner"])
         augmented = case["solver"]._prepare_augmented_state(state, model.state(), model.control())
         owner.begin(state, augmented, state.joint_qd, DT, True)
         public_state(self, model, state)
@@ -375,13 +375,13 @@ class TestG1KineticStateCPU(unittest.TestCase):
 
     def test_constructor_and_model_guards(self):
         """Do not retire original storage on unsupported CPU/kinematic configurations."""
-        module = importlib.import_module("newton._src.solvers.feather_pgs.g1_kinetic_state")
-        with patch.dict(os.environ, {"FEATHER_PGS_G1_KINETIC_STATE": "0"}):
+        module = importlib.import_module("newton._src.solvers.feather_pgs.packed_tree_owner")
+        with patch.dict(os.environ, {"FEATHER_PGS_PACKED_TREE_KINETIC_STATE": "0"}):
             case = fixture()
         solver = make_solver(case["model"], True)
-        self.assertIsNone(solver._g1_kinetic_state)
+        self.assertIsNone(solver._packed_tree_state)
         self.assertFalse(module.supported(solver))
-        owner = module.G1KineticState(case["owner"])
+        owner = module.PackedTreeState(case["owner"])
         owner.validate_model()
         flags = case["model"].body_flags.numpy()
         flags[7] |= int(newton.BodyFlags.KINEMATIC)
@@ -417,7 +417,7 @@ class TestG1KineticStateCPU(unittest.TestCase):
                 self.assertFalse(owner._force_mass_update)
 
 
-class TestG1KineticStateCUDA(unittest.TestCase):
+class TestPackedTreeStateCUDA(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Use only the device made visible by the root-owned native runner."""
@@ -435,15 +435,15 @@ class TestG1KineticStateCUDA(unittest.TestCase):
     def test_current_force_predictor_and_publication(self):
         """Check physical H, current force buckets and original anchored-root integration."""
         direct_geometry(self, self.device)
-        with patch.dict(os.environ, {"FEATHER_PGS_G1_KINETIC_STATE": "0"}):
+        with patch.dict(os.environ, {"FEATHER_PGS_PACKED_TREE_KINETIC_STATE": "0"}):
             case = fixture(self.device)
         model = case["model"]
         set_anchor(model)
         serial = make_solver(model, True, use_parallel_streams=False)
-        self.assertIsNone(serial._g1_kinetic_state)
+        self.assertIsNone(serial._packed_tree_state)
         solvers = [make_solver(model, enabled) for enabled in (False, True)]
-        self.assertIsNone(solvers[0]._g1_kinetic_state)
-        self.assertIsNotNone(solvers[1]._g1_kinetic_state)
+        self.assertIsNone(solvers[0]._packed_tree_state)
+        self.assertIsNotNone(solvers[1]._packed_tree_state)
         states, outputs = [model.state() for _ in solvers], [model.state() for _ in solvers]
         controls = [model.control() for _ in solvers]
         held = None
@@ -476,7 +476,7 @@ class TestG1KineticStateCUDA(unittest.TestCase):
                     expected_bias = baseline_bias(solver)
                     expected_vhat = solver.v_hat.numpy().copy()
                 else:
-                    native = solver._g1_kinetic_state
+                    native = solver._packed_tree_state
                     self.assertTrue(np.any(augmentation(solver)[0] > solver.R_by_size[43].numpy()[0]))
                     np.testing.assert_allclose(native.bias.numpy()[0], expected_bias, rtol=2e-5, atol=3e-5)
                     np.testing.assert_allclose(solver.v_hat.numpy(), expected_vhat, rtol=2e-5, atol=3e-5)
@@ -516,18 +516,18 @@ class TestG1KineticStateCUDA(unittest.TestCase):
         for gpu, record, data in records:
             for index, world in enumerate(data["worlds"]):
                 with self.subTest(gpu=gpu, step=record["step"], world=int(world)):
-                    with patch.dict(os.environ, {**ENV, "FEATHER_PGS_G1_KINETIC_STATE": "0"}):
+                    with patch.dict(os.environ, {**ENV, "FEATHER_PGS_PACKED_TREE_KINETIC_STATE": "0"}):
                         case = replay.bind_world(record, data, index, self.device)
                     previous, model, state = (case[name] for name in ("solver", "model", "state"))
                     solver = make_solver(model, True)
-                    self.assertIsNotNone(solver._g1_kinetic_state)
+                    self.assertIsNotNone(solver._packed_tree_state)
                     for name, value in record["settings"].items():
                         setattr(solver, name, value)
                     for name in ("shape_material_mu", "shape_material_restitution"):
                         getattr(solver, name).assign(getattr(previous, name).numpy())
                     output, control = model.state(), model.control()
                     augmented = solver._prepare_augmented_state(state, output, control)
-                    solver._g1_kinetic_state.begin(state, augmented, state.joint_qd, 0.0025, False)
+                    solver._packed_tree_state.begin(state, augmented, state.joint_qd, 0.0025, False)
                     public_state(self, model, state)
                     sparse = solver._sparse_factor
                     case.update(solver=solver, owner=sparse, host=sparse.host)
@@ -571,9 +571,9 @@ class TestG1KineticStateCUDA(unittest.TestCase):
         # including an assertion exit before the later graph lifecycle checks.
         self.addCleanup(lambda owners=solvers: wp.synchronize_device(owners[0].model.device))
         original, candidate = solvers
-        self.assertIsNone(original._g1_kinetic_state)
-        self.assertIsNotNone(candidate._g1_kinetic_state)
-        native = candidate._g1_kinetic_state
+        self.assertIsNone(original._packed_tree_state)
+        self.assertIsNotNone(candidate._packed_tree_state)
+        native = candidate._packed_tree_state
         states = [[model.state(), model.state()] for _ in solvers]
         controls = [model.control() for _ in solvers]
         for pair, control in zip(states, controls, strict=True):

@@ -395,7 +395,7 @@ def check_solver(physics: str, solver, entry: dict) -> None:
             "fused_k1": bool(getattr(solver, "_fused_k1", False)),
             "grouped_topology": getattr(solver, "_grouped_topology", None) is not None,
             "sparse_factor": getattr(solver, "_sparse_factor", None) is not None,
-            "g1_kinetic_state": getattr(solver, "_g1_kinetic_state", None) is not None,
+            "g1_kinetic_state": getattr(solver, "_packed_tree_state", None) is not None,
             "sparse_diagonal_contact_solve": bool(getattr(solver, "_sparse_diagonal_contact_solve", False)),
         }
         read = getattr(solver, "constraint_capacity_status", None)

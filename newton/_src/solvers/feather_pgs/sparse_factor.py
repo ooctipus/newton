@@ -112,7 +112,7 @@ def make_plan(model, solver=None):
         43 * worlds,
         44 * worlds,
     ):
-        raise ValueError("Sparse G1 requires one complete 44-body/43-DOF tree per world")
+        raise ValueError("Packed sparse tree requires one complete 44-body/43-DOF tree per world")
     parent = model.joint_parent.numpy().reshape(worlds, 44)
     child = model.joint_child.numpy().reshape(worlds, 44)
     types = model.joint_type.numpy().reshape(worlds, 44)
@@ -169,21 +169,21 @@ def make_plan(model, solver=None):
     if not np.array_equal(child, offset + np.arange(44)) or not np.array_equal(
         parent, np.where(expected_parent < 0, -1, offset + expected_parent)
     ):
-        raise ValueError("Sparse G1 body topology differs from the checked tree")
+        raise ValueError("Packed sparse tree body topology differs from the checked tree")
     if not np.all(types == types[0]) or types[0, 0] != int(JointType.FREE):
-        raise ValueError("Sparse G1 requires a free root and identical joint types")
+        raise ValueError("Packed sparse tree requires a free root and identical joint types")
     fixed = {7, 15, 16, 22, 30, 36}
     for j in range(1, 44):
         if types[0, j] != int(JointType.FIXED if j in fixed else JointType.REVOLUTE):
-            raise ValueError("Sparse G1 only supports the checked fixed/revolute tree")
+            raise ValueError("Packed sparse tree only supports the checked fixed/revolute tree")
     if not np.all(qd - np.arange(worlds)[:, None] * 43 == qd[0]):
-        raise ValueError("Sparse G1 requires identical DOF order")
+        raise ValueError("Packed sparse tree requires identical DOF order")
     if np.any(model.body_flags.numpy() & int(BodyFlags.KINEMATIC)):
-        raise ValueError("Sparse G1 excludes prescribed/kinematic bodies")
+        raise ValueError("Packed sparse tree excludes prescribed/kinematic bodies")
     shape_body = model.shape_body.numpy()
     collidable = (model.shape_flags.numpy() & int(ShapeFlags.COLLIDE_SHAPES)) != 0
     if np.any(~np.isin(shape_body[collidable & (shape_body >= 0)] % 44, [6, 13, 14])):
-        raise ValueError("Sparse G1 only admits feet/torso collision participants")
+        raise ValueError("Packed sparse tree only admits feet/torso collision participants")
     # The producer and row kernels still require the checked ABI above. The
     # representation itself comes from the same planner as native sparse tasks.
     mass_plan = _SparseMassMatrixPlan.build(
@@ -357,7 +357,7 @@ def get_refresh_kernel(
         else f"sparse_factor_refresh{dof_count}_{nonzero_count}"
     )
     if geometric:
-        refresh.__name__ = refresh.__qualname__ = "g1_kinetic_" + refresh.__name__
+        refresh.__name__ = refresh.__qualname__ = "packed_tree_" + refresh.__name__
     return wp.kernel(enable_backward=False, module="unique")(refresh)
 
 
@@ -556,11 +556,11 @@ class SparseFactor:
 
     def install_kinetic_state(self):
         """Admit the complete state producer only after solver construction."""
-        from .g1_kinetic_state import G1KineticState  # noqa: PLC0415
-        from .g1_kinetic_state import supported as kinetic_supported  # noqa: PLC0415
+        from .packed_tree_owner import PackedTreeState  # noqa: PLC0415
+        from .packed_tree_owner import supported as kinetic_supported  # noqa: PLC0415
 
         if kinetic_supported(self.solver):
-            self.kinetic_state = G1KineticState(self)
+            self.kinetic_state = PackedTreeState(self)
             self.kernels.refresh = get_refresh_kernel(
                 **self.factor_parameters, level_update=self.level_update, geometric=True
             )
@@ -568,12 +568,14 @@ class SparseFactor:
     def begin(self):
         """Reject changed execution ownership before any retired buffer is read."""
         if not supported(self.solver):
-            raise RuntimeError("Sparse G1 configuration changed; reconstruct the solver and recapture before stepping")
+            raise RuntimeError(
+                "Packed sparse tree configuration changed; reconstruct the solver and recapture before stepping"
+            )
         if self.kinetic_state is not None:
-            from .g1_kinetic_state import supported as kinetic_supported  # noqa: PLC0415
+            from .packed_tree_owner import supported as kinetic_supported  # noqa: PLC0415
 
             if not kinetic_supported(self.solver):
-                raise RuntimeError("G1 kinetic-state ownership changed; reconstruct and recapture before stepping")
+                raise RuntimeError("Packed tree-state ownership changed; reconstruct and recapture before stepping")
 
     def validate_notification(self, flags):
         """Re-prove structural ownership on model notifications before writes."""
@@ -588,9 +590,11 @@ class SparseFactor:
             try:
                 make_plan(self.solver.model)
             except ValueError as error:
-                raise RuntimeError("Sparse G1 structural ownership changed; reconstruct and recapture") from error
+                raise RuntimeError(
+                    "Packed sparse tree structural ownership changed; reconstruct and recapture"
+                ) from error
             if self.solver._mimic_count or self.solver._connect_count:
-                raise RuntimeError("Sparse G1 constraint ownership changed; reconstruct and recapture")
+                raise RuntimeError("Packed sparse tree constraint ownership changed; reconstruct and recapture")
         if self.kinetic_state is not None:
             self.kinetic_state.validate_model()
 
@@ -598,11 +602,13 @@ class SparseFactor:
         """Surface a failed packed operator/row guard at existing checked boundaries."""
         status = self.data.status.numpy()
         if np.any(status):
-            raise RuntimeError(f"Sparse G1 representation guard failed: {np.unique(status[status != 0]).tolist()}")
+            raise RuntimeError(
+                f"Packed sparse tree representation guard failed: {np.unique(status[status != 0]).tolist()}"
+            )
         if self.kinetic_state is not None:
             status = self.kinetic_state.status.numpy()
             if np.any(status):
-                raise RuntimeError(f"G1 kinetic-state guard failed: {np.unique(status[status != 0]).tolist()}")
+                raise RuntimeError(f"Packed tree-state guard failed: {np.unique(status[status != 0]).tolist()}")
 
     def refresh(self, state_aug):
         """Publish only the original requested held generation."""

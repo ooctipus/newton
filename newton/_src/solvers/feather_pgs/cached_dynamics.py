@@ -20,7 +20,7 @@ def install(solver, *, factor_warps: int) -> None:
     """Install an admitted cache without changing its factor or row policy."""
     solver._kinetic_world = None
     solver._tree_kinetic_state = None
-    solver._g1_kinetic_state = None
+    solver._packed_tree_state = None
     solver._franka_kinetic_state = None
     choice = solver.cached_dynamics
     if choice == "off":
@@ -54,11 +54,10 @@ def install(solver, *, factor_warps: int) -> None:
 
         solver._kinetic_world = create_owner(solver)
 
-    if solver._sparse_factor is not None and enabled("G1_KINETIC_STATE"):
+    if solver._sparse_factor is not None and enabled("PACKED_TREE_KINETIC_STATE"):
         solver._sparse_factor.install_kinetic_state()
         solver._tree_kinetic_state = solver._sparse_factor.kinetic_state
-        # Retain the original packed-consumer marker used by saved captures.
-        solver._g1_kinetic_state = solver._tree_kinetic_state
+        solver._packed_tree_state = solver._tree_kinetic_state
 
     if solver._tree_kinetic_state is None and enabled("TREE_KINETIC_STATE"):
         from .tree_kinetic_sparse import create_owner  # noqa: PLC0415

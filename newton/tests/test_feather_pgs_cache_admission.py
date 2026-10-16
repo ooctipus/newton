@@ -7,7 +7,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from newton._src.solvers.feather_pgs import g1_kinetic_owner, sparse_factor
+from newton._src.solvers.feather_pgs import packed_tree_owner, sparse_factor
 
 
 class TestSparseCacheAdmission(unittest.TestCase):
@@ -38,12 +38,12 @@ class TestSparseCacheAdmission(unittest.TestCase):
             for metric in (False, True):
                 for parallel in (False, True):
                     with self.subTest(metric=metric, parallel=parallel):
-                        self.assertTrue(g1_kinetic_owner.supported(self.fixture(metric, parallel)))
+                        self.assertTrue(packed_tree_owner.supported(self.fixture(metric, parallel)))
 
     def test_operator_and_lifecycle_still_gate_state_cache(self):
         """Retain operator, epoch, stream and publication requirements for every row policy."""
         with patch.object(sparse_factor, "supported", return_value=False):
-            self.assertFalse(g1_kinetic_owner.supported(self.fixture(False, False)))
+            self.assertFalse(packed_tree_owner.supported(self.fixture(False, False)))
         with patch.object(sparse_factor, "supported", return_value=True):
             for field, value in (
                 ("_fk_id_cache_enabled", False),
@@ -59,7 +59,7 @@ class TestSparseCacheAdmission(unittest.TestCase):
                 with self.subTest(field=field):
                     solver = self.fixture(False, False)
                     setattr(solver, field, value)
-                    self.assertFalse(g1_kinetic_owner.supported(solver))
+                    self.assertFalse(packed_tree_owner.supported(solver))
 
 
 if __name__ == "__main__":

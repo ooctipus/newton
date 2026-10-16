@@ -19,9 +19,9 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import allegro_kinetic_rows as rows
+from newton._src.solvers.feather_pgs import keyed_rows as rows
 from newton._src.solvers.feather_pgs import solver_feather_pgs as source
-from tools.fpgs_bench.test_allegro_kinetic_rows import captures
+from tools.fpgs_bench.test_keyed_rows_capture import captures
 
 
 @contextmanager
@@ -142,7 +142,7 @@ class TestAllegroKineticLifecycleCPU(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "requires CUDA"):
             make_solver(model, True)
         solver = make_solver(model, True, pgs_mode="split", enable_joint_velocity_limits=False)
-        self.assertIsNone(solver._allegro_kinetic_rows)  # CUDA-only owner, never a CPU stand-in.
+        self.assertIsNone(solver._keyed_rows)  # CUDA-only owner, never a CPU stand-in.
         self.assertEqual(model.body_count, 22)
         self.assertEqual(model.joint_dof_count, 22)
         self.assertEqual(sorted(solver.size_groups), [6, 16])
@@ -155,7 +155,7 @@ class TestAllegroKineticLifecycleCPU(unittest.TestCase):
         admitted.enable_joint_velocity_limits = True
         admitted._hinv_jt_writes_world = True
         sentinel = object()
-        with mode(True), patch.object(rows, "AllegroKineticRows", return_value=sentinel):
+        with mode(True), patch.object(rows, "KeyedRows", return_value=sentinel):
             self.assertIs(rows.create_owner(admitted), sentinel)
             for name, value in (
                 ("mf_gs_response_block_rows", 32),
@@ -179,12 +179,12 @@ class TestAllegroKineticLifecycleCUDA(unittest.TestCase):
     def test_production_step_held_refresh_fallback_reset_and_graph(self):
         model = saved_model(self.device)
         original, candidate = make_solver(model, False), make_solver(model, True)
-        self.assertIsNone(original._allegro_kinetic_rows)
-        self.assertIsNotNone(candidate._allegro_kinetic_rows)
-        self.assertTrue(candidate._allegro_kinetic_rows.keyed_rows)
-        self.assertEqual(candidate._allegro_kinetic_rows.data.rowkeys.shape, (1, candidate.dense_max_constraints))
-        self.assertFalse(hasattr(candidate._allegro_kinetic_rows.data, "coefficients"))
-        self.assertFalse(hasattr(candidate._allegro_kinetic_rows.data, "encoding"))
+        self.assertIsNone(original._keyed_rows)
+        self.assertIsNotNone(candidate._keyed_rows)
+        self.assertTrue(candidate._keyed_rows.keyed_rows)
+        self.assertEqual(candidate._keyed_rows.data.rowkeys.shape, (1, candidate.dense_max_constraints))
+        self.assertFalse(hasattr(candidate._keyed_rows.data, "coefficients"))
+        self.assertFalse(hasattr(candidate._keyed_rows.data, "encoding"))
         for buffers in candidate._J_bufs:
             for value in buffers.values():
                 value.fill_(float("nan"))

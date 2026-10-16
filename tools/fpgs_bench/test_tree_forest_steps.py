@@ -15,7 +15,7 @@ from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_solver as native
 from newton.tests.test_feather_pgs_sparse_split import _external_forces
 from tools.fpgs_bench.forest_row_order import RowOrder
-from tools.fpgs_bench.test_g1_kinetic_state import public_state
+from tools.fpgs_bench.test_packed_tree_state import public_state
 
 
 def make_case(enabled, *, permuted=False, motion=False):

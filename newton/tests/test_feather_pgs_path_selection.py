@@ -141,12 +141,14 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(solver.get_path_selection()["cached_dynamics"], "off")
 
     @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
-    def test_g1_compatibility_module_keeps_its_private_names(self):
-        """The packed G1 owner imports retained private tree-state names; a missing one breaks every G1 scene at setup."""
-        from newton._src.solvers.feather_pgs import g1_kinetic_state  # noqa: PLC0415
+    def test_packed_tree_owner_imports(self):
+        """The packed sparse factor installs its tree state lazily; an import error there breaks every packed scene at setup."""
+        from newton._src.solvers.feather_pgs import packed_tree_owner, tree_kinetic_state  # noqa: PLC0415
 
-        for name in ("_lanes", "_sync", "_storage", "get_helpers", "get_state_kernel", "get_predictor_kernel"):
-            self.assertTrue(hasattr(g1_kinetic_state, name), name)
+        self.assertTrue(callable(packed_tree_owner.supported))
+        self.assertTrue(issubclass(packed_tree_owner.PackedTreeState, tree_kinetic_state.TreeKineticState.__mro__[0]))
+        for name in ("_lanes", "_sync", "get_helpers", "get_state_kernel", "get_predictor_kernel"):
+            self.assertTrue(hasattr(tree_kinetic_state, name), name)
 
     def test_cached_dynamics_generic_tree_is_default_and_unsupported_roots_reject(self):
         """A fixed arm with a free body is cached by the generic tree owner by default; a revolute world root is rejected."""

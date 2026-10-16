@@ -130,4 +130,6 @@ class TreeLayout:
         return Template(source).substitute(values)
 
 
-G1_LAYOUT = TreeLayout(44, 43, 434, 18, 10, 6, tuple(range(42, -1, -1)))
+# The 44-body, 43-coordinate free-root chain the kernels were first written for;
+# the default layout argument and the unpacked helpers' reference.
+REFERENCE_LAYOUT = TreeLayout(44, 43, 434, 18, 10, 6, tuple(range(42, -1, -1)))

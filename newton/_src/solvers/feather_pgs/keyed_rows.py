@@ -1,15 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Experimental current-motion maps and typed Allegro kinetic rows."""
+"""Topology-generated keyed contact rows: a per-world row prefix and direct row ingestion.
 
-import os
+The layout (primary tree, secondary free body, parallel row count) comes from
+``keyed_row_layout.topology_plan``; nothing here names a robot or a size.
+"""
+
 from functools import cache, partial
 
-import numpy as np
 import warp as wp
 
-from ...sim import JointType, ModelFlags
+from ...sim import ModelFlags
 from .franka_contact_packet import ContactInput, bind
 from .keyed_row_layout import prefix_kernel
 from .keyed_row_layout import topology_plan as direct_topology_plan
@@ -17,88 +19,9 @@ from .row_inputs import ParallelRowInputs, RowArgument
 
 
 @wp.struct
-class MapInput:
+class RowMaps:
     groups: wp.array2d[int]
     starts: wp.array2d[int]
-    body_map: wp.array[int]
-    motion: wp.array[wp.spatial_vector]
-    L16: wp.array3d[float]
-    L6: wp.array3d[float]
-    inverse: wp.array2d[float]
-    maps: wp.array2d[float]
-    incident: wp.array[float]
-    kinetic_incident: wp.array2d[float]
-
-
-@cache
-def get_map_kernel():
-    """Share four-chain prefix products while reading the original held factor."""
-    source = r"""
-    const int ga = data.groups.data[world * 2], gb = data.groups.data[world * 2 + 1];
-    const int sa = data.starts.data[world * 2], sb = data.starts.data[world * 2 + 1];
-    const float* La = data.L16.data + ga * 256;
-    const float* Lb = data.L6.data + gb * 36;
-    float* W = data.inverse.data + world * 100;
-#if defined(__CUDA_ARCH__)
-    const int lane = threadIdx.x;
-#else
-    for (int lane = 0; lane < 32; ++lane) {
-#endif
-    if (lane < 22) {
-        const int n = lane < 16 ? 4 : 6;
-        const int col = lane < 16 ? lane % 4 : lane - 16;
-        const int offset = lane < 16 ? (lane / 4) * 4 : 0;
-        const int stride = lane < 16 ? 16 : 6;
-        const float* L = lane < 16 ? La + offset * 16 + offset : Lb;
-        float* out = lane < 16 ? W + (lane / 4) * 16 : W + 64;
-        for (int row = 0; row < n; ++row) {
-            float v = row == col ? 1.0f : 0.0f;
-            for (int k = 0; k < row; ++k) v -= L[row * stride + k] * out[k * n + col];
-            out[row * n + col] = v / L[row * stride + row];
-        }
-        float uv = 0.0f;
-        if (lane < 16) for (int row = lane; row < 16; ++row) uv += La[row * 16 + lane] * data.incident.data[sa + row];
-        else for (int row = lane - 16; row < 6; ++row) uv += Lb[row * 6 + lane - 16] * data.incident.data[sb + row];
-        data.kinetic_incident.data[world * 22 + lane] = uv;
-    }
-#if defined(__CUDA_ARCH__)
-    __syncwarp();
-#else
-    }
-    for (int lane = 0; lane < 32; ++lane) {
-#endif
-    if (lane < 24) {
-        const int finger = lane / 6, axis = lane % 6;
-        float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        for (int j = 0; j < 4; ++j) {
-            const float S = data.motion.data[sa + finger * 4 + j][axis];
-            for (int row = 0; row < 4; ++row) {
-                if (row >= j) v[row] += W[finger * 16 + row * 4 + j] * S;
-                data.maps.data[world * 420 + (finger * 4 + j) * 24 + row * 6 + axis] = v[row];
-            }
-        }
-    } else if (lane < 30) {
-        const int axis = lane - 24;
-        for (int row = 0; row < 6; ++row) {
-            float v = 0.0f;
-            for (int j = 0; j <= row; ++j) v += W[64 + row * 6 + j] * data.motion.data[sb + j][axis];
-            data.maps.data[world * 420 + 384 + row * 6 + axis] = v;
-        }
-    }
-#if !defined(__CUDA_ARCH__)
-    }
-#endif
-"""
-
-    @wp.func_native(source)
-    def native(world: int, logical_lane: int, data: MapInput): ...
-
-    @wp.kernel(module="unique", enable_backward=False)
-    def allegro_kinetic_motion_maps(data: MapInput):
-        world, lane = wp.tid()
-        native(world, lane, data)
-
-    return allegro_kinetic_motion_maps
 
 
 @wp.struct
@@ -110,7 +33,6 @@ class PrefixInput:
     velocity_limit: wp.array[float]
     q: wp.array[float]
     vhat: wp.array[float]
-    inverse: wp.array2d[float]
     counts: wp.array[int]
     bounds: wp.array2d[int]
     velocity_slots: wp.array[int]
@@ -134,7 +56,7 @@ class PrefixInput:
 @wp.struct
 class KineticRows:
     rowkeys: wp.array2d[int]
-    maps: MapInput
+    maps: RowMaps
     prefix: PrefixInput
     contact: ContactInput
 
@@ -149,11 +71,9 @@ def scatter_contact_keys(data: ContactInput, z: KineticRows):
                 z.rowkeys[data.world[contact], data.slot[contact] + direction] = contact * 4 + direction
 
 
-def _row_source(*, kinetic, layout=None, output="Jr[q]", private_metadata=False):
-    """Share original WR geometry and metadata between direct ingestion and fallback."""
-    if kinetic and layout is not None:
-        raise ValueError("preprojected chain inputs require their proven independent basis layout")
-    dofs = 22 if layout is None else layout.dofs
+def _row_source(*, layout, output="Jr[q]", private_metadata=False):
+    """Share row geometry and metadata between direct ingestion and the fallback."""
+    dofs = layout.dofs
     prefix = """
         const int token = ~key, d = token / 2;
         const float sign = (token & 1) == 0 ? 1.0f : -1.0f;
@@ -162,12 +82,15 @@ def _row_source(*, kinetic, layout=None, output="Jr[q]", private_metadata=False)
             __PREFIX_VALUE__
         }
     """
-    prefix = prefix.replace(
-        "__PREFIX_VALUE__",
-        "Jr[q] = q / 4 == d / 4 ? sign * z.maps.inverse.data[world * 100 + (d / 4) * 16 + (q % 4) * 4 + d % 4] : 0.0f;"
-        if kinetic
-        else "Jr[q] = q == d ? sign : 0.0f;",
-    )
+    prefix = prefix.replace("__PREFIX_VALUE__", "Jr[q] = q == d ? sign : 0.0f;")
+    physical_projection = f"""
+            const int n = c.response_dofs.data[art], local = {layout.local("q")};
+            if (n != ({layout.primary_test("q")} ? {layout.primary} : {layout.secondary})
+                || (c.body_mask.data[body] & (1u << local)) == 0u) continue;
+            const wp::spatial_vector S = c.motion.data[c.dof_start.data[art] + local];
+            const wp::vec3 linear(S[0], S[1], S[2]), angular(S[3], S[4], S[5]);
+            value += sign * wp::dot(direction, linear + wp::cross(angular, point - c.origin.data[art]));
+    """
     projection = """
         #pragma unroll
         for (int q = 0; q < __DOFS__; ++q) {
@@ -181,65 +104,8 @@ def _row_source(*, kinetic, layout=None, output="Jr[q]", private_metadata=False)
             }
             Jr[q] = value;
         }
-    """
-    projection = projection.replace(
-        "__PROJECT__",
-        """
-                const int id = z.maps.body_map.data[body];
-                if (id < 0) continue;
-                const int offset = id == 16 ? 16 : (id / 4) * 4;
-                const int n = id == 16 ? 6 : 4;
-                if (q < offset || q >= offset + n) continue;
-                const int start = id == 16 ? 384 : id * 24;
-                const float* map = z.maps.maps.data + world * 420 + start + (q - offset) * 6;
-                const wp::vec3 torque = wp::cross(point - c.origin.data[art], direction);
-                float v = 0.0f;
-                #pragma unroll
-                for (int axis = 0; axis < 3; ++axis) {
-                    v += map[axis] * direction[axis];
-                    v += map[axis + 3] * torque[axis];
-                }
-                value += sign * v;
-        """
-        if kinetic
-        else """
-                const int n = c.response_dofs.data[art], local = q < 16 ? q : q - 16;
-                if (n != (q < 16 ? 16 : 6) || (c.body_mask.data[body] & (1u << local)) == 0u) continue;
-                const wp::spatial_vector S = c.motion.data[c.dof_start.data[art] + local];
-                const wp::vec3 linear(S[0], S[1], S[2]), angular(S[3], S[4], S[5]);
-                value += sign * wp::dot(direction, linear + wp::cross(angular, point - c.origin.data[art]));
-        """,
-    )
-    if layout is not None:
-        physical_projection = f"""
-                const int n = c.response_dofs.data[art], local = {layout.local("q")};
-                if (n != ({layout.primary_test("q")} ? {layout.primary} : {layout.secondary})
-                    || (c.body_mask.data[body] & (1u << local)) == 0u) continue;
-                const wp::spatial_vector S = c.motion.data[c.dof_start.data[art] + local];
-                const wp::vec3 linear(S[0], S[1], S[2]), angular(S[3], S[4], S[5]);
-                value += sign * wp::dot(direction, linear + wp::cross(angular, point - c.origin.data[art]));
-        """
-        projection = """
-        #pragma unroll
-        for (int q = 0; q < __DOFS__; ++q) {
-            float value = 0.0f;
-            for (int side = 0; side < 2; ++side) {
-                const int body = side == 0 ? ba : bb, art = side == 0 ? aa : ab;
-                if (body < 0 || art < 0) continue;
-                const float sign = side == 0 ? 1.0f : -1.0f;
-                const wp::vec3 point = side == 0 ? pa : pb;
-                __PROJECT__
-            }
-            Jr[q] = value;
-        }
         """.replace("__PROJECT__", physical_projection)
-    incident = (
-        "relative += Jr[q] * z.maps.kinetic_incident.data[world * 22 + q];"
-        if kinetic
-        else "relative += Jr[q] * c.incident.data[z.maps.starts.data[world * 2 + (q < 16 ? 0 : 1)] + (q < 16 ? q : q - 16)];"
-    )
-    if layout is not None:
-        incident = f"relative += Jr[q] * c.incident.data[z.maps.starts.data[world * 2 + ({layout.primary_test('q')} ? 0 : 1)] + {layout.local('q')}];"
+    incident = f"relative += Jr[q] * c.incident.data[z.maps.starts.data[world * 2 + ({layout.primary_test('q')} ? 0 : 1)] + {layout.local('q')}];"
     return (
         r"""
     const int at = world * z.rowkeys.shape[1] + row;
@@ -334,7 +200,7 @@ __PROJECTION__
         .replace(
             "__PRIVATE_METADATA__",
             "built_rhs = rhs; built_mu = r == 0 ? mu : friction; built_parent = r == 0 ? -1 : c.slot.data[contact];"
-            if kinetic or private_metadata
+            if private_metadata
             else "",
         )
         .replace("__DOFS__", str(dofs))
@@ -343,15 +209,15 @@ __PROJECTION__
 
 
 @cache
-def get_fallback_kernel(layout=None):
+def get_fallback_kernel(layout):
     """Materialize current physical rows in one pass over fallback worlds only."""
-    primary = 16 if layout is None else layout.primary
-    secondary = 6 if layout is None else layout.secondary
+    primary = layout.primary
+    secondary = layout.secondary
     dofs = primary + secondary
-    limit = 128 if layout is None else layout.parallel_rows
-    primary_test = "q < 16" if layout is None else layout.primary_test("q")
-    local_a = "q" if layout is None else f"q - {layout.primary_offset}"
-    local_b = "q - 16" if layout is None else f"q - {layout.secondary_offset}"
+    limit = layout.parallel_rows
+    primary_test = layout.primary_test("q")
+    local_a = f"q - {layout.primary_offset}"
+    local_b = f"q - {layout.secondary_offset}"
     source = (
         """
     if (counts.data[world] <= $LIMIT && mf_counts.data[world] == 0) return;
@@ -364,7 +230,7 @@ def get_fallback_kernel(layout=None):
     for (int row = lane; row < counts.data[world]; row += stride) {
         float Jr[$DOFS];
 """
-        + _row_source(kinetic=False, layout=layout)
+        + _row_source(layout=layout)
         + """
         #pragma unroll
         for (int q = 0; q < $DOFS; ++q) {
@@ -398,72 +264,13 @@ def get_fallback_kernel(layout=None):
     ): ...
 
     @wp.kernel(module="unique", enable_backward=False)
-    def allegro_kinetic_keyed_fallback(
+    def keyed_rows_fallback(
         z: KineticRows, counts: wp.array[int], mf_counts: wp.array[int], J16: wp.array3d[float], J6: wp.array3d[float]
     ):
         world, lane = wp.tid()
         native(world, lane, z, counts, mf_counts, J16, J6)
 
-    return allegro_kinetic_keyed_fallback
-
-
-def get_ink_stage(na, nb, oa, ob, dofs, capacity):
-    """Replace only the input stage; retain the parallel law and inverse adjoint."""
-    if (na, nb, oa, ob, dofs) != (16, 6, 0, 16, 22):
-        raise ValueError("Allegro kinetic rows require the validated 16+6 layout")
-    return f"""
-    const int ink_ga = ink_meta.data[world * 4], ink_gb = ink_meta.data[world * 4 + 2];
-    constexpr int ink_oa = 0, ink_ob = 16;
-    for (int e = lane; e < 256; e += NT) s_L[e] = ink_L_a.data[(size_t)ink_ga * 256 + e];
-    for (int e = lane; e < 36; e += NT) s_L[256 + e] = ink_L_b.data[(size_t)ink_gb * 36 + e];
-    SYNC();
-    if (lane < 16) s_Dinv[lane] = 1.0f / s_L[lane * 16 + lane];
-    if (lane < 6) s_Dinv[16 + lane] = 1.0f / s_L[256 + lane * 6 + lane];
-    if (lane < 22) {{
-        float uv = 0.0f;
-        if (lane < 16) for (int r = lane; r < 16; ++r) uv += s_L[r * 16 + lane] * s_v[r];
-        else for (int r = lane - 16; r < 6; ++r) uv += s_L[256 + r * 6 + lane - 16] * s_v[16 + r];
-        s_dv[lane] = uv;
-    }}
-    SYNC();
-    if (lane < n_rows) {{
-        const int i = lane;
-        const int row = i;
-        const auto& z = kinetic_rows;
-        float built_rhs = 0.0f, built_mu = 0.0f;
-        int built_parent = -1;
-        {{
-        {_row_source(kinetic=True)}
-        }}
-        if (z.rowkeys.data[off_dense + i] >= 0) {{
-            const int direction = z.rowkeys.data[off_dense + i] & 3;
-            s_rhs[i] = built_rhs;
-            s_parent[i] = built_parent;
-            s_mu[i] = built_mu;
-            const bool admit = i >= dense_lo && row_phase != 2 && row_phase != 3 && row_phase != 5;
-            s_kind[i] = admit ? (direction == 0 ? 0 : 1) : -1;
-        }}
-        float bjv = 0.0f;
-        #pragma unroll
-        for (int d = 0; d < 22; ++d) {{
-            s_Yt[d * YS + i] = Jr[d]; bjv += Jr[d] * s_dv[d];
-        }}
-        s_rhs[i] += bjv;
-    }}
-"""
-
-
-def get_parallel_inputs(na, nb, oa, ob, dofs, capacity):
-    """Bind factor-coordinate staging and deferred contact metadata explicitly."""
-    key = "kinetic_rows.rowkeys.data[off_dense + i]"
-    return ParallelRowInputs(
-        stage=get_ink_stage(na, nb, oa, ob, dofs, capacity),
-        arguments=(RowArgument("kinetic_rows", KineticRows, after="world_row_cfm"),),
-        row_type=f"({key} >= 0 ? (({key} & 3) == 0 ? 0 : 2) : world_row_type.data[off_dense + i])",
-        rhs=f"{key} < 0 ? rhs_bias.data[off_dense + i] : 0",
-        parent=f"{key} < 0 ? world_row_parent.data[off_dense + i] : 0",
-        mu=f"{key} < 0 ? world_row_mu.data[off_dense + i] : 0",
-    )
+    return keyed_rows_fallback
 
 
 def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity):
@@ -484,7 +291,7 @@ def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity):
             float built_rhs = 0.0f, built_mu = 0.0f;
             int built_parent = -1;
     """
-        + _row_source(kinetic=False, layout=layout, output="Zi[q * ZS]", private_metadata=True)
+        + _row_source(layout=layout, output="Zi[q * ZS]", private_metadata=True)
         + f"""
             if ({key} >= 0) {{
                 s_rhs[i] = built_rhs; s_parent[i] = built_parent; s_mu[i] = built_mu;
@@ -503,54 +310,9 @@ def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity):
 
 
 @cache
-def get_parallel_factory(original, layout=None):
-    """Use the shared parallel policy with physical or preprojected row operands."""
-    provider = get_parallel_inputs if layout is None else partial(get_direct_parallel_inputs, layout)
-    return partial(original, row_inputs=provider)
-
-
-def topology_plan(solver):
-    """Validate the four independent scalar chains in every actual world."""
-    if sorted(solver.size_groups) != [6, 16] or solver.max_world_dofs != 22:
-        raise ValueError("Kinetic rows require one 16-coordinate hand and one free-six body per world")
-    worlds = solver.art_to_world.numpy()
-    groups = np.full((solver.world_count, 2), -1, dtype=np.int32)
-    starts = np.empty_like(groups)
-    art_start = solver.articulation_dof_start.numpy()
-    for column, size in enumerate((16, 6)):
-        arts = solver.group_to_art[size].numpy()
-        if len(arts) != solver.world_count or not np.array_equal(np.sort(worlds[arts]), np.arange(solver.world_count)):
-            raise ValueError("Kinetic rows require complete one-articulation-per-size world coverage")
-        groups[worlds[arts], column] = np.arange(len(arts), dtype=np.int32)
-        starts[worlds[arts], column] = art_start[arts]
-    masks = solver.body_response_dof_mask.numpy()
-    body_art = solver.body_to_articulation.numpy()
-    sizes = solver.articulation_response_dof_count.numpy()
-    body_map = np.full(len(masks), -1, dtype=np.int32)
-    for finger in range(4):
-        for depth in range(4):
-            mask = ((1 << (depth + 1)) - 1) << (finger * 4)
-            body_map[(body_art >= 0) & (sizes[np.maximum(body_art, 0)] == 16) & (masks == mask)] = finger * 4 + depth
-    body_map[(body_art >= 0) & (sizes[np.maximum(body_art, 0)] == 6) & (masks == 63)] = 16
-    if np.any((masks != 0) & (body_map < 0)):
-        raise ValueError("Kinetic rows reject a non-chain current response mask")
-    # A fixed articulation root is what makes the four finger blocks independent.
-    model = solver.model
-    types, joint_parent = model.joint_type.numpy(), model.joint_parent.numpy()
-    first_joint = model.articulation_start.numpy()
-    primary = solver.group_to_art[16].numpy()
-    if np.any(types[first_joint[primary]] != 3) or np.any(joint_parent[first_joint[primary]] != -1):
-        raise ValueError("The hand must have a fixed root")
-    joint_dofs = np.diff(model.joint_qd_start.numpy())
-    for art in primary:
-        selected = slice(first_joint[art], first_joint[art + 1])
-        moving_types = types[selected][joint_dofs[selected] > 0]
-        if not np.isin(moving_types, (JointType.PRISMATIC, JointType.REVOLUTE, JointType.D6)).all():
-            raise ValueError("The hand requires original velocity-limit-supported moving joint types")
-    secondary = solver.group_to_art[6].numpy()
-    if np.any(types[first_joint[secondary]] != 4) or np.any(first_joint[secondary + 1] - first_joint[secondary] != 1):
-        raise ValueError("The secondary articulation must be one free body")
-    return groups, starts, body_map
+def get_parallel_factory(original, layout):
+    """Use the shared parallel policy with the layout's physical row operands."""
+    return partial(original, row_inputs=partial(get_direct_parallel_inputs, layout))
 
 
 def _signature(solver):
@@ -568,28 +330,19 @@ def _signature(solver):
     return tuple(getattr(solver.model, name).numpy().tobytes() for name in names)
 
 
-class AllegroKineticRows:
-    """Own the current typed prefix, compact rows, and complete legacy fallback."""
+class KeyedRows:
+    """Own the per-world row prefix, direct keyed rows and the complete fallback."""
 
-    def __init__(self, solver, direct=False):
+    def __init__(self, solver):
         self.solver = solver
         self.keyed_rows = True
-        self.layout = None
-        if direct:
-            self.layout, groups, starts = direct_topology_plan(solver)
-            body_map = np.full(1, -1, dtype=np.int32)
-        else:
-            groups, starts, body_map = topology_plan(solver)
-        self.prefix_layout = self.layout if direct else direct_topology_plan(solver)[0]
+        self.layout, groups, starts = direct_topology_plan(solver)
+        self.prefix_layout = self.layout
         dev, worlds, capacity = solver.model.device, solver.world_count, solver.dense_max_constraints
-        self.data, self.maps, self.prefix = KineticRows(), MapInput(), PrefixInput()
+        self.data, self.maps, self.prefix = KineticRows(), RowMaps(), PrefixInput()
         self.data.rowkeys = wp.empty((worlds, capacity), dtype=int, device=dev)
         self.maps.groups = wp.array(groups, dtype=int, device=dev)
         self.maps.starts = wp.array(starts, dtype=int, device=dev)
-        self.maps.body_map = wp.array(body_map, dtype=int, device=dev)
-        self.maps.inverse = wp.empty((worlds, 100) if not direct else (1, 1), dtype=float, device=dev)
-        self.maps.maps = wp.empty((worlds, 420) if not direct else (1, 1), dtype=float, device=dev)
-        self.maps.kinetic_incident = wp.empty((worlds, 22) if not direct else (1, 1), dtype=float, device=dev)
         self.contact_input = None
         self._dummy_int = wp.zeros(1, dtype=int, device=dev)
         self._dummy_float = wp.zeros(1, dtype=float, device=dev)
@@ -607,23 +360,14 @@ class AllegroKineticRows:
         if flags and not (int(flags) & ~int(numeric)):
             return
         if _signature(self.solver) != self._signature:
-            raise RuntimeError("Allegro kinetic topology changed; reconstruct the solver before notification")
-        if self.layout is None:
-            topology_plan(self.solver)
+            raise RuntimeError("Keyed row topology changed; reconstruct the solver before notification")
         if direct_topology_plan(self.solver)[0] != self.prefix_layout:
             raise RuntimeError("Keyed row topology changed; reconstruct the solver")
 
     def begin_rows(self, state_in, state_aug, dt):
         """Read current motion and predictor with the current held-factor buffers."""
         s, m, p = self.solver, self.maps, self.prefix
-        na, nb = (16, 6) if self.layout is None else (self.layout.primary, self.layout.secondary)
-        m.motion, m.L16, m.L6, m.incident = (
-            state_aug.joint_S_s,
-            s.L_by_size[na],
-            s.L_by_size[nb] if nb else self._dummy_factor,
-            s.v_hat,
-        )
-        p.starts, p.inverse, p.q, p.vhat = m.starts, m.inverse, state_in.joint_q, s.v_hat
+        p.starts, p.q, p.vhat = m.starts, state_in.joint_q, s.v_hat
         for name, source in (
             ("q_index", "_joint_limit_q_index"),
             ("counts", "slot_counter"),
@@ -658,8 +402,6 @@ class AllegroKineticRows:
         )
         self.contact_input = None
         self.data.maps, self.data.prefix = m, p
-        if self.layout is None:
-            wp.launch_tiled(get_map_kernel(), dim=[s.world_count], inputs=[m], block_dim=32, device=s.model.device)
         prefix = prefix_kernel(self.prefix_layout, PrefixInput, KineticRows)
         wp.launch_tiled(prefix, dim=[s.world_count], inputs=[p, self.data], block_dim=32, device=s.model.device)
 
@@ -678,7 +420,7 @@ class AllegroKineticRows:
                 inputs=[self.contact_input, self.data],
                 device=s.model.device,
             )
-        na, nb = (16, 6) if self.layout is None else (self.layout.primary, self.layout.secondary)
+        na, nb = self.layout.primary, self.layout.secondary
         wp.launch_tiled(
             get_fallback_kernel(self.layout),
             dim=[s.world_count],
@@ -698,9 +440,6 @@ def create_owner(solver):
     """Admit one bounded complete numerical law; leave unsupported solvers ordinary."""
     from . import solver_feather_pgs as source  # noqa: PLC0415
 
-    # The topology-generated layout is the default; FEATHER_PGS_GENERATED_KEYED_ROWS=0 retains
-    # the original fixed 16+6 producer for comparison.
-    direct = os.environ.get("FEATHER_PGS_GENERATED_KEYED_ROWS") != "0"
     supported = (
         solver.model.device.is_cuda
         and not solver.model.requires_grad
@@ -709,17 +448,16 @@ def create_owner(solver):
         and solver.friction_mode == "current"
         and solver.pgs_schedule == "interleaved"
         and solver.enable_joint_limits
-        and (direct or solver.enable_joint_velocity_limits)
-        and (0 < solver.mf_gs_parallel_rows <= 128 if direct else solver.mf_gs_parallel_rows == 128)
+        and 0 < solver.mf_gs_parallel_rows <= 128
         and solver.mf_gs_parallel_matrix_free
         and solver.mf_gs_response_block_rows == 0
         and solver.dense_max_constraints >= solver.mf_gs_parallel_rows
-        and (solver.mf_gs_parallel_sweeps > 0 if direct else solver.mf_gs_parallel_sweeps == 24)
-        and (solver.pgs_iterations > 0 if direct else solver.pgs_iterations == 12)
+        and solver.mf_gs_parallel_sweeps > 0
+        and solver.pgs_iterations > 0
         and solver.pgs_velocity_iterations == 0
         and not solver.pgs_warmstart
         and solver.articulated_contact_response == "immediate"
-        and (solver._hinv_jt_writes_world or (direct and solver._jy_world_aliased))
+        and (solver._hinv_jt_writes_world or solver._jy_world_aliased)
         and not solver.fuse_joint_velocity_limits
         and not solver._regularization_enabled
         and not solver._preelim_active
@@ -733,20 +471,18 @@ def create_owner(solver):
         and solver._contact_w == 1.0
         and not solver._debug_buffers_enabled
         and source._INK_ON
-        and (direct or not source._WR_ON)
         and not source._WR_WARM
         and not source._WR_CHECK
         and not source._INK_CHECK
         and not source._CHECK_ROWS
         and not source._CHECK_ROWS_FUSED
         and not source._GROUPED_CHECK
-        and (direct or not source._MF_EXACT_ROWSUM)
         and not source._SHADOW_LEAN
         and not source._FPGS_CAPTURE
     )
     if not supported:
         return None
     try:
-        return AllegroKineticRows(solver, direct=direct)
+        return KeyedRows(solver)
     except ValueError:
         return None

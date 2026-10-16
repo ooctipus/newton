@@ -10,7 +10,7 @@ held-factor actions and publication retain their original physical meanings.
 import numpy as np
 import warp as wp
 
-from .tree_kinetic_layout import G1_LAYOUT
+from .tree_kinetic_layout import REFERENCE_LAYOUT
 
 
 @wp.struct
@@ -217,7 +217,7 @@ COMPOSE_MOTION
 """.replace("COMPOSE_MOTION", _COMPOSE_MOTION)
 
 
-def reduction_source(*, moments, layout=G1_LAYOUT):
+def reduction_source(*, moments, layout=REFERENCE_LAYOUT):
     """Add light subtrees before an inclusive heavy-chain suffix; never subtract."""
     address = f"(k<6?{layout.wrench_offset}+6*BODY+k:{layout.moment_offset}+13*BODY+k-6)" if moments else "(6*BODY+k)"
     count = "(refresh?19:6)" if moments else "6"

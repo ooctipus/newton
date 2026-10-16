@@ -50,7 +50,7 @@ ADDITIONAL_RECIPES = {
             "FEATHER_PGS_SPARSE_FACTOR": "1",
             "FEATHER_PGS_SPARSE_LEVEL_UPDATE": "1",
             "FEATHER_PGS_SPARSE_PARALLEL_LIMITS": "1",
-            "FEATHER_PGS_G1_KINETIC_STATE": "1",
+            "FEATHER_PGS_PACKED_TREE_KINETIC_STATE": "1",
         },
     ),
     "h1-flat": ("Isaac-Velocity-Flat-H1", (), {}),

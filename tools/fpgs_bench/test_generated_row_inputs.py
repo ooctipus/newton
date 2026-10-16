@@ -10,7 +10,7 @@ from unittest.mock import patch
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import allegro_kinetic_rows, franka_row_packets
+from newton._src.solvers.feather_pgs import keyed_rows, franka_row_packets
 from newton._src.solvers.feather_pgs.franka_contact_packet import ContactPacketData
 from newton._src.solvers.feather_pgs.row_inputs import CompactLocalRows, RowArgument
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_parallel_kernel
@@ -23,9 +23,9 @@ class TestGeneratedRowInputs(unittest.TestCase):
             self.assertTrue(callable(franka_row_packets.get_local_factory()))
 
     def test_keyed_factory_without_source_inspection(self):
-        allegro_kinetic_rows.get_parallel_factory.cache_clear()
+        keyed_rows.get_parallel_factory.cache_clear()
         with patch.object(inspect, "getsource", side_effect=AssertionError("factory source is not an API")):
-            self.assertTrue(callable(allegro_kinetic_rows.get_parallel_factory(_get_pgs_solve_parallel_kernel)))
+            self.assertTrue(callable(keyed_rows.get_parallel_factory(_get_pgs_solve_parallel_kernel)))
 
     @unittest.skipUnless(wp.is_cuda_available(), "native local solving requires CUDA")
     def test_non_robot_layouts_against_independent_solve_oracles(self):

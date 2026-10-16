@@ -12,7 +12,7 @@ import warp as wp
 
 from . import cached_force, kinetic_state, response_operator, sparse_factor, tree_chain_scan
 from .cached_state import StateOperands, StateStages, make_body_terms, make_state_kernel
-from .tree_kinetic_layout import G1_LAYOUT, TreeLayout
+from .tree_kinetic_layout import REFERENCE_LAYOUT, TreeLayout
 
 
 @wp.struct
@@ -141,9 +141,9 @@ def _thread_helpers(layout):
     return _lanes, _sync, _sub, _different_motion
 
 
-# Unpacked (one tree per block) helpers under their former module-level names;
-# the G1 compatibility module re-exports them.
-_lanes, _sync, _sub, _different_motion = _thread_helpers(G1_LAYOUT)
+# Unpacked (one tree per block) helpers under their module-level names, for the
+# tools tests that drive the natives directly.
+_lanes, _sync, _sub, _different_motion = _thread_helpers(REFERENCE_LAYOUT)
 
 
 @wp.func_native(r"""
@@ -508,7 +508,7 @@ _STORE_TERMS_SOURCE = r"""
 
 
 @functools.cache
-def get_helpers(layout: TreeLayout = G1_LAYOUT, chain_scan: bool = False, body_velocity: bool = False):
+def get_helpers(layout: TreeLayout = REFERENCE_LAYOUT, chain_scan: bool = False, body_velocity: bool = False):
     """Bind one physical tree evaluation to its storage and traversal schedule."""
     plan_type = tree_chain_scan.ChainPlan if chain_scan else KineticPlan
     pose_source = layout.render(tree_chain_scan._POSE if chain_scan else _POSE)
@@ -632,7 +632,7 @@ def get_state_kernel(
     finish: bool,
     chain_scan: bool = False,
     *,
-    layout: TreeLayout = G1_LAYOUT,
+    layout: TreeLayout = REFERENCE_LAYOUT,
     body_velocity: bool = False,
     motion_velocity: bool = False,
     copy_reuse: bool = False,
@@ -811,7 +811,7 @@ if lane == 0:
 
 
 @functools.cache
-def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = G1_LAYOUT, response="sparse"):
+def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFERENCE_LAYOUT, response="sparse"):
     """Apply current external/control force and both unchanged W actions."""
     plan_type = tree_chain_scan.ChainPlan if chain_scan else KineticPlan
     reduction = (

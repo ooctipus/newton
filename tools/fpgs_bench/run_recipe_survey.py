@@ -82,7 +82,7 @@ def main() -> int:
             "grouped_dynamics=True",
         ]
         if task == "g1-flat":
-            for flag in ("SPARSE_FACTOR", "SPARSE_LEVEL_UPDATE", "G1_KINETIC_STATE", "G1_CHAIN_SCAN"):
+            for flag in ("SPARSE_FACTOR", "SPARSE_LEVEL_UPDATE", "PACKED_TREE_KINETIC_STATE", "G1_CHAIN_SCAN"):
                 command.extend(("--candidate-env", f"FEATHER_PGS_{flag}=1"))
         else:
             command.extend(("--candidate-solver-attr", "lazy_kinematics=True"))

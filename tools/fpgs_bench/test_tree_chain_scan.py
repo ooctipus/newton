@@ -10,35 +10,35 @@ from unittest.mock import patch
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import g1_chain_scan, g1_kinetic_state
-from tools.fpgs_bench.test_g1_kinetic_state import DT, public_state, rotated_input, set_anchor
+from newton._src.solvers.feather_pgs import packed_tree_owner, tree_chain_scan, tree_kinetic_state
+from tools.fpgs_bench.test_packed_tree_state import DT, public_state, rotated_input, set_anchor
 from tools.fpgs_bench.test_sparse_factor import fixture
 
 
-@wp.func_native("float* s=reinterpret_cast<float*>(address);" + g1_chain_scan.reduction_source(moments=False))
-def _reduce_wrenches(address: wp.uint64, plan: g1_chain_scan.ChainPlan): ...
+@wp.func_native("float* s=reinterpret_cast<float*>(address);" + tree_chain_scan.reduction_source(moments=False))
+def _reduce_wrenches(address: wp.uint64, plan: tree_chain_scan.ChainPlan): ...
 
 
 @wp.kernel
-def _subtrees(plan: g1_chain_scan.ChainPlan, values: wp.array2d[float], result: wp.array2d[float]):
+def _subtrees(plan: tree_chain_scan.ChainPlan, values: wp.array2d[float], result: wp.array2d[float]):
     _, logical = wp.tid()
-    lanes = g1_kinetic_state._lanes()
+    lanes = tree_kinetic_state._lanes()
     lane, stride = lanes[0], lanes[1]
     if stride == 1 and logical != 0:
         return
-    address = g1_kinetic_state._storage()
+    address = tree_kinetic_state._storage()
     for body in range(lane, 44, stride):
         value = wp.spatial_vector()
         for k in range(6):
             value[k] = values[body, k]
         _store_wrench(address, body, value)
-    g1_kinetic_state._sync()
+    tree_kinetic_state._sync()
     _reduce_wrenches(address, plan)
     for body in range(lane, 44, stride):
         value = _load_wrench(address, body)
         for k in range(6):
             result[body, k] = value[k]
-    g1_kinetic_state._release(address)
+    tree_kinetic_state._release(address)
 
 
 @wp.func_native("float* s=reinterpret_cast<float*>(address);for(int k=0;k<6;++k)s[6*body+k]=value[k];")
@@ -103,7 +103,7 @@ class TestChainPlan(unittest.TestCase):
             ],
             dtype=np.int32,
         )
-        plan = g1_chain_scan.make_plan(parent)
+        plan = tree_chain_scan.make_plan(parent)
         self.assertEqual(plan["levels"], 3)
         meta = plan["meta"]
         np.testing.assert_array_equal(np.sort(meta[meta[:, 0] >= 0, 0]), np.arange(44))
@@ -118,13 +118,13 @@ class TestChainPlan(unittest.TestCase):
             self.assertEqual(anchor < 0, level == 0)
 
     def test_generic_tree_and_unsupported_packing(self):
-        plan = g1_chain_scan.make_plan(np.asarray([-1, 0, 1, 0, 3, 3], np.int32))
+        plan = tree_chain_scan.make_plan(np.asarray([-1, 0, 1, 0, 3, 3], np.int32))
         self.assertEqual(plan["levels"], 2)
         np.testing.assert_array_equal(np.sort(plan["meta"][plan["meta"][:, 0] >= 0, 0]), np.arange(6))
         with self.assertRaises(ValueError):
-            g1_chain_scan.make_plan(np.arange(-1, 33, dtype=np.int32))
+            tree_chain_scan.make_plan(np.arange(-1, 33, dtype=np.int32))
         with self.assertRaises(ValueError):
-            g1_chain_scan.make_plan(np.asarray([-1, 2, 1], np.int32))
+            tree_chain_scan.make_plan(np.asarray([-1, 2, 1], np.int32))
 
     def test_default_off_and_complete_cpu_owner(self):
         """Exercise both current/held force actions and complete next publication."""
@@ -132,11 +132,11 @@ class TestChainPlan(unittest.TestCase):
         for enabled in (False, True):
             with patch.dict(os.environ, {"FEATHER_PGS_G1_CHAIN_SCAN": str(int(enabled))}):
                 case = fixture("cpu")
-                owner = g1_kinetic_state.G1KineticState(case["owner"])
+                owner = packed_tree_owner.PackedTreeState(case["owner"])
             self.assertEqual(owner.chain_scan, enabled)
             self.assertEqual(owner.finish_kernel.key.endswith("_chain"), enabled)
             self.assertEqual(owner.predictor_kernel.key.endswith("_chain"), enabled)
-            self.assertIs(owner.plan._cls, g1_chain_scan.ChainPlan if enabled else g1_kinetic_state.KineticPlan)
+            self.assertIs(owner.plan._cls, tree_chain_scan.ChainPlan if enabled else tree_kinetic_state.KineticPlan)
             model, solver, sparse = case["model"], case["solver"], case["owner"]
             set_anchor(model)
             W = np.linalg.solve(np.linalg.cholesky(case["H"][::-1, ::-1]), np.eye(43))
@@ -172,7 +172,7 @@ class TestChainPlan(unittest.TestCase):
         """An unrelated large wrench cannot erase a small descendant subtree."""
         with patch.dict(os.environ, {"FEATHER_PGS_G1_CHAIN_SCAN": "1"}):
             case = fixture("cpu")
-            owner = g1_kinetic_state.G1KineticState(case["owner"])
+            owner = packed_tree_owner.PackedTreeState(case["owner"])
         parent = case["model"].joint_parent.numpy()[:44]
         values = np.zeros((44, 6), np.float32)
         values[6, 0], values[40, 0] = 1e20, 1.25
