@@ -80,7 +80,15 @@ def _add_cabinet(scene, cfg):
 
 
 def _build(
-    device, worlds=4, mimic=False, prescribed=False, shoulder=False, quadruped=False, cabinet=False, speed_limit=None
+    device,
+    worlds=4,
+    mimic=False,
+    prescribed=False,
+    shoulder=False,
+    quadruped=False,
+    cabinet=False,
+    speed_limit=None,
+    links=3,
 ):
     """Per world: a fixed-base three-joint arm over a free box resting on the ground.
 
@@ -92,6 +100,8 @@ def _build(
     two-drawer cabinet (independent prismatic coordinates: the solver's
     diagonal-mass response class) replaces the box. ``speed_limit`` bounds
     every arm joint's velocity (the hand recipes' joint velocity limits).
+    ``links`` is the arm's joint count (17 or more with the free box selects
+    the solver's paired response, the Kuka scenes' class).
     """
     scene = newton.ModelBuilder()
     cfg = scene.default_shape_cfg.copy()
@@ -102,10 +112,13 @@ def _build(
     parent = scene.add_link(mass=2.0, inertia=wp.mat33(np.eye(3) * 0.1), lock_inertia=True)
     joints = [
         scene.add_joint_fixed(
-            parent=-1, child=parent, parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.3), wp.quat_identity())
+            parent=-1,
+            child=parent,
+            # A longer arm hangs from a higher base so that it clears the ground.
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.3 + max(0, links - 3) * 0.2), wp.quat_identity()),
         )
     ]
-    for link in range(3):
+    for link in range(links):
         body = scene.add_link(
             mass=1.0 + 0.2 * link,
             inertia=wp.mat33(np.eye(3) * (0.04 + 0.01 * link)),
@@ -177,7 +190,7 @@ def _kinematic_free_joints(model):
     return model.joint_q_start.numpy()[joints], model.joint_qd_start.numpy()[joints]
 
 
-def _rollout(model, *, owner, steps=120, swing_joint=0, pgs_mode="matrix_free", rows=None, attrs=None):
+def _rollout(model, *, owner, steps=120, swing_joint=0, pgs_mode="matrix_free", rows=None, attrs=None, swing_stride=3):
     env = {
         "FEATHER_PGS_TREE_FOREST": str(int(getattr(_rollout, "forest", False))),
         "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": str(int(owner)),
@@ -211,7 +224,7 @@ def _rollout(model, *, owner, steps=120, swing_joint=0, pgs_mode="matrix_free", 
     qd = np.zeros(model.joint_dof_count, dtype=np.float32)
     types = model.joint_type.numpy()
     qd_start = model.joint_qd_start.numpy()
-    for joint in np.flatnonzero(types == int(newton.JointType.REVOLUTE))[swing_joint::3]:
+    for joint in np.flatnonzero(types == int(newton.JointType.REVOLUTE))[swing_joint::swing_stride]:
         qd[qd_start[joint]] = 1.5
     # Drawers (the cabinet scene) start sliding out.
     for joint in np.flatnonzero(types == int(newton.JointType.PRISMATIC)):
@@ -401,6 +414,24 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         # The swung joint started at 1.5 rad/s and was held under its 0.8 rad/s limit.
         q = owner_solver.joint_q_trajectory.reshape(len(cached), model.world_count, -1)
         self.assertLess(float(np.abs(np.diff(q[:, :, 0], axis=0)).max()) / DT, 1.0)
+
+    def test_paired_response_scenes_are_owned(self):
+        """A 17-joint arm with a free box per world (the Kuka scenes' class) selects the paired response and is owned."""
+        model = _build(wp.get_device("cuda:0"), links=17)
+        plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False, rows=192, swing_stride=17)
+        self.assertIsNone(plain_owner)
+        self.assertEqual(plain_solver._paired_response_primary_size, 17)
+        self.assertTrue(plain_solver._paired_factor_coordinates)
+        owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, rows=192, swing_stride=17)
+        self.assertIsInstance(owner, MixedTreeKineticState)
+        self.assertEqual(owner_solver._paired_response_primary_size, 17)
+        self.assertEqual(sorted(group.layout.dofs for group in owner.groups), [6, 17])
+        self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
+        np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=3.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=3.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached_qd, plain_qd, atol=3.0e-3, rtol=0.0)
+        final = cached[-1].reshape(model.world_count, -1, 7)
+        self.assertTrue(np.all(final[:, -1, 2] > 0.04))
 
     def test_mimic_rows_compose_with_the_mixed_owner(self):
         """Mimic rows are ordinary matrix-free rows over the held factors: the owner admits them and tracks the plain route."""

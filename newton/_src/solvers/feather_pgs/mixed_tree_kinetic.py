@@ -58,9 +58,15 @@ def supported(solver):
         # refreshes; the sparse tree owner has served split sweeps since it
         # existed, and the dense held owner does the same.
         and solver.pgs_mode in ("matrix_free", "split")
-        # The factor stage returns after this owner's refresh, before the
-        # paired-response inverse would be materialized.
-        and getattr(solver, "_paired_response_primary_size", None) is None
+        # The paired response (a 17-26 coordinate robot and one free body per
+        # world) reads the robot's held factor in the fused kernel's layout
+        # when it runs in factor coordinates, which this owner's refresh
+        # writes; its secondary lower inverse is materialized in stage 2 from
+        # the box family's factor. The register-inverse variant is not.
+        and (
+            getattr(solver, "_paired_response_primary_size", None) is None
+            or bool(getattr(solver, "_paired_factor_coordinates", False))
+        )
         and solver.articulated_contact_response == "immediate"
         and solver.drive_mode == "augmented"
         and solver.pgs_velocity_iterations == 0
