@@ -36,8 +36,6 @@ class ResolvedWorldInput:
     v_hat: wp.array[float]
     body_to_articulation: wp.array[int]
     art_to_world: wp.array[int]
-    articulation_start: wp.array[int]
-    joint_child: wp.array[int]
     articulation_dof_start: wp.array[int]
     articulation_response_dof_count: wp.array[int]
     prescribed_articulation: wp.array[int]
@@ -199,81 +197,72 @@ def check_world_limits(data: ResolvedWorldInput, scratch: ResolvedWorldScratch):
 
 @wp.kernel(enable_backward=False)
 def build_predicted_body_twists(data: ResolvedWorldInput, scratch: ResolvedWorldScratch):
-    """Contract each body's motion axes against the predictor, never the incoming velocity.
-
-    One warp per articulation; its lanes stride the articulation's joints and
-    handle each joint's child body, so the articulation's axes and predictor
-    are read once per DOF per warp instead of once per body.
-    """
-    art, lane = wp.tid()
+    """Contract each body's motion axes against the predictor, never the incoming velocity."""
+    body = wp.tid()
+    scratch.body_valid[body] = 0
+    scratch.body_twist[body] = wp.spatial_vector()
+    art = data.body_to_articulation[body]
+    if art < 0:
+        scratch.body_valid[body] = 1
+        return
     if art >= data.art_to_world.shape[0]:
-        if lane == 0:
-            wp.atomic_max(scratch.global_invalid, 0, 1)
+        wp.atomic_max(scratch.global_invalid, 0, 1)
         return
     world = data.art_to_world[art]
     if world < 0 or world >= scratch.resolved.shape[0]:
-        if lane == 0:
-            wp.atomic_max(scratch.global_invalid, 0, 1)
+        wp.atomic_max(scratch.global_invalid, 0, 1)
         return
     if scratch.rejected[world] != 0:
         return
-    prescribed = data.prescribed_articulation[art] != 0
-    start = data.articulation_dof_start[art]
-    count = data.articulation_response_dof_count[art]
-    free = data.is_free_rigid[art] != 0
-    for joint in range(data.articulation_start[art] + lane, data.articulation_start[art + 1], LANES):
-        body = data.joint_child[joint]
-        if body < 0 or body >= scratch.body_valid.shape[0] or data.body_to_articulation[body] != art:
-            wp.atomic_max(scratch.global_invalid, 0, 1)
-            continue
-        pose = data.body_q[body]
-        rotation = wp.transform_get_rotation(pose)
-        valid = _finite3(wp.transform_get_translation(pose)) and _finite3(data.articulation_origin[art])
-        norm = float(0.0)
-        for k in range(4):
-            valid = valid and wp.isfinite(rotation[k])
-            norm += rotation[k] * rotation[k]
-        valid = valid and wp.isfinite(norm) and norm > 0.0
-        twist = wp.spatial_vector()
-        responding = data.body_has_response_dofs[body] != 0 and (data.body_flags[body] & 2) == 0
-        if prescribed:
-            twist = data.body_v_s[body]
-        elif responding:
-            mask = data.body_response_dof_mask[body]
-            valid = valid and count > 0 and count <= 32 and start >= 0
-            if count < 32 and count >= 0:
-                valid = valid and (mask >> wp.uint32(count)) == wp.uint32(0)
-            for local in range(wp.min(count, 32)):
-                if (mask & (wp.uint32(1) << wp.uint32(local))) != wp.uint32(0):
-                    dof = start + local
-                    if dof >= data.v_hat.shape[0] or dof >= data.joint_S_s.shape[0]:
-                        valid = False
-                        continue
-                    axis = data.joint_S_s[dof]
-                    speed = data.v_hat[dof]
-                    valid = valid and _finite6(axis) and wp.isfinite(speed)
-                    twist += axis * speed
-            if free:
-                valid = valid and count == 6 and body < data.max_linear_velocity.shape[0]
-                valid = valid and body < data.max_angular_velocity.shape[0]
-                if valid:
-                    for k in range(6):
-                        limit = data.max_linear_velocity[body]
-                        if k >= 3:
-                            limit = data.max_angular_velocity[body]
-                        valid = valid and not wp.isnan(limit)
-                        if wp.isfinite(limit) and limit > 0.0:
-                            valid = valid and wp.abs(data.v_hat[start + k]) <= limit
-        elif count > 0 and (data.body_flags[body] & 2) != 0:
-            # Partial prescribed membership needs a different source target model.
-            valid = False
-        valid = valid and _finite6(twist)
+    pose = data.body_q[body]
+    rotation = wp.transform_get_rotation(pose)
+    valid = _finite3(wp.transform_get_translation(pose)) and _finite3(data.articulation_origin[art])
+    norm = float(0.0)
+    for k in range(4):
+        valid = valid and wp.isfinite(rotation[k])
+        norm += rotation[k] * rotation[k]
+    valid = valid and wp.isfinite(norm) and norm > 0.0
+    twist = wp.spatial_vector()
+    responding = data.body_has_response_dofs[body] != 0 and (data.body_flags[body] & 2) == 0
+    if data.prescribed_articulation[art] != 0:
+        twist = data.body_v_s[body]
+    elif responding:
+        start = data.articulation_dof_start[art]
+        count = data.articulation_response_dof_count[art]
+        mask = data.body_response_dof_mask[body]
+        valid = valid and count > 0 and count <= 32 and start >= 0
+        if count < 32 and count >= 0:
+            valid = valid and (mask >> wp.uint32(count)) == wp.uint32(0)
+        for local in range(wp.min(count, 32)):
+            if (mask & (wp.uint32(1) << wp.uint32(local))) != wp.uint32(0):
+                dof = start + local
+                if dof >= data.v_hat.shape[0] or dof >= data.joint_S_s.shape[0]:
+                    valid = False
+                    continue
+                axis = data.joint_S_s[dof]
+                speed = data.v_hat[dof]
+                valid = valid and _finite6(axis) and wp.isfinite(speed)
+                twist += axis * speed
+        if data.is_free_rigid[art] != 0:
+            valid = valid and count == 6 and body < data.max_linear_velocity.shape[0]
+            valid = valid and body < data.max_angular_velocity.shape[0]
+            if valid:
+                for k in range(6):
+                    limit = data.max_linear_velocity[body]
+                    if k >= 3:
+                        limit = data.max_angular_velocity[body]
+                    valid = valid and not wp.isnan(limit)
+                    if wp.isfinite(limit) and limit > 0.0:
+                        valid = valid and wp.abs(data.v_hat[start + k]) <= limit
+    elif data.articulation_response_dof_count[art] > 0 and (data.body_flags[body] & 2) != 0:
+        # Partial prescribed membership needs a different source target model.
+        valid = False
+    valid = valid and _finite6(twist)
+    if valid:
         scratch.body_twist[body] = twist
-        if valid:
-            scratch.body_valid[body] = 1
-        else:
-            scratch.body_valid[body] = 0
-            wp.atomic_max(scratch.rejected, world, 1)
+        scratch.body_valid[body] = 1
+    else:
+        wp.atomic_max(scratch.rejected, world, 1)
 
 
 @wp.func
@@ -356,9 +345,9 @@ def _check_normal(c: int, raw: RawContacts, data: ResolvedWorldInput, scratch: R
     if scratch.rejected[world] != 0:
         return
     valid = True
-    if art_a >= 0:
+    if body_a >= 0:
         valid = valid and scratch.body_valid[body_a] != 0
-    if art_b >= 0:
+    if body_b >= 0:
         valid = valid and scratch.body_valid[body_b] != 0
     n = -raw.normal[c]
     valid = valid and _finite3(n) and wp.dot(n, n) > 0.0
@@ -588,7 +577,6 @@ class ResolvedWorlds:
             "articulation_origin",
         ):
             setattr(data, name, getattr(solver, name))
-        data.articulation_start, data.joint_child = solver.model.articulation_start, solver.model.joint_child
         data.limit_q_index = solver._joint_limit_q_index
         data.lower, data.upper, data.q = (
             solver.model.joint_limit_lower,
@@ -618,10 +606,10 @@ class ResolvedWorlds:
 def launch(data, raw, scratch, contact_capacity, device, *, enabled=1):
     """Run the five decision launches in stream order on ``device``."""
     worlds = scratch.resolved.shape[0]
-    articulations = data.articulation_start.shape[0] - 1
+    bodies = scratch.body_valid.shape[0]
     wp.launch(reset_world_decisions, dim=worlds, inputs=[enabled, data, scratch], device=device)
     wp.launch(check_world_limits, dim=(worlds, LANES), inputs=[data, scratch], device=device)
-    wp.launch(build_predicted_body_twists, dim=(articulations, LANES), inputs=[data, scratch], device=device)
+    wp.launch(build_predicted_body_twists, dim=bodies, inputs=[data, scratch], device=device)
     threads = max(1, min(int(contact_capacity), 65536))
     wp.launch(check_raw_contact_normals, dim=threads, inputs=[threads, raw, data, scratch], device=device)
     wp.launch(finalize_resolved_worlds, dim=worlds, inputs=[scratch], device=device)
