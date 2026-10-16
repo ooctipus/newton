@@ -82,14 +82,17 @@ class DeviceProof:
                 raise RuntimeError(f"{what} {label} changed; reconstruct and recapture")
         if not launched:
             return
-        # Order the comparison after the caller's stream like array.numpy() does.
-        with wp.ScopedStream(self.device.null_stream):
-            self._status.zero_()
-            for bit, (_, view, frozen) in enumerate(launched):
-                wp.launch(
-                    _compare_words, dim=frozen.size, inputs=[view, frozen, self._status, 1 << bit], device=self.device
-                )
-            mismatch = int(self._status.numpy()[0])
+        # Stay on the caller's stream: the compares are ordered after its
+        # writes there, and the readback below waits for them. Running them
+        # on the legacy null stream made the next captured graph launch wait
+        # on every notification's compares, which the step timing then
+        # included (UR10 reach +1.0%).
+        self._status.zero_()
+        for bit, (_, view, frozen) in enumerate(launched):
+            wp.launch(
+                _compare_words, dim=frozen.size, inputs=[view, frozen, self._status, 1 << bit], device=self.device
+            )
+        mismatch = int(self._status.numpy()[0])
         for bit, (label, _, _) in enumerate(launched):
             if mismatch & (1 << bit):
                 raise RuntimeError(f"{what} {label} changed; reconstruct and recapture")
