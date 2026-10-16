@@ -15,7 +15,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import resolved_worlds as rw
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
-from newton.tests.test_feather_pgs_mixed_tree_free_body import DT, _build
+from newton.tests.test_feather_pgs_mixed_tree_free_body import DT, _add_quadruped, _build
 
 
 def make_case(*, free=False):
@@ -296,6 +296,61 @@ class TestResolvedWorldsCUDA(unittest.TestCase):
         self.assertTrue(np.isfinite(poses).all())
         np.testing.assert_allclose(poses[:, :, :3], plain[:, :, :3], atol=1.0e-5, rtol=0.0)
         np.testing.assert_allclose(poses[:, :, 3:], plain[:, :, 3:], atol=1.0e-5, rtol=0.0)
+
+
+def _walkers(device, worlds=4):
+    """One free-root quadruped per world on the ground: the packed sparse-factor route's class."""
+    scene = newton.ModelBuilder()
+    cfg = scene.default_shape_cfg.copy()
+    cfg.mu = 0.6
+    _add_quadruped(scene, cfg)
+    builder = newton.ModelBuilder()
+    builder.replicate(scene, worlds, spacing=(3.0, 3.0, 0.0))
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+    model.rigid_contact_max = 2048
+    return model
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "The sparse route is a CUDA path")
+class TestResolvedWorldsSparseRoute(unittest.TestCase):
+    def test_sparse_route_allocates_contacts_with_an_empty_mask(self):
+        """The packed owner declines the classifier but its allocator still takes the mask argument."""
+        model = _walkers(wp.get_device("cuda:0"))
+        env = {
+            "FEATHER_PGS_SPARSE_FACTOR": "1",
+            "FEATHER_PGS_SPARSE_LEVEL_UPDATE": "1",
+            "FEATHER_PGS_SPARSE_PARALLEL_LIMITS": "1",
+        }
+        with patch.dict(os.environ, env):
+            solver = SolverFeatherPGS(
+                model,
+                pgs_mode="matrix_free",
+                pgs_iterations=8,
+                enable_joint_limits=True,
+                grouped_dynamics=True,
+                dense_max_constraints=56,
+                friction_anchor_beta=0.0,
+                mf_gs_incremental_rows=0,
+            )
+        self.assertIsNotNone(solver._sparse_factor)
+        self.assertIsNone(solver._resolved_worlds_owner)
+        self.assertEqual(solver._resolved_worlds.shape, (0,))
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        states = [model.state() for _ in range(2)]
+        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+        control = model.control()
+        for _ in range(30):
+            pipeline.collide(states[0], contacts)
+            states[0].clear_forces()
+            solver.step(states[0], states[1], control, contacts, DT)
+            states.reverse()
+        wp.synchronize_device(model.device)
+        poses = states[0].body_q.numpy().reshape(model.world_count, -1, 7)
+        self.assertTrue(np.isfinite(poses).all())
+        self.assertTrue(np.all(poses[:, 0, 2] > 0.2))
+        self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
 
 
 if __name__ == "__main__":

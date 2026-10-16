@@ -718,6 +718,7 @@ class SparseFactor:
                     int(s.contact_friction_articulation_pairs_only),
                     1,
                     s._friction_patches.view,
+                    s._resolved_worlds,
                 ],
                 outputs=[
                     s.contact_world,
