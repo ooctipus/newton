@@ -142,6 +142,8 @@ class TreeLayout:
             **threads,
             **scratch,
             "LANES": self.lanes,
+            # Warp-shuffle scans: the shuffle width of a packed group (a full warp needs none).
+            "SHFL": f",{self.lanes}" if self.lanes < 32 else "",
             "PACK": self.pack,
             "BODIES": self.bodies,
             "DOFS": self.dofs,

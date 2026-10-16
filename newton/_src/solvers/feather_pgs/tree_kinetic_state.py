@@ -5,6 +5,7 @@
 """Generated current/next tree moments, bias and fused state publication."""
 
 import functools
+import os
 from textwrap import indent
 from types import SimpleNamespace
 
@@ -340,6 +341,82 @@ _MOTION = r"""
 #endif
 """
 
+# Register scans for warp-sized layouts: each lane carries its body's value and
+# pointer-jumps to the 2^round-th ancestor through shuffles, with no shared-memory
+# round trip and no barrier per round. Lanes past the last body idle in place.
+_POSE_SHFL = r"""
+    float* s=reinterpret_cast<float*>(address);
+#if defined(__CUDA_ARCH__)
+    const int lane=$LANE,body=lane;
+    wp::transform value=wp::transform_identity<float>();
+    if(body<$BODIES)for(int k=0;k<7;++k)value[k]=s[7*body+k];
+    int parent=body<$BODIES?p.parent.data[body]:-1;
+    for(int round=0;round<$ROUNDS;++round) {
+        const int source=parent>=0?parent:lane;
+        wp::transform ancestor;
+        for(int k=0;k<7;++k)ancestor[k]=__shfl_sync($MASK,value[k],source$SHFL);
+        const int next=__shfl_sync($MASK,parent,source$SHFL);
+        if(parent>=0)value=wp::transform_multiply(ancestor,value);
+        parent=parent>=0?next:-1;
+    }
+    if(body<$BODIES)for(int k=0;k<7;++k)s[7*body+k]=value[k];
+    $SYNC;
+#else
+    wp::transform old[$BODIES];
+    for(int round=0;round<$ROUNDS;++round) {
+        for(int body=0;body<$BODIES;++body)for(int k=0;k<7;++k)old[body][k]=s[7*body+k];
+        for(int body=0;body<$BODIES;++body) {
+            const int parent=p.jump.data[round*$BODIES+body];
+            const wp::transform v=parent>=0?wp::transform_multiply(old[parent],old[body]):old[body];
+            for(int k=0;k<7;++k)s[7*body+k]=v[k];
+        }
+    }
+#endif
+"""
+
+_MOTION_SHFL = r"""
+    float* s=reinterpret_cast<float*>(address)+$MOTION;
+#if defined(__CUDA_ARCH__)
+    const int lane=$LANE,body=lane;
+    float v[6]={},a[6]={};
+    if(body<$BODIES)for(int k=0;k<6;++k)v[k]=s[6*body+k];
+    int parent=body<$BODIES?p.parent.data[body]:-1;
+    for(int round=0;round<$ROUNDS;++round) {
+        const int source=parent>=0?parent:lane;
+        float pv[6],pa[6];
+        for(int k=0;k<6;++k){pv[k]=__shfl_sync($MASK,v[k],source$SHFL);pa[k]=__shfl_sync($MASK,a[k],source$SHFL);}
+        const int next=__shfl_sync($MASK,parent,source$SHFL);
+        if(parent>=0) {
+            const wp::vec3 pl(pv[0],pv[1],pv[2]),pw(pv[3],pv[4],pv[5]);
+            const wp::vec3 vl(v[0],v[1],v[2]),vw(v[3],v[4],v[5]);
+            const wp::vec3 c=wp::cross(pw,vl)+wp::cross(pl,vw),d=wp::cross(pw,vw);
+            for(int k=0;k<3;++k){a[k]=pa[k]+a[k]+c[k];a[k+3]=pa[k+3]+a[k+3]+d[k];}
+            for(int k=0;k<6;++k)v[k]=pv[k]+v[k];
+        }
+        parent=parent>=0?next:-1;
+    }
+    if(body<$BODIES)for(int k=0;k<6;++k){s[6*body+k]=v[k];s[$SIX_BODIES+6*body+k]=a[k];}
+    $SYNC;
+#else
+    float ov[$BODIES][6],oa[$BODIES][6];
+    for(int body=0;body<$BODIES;++body)for(int k=0;k<6;++k)s[$SIX_BODIES+6*body+k]=0.0f;
+    for(int round=0;round<$ROUNDS;++round) {
+        for(int body=0;body<$BODIES;++body)for(int k=0;k<6;++k){ov[body][k]=s[6*body+k];oa[body][k]=s[$SIX_BODIES+6*body+k];}
+        for(int body=0;body<$BODIES;++body) {
+            const int parent=p.jump.data[round*$BODIES+body];
+            if(parent<0)continue;
+            const float* pv=ov[parent],*pa=oa[parent],*v=ov[body];
+            const wp::vec3 pl(pv[0],pv[1],pv[2]),pw(pv[3],pv[4],pv[5]);
+            const wp::vec3 vl(v[0],v[1],v[2]),vw(v[3],v[4],v[5]);
+            const wp::vec3 c=wp::cross(pw,vl)+wp::cross(pl,vw),d=wp::cross(pw,vw);
+            for(int k=0;k<3;++k){s[$SIX_BODIES+6*body+k]=pa[k]+oa[body][k]+c[k];s[$SIX_BODIES_PLUS3+6*body+k]=pa[k+3]+oa[body][k+3]+d[k];}
+            for(int k=0;k<6;++k)s[6*body+k]=pv[k]+v[k];
+        }
+    }
+#endif
+"""
+
+
 _COLLECT = r"""    $PHYSICAL_DECL
 
     float* s=reinterpret_cast<float*>(address);
@@ -525,8 +602,13 @@ _STORE_TERMS_SOURCE = r"""
 def get_helpers(layout: TreeLayout = REFERENCE_LAYOUT, chain_scan: bool = False, body_velocity: bool = False):
     """Bind one physical tree evaluation to its storage and traversal schedule."""
     plan_type = tree_chain_scan.ChainPlan if chain_scan else KineticPlan
-    pose_source = layout.render(tree_chain_scan._POSE if chain_scan else _POSE)
-    motion_source = layout.render(tree_chain_scan._MOTION if chain_scan else _MOTION)
+    # A warp-sized layout scans in registers through shuffles; two-warp layouts
+    # keep the shared-memory jump table.
+    register_scan = (
+        not chain_scan and layout.lanes <= 32 and os.environ.get("FEATHER_PGS_TREE_SHUFFLE_SCAN", "1") == "1"
+    )
+    pose_source = layout.render(tree_chain_scan._POSE if chain_scan else _POSE_SHFL if register_scan else _POSE)
+    motion_source = layout.render(tree_chain_scan._MOTION if chain_scan else _MOTION_SHFL if register_scan else _MOTION)
     reduction = (
         tree_chain_scan.reduction_source(moments=True, layout=layout) if chain_scan else layout.render(_LEVEL_REDUCE)
     )
