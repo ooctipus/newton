@@ -778,8 +778,37 @@ def create_box_prism_contacts(writer_func: Any, query_filter: Any = None):
             polygon[corner, 1] = vertex[1]
             polygon[corner, 2] = vertex[2]
         clipped, count = _clip_polygon_xy(polygon, 4, e1, e2)
+        # A face on a plane needs at most four support points; a face crossing
+        # a cell yields up to seven clipped vertices, and every extra one is a
+        # contact row the solver has to visit (Go2 rough +2% with all seven).
+        # Keep the four deepest.
+        keep = wp.vector(length=4, dtype=wp.int32)
+        kept = int(0)
+        if count > 4:
+            for slot in range(4):
+                best = int(-1)
+                best_depth = float(1.0e30)
+                for i in range(count):
+                    taken = int(0)
+                    for j in range(kept):
+                        if keep[j] == i:
+                            taken = 1
+                    if taken == 0:
+                        depth = clipped[i, 0] * n[0] + clipped[i, 1] * n[1] + clipped[i, 2] * n[2]
+                        if depth < best_depth:
+                            best_depth = depth
+                            best = i
+                keep[slot] = best
+                kept += 1
         key = sort_sub_key << 3
         for i in range(count):
+            if count > 4:
+                selected = int(0)
+                for j in range(kept):
+                    if keep[j] == i:
+                        selected = 1
+                if selected == 0:
+                    continue
             p = wp.vec3(clipped[i, 0], clipped[i, 1], clipped[i, 2])
             point_a, normal, d = _footprint_point_query(p, n)
             if d > threshold + _ADMISSION_SLACK:
