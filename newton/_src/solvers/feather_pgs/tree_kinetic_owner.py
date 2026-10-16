@@ -65,6 +65,8 @@ class TreeKineticState:
             raise ValueError("Copied-state reuse requires fixed scalar coordinates and ordinary motion")
         self.copy_reuse = copy_reuse
         self.group_count = sparse_owner.plan.group_to_art.size
+        if os.environ.get("FEATHER_PGS_STAGE_CLOCKS") == "1":
+            solver._stage_clocks = wp.zeros((self.group_count, 16), dtype=wp.int64, device=solver.model.device)
         self._cache_to_art = sparse_owner.plan.group_to_art.reshape((self.group_count, 1))
         bodies, dofs = self.layout.bodies, self.layout.dofs
         jump = np.empty((self.layout.rounds, bodies), np.int32)
@@ -177,6 +179,7 @@ class TreeKineticState:
         elif self.layout.forest:
             raise ValueError("Forest groups do not use the packed chain scan")
         self.data = native.KineticData()
+        self.data.stage_clocks = cached_state_binding.stage_clocks(solver)
         groups = self.group_count
         self.data.bias = wp.empty((groups, dofs), dtype=float, device=device)
         self.data.com_offset = wp.empty((groups, bodies), dtype=wp.vec3, device=device)
@@ -261,6 +264,7 @@ class TreeKineticState:
         force.damping, force.u0, force.S = solver._passive_joint_damping, solver.joint_tau, solver.joint_S_s
         force.kinematic_joint, force.qdd, force.vhat = solver._kinematic_joint_mask, solver.joint_qdd, solver.v_hat
         force.dt = 1.0 / 240.0
+        force.stage_clocks = cached_state_binding.stage_clocks(solver)
         predict_arguments = [self.sparse.plan, self.sparse.data, self.plan, self.data, force]
         base = self.layout
         timings = {}
@@ -434,6 +438,7 @@ class TreeKineticState:
         force.kinematic_joint = solver._kinematic_joint_mask
         force.qdd, force.vhat = state_aug.joint_qdd, solver.v_hat
         force.dt = dt
+        force.stage_clocks = cached_state_binding.stage_clocks(solver)
         wp.launch_tiled(
             self.predictor_kernel,
             dim=[self.launch_count],

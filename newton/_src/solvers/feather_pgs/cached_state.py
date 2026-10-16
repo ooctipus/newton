@@ -11,6 +11,7 @@ one definition; mappings, operators and cache policies remain with their owners.
 
 import hashlib
 import linecache
+import os
 from dataclasses import dataclass
 from string import Template
 from textwrap import dedent, indent
@@ -19,6 +20,16 @@ import warp as wp
 
 from . import kernels
 from .publication_data import PublicationData
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+    return wp::int64(clock64());
+#else
+    return wp::int64(0);
+#endif
+""")
+def _clock() -> wp.int64: ...
 
 
 @dataclass(frozen=True)
@@ -86,6 +97,7 @@ if wp.static(finish):
             data.joint_qdd,
         )
     _sync()
+    $CLOCKI1
     $ROOT_LOOP:
         remove_transport(
             $ROOT_SLOT,
@@ -96,6 +108,7 @@ if wp.static(finish):
             data.joint_qdd,
         )
     _sync()
+    $CLOCKI2
     for local in range(lane, $BODIES, stride):
         joint = $JOINT
         integrate(
@@ -140,6 +153,7 @@ for local in range(lane, $BODIES, stride):
 
 def make_state_kernel(name, signature, operands, stages, namespace, *, finish):
     """Compile one complete repair/finish with the owner's existing launch ABI."""
+    clocked = os.environ.get("FEATHER_PGS_STAGE_CLOCKS") == "1"
     values = {
         "BODIES": operands.bodies,
         "DOFS": operands.dofs,
@@ -147,6 +161,8 @@ def make_state_kernel(name, signature, operands, stages, namespace, *, finish):
         "DOF": operands.dof,
         "ROOT_LOOP": operands.root_loop,
         "ROOT_SLOT": operands.root_slot,
+        "CLOCKI1": "clock_i1 = _clock()" if clocked else "pass",
+        "CLOCKI2": "clock_i2 = _clock()" if clocked else "pass",
     }
     blocks = [
         stages.setup,
@@ -163,10 +179,35 @@ def make_state_kernel(name, signature, operands, stages, namespace, *, finish):
         stages.collect,
         "_release(address)",
     ]
+    if clocked:
+        # Stage attribution: cycle counts between stage boundaries, lane 0 of
+        # each group, into data.stage_clocks[group, 0:8] (update_qdd, root
+        # transport, joint integration, relative, poses, motion, bodies, collect).
+        marks = {0: 0, 2: 1, 4: 2, 5: 3, 6: 4, 7: 5, 8: 6}
+        timed = []
+        for index, block in enumerate(blocks):
+            timed.append(block)
+            if index in marks:
+                timed.append(f"clock_{marks[index]} = _clock()")
+            if index == 2:
+                timed.append("if not wp.static(finish):\n    clock_i1 = clock_0\n    clock_i2 = clock_0")
+        deltas = [
+            "    data.stage_clocks[group, 0] = clock_i1 - clock_0",
+            "    data.stage_clocks[group, 1] = clock_i2 - clock_i1",
+            "    data.stage_clocks[group, 2] = clock_1 - clock_i2",
+        ] + [f"    data.stage_clocks[group, {k + 2}] = clock_{k + 1} - clock_{k}" for k in range(1, 6)]
+        timed.insert(len(timed) - 1, "if lane == 0 and data.stage_clocks.shape[0] > group:\n" + "\n".join(deltas))
+        blocks = timed
     body = "\n".join(dedent(block).strip("\n") for block in blocks)
     source = "def kinetic_state(" + signature + "):\n" + indent(body, "    ") + "\n"
     bindings = dict(
-        namespace, wp=wp, kernels=kernels, PublicationData=PublicationData, finish=finish, **generalized_operations()
+        namespace,
+        wp=wp,
+        kernels=kernels,
+        PublicationData=PublicationData,
+        finish=finish,
+        _clock=_clock,
+        **generalized_operations(),
     )
     function = _compile(source, bindings, "state")["kinetic_state"]
     function.__name__ = function.__qualname__ = name

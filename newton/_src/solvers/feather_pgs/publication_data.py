@@ -48,6 +48,8 @@ class PublicationData:
     angular_damping: float
     materialize_all_body_inertia: int
     materialize_body_inertia_terms: int
+    # Per-group stage cycle counts when FEATHER_PGS_STAGE_CLOCKS=1 (a 1x1 dummy otherwise).
+    stage_clocks: wp.array2d[wp.int64]
 
 
 # Model arrays bound by name, solver arrays bound through their attribute,

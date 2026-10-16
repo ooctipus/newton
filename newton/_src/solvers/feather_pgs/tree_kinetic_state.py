@@ -60,6 +60,7 @@ class KineticData:
     snapshot_qd: wp.array2d[float]
     snapshot_body_q: wp.array2d[wp.transform]
     snapshot_body_qd: wp.array2d[wp.spatial_vector]
+    stage_clocks: wp.array2d[wp.int64]
 
 
 @wp.struct
@@ -92,6 +93,7 @@ class ForceInput:
     qdd: wp.array[float]
     vhat: wp.array[float]
     dt: float
+    stage_clocks: wp.array2d[wp.int64]
 
 
 _LANES_SOURCE = r"""
@@ -425,8 +427,8 @@ _COLLECT = r"""    $PHYSICAL_DECL
 #else
     const int lane=0,stride=1;
 #endif
-$REDUCE
-    for(int dof=lane;dof<$DOFS;dof+=stride) {
+$CLOCKC0$REDUCE
+$CLOCKC1    for(int dof=lane;dof<$DOFS;dof+=stride) {
         const int body=p.dof_joint.data[dof];
         float bias=0.0f;
         for(int k=0;k<6;++k)bias+=s[$AXIS+6*dof+k]*s[$WRENCH+6*body+k];
@@ -450,7 +452,7 @@ $REDUCE
 #if defined(__CUDA_ARCH__)
     $SYNC;
 #endif
-    if(refresh)for(int e=lane;e<$NNZ;e+=stride) {
+$CLOCKC2    if(refresh)for(int e=lane;e<$NNZ;e+=stride) {
         const int row=$PHYSICAL_ROW,col=$PHYSICAL_COL,src=p.source.data[e];
         const int projection=src==col?row:col;
         float value=0.0f;
@@ -467,7 +469,7 @@ $REDUCE
 #if defined(__CUDA_ARCH__)
     $SYNC;
 #endif
-    if(lane==0) {
+$CLOCKC3    if(lane==0) {
         cache.generation.data[group]+=1;
         $CURRENT_VALID
         cache.geometry_valid.data[group]=refresh&&cache.status.data[group]==0;
@@ -497,7 +499,7 @@ _PREDICT = r"""    $PHYSICAL_DECL
     float s[$PRED_SCRATCH];int nonzero=0;
 #endif
     if(lane==0)nonzero=0;
-#if defined(__CUDA_ARCH__)
+$CLOCK0#if defined(__CUDA_ARCH__)
     $SYNC;
 #endif
     for(int local=lane;local<$BODIES;local+=stride) {
@@ -516,7 +518,7 @@ _PREDICT = r"""    $PHYSICAL_DECL
 #if defined(__CUDA_ARCH__)
     $SYNC;
 #endif
-$REDUCE
+$CLOCK1$REDUCE
     for(int i=lane;i<$DOFS;i+=stride) {
         const int dof=ds+i,body=p.dof_joint.data[i];
         float value=-cache.bias.data[group*$DOFS+i]+f.joint_f.data[dof]+f.u0.data[dof];
@@ -527,8 +529,8 @@ $REDUCE
 #if defined(__CUDA_ARCH__)
     $SYNC;
 #endif
-    $FORWARD_STAGE
-    for(int col=lane;col<$DOFS;col+=stride) {
+$CLOCK2    $FORWARD_STAGE
+$CLOCK3    for(int col=lane;col<$DOFS;col+=stride) {
         $TRANSPOSE_ACTION
         const int dof=ds+$RESPONSE_PHYSICAL;
         const bool valid=cache.current_valid.data[art]&&d.valid.data[group]&&!d.status.data[group]&&!cache.status.data[group]&&wp::isfinite(value);
@@ -545,9 +547,9 @@ $REDUCE
 #if defined(__CUDA_ARCH__)
     $SYNC;
 #endif
-    // A prescribed (kinematic) free root keeps its given velocity: no transport.
+$CLOCK4    // A prescribed (kinematic) free root keeps its given velocity: no transport.
     $TRANSPORT_BLOCK
-"""
+$CLOCK5"""
 
 _LEVEL_REDUCE = r"""    for(int level=$LAST_PARENT;level>=0;--level) {
         for(int body=lane;body<$BODIES;body+=stride)if(plan.depth.data[body]==level) {
@@ -612,7 +614,21 @@ def get_helpers(layout: TreeLayout = REFERENCE_LAYOUT, chain_scan: bool = False,
     reduction = (
         tree_chain_scan.reduction_source(moments=True, layout=layout) if chain_scan else layout.render(_LEVEL_REDUCE)
     )
-    collect_source = layout.render(_COLLECT.replace("$REDUCE", reduction))
+    collect_text = _COLLECT.replace("$REDUCE", reduction)
+    clocked = os.environ.get("FEATHER_PGS_STAGE_CLOCKS") == "1"
+    for k in range(4):
+        statement = ""
+        if clocked and k == 0:
+            statement = "#if defined(__CUDA_ARCH__)\n    long long c0=clock64(),c1=c0,c2=c0,c3=c0;\n#endif\n"
+        elif clocked:
+            statement = f"#if defined(__CUDA_ARCH__)\n    c{k}=clock64();\n#endif\n"
+        if clocked and k == 3:
+            statement += (
+                "#if defined(__CUDA_ARCH__)\n    if(lane==0&&cache.stage_clocks.shape[0]>group){long long* o=cache.stage_clocks.data"
+                "+group*cache.stage_clocks.shape[1]+13;o[0]=c1-c0;o[1]=c2-c1;o[2]=c3-c2;}\n#endif\n"
+            )
+        collect_text = collect_text.replace(f"$CLOCKC{k}", statement)
+    collect_source = layout.render(collect_text)
 
     @wp.func_native(layout.render(_STORAGE_SOURCE))
     def _storage() -> wp.uint64: ...
@@ -1049,6 +1065,21 @@ def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFER
     elif response != "sparse":
         raise ValueError("Unknown held tree response representation")
     source = _PREDICT
+    clocked = os.environ.get("FEATHER_PGS_STAGE_CLOCKS") == "1"
+    for k in range(6):
+        statement = ""
+        if clocked and k == 0:
+            statement = (
+                "#if defined(__CUDA_ARCH__)\n    long long c0=clock64(),c1=c0,c2=c0,c3=c0,c4=c0,c5=c0;\n#endif\n"
+            )
+        elif clocked:
+            statement = f"#if defined(__CUDA_ARCH__)\n    c{k}=clock64();\n#endif\n"
+        if clocked and k == 5:
+            statement += (
+                "#if defined(__CUDA_ARCH__)\n    if(lane==0&&f.stage_clocks.shape[0]>group){long long* o=f.stage_clocks.data"
+                "+group*f.stage_clocks.shape[1]+8;o[0]=c1-c0;o[1]=c2-c1;o[2]=c3-c2;o[3]=c4-c3;o[4]=c5-c4;}\n#endif\n"
+            )
+        source = source.replace(f"$CLOCK{k}", statement)
     for name, operation in operations.items():
         source = source.replace("$" + name, operation)
     source = layout.render(source)

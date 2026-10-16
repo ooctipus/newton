@@ -9,6 +9,19 @@ import warp as wp
 
 from .publication_data import CACHE_FIELDS, MODEL_FIELDS, SOLVER_FIELDS, PublicationData
 
+_DUMMY_CLOCKS = {}
+
+
+def stage_clocks(solver):
+    """The owner's stage-clock buffer when instrumentation is on, else a shared 1x1 dummy."""
+    clocks = getattr(solver, "_stage_clocks", None)
+    if clocks is not None:
+        return clocks
+    key = str(solver.model.device)
+    if key not in _DUMMY_CLOCKS:
+        _DUMMY_CLOCKS[key] = wp.zeros((1, 1), dtype=wp.int64, device=solver.model.device)
+    return _DUMMY_CLOCKS[key]
+
 
 def publication(solver, state_in, state_aug, state_out, dt):
     """Rebind numeric descriptors on each call, preserving original free finalization."""
@@ -33,6 +46,7 @@ def publication(solver, state_in, state_aug, state_out, dt):
     # Free finalization still materializes its original I_s on held steps.
     data.materialize_all_body_inertia = 0
     data.materialize_body_inertia_terms = 0
+    data.stage_clocks = stage_clocks(solver)
     return data
 
 
