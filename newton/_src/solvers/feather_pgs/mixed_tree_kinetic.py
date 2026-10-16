@@ -7,6 +7,7 @@ import numpy as np
 import warp as wp
 
 from ...sim import JointType
+from .device_proof import DeviceProof
 from .franka_kinetic_factor import get_kernel as geometric_factor
 from .sparse_factor import bind_operator_plan, operator_metadata
 from .sparse_mass_matrix import _SparseMassMatrixPlan
@@ -282,6 +283,9 @@ class MixedTreeKineticState:
     def __init__(self, solver, *, admission=None):
         self.solver = solver
         self.coverage = _coverage(solver)
+        self._dimensions = (solver.model.joint_count, solver.model.body_count, solver.model.articulation_count)
+        # The coverage proof's inputs, compared on the device on notification.
+        self._proof = DeviceProof(list(self._coverage_arrays()), solver.model.device)
         operators = [TreeHeldOperator(solver, size) for size in solver.size_groups]
         if self.coverage[-1]:
             operators.append(PrescribedRootOperator(solver))
@@ -302,21 +306,37 @@ class MixedTreeKineticState:
         self.sparse = self
         self.copy_reuse = all(group.copy_reuse for group in self.groups)
 
+    def _coverage_arrays(self):
+        solver, model = self.solver, self.solver.model
+        for size in solver.size_groups:
+            yield f"group_to_art[{size}]", solver.group_to_art[size]
+        yield "articulation_start", model.articulation_start
+        yield "joint_qd_start", model.joint_qd_start
+        yield "joint_child", model.joint_child
+        yield "articulation_dof_start", solver.articulation_dof_start
+        yield "prescribed_articulation", solver._prescribed_articulation
+
     def validate_model(self, flags=None):
         """Reject ownership changes before any cache or notification mutation."""
         if flags is not None and int(flags) != 0 and int(flags) & ~_NUMERIC_FLAGS == 0:
             # Numeric notifications cannot change ownership; see TreeKineticState.
             return
-        if _coverage(self.solver) != self.coverage:
+        solver = self.solver
+        sizes = (
+            tuple(solver.size_groups),
+            tuple(sorted(solver.n_arts_by_size.items())),
+            solver._compact_diagonal_mass_size,
+        )
+        if (
+            solver.model.joint_count,
+            solver.model.body_count,
+            solver.model.articulation_count,
+        ) != self._dimensions or sizes != self.coverage[:3]:
             raise RuntimeError("Mixed tree factor groups changed; reconstruct and recapture")
+        current = dict(self._coverage_arrays())
+        self._proof.validate(current.__getitem__, "Mixed tree factor")
         for group in self.groups:
-            expected = (
-                _prescribed_articulations(self.solver)
-                if getattr(group.sparse, "prescribed", False)
-                else self.solver.group_to_art[group.layout.dofs].numpy()
-            )
-            if not np.array_equal(group.sparse.plan.group_to_art.numpy(), expected):
-                raise RuntimeError("Mixed tree factor mapping changed; reconstruct and recapture")
+            # Each group's plan binds the same group map it was built from.
             group.validate_model(flags)
 
     def invalidate(self, world_mask=None):

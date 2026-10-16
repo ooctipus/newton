@@ -3,7 +3,6 @@
 
 """Admission and live bindings for complete tree current/next kinetic state."""
 
-import hashlib
 import math
 import os
 
@@ -12,6 +11,7 @@ import warp as wp
 
 from ...sim import ModelFlags
 from . import cached_state_binding, world_scan_owner
+from .device_proof import DeviceProof, fingerprint
 from .tree_kinetic_plan import cooperative_block_dim, make_plan
 
 _NUMERIC_FLAGS = int(
@@ -23,18 +23,14 @@ _NUMERIC_FLAGS = int(
 
 _PLAN_FIELDS = (
     *world_scan_owner.PLAN_FIELDS,
+    "joint_ancestor",
     "joint_axis",
     "joint_X_p",
     "joint_X_c",
 )
+_MAPPING_FIELDS = ("group_to_art", "art_to_world", "art_dof_start", "free_root_joint_indices")
 
-
-def _fingerprint(array):
-    """Keep immutable-plan evidence without retaining full host model copies."""
-    if array is None:
-        return None
-    values = array.numpy()
-    return values.shape, values.dtype.str, hashlib.sha256(values.tobytes()).digest()
+_fingerprint = fingerprint
 
 
 class TreeKineticState:
@@ -165,14 +161,13 @@ class TreeKineticState:
             True, self.chain_scan, layout=self.layout, body_velocity=body_velocity, copy_reuse=copy_reuse
         )
         self.predictor_kernel = native.get_predictor_kernel(self.chain_scan, layout=self.layout, response=response)
-        self._model_plan = {name: _fingerprint(getattr(model, name)) for name in _PLAN_FIELDS}
         self._plan_dimensions = self._dimensions()
-        self._mapping_plan = {
-            "group_to_art": _fingerprint(sparse_owner.plan.group_to_art),
-            "art_to_world": _fingerprint(sparse_owner.plan.art_to_world),
-            "art_dof_start": _fingerprint(sparse_owner.plan.art_dof_start),
-            "free_root_joint_indices": _fingerprint(solver._free_root_joint_indices),
-        }
+        # Everything make_plan and the kernels bake in, proven on the device.
+        self._proof = DeviceProof(
+            [(name, getattr(model, name)) for name in _PLAN_FIELDS]
+            + [(f"{name} mapping", self._mapping(name)) for name in _MAPPING_FIELDS],
+            device,
+        )
 
     def _dimensions(self):
         model = self.solver.model
@@ -186,31 +181,34 @@ class TreeKineticState:
             model.joint_dof_count,
         )
 
+    def _mapping(self, name):
+        return (
+            self.solver._free_root_joint_indices
+            if name == "free_root_joint_indices"
+            else getattr(self.sparse.plan, name)
+        )
+
     def validate_model(self, flags=None):
         """Reject changed baked ownership before notification invalidates any state.
 
         Numeric notifications (joint DOF, inertial, shape and model properties)
         change values the caches refresh from, never parents, axes, anchors or
-        body membership, so they skip the topology fingerprints, which read
-        every plan array back to the host; Isaac Lab issues such notifications
-        on every reset.
+        body membership, so they are accepted outright. Every other
+        notification compares the baked plan arrays on the device (one small
+        readback) instead of fingerprinting them on the host; Isaac Lab issues
+        a notification on every reset.
         """
         if flags is not None and int(flags) != 0 and int(flags) & ~_NUMERIC_FLAGS == 0:
             return
         if self._dimensions() != self._plan_dimensions:
             raise RuntimeError("Tree kinetic dimensions changed; reconstruct and recapture")
-        make_plan(self.solver.model, self.sparse, complete=self.complete)
-        for name, expected in self._model_plan.items():
-            if _fingerprint(getattr(self.solver.model, name)) != expected:
-                raise RuntimeError(f"Tree kinetic static {name} changed; reconstruct and recapture")
-        for name, expected in self._mapping_plan.items():
-            value = (
-                self.solver._free_root_joint_indices
-                if name == "free_root_joint_indices"
-                else getattr(self.sparse.plan, name)
-            )
-            if _fingerprint(value) != expected:
-                raise RuntimeError(f"Tree kinetic static {name} mapping changed; reconstruct and recapture")
+
+        def current(label):
+            if label.endswith(" mapping"):
+                return self._mapping(label[: -len(" mapping")])
+            return getattr(self.solver.model, label)
+
+        self._proof.validate(current, "Tree kinetic static")
 
     def invalidate(self, world_mask=None):
         """Invalidate current state for every owned articulation in selected worlds."""
