@@ -2915,20 +2915,9 @@ class SolverFeatherPGS(SolverBase):
         if (
             self._sparse_mass_matrix_size is None
             and self._point_contact_paths
-            and (
-                # Keyed rows are on wherever world rows are; FEATHER_PGS_KEYED_ROWS=0 opts
-                # out. The earlier robot-named and "generated" flags remain as aliases.
-                os.environ.get("FEATHER_PGS_KEYED_ROWS") == "1"
-                or os.environ.get("FEATHER_PGS_ALLEGRO_KINETIC_ROWS") == "1"
-                or os.environ.get("FEATHER_PGS_GENERATED_KEYED_ROWS") == "1"
-                or (
-                    _WR_ON
-                    and os.environ.get(
-                        "FEATHER_PGS_KEYED_ROWS", os.environ.get("FEATHER_PGS_GENERATED_KEYED_ROWS", "1")
-                    )
-                    != "0"
-                )
-            )
+            # Keyed rows are on by policy wherever their producer admits the solver
+            # (keyed_rows.create_owner); FEATHER_PGS_KEYED_ROWS=0 opts out.
+            and os.environ.get("FEATHER_PGS_KEYED_ROWS", "1") != "0"
         ):
             from .keyed_rows import create_owner as create_kinetic_rows_owner  # noqa: PLC0415
 

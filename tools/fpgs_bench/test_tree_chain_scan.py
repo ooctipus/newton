@@ -130,7 +130,7 @@ class TestChainPlan(unittest.TestCase):
         """Exercise both current/held force actions and complete next publication."""
         results = []
         for enabled in (False, True):
-            with patch.dict(os.environ, {"FEATHER_PGS_G1_CHAIN_SCAN": str(int(enabled))}):
+            with patch.dict(os.environ, {"FEATHER_PGS_TREE_CHAIN_SCAN": str(int(enabled))}):
                 case = fixture("cpu")
                 owner = packed_tree_owner.PackedTreeState(case["owner"])
             self.assertEqual(owner.chain_scan, enabled)
@@ -170,7 +170,7 @@ class TestChainPlan(unittest.TestCase):
 
     def test_additive_subtrees_do_not_subtract_unrelated_large_branch(self):
         """An unrelated large wrench cannot erase a small descendant subtree."""
-        with patch.dict(os.environ, {"FEATHER_PGS_G1_CHAIN_SCAN": "1"}):
+        with patch.dict(os.environ, {"FEATHER_PGS_TREE_CHAIN_SCAN": "1"}):
             case = fixture("cpu")
             owner = packed_tree_owner.PackedTreeState(case["owner"])
         parent = case["model"].joint_parent.numpy()[:44]

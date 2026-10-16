@@ -33,7 +33,7 @@ RECIPES = {
     ),
     "allegro": (
         [
-            *flags("ALLEGRO_KINETIC_ROWS"),
+            *flags("KEYED_ROWS"),
             "NEWTON_NARROW_PHASE_COHERENT_CONVEX=reject_only",
             "NEWTON_NARROW_PHASE_CONVEX_CELLS=1",
         ],
@@ -47,7 +47,7 @@ RECIPES = {
             "SPARSE_LEVEL_UPDATE",
             "SPARSE_METRIC_TANGENTS",
             "PACKED_TREE_KINETIC_STATE",
-            "G1_CHAIN_SCAN",
+            "TREE_CHAIN_SCAN",
             "SPARSE_SPECTRAL_TANGENTS",
             "SPARSE_LIMIT_JACOBI",
         )

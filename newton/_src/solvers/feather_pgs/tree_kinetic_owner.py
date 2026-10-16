@@ -100,7 +100,7 @@ class TreeKineticState:
             for dof in range(self.layout.root_dofs, dofs):
                 q_index[group, dof] = q_starts[start + dof_joint[dof]] + dof_offset[dof]
         if chain_scan_default is None:
-            chain_scan_default = os.environ.get("FEATHER_PGS_G1_CHAIN_SCAN", "0") == "1"
+            chain_scan_default = True
         self.chain_scan_requested = os.environ.get("FEATHER_PGS_TREE_CHAIN_SCAN", str(int(chain_scan_default))) == "1"
         self.chain_scan = False
         chain_host = None

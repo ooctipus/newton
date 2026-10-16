@@ -28,7 +28,7 @@ from tools.fpgs_bench.test_keyed_rows_capture import captures
 def mode(enabled):
     """Bind the existing INK recipe and the new flag before construction."""
     with (
-        patch.dict(os.environ, {"FEATHER_PGS_ALLEGRO_KINETIC_ROWS": str(int(enabled))}),
+        patch.dict(os.environ, {"FEATHER_PGS_KEYED_ROWS": str(int(enabled))}),
         patch.object(source, "_INK_ON", True),
     ):
         yield

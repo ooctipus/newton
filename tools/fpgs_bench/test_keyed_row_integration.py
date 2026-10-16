@@ -23,8 +23,7 @@ def make_case(enabled, capacity, free_count=0, *, exact=False, world_rows=False,
         patch.dict(
             os.environ,
             {
-                "FEATHER_PGS_GENERATED_KEYED_ROWS": ("" if enabled is None else str(int(enabled))),
-                "FEATHER_PGS_ALLEGRO_KINETIC_ROWS": "0",
+                "FEATHER_PGS_KEYED_ROWS": ("" if enabled is None else str(int(enabled))),
             },
         ),
         patch.object(source, "_INK_ON", True),

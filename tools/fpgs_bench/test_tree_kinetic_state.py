@@ -166,7 +166,7 @@ class TestTreePhysicalCUDA(TestTreePhysicalCPU):
         with patch.dict(os.environ):
             os.environ.pop("FEATHER_PGS_TREE_KINETIC_STATE", None)
             os.environ.pop("FEATHER_PGS_TREE_CHAIN_SCAN", None)
-            os.environ["FEATHER_PGS_G1_CHAIN_SCAN"] = "0"
+            os.environ["FEATHER_PGS_TREE_CHAIN_SCAN"] = "0"
             case = split._case(True, floating=True, branches=3, depth=2, device="cuda:0")
             self.assertIsNotNone(case[1]._tree_kinetic_state)
             self.assertTrue(case[1]._tree_kinetic_state.chain_scan)
