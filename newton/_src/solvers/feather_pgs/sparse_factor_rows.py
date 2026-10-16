@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Current sparse rows and original finite-eight law for the checked G1 owner."""
+"""Current sparse rows and the finite-eight law for the packed sparse-factor owner."""
 
 from functools import cache
 

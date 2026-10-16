@@ -12,8 +12,10 @@ from .kernels import (
 )
 
 
-def _physical_entry(D, P, S):
+def _physical_entry(D, P, S, independent_components):
     velocity_condition = "global_dof >= 0"
+    if independent_components:
+        velocity_condition += f" && (!split_component || (lane >= primary_offset && lane < primary_offset + {P}))"
     return f"""    const int global_dof = lane < {D} ? world_dof_indices.data[dof_map_base + lane] : -1;
     const float physical_velocity = {velocity_condition} ? v_out.data[global_dof] : 0.0f;
     const int primary_lane = lane - primary_offset;
@@ -36,8 +38,10 @@ def _physical_entry(D, P, S):
 """
 
 
-def _physical_exit(P, S):
+def _physical_exit(P, S, independent_components):
     output_condition = "global_dof >= 0"
+    if independent_components:
+        output_condition += f" && (!split_component || (primary_lane >= 0 && primary_lane < {P}))"
     return f"""    float physical_output = 0.0f;
 #pragma unroll
     for (int k = 0; k < {P}; ++k) {{
@@ -64,8 +68,14 @@ def get_source(
     S,
     *,
     contact_triples=False,
+    independent_components=False,
 ):
-    """Build the physical-coordinate paired recurrence source."""
+    """Build the physical-coordinate paired recurrence source.
+
+    With ``independent_components`` a world whose signed selector is negative
+    sweeps only its articulation's rows and coordinates; the free body's rows
+    run concurrently in the matrix-free kernel.
+    """
     if M <= 0 or P <= 0 or S <= 0 or P + S != D or D > 32:
         raise ValueError("paired factor source requires positive capacity and two components spanning at most 32 DOFs")
     W = 2
@@ -75,9 +85,14 @@ def get_source(
     joint_velocity_limit_type = int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
     fences = [""] * 6
     row_guard = f"    if (m > {M}) m = {M};\n"
-    row_guard += "    if (m == 0 || world_mf_constraint_count.data[world] != 0) return;"
-    entry = _physical_entry(D, P, S)
-    exit_code = _physical_exit(P, S)
+    row_guard += "    if (m == 0 || world_mf_constraint_count.data[world] "
+    row_guard += (
+        "> 0) return;\n    const bool split_component = world_mf_constraint_count.data[world] < 0;"
+        if independent_components
+        else "!= 0) return;"
+    )
+    entry = _physical_entry(D, P, S, independent_components)
+    exit_code = _physical_exit(P, S, independent_components)
     storage = f"""    __shared__ float s_lam_storage[{W * M}];
     __shared__ float s_rhs_storage[{W * M}];
     __shared__ float s_diag_storage[{W * M}];

@@ -328,8 +328,8 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
         np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
 
-    def test_forest_is_the_default_without_a_diagonal_family(self):
-        """Unset, the forest is taken where every family is held or prescribed, not where one is diagonal."""
+    def test_forest_is_the_default_with_a_prescribed_root(self):
+        """Unset, the forest is taken for a world with a prescribed root and no diagonal family."""
         _rollout.forest = None
         try:
             _solver, owner, _cached, _qd = _rollout(
@@ -339,7 +339,8 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
             self.assertEqual(owner.groups[0].layout.root_families, (3, 6, 0))
             _solver, owner, _cached, _qd = _rollout(_build(wp.get_device("cuda:0"), cabinet=True), owner=True, steps=2)
             self.assertEqual(len(owner.groups), 2)
-            self.assertTrue(any(group.layout.dofs == _solver._compact_diagonal_mass_size for group in owner.groups))
+            _solver, owner, _cached, _qd = _rollout(_build(wp.get_device("cuda:0")), owner=True, steps=2)
+            self.assertEqual(len(owner.groups), 2)
         finally:
             _rollout.forest = False
 

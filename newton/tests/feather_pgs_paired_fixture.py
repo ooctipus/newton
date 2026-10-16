@@ -8,10 +8,13 @@ per world) with dense contact triples, matrix-free rows and a position-limit
 prefix, bound as the arrays the paired-factor and matrix-free solve kernels take.
 """
 
-from types import SimpleNamespace
+import inspect
 
 import numpy as np
 import warp as wp
+
+from newton._src.solvers.feather_pgs import paired_components as components
+from newton._src.solvers.feather_pgs import solver_feather_pgs as solver
 
 
 def pack_endpoints(a, b):
@@ -35,6 +38,7 @@ def component_fixture(worlds=4, capacity=8, mf_capacity=6):
         "primary_offset": np.where(np.arange(worlds) % 2, 6, 0).astype(np.int32),
         "secondary_offset": np.where(np.arange(worlds) % 2, 0, 23).astype(np.int32),
         "primary_group": np.arange(worlds - 1, -1, -1, dtype=np.int32),
+        "selector": np.full(worlds, 91, np.int32),
         "J": floats((worlds, capacity, 29)),
         "Y": floats((worlds, capacity, 29)),
         "L": np.tril(rng.normal(0, 0.025, (worlds, 23, 23))).astype(np.float32),
@@ -75,11 +79,38 @@ def component_fixture(worlds=4, capacity=8, mf_capacity=6):
 
 
 def bind_components(host, device="cpu"):
-    """Upload the fixture as device arrays with the packed two-dimensional metadata ABI."""
-    data = SimpleNamespace(world_count=len(host["counts"]))
+    """Bind the fixture as the paired-component descriptor (packed two-dimensional metadata ABI)."""
+    data = components.PairedComponentData()
+    data.world_count = len(host["counts"])
     for name, value in host.items():
         setattr(data, name, wp.array(value, dtype=wp.int32 if value.dtype == np.int32 else wp.float32, device=device))
     return data
+
+
+def launch_components(data, device="cpu"):
+    """Run the production worker-stride qualification launch (native CPU branch on CPU)."""
+    workers = min(data.world_count, 512)
+    wp.launch_tiled(
+        components.get_prepare_kernel(23, 6), dim=[workers], inputs=[workers, data], block_dim=128, device=device
+    )
+
+
+def solve_kernels(enabled, arch="120", *, contact_triples=False):
+    """Construct the two production sweep kernels, plain or with independent components."""
+    paired = solver._get_pgs_solve_paired_factor_kernel(
+        8, 29, 23, 6, arch, contact_triples=contact_triples, independent_components=enabled
+    )
+    mixed = solver._get_pgs_solve_mf_gs_kernel(
+        8,
+        6,
+        29,
+        arch,
+        factor_coordinates=True,
+        has_drive_rows=False,
+        has_dense_velocity_limit_rows=False,
+        independent_components=enabled,
+    )
+    return paired, mixed
 
 
 def solve_fixture(device):
@@ -155,3 +186,30 @@ def solve_fixture(device):
     for name in ("target_vel_bias", "vel_multiplier", "impulse_multiplier", "max_impulse", "vel_limit"):
         arrays[f"world_drive_{name}"] = array(np.zeros((1, 1), np.float32))
     return data, arrays
+
+
+def launch_solve_pair(data, arrays, *, enabled, device, iterations=8, friction_start=0):
+    """Solve with separate writable outputs but identical current data and the same law."""
+    if enabled:
+        launch_components(data, device)
+    values = dict(arrays)
+    values.update(
+        world_count=5,
+        general_world_grid_stride=5,
+        use_general_world_queue=0,
+        iterations=iterations,
+        omega=1.0,
+        regularize=0,
+        row_phase=0,
+        friction_start_iteration=friction_start,
+        iteration_offset=0,
+        freeze_drive_rows=0,
+        defer_dense_response=0,
+    )
+    if enabled:
+        values["local_solve_owner"] = values["world_mf_constraint_count"] = data.selector
+    for kernel, grid, block in zip(
+        solve_kernels(enabled, str(device.arch), contact_triples=True), (3, 5), (64, 32), strict=True
+    ):
+        arguments = [values[name] for name in inspect.signature(kernel.func).parameters]
+        wp.launch_tiled(kernel, dim=[grid], inputs=arguments, block_dim=block, device=device)

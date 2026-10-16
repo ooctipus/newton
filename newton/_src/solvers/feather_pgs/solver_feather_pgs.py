@@ -6895,6 +6895,15 @@ class SolverFeatherPGS(SolverBase):
 
         self._paired_cholesky_inverse_kernel = None
         self._paired_response_kernel = None
+        self._paired_components = None
+        if os.environ.get("FEATHER_PGS_PAIRED_COMPONENTS", "1") == "1" and not (
+            _FPGS_CAPTURE or _GROUPED_CHECK or _DEBUG_CACHE_CMP or _INK_CHECK or _WR_CHECK
+        ):
+            from .paired_components import PairedComponents  # noqa: PLC0415
+            from .paired_components import supported as components_supported  # noqa: PLC0415
+
+            if components_supported(self):
+                self._paired_components = PairedComponents(self)
         if self._paired_response_primary_size is not None:
             primary_size = self._paired_response_primary_size
             secondary_size = self._paired_response_secondary_size
@@ -6920,6 +6929,7 @@ class SolverFeatherPGS(SolverBase):
                     secondary_size,
                     device_arch,
                     contact_triples=self._factor_coordinate_contact_triples,
+                    independent_components=self._paired_components is not None,
                 )
                 if self._paired_factor_coordinates
                 else None
@@ -7211,6 +7221,7 @@ class SolverFeatherPGS(SolverBase):
                 factor_coordinates=self._paired_factor_coordinates,
                 skip_incremental_rows=max(incremental_rows, parallel_rows),
                 skip_response_block=use_rb,
+                independent_components=self._paired_components is not None,
             )
             if use_rb:
                 self._build_response_block_sweep(model, has_drive_rows)
@@ -8488,6 +8499,11 @@ class SolverFeatherPGS(SolverBase):
                     single_ready_event = wp.get_stream(self.model.device).record_event()
                     local_stream.wait_event(single_ready_event)
             factor_kernel = self._paired_factor_solve_kernel
+            components = self._paired_components
+            if components is not None:
+                if row_phase != 0 or soft_relax or defer_dense_response:
+                    raise RuntimeError("Paired components require the physical interleaved solve")
+                components.prepare(self, dense_rhs, mf_meta)
             if factor_kernel is not None:
                 if row_phase != 0:
                     raise RuntimeError("paired factor-coordinate solve only supports the interleaved row phase")
@@ -8522,7 +8538,7 @@ class SolverFeatherPGS(SolverBase):
                                 self.row_type,
                                 self.row_parent,
                                 self.row_mu,
-                                self.mf_constraint_count,
+                                self.mf_constraint_count if components is None else components.selector,
                                 self.L_by_size[primary_size],
                                 self.Linv_by_size[primary_size],
                                 self.L_by_size[secondary_size],
@@ -8551,7 +8567,7 @@ class SolverFeatherPGS(SolverBase):
                     self._rb_class,
                     self.constraint_count,
                     self.dense_phase_bounds,
-                    self._local_solve_owner,
+                    self._local_solve_owner if components is None else components.selector,
                     self.world_dof_indices,
                     self.world_deferred_dof_mask,
                     dense_rhs,
@@ -18196,6 +18212,7 @@ def _get_pgs_solve_paired_factor_kernel(
     secondary_dofs: int,
     device_arch: str,
     contact_triples: bool = False,
+    independent_components: bool = False,
 ) -> "wp.Kernel":
     """Build the dense PGS solve for a fixed articulation/free-body pair.
 
@@ -18217,7 +18234,7 @@ def _get_pgs_solve_paired_factor_kernel(
 
     from .paired_factor_source import get_source  # noqa: PLC0415
 
-    snippet = get_source(M, D, P, S, contact_triples=contact_triples)
+    snippet = get_source(M, D, P, S, contact_triples=contact_triples, independent_components=independent_components)
 
     @wp.func_native(snippet)
     def pgs_solve_paired_factor_native(
@@ -18309,6 +18326,8 @@ def _get_pgs_solve_paired_factor_kernel(
     name = f"pgs_solve_paired_factor_{M}_{D}_{P}_{S}_w{W}"
     if contact_triples:
         name += "_contact3"
+    if independent_components:
+        name += "_components"
     pgs_solve_paired_factor_template.__name__ = name
     pgs_solve_paired_factor_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_paired_factor_template)
@@ -25506,6 +25525,7 @@ def _get_pgs_solve_mf_gs_kernel(
     factor_coordinates: bool = False,
     skip_incremental_rows: int = 0,
     skip_response_block: bool = False,
+    independent_components: bool = False,
     dense_support_tiles: bool = False,
     stage_velocities: bool = False,
 ) -> "wp.Kernel":
@@ -25570,6 +25590,7 @@ def _get_pgs_solve_mf_gs_kernel(
         factor_coordinates=factor_coordinates,
         skip_incremental_rows=skip_incremental_rows,
         skip_response_block=skip_response_block,
+        independent_components=independent_components,
         dense_support_tiles=dense_support_tiles,
         stage_velocities=stage_velocities,
     ).native
@@ -25760,6 +25781,8 @@ def _get_pgs_solve_mf_gs_kernel(
         name += f"_skipinc{int(skip_incremental_rows)}"
     if skip_response_block:
         name += "_rb"
+    if independent_components:
+        name += "_components"
     if dense_support_tiles:
         name += "_dense_tiles_phase6"
     if stage_velocities:

@@ -310,15 +310,17 @@ def forest_supported(solver):
 
 
 def forest_default(solver):
-    """Whether the forest is the default group: supported, with no diagonal-mass family.
+    """Whether the forest is the default group: a prescribed root and no diagonal-mass family.
 
-    Measured on Franka lift (9+6+prescribed) the forest beats per-size groups
-    by 10% and on Kuka lift (23+6+prescribed) by 1%; on Franka cabinet, whose
-    drawer is a diagonal-mass family the per-size owner applies in a two-lane
-    block, the forest spends the whole group on it and loses 5%.
+    The forest's gain is one group and one launch set per world where the
+    per-size groups would run a third, zero-response group for a prescribed
+    root: measured -9% on a 9+6+prescribed world and -1% on 23+6+prescribed.
+    Without a prescribed root the per-size groups' lane packing wins (+3% for
+    the forest on a 16+6 world), and a diagonal-mass family, which the per-size
+    owner applies in a two-lane block, costs the forest 5% (9+4 with a drawer).
     """
     families = forest_families(solver)
-    return families is not None and solver._compact_diagonal_mass_size not in families
+    return families is not None and 0 in families and solver._compact_diagonal_mass_size not in families
 
 
 def forest_families(solver):
