@@ -72,15 +72,13 @@ def install(solver, *, factor_warps: int) -> None:
         and not solver.contact_compliance
         and enabled("FRANKA_KINETIC_STATE")
     ):
-        from .franka_kinetic_factor import get_kernel  # noqa: PLC0415
         from .franka_kinetic_state import create_owner  # noqa: PLC0415
+        from .small_cholesky import geometric_kernel  # noqa: PLC0415
 
         solver._franka_kinetic_state = create_owner(solver)
         if solver._franka_kinetic_state is not None:
-            solver._franka_kinetic_factor = get_kernel(
-                str(solver.model.device.arch),
-                warps_per_block=factor_warps,
-                size=solver._franka_kinetic_state.layout.primary_dofs,
+            solver._franka_kinetic_factor = geometric_kernel(
+                solver._franka_kinetic_state.layout.primary_dofs, warps_per_block=factor_warps
             )
 
     # The generic held-tree owner serves dense-route scenes no other owner
@@ -95,6 +93,12 @@ def install(solver, *, factor_warps: int) -> None:
         from .mixed_tree_kinetic import create_owner  # noqa: PLC0415
 
         solver._tree_kinetic_state = create_owner(solver)
+        if solver._tree_kinetic_state is not None:
+            # The owner predicts kinematics and joint torques from its cached
+            # state; the fused world-dynamics kernel (K1) that would produce
+            # them on the general route is superseded, and every later stage
+            # takes its ordinary branch.
+            solver._fused_k1 = False
 
     owners = [
         name

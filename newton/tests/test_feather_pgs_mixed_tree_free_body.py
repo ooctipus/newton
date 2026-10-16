@@ -141,7 +141,7 @@ def _kinematic_free_joints(model):
     return model.joint_q_start.numpy()[joints], model.joint_qd_start.numpy()[joints]
 
 
-def _rollout(model, *, owner, steps=120, swing_joint=0, pgs_mode="matrix_free", rows=None):
+def _rollout(model, *, owner, steps=120, swing_joint=0, pgs_mode="matrix_free", rows=None, attrs=None):
     env = {
         "FEATHER_PGS_TREE_FOREST": str(int(getattr(_rollout, "forest", False))),
         "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": str(int(owner)),
@@ -159,6 +159,7 @@ def _rollout(model, *, owner, steps=120, swing_joint=0, pgs_mode="matrix_free", 
             update_mass_matrix_interval=2,
             friction_anchor_beta=0.0,
             **({} if rows is None else {"dense_max_constraints": rows}),
+            **(attrs or {}),
         )
     state_owner = getattr(solver, "_tree_kinetic_state", None)
     pipeline = newton.CollisionPipeline(model)
@@ -297,6 +298,27 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         final = cached[-1].reshape(model.world_count, -1, 7)
         self.assertTrue(np.all(final[:, 0, 2] > 0.2))
         self.assertEqual(int(sum(int(group.status.numpy().sum()) for group in owner.groups)), 0)
+
+    def test_fused_world_kernel_scenes_are_owned(self):
+        """Scenes on the fused world-dynamics kernel (the quadruped recipes' grouped, lazy settings) hand it to the owner."""
+        model = _build(wp.get_device("cuda:0"), quadruped=True)
+        # grouped_dynamics selects the fused kernel; lazy_kinematics (also in
+        # those recipes) would skip the per-step pose publication this
+        # comparison reads, so the ordinary route runs without it.
+        recipe = {"grouped_dynamics": True}
+        plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False, rows=256, attrs=recipe)
+        self.assertIsNone(plain_owner)
+        self.assertTrue(plain_solver._fused_k1)
+        owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, rows=256, attrs=recipe)
+        self.assertIsInstance(owner, MixedTreeKineticState)
+        self.assertFalse(owner_solver._fused_k1)
+        self.assertEqual(sorted(group.layout.dofs for group in owner.groups), [3, 6, 18])
+        self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
+        np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=3.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=3.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached_qd, plain_qd, atol=3.0e-3, rtol=0.0)
+        final = cached[-1].reshape(model.world_count, -1, 7)
+        self.assertTrue(np.all(final[:, 0, 2] > 0.2))
 
     def test_mimic_rows_compose_with_the_mixed_owner(self):
         """Mimic rows are ordinary matrix-free rows over the held factors: the owner admits them and tracks the plain route."""

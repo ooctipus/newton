@@ -200,3 +200,17 @@ def get_kernel(
     namespace = {"wp": wp, "snippet": snippet}
     exec(compile(source, filename, "exec"), namespace)
     return wp.kernel(enable_backward=False, module="unique")(namespace[name])
+
+
+def geometric_kernel(
+    size: int, *, warps_per_block: int = 4, geometric_index=(), geometric_stride: int = 0, geometric_group: bool = False
+):
+    """Factor held physical geometry (a cached owner's record) with the composite factor's arithmetic."""
+    return get_kernel(
+        size,
+        warps_per_block=warps_per_block,
+        geometric=True,
+        geometric_index=geometric_index,
+        geometric_stride=geometric_stride,
+        geometric_group=geometric_group,
+    )

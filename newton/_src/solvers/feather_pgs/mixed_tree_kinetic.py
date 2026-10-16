@@ -10,7 +10,7 @@ import warp as wp
 
 from ...sim import JointType
 from .device_proof import DeviceProof
-from .franka_kinetic_factor import get_kernel as geometric_factor
+from .small_cholesky import geometric_kernel
 from .sparse_factor import bind_operator_plan, operator_metadata
 from .sparse_mass_matrix import _SparseMassMatrixPlan
 from .tree_kinetic_owner import _NUMERIC_FLAGS, TreeKineticState
@@ -70,9 +70,9 @@ def supported(solver):
         # Franka held owner; they need nothing from the predictor itself.
         and not solver._connect_count
         and not solver._has_loop_joints
-        # lazy_kinematics only acts with the fused world-dynamics kernel,
-        # which is excluded below; the owner publishes its own kinematics.
-        and not solver._fused_k1
+        # The fused world-dynamics kernel (K1) and lazy_kinematics, which only
+        # acts with it, are superseded: the owner predicts kinematics and
+        # torques itself and install() clears the K1 selection.
         and solver._fk_id_cache_available
         and solver._async_augmented_drives
         and solver._parallel_augmented_drive_topology
@@ -183,9 +183,7 @@ class TreeHeldOperator:
         else:
             self.data.lower = solver.L_by_size[size]
             self.geometry_index = wp.array(physical_index.ravel(), dtype=int, device=device)
-            self.refresh_kernel = geometric_factor(
-                str(device.arch), size=size, geometric_index=tuple(map(int, physical_index.ravel()))
-            )
+            self.refresh_kernel = geometric_kernel(size=size, geometric_index=tuple(map(int, physical_index.ravel())))
             self.factor_offsets = wp.zeros(size, dtype=int, device=device)
             self.factor_schedule = wp.array(
                 [row * size + col for row in range(size) for col in range(row + 1)], dtype=int, device=device
@@ -376,8 +374,7 @@ class ForestHeldOperator:
                 (
                     r,
                     family,
-                    geometric_factor(
-                        str(device.arch),
+                    geometric_kernel(
                         size=family,
                         geometric_index=tuple(map(int, block.ravel())),
                         geometric_stride=self.layout.entries,
