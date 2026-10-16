@@ -37,9 +37,7 @@ def supported(solver):
         and not solver._fused_k1
         and not solver._debug_buffers_enabled
         and not solver._double_buffer
-        and getattr(solver, "_world_scan_publication", None) is None
         and getattr(solver, "_prismatic_publication", None) is None
-        and getattr(solver, "_kinetic_world", None) is None
     )
 
 

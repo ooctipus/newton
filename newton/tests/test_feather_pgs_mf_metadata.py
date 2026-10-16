@@ -12,12 +12,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import solver_feather_pgs as fpgs
-from newton.tests.test_feather_pgs_independent_components import (
-    bind_components,
-    component_fixture,
-    launch_components,
-    solve_fixture,
-)
+from newton.tests.feather_pgs_paired_fixture import solve_fixture
 
 
 def _parent_decoder(source, *, name="mf_par", packed="packed_tp"):
@@ -189,14 +184,6 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
                     device="cpu",
                 )
                 np.testing.assert_array_equal(result.numpy(), parents)
-
-    def test_independent_component_admission_reads_high_parent_rows(self):
-        """Admit complete valid contact triples above row32767 without truncation."""
-        host = component_fixture(worlds=1, mf_capacity=37248)
-        host["mf_counts"][0] = 37248
-        data = bind_components(host, "cpu")
-        launch_components(data, "cpu")
-        np.testing.assert_array_equal(data.selector.numpy(), [-1])
 
 
 def _solve_parent_rows(device, friction, parents):

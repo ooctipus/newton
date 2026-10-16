@@ -16,10 +16,10 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
+from tools.fpgs_bench.fp64_transforms import compose, inverse, rotate
 from tools.fpgs_bench.test_sparse_contact_block import saved_records
 from tools.fpgs_bench.test_sparse_factor import ASSET, fixture, physical_rows, unpack
 from tools.fpgs_bench.test_sparse_metric_tangents import check_native, physical_metrics
-from tools.fpgs_bench.test_world_scan_publication import compose, inverse, rotate
 
 DT = 1.0 / 240.0
 ENV = {

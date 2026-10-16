@@ -7,22 +7,21 @@ import functools
 
 import warp as wp
 
-from . import world_scan_owner
-from .world_scan_publication import PublicationData
+from .publication_data import CACHE_FIELDS, MODEL_FIELDS, SOLVER_FIELDS, PublicationData
 
 
 def publication(solver, state_in, state_aug, state_out, dt):
     """Rebind numeric descriptors on each call, preserving original free finalization."""
     data = PublicationData()
-    for name in world_scan_owner.MODEL_FIELDS:
+    for name in MODEL_FIELDS:
         setattr(data, name, getattr(solver.model, name))
-    for name, source in world_scan_owner.SOLVER_FIELDS.items():
+    for name, source in SOLVER_FIELDS.items():
         setattr(data, name, getattr(solver, source))
     data.joint_q, data.joint_qd = state_in.joint_q, state_in.joint_qd
     data.joint_q_new, data.joint_qd_new = state_out.joint_q, state_out.joint_qd
     data.joint_qdd = state_aug.joint_qdd
     data.body_q, data.body_qd = state_out.body_q, state_out.body_qd
-    for name in world_scan_owner.CACHE_FIELDS:
+    for name in CACHE_FIELDS:
         if name == "articulation_origin":
             value = solver.articulation_origin
         elif name == "body_inertia_terms":

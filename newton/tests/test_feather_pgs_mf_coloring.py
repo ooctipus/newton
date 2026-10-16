@@ -11,7 +11,7 @@ import warp as wp
 
 from newton._src.solvers.feather_pgs.mf_multiblock import MultiBlockContactSolver
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_mf_gs_kernel
-from newton.tests.test_feather_pgs_independent_components import pack_endpoints, solve_fixture
+from newton.tests.feather_pgs_paired_fixture import pack_endpoints, solve_fixture
 
 
 def fixture(world_contacts, device, *, max_colors=2, mode="colored", direct_static_pairs=False, parallel_prepare=False):

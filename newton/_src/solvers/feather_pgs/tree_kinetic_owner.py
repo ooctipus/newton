@@ -11,8 +11,9 @@ import numpy as np
 import warp as wp
 
 from ...sim import ModelFlags
-from . import cached_state_binding, world_scan_owner
+from . import cached_state_binding
 from .device_proof import DeviceProof, fingerprint
+from .publication_data import PLAN_FIELDS
 from .tree_kinetic_plan import cooperative_block_dim, lane_candidates, make_plan
 
 _NUMERIC_FLAGS = int(
@@ -23,7 +24,7 @@ _NUMERIC_FLAGS = int(
 )
 
 _PLAN_FIELDS = (
-    *world_scan_owner.PLAN_FIELDS,
+    *PLAN_FIELDS,
     "joint_ancestor",
     "joint_axis",
     "joint_X_p",

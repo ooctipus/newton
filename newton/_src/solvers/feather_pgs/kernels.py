@@ -3819,7 +3819,6 @@ def build_joint_limit_rows_for_size(
     max_constraints: int,
     pgs_beta: float,
     pgs_cfm: float,
-    resolved_worlds: wp.array[int],
     # outputs
     world_slot_counter: wp.array[int],
     J_group: wp.array3d[float],
@@ -3835,8 +3834,6 @@ def build_joint_limit_rows_for_size(
     group_idx = wp.tid()
     art = group_to_art[group_idx]
     world = art_to_world[art]
-    if world >= 0 and world < resolved_worlds.shape[0] and resolved_worlds[world] != 0:
-        return
     dof_start = articulation_dof_start[art]
 
     for j in range(articulation_start[art], articulation_start[art + 1]):
@@ -7620,7 +7617,6 @@ def allocate_rigid_velocity_limit_slots(
     joint_qd: wp.array[float],
     velocity_limit_activation_fraction: float,
     mf_max_constraints: int,
-    resolved_worlds: wp.array[int],
     # outputs
     rigid_velocity_limit_slot: wp.array[int],
     rigid_velocity_limit_sign: wp.array[float],
@@ -7661,8 +7657,6 @@ def allocate_rigid_velocity_limit_slots(
 
     world = art_to_world[art]
     if world < 0:
-        return
-    if world < resolved_worlds.shape[0] and resolved_worlds[world] != 0:
         return
 
     lin_limit = rigid_body_max_linear_velocity[body]

@@ -10,9 +10,15 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_JOINT_LIMIT
-from tools.fpgs_bench.test_cholesky_forest_steps import step
+from tools.fpgs_bench.test_mixed_tree_cache import DT, make_solver, model_fixture
 from tools.fpgs_bench.test_packed_tree_state import physical_mass, public_state
-from tools.fpgs_bench.test_mixed_tree_cache import make_solver, model_fixture
+
+
+def step(case):
+    """Advance one step and exchange the state banks."""
+    model, solver, state, output, control, contacts = case
+    solver.step(state, output, control, contacts, DT)
+    return model, solver, output, state, control, contacts
 
 
 def make_case(enabled, reordered):

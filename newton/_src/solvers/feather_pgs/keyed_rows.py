@@ -12,7 +12,7 @@ from functools import cache, partial
 import warp as wp
 
 from ...sim import ModelFlags
-from .franka_contact_packet import ContactInput, bind
+from .contact_input import ContactInput, bind
 from .keyed_row_layout import prefix_kernel
 from .keyed_row_layout import topology_plan as direct_topology_plan
 from .row_inputs import ParallelRowInputs, RowArgument

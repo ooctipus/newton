@@ -75,8 +75,8 @@ def supported(solver):
         # exclude the copied-state shortcut.
         # Prescribed (kinematic) free bodies are owned as zero-response roots;
         # see PrescribedRootOperator. Mimic rows are ordinary matrix-free rows
-        # over the held factors this owner refreshes, as they are for the
-        # Franka held owner; they need nothing from the predictor itself.
+        # over the held factors this owner refreshes; they need nothing from
+        # the predictor itself.
         and not solver._connect_count
         and not solver._has_loop_joints
         # The fused world-dynamics kernel (K1) and lazy_kinematics, which only
@@ -91,10 +91,6 @@ def supported(solver):
             getattr(solver, name, None) is None
             for name in (
                 "_sparse_factor",
-                "_kinetic_world",
-                "_franka_kinetic_state",
-                "_joint_world",
-                "_world_scan_publication",
                 "_prismatic_publication",
             )
         )
@@ -275,7 +271,7 @@ class PrescribedRootOperator:
     acceleration and the prescribed velocity, the free-root transport is
     skipped on kinematic roots, and the shared finish integrates the pose and
     publishes the body exactly as it does for a dynamic free body. This is
-    the generic form of the free-root slots the Franka and Kuka owners keep.
+    the generic form of a per-world free-root slot.
     """
 
     prescribed = True
@@ -344,9 +340,7 @@ class ForestHeldOperator:
 
     Each root keeps its own held factor family (the solver's dense factor
     for its size, refreshed from the forest's geometry) or responds with zero
-    when prescribed. This is the generic form of the per-world forest the
-    Franka owner was written around: roots, families and offsets come from
-    the topology.
+    when prescribed. Roots, families and offsets come from the topology.
     """
 
     def __init__(self, solver):

@@ -10,9 +10,15 @@ from types import SimpleNamespace
 
 import warp as wp
 
-from . import cached_force, kinetic_state, response_operator, sparse_factor, tree_chain_scan
+from . import cached_force, response_operator, sparse_factor, tree_chain_scan
 from .cached_state import StateOperands, StateStages, make_body_terms, make_state_kernel
 from .tree_kinetic_layout import REFERENCE_LAYOUT, TreeLayout
+
+
+@wp.func
+def _inertia_action(rotation: wp.quat, inertia: wp.mat33, value: wp.vec3):
+    """Apply a body-frame inertia to a world-frame vector."""
+    return wp.quat_rotate(rotation, inertia * wp.quat_rotate_inv(rotation, value))
 
 
 @wp.struct
@@ -609,7 +615,7 @@ if data.is_free_rigid[data.body_to_articulation[body]] != 0:
     )"""
     _body_terms = make_body_terms(
         "address: wp.uint64, body: int, local: int, world: int, pose: wp.transform, pose_com: wp.transform, origin: wp.vec3, velocity: wp.spatial_vector, acceleration: wp.spatial_vector, data: PublicationData, cache: KineticData, refresh: int",
-        dict(globals(), _store_terms=_store_terms, _inertia_action=kinetic_state._inertia_action, kernels=kernels),
+        dict(globals(), _store_terms=_store_terms, _inertia_action=_inertia_action, kernels=kernels),
         refresh="refresh",
         cache="cache",
         com_offset="radius",

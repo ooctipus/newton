@@ -18,7 +18,7 @@ from textwrap import dedent, indent
 import warp as wp
 
 from . import kernels
-from .world_scan_publication import PublicationData
+from .publication_data import PublicationData
 
 
 @dataclass(frozen=True)

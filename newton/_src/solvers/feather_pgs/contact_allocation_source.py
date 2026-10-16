@@ -78,19 +78,6 @@ _PHI = r"""    # Compute phi (same logic as populate_world_J_for_size)
 """
 
 
-_RESOLVED = r"""            shape_a = contact_shape0[c]
-            shape_b = contact_shape1[c]
-            body_a = shape_body[shape_a] if shape_a >= 0 else -1
-            body_b = shape_body[shape_b] if shape_b >= 0 else -1
-            art_a = body_to_articulation[body_a] if body_a >= 0 else -1
-            art_b = body_to_articulation[body_b] if body_b >= 0 else -1
-            world_a = art_to_world[art_a] if art_a >= 0 else -1
-            world_b = art_to_world[art_b] if art_b >= 0 else -1
-            world = world_a if world_a >= 0 else world_b
-            same_world = world_a < 0 or world_b < 0 or world_a == world_b
-"""
-
-
 _HELPER = r'''@wp.func
 def ${helper_name}(
     c: int,
@@ -320,7 +307,6 @@ def ${kernel_name}(
     contact_friction_articulation_pairs_only: int,
     row_capacity_telemetry: int,
     friction_patches: FrictionPatches,
-    resolved_worlds: wp.array[int],
     # outputs
     contact_world: wp.array[int],
     contact_slot: wp.array[int],
@@ -367,17 +353,6 @@ ${extra}):
         return
 
     for c in range(thread, total_contacts, total_num_threads):
-        if resolved_worlds.shape[0] > 0:
-${resolved}            if same_world and world >= 0 and world < resolved_worlds.shape[0] and resolved_worlds[world] != 0:
-                # Refresh every active mapping each solve. The original force
-                # converter publishes zero before reading any row for this path.
-                contact_world[c] = world
-                contact_art_a[c] = art_a
-                contact_art_b[c] = art_b
-                contact_slot[c] = -1
-                contact_path[c] = -1
-                contact_slots_needed[c] = 0
-                continue
         ${helper_name}(
             c,
             total_contacts,
@@ -433,61 +408,31 @@ ${extra_call}        )
 ${stage}'''
 
 
-def get_source(*, cached_geometry=False):
-    """Keep routing, row admission and reservations common to both consumers."""
+def get_source():
+    """Build the contact routing, row admission and reservation kernel."""
     checked_definitions(
         "contact_allocation_source.py",
-        ("_BODIES", "_WORLD", "_PHI", "_RESOLVED", "_HELPER", "_KERNEL", "get_source", "bind"),
+        ("_BODIES", "_WORLD", "_PHI", "_HELPER", "_KERNEL", "get_source", "bind"),
     )
-    helper_name = "_current_contact_slot" if cached_geometry else "_allocate_world_contact_slot"
-    cache = "    cache: ContactGeometry,\n" if cached_geometry else ""
-    helper = Template(_HELPER).substitute(
-        helper_name=helper_name,
-        extra=cache,
-        bodies=(
-            "    body_a, body_b = cache.bodies[c, 0], cache.bodies[c, 1]\n"
-            "    art_a, art_b = contact_art_a[c], contact_art_b[c]\n"
-            if cached_geometry
-            else _BODIES
-        ),
-        world="    world = contact_world[c]\n" if cached_geometry else _WORLD,
-        phi="    phi = cache.values[c, 15]\n" if cached_geometry else _PHI,
-    )
+    helper_name = "_allocate_world_contact_slot"
+    helper = Template(_HELPER).substitute(helper_name=helper_name, extra="", bodies=_BODIES, world=_WORLD, phi=_PHI)
     kernel = Template(_KERNEL).substitute(
-        decorator='@wp.kernel(module="unique", enable_backward=False)' if cached_geometry else "@wp.kernel",
-        kernel_name="kinetic_contact_allocate" if cached_geometry else "allocate_world_contact_slots",
+        decorator="@wp.kernel",
+        kernel_name="allocate_world_contact_slots",
         helper_name=helper_name,
-        extra=cache + ("    raw: RawRowInput,\n    settings: RowSettings,\n" if cached_geometry else ""),
-        overflow="total_contacts > capacity or capacity_status[3] != 0"
-        if cached_geometry
-        else "total_contacts > capacity",
-        resolved=(
-            "            art_a, art_b = contact_art_a[c], contact_art_b[c]\n"
-            "            world = contact_world[c]\n            same_world = True\n"
-            if cached_geometry
-            else _RESOLVED
-        ),
-        extra_call="            cache,\n" if cached_geometry else "",
-        stage=(
-            "\n        if contact_path[c] == 0 and contact_slot[c] >= 0:\n"
-            "            _stage_row(c, total_contacts, cache, raw, settings)\n"
-            if cached_geometry
-            else ""
-        ),
+        extra="",
+        overflow="total_contacts > capacity",
+        extra_call="",
+        stage="",
     )
     return helper + "\n\n" + kernel
 
 
-def bind(namespace, *, cached_geometry=False):
-    """Bind inspectable original/current functions without source recovery."""
-    source = get_source(cached_geometry=cached_geometry)
+def bind(namespace):
+    """Bind inspectable functions from generated source without source recovery."""
+    source = get_source()
     filename = "<contact-allocation-" + hashlib.sha256(source.encode()).hexdigest() + ">"
     linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)
     scope = dict(namespace)
     exec(compile(source, filename, "exec"), scope)
-    names = (
-        ("_current_contact_slot", "kinetic_contact_allocate")
-        if cached_geometry
-        else ("_allocate_world_contact_slot", "allocate_world_contact_slots")
-    )
-    return scope[names[0]], scope[names[1]]
+    return scope["_allocate_world_contact_slot"], scope["allocate_world_contact_slots"]

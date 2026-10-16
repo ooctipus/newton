@@ -50,7 +50,6 @@ def get_source(
     factor_coordinates: bool = False,
     skip_incremental_rows: int = 0,
     skip_response_block: bool = False,
-    independent_components: bool = False,
     dense_support_tiles: bool = False,
     stage_velocities: bool = False,
     held_policy: tuple[str, str, str] | None = None,
@@ -67,7 +66,6 @@ def get_source(
     if dense_support_tiles and (
         friction_mode != "current"
         or factor_coordinates
-        or independent_components
         or skip_local_internal_worlds
         or skip_incremental_rows
         or skip_response_block
@@ -83,8 +81,6 @@ def get_source(
         or skip_local_internal_worlds
     ):
         raise ValueError("factor coordinates require the paired augmented-drive contact solve")
-    if independent_components and (not factor_coordinates or max_world_dofs != 29):
-        raise ValueError("Independent components require the paired 29D physical fallback")
     _validate_dense_metadata_encoding(max_constraints)
     M_D = max_constraints
     M_MF = mf_max_constraints
@@ -108,7 +104,6 @@ def get_source(
             factor_coordinates,
             skip_incremental_rows,
             skip_response_block,
-            independent_components,
             dense_support_tiles,
             stage_velocities,
         ) != (
@@ -128,7 +123,6 @@ def get_source(
             True,
             0,
             False,
-            True,
             False,
             False,
         ):
@@ -1785,27 +1779,6 @@ def get_source(
             r"__shfl_sync(MASK, lane == 0 ? g_lam_mf[\1] : 0.0f, 0)",
             snippet,
         )
-
-    if independent_components:
-        # Kuka does not use local-owner queues. Only this variant receives the
-        # private signed selector in that otherwise-unused owner argument.
-        replacements = {
-            "int m_dense = world_constraint_count.data[world];": "const bool split_component = local_solve_owner.data[world] < 0;\n"
-            "    int m_dense = split_component ? 0 : world_constraint_count.data[world];",
-            "int off_meta = off_mf * 4;": "int off_meta = off_mf * 4;\n"
-            "    const int first_dofs = split_component ? mf_meta.data[off_meta] : 0;\n"
-            "    const int component_offset = split_component ? max(first_dofs >> 16, static_cast<int>(static_cast<short>(first_dofs & 65535))) : 0;",
-            "s_v[d] = global_dof >= 0 ? v_out.data[global_dof] : 0.0f;": "s_v[d] = global_dof >= 0 && (!split_component || (d >= component_offset && d < component_offset + 6)) "
-            "? v_out.data[global_dof] : 0.0f;",
-            "if (global_dof >= 0) v_out.data[global_dof] = s_v[d];": "if (global_dof >= 0 && (!split_component || (d >= component_offset && d < component_offset + 6))) "
-            "v_out.data[global_dof] = s_v[d];",
-        }
-        for old, new in replacements.items():
-            if held_policy is not None and (old.startswith("s_v[d] =") or old.startswith("if (global_dof >= 0)")):
-                continue
-            if snippet.count(old) != 1:
-                raise RuntimeError("Independent MF ownership source seam changed")
-            snippet = snippet.replace(old, new)
 
     # Fixed signature (has_drive_rows precedent): world_drive_vel_limit is
     # always a parameter; launch sites pass the solver's drive_vel_limit

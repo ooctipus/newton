@@ -533,7 +533,6 @@ class TestCompactContact(unittest.TestCase):
             "grouped_dynamics": False,
             "_debug_buffers_enabled": False,
             "_preelim_active": False,
-            "_simple_world_classifier": None,
         }
         self.assertTrue(compact.supported(SimpleNamespace(**valid)))
         for name, value in (
@@ -551,7 +550,6 @@ class TestCompactContact(unittest.TestCase):
             ("_debug_buffers_enabled", True),
             ("_preelim_active", True),
             ("_compact_diagonal_mass_size", None),
-            ("_simple_world_classifier", object()),
         ):
             self.assertFalse(compact.supported(SimpleNamespace(**{**valid, name: value})), name)
 

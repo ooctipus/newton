@@ -194,10 +194,8 @@ def _rollout(model, *, owner, steps=120, swing_joint=0, pgs_mode="matrix_free", 
     env = {
         "FEATHER_PGS_TREE_FOREST": str(int(getattr(_rollout, "forest", False))),
         "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": str(int(owner)),
-        "FEATHER_PGS_FRANKA_KINETIC_STATE": "0",
         "FEATHER_PGS_TREE_KINETIC_STATE": "0",
         "FEATHER_PGS_WORLD_SCAN_PUBLICATION": "0",
-        "FEATHER_PGS_LOCAL_ROW_PACKETS": "0",
     }
     with patch.dict(os.environ, env):
         solver = SolverFeatherPGS(

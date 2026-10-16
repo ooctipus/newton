@@ -12,7 +12,7 @@ import warp as wp
 
 from newton._src.solvers.feather_pgs.mf_dense_support import DenseRowSupport
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_mf_gs_kernel
-from newton.tests.test_feather_pgs_independent_components import solve_fixture
+from newton.tests.feather_pgs_paired_fixture import solve_fixture
 
 
 class TestFeatherPGSMFDenseSupport(unittest.TestCase):

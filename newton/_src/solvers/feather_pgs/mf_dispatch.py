@@ -94,53 +94,14 @@ def make_native(source, *, name="pgs_solve_mf_gs_native", extra=None):
     return wp.func_native(source)(_compile(declaration, namespace)[name])
 
 
-def make_dispatch(native, *, policy="plain", extra=None, bindings=None, native_extra=()):
-    """Bind queue dispatch to one explicit boundary and mutually exclusive owner."""
-    if policy not in ("plain", "guard", "hybrid", "compact"):
-        raise ValueError("Unknown matrix-free dispatch policy")
-    extra = {} if extra is None else extra
-    bindings = {} if bindings is None else bindings
-    if policy == "plain" and (extra or bindings or native_extra):
-        raise ValueError("Plain dispatch has no private operands")
-    if policy != "plain" and ("guard" not in extra or "_guard_world_check" not in bindings):
-        raise ValueError("Guarded dispatch requires the boundary descriptor and predicate")
-    required = {
-        "plain": (),
-        "guard": (),
-        "hybrid": ("kinetic_hybrid_native", "_is_cpu"),
-        "compact": ("kinetic_compact_native", "kinetic_original_arena_native", "_is_cpu", "_arena"),
-    }[policy]
-    if any(name not in bindings for name in required):
-        raise ValueError("Dispatch is missing a required owner binding")
+def make_dispatch(native):
+    """Bind the world-queue dispatch around the complete native recurrence."""
     name = "pgs_solve_mf_gs_template"
-    if policy != "plain":
-        name += "_boundary_guarded"
-    if policy in ("hybrid", "compact"):
-        name += "_" + policy
-    signature = _signature(_QUEUE_ARGUMENTS + _NATIVE_ARGUMENTS[1:], extra)
+    signature = _signature(_QUEUE_ARGUMENTS + _NATIVE_ARGUMENTS[1:], {})
     arguments = [name for name, _ in _NATIVE_ARGUMENTS]
-
-    def call(owner, additional=()):
-        return owner + "(" + ", ".join([*arguments, *additional]) + ")"
-
-    dispatch = call("pgs_solve_mf_gs_native")
-    if policy in ("hybrid", "compact"):
-        selected = "kinetic_" + policy + "_native"
-        fallback = dispatch if policy == "hybrid" else call("kinetic_original_arena_native", ("arena_address",))
-        dispatch = (
-            "if hybrid.eligible[world] != 0:\n"
-            + indent(call(selected, native_extra), "    ")
-            + "\nelse:\n"
-            + indent(fallback, "    ")
-        )
-        if policy == "compact":
-            dispatch = "arena_address = _arena()\n" + dispatch
-    if policy != "plain":
-        dispatch = "if _guard_world_check(world, guard) == 0:\n" + indent(dispatch, "    ")
-    cpu_guard = "if _is_cpu() and _lane != 0:\n    return\n" if policy in ("hybrid", "compact") else ""
+    dispatch = "pgs_solve_mf_gs_native(" + ", ".join(arguments) + ")"
     body = (
         "candidate, _lane = wp.tid()\n"
-        + cpu_guard
         + "general_index = candidate\n"
         + "general_count = general_world_count[0]\n"
         + "if use_general_world_queue == 0:\n    general_count = candidate + 1\n"
@@ -150,11 +111,10 @@ def make_dispatch(native, *, policy="plain", extra=None, bindings=None, native_e
         + indent(dispatch, "    ")
         + "\n    general_index += general_world_grid_stride\n"
     )
-    closure = dict(pgs_solve_mf_gs_native=native, **bindings)
+    closure = {"pgs_solve_mf_gs_native": native}
     declaration = "def " + name + "(" + signature + "):\n" + indent(body, "    ")
     source = "def _bind(" + ", ".join(closure) + "):\n" + indent(declaration, "    ") + "    return " + name + "\n"
-    namespace = dict(globals(), **{annotation.__name__: annotation for annotation in extra.values()})
-    result = _compile(source, namespace)["_bind"](**closure)
+    result = _compile(source, dict(globals()))["_bind"](**closure)
     result.mf_dispatch_source = declaration
-    result.mf_dispatch_policy = policy
+    result.mf_dispatch_policy = "plain"
     return result

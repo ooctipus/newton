@@ -54,7 +54,6 @@ class TestSparseCacheAdmission(unittest.TestCase):
                 ("_articulation_dynamics_stream", None),
                 ("lazy_kinematics", True),
                 ("_fused_k1", True),
-                ("_world_scan_publication", object()),
             ):
                 with self.subTest(field=field):
                     solver = self.fixture(False, False)

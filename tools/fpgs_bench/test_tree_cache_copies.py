@@ -11,8 +11,8 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
 from tools.fpgs_bench import test_mixed_tree_steps as mixed_steps
-from tools.fpgs_bench.test_packed_tree_state import public_state
 from tools.fpgs_bench.test_mixed_tree_cache import DT, make_solver, model_fixture
+from tools.fpgs_bench.test_packed_tree_state import public_state
 
 
 def generations(owner):

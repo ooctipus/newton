@@ -3,8 +3,6 @@
 
 """Share the paired GS recurrence through explicit representation entry and exit."""
 
-from string import Template
-
 from .friction import FRICTION_PAIR_CUDA
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -13,80 +11,9 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
 
-_KINETIC_ENTRY_BODY = r"""    const int primary_lane=lane-primary_offset,secondary_lane=lane-secondary_offset;
-    const int physical_dof=(primary_lane>=0&&primary_lane<23)?primary_lane:
-        ((secondary_lane>=0&&secondary_lane<6)?23+secondary_lane:-1);
-    const int global_dof=physical_dof>=0?plan.dof_ids.data[world*35+physical_dof]:-1;
-    float factor_velocity=0.0f;
-"""
 
-_KINETIC_ENTRY = "\n" + _KINETIC_ENTRY_BODY
-
-
-_KINETIC_SECONDARY = r"""    for(int k=0;k<6;++k){const float du=__shfl_sync(MASK,factor_velocity,secondary_offset+k);
-        if(secondary_lane>=0&&secondary_lane<=k&&secondary_lane<6)
-            physical_output+=held.inverse6.data[secondary_group*36+k*6+secondary_lane]*du;}
-"""
-
-_KINETIC_EXIT_BODY = Template(r"""
-    float physical_output=0.0f;
-    for(int k=0;k<23;++k){const float du=__shfl_sync(MASK,factor_velocity,primary_offset+k);
-        if(primary_lane>=0&&primary_lane<23)physical_output+=t(k,primary_lane)*du;}
-${secondary_response}    ${finite_decl} finite=global_dof<0||isfinite(physical_output+state.v_hat.data[global_dof]);
-${finite_rows}    if(!__all_sync(MASK,finite)){if(lane==0)solve.status.data[world]=2;return;}
-    if(global_dof>=0&&(!split_component||(primary_lane>=0&&primary_lane<23)))
-        v_out.data[global_dof]=state.v_hat.data[global_dof]+physical_output;
-    if(lane==0)solve.status.data[world]=0;
-""")
-
-
-def _kinetic_exit(compact=False):
-    """Publish primary held coordinates and the selected free-column representation."""
-    secondary = (
-        "    if(secondary_lane>=0&&secondary_lane<6)physical_output=factor_velocity;\n"
-        if compact
-        else _KINETIC_SECONDARY
-    )
-    rows = (
-        (
-            "    for(int i=lane;i<m;i+=32)finite &= isfinite(s_lam[i]);\n"
-            "    for(int i=lane;i<m_mf;i+=32)finite &= isfinite(s_lam_mf[i]);\n"
-        )
-        if compact
-        else ""
-    )
-    return _KINETIC_EXIT_BODY.substitute(
-        secondary_response=secondary, finite_decl="bool" if compact else "const bool", finite_rows=rows
-    )
-
-
-_KINETIC_EXIT = _kinetic_exit()
-
-
-_KINETIC_ALIASES = r"""
-    auto world_constraint_count=state.dense_count;
-    auto dense_phase_bounds=rows.phase_bounds;
-    auto world_impulses=rows.impulses;
-    auto rhs_bias=rows.r0;
-    auto world_diag=rows.diag;
-    auto world_row_type=rows.row_type;
-    auto world_row_parent=rows.row_parent;
-    auto world_row_mu=rows.row_mu;
-    auto factor_rows=rows.response;
-    auto primary_group_by_world=plan.primary_group;
-    auto secondary_group_by_world=plan.secondary_group;
-    auto primary_offset_by_world=state.primary_offset;
-    auto secondary_offset_by_world=state.secondary_offset;
-    auto v_out=solve.v_out;
-    const int iterations=solve.iterations,iteration_offset=solve.iteration_offset,friction_start_iteration=solve.friction_start_iteration;
-    const float omega=solve.omega;
-"""
-
-
-def _physical_entry(D, P, S, independent_components):
+def _physical_entry(D, P, S):
     velocity_condition = "global_dof >= 0"
-    if independent_components:
-        velocity_condition += f" && (!split_component || (lane >= primary_offset && lane < primary_offset + {P}))"
     return f"""    const int global_dof = lane < {D} ? world_dof_indices.data[dof_map_base + lane] : -1;
     const float physical_velocity = {velocity_condition} ? v_out.data[global_dof] : 0.0f;
     const int primary_lane = lane - primary_offset;
@@ -109,10 +36,8 @@ def _physical_entry(D, P, S, independent_components):
 """
 
 
-def _physical_exit(P, S, independent_components):
+def _physical_exit(P, S):
     output_condition = "global_dof >= 0"
-    if independent_components:
-        output_condition += f" && (!split_component || (primary_lane >= 0 && primary_lane < {P}))"
     return f"""    float physical_output = 0.0f;
 #pragma unroll
     for (int k = 0; k < {P}; ++k) {{
@@ -139,88 +64,42 @@ def get_source(
     S,
     *,
     contact_triples=False,
-    independent_components=False,
-    kinetic=False,
-    compact=False,
-    compact_views="",
-    compact_entry="",
-    compact_sweep="",
-    compact_store="",
 ):
-    """Build physical or held-coordinate source without recovering a sibling definition."""
+    """Build the physical-coordinate paired recurrence source."""
     if M <= 0 or P <= 0 or S <= 0 or P + S != D or D > 32:
         raise ValueError("paired factor source requires positive capacity and two components spanning at most 32 DOFs")
-    if independent_components and (P, S) != (23, 6):
-        raise ValueError("independent paired source requires the 23+6 pair")
-    if kinetic and (M, D, P, S, independent_components) != (192, 29, 23, 6, False):
-        raise ValueError("held kinetic source requires the 192-row 23+6 contract")
-    if compact and (not kinetic or not all((compact_views, compact_entry, compact_sweep, compact_store))):
-        raise ValueError("Compact recurrence requires the held-coordinate contract and complete storage/phase bindings")
-    if not compact and any((compact_views, compact_entry, compact_sweep, compact_store)):
-        raise ValueError("Compact bindings require the compact representation")
     W = 2
     contact_type = int(PGS_CONSTRAINT_TYPE_CONTACT)
     friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
     joint_limit_type = int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
     joint_velocity_limit_type = int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
     fences = [""] * 6
-    if kinetic:
-        row_guard = "    if (m < 0 || m > 192) { if(lane==0) solve.status.data[world]=1; return; }"
-        entry = "\n" + compact_entry + _KINETIC_ENTRY_BODY if compact else _KINETIC_ENTRY
-        exit_code = _kinetic_exit(compact)
-        for index, indentation in enumerate(
-            (
-                "                ",
-                "                    ",
-                "                    ",
-                "                ",
-                "                ",
-                "            ",
-            )
-        ):
-            fences[index] = f"\n{indentation}__syncwarp(MASK); /* IMPULSE_READ_COMPLETE_{index} */"
-    else:
-        row_guard = f"    if (m > {M}) m = {M};\n"
-        row_guard += "    if (m == 0 || world_mf_constraint_count.data[world] "
-        row_guard += (
-            "> 0) return;\n    const bool split_component = world_mf_constraint_count.data[world] < 0;"
-            if independent_components
-            else "!= 0) return;"
-        )
-        entry = _physical_entry(D, P, S, independent_components)
-        exit_code = _physical_exit(P, S, independent_components)
-    storage = (
-        ""
-        if compact
-        else f"""    __shared__ float s_lam_storage[{W * M}];
+    row_guard = f"    if (m > {M}) m = {M};\n"
+    row_guard += "    if (m == 0 || world_mf_constraint_count.data[world] != 0) return;"
+    entry = _physical_entry(D, P, S)
+    exit_code = _physical_exit(P, S)
+    storage = f"""    __shared__ float s_lam_storage[{W * M}];
     __shared__ float s_rhs_storage[{W * M}];
     __shared__ float s_diag_storage[{W * M}];
     __shared__ unsigned char s_type_storage[{W * M}];
     __shared__ float s_contact_mu_storage[{W * ((M + 2) // 3)}];
 """
-    )
-    views = (
-        compact_views
-        if compact
-        else f"""    float* s_lam = &s_lam_storage[world_slot * {M}];
+    views = f"""    float* s_lam = &s_lam_storage[world_slot * {M}];
     float* s_rhs = &s_rhs_storage[world_slot * {M}];
     float* s_diag = &s_diag_storage[world_slot * {M}];
     unsigned char* s_type = &s_type_storage[world_slot * {M}];
     float* s_contact_mu = &s_contact_mu_storage[world_slot * {((M + 2) // 3)}];
 
 """
-    )
-    world_slot = "" if compact else "    const int world_slot = threadIdx.x >> 5;\n"
-    primary_group_by_world = "plan.primary_group" if compact else "primary_group_by_world"
-    secondary_group_by_world = "plan.secondary_group" if compact else "secondary_group_by_world"
-    primary_offset_by_world = "state.primary_offset" if compact else "primary_offset_by_world"
-    secondary_offset_by_world = "state.secondary_offset" if compact else "secondary_offset_by_world"
-    factor_rows = "rows.response" if compact else "factor_rows"
-    rhs_bias = "rows.r0" if compact else "rhs_bias"
+    world_slot = "    const int world_slot = threadIdx.x >> 5;\n"
+    primary_group_by_world = "primary_group_by_world"
+    secondary_group_by_world = "secondary_group_by_world"
+    primary_offset_by_world = "primary_offset_by_world"
+    secondary_offset_by_world = "secondary_offset_by_world"
+    factor_rows = "factor_rows"
+    rhs_bias = "rhs_bias"
 
     def product(factor, row):
-        if compact:
-            return f"dense_j({row}, {factor}) * factor_velocity"
         return f"{factor} * factor_velocity"
 
     body = f"""{storage}    constexpr unsigned MASK = 0xffffffffu;
@@ -479,14 +358,10 @@ def get_source(
         }}
         }}
 
-{compact_sweep}        const unsigned changed = __ballot_sync(MASK, iteration_changed != 0);
+        const unsigned changed = __ballot_sync(MASK, iteration_changed != 0);
         if (global_iter >= friction_start_iteration && changed == 0u) break;
     }}
 
 {exit_code}    for (int i = lane; i < m; i += 32) world_impulses.data[off + i] = s_lam[i];
 """
-    if compact:
-        return body + compact_store
-    if kinetic:
-        return FRICTION_PAIR_CUDA + _KINETIC_ALIASES + body
     return "\n#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA + "\n" + body + "#endif\n"

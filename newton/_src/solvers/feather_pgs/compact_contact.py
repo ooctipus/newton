@@ -89,7 +89,6 @@ def supported(solver) -> bool:
         and not solver.grouped_dynamics
         and not solver._debug_buffers_enabled
         and not solver._preelim_active
-        and solver._simple_world_classifier is None
     )
 
 

@@ -444,8 +444,6 @@ def supported(solver):
         )
         and not solver._mimic_count
         and not solver._connect_count
-        and solver._joint_world is None
-        and solver._row_packets is None
         and not solver._debug_buffers_enabled
         and not solver._grouped_tau_mass
         and not solver._grouped_mass
@@ -727,7 +725,6 @@ class SparseFactor:
                     int(s.contact_friction_articulation_pairs_only),
                     1,
                     s._friction_patches.view,
-                    s._resolved_simple_worlds,
                 ],
                 outputs=[
                     s.contact_world,

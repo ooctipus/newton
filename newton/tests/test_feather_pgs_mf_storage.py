@@ -11,7 +11,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import solver_feather_pgs as fpgs
-from newton.tests.test_feather_pgs_independent_components import solve_fixture
+from newton.tests.feather_pgs_paired_fixture import solve_fixture
 
 
 class TestFeatherPGSMFStorage(unittest.TestCase):

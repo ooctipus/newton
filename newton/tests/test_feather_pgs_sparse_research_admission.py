@@ -12,7 +12,6 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import solver_feather_pgs
 from newton.solvers import SolverFeatherPGS
 
 
@@ -101,16 +100,9 @@ class TestSparseResearchAdmission(unittest.TestCase):
         """Do not replace buffers needed by an explicitly requested point-contact owner."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
         for option in (
-            "LOCAL_ROW_PACKETS",
             "ALLEGRO_KINETIC_ROWS",
-            "KUKA_JOINT_WORLD",
             "SINGLE_FACTOR",
             "SPARSE_FACTOR",
-            "KUKA_KINETIC_WORLD",
-            "FRANKA_KINETIC_STATE",
-            "INDEPENDENT_COMPONENTS",
-            "WORLD_SCAN_PUBLICATION",
-            "PAIRED_GENERAL_OVERLAP",
         ):
             with self.subTest(option=option), mock.patch.dict(os.environ, {f"FEATHER_PGS_{option}": "1"}, clear=True):
                 solver = _eligible_solver()
@@ -184,25 +176,6 @@ class TestSparseResearchAdmission(unittest.TestCase):
                 SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
                 self.assertIsNone(solver._sparse_mass_matrix_size)
 
-    def test_simple_world_request_only_reserves_point_free_bodies(self):
-        """Ignore the inactive simple-world request on articulated-only and patch scenes."""
-        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        with mock.patch.object(solver_feather_pgs, "_SIMPLE_WORLD_ZERO", True):
-            for free_bodies, patches in ((False, False), (False, True), (True, False), (True, True)):
-                with (
-                    self.subTest(free_bodies=free_bodies, patches=patches),
-                    mock.patch.dict(os.environ, {}, clear=True),
-                ):
-                    solver = _eligible_solver()
-                    solver._has_free_rigid_bodies = free_bodies
-                    solver._friction_anchors_enabled = patches
-                    if free_bodies and not patches:
-                        SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-                        self.assertIsNone(solver._sparse_mass_matrix_size)
-                    else:
-                        with self.assertRaises(_TopologyReached):
-                            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse construction requires CUDA")
     def test_branched_18_dof_trees_select_general_sparse(self):
         """Admit both wide and deeper trees without activating a second representation."""
@@ -234,7 +207,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
                 self.assertEqual(solver._ink_rows, 0)
                 for name in ("_fused_k1", "_grouped_tau_mass", "_grouped_mass"):
                     self.assertFalse(getattr(solver, name), name)
-                for name in ("_sparse_factor", "_kinetic_world", "_row_packets"):
+                for name in ("_sparse_factor",):
                     self.assertIsNone(getattr(solver, name), name)
 
 

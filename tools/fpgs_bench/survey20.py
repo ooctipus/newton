@@ -24,20 +24,11 @@ def flags(*names):
 
 RECIPES = {
     "franka": (
-        flags("SIMPLE_WORLD_ZERO", "LOCAL_ROW_PACKETS", "FRANKA_KINETIC_STATE", "FRANKA_COMPACT_WORKSPACE"),
+        [],
         {"rigid_contact_max": 8192},
     ),
     "kuka": (
-        flags(
-            "SIMPLE_WORLD_ZERO",
-            "LOCAL_ROW_PACKETS",
-            "INDEPENDENT_COMPONENTS",
-            "PAIRED_GENERAL_OVERLAP",
-            "KUKA_JOINT_WORLD",
-            "WORLD_SCAN_PUBLICATION",
-            "KUKA_KINETIC_WORLD",
-            "KUKA_CURRENT_CONTACT",
-        ),
+        [],
         {"rigid_contact_max": 77824},
     ),
     "allegro": (
@@ -48,7 +39,7 @@ RECIPES = {
         ],
         {"rigid_contact_max": 71680},
     ),
-    "anymald": (flags("SIMPLE_WORLD_ZERO"), {"rigid_contact_max": 53248, "dense_max_constraints": 72}),
+    "anymald": ([], {"rigid_contact_max": 53248, "dense_max_constraints": 72}),
     "g1": (
         flags(
             "SPARSE_FACTOR",

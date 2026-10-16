@@ -27,8 +27,6 @@ def supported_solver():
         small_dof_threshold=32,
         _mimic_count=0,
         _connect_count=0,
-        _joint_world=None,
-        _row_packets=None,
         _debug_buffers_enabled=False,
         _grouped_tau_mass=False,
         _grouped_mass=False,

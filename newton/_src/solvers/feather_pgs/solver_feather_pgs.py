@@ -65,7 +65,6 @@ from .grouped_dynamics import (
     grouped_tau_mass,
     template_fk_kinematics,
 )
-from .independent_components import IndependentComponents
 from .kernels import (
     FRICTION_MODE_BISECTION,
     FRICTION_MODE_BISECTION_DESAXCE,
@@ -309,7 +308,6 @@ _GROUPED_HINV_MAX = int(
 )  # grouped response solve for DOF sizes up to this
 _INK_ON = os.environ.get("FEATHER_PGS_INK") == "1"
 _REGISTER_WHITENING = os.environ.get("FEATHER_PGS_REGISTER_WHITENING") == "1"
-_SIMPLE_WORLD_ZERO = os.environ.get("FEATHER_PGS_SIMPLE_WORLD_ZERO") == "1"
 _SPARSE_CONTACT_DIRECT = os.environ.get("FEATHER_PGS_SPARSE_CONTACT_DIRECT") == "1"
 _WR_ON = os.environ.get("FEATHER_PGS_WORLD_ROWS") == "1"  # experiment: contact rows built inside the sweep kernel
 _WR_CHECK = os.environ.get("FEATHER_PGS_WORLD_ROWS_CHECK") == "1"
@@ -2901,15 +2899,6 @@ class SolverFeatherPGS(SolverBase):
         self._point_contact_paths = not (
             self._friction_anchors_enabled or self._contact_torsion_enabled or self.contact_compliance
         )
-        self._row_packets = None
-        if (
-            self._sparse_mass_matrix_size is None
-            and self._point_contact_paths
-            and os.environ.get("FEATHER_PGS_LOCAL_ROW_PACKETS") == "1"
-        ):
-            from .franka_row_packets import create_owner  # noqa: PLC0415
-
-            self._row_packets = create_owner(self)
         self._keyed_rows = None
         if (
             self._sparse_mass_matrix_size is None
@@ -3066,14 +3055,6 @@ class SolverFeatherPGS(SolverBase):
 
             configure_linear_state(self)
 
-        self._simple_world_classifier = None
-        self._resolved_simple_worlds = wp.empty(0, dtype=wp.int32, device=model.device)
-        if _SIMPLE_WORLD_ZERO and self._point_contact_paths and self._sparse_mass_matrix_size is None:
-            from .simple_world import SimpleWorldClassifier  # noqa: PLC0415 - optional experimental dispatcher
-
-            self._simple_world_classifier = SimpleWorldClassifier(self)
-            self._resolved_simple_worlds = self._simple_world_classifier.resolved
-
         self._compact_contact_boundary = False
         if (
             self._point_contact_paths
@@ -3095,23 +3076,6 @@ class SolverFeatherPGS(SolverBase):
             self._compact_contact_order = _ContactOrder(
                 self._max_contacts_alloc, self.world_count, self.dense_max_constraints, model.device
             )
-
-        self._joint_world = None
-        self._joint_world_active = False
-        if (
-            self._sparse_mass_matrix_size is None
-            and self._point_contact_paths
-            and os.environ.get("FEATHER_PGS_KUKA_JOINT_WORLD") == "1"
-        ):
-            from .kuka_joint_owner import create_owner  # noqa: PLC0415
-
-            self._joint_world = create_owner(self)
-
-        self._world_scan_publication = None
-        if self._sparse_mass_matrix_size is None and os.environ.get("FEATHER_PGS_WORLD_SCAN_PUBLICATION") == "1":
-            from .world_scan_owner import create_owner as create_publication  # noqa: PLC0415
-
-            self._world_scan_publication = create_publication(self)
 
         self._sparse_factor = None
         if (
@@ -3135,7 +3099,7 @@ class SolverFeatherPGS(SolverBase):
 
         from .cached_dynamics import install as install_cached_dynamics  # noqa: PLC0415
 
-        install_cached_dynamics(self, factor_warps=_CRBA_CHOLESKY_WARPS_PER_BLOCK)
+        install_cached_dynamics(self)
         # Decide the fused publication now: its host checks must not run inside
         # a later graph capture of the first step.
         self._fused_publication_admitted()
@@ -3144,9 +3108,6 @@ class SolverFeatherPGS(SolverBase):
             for name in (
                 "_sparse_factor",
                 "_tree_kinetic_state",
-                "_franka_kinetic_state",
-                "_kinetic_world",
-                "_joint_world",
                 "_single_factor",
             ):
                 if getattr(self, name, None) is not None:
@@ -3164,9 +3125,6 @@ class SolverFeatherPGS(SolverBase):
                 model.requires_grad
                 or self.L_by_size.get(6) is None
                 or self._sparse_factor is not None
-                or self._kinetic_world is not None
-                or self._franka_kinetic_state is not None
-                or self._joint_world is not None
                 or self._prismatic_linear_state
             ):
                 raise ValueError("Experimental implicit free-body gyro requires ordinary six-DOF mass factors")
@@ -3199,11 +3157,7 @@ class SolverFeatherPGS(SolverBase):
                 or self._paired_factor_coordinates
                 or self._sparse_diagonal_contact_solve
                 or self._sparse_mass_matrix_size is not None
-                or self._independent_components is not None
                 or self._sparse_factor is not None
-                or self._joint_world is not None
-                or self._kinetic_world is not None
-                or self._franka_kinetic_state is not None
                 or self._prismatic_linear_state
             ):
                 raise ValueError(
@@ -3285,9 +3239,7 @@ class SolverFeatherPGS(SolverBase):
         """
         kernels = {}
         kernel_reasons = {}
-        cached = any(
-            owner is not None for owner in (self._tree_kinetic_state, self._franka_kinetic_state, self._kinetic_world)
-        )
+        cached = self._tree_kinetic_state is not None
         for size in self.size_groups:
             sparse = size == self._sparse_mass_matrix_size
             diagonal = self._execution_plan.use_diagonal_mass(size)
@@ -3350,13 +3302,7 @@ class SolverFeatherPGS(SolverBase):
             else "ordinary",
             "pgs_kernel": "matrix_free" if self.pgs_mode == "matrix_free" else self.pgs_kernel,
             "kernel_plan_by_dof": kernels,
-            "cached_prediction": "tree"
-            if self._tree_kinetic_state is not None
-            else "held"
-            if self._franka_kinetic_state is not None
-            else "kinetic"
-            if self._kinetic_world is not None
-            else None,
+            "cached_prediction": "tree" if self._tree_kinetic_state is not None else None,
             "reasons": {
                 "sparse_mass_matrix": self._sparse_selection_reason,
                 "cached_dynamics": self._cached_dynamics_selection_reason,
@@ -3488,34 +3434,13 @@ class SolverFeatherPGS(SolverBase):
             # Geometry edits retire affected material points; unrelated shape
             # properties keep their history and live materials are checked per step.
             self._friction_patches.update_geometry(self.model)
-        franka_kinetic = getattr(self, "_franka_kinetic_state", None)
-        if franka_kinetic is not None:
-            franka_kinetic.validate_model(flags)
         if getattr(self, "_sparse_factor", None) is not None:
             self._sparse_factor.validate_notification(flags)
         tree_kinetic = getattr(self, "_tree_kinetic_state", None)
         if tree_kinetic is not None and self._sparse_factor is None:
             tree_kinetic.validate_model(flags)
-        kinetic = getattr(self, "_kinetic_world", None)
-        joint_world = getattr(self, "_joint_world", None)
-        publication = getattr(self, "_world_scan_publication", None)
-        plan_snapshot = None
-        if kinetic is not None or joint_world is not None or publication is not None:
-            from .kuka_joint_owner import notification_plan_snapshot  # noqa: PLC0415
-
-            plan_snapshot = notification_plan_snapshot(flags)
-        if kinetic is not None:
-            kinetic.validate_notification(flags, plan_snapshot=plan_snapshot)
-        if self._row_packets is not None:
-            self._row_packets.validate_notification(flags)
         if self._keyed_rows is not None:
             self._keyed_rows.validate_notification(flags)
-        if joint_world is not None:
-            joint_world.validate_notification(flags, plan_snapshot=plan_snapshot)
-        if publication is not None:
-            publication.validate_notification(flags, plan_snapshot=plan_snapshot)
-        if kinetic is not None:
-            kinetic.invalidate_model_changed(flags)
         tree_cache = getattr(self, "_tree_kinetic_state", None)
         if tree_cache is not None and flags & (
             ModelFlags.JOINT_PROPERTIES
@@ -3525,8 +3450,6 @@ class SolverFeatherPGS(SolverBase):
             | ModelFlags.MODEL_PROPERTIES
         ):
             tree_cache.invalidate()
-        if franka_kinetic is not None:
-            franka_kinetic.invalidate(None)
         if self._fk_id_cache_enabled and flags & (
             ModelFlags.JOINT_PROPERTIES
             | ModelFlags.JOINT_DOF_PROPERTIES
@@ -3587,8 +3510,6 @@ class SolverFeatherPGS(SolverBase):
             flags: State flags, which do not affect solver-owned impulse history.
         """
         del flags
-        if getattr(self, "_joint_world", None) is not None:
-            self._joint_world.join_raw()
         if self.contact_compliance:
             self._compliant_contacts = None
             self._compliant_prepared = False
@@ -3601,12 +3522,8 @@ class SolverFeatherPGS(SolverBase):
         if self.world_count == 0:
             return
 
-        if getattr(self, "_kinetic_world", None) is not None:
-            self._kinetic_world.reset(state, world_mask)
         if getattr(self, "_tree_kinetic_state", None) is not None:
             self._tree_kinetic_state.invalidate(world_mask)
-        if getattr(self, "_franka_kinetic_state", None) is not None:
-            self._franka_kinetic_state.invalidate(world_mask)
 
         wp.launch(
             _reset_solver_status,
@@ -5029,7 +4946,6 @@ class SolverFeatherPGS(SolverBase):
     def _setup_sparse_mass_matrix(self, model: Model) -> None:
         """Select sparse articulation factors with independent rigid-body response blocks."""
         self._sparse_mass_matrix_size = None
-        self._kinetic_world_plan = None
         self._sparse_split = False
         self._sparse_velocity_limits = False
         self._sparse_prepare_contacts = False
@@ -5122,28 +5038,15 @@ class SolverFeatherPGS(SolverBase):
         ):
             self._sparse_selection_reason = "A legacy grouped, multiblock or free-body option retains ordinary factors."
             return
-        from .cached_dynamics import reserve_native_patch_factors  # noqa: PLC0415
-
-        if reserve_native_patch_factors(self):
-            self._sparse_selection_reason = "A compatible native patch-dynamics cache reserves its factor buffers."
-            return
         if not self._friction_anchors_enabled and (
             self.mf_gs_parallel_rows > 0
             or self.mf_gs_response_block_rows > 0
-            or (_SIMPLE_WORLD_ZERO and self._has_free_rigid_bodies)
             or any(
                 os.environ.get(f"FEATHER_PGS_{option}") == "1"
                 for option in (
-                    "LOCAL_ROW_PACKETS",
                     "ALLEGRO_KINETIC_ROWS",
-                    "KUKA_JOINT_WORLD",
                     "SINGLE_FACTOR",
                     "SPARSE_FACTOR",
-                    "KUKA_KINETIC_WORLD",
-                    "FRANKA_KINETIC_STATE",
-                    "INDEPENDENT_COMPONENTS",
-                    "WORLD_SCAN_PUBLICATION",
-                    "PAIRED_GENERAL_OVERLAP",
                 )
             )
         ):
@@ -6991,28 +6894,6 @@ class SolverFeatherPGS(SolverBase):
 
         self._paired_cholesky_inverse_kernel = None
         self._paired_response_kernel = None
-        self._independent_components = None
-        if (
-            os.environ.get("FEATHER_PGS_INDEPENDENT_COMPONENTS", "0") == "1"
-            and model.device.is_cuda
-            and not model.requires_grad
-            and self._paired_factor_coordinates
-            and self.pgs_velocity_iterations == 0
-            and not self.pgs_debug
-            and not (_FPGS_CAPTURE or _GROUPED_CHECK or _DEBUG_CACHE_CMP or _INK_CHECK or _WR_CHECK)
-            and self._paired_response_primary_size == 23
-            and self._paired_response_secondary_size == 6
-            and self.max_world_dofs == 29
-            and self.pgs_schedule == "interleaved"
-            and not self.pgs_warmstart
-            and not self._mf_warmstart_enabled
-            and not self._regularization_enabled
-            and not self._preelim_active
-            and not self.contact_compliance
-            and self._mimic_count == 0
-            and self._connect_count == 0
-        ):
-            self._independent_components = IndependentComponents(self)
         if self._paired_response_primary_size is not None:
             primary_size = self._paired_response_primary_size
             secondary_size = self._paired_response_secondary_size
@@ -7038,7 +6919,6 @@ class SolverFeatherPGS(SolverBase):
                     secondary_size,
                     device_arch,
                     contact_triples=self._factor_coordinate_contact_triples,
-                    independent_components=self._independent_components is not None,
                 )
                 if self._paired_factor_coordinates
                 else None
@@ -7098,10 +6978,6 @@ class SolverFeatherPGS(SolverBase):
         self._pgs_solve_local_internal_worlds_per_block = {}
         self._pgs_solve_local_pair_warps_per_block = {}
         local_factory = _get_pgs_solve_local_owned_kernel
-        if self._row_packets is not None:
-            from .franka_row_packets import get_local_factory  # noqa: PLC0415
-
-            local_factory = get_local_factory()
         if self._local_internal_fast_path:
             for size, count in self._local_internal_art_counts.items():
                 if count > 0:
@@ -7334,7 +7210,6 @@ class SolverFeatherPGS(SolverBase):
                 factor_coordinates=self._paired_factor_coordinates,
                 skip_incremental_rows=max(incremental_rows, parallel_rows),
                 skip_response_block=use_rb,
-                independent_components=self._independent_components is not None,
             )
             if use_rb:
                 self._build_response_block_sweep(model, has_drive_rows)
@@ -7726,32 +7601,6 @@ class SolverFeatherPGS(SolverBase):
         )
         self._global_inertia_stream = wp.Stream(model.device) if self._compact_inertia_refresh else None
         self._articulation_dynamics_stream = wp.Stream(model.device) if self._async_augmented_drives else None
-        # The original owners have disjoint world sets. With independent
-        # components enabled, the split worlds instead have disjoint DOFs.
-        # Both forms can fork only after response/selector preparation and
-        # must join before any downstream velocity or impulse publication.
-        paired_overlap = bool(
-            os.environ.get("FEATHER_PGS_PAIRED_GENERAL_OVERLAP", "0") == "1"
-            and self.use_parallel_streams
-            and model.device.is_cuda
-            and not model.requires_grad
-            and self._paired_factor_solve_kernel is not None
-            and self._paired_response_primary_size == 23
-            and self._paired_response_secondary_size == 6
-            and self.max_world_dofs == 29
-            and not self.pgs_debug
-            and not self._mf_warmstart_enabled
-            and self._mimic_count == 0
-            and self._connect_count == 0
-            and not getattr(self, "_pgs_solve_mf_gs_incremental_kernels", ())
-            and getattr(self, "_rb_build_kernel", None) is None
-            and not (
-                _FPGS_CAPTURE or _GROUPED_CHECK or _DEBUG_CACHE_CMP or _INK_CHECK or _WR_CHECK or _FPGS_SYNC_TIMINGS
-            )
-        )
-        self._paired_general_solve_stream = wp.Stream(model.device) if paired_overlap else None
-        self._paired_general_ready = wp.Event(model.device) if paired_overlap else None
-        self._paired_general_done = wp.Event(model.device) if paired_overlap else None
 
     def _init_double_buffer_stream(self):
         """Create a CUDA stream for mass-matrix and active-Jacobian maintenance."""
@@ -7895,8 +7744,6 @@ class SolverFeatherPGS(SolverBase):
                 ]
             )
             outputs = [self.diag, self.impulses, self.v_out]
-            if self._row_packets is not None:
-                outputs.extend([self._row_packets.prefix, self._row_packets.packet])
             wp.launch_tiled(
                 kernel,
                 dim=[count // worlds_per_block],
@@ -8640,17 +8487,6 @@ class SolverFeatherPGS(SolverBase):
                     single_ready_event = wp.get_stream(self.model.device).record_event()
                     local_stream.wait_event(single_ready_event)
             factor_kernel = self._paired_factor_solve_kernel
-            components = self._independent_components
-            if components is not None:
-                if row_phase != 0 or soft_relax or defer_dense_response:
-                    raise RuntimeError("Independent components require the supported physical interleaved solve")
-                components.prepare(self, dense_rhs, mf_meta)
-            factor_stream = self._paired_general_solve_stream
-            if factor_stream is not None:
-                if row_phase != 0 or soft_relax or defer_dense_response:
-                    raise RuntimeError("Paired/general overlap requires the physical interleaved solve")
-                wp.get_stream(self.model.device).record_event(self._paired_general_ready)
-                factor_stream.wait_event(self._paired_general_ready)
             if factor_kernel is not None:
                 if row_phase != 0:
                     raise RuntimeError("paired factor-coordinate solve only supports the interleaved row phase")
@@ -8685,7 +8521,7 @@ class SolverFeatherPGS(SolverBase):
                                 self.row_type,
                                 self.row_parent,
                                 self.row_mu,
-                                self.mf_constraint_count if components is None else components.selector,
+                                self.mf_constraint_count,
                                 self.L_by_size[primary_size],
                                 self.Linv_by_size[primary_size],
                                 self.L_by_size[secondary_size],
@@ -8702,11 +8538,9 @@ class SolverFeatherPGS(SolverBase):
                             outputs=[self.v_out],
                             block_dim=64,
                             device=self.model.device,
-                            stream=factor_stream,
                         )
 
-                if factor_stream is None:
-                    launch_factor_solve()
+                launch_factor_solve()
             with self._sync_timed(f"mfgs_phase{row_phase}_iters{phase_iterations}"):
                 mf_gs_inputs = [
                     self._local_general_world_count,
@@ -8716,7 +8550,7 @@ class SolverFeatherPGS(SolverBase):
                     self._rb_class,
                     self.constraint_count,
                     self.dense_phase_bounds,
-                    self._local_solve_owner if components is None else components.selector,
+                    self._local_solve_owner,
                     self.world_dof_indices,
                     self.world_deferred_dof_mask,
                     dense_rhs,
@@ -8864,12 +8698,6 @@ class SolverFeatherPGS(SolverBase):
                         _report_grouped_check("ink_Y_diag", [self.Y_world, self.diag], ink_ref)
                     else:
                         _report_grouped_check("ink_diag", [self.diag], ink_ref[1:])
-            if factor_stream is not None:
-                # Queue the scarce general tail first; the independent paired
-                # grid shares only the pre-solve ready dependency with it.
-                launch_factor_solve()
-                factor_stream.record_event(self._paired_general_done)
-                wp.get_stream(self.model.device).wait_event(self._paired_general_done)
             local_done_events = []
             if launch_local:
                 if local_stream is not None:
@@ -10271,16 +10099,6 @@ class SolverFeatherPGS(SolverBase):
             self._step += 1
             return state_out
 
-        if self._kinetic_world is not None and self._kinetic_world.try_step(
-            state_in, state_out, state_aug, control, contacts, dt, collide_done_event
-        ):
-            self._step += 1
-            return state_out
-
-        self._joint_world_active = self._joint_world is not None and self._joint_world.begin(
-            state_in, state_out, contacts, collide_done_event
-        )
-
         # Double-buffer: select buffer set and wait for its memset to finish
         if self._memset_stream is not None:
             self.H_by_size = self._H_bufs[self._buf_idx]
@@ -10334,12 +10152,6 @@ class SolverFeatherPGS(SolverBase):
                 self._tree_kinetic_state.predict(state_in, state_aug, control, stage3_qd, dt)
                 self._stage3_correct_free_root_velocity(state_in, stage3_qd, dt, apply_transport=False)
                 self._clamp_rigid_velocity_limits(self.v_hat)
-            elif self._franka_kinetic_state is not None:
-                self._franka_kinetic_state.predict(state_in, state_aug, control, stage3_qd, dt)
-                self._stage3_correct_free_root_velocity(state_in, stage3_qd, dt, apply_transport=False)
-                self._clamp_rigid_velocity_limits(self.v_hat)
-            elif self._joint_world_active:
-                self._joint_world.predict_and_classify(state_in, state_aug, state_out, contacts, stage3_qd, dt)
             else:
                 self._stage3_zero_qdd(state_aug)
                 for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
@@ -10384,8 +10196,6 @@ class SolverFeatherPGS(SolverBase):
         # STAGE 4: Build contact problem
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S4_ContactBuild", print=False, use_nvtx=self._nvtx, synchronize=False):
-            if self._simple_world_classifier is not None and not self._joint_world_active:
-                self._simple_world_classifier.classify(state_in, state_aug, contacts, dt)
             self._stage4_build_rows(state_in, state_aug, control, contacts, dt)
             if self._contact_torsion_enabled:
                 prepare_torsion_rows(self, state_in, state_aug, contacts)
@@ -10947,22 +10757,13 @@ class SolverFeatherPGS(SolverBase):
         # STAGE 7: Update qdd + integrate
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S7_Integrate", print=False, use_nvtx=self._nvtx, synchronize=False):
-            if self._franka_kinetic_state is not None:
-                self._stage6_integrate(state_in, state_aug, state_out, dt)
-            elif self._world_scan_publication is not None and self._world_scan_publication.try_publish(
-                state_in, state_aug, state_out, dt
-            ):
-                pass
-            elif self._joint_world_active:
-                self._joint_world.finish_active(state_in, state_aug, state_out, dt)
-            elif self.pgs_mode == "matrix_free" and self.pgs_velocity_iterations > 0:
+            if self.pgs_mode == "matrix_free" and self.pgs_velocity_iterations > 0:
                 self._stage6_write_final_velocity(state_in, state_aug, state_out, dt)
             elif self._fused_publication_admitted():
                 self._stage7_finish_general(state_in, state_aug, state_out, dt)
             else:
                 self._stage6_update_qdd(state_in, state_aug, dt)
                 self._stage6_integrate(state_in, state_aug, state_out, dt)
-        self._joint_world_active = False
 
         # ── MF warm-start carry: snapshot this step's converged impulses +
         # row-type table + per-(sorted)-contact slot map so step N+1 can seed
@@ -11046,13 +10847,13 @@ class SolverFeatherPGS(SolverBase):
         # the Cholesky kernels never read H when mass_update_mask is 0.
         if self._memset_stream is not None:
             with wp.ScopedTimer("DB_Memset", print=False, use_nvtx=self._nvtx, synchronize=False):
-                if self._row_packets is None and self._keyed_rows is None:
+                if self._keyed_rows is None:
                     wp.copy(self._j_active_counts[self._buf_idx], self.constraint_count)
                 with wp.ScopedStream(self._memset_stream):
                     for size in self.size_groups:
                         if self._mass_update_global_flag:
                             self._H_bufs[self._buf_idx][size].zero_()
-                        if self._row_packets is not None or self._keyed_rows is not None:
+                        if self._keyed_rows is not None:
                             continue  # Private J is current; general active rows are cleared before materialization.
                         if self._sparse_diagonal_contact_solve and size == self._sparse_diagonal_response_size:
                             # Sparse response owns no dense J; its buffer is a one-float placeholder.
@@ -11214,8 +11015,6 @@ class SolverFeatherPGS(SolverBase):
             raise RuntimeError("check_constraint_capacity() must run outside CUDA graph capture")
         if self._sparse_factor is not None:
             self._sparse_factor.check()
-        if self._franka_kinetic_state is not None:
-            self._franka_kinetic_state.check()
         worlds = np.flatnonzero(self.constraint_overflow.numpy())
         if worlds.size:
             raise RuntimeError(
@@ -11299,9 +11098,6 @@ class SolverFeatherPGS(SolverBase):
         is not suitable for contact-wrench sensing.
         """
         if contacts is None or contacts.rigid_contact_count is None:
-            return
-
-        if self._kinetic_world is not None and self._kinetic_world.update_contacts(contacts):
             return
 
         dt = self._last_step_dt
@@ -11607,9 +11403,6 @@ class SolverFeatherPGS(SolverBase):
         refresh_composite = (self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update
         if getattr(self, "_tree_kinetic_state", None) is not None:
             self._tree_kinetic_state.begin(state_in, state_aug, stage3_qd, self._last_step_dt, refresh_composite)
-            return None, stage3_qd
-        if self._franka_kinetic_state is not None:
-            self._franka_kinetic_state.begin(state_in, state_aug, self._last_step_dt, refresh_composite)
             return None, stage3_qd
         parallel_global_refresh = refresh_composite and self._global_inertia_stream is not None
         if self._fused_k1:
@@ -12201,12 +11994,6 @@ class SolverFeatherPGS(SolverBase):
             # joint_tau currently holds only u0. Current external/control/bias
             # contributions are added by the retained-W predictor after waiting.
             return drive_rows_ready
-        if self._franka_kinetic_state is not None:
-            if drive_rows_ready is None:
-                raise RuntimeError("Franka kinetic prediction requires original asynchronous augmented drives")
-            # joint_tau retains only the current clamped actuator u0. The
-            # compact predictor consumes live passive/control/external forces.
-            return drive_rows_ready
         if drive_rows_ready is None:
             self._stage1_drives(state_in, state_aug, control, dt)
             return None
@@ -12336,47 +12123,6 @@ class SolverFeatherPGS(SolverBase):
             self._tree_kinetic_state.sparse.refresh(state_aug)
             # Consume requests just like the common tail. Leaving either set
             # changes the held-factor cadence on subsequent captured steps.
-            self._mass_update_requested.zero_()
-            self._force_mass_update = False
-            return
-
-        if self._franka_kinetic_state is not None:
-            if drive_rows_ready is None:
-                raise RuntimeError("Franka kinetic factor requires current augmented-drive coefficients")
-            wp.get_stream(model.device).wait_event(drive_rows_ready)
-            for size in self.size_groups:
-                primary = size == self._franka_kinetic_state.layout.primary_dofs
-                kernel = self._franka_kinetic_factor if primary else self._crba_cholesky_warp_kernels_by_size[size]
-                inputs = [
-                    self.n_arts_by_size[size],
-                    model.articulation_start,
-                    self.articulation_dof_start,
-                    self.mass_update_mask,
-                    model.joint_child,
-                    state_aug.joint_S_s,
-                    state_aug.body_I_s,
-                    self.group_to_art[size],
-                    self.R_by_size[size],
-                    self._franka_kinetic_state.factor_offsets
-                    if self._franka_kinetic_state.same_width
-                    else self._crba_dof_joint_offset_by_size[size],
-                    self._franka_kinetic_state.factor_schedule
-                    if self._franka_kinetic_state.same_width
-                    else self._crba_lower_schedule_by_size[size],
-                    1,
-                    self._augmented_drive_row_by_dof,
-                    self.aug_row_K,
-                ]
-                if primary:
-                    inputs.append(self._franka_kinetic_state.data.geometric)
-                wp.launch(
-                    kernel,
-                    dim=self.n_arts_by_size[size] * 32,
-                    inputs=inputs,
-                    outputs=[self.L_by_size[size]],
-                    block_dim=_CRBA_CHOLESKY_WARPS_PER_BLOCK * 32,
-                    device=model.device,
-                )
             self._mass_update_requested.zero_()
             self._force_mass_update = False
             return
@@ -12805,7 +12551,7 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage2_cholesky_loop(self, size: int):
-        if self._franka_kinetic_state is not None or self._crba_cholesky_warp_kernels_by_size[size] is not None:
+        if self._crba_cholesky_warp_kernels_by_size[size] is not None:
             return
         model = self.model
         n_arts = self.n_arts_by_size[size]
@@ -13241,9 +12987,7 @@ class SolverFeatherPGS(SolverBase):
         propagation_first_rejected_slot = (
             self._propagation_first_rejected_slot if propagation_active else self._dummy_mf_slot_counter
         )
-        j_buffers_zeroed = (
-            self._sparse_mass_matrix_size is not None or self._row_packets is not None or self._keyed_rows is not None
-        )
+        j_buffers_zeroed = self._sparse_mass_matrix_size is not None or self._keyed_rows is not None
         if self._compact_contact_boundary:
             from .compact_contact import clear_limit_prefix  # noqa: PLC0415
 
@@ -13258,8 +13002,6 @@ class SolverFeatherPGS(SolverBase):
         if _FPGS_CAPTURE:
             self._capture_contacts = contacts
             self._capture_state_in = state_in
-        if self._row_packets is not None:
-            self._row_packets.prepare_prefix(state_in, dt)
         if self._keyed_rows is not None:
             self._keyed_rows.begin_rows(state_in, state_aug, dt)
 
@@ -13352,7 +13094,7 @@ class SolverFeatherPGS(SolverBase):
         # slot index across steps.
 
         # Mimic (joint coupling) equality rows — static count per model.
-        if self._mimic_count > 0 and self._row_packets is None:
+        if self._mimic_count > 0:
             wp.launch(
                 allocate_mimic_slots,
                 dim=self._mimic_count,
@@ -13542,12 +13284,7 @@ class SolverFeatherPGS(SolverBase):
             )
 
         # Allocate and populate joint-limit rows per response-size group.
-        if (
-            self.enable_joint_limits
-            and self._joint_limit_sizes
-            and self._row_packets is None
-            and self._keyed_rows is None
-        ):
+        if self.enable_joint_limits and self._joint_limit_sizes and self._keyed_rows is None:
             if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
                 for size in self.size_groups:
                     self.J_by_size[size].zero_()
@@ -13616,7 +13353,6 @@ class SolverFeatherPGS(SolverBase):
                             max_constraints,
                             self.pgs_beta,
                             self.pgs_cfm,
-                            self._resolved_simple_worlds,
                         ],
                         outputs=[
                             self.slot_counter,
@@ -13652,7 +13388,6 @@ class SolverFeatherPGS(SolverBase):
                             max_constraints,
                             self.pgs_beta,
                             self.pgs_cfm,
-                            self._resolved_simple_worlds,
                         ],
                         outputs=[
                             self.slot_counter,
@@ -13671,7 +13406,7 @@ class SolverFeatherPGS(SolverBase):
         # Unconditional: the phase-3 boundary must include position-limit
         # rows and remain valid when that family is disabled (when it is just
         # the current watermark at the start of the velocity-limit segment).
-        if self._row_packets is None and self._keyed_rows is None:
+        if self._keyed_rows is None:
             wp.launch(
                 snapshot_dense_phase_bound,
                 dim=self.world_count,
@@ -13716,7 +13451,7 @@ class SolverFeatherPGS(SolverBase):
             )
 
         # Unconditional phase-5 boundary snapshot; dense contact rows start here.
-        if self._row_packets is None and self._keyed_rows is None:
+        if self._keyed_rows is None:
             wp.launch(
                 snapshot_dense_phase_bound,
                 dim=self.world_count,
@@ -13861,7 +13596,6 @@ class SolverFeatherPGS(SolverBase):
                     1 if self.contact_friction_articulation_pairs_only else 0,
                     1,  # capacity failures are always observable
                     self._friction_patches.view,
-                    self._resolved_simple_worlds,
                 ],
                 outputs=[
                     self.contact_world,
@@ -13890,9 +13624,7 @@ class SolverFeatherPGS(SolverBase):
                     self.J_by_size[size].zero_()
                 j_buffers_zeroed = True
 
-            if self._row_packets is not None:
-                self._row_packets.produce_contacts(state_in, state_aug, contacts, dt)
-            elif self._keyed_rows is not None:
+            if self._keyed_rows is not None:
                 self._keyed_rows.produce_contacts(state_in, state_aug, contacts, dt)
             elif self._compact_contact_boundary:
                 from .compact_contact import launch_contacts  # noqa: PLC0415
@@ -14933,7 +14665,6 @@ class SolverFeatherPGS(SolverBase):
                     self.v_hat,
                     self.velocity_limit_activation_fraction,
                     self.mf_max_constraints,
-                    self._resolved_simple_worlds,
                 ],
                 outputs=[
                     self.rigid_velocity_limit_slot,
@@ -14975,8 +14706,6 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
-        if self._row_packets is not None:
-            self._row_packets.finish_rows()
         wp.launch(
             finalize_constraint_counts_with_status,
             dim=self.world_count,
@@ -15043,7 +14772,7 @@ class SolverFeatherPGS(SolverBase):
                 ],
                 device=model.device,
             )
-        if self._local_internal_fast_path and self._row_packets is None:
+        if self._local_internal_fast_path:
             self._local_general_world_count.zero_()
             wp.launch(
                 classify_local_solve_worlds,
@@ -15270,9 +14999,6 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage4_hinv_jt_paired(self, primary_size: int, secondary_size: int) -> None:
         """Build one world response from its robot and free-body components."""
-        if getattr(self, "_joint_world_active", False):
-            self._joint_world.response.launch()
-            return
         if self._paired_response_kernel is None or self._paired_response_secondary_groups is None:
             raise RuntimeError("Paired H^-1 J^T kernel is unavailable")
         primary_linv = (
@@ -15600,9 +15326,6 @@ class SolverFeatherPGS(SolverBase):
         return int(getattr(self, "_ink_rows", 0))
 
     def _stage4_hinv_jt_par_row(self, size: int):
-        if self._row_packets is not None:
-            self._row_packets.response(size)
-            return
         model = self.model
         n_arts = self.n_arts_by_size[size]
         J_world = self.J_world if self.J_world is not None else self.J_by_size[size]
@@ -15697,8 +15420,6 @@ class SolverFeatherPGS(SolverBase):
             return  # Contact and limit producers add CFM exactly once.
         if self._sparse_factor is not None:
             return
-        if self._row_packets is not None:
-            return  # Current row owner and general response each add CFM exactly once.
         if self._compact_contact_boundary:
             return  # Both complete owners already add the original row CFM exactly once.
         model = self.model
@@ -15813,9 +15534,6 @@ class SolverFeatherPGS(SolverBase):
     def _stage4_compute_matrix_free_diag(self):
         if self._sparse_factor is not None:
             return
-        if self._row_packets is not None:
-            self._row_packets.diagonal()
-            return
         if self._compact_contact_boundary:
             from .compact_contact import produce_limit_response  # noqa: PLC0415
 
@@ -15907,7 +15625,7 @@ class SolverFeatherPGS(SolverBase):
     ):
         if self._sparse_prepare_contacts:
             return  # The admitted sparse path has a single position pass.
-        if self._row_packets is not None or self._keyed_rows is not None:
+        if self._keyed_rows is not None:
             if (
                 output is not None
                 or preserve_unreached_speculative
@@ -15998,7 +15716,7 @@ class SolverFeatherPGS(SolverBase):
                 raise RuntimeError("Sparse factor excludes non-matrix-free restitution")
             self._sparse_factor.restitution(dt)
             return
-        if self._row_packets is not None or self._keyed_rows is not None:
+        if self._keyed_rows is not None:
             return  # The current packet producer applies the same incident-velocity law.
         if matrix_free:
             if self._sparse_mass_matrix_size is not None:
@@ -16594,8 +16312,6 @@ class SolverFeatherPGS(SolverBase):
     def _stage6_update_qdd(self, state_in: State, state_aug: State, dt: float):
         if getattr(self, "_tree_kinetic_state", None) is not None:
             return  # finish owns conversion, free-root transport and integration
-        if self._franka_kinetic_state is not None:
-            return
         model = self.model
         wp.launch(
             update_qdd_from_velocity,
@@ -16608,12 +16324,6 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage6_integrate(self, state_in: State, state_aug: State, state_out: State, dt: float):
         model = self.model
-        if self._franka_kinetic_state is not None:
-            next_refresh = ((self._step + 1) % self.update_mass_matrix_interval) == 0
-            self._franka_kinetic_state.finish(state_in, state_aug, state_out, dt, next_refresh)
-            self._fk_id_cache_source_state = state_out
-            return
-
         if getattr(self, "_tree_kinetic_state", None) is not None:
             next_refresh = ((self._step + 1) % self.update_mass_matrix_interval) == 0
             self._tree_kinetic_state.finish(state_in, state_aug, state_out, dt, next_refresh)
@@ -16739,9 +16449,6 @@ class SolverFeatherPGS(SolverBase):
             and not (self._fused_k1 and self.lazy_kinematics)
             and self._prismatic_publication is None
             and getattr(self, "_tree_kinetic_state", None) is None
-            and self._franka_kinetic_state is None
-            and self._world_scan_publication is None
-            and self._joint_world is None
             and not (self.pgs_mode == "matrix_free" and self.pgs_velocity_iterations > 0)
             and not self._has_free_rigid_bodies
             and not (self._has_root_free and self._has_rigid_body_velocity_limits)
@@ -17085,7 +16792,6 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
 
     const int articulation = group_to_art.data[group_idx];
     const int world = art_to_world.data[articulation];
-    if (world >= 0 && world < resolved_worlds.shape[0] && resolved_worlds.data[world] != 0) return;
     const int dof_start = articulation_dof_start.data[articulation];
     for (int base = 0; base < {2 * size}; base += 32) {{
         const int candidate = base + lane;
@@ -17142,7 +16848,6 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
         max_constraints: int,
         pgs_beta: float,
         pgs_cfm: float,
-        resolved_worlds: wp.array[int],
         world_slot_counter: wp.array[int],
         J_group: wp.array3d[float],
         world_row_type: wp.array2d[int],
@@ -17167,7 +16872,6 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
         max_constraints: int,
         pgs_beta: float,
         pgs_cfm: float,
-        resolved_worlds: wp.array[int],
         world_slot_counter: wp.array[int],
         J_group: wp.array3d[float],
         world_row_type: wp.array2d[int],
@@ -17193,7 +16897,6 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
             max_constraints,
             pgs_beta,
             pgs_cfm,
-            resolved_worlds,
             world_slot_counter,
             J_group,
             world_row_type,
@@ -18492,7 +18195,6 @@ def _get_pgs_solve_paired_factor_kernel(
     secondary_dofs: int,
     device_arch: str,
     contact_triples: bool = False,
-    independent_components: bool = False,
 ) -> "wp.Kernel":
     """Build the dense PGS solve for a fixed articulation/free-body pair.
 
@@ -18511,12 +18213,10 @@ def _get_pgs_solve_paired_factor_kernel(
         raise ValueError("max_constraints must be positive")
     if P <= 0 or S <= 0 or P + S != D or D > 32:
         raise ValueError("paired factor PGS requires two positive components spanning at most 32 world DOFs")
-    if independent_components and (P, S) != (23, 6):
-        raise ValueError("Independent components require the 23+6 pair")
 
     from .paired_factor_source import get_source  # noqa: PLC0415
 
-    snippet = get_source(M, D, P, S, contact_triples=contact_triples, independent_components=independent_components)
+    snippet = get_source(M, D, P, S, contact_triples=contact_triples)
 
     @wp.func_native(snippet)
     def pgs_solve_paired_factor_native(
@@ -18608,8 +18308,6 @@ def _get_pgs_solve_paired_factor_kernel(
     name = f"pgs_solve_paired_factor_{M}_{D}_{P}_{S}_w{W}"
     if contact_triples:
         name += "_contact3"
-    if independent_components:
-        name += "_components"
     pgs_solve_paired_factor_template.__name__ = name
     pgs_solve_paired_factor_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_paired_factor_template)
@@ -25807,7 +25505,6 @@ def _get_pgs_solve_mf_gs_kernel(
     factor_coordinates: bool = False,
     skip_incremental_rows: int = 0,
     skip_response_block: bool = False,
-    independent_components: bool = False,
     dense_support_tiles: bool = False,
     stage_velocities: bool = False,
 ) -> "wp.Kernel":
@@ -25872,7 +25569,6 @@ def _get_pgs_solve_mf_gs_kernel(
         factor_coordinates=factor_coordinates,
         skip_incremental_rows=skip_incremental_rows,
         skip_response_block=skip_response_block,
-        independent_components=independent_components,
         dense_support_tiles=dense_support_tiles,
         stage_velocities=stage_velocities,
     ).native
@@ -26063,8 +25759,6 @@ def _get_pgs_solve_mf_gs_kernel(
         name += f"_skipinc{int(skip_incremental_rows)}"
     if skip_response_block:
         name += "_rb"
-    if independent_components:
-        name += "_components"
     if dense_support_tiles:
         name += "_dense_tiles_phase6"
     if stage_velocities:
