@@ -52,14 +52,46 @@ def _add_quadruped(scene, cfg):
     scene.add_articulation(joints)
 
 
-def _build(device, worlds=4, mimic=False, prescribed=False, shoulder=False, quadruped=False):
+def _add_cabinet(scene, cfg):
+    """A fixed cabinet with two prismatic drawers on its base: 3 bodies, 2 independent coordinates."""
+    base = scene.add_link(mass=5.0, inertia=wp.mat33(np.eye(3) * 0.3), lock_inertia=True)
+    joints = [
+        scene.add_joint_fixed(
+            parent=-1, child=base, parent_xform=wp.transform(wp.vec3(0.6, 0.0, 0.25), wp.quat_identity())
+        )
+    ]
+    scene.add_shape_box(base, hx=0.15, hy=0.2, hz=0.25, cfg=cfg)
+    for level in (-0.1, 0.1):
+        drawer = scene.add_link(mass=0.4, inertia=wp.mat33(np.eye(3) * 0.004), lock_inertia=True)
+        joints.append(
+            scene.add_joint_prismatic(
+                parent=base,
+                child=drawer,
+                axis=newton.Axis.X,
+                parent_xform=wp.transform(wp.vec3(-0.15, 0.0, level), wp.quat_identity()),
+                target_ke=20.0,
+                target_kd=2.0,
+                limit_lower=-0.3,
+                limit_upper=0.0,
+            )
+        )
+        scene.add_shape_box(drawer, hx=0.12, hy=0.15, hz=0.04, cfg=cfg)
+    scene.add_articulation(joints)
+
+
+def _build(
+    device, worlds=4, mimic=False, prescribed=False, shoulder=False, quadruped=False, cabinet=False, speed_limit=None
+):
     """Per world: a fixed-base three-joint arm over a free box resting on the ground.
 
     With ``mimic`` the third arm joint follows the second through a mimic row,
     as a gripper finger follows its leader. With ``prescribed`` a kinematic
     free body (a moving tray) sits beside the box, as a goal marker or
     conveyor does in manipulation scenes. With ``quadruped`` a free-root
-    18-coordinate walker stands beside them.
+    18-coordinate walker stands beside them. With ``cabinet`` a fixed
+    two-drawer cabinet (independent prismatic coordinates: the solver's
+    diagonal-mass response class) replaces the box. ``speed_limit`` bounds
+    every arm joint's velocity (the hand recipes' joint velocity limits).
     """
     scene = newton.ModelBuilder()
     cfg = scene.default_shape_cfg.copy()
@@ -107,6 +139,7 @@ def _build(device, worlds=4, mimic=False, prescribed=False, shoulder=False, quad
                     target_kd=2.0,
                     limit_lower=-1.5,
                     limit_upper=1.5,
+                    velocity_limit=speed_limit,
                 )
             )
         parent = body
@@ -114,8 +147,11 @@ def _build(device, worlds=4, mimic=False, prescribed=False, shoulder=False, quad
     scene.add_articulation(joints)
     if mimic:
         scene.add_constraint_mimic(joint0=joints[3], joint1=joints[2], coef0=0.0, coef1=1.0)
-    box = scene.add_body(xform=wp.transform(wp.vec3(0.15, 0.05, 0.06), wp.quat_identity()), mass=0.5)
-    scene.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+    if cabinet:
+        _add_cabinet(scene, cfg)
+    else:
+        box = scene.add_body(xform=wp.transform(wp.vec3(0.15, 0.05, 0.06), wp.quat_identity()), mass=0.5)
+        scene.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
     if prescribed:
         tray = scene.add_body(xform=wp.transform(wp.vec3(-0.4, 0.0, 0.03), wp.quat_identity()), is_kinematic=True)
         scene.add_shape_box(tray, hx=0.08, hy=0.08, hz=0.03, cfg=cfg)
@@ -177,6 +213,9 @@ def _rollout(model, *, owner, steps=120, swing_joint=0, pgs_mode="matrix_free", 
     qd_start = model.joint_qd_start.numpy()
     for joint in np.flatnonzero(types == int(newton.JointType.REVOLUTE))[swing_joint::3]:
         qd[qd_start[joint]] = 1.5
+    # Drawers (the cabinet scene) start sliding out.
+    for joint in np.flatnonzero(types == int(newton.JointType.PRISMATIC)):
+        qd[qd_start[joint]] = -0.4
     # Prescribed trays glide along +x at a constant speed.
     # The solver holds a kinematic joint's coordinates, so the tray pose is
     # advanced externally each step (as Isaac Lab writes kinematic targets)
@@ -319,6 +358,49 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         np.testing.assert_allclose(cached_qd, plain_qd, atol=3.0e-3, rtol=0.0)
         final = cached[-1].reshape(model.world_count, -1, 7)
         self.assertTrue(np.all(final[:, 0, 2] > 0.2))
+
+    def test_forest_group_carries_a_diagonal_family(self):
+        """A world of an arm and a two-drawer cabinet (Franka cabinet's class) is one forest group with a diagonal family."""
+        model = _build(wp.get_device("cuda:0"), cabinet=True)
+        plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False)
+        self.assertIsNone(plain_owner)
+        self.assertEqual(plain_solver._compact_diagonal_mass_size, 2)
+        _rollout.forest = True
+        try:
+            _owner_solver, owner, cached, cached_qd = _rollout(model, owner=True)
+        finally:
+            _rollout.forest = False
+        self.assertIsInstance(owner, MixedTreeKineticState)
+        self.assertEqual(len(owner.groups), 1)
+        layout = owner.groups[0].layout
+        self.assertEqual(layout.roots, (0, 4))
+        self.assertEqual(layout.root_families, (3, -2))
+        self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
+        np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
+        # The drawers slid out before their drives pulled them back to the closed limit.
+        q = _owner_solver.joint_q_trajectory.reshape(len(cached), model.world_count, -1)
+        self.assertLess(float(q[:, :, 3:5].min()), -0.02)
+        self.assertLessEqual(float(q[-1, :, 3:5].max()), 1.0e-3)
+
+    def test_joint_velocity_limits_are_owned(self):
+        """Joint velocity limits (the hand recipes) are ordinary rows over the owner's motion velocities."""
+        model = _build(wp.get_device("cuda:0"), speed_limit=0.8)
+        recipe = {"enable_joint_velocity_limits": True}
+        plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False, attrs=recipe)
+        self.assertIsNone(plain_owner)
+        self.assertTrue(plain_solver.enable_joint_velocity_limits)
+        owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, attrs=recipe)
+        self.assertIsInstance(owner, MixedTreeKineticState)
+        self.assertFalse(owner.copy_reuse)
+        self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
+        np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
+        # The swung joint started at 1.5 rad/s and was held under its 0.8 rad/s limit.
+        q = owner_solver.joint_q_trajectory.reshape(len(cached), model.world_count, -1)
+        self.assertLess(float(np.abs(np.diff(q[:, :, 0], axis=0)).max()) / DT, 1.0)
 
     def test_mimic_rows_compose_with_the_mixed_owner(self):
         """Mimic rows are ordinary matrix-free rows over the held factors: the owner admits them and tracks the plain route."""

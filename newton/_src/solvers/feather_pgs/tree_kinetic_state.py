@@ -576,11 +576,13 @@ def get_helpers(layout: TreeLayout = REFERENCE_LAYOUT, chain_scan: bool = False,
     from . import kernels  # noqa: PLC0415
 
     store = "_store_terms(address, local, mass, radius, inertia_com, wrench, refresh)"
-    if (layout.bodies == 1 and layout.root_dofs == 6) or layout.free_roots > 0:
-        # A root-only free body is a free rigid body (in a forest, every free
-        # root is one): the matrix-free contact path reads its spatial inertia
+    if (layout.bodies == 1 and layout.root_dofs == 6) or (layout.forest and layout.free_roots > 0):
+        # A root-only free body is a free rigid body (in a forest, a free root
+        # may be one): the matrix-free contact path reads its spatial inertia
         # and bias wrench every substep, so publish them through the ordinary
-        # free-rigid finalization; the runtime free-rigid test skips tree bodies.
+        # free-rigid finalization; the runtime free-rigid test skips tree
+        # bodies. A single free-root tree of several bodies never takes this
+        # branch (it cost Cassie flat and Humanoid 3-4% in the finish kernel).
         store += """
 if data.is_free_rigid[data.body_to_articulation[body]] != 0:
     data.body_q_com[body] = pose_com
@@ -929,6 +931,13 @@ def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFER
             if family == 0:
                 width = layout.root_coordinates[r]
                 stages.append(f"if(lane=={r}){{for(int k=0;k<{width};++k)s[$WHITE+{offset}+k]=0.0f;}}")
+                continue
+            if family < 0:
+                # A diagonal-mass root: the compact inverse over its slice.
+                stages.append(
+                    f"if(lane=={r}){{for(int k=0;k<{-family};++k)"
+                    f"s[$WHITE+{offset}+k]=d.inverse.data[ds+{offset}+k]*s[$SIX_BODIES+{offset}+k];}}"
+                )
                 continue
             lower = "d.lower" if r == 0 else f"d.lower{r}"
             held = response_operator.CholeskySolve(

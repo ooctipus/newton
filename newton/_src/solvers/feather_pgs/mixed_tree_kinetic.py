@@ -24,6 +24,7 @@ def _diagonal_geometry(
     dof_start: wp.array[int],
     mask: wp.array[int],
     geometry_index: wp.array[int],
+    geometry_group: wp.array[int],
     geometric: wp.array2d[float],
     armature: wp.array2d[float],
     drive_row: wp.array[int],
@@ -37,7 +38,7 @@ def _diagonal_geometry(
     if mask[art] == 0:
         return
     dof = dof_start[art] + local
-    mass = geometric[group, geometry_index[local]] + armature[group, local]
+    mass = geometric[geometry_group[group], geometry_index[local]] + armature[group, local]
     row = drive_row[dof]
     if row >= 0 and drive_k[row] > 0.0:
         mass += drive_k[row]
@@ -63,7 +64,9 @@ def supported(solver):
         and solver.articulated_contact_response == "immediate"
         and solver.drive_mode == "augmented"
         and solver.pgs_velocity_iterations == 0
-        and not solver.enable_joint_velocity_limits
+        # Joint velocity limits are ordinary rows over the owner's motion
+        # velocity binding (TreeKineticState.motion_velocity); they only
+        # exclude the copied-state shortcut.
         # Prescribed (kinematic) free bodies are owned as zero-response roots;
         # see PrescribedRootOperator. Mimic rows are ordinary matrix-free rows
         # over the held factors this owner refreshes, as they are for the
@@ -179,6 +182,7 @@ class TreeHeldOperator:
         if self.diagonal:
             self.data.inverse = solver._diagonal_inverse_mass
             self.geometry_index = wp.array(np.diag(physical_index).copy(), dtype=int, device=device)
+            self.geometry_group = wp.array(np.arange(len(group), dtype=np.int32), dtype=int, device=device)
             self.refresh_kernel = _diagonal_geometry
         else:
             self.data.lower = solver.L_by_size[size]
@@ -202,6 +206,7 @@ class TreeHeldOperator:
                     solver.articulation_dof_start,
                     solver.mass_update_mask,
                     self.geometry_index,
+                    self.geometry_group,
                     self.kinetic_state.geometric,
                     solver.R_by_size[size],
                     solver._augmented_drive_row_by_dof,
@@ -307,7 +312,10 @@ def forest_supported(solver):
             return False
     families = [0 if pres else size for size, pres in signature]
     for size in sorted({f for f in families if f}):
-        if size == solver._compact_diagonal_mass_size or solver._crba_cholesky_warp_kernels_by_size.get(size) is None:
+        if size == solver._compact_diagonal_mass_size:
+            if solver._diagonal_inverse_mass is None:
+                return False
+        elif not 1 <= size <= 32 or solver._execution_plan.use_diagonal_mass(size):
             return False
         group = solver.group_to_art[size].numpy()
         if len(group) != worlds or not np.array_equal(art_world[group], np.arange(worlds)):
@@ -337,7 +345,12 @@ class ForestHeldOperator:
         counts = np.diff([*solver.articulation_dof_start.numpy().tolist(), model.joint_dof_count])
         arts = np.stack([np.flatnonzero(art_world == w) for w in range(worlds)]).astype(np.int32)
         self.forest_arts = arts
-        self.root_families = tuple(0 if prescribed[a] else int(counts[a]) for a in arts[0])
+        # Family per root: its coordinate count for a held Cholesky factor,
+        # negated for a diagonal-mass size (compact inverse), 0 when prescribed.
+        diagonal = solver._compact_diagonal_mass_size
+        self.root_families = tuple(
+            0 if prescribed[a] else (-int(counts[a]) if counts[a] == diagonal else int(counts[a])) for a in arts[0]
+        )
         starts = model.articulation_start.numpy()
         first, end = int(starts[arts[0, 0]]), int(starts[arts[0, -1] + 1])
         ancestors = model.joint_ancestor.numpy()[first:end]
@@ -357,16 +370,36 @@ class ForestHeldOperator:
         self.data = HeldResponse()
         self.data.valid = wp.ones(worlds, dtype=int, device=device)
         self.data.status = wp.zeros(worlds, dtype=int, device=device)
-        self.data.inverse = wp.zeros(model.joint_dof_count, dtype=float, device=device)
+        self.data.inverse = (
+            solver._diagonal_inverse_mass
+            if any(f < 0 for f in self.root_families)
+            else wp.zeros(model.joint_dof_count, dtype=float, device=device)
+        )
         factor_index = np.zeros((worlds, len(self.root_families)), np.int32)
         self.families = []
         for r, family in enumerate(self.root_families):
             if family == 0:
                 continue
+            offset = self.layout.root_offsets[r]
+            if family < 0:
+                size = -family
+                group = solver.group_to_art[size].numpy()
+                block = physical_index[offset : offset + size, offset : offset + size]
+                self.families.append(
+                    (
+                        r,
+                        family,
+                        _diagonal_geometry,
+                        None,
+                        None,
+                        wp.array(np.diag(block).astype(np.int32), dtype=int, device=device),
+                        wp.array(art_world[group].astype(np.int32), dtype=int, device=device),
+                    )
+                )
+                continue
             group = solver.group_to_art[family].numpy()
             position = {int(a): g for g, a in enumerate(group)}
             factor_index[:, r] = [position[int(a)] for a in arts[:, r]]
-            offset = self.layout.root_offsets[r]
             block = physical_index[offset : offset + family, offset : offset + family]
             # The family's factor groups read this root's block of their
             # world's geometry record (one record per forest group).
@@ -391,8 +424,10 @@ class ForestHeldOperator:
                 )
             )
             setattr(self.data, "lower" if r == 0 else f"lower{r}", solver.L_by_size[family])
+        if not any(f > 0 for f in self.root_families):
+            self.data.lower = wp.zeros((1, 1, 1), dtype=float, device=device)
         for r, family in enumerate(self.root_families):
-            if family == 0 and r > 0:
+            if family <= 0 and r > 0:
                 setattr(self.data, f"lower{r}", self.data.lower)
         self.data.factor_index = wp.array(factor_index, dtype=int, device=device)
         self.kinetic_state = None
@@ -401,6 +436,27 @@ class ForestHeldOperator:
         """Refresh every root family's dense factor from the forest geometry."""
         solver = self.solver
         for _r, family, kernel, offsets, schedule, geometry_index, geometry_group in self.families:
+            if family < 0:
+                size = -family
+                wp.launch(
+                    kernel,
+                    dim=solver.n_arts_by_size[size] * size,
+                    inputs=[
+                        solver.group_to_art[size],
+                        solver.articulation_dof_start,
+                        solver.mass_update_mask,
+                        geometry_index,
+                        geometry_group,
+                        self.kinetic_state.geometric,
+                        solver.R_by_size[size],
+                        solver._augmented_drive_row_by_dof,
+                        solver.aug_row_K,
+                        size,
+                    ],
+                    outputs=[solver._diagonal_inverse_mass],
+                    device=solver.model.device,
+                )
+                continue
             wp.launch(
                 kernel,
                 dim=solver.n_arts_by_size[family] * 32,
@@ -431,7 +487,7 @@ class ForestHeldOperator:
     def bind_response(self):
         """Rebind the solver's held factors before a launch or capture."""
         for r, family in enumerate(self.root_families):
-            if family:
+            if family > 0:
                 setattr(self.data, "lower" if r == 0 else f"lower{r}", self.solver.L_by_size[family])
 
 
@@ -459,7 +515,7 @@ class MixedTreeKineticState:
                 complete=False,
                 response="diagonal" if operator.diagonal else "cholesky",
                 # Copied-state reuse requires fixed scalar coordinates.
-                copy_reuse=not operator.free_root,
+                copy_reuse=not operator.free_root and not solver.enable_joint_velocity_limits,
             )
             operator.kinetic_state = group
             self.groups.append(group)
