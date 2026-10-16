@@ -85,7 +85,7 @@ def _kinematic_free_joints(model):
     return model.joint_q_start.numpy()[joints], model.joint_qd_start.numpy()[joints]
 
 
-def _rollout(model, *, owner, steps=120, swing_joint=0):
+def _rollout(model, *, owner, steps=120, swing_joint=0, pgs_mode="matrix_free"):
     env = {
         "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": str(int(owner)),
         "FEATHER_PGS_FRANKA_KINETIC_STATE": "0",
@@ -96,7 +96,7 @@ def _rollout(model, *, owner, steps=120, swing_joint=0):
     with patch.dict(os.environ, env):
         solver = SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
+            pgs_mode=pgs_mode,
             pgs_iterations=8,
             enable_joint_limits=True,
             update_mass_matrix_interval=2,
@@ -167,6 +167,21 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         self.assertTrue(np.all(final[:, 4, 2] > 0.04))
         self.assertTrue(np.all(final[:, 1, 2] > 0.2))
         self.assertEqual(int(owner.groups[0].status.numpy().sum()), 0)
+
+    def test_split_mode_is_owned_and_matches_the_ordinary_route(self):
+        """Split-mode scenes (Cartpole's class) get the same owner: it refreshes the held factors the split rows use."""
+        model = _build(wp.get_device("cuda:0"))
+        plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False, pgs_mode="split")
+        self.assertIsNone(plain_owner)
+        self.assertEqual(plain_solver.pgs_mode, "split")
+        _owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, pgs_mode="split")
+        self.assertIsInstance(owner, MixedTreeKineticState)
+        self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
+        np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
+        final = cached[-1].reshape(model.world_count, -1, 7)
+        self.assertTrue(np.all(final[:, 4, 2] > 0.04))
 
     def test_mimic_rows_compose_with_the_mixed_owner(self):
         """Mimic rows are ordinary matrix-free rows over the held factors: the owner admits them and tracks the plain route."""

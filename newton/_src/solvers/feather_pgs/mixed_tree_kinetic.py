@@ -51,7 +51,13 @@ def supported(solver):
         and len(solver.size_groups) >= 1
         and solver._sparse_mass_matrix_size is None
         and solver._point_contact_paths
-        and solver.pgs_mode == "matrix_free"
+        # Split mode composes its rows from the same held factors this owner
+        # refreshes; the sparse tree owner has served split sweeps since it
+        # existed, and the dense held owner does the same.
+        and solver.pgs_mode in ("matrix_free", "split")
+        # The factor stage returns after this owner's refresh, before the
+        # paired-response inverse would be materialized.
+        and getattr(solver, "_paired_response_primary_size", None) is None
         and solver.articulated_contact_response == "immediate"
         and solver.drive_mode == "augmented"
         and solver.pgs_velocity_iterations == 0
