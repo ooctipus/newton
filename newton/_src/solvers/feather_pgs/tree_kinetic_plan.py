@@ -19,23 +19,16 @@ def cooperative_block_dim(layout, chain_plan=None):
     return 32
 
 
-_MIN_BLOCKS = 8192
-
-
 def lanes_for(bodies, groups, device):
-    """Threads per tree, so small trees share a 32-thread block.
+    """Threads per tree: the smallest power of two covering the bodies, so small
+    trees share a block (``FEATHER_PGS_TREE_LANE_PACK=0`` keeps one tree per block).
 
-    The lane count is the smallest power of two covering the bodies (at least
-    four), but the pack is also bounded so that at least ``_MIN_BLOCKS`` blocks
-    remain: these kernels are latency-bound, and eight one-body trees per
-    block left 2048 blocks on a 16k-world scene, slower than two per block.
-    The group count must divide into whole blocks; the pack halves until it
-    does. ``FEATHER_PGS_TREE_LANE_PACK=0`` keeps one tree per block.
+    The group count must divide into whole blocks; the pack halves until it does.
     """
     if bodies > 32 or not device.is_cuda or os.environ.get("FEATHER_PGS_TREE_LANE_PACK", "1") != "1":
         return 0
     lanes = max(4, 1 << (bodies - 1).bit_length())
-    while lanes < 32 and (groups % (32 // lanes) or groups // (32 // lanes) < _MIN_BLOCKS):
+    while lanes < 32 and groups % (32 // lanes):
         lanes *= 2
     return lanes
 
