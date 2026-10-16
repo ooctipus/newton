@@ -138,12 +138,8 @@ for local in range(lane, $BODIES, stride):
 """
 
 
-def make_state_kernel(name, signature, operands, stages, namespace, *, finish, launch_bounds=None):
-    """Compile one complete repair/finish with the owner's existing launch ABI.
-
-    ``launch_bounds`` is the CUDA ``(threads per block, minimum blocks per SM)``
-    pair; it caps the kernel's registers at ``65536 / (threads * blocks)``.
-    """
+def make_state_kernel(name, signature, operands, stages, namespace, *, finish):
+    """Compile one complete repair/finish with the owner's existing launch ABI."""
     values = {
         "BODIES": operands.bodies,
         "DOFS": operands.dofs,
@@ -174,8 +170,7 @@ def make_state_kernel(name, signature, operands, stages, namespace, *, finish, l
     )
     function = _compile(source, bindings, "state")["kinetic_state"]
     function.__name__ = function.__qualname__ = name
-    options = {} if launch_bounds is None else {"launch_bounds": tuple(launch_bounds)}
-    return wp.kernel(module="unique", enable_backward=False, **options)(function)
+    return wp.kernel(module="unique", enable_backward=False)(function)
 
 
 _BODY_TERMS = """

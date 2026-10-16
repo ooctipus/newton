@@ -5,7 +5,6 @@
 """Generated current/next tree moments, bias and fused state publication."""
 
 import functools
-import os
 from textwrap import indent
 from types import SimpleNamespace
 
@@ -850,10 +849,6 @@ if lane == 0:
     if motion_velocity:
         name += "_motion"
         signature += ", motion_qd: wp.array[float]"
-    # Opt-in register cap for the state kernels (an occupancy experiment): the
-    # cap is expressed through CUDA launch bounds at the layout's block size.
-    cap = int(os.environ.get("FEATHER_PGS_STATE_MAX_REGISTERS", "0") or 0)
-    bounds = (layout.block, max(1, 65536 // (layout.block * cap))) if cap > 0 and not chain_scan else None
     return make_state_kernel(
         name,
         signature,
@@ -861,7 +856,6 @@ if lane == 0:
         stages,
         dict(globals(), **locals()),
         finish=finish,
-        launch_bounds=bounds,
     )
 
 
