@@ -48,7 +48,7 @@ def supported(solver):
         solver.model.device.is_cuda
         and not solver.model.requires_grad
         and not solver.model.particle_count
-        and len(solver.size_groups) > 1
+        and len(solver.size_groups) >= 1
         and solver._sparse_mass_matrix_size is None
         and solver._point_contact_paths
         and solver.pgs_mode == "matrix_free"
@@ -97,8 +97,8 @@ def _coverage(solver):
     """Prove complete disjoint articulation and physical coordinate ownership."""
     model = solver.model
     prescribed = _prescribed_articulations(solver)
-    if len(solver.size_groups) + (1 if prescribed.size else 0) < 2 or model.joint_count != model.body_count:
-        raise ValueError("Mixed tree cache requires multiple complete factor groups")
+    if not solver.size_groups or model.joint_count != model.body_count:
+        raise ValueError("Mixed tree cache requires complete factor groups")
     arts = np.concatenate([solver.group_to_art[size].numpy() for size in solver.size_groups] + [prescribed])
     if not np.array_equal(np.sort(arts), np.arange(model.articulation_count)):
         raise ValueError("Mixed tree factors must cover every articulation exactly once")

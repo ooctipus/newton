@@ -141,8 +141,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(solver.get_path_selection()["cached_dynamics"], "off")
 
     @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
-    def test_cached_dynamics_mixed_layout_is_opt_in_and_unsupported_roots_reject(self):
-        """A fixed arm with a free body is cached only on request; a revolute world root is rejected."""
+    def test_cached_dynamics_generic_tree_is_default_and_unsupported_roots_reject(self):
+        """A fixed arm with a free body is cached by the generic tree owner by default; a revolute world root is rejected."""
         world = newton.ModelBuilder()
         joints = []
         parent = -1
@@ -161,11 +161,12 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         builder.replicate(world, 2)
         model = builder.finalize(device="cuda:0")
         solver = _make_solver(model, False, cached_dynamics="auto", friction_anchor_beta=0.0)
-        self.assertEqual(solver.get_path_selection()["cached_dynamics"], "off")
-        # The generic mixed-tree owner now covers fixed arms with free rigid bodies on request.
-        solver = _make_solver(model, False, cached_dynamics="on", friction_anchor_beta=0.0)
         self.assertEqual(solver.get_path_selection()["cached_dynamics"], "on")
         self.assertEqual(solver.get_path_selection()["cached_prediction"], "tree")
+        # FEATHER_PGS_MIXED_TREE_KINETIC_STATE=0 retains ordinary dynamics.
+        with patch.dict(os.environ, {"FEATHER_PGS_MIXED_TREE_KINETIC_STATE": "0"}):
+            solver = _make_solver(model, False, cached_dynamics="auto", friction_anchor_beta=0.0)
+        self.assertEqual(solver.get_path_selection()["cached_dynamics"], "off")
         # Cached trees require a fixed or free root; a revolute joint at the world is rejected.
         world = newton.ModelBuilder()
         joints, parent = [], -1

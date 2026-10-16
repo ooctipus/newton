@@ -84,9 +84,15 @@ def install(solver, *, factor_warps: int) -> None:
                 size=solver._franka_kinetic_state.layout.primary_dofs,
             )
 
-    # Mixed held factors have physical coverage but no established performance
-    # benefit. Retain explicit admission until their cost ranking justifies auto.
-    if solver._tree_kinetic_state is None and enabled("MIXED_TREE_KINETIC_STATE", default=False):
+    # The generic held-tree owner serves dense-route scenes no other owner
+    # takes (measured: Franka cabinet -4.8%). Where the Franka held owner is
+    # admitted it stays first: its per-world forest is still faster on its
+    # scene (4.74 vs 5.42 ms) until the generic owner has that layout.
+    if (
+        solver._tree_kinetic_state is None
+        and solver._franka_kinetic_state is None
+        and enabled("MIXED_TREE_KINETIC_STATE")
+    ):
         from .mixed_tree_kinetic import create_owner  # noqa: PLC0415
 
         solver._tree_kinetic_state = create_owner(solver)
