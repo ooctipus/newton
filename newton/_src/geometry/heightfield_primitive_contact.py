@@ -608,7 +608,15 @@ def create_cylinder_prism_contacts(writer_func: Any, query_filter: Any = None):
     return cylinder_prism_contacts
 
 
-_Polygon = wp.types.matrix(shape=(8, 3), dtype=wp.float32)
+_Polygon = wp.types.matrix(shape=(8, 4), dtype=wp.float32)
+"""Up to eight points; columns 0-2 are xyz, column 3 is 1.0 when this cell owns the point.
+
+A point produced on a footprint edge lies on the neighbouring cell's edge
+too. Half-open ownership (the cell whose outward edge normal points towards
++x, or +y on a vertical edge, owns the edge) reports it once instead of
+twice, which keeps the reducer's work proportional to the touching
+polygon rather than to the number of cells it crosses.
+"""
 
 
 @wp.func
@@ -616,7 +624,9 @@ def _clip_polygon_xy(points: _Polygon, count: int, e1: wp.vec3, e2: wp.vec3) -> 
     """Sutherland-Hodgman clip of a convex polygon against the cell footprint in the xy plane.
 
     A box face has four vertices; clipping against a triangle yields at most
-    seven. Points keep their z so they stay on the box face.
+    seven. Points keep their z so they stay on the box face. Crossing points
+    carry the half-open ownership flag of the edge they lie on (column 3);
+    input vertices keep theirs.
     """
     orientation = e1[0] * e2[1] - e1[1] * e2[0]
     current = points
@@ -641,6 +651,11 @@ def _clip_polygon_xy(points: _Polygon, count: int, e1: wp.vec3, e2: wp.vec3) -> 
         if orientation < 0.0:
             nx = -nx
             ny = -ny
+        # (nx, ny) points inward; the cell owns the edge when the outward
+        # normal points towards +x (or +y on a vertical edge).
+        owned = float(0.0)
+        if nx < 0.0 or (nx == 0.0 and ny < 0.0):
+            owned = 1.0
         output = _Polygon()
         output_count = int(0)
         if current_count == 0:
@@ -659,11 +674,13 @@ def _clip_polygon_xy(points: _Polygon, count: int, e1: wp.vec3, e2: wp.vec3) -> 
                     output[output_count, 0] = crossing[0]
                     output[output_count, 1] = crossing[1]
                     output[output_count, 2] = crossing[2]
+                    output[output_count, 3] = owned
                     output_count += 1
             if inside and output_count < 8:
                 output[output_count, 0] = point[0]
                 output[output_count, 1] = point[1]
                 output[output_count, 2] = point[2]
+                output[output_count, 3] = current[i, 3]
                 output_count += 1
             previous = point
             previous_inside = inside
@@ -777,9 +794,12 @@ def create_box_prism_contacts(writer_func: Any, query_filter: Any = None):
             polygon[corner, 0] = vertex[0]
             polygon[corner, 1] = vertex[1]
             polygon[corner, 2] = vertex[2]
+            polygon[corner, 3] = 1.0
         clipped, count = _clip_polygon_xy(polygon, 4, e1, e2)
         key = sort_sub_key << 3
         for i in range(count):
+            if clipped[i, 3] == 0.0:
+                continue
             p = wp.vec3(clipped[i, 0], clipped[i, 1], clipped[i, 2])
             point_a, normal, d = _footprint_point_query(p, n)
             if d > threshold + _ADMISSION_SLACK:
@@ -920,6 +940,7 @@ def create_convex_prism_contacts(writer_func: Any, query_filter: Any = None):
             points[j, 0] = p[0]
             points[j, 1] = p[1]
             points[j, 2] = p[2]
+            points[j, 3] = 1.0
         clipped, clipped_count = _clip_polygon_xy(points, selected, e1, e2)
         # A hull resting on a vertex may project that vertex inside the
         # touching polygon, where no direction selects it; the cell over it
@@ -930,14 +951,17 @@ def create_convex_prism_contacts(writer_func: Any, query_filter: Any = None):
             if _xy_inside_triangle(p, e1, e2):
                 clipped_count = wp.min(clipped_count, 7)
                 for i in range(clipped_count, 0, -1):
-                    for k in range(3):
+                    for k in range(4):
                         clipped[i, k] = clipped[i - 1, k]
                 clipped[0, 0] = p[0]
                 clipped[0, 1] = p[1]
                 clipped[0, 2] = p[2]
+                clipped[0, 3] = 1.0
                 clipped_count += 1
         key = sort_sub_key << 3
         for i in range(clipped_count):
+            if clipped[i, 3] == 0.0:
+                continue
             p = wp.vec3(clipped[i, 0], clipped[i, 1], clipped[i, 2])
             point_a, normal, d = _footprint_point_query(p, n)
             if d > threshold + _ADMISSION_SLACK:
