@@ -141,6 +141,13 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(solver.get_path_selection()["cached_dynamics"], "off")
 
     @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
+    def test_g1_compatibility_module_keeps_its_private_names(self):
+        """The packed G1 owner imports retained private tree-state names; a missing one breaks every G1 scene at setup."""
+        from newton._src.solvers.feather_pgs import g1_kinetic_state  # noqa: PLC0415
+
+        for name in ("_lanes", "_sync", "_storage", "get_helpers", "get_state_kernel", "get_predictor_kernel"):
+            self.assertTrue(hasattr(g1_kinetic_state, name), name)
+
     def test_cached_dynamics_generic_tree_is_default_and_unsupported_roots_reject(self):
         """A fixed arm with a free body is cached by the generic tree owner by default; a revolute world root is rejected."""
         world = newton.ModelBuilder()

@@ -141,6 +141,11 @@ def _thread_helpers(layout):
     return _lanes, _sync, _sub, _different_motion
 
 
+# Unpacked (one tree per block) helpers under their former module-level names;
+# the G1 compatibility module re-exports them.
+_lanes, _sync, _sub, _different_motion = _thread_helpers(G1_LAYOUT)
+
+
 @wp.func_native(r"""
 #if !defined(__CUDA_ARCH__)
     free(reinterpret_cast<void*>(address));
