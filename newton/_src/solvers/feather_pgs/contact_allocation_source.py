@@ -78,6 +78,19 @@ _PHI = r"""    # Compute phi (same logic as populate_world_J_for_size)
 """
 
 
+_RESOLVED = r"""            shape_a = contact_shape0[c]
+            shape_b = contact_shape1[c]
+            body_a = shape_body[shape_a] if shape_a >= 0 else -1
+            body_b = shape_body[shape_b] if shape_b >= 0 else -1
+            art_a = body_to_articulation[body_a] if body_a >= 0 else -1
+            art_b = body_to_articulation[body_b] if body_b >= 0 else -1
+            world_a = art_to_world[art_a] if art_a >= 0 else -1
+            world_b = art_to_world[art_b] if art_b >= 0 else -1
+            world = world_a if world_a >= 0 else world_b
+            same_world = world_a < 0 or world_b < 0 or world_a == world_b
+"""
+
+
 _HELPER = r'''@wp.func
 def ${helper_name}(
     c: int,
@@ -307,6 +320,7 @@ def ${kernel_name}(
     contact_friction_articulation_pairs_only: int,
     row_capacity_telemetry: int,
     friction_patches: FrictionPatches,
+    resolved_worlds: wp.array[int],
     # outputs
     contact_world: wp.array[int],
     contact_slot: wp.array[int],
@@ -353,6 +367,17 @@ ${extra}):
         return
 
     for c in range(thread, total_contacts, total_num_threads):
+        if resolved_worlds.shape[0] > 0:
+${resolved}            if same_world and world >= 0 and world < resolved_worlds.shape[0] and resolved_worlds[world] != 0:
+                # Refresh every active mapping each solve. The original force
+                # converter publishes zero before reading any row for this path.
+                contact_world[c] = world
+                contact_art_a[c] = art_a
+                contact_art_b[c] = art_b
+                contact_slot[c] = -1
+                contact_path[c] = -1
+                contact_slots_needed[c] = 0
+                continue
         ${helper_name}(
             c,
             total_contacts,
@@ -412,7 +437,7 @@ def get_source():
     """Build the contact routing, row admission and reservation kernel."""
     checked_definitions(
         "contact_allocation_source.py",
-        ("_BODIES", "_WORLD", "_PHI", "_HELPER", "_KERNEL", "get_source", "bind"),
+        ("_BODIES", "_WORLD", "_PHI", "_RESOLVED", "_HELPER", "_KERNEL", "get_source", "bind"),
     )
     helper_name = "_allocate_world_contact_slot"
     helper = Template(_HELPER).substitute(helper_name=helper_name, extra="", bodies=_BODIES, world=_WORLD, phi=_PHI)
@@ -422,6 +447,7 @@ def get_source():
         helper_name=helper_name,
         extra="",
         overflow="total_contacts > capacity",
+        resolved=_RESOLVED,
         extra_call="",
         stage="",
     )
