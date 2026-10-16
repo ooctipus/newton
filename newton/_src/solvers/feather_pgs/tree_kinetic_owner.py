@@ -13,7 +13,7 @@ import warp as wp
 from ...sim import ModelFlags
 from . import cached_state_binding, world_scan_owner
 from .device_proof import DeviceProof, fingerprint
-from .tree_kinetic_plan import cooperative_block_dim, make_plan
+from .tree_kinetic_plan import cooperative_block_dim, lane_candidates, make_plan
 
 _NUMERIC_FLAGS = int(
     ModelFlags.JOINT_DOF_PROPERTIES
@@ -109,10 +109,9 @@ class TreeKineticState:
         if chain_host is not None and self.layout.pack > 1:
             # Packed chain scans address threads directly; keep one tree per block.
             self.layout = dataclasses.replace(self.layout, lanes=0)
-        self.block_dim = cooperative_block_dim(self.layout, chain_host)
         if self.group_count % self.layout.pack:
             raise ValueError("Tree kinetic lane packing requires whole blocks of trees")
-        self.launch_count = self.group_count // self.layout.pack
+        self._chain_block_dim = cooperative_block_dim(self.layout, chain_host)
         if chain_host is None:
             self.plan = native.KineticPlan()
         else:
@@ -155,19 +154,12 @@ class TreeKineticState:
         self.geometric = self.data.geometric
         self.geometry_valid = self.data.geometry_valid
         self.status = self.data.status
-        body_velocity = getattr(sparse_owner, "requires_body_velocity", False)
-        self.repair_kernel = native.get_state_kernel(
-            False,
-            self.chain_scan,
-            layout=self.layout,
-            body_velocity=body_velocity,
-            motion_velocity=self.motion_velocity,
-            copy_reuse=copy_reuse,
-        )
-        self.finish_kernel = native.get_state_kernel(
-            True, self.chain_scan, layout=self.layout, body_velocity=body_velocity, copy_reuse=copy_reuse
-        )
-        self.predictor_kernel = native.get_predictor_kernel(self.chain_scan, layout=self.layout, response=response)
+        self._body_velocity = getattr(sparse_owner, "requires_body_velocity", False)
+        self._response = response
+        self.lane_timing = {}
+        self._bind_kernels()
+        if not self.chain_scan:
+            self._choose_lanes()
         self._plan_dimensions = self._dimensions()
         # Everything make_plan and the kernels bake in, proven on the device.
         self._proof = DeviceProof(
@@ -175,6 +167,72 @@ class TreeKineticState:
             + [(f"{name} mapping", self._mapping(name)) for name in _MAPPING_FIELDS],
             device,
         )
+
+    def _bind_kernels(self):
+        from . import tree_kinetic_state as native  # noqa: PLC0415
+
+        layout = self.layout
+        self.repair_kernel = native.get_state_kernel(
+            False,
+            self.chain_scan,
+            layout=layout,
+            body_velocity=self._body_velocity,
+            motion_velocity=self.motion_velocity,
+            copy_reuse=self.copy_reuse,
+        )
+        self.finish_kernel = native.get_state_kernel(
+            True, self.chain_scan, layout=layout, body_velocity=self._body_velocity, copy_reuse=self.copy_reuse
+        )
+        self.predictor_kernel = native.get_predictor_kernel(self.chain_scan, layout=layout, response=self._response)
+        self.block_dim = max(layout.block, self._chain_block_dim)
+        self.launch_count = self.group_count // layout.pack
+
+    def _choose_lanes(self):
+        """Time the candidate lane widths on this model and keep the fastest.
+
+        The finish kernel (scan, body terms, reduction, geometry, integration,
+        publication) is the owner's dominant launch and the one whose cost
+        depends on lanes per tree versus trees per block. No static rule fit
+        the measurements, so the width is chosen by running each candidate a
+        few times at construction, before any graph capture, on throwaway
+        states; the caches are then reset so the first real step repairs.
+        """
+        candidates = lane_candidates(self.layout.lanes, self.group_count)
+        if len(candidates) < 2:
+            return
+        import time  # noqa: PLC0415
+
+        model, device, solver = self.solver.model, self.solver.model.device, self.solver
+        probe_in, probe_out = model.state(), model.state()
+        data = self._publication(probe_in, solver, probe_out, 1.0 / 240.0)
+        arguments = [self.sparse.plan, self.plan, data, self.data, solver._mass_update_requested, 1]
+        base = self.layout
+        timings = {}
+        for lanes in candidates:
+            self.layout = dataclasses.replace(base, lanes=lanes)
+            self._bind_kernels()
+            best = math.inf
+            for _ in range(4):
+                wp.synchronize_device(device)
+                started = time.perf_counter()
+                wp.launch_tiled(
+                    self.finish_kernel,
+                    dim=[self.launch_count],
+                    inputs=arguments,
+                    block_dim=self.block_dim,
+                    device=device,
+                )
+                wp.synchronize_device(device)
+                best = min(best, time.perf_counter() - started)
+            timings[lanes] = best
+        self.lane_timing = timings
+        self.layout = dataclasses.replace(base, lanes=min(timings, key=timings.get))
+        self._bind_kernels()
+        # The probes wrote the caches and the solver's working arrays; make the
+        # first real step repair everything from its own state.
+        for name in ("current_valid", "geometry_valid", "status", "generation", "source_q", "source_qd"):
+            getattr(self.data, name).zero_()
+        self.data.geometry_generation.fill_(-1)
 
     def _dimensions(self):
         model = self.solver.model

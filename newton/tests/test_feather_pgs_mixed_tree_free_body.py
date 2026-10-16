@@ -210,6 +210,11 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         self.assertIsInstance(owner, MixedTreeKineticState)
         self.assertEqual(sorted(group.layout.dofs for group in owner.groups), [3, 6, 6])
         self.assertTrue(any(getattr(group.sparse, "prescribed", False) for group in owner.groups))
+        # Lane widths were timed at construction and the fastest candidate kept.
+        for group in owner.groups:
+            self.assertGreaterEqual(len(group.lane_timing), 2)
+            self.assertEqual(group.layout.lanes, min(group.lane_timing, key=group.lane_timing.get))
+            self.assertEqual(group.launch_count * group.layout.pack, group.group_count)
         self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
         np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
         np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)

@@ -21,16 +21,42 @@ def cooperative_block_dim(layout, chain_plan=None):
 
 def lanes_for(bodies, groups, device):
     """Threads per tree: the smallest power of two covering the bodies, so small
-    trees share a block (``FEATHER_PGS_TREE_LANE_PACK=0`` keeps one tree per block).
+    trees share a block. ``FEATHER_PGS_TREE_LANE_PACK``: ``1`` (default) picks
+    the width by timing the candidates at construction (see
+    ``lane_candidates``), ``0`` keeps one tree per block, an integer fixes it.
 
     The group count must divide into whole blocks; the pack halves until it does.
     """
-    if bodies > 32 or not device.is_cuda or os.environ.get("FEATHER_PGS_TREE_LANE_PACK", "1") != "1":
+    policy = os.environ.get("FEATHER_PGS_TREE_LANE_PACK", "1")
+    if bodies > 32 or not device.is_cuda or policy == "0":
         return 0
     lanes = max(4, 1 << (bodies - 1).bit_length())
+    if policy not in ("0", "1"):
+        fixed = int(policy)
+        if fixed not in (4, 8, 16, 32) or fixed < lanes:
+            raise ValueError(
+                "FEATHER_PGS_TREE_LANE_PACK must be 0, 1 or a lane width of 4, 8, 16 or 32 covering the bodies"
+            )
+        lanes = fixed
     while lanes < 32 and groups % (32 // lanes):
         lanes *= 2
     return lanes
+
+
+def lane_candidates(lanes, groups):
+    """Lane widths to time at construction: from the smallest covering width up to 32.
+
+    Measured, no static rule fits: one-body trees run fastest eight per block,
+    a 7-body tree one per block, an 11-body tree two per block.
+    """
+    if lanes == 0 or lanes >= 32 or os.environ.get("FEATHER_PGS_TREE_LANE_PACK", "1") != "1":
+        return [lanes]
+    candidates = []
+    while lanes <= 32:
+        if lanes == 32 or groups % (32 // lanes) == 0:
+            candidates.append(lanes)
+        lanes *= 2
+    return candidates
 
 
 def make_plan(model, operator, *, complete=True):
