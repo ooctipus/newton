@@ -50,7 +50,6 @@ class ResolvedWorldInput:
     max_linear_velocity: wp.array[float]
     max_angular_velocity: wp.array[float]
     max_depenetration_velocity: wp.array[float]
-    free_bodies: wp.array[int]
     dt: float
     beta: float
     speculative_scale: float
@@ -83,6 +82,8 @@ class ResolvedWorldScratch:
     checked_limits: wp.array[int]
     checked_normals: wp.array[int]
     minimum_residual: wp.array[float]
+    body_twist: wp.array[wp.spatial_vector]
+    body_valid: wp.array[int]
     global_invalid: wp.array[int]
 
 
@@ -195,44 +196,24 @@ def check_world_limits(data: ResolvedWorldInput, scratch: ResolvedWorldScratch):
 
 
 @wp.kernel(enable_backward=False)
-def check_free_bodies(data: ResolvedWorldInput, scratch: ResolvedWorldScratch):
-    """A free rigid body's predictor must sit inside its velocity caps, or its world keeps its rows."""
-    index = wp.tid()
-    body = data.free_bodies[index]
-    if body < 0 or body >= data.body_to_articulation.shape[0]:
-        wp.atomic_max(scratch.global_invalid, 0, 1)
-        return
+def build_predicted_body_twists(data: ResolvedWorldInput, scratch: ResolvedWorldScratch):
+    """Contract each body's motion axes against the predictor, never the incoming velocity."""
+    body = wp.tid()
+    scratch.body_valid[body] = 0
+    scratch.body_twist[body] = wp.spatial_vector()
     art = data.body_to_articulation[body]
-    if art < 0 or art >= data.art_to_world.shape[0]:
+    if art < 0:
+        scratch.body_valid[body] = 1
+        return
+    if art >= data.art_to_world.shape[0]:
         wp.atomic_max(scratch.global_invalid, 0, 1)
         return
     world = data.art_to_world[art]
     if world < 0 or world >= scratch.resolved.shape[0]:
         wp.atomic_max(scratch.global_invalid, 0, 1)
         return
-    if scratch.rejected[world] != 0 or data.prescribed_articulation[art] != 0:
+    if scratch.rejected[world] != 0:
         return
-    if data.body_has_response_dofs[body] == 0 or (data.body_flags[body] & 2) != 0:
-        return
-    start = data.articulation_dof_start[art]
-    count = data.articulation_response_dof_count[art]
-    valid = count == 6 and start >= 0 and start + 6 <= data.v_hat.shape[0]
-    valid = valid and body < data.max_linear_velocity.shape[0] and body < data.max_angular_velocity.shape[0]
-    if valid:
-        for k in range(6):
-            limit = data.max_linear_velocity[body]
-            if k >= 3:
-                limit = data.max_angular_velocity[body]
-            valid = valid and not wp.isnan(limit)
-            if wp.isfinite(limit) and limit > 0.0:
-                valid = valid and wp.abs(data.v_hat[start + k]) <= limit
-    if not valid:
-        wp.atomic_max(scratch.rejected, world, 1)
-
-
-@wp.func
-def _endpoint_twist(body: int, art: int, data: ResolvedWorldInput):
-    """The body's predicted twist about its articulation origin, and whether it is well formed."""
     pose = data.body_q[body]
     rotation = wp.transform_get_rotation(pose)
     valid = _finite3(wp.transform_get_translation(pose)) and _finite3(data.articulation_origin[art])
@@ -263,12 +244,25 @@ def _endpoint_twist(body: int, art: int, data: ResolvedWorldInput):
                 valid = valid and _finite6(axis) and wp.isfinite(speed)
                 twist += axis * speed
         if data.is_free_rigid[art] != 0:
-            valid = valid and count == 6
+            valid = valid and count == 6 and body < data.max_linear_velocity.shape[0]
+            valid = valid and body < data.max_angular_velocity.shape[0]
+            if valid:
+                for k in range(6):
+                    limit = data.max_linear_velocity[body]
+                    if k >= 3:
+                        limit = data.max_angular_velocity[body]
+                    valid = valid and not wp.isnan(limit)
+                    if wp.isfinite(limit) and limit > 0.0:
+                        valid = valid and wp.abs(data.v_hat[start + k]) <= limit
     elif data.articulation_response_dof_count[art] > 0 and (data.body_flags[body] & 2) != 0:
         # Partial prescribed membership needs a different source target model.
         valid = False
     valid = valid and _finite6(twist)
-    return wp.int32(valid), twist
+    if valid:
+        scratch.body_twist[body] = twist
+        scratch.body_valid[body] = 1
+    else:
+        wp.atomic_max(scratch.rejected, world, 1)
 
 
 @wp.func
@@ -278,11 +272,12 @@ def _endpoint_speed(
     mf: bool,
     lever: wp.vec3,
     normal: wp.vec3,
-    twist: wp.spatial_vector,
     data: ResolvedWorldInput,
+    scratch: ResolvedWorldScratch,
 ):
     value = float(0.0)
     if body >= 0 and art >= 0:
+        twist = scratch.body_twist[body]
         if mf and data.prescribed_articulation[art] == 0 and data.articulation_response_dof_count[art] > 0:
             start = data.articulation_dof_start[art]
             twist = wp.spatial_vector(
@@ -350,14 +345,10 @@ def _check_normal(c: int, raw: RawContacts, data: ResolvedWorldInput, scratch: R
     if scratch.rejected[world] != 0:
         return
     valid = True
-    twist_a = wp.spatial_vector()
-    twist_b = wp.spatial_vector()
-    if art_a >= 0:
-        ok_a, twist_a = _endpoint_twist(body_a, art_a, data)
-        valid = valid and ok_a != 0
-    if art_b >= 0:
-        ok_b, twist_b = _endpoint_twist(body_b, art_b, data)
-        valid = valid and ok_b != 0
+    if body_a >= 0:
+        valid = valid and scratch.body_valid[body_a] != 0
+    if body_b >= 0:
+        valid = valid and scratch.body_valid[body_b] != 0
     n = -raw.normal[c]
     valid = valid and _finite3(n) and wp.dot(n, n) > 0.0
     valid = valid and _finite3(raw.point0[c]) and _finite3(raw.point1[c])
@@ -405,8 +396,8 @@ def _check_normal(c: int, raw: RawContacts, data: ResolvedWorldInput, scratch: R
     if art_b >= 0:
         compatible_b = compatible_b or data.is_free_rigid[art_b] != 0
     mf = compatible_a and compatible_b
-    speed_a = _endpoint_speed(body_a, art_a, mf, lever_a, n, twist_a, data)
-    speed_b = _endpoint_speed(body_b, art_b, mf, lever_b, n, twist_b, data)
+    speed_a = _endpoint_speed(body_a, art_a, mf, lever_a, n, data, scratch)
+    speed_b = _endpoint_speed(body_b, art_b, mf, lever_b, n, data, scratch)
     incident = speed_a - speed_b
     bias = data.speculative_scale * phi / data.dt
     if phi < 0.0:
@@ -555,7 +546,8 @@ class ResolvedWorlds:
         for name in ("rejected", "checked_limits", "checked_normals"):
             setattr(self.scratch, name, wp.zeros(worlds, dtype=wp.int32, device=device))
         self.scratch.minimum_residual = wp.empty(worlds, dtype=wp.float32, device=device)
-        self.no_free_bodies = wp.empty(0, dtype=wp.int32, device=device)
+        self.scratch.body_twist = wp.empty(solver.model.body_count, dtype=wp.spatial_vector, device=device)
+        self.scratch.body_valid = wp.empty(solver.model.body_count, dtype=wp.int32, device=device)
         self.scratch.global_invalid = wp.zeros(1, dtype=wp.int32, device=device)
         # A model without rigid velocity or depenetration limits bounds nothing.
         self.unbounded = wp.full(solver.model.body_count, float("inf"), dtype=wp.float32, device=device)
@@ -585,8 +577,6 @@ class ResolvedWorlds:
             "articulation_origin",
         ):
             setattr(data, name, getattr(solver, name))
-        free = solver.free_rigid_body_indices
-        data.free_bodies = self.no_free_bodies if free is None else free
         data.limit_q_index = solver._joint_limit_q_index
         data.lower, data.upper, data.q = (
             solver.model.joint_limit_lower,
@@ -614,12 +604,12 @@ class ResolvedWorlds:
 
 
 def launch(data, raw, scratch, contact_capacity, device, *, enabled=1):
-    """Run the decision launches in stream order on ``device``."""
+    """Run the five decision launches in stream order on ``device``."""
     worlds = scratch.resolved.shape[0]
+    bodies = scratch.body_valid.shape[0]
     wp.launch(reset_world_decisions, dim=worlds, inputs=[enabled, data, scratch], device=device)
     wp.launch(check_world_limits, dim=(worlds, LANES), inputs=[data, scratch], device=device)
-    if data.free_bodies.shape[0] > 0:
-        wp.launch(check_free_bodies, dim=data.free_bodies.shape[0], inputs=[data, scratch], device=device)
+    wp.launch(build_predicted_body_twists, dim=bodies, inputs=[data, scratch], device=device)
     threads = max(1, min(int(contact_capacity), 65536))
     wp.launch(check_raw_contact_normals, dim=threads, inputs=[threads, raw, data, scratch], device=device)
     wp.launch(finalize_resolved_worlds, dim=worlds, inputs=[scratch], device=device)
