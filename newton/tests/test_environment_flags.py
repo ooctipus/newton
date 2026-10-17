@@ -127,7 +127,9 @@ def _names(node, parents, tree):
     """Return the variable names an expression spells, or None when it spells a name that cannot be listed.
 
     A literal name and a name built from a literal prefix and a listable suffix count;
-    so does a variable that keys an environment read and holds listable names.
+    so does a variable that keys an environment read and holds listable names. Any
+    other key of an environment read (a format call, a join, a case transform or a
+    variable whose values cannot be listed) cannot be checked and is refused.
     """
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         parent = parents.get(node)
@@ -147,9 +149,10 @@ def _names(node, parents, tree):
     elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add) and _head(node.left):
         head, suffix = node.left.value, node.right
     elif isinstance(node, ast.Name) and _reads_environment(node, parents):
-        return [value for value in _values(node, parents, tree) or () if _NAME.fullmatch(value)]
+        values = _values(node, parents, tree)
+        return None if values is None else [value for value in values if _NAME.fullmatch(value)]
     if head is None:
-        return []
+        return None if _reads_environment(node, parents) else []
     values = _values(suffix, parents, tree) if isinstance(suffix, ast.Name) else None
     return None if values is None else [head + value for value in values]
 
@@ -295,7 +298,20 @@ class TestEnvironmentFlagRegistry(unittest.TestCase):
             },
         )
         self.assertEqual({name for name, _ in cited}, {"NEWTON_LOOPED", "NEWTON_WRITTEN", "NEWTON_CITED"})
-        for source in ('f"FEATHER_PGS_{name()}"', '"NEWTON_" + name.upper()', 'PREFIX = "FEATHER_PGS_"'):
+        for source in (
+            'f"FEATHER_PGS_{name()}"',
+            '"NEWTON_" + name.upper()',
+            'PREFIX = "FEATHER_PGS_"',
+            # Environment reads keyed by an expression the scan cannot list.
+            'import os\nos.environ.get("FEATHER_PGS_{}".format(option))',
+            'import os\nos.environ.get("FEATHER_PGS_%s" % option)',
+            'import os\nos.environ.get("_".join(("FEATHER", "PGS", option)))',
+            'import os\nos.getenv(f"feather_pgs_{option}".upper())',
+            'import os\nos.environ.get("FEATHER_PGS" + "_" + option)',
+            'import os\nvalue = os.environ["_".join(("NEWTON", option))]',
+            'import os\npresent = "_".join(("NEWTON", option)) in os.environ',
+            "import os\nkey = make_key()\nos.environ.get(key)",
+        ):
             with self.subTest(source=source):
                 self.assertEqual(len(_scan_source(source, "example")[2]), 1)
 
