@@ -619,6 +619,20 @@ class TestPatchSortKeys(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, r"at most 2\*\*31 - 3 bodies and shapes"):
                     friction_patches._pair_key_layout(bodies, shapes)
 
+    def test_build_rejects_another_model(self):
+        """Refuse body poses or shapes of another model than the one the pair keys were sized for."""
+        scene = _Scene("cpu", 0)
+        patches = _FrictionPatchState(scene.model, 96, True, wp.zeros(96, dtype=wp.vec2, device="cpu"))
+        scene.frame()
+        fewer_bodies = SimpleNamespace(body_q=wp.array(scene.poses[:-1], dtype=wp.transform, device="cpu"))
+        more_shapes = SimpleNamespace(
+            **{**vars(scene.model), "shape_body": wp.zeros(len(scene.shape_body) + 1, dtype=int, device="cpu")}
+        )
+        for model, state in ((scene.model, fewer_bodies), (more_shapes, scene.state)):
+            with self.assertRaisesRegex(ValueError, "sized for another model"):
+                patches.build(model, state, scene.contacts)
+        patches.build(scene.model, scene.state, scene.contacts)
+
     def test_shapeless_pair_ties_the_sentinel_bits(self):
         """Keep a pair whose key equals the sentinel's sorted bits ahead of the empty slots."""
         scene = _Scene("cpu", 5, worlds=1, bodies=4, contacts=16)
@@ -813,6 +827,10 @@ class TestPatchLiveSort(unittest.TestCase):
         with mock.patch.object(friction_patches, "_LIVE_SORT_CAPACITY", 96):
             self.assertTrue(_FrictionPatchState(scene.model, 96, True, phi).live_sort)
             self.assertFalse(_FrictionPatchState(scene.model, 95, True, phi[:95]).live_sort)
+            # Pair keys of 52 bits and more fall back to the radix sort: their 11-bit
+            # slot would reach the chunk keys' pad bit.
+            self.assertTrue(friction_patches._uses_live_sort(96, 51))
+            self.assertFalse(friction_patches._uses_live_sort(96, 52))
 
     def test_live_sort_builds_match_the_full_capacity_reference(self):
         """Build, link, seed, finish and store bitwise as the reference with the live sort."""

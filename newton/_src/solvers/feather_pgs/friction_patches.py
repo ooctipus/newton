@@ -992,6 +992,15 @@ def _pair_key_layout(bodies, shapes):
     return stride, (stride * stride - 1).bit_length()
 
 
+def _uses_live_sort(capacity, key_bits):
+    """Whether the pair sort orders only the live slots instead of the whole capacity.
+
+    It does from _LIVE_SORT_CAPACITY on, unless a chunk key, the pair key with an
+    11-bit slot appended, would reach the pad bit.
+    """
+    return capacity >= _LIVE_SORT_CAPACITY and key_bits + _SORT_SLOT_BITS <= 62
+
+
 class _FrictionPatchState:
     """Own preallocated patch frames; never read device counters on the host."""
 
@@ -1032,9 +1041,7 @@ class _FrictionPatchState:
         blocks = device.sm_count if device.is_cuda else 1
         self.threads = max(1, min(capacity, _LIGHT_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
         self.build_threads = max(1, min(capacity, _BUILD_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
-        # Large capacities sort only the live slots. Chunk keys append an 11-bit
-        # slot to the pair key below the pad bit, which bounds key_bits.
-        self.live_sort = capacity >= _LIVE_SORT_CAPACITY and self.key_bits + _SORT_SLOT_BITS <= 62
+        self.live_sort = _uses_live_sort(capacity, self.key_bits)
         self.sort_blocks = max(1, min(-(-capacity // _SORT_CHUNK), _LIGHT_BLOCKS_PER_SM * blocks))
         self.merges = 0
         while _SORT_CHUNK << self.merges < capacity:
