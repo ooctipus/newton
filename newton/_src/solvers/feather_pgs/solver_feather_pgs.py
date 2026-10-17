@@ -215,7 +215,13 @@ from .kernels import (
     update_qdd_from_velocity,
     vector_add_inplace,
 )
-from .path_selection import applied_options, options_selection, route_selection
+from .path_selection import (
+    applied_options,
+    grouped_response,
+    measurement_selection,
+    options_selection,
+    route_selection,
+)
 from .response_block_sweep import (
     RB_A_SLOT,
     RB_NM,
@@ -3293,8 +3299,12 @@ class SolverFeatherPGS(SolverBase):
         ``routes`` records every construction-time owner and variant that decides
         which kernels run: the held-tree owner and its lane layouts, the contact-row
         producer, local, paired and sparse responses, the sweep kernels per route
-        and tier, resolved worlds, publication, velocity limits, free bodies and
-        the friction law, each with a reason. ``options`` records every constructor
+        and tier and what drives them, resolved worlds, publication, velocity
+        limits, free bodies, the friction law and the grouped-dynamics kernels,
+        each with a reason; a size whose response the grouped kernel solves
+        reports ``hinv_jt_kernel`` ``"grouped"``. ``measurements`` holds the
+        construction-time lane timings, kept out of ``routes`` so that two runs of
+        one configuration compare equal. ``options`` records every constructor
         option's requested, declared-default and applied value, captured once at
         construction; the applied value is the one in effect after construction's
         gates and clamps, off (``False``, ``0`` or ``"off"``) when the owner, tier
@@ -3314,6 +3324,7 @@ class SolverFeatherPGS(SolverBase):
         for size in self.size_groups:
             sparse = size == self._sparse_mass_matrix_size
             diagonal = self._execution_plan.use_diagonal_mass(size)
+            grouped = not sparse and not diagonal and grouped_response(self, size)
             kernels[size] = {
                 "cholesky_kernel": "sparse"
                 if sparse
@@ -3334,6 +3345,8 @@ class SolverFeatherPGS(SolverBase):
                 if sparse
                 else "diagonal"
                 if diagonal
+                else "grouped"
+                if grouped
                 else "tiled"
                 if self._execution_plan.use_tiled_hinv_jt(size)
                 else "par_row",
@@ -3359,6 +3372,10 @@ class SolverFeatherPGS(SolverBase):
                     reasons[name] = self._sparse_selection_reason
                 elif diagonal:
                     reasons[name] = "Independent-coordinate topology uses diagonal generalized inertia."
+            if grouped:
+                reasons["hinv_jt_kernel"] = (
+                    "Grouped dynamics replaces the planned response launch; see routes.dynamics.grouped."
+                )
             kernel_reasons[size] = {
                 name: f"{self._kernel_choice_reasons[name]} {reason}" for name, reason in reasons.items()
             }
@@ -3389,6 +3406,7 @@ class SolverFeatherPGS(SolverBase):
             },
         }
         selection["routes"] = route_selection(self)
+        selection["measurements"] = measurement_selection(self)
         selection["options"] = options_selection(self)
         selection["environment"] = copy.deepcopy(self._environment_record)
         return selection

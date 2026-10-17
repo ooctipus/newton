@@ -179,21 +179,37 @@ def route_selection(solver) -> dict:
         "velocity_limits": _velocity_limits(solver),
         "free_rigid_bodies": _free_rigid_bodies(solver),
         "friction": _friction(solver),
-        "dynamics": _dynamics(solver),
+        "dynamics": _dynamics(solver, source),
     }
+
+
+def measurement_selection(solver) -> dict:
+    """Construction-time timings, kept out of the routes so that runs of one configuration compare equal."""
+    _, groups = _held_tree_groups(solver)
+    return {
+        # Aligned with routes.held_tree.groups; empty for a group whose lane width was not timed.
+        "held_tree_lane_timing_us": [
+            {str(int(lanes)): round(float(seconds) * 1.0e6, 3) for lanes, seconds in group.lane_timing.items()}
+            for group in groups
+        ],
+    }
+
+
+def _held_tree_groups(solver) -> tuple:
+    owner = solver._tree_kinetic_state
+    if owner is None:
+        return None, []
+    if solver._packed_tree_state is owner:
+        return "packed", [owner]
+    if hasattr(owner, "groups"):
+        groups = list(owner.groups)
+        return ("forest" if any(group.layout.forest for group in groups) else "mixed"), groups
+    return "tree", [owner]
 
 
 def _held_tree(solver) -> dict:
     owner = solver._tree_kinetic_state
-    if owner is None:
-        kind, groups = None, []
-    elif solver._packed_tree_state is owner:
-        kind, groups = "packed", [owner]
-    elif hasattr(owner, "groups"):
-        groups = list(owner.groups)
-        kind = "forest" if any(group.layout.forest for group in groups) else "mixed"
-    else:
-        kind, groups = "tree", [owner]
+    kind, groups = _held_tree_groups(solver)
     return {
         "owner": kind,
         "reason": solver._cached_dynamics_selection_reason,
@@ -223,11 +239,9 @@ def _tree_group(group) -> dict:
         "copy_reuse": bool(group.copy_reuse),
         "motion_velocity": bool(group.motion_velocity),
         "publishes_twists": bool(group.publishes_twists),
-        # Several admissible widths are timed once at construction; one width is static.
+        # Several admissible widths are timed once at construction (measurements.held_tree_lane_timing_us);
+        # one width is static.
         "lane_choice": "timed" if group.lane_timing else "static",
-        "lane_timing_us": {
-            str(int(lanes)): round(float(seconds) * 1.0e6, 3) for lanes, seconds in group.lane_timing.items()
-        },
         "kernels": {
             "repair": _key(group.repair_kernel),
             "finish": _key(group.finish_kernel),
@@ -434,11 +448,28 @@ def _sweep(solver, source) -> dict:
     else:
         route = "matrix_free_gs"
         reason = "Matrix-free Gauss-Seidel; local, paired, tiered and response-block owners claim their worlds first."
-    # What drives the route's sweep each solve (mirrors _launch_matrix_free_position_solve).
-    if dense_split:
-        driver, driver_reason = "dense_split", "One dense sweep per solve."
+    # What drives the route's sweep each solve: mirrors the stage-6 branches of step(),
+    # _launch_matrix_free_position_solve and the schedule branches of _launch_matrix_free_gs_solve.
+    if dense_split and solver._has_mixed_contacts:
+        driver = "split_interleaved"
+        driver_reason = (
+            "A world holds free bodies and articulations: each iteration runs a one-iteration dense sweep, "
+            "rebuilds the velocity, runs a one-iteration matrix-free sweep and adds its velocity change to "
+            "the dense right-hand side."
+        )
+    elif dense_split and solver.pgs_debug:
+        driver = "debug_loop"
+        driver_reason = "pgs_debug launches one dense iteration per dispatch and reads the impulses back after each."
+    elif dense_split:
+        driver = "dense_split"
+        driver_reason = "One dense dispatch sweeps all iterations" + (
+            "; one matrix-free dispatch then sweeps the free-body rows." if solver._has_free_rigid_bodies else "."
+        )
     elif solver.pgs_mode != "matrix_free":
         driver, driver_reason = "direct", "The sparse split rows sweep once per solve."
+    elif solver.pgs_debug:
+        driver = "debug_loop"
+        driver_reason = "pgs_debug launches the position solve one iteration per dispatch with host reads."
     elif solver.contact_compliance:
         driver, driver_reason = (
             "contact_compliance",
@@ -451,6 +482,17 @@ def _sweep(solver, source) -> dict:
             if solver.propagation_full_fused_iterations
             else "Each iteration interleaves the route's row phases with the propagation row solve."
         )
+    elif route == "matrix_free_gs" and solver._mf_multiblock is not None:
+        driver = "multiblock"
+        driver_reason = (
+            "Each iteration launches the dense row phase, then every color (or the mass split) and the tail."
+        )
+    elif route == "matrix_free_gs" and solver.pgs_schedule == "contact_then_internal":
+        driver = "contact_then_internal"
+        driver_reason = "Contact rows sweep all iterations in one dispatch, then internal rows in a second."
+    elif route == "matrix_free_gs" and solver.pgs_schedule == "physx_grasp":
+        driver = "physx_grasp"
+        driver_reason = "Each iteration launches the drive and limit, contact and velocity-limit row phases in turn."
     else:
         driver, driver_reason = "direct", "The route sweeps all iterations in one dispatch."
     dense = None
@@ -663,7 +705,9 @@ def _friction(solver) -> dict:
     if patch:
         reason += (
             " Point-contact owners (local packets, keyed rows, compact contacts, matrix-free tiers and response"
-            " blocks, the resolved-world classifier, sparse active rows and triplets) need point friction."
+            " blocks, the resolved-world classifier, the dense-route held-tree cache, the research sparse factor,"
+            " multiblock sweeps, sparse split and velocity-limit factors, sparse active rows and triplets) need"
+            " point friction."
         )
     return {
         "law": "patch" if patch else "point",
@@ -676,9 +720,87 @@ def _friction(solver) -> dict:
     }
 
 
-def _dynamics(solver) -> dict:
+def grouped_response(solver, size) -> bool:
+    """Whether a DOF size's stage-4 response launches the grouped H^-1 J^T kernel.
+
+    Mirrors the stage-4 dispatch of ``step()`` and the early return of ``_stage4_hinv_jt_tiled``:
+    sparse, diagonal, compact, paired and fused responses own their sizes.
+    """
+    if solver._sparse_factor is not None or not solver._use_grouped_hinv_jt(size):
+        return False
+    if solver._execution_plan.use_diagonal_mass(size):
+        return False
+    if solver.pgs_mode == "matrix_free" or solver._sparse_split:
+        return not (
+            solver._compact_contact_boundary
+            or solver._sparse_mass_matrix_size is not None
+            or (solver._sparse_diagonal_contact_solve and size == solver._sparse_diagonal_response_size)
+            or size in (solver._paired_response_primary_size, solver._paired_response_secondary_size)
+        )
+    # Split mode: the fused response of one articulation per world replaces every per-size launch.
+    return not (
+        solver._is_one_solve_art_per_world
+        and bool(solver.size_groups)
+        and all(solver._execution_plan.use_fused_hinv_jt(other) for other in solver.size_groups)
+    )
+
+
+def _grouped_response_reason(solver, size, source) -> str:
+    # Follows the order of _use_grouped_hinv_jt.
+    if grouped_response(solver, size):
+        if solver._ink_skip_rows() > 0:
+            return "Grouped: the in-kernel tiers need the grouped kernel's per-world row skip."
+        return f"Grouped: sizes up to FEATHER_PGS_GROUPED_HINV_MAX={source._GROUPED_HINV_MAX} take the grouped kernel."
+    if int(size) > 32:
+        return "The grouped response solve is verified up to 32 DOFs only."
+    if solver._use_grouped_hinv_jt(size):
+        return "A sparse, diagonal, compact, paired or fused response owns this size."
+    if source._GROUPED_HINV_OFF:
+        return "FEATHER_PGS_GROUPED_HINV=0 keeps the planned response kernel."
+    if int(size) > source._GROUPED_HINV_MAX:
+        return f"Above FEATHER_PGS_GROUPED_HINV_MAX={source._GROUPED_HINV_MAX}."
+    return "Free-body sizes keep the per-row kernel; FEATHER_PGS_GROUPED_HINV_FREE=1 opts in."
+
+
+def _grouped(solver, source) -> dict | None:
+    topology = solver._grouped_topology
+    if topology is None:
+        return None
+    held = solver._tree_kinetic_state is not None
+    velocity_pass = solver.pgs_mode == "matrix_free" and solver.pgs_velocity_iterations > 0
+    # Stage-7 kinematics publication: the held-tree finish and the fused general publication bypass it.
+    publishes = solver._fk_id_cache_enabled and (velocity_pass or not (held or solver._fused_publication))
+    asynchronous = bool(solver._async_augmented_drives)
+    # _launch_rigid_tau: asynchronous drives without fused world dynamics, or drives that do not fuse tau.
+    tau = (
+        not held
+        and solver._direct_branch_tau_kernel is None
+        and (
+            (asynchronous and not solver._fused_k1)
+            or (not asynchronous and not (solver.drive_mode == "augmented" and solver.articulation_max_dofs > 0))
+        )
+    )
+    return {
+        "lanes_per_articulation": int(topology.lanes_per_articulation),
+        "articulations_per_block": int(topology.articulations_per_block),
+        # -1 when the template build failed; template kernels then stay off.
+        "template_count": int(topology.template_count),
+        "template_fk": bool(publishes and topology.template_count > 0 and not source._GROUPED_FK_OFF),
+        "tau": ("grouped_tau_mass" if solver._grouped_tau_mass else "grouped_tau") if tau else None,
+        "hinv_jt_by_dof": {
+            str(int(size)): {
+                "grouped": grouped_response(solver, size),
+                "reason": _grouped_response_reason(solver, size, source),
+            }
+            for size in solver.size_groups
+        },
+    }
+
+
+def _dynamics(solver, source) -> dict:
     return {
         "grouped_topology": solver._grouped_topology is not None,
+        "grouped": _grouped(solver, source),
         "fused_world_dynamics": bool(solver._fused_k1),
         "grouped_tau_mass": bool(solver._grouped_tau_mass),
         "grouped_mass": bool(solver._grouped_mass),

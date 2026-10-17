@@ -7,6 +7,7 @@ import inspect
 import json
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -40,6 +41,21 @@ def _cpu_free_body_model(velocity_limit=None):
     builder.add_articulation([builder.add_joint_revolute(-1, body)])
     free = builder.add_body(xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()), **limits)
     builder.add_shape_box(free, hx=0.1, hy=0.1, hz=0.1)
+    builder.add_ground_plane()
+    return builder.finalize(device="cpu")
+
+
+def _cpu_separate_worlds_model():
+    """The one-joint arm in one world and a free box resting on the ground in another: no world mixes them."""
+    builder = newton.ModelBuilder()
+    builder.begin_world()
+    body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    builder.add_articulation([builder.add_joint_revolute(-1, body)])
+    builder.end_world()
+    builder.begin_world()
+    free = builder.add_body(xform=wp.transform((0.0, 0.0, 0.09), wp.quat_identity()))
+    builder.add_shape_box(free, hx=0.1, hy=0.1, hz=0.1)
+    builder.end_world()
     builder.add_ground_plane()
     return builder.finalize(device="cpu")
 
@@ -149,10 +165,13 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
 
     def test_cpu_route_record_reports_known_selections(self):
         """Report the CPU loop sweep, the split free-body rows and the declined owners with their reasons."""
-        routes = SolverFeatherPGS(_cpu_free_body_model()).get_path_selection()["routes"]
+        selected = SolverFeatherPGS(_cpu_free_body_model()).get_path_selection()
+        routes = selected["routes"]
         self.assertEqual(routes["articulations_by_dof"], {"6": 1, "1": 1})
         self.assertEqual(routes["sweep"]["route"], "dense_loop")
-        self.assertEqual(routes["sweep"]["driver"], "dense_split")
+        # The arm and the free box share a world: split mode interleaves the dense and free-body sweeps.
+        self.assertTrue(routes["free_rigid_bodies"]["mixed_worlds"])
+        self.assertEqual(routes["sweep"]["driver"], "split_interleaved")
         self.assertEqual(routes["sweep"]["dense"], {"kernels": ["pgs_solve_loop"]})
         self.assertEqual(routes["sweep"]["free_body_matrix_free"], "pgs_solve_mf_loop")
         # Only the matrix-free step packs row metadata.
@@ -177,6 +196,41 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertIsNone(routes["sparse_mass_matrix"]["size"])
         self.assertFalse(routes["sparse_mass_matrix"]["active_rows"])
         self.assertIn("CPU", routes["sparse_mass_matrix"]["reason"])
+        self.assertIsNone(routes["dynamics"]["grouped"])
+        self.assertEqual({plan["hinv_jt_kernel"] for plan in selected["kernel_plan_by_dof"].values()}, {"par_row"})
+        self.assertEqual(selected["measurements"], {"held_tree_lane_timing_us": []})
+        separate = SolverFeatherPGS(_cpu_separate_worlds_model()).get_path_selection()["routes"]
+        self.assertFalse(separate["free_rigid_bodies"]["mixed_worlds"])
+        self.assertEqual(separate["sweep"]["driver"], "dense_split")
+        self.assertIn("free-body rows", separate["sweep"]["driver_reason"])
+        debug = SolverFeatherPGS(_cpu_model(), pgs_debug=True).get_path_selection()["routes"]
+        self.assertEqual(debug["sweep"]["driver"], "debug_loop")
+
+    def test_cpu_grouped_record_follows_the_response_dispatch(self):
+        """Label the sizes a grouped topology would serve, with their reasons, from host state alone."""
+        solver = SolverFeatherPGS(_cpu_free_body_model())
+        # A stand-in for the CUDA-only grouped topology: the record reads its layout fields only.
+        solver._grouped_topology = SimpleNamespace(
+            lanes_per_articulation=8, articulations_per_block=4, template_count=2
+        )
+        selected = solver.get_path_selection()
+        json.dumps(selected, allow_nan=False)
+        grouped = selected["routes"]["dynamics"]["grouped"]
+        self.assertEqual(
+            (grouped["lanes_per_articulation"], grouped["articulations_per_block"], grouped["template_count"]),
+            (8, 4, 2),
+        )
+        # CPU builds no FK/ID cache and no asynchronous drives, so neither template kernel is reached.
+        self.assertFalse(grouped["template_fk"])
+        self.assertIsNone(grouped["tau"])
+        by_dof = grouped["hinv_jt_by_dof"]
+        self.assertTrue(by_dof["1"]["grouped"])
+        self.assertEqual(selected["kernel_plan_by_dof"][1]["hinv_jt_kernel"], "grouped")
+        self.assertIn("routes.dynamics.grouped", selected["reasons"]["kernel_plan_by_dof"][1]["hinv_jt_kernel"])
+        # The free box's six-coordinate size keeps its planned kernel unless opted in.
+        self.assertFalse(by_dof["6"]["grouped"])
+        self.assertIn("FEATHER_PGS_GROUPED_HINV_FREE", by_dof["6"]["reason"])
+        self.assertEqual(selected["kernel_plan_by_dof"][6]["hinv_jt_kernel"], "par_row")
 
     def test_cpu_split_route_reports_free_body_velocity_limit_rows(self):
         """Report free-body velocity-limit rows in split mode, where the row builder allocates them as well."""
@@ -272,7 +326,11 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             ({"articulated_contact_response": "propagation"}, {"free_count": 2}),
             ({"articulated_contact_response": "propagation-colored"}, {"free_count": 2}),
             ({"grouped_dynamics": True}, {}),
+            ({"grouped_dynamics": True, "sparse_mass_matrix": "off", "friction_anchor_beta": 0.0}, {}),
             ({"enable_joint_velocity_limits": True}, {}),
+            # Patch friction builds no matrix-free tier, whatever the requested budget.
+            ({"sparse_mass_matrix": "off", "mf_gs_parallel_rows": 48}, {"free_count": 2}),
+            ({"sparse_mass_matrix": "off", "pgs_schedule": "physx_grasp", "friction_anchor_beta": 0.0}, {}),
         )
         built = 0
         for options, model_options in cases:
@@ -284,15 +342,34 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 built += 1
                 selected = solver.get_path_selection()
                 json.dumps(selected, allow_nan=False)
-                self.assertEqual(
-                    set(selected["options"]), set(inspect.signature(SolverFeatherPGS).parameters) - {"model"}
-                )
+                applied = {name: option["applied"] for name, option in selected["options"].items()}
+                self.assertEqual(set(applied), set(inspect.signature(SolverFeatherPGS).parameters) - {"model"})
+                routes = selected["routes"]
                 # Owners are reported only where their kernels were built.
-                owners = selected["routes"]["free_rigid_bodies"]["owners"]
+                owners = routes["free_rigid_bodies"]["owners"]
                 self.assertEqual("local_pair" in owners, bool(solver._pgs_solve_local_pair_kernels))
                 self.assertEqual("local_residual" in owners, bool(solver._pgs_solve_local_residual_kernels))
-                pack = selected["routes"]["sweep"]["mf_meta_pack"]
+                pack = routes["sweep"]["mf_meta_pack"]
                 self.assertEqual(pack is None, solver.pgs_mode != "matrix_free")
+                # Applied routing options agree with the routes they request.
+                tiers = routes["sweep"]["tiers"]
+                parallel = tiers is not None and tiers["family"] in ("parallel", "keyed_parallel")
+                self.assertEqual(applied["mf_gs_parallel_rows"], tiers["tiers"][-1]["rows"] if parallel else 0)
+                self.assertEqual(applied["grouped_dynamics"], routes["dynamics"]["grouped_topology"])
+                self.assertEqual(
+                    applied["lazy_kinematics"],
+                    selected["options"]["lazy_kinematics"]["requested"] and routes["dynamics"]["fused_world_dynamics"],
+                )
+                if options.get("pgs_schedule") == "physx_grasp" and routes["sweep"]["route"] == "matrix_free_gs":
+                    self.assertEqual(routes["sweep"]["driver"], "physx_grasp")
+                # A size whose response the grouped kernel solves is labeled so in the kernel plan.
+                grouped = routes["dynamics"]["grouped"]
+                self.assertEqual(grouped is None, solver._grouped_topology is None)
+                for size, plan in selected["kernel_plan_by_dof"].items():
+                    is_grouped = grouped is not None and grouped["hinv_jt_by_dof"][str(size)]["grouped"]
+                    self.assertEqual(plan["hinv_jt_kernel"] == "grouped", is_grouped, size)
+                if grouped is not None:
+                    self.assertEqual(grouped["lanes_per_articulation"], solver._grouped_topology.lanes_per_articulation)
         self.assertGreaterEqual(built, 8)
 
     def test_private_override_validation_and_cpu_precedence(self):
