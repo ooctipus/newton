@@ -253,7 +253,25 @@ _UNIT_PAIRS = (
 )
 
 
-def _patch_unit_rows(seed, *, worlds=3, capacity=40, prefix=2, contacts=10, diagonal=8, dense=6):
+# Serial units whose results hinge on the unit tests in the solve's skips, in row order: (ring, kind,
+# coordinates, rows, normal right-hand side, initial impulses). Every fourth unit heads a speculative batch
+# of either width (four units of eight lanes, or two of sixteen). A loaded anchor comes first; then, at
+# batch heads, an anchor whose normal and tangents are zero but whose ring mate is loaded, and an unloaded
+# anchor that carries tangent impulses: neither is a no-op. Last, a one-row unit without load precedes a
+# loaded unit, whose rows the inactive-friction skip must not pass over. Free units are separating no-ops.
+_UNIT_EDGES = (
+    (0, "coupled", (1, 3), 3, -2.0, (0.2, 0.0, 0.0)),
+    *((1, "free", (), 1, 2.0, (0.0,)),) * 3,
+    (0, "coupled", (1, 3), 3, 2.0, (0.0, 0.0, 0.0)),
+    *((2, "free", (), 1, 2.0, (0.0,)),) * 3,
+    (3, "dense", (4,), 3, 2.0, (0.0, 0.03, -0.02)),
+    *((4, "free", (), 1, 2.0, (0.0,)),) * 3,
+    (5, "free", (), 1, 2.0, (0.0,)),
+    (6, "dense", (4,), 3, -2.0, (0.0, 0.0, 0.0)),
+)
+
+
+def _patch_unit_rows(seed, *, worlds=3, capacity=40, prefix=2, contacts=10, diagonal=8, dense=6, layout=None):
     """Build sparse-diagonal rows of patch contact units with linked normal rings.
 
     Each world holds ``prefix`` dense limit rows, then contacts in a random allocation order. A contact
@@ -261,6 +279,7 @@ def _patch_unit_rows(seed, *, worlds=3, capacity=40, prefix=2, contacts=10, diag
     ring). The contacts of a body pair split into rings whose normal rows link circularly through their
     parents, as ``link_patch_rows`` leaves them. Coordinates ``[0, diagonal)`` belong to the diagonal
     articulation (index 0) and the following ``dense`` ones to the dense articulation (index 1).
+    ``layout`` replaces every world's random contacts with given units, as in :data:`_UNIT_EDGES`.
     """
     rng = np.random.default_rng(seed)
     dofs = diagonal + dense
@@ -294,54 +313,69 @@ def _patch_unit_rows(seed, *, worlds=3, capacity=40, prefix=2, contacts=10, diag
         "rings": [],
     }
     contact = {name: [] for name in ("world", "slot", "art_a", "art_b", "slots_needed")}
+
+    def add_unit(w, row, kind, coords, count):
+        """Write a unit's rows and contact, drawing its Jacobians, coefficients and right-hand sides."""
+        inverse = rows["inverse_mass"][w * dofs : (w + 1) * dofs]
+        slots = rng.permutation(2)
+        values = rng.uniform(0.3, 1.0, (count, 2)) * rng.choice((-1.0, 1.0), (count, 2))
+        for k in range(count):
+            index = row + k
+            rows["row_type"][w, index] = PGS_CONSTRAINT_TYPE_CONTACT if k == 0 else PGS_CONSTRAINT_TYPE_FRICTION
+            if k == 0:
+                # Separating normals stay unloaded, so speculative batches find no-op units.
+                rows["rhs"][w, index] = rng.uniform(-0.3, 0.0) if rng.random() < 0.5 else rng.uniform(0.0, 0.3)
+            else:
+                rows["row_parent"][w, index] = row
+                rows["row_mu"][w, index] = rng.uniform(0.2, 0.9)
+                rows["rhs"][w, index] = rng.uniform(-0.15, 0.15)
+            if kind == "dense":
+                rows["dense_J"][w, index] = rng.normal(0.0, 0.5, dense)
+            for coord, slot, value in zip(coords, slots, values[k], strict=False):
+                rows["sparse_dof"][w, index, slot] = coord
+                rows["sparse_jy"][w, index, 2 * slot : 2 * slot + 2] = (value, value * inverse[coord])
+        contact["world"].append(w)
+        contact["slot"].append(row)
+        contact["art_a"].append(-1 if kind == "free" else 0)
+        contact["art_b"].append(1 if kind == "dense" else -1)
+        contact["slots_needed"].append(count)
+
     for w in range(worlds):
         inverse = rows["inverse_mass"][w * dofs : (w + 1) * dofs]
         rows["row_type"][w, :prefix] = PGS_CONSTRAINT_TYPE_JOINT_LIMIT
         rows["dense_J"][w, :prefix] = rng.normal(0.0, 0.5, (prefix, dense))
         rows["rhs"][w, :prefix] = rng.uniform(-0.2, 0.1, prefix)
         rows["bounds"][w] = prefix
-        rings = []
-        for kind, coords in _UNIT_PAIRS:
-            members = np.arange(int(rng.integers(1, 5)))
-            cuts = rng.choice(np.arange(1, len(members)), size=int(rng.integers(0, len(members))), replace=False)
-            for ring in np.split(members, np.sort(cuts)):
-                anchors = rng.choice(len(ring), size=min(len(ring), int(rng.integers(0, 3))), replace=False)
-                rings.append([(kind, coords, 3 if k in anchors else 1) for k in range(len(ring))])
-        units = [(index, unit) for index, ring in enumerate(rings) for unit in ring]
-        heads = [[] for _ in rings]
         row = prefix
-        for position in rng.permutation(len(units))[:contacts]:
-            ring_index, (kind, coords, count) = units[position]
-            if row + count > capacity:
-                continue
-            heads[ring_index].append(row)
-            slots = rng.permutation(2)
-            values = rng.uniform(0.3, 1.0, (count, 2)) * rng.choice((-1.0, 1.0), (count, 2))
-            for k in range(count):
-                index = row + k
-                rows["row_type"][w, index] = PGS_CONSTRAINT_TYPE_CONTACT if k == 0 else PGS_CONSTRAINT_TYPE_FRICTION
-                if k == 0:
-                    # Separating normals stay unloaded, so speculative batches find no-op units.
-                    rows["rhs"][w, index] = rng.uniform(-0.3, 0.0) if rng.random() < 0.5 else rng.uniform(0.0, 0.3)
-                else:
-                    rows["row_parent"][w, index] = row
-                    rows["row_mu"][w, index] = rng.uniform(0.2, 0.9)
-                    rows["rhs"][w, index] = rng.uniform(-0.15, 0.15)
-                if kind == "dense":
-                    rows["dense_J"][w, index] = rng.normal(0.0, 0.5, dense)
-                for coord, slot, value in zip(coords, slots, values[k], strict=False):
-                    rows["sparse_dof"][w, index, slot] = coord
-                    rows["sparse_jy"][w, index, 2 * slot : 2 * slot + 2] = (value, value * inverse[coord])
-            if rng.random() < 0.4:
-                rows["impulses"][w, row] = rng.uniform(0.0, 0.2)
-                if count == 3 and rng.random() < 0.6:
-                    rows["impulses"][w, row + 1 : row + 3] = rng.uniform(-0.02, 0.02, 2)
-            contact["world"].append(w)
-            contact["slot"].append(row)
-            contact["art_a"].append(-1 if kind == "free" else 0)
-            contact["art_b"].append(1 if kind == "dense" else -1)
-            contact["slots_needed"].append(count)
-            row += count
+        if layout is None:
+            rings = []
+            for kind, coords in _UNIT_PAIRS:
+                members = np.arange(int(rng.integers(1, 5)))
+                cuts = rng.choice(np.arange(1, len(members)), size=int(rng.integers(0, len(members))), replace=False)
+                for ring in np.split(members, np.sort(cuts)):
+                    anchors = rng.choice(len(ring), size=min(len(ring), int(rng.integers(0, 3))), replace=False)
+                    rings.append([(kind, coords, 3 if k in anchors else 1) for k in range(len(ring))])
+            units = [(index, unit) for index, ring in enumerate(rings) for unit in ring]
+            heads = [[] for _ in rings]
+            for position in rng.permutation(len(units))[:contacts]:
+                ring_index, (kind, coords, count) = units[position]
+                if row + count > capacity:
+                    continue
+                heads[ring_index].append(row)
+                add_unit(w, row, kind, coords, count)
+                if rng.random() < 0.4:
+                    rows["impulses"][w, row] = rng.uniform(0.0, 0.2)
+                    if count == 3 and rng.random() < 0.6:
+                        rows["impulses"][w, row + 1 : row + 3] = rng.uniform(-0.02, 0.02, 2)
+                row += count
+        else:
+            heads = [[] for _ in range(1 + max(unit[0] for unit in layout))]
+            for ring_index, kind, coords, count, normal_rhs, impulses in layout:
+                heads[ring_index].append(row)
+                add_unit(w, row, kind, coords, count)
+                rows["rhs"][w, row] = normal_rhs
+                rows["impulses"][w, row : row + count] = impulses
+                row += count
         for members in heads:
             linked = rng.permutation(members)
             for k, head in enumerate(linked):
@@ -363,6 +397,18 @@ def _patch_unit_rows(seed, *, worlds=3, capacity=40, prefix=2, contacts=10, diag
         rows["limit_upper_rhs"][w, limited] = rng.uniform(-0.1, 0.05, 3)
     rows["contacts"] = {name: np.array(values, np.int32) for name, values in contact.items()}
     return rows
+
+
+def _patch_unit_cases():
+    """Fixtures of the CUDA unit twins, labeled ``(dense, seed, capacity)``: random layouts, then the edges.
+
+    Six dense coordinates batch four units in eight lanes; nine, as a Franka arm, batch two in sixteen.
+    """
+    for dense in (6, 9):
+        for seed, (capacity, contacts, prefix) in itertools.product(range(4), ((40, 10, 2), (32, 30, 0), (20, 40, 1))):
+            rows = _patch_unit_rows(seed, capacity=capacity, contacts=contacts, prefix=prefix, dense=dense)
+            yield (dense, seed, capacity), rows
+        yield (dense, "edges", 32), _patch_unit_rows(0, capacity=32, dense=dense, layout=_UNIT_EDGES)
 
 
 def _mark_patch_units(rows, device):
@@ -1120,9 +1166,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
     def test_independent_sparse_contact_units_keep_rings_together(self):
         """Schedule mixed one- and three-row units; every ring member carries the same independence mark."""
         device = wp.get_device("cuda:0")
-        for seed, (capacity, contacts, prefix) in itertools.product(range(4), ((40, 10, 2), (32, 30, 0), (20, 40, 1))):
-            with self.subTest(seed=seed, capacity=capacity):
-                rows = _patch_unit_rows(seed, capacity=capacity, contacts=contacts, prefix=prefix)
+        for (dense, seed, capacity), rows in _patch_unit_cases():
+            with self.subTest(dense=dense, seed=seed, capacity=capacity):
                 marked = _mark_patch_units(rows, device)
                 expected = _unit_schedule_oracle(rows, marked)
                 worlds, dofs = rows["worlds"], rows["dofs"]
@@ -1164,11 +1209,14 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "speculative contact units require CUDA")
     def test_speculative_sparse_contact_units_match_serial_loop(self):
-        """Solve mixed one- and three-row units on linked rings bitwise like the serial loop."""
+        """Solve mixed one- and three-row units on linked rings bitwise like the serial loop.
+
+        The edge layout makes the ring load, the carried tangents and the unit length decide the
+        speculative batches' no-op test and the inactive-friction skip.
+        """
         device = wp.get_device("cuda:0")
-        for seed, (capacity, contacts, prefix) in itertools.product(range(4), ((40, 10, 2), (32, 30, 0), (20, 40, 1))):
-            rows = _patch_unit_rows(seed, capacity=capacity, contacts=contacts, prefix=prefix)
-            worlds, dofs, dense = rows["worlds"], rows["dofs"], rows["dense"]
+        for (dense, seed, capacity), rows in _patch_unit_cases():
+            worlds, dofs = rows["worlds"], rows["dofs"]
             marked = _mark_patch_units(rows, device)
             schedule = _unit_schedule_oracle(rows, marked)
             serial_heads = np.zeros((worlds, capacity), np.int32)
@@ -1240,7 +1288,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 for label in ("units", "batches"):
                     for name, values in results["serial"].items():
                         with self.subTest(
-                            seed=seed, capacity=capacity, schedule=label, iterations=iterations, value=name
+                            dense=dense, seed=seed, capacity=capacity, schedule=label, iterations=iterations, value=name
                         ):
                             np.testing.assert_array_equal(results[label][name], values)
                             np.testing.assert_allclose(results[label][name], reference[name], rtol=1.0e-4, atol=2.0e-5)
