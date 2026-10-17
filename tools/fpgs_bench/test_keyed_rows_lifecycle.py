@@ -26,9 +26,13 @@ from tools.fpgs_bench.test_keyed_rows_capture import captures
 
 @contextmanager
 def mode(enabled):
-    """Bind the existing INK recipe and the new flag before construction."""
+    """Bind the existing INK recipe and the new flag before construction.
+
+    Patch friction is admitted to keyed rows and the parallel tiers explicitly,
+    so an exported ``FEATHER_PGS_PATCH_PARALLEL_ROWS=0`` cannot change the route.
+    """
     with (
-        patch.dict(os.environ, {"FEATHER_PGS_KEYED_ROWS": str(int(enabled))}),
+        patch.dict(os.environ, {"FEATHER_PGS_KEYED_ROWS": str(int(enabled)), "FEATHER_PGS_PATCH_PARALLEL_ROWS": "1"}),
         patch.object(source, "_INK_ON", True),
     ):
         yield
@@ -94,7 +98,9 @@ def saved_model(device):
 
 
 def make_solver(model, enabled, **overrides):
+    """Build the captured recipe's solver; point friction unless ``friction_anchor_beta`` is overridden."""
     options = {
+        "friction_anchor_beta": 0.0,
         "pgs_mode": "matrix_free",
         "drive_mode": "augmented",
         "friction_mode": "current",
@@ -168,6 +174,17 @@ class TestAllegroKineticLifecycleCPU(unittest.TestCase):
                 with self.subTest(unsupported=name), patch.object(admitted, name, value):
                     self.assertIsNone(rows.create_owner(admitted))
 
+    def test_solver_friction_laws(self):
+        """Build point friction unless a test asks for patch friction, which keyed rows then admit."""
+        model = saved_model("cpu")
+        options = {"pgs_mode": "split", "enable_joint_velocity_limits": False}
+        point = make_solver(model, True, **options)
+        self.assertEqual(point.friction_anchor_beta, 0.0)
+        self.assertTrue(point._point_contact_paths)
+        patch_friction = make_solver(model, True, friction_anchor_beta=0.2, **options)
+        self.assertTrue(patch_friction._friction_anchors_enabled)
+        self.assertTrue(patch_friction._parallel_contact_paths)
+
 
 class TestAllegroKineticLifecycleCUDA(unittest.TestCase):
     @classmethod
@@ -177,11 +194,33 @@ class TestAllegroKineticLifecycleCUDA(unittest.TestCase):
         cls.device = wp.get_device("cuda:0")
 
     def test_production_step_held_refresh_fallback_reset_and_graph(self):
+        """Step point keyed rows through held refresh, fallback above the tier budget, reset and graph replay."""
+        self._lifecycle()
+
+    def test_patch_step_held_refresh_fallback_reset_and_graph(self):
+        """Step the same lifecycle under patch friction through keyed rows and linked tiers.
+
+        The 45 coincident contacts form one patch ring with a single anchor: 47
+        contact rows against the point law's 135 (CPU split route). A 32-row tier
+        budget therefore sends that world to the keyed patch fallback, as the point
+        law's 128-row budget does, and keeps the 3-contact steps in the tier.
+        """
+        self._lifecycle(friction_anchor_beta=0.2, mf_gs_parallel_rows=32)
+
+    def _lifecycle(self, **overrides):
         model = saved_model(self.device)
-        original, candidate = make_solver(model, False), make_solver(model, True)
+        original, candidate = make_solver(model, False, **overrides), make_solver(model, True, **overrides)
+        budget = int(overrides.get("mf_gs_parallel_rows", 128))
+        linked = bool(candidate._friction_anchors_enabled)
+        self.assertEqual(candidate._ink_rows, budget)
         self.assertIsNone(original._keyed_rows)
         self.assertIsNotNone(candidate._keyed_rows)
         self.assertTrue(candidate._keyed_rows.keyed_rows)
+        self.assertEqual(candidate._keyed_rows.patch, linked)
+        for solver in (original, candidate):
+            keys = [kernel.key for kernel in solver._pgs_solve_mf_gs_incremental_kernels]
+            self.assertTrue(keys)
+            self.assertTrue(all(key.endswith("_linked") == linked for key in keys), keys)
         self.assertEqual(candidate._keyed_rows.data.rowkeys.shape, (1, candidate.dense_max_constraints))
         self.assertFalse(hasattr(candidate._keyed_rows.data, "coefficients"))
         self.assertFalse(hasattr(candidate._keyed_rows.data, "encoding"))
@@ -219,7 +258,7 @@ class TestAllegroKineticLifecycleCUDA(unittest.TestCase):
         for n in (6, 16):
             np.testing.assert_array_equal(candidate.L_by_size[n].numpy(), held[n])
         paired_step(45)
-        self.assertGreater(int(candidate.constraint_count.numpy()[0]), 128)
+        self.assertGreater(int(candidate.constraint_count.numpy()[0]), budget)
         for n in (6, 16):
             count = int(candidate.constraint_count.numpy()[0])
             # Original end-of-step maintenance has already cleared its J;
@@ -260,9 +299,9 @@ class TestAllegroKineticLifecycleCUDA(unittest.TestCase):
             )
             current = int(candidate.constraint_count.numpy()[0])
             if count == 45:
-                self.assertGreater(current, 128)
+                self.assertGreater(current, budget)
             else:
-                self.assertLessEqual(current, 128)
+                self.assertLessEqual(current, budget)
             np.testing.assert_array_equal(candidate._constraint_capacity_status.numpy(), np.zeros(4, dtype=np.int32))
 
 
