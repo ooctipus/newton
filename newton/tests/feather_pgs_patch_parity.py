@@ -466,8 +466,10 @@ def assert_region_impulses_close(a, b, *, load_atol, friction_atol):
     """Bound the difference of each patch region's normal load and friction vector between two routes.
 
     ``a`` and ``b`` are :func:`patch_rows` records; the bounds are spreads
-    measured against a twin whose input differs by one float32 ulp (see
-    :data:`STANDING_REGION_BOUNDS`).
+    measured between routes whose inputs differ by float32 ulps (see
+    :data:`STANDING_REGION_BOUNDS`). ``friction_atol`` None skips the friction
+    vectors, which a stance whose contact rows outnumber its degrees of freedom
+    does not determine.
     """
     if sorted(a["regions"]) != sorted(b["regions"]):
         raise AssertionError(f"Patch regions differ: {sorted(set(a['regions']) ^ set(b['regions']))}")
@@ -477,6 +479,8 @@ def assert_region_impulses_close(a, b, *, load_atol, friction_atol):
             raise AssertionError(
                 f"Region {key} normal load {first['load']} vs {second['load']} differs by more than {load_atol}"
             )
+        if friction_atol is None:
+            continue
         difference = float(np.linalg.norm(first["friction"] - second["friction"]))
         if difference > friction_atol:
             raise AssertionError(
@@ -606,24 +610,26 @@ def assert_states_close(first, second, *, velocity_atol=2.0e-3):
         )
 
 
-# The standing feet rest on their corners at zero gap, where the position correction's 1/dt gain turns
-# one float32 ulp of a foot's pose into up to 2.3e-3 of joint velocity and 2.1e-3 of momentum at 8 PGS
-# iterations (CPU one-ulp twins as below; sliding feet 1.4e-3), while poses move by 4.4e-6 at most. Their
-# states compare poses at 2e-4 and twists and momentum within this bound.
-STANDING_VELOCITY_ATOL = 5.0e-3
-# Region impulse bounds for cross-route comparisons, at least twice the spread measured on CPU between
-# the dense split route and a twin whose torso starts one float32 ulp higher, over 24 steps with masked
-# resets and over the same steps restarted each step from the reference state plus one ulp on every body
-# pose component. They are CPU measurements: re-measure on CUDA (dense against sparse split rows and the
-# ordinary against the incremental matrix-free sweep) before tightening them.
-# Standing (8 PGS iterations): region normal load 1.4e-3 and friction 2.8e-3 at most. The two-foot
-# stance has more contact rows than degrees of freedom, so float order redistributes friction between
-# the feet: only gross friction errors exceed this bound.
-STANDING_REGION_BOUNDS = {"load_atol": 3.0e-3, "friction_atol": 6.0e-3}
-# Sliding feet (SLIDING_FEET, SLIDING_ITERATIONS): load 5.6e-4 and friction 8.5e-5 at most. Every
-# anchor sits at its pooled budget, so kinetic friction fixes each region's friction at its coefficient
-# times the region's load: an anchor budget that pools only its own normal moves it by 6.5e-3.
-SLIDING_REGION_BOUNDS = {"load_atol": 1.5e-3, "friction_atol": 2.0e-4}
+# The box feet rest on their corners at zero gap, where the position correction's 1/dt gain turns float32
+# rounding of a foot's pose into joint velocity, momentum and contact impulse. Two routes that differ in float
+# order drift apart from step to step; on CPU, two dense split arms of which one moves every body pose
+# component its rows read by +-1 ulp at every step spread, at most over 32 noise seeds:
+# - standing (8 PGS iterations, the 24-step masked-reset schedule): joint velocity 3.6e-3, body twist 3.1e-3,
+#   momentum 3.7e-3, region normal load 1.6e-3, region friction 4.2e-3, poses 8.1e-6, row Jacobians 5.3e-6
+#   (a torso started one ulp higher without further noise: joint velocity 2.3e-3, load 1.4e-3);
+# - sliding (SLIDING_FEET, SLIDING_ITERATIONS, 24 steps): joint velocity 1.7e-3, region load 1.1e-3, region
+#   friction 1.0e-4.
+# The bounds below are at least twice these. They are CPU measurements: re-measure on CUDA (dense against
+# sparse split rows, the ordinary against the incremental matrix-free sweep) before tightening them.
+# Twists and momentum of the standing and sliding feet.
+STANDING_VELOCITY_ATOL = 7.5e-3
+# The stance's contact rows outnumber its degrees of freedom, so float order shifts friction between its
+# feet by more than any region carries (3.5e-3 at most): stance regions compare normal load only, and the
+# sliding feet check friction.
+STANDING_REGION_BOUNDS = {"load_atol": 3.5e-3, "friction_atol": None}
+# Every sliding anchor sits at its pooled budget, so kinetic friction fixes each region's friction at its
+# coefficient times the region's load: an anchor budget that pools only its own normal moves it by 6.5e-3.
+SLIDING_REGION_BOUNDS = {"load_atol": 2.5e-3, "friction_atol": 3.0e-4}
 # Low-friction feet (feet and ground mu 0.1) start sliding forward at 0.5 m/s and keep sliding.
 SLIDING_FEET = {"mu": 0.1, "speed": 0.5}
 # Iterations that keep every sliding anchor at its pooled budget (8 leave a third of them inside).
