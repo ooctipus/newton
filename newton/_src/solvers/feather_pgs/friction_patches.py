@@ -284,15 +284,14 @@ def _prepare(
     frame: _PatchFrame,
     patches: FrictionPatches,
     extent: wp.array[int],
-    head_count: wp.array[int],
 ):
     """Fill this frame's contact slots and clear every slot an earlier frame used.
 
     The narrow phase counts contacts before checking its capacity, so an
     overflowing count describes an incomplete frame and leaves no contact live.
     Slots past the stored and the last built frame already hold the empty
-    record. Thread 0 publishes the slots to visit and the live count, and empties
-    the pair head list; this launch reads none of them.
+    record. Thread 0 publishes the slots to visit and the live count; this
+    launch reads neither.
     """
     thread = wp.tid()
     live = count[0]
@@ -303,7 +302,6 @@ def _prepare(
     if thread == 0:
         extent[0] = end
         extent[1] = live
-        head_count[0] = 0
     for c in range(thread, end, threads):
         _prepare_contact(
             c,
@@ -880,21 +878,6 @@ def _build_pair(
 
 
 @wp.kernel(enable_backward=False)
-def _mark_pair_heads(
-    extent: wp.array[int],
-    frame: _PatchFrame,
-    threads: int,
-    heads: wp.array[int],
-    head_count: wp.array[int],
-):
-    """List the sorted positions that start a body pair's run, in any order."""
-    thread = wp.tid()
-    for start in range(thread, extent[1], threads):
-        if start == 0 or frame.keys[start - 1] != frame.keys[start]:
-            heads[wp.atomic_add(head_count, 0, 1)] = start
-
-
-@wp.kernel(enable_backward=False)
 def _build(
     extent: wp.array[int],
     stored: wp.array[int],
@@ -902,28 +885,23 @@ def _build(
     previous_q: wp.array[wp.transform],
     shape_transform: wp.array[wp.transform],
     shape_radius: wp.array[float],
-    heads: wp.array[int],
-    head_count: wp.array[int],
     threads: int,
     frame: _PatchFrame,
     prev: _PatchFrame,
     patches: FrictionPatches,
     built: wp.array[int],
 ):
-    """Stride over the listed pair heads; body pairs write disjoint current/previous records.
+    """Stride over the live sorted positions; body pairs write disjoint current/previous records.
 
-    Each pair reads only its own sorted run, its previous run and its own
-    contacts, so the head list's order changes no output. Thread 0 records the
-    live count, so the next _prepare clears these slots even when no store
-    follows this build.
+    Thread 0 records the live count, so the next _prepare clears these slots even
+    when no store follows this build.
     """
     thread = wp.tid()
     live = extent[1]
     if thread == 0:
         built[0] = live
     previous_end = stored[0]
-    for head in range(thread, head_count[0], threads):
-        start = heads[head]
+    for start in range(thread, live, threads):
         _build_pair(start, live, previous_end, q, previous_q, shape_transform, shape_radius, frame, prev, patches)
 
 
@@ -1054,9 +1032,6 @@ class _FrictionPatchState:
         self.stored = wp.zeros(1, dtype=int, device=device)
         self.built = wp.zeros(1, dtype=int, device=device)
         self.extent = wp.zeros(2, dtype=int, device=device)
-        # _build visits only the sorted positions that start a body pair.
-        self.heads = wp.zeros(capacity, dtype=int, device=device)
-        self.head_count = wp.zeros(1, dtype=int, device=device)
         # Fixed grids keep CUDA graph replay valid; threads stride over live slots.
         blocks = device.sm_count if device.is_cuda else 1
         self.threads = max(1, min(capacity, _LIGHT_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
@@ -1207,7 +1182,7 @@ class _FrictionPatchState:
                 self.current,
                 self.view,
             ],
-            outputs=[self.extent, self.head_count],
+            outputs=[self.extent],
             device=model.device,
         )
         if self.live_sort:
@@ -1216,13 +1191,6 @@ class _FrictionPatchState:
             # Empty slots hold INT64_MAX, whose low key_bits are all ones: no pair
             # key exceeds them, and the stable sort keeps live slots ahead of a tie.
             wp.utils.radix_sort_pairs(self.current.keys, self.current.indices, self.capacity, end_bit=self.key_bits)
-        wp.launch(
-            _mark_pair_heads,
-            dim=self.threads,
-            inputs=[self.extent, self.current, self.threads],
-            outputs=[self.heads, self.head_count],
-            device=model.device,
-        )
         wp.launch(
             _build,
             dim=self.build_threads,
@@ -1233,8 +1201,6 @@ class _FrictionPatchState:
                 self.previous_q,
                 model.shape_transform,
                 model.shape_collision_radius,
-                self.heads,
-                self.head_count,
                 self.build_threads,
                 self.current,
                 self.previous,

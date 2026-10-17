@@ -47,7 +47,6 @@ _PATCH_ONLY = frozenset(
         "friction_patches._build",
         "friction_patches._finish_and_store",
         "friction_patches._invalidate_geometry_history",
-        "friction_patches._mark_pair_heads",
         "friction_patches._merge_runs",
         "friction_patches._prepare",
         "friction_patches._reset_history",
