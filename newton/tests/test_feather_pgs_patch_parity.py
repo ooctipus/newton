@@ -29,6 +29,7 @@ from newton.tests.feather_pgs_patch_parity import (
     anchor_sites,
     assert_anchor_sites_close,
     assert_contact_impulses_close,
+    assert_factor_rows_consistent,
     assert_history_close,
     assert_history_matches_rows,
     assert_loaded_anchors,
@@ -334,6 +335,39 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
         small.store(state)
         with self.assertRaisesRegex(AssertionError, "hold 8 and 16 contact slots"):
             assert_history_close(small, large)
+
+    def test_sparse_rows_must_carry_their_impulses(self):
+        """Reject a factor delta without a seeded row's response, a stale incident and an undecoded velocity.
+
+        Synthetic rows stand in for a native sparse split step, which needs
+        CUDA: physical rows J, factor rows z = J F for an invertible factor
+        transform F, the factor delta z^T lambda and v_out = v_hat + F delta.
+        """
+        rng = np.random.default_rng(3)
+        jacobian = rng.normal(size=(6, 4))
+        transform = np.tril(rng.normal(size=(4, 4))) + 3.0 * np.eye(4)
+        z = jacobian @ transform
+        impulses = np.abs(rng.normal(size=6)) * 1.0e-2
+        v_hat = rng.normal(size=4) * 0.1
+        delta = z.T @ impulses
+        rows = {
+            "z": z,
+            "jacobian": jacobian,
+            "impulses": impulses,
+            "incident": jacobian @ v_hat,
+            "delta": delta,
+            "v_hat": v_hat,
+            "v_out": v_hat + transform @ delta,
+        }
+        assert_factor_rows_consistent(**rows)
+        # A sweep that leaves a seeded row out of its starting delta still decodes v_out from that delta.
+        unseeded = delta - z[4] * impulses[4]
+        with self.assertRaisesRegex(AssertionError, "factor delta"):
+            assert_factor_rows_consistent(**{**rows, "delta": unseeded, "v_out": v_hat + transform @ unseeded})
+        with self.assertRaisesRegex(AssertionError, "row incident"):
+            assert_factor_rows_consistent(**{**rows, "incident": jacobian @ (1.01 * v_hat)})
+        with self.assertRaisesRegex(AssertionError, "decoded velocity"):
+            assert_factor_rows_consistent(**{**rows, "v_out": v_hat})
 
 
 if __name__ == "__main__":

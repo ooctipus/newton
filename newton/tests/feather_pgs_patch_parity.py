@@ -577,6 +577,55 @@ def assert_history_matches_rows(solver, contacts, *, atol=1e-6, rtol=1e-6):
     return checked
 
 
+def assert_factor_rows_consistent(z, jacobian, impulses, incident, delta, v_hat, v_out, *, label=""):
+    """Tie one world's native sparse rows, factor delta and velocity to its solved impulses.
+
+    ``z`` holds the rows in factor coordinates and ``jacobian`` the physical
+    rows recovered from them, both ``[rows, world dofs]``. The sparse sweep
+    reads each row's ``incident`` (``J v_hat``) apart from its bias, keeps the
+    impulses' response as the factor-coordinate ``delta`` (seeded from the
+    carried impulses when warm starting) and decodes ``v_out`` from it. So the
+    incident must equal ``jacobian @ v_hat``, ``delta`` must equal
+    ``z.T @ impulses``, and ``jacobian @ v_out`` must equal ``z @ delta`` plus
+    the incident. Tolerances are those of the sparse solver's own state check.
+    """
+    np.testing.assert_allclose(jacobian @ v_hat, incident, atol=2e-5, rtol=2e-5, err_msg=f"{label} row incident")
+    np.testing.assert_allclose(delta, z.T @ impulses, atol=3e-5, rtol=3e-4, err_msg=f"{label} factor delta")
+    np.testing.assert_allclose(
+        jacobian @ v_out, z @ delta + incident, atol=3e-5, rtol=3e-5, err_msg=f"{label} decoded velocity"
+    )
+
+
+def assert_sparse_rows_consistent(solver):
+    """Apply :func:`assert_factor_rows_consistent` to every world of a native sparse split step.
+
+    Returns the number of rows checked.
+    """
+    from newton.tests.test_feather_pgs_sparse_solver import TestFeatherPGSSparseSolver  # noqa: PLC0415
+
+    recover = TestFeatherPGSSparseSolver()._sparse_rows_physical
+    impulses, incident = solver.impulses.numpy(), solver._sparse_row_incident.numpy()
+    delta, dofs = solver._sparse_factor_velocity_delta.numpy(), solver.world_dof_indices.numpy()
+    v_hat, v_out = solver.v_hat.numpy(), solver.v_out.numpy()
+    checked = 0
+    for world, live in enumerate(solver.constraint_count.numpy()):
+        count = int(live)
+        z, jacobian = recover(solver, world, count)
+        velocity = dofs[world]
+        assert_factor_rows_consistent(
+            z,
+            jacobian,
+            impulses[world, :count],
+            incident[world, :count],
+            delta[world],
+            v_hat[velocity],
+            v_out[velocity],
+            label=f"world {world}",
+        )
+        checked += count
+    return checked
+
+
 def ring_budget_ratios(solver, route=0):
     """Return each friction pair's |lambda_t| over its coefficient times the pooled ring normal load."""
     arrays = route_arrays(solver, route)

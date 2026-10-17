@@ -33,6 +33,7 @@ from newton.tests.feather_pgs_patch_parity import (
     assert_patch_rows_close,
     assert_region_impulses_close,
     assert_ring_coulomb,
+    assert_sparse_rows_consistent,
     assert_states_close,
     patch_rows,
     ring_budget_ratios,
@@ -523,13 +524,16 @@ class TestSparseSplitPatchPhysics(unittest.TestCase):
         STANDING_VELOCITY_ATOL: the feet's contact rows outnumber the degrees of freedom, so float order
         redistributes load among the rows. Without, impulses compare per normal row and per anchor.
         ``lifecycle`` compares anchor phi and the stored anchors, which sliding anchors release at the
-        cone boundary.
+        cone boundary. Rows compare with their physical Jacobians. A sparse row's bias leaves out the
+        J v_hat that dense split rows bake in, so the sparse arm's own incident, factor delta and
+        velocity must carry its rows and impulses (assert_sparse_rows_consistent).
         """
         velocity_atol = 2e-3 if bounds is None else STANDING_VELOCITY_ATOL
         TestSparseSplitPhysics._assert_state(self, dense, sparse, velocity_atol=velocity_atol)
-        rows = patch_rows(dense[1], dense[-1], DT)
-        candidate = patch_rows(sparse[1], sparse[-1], DT)
+        rows = patch_rows(dense[1], dense[-1], DT, jacobian=True)
+        candidate = patch_rows(sparse[1], sparse[-1], DT, jacobian=True)
         assert_patch_rows_close(rows, candidate, lifecycle=lifecycle)
+        assert_sparse_rows_consistent(sparse[1])
         if bounds is None:
             assert_patch_impulses_close(rows, candidate)
         else:
