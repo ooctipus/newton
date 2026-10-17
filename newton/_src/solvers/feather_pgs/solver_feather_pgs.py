@@ -2344,7 +2344,7 @@ class SolverFeatherPGS(SolverBase):
         self._kinematic_joint_mask = wp.zeros(model.joint_count, dtype=wp.int32, device=model.device)
         self._kinematic_dof_mask = wp.zeros(model.joint_dof_count, dtype=wp.int32, device=model.device)
         self._body_prescribed = wp.zeros(max(model.body_count, 1), dtype=wp.int32, device=model.device)
-        self._update_kinematic_state()
+        self._apply_kinematic_state(self._kinematic_state())
         # Prescribed-response elision removes fully-kinematic free bases from
         # the compact response mapping, which would desynchronize it from the
         # contiguous per-world windows the propagation kernels address (see
@@ -3426,8 +3426,17 @@ class SolverFeatherPGS(SolverBase):
                 raise RuntimeError("Validate contact torsion outside CUDA graph capture")
             preparation.validate()
 
-    def _update_kinematic_state(self) -> None:
-        """Refresh cached kinematic flags and effective joint armature."""
+    def _kinematic_state(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Derive the kinematic masks and effective joint armature from the body flags, changing nothing.
+
+        Returns:
+            ``(armature, joint_mask, dof_mask)`` for :meth:`_apply_kinematic_state`.
+
+        Raises:
+            RuntimeError: If the flags make a DOF of a sparse split or
+                velocity-limit response kinematic, or a DOF of a
+                prescribed-response articulation dynamic. Both need a new solver.
+        """
         model = self.model
         armature = model.joint_armature.numpy().copy()
         joint_mask = np.zeros(model.joint_count, dtype=np.int32)
@@ -3465,7 +3474,11 @@ class SolverFeatherPGS(SolverBase):
                         "A prescribed-response articulation changed kinematic membership; "
                         "reconstruct the solver and recapture its CUDA graph."
                     )
+        return armature, joint_mask, dof_mask
 
+    def _apply_kinematic_state(self, kinematic: tuple[np.ndarray, np.ndarray, np.ndarray]) -> None:
+        """Publish derived kinematic masks and armature in place, where captured graphs read them."""
+        armature, joint_mask, dof_mask = kinematic
         self._joint_armature_effective = armature
         self._kinematic_dof_mask_host = dof_mask.copy()
         self._kinematic_joint_mask.assign(joint_mask)
@@ -3502,8 +3515,16 @@ class SolverFeatherPGS(SolverBase):
         Material-equivalence changes also require
         :meth:`newton.CollisionPipeline.refresh_body_pair_reduction_groups` when
         body-pair reduction is enabled. Capacity failures remain latched until
-        an explicit episode reset.
+        an explicit episode reset. Body flags that make a DOF of a
+        prescribed-response articulation dynamic, or a DOF of a sparse split or
+        velocity-limit response kinematic, raise before any solver state
+        changes; reconstruct the solver for them.
         """
+        # Derive the kinematic state first: a body-flag change the solver
+        # cannot absorb raises here, before any mask, cache or owner changes.
+        kinematic = (
+            self._kinematic_state() if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES) else None
+        )
         if self._friction_anchors_enabled and flags & ModelFlags.SHAPE_PROPERTIES:
             # Geometry edits retire affected material points; unrelated shape
             # properties keep their history and live materials are checked per step.
@@ -3532,8 +3553,8 @@ class SolverFeatherPGS(SolverBase):
             | ModelFlags.MODEL_PROPERTIES
         ):
             self._fk_id_cache_valid.zero_()
-        if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES):
-            self._update_kinematic_state()
+        if kinematic is not None:
+            self._apply_kinematic_state(kinematic)
             self._scatter_armature_to_groups()
             self._mass_update_requested.fill_(1)
         if flags & ModelFlags.BODY_INERTIAL_PROPERTIES and self.model.body_count:

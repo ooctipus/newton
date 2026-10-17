@@ -1,9 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Cached tree dynamics treat kinematic bodies as ordinary dynamics does."""
+"""Cached tree dynamics treat kinematic bodies as ordinary dynamics does.
 
+Body flags are live model data. A body made kinematic or dynamic at runtime
+changes only the kinematic masks and effective armature, which the solver
+re-derives in place on a body-property notification and the held-tree owner
+reads at every launch. The owner therefore stays installed across such
+notifications, also through replays of a graph captured before them, and the
+changes ordinary dynamics rejects raise its error before anything changes.
+"""
+
+import os
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -16,9 +26,14 @@ from newton.tests import test_feather_pgs_sparse_split as sparse_split
 
 DT = 1.0 / 240.0
 KINEMATIC = int(newton.BodyFlags.KINEMATIC)
+DYNAMIC = int(newton.BodyFlags.DYNAMIC)
 # Point friction and Newton's default patch friction admit the owner through different contact paths.
 FRICTION_LAWS = {"point": 0.0, "patch": 0.2}
 STATE_FIELDS = ("body_q", "body_qd", "joint_q", "joint_qd")
+PRESCRIBED_ERROR = (
+    "A prescribed-response articulation changed kinematic membership; "
+    "reconstruct the solver and recapture its CUDA graph."
+)
 
 
 def _set_flag(model, body, flag):
@@ -30,6 +45,24 @@ def _set_flag(model, body, flag):
 def _solver(model, beta, cached, **options):
     """A default solver under one friction law; ``cached`` is the ``cached_dynamics`` choice."""
     return SolverFeatherPGS(model, angular_damping=0.0, friction_anchor_beta=beta, cached_dynamics=cached, **options)
+
+
+def _toggle_scene():
+    """One kinematic free body in zero gravity: the runtime-toggle scene of test_kinematic_links."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    body = builder.add_body(xform=wp.transform_identity(), mass=1.0, is_kinematic=True)
+    builder.add_shape_sphere(body, radius=0.1)
+    return builder.finalize(device="cuda:0"), body
+
+
+def _pair_scene():
+    """A kinematic box beside a dynamic probe sphere; the box is a prescribed root in matrix-free mode."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    box = builder.add_body(xform=wp.transform(wp.vec3(-0.3, 0.0, 0.0), wp.quat_identity()), mass=1.0, is_kinematic=True)
+    builder.add_shape_box(box, hx=0.25, hy=0.15, hz=0.15)
+    probe = builder.add_body(xform=wp.transform(wp.vec3(0.45, 0.0, 0.0), wp.quat_identity()), mass=1.0)
+    builder.add_shape_sphere(probe, radius=0.1)
+    return builder.finalize(device="cuda:0"), box, probe
 
 
 def _chain(*, floating):
@@ -71,10 +104,29 @@ def _snapshot(state):
     return {name: getattr(state, name).numpy().copy() for name in STATE_FIELDS}
 
 
-class _Rollout:
-    """Step one solver under a constant wrench on one body."""
+def _solver_snapshot(solver):
+    """Everything a body-flag notification may change in the solver and its owner."""
+    arrays = {
+        "kinematic_dof_mask_host": solver._kinematic_dof_mask_host,
+        "kinematic_dof_mask": solver._kinematic_dof_mask,
+        "kinematic_joint_mask": solver._kinematic_joint_mask,
+        "joint_armature_effective": solver._joint_armature_effective,
+        "body_prescribed": solver._body_prescribed,
+        "fk_id_cache_valid": solver._fk_id_cache_valid,
+        "mass_update_requested": solver._mass_update_requested,
+        **{f"R_by_size[{size}]": solver.R_by_size[size] for size in solver.size_groups},
+    }
+    owner = solver._tree_kinetic_state
+    for index, group in enumerate(getattr(owner, "groups", ())):
+        for name in ("geometry_valid", "generation", "geometry_generation", "status"):
+            arrays[f"group {index} {name}"] = getattr(group.data, name)
+    return {key: (value.numpy() if isinstance(value, wp.array) else value).copy() for key, value in arrays.items()}
 
-    def __init__(self, model, solver, body, wrench):
+
+class _Rollout:
+    """Step one solver under a constant wrench on one body, eagerly or by replaying one captured step."""
+
+    def __init__(self, model, solver, body, wrench, *, graph=False):
         self.model, self.solver = model, solver
         self.pipeline = newton.CollisionPipeline(model)
         self.contacts = self.pipeline.contacts()
@@ -86,6 +138,7 @@ class _Rollout:
         wrenches[body] = wrench
         self.state.body_f.assign(wrenches)
         self.next_state.body_f.assign(wrenches)
+        self.graph, self._captured = graph, None
 
     def step(self):
         self.pipeline.collide(self.state, self.contacts)
@@ -93,8 +146,18 @@ class _Rollout:
         self.state.assign(self.next_state)
 
     def run(self, steps):
-        for _ in range(steps):
+        if self.graph and self._captured is None:
+            # One eager step, then capture the next; replays take every later step.
             self.step()
+            steps -= 1
+            with wp.ScopedCapture(device=self.model.device) as capture:
+                self.step()
+            self._captured = capture.graph
+        for _ in range(steps):
+            if self.graph:
+                wp.capture_launch(self._captured)
+            else:
+                self.step()
         return _snapshot(self.state)
 
 
@@ -103,6 +166,29 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
     def _assert_states_close(self, actual, expected, atol=1.0e-5, what=""):
         for name in STATE_FIELDS:
             np.testing.assert_allclose(actual[name], expected[name], atol=atol, rtol=0.0, err_msg=f"{what} {name}")
+
+    def _assert_phases_close(self, actual, expected, atol=1.0e-5):
+        self.assertEqual(len(actual), len(expected))
+        for phase, (a, e) in enumerate(zip(actual, expected, strict=True)):
+            self._assert_states_close(a, e, atol=atol, what=f"phase {phase}")
+
+    def _notify(self, model, solver, body, flag):
+        """Set one body's flag and notify; any owner and its route record must survive."""
+        owner = solver._tree_kinetic_state
+        route = solver.get_path_selection()["routes"]["held_tree"]
+        _set_flag(model, body, flag)
+        solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
+        self.assertIs(solver._tree_kinetic_state, owner)
+        self.assertEqual(solver.get_path_selection()["routes"]["held_tree"], route)
+
+    def _phases(self, model, solver, body, flags, *, load, wrench, steps, graph=False):
+        """State after each phase of ``steps``; between phases ``body`` takes the next of ``flags``."""
+        rollout = _Rollout(model, solver, load, wrench, graph=graph)
+        phases = [rollout.run(steps)]
+        for flag in flags:
+            self._notify(model, solver, body, flag)
+            phases.append(rollout.run(steps))
+        return phases
 
     def test_wrench_on_a_kinematic_link_stays_off_its_ancestors(self):
         """An external wrench on a kinematic link moves nothing under the owner, as under ordinary dynamics.
@@ -147,6 +233,157 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                     runs[cached] = _snapshot(case[2])
                 self.assertTrue(np.isfinite(runs["auto"]["joint_qd"]).all())
                 self._assert_states_close(runs["auto"], runs["off"], what="owner against ordinary")
+
+    def test_toggled_free_body_keeps_the_owner_and_ordinary_dynamics(self):
+        """A free body made dynamic and kinematic again keeps the owner and tracks ordinary dynamics.
+
+        This is test_kinematic_links' runtime toggle on the default solver,
+        whose held-tree owner froze body flags in its static proof and
+        refused the first notification.
+        """
+        wrench = np.array([10.0, 0.0, 0.0, 0.0, 0.0, 0.0], np.float32)
+        for law, beta in FRICTION_LAWS.items():
+            for mode in ("split", "matrix_free"):
+                with self.subTest(law=law, pgs_mode=mode):
+                    runs = {}
+                    for cached in ("off", "auto"):
+                        model, body = _toggle_scene()
+                        solver = _solver(model, beta, cached, pgs_mode=mode, update_mass_matrix_interval=100)
+                        if cached == "auto":
+                            self.assertIsInstance(solver._tree_kinetic_state, MixedTreeKineticState)
+                        runs[cached] = self._phases(
+                            model, solver, body, (DYNAMIC, KINEMATIC), load=body, wrench=wrench, steps=60
+                        )
+                    self._assert_phases_close(runs["auto"], runs["off"])
+                    held, moved, held_again = (phase["body_q"][body, :3] for phase in runs["auto"])
+                    self.assertLess(float(np.linalg.norm(held)), 1.0e-3)
+                    self.assertGreater(float(moved[0]), 0.05)
+                    self.assertLess(float(np.linalg.norm(held_again - moved)), 1.0e-3)
+
+    def test_graph_replayed_across_toggles_matches_eager_stepping(self):
+        """A step captured before the toggles replays with the inputs each notification re-derives.
+
+        The notifications run between replays, outside capture. They rewrite
+        the kinematic masks, the held factors' armature and the mass-update
+        request in place, so the graph needs no recapture and the replayed
+        owner matches eager stepping on both routes.
+        """
+        wrench = np.array([10.0, 0.0, 0.0, 0.0, 0.0, 0.0], np.float32)
+        for law, beta in FRICTION_LAWS.items():
+            for mode in ("split", "matrix_free"):
+                with self.subTest(law=law, pgs_mode=mode):
+                    runs = {}
+                    for name, cached, graph in (
+                        ("eager ordinary", "off", False),
+                        ("eager owner", "auto", False),
+                        ("replayed owner", "auto", True),
+                    ):
+                        model, body = _toggle_scene()
+                        solver = _solver(model, beta, cached, pgs_mode=mode, update_mass_matrix_interval=100)
+                        runs[name] = self._phases(
+                            model, solver, body, (DYNAMIC, KINEMATIC), load=body, wrench=wrench, steps=60, graph=graph
+                        )
+                    replayed = runs["replayed owner"]
+                    self.assertIsInstance(solver._tree_kinetic_state, MixedTreeKineticState)
+                    self._assert_phases_close(replayed, runs["eager owner"])
+                    self._assert_phases_close(replayed, runs["eager ordinary"])
+                    self.assertGreater(float(replayed[1]["body_q"][body, 0]), 0.05)
+
+    def test_forest_and_per_size_groups_absorb_a_probe_toggle(self):
+        """Both group forms of a world with a prescribed root keep the owner while its probe toggles."""
+        wrench = np.array([2.0, 0.0, 0.0, 0.0, 0.0, 0.5], np.float32)
+        for law, beta in FRICTION_LAWS.items():
+            for forest in ("1", "0"):
+                with (
+                    self.subTest(law=law, forest=forest),
+                    mock.patch.dict(os.environ, {"FEATHER_PGS_TREE_FOREST": forest}),
+                ):
+                    runs = {}
+                    for cached in ("off", "auto"):
+                        model, box, probe = _pair_scene()
+                        solver = _solver(model, beta, cached, pgs_mode="matrix_free")
+                        self.assertTrue(solver._has_prescribed_response)
+                        if cached == "auto":
+                            groups = solver._tree_kinetic_state.groups
+                            if forest == "1":
+                                self.assertEqual([group.layout.root_families for group in groups], [(0, 6)])
+                            else:
+                                operators = sorted(type(group.sparse).__name__ for group in groups)
+                                self.assertEqual(operators, ["PrescribedRootOperator", "TreeHeldOperator"])
+                        runs[cached] = self._phases(
+                            model, solver, probe, (KINEMATIC, DYNAMIC), load=probe, wrench=wrench, steps=30
+                        )
+                    self._assert_phases_close(runs["auto"], runs["off"])
+                    # The prescribed box holds its pose; the dynamic probe (5.2 kg with its
+                    # sphere) is pushed 3 mm along x before it first becomes kinematic.
+                    for phase in runs["auto"]:
+                        np.testing.assert_allclose(phase["body_q"][box, :3], (-0.3, 0.0, 0.0), atol=1.0e-6)
+                    self.assertGreater(float(runs["auto"][0]["body_q"][probe, 0]), 0.452)
+
+    def test_chain_links_toggled_at_runtime_match_ordinary_dynamics(self):
+        """Roots and leaves made kinematic mid-run keep the held-tree and sparse-tree owners on ordinary dynamics."""
+        wrench = np.array([0.0, 0.0, 3.0, 0.0, 0.0, 0.0], np.float32)
+        cases = (
+            # (base, toggled link, flags after the first phase, loaded link)
+            ("floating", 0, (KINEMATIC, DYNAMIC), 1),
+            ("fixed", 2, (KINEMATIC,), 2),
+            ("floating", 2, (KINEMATIC,), 2),
+        )
+        for law, beta in FRICTION_LAWS.items():
+            for base, link, flags, load in cases:
+                with self.subTest(law=law, base=base, link=link):
+                    runs = {}
+                    for cached in ("off", "auto"):
+                        model, links = _chain(floating=base == "floating")
+                        solver = _solver(model, beta, cached, pgs_mode="matrix_free")
+                        if cached == "auto":
+                            self.assertIsInstance(solver._tree_kinetic_state, MixedTreeKineticState)
+                        runs[cached] = self._phases(
+                            model, solver, links[link], flags, load=links[load], wrench=wrench, steps=20
+                        )
+                    self._assert_phases_close(runs["auto"], runs["off"])
+            # The sparse scene's floating root (body 0) and contacting leaf (body 1) of the first world.
+            for body, flags in ((0, (KINEMATIC, DYNAMIC)), (1, (KINEMATIC,))):
+                with self.subTest(law=law, owner="sparse tree", body=body):
+                    runs = {}
+                    for cached in ("off", "auto"):
+                        case = _sparse_case(beta, cached)
+                        model, solver = case[0], case[1]
+                        if cached == "auto":
+                            self.assertIsInstance(solver._tree_kinetic_state, TreeKineticState)
+                        phases = []
+                        for flag in (None, *flags):
+                            if flag is not None:
+                                self._notify(model, solver, body, flag)
+                            for _ in range(20):
+                                sparse_split._step(case)
+                            phases.append(_snapshot(case[2]))
+                        runs[cached] = phases
+                    self._assert_phases_close(runs["auto"], runs["off"])
+
+    def test_rejected_toggle_raises_the_ordinary_error_before_any_change(self):
+        """A prescribed root made dynamic raises the ordinary error on both routes and changes no solver state."""
+        wrench = np.array([2.0, 0.0, 0.0, 0.0, 0.0, 0.5], np.float32)
+        for law, beta in FRICTION_LAWS.items():
+            for cached in ("off", "auto"):
+                with self.subTest(law=law, cached_dynamics=cached):
+                    model, box, probe = _pair_scene()
+                    solver = _solver(model, beta, cached, pgs_mode="matrix_free")
+                    owner = solver._tree_kinetic_state
+                    self.assertEqual(owner is not None, cached == "auto")
+                    _Rollout(model, solver, probe, wrench).run(5)
+                    before = _solver_snapshot(solver)
+                    # Valid caches, so an invalidation would show.
+                    self.assertTrue(before["fk_id_cache_valid"].all())
+                    _set_flag(model, box, DYNAMIC)
+                    with self.assertRaises(RuntimeError) as raised:
+                        solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
+                    self.assertEqual(str(raised.exception), PRESCRIBED_ERROR)
+                    self.assertIs(solver._tree_kinetic_state, owner)
+                    after = _solver_snapshot(solver)
+                    self.assertEqual(after.keys(), before.keys())
+                    for key, value in before.items():
+                        np.testing.assert_array_equal(after[key], value, err_msg=key)
 
 
 if __name__ == "__main__":

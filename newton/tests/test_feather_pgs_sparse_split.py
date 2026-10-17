@@ -358,7 +358,7 @@ class TestSparseSplitPhysics(unittest.TestCase):
                 self.assertGreater(contact_count, 0)
 
     def test_prescribed_dof_notification_requires_reconstruction(self):
-        """Reject prescribed response before changing either owner's masks or cache."""
+        """Reject prescribed response with one error before changing masks or caches, cached or not."""
         for cached in (True, False):
             with self.subTest(cached=cached):
                 with mock.patch.dict(os.environ, {"FEATHER_PGS_TREE_KINETIC_STATE": str(int(cached))}):
@@ -370,26 +370,25 @@ class TestSparseSplitPhysics(unittest.TestCase):
                 self.assertEqual(owner is not None, cached)
                 old_host = solver._kinematic_dof_mask_host.copy()
                 old_device = solver._kinematic_dof_mask.numpy().copy()
+                old_fk = solver._fk_id_cache_valid.numpy().copy()
+                self.assertTrue(old_fk.all())
                 names = ("current_valid", "geometry_valid", "generation", "geometry_generation", "status")
                 old_cache = {name: getattr(owner.data, name).numpy().copy() for name in names} if owner else {}
                 flags = model.body_flags.numpy().copy()
                 flags[0] |= int(newton.BodyFlags.KINEMATIC)
                 model.body_flags.assign(flags)
-                # A cached owner rejects the changed body flags before any mask or
-                # cache mutation (prescribed free roots are owned since the mixed
-                # owner learned them, so the plan no longer rejects kinematic
-                # bodies outright); the ordinary route rejects the gained DOFs.
-                error = RuntimeError
-                message = (
-                    "Tree kinetic static body_flags changed; reconstruct and recapture"
-                    if cached
-                    else "Sparse response gained prescribed DOFs; reconstruct the solver and recapture its CUDA graph."
-                )
-                with self.assertRaises(error) as raised:
+                # The solver derives the kinematic state before any owner check
+                # or cache invalidation, so both routes reject the gained DOFs
+                # with the same error and leave every mask and cache unchanged.
+                with self.assertRaises(RuntimeError) as raised:
                     solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
-                self.assertEqual(str(raised.exception), message)
+                self.assertEqual(
+                    str(raised.exception),
+                    "Sparse response gained prescribed DOFs; reconstruct the solver and recapture its CUDA graph.",
+                )
                 np.testing.assert_array_equal(solver._kinematic_dof_mask_host, old_host)
                 np.testing.assert_array_equal(solver._kinematic_dof_mask.numpy(), old_device)
+                np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), old_fk)
                 for name, values in old_cache.items():
                     np.testing.assert_array_equal(getattr(owner.data, name).numpy(), values)
 

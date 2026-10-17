@@ -90,6 +90,11 @@ CACHE_FIELDS = (
     "body_I_s",
     "body_inertia_terms",
 )
+# Body flags are live inputs, not plan fields: the kernels read the kinematic
+# masks and effective armature derived from them, which the solver re-derives
+# in place on a body-property notification. Their structural consequence, the
+# prescribed-response articulations, is fixed at construction, and the solver
+# rejects flags that contradict it.
 PLAN_FIELDS = (
     "articulation_start",
     "joint_type",
@@ -98,5 +103,4 @@ PLAN_FIELDS = (
     "joint_q_start",
     "joint_qd_start",
     "joint_dof_dim",
-    "body_flags",
 )

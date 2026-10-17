@@ -430,7 +430,9 @@ class TreeKineticState:
         body membership, so they are accepted outright. Every other
         notification compares the baked plan arrays on the device (one small
         readback) instead of fingerprinting them on the host; Isaac Lab issues
-        a notification on every reset.
+        a notification on every reset. Body flags are not baked: the kernels
+        read the kinematic masks and armature the solver re-derives in place,
+        after rejecting any flag change it cannot absorb.
         """
         if flags is not None and int(flags) != 0 and int(flags) & ~_NUMERIC_FLAGS == 0:
             return
