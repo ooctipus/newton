@@ -18,7 +18,8 @@ from newton._src.geometry.convex_query_cost import _ConvexMethodChoice, _nonnega
 from newton.tests.test_coherent_convex_rejection import _accepted, _box_inputs, _buffers, _original, _selector_model
 from newton.tests.unittest_utils import add_function_test, assert_host_only, get_test_devices
 
-# Pin every terrain route flag so a developer's shell cannot change the expected routes.
+# Terrain route flags the cases flip; every other NEWTON_ variable is cleared, so a
+# developer's shell cannot change the expected routes.
 _TERRAIN_ENVIRONMENT = {
     "NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY": "0",
     "NEWTON_HEIGHTFIELD_CONVEX_CELLS": "0",
@@ -62,9 +63,11 @@ def _terrain_model(device):
 
 
 def _terrain_pipeline(model, choice, environment=None):
-    """Build a pipeline with the terrain flags pinned and the convex split left automatic."""
-    with patch.dict(os.environ, {**_TERRAIN_ENVIRONMENT, **(environment or {})}):
-        os.environ.pop("NEWTON_HEIGHTFIELD_CONVEX_SPLIT", None)
+    """Build a pipeline from Newton's defaults with the terrain flags pinned and the convex split left automatic."""
+    with patch.dict(os.environ):
+        for name in [name for name in os.environ if name.startswith("NEWTON_")]:
+            del os.environ[name]
+        os.environ.update({**_TERRAIN_ENVIRONMENT, **(environment or {})})
         return newton.CollisionPipeline(model, rigid_contact_max=4096, max_triangle_pairs=4096, convex_collision=choice)
 
 
@@ -266,7 +269,11 @@ class TestAutoConvexSelection(unittest.TestCase):
                     [kernel.key for kernel in pipeline.narrow_phase._heightfield_primitive_kernels],
                 )
                 self.assertEqual(selection["narrow_phase"]["coherent_convex"]["mode"], "off")
-        automatic = _terrain_pipeline(model, "auto").get_collision_selection()["heightfield"]
+        automatic_selection = _terrain_pipeline(model, "auto").get_collision_selection()
+        # The pipeline's typed-table request superseded the pinned NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY=0.
+        self.assertEqual(automatic_selection["environment"]["overridden"], {"NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY": "0"})
+        self.assertNotIn("NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY", automatic_selection["environment"]["applied"])
+        automatic = automatic_selection["heightfield"]
         self.assertEqual(automatic["primitive_query"]["source"], "argument")
         self.assertIn("convex_collision: admitted", automatic["primitive_query"]["reason"])
         self.assertEqual(
@@ -285,7 +292,11 @@ class TestAutoConvexSelection(unittest.TestCase):
         self.assertEqual(forced_rows[-1]["hull"], "excluded")
         self.assertEqual(forced["narrow_phase"]["coherent_convex"]["reason"], "terrain_cells_only")
         environment = {"NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY": "1", "NEWTON_HEIGHTFIELD_CYLINDER_SPLIT": "1"}
-        split = _terrain_pipeline(model, "ordinary", environment).get_collision_selection()["heightfield"]
+        split_selection = _terrain_pipeline(model, "ordinary", environment).get_collision_selection()
+        # "ordinary" requests no typed table, so the environment's value is the one applied.
+        self.assertEqual(split_selection["environment"]["applied"]["NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY"], "1")
+        self.assertNotIn("NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY", split_selection["environment"]["overridden"])
+        split = split_selection["heightfield"]
         self.assertFalse(split["cylinder_split"]["enabled"])
         self.assertIn("closed-form cylinder row", split["cylinder_split"]["reason"])
         self.assertEqual(split["primitive_query"]["source"], "environment")

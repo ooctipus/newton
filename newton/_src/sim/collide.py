@@ -2299,6 +2299,20 @@ class CollisionPipeline:
             )
             self.hydroelastic_sdf = self.narrow_phase.hydroelastic_sdf
 
+        # A declared variable that an explicit argument superseded was present but not applied.
+        superseded = []
+        if convex_collision is not None:  # it replaces both environment reads above, unvalidated
+            superseded += ["NEWTON_NARROW_PHASE_COHERENT_CONVEX", "NEWTON_NARROW_PHASE_CONVEX_CELLS"]
+        if getattr(self.narrow_phase, "_route_requests", {}).get("primitive_query_source") == "argument":
+            superseded.append("NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY")
+        if getattr(self.narrow_phase, "contact_export", None) is not None:
+            # NarrowPhase reads NEWTON_REDUCER_COMPACT_EXPORT only when contact_export is None.
+            superseded.append("NEWTON_REDUCER_COMPACT_EXPORT")
+        applied = self._environment_record["applied"]
+        self._environment_record["overridden"] = {
+            name: applied.pop(name) for name in sorted(superseded) if name in applied
+        }
+
         if getattr(self.narrow_phase, "_heightfield_finite_query", False) or getattr(
             self.narrow_phase, "_heightfield_geometric_cull", False
         ):
@@ -2703,7 +2717,11 @@ class CollisionPipeline:
         """Read the requested and current convex method outside CUDA graph capture.
 
         Automatic selection can change during replay. This reports the latest
-        observation, not the fraction of calls using each method.
+        observation, not the fraction of calls using each method. With an
+        automatic chooser installed (``convex_collision="auto"`` on CUDA), the
+        top-level ``method`` and ``reason`` and the ``heightfield_support``
+        fields read the chooser's device state and synchronize: never call this
+        inside a timed window or a graph capture.
 
         ``narrow_phase`` records the coherent-convex mode and the generic convex
         query variants. ``heightfield`` (``None`` without heightfield collision)
@@ -2712,11 +2730,16 @@ class CollisionPipeline:
         convex-cells owner and its chooser, and each opt-in terrain route with
         its reason. ``environment`` records the ``NEWTON_*`` variables present at
         construction: ``applied`` maps declared names Newton reads to their
-        values, ``unknown`` lists undeclared names (recorded, not rejected),
-        ``retired`` lists retired names whose value did not raise and
-        ``isaac_lab`` maps the names Isaac Lab reads and Newton does not. All
-        three are construction-time host records: they read no device memory
-        and are JSON-compliant.
+        values, ``overridden`` maps declared names whose value an explicit
+        argument superseded to their unapplied, unvalidated values
+        (``convex_collision`` for the coherent-convex and convex-cells
+        variables, the pipeline's typed-table request for
+        ``NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY`` and ``contact_export`` for
+        ``NEWTON_REDUCER_COMPACT_EXPORT``), ``unknown`` lists undeclared names
+        (recorded, not rejected), ``retired`` lists retired names whose value
+        did not raise and ``isaac_lab`` maps the names Isaac Lab reads and
+        Newton does not. These three sections are construction-time host
+        records: they read no device memory and are JSON-compliant.
         """
         owner = getattr(self.narrow_phase, "_convex_method_choice", None)
         result = {"requested": self.convex_collision, "reason": self._convex_selection_reason}

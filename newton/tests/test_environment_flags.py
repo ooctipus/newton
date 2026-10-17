@@ -395,12 +395,42 @@ class TestSelectionEnvironment(unittest.TestCase):
             "unknown": ["NEWTON_UNDECLARED_EXAMPLE"],
             "retired": ["NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD"],
             "isaac_lab": {"NEWTON_COLLISION_BOX_SAT": "0", "NEWTON_NARROW_PHASE_THREADS_X": "4"},
+            "overridden": {},
         }
         selected = pipeline.get_collision_selection()
         self.assertEqual(selected["environment"], expected)
         selected["environment"]["isaac_lab"].clear()
         with _environment({"NEWTON_HEIGHTFIELD_CELL_REJECT": "0"}):
             self.assertEqual(pipeline.get_collision_selection()["environment"], expected)
+
+    def test_collision_pipeline_reports_overridden_environment(self):
+        """Report the NEWTON_ names an explicit argument superseded apart from the applied ones."""
+        flags = {
+            # Invalid on their own: an explicit argument replaces them before validation.
+            "NEWTON_NARROW_PHASE_COHERENT_CONVEX": "not_a_mode",
+            "NEWTON_NARROW_PHASE_CONVEX_CELLS": "maybe",
+            "NEWTON_REDUCER_COMPACT_EXPORT": "1",
+            "NEWTON_HEIGHTFIELD_CELL_REJECT": "1",
+        }
+        with _environment(flags):
+            pipeline = newton.CollisionPipeline(_cpu_model(), convex_collision="auto", contact_export="auto")
+        selected = pipeline.get_collision_selection()
+        self.assertEqual(selected["environment"]["applied"], {"NEWTON_HEIGHTFIELD_CELL_REJECT": "1"})
+        self.assertEqual(
+            selected["environment"]["overridden"],
+            {
+                "NEWTON_NARROW_PHASE_COHERENT_CONVEX": "not_a_mode",
+                "NEWTON_NARROW_PHASE_CONVEX_CELLS": "maybe",
+                "NEWTON_REDUCER_COMPACT_EXPORT": "1",
+            },
+        )
+        self.assertEqual(selected["narrow_phase"]["coherent_convex"]["source"], "argument")
+        with _environment({"NEWTON_NARROW_PHASE_COHERENT_CONVEX": "0", "NEWTON_REDUCER_COMPACT_EXPORT": "0"}):
+            environment = newton.CollisionPipeline(_cpu_model()).get_collision_selection()["environment"]
+        self.assertEqual(
+            environment["applied"], {"NEWTON_NARROW_PHASE_COHERENT_CONVEX": "0", "NEWTON_REDUCER_COMPACT_EXPORT": "0"}
+        )
+        self.assertEqual(environment["overridden"], {})
 
 
 if __name__ == "__main__":
