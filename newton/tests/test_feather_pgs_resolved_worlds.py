@@ -470,6 +470,37 @@ class TestResolvedWorlds(unittest.TestCase):
         solver._sparse_mass_matrix_size = 23
         self.assertFalse(rw.supported(solver))
 
+    def test_classify_bounds_patch_worlds_by_the_solver_capacities(self):
+        """Under patch friction the decision gets the solver's dense and matrix-free row capacities; point gets none."""
+        model = _build("cpu", worlds=2)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        state = model.state()
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        pipeline.collide(state, contacts)
+        augmented = SimpleNamespace(
+            body_v_s=wp.zeros(model.body_count, dtype=wp.spatial_vector, device="cpu"),
+            joint_S_s=wp.zeros(model.joint_dof_count, dtype=wp.spatial_vector, device="cpu"),
+        )
+        for law, beta, bound in (("patch", None, (48, 24)), ("point", 0.0, None)):
+            with self.subTest(law=law):
+                solver = SolverFeatherPGS(
+                    model, pgs_mode="split", dense_max_constraints=48, mf_max_constraints=24, friction_anchor_beta=beta
+                )
+                # The classifier owns only the CUDA matrix-free route; split mode keeps no world DOF map,
+                # which the mocked decision launch never reads.
+                solver.world_dof_indices = wp.zeros((model.world_count, 1), dtype=int, device="cpu")
+                solver.world_dof_count = wp.zeros(model.world_count, dtype=int, device="cpu")
+                with patch.object(rw, "supported", return_value=True):
+                    owner = rw.ResolvedWorlds(solver)
+                with patch.object(rw, "launch") as launch:
+                    owner.classify(state, augmented, contacts, DT)
+                launch.assert_called_once()
+                options = launch.call_args.kwargs
+                self.assertEqual(options["row_bound"], bound)
+                self.assertIs(options["free_normals"], owner.free_normals)
+                self.assertEqual(owner.free_normals.shape, (model.world_count if bound else 0,))
+
     def test_policy_names_no_robot(self):
         """The admission reads row kinds and sizes, never a robot."""
         source = inspect.getsource(rw).lower()
@@ -527,12 +558,21 @@ def _admissible_solver():
 
 
 def _rollout(
-    model, *, classifier, steps=90, published=True, friction_anchor_beta=0.0, history=None, solver_kwargs=None
+    model,
+    *,
+    classifier,
+    steps=90,
+    published=True,
+    friction_anchor_beta=0.0,
+    history=None,
+    solver_kwargs=None,
+    toss_every=2,
 ):
-    """Swing the arms and toss the boxes; return the solver, poses and the per-step resolved masks.
+    """Swing the arms and toss every ``toss_every``-th free body; return the solver, poses and resolved masks.
 
-    ``history`` collects each step's stored anchor validity and the count of contacts the
-    classifier marked CONTACT_PATH_RESOLVED.
+    ``history`` collects one record per step: the stored anchor validity (``valid``), the count of
+    contacts the classifier marked CONTACT_PATH_RESOLVED (``marked``) and, with the classifier, the
+    worlds whose rows all separate (``separating``) and those it resolved (``resolved``).
     """
     env = {
         "FEATHER_PGS_PREDICTED_TWISTS": str(int(published)),
@@ -561,8 +601,8 @@ def _rollout(
     types, qd_start = model.joint_type.numpy(), model.joint_qd_start.numpy()
     for joint in np.flatnonzero(types == int(newton.JointType.REVOLUTE))[::3]:
         qd[qd_start[joint]] = 1.5
-    # Every other box starts moving up: its ground contact separates at the predictor.
-    for joint in np.flatnonzero(types == int(newton.JointType.FREE))[::2]:
+    # A tossed body starts moving up: its ground contact separates at the predictor.
+    for joint in np.flatnonzero(types == int(newton.JointType.FREE))[::toss_every]:
         qd[qd_start[joint] + 2] = 1.0
     states[0].joint_qd.assign(qd)
     poses, masks = [], []
@@ -575,14 +615,56 @@ def _rollout(
         masks.append(solver._resolved_worlds.numpy().copy())
         if history is not None:
             count = int(contacts.rigid_contact_count.numpy()[0])
-            history.append(
-                (
-                    solver._friction_patches.previous.valid.numpy().copy(),
-                    int(np.sum(solver.contact_path.numpy()[:count] == int(CONTACT_PATH_RESOLVED))),
-                )
-            )
+            record = {
+                "valid": solver._friction_patches.previous.valid.numpy().copy(),
+                "marked": int(np.sum(solver.contact_path.numpy()[:count] == int(CONTACT_PATH_RESOLVED))),
+            }
+            owner = solver._resolved_worlds_owner
+            if owner is not None:
+                scratch = owner.scratch
+                invalid = int(scratch.global_invalid.numpy()[0]) != 0
+                record["separating"] = (scratch.rejected.numpy() == 0) & (not invalid)
+                record["resolved"] = owner.resolved.numpy() != 0
+            history.append(record)
     wp.synchronize_device(model.device)
     return solver, np.array(poses), np.array(masks)
+
+
+def _tossed_spheres(device, worlds=4):
+    """Per world, a two-joint arm hanging clear of the ground and a free sphere 1 cm above it.
+
+    The sphere's one contact holds a patch anchor, whose three rows a matrix-free capacity of two
+    rows rejects on the complete path whatever the slot order, so the anchor keeps its history.
+    """
+    scene = newton.ModelBuilder()
+    cfg = scene.default_shape_cfg.copy()
+    cfg.mu = 0.6
+    parent, joints = -1, []
+    for link in range(2):
+        body = scene.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.04), lock_inertia=True)
+        joints.append(
+            scene.add_joint_revolute(
+                parent=parent,
+                child=body,
+                axis=newton.Axis.Y,
+                parent_xform=wp.transform(wp.vec3(0.0, 0.0, 1.0 if link == 0 else -0.2), wp.quat_identity()),
+                target_ke=30.0,
+                target_kd=2.0,
+                limit_lower=-1.5,
+                limit_upper=1.5,
+            )
+        )
+        parent = body
+    scene.add_shape_capsule(parent, radius=0.03, half_height=0.1, cfg=cfg)
+    scene.add_articulation(joints)
+    sphere = scene.add_body(xform=wp.transform(wp.vec3(0.6, 0.0, 0.06), wp.quat_identity()), mass=0.5)
+    scene.add_shape_sphere(sphere, radius=0.05, cfg=cfg)
+    builder = newton.ModelBuilder()
+    builder.replicate(scene, worlds, spacing=(3.0, 3.0, 0.0))
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+    model.rigid_contact_max = 256
+    return model
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "The classifier is a CUDA path")
@@ -636,15 +718,41 @@ class TestResolvedWorldsCUDA(unittest.TestCase):
                 )
                 self.assertGreater(int(masks.sum()), 0)
                 self.assertLess(int(masks.sum()), masks.size)
-                self.assertGreater(sum(marked for _, marked in history), 0, "no contact released its anchor")
+                self.assertGreater(sum(record["marked"] for record in history), 0, "no contact released its anchor")
                 # Boxes start just above the ground; resting ones hold anchors once they land.
-                self.assertGreater(max(int(np.sum(valid)) for valid, _ in complete_history), 0, "no anchor stuck")
-                for step, ((valid, _), (expected, _)) in enumerate(zip(history, complete_history, strict=True)):
-                    np.testing.assert_array_equal(valid, expected, err_msg=f"previous.valid at step {step}")
+                self.assertGreater(max(int(np.sum(record["valid"])) for record in complete_history), 0, "no anchor")
+                for step, (record, expected) in enumerate(zip(history, complete_history, strict=True)):
+                    np.testing.assert_array_equal(
+                        record["valid"], expected["valid"], err_msg=f"previous.valid at step {step}"
+                    )
                 assert_history_close(solver, plain_solver)
                 self.assertTrue(np.isfinite(poses).all())
                 np.testing.assert_allclose(poses[:, :, :3], plain[:, :, :3], atol=1.0e-5, rtol=0.0)
                 np.testing.assert_allclose(poses[:, :, 3:], plain[:, :, 3:], atol=1.0e-5, rtol=0.0)
+
+    def test_patch_bound_keeps_worlds_whose_rows_overflow(self):
+        """A separating world whose rows overflow a route stays on the complete path, which keeps the anchors.
+
+        Each tossed sphere's contact separates, so the unbounded decision would resolve its world and
+        release the anchor; the complete path rejects the contact's three rows for capacity instead and
+        keeps the anchor. The capacity bound (three rows per checked contact) must hold the world.
+        """
+        model = _tossed_spheres(wp.get_device("cuda:0"))
+        # Thirty steps: each sphere rises about 5 cm and starts falling, inside the 10 cm contact gap.
+        options = {"steps": 30, "friction_anchor_beta": None, "solver_kwargs": {"mf_max_constraints": 2}}
+        complete_history, history = [], []
+        plain_solver, plain, _ = _rollout(model, classifier=False, history=complete_history, toss_every=1, **options)
+        solver, poses, _ = _rollout(model, classifier=True, history=history, toss_every=1, **options)
+        self.assertEqual(solver._resolved_worlds_owner.row_bound, (solver.dense_max_constraints, 2))
+        held = sum(int(np.sum(record["separating"] & ~record["resolved"])) for record in history)
+        self.assertGreater(held, 0, "no separating world was held for capacity")
+        self.assertEqual(sum(record["marked"] for record in history), 0)
+        # The complete path keeps the anchor of every rejected contact.
+        self.assertGreater(min(int(np.sum(record["valid"])) for record in complete_history), 0, "no anchor kept")
+        for step, (record, expected) in enumerate(zip(history, complete_history, strict=True)):
+            np.testing.assert_array_equal(record["valid"], expected["valid"], err_msg=f"previous.valid at step {step}")
+        assert_history_close(solver, plain_solver)
+        np.testing.assert_allclose(poses, plain, atol=1.0e-5, rtol=0.0)
 
     def test_published_twists_match_the_body_pass(self):
         """The predictor's published twists decide the same worlds as the classifier's own body pass."""
