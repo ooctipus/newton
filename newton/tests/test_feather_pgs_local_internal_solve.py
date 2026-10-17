@@ -428,13 +428,22 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "local internal solve requires CUDA")
     def test_row_packet_kernel_pools_the_patch_load_like_group_rows(self):
-        """Pool a patch ring and solve its tangent pair from row packets exactly as from group Jacobians."""
-        results = _patch_ring_solves(wp.get_cuda_device())
-        for packet, group in zip(results["packets"], results["group"], strict=True):
-            np.testing.assert_array_equal(packet, group)
-        # The pooled normal impulse gives radius 2; the coupled tangent solution is [.25, 1.5].
-        np.testing.assert_allclose(results["packets"][1][0], [0.0, 0.25, 1.5, 4.0], rtol=0.0, atol=2.0e-6)
-        np.testing.assert_allclose(results["packets"][2], [1.0, 1.5], rtol=0.0, atol=2.0e-6)
+        """Pool a patch ring and bound its tangent pair from row packets exactly as from group Jacobians.
+
+        Mu 0.5 times the ring's pooled normal impulse (rows 0 and 3) bounds the tangent pair of row 0.
+        With 4 on row 3 the radius is 2, which holds the coupled solution [.25, 1.5] of
+        A x = [1, 2], A = [[1, .5], [.5, 1.25]]. With 2 the radius is 1 < 1.52: the pair minimizes the
+        same quadratic on the circle, (A + 0.6906 I) x = [1, 2], not the free pair's radial projection
+        [.1644, .9864].
+        """
+        for load, pair in ((4.0, (0.25, 1.5)), (2.0, (0.3103473, 0.9506233))):
+            with self.subTest(load=load):
+                results = _patch_ring_solves(wp.get_cuda_device(), load)
+                for packet, group in zip(results["packets"], results["group"], strict=True):
+                    np.testing.assert_array_equal(packet, group)
+                np.testing.assert_allclose(results["packets"][1][0], [0.0, *pair, load], rtol=0.0, atol=2.0e-6)
+                velocity = (pair[0] + 0.5 * pair[1], pair[1])
+                np.testing.assert_allclose(results["packets"][2], velocity, rtol=0.0, atol=2.0e-6)
 
     @unittest.skipUnless(wp.is_cuda_available(), "local internal solve requires CUDA")
     def test_local_residual_queue_matches_sequential_dense_and_matrix_free_pgs(self):
@@ -579,12 +588,12 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
         np.testing.assert_allclose(mf_impulses.numpy()[0, :mf_count], expected_mf_impulses, rtol=0.0, atol=3.0e-6)
 
 
-def _patch_ring_solves(device):
+def _patch_ring_solves(device, load):
     """Solve one world's patch ring with the group-Jacobian and the row-packet local kernels.
 
-    Normal rows 0 and 3 form the ring and hold no Jacobian; the tangent pair of row 0 reads the
-    pooled load. The packets hold the group Jacobian's rows and no prefix row. Returns, per kernel,
-    the diagonal, impulses and velocity after one sweep.
+    Normal rows 0 and 3 form the ring and hold no Jacobian; row 3 carries ``load`` and the tangent
+    pair of row 0 reads the pooled load. The packets hold the group Jacobian's rows and no prefix
+    row. Returns, per kernel, the diagonal, impulses and velocity after one sweep.
     """
     dof_count, max_constraints = 2, 4
     rows = [[0.0, 0.0], [1.0, 0.0], [0.5, 1.0], [0.0, 0.0]]
@@ -615,7 +624,7 @@ def _patch_ring_solves(device):
     results = {}
     for name, (kernel, operands) in kernels.items():
         diagonal = wp.array([[1.0, 0.0, 0.0, 1.0]], dtype=wp.float32, device=device)
-        impulses = wp.array([[0.0, 0.0, 0.0, 4.0]], dtype=wp.float32, device=device)
+        impulses = wp.array([[0.0, 0.0, 0.0, load]], dtype=wp.float32, device=device)
         velocity = wp.zeros(dof_count, dtype=wp.float32, device=device)
         wp.launch_tiled(
             kernel,
