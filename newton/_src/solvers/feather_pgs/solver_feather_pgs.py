@@ -213,6 +213,7 @@ from .kernels import (
     update_qdd_from_velocity,
     vector_add_inplace,
 )
+from .path_selection import applied_options, options_selection, route_selection
 from .response_block_sweep import (
     RB_A_SLOT,
     RB_NM,
@@ -1838,6 +1839,8 @@ class SolverFeatherPGS(SolverBase):
                 ``[0, 1]``; non-finite values are treated as zero. Set the threshold to zero to apply restitution
                 to every closing impact. Defaults to 0.5 m/s.
         """
+        # Every option as requested, before any default resolution; get_path_selection() reports it.
+        requested_options = dict(locals())
         if contact_compliance:
             _contact_compliance.validate_configuration(
                 model,
@@ -1901,11 +1904,14 @@ class SolverFeatherPGS(SolverBase):
         self.contact_friction_articulation_pairs_only = bool(contact_friction_articulation_pairs_only)
         self.contact_friction_scale = float(contact_friction_scale)
         effective_pgs_kernel = pgs_kernel
+        # How friction_anchor_beta was resolved, for get_path_selection().
+        self._friction_anchor_beta_source = "argument"
         if friction_anchor_beta is None:
             # An explicit point algorithm remains a valid way to select point
             # friction. The ordinary constructor enables persistent patches.
             if contact_compliance:
                 friction_anchor_beta = 0.0
+                self._friction_anchor_beta_source = "default_compliance"
                 warnings.warn(
                     "The selected contact material law uses velocity-only point friction; "
                     "contact_compliance does not support persistent friction patches. "
@@ -1915,6 +1921,7 @@ class SolverFeatherPGS(SolverBase):
                 )
             elif friction_mode != "current" or effective_pgs_kernel in ("tiled_contact", "streaming"):
                 friction_anchor_beta = 0.0
+                self._friction_anchor_beta_source = "default_point_solver"
                 warnings.warn(
                     "The selected point-contact solver uses velocity-only friction. "
                     "Omit the point solver selection to use default patch friction, or set "
@@ -1924,6 +1931,7 @@ class SolverFeatherPGS(SolverBase):
                 )
             else:
                 friction_anchor_beta = 0.2
+                self._friction_anchor_beta_source = "default"
         self.friction_anchor_beta = float(friction_anchor_beta)
         if not np.isfinite(self.friction_anchor_beta) or self.friction_anchor_beta < 0.0:
             raise ValueError("friction_anchor_beta must be finite and non-negative")
@@ -2101,6 +2109,9 @@ class SolverFeatherPGS(SolverBase):
             legacy_mf_decay = float(mf_warmstart_decay)
         if not math.isfinite(legacy_mf_decay) or legacy_mf_decay < 0.0:
             raise ValueError(f"mf_warmstart_decay must be finite and non-negative, got {legacy_mf_decay!r}")
+        # Effective legacy alias values (argument or IL_NEWTON_FPGS_* environment), for get_path_selection().
+        self._legacy_mf_warmstart = legacy_mf_warmstart
+        self._legacy_mf_warmstart_decay = legacy_mf_decay
 
         requested_pgs_decay = float(pgs_warmstart_decay)
         if not math.isfinite(requested_pgs_decay) or requested_pgs_decay < 0.0:
@@ -2903,25 +2914,44 @@ class SolverFeatherPGS(SolverBase):
         # limit prefix and contact packets built in place for the local solve
         # owners (row_packets.py); FEATHER_PGS_ROW_PACKETS=0 opts out.
         self._row_packets = None
-        if (
-            self._sparse_mass_matrix_size is None
-            and self._point_contact_paths
-            and os.environ.get("FEATHER_PGS_ROW_PACKETS", "1") == "1"
-        ):
+        if self._sparse_mass_matrix_size is not None:
+            self._row_packets_reason = "Native sparse factors own the contact rows."
+        elif not self._point_contact_paths:
+            self._row_packets_reason = (
+                "Local packets implement point contacts; patch friction, torsion and compliance keep ordinary rows."
+            )
+        elif os.environ.get("FEATHER_PGS_ROW_PACKETS", "1") != "1":
+            self._row_packets_reason = "FEATHER_PGS_ROW_PACKETS disables local packets."
+        else:
             from .row_packets import create_owner as create_row_packets  # noqa: PLC0415
 
             self._row_packets = create_row_packets(self)
+            self._row_packets_reason = (
+                "Admitted: worlds of one limited articulation and at most one other build packets in place."
+                if self._row_packets is not None
+                else "The local packet law does not admit this topology, policy or device."
+            )
+        # Keyed rows are on by policy wherever their producer admits the solver
+        # (keyed_rows.create_owner); FEATHER_PGS_KEYED_ROWS=0 opts out.
         self._keyed_rows = None
-        if (
-            self._sparse_mass_matrix_size is None
-            and self._point_contact_paths
-            # Keyed rows are on by policy wherever their producer admits the solver
-            # (keyed_rows.create_owner); FEATHER_PGS_KEYED_ROWS=0 opts out.
-            and os.environ.get("FEATHER_PGS_KEYED_ROWS", "1") != "0"
-        ):
+        if self._sparse_mass_matrix_size is not None:
+            self._keyed_rows_reason = "Native sparse factors own the contact rows."
+        elif not self._point_contact_paths:
+            self._keyed_rows_reason = (
+                "Keyed rows implement point contacts; patch friction, torsion and compliance keep ordinary rows."
+            )
+        elif os.environ.get("FEATHER_PGS_KEYED_ROWS", "1") == "0":
+            self._keyed_rows_reason = "FEATHER_PGS_KEYED_ROWS=0 disables keyed rows."
+        else:
             from .keyed_rows import create_owner as create_kinetic_rows_owner  # noqa: PLC0415
 
             self._keyed_rows = create_kinetic_rows_owner(self)
+            self._keyed_rows_reason = (
+                "Admitted: the in-kernel parallel sweep builds keyed rows for its bounded worlds."
+                if self._keyed_rows is not None
+                else "Keyed rows need the opt-in in-kernel parallel sweep (FEATHER_PGS_INK=1 with "
+                "mf_gs_parallel_rows and mf_gs_parallel_matrix_free) and a plain matrix-free policy."
+            )
         self._init_tiled_kernels(model)
         self._init_size_group_streams(model)
         self._dummy_contact_impulses = wp.zeros((1, 1), dtype=wp.float32, device=model.device)
@@ -3079,11 +3109,13 @@ class SolverFeatherPGS(SolverBase):
             )
 
         self._sparse_factor = None
-        if (
-            self._sparse_mass_matrix_size is None
-            and self._point_contact_paths
-            and os.environ.get("FEATHER_PGS_SPARSE_FACTOR") == "1"
-        ):
+        if self._sparse_mass_matrix_size is not None:
+            self._sparse_factor_reason = "Native sparse factors own factor and row storage."
+        elif not self._point_contact_paths:
+            self._sparse_factor_reason = "The packed research factor implements point contacts only."
+        elif os.environ.get("FEATHER_PGS_SPARSE_FACTOR") != "1":
+            self._sparse_factor_reason = "Off: FEATHER_PGS_SPARSE_FACTOR is a research opt-in."
+        else:
             from .sparse_factor import create_owner as create_sparse_factor  # noqa: PLC0415
 
             if (
@@ -3097,6 +3129,11 @@ class SolverFeatherPGS(SolverBase):
             ):
                 raise ValueError("Sparse factor excludes canonical factor/row debug readers")
             self._sparse_factor = create_sparse_factor(self)
+            self._sparse_factor_reason = (
+                "FEATHER_PGS_SPARSE_FACTOR=1: the packed research factor owns factor, rows and sweep."
+                if self._sparse_factor is not None
+                else "FEATHER_PGS_SPARSE_FACTOR=1 declined: the topology or solver policy is outside its contract."
+            )
 
         from .cached_dynamics import install as install_cached_dynamics  # noqa: PLC0415
 
@@ -3113,6 +3150,7 @@ class SolverFeatherPGS(SolverBase):
         classifier = ResolvedWorlds(self)
         self._resolved_worlds_owner = classifier if classifier.enabled else None
         self._resolved_worlds = classifier.resolved
+        self._resolved_worlds_reason = classifier.reason
 
         if self._explicit_dense_kernels:
             for name in (
@@ -3236,16 +3274,28 @@ class SolverFeatherPGS(SolverBase):
                 dense_support_tiles=True,
                 stage_velocities=True,
             )
+        # Record the applied options once; get_path_selection() returns detached copies.
+        self._applied_options = applied_options(self, SolverFeatherPGS.__init__, requested_options)
 
     def get_path_selection(self) -> dict:
         """Return requested choices, active plans and selection reasons without device synchronization.
 
         Kernel plans describe ordinary stages per articulation DOF count. Cached
         prediction can replace these stages; its owner is reported separately.
-        Automatic choices use topology and resource rules, not online timing.
-        Recreate the solver to change them. The ``reasons`` mapping explains
-        construction-time admission and fallbacks; it does not predict dynamic
-        per-world branches. Ordinary kernel plans can be superseded by a cache.
+        Automatic choices use topology and resource rules; only the held-tree
+        lane width is timed, once, at construction. Recreate the solver to change
+        them. The ``reasons`` mapping explains construction-time admission and
+        fallbacks; it does not predict dynamic per-world branches. Ordinary
+        kernel plans can be superseded by a cache.
+
+        ``routes`` records every construction-time owner and variant that decides
+        which kernels run: the held-tree owner and its lane layouts, the contact-row
+        producer, local, paired and sparse responses, the sweep kernels per route
+        and tier, resolved worlds, publication, velocity limits, free bodies and
+        the friction law, each with a reason. ``options`` records every constructor
+        option's requested, declared-default and applied value, captured once at
+        construction. The record is host-only, detached from solver state and
+        JSON-compliant (non-finite floats are strings).
         """
         kernels = {}
         kernel_reasons = {}
@@ -3301,7 +3351,7 @@ class SolverFeatherPGS(SolverBase):
             kernel_reasons[size] = {
                 name: f"{self._kernel_choice_reasons[name]} {reason}" for name, reason in reasons.items()
             }
-        return {
+        selection = {
             "requested": dict(self._requested_kernel_choices),
             "sparse_mass_matrix": "on" if self._sparse_mass_matrix_size is not None else "off",
             "cached_dynamics": "on" if cached else "off",
@@ -3327,6 +3377,9 @@ class SolverFeatherPGS(SolverBase):
                 "kernel_plan_by_dof": kernel_reasons,
             },
         }
+        selection["routes"] = route_selection(self)
+        selection["options"] = options_selection(self)
+        return selection
 
     def prepare_contact_torsion_capture(self, state_in: State, state_out: State) -> None:
         """Prepare experimental torsion rollback buffers before CUDA graph capture.
@@ -4963,6 +5016,11 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_prepare_contacts = False
         self._sparse_row_support = _SparseRowSupport()
         self._sparse_contact_triplets = False
+        # Route details for get_path_selection(), set where the sparse owner is admitted.
+        self._sparse_active_rows = False
+        self._sparse_active_rows_reason = "Native sparse factors are not selected."
+        self._sparse_contact_triplets_reason = "Native sparse factors are not selected."
+        self._sparse_max_row_support = None
         sparse_choice = getattr(self, "sparse_mass_matrix", "auto")
         if sparse_choice == "off":
             self._sparse_selection_reason = "Explicit sparse_mass_matrix='off' retains ordinary factors."
@@ -5158,6 +5216,18 @@ class SolverFeatherPGS(SolverBase):
             and not self._has_free_rigid_bodies
             and not self._friction_anchors_enabled
         )
+        if active_rows:
+            active_rows_reason = "Point-contact normal and limit rows are selected at sweep entry."
+        elif not self._kernel_overrides.get("sparse_active_contacts", True):
+            active_rows_reason = "A private sparse_active_contacts override disables the active-row scan."
+        elif split_candidate or velocity_candidate:
+            active_rows_reason = "Split and velocity-limit rows keep full ordered sweeps."
+        elif self._has_free_rigid_bodies:
+            active_rows_reason = "Independent free-body rows keep full ordered sweeps."
+        else:
+            active_rows_reason = (
+                "Patch friction (friction_anchor_beta > 0) links rows; the active-row scan needs point friction."
+            )
         solve_shared_bytes = 8 * self.max_world_dofs + 26 * self.dense_max_constraints + 16 * mf_capacity
         if split_candidate or velocity_candidate:
             solve_shared_bytes += 256  # Warp's tiled launch base.
@@ -5188,6 +5258,9 @@ class SolverFeatherPGS(SolverBase):
             f"solve uses {solve_shared_bytes}/{shared_limit} bytes of shared memory."
         )
         self._sparse_mass_matrix_size = size
+        self._sparse_active_rows = active_rows
+        self._sparse_active_rows_reason = active_rows_reason
+        self._sparse_max_row_support = int(max_support)
         self._sparse_split = split_candidate
         self._sparse_velocity_limits = velocity_candidate
         self._sparse_prepare_contacts = bool(self._kernel_overrides.get("sparse_prepare_contacts", True))
@@ -5234,13 +5307,28 @@ class SolverFeatherPGS(SolverBase):
         # Include Warp's tiled base and align the two maps before their counters.
         metric_map_bytes = (2 * triplet_capacity + 3) // 4 * 4
         triplet_shared_bytes = 256 + 40 * metric_cache_size + metric_map_bytes + 8
+        triplets_requested = os.environ.get("FEATHER_PGS_SPARSE_CONTACT_TRIPLETS", "0") == "1"
         self._sparse_contact_triplets = bool(
-            os.environ.get("FEATHER_PGS_SPARSE_CONTACT_TRIPLETS", "0") == "1"
+            triplets_requested
             and active_rows
             and use_support_table
             and triplet_capacity > 0
             and solve_shared_bytes + triplet_shared_bytes <= shared_limit
         )
+        if self._sparse_contact_triplets:
+            self._sparse_contact_triplets_reason = (
+                "FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1: tangent metrics stay in registers."
+            )
+        elif not triplets_requested:
+            self._sparse_contact_triplets_reason = "Off: FEATHER_PGS_SPARSE_CONTACT_TRIPLETS is an opt-in."
+        elif not active_rows:
+            self._sparse_contact_triplets_reason = "Requested, but triplets need the active-row scan."
+        elif not use_support_table:
+            self._sparse_contact_triplets_reason = "Requested, but triplets need the row support table."
+        else:
+            self._sparse_contact_triplets_reason = (
+                "Requested, but row capacity or shared memory leaves no triplet cache."
+            )
         index_shape = (1, 1, 1) if use_support_table else shape
         self._sparse_row_dof = wp.empty(index_shape, dtype=wp.int32, device=model.device)
         self._sparse_row_factor = wp.empty(shape, dtype=wp.float32, device=model.device)
@@ -6911,14 +6999,25 @@ class SolverFeatherPGS(SolverBase):
         self._paired_cholesky_inverse_kernel = None
         self._paired_response_kernel = None
         self._paired_components = None
-        if os.environ.get("FEATHER_PGS_PAIRED_COMPONENTS", "1") == "1" and not (
-            _FPGS_CAPTURE or _GROUPED_CHECK or _DEBUG_CACHE_CMP or _INK_CHECK or _WR_CHECK
-        ):
+        if os.environ.get("FEATHER_PGS_PAIRED_COMPONENTS", "1") != "1":
+            self._paired_components_reason = "FEATHER_PGS_PAIRED_COMPONENTS disables independent components."
+        elif _FPGS_CAPTURE or _GROUPED_CHECK or _DEBUG_CACHE_CMP or _INK_CHECK or _WR_CHECK:
+            self._paired_components_reason = "Debug capture and comparison modes keep the coupled paired sweep."
+        else:
             from .paired_components import PairedComponents  # noqa: PLC0415
             from .paired_components import supported as components_supported  # noqa: PLC0415
 
             if components_supported(self):
                 self._paired_components = PairedComponents(self)
+                self._paired_components_reason = (
+                    "Admitted: each paired world splits into independent articulation and free-body components."
+                )
+            else:
+                self._paired_components_reason = (
+                    "Components need the paired factor-coordinate sweep with one free body per world and a plain "
+                    "interleaved policy without warm start, regularization, preelimination, compliance or "
+                    "bilateral rows."
+                )
         if self._paired_response_primary_size is not None:
             primary_size = self._paired_response_primary_size
             secondary_size = self._paired_response_secondary_size

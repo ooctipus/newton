@@ -3,6 +3,8 @@
 
 """Exercise public automatic choices and forced implementation contracts."""
 
+import inspect
+import json
 import os
 import unittest
 from unittest.mock import patch
@@ -22,6 +24,26 @@ def _cpu_model():
     return builder.finalize(device="cpu")
 
 
+def _cpu_free_body_model(velocity_limit=None):
+    """A one-joint arm and a free box above the ground in one CPU world, optionally with box velocity limits."""
+    builder = newton.ModelBuilder()
+    limits = {}
+    if velocity_limit is not None:
+        SolverFeatherPGS.register_custom_attributes(builder)
+        limits = {
+            "custom_attributes": {
+                "rigid_body_max_linear_velocity": velocity_limit,
+                "rigid_body_max_angular_velocity": velocity_limit,
+            }
+        }
+    body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    builder.add_articulation([builder.add_joint_revolute(-1, body)])
+    free = builder.add_body(xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()), **limits)
+    builder.add_shape_box(free, hx=0.1, hy=0.1, hz=0.1)
+    builder.add_ground_plane()
+    return builder.finalize(device="cpu")
+
+
 class TestFeatherPGSPathSelection(unittest.TestCase):
     def test_cpu_selection_reasons_are_detached_and_host_only(self):
         """Explain CPU fallbacks without synchronizing or exposing mutable solver state."""
@@ -32,8 +54,198 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertIn("CPU", selected["reasons"]["sparse_mass_matrix"])
         self.assertIn("CPU", selected["reasons"]["cached_dynamics"])
         self.assertIn("CPU", selected["reasons"]["kernel_plan_by_dof"][1]["cholesky_kernel"])
+        # Benchmark results store this record with json.dumps(..., allow_nan=False).
+        json.dumps(selected, allow_nan=False)
         selected["reasons"]["kernel_plan_by_dof"][1]["cholesky_kernel"] = "edited"
-        self.assertNotEqual(solver.get_path_selection()["reasons"], selected["reasons"])
+        selected["routes"]["friction"]["law"] = "edited"
+        selected["options"]["pgs_iterations"]["applied"] = -1
+        again = solver.get_path_selection()
+        self.assertNotEqual(again["reasons"], selected["reasons"])
+        self.assertEqual(again["routes"]["friction"]["law"], "patch")
+        self.assertEqual(again["options"]["pgs_iterations"]["applied"], 12)
+
+    def test_cpu_options_record_applied_values_and_sources(self):
+        """Record every option's requested, default and applied value once, with non-finite floats as strings."""
+        model = _cpu_model()
+        options = SolverFeatherPGS(model).get_path_selection()["options"]
+        self.assertEqual(set(options), set(inspect.signature(SolverFeatherPGS).parameters) - {"model"})
+        self.assertEqual(
+            options["friction_anchor_beta"], {"applied": 0.2, "requested": None, "default": None, "source": "default"}
+        )
+        self.assertEqual(
+            options["pgs_kernel"], {"applied": "loop", "requested": "auto", "default": "auto", "source": "default"}
+        )
+        self.assertEqual(options["pgs_chunk_size"]["applied"], 1)
+        self.assertEqual(options["contact_friction_gap_threshold"]["applied"], "inf")
+        self.assertEqual(options["joint_limit_activation_gap"]["default"], "inf")
+        self.assertFalse(options["fuse_joint_velocity_limits"]["applied"])
+        self.assertEqual(options["sparse_mass_matrix"]["applied"], "off")
+        self.assertEqual(options["cached_dynamics"]["applied"], "off")
+        solver = SolverFeatherPGS(model, 0.1, friction_anchor_beta=0.0, pgs_iterations=7, parallel_tree=True)
+        selected = solver.get_path_selection()
+        options = selected["options"]
+        self.assertEqual(
+            options["angular_damping"], {"applied": 0.1, "requested": 0.1, "default": 0.05, "source": "argument"}
+        )
+        self.assertEqual(
+            options["friction_anchor_beta"], {"applied": 0.0, "requested": 0.0, "default": None, "source": "argument"}
+        )
+        # CPU keeps serial traversal: the request resolves to no tree plan.
+        self.assertEqual(
+            options["parallel_tree"], {"applied": False, "requested": True, "default": False, "source": "argument"}
+        )
+        self.assertEqual(selected["routes"]["friction"]["law"], "point")
+        self.assertEqual(selected["routes"]["friction"]["anchor_beta_source"], "argument")
+        solver.pgs_iterations = 3
+        self.assertEqual(solver.get_path_selection()["options"]["pgs_iterations"]["applied"], 7)
+
+    def test_cpu_route_record_reports_known_selections(self):
+        """Report the CPU loop sweep, the split free-body rows and the declined owners with their reasons."""
+        routes = SolverFeatherPGS(_cpu_free_body_model()).get_path_selection()["routes"]
+        self.assertEqual(routes["articulations_by_dof"], {"6": 1, "1": 1})
+        self.assertEqual(routes["sweep"]["route"], "dense_loop")
+        self.assertEqual(routes["sweep"]["driver"], "dense_split")
+        self.assertEqual(routes["sweep"]["dense"], {"kernels": ["pgs_solve_loop"]})
+        self.assertEqual(routes["sweep"]["free_body_matrix_free"], "pgs_solve_mf_loop")
+        # Only the matrix-free step packs row metadata.
+        self.assertIsNone(routes["sweep"]["mf_meta_pack"])
+        self.assertEqual(routes["free_rigid_bodies"]["count"], 1)
+        self.assertEqual(routes["free_rigid_bodies"]["owners"], ["split_matrix_free_rows"])
+        self.assertIsNone(routes["held_tree"]["owner"])
+        self.assertIn("CPU", routes["held_tree"]["reason"])
+        self.assertEqual(routes["contact_rows"]["producer"], "general")
+        self.assertEqual(routes["contact_rows"]["general_method_by_dof"], {"6": "per_contact", "1": "per_contact"})
+        self.assertFalse(routes["contact_rows"]["row_packets"]["enabled"])
+        self.assertIn("point contacts", routes["contact_rows"]["row_packets"]["reason"])
+        self.assertFalse(routes["resolved_worlds"]["enabled"])
+        self.assertIn("matrix-free route", routes["resolved_worlds"]["reason"])
+        self.assertEqual(routes["publication"]["owner"], "ordinary")
+        self.assertEqual(routes["publication"]["fk_id_cache"], "off")
+        self.assertEqual(routes["velocity_limits"]["joint"], "off")
+        self.assertFalse(routes["velocity_limits"]["free_body_rows"])
+        self.assertEqual(routes["friction"]["law"], "patch")
+        self.assertEqual(routes["friction"]["anchor_beta_source"], "default")
+        self.assertIn("need point friction", routes["friction"]["reason"])
+        self.assertIsNone(routes["sparse_mass_matrix"]["size"])
+        self.assertFalse(routes["sparse_mass_matrix"]["active_rows"])
+        self.assertIn("CPU", routes["sparse_mass_matrix"]["reason"])
+
+    def test_cpu_split_route_reports_free_body_velocity_limit_rows(self):
+        """Report free-body velocity-limit rows in split mode, where the row builder allocates them as well."""
+        solver = SolverFeatherPGS(_cpu_free_body_model(velocity_limit=1.0))
+        limits = solver.get_path_selection()["routes"]["velocity_limits"]
+        self.assertTrue(limits["rigid_body_limits"])
+        self.assertIsNotNone(solver.rigid_velocity_limit_slot)
+        self.assertTrue(limits["free_body_rows"])
+        # Split mode keeps the direct root clamp beside the rows.
+        self.assertEqual(limits["root_clamp"], bool(solver._has_root_free))
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Sparse admission requires CUDA")
+    def test_route_record_reports_sparse_rows_and_tree_owner(self):
+        """Report the active-row scan, triplets, sweep kernel and held-tree layout of the sparse route."""
+        model = _build_model()
+        with patch.dict(os.environ, {"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "1"}):
+            point = _make_solver(model, True, friction_anchor_beta=0.0)
+            patch_friction = _make_solver(model, True)
+        selected = point.get_path_selection()
+        json.dumps(selected, allow_nan=False)
+        routes = selected["routes"]
+        sparse = routes["sparse_mass_matrix"]
+        self.assertEqual(sparse["size"], point._sparse_mass_matrix_size)
+        self.assertTrue(sparse["active_rows"])
+        self.assertEqual(sparse["contact_triplets"], point._sparse_contact_triplets)
+        self.assertEqual(routes["sweep"]["route"], "sparse_pgs")
+        self.assertEqual(routes["sweep"]["sparse"], point._pgs_solve_sparse_kernel.key)
+        self.assertIn("_active", routes["sweep"]["sparse"])
+        if sparse["contact_triplets"]:
+            self.assertIn("_contact_triplets", routes["sweep"]["sparse"])
+        patch_sparse = patch_friction.get_path_selection()["routes"]["sparse_mass_matrix"]
+        self.assertFalse(patch_sparse["active_rows"])
+        self.assertFalse(patch_sparse["contact_triplets"])
+        if patch_sparse["size"] is not None:
+            self.assertIn("friction_anchor_beta", patch_sparse["active_rows_reason"])
+            self.assertIn("active-row scan", patch_sparse["contact_triplets_reason"])
+        tree = routes["held_tree"]
+        self.assertEqual(tree["owner"] is None, point._tree_kinetic_state is None)
+        for group in tree["groups"]:
+            self.assertIn(group["lanes"], (4, 8, 16, 32, 64))
+            self.assertEqual(len(group["roots"]), len(group["root_families"]))
+            self.assertIsNotNone(group["kernels"]["finish"])
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
+    def test_route_record_reports_mixed_owner_and_paired_response(self):
+        """Report the mixed held-tree groups and the paired response of an arm with one free box per world."""
+        from newton.tests.test_feather_pgs_mixed_tree_free_body import _build  # noqa: PLC0415
+
+        model = _build(wp.get_device("cuda:0"), links=17)
+        environment = {
+            "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": "1",
+            "FEATHER_PGS_TREE_KINETIC_STATE": "0",
+            "FEATHER_PGS_TREE_FOREST": "0",
+        }
+        with patch.dict(os.environ, environment):
+            solver = SolverFeatherPGS(
+                model,
+                pgs_mode="matrix_free",
+                pgs_iterations=8,
+                enable_joint_limits=True,
+                update_mass_matrix_interval=2,
+                friction_anchor_beta=0.0,
+                dense_max_constraints=192,
+            )
+        selected = solver.get_path_selection()
+        json.dumps(selected, allow_nan=False)
+        routes = selected["routes"]
+        paired = routes["paired_response"]
+        self.assertEqual(paired["primary_dofs"], 17)
+        self.assertEqual(paired["factor_coordinates"], solver._paired_factor_coordinates)
+        self.assertEqual(paired["components"], solver._paired_components is not None)
+        self.assertEqual(paired["two_stream_overlap"], solver._paired_general_solve_stream is not None)
+        self.assertEqual(routes["sweep"]["paired_factor"], getattr(solver._paired_factor_solve_kernel, "key", None))
+        self.assertEqual(routes["held_tree"]["owner"], "mixed")
+        self.assertIn("FEATHER_PGS_TREE_FOREST", routes["held_tree"]["layout_reason"])
+        self.assertEqual(sorted(group["dofs"] for group in routes["held_tree"]["groups"]), [6, 17])
+        self.assertIn(routes["free_rigid_bodies"]["owners"][0], ("paired_factor", "paired_response"))
+        self.assertEqual(routes["resolved_worlds"]["enabled"], solver._resolved_worlds_owner is not None)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Matrix-free routes require CUDA")
+    def test_route_record_is_json_across_routes(self):
+        """Build a JSON-compliant record for every major admitted construction route."""
+        cases = (
+            ({}, {}),
+            ({"friction_anchor_beta": 0.0}, {}),
+            ({"pgs_mode": "split"}, {}),
+            ({"sparse_mass_matrix": "off", "friction_anchor_beta": 0.0}, {"free_count": 2}),
+            (
+                {"sparse_mass_matrix": "off", "mf_gs_parallel_rows": 48, "friction_anchor_beta": 0.0},
+                {"free_count": 2},
+            ),
+            ({"sparse_mass_matrix": "off", "mf_gs_response_block_rows": 64, "friction_anchor_beta": 0.0}, {}),
+            ({"articulated_contact_response": "propagation"}, {"free_count": 2}),
+            ({"articulated_contact_response": "propagation-colored"}, {"free_count": 2}),
+            ({"grouped_dynamics": True}, {}),
+            ({"enable_joint_velocity_limits": True}, {}),
+        )
+        built = 0
+        for options, model_options in cases:
+            with self.subTest(options=options, model=model_options):
+                try:
+                    solver = _make_solver(_build_model(**model_options), True, **options)
+                except (ValueError, NotImplementedError):
+                    continue  # The record describes admitted constructors only.
+                built += 1
+                selected = solver.get_path_selection()
+                json.dumps(selected, allow_nan=False)
+                self.assertEqual(
+                    set(selected["options"]), set(inspect.signature(SolverFeatherPGS).parameters) - {"model"}
+                )
+                # Owners are reported only where their kernels were built.
+                owners = selected["routes"]["free_rigid_bodies"]["owners"]
+                self.assertEqual("local_pair" in owners, bool(solver._pgs_solve_local_pair_kernels))
+                self.assertEqual("local_residual" in owners, bool(solver._pgs_solve_local_residual_kernels))
+                pack = selected["routes"]["sweep"]["mf_meta_pack"]
+                self.assertEqual(pack is None, solver.pgs_mode != "matrix_free")
+        self.assertGreaterEqual(built, 8)
 
     def test_private_override_validation_and_cpu_precedence(self):
         """Validate effective overrides while preserving explicit choices and CPU fallbacks."""
@@ -143,13 +355,18 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
     def test_packed_tree_owner_imports(self):
         """The packed sparse factor installs its tree state lazily; an import error there breaks every packed scene at setup."""
-        from newton._src.solvers.feather_pgs import packed_tree_owner, tree_kinetic_owner, tree_kinetic_state  # noqa: PLC0415
+        from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
+            packed_tree_owner,
+            tree_kinetic_owner,
+            tree_kinetic_state,
+        )
 
         self.assertTrue(callable(packed_tree_owner.supported))
         self.assertTrue(issubclass(packed_tree_owner.PackedTreeState, tree_kinetic_owner.TreeKineticState))
         for name in ("_lanes", "_sync", "get_helpers", "get_state_kernel", "get_predictor_kernel"):
             self.assertTrue(hasattr(tree_kinetic_state, name), name)
 
+    @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
     def test_cached_dynamics_generic_tree_is_default_and_unsupported_roots_reject(self):
         """A fixed arm with a free body is cached by the generic tree owner by default; a revolute world root is rejected."""
         world = newton.ModelBuilder()

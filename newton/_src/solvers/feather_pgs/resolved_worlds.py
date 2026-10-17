@@ -598,6 +598,19 @@ class ResolvedWorlds:
     def __init__(self, solver, *, absolute_margin: float = 1.0e-5, relative_margin: float = 2.0**-20):
         self.solver = solver
         self.enabled = bool(supported(solver))
+        if self.enabled:
+            self.reason = "Admitted: interleaved matrix-free point-contact rows whose kinds are all unilateral."
+        elif os.environ.get("FEATHER_PGS_RESOLVED_WORLDS", "1") != "1":
+            self.reason = "FEATHER_PGS_RESOLVED_WORLDS disables the classifier."
+        elif getattr(solver, "pgs_mode", None) != "matrix_free" or not solver.model.device.is_cuda:
+            self.reason = "The classifier evaluates the CUDA matrix-free route only."
+        elif not getattr(solver, "_point_contact_paths", False):
+            self.reason = "Patch friction, torsion and compliance rows are outside the point-contact law it classifies."
+        else:
+            self.reason = (
+                "The rows are outside the classified law (route, bilateral or velocity rows, warm start, "
+                "regularization, device or world width)."
+            )
         self.absolute_margin = float(absolute_margin)
         self.relative_margin = float(relative_margin)
         if not all(math.isfinite(v) and v >= 0.0 for v in (self.absolute_margin, self.relative_margin)):

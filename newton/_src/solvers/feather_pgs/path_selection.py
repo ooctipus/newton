@@ -1,0 +1,658 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+"""Host-only records of the construction-time routes and applied options of SolverFeatherPGS.
+
+Every function here reads host attributes only: no device array is read, no
+kernel is launched and nothing synchronizes. Values are JSON-compliant:
+non-finite floats become ``"inf"``, ``"-inf"`` or ``"nan"`` and tuples become lists.
+"""
+
+import copy
+import functools
+import inspect
+import math
+
+import numpy as np
+
+# Options whose applied value lives under another attribute after construction.
+_APPLIED_ATTRIBUTES = {
+    "double_buffer": "_double_buffer",
+    "nvtx": "_nvtx",
+    "row_watermark": "_row_watermark",
+    "mf_warmstart": "_legacy_mf_warmstart",
+    "mf_warmstart_decay": "_legacy_mf_warmstart_decay",
+    "enable_bilateral_preelimination": "_preelim_active",
+}
+
+_BETA_REASONS = {
+    "default": "friction_anchor_beta omitted: persistent patch friction at the 0.2 default.",
+    "default_point_solver": "friction_anchor_beta omitted with a point-contact solver: point friction.",
+    "default_compliance": "friction_anchor_beta omitted with contact_compliance: point friction.",
+    "argument": "friction_anchor_beta passed explicitly.",
+}
+
+
+def json_value(value):
+    """Return a JSON-compliant host copy of a scalar, sequence or mapping without reading device memory."""
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        value = float(value)
+        return value if math.isfinite(value) else repr(value)
+    if isinstance(value, (tuple, list)):
+        return [json_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): json_value(item) for key, item in value.items()}
+    if isinstance(value, np.ndarray):
+        return json_value(value.tolist())
+    # Never str(): a Warp array's str() copies device memory to the host.
+    return f"<{type(value).__name__}>"
+
+
+@functools.cache
+def _declared_defaults(init) -> dict:
+    parameters = list(inspect.signature(init).parameters.values())[2:]  # after self and model
+    return {parameter.name: parameter.default for parameter in parameters}
+
+
+def _is_default(value, default) -> bool:
+    if value is default:
+        return True
+    try:
+        same = value == default
+    except Exception:
+        return False
+    return bool(same) if isinstance(same, (bool, np.bool_)) else False
+
+
+def applied_options(solver, init, arguments: dict) -> dict:
+    """Record every constructor option's requested, declared-default and applied value.
+
+    ``arguments`` is ``locals()`` taken as the constructor's first statement.
+    Call once, after construction. ``source`` is ``"argument"`` when the
+    requested value differs from the declared default and ``"default"``
+    otherwise; Python cannot tell an omitted option from one passed with its
+    default value.
+    """
+    record = {}
+    for name, default in _declared_defaults(init).items():
+        value = arguments.get(name, default)
+        if name == "sparse_mass_matrix":
+            applied = "on" if solver._sparse_mass_matrix_size is not None else "off"
+        elif name == "cached_dynamics":
+            applied = "on" if solver._tree_kinetic_state is not None else "off"
+        elif name == "parallel_tree":
+            applied = solver._tree_plan is not None
+        else:
+            applied = getattr(solver, _APPLIED_ATTRIBUTES.get(name, name), value)
+        record[name] = {
+            "applied": json_value(applied),
+            "requested": json_value(value),
+            "default": json_value(default),
+            "source": "default" if _is_default(value, default) else "argument",
+        }
+    return record
+
+
+def options_selection(solver) -> dict:
+    """Return a detached copy of the options recorded at construction."""
+    return copy.deepcopy(solver._applied_options)
+
+
+def _key(kernel):
+    return None if kernel is None else getattr(kernel, "key", type(kernel).__name__)
+
+
+def _keys_by_size(kernels) -> dict:
+    return {str(int(size)): _key(kernel) for size, kernel in kernels.items() if kernel is not None}
+
+
+def _counts(counts) -> dict:
+    return {str(int(size)): int(count) for size, count in counts.items() if count}
+
+
+def route_selection(solver) -> dict:
+    """Describe every construction-time owner and variant that decides which kernels run."""
+    from . import solver_feather_pgs as source  # noqa: PLC0415 - the solver module's import-time flags
+
+    return {
+        "articulations_by_dof": {str(int(size)): int(count) for size, count in solver.n_arts_by_size.items()},
+        "held_tree": _held_tree(solver),
+        "contact_rows": _contact_rows(solver, source),
+        "local_solve": _local_solve(solver),
+        "paired_response": _paired_response(solver),
+        "sparse_diagonal": _sparse_diagonal(solver),
+        "sparse_mass_matrix": _sparse_mass_matrix(solver),
+        "research_sparse_factor": _research_sparse_factor(solver),
+        "sweep": _sweep(solver, source),
+        "resolved_worlds": _resolved_worlds(solver),
+        "publication": _publication(solver, source),
+        "velocity_limits": _velocity_limits(solver),
+        "free_rigid_bodies": _free_rigid_bodies(solver),
+        "friction": _friction(solver),
+        "dynamics": _dynamics(solver),
+    }
+
+
+def _held_tree(solver) -> dict:
+    owner = solver._tree_kinetic_state
+    if owner is None:
+        kind, groups = None, []
+    elif solver._packed_tree_state is owner:
+        kind, groups = "packed", [owner]
+    elif hasattr(owner, "groups"):
+        groups = list(owner.groups)
+        kind = "forest" if any(group.layout.forest for group in groups) else "mixed"
+    else:
+        kind, groups = "tree", [owner]
+    return {
+        "owner": kind,
+        "reason": solver._cached_dynamics_selection_reason,
+        "layout_reason": getattr(owner, "forest_reason", None),
+        "groups": [_tree_group(group) for group in groups],
+    }
+
+
+def _tree_group(group) -> dict:
+    layout, operator = group.layout, group.sparse
+    return {
+        "operator": type(operator).__name__,
+        "size": json_value(getattr(operator, "size", None)),
+        "group_count": int(group.group_count),
+        "bodies": int(layout.bodies),
+        "dofs": int(layout.dofs),
+        "lanes": int(layout.lanes),
+        "trees_per_block": int(layout.pack),
+        "block_dim": int(group.block_dim),
+        "roots": json_value(layout.roots),
+        "root_coordinates": json_value(layout.root_coordinates),
+        # Factor family per root: its coordinate count, negated for a diagonal-mass family, 0 when prescribed.
+        "root_families": json_value(layout.root_families),
+        "chain_scan": bool(group.chain_scan),
+        "chain_scan_requested": bool(group.chain_scan_requested),
+        "response": group._response,
+        "copy_reuse": bool(group.copy_reuse),
+        "motion_velocity": bool(group.motion_velocity),
+        "publishes_twists": bool(group.publishes_twists),
+        # Several admissible widths are timed once at construction; one width is static.
+        "lane_choice": "timed" if group.lane_timing else "static",
+        "lane_timing_us": {
+            str(int(lanes)): round(float(seconds) * 1.0e6, 3) for lanes, seconds in group.lane_timing.items()
+        },
+        "kernels": {
+            "repair": _key(group.repair_kernel),
+            "finish": _key(group.finish_kernel),
+            "predict": _key(group.predictor_kernel),
+        },
+    }
+
+
+def _contact_rows(solver, source) -> dict:
+    point = bool(solver._point_contact_paths)
+    if solver._sparse_factor is not None:
+        producer = "research_sparse_factor"
+    elif solver._row_packets is not None:
+        producer = "local_packets"
+    elif solver._keyed_rows is not None:
+        producer = "keyed_rows"
+    elif solver._compact_contact_boundary:
+        producer = "compact_contact_boundary"
+    elif solver._sparse_mass_matrix_size is not None:
+        producer = "sparse_contact_response"
+    elif solver._sparse_diagonal_contact_solve:
+        producer = "sparse_diagonal"
+    elif solver._compact_contact_jacobian:
+        producer = "compact_jacobian"
+    else:
+        producer = "general"
+    methods = None
+    if producer == "general":
+        # Mirrors _stage4_build_rows; the debug row checks are not routes.
+        masked_sizes = [int(size) for size in solver.size_groups if size <= 32]
+        methods = {}
+        for size in solver.size_groups:
+            if not point or size > 32 or not (source._ROWS_MASKED or source._ROWS_NATIVE):
+                method = "per_contact"
+            elif source._ROWS_NATIVE:
+                method = "native"
+            elif 1 <= len(masked_sizes) <= 2:
+                method = "fused_rows" if source._ROWS_FUSED and not source._CHECK_ROWS_FUSED else "masked_combined"
+            else:
+                method = "masked"
+            methods[str(int(size))] = method
+    if solver._compact_contact_boundary:
+        compact_reason = "FEATHER_PGS_COMPACT_CONTACT_BOUNDARY admitted the six-coordinate sparse-diagonal triples."
+    elif not source._COMPACT_CONTACT_BOUNDARY:
+        compact_reason = "Off: FEATHER_PGS_COMPACT_CONTACT_BOUNDARY is an import-time opt-in."
+    elif not point:
+        compact_reason = "Compact contacts implement point contacts only."
+    else:
+        compact_reason = "Declined: requires the six-coordinate sparse-diagonal triple contract and no row checks."
+    packets = solver._row_packets
+    return {
+        "producer": producer,
+        "general_method_by_dof": methods,
+        "point_contact_paths": point,
+        "row_packets": {
+            "enabled": packets is not None,
+            "reason": solver._row_packets_reason,
+            "primary_dofs": None if packets is None else int(packets.primary),
+            "secondary_dofs": None if packets is None else int(packets.secondary),
+            "mimic_rows": None if packets is None else int(packets.mimics),
+            "packets": None if packets is None else int(packets.packets),
+        },
+        "keyed_rows": {"enabled": solver._keyed_rows is not None, "reason": solver._keyed_rows_reason},
+        "compact_contact": {
+            "boundary": bool(solver._compact_contact_boundary),
+            "order": solver._compact_contact_order is not None,
+            "reason": compact_reason,
+        },
+        "compact_jacobian": bool(solver._compact_contact_jacobian),
+    }
+
+
+def _local_solve(solver) -> dict:
+    enabled = bool(solver._local_internal_fast_path)
+    if enabled:
+        reason = "Worlds with one small non-free articulation (and at most one free body) solve in local shared memory."
+    elif solver._sparse_mass_matrix_size is not None:
+        reason = "Native sparse factors replace the local owners."
+    else:
+        reason = (
+            "Local owners need CUDA matrix-free immediate interleaved augmented-drive solving with free rigid "
+            "bodies present, one small articulation per world, and no velocity limits, velocity passes, warm "
+            "start, preelimination, debug, torsion or multiblock."
+        )
+    # The candidate counts predate sparse admission, which can retire the owners; report built owners only.
+    return {
+        "enabled": enabled,
+        "internal_articulations_by_dof": _counts(solver._local_internal_art_counts) if enabled else {},
+        "pair_articulations_by_dof": _counts(solver._local_pair_art_counts) if enabled else {},
+        "residual_articulations_by_dof": _counts(solver._local_residual_art_counts) if enabled else {},
+        "reason": reason,
+    }
+
+
+def _paired_response(solver) -> dict:
+    primary = solver._paired_response_primary_size
+    if primary is None:
+        if solver._sparse_diagonal_contact_solve or solver._sparse_mass_matrix_size is not None:
+            reason = "A sparse response owner owns response."
+        elif solver._explicit_dense_kernels:
+            reason = "An explicit dense kernel choice owns response."
+        else:
+            reason = "No world pairs one tiled-response articulation with exactly one free body."
+        return {"enabled": False, "reason": reason}
+    factor = bool(solver._paired_factor_coordinates)
+    overlap = solver._paired_general_solve_stream is not None
+    return {
+        "enabled": True,
+        "primary_dofs": int(primary),
+        "secondary_dofs": int(solver._paired_response_secondary_size),
+        "factor_coordinates": factor,
+        "contact_triples": bool(solver._factor_coordinate_contact_triples),
+        "components": solver._paired_components is not None,
+        "components_reason": solver._paired_components_reason,
+        "two_stream_overlap": overlap,
+        "two_stream_reason": "The paired factor sweep and the general sweep fork onto two streams."
+        if overlap
+        else "Overlap needs independent components on parallel CUDA streams without debug, warm start, "
+        "parallel tiers or a response block.",
+        "reason": "One articulation factor and one free body per world share one response"
+        + (" in factor coordinates." if factor else " with a register inverse."),
+    }
+
+
+def _sparse_diagonal(solver) -> dict:
+    enabled = bool(solver._sparse_diagonal_contact_solve)
+    if enabled:
+        reason = "One diagonal-mass articulation and one compact dense articulation per world share one owner."
+    elif solver._contact_torsion_radius > 0.0 or solver._explicit_dense_kernels:
+        reason = "Contact torsion or an explicit dense kernel choice keeps the general response."
+    else:
+        reason = "No world pairs a diagonal-mass articulation with fused limits and one compact dense articulation."
+    return {
+        "enabled": enabled,
+        "response_dofs": json_value(solver._sparse_diagonal_response_size),
+        "dense_dofs": int(solver._sparse_diagonal_dense_size),
+        "contact_triples": bool(solver._sparse_diagonal_contact_triples),
+        "speculative_contact_batches": bool(solver._sparse_diagonal_speculative_contact_batches),
+        "fused_joint_limits": bool(solver._fused_diagonal_joint_limits),
+        "reason": reason,
+    }
+
+
+def _sparse_mass_matrix(solver) -> dict:
+    size = solver._sparse_mass_matrix_size
+    record = {
+        "size": json_value(size),
+        "reason": solver._sparse_selection_reason,
+        "split": bool(solver._sparse_split),
+        "velocity_limits": bool(solver._sparse_velocity_limits),
+        "prepare_contacts": bool(solver._sparse_prepare_contacts),
+        "active_rows": bool(solver._sparse_active_rows),
+        "active_rows_reason": solver._sparse_active_rows_reason,
+        "support_table": bool(solver._sparse_row_support.enabled),
+        "contact_triplets": bool(solver._sparse_contact_triplets),
+        "contact_triplets_reason": solver._sparse_contact_triplets_reason,
+    }
+    if size is not None:
+        record.update(
+            {
+                "max_row_support": json_value(solver._sparse_max_row_support),
+                "solve_lanes": int(solver._sparse_solve_lanes),
+                "local_factors": bool(solver._sparse_local_factors),
+                "factor_warps_per_block": int(solver._sparse_factor_warps_per_block),
+                "factor_kernel": _key(solver._crba_sparse_factor_kernel),
+                "contact_response_kernel": _key(solver._sparse_contact_response_kernel),
+                "sweep_kernel": _key(solver._pgs_solve_sparse_kernel),
+            }
+        )
+    return record
+
+
+def _research_sparse_factor(solver) -> dict:
+    owner = solver._sparse_factor
+    record = {"enabled": owner is not None, "reason": solver._sparse_factor_reason}
+    if owner is not None:
+        record.update(
+            {
+                "block_contacts": bool(owner.block_contacts),
+                "metric_tangents": bool(owner.metric_tangents),
+                "spectral_tangents": bool(owner.spectral_tangents),
+                "limit_jacobi": bool(owner.limit_jacobi),
+                "level_update": bool(owner.level_update),
+                "parallel_limit_prefix": bool(owner.parallel_limit_prefix),
+                "packed_tree_state": owner.kinetic_state is not None,
+                "solve_kernel": _key(owner.kernels.solve),
+            }
+        )
+    return record
+
+
+def _sweep(solver, source) -> dict:
+    # Split mode sweeps assembled Delassus rows unless native sparse factors own its rows.
+    dense_split = solver.pgs_mode != "matrix_free" and not solver._sparse_split
+    if dense_split:
+        route = f"dense_{solver.pgs_kernel}"
+        reason = f"Split mode sweeps the assembled Delassus rows with the {solver.pgs_kernel} kernel."
+    elif solver._sparse_factor is not None:
+        route, reason = "research_sparse_factor", "The packed research factor owns the sweep."
+    elif solver._sparse_mass_matrix_size is not None:
+        route, reason = "sparse_pgs", "Native sparse factors own the sweep."
+    elif solver._sparse_diagonal_contact_solve:
+        route, reason = "sparse_diagonal", "The diagonal-mass contact owner owns the sweep."
+    else:
+        route = "matrix_free_gs"
+        reason = "Matrix-free Gauss-Seidel; local, paired, tiered and response-block owners claim their worlds first."
+    # What drives the route's sweep each solve (mirrors _launch_matrix_free_position_solve).
+    if dense_split:
+        driver, driver_reason = "dense_split", "One dense sweep per solve."
+    elif solver.pgs_mode != "matrix_free":
+        driver, driver_reason = "direct", "The sparse split rows sweep once per solve."
+    elif solver.contact_compliance:
+        driver, driver_reason = (
+            "contact_compliance",
+            "Compliance updates the right-hand side and repacks metadata before every one-iteration sweep.",
+        )
+    elif solver._propagation_contacts_enabled():
+        driver = "propagation_fused" if solver.propagation_full_fused_iterations else "propagation_phases"
+        driver_reason = (
+            "One fused kernel runs each propagation iteration."
+            if solver.propagation_full_fused_iterations
+            else "Each iteration interleaves the route's row phases with the propagation row solve."
+        )
+    else:
+        driver, driver_reason = "direct", "The route sweeps all iterations in one dispatch."
+    dense = None
+    if dense_split:
+        if solver.pgs_kernel == "tiled_row":
+            budgets = tuple(solver._pgs_solve_tiled_row_budgets)
+            dense = {
+                "kernels": [_key(kernel) for kernel in budgets or (solver._pgs_solve_tiled_row_kernel,)],
+                "row_budgets": bool(budgets),
+                "register_state": bool(solver._pgs_solve_tiled_row_register_kernels),
+            }
+        elif solver.pgs_kernel == "tiled_contact":
+            dense = {"kernels": [_key(solver._pgs_solve_tiled_contact_kernel)]}
+        elif solver.pgs_kernel == "streaming":
+            dense = {"kernels": [_key(solver._pgs_solve_streaming_kernel)]}
+        else:
+            dense = {"kernels": [_key(source.pgs_solve_loop)]}
+    free_body = None
+    if dense_split and solver._has_free_rigid_bodies:
+        free_body = _key(solver._pgs_solve_mf_kernel if solver.model.device.is_cuda else source.pgs_solve_mf_loop)
+    mf_meta_pack = None
+    if solver.pgs_mode == "matrix_free":
+        # Mirrors _pack_mf_meta: only free rigid bodies produce matrix-free rows.
+        packed = bool(solver._has_free_rigid_bodies)
+        mf_meta_pack = {
+            "launched": packed,
+            "kernel": _key(solver._pack_mf_meta_kernel),
+            "reason": "Free rigid-body rows pack their metadata each step."
+            if packed
+            else "Skipped: without free rigid bodies no matrix-free row exists.",
+        }
+    propagation = None
+    if solver._propagation_contacts_enabled():
+        propagation = {
+            "mode": solver.articulated_contact_response,
+            "row_solve": _key(solver._pgs_solve_propagation_kernel),
+            "full_iteration": _key(solver._pgs_solve_propagation_full_iteration_kernel),
+            "colored_block": _key(solver._pgs_solve_propagation_colored_block_kernel),
+            "colored_warp": _key(getattr(solver, "_pgs_solve_propagation_colored_warp_kernel", None)),
+            "cached_response": bool(solver._propagation_cached_response_active),
+        }
+    local = None
+    if solver._local_internal_fast_path:
+        local = {
+            "factory": "row_packets" if solver._row_packets is not None else "local_owned",
+            "internal": _keys_by_size(solver._pgs_solve_local_internal_kernels),
+            "pair": _keys_by_size(solver._pgs_solve_local_pair_kernels),
+            "residual": _keys_by_size(solver._pgs_solve_local_residual_kernels),
+        }
+    multiblock = solver._mf_multiblock
+    return {
+        "route": route,
+        "reason": reason,
+        "driver": driver,
+        "driver_reason": driver_reason,
+        "schedule": solver.pgs_schedule,
+        "iterations": int(solver.pgs_iterations),
+        "velocity_iterations": int(solver.pgs_velocity_iterations),
+        "mf_meta_pack": mf_meta_pack,
+        "sparse": _key(solver._pgs_solve_sparse_kernel) if route == "sparse_pgs" else None,
+        "research_sparse_factor": None if solver._sparse_factor is None else _key(solver._sparse_factor.kernels.solve),
+        "sparse_diagonal": _key(solver._pgs_solve_sparse_diagonal_kernel),
+        "paired_factor": _key(solver._paired_factor_solve_kernel),
+        "mf_gs": _key(solver._pgs_solve_mf_gs_kernel),
+        "tiers": _tiers(solver),
+        "response_block": solver._rb_build_kernel is not None,
+        "local": local,
+        "multiblock": None if multiblock is None else multiblock.mode,
+        "dense_tiles": solver._mf_dense_support is not None,
+        "dense": dense,
+        "free_body_matrix_free": free_body,
+        "propagation": propagation,
+    }
+
+
+def _tiers(solver) -> dict | None:
+    kernels = list(solver._pgs_solve_mf_gs_incremental_kernels)
+    if not kernels:
+        return None
+    if solver._ink_rows > 0:
+        return {
+            "family": "keyed_parallel" if solver._keyed_rows is not None else "parallel",
+            # FEATHER_PGS_INK: the tier kernels build their world's response in-kernel.
+            "inkernel_response": solver._ink_sizes is not None,
+            "nesterov": bool(solver.mf_gs_parallel_nesterov),
+            "matrix_free": bool(solver.mf_gs_parallel_matrix_free),
+            "sweeps": int(solver.mf_gs_parallel_sweeps),
+            "tolerance": json_value(solver.mf_gs_parallel_tol),
+            "tiers": [
+                {"rows": int(rows), "min_rows": int(min_rows), "kernel": _key(kernel)}
+                for (rows, min_rows), kernel in zip(solver._par_tiers, kernels, strict=False)
+            ],
+        }
+    return {"family": "incremental", "tiers": [{"kernel": _key(kernel)} for kernel in kernels]}
+
+
+def _resolved_worlds(solver) -> dict:
+    owner = solver._resolved_worlds_owner
+    published = bool(owner is not None and owner.published)
+    if owner is None:
+        twists = None
+    elif published:
+        twists = "The held-tree predictor publishes body twists for every responding articulation."
+    else:
+        twists = "The classifier builds body twists itself: a responding articulation has no twist-publishing tree."
+    return {
+        "enabled": owner is not None,
+        "reason": solver._resolved_worlds_reason,
+        "publishes_predicted_twists": published,
+        "twists_reason": twists,
+    }
+
+
+def _publication(solver, source) -> dict:
+    fused = bool(solver._fused_publication)
+    if solver._tree_kinetic_state is not None:
+        owner, reason = "cached", "The held-tree owner publishes next-step state."
+    elif solver.lazy_kinematics and solver._fused_k1:
+        owner, reason = "deferred", "Fused current dynamics permits deferred kinematics publication."
+    elif fused:
+        owner, reason = "fused_general", "Each articulation publishes in one launch per size group."
+    elif not source._FUSED_PUBLISH:
+        owner, reason = "ordinary", "Separate launches; FEATHER_PGS_FUSED_PUBLISH is an import-time opt-in."
+    else:
+        owner = "ordinary"
+        reason = (
+            "Fused publication declined: an owner, free body, velocity limit or loop joint needs separate launches."
+        )
+    if not solver._fk_id_cache_enabled:
+        cache = "off"
+    elif solver._fk_id_cache_uses_snapshot:
+        cache = "snapshot"
+    else:
+        cache = "in_place"
+    return {
+        "owner": owner,
+        "reason": reason,
+        "fused_general": fused,
+        "fk_id_cache": cache,
+        "prismatic_publication": solver._prismatic_publication is not None,
+        "prismatic_linear_state": bool(solver._prismatic_linear_state),
+    }
+
+
+def _velocity_limits(solver) -> dict:
+    if not solver.enable_joint_velocity_limits:
+        joint, reason = "off", "enable_joint_velocity_limits is False."
+    elif solver._sparse_velocity_limits:
+        joint, reason = "sparse_factor_rows", "Native sparse factors solve velocity-limit rows in factor coordinates."
+    elif solver.fuse_joint_velocity_limits:
+        joint = "fused_clamp"
+        reason = "Driven DOFs take the stateless end-of-iteration clamp; undriven limited DOFs keep dedicated rows."
+    else:
+        joint, reason = (
+            "rows",
+            "Dedicated velocity-limit rows (the fused clamp needs matrix-free physx_pgs drives, a finite "
+            "activation fraction and model joint velocity limits).",
+        )
+    limits = bool(solver._has_rigid_body_velocity_limits)
+    matrix_free = solver.pgs_mode == "matrix_free"
+    return {
+        "joint": joint,
+        "reason": reason,
+        "activation_fraction": json_value(solver.velocity_limit_activation_fraction),
+        "rigid_body_limits": limits,
+        # Mirrors _allocate_mf_buffers and the row allocation of _stage4_build_rows (both modes),
+        # and _clamp_rigid_velocity_limits for free articulation roots.
+        "free_body_rows": bool(limits and solver._free_rigid_body_count > 0 and solver._sparse_factor is None),
+        "root_clamp": bool(
+            limits
+            and solver._has_root_free
+            and not (matrix_free and getattr(solver, "rigid_velocity_limit_slot", None) is not None)
+        ),
+    }
+
+
+def _free_rigid_bodies(solver) -> dict:
+    count = int(solver._free_rigid_body_count)
+    owners = []
+    if count:
+        if solver._route_free_free_contacts:
+            owners.append("propagation_rows")
+        elif solver.pgs_mode != "matrix_free" and not solver._sparse_split:
+            owners.append("split_matrix_free_rows")
+        else:
+            if solver._sparse_mass_matrix_size is not None:
+                owners.append("sparse_free_rows")
+            if solver._paired_response_primary_size is not None:
+                owners.append("paired_factor" if solver._paired_factor_coordinates else "paired_response")
+            # Built local kernels only: sparse admission retires the local owners after their candidates.
+            if solver._pgs_solve_local_pair_kernels:
+                owners.append("local_pair")
+            if solver._pgs_solve_local_residual_kernels:
+                owners.append("local_residual")
+            owners.append("matrix_free_rows")
+    return {
+        "count": count,
+        "mixed_worlds": bool(solver._has_mixed_contacts),
+        "owners": owners,
+        "implicit_gyro": solver._free_body_gyro_kernel is not None,
+        "reason": "No free rigid bodies."
+        if not count
+        else "Owners that can solve free-body rows, in claim order; contacts are routed per world at run time.",
+    }
+
+
+def _friction(solver) -> dict:
+    patch = bool(solver._friction_anchors_enabled)
+    reason = _BETA_REASONS[solver._friction_anchor_beta_source]
+    if patch:
+        reason += (
+            " Point-contact owners (local packets, keyed rows, compact contacts, matrix-free tiers and response"
+            " blocks, the resolved-world classifier, sparse active rows and triplets) need point friction."
+        )
+    return {
+        "law": "patch" if patch else "point",
+        "friction_anchor_beta": json_value(solver.friction_anchor_beta),
+        "anchor_beta_source": solver._friction_anchor_beta_source,
+        "friction_mode": solver.friction_mode,
+        "torsion": bool(solver._contact_torsion_enabled),
+        "compliance": bool(solver.contact_compliance),
+        "reason": reason,
+    }
+
+
+def _dynamics(solver) -> dict:
+    return {
+        "grouped_topology": solver._grouped_topology is not None,
+        "fused_world_dynamics": bool(solver._fused_k1),
+        "grouped_tau_mass": bool(solver._grouped_tau_mass),
+        "grouped_mass": bool(solver._grouped_mass),
+        "parallel_tree": solver._tree_plan is not None,
+        "compact_diagonal_mass_dofs": json_value(solver._compact_diagonal_mass_size),
+        "diagonal_mass_dofs": sorted(int(size) for size in solver._diagonal_mass_sizes),
+        "parallel_composite_inertia": bool(solver._parallel_composite_inertia),
+        "compact_inertia_refresh": bool(solver._compact_inertia_refresh),
+        # Response layout: whether J/Y are gathered per world or already world-indexed.
+        "jy_world_aliased": bool(solver._jy_world_aliased),
+        "hinv_jt_writes_world": bool(solver._hinv_jt_writes_world),
+        "async_augmented_drives": bool(solver._async_augmented_drives),
+        "parallel_augmented_drive_topology": bool(solver._parallel_augmented_drive_topology),
+        "double_buffer": bool(solver._double_buffer),
+        "size_group_streams": any(stream is not None for stream in solver._size_streams.values()),
+        "preelimination": bool(solver._preelim_active),
+        "mimic_rows": int(solver._mimic_count or 0),
+        "connect_rows": int(solver._connect_count or 0),
+        "loop_joints": bool(solver._has_loop_joints),
+        "prescribed_response": bool(solver._has_prescribed_response),
+    }

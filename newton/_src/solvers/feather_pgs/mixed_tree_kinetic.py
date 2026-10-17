@@ -531,13 +531,29 @@ class MixedTreeKineticState:
         self._proof = DeviceProof(list(self._coverage_arrays()), solver.model.device)
         # One read of the kernel switches for every group this owner composes.
         self.reference, self.clocked = kernel_switches()
-        forest = os.environ.get("FEATHER_PGS_TREE_FOREST", "1" if forest_default(solver) else "0") == "1"
+        default = forest_default(solver)
+        override = os.environ.get("FEATHER_PGS_TREE_FOREST")
+        forest = (override if override is not None else "1" if default else "0") == "1"
         if forest and forest_supported(solver):
             operators = [ForestHeldOperator(solver)]
+            self.forest_reason = (
+                "FEATHER_PGS_TREE_FOREST=1 selects one group per world."
+                if override is not None
+                else "Default: a prescribed root and no diagonal-mass family make one group per world cheaper."
+            )
         else:
             operators = [TreeHeldOperator(solver, size) for size in solver.size_groups]
             if self.coverage[-1]:
                 operators.append(PrescribedRootOperator(solver))
+            if forest:
+                self.forest_reason = "The world layout does not admit one forest group."
+            elif override is not None:
+                self.forest_reason = "FEATHER_PGS_TREE_FOREST keeps per-size groups."
+            else:
+                self.forest_reason = (
+                    "Default: per-size groups (the layout admits no forest, has no prescribed root, or has a "
+                    "diagonal-mass family the forest applies at a loss)."
+                )
         self.groups = []
         for operator in operators:
             group = TreeKineticState(
