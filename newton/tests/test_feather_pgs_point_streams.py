@@ -55,6 +55,17 @@ _PATCH_ONLY = frozenset(
         "friction_patches.link_patch_rows",
         "friction_patches.seed_patch_impulses",
         "friction_patches.seed_patch_routes",
+        # Sparse-diagonal schedules over patch contact units.
+        "solver_feather_pgs._get_pgs_solve_sparse_diagonal_kernel(64, 10, 9, '120', contact_units=True, "
+        "speculative_contact_batches=False)",
+        "solver_feather_pgs._get_pgs_solve_sparse_diagonal_kernel(64, 10, 9, '120', contact_units=True, "
+        "speculative_contact_batches=True)",
+        "solver_feather_pgs._get_build_independent_sparse_contact_groups_kernel(64, 10, '120', "
+        "build_serial_contacts=False, units=True)",
+        "solver_feather_pgs._get_build_independent_sparse_contact_groups_kernel(64, 10, '120', "
+        "build_serial_contacts=True, units=True)",
+        "solver_feather_pgs._get_mark_independent_sparse_contact_candidates_kernel(1, '120', units=True)",
+        "solver_feather_pgs._get_mark_independent_sparse_contact_candidates_kernel(2, '120', units=True)",
     )
 )
 
@@ -129,6 +140,18 @@ def _solver_factory_calls():
     for dofs in (1, 2):
         factory = solver._get_mark_independent_sparse_contact_candidates_kernel.__wrapped__
         yield name + "_get_mark_independent_sparse_contact_candidates_kernel", factory, (dofs, _ARCH), {}
+    # Patch-only unit schedules of the same factories.
+    for batches in (False, True):
+        kwargs = {"contact_units": True, "speculative_contact_batches": batches}
+        factory = solver._get_pgs_solve_sparse_diagonal_kernel.__wrapped__
+        yield name + "_get_pgs_solve_sparse_diagonal_kernel", factory, (64, 10, 9, _ARCH), kwargs
+    for serial in (False, True):
+        factory = solver._get_build_independent_sparse_contact_groups_kernel.__wrapped__
+        kwargs = {"build_serial_contacts": serial, "units": True}
+        yield name + "_get_build_independent_sparse_contact_groups_kernel", factory, (64, 10, _ARCH), kwargs
+    for dofs in (1, 2):
+        factory = solver._get_mark_independent_sparse_contact_candidates_kernel.__wrapped__
+        yield name + "_get_mark_independent_sparse_contact_candidates_kernel", factory, (dofs, _ARCH), {"units": True}
     for tier, drives, velocity, local in itertools.product(((32, 0), (64, 32)), *([(False, True)] * 3)):
         kwargs = {
             "incremental_rows": tier[0],

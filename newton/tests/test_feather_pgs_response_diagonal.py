@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import itertools
 import unittest
 from unittest import mock
 
@@ -12,6 +13,7 @@ from newton._src.solvers.feather_pgs.friction import friction_pair_candidate
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PGS_LOCAL_SOLVE_OWNER_GENERAL,
     PGS_LOCAL_SOLVE_OWNER_PAIR,
@@ -233,6 +235,303 @@ def _assert_owner_parity(test, general, local):
                 atol=2.0e-6,
                 err_msg=f"{label} differed at step {step}",
             )
+
+
+# Body pairs of the patch-unit fixture: (kind, diagonal coordinates). Scalar pairs touch one coordinate
+# (two pairs share coordinate 2); the coupled pairs add the dense articulation or a second diagonal
+# coordinate, which keeps coordinates 1, 3 and 4 in the serial chain; the free pair touches none.
+_UNIT_PAIRS = (
+    ("scalar", (0,)),
+    ("scalar", (1,)),
+    ("scalar", (2,)),
+    ("scalar", (2,)),
+    ("coupled", (1, 3)),
+    ("dense", (4,)),
+    ("dense", ()),
+    ("scalar", (5,)),
+    ("free", ()),
+)
+
+
+def _patch_unit_rows(seed, *, worlds=3, capacity=40, prefix=2, contacts=10, diagonal=8, dense=6):
+    """Build sparse-diagonal rows of patch contact units with linked normal rings.
+
+    Each world holds ``prefix`` dense limit rows, then contacts in a random allocation order. A contact
+    is a unit: its normal row, followed by two tangent rows when it owns an anchor (at most two per
+    ring). The contacts of a body pair split into rings whose normal rows link circularly through their
+    parents, as ``link_patch_rows`` leaves them. Coordinates ``[0, diagonal)`` belong to the diagonal
+    articulation (index 0) and the following ``dense`` ones to the dense articulation (index 1).
+    """
+    rng = np.random.default_rng(seed)
+    dofs = diagonal + dense
+    rows = {
+        "worlds": worlds,
+        "capacity": capacity,
+        "dofs": dofs,
+        "dense": dense,
+        "diagonal": diagonal,
+        "cfm": 1.0e-6,
+        "row_count": np.zeros(worlds, np.int32),
+        "bounds": np.zeros((worlds, 2), np.int32),
+        # Rows past each world's count hold a type no row family uses.
+        "row_type": np.full((worlds, capacity), 7, np.int32),
+        "row_parent": np.full((worlds, capacity), -1, np.int32),
+        "row_mu": np.zeros((worlds, capacity), np.float32),
+        "rhs": np.zeros((worlds, capacity), np.float32),
+        "diag": np.zeros((worlds, capacity), np.float32),
+        "impulses": np.zeros((worlds, capacity), np.float32),
+        "dense_J": np.zeros((worlds, capacity, dense), np.float32),
+        "dense_Y": np.zeros((worlds, capacity, dense), np.float32),
+        "sparse_dof": np.full((worlds, capacity, 2), -1, np.int32),
+        "sparse_jy": np.zeros((worlds, capacity, 4), np.float32),
+        "velocity": rng.uniform(-0.3, 0.3, worlds * dofs).astype(np.float32),
+        "inverse_mass": rng.uniform(0.5, 1.5, worlds * dofs).astype(np.float32),
+        "limit_active": np.zeros((worlds, dofs), np.int32),
+        "limit_lower_rhs": np.zeros((worlds, dofs), np.float32),
+        "limit_upper_rhs": np.zeros((worlds, dofs), np.float32),
+        "dense_offsets": np.full(worlds, diagonal, np.int32),
+        "dense_groups": np.arange(worlds, dtype=np.int32),
+        "rings": [],
+    }
+    contact = {name: [] for name in ("world", "slot", "art_a", "art_b", "slots_needed")}
+    for w in range(worlds):
+        inverse = rows["inverse_mass"][w * dofs : (w + 1) * dofs]
+        rows["row_type"][w, :prefix] = PGS_CONSTRAINT_TYPE_JOINT_LIMIT
+        rows["dense_J"][w, :prefix] = rng.normal(0.0, 0.5, (prefix, dense))
+        rows["rhs"][w, :prefix] = rng.uniform(-0.2, 0.1, prefix)
+        rows["bounds"][w] = prefix
+        rings = []
+        for kind, coords in _UNIT_PAIRS:
+            members = np.arange(int(rng.integers(1, 5)))
+            cuts = rng.choice(np.arange(1, len(members)), size=int(rng.integers(0, len(members))), replace=False)
+            for ring in np.split(members, np.sort(cuts)):
+                anchors = rng.choice(len(ring), size=min(len(ring), int(rng.integers(0, 3))), replace=False)
+                rings.append([(kind, coords, 3 if k in anchors else 1) for k in range(len(ring))])
+        units = [(index, unit) for index, ring in enumerate(rings) for unit in ring]
+        heads = [[] for _ in rings]
+        row = prefix
+        for position in rng.permutation(len(units))[:contacts]:
+            ring_index, (kind, coords, count) = units[position]
+            if row + count > capacity:
+                continue
+            heads[ring_index].append(row)
+            slots = rng.permutation(2)
+            values = rng.uniform(0.3, 1.0, (count, 2)) * rng.choice((-1.0, 1.0), (count, 2))
+            for k in range(count):
+                index = row + k
+                rows["row_type"][w, index] = PGS_CONSTRAINT_TYPE_CONTACT if k == 0 else PGS_CONSTRAINT_TYPE_FRICTION
+                if k == 0:
+                    # Separating normals stay unloaded, so speculative batches find no-op units.
+                    rows["rhs"][w, index] = rng.uniform(-0.3, 0.0) if rng.random() < 0.5 else rng.uniform(0.0, 0.3)
+                else:
+                    rows["row_parent"][w, index] = row
+                    rows["row_mu"][w, index] = rng.uniform(0.2, 0.9)
+                    rows["rhs"][w, index] = rng.uniform(-0.15, 0.15)
+                if kind == "dense":
+                    rows["dense_J"][w, index] = rng.normal(0.0, 0.5, dense)
+                for coord, slot, value in zip(coords, slots, values[k], strict=False):
+                    rows["sparse_dof"][w, index, slot] = coord
+                    rows["sparse_jy"][w, index, 2 * slot : 2 * slot + 2] = (value, value * inverse[coord])
+            if rng.random() < 0.4:
+                rows["impulses"][w, row] = rng.uniform(0.0, 0.2)
+                if count == 3 and rng.random() < 0.6:
+                    rows["impulses"][w, row + 1 : row + 3] = rng.uniform(-0.02, 0.02, 2)
+            contact["world"].append(w)
+            contact["slot"].append(row)
+            contact["art_a"].append(-1 if kind == "free" else 0)
+            contact["art_b"].append(1 if kind == "dense" else -1)
+            contact["slots_needed"].append(count)
+            row += count
+        for members in heads:
+            linked = rng.permutation(members)
+            for k, head in enumerate(linked):
+                rows["row_parent"][w, head] = linked[(k + 1) % len(linked)]
+            if members:
+                rows["rings"].append((w, sorted(members)))
+        rows["row_count"][w] = row
+        rows["dense_Y"][w, :row] = rows["dense_J"][w, :row] * inverse[diagonal:]
+        diag = np.sum(rows["dense_J"][w, :row] * rows["dense_Y"][w, :row], axis=1)
+        for slot in range(2):
+            present = rows["sparse_dof"][w, :row, slot] >= 0
+            diag += np.where(
+                present, rows["sparse_jy"][w, :row, 2 * slot] * rows["sparse_jy"][w, :row, 2 * slot + 1], 0
+            )
+        rows["diag"][w, :row] = diag + np.float32(rows["cfm"])
+        limited = rng.choice(diagonal, size=3, replace=False)
+        rows["limit_active"][w, limited] = rng.integers(1, 4, 3)
+        rows["limit_lower_rhs"][w, limited] = rng.uniform(-0.1, 0.05, 3)
+        rows["limit_upper_rhs"][w, limited] = rng.uniform(-0.1, 0.05, 3)
+    rows["contacts"] = {name: np.array(values, np.int32) for name, values in contact.items()}
+    return rows
+
+
+def _mark_patch_units(rows, device):
+    """Run the unit marker over the fixture's contacts and return the marked sparse coordinates."""
+    contacts = rows["contacts"]
+    count = len(contacts["slot"])
+    sparse_dof = wp.array(rows["sparse_dof"], dtype=wp.int32, device=device)
+    marker = _get_mark_independent_sparse_contact_candidates_kernel(rows["diagonal"], str(device.arch), units=True)
+    if count:
+        wp.launch(
+            marker,
+            dim=count,
+            inputs=[
+                wp.array((count,), dtype=wp.int32, device=device),
+                count,
+                wp.array(contacts["world"], dtype=wp.int32, device=device),
+                wp.array(contacts["slot"], dtype=wp.int32, device=device),
+                wp.array(contacts["art_a"], dtype=wp.int32, device=device),
+                wp.array(contacts["art_b"], dtype=wp.int32, device=device),
+                wp.zeros(count, dtype=wp.int32, device=device),
+                wp.array(contacts["slots_needed"], dtype=wp.int32, device=device),
+                wp.array((rows["diagonal"], rows["dense"]), dtype=wp.int32, device=device),
+            ],
+            outputs=[sparse_dof],
+            device=device,
+        )
+    return sparse_dof.numpy()
+
+
+def _unit_schedule_oracle(rows, marked):
+    """Return the unit schedule the builder must produce from marked unit heads.
+
+    Every row other than a tangent row heads a unit. A marked head joins its coordinate's chain unless a
+    coupled unit uses that coordinate; chains link in ascending row order (``-(next + 3)``, ``-2`` at the
+    end), group heads list each chain's first unit by coordinate, and the serial list holds the remaining
+    heads in row order.
+    """
+    links = marked.copy()
+    group_count = np.zeros(rows["worlds"], np.int32)
+    group_heads = np.full((rows["worlds"], rows["dofs"]), -1, np.int32)
+    serial = []
+    for w in range(rows["worlds"]):
+        start, end = int(rows["bounds"][w, 1]), int(rows["row_count"][w])
+        heads = [row for row in range(start, end) if rows["row_type"][w, row] != PGS_CONSTRAINT_TYPE_FRICTION]
+        candidates = [row for row in heads if np.any(marked[w, row] < -1)]
+        reserved = {int(c) for row in heads if row not in candidates for c in marked[w, row] if c >= 0}
+        chains = {}
+        for row in candidates:
+            coordinate, slot = int(np.max(marked[w, row])), int(np.argmin(marked[w, row]))
+            if coordinate in reserved:
+                links[w, row, slot] = -1
+            else:
+                chains.setdefault(coordinate, []).append((row, slot))
+        for chain in chains.values():
+            for (row, slot), following in zip(chain, [*chain[1:], None], strict=True):
+                links[w, row, slot] = -2 if following is None else -(following[0] + 3)
+        firsts = [chain[0][0] for _, chain in sorted(chains.items())]
+        group_count[w] = len(firsts)
+        group_heads[w, : len(firsts)] = firsts
+        serial.append([row for row in heads if not np.any(links[w, row] < -1)])
+    return {"sparse_row_dof": links, "group_count": group_count, "group_heads": group_heads, "serial": serial}
+
+
+def _unit_schedule_order(rows, schedule, world):
+    """Rows in the unit schedule's order: independent chains by coordinate, the prefix, then serial units."""
+
+    def unit(head):
+        owns_tangents = (
+            head + 2 < rows["row_count"][world]
+            and rows["row_type"][world, head + 1] == PGS_CONSTRAINT_TYPE_FRICTION
+            and rows["row_parent"][world, head + 1] == head
+        )
+        return [head, head + 1, head + 2] if owns_tangents else [head]
+
+    order = []
+    for first in schedule["group_heads"][world, : schedule["group_count"][world]]:
+        head = int(first)
+        while head >= 0:
+            order += unit(head)
+            link = int(np.min(schedule["sparse_row_dof"][world, head]))
+            head = -1 if link == -2 else -link - 3
+    order += list(range(int(rows["bounds"][world, 1])))
+    for head in schedule["serial"][world]:
+        order += unit(head)
+    return order
+
+
+def _ring_pooled_serial_reference(rows, *, iterations, friction_start=0, schedule=None, omega=1.0):
+    """Sweep the sparse-diagonal rows in float64 with the general owner's row law.
+
+    Each iteration projects the fused diagonal limits, then visits rows in order (or in the unit
+    schedule's order): a normal row clamps at zero, a unit's first tangent row solves both tangents on
+    the friction disk of radius mu times the pooled normal load of its patch ring, and the second
+    tangent row is a no-op.
+    """
+    dofs, dense, cfm = rows["dofs"], rows["dense"], rows["cfm"]
+    velocity = rows["velocity"].astype(np.float64)
+    impulses = rows["impulses"].astype(np.float64)
+    lower = np.zeros((rows["worlds"], dofs))
+    upper = np.zeros((rows["worlds"], dofs))
+    for w in range(rows["worlds"]):
+        v, lam = velocity[w * dofs : (w + 1) * dofs], impulses[w]
+        count, offset = int(rows["row_count"][w]), int(rows["dense_offsets"][w])
+        J, Y = np.zeros((count, dofs)), np.zeros((count, dofs))
+        J[:, offset : offset + dense] = rows["dense_J"][w, :count]
+        Y[:, offset : offset + dense] = rows["dense_Y"][w, :count]
+        for row, slot in np.argwhere(rows["sparse_dof"][w, :count] >= 0):
+            coord = rows["sparse_dof"][w, row, slot]
+            J[row, coord] += rows["sparse_jy"][w, row, 2 * slot]
+            Y[row, coord] += rows["sparse_jy"][w, row, 2 * slot + 1]
+        inverse = rows["inverse_mass"][w * dofs : (w + 1) * dofs].astype(np.float64)
+        parents = rows["row_parent"][w, :count]
+        order = range(count) if schedule is None else _unit_schedule_order(rows, schedule, w)
+        for iteration in range(iterations):
+            changed = False
+            for coord in range(dofs):
+                for bit, sign, limit_rhs, lambdas in (
+                    (1, 1.0, "limit_lower_rhs", lower),
+                    (2, -1.0, "limit_upper_rhs", upper),
+                ):
+                    if rows["limit_active"][w, coord] & bit:
+                        old = lambdas[w, coord]
+                        residual = sign * v[coord] + rows[limit_rhs][w, coord]
+                        lambdas[w, coord] = max(0.0, old - omega * residual / (inverse[coord] + cfm))
+                        v[coord] += sign * inverse[coord] * (lambdas[w, coord] - old)
+                        changed |= lambdas[w, coord] != old
+            for row in order:
+                kind, parent, denominator = rows["row_type"][w, row], parents[row], rows["diag"][w, row]
+                if kind == PGS_CONSTRAINT_TYPE_FRICTION and iteration < friction_start:
+                    lam[row] = 0.0
+                    continue
+                if kind == PGS_CONSTRAINT_TYPE_FRICTION and row != parent + 1:
+                    continue
+                if denominator <= 0.0 and kind != PGS_CONSTRAINT_TYPE_FRICTION:
+                    continue
+                residual = J[row] @ v + rows["rhs"][w, row]
+                old = lam[row]
+                new = old - omega * residual / denominator if denominator > 0.0 else old
+                if kind != PGS_CONSTRAINT_TYPE_FRICTION:
+                    new = max(new, 0.0)
+                else:
+                    sibling = parent + 2
+                    load, member = lam[parent], parents[parent]
+                    while member >= 0 and member != parent:
+                        load, member = load + lam[member], parents[member]
+                    radius = max(rows["row_mu"][w, row] * load, 0.0)
+                    pair = (0.0, 0.0)
+                    if radius > 0.0:
+                        pair = friction_pair_candidate(
+                            float(denominator),
+                            float(J[row] @ Y[sibling]),
+                            float(rows["diag"][w, sibling]),
+                            wp.vec2(float(residual), float(J[sibling] @ v + rows["rhs"][w, sibling])),
+                            wp.vec2(float(old), float(lam[sibling])),
+                            float(radius),
+                            float(omega),
+                        )
+                    magnitude = np.hypot(pair[0], pair[1])
+                    scale = radius / magnitude if magnitude > radius else 1.0
+                    new, sibling_new = pair[0] * scale, pair[1] * scale
+                    changed |= sibling_new != lam[sibling]
+                    v += Y[sibling] * (sibling_new - lam[sibling])
+                    lam[sibling] = sibling_new
+                changed |= new != old
+                v += Y[row] * (new - old)
+                lam[row] = new
+            if iteration >= friction_start and not changed:
+                break
+    return {"impulses": impulses, "velocity": velocity, "lower": lower, "upper": upper}
 
 
 class TestFeatherPGSResponseDiagonal(unittest.TestCase):
@@ -717,6 +1016,228 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         np.testing.assert_array_equal(serial_normals.numpy()[0, :2], np.array((3, 6), dtype=np.int32))
         normal_links = sparse_row_dof.numpy()[0, ::3, 1]
         np.testing.assert_array_equal(normal_links, np.array((-12, -1, -1, -2), dtype=np.int32))
+
+    def test_unit_marker_admits_one_and_three_row_units(self):
+        """Mark patch units of one or three rows confined to one diagonal coordinate, as triples are marked."""
+        device = wp.get_device("cpu")
+        # Contacts: a 3-row and a 1-row scalar unit, a scalar contact of another route, an unallocated
+        # one, one with a stale slot count, a dense-coupled unit and a two-coordinate unit.
+        slots = np.array((0, 3, 4, -1, 5, 6, 7), dtype=np.int32)
+        sparse_dof = np.full((1, 12, 2), -1, dtype=np.int32)
+        sparse_dof[0, (0, 4), 0] = 2
+        sparse_dof[0, 3, 1] = 5
+        sparse_dof[0, 5, 0] = 1
+        sparse_dof[0, 6, 1] = 4
+        sparse_dof[0, 7] = (2, 3)
+        launches = {}
+        for units in (False, True):
+            marked = wp.array(sparse_dof, device=device)
+            marker = _get_mark_independent_sparse_contact_candidates_kernel(108, "cpu", units=units)
+            wp.launch(
+                marker,
+                dim=3,
+                inputs=[
+                    wp.array((7,), dtype=wp.int32, device=device),
+                    3,
+                    wp.zeros(7, dtype=wp.int32, device=device),
+                    wp.array(slots, device=device),
+                    wp.zeros(7, dtype=wp.int32, device=device),
+                    wp.array((-1, -1, -1, -1, -1, 1, -1), dtype=wp.int32, device=device),
+                    wp.array((0, 0, 1, 0, 0, 0, 0), dtype=wp.int32, device=device),
+                    wp.array((3, 1, 3, 3, 2, 3, 1), dtype=wp.int32, device=device),
+                    wp.array((108, 6), dtype=wp.int32, device=device),
+                ],
+                outputs=[marked],
+                device=device,
+            )
+            launches[units] = marked.numpy()[0]
+            self.assertEqual(marker.key.endswith("_units"), units)
+        expected = sparse_dof[0].copy()
+        expected[0, 1] = -2
+        # Triples skip the 1-row unit; units mark it in its empty slot.
+        np.testing.assert_array_equal(launches[False], expected)
+        expected[3, 0] = -2
+        np.testing.assert_array_equal(launches[True], expected)
+
+    def test_unit_schedule_factories_name_and_reject_layouts(self):
+        """Name the unit variants and keep speculative batches within sixteen response lanes."""
+        solve = _get_pgs_solve_sparse_diagonal_kernel(24, 12, 9, "120", contact_units=True)
+        batched = _get_pgs_solve_sparse_diagonal_kernel(
+            24, 12, 9, "120", contact_units=True, speculative_contact_batches=True
+        )
+        builder = _get_build_independent_sparse_contact_groups_kernel(
+            24, 12, "120", build_serial_contacts=True, units=True
+        )
+        self.assertEqual(solve.key, "pgs_solve_sparse_diagonal_24_12_9_units")
+        self.assertEqual(batched.key, "pgs_solve_sparse_diagonal_24_12_9_speculative_batches_units")
+        self.assertEqual(builder.key, "build_independent_sparse_contact_groups_24_12_serial_contacts_units")
+        for kwargs in (
+            {"contact_triples": True, "contact_units": True},
+            {"contact_units": True, "speculative_contact_batches": True, "dense_dofs": 15},
+        ):
+            dense_dofs = kwargs.pop("dense_dofs", 9)
+            with self.subTest(**kwargs), self.assertRaises(ValueError):
+                _get_pgs_solve_sparse_diagonal_kernel(24, dense_dofs + 3, dense_dofs, "120", **kwargs)
+
+    def test_unit_schedule_reorders_only_commuting_rows(self):
+        """Keep each patch ring in one independence class, and GS order on every coordinate.
+
+        The schedule oracle is the reference the CUDA unit builder must reproduce. Sweeping the
+        rows in its order (independent chains first, then the prefix and the serial units) must give
+        exactly the impulses and velocities of the original row order.
+        """
+        device = wp.get_device("cpu")
+        independent = serial = 0
+        for seed, (capacity, contacts, prefix) in itertools.product(
+            range(6), ((40, 10, 2), (64, 24, 2), (24, 12, 2), (32, 30, 0), (20, 40, 1))
+        ):
+            with self.subTest(seed=seed, capacity=capacity):
+                rows = _patch_unit_rows(seed, capacity=capacity, contacts=contacts, prefix=prefix)
+                schedule = _unit_schedule_oracle(rows, _mark_patch_units(rows, device))
+                for world, members in rows["rings"]:
+                    marks = {bool(np.any(schedule["sparse_row_dof"][world, member] < -1)) for member in members}
+                    self.assertEqual(len(marks), 1, f"ring {members} of world {world} split its marks")
+                independent += sum(int(count) for count in schedule["group_count"])
+                serial += sum(len(heads) for heads in schedule["serial"])
+                for iterations, friction_start in ((6, 0), (5, 2)):
+                    original = _ring_pooled_serial_reference(rows, iterations=iterations, friction_start=friction_start)
+                    scheduled = _ring_pooled_serial_reference(
+                        rows, iterations=iterations, friction_start=friction_start, schedule=schedule
+                    )
+                    for name, values in original.items():
+                        np.testing.assert_array_equal(scheduled[name], values, err_msg=name)
+        # The fixtures exercise both phases.
+        self.assertGreater(independent, 50)
+        self.assertGreater(serial, 50)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "independent contact units require CUDA")
+    def test_independent_sparse_contact_units_keep_rings_together(self):
+        """Schedule mixed one- and three-row units; every ring member carries the same independence mark."""
+        device = wp.get_device("cuda:0")
+        for seed, (capacity, contacts, prefix) in itertools.product(range(4), ((40, 10, 2), (32, 30, 0), (20, 40, 1))):
+            with self.subTest(seed=seed, capacity=capacity):
+                rows = _patch_unit_rows(seed, capacity=capacity, contacts=contacts, prefix=prefix)
+                marked = _mark_patch_units(rows, device)
+                expected = _unit_schedule_oracle(rows, marked)
+                worlds, dofs = rows["worlds"], rows["dofs"]
+                for serial_contacts in (False, True):
+                    sparse_row_dof = wp.array(marked, device=device)
+                    group_count = wp.full(worlds, -7, dtype=wp.int32, device=device)
+                    group_heads = wp.full((worlds, dofs), -7, dtype=wp.int32, device=device)
+                    serial_count = wp.full(worlds, -7, dtype=wp.int32, device=device)
+                    serial_heads = wp.full((worlds, capacity), -7, dtype=wp.int32, device=device)
+                    schedule = _get_build_independent_sparse_contact_groups_kernel(
+                        capacity, dofs, str(device.arch), build_serial_contacts=serial_contacts, units=True
+                    )
+                    wp.launch(
+                        schedule,
+                        dim=worlds * 32,
+                        inputs=[
+                            wp.array(rows["row_count"], device=device),
+                            wp.array(rows["bounds"], device=device),
+                            wp.array(rows["row_type"], device=device),
+                            wp.array(rows["row_parent"], device=device),
+                        ],
+                        outputs=[sparse_row_dof, group_count, group_heads, serial_count, serial_heads],
+                        device=device,
+                    )
+                    np.testing.assert_array_equal(sparse_row_dof.numpy(), expected["sparse_row_dof"])
+                    np.testing.assert_array_equal(group_count.numpy(), expected["group_count"])
+                    for world in range(worlds):
+                        count = int(expected["group_count"][world])
+                        np.testing.assert_array_equal(
+                            group_heads.numpy()[world, :count], expected["group_heads"][world, :count]
+                        )
+                        if serial_contacts:
+                            heads = expected["serial"][world]
+                            self.assertEqual(int(serial_count.numpy()[world]), len(heads))
+                            np.testing.assert_array_equal(serial_heads.numpy()[world, : len(heads)], heads)
+                    for world, members in rows["rings"]:
+                        marks = {bool(np.any(sparse_row_dof.numpy()[world, member] < -1)) for member in members}
+                        self.assertEqual(len(marks), 1, f"ring {members} of world {world} split its marks")
+
+    @unittest.skipUnless(wp.is_cuda_available(), "speculative contact units require CUDA")
+    def test_speculative_sparse_contact_units_match_serial_loop(self):
+        """Solve mixed one- and three-row units on linked rings bitwise like the serial loop."""
+        device = wp.get_device("cuda:0")
+        for seed, (capacity, contacts, prefix) in itertools.product(range(4), ((40, 10, 2), (32, 30, 0), (20, 40, 1))):
+            rows = _patch_unit_rows(seed, capacity=capacity, contacts=contacts, prefix=prefix)
+            worlds, dofs, dense = rows["worlds"], rows["dofs"], rows["dense"]
+            marked = _mark_patch_units(rows, device)
+            schedule = _unit_schedule_oracle(rows, marked)
+            serial_heads = np.zeros((worlds, capacity), np.int32)
+            for world, heads in enumerate(schedule["serial"]):
+                serial_heads[world, : len(heads)] = heads
+            for iterations, friction_start in ((8, 0), (5, 2)):
+                results = {}
+                for label, units, batches in (
+                    ("serial", False, False),
+                    ("units", True, False),
+                    ("batches", True, True),
+                ):
+                    impulses = wp.array(rows["impulses"], device=device)
+                    lower = wp.zeros((worlds, dofs), dtype=wp.float32, device=device)
+                    upper = wp.zeros((worlds, dofs), dtype=wp.float32, device=device)
+                    velocity = wp.array(rows["velocity"], device=device)
+                    kernel = _get_pgs_solve_sparse_diagonal_kernel(
+                        capacity,
+                        dofs,
+                        dense,
+                        str(device.arch),
+                        contact_units=units,
+                        speculative_contact_batches=batches,
+                    )
+                    wp.launch_tiled(
+                        kernel,
+                        dim=[worlds],
+                        inputs=[
+                            wp.array(rows["row_count"], device=device),
+                            wp.array(np.arange(worlds * dofs, dtype=np.int32).reshape(worlds, dofs), device=device),
+                            wp.array(rows["rhs"], device=device),
+                            wp.array(rows["diag"], device=device),
+                            impulses,
+                            wp.array(rows["row_type"], device=device),
+                            wp.array(rows["row_parent"], device=device),
+                            wp.array(rows["row_mu"], device=device),
+                            wp.array(rows["bounds"], device=device),
+                            wp.array(schedule["group_count"], device=device),
+                            wp.array(schedule["group_heads"], device=device),
+                            wp.array([len(heads) for heads in schedule["serial"]], dtype=wp.int32, device=device),
+                            wp.array(serial_heads, device=device),
+                            wp.array(rows["dense_offsets"], device=device),
+                            wp.array(rows["dense_groups"], device=device),
+                            wp.array(rows["dense_J"], device=device),
+                            wp.array(rows["dense_Y"], device=device),
+                            wp.array(schedule["sparse_row_dof"], device=device),
+                            wp.array(rows["sparse_jy"], device=device),
+                            wp.array(rows["limit_active"], device=device),
+                            wp.array(rows["limit_lower_rhs"], device=device),
+                            wp.array(rows["limit_upper_rhs"], device=device),
+                            wp.array(rows["inverse_mass"], device=device),
+                            rows["cfm"],
+                            iterations,
+                            1.0,
+                            friction_start,
+                            0,
+                        ],
+                        outputs=[lower, upper, velocity],
+                        block_dim=32,
+                        device=device,
+                    )
+                    results[label] = {
+                        "impulses": impulses.numpy(),
+                        "velocity": velocity.numpy(),
+                        "lower": lower.numpy(),
+                        "upper": upper.numpy(),
+                    }
+                reference = _ring_pooled_serial_reference(rows, iterations=iterations, friction_start=friction_start)
+                for label in ("units", "batches"):
+                    for name, values in results["serial"].items():
+                        with self.subTest(
+                            seed=seed, capacity=capacity, schedule=label, iterations=iterations, value=name
+                        ):
+                            np.testing.assert_array_equal(results[label][name], values)
+                            np.testing.assert_allclose(results[label][name], reference[name], rtol=1.0e-4, atol=2.0e-5)
 
     def test_mixed_world_diagonal_map_includes_free_rigid_response(self):
         """Include free rigid articulations in every forced-tiled diagonal group."""

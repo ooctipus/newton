@@ -699,14 +699,17 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             return history
 
         slick = run(make_solver(enable_contact_friction=False))
-        for label, friction_kwargs, triples in (("patch", {}, False), ("point", {"friction_anchor_beta": 0.0}, True)):
+        for label, friction_kwargs in (("patch", {}), ("point", {"friction_anchor_beta": 0.0})):
             with self.subTest(friction=label):
                 optimized = make_solver(**friction_kwargs)
                 reference = make_solver(use_parallel_streams=False, **friction_kwargs)
                 self.assertTrue(optimized._sparse_diagonal_contact_solve)
                 self.assertEqual(optimized._friction_anchors_enabled, label == "patch")
-                self.assertEqual(optimized._sparse_diagonal_contact_triples, triples)
-                self.assertEqual(optimized._sparse_diagonal_speculative_contact_batches, triples)
+                # Point contacts are uniform triples; patch contacts are units of one or three rows.
+                self.assertEqual(optimized._sparse_diagonal_contact_triples, label == "point")
+                self.assertEqual(optimized._sparse_diagonal_contact_units, label == "patch")
+                self.assertTrue(optimized._sparse_diagonal_speculative_contact_batches)
+                self.assertEqual(optimized._pgs_solve_sparse_diagonal_kernel.key.endswith("_units"), label == "patch")
                 self.assertFalse(reference._sparse_diagonal_contact_solve)
 
                 sparse = run(optimized)

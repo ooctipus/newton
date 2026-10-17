@@ -374,6 +374,7 @@ def _sparse_diagonal(solver) -> dict:
         "response_dofs": json_value(solver._sparse_diagonal_response_size),
         "dense_dofs": int(solver._sparse_diagonal_dense_size),
         "contact_triples": bool(solver._sparse_diagonal_contact_triples),
+        "contact_units": bool(solver._sparse_diagonal_contact_units),
         "speculative_contact_batches": bool(solver._sparse_diagonal_speculative_contact_batches),
         "fused_joint_limits": bool(solver._fused_diagonal_joint_limits),
         "reason": reason,
