@@ -17,6 +17,7 @@ import warp as wp
 
 from ...geometry.flags import ShapeFlags
 from ...sim import BodyFlags, JointType
+from .environment_flags import reject_retired
 from .sparse_factorization import _sparse_cholesky_source, _sparse_inverse_source
 from .sparse_mass_matrix import (
     _factor_update_schedule as _level_update_schedule,
@@ -429,9 +430,7 @@ def supported(solver):
 
 def create_owner(solver):
     """Keep unsupported constructors on the complete original representation."""
-    from .solver_feather_pgs import _reject_retired_experiments  # noqa: PLC0415
-
-    _reject_retired_experiments()
+    reject_retired()
     if not supported(solver):
         return None
     try:
@@ -445,7 +444,6 @@ class SparseFactor:
     """Own every consumer of the selected packed held/current representation."""
 
     def __init__(self, solver, plan, host):
-        from .solver_feather_pgs import _reject_retired_experiments  # noqa: PLC0415
         from .sparse_factor_rows import (  # noqa: PLC0415
             build_limit_prefix,
             get_contact_kernel,
@@ -453,7 +451,7 @@ class SparseFactor:
             get_solve_kernel,
         )
 
-        _reject_retired_experiments()
+        reject_retired()
         self.solver, self.plan, self.host = solver, plan, host
         w, c, device = solver.world_count, solver.dense_max_constraints, solver.model.device
         # Retain false markers consumed by checked capture readers.

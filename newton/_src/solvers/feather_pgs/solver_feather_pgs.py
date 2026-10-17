@@ -43,6 +43,7 @@ from ..semi_implicit.kernels_particle import (
 )
 from ..solver import SolverBase
 from . import contact_compliance as _contact_compliance
+from . import environment_flags as _environment_flags
 from . import execution_plan as _execution_plan
 from . import row_metadata as _row_metadata
 from .body_mapping import build_body_maps
@@ -251,21 +252,6 @@ from .sparse_pgs import (
     _SPARSE_LOCAL_WORKSPACE_BYTES,
     _get_pgs_solve_sparse_kernel,
 )
-
-
-def _reject_retired_experiments():
-    """Reject obsolete recipes before they silently select a different owner."""
-    for flag in (
-        "FEATHER_PGS_SINGLE_FACTOR",
-        "FEATHER_PGS_BODY_BASIS_ROWS",
-        "FEATHER_PGS_SPARSE_PACKETS",
-        "FEATHER_PGS_SPARSE_PAIRED_GS",
-        "FEATHER_PGS_COUPLED_CONTACT",
-        "FEATHER_PGS_COUPLED_JACOBI",
-    ):
-        if os.environ.get(flag) == "1":
-            raise ValueError(f"{flag} selects a retired experiment; reproduce it from the original research checkout")
-
 
 # --- env-gated capture of pgs_solve_mf_gs kernel inputs, for standalone replay/bench ---
 # Off unless FEATHER_PGS_CAPTURE_KERNEL=1. Snapshots the dominant FPGS contact-solve
@@ -1867,7 +1853,7 @@ class SolverFeatherPGS(SolverBase):
         self.compliance_skipped_contact_count = 0
         self._compliant_contacts = None
         self._compliant_prepared = False
-        _reject_retired_experiments()
+        _environment_flags.reject_retired()
         super().__init__(model)
 
         self._requested_kernel_choices = {
