@@ -16,6 +16,13 @@ from newton._src.solvers.feather_pgs import compact_contact as compact
 from newton._src.solvers.feather_pgs import kernels
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
+from newton.tests.feather_pgs_patch_parity import (
+    assert_contact_impulses_close,
+    assert_history_close,
+    assert_ring_coulomb,
+    assert_rows_close,
+    contact_rows,
+)
 
 OUTPUTS = (
     "row_type",
@@ -34,8 +41,12 @@ OUTPUTS = (
 )
 
 
-def fixture(device="cpu", *, prefix=(2, 3), kept=(7, 7), shared=0, friction_shared=1):
-    """Include coupled/same-art/same-coordinate/static/prescribed contacts and permuted groups."""
+def fixture(device="cpu", *, prefix=(2, 3), kept=(7, 7), shared=0, friction_shared=1, rows=(3,) * 8):
+    """Include coupled/same-art/same-coordinate/static/prescribed contacts and permuted groups.
+
+    ``rows`` gives each world's contacts their reserved rows: 3 for a normal and two tangents, or 1
+    for a patch contact without an anchor.
+    """
     rng = np.random.default_rng(191)
     data = compact.ContactBoundaryData()
 
@@ -51,8 +62,10 @@ def fixture(device="cpu", *, prefix=(2, 3), kept=(7, 7), shared=0, friction_shar
     body_art = np.array([0, 0, 1, 1, 2, -1, 3, 3, 4, 4, 5, -1])
     art0 = body_art[shapes0]
     art1 = np.where(shapes1 >= 0, body_art[np.maximum(shapes1, 0)], -1)
+    rows = np.asarray(rows, dtype=np.int32)
     slots = np.array(
-        [prefix[w] + 3 * c if c < kept[w] else -1 for w, c in zip(world, local, strict=True)], dtype=np.int32
+        [prefix[w] + int(np.sum(rows[:c])) if c < kept[w] else -1 for w, c in zip(world, local, strict=True)],
+        dtype=np.int32,
     )
     data.count = array([16], int)
     data.point0 = array(rng.normal(0, 0.2, (16, 3)).astype(np.float32), wp.vec3)
@@ -69,7 +82,7 @@ def fixture(device="cpu", *, prefix=(2, 3), kept=(7, 7), shared=0, friction_shar
     data.art0 = array(art0, int)
     data.art1 = array(art1, int)
     data.path = array(np.where(slots >= 0, 0, -1), int)
-    data.slots_needed = array(np.full(16, 3, dtype=np.int32), int)
+    data.slots_needed = array(rows[local], int)
     data.shape_body = array([0, 1, 2, 3, 4, -1, 6, 7, 8, 9, 10, -1], int)
     poses = np.zeros((12, 7), dtype=np.float32)
     poses[:, :3] = rng.normal(size=(12, 3))
@@ -110,7 +123,7 @@ def fixture(device="cpu", *, prefix=(2, 3), kept=(7, 7), shared=0, friction_shar
         if name == "sparse_jy":
             shape = (2, 40, 4)
         setattr(data, name, wp.full(shape, -777 if dtype is int else float("nan"), dtype=dtype, device=device))
-    counts = array([prefix[w] + 3 * kept[w] for w in range(2)], int)
+    counts = array([prefix[w] + int(np.sum(rows[: kept[w]])) for w in range(2)], int)
     bounds = array([[p, p] for p in prefix], int)
     return data, SimpleNamespace(counts=counts, bounds=bounds, device=device)
 
@@ -133,12 +146,29 @@ def install_prefix(data, aux):
     data.row_cfm.assign(cfm)
 
 
-def run_original(data, aux):
-    """Execute all seven original producer/consumer kernels on exactly the same inputs."""
+def patch_view(device, count=16, *, seed=29):
+    """An enabled patch view: friction locations away from the contact points and nonzero tangential phi."""
+    rng = np.random.default_rng(seed)
+    patches = FrictionPatches()
+    patches.enabled = 1
+    patches.weight = wp.array(rng.uniform(0.0, 1.0, count).astype(np.float32), dtype=float, device=device)
+    patches.next_contact = wp.full(count, -1, dtype=int, device=device)
+    patches.point_a = wp.array(rng.normal(0, 0.2, (count, 3)).astype(np.float32), dtype=wp.vec3, device=device)
+    patches.point_b = wp.array(rng.normal(0, 0.2, (count, 3)).astype(np.float32), dtype=wp.vec3, device=device)
+    patches.phi = wp.array(rng.normal(0, 0.01, (count, 2)).astype(np.float32), dtype=wp.vec2, device=device)
+    return patches
+
+
+def run_original(data, aux, patches=None, friction_anchor_beta=0.0):
+    """Execute all seven original producer/consumer kernels on exactly the same inputs.
+
+    Without ``patches`` the producers see point friction's zero-phi view.
+    """
     data.J.zero_()
     install_prefix(data, aux)
-    patches = FrictionPatches()
-    patches.phi = wp.zeros(data.point0.shape[0], dtype=wp.vec2, device=aux.device)
+    if patches is None:
+        patches = FrictionPatches()
+        patches.phi = wp.zeros(data.point0.shape[0], dtype=wp.vec2, device=aux.device)
     values = {
         "contact_count": data.count,
         "total_num_threads": 16,
@@ -167,7 +197,7 @@ def run_original(data, aux):
         "contact_friction_gap_threshold": float("inf"),
         "contact_friction_shared_anchor": data.friction_shared_anchor,
         "friction_patches": patches,
-        "friction_anchor_beta": 0.0,
+        "friction_anchor_beta": friction_anchor_beta,
         "contact_friction_articulation_pairs_only": 0,
         "is_free_rigid": wp.zeros(6, dtype=int, device=aux.device),
         "contact_friction_scale": data.friction_scale,
@@ -226,8 +256,11 @@ def run_original(data, aux):
     launch(kernels.finalize_world_diag_cfm, 2)
 
 
-def run_candidate(data, aux):
-    """Execute complete owners and the contact clear, leaving original allocation untouched."""
+def run_candidate(data, aux, law=None):
+    """Execute complete owners and the contact clear, leaving original allocation untouched.
+
+    ``law`` selects the patch friction producer.
+    """
     install_prefix(data, aux)
     wp.launch(
         compact.clear_contact_response,
@@ -236,7 +269,10 @@ def run_candidate(data, aux):
         block_dim=256,
         device=aux.device,
     )
-    wp.launch(compact.produce_contacts, dim=16, inputs=[data], device=aux.device)
+    if law is None:
+        wp.launch(compact.produce_contacts, dim=16, inputs=[data], device=aux.device)
+    else:
+        wp.launch(compact.produce_patch_contacts, dim=16, inputs=[data, law], device=aux.device)
     wp.launch(
         compact.produce_limit_response,
         dim=(2, 12),
@@ -424,6 +460,50 @@ def install_contacts(model, state, contacts):
     contacts.rigid_contact_count.assign(np.array([6], dtype=np.int32))
 
 
+def install_patch_contacts(model, state, contacts, *, margin=0.02):
+    """Contacts that the patch builder links into rings, held at a loaded depth during short steps.
+
+    Per world, each star sphere rests on a static support at three contacts in a row: the outer two
+    become the ring's anchors (three-row units) and the middle one a normal-only unit. A two-contact
+    ring couples the first star sphere to the chain's last sphere, which keeps that sphere's
+    coordinate out of the independent schedule. ``margin`` sets every contact's depth.
+    """
+    shape_body = model.shape_body.numpy()
+    poses = state.body_q.numpy().astype(np.float64)
+    radius = 0.01
+
+    def local(shape, point):
+        if shape < 0:
+            return point
+        pose = poses[shape_body[shape]]
+        q = -pose[3:6]
+        p = point - pose[:3]
+        return p + 2 * np.cross(q, np.cross(q, p) + pose[6] * p)
+
+    rows = []
+    for world in range(2):
+        star0, star1, _, chain = 4 * world, 4 * world + 1, 4 * world + 2, 4 * world + 3
+        for shape in (star0, star1):
+            bottom = poses[shape_body[shape], :3] - np.array((0.0, 0.0, radius))
+            rows += [(shape, -1, bottom + np.array((offset, 0.0, 0.0))) for offset in (-0.004, 0.0, 0.004)]
+        middle = 0.5 * (poses[shape_body[star0], :3] + poses[shape_body[chain], :3])
+        rows += [(star0, chain, middle + np.array((0.0, offset, 0.0))) for offset in (-0.004, 0.004)]
+    capacity = contacts.rigid_contact_shape0.shape[0]
+    shapes = np.full((2, capacity), -1, dtype=np.int32)
+    points = np.zeros((2, capacity, 3), dtype=np.float32)
+    for contact, (shape0, shape1, point) in enumerate(rows):
+        shapes[:, contact] = (shape0, shape1)
+        points[0, contact] = local(shape0, point)
+        points[1, contact] = local(shape1, point)
+    for endpoint in range(2):
+        getattr(contacts, f"rigid_contact_shape{endpoint}").assign(shapes[endpoint])
+        getattr(contacts, f"rigid_contact_point{endpoint}").assign(points[endpoint])
+    contacts.rigid_contact_margin0.fill_(margin)
+    contacts.rigid_contact_margin1.zero_()
+    contacts.rigid_contact_normal.assign(np.tile(np.array([0.0, 0.0, -1.0], np.float32), (capacity, 1)))
+    contacts.rigid_contact_count.assign(np.array([len(rows)], dtype=np.int32))
+
+
 class TestCompactContact(unittest.TestCase):
     def compare(self, original, candidate, aux):
         """Compare every active complete field, not only the diagonal or row count."""
@@ -453,6 +533,87 @@ class TestCompactContact(unittest.TestCase):
             np.testing.assert_array_equal(candidate.factor.numpy(), before)
             # The prescribed body has genuine nonzero velocity, not a zero-target fixture.
             self.assertGreater(np.max(np.abs(candidate.target.numpy()[:, 14:20])), 0.01)
+
+    def test_patch_rows_match_original_chain(self):
+        """Write patch rows of mixed units as the original producers do, at the patch friction location."""
+        # The prescribed contacts (4 and 5) own anchors; the last allocated contact is normal-only.
+        units = (3, 1, 1, 3, 3, 3, 1, 3)
+        beta = 0.35
+        for shared, friction_shared in ((0, 0), (0, 1), (1, 0)):
+            original, aux = fixture(shared=shared, friction_shared=friction_shared, rows=units)
+            candidate, _ = fixture(shared=shared, friction_shared=friction_shared, rows=units)
+            point, _ = fixture(shared=shared, friction_shared=friction_shared, rows=units)
+            patches = patch_view(aux.device)
+            law = compact.PatchRowLaw()
+            law.patches = patches
+            law.beta = beta
+            run_original(original, aux, patches=patches, friction_anchor_beta=beta)
+            run_candidate(candidate, aux, law=law)
+            self.compare(original, candidate, aux)
+            run_candidate(point, aux)
+            # Tangent rows carry the anchor's phi and beta and the undivided coefficient, and they act
+            # at the patch location: the point producer's tangent rows differ.
+            phi = patches.phi.numpy()
+            for contact, (world, slot) in enumerate(zip(candidate.world.numpy(), candidate.slot.numpy(), strict=True)):
+                if slot < 0 or candidate.slots_needed.numpy()[contact] != 3:
+                    continue
+                tangents = slice(slot + 1, slot + 3)
+                np.testing.assert_array_equal(candidate.row_type.numpy()[world, tangents], 2)
+                np.testing.assert_array_equal(candidate.row_parent.numpy()[world, tangents], slot)
+                np.testing.assert_array_equal(candidate.phi.numpy()[world, tangents], phi[contact])
+                np.testing.assert_array_equal(candidate.row_beta.numpy()[world, tangents], np.float32(beta))
+                np.testing.assert_array_equal(
+                    candidate.row_mu.numpy()[world, tangents], point.row_mu.numpy()[world, tangents]
+                )
+            friction = candidate.row_type.numpy() == 2
+            self.assertGreater(np.max(np.abs(candidate.target.numpy() - point.target.numpy())[friction]), 1.0e-3)
+            self.assertGreater(np.max(np.abs(candidate.sparse_jy.numpy() - point.sparse_jy.numpy())[friction]), 1.0e-3)
+            # Normal-only units hold one row; normal rows match the point producer.
+            normal = candidate.row_type.numpy() == 0
+            np.testing.assert_array_equal(candidate.diag.numpy()[normal], point.diag.numpy()[normal])
+
+    def test_ordered_patch_rows_match_collision_order(self):
+        """Publish patch rows through the contact schedule exactly as in collision order."""
+        units = (3, 1, 1, 3, 3, 3, 1, 3)
+        reference, aux = fixture(rows=units)
+        candidate, _ = fixture(rows=units)
+        law = compact.PatchRowLaw()
+        law.patches = patch_view(aux.device)
+        law.beta = 0.35
+        run_candidate(reference, aux, law=law)
+        # Permute the contacts and their patch view together; allocated rows keep their owners.
+        permutation = np.random.default_rng(457).permutation(16)
+        for field in ("point0", "point1", "normal", "shape0", "shape1", "margin0", "margin1"):
+            getattr(candidate, field).assign(getattr(reference, field).numpy()[permutation].copy())
+        for field in ("world", "slot", "art0", "art1", "path", "slots_needed"):
+            getattr(candidate, field).assign(getattr(reference, field).numpy()[permutation].copy())
+        for field in ("weight", "point_a", "point_b", "phi"):
+            getattr(law.patches, field).assign(getattr(law.patches, field).numpy()[permutation].copy())
+        install_prefix(candidate, aux)
+        wp.launch(
+            compact.clear_contact_response,
+            dim=(2, 256),
+            inputs=[aux.counts, aux.bounds, candidate.dense_group, candidate.J, candidate.Y],
+            block_dim=256,
+            device=aux.device,
+        )
+        compact._ContactOrder(16, 2, 40, aux.device).launch(candidate, 16, law)
+        wp.launch(
+            compact.produce_limit_response,
+            dim=(2, 12),
+            inputs=[
+                aux.bounds,
+                aux.counts,
+                candidate.dense_group,
+                candidate.factor,
+                candidate.J,
+                candidate.Y,
+                candidate.row_cfm,
+                candidate.diag,
+            ],
+            device=aux.device,
+        )
+        self.compare(reference, candidate, aux)
 
     def test_empty_and_growing_prefix_with_poison(self):
         """Overwrite every active row through empty, growing and shrinking prefix cases."""
@@ -522,6 +683,7 @@ class TestCompactContact(unittest.TestCase):
             "_sparse_diagonal_dense_size": 6,
             "_sparse_diagonal_response_size": 108,
             "_sparse_diagonal_contact_triples": True,
+            "_sparse_diagonal_contact_units": False,
             "dense_max_constraints": 40,
             "_fused_diagonal_joint_limits": True,
             "_dense_internal_max_rows": 12,
@@ -535,6 +697,9 @@ class TestCompactContact(unittest.TestCase):
             "_preelim_active": False,
         }
         self.assertTrue(compact.supported(SimpleNamespace(**valid)))
+        # Patch friction schedules units instead of triples.
+        units = {**valid, "_sparse_diagonal_contact_triples": False, "_sparse_diagonal_contact_units": True}
+        self.assertTrue(compact.supported(SimpleNamespace(**units)))
         for name, value in (
             ("_sparse_diagonal_contact_solve", False),
             ("_sparse_diagonal_dense_size", 7),
@@ -648,6 +813,78 @@ class TestCompactContact(unittest.TestCase):
                 for graph in graphs:
                     wp.capture_launch(graph)
                 compare()
+
+    def test_cuda_patch_rows_match_the_original_producers(self):
+        """Write persistent patch rows from the compact boundary as the original producers do.
+
+        All arms run the sparse unit schedule under default patch friction; the compact arms replace only
+        the row producer, so rows by contact, impulses, states and anchor history must agree.
+        """
+        devices = wp.get_cuda_devices()
+        if not devices:
+            self.skipTest("Actual sparse constructor requires CUDA")
+        for device in devices:
+            model = build_solver_fixture(device)
+            model.rigid_contact_max = 24
+            solvers = []
+            for enabled, ordered in ((False, False), (True, False), (True, True)):
+                with (
+                    mock.patch.object(solver_module, "_COMPACT_CONTACT_BOUNDARY", enabled),
+                    mock.patch.object(solver_module, "_COMPACT_CONTACT_ORDERING", ordered),
+                    mock.patch.object(solver_module, "_SPARSE_CONTACT_DIRECT", True),
+                ):
+                    solvers.append(
+                        newton.solvers.SolverFeatherPGS(
+                            model,
+                            pgs_mode="matrix_free",
+                            pgs_iterations=8,
+                            use_parallel_streams=True,
+                            enable_joint_limits=True,
+                            dense_max_constraints=64,
+                            mf_max_constraints=64,
+                        )
+                    )
+            for solver, enabled in zip(solvers, (False, True, True), strict=True):
+                self.assertTrue(solver._friction_anchors_enabled)
+                self.assertTrue(solver._sparse_diagonal_contact_units)
+                self.assertEqual(solver._compact_contact_boundary, enabled)
+                record = solver.get_path_selection()["routes"]["contact_rows"]
+                self.assertEqual(record["producer"], "compact_contact_boundary" if enabled else "sparse_diagonal")
+            self.assertIsNotNone(solvers[2]._compact_contact_order)
+            states = [[model.state(), model.state()] for _ in solvers]
+            controls = [model.control() for _ in solvers]
+            contacts = [newton.Contacts(model.rigid_contact_max, 0, device=device) for _ in solvers]
+            for index in range(len(solvers)):
+                state = states[index][0]
+                newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+                install_patch_contacts(model, state, contacts[index])
+            linked = independent = False
+            for _step in range(6):
+                for index, solver in enumerate(solvers):
+                    current, following = states[index]
+                    solver.step(current, following, controls[index], contacts[index], 1 / 240)
+                    states[index] = [following, current]
+                reference = contact_rows(solvers[0], contacts[0])
+                for index in (1, 2):
+                    for field in ("joint_q", "joint_qd", "body_q", "body_qd"):
+                        np.testing.assert_allclose(
+                            getattr(states[index][0], field).numpy(),
+                            getattr(states[0][0], field).numpy(),
+                            rtol=3e-5,
+                            atol=5e-6,
+                        )
+                    rows = contact_rows(solvers[index], contacts[index])
+                    assert_rows_close(reference, rows)
+                    assert_contact_impulses_close(reference, rows)
+                    assert_history_close(solvers[0], solvers[index])
+                for solver in solvers:
+                    solver.check_constraint_capacity()
+                    assert_ring_coulomb(solver)
+                linked |= any(len(record["types"]) == 1 and record["parents"][0] >= 0 for record in reference.values())
+                independent |= bool(np.any(solvers[1]._sparse_contact_group_count.numpy() > 0))
+            self.assertTrue(linked, "A normal-only unit must link into a patch ring")
+            self.assertTrue(independent, "A patch ring must schedule independently")
+            self.assertTrue(solvers[0]._friction_patches.previous.valid.numpy().any(), "Anchors must carry history")
 
     def test_cuda_complete_owners_and_two_graphs(self):
         """Check real device owners and repeated graph outputs without launching CUDA on CPU hosts."""

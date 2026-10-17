@@ -5,11 +5,21 @@
 
 Allocation, contact admission, scheduling, RHS and the solve remain authoritative
 in the original pipeline. This module only changes the representation producer.
+Persistent patch friction writes its tangent rows with the patch row law; patch
+ring links and the divided friction coefficient stay with ``link_patch_rows``,
+which runs after this producer.
 """
 
 import warp as wp
 
-from .kernels import contact_tangent_basis, mixed_contact_restitution, prescribed_relative_contact_target
+from .friction_patches import PatchRowLaw, patch_friction_location
+from .kernels import (
+    PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_FRICTION,
+    contact_tangent_basis,
+    mixed_contact_restitution,
+    prescribed_relative_contact_target,
+)
 
 _Vec6 = wp.types.vector(length=6, dtype=wp.float32)
 
@@ -68,13 +78,13 @@ class ContactBoundaryData:
 
 
 def supported(solver) -> bool:
-    """Require the inherited complete sparse contract and its dense-six triple mode."""
+    """Require the inherited complete sparse contract and its dense-six triple or unit mode."""
     return bool(
         solver.model.device.is_cuda
         and solver._sparse_diagonal_contact_solve
         and solver._sparse_diagonal_dense_size == 6
         and solver._sparse_diagonal_response_size > 6
-        and solver._sparse_diagonal_contact_triples
+        and (solver._sparse_diagonal_contact_triples or solver._sparse_diagonal_contact_units)
         and solver.dense_max_constraints >= 12
         # The inherited sparse owner fuses all wide-articulation limits. With
         # augmented (implicit) drives and no other row family, only the dense
@@ -309,6 +319,175 @@ def _produce_contact(data: ContactBoundaryData, contact: int):
         data.diag[world, output_row] = (diagonal + sparse_diagonal) + data.cfm
 
 
+@wp.func
+def _publish_row_response(
+    data: ContactBoundaryData,
+    world: int,
+    output_row: int,
+    group: int,
+    has_dense: bool,
+    art0: int,
+    body0: int,
+    art1: int,
+    body1: int,
+    direction: wp.vec3,
+    p0: wp.vec3,
+    p1: wp.vec3,
+):
+    """Write one row's dense-six and sparse response and its diagonal, as ``_produce_contact`` does."""
+    diagonal = float(0.0)
+    if has_dense:
+        jacobian = _Vec6()
+        for dof in range(6):
+            value0 = float(0.0)
+            value1 = float(0.0)
+            bit = wp.uint32(1) << wp.uint32(dof)
+            if art0 >= 0 and body0 >= 0 and data.response_dofs[art0] == 6:
+                if (data.body_mask[body0] & bit) != wp.uint32(0):
+                    value0 = point_projection(data.motion[data.dof_start[art0] + dof], direction, p0, data.origin[art0])
+            if art1 >= 0 and body1 >= 0 and data.response_dofs[art1] == 6:
+                if (data.body_mask[body1] & bit) != wp.uint32(0):
+                    value1 = -point_projection(
+                        data.motion[data.dof_start[art1] + dof], direction, p1, data.origin[art1]
+                    )
+            jacobian[dof] = value0 + value1
+        response = solve_six(data.factor, group, jacobian)
+        for dof in range(6):
+            data.J[group, output_row, dof] = jacobian[dof]
+            data.Y[group, output_row, dof] = response[dof]
+            diagonal += jacobian[dof] * response[dof]
+    coord0 = -1
+    coord1 = -1
+    value0 = float(0.0)
+    value1 = float(0.0)
+    response0 = float(0.0)
+    response1 = float(0.0)
+    if art0 >= 0 and body0 >= 0 and data.response_dofs[art0] == data.sparse_size:
+        dof0 = data.body_single_dof[body0]
+        if dof0 >= 0:
+            local0 = dof0 - data.dof_start[art0]
+            if local0 >= 0 and local0 < data.sparse_size:
+                coord0 = data.dof_offset[art0] + local0
+                value0 = point_projection(data.motion[dof0], direction, p0, data.origin[art0])
+                response0 = value0 * data.inverse_mass[dof0]
+    if art1 >= 0 and body1 >= 0 and data.response_dofs[art1] == data.sparse_size:
+        dof1 = data.body_single_dof[body1]
+        if dof1 >= 0:
+            local1 = dof1 - data.dof_start[art1]
+            if local1 >= 0 and local1 < data.sparse_size:
+                coord1 = data.dof_offset[art1] + local1
+                value1 = -point_projection(data.motion[dof1], direction, p1, data.origin[art1])
+                response1 = value1 * data.inverse_mass[dof1]
+    if coord0 >= 0 and coord0 == coord1:
+        value0 += value1
+        response0 += response1
+        coord1 = -1
+        value1 = 0.0
+        response1 = 0.0
+    data.sparse_dof[world, output_row, 0] = coord0
+    data.sparse_dof[world, output_row, 1] = coord1
+    data.sparse_jy[world, output_row, 0] = value0
+    data.sparse_jy[world, output_row, 1] = response0
+    data.sparse_jy[world, output_row, 2] = value1
+    data.sparse_jy[world, output_row, 3] = response1
+    sparse_diagonal = float(0.0)
+    if coord0 >= 0:
+        sparse_diagonal += value0 * response0
+    if coord1 >= 0:
+        sparse_diagonal += value1 * response1
+    data.diag[world, output_row] = (diagonal + sparse_diagonal) + data.cfm
+
+
+@wp.func
+def _produce_patch_contact(data: ContactBoundaryData, law: PatchRowLaw, contact: int):
+    """Publish one contact's rows with the persistent patch friction law.
+
+    The normal row is ``_produce_contact``'s. Tangent rows, present only when the
+    contact owns an anchor, act at the patch friction location, carry the anchor's
+    tangential phi with ``law.beta``, and keep the undivided friction coefficient.
+    """
+    if contact >= wp.min(data.count[0], data.point0.shape[0]):
+        return
+    slot = data.slot[contact]
+    if data.path[contact] != 0 or slot < 0:
+        return
+    world = data.world[contact]
+    art0 = data.art0[contact]
+    art1 = data.art1[contact]
+    shape0 = data.shape0[contact]
+    shape1 = data.shape1[contact]
+    body0 = -1
+    body1 = -1
+    if shape0 >= 0:
+        body0 = data.shape_body[shape0]
+    if shape1 >= 0:
+        body1 = data.shape_body[shape1]
+    has_dense = False
+    if art0 >= 0 and body0 >= 0:
+        has_dense = data.response_dofs[art0] == 6
+    if art1 >= 0 and body1 >= 0:
+        has_dense = has_dense or data.response_dofs[art1] == 6
+    normal = -data.normal[contact]
+    point0 = data.point0[contact] - data.margin0[contact] * normal
+    point1 = data.point1[contact] + data.margin1[contact] * normal
+    if body0 >= 0:
+        point0 = wp.transform_point(data.body_q[body0], data.point0[contact]) - data.margin0[contact] * normal
+    if body1 >= 0:
+        point1 = wp.transform_point(data.body_q[body1], data.point1[contact]) + data.margin1[contact] * normal
+    phi = wp.dot(normal, point0 - point1)
+    mu = float(0.0)
+    materials = int(0)
+    if shape0 >= 0:
+        mu += data.material_mu[shape0]
+        materials += 1
+    if shape1 >= 0:
+        mu += data.material_mu[shape1]
+        materials += 1
+    if materials > 0:
+        mu /= float(materials)
+    restitution = mixed_contact_restitution(shape0, shape1, data.material_restitution)
+    tangent0, tangent1 = contact_tangent_basis(normal)
+    anchor = 0.5 * (point0 + point1)
+    friction0, friction1 = patch_friction_location(law.patches, contact)
+    group = data.dense_group[world]
+    for row in range(data.slots_needed[contact]):
+        direction = normal
+        p0 = point0
+        p1 = point1
+        if row == 0:
+            if data.shared_anchor != 0:
+                p0 = anchor
+                p1 = anchor
+        else:
+            if row == 1:
+                direction = tangent0
+            else:
+                direction = tangent1
+            p0 = friction0
+            p1 = friction1
+        output_row = slot + row
+        target = prescribed_relative_contact_target(
+            body0, art0, body1, art1, p0, p1, direction, data.prescribed, data.origin, data.body_v
+        )
+        data.target[world, output_row] = target
+        data.row_cfm[world, output_row] = data.cfm
+        if row == 0:
+            data.row_type[world, output_row] = PGS_CONSTRAINT_TYPE_CONTACT
+            data.row_parent[world, output_row] = -1
+            data.row_mu[world, output_row] = mu
+            data.row_beta[world, output_row] = data.beta
+            data.phi[world, output_row] = phi
+            data.restitution[world, output_row] = restitution
+        else:
+            data.row_type[world, output_row] = PGS_CONSTRAINT_TYPE_FRICTION
+            data.row_parent[world, output_row] = slot
+            data.row_mu[world, output_row] = mu * data.friction_scale
+            data.row_beta[world, output_row] = law.beta
+            data.phi[world, output_row] = law.patches.phi[contact][row - 1]
+            data.restitution[world, output_row] = 0.0
+        _publish_row_response(data, world, output_row, group, has_dense, art0, body0, art1, body1, direction, p0, p1)
+
+
 @wp.kernel
 def produce_contacts(data: ContactBoundaryData):
     """Publish contacts in their original collision order."""
@@ -318,6 +497,17 @@ def produce_contacts(data: ContactBoundaryData):
 @wp.kernel
 def _produce_ordered_contacts(data: ContactBoundaryData, order: wp.array[int]):
     _produce_contact(data, order[wp.tid()])
+
+
+@wp.kernel
+def produce_patch_contacts(data: ContactBoundaryData, law: PatchRowLaw):
+    """Publish contacts with the patch friction law in their original collision order."""
+    _produce_patch_contact(data, law, wp.tid())
+
+
+@wp.kernel
+def _produce_ordered_patch_contacts(data: ContactBoundaryData, law: PatchRowLaw, order: wp.array[int]):
+    _produce_patch_contact(data, law, order[wp.tid()])
 
 
 @wp.kernel
@@ -346,8 +536,11 @@ class _ContactOrder:
         self.keys = wp.empty(2 * capacity, dtype=wp.uint32, device=device)
         self.order = wp.empty(2 * capacity, dtype=int, device=device)
 
-    def launch(self, data: ContactBoundaryData, capacity: int):
-        """Schedule allocated rows without changing their identities or solver order."""
+    def launch(self, data: ContactBoundaryData, capacity: int, law: "PatchRowLaw | None" = None):
+        """Schedule allocated rows without changing their identities or solver order.
+
+        ``law`` selects the persistent patch friction producer.
+        """
         if not 0 <= capacity <= self.capacity:
             raise ValueError("contact ordering scratch is smaller than the contact capacity")
         if capacity == 0:
@@ -360,7 +553,10 @@ class _ContactOrder:
         )
         with wp.ScopedDevice(self.device):
             wp.utils.radix_sort_pairs(self.keys, self.order, capacity, end_bit=self.bits)
-        wp.launch(_produce_ordered_contacts, dim=capacity, inputs=[data, self.order], device=self.device)
+        if law is None:
+            wp.launch(_produce_ordered_contacts, dim=capacity, inputs=[data, self.order], device=self.device)
+        else:
+            wp.launch(_produce_ordered_patch_contacts, dim=capacity, inputs=[data, law, self.order], device=self.device)
 
 
 @wp.kernel
@@ -457,10 +653,23 @@ def launch_contacts(solver, state_in, state_aug, contacts, workers):
         block_dim=256,
         device=solver.model.device,
     )
-    if solver._compact_contact_order is None:
+    order = solver._compact_contact_order
+    # Persistent patches write their tangent rows with the patch row law. The
+    # original link_patch_rows still runs after this producer: it alone links
+    # normal rows into patch rings and divides the tangent coefficient.
+    law = None
+    if solver._friction_anchors_enabled:
+        law = PatchRowLaw()
+        law.patches = solver._friction_patches.view
+        law.beta = solver.friction_anchor_beta
+    if order is not None:
+        order.launch(data, contacts.rigid_contact_max, law)
+    elif law is None:
         wp.launch(produce_contacts, dim=contacts.rigid_contact_max, inputs=[data], device=solver.model.device)
     else:
-        solver._compact_contact_order.launch(data, contacts.rigid_contact_max)
+        wp.launch(
+            produce_patch_contacts, dim=contacts.rigid_contact_max, inputs=[data, law], device=solver.model.device
+        )
     # These original kernels encode schedule links into the freshly published
     # sparse DOF slots. Never overwrite those fields after this point.
     wp.launch(

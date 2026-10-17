@@ -3111,8 +3111,9 @@ class SolverFeatherPGS(SolverBase):
             configure_linear_state(self)
 
         self._compact_contact_boundary = False
+        # The compact producer writes the point and the patch row law; torsion and compliance keep ordinary rows.
         if (
-            self._point_contact_paths
+            self._law_agnostic_contact_paths
             and _COMPACT_CONTACT_BOUNDARY
             and not (_GROUPED_CHECK or _CHECK_ROWS or _CHECK_ROWS_FUSED)
         ):

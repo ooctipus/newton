@@ -2,10 +2,12 @@
  "kernels": {
   "compact_contact._build_contact_order": "55503a98888211c5f338f34c0442653783cd51caa7291c653b6f631dcb504580",
   "compact_contact._produce_ordered_contacts": "8d286ec858adde799567df2e8b24c70ab9404f42c3075c69aa2ea37510a6b6a7",
+  "compact_contact._produce_ordered_patch_contacts": "15ef0a0ffb81a74a9ff3010dc4b6431060993d8852142066ed944c2eca0e47e7",
   "compact_contact.clear_contact_response": "40bfb5f4f1602fff174cc57df8937bdcf8dc7777f80542a7833987f649b748a6",
   "compact_contact.clear_limit_prefix": "7f1b983839f72e16f5904707bbf87c71c6c1b4c141c6ac634a5203eaafb0f1a8",
   "compact_contact.produce_contacts": "46fbabb8d68c827b120a22204aa7a194be9851fa23c2d7e8c9fbfb2ba22e7a6d",
   "compact_contact.produce_limit_response": "cc7f41790d5dd1243b5a84c2a525fb696cab61073c895d9ddbb83d987eab481a",
+  "compact_contact.produce_patch_contacts": "36e61185700242aa4cdd1c1f81cf0db6f61297424a4b4939d8d5baeee4fc044d",
   "contact_compliance.update_compliant_rhs": "a70684cc25f74be3186c1c96d9b6b2085abbe59808ec1a1dc75a88a4c6972f6e",
   "contact_torsion._prepare_velocity_torsion_rows": "db04180e57b331118c6a913d6049258006e0e69fc8f9124f922e03ef9318e1f4",
   "contact_torsion_device._apply_counts": "7526241579441e586c430e6f7b599735db2153f73263db7101af37b324e8f2d8",

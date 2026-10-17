@@ -65,6 +65,25 @@ class FrictionPatches:
 
 
 @wp.struct
+class PatchRowLaw:
+    """Tangent-row law of persistent patches, for producers that write their own friction rows.
+
+    A tangent row acts at its patch's friction location, carries the anchor's tangential
+    displacement as phi and corrects it with ``beta`` (``friction_anchor_beta``). Producers write
+    the undivided friction coefficient; ``link_patch_rows`` divides it and links the ring.
+    """
+
+    patches: FrictionPatches
+    beta: float
+
+
+@wp.func
+def patch_friction_location(patches: FrictionPatches, c: int):
+    """Return contact ``c``'s friction location on each side, in world coordinates."""
+    return patches.point_a[c], patches.point_b[c]
+
+
+@wp.struct
 class _PatchFrame:
     keys: wp.array[wp.int64]
     indices: wp.array[int]

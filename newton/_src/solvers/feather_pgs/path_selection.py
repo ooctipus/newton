@@ -279,13 +279,19 @@ def _contact_rows(solver, source) -> dict:
                 method = "masked"
             methods[str(int(size))] = method
     if solver._compact_contact_boundary:
-        compact_reason = "FEATHER_PGS_COMPACT_CONTACT_BOUNDARY admitted the six-coordinate sparse-diagonal triples."
+        compact_reason = (
+            "FEATHER_PGS_COMPACT_CONTACT_BOUNDARY admitted the six-coordinate sparse-diagonal triples or units."
+        )
     elif not source._COMPACT_CONTACT_BOUNDARY:
         compact_reason = "Off: FEATHER_PGS_COMPACT_CONTACT_BOUNDARY is an import-time opt-in."
-    elif not point:
-        compact_reason = "Compact contacts implement point contacts only."
+    elif not solver._law_agnostic_contact_paths:
+        compact_reason = (
+            "Compact contacts implement the point and patch row laws; torsion and compliance keep ordinary rows."
+        )
     else:
-        compact_reason = "Declined: requires the six-coordinate sparse-diagonal triple contract and no row checks."
+        compact_reason = (
+            "Declined: requires the six-coordinate sparse-diagonal triple or unit contract and no row checks."
+        )
     packets = solver._row_packets
     return {
         "producer": producer,

@@ -41,6 +41,8 @@ _ARCH = "120"
 # may change; a change that adds a patch-only kernel lists it here.
 _PATCH_ONLY = frozenset(
     (
+        "compact_contact._produce_ordered_patch_contacts",
+        "compact_contact.produce_patch_contacts",
         "friction_patches._arange",
         "friction_patches._build",
         "friction_patches._finish_and_store",
