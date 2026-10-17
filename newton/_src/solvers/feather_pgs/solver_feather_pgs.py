@@ -2723,6 +2723,13 @@ class SolverFeatherPGS(SolverBase):
         configure_contact_torsion(
             self, contact_torsion_radius, contact_torsion_shape_indices, contact_torsion_shape_patterns
         )
+        # Owners and consumers that neither write friction rows nor project
+        # friction without the linked normal ring serve point and patch
+        # friction. Producers that write their own friction rows stay
+        # point-only until they write the patch row law. Defined before route
+        # selection so admission can read both.
+        self._law_agnostic_contact_paths = not (self._contact_torsion_enabled or self.contact_compliance)
+        self._point_contact_paths = self._law_agnostic_contact_paths and not self._friction_anchors_enabled
         if self.pgs_mode == "matrix_free":
             self._jy_world_aliased = self._detect_jy_world_identity()
         else:
@@ -2913,11 +2920,7 @@ class SolverFeatherPGS(SolverBase):
         )
         self._allocate_debug_buffers(model)
         self._scatter_armature_to_groups()
-        # Retained compact owners implement point contacts. New contact laws
-        # keep the mainline row pipeline until those owners support them.
-        self._point_contact_paths = not (
-            self._friction_anchors_enabled or self._contact_torsion_enabled or self.contact_compliance
-        )
+        # The point-only producers below read _point_contact_paths, set after configure_contact_torsion.
         # Worlds of one limited articulation and at most one other get their
         # limit prefix and contact packets built in place for the local solve
         # owners (row_packets.py); FEATHER_PGS_ROW_PACKETS=0 opts out.

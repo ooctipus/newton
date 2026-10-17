@@ -10,6 +10,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_JOINT_LIMIT
+from newton.tests.feather_pgs_patch_parity import assert_history_close, make_loaded
 from tools.fpgs_bench.test_mixed_tree_cache import DT, make_solver, model_fixture
 from tools.fpgs_bench.test_packed_tree_state import physical_mass, public_state
 
@@ -21,10 +22,10 @@ def step(case):
     return model, solver, output, state, control, contacts
 
 
-def make_case(enabled, reordered):
+def make_case(enabled, reordered, *, friction_anchor_beta=0.0):
     """Couple the two factor families with a loaded contact in every world."""
     model = model_fixture("cuda:0", reordered=reordered)
-    solver = make_solver(model, enabled=enabled, permuted=True)
+    solver = make_solver(model, enabled=enabled, permuted=True, friction_anchor_beta=friction_anchor_beta)
     state, output, control = model.state(), model.state(), model.control()
     state.joint_qd.assign(np.linspace(-0.12, 0.16, model.joint_dof_count, dtype=np.float32))
     state.body_f.assign(np.random.default_rng(111).normal(0, 0.05, (model.body_count, 6)).astype(np.float32))
@@ -58,6 +59,14 @@ def make_case(enabled, reordered):
 
 @unittest.skipUnless(wp.is_cuda_available(), "CUDA unavailable")
 class TestMixedTreeSteps(unittest.TestCase):
+    friction_anchor_beta = 0.0
+
+    def make_cases(self, reordered):
+        """Build the ordinary and the held-tree arm of one fixture."""
+        return [
+            make_case(enabled, reordered, friction_anchor_beta=self.friction_anchor_beta) for enabled in (False, True)
+        ]
+
     def assert_pair(self, cases):
         """Check public state, finite impulses and unchanged unilateral row laws."""
         for model, solver, state, *_ in cases:
@@ -108,7 +117,7 @@ class TestMixedTreeSteps(unittest.TestCase):
     def test_loaded_steps_and_model_changes(self):
         """Preserve coupled steps, held factors, selective resets and numeric updates."""
         for reordered in (False, True):
-            cases = [make_case(enabled, reordered) for enabled in (False, True)]
+            cases = self.make_cases(reordered)
             self.assertIsNone(cases[0][1]._tree_kinetic_state)
             self.assertIsNotNone(cases[1][1]._tree_kinetic_state)
             held = None
@@ -134,7 +143,7 @@ class TestMixedTreeSteps(unittest.TestCase):
 
     def test_complete_graph_and_dynamic_masks(self):
         """Replay complete held-factor cycles under changing reset masks."""
-        cases = [make_case(enabled, True) for enabled in (False, True)]
+        cases = self.make_cases(True)
         graphs, masks = [], []
         for arm in range(len(cases)):
             case = cases[arm]
@@ -157,6 +166,40 @@ class TestMixedTreeSteps(unittest.TestCase):
                 wp.capture_launch(graph)
             self.assert_pair(cases)
         wp.synchronize()  # Keep fixture arrays alive until all captured streams finish.
+
+
+class TestPatchMixedTreeSteps(TestMixedTreeSteps):
+    """Run the held-tree owner around the ordinary persistent-friction row pipeline."""
+
+    friction_anchor_beta = 0.2
+
+    def assert_pair(self, cases):
+        """Add equal contact impulses and anchor lifecycle to the inherited physical checks."""
+        super().assert_pair(cases)
+        for case in cases:
+            self.assertTrue(case[1]._friction_anchors_enabled)
+            self.assertFalse(case[1]._point_contact_paths)
+        for prefix in ("", "mf_"):
+            a, b = (getattr(case[1], prefix + "impulses").numpy() for case in cases)
+            np.testing.assert_allclose(a, b, atol=2e-5, rtol=7e-4)
+        assert_history_close(cases[0][1], cases[1][1])
+
+    def test_patch_rows_are_loaded(self):
+        """Carry sticking anchors and their friction impulse into the next frame."""
+        cases = self.make_cases(False)
+        for model, _solver, state, _output, _control, contacts in cases:
+            make_loaded(model, state, contacts)
+        cases = [step(case) for case in cases]
+        self.assert_pair(cases)
+        for case in cases:
+            patches = case[1]._friction_patches
+            self.assertGreater(np.count_nonzero(patches.view.weight.numpy()), 0)
+            self.assertGreater(np.count_nonzero(patches.previous.valid.numpy()), 0)
+            self.assertGreater(float(np.linalg.norm(patches.previous.tangent_impulse.numpy())), 0.0)
+        cases = [step(case) for case in cases]
+        self.assert_pair(cases)
+        for case in cases:
+            self.assertTrue(np.any(case[1]._friction_patches.current.source.numpy() >= 0))
 
 
 if __name__ == "__main__":

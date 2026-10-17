@@ -69,7 +69,7 @@ def model_fixture(device="cpu", *, worlds=3, reordered=False, primary_dofs=9):
     return model
 
 
-def make_solver(model, *, enabled=False, permuted=False):
+def make_solver(model, *, enabled=False, permuted=False, friction_anchor_beta=0.0):
     """Retain original Cholesky and independent-branch diagonal representations."""
     setup = SolverFeatherPGS._setup_size_grouping
 
@@ -111,7 +111,7 @@ def make_solver(model, *, enabled=False, permuted=False):
             double_buffer=False,
             use_parallel_streams=model.device.is_cuda,
             angular_damping=0.05,
-            friction_anchor_beta=0.0,
+            friction_anchor_beta=friction_anchor_beta,
         )
     if not model.device.is_cuda:
         # Direct CPU physical tests supply the original compact descriptor;

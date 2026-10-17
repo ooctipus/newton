@@ -15,8 +15,11 @@ import warp as wp
 
 import newton
 from newton.solvers import SolverFeatherPGS
+from newton.tests.feather_pgs_patch_parity import assert_history_close
 from newton.tests.test_feather_pgs_sparse_solver import _build_model, _make_solver
 from newton.tests.unittest_utils import assert_host_only
+
+STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
 
 
 def _cpu_model():
@@ -59,6 +62,31 @@ def _cpu_separate_worlds_model():
     builder.end_world()
     builder.add_ground_plane()
     return builder.finalize(device="cpu")
+
+
+def _graph_and_reset_rollout(model, sparse, cached_dynamics):
+    """Step once, then replay a captured contacting step around a partial-world reset."""
+    solver = _make_solver(model, sparse, cached_dynamics=cached_dynamics)
+    state, output = model.state(), model.state()
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    pipeline = newton.CollisionPipeline(model, convex_collision="ordinary")
+    contacts, control = pipeline.contacts(), model.control()
+
+    def step():
+        pipeline.collide(state, contacts)
+        solver.step(state, output, control, contacts, 1.0 / 400.0)
+        state.assign(output)
+
+    step()
+    with wp.ScopedCapture(device=model.device) as capture:
+        step()
+    for _ in range(8):
+        wp.capture_launch(capture.graph)
+    solver.reset(state, world_mask=wp.array([True, False], dtype=wp.bool, device=model.device))
+    for _ in range(8):
+        wp.capture_launch(capture.graph)
+    solver.check_constraint_capacity()
+    return solver, contacts, state
 
 
 def _launched_kernel_keys(model, solver):
@@ -596,32 +624,28 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         model = _build_model()
         outputs = []
         for choice in ("off", "on"):
-            solver = _make_solver(model, True, cached_dynamics=choice)
-            state, output = model.state(), model.state()
-            newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-            pipeline = newton.CollisionPipeline(model, convex_collision="ordinary")
-            contacts, control = pipeline.contacts(), model.control()
-
-            def step(pipeline=pipeline, state=state, contacts=contacts, solver=solver, output=output, control=control):
-                pipeline.collide(state, contacts)
-                solver.step(state, output, control, contacts, 1.0 / 400.0)
-                state.assign(output)
-
-            step()
-            with wp.ScopedCapture(device=model.device) as capture:
-                step()
-            for _ in range(8):
-                wp.capture_launch(capture.graph)
-            solver.reset(state, world_mask=wp.array([True, False], dtype=wp.bool, device=model.device))
-            for _ in range(8):
-                wp.capture_launch(capture.graph)
-            solver.check_constraint_capacity()
+            _solver, contacts, state = _graph_and_reset_rollout(model, True, choice)
             self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
-            outputs.append(
-                {name: getattr(state, name).numpy() for name in ("joint_q", "joint_qd", "body_q", "body_qd")}
-            )
+            outputs.append({name: getattr(state, name).numpy() for name in STATE_FIELDS})
         for name in outputs[0]:
             np.testing.assert_allclose(outputs[0][name], outputs[1][name], atol=3e-4, rtol=3e-4, err_msg=name)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
+    def test_cached_dynamics_dense_patch_graph_and_reset(self):
+        """Cache the dense route under default patch friction with unchanged states and anchor history."""
+        model = _build_model()
+        runs = [_graph_and_reset_rollout(model, False, choice) for choice in ("off", "on")]
+        self.assertIsNone(runs[0][0].get_path_selection()["cached_prediction"])
+        self.assertEqual(runs[1][0].get_path_selection()["cached_prediction"], "tree")
+        for solver, contacts, _state in runs:
+            self.assertTrue(solver._friction_anchors_enabled)
+            self.assertIsNone(solver._sparse_mass_matrix_size)
+            self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
+        for name in STATE_FIELDS:
+            np.testing.assert_allclose(
+                getattr(runs[0][2], name).numpy(), getattr(runs[1][2], name).numpy(), atol=3e-4, rtol=3e-4, err_msg=name
+            )
+        assert_history_close(runs[0][0], runs[1][0])
 
     def test_scalar_overrides_reach_solver(self):
         """Honor public choices independently of private test overrides."""

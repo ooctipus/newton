@@ -25,6 +25,16 @@ class _AdmissionProbe(SimpleNamespace):
         # Stop after admission, before any factor planning or device allocation.
         raise _TopologyReached
 
+    # The solver defines both contact-law predicates before route selection;
+    # derive them from the probe's law fields as it does.
+    @property
+    def _law_agnostic_contact_paths(self):
+        return not (self._contact_torsion_enabled or self.contact_compliance)
+
+    @property
+    def _point_contact_paths(self):
+        return self._law_agnostic_contact_paths and not self._friction_anchors_enabled
+
 
 def _eligible_solver():
     """Provide only the host fields needed before topology planning starts."""

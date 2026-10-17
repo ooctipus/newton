@@ -53,7 +53,10 @@ def supported(solver):
         and not solver.model.particle_count
         and len(solver.size_groups) >= 1
         and solver._sparse_mass_matrix_size is None
-        and solver._point_contact_paths
+        # The owner holds no rows, impulses or patch frames: the patch build,
+        # link, seed and finish stay on the solver pipeline around it, so it
+        # serves point and patch friction alike.
+        and solver._law_agnostic_contact_paths
         # Split mode composes its rows from the same held factors this owner
         # refreshes; the sparse tree owner has served split sweeps since it
         # existed, and the dense held owner does the same.
