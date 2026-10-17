@@ -104,7 +104,8 @@ BETA_THRESHOLD = 0.0001  # 0.1mm
 
 VALUES_PER_KEY = NUM_SPATIAL_DIRECTIONS + 1
 # Values are stored entry-major: each key owns one row of VALUES_STRIDE words,
-# of which the first VALUES_PER_KEY hold its winners. Eight uint64 words make a
+# of which the first VALUES_PER_KEY hold its winners. The last word only pads
+# the row: no writer addresses it, so it stays zero. Eight uint64 words make a
 # 64-byte row, so reading or retiring a key touches two sectors instead of one
 # sector in each of seven slot planes ``capacity`` entries apart.
 VALUES_STRIDE = 8
@@ -220,8 +221,9 @@ def compute_effective_radius(shape_type: int, shape_scale: wp.vec4) -> float:
 # These functions handle the entry-major value storage used for contact
 # reduction. Each hashtable entry owns one row of VALUES_STRIDE values:
 # [entry0_slot0, ..., entry0_slot7, entry1_slot0, ..., entry1_slot7, ...]
-# Every access addresses a value through reduction_value_index (device) or
-# reduction_value_index_np (host).
+# Slots 0 to VALUES_PER_KEY - 1 hold winners; slot 7 is padding that stays
+# zero. Every access addresses a value through reduction_value_index (device)
+# or reduction_value_index_np (host).
 
 
 @wp.func
@@ -230,7 +232,8 @@ def reduction_value_index(entry_idx: int, slot_id: int) -> int:
 
     Args:
         entry_idx: Entry index from hashtable_find_or_insert()
-        slot_id: Value slot within the entry's row (0 to ``VALUES_STRIDE - 1``)
+        slot_id: Winner slot within the entry's row (0 to ``VALUES_PER_KEY - 1``),
+            or the padding slot ``VALUES_STRIDE - 1`` when clearing the whole row
     """
     return entry_idx * wp.static(VALUES_STRIDE) + slot_id
 
@@ -254,7 +257,7 @@ def reduction_update_slot(
 
     Args:
         entry_idx: Entry index from hashtable_find_or_insert()
-        slot_id: Which value slot to write to (0 to values_per_key-1)
+        slot_id: Which value slot to write to (0 to ``VALUES_PER_KEY - 1``)
         value: The uint64 value to max with existing value
         values: Values array in entry-major layout
     """
@@ -322,7 +325,7 @@ def reduction_insert_slot(
 
     Args:
         key: The uint64 key to insert
-        slot_id: Which value slot to write to (0 to ``VALUES_STRIDE - 1``)
+        slot_id: Which value slot to write to (0 to ``VALUES_PER_KEY - 1``)
         value: The uint64 value to insert or max with
         keys: The hash table keys array (length must be power of two)
         values: Values array in entry-major layout, ``VALUES_STRIDE`` values per key

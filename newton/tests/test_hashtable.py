@@ -9,6 +9,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.geometry.contact_reduction_global import (
+    VALUES_PER_KEY,
     VALUES_STRIDE,
     GlobalContactReducer,
     reduction_insert_slot,
@@ -82,8 +83,8 @@ def test_insert_single_slot(test, device):
         reduction_insert_slot(wp.uint64(123), 0, wp.uint64(100), keys, values, active_slots)
         # Insert into slot 5
         reduction_insert_slot(wp.uint64(123), 5, wp.uint64(200), keys, values, active_slots)
-        # Insert into the last slot of the entry's row
-        reduction_insert_slot(wp.uint64(123), wp.static(VALUES_STRIDE - 1), wp.uint64(300), keys, values, active_slots)
+        # Insert into the entry's last winner slot
+        reduction_insert_slot(wp.uint64(123), wp.static(VALUES_PER_KEY - 1), wp.uint64(300), keys, values, active_slots)
 
     ht = HashTable(capacity=64, device=device)
     # Allocate values array externally (caller-managed)
@@ -107,7 +108,8 @@ def test_insert_single_slot(test, device):
     # Check values at each slot of the entry's row
     test.assertEqual(values_np[reduction_value_index_np(idx, 0)], 100)
     test.assertEqual(values_np[reduction_value_index_np(idx, 5)], 200)
-    test.assertEqual(values_np[reduction_value_index_np(idx, VALUES_STRIDE - 1)], 300)
+    test.assertEqual(values_np[reduction_value_index_np(idx, VALUES_PER_KEY - 1)], 300)
+    # Nothing else is written, including the padding slot that ends the row.
     test.assertEqual(np.count_nonzero(values_np), 3)
 
 
@@ -275,7 +277,7 @@ def test_high_collision(test, device):
         tid = wp.tid()
         # Only 10 unique keys, but 1000 threads
         key = wp.uint64(tid % 10)
-        slot = tid % wp.static(VALUES_STRIDE)
+        slot = tid % wp.static(VALUES_PER_KEY)
         value = wp.uint64(tid)
         reduction_insert_slot(key, slot, value, keys, values, active_slots)
 

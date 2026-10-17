@@ -87,10 +87,13 @@ def test_value_index_is_a_bijection(test, device):
 
 
 def test_slot_accessors_touch_only_their_cell(test, device):
-    """Write each accessor's value into the one cell its (entry, slot) names."""
+    """Write each accessor's value into the one cell its (entry, slot) names.
+
+    Accessors name winner slots only, so every row's padding word keeps its value.
+    """
     capacity = 4
     entries, slots = (
-        grid.ravel() for grid in np.meshgrid(np.arange(capacity), np.arange(VALUES_STRIDE), indexing="ij")
+        grid.ravel() for grid in np.meshgrid(np.arange(capacity), np.arange(VALUES_PER_KEY), indexing="ij")
     )
     cases = len(entries)
     cells = reduction_value_index_np(entries, slots)
