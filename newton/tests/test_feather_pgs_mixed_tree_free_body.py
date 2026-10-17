@@ -16,6 +16,11 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import assert_history_close
 
 DT = 1.0 / 240.0
+# PGS iterations of the patch-friction (friction_anchor_beta > 0) parity subtests; point subtests run 8.
+# At 8 iterations a resting box's patch anchors switch diagonals on steps that float32 rounding of its
+# world position decides, each switch kicking the box by about 5e-3 rad/s, so the ordinary route fails
+# these parity checks against its own replicated worlds (TestFeatherPGSMixedTreePatchFixture).
+PATCH_PARITY_ITERATIONS = 32
 
 
 def _add_quadruped(scene, cfg):
@@ -202,7 +207,16 @@ def _rollout(
     attrs=None,
     swing_stride=3,
     friction_anchor_beta=0.0,
+    pgs_iterations=None,
+    observe=None,
 ):
+    """Roll out a scene and return the solver, its owner, the body pose trajectory and the final twists.
+
+    ``pgs_iterations`` defaults to :data:`PATCH_PARITY_ITERATIONS` under patch friction and to 8
+    otherwise. ``observe`` is called after every step with the solver and its contacts.
+    """
+    if pgs_iterations is None:
+        pgs_iterations = PATCH_PARITY_ITERATIONS if friction_anchor_beta > 0.0 else 8
     env = {
         "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": str(int(owner)),
         "FEATHER_PGS_TREE_KINETIC_STATE": "0",
@@ -215,7 +229,7 @@ def _rollout(
         solver = SolverFeatherPGS(
             model,
             pgs_mode=pgs_mode,
-            pgs_iterations=8,
+            pgs_iterations=pgs_iterations,
             enable_joint_limits=True,
             update_mass_matrix_interval=2,
             friction_anchor_beta=friction_anchor_beta,
@@ -260,6 +274,8 @@ def _rollout(
         states[0].clear_forces()
         solver.step(states[0], states[1], control, contacts, DT)
         states.reverse()
+        if observe is not None:
+            observe(solver, contacts)
         trajectory.append(states[0].body_q.numpy().copy())
         joint_trajectory.append(states[0].joint_q.numpy().copy())
     wp.synchronize_device(model.device)
@@ -552,6 +568,71 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
                 self.assertGreater(float(np.abs(tray_qd).max()), 0.9 * TRAY_VELOCITY)
                 self.assertEqual(int(sum(int(group.status.numpy().sum()) for group in owner.groups)), 0)
                 self._assert_patch_history(plain_solver, owner_solver)
+
+
+def _box_anchor_corners(model, solver, contacts, box=4):
+    """Per world: the box-frame corner signs (x, y) of the box contacts that carry patch anchors."""
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    bodies_per_world = model.body_count // model.world_count
+    shape_body = model.shape_body.numpy()
+    carriers = np.flatnonzero(solver._friction_patches.view.weight.numpy()[:count] > 0.0)
+    corners = [set() for _ in range(model.world_count)]
+    for shapes, points in (
+        (contacts.rigid_contact_shape0.numpy(), contacts.rigid_contact_point0.numpy()),
+        (contacts.rigid_contact_shape1.numpy(), contacts.rigid_contact_point1.numpy()),
+    ):
+        for c in carriers:
+            body = int(shape_body[shapes[c]])
+            if body >= 0 and body % bodies_per_world == box:
+                corners[body // bodies_per_world].add((int(np.sign(points[c][0])), int(np.sign(points[c][1]))))
+    return corners
+
+
+class TestFeatherPGSMixedTreePatchFixture(unittest.TestCase):
+    """Check on CPU that the patch parity subtests compare rounding-stable outcomes."""
+
+    def test_patch_parity_fixture_is_roundoff_stable(self):
+        """Hold the replicated worlds and a rounding-perturbed rerun of the patch fixture on one anchor history.
+
+        The four worlds differ only in the float32 rounding of their positions, and a box mass of
+        x(1+1e-6) changes the rounding again, so a cross-route comparison of the box is well posed only
+        if all of them rest on the same anchors with the same velocity. Measured on CPU (ordinary split
+        route): at 8 iterations the final box velocity spreads by 7.4e-3 across the worlds; at 24 the
+        spread is 2.0e-5, but the anchor corners and validity bits still switch on rounding-chosen
+        steps; at :data:`PATCH_PARITY_ITERATIONS` nothing switches and the spread is 2.7e-6.
+        """
+        histories = []
+        for mass_scale in (1.0, 1.0 + 1.0e-6):
+            model = _build(wp.get_device("cpu"))
+            if mass_scale != 1.0:
+                boxes = np.arange(model.world_count) * (model.body_count // model.world_count) + 4
+                mass, inverse = model.body_mass.numpy(), model.body_inv_mass.numpy()
+                mass[boxes] *= np.float32(mass_scale)
+                inverse[boxes] = 1.0 / mass[boxes]
+                model.body_mass.assign(mass)
+                model.body_inv_mass.assign(inverse)
+            corners, valid = [], []
+
+            def observe(solver, contacts, model=model, corners=corners, valid=valid):
+                corners.append(_box_anchor_corners(model, solver, contacts))
+                valid.append(solver._friction_patches.previous.valid.numpy().copy())
+
+            solver, _owner, _trajectory, final_qd = _rollout(
+                model, owner=False, pgs_mode="split", friction_anchor_beta=0.2, observe=observe
+            )
+            self.assertEqual(solver.pgs_iterations, PATCH_PARITY_ITERATIONS)
+            histories.append(valid)
+            if mass_scale != 1.0:
+                continue
+            box = final_qd.reshape(model.world_count, -1, 6)[:, 4]
+            # A tenth of the parity subtests' 2e-3 twist tolerance.
+            self.assertLess(float(np.ptp(box, axis=0).max()), 2.0e-4)
+            for step, per_world in enumerate(corners):
+                self.assertEqual(per_world, [per_world[0]] * len(per_world), f"box anchor corners at step {step}")
+            self.assertEqual(len(corners[-1][0]), 2, "The resting box holds two anchors")
+        for step, (first, second) in enumerate(zip(*histories, strict=True)):
+            np.testing.assert_array_equal(first, second, err_msg=f"previous.valid at step {step}")
+        self.assertTrue(histories[0][-1].any(), "The resting boxes hold anchors")
 
 
 if __name__ == "__main__":
