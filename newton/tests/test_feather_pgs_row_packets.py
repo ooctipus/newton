@@ -596,6 +596,13 @@ class TestRowPacketPatchRowsCUDA(_PatchRowTwins, unittest.TestCase):
 # rows (the box rests on matrix-free rows): they carry friction from the first step, and on the mimic
 # arm their anchors carry phi after about 30 steps.
 _PRESS = {"swing": 0.0, "start": -0.16, "target": -0.3}
+# Press a row of sphere pads (``_build``'s ``pads``) into each box's side from contact while the box
+# settles onto the ground. Per world, one dense patch region slides at its pooled bound from the first
+# step: its end pads own two anchors that share the friction coefficient, its inner pads are
+# normal-only units. On the CPU split route, a start change of up to 1e-5 rad keeps the rings and the
+# poses of _PAD_STEPS steps inside the twin's checks.
+_PADS = {"swing": 0.0, "start": -0.16, "target": -0.26}
+_PAD_STEPS = 10
 
 
 def _arm(model, *, packets, swing_stride=3, friction_anchor_beta=0.0, swing=1.5, start=0.0, target=0.0):
@@ -647,6 +654,29 @@ def _step(arm, contacts=None):
     arm.solver.step(arm.states[0], arm.states[1], arm.control, contacts, DT)
     arm.states.reverse()
     return contacts
+
+
+def _rings(records):
+    """Return each patch ring of :func:`contact_rows` records, keyed by its lowest contact.
+
+    A ring holds its member contacts, its anchors (the members with tangent rows) and its impulses:
+    the pooled normal impulse and the anchors' summed tangent impulses, in the shared basis of the
+    members' common normal.
+    """
+    rings = {}
+    for first in records:
+        members, contact = [], first
+        while contact >= 0 and contact not in members:
+            members.append(contact)
+            contact = int(records[contact]["parents"][0])
+        key = min(members)
+        if key in rings:
+            continue
+        anchors = [c for c in sorted(members) if len(records[c]["types"]) == 3]
+        tangent = sum((records[c]["impulses"][1:].astype(np.float64) for c in anchors), np.zeros(2))
+        load = sum(float(records[c]["impulses"][0]) for c in members)
+        rings[key] = SimpleNamespace(members=sorted(members), anchors=anchors, impulses=np.array([load, *tangent]))
+    return rings
 
 
 def _rollout(model, *, packets, steps=120, **kwargs):
@@ -739,6 +769,57 @@ class TestRowPacketsCUDA(unittest.TestCase):
         assert_rows_close(*(contact_rows(arm.solver, contacts) for arm in (plain, packets)))
         self.assertTrue(plain.solver._friction_patches.previous.valid.numpy().any(), "Pressed boxes hold anchors")
         assert_history_close(plain.solver, packets.solver)
+
+    def test_patch_rings_match_the_ordinary_producers(self):
+        """Pool loaded patch rings of two anchors and normal-only units from the packet rows.
+
+        Each box slides down the pads that press its side, so the pads' ring carries friction at its
+        pooled bound from the first step. There the rows agree by contact, and each ring's pooled
+        normal and summed tangent impulses agree. The pads' own normal impulses split the load in the
+        sweep's row order, which slot allocation leaves free, so they are compared through their ring.
+        Both routes step on the same contacts and keep the same rings, the tangent law and close poses.
+        """
+        model = _build(wp.get_device("cuda:0"), worlds=6, pads=_PADS["start"])
+        plain, packets = (_arm(model, packets=enabled, friction_anchor_beta=0.2, **_PADS) for enabled in (False, True))
+        self.assertIsNone(plain.solver._row_packets)
+        self.assertIsInstance(packets.solver._row_packets, rp.LocalRowPackets)
+        self.assertTrue(packets.solver._row_packets.patch_friction)
+        self._step_pad_rings(plain, packets)
+
+    def _step_pad_rings(self, plain, packets):
+        """Step both routes on the plain route's contacts and compare their patch rings."""
+        scale, poses = plain.solver.contact_friction_scale, []
+        for step in range(_PAD_STEPS):
+            contacts = _step(plain)
+            _step(packets, contacts)
+            records = [contact_rows(arm.solver, contacts) for arm in (plain, packets)]
+            self.assertEqual(sorted(records[1]), sorted(records[0]))
+            for c, record in records[0].items():
+                for name in ("types", "parents"):
+                    np.testing.assert_array_equal(records[1][c][name], record[name], f"step {step} contact {c} {name}")
+            if step == 0:
+                rings = [_rings(record) for record in records]
+                loaded = [ring for ring in rings[0].values() if len(ring.anchors) == 2 and len(ring.members) > 2]
+                loaded = [ring for ring in loaded if ring.impulses[0] > 0.0]
+                self.assertTrue(loaded, "The pads must load a ring of two anchors and normal-only units")
+                bound = 0.0
+                for ring in loaded:
+                    for c in ring.anchors:
+                        mu, impulses = records[0][c]["mu"], records[0][c]["impulses"]
+                        # The link divides the coefficient between the ring's two anchors.
+                        np.testing.assert_allclose(mu[1:], mu[0] * scale / 2.0, rtol=1.0e-6)
+                        bound = max(bound, float(np.linalg.norm(impulses[1:])) / (float(mu[1]) * ring.impulses[0]))
+                self.assertGreater(bound, 0.98, "The pads' friction must reach the ring's pooled bound")
+                assert_rows_close(*records, atol=1.0e-6, rtol=1.0e-5)
+                for key, ring in rings[0].items():
+                    np.testing.assert_allclose(
+                        rings[1][key].impulses, ring.impulses, atol=2.0e-5, rtol=7.0e-4, err_msg=f"ring {key}"
+                    )
+            assert_patch_tangent_law(packets.solver, contacts)
+            poses.append([arm.states[0].body_q.numpy() for arm in (plain, packets)])
+        poses = np.array(poses)
+        self.assertTrue(np.isfinite(poses).all())
+        np.testing.assert_allclose(poses[:, 1], poses[:, 0], atol=1.0e-4, rtol=0.0)
 
     def test_patch_friction_keeps_every_packet_layout(self):
         """Admit every packet layout under patch friction and track the ordinary producers' rollout."""

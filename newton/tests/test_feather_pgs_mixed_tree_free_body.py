@@ -85,6 +85,25 @@ def _add_cabinet(scene, cfg):
     scene.add_articulation(joints)
 
 
+def _add_pads(scene, body, cfg, angle, links):
+    """Four overlapping sphere pads in a row along y that touch the box's -x face at ``angle``.
+
+    The pads sit on the arm's last link, whose origin hangs 0.2 m per later joint below the first
+    joint. They reach the face at the box's starting mid height when the first joint is at ``angle``
+    rad and the other joints are at zero.
+    """
+    radius = 0.012
+    pivot = 0.6 + max(0, links - 3) * 0.2
+    drop = 0.2 * (links - 1)
+    # Pad centers relative to the first joint, in the world, and then in the last link's frame.
+    x, z = 0.1 - radius, 0.06 - pivot
+    cos, sin = np.cos(angle), np.sin(angle)
+    center_x, center_z = cos * x - sin * z, sin * x + cos * z + drop
+    for y in (0.02, 0.04, 0.06, 0.08):
+        center = wp.transform(wp.vec3(center_x, y, center_z), wp.quat_identity())
+        scene.add_shape_sphere(body, xform=center, radius=radius, cfg=cfg)
+
+
 def _build(
     device,
     worlds=4,
@@ -95,6 +114,7 @@ def _build(
     cabinet=False,
     speed_limit=None,
     links=3,
+    pads=None,
 ):
     """Per world: a fixed-base three-joint arm over a free box resting on the ground.
 
@@ -107,7 +127,10 @@ def _build(
     diagonal-mass response class) replaces the box. ``speed_limit`` bounds
     every arm joint's velocity (the hand recipes' joint velocity limits).
     ``links`` is the arm's joint count (17 or more with the free box selects
-    the solver's paired response, the Kuka scenes' class).
+    the solver's paired response, the Kuka scenes' class). ``pads`` replaces
+    the arm's capsule with a row of sphere pads that touch the box's side when
+    the first joint is at ``pads`` rad: one contact region, whose end pads own
+    its two friction anchors and whose inner pads are normal-only units.
     """
     scene = newton.ModelBuilder()
     cfg = scene.default_shape_cfg.copy()
@@ -162,7 +185,10 @@ def _build(
                 )
             )
         parent = body
-    scene.add_shape_capsule(parent, radius=0.03, half_height=0.1, cfg=cfg)
+    if pads is None:
+        scene.add_shape_capsule(parent, radius=0.03, half_height=0.1, cfg=cfg)
+    else:
+        _add_pads(scene, parent, cfg, pads, links)
     scene.add_articulation(joints)
     if mimic:
         scene.add_constraint_mimic(joint0=joints[3], joint1=joints[2], coef0=0.0, coef1=1.0)
