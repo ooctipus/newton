@@ -11,8 +11,8 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_JOINT_LIMIT
 from newton.tests.feather_pgs_patch_parity import assert_history_close, make_loaded
+from tools.fpgs_bench.public_state_oracle import physical_mass, public_state
 from tools.fpgs_bench.test_mixed_tree_cache import DT, make_solver, model_fixture
-from tools.fpgs_bench.test_packed_tree_state import physical_mass, public_state
 
 
 def step(case):

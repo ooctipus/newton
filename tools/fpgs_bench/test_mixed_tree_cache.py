@@ -13,7 +13,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
 from newton.solvers import SolverFeatherPGS
-from tools.fpgs_bench.test_packed_tree_state import physical_mass, public_state
+from tools.fpgs_bench.public_state_oracle import physical_mass, public_state
 
 DT = 1.0 / 240.0
 
@@ -88,7 +88,6 @@ def make_solver(model, *, enabled=False, permuted=False, friction_anchor_beta=0.
             os.environ,
             {
                 "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": str(int(enabled)),
-                "FEATHER_PGS_SPARSE_FACTOR": "0",
                 "FEATHER_PGS_TREE_KINETIC_STATE": "0",
                 "FEATHER_PGS_WORLD_SCAN_PUBLICATION": "0",
             },

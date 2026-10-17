@@ -1,18 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Topology and dispatch controls for the complete packed-chain tree schedule."""
+"""Topology and subtree-reduction controls for the packed-chain tree schedule."""
 
-import os
 import unittest
-from unittest.mock import patch
 
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import packed_tree_owner, tree_chain_scan, tree_kinetic_state
-from tools.fpgs_bench.test_packed_tree_state import DT, public_state, rotated_input, set_anchor
-from tools.fpgs_bench.test_sparse_factor import fixture
+from newton._src.solvers.feather_pgs import tree_chain_scan, tree_kinetic_state
 
 
 @wp.func_native("float* s=reinterpret_cast<float*>(address);" + tree_chain_scan.reduction_source(moments=False))
@@ -52,57 +48,73 @@ def _store_wrench(address: wp.uint64, body: int, value: wp.spatial_vector): ...
 def _load_wrench(address: wp.uint64, body: int) -> wp.spatial_vector: ...
 
 
+# One body per joint, parents first: a 44-body humanoid tree with a long and a branched limb.
+_TREE_44 = np.asarray(
+    [
+        -1,
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        0,
+        0,
+        8,
+        9,
+        10,
+        11,
+        12,
+        0,
+        14,
+        14,
+        14,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        22,
+        25,
+        22,
+        27,
+        28,
+        14,
+        14,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        36,
+        39,
+        36,
+        41,
+        42,
+    ],
+    dtype=np.int32,
+)
+
+
+def _chain_plan(parent, device):
+    """Bind a chain plan from its host schedule as the held-tree owner does."""
+    host = tree_chain_scan.make_plan(parent)
+    plan = tree_chain_scan.ChainPlan()
+    plan.chain_meta = wp.array(host["meta"].reshape(-1), dtype=int, device=device)
+    for name in ("light_offsets", "light_children", "stage_width"):
+        setattr(plan, name, wp.array(host[name], dtype=int, device=device))
+    plan.chain_levels = host["levels"]
+    plan.chain_width = int(host["widths"].max())
+    return plan
+
+
 class TestChainPlan(unittest.TestCase):
     def test_current_tree_packs_without_cross_warp_segments(self):
-        parent = np.asarray(
-            [
-                -1,
-                0,
-                1,
-                2,
-                3,
-                4,
-                5,
-                0,
-                0,
-                8,
-                9,
-                10,
-                11,
-                12,
-                0,
-                14,
-                14,
-                14,
-                17,
-                18,
-                19,
-                20,
-                21,
-                22,
-                23,
-                22,
-                25,
-                22,
-                27,
-                28,
-                14,
-                14,
-                31,
-                32,
-                33,
-                34,
-                35,
-                36,
-                37,
-                36,
-                39,
-                36,
-                41,
-                42,
-            ],
-            dtype=np.int32,
-        )
+        parent = _TREE_44
         plan = tree_chain_scan.make_plan(parent)
         self.assertEqual(plan["levels"], 3)
         meta = plan["meta"]
@@ -126,54 +138,9 @@ class TestChainPlan(unittest.TestCase):
         with self.assertRaises(ValueError):
             tree_chain_scan.make_plan(np.asarray([-1, 2, 1], np.int32))
 
-    def test_default_off_and_complete_cpu_owner(self):
-        """Exercise both current/held force actions and complete next publication."""
-        results = []
-        for enabled in (False, True):
-            with patch.dict(os.environ, {"FEATHER_PGS_TREE_CHAIN_SCAN": str(int(enabled))}):
-                case = fixture("cpu")
-                owner = packed_tree_owner.PackedTreeState(case["owner"])
-            self.assertEqual(owner.chain_scan, enabled)
-            self.assertEqual(owner.finish_kernel.key.endswith("_chain"), enabled)
-            self.assertEqual(owner.predictor_kernel.key.endswith("_chain"), enabled)
-            self.assertIs(owner.plan._cls, tree_chain_scan.ChainPlan if enabled else tree_kinetic_state.KineticPlan)
-            model, solver, sparse = case["model"], case["solver"], case["owner"]
-            set_anchor(model)
-            W = np.linalg.solve(np.linalg.cholesky(case["H"][::-1, ::-1]), np.eye(43))
-            packed = W[sparse.host["row"], sparse.host["col"]][None].astype(np.float32)
-            sparse.data.W.assign(packed)
-            sparse.data.valid.fill_(1)
-            control = model.control()
-            control.joint_f.assign(np.linspace(-0.2, 0.4, 43, dtype=np.float32))
-            epochs = []
-            for epoch in range(2):
-                state, output = model.state(), model.state()
-                rotated_input(model, state, epoch=epoch)
-                if epoch:
-                    state.body_f.zero_()  # Preserve the original zero-external-force shortcut too.
-                augmented = solver._prepare_augmented_state(state, output, control)
-                augmented.joint_tau.assign(np.linspace(0.02, -0.01, 43, dtype=np.float32))
-                owner.invalidate()
-                owner.begin(state, augmented, state.joint_qd, DT, epoch == 0)
-                owner.predict(state, augmented, control, state.joint_qd, DT)
-                vhat, bias = solver.v_hat.numpy().copy(), owner.bias.numpy().copy()
-                solver.v_out.assign(state.joint_qd.numpy() + np.linspace(0.1, -0.1, 43, dtype=np.float32))
-                owner.finish(state, augmented, output, DT, epoch == 0)
-                public_state(self, model, output)
-                np.testing.assert_array_equal(owner.status.numpy(), [0])
-                np.testing.assert_array_equal(sparse.data.W.numpy(), packed)
-                epochs.append((vhat, bias, output.joint_q.numpy(), output.joint_qd.numpy(), owner.bias.numpy()))
-            results.append(epochs)
-        for old, new in zip(results[0], results[1], strict=True):
-            for expected, actual in zip(old, new, strict=True):
-                np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=3e-5)
-
     def test_additive_subtrees_do_not_subtract_unrelated_large_branch(self):
         """An unrelated large wrench cannot erase a small descendant subtree."""
-        with patch.dict(os.environ, {"FEATHER_PGS_TREE_CHAIN_SCAN": "1"}):
-            case = fixture("cpu")
-            owner = packed_tree_owner.PackedTreeState(case["owner"])
-        parent = case["model"].joint_parent.numpy()[:44]
+        parent = _TREE_44
         values = np.zeros((44, 6), np.float32)
         values[6, 0], values[40, 0] = 1e20, 1.25
         values[38, 1], values[43, 1] = 0.5, -0.25
@@ -184,7 +151,7 @@ class TestChainPlan(unittest.TestCase):
         wp.launch_tiled(
             _subtrees,
             dim=[1],
-            inputs=[owner.plan, wp.array(values, dtype=float, device="cpu"), result],
+            inputs=[_chain_plan(parent, "cpu"), wp.array(values, dtype=float, device="cpu"), result],
             block_dim=64,
             device="cpu",
         )

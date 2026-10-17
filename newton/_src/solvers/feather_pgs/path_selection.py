@@ -172,7 +172,6 @@ def route_selection(solver) -> dict:
         "paired_response": _paired_response(solver),
         "sparse_diagonal": _sparse_diagonal(solver),
         "sparse_mass_matrix": _sparse_mass_matrix(solver),
-        "research_sparse_factor": _research_sparse_factor(solver),
         "sweep": _sweep(solver, source),
         "resolved_worlds": _resolved_worlds(solver),
         "publication": _publication(solver, source),
@@ -199,8 +198,6 @@ def _held_tree_groups(solver) -> tuple:
     owner = solver._tree_kinetic_state
     if owner is None:
         return None, []
-    if solver._packed_tree_state is owner:
-        return "packed", [owner]
     if hasattr(owner, "groups"):
         groups = list(owner.groups)
         return ("forest" if any(group.layout.forest for group in groups) else "mixed"), groups
@@ -252,9 +249,7 @@ def _tree_group(group) -> dict:
 
 def _contact_rows(solver, source) -> dict:
     point = bool(solver._point_contact_paths)
-    if solver._sparse_factor is not None:
-        producer = "research_sparse_factor"
-    elif solver._row_packets is not None:
+    if solver._row_packets is not None:
         producer = "local_packets"
     elif solver._keyed_rows is not None:
         producer = "keyed_rows"
@@ -414,33 +409,12 @@ def _sparse_mass_matrix(solver) -> dict:
     return record
 
 
-def _research_sparse_factor(solver) -> dict:
-    owner = solver._sparse_factor
-    record = {"enabled": owner is not None, "reason": solver._sparse_factor_reason}
-    if owner is not None:
-        record.update(
-            {
-                "block_contacts": bool(owner.block_contacts),
-                "metric_tangents": bool(owner.metric_tangents),
-                "spectral_tangents": bool(owner.spectral_tangents),
-                "limit_jacobi": bool(owner.limit_jacobi),
-                "level_update": bool(owner.level_update),
-                "parallel_limit_prefix": bool(owner.parallel_limit_prefix),
-                "packed_tree_state": owner.kinetic_state is not None,
-                "solve_kernel": _key(owner.kernels.solve),
-            }
-        )
-    return record
-
-
 def _sweep(solver, source) -> dict:
     # Split mode sweeps assembled Delassus rows unless native sparse factors own its rows.
     dense_split = solver.pgs_mode != "matrix_free" and not solver._sparse_split
     if dense_split:
         route = f"dense_{solver.pgs_kernel}"
         reason = f"Split mode sweeps the assembled Delassus rows with the {solver.pgs_kernel} kernel."
-    elif solver._sparse_factor is not None:
-        route, reason = "research_sparse_factor", "The packed research factor owns the sweep."
     elif solver._sparse_mass_matrix_size is not None:
         route, reason = "sparse_pgs", "Native sparse factors own the sweep."
     elif solver._sparse_diagonal_contact_solve:
@@ -553,7 +527,6 @@ def _sweep(solver, source) -> dict:
         "velocity_iterations": int(solver.pgs_velocity_iterations),
         "mf_meta_pack": mf_meta_pack,
         "sparse": _key(solver._pgs_solve_sparse_kernel) if route == "sparse_pgs" else None,
-        "research_sparse_factor": None if solver._sparse_factor is None else _key(solver._sparse_factor.kernels.solve),
         "sparse_diagonal": _key(solver._pgs_solve_sparse_diagonal_kernel),
         "paired_factor": _key(solver._paired_factor_solve_kernel),
         "mf_gs": _key(solver._pgs_solve_mf_gs_kernel),
@@ -662,7 +635,7 @@ def _velocity_limits(solver) -> dict:
         "rigid_body_limits": limits,
         # Mirrors _allocate_mf_buffers and the row allocation of _stage4_build_rows (both modes),
         # and _clamp_rigid_velocity_limits for free articulation roots.
-        "free_body_rows": bool(limits and solver._free_rigid_body_count > 0 and solver._sparse_factor is None),
+        "free_body_rows": bool(limits and solver._free_rigid_body_count > 0),
         "root_clamp": bool(
             limits
             and solver._has_root_free
@@ -707,8 +680,8 @@ def _friction(solver) -> dict:
     if patch:
         reason += (
             " Point-contact owners (local packets, keyed rows, compact contacts, parallel matrix-free tiers and"
-            " response blocks, the resolved-world classifier, the research sparse factor, multiblock sweeps, sparse"
-            " active rows and triplets) need point friction."
+            " response blocks, the resolved-world classifier, multiblock sweeps, sparse active rows and triplets)"
+            " need point friction."
         )
     return {
         "law": "patch" if patch else "point",
@@ -727,7 +700,7 @@ def grouped_response(solver, size) -> bool:
     Mirrors the stage-4 dispatch of ``step()`` and the early return of ``_stage4_hinv_jt_tiled``:
     sparse, diagonal, compact, paired and fused responses own their sizes.
     """
-    if solver._sparse_factor is not None or not solver._use_grouped_hinv_jt(size):
+    if not solver._use_grouped_hinv_jt(size):
         return False
     if solver._execution_plan.use_diagonal_mass(size):
         return False

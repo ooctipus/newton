@@ -90,13 +90,7 @@ def supported(solver):
         and solver._parallel_augmented_drive_topology
         and solver._articulation_dynamics_stream is not None
         and not solver._debug_buffers_enabled
-        and all(
-            getattr(solver, name, None) is None
-            for name in (
-                "_sparse_factor",
-                "_prismatic_publication",
-            )
-        )
+        and getattr(solver, "_prismatic_publication", None) is None
         # Every family refreshes through the geometric small Cholesky (one lane
         # per factor row, up to 32 coordinates) into the solver's dense factor
         # of the same shape; a diagonal-mass size keeps its compact inverse.

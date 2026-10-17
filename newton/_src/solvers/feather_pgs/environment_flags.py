@@ -5,8 +5,9 @@
 
 Each entry names the modules that read it; ``newton/tests/test_environment_flags.py``
 keeps the declarations equal to the read sites. Retired selectors are rejected
-here for the solver and the research sparse owner. The solver records its
-environment once at construction and records undeclared names instead of
+here for the solver, except those of :data:`IGNORED_RETIRED`, which recipes still
+set: they select nothing and the record lists them as retired. The solver records
+its environment once at construction and records undeclared names instead of
 rejecting them.
 """
 
@@ -21,7 +22,6 @@ PREFIXES = ("FEATHER_PGS_", "IL_NEWTON_FPGS_")
 
 _PACKAGE = "solvers.feather_pgs."
 _SOLVER = ("solver_feather_pgs",)
-_SPARSE_FACTOR = ("sparse_factor",)
 _CACHE = ("cached_dynamics",)
 
 
@@ -194,6 +194,12 @@ FLAGS = declare(
         "=1 publishes each general-route articulation in one launch per size group.",
     ),
     _flag(
+        "FEATHER_PGS_G1_CHAIN_SCAN",
+        "retired",
+        ("environment_flags",),
+        "Retired G1 alias of the held-tree chain scan; ignored (FEATHER_PGS_TREE_CHAIN_SCAN=0 opts out of it).",
+    ),
+    _flag(
         "FEATHER_PGS_GROUPED_FK",
         "policy",
         _SOLVER,
@@ -327,9 +333,9 @@ FLAGS = declare(
     ),
     _flag(
         "FEATHER_PGS_PACKED_TREE_KINETIC_STATE",
-        "policy",
-        _CACHE,
-        "Values other than 1 disable the packed tree cache on sparse factors under cached_dynamics='auto'.",
+        "retired",
+        ("environment_flags",),
+        "Retired tree cache of the packed sparse-factor route; ignored.",
     ),
     _flag(
         "FEATHER_PGS_PAIRED_COMPONENTS",
@@ -417,9 +423,9 @@ FLAGS = declare(
     ),
     _flag(
         "FEATHER_PGS_SPARSE_CONTACT_BLOCK",
-        "experiment",
-        _SPARSE_FACTOR,
-        "=1 uses contact-block rows in the packed sparse factor.",
+        "retired",
+        ("environment_flags",),
+        "Retired contact-block rows of the packed sparse-factor route; ignored.",
     ),
     _flag(
         "FEATHER_PGS_SPARSE_CONTACT_DIRECT",
@@ -435,9 +441,9 @@ FLAGS = declare(
     ),
     _flag(
         "FEATHER_PGS_SPARSE_FACTOR",
-        "experiment",
-        _SOLVER,
-        "=1 selects the packed sparse factor owner for point contacts.",
+        "retired",
+        ("environment_flags",),
+        "Retired packed sparse-factor route; ignored, the general route (sparse factors where admitted) runs.",
     ),
     _flag(
         "FEATHER_PGS_SPARSE_GROUPED_DYNAMICS",
@@ -447,15 +453,15 @@ FLAGS = declare(
     ),
     _flag(
         "FEATHER_PGS_SPARSE_LEVEL_UPDATE",
-        "experiment",
-        _SPARSE_FACTOR,
-        "=1 updates the packed sparse factor level by level.",
+        "retired",
+        ("environment_flags",),
+        "Retired level-by-level factor update of the packed sparse-factor route; ignored.",
     ),
     _flag(
         "FEATHER_PGS_SPARSE_LIMIT_JACOBI",
-        "experiment",
-        _SPARSE_FACTOR,
-        "=1 solves joint limits by Jacobi in the spectral packed sparse owner.",
+        "retired",
+        ("environment_flags",),
+        "Retired Jacobi joint-limit solve of the packed sparse-factor route; ignored.",
     ),
     _flag(
         "FEATHER_PGS_SPARSE_LOCAL_FACTORS",
@@ -465,15 +471,15 @@ FLAGS = declare(
     ),
     _flag(
         "FEATHER_PGS_SPARSE_METRIC_TANGENTS",
-        "experiment",
-        _SPARSE_FACTOR,
-        "=1 uses metric tangents in the packed sparse owner at 100-row capacity.",
+        "retired",
+        ("environment_flags",),
+        "Retired metric tangents of the packed sparse-factor route; ignored.",
     ),
     _flag(
         "FEATHER_PGS_SPARSE_PARALLEL_LIMITS",
-        "experiment",
-        _SPARSE_FACTOR,
-        "=1 emits the packed joint-limit prefix in parallel.",
+        "retired",
+        ("environment_flags",),
+        "Retired parallel joint-limit prefix of the packed sparse-factor route; ignored.",
     ),
     _flag(
         "FEATHER_PGS_SPARSE_SMALL_WORLDS",
@@ -483,9 +489,9 @@ FLAGS = declare(
     ),
     _flag(
         "FEATHER_PGS_SPARSE_SPECTRAL_TANGENTS",
-        "experiment",
-        _SPARSE_FACTOR,
-        "=1 uses spectral tangents; requires metric tangents.",
+        "retired",
+        ("environment_flags",),
+        "Retired spectral tangents of the packed sparse-factor route; ignored.",
     ),
     _flag(
         "FEATHER_PGS_SPARSE_SPLIT",
@@ -598,11 +604,30 @@ FLAGS = declare(
 )
 
 
+# The retired packed sparse-factor route's selectors and the G1 chain-scan
+# alias. Isaac Lab's G1 recipes still set them, so they are ignored rather than
+# rejected: the general route runs and the construction record lists them as
+# retired.
+IGNORED_RETIRED = frozenset(
+    (
+        "FEATHER_PGS_G1_CHAIN_SCAN",
+        "FEATHER_PGS_PACKED_TREE_KINETIC_STATE",
+        "FEATHER_PGS_SPARSE_CONTACT_BLOCK",
+        "FEATHER_PGS_SPARSE_FACTOR",
+        "FEATHER_PGS_SPARSE_LEVEL_UPDATE",
+        "FEATHER_PGS_SPARSE_LIMIT_JACOBI",
+        "FEATHER_PGS_SPARSE_METRIC_TANGENTS",
+        "FEATHER_PGS_SPARSE_PARALLEL_LIMITS",
+        "FEATHER_PGS_SPARSE_SPECTRAL_TANGENTS",
+    )
+)
+
+
 def reject_retired(environ: Mapping[str, str] | None = None) -> None:
     """Reject obsolete recipes before they silently select a different owner."""
     environ = os.environ if environ is None else environ
     for name, flag in FLAGS.items():
-        if flag.kind == "retired" and environ.get(name) == "1":
+        if flag.kind == "retired" and name not in IGNORED_RETIRED and environ.get(name) == "1":
             raise ValueError(f"{name} selects a retired experiment; reproduce it from the original research checkout")
 
 

@@ -9,7 +9,6 @@ import os
 def install(solver) -> None:
     """Install an admitted cache without changing its factor or row policy."""
     solver._tree_kinetic_state = None
-    solver._packed_tree_state = None
     choice = solver.cached_dynamics
     if choice == "off":
         solver._cached_dynamics_selection_reason = "Explicit cached_dynamics='off' retains ordinary dynamics."
@@ -29,12 +28,7 @@ def install(solver) -> None:
             disabled.append(f"FEATHER_PGS_{option}")
         return admitted
 
-    if solver._sparse_factor is not None and enabled("PACKED_TREE_KINETIC_STATE"):
-        solver._sparse_factor.install_kinetic_state()
-        solver._tree_kinetic_state = solver._sparse_factor.kinetic_state
-        solver._packed_tree_state = solver._tree_kinetic_state
-
-    if solver._tree_kinetic_state is None and enabled("TREE_KINETIC_STATE"):
+    if enabled("TREE_KINETIC_STATE"):
         from .tree_kinetic_sparse import create_owner  # noqa: PLC0415
 
         solver._tree_kinetic_state = create_owner(solver)

@@ -317,7 +317,7 @@ class TestResolvedWorldsCUDA(unittest.TestCase):
 
 
 def _walkers(device, worlds=4):
-    """One free-root quadruped per world on the ground: the packed sparse-factor route's class."""
+    """One free-root quadruped per world on the ground: a class the general sparse route owns."""
     scene = newton.ModelBuilder()
     cfg = scene.default_shape_cfg.copy()
     cfg.mu = 0.6
@@ -333,8 +333,9 @@ def _walkers(device, worlds=4):
 @unittest.skipUnless(wp.is_cuda_available(), "The sparse route is a CUDA path")
 class TestResolvedWorldsSparseRoute(unittest.TestCase):
     def test_sparse_route_allocates_contacts_with_an_empty_mask(self):
-        """The packed owner declines the classifier but its allocator still takes the mask argument."""
+        """Retired packed-route flags leave the general sparse route, which declines the classifier."""
         model = _walkers(wp.get_device("cuda:0"))
+        # A recipe that still sets the retired packed sparse-factor selectors.
         env = {
             "FEATHER_PGS_SPARSE_FACTOR": "1",
             "FEATHER_PGS_SPARSE_LEVEL_UPDATE": "1",
@@ -351,7 +352,10 @@ class TestResolvedWorldsSparseRoute(unittest.TestCase):
                 friction_anchor_beta=0.0,
                 mf_gs_incremental_rows=0,
             )
-        self.assertIsNotNone(solver._sparse_factor)
+        self.assertIsNotNone(solver._sparse_mass_matrix_size)
+        routes = solver.get_path_selection()["routes"]
+        self.assertNotIn("research_sparse_factor", routes)
+        self.assertEqual(routes["sweep"]["route"], "sparse_pgs")
         self.assertIsNone(solver._resolved_worlds_owner)
         self.assertEqual(solver._resolved_worlds.shape, (0,))
         pipeline = newton.CollisionPipeline(model)

@@ -19,7 +19,7 @@ from newton._src.solvers.feather_pgs.tree_kinetic_owner import TreeKineticState
 from newton._src.solvers.feather_pgs.tree_kinetic_plan import cooperative_block_dim
 from newton._src.solvers.feather_pgs.tree_kinetic_sparse import TreeSparseOperator
 from newton.tests import test_feather_pgs_sparse_split as split
-from tools.fpgs_bench.test_packed_tree_state import physical_mass, public_state
+from tools.fpgs_bench.public_state_oracle import physical_mass, public_state
 
 
 class TestTreeLayout(unittest.TestCase):

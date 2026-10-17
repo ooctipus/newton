@@ -544,7 +544,6 @@ def supported(solver) -> bool:
         "_preelim_count": 0,
         "articulated_contact_response": "immediate",
         "_sparse_mass_matrix_size": None,
-        "_sparse_factor": None,
         "_keyed_rows": None,
         "drive_slot": None,
     }

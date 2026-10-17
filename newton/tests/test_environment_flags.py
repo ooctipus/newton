@@ -36,6 +36,18 @@ _RETIRED_ORDER = [
     "FEATHER_PGS_COUPLED_CONTACT",
     "FEATHER_PGS_COUPLED_JACOBI",
 ]
+# The retired packed sparse-factor route's selectors: ignored and recorded, never rejected.
+_RETIRED_IGNORED = [
+    "FEATHER_PGS_G1_CHAIN_SCAN",
+    "FEATHER_PGS_PACKED_TREE_KINETIC_STATE",
+    "FEATHER_PGS_SPARSE_CONTACT_BLOCK",
+    "FEATHER_PGS_SPARSE_FACTOR",
+    "FEATHER_PGS_SPARSE_LEVEL_UPDATE",
+    "FEATHER_PGS_SPARSE_LIMIT_JACOBI",
+    "FEATHER_PGS_SPARSE_METRIC_TANGENTS",
+    "FEATHER_PGS_SPARSE_PARALLEL_LIMITS",
+    "FEATHER_PGS_SPARSE_SPECTRAL_TANGENTS",
+]
 
 
 def _parents(tree):
@@ -256,7 +268,9 @@ class TestEnvironmentFlagRegistry(unittest.TestCase):
                         else:
                             self.assertTrue((_SRC / Path(*reader.split("."))).with_suffix(".py").is_file(), reader)
         retired = [name for name, flag in fpgs_flags.FLAGS.items() if flag.kind == "retired"]
-        self.assertEqual(retired, _RETIRED_ORDER)
+        self.assertEqual([name for name in retired if name not in fpgs_flags.IGNORED_RETIRED], _RETIRED_ORDER)
+        self.assertEqual(sorted(fpgs_flags.IGNORED_RETIRED), _RETIRED_IGNORED)
+        self.assertTrue(fpgs_flags.IGNORED_RETIRED <= set(retired))
 
     def test_scan_separates_reads_from_citations(self):
         """List literal and constructed names, split environment reads from citations, refuse the rest."""
@@ -367,6 +381,17 @@ class TestEnvironmentRecord(unittest.TestCase):
                 record = fpgs_flags.record({"FEATHER_PGS_COUPLED_CONTACT": value, "FEATHER_PGS_NOT_DECLARED": "1"})
                 self.assertEqual(record["retired"], ["FEATHER_PGS_COUPLED_CONTACT"])
                 self.assertEqual(record["unknown"], ["FEATHER_PGS_NOT_DECLARED"])
+
+    def test_ignored_retired_selectors_record_without_raising(self):
+        """Record the retired packed-route selectors that recipes still set to 1 instead of raising."""
+        environ = dict.fromkeys(_RETIRED_IGNORED, "1")
+        fpgs_flags.reject_retired(environ)
+        self.assertEqual(
+            fpgs_flags.record(environ), {"applied": {}, "unknown": [], "retired": _RETIRED_IGNORED, "isaac_lab": {}}
+        )
+        # An ignored selector does not mask a rejected one set beside it.
+        with self.assertRaisesRegex(ValueError, "^FEATHER_PGS_COUPLED_JACOBI selects a retired experiment"):
+            fpgs_flags.record({**environ, "FEATHER_PGS_COUPLED_JACOBI": "1"})
 
 
 class TestSelectionEnvironment(unittest.TestCase):

@@ -5,16 +5,10 @@
 
 import hashlib
 import importlib.util
-import json
-import os
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 import numpy as np
-import warp as wp
-
-from tools.fpgs_bench.test_sparse_factor import fixture, original_eight, physical_rows, unpack
 
 CAPTURES = Path("/tmp/fpgs-g1-sparse-operator-paired16k-20260913-02")
 REPLAY = Path("/tmp/fpgs-g1-tree-factor-OzkV0Het/replay_operator_assessment.py")
@@ -25,7 +19,6 @@ PAYLOAD_SHA = {
     (1, 1600): "323fc0f71d749706b63de8758a09bf5e0250112435129235432f0df011dcd740",
     (1, 1601): "be3cbe45678f5a6850d65ba9fe5776b7102a8708b57f7d00bd2ad625200836fd",
 }
-BLOCK_ENV = {"FEATHER_PGS_SPARSE_CONTACT_BLOCK": "1", "FEATHER_PGS_SPARSE_PACKETS": "0"}
 
 
 def saved_records():
@@ -176,6 +169,35 @@ def simple_case(kind="stick"):
     return z, diagonal, rhs, np.array([0, 2, 2]), np.array([-1, 0, 0]), mu
 
 
+def original_eight(J, Y, diag, rhs, types, parent, mu, vhat):
+    """Independent physical-velocity recurrence, original current friction law."""
+    v = np.array(vhat, float)
+    lam = np.zeros(len(J), float)
+    for _ in range(8):
+        for row in range(len(J)):
+            old = lam[row]
+            new = old - (J[row] @ v + rhs[row]) / diag[row]
+            if types[row] in (0, 3):
+                new = max(new, 0.0)
+            elif types[row] == 2:
+                p = parent[row]
+                radius = max(mu[row] * lam[p], 0.0)
+                if radius <= 0:
+                    new = 0.0
+                else:
+                    sib = p + 2 if row == p + 1 else p + 1
+                    mag = np.hypot(new, lam[sib])
+                    if mag > radius:
+                        scale = radius / mag
+                        new *= scale
+                        other = lam[sib] * scale
+                        v += Y[sib] * (other - lam[sib])
+                        lam[sib] = other
+            lam[row] = new
+            v += Y[row] * (new - old)
+    return v, lam
+
+
 class TestSparseContactBlockCPU(unittest.TestCase):
     def test_local_stick_fallback_and_denominator_only_cfm(self):
         """Check local cone cases and regularization against the independent block law."""
@@ -239,217 +261,6 @@ class TestSparseContactBlockCPU(unittest.TestCase):
         self.assertEqual(len(scores), 16)
         self.assertEqual(totals, {"stick": 44, "open": 673, "slip": 75, "unsafe": 0})
         self.assertLessEqual(max(v[1] for v in scores), max(v[0] for v in scores))
-
-
-def full_rows(owner, count):
-    packed = owner.data.Z.numpy()[0, :count]
-    templates = owner.data.support.numpy()[0, :count]
-    full = np.zeros((count, 43))
-    for row, template in enumerate(templates):
-        length = owner.host["support_count"][template]
-        full[row, owner.host["support_nodes"][template, :length]] = packed[row, :length]
-    return full, templates
-
-
-def check_native(test, f, *, iterations=8, omega=1.0, friction_start=0):
-    s, owner = f["solver"], f["owner"]
-    test.assertTrue(owner.block_contacts)
-    test.assertEqual(owner.kernels.solve.key, "sparse_contact_block43_s18_c100")
-    count = int(s.constraint_count.numpy()[0])
-    z, templates = full_rows(owner, count)
-    diagonal, rhs, types, parents, mu, incoming = (
-        getattr(s, name).numpy()[0, :count] for name in ("diag", "rhs", "row_type", "row_parent", "row_mu", "impulses")
-    )
-    seed = rhs.astype(float) + owner.data.incident.numpy()[0, :count]
-    du, expected_lam, _ = reference(
-        z,
-        z,
-        diagonal,
-        seed,
-        types,
-        parents,
-        mu,
-        np.zeros(43),
-        iterations=iterations,
-        omega=omega,
-        friction_start=friction_start,
-        incoming=incoming,
-        templates=templates,
-    )
-    vhat, W = s.v_hat.numpy().copy(), unpack(owner)
-    owner.solve(s.rhs, iterations, omega, friction_start)
-    owner.check()
-    actual, lam = s.v_out.numpy(), s.impulses.numpy()[0, :count]
-    np.testing.assert_allclose(lam, expected_lam, rtol=3e-4, atol=3e-5)
-    np.testing.assert_allclose(actual, vhat + (W.T @ du)[::-1], rtol=3e-4, atol=3e-5)
-    test.assertTrue(np.isfinite(actual).all() and np.isfinite(lam).all())
-    if not np.any(incoming):
-        np.testing.assert_allclose(actual, vhat + (W.T @ (z.T @ lam))[::-1], rtol=3e-5, atol=3e-6)
-    return actual.copy(), lam.copy()
-
-
-@unittest.skipUnless(wp.is_cuda_available(), "Native contact-block controls require CUDA")
-class TestSparseContactBlockCUDA(unittest.TestCase):
-    def test_native_stick_open_slip_and_guarded_fallback(self):
-        """Match native impulse transactions to independent stick and fallback cases."""
-        with patch.dict(os.environ, BLOCK_ENV):
-            f = fixture("cuda:0")
-        s, owner = f["solver"], f["owner"]
-        owner.refresh(s)
-        template = int(np.flatnonzero(owner.host["support_count"] >= 3)[0])
-        owner.data.support.fill_(template)
-        owner.data.incident.zero_()
-        s.v_hat.zero_()
-        for kind in ("stick", "open", "slip", "singular", "cfm", "incoming", "delayed", "overrelaxed"):
-            with self.subTest(kind=kind):
-                z, diagonal, rhs, types, parents, mu = simple_case(kind)
-                packed = np.zeros((1, 100, 18), np.float32)
-                packed[0, :3, :3] = z
-                owner.data.Z.assign(packed)
-                s.constraint_count.assign(np.array([3], np.int32))
-                for name, values in (
-                    ("diag", diagonal),
-                    ("rhs", rhs),
-                    ("row_type", types),
-                    ("row_parent", parents),
-                    ("row_mu", mu),
-                ):
-                    array = getattr(s, name)
-                    data = np.zeros(array.shape, values.dtype)
-                    data[0, :3] = values
-                    array.assign(data)
-                s.impulses.zero_()
-                if kind in ("incoming", "delayed"):
-                    impulses = s.impulses.numpy()
-                    impulses[0, :3] = [0.3, 0.01, -0.01]
-                    s.impulses.assign(impulses)
-                check_native(
-                    self,
-                    f,
-                    iterations=1,
-                    friction_start=int(kind == "delayed"),
-                    omega=1.2 if kind == "overrelaxed" else 1.0,
-                )
-
-    def test_native_current_held_graph_and_empty(self):
-        """Check current rows, held factors, replay cache lifetime and empty output."""
-        with patch.dict(os.environ, BLOCK_ENV):
-            f = fixture("cuda:0")
-        s, owner = f["solver"], f["owner"]
-        owner.refresh(s)
-        W = unpack(owner)
-        action = (W.T @ W)[::-1, ::-1]
-        defect = np.linalg.norm(f["H"] @ action - np.eye(43), np.inf) / (
-            1 + np.linalg.norm(f["H"], np.inf) * np.linalg.norm(action, np.inf)
-        )
-        self.assertLess(defect, 2e-6)
-        saved = owner.data.W.numpy().copy()
-        for held in (False, True):
-            if held:
-                s.mass_update_mask.zero_()
-                s.body_I_c.fill_(wp.spatial_matrix(np.nan))
-                owner.refresh(s)
-                np.testing.assert_array_equal(owner.data.W.numpy(), saved)
-                points = f["contacts"].rigid_contact_point0.numpy()
-                points[:3, 0] += 0.007
-                f["contacts"].rigid_contact_point0.assign(points)
-            s.v_hat.assign(np.random.default_rng(12 + held).normal(0, 0.02, 43).astype(np.float32))
-            owner.build_rows(f["state"], s, f["contacts"], 0.0025)
-            s.check_constraint_capacity()
-            count = int(s.constraint_count.numpy()[0])
-            z, _ = full_rows(owner, count)
-            J = physical_rows(f)
-            np.testing.assert_allclose(z, (W @ J[:, ::-1].T).T, rtol=3e-5, atol=3e-6)
-            s._stage4_compute_rhs_world(0.0025)
-            owner.restitution(0.0025)
-            s.impulses.zero_()
-            expected, expected_lam = check_native(self, f)
-            with wp.ScopedCapture(device="cuda:0") as capture:
-                s.impulses.zero_()
-                owner.solve(s.rhs, 8, 1.0, 0)
-            for _ in range(2):
-                wp.capture_launch(capture.graph)
-                np.testing.assert_array_equal(s.v_out.numpy(), expected)
-                np.testing.assert_array_equal(s.impulses.numpy()[0, :count], expected_lam)
-        s.constraint_count.zero_()
-        s.v_out.fill_(np.nan)
-        owner.solve(s.rhs, 8, 1.0, 0)
-        np.testing.assert_array_equal(s.v_out.numpy(), s.v_hat.numpy())
-
-    def test_native_saved_sixteen_current_held_epochs(self):
-        """Check native block numerics on all sixteen pinned world/epoch payloads."""
-        replay, records = saved_records()
-        for gpu, record, data in records:
-            for index, world in enumerate(data["worlds"]):
-                with self.subTest(gpu=gpu, step=record["step"], world=int(world)), patch.dict(os.environ, BLOCK_ENV):
-                    f = replay.bind_world(record, data, index, "cuda:0")
-                    s, owner = f["solver"], f["owner"]
-                    lower = np.linalg.cholesky(f["H"][::-1, ::-1])
-                    W = np.linalg.solve(lower, np.eye(43))
-                    owner.data.W.assign(W[owner.host["row"], owner.host["col"]][None].astype(np.float32))
-                    owner.data.valid.fill_(1)
-                    owner.build_rows(f["state"], s, f["contacts"], 0.0025)
-                    s.check_constraint_capacity()
-                    s._stage4_compute_rhs_world(0.0025)
-                    owner.restitution(0.0025)
-                    s.impulses.zero_()
-                    count = int(s.constraint_count.numpy()[0])
-                    J = physical_rows(f)
-                    z, templates = full_rows(owner, count)
-                    # Warm geometry has known FP32 coefficient cancellation.
-                    # Report the unchanged diagnostic, then assess the solve and
-                    # physical response instead of stopping at an intermediate.
-                    coefficient = replay.component_diagnostic(z, (unpack(owner) @ J[:, ::-1].T).T)
-                    diagonal, rhs, types, parents, mu = (
-                        getattr(s, name).numpy()[0, :count]
-                        for name in ("diag", "rhs", "row_type", "row_parent", "row_mu")
-                    )
-                    # Compare numerical iterations on identical current rows,
-                    # not the original capture's different atomic slot order.
-                    seed = rhs.astype(float) + owner.data.incident.numpy()[0, :count]
-                    scalar_du, scalar_lam, _ = reference(
-                        z, z, diagonal, seed, types, parents, mu, np.zeros(43), block=False, templates=templates
-                    )
-                    scalar_v = s.v_hat.numpy() + (unpack(owner).T @ scalar_du)[::-1]
-                    scalar_score, scalar_cone = residual_metrics(
-                        J, diagonal, rhs, types, parents, mu, s.v_hat.numpy(), scalar_v, scalar_lam
-                    )
-                    permutation = replay.row_permutation(f, count)
-                    rhs_diagnostic = replay.component_diagnostic(rhs, data[f"rhs_{world}"][permutation])
-                    actual, lam = check_native(self, f)
-                    score, cone = residual_metrics(J, diagonal, rhs, types, parents, mu, s.v_hat.numpy(), actual, lam)
-                    delta = actual.astype(float) - s.v_hat.numpy().astype(float)
-                    force = J.T @ lam.astype(float)
-                    momentum = float(
-                        np.linalg.norm(f["H"] @ delta - force, np.inf)
-                        / (
-                            1
-                            + np.linalg.norm(f["H"], np.inf) * np.linalg.norm(delta, np.inf)
-                            + np.linalg.norm(force, np.inf)
-                        )
-                    )
-                    print(
-                        "contact_block_saved_native "
-                        + json.dumps(
-                            {
-                                "gpu_fixture": gpu,
-                                "step": record["step"],
-                                "world": int(world),
-                                "coefficient": coefficient,
-                                "current_to_captured_row": permutation.tolist(),
-                                "rhs_vs_captured": rhs_diagnostic,
-                                "scalar_current_natural_residual": scalar_score,
-                                "scalar_current_cone_error": scalar_cone,
-                                "natural_residual": score,
-                                "cone_error": cone,
-                                "momentum_defect": momentum,
-                            }
-                        ),
-                        flush=True,
-                    )
-                    self.assertTrue(np.isfinite(score))
-                    self.assertLess(cone, 3e-5)
-                    self.assertLess(momentum, 2e-6)
 
 
 if __name__ == "__main__":

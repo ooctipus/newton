@@ -709,12 +709,10 @@ class TestCheckedCapture(unittest.TestCase):
             setattr(solver, name, value)
         solver._fused_k1 = True
         solver._grouped_topology = object()
-        solver._sparse_factor = object()
         checked.check_solver("feather_pgs", solver, entry)
         self.assertEqual(entry["solver_recipe"], expected)
         self.assertTrue(entry["solver_paths"]["fused_k1"])
         self.assertTrue(entry["solver_paths"]["grouped_topology"])
-        self.assertTrue(entry["solver_paths"]["sparse_factor"])
 
     def test_fpgs_failure_records_flags_before_raising(self):
         """Retain overflow evidence and reject even a defective no-op checker."""

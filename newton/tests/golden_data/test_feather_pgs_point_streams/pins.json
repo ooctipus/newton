@@ -274,8 +274,6 @@
   "sparse_contact.build_sparse_joint_velocity_limit_rows": "40512ab89e33caf58c01877a047169586eacf11fbe388f4d87212fcfb3338680",
   "sparse_contact.build_sparse_mimic_rows": "71e7f99ef4c9d88e2f9cc33bc0350c76b3b050c4bea9089e9afba0efaf1aa110",
   "sparse_contact.finalize_sparse_joint_limit_rows": "ca940333ff873e0c53d4026e6ab2a2cb948b06cf5cf2865158b9177d4bcf4736",
-  "sparse_factor_rows.apply_restitution": "21c9b296612731b84836ed1b609f4136984eed651089fa3aae31b3cde3001027",
-  "sparse_factor_rows.build_limit_prefix": "a8ddefd98277f16969a27243fda3984b4a8957a02b044ff00c6e1efb660f1918",
   "sparse_mass_matrix.solve_sparse_mass_matrix": "fa218b9c5f138152cfc3ccf2762c380afe987cb869a38fafc4833792324a3038",
   "sparse_pgs._get_pgs_solve_sparse_kernel(32, 8, 8, active_rows=False, contact_triplets=False, free_row_dofs=0, lanes_per_world=16, local_factors=False, mf_max_constraints=0, use_support_table=False, velocity_limits=False, warm_start=False)": "168e6fe07457edd07269117fa3fdaaed5f33ddfeb29d8bd77e3c24476eeba399",
   "sparse_pgs._get_pgs_solve_sparse_kernel(32, 8, 8, active_rows=False, contact_triplets=False, free_row_dofs=0, lanes_per_world=16, local_factors=False, mf_max_constraints=0, use_support_table=False, velocity_limits=False, warm_start=True)": "122cd8b8f8316b4485153794fff3556e42f55dd5799bd46735e3647d5c28092c",

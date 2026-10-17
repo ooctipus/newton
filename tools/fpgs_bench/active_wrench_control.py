@@ -19,8 +19,8 @@ from pathlib import Path
 
 import numpy as np
 
-from tools.fpgs_bench.test_sparse_contact_block import PAYLOAD_SHA
-from tools.fpgs_bench.test_sparse_metric_tangents import metric_disk, physical_metrics, reference, saved_records
+from tools.fpgs_bench.test_sparse_contact_block import PAYLOAD_SHA, saved_records
+from tools.fpgs_bench.test_sparse_metric_tangents import metric_disk, physical_metrics, reference
 
 RANK_TOL = 32.0 * np.finfo(np.float32).eps
 EVENT_TOL = 1.0e-10

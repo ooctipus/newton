@@ -16,7 +16,7 @@ from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_kinetic_owner import TreeKineticState
 from newton._src.solvers.feather_pgs.tree_kinetic_state import get_state_kernel
 from newton.tests import test_feather_pgs_sparse_split as split
-from tools.fpgs_bench.test_packed_tree_state import physical_mass
+from tools.fpgs_bench.public_state_oracle import physical_mass
 from tools.fpgs_bench.test_tree_kinetic_state import fixture as tree_fixture
 
 

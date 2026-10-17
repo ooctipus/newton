@@ -109,14 +109,35 @@ class TestSparseResearchAdmission(unittest.TestCase):
     def test_point_research_requests_keep_ownership(self):
         """Do not replace buffers needed by an explicitly requested point-contact owner."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        for option in (
-            "SINGLE_FACTOR",
-            "SPARSE_FACTOR",
-        ):
-            with self.subTest(option=option), mock.patch.dict(os.environ, {f"FEATHER_PGS_{option}": "1"}, clear=True):
+        with mock.patch.dict(os.environ, {"FEATHER_PGS_SINGLE_FACTOR": "1"}, clear=True):
+            solver = _eligible_solver()
+            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+            self.assertIsNone(solver._sparse_mass_matrix_size)
+
+    def test_retired_packed_route_flags_reach_general_sparse(self):
+        """Admit the general sparse route under either friction law when a recipe sets the retired flags."""
+        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
+        flags = dict.fromkeys(
+            (
+                "FEATHER_PGS_G1_CHAIN_SCAN",
+                "FEATHER_PGS_SPARSE_FACTOR",
+                "FEATHER_PGS_SPARSE_LEVEL_UPDATE",
+                "FEATHER_PGS_SPARSE_LIMIT_JACOBI",
+                "FEATHER_PGS_SPARSE_METRIC_TANGENTS",
+                "FEATHER_PGS_SPARSE_PARALLEL_LIMITS",
+                "FEATHER_PGS_SPARSE_SPECTRAL_TANGENTS",
+            ),
+            "1",
+        )
+        for anchors in (False, True):
+            with (
+                self.subTest(friction_anchors=anchors),
+                mock.patch.dict(os.environ, flags, clear=True),
+                self.assertRaises(_TopologyReached),
+            ):
                 solver = _eligible_solver()
+                solver._friction_anchors_enabled = anchors
                 SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-                self.assertIsNone(solver._sparse_mass_matrix_size)
 
     def test_free_rigid_bodies_keep_the_dense_route(self):
         """A world pairing an articulation with free rigid bodies declines the sparse route."""
@@ -127,17 +148,6 @@ class TestSparseResearchAdmission(unittest.TestCase):
             SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
             self.assertIsNone(solver._sparse_mass_matrix_size)
             self.assertIn("free rigid bodies", solver._sparse_selection_reason)
-
-    def test_inactive_point_request_does_not_block_patch_sparse(self):
-        """Keep general patch support when the requested point-only owner cannot run."""
-        solver = _eligible_solver()
-        solver._friction_anchors_enabled = True
-        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        with (
-            mock.patch.dict(os.environ, {"FEATHER_PGS_SPARSE_FACTOR": "1"}, clear=True),
-            self.assertRaises(_TopologyReached),
-        ):
-            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
 
     def test_contact_writer_requests_do_not_block_sparse(self):
         """Allow general sparse producers to supersede optional canonical row writers."""
@@ -226,8 +236,6 @@ class TestSparseResearchAdmission(unittest.TestCase):
                 self.assertEqual(solver._ink_rows, 0)
                 for name in ("_fused_k1", "_grouped_tau_mass", "_grouped_mass"):
                     self.assertFalse(getattr(solver, name), name)
-                for name in ("_sparse_factor",):
-                    self.assertIsNone(getattr(solver, name), name)
 
 
 if __name__ == "__main__":

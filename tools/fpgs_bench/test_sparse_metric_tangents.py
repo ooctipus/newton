@@ -3,30 +3,17 @@
 
 """Check fixed-normal metric-disk tangents without assuming old GS convergence."""
 
-import json
-import os
 import unittest
-from unittest.mock import patch
 
 import numpy as np
-import warp as wp
 
-from tools.fpgs_bench.test_sparse_contact_block import (
-    full_rows,
-    residual_metrics,
-    saved_records,
-    simple_case,
-)
 from tools.fpgs_bench.test_sparse_contact_block import (
     reference as scalar_reference,
 )
-from tools.fpgs_bench.test_sparse_factor import fixture, physical_rows, unpack
-
-METRIC_ENV = {
-    "FEATHER_PGS_SPARSE_METRIC_TANGENTS": "1",
-    "FEATHER_PGS_SPARSE_PACKETS": "0",
-    "FEATHER_PGS_SPARSE_CONTACT_BLOCK": "0",
-}
+from tools.fpgs_bench.test_sparse_contact_block import (
+    residual_metrics,
+    simple_case,
+)
 
 
 def metric_disk(matrix, linear, radius):
@@ -176,45 +163,6 @@ def physical_metrics(J, diagonal, rhs, types, parents, mu, vhat, v, lam):
     return {"natural": natural, "cone": cone, "normal": normal_error, "complementarity": complementarity, "mdp": mdp}
 
 
-def check_native(test, f, *, iterations=8, omega=1.0, friction_start=0, metric=True):
-    """Compare the native law on current rounded rows and verify its impulse publication."""
-    s, owner = f["solver"], f["owner"]
-    test.assertTrue(owner.metric_tangents)
-    test.assertEqual(owner.kernels.solve.key, "sparse_metric_tangent43_s18_c100")
-    count = int(s.constraint_count.numpy()[0])
-    z, templates = full_rows(owner, count)
-    diagonal, rhs, types, parents, mu, incoming = (
-        getattr(s, name).numpy()[0, :count] for name in ("diag", "rhs", "row_type", "row_parent", "row_mu", "impulses")
-    )
-    seed = rhs.astype(float) + owner.data.incident.numpy()[0, :count]
-    du, expected_lam, stats = reference(
-        z,
-        z,
-        diagonal,
-        seed,
-        types,
-        parents,
-        mu,
-        np.zeros(43),
-        iterations=iterations,
-        omega=omega,
-        friction_start=friction_start,
-        incoming=incoming,
-        templates=templates,
-        metric=metric,
-    )
-    vhat, W = s.v_hat.numpy().copy(), unpack(owner)
-    owner.solve(s.rhs, iterations, omega, friction_start)
-    owner.check()
-    actual, lam = s.v_out.numpy(), s.impulses.numpy()[0, :count]
-    np.testing.assert_allclose(lam, expected_lam, rtol=3e-4, atol=3e-5)
-    np.testing.assert_allclose(actual, vhat + (W.T @ du)[::-1], rtol=3e-4, atol=3e-5)
-    test.assertTrue(np.isfinite(actual).all() and np.isfinite(lam).all())
-    if friction_start == 0 or not np.any(incoming):
-        np.testing.assert_allclose(actual, vhat + (W.T @ (z.T @ (lam - incoming)))[::-1], rtol=3e-5, atol=3e-6)
-    return actual.copy(), lam.copy(), stats
-
-
 def check_reference_law(test):
     """Distinguish the metric disk law, scalar normal and proximal-only CFM on CPU."""
     matrix = np.array([[4.0, 0.8], [0.8, 1.0]])
@@ -273,243 +221,9 @@ def check_reference_law(test):
 
 
 class TestSparseMetricTangentsCPU(unittest.TestCase):
-    def test_owner_admission(self):
-        """Require explicit metric ownership and reject conflicting modes."""
-        with patch.dict(os.environ, METRIC_ENV):
-            owner = fixture("cpu")["owner"]
-        self.assertTrue(owner.metric_tangents)
-        self.assertFalse(owner.block_contacts)
-        self.assertEqual(owner.kernels.solve.key, "sparse_metric_tangent43_s18_c100")
-        with patch.dict(os.environ, {**METRIC_ENV, "FEATHER_PGS_SPARSE_METRIC_TANGENTS": "0"}):
-            ordinary = fixture("cpu")["owner"]
-        self.assertFalse(ordinary.metric_tangents)
-        for flag in ("FEATHER_PGS_SPARSE_PACKETS", "FEATHER_PGS_SPARSE_CONTACT_BLOCK"):
-            with self.subTest(flag=flag), patch.dict(os.environ, {**METRIC_ENV, flag: "1"}):
-                with self.assertRaises(ValueError):
-                    fixture("cpu")
-        with patch.dict(os.environ, METRIC_ENV):
-            other_capacity = fixture("cpu", capacity=101)["owner"]
-        self.assertFalse(other_capacity.metric_tangents)
-        self.assertEqual(other_capacity.kernels.solve.key, "sparse_factor_gs43_s18_c101")
+    def test_reference_law(self):
+        """Distinguish the metric disk law, scalar normal and proximal-only CFM on CPU."""
         check_reference_law(self)
-
-
-@unittest.skipUnless(wp.is_cuda_available(), "Native metric-tangent controls require CUDA")
-class TestSparseMetricTangentsCUDA(unittest.TestCase):
-    def test_native_stick_open_slip_and_guarded_fallback(self):
-        """Check fused scalar-normal/QP transactions, zero disks and pre-mutation fallback."""
-        with patch.dict(os.environ, METRIC_ENV):
-            f = fixture("cuda:0")
-        s, owner = f["solver"], f["owner"]
-        owner.refresh(s)
-        templates = np.flatnonzero(owner.host["support_count"] >= 3)
-        template = int(templates[0])
-        owner.data.incident.zero_()
-        s.v_hat.zero_()
-        kinds = (
-            "stick",
-            "open",
-            "slip",
-            "singular",
-            "cfm",
-            "incoming",
-            "delayed",
-            "overrelaxed",
-            "zero_mu",
-            "closing_old_tangents",
-            "mismatched_support",
-            "mismatched_mu",
-            "root_overflow",
-            "limit",
-        )
-        for kind in kinds:
-            with self.subTest(kind=kind):
-                z, diagonal, rhs, types, parents, mu = simple_case(kind)
-                incoming = np.zeros(3)
-                if kind in ("incoming", "delayed", "zero_mu", "closing_old_tangents"):
-                    incoming[:] = [0.3, 0.01, -0.01]
-                if kind == "zero_mu":
-                    mu[1:] = 0
-                elif kind == "closing_old_tangents":
-                    rhs[0] = 1
-                elif kind == "mismatched_mu":
-                    mu[2] *= 0.5
-                elif kind == "root_overflow":
-                    # Keep the radius normal-range (not flushed to zero), but
-                    # overflow beta_norm/radius so the native root must reject.
-                    mu[1:] = 1e-37
-                    rhs[1:] = [1e3, -1e3]
-                elif kind == "limit":
-                    types[:] = 3
-                packed = np.zeros((1, 100, 18), np.float32)
-                packed[0, :3, :3] = z
-                owner.data.Z.assign(packed)
-                owner.data.support.fill_(template)
-                if kind == "mismatched_support":
-                    support = owner.data.support.numpy()
-                    support[0, 2] = int(templates[-1])
-                    self.assertNotEqual(support[0, 2], template)
-                    owner.data.support.assign(support)
-                s.constraint_count.assign(np.array([3], np.int32))
-                for name, values in (
-                    ("diag", diagonal),
-                    ("rhs", rhs),
-                    ("row_type", types),
-                    ("row_parent", parents),
-                    ("row_mu", mu),
-                    ("impulses", incoming),
-                ):
-                    array = getattr(s, name)
-                    data = np.zeros(array.shape, dtype=array.numpy().dtype)
-                    data[0, :3] = values
-                    array.assign(data)
-                _, _, stats = check_native(
-                    self,
-                    f,
-                    iterations=1,
-                    friction_start=int(kind == "delayed"),
-                    omega=1.2 if kind == "overrelaxed" else 1.0,
-                    metric=kind != "root_overflow",
-                )
-                if kind in ("stick", "cfm", "slip"):
-                    self.assertEqual(stats["slip" if kind == "slip" else "stick"], 1)
-                elif kind in ("open", "zero_mu", "closing_old_tangents"):
-                    self.assertEqual(stats["open"], 1)
-                elif kind == "singular":
-                    self.assertEqual(stats["unsafe"], 1)
-        s.impulses.zero_()
-        s.v_out.fill_(np.nan)
-        check_native(self, f, iterations=0)
-
-    def test_native_current_held_graph_and_empty(self):
-        """Check held-factor rows and reinitialize lazy cross terms on graph replay and empty transitions."""
-        with patch.dict(os.environ, METRIC_ENV):
-            f = fixture("cuda:0")
-        s, owner = f["solver"], f["owner"]
-        owner.refresh(s)
-        W = unpack(owner)
-        action = (W.T @ W)[::-1, ::-1]
-        defect = np.linalg.norm(f["H"] @ action - np.eye(43), np.inf) / (
-            1 + np.linalg.norm(f["H"], np.inf) * np.linalg.norm(action, np.inf)
-        )
-        self.assertLess(defect, 2e-6)
-        saved = owner.data.W.numpy().copy()
-        graph = None
-        for held in (False, True):
-            if held:
-                s.mass_update_mask.zero_()
-                s.body_I_c.fill_(wp.spatial_matrix(np.nan))
-                owner.refresh(s)
-                np.testing.assert_array_equal(owner.data.W.numpy(), saved)
-                points = f["contacts"].rigid_contact_point0.numpy()
-                points[:3, 0] += 0.007
-                f["contacts"].rigid_contact_point0.assign(points)
-            s.v_hat.assign(np.random.default_rng(12 + held).normal(0, 0.02, 43).astype(np.float32))
-            owner.build_rows(f["state"], s, f["contacts"], 0.0025)
-            s.check_constraint_capacity()
-            count = int(s.constraint_count.numpy()[0])
-            z, _ = full_rows(owner, count)
-            J = physical_rows(f)
-            self.assertTrue(np.isfinite(z).all() and np.isfinite(J).all())
-            s._stage4_compute_rhs_world(0.0025)
-            owner.restitution(0.0025)
-            s.impulses.zero_()
-            expected, expected_lam, _ = check_native(self, f)
-            if graph is None:
-                with wp.ScopedCapture(device="cuda:0") as capture:
-                    s.impulses.zero_()
-                    owner.solve(s.rhs, 8, 1.0, 0)
-                graph = capture.graph
-            # Reuse the SAME captured solve with changed current rows/incident
-            # and held W; per-launch shared cross coefficients cannot survive.
-            for _ in range(2):
-                wp.capture_launch(graph)
-                np.testing.assert_array_equal(s.v_out.numpy(), expected)
-                np.testing.assert_array_equal(s.impulses.numpy()[0, :count], expected_lam)
-            s.constraint_count.zero_()
-            s.v_out.fill_(np.nan)
-            wp.capture_launch(graph)
-            np.testing.assert_array_equal(s.v_out.numpy(), s.v_hat.numpy())
-            s.constraint_count.assign(np.array([count], np.int32))
-            wp.capture_launch(graph)
-            np.testing.assert_array_equal(s.v_out.numpy(), expected)
-            np.testing.assert_array_equal(s.impulses.numpy()[0, :count], expected_lam)
-
-    def test_native_saved_sixteen_current_held_epochs(self):
-        """Check the metric law and physical response on sixteen pinned current/held payloads."""
-        replay, records = saved_records()
-        tested = 0
-        for gpu, record, data in records:
-            for index, world in enumerate(data["worlds"]):
-                with self.subTest(gpu=gpu, step=record["step"], world=int(world)), patch.dict(os.environ, METRIC_ENV):
-                    f = replay.bind_world(record, data, index, "cuda:0")
-                    s, owner = f["solver"], f["owner"]
-                    # The audited replay reconstructs held H from valid L;
-                    # saved H_by_size is unused zero storage, not the operator.
-                    lower = np.linalg.cholesky(f["H"][::-1, ::-1])
-                    W = np.linalg.solve(lower, np.eye(43))
-                    owner.data.W.assign(W[owner.host["row"], owner.host["col"]][None].astype(np.float32))
-                    owner.data.valid.fill_(1)
-                    owner.build_rows(f["state"], s, f["contacts"], 0.0025)
-                    s.check_constraint_capacity()
-                    s._stage4_compute_rhs_world(0.0025)
-                    owner.restitution(0.0025)
-                    s.impulses.zero_()
-                    count = int(s.constraint_count.numpy()[0])
-                    J = physical_rows(f)
-                    z, templates = full_rows(owner, count)
-                    coefficient = replay.component_diagnostic(z, (unpack(owner) @ J[:, ::-1].T).T)
-                    diagonal, rhs, types, parents, mu = (
-                        getattr(s, name).numpy()[0, :count]
-                        for name in ("diag", "rhs", "row_type", "row_parent", "row_mu")
-                    )
-                    # The current atomic row order and FP32 Z/incident are the
-                    # same-input oracle. Original-capture order is diagnostic.
-                    seed = rhs.astype(float) + owner.data.incident.numpy()[0, :count]
-                    scalar_du, scalar_lam, _ = scalar_reference(
-                        z, z, diagonal, seed, types, parents, mu, np.zeros(43), block=False, templates=templates
-                    )
-                    scalar_v = s.v_hat.numpy() + (unpack(owner).T @ scalar_du)[::-1]
-                    scalar = physical_metrics(
-                        J, diagonal, rhs, types, parents, mu, s.v_hat.numpy(), scalar_v, scalar_lam
-                    )
-                    permutation = replay.row_permutation(f, count)
-                    rhs_diagnostic = replay.component_diagnostic(rhs, data[f"rhs_{world}"][permutation])
-                    actual, lam, stats = check_native(self, f)
-                    metrics = physical_metrics(J, diagonal, rhs, types, parents, mu, s.v_hat.numpy(), actual, lam)
-                    delta = actual.astype(float) - s.v_hat.numpy().astype(float)
-                    force = J.T @ lam.astype(float)
-                    momentum = float(
-                        np.linalg.norm(f["H"] @ delta - force, np.inf)
-                        / (
-                            1
-                            + np.linalg.norm(f["H"], np.inf) * np.linalg.norm(delta, np.inf)
-                            + np.linalg.norm(force, np.inf)
-                        )
-                    )
-                    print(
-                        "metric_tangent_saved_native "
-                        + json.dumps(
-                            {
-                                "gpu_fixture": gpu,
-                                "step": record["step"],
-                                "world": int(world),
-                                "coefficient": coefficient,
-                                "current_to_captured_row": permutation.tolist(),
-                                "rhs_vs_captured": rhs_diagnostic,
-                                "scalar_current": scalar,
-                                "metric_current": metrics,
-                                "momentum_defect": momentum,
-                                "oracle_transactions": stats,
-                            }
-                        ),
-                        flush=True,
-                    )
-                    self.assertTrue(np.isfinite(list(metrics.values())).all())
-                    self.assertLess(metrics["cone"], 3e-5)
-                    self.assertLess(momentum, 2e-6)
-                    tested += 1
-        self.assertEqual(tested, 16)
 
 
 if __name__ == "__main__":

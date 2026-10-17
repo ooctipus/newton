@@ -3121,33 +3121,6 @@ class SolverFeatherPGS(SolverBase):
                 self._max_contacts_alloc, self.world_count, self.dense_max_constraints, model.device
             )
 
-        self._sparse_factor = None
-        if self._sparse_mass_matrix_size is not None:
-            self._sparse_factor_reason = "Native sparse factors own factor and row storage."
-        elif not self._point_contact_paths:
-            self._sparse_factor_reason = "The packed research factor implements point contacts only."
-        elif os.environ.get("FEATHER_PGS_SPARSE_FACTOR") != "1":
-            self._sparse_factor_reason = "Off: FEATHER_PGS_SPARSE_FACTOR is a research opt-in."
-        else:
-            from .sparse_factor import create_owner as create_sparse_factor  # noqa: PLC0415
-
-            if (
-                _FPGS_CAPTURE
-                or _GROUPED_CHECK
-                or _CHECK_ROWS
-                or _CHECK_ROWS_FUSED
-                or _DEBUG_CACHE_CMP
-                or _INK_CHECK
-                or _WR_CHECK
-            ):
-                raise ValueError("Sparse factor excludes canonical factor/row debug readers")
-            self._sparse_factor = create_sparse_factor(self)
-            self._sparse_factor_reason = (
-                "FEATHER_PGS_SPARSE_FACTOR=1: the packed research factor owns factor, rows and sweep."
-                if self._sparse_factor is not None
-                else "FEATHER_PGS_SPARSE_FACTOR=1 declined: the topology or solver policy is outside its contract."
-            )
-
         from .cached_dynamics import install as install_cached_dynamics  # noqa: PLC0415
 
         install_cached_dynamics(self)
@@ -3167,7 +3140,6 @@ class SolverFeatherPGS(SolverBase):
 
         if self._explicit_dense_kernels:
             for name in (
-                "_sparse_factor",
                 "_tree_kinetic_state",
                 "_single_factor",
             ):
@@ -3182,12 +3154,7 @@ class SolverFeatherPGS(SolverBase):
             # A predictor experiment independent of contact scheduling. The
             # effective six-DOF factor retains drive/armature contributions;
             # physical COM inertia supplies only the gyroscopic correction.
-            if (
-                model.requires_grad
-                or self.L_by_size.get(6) is None
-                or self._sparse_factor is not None
-                or self._prismatic_linear_state
-            ):
+            if model.requires_grad or self.L_by_size.get(6) is None or self._prismatic_linear_state:
                 raise ValueError("Experimental implicit free-body gyro requires ordinary six-DOF mass factors")
             from .free_body_gyro import correct_free_body_gyroscopic_predictor  # noqa: PLC0415
 
@@ -3218,7 +3185,6 @@ class SolverFeatherPGS(SolverBase):
                 or self._paired_factor_coordinates
                 or self._sparse_diagonal_contact_solve
                 or self._sparse_mass_matrix_size is not None
-                or self._sparse_factor is not None
                 or self._prismatic_linear_state
             ):
                 raise ValueError(
@@ -3530,10 +3496,8 @@ class SolverFeatherPGS(SolverBase):
             # Geometry edits retire affected material points; unrelated shape
             # properties keep their history and live materials are checked per step.
             self._friction_patches.update_geometry(self.model)
-        if getattr(self, "_sparse_factor", None) is not None:
-            self._sparse_factor.validate_notification(flags)
         tree_kinetic = getattr(self, "_tree_kinetic_state", None)
-        if tree_kinetic is not None and self._sparse_factor is None:
+        if tree_kinetic is not None:
             tree_kinetic.validate_model(flags)
         if self._row_packets is not None:
             self._row_packets.validate_notification(flags)
@@ -5142,7 +5106,7 @@ class SolverFeatherPGS(SolverBase):
         if not self._friction_anchors_enabled and (
             self.mf_gs_parallel_rows > 0
             or self.mf_gs_response_block_rows > 0
-            or any(os.environ.get(f"FEATHER_PGS_{option}") == "1" for option in ("SINGLE_FACTOR", "SPARSE_FACTOR"))
+            or os.environ.get("FEATHER_PGS_SINGLE_FACTOR") == "1"
         ):
             self._sparse_selection_reason = "A competing response or publication owner reserves the ordinary buffers."
             return
@@ -8407,17 +8371,6 @@ class SolverFeatherPGS(SolverBase):
             return
         if friction_start_iteration is None:
             friction_start_iteration = self._contact_friction_start_iteration(iterations)
-        if self._sparse_factor is not None:
-            if (
-                row_phase_override not in (None, 0)
-                or iteration_offset
-                or freeze_drive_rows
-                or defer_dense_response
-                or soft_relax
-            ):
-                raise RuntimeError("Sparse factor requires the complete original interleaved solve")
-            self._sparse_factor.solve(dense_rhs, iterations, omega, int(friction_start_iteration))
-            return
         if self._sparse_mass_matrix_size is not None:
             if row_phase_override not in (None, 0) or defer_dense_response or soft_relax:
                 raise RuntimeError("sparse factor response requires the interleaved augmented-drive solve")
@@ -10248,8 +10201,6 @@ class SolverFeatherPGS(SolverBase):
         if self.contact_compliance:
             # Reject incompatible contact preprocessing before it can mutate the stream.
             _contact_compliance.validate_step(self)
-        if self._sparse_factor is not None:
-            self._sparse_factor.begin()
         if contacts is not None and contacts.rigid_contact_max > self._max_contacts_alloc:
             raise ValueError(
                 "FeatherPGS contact capacity mismatch: received "
@@ -11230,8 +11181,6 @@ class SolverFeatherPGS(SolverBase):
         """
         if self.model.device.is_cuda and self.model.device.is_capturing:
             raise RuntimeError("check_constraint_capacity() must run outside CUDA graph capture")
-        if self._sparse_factor is not None:
-            self._sparse_factor.check()
         worlds = np.flatnonzero(self.constraint_overflow.numpy())
         if worlds.size:
             raise RuntimeError(
@@ -12369,9 +12318,7 @@ class SolverFeatherPGS(SolverBase):
 
         # The immutable drive layout gives CRBA direct DOF-to-row ownership.
         # Make the dynamic coefficients visible before any fused mass write.
-        if drive_rows_ready is not None and (
-            self._parallel_augmented_drive_topology or self._sparse_factor is not None
-        ):
+        if drive_rows_ready is not None and self._parallel_augmented_drive_topology:
             wp.get_stream(model.device).wait_event(drive_rows_ready)
 
         # Global refreshes were accumulated by the warp-parallel launch next
@@ -12406,9 +12353,6 @@ class SolverFeatherPGS(SolverBase):
         # the per-step memset.
         for size in self.size_groups:
             n_arts = self.n_arts_by_size[size]
-            if self._sparse_factor is not None:
-                self._sparse_factor.refresh(state_aug)
-                continue
             if size == self._sparse_mass_matrix_size:
                 wp.launch(
                     self._crba_sparse_factor_kernel,
@@ -12608,7 +12552,7 @@ class SolverFeatherPGS(SolverBase):
         if drive_rows_ready is not None and not self._parallel_augmented_drive_topology:
             wp.get_stream(model.device).wait_event(drive_rows_ready)
 
-        if not self._parallel_augmented_drive_topology and self._sparse_factor is None:
+        if not self._parallel_augmented_drive_topology:
             for size in self.size_groups:
                 n_arts = self.n_arts_by_size[size]
                 wp.launch(
@@ -12726,8 +12670,6 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage2_cholesky_tiled(self, size: int):
-        if self._sparse_factor is not None:
-            return
         model = self.model
         n_arts = self.n_arts_by_size[size]
         if self._crba_cholesky_kernels_by_size[size] is not None:
@@ -12845,9 +12787,6 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage3_trisolve_tiled(self, size: int, state_aug: State):
-        if self._sparse_factor is not None:
-            self._sparse_factor.predict(state_aug)
-            return
         model = self.model
         n_arts = self.n_arts_by_size[size]
 
@@ -13117,10 +13056,6 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage4_build_rows(self, state_in: State, state_aug: State, control: Control, contacts: Contacts, dt: float):
-        if self._sparse_factor is not None:
-            self._sparse_factor.build_rows(state_in, state_aug, contacts, dt)
-            self._finalize_constraint_status(contacts)
-            return
         if self.contact_compliance:
             _contact_compliance.start_step(self, contacts, dt)
             # The allocator writes slots_needed only after intentional skip gates.
@@ -15107,8 +15042,6 @@ class SolverFeatherPGS(SolverBase):
         self.diag.zero_()
 
     def _stage4_hinv_jt_tiled(self, size: int):
-        if self._sparse_factor is not None:
-            return
         model = self.model
         n_arts = self.n_arts_by_size[size]
         hinv_jt_kernel = self._hinv_jt_kernels_by_size[size]
@@ -15655,8 +15588,6 @@ class SolverFeatherPGS(SolverBase):
     def _stage4_finalize_world_diag_cfm(self):
         if self._sparse_prepare_contacts:
             return  # Contact and limit producers add CFM exactly once.
-        if self._sparse_factor is not None:
-            return
         if self._row_packets is not None:
             return  # Current row owner and general response each add CFM exactly once.
         if self._compact_contact_boundary:
@@ -15771,8 +15702,6 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage4_compute_matrix_free_diag(self):
-        if self._sparse_factor is not None:
-            return
         if self._row_packets is not None:
             self._row_packets.diagonal()
             return
@@ -15953,11 +15882,6 @@ class SolverFeatherPGS(SolverBase):
         """Replace geometric contact bias for impacts selected from ``v_hat``."""
         if self._sparse_prepare_contacts:
             return  # The sparse contact producer uses its projected incident velocity.
-        if self._sparse_factor is not None:
-            if not matrix_free:
-                raise RuntimeError("Sparse factor excludes non-matrix-free restitution")
-            self._sparse_factor.restitution(dt)
-            return
         if self._row_packets is not None or self._keyed_rows is not None:
             return  # The current packet producer applies the same incident-velocity law.
         if matrix_free:
