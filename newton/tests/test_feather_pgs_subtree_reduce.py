@@ -128,9 +128,16 @@ def _finish(group, reference):
     )
 
 
+def _rotation_angle(a, b):
+    """Relative rotation angle [rad] between quaternion arrays (xyzw), sign-invariant, in float64."""
+    a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
+    chord = np.minimum(np.linalg.norm(a - b, axis=-1), np.linalg.norm(a + b, axis=-1))
+    return 4.0 * np.arcsin(np.minimum(0.5 * chord, 1.0))
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "The held-tree owner is a CUDA path")
 class TestPrefixSubtreeReduction(unittest.TestCase):
-    def _compare(self, model, *, bias_tolerance=(1e-5, 1e-4)):
+    def _compare(self, model, *, bias_tolerance=(1e-5, 1e-4), angle_tolerance=None):
         owner_reference, plain, plain_bias = _rollout(model, level_loop=True)
         owner, poses, bias = _rollout(model, level_loop=False)
         self.assertIsNotNone(owner)
@@ -149,7 +156,14 @@ class TestPrefixSubtreeReduction(unittest.TestCase):
         # amplified where a subtree's terms cancel (a walker landing on its feet).
         np.testing.assert_allclose(bias, plain_bias, rtol=bias_tolerance[0], atol=bias_tolerance[1])
         np.testing.assert_allclose(poses[:, :, :3], plain[:, :, :3], atol=1e-5, rtol=0.0)
-        np.testing.assert_allclose(poses[:, :, 3:], plain[:, :, 3:], atol=1e-5, rtol=0.0)
+        if angle_tolerance is None:
+            np.testing.assert_allclose(poses[:, :, 3:], plain[:, :, 3:], atol=1e-5, rtol=0.0)
+        else:
+            # Orientation as a rotation angle: when both arms still ran the reference
+            # kernels, a free box resting on contacts already differed by over 2e-5 rad.
+            angle = _rotation_angle(poses[:, :, 3:], plain[:, :, 3:])
+            step, body = np.unravel_index(np.argmax(angle), angle.shape)
+            self.assertLessEqual(float(angle[step, body]), angle_tolerance, f"step {step}, body {body}")
         return owner
 
     def test_forest_with_prescribed_root(self):
@@ -164,7 +178,11 @@ class TestPrefixSubtreeReduction(unittest.TestCase):
 
     def test_free_root_walker(self):
         """An 18-coordinate quadruped beside the arm: two groups, both on the prefix reduction."""
-        self._compare(_build(wp.get_device("cuda:0"), worlds=4, quadruped=True), bias_tolerance=(1e-4, 2e-3))
+        self._compare(
+            _build(wp.get_device("cuda:0"), worlds=4, quadruped=True),
+            bias_tolerance=(1e-4, 2e-3),
+            angle_tolerance=1e-4,
+        )
 
 
 if __name__ == "__main__":
