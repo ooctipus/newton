@@ -706,9 +706,9 @@ def _friction(solver) -> dict:
     reason = _BETA_REASONS[solver._friction_anchor_beta_source]
     if patch:
         reason += (
-            " Point-contact owners (local packets, keyed rows, compact contacts, matrix-free tiers and response"
-            " blocks, the resolved-world classifier, the research sparse factor, multiblock sweeps, sparse active"
-            " rows and triplets) need point friction."
+            " Point-contact owners (local packets, keyed rows, compact contacts, parallel matrix-free tiers and"
+            " response blocks, the resolved-world classifier, the research sparse factor, multiblock sweeps, sparse"
+            " active rows and triplets) need point friction."
         )
     return {
         "law": "patch" if patch else "point",

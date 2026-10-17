@@ -7328,10 +7328,12 @@ class SolverFeatherPGS(SolverBase):
             if use_rb and self.mf_gs_response_block_rows != 64:
                 raise ValueError("mf_gs_response_block_rows must be 64 or 0")
             incremental_rows = 0
+            # The incremental kernel loads the whole row prefix and pools each
+            # friction pair's ring of normal loads, so it serves patch friction.
             if (
                 not use_rb
                 and self.mf_gs_incremental_rows > 0
-                and self._point_contact_paths
+                and self._law_agnostic_contact_paths
                 and self.friction_mode == "current"
                 and not self.fuse_joint_velocity_limits
                 and not self._paired_factor_coordinates

@@ -9,7 +9,16 @@ import unittest
 import numpy as np
 import warp as wp
 
+import newton
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_mf_gs_incremental_kernel
+from newton.solvers import SolverFeatherPGS
+from newton.tests import test_feather_pgs_sparse_solver as sparse_tests
+from newton.tests import test_feather_pgs_sparse_split as split_tests
+from newton.tests.feather_pgs_patch_parity import (
+    assert_history_close,
+    assert_ring_coulomb,
+    contact_rows,
+)
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "Incremental native solve requires CUDA")
@@ -95,6 +104,65 @@ class TestFeatherPGSIncremental(unittest.TestCase):
                         np.testing.assert_allclose(
                             values["world_impulses"].numpy()[0], expected, rtol=1.0e-6, atol=1.0e-7
                         )
+
+
+def _patch_case(model, incremental_rows):
+    """Solve dense matrix-free rows under patch friction, optionally through the incremental kernel."""
+    solver = SolverFeatherPGS(
+        model,
+        pgs_mode="matrix_free",
+        pgs_iterations=8,
+        enable_joint_limits=True,
+        friction_anchor_beta=0.2,
+        sparse_mass_matrix="off",
+        cached_dynamics="off",
+        mf_gs_incremental_rows=incremental_rows,
+        dense_max_constraints=32,
+        double_buffer=False,
+        update_mass_matrix_interval=2,
+    )
+    state, out, control = model.state(), model.state(), model.control()
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=32)
+    return model, solver, state, out, control, pipeline, pipeline.contacts()
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "Incremental native solve requires CUDA")
+class TestFeatherPGSIncrementalPatch(unittest.TestCase):
+    def test_patch_rows_match_the_ordinary_sweep(self):
+        """Solve linked patch rows through the incremental kernel as the ordinary matrix-free sweep does."""
+        for name, build in (
+            ("box_foot", lambda: split_tests._model(foot="box")),
+            ("tripod", sparse_tests._build_model),
+        ):
+            with self.subTest(fixture=name):
+                model = build()
+                reference, candidate = _patch_case(model, 0), _patch_case(model, 32)
+                self.assertEqual(reference[1]._incremental_rows, 0)
+                self.assertEqual(candidate[1]._incremental_rows, 32)
+                self.assertTrue(candidate[1]._pgs_solve_mf_gs_incremental_kernels)
+                linked = carried = False
+                for _ in range(12):
+                    for case in (reference, candidate):
+                        split_tests._step(case)
+                    # Only float order differs; it compounds through the rollout like other route changes.
+                    sparse_tests.TestFeatherPGSSparseSolver.assert_states_close(self, reference[2], candidate[2])
+                    for world, count in enumerate(reference[1].constraint_count.numpy()):
+                        np.testing.assert_allclose(
+                            candidate[1].impulses.numpy()[world, :count],
+                            reference[1].impulses.numpy()[world, :count],
+                            atol=2e-5,
+                            rtol=7e-4,
+                        )
+                    for case in (reference, candidate):
+                        assert_ring_coulomb(case[1])
+                    assert_history_close(reference[1], candidate[1])
+                    rows = contact_rows(candidate[1], candidate[-1])
+                    linked |= any(record["parents"][0] not in (-1, c) for c, record in rows.items())
+                    carried |= bool(candidate[1]._friction_patches.previous.valid.numpy().any())
+                self.assertTrue(carried, "Anchors must carry history between steps")
+                if name == "box_foot":
+                    self.assertTrue(linked, "A box foot must link several normals in one ring")
 
 
 if __name__ == "__main__":

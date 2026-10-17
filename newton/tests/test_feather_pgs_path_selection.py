@@ -405,7 +405,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             ({"grouped_dynamics": True}, {}),
             ({"grouped_dynamics": True, "sparse_mass_matrix": "off", "friction_anchor_beta": 0.0}, {}),
             ({"enable_joint_velocity_limits": True}, {}),
-            # Patch friction builds no matrix-free tier, whatever the requested budget.
+            # Patch friction builds no parallel tier, whatever the requested budget.
             ({"sparse_mass_matrix": "off", "mf_gs_parallel_rows": 48}, {"free_count": 2}),
             ({"sparse_mass_matrix": "off", "pgs_schedule": "physx_grasp", "friction_anchor_beta": 0.0}, {}),
         )
