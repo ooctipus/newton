@@ -114,6 +114,7 @@ def _prepare(
     articulation_pair_gap_gate: float,
     friction_gap: float,
     friction_articulation_pairs_only: int,
+    key_stride: int,
     frame: _PatchFrame,
     patches: FrictionPatches,
 ):
@@ -190,7 +191,9 @@ def _prepare(
         sa = sb
         sb = t
         n = -n
-    frame.keys[c] = (wp.int64(ka) << wp.int64(32)) | wp.int64(kb)
+    # ka and kb are below key_stride, so the key orders pairs as (ka, kb) does
+    # and occupies only the low bits that build() sorts.
+    frame.keys[c] = wp.int64(ka) * wp.int64(key_stride) + wp.int64(kb)
     frame.body_a[c] = a
     frame.body_b[c] = b
     frame.shape_a[c] = sa
@@ -739,6 +742,16 @@ class _FrictionPatchState:
         self.view.point_b = wp.zeros(n, dtype=wp.vec3, device=device)
         if not enabled:
             return
+        # _prepare codes bodies as 1..body_count and static or missing shapes
+        # above them, so every code is below key_stride. A pair key then needs
+        # key_bits bits, and the sort skips the bits no key can set.
+        self.key_stride = model.body_count + model.shape_body.shape[0] + 2
+        self.key_bits = (self.key_stride * self.key_stride - 1).bit_length()
+        if self.key_bits > 62:
+            raise ValueError(
+                f"Friction patch pair keys need {self.key_bits} bits; "
+                "patch friction supports at most 2**31 - 2 bodies and shapes"
+            )
         self.body_world = model.body_world
         self.body_radius = wp.zeros(model.body_count, dtype=float, device=device)
         self.update_geometry(model)
@@ -844,6 +857,12 @@ class _FrictionPatchState:
         friction_gap=float("inf"),
         friction_articulation_pairs_only=False,
     ):
+        bodies = 0 if state.body_q is None else state.body_q.shape[0]
+        if bodies + model.shape_body.shape[0] + 2 != self.key_stride:
+            raise ValueError(
+                "Friction patch pair keys were sized for another model: "
+                f"{bodies} body poses and {model.shape_body.shape[0]} shapes"
+            )
         wp.launch(
             _prepare,
             dim=self.capacity,
@@ -868,12 +887,15 @@ class _FrictionPatchState:
                 articulation_pair_gap_gate,
                 friction_gap,
                 int(friction_articulation_pairs_only),
+                self.key_stride,
                 self.current,
                 self.view,
             ],
             device=model.device,
         )
-        wp.utils.radix_sort_pairs(self.current.keys, self.current.indices, self.capacity)
+        # Empty slots hold INT64_MAX, whose low key_bits are all ones: no pair
+        # key exceeds them, and the stable sort keeps live slots ahead of a tie.
+        wp.utils.radix_sort_pairs(self.current.keys, self.current.indices, self.capacity, end_bit=self.key_bits)
         wp.launch(
             _build,
             dim=self.capacity,
