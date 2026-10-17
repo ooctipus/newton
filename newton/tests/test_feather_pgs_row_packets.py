@@ -394,8 +394,20 @@ def _owner_solver(device, *, anchors, beta=0.0):
     )
 
 
-class TestRowPacketPatchRows(unittest.TestCase):
-    """CPU twins: the packet producers write the persistent patch rows of the general route."""
+class _PatchRowTwins:
+    """Twins: the packet producers write the persistent patch rows of the general route.
+
+    On the CPU one lane writes each contact's rows; on CUDA a warp's lanes split its coefficients.
+    """
+
+    device = "cpu"
+
+    def assert_same(self, actual, expected, err_msg=""):
+        """Require equal arrays: bitwise on the CPU, and floats to 1e-5 on CUDA, where FMA contraction may differ."""
+        if self.device == "cpu" or np.asarray(expected).dtype.kind != "f":
+            np.testing.assert_array_equal(actual, expected, err_msg=err_msg)
+        else:
+            np.testing.assert_allclose(actual, expected, rtol=1.0e-5, atol=1.0e-5, err_msg=err_msg)
 
     def test_patch_rows_match_the_general_route(self):
         """Write every patch row field and Jacobian of the general route, then link the same rings.
@@ -407,7 +419,7 @@ class TestRowPacketPatchRows(unittest.TestCase):
         beta = 0.35
         for shared, friction_shared in ((0, 0), (0, 1), (1, 0), (1, 1)):
             with self.subTest(shared=shared, friction_shared=friction_shared):
-                data, layout = _patch_fixture(shared=shared, friction_shared=friction_shared)
+                data, layout = _patch_fixture(self.device, shared=shared, friction_shared=friction_shared)
                 general, jacobians, bias = _run_general(data, layout, beta)
                 packet = _packet(layout.device)
                 _launch(rp.produce_patch_contacts, data, layout, _law(layout.view, beta), packet, PRIMARY, SECONDARY)
@@ -425,7 +437,7 @@ class TestRowPacketPatchRows(unittest.TestCase):
                 self.assertTrue(np.all(rhs[bounced] != bias[bounced]), "Bouncing rows must leave the bias")
                 reference[bounced] = rhs[bounced]
                 for name in _ROW_OUTPUTS:
-                    np.testing.assert_array_equal(getattr(data, name).numpy(), expected[name], err_msg=name)
+                    self.assert_same(getattr(data, name).numpy(), expected[name], err_msg=name)
                 groups = layout.groups.numpy()
                 jacobian = np.full((WORLDS, PACKETS, PRIMARY + SECONDARY), np.nan, dtype=np.float32)
                 row_contact = np.full((WORLDS, PACKETS), -1, dtype=np.int32)
@@ -434,8 +446,8 @@ class TestRowPacketPatchRows(unittest.TestCase):
                         row_contact[w, row] = 3 * c + row - first
                         jacobian[w, row, :PRIMARY] = jacobians[PRIMARY].numpy()[groups[2 * w], row]
                         jacobian[w, row, PRIMARY:] = jacobians[SECONDARY].numpy()[groups[2 * w + 1], row]
-                np.testing.assert_array_equal(packet.row_contact.numpy(), row_contact)
-                np.testing.assert_array_equal(packet.jacobian.numpy(), jacobian)
+                self.assert_same(packet.row_contact.numpy(), row_contact)
+                self.assert_same(packet.jacobian.numpy(), jacobian)
                 # The fixture bounces, holds anchors with and without tangent rows and overflows the packets.
                 weight = layout.view.weight.numpy()
                 contacts = list(_contact_rows(data))
@@ -447,7 +459,7 @@ class TestRowPacketPatchRows(unittest.TestCase):
                 _link(data, layout, data)
                 _link(data, layout, general)
                 for name in ("row_parent", "row_mu"):
-                    np.testing.assert_array_equal(getattr(data, name).numpy(), getattr(general, name).numpy(), name)
+                    self.assert_same(getattr(data, name).numpy(), getattr(general, name).numpy(), name)
                 parents = data.row_parent.numpy()
                 linked = [parents[w, first] for c, w, first, count in contacts if count == 1]
                 self.assertTrue(any(parent >= 0 for parent in linked), "A normal-only unit must join a ring")
@@ -459,7 +471,7 @@ class TestRowPacketPatchRows(unittest.TestCase):
         cleared zeros, and a locally owned world's rows stay stale.
         """
         for shared, friction_shared in ((0, 0), (1, 1)):
-            data, layout = _patch_fixture(shared=shared, friction_shared=friction_shared)
+            data, layout = _patch_fixture(self.device, shared=shared, friction_shared=friction_shared)
             _, jacobians, _ = _run_general(data, layout, 0.35)
             law, groups = _law(layout.view), layout.groups.numpy()
             # The second world is locally owned, or every world falls back to the general response.
@@ -475,7 +487,7 @@ class TestRowPacketPatchRows(unittest.TestCase):
                             values[group] = expected[group] = np.nan
                         J = wp.array(values, dtype=float, device=layout.device)
                         _launch(rp.materialize_patch_fallback, data, layout, law, owner, size, layout.groups, J)
-                        np.testing.assert_array_equal(J.numpy(), expected, err_msg=f"size {size}")
+                        self.assert_same(J.numpy(), expected, err_msg=f"size {size}")
 
     def test_patch_tangent_rows_replace_the_point_law(self):
         """Keep the point law's normal rows and move only the tangent rows to the patch law.
@@ -486,8 +498,8 @@ class TestRowPacketPatchRows(unittest.TestCase):
         the point producer's ``x / dt``.
         """
         beta = 0.35
-        data, layout = _patch_fixture()
-        point, _ = _patch_fixture()
+        data, layout = _patch_fixture(self.device)
+        point, _ = _patch_fixture(self.device)
         packet, point_packet = _packet(layout.device), _packet(layout.device)
         _launch(rp.produce_patch_contacts, data, layout, _law(layout.view, beta), packet, PRIMARY, SECONDARY)
         _launch(rp.produce_contacts, point, layout, point_packet, PRIMARY, SECONDARY)
@@ -495,16 +507,14 @@ class TestRowPacketPatchRows(unittest.TestCase):
         moved = 0.0
         for c, w, first, count in _contact_rows(data):
             for name in ("row_type", "row_parent", "row_mu", "row_beta", "row_cfm", "phi", "target", "restitution"):
-                np.testing.assert_array_equal(
+                self.assert_same(
                     getattr(data, name).numpy()[w, first], getattr(point, name).numpy()[w, first], f"contact {c}"
                 )
             np.testing.assert_allclose(
                 data.rhs.numpy()[w, first], point.rhs.numpy()[w, first], rtol=1.0e-6, atol=1.0e-6
             )
             if first < PACKETS:
-                np.testing.assert_array_equal(
-                    packet.jacobian.numpy()[w, first], point_packet.jacobian.numpy()[w, first]
-                )
+                self.assert_same(packet.jacobian.numpy()[w, first], point_packet.jacobian.numpy()[w, first])
             if count != 3:
                 continue
             tangents = slice(first + 1, first + 3)
@@ -522,6 +532,10 @@ class TestRowPacketPatchRows(unittest.TestCase):
                 difference = packet.jacobian.numpy()[w, tangents] - point_packet.jacobian.numpy()[w, tangents]
                 moved = max(moved, float(np.max(np.abs(difference))))
         self.assertGreater(moved, 1.0e-3, "Tangent rows must act at the patch friction location")
+
+
+class TestRowPacketPatchRows(_PatchRowTwins, unittest.TestCase):
+    """CPU twins, and the owner's choice of the friction law."""
 
     def test_owner_launches_the_friction_law_it_was_built_with(self):
         """Launch the patch producer and fallback exactly under anchors, with the solver's patch view and beta.
@@ -569,6 +583,13 @@ class TestRowPacketPatchRows(unittest.TestCase):
                             self.assertEqual(law.patches.enabled, 1)
                             for name in ("weight", "next_contact", "point_a", "point_b", "phi"):
                                 self.assertIs(getattr(law.patches, name), getattr(view, name), name)
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "The packet producers split each contact over a warp on CUDA")
+class TestRowPacketPatchRowsCUDA(_PatchRowTwins, unittest.TestCase):
+    """The twins on CUDA, where a contact's coefficients are split over a warp's lanes."""
+
+    device = "cuda:0"
 
 
 # Drive each arm's capsule into the side of its box from contact. The arm-box rows are the dense patch
