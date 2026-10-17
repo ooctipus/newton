@@ -706,8 +706,7 @@ def _friction(solver) -> dict:
         reason += (
             " Point-contact owners (local packets, keyed rows, compact contacts, matrix-free tiers and response"
             " blocks, the resolved-world classifier, the dense-route held-tree cache, the research sparse factor,"
-            " multiblock sweeps, sparse split and velocity-limit factors, sparse active rows and triplets) need"
-            " point friction."
+            " multiblock sweeps, sparse velocity-limit factors, sparse active rows and triplets) need point friction."
         )
     return {
         "law": "patch" if patch else "point",

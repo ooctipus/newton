@@ -5059,14 +5059,13 @@ class SolverFeatherPGS(SolverBase):
             self._sparse_selection_reason = "An explicit dense kernel choice owns factor and response construction."
             return
         # Reuse the factor representation without changing split's row law or
-        # state-cache lifecycle. Nonzero seeds need a factor-delta initialization
-        # that this cold owner deliberately does not provide.
+        # state-cache lifecycle. The full ordered sweep pools linked patch normal
+        # loads; carried impulses seed the factor delta (warm_start).
         split_candidate = (
             self.pgs_mode == "split"
             and (sparse_choice == "on" or os.environ.get("FEATHER_PGS_SPARSE_SPLIT", "1") == "1")
             and self.pgs_kernel == "tiled_row"
             and not self._has_free_rigid_bodies
-            and not self._friction_anchors_enabled
             and self._kernel_overrides.get("sparse_prepare_contacts", True)
         )
         velocity_candidate = (
@@ -10235,7 +10234,7 @@ class SolverFeatherPGS(SolverBase):
             or self.enable_joint_velocity_limits != self._sparse_velocity_limits
             or self._contact_torsion_enabled
             or self.contact_compliance
-            or (self._sparse_split and (self.pgs_kernel != "tiled_row" or self._friction_anchors_enabled))
+            or (self._sparse_split and self.pgs_kernel != "tiled_row")
             or (self._sparse_velocity_limits and self._friction_anchors_enabled)
         ):
             raise RuntimeError("Reconstruct the solver after changing options incompatible with sparse mass factors")

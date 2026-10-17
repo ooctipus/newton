@@ -13,13 +13,18 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
-from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_LIMIT as LIMIT
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_tiled_row_kernel
 from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_contact_triplets as triplet_tests
 from newton.tests import test_feather_pgs_sparse_solver as sparse_tests
+from newton.tests.feather_pgs_patch_parity import (
+    assert_history_close,
+    assert_ring_coulomb,
+    assert_rows_close,
+    contact_rows,
+)
 from newton.tests.test_feather_pgs_sparse_pgs import _sweep
 from newton.tests.test_feather_pgs_sparse_research_admission import _eligible_solver, _TopologyReached
 
@@ -34,8 +39,13 @@ def _probe():
     return solver
 
 
-def _model(*, floating=True, branches=3, depth=1, device="cuda:0"):
-    """Build branched floating or fixed trees with a single contacting foot."""
+def _model(*, floating=True, branches=3, depth=1, foot="sphere", device="cuda:0"):
+    """Build branched floating or fixed trees with one contacting foot.
+
+    A sphere foot touches the ground at one point. A box foot touches it at
+    several, so patch friction links their normals in one ring and divides
+    the friction budget between its anchors.
+    """
     scene = newton.ModelBuilder()
     root = scene.add_link(
         xform=wp.transform(wp.vec3(0.0, 0.0, 0.16), wp.quat_identity()),
@@ -72,12 +82,11 @@ def _model(*, floating=True, branches=3, depth=1, device="cuda:0"):
             if branch == 0 and level == depth - 1:
                 cfg = scene.default_shape_cfg.copy()
                 cfg.density, cfg.mu, cfg.restitution = 0.0, 0.6, 0.4
-                scene.add_shape_sphere(
-                    child,
-                    xform=wp.transform(wp.vec3(0.02, 0.0, 0.0), wp.quat_identity()),
-                    radius=0.055,
-                    cfg=cfg,
-                )
+                xform = wp.transform(wp.vec3(0.02, 0.0, 0.0), wp.quat_identity())
+                if foot == "box":
+                    scene.add_shape_box(child, xform=xform, hx=0.04, hy=0.04, hz=0.055, cfg=cfg)
+                else:
+                    scene.add_shape_sphere(child, xform=xform, radius=0.055, cfg=cfg)
             parent = child
     scene.add_articulation(joints)
     scene.joint_q[7 if floating else 0] = 0.23
@@ -123,13 +132,14 @@ def _solver(model, enabled, **overrides):
         return SolverFeatherPGS(model, **options)
 
 
-def _case(enabled, **shape):
+def _case(enabled, *, options=None, contact_matching=None, **shape):
     model = _model(**shape)
-    solver = _solver(model, enabled)
+    solver = _solver(model, enabled, **(options or {}))
     state, out, control = model.state(), model.state(), model.control()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     control.joint_f.assign(np.linspace(-0.08, 0.11, model.joint_dof_count, dtype=np.float32))
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=32)
+    matching = {} if contact_matching is None else {"contact_matching": contact_matching}
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=32, **matching)
     return model, solver, state, out, control, pipeline, pipeline.contacts()
 
 
@@ -151,24 +161,25 @@ def _step(case):
 
 class TestSparseSplitAdmission(unittest.TestCase):
     def test_auto_and_opt_in_reach_topology_without_changing_mode(self):
-        """Admit the split recipe before choosing its topology-derived representation."""
-        solver = _probe()
+        """Admit the split recipe under either friction law before choosing its topology-derived representation."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        for environment in ({}, {"FEATHER_PGS_SPARSE_SPLIT": "1"}):
-            with (
-                self.subTest(environment=environment),
-                mock.patch.dict(os.environ, environment, clear=True),
-                self.assertRaises(_TopologyReached),
-            ):
-                SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-        self.assertEqual(solver.pgs_mode, "split")
+        for patches in (False, True):
+            solver = _probe()
+            solver._friction_anchors_enabled = patches
+            for environment in ({}, {"FEATHER_PGS_SPARSE_SPLIT": "1"}):
+                with (
+                    self.subTest(patches=patches, environment=environment),
+                    mock.patch.dict(os.environ, environment, clear=True),
+                    self.assertRaises(_TopologyReached),
+                ):
+                    SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+            self.assertEqual(solver.pgs_mode, "split")
 
     def test_default_and_unsupported_recipes_keep_dense_storage(self):
-        """Preserve seeded, alternate-law and mixed-response owners before allocation."""
+        """Preserve alternate-law and mixed-response owners before allocation."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
         cases = (
             ("default", {}, "0"),
-            ("patches", {"_friction_anchors_enabled": True}, "1"),
             ("velocity_limits", {"enable_joint_velocity_limits": True}, "1"),
             ("free_response", {"_has_free_rigid_bodies": True}, "1"),
             ("alternate_kernel", {"pgs_kernel": "loop"}, "1"),
@@ -239,14 +250,10 @@ class TestSparseSplitPhysics(unittest.TestCase):
             )
             np.testing.assert_allclose(residual, expected_residual, atol=5e-5, rtol=5e-4)
             impulse = new.impulses.numpy()[world, :count]
-            kinds, parents, mu = (
-                getattr(new, name).numpy()[world, :count] for name in ("row_type", "row_parent", "row_mu")
-            )
+            kinds = new.row_type.numpy()[world, :count]
             self.assertTrue(np.all(impulse[(kinds == CONTACT) | (kinds == LIMIT)] >= -1e-7))
-            for row in np.flatnonzero(kinds == FRICTION):
-                parent = int(parents[row])
-                if row == parent + 1:
-                    self.assertLessEqual(np.linalg.norm(impulse[row : row + 2]), mu[row] * impulse[parent] + 2e-5)
+        # Patch friction pools the normal load of each linked ring; point rows have no ring.
+        assert_ring_coulomb(new)
 
     def test_branched_floating_and_fixed_physical_step(self):
         """Preserve eight ordered sweeps, restitution, drives and external forces."""
@@ -367,12 +374,12 @@ class TestSparseSplitPhysics(unittest.TestCase):
                     np.testing.assert_array_equal(getattr(owner.data, name).numpy(), values)
 
     def test_unsupported_actual_models_and_seeded_modes_fall_back(self):
-        """Keep dense allocation for mixed and prescribed recipes; carried impulses are admitted."""
+        """Keep dense allocation for mixed and prescribed recipes; patch friction and carried impulses are admitted."""
         model = _model()
         solver = _solver(model, True, friction_anchor_beta=0.2)
-        self.assertFalse(solver._sparse_split)
-        self.assertIsNone(solver._sparse_mass_matrix_size)
-        self.assertIsNotNone(solver.C)
+        self.assertTrue(solver._sparse_split)
+        self.assertIsNotNone(solver._sparse_mass_matrix_size)
+        self.assertIsNone(solver.C)
         self.assertEqual(solver.pgs_mode, "split")
         # Warm start seeds the sparse factor delta from the carried impulses (no free bodies here).
         warm = _solver(model, True, pgs_warmstart=True)
@@ -460,6 +467,80 @@ class TestSparseSplitPhysics(unittest.TestCase):
                 np.testing.assert_allclose(impulses[0, :count], expected_impulse, atol=3e-5, rtol=3e-4)
                 if activity == "deferred_activation" and iterations == 1:
                     self.assertGreater(impulses[0, 3], 0.0)
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
+class TestSparseSplitPatchPhysics(unittest.TestCase):
+    """Run persistent patch friction (friction_anchor_beta=0.2) through dense and sparse split rows."""
+
+    def _pair(self, **options):
+        shape = {name: options.pop(name) for name in ("floating", "branches", "depth", "foot") if name in options}
+        matching = options.pop("contact_matching", None)
+        options["friction_anchor_beta"] = 0.2
+        dense, sparse = (
+            _case(enabled, options=options, contact_matching=matching, **shape) for enabled in (False, True)
+        )
+        self.assertFalse(dense[1]._sparse_split)
+        self.assertTrue(sparse[1]._sparse_split)
+        for case in (dense, sparse):
+            self.assertTrue(case[1]._friction_anchors_enabled)
+        return dense, sparse
+
+    def _assert_patch(self, dense, sparse):
+        """Match states, patch rows by contact, the pooled Coulomb bound and the anchor lifecycle."""
+        TestSparseSplitPhysics._assert_state(self, dense, sparse)
+        rows = contact_rows(dense[1], dense[-1])
+        assert_rows_close(rows, contact_rows(sparse[1], sparse[-1], incident=True))
+        for case in (dense, sparse):
+            assert_ring_coulomb(case[1])
+        assert_history_close(dense[1], sparse[1])
+        return rows
+
+    def test_patch_steps_and_masked_resets(self):
+        """Keep patch rows, divided mu, ring links and anchor history over 24 steps with masked resets."""
+        for shape in (
+            {"floating": True, "branches": 3, "depth": 1},
+            {"floating": False, "branches": 2, "depth": 2},
+            {"floating": True, "branches": 3, "depth": 1, "foot": "box"},
+        ):
+            with self.subTest(shape=shape):
+                dense, sparse = self._pair(**shape)
+                linked = carried = False
+                for index in range(24):
+                    for case in (dense, sparse):
+                        if index in (5, 13, 19):
+                            mask = wp.array([index != 13, index != 5], dtype=wp.bool, device=case[0].device)
+                            case[1].reset(case[2], world_mask=mask)
+                        _step(case)
+                    rows = self._assert_patch(dense, sparse)
+                    linked |= any(record["parents"][0] not in (-1, c) for c, record in rows.items())
+                    carried |= bool(sparse[1]._friction_patches.previous.valid.numpy().any())
+                self.assertTrue(carried, "Anchors must carry history between steps")
+                if shape.get("foot") == "box":
+                    self.assertTrue(linked, "A box foot must link several normals in one ring")
+
+    def test_warm_start_seeds_patch_impulses(self):
+        """Seed carried patch impulses through the sparse factor delta as dense split rows do."""
+        dense, sparse = self._pair(foot="box", pgs_warmstart=True, contact_matching="latest")
+        self.assertTrue(sparse[1]._pgs_solve_sparse_kernel.key.endswith("_warm_start"))
+        for _ in range(8):
+            for case in (dense, sparse):
+                _step(case)
+            self._assert_patch(dense, sparse)
+
+    def test_graph_replay(self):
+        """Replay captured sparse patch steps against eager dense split steps."""
+        dense, sparse = self._pair(foot="box")
+        for case in (dense, sparse):
+            _step(case)
+        with wp.ScopedCapture("cuda:0") as capture:
+            _step(sparse)
+            _step(sparse)
+        for _ in range(4):
+            _step(dense)
+            _step(dense)
+            wp.capture_launch(capture.graph)
+            self._assert_patch(dense, sparse)
 
 
 if __name__ == "__main__":
