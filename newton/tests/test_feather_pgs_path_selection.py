@@ -23,6 +23,7 @@ from newton.tests.feather_pgs_patch_parity import (
     assert_anchor_sites_close,
     assert_history_matches_rows,
     assert_loaded_anchors,
+    assert_patch_impulses_close,
     assert_patch_rows_close,
     assert_region_impulses_close,
     assert_ring_coulomb,
@@ -35,6 +36,16 @@ from newton.tests.unittest_utils import assert_host_only
 
 STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
 PATCH_DT = 1.0 / 400.0
+# The first step of the cached patch route against the ordinary route, from one state. The owner's forward
+# kinematics writes the input poses a few float32 ulps from the ordinary FK, and the resting feet's 1/dt
+# position gain turns that into joint velocity and contact impulse. Per ulp of every input pose component
+# (CPU split stand-in, 32 iterations, 32 sign draws, linear up to 4 ulps): joint coordinates 2.8e-7, joint
+# velocity 1.2e-4, per-contact normal impulse 1.2e-4, region normal load 1.4e-4, region friction 1.5e-5. The
+# bounds admit six to eight ulps, as the step's 2e-6 pose bound admits seven, and stay below the step's own
+# joint velocity (1.5e-3), so a route that publishes stale velocities fails; re-measure on CUDA.
+FIRST_STEP_VELOCITY_ATOL = 7.5e-4
+FIRST_STEP_IMPULSE_ATOL = 1.0e-3
+FIRST_STEP_REGION_BOUNDS = {"load_atol": 1.0e-3, "friction_atol": 1.0e-4}
 
 
 def _cpu_model():
@@ -730,11 +741,16 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         route's release test reads, and publishes, forward kinematics of its
         integrated state. The owner's own forward kinematics rewrites the input
         poses by a few ulps, which the resting feet's 1/dt position gain turns
-        into 1e-4 of contact impulse and velocity, so impulses compare as region
-        sums. Through graph replay and a partial reset, the routes then keep the
-        same stored anchors, each tied to its own solved rows: the standing
-        fixture's per-anchor impulses are not determined (its contact rows
-        outnumber its degrees of freedom), so they do not compare across routes.
+        into about 1e-4 of contact impulse and velocity per ulp, so the step's
+        impulses and twists compare within the FIRST_STEP bounds. Every link of
+        the standing fixture has its center of mass at its origin, so these
+        checks cannot see a center-of-mass twist convention error; the tools
+        TestPatchMixedTreeSteps (public-state oracle, offset centers of mass)
+        and the mixed-tree free-body tests cover the owner's convention.
+        Through graph replay and a partial reset, the routes then keep the same
+        stored anchors, each tied to its own solved rows: the standing fixture's
+        per-anchor impulses are not determined (its contact rows outnumber its
+        degrees of freedom), so they do not compare across routes.
         """
         model = standing_model()
         # Without the owner this is the ordinary patch route: the incremental tier, which also serves
@@ -766,7 +782,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             for solver, contacts in ((ordinary, ordinary_contacts), (cached, cached_contacts))
         ]
         assert_patch_rows_close(*rows)
-        assert_region_impulses_close(*rows, **STANDING_REGION_BOUNDS)
+        assert_patch_impulses_close(*rows, atol=FIRST_STEP_IMPULSE_ATOL, rtol=0.0)
+        assert_region_impulses_close(*rows, **FIRST_STEP_REGION_BOUNDS)
         for name in ("joint_q", "body_q"):
             np.testing.assert_allclose(
                 getattr(cached_output, name).numpy(),
@@ -775,7 +792,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 atol=2e-6,
                 err_msg=name,
             )
-        assert_states_close(ordinary_output, cached_output, velocity_atol=2e-3)
+        assert_states_close(ordinary_output, cached_output, velocity_atol=FIRST_STEP_VELOCITY_ATOL)
 
         def reset_restarts_world_0(solver, contacts):
             assert_loaded_anchors(solver, contacts, reset_worlds=(0,))
@@ -796,7 +813,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             assert_loaded_anchors(solver, contacts)
             self.assertGreater(assert_ring_coulomb(solver), 0)
             self.assertGreater(assert_history_matches_rows(solver, contacts), 0)
-        # One float32 ulp of a foot's pose moves joint velocity by up to 6.6e-4 over this schedule.
+        # Poses that drift by one float32 ulp per step move joint velocity by up to 8.7e-4 over this schedule
+        # (CPU split stand-in, 32 seeds).
         assert_states_close(runs[0][2], runs[1][2], velocity_atol=2e-3)
         assert_region_impulses_close(
             *(patch_rows(solver, contacts, PATCH_DT) for solver, contacts, _ in runs), **STANDING_REGION_BOUNDS
