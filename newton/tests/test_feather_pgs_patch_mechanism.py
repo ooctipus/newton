@@ -609,6 +609,16 @@ class TestPatchSortKeys(unittest.TestCase):
                     assert_empty_tail(patches, f"step {step} store")
                 self.assertGreater(carried, 0, "the frames must carry anchor history")
 
+    def test_key_stride_fits_a_kernel_int(self):
+        """Admit pair-key strides up to the largest 32-bit int, the type _prepare receives them as."""
+        self.assertEqual(friction_patches._pair_key_layout(12, 18), (32, 10))
+        self.assertEqual(friction_patches._pair_key_layout(2**31 - 3, 0), (2**31 - 1, 62))
+        self.assertEqual(friction_patches._pair_key_layout(2**30, 2**30 - 3), (2**31 - 1, 62))
+        for bodies, shapes in ((2**31 - 2, 0), (0, 2**31 - 2), (2**31, 2**31)):
+            with self.subTest(bodies=bodies, shapes=shapes):
+                with self.assertRaisesRegex(ValueError, r"at most 2\*\*31 - 3 bodies and shapes"):
+                    friction_patches._pair_key_layout(bodies, shapes)
+
     def test_shapeless_pair_ties_the_sentinel_bits(self):
         """Keep a pair whose key equals the sentinel's sorted bits ahead of the empty slots."""
         scene = _Scene("cpu", 5, worlds=1, bodies=4, contacts=16)

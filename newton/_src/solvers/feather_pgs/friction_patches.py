@@ -977,6 +977,21 @@ def _invalidate_geometry_history(prev: _PatchFrame, bodies: wp.array[int], shape
         prev.valid[c] = 0
 
 
+def _pair_key_layout(bodies, shapes):
+    """Return the pair key stride and the number of bits a pair key occupies.
+
+    _prepare codes bodies as 1..bodies and static or missing shapes above them,
+    so every code is below the stride. The stride reaches _prepare as a 32-bit
+    int, which bounds it and keeps pair keys below 2**62.
+    """
+    stride = bodies + shapes + 2
+    if stride > 2**31 - 1:
+        raise ValueError(
+            f"Patch friction supports at most 2**31 - 3 bodies and shapes, got {bodies} bodies and {shapes} shapes"
+        )
+    return stride, (stride * stride - 1).bit_length()
+
+
 class _FrictionPatchState:
     """Own preallocated patch frames; never read device counters on the host."""
 
@@ -994,16 +1009,8 @@ class _FrictionPatchState:
         if not enabled:
             return
         self.device = device
-        # _prepare codes bodies as 1..body_count and static or missing shapes
-        # above them, so every code is below key_stride. A pair key then needs
-        # key_bits bits, and the sort skips the bits no key can set.
-        self.key_stride = model.body_count + model.shape_body.shape[0] + 2
-        self.key_bits = (self.key_stride * self.key_stride - 1).bit_length()
-        if self.key_bits > 62:
-            raise ValueError(
-                f"Friction patch pair keys need {self.key_bits} bits; "
-                "patch friction supports at most 2**31 - 2 bodies and shapes"
-            )
+        # The pair sort skips the key bits no pair key can set.
+        self.key_stride, self.key_bits = _pair_key_layout(model.body_count, model.shape_body.shape[0])
         self.body_world = model.body_world
         self.body_radius = wp.zeros(model.body_count, dtype=float, device=device)
         self.update_geometry(model)
