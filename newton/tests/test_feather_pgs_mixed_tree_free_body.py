@@ -237,7 +237,9 @@ def _rollout(
             **(attrs or {}),
         )
     state_owner = getattr(solver, "_tree_kinetic_state", None)
-    pipeline = newton.CollisionPipeline(model)
+    # Patch rollouts compare anchor history by contact index (assert_history_close), so they sort contacts:
+    # both arms then see one contact order whatever the narrow phase's thread scheduling.
+    pipeline = newton.CollisionPipeline(model, deterministic=friction_anchor_beta > 0.0)
     contacts = pipeline.contacts()
     states = [model.state() for _ in range(2)]
     newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
@@ -290,6 +292,11 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
 
         ``loaded``: resting boxes hold sticking anchors at the end, so the
         compared history is populated. The cabinet scene has no patch contact.
+        The history compares by contact index, which is why patch rollouts sort
+        their contacts. Rounding of the box's corner positions picks the
+        diagonal that carries its anchors: rounding-level differences keep it
+        (TestFeatherPGSMixedTreePatchFixture), but a box yaw of 1e-6 rad moves
+        it on CPU, changing validity bits while the twists still agree.
         """
         self.assertEqual(owner_solver._friction_anchors_enabled, plain_solver._friction_anchors_enabled)
         if not plain_solver._friction_anchors_enabled:
