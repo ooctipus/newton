@@ -522,17 +522,26 @@ def install_contacts(model, state, contacts):
     contacts.rigid_contact_count.assign(np.array([6], dtype=np.int32))
 
 
-def install_patch_contacts(model, state, contacts, *, margin=0.02):
-    """Contacts that the patch builder links into rings, held at a loaded depth during short steps.
+def install_patch_contacts(model, state, contacts):
+    """Contacts that the patch builder links into rings, held during short steps.
 
     Per world, each star sphere rests on a static support at three contacts in a row: the outer two
     become the ring's anchors (three-row units) and the middle one a normal-only unit. A two-contact
     ring couples the first star sphere to the chain's last sphere, which keeps that sphere's
-    coordinate out of the independent schedule. ``margin`` sets every contact's depth.
+    coordinate out of the independent schedule.
+
+    The stars slide along z only, so a level support's tangent rows have no Jacobian. The first star's
+    support is tilted by 30 degrees and its contacts start 1 mm deep: the depth's correction slides the
+    star, its friction reaches the pooled load of a ring whose normal-only unit carries load, and its
+    anchors gain tangential phi. The second star rests on a level support at zero depth, where gravity
+    keeps its anchors loaded and their history held. Deeper contacts would lift the stars off within a
+    step. Only the second world's stars start inside their limits and stay supported.
     """
     shape_body = model.shape_body.numpy()
     poses = state.body_q.numpy().astype(np.float64)
     radius = 0.01
+    down = np.array((0.0, 0.0, -1.0))
+    tilted = np.array((-0.5, 0.0, -np.sqrt(0.75)))
 
     def local(shape, point):
         if shape < 0:
@@ -545,25 +554,67 @@ def install_patch_contacts(model, state, contacts, *, margin=0.02):
     rows = []
     for world in range(2):
         star0, star1, _, chain = 4 * world, 4 * world + 1, 4 * world + 2, 4 * world + 3
-        for shape in (star0, star1):
+        for shape, normal, depth in ((star0, tilted, 1.0e-3), (star1, down, 0.0)):
             bottom = poses[shape_body[shape], :3] - np.array((0.0, 0.0, radius))
-            rows += [(shape, -1, bottom + np.array((offset, 0.0, 0.0))) for offset in (-0.004, 0.0, 0.004)]
+            # The row runs along y, which both supports keep tangent.
+            rows += [
+                (shape, -1, bottom + np.array((0.0, offset, 0.0)), normal, depth) for offset in (-0.004, 0.0, 0.004)
+            ]
         middle = 0.5 * (poses[shape_body[star0], :3] + poses[shape_body[chain], :3])
-        rows += [(star0, chain, middle + np.array((0.0, offset, 0.0))) for offset in (-0.004, 0.004)]
+        rows += [(star0, chain, middle + np.array((0.0, offset, 0.0)), down, 0.0) for offset in (-0.004, 0.004)]
     capacity = contacts.rigid_contact_shape0.shape[0]
     shapes = np.full((2, capacity), -1, dtype=np.int32)
     points = np.zeros((2, capacity, 3), dtype=np.float32)
-    for contact, (shape0, shape1, point) in enumerate(rows):
+    normals = np.tile(down, (capacity, 1)).astype(np.float32)
+    depths = np.zeros(capacity, dtype=np.float32)
+    for contact, (shape0, shape1, point, normal, depth) in enumerate(rows):
         shapes[:, contact] = (shape0, shape1)
         points[0, contact] = local(shape0, point)
         points[1, contact] = local(shape1, point)
+        normals[contact] = normal
+        depths[contact] = depth
     for endpoint in range(2):
         getattr(contacts, f"rigid_contact_shape{endpoint}").assign(shapes[endpoint])
         getattr(contacts, f"rigid_contact_point{endpoint}").assign(points[endpoint])
-    contacts.rigid_contact_margin0.fill_(margin)
+    contacts.rigid_contact_margin0.assign(depths)
     contacts.rigid_contact_margin1.zero_()
-    contacts.rigid_contact_normal.assign(np.tile(np.array([0.0, 0.0, -1.0], np.float32), (capacity, 1)))
+    contacts.rigid_contact_normal.assign(normals)
     contacts.rigid_contact_count.assign(np.array([len(rows)], dtype=np.int32))
+
+
+def assert_patch_tangent_law(solver, contacts):
+    """Require each anchor's tangent rows to carry its patch phi and ``friction_anchor_beta``.
+
+    Returns the number of anchors checked. ``contact_rows`` keeps phi for the normal row only.
+    """
+    count = min(int(contacts.rigid_contact_count.numpy()[0]), solver.contact_slot.shape[0])
+    world, slot = solver.contact_world.numpy()[:count], solver.contact_slot.numpy()[:count]
+    path, needed = solver.contact_path.numpy()[:count], solver.contact_slots_needed.numpy()[:count]
+    phi, beta, view = solver.phi.numpy(), solver.row_beta.numpy(), solver._friction_patches.view.phi.numpy()
+    anchors = 0
+    for c in range(count):
+        if path[c] != 0 or slot[c] < 0 or needed[c] != 3:
+            continue
+        tangents = slice(int(slot[c]) + 1, int(slot[c]) + 3)
+        np.testing.assert_array_equal(phi[world[c], tangents], view[c], err_msg=f"contact {c} phi")
+        np.testing.assert_array_equal(
+            beta[world[c], tangents], np.float32(solver.friction_anchor_beta), err_msg=f"contact {c} beta"
+        )
+        anchors += 1
+    return anchors
+
+
+def ring_carries_friction(records, first):
+    """Whether contact ``first``'s patch ring, walked through ``contact_rows`` parents, holds friction."""
+    contact = first
+    for _ in range(len(records)):
+        record = records[contact]
+        if len(record["types"]) == 3 and np.any(record["impulses"][1:] != 0.0):
+            return True
+        contact = int(record["parents"][0])
+        if contact < 0 or contact == first:
+            return False
+    return False
 
 
 class TestCompactContact(unittest.TestCase):
@@ -972,7 +1023,7 @@ class TestCompactContact(unittest.TestCase):
                 state = states[index][0]
                 newton.eval_fk(model, state.joint_q, state.joint_qd, state)
                 install_patch_contacts(model, state, contacts[index])
-            linked = False
+            linked = pooled = False
             independent = [False] * len(solvers)
             serial = [False] * len(solvers)
             for _step in range(6):
@@ -996,12 +1047,19 @@ class TestCompactContact(unittest.TestCase):
                 for index, solver in enumerate(solvers):
                     solver.check_constraint_capacity()
                     assert_ring_coulomb(solver)
+                    self.assertGreater(assert_patch_tangent_law(solver, contacts[index]), 0)
                     independent[index] |= bool(np.any(solver._sparse_contact_group_count.numpy() > 0))
                     serial[index] |= bool(np.any(solver._sparse_contact_serial_count.numpy() > 0))
                 linked |= any(len(record["types"]) == 1 and record["parents"][0] >= 0 for record in reference.values())
+                pooled |= any(
+                    ring_carries_friction(reference, c)
+                    for c, record in reference.items()
+                    if len(record["types"]) == 1 and record["impulses"][0] > 0.0
+                )
             self.assertTrue(linked, "A normal-only unit must link into a patch ring")
-            # In every arm the second star's support ring schedules independently; the coupled ring keeps the
-            # first star's support ring serial, in speculative batches.
+            self.assertTrue(pooled, "A loaded normal-only unit must share a ring that carries friction")
+            # In every arm the level support's ring schedules independently; the coupled ring keeps the tilted
+            # support's ring serial, in speculative batches.
             self.assertEqual(independent, [True] * len(solvers), "A patch ring must schedule independently")
             self.assertEqual(serial, [True] * len(solvers), "Patch rings on a coupled coordinate must stay serial")
             self.assertTrue(solvers[0]._friction_patches.previous.valid.numpy().any(), "Anchors must carry history")
