@@ -68,7 +68,7 @@ def _jacobian(solver, route, world, count):
     )
 
 
-def contact_rows(solver, contacts, route=0, *, incident=False, jacobian=False):
+def contact_rows(solver, contacts, route=0, *, incident=False, jacobian=False, every_row=False):
     """Return each routed contact's rows keyed by its contact index.
 
     Each record holds the contact's row types; row parents as contact indices
@@ -78,7 +78,9 @@ def contact_rows(solver, contacts, route=0, *, incident=False, jacobian=False):
     weight, tangential phi and friction location when patches are enabled.
     ``incident`` adds the native sparse route's separately stored ``J v_hat``
     to the right-hand side, matching the assembled split rows. ``jacobian``
-    adds the physical row Jacobians.
+    adds the physical row Jacobians. ``every_row`` records phi and the target
+    of each of the contact's rows, tangent rows included, instead of the
+    normal row's only.
     """
     count = min(int(contacts.rigid_contact_count.numpy()[0]), solver.contact_slot.shape[0])
     slot, path = solver.contact_slot.numpy()[:count], solver.contact_path.numpy()[:count]
@@ -99,14 +101,15 @@ def contact_rows(solver, contacts, route=0, *, incident=False, jacobian=False):
         w, first = int(world[c]), int(slot[c])
         rows = slice(first, first + int(needed[c]))
         parents = arrays["parent"][w, rows]
+        phi, target = arrays["phi"], arrays["target"]
         record = {
             "types": arrays["type"][w, rows].copy(),
             "parents": np.array([owner.get((w, int(p)), -2) if p >= 0 else -1 for p in parents], dtype=np.int64),
             "mu": arrays["mu"][w, rows].copy(),
             "rhs": arrays["rhs"][w, rows].copy(),
             "impulses": arrays["impulse"][w, rows].copy(),
-            "phi": float(arrays["phi"][w, first]),
-            "target": None if arrays["target"] is None else float(arrays["target"][w, first]),
+            "phi": phi[w, rows].copy() if every_row else float(phi[w, first]),
+            "target": None if target is None else (target[w, rows].copy() if every_row else float(target[w, first])),
             "patch": None,
         }
         if view is not None:

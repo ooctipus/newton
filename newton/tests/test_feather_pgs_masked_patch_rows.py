@@ -54,12 +54,13 @@ def _arrays(solver):
 def _rows(solver, contacts):
     """Each routed contact's rows by contact index, with the Jacobian rows of every articulation it touches.
 
-    Matrix-free mode reads the world rows. Split mode keeps each articulation's rows in its size group,
-    so a contact's Jacobian concatenates its two articulations' group rows.
+    Every row's phi and target are recorded, the tangent rows' included. Matrix-free mode reads the
+    world rows. Split mode keeps each articulation's rows in its size group, so a contact's Jacobian
+    concatenates its two articulations' group rows.
     """
     if solver.pgs_mode == "matrix_free":
-        return contact_rows(solver, contacts, jacobian=True)
-    records = contact_rows(solver, contacts)
+        return contact_rows(solver, contacts, jacobian=True, every_row=True)
+    records = contact_rows(solver, contacts, every_row=True)
     count = len(solver.contact_slot.numpy())
     slot, needed = solver.contact_slot.numpy()[:count], solver.contact_slots_needed.numpy()[:count]
     arts = (solver.contact_art_a.numpy()[:count], solver.contact_art_b.numpy()[:count])
@@ -108,6 +109,44 @@ def _mixed_model(device, dof_count):
     return model
 
 
+def _add_chain(builder, cfg, parent, links, half_width):
+    """Append revolute links given as (axis, offset) and a box foot under the last; return the joints."""
+    joints = []
+    for axis, offset in links:
+        body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.05), lock_inertia=True)
+        joints.append(
+            builder.add_joint_revolute(
+                parent=parent,
+                child=body,
+                axis=axis,
+                parent_xform=wp.transform(wp.vec3(*offset), wp.quat_identity()),
+                target_ke=400.0,
+                target_kd=20.0,
+            )
+        )
+        parent = body
+    foot = wp.transform(wp.vec3(0.0, 0.0, -0.2), wp.quat_identity())
+    builder.add_shape_box(parent, xform=foot, hx=0.06, hy=half_width, hz=0.03, cfg=cfg)
+    return joints
+
+
+def _add_robot(builder, cfg):
+    """Stand a floating torso on two legs of three joints (12 DOFs), each box foot on its four corners at z = 0."""
+    torso = builder.add_link(
+        xform=wp.transform(wp.vec3(0.0, 0.0, 0.48), wp.quat_identity()),
+        mass=2.0,
+        inertia=wp.mat33(np.eye(3) * 0.1),
+        lock_inertia=True,
+    )
+    joints = [builder.add_joint_free(child=torso)]
+    for side in (-1.0, 1.0):
+        # Hip roll and pitch, then the knee.
+        hip, knee = (0.0, 0.15 * side, 0.0), (0.0, 0.0, -0.25)
+        legs = ((newton.Axis.X, hip), (newton.Axis.Y, (0.0, 0.0, 0.0)), (newton.Axis.Y, knee))
+        joints += _add_chain(builder, cfg, torso, legs, 0.03)
+    builder.add_articulation(joints)
+
+
 def _three_size_model(device, worlds=2):
     """Per world, a standing robot (12 DOFs), a fixed arm resting its tip on the ground (2) and a free box (6).
 
@@ -117,46 +156,12 @@ def _three_size_model(device, worlds=2):
     builder = newton.ModelBuilder()
     cfg = builder.default_shape_cfg.copy()
     cfg.density, cfg.mu = 0.0, 0.8
-    inertia = wp.mat33(np.eye(3) * 0.05)
-
-    def chain(parent, links, half_width):
-        """Append revolute links given as (axis, offset) and a box foot under the last; return the joints."""
-        joints = []
-        for axis, offset in links:
-            body = builder.add_link(mass=1.0, inertia=inertia, lock_inertia=True)
-            joints.append(
-                builder.add_joint_revolute(
-                    parent=parent,
-                    child=body,
-                    axis=axis,
-                    parent_xform=wp.transform(wp.vec3(*offset), wp.quat_identity()),
-                    target_ke=400.0,
-                    target_kd=20.0,
-                )
-            )
-            parent = body
-        foot = wp.transform(wp.vec3(0.0, 0.0, -0.2), wp.quat_identity())
-        builder.add_shape_box(parent, xform=foot, hx=0.06, hy=half_width, hz=0.03, cfg=cfg)
-        return joints
-
     for _ in range(worlds):
         builder.begin_world()
-        torso = builder.add_link(
-            xform=wp.transform(wp.vec3(0.0, 0.0, 0.48), wp.quat_identity()),
-            mass=2.0,
-            inertia=wp.mat33(np.eye(3) * 0.1),
-            lock_inertia=True,
-        )
-        joints = [builder.add_joint_free(child=torso)]
-        for side in (-1.0, 1.0):
-            # Hip roll and pitch, then the knee; each box foot rests on its four corners.
-            hip, knee = (0.0, 0.15 * side, 0.0), (0.0, 0.0, -0.25)
-            legs = ((newton.Axis.X, hip), (newton.Axis.Y, (0.0, 0.0, 0.0)), (newton.Axis.Y, knee))
-            joints += chain(torso, legs, 0.03)
-        builder.add_articulation(joints)
+        _add_robot(builder, cfg)
         # A two-joint arm on a fixed shoulder, its tip box resting on the ground.
         arm = ((newton.Axis.Y, (0.6, 0.0, 0.33)), (newton.Axis.Y, (0.0, 0.0, -0.1)))
-        builder.add_articulation(chain(-1, arm, 0.06))
+        builder.add_articulation(_add_chain(builder, cfg, -1, arm, 0.06))
         box = builder.add_link(
             xform=wp.transform(wp.vec3(-0.6, 0.0, 0.05), wp.quat_identity()),
             mass=0.5,
@@ -167,6 +172,38 @@ def _three_size_model(device, worlds=2):
         builder.end_world()
     builder.add_ground_plane()
     return builder.finalize(device=device)
+
+
+# The conveyor plate's twist: linear (rising at 2 cm/s), then angular velocity [m/s, rad/s].
+_CONVEYOR_TWIST = (0.2, 0.05, 0.02, 0.0, 0.0, 0.5)
+
+
+def _conveyor_model(device, worlds=2):
+    """Per world, the 12-DOF standing robot on a kinematic plate that carries a prescribed twist.
+
+    Every contact row on the plate gets a target velocity. The feet's tangent rows take theirs at the
+    patch friction location (the midpoint of a foot's short edge), which the spin moves differently
+    from the contact's own corner.
+    """
+    builder = newton.ModelBuilder()
+    cfg = builder.default_shape_cfg.copy()
+    cfg.density, cfg.mu = 0.0, 0.8
+    for _ in range(worlds):
+        builder.begin_world()
+        plate = builder.add_body(xform=wp.transform(wp.vec3(0.1, 0.0, -0.02), wp.quat_identity()), is_kinematic=True)
+        builder.add_shape_box(plate, hx=0.6, hy=0.6, hz=0.02)
+        _add_robot(builder, cfg)
+        builder.end_world()
+    model = builder.finalize(device=device)
+    types, flags, child = model.joint_type.numpy(), model.body_flags.numpy(), model.joint_child.numpy()
+    plates = np.flatnonzero(
+        (types == int(newton.JointType.FREE)) & (flags[child] & int(newton.BodyFlags.KINEMATIC) != 0)
+    )
+    qd = model.joint_qd.numpy()
+    for start in model.joint_qd_start.numpy()[plates]:
+        qd[start : start + 6] = _CONVEYOR_TWIST
+    model.joint_qd.assign(qd)
+    return model
 
 
 def _anchor_count(records):
@@ -204,7 +241,10 @@ class TestMaskedPatchRowAdmission(unittest.TestCase):
 
 class TestMaskedPatchRows(unittest.TestCase):
     def _assert_parity(self, model, steps, method="masked_combined", **solver_kwargs):
-        """Step both builders; ``method`` is the masked route: one combined launch, or one per size."""
+        """Step both builders; return the masked solver.
+
+        ``method`` is the masked route: one combined launch, or one per size.
+        """
         masked_solver, masked, masked_methods = _rollout(model, masked=True, steps=steps, **solver_kwargs)
         general_solver, general, general_methods = _rollout(model, masked=False, steps=steps, **solver_kwargs)
         self.assertEqual(masked_methods, {method})
@@ -283,6 +323,33 @@ class TestMaskedPatchRows(unittest.TestCase):
                     mf_max_constraints=32,
                 )
                 self.assertFalse(solver._compact_contact_jacobian)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "prescribed contact targets need the CUDA matrix-free route")
+    def test_cuda_masked_patch_rows_carry_prescribed_targets(self):
+        """A robot on a conveyor: each patch row's target matches the per-contact builder's.
+
+        Split mode gives a kinematic body response coordinates instead of prescribing its motion, so
+        only the matrix-free route writes targets. The rows compare at the first step, which both
+        builders build from the same state. Later states depend on the order of the atomic slot
+        reservations, which changes how the sweep splits a foot's load among its four corners (over
+        six steps, impulses differed by up to 4e-3 and poses by 7e-8), and a sliding foot then
+        releases different anchors. Sparse factors stay off, as they would own a free root's rows.
+        """
+        model = _conveyor_model(wp.get_device("cuda:0"))
+        options = {"pgs_mode": "matrix_free", "pgs_iterations": 8, "dense_max_constraints": 96}
+        solver, masked, methods = _rollout(model, masked=True, steps=1, sparse_mass_matrix="off", **options)
+        _, general, general_methods = _rollout(model, masked=False, steps=1, sparse_mass_matrix="off", **options)
+        self.assertEqual(methods, {"masked_combined"})
+        self.assertEqual(general_methods, {"per_contact"})
+        self.assertTrue(solver._has_prescribed_response)
+        self.assertFalse(solver._compact_contact_jacobian)
+        (rows, _, _), (expected, _, _) = masked[0], general[0]
+        assert_rows_close(rows, expected, atol=1.0e-6, rtol=1.0e-6)
+        anchors = [record["target"] for record in rows.values() if len(record["types"]) == 3]
+        self.assertGreater(len(anchors), 0, "no contact owned an anchor")
+        # The plate's surface moves at about 0.2 m/s along the ground and rises at 0.02 m/s.
+        self.assertGreater(float(np.abs(np.concatenate([target[1:] for target in anchors])).max()), 0.1)
+        self.assertGreater(float(np.abs([target[0] for target in anchors]).min()), 0.01)
 
 
 if __name__ == "__main__":
