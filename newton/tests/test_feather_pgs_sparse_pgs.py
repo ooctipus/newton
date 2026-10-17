@@ -22,6 +22,15 @@ from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_ker
 _SWEEP_CASES = ((0, 0, 1.0), (3, 1, 0.7), (3, 4, 1.2))
 
 
+def _ring(parents, first):
+    """Return the patch ring of normal rows that starts at ``first``, in the order the pair update pools it."""
+    rows, row = [int(first)], int(parents[first])
+    while row >= 0 and row != first:
+        rows.append(row)
+        row = int(parents[row])
+    return rows
+
+
 def _sweep(
     jacobian,
     response,
@@ -37,23 +46,35 @@ def _sweep(
     iteration_offset=0,
     omega=1.0,
     active_rows=False,
+    linked_rows=False,
+    select_friction=True,
     iterations=8,
 ):
+    """Run ordered PGS sweeps in physical coordinates.
+
+    ``active_rows`` applies the deferral law: a sweep visits only the normal and
+    limit rows that hold impulse or are violated at its entry. Without
+    ``linked_rows`` a world with a ring-linked normal keeps the full sweep; with
+    it a friction pair is visited while any normal of its ring is selected or the
+    pair holds impulse. ``select_friction=False`` visits every friction pair
+    instead, the deferral law the selection must reproduce exactly.
+    """
     velocity, impulses = velocity.copy(), impulses.copy()
     active_rows = (
         active_rows
         and np.isfinite(omega)
         and omega >= 0
-        and not np.any((types == PGS_CONSTRAINT_TYPE_CONTACT) & (parents >= 0))
+        and (linked_rows or not np.any((types == PGS_CONSTRAINT_TYPE_CONTACT) & (parents >= 0)))
     )
     for iteration in range(iterations):
         selected = np.ones(len(types), dtype=bool)
         if active_rows:
             unilateral = np.isin(types, (PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_JOINT_LIMIT))
             selected[unilateral] = (impulses[unilateral] != 0) | ((jacobian @ velocity + bias)[unilateral] < 0)
-            for row in np.flatnonzero(types == PGS_CONSTRAINT_TYPE_FRICTION):
+            for row in np.flatnonzero((types == PGS_CONSTRAINT_TYPE_FRICTION) & select_friction):
                 parent = parents[row]
-                selected[row] = selected[parent] or np.any(impulses[parent + 1 : parent + 3] != 0)
+                ring = _ring(parents, parent) if linked_rows else [parent]
+                selected[row] = np.any(selected[ring]) or np.any(impulses[parent + 1 : parent + 3] != 0)
         for row, kind in enumerate(types):
             if kind == PGS_CONSTRAINT_TYPE_FRICTION and iteration_offset + iteration < friction_start:
                 impulses[row] = 0.0
@@ -141,10 +162,13 @@ def _problem(dofs=43, support=18, seeded=False, *, contact_activity=None):
             # A later normal row activates the initially unloaded pair next sweep.
             rows[3, :3] = (-1.0, 0.0, 1.0)
             bias[3] = -1.0
-        elif contact_activity == "deferred_activation":
+        elif contact_activity in ("deferred_activation", "linked_deferral"):
             # An earlier normal makes a later zero normal eligible only next sweep.
             rows[0, 0], rows[3, 0] = -1.0, 1.0
             bias[0], bias[3] = -1.0, 0.25
+            if contact_activity == "linked_deferral":
+                # Both normals share one patch ring, so the late normal also loads the pair.
+                parents[0], parents[3] = 3, 0
         elif contact_activity == "near_singular":
             rows[2, 1:3] = (1.0, 0.001)
             bias[:3] = (-1.0, -1.0, 0.25)
@@ -167,6 +191,45 @@ def _problem(dofs=43, support=18, seeded=False, *, contact_activity=None):
     incident = jacobian @ initial
     diagonal = np.sum(rows * rows, axis=1) + 1.0e-6
     return factor, indices, rows, initial, bias, types, parents, mu, impulses, jacobian, response, incident, diagonal
+
+
+def _patch_problem(rng, *, dofs=10, regions=4, limits=1):
+    """Build random patch rows: limit rows, then interleaved one-row normal and three-row anchor units.
+
+    Each region links its normals in one ring (a lone normal links to itself or
+    to nothing). Responses equal the rows, as in factor coordinates. Normals and
+    tangents start at zero or seeded; biases leave some normals separating, some
+    violated and some close enough for an earlier update to violate them.
+    """
+    units = []
+    for region in range(regions):
+        contacts = int(rng.integers(1, 5))
+        anchors = rng.choice(contacts, size=int(rng.integers(0, min(contacts, 2) + 1)), replace=False)
+        units += [(region, contact in anchors) for contact in range(contacts)]
+    rng.shuffle(units)
+    types = [PGS_CONSTRAINT_TYPE_JOINT_LIMIT] * limits
+    parents, mu, members = [-1] * limits, [0.0] * limits, [[] for _ in range(regions)]
+    for region, anchor in units:
+        normal = len(types)
+        members[region].append(normal)
+        types.append(PGS_CONSTRAINT_TYPE_CONTACT)
+        parents.append(-1)
+        mu.append(0.0)
+        if anchor:
+            types += [PGS_CONSTRAINT_TYPE_FRICTION] * 2
+            parents += [normal] * 2
+            mu += [rng.uniform(0.2, 0.8)] * 2
+    types, parents, mu = np.array(types, np.int32), np.array(parents, np.int32), np.array(mu)
+    for ring in members:
+        if len(ring) > 1 or rng.random() < 0.5:
+            parents[ring] = np.roll(ring, -1)
+    rows = rng.normal(scale=0.5, size=(len(types), dofs))
+    bias = rng.uniform(-0.3, 0.3, size=len(types))
+    impulses = np.where(rng.random(len(types)) < 0.3, rng.uniform(0.0, 0.2, size=len(types)), 0.0)
+    friction = types == PGS_CONSTRAINT_TYPE_FRICTION
+    impulses[friction] = np.where(rng.random(friction.sum()) < 0.2, rng.normal(scale=0.02, size=friction.sum()), 0.0)
+    diagonal = np.sum(rows * rows, axis=1) + 1.0e-6
+    return rows, bias, diagonal, types, parents, mu, impulses
 
 
 def _mixed_problem():
@@ -501,6 +564,89 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
         np.testing.assert_array_equal(fallback[0], exact[0])
         np.testing.assert_array_equal(fallback[1], exact[1])
 
+    def test_linked_active_rows_defer_patch_rings(self):
+        """Defer a newly violated ring normal under linked selection, where point selection keeps the full sweep."""
+        _, _, rows, initial, bias, types, parents, mu, impulses, _, _, incident, diag = _problem(
+            3, 3, contact_activity="linked_deferral"
+        )
+        self.assertEqual(_ring(parents, 0), [0, 3])
+        args = (rows, rows, np.zeros_like(initial), incident + bias, diag, types, parents, mu, impulses)
+        _, exact = _sweep(*args, iterations=1)
+        _, point = _sweep(*args, active_rows=True, iterations=1)
+        _, linked = _sweep(*args, active_rows=True, linked_rows=True, iterations=1)
+        _, next_sweep = _sweep(*args, active_rows=True, linked_rows=True, iterations=2)
+        # A ring-linked world falls back to the full sweep without linked selection.
+        np.testing.assert_array_equal(point, exact)
+        self.assertGreater(exact[3], 0.0)
+        self.assertEqual(linked[3], 0.0)
+        self.assertGreater(next_sweep[3], 0.0)
+        np.testing.assert_array_equal(linked[:3], exact[:3])
+        exact = _sweep(*args, omega=-0.5)
+        fallback = _sweep(*args, omega=-0.5, active_rows=True, linked_rows=True)
+        np.testing.assert_array_equal(fallback[0], exact[0])
+        np.testing.assert_array_equal(fallback[1], exact[1])
+
+    def test_linked_selection_matches_the_deferral_law(self):
+        """Skip only friction pairs whose deferral-law update is a no-op, bitwise.
+
+        Random patch rows interleave one-row normals and three-row anchor units in
+        rings of one to four normals (self-loops and unlinked normals included),
+        with zero and seeded impulses, delayed friction and relaxation. Selecting a
+        pair while any normal of its ring is selected, or while it holds impulse,
+        equals visiting every pair. The rows include pairs whose own normal is
+        unselected at sweep entry while another normal of its ring is selected, so
+        a selection by the pair's own normal alone would drop their load.
+        """
+        rng = np.random.default_rng(13)
+        ring_loaded = 0
+        for case in range(120):
+            rows, bias, diagonal, types, parents, mu, impulses = _patch_problem(rng)
+            friction_start, iteration_offset, omega = _SWEEP_CASES[case % len(_SWEEP_CASES)]
+            settings = {"friction_start": friction_start, "iteration_offset": iteration_offset, "omega": omega}
+            args = (rows, rows, np.zeros(rows.shape[1]), bias, diagonal, types, parents, mu, impulses)
+            with self.subTest(case=case):
+                selected = _sweep(*args, active_rows=True, linked_rows=True, **settings)
+                every_pair = _sweep(*args, active_rows=True, linked_rows=True, select_friction=False, **settings)
+                np.testing.assert_array_equal(selected[0], every_pair[0])
+                np.testing.assert_array_equal(selected[1], every_pair[1])
+            entry = (impulses != 0) | (bias < 0)
+            for row in np.flatnonzero(types == PGS_CONSTRAINT_TYPE_FRICTION):
+                parent = parents[row]
+                ring_loaded += row == parent + 1 and not entry[parent] and bool(np.any(entry[_ring(parents, parent)]))
+        self.assertGreater(ring_loaded, 20)
+
+    def test_linked_active_rows_differ_from_the_full_sweep_by_deferral(self):
+        """Match the full patch sweep bitwise unless a sweep's earlier updates violate an unselected row.
+
+        The deferral law is not float reordering: such a row, and the pairs its ring
+        loads, wait for the next sweep. Stepping the full sweep one sweep at a time, a
+        sweep that the deferral law changes is a deferral. Problems without one end
+        bitwise equal after eight sweeps; every problem with one differs.
+        """
+        rng = np.random.default_rng(29)
+        deferred = 0
+        for case in range(60):
+            rows, bias, diagonal, types, parents, mu, impulses = _patch_problem(rng)
+            friction_start, iteration_offset, omega = _SWEEP_CASES[case % len(_SWEEP_CASES)]
+            settings = {"friction_start": friction_start, "omega": omega}
+            velocity, steps, deferrals = np.zeros(rows.shape[1]), impulses, 0
+            for sweep in range(8):
+                args = (rows, rows, velocity, bias, diagonal, types, parents, mu, steps)
+                once = {**settings, "iteration_offset": iteration_offset + sweep, "iterations": 1}
+                full = _sweep(*args, **once)
+                lazy = _sweep(*args, active_rows=True, linked_rows=True, **once)
+                deferrals += not (np.array_equal(full[0], lazy[0]) and np.array_equal(full[1], lazy[1]))
+                velocity, steps = full
+            args = (rows, rows, np.zeros(rows.shape[1]), bias, diagonal, types, parents, mu, impulses)
+            full = _sweep(*args, iteration_offset=iteration_offset, **settings)
+            lazy = _sweep(*args, iteration_offset=iteration_offset, active_rows=True, linked_rows=True, **settings)
+            same = np.array_equal(full[0], lazy[0]) and np.array_equal(full[1], lazy[1])
+            with self.subTest(case=case, deferrals=deferrals):
+                self.assertEqual(same, deferrals == 0)
+            deferred += deferrals > 0
+        self.assertGreater(deferred, 10)
+        self.assertLess(deferred, 50)
+
     @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
     def test_cuda_active_sweeps_match_reference(self):
         """Match independent eligibility, seeded retraction, delayed friction and linked fallback."""
@@ -521,8 +667,18 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                 active_rows=False, use_support_table=True, lanes_per_world=lanes, local_factors=True
             )
 
+    @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
+    def test_cuda_linked_active_sweeps_match_reference(self):
+        """Select patch rings at sweep entry with seeded impulses, delayed friction, word-crossing rings and replay.
+
+        Worlds without a linked normal also match the point active kernel bitwise.
+        """
+        for use_support_table in (False, True):
+            with self.subTest(use_support_table=use_support_table):
+                self._check_cuda_sparse_sweeps(active_rows=True, use_support_table=use_support_table, linked_rows=True)
+
     def _check_cuda_sparse_sweeps(
-        self, *, active_rows, use_support_table=False, lanes_per_world=32, local_factors=False
+        self, *, active_rows, use_support_table=False, lanes_per_world=32, local_factors=False, linked_rows=False
     ):
         """Compare each schedule with its own physical recurrence without weakening the exact control."""
         device = wp.get_device("cuda:0")
@@ -530,6 +686,8 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
         cases.extend((3, 3, activity) for activity in ("late_activation", "seeded_retraction", "linked_load"))
         if active_rows:
             cases.extend((3, 3, activity) for activity in ("deferred_activation", "near_singular", "negative_omega"))
+        if linked_rows:
+            cases.append((3, 3, "linked_deferral"))
         for dofs, support, contact_activity in cases:
             if lanes_per_world < 32 and dofs > lanes_per_world:
                 continue
@@ -551,7 +709,7 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                     _, indices, rows, initial, bias, types, parents, mu, impulses, _, _, incident, diag = _problem(
                         dofs, support, seeded, contact_activity=contact_activity
                     )
-                    if active_rows and contact_activity is None:
+                    if active_rows and contact_activity is None and not linked_rows:
                         parents[types == PGS_CONSTRAINT_TYPE_CONTACT] = -1
                     offset = 30 if active_rows and (dofs == 75 or (use_support_table and dofs == 43)) else 0
                     if offset:
@@ -577,6 +735,7 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                         iteration_offset=iteration_offset,
                         omega=omega,
                         active_rows=active_rows,
+                        linked_rows=linked_rows,
                     )
                     if contact_activity == "seeded_retraction":
                         np.testing.assert_array_equal(expected_impulses[1:3], 0.0)
@@ -618,7 +777,9 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                         use_support_table=use_support_table,
                         lanes_per_world=lanes_per_world,
                         local_factors=local_factors,
+                        linked_rows=linked_rows,
                     )
+                    self.assertEqual("_linked" in kernel.key, linked_rows and active_rows)
                     launch_args = {
                         "dim": [2],
                         "inputs": [
@@ -667,6 +828,22 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                         np.testing.assert_allclose(
                             result_impulses[world, :count], expected_impulses, atol=2.0e-5, rtol=2.0e-4
                         )
+                    if linked_rows and not np.any((types == PGS_CONSTRAINT_TYPE_CONTACT) & (parents >= 0)):
+                        # Without a linked normal the ring walk selects as the point scan does.
+                        point_kernel = _get_pgs_solve_sparse_kernel(
+                            capacity,
+                            dofs,
+                            support,
+                            active_rows=active_rows,
+                            use_support_table=use_support_table,
+                            lanes_per_world=lanes_per_world,
+                            local_factors=local_factors,
+                        )
+                        self.assertNotIn("_linked", point_kernel.key)
+                        wp.copy(actual_impulses, initial_impulses)
+                        wp.launch_tiled(point_kernel, **launch_args)
+                        np.testing.assert_array_equal(delta.numpy(), actual)
+                        np.testing.assert_array_equal(actual_impulses.numpy(), result_impulses)
                     if use_support_table:
                         packed_kernel = _get_pgs_solve_sparse_kernel(
                             capacity,
@@ -675,6 +852,7 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                             active_rows=active_rows,
                             lanes_per_world=lanes_per_world,
                             local_factors=local_factors,
+                            linked_rows=linked_rows,
                         )
                         wp.copy(actual_impulses, initial_impulses)
                         launch_args["inputs"][5] = wp.array(row_dof, device=device)

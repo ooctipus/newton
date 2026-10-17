@@ -70,6 +70,15 @@ _PATCH_ONLY = frozenset(
         "build_serial_contacts=True, units=True)",
         "solver_feather_pgs._get_mark_independent_sparse_contact_candidates_kernel(1, '120', units=True)",
         "solver_feather_pgs._get_mark_independent_sparse_contact_candidates_kernel(2, '120', units=True)",
+        # Native sparse sweeps that select patch rings at sweep entry.
+        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, linked_rows=True, "
+        "use_support_table=False, warm_start=False)",
+        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, linked_rows=True, "
+        "use_support_table=False, warm_start=True)",
+        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, linked_rows=True, "
+        "use_support_table=True, warm_start=False)",
+        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, linked_rows=True, "
+        "use_support_table=True, warm_start=True)",
     )
 )
 
@@ -168,6 +177,16 @@ def _sparse_sweep_calls():
                 "warm_start": warm,
             }
             yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, size, kwargs
+
+
+def _linked_sweep_calls():
+    """Patch-only native sparse sweeps over linked rows (sparse_pgs.py)."""
+    from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel  # noqa: PLC0415
+
+    factory = _get_pgs_solve_sparse_kernel.__wrapped__
+    for table, warm in itertools.product((False, True), repeat=2):
+        kwargs = {"active_rows": True, "use_support_table": table, "warm_start": warm, "linked_rows": True}
+        yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, (48, 18, 12), kwargs
 
 
 def _sparse_contact_calls():
@@ -280,7 +299,11 @@ def _factory_kernels():
 
     kernels = {"row_build_native.get_row_build_native_kernel()": get_row_build_native_kernel()}
     for name, factory, args, kwargs in itertools.chain(
-        _sparse_sweep_calls(), _sparse_contact_calls(), _solver_factory_calls(), _keyed_row_calls()
+        _sparse_sweep_calls(),
+        _linked_sweep_calls(),
+        _sparse_contact_calls(),
+        _solver_factory_calls(),
+        _keyed_row_calls(),
     ):
         try:
             kernel = factory(*args, **kwargs)
@@ -434,7 +457,13 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
             with self.subTest(family=family):
                 self.assertIn(family, families)
         sparse = [name for name in self.current if name.startswith("sparse_pgs.")]
-        for flag in ("active_rows=True", "contact_triplets=True", "velocity_limits=True", "warm_start=True"):
+        for flag in (
+            "active_rows=True",
+            "contact_triplets=True",
+            "velocity_limits=True",
+            "warm_start=True",
+            "linked_rows=True",
+        ):
             with self.subTest(flag=flag):
                 self.assertTrue(any(flag in name for name in sparse))
         # The patch-only linked tiers are pinned beside the point tiers they extend.

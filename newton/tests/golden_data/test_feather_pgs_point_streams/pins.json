@@ -373,7 +373,11 @@
   "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, contact_triplets=False, free_row_dofs=0, lanes_per_world=32, local_factors=False, mf_max_constraints=0, use_support_table=True, velocity_limits=False, warm_start=False)": "c535eebb8a00278dcde0e813b9b69c0c0322bd4f65f9c57b3e01cf7775cdac49",
   "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, contact_triplets=False, free_row_dofs=0, lanes_per_world=32, local_factors=False, mf_max_constraints=0, use_support_table=True, velocity_limits=False, warm_start=True)": "6948e22afac8d159474679efa38e234f5d472cfe83030c2ae899f96678551aca",
   "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, contact_triplets=True, free_row_dofs=0, lanes_per_world=32, local_factors=False, mf_max_constraints=0, use_support_table=True, velocity_limits=False, warm_start=False)": "5db916051d5d76b65ad2e09541adfa8e7da4fdd798655b4111aca0e08a34aa06",
-  "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, contact_triplets=True, free_row_dofs=0, lanes_per_world=32, local_factors=False, mf_max_constraints=0, use_support_table=True, velocity_limits=False, warm_start=True)": "8deedfa2457ba1ac187b37beadc4cb814ca52a142fa05d9966ec66e8622a3694"
+  "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, contact_triplets=True, free_row_dofs=0, lanes_per_world=32, local_factors=False, mf_max_constraints=0, use_support_table=True, velocity_limits=False, warm_start=True)": "8deedfa2457ba1ac187b37beadc4cb814ca52a142fa05d9966ec66e8622a3694",
+  "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, linked_rows=True, use_support_table=False, warm_start=False)": "adf52b70f873973377b0d7bb18a6e12c4440124e3edf9b1f3cf4c49a0ffc1b34",
+  "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, linked_rows=True, use_support_table=False, warm_start=True)": "7e6eb98638c036c8cc21a129696875019478d76d9fab9bb4c4c8f646394667ac",
+  "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, linked_rows=True, use_support_table=True, warm_start=False)": "3f002cb15e3c7481f80315c84ddff154b0fb1985b041b69e4ffbe142f1dd2414",
+  "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, linked_rows=True, use_support_table=True, warm_start=True)": "9e2d05fee30e9423c4ddb03247c62327f3a0aa12a7f834c4b72a556375a84006"
  },
  "warp": "1.17.0.dev20260807"
 }

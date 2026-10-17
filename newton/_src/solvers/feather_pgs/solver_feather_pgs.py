@@ -1112,6 +1112,13 @@ class SolverFeatherPGS(SolverBase):
     layout requires a common articulated topology with at most 64 DOFs per
     articulation. Dense-factor chains and unsupported features retain the
     existing representation. Selection uses topology and resources, not task names.
+    Without split, velocity-limit or free-body rows, the sparse sweep selects
+    its normal and limit rows at sweep entry: a zero-impulse row that the
+    sweep's earlier updates violate waits for the next sweep. Under persistent
+    patch friction a friction pair is visited while any normal of its patch
+    ring is selected or the pair holds impulse, and small worlds keep their
+    packed full sweep; set ``FEATHER_PGS_PATCH_ACTIVE_ROWS=0`` before
+    construction to keep patch friction on the full ordered sweep.
 
     Automatic sparse selection includes factor-coordinate velocity-limit
     responses for compatible ``matrix_free`` CUDA models,
@@ -5051,6 +5058,10 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_prepare_contacts = False
         self._sparse_row_support = _SparseRowSupport()
         self._sparse_contact_triplets = False
+        # Policy: patch friction may adopt the active-row scan's deferral law.
+        self._patch_active_rows = bool(
+            self._friction_anchors_enabled and os.environ.get("FEATHER_PGS_PATCH_ACTIVE_ROWS", "1") != "0"
+        )
         # Route details for get_path_selection(), set where the sparse owner is admitted.
         self._sparse_active_rows = False
         self._sparse_active_rows_reason = "Native sparse factors are not selected."
@@ -5247,32 +5258,28 @@ class SolverFeatherPGS(SolverBase):
         shared_limit = min(48 * 1024, int(model.device.max_shared_memory_per_block))
         # Two worlds share a block: three float row arrays, row types, and velocity deltas.
         mf_capacity = self.mf_max_constraints if self._has_free_rigid_bodies else 0
-        active_rows = (
-            self._kernel_overrides.get("sparse_active_contacts", True)
-            and not split_candidate
-            and not velocity_candidate
-            and not self._has_free_rigid_bodies
-            and not self._friction_anchors_enabled
-        )
-        if active_rows:
-            active_rows_reason = "Point-contact normal and limit rows are selected at sweep entry."
-        elif not self._kernel_overrides.get("sparse_active_contacts", True):
-            active_rows_reason = "A private sparse_active_contacts override disables the active-row scan."
-        elif split_candidate or velocity_candidate:
-            active_rows_reason = "Split and velocity-limit rows keep full ordered sweeps."
-        elif self._has_free_rigid_bodies:
-            active_rows_reason = "Independent free-body rows keep full ordered sweeps."
-        else:
-            active_rows_reason = (
-                "Patch friction (friction_anchor_beta > 0) links rows; the active-row scan needs point friction."
-            )
         solve_shared_bytes = 8 * self.max_world_dofs + 26 * self.dense_max_constraints + 16 * mf_capacity
         if split_candidate or velocity_candidate:
             solve_shared_bytes += 256  # Warp's tiled launch base.
+        # Patch friction keeps the packed lanes of small worlds, so size them from the
+        # full sweep before the active-row scan claims whole warps.
+        small_world_lanes = self._sparse_small_world_lanes(solve_shared_bytes, shared_limit, mf_capacity)
+        active_rows, active_rows_reason = self._admit_sparse_active_rows(
+            split_candidate=split_candidate,
+            velocity_candidate=velocity_candidate,
+            small_world_lanes=small_world_lanes,
+        )
         if active_rows:
             # Two row bitsets per world, with aligned unsigned-word storage.
-            solve_shared_bytes += 16 * ((self.dense_max_constraints + 31) // 32)
-            solve_shared_bytes = (solve_shared_bytes + 3) // 4 * 4
+            active_bytes = (solve_shared_bytes + 16 * ((self.dense_max_constraints + 31) // 32) + 3) // 4 * 4
+            if self._friction_anchors_enabled and active_bytes > shared_limit:
+                # Patch friction admitted this route before it adopted the scan; keep it.
+                active_rows = False
+                active_rows_reason = (
+                    "Patch friction keeps the full ordered sweep: the row bitsets exceed shared memory."
+                )
+            else:
+                solve_shared_bytes = active_bytes
         if solve_shared_bytes > shared_limit:
             self._sparse_selection_reason = (
                 f"Row capacity needs {solve_shared_bytes} bytes of shared memory for sparse solving; "
@@ -5346,9 +5353,11 @@ class SolverFeatherPGS(SolverBase):
         metric_map_bytes = (2 * triplet_capacity + 3) // 4 * 4
         triplet_shared_bytes = 256 + 40 * metric_cache_size + metric_map_bytes + 8
         triplets_requested = os.environ.get("FEATHER_PGS_SPARSE_CONTACT_TRIPLETS", "0") == "1"
+        # The point transaction pools no ring: patch rows keep ordinary updates.
         self._sparse_contact_triplets = bool(
             triplets_requested
             and active_rows
+            and not self._friction_anchors_enabled
             and use_support_table
             and triplet_capacity > 0
             and solve_shared_bytes + triplet_shared_bytes <= shared_limit
@@ -5361,6 +5370,11 @@ class SolverFeatherPGS(SolverBase):
             self._sparse_contact_triplets_reason = "Off: FEATHER_PGS_SPARSE_CONTACT_TRIPLETS is an opt-in."
         elif not active_rows:
             self._sparse_contact_triplets_reason = "Requested, but triplets need the active-row scan."
+        elif self._friction_anchors_enabled:
+            self._sparse_contact_triplets_reason = (
+                "Requested, but triplets fuse unlinked point rows; patch rings (friction_anchor_beta > 0) keep "
+                "ordinary updates."
+            )
         elif not use_support_table:
             self._sparse_contact_triplets_reason = "Requested, but triplets need the row support table."
         else:
@@ -5397,18 +5411,7 @@ class SolverFeatherPGS(SolverBase):
         )
         # Reuse the local solver's small-world packing without changing this
         # owner's row representation, sweep policy or velocity-limit phase.
-        self._sparse_solve_lanes = 32
-        if (
-            os.environ.get("FEATHER_PGS_SPARSE_SMALL_WORLDS", "1") != "0"
-            and not active_rows
-            and not mf_capacity
-            and not self._has_free_rigid_bodies
-            and self.max_world_dofs <= 16
-            and self.dense_max_constraints <= 64
-        ):
-            lanes = 8 if self.max_world_dofs <= 8 else 16
-            if solve_shared_bytes * (32 // lanes) <= shared_limit:
-                self._sparse_solve_lanes = lanes
+        self._sparse_solve_lanes = small_world_lanes if small_world_lanes and not active_rows else 32
         local_factor_bytes = 4 * (64 // self._sparse_solve_lanes) * self.dense_max_constraints * self.max_world_dofs
         # Large resident workspaces regressed whole-step timing in measured
         # small systems. Keep the global-row consumer when the cache is large.
@@ -5431,6 +5434,66 @@ class SolverFeatherPGS(SolverBase):
             lanes_per_world=self._sparse_solve_lanes,
             local_factors=self._sparse_local_factors,
             warm_start=self.pgs_warmstart,
+            linked_rows=self._friction_anchors_enabled,
+        )
+
+    def _sparse_small_world_lanes(self, solve_shared_bytes: int, shared_limit: int, mf_capacity: int) -> int:
+        """Return the lanes per world (8 or 16) that pack a small complete sparse sweep, or 0 for whole warps.
+
+        Args:
+            solve_shared_bytes: Shared memory of one world's full ordered sweep.
+            shared_limit: Static shared memory available to one block.
+            mf_capacity: Independent free-body rows per world.
+        """
+        if (
+            os.environ.get("FEATHER_PGS_SPARSE_SMALL_WORLDS", "1") == "0"
+            or mf_capacity
+            or self._has_free_rigid_bodies
+            or self.max_world_dofs > 16
+            or self.dense_max_constraints > 64
+        ):
+            return 0
+        lanes = 8 if self.max_world_dofs <= 8 else 16
+        return lanes if solve_shared_bytes * (32 // lanes) <= shared_limit else 0
+
+    def _admit_sparse_active_rows(
+        self, *, split_candidate: bool, velocity_candidate: bool, small_world_lanes: int
+    ) -> tuple[bool, str]:
+        """Decide whether the native sparse sweep selects its normal and limit rows at sweep entry, and why.
+
+        Under this law a zero-impulse row that a sweep's earlier updates violate waits for
+        the next sweep. Patch friction (``friction_anchor_beta > 0``) adopts it: a friction
+        pair is visited while any normal of its patch ring is selected or the pair holds
+        impulse, which skips only pairs whose update would be a no-op. Small worlds keep
+        their packed lanes, and ``FEATHER_PGS_PATCH_ACTIVE_ROWS=0`` keeps patch friction on
+        the full ordered sweep.
+
+        Args:
+            split_candidate: Whether split mode sweeps the sparse rows.
+            velocity_candidate: Whether the sweep carries joint velocity-limit rows.
+            small_world_lanes: Lanes per world of a packed small-world sweep, 0 for whole warps.
+        """
+        if not self._kernel_overrides.get("sparse_active_contacts", True):
+            return False, "A private sparse_active_contacts override disables the active-row scan."
+        if split_candidate or velocity_candidate:
+            return False, "Split and velocity-limit rows keep full ordered sweeps."
+        if self._has_free_rigid_bodies:
+            return False, "Independent free-body rows keep full ordered sweeps."
+        if not self._friction_anchors_enabled:
+            return True, "Point-contact normal and limit rows are selected at sweep entry."
+        if not self._patch_active_rows:
+            return False, (
+                "FEATHER_PGS_PATCH_ACTIVE_ROWS=0 keeps patch friction (friction_anchor_beta > 0) on the full "
+                "ordered sweep."
+            )
+        if small_world_lanes:
+            return False, (
+                f"Patch friction (friction_anchor_beta > 0) keeps the packed {small_world_lanes}-lane full sweep "
+                "of small worlds."
+            )
+        return True, (
+            "Normal and limit rows are selected at sweep entry; a patch friction pair (friction_anchor_beta > 0) "
+            "while any normal of its ring is selected or the pair holds impulse."
         )
 
     def _build_body_maps(self, model):

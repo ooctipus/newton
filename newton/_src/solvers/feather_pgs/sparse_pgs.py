@@ -35,6 +35,7 @@ def _get_pgs_solve_sparse_kernel(
     lanes_per_world: int = 32,
     local_factors: bool = False,
     warm_start: bool = False,
+    linked_rows: bool = False,
 ) -> wp.Kernel:
     """Build a CUDA sweep over factored articulations and physical free bodies.
 
@@ -56,6 +57,14 @@ def _get_pgs_solve_sparse_kernel(
     ``active_rows`` selects point-contact normal/limit rows at sweep entry,
     then retains their ordered GS updates. Newly violated zero rows wait until
     the next sweep; mixed responses and linked patches retain the full sweep.
+
+    ``linked_rows`` admits ring-linked patch normals to the active-row scan.
+    A first tangent is then selected while any normal of its patch ring is
+    selected at sweep entry, or while either of its tangents holds impulse.
+    A normal unselected at entry keeps zero impulse through the sweep, so a
+    ring without a selected normal keeps zero load, and the ordinary update
+    of its zero-impulse pair would be a no-op. Unlinked normals select as
+    without ``linked_rows``.
 
     ``use_support_table`` reads identical padded indices from a shared
     topology table. It requires a single factored articulation per world,
@@ -134,6 +143,7 @@ def _get_pgs_solve_sparse_kernel(
     velocity_limit_type = int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
     active_rows = bool(active_rows) and F == 0 and P == 0
     contact_triplets = bool(contact_triplets) and active_rows and use_support_table and M >= 3
+    linked_rows = bool(linked_rows) and active_rows
     active_storage = active_initialize = active_scan = ""
     row_loop = "        for (int row = 0; row < count; ++row) {"
     row_loop_end = "        }"
@@ -151,6 +161,21 @@ def _get_pgs_solve_sparse_kernel(
         if (type[row] == {contact_type} && world_row_parent.data[offset + row] >= 0) linked = true;
     const bool select_active = __ballot_sync(MASK, linked) == 0u && isfinite(omega) && omega >= 0.0f;
 """
+        tangent_selection = """selected = row == parent + 1 && (
+                        ((normal_words[parent / 32] >> (parent & 31)) & 1u) != 0u
+                        || impulse[row] != 0.0f || impulse[parent + 2] != 0.0f);"""
+        if linked_rows:
+            # Rings select by their pooled load below; no linked world falls back.
+            active_initialize = """
+    const bool select_active = isfinite(omega) && omega >= 0.0f;
+"""
+            # Walk the ring as the pair update pools its load, from the pair's own normal.
+            tangent_selection = """selected = row == parent + 1 && (impulse[row] != 0.0f || impulse[parent + 2] != 0.0f);
+                    for (int next = parent; row == parent + 1 && !selected && next >= 0;) {
+                        selected = ((normal_words[next / 32] >> (next & 31)) & 1u) != 0u;
+                        next = world_row_parent.data[offset + next];
+                        if (next == parent) break;
+                    }"""
         active_scan = f"""
         for (int first = 0; first < count; first += 32) {{
             const int row = first + lane;
@@ -192,9 +217,7 @@ def _get_pgs_solve_sparse_kernel(
                 if (select_active && type[row] == {friction_type}
                     && global_iteration >= friction_start_iteration) {{
                     const int parent = world_row_parent.data[offset + row];
-                    selected = row == parent + 1 && (
-                        ((normal_words[parent / 32] >> (parent & 31)) & 1u) != 0u
-                        || impulse[row] != 0.0f || impulse[parent + 2] != 0.0f);
+                    {tangent_selection}
                 }}
             }}
             const unsigned mask = __ballot_sync(MASK, selected);
@@ -710,6 +733,8 @@ def _get_pgs_solve_sparse_kernel(
         suffix += "_support_table"
     if contact_triplets:
         suffix += "_contact_triplets"
+    if linked_rows:
+        suffix += "_linked"
     if velocity_limits:
         suffix += "_velocity_limits"
     if L != 32:

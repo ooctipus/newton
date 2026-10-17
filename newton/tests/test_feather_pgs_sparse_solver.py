@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Integration checks for the sparse dynamics and contact path."""
 
+import os
 import unittest
 from unittest import mock
 
@@ -395,8 +396,17 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         return identities
 
     def test_two_articulations_share_contact_solve(self):
-        """Distinguish factor groups from worlds when two branched robots contact each other."""
-        dense, sparse = _case(False, robot_count=2), _case(True, robot_count=2)
+        """Distinguish factor groups from worlds when two branched robots contact each other.
+
+        The dense route sweeps every row, so the sparse arm keeps patch friction's
+        full ordered sweep and the comparison isolates the representation. On this
+        fixture the active-row law alone moves joint velocities by up to 0.07 for
+        either friction law (test_feather_pgs_sparse_patch_rows covers it).
+        """
+        dense = _case(False, robot_count=2)
+        with mock.patch.dict(os.environ, {"FEATHER_PGS_PATCH_ACTIVE_ROWS": "0"}):
+            sparse = _case(True, robot_count=2)
+        self.assertFalse(sparse[1]._sparse_active_rows)
         self.assertEqual(sparse[1]._sparse_mass_matrix_size, 9)
         self.assertEqual(sparse[1]._sparse_Linv.shape[0], 4)
         self.assertEqual(sparse[1].world_count, 2)

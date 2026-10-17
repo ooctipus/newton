@@ -344,6 +344,12 @@ FLAGS = declare(
         "Values other than 1 disable independent components in the paired response.",
     ),
     _flag(
+        "FEATHER_PGS_PATCH_ACTIVE_ROWS",
+        "policy",
+        _SOLVER,
+        "=0 keeps patch friction on the full ordered sparse sweep instead of the active-row scan (default on).",
+    ),
+    _flag(
         "FEATHER_PGS_PATCH_PARALLEL_ROWS",
         "experiment",
         _SOLVER,
