@@ -92,8 +92,8 @@ _EFFECTIVE = {
     "cached_dynamics": lambda solver: "on" if solver._tree_kinetic_state is not None else "off",
     "parallel_tree": lambda solver: solver._tree_plan is not None,
     "grouped_dynamics": lambda solver: solver._grouped_topology is not None,
-    # Deferred publication acts only with the fused world-dynamics kernel (K1).
-    "lazy_kinematics": lambda solver: bool(solver.lazy_kinematics and solver._fused_k1),
+    # Deferred publication acts only with the fused world-dynamics kernel (K1), and not under patch friction.
+    "lazy_kinematics": lambda solver: solver._publication_deferred(),
     # Tier budgets after their gates and clamps.
     "mf_gs_parallel_rows": lambda solver: int(solver._ink_rows),
     "mf_gs_parallel_matrix_free": lambda solver: bool(solver.mf_gs_parallel_matrix_free and solver._ink_rows > 0),
@@ -610,8 +610,10 @@ def _publication(solver, source) -> dict:
     fused = bool(solver._fused_publication)
     if solver._tree_kinetic_state is not None:
         owner, reason = "cached", "The held-tree owner publishes next-step state."
-    elif solver.lazy_kinematics and solver._fused_k1:
+    elif solver._publication_deferred():
         owner, reason = "deferred", "Fused current dynamics permits deferred kinematics publication."
+    elif solver.lazy_kinematics and solver._fused_k1:
+        owner, reason = "ordinary", "Patch friction publishes every substep for its release test."
     elif fused:
         owner, reason = "fused_general", "Each articulation publishes in one launch per size group."
     elif not source._FUSED_PUBLISH:

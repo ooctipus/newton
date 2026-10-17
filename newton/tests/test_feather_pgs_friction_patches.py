@@ -5,6 +5,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -1143,6 +1144,76 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                     self.assertLess(abs(float(s0.body_q.numpy()[0, 5])), 0.01)
                 else:
                     self.assertGreater(angular_speed, 1.0)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "The fused world-dynamics kernel is a CUDA path")
+    def test_lazy_publication_precedes_the_release_test(self):
+        """Step lazy and ordinary publication bit for bit while twisted anchors saturate and slip."""
+        from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module  # noqa: PLC0415
+        from newton.tests.test_feather_pgs_mixed_tree_free_body import DT, _build  # noqa: PLC0415
+
+        model = _build(wp.get_device("cuda:0"), quadruped=True)
+        types, children = model.joint_type.numpy(), model.joint_child.numpy()
+        starts, q_start = model.articulation_start.numpy(), model.joint_q_start.numpy()
+        # One free box per world rests on the ground under a yaw torque its friction cannot hold.
+        boxes = [
+            int(starts[a])
+            for a in range(model.articulation_count)
+            if starts[a + 1] - starts[a] == 1 and types[starts[a]] == int(newton.JointType.FREE)
+        ]
+        self.assertEqual(len(boxes), model.world_count)
+        joint_q = model.joint_q.numpy()
+        joint_q[q_start[boxes] + 2] = 0.049
+        torque = np.zeros((model.body_count, 6), dtype=np.float32)
+        torque[children[boxes], 5] = 0.5
+        arms = []
+        for lazy in (False, True):
+            # The reference takes the separate publication launches that the lazy arm forces.
+            with mock.patch.object(solver_module, "_FUSED_PUBLISH", False):
+                solver = newton.solvers.SolverFeatherPGS(
+                    model,
+                    pgs_mode="matrix_free",
+                    pgs_iterations=8,
+                    enable_joint_limits=True,
+                    update_mass_matrix_interval=2,
+                    dense_max_constraints=256,
+                    grouped_dynamics=True,
+                    lazy_kinematics=lazy,
+                    cached_dynamics="off",
+                    sparse_mass_matrix="off",
+                    friction_anchor_beta=0.2,
+                )
+            self.assertTrue(solver._fused_k1)
+            self.assertFalse(solver._fused_publication_admitted())
+            self.assertEqual(solver.get_path_selection()["publication"], "ordinary")
+            pipeline = newton.CollisionPipeline(model)
+            states = [model.state(), model.state()]
+            states[0].joint_q.assign(joint_q)
+            newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+            arms.append((solver, pipeline, pipeline.contacts(), states, model.control()))
+        carried = False
+        for _ in range(16):
+            for solver, pipeline, contacts, states, control in arms:
+                pipeline.collide(states[0], contacts)
+                states[0].body_f.assign(torque)
+                solver.step(states[0], states[1], control, contacts, DT)
+                states.reverse()
+            for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
+                first, second = (getattr(arm[3][0], name).numpy() for arm in arms)
+                np.testing.assert_array_equal(first, second, err_msg=name)
+            histories = [arm[0]._friction_patches.previous for arm in arms]
+            for name in ("valid", "tangent_impulse"):
+                first, second = (getattr(history, name).numpy() for history in histories)
+                np.testing.assert_array_equal(first, second, err_msg=f"previous.{name}")
+            carried |= bool(histories[0].valid.numpy().any())
+        self.assertTrue(carried, "Anchors must carry history before they slip")
+        spin = arms[0][3][0].body_qd.numpy()[children[boxes], 5]
+        self.assertTrue(np.all(np.abs(spin) > 1.0), "Every twisted box must slip")
+        # Publishing again on request reproduces the already published state.
+        solver, _, _, states, _ = arms[1]
+        published = [states[0].body_q.numpy().copy(), states[0].body_qd.numpy().copy()]
+        solver.publish_kinematics(states[0])
+        np.testing.assert_array_equal(states[0].body_q.numpy(), published[0])
+        np.testing.assert_array_equal(states[0].body_qd.numpy(), published[1])
 
     def test_pooled_coulomb_budget(self):
         """Share the loaded middle normal's budget across two unloaded anchor normals."""

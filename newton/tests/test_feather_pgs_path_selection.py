@@ -545,6 +545,20 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             with self.subTest(choice=choice), self.assertRaisesRegex(ValueError, "cached_dynamics"):
                 SolverFeatherPGS(model, cached_dynamics=choice)
 
+    def test_cpu_patch_publication_is_never_deferred(self):
+        """Report every-substep publication for patch friction, even with lazy kinematics on the fused kernel."""
+        for beta, publication in ((0.0, "deferred"), (0.2, "ordinary")):
+            with self.subTest(friction_anchor_beta=beta):
+                solver = SolverFeatherPGS(_cpu_model(), friction_anchor_beta=beta, lazy_kinematics=True)
+                # A stand-in for the CUDA-only fused world-dynamics kernel: the record reads host flags only.
+                solver._fused_k1 = True
+                selected = solver.get_path_selection()
+                self.assertEqual(selected["publication"], publication)
+                self.assertEqual(selected["routes"]["publication"]["owner"], publication)
+                if beta:
+                    self.assertIn("release test", selected["reasons"]["publication"])
+                    self.assertIn("release test", selected["routes"]["publication"]["reason"])
+
     @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
     def test_cached_dynamics_overrides_environment_and_dense_conflicts(self):
         """Honor explicit cache choices and retain automatic dense kernel requests."""

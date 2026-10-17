@@ -1621,7 +1621,9 @@ class SolverFeatherPGS(SolverBase):
             lazy_kinematics (bool, optional): With the fused world-dynamics kernel, skip the end-of-substep
                 forward-kinematics publish (body poses, CoM velocities, cached dynamics) and publish only when
                 :meth:`publish_kinematics` is called (Isaac Lab calls it before collision and sensor updates).
-                The fused kernel recomputes kinematics from ``joint_q`` at the start of every substep.
+                The fused kernel recomputes kinematics from ``joint_q`` at the start of every substep. Persistent
+                patch friction (``friction_anchor_beta > 0``) still publishes every substep: its anchor release
+                test reads the integrated body state.
                 Experimental: useful when several substeps share a publication point. The caller must publish
                 before collision, sensors, or any other body-state read; without a compatible fused kernel,
                 this option saves no publication work. Keep False if those hooks are absent, or to retain
@@ -3386,11 +3388,7 @@ class SolverFeatherPGS(SolverBase):
             "requested": dict(self._requested_kernel_choices),
             "sparse_mass_matrix": "on" if self._sparse_mass_matrix_size is not None else "off",
             "cached_dynamics": "on" if cached else "off",
-            "publication": "cached"
-            if cached
-            else "deferred"
-            if self.lazy_kinematics and self._fused_k1
-            else "ordinary",
+            "publication": "cached" if cached else "deferred" if self._publication_deferred() else "ordinary",
             "pgs_kernel": "matrix_free" if self.pgs_mode == "matrix_free" else self.pgs_kernel,
             "kernel_plan_by_dof": kernels,
             "cached_prediction": "tree" if self._tree_kinetic_state is not None else None,
@@ -3400,6 +3398,8 @@ class SolverFeatherPGS(SolverBase):
                 "publication": "Paired cache owns next-state publication."
                 if cached
                 else "Fused current dynamics permits deferred kinematics publication."
+                if self._publication_deferred()
+                else "Patch friction publishes every substep for its release test."
                 if self.lazy_kinematics and self._fused_k1
                 else "Ordinary state publication remains active.",
                 "pgs_kernel": "Matrix-free mode owns the iteration kernel; split PGS selection is unused."
@@ -10984,6 +10984,9 @@ class SolverFeatherPGS(SolverBase):
         # the MF carry below).
         if self._friction_anchors_enabled:
             with wp.ScopedTimer("S7_Friction_Patch_Carry", print=False, use_nvtx=self._nvtx, synchronize=False):
+                if self._fused_k1 and self.lazy_kinematics:
+                    # The release test reads the integrated public body state.
+                    self._stage7_update_kinematics(state_out, state_aug, force=True)
                 self._finish_friction_patches(state_in, state_out, contacts, dt)
 
         if self.pgs_warmstart and self._ws_prev_dense_impulses is not None:
@@ -16662,6 +16665,15 @@ class SolverFeatherPGS(SolverBase):
         """Publish body poses and CoM velocities of ``state`` (used with ``lazy_kinematics``)."""
         if self._fused_k1 and self.lazy_kinematics:
             self._stage7_update_kinematics(state, self._last_debug_state_aug, force=True)
+
+    def _publication_deferred(self) -> bool:
+        """Whether body-state publication waits for :meth:`publish_kinematics`.
+
+        Only the fused world-dynamics kernel defers it. Patch friction
+        publishes every substep, because its anchor release test reads the
+        integrated body state.
+        """
+        return bool(self.lazy_kinematics and self._fused_k1 and not self._friction_anchors_enabled)
 
     def _fused_publication_admitted(self) -> bool:
         """Admit the one-launch-per-size-group publication of the general route.
