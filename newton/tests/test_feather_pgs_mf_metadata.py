@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Exercise MF parent indices beyond the signed-16-bit boundary."""
+"""Exercise MF metadata: parent indices beyond the signed-16-bit boundary and the pack launch policy."""
 
 import inspect
 import re
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import warp as wp
@@ -13,6 +15,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import solver_feather_pgs as fpgs
 from newton.tests.feather_pgs_paired_fixture import solve_fixture
+from newton.tests.test_feather_pgs_fused_publication import _build_pendulums
 
 
 def _parent_decoder(source, *, name="mf_par", packed="packed_tp"):
@@ -45,7 +48,71 @@ def _metadata_packer(source):
     return pack_rows
 
 
+def _pack_state(has_free_rigid_bodies):
+    """Stand in for a solver with opaque metadata-pack operands."""
+    state = SimpleNamespace(
+        _pack_mf_meta_kernel=object(),
+        _has_free_rigid_bodies=has_free_rigid_bodies,
+        world_count=7,
+        model=SimpleNamespace(device="mock-device"),
+    )
+    for name in (
+        "mf_constraint_count",
+        "mf_dof_a",
+        "mf_dof_b",
+        "mf_eff_mass_inv",
+        "mf_row_type",
+        "mf_row_parent",
+        "mf_meta_packed",
+    ):
+        setattr(state, name, object())
+    return state
+
+
 class TestFeatherPGSMFMetadata(unittest.TestCase):
+    def test_pack_launch_requires_free_rigid_bodies(self):
+        """Launch the metadata pack only when free rigid bodies can produce matrix-free rows."""
+        rhs = object()
+        for has_free in (False, True):
+            state = _pack_state(has_free)
+            with (
+                self.subTest(has_free_rigid_bodies=has_free),
+                patch.object(fpgs.wp, "launch_tiled") as launch,
+            ):
+                fpgs.SolverFeatherPGS._pack_mf_meta(state, rhs)
+                if not has_free:
+                    launch.assert_not_called()
+                else:
+                    launch.assert_called_once_with(
+                        state._pack_mf_meta_kernel,
+                        dim=[7],
+                        inputs=[
+                            state.mf_constraint_count,
+                            state.mf_dof_a,
+                            state.mf_dof_b,
+                            state.mf_eff_mass_inv,
+                            rhs,
+                            state.mf_row_type,
+                            state.mf_row_parent,
+                        ],
+                        outputs=[state.mf_meta_packed],
+                        block_dim=32,
+                        device="mock-device",
+                    )
+
+    def test_missing_pack_kernel_still_raises(self):
+        """Keep the missing-kernel error whether or not matrix-free rows can exist."""
+        for has_free in (False, True):
+            state = _pack_state(has_free)
+            state._pack_mf_meta_kernel = None
+            with (
+                self.subTest(has_free_rigid_bodies=has_free),
+                patch.object(fpgs.wp, "launch_tiled") as launch,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "pack kernel is unavailable"):
+                    fpgs.SolverFeatherPGS._pack_mf_meta(state, object())
+                launch.assert_not_called()
+
     def test_pack_preserves_parent_bits_and_no_parent(self):
         """Preserve the existing word layout using defined unsigned shift arithmetic."""
         parents = np.array([-1, 0, 32767, 32768, 37247, 65534], np.int32)
@@ -271,6 +338,116 @@ class TestFeatherPGSMFMetadataCUDA(unittest.TestCase):
                 self.assertTrue(np.all(high[1][:, 0] > 0))
                 self.assertTrue(np.all(np.linalg.norm(high[1][:, 1:], axis=1) > 0))
                 self.assertTrue(np.all(np.linalg.norm(high[1][:, 1:], axis=1) <= 0.4 * high[1][:, 0] + 1e-6))
+
+
+def _record_pack_launches(solver):
+    """Record the RHS operand of each metadata-pack launch while still launching it."""
+    launch_tiled = wp.launch_tiled
+    packed = []
+
+    def record(kernel, *args, **kwargs):
+        if kernel is solver._pack_mf_meta_kernel:
+            packed.append(kwargs["inputs"][4])
+        return launch_tiled(kernel, *args, **kwargs)
+
+    return packed, patch.object(fpgs.wp, "launch_tiled", record)
+
+
+def _launch_pack_unconditionally(solver):
+    """Restore the launch that ran before the skip, whether or not matrix-free rows exist."""
+
+    def pack(mf_rhs):
+        wp.launch_tiled(
+            solver._pack_mf_meta_kernel,
+            dim=[solver.world_count],
+            inputs=[
+                solver.mf_constraint_count,
+                solver.mf_dof_a,
+                solver.mf_dof_b,
+                solver.mf_eff_mass_inv,
+                mf_rhs,
+                solver.mf_row_type,
+                solver.mf_row_parent,
+            ],
+            outputs=[solver.mf_meta_packed],
+            block_dim=32,
+            device=solver.model.device,
+        )
+
+    solver._pack_mf_meta = pack
+
+
+def _step_matrix_free(model, solver, *, steps, joint_qd=0.0, dt=1.0 / 240.0):
+    """Step through the collision pipeline; return the pack launches and the final values."""
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    contacts = pipeline.contacts()
+    states = [model.state() for _ in range(2)]
+    newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+    states[0].joint_qd.fill_(joint_qd)
+    control = model.control()
+    packed, recording = _record_pack_launches(solver)
+    with recording:
+        for _ in range(steps):
+            pipeline.collide(states[0], contacts)
+            states[0].clear_forces()
+            solver.step(states[0], states[1], control, contacts, dt)
+            states.reverse()
+    values = {name: getattr(states[0], name).numpy() for name in ("joint_q", "joint_qd", "body_q", "body_qd")}
+    for name in ("impulses", "v_out", "mf_constraint_count", "mf_meta_packed"):
+        values[name] = getattr(solver, name).numpy()
+    values["contact_count"] = contacts.rigid_contact_count.numpy()
+    return packed, values
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "Matrix-free stepping requires CUDA")
+class TestFeatherPGSMFMetadataPackCUDA(unittest.TestCase):
+    def test_no_free_rigid_bodies_skip_pack_and_keep_steps(self):
+        """Skip both pack launches without free rigid bodies and match the unskipped steps bit for bit."""
+        model = _build_pendulums(wp.get_device("cuda:0"))
+        steps = 16
+        for velocity_iterations in (0, 2):
+            with self.subTest(velocity_iterations=velocity_iterations):
+                runs = []
+                for unconditional in (False, True):
+                    solver = fpgs.SolverFeatherPGS(
+                        model, pgs_mode="matrix_free", pgs_iterations=6, pgs_velocity_iterations=velocity_iterations
+                    )
+                    self.assertFalse(solver._has_free_rigid_bodies)
+                    self.assertIsNotNone(solver._pack_mf_meta_kernel)
+                    if unconditional:
+                        _launch_pack_unconditionally(solver)
+                    runs.append((solver, *_step_matrix_free(model, solver, steps=steps, joint_qd=0.2)))
+                (_, skipped_packs, skipped), (legacy, legacy_packs, unskipped) = runs
+                self.assertEqual(skipped_packs, [])
+                # The legacy arm proves both call sites ran: position pass, then velocity pass.
+                passes = 2 if velocity_iterations else 1
+                expected = [legacy.mf_rhs, legacy.mf_rhs_unbiased][:passes] * steps
+                self.assertEqual(len(legacy_packs), len(expected))
+                for actual, rhs in zip(legacy_packs, expected, strict=True):
+                    self.assertIs(actual, rhs)
+                self.assertTrue(np.all(skipped["contact_count"] > 0))
+                self.assertTrue(np.any(skipped["impulses"] != 0.0))
+                np.testing.assert_array_equal(skipped["mf_constraint_count"], 0)
+                np.testing.assert_array_equal(skipped["mf_meta_packed"], 0)
+                for name, value in skipped.items():
+                    np.testing.assert_array_equal(value, unskipped[name], err_msg=name)
+
+    def test_free_rigid_bodies_keep_both_pack_launches(self):
+        """Pack the position and velocity problems on every step when free rigid bodies exist."""
+        builder = newton.ModelBuilder()
+        builder.rigid_gap = 0.01
+        builder.add_ground_plane()
+        box = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()))
+        builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05)
+        model = builder.finalize(device=wp.get_device("cuda:0"))
+        solver = fpgs.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_iterations=6, pgs_velocity_iterations=2)
+        self.assertTrue(solver._has_free_rigid_bodies)
+        steps = 4
+        packed, values = _step_matrix_free(model, solver, steps=steps)
+        self.assertGreater(int(values["mf_constraint_count"].max()), 0)
+        self.assertEqual(len(packed), 2 * steps)
+        for index, rhs in enumerate(packed):
+            self.assertIs(rhs, solver.mf_rhs_unbiased if index % 2 else solver.mf_rhs)
 
 
 if __name__ == "__main__":

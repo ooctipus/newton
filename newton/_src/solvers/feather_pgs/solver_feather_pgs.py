@@ -6258,11 +6258,12 @@ class SolverFeatherPGS(SolverBase):
 
         if not self._has_free_rigid_bodies:
             # pgs_mode == "matrix_free" with no free rigid bodies: the step
-            # path still passes mf_* arrays to kernels (pack_mf_meta, the
-            # fused GS solve, the PGS diagnostics), but mf_constraint_count
-            # stays zero so every mf access is bounded by m_mf == 0 and no
-            # element is ever read or written. One-slot dummies stand in for
-            # the large (worlds, mf_max_constraints, ...) buffers.
+            # path still passes mf_* arrays to kernels (the fused GS solve,
+            # the PGS diagnostics), but mf_constraint_count stays zero so
+            # every mf access is bounded by m_mf == 0 and no element is ever
+            # read or written; _pack_mf_meta skips its launch. One-slot
+            # dummies stand in for the large (worlds, mf_max_constraints, ...)
+            # buffers.
             self._allocate_mf_dummy_buffers(model)
             return
 
@@ -6443,11 +6444,13 @@ class SolverFeatherPGS(SolverBase):
     def _allocate_mf_dummy_buffers(self, model):
         """Allocate one-slot MF dummies for matrix_free models with no free rigid bodies.
 
-        ``mf_constraint_count`` is allocated zero and never written on this
-        path (``finalize_mf_constraint_counts`` only launches when MF is
-        active), so the generated pack/GS kernels and the PGS diagnostics
-        never dereference an mf element: every access sits inside a loop
-        bounded by ``m_mf = mf_constraint_count[world] == 0``. Only the
+        ``mf_constraint_count`` is allocated zero and never written nonzero on
+        this path (``_clear_dense_row_state`` and
+        ``finalize_constraint_counts_with_status`` write it only when MF is
+        active), so the generated GS kernels and the PGS diagnostics never
+        dereference an mf element: every access sits inside a loop bounded by
+        ``m_mf = mf_constraint_count[world] == 0``. The metadata pack would
+        write nothing, so :meth:`_pack_mf_meta` does not launch it. Only the
         per-world count must keep its real width; the per-constraint arrays
         shrink to a single slot. The split-only buffers (``mf_body_Hinv``,
         ``mf_body_list`` et al., ``max_mf_bodies``) are skipped entirely so
@@ -7703,9 +7706,15 @@ class SolverFeatherPGS(SolverBase):
         return iterations - active
 
     def _pack_mf_meta(self, mf_rhs: wp.array) -> None:
+        """Pack matrix-free row metadata for the GS kernels, or skip when no such row can exist."""
         pack_kernel = self._pack_mf_meta_kernel
         if pack_kernel is None:
             raise RuntimeError("Matrix-free metadata pack kernel is unavailable for this solver shape")
+        if not self._has_free_rigid_bodies:
+            # Only free rigid bodies produce matrix-free rows, and the model plan fixes
+            # them at construction: mf_constraint_count stays zero on the one-slot
+            # dummy buffers, so the pack would write nothing.
+            return
         wp.launch_tiled(
             pack_kernel,
             dim=[self.world_count],
