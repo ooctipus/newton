@@ -233,6 +233,9 @@ _LINKED_LAYOUTS = {
     # The anchor's own normal separates; the other normal of its ring loads it.
     "two_member_ring": ((0, True, 0.15), (0, False, -0.3)),
     "three_member_ring": ((0, True, -0.1), (0, False, 0.2), (0, True, -0.25)),
+    # Only the fourth member is violated: selecting the pair, and the fused radius, need
+    # the whole ring.
+    "far_ring": ((0, True, 0.6), (0, False, 0.6), (0, False, 0.6), (0, False, -0.3)),
     "mixed_units": (
         (0, True, -0.2),
         (1, False, -0.1),
@@ -611,10 +614,11 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
     def test_linked_triplets_equal_linked_sweeps_bitwise_cuda(self):
         """Match the same linked sweep without triplets bitwise, and the ring-pooled physical reference.
 
-        Self-loops, two- and three-member rings, interleaved one- and three-row units
-        and an unlinked anchor, with and without a 30-row lead that moves records and
-        rings across 32-row words; zero and seeded impulses, delayed friction and
-        relaxation, in the linked active scan and in the full sweep.
+        Self-loops, two- and three-member rings, a four-member ring loaded only through
+        its last member, interleaved one- and three-row units and an unlinked anchor,
+        with and without a 30-row lead that moves records and rings across 32-row
+        words; zero and seeded impulses, delayed friction and relaxation, in the
+        linked active scan and in the full sweep.
         """
         settings = (
             {},

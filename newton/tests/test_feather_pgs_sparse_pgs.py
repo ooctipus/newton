@@ -184,6 +184,12 @@ def _problem(dofs=43, support=18, seeded=False, *, contact_activity=None):
             bias[3] = -1.0
             parents[0], parents[3] = 3, 0
             impulses[3] = 0.5
+        elif contact_activity == "linked_far_ring":
+            # The anchor and the next normal of its ring separate; only the third ring
+            # member is violated at sweep entry, so only a whole ring walk visits the pair.
+            rows[4, 2] = 1.0
+            bias[3], bias[4] = 0.25, -1.0
+            parents[0], parents[3], parents[4] = 3, 4, 0
         else:
             raise ValueError(f"Unknown contact activity: {contact_activity}")
     jacobian = rows @ factor.T
@@ -671,7 +677,8 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
     def test_cuda_linked_active_sweeps_match_reference(self):
         """Select patch rings at sweep entry with seeded impulses, delayed friction, word-crossing rings and replay.
 
-        Worlds without a linked normal also match the point active kernel bitwise.
+        A ring loaded only through its third member checks the whole ring walk. Worlds
+        without a linked normal also match the point active kernel bitwise.
         """
         for use_support_table in (False, True):
             with self.subTest(use_support_table=use_support_table):
@@ -687,7 +694,7 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
         if active_rows:
             cases.extend((3, 3, activity) for activity in ("deferred_activation", "near_singular", "negative_omega"))
         if linked_rows:
-            cases.append((3, 3, "linked_deferral"))
+            cases.extend((3, 3, activity) for activity in ("linked_deferral", "linked_far_ring"))
         for dofs, support, contact_activity in cases:
             if lanes_per_world < 32 and dofs > lanes_per_world:
                 continue
@@ -746,6 +753,10 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                         self.assertGreater(np.linalg.norm(expected_impulses[1:3]), 0.0)
                         if contact_activity == "linked_load":
                             self.assertEqual(expected_impulses[0], 0.0)
+                        elif contact_activity == "linked_far_ring":
+                            # The pair's load comes from the ring's third member alone.
+                            np.testing.assert_array_equal(expected_impulses[[0, 3]], 0.0)
+                            self.assertGreater(expected_impulses[4], 0.0)
                     worlds, capacity = 3, count + 2
                     row_dof = np.full((worlds, capacity, support), -1, dtype=np.int32)
                     row_dof[:, :count] = indices
