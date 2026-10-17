@@ -27033,8 +27033,15 @@ def _get_pgs_solve_parallel_kernel(
     lean_sweep: bool = False,
     bound_finger: bool = False,
     row_inputs=None,
+    linked_rows: bool = False,
 ) -> "wp.Kernel":
     """Scaled parallel projection (Jacobi with per-row step scaling and Nesterov momentum) for dense-row worlds.
+
+    With ``linked_rows`` (persistent patch friction) each friction pair is scaled into the disk of radius
+    ``mu * (sum of its patch ring's normal impulses)`` instead. A contact row's parent links the next normal of its
+    patch (a circular list, -1 for a contact without a patch), as the patch link writes it before the sweep. Within
+    a sweep every pair reads the freshly clamped impulses of all its ring's normals, which this sweep updated
+    together, just as a point pair reads its own freshly clamped normal.
 
     With ``inkernel_response=(NA, NB, OA, OB)`` (group sizes and world-DOF offsets; matrix-free only) the kernel does not read ``J_world``/``Y_world``/``diag``:
     it gathers the group-layout Jacobian rows of the world's (at most two) articulations, solves ``Y = H^-1 J^T``
@@ -27093,6 +27100,9 @@ def _get_pgs_solve_parallel_kernel(
     WWC = 64  # per-world contact table capacity  # contact rows (geometry, metadata, bias, J) built in-kernel from per-world contact lists
     if WR and not INK:
         raise ValueError("world_rows needs inkernel_response")
+    if WR and linked_rows:
+        # The in-sweep builder writes point rows after the patch link: parents -1 and undivided coefficients.
+        raise ValueError("world_rows builds point friction rows; linked_rows needs the patch link's rows")
     WC = M_D  # per-world contact list capacity
     ZG = 1 if (INK and not matrix_free) else 0  # A-based: Z rows live in the world response buffer, not shared memory
     if ZG and D * (AM + 4) > AM * (AM + 1):
@@ -27875,6 +27885,8 @@ def _get_pgs_solve_parallel_kernel(
             f"s_L[e] = ink_L_a.data[(size_t)ink_ga * {NA} * {NA} + e];\n" + reconstruct
         )
         snippet = snippet.replace(reconstruct, reloaded)
+    if linked_rows:
+        snippet = _link_parallel_friction_pairs(snippet)
 
     def pgs_solve_parallel_signature(
         world: int,
@@ -27992,6 +28004,8 @@ def _get_pgs_solve_parallel_kernel(
     )
     if skip_local_internal_worlds:
         name += "_local_fallback"
+    if linked_rows:
+        name += "_linked"
     if row_inputs is not None:
         name = name.replace("pgs_solve_parallel_", "pgs_solve_kinetic_keyed_parallel_", 1)
     kernel = make_row_kernel(name, snippet, pgs_solve_parallel_signature, input_arguments, dispatch="parallel")
@@ -28000,3 +28014,39 @@ def _get_pgs_solve_parallel_kernel(
     kernel._fpgs_extra_inputs = True  # takes the in-kernel response inputs after defer_dense_response
     kernel._fpgs_world_rows = bool(WR)
     return kernel
+
+
+def _link_parallel_friction_pairs(snippet: str) -> str:
+    """Pool each friction pair's cone over its patch ring in a parallel sweep snippet.
+
+    Normal rows keep their clamped value through the friction projection, so a pair
+    reads every normal of its ring at the value this sweep stores, summed in ring
+    order from the pair's own normal as the ordered sweeps sum it.
+    """
+    ring = (
+        "float load = s_x[p];\n"
+        "{indent}for (int ring = s_parent[p], hop = 0; ring >= 0 && ring < n_rows && ring != p && hop < n_rows;"
+        " ring = s_parent[ring], ++hop)\n"
+        "{indent}    load += s_x[ring];\n"
+        "{indent}const float radius = fmaxf(s_mu[i] * load, 0.0f);\n"
+    )
+    # One warp: the normals arrive by shuffle in the point law; stage them for the ring walk instead.
+    warp_pair = (
+        "            const float xp = __shfl_sync(MASK, x_new[0], p & 31);\n"
+        "            const float xs = __shfl_sync(MASK, x_new[0], sib & 31);\n"
+        "            if (fr) {\n"
+        "                const float radius = fmaxf(s_mu[i] * xp, 0.0f);\n"
+    )
+    warp_ring = (
+        "            const float xs = __shfl_sync(MASK, x_new[0], sib & 31);\n"
+        "            if (i < n_rows) s_x[i] = x_new[0];\n"
+        "            __syncwarp();\n"
+        "            if (fr) {\n"
+        "                " + ring.format(indent="                ")
+    )
+    # Several warps already stage every row in s_x before projecting.
+    block_pair = "                const float radius = fmaxf(s_mu[i] * s_x[p], 0.0f);\n"
+    block_ring = "                " + ring.format(indent="                ")
+    if snippet.count(warp_pair) != 1 or snippet.count(block_pair) != 1:
+        raise ValueError("the parallel sweep's friction projection changed; update the patch ring walk")
+    return snippet.replace(warp_pair, warp_ring).replace(block_pair, block_ring)

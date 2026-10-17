@@ -78,6 +78,24 @@ def _label(name, args, kwargs):
     return f"{name}({', '.join(parts)})"
 
 
+def _linked_tier_calls():
+    """Patch-only parallel tiers, whose friction pairs pool their patch ring's normal impulses."""
+    for tier, matrix_free, inkernel in itertools.product(((32, 0), (48, 32)), (False, True), ((18, 0, 0, 0), None)):
+        kwargs = {
+            "rows": tier[0],
+            "min_rows": tier[1],
+            "sweeps": 24,
+            "matrix_free": matrix_free,
+            "inkernel_response": inkernel,
+            "exact_row_sums": matrix_free,
+            "linked_rows": True,
+        }
+        yield "solver_feather_pgs._get_pgs_solve_parallel_kernel", (64, 32, 18, _ARCH), kwargs
+
+
+_PATCH_ONLY |= frozenset(_label(name, args, kwargs) for name, args, kwargs in _linked_tier_calls())
+
+
 def _module_kernels():
     """Every non-generic kernel defined at module level in the FeatherPGS package."""
     package = importlib.import_module(_PACKAGE)
@@ -199,6 +217,8 @@ def _solver_factory_calls():
             (64, 32, 18, _ARCH),
             kwargs,
         )
+    for label, args, kwargs in _linked_tier_calls():
+        yield label, solver._get_pgs_solve_parallel_kernel, args, kwargs
 
 
 def _keyed_row_calls():
@@ -389,6 +409,10 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
         for flag in ("active_rows=True", "contact_triplets=True", "velocity_limits=True", "warm_start=True"):
             with self.subTest(flag=flag):
                 self.assertTrue(any(flag in name for name in sparse))
+        # The patch-only linked tiers are pinned beside the point tiers they extend.
+        linked = [name for name in self.current if "linked_rows=True" in name]
+        self.assertTrue(linked)
+        self.assertTrue(set(linked) <= _PATCH_ONLY)
 
 
 def record():
