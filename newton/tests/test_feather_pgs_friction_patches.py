@@ -144,6 +144,37 @@ class TestFrictionPatchHistory(unittest.TestCase):
                 np.testing.assert_allclose(locations @ across, 0.0, atol=1.0e-7)
                 np.testing.assert_allclose(np.sort(locations @ axis), [-0.025, 0.025], atol=1.0e-7)
 
+    def test_isotropic_footprint_pair_ignores_roundoff_and_placement(self):
+        """Keep a square's and a tripod's anchor pair when a corner moves one float32 ulp, near or far from the origin.
+
+        The pair starts at the lowest contact index and spans the footprint;
+        equally distant members go to the lower index. Neither the order of world
+        coordinates nor a roundoff-sized anisotropy may choose it.
+        """
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        angles = (0.0, 2.0 * np.pi / 3.0, 4.0 * np.pi / 3.0)
+        footprints = {
+            "square": ([[x, y, 0.0] for y in (-0.05, 0.05) for x in (-0.05, 0.05)], (0, 3)),
+            "tripod": ([[0.05 * np.cos(a), 0.05 * np.sin(a), 0.0] for a in angles], (0, 1)),
+        }
+        for name, (footprint, expected) in footprints.items():
+            for offset in (0.0, 1.5, 80.0):
+                points = (np.asarray(footprint) + np.array([offset, offset, 0.0])).astype(np.float32)
+                pairs = set()
+                for corner in range(len(points)):
+                    for step in (-1, 0, 1):
+                        moved = points.copy()
+                        if step != 0:
+                            moved[corner, 0] = np.nextafter(moved[corner, 0], np.float32(step * np.inf))
+                        _, _, _, patches = _patch_fixture(moved, device=device)
+                        held = np.flatnonzero(patches.view.weight.numpy()[: len(points)] > 0.0)
+                        pairs.add(tuple(held))
+                        with self.subTest(footprint=name, offset=offset, corner=corner, step=step):
+                            # Isotropic anchors sit on their carriers' contact centres.
+                            np.testing.assert_array_equal(patches.view.point_a.numpy()[held], moved[held])
+                with self.subTest(footprint=name, offset=offset):
+                    self.assertEqual(pairs, {expected})
+
     def test_pose_increment_preserves_fixed_pivots_and_no_slip_rolling(self):
         """Distinguish rigid rotation from slip without querying the collision shape."""
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
@@ -828,6 +859,57 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         self.assertLess(float(np.max(np.abs(poses[:, :2]))), 0.005)
         self.assertLess(float(np.max(np.linalg.norm(velocities[:, :3], axis=1))), 0.05)
         self.assertGreater(np.count_nonzero(solver._friction_patches.previous.valid.numpy()), 0)
+
+    def test_resting_cubes_keep_their_anchor_corners(self):
+        """Keep each resting cube's friction anchors on the same corners, so roundoff cannot kick it.
+
+        The worlds sit 1.5 m from the origin, where float32 contact centres
+        carry about 1e-7 m of quantization. At 8 iterations every swap of a
+        cube's anchor diagonal kicks it by milliradians per second.
+        """
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        # The free box of the mixed-tree parity scenes, alone: it lands from 1 cm.
+        scene = newton.ModelBuilder()
+        cfg = newton.ModelBuilder.ShapeConfig(mu=0.6)
+        cube = scene.add_body(xform=wp.transform(wp.vec3(0.15, 0.05, 0.06), wp.quat_identity()), mass=0.5)
+        scene.add_shape_box(cube, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+        builder = newton.ModelBuilder()
+        builder.replicate(scene, 4, spacing=(3.0, 3.0, 0.0))
+        builder.add_ground_plane(cfg=cfg)
+        model = builder.finalize(device=device)
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split", pgs_iterations=8)
+        self.assertTrue(solver._friction_anchors_enabled)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        s0, s1 = model.state(), model.state()
+        control = model.control()
+        shape_body, body_world = model.shape_body.numpy(), model.body_world.numpy()
+        corners, spin = [], []
+        for _ in range(120):
+            s0.clear_forces()
+            pipeline.collide(s0, contacts)
+            solver.step(s0, s1, control, contacts, 1.0 / 240.0)
+            s0, s1 = s1, s0
+            # On the CPU .numpy() views the state buffer that a later step reuses.
+            spin.append(s0.body_qd.numpy()[:, 3:].copy())
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            weight = solver._friction_patches.view.weight.numpy()[:count]
+            shape0, shape1 = contacts.rigid_contact_shape0.numpy(), contacts.rigid_contact_shape1.numpy()
+            point0, point1 = contacts.rigid_contact_point0.numpy(), contacts.rigid_contact_point1.numpy()
+            # Name each anchor by its world and the cube corner it sits on.
+            held = [[] for _ in range(model.world_count)]
+            for c in np.flatnonzero(weight > 0.0):
+                cube_first = shape_body[shape0[c]] >= 0
+                corner = point0[c] if cube_first else point1[c]
+                world = body_world[shape_body[shape0[c] if cube_first else shape1[c]]]
+                held[world].append((bool(corner[0] > 0.0), bool(corner[1] > 0.0)))
+            corners.append([tuple(sorted(anchors)) for anchors in held])
+        for world in range(model.world_count):
+            with self.subTest(world=world):
+                pairs = {step[world] for step in corners[30:]}
+                self.assertEqual(len(pairs), 1, f"anchor corners changed between steps: {sorted(pairs)}")
+                self.assertEqual(len(next(iter(pairs))), 2)
+        self.assertLess(float(np.abs(np.array(spin[60:])).max()), 1.0e-3)
 
     def test_default_patch_friction_and_explicit_opt_out(self):
         """Build persistent patches by default while retaining an explicit velocity-only opt-out."""

@@ -7,7 +7,9 @@ Normal contacts are never reduced here. Each compatible region selects up to two
 friction locations, with an equal share of the region's total normal impulse.
 Locations average the support edges along the footprint's principal extent,
 avoiding a diagonal friction couple on symmetric narrow footprints. Isotropic
-footprints retain a canonical farthest pair because they have no unique axis.
+footprints retain a canonical farthest pair because they have no unique axis;
+member spans and contact order choose it, so float32 roundoff in world
+coordinates cannot swap it between steps.
 Regions require matching friction materials, nearly aligned normals, nearby
 contact planes, and connected shape bounding spheres on each body. The latter
 is a conservative test across convex seams, not an exact surface-connectivity
@@ -50,6 +52,13 @@ _LIVE_SORT_CAPACITY = 2_000_000
 _SORT_CHUNK = wp.constant(2048)
 _SORT_SLOT_BITS = wp.constant(11)
 _SORT_PAD = wp.constant(wp.int64(1 << 62))
+# Contact centres carry the narrow phase's float32 world-space quantization. On
+# a resting 0.1 m cube it reads as a relative anisotropy of the footprint's
+# second moments of up to 1.2e-6 at 1.5 m from the origin, 9.5e-6 at 10 m and
+# 5.4e-5 at 80 m. Second moments and squared member spans that differ by less
+# than this fraction count as equal, so roundoff neither gives an isotropic
+# footprint an axis nor chooses between equally distant members.
+_FOOTPRINT_TOLERANCE = wp.constant(1.0e-3)
 
 
 @wp.struct
@@ -640,17 +649,10 @@ def _build_pair(
                             remaining -= 1
                             patches.next_contact[tail] = c
                             tail = c
-                            if frame.eligible[c] != 0:
-                                if first < 0:
-                                    first = c
-                                else:
-                                    position = frame.center[c]
-                                    p0 = frame.center[first]
-                                    if position[0] < p0[0] or (
-                                        position[0] == p0[0]
-                                        and (position[1] < p0[1] or (position[1] == p0[1] and position[2] < p0[2]))
-                                    ):
-                                        first = c
+                            # Sorted order within a pair is contact order, so the
+                            # lowest index is the first eligible member in it.
+                            if frame.eligible[c] != 0 and (first < 0 or c < first):
+                                first = c
                 expanded_a = sa
                 expanded_b = sb
             cursor = patches.next_contact[cursor]
@@ -662,7 +664,11 @@ def _build_pair(
             # filtered step does not forget the accumulated positional correction.
             carry_only = int(1)
             first = seed
-        second = first
+        # The canonical farthest pair: the member farthest from the first
+        # eligible one, then the member farthest from that. Member spans and
+        # contact order define it, so neither roundoff in world coordinates nor
+        # the footprint's pose can swap its diagonal.
+        reference = first
         separation = float(0.0)
         member_start = member_stop
         # Preserve sorted contact order for footprint sums and tie breaking.
@@ -674,16 +680,19 @@ def _build_pair(
             frame.members[member_stop] = c
             member_stop += 1
             if carry_only != 0 or frame.eligible[c] != 0:
-                distance = wp.length_sq(frame.center[c] - frame.center[first])
-                if distance > separation:
+                distance = wp.length_sq(frame.center[c] - frame.center[reference])
+                if distance > separation * (1.0 + _FOOTPRINT_TOLERANCE):
                     separation = distance
-                    second = c
+                    first = c
         anchors = int(1)
         if separation > 1.0e-8 * frame.radius[seed] * frame.radius[seed]:
             anchors = 2
+        else:
+            first = reference
+        second = first
         location0 = frame.center[first]
-        location1 = frame.center[second]
-        if anchors == 2 and carry_only == 0:
+        location1 = location0
+        if anchors == 2:
             # Use the footprint's principal extent, averaging its support edges.
             # Picking opposite corners of a narrow rectangle introduces an
             # artificial diagonal friction couple even when the footprint is symmetric.
@@ -698,10 +707,15 @@ def _build_pair(
             sum_xy = wp.float64(0.0)
             sum_yy = wp.float64(0.0)
             members = int(0)
+            reach = float(0.0)
             for j in range(member_start, member_stop):
                 c = frame.members[j]
-                if frame.eligible[c] != 0:
+                if carry_only != 0 or frame.eligible[c] != 0:
                     offset = frame.center[c] - origin
+                    distance = wp.length_sq(offset)
+                    if distance > reach * (1.0 + _FOOTPRINT_TOLERANCE):
+                        reach = distance
+                        second = c
                     x = wp.float64(wp.dot(offset, t0))
                     y = wp.float64(wp.dot(offset, t1))
                     sum_x += x
@@ -710,14 +724,16 @@ def _build_pair(
                     sum_xy += x * y
                     sum_yy += y * y
                     members += 1
+            location1 = frame.center[second]
             member_count = wp.float64(members)
             xx = float(sum_xx - sum_x * sum_x / member_count)
             xy = float(sum_xy - sum_x * sum_y / member_count)
             yy = float(sum_yy - sum_y * sum_y / member_count)
             spread = wp.sqrt((xx - yy) * (xx - yy) + 4.0 * xy * xy)
             # An isotropic footprint has no distinguished axis; retain its
-            # canonical farthest pair instead of amplifying roundoff.
-            if spread > 1.0e-6 * (xx + yy):
+            # canonical farthest pair instead of amplifying roundoff. Carry-only
+            # regions keep that pair too.
+            if carry_only == 0 and spread > _FOOTPRINT_TOLERANCE * (xx + yy):
                 largest = 0.5 * (xx + yy + spread)
                 axis2 = wp.vec2(xy, largest - xx)
                 if xx >= yy:

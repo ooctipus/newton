@@ -11,8 +11,10 @@ this reference, decoding pair keys through :func:`pair_codes`: bitwise on the
 CPU, and on CUDA with computed float payloads within the FMA-contraction bound
 of ``assert_same_patches``, because NVRTC may contract this module's
 multiply-adds differently from the patch module's. Device
-functions that the mechanism work leaves unchanged are imported. This module
-holds shared test helpers; it defines no tests.
+functions that the mechanism work leaves unchanged are imported. ``_build``
+follows the builder's current anchor choice (the canonical farthest pair and
+the footprint tolerance), which is not mechanism work. This module holds shared
+test helpers; it defines no tests.
 """
 
 import numpy as np
@@ -20,6 +22,7 @@ import warp as wp
 
 from newton._src.solvers.feather_pgs.contact_filters import contact_friction_eligible, contact_normal_gap_limit
 from newton._src.solvers.feather_pgs.friction_patches import (
+    _FOOTPRINT_TOLERANCE,
     FrictionPatches,
     _carried_displacement,
     _compatible,
@@ -251,17 +254,10 @@ def _build(
                             remaining -= 1
                             patches.next_contact[tail] = c
                             tail = c
-                            if frame.eligible[c] != 0:
-                                if first < 0:
-                                    first = c
-                                else:
-                                    position = frame.center[c]
-                                    p0 = frame.center[first]
-                                    if position[0] < p0[0] or (
-                                        position[0] == p0[0]
-                                        and (position[1] < p0[1] or (position[1] == p0[1] and position[2] < p0[2]))
-                                    ):
-                                        first = c
+                            # Sorted order within a pair is contact order, so the
+                            # lowest index is the first eligible member in it.
+                            if frame.eligible[c] != 0 and (first < 0 or c < first):
+                                first = c
                 expanded_a = sa
                 expanded_b = sb
             cursor = patches.next_contact[cursor]
@@ -273,7 +269,11 @@ def _build(
             # filtered step does not forget the accumulated positional correction.
             carry_only = int(1)
             first = seed
-        second = first
+        # The canonical farthest pair: the member farthest from the first
+        # eligible one, then the member farthest from that. Member spans and
+        # contact order define it, so neither roundoff in world coordinates nor
+        # the footprint's pose can swap its diagonal.
+        reference = first
         separation = float(0.0)
         member_start = member_stop
         # Preserve sorted contact order for footprint sums and tie breaking.
@@ -285,16 +285,19 @@ def _build(
             frame.members[member_stop] = c
             member_stop += 1
             if carry_only != 0 or frame.eligible[c] != 0:
-                distance = wp.length_sq(frame.center[c] - frame.center[first])
-                if distance > separation:
+                distance = wp.length_sq(frame.center[c] - frame.center[reference])
+                if distance > separation * (1.0 + _FOOTPRINT_TOLERANCE):
                     separation = distance
-                    second = c
+                    first = c
         anchors = int(1)
         if separation > 1.0e-8 * frame.radius[seed] * frame.radius[seed]:
             anchors = 2
+        else:
+            first = reference
+        second = first
         location0 = frame.center[first]
-        location1 = frame.center[second]
-        if anchors == 2 and carry_only == 0:
+        location1 = location0
+        if anchors == 2:
             # Use the footprint's principal extent, averaging its support edges.
             # Picking opposite corners of a narrow rectangle introduces an
             # artificial diagonal friction couple even when the footprint is symmetric.
@@ -309,10 +312,15 @@ def _build(
             sum_xy = wp.float64(0.0)
             sum_yy = wp.float64(0.0)
             members = int(0)
+            reach = float(0.0)
             for j in range(member_start, member_stop):
                 c = frame.members[j]
-                if frame.eligible[c] != 0:
+                if carry_only != 0 or frame.eligible[c] != 0:
                     offset = frame.center[c] - origin
+                    distance = wp.length_sq(offset)
+                    if distance > reach * (1.0 + _FOOTPRINT_TOLERANCE):
+                        reach = distance
+                        second = c
                     x = wp.float64(wp.dot(offset, t0))
                     y = wp.float64(wp.dot(offset, t1))
                     sum_x += x
@@ -321,14 +329,16 @@ def _build(
                     sum_xy += x * y
                     sum_yy += y * y
                     members += 1
+            location1 = frame.center[second]
             member_count = wp.float64(members)
             xx = float(sum_xx - sum_x * sum_x / member_count)
             xy = float(sum_xy - sum_x * sum_y / member_count)
             yy = float(sum_yy - sum_y * sum_y / member_count)
             spread = wp.sqrt((xx - yy) * (xx - yy) + 4.0 * xy * xy)
             # An isotropic footprint has no distinguished axis; retain its
-            # canonical farthest pair instead of amplifying roundoff.
-            if spread > 1.0e-6 * (xx + yy):
+            # canonical farthest pair instead of amplifying roundoff. Carry-only
+            # regions keep that pair too.
+            if carry_only == 0 and spread > _FOOTPRINT_TOLERANCE * (xx + yy):
                 largest = 0.5 * (xx + yy + spread)
                 axis2 = wp.vec2(xy, largest - xx)
                 if xx >= yy:
