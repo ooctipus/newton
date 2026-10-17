@@ -986,19 +986,29 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         pooled budget at fixed, different stages of the sweep, which spun this
         box at more than 1 rad/s; carriers chosen by roundoff, or edges split
         by roundoff 10 m from the origin, yawed it by a few hundredths to
-        tenths.
+        tenths. The last contact's rows follow its edge's normal rows only
+        where row slots follow contact order, as serial CPU allocation
+        guarantees; CUDA reserves each contact's slots with a per-world
+        atomic, so a failure reports how often the slots kept contact order.
         """
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
         # Worlds 1.5 m and 10 m from the origin.
         for spacing, heading in itertools.product((3.0, 20.0), (0.75 * np.pi + 0.4, np.pi + 0.4)):
-            with self.subTest(spacing=spacing, heading=heading), wp.ScopedDevice("cpu"):
-                yaw_rate, deceleration, weights = self._slide_box(heading, spacing)
+            with self.subTest(spacing=spacing, heading=heading):
+                yaw_rate, deceleration, weights, ordered = self._slide_box(heading, spacing, device)
                 # Each sliding box keeps its two edge anchors, so patch friction carries the load.
                 self.assertEqual(weights, {(0.5, 0.5)})
-                self.assertLess(yaw_rate, 5.0e-3)
+                self.assertLess(yaw_rate, 5.0e-3, f"row slots kept contact order in {ordered:.0%} of world steps")
                 np.testing.assert_allclose(deceleration, 0.5 * 9.81, rtol=1.0e-3)
 
-    def _slide_box(self, heading, spacing):
-        """Return the largest yaw rate while sliding, each world's fitted deceleration and the anchor weights seen."""
+    def _slide_box(self, heading, spacing, device):
+        """Slide four boxes and measure their yaw, deceleration, anchors and row order.
+
+        Returns:
+            The largest yaw rate while sliding, each world's fitted deceleration,
+            the anchor weights seen while sliding, and the fraction of world
+            steps whose row slots kept contact order.
+        """
         scene = newton.ModelBuilder()
         cfg = newton.ModelBuilder.ShapeConfig(mu=0.5)
         box = scene.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()))
@@ -1006,7 +1016,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         builder = newton.ModelBuilder()
         builder.replicate(scene, 4, spacing=(spacing, spacing, 0.0))
         builder.add_ground_plane(cfg=cfg)
-        model = builder.finalize()
+        model = builder.finalize(device=device)
         solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split", pgs_iterations=8)
         self.assertTrue(solver._friction_anchors_enabled)
         pipeline = newton.CollisionPipeline(model)
@@ -1015,7 +1025,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         control = model.control()
         shape_body, body_world = model.shape_body.numpy(), model.body_world.numpy()
         direction = np.array([np.cos(heading), np.sin(heading), 0.0])
-        speeds, yaw_rates, weights = [], [], set()
+        speeds, yaw_rates, weights, ordered = [], [], set(), []
         for step in range(84):
             if step == 24:
                 # Launch every settled box at 1 m/s.
@@ -1041,13 +1051,19 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 for world in np.flatnonzero(speeds[-1] > 0.2):
                     held = (body_world[bodies] == world) & (weight > 0.0)
                     weights.add(tuple(float(w) for w in np.sort(weight[held])))
+                slots, paths = solver.contact_slot.numpy()[:count], solver.contact_path.numpy()[:count]
+                for world in range(model.world_count):
+                    for path in np.unique(paths[paths >= 0]):
+                        mine = (body_world[bodies] == world) & (paths == path)
+                        ordered.append(bool(np.all(np.diff(slots[mine]) > 0)))
         speeds, yaw_rates = np.array(speeds), np.array(yaw_rates)
         times = np.arange(len(speeds)) / 240.0
         deceleration = []
         for world in range(model.world_count):
             sliding = (speeds[:, world] > 0.2) & (speeds[:, world] < 0.8)
             deceleration.append(-np.polyfit(times[sliding], speeds[sliding, world], 1)[0])
-        return float(np.abs(yaw_rates[speeds > 1.0e-3]).max()), np.array(deceleration), weights
+        yaw_rate = float(np.abs(yaw_rates[speeds > 1.0e-3]).max())
+        return yaw_rate, np.array(deceleration), weights, float(np.mean(ordered))
 
     def test_default_patch_friction_and_explicit_opt_out(self):
         """Build persistent patches by default while retaining an explicit velocity-only opt-out."""
