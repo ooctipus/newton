@@ -62,10 +62,10 @@ def contact_rows(solver, contacts, route=0, *, incident=False, jacobian=False):
     (the next normal of the patch ring for the normal row, the owning contact
     for friction rows, -1 for none); mu, the right-hand side and the solved
     impulse per row; the normal row's phi and target; and the patch view's
-    weight, tangential phi and friction location when patches are enabled. ``incident`` adds the
-    native sparse route's separately stored ``J v_hat`` to the right-hand
-    side, matching the assembled split rows. ``jacobian`` adds the physical
-    row Jacobians.
+    weight, tangential phi and friction location when patches are enabled.
+    ``incident`` adds the native sparse route's separately stored ``J v_hat``
+    to the right-hand side, matching the assembled split rows. ``jacobian``
+    adds the physical row Jacobians.
     """
     count = min(int(contacts.rigid_contact_count.numpy()[0]), solver.contact_slot.shape[0])
     slot, path = solver.contact_slot.numpy()[:count], solver.contact_path.numpy()[:count]
