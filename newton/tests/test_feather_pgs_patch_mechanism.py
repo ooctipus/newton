@@ -17,7 +17,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import friction_patches
-from newton._src.solvers.feather_pgs.friction_patches import _FrictionPatchState, patch_routes
+from newton._src.solvers.feather_pgs.friction_patches import _FrictionPatchState, _PatchFrame, patch_routes
 from newton.tests.feather_pgs_patch_reference import SENTINEL, ReferencePatches, pair_codes
 
 _PIECE_OFFSET = 0.04
@@ -826,6 +826,64 @@ class TestPatchLiveSort(unittest.TestCase):
         """Match the reference with the live sort on multi-block grids, through merges and graph replay."""
         run_reference_differential("cuda:0", 12, worlds=160, contacts=8192, capacity=8192, live_sort=True)
         run_graph_replay("cuda:0", worlds=160, contacts=8192, capacity=8192, live_sort=True)
+
+
+@wp.kernel(enable_backward=False)
+def _mark_pair_heads_reversed(
+    extent: wp.array[int],
+    frame: _PatchFrame,
+    threads: int,
+    heads: wp.array[int],
+    head_count: wp.array[int],
+):
+    """List pair heads from the last sorted position down, against the launch order."""
+    thread = wp.tid()
+    live = extent[1]
+    for i in range(thread, live, threads):
+        start = live - 1 - i
+        if start == 0 or frame.keys[start - 1] != frame.keys[start]:
+            heads[wp.atomic_add(head_count, 0, 1)] = start
+
+
+class TestPatchPairHeads(unittest.TestCase):
+    def test_pair_heads_list_each_body_pair_once(self):
+        """List exactly the sorted positions that start a body pair's run."""
+        scene = _Scene("cpu", 9)
+        patches, _ = _pair(scene, 128)
+        patches.threads = 7
+        for mode in ("live", "sparse", "empty", "overflow", "live"):
+            with self.subTest(mode=mode):
+                scene.move()
+                live = scene.frame(mode)
+                patches.build(scene.model, scene.state, scene.contacts)
+                keys = patches.current.keys.numpy()[:live]
+                expected = np.flatnonzero(np.concatenate(([True], keys[1:] != keys[:-1])))[: len(np.unique(keys))]
+                count = int(patches.head_count.numpy()[0])
+                self.assertEqual(count, len(np.unique(keys)))
+                np.testing.assert_array_equal(np.sort(patches.heads.numpy()[:count]), expected)
+                patches.store(scene.state)
+
+    def test_head_order_changes_no_output(self):
+        """Build bitwise as the reference when the pair heads arrive in reverse order."""
+        with mock.patch.object(friction_patches, "_mark_pair_heads", _mark_pair_heads_reversed):
+            scene = _Scene("cpu", 13)
+            patches, _ = _pair(scene, 128)
+            scene.active[:] = True
+            live = scene.frame()
+            patches.build(scene.model, scene.state, scene.contacts)
+            heads = patches.heads.numpy()[: int(patches.head_count.numpy()[0])]
+            self.assertTrue(np.all(np.diff(heads) < 0), "the pair heads must arrive in reverse order")
+            self.assertGreater(live, 0)
+            for seed, threads in ((14, None), (15, (7, 5))):
+                with self.subTest(seed=seed, threads=threads):
+                    run_reference_differential("cpu", seed, capacity=160, threads=threads)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "multi-block grids need CUDA")
+    def test_head_order_changes_no_output_on_many_blocks(self):
+        """Build bitwise as the reference on many blocks with reversed or atomic head order."""
+        run_reference_differential("cuda:0", 16, worlds=48, contacts=2048, capacity=3072)
+        with mock.patch.object(friction_patches, "_mark_pair_heads", _mark_pair_heads_reversed):
+            run_reference_differential("cuda:0", 17, worlds=48, contacts=2048, capacity=3072)
 
 
 if __name__ == "__main__":
