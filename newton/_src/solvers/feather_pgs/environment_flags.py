@@ -350,6 +350,12 @@ FLAGS = declare(
         "=0 keeps patch friction on the full ordered sparse sweep instead of the active-row scan (default on).",
     ),
     _flag(
+        "FEATHER_PGS_PATCH_DENSE_PATHS",
+        "policy",
+        _SOLVER,
+        "=0 keeps patch friction on the general paired factor sweep instead of its contact units (default on).",
+    ),
+    _flag(
         "FEATHER_PGS_PATCH_PARALLEL_ROWS",
         "experiment",
         _SOLVER,

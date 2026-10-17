@@ -37,7 +37,8 @@ PINNED = {
     "paired_factor_source.py": {
         "_physical_entry": "57b685e553d3b34f3a7958019b33e39d48308ac71faefeaddcda895f48f65bfb",
         "_physical_exit": "ee488b1935af525104f25aca4904ef3b26409ba9ec19baff61edef6d71966101",
-        "get_source": "0014db0213be46f8f9dc7f4981d72af856f867022588cee986a0e65a73fef3af",
+        "get_source": "b6873bc1158b03ee895349fe9584c1b961b0ed37bc9f0ab8a6568174809e5b05",
+        "_unit_walk": "68ba7535eb2d321bb7869761e4368c772926844b3a327de2ae56dd9762638869",
     },
     "small_cholesky.py": {
         "_FACTOR": "0622916ba6629039cec48620ddcc0bb3b8208f7ba4ce2e7af8c9c4dce04a2134",
@@ -47,7 +48,7 @@ PINNED = {
         "get_kernel": "d1cd133efac455c6e9f59821af782fec4f2ff3b6f9102dfb5246000f19299204",
     },
     "solver_feather_pgs.py": {
-        "_get_pgs_solve_paired_factor_kernel": "1cc5dd5422f40ed122d0dce461553bbe8fbdd73fb5df84d59e7545ab97c1590a",
+        "_get_pgs_solve_paired_factor_kernel": "0458aec8bab78ff5236bed022bc32d708607d02e3b9b7e84b29a78990d802e66",
         "_get_pgs_solve_mf_gs_kernel": "35602b2592d4131f24f31518c17ccd5275684b81502311ee2faaabf1e10d9dd5",
         "_get_crba_cholesky_warp_kernel": "f507209b4a71155f75aa86a783241723e1370c41a0c262744c020bfc224969de",
         "_get_inverse_cholesky_register_kernel": "f1f2c60767d69d8006fb074c768877b921579954b7d36bc1efee9366212234d3",

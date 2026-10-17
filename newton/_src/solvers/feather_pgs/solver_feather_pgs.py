@@ -2755,6 +2755,14 @@ class SolverFeatherPGS(SolverBase):
         # only under the opt-in FEATHER_PGS_PATCH_PARALLEL_ROWS=1; by default it keeps
         # its serial sweeps and ordinary rows.
         self._parallel_contact_paths, self._parallel_contact_paths_reason = self._admit_parallel_contact_paths()
+        # Patch friction on the dense paired route: the paired factor sweep walks
+        # patch contact units. FEATHER_PGS_PATCH_DENSE_PATHS=0 restores the
+        # general paired sweep.
+        self._patch_dense_paths = bool(
+            self._law_agnostic_contact_paths
+            and self._friction_anchors_enabled
+            and os.environ.get("FEATHER_PGS_PATCH_DENSE_PATHS", "1") != "0"
+        )
         if self.pgs_mode == "matrix_free":
             self._jy_world_aliased = self._detect_jy_world_identity()
         else:
@@ -2860,6 +2868,10 @@ class SolverFeatherPGS(SolverBase):
             and self.contact_friction_gap_threshold == math.inf
             and not self._friction_anchors_enabled
         )
+        # Patch contacts are units of one row, or three when they own an anchor;
+        # the factor sweep walks them with the generic path's row order and
+        # arithmetic, solving each tangent pair once.
+        self._factor_coordinate_contact_units = bool(self._paired_factor_coordinates and self._patch_dense_paths)
         self._paired_factor_primary_groups_by_world = None
         self._paired_factor_secondary_groups_by_world = None
         self._paired_factor_primary_offsets_by_world = None
@@ -7146,6 +7158,7 @@ class SolverFeatherPGS(SolverBase):
                     device_arch,
                     contact_triples=self._factor_coordinate_contact_triples,
                     independent_components=self._paired_components is not None,
+                    contact_units=self._factor_coordinate_contact_units,
                 )
                 if self._paired_factor_coordinates
                 else None
@@ -18513,6 +18526,8 @@ def _get_pgs_solve_paired_factor_kernel(
     device_arch: str,
     contact_triples: bool = False,
     independent_components: bool = False,
+    *,
+    contact_units: bool = False,
 ) -> "wp.Kernel":
     """Build the dense PGS solve for a fixed articulation/free-body pair.
 
@@ -18520,6 +18535,7 @@ def _get_pgs_solve_paired_factor_kernel(
     physical generalized velocity with ``L^T``, applies the dense PGS sweeps
     using ``L^-1 J^T`` rows, and transforms back with ``L^-T``. Worlds with
     matrix-free rows remain owned by the general physical-coordinate solver.
+    ``contact_units`` walks patch contact units (paired_factor_source.get_source).
     """
     del device_arch
     M = int(max_constraints)
@@ -18534,7 +18550,15 @@ def _get_pgs_solve_paired_factor_kernel(
 
     from .paired_factor_source import get_source  # noqa: PLC0415
 
-    snippet = get_source(M, D, P, S, contact_triples=contact_triples, independent_components=independent_components)
+    snippet = get_source(
+        M,
+        D,
+        P,
+        S,
+        contact_triples=contact_triples,
+        independent_components=independent_components,
+        contact_units=contact_units,
+    )
 
     @wp.func_native(snippet)
     def pgs_solve_paired_factor_native(
@@ -18626,6 +18650,8 @@ def _get_pgs_solve_paired_factor_kernel(
     name = f"pgs_solve_paired_factor_{M}_{D}_{P}_{S}_w{W}"
     if contact_triples:
         name += "_contact3"
+    if contact_units:
+        name += "_units"
     if independent_components:
         name += "_components"
     pgs_solve_paired_factor_template.__name__ = name

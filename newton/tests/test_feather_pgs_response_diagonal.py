@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import itertools
+import os
 import unittest
 from unittest import mock
 
@@ -20,6 +21,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
     accumulate_group_diag_worlds,
 )
+from newton._src.solvers.feather_pgs.paired_factor_source import get_source as get_paired_factor_source
 from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _FeatherPGSExecutionPlan,
     _get_build_independent_sparse_contact_groups_kernel,
@@ -27,6 +29,7 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _get_hinv_jt_kernel,
     _get_mark_independent_sparse_contact_candidates_kernel,
     _get_partitioned_inverse_dynamics_kernels,
+    _get_pgs_solve_paired_factor_kernel,
     _get_pgs_solve_sparse_diagonal_kernel,
 )
 from newton.solvers import SolverFeatherPGS
@@ -581,7 +584,218 @@ def _ring_pooled_serial_reference(rows, *, iterations, friction_start=0, schedul
     return {"impulses": impulses, "velocity": velocity, "lower": lower, "upper": upper}
 
 
+def _paired_unit_rows(seed, *, worlds=6, capacity=64, primary=23, secondary=6):
+    """Build paired factor-coordinate rows of patch contact units with linked normal rings.
+
+    Each world holds a prefix of position-limit rows (one world adds a velocity-limit row), then
+    contacts in a random allocation order. A contact is a unit: its normal row, followed by two
+    tangent rows naming it as parent when it owns an anchor (at most two per ring). The normal rows
+    of a ring link circularly through their parents, as ``link_patch_rows`` leaves them; a ring of
+    one ends with -1 or links to itself. Factor rows, right-hand sides and impulses are random:
+    normals separate or close, and some unloaded anchors start with tangent impulses, signed zeros
+    included.
+    """
+    rng = np.random.default_rng(seed)
+    dofs = primary + secondary
+    rows = {
+        "row_count": np.zeros(worlds, np.int32),
+        "bounds": np.zeros((worlds, 2), np.int32),
+        # Rows past each world's count hold a type no row family uses.
+        "row_type": np.full((worlds, capacity), 7, np.int32),
+        "row_parent": np.full((worlds, capacity), -1, np.int32),
+        "row_mu": np.zeros((worlds, capacity), np.float32),
+        "rhs": np.zeros((worlds, capacity), np.float32),
+        "diag": np.zeros((worlds, capacity), np.float32),
+        "impulses": np.zeros((worlds, capacity), np.float32),
+        "factor_rows": np.zeros((worlds, capacity, dofs), np.float32),
+        "anchors": 0,
+        "loaded_rings": 0,
+    }
+    for w in range(worlds):
+        prefix = int(rng.integers(0, 4))
+        rows["row_type"][w, :prefix] = PGS_CONSTRAINT_TYPE_JOINT_LIMIT
+        if w == 1:
+            rows["row_type"][w, prefix] = PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
+            prefix += 1
+        rows["rhs"][w, :prefix] = rng.uniform(-0.2, 0.1, prefix)
+        rows["bounds"][w] = prefix
+        rings = []
+        for _ in range(int(rng.integers(3, 8))):
+            members = int(rng.integers(1, 5))
+            anchors = rng.choice(members, size=min(members, int(rng.integers(0, 3))), replace=False)
+            rings.append([3 if k in anchors else 1 for k in range(members)])
+        units = [(ring, count) for ring, counts in enumerate(rings) for count in counts]
+        heads = [[] for _ in rings]
+        row = prefix
+        for position in rng.permutation(len(units)):
+            ring, count = units[position]
+            if row + count > capacity:
+                continue
+            heads[ring].append(row)
+            rows["row_type"][w, row] = PGS_CONSTRAINT_TYPE_CONTACT
+            closing = rng.random() < 0.5
+            rows["rhs"][w, row] = rng.uniform(-0.3, 0.0) if closing else rng.uniform(0.0, 0.3)
+            if rng.random() < 0.4:
+                rows["impulses"][w, row] = rng.uniform(0.0, 0.2)
+            if count == 3:
+                rows["anchors"] += 1
+                rows["row_type"][w, row + 1 : row + 3] = PGS_CONSTRAINT_TYPE_FRICTION
+                rows["row_parent"][w, row + 1 : row + 3] = row
+                rows["row_mu"][w, row + 1 : row + 3] = rng.uniform(0.2, 0.9)
+                rows["rhs"][w, row + 1 : row + 3] = rng.uniform(-0.15, 0.15, 2)
+                draw = rng.random()
+                if draw < 0.3:
+                    rows["impulses"][w, row + 1 : row + 3] = rng.uniform(-0.02, 0.02, 2)
+                elif draw < 0.45:
+                    rows["impulses"][w, row + 1 : row + 3] = -0.0
+            row += count
+        for members in heads:
+            if len(members) == 1:
+                rows["row_parent"][w, members[0]] = members[0] if rng.random() < 0.5 else -1
+                continue
+            linked = rng.permutation(members)
+            for k, head in enumerate(linked):
+                rows["row_parent"][w, head] = linked[(k + 1) % len(linked)]
+            rows["loaded_rings"] += int(np.any(rows["impulses"][w, members] > 0.0))
+        rows["row_count"][w] = row
+        rows["factor_rows"][w, :row] = rng.normal(0.0, 0.3, (row, dofs))
+        rows["diag"][w, :row] = np.sum(rows["factor_rows"][w, :row] ** 2, axis=1) + np.float32(0.01)
+    # A normal row without response is skipped by both schedules.
+    first_normal = int(np.flatnonzero(rows["row_type"][0] == PGS_CONSTRAINT_TYPE_CONTACT)[0])
+    rows["diag"][0, first_normal] = 0.0
+    return rows
+
+
+def _launch_paired_factor_solve(
+    kernel, rows, device, *, primary, components, iterations, omega, friction_start, offset
+):
+    """Run one paired factor-coordinate sweep over the rows; return its impulses and velocities."""
+    worlds, _capacity, dofs = rows["factor_rows"].shape
+    secondary = dofs - primary
+    rng = np.random.default_rng(99)
+
+    def factor(size):
+        lower = np.tril(rng.normal(0.0, 0.2, (worlds, size, size))) + 1.5 * np.eye(size)
+        return lower.astype(np.float32), np.linalg.inv(lower).astype(np.float32)
+
+    primary_L, primary_Linv = factor(primary)
+    secondary_L, secondary_Linv = factor(secondary)
+    odd = np.arange(worlds) % 2 == 1
+    selector = np.zeros(worlds, np.int32)
+    if components:
+        selector[2] = -1
+
+    def array(value, dtype):
+        return wp.array(np.ascontiguousarray(value), dtype=dtype, device=device)
+
+    impulses = array(rows["impulses"], wp.float32)
+    velocity = array(rng.normal(0.0, 0.3, worlds * dofs).astype(np.float32), wp.float32)
+    wp.launch_tiled(
+        kernel,
+        dim=[(worlds + 1) // 2],
+        inputs=[
+            worlds,
+            array(rows["row_count"], wp.int32),
+            array(rows["bounds"], wp.int32),
+            array(np.arange(worlds * dofs, dtype=np.int32).reshape(worlds, dofs), wp.int32),
+            array(rows["rhs"], wp.float32),
+            array(rows["diag"], wp.float32),
+            impulses,
+            array(rows["factor_rows"], wp.float32),
+            array(rows["row_type"], wp.int32),
+            array(rows["row_parent"], wp.int32),
+            array(rows["row_mu"], wp.float32),
+            array(selector, wp.int32),
+            array(primary_L, wp.float32),
+            array(primary_Linv, wp.float32),
+            array(secondary_L, wp.float32),
+            array(secondary_Linv, wp.float32),
+            array(np.arange(worlds, dtype=np.int32), wp.int32),
+            array(np.arange(worlds, dtype=np.int32), wp.int32),
+            array(np.where(odd, secondary, 0).astype(np.int32), wp.int32),
+            array(np.where(odd, 0, primary).astype(np.int32), wp.int32),
+            iterations,
+            omega,
+            friction_start,
+            offset,
+            velocity,
+        ],
+        block_dim=64,
+        device=device,
+    )
+    return impulses.numpy(), velocity.numpy()
+
+
+class TestPairedFactorUnitSource(unittest.TestCase):
+    def test_unit_walk_replaces_the_runtime_layout_test(self):
+        """Walk units from each row's type and parent; keep the triple and general sources as they were."""
+        units = get_paired_factor_source(192, 29, 23, 6, contact_units=True, independent_components=True)
+        general = get_paired_factor_source(192, 29, 23, 6, independent_components=True)
+        triples = get_paired_factor_source(192, 29, 23, 6, contact_triples=True, independent_components=True)
+        # A unit owns tangent rows only when the next row is a tangent naming it as parent; three
+        # normal-only units must not read as one triple, so the walk needs no stride-3 layout test.
+        self.assertIn("world_row_parent.data[off + tangent1] == i", units)
+        self.assertIn("world_row_mu.data[off + tangent1]", units)
+        for text in ("triple_layout", "s_contact_mu", "% 3"):
+            self.assertNotIn(text, units)
+        self.assertIn("triple_layout", general)
+        self.assertIn("const bool triple_layout = true", triples)
+        with self.assertRaises(ValueError):
+            get_paired_factor_source(192, 29, 23, 6, contact_triples=True, contact_units=True)
+        factory = _get_pgs_solve_paired_factor_kernel.__wrapped__
+        self.assertEqual(
+            factory(192, 29, 23, 6, "120", False, True, contact_units=True).key,
+            "pgs_solve_paired_factor_192_29_23_6_w2_units_components",
+        )
+        self.assertEqual(
+            factory(192, 29, 23, 6, "120", True, True).key, "pgs_solve_paired_factor_192_29_23_6_w2_contact3_components"
+        )
+
+
 class TestFeatherPGSResponseDiagonal(unittest.TestCase):
+    @unittest.skipUnless(wp.is_cuda_available(), "paired factor sweeps require CUDA")
+    def test_paired_factor_units_match_the_general_sweep_bitwise(self):
+        """Walk patch units with the general sweep's row order and arithmetic: identical bits out."""
+        device = wp.get_device("cuda:0")
+        for (capacity, primary, secondary), components, (
+            iterations,
+            omega,
+            friction_start,
+            offset,
+        ) in itertools.product(
+            ((64, 23, 6), (48, 10, 6)), (False, True), ((8, 1.0, 0, 0), (8, 0.9, 3, 0), (5, 1.0, 3, 2))
+        ):
+            rows = _paired_unit_rows(capacity + primary, capacity=capacity, primary=primary, secondary=secondary)
+            self.assertGreater(rows["anchors"], 4)
+            self.assertGreater(rows["loaded_rings"], 0)
+            dofs = primary + secondary
+            kernels = [
+                _get_pgs_solve_paired_factor_kernel(
+                    capacity, dofs, primary, secondary, str(device.arch), independent_components=components, **kwargs
+                )
+                for kwargs in ({}, {"contact_units": True})
+            ]
+            general, units = (
+                _launch_paired_factor_solve(
+                    kernel,
+                    rows,
+                    device,
+                    primary=primary,
+                    components=components,
+                    iterations=iterations,
+                    omega=omega,
+                    friction_start=friction_start,
+                    offset=offset,
+                )
+                for kernel in kernels
+            )
+            with self.subTest(capacity=capacity, components=components, friction_start=friction_start, offset=offset):
+                self.assertFalse(np.array_equal(general[0], rows["impulses"]), "the sweep changed no impulse")
+                tangents = rows["row_type"] == PGS_CONSTRAINT_TYPE_FRICTION
+                self.assertTrue(np.any(general[0][tangents] != 0.0), "no tangent row was loaded")
+                np.testing.assert_array_equal(units[0].view(np.uint32), general[0].view(np.uint32))
+                np.testing.assert_array_equal(units[1].view(np.uint32), general[1].view(np.uint32))
+
     @unittest.skipUnless(wp.is_cuda_available(), "sparse diagonal GS requires CUDA")
     def test_sparse_diagonal_gs_matches_scalar_reference(self):
         """Match a scalar PGS reference with coupled limits and friction."""
@@ -1385,8 +1599,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             "restitution": 0.3,
             "tangential_velocity": 2.0,
         }
-        # Patch friction rows are not uniform triples, so the generic factor path pools the patch load; point
-        # friction keeps the contact-triple layout.
+        # Patch friction rows are not uniform triples: the factor sweep walks patch contact units, pooling
+        # the patch load as the generic path does; point friction keeps the contact-triple layout.
         for label, friction_anchor_beta, triples in (("patch", None, False), ("point", 0.0, True)):
             with self.subTest(friction=label):
                 reference_solver, reference = _run_mixed_response(
@@ -1404,6 +1618,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 self.assertIsNotNone(paired_solver._paired_factor_solve_kernel)
                 self.assertTrue(paired_solver._paired_factor_coordinates)
                 self.assertEqual(paired_solver._factor_coordinate_contact_triples, triples)
+                self.assertEqual(paired_solver._factor_coordinate_contact_units, label == "patch")
+                self.assertEqual("_units" in paired_solver._paired_factor_solve_kernel.key, label == "patch")
                 self.assertGreater(reference[0][0], 0, "mixed scene generated no dense constraint rows")
                 self.assertTrue(
                     any(np.any(sample[6] == PGS_CONSTRAINT_TYPE_FRICTION) for sample in paired),
@@ -1483,17 +1699,37 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 mf_max_constraints=32,
                 friction_anchor_beta=0.0,
             )
+            with mock.patch.dict(os.environ, {"FEATHER_PGS_PATCH_DENSE_PATHS": "0"}):
+                general = SolverFeatherPGS(
+                    model,
+                    pgs_mode="matrix_free",
+                    enable_joint_limits=True,
+                    joint_limit_activation_gap=0.0,
+                    pgs_iterations=8,
+                    dense_max_constraints=96,
+                    mf_max_constraints=32,
+                )
         self.assertTrue(solvers[0.0]._friction_anchors_enabled)
         self.assertTrue(solvers[0.0]._paired_factor_coordinates)
-        # Patch rows are not uniform triples; the generic factor path pools the patch load instead.
+        # Patch rows are not uniform triples; the factor sweep walks patch contact units instead.
         self.assertFalse(solvers[0.0]._factor_coordinate_contact_triples)
+        self.assertTrue(solvers[0.0]._factor_coordinate_contact_units)
+        self.assertIn("_units", solvers[0.0]._paired_factor_solve_kernel.key)
+        self.assertTrue(solvers[0.0].get_path_selection()["routes"]["paired_response"]["contact_units"])
+        # FEATHER_PGS_PATCH_DENSE_PATHS=0 restores the general factor sweep.
+        self.assertTrue(general._paired_factor_coordinates)
+        self.assertFalse(general._factor_coordinate_contact_units)
+        self.assertNotIn("_units", general._paired_factor_solve_kernel.key)
+        self.assertNotIn("_contact3", general._paired_factor_solve_kernel.key)
         self.assertFalse(point._friction_anchors_enabled)
         self.assertTrue(point._paired_factor_coordinates)
         self.assertTrue(point._factor_coordinate_contact_triples)
+        self.assertFalse(point._factor_coordinate_contact_units)
         self.assertTrue(solvers[0.01]._contact_torsion_enabled)
         self.assertIsNotNone(solvers[0.01]._paired_response_primary_size)
         self.assertFalse(solvers[0.01]._paired_factor_coordinates)
         self.assertFalse(solvers[0.01]._factor_coordinate_contact_triples)
+        self.assertFalse(solvers[0.01]._factor_coordinate_contact_units)
 
     @unittest.skipUnless(wp.is_cuda_available(), "articulation-local mixed-world parity requires CUDA")
     def test_local_internal_mixed_world_matches_general_response(self):

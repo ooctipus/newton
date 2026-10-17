@@ -79,6 +79,11 @@ _PATCH_ONLY = frozenset(
         "use_support_table=True, warm_start=False)",
         "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, linked_rows=True, "
         "use_support_table=True, warm_start=True)",
+        # Paired factor sweeps over patch contact units.
+        "solver_feather_pgs._get_pgs_solve_paired_factor_kernel(192, 29, 23, 6, '120', False, False, "
+        "contact_units=True)",
+        "solver_feather_pgs._get_pgs_solve_paired_factor_kernel(192, 29, 23, 6, '120', False, True, "
+        "contact_units=True)",
     )
 )
 
@@ -247,6 +252,11 @@ def _solver_factory_calls():
     for triples, components in itertools.product((False, True), repeat=2):
         factory = solver._get_pgs_solve_paired_factor_kernel.__wrapped__
         yield name + "_get_pgs_solve_paired_factor_kernel", factory, (192, 29, 23, 6, _ARCH, triples, components), {}
+    # Patch-only unit walks of the same factory.
+    for components in (False, True):
+        factory = solver._get_pgs_solve_paired_factor_kernel.__wrapped__
+        args = (192, 29, 23, 6, _ARCH, False, components)
+        yield name + "_get_pgs_solve_paired_factor_kernel", factory, args, {"contact_units": True}
     # Parallel tiers: one articulation per world with in-kernel response and world rows,
     # and the response-block variants without them.
     for tier, matrix_free, inkernel, world_rows in itertools.product(

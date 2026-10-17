@@ -355,6 +355,7 @@ def _paired_response(solver) -> dict:
         "secondary_dofs": int(solver._paired_response_secondary_size),
         "factor_coordinates": factor,
         "contact_triples": bool(solver._factor_coordinate_contact_triples),
+        "contact_units": bool(solver._factor_coordinate_contact_units),
         "components": solver._paired_components is not None,
         "components_reason": solver._paired_components_reason,
         "two_stream_overlap": overlap,
