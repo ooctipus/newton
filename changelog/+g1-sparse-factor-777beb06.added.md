@@ -1,1 +1,0 @@
-Add a default-off experimental G1 ancestor-sparse held inverse-whitener owner that replaces dense factor, response, and constraint-solve intermediates while retaining the selected physical iteration policy.
