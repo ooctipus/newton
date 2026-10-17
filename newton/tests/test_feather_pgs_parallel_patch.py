@@ -547,13 +547,15 @@ class TestPatchParallelAdmission(unittest.TestCase):
         """Admit patch friction to the parallel tiers and keyed rows by default, record why, and honor the switch.
 
         ``FEATHER_PGS_PATCH_PARALLEL_ROWS=0`` keeps patch friction on its serial sweeps
-        and ordinary rows; point friction is admitted whatever the switch says.
+        and ordinary rows; point friction is admitted whatever the switch says. This is
+        the one test of the switch's default (the unset rows); every other test that
+        needs patch admission sets the switch.
         """
         model = _cpu_arm()
         for beta, switch, admitted in (
             (0.0, None, True),
             (0.0, "0", True),
-            (0.2, None, True),
+            (0.2, None, True),  # the default: on
             (0.2, "1", True),
             (0.2, "0", False),
         ):
@@ -828,8 +830,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
         """Build linked tiers for patch friction, point tiers for point friction, and today's route when switched off."""
         model = standing_model()
         options = {"sparse_mass_matrix": "auto", "cached_dynamics": "auto"}
-        with patch.dict(os.environ):
-            os.environ.pop(_SWITCH, None)
+        with patch.dict(os.environ, {_SWITCH: "1"}):
             patch_tiers = _matrix_free_solver(model, beta=0.2, parallel_rows=32, **options)
             point_tiers = _matrix_free_solver(model, beta=0.0, parallel_rows=32, **options)
             serial = _matrix_free_solver(model, beta=0.2, parallel_rows=0, **options)
@@ -864,9 +865,8 @@ class TestPatchParallelRoutes(unittest.TestCase):
         with (
             patch.object(source, "_INK_ON", True),
             patch.object(source, "_WR_ON", True),
-            patch.dict(os.environ, {"FEATHER_PGS_KEYED_ROWS": "0"}),
+            patch.dict(os.environ, {"FEATHER_PGS_KEYED_ROWS": "0", _SWITCH: "1"}),
         ):
-            os.environ.pop(_SWITCH, None)
             for beta in (0.0, 0.2):
                 built[beta] = _matrix_free_solver(model, beta=beta, parallel_rows=32)
         point, patch_friction = built[0.0], built[0.2]
@@ -899,8 +899,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
         velocity = model.joint_qd.numpy()
         velocity[0::10] = 0.05  # the torsos drift sideways, loading the feet's friction without slipping
         model.joint_qd.assign(velocity)
-        with patch.dict(os.environ):
-            os.environ.pop(_SWITCH, None)
+        with patch.dict(os.environ, {_SWITCH: "1"}):
             states = {}
             for beta, parallel_rows in itertools.product((0.0, 0.2), (0, 32)):
 
@@ -932,8 +931,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
         expected = speed * speed / (2.0 * mu * gravity)
         model = _sliding_boxes("cuda:0", (0.0, speed), mu=mu)
         distances = {}
-        with patch.dict(os.environ):
-            os.environ.pop(_SWITCH, None)
+        with patch.dict(os.environ, {_SWITCH: "1"}):
             for beta, parallel_rows in itertools.product((0.0, 0.2), (0, 32)):
                 ratios = []
 

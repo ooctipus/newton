@@ -492,7 +492,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         for options, model_options in cases:
             with self.subTest(options=options, model=model_options):
                 try:
-                    solver = _make_solver(_build_model(**model_options), True, **options)
+                    # The patch-friction parallel case builds linked tiers whatever the environment says.
+                    with patch.dict(os.environ, {"FEATHER_PGS_PATCH_PARALLEL_ROWS": "1"}):
+                        solver = _make_solver(_build_model(**model_options), True, **options)
                 except (ValueError, NotImplementedError):
                     continue  # The record describes admitted constructors only.
                 built += 1
