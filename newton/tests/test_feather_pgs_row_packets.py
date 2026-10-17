@@ -45,6 +45,9 @@ _CONTACTS = (
 )
 # Patch rings by contact within a world; the rejected contact shares the support's ring.
 _RINGS = ((1, 2, 3, 9), (0, 6), (4,))
+# Normal-only units that hold an anchor nonetheless, as allocation leaves one whose gap is above the
+# friction threshold. The second world ends with one, so rows written past it reach no other contact.
+_ANCHORS_WITHOUT_ROWS = (5,)
 # Limit rows before the contacts, and contacts kept, per world. The first and last worlds have more
 # rows than the packets hold.
 _PREFIX = (2, 0, 4)
@@ -79,7 +82,8 @@ def _patch_fixture(device="cpu", *, shared=0, friction_shared=0):
     The arm and the box touch each other in both shape orders, the arm touches itself, static
     supports sit on either side, one contact has no second shape, and a matrix-free and a rejected
     contact are skipped. Groups are permuted per size, the second world's box is prescribed and the
-    first world's box bounces. Returns the producer input and the layout.
+    first world's box bounces. Anchors hold every three-row contact and one normal-only unit per
+    world. Returns the producer input and the layout.
     """
     rng = np.random.default_rng(1017)
 
@@ -101,6 +105,7 @@ def _patch_fixture(device="cpu", *, shared=0, friction_shared=0):
         return int(body_art[shape_body[shape]]) if shape >= 0 and shape_body[shape] >= 0 else -1
 
     needed = np.array([record[4] for record in records], dtype=np.int32)
+    anchored = (needed == 3) | np.isin([record[1] for record in records], _ANCHORS_WITHOUT_ROWS)
     slot = np.full(count, -1, dtype=np.int32)
     path = np.zeros(count, dtype=np.int32)
     dense_rows = list(_PREFIX)
@@ -118,7 +123,7 @@ def _patch_fixture(device="cpu", *, shared=0, friction_shared=0):
                 next_contact[member] = members[(index + 1) % len(members)]
     view = FrictionPatches()
     view.enabled = 1
-    view.weight = array(np.where(needed == 3, 0.5, 0.0).astype(np.float32), float)
+    view.weight = array(np.where(anchored, 0.5, 0.0).astype(np.float32), float)
     view.next_contact = array(next_contact, int)
     view.point_a = array(rng.normal(0.0, 0.3, (count, 3)).astype(np.float32), wp.vec3)
     view.point_b = array(rng.normal(0.0, 0.3, (count, 3)).astype(np.float32), wp.vec3)
@@ -270,6 +275,14 @@ def _contact_rows(data):
             yield c, int(w), int(slots[c]), int(rows)
 
 
+def _owned_rows(data):
+    """Return the mask of the rows that allocated dense-route contacts own, by world."""
+    owned = np.zeros((WORLDS, ROWS), dtype=bool)
+    for _c, w, first, count in _contact_rows(data):
+        owned[w, first : first + count] = True
+    return owned
+
+
 def _link(data, layout, rows):
     """Link the rows' patch rings and divide their coefficients, as the patch link does after the producer."""
     routing = (data.world, data.slot, data.path, data.slots_needed)
@@ -388,7 +401,8 @@ class TestRowPacketPatchRows(unittest.TestCase):
         """Write every patch row field and Jacobian of the general route, then link the same rings.
 
         Rows equal the general route's bitwise, except a bouncing normal row's right-hand side: its
-        incident velocity sums per body instead of per world coordinate.
+        incident velocity sums per body instead of per world coordinate. Whole buffers are compared, so
+        a row written past a contact's allocation shows even where a later contact rewrites it.
         """
         beta = 0.35
         for shared, friction_shared in ((0, 0), (0, 1), (1, 0), (1, 1)):
@@ -397,80 +411,71 @@ class TestRowPacketPatchRows(unittest.TestCase):
                 general, jacobians, bias = _run_general(data, layout, beta)
                 packet = _packet(layout.device)
                 _launch(rp.produce_patch_contacts, data, layout, _law(layout.view, beta), packet, PRIMARY, SECONDARY)
+                owned = _owned_rows(data)
+                # The general route writes the metadata of allocated rows alone; the producer also seeds their
+                # diagonals with cfm and, with contact_w 1, leaves row_w alone. Other rows keep their poison.
+                expected = {name: getattr(general, name).numpy().copy() for name in _ROW_OUTPUTS}
+                for name, (_, poison) in _ROW_OUTPUTS.items():
+                    expected[name][~owned] = poison
+                expected["diag"][owned] = data.cfm
+                # A bouncing normal row agrees to rounding; compare it apart from the bitwise rest.
+                rhs, reference = data.rhs.numpy(), expected["rhs"]
+                bounced = owned & (reference != bias)
+                np.testing.assert_allclose(rhs[bounced], reference[bounced], rtol=1.0e-5, atol=1.0e-5)
+                self.assertTrue(np.all(rhs[bounced] != bias[bounced]), "Bouncing rows must leave the bias")
+                reference[bounced] = rhs[bounced]
+                for name in _ROW_OUTPUTS:
+                    np.testing.assert_array_equal(getattr(data, name).numpy(), expected[name], err_msg=name)
                 groups = layout.groups.numpy()
-                rhs, reference = data.rhs.numpy(), general.rhs.numpy()
-                jacobian, row_contact = packet.jacobian.numpy(), packet.row_contact.numpy()
-                bounces = anchors = unpacked = 0
+                jacobian = np.full((WORLDS, PACKETS, PRIMARY + SECONDARY), np.nan, dtype=np.float32)
+                row_contact = np.full((WORLDS, PACKETS), -1, dtype=np.int32)
                 for c, w, first, count in _contact_rows(data):
-                    rows = slice(first, first + count)
-                    for name in _ROW_OUTPUTS:
-                        if name in ("rhs", "diag", "row_w"):
-                            continue
-                        np.testing.assert_array_equal(
-                            getattr(data, name).numpy()[w, rows],
-                            getattr(general, name).numpy()[w, rows],
-                            err_msg=f"contact {c} {name}",
-                        )
-                    if reference[w, first] != bias[w, first]:
-                        bounces += 1
-                        self.assertNotEqual(rhs[w, first], bias[w, first], f"contact {c} must bounce")
-                        np.testing.assert_allclose(rhs[w, first], reference[w, first], rtol=1.0e-5, atol=1.0e-5)
-                    else:
-                        np.testing.assert_array_equal(rhs[w, first], reference[w, first], err_msg=f"contact {c} rhs")
-                    np.testing.assert_array_equal(
-                        rhs[w, first + 1 : first + count], reference[w, first + 1 : first + count]
-                    )
-                    np.testing.assert_array_equal(data.diag.numpy()[w, rows], np.float32(data.cfm))
-                    anchors += count == 3
-                    for row in range(first, first + count):
-                        if row >= PACKETS:
-                            unpacked += 1
-                            continue
-                        self.assertEqual(row_contact[w, row], 3 * c + row - first)
-                        np.testing.assert_array_equal(
-                            jacobian[w, row, :PRIMARY], jacobians[PRIMARY].numpy()[groups[2 * w], row]
-                        )
-                        np.testing.assert_array_equal(
-                            jacobian[w, row, PRIMARY:], jacobians[SECONDARY].numpy()[groups[2 * w + 1], row]
-                        )
-                # The fixture bounces, holds anchors and overflows the packets.
-                self.assertGreater(bounces, 0)
-                self.assertGreater(anchors, 0)
-                self.assertGreater(unpacked, 0)
+                    for row in range(first, min(first + count, PACKETS)):
+                        row_contact[w, row] = 3 * c + row - first
+                        jacobian[w, row, :PRIMARY] = jacobians[PRIMARY].numpy()[groups[2 * w], row]
+                        jacobian[w, row, PRIMARY:] = jacobians[SECONDARY].numpy()[groups[2 * w + 1], row]
+                np.testing.assert_array_equal(packet.row_contact.numpy(), row_contact)
+                np.testing.assert_array_equal(packet.jacobian.numpy(), jacobian)
+                # The fixture bounces, holds anchors with and without tangent rows and overflows the packets.
+                weight = layout.view.weight.numpy()
+                contacts = list(_contact_rows(data))
+                self.assertTrue(bounced.any())
+                self.assertTrue(any(count == 3 for *_, count in contacts))
+                self.assertTrue(any(weight[c] > 0.0 and count == 1 for c, *_, count in contacts))
+                self.assertTrue(owned[:, PACKETS:].any())
                 # The patch link runs after the producer and writes the same ring parents and coefficients.
                 _link(data, layout, data)
                 _link(data, layout, general)
                 for name in ("row_parent", "row_mu"):
                     np.testing.assert_array_equal(getattr(data, name).numpy(), getattr(general, name).numpy(), name)
                 parents = data.row_parent.numpy()
-                linked = [parents[w, first] for c, w, first, count in _contact_rows(data) if count == 1]
+                linked = [parents[w, first] for c, w, first, count in contacts if count == 1]
                 self.assertTrue(any(parent >= 0 for parent in linked), "A normal-only unit must join a ring")
 
     def test_patch_fallback_matches_the_general_jacobians(self):
-        """Materialize only general worlds' patch rows, with the general route's Jacobians."""
+        """Materialize only general worlds' patch rows, with the general route's Jacobians.
+
+        Whole buffers are compared: a general world's rows past its contacts' allocations keep their
+        cleared zeros, and a locally owned world's rows stay stale.
+        """
         for shared, friction_shared in ((0, 0), (1, 1)):
-            with self.subTest(shared=shared, friction_shared=friction_shared):
-                data, layout = _patch_fixture(shared=shared, friction_shared=friction_shared)
-                _, jacobians, _ = _run_general(data, layout, 0.35)
-                # The second world is locally owned; the others fall back to the general response.
-                owner = wp.array([0, 2, 0], dtype=int, device=layout.device)
-                groups = layout.groups.numpy()
-                for size in (PRIMARY, SECONDARY):
-                    # materialize_general_prefix has cleared the general worlds' rows; the local world's are stale.
-                    values = np.zeros((WORLDS, ROWS, size), dtype=np.float32)
-                    values[groups[2 + int(size == SECONDARY)]] = np.nan
-                    J = wp.array(values, dtype=float, device=layout.device)
-                    _launch(
-                        rp.materialize_patch_fallback, data, layout, _law(layout.view), owner, size, layout.groups, J
-                    )
-                    for c, w, first, count in _contact_rows(data):
-                        group, rows = groups[2 * w + int(size == SECONDARY)], slice(first, first + count)
-                        if w == 1:
-                            self.assertTrue(np.isnan(J.numpy()[group, rows]).all(), f"contact {c}")
-                        else:
-                            np.testing.assert_array_equal(
-                                J.numpy()[group, rows], jacobians[size].numpy()[group, rows], err_msg=f"contact {c}"
-                            )
+            data, layout = _patch_fixture(shared=shared, friction_shared=friction_shared)
+            _, jacobians, _ = _run_general(data, layout, 0.35)
+            law, groups = _law(layout.view), layout.groups.numpy()
+            # The second world is locally owned, or every world falls back to the general response.
+            for owners in ((0, 2, 0), (0, 0, 0)):
+                with self.subTest(shared=shared, friction_shared=friction_shared, owners=owners):
+                    owner = wp.array(owners, dtype=int, device=layout.device)
+                    for size in (PRIMARY, SECONDARY):
+                        # materialize_general_prefix has cleared the general worlds' rows; a local world's are stale.
+                        values = np.zeros((WORLDS, ROWS, size), dtype=np.float32)
+                        expected = jacobians[size].numpy().copy()
+                        for w in np.flatnonzero(owners):
+                            group = groups[2 * w + int(size == SECONDARY)]
+                            values[group] = expected[group] = np.nan
+                        J = wp.array(values, dtype=float, device=layout.device)
+                        _launch(rp.materialize_patch_fallback, data, layout, law, owner, size, layout.groups, J)
+                        np.testing.assert_array_equal(J.numpy(), expected, err_msg=f"size {size}")
 
     def test_patch_tangent_rows_replace_the_point_law(self):
         """Keep the point law's normal rows and move only the tangent rows to the patch law.
