@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Declared environment variables.
+"""Declared environment variables and the construction-time record of them.
 
 Every ``NEWTON_*`` variable that a module under ``newton._src`` reads is declared
 in :data:`NEWTON_FLAGS`, together with the ``NEWTON_*`` variables that Isaac Lab
@@ -9,10 +9,13 @@ reads and Newton does not. A solver with a private family declares it next to th
 solver (``FEATHER_PGS_*`` in ``newton._src.solvers.feather_pgs.environment_flags``).
 ``newton/tests/test_environment_flags.py`` scans the sources and keeps the
 declarations equal to the read sites, so a new variable must be declared here.
+A record only classifies what the environment held; the read sites are unchanged.
 """
 
 from __future__ import annotations
 
+import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, get_args
 
@@ -54,6 +57,43 @@ def declare(*flags: EnvironmentFlag) -> dict[str, EnvironmentFlag]:
             raise ValueError(f"{flag.name} has kind {flag.kind!r} and owner {flag.owner!r}")
         table[flag.name] = flag
     return table
+
+
+def record_environment(
+    declared: Mapping[str, EnvironmentFlag],
+    prefixes: tuple[str, ...],
+    environ: Mapping[str, str] | None = None,
+) -> dict:
+    """Classify the variables of ``environ`` whose names start with one of ``prefixes``.
+
+    Args:
+        declared: Declarations indexed by name.
+        prefixes: Name prefixes that belong to the caller.
+        environ: Variables to classify; defaults to :data:`os.environ`.
+
+    Returns:
+        ``{"applied": {name: value}, "unknown": [name], "retired": [name], "isaac_lab": {name: value}}``
+        sorted by name: declared variables Newton reads, undeclared names (recorded, not
+        rejected), retired names whose value did not raise, and variables only Isaac Lab reads.
+    """
+    environ = os.environ if environ is None else environ
+    applied: dict[str, str] = {}
+    unknown: list[str] = []
+    retired: list[str] = []
+    isaac_lab: dict[str, str] = {}
+    for name in sorted(environ):
+        if not name.startswith(prefixes):
+            continue
+        flag = declared.get(name)
+        if flag is None:
+            unknown.append(name)
+        elif flag.owner == "isaac_lab":
+            isaac_lab[name] = environ[name]
+        elif flag.kind == "retired":
+            retired.append(name)
+        else:
+            applied[name] = environ[name]
+    return {"applied": applied, "unknown": unknown, "retired": retired, "isaac_lab": isaac_lab}
 
 
 _COLLIDE = ("sim.collide",)
@@ -237,3 +277,8 @@ NEWTON_FLAGS = declare(
         owner="isaac_lab",
     ),
 )
+
+
+def record_newton_environment(environ: Mapping[str, str] | None = None) -> dict:
+    """Record the ``NEWTON_*`` environment once, when a collision pipeline is constructed."""
+    return record_environment(NEWTON_FLAGS, NEWTON_PREFIXES, environ)

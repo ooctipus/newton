@@ -1,12 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Keep the declared environment variables equal to the variables Newton reads."""
+"""Keep the declared environment variables equal to the variables Newton reads, and record them."""
 
 import ast
+import os
 import re
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
+
+import numpy as np
+import warp as wp
 
 import newton
 from newton._src.core import environment_flags as core_flags
@@ -17,6 +23,7 @@ _REGISTRIES = {
     "core.environment_flags": core_flags.NEWTON_FLAGS,
     "solvers.feather_pgs.environment_flags": fpgs_flags.FLAGS,
 }
+_PREFIXES = ("FEATHER_PGS_", "IL_NEWTON_FPGS_", "NEWTON_")
 # A complete variable name, and the literal start of a constructed one (a bare prefix included).
 _NAME = re.compile(r"(?:FEATHER_PGS|IL_NEWTON_FPGS|NEWTON)_[A-Z0-9](?:[A-Z0-9_]*[A-Z0-9])?")
 _HEAD = re.compile(r"(?:FEATHER_PGS|IL_NEWTON_FPGS|NEWTON)_[A-Z0-9_]*")
@@ -183,6 +190,25 @@ def _declared():
     return declared
 
 
+@contextmanager
+def _environment(flags):
+    """Replace every flag-prefixed variable of the process with ``flags`` for the duration."""
+    with patch.dict(os.environ):
+        for name in [name for name in os.environ if name.startswith(_PREFIXES)]:
+            del os.environ[name]
+        os.environ.update(flags)
+        yield
+
+
+def _cpu_model():
+    builder = newton.ModelBuilder()
+    body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    builder.add_shape_box(body=body, hx=0.5, hy=0.5, hz=0.5)
+    builder.add_articulation([builder.add_joint_revolute(-1, body)])
+    builder.add_ground_plane()
+    return builder.finalize(device="cpu")
+
+
 class TestEnvironmentFlagRegistry(unittest.TestCase):
     def test_declarations_match_read_sites(self):
         """Require every FEATHER_PGS_/NEWTON_ name under newton._src to be declared with its readers, and back."""
@@ -273,16 +299,108 @@ class TestEnvironmentFlagRegistry(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(len(_scan_source(source, "example")[2]), 1)
 
+
+class TestEnvironmentRecord(unittest.TestCase):
+    def test_record_classifies_names(self):
+        """Record declared values, undeclared names, retired names and Isaac Lab-owned names separately."""
+        environ = {
+            "FEATHER_PGS_ROWS_MASKED": "1",
+            "FEATHER_PGS_SPARSE_BRANCH_SWEEPS": "0",
+            "FEATHER_PGS_COUPLED_JACOBI": "0",
+            "IL_NEWTON_FPGS_MF_WARMSTART": "0",
+            "NEWTON_NARROW_PHASE_THREADS_X": "4",
+            "PATH": "/usr/bin",
+        }
+        self.assertEqual(
+            fpgs_flags.record(environ),
+            {
+                "applied": {"FEATHER_PGS_ROWS_MASKED": "1", "IL_NEWTON_FPGS_MF_WARMSTART": "0"},
+                "unknown": ["FEATHER_PGS_SPARSE_BRANCH_SWEEPS"],
+                "retired": ["FEATHER_PGS_COUPLED_JACOBI"],
+                "isaac_lab": {},
+            },
+        )
+        environ = {
+            "NEWTON_NARROW_PHASE_THREADS_X": "4",
+            "NEWTON_CONTACT_MATCHING": "latest",
+            "NEWTON_HEIGHTFIELD_CELL_REJECT": "1",
+            "NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD": "0",
+            "NEWTON_UNDECLARED_EXAMPLE": "1",
+            "FEATHER_PGS_ROWS_MASKED": "1",
+        }
+        self.assertEqual(
+            core_flags.record_newton_environment(environ),
+            {
+                "applied": {"NEWTON_HEIGHTFIELD_CELL_REJECT": "1"},
+                "unknown": ["NEWTON_UNDECLARED_EXAMPLE"],
+                "retired": ["NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD"],
+                "isaac_lab": {"NEWTON_CONTACT_MATCHING": "latest", "NEWTON_NARROW_PHASE_THREADS_X": "4"},
+            },
+        )
+
     def test_retired_selector_raises_only_for_one(self):
-        """Raise for a retired selector set to 1, naming the first in the original order; accept other values."""
+        """Raise for a retired selector set to 1, naming the first in the original order; record other values."""
         message = (
             "^FEATHER_PGS_SINGLE_FACTOR selects a retired experiment; reproduce it from the original research checkout$"
         )
-        with self.assertRaisesRegex(ValueError, message):
-            fpgs_flags.reject_retired(dict.fromkeys(_RETIRED_ORDER, "1"))
+        for check in (fpgs_flags.reject_retired, fpgs_flags.record):
+            with self.subTest(check=check.__name__), self.assertRaisesRegex(ValueError, message):
+                check(dict.fromkeys(_RETIRED_ORDER, "1"))
         for value in ("0", "", "true"):
             with self.subTest(value=value):
-                fpgs_flags.reject_retired({"FEATHER_PGS_COUPLED_CONTACT": value, "FEATHER_PGS_NOT_DECLARED": "1"})
+                record = fpgs_flags.record({"FEATHER_PGS_COUPLED_CONTACT": value, "FEATHER_PGS_NOT_DECLARED": "1"})
+                self.assertEqual(record["retired"], ["FEATHER_PGS_COUPLED_CONTACT"])
+                self.assertEqual(record["unknown"], ["FEATHER_PGS_NOT_DECLARED"])
+
+
+class TestSelectionEnvironment(unittest.TestCase):
+    def test_solver_reports_construction_environment(self):
+        """Report the FEATHER_PGS_ environment read at construction, detached from later changes."""
+        flags = {
+            "FEATHER_PGS_RESOLVED_WORLDS": "1",
+            "FEATHER_PGS_SPARSE_BRANCH_SWEEPS": "0",
+            "FEATHER_PGS_COUPLED_JACOBI": "0",
+            "NEWTON_HEIGHTFIELD_CELL_REJECT": "1",
+        }
+        with _environment(flags):
+            solver = newton.solvers.SolverFeatherPGS(_cpu_model())
+        expected = {
+            "applied": {"FEATHER_PGS_RESOLVED_WORLDS": "1"},
+            "unknown": ["FEATHER_PGS_SPARSE_BRANCH_SWEEPS"],
+            "retired": ["FEATHER_PGS_COUPLED_JACOBI"],
+            "isaac_lab": {},
+        }
+        selected = solver.get_path_selection()
+        self.assertEqual(selected["environment"], expected)
+        selected["environment"]["unknown"].append("edited")
+        selected["environment"]["applied"].clear()
+        with _environment({"FEATHER_PGS_KEYED_ROWS": "0"}):
+            self.assertEqual(solver.get_path_selection()["environment"], expected)
+
+    def test_collision_pipeline_reports_construction_environment(self):
+        """Report the NEWTON_ environment read at construction, with Isaac Lab-owned names kept apart."""
+        flags = {
+            "NEWTON_NARROW_PHASE_THREADS_X": "4",
+            "NEWTON_COLLISION_BOX_SAT": "0",
+            "NEWTON_HEIGHTFIELD_CELL_REJECT": "1",
+            "NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD": "0",
+            "NEWTON_UNDECLARED_EXAMPLE": "1",
+            "FEATHER_PGS_ROWS_MASKED": "1",
+        }
+        model = _cpu_model()
+        with _environment(flags):
+            pipeline = newton.CollisionPipeline(model)
+        expected = {
+            "applied": {"NEWTON_HEIGHTFIELD_CELL_REJECT": "1"},
+            "unknown": ["NEWTON_UNDECLARED_EXAMPLE"],
+            "retired": ["NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD"],
+            "isaac_lab": {"NEWTON_COLLISION_BOX_SAT": "0", "NEWTON_NARROW_PHASE_THREADS_X": "4"},
+        }
+        selected = pipeline.get_collision_selection()
+        self.assertEqual(selected["environment"], expected)
+        selected["environment"]["isaac_lab"].clear()
+        with _environment({"NEWTON_HEIGHTFIELD_CELL_REJECT": "0"}):
+            self.assertEqual(pipeline.get_collision_selection()["environment"], expected)
 
 
 if __name__ == "__main__":

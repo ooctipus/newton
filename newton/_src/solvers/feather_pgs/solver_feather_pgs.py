@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import json
 import math
 import os
@@ -1853,7 +1854,9 @@ class SolverFeatherPGS(SolverBase):
         self.compliance_skipped_contact_count = 0
         self._compliant_contacts = None
         self._compliant_prepared = False
-        _environment_flags.reject_retired()
+        # Read the FEATHER_PGS_* environment once: a retired selector set to 1 raises
+        # before any model access; undeclared names are recorded, not rejected.
+        self._environment_record = _environment_flags.record()
         super().__init__(model)
 
         self._requested_kernel_choices = {
@@ -3280,8 +3283,14 @@ class SolverFeatherPGS(SolverBase):
         and tier, resolved worlds, publication, velocity limits, free bodies and
         the friction law, each with a reason. ``options`` records every constructor
         option's requested, declared-default and applied value, captured once at
-        construction. The record is host-only, detached from solver state and
-        JSON-compliant (non-finite floats are strings).
+        construction. ``environment`` records the ``FEATHER_PGS_*`` and
+        ``IL_NEWTON_FPGS_*`` variables present at construction: ``applied`` maps
+        declared names to their values, ``unknown`` lists undeclared names
+        (recorded, not rejected), ``retired`` lists retired names whose value did
+        not reject construction and ``isaac_lab`` is empty for this family.
+        Switches read at import keep the values present at import. The record is
+        host-only, detached from solver state and JSON-compliant (non-finite
+        floats are strings).
         """
         kernels = {}
         kernel_reasons = {}
@@ -3365,6 +3374,7 @@ class SolverFeatherPGS(SolverBase):
         }
         selection["routes"] = route_selection(self)
         selection["options"] = options_selection(self)
+        selection["environment"] = copy.deepcopy(self._environment_record)
         return selection
 
     def prepare_contact_torsion_capture(self, state_in: State, state_out: State) -> None:

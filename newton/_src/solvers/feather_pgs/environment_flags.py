@@ -5,7 +5,9 @@
 
 Each entry names the modules that read it; ``newton/tests/test_environment_flags.py``
 keeps the declarations equal to the read sites. Retired selectors are rejected
-here for the solver and the research sparse owner.
+here for the solver and the research sparse owner. The solver records its
+environment once at construction and records undeclared names instead of
+rejecting them.
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 
-from ...core.environment_flags import EnvironmentFlag, FlagKind, declare
+from ...core.environment_flags import EnvironmentFlag, FlagKind, declare, record_environment
 
 PREFIXES = ("FEATHER_PGS_", "IL_NEWTON_FPGS_")
 
@@ -602,3 +604,10 @@ def reject_retired(environ: Mapping[str, str] | None = None) -> None:
     for name, flag in FLAGS.items():
         if flag.kind == "retired" and environ.get(name) == "1":
             raise ValueError(f"{name} selects a retired experiment; reproduce it from the original research checkout")
+
+
+def record(environ: Mapping[str, str] | None = None) -> dict:
+    """Reject retired selectors, then record the solver's environment once at construction."""
+    environ = os.environ if environ is None else environ
+    reject_retired(environ)
+    return record_environment(FLAGS, PREFIXES, environ)

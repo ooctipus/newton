@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import os
 import warnings
@@ -13,6 +14,7 @@ from typing import Literal
 import numpy as np
 import warp as wp
 
+from ..core.environment_flags import record_newton_environment
 from ..core.reset import normalize_reset_world_mask
 from ..geometry.broad_phase_nxn import BroadPhaseAllPairs, BroadPhaseExplicit
 from ..geometry.broad_phase_sap import BroadPhaseSAP
@@ -1908,6 +1910,9 @@ class CollisionPipeline:
             if using_expert_components or mode_from_broad_phase not in (None, "explicit"):
                 raise ValueError("broad_phase_output_max requires internal explicit broad/narrow phases")
         self.broad_phase_output_max = None if broad_phase_output_max is None else int(broad_phase_output_max)
+        # Record the NEWTON_* environment once, before the reads below; undeclared names
+        # are recorded, not rejected, and names only Isaac Lab reads are kept apart.
+        self._environment_record = record_newton_environment()
         pair_shape_prep = os.environ.get("NEWTON_NARROW_PHASE_PAIR_SHAPE_PREP", "0")
         if pair_shape_prep not in ("0", "1"):
             raise ValueError("NEWTON_NARROW_PHASE_PAIR_SHAPE_PREP must be 0 or 1")
@@ -2703,8 +2708,13 @@ class CollisionPipeline:
         records the terrain midphase, the typed primitive table and its
         closed-form rows, the route convex-hull pairs take, the terrain
         convex-cells owner and its chooser, and each opt-in terrain route with
-        its reason. Both are construction-time host records: they read no device
-        memory and are JSON-compliant.
+        its reason. ``environment`` records the ``NEWTON_*`` variables present at
+        construction: ``applied`` maps declared names Newton reads to their
+        values, ``unknown`` lists undeclared names (recorded, not rejected),
+        ``retired`` lists retired names whose value did not raise and
+        ``isaac_lab`` maps the names Isaac Lab reads and Newton does not. All
+        three are construction-time host records: they read no device memory
+        and are JSON-compliant.
         """
         owner = getattr(self.narrow_phase, "_convex_method_choice", None)
         result = {"requested": self.convex_collision, "reason": self._convex_selection_reason}
@@ -2748,6 +2758,7 @@ class CollisionPipeline:
             result["reason"] = result["heightfield_support"]["reason"]
         result["narrow_phase"] = self._narrow_phase_selection()
         result["heightfield"] = self._heightfield_selection()
+        result["environment"] = copy.deepcopy(self._environment_record)
         return result
 
     def _narrow_phase_selection(self) -> dict:
