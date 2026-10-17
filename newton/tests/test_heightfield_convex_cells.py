@@ -34,6 +34,54 @@ def pipeline(model, enabled, *, automatic=False):
         )
 
 
+def _hull_box_capsule_model():
+    """A flat heightfield under an admitted cube hull, a box and a lying capsule, each resting 5 mm deep."""
+    builder = newton.ModelBuilder()
+    builder.add_shape_heightfield(
+        heightfield=newton.Heightfield(data=np.zeros((17, 17), np.float32), nrow=17, ncol=17, hx=3.0, hy=3.0)
+    )
+    lying = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), 0.5 * np.pi)
+    labels = {}
+    for kind, x in (("hull", -1.5), ("box", 0.0), ("capsule", 1.5)):
+        body = builder.add_body(xform=wp.transform((x, 0.3, 0.245), wp.quat_identity()))
+        if kind == "hull":
+            shape = builder.add_shape_convex_hull(body, mesh=newton.Mesh(VERTICES, FACES.ravel()))
+        elif kind == "box":
+            shape = builder.add_shape_box(body, hx=0.25, hy=0.25, hz=0.25)
+        else:
+            shape = builder.add_shape_capsule(body, xform=wp.transform(wp.vec3(), lying), radius=0.25, half_height=0.25)
+        labels[shape] = kind
+    return builder.finalize(device="cpu"), labels
+
+
+def _contacts_by_shape(model, labels, convex_collision, environment):
+    """Collide once from Newton's defaults plus ``environment``; return each shape's sorted contact points and normals."""
+    with patch.dict(os.environ):
+        for name in [name for name in os.environ if name.startswith("NEWTON_")]:
+            del os.environ[name]
+        os.environ.update(environment)
+        collider = newton.CollisionPipeline(
+            model, rigid_contact_max=4096, max_triangle_pairs=16384, convex_collision=convex_collision
+        )
+    contacts = collider.contacts()
+    collider.collide(model.state(), contacts)
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    shapes = contacts.rigid_contact_shape0.numpy()[:count], contacts.rigid_contact_shape1.numpy()[:count]
+    rows = np.concatenate(
+        [
+            contacts.rigid_contact_point0.numpy()[:count],
+            contacts.rigid_contact_point1.numpy()[:count],
+            contacts.rigid_contact_normal.numpy()[:count],
+        ],
+        axis=1,
+    )
+    found = {}
+    for shape, kind in labels.items():
+        mine = rows[(shapes[0] == shape) | (shapes[1] == shape)]
+        found[kind] = mine[np.lexsort(mine.T[::-1])]
+    return collider, found
+
+
 class TestHeightfieldConvexCells(unittest.TestCase):
     def test_public_admission_cpu(self):
         """Force supported terrain cells without environment configuration."""
@@ -52,6 +100,27 @@ class TestHeightfieldConvexCells(unittest.TestCase):
             for options in ({"reduce_contacts": False}, {"deterministic": True}):
                 with self.subTest(options=options), self.assertRaises(ValueError):
                     newton.CollisionPipeline(model, convex_collision="convex_cells", **options)
+
+    def test_cells_owner_keeps_typed_primitive_rows_cpu(self):
+        """Keep box and capsule terrain contacts when the cells owner takes the hulls out of the fallback scan."""
+        model, labels = _hull_box_capsule_model()
+        typed_table = {"NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY": "1"}
+        _, reference = _contacts_by_shape(model, labels, "ordinary", typed_table)
+        for convex_collision, environment in (
+            ("convex_cells", {}),
+            (None, {**typed_table, "NEWTON_HEIGHTFIELD_CONVEX_CELLS": "1"}),
+        ):
+            with self.subTest(convex_collision=convex_collision):
+                collider, actual = _contacts_by_shape(model, labels, convex_collision, environment)
+                self.assertIsNotNone(collider.narrow_phase._heightfield_cell_owner)
+                self.assertGreater(len(actual["hull"]), 0)
+                for kind in ("box", "capsule"):
+                    self.assertGreater(len(reference[kind]), 0, kind)
+                    # The typed rows are the same cached kernels in both pipelines.
+                    np.testing.assert_array_equal(actual[kind], reference[kind], err_msg=kind)
+                rows = collider.get_collision_selection()["heightfield"]["primitive_query"]["rows"]
+                self.assertEqual([row["row"] for row in rows], ["sphere", "cylinder", "capsule", "box", "fallback"])
+                self.assertEqual(rows[-1]["hull"], "excluded")
 
     def check_contacts(self, device):
         checker = TestHeightfieldPrimitiveQuery()

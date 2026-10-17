@@ -2547,8 +2547,10 @@ class CollisionPipeline:
                         support_selected if choice is not None else support_heightfield_cells,
                         TerrainSupportData if choice is not None else _CellData,
                     )
+                # Keep every typed row; only the trailing generic fallback changes, so that it
+                # no longer scans the hull pairs the cells owner serves.
                 self.narrow_phase._heightfield_primitive_kernels = (
-                    *self.narrow_phase._heightfield_primitive_kernels[:2],
+                    *self.narrow_phase._heightfield_primitive_kernels[:-1],
                     create_mesh_triangle_contacts_to_reducer_kernel(
                         exclude_primitives=True, exclude_heightfield_convex=True
                     ),

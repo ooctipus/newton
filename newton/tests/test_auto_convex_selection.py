@@ -278,7 +278,10 @@ class TestAutoConvexSelection(unittest.TestCase):
         self.assertEqual(forced["heightfield"]["convex_cells"]["owner"], "fixed")
         self.assertEqual(forced["heightfield"]["convex_cells"]["query"], "gjk_mpr")
         self.assertIn("convex_cells", forced["heightfield"]["convex_cells"]["reason"])
-        self.assertEqual(forced["heightfield"]["primitive_query"]["rows"][-1]["hull"], "excluded")
+        # The cells owner replaces only the fallback; every typed row stays.
+        forced_rows = forced["heightfield"]["primitive_query"]["rows"]
+        self.assertEqual([row["row"] for row in forced_rows], ["sphere", "cylinder", "capsule", "box", "fallback"])
+        self.assertEqual(forced_rows[-1]["hull"], "excluded")
         self.assertEqual(forced["narrow_phase"]["coherent_convex"]["reason"], "terrain_cells_only")
         environment = {"NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY": "1", "NEWTON_HEIGHTFIELD_CYLINDER_SPLIT": "1"}
         split = _terrain_pipeline(model, "ordinary", environment).get_collision_selection()["heightfield"]
@@ -308,6 +311,10 @@ class TestAutoConvexSelection(unittest.TestCase):
         self.assertEqual(
             [row["kernel"] for row in terrain["primitive_query"]["rows"]],
             [kernel.key for kernel in pipeline.narrow_phase._heightfield_primitive_kernels],
+        )
+        self.assertEqual(
+            [row["row"] for row in terrain["primitive_query"]["rows"]],
+            ["sphere", "cylinder", "capsule", "box", "fallback"],
         )
         ordinary = _terrain_pipeline(model, "ordinary", {"NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY": "1"})
         self.assertEqual(ordinary.get_collision_selection()["heightfield"]["hull_route"], "closed_form_hull_row")
