@@ -806,12 +806,14 @@ def produce_patch_contacts(
 ):
     """Project current contacts into physical packets with the persistent patch friction law.
 
-    Packets and metadata are those of :func:`produce_contacts`, except for the tangent rows, present
-    only when the contact owns an anchor: they act at the patch friction location, carry the anchor's
-    tangential phi with ``law.beta`` and keep the undivided friction coefficient. Every bias is formed
-    as ``compute_world_contact_bias`` forms it, times ``1 / dt``, so the rows equal the general
-    route's; only a bouncing normal row sums its incident velocity per body, as
-    :func:`produce_contacts` does, instead of per world coordinate.
+    The normal row's metadata and packet are those of :func:`produce_contacts`. Tangent rows, present
+    only when the contact owns an anchor, act at the patch friction location, carry the anchor's
+    tangential phi with ``law.beta`` and keep the undivided friction coefficient. Every bias takes
+    ``compute_world_contact_bias``'s form, ``x * (1 / dt)``, where :func:`produce_contacts` forms
+    ``x / dt``, so the rows equal the general route's bitwise. A bouncing normal row sums its incident
+    velocity per body, as :func:`produce_contacts` does, instead of per world coordinate. It agrees
+    with the general route's to rounding, unless the incident velocity lies within a rounding of a
+    bounce threshold, where the two routes can disagree on whether the row bounces.
     """
     worker, _logical_lane = wp.tid()
     lane = _lane()

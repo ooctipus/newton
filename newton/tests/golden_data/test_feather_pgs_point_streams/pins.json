@@ -213,7 +213,7 @@
   "row_packets.materialize_general_prefix": "43ae5e5b2301884ce69f4f7acd6ca275b5b527bca717e73f5f1b0f8941845e81",
   "row_packets.materialize_patch_fallback": "5f20c40528a0b198ea0ca9d0b47b6801932a18a8f9a76c65d6be735ac940c9eb",
   "row_packets.produce_contacts": "afd9c58775695ad8ff53ceff42a034edeb2a104051fbf647bfb559ee8b5a8fdc",
-  "row_packets.produce_patch_contacts": "a1289f492345bc53a3737e256947523157c3aed56e50396e2320c9ba41bb47b5",
+  "row_packets.produce_patch_contacts": "5ca0c46cdc898b76d5c67c826ee6f1a2466f733eb4a6624da2ee334fb98c6640",
   "solver_feather_pgs._accumulate_row_capacity_telemetry": "d909544ecf9669c05bf97c1de0396fe39ff5195c068c12a899905c12588a4e3e",
   "solver_feather_pgs._accumulate_row_watermark": "91493d15a468654d25833fca1813f2964674ac21cd8ba8e300163344143cc7e3",
   "solver_feather_pgs._clear_dense_row_state": "2222d5f2eb4dabf325036b3739f4d68380ff09821b1b42ea1dce421548ce1b73",

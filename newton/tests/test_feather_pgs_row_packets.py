@@ -413,8 +413,10 @@ class _PatchRowTwins:
         """Write every patch row field and Jacobian of the general route, then link the same rings.
 
         Rows equal the general route's bitwise, except a bouncing normal row's right-hand side: its
-        incident velocity sums per body instead of per world coordinate. Whole buffers are compared, so
-        a row written past a contact's allocation shows even where a later contact rewrites it.
+        incident velocity sums per body instead of per world coordinate, which agrees to rounding
+        because every incident velocity here lies far from the bounce thresholds. Whole buffers are
+        compared, so a row written past a contact's allocation shows even where a later contact
+        rewrites it.
         """
         beta = 0.35
         for shared, friction_shared in ((0, 0), (0, 1), (1, 0), (1, 1)):
