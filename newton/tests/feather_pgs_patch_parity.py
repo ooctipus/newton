@@ -125,12 +125,21 @@ def assert_rows_close(a, b, *, atol=3e-5, rtol=3e-4):
 
 
 def ring_load(parents, impulses, first):
-    """Sum the normal impulses of the patch ring that starts at row ``first``."""
+    """Sum the normal impulses of the patch ring that starts at row ``first``.
+
+    A ring visits each live row at most once, so a walk that has not returned
+    to ``first`` (or ended at -1) after that many links is a malformed ring:
+    raise instead of following it forever.
+    """
     load, row = float(impulses[first]), int(parents[first])
-    while row >= 0 and row != first:
+    for _ in range(len(parents)):
+        if row < 0 or row == first:
+            return load
+        if row >= len(parents):
+            raise AssertionError(f"Patch ring from row {first} links to row {row}, past the {len(parents)} live rows")
         load += float(impulses[row])
         row = int(parents[row])
-    return load
+    raise AssertionError(f"Patch ring from row {first} does not close within {len(parents)} rows")
 
 
 def assert_ring_coulomb(solver, route=0, *, atol=2e-5):

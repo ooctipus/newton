@@ -19,6 +19,7 @@ from newton.tests.feather_pgs_patch_parity import (
     assert_ring_coulomb,
     assert_rows_close,
     contact_rows,
+    ring_load,
 )
 from newton.tests.test_feather_pgs_friction_patches import _ground_box, _patch_fixture
 
@@ -122,6 +123,16 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
         impulses.assign(solved)
         with self.assertRaisesRegex(AssertionError, "pooled budget"):
             assert_ring_coulomb(stand_in)
+
+    def test_ring_walk_rejects_malformed_rings(self):
+        """Pool a closed ring and fail, instead of looping forever, on one that never returns to its start."""
+        impulses = np.array([1.0, 2.0, 4.0, 8.0])
+        self.assertEqual(ring_load(np.array([1, 2, 0, -1]), impulses, 0), 7.0)
+        self.assertEqual(ring_load(np.array([-1, 2, 0, -1]), impulses, 0), 1.0)
+        with self.assertRaisesRegex(AssertionError, "does not close"):
+            ring_load(np.array([1, 2, 1, -1]), impulses, 0)
+        with self.assertRaisesRegex(AssertionError, "past the 4 live rows"):
+            ring_load(np.array([1, 7, 0, -1]), impulses, 0)
 
     def test_history_comparison_detects_lifecycle_differences(self):
         """Match equal anchor histories and report a changed validity bit or carried displacement."""
