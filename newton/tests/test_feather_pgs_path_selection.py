@@ -92,6 +92,37 @@ def _cpu_separate_worlds_model():
     return builder.finalize(device="cpu")
 
 
+def _branched_arm_and_box(device="cuda:0", worlds=2):
+    """A fixed-base arm of two four-link branches (eight DOFs that sparse factors admit) and a free box per world."""
+    scene = newton.ModelBuilder()
+    base = scene.add_link(mass=2.0, inertia=wp.mat33(np.eye(3) * 0.1))
+    joints = [scene.add_joint_fixed(-1, base, parent_xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()))]
+    for side in (-1.0, 1.0):
+        parent = base
+        for _ in range(4):
+            child = scene.add_link(mass=0.5, inertia=wp.mat33(np.eye(3) * 0.05))
+            joints.append(
+                scene.add_joint_revolute(
+                    parent,
+                    child,
+                    axis=newton.Axis.Y,
+                    parent_xform=wp.transform(wp.vec3(0.1, 0.1 * side, -0.1), wp.quat_identity()),
+                    target_ke=20.0,
+                    target_kd=2.0,
+                    armature=0.1,
+                )
+            )
+            parent = child
+        scene.add_shape_sphere(parent, radius=0.04)
+    scene.add_articulation(joints)
+    box = scene.add_body(xform=wp.transform(wp.vec3(0.6, 0.0, 0.06), wp.quat_identity()), mass=0.5)
+    scene.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05)
+    builder = newton.ModelBuilder()
+    builder.replicate(scene, worlds, spacing=(3.0, 3.0, 0.0))
+    builder.add_ground_plane()
+    return builder.finalize(device=device)
+
+
 def _graph_and_reset_rollout(model, sparse, cached_dynamics, *, deterministic=False, after_reset=None, **options):
     """Step once, then replay a captured contacting step around a partial-world reset.
 
@@ -746,6 +777,32 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         model = builder.finalize(device="cuda:0")
         with self.assertRaisesRegex(ValueError, "cached_dynamics"):
             _make_solver(model, False, cached_dynamics="on", friction_anchor_beta=0.0)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Sparse admission requires CUDA")
+    def test_free_body_worlds_keep_the_dense_route_for_both_laws(self):
+        """A branched arm with a free body per world stays dense with the tree cache, under patch friction too.
+
+        Sparse factors admit the arm alone; FEATHER_PGS_PATCH_DENSE_PATHS=0 returns patch friction's
+        free-body worlds to them.
+        """
+        model = _branched_arm_and_box()
+        classified = {}
+        for law, beta in (("patch", None), ("point", 0.0)):
+            with self.subTest(law=law):
+                solver = _make_solver(model, True, friction_anchor_beta=beta)
+                selected = solver.get_path_selection()
+                self.assertEqual(selected["routes"]["friction"]["law"], law)
+                self.assertEqual(selected["sparse_mass_matrix"], "off")
+                self.assertIn("free rigid bodies", selected["reasons"]["sparse_mass_matrix"])
+                self.assertEqual(selected["cached_prediction"], "tree")
+                classified[law] = selected["routes"]["resolved_worlds"]["enabled"]
+        # The classifier's admission does not depend on the friction law.
+        self.assertEqual(classified["patch"], classified["point"])
+        with patch.dict(os.environ, {"FEATHER_PGS_PATCH_DENSE_PATHS": "0"}):
+            solver = _make_solver(model, True)
+        selected = solver.get_path_selection()
+        self.assertEqual(selected["sparse_mass_matrix"], "on")
+        self.assertFalse(selected["routes"]["resolved_worlds"]["enabled"])
 
     @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
     def test_cached_dynamics_contact_graph_and_reset(self):

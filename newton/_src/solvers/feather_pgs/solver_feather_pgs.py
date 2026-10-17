@@ -2762,10 +2762,12 @@ class SolverFeatherPGS(SolverBase):
         # its serial sweeps and ordinary rows.
         self._parallel_contact_paths, self._parallel_contact_paths_reason = self._admit_parallel_contact_paths()
         # Patch friction on the dense route: the paired factor sweep walks patch
-        # contact units, the masked row builder writes the patch row law and the
-        # resolved-world classifier skips worlds whose rows all separate.
+        # contact units, the masked row builder writes the patch row law, the
+        # resolved-world classifier skips worlds whose rows all separate, and
+        # worlds with free rigid bodies keep the dense route.
         # FEATHER_PGS_PATCH_DENSE_PATHS=0 restores the general paired sweep, the
-        # per-contact row builder and complete rows in every world.
+        # per-contact row builder, complete rows in every world and sparse
+        # factors for free-body worlds.
         self._patch_dense_paths = bool(
             self._law_agnostic_contact_paths
             and self._friction_anchors_enabled
@@ -5185,10 +5187,13 @@ class SolverFeatherPGS(SolverBase):
         ):
             self._sparse_selection_reason = "A competing response or publication owner reserves the ordinary buffers."
             return
-        if not self._friction_anchors_enabled and self._has_free_rigid_bodies:
+        if self._has_free_rigid_bodies and (self._point_contact_paths or self._patch_dense_paths):
             # A world that pairs an articulation with free rigid bodies is served
             # by the held-tree owner and the paired response on the dense route
             # (measured: Kuka lift 12.7 ms there against 15.5 on sparse factors).
+            # Both friction laws: patch friction walks contact units in the paired
+            # sweep, writes masked patch rows and keeps the resolved-world
+            # classifier, unless FEATHER_PGS_PATCH_DENSE_PATHS=0.
             self._sparse_selection_reason = (
                 "Worlds with free rigid bodies keep the dense route for the held-tree owner and paired response."
             )

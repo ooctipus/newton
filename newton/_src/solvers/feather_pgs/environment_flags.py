@@ -353,8 +353,8 @@ FLAGS = declare(
         "FEATHER_PGS_PATCH_DENSE_PATHS",
         "policy",
         _SOLVER,
-        "=0 keeps patch friction off the paired factor sweep's contact units, masked rows and the "
-        "resolved-world classifier (default on).",
+        "=0 keeps patch friction off the paired factor sweep's contact units, masked rows, the resolved-world "
+        "classifier and the dense route for free-body worlds (default on).",
     ),
     _flag(
         "FEATHER_PGS_PATCH_PARALLEL_ROWS",

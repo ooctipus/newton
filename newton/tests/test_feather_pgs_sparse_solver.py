@@ -127,8 +127,13 @@ def _case(sparse, *, free_count=0, free_first=False, robot_count=1, prescribed=F
         heterogeneous=heterogeneous,
     )
     # Row-level comparisons need every world's rows: the resolved-world classifier, which skips the
-    # rows of worlds that all separate, stays off on the dense reference.
-    with mock.patch.dict(os.environ, {"FEATHER_PGS_RESOLVED_WORLDS": "0"}):
+    # rows of worlds that all separate, stays off on the dense reference. Worlds with free rigid
+    # bodies keep the dense route by policy; FEATHER_PGS_PATCH_DENSE_PATHS=0 returns patch friction's
+    # free-body worlds to native sparse factors, the route these cases cover.
+    environment = {"FEATHER_PGS_RESOLVED_WORLDS": "0"}
+    if sparse and (free_count or heterogeneous):
+        environment["FEATHER_PGS_PATCH_DENSE_PATHS"] = "0"
+    with mock.patch.dict(os.environ, environment):
         solver = _make_solver(
             model,
             sparse,

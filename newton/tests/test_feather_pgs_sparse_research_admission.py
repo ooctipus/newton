@@ -42,6 +42,14 @@ class _AdmissionProbe(SimpleNamespace):
     def _parallel_contact_paths(self):
         return self._point_contact_paths or (self._law_agnostic_contact_paths and self._patch_parallel_rows)
 
+    @property
+    def _patch_dense_paths(self):
+        return (
+            self._law_agnostic_contact_paths
+            and self._friction_anchors_enabled
+            and os.environ.get("FEATHER_PGS_PATCH_DENSE_PATHS", "1") != "0"
+        )
+
 
 def _eligible_solver():
     """Provide only the host fields needed before topology planning starts."""
@@ -148,14 +156,25 @@ class TestSparseResearchAdmission(unittest.TestCase):
                 SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
 
     def test_free_rigid_bodies_keep_the_dense_route(self):
-        """A world pairing an articulation with free rigid bodies declines the sparse route."""
+        """A world pairing an articulation with free rigid bodies declines the sparse route, for both friction laws."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        with mock.patch.dict(os.environ, {}, clear=True):
+        for anchors in (False, True):
+            with self.subTest(friction_anchors=anchors), mock.patch.dict(os.environ, {}, clear=True):
+                solver = _eligible_solver()
+                solver._friction_anchors_enabled = anchors
+                solver._has_free_rigid_bodies = True
+                SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+                self.assertIsNone(solver._sparse_mass_matrix_size)
+                self.assertIn("free rigid bodies", solver._sparse_selection_reason)
+        # FEATHER_PGS_PATCH_DENSE_PATHS=0 leaves patch friction's free-body worlds to sparse admission.
+        with (
+            mock.patch.dict(os.environ, {"FEATHER_PGS_PATCH_DENSE_PATHS": "0"}, clear=True),
+            self.assertRaises(_TopologyReached),
+        ):
             solver = _eligible_solver()
+            solver._friction_anchors_enabled = True
             solver._has_free_rigid_bodies = True
             SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-            self.assertIsNone(solver._sparse_mass_matrix_size)
-            self.assertIn("free rigid bodies", solver._sparse_selection_reason)
 
     def test_contact_writer_requests_do_not_block_sparse(self):
         """Allow general sparse producers to supersede optional canonical row writers."""
