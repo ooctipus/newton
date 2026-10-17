@@ -7,7 +7,10 @@ The kernels below are verbatim copies of the patch kernels at 98401301: pair
 keys ``(ka << 32) | kb``, every launch over the whole contact capacity, one row
 kernel launch per contact route, and the reset kernel over the whole history.
 Later versions launch over the live contacts instead; tests compare them with
-this reference bitwise, decoding pair keys through :func:`pair_codes`. Device
+this reference, decoding pair keys through :func:`pair_codes`: bitwise on the
+CPU, and on CUDA with computed float payloads within the FMA-contraction bound
+of ``assert_same_patches``, because NVRTC may contract this module's
+multiply-adds differently from the patch module's. Device
 functions that the mechanism work leaves unchanged are imported. This module
 holds shared test helpers; it defines no tests.
 """
