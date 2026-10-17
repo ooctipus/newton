@@ -232,9 +232,45 @@ def assert_pooled_coulomb(test, case, impulses, *, linked, atol=1.0e-6):
     test.assertGreater(pairs, 0)
 
 
+# Golden text of the parallel sweep's friction projection, one warp (NT == 32) and several warps. The point
+# pair scales into the disk of its own freshly clamped normal. The linked pair stages every row's fresh value
+# in shared memory (one warp: store, then __syncwarp; several warps stage before projecting) and walks its
+# ring from its own normal, summing in ring order.
+_RING_WALK = (
+    "                float load = s_x[p];\n"
+    "                for (int ring = s_parent[p], hop = 0; ring >= 0 && ring < n_rows && ring != p && hop < n_rows;"
+    " ring = s_parent[ring], ++hop)\n"
+    "                    load += s_x[ring];\n"
+    "                const float radius = fmaxf(s_mu[i] * load, 0.0f);\n"
+)
+_POINT_WARP_PAIR = (
+    "            const float xp = __shfl_sync(MASK, x_new[0], p & 31);\n"
+    "            const float xs = __shfl_sync(MASK, x_new[0], sib & 31);\n"
+    "            if (fr) {\n"
+    "                const float radius = fmaxf(s_mu[i] * xp, 0.0f);\n"
+    "                const float a_val = x_new[0];\n"
+)
+_LINKED_WARP_PAIR = (
+    "            const float xs = __shfl_sync(MASK, x_new[0], sib & 31);\n"
+    "            if (i < n_rows) s_x[i] = x_new[0];\n"
+    "            __syncwarp();\n"
+    "            if (fr) {\n" + _RING_WALK + "                const float a_val = x_new[0];\n"
+)
+_POINT_BLOCK_PAIR = (
+    "                const int sib = (i == p + 1) ? p + 2 : p + 1;\n"
+    "                const float radius = fmaxf(s_mu[i] * s_x[p], 0.0f);\n"
+    "                const float a_val = s_x[i];\n"
+)
+_LINKED_BLOCK_PAIR = (
+    "                const int sib = (i == p + 1) ? p + 2 : p + 1;\n"
+    + _RING_WALK
+    + "                const float a_val = s_x[i];\n"
+)
+
+
 class TestParallelPatchReference(unittest.TestCase):
     def test_linked_factory_pools_only_the_friction_disk(self):
-        """Build linked tiers as the point tiers plus the ring walk, and refuse in-sweep world rows."""
+        """Build linked tiers as the point tiers with the golden ring walk, and refuse in-sweep world rows."""
         for rows, min_rows, matrix_free, inkernel in itertools.product(
             (32, 64), (0,), (False, True), (None, (6, 0, 0, 0))
         ):
@@ -251,9 +287,16 @@ class TestParallelPatchReference(unittest.TestCase):
                 self.assertEqual(linked.key, point.key + "_linked")
                 point_source = point._fpgs_row_native_source
                 linked_source = linked._fpgs_row_native_source
-                self.assertEqual(source._link_parallel_friction_pairs(point_source), linked_source)
-                self.assertNotIn("xp = __shfl_sync", linked_source)
-                self.assertEqual(linked_source.count("load += s_x[ring];"), 2)
+                for text, golden in (
+                    (point_source, _POINT_WARP_PAIR),
+                    (point_source, _POINT_BLOCK_PAIR),
+                    (linked_source, _LINKED_WARP_PAIR),
+                    (linked_source, _LINKED_BLOCK_PAIR),
+                ):
+                    self.assertEqual(text.count(golden), 1, golden)
+                # Nothing but the two projections differs from the point tier.
+                restored = linked_source.replace(_LINKED_WARP_PAIR, _POINT_WARP_PAIR)
+                self.assertEqual(restored.replace(_LINKED_BLOCK_PAIR, _POINT_BLOCK_PAIR), point_source)
                 self.assertEqual(linked._fpgs_block_dim, point._fpgs_block_dim)
         with self.assertRaisesRegex(ValueError, "linked_rows"):
             source._get_pgs_solve_parallel_kernel(
@@ -484,7 +527,8 @@ class TestKeyedPatchRows(unittest.TestCase):
             self.assertNotIn(written, text)
         self.assertIn("patch_law.patches.point_a.data[contact]", text)
         self.assertIn("patch_law.patches.phi.data[contact][r - 1]", text)
-        self.assertEqual(text.count("load += s_x[ring];"), 2)
+        for golden in (_LINKED_WARP_PAIR, _LINKED_BLOCK_PAIR):
+            self.assertEqual(text.count(golden), 1, golden)
 
 
 _SWITCH = "FEATHER_PGS_PATCH_PARALLEL_ROWS"
