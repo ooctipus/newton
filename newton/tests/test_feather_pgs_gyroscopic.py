@@ -175,10 +175,24 @@ def _mixed_scene(device, *, arm, totes):
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     control = model.control()
     control.joint_target_q.fill_(0.1)
+    # One route for every scene. The held-tree owner refuses the arm's revolute root but would take
+    # the totes-only scene, and each scene would key its own incremental tier by its world width;
+    # none of these scenes has a constraint row for the tier to solve.
     solver = newton.solvers.SolverFeatherPGS(
-        model, pgs_mode="matrix_free" if wp.get_device(device).is_cuda else "split", angular_damping=0.0
+        model,
+        pgs_mode="matrix_free" if wp.get_device(device).is_cuda else "split",
+        angular_damping=0.0,
+        cached_dynamics="off",
+        mf_gs_incremental_rows=0,
     )
     return model, solver, control, [state, output]
+
+
+def _route(solver):
+    """Return the route-deciding entries of a solver's path selection."""
+    selection = solver.get_path_selection()
+    sweep = selection["routes"]["sweep"]
+    return selection["cached_prediction"], selection["sparse_mass_matrix"], sweep["route"], sweep["tiers"]
 
 
 def test_mixed_arm_and_spinning_bodies(test, device):
@@ -191,6 +205,13 @@ def test_mixed_arm_and_spinning_bodies(test, device):
                 _mixed_scene(device, arm=True, totes=False),
                 _mixed_scene(device, arm=False, totes=True),
             ]
+            # The comparisons below hold within one route. The spin is not chaotic, but world
+            # angular velocity w = R I^-1 R^T L with I_min = 0.001 kg*m^2 turns a one-ulp
+            # orientation difference into 2e-4 rad/s within seven steps.
+            routes = [_route(scene[1]) for scene in scenes]
+            test.assertEqual(routes, [routes[0]] * len(routes), "scenes compared across routes")
+            test.assertIsNone(routes[0][0])
+            test.assertIsNone(routes[0][3])
             model, solver, _, states = scenes[0]
             free_bodies = (0, 20, 21, 41)
             inertias = model.body_inertia.numpy().astype(np.float64)
