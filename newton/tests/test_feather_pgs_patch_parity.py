@@ -103,6 +103,14 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
         changed[anchors[0]]["impulses"][1] += 1.0e-3
         with self.assertRaisesRegex(AssertionError, f"contact {anchors[0]} impulses"):
             assert_contact_impulses_close(rows, changed)
+        # A load-scaled bound admits a change within its share of that contact's normal impulse only.
+        load = float(rows[anchors[0]]["impulses"][0])
+        self.assertGreater(load, 0.0)
+        changed[anchors[0]]["impulses"][1] = rows[anchors[0]]["impulses"][1] + 0.9 * 5.0e-3 * load
+        assert_contact_impulses_close(rows, changed, atol=0.0, rtol=0.0, load_rtol=5.0e-3)
+        changed[anchors[0]]["impulses"][1] = rows[anchors[0]]["impulses"][1] + 1.1 * 5.0e-3 * load
+        with self.assertRaisesRegex(AssertionError, f"contact {anchors[0]} impulses"):
+            assert_contact_impulses_close(rows, changed, atol=0.0, rtol=0.0, load_rtol=5.0e-3)
 
     def test_ring_coulomb_accepts_the_pooled_budget(self):
         """Accept friction bounded by the ring's pooled normal load and reject an exceeded budget."""

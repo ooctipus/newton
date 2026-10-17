@@ -127,18 +127,26 @@ def assert_rows_close(a, b, *, atol=3e-5, rtol=3e-4):
             np.testing.assert_allclose(first[name], second[name], atol=atol, rtol=rtol, err_msg=f"contact {c} {name}")
 
 
-def assert_contact_impulses_close(a, b, *, atol=2e-5, rtol=7e-4):
+def assert_contact_impulses_close(a, b, *, atol=2e-5, rtol=7e-4, load_rtol=0.0):
     """Require the same contacts and close solved impulses on each contact's rows.
 
     ``a`` and ``b`` are :func:`contact_rows` records, so impulses compare by
     contact rather than by slot. The default tolerance is the patch history
-    contract of :func:`assert_history_close`.
+    contract of :func:`assert_history_close`. ``load_rtol`` widens each
+    contact's absolute tolerance by that fraction of its normal impulse (the
+    larger of the two records'), for contacts whose saturated friction follows
+    a changing normal load.
     """
     if sorted(a) != sorted(b):
         raise AssertionError(f"Routed contacts differ: {sorted(set(a) ^ set(b))}")
     for c in sorted(a):
+        load = max(abs(float(a[c]["impulses"][0])), abs(float(b[c]["impulses"][0])))
         np.testing.assert_allclose(
-            a[c]["impulses"], b[c]["impulses"], atol=atol, rtol=rtol, err_msg=f"contact {c} impulses"
+            a[c]["impulses"],
+            b[c]["impulses"],
+            atol=atol + load_rtol * load,
+            rtol=rtol,
+            err_msg=f"contact {c} impulses",
         )
 
 
