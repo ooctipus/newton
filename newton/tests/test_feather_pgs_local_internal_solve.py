@@ -6,6 +6,7 @@ import unittest
 import numpy as np
 import warp as wp
 
+from newton._src.solvers.feather_pgs import row_packets
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -426,6 +427,16 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
         np.testing.assert_allclose(velocity.numpy(), [1.0, 1.5], rtol=0.0, atol=2.0e-6)
 
     @unittest.skipUnless(wp.is_cuda_available(), "local internal solve requires CUDA")
+    def test_row_packet_kernel_pools_the_patch_load_like_group_rows(self):
+        """Pool a patch ring and solve its tangent pair from row packets exactly as from group Jacobians."""
+        results = _patch_ring_solves(wp.get_cuda_device())
+        for packet, group in zip(results["packets"], results["group"], strict=True):
+            np.testing.assert_array_equal(packet, group)
+        # The pooled normal impulse gives radius 2; the coupled tangent solution is [.25, 1.5].
+        np.testing.assert_allclose(results["packets"][1][0], [0.0, 0.25, 1.5, 4.0], rtol=0.0, atol=2.0e-6)
+        np.testing.assert_allclose(results["packets"][2], [1.0, 1.5], rtol=0.0, atol=2.0e-6)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "local internal solve requires CUDA")
     def test_local_residual_queue_matches_sequential_dense_and_matrix_free_pgs(self):
         device = wp.get_cuda_device()
         primary_dofs = 3
@@ -566,6 +577,89 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
         np.testing.assert_allclose(velocity.numpy(), expected_velocity, rtol=0.0, atol=3.0e-6)
         np.testing.assert_allclose(dense_impulses.numpy()[0, 0], expected_dense_impulse, rtol=0.0, atol=3.0e-6)
         np.testing.assert_allclose(mf_impulses.numpy()[0, :mf_count], expected_mf_impulses, rtol=0.0, atol=3.0e-6)
+
+
+def _patch_ring_solves(device):
+    """Solve one world's patch ring with the group-Jacobian and the row-packet local kernels.
+
+    Normal rows 0 and 3 form the ring and hold no Jacobian; the tangent pair of row 0 reads the
+    pooled load. The packets hold the group Jacobian's rows and no prefix row. Returns, per kernel,
+    the diagonal, impulses and velocity after one sweep.
+    """
+    dof_count, max_constraints = 2, 4
+    rows = [[0.0, 0.0], [1.0, 0.0], [0.5, 1.0], [0.0, 0.0]]
+    prefix = row_packets.PrefixData()
+    prefix.dofs = wp.full((1, max_constraints, row_packets.PREFIX_WIDTH), -1, dtype=wp.int32, device=device)
+    prefix.weights = wp.zeros((1, max_constraints, row_packets.PREFIX_WIDTH), dtype=wp.float32, device=device)
+    packets = row_packets.ContactPacketData()
+    packets.jacobian = wp.array([rows], dtype=wp.float32, device=device)
+    packets.row_contact = wp.array([[0, 1, 2, 3]], dtype=wp.int32, device=device)
+    arch = wp.get_device(device).arch
+    kernels = {
+        "group": (
+            _get_pgs_solve_local_owned_kernel(
+                max_constraints, max_constraints, dof_count, arch, dense_response_matrix=True
+            ),
+            [],
+        ),
+        "packets": (
+            row_packets.get_local_factory(dof_count, 0, max_constraints)(
+                max_constraints, max_constraints, dof_count, arch, dense_response_matrix=True
+            ),
+            [prefix, packets],
+        ),
+    }
+    candidate = wp.array([0], dtype=wp.int32, device=device)
+    lower = wp.array(np.eye(dof_count, dtype=np.float32)[None], dtype=wp.float32, device=device)
+    jacobian = wp.array([rows], dtype=wp.float32, device=device)
+    results = {}
+    for name, (kernel, operands) in kernels.items():
+        diagonal = wp.array([[1.0, 0.0, 0.0, 1.0]], dtype=wp.float32, device=device)
+        impulses = wp.array([[0.0, 0.0, 0.0, 4.0]], dtype=wp.float32, device=device)
+        velocity = wp.zeros(dof_count, dtype=wp.float32, device=device)
+        wp.launch_tiled(
+            kernel,
+            dim=[1],
+            inputs=[
+                candidate,
+                candidate,
+                PGS_LOCAL_SOLVE_OWNER_SINGLE,
+                wp.array([0], dtype=wp.int32, device=device),
+                wp.array([0], dtype=wp.int32, device=device),
+                wp.array([0], dtype=wp.int32, device=device),
+                wp.array([PGS_LOCAL_SOLVE_OWNER_SINGLE], dtype=wp.int32, device=device),
+                wp.array([max_constraints], dtype=wp.int32, device=device),
+                lower,
+                jacobian,
+                lower,
+                jacobian,
+                wp.array([[0.0, -1.0, -2.0, 0.0]], dtype=wp.float32, device=device),
+                wp.array(
+                    [
+                        [
+                            PGS_CONSTRAINT_TYPE_CONTACT,
+                            PGS_CONSTRAINT_TYPE_FRICTION,
+                            PGS_CONSTRAINT_TYPE_FRICTION,
+                            PGS_CONSTRAINT_TYPE_CONTACT,
+                        ]
+                    ],
+                    dtype=wp.int32,
+                    device=device,
+                ),
+                wp.array([[3, 0, 0, 0]], dtype=wp.int32, device=device),
+                wp.array([[0.0, 0.5, 0.5, 0.0]], dtype=wp.float32, device=device),
+                *TestFeatherPGSLocalInternalSolve._empty_mf_inputs(1, device),
+                1,
+                1.0,
+                0,
+                0,
+            ],
+            outputs=[diagonal, impulses, velocity, *operands],
+            block_dim=32,
+            device=device,
+        )
+        results[name] = (diagonal.numpy(), impulses.numpy(), velocity.numpy())
+    return results
 
 
 if __name__ == "__main__":
