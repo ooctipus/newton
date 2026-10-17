@@ -8,23 +8,31 @@ per-row step scales and Nesterov momentum). Under patch friction a contact's
 normal row links the next normal of its patch ring, and each tangent pair is
 projected into the disk of radius ``mu * (sum of its ring's normal impulses)``.
 The reference below repeats the kernel's sweep in float64 so the CUDA kernels
-can be checked row by row.
+can be checked row by row. Keyed rows write the patch row law themselves; the
+CPU fallback checks it against the general producer and the patch link.
 """
 
 import inspect
 import itertools
 import math
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import warp as wp
 
+import newton
+from newton._src.solvers.feather_pgs import keyed_rows
 from newton._src.solvers.feather_pgs import solver_feather_pgs as source
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
+    compute_world_contact_bias,
 )
+from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
+from newton.solvers import SolverFeatherPGS
+from newton.tests.feather_pgs_patch_parity import standing_model
 
 _DOFS = 6
 _CAPACITY = 64
@@ -283,6 +291,185 @@ class TestParallelPatchReference(unittest.TestCase):
                     np.testing.assert_array_equal(same, point)
                     # The patch anchors pool four normals at half the coefficient, which moves the solution.
                     self.assertGreater(np.max(np.abs(linked - point)), 1.0e-3)
+
+
+class _RowsBuilt(Exception):
+    """Stops a step once its contact rows are built and linked, before any sweep."""
+
+
+_ROW_ARRAYS = (
+    "constraint_count",
+    "row_type",
+    "row_parent",
+    "row_mu",
+    "row_beta",
+    "row_cfm",
+    "phi",
+    "target_velocity",
+    "row_restitution",
+    "rhs",
+    "contact_slot",
+    "contact_world",
+    "contact_slots_needed",
+    "contact_path",
+)
+
+
+def _linked_rows(solver, state, contacts, dt):
+    """Step until the contact rows are built and linked, and return host copies of the rows."""
+    rows = {}
+    finalize = SolverFeatherPGS._finalize_constraint_status
+
+    def capture(self, step_contacts):
+        finalize(self, step_contacts)
+        if self is solver:
+            rows.update({name: getattr(self, name).numpy().copy() for name in _ROW_ARRAYS})
+            rows["J"] = {size: self.J_by_size[size].numpy().copy() for size in self.size_groups}
+            raise _RowsBuilt
+
+    with patch.object(SolverFeatherPGS, "_finalize_constraint_status", capture):
+        try:
+            solver.step(state, solver.model.state(), solver.model.control(), contacts, dt)
+        except _RowsBuilt:
+            pass
+    if not rows:
+        raise AssertionError("The step did not build contact rows")
+    return rows
+
+
+def _general_bias(solver, rows, dt):
+    """The general route's contact and friction bias for captured rows (without ``J v``)."""
+    device = solver.model.device
+    count = wp.array(rows["constraint_count"], dtype=wp.int32, device=device)
+    rhs = wp.zeros(rows["rhs"].shape, dtype=wp.float32, device=device)
+    wp.launch(
+        compute_world_contact_bias,
+        dim=rhs.shape[0] * rhs.shape[1],
+        inputs=[
+            count,
+            rhs.shape[1],
+            wp.array(rows["phi"], dtype=wp.float32, device=device),
+            wp.array(rows["row_beta"], dtype=wp.float32, device=device),
+            wp.array(rows["row_type"], dtype=wp.int32, device=device),
+            wp.array(rows["target_velocity"], dtype=wp.float32, device=device),
+            dt,
+            1.0,
+            solver.contact_speculative_scale,
+            1.0,
+            1.0,
+            wp.zeros(rhs.shape[0], dtype=wp.int32, device=device),
+            0,
+        ],
+        outputs=[rhs, wp.zeros_like(rhs)],
+        device=device,
+    )
+    return rhs.numpy()
+
+
+def _contact_rows_by_id(rows, count):
+    """Map each live dense-routed contact to its rows: ``{contact: (world, first row, row count)}``."""
+    owner = {}
+    for c in range(count):
+        slot, needed = int(rows["contact_slot"][c]), int(rows["contact_slots_needed"][c])
+        if rows["contact_path"][c] == 0 and slot >= 0 and needed > 0:
+            owner[c] = (int(rows["contact_world"][c]), slot, needed)
+    return owner
+
+
+class TestKeyedPatchRows(unittest.TestCase):
+    def test_keyed_rows_write_the_patch_row_law(self):
+        """Write keyed patch rows as the general producer and the patch link write them.
+
+        Every world above the keyed row budget takes the fallback, which runs on
+        CPU and shares its row source with the parallel tiers' in-kernel reader:
+        tangent rows act at the patch friction location with the anchor's phi and
+        friction_anchor_beta, normals link their ring and anchors divide the
+        coefficient, and the bias matches the general route's. Both solvers build
+        the frame from the same anchor history, which a few general steps load.
+        """
+        model = standing_model(device="cpu", worlds=2)
+        dt = 1.0 / 240.0
+        options = {
+            "friction_anchor_beta": 0.2,
+            "pgs_iterations": 4,
+            "dense_max_constraints": 64,
+            "joint_limit_activation_gap": 0.1,
+        }
+        general = SolverFeatherPGS(model, **options)
+        keyed = SolverFeatherPGS(model, **options)
+        # Stand-ins for the matrix-free world layout keyed rows read: one articulation per world.
+        keyed.max_world_dofs = int(model.joint_dof_count) // keyed.world_count
+        keyed.articulation_world_dof_offset = wp.zeros(model.articulation_count, dtype=int, device=model.device)
+        keyed.mf_constraint_count = wp.zeros(keyed.world_count, dtype=int, device=model.device)
+        keyed.mf_gs_parallel_rows = 4
+        keyed._friction_patches = general._friction_patches
+        keyed._keyed_rows = keyed_rows.KeyedRows(keyed)
+        state, out = model.state(), model.state()
+        velocity = state.joint_qd.numpy()
+        velocity[0], velocity[11] = 0.05, -0.04
+        state.joint_qd.assign(velocity)
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True)
+        contacts = pipeline.contacts()
+        for _ in range(6):
+            pipeline.collide(state, contacts)
+            general.step(state, out, model.control(), contacts, dt)
+            state, out = out, state
+        pipeline.collide(state, contacts)
+        expected = _linked_rows(general, state, contacts, dt)
+        actual = _linked_rows(keyed, state, contacts, dt)
+        live = int(contacts.rigid_contact_count.numpy()[0])
+        owner = _contact_rows_by_id(expected, live)
+        self.assertEqual(owner, _contact_rows_by_id(actual, live))
+        slot_contact = {(world, first): c for c, (world, first, _) in owner.items()}
+        bias = _general_bias(general, expected, dt)
+        size = keyed._keyed_rows.layout.primary
+        linked = tangent_phi = 0
+        for c, (world, first, needed) in owner.items():
+            rows = slice(first, first + needed)
+            with self.subTest(contact=c):
+                for name in ("row_type", "row_beta", "row_cfm", "row_restitution"):
+                    np.testing.assert_array_equal(actual[name][world, rows], expected[name][world, rows], name)
+                # Ring links by contact: the next normal of the patch, the owning normal of a tangent row.
+                for rows_of in (expected, actual):
+                    parents = [
+                        slot_contact.get((world, int(p)), -2) if p >= 0 else -1
+                        for p in rows_of["row_parent"][world, rows]
+                    ]
+                    rows_of.setdefault("linked", {})[c] = parents
+                self.assertEqual(actual["linked"][c], expected["linked"][c])
+                for name in ("row_mu", "phi", "target_velocity"):
+                    np.testing.assert_allclose(
+                        actual[name][world, rows], expected[name][world, rows], rtol=1.0e-6, atol=1.0e-9, err_msg=name
+                    )
+                np.testing.assert_allclose(
+                    actual["J"][size][world, rows], expected["J"][size][world, rows], rtol=1.0e-6, atol=1.0e-7
+                )
+                np.testing.assert_allclose(actual["rhs"][world, rows], bias[world, rows], rtol=1.0e-5, atol=1.0e-7)
+                linked += expected["linked"][c][0] not in (-1, c)
+                tangent_phi += needed == 3 and bool(np.any(expected["phi"][world, first + 1 : first + 3] != 0.0))
+        self.assertGreater(linked, 0, "A box foot must link several normals in one ring")
+        self.assertGreater(tangent_phi, 0, "Anchors must carry tangential phi")
+
+    def test_keyed_factory_reads_linked_parents(self):
+        """Read every row's parent and coefficient in the keyed patch tiers instead of building them."""
+        layout = KeyedLayout(16, 6, 0, 16, 128, False, 0)
+        factory = keyed_rows.get_parallel_factory(source._get_pgs_solve_parallel_kernel, layout)
+        options = {"rows": 32, "sweeps": 24, "matrix_free": True, "inkernel_response": (16, 6, 0, 16)}
+        point = factory(128, 32, 22, "120", **options)
+        linked = factory(128, 32, 22, "120", linked_rows=True, **options)
+        self.assertEqual(linked.key, point.key + "_linked")
+        self.assertTrue(linked.key.startswith("pgs_solve_kinetic_keyed_parallel_"))
+        self.assertIn("patch_law", inspect.signature(linked.func).parameters)
+        self.assertNotIn("patch_law", inspect.signature(point.func).parameters)
+        text = linked._fpgs_row_native_source
+        self.assertIn("s_parent[i] = world_row_parent.data[off_dense + i];", text)
+        self.assertIn("s_mu[i] = world_row_mu.data[off_dense + i];", text)
+        for written in ("c.row_parent.data", "c.row_mu.data", "c.row_type.data", "built_parent", "built_mu"):
+            self.assertNotIn(written, text)
+        self.assertIn("patch_law.patches.point_a.data[contact]", text)
+        self.assertIn("patch_law.patches.phi.data[contact][r - 1]", text)
+        self.assertEqual(text.count("load += s_x[ring];"), 2)
 
 
 def _dummy(arg):

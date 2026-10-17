@@ -43,6 +43,7 @@ _PATCH_ONLY = frozenset(
     (
         "compact_contact._produce_ordered_patch_contacts",
         "compact_contact.produce_patch_contacts",
+        "keyed_rows.scatter_patch_contact_keys",
         "friction_patches._arange",
         "friction_patches._build",
         "friction_patches._finish_and_store",
@@ -93,7 +94,39 @@ def _linked_tier_calls():
         yield "solver_feather_pgs._get_pgs_solve_parallel_kernel", (64, 32, 18, _ARCH), kwargs
 
 
-_PATCH_ONLY |= frozenset(_label(name, args, kwargs) for name, args, kwargs in _linked_tier_calls())
+def _keyed_layout():
+    """The 16+6 coordinate layout of the keyed-row sweeps."""
+    from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
+
+    return KeyedLayout(16, 6, 0, 16, 128, False, 0)
+
+
+def _keyed_tier_kwargs(*, linked):
+    """Keyed parallel tiers; ``linked`` selects the patch row law and the ring-pooled projection."""
+    for rows, min_rows in ((32, 0), (64, 32), (96, 64), (128, 96)):
+        kwargs = {
+            "rows": rows,
+            "min_rows": min_rows,
+            "sweeps": 24,
+            "matrix_free": True,
+            "inkernel_response": (16, 6, 0, 16),
+            "exact_row_sums": True,
+        }
+        if linked:
+            kwargs["linked_rows"] = True
+        yield kwargs
+
+
+def _patch_only_factory_labels():
+    """Labels of the factory-built kernels only patch friction launches."""
+    for name, args, kwargs in _linked_tier_calls():
+        yield _label(name, args, kwargs)
+    yield _label("keyed_rows.get_patch_fallback_kernel", (_keyed_layout(),), {})
+    for kwargs in _keyed_tier_kwargs(linked=True):
+        yield _label("keyed_rows.get_parallel_factory", (_keyed_layout(), 128, 32, 22, _ARCH), kwargs)
+
+
+_PATCH_ONLY |= frozenset(_patch_only_factory_labels())
 
 
 def _module_kernels():
@@ -225,24 +258,19 @@ def _keyed_row_calls():
     """Keyed rows of a 16+6 coordinate world (keyed_rows.py), including their parallel tiers."""
     from newton._src.solvers.feather_pgs import keyed_rows  # noqa: PLC0415
     from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
-    from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
 
     def parallel(layout, *args, **kwargs):
         return keyed_rows.get_parallel_factory.__wrapped__(solver._get_pgs_solve_parallel_kernel, layout)(
             *args, **kwargs
         )
 
-    layout = KeyedLayout(16, 6, 0, 16, 128, False, 0)
+    layout = _keyed_layout()
     yield "keyed_rows.get_fallback_kernel", keyed_rows.get_fallback_kernel.__wrapped__, (layout,), {}
-    for rows, min_rows in ((32, 0), (64, 32), (96, 64), (128, 96)):
-        kwargs = {
-            "rows": rows,
-            "min_rows": min_rows,
-            "sweeps": 24,
-            "matrix_free": True,
-            "inkernel_response": (16, 6, 0, 16),
-            "exact_row_sums": True,
-        }
+    for kwargs in _keyed_tier_kwargs(linked=False):
+        yield "keyed_rows.get_parallel_factory", parallel, (layout, 128, 32, 22, _ARCH), kwargs
+    # The persistent patch row law of the same rows.
+    yield "keyed_rows.get_patch_fallback_kernel", keyed_rows.get_patch_fallback_kernel.__wrapped__, (layout,), {}
+    for kwargs in _keyed_tier_kwargs(linked=True):
         yield "keyed_rows.get_parallel_factory", parallel, (layout, 128, 32, 22, _ARCH), kwargs
 
 

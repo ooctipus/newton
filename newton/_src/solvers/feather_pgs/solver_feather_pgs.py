@@ -8844,7 +8844,7 @@ class SolverFeatherPGS(SolverBase):
                     if getattr(gs_kernel, "_fpgs_extra_inputs", False):
                         inputs = inputs + self._inkernel_response_inputs()
                         if getattr(gs_kernel, "_fpgs_kinetic_rows", False):
-                            inputs = [*inputs, self._keyed_rows.data]
+                            inputs = [*inputs, *self._keyed_rows.parallel_arguments()]
                         inputs = inputs + self._world_rows_inputs()
                     launch_kernel = gs_kernel
                     outputs = [self.v_out]

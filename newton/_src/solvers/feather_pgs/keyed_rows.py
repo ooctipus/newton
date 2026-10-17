@@ -5,6 +5,14 @@
 
 The layout (primary tree, secondary free body, parallel row count) comes from
 ``keyed_row_layout.topology_plan``; nothing here names a robot or a size.
+
+Under persistent patch friction the contact keys are scattered with each row's
+type, parent and undivided friction coefficient before the patch link
+(``_FrictionPatchState.link``) links the normal rows into their patch rings and
+divides the tangent coefficients. The row sources then write the patch row law
+(tangent rows at the patch friction location with the anchor's phi and
+``friction_anchor_beta``) and read parents and coefficients instead of writing
+them, so the links survive until the sweep and the patch finish read them.
 """
 
 from functools import cache, partial
@@ -13,6 +21,8 @@ import warp as wp
 
 from ...sim import ModelFlags
 from .contact_input import ContactInput, bind
+from .friction_patches import PatchRowLaw
+from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 from .keyed_row_layout import prefix_kernel
 from .keyed_row_layout import topology_plan as direct_topology_plan
 from .row_inputs import ParallelRowInputs, RowArgument
@@ -71,8 +81,83 @@ def scatter_contact_keys(data: ContactInput, z: KineticRows):
                 z.rowkeys[data.world[contact], data.slot[contact] + direction] = contact * 4 + direction
 
 
-def _row_source(*, layout, output="Jr[q]", private_metadata=False):
-    """Share row geometry and metadata between direct ingestion and the fallback."""
+@wp.kernel(enable_backward=False)
+def scatter_patch_contact_keys(data: ContactInput, z: KineticRows):
+    """Emit the contact keys with the type, parent and undivided coefficient of each patch row.
+
+    The patch link runs after this launch and before any row is read: it links
+    each normal row into its patch ring and divides the tangent coefficient
+    among the anchors that received rows.
+    """
+    contact = wp.tid()
+    if contact < wp.min(data.count[0], data.point0.shape[0]):
+        if data.path[contact] == 0 and data.slot[contact] >= 0:
+            world = data.world[contact]
+            slot = data.slot[contact]
+            mu = float(0.0)
+            materials = int(0)
+            if data.shape0[contact] >= 0:
+                mu += data.material_mu[data.shape0[contact]]
+                materials += 1
+            if data.shape1[contact] >= 0:
+                mu += data.material_mu[data.shape1[contact]]
+                materials += 1
+            if materials > 0:
+                mu /= float(materials)
+            for direction in range(data.slots_needed[contact]):
+                row = slot + direction
+                z.rowkeys[world, row] = contact * 4 + direction
+                if direction == 0:
+                    data.row_type[world, row] = PGS_CONSTRAINT_TYPE_CONTACT
+                    data.row_parent[world, row] = -1
+                    data.row_mu[world, row] = mu
+                else:
+                    data.row_type[world, row] = PGS_CONSTRAINT_TYPE_FRICTION
+                    data.row_parent[world, row] = slot
+                    data.row_mu[world, row] = mu * data.friction_scale
+
+
+def _patch_row_law(source):
+    """Turn a point row source into the patch row law, reading the linked parents and coefficients.
+
+    Tangent rows act at the patch friction location for both the Jacobian and
+    the prescribed target, carry the anchor's tangential phi, and correct it
+    with ``patch_law.beta``. The type, parent and coefficient of every contact
+    row stay as :func:`scatter_patch_contact_keys` and the patch link left them.
+    """
+    edits = (
+        (
+            "            const wp::vec3 anchor = 0.5f * (pa + pb); pa = anchor; pb = anchor;\n        }\n",
+            "            const wp::vec3 anchor = 0.5f * (pa + pb); pa = anchor; pb = anchor;\n        }\n"
+            "        if (r > 0) { pa = patch_law.patches.point_a.data[contact]; "
+            "pb = patch_law.patches.point_b.data[contact]; }\n",
+        ),
+        (
+            "const float phi = r == 0 ? separation : 0.0f;",
+            "const float phi = r == 0 ? separation : patch_law.patches.phi.data[contact][r - 1];",
+        ),
+        (
+            "        c.row_type.data[at] = r == 0 ? 0 : 2;\n"
+            "        c.row_parent.data[at] = r == 0 ? -1 : c.slot.data[contact];\n"
+            "        c.row_mu.data[at] = r == 0 ? mu : friction;\n"
+            "        c.row_beta.data[at] = r == 0 ? c.beta : 0.0f;\n",
+            "        if (r > 0) rhs += c.bias_scale * patch_law.beta * phi / c.dt;\n"
+            "        c.row_beta.data[at] = r == 0 ? c.beta : patch_law.beta;\n",
+        ),
+    )
+    for old, new in edits:
+        if source.count(old) != 1:
+            raise ValueError("the keyed row source changed; update the patch row law")
+        source = source.replace(old, new)
+    return source
+
+
+def _row_source(*, layout, output="Jr[q]", private_metadata=False, patch=False):
+    """Share row geometry and metadata between direct ingestion and the fallback.
+
+    ``patch`` writes the persistent patch row law and reads the linked parents
+    and coefficients (see :func:`_patch_row_law`).
+    """
     dofs = layout.dofs
     prefix = """
         const int token = ~key, d = token / 2;
@@ -106,7 +191,15 @@ def _row_source(*, layout, output="Jr[q]", private_metadata=False):
         }
         """.replace("__PROJECT__", physical_projection)
     incident = f"relative += Jr[q] * c.incident.data[z.maps.starts.data[world * 2 + ({layout.primary_test('q')} ? 0 : 1)] + {layout.local('q')}];"
-    return (
+    if not private_metadata:
+        metadata = ""
+    elif patch:
+        metadata = "built_rhs = rhs;"
+    else:
+        metadata = (
+            "built_rhs = rhs; built_mu = r == 0 ? mu : friction; built_parent = r == 0 ? -1 : c.slot.data[contact];"
+        )
+    source = (
         r"""
     const int at = world * z.rowkeys.shape[1] + row;
     const int key = z.rowkeys.data[at];
@@ -197,20 +290,14 @@ __PROJECTION__
 """.replace("__PREFIX__", prefix)
         .replace("__PROJECTION__", projection)
         .replace("__INCIDENT__", incident)
-        .replace(
-            "__PRIVATE_METADATA__",
-            "built_rhs = rhs; built_mu = r == 0 ? mu : friction; built_parent = r == 0 ? -1 : c.slot.data[contact];"
-            if private_metadata
-            else "",
-        )
+        .replace("__PRIVATE_METADATA__", metadata)
         .replace("__DOFS__", str(dofs))
         .replace("Jr[q]", output)
     )
+    return _patch_row_law(source) if patch else source
 
 
-@cache
-def get_fallback_kernel(layout):
-    """Materialize current physical rows in one pass over fallback worlds only."""
+def _fallback_source(layout, *, patch=False):
     primary = layout.primary
     secondary = layout.secondary
     dofs = primary + secondary
@@ -230,7 +317,7 @@ def get_fallback_kernel(layout):
     for (int row = lane; row < counts.data[world]; row += stride) {
         float Jr[$DOFS];
 """
-        + _row_source(layout=layout)
+        + _row_source(layout=layout, patch=patch)
         + """
         #pragma unroll
         for (int q = 0; q < $DOFS; ++q) {
@@ -251,6 +338,13 @@ def get_fallback_kernel(layout):
         "$LOCAL_B": local_b,
     }.items():
         source = source.replace(key, str(value))
+    return source
+
+
+@cache
+def get_fallback_kernel(layout):
+    """Materialize current physical rows in one pass over fallback worlds only."""
+    source = _fallback_source(layout)
 
     @wp.func_native(source)
     def native(
@@ -273,8 +367,44 @@ def get_fallback_kernel(layout):
     return keyed_rows_fallback
 
 
-def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity):
-    """Decode physical endpoints in the ordinary factor stage, including register whitening."""
+@cache
+def get_patch_fallback_kernel(layout):
+    """Materialize the fallback worlds' rows with the persistent patch row law."""
+    source = _fallback_source(layout, patch=True)
+
+    @wp.func_native(source)
+    def native(
+        world: int,
+        logical_lane: int,
+        z: KineticRows,
+        patch_law: PatchRowLaw,
+        counts: wp.array[int],
+        mf_counts: wp.array[int],
+        J16: wp.array3d[float],
+        J6: wp.array3d[float],
+    ): ...
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def keyed_rows_patch_fallback(
+        z: KineticRows,
+        patch_law: PatchRowLaw,
+        counts: wp.array[int],
+        mf_counts: wp.array[int],
+        J16: wp.array3d[float],
+        J6: wp.array3d[float],
+    ):
+        world, lane = wp.tid()
+        native(world, lane, z, patch_law, counts, mf_counts, J16, J6)
+
+    return keyed_rows_patch_fallback
+
+
+def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, patch=False):
+    """Decode physical endpoints in the ordinary factor stage, including register whitening.
+
+    ``patch`` writes the persistent patch row law and reads every row's parent and
+    coefficient as the scatter and the patch link left them.
+    """
     if (na, nb, oa, ob, dofs) != (
         layout.primary,
         layout.secondary,
@@ -284,6 +414,30 @@ def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity):
     ):
         raise ValueError("physical row layout and parallel operator disagree")
     key = "kinetic_rows.rowkeys.data[off_dense + i]"
+    if patch:
+        reader = (
+            """
+            const int row = i;
+            const auto& z = kinetic_rows;
+            float built_rhs = 0.0f;
+    """
+            + _row_source(layout=layout, output="Zi[q * ZS]", private_metadata=True, patch=True)
+            + f"""
+            if ({key} >= 0) s_rhs[i] = built_rhs;
+    """
+        )
+        return ParallelRowInputs(
+            stage=None,
+            physical_row=reader,
+            arguments=(
+                RowArgument("kinetic_rows", KineticRows, after="world_row_cfm"),
+                RowArgument("patch_law", PatchRowLaw, after="kinetic_rows"),
+            ),
+            row_type=f"({key} >= 0 ? (({key} & 3) == 0 ? 0 : 2) : world_row_type.data[off_dense + i])",
+            rhs=f"{key} < 0 ? rhs_bias.data[off_dense + i] : 0",
+            parent="world_row_parent.data[off_dense + i]",
+            mu="world_row_mu.data[off_dense + i]",
+        )
     reader = (
         """
             const int row = i;
@@ -311,8 +465,17 @@ def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity):
 
 @cache
 def get_parallel_factory(original, layout):
-    """Use the shared parallel policy with the layout's physical row operands."""
-    return partial(original, row_inputs=partial(get_direct_parallel_inputs, layout))
+    """Use the shared parallel policy with the layout's physical row operands.
+
+    ``linked_rows`` selects the persistent patch row law and the policy's
+    ring-pooled friction projection together.
+    """
+
+    def factory(*args, linked_rows=False, **kwargs):
+        inputs = partial(get_direct_parallel_inputs, layout, patch=linked_rows)
+        return original(*args, row_inputs=inputs, linked_rows=linked_rows, **kwargs)
+
+    return factory
 
 
 def _signature(solver):
@@ -348,6 +511,13 @@ class KeyedRows:
         self._dummy_float = wp.zeros(1, dtype=float, device=dev)
         self._dummy_factor = wp.zeros((1, 1, 1), dtype=float, device=dev)
         self._signature = _signature(solver)
+        # Persistent patch friction: the rows carry the patch law, and the patch link owns parents and coefficients.
+        self.patch = bool(solver._friction_anchors_enabled)
+        self.law = None
+        if self.patch:
+            self.law = PatchRowLaw()
+            self.law.patches = solver._friction_patches.view
+            self.law.beta = solver.friction_anchor_beta
 
     def validate_notification(self, flags=ModelFlags.ALL):
         """Reject static-plan changes before retiring any canonical producer."""
@@ -406,14 +576,25 @@ class KeyedRows:
         wp.launch_tiled(prefix, dim=[s.world_count], inputs=[p, self.data], block_dim=32, device=s.model.device)
 
     def produce_contacts(self, state_in, state_aug, contacts, dt):
-        """Defer current contact construction until final fallback counts are known."""
+        """Defer current contact construction until final fallback counts are known.
+
+        Under patch friction the contact keys are scattered now, with the type,
+        parent and undivided coefficient the patch link reads and rewrites.
+        """
         self.contact_input = bind(self.solver, state_in, state_aug, contacts, dt, 1.0)
         self.data.contact = self.contact_input
+        if self.patch:
+            wp.launch(
+                scatter_patch_contact_keys,
+                dim=self.contact_input.point0.shape[0],
+                inputs=[self.contact_input, self.data],
+                device=self.solver.model.device,
+            )
 
     def finish_rows(self):
         """Publish current direct rows and fully materialize only fallback worlds."""
         s = self.solver
-        if self.contact_input is not None:
+        if self.contact_input is not None and not self.patch:
             wp.launch(
                 scatter_contact_keys,
                 dim=self.contact_input.point0.shape[0],
@@ -421,11 +602,12 @@ class KeyedRows:
                 device=s.model.device,
             )
         na, nb = self.layout.primary, self.layout.secondary
+        fallback = get_patch_fallback_kernel(self.layout) if self.patch else get_fallback_kernel(self.layout)
         wp.launch_tiled(
-            get_fallback_kernel(self.layout),
+            fallback,
             dim=[s.world_count],
             inputs=[
-                self.data,
+                *self.parallel_arguments(),
                 s.constraint_count,
                 s.mf_constraint_count,
                 s.J_by_size[na],
@@ -434,6 +616,10 @@ class KeyedRows:
             block_dim=32,
             device=s.model.device,
         )
+
+    def parallel_arguments(self):
+        """Return the row operands the keyed fallback and parallel tiers take: the rows and the patch law."""
+        return [self.data, self.law] if self.patch else [self.data]
 
 
 def create_owner(solver):
