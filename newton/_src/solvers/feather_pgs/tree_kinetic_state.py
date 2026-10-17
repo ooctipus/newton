@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import warp as wp
 
+from ...sim import BodyFlags
 from . import cached_force, response_operator, sparse_factor, tree_chain_scan
 from .cached_state import StateOperands, StateStages, make_body_terms, make_state_kernel
 from .tree_kinetic_layout import REFERENCE_LAYOUT, TreeLayout
@@ -512,7 +513,10 @@ $CLOCK0#if defined(__CUDA_ARCH__)
 #endif
     for(int local=lane;local<$BODIES;local+=stride) {
         const int body=p.joint_child.data[js+local];
-        const auto input=f.body_f.data[body];
+        // A kinematic body takes no external wrench, as in ordinary dynamics
+        // (kernels._compute_body_net_wrench): its wrench must not reach its ancestors.
+        auto input=f.body_f.data[body];
+        if((f.body_flags.data[body]&$KINEMATIC_FLAG)!=0){for(int k=0;k<6;++k)input[k]=0.0f;}
         $SHIFT
         bool active=false;for(int k=0;k<6;++k)active|=input[k]!=0.0f;
         if(active) {
@@ -1109,6 +1113,7 @@ def get_predictor_kernel(
         else "physical[$index]"
     )
     operations = {
+        "KINEMATIC_FLAG": str(int(BodyFlags.KINEMATIC)),
         "SHIFT": cached_force.shift_wrench(
             "input", "cache.com_offset.data[group*$BODIES+local]", "s[6*local+k]", "s[6*local+3+k]"
         ),
