@@ -6,10 +6,11 @@
 Normal contacts are never reduced here. Each compatible region selects up to two
 friction locations, with an equal share of the region's total normal impulse.
 Locations average the support edges along the footprint's principal extent,
-avoiding a diagonal friction couple on symmetric narrow footprints. Isotropic
-footprints retain a canonical farthest pair because they have no unique axis;
-member spans and contact order choose it, so float32 roundoff in world
-coordinates cannot swap it between steps.
+avoiding a diagonal friction couple on symmetric narrow footprints; each edge's
+last member in contact order carries its friction rows. Isotropic footprints
+retain a canonical farthest pair because they have no unique axis; member spans
+and contact order choose it, so float32 roundoff in world coordinates cannot
+swap it between steps.
 Regions require matching friction materials, nearly aligned normals, nearby
 contact planes, and connected shape bounding spheres on each body. The latter
 is a conservative test across convex seams, not an exact surface-connectivity
@@ -746,12 +747,8 @@ def _build_pair(
                     c = frame.members[j]
                     if frame.eligible[c] != 0:
                         projection = wp.dot(frame.center[c] - origin, axis)
-                        if projection < low:
-                            low = projection
-                            first = c
-                        if projection > high:
-                            high = projection
-                            second = c
+                        low = wp.min(low, projection)
+                        high = wp.max(high, projection)
                 sum0 = wp.vec3d(0.0)
                 sum1 = wp.vec3d(0.0)
                 count0 = int(0)
@@ -764,10 +761,19 @@ def _build_pair(
                         offset = point - origin
                         projection = wp.dot(offset, axis)
                         precise_point = wp.vec3d(wp.float64(point[0]), wp.float64(point[1]), wp.float64(point[2]))
+                        # Each edge's last member in contact order carries its
+                        # rows, not the strict extreme, which roundoff picks
+                        # among tied corners. Where rows follow contact order, a
+                        # Gauss-Seidel sweep reaches the anchor's friction rows
+                        # after every normal row of its edge; the first member
+                        # splits them, and the fixed lag in the anchors' pooled
+                        # budgets yaws sliding boxes at low iteration counts.
                         if projection <= low + edge_tolerance:
+                            first = c
                             sum0 += precise_point
                             count0 += 1
                         if projection >= high - edge_tolerance:
+                            second = c
                             sum1 += precise_point
                             count1 += 1
                 # Preserve constant coordinates and single-point edges exactly;

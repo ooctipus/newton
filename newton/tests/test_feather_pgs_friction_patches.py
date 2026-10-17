@@ -175,6 +175,35 @@ class TestFrictionPatchHistory(unittest.TestCase):
                 with self.subTest(footprint=name, offset=offset):
                     self.assertEqual(pairs, {expected})
 
+    def test_support_edge_carriers_ignore_roundoff(self):
+        """Carry each support edge's rows on its last contact when its tied corners move one float32 ulp.
+
+        The anchor locations stay the edge midpoints. Carriers follow contact
+        order, so a collision pipeline that reorders contacts can still move
+        the rows, though not the locations.
+        """
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        corners = [[-0.06, -0.03, 0.0], [0.06, -0.03, 0.0], [-0.06, 0.03, 0.0], [0.06, 0.03, 0.0]]
+        edges = ((0, 2), (1, 3))
+        for offset in (0.0, 1.5):
+            points = (np.asarray(corners) + np.array([offset, offset, 0.0])).astype(np.float32)
+            carriers = set()
+            for corner in range(len(points)):
+                for step in (-1, 0, 1):
+                    moved = points.copy()
+                    if step != 0:
+                        moved[corner, 0] = np.nextafter(moved[corner, 0], np.float32(step * np.inf))
+                    _, _, _, patches = _patch_fixture(moved, device=device)
+                    held = np.flatnonzero(patches.view.weight.numpy()[: len(points)] > 0.0)
+                    carriers.add(tuple(held))
+                    for carrier in held:
+                        edge = next(edge for edge in edges if carrier in edge)
+                        midpoint = moved[list(edge)].astype(np.float64).mean(axis=0).astype(np.float32)
+                        with self.subTest(offset=offset, corner=corner, step=step, carrier=carrier):
+                            np.testing.assert_array_equal(patches.view.point_a.numpy()[carrier], midpoint)
+            with self.subTest(offset=offset):
+                self.assertEqual(carriers, {(2, 3)})
+
     def test_pose_increment_preserves_fixed_pivots_and_no_slip_rolling(self):
         """Distinguish rigid rotation from slip without querying the collision shape."""
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
@@ -867,12 +896,26 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         carry about 1e-7 m of quantization. At 8 iterations every swap of a
         cube's anchor diagonal kicks it by milliradians per second.
         """
+        self._check_resting_anchor_corners(0.05)
+
+    def test_resting_boxes_keep_their_edge_carriers(self):
+        """Carry each resting box's support-edge rows on the same corners, so roundoff cannot kick it.
+
+        The two corners of each short edge tie along the principal axis up to
+        roundoff. The edge midpoints stay the anchor locations; at 8 iterations
+        moving the rows between the tied corners kicks the box by milliradians
+        per second.
+        """
+        self._check_resting_anchor_corners(0.075)
+
+    def _check_resting_anchor_corners(self, half_width):
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
-        # The free box of the mixed-tree parity scenes, alone: it lands from 1 cm.
+        # The free box of the mixed-tree parity scenes, alone, with half_width
+        # along y: it lands from 1 cm.
         scene = newton.ModelBuilder()
         cfg = newton.ModelBuilder.ShapeConfig(mu=0.6)
-        cube = scene.add_body(xform=wp.transform(wp.vec3(0.15, 0.05, 0.06), wp.quat_identity()), mass=0.5)
-        scene.add_shape_box(cube, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+        box = scene.add_body(xform=wp.transform(wp.vec3(0.15, 0.05, 0.06), wp.quat_identity()), mass=0.5)
+        scene.add_shape_box(box, hx=0.05, hy=half_width, hz=0.05, cfg=cfg)
         builder = newton.ModelBuilder()
         builder.replicate(scene, 4, spacing=(3.0, 3.0, 0.0))
         builder.add_ground_plane(cfg=cfg)
@@ -896,12 +939,12 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
             weight = solver._friction_patches.view.weight.numpy()[:count]
             shape0, shape1 = contacts.rigid_contact_shape0.numpy(), contacts.rigid_contact_shape1.numpy()
             point0, point1 = contacts.rigid_contact_point0.numpy(), contacts.rigid_contact_point1.numpy()
-            # Name each anchor by its world and the cube corner it sits on.
+            # Name each anchor by its world and the corner that carries its rows.
             held = [[] for _ in range(model.world_count)]
             for c in np.flatnonzero(weight > 0.0):
-                cube_first = shape_body[shape0[c]] >= 0
-                corner = point0[c] if cube_first else point1[c]
-                world = body_world[shape_body[shape0[c] if cube_first else shape1[c]]]
+                box_first = shape_body[shape0[c]] >= 0
+                corner = point0[c] if box_first else point1[c]
+                world = body_world[shape_body[shape0[c] if box_first else shape1[c]]]
                 held[world].append((bool(corner[0] > 0.0), bool(corner[1] > 0.0)))
             corners.append([tuple(sorted(anchors)) for anchors in held])
         for world in range(model.world_count):
@@ -910,6 +953,62 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 self.assertEqual(len(pairs), 1, f"anchor corners changed between steps: {sorted(pairs)}")
                 self.assertEqual(len(next(iter(pairs))), 2)
         self.assertLess(float(np.abs(np.array(spin[60:])).max()), 1.0e-3)
+
+    def test_sliding_box_keeps_its_heading(self):
+        """Slide a 0.1 x 0.15 m box diagonally at 8 iterations without yawing it or losing Coulomb friction.
+
+        Each support edge's rows follow the edge's normal rows in the split
+        sweep. Carriers between those rows made the two anchors read their
+        pooled budget at fixed, different stages of the sweep, which spun this
+        box at more than 1 rad/s; carriers chosen by roundoff yawed it by a few
+        hundredths.
+        """
+        for heading in (0.75 * np.pi + 0.4, np.pi + 0.4):
+            with self.subTest(heading=heading), wp.ScopedDevice("cpu"):
+                yaw_rate, deceleration = self._slide_box(heading)
+                self.assertLess(yaw_rate, 5.0e-3)
+                np.testing.assert_allclose(deceleration, 0.5 * 9.81, rtol=1.0e-3)
+
+    def _slide_box(self, heading):
+        """Return the largest yaw rate while sliding and each world's fitted deceleration."""
+        scene = newton.ModelBuilder()
+        cfg = newton.ModelBuilder.ShapeConfig(mu=0.5)
+        box = scene.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()))
+        scene.add_shape_box(box, hx=0.05, hy=0.075, hz=0.05, cfg=cfg)
+        builder = newton.ModelBuilder()
+        builder.replicate(scene, 4, spacing=(3.0, 3.0, 0.0))
+        builder.add_ground_plane(cfg=cfg)
+        model = builder.finalize()
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split", pgs_iterations=8)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        states = [model.state(), model.state()]
+        control = model.control()
+        direction = np.array([np.cos(heading), np.sin(heading), 0.0])
+        speeds, yaw_rates = [], []
+        for step in range(84):
+            if step == 24:
+                # Launch every settled box at 1 m/s.
+                qd = states[0].joint_qd.numpy().reshape(-1, 6)
+                qd[:, :3] = direction
+                qd[:, 3:] = 0.0
+                states[0].joint_qd.assign(qd.reshape(-1))
+                newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+            states[0].clear_forces()
+            pipeline.collide(states[0], contacts)
+            solver.step(states[0], states[1], control, contacts, 1.0 / 240.0)
+            states.reverse()
+            if step >= 24:
+                body_qd = states[0].body_qd.numpy()
+                speeds.append(body_qd[:, :3] @ direction)
+                yaw_rates.append(body_qd[:, 5].copy())
+        speeds, yaw_rates = np.array(speeds), np.array(yaw_rates)
+        times = np.arange(len(speeds)) / 240.0
+        deceleration = []
+        for world in range(model.world_count):
+            sliding = (speeds[:, world] > 0.2) & (speeds[:, world] < 0.8)
+            deceleration.append(-np.polyfit(times[sliding], speeds[sliding, world], 1)[0])
+        return float(np.abs(yaw_rates[speeds > 1.0e-3]).max()), np.array(deceleration)
 
     def test_default_patch_friction_and_explicit_opt_out(self):
         """Build persistent patches by default while retaining an explicit velocity-only opt-out."""

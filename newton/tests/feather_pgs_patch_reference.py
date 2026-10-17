@@ -12,9 +12,9 @@ CPU, and on CUDA with computed float payloads within the FMA-contraction bound
 of ``assert_same_patches``, because NVRTC may contract this module's
 multiply-adds differently from the patch module's. Device
 functions that the mechanism work leaves unchanged are imported. ``_build``
-follows the builder's current anchor choice (the canonical farthest pair and
-the footprint tolerance), which is not mechanism work. This module holds shared
-test helpers; it defines no tests.
+follows the builder's current anchor choice (the canonical farthest pair, the
+footprint tolerance and the support-edge carriers), which is not mechanism
+work. This module holds shared test helpers; it defines no tests.
 """
 
 import numpy as np
@@ -351,12 +351,8 @@ def _build(
                     c = frame.members[j]
                     if frame.eligible[c] != 0:
                         projection = wp.dot(frame.center[c] - origin, axis)
-                        if projection < low:
-                            low = projection
-                            first = c
-                        if projection > high:
-                            high = projection
-                            second = c
+                        low = wp.min(low, projection)
+                        high = wp.max(high, projection)
                 sum0 = wp.vec3d(0.0)
                 sum1 = wp.vec3d(0.0)
                 count0 = int(0)
@@ -369,10 +365,19 @@ def _build(
                         offset = point - origin
                         projection = wp.dot(offset, axis)
                         precise_point = wp.vec3d(wp.float64(point[0]), wp.float64(point[1]), wp.float64(point[2]))
+                        # Each edge's last member in contact order carries its
+                        # rows, not the strict extreme, which roundoff picks
+                        # among tied corners. Where rows follow contact order, a
+                        # Gauss-Seidel sweep reaches the anchor's friction rows
+                        # after every normal row of its edge; the first member
+                        # splits them, and the fixed lag in the anchors' pooled
+                        # budgets yaws sliding boxes at low iteration counts.
                         if projection <= low + edge_tolerance:
+                            first = c
                             sum0 += precise_point
                             count0 += 1
                         if projection >= high - edge_tolerance:
+                            second = c
                             sum1 += precise_point
                             count1 += 1
                 # Preserve constant coordinates and single-point edges exactly;
