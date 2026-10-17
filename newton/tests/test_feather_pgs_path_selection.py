@@ -81,7 +81,23 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertFalse(options["fuse_joint_velocity_limits"]["applied"])
         self.assertEqual(options["sparse_mass_matrix"]["applied"], "off")
         self.assertEqual(options["cached_dynamics"]["applied"], "off")
-        solver = SolverFeatherPGS(model, 0.1, friction_anchor_beta=0.0, pgs_iterations=7, parallel_tree=True)
+        # Split mode builds no matrix-free tier and CPU builds no stream or cached propagation response.
+        self.assertEqual(
+            options["mf_gs_incremental_rows"], {"applied": 0, "requested": 32, "default": 32, "source": "default"}
+        )
+        self.assertEqual(options["mf_gs_response_block_lane_rows"]["applied"], 0)
+        for name in ("use_parallel_streams", "propagation_cached_response"):
+            self.assertEqual(options[name], {"applied": False, "requested": True, "default": True, "source": "default"})
+        solver = SolverFeatherPGS(
+            model,
+            0.1,
+            friction_anchor_beta=0.0,
+            pgs_iterations=7,
+            parallel_tree=True,
+            grouped_dynamics=True,
+            lazy_kinematics=True,
+            mf_gs_parallel_rows=48,
+        )
         selected = solver.get_path_selection()
         options = selected["options"]
         self.assertEqual(
@@ -90,14 +106,46 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(
             options["friction_anchor_beta"], {"applied": 0.0, "requested": 0.0, "default": None, "source": "argument"}
         )
-        # CPU keeps serial traversal: the request resolves to no tree plan.
+        # CPU keeps serial traversal and ordinary dynamics: each request resolves to no owner.
+        for name in ("parallel_tree", "grouped_dynamics", "lazy_kinematics"):
+            self.assertEqual(
+                options[name], {"applied": False, "requested": True, "default": False, "source": "argument"}
+            )
         self.assertEqual(
-            options["parallel_tree"], {"applied": False, "requested": True, "default": False, "source": "argument"}
+            options["mf_gs_parallel_rows"], {"applied": 0, "requested": 48, "default": 0, "source": "argument"}
         )
+        self.assertIsNone(selected["routes"]["sweep"]["tiers"])
+        self.assertFalse(selected["routes"]["dynamics"]["grouped_topology"])
+        self.assertEqual(selected["routes"]["publication"]["owner"], "ordinary")
         self.assertEqual(selected["routes"]["friction"]["law"], "point")
         self.assertEqual(selected["routes"]["friction"]["anchor_beta_source"], "argument")
         solver.pgs_iterations = 3
         self.assertEqual(solver.get_path_selection()["options"]["pgs_iterations"]["applied"], 7)
+
+    def test_cpu_options_record_legacy_alias_environment(self):
+        """Attribute an option the IL_NEWTON_FPGS_ warm-start aliases changed to the environment."""
+        with patch.dict(os.environ, {"IL_NEWTON_FPGS_MF_WARMSTART": "1", "IL_NEWTON_FPGS_MF_WARMSTART_DECAY": "0.5"}):
+            options = SolverFeatherPGS(_cpu_model()).get_path_selection()["options"]
+        self.assertEqual(
+            options["mf_warmstart"], {"applied": True, "requested": False, "default": False, "source": "environment"}
+        )
+        self.assertEqual(
+            options["mf_warmstart_decay"], {"applied": 0.5, "requested": 1.0, "default": 1.0, "source": "environment"}
+        )
+        self.assertEqual(
+            options["pgs_warmstart"], {"applied": True, "requested": False, "default": False, "source": "environment"}
+        )
+        self.assertEqual(
+            options["pgs_warmstart_decay"],
+            {"applied": 0.5, "requested": 1.0, "default": 1.0, "source": "environment"},
+        )
+        with patch.dict(os.environ, {"IL_NEWTON_FPGS_MF_WARMSTART": "0", "IL_NEWTON_FPGS_MF_WARMSTART_DECAY": "0.5"}):
+            options = SolverFeatherPGS(_cpu_model()).get_path_selection()["options"]
+        self.assertEqual(options["mf_warmstart_decay"]["source"], "environment")
+        # Without the warm-start alias the decay alias leaves the unified decay alone.
+        self.assertEqual(
+            options["pgs_warmstart_decay"], {"applied": 1.0, "requested": 1.0, "default": 1.0, "source": "default"}
+        )
 
     def test_cpu_route_record_reports_known_selections(self):
         """Report the CPU loop sweep, the split free-body rows and the declined owners with their reasons."""

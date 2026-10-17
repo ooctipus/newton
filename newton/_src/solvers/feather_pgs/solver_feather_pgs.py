@@ -2107,6 +2107,19 @@ class SolverFeatherPGS(SolverBase):
             raise ValueError(f"pgs_warmstart_decay must be finite and non-negative, got {pgs_warmstart_decay!r}")
         self.pgs_warmstart = bool(pgs_warmstart) or legacy_mf_warmstart
         self.pgs_warmstart_decay = requested_pgs_decay if pgs_warmstart or not legacy_mf_warmstart else legacy_mf_decay
+        # Options whose effective value an IL_NEWTON_FPGS_* alias changed; get_path_selection()
+        # reports their source as "environment".
+        argument_decay = requested_pgs_decay if pgs_warmstart or not mf_warmstart else float(mf_warmstart_decay)
+        self._environment_options = frozenset(
+            name
+            for name, changed in (
+                ("mf_warmstart", legacy_mf_warmstart != bool(mf_warmstart)),
+                ("mf_warmstart_decay", legacy_mf_decay != float(mf_warmstart_decay)),
+                ("pgs_warmstart", self.pgs_warmstart != (bool(pgs_warmstart) or bool(mf_warmstart))),
+                ("pgs_warmstart_decay", self.pgs_warmstart_decay != argument_decay),
+            )
+            if changed
+        )
         self._ws_prev_dense_impulses = None
         self._ws_prev_dense_row_type = None
         self._ws_prev_dense_row_parent = None
@@ -3283,7 +3296,10 @@ class SolverFeatherPGS(SolverBase):
         and tier, resolved worlds, publication, velocity limits, free bodies and
         the friction law, each with a reason. ``options`` records every constructor
         option's requested, declared-default and applied value, captured once at
-        construction. ``environment`` records the ``FEATHER_PGS_*`` and
+        construction; the applied value is the one in effect after construction's
+        gates and clamps, off (``False``, ``0`` or ``"off"``) when the owner, tier
+        or stream an option requests was not built.
+        ``environment`` records the ``FEATHER_PGS_*`` and
         ``IL_NEWTON_FPGS_*`` variables present at construction: ``applied`` maps
         declared names to their values, ``unknown`` lists undeclared names
         (recorded, not rejected), ``retired`` lists retired names whose value did
@@ -7190,6 +7206,8 @@ class SolverFeatherPGS(SolverBase):
         self._pgs_solve_mf_gs_incremental_kernels = []
         self._ink_sizes = None
         self._ink_rows = 0
+        # Row budget of the built incremental tiers (0 when none); recorded by get_path_selection().
+        self._incremental_rows = 0
         self._rb_build_kernel = None
         if self.grouped_dynamics and model.device.is_cuda and int(model.articulation_count) > 0:
             self._grouped_topology = GroupedTopology(
@@ -7340,6 +7358,7 @@ class SolverFeatherPGS(SolverBase):
             self._pgs_solve_mf_gs_incremental_kernels = []
             self._ink_sizes = self._build_inkernel_response_meta() if (parallel_rows > 0 and _INK_ON) else None
             self._ink_rows = int(parallel_rows)
+            self._incremental_rows = int(incremental_rows)
             if _WR_ON and self._ink_sizes is not None and self._keyed_rows is None:
                 self._wr_world_contacts = wp.empty(
                     (self.world_count, int(self.dense_max_constraints)), dtype=wp.int32, device=model.device

@@ -70,31 +70,75 @@ def _is_default(value, default) -> bool:
     return bool(same) if isinstance(same, (bool, np.bool_)) else False
 
 
+def _streams_created(solver) -> bool:
+    # Every stream use_parallel_streams gates: size groups, local owners, the compact inertia
+    # refresh, asynchronous augmented drives and the paired overlap. CPU builds none.
+    names = ("_local_internal_stream", "_global_inertia_stream", "_articulation_dynamics_stream")
+    streams = (
+        *solver._size_streams.values(),
+        *(getattr(solver, name, None) for name in names),
+        getattr(solver, "_paired_general_solve_stream", None),
+    )
+    return any(stream is not None for stream in streams)
+
+
+def _response_block_rows(solver, rows) -> int:
+    return int(rows) if solver._rb_build_kernel is not None else 0
+
+
+# Options whose request can resolve to another value, or to no owner or tier at all.
+_EFFECTIVE = {
+    "sparse_mass_matrix": lambda solver: "on" if solver._sparse_mass_matrix_size is not None else "off",
+    "cached_dynamics": lambda solver: "on" if solver._tree_kinetic_state is not None else "off",
+    "parallel_tree": lambda solver: solver._tree_plan is not None,
+    "grouped_dynamics": lambda solver: solver._grouped_topology is not None,
+    # Deferred publication acts only with the fused world-dynamics kernel (K1).
+    "lazy_kinematics": lambda solver: bool(solver.lazy_kinematics and solver._fused_k1),
+    # Tier budgets after their gates and clamps.
+    "mf_gs_parallel_rows": lambda solver: int(solver._ink_rows),
+    "mf_gs_parallel_matrix_free": lambda solver: bool(solver.mf_gs_parallel_matrix_free and solver._ink_rows > 0),
+    "mf_gs_incremental_rows": lambda solver: int(solver._incremental_rows),
+    "mf_gs_response_block_rows": lambda solver: _response_block_rows(solver, solver.mf_gs_response_block_rows),
+    "mf_gs_response_block_lane_rows": lambda solver: _response_block_rows(solver, getattr(solver, "_rb_lane_rows", 0)),
+    "use_parallel_streams": _streams_created,
+    "propagation_cached_response": lambda solver: bool(solver._propagation_cached_response_active),
+}
+
+
 def applied_options(solver, init, arguments: dict) -> dict:
     """Record every constructor option's requested, declared-default and applied value.
 
     ``arguments`` is ``locals()`` taken as the constructor's first statement.
-    Call once, after construction. ``source`` is ``"argument"`` when the
-    requested value differs from the declared default and ``"default"``
-    otherwise; Python cannot tell an omitted option from one passed with its
-    default value.
+    Call once, after construction. ``applied`` is the value in effect after
+    construction's gates and clamps: an option whose owner, tier or stream was
+    not built reports its off value (``False``, ``0`` or ``"off"``), and a row
+    budget reports the rows the built tier serves. ``requested`` keeps the
+    request, which can still decline other owners when its own mechanism does
+    not engage (for example ``grouped_dynamics`` and ``lazy_kinematics``);
+    ``routes`` names the owners. ``source`` is ``"environment"`` when an
+    ``IL_NEWTON_FPGS_*`` legacy alias changed the applied value, ``"argument"``
+    when the requested value differs from the declared default and
+    ``"default"`` otherwise; Python cannot tell an omitted option from one
+    passed with its default value.
     """
     record = {}
+    environment = getattr(solver, "_environment_options", frozenset())
     for name, default in _declared_defaults(init).items():
         value = arguments.get(name, default)
-        if name == "sparse_mass_matrix":
-            applied = "on" if solver._sparse_mass_matrix_size is not None else "off"
-        elif name == "cached_dynamics":
-            applied = "on" if solver._tree_kinetic_state is not None else "off"
-        elif name == "parallel_tree":
-            applied = solver._tree_plan is not None
+        effective = _EFFECTIVE.get(name)
+        if effective is not None:
+            applied = effective(solver)
         else:
             applied = getattr(solver, _APPLIED_ATTRIBUTES.get(name, name), value)
+        if name in environment:
+            source = "environment"
+        else:
+            source = "default" if _is_default(value, default) else "argument"
         record[name] = {
             "applied": json_value(applied),
             "requested": json_value(value),
             "default": json_value(default),
-            "source": "default" if _is_default(value, default) else "argument",
+            "source": source,
         }
     return record
 
