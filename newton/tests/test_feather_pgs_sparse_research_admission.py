@@ -175,6 +175,16 @@ class TestSparseResearchAdmission(unittest.TestCase):
             solver._friction_anchors_enabled = True
             solver._has_free_rigid_bodies = True
             SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+        # The decline is about free rigid bodies, not the friction law: without them, both laws reach admission.
+        for anchors in (False, True):
+            with (
+                self.subTest(friction_anchors=anchors, free_rigid_bodies=False),
+                mock.patch.dict(os.environ, {}, clear=True),
+                self.assertRaises(_TopologyReached),
+            ):
+                solver = _eligible_solver()
+                solver._friction_anchors_enabled = anchors
+                SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
 
     def test_contact_writer_requests_do_not_block_sparse(self):
         """Allow general sparse producers to supersede optional canonical row writers."""
