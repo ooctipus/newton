@@ -16,7 +16,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs.path_selection import applied_options
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_patch_parity import assert_history_close
+from newton.tests.feather_pgs_patch_parity import assert_history_close, assert_loaded_anchors, standing_model
 from newton.tests.test_feather_pgs_sparse_solver import _build_model, _make_solver
 from newton.tests.unittest_utils import assert_host_only
 
@@ -693,8 +693,12 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
     def test_cached_dynamics_dense_patch_graph_and_reset(self):
-        """Cache the dense route under default patch friction with unchanged states and anchor history."""
-        model = _build_model()
+        """Cache the dense route under default patch friction with unchanged states and anchor history.
+
+        The standing fixture's feet keep loaded, ring-linked anchors through the replays and the
+        partial reset, so the history comparison covers carried anchors.
+        """
+        model = standing_model()
         # Without the owner this is the ordinary patch route: the incremental tier, which also serves
         # patch friction, stays off in both arms so that they differ by the owner alone.
         runs = [_graph_and_reset_rollout(model, False, choice, mf_gs_incremental_rows=0) for choice in ("off", "on")]
@@ -709,6 +713,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             np.testing.assert_allclose(
                 getattr(runs[0][2], name).numpy(), getattr(runs[1][2], name).numpy(), atol=3e-4, rtol=3e-4, err_msg=name
             )
+        for solver, contacts, _state in runs:
+            assert_loaded_anchors(solver, contacts)
         assert_history_close(runs[0][0], runs[1][0])
 
     def test_scalar_overrides_reach_solver(self):

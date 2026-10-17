@@ -16,8 +16,10 @@ from newton.tests import test_feather_pgs_sparse_solver as sparse_tests
 from newton.tests import test_feather_pgs_sparse_split as split_tests
 from newton.tests.feather_pgs_patch_parity import (
     assert_history_close,
+    assert_loaded_anchors,
     assert_ring_coulomb,
     contact_rows,
+    standing_model,
 )
 
 
@@ -130,9 +132,13 @@ def _patch_case(model, incremental_rows):
 @unittest.skipUnless(wp.is_cuda_available(), "Incremental native solve requires CUDA")
 class TestFeatherPGSIncrementalPatch(unittest.TestCase):
     def test_patch_rows_match_the_ordinary_sweep(self):
-        """Solve linked patch rows through the incremental kernel as the ordinary matrix-free sweep does."""
+        """Solve linked patch rows through the incremental kernel as the ordinary matrix-free sweep does.
+
+        The standing fixture keeps loaded, ring-linked anchors on its box feet at every step, so the
+        anchor history comparison covers carried anchors; the tripod covers limit rows beside contacts.
+        """
         for name, build in (
-            ("box_foot", lambda: split_tests._model(foot="box")),
+            ("standing", standing_model),
             ("tripod", sparse_tests._build_model),
         ):
             with self.subTest(fixture=name):
@@ -149,7 +155,7 @@ class TestFeatherPGSIncrementalPatch(unittest.TestCase):
                     tiers = selected["routes"]["sweep"]["tiers"]
                     self.assertEqual(None if tiers is None else tiers["family"], "incremental" if rows else None)
                 linked = carried = False
-                for _ in range(12):
+                for index in range(12):
                     for case in (reference, candidate):
                         split_tests._step(case)
                     # Only float order differs; it compounds through the rollout like other route changes.
@@ -164,11 +170,14 @@ class TestFeatherPGSIncrementalPatch(unittest.TestCase):
                     for case in (reference, candidate):
                         assert_ring_coulomb(case[1])
                     assert_history_close(reference[1], candidate[1])
+                    if name == "standing":
+                        for case in (reference, candidate):
+                            assert_loaded_anchors(case[1], case[-1], carried=index > 0)
                     rows = contact_rows(candidate[1], candidate[-1])
                     linked |= any(record["parents"][0] not in (-1, c) for c, record in rows.items())
                     carried |= bool(candidate[1]._friction_patches.previous.valid.numpy().any())
                 self.assertTrue(carried, "Anchors must carry history between steps")
-                if name == "box_foot":
+                if name == "standing":
                     self.assertTrue(linked, "A box foot must link several normals in one ring")
 
 

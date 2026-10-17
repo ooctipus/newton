@@ -9,17 +9,21 @@ from types import SimpleNamespace
 import numpy as np
 import warp as wp
 
+import newton
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     pgs_solve_loop,
 )
+from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import (
     assert_history_close,
+    assert_loaded_anchors,
     assert_ring_coulomb,
     assert_rows_close,
     contact_rows,
     ring_load,
+    standing_model,
 )
 from newton.tests.test_feather_pgs_friction_patches import _ground_box, _patch_fixture
 
@@ -133,6 +137,33 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
             ring_load(np.array([1, 2, 1, -1]), impulses, 0)
         with self.assertRaisesRegex(AssertionError, "past the 4 live rows"):
             ring_load(np.array([1, 7, 0, -1]), impulses, 0)
+
+    def test_standing_feet_keep_loaded_ring_anchors(self):
+        """Carry ring-linked anchors from step to step on the standing fixture, and restart a reset world's."""
+        with wp.ScopedDevice("cpu"):
+            model = standing_model("cpu")
+            solver = SolverFeatherPGS(
+                model, pgs_mode="split", friction_anchor_beta=0.2, pgs_iterations=8, dense_max_constraints=32
+            )
+            pipeline = newton.CollisionPipeline(model, rigid_contact_max=32)
+            contacts, control = pipeline.contacts(), model.control()
+            state, output = model.state(), model.state()
+            newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+            for step in range(12):
+                reset = step == 6
+                if reset:
+                    solver.reset(state, world_mask=wp.array([True, False], dtype=wp.bool, device="cpu"))
+                pipeline.collide(state, contacts)
+                solver.step(state, output, control, contacts, 1.0 / 400.0)
+                state.assign(output)
+                # Two feet per world, each a ring of four normals with two anchors.
+                count = assert_loaded_anchors(solver, contacts, carried=step > 0, reset_worlds=(0,) if reset else ())
+                self.assertEqual(count, 8)
+            with self.assertRaisesRegex(AssertionError, "carried history"):
+                assert_loaded_anchors(solver, contacts, carried=False)
+            # The feet hold the torso at its standing height.
+            np.testing.assert_allclose(state.body_q.numpy()[:: model.body_count // 2, 2], 0.48, atol=1.0e-3)
+            self.assertLess(float(np.abs(state.body_qd.numpy()).max()), 1.0e-2)
 
     def test_history_comparison_detects_lifecycle_differences(self):
         """Match equal anchor histories and report a changed validity bit or carried displacement."""

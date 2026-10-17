@@ -21,9 +21,11 @@ from newton.tests import test_feather_pgs_sparse_contact_triplets as triplet_tes
 from newton.tests import test_feather_pgs_sparse_solver as sparse_tests
 from newton.tests.feather_pgs_patch_parity import (
     assert_history_close,
+    assert_loaded_anchors,
     assert_ring_coulomb,
     assert_rows_close,
     contact_rows,
+    standing_model,
 )
 from newton.tests.test_feather_pgs_sparse_pgs import _sweep
 from newton.tests.test_feather_pgs_sparse_research_admission import _eligible_solver, _TopologyReached
@@ -132,8 +134,8 @@ def _solver(model, enabled, **overrides):
         return SolverFeatherPGS(model, **options)
 
 
-def _case(enabled, *, options=None, contact_matching=None, **shape):
-    model = _model(**shape)
+def _case(enabled, *, options=None, contact_matching=None, standing=False, **shape):
+    model = standing_model(**shape) if standing else _model(**shape)
     solver = _solver(model, enabled, **(options or {}))
     state, out, control = model.state(), model.state(), model.control()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
@@ -474,7 +476,8 @@ class TestSparseSplitPatchPhysics(unittest.TestCase):
     """Run persistent patch friction (friction_anchor_beta=0.2) through dense and sparse split rows."""
 
     def _pair(self, **options):
-        shape = {name: options.pop(name) for name in ("floating", "branches", "depth", "foot") if name in options}
+        names = ("floating", "branches", "depth", "foot", "standing")
+        shape = {name: options.pop(name) for name in names if name in options}
         matching = options.pop("contact_matching", None)
         options["friction_anchor_beta"] = 0.2
         # The reference is the ordinary patch route: dense split rows without the held-tree owner,
@@ -502,40 +505,57 @@ class TestSparseSplitPatchPhysics(unittest.TestCase):
         return rows
 
     def test_patch_steps_and_masked_resets(self):
-        """Keep patch rows, divided mu, ring links and anchor history over 24 steps with masked resets."""
+        """Keep patch rows, divided mu, ring links and anchor history over 24 steps with masked resets.
+
+        The standing fixture keeps loaded, ring-linked anchors on both feet throughout, so its history
+        comparison covers carried anchors, and each masked reset restarts the anchors of exactly the
+        reset worlds. The other trees leave the ground within a few steps and cover rows and states.
+        """
         for shape in (
             {"floating": True, "branches": 3, "depth": 1},
             {"floating": False, "branches": 2, "depth": 2},
             {"floating": True, "branches": 3, "depth": 1, "foot": "box"},
+            {"standing": True},
         ):
             with self.subTest(shape=shape):
                 dense, sparse = self._pair(**shape)
                 linked = carried = False
                 for index in range(24):
+                    reset_worlds = ()
+                    if index in (5, 13, 19):
+                        selected = [index != 13, index != 5]
+                        reset_worlds = tuple(world for world, reset in enumerate(selected) if reset)
+                        for case in (dense, sparse):
+                            case[1].reset(case[2], world_mask=wp.array(selected, dtype=wp.bool, device=case[0].device))
                     for case in (dense, sparse):
-                        if index in (5, 13, 19):
-                            mask = wp.array([index != 13, index != 5], dtype=wp.bool, device=case[0].device)
-                            case[1].reset(case[2], world_mask=mask)
                         _step(case)
                     rows = self._assert_patch(dense, sparse)
+                    if shape.get("standing"):
+                        for case in (dense, sparse):
+                            assert_loaded_anchors(case[1], case[-1], carried=index > 0, reset_worlds=reset_worlds)
                     linked |= any(record["parents"][0] not in (-1, c) for c, record in rows.items())
                     carried |= bool(sparse[1]._friction_patches.previous.valid.numpy().any())
                 self.assertTrue(carried, "Anchors must carry history between steps")
-                if shape.get("foot") == "box":
+                if shape.get("foot") == "box" or shape.get("standing"):
                     self.assertTrue(linked, "A box foot must link several normals in one ring")
 
     def test_warm_start_seeds_patch_impulses(self):
         """Seed carried patch impulses through the sparse factor delta as dense split rows do."""
-        dense, sparse = self._pair(foot="box", pgs_warmstart=True, contact_matching="latest")
+        dense, sparse = self._pair(standing=True, pgs_warmstart=True, contact_matching="latest")
         self.assertTrue(sparse[1]._pgs_solve_sparse_kernel.key.endswith("_warm_start"))
-        for _ in range(8):
+        for index in range(8):
             for case in (dense, sparse):
                 _step(case)
             self._assert_patch(dense, sparse)
+            # Matched anchors carry their friction impulse into the next step's seed.
+            for case in (dense, sparse):
+                assert_loaded_anchors(case[1], case[-1], carried=index > 0)
+        patches = sparse[1]._friction_patches.previous
+        self.assertGreater(float(np.abs(patches.tangent_impulse.numpy()[patches.valid.numpy() != 0]).max()), 0.0)
 
     def test_graph_replay(self):
         """Replay captured sparse patch steps against eager dense split steps."""
-        dense, sparse = self._pair(foot="box")
+        dense, sparse = self._pair(standing=True)
         for case in (dense, sparse):
             _step(case)
         with wp.ScopedCapture("cuda:0") as capture:
@@ -546,6 +566,9 @@ class TestSparseSplitPatchPhysics(unittest.TestCase):
             _step(dense)
             wp.capture_launch(capture.graph)
             self._assert_patch(dense, sparse)
+            # Replayed steps carry the loaded ring-linked anchors as eager steps do.
+            for case in (dense, sparse):
+                assert_loaded_anchors(case[1], case[-1])
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ helpers; it defines no tests.
 """
 
 import numpy as np
+import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
@@ -184,6 +185,75 @@ def assert_history_close(a, b, *, atol=2e-5, rtol=7e-4):
             rtol=rtol,
             err_msg=f"previous.{name}",
         )
+
+
+def assert_loaded_anchors(solver, contacts, *, carried=True, reset_worlds=()):
+    """Require every ring-linked anchor to hold a valid anchor and, where expected, carried history.
+
+    On a loaded sticking fixture each patch keeps its anchors from step to
+    step, so the anchor history that parity checks compare stays populated.
+    ``carried`` expects every anchor outside ``reset_worlds`` to have matched
+    an anchor of the previous step (``current.source >= 0``); anchors of reset
+    worlds start over. Route 0 rows only. Returns the number of ring-linked
+    anchors.
+    """
+    rows = contact_rows(solver, contacts)
+    patches = solver._friction_patches
+    valid, source = patches.previous.valid.numpy(), patches.current.source.numpy()
+    worlds = solver.contact_world.numpy()
+    anchors = [c for c, record in rows.items() if len(record["types"]) == 3 and record["parents"][0] not in (-1, c)]
+    if not anchors:
+        raise AssertionError("No ring-linked contact holds an anchor")
+    for c in anchors:
+        if not valid[c]:
+            raise AssertionError(f"Ring-linked contact {c} lost its anchor")
+        expected = carried and int(worlds[c]) not in reset_worlds
+        if bool(source[c] >= 0) != expected:
+            raise AssertionError(f"Contact {c} carried history: {bool(source[c] >= 0)}, expected {expected}")
+    return len(anchors)
+
+
+def standing_model(device="cuda:0", worlds=2):
+    """Stand a floating torso on two position-held legs with box feet, one articulation per world.
+
+    Each foot rests on four corners, so patch friction links their normals in
+    one ring and keeps two loaded, sticking anchors per foot from step to step.
+    The tree is branched with a free root, as the sparse routes require.
+    """
+    builder = newton.ModelBuilder()
+    cfg = builder.default_shape_cfg.copy()
+    cfg.density, cfg.mu = 0.0, 0.8
+    for _ in range(worlds):
+        builder.begin_world()
+        torso = builder.add_link(
+            xform=wp.transform(wp.vec3(0.0, 0.0, 0.48), wp.quat_identity()),
+            mass=2.0,
+            inertia=wp.mat33(np.eye(3) * 0.1),
+            lock_inertia=True,
+        )
+        joints = [builder.add_joint_free(child=torso)]
+        for side in (-1.0, 1.0):
+            parent = torso
+            for link in range(2):
+                body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.05), lock_inertia=True)
+                offset = wp.vec3(0.0, 0.15 * side, 0.0) if link == 0 else wp.vec3(0.0, 0.0, -0.25)
+                joints.append(
+                    builder.add_joint_revolute(
+                        parent=parent,
+                        child=body,
+                        axis=newton.Axis.Y if link else newton.Axis.X,
+                        parent_xform=wp.transform(offset, wp.quat_identity()),
+                        target_ke=400.0,
+                        target_kd=20.0,
+                    )
+                )
+                parent = body
+            foot = wp.transform(wp.vec3(0.0, 0.0, -0.2), wp.quat_identity())
+            builder.add_shape_box(parent, hx=0.06, hy=0.03, hz=0.03, xform=foot, cfg=cfg)
+        builder.add_articulation(joints)
+        builder.end_world()
+    builder.add_ground_plane()
+    return builder.finalize(device=device)
 
 
 def make_loaded(model, state, contacts, *, margin=0.005, speed=0.01):
