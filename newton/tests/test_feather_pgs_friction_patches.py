@@ -1184,7 +1184,12 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 )
             self.assertTrue(solver._fused_k1)
             self.assertFalse(solver._fused_publication_admitted())
-            self.assertEqual(solver.get_path_selection()["publication"], "ordinary")
+            selected = solver.get_path_selection()
+            self.assertEqual(selected["publication"], "ordinary")
+            self.assertTrue(selected["routes"]["dynamics"]["fused_world_dynamics"])
+            # Patch friction publishes every substep, so a lazy request applies nothing.
+            lazy_option = selected["options"]["lazy_kinematics"]
+            self.assertEqual((lazy_option["requested"], lazy_option["applied"]), (lazy, False))
             pipeline = newton.CollisionPipeline(model)
             states = [model.state(), model.state()]
             states[0].joint_q.assign(joint_q)

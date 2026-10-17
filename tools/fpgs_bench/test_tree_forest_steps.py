@@ -110,9 +110,17 @@ class TestTreeForestSteps(unittest.TestCase):
         cases = [make_case(False), make_case(False, lazy=True), make_case(True, lazy=True)]
         self.assertIsNone(cases[1][1]._tree_kinetic_state)
         self.assertIsNotNone(cases[2][1]._tree_kinetic_state)
-        for case in cases:
+        for arm, case in enumerate(cases):
             self.assertIsNotNone(case[1]._sparse_mass_matrix_size)
             self.assertFalse(case[1]._fused_k1)
+            # The route record the GPU gates grade: sparse factors, the owner where admitted, and a
+            # lazy request that applies nothing on this route.
+            selected = case[1].get_path_selection()
+            self.assertEqual(selected["sparse_mass_matrix"], "on")
+            self.assertEqual(selected["routes"]["held_tree"]["owner"], "tree" if arm == 2 else None)
+            self.assertEqual(selected["cached_prediction"], "tree" if arm == 2 else None)
+            lazy_option = selected["options"]["lazy_kinematics"]
+            self.assertEqual((lazy_option["requested"], lazy_option["applied"]), (arm > 0, False))
         for index in range(24):
             orders = []
             for arm, case in enumerate(cases):

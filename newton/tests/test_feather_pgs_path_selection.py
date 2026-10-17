@@ -14,6 +14,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.path_selection import applied_options
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import assert_history_close
 from newton.tests.test_feather_pgs_sparse_solver import _build_model, _make_solver
@@ -408,6 +409,26 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             # Patch friction builds no parallel tier, whatever the requested budget.
             ({"sparse_mass_matrix": "off", "mf_gs_parallel_rows": 48}, {"free_count": 2}),
             ({"sparse_mass_matrix": "off", "pgs_schedule": "physx_grasp", "friction_anchor_beta": 0.0}, {}),
+            # Lazy publication defers only on the fused world-dynamics kernel, and never under patch friction.
+            (
+                {
+                    "grouped_dynamics": True,
+                    "lazy_kinematics": True,
+                    "sparse_mass_matrix": "off",
+                    "cached_dynamics": "off",
+                    "friction_anchor_beta": 0.0,
+                },
+                {},
+            ),
+            (
+                {
+                    "grouped_dynamics": True,
+                    "lazy_kinematics": True,
+                    "sparse_mass_matrix": "off",
+                    "cached_dynamics": "off",
+                },
+                {},
+            ),
         )
         built = 0
         for options, model_options in cases:
@@ -436,8 +457,11 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 self.assertEqual(applied["grouped_dynamics"], routes["dynamics"]["grouped_topology"])
                 self.assertEqual(
                     applied["lazy_kinematics"],
-                    selected["options"]["lazy_kinematics"]["requested"] and routes["dynamics"]["fused_world_dynamics"],
+                    selected["options"]["lazy_kinematics"]["requested"]
+                    and routes["dynamics"]["fused_world_dynamics"]
+                    and routes["friction"]["law"] == "point",
                 )
+                self.assertEqual(applied["lazy_kinematics"], routes["publication"]["owner"] == "deferred")
                 if options.get("pgs_schedule") == "physx_grasp" and routes["sweep"]["route"] == "matrix_free_gs":
                     self.assertEqual(routes["sweep"]["driver"], "physx_grasp")
                 # A size whose response the grouped kernel solves is labeled so in the kernel plan.
@@ -573,6 +597,11 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 selected = solver.get_path_selection()
                 self.assertEqual(selected["publication"], publication)
                 self.assertEqual(selected["routes"]["publication"]["owner"], publication)
+                # The options record was captured at construction, before the stand-in: recompute it.
+                options = applied_options(
+                    solver, SolverFeatherPGS.__init__, {"friction_anchor_beta": beta, "lazy_kinematics": True}
+                )
+                self.assertEqual(options["lazy_kinematics"]["applied"], publication == "deferred")
                 if beta:
                     self.assertIn("release test", selected["reasons"]["publication"])
                     self.assertIn("release test", selected["routes"]["publication"]["reason"])
