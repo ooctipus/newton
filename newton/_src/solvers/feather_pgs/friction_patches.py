@@ -63,7 +63,10 @@ _SORT_PAD = wp.constant(wp.int64(1 << 62))
 # than this fraction count as equal, and members within this fraction of the
 # footprint's extent of a support edge belong to it, so roundoff neither gives
 # an isotropic footprint an axis, chooses between equally distant members, nor
-# splits an edge.
+# splits an edge. The anisotropy grows as the footprint shrinks: one-ulp moves
+# of every corner of a square of half-width h reach 2 ulp(|x|) / h, so the
+# fraction covers squares wider than about 3 cm at 80 m from the origin and
+# 6 cm at 190 m, and narrower ones nearer to it.
 _FOOTPRINT_TOLERANCE = wp.constant(1.0e-3)
 
 
