@@ -8,7 +8,12 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import contact_torsion
-from newton.tests.test_feather_pgs_contact_torsion import PATCH_OPTIONS, fixture
+from newton.tests.test_feather_pgs_contact_torsion import (
+    PATCH_OPTIONS,
+    TORSION_OFF_ROUTE,
+    assert_torsion_neutral_routes,
+    fixture,
+)
 
 
 class TestTorsionVelocityAdmission(unittest.TestCase):
@@ -212,12 +217,13 @@ class TestTorsionVelocitySolve(unittest.TestCase):
     def test_selected_out_torsion_matches_zero_radius(self):
         """Keep the torsion-zero velocity path identical when no shapes are selected."""
         for velocity in (0, 4):
-            expected, *_ = fixture(0.0, pgs_velocity_iterations=velocity, **PATCH_OPTIONS)
-            actual, *_ = fixture(
-                0.01, pgs_velocity_iterations=velocity, contact_torsion_shape_indices=(), **PATCH_OPTIONS
-            )
-            for key in expected:
-                np.testing.assert_array_equal(actual[key], expected[key], err_msg=key)
+            with self.subTest(pgs_velocity_iterations=velocity):
+                options = {"pgs_velocity_iterations": velocity, **TORSION_OFF_ROUTE, **PATCH_OPTIONS}
+                expected, reference, *_ = fixture(0.0, **options)
+                actual, selected_out, *_ = fixture(0.01, contact_torsion_shape_indices=(), **options)
+                assert_torsion_neutral_routes(self, reference, selected_out)
+                for key in expected:
+                    np.testing.assert_array_equal(actual[key], expected[key], err_msg=key)
 
     def test_runtime_incompatible_mutation_rejected(self):
         """Reject unsupported mutation before stepping an allocated torsion solver."""

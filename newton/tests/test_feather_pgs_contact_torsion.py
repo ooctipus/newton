@@ -119,6 +119,56 @@ def fixture(
     return result, solver, model, a, contacts
 
 
+# The one route both arms of a zero-radius versus selected-out torsion comparison take: ordinary
+# factors, no held-tree owner and the legacy matrix-free sweep. A positive radius keeps a solver on
+# it even with no shape selected (torsion requires ordinary factors and is not law-agnostic), while a
+# zero radius admits native sparse velocity-limit factors, the held-tree owner and the incremental
+# tier wherever they fit; these differ from the legacy route in float order only.
+TORSION_OFF_ROUTE = {"sparse_mass_matrix": "off", "cached_dynamics": "off", "mf_gs_incremental_rows": 0}
+
+
+def _without_reasons(record):
+    """Drop the explanatory texts of a path-selection record, keeping every selection."""
+    if isinstance(record, dict):
+        return {
+            key: _without_reasons(value)
+            for key, value in record.items()
+            if not (isinstance(key, str) and (key in ("reason", "reasons") or key.endswith("_reason")))
+        }
+    if isinstance(record, list):
+        return [_without_reasons(value) for value in record]
+    return record
+
+
+def torsion_neutral_route(solver):
+    """Return a solver's route record without the entries that name its torsion configuration.
+
+    A zero-radius solver and a positive-radius solver with no shape selected differ by construction
+    only in the torsion options, the friction record's torsion flag, the point-contact flag that
+    torsion clears and the torsion specialization of the matrix-free sweep kernel. Reasons are text
+    and lane timings are measurements; every other selection and applied option must match.
+    """
+    record = _without_reasons(solver.get_path_selection())
+    del record["measurements"]
+    for name in ("contact_torsion_radius", "contact_torsion_shape_indices"):
+        del record["options"][name]
+    routes = record["routes"]
+    del routes["friction"]["torsion"]
+    del routes["contact_rows"]["point_contact_paths"]
+    if routes["sweep"]["mf_gs"] is not None:
+        routes["sweep"]["mf_gs"] = routes["sweep"]["mf_gs"].replace("_torsion", "")
+    return record
+
+
+def assert_torsion_neutral_routes(test, reference, selected_out):
+    """Require a zero-radius and a selected-out torsion solver to share the pinned ordinary route."""
+    route = torsion_neutral_route(reference)
+    test.assertEqual(torsion_neutral_route(selected_out), route)
+    test.assertEqual(route["sparse_mass_matrix"], "off")
+    test.assertIsNone(route["cached_prediction"])
+    test.assertIsNone(route["routes"]["sweep"]["tiers"])
+
+
 def held_box(radius, torque, *, steps=20, dt=0.0025, mu=0.5, mass=0.3, half=0.005):
     """Rest a small articulated box on the ground under gravity and a yaw torque with patch friction.
 
@@ -323,8 +373,9 @@ class TestContactTorsion(unittest.TestCase):
 
     def test_default_off_equivalent(self):
         """Keep the zero-radius option exactly equivalent to prefeature output."""
-        reference, *_ = fixture(0.0)
-        actual, *_ = fixture(0.01, contact_torsion_shape_indices=())
+        reference, reference_solver, *_ = fixture(0.0, **TORSION_OFF_ROUTE)
+        actual, selected_out, *_ = fixture(0.01, contact_torsion_shape_indices=(), **TORSION_OFF_ROUTE)
+        assert_torsion_neutral_routes(self, reference_solver, selected_out)
         for key in reference:
             np.testing.assert_array_equal(actual[key], reference[key], err_msg=key)
 

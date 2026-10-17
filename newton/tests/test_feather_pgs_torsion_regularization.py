@@ -7,7 +7,12 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton.tests.test_feather_pgs_contact_torsion import PATCH_OPTIONS, fixture
+from newton.tests.test_feather_pgs_contact_torsion import (
+    PATCH_OPTIONS,
+    TORSION_OFF_ROUTE,
+    assert_torsion_neutral_routes,
+    fixture,
+)
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "Contact torsion requires CUDA")
@@ -85,13 +90,16 @@ class TestTorsionRegularization(unittest.TestCase):
     def test_zero_controls_and_no_load(self):
         """Preserve excluded/radius-zero controls and forbid spin without compressive load."""
         for regularization in (0.0, 0.01, 0.02):
-            base, *_ = fixture(0.0, pgs_contact_regularization=regularization)
-            excluded, *_ = fixture(0.01, pgs_contact_regularization=regularization, contact_torsion_shape_indices=())
-            for name in base:
-                np.testing.assert_array_equal(base[name], excluded[name], err_msg=name)
-            for options in ({"closing": 0.0}, {"mu": 0.0}):
-                result, *_ = fixture(0.01, pgs_contact_regularization=regularization, center_only=True, **options)
-                self.assertLess(np.abs(result["impulses"][result["row_type"] == 7]).max(initial=0), 1e-9)
+            with self.subTest(regularization=regularization):
+                pinned = {"pgs_contact_regularization": regularization, **TORSION_OFF_ROUTE}
+                base, reference, *_ = fixture(0.0, **pinned)
+                excluded, selected_out, *_ = fixture(0.01, contact_torsion_shape_indices=(), **pinned)
+                assert_torsion_neutral_routes(self, reference, selected_out)
+                for name in base:
+                    np.testing.assert_array_equal(base[name], excluded[name], err_msg=name)
+                for options in ({"closing": 0.0}, {"mu": 0.0}):
+                    result, *_ = fixture(0.01, pgs_contact_regularization=regularization, center_only=True, **options)
+                    self.assertLess(np.abs(result["impulses"][result["row_type"] == 7]).max(initial=0), 1e-9)
 
     def test_substep_force_export_and_release(self):
         """Export the actual solved normal load over dt and forget torque on release."""
