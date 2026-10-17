@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -422,6 +423,32 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
 
         self.assertEqual(solver.mass_update_mask.numpy().tolist(), [1, 1])
         self.assertEqual(solver._mass_update_requested.numpy().tolist(), [0, 0])
+
+    def test_held_tree_route_consumes_mass_requests(self):
+        """Refresh the held tree once and consume every request, as the ordinary route's tail does."""
+        for force, step, requested, expected in (
+            (True, 1, [0, 0, 0], [1, 1, 1]),
+            (False, 0, [0, 0, 0], [1, 1, 1]),
+            (False, 1, [1, 1, 1], [1, 1, 1]),
+            (False, 1, [0, 0, 0], [0, 0, 0]),
+            (False, 1, [0, 1, 0], [0, 1, 0]),
+        ):
+            with self.subTest(force=force, step=step, requested=requested):
+                calls = []
+                owner = SimpleNamespace(
+                    model=SimpleNamespace(articulation_count=3, device=wp.get_device("cpu")),
+                    _step=step,
+                    update_mass_matrix_interval=2,
+                    _force_mass_update=force,
+                    _tree_kinetic_state=SimpleNamespace(sparse=SimpleNamespace(refresh=calls.append)),
+                    _mass_update_requested=wp.array(requested, dtype=int, device="cpu"),
+                    mass_update_mask=wp.zeros(3, dtype=int, device="cpu"),
+                )
+                SolverFeatherPGS._stage1_crba(owner, owner, None, None)
+                self.assertEqual(calls, [owner])
+                np.testing.assert_array_equal(owner.mass_update_mask.numpy(), expected)
+                np.testing.assert_array_equal(owner._mass_update_requested.numpy(), [0, 0, 0])
+                self.assertFalse(owner._force_mass_update)
 
     def test_teardown_drains_device_without_accessing_finalized_streams(self):
         """Drain all owned streams without dereferencing finalized handles."""
