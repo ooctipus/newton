@@ -14,16 +14,33 @@ import newton
 from newton._src.solvers.feather_pgs import keyed_rows as rows
 from newton._src.solvers.feather_pgs import solver_feather_pgs as source
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
+from newton.tests.feather_pgs_patch_parity import (
+    assert_history_close,
+    assert_ring_coulomb,
+    contact_rows,
+    standing_model,
+)
 from newton.tests.test_feather_pgs_sparse_solver import STATE_FIELDS, _build_model, _make_solver, _step
 
 
-def make_case(enabled, capacity, free_count=0, *, exact=False, world_rows=False, model_factory=None):
+def make_case(
+    enabled,
+    capacity,
+    free_count=0,
+    *,
+    exact=False,
+    world_rows=False,
+    model_factory=None,
+    beta=0.0,
+    deterministic=False,
+):
     model = _build_model(free_count=free_count) if model_factory is None else model_factory()
     with (
         patch.dict(
             os.environ,
             {
                 "FEATHER_PGS_KEYED_ROWS": ("" if enabled is None else str(int(enabled))),
+                "FEATHER_PGS_PATCH_PARALLEL_ROWS": "1",
             },
         ),
         patch.object(source, "_INK_ON", True),
@@ -40,12 +57,12 @@ def make_case(enabled, capacity, free_count=0, *, exact=False, world_rows=False,
             mf_gs_parallel_rows=capacity,
             mf_gs_parallel_sweeps=24,
             mf_gs_parallel_matrix_free=True,
-            friction_anchor_beta=0.0,
+            friction_anchor_beta=beta,
             fuse_joint_velocity_limits=False,
         )
     state, out = model.state(), model.state()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=128)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=128, deterministic=deterministic)
     return model, solver, state, out, model.control(), pipeline, pipeline.contacts()
 
 
@@ -138,6 +155,44 @@ class TestKeyedRowIntegration(unittest.TestCase):
         self.assertIsNotNone(case[1]._keyed_rows)
         self.assertIsNotNone(case[1]._keyed_rows.layout)
         self.assertIsNone(getattr(case[1], "_wr_world_contacts", None))
+
+    def test_patch_rows_match_ordinary_patch_rows(self):
+        """Solve patch friction through keyed rows as through ordinary rows in the same linked tiers.
+
+        Both arms run the ring-pooled parallel law, so they agree up to float
+        order: the same contacts, row types, ring links and divided coefficients,
+        states within the point twin's tolerance, pooled cones and anchor history.
+        Sorted contacts let the by-contact checks pair the arms' contacts.
+        """
+        for name, factory, free_count in (("tripod", None, 1), ("standing", standing_model, 0)):
+            with self.subTest(fixture=name):
+                ordinary, keyed = (
+                    make_case(enabled, 32, free_count, model_factory=factory, beta=0.2, deterministic=True)
+                    for enabled in (False, True)
+                )
+                self.assertIsNone(ordinary[1]._keyed_rows)
+                self.assertTrue(keyed[1]._keyed_rows.patch)
+                for case in (ordinary, keyed):
+                    kernels = case[1]._pgs_solve_mf_gs_incremental_kernels
+                    self.assertTrue(kernels)
+                    self.assertTrue(all(kernel.key.endswith("_linked") for kernel in kernels))
+                linked = False
+                for _ in range(8):
+                    _step(ordinary)
+                    _step(keyed)
+                    self.compare(ordinary, keyed)
+                    expected, actual = contact_rows(ordinary[1], ordinary[-1]), contact_rows(keyed[1], keyed[-1])
+                    self.assertEqual(sorted(actual), sorted(expected))
+                    for c, record in expected.items():
+                        np.testing.assert_array_equal(actual[c]["types"], record["types"])
+                        np.testing.assert_array_equal(actual[c]["parents"], record["parents"])
+                        np.testing.assert_allclose(actual[c]["mu"], record["mu"], rtol=1.0e-6)
+                        linked |= record["parents"][0] not in (-1, c)
+                    for case in (ordinary, keyed):
+                        assert_ring_coulomb(case[1])
+                    assert_history_close(ordinary[1], keyed[1])
+                if name == "standing":
+                    self.assertTrue(linked, "A box foot must link several normals in one ring")
 
     def test_physical_reader_against_captured_allegro_operator(self):
         """Compare the physical reader with independent captured mass actions."""

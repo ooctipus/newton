@@ -15,6 +15,7 @@ CPU fallback checks it against the general producer and the patch link.
 import inspect
 import itertools
 import math
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -33,7 +34,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 )
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_patch_parity import standing_model
+from newton.tests.feather_pgs_patch_parity import assert_loaded_anchors, assert_ring_coulomb, standing_model
 
 _DOFS = 6
 _CAPACITY = 64
@@ -473,7 +474,61 @@ class TestKeyedPatchRows(unittest.TestCase):
         self.assertEqual(text.count("load += s_x[ring];"), 2)
 
 
+_SWITCH = "FEATHER_PGS_PATCH_PARALLEL_ROWS"
+
+
+def _cpu_arm():
+    """A one-joint arm: enough for construction-time admission on CPU."""
+    builder = newton.ModelBuilder()
+    body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    builder.add_articulation([builder.add_joint_revolute(-1, body)])
+    return builder.finalize(device="cpu")
+
+
 class TestPatchParallelAdmission(unittest.TestCase):
+    def test_policy_switch_admits_patch_friction_and_records_why(self):
+        """Admit patch friction to the parallel tiers and keyed rows by default, record why, and honor the switch.
+
+        ``FEATHER_PGS_PATCH_PARALLEL_ROWS=0`` keeps patch friction on its serial sweeps
+        and ordinary rows; point friction is admitted whatever the switch says.
+        """
+        model = _cpu_arm()
+        for beta, switch, admitted in (
+            (0.0, None, True),
+            (0.0, "0", True),
+            (0.2, None, True),
+            (0.2, "1", True),
+            (0.2, "0", False),
+        ):
+            with self.subTest(beta=beta, switch=switch), patch.dict(os.environ):
+                os.environ.pop(_SWITCH, None)
+                if switch is not None:
+                    os.environ[_SWITCH] = switch
+                solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
+                selected = solver.get_path_selection()
+                friction = selected["routes"]["friction"]
+                keyed = selected["routes"]["contact_rows"]["keyed_rows"]
+                self.assertEqual(solver._parallel_contact_paths, admitted)
+                self.assertEqual(friction["parallel_rows"]["admitted"], admitted)
+                self.assertEqual(selected["environment"]["applied"].get(_SWITCH), switch)
+                if beta == 0.0:
+                    self.assertIn("Point friction", friction["parallel_rows"]["reason"])
+                    continue
+                # Without the switch the only parallel-row owners left to point friction are the response blocks.
+                self.assertEqual("keyed rows" in friction["reason"], not admitted)
+                self.assertIn("need point friction", friction["reason"])
+                if admitted:
+                    self.assertIn("patch ring", friction["parallel_rows"]["reason"])
+                    self.assertNotIn("point contacts", keyed["reason"])
+                else:
+                    self.assertIn(f"{_SWITCH}=0", friction["parallel_rows"]["reason"])
+                    self.assertIn(f"{_SWITCH}=0", keyed["reason"])
+        # Torsion and compliance (CUDA-only laws here) keep ordinary rows whatever the switch says.
+        other_law = SimpleNamespace(_point_contact_paths=False, _law_agnostic_contact_paths=False)
+        admitted, reason = SolverFeatherPGS._admit_parallel_contact_paths(other_law)
+        self.assertFalse(admitted)
+        self.assertIn("torsion", reason)
+
     def test_in_sweep_world_rows_serve_point_friction_only(self):
         """Build contact rows inside the sweep only under point friction, the law that builder writes.
 
@@ -591,6 +646,239 @@ class TestParallelPatchKernel(unittest.TestCase):
                     )
                     np.testing.assert_allclose(velocity, expected_velocity, rtol=1.0e-3, atol=2.0e-5 * scale)
                     assert_pooled_coulomb(self, case, impulses.astype(np.float64), linked=linked, atol=2.0e-5 * scale)
+
+
+_STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
+# Float-order tolerances of an exact route change (assert_states_close of the sparse solver tests).
+_STATE_FLOOR = {"joint_q": 2.0e-4, "body_q": 2.0e-4, "joint_qd": 2.0e-3, "body_qd": 2.0e-3}
+
+
+def _matrix_free_solver(model, *, beta, parallel_rows, **options):
+    """A dense matrix-free solver whose sweep is serial (``parallel_rows=0``) or the parallel tiers."""
+    settings = {
+        "pgs_mode": "matrix_free",
+        "friction_anchor_beta": beta,
+        "pgs_iterations": 8,
+        "dense_max_constraints": 32,
+        "sparse_mass_matrix": "off",
+        "mf_gs_incremental_rows": 0,
+        "mf_gs_parallel_rows": parallel_rows,
+        "mf_gs_parallel_matrix_free": True,
+        "mf_gs_parallel_sweeps": 24,
+        "double_buffer": False,
+    }
+    settings.update(options)
+    return SolverFeatherPGS(model, **settings)
+
+
+def _rollout(model, solver, steps, *, dt=1.0 / 240.0, after_step=None):
+    """Step through the collision pipeline; return the final state and the contacts of the last step."""
+    state, out, control = model.state(), model.state(), model.control()
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True)
+    contacts = pipeline.contacts()
+    for step in range(steps):
+        state.clear_forces()
+        pipeline.collide(state, contacts)
+        solver.step(state, out, control, contacts, dt)
+        state, out = out, state
+        if after_step is not None:
+            after_step(step, solver, contacts, state)
+    return state, contacts
+
+
+def _state_differences(first, second):
+    return {
+        name: float(np.max(np.abs(getattr(first, name).numpy() - getattr(second, name).numpy())))
+        for name in _STATE_FIELDS
+    }
+
+
+def _sliding_boxes(device, speeds, *, mu=0.5):
+    """One box per world on prismatic x, y and z joints over the ground, starting at ``speeds`` along x.
+
+    The box rests on four corner contacts, one patch ring with two anchors. It
+    cannot rotate, so its friction acts along a fixed tangent and a slide stops
+    after ``v^2 / (2 mu g)``.
+    """
+    builder = newton.ModelBuilder()
+    cfg = builder.default_shape_cfg.copy()
+    cfg.density, cfg.mu = 0.0, mu
+    for _ in speeds:
+        builder.begin_world()
+        parent, joints = -1, []
+        for axis in (newton.Axis.X, newton.Axis.Y, newton.Axis.Z):
+            box = axis == newton.Axis.Z
+            body = builder.add_link(
+                mass=1.0 if box else 0.01, inertia=wp.mat33(np.eye(3) * (0.005 if box else 1.0e-5)), lock_inertia=True
+            )
+            joints.append(builder.add_joint_prismatic(parent=parent, child=body, axis=axis))
+            parent = body
+        builder.add_shape_box(parent, hx=0.1, hy=0.1, hz=0.05, cfg=cfg)
+        builder.add_articulation(joints)
+        builder.end_world()
+    builder.add_ground_plane(cfg=cfg)
+    model = builder.finalize(device=device)
+    q, qd = model.joint_q.numpy(), model.joint_qd.numpy()
+    for world, speed in enumerate(speeds):
+        q[3 * world + 2] = 0.05
+        qd[3 * world] = speed
+    model.joint_q.assign(q)
+    model.joint_qd.assign(qd)
+    return model
+
+
+def _friction_pairs(solver, world):
+    """Each friction pair's impulse magnitude and pooled budget ``mu * (ring's normal impulses)``."""
+    count = int(solver.constraint_count.numpy()[world])
+    kinds = solver.row_type.numpy()[world, :count]
+    parents = solver.row_parent.numpy()[world, :count]
+    mu, impulses = solver.row_mu.numpy()[world, :count], solver.impulses.numpy()[world, :count]
+    pairs = []
+    for row in np.flatnonzero(kinds == PGS_CONSTRAINT_TYPE_FRICTION):
+        parent = int(parents[row])
+        if row == parent + 1:
+            budget = float(mu[row]) * ring_load(parents, impulses.astype(np.float64), parent)
+            pairs.append((math.hypot(impulses[row], impulses[row + 1]), budget))
+    return pairs
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "Parallel matrix-free tiers require CUDA")
+class TestPatchParallelRoutes(unittest.TestCase):
+    def test_patch_runs_linked_tiers_unless_switched_off(self):
+        """Build linked tiers for patch friction, point tiers for point friction, and today's route when switched off."""
+        model = standing_model()
+        options = {"sparse_mass_matrix": "auto", "cached_dynamics": "auto"}
+        with patch.dict(os.environ):
+            os.environ.pop(_SWITCH, None)
+            patch_tiers = _matrix_free_solver(model, beta=0.2, parallel_rows=32, **options)
+            point_tiers = _matrix_free_solver(model, beta=0.0, parallel_rows=32, **options)
+            serial = _matrix_free_solver(model, beta=0.2, parallel_rows=0, **options)
+            os.environ[_SWITCH] = "0"
+            switched = _matrix_free_solver(model, beta=0.2, parallel_rows=32, **options)
+        for solver, linked in ((patch_tiers, True), (point_tiers, False)):
+            self.assertEqual(solver._ink_rows, 32)
+            # The tier owns the ordinary buffers for either law.
+            self.assertIsNone(solver._sparse_mass_matrix_size)
+            keys = [kernel.key for kernel in solver._pgs_solve_mf_gs_incremental_kernels]
+            self.assertTrue(keys)
+            self.assertTrue(all(key.endswith("_linked") == linked for key in keys), keys)
+            tiers = solver.get_path_selection()["routes"]["sweep"]["tiers"]
+            self.assertEqual((tiers["family"], tiers["linked_rows"]), ("parallel", linked))
+        # Switched off, patch friction keeps the serial route it had before the tiers learned the ring.
+        self.assertEqual(switched._ink_rows, 0)
+        self.assertEqual(switched._pgs_solve_mf_gs_incremental_kernels, [])
+        expected, actual = serial.get_path_selection(), switched.get_path_selection()
+        for name in ("sweep", "sparse_mass_matrix", "held_tree", "dynamics", "publication", "contact_rows"):
+            if name == "contact_rows":
+                expected["routes"][name]["keyed_rows"].pop("reason")
+                actual["routes"][name]["keyed_rows"].pop("reason")
+            self.assertEqual(actual["routes"][name], expected["routes"][name], name)
+        self.assertEqual(actual["kernel_plan_by_dof"], expected["kernel_plan_by_dof"])
+        self.assertFalse(actual["routes"]["friction"]["parallel_rows"]["admitted"])
+
+    def test_in_sweep_world_rows_stay_point_only(self):
+        """Own no in-sweep world rows under patch friction with INK and WORLD_ROWS and keyed rows declined."""
+        model = standing_model()
+        built = {}
+        with (
+            patch.object(source, "_INK_ON", True),
+            patch.object(source, "_WR_ON", True),
+            patch.dict(os.environ, {"FEATHER_PGS_KEYED_ROWS": "0"}),
+        ):
+            os.environ.pop(_SWITCH, None)
+            for beta in (0.0, 0.2):
+                built[beta] = _matrix_free_solver(model, beta=beta, parallel_rows=32)
+        point, patch_friction = built[0.0], built[0.2]
+        for solver in (point, patch_friction):
+            self.assertIsNone(solver._keyed_rows)
+            self.assertIsNotNone(solver._ink_sizes)
+            self.assertEqual(solver._ink_rows, 32)
+        self.assertTrue(point._world_rows)
+        self.assertEqual(point._world_rows_owned_le(), 32)
+        self.assertFalse(patch_friction._world_rows)
+        self.assertEqual(patch_friction._world_rows_owned_le(), 0)
+        for kernel in patch_friction._pgs_solve_mf_gs_incremental_kernels:
+            self.assertFalse(kernel._fpgs_world_rows)
+            self.assertTrue(kernel.key.endswith("_linked"))
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "Parallel matrix-free tiers require CUDA")
+class TestPatchParallelPhysics(unittest.TestCase):
+    """Compare each law's parallel tiers with its serial sweep, the patch gap bounded by the point gap.
+
+    Parallel tiers are Jacobi sweeps, not float reorderings of the serial sweep, so
+    a law's parallel and serial rollouts differ by its convergence gap. The point
+    tiers' measured gap on the same fixture, with a floor at the float-order
+    tolerance of an exact route change, bounds the patch tiers' gap.
+    """
+
+    def test_standing_feet_match_the_serial_patch_sweep(self):
+        """Keep loaded, ring-linked anchors and the serial sweep's motion on two box feet."""
+        model = standing_model()
+        velocity = model.joint_qd.numpy()
+        velocity[0::10] = 0.05  # the torsos drift sideways, loading the feet's friction without slipping
+        model.joint_qd.assign(velocity)
+        with patch.dict(os.environ):
+            os.environ.pop(_SWITCH, None)
+            states = {}
+            for beta, parallel_rows in itertools.product((0.0, 0.2), (0, 32)):
+
+                def check(step, solver, contacts, state, beta=beta, parallel_rows=parallel_rows):
+                    for name in _STATE_FIELDS:
+                        self.assertTrue(np.isfinite(getattr(state, name).numpy()).all(), name)
+                    self.assertFalse(solver.constraint_overflow.numpy().any())
+                    if beta and parallel_rows:
+                        # Every stored parallel iterate lies in its pooled cone; a serial sweep's last
+                        # pair update can precede a ring normal's, so only the tiers hold it exactly.
+                        assert_ring_coulomb(solver)
+                        assert_loaded_anchors(solver, contacts, carried=step > 0)
+
+                solver = _matrix_free_solver(model, beta=beta, parallel_rows=parallel_rows)
+                states[beta, parallel_rows] = _rollout(model, solver, 24, after_step=check)[0]
+        point_gap = _state_differences(states[0.0, 32], states[0.0, 0])
+        patch_gap = _state_differences(states[0.2, 32], states[0.2, 0])
+        for name in _STATE_FIELDS:
+            self.assertLessEqual(patch_gap[name], 3.0 * point_gap[name] + _STATE_FLOOR[name], (name, point_gap))
+
+    def test_box_rests_and_slides_like_the_serial_patch_sweep(self):
+        """Hold a resting box, and stop a sliding one where the serial patch sweep stops it.
+
+        A sliding box saturates its patch's pooled cone: each anchor pair carries
+        mu / 2 of the four normals' load. Pooling each pair on its own normal would
+        halve the friction and double the stopping distance.
+        """
+        speed, mu, gravity = 1.0, 0.5, 9.81
+        expected = speed * speed / (2.0 * mu * gravity)
+        model = _sliding_boxes("cuda:0", (0.0, speed), mu=mu)
+        distances, saturated = {}, {}
+        with patch.dict(os.environ):
+            os.environ.pop(_SWITCH, None)
+            for beta, parallel_rows in itertools.product((0.0, 0.2), (0, 32)):
+                ratios = []
+
+                def check(step, solver, contacts, state, ratios=ratios):
+                    if 2 <= step <= 30:  # sliding: every friction pair sits on its cone
+                        pairs = _friction_pairs(solver, world=1)
+                        ratios.extend(magnitude / budget for magnitude, budget in pairs if budget > 0.0)
+
+                solver = _matrix_free_solver(model, beta=beta, parallel_rows=parallel_rows)
+                if parallel_rows:
+                    self.assertTrue(solver._pgs_solve_mf_gs_incremental_kernels)
+                state, _ = _rollout(model, solver, 96, after_step=check)
+                q, qd = state.joint_q.numpy(), state.joint_qd.numpy()
+                with self.subTest(beta=beta, parallel_rows=parallel_rows):
+                    self.assertLess(np.max(np.abs(q[0:2])), 2.0e-4, "the resting box must not creep")
+                    self.assertLess(abs(qd[3]), 1.0e-3, "the sliding box must stop")
+                    self.assertLess(abs(q[3] - expected), 0.2 * expected, "friction must act at the full coefficient")
+                    self.assertTrue(ratios)
+                    self.assertGreater(min(ratios), 0.95)
+                    self.assertLess(max(ratios), 1.0 + 1.0e-3)
+                distances[beta, parallel_rows] = float(q[3])
+                saturated[beta, parallel_rows] = len(ratios)
+        point_gap = abs(distances[0.0, 32] - distances[0.0, 0])
+        patch_gap = abs(distances[0.2, 32] - distances[0.2, 0])
+        self.assertLessEqual(patch_gap, max(3.0 * point_gap, 0.01 * expected), distances)
 
 
 if __name__ == "__main__":

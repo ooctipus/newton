@@ -557,6 +557,8 @@ def _tiers(solver) -> dict | None:
             "family": "keyed_parallel" if solver._keyed_rows is not None else "parallel",
             # FEATHER_PGS_INK: the tier kernels build their world's response in-kernel.
             "inkernel_response": solver._ink_sizes is not None,
+            # Patch friction: each friction pair projects on its patch ring's pooled normal load.
+            "linked_rows": bool(solver._friction_anchors_enabled),
             "nesterov": bool(solver.mf_gs_parallel_nesterov),
             "matrix_free": bool(solver.mf_gs_parallel_matrix_free),
             "sweeps": int(solver.mf_gs_parallel_sweeps),
@@ -685,9 +687,10 @@ def _friction(solver) -> dict:
     patch = bool(solver._friction_anchors_enabled)
     reason = _BETA_REASONS[solver._friction_anchor_beta_source]
     if patch:
+        parallel = "" if solver._parallel_contact_paths else "keyed rows, parallel matrix-free tiers and "
         reason += (
-            " Point-contact owners (keyed rows, parallel matrix-free tiers and response blocks, the resolved-world"
-            " classifier, multiblock sweeps, sparse active rows and triplets) need point friction."
+            f" Point-contact owners ({parallel}response blocks, the resolved-world classifier,"
+            " multiblock sweeps, sparse active rows and triplets) need point friction."
         )
     return {
         "law": "patch" if patch else "point",
@@ -696,6 +699,12 @@ def _friction(solver) -> dict:
         "friction_mode": solver.friction_mode,
         "torsion": bool(solver._contact_torsion_enabled),
         "compliance": bool(solver.contact_compliance),
+        # Whether the parallel tiers and keyed rows may serve this law; routes.sweep.tiers and
+        # routes.contact_rows.keyed_rows report whether the recipe built them.
+        "parallel_rows": {
+            "admitted": bool(solver._parallel_contact_paths),
+            "reason": solver._parallel_contact_paths_reason,
+        },
         "reason": reason,
     }
 

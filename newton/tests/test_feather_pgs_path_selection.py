@@ -464,7 +464,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             ({"grouped_dynamics": True}, {}),
             ({"grouped_dynamics": True, "sparse_mass_matrix": "off", "friction_anchor_beta": 0.0}, {}),
             ({"enable_joint_velocity_limits": True}, {}),
-            # Patch friction builds no parallel tier, whatever the requested budget.
+            # Patch friction builds ring-pooled (linked) parallel tiers, as point friction builds its tiers.
             ({"sparse_mass_matrix": "off", "mf_gs_parallel_rows": 48}, {"free_count": 2}),
             ({"sparse_mass_matrix": "off", "pgs_schedule": "physx_grasp", "friction_anchor_beta": 0.0}, {}),
             # Lazy publication defers only on the fused world-dynamics kernel, and never under patch friction.
@@ -512,6 +512,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 tiers = routes["sweep"]["tiers"]
                 parallel = tiers is not None and tiers["family"] in ("parallel", "keyed_parallel")
                 self.assertEqual(applied["mf_gs_parallel_rows"], tiers["tiers"][-1]["rows"] if parallel else 0)
+                if parallel:
+                    self.assertEqual(tiers["linked_rows"], routes["friction"]["law"] == "patch")
                 self.assertEqual(applied["grouped_dynamics"], routes["dynamics"]["grouped_topology"])
                 self.assertEqual(
                     applied["lazy_kinematics"],

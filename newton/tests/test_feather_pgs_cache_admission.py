@@ -103,7 +103,7 @@ class TestHeldTreeContactLaw(unittest.TestCase):
                 self.assertEqual(mixed_tree_kinetic.supported(_held_tree_solver(law)), admitted)
 
     def test_contact_law_predicates_precede_route_selection(self):
-        """Define both contact-law predicates before sparse route selection can read them."""
+        """Define the contact-law predicates, the parallel-row one included, before sparse route selection."""
         builder = newton.ModelBuilder()
         body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
         builder.add_articulation([builder.add_joint_revolute(-1, body)])
@@ -112,14 +112,17 @@ class TestHeldTreeContactLaw(unittest.TestCase):
         seen = []
 
         def recording(solver, source):
-            seen.append((solver._law_agnostic_contact_paths, solver._point_contact_paths))
+            seen.append(
+                (solver._law_agnostic_contact_paths, solver._point_contact_paths, solver._parallel_contact_paths)
+            )
             return setup(solver, source)
 
         with patch.object(SolverFeatherPGS, "_setup_sparse_mass_matrix", recording):
             for beta, law in ((0.0, "point"), (0.2, "patch")):
                 with self.subTest(law=law):
                     solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
-                    self.assertEqual(seen[-1], _CONTACT_LAWS[law])
+                    # Both laws may run the parallel tiers unless the policy switch keeps patch serial.
+                    self.assertEqual(seen[-1], (*_CONTACT_LAWS[law], True))
                     self.assertEqual(
                         (solver._law_agnostic_contact_paths, solver._point_contact_paths), _CONTACT_LAWS[law]
                     )

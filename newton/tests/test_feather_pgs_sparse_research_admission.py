@@ -35,6 +35,12 @@ class _AdmissionProbe(SimpleNamespace):
     def _point_contact_paths(self):
         return self._law_agnostic_contact_paths and not self._friction_anchors_enabled
 
+    # Patch friction may run the parallel tiers unless FEATHER_PGS_PATCH_PARALLEL_ROWS=0
+    # (the probe's _patch_parallel_rows) keeps it on its serial sweeps.
+    @property
+    def _parallel_contact_paths(self):
+        return self._point_contact_paths or (self._law_agnostic_contact_paths and self._patch_parallel_rows)
+
 
 def _eligible_solver():
     """Provide only the host fields needed before topology planning starts."""
@@ -66,6 +72,7 @@ def _eligible_solver():
         mf_gs_parallel_rows=0,
         mf_gs_incremental_rows=32,
         mf_gs_response_block_rows=0,
+        _patch_parallel_rows=True,
     )
 
 
@@ -204,6 +211,34 @@ class TestSparseResearchAdmission(unittest.TestCase):
                 setattr(solver, name, 32)
                 SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
                 self.assertIsNone(solver._sparse_mass_matrix_size)
+
+    def test_patch_friction_yields_only_to_a_parallel_tier_it_runs(self):
+        """Keep the ordinary buffers for a patch parallel tier, but not for split mode, response blocks or the switch.
+
+        Patch friction runs the recipe's parallel tier as point friction does, so the
+        tier's request declines sparse factors in matrix-free mode. Split mode builds no
+        tier, response blocks stay point-only, and FEATHER_PGS_PATCH_PARALLEL_ROWS=0
+        keeps today's sparse patch route.
+        """
+        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
+        for name, changes, declined in (
+            ("parallel", {"mf_gs_parallel_rows": 48}, True),
+            ("switched_off", {"mf_gs_parallel_rows": 48, "_patch_parallel_rows": False}, False),
+            ("split", {"mf_gs_parallel_rows": 48, "pgs_mode": "split", "pgs_kernel": "tiled_row"}, False),
+            ("response_block", {"mf_gs_response_block_rows": 64}, False),
+        ):
+            with self.subTest(name=name), mock.patch.dict(os.environ, {}, clear=True):
+                solver = _eligible_solver()
+                solver._friction_anchors_enabled = True
+                for attribute, value in changes.items():
+                    setattr(solver, attribute, value)
+                if declined:
+                    SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+                    self.assertIsNone(solver._sparse_mass_matrix_size)
+                    self.assertIn("competing", solver._sparse_selection_reason)
+                else:
+                    with self.assertRaises(_TopologyReached):
+                        SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse construction requires CUDA")
     def test_branched_18_dof_trees_select_general_sparse(self):
