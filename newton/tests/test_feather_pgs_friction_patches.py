@@ -3,6 +3,7 @@
 
 """Regression tests for persistent patch friction in FeatherPGS."""
 
+import itertools
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -75,7 +76,14 @@ def _ground_box(device, **solver_kwargs):
 
 
 def _patch_fixture(
-    points, *, shape0=None, normals=None, materials=(0.5, 0.5, 0.5), shape_bodies=(0, 1, 0), device="cpu"
+    points,
+    *,
+    shape0=None,
+    normals=None,
+    materials=(0.5, 0.5, 0.5),
+    shape_bodies=(0, 1, 0),
+    radius=0.2,
+    device="cpu",
 ):
     """Construct patch geometry without a collision matcher or a solver step."""
     n = len(points)
@@ -85,7 +93,7 @@ def _patch_fixture(
         body_count=body_count,
         body_world=wp.zeros(body_count, dtype=int, device=device),
         shape_body=wp.array(shape_bodies, dtype=int, device=device),
-        shape_collision_radius=wp.array([0.2] * len(shape_bodies), dtype=float, device=device),
+        shape_collision_radius=wp.array([radius] * len(shape_bodies), dtype=float, device=device),
         shape_transform=wp.array([wp.transform_identity()] * len(shape_bodies), dtype=wp.transform, device=device),
         shape_scale=wp.ones(len(shape_bodies), dtype=wp.vec3, device=device),
         shape_type=wp.zeros(len(shape_bodies), dtype=int, device=device),
@@ -176,33 +184,39 @@ class TestFrictionPatchHistory(unittest.TestCase):
                     self.assertEqual(pairs, {expected})
 
     def test_support_edge_carriers_ignore_roundoff(self):
-        """Carry each support edge's rows on its last contact when its tied corners move one float32 ulp.
+        """Keep each support edge whole and its rows on its last contact when corners move one float32 ulp, near or far from the origin.
 
-        The anchor locations stay the edge midpoints. Carriers follow contact
-        order, so a collision pipeline that reorders contacts can still move
-        the rows, though not the locations.
+        The anchor locations stay the edge midpoints. Tied corners differ along
+        the axis by the quantization of world coordinates, and a near square's
+        also by the axis tilt that quantization causes. Carriers follow contact
+        order, so a collision pipeline that reorders contacts can still move the
+        rows, though not the locations.
         """
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
-        corners = [[-0.06, -0.03, 0.0], [0.06, -0.03, 0.0], [-0.06, 0.03, 0.0], [0.06, 0.03, 0.0]]
         edges = ((0, 2), (1, 3))
-        for offset in (0.0, 1.5):
-            points = (np.asarray(corners) + np.array([offset, offset, 0.0])).astype(np.float32)
-            carriers = set()
-            for corner in range(len(points)):
-                for step in (-1, 0, 1):
+        moves = [None, *itertools.product(range(4), (0, 1), (-1, 1))]
+        # Bottom faces of 0.1 m tall boxes, long along x: 2:1 and 3% longer than wide.
+        for hx, hy in ((0.06, 0.03), (0.0515, 0.05)):
+            corners = np.array([[x, y, 0.0] for y in (-hy, hy) for x in (-hx, hx)])
+            radius = float(np.linalg.norm([hx, hy, 0.05]))
+            for offset in (0.0, 1.5, 10.0, 80.0):
+                points = (corners + np.array([offset, offset, 0.0])).astype(np.float32)
+                carriers = set()
+                for move in moves:
                     moved = points.copy()
-                    if step != 0:
-                        moved[corner, 0] = np.nextafter(moved[corner, 0], np.float32(step * np.inf))
-                    _, _, _, patches = _patch_fixture(moved, device=device)
+                    if move is not None:
+                        corner, axis, step = move
+                        moved[corner, axis] = np.nextafter(moved[corner, axis], np.float32(step * np.inf))
+                    _, _, _, patches = _patch_fixture(moved, radius=radius, device=device)
                     held = np.flatnonzero(patches.view.weight.numpy()[: len(points)] > 0.0)
                     carriers.add(tuple(held))
                     for carrier in held:
                         edge = next(edge for edge in edges if carrier in edge)
                         midpoint = moved[list(edge)].astype(np.float64).mean(axis=0).astype(np.float32)
-                        with self.subTest(offset=offset, corner=corner, step=step, carrier=carrier):
+                        with self.subTest(hx=hx, offset=offset, move=move, carrier=carrier):
                             np.testing.assert_array_equal(patches.view.point_a.numpy()[carrier], midpoint)
-            with self.subTest(offset=offset):
-                self.assertEqual(carriers, {(2, 3)})
+                with self.subTest(hx=hx, offset=offset):
+                    self.assertEqual(carriers, {(2, 3)})
 
     def test_pose_increment_preserves_fixed_pivots_and_no_slip_rolling(self):
         """Distinguish rigid rotation from slip without querying the collision shape."""
@@ -892,9 +906,9 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
     def test_resting_cubes_keep_their_anchor_corners(self):
         """Keep each resting cube's friction anchors on the same corners, so roundoff cannot kick it.
 
-        The worlds sit 1.5 m from the origin, where float32 contact centres
-        carry about 1e-7 m of quantization. At 8 iterations every swap of a
-        cube's anchor diagonal kicks it by milliradians per second.
+        The worlds sit 1.5 m to 80 m from the origin, where float32 contact
+        centres carry 1e-7 m to 8e-6 m of quantization. At 8 iterations every
+        swap of a cube's anchor diagonal kicks it by milliradians per second.
         """
         self._check_resting_anchor_corners(0.05)
 
@@ -902,14 +916,28 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         """Carry each resting box's support-edge rows on the same corners, so roundoff cannot kick it.
 
         The two corners of each short edge tie along the principal axis up to
-        roundoff. The edge midpoints stay the anchor locations; at 8 iterations
-        moving the rows between the tied corners kicks the box by milliradians
-        per second.
+        roundoff, which grows with the distance from the origin. The edge
+        midpoints stay the anchor locations; at 8 iterations moving the rows
+        between the tied corners, or the anchor between the midpoint and a
+        corner, kicks the box by milliradians per second.
         """
         self._check_resting_anchor_corners(0.075)
 
     def _check_resting_anchor_corners(self, half_width):
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        # Worlds 1.5 m, 4 m, 10 m and 80 m from the origin.
+        for spacing in (3.0, 8.0, 20.0, 160.0):
+            with self.subTest(spacing=spacing):
+                corners, spin = self._rest_box(half_width, spacing, device)
+                for world, held in enumerate(zip(*corners[30:], strict=True)):
+                    with self.subTest(world=world):
+                        pairs = set(held)
+                        self.assertEqual(len(pairs), 1, f"anchor corners changed between steps: {sorted(pairs)}")
+                        self.assertEqual(len(next(iter(pairs))), 2)
+                self.assertLess(float(np.abs(np.array(spin[60:])).max()), 1.0e-3)
+
+    def _rest_box(self, half_width, spacing, device):
+        """Return each step's anchor-carrying corners per world and the boxes' angular velocities."""
         # The free box of the mixed-tree parity scenes, alone, with half_width
         # along y: it lands from 1 cm.
         scene = newton.ModelBuilder()
@@ -917,7 +945,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         box = scene.add_body(xform=wp.transform(wp.vec3(0.15, 0.05, 0.06), wp.quat_identity()), mass=0.5)
         scene.add_shape_box(box, hx=0.05, hy=half_width, hz=0.05, cfg=cfg)
         builder = newton.ModelBuilder()
-        builder.replicate(scene, 4, spacing=(3.0, 3.0, 0.0))
+        builder.replicate(scene, 4, spacing=(spacing, spacing, 0.0))
         builder.add_ground_plane(cfg=cfg)
         model = builder.finalize(device=device)
         solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split", pgs_iterations=8)
@@ -947,12 +975,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 world = body_world[shape_body[shape0[c] if box_first else shape1[c]]]
                 held[world].append((bool(corner[0] > 0.0), bool(corner[1] > 0.0)))
             corners.append([tuple(sorted(anchors)) for anchors in held])
-        for world in range(model.world_count):
-            with self.subTest(world=world):
-                pairs = {step[world] for step in corners[30:]}
-                self.assertEqual(len(pairs), 1, f"anchor corners changed between steps: {sorted(pairs)}")
-                self.assertEqual(len(next(iter(pairs))), 2)
-        self.assertLess(float(np.abs(np.array(spin[60:])).max()), 1.0e-3)
+        return corners, spin
 
     def test_sliding_box_keeps_its_heading(self):
         """Slide a 0.1 x 0.15 m box diagonally at 8 iterations without yawing it or losing Coulomb friction.
@@ -960,23 +983,25 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         Each support edge's rows follow the edge's normal rows in the split
         sweep. Carriers between those rows made the two anchors read their
         pooled budget at fixed, different stages of the sweep, which spun this
-        box at more than 1 rad/s; carriers chosen by roundoff yawed it by a few
-        hundredths.
+        box at more than 1 rad/s; carriers chosen by roundoff, or edges split
+        by roundoff 10 m from the origin, yawed it by a few hundredths to
+        tenths.
         """
-        for heading in (0.75 * np.pi + 0.4, np.pi + 0.4):
-            with self.subTest(heading=heading), wp.ScopedDevice("cpu"):
-                yaw_rate, deceleration = self._slide_box(heading)
+        # Worlds 1.5 m and 10 m from the origin.
+        for spacing, heading in itertools.product((3.0, 20.0), (0.75 * np.pi + 0.4, np.pi + 0.4)):
+            with self.subTest(spacing=spacing, heading=heading), wp.ScopedDevice("cpu"):
+                yaw_rate, deceleration = self._slide_box(heading, spacing)
                 self.assertLess(yaw_rate, 5.0e-3)
                 np.testing.assert_allclose(deceleration, 0.5 * 9.81, rtol=1.0e-3)
 
-    def _slide_box(self, heading):
+    def _slide_box(self, heading, spacing):
         """Return the largest yaw rate while sliding and each world's fitted deceleration."""
         scene = newton.ModelBuilder()
         cfg = newton.ModelBuilder.ShapeConfig(mu=0.5)
         box = scene.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()))
         scene.add_shape_box(box, hx=0.05, hy=0.075, hz=0.05, cfg=cfg)
         builder = newton.ModelBuilder()
-        builder.replicate(scene, 4, spacing=(3.0, 3.0, 0.0))
+        builder.replicate(scene, 4, spacing=(spacing, spacing, 0.0))
         builder.add_ground_plane(cfg=cfg)
         model = builder.finalize()
         solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split", pgs_iterations=8)

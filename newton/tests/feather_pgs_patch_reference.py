@@ -13,8 +13,8 @@ of ``assert_same_patches``, because NVRTC may contract this module's
 multiply-adds differently from the patch module's. Device
 functions that the mechanism work leaves unchanged are imported. ``_build``
 follows the builder's current anchor choice (the canonical farthest pair, the
-footprint tolerance and the support-edge carriers), which is not mechanism
-work. This module holds shared test helpers; it defines no tests.
+footprint tolerance, the support-edge members and their carriers), which is
+not mechanism work. This module holds shared test helpers; it defines no tests.
 """
 
 import numpy as np
@@ -357,7 +357,11 @@ def _build(
                 sum1 = wp.vec3d(0.0)
                 count0 = int(0)
                 count1 = int(0)
-                edge_tolerance = 1.0e-5 * frame.radius[seed]
+                # Tied corners differ along the axis by the quantization of
+                # world coordinates and by the axis tilt it causes, which
+                # outgrow a fixed fraction of the body radius a few meters
+                # from the origin.
+                edge_tolerance = wp.max(1.0e-5 * frame.radius[seed], _FOOTPRINT_TOLERANCE * (high - low))
                 for j in range(member_start, member_stop):
                     c = frame.members[j]
                     if frame.eligible[c] != 0:

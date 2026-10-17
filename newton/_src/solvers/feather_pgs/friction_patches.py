@@ -57,8 +57,10 @@ _SORT_PAD = wp.constant(wp.int64(1 << 62))
 # a resting 0.1 m cube it reads as a relative anisotropy of the footprint's
 # second moments of up to 1.2e-6 at 1.5 m from the origin, 9.5e-6 at 10 m and
 # 5.4e-5 at 80 m. Second moments and squared member spans that differ by less
-# than this fraction count as equal, so roundoff neither gives an isotropic
-# footprint an axis nor chooses between equally distant members.
+# than this fraction count as equal, and members within this fraction of the
+# footprint's extent of a support edge belong to it, so roundoff neither gives
+# an isotropic footprint an axis, chooses between equally distant members, nor
+# splits an edge.
 _FOOTPRINT_TOLERANCE = wp.constant(1.0e-3)
 
 
@@ -753,7 +755,11 @@ def _build_pair(
                 sum1 = wp.vec3d(0.0)
                 count0 = int(0)
                 count1 = int(0)
-                edge_tolerance = 1.0e-5 * frame.radius[seed]
+                # Tied corners differ along the axis by the quantization of
+                # world coordinates and by the axis tilt it causes, which
+                # outgrow a fixed fraction of the body radius a few meters
+                # from the origin.
+                edge_tolerance = wp.max(1.0e-5 * frame.radius[seed], _FOOTPRINT_TOLERANCE * (high - low))
                 for j in range(member_start, member_stop):
                     c = frame.members[j]
                     if frame.eligible[c] != 0:
