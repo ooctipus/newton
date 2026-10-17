@@ -81,6 +81,9 @@ def _rollout(model, *, level_loop, steps=60):
         "FEATHER_PGS_TREE_KINETIC_STATE": "0",
         "FEATHER_PGS_RESOLVED_WORLDS": "0",
         "FEATHER_PGS_TREE_REFERENCE": str(int(level_loop)),
+        # A fixed width leaves no candidate to time, so both arms build the same layouts. Sixteen
+        # lanes cover every tree here and pack two trees per block (the segmented reduction).
+        "FEATHER_PGS_TREE_LANE_PACK": "16",
     }
     with patch.dict(os.environ, env):
         solver = SolverFeatherPGS(
@@ -92,7 +95,8 @@ def _rollout(model, *, level_loop, steps=60):
             friction_anchor_beta=0.0,
         )
     owner = getattr(solver, "_tree_kinetic_state", None)
-    pipeline = newton.CollisionPipeline(model)
+    # Sorted contacts: the narrow phase's output order no longer depends on thread scheduling.
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
     contacts = pipeline.contacts()
     states = [model.state() for _ in range(2)]
     newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
@@ -135,13 +139,47 @@ def _rotation_angle(a, b):
     return 4.0 * np.arcsin(np.minimum(0.5 * chord, 1.0))
 
 
+def _excess(actual, desired, rtol=0.0):
+    """Largest ``|actual - desired| - rtol * |desired|``: within ``atol`` exactly when assert_allclose passes."""
+    actual, desired = np.asarray(actual, np.float64), np.asarray(desired, np.float64)
+    return max(float(np.max(np.abs(actual - desired) - rtol * np.abs(desired))), 0.0)
+
+
+def _assert_switch_within(test, label, switch, again, tolerance):
+    """Bound an A/B difference by the tolerance plus the default arm's own run-to-run (A/A) spread.
+
+    The A/A spread must itself stay within the tolerance: a larger one means the rollout's
+    nondeterminism, not the switch, decides the comparison.
+    """
+    test.assertLessEqual(
+        again,
+        tolerance,
+        f"{label}: the default arm differs from itself by {again:.3g} (> {tolerance:.3g}); "
+        "the rollout cannot resolve the switch",
+    )
+    test.assertLessEqual(
+        switch,
+        tolerance + again,
+        f"{label}: the switch changes it by {switch:.3g}, above {tolerance:.3g} plus the A/A spread {again:.3g}",
+    )
+
+
+def _assert_same_layouts(test, first, second):
+    """Both arms build the same, untimed layouts (the pinned lane width leaves no candidate to time)."""
+    test.assertFalse(any(group.lane_timing for arm in (first, second) for group in arm.groups))
+    test.assertEqual([group.layout for group in first.groups], [group.layout for group in second.groups])
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "The held-tree owner is a CUDA path")
 class TestPrefixSubtreeReduction(unittest.TestCase):
     def _compare(self, model, *, bias_tolerance=(1e-5, 1e-4), angle_tolerance=None):
         owner_reference, plain, plain_bias = _rollout(model, level_loop=True)
         owner, poses, bias = _rollout(model, level_loop=False)
+        # A/A control: the default arm once more, for its run-to-run spread.
+        _, poses_again, bias_again = _rollout(model, level_loop=False)
         self.assertIsNotNone(owner)
         self.assertTrue(all(group.layout.lanes <= 32 and not group.chain_scan for group in owner.groups))
+        _assert_same_layouts(self, owner_reference, owner)
         # Each arm ran the finish kernel its own switch selects: the switch is a factory
         # argument, so the second arm cannot reuse the first arm's kernels, and on these
         # warp-sized layouts the interval reduction differs from the level loop.
@@ -154,16 +192,21 @@ class TestPrefixSubtreeReduction(unittest.TestCase):
         self.assertTrue(np.isfinite(poses).all())
         # Both forms add the same body terms in a different grouping; they differ by float rounding,
         # amplified where a subtree's terms cancel (a walker landing on its feet).
-        np.testing.assert_allclose(bias, plain_bias, rtol=bias_tolerance[0], atol=bias_tolerance[1])
-        np.testing.assert_allclose(poses[:, :, :3], plain[:, :, :3], atol=1e-5, rtol=0.0)
+        rtol, atol = bias_tolerance
+        _assert_switch_within(self, "bias", _excess(bias, plain_bias, rtol), _excess(bias_again, bias, rtol), atol)
+        switch = _excess(poses[:, :, :3], plain[:, :, :3])
+        _assert_switch_within(self, "position [m]", switch, _excess(poses_again[:, :, :3], poses[:, :, :3]), 1e-5)
         if angle_tolerance is None:
-            np.testing.assert_allclose(poses[:, :, 3:], plain[:, :, 3:], atol=1e-5, rtol=0.0)
+            switch = _excess(poses[:, :, 3:], plain[:, :, 3:])
+            _assert_switch_within(self, "orientation", switch, _excess(poses_again[:, :, 3:], poses[:, :, 3:]), 1e-5)
         else:
-            # Orientation as a rotation angle: when both arms still ran the reference
-            # kernels, a free box resting on contacts already differed by over 2e-5 rad.
+            # Orientation as a rotation angle: with both arms on the reference kernels and unsorted
+            # contacts, a free box resting on contacts already differed by over 2e-5 rad.
             angle = _rotation_angle(poses[:, :, 3:], plain[:, :, 3:])
             step, body = np.unravel_index(np.argmax(angle), angle.shape)
-            self.assertLessEqual(float(angle[step, body]), angle_tolerance, f"step {step}, body {body}")
+            again = float(_rotation_angle(poses_again[:, :, 3:], poses[:, :, 3:]).max())
+            label = f"rotation angle [rad] (largest at step {step}, body {body})"
+            _assert_switch_within(self, label, float(angle[step, body]), again, angle_tolerance)
         return owner
 
     def test_forest_with_prescribed_root(self):

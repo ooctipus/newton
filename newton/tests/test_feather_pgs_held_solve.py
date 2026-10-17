@@ -14,6 +14,7 @@ import newton
 from newton._src.solvers.feather_pgs import response_operator, tree_kinetic_state
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton.tests.test_feather_pgs_mixed_tree_free_body import DT, _build
+from newton.tests.test_feather_pgs_subtree_reduce import _assert_same_layouts, _assert_switch_within, _excess
 
 
 class TestLaneCholeskyEmitter(unittest.TestCase):
@@ -37,6 +38,9 @@ def _rollout(model, *, serial, steps=90):
         "FEATHER_PGS_TREE_KINETIC_STATE": "0",
         "FEATHER_PGS_RESOLVED_WORLDS": "0",
         "FEATHER_PGS_TREE_REFERENCE": str(int(serial)),
+        # One tree per 32-lane block: no candidate width is timed, so both arms build the same
+        # layouts (the long arm needs more than 16 lanes).
+        "FEATHER_PGS_TREE_LANE_PACK": "0",
     }
     with patch.dict(os.environ, env):
         solver = SolverFeatherPGS(
@@ -48,7 +52,8 @@ def _rollout(model, *, serial, steps=90):
             friction_anchor_beta=0.0,
         )
     owner = getattr(solver, "_tree_kinetic_state", None)
-    pipeline = newton.CollisionPipeline(model)
+    # Sorted contacts: the narrow phase's output order no longer depends on thread scheduling.
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
     contacts = pipeline.contacts()
     states = [model.state() for _ in range(2)]
     newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
@@ -90,9 +95,12 @@ class TestLaneParallelHeldSolve(unittest.TestCase):
     def _compare(self, model, families):
         owner_serial, plain, plain_predictor = _rollout(model, serial=True)
         owner, poses, predictor = _rollout(model, serial=False)
+        # A/A control: the default arm once more, for its run-to-run spread.
+        _, poses_again, predictor_again = _rollout(model, serial=False)
         self.assertIsNotNone(owner)
         self.assertEqual(sorted(group.layout.root_families for group in owner.groups), sorted(families))
         self.assertIs(type(owner), type(owner_serial))
+        _assert_same_layouts(self, owner_serial, owner)
         # Each arm ran the predictor its own switch selects: the switch is a factory
         # argument, so the second arm cannot reuse the first arm's kernels, and every
         # lane-parallel group differs from the serial law built for its own layout.
@@ -107,9 +115,11 @@ class TestLaneParallelHeldSolve(unittest.TestCase):
         self.assertTrue(np.isfinite(poses).all())
         # The forward pass is the same arithmetic in the same order; the
         # transposed pass accumulates in the other direction (1 ulp effects).
-        np.testing.assert_allclose(predictor, plain_predictor, rtol=1e-5, atol=1e-5)
-        np.testing.assert_allclose(poses[:, :, :3], plain[:, :, :3], atol=1e-5, rtol=0.0)
-        np.testing.assert_allclose(poses[:, :, 3:], plain[:, :, 3:], atol=1e-5, rtol=0.0)
+        switch, again = _excess(predictor, plain_predictor, 1e-5), _excess(predictor_again, predictor, 1e-5)
+        _assert_switch_within(self, "predictor", switch, again, 1e-5)
+        for label, part in (("position [m]", slice(0, 3)), ("orientation", slice(3, None))):
+            switch = _excess(poses[:, :, part], plain[:, :, part])
+            _assert_switch_within(self, label, switch, _excess(poses_again[:, :, part], poses[:, :, part]), 1e-5)
 
     def test_forest_with_prescribed_and_free_roots(self):
         """A three-joint arm, a free box and a kinematic tray: families 3, 6 and a prescribed root."""
