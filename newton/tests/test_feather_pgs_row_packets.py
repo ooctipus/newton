@@ -524,7 +524,11 @@ class TestRowPacketPatchRows(unittest.TestCase):
         self.assertGreater(moved, 1.0e-3, "Tangent rows must act at the patch friction location")
 
     def test_owner_launches_the_friction_law_it_was_built_with(self):
-        """Launch the patch producer and fallback exactly under anchors, with the solver's patch view and beta."""
+        """Launch the patch producer and fallback exactly under anchors, with the solver's patch view and beta.
+
+        The law is fixed when the owner is built; ``friction_anchor_beta`` is read at each launch, as the
+        general route reads it, so a change after construction reaches the next step's rows.
+        """
         device = "cpu"
         for anchors in (False, True):
             with self.subTest(anchors=anchors):
@@ -532,37 +536,39 @@ class TestRowPacketPatchRows(unittest.TestCase):
                 with mock.patch.object(rp, "topology_signature", return_value=()):
                     owner = rp.LocalRowPackets(solver, PRIMARY, SECONDARY, 0)
                 self.assertEqual(owner.patch_friction, anchors)
-                contact_input = rp.ContactInput()
-                with (
-                    mock.patch.object(rp, "bind", return_value=contact_input) as bind,
-                    mock.patch.object(rp.wp, "launch_tiled") as tiled,
-                    mock.patch.object(rp.wp, "launch") as launch,
-                ):
-                    owner.produce_contacts("state_in", "state_aug", "contacts", 0.25)
-                    owner.finish_rows()
-                bind.assert_called_once_with(solver, "state_in", "state_aug", "contacts", 0.25, 1.0)
-                self.assertEqual([call.args[0] for call in launch.call_args_list], [rp.finalize_and_queue])
-                producer = rp.produce_patch_contacts if anchors else rp.produce_contacts
-                fallback = rp.materialize_patch_fallback if anchors else rp.materialize_fallback
-                self.assertEqual(
-                    [call.args[0] for call in tiled.call_args_list],
-                    [producer, rp.materialize_general_prefix, fallback, rp.materialize_general_prefix, fallback],
-                )
-                laws = []
-                for call in (tiled.call_args_list[0], *tiled.call_args_list[2::2]):
-                    inputs = call.kwargs["inputs"]
-                    self.assertIs(inputs[1], contact_input)
-                    # The patch row law follows the contact input; the point kernels take none.
-                    self.assertEqual(isinstance(inputs[2], rp.PatchRowLaw.cls), anchors)
-                    laws.append(inputs[2])
-                self.assertIs(tiled.call_args_list[0].kwargs["inputs"][2 + int(anchors)], owner.packet)
-                if anchors:
-                    view = solver._friction_patches.view
-                    for law in laws:
-                        self.assertEqual(law.beta, 0.375)
-                        self.assertEqual(law.patches.enabled, 1)
-                        for name in ("weight", "next_contact", "point_a", "point_b", "phi"):
-                            self.assertIs(getattr(law.patches, name), getattr(view, name), name)
+                for beta in (0.5, 0.125) if anchors else (0.0,):
+                    solver.friction_anchor_beta = beta
+                    contact_input = rp.ContactInput()
+                    with (
+                        mock.patch.object(rp, "bind", return_value=contact_input) as bind,
+                        mock.patch.object(rp.wp, "launch_tiled") as tiled,
+                        mock.patch.object(rp.wp, "launch") as launch,
+                    ):
+                        owner.produce_contacts("state_in", "state_aug", "contacts", 0.25)
+                        owner.finish_rows()
+                    bind.assert_called_once_with(solver, "state_in", "state_aug", "contacts", 0.25, 1.0)
+                    self.assertEqual([call.args[0] for call in launch.call_args_list], [rp.finalize_and_queue])
+                    producer = rp.produce_patch_contacts if anchors else rp.produce_contacts
+                    fallback = rp.materialize_patch_fallback if anchors else rp.materialize_fallback
+                    self.assertEqual(
+                        [call.args[0] for call in tiled.call_args_list],
+                        [producer, rp.materialize_general_prefix, fallback, rp.materialize_general_prefix, fallback],
+                    )
+                    laws = []
+                    for call in (tiled.call_args_list[0], *tiled.call_args_list[2::2]):
+                        inputs = call.kwargs["inputs"]
+                        self.assertIs(inputs[1], contact_input)
+                        # The patch row law follows the contact input; the point kernels take none.
+                        self.assertEqual(isinstance(inputs[2], rp.PatchRowLaw.cls), anchors)
+                        laws.append(inputs[2])
+                    self.assertIs(tiled.call_args_list[0].kwargs["inputs"][2 + int(anchors)], owner.packet)
+                    if anchors:
+                        view = solver._friction_patches.view
+                        for law in laws:
+                            self.assertEqual(law.beta, beta)
+                            self.assertEqual(law.patches.enabled, 1)
+                            for name in ("weight", "next_contact", "point_a", "point_b", "phi"):
+                                self.assertIs(getattr(law.patches, name), getattr(view, name), name)
 
 
 # Drive each arm's capsule into the side of its box from contact. The arm-box rows are the dense patch
