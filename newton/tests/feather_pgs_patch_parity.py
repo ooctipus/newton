@@ -263,7 +263,7 @@ def _tangent_basis(normal):
     return first, second / np.linalg.norm(second)
 
 
-def patch_rows(solver, contacts, dt):
+def patch_rows(solver, contacts, dt, *, jacobian=False):
     """Describe route 0's patch rows independent of which support-edge member carries each anchor.
 
     ``normals`` keys every routed contact's normal row by contact index: its type,
@@ -277,10 +277,11 @@ def patch_rows(solver, contacts, dt):
     rows add in (matrix-free and sparse split rows keep it apart): ``-target``
     plus the position bias of the row's phi. The record keeps the largest
     position-bias gain of step ``dt`` for normal and anchor rows
-    (:func:`assert_patch_rows_close`).
+    (:func:`assert_patch_rows_close`). ``jacobian`` also records each row's
+    physical Jacobian (:func:`contact_rows`).
     """
     baked = solver.pgs_mode != "matrix_free" and not solver._sparse_split
-    rows = contact_rows(solver, contacts, jacobian=baked)
+    rows = contact_rows(solver, contacts, jacobian=baked or jacobian)
     patches = solver._friction_patches
     count = min(int(contacts.rigid_contact_count.numpy()[0]), solver.contact_slot.shape[0])
     owner = patches.current.owner.numpy()[:count]
@@ -317,6 +318,7 @@ def patch_rows(solver, contacts, dt):
             "phi": row["phi"],
             "target": row["target"],
             "impulse": float(row["impulses"][0]),
+            "jacobian": row["jacobian"][0] if jacobian else None,
         }
     for region in members.values():
         anchors, friction = [], np.zeros(3)
@@ -338,6 +340,7 @@ def patch_rows(solver, contacts, dt):
                     "mu": row["mu"][1:].astype(np.float64),
                     "bias": row["bias"][1:],
                     "impulses": row["impulses"][1:].astype(np.float64),
+                    "jacobian": row["jacobian"][1:] if jacobian else None,
                 }
             )
         record["regions"][tuple(sorted(region))] = {
@@ -376,8 +379,8 @@ def assert_patch_rows_close(a, b, *, atol=3e-5, rtol=3e-4, lifecycle=True):
 
     ``a`` and ``b`` are :func:`patch_rows` records. Normal rows compare by contact
     and anchor rows by friction location: row types, ring links, mu (divided on
-    anchor rows), phi, target, patch weight and location within ``atol`` and
-    ``rtol``. A row's bias follows its phi through the position-bias gain, so its
+    anchor rows), phi, target, patch weight, location and, where both records
+    hold them, row Jacobians within ``atol`` and ``rtol``. A row's bias follows its phi through the position-bias gain, so its
     tolerance adds the gain times the records' phi difference: one float32 ulp of
     a foot's pose moves phi by about 4e-7 and the bias of a gap row by 400 times
     that. ``lifecycle`` also compares each anchor's tangential phi, which its
@@ -391,7 +394,7 @@ def assert_patch_rows_close(a, b, *, atol=3e-5, rtol=3e-4, lifecycle=True):
         for name in ("type", "next"):
             if first[name] != second[name]:
                 raise AssertionError(f"contact {c} normal row {name}: {first[name]} != {second[name]}")
-        for name in ("mu", "phi", "target"):
+        for name in ("mu", "phi", "target", "jacobian"):
             if first[name] is not None and second[name] is not None:
                 np.testing.assert_allclose(
                     first[name], second[name], atol=atol, rtol=rtol, err_msg=f"contact {c} {name}"
@@ -412,6 +415,10 @@ def assert_patch_rows_close(a, b, *, atol=3e-5, rtol=3e-4, lifecycle=True):
                 first["location"], second["location"], atol=atol, rtol=rtol, err_msg=f"{label} location"
             )
             np.testing.assert_array_equal(first["types"], second["types"], err_msg=f"{label} types")
+            if first["jacobian"] is not None and second["jacobian"] is not None:
+                np.testing.assert_allclose(
+                    first["jacobian"], second["jacobian"], atol=atol, rtol=rtol, err_msg=f"{label} jacobian"
+                )
             if not (first["own"] and second["own"]):
                 raise AssertionError(f"{label}: friction rows must link to the anchor's own normal row")
             np.testing.assert_allclose(

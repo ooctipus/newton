@@ -14,13 +14,27 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import friction_patches
 from newton._src.solvers.feather_pgs.path_selection import applied_options
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_patch_parity import assert_history_close, assert_loaded_anchors, standing_model
+from newton.tests.feather_pgs_patch_parity import (
+    STANDING_REGION_BOUNDS,
+    anchor_sites,
+    assert_anchor_sites_close,
+    assert_history_matches_rows,
+    assert_loaded_anchors,
+    assert_patch_rows_close,
+    assert_region_impulses_close,
+    assert_ring_coulomb,
+    assert_states_close,
+    patch_rows,
+    standing_model,
+)
 from newton.tests.test_feather_pgs_sparse_solver import _build_model, _make_solver
 from newton.tests.unittest_utils import assert_host_only
 
 STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
+PATCH_DT = 1.0 / 400.0
 
 
 def _cpu_model():
@@ -65,17 +79,21 @@ def _cpu_separate_worlds_model():
     return builder.finalize(device="cpu")
 
 
-def _graph_and_reset_rollout(model, sparse, cached_dynamics, **options):
-    """Step once, then replay a captured contacting step around a partial-world reset."""
+def _graph_and_reset_rollout(model, sparse, cached_dynamics, *, deterministic=False, after_reset=None, **options):
+    """Step once, then replay a captured contacting step around a partial-world reset.
+
+    ``after_reset(solver, contacts)`` runs after the first replay that follows
+    the reset; seven more replays follow it. ``deterministic`` sorts contacts.
+    """
     solver = _make_solver(model, sparse, cached_dynamics=cached_dynamics, **options)
     state, output = model.state(), model.state()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-    pipeline = newton.CollisionPipeline(model, convex_collision="ordinary")
+    pipeline = newton.CollisionPipeline(model, convex_collision="ordinary", deterministic=deterministic)
     contacts, control = pipeline.contacts(), model.control()
 
     def step():
         pipeline.collide(state, contacts)
-        solver.step(state, output, control, contacts, 1.0 / 400.0)
+        solver.step(state, output, control, contacts, PATCH_DT)
         state.assign(output)
 
     step()
@@ -84,10 +102,33 @@ def _graph_and_reset_rollout(model, sparse, cached_dynamics, **options):
     for _ in range(8):
         wp.capture_launch(capture.graph)
     solver.reset(state, world_mask=wp.array([True, False], dtype=wp.bool, device=model.device))
-    for _ in range(8):
+    wp.capture_launch(capture.graph)
+    if after_reset is not None:
+        after_reset(solver, contacts)
+    for _ in range(7):
         wp.capture_launch(capture.graph)
     solver.check_constraint_capacity()
     return solver, contacts, state
+
+
+def _first_patch_step(model, cached_dynamics):
+    """Step a fresh standing solver once, eagerly, and copy the poses and twists its release test reads."""
+    solver = _make_solver(model, False, cached_dynamics=cached_dynamics, mf_gs_incremental_rows=0)
+    state, output = model.state(), model.state()
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    pipeline = newton.CollisionPipeline(model, convex_collision="ordinary", deterministic=True)
+    contacts = pipeline.contacts()
+    pipeline.collide(state, contacts)
+    launch, released = wp.launch, []
+
+    def release_inputs(kernel, *args, **kwargs):
+        if kernel is friction_patches._finish_and_store and kwargs["inputs"][2] is not None:
+            released.append((kwargs["inputs"][2].numpy().copy(), kwargs["inputs"][3].numpy().copy()))
+        return launch(kernel, *args, **kwargs)
+
+    with patch.object(wp, "launch", release_inputs):
+        solver.step(state, output, model.control(), contacts, PATCH_DT)
+    return solver, contacts, output, released
 
 
 def _launched_kernel_keys(model, solver, **pipeline_options):
@@ -682,15 +723,69 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
     def test_cached_dynamics_dense_patch_graph_and_reset(self):
-        """Cache the dense route under default patch friction with unchanged states and anchor history.
+        """Cache the dense route under default patch friction with the ordinary step-0 operators and anchor lifecycle.
 
-        The standing fixture's feet keep loaded, ring-linked anchors through the replays and the
-        partial reset, so the history comparison covers carried anchors.
+        One eager step from the same state isolates the owner: its predicted
+        velocity, row Jacobians and biases match the ordinary route's, and each
+        route's release test reads, and publishes, forward kinematics of its
+        integrated state. The owner's own forward kinematics rewrites the input
+        poses by a few ulps, which the resting feet's 1/dt position gain turns
+        into 1e-4 of contact impulse and velocity, so impulses compare as region
+        sums. Through graph replay and a partial reset, the routes then keep the
+        same stored anchors, each tied to its own solved rows: the standing
+        fixture's per-anchor impulses are not determined (its contact rows
+        outnumber its degrees of freedom), so they do not compare across routes.
         """
         model = standing_model()
         # Without the owner this is the ordinary patch route: the incremental tier, which also serves
         # patch friction, stays off in both arms so that they differ by the owner alone.
-        runs = [_graph_and_reset_rollout(model, False, choice, mf_gs_incremental_rows=0) for choice in ("off", "on")]
+        first = [_first_patch_step(model, choice) for choice in ("off", "on")]
+        self.assertIsNone(first[0][0].get_path_selection()["cached_prediction"])
+        self.assertEqual(first[1][0].get_path_selection()["cached_prediction"], "tree")
+        kinematics = model.state()
+        for _solver, _contacts, output, released in first:
+            self.assertTrue(released, "The release test must run")
+            newton.eval_fk(model, output.joint_q, output.joint_qd, kinematics)
+            published = (output.body_q.numpy(), output.body_qd.numpy())
+            for label, (body_q, body_qd) in [
+                *(("release input", inputs) for inputs in released),
+                ("published", published),
+            ]:
+                np.testing.assert_allclose(body_q, kinematics.body_q.numpy(), rtol=0.0, atol=1e-6, err_msg=label)
+                np.testing.assert_allclose(body_qd, kinematics.body_qd.numpy(), rtol=0.0, atol=1e-6, err_msg=label)
+        (ordinary, ordinary_contacts, ordinary_output, _), (cached, cached_contacts, cached_output, _) = first
+        np.testing.assert_allclose(
+            cached._debug_stage3_v_hat.numpy(),
+            ordinary._debug_stage3_v_hat.numpy(),
+            rtol=1e-5,
+            atol=1e-6,
+            err_msg="v_hat",
+        )
+        rows = [
+            patch_rows(solver, contacts, PATCH_DT, jacobian=True)
+            for solver, contacts in ((ordinary, ordinary_contacts), (cached, cached_contacts))
+        ]
+        assert_patch_rows_close(*rows)
+        assert_region_impulses_close(*rows, **STANDING_REGION_BOUNDS)
+        for name in ("joint_q", "body_q"):
+            np.testing.assert_allclose(
+                getattr(cached_output, name).numpy(),
+                getattr(ordinary_output, name).numpy(),
+                rtol=0.0,
+                atol=2e-6,
+                err_msg=name,
+            )
+        assert_states_close(ordinary_output, cached_output, velocity_atol=2e-3)
+
+        def reset_restarts_world_0(solver, contacts):
+            assert_loaded_anchors(solver, contacts, reset_worlds=(0,))
+
+        runs = [
+            _graph_and_reset_rollout(
+                model, False, choice, deterministic=True, after_reset=reset_restarts_world_0, mf_gs_incremental_rows=0
+            )
+            for choice in ("off", "on")
+        ]
         self.assertIsNone(runs[0][0].get_path_selection()["cached_prediction"])
         self.assertEqual(runs[1][0].get_path_selection()["cached_prediction"], "tree")
         for solver, contacts, _state in runs:
@@ -698,13 +793,15 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             self.assertIsNone(solver._sparse_mass_matrix_size)
             self.assertIsNone(solver.get_path_selection()["routes"]["sweep"]["tiers"])
             self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
-        for name in STATE_FIELDS:
-            np.testing.assert_allclose(
-                getattr(runs[0][2], name).numpy(), getattr(runs[1][2], name).numpy(), atol=3e-4, rtol=3e-4, err_msg=name
-            )
-        for solver, contacts, _state in runs:
             assert_loaded_anchors(solver, contacts)
-        assert_history_close(runs[0][0], runs[1][0])
+            self.assertGreater(assert_ring_coulomb(solver), 0)
+            self.assertGreater(assert_history_matches_rows(solver, contacts), 0)
+        # One float32 ulp of a foot's pose moves joint velocity by up to 6.6e-4 over this schedule.
+        assert_states_close(runs[0][2], runs[1][2], velocity_atol=2e-3)
+        assert_region_impulses_close(
+            *(patch_rows(solver, contacts, PATCH_DT) for solver, contacts, _ in runs), **STANDING_REGION_BOUNDS
+        )
+        assert_anchor_sites_close(*(anchor_sites(solver, contacts) for solver, contacts, _ in runs), tangent=False)
 
     def test_scalar_overrides_reach_solver(self):
         """Honor public choices independently of private test overrides."""
