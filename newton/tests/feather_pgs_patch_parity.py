@@ -790,7 +790,10 @@ def assert_states_close(first, second, *, velocity_atol=2.0e-3):
 # - sliding (SLIDING_FEET, SLIDING_ITERATIONS, 24 steps): joint velocity 1.7e-3, region load 1.1e-3, region
 #   friction 1.0e-4.
 # The bounds below are at least twice these. They are CPU measurements: re-measure on CUDA (dense against
-# sparse split rows, the ordinary against the incremental matrix-free sweep) before tightening them.
+# sparse split rows, the ordinary against the incremental matrix-free sweep) before tightening them. They
+# assume that both arms reserve each world's contact rows in one order, as sorted contacts within one CUDA
+# warp do: dealing one arm's rows in a random per-world order alone moves standing joint velocity by up to
+# 1.2e-2 and region load by 5.9e-3 on CPU.
 # Twists and momentum of the standing and sliding feet.
 STANDING_VELOCITY_ATOL = 7.5e-3
 # The stance's contact rows outnumber its degrees of freedom, so float order shifts friction between its

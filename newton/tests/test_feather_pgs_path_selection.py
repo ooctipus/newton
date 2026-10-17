@@ -42,7 +42,9 @@ PATCH_DT = 1.0 / 400.0
 # (CPU split stand-in, 32 iterations, 32 sign draws, linear up to 4 ulps): joint coordinates 2.8e-7, joint
 # velocity 1.2e-4, per-contact normal impulse 1.2e-4, region normal load 1.4e-4, region friction 1.5e-5. The
 # bounds admit six to eight ulps, as the step's 2e-6 pose bound admits seven, and stay below the step's own
-# joint velocity (1.5e-3), so a route that publishes stale velocities fails; re-measure on CUDA.
+# joint velocity (1.5e-3), so a route that publishes stale velocities fails; re-measure on CUDA. Both routes
+# reserve contact rows in one order (sorted contacts, one warp): a random per-world row order alone moves the
+# step's joint velocity by 3.3e-3 on CPU.
 FIRST_STEP_VELOCITY_ATOL = 7.5e-4
 FIRST_STEP_IMPULSE_ATOL = 1.0e-3
 FIRST_STEP_REGION_BOUNDS = {"load_atol": 1.0e-3, "friction_atol": 1.0e-4}
