@@ -5,6 +5,7 @@
 
 import ast
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -71,6 +72,67 @@ def _is_cache(decorator):
     return isinstance(target, ast.Name) and target.id in ("cache", "lru_cache")
 
 
+def _package_functions(package):
+    """Every function of a flat package by (module, qualified name), and each module's relative imports."""
+    functions, imports = {}, {}
+
+    def collect(module, body, prefix):
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                functions[(module, prefix + node.name)] = node
+                collect(module, node.body, f"{prefix}{node.name}.")
+            elif isinstance(node, ast.ClassDef):
+                collect(module, node.body, f"{prefix}{node.name}.")
+
+    for path in sorted(package.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        names = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.level == 1:
+                for alias in node.names:
+                    # "from . import module" binds a module; "from .module import name" binds a member.
+                    target = (alias.name, None) if node.module is None else (node.module, alias.name)
+                    names.setdefault(alias.asname or alias.name, target)
+        imports[path.stem] = names
+        collect(path.stem, tree.body, "")
+    return functions, imports
+
+
+def _callees(module, node, functions, imports):
+    """Package functions a body calls through a name or an imported module that resolves exactly."""
+    for call in ast.walk(node):
+        func = call.func if isinstance(call, ast.Call) else None
+        if isinstance(func, ast.Name):
+            source, member = imports[module].get(func.id, (None, None))
+            for key in ((module, func.id), (source, member)):
+                if key in functions:
+                    yield key
+        elif isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            source, member = imports[module].get(func.value.id, (None, None))
+            if member is None and (source, func.attr) in functions:
+                yield source, func.attr
+
+
+def _cached_environment_reads(package):
+    """Environment reads any cached factory of the package reaches through resolvable calls."""
+    functions, imports = _package_functions(package)
+    reads = []
+    for factory, node in functions.items():
+        if not any(_is_cache(decorator) for decorator in node.decorator_list):
+            continue
+        seen, pending = {factory}, [factory]
+        while pending:
+            key = pending.pop()
+            lines = _environment_reads(functions[key])
+            if lines:
+                reads.append(f"{'.'.join(factory)} reaches {'.'.join(key)}, lines {lines}")
+            for callee in _callees(key[0], functions[key], functions, imports):
+                if callee not in seen:
+                    seen.add(callee)
+                    pending.append(callee)
+    return sorted(reads)
+
+
 class TestTreeKernelSwitches(unittest.TestCase):
     def test_switches_select_the_kernels_by_argument(self):
         """Build four different repair, finish and predictor kernels for the four switch combinations."""
@@ -104,6 +166,31 @@ class TestTreeKernelSwitches(unittest.TestCase):
                 if isinstance(node, ast.FunctionDef) and any(_is_cache(d) for d in node.decorator_list):
                     with self.subTest(factory=f"{path.name}:{node.name}"):
                         self.assertEqual(_environment_reads(node), [])
+
+    def test_cached_factories_reach_no_environment_read(self):
+        """Follow every cached factory's calls through the package: none reaches an environment read."""
+        self.assertEqual(_cached_environment_reads(Path(tree_kinetic_state.__file__).parent), [])
+
+    def test_reach_scan_follows_helpers_across_modules(self):
+        """Report a read that a cached factory reaches through a helper, by name or through its module."""
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory)
+            (package / "switches.py").write_text(
+                'import os\n\n\ndef reference():\n    return os.environ.get("FEATHER_PGS_TREE_REFERENCE") == "1"\n'
+            )
+            (package / "factories.py").write_text(
+                "import functools\n\nfrom . import switches\nfrom .switches import reference\n\n\n"
+                "@functools.cache\ndef by_name(layout):\n    return layout, reference()\n\n\n"
+                "@functools.cache\ndef by_module(layout):\n    return layout, switches.reference()\n\n\n"
+                "@functools.cache\ndef clean(layout):\n    return layout\n"
+            )
+            self.assertEqual(
+                _cached_environment_reads(package),
+                [
+                    "factories.by_module reaches switches.reference, lines [5]",
+                    "factories.by_name reaches switches.reference, lines [5]",
+                ],
+            )
 
     def test_owners_in_one_process_build_their_own_kernels(self):
         """Bind each owner's own kernels when owners are built one after another under each switch.
