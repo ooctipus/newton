@@ -1142,18 +1142,22 @@ class SolverFeatherPGS(SolverBase):
     The experimental sparse contact-triplet mode is disabled by default. Set
     ``FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1`` before construction to cache tangent
     metrics within each solve and retain admitted normal/tangent updates in
-    registers. It requires the active sparse sweep, one articulated coordinate
-    block per world, support tables, and no physical free-body response. Under
-    persistent patch friction it fuses each patch's anchor units, pooling the
-    ring's normal loads as the ordinary update does, bitwise, in the active
-    sweep or, with ``FEATHER_PGS_PATCH_ACTIVE_ROWS=0``, in the full ordered
-    sweep; small worlds keep their packed sweep. Shared memory limits retain
-    the ordinary sparse owner; unsupported row metadata, delayed friction, and
-    negative relaxation in the active sweep retain ordinary row updates. At
-    most twelve used tangent pairs per world retain metrics; additional pairs
-    recompute their metrics without limiting solved rows. The mode preserves
-    the selected ordered sweeps and friction law. This feature is
-    experimental and may change without notice.
+    registers. It requires one articulated coordinate block per world, support
+    tables, and no physical free-body response. Point friction fuses its
+    contacts in the active sparse sweep only. Persistent patch friction fuses
+    each patch's anchor units in whichever sweep it runs, the active sweep or
+    the full ordered sweep (``FEATHER_PGS_PATCH_ACTIVE_ROWS=0``), pooling the
+    ring's normal loads as the ordinary update does; split, velocity-limit and
+    packed small-world sweeps keep ordinary updates. Shared memory limits
+    retain the ordinary sparse owner; unsupported row metadata, delayed
+    friction, and negative relaxation in the active sweep retain ordinary row
+    updates. At most twelve used tangent pairs per world retain metrics;
+    additional pairs recompute their metrics without limiting solved rows.
+    The mode preserves the selected ordered sweeps and friction law: patch
+    results are bitwise unchanged, and so are point results unless
+    ``pgs_relative_change_tolerance > 0``, where the point early exit bounds
+    tangent changes by the new normal impulse. This feature is experimental
+    and may change without notice.
 
     """
 

@@ -451,7 +451,8 @@ FLAGS = declare(
         "FEATHER_PGS_SPARSE_CONTACT_TRIPLETS",
         "experiment",
         _SOLVER,
-        "=1 caches tangent metrics per contact triplet in the active sparse sweep.",
+        "=1 fuses contact triplets in the sparse sweep: point friction's in the active-row scan, patch "
+        "friction's anchor units in whichever sweep it runs.",
     ),
     _flag(
         "FEATHER_PGS_SPARSE_FACTOR",
