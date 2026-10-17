@@ -9,7 +9,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.geometry.contact_data import ContactData, make_contact_sort_key
-from newton._src.geometry.contact_reduction import float_flip
+from newton._src.geometry.contact_reduction import NUM_NORMAL_BINS, NUM_SPATIAL_DIRECTIONS, float_flip
 from newton._src.geometry.contact_reduction_global import (
     CLEAR_ACTIVE_ENTRY_PARALLEL_THRESHOLD,
     EXPORT_REDUCED_CONTACTS_BLOCK_DIM,
@@ -1132,6 +1132,97 @@ def test_centered_pre_pruning_reduces_buffer_usage(test, device):
     )
 
 
+@wp.kernel(enable_backward=False)
+def _store_probed_contact_kernel(reducer_data: GlobalContactReducerData, two_tier: int, depth: float):
+    """Offer one contact to a centered writer, which probes its rows before allocating."""
+    position = wp.vec3(0.3, 0.0, 0.2)
+    normal = wp.vec3(0.0, 1.0, 0.0)
+    aabb_lower = wp.vec3(-1.0, -1.0, -1.0)
+    aabb_upper = wp.vec3(1.0, 1.0, 1.0)
+    if two_tier != 0:
+        export_and_reduce_contact_centered_two_spatial_depths(
+            shape_a=3,
+            shape_b=7,
+            position=position,
+            normal=normal,
+            depth=depth,
+            fingerprint=5,
+            centered_position=position,
+            inner_spatial_depth=0.0,
+            outer_spatial_depth=0.1,
+            position_local=position,
+            aabb_lower_voxel=aabb_lower,
+            aabb_upper_voxel=aabb_upper,
+            voxel_res=wp.vec3i(4, 4, 4),
+            reducer_data=reducer_data,
+        )
+    else:
+        export_and_reduce_contact_centered(
+            shape_a=3,
+            shape_b=7,
+            position=position,
+            normal=normal,
+            depth=depth,
+            fingerprint=5,
+            centered_position=position,
+            X_ws_voxel_shape=wp.transform_identity(),
+            aabb_lower_voxel=aabb_lower,
+            aabb_upper_voxel=aabb_upper,
+            voxel_res=wp.vec3i(4, 4, 4),
+            reducer_data=reducer_data,
+        )
+
+
+def test_centered_pre_prune_probes_read_their_own_rows(test, device):
+    """Admit a contact whose own slots are weak while every other value is a strong winner.
+
+    Each pre-prune probe of the single-tier and two-tier centered writers reads
+    the contact's own normal-bin or voxel row before allocating a buffer slot. A
+    probe that read any other value would see a strong winner and prune it.
+    """
+    strong = np.iinfo(np.uint64).max
+    # (two_tier, depth, probed slots): depth -0.01 is inside both writers' inner
+    # tier, 0.05 only inside the two-tier writer's outer, directional tier.
+    cases = (
+        (0, -0.01, "max_depth"),
+        (0, -0.01, "spatial"),
+        (0, -0.01, "voxel"),
+        (1, -0.01, "max_depth"),
+        (1, -0.01, "spatial"),
+        (1, 0.05, "spatial"),
+        (1, -0.01, "voxel"),
+    )
+    for deterministic in (False, True):
+        for two_tier, depth, probe in cases:
+            with test.subTest(deterministic=deterministic, two_tier=two_tier, depth=depth, probe=probe):
+                reducer = GlobalContactReducer(capacity=64, device=device, deterministic=deterministic)
+                inputs = [reducer.get_data_struct(), two_tier, depth]
+                # An empty table admits the contact and inserts its keys.
+                wp.launch(_store_probed_contact_kernel, dim=1, inputs=inputs, device=device)
+                test.assertEqual(get_contact_count(reducer), 1)
+                active = reducer.hashtable.active_slots.numpy()
+                entries = active[: active[reducer.hashtable.capacity]]
+                bins = (reducer.hashtable.keys.numpy()[entries] >> np.uint64(55)) & np.uint64(0xFF)
+                normal_entries = entries[bins < NUM_NORMAL_BINS]
+                voxel_entries = entries[bins >= NUM_NORMAL_BINS]
+                test.assertEqual(len(normal_entries), 1)
+                if probe == "max_depth":
+                    weak = reduction_value_index_np(normal_entries, NUM_SPATIAL_DIRECTIONS)
+                elif probe == "spatial":
+                    weak = reduction_value_index_np(normal_entries[:, None], np.arange(NUM_SPATIAL_DIRECTIONS))
+                else:
+                    test.assertEqual(len(voxel_entries), 1)
+                    weak = reduction_value_index_np(voxel_entries[:, None], np.arange(VALUES_PER_KEY))
+                for admitted in (False, True):
+                    values = np.full(reducer.ht_values.shape[0], strong, dtype=np.uint64)
+                    if admitted:
+                        values[weak] = 0
+                    reducer.ht_values.assign(values)
+                    reducer.contact_count.zero_()
+                    wp.launch(_store_probed_contact_kernel, dim=1, inputs=inputs, device=device)
+                    test.assertEqual(get_contact_count(reducer), int(admitted))
+
+
 # =============================================================================
 # Float-flip precision tests
 # =============================================================================
@@ -1630,6 +1721,12 @@ add_function_test(
     TestGlobalContactReducer,
     "test_centered_pre_pruning_reduces_buffer_usage",
     test_centered_pre_pruning_reduces_buffer_usage,
+    devices=devices,
+)
+add_function_test(
+    TestGlobalContactReducer,
+    "test_centered_pre_prune_probes_read_their_own_rows",
+    test_centered_pre_prune_probes_read_their_own_rows,
     devices=devices,
 )
 add_function_test(TestKeyConstruction, "test_key_uniqueness", test_key_uniqueness, devices=devices)
