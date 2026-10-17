@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs.friction_patches import _FrictionPatchState
+from newton._src.solvers.feather_pgs.friction_patches import _FrictionPatchState, patch_routes
 from newton.tests.feather_pgs_patch_reference import SENTINEL, ReferencePatches, pair_codes
 
 _PIECE_OFFSET = 0.04
@@ -227,20 +227,22 @@ def _pair(scene, capacity):
 def assert_same_patches(patches, reference, live, context=""):
     """Require bitwise-equal patch state on every index a patch kernel reads.
 
-    Sorted keys and indices, validity, ownership, sources, the patch view and
-    stored worlds compare everywhere; contact payload on the live contacts;
-    stored payload on valid anchors; history poses on the bodies of valid
-    anchors. Scratch arrays (``members``, ``used``) and the sort's second halves
-    are excluded.
+    Sorted keys, validity, ownership, sources, the patch view and stored worlds
+    compare everywhere; sorted indices where a pair key is live; contact payload
+    on the live contacts; stored payload on valid anchors; history poses on the
+    bodies of valid anchors. Scratch arrays (``members``, ``used``) and the
+    sort's second halves are excluded.
     """
     n = reference.capacity
     stride = patches.key_stride
     for name in ("current", "previous"):
         mine, theirs = getattr(patches, name), getattr(reference, name)
+        codes = pair_codes(theirs.keys.numpy()[:n])
+        np.testing.assert_array_equal(pair_codes(mine.keys.numpy()[:n], stride), codes, f"{context} {name}.keys")
+        keyed = codes[:, 0] >= 0
         np.testing.assert_array_equal(
-            pair_codes(mine.keys.numpy()[:n], stride), pair_codes(theirs.keys.numpy()[:n]), f"{context} {name}.keys"
+            mine.indices.numpy()[:n][keyed], theirs.indices.numpy()[:n][keyed], f"{context} {name}.indices"
         )
-        np.testing.assert_array_equal(mine.indices.numpy()[:n], theirs.indices.numpy()[:n], f"{context} {name}.indices")
         np.testing.assert_array_equal(mine.valid.numpy(), theirs.valid.numpy(), f"{context} {name}.valid")
     for name in ("owner", "source"):
         np.testing.assert_array_equal(
@@ -307,6 +309,260 @@ def assert_same_patches(patches, reference, live, context=""):
     )
 
 
+def assert_empty_tail(patches, context=""):
+    """Require Invariant I: slots past the stored and built counts hold the empty record.
+
+    Bounded launches never visit those slots, so they must already hold what a
+    full-capacity frame writes there.
+    """
+    n = patches.capacity
+    stored = int(patches.stored.numpy()[0])
+    built = int(patches.built.numpy()[0])
+    for name, count in (("previous", stored), ("current", built)):
+        frame = getattr(patches, name)
+        np.testing.assert_array_equal(frame.keys.numpy()[count:n], SENTINEL, f"{context} {name}.keys tail")
+        np.testing.assert_array_equal(frame.indices.numpy()[count:n], np.arange(count, n), f"{context} {name}.indices")
+        np.testing.assert_array_equal(frame.valid.numpy()[count:], 0, f"{context} {name}.valid tail")
+    for name, empty in (("owner", -1), ("source", -1)):
+        np.testing.assert_array_equal(getattr(patches.current, name).numpy()[built:], empty, f"{context} {name} tail")
+    for name, empty in (("weight", 0.0), ("next_contact", -1), ("phi", 0.0)):
+        np.testing.assert_array_equal(getattr(patches.view, name).numpy()[built:], empty, f"{context} {name} tail")
+    np.testing.assert_array_equal(patches.previous_world.numpy()[stored:], -1, f"{context} previous_world tail")
+
+
+class _Rows:
+    """Synthetic contact routing and row arrays of routes 0, 1 and 2.
+
+    Live contacts get world, route, slot and row values the way the allocator
+    and row builders lay them out; slots past the live count keep stale values
+    that no patch kernel may read. :meth:`arrays` returns a fresh device copy
+    per state, because linking, seeding and finishing write the row arrays.
+    """
+
+    def __init__(self, scene, capacity, rng):
+        self.rng = rng
+        self.scene = scene
+        self.capacity = capacity
+        self.rows = 3 * capacity + 8
+
+    def generate(self, reference, live, routes=(0, 1, 2)):
+        rng, n, rows, worlds = self.rng, self.capacity, self.rows, self.scene.worlds
+        world = rng.integers(0, worlds, size=n)
+        path = rng.integers(0, 3, size=n)
+        needed = rng.choice([1, 3], size=n)
+        slot = rng.integers(0, rows - 3, size=n)
+        parents = rng.integers(-1, rows, size=(3, worlds, rows))
+        mu = rng.uniform(0.0, 1.0, size=(3, worlds, rows))
+        impulses = rng.uniform(-1.0, 1.0, size=(3, worlds, rows))
+        body_a, body_b = reference.current.body_a.numpy(), reference.current.body_b.numpy()
+        weight = reference.view.weight.numpy()
+        counters = np.zeros((3, worlds), dtype=int)
+        for c in rng.permutation(live):
+            a, b = int(body_a[c]), int(body_b[c])
+            body = a if a >= 0 else b
+            world[c] = self.scene.body_world[body] if body >= 0 else 0
+            # Contacts of one pair mostly share a route, as the allocator assigns them.
+            path[c] = (max(a, b) + 7) % 3 if rng.random() < 0.9 else rng.integers(0, 3)
+            needed[c] = 3 if weight[c] > 0.0 and rng.random() < 0.9 else 1
+            if rng.random() < 0.05 or path[c] not in routes:
+                slot[c] = -1  # A capacity rejection, or a route without rows.
+                continue
+            r, w = path[c], world[c]
+            s = counters[r, w]
+            counters[r, w] += needed[c]
+            slot[c] = s
+            load = 0.0 if rng.random() < 0.15 else rng.uniform(0.1, 2.0)
+            parents[r, w, s] = -1
+            impulses[r, w, s] = load
+            mu[r, w, s : s + needed[c]] = rng.uniform(0.2, 1.0)
+            if needed[c] == 3:
+                parents[r, w, s + 1 : s + 3] = s
+                tangent = rng.normal(size=2)
+                tangent *= mu[r, w, s + 1] * load * rng.uniform(0.0, 3.0) / max(np.linalg.norm(tangent), 1.0e-9)
+                impulses[r, w, s + 1 : s + 3] = tangent
+        self.maps = (world, slot, path, needed)
+        self.values = (parents, mu, impulses)
+        self.routes = routes
+        self.decay = np.where(rng.random(3) < 0.3, 0.0, rng.uniform(0.3, 1.0, size=3))
+
+    def arrays(self):
+        """Return device copies: contact maps and ``(route, parents, mu, impulses, decay)`` rows."""
+        device = self.scene.device
+        maps = [wp.array(values.astype(np.int32), dtype=int, device=device) for values in self.maps]
+        parents, mu, impulses = self.values
+        routes = [
+            (
+                r,
+                wp.array(parents[r].astype(np.int32), dtype=int, device=device),
+                wp.array(mu[r].astype(np.float32), dtype=float, device=device),
+                wp.array(impulses[r].astype(np.float32), dtype=float, device=device),
+                float(self.decay[r]),
+            )
+            for r in self.routes
+        ]
+        return maps, routes
+
+
+def _assert_same_rows(mine, theirs, context=""):
+    for (route, *arrays), (_, *expected) in zip(mine, theirs, strict=True):
+        for name, array, reference in zip(("parents", "mu", "impulses"), arrays[:3], expected[:3], strict=True):
+            np.testing.assert_array_equal(array.numpy(), reference.numpy(), f"{context} route {route} {name}")
+
+
+def _solved_state(scene, rng):
+    """Return a moved output state and centers of mass for the release test."""
+    poses = scene.poses.copy()
+    poses[:, :3] += rng.normal(scale=1.0e-4, size=(scene.body_count, 3))
+    velocity = rng.normal(scale=0.05, size=(scene.body_count, 6))
+    device = scene.device
+    out = SimpleNamespace(
+        body_q=wp.array(poses, dtype=wp.transform, device=device),
+        body_qd=wp.array(velocity, dtype=wp.spatial_vector, device=device),
+    )
+    return out, wp.array(rng.normal(scale=0.01, size=(scene.body_count, 3)), dtype=wp.vec3, device=device)
+
+
+# Random sequence events: "grow" raises the active pair count, "sparse" keeps one
+# pair, "empty" and "overflow" leave no live contact, "none" passes no contacts,
+# "noframe" passes contacts without capacity, "rebuild" builds twice before the
+# rows, "gates" filters friction, "geometry" edits a shape, and "reset" and
+# "masked" reset all or some worlds after the step.
+_PLAN = (
+    "grow",
+    "grow",
+    "grow",
+    "live",
+    "sparse",
+    "live",
+    "empty",
+    "grow",
+    "overflow",
+    "live",
+    "none",
+    "live",
+    "rebuild",
+    "live",
+    "noframe",
+    "live",
+    "masked",
+    "live",
+    "geometry",
+    "live",
+    "gates",
+    "grow",
+    "sparse",
+    "reset",
+    "live",
+    "overflow",
+    "sparse",
+    "live",
+)
+
+
+def _gates(scene, rng):
+    """Return build gates that filter friction or normals, with articulation maps."""
+    articulation = np.where(rng.random(scene.body_count) < 0.8, np.arange(scene.body_count), -1)
+    free = (rng.random(scene.body_count) < 0.5).astype(np.int32)
+    device = scene.device
+    gates = {
+        "body_to_articulation": wp.array(articulation.astype(np.int32), dtype=int, device=device),
+        "is_free_rigid": wp.array(free, dtype=int, device=device),
+    }
+    if rng.random() < 0.5:
+        gates["friction_gap"] = -1.0
+    else:
+        gates.update(contact_gap_gate=1.0e-3, articulation_pair_gap_gate=5.0e-4, same_articulation_gap_gate=2.0e-4)
+    return gates
+
+
+def run_reference_differential(device, seed, *, worlds=3, bodies=4, contacts=96, capacity=128, threads=None):
+    """Step a patch state and the reference through :data:`_PLAN`, comparing after every launch group.
+
+    Returns counts of carried anchors and of anchors released by finishing, so
+    callers can require the sequence to exercise both.
+    """
+    rng = np.random.default_rng(1000 + seed)
+    scene = _Scene(device, seed, worlds=worlds, bodies=bodies, contacts=contacts)
+    patches, reference = _pair(scene, capacity)
+    if threads is not None:
+        patches.threads, patches.build_threads = threads
+    rows = _Rows(scene, capacity, rng)
+    coverage = {"carried": 0, "released": 0}
+    fraction = 0.1
+    dt = 1.0 / 240.0
+    for step, event in enumerate(_PLAN):
+        context = f"seed {seed} step {step} {event}"
+        scene.move()
+        if event == "grow":
+            fraction = min(1.0, fraction + 0.3)
+            scene.active = scene.rng.random(len(scene.pairs)) < fraction
+        if event == "geometry":
+            transforms = scene.model.shape_transform.numpy()
+            transforms[int(rng.integers(0, len(transforms))), 0] += 1.0e-3
+            scene.model.shape_transform.assign(transforms)
+            for state in (patches, reference):
+                state.update_geometry(scene.model)
+            assert_same_patches(patches, reference, 0, f"{context} invalidate")
+        if event == "none":
+            for state in (patches, reference):
+                state.previous.valid.zero_()
+            assert_same_patches(patches, reference, 0, context)
+            assert_empty_tail(patches, context)
+            continue
+        if event == "noframe":
+            # No frame this step: the reference's row kernels launch over no slots
+            # and its store copies the last frame again; the state stores it alone.
+            empty = SimpleNamespace(rigid_contact_max=0, rigid_contact_count=scene.contacts.rigid_contact_count)
+            out, com = _solved_state(scene, rng)
+            maps, routes = rows.arrays()
+            reference.finish(empty, scene.state, out, com, *maps, routes, dt)
+            patches.store(scene.state)
+            assert_same_patches(patches, reference, 0, context)
+            assert_empty_tail(patches, context)
+            continue
+        mode = {"sparse": "sparse", "empty": "empty", "overflow": "overflow"}.get(event, "live")
+        gates = _gates(scene, rng) if event == "gates" else {}
+        if event == "rebuild":
+            scene.frame("live")
+            for state in (patches, reference):
+                state.build(scene.model, scene.state, scene.contacts)
+            mode = "sparse"
+        live = scene.frame(mode)
+        for state in (patches, reference):
+            state.build(scene.model, scene.state, scene.contacts, **gates)
+        assert_same_patches(patches, reference, live, f"{context} build")
+        assert_empty_tail(patches, f"{context} build")
+        coverage["carried"] += int(np.count_nonzero(reference.current.source.numpy()[:live] >= 0))
+        routes_present = (0, 1, 2) if rng.random() < 0.7 else (0, 1)
+        rows.generate(reference, live, routes_present)
+        mine_maps, mine_routes = rows.arrays()
+        their_maps, their_routes = rows.arrays()
+        patches.link(*mine_maps, patch_routes(mine_routes))
+        reference.link(scene.contacts, *their_maps, their_routes)
+        _assert_same_rows(mine_routes, their_routes, f"{context} link")
+        seeded = [row for row in mine_routes if row[4] > 0.0]
+        if seeded:
+            patches.seed(scene.state, *mine_maps, patch_routes(seeded))
+        reference.seed(scene.contacts, scene.state, *their_maps, their_routes)
+        _assert_same_rows(mine_routes, their_routes, f"{context} seed")
+        out, com = _solved_state(scene, rng)
+        before = int(np.count_nonzero(reference.current.valid.numpy()[:live]))
+        patches.finish(scene.state, out, com, *mine_maps, patch_routes(mine_routes), dt)
+        reference.finish(scene.contacts, scene.state, out, com, *their_maps, their_routes, dt)
+        coverage["released"] += before - int(np.count_nonzero(reference.current.valid.numpy()[:live]))
+        assert_same_patches(patches, reference, live, f"{context} finish")
+        assert_empty_tail(patches, f"{context} finish")
+        if event in ("reset", "masked"):
+            mask = None
+            if event == "masked":
+                mask = wp.array(rng.random(scene.worlds) < 0.5, dtype=wp.bool, device=device)
+            for state in (patches, reference):
+                state.reset(mask)
+            assert_same_patches(patches, reference, live, f"{context} reset")
+            assert_empty_tail(patches, f"{context} reset")
+    return coverage
+
+
 class TestPatchSortKeys(unittest.TestCase):
     def test_host_sort_honors_end_bit(self):
         """Ignore key bits at and above ``end_bit`` and keep equal keys in input order on the host."""
@@ -342,6 +598,7 @@ class TestPatchSortKeys(unittest.TestCase):
                     for state in (patches, reference):
                         state.store(scene.state)
                     assert_same_patches(patches, reference, live, f"step {step} store")
+                    assert_empty_tail(patches, f"step {step} store")
                 self.assertGreater(carried, 0, "the frames must carry anchor history")
 
     def test_shapeless_pair_ties_the_sentinel_bits(self):
@@ -361,6 +618,115 @@ class TestPatchSortKeys(unittest.TestCase):
         self.assertTrue(np.any(codes[:, 0] == stride - 1))
         self.assertTrue(np.all(patches.current.keys.numpy()[live : patches.capacity] == SENTINEL))
         assert_same_patches(patches, reference, live)
+
+
+class TestPatchLiveExtent(unittest.TestCase):
+    def test_live_extent_matches_the_full_capacity_reference(self):
+        """Match the full-capacity mechanism bitwise through rising, dropping, overflowing and missing frames."""
+        totals = {"carried": 0, "released": 0}
+        for seed, contacts, capacity, threads in (
+            (0, 96, 96, None),
+            (1, 96, 128, (7, 5)),
+            (2, 64, 160, (1, 3)),
+            (3, 128, 128, (32, 64)),
+        ):
+            with self.subTest(seed=seed, capacity=capacity, threads=threads):
+                coverage = run_reference_differential(
+                    "cpu", seed, contacts=contacts, capacity=capacity, threads=threads
+                )
+                for name, count in coverage.items():
+                    totals[name] += count
+        self.assertGreater(totals["carried"], 0, "the sequences must carry anchor history")
+        self.assertGreater(totals["released"], 0, "the sequences must release finished anchors")
+
+    def test_unstored_builds_clear_their_slots(self):
+        """Clear the slots of a build that no store followed, as a full-capacity frame does."""
+        scene = _Scene("cpu", 8)
+        patches, reference = _pair(scene, 96)
+        patches.threads, patches.build_threads = 5, 3
+        scene.active[:] = True
+        for mode in ("live", "overflow", "live", "sparse", "empty"):
+            scene.move()
+            live = scene.frame(mode)
+            for state in (patches, reference):
+                state.build(scene.model, scene.state, scene.contacts)
+            assert_same_patches(patches, reference, live, mode)
+            assert_empty_tail(patches, mode)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "multi-block grids need CUDA")
+    def test_live_extent_matches_the_reference_on_many_blocks(self):
+        """Publish the live extent without a race while many blocks stride over sharp drops."""
+        for seed, threads in ((10, None), (11, (1000, 600))):
+            with self.subTest(seed=seed, threads=threads):
+                coverage = run_reference_differential(
+                    "cuda:0", seed, worlds=48, contacts=2048, capacity=3072, threads=threads
+                )
+                self.assertGreater(coverage["carried"], 0)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
+    def test_graph_replay_follows_changing_counts(self):
+        """Replay one captured patch step over rising, empty, overflowing and sharply dropping counts."""
+        device = "cuda:0"
+        rng = np.random.default_rng(7)
+        scene = _Scene(device, 21, worlds=32, contacts=1536)
+        patches, reference = _pair(scene, 2048)
+        rows = _Rows(scene, 2048, rng)
+        dt = 1.0 / 240.0
+        decay = np.array([0.8, 0.0, 0.6])
+
+        def prepare(mode):
+            scene.move()
+            live = scene.frame(mode)
+            reference.build(scene.model, scene.state, scene.contacts)
+            rows.generate(reference, live)
+            rows.decay = decay
+            return live
+
+        def assign(fixed, out, com):
+            (maps, routes), (fresh_maps, fresh_routes) = fixed, rows.arrays()
+            for array, values in zip(maps, fresh_maps, strict=True):
+                array.assign(values)
+            for row, values in zip(routes, fresh_routes, strict=True):
+                for array, fresh in zip(row[1:4], values[1:4], strict=True):
+                    array.assign(fresh)
+            solved, centers = _solved_state(scene, rng)
+            out.body_q.assign(solved.body_q)
+            out.body_qd.assign(solved.body_qd)
+            com.assign(centers)
+
+        live = prepare("live")
+        fixed = rows.arrays()
+        out, com = _solved_state(scene, rng)
+        maps, routes = fixed
+        linked, seeded = patch_routes(routes), patch_routes(row for row in routes if row[4] > 0.0)
+
+        def step():
+            patches.build(scene.model, scene.state, scene.contacts)
+            patches.link(*maps, linked)
+            patches.seed(scene.state, *maps, seeded)
+            patches.finish(scene.state, out, com, *maps, linked, dt)
+
+        def reference_step(live):
+            their_maps, their_routes = rows.arrays()
+            reference.link(scene.contacts, *their_maps, their_routes)
+            reference.seed(scene.contacts, scene.state, *their_maps, their_routes)
+            reference.finish(scene.contacts, scene.state, out, com, *their_maps, their_routes, dt)
+            return their_routes
+
+        step()
+        their_routes = reference_step(live)
+        assert_same_patches(patches, reference, live, "eager")
+        with wp.ScopedCapture(device=device) as capture:
+            step()
+        for index, mode in enumerate(("live", "sparse", "empty", "live", "overflow", "live", "sparse", "live")):
+            scene.active = scene.rng.random(len(scene.pairs)) < (0.9 if index == 3 else 0.6)
+            live = prepare(mode)
+            assign(fixed, out, com)
+            wp.capture_launch(capture.graph)
+            their_routes = reference_step(live)
+            assert_same_patches(patches, reference, live, f"replay {index} {mode}")
+            assert_empty_tail(patches, f"replay {index} {mode}")
+            _assert_same_rows(routes, their_routes, f"replay {index} {mode}")
 
 
 if __name__ == "__main__":

@@ -3111,21 +3111,6 @@ def finish_articulation_general(
             )
 
 
-@wp.kernel
-def reset_friction_anchor_history(
-    world_mask: wp.array[wp.bool],
-    prev_world: wp.array[int],
-    prev_valid: wp.array[int],
-):
-    """Drop the carried friction anchors of reset worlds (all worlds for an empty mask)."""
-    c = wp.tid()
-    if world_mask:
-        w = prev_world[c]
-        if w >= 0 and w < world_mask.shape[0] and not world_mask[w]:
-            return
-    prev_valid[c] = 0
-
-
 @wp.func
 def _contact_linear_force(
     c: int,

@@ -25,7 +25,9 @@ saturation alone does not. All matching tolerances are internal so correction
 strength is the only new user control.
 
 Sorting body pairs makes construction local to a pair and preserves CUDA graph
-capture: all buffers and the radix-sort workspace have fixed capacity.
+capture: all buffers and the radix-sort workspace have fixed capacity. Launches
+stride over the live contacts and the slots earlier frames used, so their work
+follows the live contact count rather than the capacity.
 """
 
 import numpy as np
@@ -33,6 +35,12 @@ import warp as wp
 
 from ...math.spatial import velocity_at_point
 from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
+
+# Grids are fixed at construction so CUDA graphs replay them. The sizes are
+# provisional until calibrated against the measured empty-launch floor.
+_BLOCK_THREADS = 256
+_LIGHT_BLOCKS_PER_SM = 2
+_BUILD_BLOCKS_PER_SM = 4
 
 
 @wp.struct
@@ -92,9 +100,10 @@ def _local_point(q: wp.array[wp.transform], body: int, point: wp.vec3):
     return result
 
 
-@wp.kernel(enable_backward=False)
-def _prepare(
-    count: wp.array[int],
+@wp.func
+def _prepare_contact(
+    c: int,
+    live: int,
     shape0: wp.array[int],
     shape1: wp.array[int],
     point0: wp.array[wp.vec3],
@@ -118,7 +127,6 @@ def _prepare(
     frame: _PatchFrame,
     patches: FrictionPatches,
 ):
-    c = wp.tid()
     frame.indices[c] = c
     frame.keys[c] = wp.int64(0x7FFFFFFFFFFFFFFF)
     frame.owner[c] = -1
@@ -130,7 +138,7 @@ def _prepare(
     patches.weight[c] = 0.0
     patches.next_contact[c] = -1
     patches.phi[c] = wp.vec2(0.0)
-    if count[0] > shape0.shape[0] or c >= count[0] or c >= shape0.shape[0]:
+    if c >= live:
         return
     sa = shape0[c]
     sb = shape1[c]
@@ -218,6 +226,82 @@ def _prepare(
     frame.radius[c] = wp.max(r, 1.0e-4)
 
 
+@wp.kernel(enable_backward=False)
+def _prepare(
+    count: wp.array[int],
+    shape0: wp.array[int],
+    shape1: wp.array[int],
+    point0: wp.array[wp.vec3],
+    point1: wp.array[wp.vec3],
+    normal: wp.array[wp.vec3],
+    margin0: wp.array[float],
+    margin1: wp.array[float],
+    shape_body: wp.array[int],
+    shape_mu: wp.array[float],
+    shape_gap: wp.array[float],
+    body_radius: wp.array[float],
+    q: wp.array[wp.transform],
+    body_to_articulation: wp.array[int],
+    is_free_rigid: wp.array[int],
+    contact_gap_gate: float,
+    same_articulation_gap_gate: float,
+    articulation_pair_gap_gate: float,
+    friction_gap: float,
+    friction_articulation_pairs_only: int,
+    key_stride: int,
+    stored: wp.array[int],
+    built: wp.array[int],
+    threads: int,
+    frame: _PatchFrame,
+    patches: FrictionPatches,
+    extent: wp.array[int],
+):
+    """Fill this frame's contact slots and clear every slot an earlier frame used.
+
+    The narrow phase counts contacts before checking its capacity, so an
+    overflowing count describes an incomplete frame and leaves no contact live.
+    Slots past the stored and the last built frame already hold the empty
+    record. Thread 0 publishes the slots to visit and the live count; this
+    launch reads neither.
+    """
+    thread = wp.tid()
+    live = count[0]
+    if live < 0 or live > shape0.shape[0]:
+        live = 0
+    live = wp.min(live, frame.valid.shape[0])
+    end = wp.max(live, wp.max(stored[0], built[0]))
+    if thread == 0:
+        extent[0] = end
+        extent[1] = live
+    for c in range(thread, end, threads):
+        _prepare_contact(
+            c,
+            live,
+            shape0,
+            shape1,
+            point0,
+            point1,
+            normal,
+            margin0,
+            margin1,
+            shape_body,
+            shape_mu,
+            shape_gap,
+            body_radius,
+            q,
+            body_to_articulation,
+            is_free_rigid,
+            contact_gap_gate,
+            same_articulation_gap_gate,
+            articulation_pair_gap_gate,
+            friction_gap,
+            friction_articulation_pairs_only,
+            key_stride,
+            frame,
+            patches,
+        )
+
+
 @wp.func
 def _compatible(frame: _PatchFrame, seed: int, c: int):
     d = frame.center[c] - frame.center[seed]
@@ -299,9 +383,11 @@ def _carried_displacement(q: wp.array[wp.transform], prev: _PatchFrame, p: int, 
     return error
 
 
-@wp.kernel(enable_backward=False)
-def _build(
-    count: wp.array[int],
+@wp.func
+def _build_pair(
+    start: int,
+    end: int,
+    previous_end: int,
     q: wp.array[wp.transform],
     previous_q: wp.array[wp.transform],
     shape_transform: wp.array[wp.transform],
@@ -310,10 +396,8 @@ def _build(
     prev: _PatchFrame,
     patches: FrictionPatches,
 ):
-    """One thread per sorted body pair; writes disjoint current/previous records."""
-    start = wp.tid()
-    end = wp.min(count[0], frame.center.shape[0])
-    if start >= end or (start > 0 and frame.keys[start - 1] == frame.keys[start]):
+    """Build the body pair whose sorted run starts at ``start``; other positions return."""
+    if start > 0 and frame.keys[start - 1] == frame.keys[start]:
         return
     key = frame.keys[start]
     if key == wp.int64(0x7FFFFFFFFFFFFFFF):
@@ -323,8 +407,9 @@ def _build(
         stop += 1
 
     # Binary search the previous pair, avoiding a scan over other worlds/pairs.
+    # Positions from previous_end on hold no stored record.
     lo = int(0)
-    hi = prev.center.shape[0]
+    hi = previous_end
     while lo < hi:
         mid = (lo + hi) // 2
         if prev.keys[mid] < key:
@@ -336,7 +421,7 @@ def _build(
     # Index valid history once per pair rather than rescanning all old contacts
     # for every new friction location. Keep sorted order for matching ties.
     prev_anchor_stop = prev_start
-    while prev_stop < prev.center.shape[0] and prev.keys[prev_stop] == key:
+    while prev_stop < previous_end and prev.keys[prev_stop] == key:
         p = prev.indices[prev_stop]
         prev.used[p] = 0
         if prev.valid[p] != 0:
@@ -659,7 +744,36 @@ def _build(
 
 
 @wp.kernel(enable_backward=False)
-def _store_history(
+def _build(
+    extent: wp.array[int],
+    stored: wp.array[int],
+    q: wp.array[wp.transform],
+    previous_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_radius: wp.array[float],
+    threads: int,
+    frame: _PatchFrame,
+    prev: _PatchFrame,
+    patches: FrictionPatches,
+    built: wp.array[int],
+):
+    """Stride over the live sorted positions; body pairs write disjoint current/previous records.
+
+    Thread 0 records the live count, so the next _prepare clears these slots even
+    when no store follows this build.
+    """
+    thread = wp.tid()
+    live = extent[1]
+    if thread == 0:
+        built[0] = live
+    previous_end = stored[0]
+    for start in range(thread, live, threads):
+        _build_pair(start, live, previous_end, q, previous_q, shape_transform, shape_radius, frame, prev, patches)
+
+
+@wp.func
+def _store_contact(
+    c: int,
     q: wp.array[wp.transform],
     body_world: wp.array[int],
     frame: _PatchFrame,
@@ -668,11 +782,6 @@ def _store_history(
     previous_q: wp.array[wp.transform],
 ):
     """Carry contact history and input poses, independent of solver velocity passes."""
-    c = wp.tid()
-    if c < previous_q.shape[0]:
-        previous_q[c] = q[c]
-    if c >= frame.valid.shape[0]:
-        return
     # Pair searches need the complete sorted index, but only live anchors own
     # geometric history. Retire stale validity and reset ownership before exit.
     prev.keys[c] = frame.keys[c]
@@ -705,6 +814,12 @@ def _store_history(
     # The solver maps the default, unpartitioned world (-1) to world zero.
     world = wp.max(world, 0)
     previous_world[c] = world
+    # _build reads pose increments only through valid stored anchors, so only
+    # their bodies need the input pose.
+    if frame.body_a[c] >= 0:
+        previous_q[frame.body_a[c]] = q[frame.body_a[c]]
+    if frame.body_b[c] >= 0:
+        previous_q[frame.body_b[c]] = q[frame.body_b[c]]
 
 
 @wp.kernel(enable_backward=False)
@@ -742,6 +857,7 @@ class _FrictionPatchState:
         self.view.point_b = wp.zeros(n, dtype=wp.vec3, device=device)
         if not enabled:
             return
+        self.device = device
         # _prepare codes bodies as 1..body_count and static or missing shapes
         # above them, so every code is below key_stride. A pair key then needs
         # key_bits bits, and the sort skips the bits no key can set.
@@ -759,6 +875,17 @@ class _FrictionPatchState:
         self.previous = self._frame(capacity, device)
         self.previous_world = wp.full(capacity, -1, dtype=int, device=device)
         self.previous_q = wp.zeros(model.body_count, dtype=wp.transform, device=device)
+        # Live contact counts on the device. The finish epilogue alone writes the
+        # stored frame's count and _build the last built frame's; _prepare
+        # publishes the slots this frame visits and its live count. No launch
+        # reads a count it writes, so blocks never race on them.
+        self.stored = wp.zeros(1, dtype=int, device=device)
+        self.built = wp.zeros(1, dtype=int, device=device)
+        self.extent = wp.zeros(2, dtype=int, device=device)
+        # Fixed grids keep CUDA graph replay valid; threads stride over live slots.
+        blocks = device.sm_count if device.is_cuda else 1
+        self.threads = max(1, min(capacity, _LIGHT_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
+        self.build_threads = max(1, min(capacity, _BUILD_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
 
     def update_geometry(self, model):
         """Refresh scales and retire affected history after explicit geometry edits."""
@@ -811,8 +938,12 @@ class _FrictionPatchState:
     @staticmethod
     def _frame(n, device):
         frame = _PatchFrame()
+        # Every slot starts as the empty record _prepare writes: the sentinel key,
+        # its own index, and no owner or source. Bounded launches never revisit
+        # slots that still hold it.
         frame.keys = wp.full(2 * n, 0x7FFFFFFFFFFFFFFF, dtype=wp.int64, device=device)
         frame.indices = wp.zeros(2 * n, dtype=int, device=device)
+        wp.launch(_arange, dim=n, inputs=[frame.indices], device=device)
         for field in (
             "center",
             "normal",
@@ -841,6 +972,8 @@ class _FrictionPatchState:
             "members",
         ):
             setattr(frame, field, wp.zeros(n, dtype=int, device=device))
+        frame.owner.fill_(-1)
+        frame.source.fill_(-1)
         return frame
 
     def build(
@@ -865,7 +998,7 @@ class _FrictionPatchState:
             )
         wp.launch(
             _prepare,
-            dim=self.capacity,
+            dim=self.threads,
             inputs=[
                 contacts.rigid_contact_count,
                 contacts.rigid_contact_shape0,
@@ -888,9 +1021,13 @@ class _FrictionPatchState:
                 friction_gap,
                 int(friction_articulation_pairs_only),
                 self.key_stride,
+                self.stored,
+                self.built,
+                self.threads,
                 self.current,
                 self.view,
             ],
+            outputs=[self.extent],
             device=model.device,
         )
         # Empty slots hold INT64_MAX, whose low key_bits are all ones: no pair
@@ -898,33 +1035,96 @@ class _FrictionPatchState:
         wp.utils.radix_sort_pairs(self.current.keys, self.current.indices, self.capacity, end_bit=self.key_bits)
         wp.launch(
             _build,
-            dim=self.capacity,
+            dim=self.build_threads,
             inputs=[
-                contacts.rigid_contact_count,
+                self.extent,
+                self.stored,
                 state.body_q,
                 self.previous_q,
                 model.shape_transform,
                 model.shape_collision_radius,
+                self.build_threads,
                 self.current,
                 self.previous,
                 self.view,
             ],
+            outputs=[self.built],
             device=model.device,
         )
 
-    def store(self, state):
+    def link(self, world, slot, path, slots_needed, routes):
+        """Link the normal rows of each patch and share its Coulomb budget on the enabled routes."""
         wp.launch(
-            _store_history,
-            dim=max(self.capacity, self.previous_q.shape[0]),
+            link_patch_routes,
+            dim=self.threads,
+            inputs=[self.extent, self.view, world, slot, path, slots_needed, routes, self.threads],
+            device=self.device,
+        )
+
+    def seed(self, state, world, slot, path, slots_needed, routes):
+        """Transport cached patch impulses on the enabled routes, scaled by each route's decay."""
+        wp.launch(
+            seed_patch_routes,
+            dim=self.threads,
             inputs=[
+                self.extent,
+                self.current,
+                self.previous,
                 state.body_q,
+                world,
+                slot,
+                path,
+                slots_needed,
+                routes,
+                self.threads,
+            ],
+            device=self.device,
+        )
+
+    def finish(self, state_in, state_out, com, world, slot, path, slots_needed, routes, dt):
+        """Cache solved friction and release anchors on the enabled routes, then store the frame."""
+        self._finish(
+            state_in.body_q, state_out.body_q, state_out.body_qd, com, world, slot, path, slots_needed, routes, dt
+        )
+
+    def store(self, state):
+        """Store the current frame as built, without finishing any anchor."""
+        self._finish(state.body_q, None, None, None, None, None, None, None, _PatchRoutes(), 0.0)
+
+    def _finish(self, q, q_out, qd_out, com, world, slot, path, slots_needed, routes, dt):
+        wp.launch(
+            _finish_and_store,
+            dim=self.threads,
+            inputs=[
+                self.extent,
+                q,
+                q_out,
+                qd_out,
+                com,
                 self.body_world,
+                world,
+                slot,
+                path,
+                slots_needed,
+                routes,
+                dt,
+                self.threads,
                 self.current,
                 self.previous,
                 self.previous_world,
                 self.previous_q,
             ],
-            device=state.body_q.device,
+            outputs=[self.stored],
+            device=self.device,
+        )
+
+    def reset(self, world_mask):
+        """Drop the stored anchors of the masked worlds (all worlds without a mask)."""
+        wp.launch(
+            _reset_history,
+            dim=self.threads,
+            inputs=[world_mask, self.stored, self.threads, self.previous_world, self.previous.valid],
+            device=self.device,
         )
 
 
@@ -944,9 +1144,86 @@ def patch_normal_load(parents: wp.array2d[int], impulses: wp.array2d[float], wor
     return load
 
 
-@wp.kernel(enable_backward=False)
-def link_patch_rows(
-    count: wp.array[int],
+@wp.struct
+class _PatchRoutes:
+    """Row arrays of the contact routes that hold patch rows; ``enabled`` gates each route.
+
+    ``scale`` holds each route's warm-start decay, which only seeding reads.
+    """
+
+    enabled: wp.vec3i
+    scale: wp.vec3
+    parents0: wp.array2d[int]
+    parents1: wp.array2d[int]
+    parents2: wp.array2d[int]
+    mu0: wp.array2d[float]
+    mu1: wp.array2d[float]
+    mu2: wp.array2d[float]
+    impulses0: wp.array2d[float]
+    impulses1: wp.array2d[float]
+    impulses2: wp.array2d[float]
+
+
+def patch_routes(rows):
+    """Pack ``(route, parents, mu, impulses, scale)`` rows into one launch argument.
+
+    Routes absent from ``rows`` stay disabled, and no launch reads their arrays.
+    """
+    routes = _PatchRoutes()
+    enabled = [0, 0, 0]
+    scale = [0.0, 0.0, 0.0]
+    for route, parents, mu, impulses, decay in rows:
+        enabled[route] = 1
+        scale[route] = decay
+        setattr(routes, f"parents{route}", parents)
+        setattr(routes, f"mu{route}", mu)
+        setattr(routes, f"impulses{route}", impulses)
+    routes.enabled = wp.vec3i(*enabled)
+    routes.scale = wp.vec3(*scale)
+    return routes
+
+
+@wp.func
+def _contact_route(routes: _PatchRoutes, slot: wp.array[int], path: wp.array[int], c: int):
+    """Return the enabled route that holds contact ``c``'s rows, or -1 without rows."""
+    route = int(-1)
+    if routes.enabled[0] + routes.enabled[1] + routes.enabled[2] > 0 and slot[c] >= 0:
+        route = path[c]
+        if route < 0 or route > 2 or routes.enabled[route] == 0:
+            route = -1
+    return route
+
+
+@wp.func
+def _route_parents(routes: _PatchRoutes, route: int):
+    if route == 1:
+        return routes.parents1
+    if route == 2:
+        return routes.parents2
+    return routes.parents0
+
+
+@wp.func
+def _route_mu(routes: _PatchRoutes, route: int):
+    if route == 1:
+        return routes.mu1
+    if route == 2:
+        return routes.mu2
+    return routes.mu0
+
+
+@wp.func
+def _route_impulses(routes: _PatchRoutes, route: int):
+    if route == 1:
+        return routes.impulses1
+    if route == 2:
+        return routes.impulses2
+    return routes.impulses0
+
+
+@wp.func
+def _link_contact(
+    c: int,
     patches: FrictionPatches,
     world: wp.array[int],
     slot: wp.array[int],
@@ -958,13 +1235,10 @@ def link_patch_rows(
 ):
     """Link only allocated rows and divide the Coulomb budget among surviving anchors.
 
-    Row builders write the unscaled friction coefficient; this kernel divides it by
+    Row builders write the unscaled friction coefficient; linking divides it by
     the number of anchors that actually received rows, so the pooled normal load
     is shared exactly once.
     """
-    c = wp.tid()
-    if c >= count[0] or slot[c] < 0 or path[c] != route:
-        return
     row = patches.next_contact[c]
     if row < 0:
         return
@@ -985,6 +1259,50 @@ def link_patch_rows(
             mu[world[c], slot[c] + t] /= float(anchors)
 
 
+@wp.kernel(enable_backward=False)
+def link_patch_rows(
+    count: wp.array[int],
+    patches: FrictionPatches,
+    world: wp.array[int],
+    slot: wp.array[int],
+    path: wp.array[int],
+    slots_needed: wp.array[int],
+    route: int,
+    parents: wp.array2d[int],
+    mu: wp.array2d[float],
+):
+    """Link the allocated rows of one route; see :func:`_link_contact`."""
+    c = wp.tid()
+    if c >= count[0] or slot[c] < 0 or path[c] != route:
+        return
+    _link_contact(c, patches, world, slot, path, slots_needed, route, parents, mu)
+
+
+@wp.kernel(enable_backward=False)
+def link_patch_routes(
+    extent: wp.array[int],
+    patches: FrictionPatches,
+    world: wp.array[int],
+    slot: wp.array[int],
+    path: wp.array[int],
+    slots_needed: wp.array[int],
+    routes: _PatchRoutes,
+    threads: int,
+):
+    """Link the rows of every enabled route in one launch over the live contacts.
+
+    A contact writes only its own rows, on the route that holds them, so this
+    matches one launch per route.
+    """
+    thread = wp.tid()
+    for c in range(thread, extent[1], threads):
+        route = _contact_route(routes, slot, path, c)
+        if route >= 0:
+            parents = _route_parents(routes, route)
+            mu = _route_mu(routes, route)
+            _link_contact(c, patches, world, slot, path, slots_needed, route, parents, mu)
+
+
 @wp.func
 def contact_tangent_basis(n: wp.vec3):
     """Return the deterministic tangent pair every FeatherPGS friction row uses for ``n``."""
@@ -996,17 +1314,14 @@ def contact_tangent_basis(n: wp.vec3):
     return tangent0, tangent1
 
 
-@wp.kernel(enable_backward=False)
-def seed_patch_impulses(
-    count: wp.array[int],
+@wp.func
+def _seed_contact(
+    c: int,
     frame: _PatchFrame,
     prev: _PatchFrame,
     q: wp.array[wp.transform],
     world: wp.array[int],
     slot: wp.array[int],
-    path: wp.array[int],
-    slots_needed: wp.array[int],
-    route: int,
     parents: wp.array2d[int],
     mu: wp.array2d[float],
     impulses: wp.array2d[float],
@@ -1017,9 +1332,6 @@ def seed_patch_impulses(
     Anchors without patch history keep whatever the contact-matched warm start
     seeded; only carried anchors overwrite their friction rows.
     """
-    c = wp.tid()
-    if c >= count[0] or path[c] != route or slot[c] < 0 or slots_needed[c] != 3:
-        return
     source = frame.source[c]
     if source < 0:
         return
@@ -1042,6 +1354,57 @@ def seed_patch_impulses(
     impulses[w, s + 2] = value[1]
 
 
+@wp.kernel(enable_backward=False)
+def seed_patch_impulses(
+    count: wp.array[int],
+    frame: _PatchFrame,
+    prev: _PatchFrame,
+    q: wp.array[wp.transform],
+    world: wp.array[int],
+    slot: wp.array[int],
+    path: wp.array[int],
+    slots_needed: wp.array[int],
+    route: int,
+    parents: wp.array2d[int],
+    mu: wp.array2d[float],
+    impulses: wp.array2d[float],
+    scale: float,
+):
+    """Seed the friction rows of one route; see :func:`_seed_contact`."""
+    c = wp.tid()
+    if c >= count[0] or path[c] != route or slot[c] < 0 or slots_needed[c] != 3:
+        return
+    _seed_contact(c, frame, prev, q, world, slot, parents, mu, impulses, scale)
+
+
+@wp.kernel(enable_backward=False)
+def seed_patch_routes(
+    extent: wp.array[int],
+    frame: _PatchFrame,
+    prev: _PatchFrame,
+    q: wp.array[wp.transform],
+    world: wp.array[int],
+    slot: wp.array[int],
+    path: wp.array[int],
+    slots_needed: wp.array[int],
+    routes: _PatchRoutes,
+    threads: int,
+):
+    """Seed every enabled route in one launch over the live contacts, scaled by its decay.
+
+    A contact writes only its own friction rows and reads normal rows, which
+    seeding never writes, so this matches one launch per route.
+    """
+    thread = wp.tid()
+    for c in range(thread, extent[1], threads):
+        route = _contact_route(routes, slot, path, c)
+        if route >= 0 and slots_needed[c] == 3:
+            parents = _route_parents(routes, route)
+            mu = _route_mu(routes, route)
+            impulses = _route_impulses(routes, route)
+            _seed_contact(c, frame, prev, q, world, slot, parents, mu, impulses, routes.scale[route])
+
+
 @wp.func
 def _point_velocity(
     q: wp.array[wp.transform], qd: wp.array[wp.spatial_vector], com: wp.array[wp.vec3], body: int, anchor: wp.vec3
@@ -1052,9 +1415,9 @@ def _point_velocity(
     return velocity
 
 
-@wp.kernel(enable_backward=False)
-def finish_patch_impulses(
-    count: wp.array[int],
+@wp.func
+def _finish_contact(
+    c: int,
     frame: _PatchFrame,
     q: wp.array[wp.transform],
     q_out: wp.array[wp.transform],
@@ -1062,9 +1425,7 @@ def finish_patch_impulses(
     com: wp.array[wp.vec3],
     world: wp.array[int],
     slot: wp.array[int],
-    path: wp.array[int],
     slots_needed: wp.array[int],
-    route: int,
     parents: wp.array2d[int],
     mu: wp.array2d[float],
     impulses: wp.array2d[float],
@@ -1075,15 +1436,6 @@ def finish_patch_impulses(
     The tolerance is relative to geometry and timestep. Merely resting at the
     Coulomb limit does not prove sliding, so it must not erase static history.
     """
-    c = wp.tid()
-    if c >= count[0] or frame.valid[c] == 0:
-        return
-    if slot[c] < 0:
-        # Capacity rejection provides no solved normal load; preserve the
-        # geometrically supported history until rows are available again.
-        return
-    if path[c] != route:
-        return
     w = world[c]
     s = slot[c]
     load = patch_normal_load(parents, impulses, w, s)
@@ -1116,3 +1468,105 @@ def finish_patch_impulses(
     if radius > 0.0 and wp.length(tangent) >= (1.0 - 1.0e-5) * radius:
         if wp.dot(speed, tangent) < -radius * (1.0e-5 * frame.radius[c] / dt):
             frame.valid[c] = 0
+
+
+@wp.kernel(enable_backward=False)
+def finish_patch_impulses(
+    count: wp.array[int],
+    frame: _PatchFrame,
+    q: wp.array[wp.transform],
+    q_out: wp.array[wp.transform],
+    qd_out: wp.array[wp.spatial_vector],
+    com: wp.array[wp.vec3],
+    world: wp.array[int],
+    slot: wp.array[int],
+    path: wp.array[int],
+    slots_needed: wp.array[int],
+    route: int,
+    parents: wp.array2d[int],
+    mu: wp.array2d[float],
+    impulses: wp.array2d[float],
+    dt: float,
+):
+    """Finish the anchors of one route; see :func:`_finish_contact`."""
+    c = wp.tid()
+    if c >= count[0] or frame.valid[c] == 0:
+        return
+    if slot[c] < 0:
+        # Capacity rejection provides no solved normal load; preserve the
+        # geometrically supported history until rows are available again.
+        return
+    if path[c] != route:
+        return
+    _finish_contact(c, frame, q, q_out, qd_out, com, world, slot, slots_needed, parents, mu, impulses, dt)
+
+
+@wp.kernel(enable_backward=False)
+def _finish_and_store(
+    extent: wp.array[int],
+    q: wp.array[wp.transform],
+    q_out: wp.array[wp.transform],
+    qd_out: wp.array[wp.spatial_vector],
+    com: wp.array[wp.vec3],
+    body_world: wp.array[int],
+    world: wp.array[int],
+    slot: wp.array[int],
+    path: wp.array[int],
+    slots_needed: wp.array[int],
+    routes: _PatchRoutes,
+    dt: float,
+    threads: int,
+    frame: _PatchFrame,
+    prev: _PatchFrame,
+    previous_world: wp.array[int],
+    previous_q: wp.array[wp.transform],
+    stored: wp.array[int],
+):
+    """Finish each live anchor on its route, then store every slot this frame visits.
+
+    Finishing writes only the contact's own validity and tangent impulse and
+    reads other contacts only through the row arrays, so finishing and storing
+    contact by contact matches finishing every route before storing. Anchors
+    without rows (capacity rejection, or a disabled route) keep their history.
+    Thread 0 publishes the stored count, which this launch never reads.
+    """
+    thread = wp.tid()
+    live = extent[1]
+    if thread == 0:
+        stored[0] = live
+    for c in range(thread, extent[0], threads):
+        if c < live and frame.valid[c] != 0:
+            route = _contact_route(routes, slot, path, c)
+            if route >= 0:
+                parents = _route_parents(routes, route)
+                mu = _route_mu(routes, route)
+                impulses = _route_impulses(routes, route)
+                _finish_contact(c, frame, q, q_out, qd_out, com, world, slot, slots_needed, parents, mu, impulses, dt)
+        _store_contact(c, q, body_world, frame, prev, previous_world, previous_q)
+
+
+@wp.kernel(enable_backward=False)
+def _reset_history(
+    world_mask: wp.array[wp.bool],
+    stored: wp.array[int],
+    threads: int,
+    prev_world: wp.array[int],
+    prev_valid: wp.array[int],
+):
+    """Drop the stored anchors of reset worlds (all worlds for an empty mask).
+
+    Slots from the stored count on hold no anchor.
+    """
+    thread = wp.tid()
+    for c in range(thread, stored[0], threads):
+        if world_mask:
+            w = prev_world[c]
+            if w >= 0 and w < world_mask.shape[0] and not world_mask[w]:
+                continue
+        prev_valid[c] = 0
+
+
+@wp.kernel(enable_backward=False)
+def _arange(values: wp.array[int]):
+    i = wp.tid()
+    values[i] = i

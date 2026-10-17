@@ -11,13 +11,23 @@ import warp as wp
 from newton.tests.test_feather_pgs_friction_patches import _patch_fixture
 
 
+def _anchor_bodies(patches):
+    """Return the bodies of valid stored anchors, the only history poses a build reads."""
+    valid = patches.previous.valid.numpy() != 0
+    bodies = np.concatenate((patches.previous.body_a.numpy()[valid], patches.previous.body_b.numpy()[valid]))
+    return np.unique(bodies[bodies >= 0])
+
+
 class TestPatchHistoryWork(unittest.TestCase):
     def test_invalid_payload_is_not_published(self):
         """Retire stale anchors without reading or copying unused geometric payload."""
         devices = ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else [])
         for device in devices:
             with self.subTest(device=device):
-                _, state, _, patches = _patch_fixture([[-0.1, 0, 0], [0.1, 0, 0]], device=device)
+                model, state, contacts, patches = _patch_fixture([[-0.1, 0, 0], [0.1, 0, 0]], device=device)
+                # The fills below stand for a stored frame that used every slot.
+                patches.stored.fill_(patches.capacity)
+                patches.build(model, state, contacts)
                 valid = patches.current.valid.numpy().astype(bool)
                 self.assertEqual(valid.sum(), 2)
                 patches.previous.valid.fill_(1)
@@ -32,7 +42,9 @@ class TestPatchHistoryWork(unittest.TestCase):
                 n = patches.capacity
                 np.testing.assert_array_equal(patches.previous.keys.numpy()[:n], patches.current.keys.numpy()[:n])
                 np.testing.assert_array_equal(patches.previous.indices.numpy()[:n], patches.current.indices.numpy()[:n])
-                np.testing.assert_array_equal(patches.previous_q.numpy(), state.body_q.numpy())
+                bodies = _anchor_bodies(patches)
+                self.assertEqual(len(bodies), 2)
+                np.testing.assert_array_equal(patches.previous_q.numpy()[bodies], state.body_q.numpy()[bodies])
 
     def test_history_survives_population_changes(self):
         """Keep live anchors and retire empty or incomplete frames through graph replay."""
@@ -63,7 +75,9 @@ class TestPatchHistoryWork(unittest.TestCase):
                     self.assertEqual(np.count_nonzero(patches.previous.valid.numpy()), anchors)
                     if anchors == 0:
                         np.testing.assert_array_equal(patches.previous_world.numpy(), -1)
-                    np.testing.assert_array_equal(patches.previous_q.numpy(), state.body_q.numpy())
+                    bodies = _anchor_bodies(patches)
+                    self.assertEqual(len(bodies), 2 if anchors else 0)
+                    np.testing.assert_array_equal(patches.previous_q.numpy()[bodies], state.body_q.numpy()[bodies])
                 poses = state.body_q.numpy()
                 poses[10, 0] += 0.003
                 state.body_q.assign(poses)

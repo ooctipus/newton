@@ -237,7 +237,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         np.testing.assert_allclose(patches.view.weight.numpy()[:2], [1, 1])
 
     def test_pose_history_covers_bodies_beyond_contact_capacity(self):
-        """Capture every body pose even when the contact buffer is smaller."""
+        """Capture anchor body poses even when the body index exceeds the contact capacity."""
         model, state, contacts, patches = _patch_fixture([[0, 0, 0]], shape_bodies=(9, 10, 9))
         transforms = state.body_q.numpy()
         transforms[10, 0] = 0.002

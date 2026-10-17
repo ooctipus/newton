@@ -548,6 +548,8 @@ class TestFeatherPGSFrictionAnchorKernels(unittest.TestCase):
         )
         self.assertFalse(solver.pgs_warmstart)
         n = solver._friction_patches.previous.valid.shape[0]
+        # The fills below stand for a stored frame that used every slot.
+        solver._friction_patches.stored.fill_(n)
         worlds = np.arange(n, dtype=np.int32) % 2
         for mask, expect_cleared in (
             (None, (True, True)),

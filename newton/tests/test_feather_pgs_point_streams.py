@@ -38,14 +38,17 @@ _ARCH = "120"
 # may change; a change that adds a patch-only kernel lists it here.
 _PATCH_ONLY = frozenset(
     (
+        "friction_patches._arange",
         "friction_patches._build",
+        "friction_patches._finish_and_store",
         "friction_patches._invalidate_geometry_history",
         "friction_patches._prepare",
-        "friction_patches._store_history",
+        "friction_patches._reset_history",
         "friction_patches.finish_patch_impulses",
+        "friction_patches.link_patch_routes",
         "friction_patches.link_patch_rows",
         "friction_patches.seed_patch_impulses",
-        "kernels.reset_friction_anchor_history",
+        "friction_patches.seed_patch_routes",
     )
 )
 

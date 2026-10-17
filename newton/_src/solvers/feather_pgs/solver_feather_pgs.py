@@ -57,7 +57,7 @@ from .contact_torsion import (
 )
 from .dense_row_state import get_dense_row_state_kernel
 from .friction import FRICTION_PAIR_CUDA
-from .friction_patches import _FrictionPatchState, finish_patch_impulses, link_patch_rows, seed_patch_impulses
+from .friction_patches import _FrictionPatchState, patch_routes
 from .fused_dynamics import fused_dynamics_launch_shape, get_fused_dynamics_kernel, template_supported
 from .grouped_dynamics import (
     GroupedTopology,
@@ -200,7 +200,6 @@ from .kernels import (
     refresh_propagation_free_body_qd_from_vout,
     refresh_propagation_tree_body_qd_for_size,
     remove_free_root_transport_from_qdd,
-    reset_friction_anchor_history,
     reset_world_warmstart_buffers,
     rhs_accum_world_par_art,
     rhs_accum_world_par_row,
@@ -3595,12 +3594,7 @@ class SolverFeatherPGS(SolverBase):
         )
         if self._friction_anchors_enabled:
             # Use the world associated with each stored patch anchor.
-            wp.launch(
-                reset_friction_anchor_history,
-                dim=self._friction_patches.previous.valid.shape[0],
-                inputs=[world_mask, self._friction_patches.previous_world, self._friction_patches.previous.valid],
-                device=self.model.device,
-            )
+            self._friction_patches.reset(world_mask)
         if self._fk_id_cache_enabled:
             wp.launch(
                 invalidate_articulation_fk_id_cache,
@@ -10505,29 +10499,22 @@ class SolverFeatherPGS(SolverBase):
                     device=self.model.device,
                 )
 
-        if self._friction_anchors_enabled and contacts is not None:
-            for route, parents, mu, impulses, decay in self._patch_row_arrays():
-                if decay > 0.0:
-                    wp.launch(
-                        seed_patch_impulses,
-                        dim=contacts.rigid_contact_max,
-                        inputs=[
-                            contacts.rigid_contact_count,
-                            self._friction_patches.current,
-                            self._friction_patches.previous,
-                            state_in.body_q,
-                            self.contact_world,
-                            self.contact_slot,
-                            self.contact_path,
-                            self.contact_slots_needed,
-                            route,
-                            parents,
-                            mu,
-                            impulses,
-                            decay * (dt / self._ws_prev_dt if self._ws_prev_dt > 0.0 else 1.0),
-                        ],
-                        device=model.device,
-                    )
+        if self._friction_anchors_enabled and self._patch_frame_built(contacts):
+            ratio = dt / self._ws_prev_dt if self._ws_prev_dt > 0.0 else 1.0
+            seeded = [
+                (route, parents, mu, impulses, decay * ratio)
+                for route, parents, mu, impulses, decay in self._patch_row_arrays()
+                if decay > 0.0
+            ]
+            if seeded:
+                self._friction_patches.seed(
+                    state_in,
+                    self.contact_world,
+                    self.contact_slot,
+                    self.contact_path,
+                    self.contact_slots_needed,
+                    patch_routes(seeded),
+                )
 
         if self.pgs_mode != "matrix_free":
             self._stage6_apply_contact_regularization()
@@ -12950,27 +12937,25 @@ class SolverFeatherPGS(SolverBase):
                 friction_articulation_pairs_only=self.contact_friction_articulation_pairs_only,
             )
 
+    @staticmethod
+    def _patch_frame_built(contacts):
+        """Whether this step builds a patch frame, under the contact row stage's own condition."""
+        return (
+            contacts is not None
+            and getattr(contacts, "rigid_contact_count", None) is not None
+            and contacts.rigid_contact_max > 0
+        )
+
     def _link_friction_patches(self, contacts):
         """Link shared normal loads before any consumer packs row metadata."""
-        if self._friction_anchors_enabled and contacts is not None:
-            for route, parents, mu, _impulses, _decay in self._patch_row_arrays():
-                if parents is not None:
-                    wp.launch(
-                        link_patch_rows,
-                        dim=contacts.rigid_contact_max,
-                        inputs=[
-                            contacts.rigid_contact_count,
-                            self._friction_patches.view,
-                            self.contact_world,
-                            self.contact_slot,
-                            self.contact_path,
-                            self.contact_slots_needed,
-                            route,
-                            parents,
-                            mu,
-                        ],
-                        device=self.model.device,
-                    )
+        if self._friction_anchors_enabled and self._patch_frame_built(contacts):
+            self._friction_patches.link(
+                self.contact_world,
+                self.contact_slot,
+                self.contact_path,
+                self.contact_slots_needed,
+                self._patch_routes(),
+            )
 
     def _finish_friction_patches(self, state_in, state_out, contacts, dt):
         """Publish persistent patch history from the integrated public state."""
@@ -12979,30 +12964,23 @@ class SolverFeatherPGS(SolverBase):
         if contacts is None:
             self._friction_patches.previous.valid.zero_()
             return
-        for route, parents, mu, impulses, _decay in self._patch_row_arrays():
-            wp.launch(
-                finish_patch_impulses,
-                dim=contacts.rigid_contact_max,
-                inputs=[
-                    contacts.rigid_contact_count,
-                    self._friction_patches.current,
-                    state_in.body_q,
-                    state_out.body_q,
-                    state_out.body_qd,
-                    self.model.body_com,
-                    self.contact_world,
-                    self.contact_slot,
-                    self.contact_path,
-                    self.contact_slots_needed,
-                    route,
-                    parents,
-                    mu,
-                    impulses,
-                    dt,
-                ],
-                device=self.model.device,
-            )
-        self._friction_patches.store(state_in)
+        # A step without a frame holds no patch rows; it stores the last frame again.
+        routes = self._patch_routes() if self._patch_frame_built(contacts) else patch_routes(())
+        self._friction_patches.finish(
+            state_in,
+            state_out,
+            self.model.body_com,
+            self.contact_world,
+            self.contact_slot,
+            self.contact_path,
+            self.contact_slots_needed,
+            routes,
+            dt,
+        )
+
+    def _patch_routes(self):
+        """Pack the routes that can hold patch rows into one launch argument."""
+        return patch_routes(row for row in self._patch_row_arrays() if row[1] is not None)
 
     def _patch_row_arrays(self):
         """Yield possible contact routes and their configured warm-start decay."""
