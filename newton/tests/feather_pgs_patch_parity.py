@@ -6,8 +6,15 @@
 Contact slots come from per-world atomic reservations, and a patch normal row's
 parent names the slot of the next normal of its patch. These helpers key rows
 and anchor history by contact index instead, so two solvers that build the same
-rows in a different slot order compare equal. This module holds shared test
-helpers; it defines no tests.
+rows in a different slot order compare equal.
+
+Keying anchor rows by contact is sound only where one member carries each
+anchor. On a rectangular footprint the members of a support edge tie, and
+float32 rounding of their positions picks the member that carries the edge's
+friction rows; the anchor's location, the edge mean, does not move. The
+:func:`patch_rows` family keys normal rows by contact and anchor rows by their
+friction location, and compares impulses and history where they are well posed.
+This module holds shared test helpers; it defines no tests.
 """
 
 import numpy as np
@@ -193,9 +200,15 @@ def assert_history_close(a, b, *, atol=2e-5, rtol=7e-4):
     """Require identical anchor validity and matches, and close carried history.
 
     ``a`` and ``b`` are solvers or their patch states. Frames are indexed by
-    contact, so both must have stepped the same contacts.
+    contact, so both must have stepped the same contacts with the same contact
+    capacity.
     """
     first, second = (getattr(x, "_friction_patches", x) for x in (a, b))
+    if first.capacity != second.capacity:
+        raise AssertionError(
+            f"Patch histories hold {first.capacity} and {second.capacity} contact slots; construct both solvers "
+            "with the same model.rigid_contact_max (build the collision pipeline before the solver)"
+        )
     valid = first.previous.valid.numpy()
     np.testing.assert_array_equal(valid, second.previous.valid.numpy(), err_msg="previous.valid")
     np.testing.assert_array_equal(

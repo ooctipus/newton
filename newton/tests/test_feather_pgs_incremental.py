@@ -113,6 +113,10 @@ class TestFeatherPGSIncremental(unittest.TestCase):
 
 def _patch_case(model, incremental_rows):
     """Solve dense matrix-free rows under patch friction, optionally through the incremental kernel."""
+    # Sorted contacts: both arms see the same contact order, which the by-contact patch checks key on.
+    # The pipeline sets model.rigid_contact_max, which sizes the solver's contact and patch buffers, so it is
+    # built first: both arms then hold the same capacity on the shared model.
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=32, deterministic=True)
     solver = SolverFeatherPGS(
         model,
         pgs_mode="matrix_free",
@@ -128,8 +132,6 @@ def _patch_case(model, incremental_rows):
     )
     state, out, control = model.state(), model.state(), model.control()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-    # Sorted contacts: both arms see the same contact order, which the by-contact patch checks key on.
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=32, deterministic=True)
     return model, solver, state, out, control, pipeline, pipeline.contacts()
 
 
@@ -148,6 +150,7 @@ class TestFeatherPGSIncrementalPatch(unittest.TestCase):
             with self.subTest(fixture=name):
                 model = build()
                 reference, candidate = _patch_case(model, 0), _patch_case(model, 32)
+                self.assertEqual(reference[1]._friction_patches.capacity, candidate[1]._friction_patches.capacity)
                 self.assertEqual(reference[1]._incremental_rows, 0)
                 self.assertEqual(candidate[1]._incremental_rows, 32)
                 self.assertTrue(candidate[1]._pgs_solve_mf_gs_incremental_kernels)

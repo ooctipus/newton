@@ -206,6 +206,16 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "previous.displacement"):
             assert_history_close(*histories)
 
+    def test_history_comparison_requires_equal_capacity(self):
+        """Name both contact capacities instead of comparing differently sized histories slot by slot."""
+        square = [[x, y, 0.0] for x in (-0.05, 0.05) for y in (-0.05, 0.05)]
+        _model, state, _contacts, small = _patch_fixture(np.array(square, dtype=np.float32))
+        _model, _state, _contacts, large = _patch_fixture(np.array(square * 4, dtype=np.float32))
+        self.assertEqual((small.capacity, large.capacity), (8, 16))
+        small.store(state)
+        with self.assertRaisesRegex(AssertionError, "hold 8 and 16 contact slots"):
+            assert_history_close(small, large)
+
 
 if __name__ == "__main__":
     unittest.main()
