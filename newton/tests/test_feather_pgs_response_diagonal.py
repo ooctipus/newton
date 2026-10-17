@@ -426,27 +426,28 @@ def _unit_schedule_oracle(rows, marked):
     return {"sparse_row_dof": links, "group_count": group_count, "group_heads": group_heads, "serial": serial}
 
 
+def _unit_rows(rows, world, head):
+    """The rows of the unit ``head`` heads: its normal row, then the two tangent rows it owns, if any."""
+    owns_tangents = (
+        head + 2 < rows["row_count"][world]
+        and rows["row_type"][world, head + 1] == PGS_CONSTRAINT_TYPE_FRICTION
+        and rows["row_parent"][world, head + 1] == head
+    )
+    return [head, head + 1, head + 2] if owns_tangents else [head]
+
+
 def _unit_schedule_order(rows, schedule, world):
     """Rows in the unit schedule's order: independent chains by coordinate, the prefix, then serial units."""
-
-    def unit(head):
-        owns_tangents = (
-            head + 2 < rows["row_count"][world]
-            and rows["row_type"][world, head + 1] == PGS_CONSTRAINT_TYPE_FRICTION
-            and rows["row_parent"][world, head + 1] == head
-        )
-        return [head, head + 1, head + 2] if owns_tangents else [head]
-
     order = []
     for first in schedule["group_heads"][world, : schedule["group_count"][world]]:
         head = int(first)
         while head >= 0:
-            order += unit(head)
+            order += _unit_rows(rows, world, head)
             link = int(np.min(schedule["sparse_row_dof"][world, head]))
             head = -1 if link == -2 else -link - 3
     order += list(range(int(rows["bounds"][world, 1])))
     for head in schedule["serial"][world]:
-        order += unit(head)
+        order += _unit_rows(rows, world, head)
     return order
 
 
@@ -1080,14 +1081,17 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 _get_pgs_solve_sparse_diagonal_kernel(24, dense_dofs + 3, dense_dofs, "120", **kwargs)
 
     def test_unit_schedule_reorders_only_commuting_rows(self):
-        """Keep each patch ring in one independence class, and GS order on every coordinate.
+        """Keep GS order on every coordinate when sweeping in the unit schedule's order.
 
         The schedule oracle is the reference the CUDA unit builder must reproduce. Sweeping the
         rows in its order (independent chains first, then the prefix and the serial units) must give
-        exactly the impulses and velocities of the original row order.
+        exactly the impulses and velocities of the original row order, including on independent patch
+        rings that mix one- and three-row units. The members of a fixture ring share one coordinate, so
+        the oracle cannot split a ring's independence marks; the CUDA builder twin checks that property
+        on the kernel.
         """
         device = wp.get_device("cpu")
-        independent = serial = 0
+        independent = serial = mixed_rings = 0
         for seed, (capacity, contacts, prefix) in itertools.product(
             range(6), ((40, 10, 2), (64, 24, 2), (24, 12, 2), (32, 30, 0), (20, 40, 1))
         ):
@@ -1095,8 +1099,9 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 rows = _patch_unit_rows(seed, capacity=capacity, contacts=contacts, prefix=prefix)
                 schedule = _unit_schedule_oracle(rows, _mark_patch_units(rows, device))
                 for world, members in rows["rings"]:
-                    marks = {bool(np.any(schedule["sparse_row_dof"][world, member] < -1)) for member in members}
-                    self.assertEqual(len(marks), 1, f"ring {members} of world {world} split its marks")
+                    lengths = {len(_unit_rows(rows, world, head)) for head in members}
+                    if lengths == {1, 3} and np.any(schedule["sparse_row_dof"][world, members] < -1):
+                        mixed_rings += 1
                 independent += sum(int(count) for count in schedule["group_count"])
                 serial += sum(len(heads) for heads in schedule["serial"])
                 for iterations, friction_start in ((6, 0), (5, 2)):
@@ -1106,9 +1111,10 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                     )
                     for name, values in original.items():
                         np.testing.assert_array_equal(scheduled[name], values, err_msg=name)
-        # The fixtures exercise both phases.
+        # The fixtures exercise both phases, and independent rings whose loads cross unit lengths.
         self.assertGreater(independent, 50)
         self.assertGreater(serial, 50)
+        self.assertGreater(mixed_rings, 20)
 
     @unittest.skipUnless(wp.is_cuda_available(), "independent contact units require CUDA")
     def test_independent_sparse_contact_units_keep_rings_together(self):
