@@ -991,12 +991,14 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         # Worlds 1.5 m and 10 m from the origin.
         for spacing, heading in itertools.product((3.0, 20.0), (0.75 * np.pi + 0.4, np.pi + 0.4)):
             with self.subTest(spacing=spacing, heading=heading), wp.ScopedDevice("cpu"):
-                yaw_rate, deceleration = self._slide_box(heading, spacing)
+                yaw_rate, deceleration, weights = self._slide_box(heading, spacing)
+                # Each sliding box keeps its two edge anchors, so patch friction carries the load.
+                self.assertEqual(weights, {(0.5, 0.5)})
                 self.assertLess(yaw_rate, 5.0e-3)
                 np.testing.assert_allclose(deceleration, 0.5 * 9.81, rtol=1.0e-3)
 
     def _slide_box(self, heading, spacing):
-        """Return the largest yaw rate while sliding and each world's fitted deceleration."""
+        """Return the largest yaw rate while sliding, each world's fitted deceleration and the anchor weights seen."""
         scene = newton.ModelBuilder()
         cfg = newton.ModelBuilder.ShapeConfig(mu=0.5)
         box = scene.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()))
@@ -1006,12 +1008,14 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         builder.add_ground_plane(cfg=cfg)
         model = builder.finalize()
         solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split", pgs_iterations=8)
+        self.assertTrue(solver._friction_anchors_enabled)
         pipeline = newton.CollisionPipeline(model)
         contacts = pipeline.contacts()
         states = [model.state(), model.state()]
         control = model.control()
+        shape_body, body_world = model.shape_body.numpy(), model.body_world.numpy()
         direction = np.array([np.cos(heading), np.sin(heading), 0.0])
-        speeds, yaw_rates = [], []
+        speeds, yaw_rates, weights = [], [], set()
         for step in range(84):
             if step == 24:
                 # Launch every settled box at 1 m/s.
@@ -1028,13 +1032,22 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 body_qd = states[0].body_qd.numpy()
                 speeds.append(body_qd[:, :3] @ direction)
                 yaw_rates.append(body_qd[:, 5].copy())
+                count = int(contacts.rigid_contact_count.numpy()[0])
+                weight = solver._friction_patches.view.weight.numpy()[:count]
+                bodies = np.maximum(
+                    shape_body[contacts.rigid_contact_shape0.numpy()[:count]],
+                    shape_body[contacts.rigid_contact_shape1.numpy()[:count]],
+                )
+                for world in np.flatnonzero(speeds[-1] > 0.2):
+                    held = (body_world[bodies] == world) & (weight > 0.0)
+                    weights.add(tuple(float(w) for w in np.sort(weight[held])))
         speeds, yaw_rates = np.array(speeds), np.array(yaw_rates)
         times = np.arange(len(speeds)) / 240.0
         deceleration = []
         for world in range(model.world_count):
             sliding = (speeds[:, world] > 0.2) & (speeds[:, world] < 0.8)
             deceleration.append(-np.polyfit(times[sliding], speeds[sliding, world], 1)[0])
-        return float(np.abs(yaw_rates[speeds > 1.0e-3]).max()), np.array(deceleration)
+        return float(np.abs(yaw_rates[speeds > 1.0e-3]).max()), np.array(deceleration), weights
 
     def test_default_patch_friction_and_explicit_opt_out(self):
         """Build persistent patches by default while retaining an explicit velocity-only opt-out."""
