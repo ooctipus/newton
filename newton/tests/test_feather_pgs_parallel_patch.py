@@ -892,6 +892,24 @@ def _sliding_boxes(device, speeds, *, mu=0.5):
     return model
 
 
+def _assert_tier_owned(test, solver, budget):
+    """Require the parallel tiers to have solved every world with rows in the last step.
+
+    A tier takes a world with at most ``budget`` dense rows and no matrix-free rows,
+    unless a local owner holds it; the serial sweep returns early for exactly those
+    worlds, so a world in that domain is the tier's (``skip_incremental_rows``).
+    """
+    test.assertEqual(solver._ink_rows, budget)
+    test.assertTrue(solver._pgs_solve_mf_gs_incremental_kernels)
+    test.assertFalse(solver._local_internal_fast_path)
+    counts, free_rows = solver.constraint_count.numpy(), solver.mf_constraint_count.numpy()
+    test.assertGreater(int(counts.max()), 0)
+    for world, (rows, mf_rows) in enumerate(zip(counts, free_rows, strict=True)):
+        if rows:
+            test.assertLessEqual(int(rows), budget, f"world {world}")
+            test.assertEqual(int(mf_rows), 0, f"world {world}")
+
+
 def _friction_pairs(solver, world):
     """Each friction pair's impulse magnitude and pooled budget ``mu * (ring's normal impulses)``."""
     count = int(solver.constraint_count.numpy()[world])
@@ -970,10 +988,17 @@ class TestPatchParallelRoutes(unittest.TestCase):
 class TestPatchParallelPhysics(unittest.TestCase):
     """Compare each law's parallel tiers with its serial sweep, the patch gap bounded by the point gap.
 
-    Parallel tiers are Jacobi sweeps, not float reorderings of the serial sweep, so
-    a law's parallel and serial rollouts differ by its convergence gap. The point
-    tiers' measured gap on the same fixture, with a floor at the float-order
-    tolerance of an exact route change, bounds the patch tiers' gap.
+    Parallel tiers are Jacobi sweeps, not float reorderings of the serial sweep.
+    While every pair sticks the two schemes share their fixed point, and the
+    rollouts differ by the convergence gap. Once a pair slides they do not: the
+    tiers scale the pair radially after per-row step scales, which turns its
+    sliding direction and, through the coupling, moves the normals and the body
+    velocity, for point and patch friction alike (on this module's reference case
+    the converged velocities of the two schemes differ by 4-15 % for either law).
+    So the point tiers' measured gap on the same fixture, with a floor at the
+    float-order tolerance of an exact route change, bounds the patch tiers' gap.
+    Every parallel step must leave each world in the tiers' domain, so the
+    comparison is never serial against serial.
     """
 
     def test_standing_feet_match_the_serial_patch_sweep(self):
@@ -990,6 +1015,8 @@ class TestPatchParallelPhysics(unittest.TestCase):
                     for name in _STATE_FIELDS:
                         self.assertTrue(np.isfinite(getattr(state, name).numpy()).all(), name)
                     self.assertFalse(solver.constraint_overflow.numpy().any())
+                    if parallel_rows:
+                        _assert_tier_owned(self, solver, parallel_rows)
                     if beta and parallel_rows:
                         # Every stored parallel iterate lies in its pooled cone; a serial sweep's last
                         # pair update can precede a ring normal's, so only the tiers hold it exactly.
@@ -1000,8 +1027,9 @@ class TestPatchParallelPhysics(unittest.TestCase):
                 states[beta, parallel_rows] = _rollout(model, solver, 24, after_step=check)[0]
         point_gap = _state_differences(states[0.0, 32], states[0.0, 0])
         patch_gap = _state_differences(states[0.2, 32], states[0.2, 0])
+        measured = {"point_gap": point_gap, "patch_gap": patch_gap}
         for name in _STATE_FIELDS:
-            self.assertLessEqual(patch_gap[name], 3.0 * point_gap[name] + _STATE_FLOOR[name], (name, point_gap))
+            self.assertLessEqual(patch_gap[name], 3.0 * point_gap[name] + _STATE_FLOOR[name], (name, measured))
 
     def test_box_rests_and_slides_like_the_serial_patch_sweep(self):
         """Hold a resting box, and stop a sliding one where the serial patch sweep stops it.
@@ -1018,14 +1046,14 @@ class TestPatchParallelPhysics(unittest.TestCase):
             for beta, parallel_rows in itertools.product((0.0, 0.2), (0, 32)):
                 ratios = []
 
-                def check(step, solver, contacts, state, ratios=ratios):
+                def check(step, solver, contacts, state, ratios=ratios, parallel_rows=parallel_rows):
+                    if parallel_rows:
+                        _assert_tier_owned(self, solver, parallel_rows)
                     if 2 <= step <= 30:  # sliding: every friction pair sits on its cone
                         pairs = _friction_pairs(solver, world=1)
                         ratios.extend(magnitude / budget for magnitude, budget in pairs if budget > 0.0)
 
                 solver = _matrix_free_solver(model, beta=beta, parallel_rows=parallel_rows)
-                if parallel_rows:
-                    self.assertTrue(solver._pgs_solve_mf_gs_incremental_kernels)
                 state, _ = _rollout(model, solver, 96, after_step=check)
                 q, qd = state.joint_q.numpy(), state.joint_qd.numpy()
                 with self.subTest(beta=beta, parallel_rows=parallel_rows):
