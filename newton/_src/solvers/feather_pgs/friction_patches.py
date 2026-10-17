@@ -71,7 +71,8 @@ class PatchRowLaw:
     A tangent row acts at its patch's friction location, carries the anchor's tangential
     displacement as phi and corrects it with ``beta`` (``friction_anchor_beta``). Producers write
     the undivided friction coefficient; the patch link (``_FrictionPatchState.link``, which
-    launches ``link_patch_routes``) divides it and links the ring.
+    launches ``link_patch_routes``) divides it and links the ring. Producers apply the law through
+    :func:`patch_row_frame` and :func:`patch_tangent_row`.
     """
 
     patches: FrictionPatches
@@ -82,6 +83,51 @@ class PatchRowLaw:
 def patch_friction_location(patches: FrictionPatches, c: int):
     """Return contact ``c``'s friction location on each side, in world coordinates."""
     return patches.point_a[c], patches.point_b[c]
+
+
+@wp.func
+def patch_row_frame(
+    row: int,
+    shared_anchor: int,
+    normal: wp.vec3,
+    tangent0: wp.vec3,
+    tangent1: wp.vec3,
+    point0: wp.vec3,
+    point1: wp.vec3,
+    friction0: wp.vec3,
+    friction1: wp.vec3,
+):
+    """Return contact row ``row``'s direction and endpoints under the patch row law.
+
+    The normal row (row 0) acts at the contact points ``point0`` and ``point1``, or at their
+    midpoint with ``shared_anchor``. Tangent rows 1 and 2 act along ``tangent0`` and ``tangent1``
+    at the friction location ``friction0`` and ``friction1`` (:func:`patch_friction_location`),
+    which takes the place of both shared anchors.
+    """
+    direction = normal
+    p0 = point0
+    p1 = point1
+    if row == 0:
+        if shared_anchor != 0:
+            p0 = 0.5 * (point0 + point1)
+            p1 = p0
+    else:
+        direction = tangent0
+        if row == 2:
+            direction = tangent1
+        p0 = friction0
+        p1 = friction1
+    return direction, p0, p1
+
+
+@wp.func
+def patch_tangent_row(law: PatchRowLaw, c: int, row: int, mu: float, friction_scale: float):
+    """Return contact ``c``'s tangent row ``row`` (1 or 2): its phi, beta and friction coefficient.
+
+    The coefficient is the undivided ``mu * friction_scale``; the patch link divides it among the
+    ring's anchors.
+    """
+    return law.patches.phi[c][row - 1], law.beta, mu * friction_scale
 
 
 @wp.struct

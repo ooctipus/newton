@@ -13,7 +13,7 @@ links the patch rings and divides the friction coefficient; its
 
 import warp as wp
 
-from .friction_patches import PatchRowLaw, patch_friction_location
+from .friction_patches import PatchRowLaw, patch_friction_location, patch_row_frame, patch_tangent_row
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -404,8 +404,10 @@ def _produce_patch_contact(data: ContactBoundaryData, law: PatchRowLaw, contact:
     """Publish one contact's rows with the persistent patch friction law.
 
     The normal row is ``_produce_contact``'s. Tangent rows, present only when the
-    contact owns an anchor, act at the patch friction location, carry the anchor's
-    tangential phi with ``law.beta``, and keep the undivided friction coefficient.
+    contact owns an anchor, follow the patch row law (``patch_row_frame`` and
+    ``patch_tangent_row``): they act at the patch friction location, carry the
+    anchor's tangential phi with ``law.beta``, and keep the undivided friction
+    coefficient.
     """
     if contact >= wp.min(data.count[0], data.point0.shape[0]):
         return
@@ -448,24 +450,12 @@ def _produce_patch_contact(data: ContactBoundaryData, law: PatchRowLaw, contact:
         mu /= float(materials)
     restitution = mixed_contact_restitution(shape0, shape1, data.material_restitution)
     tangent0, tangent1 = contact_tangent_basis(normal)
-    anchor = 0.5 * (point0 + point1)
     friction0, friction1 = patch_friction_location(law.patches, contact)
     group = data.dense_group[world]
     for row in range(data.slots_needed[contact]):
-        direction = normal
-        p0 = point0
-        p1 = point1
-        if row == 0:
-            if data.shared_anchor != 0:
-                p0 = anchor
-                p1 = anchor
-        else:
-            if row == 1:
-                direction = tangent0
-            else:
-                direction = tangent1
-            p0 = friction0
-            p1 = friction1
+        direction, p0, p1 = patch_row_frame(
+            row, data.shared_anchor, normal, tangent0, tangent1, point0, point1, friction0, friction1
+        )
         output_row = slot + row
         target = prescribed_relative_contact_target(
             body0, art0, body1, art1, p0, p1, direction, data.prescribed, data.origin, data.body_v
@@ -480,11 +470,12 @@ def _produce_patch_contact(data: ContactBoundaryData, law: PatchRowLaw, contact:
             data.phi[world, output_row] = phi
             data.restitution[world, output_row] = restitution
         else:
+            tangent_phi, beta, friction_mu = patch_tangent_row(law, contact, row, mu, data.friction_scale)
             data.row_type[world, output_row] = PGS_CONSTRAINT_TYPE_FRICTION
             data.row_parent[world, output_row] = slot
-            data.row_mu[world, output_row] = mu * data.friction_scale
-            data.row_beta[world, output_row] = law.beta
-            data.phi[world, output_row] = law.patches.phi[contact][row - 1]
+            data.row_mu[world, output_row] = friction_mu
+            data.row_beta[world, output_row] = beta
+            data.phi[world, output_row] = tangent_phi
             data.restitution[world, output_row] = 0.0
         _publish_row_response(data, world, output_row, group, has_dense, art0, body0, art1, body1, direction, p0, p1)
 

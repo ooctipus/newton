@@ -28,7 +28,7 @@ import warp as wp
 
 from ...sim import ModelFlags
 from .contact_input import ContactInput, bind
-from .friction_patches import PatchRowLaw, patch_friction_location
+from .friction_patches import PatchRowLaw, patch_friction_location, patch_row_frame, patch_tangent_row
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -767,39 +767,6 @@ def materialize_fallback(
                 J[group1, output_row, dof] = value1
 
 
-@wp.func
-def patch_row_frame(
-    data: ContactInput,
-    row: int,
-    normal: wp.vec3,
-    tangent0: wp.vec3,
-    tangent1: wp.vec3,
-    point0: wp.vec3,
-    point1: wp.vec3,
-    friction0: wp.vec3,
-    friction1: wp.vec3,
-):
-    """Return a patch contact row's direction and endpoints.
-
-    The normal row acts at the contact points, or at their midpoint with a shared anchor. Tangent
-    rows act at the patch friction location, which takes the place of both shared anchors.
-    """
-    direction = normal
-    p0 = point0
-    p1 = point1
-    if row == 0:
-        if data.shared_anchor != 0:
-            p0 = 0.5 * (point0 + point1)
-            p1 = p0
-    else:
-        direction = tangent0
-        if row == 2:
-            direction = tangent1
-        p0 = friction0
-        p1 = friction1
-    return direction, p0, p1
-
-
 @wp.kernel(enable_backward=False)
 def produce_patch_contacts(
     workers: int, data: ContactInput, law: PatchRowLaw, packet: ContactPacketData, primary: int, secondary: int
@@ -807,8 +774,9 @@ def produce_patch_contacts(
     """Project current contacts into physical packets with the persistent patch friction law.
 
     The normal row's metadata and packet are those of :func:`produce_contacts`. Tangent rows, present
-    only when the contact owns an anchor, act at the patch friction location, carry the anchor's
-    tangential phi with ``law.beta`` and keep the undivided friction coefficient. Every bias takes
+    only when the contact owns an anchor, follow the patch row law that the compact producer shares
+    (``patch_row_frame`` and ``patch_tangent_row``): they act at the patch friction location, carry
+    the anchor's tangential phi with ``law.beta`` and keep the undivided coefficient. Every bias takes
     ``compute_world_contact_bias``'s form, ``x * (1 / dt)``, where :func:`produce_contacts` forms
     ``x / dt``, so the rows equal the general route's bitwise. A bouncing normal row sums its incident
     velocity per body, as :func:`produce_contacts` does, instead of per world coordinate. It agrees
@@ -859,7 +827,7 @@ def produce_patch_contacts(
                     size = secondary
                     dof -= primary
                 direction, p0, p1 = patch_row_frame(
-                    data, row, normal, tangent0, tangent1, point0, point1, friction0, friction1
+                    row, data.shared_anchor, normal, tangent0, tangent1, point0, point1, friction0, friction1
                 )
                 value = endpoint_projection(data, body0, art0, size, dof, p0, direction)
                 value -= endpoint_projection(data, body1, art1, size, dof, p1, direction)
@@ -884,7 +852,7 @@ def produce_patch_contacts(
             for row in range(rows):
                 output_row = slot + row
                 direction, p0, p1 = patch_row_frame(
-                    data, row, normal, tangent0, tangent1, point0, point1, friction0, friction1
+                    row, data.shared_anchor, normal, tangent0, tangent1, point0, point1, friction0, friction1
                 )
                 target = prescribed_relative_contact_target(
                     body0, art0, body1, art1, p0, p1, direction, data.prescribed, data.origin, data.body_v
@@ -911,10 +879,8 @@ def produce_patch_contacts(
                             rhs = -target + restitution * relative
                             weight = 1.0
                 else:
-                    phi = law.patches.phi[contact][row - 1]
-                    beta = law.beta
+                    phi, beta, row_mu = patch_tangent_row(law, contact, row, mu, data.friction_scale)
                     row_restitution = 0.0
-                    row_mu = mu * data.friction_scale
                     kind = int(PGS_CONSTRAINT_TYPE_FRICTION)
                     parent = slot
                     rhs += data.bias_scale * beta * phi * inv_dt
@@ -970,7 +936,7 @@ def materialize_patch_fallback(
             row = coefficient // target_size
             dof = coefficient % target_size
             direction, p0, p1 = patch_row_frame(
-                data, row, normal, tangent0, tangent1, point0, point1, friction0, friction1
+                row, data.shared_anchor, normal, tangent0, tangent1, point0, point1, friction0, friction1
             )
             value0 = endpoint_projection(data, body0, art0, target_size, dof, p0, direction)
             value1 = -endpoint_projection(data, body1, art1, target_size, dof, p1, direction)

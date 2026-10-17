@@ -14,7 +14,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import kernels
+from newton._src.solvers.feather_pgs import compact_contact, friction_patches, kernels
 from newton._src.solvers.feather_pgs import row_packets as rp
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, link_patch_rows
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
@@ -283,6 +283,19 @@ def _owned_rows(data):
     return owned
 
 
+def _called_functions(kernel):
+    """Return the user functions a kernel calls, directly or through the functions it calls."""
+    called, pending = set(), [kernel.adj]
+    while pending:
+        _, _, functions = pending.pop().get_references()
+        for function in functions:
+            if not function.is_builtin() and function not in called:
+                called.add(function)
+                overloads = {**function.user_overloads, **function.user_templates}.values()
+                pending.extend(overload.adj for overload in overloads if overload.generic_parent is None)
+    return called
+
+
 def _link(data, layout, rows):
     """Link the rows' patch rings and divide their coefficients, as the patch link does after the producer."""
     routing = (data.world, data.slot, data.path, data.slots_needed)
@@ -537,7 +550,27 @@ class _PatchRowTwins:
 
 
 class TestRowPacketPatchRows(_PatchRowTwins, unittest.TestCase):
-    """CPU twins, and the owner's choice of the friction law."""
+    """CPU twins, the owner's choice of the friction law, and the shared row law."""
+
+    def test_patch_producers_share_one_row_law(self):
+        """Write patch rows through one shared row law in the packet and compact producers.
+
+        The general route's row kernels serve point friction too and keep their own copy, which the
+        twins compare against.
+        """
+        producers = (
+            rp.produce_patch_contacts,
+            rp.materialize_patch_fallback,
+            compact_contact.produce_patch_contacts,
+            compact_contact._produce_ordered_patch_contacts,
+        )
+        for kernel in producers:
+            name = f"{kernel.func.__module__}.{kernel.key}"
+            called = _called_functions(kernel)
+            self.assertIn(friction_patches.patch_row_frame, called, name)
+            # The fallback writes Jacobians alone; the producers also write the tangent rows' metadata.
+            if kernel is not rp.materialize_patch_fallback:
+                self.assertIn(friction_patches.patch_tangent_row, called, name)
 
     def test_owner_launches_the_friction_law_it_was_built_with(self):
         """Launch the patch producer and fallback exactly under anchors, with the solver's patch view and beta.
