@@ -290,6 +290,68 @@ def run_candidate(data, aux, law=None):
     )
 
 
+# Solver attributes that launch_contacts binds, by the ContactBoundaryData field they fill.
+_LAUNCH_FIELDS = {
+    "contact_world": "world",
+    "contact_slot": "slot",
+    "contact_art_a": "art0",
+    "contact_art_b": "art1",
+    "contact_path": "path",
+    "contact_slots_needed": "slots_needed",
+    "body_response_dof_mask": "body_mask",
+    "body_single_response_dof": "body_single_dof",
+    "articulation_response_dof_count": "response_dofs",
+    "articulation_dof_start": "dof_start",
+    "articulation_world_dof_offset": "dof_offset",
+    "articulation_origin": "origin",
+    "_prescribed_articulation": "prescribed",
+    "shape_material_mu": "material_mu",
+    "shape_material_restitution": "material_restitution",
+    "_diagonal_inverse_mass": "inverse_mass",
+    "_sparse_diagonal_dense_groups": "dense_group",
+    "_sparse_diagonal_response_size": "sparse_size",
+    "contact_friction_scale": "friction_scale",
+    "pgs_beta": "beta",
+    "pgs_cfm": "cfm",
+    "row_type": "row_type",
+    "row_parent": "row_parent",
+    "row_mu": "row_mu",
+    "row_beta": "row_beta",
+    "row_cfm": "row_cfm",
+    "phi": "phi",
+    "target_velocity": "target",
+    "row_restitution": "restitution",
+    "_sparse_diagonal_row_dof": "sparse_dof",
+    "_sparse_diagonal_row_jy": "sparse_jy",
+    "diag": "diag",
+    "contact_shared_anchor": "shared_anchor",
+    "contact_friction_shared_anchor": "friction_shared_anchor",
+}
+
+
+def launch_solver(data, aux, *, anchors, order=None, beta=0.0):
+    """A solver namespace holding what ``launch_contacts`` binds, over the fixture's arrays.
+
+    ``anchors`` turns on persistent patch friction with an enabled patch view and ``friction_anchor_beta``
+    ``beta``; ``order`` is the contact schedule, or ``None`` for collision order.
+    """
+    return SimpleNamespace(
+        **{name: getattr(data, field) for name, field in _LAUNCH_FIELDS.items()},
+        world_count=2,
+        slot_counter=aux.counts,
+        dense_phase_bounds=aux.bounds,
+        model=SimpleNamespace(device=aux.device, shape_body=data.shape_body),
+        L_by_size={6: data.factor},
+        J_by_size={6: data.J},
+        Y_by_size={6: data.Y},
+        _mark_independent_sparse_contact_candidates_kernel=object(),
+        _compact_contact_order=order,
+        _friction_anchors_enabled=anchors,
+        _friction_patches=SimpleNamespace(view=patch_view(aux.device) if anchors else FrictionPatches()),
+        friction_anchor_beta=beta,
+    )
+
+
 def geometry_reference(data):
     """Independent FP64 point-velocity construction, without reading any produced row."""
     names = (
@@ -614,6 +676,58 @@ class TestCompactContact(unittest.TestCase):
             device=aux.device,
         )
         self.compare(reference, candidate, aux)
+
+    def test_launch_binds_the_friction_law_of_the_solver(self):
+        """Launch the patch producer exactly when anchors are on, with the solver's patch view and beta.
+
+        The tests above check the producers' rows; this checks the selection in ``launch_contacts``, in
+        collision order and through the contact schedule.
+        """
+        data, aux = fixture(rows=(3, 1, 1, 3, 3, 3, 1, 3))
+        contacts = SimpleNamespace(
+            rigid_contact_max=16,
+            **{
+                "rigid_contact_" + name: getattr(data, name)
+                for name in ("count", "point0", "point1", "normal", "shape0", "shape1", "margin0", "margin1")
+            },
+        )
+        producers = {
+            (False, False): compact.produce_contacts,
+            (True, False): compact.produce_patch_contacts,
+            (False, True): compact._produce_ordered_contacts,
+            (True, True): compact._produce_ordered_patch_contacts,
+        }
+        for (anchors, ordered), producer in producers.items():
+            with self.subTest(anchors=anchors, ordered=ordered):
+                order = compact._ContactOrder(16, 2, 40, aux.device) if ordered else None
+                solver = launch_solver(data, aux, anchors=anchors, order=order, beta=0.375 if anchors else 0.0)
+                with mock.patch.object(compact.wp, "launch") as launch:
+                    compact.launch_contacts(
+                        solver,
+                        SimpleNamespace(body_q=data.body_q),
+                        SimpleNamespace(body_v_s=data.body_v, joint_S_s=data.motion),
+                        contacts,
+                        16,
+                    )
+                schedule = [compact._build_contact_order] if ordered else []
+                marker = solver._mark_independent_sparse_contact_candidates_kernel
+                self.assertEqual(
+                    [call.args[0] for call in launch.call_args_list],
+                    [compact.clear_contact_response, *schedule, producer, marker],
+                )
+                produce = launch.call_args_list[-2]
+                self.assertEqual(produce.kwargs["dim"], 16)
+                inputs = produce.kwargs["inputs"]
+                # The data, then the patch row law under anchors, then the schedule's order.
+                self.assertEqual(len(inputs), 1 + int(anchors) + int(ordered))
+                if ordered:
+                    self.assertIs(inputs[-1], order.order)
+                if anchors:
+                    law, view = inputs[1], solver._friction_patches.view
+                    self.assertEqual(law.beta, 0.375)
+                    self.assertEqual(law.patches.enabled, 1)
+                    for name in ("weight", "next_contact", "point_a", "point_b", "phi"):
+                        self.assertIs(getattr(law.patches, name), getattr(view, name), name)
 
     def test_empty_and_growing_prefix_with_poison(self):
         """Overwrite every active row through empty, growing and shrinking prefix cases."""
