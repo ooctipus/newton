@@ -6,9 +6,13 @@
 Random contact frames cover static and missing shapes, flipped pair orientation,
 several contacts per pair, empty tails and overflowing counts. The reference
 copies the patch kernels as of 98401301 (:mod:`feather_pgs_patch_reference`);
-pair keys compare through their decoded body and shape codes.
+pair keys compare through their decoded body and shape codes. A solver-level
+check covers the route tables and warm-start scales the solver passes to the
+patch state.
 """
 
+import contextlib
+import inspect
 import itertools
 import unittest
 from types import SimpleNamespace
@@ -17,9 +21,11 @@ from unittest import mock
 import numpy as np
 import warp as wp
 
+import newton
 from newton._src.solvers.feather_pgs import friction_patches
 from newton._src.solvers.feather_pgs.friction_patches import _FrictionPatchState, _PatchFrame, patch_routes
 from newton.tests.feather_pgs_patch_reference import SENTINEL, ReferencePatches, pair_codes
+from newton.tests.test_feather_pgs_mixed_tree_free_body import _build as _arm_over_box
 
 _PIECE_OFFSET = 0.04
 
@@ -786,6 +792,84 @@ def run_graph_replay(device, *, worlds=32, contacts=1536, capacity=2048, live_so
         assert_same_patches(patches, reference, live, f"replay {index} {mode}")
         assert_empty_tail(patches, f"replay {index} {mode}")
         _assert_same_rows(routes, their_routes, f"replay {index} {mode}")
+
+
+@contextlib.contextmanager
+def _record_patch_routes(patches):
+    """Record ``(method, routes)`` for every link, seed and finish call the solver makes on ``patches``."""
+    calls = []
+    with contextlib.ExitStack() as stack:
+        for name in ("link", "seed", "finish"):
+            method = getattr(patches, name)
+
+            def record(*args, _name=name, _method=method, **kwargs):
+                calls.append((_name, inspect.signature(_method).bind(*args, **kwargs).arguments["routes"]))
+                return _method(*args, **kwargs)
+
+            stack.enter_context(mock.patch.object(patches, name, record))
+        yield calls
+
+
+class TestPatchSolverRoutes(unittest.TestCase):
+    def test_solver_passes_every_patch_route(self):
+        """Link, seed and finish every route that holds patch rows; seed with its decay times dt over the last dt."""
+        # Split mode on the CPU routes the fixed-base arm's contacts through dense
+        # rows and the free box's through matrix-free rows; matrix-free mode with
+        # propagation rows on CUDA enables all three routes.
+        configs = [("cpu", {"pgs_mode": "split"}, (1, 1, 0))]
+        if wp.is_cuda_available():
+            propagation = {"pgs_mode": "matrix_free", "articulated_contact_response": "propagation"}
+            configs.append(("cuda:0", propagation, (1, 1, 1)))
+        dts = (1.0 / 240.0, 1.0 / 240.0, 1.0 / 120.0, 1.0 / 480.0)
+        for (device, mode, enabled), warmstart in itertools.product(configs, (False, True)):
+            with self.subTest(device=device, warmstart=warmstart):
+                model = _arm_over_box(wp.get_device(device), worlds=2)
+                solver = newton.solvers.SolverFeatherPGS(
+                    model, pgs_iterations=4, pgs_warmstart=warmstart, pgs_warmstart_decay=0.8, **mode
+                )
+                self.assertGreater(solver.friction_anchor_beta, 0.0)
+                arrays = (
+                    (solver.row_parent, solver.row_mu, solver.impulses),
+                    (solver.mf_row_parent, solver.mf_row_mu, solver.mf_impulses),
+                    (solver.propagation_row_parent, solver.propagation_row_mu, solver.propagation_impulses),
+                )
+                pipeline = newton.CollisionPipeline(model, contact_matching="latest")
+                contacts = pipeline.contacts()
+                state, out = model.state(), model.state()
+                newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+                control = model.control()
+                paths = set()
+                with _record_patch_routes(solver._friction_patches) as calls:
+                    for step, dt in enumerate(dts):
+                        pipeline.collide(state, contacts)
+                        state.clear_forces()
+                        solver.step(state, out, control, contacts, dt)
+                        state, out = out, state
+                        count = int(contacts.rigid_contact_count.numpy()[0])
+                        paths.update(solver.contact_path.numpy()[:count].tolist())
+                        expected = ["link", "seed", "finish"] if warmstart else ["link", "finish"]
+                        self.assertEqual([name for name, _ in calls], expected, f"step {step}")
+                        for name, routes in calls:
+                            self.assertEqual(tuple(routes.enabled), enabled, f"step {step} {name}")
+                            for route in np.flatnonzero(enabled):
+                                for field, array in zip(("parents", "mu", "impulses"), arrays[route], strict=True):
+                                    self.assertEqual(getattr(routes, f"{field}{route}").ptr, array.ptr, field)
+                        if warmstart:
+                            ratio = dt / dts[step - 1] if step else 1.0
+                            seeded = dict(calls)["seed"]
+                            np.testing.assert_allclose(seeded.scale, 0.8 * ratio * np.asarray(enabled), rtol=1.0e-6)
+                        calls.clear()
+                    # A step without a frame finishes no route; a step without contacts
+                    # drops the stored anchors without calling the patch state.
+                    empty = newton.Contacts(0, 0, device=device, contact_matching=True)
+                    for step_contacts, expected in ((empty, [("finish", (0, 0, 0))]), (None, [])):
+                        solver.step(state, out, control, step_contacts, dts[0])
+                        state, out = out, state
+                        self.assertEqual([(name, tuple(routes.enabled)) for name, routes in calls], expected)
+                        calls.clear()
+                    self.assertFalse(np.any(solver._friction_patches.previous.valid.numpy()))
+                if device == "cpu":
+                    self.assertLessEqual({0, 1}, paths, "contacts must use the dense and matrix-free routes")
 
 
 def _fill_sort_case(patches, live, rng, codes):
