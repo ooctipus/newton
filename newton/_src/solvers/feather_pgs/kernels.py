@@ -27,7 +27,7 @@ from ...sim.articulation import (
 from . import contact_allocation_source
 from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
 from .friction import friction_pair_candidate
-from .friction_patches import FrictionPatches, contact_tangent_basis, patch_normal_load
+from .friction_patches import CONTACT_PATH_RESOLVED, FrictionPatches, contact_tangent_basis, patch_normal_load
 
 PGS_CONSTRAINT_TYPE_CONTACT = 0
 PGS_CONSTRAINT_TYPE_JOINT_TARGET = 1
@@ -4656,10 +4656,13 @@ _contact_allocator = contact_allocation_source.bind(
         "contact_friction_eligible": contact_friction_eligible,
         "BodyFlags": BodyFlags,
         "FrictionPatches": FrictionPatches,
+        "CONTACT_PATH_RESOLVED": CONTACT_PATH_RESOLVED,
     }
 )
 _allocate_world_contact_slot = _contact_allocator[0]
 allocate_world_contact_slots = _contact_allocator[1]
+# Persistent patch friction with the resolved-world classifier (contact_allocation_source.get_source).
+allocate_world_contact_slots_patch_resolved = _contact_allocator[2]
 
 
 @wp.func

@@ -94,6 +94,7 @@ from .kernels import (
     allocate_physx_drive_slots,
     allocate_rigid_velocity_limit_slots,
     allocate_world_contact_slots,
+    allocate_world_contact_slots_patch_resolved,
     apply_augmented_mass_diagonal_grouped,
     apply_contact_regularization,
     apply_free_root_transport_to_predictor,
@@ -2761,9 +2762,10 @@ class SolverFeatherPGS(SolverBase):
         # its serial sweeps and ordinary rows.
         self._parallel_contact_paths, self._parallel_contact_paths_reason = self._admit_parallel_contact_paths()
         # Patch friction on the dense route: the paired factor sweep walks patch
-        # contact units and the masked row builder writes the patch row law.
-        # FEATHER_PGS_PATCH_DENSE_PATHS=0 restores the general paired sweep and
-        # the per-contact row builder.
+        # contact units, the masked row builder writes the patch row law and the
+        # resolved-world classifier skips worlds whose rows all separate.
+        # FEATHER_PGS_PATCH_DENSE_PATHS=0 restores the general paired sweep, the
+        # per-contact row builder and complete rows in every world.
         self._patch_dense_paths = bool(
             self._law_agnostic_contact_paths
             and self._friction_anchors_enabled
@@ -13836,8 +13838,15 @@ class SolverFeatherPGS(SolverBase):
 
             self._build_friction_patches(state_in, contacts)
 
+            # Under persistent patch friction, contacts of resolved worlds that the complete path would
+            # give rows are marked so the patch finish releases their anchors (contact_allocation_source).
+            allocator = (
+                allocate_world_contact_slots_patch_resolved
+                if self._friction_anchors_enabled and self._resolved_worlds_owner is not None
+                else allocate_world_contact_slots
+            )
             wp.launch(
-                allocate_world_contact_slots,
+                allocator,
                 dim=contact_build_threads,
                 inputs=[
                     contacts.rigid_contact_count,

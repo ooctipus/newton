@@ -285,6 +285,101 @@ ${world}${phi}    # Use the same eligibility as patch selection before reserving
 '''
 
 
+_RESOLVED_PATCH = r'''@wp.func
+def ${release_name}(
+    c: int,
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    contact_point0: wp.array[wp.vec3],
+    contact_point1: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    contact_thickness0: wp.array[float],
+    contact_thickness1: wp.array[float],
+    body_q: wp.array[wp.transform],
+    shape_body: wp.array[int],
+    body_to_articulation: wp.array[int],
+    art_to_world: wp.array[int],
+    articulation_response_dof_count: wp.array[int],
+    body_flags: wp.array[wp.int32],
+    body_has_response_dofs: wp.array[int],
+    is_free_rigid: wp.array[int],
+    contact_gap_gate: float,
+    same_articulation_contact_gap_gate: float,
+    articulation_pair_contact_gap_gate: float,
+    # outputs
+    contact_slot: wp.array[int],
+    contact_path: wp.array[int],
+):
+    """Mark a contact of a resolved world that the row allocator would reserve rows for.
+
+    Repeats the allocator's checks before any reservation: a responding
+    endpoint, one world and the normal gap limit. Such a contact gets
+    CONTACT_PATH_RESOLVED and no slot; persistent patch friction releases its
+    anchor at the finish, as the complete path releases an anchor whose rows
+    solve zero load. Every other contact keeps path -1, and its anchor history.
+    """
+    shape_a = contact_shape0[c]
+    shape_b = contact_shape1[c]
+
+${bodies}    a_has_dofs = art_a >= 0 and articulation_response_dof_count[art_a] > 0
+    b_has_dofs = art_b >= 0 and articulation_response_dof_count[art_b] > 0
+    a_can_respond = (
+        a_has_dofs and body_has_response_dofs[body_a] != 0 and (body_flags[body_a] & BodyFlags.KINEMATIC) == 0
+    )
+    b_can_respond = (
+        b_has_dofs and body_has_response_dofs[body_b] != 0 and (body_flags[body_b] & BodyFlags.KINEMATIC) == 0
+    )
+    if not a_can_respond and not b_can_respond:
+        contact_slot[c] = -1
+        contact_path[c] = -1
+        return
+
+${world}${phi}    a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
+    b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
+    normal_gap_limit = contact_normal_gap_limit(
+        a_non_free,
+        b_non_free,
+        art_a == art_b,
+        contact_gap_gate,
+        articulation_pair_contact_gap_gate,
+        same_articulation_contact_gap_gate,
+    )
+    if phi > normal_gap_limit:
+        contact_slot[c] = -1
+        contact_path[c] = -1
+        return
+
+    contact_slot[c] = -1
+    contact_path[c] = CONTACT_PATH_RESOLVED
+'''
+
+
+_RELEASE_CALL = r"""                ${release_name}(
+                    c,
+                    contact_shape0,
+                    contact_shape1,
+                    contact_point0,
+                    contact_point1,
+                    contact_normal,
+                    contact_thickness0,
+                    contact_thickness1,
+                    body_q,
+                    shape_body,
+                    body_to_articulation,
+                    art_to_world,
+                    articulation_response_dof_count,
+                    body_flags,
+                    body_has_response_dofs,
+                    is_free_rigid,
+                    contact_gap_gate,
+                    same_articulation_contact_gap_gate,
+                    articulation_pair_contact_gap_gate,
+                    contact_slot,
+                    contact_path,
+                )
+"""
+
+
 _KERNEL = r'''${decorator}
 def ${kernel_name}(
     contact_count: wp.array[int],
@@ -377,7 +472,7 @@ ${resolved}            if same_world and world >= 0 and world < resolved_worlds.
                 contact_slot[c] = -1
                 contact_path[c] = -1
                 contact_slots_needed[c] = 0
-                continue
+${resolved_release}                continue
         ${helper_name}(
             c,
             total_contacts,
@@ -433,32 +528,71 @@ ${extra_call}        )
 ${stage}'''
 
 
-def get_source():
-    """Build the contact routing, row admission and reservation kernel."""
+def get_source(*, patch_resolved=False):
+    """Build the contact routing, row admission and reservation kernel.
+
+    ``patch_resolved`` appends a second kernel, ``allocate_world_contact_slots_patch_resolved``,
+    for persistent patch friction: in a world the resolved-world classifier skips, it marks the
+    contacts the first kernel would reserve rows for with CONTACT_PATH_RESOLVED, so the patch
+    finish releases their anchors as the complete path does. The first kernel's text does not
+    depend on the option.
+    """
     checked_definitions(
         "contact_allocation_source.py",
-        ("_BODIES", "_WORLD", "_PHI", "_RESOLVED", "_HELPER", "_KERNEL", "get_source", "bind"),
+        (
+            "_BODIES",
+            "_WORLD",
+            "_PHI",
+            "_RESOLVED",
+            "_HELPER",
+            "_RESOLVED_PATCH",
+            "_RELEASE_CALL",
+            "_KERNEL",
+            "get_source",
+            "bind",
+        ),
     )
     helper_name = "_allocate_world_contact_slot"
     helper = Template(_HELPER).substitute(helper_name=helper_name, extra="", bodies=_BODIES, world=_WORLD, phi=_PHI)
-    kernel = Template(_KERNEL).substitute(
-        decorator="@wp.kernel",
-        kernel_name="allocate_world_contact_slots",
-        helper_name=helper_name,
-        extra="",
-        overflow="total_contacts > capacity",
-        resolved=_RESOLVED,
-        extra_call="",
-        stage="",
+    kernels = {"allocate_world_contact_slots": ""}
+    if patch_resolved:
+        release_name = "_mark_resolved_patch_contact"
+        helper += "\n\n" + Template(_RESOLVED_PATCH).substitute(
+            release_name=release_name, bodies=_BODIES, world=_WORLD, phi=_PHI
+        )
+        kernels["allocate_world_contact_slots_patch_resolved"] = Template(_RELEASE_CALL).substitute(
+            release_name=release_name
+        )
+    return helper + "".join(
+        "\n\n"
+        + Template(_KERNEL).substitute(
+            decorator="@wp.kernel",
+            kernel_name=kernel_name,
+            helper_name=helper_name,
+            extra="",
+            overflow="total_contacts > capacity",
+            resolved=_RESOLVED,
+            resolved_release=release,
+            extra_call="",
+            stage="",
+        )
+        for kernel_name, release in kernels.items()
     )
-    return helper + "\n\n" + kernel
 
 
 def bind(namespace):
-    """Bind inspectable functions from generated source without source recovery."""
-    source = get_source()
+    """Bind inspectable functions from generated source without source recovery.
+
+    Returns the reservation helper, the allocation kernel and its persistent-patch twin
+    (``get_source(patch_resolved=True)``).
+    """
+    source = get_source(patch_resolved=True)
     filename = "<contact-allocation-" + hashlib.sha256(source.encode()).hexdigest() + ">"
     linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)
     scope = dict(namespace)
     exec(compile(source, filename, "exec"), scope)
-    return scope["_allocate_world_contact_slot"], scope["allocate_world_contact_slots"]
+    return (
+        scope["_allocate_world_contact_slot"],
+        scope["allocate_world_contact_slots"],
+        scope["allocate_world_contact_slots_patch_resolved"],
+    )

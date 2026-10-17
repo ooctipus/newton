@@ -4,6 +4,7 @@
 """CPU tests for the predictor-resolved world classifier."""
 
 import inspect
+import itertools
 import os
 import unittest
 from types import SimpleNamespace
@@ -13,8 +14,17 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import kernels
 from newton._src.solvers.feather_pgs import resolved_worlds as rw
+from newton._src.solvers.feather_pgs.friction_patches import (
+    CONTACT_PATH_RESOLVED,
+    FrictionPatches,
+    finish_patch_impulses,
+    patch_routes,
+)
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
+from newton.tests.feather_pgs_patch_parity import assert_history_close
+from newton.tests.test_feather_pgs_friction_patches import _patch_fixture
 from newton.tests.test_feather_pgs_mixed_tree_free_body import DT, _add_quadruped, _build
 
 
@@ -72,15 +82,101 @@ def make_case(*, free=False):
     return data, raw, scratch
 
 
-def evaluate(data, raw, scratch, *, enabled=1, published=False):
+def evaluate(data, raw, scratch, *, enabled=1, published=False, row_bound=None):
     """Execute the decision kernels on CPU, without initializing CUDA.
 
     ``published`` reads the predictor twists in ``data.predicted_twist``, as
     on the held-tree owner, instead of running the classifier's body pass.
+    ``row_bound`` (dense, matrix-free) runs persistent patch friction's capacity-bounded decision.
     """
     data.use_published = int(published)
-    rw.launch(data, raw, scratch, 1, "cpu", enabled=enabled, published=published)
+    free_normals = wp.zeros(1, dtype=wp.int32, device="cpu") if row_bound is not None else None
+    rw.launch(
+        data,
+        raw,
+        scratch,
+        1,
+        "cpu",
+        enabled=enabled,
+        published=published,
+        row_bound=row_bound,
+        free_normals=free_normals,
+    )
     return int(scratch.resolved.numpy()[0])
+
+
+# Synthetic contacts of two worlds. Bodies: 0 an arm link (articulation 0, world 0), 1 a link
+# without response DOFs (articulation 1, world 0), 2 an arm link of world 1 (articulation 2) and
+# 3 a free box (articulation 3, world 0); shapes 0-3 sit on them and shape 4 is static. Contacts:
+# (0) the link on the ground, (1) the unresponsive link on the ground, (2) the link 0.5 m above the
+# ground, past the 0.1 m gap gate, (3) world 1's link on the ground, (4) a pair across worlds and
+# (5) the free box on the ground.
+_ALLOCATION_SHAPES = ((0, 4), (1, 4), (0, 4), (2, 4), (0, 2), (3, 4))
+_ALLOCATION_LIFT = (0.0, 0.0, 0.5, 0.0, 0.0, 0.0)
+
+
+def _allocate(kernel, resolved):
+    """Run one allocator serially over the synthetic contacts; return its per-contact outputs and counters."""
+    count = len(_ALLOCATION_SHAPES)
+
+    def integers(values):
+        return wp.array(values, dtype=wp.int32, device="cpu")
+
+    arrays = {
+        "contact_count": integers([count]),
+        "total_num_threads": 1,
+        "contact_shape0": integers([pair[0] for pair in _ALLOCATION_SHAPES]),
+        "contact_shape1": integers([pair[1] for pair in _ALLOCATION_SHAPES]),
+        "contact_point0": wp.array([[0.0, 0.0, lift] for lift in _ALLOCATION_LIFT], dtype=wp.vec3, device="cpu"),
+        "contact_point1": wp.zeros(count, dtype=wp.vec3, device="cpu"),
+        "contact_normal": wp.array([[0.0, 0.0, -1.0]] * count, dtype=wp.vec3, device="cpu"),
+        "contact_thickness0": wp.zeros(count, dtype=float, device="cpu"),
+        "contact_thickness1": wp.zeros(count, dtype=float, device="cpu"),
+        "body_q": wp.array([wp.transform_identity()] * 4, dtype=wp.transform, device="cpu"),
+        "shape_transform": wp.array([wp.transform_identity()] * 5, dtype=wp.transform, device="cpu"),
+        "shape_body": integers([0, 1, 2, 3, -1]),
+        "body_to_articulation": integers([0, 1, 2, 3]),
+        "art_to_world": integers([0, 0, 1, 0]),
+        "articulation_response_dof_count": integers([3, 0, 3, 6]),
+        "body_flags": integers([0, 0, 0, 0]),
+        "body_has_response_dofs": integers([1, 0, 1, 1]),
+        "is_free_rigid": integers([0, 0, 0, 1]),
+        "has_free_rigid": 1,
+        "propagation_articulated_contacts": 0,
+        "propagation_same_articulation": 0,
+        "propagation_free_free": 0,
+        "contact_gap_gate": 0.1,
+        "same_articulation_contact_gap_gate": 0.0,
+        "articulation_pair_contact_gap_gate": 0.0,
+        "max_constraints": 32,
+        "mf_max_constraints": 32,
+        "propagation_max_constraints": 32,
+        "enable_friction": 1,
+        "contact_friction_gap_threshold": float("inf"),
+        "contact_friction_articulation_pairs_only": 0,
+        "row_capacity_telemetry": 0,
+        "friction_patches": FrictionPatches(),
+        "resolved_worlds": integers(resolved),
+        "contact_world": integers([-9] * count),
+        "contact_slot": integers([-9] * count),
+        "contact_art_a": integers([-9] * count),
+        "contact_art_b": integers([-9] * count),
+        "world_slot_counter": integers([0, 0]),
+        "contact_path": integers([-9] * count),
+        "mf_slot_counter": integers([0, 0]),
+        "propagation_slot_counter": integers([0, 0]),
+        "dense_contact_world_flag": integers([0, 0]),
+        "contact_slots_needed": integers([-9] * count),
+        "dense_dropped_contact_rows": integers([0, 0]),
+        "mf_dropped_contact_rows": integers([0, 0]),
+        "propagation_dropped_contact_rows": integers([0, 0]),
+        "dense_first_rejected_slot": integers([2**31 - 1] * 2),
+        "mf_first_rejected_slot": integers([2**31 - 1] * 2),
+        "propagation_first_rejected_slot": integers([2**31 - 1] * 2),
+        "capacity_status": integers([0] * 4),
+    }
+    wp.launch(kernel, dim=1, inputs=[arrays[name] for name in inspect.signature(kernel.func).parameters], device="cpu")
+    return {name: value.numpy() for name, value in arrays.items() if isinstance(value, wp.array)}
 
 
 class TestResolvedWorlds(unittest.TestCase):
@@ -157,6 +253,8 @@ class TestResolvedWorlds(unittest.TestCase):
         kinematic root of a dynamic tree, moves with its prescribed velocity.
         The body pass rejects its world. The published path reads no twist
         for it and took it as still, resolving a world it was closing on.
+        Persistent patch friction runs the capacity-bounded decision, whose
+        contact check must reject the same contacts under both twist sources.
         """
         data, raw, scratch = make_case()
 
@@ -172,14 +270,18 @@ class TestResolvedWorlds(unittest.TestCase):
         data.prescribed_articulation = a([0, 0], wp.int32)
         data.body_has_response_dofs = a([1, 1], wp.int32)
         data.body_response_dof_mask = a([1, 1], wp.uint32)
+        # Point friction decides without a row bound; patch friction's bound fits the contact's three rows.
+        laws = (("point", None), ("patch", (100, 100)))
         # (flag of body 1, its speed along the contact normal, resolved); positive speed closes the gap.
         for flag, speed, resolved in ((1, 2.0, 0), (1, -2.0, 1), (2, 2.0, 0), (2, -2.0, 0)):
             data.body_flags.assign([1, flag])
             data.v_hat.assign([0.0, speed])
             data.predicted_twist.assign([[0.0] * 6, [speed, 0.0, 0.0, 0.0, 0.0, 0.0]])
-            for published in (False, True):
-                with self.subTest(kinematic=flag == 2, speed=speed, published=published):
-                    self.assertEqual(evaluate(data, raw, scratch, published=published), resolved)
+            for (law, row_bound), published in itertools.product(laws, (False, True)):
+                with self.subTest(law=law, kinematic=flag == 2, speed=speed, published=published):
+                    decision = evaluate(data, raw, scratch, published=published, row_bound=row_bound)
+                    self.assertEqual(decision, resolved)
+                    self.assertEqual(int(scratch.checked_normals.numpy()[0]), 1)
 
     def test_zero_friction_radius_allows_slip(self):
         """Accept zero normal impulse without requiring zero tangential speed."""
@@ -266,6 +368,108 @@ class TestResolvedWorlds(unittest.TestCase):
         self.assertEqual(classifier.resolved.shape, (0,))
         classifier.classify(None, None, None, 0.0)
 
+    def test_patch_allocator_marks_the_contacts_the_complete_path_reserves(self):
+        """In a resolved world, mark exactly the contacts the allocator would give rows; leave other worlds alone."""
+        complete = _allocate(kernels.allocate_world_contact_slots, [])
+        point = _allocate(kernels.allocate_world_contact_slots, [1, 0])
+        patch_friction = _allocate(kernels.allocate_world_contact_slots_patch_resolved, [1, 0])
+        np.testing.assert_array_equal(complete["contact_slot"] >= 0, [True, False, False, True, False, True])
+        np.testing.assert_array_equal(complete["contact_path"], [0, -1, -1, 0, -1, 1])
+        world_zero = np.array([True, True, True, False, False, True])
+        # Point friction keeps no anchors: resolved contacts carry no route at all.
+        np.testing.assert_array_equal(point["contact_path"][world_zero], -1)
+        expected = np.where(complete["contact_slot"] >= 0, int(CONTACT_PATH_RESOLVED), -1)
+        np.testing.assert_array_equal(patch_friction["contact_path"][world_zero], expected[world_zero])
+        for name in ("contact_slot", "contact_slots_needed", "contact_world", "contact_art_a", "contact_art_b"):
+            np.testing.assert_array_equal(patch_friction[name][world_zero], point[name][world_zero], err_msg=name)
+        np.testing.assert_array_equal(patch_friction["contact_slot"][world_zero], -1)
+        # The resolved world reserves no rows; world 1 and the cross-world pair allocate as before.
+        for name in ("world_slot_counter", "mf_slot_counter", "capacity_status"):
+            np.testing.assert_array_equal(patch_friction[name], point[name], err_msg=name)
+        self.assertEqual(int(patch_friction["world_slot_counter"][0]) + int(patch_friction["mf_slot_counter"][0]), 0)
+        for name in ("contact_slot", "contact_path", "contact_slots_needed"):
+            np.testing.assert_array_equal(patch_friction[name][~world_zero], complete[name][~world_zero], err_msg=name)
+
+    def test_patch_finish_releases_resolved_contacts_only(self):
+        """The finish epilogue releases CONTACT_PATH_RESOLVED anchors, keeps unrouted ones and finishes routed ones."""
+        model, state, contacts, patches = _patch_fixture([[-0.2, 0, 0], [0.0, 0, 0], [0.2, 0, 0], [0.4, 0, 0]])
+        count = 4
+        state.body_qd = wp.zeros(model.body_count, dtype=wp.spatial_vector, device="cpu")
+        com = wp.zeros(model.body_count, dtype=wp.vec3, device="cpu")
+        world = wp.zeros(count, dtype=int, device="cpu")
+        # 0 resolved, 1 capacity-rejected, 2 routed with load, 3 routed without load.
+        slot = wp.array([-1, -1, 0, 3], dtype=int, device="cpu")
+        path = wp.array([int(CONTACT_PATH_RESOLVED), -1, 0, 0], dtype=int, device="cpu")
+        needed = wp.array([0, 0, 3, 3], dtype=int, device="cpu")
+        parents = wp.array([[-1, 0, 0, -1, 3, 3, -1, -1]], dtype=int, device="cpu")
+        mu = wp.full((1, 8), 0.5, dtype=float, device="cpu")
+        impulses = wp.array([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=float, device="cpu")
+        routes = patch_routes(((0, parents, mu, impulses, 0.0),))
+        for label, finish_routes, expected in (
+            ("finish", routes, [0, 1, 1, 0]),
+            ("store only", patch_routes(()), [1, 1, 1, 1]),
+        ):
+            with self.subTest(label):
+                patches.current.valid.assign([1] * count + [0] * (patches.capacity - count))
+                patches.finish(state, state, com, world, slot, path, needed, finish_routes, DT)
+                np.testing.assert_array_equal(patches.previous.valid.numpy()[:count], expected)
+        # The single-route kernel tests use applies the same release.
+        patches.current.valid.assign([1] * count + [0] * (patches.capacity - count))
+        wp.launch(
+            finish_patch_impulses,
+            dim=count,
+            inputs=[
+                contacts.rigid_contact_count,
+                patches.current,
+                state.body_q,
+                state.body_q,
+                state.body_qd,
+                com,
+                world,
+                slot,
+                path,
+                needed,
+                0,
+                parents,
+                mu,
+                impulses,
+                DT,
+            ],
+            device="cpu",
+        )
+        np.testing.assert_array_equal(patches.current.valid.numpy()[:count], [0, 1, 1, 0])
+
+    def test_patch_bound_resolves_only_worlds_whose_rows_fit_each_route(self):
+        """Count each checked limit as one dense row and each checked contact as three rows on its route."""
+        data, raw, scratch = make_case()
+        self.assertEqual(evaluate(data, raw, scratch), 1)
+        # The articulated contact takes dense rows.
+        self.assertEqual(evaluate(data, raw, scratch, row_bound=(3, 0)), 1)
+        self.assertEqual(evaluate(data, raw, scratch, row_bound=(2, 100)), 0)
+        data.lower.assign([-1.0])
+        data.activation_gap = float("inf")
+        self.assertEqual(evaluate(data, raw, scratch, row_bound=(4, 0)), 1)
+        self.assertEqual(int(scratch.checked_limits.numpy()[0]), 1)
+        self.assertEqual(evaluate(data, raw, scratch, row_bound=(3, 100)), 0)
+        # A rejected world stays rejected under any bound.
+        data.v_hat.assign([-2.0])
+        self.assertEqual(evaluate(data, raw, scratch, row_bound=(100, 100)), 0)
+        # A free body's contact with a prescribed endpoint takes matrix-free rows.
+        data, raw, scratch = make_case(free=True)
+        self.assertEqual(evaluate(data, raw, scratch, row_bound=(0, 3)), 1)
+        self.assertEqual(evaluate(data, raw, scratch, row_bound=(100, 2)), 0)
+
+    def test_patch_friction_admission(self):
+        """Admit persistent patch friction on the dense route unless FEATHER_PGS_PATCH_DENSE_PATHS=0 or torsion."""
+        solver = _admissible_solver()
+        self.assertTrue(rw.supported(solver))
+        solver._point_contact_paths = False
+        self.assertFalse(rw.supported(solver))
+        solver._patch_dense_paths = True
+        self.assertTrue(rw.supported(solver))
+        solver._sparse_mass_matrix_size = 23
+        self.assertFalse(rw.supported(solver))
+
     def test_policy_names_no_robot(self):
         """The admission reads row kinds and sizes, never a robot."""
         source = inspect.getsource(rw).lower()
@@ -273,8 +477,63 @@ class TestResolvedWorlds(unittest.TestCase):
             self.assertNotIn(token, source)
 
 
-def _rollout(model, *, classifier, steps=90, published=True):
-    """Swing the arms and toss the boxes; return the solver, poses and the per-step resolved masks."""
+def _admissible_solver():
+    """A stand-in solver whose policy the classifier admits; device checks see CUDA."""
+    solver = SimpleNamespace(
+        pgs_mode="matrix_free",
+        drive_mode="augmented",
+        pgs_schedule="interleaved",
+        friction_mode="current",
+        pgs_velocity_iterations=0,
+        _mimic_count=0,
+        _connect_count=0,
+        _preelim_count=0,
+        articulated_contact_response="immediate",
+        _sparse_mass_matrix_size=None,
+        _keyed_rows=None,
+        drive_slot=None,
+        _point_contact_paths=True,
+        _patch_dense_paths=False,
+        model=SimpleNamespace(requires_grad=False, device=SimpleNamespace(is_cuda=True)),
+        max_world_dofs=29,
+        _world_rows_owned_le=lambda: 0,
+        world_dof_indices=1,
+        world_dof_count=1,
+        body_response_dof_mask=1,
+        body_has_response_dofs=1,
+        _joint_limit_q_index=1,
+    )
+    for name in (
+        "pgs_warmstart",
+        "_mf_warmstart_enabled",
+        "_preelim_active",
+        "_regularization_enabled",
+        "enable_bilateral_preelimination",
+        "enable_joint_velocity_limits",
+        "fuse_joint_velocity_limits",
+        "_fused_diagonal_joint_limits",
+        "_sparse_diagonal_contact_solve",
+        "_compact_contact_boundary",
+        "pgs_debug",
+        "_row_watermark",
+        "_route_free_free_contacts",
+        "propagation_same_articulation_rows",
+        "_fused_k1",
+        "grouped_dynamics",
+        "lazy_kinematics",
+    ):
+        setattr(solver, name, False)
+    return solver
+
+
+def _rollout(
+    model, *, classifier, steps=90, published=True, friction_anchor_beta=0.0, history=None, solver_kwargs=None
+):
+    """Swing the arms and toss the boxes; return the solver, poses and the per-step resolved masks.
+
+    ``history`` collects each step's stored anchor validity and the count of contacts the
+    classifier marked CONTACT_PATH_RESOLVED.
+    """
     env = {
         "FEATHER_PGS_PREDICTED_TWISTS": str(int(published)),
         "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": "1",
@@ -288,7 +547,9 @@ def _rollout(model, *, classifier, steps=90, published=True):
             pgs_iterations=8,
             enable_joint_limits=True,
             update_mass_matrix_interval=2,
-            friction_anchor_beta=0.0,
+            friction_anchor_beta=friction_anchor_beta,
+            sparse_mass_matrix="off",
+            **(solver_kwargs or {}),
         )
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
@@ -312,6 +573,14 @@ def _rollout(model, *, classifier, steps=90, published=True):
         states.reverse()
         poses.append(states[0].body_q.numpy().copy())
         masks.append(solver._resolved_worlds.numpy().copy())
+        if history is not None:
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            history.append(
+                (
+                    solver._friction_patches.previous.valid.numpy().copy(),
+                    int(np.sum(solver.contact_path.numpy()[:count] == int(CONTACT_PATH_RESOLVED))),
+                )
+            )
     wp.synchronize_device(model.device)
     return solver, np.array(poses), np.array(masks)
 
@@ -336,6 +605,46 @@ class TestResolvedWorldsCUDA(unittest.TestCase):
         self.assertTrue(np.isfinite(poses).all())
         np.testing.assert_allclose(poses[:, :, :3], plain[:, :, :3], atol=1.0e-5, rtol=0.0)
         np.testing.assert_allclose(poses[:, :, 3:], plain[:, :, 3:], atol=1.0e-5, rtol=0.0)
+
+    def test_patch_resolved_worlds_match_the_complete_path(self):
+        """Persistent patch friction: resolved worlds step identically and release the same anchors.
+
+        Boxes stick on the ground, rise (their worlds resolve and their anchors release), and land
+        again; arms of three links run the general sweep, arms of seventeen the paired factor sweep.
+        """
+        # The seventeen-link arm has 34 position limits: keep its rows within capacity as Kuka's recipe does.
+        for links, solver_kwargs in ((3, {}), (17, {"dense_max_constraints": 128, "joint_limit_activation_gap": 0.1})):
+            with self.subTest(links=links):
+                model = _build(wp.get_device("cuda:0"), worlds=6, links=links)
+                complete_history, history = [], []
+                plain_solver, plain, plain_masks = _rollout(
+                    model,
+                    classifier=False,
+                    friction_anchor_beta=None,
+                    history=complete_history,
+                    solver_kwargs=solver_kwargs,
+                )
+                self.assertIsNone(plain_solver._resolved_worlds_owner)
+                self.assertEqual(plain_masks.shape[1], 0)
+                solver, poses, masks = _rollout(
+                    model, classifier=True, friction_anchor_beta=None, history=history, solver_kwargs=solver_kwargs
+                )
+                self.assertTrue(solver._friction_anchors_enabled)
+                self.assertIsNotNone(solver._resolved_worlds_owner)
+                self.assertEqual(
+                    solver._resolved_worlds_owner.row_bound, (solver.dense_max_constraints, solver.mf_max_constraints)
+                )
+                self.assertGreater(int(masks.sum()), 0)
+                self.assertLess(int(masks.sum()), masks.size)
+                self.assertGreater(sum(marked for _, marked in history), 0, "no contact released its anchor")
+                # Boxes start just above the ground; resting ones hold anchors once they land.
+                self.assertGreater(max(int(np.sum(valid)) for valid, _ in complete_history), 0, "no anchor stuck")
+                for step, ((valid, _), (expected, _)) in enumerate(zip(history, complete_history, strict=True)):
+                    np.testing.assert_array_equal(valid, expected, err_msg=f"previous.valid at step {step}")
+                assert_history_close(solver, plain_solver)
+                self.assertTrue(np.isfinite(poses).all())
+                np.testing.assert_allclose(poses[:, :, :3], plain[:, :, :3], atol=1.0e-5, rtol=0.0)
+                np.testing.assert_allclose(poses[:, :, 3:], plain[:, :, 3:], atol=1.0e-5, rtol=0.0)
 
     def test_published_twists_match_the_body_pass(self):
         """The predictor's published twists decide the same worlds as the classifier's own body pass."""

@@ -68,6 +68,10 @@ _SORT_PAD = wp.constant(wp.int64(1 << 62))
 # fraction covers squares wider than about 3 cm at 80 m from the origin and
 # 6 cm at 190 m, and narrower ones nearer to it.
 _FOOTPRINT_TOLERANCE = wp.constant(1.0e-3)
+# Contact paths 0, 1 and 2 hold dense, matrix-free and propagation rows, and -1 holds none.
+# CONTACT_PATH_RESOLVED marks a contact without rows in a world the resolved-world classifier
+# skipped, where the complete path would have reserved them: its patch anchor releases.
+CONTACT_PATH_RESOLVED = wp.constant(-2)
 
 
 @wp.struct
@@ -1759,8 +1763,12 @@ def finish_patch_impulses(
     if c >= count[0] or frame.valid[c] == 0:
         return
     if slot[c] < 0:
-        # Capacity rejection provides no solved normal load; preserve the
-        # geometrically supported history until rows are available again.
+        # A contact of a resolved world would have solved zero load on the complete
+        # path, which releases its anchor. Capacity rejection provides no solved
+        # normal load; preserve the geometrically supported history until rows are
+        # available again.
+        if path[c] == CONTACT_PATH_RESOLVED:
+            frame.valid[c] = 0
         return
     if path[c] != route:
         return
@@ -1792,22 +1800,30 @@ def _finish_and_store(
 
     Finishing writes only the contact's own validity and tangent impulse and
     reads other contacts only through the row arrays, so finishing and storing
-    contact by contact matches finishing every route before storing. Anchors
-    without rows (capacity rejection, or a disabled route) keep their history.
-    Thread 0 publishes the stored count, which this launch never reads.
+    contact by contact matches finishing every route before storing. A contact
+    the resolved-world classifier left without rows (CONTACT_PATH_RESOLVED)
+    releases its anchor, as its zero load does on the complete path. Other
+    anchors without rows (capacity rejection, or a disabled route) keep their
+    history. Thread 0 publishes the stored count, which this launch never reads.
     """
     thread = wp.tid()
     live = extent[1]
     if thread == 0:
         stored[0] = live
+    finishing = routes.enabled[0] + routes.enabled[1] + routes.enabled[2] > 0
     for c in range(thread, extent[0], threads):
-        if c < live and frame.valid[c] != 0:
-            route = _contact_route(routes, slot, path, c)
-            if route >= 0:
-                parents = _route_parents(routes, route)
-                mu = _route_mu(routes, route)
-                impulses = _route_impulses(routes, route)
-                _finish_contact(c, frame, q, q_out, qd_out, com, world, slot, slots_needed, parents, mu, impulses, dt)
+        if finishing and c < live and frame.valid[c] != 0:
+            if slot[c] < 0 and path[c] == CONTACT_PATH_RESOLVED:
+                frame.valid[c] = 0
+            else:
+                route = _contact_route(routes, slot, path, c)
+                if route >= 0:
+                    parents = _route_parents(routes, route)
+                    mu = _route_mu(routes, route)
+                    impulses = _route_impulses(routes, route)
+                    _finish_contact(
+                        c, frame, q, q_out, qd_out, com, world, slot, slots_needed, parents, mu, impulses, dt
+                    )
         _store_contact(c, q, body_world, frame, prev, previous_world, previous_q)
 
 

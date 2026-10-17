@@ -22,9 +22,11 @@ PINNED = {
         "_PHI": "0075baa843e40e3c7c0ec4ddd26b14b397c47a73f011c2d414e403a275166c6a",
         "_RESOLVED": "54b6f3f3cd95fea186492a4144c1ce41aabebef2bf77e820afeefa580e6c95de",
         "_HELPER": "adb4b579ac2cb68406804ce53256dcccabf5aaa18ffa0942551b050096f08cf4",
-        "_KERNEL": "55c3009578f93abf574ab1f76474eabc3e0cc2a7837b99eda5b31c486d216872",
-        "get_source": "36587caa26a12c4fa2f223071c5eee3e44decb186defab603ddab1951c5ca38c",
-        "bind": "2459bd92c84b87e6b3b24ca3b10ba242ebde853bbc09f9a66bf41c76fd426c01",
+        "_RESOLVED_PATCH": "ea3aac805396622cf54513961a4fe9c026b6c9627acf6955bde51679d36d98ed",
+        "_RELEASE_CALL": "be35085d426816b9bdb9da162f1326d90436488a7db7ec94b0d65762909b0264",
+        "_KERNEL": "da0cccc26b151895b2baa621bcee1ad7604aa0c2f46a162c8847f12dd2bbbbcb",
+        "get_source": "d475b7bf49436c4fdbd26767185fddf0885fbac7bcb2e3d6a14ece532fc10c92",
+        "bind": "b0d0a0afcc91eef9eae271e4875af6a927a7fbe787d4e4058b1aa4384ff12b0d",
     },
     "mf_dispatch.py": {
         "_NATIVE_ARGUMENTS": "795a55f6b5227fce9bba9d2df228dc0560ba344eb9e4da0227cb17684d59d28f",
@@ -56,7 +58,7 @@ PINNED = {
         "_get_pack_mf_meta_kernel": "353265897c2af4cb85fc0e284b25bb9a862f67b54b74edd2e7b472a331c55a81",
     },
     "kernels.py": {
-        "_contact_allocator": "691354a0e712447d8ed88bb4021cc75b720b2c9a597689b4661730b8423a1a09",
+        "_contact_allocator": "0d3a8115ad2a22b0464e586657f787dfc7364fa138283e5b40c15fe4306922ba",
         "_allocate_world_contact_slot": "0e908992c5b8a236538cd9f07c7d92a4205df1d5e07fedcf81f51699285d7722",
         "allocate_world_contact_slots": "fc7bd52682bb252393da31ce2bc307bd40ce5a9db13101b4c3dad6171aeda789",
         "allocate_rigid_velocity_limit_slots": "0c85ccc6a10fb4a59099870574929fe80c8a8b21480a3d91d02f6671c2d195fa",

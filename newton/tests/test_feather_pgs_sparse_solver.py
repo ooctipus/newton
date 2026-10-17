@@ -126,15 +126,18 @@ def _case(sparse, *, free_count=0, free_first=False, robot_count=1, prescribed=F
         prescribed=prescribed,
         heterogeneous=heterogeneous,
     )
-    solver = _make_solver(
-        model,
-        sparse,
-        **(
-            {"dense_max_constraints": 96 if robot_count > 1 else 64, "mf_max_constraints": 64}
-            if free_count or robot_count > 1
-            else {}
-        ),
-    )
+    # Row-level comparisons need every world's rows: the resolved-world classifier, which skips the
+    # rows of worlds that all separate, stays off on the dense reference.
+    with mock.patch.dict(os.environ, {"FEATHER_PGS_RESOLVED_WORLDS": "0"}):
+        solver = _make_solver(
+            model,
+            sparse,
+            **(
+                {"dense_max_constraints": 96 if robot_count > 1 else 64, "mf_max_constraints": 64}
+                if free_count or robot_count > 1
+                else {}
+            ),
+        )
     state, out = model.state(), model.state()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=128 if free_count else 64)
