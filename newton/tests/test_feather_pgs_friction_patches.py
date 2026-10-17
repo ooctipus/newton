@@ -121,6 +121,12 @@ def _patch_fixture(
     return model, state, contacts, patches
 
 
+def _yaw(points, angle):
+    """Rotate ``points`` about the z axis by ``angle`` [rad]."""
+    c, s = np.cos(angle), np.sin(angle)
+    return np.asarray(points) @ np.array([[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
 class TestFrictionPatchHistory(unittest.TestCase):
     def test_support_edge_centers_ignore_contact_order(self):
         """Keep identical edge centers when contact ordering changes at rest."""
@@ -153,7 +159,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
                 np.testing.assert_allclose(np.sort(locations @ axis), [-0.025, 0.025], atol=1.0e-7)
 
     def test_isotropic_footprint_pair_ignores_roundoff_and_placement(self):
-        """Keep a square's and a tripod's anchor pair when a corner moves one float32 ulp, near or far from the origin.
+        """Keep a square's and a tripod's anchor pair when a corner moves one float32 ulp, at any yaw, near or far from the origin.
 
         The pair starts at the lowest contact index and spans the footprint;
         equally distant members go to the lower index. Neither the order of world
@@ -167,8 +173,8 @@ class TestFrictionPatchHistory(unittest.TestCase):
             "tripod": ([[0.05 * np.cos(a), 0.05 * np.sin(a), 0.0] for a in angles], (0, 1)),
         }
         for name, (footprint, expected) in footprints.items():
-            for offset in (0.0, 1.5, 80.0):
-                points = (np.asarray(footprint) + np.array([offset, offset, 0.0])).astype(np.float32)
+            for yaw, offset in itertools.product((0.0, 0.3, 0.25 * np.pi), (0.0, 1.5, 80.0)):
+                points = (_yaw(footprint, yaw) + np.array([offset, offset, 0.0])).astype(np.float32)
                 pairs = set()
                 for corner in range(len(points)):
                     for step in (-1, 0, 1):
@@ -178,30 +184,31 @@ class TestFrictionPatchHistory(unittest.TestCase):
                         _, _, _, patches = _patch_fixture(moved, device=device)
                         held = np.flatnonzero(patches.view.weight.numpy()[: len(points)] > 0.0)
                         pairs.add(tuple(held))
-                        with self.subTest(footprint=name, offset=offset, corner=corner, step=step):
+                        with self.subTest(footprint=name, yaw=yaw, offset=offset, corner=corner, step=step):
                             # Isotropic anchors sit on their carriers' contact centres.
                             np.testing.assert_array_equal(patches.view.point_a.numpy()[held], moved[held])
-                with self.subTest(footprint=name, offset=offset):
+                with self.subTest(footprint=name, yaw=yaw, offset=offset):
                     self.assertEqual(pairs, {expected})
 
     def test_support_edge_carriers_ignore_roundoff(self):
-        """Keep each support edge whole and its rows on its last contact when corners move one float32 ulp, near or far from the origin.
+        """Keep each support edge whole and its rows on its last contact when corners move one float32 ulp, at any yaw and placement.
 
         The anchor locations stay the edge midpoints. Tied corners differ along
         the axis by the quantization of world coordinates, and a near square's
-        also by the axis tilt that quantization causes. Carriers follow contact
-        order, so a collision pipeline that reorders contacts can still move the
-        rows, though not the locations.
+        also by the axis tilt that quantization causes; beyond about 50 m that
+        tilt can exceed the edge tolerance, so the near square stays within
+        10 m. Carriers follow contact order, so a collision pipeline that
+        reorders contacts can still move the rows, though not the locations.
         """
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
         edges = ((0, 2), (1, 3))
         moves = [None, *itertools.product(range(4), (0, 1), (-1, 1))]
         # Bottom faces of 0.1 m tall boxes, long along x: 2:1 and 3% longer than wide.
-        for hx, hy in ((0.06, 0.03), (0.0515, 0.05)):
+        for (hx, hy), offsets in (((0.06, 0.03), (0.0, 1.5, 10.0, 80.0)), ((0.0515, 0.05), (0.0, 1.5, 10.0))):
             corners = np.array([[x, y, 0.0] for y in (-hy, hy) for x in (-hx, hx)])
             radius = float(np.linalg.norm([hx, hy, 0.05]))
-            for offset in (0.0, 1.5, 10.0, 80.0):
-                points = (corners + np.array([offset, offset, 0.0])).astype(np.float32)
+            for yaw, offset in itertools.product((0.0, 0.3, 0.25 * np.pi), offsets):
+                points = (_yaw(corners, yaw) + np.array([offset, offset, 0.0])).astype(np.float32)
                 carriers = set()
                 for move in moves:
                     moved = points.copy()
@@ -214,9 +221,9 @@ class TestFrictionPatchHistory(unittest.TestCase):
                     for carrier in held:
                         edge = next(edge for edge in edges if carrier in edge)
                         midpoint = moved[list(edge)].astype(np.float64).mean(axis=0).astype(np.float32)
-                        with self.subTest(hx=hx, offset=offset, move=move, carrier=carrier):
+                        with self.subTest(hx=hx, yaw=yaw, offset=offset, move=move, carrier=carrier):
                             np.testing.assert_array_equal(patches.view.point_a.numpy()[carrier], midpoint)
-                with self.subTest(hx=hx, offset=offset):
+                with self.subTest(hx=hx, yaw=yaw, offset=offset):
                     self.assertEqual(carriers, {(2, 3)})
 
     def test_pose_increment_preserves_fixed_pivots_and_no_slip_rolling(self):
@@ -908,8 +915,9 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         """Keep each resting cube's friction anchors on the same corners, so roundoff cannot kick it.
 
         The worlds sit 1.5 m to 80 m from the origin, where float32 contact
-        centres carry 1e-7 m to 8e-6 m of quantization. At 8 iterations every
-        swap of a cube's anchor diagonal kicks it by milliradians per second.
+        centres carry 1e-7 m to 8e-6 m of quantization, with the cubes square
+        to the world axes or yawed. At 8 iterations every swap of a cube's
+        anchor diagonal kicks it by milliradians per second.
         """
         self._check_resting_anchor_corners(0.05)
 
@@ -926,10 +934,10 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
 
     def _check_resting_anchor_corners(self, half_width):
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
-        # Worlds 1.5 m, 4 m, 10 m and 80 m from the origin.
-        for spacing in (3.0, 8.0, 20.0, 160.0):
-            with self.subTest(spacing=spacing):
-                corners, spin = self._rest_box(half_width, spacing, device)
+        # Worlds 1.5 m, 4 m, 10 m and 80 m from the origin, square to the world axes and yawed.
+        for spacing, yaw in itertools.product((3.0, 8.0, 20.0, 160.0), (0.0, 0.3)):
+            with self.subTest(spacing=spacing, yaw=yaw):
+                corners, spin = self._rest_box(half_width, spacing, yaw, device)
                 for world, held in enumerate(zip(*corners[30:], strict=True)):
                     with self.subTest(world=world):
                         pairs = set(held)
@@ -937,13 +945,14 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                         self.assertEqual(len(next(iter(pairs))), 2)
                 self.assertLess(float(np.abs(np.array(spin[60:])).max()), 1.0e-3)
 
-    def _rest_box(self, half_width, spacing, device):
+    def _rest_box(self, half_width, spacing, yaw, device):
         """Return each step's anchor-carrying corners per world and the boxes' angular velocities."""
         # The free box of the mixed-tree parity scenes, alone, with half_width
         # along y: it lands from 1 cm.
         scene = newton.ModelBuilder()
         cfg = newton.ModelBuilder.ShapeConfig(mu=0.6)
-        box = scene.add_body(xform=wp.transform(wp.vec3(0.15, 0.05, 0.06), wp.quat_identity()), mass=0.5)
+        rotation = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), yaw)
+        box = scene.add_body(xform=wp.transform(wp.vec3(0.15, 0.05, 0.06), rotation), mass=0.5)
         scene.add_shape_box(box, hx=0.05, hy=half_width, hz=0.05, cfg=cfg)
         builder = newton.ModelBuilder()
         builder.replicate(scene, 4, spacing=(spacing, spacing, 0.0))
