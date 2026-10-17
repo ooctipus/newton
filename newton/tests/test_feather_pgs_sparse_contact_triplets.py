@@ -5,7 +5,9 @@
 
 import os
 import unittest
+from itertools import product
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -22,17 +24,19 @@ from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_ker
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_feather_pgs_sparse_pgs import _problem, _sweep
 from newton.tests.test_feather_pgs_sparse_research_admission import _branched_model
+from newton.tests.test_feather_pgs_sparse_solver import _build_model, _make_solver
 
 CANDIDATE_OPTIONS = {"contact_triplets": True}
 
 
-def factory(capacity, dofs, width, *, candidate=True):
+def factory(capacity, dofs, width, *, candidate=True, active=True, linked=False):
     return _get_pgs_solve_sparse_kernel(
         capacity,
         dofs,
         width,
-        active_rows=True,
+        active_rows=active,
         use_support_table=True,
+        linked_rows=linked,
         **(CANDIDATE_OPTIONS if candidate else {}),
     )
 
@@ -117,12 +121,12 @@ def fixture(*, offset=0, activity=None, seeded=False, omega=1.0, delay=0, iterat
 class DeviceSolve:
     """One ABI adapter shared by synthetic and preserved actual-input tests."""
 
-    def __init__(self, data, *, candidate, device="cuda:0"):
+    def __init__(self, data, *, candidate, device="cuda:0", active=True, linked=False):
         self.device = wp.get_device(device)
         self.data = data
         self.worlds, self.capacity, self.width = data["row_factor"].shape
         self.dofs = data["reference_factor_delta"].shape[1]
-        self.kernel = factory(self.capacity, self.dofs, self.width, candidate=candidate)
+        self.kernel = factory(self.capacity, self.dofs, self.width, candidate=candidate, active=active, linked=linked)
 
         def array(value, dtype=float):
             return wp.array(value, dtype=dtype, device=self.device)
@@ -220,6 +224,110 @@ def assert_output(test, data, delta, impulses, *, physical=None, reference=None)
                 continue  # Linked normal loads retain their existing fallback.
             radius = max(float(data["row_mu"][world, row] * impulses[world, parent]), 0.0)
             test.assertLessEqual(float(np.linalg.norm(impulses[world, row : row + 2])), radius + 3e-5)
+
+
+# Contact units (region, anchor, normal bias): a region links its normals in one ring, in
+# layout order; region None leaves the normal unlinked. An anchor adds its two tangents.
+_LINKED_LAYOUTS = {
+    "self_loop": ((0, True, -0.2),),
+    # The anchor's own normal separates; the other normal of its ring loads it.
+    "two_member_ring": ((0, True, 0.15), (0, False, -0.3)),
+    "three_member_ring": ((0, True, -0.1), (0, False, 0.2), (0, True, -0.25)),
+    "mixed_units": (
+        (0, True, -0.2),
+        (1, False, -0.1),
+        (1, True, 0.1),
+        (None, True, -0.15),
+        (2, False, 0.3),
+        (0, False, -0.15),
+        (2, True, -0.05),
+        (1, False, -0.2),
+    ),
+}
+
+
+def linked_fixture(layout, *, pad=0, seeded=False, omega=1.0, delay=0, iteration_offset=0, active=True):
+    """Build ring-linked patch rows in the DeviceSolve layout, with their physical sweep.
+
+    ``pad`` separating, unlinked normals lead the units, moving records and rings
+    across 32-row words. Unit masses make the factor rows the physical Jacobian.
+    """
+    rng = np.random.default_rng(len(layout) + pad)
+    dofs = 12
+    kinds, parents, mu, bias, rings = [CONTACT] * pad, [-1] * pad, [0.0] * pad, [1.0] * pad, {}
+    for region, anchor, normal_bias in layout:
+        normal = len(kinds)
+        if region is not None:
+            rings.setdefault(region, []).append(normal)
+        kinds.append(CONTACT)
+        parents.append(-1)
+        mu.append(0.0)
+        bias.append(normal_bias)
+        if anchor:
+            kinds += [FRICTION] * 2
+            parents += [normal] * 2
+            mu += [0.5] * 2
+            bias += list(rng.uniform(-0.2, 0.2, 2))
+    kinds, parents, mu, bias = np.array(kinds, np.int32), np.array(parents, np.int32), np.array(mu), np.array(bias)
+    for ring in rings.values():
+        parents[ring] = np.roll(ring, -1)
+    count = len(kinds)
+    # Round the inputs to float32 once, so that the device and the oracle solve one problem.
+    rows = rng.normal(scale=0.4, size=(count, dofs)).astype(np.float32).astype(np.float64)
+    bias = bias.astype(np.float32).astype(np.float64)
+    diagonal = (np.sum(rows * rows, axis=1) + 1.0e-6).astype(np.float32).astype(np.float64)
+    impulses = np.zeros(count)
+    if seeded:
+        impulses[np.flatnonzero(kinds == CONTACT)[1::2]] = 0.0625
+        impulses[kinds == FRICTION] = np.tile((0.015625, -0.03125), np.count_nonzero(kinds == FRICTION) // 2)
+    capacity, worlds = 192, 3
+
+    def padded(value, dtype=np.float32):
+        result = np.zeros((worlds, capacity, *value.shape[1:]), dtype=dtype)
+        result[:, : len(value)] = value
+        return result
+
+    data = {
+        "world_constraint_count": np.array([count, 0, count], np.int32),
+        "rhs_bias": padded(bias),
+        "diagonal": padded(diagonal),
+        "initial_impulses": padded(impulses),
+        "row_factor": padded(rows),
+        "row_incident": padded(np.zeros(count)),
+        "row_type": padded(kinds, np.int32),
+        "row_parent": padded(parents, np.int32),
+        "row_mu": padded(mu),
+        "support_row_class": np.zeros((worlds, capacity), np.int32),
+        "support_class_dof": np.arange(dofs, dtype=np.int32)[None],
+        "iterations": np.array(8),
+        "omega": np.array(omega),
+        "friction_start_iteration": np.array(delay),
+        "iteration_offset": np.array(iteration_offset),
+        "reference_factor_delta": np.zeros((worlds, dofs), np.float32),
+    }
+    velocity, impulse = _sweep(
+        rows,
+        rows,
+        np.zeros(dofs),
+        bias,
+        diagonal,
+        kinds,
+        parents,
+        mu,
+        impulses,
+        omega=omega,
+        friction_start=delay,
+        iteration_offset=iteration_offset,
+        active_rows=active,
+        linked_rows=True,
+    )
+    physical = {
+        "factor": np.eye(dofs),
+        "initial": np.zeros(dofs),
+        "expected_velocity": velocity,
+        "expected_impulse": impulse,
+    }
+    return data, physical
 
 
 class TestSparseContactTriplets(unittest.TestCase):
@@ -441,6 +549,133 @@ class TestSparseContactTriplets(unittest.TestCase):
             control.launch()
             wp.capture_launch(captured.graph)
             assert_output(self, data, *candidate.result(), reference=control.result())
+
+
+class TestSparseContactTripletsPatch(unittest.TestCase):
+    """Fuse patch anchor units, pooling their ring loads, in the linked active and full sweeps."""
+
+    def test_linked_factory_cpu(self):
+        """Admit ring-linked normals to the transaction in either sweep, and keep point variants unlinked."""
+        options = {"use_support_table": True, "contact_triplets": True}
+        active = _get_pgs_solve_sparse_kernel(192, 12, 12, active_rows=True, linked_rows=True, **options)
+        full = _get_pgs_solve_sparse_kernel(192, 12, 12, linked_rows=True, **options)
+        point = _get_pgs_solve_sparse_kernel(192, 12, 12, active_rows=True, **options)
+        self.assertTrue(active.key.endswith("_active_support_table_contact_triplets_linked"))
+        self.assertTrue(full.key.endswith("_0_0_support_table_contact_triplets_linked"))
+        self.assertTrue(point.key.endswith("_active_support_table_contact_triplets"))
+        # Point friction fuses only in the active sweep, and nothing fuses without support tables.
+        for unfused in ({"use_support_table": True}, {"active_rows": True, "linked_rows": True}):
+            with self.subTest(options=unfused):
+                kernel = _get_pgs_solve_sparse_kernel(192, 12, 12, contact_triplets=True, **unfused)
+                self.assertNotIn("contact_triplets", kernel.key)
+
+    def test_patch_triplet_admission_cpu(self):
+        """Fuse patch triplets in the linked active scan or the full sweep; never in packed, split or free sweeps."""
+        cases = (
+            # Probe changes, active rows, split, velocity limits, support table, fits, flag; admitted, reason.
+            ({}, True, False, False, True, True, "1", True, "active-row scan"),
+            ({}, False, False, False, True, True, "1", True, "full ordered sweep"),
+            ({"_sparse_solve_lanes": 16}, False, False, False, True, True, "1", False, "16-lane"),
+            ({}, False, True, False, True, True, "1", False, "split"),
+            ({}, False, False, True, True, True, "1", False, "velocity-limit"),
+            ({"_has_free_rigid_bodies": True}, False, False, False, True, True, "1", False, "free-body"),
+            ({}, True, False, False, False, True, "1", False, "support table"),
+            ({}, True, False, False, True, False, "1", False, "shared memory"),
+            ({}, True, False, False, True, True, "0", False, "opt-in"),
+            # Point friction keeps its rule: triplets need the active-row scan.
+            ({"_friction_anchors_enabled": False}, False, False, False, True, True, "1", False, "active-row scan"),
+            ({"_friction_anchors_enabled": False}, True, False, False, True, True, "1", True, "registers."),
+        )
+        for changes, active, split, velocity, table, fits, flag, admitted, phrase in cases:
+            probe = SimpleNamespace(
+                _friction_anchors_enabled=True, _has_free_rigid_bodies=False, _sparse_solve_lanes=32
+            )
+            for name, value in changes.items():
+                setattr(probe, name, value)
+            with (
+                self.subTest(changes=changes, active=active, split=split, velocity=velocity, table=table, fits=fits),
+                mock.patch.dict(os.environ, {"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": flag}, clear=True),
+            ):
+                decision, reason = SolverFeatherPGS._admit_sparse_contact_triplets(
+                    probe,
+                    active_rows=active,
+                    split_candidate=split,
+                    velocity_candidate=velocity,
+                    use_support_table=table,
+                    fits=fits,
+                )
+                self.assertEqual(decision, admitted)
+                self.assertIn(phrase, reason)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
+    def test_linked_triplets_equal_linked_sweeps_bitwise_cuda(self):
+        """Match the same linked sweep without triplets bitwise, and the ring-pooled physical reference.
+
+        Self-loops, two- and three-member rings, interleaved one- and three-row units
+        and an unlinked anchor, with and without a 30-row lead that moves records and
+        rings across 32-row words; zero and seeded impulses, delayed friction and
+        relaxation, in the linked active scan and in the full sweep.
+        """
+        settings = (
+            {},
+            {"seeded": True, "omega": 0.7},
+            {"seeded": True, "omega": 1.2, "delay": 3, "iteration_offset": 1},
+            {"seeded": True, "delay": 3, "iteration_offset": 4},
+            {"seeded": True, "omega": -0.5},
+        )
+        for (name, layout), pad, options, active in product(_LINKED_LAYOUTS.items(), (0, 30), settings, (True, False)):
+            with self.subTest(layout=name, pad=pad, active=active, **options):
+                data, physical = linked_fixture(layout, pad=pad, active=active, **options)
+                control = DeviceSolve(data, candidate=False, active=active, linked=True)
+                candidate = DeviceSolve(data, candidate=True, active=active, linked=True)
+                self.assertIn("_contact_triplets_linked", candidate.kernel.key)
+                self.assertNotIn("_contact_triplets", control.kernel.key)
+                control.launch()
+                candidate.launch()
+                delta, impulses = candidate.result()
+                np.testing.assert_array_equal(delta, control.result()[0])
+                np.testing.assert_array_equal(impulses, control.result()[1])
+                # The oracle pools each ring as the ordinary update does; a fused radius
+                # without the ring would leave it.
+                assert_output(self, data, delta, impulses, physical=physical)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Sparse construction requires CUDA")
+    def test_patch_host_admission_cuda(self):
+        """Build the linked triplet sweep the patch policy selects, and keep a small world's packed sweep."""
+        model = _branched_model(4, 3, "cuda:0")
+        for environment, suffix in (
+            ({"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "1"}, "_active_support_table_contact_triplets_linked"),
+            (
+                {"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "1", "FEATHER_PGS_PATCH_ACTIVE_ROWS": "0"},
+                "_0_0_support_table_contact_triplets_linked",
+            ),
+            ({"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "0"}, "_active_support_table_linked"),
+            ({"FEATHER_PGS_PATCH_ACTIVE_ROWS": "0"}, "_0_0_support_table"),
+        ):
+            with self.subTest(environment=environment), mock.patch.dict(os.environ, environment, clear=True):
+                solver = SolverFeatherPGS(
+                    model,
+                    pgs_mode="matrix_free",
+                    drive_mode="augmented",
+                    articulated_contact_response="immediate",
+                    enable_joint_velocity_limits=False,
+                    pgs_warmstart=False,
+                    mf_warmstart=False,
+                    dense_max_constraints=192,
+                    grouped_dynamics=False,
+                    mf_gs_parallel_rows=0,
+                    mf_gs_response_block_rows=0,
+                    use_parallel_streams=True,
+                )
+                self.assertEqual(solver._sparse_mass_matrix_size, 18)
+                key = solver._pgs_solve_sparse_kernel.key
+                self.assertTrue(key.endswith(suffix), key)
+                self.assertEqual(solver._sparse_contact_triplets, "contact_triplets" in suffix)
+        with mock.patch.dict(os.environ, {"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "1"}, clear=True):
+            packed = _make_solver(_build_model(), True)
+        self.assertEqual(packed._sparse_solve_lanes, 16)
+        self.assertFalse(packed._sparse_contact_triplets)
+        self.assertIn("16-lane", packed._sparse_contact_triplets_reason)
 
 
 def check_frozen_payload(path, *, device="cuda:0"):

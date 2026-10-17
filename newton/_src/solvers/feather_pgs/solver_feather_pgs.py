@@ -1140,13 +1140,17 @@ class SolverFeatherPGS(SolverBase):
     ``FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1`` before construction to cache tangent
     metrics within each solve and retain admitted normal/tangent updates in
     registers. It requires the active sparse sweep, one articulated coordinate
-    block per world, support tables, and no physical free-body response. Shared
-    memory limits retain the ordinary sparse owner; unsupported row metadata,
-    linked contacts, delayed friction, and negative relaxation retain ordinary
-    row updates. At most twelve used tangent pairs per world retain metrics;
-    additional pairs recompute their metrics without limiting solved rows.
-    The mode preserves the selected ordered sweeps and friction law. This
-    feature is experimental and may change without notice.
+    block per world, support tables, and no physical free-body response. Under
+    persistent patch friction it fuses each patch's anchor units, pooling the
+    ring's normal loads as the ordinary update does, bitwise, in the active
+    sweep or, with ``FEATHER_PGS_PATCH_ACTIVE_ROWS=0``, in the full ordered
+    sweep; small worlds keep their packed sweep. Shared memory limits retain
+    the ordinary sparse owner; unsupported row metadata, delayed friction, and
+    negative relaxation in the active sweep retain ordinary row updates. At
+    most twelve used tangent pairs per world retain metrics; additional pairs
+    recompute their metrics without limiting solved rows. The mode preserves
+    the selected ordered sweeps and friction law. This feature is
+    experimental and may change without notice.
 
     """
 
@@ -5344,6 +5348,9 @@ class SolverFeatherPGS(SolverBase):
                     )
         # Unsupported mixed worlds retain explicit row indices and their existing kernels.
         use_support_table = bool(self._sparse_row_support.enabled)
+        # Reuse the local solver's small-world packing without changing this
+        # owner's row representation, sweep policy or velocity-limit phase.
+        self._sparse_solve_lanes = small_world_lanes if small_world_lanes and not active_rows else 32
         # The opt-in transaction retains a bounded set of five-scalar tangent
         # metrics, with one signed-byte map entry per possible full triplet.
         # Larger capacities keep the ordinary sparse owner at its launch bound.
@@ -5352,35 +5359,13 @@ class SolverFeatherPGS(SolverBase):
         # Include Warp's tiled base and align the two maps before their counters.
         metric_map_bytes = (2 * triplet_capacity + 3) // 4 * 4
         triplet_shared_bytes = 256 + 40 * metric_cache_size + metric_map_bytes + 8
-        triplets_requested = os.environ.get("FEATHER_PGS_SPARSE_CONTACT_TRIPLETS", "0") == "1"
-        # The point transaction pools no ring: patch rows keep ordinary updates.
-        self._sparse_contact_triplets = bool(
-            triplets_requested
-            and active_rows
-            and not self._friction_anchors_enabled
-            and use_support_table
-            and triplet_capacity > 0
-            and solve_shared_bytes + triplet_shared_bytes <= shared_limit
+        self._sparse_contact_triplets, self._sparse_contact_triplets_reason = self._admit_sparse_contact_triplets(
+            active_rows=active_rows,
+            split_candidate=split_candidate,
+            velocity_candidate=velocity_candidate,
+            use_support_table=use_support_table,
+            fits=triplet_capacity > 0 and solve_shared_bytes + triplet_shared_bytes <= shared_limit,
         )
-        if self._sparse_contact_triplets:
-            self._sparse_contact_triplets_reason = (
-                "FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1: tangent metrics stay in registers."
-            )
-        elif not triplets_requested:
-            self._sparse_contact_triplets_reason = "Off: FEATHER_PGS_SPARSE_CONTACT_TRIPLETS is an opt-in."
-        elif not active_rows:
-            self._sparse_contact_triplets_reason = "Requested, but triplets need the active-row scan."
-        elif self._friction_anchors_enabled:
-            self._sparse_contact_triplets_reason = (
-                "Requested, but triplets fuse unlinked point rows; patch rings (friction_anchor_beta > 0) keep "
-                "ordinary updates."
-            )
-        elif not use_support_table:
-            self._sparse_contact_triplets_reason = "Requested, but triplets need the row support table."
-        else:
-            self._sparse_contact_triplets_reason = (
-                "Requested, but row capacity or shared memory leaves no triplet cache."
-            )
         index_shape = (1, 1, 1) if use_support_table else shape
         self._sparse_row_dof = wp.empty(index_shape, dtype=wp.int32, device=model.device)
         self._sparse_row_factor = wp.empty(shape, dtype=wp.float32, device=model.device)
@@ -5409,9 +5394,6 @@ class SolverFeatherPGS(SolverBase):
             prepare_rows=self._sparse_prepare_contacts,
             use_support_table=use_support_table,
         )
-        # Reuse the local solver's small-world packing without changing this
-        # owner's row representation, sweep policy or velocity-limit phase.
-        self._sparse_solve_lanes = small_world_lanes if small_world_lanes and not active_rows else 32
         local_factor_bytes = 4 * (64 // self._sparse_solve_lanes) * self.dense_max_constraints * self.max_world_dofs
         # Large resident workspaces regressed whole-step timing in measured
         # small systems. Keep the global-row consumer when the cache is large.
@@ -5495,6 +5477,50 @@ class SolverFeatherPGS(SolverBase):
             "Normal and limit rows are selected at sweep entry; a patch friction pair (friction_anchor_beta > 0) "
             "while any normal of its ring is selected or the pair holds impulse."
         )
+
+    def _admit_sparse_contact_triplets(
+        self,
+        *,
+        active_rows: bool,
+        split_candidate: bool,
+        velocity_candidate: bool,
+        use_support_table: bool,
+        fits: bool,
+    ) -> tuple[bool, str]:
+        """Decide whether the sparse sweep fuses contact triplets (``FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1``), and why.
+
+        Point friction fuses them in the active-row scan. Patch friction fuses its anchor
+        units, pooling their ring loads as the ordinary pair update does, in the active
+        scan or else in the full ordered sweep; split, velocity-limit, free-body and
+        packed small-world sweeps keep ordinary updates. Either way the transaction is
+        bitwise equal to the same sweep without it.
+
+        Args:
+            active_rows: Whether the sweep selects its rows at sweep entry.
+            split_candidate: Whether split mode sweeps the sparse rows.
+            velocity_candidate: Whether the sweep carries joint velocity-limit rows.
+            use_support_table: Whether rows read the shared support table.
+            fits: Whether the metric cache fits the row capacity and shared memory.
+        """
+        if os.environ.get("FEATHER_PGS_SPARSE_CONTACT_TRIPLETS", "0") != "1":
+            return False, "Off: FEATHER_PGS_SPARSE_CONTACT_TRIPLETS is an opt-in."
+        if not active_rows and not self._friction_anchors_enabled:
+            return False, "Requested, but triplets need the active-row scan."
+        if not active_rows and (split_candidate or velocity_candidate or self._has_free_rigid_bodies):
+            return False, "Requested, but split, velocity-limit and free-body sweeps keep ordinary updates."
+        if self._sparse_solve_lanes < 32:
+            return False, f"Requested, but small worlds keep their packed {self._sparse_solve_lanes}-lane full sweep."
+        if not use_support_table:
+            return False, "Requested, but triplets need the row support table."
+        if not fits:
+            return False, "Requested, but row capacity or shared memory leaves no triplet cache."
+        if self._friction_anchors_enabled:
+            sweep = "active-row scan" if active_rows else "full ordered sweep"
+            return True, (
+                f"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1: tangent metrics stay in registers; patch anchor units "
+                f"pool their ring loads in the {sweep}."
+            )
+        return True, "FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1: tangent metrics stay in registers."
 
     def _build_body_maps(self, model):
         if not model.body_count or not model.articulation_count:

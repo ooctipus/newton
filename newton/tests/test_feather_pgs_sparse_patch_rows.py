@@ -117,6 +117,8 @@ class TestFeatherPGSSparsePatchRows(unittest.TestCase):
                 self.assertEqual(friction["law"], law)
                 if law == "patch":
                     self.assertEqual("sparse active rows" in friction["reason"], not policy)
+                    # Linked triplets serve patch friction in either sweep.
+                    self.assertNotIn("triplets", friction["reason"])
                 self.assertEqual(
                     selected["environment"]["applied"].get("FEATHER_PGS_PATCH_ACTIVE_ROWS"),
                     environment.get("FEATHER_PGS_PATCH_ACTIVE_ROWS"),
