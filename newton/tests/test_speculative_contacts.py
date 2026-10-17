@@ -22,6 +22,7 @@ from newton._src.geometry.contact_reduction_global import (
     reclaim_contact_id,
     reduce_buffered_contacts_speculative_kernel,
     reduction_finalize_slot,
+    reduction_value_index,
 )
 from newton._src.geometry.narrow_phase import (
     ContactWriterData,
@@ -391,8 +392,8 @@ def _replace_validated_predictive_claims(
     fingerprint = int(7)
     provisional_clearance = make_contact_value(-0.1, fingerprint, 0, reducer_data.deterministic)
     provisional_impact = make_contact_value(0.1, fingerprint, 0, reducer_data.deterministic)
-    clearance_idx = clearance_slot * reducer_data.ht_capacity + entry_idx
-    impact_idx = impact_slot * reducer_data.ht_capacity + entry_idx
+    clearance_idx = reduction_value_index(entry_idx, clearance_slot)
+    impact_idx = reduction_value_index(entry_idx, impact_slot)
     reducer_data.ht_values[clearance_idx] = provisional_clearance
     reducer_data.ht_values[impact_idx] = provisional_impact
 
@@ -417,7 +418,6 @@ def _replace_validated_predictive_claims(
         provisional_clearance,
         clearance_final,
         reducer_data.ht_values,
-        reducer_data.ht_capacity,
     )
     if reduction_finalize_slot(
         entry_idx,
@@ -425,7 +425,6 @@ def _replace_validated_predictive_claims(
         provisional_impact,
         impact_final,
         reducer_data.ht_values,
-        reducer_data.ht_capacity,
     ):
         retained = True
     if not retained:

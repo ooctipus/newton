@@ -19,6 +19,8 @@ from newton._src.geometry.contact_reduction_global import (
     create_export_reduced_contacts_kernel,
     export_contact_to_buffer,
     make_contact_key,
+    reduction_value_index,
+    reduction_value_index_np,
 )
 from newton._src.geometry.hashtable import hashtable_find_or_insert
 from newton._src.geometry.narrow_phase import NarrowPhase, write_contact_simple
@@ -90,7 +92,7 @@ def _seed_entries(data: GlobalContactReducerData, enabled: wp.array[int]):
             if bin_index == 0 and slot == 6:
                 # Nonzero winner with reserved ID zero must never reach the writer.
                 value = wp.uint64(1) << wp.uint64(32)
-            data.ht_values[slot * data.ht_capacity + entry] = value
+            data.ht_values[reduction_value_index(entry, slot)] = value
 
 
 @wp.kernel
@@ -161,7 +163,7 @@ class _Fixture:
 
 class TestContactReductionExportCleanup(unittest.TestCase):
     def test_consumed_entries_retire_cpu(self):
-        """Publish a winning contact before retiring its key and every winner plane."""
+        """Publish a winning contact before retiring its key and every winner slot."""
         device = "cpu"
         reducer = GlobalContactReducer(8, device=device)
         capacity = reducer.hashtable.capacity
@@ -173,7 +175,8 @@ class TestContactReductionExportCleanup(unittest.TestCase):
         active[0], active[capacity] = entry, 1
         reducer.hashtable.active_slots.assign(active)
         values = np.zeros(reducer.ht_values.shape[0], dtype=np.uint64)
-        values[entry::capacity] = 1
+        winners = reduction_value_index_np(entry, np.arange(VALUES_PER_KEY))
+        values[winners] = 1
         reducer.ht_values.assign(values)
         reducer.contact_count.fill_(1)
         reducer.ht_insert_failures.fill_(3)
@@ -204,7 +207,7 @@ class TestContactReductionExportCleanup(unittest.TestCase):
             device=device,
         )
         self.assertEqual(int(output.numpy()[0]), 1)
-        self.assertTrue(np.all(reducer.ht_values.numpy()[entry::capacity] == 0))
+        self.assertTrue(np.all(reducer.ht_values.numpy()[winners] == 0))
         self.assertEqual(int(reducer.hashtable.keys.numpy()[entry]), (1 << 64) - 1)
         self.assertEqual(int(reducer.hashtable.active_slots.numpy()[capacity]), 1)
         self.assertEqual(int(reducer.contact_count.numpy()[0]), 1)

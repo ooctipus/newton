@@ -29,6 +29,8 @@ from newton._src.geometry.contact_reduction_global import (
     export_and_reduce_contact_centered_two_spatial_depths,
     export_contact_to_buffer,
     make_contact_key,
+    reduction_value_index,
+    reduction_value_index_np,
 )
 from newton._src.geometry.hashtable import hashtable_find_or_insert
 from newton._src.geometry.narrow_phase import ContactWriterData
@@ -64,9 +66,8 @@ def get_winning_contacts(reducer: GlobalContactReducer) -> list[int]:
 
     for i in range(count):
         entry_idx = active_slots_np[i]
-        # Slot-major layout: slot * capacity + entry_idx
         for slot in range(values_per_key):
-            val = values[slot * capacity + entry_idx]
+            val = values[reduction_value_index_np(entry_idx, slot)]
             if val != 0:
                 contact_id = int(val) & contact_id_mask
                 contact_ids.add(contact_id)
@@ -514,7 +515,7 @@ def test_clear_active(test, device):
 
 
 def test_clear_active_coalesced(test, device, active_count=CLEAR_ACTIVE_ENTRY_PARALLEL_THRESHOLD):
-    """Verify the coalesced branch resets directly seeded active entries."""
+    """Verify a clear branch resets directly seeded active entries."""
     reducer = GlobalContactReducer(
         capacity=4 * active_count,
         device=device,
@@ -564,8 +565,11 @@ def test_clear_active_coalesced(test, device, active_count=CLEAR_ACTIVE_ENTRY_PA
         reducer.hashtable.keys.numpy()[active_entries],
         np.full(active_count, np.iinfo(np.uint64).max, dtype=np.uint64),
     )
-    cleared_values = reducer.ht_values.numpy().reshape(reducer.values_per_key, ht_capacity)[:, active_entries]
-    np.testing.assert_array_equal(cleared_values, 0)
+    # Clearing retires each active entry's whole row and leaves other rows alone.
+    values = reducer.ht_values.numpy()
+    rows = reduction_value_index_np(np.arange(ht_capacity)[:, None], np.arange(reducer.values_stride))
+    np.testing.assert_array_equal(values[rows[active_entries]], 0)
+    np.testing.assert_array_equal(values[rows[active_count:]], 1)
     for values in entry_arrays:
         np.testing.assert_array_equal(values.numpy()[active_entries], 0.0)
 
@@ -667,15 +671,15 @@ def test_export_reduced_contacts_kernel(test, device):
         entry_idx = hashtable_find_or_insert(
             make_contact_key(10, 110, 0), reducer_data.ht_keys, reducer_data.ht_active_slots
         )
-        reducer_data.ht_values[entry_idx] = _make_contact_value_fast(1.0, 30, contact_a)
+        reducer_data.ht_values[reduction_value_index(entry_idx, 0)] = _make_contact_value_fast(1.0, 30, contact_a)
 
         sentinel_entry_idx = hashtable_find_or_insert(
             make_contact_key(11, 111, 0), reducer_data.ht_keys, reducer_data.ht_active_slots
         )
-        reducer_data.ht_values[sentinel_entry_idx] = _make_contact_value_fast(2.0, 0, 0)
-        reducer_data.ht_values[reducer_data.ht_capacity + entry_idx] = _make_contact_value_fast(1.0, 20, contact_b)
-        reducer_data.ht_values[2 * reducer_data.ht_capacity + entry_idx] = _make_contact_value_fast(1.0, 10, contact_c)
-        reducer_data.ht_values[3 * reducer_data.ht_capacity + entry_idx] = _make_contact_value_fast(1.0, 30, contact_a)
+        reducer_data.ht_values[reduction_value_index(sentinel_entry_idx, 0)] = _make_contact_value_fast(2.0, 0, 0)
+        reducer_data.ht_values[reduction_value_index(entry_idx, 1)] = _make_contact_value_fast(1.0, 20, contact_b)
+        reducer_data.ht_values[reduction_value_index(entry_idx, 2)] = _make_contact_value_fast(1.0, 10, contact_c)
+        reducer_data.ht_values[reduction_value_index(entry_idx, 3)] = _make_contact_value_fast(1.0, 30, contact_a)
 
         distinct_entry_idx = hashtable_find_or_insert(
             make_contact_key(12, 112, 0), reducer_data.ht_keys, reducer_data.ht_active_slots
@@ -690,7 +694,7 @@ def test_export_reduced_contacts_kernel(test, device):
                 fingerprint=100 + slot,
                 reducer_data=reducer_data,
             )
-            reducer_data.ht_values[slot * reducer_data.ht_capacity + distinct_entry_idx] = _make_contact_value_fast(
+            reducer_data.ht_values[reduction_value_index(distinct_entry_idx, slot)] = _make_contact_value_fast(
                 1.0, 100 + slot, contact_id
             )
 
@@ -1528,7 +1532,7 @@ def test_deterministic_identical_across_runs(test, device):
         for i in range(count):
             entry_idx = active_slots_np[i]
             for slot in range(reducer.values_per_key):
-                val = values[slot * capacity + entry_idx]
+                val = values[reduction_value_index_np(entry_idx, slot)]
                 if val != 0:
                     contact_id = int(val) & ((1 << 20) - 1)
                     if contact_id not in seen_ids:
@@ -1572,6 +1576,13 @@ add_function_test(TestGlobalContactReducer, "test_clear", test_clear, devices=de
 add_function_test(TestGlobalContactReducer, "test_stress_many_contacts", test_stress_many_contacts, devices=devices)
 add_function_test(TestGlobalContactReducer, "test_clear_active", test_clear_active, devices=devices)
 add_function_test(TestGlobalContactReducer, "test_clear_active_coalesced", test_clear_active_coalesced, devices=devices)
+add_function_test(
+    TestGlobalContactReducer,
+    "test_clear_active_per_value",
+    test_clear_active_coalesced,
+    devices=devices,
+    active_count=CLEAR_ACTIVE_ENTRY_PARALLEL_THRESHOLD - 1,
+)
 add_function_test(
     TestGlobalContactReducer,
     "test_clear_active_grid_stride",

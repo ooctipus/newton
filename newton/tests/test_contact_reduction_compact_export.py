@@ -32,7 +32,6 @@ def _equal_id_pairs(
     output[pair] = _roundoff_duplicate_bit_for_slot_pair(
         pair,
         0,
-        1,
         values,
         positions,
         normals,

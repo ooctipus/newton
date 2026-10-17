@@ -30,6 +30,7 @@ from newton._src.geometry.contact_reduction_global import (
     create_export_reduced_contacts_kernel,
     export_contact_to_buffer,
     make_contact_key,
+    reduction_value_index,
 )
 from newton._src.geometry.hashtable import hashtable_find_or_insert
 from newton._src.geometry.types import GeoType
@@ -149,13 +150,13 @@ def seed_pool(
         entry = hashtable_find_or_insert(
             make_contact_key(pair[0], pair[1], bins[i]), data.ht_keys, data.ht_active_slots
         )
-        data.ht_values[slots[i] * data.ht_capacity + entry] = _make_contact_value_fast(1.0, i + 1, contact_id)
+        data.ht_values[reduction_value_index(entry, slots[i])] = _make_contact_value_fast(1.0, i + 1, contact_id)
         if i == 0:
             # The same ID in a normal and voxel key must not consume two slots.
             duplicate_entry = hashtable_find_or_insert(
                 make_contact_key(pair[0], pair[1], 34), data.ht_keys, data.ht_active_slots
             )
-            data.ht_values[duplicate_entry] = _make_contact_value_fast(1.0, i + 1, contact_id)
+            data.ht_values[reduction_value_index(duplicate_entry, 0)] = _make_contact_value_fast(1.0, i + 1, contact_id)
 
 
 def exercise_export(test, device):
