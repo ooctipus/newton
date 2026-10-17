@@ -11,6 +11,9 @@ import newton
 from newton.solvers import SolverFeatherPGS
 
 DT = 1.0 / 60.0
+# FK/ID reuse and the parallel inertia refresh belong to the ordinary dense
+# route; keep sparse factors and cache owners off under either friction law.
+ORDINARY_ROUTE = {"sparse_mass_matrix": "off", "cached_dynamics": "off"}
 # Per-articulation initial pose/velocity: [base, left branch, right branch].
 INITIAL_JOINT_Q = (0.7, 0.3, -0.4)
 INITIAL_JOINT_QD = (0.5, -0.2, 0.3)
@@ -206,7 +209,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
     def test_fk_id_launch_storage_exists_when_reuse_is_disabled(self):
         """Keep the unconditional FK/ID launch output valid without reuse."""
         model = _build_model("cuda:0", num_worlds=1, ground=False)
-        solver = SolverFeatherPGS(model, pgs_mode="matrix_free", enable_joint_velocity_limits=True)
+        solver = SolverFeatherPGS(model, pgs_mode="matrix_free", enable_joint_velocity_limits=True, **ORDINARY_ROUTE)
         self.assertFalse(solver._fk_id_cache_enabled)
         self.assertEqual(solver._fk_id_cache_valid.shape[0], model.articulation_count)
 
@@ -221,7 +224,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         trajectories = []
         for invalidate_fk_each_step in (False, True):
             model = _build_model("cuda:0", ground=False)
-            solver = SolverFeatherPGS(model, update_mass_matrix_interval=2)
+            solver = SolverFeatherPGS(model, update_mass_matrix_interval=2, **ORDINARY_ROUTE)
             trajectory, mass_masks = _run_state_trajectory(
                 model, solver, num_steps=20, invalidate_fk_each_step=invalidate_fk_each_step
             )
@@ -240,7 +243,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         trajectories = []
         for invalidate_fk_each_step in (False, True):
             model = _build_floating_model("cuda:0")
-            solver = SolverFeatherPGS(model, update_mass_matrix_interval=2)
+            solver = SolverFeatherPGS(model, update_mass_matrix_interval=2, **ORDINARY_ROUTE)
             trajectory, mass_masks = _run_floating_trajectory(
                 model, solver, num_steps=20, invalidate_fk_each_step=invalidate_fk_each_step
             )
@@ -263,6 +266,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
                 update_mass_matrix_interval=1,
                 double_buffer=False,
                 use_parallel_streams=use_parallel_streams,
+                **ORDINARY_ROUTE,
             )
             trajectories.append(_run_trajectory(model, solver, num_steps=20))
 
@@ -278,12 +282,14 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
             update_mass_matrix_interval=1,
             double_buffer=False,
             use_parallel_streams=True,
+            **ORDINARY_ROUTE,
         )
         eager_solver = SolverFeatherPGS(
             eager_model,
             update_mass_matrix_interval=1,
             double_buffer=False,
             use_parallel_streams=False,
+            **ORDINARY_ROUTE,
         )
         graph_state, graph_out = _make_initial_state(graph_model), graph_model.state()
         eager_state, eager_out = _make_initial_state(eager_model), eager_model.state()

@@ -49,8 +49,12 @@ def _build_pendulums(device, worlds=5):
 
 def _rollout(model, fused, *, steps=48, dt=1.0 / 240.0, graph=False, **solver_kwargs):
     device = model.device
+    # The fused publication belongs to the general dense route: keep sparse
+    # factors and cache owners off under either friction law.
     with patch.object(solver_module, "_FUSED_PUBLISH", fused):
-        solver = SolverFeatherPGS(model, pgs_iterations=6, **solver_kwargs)
+        solver = SolverFeatherPGS(
+            model, pgs_iterations=6, sparse_mass_matrix="off", cached_dynamics="off", **solver_kwargs
+        )
     # Admission is decided at construction; the first step may be a graph capture.
     admitted = solver._fused_publication
     pipeline = newton.CollisionPipeline(model)
