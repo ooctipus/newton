@@ -571,8 +571,9 @@ def _rollout(
     """Swing the arms and toss every ``toss_every``-th free body; return the solver, poses and resolved masks.
 
     ``history`` collects one record per step: the stored anchor validity (``valid``), the count of
-    contacts the classifier marked CONTACT_PATH_RESOLVED (``marked``) and, with the classifier, the
-    worlds whose rows all separate (``separating``) and those it resolved (``resolved``).
+    contacts the classifier marked CONTACT_PATH_RESOLVED (``marked``), how many of those held an
+    anchor when the patch finish began, which releases it (``released``), and, with the classifier,
+    the worlds whose rows all separate (``separating``) and those it resolved (``resolved``).
     """
     env = {
         "FEATHER_PGS_PREDICTED_TWISTS": str(int(published)),
@@ -605,8 +606,20 @@ def _rollout(
     for joint in np.flatnonzero(types == int(newton.JointType.FREE))[::toss_every]:
         qd[qd_start[joint] + 2] = 1.0
     states[0].joint_qd.assign(qd)
+    held = []
+    if history is not None:
+        patches = solver._friction_patches
+        finish = patches.finish
+
+        def finish_and_record(*args, **kwargs):
+            # The anchors the contacts hold before the finish keeps or releases them.
+            held.append(patches.current.valid.numpy().copy())
+            finish(*args, **kwargs)
+
+        patches.finish = finish_and_record
     poses, masks = [], []
     for _ in range(steps):
+        held.clear()
         pipeline.collide(states[0], contacts)
         states[0].clear_forces()
         solver.step(states[0], states[1], control, contacts, DT)
@@ -615,9 +628,12 @@ def _rollout(
         masks.append(solver._resolved_worlds.numpy().copy())
         if history is not None:
             count = int(contacts.rigid_contact_count.numpy()[0])
+            marked = solver.contact_path.numpy()[:count] == int(CONTACT_PATH_RESOLVED)
+            (anchors,) = held
             record = {
-                "valid": solver._friction_patches.previous.valid.numpy().copy(),
-                "marked": int(np.sum(solver.contact_path.numpy()[:count] == int(CONTACT_PATH_RESOLVED))),
+                "valid": patches.previous.valid.numpy().copy(),
+                "marked": int(np.sum(marked)),
+                "released": int(np.sum(marked & (anchors[:count] != 0))),
             }
             owner = solver._resolved_worlds_owner
             if owner is not None:
@@ -718,7 +734,8 @@ class TestResolvedWorldsCUDA(unittest.TestCase):
                 )
                 self.assertGreater(int(masks.sum()), 0)
                 self.assertLess(int(masks.sum()), masks.size)
-                self.assertGreater(sum(record["marked"] for record in history), 0, "no contact released its anchor")
+                # A marked contact need not hold an anchor: count the anchors the finish released.
+                self.assertGreater(sum(record["released"] for record in history), 0, "no marked contact held an anchor")
                 # Boxes start just above the ground; resting ones hold anchors once they land.
                 self.assertGreater(max(int(np.sum(record["valid"])) for record in complete_history), 0, "no anchor")
                 for step, (record, expected) in enumerate(zip(history, complete_history, strict=True)):
