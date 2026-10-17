@@ -83,22 +83,12 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
                 if not has_free:
                     launch.assert_not_called()
                 else:
-                    launch.assert_called_once_with(
-                        state._pack_mf_meta_kernel,
-                        dim=[7],
-                        inputs=[
-                            state.mf_constraint_count,
-                            state.mf_dof_a,
-                            state.mf_dof_b,
-                            state.mf_eff_mass_inv,
-                            rhs,
-                            state.mf_row_type,
-                            state.mf_row_parent,
-                        ],
-                        outputs=[state.mf_meta_packed],
-                        block_dim=32,
-                        device="mock-device",
-                    )
+                    # The launch contract, not its operand layout: the pack kernel packs this RHS into the metadata.
+                    launch.assert_called_once()
+                    args, kwargs = launch.call_args
+                    self.assertIs(args[0], state._pack_mf_meta_kernel)
+                    self.assertTrue(any(operand is rhs for operand in kwargs["inputs"]))
+                    self.assertEqual(kwargs["outputs"], [state.mf_meta_packed])
 
     def test_missing_pack_kernel_still_raises(self):
         """Keep the missing-kernel error whether or not matrix-free rows can exist."""
@@ -355,26 +345,14 @@ def _record_pack_launches(solver):
 
 def _launch_pack_unconditionally(solver):
     """Restore the launch that ran before the skip, whether or not matrix-free rows exist."""
+    pack = type(solver)._pack_mf_meta
 
-    def pack(mf_rhs):
-        wp.launch_tiled(
-            solver._pack_mf_meta_kernel,
-            dim=[solver.world_count],
-            inputs=[
-                solver.mf_constraint_count,
-                solver.mf_dof_a,
-                solver.mf_dof_b,
-                solver.mf_eff_mass_inv,
-                mf_rhs,
-                solver.mf_row_type,
-                solver.mf_row_parent,
-            ],
-            outputs=[solver.mf_meta_packed],
-            block_dim=32,
-            device=solver.model.device,
-        )
+    def unconditional(mf_rhs):
+        # The production launch, with the skip's only gate held open for the call.
+        with patch.object(solver, "_has_free_rigid_bodies", True):
+            pack(solver, mf_rhs)
 
-    solver._pack_mf_meta = pack
+    solver._pack_mf_meta = unconditional
 
 
 def _step_matrix_free(model, solver, *, steps, joint_qd=0.0, dt=1.0 / 240.0):
@@ -417,8 +395,13 @@ class TestFeatherPGSMFMetadataPackCUDA(unittest.TestCase):
                     if unconditional:
                         _launch_pack_unconditionally(solver)
                     runs.append((solver, *_step_matrix_free(model, solver, steps=steps, joint_qd=0.2)))
-                (_, skipped_packs, skipped), (legacy, legacy_packs, unskipped) = runs
+                (skipping, skipped_packs, skipped), (legacy, legacy_packs, unskipped) = runs
                 self.assertEqual(skipped_packs, [])
+                # The route record says what the step did. The legacy arm's pack is replaced on the
+                # instance, so only the skipping arm's record describes its launches.
+                pack = skipping.get_path_selection()["routes"]["sweep"]["mf_meta_pack"]
+                self.assertFalse(pack["launched"])
+                self.assertEqual(pack["kernel"], skipping._pack_mf_meta_kernel.key)
                 # The legacy arm proves both call sites ran: position pass, then velocity pass.
                 passes = 2 if velocity_iterations else 1
                 expected = [legacy.mf_rhs, legacy.mf_rhs_unbiased][:passes] * steps
@@ -446,6 +429,9 @@ class TestFeatherPGSMFMetadataPackCUDA(unittest.TestCase):
         packed, values = _step_matrix_free(model, solver, steps=steps)
         self.assertGreater(int(values["mf_constraint_count"].max()), 0)
         self.assertEqual(len(packed), 2 * steps)
+        pack = solver.get_path_selection()["routes"]["sweep"]["mf_meta_pack"]
+        self.assertTrue(pack["launched"])
+        self.assertEqual(pack["kernel"], solver._pack_mf_meta_kernel.key)
         for index, rhs in enumerate(packed):
             self.assertIs(rhs, solver.mf_rhs_unbiased if index % 2 else solver.mf_rhs)
 

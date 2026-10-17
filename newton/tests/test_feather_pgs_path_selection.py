@@ -16,6 +16,7 @@ import warp as wp
 import newton
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_feather_pgs_sparse_solver import _build_model, _make_solver
+from newton.tests.unittest_utils import assert_host_only
 
 
 def _cpu_model():
@@ -60,13 +61,33 @@ def _cpu_separate_worlds_model():
     return builder.finalize(device="cpu")
 
 
+def _launched_kernel_keys(model, solver):
+    """Step once through the collision pipeline and return the key of every kernel the step launched."""
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state_in, state_out = model.state(), model.state()
+    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+    pipeline.collide(state_in, contacts)
+    keys = []
+
+    def recording(launch):
+        def record(kernel, *args, **kwargs):
+            keys.append(getattr(kernel, "key", None))
+            return launch(kernel, *args, **kwargs)
+
+        return record
+
+    with patch.multiple(wp, launch=recording(wp.launch), launch_tiled=recording(wp.launch_tiled)):
+        solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
+    return keys
+
+
 class TestFeatherPGSPathSelection(unittest.TestCase):
     def test_cpu_selection_reasons_are_detached_and_host_only(self):
         """Explain CPU fallbacks without synchronizing or exposing mutable solver state."""
         solver = SolverFeatherPGS(_cpu_model())
-        with patch.object(wp, "synchronize", side_effect=AssertionError("unexpected synchronization")):
-            with patch.object(wp.array, "numpy", side_effect=AssertionError("unexpected device read")):
-                selected = solver.get_path_selection()
+        with assert_host_only():
+            selected = solver.get_path_selection()
         self.assertIn("CPU", selected["reasons"]["sparse_mass_matrix"])
         self.assertIn("CPU", selected["reasons"]["cached_dynamics"])
         self.assertIn("CPU", selected["reasons"]["kernel_plan_by_dof"][1]["cholesky_kernel"])
@@ -232,6 +253,31 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertIn("FEATHER_PGS_GROUPED_HINV_FREE", by_dof["6"]["reason"])
         self.assertEqual(selected["kernel_plan_by_dof"][6]["hinv_jt_kernel"], "par_row")
 
+    def test_cpu_route_record_matches_launched_kernels(self):
+        """Tie the record's sweep driver, row builders and root clamp to the kernels one CPU step launches."""
+        for name, model in (
+            ("mixed", _cpu_free_body_model()),
+            ("mixed_velocity_limits", _cpu_free_body_model(velocity_limit=1.0)),
+            ("separate_worlds", _cpu_separate_worlds_model()),
+            ("arm", _cpu_model()),
+        ):
+            with self.subTest(model=name):
+                solver = SolverFeatherPGS(model)
+                routes = solver.get_path_selection()["routes"]
+                sweep = routes["sweep"]
+                keys = _launched_kernel_keys(model, solver)
+                dense, free_body = sweep["dense"]["kernels"][0], sweep["free_body_matrix_free"]
+                sweeps = [key for key in keys if key in (dense, free_body)]
+                if sweep["driver"] == "split_interleaved":
+                    # One one-iteration dense sweep, then one free-body sweep, per iteration.
+                    self.assertEqual(sweeps, [dense, free_body] * solver.pgs_iterations)
+                else:
+                    self.assertEqual(sweep["driver"], "dense_split")
+                    self.assertEqual(sweeps, [dense] if free_body is None else [dense, free_body])
+                methods = routes["contact_rows"]["general_method_by_dof"]
+                self.assertEqual(keys.count("populate_world_J_for_size"), list(methods.values()).count("per_contact"))
+                self.assertEqual(routes["velocity_limits"]["root_clamp"], "clamp_free_root_velocity_limits" in keys)
+
     def test_cpu_split_route_reports_free_body_velocity_limit_rows(self):
         """Report free-body velocity-limit rows in split mode, where the row builder allocates them as well."""
         solver = SolverFeatherPGS(_cpu_free_body_model(velocity_limit=1.0))
@@ -239,8 +285,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertTrue(limits["rigid_body_limits"])
         self.assertIsNotNone(solver.rigid_velocity_limit_slot)
         self.assertTrue(limits["free_body_rows"])
-        # Split mode keeps the direct root clamp beside the rows.
-        self.assertEqual(limits["root_clamp"], bool(solver._has_root_free))
+        # Split mode keeps the direct root clamp of the free box beside the rows.
+        self.assertTrue(limits["root_clamp"])
 
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse admission requires CUDA")
     def test_route_record_reports_sparse_rows_and_tree_owner(self):
@@ -249,7 +295,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         with patch.dict(os.environ, {"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "1"}):
             point = _make_solver(model, True, friction_anchor_beta=0.0)
             patch_friction = _make_solver(model, True)
-        selected = point.get_path_selection()
+        with assert_host_only():
+            selected = point.get_path_selection()
+            patch_selected = patch_friction.get_path_selection()
         json.dumps(selected, allow_nan=False)
         routes = selected["routes"]
         sparse = routes["sparse_mass_matrix"]
@@ -261,7 +309,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertIn("_active", routes["sweep"]["sparse"])
         if sparse["contact_triplets"]:
             self.assertIn("_contact_triplets", routes["sweep"]["sparse"])
-        patch_sparse = patch_friction.get_path_selection()["routes"]["sparse_mass_matrix"]
+        patch_sparse = patch_selected["routes"]["sparse_mass_matrix"]
         self.assertFalse(patch_sparse["active_rows"])
         self.assertFalse(patch_sparse["contact_triplets"])
         if patch_sparse["size"] is not None:
@@ -295,7 +343,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 friction_anchor_beta=0.0,
                 dense_max_constraints=192,
             )
-        selected = solver.get_path_selection()
+        with assert_host_only():
+            selected = solver.get_path_selection()
         json.dumps(selected, allow_nan=False)
         routes = selected["routes"]
         paired = routes["paired_response"]
@@ -340,7 +389,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 except (ValueError, NotImplementedError):
                     continue  # The record describes admitted constructors only.
                 built += 1
-                selected = solver.get_path_selection()
+                with assert_host_only():
+                    selected = solver.get_path_selection()
                 json.dumps(selected, allow_nan=False)
                 applied = {name: option["applied"] for name, option in selected["options"].items()}
                 self.assertEqual(set(applied), set(inspect.signature(SolverFeatherPGS).parameters) - {"model"})

@@ -16,6 +16,7 @@ import time
 import unittest
 import xml.etree.ElementTree as ET
 from typing import Any
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -58,6 +59,25 @@ def patch_sys_module(name: str, module: Any):
             sys.modules.pop(name, None)
         else:
             sys.modules[name] = original
+
+
+@contextlib.contextmanager
+def assert_host_only():
+    """Fail on any Warp kernel launch, copy, synchronization or array read or write inside the block.
+
+    ``wp.array.list()`` and ``str()`` read through ``numpy()``, and ``clone()`` copies through
+    :func:`warp.copy`, so the patched entry points cover them.
+    """
+    targets = [
+        *(("wp", wp, name) for name in ("launch", "launch_tiled", "copy")),
+        *(("wp", wp, name) for name in ("synchronize", "synchronize_device", "synchronize_stream")),
+        *(("wp.array", wp.array, name) for name in ("numpy", "assign", "zero_", "fill_")),
+    ]
+    with contextlib.ExitStack() as stack:
+        for label, owner, name in targets:
+            error = AssertionError(f"unexpected device access: {label}.{name}")
+            stack.enter_context(mock.patch.object(owner, name, side_effect=error))
+        yield
 
 
 try:

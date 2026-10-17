@@ -16,7 +16,7 @@ from newton._src.geometry.coherent_convex import _ConvexQueryCache
 from newton._src.geometry.coherent_convex_rejection import _create_rejection_query_kernels
 from newton._src.geometry.convex_query_cost import _ConvexMethodChoice, _nonnegative_fit, _QueryCostModel
 from newton.tests.test_coherent_convex_rejection import _accepted, _box_inputs, _buffers, _original, _selector_model
-from newton.tests.unittest_utils import add_function_test, get_test_devices
+from newton.tests.unittest_utils import add_function_test, assert_host_only, get_test_devices
 
 # Pin every terrain route flag so a developer's shell cannot change the expected routes.
 _TERRAIN_ENVIRONMENT = {
@@ -253,7 +253,8 @@ class TestAutoConvexSelection(unittest.TestCase):
         for choice, environment, hull, table in cases:
             with self.subTest(choice=choice, environment=environment):
                 pipeline = _terrain_pipeline(model, choice, environment)
-                with patch.object(wp.array, "numpy", side_effect=AssertionError("unexpected device read")):
+                # No chooser exists on CPU, so the whole record is host-only here.
+                with assert_host_only():
                     selection = pipeline.get_collision_selection()
                 # Benchmark results store this record with json.dumps(..., allow_nan=False).
                 json.dumps(selection, allow_nan=False)
@@ -300,6 +301,10 @@ class TestAutoConvexSelection(unittest.TestCase):
         """Report that automatic terrain cells send hulls through GJK/MPR, not the closed-form hull row."""
         model = _terrain_model("cuda:0")
         pipeline = _terrain_pipeline(model, "auto")
+        # The sampled chooser's describe() reads the device by design; the route sections must not.
+        with assert_host_only():
+            pipeline._narrow_phase_selection()
+            pipeline._heightfield_selection()
         automatic = pipeline.get_collision_selection()
         json.dumps(automatic, allow_nan=False)
         terrain = automatic["heightfield"]
