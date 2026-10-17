@@ -22,9 +22,10 @@ cost on fixed contacts, not stability or end-to-end collision performance.
 Use ``--profile-stages`` to collect a separate uncaptured CUDA activity timeline
 after the throughput measurement, with warm starts independently controlled by
 ``--warmstart``. The timeline includes prepare/build/link/seed/finish/store kernel
-names and copies. Native patch radix sort is measured separately with CUDA
-events because it is absent from Warp's kernel activity list. Event spans include
-any stream gaps within the native call; neither measure is host wall-clock cost.
+names and copies. The patch sort is measured separately with CUDA events, both
+the native radix sort, which is absent from Warp's kernel activity list, and the
+live-slot sort that large contact capacities use instead. Event spans include
+any stream gaps within the sort; neither measure is host wall-clock cost.
 ``--tiles 13 --worlds 1`` is a synthetic 169-shape stress case, not the 175-hull
 Robotiq asset or evidence of that gripper's performance.
 """
@@ -50,23 +51,31 @@ def _apply_load(body_f: wp.array[wp.spatial_vector]):
 
 @contextmanager
 def _time_patch_sort(patches):
-    """Record CUDA event spans for native patch sorts outside the throughput measurement."""
+    """Record CUDA event spans for patch sorts outside the throughput measurement."""
     original = wp.utils.radix_sort_pairs
+    live_sort = patches._sort_live
     spans = []
 
-    def timed_sort(keys, values, count, *args, **kwargs):
-        if not patches.view.enabled or keys.ptr != patches.current.keys.ptr:
-            return original(keys, values, count, *args, **kwargs)
-        start = wp.Event(device=keys.device, enable_timing=True)
-        end = wp.Event(device=keys.device, enable_timing=True)
-        with wp.ScopedDevice(keys.device):
+    def timed(sort, device, *args, **kwargs):
+        start = wp.Event(device=device, enable_timing=True)
+        end = wp.Event(device=device, enable_timing=True)
+        with wp.ScopedDevice(device):
             wp.record_event(start)
-            result = original(keys, values, count, *args, **kwargs)
+            result = sort(*args, **kwargs)
             wp.record_event(end)
         spans.append((start, end))
         return result
 
-    with mock.patch.object(wp.utils, "radix_sort_pairs", timed_sort):
+    def timed_sort(keys, values, count, *args, **kwargs):
+        if not patches.view.enabled or keys.ptr != patches.current.keys.ptr:
+            return original(keys, values, count, *args, **kwargs)
+        return timed(original, keys.device, keys, values, count, *args, **kwargs)
+
+    # From the live-sort capacity on, build() sorts only the live slots instead.
+    with (
+        mock.patch.object(wp.utils, "radix_sort_pairs", timed_sort),
+        mock.patch.object(patches, "_sort_live", lambda: timed(live_sort, patches.device)),
+    ):
         yield spans
 
 

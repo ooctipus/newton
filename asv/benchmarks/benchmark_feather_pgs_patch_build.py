@@ -18,6 +18,7 @@ import inspect
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -141,26 +142,16 @@ def run(data, device, iterations, history):
         result["construction_ms"] = measure(lambda: patches.build(model, state, contacts))
         # _build mutates owner/next_contact. Restore prepared inputs each replay;
         # report the reset-inclusive span explicitly instead of subtracting noise.
-        patches.build(model, state, contacts)
+        # The replay repeats build()'s own _build launch, whose inputs the
+        # preceding passes of that build() left in place.
+        with mock.patch.object(wp, "launch", wraps=wp.launch) as launch:
+            patches.build(model, state, contacts)
+        (build_launch,) = (call for call in launch.call_args_list if call.args[0] is _build)
 
         def build_only():
             patches.current.owner.fill_(-1)
             patches.view.next_contact.fill_(-1)
-            wp.launch(
-                _build,
-                dim=capacity,
-                inputs=[
-                    contacts.rigid_contact_count,
-                    state.body_q,
-                    patches.previous_q,
-                    model.shape_transform,
-                    model.shape_collision_radius,
-                    patches.current,
-                    patches.previous,
-                    patches.view,
-                ],
-                device=device,
-            )
+            wp.launch(*build_launch.args, **build_launch.kwargs)
 
         result["build_with_reset_ms"] = measure(build_only)
     return result, outputs
