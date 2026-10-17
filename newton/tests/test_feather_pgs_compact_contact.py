@@ -972,7 +972,9 @@ class TestCompactContact(unittest.TestCase):
                 state = states[index][0]
                 newton.eval_fk(model, state.joint_q, state.joint_qd, state)
                 install_patch_contacts(model, state, contacts[index])
-            linked = independent = False
+            linked = False
+            independent = [False] * len(solvers)
+            serial = [False] * len(solvers)
             for _step in range(6):
                 for index, solver in enumerate(solvers):
                     current, following = states[index]
@@ -991,13 +993,17 @@ class TestCompactContact(unittest.TestCase):
                     assert_rows_close(reference, rows)
                     assert_contact_impulses_close(reference, rows)
                     assert_history_close(solvers[0], solvers[index])
-                for solver in solvers:
+                for index, solver in enumerate(solvers):
                     solver.check_constraint_capacity()
                     assert_ring_coulomb(solver)
+                    independent[index] |= bool(np.any(solver._sparse_contact_group_count.numpy() > 0))
+                    serial[index] |= bool(np.any(solver._sparse_contact_serial_count.numpy() > 0))
                 linked |= any(len(record["types"]) == 1 and record["parents"][0] >= 0 for record in reference.values())
-                independent |= bool(np.any(solvers[1]._sparse_contact_group_count.numpy() > 0))
             self.assertTrue(linked, "A normal-only unit must link into a patch ring")
-            self.assertTrue(independent, "A patch ring must schedule independently")
+            # In every arm the second star's support ring schedules independently; the coupled ring keeps the
+            # first star's support ring serial, in speculative batches.
+            self.assertEqual(independent, [True] * len(solvers), "A patch ring must schedule independently")
+            self.assertEqual(serial, [True] * len(solvers), "Patch rings on a coupled coordinate must stay serial")
             self.assertTrue(solvers[0]._friction_patches.previous.valid.numpy().any(), "Anchors must carry history")
 
     def test_cuda_complete_owners_and_two_graphs(self):

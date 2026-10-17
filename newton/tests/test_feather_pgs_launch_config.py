@@ -715,6 +715,19 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 sparse = run(optimized)
                 general = run(reference)
                 self.assertGreater(int(optimized.constraint_count.numpy().max()), 0, "no contact rows were generated")
+                # Each box's contacts act on its branch's coordinate alone, so they schedule independently.
+                # The serial list holds a head per row of capacity for units, and one per three rows for triples.
+                self.assertGreater(int(optimized._sparse_contact_group_count.numpy().max()), 0)
+                capacity = optimized.dense_max_constraints
+                self.assertEqual(
+                    optimized._sparse_contact_serial_normals.shape,
+                    (2, capacity if label == "patch" else (capacity + 2) // 3),
+                )
+                for kernel in (
+                    optimized._mark_independent_sparse_contact_candidates_kernel,
+                    optimized._build_independent_sparse_contact_groups_kernel,
+                ):
+                    self.assertEqual(kernel.key.endswith("_units"), label == "patch", kernel.key)
                 self.assertGreater(
                     float(np.abs(sparse[-1][1] - slick[-1][1]).max()),
                     1.0e-3,
