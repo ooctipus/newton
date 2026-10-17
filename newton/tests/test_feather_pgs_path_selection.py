@@ -287,7 +287,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(routes["contact_rows"]["producer"], "general")
         self.assertEqual(routes["contact_rows"]["general_method_by_dof"], {"6": "per_contact", "1": "per_contact"})
         self.assertFalse(routes["contact_rows"]["row_packets"]["enabled"])
-        self.assertIn("point contacts", routes["contact_rows"]["row_packets"]["reason"])
+        # Patch friction reaches the packet owner, which declines the CPU device.
+        self.assertIn("does not admit", routes["contact_rows"]["row_packets"]["reason"])
         self.assertFalse(routes["resolved_worlds"]["enabled"])
         self.assertIn("matrix-free route", routes["resolved_worlds"]["reason"])
         self.assertEqual(routes["publication"]["owner"], "ordinary")
@@ -297,8 +298,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(routes["friction"]["law"], "patch")
         self.assertEqual(routes["friction"]["anchor_beta_source"], "default")
         self.assertIn("need point friction", routes["friction"]["reason"])
-        # The compact contact boundary writes the patch row law as well.
+        # The compact contact boundary and the local packets write the patch row law as well.
         self.assertNotIn("compact contacts", routes["friction"]["reason"])
+        self.assertNotIn("local packets", routes["friction"]["reason"])
         self.assertIsNone(routes["sparse_mass_matrix"]["size"])
         self.assertFalse(routes["sparse_mass_matrix"]["active_rows"])
         self.assertIn("CPU", routes["sparse_mass_matrix"]["reason"])

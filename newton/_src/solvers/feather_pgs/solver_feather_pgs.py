@@ -2933,16 +2933,16 @@ class SolverFeatherPGS(SolverBase):
         )
         self._allocate_debug_buffers(model)
         self._scatter_armature_to_groups()
-        # The point-only producers below read _point_contact_paths, set after configure_contact_torsion.
         # Worlds of one limited articulation and at most one other get their
         # limit prefix and contact packets built in place for the local solve
-        # owners (row_packets.py); FEATHER_PGS_ROW_PACKETS=0 opts out.
+        # owners (row_packets.py), with the point or the patch row law;
+        # FEATHER_PGS_ROW_PACKETS=0 opts out. The keyed rows below stay point-only.
         self._row_packets = None
         if self._sparse_mass_matrix_size is not None:
             self._row_packets_reason = "Native sparse factors own the contact rows."
-        elif not self._point_contact_paths:
+        elif not self._law_agnostic_contact_paths:
             self._row_packets_reason = (
-                "Local packets implement point contacts; patch friction, torsion and compliance keep ordinary rows."
+                "Local packets implement the point and patch row laws; torsion and compliance keep ordinary rows."
             )
         elif os.environ.get("FEATHER_PGS_ROW_PACKETS", "1") != "1":
             self._row_packets_reason = "FEATHER_PGS_ROW_PACKETS disables local packets."

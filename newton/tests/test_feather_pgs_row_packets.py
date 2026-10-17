@@ -6,15 +6,279 @@
 import inspect
 import os
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import patch
 
 import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import kernels
 from newton._src.solvers.feather_pgs import row_packets as rp
+from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, link_patch_rows
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
+from newton.tests.feather_pgs_patch_parity import (
+    assert_contact_impulses_close,
+    assert_history_close,
+    assert_rows_close,
+    contact_rows,
+)
+from newton.tests.test_feather_pgs_compact_contact import assert_patch_tangent_law
 from newton.tests.test_feather_pgs_mixed_tree_free_body import DT, _build
+
+WORLDS, PRIMARY, SECONDARY, ROWS, PACKETS = 3, 3, 6, 48, 20
+# Per world, in contact order: shape0 and shape1 (the arm's links 0 and 1, the box 2, a static support 3,
+# or -1 for none), the rows allocation reserved (3 for an anchor's normal and tangents, 1 for a
+# normal-only unit) and the route (0 dense, 1 matrix-free, None rejected by allocation).
+_CONTACTS = (
+    (1, 2, 3, 0),  # the arm on the box
+    (2, 3, 3, 0),  # the box on its support: two anchors and a normal-only unit in one ring
+    (2, 3, 1, 0),
+    (2, 3, 3, 0),
+    (0, 1, 3, 0),  # the arm on itself
+    (3, 2, 1, 0),  # the support first
+    (2, 1, 3, 0),  # the box on the arm
+    (1, -1, 3, 0),  # no second shape
+    (2, 3, 3, 1),
+    (0, 3, 3, None),
+)
+# Patch rings by contact within a world; the rejected contact shares the support's ring.
+_RINGS = ((1, 2, 3, 9), (0, 6), (4,))
+# Limit rows before the contacts, and contacts kept, per world. The first and last worlds have more
+# rows than the packets hold.
+_PREFIX = (2, 0, 4)
+_KEPT = (10, 6, 10)
+# Row outputs of a contact producer, with their poison.
+_ROW_OUTPUTS = {
+    "row_type": (int, -777),
+    "row_parent": (int, -777),
+    "row_mu": (float, float("nan")),
+    "row_beta": (float, float("nan")),
+    "row_cfm": (float, float("nan")),
+    "phi": (float, float("nan")),
+    "target": (float, float("nan")),
+    "restitution": (float, float("nan")),
+    "rhs": (float, float("nan")),
+    "diag": (float, float("nan")),
+    "row_w": (float, float("nan")),
+}
+
+
+def _poisoned_rows(device):
+    return {
+        name: wp.full((WORLDS, ROWS), poison, dtype=dtype, device=device)
+        for name, (dtype, poison) in _ROW_OUTPUTS.items()
+    }
+
+
+def _patch_fixture(device="cpu", *, shared=0, friction_shared=0):
+    """Contacts of three arm-and-box worlds, their enabled patch view and poisoned row outputs.
+
+    Each world holds a primary arm (three coordinates over two links) and a secondary box (six).
+    The arm and the box touch each other in both shape orders, the arm touches itself, static
+    supports sit on either side, one contact has no second shape, and a matrix-free and a rejected
+    contact are skipped. Groups are permuted per size, the second world's box is prescribed and the
+    first world's box bounces. Returns the producer input and the layout.
+    """
+    rng = np.random.default_rng(1017)
+
+    def array(values, dtype):
+        return wp.array(values, dtype=dtype, device=device)
+
+    records = [
+        (world, local, *contact) for world, kept in enumerate(_KEPT) for local, contact in enumerate(_CONTACTS[:kept])
+    ]
+    count = len(records)
+    first = np.cumsum((0, *_KEPT))
+    world = np.array([record[0] for record in records], dtype=np.int32)
+    shape0 = np.array([4 * w + s0 for w, _, s0, _, _, _ in records], dtype=np.int32)
+    shape1 = np.array([4 * w + s1 if s1 >= 0 else -1 for w, _, _, s1, _, _ in records], dtype=np.int32)
+    shape_body = np.array([3 * w + s if s < 3 else -1 for w in range(WORLDS) for s in range(4)], dtype=np.int32)
+    body_art = np.array([2 * w + (k == 2) for w in range(WORLDS) for k in range(3)], dtype=np.int32)
+
+    def art(shape):
+        return int(body_art[shape_body[shape]]) if shape >= 0 and shape_body[shape] >= 0 else -1
+
+    needed = np.array([record[4] for record in records], dtype=np.int32)
+    slot = np.full(count, -1, dtype=np.int32)
+    path = np.zeros(count, dtype=np.int32)
+    dense_rows = list(_PREFIX)
+    free_rows = [0] * WORLDS
+    for c, (w, _, _, _, rows, route) in enumerate(records):
+        if route == 0:
+            slot[c], dense_rows[w] = dense_rows[w], dense_rows[w] + rows
+        elif route == 1:
+            slot[c], free_rows[w], path[c] = free_rows[w], free_rows[w] + rows, 1
+    next_contact = np.full(count, -1, dtype=np.int32)
+    for w, kept in enumerate(_KEPT):
+        for ring in _RINGS:
+            members = [first[w] + local for local in ring if local < kept]
+            for index, member in enumerate(members):
+                next_contact[member] = members[(index + 1) % len(members)]
+    view = FrictionPatches()
+    view.enabled = 1
+    view.weight = array(np.where(needed == 3, 0.5, 0.0).astype(np.float32), float)
+    view.next_contact = array(next_contact, int)
+    view.point_a = array(rng.normal(0.0, 0.3, (count, 3)).astype(np.float32), wp.vec3)
+    view.point_b = array(rng.normal(0.0, 0.3, (count, 3)).astype(np.float32), wp.vec3)
+    view.phi = array(rng.normal(0.0, 0.02, (count, 2)).astype(np.float32), wp.vec2)
+
+    data = rp.ContactInput()
+    data.count = array([count], int)
+    data.point0 = array(rng.normal(0.0, 0.1, (count, 3)).astype(np.float32), wp.vec3)
+    data.point1 = array(rng.normal(0.0, 0.1, (count, 3)).astype(np.float32), wp.vec3)
+    normal = rng.normal(size=(count, 3))
+    data.normal = array((normal / np.linalg.norm(normal, axis=1)[:, None]).astype(np.float32), wp.vec3)
+    data.shape0, data.shape1 = array(shape0, int), array(shape1, int)
+    data.margin0 = array(rng.uniform(0.0, 0.01, count).astype(np.float32), float)
+    data.margin1 = array(rng.uniform(0.0, 0.01, count).astype(np.float32), float)
+    data.world, data.slot, data.path = array(world, int), array(slot, int), array(path, int)
+    data.art0 = array([art(s) for s in shape0], int)
+    data.art1 = array([art(s) for s in shape1], int)
+    data.slots_needed = array(needed, int)
+    data.shape_body = array(shape_body, int)
+    poses = np.zeros((3 * WORLDS, 7), dtype=np.float32)
+    poses[:, :3] = rng.normal(size=(3 * WORLDS, 3))
+    quaternions = rng.normal(size=(3 * WORLDS, 4))
+    poses[:, 3:] = quaternions / np.linalg.norm(quaternions, axis=1)[:, None]
+    data.body_q = array(poses, wp.transform)
+    data.body_v = array(rng.normal(size=(3 * WORLDS, 6)).astype(np.float32), wp.spatial_vector)
+    data.body_mask = array(np.tile(np.array([0b1, 0b111, 0b111111]), WORLDS), wp.uint32)
+    data.response_dofs = array(np.tile(np.array([PRIMARY, SECONDARY]), WORLDS), int)
+    data.dof_start = array([9 * w + (3 if a else 0) for w in range(WORLDS) for a in range(2)], int)
+    data.origin = array(rng.normal(size=(2 * WORLDS, 3)).astype(np.float32), wp.vec3)
+    data.motion = array(rng.normal(size=(9 * WORLDS, 6)).astype(np.float32), wp.spatial_vector)
+    data.prescribed = array([int(a == 3) for a in range(2 * WORLDS)], int)
+    data.is_free = array(np.zeros(2 * WORLDS), int)
+    data.material_mu = array(rng.uniform(0.2, 1.2, 4 * WORLDS).astype(np.float32), float)
+    data.material_restitution = array([0.8 if s == 2 else 0.0 for s in range(4 * WORLDS)], float)
+    data.incident = array(rng.normal(0.0, 3.0, 9 * WORLDS).astype(np.float32), float)
+    data.shared_anchor, data.friction_shared_anchor = shared, friction_shared
+    data.friction_anchor_limit, data.friction_pairs_only = 0, 0
+    data.friction_scale, data.beta, data.cfm, data.dt = 0.85, 0.23, 2.0e-4, 1.0 / 240.0
+    data.bias_scale, data.speculative_scale, data.restitution_threshold, data.contact_w = 1.0, 0.6, 0.05, 1.0
+    for name, values in _poisoned_rows(device).items():
+        setattr(data, name, values)
+    layout = SimpleNamespace(
+        device=device,
+        view=view,
+        counts=array(dense_rows, int),
+        # Each size's groups are permuted against the worlds.
+        groups=array([group for w in range(WORLDS) for group in ((2, 0, 1)[w], (1, 2, 0)[w])], int),
+    )
+    return data, layout
+
+
+def _packet(device):
+    packet = rp.ContactPacketData()
+    packet.jacobian = wp.full((WORLDS, PACKETS, PRIMARY + SECONDARY), float("nan"), dtype=float, device=device)
+    packet.row_contact = wp.full((WORLDS, PACKETS), -1, dtype=int, device=device)
+    return packet
+
+
+def _law(view, beta=0.35):
+    law = rp.PatchRowLaw()
+    law.patches = view
+    law.beta = beta
+    return law
+
+
+def _run_general(data, layout, beta):
+    """Run the general patch route's row chain on the fixture's inputs, into fresh outputs.
+
+    As Franka's compact-Jacobian route: prepare_world_contact_rows writes the metadata,
+    populate_world_J_for_compact_size each size's Jacobian, compute_world_contact_bias the bias and
+    apply_world_contact_restitution_matrix_free the bounces. Returns the rows, the Jacobians by size
+    and the right-hand sides before the bounces.
+    """
+    device, rows = layout.device, SimpleNamespace(**_poisoned_rows(layout.device))
+    geometry = [data.point0, data.point1, data.normal, data.shape0, data.shape1, data.margin0, data.margin1]
+    metadata = [rows.row_type, rows.row_parent, rows.row_mu, rows.row_beta, rows.row_cfm, rows.phi, rows.target]
+    wp.launch(
+        kernels.prepare_world_contact_rows,
+        dim=16,
+        inputs=[
+            *(data.count, 16, *geometry),
+            *(data.world, data.slot, data.art0, data.art1, data.path, data.slots_needed),
+            *(data.shape_body, data.body_q, data.body_v, data.prescribed, data.origin),
+            *(data.material_mu, data.material_restitution, data.friction_shared_anchor, data.friction_scale),
+            *(data.shared_anchor, data.beta, data.cfm, layout.view, beta),
+        ],
+        outputs=[*metadata, rows.restitution],
+        device=device,
+    )
+    jacobians = {}
+    for size in (PRIMARY, SECONDARY):
+        jacobians[size] = wp.zeros((WORLDS, ROWS, size), dtype=float, device=device)
+        wp.launch(
+            kernels.populate_world_J_for_compact_size,
+            dim=(4, 32),
+            inputs=[
+                *(data.count, 4, *geometry),
+                *(data.slot, data.art0, data.art1, data.path, data.slots_needed, size, data.response_dofs),
+                *(layout.groups, data.dof_start, data.origin, data.body_mask, data.motion, data.shape_body),
+                *(data.body_q, data.friction_shared_anchor, layout.view, data.shared_anchor),
+            ],
+            outputs=[jacobians[size]],
+            device=device,
+        )
+    # The world Jacobian the general response gathers, which only the bounce reads.
+    groups = layout.groups.numpy()
+    world_jacobian = np.zeros((WORLDS, ROWS, PRIMARY + SECONDARY), dtype=np.float32)
+    for w in range(WORLDS):
+        world_jacobian[w, :, :PRIMARY] = jacobians[PRIMARY].numpy()[groups[2 * w]]
+        world_jacobian[w, :, PRIMARY:] = jacobians[SECONDARY].numpy()[groups[2 * w + 1]]
+    no_free_rows = wp.zeros(WORLDS, dtype=int, device=device)
+    wp.launch(
+        kernels.compute_world_contact_bias,
+        dim=WORLDS * ROWS,
+        inputs=[
+            *(layout.counts, ROWS, rows.phi, rows.row_beta, rows.row_type, rows.target, data.dt, data.bias_scale),
+            *(data.speculative_scale, 1.0, data.contact_w, no_free_rows, 0),
+        ],
+        outputs=[rows.rhs, rows.row_w],
+        device=device,
+    )
+    bias = rows.rhs.numpy().copy()
+    wp.launch(
+        kernels.apply_world_contact_restitution_matrix_free,
+        dim=WORLDS * ROWS,
+        inputs=[
+            *(layout.counts, ROWS, wp.full(WORLDS, PRIMARY + SECONDARY, dtype=int, device=device)),
+            *(rows.phi, rows.row_type, rows.target, rows.restitution, data.incident),
+            wp.array(np.arange(9 * WORLDS, dtype=np.int32).reshape(WORLDS, 9), dtype=int, device=device),
+            wp.array(world_jacobian, dtype=float, device=device),
+            *(data.dt, data.restitution_threshold, 0, no_free_rows, 0),
+        ],
+        outputs=[rows.rhs, rows.row_w],
+        device=device,
+    )
+    return rows, jacobians, bias
+
+
+def _launch(kernel, data, layout, *inputs):
+    """Launch a packet producer on the fixture as the owner does (one 32-lane worker per block)."""
+    wp.launch_tiled(kernel, dim=[4], inputs=[4, data, *inputs], block_dim=32, device=layout.device)
+
+
+def _contact_rows(data):
+    """Yield ``(contact, world, first row, row count)`` of every allocated dense-route contact."""
+    slots, paths = data.slot.numpy(), data.path.numpy()
+    for c, (w, rows) in enumerate(zip(data.world.numpy(), data.slots_needed.numpy(), strict=True)):
+        if paths[c] == 0 and slots[c] >= 0:
+            yield c, int(w), int(slots[c]), int(rows)
+
+
+def _link(data, layout, rows):
+    """Link the rows' patch rings and divide their coefficients, as the patch link does after the producer."""
+    routing = (data.world, data.slot, data.path, data.slots_needed)
+    wp.launch(
+        link_patch_rows,
+        dim=data.point0.shape[0],
+        inputs=[data.count, layout.view, *routing, 0, rows.row_parent, rows.row_mu],
+        device=layout.device,
+    )
 
 
 class TestRowPacketPlan(unittest.TestCase):
@@ -58,8 +322,255 @@ class TestRowPacketPlan(unittest.TestCase):
             self.assertNotIn(token, source)
 
 
-def _rollout(model, *, packets, steps=120, swing_stride=3):
-    """Swing the arms over the boxes; return the solver and the body poses."""
+def _owner_solver(device, *, anchors, beta=0.0):
+    """A solver namespace holding what the packet owner reads, over small arrays."""
+
+    def ints(*shape):
+        return wp.zeros(shape, dtype=int, device=device)
+
+    worlds = 2
+    view = FrictionPatches()
+    view.enabled = int(anchors)
+    for name, dtype in (("weight", float), ("next_contact", int), ("point_a", wp.vec3), ("point_b", wp.vec3)):
+        setattr(view, name, wp.zeros(4, dtype=dtype, device=device))
+    view.phi = wp.zeros(4, dtype=wp.vec2, device=device)
+    queue = {
+        name: ints(worlds)
+        for name in (
+            "_local_primary_articulation",
+            "_local_pair_articulation",
+            "_local_residual_pair_articulation",
+            "mf_constraint_count",
+            "constraint_count",
+            "_local_solve_owner",
+            "_local_general_worlds",
+        )
+    }
+    active = {
+        name: {PRIMARY: ints(worlds)}
+        for name in (
+            "_local_pair_active_counts",
+            "_local_pair_active_candidates",
+            "_local_pair_active_secondaries",
+            "_local_residual_active_counts",
+            "_local_residual_active_candidates",
+            "_local_residual_active_secondaries",
+        )
+    }
+    return SimpleNamespace(
+        model=SimpleNamespace(device=wp.get_device(device), articulation_count=2 * worlds),
+        world_count=worlds,
+        size_groups=[PRIMARY, SECONDARY],
+        _local_solve_max_rows=PACKETS // 2,
+        _local_residual_max_rows=PACKETS,
+        _local_residual_mf_max_rows=4,
+        **queue,
+        **active,
+        mf_body_a=ints(worlds, 4),
+        mf_body_b=ints(worlds, 4),
+        mf_row_type=ints(worlds, 4),
+        body_to_articulation=ints(3 * worlds),
+        _local_general_world_count=ints(1),
+        world_response_group_art_start={size: ints(worlds + 1) for size in (PRIMARY, SECONDARY)},
+        world_response_group_to_art={size: ints(worlds) for size in (PRIMARY, SECONDARY)},
+        art_group_idx=ints(2 * worlds),
+        J_by_size={size: wp.zeros((worlds, ROWS, size), dtype=float, device=device) for size in (PRIMARY, SECONDARY)},
+        _friction_anchors_enabled=anchors,
+        _friction_patches=SimpleNamespace(view=view),
+        friction_anchor_beta=beta,
+    )
+
+
+class TestRowPacketPatchRows(unittest.TestCase):
+    """CPU twins: the packet producers write the persistent patch rows of the general route."""
+
+    def test_patch_rows_match_the_general_route(self):
+        """Write every patch row field and Jacobian of the general route, then link the same rings.
+
+        Rows equal the general route's bitwise, except a bouncing normal row's right-hand side: its
+        incident velocity sums per body instead of per world coordinate.
+        """
+        beta = 0.35
+        for shared, friction_shared in ((0, 0), (0, 1), (1, 0), (1, 1)):
+            with self.subTest(shared=shared, friction_shared=friction_shared):
+                data, layout = _patch_fixture(shared=shared, friction_shared=friction_shared)
+                general, jacobians, bias = _run_general(data, layout, beta)
+                packet = _packet(layout.device)
+                _launch(rp.produce_patch_contacts, data, layout, _law(layout.view, beta), packet, PRIMARY, SECONDARY)
+                groups = layout.groups.numpy()
+                rhs, reference = data.rhs.numpy(), general.rhs.numpy()
+                jacobian, row_contact = packet.jacobian.numpy(), packet.row_contact.numpy()
+                bounces = anchors = unpacked = 0
+                for c, w, first, count in _contact_rows(data):
+                    rows = slice(first, first + count)
+                    for name in _ROW_OUTPUTS:
+                        if name in ("rhs", "diag", "row_w"):
+                            continue
+                        np.testing.assert_array_equal(
+                            getattr(data, name).numpy()[w, rows],
+                            getattr(general, name).numpy()[w, rows],
+                            err_msg=f"contact {c} {name}",
+                        )
+                    if reference[w, first] != bias[w, first]:
+                        bounces += 1
+                        self.assertNotEqual(rhs[w, first], bias[w, first], f"contact {c} must bounce")
+                        np.testing.assert_allclose(rhs[w, first], reference[w, first], rtol=1.0e-5, atol=1.0e-5)
+                    else:
+                        np.testing.assert_array_equal(rhs[w, first], reference[w, first], err_msg=f"contact {c} rhs")
+                    np.testing.assert_array_equal(
+                        rhs[w, first + 1 : first + count], reference[w, first + 1 : first + count]
+                    )
+                    np.testing.assert_array_equal(data.diag.numpy()[w, rows], np.float32(data.cfm))
+                    anchors += count == 3
+                    for row in range(first, first + count):
+                        if row >= PACKETS:
+                            unpacked += 1
+                            continue
+                        self.assertEqual(row_contact[w, row], 3 * c + row - first)
+                        np.testing.assert_array_equal(
+                            jacobian[w, row, :PRIMARY], jacobians[PRIMARY].numpy()[groups[2 * w], row]
+                        )
+                        np.testing.assert_array_equal(
+                            jacobian[w, row, PRIMARY:], jacobians[SECONDARY].numpy()[groups[2 * w + 1], row]
+                        )
+                # The fixture bounces, holds anchors and overflows the packets.
+                self.assertGreater(bounces, 0)
+                self.assertGreater(anchors, 0)
+                self.assertGreater(unpacked, 0)
+                # The patch link runs after the producer and writes the same ring parents and coefficients.
+                _link(data, layout, data)
+                _link(data, layout, general)
+                for name in ("row_parent", "row_mu"):
+                    np.testing.assert_array_equal(getattr(data, name).numpy(), getattr(general, name).numpy(), name)
+                parents = data.row_parent.numpy()
+                linked = [parents[w, first] for c, w, first, count in _contact_rows(data) if count == 1]
+                self.assertTrue(any(parent >= 0 for parent in linked), "A normal-only unit must join a ring")
+
+    def test_patch_fallback_matches_the_general_jacobians(self):
+        """Materialize only general worlds' patch rows, with the general route's Jacobians."""
+        for shared, friction_shared in ((0, 0), (1, 1)):
+            with self.subTest(shared=shared, friction_shared=friction_shared):
+                data, layout = _patch_fixture(shared=shared, friction_shared=friction_shared)
+                _, jacobians, _ = _run_general(data, layout, 0.35)
+                # The second world is locally owned; the others fall back to the general response.
+                owner = wp.array([0, 2, 0], dtype=int, device=layout.device)
+                groups = layout.groups.numpy()
+                for size in (PRIMARY, SECONDARY):
+                    # materialize_general_prefix has cleared the general worlds' rows; the local world's are stale.
+                    values = np.zeros((WORLDS, ROWS, size), dtype=np.float32)
+                    values[groups[2 + int(size == SECONDARY)]] = np.nan
+                    J = wp.array(values, dtype=float, device=layout.device)
+                    _launch(
+                        rp.materialize_patch_fallback, data, layout, _law(layout.view), owner, size, layout.groups, J
+                    )
+                    for c, w, first, count in _contact_rows(data):
+                        group, rows = groups[2 * w + int(size == SECONDARY)], slice(first, first + count)
+                        if w == 1:
+                            self.assertTrue(np.isnan(J.numpy()[group, rows]).all(), f"contact {c}")
+                        else:
+                            np.testing.assert_array_equal(
+                                J.numpy()[group, rows], jacobians[size].numpy()[group, rows], err_msg=f"contact {c}"
+                            )
+
+    def test_patch_tangent_rows_replace_the_point_law(self):
+        """Keep the point law's normal rows and move only the tangent rows to the patch law.
+
+        Tangent rows carry the anchor's phi and ``friction_anchor_beta``, keep the undivided
+        coefficient and act at the patch location; the point producer's act at the contact points
+        with no phi or beta. Normal rows differ only in the bias rounding, ``x * (1 / dt)`` against
+        the point producer's ``x / dt``.
+        """
+        beta = 0.35
+        data, layout = _patch_fixture()
+        point, _ = _patch_fixture()
+        packet, point_packet = _packet(layout.device), _packet(layout.device)
+        _launch(rp.produce_patch_contacts, data, layout, _law(layout.view, beta), packet, PRIMARY, SECONDARY)
+        _launch(rp.produce_contacts, point, layout, point_packet, PRIMARY, SECONDARY)
+        phi = layout.view.phi.numpy()
+        moved = 0.0
+        for c, w, first, count in _contact_rows(data):
+            for name in ("row_type", "row_parent", "row_mu", "row_beta", "row_cfm", "phi", "target", "restitution"):
+                np.testing.assert_array_equal(
+                    getattr(data, name).numpy()[w, first], getattr(point, name).numpy()[w, first], f"contact {c}"
+                )
+            np.testing.assert_allclose(
+                data.rhs.numpy()[w, first], point.rhs.numpy()[w, first], rtol=1.0e-6, atol=1.0e-6
+            )
+            if first < PACKETS:
+                np.testing.assert_array_equal(
+                    packet.jacobian.numpy()[w, first], point_packet.jacobian.numpy()[w, first]
+                )
+            if count != 3:
+                continue
+            tangents = slice(first + 1, first + 3)
+            np.testing.assert_array_equal(data.row_type.numpy()[w, tangents], kernels.PGS_CONSTRAINT_TYPE_FRICTION)
+            np.testing.assert_array_equal(data.row_parent.numpy()[w, tangents], first)
+            np.testing.assert_array_equal(data.phi.numpy()[w, tangents], phi[c])
+            np.testing.assert_array_equal(data.row_beta.numpy()[w, tangents], np.float32(beta))
+            np.testing.assert_array_equal(data.row_mu.numpy()[w, tangents], point.row_mu.numpy()[w, tangents])
+            np.testing.assert_array_equal(point.phi.numpy()[w, tangents], 0.0)
+            np.testing.assert_array_equal(point.row_beta.numpy()[w, tangents], 0.0)
+            moved = max(
+                moved, float(np.max(np.abs(data.target.numpy()[w, tangents] - point.target.numpy()[w, tangents])))
+            )
+            if first + 2 < PACKETS:
+                difference = packet.jacobian.numpy()[w, tangents] - point_packet.jacobian.numpy()[w, tangents]
+                moved = max(moved, float(np.max(np.abs(difference))))
+        self.assertGreater(moved, 1.0e-3, "Tangent rows must act at the patch friction location")
+
+    def test_owner_launches_the_friction_law_it_was_built_with(self):
+        """Launch the patch producer and fallback exactly under anchors, with the solver's patch view and beta."""
+        device = "cpu"
+        for anchors in (False, True):
+            with self.subTest(anchors=anchors):
+                solver = _owner_solver(device, anchors=anchors, beta=0.375 if anchors else 0.0)
+                with mock.patch.object(rp, "topology_signature", return_value=()):
+                    owner = rp.LocalRowPackets(solver, PRIMARY, SECONDARY, 0)
+                self.assertEqual(owner.patch_friction, anchors)
+                contact_input = rp.ContactInput()
+                with (
+                    mock.patch.object(rp, "bind", return_value=contact_input) as bind,
+                    mock.patch.object(rp.wp, "launch_tiled") as tiled,
+                    mock.patch.object(rp.wp, "launch") as launch,
+                ):
+                    owner.produce_contacts("state_in", "state_aug", "contacts", 0.25)
+                    owner.finish_rows()
+                bind.assert_called_once_with(solver, "state_in", "state_aug", "contacts", 0.25, 1.0)
+                self.assertEqual([call.args[0] for call in launch.call_args_list], [rp.finalize_and_queue])
+                producer = rp.produce_patch_contacts if anchors else rp.produce_contacts
+                fallback = rp.materialize_patch_fallback if anchors else rp.materialize_fallback
+                self.assertEqual(
+                    [call.args[0] for call in tiled.call_args_list],
+                    [producer, rp.materialize_general_prefix, fallback, rp.materialize_general_prefix, fallback],
+                )
+                laws = []
+                for call in (tiled.call_args_list[0], *tiled.call_args_list[2::2]):
+                    inputs = call.kwargs["inputs"]
+                    self.assertIs(inputs[1], contact_input)
+                    # The patch row law follows the contact input; the point kernels take none.
+                    self.assertEqual(isinstance(inputs[2], rp.PatchRowLaw.cls), anchors)
+                    laws.append(inputs[2])
+                self.assertIs(tiled.call_args_list[0].kwargs["inputs"][2 + int(anchors)], owner.packet)
+                if anchors:
+                    view = solver._friction_patches.view
+                    for law in laws:
+                        self.assertEqual(law.beta, 0.375)
+                        self.assertEqual(law.patches.enabled, 1)
+                        for name in ("weight", "next_contact", "point_a", "point_b", "phi"):
+                            self.assertIs(getattr(law.patches, name), getattr(view, name), name)
+
+
+# Drive each arm's capsule into the side of its box from first contact. The arm-box rows are the dense
+# patch rows (the box rests on matrix-free rows), so they carry load, friction and anchor phi.
+_PRESS = {"swing": 0.0, "start": -0.185, "target": -0.3}
+
+
+def _arm(model, *, packets, swing_stride=3, friction_anchor_beta=0.0, swing=1.5, start=0.0, target=0.0):
+    """Build one route with its own collision and states.
+
+    Every ``swing_stride``-th revolute joint starts at angle ``start`` and speed ``swing`` and is
+    driven to ``target``; by default the arms swing over the boxes from rest.
+    """
     env = {
         "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": "1",
         "FEATHER_PGS_TREE_KINETIC_STATE": "0",
@@ -73,28 +584,47 @@ def _rollout(model, *, packets, steps=120, swing_stride=3):
             pgs_iterations=8,
             enable_joint_limits=True,
             update_mass_matrix_interval=2,
-            friction_anchor_beta=0.0,
+            friction_anchor_beta=friction_anchor_beta,
         )
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
     states = [model.state() for _ in range(2)]
+    types, q_start, qd_start = model.joint_type.numpy(), model.joint_q_start.numpy(), model.joint_qd_start.numpy()
+    driven = np.flatnonzero(types == int(newton.JointType.REVOLUTE))[::swing_stride]
+    q = states[0].joint_q.numpy()
+    q[q_start[driven]] = start
+    states[0].joint_q.assign(q)
     newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
     control = model.control()
-    control.joint_target_q.assign(np.zeros_like(model.joint_target_q.numpy()))
+    targets = np.zeros_like(model.joint_target_q.numpy())
+    targets[qd_start[driven]] = target
+    control.joint_target_q.assign(targets)
     qd = np.zeros(model.joint_dof_count, dtype=np.float32)
-    types, qd_start = model.joint_type.numpy(), model.joint_qd_start.numpy()
-    for joint in np.flatnonzero(types == int(newton.JointType.REVOLUTE))[::swing_stride]:
-        qd[qd_start[joint]] = 1.5
+    qd[qd_start[driven]] = swing
     states[0].joint_qd.assign(qd)
+    return SimpleNamespace(solver=solver, pipeline=pipeline, contacts=contacts, states=states, control=control)
+
+
+def _step(arm, contacts=None):
+    """Advance one route by a step on its own collision, or on ``contacts``; return the contacts it used."""
+    if contacts is None:
+        arm.pipeline.collide(arm.states[0], arm.contacts)
+        contacts = arm.contacts
+    arm.states[0].clear_forces()
+    arm.solver.step(arm.states[0], arm.states[1], arm.control, contacts, DT)
+    arm.states.reverse()
+    return contacts
+
+
+def _rollout(model, *, packets, steps=120, **kwargs):
+    """Swing the arms over the boxes; return the solver and the body poses."""
+    arm = _arm(model, packets=packets, **kwargs)
     poses = []
     for _ in range(steps):
-        pipeline.collide(states[0], contacts)
-        states[0].clear_forces()
-        solver.step(states[0], states[1], control, contacts, DT)
-        states.reverse()
-        poses.append(states[0].body_q.numpy().copy())
+        _step(arm)
+        poses.append(arm.states[0].body_q.numpy().copy())
     wp.synchronize_device(model.device)
-    return solver, np.array(poses)
+    return arm.solver, np.array(poses)
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "The local solve owners are a CUDA path")
@@ -104,9 +634,13 @@ class TestRowPacketsCUDA(unittest.TestCase):
         self.assertIsNone(plain_solver._row_packets)
         solver, poses = _rollout(model, packets=True, **kwargs)
         self.assertIsInstance(solver._row_packets, rp.LocalRowPackets)
+        self.assertEqual(solver._row_packets.patch_friction, solver._friction_anchors_enabled)
         self.assertTrue(np.isfinite(poses).all())
         np.testing.assert_allclose(poses[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
         np.testing.assert_allclose(poses[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
+        if solver._friction_anchors_enabled:
+            self.assertTrue(plain_solver._friction_patches.previous.valid.numpy().any(), "The boxes hold anchors")
+            assert_history_close(plain_solver, solver)
         return solver
 
     def test_arm_and_box_match_the_ordinary_producers(self):
@@ -128,6 +662,61 @@ class TestRowPacketsCUDA(unittest.TestCase):
         model = _build(wp.get_device("cuda:0"), worlds=4, links=5)
         solver = self._compare(model)
         self.assertEqual(solver._row_packets.primary, 5)
+
+    def test_patch_friction_matches_the_ordinary_producers(self):
+        """Write the ordinary producers' persistent patch rows and track their rollout.
+
+        Both routes run the local owners under patch friction; only the row producer differs. The
+        arms press their boxes, so the dense patch rows carry friction from the first step, which
+        gives both solvers the same contacts: rows and impulses by contact agree to rounding. Every
+        anchor carries its patch phi and friction_anchor_beta, and the routes end with the same
+        poses, rows and anchor history.
+        """
+        model = _build(wp.get_device("cuda:0"), worlds=6)
+        plain, packets = (_arm(model, packets=enabled, friction_anchor_beta=0.2, **_PRESS) for enabled in (False, True))
+        self.assertIsNone(plain.solver._row_packets)
+        self.assertIsInstance(packets.solver._row_packets, rp.LocalRowPackets)
+        self.assertTrue(packets.solver._row_packets.patch_friction)
+        routes = packets.solver.get_path_selection()["routes"]
+        self.assertEqual(routes["friction"]["law"], "patch")
+        self.assertEqual(routes["contact_rows"]["producer"], "local_packets")
+        self.assertEqual(routes["sweep"]["local"]["factory"], "row_packets")
+        contacts = _step(plain)
+        _step(packets, contacts)
+        first = [contact_rows(arm.solver, contacts) for arm in (plain, packets)]
+        self.assertTrue(
+            any(len(record["types"]) == 3 and np.any(record["impulses"][1:] != 0.0) for record in first[0].values()),
+            "The arms must press their boxes with friction from the first step",
+        )
+        assert_rows_close(*first, atol=1.0e-6, rtol=1.0e-5)
+        assert_contact_impulses_close(*first, atol=1.0e-5, rtol=1.0e-4)
+        anchors, carried, poses = 0, 0, []
+        for _ in range(119):
+            for arm in (plain, packets):
+                _step(arm)
+            anchors += assert_patch_tangent_law(packets.solver, packets.contacts)
+            records = contact_rows(packets.solver, packets.contacts).values()
+            carried += sum(len(record["types"]) == 3 and np.any(record["patch"][1:3] != 0.0) for record in records)
+            poses.append([arm.states[0].body_q.numpy() for arm in (plain, packets)])
+        poses = np.array(poses)
+        self.assertTrue(np.isfinite(poses).all())
+        np.testing.assert_allclose(poses[:, 1], poses[:, 0], atol=1.0e-4, rtol=0.0)
+        self.assertGreater(anchors, 0)
+        self.assertGreater(carried, 0, "Anchors must carry tangential phi")
+        last = [contact_rows(arm.solver, arm.contacts) for arm in (plain, packets)]
+        assert_rows_close(*last)
+        assert_contact_impulses_close(*last)
+        self.assertTrue(plain.solver._friction_patches.previous.valid.numpy().any(), "Pressed boxes hold anchors")
+        assert_history_close(plain.solver, packets.solver)
+
+    def test_patch_friction_keeps_every_packet_layout(self):
+        """Admit the mimic prefix and a five-joint arm under patch friction, tracking the ordinary producers."""
+        for kwargs, layout in (({"worlds": 6, "mimic": True}, (3, 1)), ({"worlds": 4, "links": 5}, (5, 0))):
+            with self.subTest(**kwargs):
+                model = _build(wp.get_device("cuda:0"), **kwargs)
+                solver = self._compare(model, friction_anchor_beta=0.2, **_PRESS)
+                self.assertTrue(solver._row_packets.patch_friction)
+                self.assertEqual((solver._row_packets.primary, solver._row_packets.mimics), layout)
 
 
 if __name__ == "__main__":

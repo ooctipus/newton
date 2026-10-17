@@ -14,6 +14,11 @@ local owners decline (too many rows, matrix-free rows of another body,
 unsupported row kinds) have their rows materialized into the ordinary
 per-size buffers and run the ordinary response. Every size here comes from
 the solver's topology plan; nothing names a robot.
+
+Persistent patch friction writes its tangent rows with the patch row law.
+The patch link, ``_FrictionPatchState.link``, runs after this producer and
+alone links the patch rings and divides the friction coefficient; the
+local owners pool each ring's normal load from the linked parents.
 """
 
 from functools import cache, partial
@@ -23,7 +28,10 @@ import warp as wp
 
 from ...sim import ModelFlags
 from .contact_input import ContactInput, bind
+from .friction_patches import PatchRowLaw, patch_friction_location
 from .kernels import (
+    PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     contact_restitution_fires,
     contact_tangent_basis,
@@ -759,6 +767,218 @@ def materialize_fallback(
                 J[group1, output_row, dof] = value1
 
 
+@wp.func
+def patch_row_frame(
+    data: ContactInput,
+    row: int,
+    normal: wp.vec3,
+    tangent0: wp.vec3,
+    tangent1: wp.vec3,
+    point0: wp.vec3,
+    point1: wp.vec3,
+    friction0: wp.vec3,
+    friction1: wp.vec3,
+):
+    """Return a patch contact row's direction and endpoints.
+
+    The normal row acts at the contact points, or at their midpoint with a shared anchor. Tangent
+    rows act at the patch friction location, which takes the place of both shared anchors.
+    """
+    direction = normal
+    p0 = point0
+    p1 = point1
+    if row == 0:
+        if data.shared_anchor != 0:
+            p0 = 0.5 * (point0 + point1)
+            p1 = p0
+    else:
+        direction = tangent0
+        if row == 2:
+            direction = tangent1
+        p0 = friction0
+        p1 = friction1
+    return direction, p0, p1
+
+
+@wp.kernel(enable_backward=False)
+def produce_patch_contacts(
+    workers: int, data: ContactInput, law: PatchRowLaw, packet: ContactPacketData, primary: int, secondary: int
+):
+    """Project current contacts into physical packets with the persistent patch friction law.
+
+    Packets and metadata are those of :func:`produce_contacts`, except for the tangent rows, present
+    only when the contact owns an anchor: they act at the patch friction location, carry the anchor's
+    tangential phi with ``law.beta`` and keep the undivided friction coefficient. Every bias is formed
+    as ``compute_world_contact_bias`` forms it, times ``1 / dt``, so the rows equal the general
+    route's; only a bouncing normal row sums its incident velocity per body, as
+    :func:`produce_contacts` does, instead of per world coordinate.
+    """
+    worker, _logical_lane = wp.tid()
+    lane = _lane()
+    stride = _stride_value()
+    capacity = packet.jacobian.shape[1]
+    width = primary + secondary
+    total = wp.min(data.count[0], data.point0.shape[0])
+    for contact in range(worker, total, workers):
+        if data.path[contact] != 0 or data.slot[contact] < 0:
+            continue
+        world = data.world[contact]
+        slot = data.slot[contact]
+        rows = data.slots_needed[contact]
+        art0 = data.art0[contact]
+        art1 = data.art1[contact]
+        body0 = int(-1)
+        body1 = int(-1)
+        if data.shape0[contact] >= 0:
+            body0 = data.shape_body[data.shape0[contact]]
+        if data.shape1[contact] >= 0:
+            body1 = data.shape_body[data.shape1[contact]]
+        normal = -data.normal[contact]
+        point0 = wp.vec3()
+        point1 = wp.vec3()
+        tangent0 = wp.vec3()
+        tangent1 = wp.vec3()
+        if lane == 0:
+            _body0, _body1, point0, point1 = contact_points(data, contact)
+            tangent0, tangent1 = contact_tangent_basis(normal)
+        point0 = _broadcast(point0)
+        point1 = _broadcast(point1)
+        tangent0 = _broadcast(tangent0)
+        tangent1 = _broadcast(tangent1)
+        friction0, friction1 = patch_friction_location(law.patches, contact)
+        for coefficient in range(lane, rows * width, stride):
+            row = coefficient // width
+            coordinate = coefficient % width
+            output_row = slot + row
+            if output_row < capacity:
+                size = primary
+                dof = coordinate
+                if coordinate >= primary:
+                    size = secondary
+                    dof -= primary
+                direction, p0, p1 = patch_row_frame(
+                    data, row, normal, tangent0, tangent1, point0, point1, friction0, friction1
+                )
+                value = endpoint_projection(data, body0, art0, size, dof, p0, direction)
+                value -= endpoint_projection(data, body1, art1, size, dof, p1, direction)
+                packet.jacobian[world, output_row, coordinate] = value
+        _join()
+        if lane == 0:
+            mu = float(0.0)
+            materials = int(0)
+            if data.shape0[contact] >= 0:
+                mu += data.material_mu[data.shape0[contact]]
+                materials += 1
+            if data.shape1[contact] >= 0:
+                mu += data.material_mu[data.shape1[contact]]
+                materials += 1
+            if materials > 0:
+                mu /= float(materials)
+            restitution = mixed_contact_restitution(
+                data.shape0[contact], data.shape1[contact], data.material_restitution
+            )
+            separation = wp.dot(normal, point0 - point1)
+            inv_dt = 1.0 / data.dt
+            for row in range(rows):
+                output_row = slot + row
+                direction, p0, p1 = patch_row_frame(
+                    data, row, normal, tangent0, tangent1, point0, point1, friction0, friction1
+                )
+                target = prescribed_relative_contact_target(
+                    body0, art0, body1, art1, p0, p1, direction, data.prescribed, data.origin, data.body_v
+                )
+                phi = separation
+                beta = data.beta
+                row_restitution = restitution
+                row_mu = mu
+                kind = int(PGS_CONSTRAINT_TYPE_CONTACT)
+                parent = int(-1)
+                rhs = -target
+                weight = float(1.0)
+                if row == 0:
+                    if phi <= 0.0:
+                        rhs += data.bias_scale * beta * phi * inv_dt
+                        weight = data.contact_w
+                    else:
+                        rhs += data.speculative_scale * phi * inv_dt
+                    if restitution > 0.0:
+                        relative = incident_projection(data, body0, art0, p0, direction)
+                        relative -= incident_projection(data, body1, art1, p1, direction)
+                        relative -= target
+                        if contact_restitution_fires(phi, relative, data.dt, data.restitution_threshold):
+                            rhs = -target + restitution * relative
+                            weight = 1.0
+                else:
+                    phi = law.patches.phi[contact][row - 1]
+                    beta = law.beta
+                    row_restitution = 0.0
+                    row_mu = mu * data.friction_scale
+                    kind = int(PGS_CONSTRAINT_TYPE_FRICTION)
+                    parent = slot
+                    rhs += data.bias_scale * beta * phi * inv_dt
+                data.row_type[world, output_row] = kind
+                data.row_parent[world, output_row] = parent
+                data.row_mu[world, output_row] = row_mu
+                data.row_beta[world, output_row] = beta
+                data.row_cfm[world, output_row] = data.cfm
+                data.phi[world, output_row] = phi
+                data.target[world, output_row] = target
+                data.restitution[world, output_row] = row_restitution
+                data.rhs[world, output_row] = rhs
+                data.diag[world, output_row] = data.cfm
+                if data.contact_w < 1.0:
+                    data.row_w[world, output_row] = weight
+                if output_row < capacity:
+                    packet.row_contact[world, output_row] = contact * 3 + row
+        _join()
+
+
+@wp.kernel(enable_backward=False)
+def materialize_patch_fallback(
+    workers: int,
+    data: ContactInput,
+    law: PatchRowLaw,
+    owner: wp.array[int],
+    target_size: int,
+    groups: wp.array[int],
+    J: wp.array3d[float],
+):
+    """Reproject every general-world endpoint as :func:`materialize_fallback` does, with the patch law."""
+    worker, _logical_lane = wp.tid()
+    lane = _lane()
+    stride = _stride_value()
+    total = wp.min(data.count[0], data.point0.shape[0])
+    for contact in range(worker, total, workers):
+        if data.path[contact] != 0 or data.slot[contact] < 0:
+            continue
+        world = data.world[contact]
+        if owner[world] != 0:
+            continue
+        body0, body1, point0, point1 = contact_points(data, contact)
+        normal = -data.normal[contact]
+        tangent0, tangent1 = contact_tangent_basis(normal)
+        friction0, friction1 = patch_friction_location(law.patches, contact)
+        art0, art1 = data.art0[contact], data.art1[contact]
+        group0, group1 = int(-1), int(-1)
+        if art0 >= 0 and data.response_dofs[art0] == target_size:
+            group0 = groups[art0]
+        if art1 >= 0 and data.response_dofs[art1] == target_size:
+            group1 = groups[art1]
+        for coefficient in range(lane, data.slots_needed[contact] * target_size, stride):
+            row = coefficient // target_size
+            dof = coefficient % target_size
+            direction, p0, p1 = patch_row_frame(
+                data, row, normal, tangent0, tangent1, point0, point1, friction0, friction1
+            )
+            value0 = endpoint_projection(data, body0, art0, target_size, dof, p0, direction)
+            value1 = -endpoint_projection(data, body1, art1, target_size, dof, p1, direction)
+            output_row = data.slot[contact] + row
+            if group0 >= 0:
+                J[group0, output_row, dof] = value0 + value1 if group0 == group1 else value0
+            if group1 >= 0 and group1 != group0:
+                J[group1, output_row, dof] = value1
+
+
 def topology_signature(solver):
     """Pin only structural indices; enabled flags, coefficients, q and limits stay live."""
     names = (
@@ -874,12 +1094,24 @@ class LocalRowPackets:
             ("residual_pair", "_local_residual_active_secondaries"),
         ):
             setattr(self.queue, name, getattr(solver, source)[self.primary])
+        # The friction law is fixed at construction; produce_contacts binds its current arrays.
+        self.patch_friction = bool(solver._friction_anchors_enabled)
         self.contact_input = None
+        self.law = None
         self._topology_signature = topology_signature(solver)
         self._prefix_kernel = get_prefix_kernel(self.primary, self.mimics, self.packets)
 
     def local_factory(self):
         return get_local_factory(self.primary, self.secondary, self.packets)
+
+    def row_law(self):
+        """Bind the persistent patch friction row law, or return ``None`` for point friction."""
+        if not self.patch_friction:
+            return None
+        law = PatchRowLaw()
+        law.patches = self.solver._friction_patches.view
+        law.beta = self.solver.friction_anchor_beta
+        return law
 
     def validate_notification(self, flags: ModelFlags | int = ModelFlags.ALL):
         """Validate structural changes without reading back numeric-only updates."""
@@ -951,6 +1183,7 @@ class LocalRowPackets:
         data.activation_gap, data.beta, data.cfm = solver.joint_limit_activation_gap, solver.pgs_beta, solver.pgs_cfm
         data.bias_scale, data.limit_speculative_scale = 1.0, 1.0
         self.contact_input = None
+        self.law = None
         wp.launch_tiled(
             self._prefix_kernel,
             dim=[(solver.n_arts_by_size[self.primary] + WARPS_PER_BLOCK - 1) // WARPS_PER_BLOCK],
@@ -960,12 +1193,18 @@ class LocalRowPackets:
         )
 
     def produce_contacts(self, state_in, state_aug, contacts, dt):
-        """Publish private current J and complete canonical contact metadata/RHS."""
+        """Publish private current J and complete canonical contact metadata/RHS.
+
+        Persistent patch friction writes its tangent rows with the patch row law. The patch link
+        runs after this producer; :meth:`finish_rows` writes neither row parents nor coefficients.
+        """
         self.contact_input = bind(self.solver, state_in, state_aug, contacts, dt, 1.0)
+        self.law = self.row_law()
+        kernel, law = (produce_contacts, ()) if self.law is None else (produce_patch_contacts, (self.law,))
         wp.launch_tiled(
-            produce_contacts,
+            kernel,
             dim=[self.workers],
-            inputs=[self.workers, self.contact_input, self.packet, self.primary, self.secondary],
+            inputs=[self.workers, self.contact_input, *law, self.packet, self.primary, self.secondary],
             block_dim=32,
             device=self.solver.model.device,
         )
@@ -1007,12 +1246,16 @@ class LocalRowPackets:
                 device=solver.model.device,
             )
             if self.contact_input is not None:
+                kernel, law = (
+                    (materialize_fallback, ()) if self.law is None else (materialize_patch_fallback, (self.law,))
+                )
                 wp.launch_tiled(
-                    materialize_fallback,
+                    kernel,
                     dim=[self.workers],
                     inputs=[
                         self.workers,
                         self.contact_input,
+                        *law,
                         queue.owner,
                         size,
                         solver.art_group_idx,
@@ -1059,7 +1302,11 @@ class LocalRowPackets:
 
 
 def create_owner(solver):
-    """Admit the local packet law for a topology that fits it; unsupported solvers stay ordinary."""
+    """Admit the local packet law for a topology that fits it; unsupported solvers stay ordinary.
+
+    The owner writes the solver's friction law: point rows, or persistent patch rows when friction
+    anchors are on. The solver admits neither contact torsion nor compliance here.
+    """
     from . import solver_feather_pgs as source  # noqa: PLC0415
 
     if not (

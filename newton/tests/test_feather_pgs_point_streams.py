@@ -56,6 +56,8 @@ _PATCH_ONLY = frozenset(
         "friction_patches.link_patch_rows",
         "friction_patches.seed_patch_impulses",
         "friction_patches.seed_patch_routes",
+        "row_packets.materialize_patch_fallback",
+        "row_packets.produce_patch_contacts",
         # Sparse-diagonal schedules over patch contact units.
         "solver_feather_pgs._get_pgs_solve_sparse_diagonal_kernel(64, 10, 9, '120', contact_units=True, "
         "speculative_contact_batches=False)",
