@@ -41,6 +41,15 @@ from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
 _BLOCK_THREADS = 256
 _LIGHT_BLOCKS_PER_SM = 2
 _BUILD_BLOCKS_PER_SM = 4
+# From this contact capacity on, the pair sort orders only the live slots
+# instead of the whole capacity. Provisional: calibrate against the full radix
+# sort on the GPU at large capacities and at high occupancy.
+_LIVE_SORT_CAPACITY = 2_000_000
+# The live sort orders chunks of _SORT_CHUNK slots in shared memory by
+# (key, slot) and then merges sorted runs pairwise.
+_SORT_CHUNK = wp.constant(2048)
+_SORT_SLOT_BITS = wp.constant(11)
+_SORT_PAD = wp.constant(wp.int64(1 << 62))
 
 
 @wp.struct
@@ -300,6 +309,104 @@ def _prepare(
             frame,
             patches,
         )
+
+
+@wp.func
+def _chunk_key(key: wp.int64, local: int, start: int, live: int):
+    """Order a chunk's slots by (pair key, slot); slots past the live count sort last, in slot order."""
+    if start + local < live:
+        return (key << wp.int64(_SORT_SLOT_BITS)) | wp.int64(local)
+    return _SORT_PAD + wp.int64(local)
+
+
+@wp.func
+def _chunk_pair_key(order: wp.int64):
+    if order >= _SORT_PAD:
+        return wp.int64(0x7FFFFFFFFFFFFFFF)
+    return order >> wp.int64(_SORT_SLOT_BITS)
+
+
+@wp.func
+def _merge_rounds(live: int):
+    """Return the pairwise merges that join sorted chunks into one run of ``live`` slots."""
+    rounds = int(0)
+    width = int(_SORT_CHUNK)
+    while width < live and rounds < 30:
+        width *= 2
+        rounds += 1
+    return rounds
+
+
+@wp.kernel(enable_backward=False)
+def _sort_chunks(
+    keys: wp.array[wp.int64],
+    indices: wp.array[int],
+    extent: wp.array[int],
+    capacity: int,
+    blocks: int,
+):
+    """Sort each chunk of the live slots by (key, slot) in shared memory.
+
+    The composite keys are unique, so even an unstable sort orders a chunk as a
+    stable sort by key would. Each block strides over chunks; the output goes to
+    the half from which the merges end in the first.
+    """
+    block = wp.tid()
+    live = extent[1]
+    output = capacity * (_merge_rounds(live) % 2)
+    for start in range(block * _SORT_CHUNK, live, blocks * _SORT_CHUNK):
+        loaded = wp.tile_load(keys, shape=_SORT_CHUNK, offset=start)
+        local = wp.tile_arange(_SORT_CHUNK, dtype=int)
+        first = wp.tile_full(_SORT_CHUNK, start, dtype=int)
+        count = wp.tile_full(_SORT_CHUNK, live, dtype=int)
+        order = wp.tile_zeros(shape=_SORT_CHUNK, dtype=wp.int64, storage="shared")
+        wp.tile_assign(order, wp.tile_map(_chunk_key, loaded, local, first, count))
+        values = wp.tile_load(indices, shape=_SORT_CHUNK, offset=start, storage="shared")
+        wp.tile_sort(order, values)
+        wp.tile_store(keys, wp.tile_map(_chunk_pair_key, order), offset=output + start)
+        wp.tile_store(indices, values, offset=output + start)
+
+
+@wp.kernel(enable_backward=False)
+def _merge_runs(
+    keys: wp.array[wp.int64],
+    indices: wp.array[int],
+    extent: wp.array[int],
+    capacity: int,
+    merge: int,
+    threads: int,
+):
+    """Merge sorted runs pairwise; each slot moves past the smaller slots of its partner run.
+
+    Slots compare by (key, index). Indices are unique, so no two slots tie and
+    every target position is distinct. Launches past the needed merges return.
+    """
+    thread = wp.tid()
+    live = extent[1]
+    rounds = _merge_rounds(live)
+    if merge >= rounds:
+        return
+    source = capacity * ((rounds + merge) % 2)
+    target = capacity * ((rounds + merge + 1) % 2)
+    width = int(_SORT_CHUNK) << merge
+    for i in range(thread, live, threads):
+        key = keys[source + i]
+        index = indices[source + i]
+        run = i // width
+        partner = run ^ 1
+        lo = partner * width
+        hi = wp.min(lo + width, live)
+        first = lo
+        while lo < hi:
+            mid = (lo + hi) // 2
+            other = keys[source + mid]
+            if other < key or (other == key and indices[source + mid] < index):
+                lo = mid + 1
+            else:
+                hi = mid
+        position = wp.min(run, partner) * width + (i - run * width) + (lo - first)
+        keys[target + position] = key
+        indices[target + position] = index
 
 
 @wp.func
@@ -886,6 +993,13 @@ class _FrictionPatchState:
         blocks = device.sm_count if device.is_cuda else 1
         self.threads = max(1, min(capacity, _LIGHT_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
         self.build_threads = max(1, min(capacity, _BUILD_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
+        # Large capacities sort only the live slots. Chunk keys append an 11-bit
+        # slot to the pair key below the pad bit, which bounds key_bits.
+        self.live_sort = capacity >= _LIVE_SORT_CAPACITY and self.key_bits + _SORT_SLOT_BITS <= 62
+        self.sort_blocks = max(1, min(-(-capacity // _SORT_CHUNK), _LIGHT_BLOCKS_PER_SM * blocks))
+        self.merges = 0
+        while _SORT_CHUNK << self.merges < capacity:
+            self.merges += 1
 
     def update_geometry(self, model):
         """Refresh scales and retire affected history after explicit geometry edits."""
@@ -1030,9 +1144,12 @@ class _FrictionPatchState:
             outputs=[self.extent],
             device=model.device,
         )
-        # Empty slots hold INT64_MAX, whose low key_bits are all ones: no pair
-        # key exceeds them, and the stable sort keeps live slots ahead of a tie.
-        wp.utils.radix_sort_pairs(self.current.keys, self.current.indices, self.capacity, end_bit=self.key_bits)
+        if self.live_sort:
+            self._sort_live()
+        else:
+            # Empty slots hold INT64_MAX, whose low key_bits are all ones: no pair
+            # key exceeds them, and the stable sort keeps live slots ahead of a tie.
+            wp.utils.radix_sort_pairs(self.current.keys, self.current.indices, self.capacity, end_bit=self.key_bits)
         wp.launch(
             _build,
             dim=self.build_threads,
@@ -1051,6 +1168,29 @@ class _FrictionPatchState:
             outputs=[self.built],
             device=model.device,
         )
+
+    def _sort_live(self):
+        """Stably sort the live slots by pair key and leave every other slot untouched.
+
+        A stable sort of slots [0, live) from indices c is the unique order by
+        (key, c), which the full radix sort produces; slots past live already
+        hold the empty record that sort leaves there.
+        """
+        keys, indices = self.current.keys, self.current.indices
+        wp.launch_tiled(
+            _sort_chunks,
+            dim=[self.sort_blocks],
+            inputs=[keys, indices, self.extent, self.capacity, self.sort_blocks],
+            block_dim=_BLOCK_THREADS,
+            device=self.device,
+        )
+        for merge in range(self.merges):
+            wp.launch(
+                _merge_runs,
+                dim=self.build_threads,
+                inputs=[keys, indices, self.extent, self.capacity, merge, self.build_threads],
+                device=self.device,
+            )
 
     def link(self, world, slot, path, slots_needed, routes):
         """Link the normal rows of each patch and share its Coulomb budget on the enabled routes."""

@@ -11,10 +11,12 @@ pair keys compare through their decoded body and shape codes.
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import warp as wp
 
+from newton._src.solvers.feather_pgs import friction_patches
 from newton._src.solvers.feather_pgs.friction_patches import _FrictionPatchState, patch_routes
 from newton.tests.feather_pgs_patch_reference import SENTINEL, ReferencePatches, pair_codes
 
@@ -475,22 +477,27 @@ def _gates(scene, rng):
     return gates
 
 
-def run_reference_differential(device, seed, *, worlds=3, bodies=4, contacts=96, capacity=128, threads=None):
-    """Step a patch state and the reference through :data:`_PLAN`, comparing after every launch group.
+def run_reference_differential(
+    device, seed, *, worlds=3, bodies=4, contacts=96, capacity=128, threads=None, live_sort=None, plan=_PLAN
+):
+    """Step a patch state and the reference through ``plan``, comparing after every launch group.
 
-    Returns counts of carried anchors and of anchors released by finishing, so
-    callers can require the sequence to exercise both.
+    ``live_sort`` overrides the capacity's choice of pair sort. Returns counts of
+    carried anchors and of anchors released by finishing, and the largest live
+    count, so callers can require the sequence to exercise them.
     """
     rng = np.random.default_rng(1000 + seed)
     scene = _Scene(device, seed, worlds=worlds, bodies=bodies, contacts=contacts)
     patches, reference = _pair(scene, capacity)
     if threads is not None:
         patches.threads, patches.build_threads = threads
+    if live_sort is not None:
+        patches.live_sort = live_sort
     rows = _Rows(scene, capacity, rng)
-    coverage = {"carried": 0, "released": 0}
+    coverage = {"carried": 0, "released": 0, "live": 0}
     fraction = 0.1
     dt = 1.0 / 240.0
-    for step, event in enumerate(_PLAN):
+    for step, event in enumerate(plan):
         context = f"seed {seed} step {step} {event}"
         scene.move()
         if event == "grow":
@@ -532,6 +539,7 @@ def run_reference_differential(device, seed, *, worlds=3, bodies=4, contacts=96,
             state.build(scene.model, scene.state, scene.contacts, **gates)
         assert_same_patches(patches, reference, live, f"{context} build")
         assert_empty_tail(patches, f"{context} build")
+        coverage["live"] = max(coverage["live"], live)
         coverage["carried"] += int(np.count_nonzero(reference.current.source.numpy()[:live] >= 0))
         routes_present = (0, 1, 2) if rng.random() < 0.7 else (0, 1)
         rows.generate(reference, live, routes_present)
@@ -634,8 +642,8 @@ class TestPatchLiveExtent(unittest.TestCase):
                 coverage = run_reference_differential(
                     "cpu", seed, contacts=contacts, capacity=capacity, threads=threads
                 )
-                for name, count in coverage.items():
-                    totals[name] += count
+                for name in totals:
+                    totals[name] += coverage[name]
         self.assertGreater(totals["carried"], 0, "the sequences must carry anchor history")
         self.assertGreater(totals["released"], 0, "the sequences must release finished anchors")
 
@@ -666,67 +674,158 @@ class TestPatchLiveExtent(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
     def test_graph_replay_follows_changing_counts(self):
         """Replay one captured patch step over rising, empty, overflowing and sharply dropping counts."""
-        device = "cuda:0"
-        rng = np.random.default_rng(7)
-        scene = _Scene(device, 21, worlds=32, contacts=1536)
-        patches, reference = _pair(scene, 2048)
-        rows = _Rows(scene, 2048, rng)
-        dt = 1.0 / 240.0
-        decay = np.array([0.8, 0.0, 0.6])
+        run_graph_replay("cuda:0")
 
-        def prepare(mode):
-            scene.move()
-            live = scene.frame(mode)
-            reference.build(scene.model, scene.state, scene.contacts)
-            rows.generate(reference, live)
-            rows.decay = decay
-            return live
 
-        def assign(fixed, out, com):
-            (maps, routes), (fresh_maps, fresh_routes) = fixed, rows.arrays()
-            for array, values in zip(maps, fresh_maps, strict=True):
-                array.assign(values)
-            for row, values in zip(routes, fresh_routes, strict=True):
-                for array, fresh in zip(row[1:4], values[1:4], strict=True):
-                    array.assign(fresh)
-            solved, centers = _solved_state(scene, rng)
-            out.body_q.assign(solved.body_q)
-            out.body_qd.assign(solved.body_qd)
-            com.assign(centers)
+def run_graph_replay(device, *, worlds=32, contacts=1536, capacity=2048, live_sort=None):
+    """Capture one patch step, replay it over changing counts, and compare each replay with the reference."""
+    rng = np.random.default_rng(7)
+    scene = _Scene(device, 21, worlds=worlds, contacts=contacts)
+    patches, reference = _pair(scene, capacity)
+    if live_sort is not None:
+        patches.live_sort = live_sort
+    rows = _Rows(scene, capacity, rng)
+    dt = 1.0 / 240.0
+    decay = np.array([0.8, 0.0, 0.6])
 
-        live = prepare("live")
-        fixed = rows.arrays()
-        out, com = _solved_state(scene, rng)
-        maps, routes = fixed
-        linked, seeded = patch_routes(routes), patch_routes(row for row in routes if row[4] > 0.0)
+    def prepare(mode):
+        scene.move()
+        live = scene.frame(mode)
+        reference.build(scene.model, scene.state, scene.contacts)
+        rows.generate(reference, live)
+        rows.decay = decay
+        return live
 
-        def step():
-            patches.build(scene.model, scene.state, scene.contacts)
-            patches.link(*maps, linked)
-            patches.seed(scene.state, *maps, seeded)
-            patches.finish(scene.state, out, com, *maps, linked, dt)
+    def assign(fixed, out, com):
+        (maps, routes), (fresh_maps, fresh_routes) = fixed, rows.arrays()
+        for array, values in zip(maps, fresh_maps, strict=True):
+            array.assign(values)
+        for row, values in zip(routes, fresh_routes, strict=True):
+            for array, fresh in zip(row[1:4], values[1:4], strict=True):
+                array.assign(fresh)
+        solved, centers = _solved_state(scene, rng)
+        out.body_q.assign(solved.body_q)
+        out.body_qd.assign(solved.body_qd)
+        com.assign(centers)
 
-        def reference_step(live):
-            their_maps, their_routes = rows.arrays()
-            reference.link(scene.contacts, *their_maps, their_routes)
-            reference.seed(scene.contacts, scene.state, *their_maps, their_routes)
-            reference.finish(scene.contacts, scene.state, out, com, *their_maps, their_routes, dt)
-            return their_routes
+    live = prepare("live")
+    fixed = rows.arrays()
+    out, com = _solved_state(scene, rng)
+    maps, routes = fixed
+    linked, seeded = patch_routes(routes), patch_routes(row for row in routes if row[4] > 0.0)
 
+    def step():
+        patches.build(scene.model, scene.state, scene.contacts)
+        patches.link(*maps, linked)
+        patches.seed(scene.state, *maps, seeded)
+        patches.finish(scene.state, out, com, *maps, linked, dt)
+
+    def reference_step():
+        their_maps, their_routes = rows.arrays()
+        reference.link(scene.contacts, *their_maps, their_routes)
+        reference.seed(scene.contacts, scene.state, *their_maps, their_routes)
+        reference.finish(scene.contacts, scene.state, out, com, *their_maps, their_routes, dt)
+        return their_routes
+
+    step()
+    reference_step()
+    assert_same_patches(patches, reference, live, "eager")
+    with wp.ScopedCapture(device=device) as capture:
         step()
-        their_routes = reference_step(live)
-        assert_same_patches(patches, reference, live, "eager")
-        with wp.ScopedCapture(device=device) as capture:
-            step()
-        for index, mode in enumerate(("live", "sparse", "empty", "live", "overflow", "live", "sparse", "live")):
-            scene.active = scene.rng.random(len(scene.pairs)) < (0.9 if index == 3 else 0.6)
-            live = prepare(mode)
-            assign(fixed, out, com)
-            wp.capture_launch(capture.graph)
-            their_routes = reference_step(live)
-            assert_same_patches(patches, reference, live, f"replay {index} {mode}")
-            assert_empty_tail(patches, f"replay {index} {mode}")
-            _assert_same_rows(routes, their_routes, f"replay {index} {mode}")
+    for index, mode in enumerate(("live", "sparse", "empty", "live", "overflow", "live", "sparse", "live")):
+        scene.active = scene.rng.random(len(scene.pairs)) < (0.9 if index == 3 else 0.6)
+        live = prepare(mode)
+        assign(fixed, out, com)
+        wp.capture_launch(capture.graph)
+        their_routes = reference_step()
+        assert_same_patches(patches, reference, live, f"replay {index} {mode}")
+        assert_empty_tail(patches, f"replay {index} {mode}")
+        _assert_same_rows(routes, their_routes, f"replay {index} {mode}")
+
+
+def _fill_sort_case(patches, live, rng, codes):
+    """Write a frame as _prepare leaves it: ``live`` pair keys drawn from ``codes``, then empty slots.
+
+    The second halves hold unrelated values, as the radix sort's scratch would.
+    Returns the first half of the keys.
+    """
+    n = patches.capacity
+    keys = np.full(2 * n, SENTINEL, dtype=np.int64)
+    keys[:live] = rng.choice(codes, size=live)
+    keys[n:] = rng.integers(0, 1 << 40, size=n)
+    indices = np.concatenate((np.arange(n), rng.integers(0, n, size=n))).astype(np.int32)
+    patches.current.keys.assign(keys)
+    patches.current.indices.assign(indices)
+    patches.extent.assign([live, live])
+    return keys[:n]
+
+
+def run_live_sort_cases(test, device, capacities, extra_counts=()):
+    """Sort live prefixes of several sizes and compare with numpy's stable argsort and the radix sort."""
+    rng = np.random.default_rng(17)
+    scene = _Scene(device, 0)
+    # Pair codes of several worlds, including the smallest and largest ones a
+    # model with 2**25 + 1 bodies and shapes can produce; few codes, many repeats.
+    stride = (1 << 25) + 3
+    first = np.concatenate(([1, 2, stride - 2, stride - 1], rng.integers(1, stride, size=40)))
+    second = np.concatenate(([stride - 1, 3, stride - 1, stride - 1], rng.integers(1, stride, size=40)))
+    codes = np.minimum(first, second).astype(np.int64) * stride + np.maximum(first, second)
+    test.assertLess(int(codes.max()), 1 << 51)
+    for capacity in capacities:
+        patches = _FrictionPatchState(scene.model, capacity, True, wp.zeros(capacity, dtype=wp.vec2, device=device))
+        counts = {0, 1, 2047, 2048, 2049, capacity // 2, capacity - 1, capacity, *extra_counts}
+        for live in sorted(count for count in counts if 0 <= count <= capacity):
+            with test.subTest(capacity=capacity, live=live):
+                keys = _fill_sort_case(patches, live, rng, codes)
+                patches._sort_live()
+                sorted_keys = patches.current.keys.numpy()[:capacity]
+                sorted_indices = patches.current.indices.numpy()[:capacity]
+                order = np.argsort(keys[:live], kind="stable")
+                np.testing.assert_array_equal(sorted_indices[:live], order)
+                np.testing.assert_array_equal(sorted_keys[:live], keys[order])
+                radix_keys = wp.array(np.tile(keys, 2), dtype=wp.int64, device=device)
+                radix_indices = wp.array(np.tile(np.arange(capacity, dtype=np.int32), 2), dtype=int, device=device)
+                wp.utils.radix_sort_pairs(radix_keys, radix_indices, capacity)
+                np.testing.assert_array_equal(sorted_keys, radix_keys.numpy()[:capacity])
+                np.testing.assert_array_equal(sorted_indices, radix_indices.numpy()[:capacity])
+
+
+class TestPatchLiveSort(unittest.TestCase):
+    def test_live_sort_matches_stable_argsort_and_radix_sort(self):
+        """Sort the live prefix exactly as a stable sort, from no contacts through several merges."""
+        run_live_sort_cases(self, "cpu", (2047, 3000, 4096, 10000))
+
+    def test_capacity_threshold_selects_the_live_sort(self):
+        """Sort only the live prefix from the capacity threshold on, while chunk keys fit."""
+        scene = _Scene("cpu", 0)
+        phi = wp.zeros(96, dtype=wp.vec2, device="cpu")
+        self.assertFalse(_FrictionPatchState(scene.model, 96, True, phi).live_sort)
+        with mock.patch.object(friction_patches, "_LIVE_SORT_CAPACITY", 96):
+            self.assertTrue(_FrictionPatchState(scene.model, 96, True, phi).live_sort)
+            self.assertFalse(_FrictionPatchState(scene.model, 95, True, phi[:95]).live_sort)
+
+    def test_live_sort_builds_match_the_full_capacity_reference(self):
+        """Build, link, seed, finish and store bitwise as the reference with the live sort."""
+        for seed, threads in ((4, None), (5, (7, 5))):
+            with self.subTest(seed=seed, threads=threads):
+                run_reference_differential("cpu", seed, capacity=160, threads=threads, live_sort=True)
+        # More than one chunk of live contacts runs the merges.
+        plan = ("grow", "grow", "grow", "live", "sparse", "grow", "overflow", "live", "rebuild", "masked", "live")
+        coverage = run_reference_differential(
+            "cpu", 6, worlds=110, contacts=4096, capacity=4600, threads=(97, 61), live_sort=True, plan=plan
+        )
+        self.assertGreater(coverage["live"], 2048)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "the device sort needs CUDA")
+    def test_live_sort_matches_on_the_device(self):
+        """Sort live prefixes on the device, up to hundreds of chunks and nine merges."""
+        run_live_sort_cases(self, "cuda:0", (3000, 10000, 1_000_000), (300_000,))
+
+    @unittest.skipUnless(wp.is_cuda_available(), "multi-block grids need CUDA")
+    def test_live_sort_builds_match_on_many_blocks(self):
+        """Match the reference with the live sort on multi-block grids, through merges and graph replay."""
+        run_reference_differential("cuda:0", 12, worlds=160, contacts=8192, capacity=8192, live_sort=True)
+        run_graph_replay("cuda:0", worlds=160, contacts=8192, capacity=8192, live_sort=True)
 
 
 if __name__ == "__main__":
