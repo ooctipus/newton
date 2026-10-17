@@ -341,6 +341,8 @@ def _merge_rounds(live: int):
 
 @wp.kernel(enable_backward=False)
 def _sort_chunks(
+    slot_keys: wp.array[wp.int64],
+    slot_indices: wp.array[int],
     keys: wp.array[wp.int64],
     indices: wp.array[int],
     extent: wp.array[int],
@@ -351,13 +353,16 @@ def _sort_chunks(
 
     The composite keys are unique, so even an unstable sort orders a chunk as a
     stable sort by key would. Each block strides over chunks; the output goes to
-    the half from which the merges end in the first.
+    the half from which the merges end in the first. Chunks load through
+    ``slot_keys`` and ``slot_indices``, views of the first half that read zeros
+    past the capacity, so no block reads what another block of this launch
+    writes.
     """
     block = wp.tid()
     live = extent[1]
     output = capacity * (_merge_rounds(live) % 2)
     for start in range(block * _SORT_CHUNK, live, blocks * _SORT_CHUNK):
-        loaded = wp.tile_load(keys, shape=_SORT_CHUNK, offset=start)
+        loaded = wp.tile_load(slot_keys, shape=_SORT_CHUNK, offset=start)
         local = wp.tile_arange(_SORT_CHUNK, dtype=int)
         first = wp.tile_full(_SORT_CHUNK, start, dtype=int)
         count = wp.tile_full(_SORT_CHUNK, live, dtype=int)
@@ -365,7 +370,7 @@ def _sort_chunks(
         # Warp hashes a function passed to a builtin only through wp.static();
         # otherwise edits to the key maps would reuse a stale cached kernel.
         wp.tile_assign(order, wp.tile_map(wp.static(_chunk_key), loaded, local, first, count))
-        values = wp.tile_load(indices, shape=_SORT_CHUNK, offset=start, storage="shared")
+        values = wp.tile_load(slot_indices, shape=_SORT_CHUNK, offset=start, storage="shared")
         wp.tile_sort(order, values)
         wp.tile_store(keys, wp.tile_map(wp.static(_chunk_pair_key), order), offset=output + start)
         wp.tile_store(indices, values, offset=output + start)
@@ -1213,10 +1218,11 @@ class _FrictionPatchState:
         hold the empty record that sort leaves there.
         """
         keys, indices = self.current.keys, self.current.indices
+        n = self.capacity
         wp.launch_tiled(
             _sort_chunks,
             dim=[self.sort_blocks],
-            inputs=[keys, indices, self.extent, self.capacity, self.sort_blocks],
+            inputs=[keys[:n], indices[:n], keys, indices, self.extent, n, self.sort_blocks],
             block_dim=_BLOCK_THREADS,
             device=self.device,
         )
