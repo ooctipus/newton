@@ -1,32 +1,86 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Check the slot-order independent patch-friction comparisons on CPU."""
+"""Check the slot-order and carrier independent patch-friction comparisons on CPU."""
 
+import contextlib
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.friction_patches import link_patch_routes
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     pgs_solve_loop,
 )
 from newton.solvers import SolverFeatherPGS
+from newton.tests import test_feather_pgs_sparse_split as split
 from newton.tests.feather_pgs_patch_parity import (
+    SLIDING_FEET,
+    SLIDING_ITERATIONS,
+    SLIDING_REGION_BOUNDS,
+    STANDING_REGION_BOUNDS,
+    STANDING_VELOCITY_ATOL,
+    anchor_sites,
+    assert_anchor_sites_close,
     assert_contact_impulses_close,
     assert_history_close,
+    assert_history_matches_rows,
     assert_loaded_anchors,
+    assert_patch_rows_close,
+    assert_region_impulses_close,
     assert_ring_coulomb,
     assert_rows_close,
+    assert_states_close,
     contact_rows,
+    patch_rows,
+    ring_budget_ratios,
     ring_load,
     standing_model,
 )
 from newton.tests.test_feather_pgs_friction_patches import _ground_box, _patch_fixture
+
+# The dense split reference of the patch parity tests, on CPU.
+_DENSE_SPLIT = {"friction_anchor_beta": 0.2, "cached_dynamics": "off", "pgs_kernel": "loop"}
+
+
+def _standing_cases(count, *, twin=False, iterations=8, **shape):
+    """Build dense split standing cases on CPU; with ``twin`` the last one's torsos start one float32 ulp higher."""
+    options = {**_DENSE_SPLIT, "pgs_iterations": iterations}
+    cases = [
+        split._case(False, options=dict(options), deterministic=True, standing=True, device="cpu", **shape)
+        for _ in range(count)
+    ]
+    if twin:
+        model, _solver, state, *_ = cases[-1]
+        q = state.joint_q.numpy().reshape(model.world_count, -1)
+        q[:, 2] = np.nextafter(q[:, 2], np.float32(1.0))
+        state.joint_q.assign(q.reshape(-1))
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    return cases
+
+
+@contextlib.contextmanager
+def _ring_pool_dropped(solver):
+    """Cut the normal rows out of their patch rings after the link, so each anchor's budget pools its own normal only."""
+    launch = wp.launch
+
+    def cut(kernel, *args, **kwargs):
+        result = launch(kernel, *args, **kwargs)
+        if kernel is link_patch_routes:
+            kinds, parents = solver.row_type.numpy(), solver.row_parent.numpy()
+            parents[kinds == PGS_CONSTRAINT_TYPE_CONTACT] = -1
+            solver.row_parent.assign(parents)
+        return result
+
+    with mock.patch.object(wp, "launch", cut):
+        yield
+
 
 _MF_ROWS = ("mf_row_type", "mf_row_parent", "mf_row_mu", "mf_rhs", "mf_impulses", "mf_phi", "mf_J_a", "mf_J_b")
 
@@ -205,6 +259,71 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
         histories[1].previous.displacement.assign(displacement)
         with self.assertRaisesRegex(AssertionError, "previous.displacement"):
             assert_history_close(*histories)
+
+    def test_patch_rows_ignore_which_edge_member_carries_an_anchor(self):
+        """Match the standing fixture and a one-ulp twin by anchor location while rounding moves anchor rows.
+
+        On the rectangular feet the two corners of each short support edge tie,
+        and float32 rounding picks the corner that carries the edge's friction
+        rows. The twin's torsos start one ulp higher. Within a few steps the two
+        put some anchor rows on different corners, so by-contact rows disagree,
+        while the states (twists within STANDING_VELOCITY_ATOL), the
+        carrier-agnostic rows, the region bounds, the anchor sites and each arm's
+        stored history hold at every step of the masked-reset schedule.
+        """
+        cases = _standing_cases(2, twin=True)
+        moved = 0
+        for index in range(24):
+            if index in (5, 13, 19):
+                selected = wp.array([index != 13, index != 5], dtype=wp.bool, device="cpu")
+                for case in cases:
+                    case[1].reset(case[2], world_mask=selected)
+            for case in cases:
+                split._step(case)
+            assert_states_close(cases[0][2], cases[1][2], velocity_atol=STANDING_VELOCITY_ATOL)
+            rows = [patch_rows(case[1], case[-1], split.DT) for case in cases]
+            assert_patch_rows_close(*rows)
+            assert_region_impulses_close(*rows, **STANDING_REGION_BOUNDS)
+            assert_anchor_sites_close(*(anchor_sites(case[1], case[-1]) for case in cases), tangent=False)
+            for case in cases:
+                self.assertEqual(assert_history_matches_rows(case[1], case[-1]), 8)
+            carriers = [
+                {anchor["contact"] for region in record["regions"].values() for anchor in region["anchors"]}
+                for record in rows
+            ]
+            moved += carriers[0] != carriers[1]
+        self.assertGreater(moved, 0, "Rounding must move some anchor's rows to the other corner of its edge")
+
+    def test_sliding_feet_expose_a_dropped_ring_pool(self):
+        """Keep sliding anchors at their pooled budget and reject a budget that pools only its own normal.
+
+        Both feet slide (SLIDING_FEET) with every anchor at its pooled ring
+        budget, so kinetic friction fixes each region's friction. A one-ulp twin
+        stays within SLIDING_REGION_BOUNDS; an arm whose normal rows leave their
+        rings after the patch link, so each anchor's divided budget pools only its
+        own normal, does not.
+        """
+        reference, twin = _standing_cases(2, twin=True, iterations=SLIDING_ITERATIONS, **SLIDING_FEET)
+        (unpooled,) = _standing_cases(1, iterations=SLIDING_ITERATIONS, **SLIDING_FEET)
+        ratios, rejected = [], 0
+        for _ in range(24):
+            for case in (reference, twin):
+                split._step(case)
+            with _ring_pool_dropped(unpooled[1]):
+                split._step(unpooled)
+            assert_states_close(reference[2], twin[2], velocity_atol=STANDING_VELOCITY_ATOL)
+            rows = [patch_rows(case[1], case[-1], split.DT) for case in (reference, twin, unpooled)]
+            assert_patch_rows_close(rows[0], rows[1], lifecycle=False)
+            assert_region_impulses_close(rows[0], rows[1], **SLIDING_REGION_BOUNDS)
+            for case in (reference, twin):
+                assert_ring_coulomb(case[1])
+                ratios.extend(ring_budget_ratios(case[1]))
+            try:
+                assert_region_impulses_close(rows[0], rows[2], **SLIDING_REGION_BOUNDS)
+            except AssertionError:
+                rejected += 1
+        self.assertGreater(float(np.mean(np.asarray(ratios) > 0.99)), 0.9, "Sliding anchors must load their budget")
+        self.assertEqual(rejected, 24, "A budget without the ring's load must change region friction every step")
 
     def test_history_comparison_requires_equal_capacity(self):
         """Name both contact capacities instead of comparing differently sized histories slot by slot."""

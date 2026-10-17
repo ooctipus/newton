@@ -50,16 +50,18 @@ def _jacobian(solver, route, world, count):
         return TestFeatherPGSSparseSolver()._sparse_rows_physical(solver, world, count)[1]
     if solver.pgs_mode == "matrix_free":
         return solver.J_world.numpy()[world, :count]
-    # Split mode keeps each articulation's columns in its size group.
-    jacobian = np.zeros((count, solver.max_world_dofs))
-    worlds, offsets = solver.art_to_world.numpy(), solver.articulation_world_dof_offset.numpy()
+    # Split mode keeps each articulation's columns in its size group; the world's
+    # articulations follow in index order (split construction maps no world offsets).
+    worlds = solver.art_to_world.numpy()
+    blocks = []
     for size in solver.size_groups:
         group_jacobian = solver.J_by_size[size].numpy()
         for group, art in enumerate(solver.group_to_art[size].numpy()):
             if worlds[art] == world:
-                offset = int(offsets[art])
-                jacobian[:, offset : offset + size] = group_jacobian[group, :count]
-    return jacobian
+                blocks.append((int(art), group_jacobian[group, :count]))
+    return np.concatenate(
+        [block for _art, block in sorted(blocks, key=lambda item: item[0])] or [np.zeros((count, 0))], axis=1
+    )
 
 
 def contact_rows(solver, contacts, route=0, *, incident=False, jacobian=False):
@@ -251,16 +253,389 @@ def assert_loaded_anchors(solver, contacts, *, carried=True, reset_worlds=()):
     return len(anchors)
 
 
-def standing_model(device="cuda:0", worlds=2):
+def _tangent_basis(normal):
+    """Return the tangent pair of FeatherPGS friction rows for ``normal`` (``contact_tangent_basis``)."""
+    first = np.cross(normal, (1.0, 0.0, 0.0))
+    if np.dot(first, first) < 1.0e-12:
+        first = np.cross(normal, (0.0, 1.0, 0.0))
+    first = first / np.linalg.norm(first)
+    second = np.cross(normal, first)
+    return first, second / np.linalg.norm(second)
+
+
+def patch_rows(solver, contacts, dt):
+    """Describe route 0's patch rows independent of which support-edge member carries each anchor.
+
+    ``normals`` keys every routed contact's normal row by contact index: its type,
+    its ring successor (a contact index, -1 for none), mu, bias, phi, target and
+    solved impulse. ``regions`` keys each patch region by its sorted member
+    contacts and lists its anchors, each with the patch view's friction location,
+    weight and tangential phi and its friction rows' types, mu, biases and
+    impulses (``own`` when both rows link to the anchor's own normal row), plus
+    the region's normal load and friction vector. A row's bias is its right-hand
+    side without the predicted velocity's ``J v_hat``, which only dense split
+    rows add in (matrix-free and sparse split rows keep it apart): ``-target``
+    plus the position bias of the row's phi. The record keeps the largest
+    position-bias gain of step ``dt`` for normal and anchor rows
+    (:func:`assert_patch_rows_close`).
+    """
+    baked = solver.pgs_mode != "matrix_free" and not solver._sparse_split
+    rows = contact_rows(solver, contacts, jacobian=baked)
+    patches = solver._friction_patches
+    count = min(int(contacts.rigid_contact_count.numpy()[0]), solver.contact_slot.shape[0])
+    owner = patches.current.owner.numpy()[:count]
+    weight = patches.view.weight.numpy()[:count]
+    location = patches.view.point_a.numpy()[:count].astype(np.float64)
+    tangent_phi = patches.view.phi.numpy()[:count].astype(np.float64)
+    normal = contacts.rigid_contact_normal.numpy()[:count].astype(np.float64)
+    worlds = solver.contact_world.numpy()[:count]
+    velocities = {}
+
+    def bias(c, row):
+        if not baked:
+            return row["rhs"].astype(np.float64)
+        w = int(worlds[c])
+        if w not in velocities:
+            velocities[w] = _predicted_velocity(solver, w)
+        return row["rhs"].astype(np.float64) - row["jacobian"].astype(np.float64) @ velocities[w]
+
+    record = {
+        "normals": {},
+        "regions": {},
+        "gain": max(float(solver.pgs_beta), float(solver.contact_speculative_scale)) / dt,
+        "friction_gain": float(solver.friction_anchor_beta) / dt,
+    }
+    members = {}
+    for c, row in rows.items():
+        members.setdefault(int(owner[c]), []).append(c)
+        row["bias"] = bias(c, row)
+        record["normals"][c] = {
+            "type": int(row["types"][0]),
+            "next": int(row["parents"][0]),
+            "mu": float(row["mu"][0]),
+            "bias": float(row["bias"][0]),
+            "phi": row["phi"],
+            "target": row["target"],
+            "impulse": float(row["impulses"][0]),
+        }
+    for region in members.values():
+        anchors, friction = [], np.zeros(3)
+        for c in region:
+            row = rows[c]
+            if len(row["types"]) != 3:
+                continue
+            first, second = _tangent_basis(normal[c])
+            vector = float(row["impulses"][1]) * first + float(row["impulses"][2]) * second
+            friction += vector
+            anchors.append(
+                {
+                    "contact": c,
+                    "location": location[c],
+                    "weight": float(weight[c]),
+                    "phi": tangent_phi[c],
+                    "types": row["types"][1:].copy(),
+                    "own": bool(np.all(row["parents"][1:] == c)),
+                    "mu": row["mu"][1:].astype(np.float64),
+                    "bias": row["bias"][1:],
+                    "impulses": row["impulses"][1:].astype(np.float64),
+                }
+            )
+        record["regions"][tuple(sorted(region))] = {
+            "anchors": anchors,
+            "load": sum(float(rows[c]["impulses"][0]) for c in region),
+            "friction": friction,
+        }
+    return record
+
+
+def _predicted_velocity(solver, world):
+    """Return a world's predicted generalized velocity in the column order of its dense split row Jacobians."""
+    v_hat = solver.v_hat.numpy().astype(np.float64)
+    # The world's articulations in index order, as :func:`_jacobian` lays them out.
+    worlds, starts = solver.art_to_world.numpy(), solver.articulation_dof_start.numpy()
+    blocks = []
+    for size in solver.size_groups:
+        for art in solver.group_to_art[size].numpy():
+            if worlds[art] == world:
+                blocks.append((int(art), v_hat[int(starts[art]) : int(starts[art]) + size]))
+    return np.concatenate([block for _art, block in sorted(blocks, key=lambda item: item[0])] or [np.zeros(0)])
+
+
+def _match_anchors(first, second):
+    """Pair two regions' anchors one to one, each with the nearest remaining friction location."""
+    pairs, remaining = [], list(range(len(second)))
+    for anchor in first:
+        nearest = min(remaining, key=lambda j: float(np.linalg.norm(second[j]["location"] - anchor["location"])))
+        remaining.remove(nearest)
+        pairs.append((anchor, second[nearest]))
+    return pairs
+
+
+def assert_patch_rows_close(a, b, *, atol=3e-5, rtol=3e-4, lifecycle=True):
+    """Require the same patch rows on two routes, whichever member of a support edge carries an anchor.
+
+    ``a`` and ``b`` are :func:`patch_rows` records. Normal rows compare by contact
+    and anchor rows by friction location: row types, ring links, mu (divided on
+    anchor rows), phi, target, patch weight and location within ``atol`` and
+    ``rtol``. A row's bias follows its phi through the position-bias gain, so its
+    tolerance adds the gain times the records' phi difference: one float32 ulp of
+    a foot's pose moves phi by about 4e-7 and the bias of a gap row by 400 times
+    that. ``lifecycle`` also compares each anchor's tangential phi, which its
+    carried history decides; leave it off where anchors release at the friction
+    cone's boundary (sliding feet).
+    """
+    if sorted(a["normals"]) != sorted(b["normals"]):
+        raise AssertionError(f"Routed contacts differ: {sorted(set(a['normals']) ^ set(b['normals']))}")
+    for c in sorted(a["normals"]):
+        first, second = a["normals"][c], b["normals"][c]
+        for name in ("type", "next"):
+            if first[name] != second[name]:
+                raise AssertionError(f"contact {c} normal row {name}: {first[name]} != {second[name]}")
+        for name in ("mu", "phi", "target"):
+            if first[name] is not None and second[name] is not None:
+                np.testing.assert_allclose(
+                    first[name], second[name], atol=atol, rtol=rtol, err_msg=f"contact {c} {name}"
+                )
+        follow = a["gain"] * abs(first["phi"] - second["phi"])
+        np.testing.assert_allclose(
+            first["bias"], second["bias"], atol=atol + follow, rtol=rtol, err_msg=f"contact {c} bias"
+        )
+    if sorted(a["regions"]) != sorted(b["regions"]):
+        raise AssertionError(f"Patch regions differ: {sorted(set(a['regions']) ^ set(b['regions']))}")
+    for key in sorted(a["regions"]):
+        anchors = a["regions"][key]["anchors"], b["regions"][key]["anchors"]
+        if len(anchors[0]) != len(anchors[1]):
+            raise AssertionError(f"Region {key} holds {len(anchors[0])} and {len(anchors[1])} anchors")
+        for first, second in _match_anchors(*anchors):
+            label = f"region {key} anchor at {np.round(first['location'], 4).tolist()}"
+            np.testing.assert_allclose(
+                first["location"], second["location"], atol=atol, rtol=rtol, err_msg=f"{label} location"
+            )
+            np.testing.assert_array_equal(first["types"], second["types"], err_msg=f"{label} types")
+            if not (first["own"] and second["own"]):
+                raise AssertionError(f"{label}: friction rows must link to the anchor's own normal row")
+            np.testing.assert_allclose(
+                [first["weight"], *first["mu"]],
+                [second["weight"], *second["mu"]],
+                atol=atol,
+                rtol=rtol,
+                err_msg=f"{label} weight and mu",
+            )
+            follow = a["friction_gain"] * float(np.abs(first["phi"] - second["phi"]).max())
+            np.testing.assert_allclose(
+                first["bias"], second["bias"], atol=atol + follow, rtol=rtol, err_msg=f"{label} bias"
+            )
+            if lifecycle:
+                np.testing.assert_allclose(
+                    first["phi"], second["phi"], atol=atol, rtol=rtol, err_msg=f"{label} tangential phi"
+                )
+
+
+def assert_patch_impulses_close(a, b, *, atol=2e-5, rtol=7e-4):
+    """Require close solved impulses per normal row and per anchor, keyed as by :func:`assert_patch_rows_close`.
+
+    Sound where each region's impulses are determined, such as point feet or a
+    single bouncing foot. On a stance whose contact rows outnumber its degrees
+    of freedom, float order redistributes load among the rows; compare region
+    sums there (:func:`assert_region_impulses_close`). Call after
+    :func:`assert_patch_rows_close`, which matches contacts and anchors.
+    """
+    for c in sorted(a["normals"]):
+        np.testing.assert_allclose(
+            a["normals"][c]["impulse"], b["normals"][c]["impulse"], atol=atol, rtol=rtol, err_msg=f"contact {c} impulse"
+        )
+    for key in sorted(a["regions"]):
+        for first, second in _match_anchors(a["regions"][key]["anchors"], b["regions"][key]["anchors"]):
+            np.testing.assert_allclose(
+                first["impulses"],
+                second["impulses"],
+                atol=atol,
+                rtol=rtol,
+                err_msg=f"region {key} anchor at {np.round(first['location'], 4).tolist()} impulses",
+            )
+
+
+def assert_region_impulses_close(a, b, *, load_atol, friction_atol):
+    """Bound the difference of each patch region's normal load and friction vector between two routes.
+
+    ``a`` and ``b`` are :func:`patch_rows` records; the bounds are spreads
+    measured against a twin whose input differs by one float32 ulp (see
+    :data:`STANDING_REGION_BOUNDS`).
+    """
+    if sorted(a["regions"]) != sorted(b["regions"]):
+        raise AssertionError(f"Patch regions differ: {sorted(set(a['regions']) ^ set(b['regions']))}")
+    for key in sorted(a["regions"]):
+        first, second = a["regions"][key], b["regions"][key]
+        if abs(first["load"] - second["load"]) > load_atol:
+            raise AssertionError(
+                f"Region {key} normal load {first['load']} vs {second['load']} differs by more than {load_atol}"
+            )
+        difference = float(np.linalg.norm(first["friction"] - second["friction"]))
+        if difference > friction_atol:
+            raise AssertionError(
+                f"Region {key} friction {first['friction'].tolist()} vs {second['friction'].tolist()}: "
+                f"|difference| {difference} exceeds {friction_atol}"
+            )
+
+
+def anchor_sites(solver, contacts):
+    """List the stored anchors by site: body, body-frame location, carried flag and carried history.
+
+    A site does not change when float32 rounding moves an anchor's rows to
+    another member of its support edge, unlike the contact index that carries it.
+    """
+    patches = solver._friction_patches
+    previous = patches.previous
+    count = min(int(contacts.rigid_contact_count.numpy()[0]), patches.capacity)
+    valid = previous.valid.numpy()[:count]
+    body = previous.body_a.numpy()[:count]
+    anchor = previous.anchor_a.numpy()[:count].astype(np.float64)
+    displacement = previous.displacement.numpy()[:count].astype(np.float64)
+    tangent = previous.tangent_impulse.numpy()[:count].astype(np.float64)
+    source = patches.current.source.numpy()[:count]
+    return [
+        {
+            "body": int(body[c]),
+            "anchor": anchor[c],
+            "carried": bool(source[c] >= 0),
+            "displacement": displacement[c],
+            "tangent": tangent[c],
+        }
+        for c in np.flatnonzero(valid)
+    ]
+
+
+def assert_anchor_sites_close(a, b, *, atol=3e-5, rtol=3e-4, history=(2e-5, 7e-4), tangent=True):
+    """Require the same stored anchors on two routes and close carried history.
+
+    ``a`` and ``b`` are :func:`anchor_sites` lists, paired by body and nearest
+    location; locations agree within ``atol`` and ``rtol`` and carried flags
+    exactly. ``history`` is the (atol, rtol) of the stored displacement and,
+    with ``tangent``, of the stored tangent impulse; None skips both. Leave
+    ``tangent`` off where float order redistributes friction among a stance's
+    anchors; :func:`assert_history_matches_rows` still ties each route's stored
+    impulses to its solved rows.
+    """
+    if len(a) != len(b):
+        raise AssertionError(f"Stored anchors differ in number: {len(a)} and {len(b)}")
+    remaining = list(range(len(b)))
+    for site in a:
+        candidates = [j for j in remaining if b[j]["body"] == site["body"]]
+        if not candidates:
+            raise AssertionError(f"No stored anchor of body {site['body']} pairs with {site['anchor'].tolist()}")
+        nearest = min(candidates, key=lambda j: float(np.linalg.norm(b[j]["anchor"] - site["anchor"])))
+        remaining.remove(nearest)
+        other = b[nearest]
+        label = f"body {site['body']} anchor at {np.round(site['anchor'], 4).tolist()}"
+        np.testing.assert_allclose(site["anchor"], other["anchor"], atol=atol, rtol=rtol, err_msg=f"{label} location")
+        if site["carried"] != other["carried"]:
+            raise AssertionError(f"{label} carried history: {site['carried']} and {other['carried']}")
+        if history is None:
+            continue
+        names = ("displacement", "tangent") if tangent else ("displacement",)
+        for name in names:
+            np.testing.assert_allclose(
+                site[name], other[name], atol=history[0], rtol=history[1], err_msg=f"{label} stored {name}"
+            )
+
+
+def assert_history_matches_rows(solver, contacts, *, atol=1e-6, rtol=1e-6):
+    """Require each stored anchor with route 0 rows to hold the tangent impulse its rows solved.
+
+    Compares magnitudes, which the frame of the stored impulse does not change
+    beyond float32 rounding of its rotation into the body frame. Returns the
+    number of anchors checked.
+    """
+    patches = solver._friction_patches
+    count = min(int(contacts.rigid_contact_count.numpy()[0]), patches.capacity)
+    valid = patches.previous.valid.numpy()[:count]
+    tangent = patches.previous.tangent_impulse.numpy()[:count]
+    slot, world = solver.contact_slot.numpy()[:count], solver.contact_world.numpy()[:count]
+    needed, path = solver.contact_slots_needed.numpy()[:count], solver.contact_path.numpy()[:count]
+    impulses = solver.impulses.numpy()
+    checked = 0
+    for c in np.flatnonzero(valid):
+        if path[c] != 0 or slot[c] < 0 or needed[c] != 3:
+            continue
+        w, s = int(world[c]), int(slot[c])
+        solved = float(np.hypot(impulses[w, s + 1], impulses[w, s + 2]))
+        stored = float(np.linalg.norm(tangent[c]))
+        if abs(stored - solved) > atol + rtol * solved:
+            raise AssertionError(f"Contact {c} stored tangent impulse {stored}; its friction rows solved {solved}")
+        checked += 1
+    return checked
+
+
+def ring_budget_ratios(solver, route=0):
+    """Return each friction pair's |lambda_t| over its coefficient times the pooled ring normal load."""
+    arrays = route_arrays(solver, route)
+    ratios = []
+    for w, count in enumerate(arrays["count"]):
+        kinds, parents = arrays["type"][w, :count], arrays["parent"][w, :count]
+        mu, impulses = arrays["mu"][w, :count], arrays["impulse"][w, :count]
+        for row in np.flatnonzero(kinds == PGS_CONSTRAINT_TYPE_FRICTION):
+            parent = int(parents[row])
+            if row != parent + 1 or kinds[parent] != PGS_CONSTRAINT_TYPE_CONTACT:
+                continue
+            budget = float(mu[row]) * ring_load(parents, impulses, parent)
+            if budget > 0.0:
+                ratios.append(float(np.linalg.norm(impulses[row : row + 2])) / budget)
+    return np.asarray(ratios)
+
+
+def assert_states_close(first, second, *, velocity_atol=2.0e-3):
+    """Require close states: poses within 2e-4 and twists within ``velocity_atol``, both relative 2e-4.
+
+    The default is the sparse-solver state contract; the standing feet compare
+    twists at :data:`STANDING_VELOCITY_ATOL`.
+    """
+    for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
+        np.testing.assert_allclose(
+            getattr(first, name).numpy(),
+            getattr(second, name).numpy(),
+            rtol=2.0e-4,
+            atol=velocity_atol if name.endswith("qd") else 2.0e-4,
+            err_msg=name,
+        )
+
+
+# The standing feet rest on their corners at zero gap, where the position correction's 1/dt gain turns
+# one float32 ulp of a foot's pose into up to 2.3e-3 of joint velocity and 2.1e-3 of momentum at 8 PGS
+# iterations (CPU one-ulp twins as below; sliding feet 1.4e-3), while poses move by 4.4e-6 at most. Their
+# states compare poses at 2e-4 and twists and momentum within this bound.
+STANDING_VELOCITY_ATOL = 5.0e-3
+# Region impulse bounds for cross-route comparisons, at least twice the spread measured on CPU between
+# the dense split route and a twin whose torso starts one float32 ulp higher, over 24 steps with masked
+# resets and over the same steps restarted each step from the reference state plus one ulp on every body
+# pose component. They are CPU measurements: re-measure on CUDA (dense against sparse split rows and the
+# ordinary against the incremental matrix-free sweep) before tightening them.
+# Standing (8 PGS iterations): region normal load 1.4e-3 and friction 2.8e-3 at most. The two-foot
+# stance has more contact rows than degrees of freedom, so float order redistributes friction between
+# the feet: only gross friction errors exceed this bound.
+STANDING_REGION_BOUNDS = {"load_atol": 3.0e-3, "friction_atol": 6.0e-3}
+# Sliding feet (SLIDING_FEET, SLIDING_ITERATIONS): load 5.6e-4 and friction 8.5e-5 at most. Every
+# anchor sits at its pooled budget, so kinetic friction fixes each region's friction at its coefficient
+# times the region's load: an anchor budget that pools only its own normal moves it by 6.5e-3.
+SLIDING_REGION_BOUNDS = {"load_atol": 1.5e-3, "friction_atol": 2.0e-4}
+# Low-friction feet (feet and ground mu 0.1) start sliding forward at 0.5 m/s and keep sliding.
+SLIDING_FEET = {"mu": 0.1, "speed": 0.5}
+# Iterations that keep every sliding anchor at its pooled budget (8 leave a third of them inside).
+SLIDING_ITERATIONS = 32
+
+
+def standing_model(device="cuda:0", worlds=2, *, mu=None, speed=0.0):
     """Stand a floating torso on two position-held legs with box feet, one articulation per world.
 
     Each foot rests on four corners, so patch friction links their normals in
     one ring and keeps two loaded, sticking anchors per foot from step to step.
     The tree is branched with a free root, as the sparse routes require.
+    ``mu`` sets the friction coefficient of the feet and the ground (default:
+    0.8 feet on the default ground), and ``speed`` starts the torso moving
+    along +x [m/s], so low-friction feet slide (:data:`SLIDING_FEET`).
     """
     builder = newton.ModelBuilder()
     cfg = builder.default_shape_cfg.copy()
-    cfg.density, cfg.mu = 0.0, 0.8
+    cfg.density, cfg.mu = 0.0, 0.8 if mu is None else mu
     for _ in range(worlds):
         builder.begin_world()
         torso = builder.add_link(
@@ -270,6 +645,7 @@ def standing_model(device="cuda:0", worlds=2):
             lock_inertia=True,
         )
         joints = [builder.add_joint_free(child=torso)]
+        builder.joint_qd[-6] = speed
         for side in (-1.0, 1.0):
             parent = torso
             for link in range(2):
@@ -290,7 +666,12 @@ def standing_model(device="cuda:0", worlds=2):
             builder.add_shape_box(parent, hx=0.06, hy=0.03, hz=0.03, xform=foot, cfg=cfg)
         builder.add_articulation(joints)
         builder.end_world()
-    builder.add_ground_plane()
+    if mu is None:
+        builder.add_ground_plane()
+    else:
+        ground = builder.default_shape_cfg.copy()
+        ground.mu = mu
+        builder.add_ground_plane(cfg=ground)
     return builder.finalize(device=device)
 
 
