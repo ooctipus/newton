@@ -515,17 +515,22 @@ def test_clear_active(test, device):
 
 
 def test_clear_active_coalesced(test, device, active_count=CLEAR_ACTIVE_ENTRY_PARALLEL_THRESHOLD):
-    """Verify a clear branch resets directly seeded active entries."""
+    """Verify a clear branch resets directly seeded active entries.
+
+    The active entries are the odd ones, so every active row sits between
+    inactive rows that the clear must leave alone.
+    """
     reducer = GlobalContactReducer(
-        capacity=4 * active_count,
+        capacity=8 * active_count,
         device=device,
         store_hydroelastic_data=True,
         store_moment_data=True,
     )
     ht_capacity = reducer.hashtable.capacity
-    test.assertGreaterEqual(ht_capacity, active_count)
+    test.assertGreaterEqual(ht_capacity, 2 * active_count)
 
-    active_entries = np.arange(active_count, dtype=np.int32)
+    active_entries = 2 * np.arange(active_count, dtype=np.int32) + 1
+    inactive_entries = np.setdiff1d(np.arange(ht_capacity), active_entries)
     keys = np.full(ht_capacity, np.iinfo(np.uint64).max, dtype=np.uint64)
     keys[active_entries] = np.arange(1, active_count + 1, dtype=np.uint64)
     active_slots = np.zeros(ht_capacity + 1, dtype=np.int32)
@@ -569,9 +574,10 @@ def test_clear_active_coalesced(test, device, active_count=CLEAR_ACTIVE_ENTRY_PA
     values = reducer.ht_values.numpy()
     rows = reduction_value_index_np(np.arange(ht_capacity)[:, None], np.arange(reducer.values_stride))
     np.testing.assert_array_equal(values[rows[active_entries]], 0)
-    np.testing.assert_array_equal(values[rows[active_count:]], 1)
+    np.testing.assert_array_equal(values[rows[inactive_entries]], 1)
     for values in entry_arrays:
         np.testing.assert_array_equal(values.numpy()[active_entries], 0.0)
+        np.testing.assert_array_equal(values.numpy()[inactive_entries], 1.0)
 
 
 def test_export_reduced_contacts_kernel(test, device):
