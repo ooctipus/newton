@@ -388,7 +388,14 @@ class TestKeyedPatchRows(unittest.TestCase):
         friction_anchor_beta, normals link their ring and anchors divide the
         coefficient, and the bias matches the general route's. Both solvers build
         the frame from the same anchor history, which a few general steps load.
+        Both also read a friction_anchor_beta assigned after construction, as the
+        general producer reads it every step.
         """
+        for late_beta in (None, 0.35):
+            with self.subTest(late_beta=late_beta):
+                self._check_keyed_patch_rows(late_beta)
+
+    def _check_keyed_patch_rows(self, late_beta):
         model = standing_model(device="cpu", worlds=2)
         dt = 1.0 / 240.0
         options = {
@@ -406,6 +413,8 @@ class TestKeyedPatchRows(unittest.TestCase):
         keyed.mf_gs_parallel_rows = 4
         keyed._friction_patches = general._friction_patches
         keyed._keyed_rows = keyed_rows.KeyedRows(keyed)
+        if late_beta is not None:
+            general.friction_anchor_beta = keyed.friction_anchor_beta = late_beta
         state, out = model.state(), model.state()
         velocity = state.joint_qd.numpy()
         velocity[0], velocity[11] = 0.05, -0.04
@@ -450,6 +459,10 @@ class TestKeyedPatchRows(unittest.TestCase):
                 np.testing.assert_allclose(actual["rhs"][world, rows], bias[world, rows], rtol=1.0e-5, atol=1.0e-7)
                 linked += expected["linked"][c][0] not in (-1, c)
                 tangent_phi += needed == 3 and bool(np.any(expected["phi"][world, first + 1 : first + 3] != 0.0))
+                if needed == 3:
+                    # The anchors carry the coefficient in force at this step.
+                    beta = options["friction_anchor_beta"] if late_beta is None else late_beta
+                    np.testing.assert_array_equal(expected["row_beta"][world, first + 1 : first + 3], np.float32(beta))
         self.assertGreater(linked, 0, "A box foot must link several normals in one ring")
         self.assertGreater(tangent_phi, 0, "Anchors must carry tangential phi")
 

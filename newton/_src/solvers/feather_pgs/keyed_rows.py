@@ -584,6 +584,8 @@ class KeyedRows:
         self.contact_input = bind(self.solver, state_in, state_aug, contacts, dt, 1.0)
         self.data.contact = self.contact_input
         if self.patch:
+            # Like bind() and the other row producers, read the anchor coefficient every step.
+            self.law.beta = self.solver.friction_anchor_beta
             wp.launch(
                 scatter_patch_contact_keys,
                 dim=self.contact_input.point0.shape[0],
