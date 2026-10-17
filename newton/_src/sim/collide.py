@@ -1403,6 +1403,42 @@ def _warn_full_surface_fallbacks(model: Model, capable: np.ndarray) -> None:
     )
 
 
+_TYPED_TERRAIN_QUERY = "_contacts_to_reducer_kernel"
+
+
+def _heightfield_row(kernel) -> dict:
+    """Describe one typed terrain query from its factory-generated kernel key.
+
+    ``_create_mesh_triangle_contacts_to_reducer_kernel`` names typed queries
+    ``heightfield_<type>_contacts_to_reducer_kernel[_analytic]``; the fallback
+    appends ``_without_hfield_convex`` or ``_analytic_convex``.
+    """
+    key = kernel.key
+    if key.startswith("heightfield_") and _TYPED_TERRAIN_QUERY in key:
+        row = key[len("heightfield_") : key.index(_TYPED_TERRAIN_QUERY)]
+        return {"row": row, "kernel": key, "closed_form": key.endswith("_analytic")}
+    hull = (
+        "excluded" if "_without_hfield_convex" in key else "closed_form" if key.endswith("_analytic_convex") else "gjk"
+    )
+    return {"row": "fallback", "kernel": key, "hull": hull}
+
+
+def _route_gate(enabled: bool, requested: bool, flag: str, blockers, request: str | None = None) -> str:
+    """Explain an opt-in route: admitted, off, or the first admission gate that declined it.
+
+    ``request`` names an argument request; the default names the environment flag.
+    """
+    request = request or f"{flag}=1"
+    if enabled:
+        return f"{request}: admitted."
+    if not requested:
+        return f"Off: {flag} is not 1."
+    for blocked, reason in blockers:
+        if blocked:
+            return f"{request} declined: {reason}."
+    return f"{request} declined: a custom contact writer."
+
+
 class CollisionPipeline:
     """
     Full-featured collision pipeline with GJK/MPR narrow phase and pluggable broad phase.
@@ -1880,6 +1916,9 @@ class CollisionPipeline:
         convex_cells = os.environ.get("NEWTON_NARROW_PHASE_CONVEX_CELLS", "0")
         self._convex_cells = None
         self._heightfield_convex_cells = None
+        # Construction-time terrain route reasons, reported by get_collision_selection().
+        self._terrain_cells_reason = None
+        self._terrain_split_reason = None
         coherent_convex = os.environ.get("NEWTON_NARROW_PHASE_COHERENT_CONVEX", "0")
         if convex_collision is not None:
             methods = {
@@ -1894,6 +1933,8 @@ class CollisionPipeline:
         if convex_cells not in ("0", "1"):
             raise ValueError("NEWTON_NARROW_PHASE_CONVEX_CELLS must be 0 or 1")
         self.convex_collision = convex_collision
+        # The coherent-convex owner requested by convex_collision or the environment, before admission.
+        self._coherent_convex_requested = coherent_convex
         coherent_stats = os.environ.get("NEWTON_NARROW_PHASE_COHERENT_STATS", "0")
         if coherent_convex not in ("0", "reject_only", "auto") or coherent_stats not in ("0", "1"):
             raise ValueError(
@@ -2196,6 +2237,7 @@ class CollisionPipeline:
             # magnitude larger than the neighbor-budget contact estimate and
             # allocating sorter scratch at that size burns multi-GB of VRAM.
             terrain_split = None
+            self._terrain_split_reason = "NEWTON_HEIGHTFIELD_CONVEX_SPLIT selects the hull query schedule."
             if "NEWTON_HEIGHTFIELD_CONVEX_SPLIT" not in os.environ:
                 # Staging trades extra scratch/launches for lower query register
                 # pressure. Keep small batches and tight allocations fused.
@@ -2206,6 +2248,13 @@ class CollisionPipeline:
                     and device.is_cuda
                     and model.world_count >= 1024
                     and 44 * max_triangle_pairs + 4 <= device.free_memory // 8
+                )
+                self._terrain_split_reason = (
+                    "Automatic: staged hull queries for at least 1024 CUDA worlds whose scratch fits an eighth of "
+                    "free device memory at construction."
+                    if terrain_split
+                    else "Automatic: fused hull queries (no hull terrain request, CPU, fewer than 1024 worlds, or "
+                    "scratch above an eighth of free device memory at construction)."
                 )
             self.narrow_phase = NarrowPhase(
                 max_candidate_pairs=self.shape_pairs_max,
@@ -2410,6 +2459,8 @@ class CollisionPipeline:
                     "the internal lean CUDA split pipeline, no mesh/heightfield/particle/hydroelastic or "
                     "speculative contacts, no body-pair reduction, and no gradients"
                 )
+        # The admitted coherent-convex owner ("0" when none), reported by get_collision_selection().
+        self._coherent_convex_mode = coherent_convex
         if coherent_convex != "0":
             from ..geometry.coherent_convex import _ConvexQueryCache  # noqa: PLC0415
             from ..geometry.coherent_convex_rejection import _create_rejection_query_kernels  # noqa: PLC0415
@@ -2497,6 +2548,31 @@ class CollisionPipeline:
                         exclude_primitives=True, exclude_heightfield_convex=True
                     ),
                 )
+        # Why the terrain convex-cells owner is or is not installed, reported by get_collision_selection().
+        if not self.narrow_phase.has_heightfields:
+            self._terrain_cells_reason = None
+        elif self._heightfield_convex_cells is not None:
+            if terrain_forced:
+                self._terrain_cells_reason = "convex_collision='convex_cells' forces the cells owner."
+            elif terrain_requested:
+                self._terrain_cells_reason = "NEWTON_HEIGHTFIELD_CONVEX_CELLS=1 installs the cells owner."
+            else:
+                self._terrain_cells_reason = (
+                    "convex_collision='auto' on CUDA installs the cells owner; a sampled chooser picks cell or "
+                    "vertex-scan support for its GJK/MPR hull query."
+                )
+        elif not self.narrow_phase._heightfield_primitive_query:
+            self._terrain_cells_reason = "The cells owner needs the typed heightfield primitive table, which is off."
+        elif not terrain_supported:
+            self._terrain_cells_reason = (
+                "Expert components, particles, hydroelastic contacts or gradients keep the table without cells."
+            )
+        elif convex_collision == "auto" and not device.is_cuda:
+            self._terrain_cells_reason = "Automatic terrain cells require CUDA."
+        elif terrain_auto:
+            self._terrain_cells_reason = "No convex mesh was admitted to the cell tables."
+        else:
+            self._terrain_cells_reason = f"convex_collision={convex_collision!r} does not request terrain cells."
 
         # Built here (not in finalize) so models/tasks that never collide don't pay for it.
         # Host-side, so not graph-capture-safe -- construct the pipeline before any capture.
@@ -2621,6 +2697,14 @@ class CollisionPipeline:
 
         Automatic selection can change during replay. This reports the latest
         observation, not the fraction of calls using each method.
+
+        ``narrow_phase`` records the coherent-convex mode and the generic convex
+        query variants. ``heightfield`` (``None`` without heightfield collision)
+        records the terrain midphase, the typed primitive table and its
+        closed-form rows, the route convex-hull pairs take, the terrain
+        convex-cells owner and its chooser, and each opt-in terrain route with
+        its reason. Both are construction-time host records: they read no device
+        memory and are JSON-compliant.
         """
         owner = getattr(self.narrow_phase, "_convex_method_choice", None)
         result = {"requested": self.convex_collision, "reason": self._convex_selection_reason}
@@ -2662,7 +2746,203 @@ class CollisionPipeline:
         if "heightfield_support" in result:
             result["method"] = result["heightfield_support"]["method"]
             result["reason"] = result["heightfield_support"]["reason"]
+        result["narrow_phase"] = self._narrow_phase_selection()
+        result["heightfield"] = self._heightfield_selection()
         return result
+
+    def _narrow_phase_selection(self) -> dict:
+        """Host-only record of the coherent-convex mode and the generic convex query variants."""
+        narrow = self.narrow_phase
+
+        def mode(value):
+            return "off" if value == "0" else value
+
+        reason = self._convex_selection_reason
+        if self._coherent_convex_requested == "reject_only" and self._coherent_convex_mode == "0":
+            # convex_collision='convex_cells' on a pipeline the generic owner cannot serve keeps only terrain cells.
+            reason = "terrain_cells_only"
+        return {
+            "coherent_convex": {
+                "requested": mode(self._coherent_convex_requested),
+                "source": "environment" if self.convex_collision is None else "argument",
+                "mode": mode(self._coherent_convex_mode),
+                "reason": reason,
+            },
+            "broad_phase": self.broad_phase_mode,
+            "split_gjk_mpr": bool(narrow.split_gjk_mpr),
+            "lean_gjk_mpr": bool(narrow._use_lean_gjk_mpr),
+            "sparse_gjk_pairs": bool(narrow.sparse_gjk_pairs),
+            "mesh_reduction": bool(self.mesh_contact_reduction_enabled),
+            "body_pair_reduction": bool(self.contact_reduction_config.body_pairs),
+            "deterministic": bool(self.deterministic),
+            "speculative": bool(self._speculative_enabled),
+            "hydroelastic": self.hydroelastic_sdf is not None,
+            "contact_matching": self.contact_matching,
+            "pair_shape_prep": bool(self._pair_shape_prep),
+        }
+
+    def _heightfield_selection(self) -> dict | None:
+        """Host-only record of the terrain routes; ``None`` without heightfield collision."""
+        narrow = self.narrow_phase
+        if not narrow.has_heightfields:
+            return None
+        requests = narrow._route_requests
+        rows = [_heightfield_row(kernel) for kernel in narrow._heightfield_primitive_kernels]
+        if narrow._heightfield_cylinder_split and len(rows) > 1:
+            # The launch replaces index 1 (the typed cylinder query) with the staged GJK split.
+            rows[1]["split_kernels"] = [kernel.key for kernel in narrow._heightfield_cylinder_split_kernels]
+        if not narrow.reduce_contacts:
+            hull = "finite_query_direct" if narrow._heightfield_finite_query else "generic_gjk_direct"
+        elif narrow._heightfield_pair_csr:
+            hull = "pair_csr"
+        elif narrow._heightfield_finite_query:
+            hull = "finite_query"
+        elif narrow._heightfield_primitive_query:
+            if narrow._heightfield_convex_cell_kernel is not None:
+                hull = "terrain_cells_gjk"
+            elif rows and rows[-1].get("hull") == "closed_form":
+                hull = "closed_form_hull_row"
+            else:
+                hull = "gjk_fallback"
+        else:
+            hull = "generic_gjk"
+        if narrow._heightfield_pair_csr:
+            midphase = "pair_csr"
+        elif narrow._heightfield_geometric_cull:
+            midphase = "geometric_cull"
+        elif narrow._heightfield_cell_reject:
+            midphase = "cell_reject_packed" if narrow._heightfield_packed_pairs else "cell_reject"
+        else:
+            midphase = "full"
+        common = (
+            (narrow.speculative, "speculative contacts"),
+            (narrow.deterministic, "deterministic contacts"),
+            (narrow.hydroelastic_sdf is not None, "hydroelastic contacts"),
+        )
+        # The pipeline requests the table by argument only for convex hulls on heightfields under
+        # convex_collision 'auto' or 'convex_cells'; otherwise the environment flag decides.
+        typed_request = (
+            "The typed-table request of convex_collision" if requests["primitive_query_source"] == "argument" else None
+        )
+        if not narrow._heightfield_primitive_query and not requests["primitive_query"]:
+            primitive_reason = (
+                "Off: NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY is not 1 and convex_collision requests no typed table "
+                "(only 'auto' and 'convex_cells' with convex hulls on heightfields do)."
+            )
+        else:
+            primitive_reason = _route_gate(
+                narrow._heightfield_primitive_query,
+                True,
+                "NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY",
+                (
+                    (not narrow.reduce_contacts, "contact reduction is off"),
+                    (narrow._heightfield_finite_query, "the finite query owns terrain pairs"),
+                    (narrow._heightfield_pair_csr_requested, "the pair-CSR route owns terrain pairs"),
+                    *common,
+                ),
+                request=typed_request,
+            )
+        if (
+            requests["cylinder_split"]
+            and narrow._heightfield_primitive_query
+            and not narrow._heightfield_cylinder_split
+        ):
+            cylinder_reason = "NEWTON_HEIGHTFIELD_CYLINDER_SPLIT=1 declined: the closed-form cylinder row replaces it."
+        else:
+            cylinder_reason = _route_gate(
+                narrow._heightfield_cylinder_split,
+                requests["cylinder_split"],
+                "NEWTON_HEIGHTFIELD_CYLINDER_SPLIT",
+                ((not narrow._heightfield_primitive_query, "the typed primitive table is off"),),
+            )
+        if narrow._heightfield_pair_csr:
+            pair_reason = "NEWTON_HEIGHTFIELD_PAIR_CSR=1: admitted and bound to unique model pairs."
+        elif narrow._heightfield_pair_csr_requested:
+            pair_reason = "NEWTON_HEIGHTFIELD_PAIR_CSR=1 admitted but not bound: the pairs are not unique model pairs."
+        else:
+            pair_reason = _route_gate(
+                False,
+                requests["pair_csr"],
+                "NEWTON_HEIGHTFIELD_PAIR_CSR",
+                (
+                    (not narrow._heightfield_geometric_cull, "requires the geometric cull"),
+                    (not narrow._heightfield_finite_query, "requires the finite query"),
+                    (narrow.has_meshes, "meshes share the terrain path"),
+                    *common,
+                ),
+            )
+        cells = self._heightfield_convex_cells
+        cell_kernel = narrow._heightfield_convex_cell_kernel
+        return {
+            "midphase": midphase,
+            "hull_route": hull,
+            "primitive_query": {
+                "enabled": bool(narrow._heightfield_primitive_query),
+                "source": requests["primitive_query_source"],
+                "reason": primitive_reason,
+                "rows": rows,
+            },
+            "convex_cells": {
+                "owner": None
+                if cells is None
+                else "sampled_chooser"
+                if narrow._heightfield_method_choice is not None
+                else "fixed",
+                "query": None if cell_kernel is None else "gjk_mpr",
+                "schedule": None
+                if cell_kernel is None
+                else "split"
+                if narrow._heightfield_convex_split_kernels
+                else "fused",
+                "reason": self._terrain_cells_reason,
+                "schedule_reason": self._terrain_split_reason,
+            },
+            "cylinder_split": {"enabled": bool(narrow._heightfield_cylinder_split), "reason": cylinder_reason},
+            "geometric_cull": {
+                "enabled": bool(narrow._heightfield_geometric_cull),
+                "reason": _route_gate(
+                    narrow._heightfield_geometric_cull,
+                    requests["geometric_cull"],
+                    "NEWTON_HEIGHTFIELD_GEOMETRIC_CULL",
+                    (
+                        (not narrow._heightfield_cell_reject, "cell rejection is off or meshes share the midphase"),
+                        (narrow.speculative, "speculative contacts"),
+                        (not narrow.reduce_contacts, "contact reduction is off"),
+                    ),
+                ),
+            },
+            "finite_query": {
+                "enabled": bool(narrow._heightfield_finite_query),
+                "reason": _route_gate(
+                    narrow._heightfield_finite_query,
+                    requests["finite_query"],
+                    "NEWTON_HEIGHTFIELD_FINITE_QUERY",
+                    (
+                        (narrow.has_meshes, "meshes share the terrain path"),
+                        (narrow.speculative, "speculative contacts"),
+                    ),
+                ),
+            },
+            "pair_csr": {
+                "enabled": bool(narrow._heightfield_pair_csr),
+                "shell": bool(narrow._heightfield_pair_csr_shell),
+                "reason": pair_reason,
+            },
+            "reducer_export_cleanup": {
+                "enabled": bool(narrow._reducer_export_cleanup),
+                "reason": _route_gate(
+                    narrow._reducer_export_cleanup,
+                    requests["export_cleanup"],
+                    "NEWTON_REDUCER_EXPORT_CLEANUP",
+                    (
+                        (not narrow.reduce_contacts, "contact reduction is off"),
+                        (narrow._heightfield_finite_query, "the finite query owns export"),
+                        (narrow._heightfield_pair_csr_requested, "the pair-CSR route owns export"),
+                        *common,
+                    ),
+                ),
+            },
+        }
 
     def _acquire_contacts_graph_lease(self, token: object, contacts: Contacts, mode: str):
         """Register a graph-owned reducer writer lease (Contacts callback)."""

@@ -3,6 +3,7 @@
 
 """Check automatic collision choice without task-specific dispatch."""
 
+import json
 import os
 import unittest
 from unittest.mock import patch
@@ -16,6 +17,55 @@ from newton._src.geometry.coherent_convex_rejection import _create_rejection_que
 from newton._src.geometry.convex_query_cost import _ConvexMethodChoice, _nonnegative_fit, _QueryCostModel
 from newton.tests.test_coherent_convex_rejection import _accepted, _box_inputs, _buffers, _original, _selector_model
 from newton.tests.unittest_utils import add_function_test, get_test_devices
+
+# Pin every terrain route flag so a developer's shell cannot change the expected routes.
+_TERRAIN_ENVIRONMENT = {
+    "NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY": "0",
+    "NEWTON_HEIGHTFIELD_CONVEX_CELLS": "0",
+    "NEWTON_HEIGHTFIELD_ANALYTIC_PRIMITIVES": "1",
+    "NEWTON_HEIGHTFIELD_ANALYTIC_CONVEX": "1",
+    "NEWTON_HEIGHTFIELD_CYLINDER_SPLIT": "0",
+    "NEWTON_HEIGHTFIELD_FINITE_QUERY": "0",
+    "NEWTON_HEIGHTFIELD_GEOMETRIC_CULL": "0",
+    "NEWTON_HEIGHTFIELD_PAIR_CSR": "0",
+    "NEWTON_REDUCER_EXPORT_CLEANUP": "0",
+}
+
+
+def _terrain_model(device):
+    """Place one cube hull (8 vertices, 12 triangles) over a flat heightfield."""
+    vertices = np.array([[x, y, z] for x in (-0.25, 0.25) for y in (-0.25, 0.25) for z in (-0.25, 0.25)], np.float32)
+    faces = np.array(
+        [
+            [0, 1, 3],
+            [0, 3, 2],
+            [4, 6, 7],
+            [4, 7, 5],
+            [0, 4, 5],
+            [0, 5, 1],
+            [2, 3, 7],
+            [2, 7, 6],
+            [0, 2, 6],
+            [0, 6, 4],
+            [1, 5, 7],
+            [1, 7, 3],
+        ],
+        np.int32,
+    )
+    builder = newton.ModelBuilder()
+    builder.add_shape_heightfield(
+        heightfield=newton.Heightfield(data=np.zeros((5, 5), np.float32), nrow=5, ncol=5, hx=0.4, hy=0.4)
+    )
+    body = builder.add_body(xform=wp.transform((0.0, 0.0, 0.25), wp.quat_identity()))
+    builder.add_shape_convex_hull(body, mesh=newton.Mesh(vertices, faces.ravel()))
+    return builder.finalize(device=device)
+
+
+def _terrain_pipeline(model, choice, environment=None):
+    """Build a pipeline with the terrain flags pinned and the convex split left automatic."""
+    with patch.dict(os.environ, {**_TERRAIN_ENVIRONMENT, **(environment or {})}):
+        os.environ.pop("NEWTON_HEIGHTFIELD_CONVEX_SPLIT", None)
+        return newton.CollisionPipeline(model, rigid_contact_max=4096, max_triangle_pairs=4096, convex_collision=choice)
 
 
 def test_graph_choice_preserves_queries(test, device):
@@ -172,9 +222,95 @@ class TestAutoConvexSelection(unittest.TestCase):
         self.assertEqual(ordinary.get_collision_selection()["method"], "ordinary")
         self.assertEqual(automatic.get_collision_selection()["requested"], "auto")
         self.assertEqual(automatic.get_collision_selection()["reason"], "unsupported_pipeline")
+        self.assertEqual(
+            ordinary.get_collision_selection()["narrow_phase"]["coherent_convex"],
+            {"requested": "off", "source": "argument", "mode": "off", "reason": "explicit_ordinary"},
+        )
+        self.assertEqual(
+            automatic.get_collision_selection()["narrow_phase"]["coherent_convex"],
+            {"requested": "auto", "source": "argument", "mode": "off", "reason": "unsupported_pipeline"},
+        )
+        self.assertIsNone(automatic.get_collision_selection()["heightfield"])
         for choice in ("rejection", "convex_cells", "typo"):
             with self.subTest(choice=choice), self.assertRaisesRegex(ValueError, "convex_collision"):
                 newton.CollisionPipeline(model, convex_collision=choice)
+
+    def test_collision_record_reports_terrain_routes_cpu(self):
+        """Report the typed terrain table, the convex-hull route and opt-in routes without device reads."""
+        model = _terrain_model("cpu")
+        geometric = {
+            "NEWTON_HEIGHTFIELD_FINITE_QUERY": "1",
+            "NEWTON_HEIGHTFIELD_GEOMETRIC_CULL": "1",
+            "NEWTON_HEIGHTFIELD_PAIR_CSR": "1",
+        }
+        cases = (
+            ("auto", {}, "closed_form_hull_row", True),
+            ("ordinary", {}, "generic_gjk", False),
+            ("ordinary", {"NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY": "1"}, "closed_form_hull_row", True),
+            ("convex_cells", {}, "terrain_cells_gjk", True),
+            ("ordinary", geometric, "pair_csr", False),
+        )
+        for choice, environment, hull, table in cases:
+            with self.subTest(choice=choice, environment=environment):
+                pipeline = _terrain_pipeline(model, choice, environment)
+                with patch.object(wp.array, "numpy", side_effect=AssertionError("unexpected device read")):
+                    selection = pipeline.get_collision_selection()
+                # Benchmark results store this record with json.dumps(..., allow_nan=False).
+                json.dumps(selection, allow_nan=False)
+                terrain = selection["heightfield"]
+                self.assertEqual(terrain["hull_route"], hull)
+                self.assertEqual(terrain["primitive_query"]["enabled"], table)
+                self.assertEqual(
+                    [row["kernel"] for row in terrain["primitive_query"]["rows"]],
+                    [kernel.key for kernel in pipeline.narrow_phase._heightfield_primitive_kernels],
+                )
+                self.assertEqual(selection["narrow_phase"]["coherent_convex"]["mode"], "off")
+        automatic = _terrain_pipeline(model, "auto").get_collision_selection()["heightfield"]
+        self.assertEqual(automatic["primitive_query"]["source"], "argument")
+        self.assertIn("convex_collision: admitted", automatic["primitive_query"]["reason"])
+        self.assertEqual(
+            [(row["row"], row.get("closed_form", row.get("hull"))) for row in automatic["primitive_query"]["rows"]],
+            [("sphere", True), ("cylinder", True), ("capsule", True), ("box", True), ("fallback", "closed_form")],
+        )
+        self.assertIsNone(automatic["convex_cells"]["owner"])
+        self.assertIn("CUDA", automatic["convex_cells"]["reason"])
+        forced = _terrain_pipeline(model, "convex_cells").get_collision_selection()
+        self.assertEqual(forced["heightfield"]["convex_cells"]["owner"], "fixed")
+        self.assertEqual(forced["heightfield"]["convex_cells"]["query"], "gjk_mpr")
+        self.assertIn("convex_cells", forced["heightfield"]["convex_cells"]["reason"])
+        self.assertEqual(forced["heightfield"]["primitive_query"]["rows"][-1]["hull"], "excluded")
+        self.assertEqual(forced["narrow_phase"]["coherent_convex"]["reason"], "terrain_cells_only")
+        environment = {"NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY": "1", "NEWTON_HEIGHTFIELD_CYLINDER_SPLIT": "1"}
+        split = _terrain_pipeline(model, "ordinary", environment).get_collision_selection()["heightfield"]
+        self.assertFalse(split["cylinder_split"]["enabled"])
+        self.assertIn("closed-form cylinder row", split["cylinder_split"]["reason"])
+        self.assertEqual(split["primitive_query"]["source"], "environment")
+        self.assertEqual(split["primitive_query"]["reason"], "NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY=1: admitted.")
+        pair = _terrain_pipeline(model, "ordinary", geometric).get_collision_selection()["heightfield"]
+        self.assertEqual(pair["midphase"], "pair_csr")
+        self.assertTrue(pair["pair_csr"]["enabled"])
+        self.assertTrue(pair["finite_query"]["enabled"] and pair["geometric_cull"]["enabled"])
+        self.assertIn("NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY is not 1", pair["primitive_query"]["reason"])
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Automatic terrain cells require CUDA")
+    def test_collision_record_reports_automatic_terrain_cells_cuda(self):
+        """Report that automatic terrain cells send hulls through GJK/MPR, not the closed-form hull row."""
+        model = _terrain_model("cuda:0")
+        pipeline = _terrain_pipeline(model, "auto")
+        automatic = pipeline.get_collision_selection()
+        json.dumps(automatic, allow_nan=False)
+        terrain = automatic["heightfield"]
+        self.assertEqual(terrain["hull_route"], "terrain_cells_gjk")
+        self.assertEqual(terrain["convex_cells"]["owner"], "sampled_chooser")
+        self.assertEqual(terrain["convex_cells"]["query"], "gjk_mpr")
+        self.assertIn("auto", terrain["convex_cells"]["reason"])
+        self.assertIsNotNone(terrain["convex_cells"]["schedule_reason"])
+        self.assertEqual(
+            [row["kernel"] for row in terrain["primitive_query"]["rows"]],
+            [kernel.key for kernel in pipeline.narrow_phase._heightfield_primitive_kernels],
+        )
+        ordinary = _terrain_pipeline(model, "ordinary", {"NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY": "1"})
+        self.assertEqual(ordinary.get_collision_selection()["heightfield"]["hull_route"], "closed_form_hull_row")
 
     def test_nonnegative_cost_fit(self):
         # Constraining a negative slope requires refitting the intercept.

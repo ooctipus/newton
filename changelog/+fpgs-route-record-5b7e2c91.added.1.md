@@ -1,0 +1,1 @@
+Add the heightfield routes (typed primitive table and its closed-form rows, the convex-hull route, the terrain convex-cells owner and the opt-in terrain routes) and the coherent-convex mode to `CollisionPipeline.get_collision_selection()`.

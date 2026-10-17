@@ -2738,6 +2738,17 @@ class NarrowPhase:
                     "without deterministic, speculative, hydroelastic or alternate heightfield export"
                 )
             self._reducer_compact_export = contact_export != "tiled" and compact_supported
+        # Requested terrain and reducer routes (environment or explicit argument), reported by
+        # CollisionPipeline.get_collision_selection(); the admitted routes are the fields above.
+        self._route_requests = {
+            "finite_query": finite_query == "1",
+            "geometric_cull": geometric_cull == "1",
+            "pair_csr": pair_csr == "1",
+            "primitive_query": primitive_query == "1",
+            "primitive_query_source": "environment" if heightfield_primitive_query is None else "argument",
+            "cylinder_split": cylinder_split == "1",
+            "export_cleanup": export_cleanup == "1",
+        }
         self._finite_bounds = None
         self._finite_source = None
         self.mesh_sdf_texture_only = mesh_sdf_texture_only
