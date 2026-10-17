@@ -1492,6 +1492,11 @@ class SolverFeatherPGS(SolverBase):
                 ``contact_friction_shared_anchor`` apply only to normal rows and velocity-only friction.
                 Requires ``friction_mode="current"`` and ``pgs_kernel="loop"`` or ``"tiled_row"``.
                 Explicit positive gains with an incompatible point algorithm raise an error.
+                In a captured CUDA graph, a step that receives the contact frame it sorted last (the
+                same ``Contacts`` instance, ``contact_generation`` and contact count) reuses that
+                order, so code that rewrites contact arrays between captured steps without a
+                collision pass must advance ``contact_generation`` (for example with
+                :meth:`~newton.Contacts.clear`) or change the count.
                 Defaults to None.
             contact_speculative_scale (float, optional): Multiplies the positive-gap position RHS
                 for normal contact rows on the dense, matrix-free free-rigid, and propagation
@@ -3565,6 +3570,10 @@ class SolverFeatherPGS(SolverBase):
         kinematic = (
             self._kinematic_state() if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES) else None
         )
+        if self._friction_anchors_enabled:
+            # The next captured build sorts its pairs again rather than reusing the
+            # sorted contact frame across a model change.
+            self._friction_patches.forget_frame()
         if self._friction_anchors_enabled and flags & ModelFlags.SHAPE_PROPERTIES:
             # Geometry edits retire affected material points; unrelated shape
             # properties keep their history and live materials are checked per step.
@@ -6089,11 +6098,13 @@ class SolverFeatherPGS(SolverBase):
         # Row builders always receive a zero phi view when patch friction is off.
         # Persistent state is owned by the body-pair patch builder, independently
         # of collision matching and the contact warm-start tables.
+        reuse_frames, self._patch_conditional_nodes_reason = self._patch_conditional_nodes(device)
         self._friction_patches = _FrictionPatchState(
             model,
             max_contacts,
             self._friction_anchors_enabled,
             wp.zeros(max_contacts, dtype=wp.vec2, device=device),
+            reuse_frames=reuse_frames,
         )
         self._ws_prev_contact_normal = (
             wp.zeros(max_contacts, dtype=wp.vec3, device=device) if self.pgs_warmstart else None
@@ -7917,6 +7928,32 @@ class SolverFeatherPGS(SolverBase):
         main_stream = wp.get_stream(self.model.device)
         self._memset_done_event[0] = main_stream.record_event()
         self._memset_done_event[1] = main_stream.record_event()
+
+    @contextmanager
+    def _double_buffer_capture_pause(self):
+        """Keep the double buffer valid across a pause of the graph capture.
+
+        A conditional node pauses the capture to record its body. The pause ends
+        the capture, which must then have joined every forked stream, and no
+        event recorded before it can be waited on after it. The memset stream
+        forked at the end of a step is joined two steps later, so while it takes
+        part in the capture the main stream waits for both buffer slots before
+        the pause. Both slots are recorded again after it; each slot's consumer
+        still waits for its memset.
+        """
+        stream = self._memset_stream
+        events = self._memset_done_event if stream is not None else []
+        main_stream = wp.get_stream(self.model.device) if events else None
+        if stream is not None and stream.is_capturing:
+            # Forked by an earlier step of this capture, so both slots hold
+            # events of this capture: that step's and one already waited on.
+            for event in events:
+                if event is not None:
+                    main_stream.wait_event(event)
+        yield
+        for slot, event in enumerate(events):
+            if event is not None:
+                events[slot] = main_stream.record_event()
 
     def reset_diagnostic_logs(self) -> None:
         """Clear per-step PGS diagnostic logs populated when ``pgs_debug=True``.
@@ -13069,6 +13106,28 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
+    def _patch_conditional_nodes(self, device) -> tuple[bool, str]:
+        """Return whether captured graphs branch around the patch pair sort, with the reason.
+
+        Conditional nodes skip the sort for an empty contact frame and on substeps
+        that share the last sorted collision frame (see :class:`_FrictionPatchState`).
+        """
+        if not self._friction_anchors_enabled:
+            return False, "Point friction sorts no patch pairs."
+        if os.environ.get("FEATHER_PGS_PATCH_CONDITIONAL_NODES", "1") != "1":
+            return False, "FEATHER_PGS_PATCH_CONDITIONAL_NODES keeps the patch pair sort unconditional."
+        if not device.is_cuda:
+            return False, "Conditional graph nodes need a CUDA device; the patch pair sort is unconditional."
+        if not wp.is_conditional_graph_supported():
+            return False, (
+                "Conditional graph nodes need a CUDA 12.4+ driver and a Warp build with CUDA 12.4+; "
+                "the patch pair sort is unconditional."
+            )
+        return True, (
+            "Captured graphs sort patch pairs under a conditional node that skips empty contact frames and "
+            "substeps sharing the last sorted collision frame."
+        )
+
     def _build_friction_patches(self, state_in, contacts):
         """Construct the shared contact law independently of the dynamics owner."""
         if self._friction_anchors_enabled and contacts is not None:
@@ -13083,6 +13142,7 @@ class SolverFeatherPGS(SolverBase):
                 articulation_pair_gap_gate=self.articulation_pair_contact_gap_gate,
                 friction_gap=self.contact_friction_gap_threshold,
                 friction_articulation_pairs_only=self.contact_friction_articulation_pairs_only,
+                capture_pause=self._double_buffer_capture_pause,
             )
 
     @staticmethod

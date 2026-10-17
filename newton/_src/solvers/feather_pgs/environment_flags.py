@@ -350,6 +350,12 @@ FLAGS = declare(
         "=0 keeps patch friction on the full ordered sparse sweep instead of the active-row scan (default on).",
     ),
     _flag(
+        "FEATHER_PGS_PATCH_CONDITIONAL_NODES",
+        "policy",
+        _SOLVER,
+        "Values other than 1 keep the captured patch pair sort unconditional (no skip of empty or reused frames).",
+    ),
+    _flag(
         "FEATHER_PGS_PATCH_DENSE_PATHS",
         "policy",
         _SOLVER,

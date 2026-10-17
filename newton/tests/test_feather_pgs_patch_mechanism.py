@@ -34,6 +34,7 @@ steps alongside on CUDA and must match the state under test bitwise
 import contextlib
 import inspect
 import itertools
+import os
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -44,6 +45,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import friction_patches
 from newton._src.solvers.feather_pgs.friction_patches import _FrictionPatchState, _PatchFrame, patch_routes
+from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_reference import SENTINEL, ReferencePatches, pair_codes
 from newton.tests.test_feather_pgs_mixed_tree_free_body import _build as _arm_over_box
 
@@ -1662,6 +1664,34 @@ class TestPatchFrameReuse(unittest.TestCase):
                 np.testing.assert_array_equal(patches.sorted_frame.numpy(), -1)
         self.assertFalse(_FrictionPatchState(scene.model, 128, False, phi, reuse_frames=True).reuse_frames)
 
+    def test_capture_pause_wraps_each_conditional_node(self):
+        """Enter the caller's capture pause around each captured node, sorting or not, and never eagerly."""
+        scene = _Scene("cpu", 8)
+        self.assertGreater(scene.frame(), 0)
+        log = []
+
+        @contextlib.contextmanager
+        def pause():
+            log.append("pause")
+            yield
+            log.append("resume")
+
+        cases = ((None, (["sort"], ["sort"])), (_host_branch, (["pause", "sort", "resume"], ["pause", "resume"])))
+        for branch, builds in cases:
+            with self.subTest(captured=branch is not None):
+                patches, _, _ = _reusing_pair(scene, 128, branch=branch)
+                order = patches._order_pairs
+
+                def logged(order=order, **kwargs):
+                    log.append("sort")
+                    order(**kwargs)
+
+                patches._order_pairs = logged
+                for build, expected in enumerate(builds):
+                    log.clear()
+                    patches.build(scene.model, scene.state, scene.contacts, capture_pause=pause)
+                    self.assertEqual(log, expected, f"build {build} of one frame")
+
     @unittest.skipUnless(wp.is_cuda_available(), "multi-block grids need CUDA")
     def test_reused_frames_match_on_many_blocks(self):
         """Keep and reuse sorted pairs as the reference does while many blocks stride over the slots."""
@@ -1675,6 +1705,308 @@ class TestPatchFrameReuse(unittest.TestCase):
             self.skipTest("Conditional graph nodes need a CUDA 12.4+ driver and Warp build")
         run_frame_reuse_graph(self, "cuda:0")
         run_frame_reuse_graph(self, "cuda:0", worlds=160, contacts=8192, capacity=8192, live_sort=True)
+
+
+def _expected_pairs(model, contacts, capacity):
+    """Return the sorted pair keys and slot order of the live contacts, computed on the host."""
+    bodies, shapes = model.body_count, model.shape_body.shape[0]
+    stride = bodies + shapes + 2
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    live = min(count, capacity) if 0 <= count <= contacts.rigid_contact_max else 0
+    shape_body = model.shape_body.numpy()
+
+    def codes(shape):
+        body = np.where(shape >= 0, shape_body[np.maximum(shape, 0)], -1)
+        return np.where(body >= 0, body + 1, bodies + np.where(shape >= 0, shape, shapes) + 1).astype(np.int64)
+
+    a = codes(contacts.rigid_contact_shape0.numpy()[:live])
+    b = codes(contacts.rigid_contact_shape1.numpy()[:live])
+    keys = np.minimum(a, b) * stride + np.maximum(a, b)
+    order = np.argsort(keys, kind="stable")
+    return keys[order], order
+
+
+def _permute_contacts(contacts, target, order):
+    """Copy ``contacts`` into ``target`` with its slots reordered, keeping the generation and the count."""
+    for name, value in vars(contacts).items():
+        if (
+            name.startswith("rigid_contact_")
+            and isinstance(value, wp.array)
+            and value.ndim == 1
+            and value.shape[0] == contacts.rigid_contact_max
+        ):
+            getattr(target, name).assign(value.numpy()[order])
+    target.rigid_contact_count.assign(contacts.rigid_contact_count)
+    target.contact_generation.assign(contacts.contact_generation)
+
+
+class _SolverTwin:
+    """A FeatherPGS scene under default patch friction with two contact streams and double-buffered states.
+
+    ``reuse`` forces frame reuse on (also on the CPU, where conditional graph
+    nodes do not exist) or turns it off with the registry flag; ``None`` keeps
+    the solver's own choice. ``jaws`` selects the squeezing gripper of the
+    friction-anchor tests, whose graphs capture two solver steps each, instead
+    of the arms over boxes. Its pipeline sorts the contacts, so twins collide
+    into the same slots: the CUDA narrow phase assigns them in a run-dependent
+    order.
+    """
+
+    def __init__(self, device, *, reuse=None, jaws=False):
+        if jaws:
+            from newton.tests.test_feather_pgs_friction_anchors import _SQUEEZE_SOLVER, _build_v_jaws  # noqa: PLC0415
+
+            with wp.ScopedDevice(device):
+                self.model, _, _ = _build_v_jaws(5.0)
+            options = dict(_SQUEEZE_SOLVER)
+            pipeline_options = {"rigid_contact_max": 256, "broad_phase": "nxn", "deterministic": True}
+        else:
+            self.model = _arm_over_box(wp.get_device(device), worlds=2)
+            options, pipeline_options = {"pgs_iterations": 8}, {}
+        if reuse is None:
+            self.solver = SolverFeatherPGS(self.model, **options)
+        elif reuse:
+            forced = (True, "Forced by the test.")
+            with mock.patch.object(SolverFeatherPGS, "_patch_conditional_nodes", return_value=forced):
+                self.solver = SolverFeatherPGS(self.model, **options)
+        else:
+            with mock.patch.dict(os.environ, {"FEATHER_PGS_PATCH_CONDITIONAL_NODES": "0"}):
+                self.solver = SolverFeatherPGS(self.model, **options)
+        self.patches = self.solver._friction_patches
+        self.pipeline = newton.CollisionPipeline(self.model, **pipeline_options)
+        self.streams = [self.pipeline.contacts(), self.pipeline.contacts()]
+        self.states = [self.model.state(), self.model.state()]
+        newton.eval_fk(self.model, self.states[0].joint_q, self.states[0].joint_qd, self.states[0])
+        self.control = self.model.control()
+
+    def substep(self, stream=0, collide=False):
+        """Step once from ``states[0]`` into ``states[1]`` and swap them back, as a graph would not."""
+        state, following = self.states
+        contacts = self.streams[stream]
+        if collide:
+            self.pipeline.collide(state, contacts)
+        state.clear_forces()
+        self.solver.step(state, following, self.control, contacts, 1.0 / 240.0)
+        self.states.reverse()
+
+    def pair(self, stream=0, collide=False):
+        """Two substeps that return to ``states[0]``, collided first when ``collide``."""
+        self.substep(stream, collide)
+        self.substep(stream)
+
+    def assert_sorted(self, test, stream, context):
+        """Require the slots to hold the host-sorted pairs of a stream's live contacts."""
+        keys, order = _expected_pairs(self.model, self.streams[stream], self.patches.capacity)
+        live = len(keys)
+        np.testing.assert_array_equal(
+            pair_codes(self.patches.current.keys.numpy()[:live], self.patches.key_stride),
+            pair_codes(keys, self.patches.key_stride),
+            f"{context} keys",
+        )
+        np.testing.assert_array_equal(self.patches.current.indices.numpy()[:live], order, f"{context} indices")
+        np.testing.assert_array_equal(
+            self.patches.current.keys.numpy()[live : self.patches.capacity], SENTINEL, f"{context} empty keys"
+        )
+        test.assertGreater(live, 0, f"{context}: the box must touch its support")
+
+
+def _change(twins, event, rng):
+    """Apply a frame change between substeps to every twin; returns the contact stream the next substeps use."""
+    if event == "truncate":
+        for twin in twins:
+            count = int(twin.streams[0].rigid_contact_count.numpy()[0])
+            twin.streams[0].rigid_contact_count.assign([count - 1])
+    elif event == "notify":
+        for twin in twins:
+            twin.solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
+    elif event == "swap":
+        source = twins[0].streams[0]
+        count = int(source.rigid_contact_count.numpy()[0])
+        order = np.concatenate((rng.permutation(count), np.arange(count, source.rigid_contact_max)))
+        for twin in twins:
+            _permute_contacts(twin.streams[0], twin.streams[1], order)
+        return 1
+    return 0
+
+
+# Substep pairs of the solver-level reuse tests: "collide" opens a collision frame,
+# "step" shares the last one, "truncate" lowers the count and "notify" reports a
+# model change before sharing it, "swap" moves to a reordered stream of equal
+# generation and count, and "back" returns to the first stream.
+_SOLVER_PLAN = (
+    "collide",
+    "collide",
+    "step",
+    "step",
+    "collide",
+    "truncate",
+    "step",
+    "notify",
+    "swap",
+    "back",
+    "collide",
+)
+
+
+def _sorts_each_substep(event):
+    """Return whether a pair's first and second substep sort, by the event that precedes the pair."""
+    return (event != "step", False)
+
+
+class TestPatchSolverFrameReuse(unittest.TestCase):
+    def test_solver_records_its_conditional_nodes(self):
+        """Report whether captured graphs branch around the patch pair sort, and why."""
+        devices = ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else [])
+        for device in devices:
+            model = _arm_over_box(wp.get_device(device), worlds=2)
+            supported = device != "cpu" and wp.is_conditional_graph_supported()
+            default = "conditional node" if supported else "CUDA device" if device == "cpu" else "12.4"
+            cases = (
+                ({}, {}, supported, default),
+                ({"friction_anchor_beta": 0.0}, {}, False, "Point friction"),
+                ({}, {"FEATHER_PGS_PATCH_CONDITIONAL_NODES": "0"}, False, "FEATHER_PGS_PATCH_CONDITIONAL_NODES"),
+            )
+            for options, environment, enabled, reason in cases:
+                with self.subTest(device=device, options=options, environment=environment):
+                    with mock.patch.dict(os.environ, environment):
+                        solver = SolverFeatherPGS(model, **options)
+                    record = solver.get_path_selection()["routes"]["friction"]["conditional_nodes"]
+                    self.assertEqual(record["enabled"], enabled)
+                    self.assertEqual(solver._friction_patches.reuse_frames, enabled)
+                    self.assertIn(reason, record["reason"])
+
+    def test_solver_falls_back_without_conditional_node_support(self):
+        """Keep the patch pair sort unconditional on a CUDA device whose Warp or driver lacks conditional nodes."""
+        solver, cuda = SimpleNamespace(_friction_anchors_enabled=True), SimpleNamespace(is_cuda=True)
+        with mock.patch.dict(os.environ, {"FEATHER_PGS_PATCH_CONDITIONAL_NODES": "1"}):
+            for supported in (False, True):
+                with mock.patch.object(wp, "is_conditional_graph_supported", return_value=supported):
+                    enabled, reason = SolverFeatherPGS._patch_conditional_nodes(solver, cuda)
+                self.assertEqual(enabled, supported)
+                self.assertIn("conditional node" if supported else "CUDA 12.4+ driver", reason)
+
+    def test_capture_pause_joins_the_double_buffer(self):
+        """Wait for the memset slots before a capture pause and record them on the main stream after it."""
+        log = []
+        main = SimpleNamespace(
+            wait_event=lambda event: log.append(f"wait {event}"),
+            record_event=lambda: log.append("record") or f"main {len(log)}",
+        )
+        # (memset stream in the capture, slots before, calls, slots after); the
+        # first capture step's stream has not been forked into the capture yet.
+        cases = (
+            (
+                True,
+                ["main 0", "memset 1"],
+                ["wait main 0", "wait memset 1", "node", "record", "record"],
+                ["main 4", "main 5"],
+            ),
+            (True, ["memset 0", None], ["wait memset 0", "node", "record"], ["main 3", None]),
+            (False, ["seed 0", "seed 1"], ["node", "record", "record"], ["main 2", "main 3"]),
+            (False, [None, "eager 1"], ["node", "record"], [None, "main 2"]),
+            (None, None, ["node"], None),
+        )
+        for capturing, events, expected, after in cases:
+            with self.subTest(capturing=capturing, events=str(events)):
+                log.clear()
+                solver = SimpleNamespace(
+                    model=SimpleNamespace(device=None),
+                    _memset_stream=None if capturing is None else SimpleNamespace(is_capturing=capturing),
+                    _memset_done_event=events,
+                )
+                with mock.patch.object(wp, "get_stream", return_value=main) as get_stream:
+                    with SolverFeatherPGS._double_buffer_capture_pause(solver):
+                        log.append("node")
+                self.assertEqual(log, expected)
+                self.assertEqual(solver._memset_done_event, after)
+                self.assertEqual(get_stream.called, events is not None)
+
+    def test_reused_frames_step_bitwise_as_the_unconditional_chain(self):
+        """Step bitwise as with the flag off while substeps share frames and only changed frames sort."""
+        rng = np.random.default_rng(5)
+        reuse, plain = _SolverTwin("cpu", reuse=True), _SolverTwin("cpu", reuse=False)
+        self.assertFalse(plain.patches.reuse_frames)
+        reuse.patches._capture_branch = lambda: _host_branch
+        sorts, pauses = [], []
+        order, pause = reuse.patches._order_pairs, reuse.solver._double_buffer_capture_pause
+
+        def counted(**kwargs):
+            sorts.append(1)
+            order(**kwargs)
+
+        def paused():
+            pauses.append(1)
+            return pause()
+
+        reuse.patches._order_pairs = counted
+        reuse.solver._double_buffer_capture_pause = paused
+        for twin in (reuse, plain):
+            twin.pair(collide=True)
+        for index, event in enumerate(_SOLVER_PLAN):
+            context = f"pair {index} {event}"
+            stream = _change((reuse, plain), event, rng)
+            for substep, expected in enumerate(_sorts_each_substep(event)):
+                before = len(sorts), len(pauses)
+                for twin in (reuse, plain):
+                    twin.substep(stream, collide=substep == 0 and event == "collide")
+                self.assertEqual(len(sorts) - before[0], int(expected), f"{context} substep {substep} sorts")
+                self.assertEqual(len(pauses) - before[1], 1, f"{context} substep {substep} solver capture pauses")
+                reuse.assert_sorted(self, stream, f"{context} substep {substep}")
+                for name in ("body_q", "body_qd", "joint_q", "joint_qd"):
+                    np.testing.assert_array_equal(
+                        getattr(reuse.states[0], name).numpy(),
+                        getattr(plain.states[0], name).numpy(),
+                        f"{context} substep {substep} {name}",
+                    )
+                for name in ("valid", "tangent_impulse", "displacement"):
+                    np.testing.assert_array_equal(
+                        getattr(reuse.patches.previous, name).numpy(),
+                        getattr(plain.patches.previous, name).numpy(),
+                        f"{context} substep {substep} previous.{name}",
+                    )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
+    def test_solver_graphs_reuse_sorted_frames(self):
+        """Replay collide and substep graphs bitwise as eager flag-off steps, sorting only changed frames in a node."""
+        if not wp.is_conditional_graph_supported():
+            self.skipTest("Conditional graph nodes need a CUDA 12.4+ driver and Warp build")
+        rng = np.random.default_rng(6)
+        graph, eager = _SolverTwin("cuda:0", jaws=True), _SolverTwin("cuda:0", reuse=False, jaws=True)
+        self.assertTrue(graph.patches.reuse_frames)
+        # The memset stream forked at each step's end must stay valid across the node's capture pause.
+        self.assertIsNotNone(graph.solver._memset_stream, "the jaws double-buffer their mass matrices")
+        for _ in range(3):
+            for twin in (graph, eager):
+                twin.pair(collide=True)
+        captured = {}
+        for name, stream, collide in (("collide", 0, True), ("step", 0, False), ("swap", 1, False)):
+            with wp.ScopedCapture(device="cuda:0") as capture:
+                graph.solver.seed_double_buffer_events()
+                graph.pair(stream, collide)
+            captured[name] = capture.graph
+        n = graph.patches.capacity
+        for index, event in enumerate(_SOLVER_PLAN):
+            context = f"pair {index} {event}"
+            stream = _change((graph, eager), event, rng)
+            keys = graph.patches.current.keys.numpy()
+            keys[n:] = -12345
+            graph.patches.current.keys.assign(keys)
+            wp.capture_launch(captured[event if event in ("collide", "swap") else "step"])
+            eager.pair(stream, collide=event == "collide")
+            sorted_any = any(_sorts_each_substep(event))
+            intact = bool(np.all(graph.patches.current.keys.numpy()[n:] == -12345))
+            self.assertEqual(intact, not sorted_any, f"{context}: the radix sort ran {'never' if intact else 'once'}")
+            graph.assert_sorted(self, stream, context)
+            for name in ("body_q", "body_qd", "joint_q", "joint_qd"):
+                np.testing.assert_array_equal(
+                    getattr(graph.states[0], name).numpy(), getattr(eager.states[0], name).numpy(), f"{context} {name}"
+                )
+            for name in ("valid", "tangent_impulse", "displacement"):
+                np.testing.assert_array_equal(
+                    getattr(graph.patches.previous, name).numpy(),
+                    getattr(eager.patches.previous, name).numpy(),
+                    f"{context} previous.{name}",
+                )
 
 
 if __name__ == "__main__":

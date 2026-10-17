@@ -39,6 +39,8 @@ contact frame whose pairs the slots already hold sorted, which is the case on
 every solver substep that shares a collision frame.
 """
 
+from contextlib import nullcontext
+
 import numpy as np
 import warp as wp
 
@@ -1387,7 +1389,15 @@ class _FrictionPatchState:
         articulation_pair_gap_gate=0.0,
         friction_gap=float("inf"),
         friction_articulation_pairs_only=False,
+        capture_pause=nullcontext,
     ):
+        """Build the current patch frame from ``contacts``.
+
+        ``capture_pause`` returns a context manager entered around a captured
+        conditional node. The node pauses the graph capture to record its body,
+        so the caller can join its forked streams there and record again the
+        events it waits on later.
+        """
         bodies = 0 if state.body_q is None else state.body_q.shape[0]
         if bodies + model.shape_body.shape[0] + 2 != self.key_stride:
             raise ValueError(
@@ -1460,7 +1470,8 @@ class _FrictionPatchState:
             if branch is None:
                 self._order_pairs(record=record)
             else:
-                branch(self.sort_pairs, on_true=self._order_pairs, record=record)
+                with capture_pause():
+                    branch(self.sort_pairs, on_true=self._order_pairs, record=record)
         wp.launch(_build, dim=self.build_threads, inputs=build_inputs, outputs=[self.built], device=model.device)
 
     def _capture_branch(self):
