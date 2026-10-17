@@ -65,9 +65,9 @@ def _cpu_separate_worlds_model():
     return builder.finalize(device="cpu")
 
 
-def _graph_and_reset_rollout(model, sparse, cached_dynamics):
+def _graph_and_reset_rollout(model, sparse, cached_dynamics, **options):
     """Step once, then replay a captured contacting step around a partial-world reset."""
-    solver = _make_solver(model, sparse, cached_dynamics=cached_dynamics)
+    solver = _make_solver(model, sparse, cached_dynamics=cached_dynamics, **options)
     state, output = model.state(), model.state()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     pipeline = newton.CollisionPipeline(model, convex_collision="ordinary")
@@ -695,12 +695,15 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
     def test_cached_dynamics_dense_patch_graph_and_reset(self):
         """Cache the dense route under default patch friction with unchanged states and anchor history."""
         model = _build_model()
-        runs = [_graph_and_reset_rollout(model, False, choice) for choice in ("off", "on")]
+        # Without the owner this is the ordinary patch route: the incremental tier, which also serves
+        # patch friction, stays off in both arms so that they differ by the owner alone.
+        runs = [_graph_and_reset_rollout(model, False, choice, mf_gs_incremental_rows=0) for choice in ("off", "on")]
         self.assertIsNone(runs[0][0].get_path_selection()["cached_prediction"])
         self.assertEqual(runs[1][0].get_path_selection()["cached_prediction"], "tree")
         for solver, contacts, _state in runs:
             self.assertTrue(solver._friction_anchors_enabled)
             self.assertIsNone(solver._sparse_mass_matrix_size)
+            self.assertIsNone(solver.get_path_selection()["routes"]["sweep"]["tiers"])
             self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
         for name in STATE_FIELDS:
             np.testing.assert_allclose(

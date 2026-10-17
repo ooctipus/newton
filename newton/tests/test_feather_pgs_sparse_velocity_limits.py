@@ -286,6 +286,19 @@ def _solve_data(sign, *, contact, iterations, omega):
     return data, physical, factor
 
 
+# The reference arm's ordinary route: neither the held-tree owner nor the incremental matrix-free tier,
+# both of which serve either friction law.
+ORDINARY_ROUTE = {"cached_dynamics": "off", "mf_gs_incremental_rows": 0}
+
+
+def _assert_ordinary_route(test, case):
+    """Require the reference arm to run ordinary factors, dynamics and matrix-free sweeps."""
+    selected = case[1].get_path_selection()
+    test.assertEqual(selected["sparse_mass_matrix"], "off")
+    test.assertEqual(selected["cached_dynamics"], "off")
+    test.assertIsNone(selected["routes"]["sweep"]["tiers"])
+
+
 def _case(enabled, *, floating=True, branches=3, depth=1, activation_fraction=0.0, friction_anchor_beta=0.0):
     model = split_tests._model(floating=floating, branches=branches, depth=depth)
     limits = np.full(model.joint_dof_count, 0.25, np.float32)
@@ -309,6 +322,7 @@ def _case(enabled, *, floating=True, branches=3, depth=1, activation_fraction=0.
             double_buffer=False,
             update_mass_matrix_interval=2,
             restitution_velocity_threshold=0.01,
+            **({} if enabled else ORDINARY_ROUTE),
         )
     state, out, control = model.state(), model.state(), model.control()
     qd = state.joint_qd.numpy().copy().reshape(2, -1)
@@ -323,6 +337,7 @@ def _case(enabled, *, floating=True, branches=3, depth=1, activation_fraction=0.
 @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
 class TestSparseVelocityLimitPhysics(unittest.TestCase):
     def _assert_state(self, reference, candidate):
+        _assert_ordinary_route(self, reference)
         sparse_tests.TestFeatherPGSSparseSolver.assert_states_close(self, reference[2], candidate[2])
         for case in (reference, candidate):
             self.assertFalse(case[1].constraint_overflow.numpy().any())

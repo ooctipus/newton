@@ -477,11 +477,16 @@ class TestSparseSplitPatchPhysics(unittest.TestCase):
         shape = {name: options.pop(name) for name in ("floating", "branches", "depth", "foot") if name in options}
         matching = options.pop("contact_matching", None)
         options["friction_anchor_beta"] = 0.2
-        dense, sparse = (
-            _case(enabled, options=options, contact_matching=matching, **shape) for enabled in (False, True)
-        )
+        # The reference is the ordinary patch route: dense split rows without the held-tree owner,
+        # which also serves patch friction.
+        dense = _case(False, options={**options, "cached_dynamics": "off"}, contact_matching=matching, **shape)
+        sparse = _case(True, options=options, contact_matching=matching, **shape)
         self.assertFalse(dense[1]._sparse_split)
         self.assertTrue(sparse[1]._sparse_split)
+        reference = dense[1].get_path_selection()
+        self.assertEqual(reference["cached_dynamics"], "off")
+        self.assertIsNone(reference["routes"]["held_tree"]["owner"])
+        self.assertEqual(sparse[1].get_path_selection()["sparse_mass_matrix"], "on")
         for case in (dense, sparse):
             self.assertTrue(case[1]._friction_anchors_enabled)
         return dense, sparse
