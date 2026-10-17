@@ -9,6 +9,7 @@ copies the patch kernels as of 98401301 (:mod:`feather_pgs_patch_reference`);
 pair keys compare through their decoded body and shape codes.
 """
 
+import itertools
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -427,7 +428,8 @@ def _solved_state(scene, rng):
 # Random sequence events: "grow" raises the active pair count, "sparse" keeps one
 # pair, "empty" and "overflow" leave no live contact, "none" passes no contacts,
 # "noframe" passes contacts without capacity, "rebuild" builds twice before the
-# rows, "gates" filters friction, "geometry" edits a shape, and "reset" and
+# rows, "unstored" resets all worlds between an unstored sparse build and the
+# step, "gates" filters friction, "geometry" edits a shape, and "reset" and
 # "masked" reset all or some worlds after the step.
 _PLAN = (
     "grow",
@@ -436,6 +438,7 @@ _PLAN = (
     "live",
     "sparse",
     "live",
+    "unstored",
     "empty",
     "grow",
     "overflow",
@@ -483,8 +486,9 @@ def run_reference_differential(
     """Step a patch state and the reference through ``plan``, comparing after every launch group.
 
     ``live_sort`` overrides the capacity's choice of pair sort. Returns counts of
-    carried anchors and of anchors released by finishing, and the largest live
-    count, so callers can require the sequence to exercise them.
+    carried anchors, of anchors released by finishing and of stored anchors past
+    an unstored build's live count, and the largest live count, so callers can
+    require the sequence to exercise them.
     """
     rng = np.random.default_rng(1000 + seed)
     scene = _Scene(device, seed, worlds=worlds, bodies=bodies, contacts=contacts)
@@ -494,7 +498,7 @@ def run_reference_differential(
     if live_sort is not None:
         patches.live_sort = live_sort
     rows = _Rows(scene, capacity, rng)
-    coverage = {"carried": 0, "released": 0, "live": 0}
+    coverage = {"carried": 0, "released": 0, "unstored": 0, "live": 0}
     fraction = 0.1
     dt = 1.0 / 240.0
     for step, event in enumerate(plan):
@@ -534,6 +538,18 @@ def run_reference_differential(
             for state in (patches, reference):
                 state.build(scene.model, scene.state, scene.contacts)
             mode = "sparse"
+        if event == "unstored":
+            # The reset must reach every stored anchor, also past the live count
+            # of a build that no store followed.
+            sparse = scene.frame("sparse")
+            for state in (patches, reference):
+                state.build(scene.model, scene.state, scene.contacts)
+            assert_same_patches(patches, reference, sparse, f"{context} unstored build")
+            coverage["unstored"] += int(np.count_nonzero(reference.previous.valid.numpy()[sparse:]))
+            for state in (patches, reference):
+                state.reset(None)
+            assert_same_patches(patches, reference, sparse, f"{context} unstored reset")
+            assert_empty_tail(patches, f"{context} unstored reset")
         live = scene.frame(mode)
         for state in (patches, reference):
             state.build(scene.model, scene.state, scene.contacts, **gates)
@@ -634,28 +650,32 @@ class TestPatchSortKeys(unittest.TestCase):
         patches.build(scene.model, scene.state, scene.contacts)
 
     def test_shapeless_pair_ties_the_sentinel_bits(self):
-        """Keep a pair whose key equals the sentinel's sorted bits ahead of the empty slots."""
-        scene = _Scene("cpu", 5, worlds=1, bodies=4, contacts=16)
-        stride = scene.body_count + len(scene.shape_body) + 2
-        self.assertEqual(stride & (stride - 1), 0, "the fixture needs a power-of-two key stride")
-        patches, reference = _pair(scene, 24)
-        self.assertEqual(stride * stride - 1, (1 << patches.key_bits) - 1)
-        scene.active[:] = False
-        scene.active[-1] = True  # The (-1, -1) pair has the largest key, stride**2 - 1.
-        scene.active[0] = True
-        live = scene.frame(churn=False)
-        for state in (patches, reference):
-            state.build(scene.model, scene.state, scene.contacts)
-        codes = pair_codes(patches.current.keys.numpy()[:live], stride)
-        self.assertTrue(np.any(codes[:, 0] == stride - 1))
-        self.assertTrue(np.all(patches.current.keys.numpy()[live : patches.capacity] == SENTINEL))
-        assert_same_patches(patches, reference, live)
+        """Keep a pair whose key equals the sentinel's sorted bits ahead of the empty slots, with either sort."""
+        devices = ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else [])
+        for device, live_sort in itertools.product(devices, (False, True)):
+            with self.subTest(device=device, live_sort=live_sort):
+                scene = _Scene(device, 5, worlds=1, bodies=4, contacts=16)
+                stride = scene.body_count + len(scene.shape_body) + 2
+                self.assertEqual(stride & (stride - 1), 0, "the fixture needs a power-of-two key stride")
+                patches, reference = _pair(scene, 24)
+                patches.live_sort = live_sort
+                self.assertEqual(stride * stride - 1, (1 << patches.key_bits) - 1)
+                scene.active[:] = False
+                scene.active[-1] = True  # The (-1, -1) pair has the largest key, stride**2 - 1.
+                scene.active[0] = True
+                live = scene.frame(churn=False)
+                for state in (patches, reference):
+                    state.build(scene.model, scene.state, scene.contacts)
+                codes = pair_codes(patches.current.keys.numpy()[:live], stride)
+                self.assertTrue(np.any(codes[:, 0] == stride - 1))
+                self.assertTrue(np.all(patches.current.keys.numpy()[live : patches.capacity] == SENTINEL))
+                assert_same_patches(patches, reference, live)
 
 
 class TestPatchLiveExtent(unittest.TestCase):
     def test_live_extent_matches_the_full_capacity_reference(self):
         """Match the full-capacity mechanism bitwise through rising, dropping, overflowing and missing frames."""
-        totals = {"carried": 0, "released": 0}
+        totals = {"carried": 0, "released": 0, "unstored": 0}
         for seed, contacts, capacity, threads in (
             (0, 96, 96, None),
             (1, 96, 128, (7, 5)),
@@ -670,6 +690,7 @@ class TestPatchLiveExtent(unittest.TestCase):
                     totals[name] += coverage[name]
         self.assertGreater(totals["carried"], 0, "the sequences must carry anchor history")
         self.assertGreater(totals["released"], 0, "the sequences must release finished anchors")
+        self.assertGreater(totals["unstored"], 0, "a reset must find stored anchors past an unstored build")
 
     def test_unstored_builds_clear_their_slots(self):
         """Clear the slots of a build that no store followed, as a full-capacity frame does."""
