@@ -199,7 +199,7 @@ class TestKeyedRowIntegration(unittest.TestCase):
 
     def test_physical_reader_against_captured_allegro_operator(self):
         """Compare the physical reader with independent captured mass actions."""
-        from tools.fpgs_bench import test_keyed_rows as capture  # noqa: PLC0415
+        from tools.fpgs_bench import test_keyed_rows_capture as capture  # noqa: PLC0415
 
         original = rows.get_parallel_factory
         layout = KeyedLayout(16, 6, 0, 16, 128, True, (1 << 16) - 1)
