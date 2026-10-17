@@ -15,14 +15,25 @@ from newton._src.solvers.feather_pgs import tree_chain_scan, tree_kinetic_state
 def _reduce_wrenches(address: wp.uint64, plan: tree_chain_scan.ChainPlan): ...
 
 
+# The owner's per-tree storage mallocs on CPU, which this Warp's CPU JIT cannot
+# resolve; the reduction only needs a scratch address, so pass the test's own.
+@wp.func_native("return reinterpret_cast<uint64_t>(scratch.data);")
+def _scratch_address(scratch: wp.array[float]) -> wp.uint64: ...
+
+
 @wp.kernel
-def _subtrees(plan: tree_chain_scan.ChainPlan, values: wp.array2d[float], result: wp.array2d[float]):
+def _subtrees(
+    plan: tree_chain_scan.ChainPlan,
+    values: wp.array2d[float],
+    scratch: wp.array[float],
+    result: wp.array2d[float],
+):
     _, logical = wp.tid()
     lanes = tree_kinetic_state._lanes()
     lane, stride = lanes[0], lanes[1]
     if stride == 1 and logical != 0:
         return
-    address = tree_kinetic_state._storage()
+    address = _scratch_address(scratch)
     for body in range(lane, 44, stride):
         value = wp.spatial_vector()
         for k in range(6):
@@ -34,7 +45,6 @@ def _subtrees(plan: tree_chain_scan.ChainPlan, values: wp.array2d[float], result
         value = _load_wrench(address, body)
         for k in range(6):
             result[body, k] = value[k]
-    tree_kinetic_state._release(address)
 
 
 @wp.func_native("float* s=reinterpret_cast<float*>(address);for(int k=0;k<6;++k)s[6*body+k]=value[k];")
@@ -151,7 +161,12 @@ class TestChainPlan(unittest.TestCase):
         wp.launch_tiled(
             _subtrees,
             dim=[1],
-            inputs=[_chain_plan(parent, "cpu"), wp.array(values, dtype=float, device="cpu"), result],
+            inputs=[
+                _chain_plan(parent, "cpu"),
+                wp.array(values, dtype=float, device="cpu"),
+                wp.zeros(44 * 6, dtype=float, device="cpu"),
+                result,
+            ],
             block_dim=64,
             device="cpu",
         )
