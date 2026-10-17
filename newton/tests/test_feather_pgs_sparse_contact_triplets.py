@@ -236,6 +236,9 @@ _LINKED_LAYOUTS = {
     # Only the fourth member is violated: selecting the pair, and the fused radius, need
     # the whole ring.
     "far_ring": ((0, True, 0.6), (0, False, 0.6), (0, False, 0.6), (0, False, -0.3)),
+    # Four lightly loaded normals hold two sliding anchors, so the fused radius rounds
+    # as the ring order sums it.
+    "loaded_ring": ((0, True, -0.04), (0, False, -0.07), (0, False, -0.03), (0, True, -0.05)),
     "mixed_units": (
         (0, True, -0.2),
         (1, False, -0.1),
@@ -615,10 +618,11 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
         """Match the same linked sweep without triplets bitwise, and the ring-pooled physical reference.
 
         Self-loops, two- and three-member rings, a four-member ring loaded only through
-        its last member, interleaved one- and three-row units and an unlinked anchor,
-        with and without a 30-row lead that moves records and rings across 32-row
-        words; zero and seeded impulses, delayed friction and relaxation, in the
-        linked active scan and in the full sweep. A relative change tolerance ends
+        its last member, a four-member loaded ring whose sliding anchors' radii round
+        by the ring order, interleaved one- and three-row units and an unlinked
+        anchor, with and without a 30-row lead that moves records and rings across
+        32-row words; zero and seeded impulses, delayed friction and relaxation, in
+        the linked active scan and in the full sweep. A relative change tolerance ends
         sweeps early on the same decisions: the normal bounds its change by its new
         impulse and the pair by its new first tangent, as their ordinary updates do.
         """
