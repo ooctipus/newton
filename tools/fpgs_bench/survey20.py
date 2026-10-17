@@ -40,17 +40,10 @@ RECIPES = {
         {"rigid_contact_max": 71680},
     ),
     "anymald": ([], {"rigid_contact_max": 53248, "dense_max_constraints": 72}),
+    # The original G1 recipe's packed sparse-factor opt-ins are retired; the
+    # general route runs in their place.
     "g1": (
-        flags(
-            "SPARSE_FACTOR",
-            "SPARSE_PARALLEL_LIMITS",
-            "SPARSE_LEVEL_UPDATE",
-            "SPARSE_METRIC_TANGENTS",
-            "PACKED_TREE_KINETIC_STATE",
-            "TREE_CHAIN_SCAN",
-            "SPARSE_SPECTRAL_TANGENTS",
-            "SPARSE_LIMIT_JACOBI",
-        )
+        flags("TREE_CHAIN_SCAN")
         + [
             f"NEWTON_HEIGHTFIELD_{name}=1"
             for name in (

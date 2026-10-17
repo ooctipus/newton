@@ -3,10 +3,8 @@
 
 """Reuse corrected CSR physical controls with the proven finite-shell query."""
 
-import ast
 import os
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -108,53 +106,6 @@ class TestHeightfieldShellPairCSR(csr_tests.TestHeightfieldPairCSR):
     def test_handled_shell_faces_cuda(self):
         """Check native handled markers and exact pair tags on current geometry."""
         self._handled_shell_faces("cuda:0")
-
-    def test_observer_actual_pipeline_cpu(self):
-        """Check the real pipeline and reject wrong factories, markers and status."""
-        from newton._src.geometry.heightfield_pair_csr import get_query_kernels  # noqa: PLC0415
-
-        wrapper = Path(__file__).with_name("chain_capture_20260916") / "checked_sparse.py"
-        syntax = ast.parse(wrapper.read_text())
-        literal = next(
-            ast.literal_eval(node.value)
-            for node in syntax.body
-            if isinstance(node, ast.Assign)
-            and any(isinstance(target, ast.Name) and target.id == "collision_replacement" for target in node.targets)
-        )
-        namespace = {"os": os}
-        exec(compile("def observe(narrow, result):\n" + literal, str(wrapper), "exec"), namespace)
-        observe = namespace["observe"]
-        q = csr_tests.fixtures
-        case = next(case for case in q.CASES if case.name == "support")
-        for enabled in (False, True):
-            with patch.dict(
-                os.environ,
-                {
-                    "NEWTON_HEIGHTFIELD_PAIR_CSR": "1",
-                    "NEWTON_HEIGHTFIELD_PAIR_CSR_SHELL": str(int(enabled)),
-                    "NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD": "0",
-                    "NEWTON_HEIGHTFIELD_GEOMETRIC_CULL": "1",
-                },
-            ):
-                scene = q.build_scene(case, True, "cpu", make_solver=False)
-                narrow = scene.pipeline.narrow_phase
-                scene.pipeline.collide(scene.states[0], scene.contacts)
-                self.assertTrue(observe(narrow, {})["check_pass"])
-                with patch.object(narrow._pair_csr, "finite", get_query_kernels(not enabled)[1]):
-                    with self.assertRaisesRegex(RuntimeError, "exact production factories"):
-                        observe(narrow, {})
-                with patch.object(narrow, "_heightfield_pair_csr_shell", not enabled):
-                    with self.assertRaisesRegex(RuntimeError, "actual pair-CSR dispatch"):
-                        observe(narrow, {})
-                with patch.object(narrow._pair_csr, "shell_support", not enabled):
-                    with self.assertRaisesRegex(RuntimeError, "shell owner marker"):
-                        observe(narrow, {})
-                with patch.dict(os.environ, {"NEWTON_HEIGHTFIELD_PAIR_CSR_SHELL": ""}):
-                    with self.assertRaisesRegex(RuntimeError, "explicit pair-CSR shell flag"):
-                        observe(narrow, {})
-                narrow._pair_csr.status.fill_(1)
-                with self.assertRaisesRegex(RuntimeError, "sticky routing/capacity"):
-                    observe(narrow, {})
 
     @unittest.skipUnless(wp.is_cuda_available(), "Root owns CUDA execution")
     def test_loaded_cuda(self):

@@ -80,12 +80,9 @@ def main() -> int:
             "40",
             "--candidate-solver-attr",
             "grouped_dynamics=True",
+            "--candidate-solver-attr",
+            "lazy_kinematics=True",
         ]
-        if task == "g1-flat":
-            for flag in ("SPARSE_FACTOR", "SPARSE_LEVEL_UPDATE", "PACKED_TREE_KINETIC_STATE", "TREE_CHAIN_SCAN"):
-                command.extend(("--candidate-env", f"FEATHER_PGS_{flag}=1"))
-        else:
-            command.extend(("--candidate-solver-attr", "lazy_kinematics=True"))
         for capacity in previous["capacity"]:
             command.extend(("--capacity", capacity))
         record = {"task": task, "command": command, "status": "running", "manifest": str(output / "manifest.json")}
