@@ -10,7 +10,10 @@ avoiding a diagonal friction couple on symmetric narrow footprints; each edge's
 last member in contact order carries its friction rows. Isotropic footprints
 retain a canonical farthest pair because they have no unique axis; member spans
 and contact order choose it, so float32 roundoff in world coordinates cannot
-swap it between steps.
+swap it between steps. Both choices are canonical relative to contact order: a
+collision pipeline that reorders a pair's contacts between steps moves an edge's
+rows to another member, and can swap an isotropic pair, whose locations are its
+members' contact centres.
 Regions require matching friction materials, nearly aligned normals, nearby
 contact planes, and connected shape bounding spheres on each body. The latter
 is a conservative test across convex seams, not an exact surface-connectivity
@@ -670,7 +673,9 @@ def _build_pair(
         # The canonical farthest pair: the member farthest from the first
         # eligible one, then the member farthest from that. Member spans and
         # contact order define it, so neither roundoff in world coordinates nor
-        # the footprint's pose can swap its diagonal.
+        # the footprint's pose can swap its diagonal; reordering the contacts
+        # can. A choice independent of contact order kicked resting boxes whose
+        # contacts were reordered every step harder (measured).
         reference = first
         separation = float(0.0)
         member_start = member_stop

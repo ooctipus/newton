@@ -157,7 +157,8 @@ class TestFrictionPatchHistory(unittest.TestCase):
 
         The pair starts at the lowest contact index and spans the footprint;
         equally distant members go to the lower index. Neither the order of world
-        coordinates nor a roundoff-sized anisotropy may choose it.
+        coordinates nor a roundoff-sized anisotropy may choose it; it is
+        canonical relative to contact order, so reordering the contacts may.
         """
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
         angles = (0.0, 2.0 * np.pi / 3.0, 4.0 * np.pi / 3.0)

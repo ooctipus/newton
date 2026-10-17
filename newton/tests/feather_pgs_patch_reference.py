@@ -272,7 +272,9 @@ def _build(
         # The canonical farthest pair: the member farthest from the first
         # eligible one, then the member farthest from that. Member spans and
         # contact order define it, so neither roundoff in world coordinates nor
-        # the footprint's pose can swap its diagonal.
+        # the footprint's pose can swap its diagonal; reordering the contacts
+        # can. A choice independent of contact order kicked resting boxes whose
+        # contacts were reordered every step harder (measured).
         reference = first
         separation = float(0.0)
         member_start = member_stop
