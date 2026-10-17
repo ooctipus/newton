@@ -108,6 +108,67 @@ def _mixed_model(device, dof_count):
     return model
 
 
+def _three_size_model(device, worlds=2):
+    """Per world, a standing robot (12 DOFs), a fixed arm resting its tip on the ground (2) and a free box (6).
+
+    Three size groups of at most 32 DOFs take the masked builder size by size instead of in one
+    combined launch. The robot's 12 DOFs keep CUDA off the compact contact producer (up to 10 DOFs).
+    """
+    builder = newton.ModelBuilder()
+    cfg = builder.default_shape_cfg.copy()
+    cfg.density, cfg.mu = 0.0, 0.8
+    inertia = wp.mat33(np.eye(3) * 0.05)
+
+    def chain(parent, links, half_width):
+        """Append revolute links given as (axis, offset) and a box foot under the last; return the joints."""
+        joints = []
+        for axis, offset in links:
+            body = builder.add_link(mass=1.0, inertia=inertia, lock_inertia=True)
+            joints.append(
+                builder.add_joint_revolute(
+                    parent=parent,
+                    child=body,
+                    axis=axis,
+                    parent_xform=wp.transform(wp.vec3(*offset), wp.quat_identity()),
+                    target_ke=400.0,
+                    target_kd=20.0,
+                )
+            )
+            parent = body
+        foot = wp.transform(wp.vec3(0.0, 0.0, -0.2), wp.quat_identity())
+        builder.add_shape_box(parent, xform=foot, hx=0.06, hy=half_width, hz=0.03, cfg=cfg)
+        return joints
+
+    for _ in range(worlds):
+        builder.begin_world()
+        torso = builder.add_link(
+            xform=wp.transform(wp.vec3(0.0, 0.0, 0.48), wp.quat_identity()),
+            mass=2.0,
+            inertia=wp.mat33(np.eye(3) * 0.1),
+            lock_inertia=True,
+        )
+        joints = [builder.add_joint_free(child=torso)]
+        for side in (-1.0, 1.0):
+            # Hip roll and pitch, then the knee; each box foot rests on its four corners.
+            hip, knee = (0.0, 0.15 * side, 0.0), (0.0, 0.0, -0.25)
+            legs = ((newton.Axis.X, hip), (newton.Axis.Y, (0.0, 0.0, 0.0)), (newton.Axis.Y, knee))
+            joints += chain(torso, legs, 0.03)
+        builder.add_articulation(joints)
+        # A two-joint arm on a fixed shoulder, its tip box resting on the ground.
+        arm = ((newton.Axis.Y, (0.6, 0.0, 0.33)), (newton.Axis.Y, (0.0, 0.0, -0.1)))
+        builder.add_articulation(chain(-1, arm, 0.06))
+        box = builder.add_link(
+            xform=wp.transform(wp.vec3(-0.6, 0.0, 0.05), wp.quat_identity()),
+            mass=0.5,
+            inertia=wp.mat33(np.eye(3) * 0.01),
+        )
+        builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+        builder.add_articulation([builder.add_joint_free(parent=-1, child=box)])
+        builder.end_world()
+    builder.add_ground_plane()
+    return builder.finalize(device=device)
+
+
 def _anchor_count(records):
     return sum(len(record["types"]) == 3 for rows, _, _ in records for record in rows.values())
 
@@ -142,10 +203,11 @@ class TestMaskedPatchRowAdmission(unittest.TestCase):
 
 
 class TestMaskedPatchRows(unittest.TestCase):
-    def _assert_parity(self, model, steps, **solver_kwargs):
+    def _assert_parity(self, model, steps, method="masked_combined", **solver_kwargs):
+        """Step both builders; ``method`` is the masked route: one combined launch, or one per size."""
         masked_solver, masked, masked_methods = _rollout(model, masked=True, steps=steps, **solver_kwargs)
         general_solver, general, general_methods = _rollout(model, masked=False, steps=steps, **solver_kwargs)
-        self.assertEqual(masked_methods, {"masked_combined"})
+        self.assertEqual(masked_methods, {method})
         self.assertEqual(general_methods, {"per_contact"})
         self.assertGreater(_anchor_count(masked), 0, "no contact owned an anchor")
         self.assertGreater(
@@ -178,12 +240,13 @@ class TestMaskedPatchRows(unittest.TestCase):
 
     def test_cpu_masked_patch_rows_match_the_per_contact_builder(self):
         """Patch rows, ring links, Jacobians and steps equal the per-contact builder's bit for bit (split mode)."""
-        for name, model, steps in (
-            ("standing", standing_model("cpu"), 4),
-            ("arm_and_box", _mixed_model("cpu", 13), 8),
+        for name, model, steps, method in (
+            ("standing", standing_model("cpu"), 4, "masked_combined"),
+            ("arm_and_box", _mixed_model("cpu", 13), 8, "masked_combined"),
+            ("three_sizes", _three_size_model("cpu"), 6, "masked"),
         ):
             with self.subTest(scene=name):
-                self._assert_parity(model, steps, pgs_mode="split", pgs_iterations=8)
+                self._assert_parity(model, steps, method, pgs_mode="split", pgs_iterations=8)
 
     def test_cpu_flag_off_restores_the_per_contact_builder(self):
         """FEATHER_PGS_PATCH_DENSE_PATHS=0 keeps patch friction on the per-contact builder."""
@@ -199,14 +262,20 @@ class TestMaskedPatchRows(unittest.TestCase):
         """Matrix-free dense route: masked patch rows step in parity with the per-contact builder.
 
         Contact Jacobians of articulations wider than the compact path's 10 DOFs come from the
-        general builders; the 23-DOF arm also runs the paired factor sweep over patch units.
+        general builders; the 23-DOF arm also runs the paired factor sweep over patch units, and
+        three size groups take the masked builder size by size.
         """
         device = wp.get_device("cuda:0")
-        for dof_count in (13, 23):
-            with self.subTest(dof_count=dof_count):
+        for name, model, method in (
+            ("arm_and_box_13", _mixed_model(device, 13), "masked_combined"),
+            ("arm_and_box_23", _mixed_model(device, 23), "masked_combined"),
+            ("three_sizes", _three_size_model(device), "masked"),
+        ):
+            with self.subTest(scene=name):
                 solver = self._assert_parity(
-                    _mixed_model(device, dof_count),
+                    model,
                     6,
+                    method,
                     pgs_mode="matrix_free",
                     pgs_iterations=8,
                     enable_joint_limits=True,
