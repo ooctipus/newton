@@ -11,7 +11,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import response_operator
+from newton._src.solvers.feather_pgs import response_operator, tree_kinetic_state
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton.tests.test_feather_pgs_mixed_tree_free_body import DT, _build
 
@@ -71,6 +71,20 @@ def _rollout(model, *, serial, steps=90):
     return owner, np.array(poses), np.array(predictors)
 
 
+def _predictor(group, reference):
+    """The predictor kernel the factory builds for a group's layout under ``reference``."""
+    return tree_kinetic_state.get_predictor_kernel(
+        group.chain_scan, layout=group.layout, response=group._response, reference=reference, clocked=group.clocked
+    )
+
+
+def _lane_parallel(group):
+    """Whether a group holds a factor family its lanes solve in parallel (one lane per row)."""
+    return group._response == "cholesky" and any(
+        0 < family <= min(32, group.layout.lanes) for family in group.layout.root_families
+    )
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "The held-tree owner is a CUDA path")
 class TestLaneParallelHeldSolve(unittest.TestCase):
     def _compare(self, model, families):
@@ -79,6 +93,17 @@ class TestLaneParallelHeldSolve(unittest.TestCase):
         self.assertIsNotNone(owner)
         self.assertEqual(sorted(group.layout.root_families for group in owner.groups), sorted(families))
         self.assertIs(type(owner), type(owner_serial))
+        # Each arm ran the predictor its own switch selects: the switch is a factory
+        # argument, so the second arm cannot reuse the first arm's kernels, and every
+        # lane-parallel group differs from the serial law built for its own layout.
+        for arm, reference in ((owner_serial, True), (owner, False)):
+            self.assertEqual(arm.reference, reference)
+            for group in arm.groups:
+                self.assertIs(group.predictor_kernel, _predictor(group, reference))
+        parallel = [group for group in owner.groups if _lane_parallel(group)]
+        self.assertTrue(parallel)
+        for group in parallel:
+            self.assertIsNot(group.predictor_kernel, _predictor(group, True))
         self.assertTrue(np.isfinite(poses).all())
         # The forward pass is the same arithmetic in the same order; the
         # transposed pass accumulates in the other direction (1 ulp effects).

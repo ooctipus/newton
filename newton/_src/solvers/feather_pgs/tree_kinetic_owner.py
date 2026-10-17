@@ -66,6 +66,25 @@ def dfs_intervals(parent):
     return np.asarray(order, np.int32), end
 
 
+def kernel_switches():
+    """Read the tree kernels' comparison and instrumentation switches, once per owner.
+
+    ``FEATHER_PGS_TREE_REFERENCE=1`` selects the reference forms the A/B tests
+    compare against (the serial one-lane held solve, the depth-level subtree
+    reduction and the shared-memory scans); ``FEATHER_PGS_STAGE_CLOCKS=1`` adds
+    per-stage cycle counters. Both change the emitted code, so an owner reads
+    them at construction and passes them to every kernel factory as arguments,
+    which keeps them in the factories' cache keys.
+
+    Returns:
+        ``(reference, clocked)``.
+    """
+    return (
+        os.environ.get("FEATHER_PGS_TREE_REFERENCE") == "1",
+        os.environ.get("FEATHER_PGS_STAGE_CLOCKS") == "1",
+    )
+
+
 class TreeKineticState:
     """Own one current cache with device state-bank tags and a separate held W."""
 
@@ -78,6 +97,8 @@ class TreeKineticState:
         complete=True,
         response="sparse",
         copy_reuse=False,
+        reference=None,
+        clocked=None,
     ):
         from . import tree_kinetic_state as native  # noqa: PLC0415
 
@@ -96,7 +117,14 @@ class TreeKineticState:
             raise ValueError("Copied-state reuse requires fixed scalar coordinates and ordinary motion")
         self.copy_reuse = copy_reuse
         self.group_count = sparse_owner.plan.group_to_art.size
-        if os.environ.get("FEATHER_PGS_STAGE_CLOCKS") == "1":
+        # Kernel-selecting switches: a composite owner passes the values it read
+        # for all of its groups; a direct construction reads them here.
+        if reference is None or clocked is None:
+            read_reference, read_clocked = kernel_switches()
+            reference = read_reference if reference is None else reference
+            clocked = read_clocked if clocked is None else clocked
+        self.reference, self.clocked = bool(reference), bool(clocked)
+        if self.clocked:
             solver._stage_clocks = wp.zeros((self.group_count, 28), dtype=wp.int64, device=solver.model.device)
         self._cache_to_art = sparse_owner.plan.group_to_art.reshape((self.group_count, 1))
         bodies, dofs = self.layout.bodies, self.layout.dofs
@@ -286,11 +314,21 @@ class TreeKineticState:
             body_velocity=self._body_velocity,
             motion_velocity=self.motion_velocity,
             copy_reuse=self.copy_reuse,
+            reference=self.reference,
+            clocked=self.clocked,
         )
         self.finish_kernel = native.get_state_kernel(
-            True, self.chain_scan, layout=layout, body_velocity=self._body_velocity, copy_reuse=self.copy_reuse
+            True,
+            self.chain_scan,
+            layout=layout,
+            body_velocity=self._body_velocity,
+            copy_reuse=self.copy_reuse,
+            reference=self.reference,
+            clocked=self.clocked,
         )
-        self.predictor_kernel = native.get_predictor_kernel(self.chain_scan, layout=layout, response=self._response)
+        self.predictor_kernel = native.get_predictor_kernel(
+            self.chain_scan, layout=layout, response=self._response, reference=self.reference, clocked=self.clocked
+        )
         self.block_dim = max(layout.block, self._chain_block_dim)
         self.launch_count = self.group_count // layout.pack
 

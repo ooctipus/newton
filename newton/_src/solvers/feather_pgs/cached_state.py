@@ -11,7 +11,6 @@ one definition; mappings, operators and cache policies remain with their owners.
 
 import hashlib
 import linecache
-import os
 from dataclasses import dataclass
 from string import Template
 from textwrap import dedent, indent
@@ -151,9 +150,12 @@ for local in range(lane, $BODIES, stride):
 """
 
 
-def make_state_kernel(name, signature, operands, stages, namespace, *, finish):
-    """Compile one complete repair/finish with the owner's existing launch ABI."""
-    clocked = os.environ.get("FEATHER_PGS_STAGE_CLOCKS") == "1"
+def make_state_kernel(name, signature, operands, stages, namespace, *, finish, clocked=False):
+    """Compile one complete repair/finish with the owner's existing launch ABI.
+
+    ``clocked`` adds the stage cycle counters; the caller passes it so that it
+    is part of the caller's kernel cache key.
+    """
     values = {
         "BODIES": operands.bodies,
         "DOFS": operands.dofs,
@@ -248,9 +250,11 @@ $CLOCKB3
 """
 
 
-def make_body_terms(signature, namespace, *, refresh, cache, com_offset, store, body_velocity=False):
-    """Share body bias/moment arithmetic while retaining each publication contract."""
-    clocked = os.environ.get("FEATHER_PGS_STAGE_CLOCKS") == "1"
+def make_body_terms(signature, namespace, *, refresh, cache, com_offset, store, body_velocity=False, clocked=False):
+    """Share body bias/moment arithmetic while retaining each publication contract.
+
+    ``clocked`` adds the body-term cycle counters (see :func:`make_state_kernel`).
+    """
     clocks = {f"CLOCKB{k}": (f"clock_b{k} = _clock()" if clocked else "pass") for k in range(4)}
     if clocked:
         clocks["CLOCKB3"] = (

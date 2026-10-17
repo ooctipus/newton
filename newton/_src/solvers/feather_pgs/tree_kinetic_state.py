@@ -5,7 +5,6 @@
 """Generated current/next tree moments, bias and fused state publication."""
 
 import functools
-import os
 from textwrap import indent
 from types import SimpleNamespace
 
@@ -686,22 +685,34 @@ _STORE_TERMS_SOURCE = r"""
 
 
 @functools.cache
-def get_helpers(layout: TreeLayout = REFERENCE_LAYOUT, chain_scan: bool = False, body_velocity: bool = False):
-    """Bind one physical tree evaluation to its storage and traversal schedule."""
+def get_helpers(
+    layout: TreeLayout = REFERENCE_LAYOUT,
+    chain_scan: bool = False,
+    body_velocity: bool = False,
+    *,
+    reference: bool = False,
+    clocked: bool = False,
+):
+    """Bind one physical tree evaluation to its storage and traversal schedule.
+
+    ``reference`` keeps the shared-memory scans and the depth-level subtree
+    reduction on warp-sized layouts (the forms the A/B tests compare against);
+    ``clocked`` adds the collection stage counters. Both change the emitted
+    code, so they are arguments (cache-key members), never environment reads.
+    """
     plan_type = tree_chain_scan.ChainPlan if chain_scan else KineticPlan
     # A warp-sized layout scans in registers through shuffles; two-warp layouts
     # keep the shared-memory jump table.
-    register_scan = not chain_scan and layout.lanes <= 32 and os.environ.get("FEATHER_PGS_TREE_REFERENCE") != "1"
+    register_scan = not chain_scan and layout.lanes <= 32 and not reference
     pose_source = layout.render(tree_chain_scan._POSE if chain_scan else _POSE_SHFL if register_scan else _POSE)
     motion_source = layout.render(tree_chain_scan._MOTION if chain_scan else _MOTION_SHFL if register_scan else _MOTION)
-    interval_reduce = not chain_scan and layout.lanes <= 32 and os.environ.get("FEATHER_PGS_TREE_REFERENCE") != "1"
+    interval_reduce = not chain_scan and layout.lanes <= 32 and not reference
     reduction = (
         tree_chain_scan.reduction_source(moments=True, layout=layout)
         if chain_scan
         else layout.render(_INTERVAL_REDUCE if interval_reduce else _LEVEL_REDUCE)
     )
     collect_text = _COLLECT.replace("$REDUCE", reduction)
-    clocked = os.environ.get("FEATHER_PGS_STAGE_CLOCKS") == "1"
     for k in range(4):
         statement = ""
         if clocked and k == 0:
@@ -805,6 +816,7 @@ if data.is_free_rigid[data.body_to_articulation[body]] != 0:
         com_offset="radius",
         body_velocity=body_velocity,
         store=store,
+        clocked=clocked,
     )
 
     @wp.func_native(collect_source)
@@ -837,13 +849,19 @@ def get_state_kernel(
     body_velocity: bool = False,
     motion_velocity: bool = False,
     copy_reuse: bool = False,
+    reference: bool = False,
+    clocked: bool = False,
 ):
-    """Build complete repair/finish using original generalized integration laws."""
+    """Build complete repair/finish using original generalized integration laws.
+
+    ``reference`` and ``clocked`` select the comparison forms and the stage
+    counters (see :func:`get_helpers`).
+    """
     if finish and motion_velocity:
         raise ValueError("Alternate motion velocity is a repair-only contract")
     if copy_reuse and (layout.root_dofs or motion_velocity):
         raise ValueError("Copied-state reuse requires fixed scalar coordinates and ordinary motion")
-    h = get_helpers(layout, chain_scan, body_velocity)
+    h = get_helpers(layout, chain_scan, body_velocity, reference=reference, clocked=clocked)
     plan_type = h.plan_type
     _lanes, _sync, _sub, _different_motion = _thread_helpers(layout)
     pack = layout.pack
@@ -875,7 +893,7 @@ def get_state_kernel(
 """
         copy_store = "_copy_store(plan, cache, group, ds, q, qd, data.joint_child, js, data.body_q, data.body_qd)\n"
     motion_clock = ["pass"] * 4
-    if os.environ.get("FEATHER_PGS_STAGE_CLOCKS") == "1":
+    if clocked:
         motion_clock = [f"clock_m{k} = _clock()" for k in range(4)]
         motion_clock[3] += (
             "\n    if local == 0 and data.stage_clocks.shape[0] > group:\n"
@@ -1053,12 +1071,24 @@ if lane == 0:
         stages,
         dict(globals(), **locals()),
         finish=finish,
+        clocked=clocked,
     )
 
 
 @functools.cache
-def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFERENCE_LAYOUT, response="sparse"):
-    """Apply current external/control force and both unchanged W actions."""
+def get_predictor_kernel(
+    chain_scan: bool = False,
+    *,
+    layout: TreeLayout = REFERENCE_LAYOUT,
+    response="sparse",
+    reference: bool = False,
+    clocked: bool = False,
+):
+    """Apply current external/control force and both unchanged W actions.
+
+    ``reference`` keeps the serial one-lane held solve on CUDA; ``clocked``
+    adds the predictor stage counters (see :func:`get_helpers`).
+    """
     plan_type = tree_chain_scan.ChainPlan if chain_scan else KineticPlan
     reduction = (
         tree_chain_scan.reduction_source(moments=False, layout=layout)
@@ -1119,9 +1149,8 @@ def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFER
         # (one lane per row, one shuffle per step); larger families and the
         # CPU twin keep the serial one-lane law. A prescribed root (family 0)
         # responds with zero and a diagonal-mass root (negative family) with
-        # its stored inverse. FEATHER_PGS_TREE_REFERENCE=1 keeps the serial
-        # form on CUDA for comparison (with the level reduction and shared-memory scans).
-        serial_only = os.environ.get("FEATHER_PGS_TREE_REFERENCE") == "1"
+        # its stored inverse. ``reference`` keeps the serial form on CUDA for
+        # comparison (the owner reads FEATHER_PGS_TREE_REFERENCE at construction).
         roots = len(layout.roots)
         if not layout.forest:
             families = [(0, layout.dofs, f"d.lower.data+group*{layout.dofs**2}", layout.dofs)]
@@ -1153,7 +1182,7 @@ def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFER
                 + held.transpose(f"s[$WHITE+{offset}+$index]", f"s[$WHITE+{offset}+$index]")
                 + "\n}"
             )
-            if family <= min(32, layout.lanes) and not serial_only:
+            if family <= min(32, layout.lanes) and not reference:
                 parallel.append(
                     response_operator.LaneCholeskySolve(family, pointer).solve(
                         f"$SIX_BODIES+{offset}", f"$WHITE+{offset}"
@@ -1180,7 +1209,6 @@ def get_predictor_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFER
         raise ValueError("Unknown held tree response representation")
     operations["TWIST_BLOCK"] = _TWIST_BLOCK if (layout.lanes <= 32 and not chain_scan) else ""
     source = _PREDICT
-    clocked = os.environ.get("FEATHER_PGS_STAGE_CLOCKS") == "1"
     for k in range(6):
         statement = ""
         if clocked and k == 0:

@@ -11,6 +11,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import tree_kinetic_state
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton._src.solvers.feather_pgs.tree_kinetic_owner import dfs_intervals
 from newton.tests.test_feather_pgs_mixed_tree_free_body import DT, _build
@@ -114,13 +115,35 @@ def _rollout(model, *, level_loop, steps=60):
     return owner, np.array(poses), np.array(biases)
 
 
+def _finish(group, reference):
+    """The finish kernel the factory builds for a group's layout under ``reference``."""
+    return tree_kinetic_state.get_state_kernel(
+        True,
+        group.chain_scan,
+        layout=group.layout,
+        body_velocity=group._body_velocity,
+        copy_reuse=group.copy_reuse,
+        reference=reference,
+        clocked=group.clocked,
+    )
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "The held-tree owner is a CUDA path")
 class TestPrefixSubtreeReduction(unittest.TestCase):
     def _compare(self, model, *, bias_tolerance=(1e-5, 1e-4)):
-        _owner, plain, plain_bias = _rollout(model, level_loop=True)
+        owner_reference, plain, plain_bias = _rollout(model, level_loop=True)
         owner, poses, bias = _rollout(model, level_loop=False)
         self.assertIsNotNone(owner)
-        self.assertTrue(all(group.layout.lanes <= 32 for group in owner.groups))
+        self.assertTrue(all(group.layout.lanes <= 32 and not group.chain_scan for group in owner.groups))
+        # Each arm ran the finish kernel its own switch selects: the switch is a factory
+        # argument, so the second arm cannot reuse the first arm's kernels, and on these
+        # warp-sized layouts the interval reduction differs from the level loop.
+        for arm, reference in ((owner_reference, True), (owner, False)):
+            self.assertEqual(arm.reference, reference)
+            for group in arm.groups:
+                self.assertIs(group.finish_kernel, _finish(group, reference))
+        for group in owner.groups:
+            self.assertIsNot(group.finish_kernel, _finish(group, True))
         self.assertTrue(np.isfinite(poses).all())
         # Both forms add the same body terms in a different grouping; they differ by float rounding,
         # amplified where a subtree's terms cancel (a walker landing on its feet).

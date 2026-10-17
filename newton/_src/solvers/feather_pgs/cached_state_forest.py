@@ -152,6 +152,7 @@ def make_forest_state(
     valid,
     stamp="",
     padded=False,
+    clocked=False,
 ):
     """Bind forest publication to its explicit current/geometric cache policy."""
     if primary_bodies <= 0 or free_roots < 0:
@@ -201,4 +202,4 @@ def make_forest_state(
         f"for root in range(lane, {free_roots}, stride)",
         "plan.root_slots[world, root]",
     )
-    return make_state_kernel(name, signature, operands, stages, namespace, finish=finish)
+    return make_state_kernel(name, signature, operands, stages, namespace, finish=finish, clocked=clocked)

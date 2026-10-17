@@ -13,7 +13,7 @@ from .device_proof import DeviceProof
 from .small_cholesky import geometric_kernel
 from .sparse_factor import bind_operator_plan, operator_metadata
 from .sparse_mass_matrix import _SparseMassMatrixPlan
-from .tree_kinetic_owner import _NUMERIC_FLAGS, TreeKineticState
+from .tree_kinetic_owner import _NUMERIC_FLAGS, TreeKineticState, kernel_switches
 from .tree_kinetic_plan import make_plan
 from .tree_kinetic_state import HeldResponse
 
@@ -529,6 +529,8 @@ class MixedTreeKineticState:
         self._dimensions = (solver.model.joint_count, solver.model.body_count, solver.model.articulation_count)
         # The coverage proof's inputs, compared on the device on notification.
         self._proof = DeviceProof(list(self._coverage_arrays()), solver.model.device)
+        # One read of the kernel switches for every group this owner composes.
+        self.reference, self.clocked = kernel_switches()
         forest = os.environ.get("FEATHER_PGS_TREE_FOREST", "1" if forest_default(solver) else "0") == "1"
         if forest and forest_supported(solver):
             operators = [ForestHeldOperator(solver)]
@@ -546,6 +548,8 @@ class MixedTreeKineticState:
                 response="diagonal" if operator.diagonal else "cholesky",
                 # Copied-state reuse requires fixed scalar coordinates.
                 copy_reuse=not operator.free_root and not solver.enable_joint_velocity_limits,
+                reference=self.reference,
+                clocked=self.clocked,
             )
             operator.kinetic_state = group
             self.groups.append(group)
