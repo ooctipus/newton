@@ -38,6 +38,8 @@ from newton.tests.feather_pgs_patch_parity import assert_loaded_anchors, assert_
 
 _DOFS = 6
 _CAPACITY = 64
+# spread_rows seed that puts all three rings of the two-warp case across row 32.
+_SPREAD_SEED = 0
 
 
 def ring_load(parents, impulses, normal, *, linked=True):
@@ -219,6 +221,42 @@ def parallel_case(seed, *, faces=1, linked=True, warm=False):
     }
 
 
+def spread_rows(case, seed):
+    """Shuffle a case's row slots by contact, as atomic slot allocation spreads a patch over a world's rows.
+
+    A contact's normal keeps its tangent rows right behind it; a limit row moves
+    alone. Parents follow their rows. Returns the shuffled case and ``order``
+    (shuffled row -> original row): a parallel sweep updates every row from the
+    same impulses, so its solution moves with the rows.
+    """
+    types, parents = case["types"], case["parents"]
+    blocks, row = [], 0
+    while row < len(types):
+        size = 1
+        while row + size < len(types) and types[row + size] == PGS_CONSTRAINT_TYPE_FRICTION:
+            size += 1
+        blocks.append(np.arange(row, row + size))
+        row += size
+    order = np.concatenate([blocks[b] for b in np.random.default_rng(seed).permutation(len(blocks))])
+    position = np.empty_like(order)
+    position[order] = np.arange(len(order))
+    spread = dict(case)
+    for name in ("J", "Y", "Z", "diag", "kinds", "types", "mu", "rhs", "impulses"):
+        spread[name] = case[name][order]
+    moved = parents[order]
+    spread["parents"] = np.where(moved >= 0, position[np.maximum(moved, 0)], -1).astype(np.int32)
+    return spread, order
+
+
+def ring_rows(parents, normal):
+    """The normal rows of the patch ring that starts at ``normal``, in ring order."""
+    ring, row = [normal], parents[normal]
+    while 0 <= row < len(parents) and row != normal:
+        ring.append(int(row))
+        row = parents[row]
+    return ring
+
+
 def assert_pooled_coulomb(test, case, impulses, *, linked, atol=1.0e-6):
     """Bound every tangent pair by its coefficient times its ring's (or its own) normal impulse."""
     pairs = 0
@@ -336,6 +374,47 @@ class TestParallelPatchReference(unittest.TestCase):
                     np.testing.assert_array_equal(same, point)
                     # The patch anchors pool four normals at half the coefficient, which moves the solution.
                     self.assertGreater(np.max(np.abs(linked - point)), 1.0e-3)
+
+    def test_spread_rings_cross_the_warp_boundary(self):
+        """Spread every patch ring of the two-warp case across row 32 and keep the sweep's solution.
+
+        The two-warp tiers read a ring normal staged by the other warp; the spread
+        case puts pairs and ring members on both sides of row 32. The reference
+        solution moves with the rows, which also checks the parent relinking.
+        """
+        case = parallel_case(3, faces=3)
+        spread, order = spread_rows(case, _SPREAD_SEED)
+        parents = spread["parents"]
+        rings = {
+            tuple(sorted(ring_rows(parents, int(n))))
+            for n in np.flatnonzero(spread["types"] == PGS_CONSTRAINT_TYPE_CONTACT)
+            if parents[n] >= 0 and parents[n] != n
+        }
+        self.assertEqual(len(rings), 3)
+        self.assertTrue(all(min(ring) < 32 <= max(ring) for ring in rings), rings)
+        crossing = [
+            row
+            for row in np.flatnonzero(spread["types"] == PGS_CONSTRAINT_TYPE_FRICTION)
+            if row == parents[row] + 1
+            and any((member >= 32) != (row >= 32) for member in ring_rows(parents, int(parents[row])))
+        ]
+        self.assertGreaterEqual(len(crossing), 2)
+        for matrix_free, inkernel in itertools.product((False, True), repeat=2):
+            with self.subTest(matrix_free=matrix_free, inkernel=inkernel):
+                options = {
+                    "matrix_free": matrix_free,
+                    "inkernel": inkernel,
+                    "exact": False,
+                    "sweeps": 24,
+                    "nesterov": True,
+                    "tol": 0.0,
+                    "linked": True,
+                }
+                impulses, velocity = parallel_sweep_reference(case, **options)
+                moved, moved_velocity = parallel_sweep_reference(spread, **options)
+                np.testing.assert_allclose(moved, impulses[order], rtol=1.0e-12, atol=1.0e-14)
+                np.testing.assert_allclose(moved_velocity, velocity, rtol=1.0e-12, atol=1.0e-14)
+                assert_pooled_coulomb(self, spread, moved, linked=True)
 
 
 class _RowsBuilt(Exception):
@@ -692,16 +771,20 @@ class TestParallelPatchKernel(unittest.TestCase):
 
         The point tiers on the same rows without ring links pin the reference to the
         kernel's existing law first, so a mismatch of the linked tiers isolates the ring walk.
+        Each case also runs with its contacts' slots spread (spread_rows), which puts the
+        two-warp case's rings and pairs on both sides of row 32.
         """
         device = wp.get_device("cuda:0")
         arch = str(device.arch)
-        for (faces, rows, min_rows), matrix_free, inkernel, nesterov, warm in itertools.product(
-            ((1, 32, 0), (3, 64, 32)), (False, True), (False, True), (False, True), (False, True)
+        for (faces, rows, min_rows), matrix_free, inkernel, nesterov, warm, spread in itertools.product(
+            ((1, 32, 0), (3, 64, 32)), (False, True), (False, True), (False, True), (False, True), (False, True)
         ):
             options = {"matrix_free": matrix_free, "inkernel": inkernel, "exact": False, "nesterov": nesterov}
-            with self.subTest(faces=faces, warm=warm, **options):
+            with self.subTest(faces=faces, warm=warm, spread=spread, **options):
                 for linked in (False, True):
                     case = parallel_case(faces, faces=faces, linked=linked, warm=warm)
+                    if spread:
+                        case, _ = spread_rows(case, _SPREAD_SEED)
                     self.assertGreater(len(case["J"]), min_rows)
                     kernel = source._get_pgs_solve_parallel_kernel(
                         _CAPACITY,
