@@ -28,6 +28,7 @@ from newton.tests import test_feather_pgs_sparse_contact_triplets as triplet_tes
 from newton.tests import test_feather_pgs_sparse_solver as sparse_tests
 from newton.tests import test_feather_pgs_sparse_split as split_tests
 from newton.tests.feather_pgs_patch_parity import (
+    assert_contact_impulses_close,
     assert_history_close,
     assert_ring_coulomb,
     assert_rows_close,
@@ -330,7 +331,8 @@ def _case(enabled, *, floating=True, branches=3, depth=1, activation_fraction=0.
     state.joint_qd.assign(qd.reshape(-1))
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     control.joint_f.assign(np.linspace(-0.08, 0.11, model.joint_dof_count, dtype=np.float32))
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=32)
+    # Sorted contacts: both arms see the same contact order, which the by-contact patch checks key on.
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=32, deterministic=True)
     return model, solver, state, out, control, pipeline, pipeline.contacts()
 
 
@@ -351,17 +353,11 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
     def _assert_patch(self, reference, candidate):
         """Match patch rows and contact impulses, the pooled Coulomb bound and the anchor lifecycle."""
         self.assertTrue(reference[1]._friction_anchors_enabled)
-        assert_rows_close(contact_rows(reference[1], reference[-1]), contact_rows(candidate[1], candidate[-1]))
-        for world, row_count in enumerate(reference[1].constraint_count.numpy()):
-            count = int(row_count)
-            kinds = reference[1].row_type.numpy()[world, :count]
-            contact = (kinds == CONTACT) | (kinds == FRICTION)
-            np.testing.assert_allclose(
-                candidate[1].impulses.numpy()[world, :count][contact],
-                reference[1].impulses.numpy()[world, :count][contact],
-                atol=2e-5,
-                rtol=7e-4,
-            )
+        # Keyed by contact: ring parents and patch rows are slots of per-world atomic reservations.
+        rows = contact_rows(reference[1], reference[-1])
+        candidate_rows = contact_rows(candidate[1], candidate[-1])
+        assert_rows_close(rows, candidate_rows)
+        assert_contact_impulses_close(rows, candidate_rows)
         for case in (reference, candidate):
             assert_ring_coulomb(case[1])
         assert_history_close(reference[1], candidate[1])
@@ -377,7 +373,8 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
             z, jacobian = sparse_tests.TestFeatherPGSSparseSolver._sparse_rows_physical(self, new, world, count)
             np.testing.assert_allclose(jacobian, old_j[world, :count], atol=3e-5, rtol=3e-4)
             np.testing.assert_allclose(z @ z.T, old_j[world, :count] @ old_y[world, :count].T, atol=3e-5, rtol=3e-4)
-            for name in ("row_type", "row_parent"):
+            # Patch ring parents name other contacts' slots; _assert_patch compares them by contact.
+            for name in ("row_type",) if old._friction_anchors_enabled else ("row_type", "row_parent"):
                 np.testing.assert_array_equal(
                     getattr(new, name).numpy()[world, :count], getattr(old, name).numpy()[world, :count]
                 )

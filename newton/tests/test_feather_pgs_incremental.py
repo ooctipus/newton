@@ -10,11 +10,14 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
+from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_mf_gs_incremental_kernel
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_solver as sparse_tests
 from newton.tests import test_feather_pgs_sparse_split as split_tests
 from newton.tests.feather_pgs_patch_parity import (
+    assert_contact_impulses_close,
     assert_history_close,
     assert_loaded_anchors,
     assert_ring_coulomb,
@@ -125,7 +128,8 @@ def _patch_case(model, incremental_rows):
     )
     state, out, control = model.state(), model.state(), model.control()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=32)
+    # Sorted contacts: both arms see the same contact order, which the by-contact patch checks key on.
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=32, deterministic=True)
     return model, solver, state, out, control, pipeline, pipeline.contacts()
 
 
@@ -160,10 +164,16 @@ class TestFeatherPGSIncrementalPatch(unittest.TestCase):
                         split_tests._step(case)
                     # Only float order differs; it compounds through the rollout like other route changes.
                     sparse_tests.TestFeatherPGSSparseSolver.assert_states_close(self, reference[2], candidate[2])
+                    # Contact rows by contact (their slots come from per-world atomics), the other rows by slot.
+                    rows = contact_rows(candidate[1], candidate[-1])
+                    assert_contact_impulses_close(contact_rows(reference[1], reference[-1]), rows)
                     for world, count in enumerate(reference[1].constraint_count.numpy()):
+                        kinds = reference[1].row_type.numpy()[world, :count]
+                        other = (kinds != CONTACT) & (kinds != FRICTION)
+                        np.testing.assert_array_equal(candidate[1].row_type.numpy()[world, :count][other], kinds[other])
                         np.testing.assert_allclose(
-                            candidate[1].impulses.numpy()[world, :count],
-                            reference[1].impulses.numpy()[world, :count],
+                            candidate[1].impulses.numpy()[world, :count][other],
+                            reference[1].impulses.numpy()[world, :count][other],
                             atol=2e-5,
                             rtol=7e-4,
                         )
@@ -173,7 +183,6 @@ class TestFeatherPGSIncrementalPatch(unittest.TestCase):
                     if name == "standing":
                         for case in (reference, candidate):
                             assert_loaded_anchors(case[1], case[-1], carried=index > 0)
-                    rows = contact_rows(candidate[1], candidate[-1])
                     linked |= any(record["parents"][0] not in (-1, c) for c, record in rows.items())
                     carried |= bool(candidate[1]._friction_patches.previous.valid.numpy().any())
                 self.assertTrue(carried, "Anchors must carry history between steps")

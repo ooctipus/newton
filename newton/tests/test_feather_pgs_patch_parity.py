@@ -17,6 +17,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 )
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import (
+    assert_contact_impulses_close,
     assert_history_close,
     assert_loaded_anchors,
     assert_ring_coulomb,
@@ -93,7 +94,15 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
             with self.subTest(shift=shift):
                 stand_in = _permuted_slots(solver, contacts, shift)
                 self.assertFalse(np.array_equal(stand_in.contact_slot.numpy(), solver.contact_slot.numpy()))
-                assert_rows_close(rows, contact_rows(stand_in, contacts, route=1, jacobian=True), atol=0.0, rtol=0.0)
+                permuted = contact_rows(stand_in, contacts, route=1, jacobian=True)
+                assert_rows_close(rows, permuted, atol=0.0, rtol=0.0)
+                assert_contact_impulses_close(rows, permuted, atol=0.0, rtol=0.0)
+        # A resting box carries its weight: an impulse changed on one contact is reported on that contact.
+        self.assertGreater(sum(float(rows[c]["impulses"][0]) for c in normals), 0.0)
+        changed = {c: dict(record, impulses=record["impulses"].copy()) for c, record in rows.items()}
+        changed[anchors[0]]["impulses"][1] += 1.0e-3
+        with self.assertRaisesRegex(AssertionError, f"contact {anchors[0]} impulses"):
+            assert_contact_impulses_close(rows, changed)
 
     def test_ring_coulomb_accepts_the_pooled_budget(self):
         """Accept friction bounded by the ring's pooled normal load and reject an exceeded budget."""

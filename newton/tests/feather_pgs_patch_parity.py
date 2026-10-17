@@ -60,9 +60,9 @@ def contact_rows(solver, contacts, route=0, *, incident=False, jacobian=False):
 
     Each record holds the contact's row types; row parents as contact indices
     (the next normal of the patch ring for the normal row, the owning contact
-    for friction rows, -1 for none); mu and the right-hand side per row; the
-    normal row's phi and target; and the patch view's weight, tangential phi
-    and friction location when patches are enabled. ``incident`` adds the
+    for friction rows, -1 for none); mu, the right-hand side and the solved
+    impulse per row; the normal row's phi and target; and the patch view's
+    weight, tangential phi and friction location when patches are enabled. ``incident`` adds the
     native sparse route's separately stored ``J v_hat`` to the right-hand
     side, matching the assembled split rows. ``jacobian`` adds the physical
     row Jacobians.
@@ -91,6 +91,7 @@ def contact_rows(solver, contacts, route=0, *, incident=False, jacobian=False):
             "parents": np.array([owner.get((w, int(p)), -2) if p >= 0 else -1 for p in parents], dtype=np.int64),
             "mu": arrays["mu"][w, rows].copy(),
             "rhs": arrays["rhs"][w, rows].copy(),
+            "impulses": arrays["impulse"][w, rows].copy(),
             "phi": float(arrays["phi"][w, first]),
             "target": None if arrays["target"] is None else float(arrays["target"][w, first]),
             "patch": None,
@@ -111,7 +112,8 @@ def assert_rows_close(a, b, *, atol=3e-5, rtol=3e-4):
     """Require the same contacts, row types and ring links, and close row values.
 
     Float fields that one record does not hold (for example a route without a
-    stored target) are skipped.
+    stored target) are skipped. Solved impulses are left to
+    :func:`assert_contact_impulses_close`.
     """
     if sorted(a) != sorted(b):
         raise AssertionError(f"Routed contacts differ: {sorted(set(a) ^ set(b))}")
@@ -123,6 +125,21 @@ def assert_rows_close(a, b, *, atol=3e-5, rtol=3e-4):
             if first.get(name) is None or second.get(name) is None:
                 continue
             np.testing.assert_allclose(first[name], second[name], atol=atol, rtol=rtol, err_msg=f"contact {c} {name}")
+
+
+def assert_contact_impulses_close(a, b, *, atol=2e-5, rtol=7e-4):
+    """Require the same contacts and close solved impulses on each contact's rows.
+
+    ``a`` and ``b`` are :func:`contact_rows` records, so impulses compare by
+    contact rather than by slot. The default tolerance is the patch history
+    contract of :func:`assert_history_close`.
+    """
+    if sorted(a) != sorted(b):
+        raise AssertionError(f"Routed contacts differ: {sorted(set(a) ^ set(b))}")
+    for c in sorted(a):
+        np.testing.assert_allclose(
+            a[c]["impulses"], b[c]["impulses"], atol=atol, rtol=rtol, err_msg=f"contact {c} impulses"
+        )
 
 
 def ring_load(parents, impulses, first):
