@@ -33,7 +33,8 @@ def supported(solver):
         and solver._async_augmented_drives
         and solver._parallel_augmented_drive_topology
         and solver._articulation_dynamics_stream is not None
-        and not solver.lazy_kinematics
+        # lazy_kinematics defers publication only with the fused world-dynamics
+        # kernel (K1), which needs ordinary factors; on this route it is inert.
         and not solver._fused_k1
         and not solver._debug_buffers_enabled
         and not solver._double_buffer

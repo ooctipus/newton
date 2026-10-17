@@ -11,7 +11,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import mixed_tree_kinetic, packed_tree_owner, sparse_factor
+from newton._src.solvers.feather_pgs import mixed_tree_kinetic, packed_tree_owner, sparse_factor, tree_kinetic_sparse
 from newton.solvers import SolverFeatherPGS
 
 # (law-agnostic, point) contact-path predicates of each contact law.
@@ -102,6 +102,49 @@ class TestSparseCacheAdmission(unittest.TestCase):
                     solver = self.fixture(False, False)
                     setattr(solver, field, value)
                     self.assertFalse(packed_tree_owner.supported(solver))
+
+
+def _sparse_tree_solver(**changes):
+    """Describe a native sparse route that every sparse tree-owner admission term accepts."""
+    solver = SimpleNamespace(
+        model=SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False, particle_count=0),
+        _sparse_mass_matrix_size=18,
+        _has_free_rigid_bodies=False,
+        _mimic_count=0,
+        _sparse_velocity_limits=False,
+        _mimic_valid_np=None,
+        _connect_count=0,
+        _has_loop_joints=False,
+        _has_prescribed_response=False,
+        _fk_id_cache_available=True,
+        pgs_mode="matrix_free",
+        _sparse_split=False,
+        _async_augmented_drives=True,
+        _parallel_augmented_drive_topology=True,
+        _articulation_dynamics_stream=object(),
+        lazy_kinematics=False,
+        _fused_k1=False,
+        _debug_buffers_enabled=False,
+        _double_buffer=False,
+        _prismatic_publication=None,
+    )
+    for name, value in changes.items():
+        setattr(solver, name, value)
+    return solver
+
+
+class TestSparseTreeAdmission(unittest.TestCase):
+    def test_lazy_kinematics_is_inert_on_the_sparse_route(self):
+        """Admit lazy kinematics on the sparse route, where nothing defers publication, but not the fused kernel."""
+        for lazy, fused, admitted in (
+            (False, False, True),
+            (True, False, True),
+            (False, True, False),
+            (True, True, False),
+        ):
+            with self.subTest(lazy_kinematics=lazy, fused_k1=fused):
+                solver = _sparse_tree_solver(lazy_kinematics=lazy, _fused_k1=fused)
+                self.assertEqual(tree_kinetic_sparse.supported(solver), admitted)
 
 
 class TestHeldTreeContactLaw(unittest.TestCase):
