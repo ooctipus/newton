@@ -121,6 +121,23 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
     )
 
 
+class TestFeatherPGSRowAllocationCPU(unittest.TestCase):
+    def test_overflowing_allocation_launches_and_bounds_rows_cpu(self):
+        """Launch the overflowing allocation on CPU, so its operand list is checked without a GPU.
+
+        CPU reservations run one at a time, so the race the CUDA test provokes cannot occur;
+        the same invariants hold.
+        """
+        slot, needed, count, counter, dropped = _allocate_overflowing_contacts(wp.get_device("cpu"), 300, 48)
+        accepted = slot >= 0
+        self.assertTrue(accepted.any())
+        self.assertGreater(dropped, 0)
+        self.assertLessEqual(count, 48)
+        self.assertEqual(counter, int(needed[accepted].sum()) + dropped)
+        self.assertEqual(int(np.sum(needed[accepted])), count)
+        self.assertLessEqual(int(np.max(slot[accepted] + needed[accepted])), count)
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "the allocation race needs concurrent GPU reservations")
 class TestFeatherPGSRowAllocation(unittest.TestCase):
     def test_overflow_keeps_every_accepted_contact_below_the_count(self):

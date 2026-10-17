@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import warp as wp
@@ -25,111 +26,126 @@ def _outputs(articulation_count: int, max_constraints: int, size: int, device):
     )
 
 
+def _problem(device, articulation_count=257, size=6):
+    """One D6 joint per articulation and world, with positions drawn around its [-1, 1] limits."""
+    dof_count = articulation_count * size
+    rng = np.random.default_rng(42)
+    return SimpleNamespace(
+        device=device,
+        articulation_count=articulation_count,
+        size=size,
+        max_constraints=2 * size,
+        dof_count=dof_count,
+        articulation_start=wp.array(np.arange(articulation_count + 1), dtype=wp.int32, device=device),
+        articulation_dof_start=wp.array(np.arange(articulation_count) * size, dtype=wp.int32, device=device),
+        joint_type=wp.array(np.full(articulation_count, JointType.D6), dtype=wp.int32, device=device),
+        joint_q_start=wp.array(np.arange(articulation_count) * size, dtype=wp.int32, device=device),
+        joint_qd_start=wp.array(np.arange(articulation_count) * size, dtype=wp.int32, device=device),
+        joint_dof_dim=wp.array(np.tile([3, 3], (articulation_count, 1)), dtype=wp.int32, device=device),
+        lower=wp.array(np.full(dof_count, -1.0, dtype=np.float32), dtype=wp.float32, device=device),
+        upper=wp.array(np.full(dof_count, 1.0, dtype=np.float32), dtype=wp.float32, device=device),
+        joint_q=wp.array(rng.uniform(-1.2, 1.2, dof_count).astype(np.float32), dtype=wp.float32, device=device),
+        art_to_world=wp.array(np.arange(articulation_count), dtype=wp.int32, device=device),
+        group_to_art=wp.array(np.arange(articulation_count), dtype=wp.int32, device=device),
+    )
+
+
+def _resolved_mask(problem, resolved):
+    """The per-world resolved mask operand; ``None`` passes the empty mask (no world resolved)."""
+    if resolved is None:
+        return wp.empty(0, dtype=wp.int32, device=problem.device)
+    return wp.array(np.asarray(resolved, np.int32), dtype=wp.int32, device=problem.device)
+
+
+def _scalar_rows(problem, resolved=None):
+    """Build the joint-limit rows with the scalar per-articulation kernel."""
+    outputs = _outputs(problem.articulation_count, problem.max_constraints, problem.size, problem.device)
+    wp.launch(
+        build_joint_limit_rows_for_size,
+        dim=problem.articulation_count,
+        inputs=[
+            problem.articulation_start,
+            problem.articulation_dof_start,
+            problem.joint_type,
+            problem.joint_q_start,
+            problem.joint_qd_start,
+            problem.joint_dof_dim,
+            problem.lower,
+            problem.upper,
+            problem.joint_q,
+            0.25,
+            problem.art_to_world,
+            problem.group_to_art,
+            problem.max_constraints,
+            0.2,
+            1.0e-6,
+            _resolved_mask(problem, resolved),
+        ],
+        outputs=list(outputs),
+        device=problem.device,
+    )
+    return outputs
+
+
+def _warp_rows(problem, resolved=None, warps_per_block=4):
+    """Build the joint-limit rows with the warp-parallel kernel (CUDA only)."""
+    outputs = _outputs(problem.articulation_count, problem.max_constraints, problem.size, problem.device)
+    kernel = _get_joint_limit_warp_kernel(problem.size, problem.device.arch, warps_per_block)
+    wp.launch_tiled(
+        kernel,
+        dim=[(problem.articulation_count + warps_per_block - 1) // warps_per_block],
+        inputs=[
+            problem.articulation_count,
+            problem.articulation_dof_start,
+            problem.art_to_world,
+            problem.group_to_art,
+            wp.array(np.arange(problem.dof_count), dtype=wp.int32, device=problem.device),
+            problem.lower,
+            problem.upper,
+            problem.joint_q,
+            0.25,
+            problem.max_constraints,
+            0.2,
+            1.0e-6,
+            _resolved_mask(problem, resolved),
+        ],
+        outputs=list(outputs),
+        block_dim=32 * warps_per_block,
+        device=problem.device,
+    )
+    return outputs
+
+
 class TestFeatherPGSJointLimitWarp(unittest.TestCase):
+    def test_scalar_builder_skips_resolved_worlds_cpu(self):
+        """Launch the scalar builder on CPU, so its operand list is checked without a GPU.
+
+        An all-zero mask builds the same rows as the empty mask, and a resolved world builds none.
+        """
+        problem = _problem(wp.get_device("cpu"))
+        unmasked = _scalar_rows(problem)
+        self.assertGreater(int(unmasked[0].numpy().sum()), 0)
+        for actual, expected in zip(_scalar_rows(problem, np.zeros(problem.articulation_count)), unmasked, strict=True):
+            np.testing.assert_array_equal(actual.numpy(), expected.numpy())
+        resolved = np.arange(problem.articulation_count) % 3 == 0
+        for actual, original in zip(_scalar_rows(problem, resolved), unmasked, strict=True):
+            expected = original.numpy()
+            expected[resolved] = 0
+            np.testing.assert_array_equal(actual.numpy(), expected)
+
     @unittest.skipUnless(wp.is_cuda_available(), "warp-parallel joint-limit assembly requires CUDA")
     def test_warp_builder_matches_scalar_row_order_and_values(self):
-        device = wp.get_cuda_device()
-        articulation_count = 257
-        size = 6
-        max_constraints = 2 * size
-        dof_count = articulation_count * size
-        rng = np.random.default_rng(42)
-
-        articulation_start = wp.array(np.arange(articulation_count + 1), dtype=wp.int32, device=device)
-        articulation_dof_start = wp.array(np.arange(articulation_count) * size, dtype=wp.int32, device=device)
-        joint_type = wp.array(np.full(articulation_count, JointType.D6), dtype=wp.int32, device=device)
-        joint_q_start = wp.array(np.arange(articulation_count) * size, dtype=wp.int32, device=device)
-        joint_qd_start = wp.array(np.arange(articulation_count) * size, dtype=wp.int32, device=device)
-        joint_dof_dim = wp.array(np.tile([3, 3], (articulation_count, 1)), dtype=wp.int32, device=device)
-        lower = wp.array(np.full(dof_count, -1.0, dtype=np.float32), dtype=wp.float32, device=device)
-        upper = wp.array(np.full(dof_count, 1.0, dtype=np.float32), dtype=wp.float32, device=device)
-        joint_q = wp.array(rng.uniform(-1.2, 1.2, dof_count).astype(np.float32), dtype=wp.float32, device=device)
-        art_to_world = wp.array(np.arange(articulation_count), dtype=wp.int32, device=device)
-        group_to_art = wp.array(np.arange(articulation_count), dtype=wp.int32, device=device)
-        scalar = _outputs(articulation_count, max_constraints, size, device)
-
-        wp.launch(
-            build_joint_limit_rows_for_size,
-            dim=articulation_count,
-            inputs=[
-                articulation_start,
-                articulation_dof_start,
-                joint_type,
-                joint_q_start,
-                joint_qd_start,
-                joint_dof_dim,
-                lower,
-                upper,
-                joint_q,
-                0.25,
-                art_to_world,
-                group_to_art,
-                max_constraints,
-                0.2,
-                1.0e-6,
-                wp.empty(0, dtype=wp.int32, device=device),
-            ],
-            outputs=list(scalar),
-            device=device,
-        )
-
-        parallel = _outputs(articulation_count, max_constraints, size, device)
-        warps_per_block = 4
-        kernel = _get_joint_limit_warp_kernel(size, device.arch, warps_per_block)
-        wp.launch_tiled(
-            kernel,
-            dim=[(articulation_count + warps_per_block - 1) // warps_per_block],
-            inputs=[
-                articulation_count,
-                articulation_dof_start,
-                art_to_world,
-                group_to_art,
-                wp.array(np.arange(dof_count), dtype=wp.int32, device=device),
-                lower,
-                upper,
-                joint_q,
-                0.25,
-                max_constraints,
-                0.2,
-                1.0e-6,
-                wp.empty(0, dtype=wp.int32, device=device),
-            ],
-            outputs=list(parallel),
-            block_dim=32 * warps_per_block,
-            device=device,
-        )
-        wp.synchronize_device(device)
-
+        """Build the scalar kernel's rows with the warp-parallel kernel, with and without resolved worlds."""
+        problem = _problem(wp.get_cuda_device())
+        scalar = _scalar_rows(problem)
+        parallel = _warp_rows(problem)
         for parallel_array, scalar_array in zip(parallel, scalar, strict=True):
             np.testing.assert_array_equal(parallel_array.numpy(), scalar_array.numpy())
 
         # Mixed decisions share a block: returning resolved warps must leave
         # neighboring fallback warps' ballots and row order unchanged.
-        resolved = np.arange(articulation_count) % 3 == 0
-        mixed = _outputs(articulation_count, max_constraints, size, device)
-        wp.launch_tiled(
-            kernel,
-            dim=[(articulation_count + warps_per_block - 1) // warps_per_block],
-            inputs=[
-                articulation_count,
-                articulation_dof_start,
-                art_to_world,
-                group_to_art,
-                wp.array(np.arange(dof_count), dtype=wp.int32, device=device),
-                lower,
-                upper,
-                joint_q,
-                0.25,
-                max_constraints,
-                0.2,
-                1.0e-6,
-                wp.array(resolved.astype(np.int32), dtype=wp.int32, device=device),
-            ],
-            outputs=list(mixed),
-            block_dim=32 * warps_per_block,
-            device=device,
-        )
-        wp.synchronize_device(device)
+        resolved = np.arange(problem.articulation_count) % 3 == 0
+        mixed = _warp_rows(problem, resolved)
         for actual, original in zip(mixed, scalar, strict=True):
             expected = original.numpy()
             expected[resolved] = 0
