@@ -15,6 +15,7 @@ from newton._src.solvers.feather_pgs import keyed_rows as rows
 from newton._src.solvers.feather_pgs import solver_feather_pgs as source
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton.tests.feather_pgs_patch_parity import (
+    assert_contact_impulses_close,
     assert_history_close,
     assert_ring_coulomb,
     contact_rows,
@@ -161,8 +162,9 @@ class TestKeyedRowIntegration(unittest.TestCase):
 
         Both arms run the ring-pooled parallel law, so they agree up to float
         order: the same contacts, row types, ring links and divided coefficients,
-        states within the point twin's tolerance, pooled cones and anchor history.
-        Sorted contacts let the by-contact checks pair the arms' contacts.
+        impulses by contact, states within the point twin's tolerance, pooled cones
+        and anchor history. Sorted contacts let the by-contact checks pair the arms'
+        contacts.
         """
         for name, factory, free_count in (("tripod", None, 1), ("standing", standing_model, 0)):
             with self.subTest(fixture=name):
@@ -183,6 +185,7 @@ class TestKeyedRowIntegration(unittest.TestCase):
                     self.compare(ordinary, keyed)
                     expected, actual = contact_rows(ordinary[1], ordinary[-1]), contact_rows(keyed[1], keyed[-1])
                     self.assertEqual(sorted(actual), sorted(expected))
+                    assert_contact_impulses_close(expected, actual)
                     for c, record in expected.items():
                         np.testing.assert_array_equal(actual[c]["types"], record["types"])
                         np.testing.assert_array_equal(actual[c]["parents"], record["parents"])
