@@ -364,13 +364,18 @@ def _step_matrix_free(model, solver, *, steps, joint_qd=0.0, dt=1.0 / 240.0):
     states[0].joint_qd.fill_(joint_qd)
     control = model.control()
     packed, recording = _record_pack_launches(solver)
+    # The pendulum tips touch the ground intermittently, so the final step alone may carry no
+    # contact impulse; the per-step peak shows the solve exercised contact rows during the run.
+    impulse_peak = []
     with recording:
         for _ in range(steps):
             pipeline.collide(states[0], contacts)
             states[0].clear_forces()
             solver.step(states[0], states[1], control, contacts, dt)
             states.reverse()
+            impulse_peak.append(np.abs(solver.impulses.numpy()).max())
     values = {name: getattr(states[0], name).numpy() for name in ("joint_q", "joint_qd", "body_q", "body_qd")}
+    values["impulse_peak"] = np.array(impulse_peak)
     for name in ("impulses", "v_out", "mf_constraint_count", "mf_meta_packed"):
         values[name] = getattr(solver, name).numpy()
     values["contact_count"] = contacts.rigid_contact_count.numpy()
@@ -409,7 +414,7 @@ class TestFeatherPGSMFMetadataPackCUDA(unittest.TestCase):
                 for actual, rhs in zip(legacy_packs, expected, strict=True):
                     self.assertIs(actual, rhs)
                 self.assertTrue(np.all(skipped["contact_count"] > 0))
-                self.assertTrue(np.any(skipped["impulses"] != 0.0))
+                self.assertTrue(np.any(skipped["impulse_peak"] > 0.0))
                 np.testing.assert_array_equal(skipped["mf_constraint_count"], 0)
                 np.testing.assert_array_equal(skipped["mf_meta_packed"], 0)
                 for name, value in skipped.items():
