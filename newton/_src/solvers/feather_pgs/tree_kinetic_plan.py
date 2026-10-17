@@ -150,28 +150,26 @@ def make_plan(model, operator, *, complete=True):
         qd[joints] - qd[starts[group, None]] == qd[joints[0]] - qd[starts[group[0]]]
     ):
         raise ValueError("Cached trees require uniform coordinate indexing")
-    # Kinematic bodies: a prescribed group owns whole free bodies whose six
-    # coordinates are all kinematic; any other group must be fully dynamic.
-    # (A welded kinematic base of a fixed-root tree carries no coordinate.)
+    # Kinematic bodies. A prescribed group owns whole free bodies whose six
+    # coordinates are all kinematic, and a forest's zero family a kinematic
+    # free root; neither holds a factor. Held groups serve kinematic
+    # coordinate bodies as ordinary dynamics does, also after a runtime flag
+    # change: the kinematic armature enters the held factor, the live
+    # kinematic masks guard the free-root transport and the finish, and the
+    # predictor drops a kinematic body's external wrench.
     kinematic = model.body_flags.numpy()[child[joints]] & int(BodyFlags.KINEMATIC)
-    coordinate_bodies = counts > 0
     prescribed = bool(getattr(operator, "prescribed", False))
     if prescribed:
         if bodies != 1 or dofs != 6 or not np.all(kinematic[:, 0]):
             raise ValueError("Prescribed cached roots must be single kinematic free bodies")
     elif forest is not None:
-        # A forest may carry prescribed free roots (a zero family); every other
-        # coordinate body is dynamic.
         families = np.asarray(operator.root_families, np.int64)
         for r, root in enumerate(root_locals):
             if families[r] == 0 and not np.all(kinematic[:, root]):
                 raise ValueError("A zero-family forest root must be a kinematic free body")
+            # Construction places the forest's held families on dynamic roots only.
             if families[r] != 0 and np.any(kinematic[:, root]):
                 raise ValueError("A dynamic forest root must not be kinematic")
-        if np.any(kinematic[:, non_root] & coordinate_bodies[:, non_root]):
-            raise ValueError("Cached trees exclude kinematic bodies with coordinates")
-    elif np.any(kinematic & coordinate_bodies):
-        raise ValueError("Cached trees exclude kinematic bodies with coordinates")
     mass = _SparseMassMatrixPlan.build(parent, counts[0])
     if not np.array_equal(mass.lookup, operator.host["index"]) or not np.array_equal(
         mass.dof_joint, operator.host["dof_joint"]

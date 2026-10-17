@@ -13,6 +13,7 @@ changes ordinary dynamics rejects raise its error before anything changes.
 
 import os
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -20,7 +21,10 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
+from newton._src.solvers.feather_pgs.sparse_factor import operator_metadata
+from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseMassMatrixPlan
 from newton._src.solvers.feather_pgs.tree_kinetic_owner import TreeKineticState
+from newton._src.solvers.feather_pgs.tree_kinetic_plan import make_plan
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_split as sparse_split
 
@@ -384,6 +388,68 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                     self.assertEqual(after.keys(), before.keys())
                     for key, value in before.items():
                         np.testing.assert_array_equal(after[key], value, err_msg=key)
+
+
+INERTIA = wp.mat33(np.eye(3) * 0.01)
+
+
+def _replicated(scene, worlds=2):
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    builder.replicate(scene, worlds)
+    return builder.finalize(device="cpu")
+
+
+def _held_operator(model, arts, parents, counts, **attributes):
+    """A cached-tree operator over articulations ``arts`` that share one topology, for make_plan alone."""
+    mass = _SparseMassMatrixPlan.build(np.asarray(parents, np.int32), np.asarray(counts, np.int32))
+    plan = SimpleNamespace(
+        group_to_art=wp.array(np.asarray(arts, np.int32), dtype=int, device=model.device),
+        art_to_world=wp.array(model.articulation_world.numpy(), dtype=int, device=model.device),
+    )
+    return SimpleNamespace(plan=plan, host=operator_metadata(mass), **attributes)
+
+
+class TestTreePlanKinematicBodies(unittest.TestCase):
+    """make_plan's admission of kinematic bodies, on the host (no kernels)."""
+
+    def test_held_groups_admit_kinematic_coordinate_bodies(self):
+        """A kinematic free body and a chain with a kinematic root or link are admitted into held groups."""
+        scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        scene.add_body(mass=1.0, inertia=INERTIA, is_kinematic=True)
+        model = _replicated(scene)
+        layout, _, _ = make_plan(model, _held_operator(model, [0, 1], [-1], [6]))
+        self.assertEqual(layout.root_coordinates, (6,))
+        for link in (0, 2):
+            with self.subTest(link=link):
+                scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+                links = [scene.add_link(mass=1.0, inertia=INERTIA) for _ in range(3)]
+                joints = [scene.add_joint_free(links[0])]
+                joints += [scene.add_joint_revolute(links[i - 1], links[i], axis=newton.Axis.Y) for i in (1, 2)]
+                scene.add_articulation(joints)
+                model = _replicated(scene)
+                # Body flags are live data; a link may be made kinematic after finalize.
+                _set_flag(model, link, KINEMATIC)
+                layout, _, _ = make_plan(model, _held_operator(model, [0, 1], [-1, 0, 1], [6, 1, 1]))
+                self.assertEqual((layout.bodies, layout.dofs), (3, 8))
+
+    def test_factorless_roots_must_be_kinematic_free_bodies(self):
+        """A prescribed group and a forest's zero family still refuse a dynamic body."""
+        scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        scene.add_body(mass=1.0, inertia=INERTIA)
+        model = _replicated(scene)
+        with self.assertRaisesRegex(ValueError, "Prescribed cached roots must be single kinematic free bodies"):
+            make_plan(model, _held_operator(model, [0, 1], [-1], [6], prescribed=True))
+        scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        box = scene.add_body(mass=1.0, inertia=INERTIA, is_kinematic=True)
+        scene.add_body(mass=1.0, inertia=INERTIA)
+        model = _replicated(scene)
+        forest = {"forest_arts": np.array([[0, 1], [2, 3]]), "root_families": (0, 6)}
+        layout, _, _ = make_plan(model, _held_operator(model, [0, 2], [-1, -1], [6, 6], **forest), complete=False)
+        self.assertEqual(layout.root_families, (0, 6))
+        for world in range(2):
+            _set_flag(model, box + 2 * world, DYNAMIC)
+        with self.assertRaisesRegex(ValueError, "A zero-family forest root must be a kinematic free body"):
+            make_plan(model, _held_operator(model, [0, 2], [-1, -1], [6, 6], **forest), complete=False)
 
 
 if __name__ == "__main__":
