@@ -3,6 +3,7 @@
 
 """Preserve articulated velocity clamps in factor-coordinate response."""
 
+import itertools
 import os
 import unittest
 from types import SimpleNamespace
@@ -26,24 +27,32 @@ from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_contact_triplets as triplet_tests
 from newton.tests import test_feather_pgs_sparse_solver as sparse_tests
 from newton.tests import test_feather_pgs_sparse_split as split_tests
+from newton.tests.feather_pgs_patch_parity import (
+    assert_history_close,
+    assert_ring_coulomb,
+    assert_rows_close,
+    contact_rows,
+)
 from newton.tests.test_feather_pgs_sparse_pgs import _sweep
 from newton.tests.test_feather_pgs_sparse_research_admission import _eligible_solver, _TopologyReached
 
 
 class TestSparseVelocityLimitAdmission(unittest.TestCase):
     def test_auto_and_enabled_velocity_owner_reach_topology(self):
-        """Admit the unchanged augmented matrix-free recipe before planning its factor."""
-        solver = _eligible_solver()
-        solver.enable_joint_velocity_limits = True
+        """Admit the unchanged augmented matrix-free recipe under either friction law before planning its factor."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        for environment in ({}, {"FEATHER_PGS_SPARSE_VELOCITY_LIMITS": "1"}):
-            with (
-                self.subTest(environment=environment),
-                mock.patch.dict(os.environ, environment, clear=True),
-                self.assertRaises(_TopologyReached),
-            ):
-                SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-        self.assertEqual(solver.pgs_mode, "matrix_free")
+        for patches in (False, True):
+            solver = _eligible_solver()
+            solver.enable_joint_velocity_limits = True
+            solver._friction_anchors_enabled = patches
+            for environment in ({}, {"FEATHER_PGS_SPARSE_VELOCITY_LIMITS": "1"}):
+                with (
+                    self.subTest(patches=patches, environment=environment),
+                    mock.patch.dict(os.environ, environment, clear=True),
+                    self.assertRaises(_TopologyReached),
+                ):
+                    SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+            self.assertEqual(solver.pgs_mode, "matrix_free")
 
     def test_default_and_unsupported_recipes_keep_existing_owner(self):
         """Decline unsupported laws before removing ordinary response storage."""
@@ -52,7 +61,6 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
             ({}, "0"),
             ({"pgs_warmstart": True}, "1"),
             ({"_mf_warmstart_enabled": True}, "1"),
-            ({"_friction_anchors_enabled": True}, "1"),
             ({"_has_free_rigid_bodies": True}, "1"),
             ({"drive_mode": "physx_pgs"}, "1"),
             ({"articulated_contact_response": "propagation"}, "1"),
@@ -278,7 +286,7 @@ def _solve_data(sign, *, contact, iterations, omega):
     return data, physical, factor
 
 
-def _case(enabled, *, floating=True, branches=3, depth=1, activation_fraction=0.0):
+def _case(enabled, *, floating=True, branches=3, depth=1, activation_fraction=0.0, friction_anchor_beta=0.0):
     model = split_tests._model(floating=floating, branches=branches, depth=depth)
     limits = np.full(model.joint_dof_count, 0.25, np.float32)
     limits.reshape(2, -1)[:, -1] = np.inf
@@ -288,7 +296,7 @@ def _case(enabled, *, floating=True, branches=3, depth=1, activation_fraction=0.
             model,
             pgs_mode="matrix_free",
             drive_mode="augmented",
-            friction_anchor_beta=0.0,
+            friction_anchor_beta=friction_anchor_beta,
             enable_joint_limits=True,
             enable_joint_velocity_limits=True,
             velocity_limit_activation_fraction=activation_fraction,
@@ -321,6 +329,27 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
             for name in split_tests.STATE_FIELDS:
                 self.assertTrue(np.isfinite(getattr(case[2], name).numpy()).all(), name)
         np.testing.assert_array_equal(candidate[1]._sparse_mass_matrix_status.numpy(), 0)
+        if candidate[1]._friction_anchors_enabled:
+            # Called unbound so that suites reusing this check (mimic rows) inherit it.
+            TestSparseVelocityLimitPhysics._assert_patch(self, reference, candidate)
+
+    def _assert_patch(self, reference, candidate):
+        """Match patch rows and contact impulses, the pooled Coulomb bound and the anchor lifecycle."""
+        self.assertTrue(reference[1]._friction_anchors_enabled)
+        assert_rows_close(contact_rows(reference[1], reference[-1]), contact_rows(candidate[1], candidate[-1]))
+        for world, row_count in enumerate(reference[1].constraint_count.numpy()):
+            count = int(row_count)
+            kinds = reference[1].row_type.numpy()[world, :count]
+            contact = (kinds == CONTACT) | (kinds == FRICTION)
+            np.testing.assert_allclose(
+                candidate[1].impulses.numpy()[world, :count][contact],
+                reference[1].impulses.numpy()[world, :count][contact],
+                atol=2e-5,
+                rtol=7e-4,
+            )
+        for case in (reference, candidate):
+            assert_ring_coulomb(case[1])
+        assert_history_close(reference[1], candidate[1])
 
     def _assert_rows(self, reference, candidate):
         """Compare signed physical response, final residual and live speed-limit targets."""
@@ -381,10 +410,13 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
                     np.testing.assert_array_equal(delta[1], 0.0)
 
     def test_serial_and_branched_dense_reference(self):
-        """Keep signed clamps, contacts and momentum response on independent tree shapes."""
-        for shape in ({"floating": False, "branches": 1, "depth": 3}, {"floating": True, "branches": 3, "depth": 1}):
-            with self.subTest(shape=shape):
-                reference, candidate = _case(False, **shape), _case(True, **shape)
+        """Keep signed clamps, contacts and momentum response on independent tree shapes under either friction law."""
+        for beta, shape in itertools.product(
+            (0.0, 0.2), ({"floating": False, "branches": 1, "depth": 3}, {"floating": True, "branches": 3, "depth": 1})
+        ):
+            with self.subTest(friction_anchor_beta=beta, shape=shape):
+                reference = _case(False, friction_anchor_beta=beta, **shape)
+                candidate = _case(True, friction_anchor_beta=beta, **shape)
                 self.assertFalse(reference[1]._sparse_velocity_limits)
                 self.assertTrue(candidate[1]._sparse_velocity_limits)
                 self.assertEqual(candidate[1].pgs_mode, "matrix_free")
@@ -401,7 +433,15 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
 
     def test_held_factor_reset_and_limit_mutation_graph(self):
         """Retain factor cadence while finite, unlimited and disabled speed rows regrow."""
-        reference, candidate = _case(False), _case(True)
+        self._check_held_factor_graph(0.0)
+
+    def test_patch_held_factor_reset_and_limit_mutation_graph(self):
+        """Retain the factor cadence and the patch anchor lifecycle through resets and captured limit changes."""
+        self._check_held_factor_graph(0.2)
+
+    def _check_held_factor_graph(self, friction_anchor_beta):
+        reference = _case(False, friction_anchor_beta=friction_anchor_beta)
+        candidate = _case(True, friction_anchor_beta=friction_anchor_beta)
         self.assertTrue(candidate[1]._sparse_velocity_limits)
         for case in (reference, candidate):
             split_tests._step(case)

@@ -1119,8 +1119,8 @@ class SolverFeatherPGS(SolverBase):
     including serial chains and same-articulation mimic couplings. It preserves
     ordered PGS sweeps and the final, stateless speed-limit projection in each
     sweep. It requires augmented drives and current friction; warm starts,
-    friction anchors, independent free bodies, prescribed motion and loop-closure
-    constraints retain the existing representation. Selection also follows the
+    independent free bodies, prescribed motion and loop-closure constraints
+    retain the existing representation. Selection also follows the
     topology and resource limits above. Compatible split sweeps and grouped
     dynamics also compose with automatic sparse factors. Set
     ``sparse_mass_matrix="off"`` to retain ordinary factors. Legacy
@@ -5073,7 +5073,6 @@ class SolverFeatherPGS(SolverBase):
             and self.enable_joint_velocity_limits
             and (sparse_choice == "on" or os.environ.get("FEATHER_PGS_SPARSE_VELOCITY_LIMITS", "1") == "1")
             and not self._has_free_rigid_bodies
-            and not self._friction_anchors_enabled
             and self._kernel_overrides.get("sparse_prepare_contacts", True)
         )
         for supported, reason in (
@@ -10235,7 +10234,6 @@ class SolverFeatherPGS(SolverBase):
             or self._contact_torsion_enabled
             or self.contact_compliance
             or (self._sparse_split and self.pgs_kernel != "tiled_row")
-            or (self._sparse_velocity_limits and self._friction_anchors_enabled)
         ):
             raise RuntimeError("Reconstruct the solver after changing options incompatible with sparse mass factors")
         if self._contact_torsion_enabled:

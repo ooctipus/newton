@@ -3,6 +3,7 @@
 
 """Preserve bilateral mimic rows with factor-coordinate velocity limits."""
 
+import itertools
 import os
 import unittest
 from types import SimpleNamespace
@@ -186,7 +187,7 @@ def _model(offset, scale, error, device="cuda:0"):
     return builder.finalize(device=device)
 
 
-def _case(enabled, offset=0.025, scale=-0.5, error=-0.015):
+def _case(enabled, offset=0.025, scale=-0.5, error=-0.015, *, friction_anchor_beta=0.0):
     model = _model(offset, scale, error)
     model.joint_velocity_limit.assign(np.tile([0.4, 0.25, 0.2], 2).astype(np.float32))
     with mock.patch.dict(os.environ, {"FEATHER_PGS_SPARSE_VELOCITY_LIMITS": str(int(enabled))}):
@@ -194,7 +195,7 @@ def _case(enabled, offset=0.025, scale=-0.5, error=-0.015):
             model,
             pgs_mode="matrix_free",
             drive_mode="augmented",
-            friction_anchor_beta=0.0,
+            friction_anchor_beta=friction_anchor_beta,
             enable_joint_limits=True,
             enable_joint_velocity_limits=True,
             pgs_iterations=8,
@@ -228,10 +229,11 @@ class TestSparseVelocityMimicPhysics(unittest.TestCase):
         velocity_tests.TestSparseVelocityLimitPhysics._assert_rows(self, reference, candidate)
 
     def test_loaded_mimic_velocity_contact_matches_dense(self):
-        """Preserve bilateral response and speed clamps for either mimic error sign."""
-        for offset, scale, error in ((0.025, -0.5, -0.015), (-0.03, 1.5, 0.015)):
-            with self.subTest(offset=offset, scale=scale, error=error):
-                reference, candidate = _case(False, offset, scale, error), _case(True, offset, scale, error)
+        """Preserve bilateral response and speed clamps for either mimic error sign and friction law."""
+        for beta, (offset, scale, error) in itertools.product((0.0, 0.2), ((0.025, -0.5, -0.015), (-0.03, 1.5, 0.015))):
+            with self.subTest(friction_anchor_beta=beta, offset=offset, scale=scale, error=error):
+                reference = _case(False, offset, scale, error, friction_anchor_beta=beta)
+                candidate = _case(True, offset, scale, error, friction_anchor_beta=beta)
                 self.assertTrue(candidate[1]._sparse_velocity_limits)
                 self.assertFalse(candidate[1]._sparse_row_support.enabled)
                 self.assertEqual(candidate[1]._mimic_count, 2)
@@ -251,7 +253,15 @@ class TestSparseVelocityMimicPhysics(unittest.TestCase):
 
     def test_live_coefficients_enabled_graph_and_held_reset(self):
         """Read current mimic coefficients and enabled state without stale captured rows."""
-        reference, candidate = _case(False), _case(True)
+        self._check_live_coefficients(0.0)
+
+    def test_patch_live_coefficients_enabled_graph_and_held_reset(self):
+        """Keep mimic coefficient updates, held resets and the patch anchor lifecycle through graph replay."""
+        self._check_live_coefficients(0.2)
+
+    def _check_live_coefficients(self, friction_anchor_beta):
+        reference = _case(False, friction_anchor_beta=friction_anchor_beta)
+        candidate = _case(True, friction_anchor_beta=friction_anchor_beta)
         self.assertTrue(candidate[1]._sparse_velocity_limits)
         for case in (reference, candidate):
             split_tests._step(case)

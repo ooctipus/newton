@@ -490,7 +490,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     self.assertEqual(solver.get_path_selection()["sparse_mass_matrix"], "on")
                     disabled = _make_solver(model, True, sparse_mass_matrix="off", friction_anchor_beta=0.0, **options)
                     self.assertEqual(disabled.get_path_selection()["sparse_mass_matrix"], "off")
-            for options in ({"pgs_mode": "split"},):
+            for options in ({"pgs_mode": "split"}, {"enable_joint_velocity_limits": True}):
                 with self.subTest(patch=options):
                     # Default patch friction composes with the same sparse factors and tree cache.
                     selected = _make_solver(model, True, **options).get_path_selection()

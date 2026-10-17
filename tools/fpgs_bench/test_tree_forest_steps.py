@@ -43,7 +43,6 @@ def make_case(enabled, *, permuted=False, motion=False):
             dense_max_constraints=96,
             mf_max_constraints=64,
             enable_joint_velocity_limits=motion,
-            **({"friction_anchor_beta": 0.0} if motion else {}),
         )
     state, output, control = model.state(), model.state(), model.control()
     control.joint_f.assign(np.random.default_rng(517).normal(0.0, 0.04, model.joint_dof_count).astype(np.float32))
