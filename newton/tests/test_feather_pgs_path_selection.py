@@ -243,6 +243,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(routes["friction"]["law"], "patch")
         self.assertEqual(routes["friction"]["anchor_beta_source"], "default")
         self.assertIn("need point friction", routes["friction"]["reason"])
+        # The compact contact boundary writes the patch row law as well.
+        self.assertNotIn("compact contacts", routes["friction"]["reason"])
         self.assertIsNone(routes["sparse_mass_matrix"]["size"])
         self.assertFalse(routes["sparse_mass_matrix"]["active_rows"])
         self.assertIn("CPU", routes["sparse_mass_matrix"]["reason"])
