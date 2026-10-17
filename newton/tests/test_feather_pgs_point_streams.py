@@ -5,11 +5,13 @@
 
 Warp's per-kernel content hash covers the kernel source, every ``@wp.func`` it
 calls (``func_native`` snippets included), struct layouts and ``wp.static``
-values. It does not depend on line numbers or on other kernels of the same
-module, and it is computed on the host without compiling anything. Changes that
-admit persistent patch friction (``friction_anchor_beta > 0``) on a route must
-leave these pins unchanged: point friction keeps its kernels, and patch work
-lands as new variants.
+values. A function passed by name to a builtin, such as the operator of
+``wp.tile_map``, is compiled but not hashed, so kernels pass such functions
+through ``wp.static``. The hash does not depend on line numbers or on other
+kernels of the same module, and it is computed on the host without compiling
+anything. Changes that admit persistent patch friction
+(``friction_anchor_beta > 0``) on a route must leave these pins unchanged: point
+friction keeps its kernels, and patch work lands as new variants.
 
 Run ``python -m newton.tests.test_feather_pgs_point_streams --record`` to add
 pins for new kernels. Recording refreshes patch-only pins but refuses to change
@@ -17,6 +19,7 @@ a point pin, unless the pins were taken with another Warp version.
 """
 
 import argparse
+import ast
 import importlib
 import itertools
 import json
@@ -224,9 +227,50 @@ def _kernel_hash(kernel):
     return kernel.hash.hex()
 
 
-def collect():
-    """Return ``{pin name: content hash}`` for the module-level and factory-built kernels."""
-    kernels = {**_module_kernels(), **_factory_kernels()}
+def _unhashed_functions(kernel):
+    """Return the user functions that a kernel, or a function it hashes, passes to a call unhashed.
+
+    The hash follows called functions and ``wp.static`` values, not a function
+    passed by name as an argument (the operator of ``wp.tile_map``). Editing such
+    a function would change neither a pin nor the kernel cache key. Run after
+    :func:`_kernel_hash`, which resolves deferred ``wp.static`` values.
+    """
+    from warp._src.context import Function  # noqa: PLC0415
+
+    missing, visited, pending = set(), set(), [kernel.adj]
+    while pending:
+        adj = pending.pop()
+        if id(adj) in visited:
+            continue
+        visited.add(id(adj))
+        _, _, functions = adj.get_references()
+        statics = itertools.chain(
+            adj.resolved_static_expressions.values(), (v for _, v in adj.deferred_static_expressions)
+        )
+        hashed = set(functions) | {value for value in statics if isinstance(value, Function)}
+        for node in adj.reference_nodes():
+            if not isinstance(node, ast.Call):
+                continue
+            for argument in (*node.args, *(keyword.value for keyword in node.keywords)):
+                if isinstance(argument, (ast.Name, ast.Attribute)):
+                    value, _ = adj.resolve_static_expression(argument, eval_types=False)
+                    if isinstance(value, Function) and not value.is_builtin() and value not in hashed:
+                        missing.add(value.key)
+        for function in hashed:
+            if not function.is_builtin():
+                overloads = {**function.user_overloads, **function.user_templates}.values()
+                pending.extend(overload.adj for overload in overloads if overload.generic_parent is None)
+    return sorted(missing)
+
+
+def _inventory():
+    """Return ``{pin name: kernel}`` for the module-level and factory-built kernels."""
+    return {**_module_kernels(), **_factory_kernels()}
+
+
+def collect(kernels=None):
+    """Return ``{pin name: content hash}`` for ``kernels``, by default the whole inventory."""
+    kernels = _inventory() if kernels is None else kernels
     return {name: _kernel_hash(kernel) for name, kernel in sorted(kernels.items())}
 
 
@@ -253,9 +297,10 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.stored = _stored()
-        cls.current = None
+        cls.kernels = cls.current = None
         if cls.stored["warp"] == wp.config.version and not _environment_switches():
-            cls.current = collect()
+            cls.kernels = _inventory()
+            cls.current = collect(cls.kernels)
 
     def setUp(self):
         if self.stored["warp"] != wp.config.version:
@@ -282,6 +327,15 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
     def test_patch_only_kernels_exist(self):
         """List only kernels that still exist as patch-only."""
         self.assertTrue(_PATCH_ONLY <= set(self.current), sorted(_PATCH_ONLY - set(self.current)))
+
+    def test_hashes_cover_function_arguments(self):
+        """Hash every function a kernel passes to a builtin, so pins and the kernel cache follow its edits."""
+        unhashed = {name: _unhashed_functions(kernel) for name, kernel in self.kernels.items()}
+        self.assertEqual(
+            {name: functions for name, functions in unhashed.items() if functions},
+            {},
+            "Pass these functions through wp.static() so that Warp hashes them",
+        )
 
     def test_inventory_covers_the_varied_factories(self):
         """Reach every factory and variant family that patch integration extends."""

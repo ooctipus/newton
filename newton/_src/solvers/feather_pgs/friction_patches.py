@@ -362,10 +362,12 @@ def _sort_chunks(
         first = wp.tile_full(_SORT_CHUNK, start, dtype=int)
         count = wp.tile_full(_SORT_CHUNK, live, dtype=int)
         order = wp.tile_zeros(shape=_SORT_CHUNK, dtype=wp.int64, storage="shared")
-        wp.tile_assign(order, wp.tile_map(_chunk_key, loaded, local, first, count))
+        # Warp hashes a function passed to a builtin only through wp.static();
+        # otherwise edits to the key maps would reuse a stale cached kernel.
+        wp.tile_assign(order, wp.tile_map(wp.static(_chunk_key), loaded, local, first, count))
         values = wp.tile_load(indices, shape=_SORT_CHUNK, offset=start, storage="shared")
         wp.tile_sort(order, values)
-        wp.tile_store(keys, wp.tile_map(_chunk_pair_key, order), offset=output + start)
+        wp.tile_store(keys, wp.tile_map(wp.static(_chunk_pair_key), order), offset=output + start)
         wp.tile_store(indices, values, offset=output + start)
 
 
