@@ -331,7 +331,12 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         """Make prediction and solved-velocity conversion match root integration."""
         device = wp.get_device()
         model = _build_slider(device)
-        solver = SolverFeatherPGS(model, angular_damping=0.0)
+        # These are the ordinary split route's stage conversions. On CUDA the held-tree owner admits
+        # this free-rooted body under either friction law and converts, transports and integrates in
+        # its finish kernel instead (_stage6_update_qdd then returns early);
+        # test_frictionless_slide_is_spin_invariant covers that route end to end.
+        solver = SolverFeatherPGS(model, angular_damping=0.0, cached_dynamics="off")
+        self.assertIsNone(solver.get_path_selection()["cached_prediction"])
         self.assertEqual(solver._free_root_joint_count, 1)
         state_in, state_out = model.state(), model.state()
         state_aug = solver._prepare_augmented_state(state_in, state_out, model.control())
