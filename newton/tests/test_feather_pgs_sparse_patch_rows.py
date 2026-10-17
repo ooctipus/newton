@@ -126,7 +126,10 @@ class TestFeatherPGSSparsePatchRows(unittest.TestCase):
 
 
 def _rollout(solver, model, *, steps, slide_world=None, speed=0.0):
-    """Step a standing fixture through the collision pipeline; return per-step anchors, contacts and states."""
+    """Step a standing fixture through the collision pipeline.
+
+    Returns per-step anchor counts, contact counts and (body_q, body_qd, row impulses).
+    """
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
     contacts, control = pipeline.contacts(), model.control()
     state, output = model.state(), model.state()
@@ -147,7 +150,7 @@ def _rollout(solver, model, *, steps, slide_world=None, speed=0.0):
         worlds = patches.previous_world.numpy()[:stored]
         anchors.append(np.bincount(worlds[valid], minlength=model.world_count))
         contact_counts.append(int(contacts.rigid_contact_count.numpy()[0]))
-        states.append((state.body_q.numpy().copy(), state.body_qd.numpy().copy()))
+        states.append((state.body_q.numpy().copy(), state.body_qd.numpy().copy(), solver.impulses.numpy().copy()))
     return np.array(anchors), np.array(contact_counts), states
 
 
@@ -220,9 +223,37 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
         runs = {name: _rollout(solver, model, steps=24) for name, solver in solvers.items()}
         np.testing.assert_array_equal(runs["on"][0], runs["off"][0])
         self.assertGreater(runs["on"][1].min(), 0)
-        for (q_on, qd_on), (q_off, qd_off) in zip(runs["on"][2], runs["off"][2], strict=True):
-            np.testing.assert_array_equal(q_on, q_off)
-            np.testing.assert_array_equal(qd_on, qd_off)
+        for on, off in zip(runs["on"][2], runs["off"][2], strict=True):
+            for value_on, value_off in zip(on, off, strict=True):
+                np.testing.assert_array_equal(value_on, value_off)
+
+    def test_switched_off_patch_sweep_with_fused_triplets_is_bitwise(self):
+        """Step the switched-off full patch sweep bitwise whether or not it fuses anchor triplets.
+
+        With ``FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1``, the suite recipe,
+        ``FEATHER_PGS_PATCH_ACTIVE_ROWS=0`` keeps the full ordered sweep but fuses its
+        anchor units; the previous kernel needs the triplet flag off as well. A resting
+        and a sliding biped world must step identically either way.
+        """
+        model = standing_model("cuda:0", worlds=2)
+        options = {"dense_max_constraints": 96, "pgs_iterations": 8, "enable_joint_limits": False}
+        solvers = {}
+        for triplets in ("1", "0"):
+            environment = {"FEATHER_PGS_PATCH_ACTIVE_ROWS": "0", "FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": triplets}
+            with mock.patch.dict(os.environ, environment):
+                solvers[triplets] = _make_solver(model, True, **options)
+        self.assertTrue(
+            solvers["1"]._pgs_solve_sparse_kernel.key.endswith("_0_0_support_table_contact_triplets_linked")
+        )
+        self.assertTrue(solvers["0"]._pgs_solve_sparse_kernel.key.endswith("_0_0_support_table"))
+        self.assertFalse(solvers["1"]._sparse_active_rows)
+        runs = {name: _rollout(solver, model, steps=120, slide_world=1, speed=0.6) for name, solver in solvers.items()}
+        np.testing.assert_array_equal(runs["1"][0], runs["0"][0])
+        np.testing.assert_array_equal(runs["1"][1], runs["0"][1])
+        self.assertLess(runs["0"][0][5:30, 1].mean(), 4.0, "The sliding world must release anchors")
+        for fused, ordinary in zip(runs["1"][2], runs["0"][2], strict=True):
+            for value_fused, value_ordinary in zip(fused, ordinary, strict=True):
+                np.testing.assert_array_equal(value_fused, value_ordinary)
 
     def test_patch_history_follows_the_full_sweep(self):
         """Keep the anchor-count trajectory of a resting and a sliding world near the full patch sweep's.

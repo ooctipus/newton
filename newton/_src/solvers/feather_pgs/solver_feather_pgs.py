@@ -1118,7 +1118,10 @@ class SolverFeatherPGS(SolverBase):
     patch friction a friction pair is visited while any normal of its patch
     ring is selected or the pair holds impulse, and small worlds keep their
     packed full sweep; set ``FEATHER_PGS_PATCH_ACTIVE_ROWS=0`` before
-    construction to keep patch friction on the full ordered sweep.
+    construction to keep patch friction on the full ordered sweep. With
+    ``FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1`` that sweep still fuses anchor
+    triplets, bitwise equal to its ordinary updates; the previous sweep kernel
+    needs both flags off.
 
     Automatic sparse selection includes factor-coordinate velocity-limit
     responses for compatible ``matrix_free`` CUDA models,

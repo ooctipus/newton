@@ -347,7 +347,9 @@ FLAGS = declare(
         "FEATHER_PGS_PATCH_ACTIVE_ROWS",
         "policy",
         _SOLVER,
-        "=0 keeps patch friction on the full ordered sparse sweep instead of the active-row scan (default on).",
+        "=0 keeps patch friction on the full ordered sparse sweep instead of the active-row scan (default on); "
+        "with FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1 that sweep fuses anchor triplets, so the previous kernel "
+        "needs both off.",
     ),
     _flag(
         "FEATHER_PGS_PATCH_PARALLEL_ROWS",
