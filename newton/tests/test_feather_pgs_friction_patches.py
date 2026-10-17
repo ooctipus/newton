@@ -1147,19 +1147,24 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "The fused world-dynamics kernel is a CUDA path")
     def test_lazy_publication_precedes_the_release_test(self):
-        """Step lazy and ordinary publication bit for bit while twisted anchors saturate and slip.
+        """Publish the integrated body state before the anchor release test reads it, eager and lazy alike.
 
-        The ordinary arm runs twice. Contacts are sorted, but FPGS reserves
-        contact rows with per-world atomics, so a rollout need not reproduce
-        itself bit for bit: the bitwise claim is checked while the two ordinary
-        arms agree bit for bit (A/A). Should they ever differ, the lazy arm's
-        states and carried friction impulses must instead stay within the
-        float-order tolerances plus that A/A spread; a stale publication moves
-        contacts and anchor releases far beyond both.
+        The release test (``_finish_and_store``) reads ``state_out``'s body poses
+        and twists. With lazy kinematics the fused world-dynamics kernel defers
+        that publication to the next substep, so patch friction forces it first.
+        In each arm, the release test's inputs, captured as it launches, and the
+        published state must equal forward kinematics of the integrated joint
+        state while twisted boxes slip and release their anchors. Two arms do
+        not reproduce each other bit for bit on CUDA (per-world atomic row
+        reservations order the Gauss-Seidel rows), so no arm is compared with
+        another. Basis: on CPU, where the integrated state is published
+        directly, the captured inputs equal forward kinematics exactly; one
+        float32 ulp at 4 m is 4.8e-7; a stale publication misses by at least
+        1.95e-3 m and 4.8e-2 in twist.
         """
+        from newton._src.solvers.feather_pgs import friction_patches  # noqa: PLC0415
         from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module  # noqa: PLC0415
         from newton.tests.test_feather_pgs_mixed_tree_free_body import DT, _build  # noqa: PLC0415
-        from newton.tests.test_feather_pgs_subtree_reduce import _assert_switch_within, _excess  # noqa: PLC0415
 
         model = _build(wp.get_device("cuda:0"), quadruped=True)
         types, children = model.joint_type.numpy(), model.joint_child.numpy()
@@ -1173,86 +1178,92 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         self.assertEqual(len(boxes), model.world_count)
         joint_q = model.joint_q.numpy()
         joint_q[q_start[boxes] + 2] = 0.049
+        # The boxes' patches hold up to about 0.7 N*m; 1.0 N*m spins them past 1 rad/s within two steps.
         torque = np.zeros((model.body_count, 6), dtype=np.float32)
-        torque[children[boxes], 5] = 0.5
-        arms = []
-        # The ordinary arm, the same arm again (A/A control) and the lazy arm.
-        for lazy in (False, False, True):
-            # The reference takes the separate publication launches that the lazy arm forces.
-            with mock.patch.object(solver_module, "_FUSED_PUBLISH", False):
-                solver = newton.solvers.SolverFeatherPGS(
-                    model,
-                    pgs_mode="matrix_free",
-                    pgs_iterations=8,
-                    enable_joint_limits=True,
-                    update_mass_matrix_interval=2,
-                    dense_max_constraints=256,
-                    grouped_dynamics=True,
-                    lazy_kinematics=lazy,
-                    cached_dynamics="off",
-                    sparse_mass_matrix="off",
-                    friction_anchor_beta=0.2,
-                )
-            self.assertTrue(solver._fused_k1)
-            self.assertFalse(solver._fused_publication_admitted())
-            selected = solver.get_path_selection()
-            self.assertEqual(selected["publication"], "ordinary")
-            self.assertTrue(selected["routes"]["dynamics"]["fused_world_dynamics"])
-            # Patch friction publishes every substep, so a lazy request applies nothing.
-            lazy_option = selected["options"]["lazy_kinematics"]
-            self.assertEqual((lazy_option["requested"], lazy_option["applied"]), (lazy, False))
-            # Sorted contacts: the narrow phase's output order no longer depends on thread scheduling.
-            pipeline = newton.CollisionPipeline(model, deterministic=True)
-            states = [model.state(), model.state()]
-            states[0].joint_q.assign(joint_q)
-            newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
-            arms.append((solver, pipeline, pipeline.contacts(), states, model.control()))
-        # (absolute, relative) float-order tolerances: the sparse-solver state contract and the
-        # patch-parity impulse contract.
-        tolerances = {
-            "joint_q": (2.0e-4, 2.0e-4),
-            "joint_qd": (2.0e-3, 2.0e-4),
-            "body_q": (2.0e-4, 2.0e-4),
-            "body_qd": (2.0e-3, 2.0e-4),
-            "previous.tangent_impulse": (2.0e-5, 7.0e-4),
-        }
-        reproducible, carried = True, False
-        for step in range(16):
-            for solver, pipeline, contacts, states, control in arms:
-                pipeline.collide(states[0], contacts)
-                states[0].body_f.assign(torque)
-                solver.step(states[0], states[1], control, contacts, DT)
-                states.reverse()
-            values = {
-                name: [getattr(arm[3][0], name).numpy() for arm in arms]
-                for name in ("joint_q", "joint_qd", "body_q", "body_qd")
-            }
-            histories = [arm[0]._friction_patches.previous for arm in arms]
-            for name in ("valid", "tangent_impulse"):
-                values[f"previous.{name}"] = [getattr(history, name).numpy() for history in histories]
-            reproducible = reproducible and all(np.array_equal(first, again) for first, again, _ in values.values())
-            for label, (first, again, deferred) in values.items():
-                if reproducible:
-                    np.testing.assert_array_equal(deferred, first, err_msg=f"{label} at step {step}")
-                elif label in tolerances:
-                    atol, rtol = tolerances[label]
-                    _assert_switch_within(
-                        self,
-                        f"{label} at step {step}",
-                        _excess(deferred, first, rtol),
-                        _excess(again, first, rtol),
-                        atol,
+        torque[children[boxes], 5] = 1.0
+        box_bodies = {int(body) for body in children[boxes]}
+        shape_body = model.shape_body.numpy()
+        launch = wp.launch  # solver_module.wp is the warp module: keep the original before patching it
+        released = []
+
+        def release_inputs(kernel, *args, **kwargs):
+            """Copy the poses and twists the release test reads, before it runs."""
+            if kernel is friction_patches._finish_and_store and kwargs["inputs"][2] is not None:
+                released.append((kwargs["inputs"][2].numpy().copy(), kwargs["inputs"][3].numpy().copy()))
+            return launch(kernel, *args, **kwargs)
+
+        for lazy in (False, True):
+            with self.subTest(lazy_kinematics=lazy):
+                # The ordinary arm takes the separate publication launches that the lazy arm forces.
+                with mock.patch.object(solver_module, "_FUSED_PUBLISH", False):
+                    solver = newton.solvers.SolverFeatherPGS(
+                        model,
+                        pgs_mode="matrix_free",
+                        pgs_iterations=8,
+                        enable_joint_limits=True,
+                        update_mass_matrix_interval=2,
+                        dense_max_constraints=256,
+                        grouped_dynamics=True,
+                        lazy_kinematics=lazy,
+                        cached_dynamics="off",
+                        sparse_mass_matrix="off",
+                        friction_anchor_beta=0.2,
                     )
-            carried |= bool(histories[0].valid.numpy().any())
-        self.assertTrue(carried, "Anchors must carry history before they slip")
-        spin = arms[0][3][0].body_qd.numpy()[children[boxes], 5]
-        self.assertTrue(np.all(np.abs(spin) > 1.0), "Every twisted box must slip")
-        # Publishing again on request reproduces the already published state.
-        solver, _, _, states, _ = arms[2]
-        published = [states[0].body_q.numpy().copy(), states[0].body_qd.numpy().copy()]
-        solver.publish_kinematics(states[0])
-        np.testing.assert_array_equal(states[0].body_q.numpy(), published[0])
-        np.testing.assert_array_equal(states[0].body_qd.numpy(), published[1])
+                self.assertTrue(solver._fused_k1)
+                self.assertFalse(solver._fused_publication_admitted())
+                selected = solver.get_path_selection()
+                self.assertEqual(selected["publication"], "ordinary")
+                self.assertTrue(selected["routes"]["dynamics"]["fused_world_dynamics"])
+                # Patch friction publishes every substep, so a lazy request applies nothing.
+                lazy_option = selected["options"]["lazy_kinematics"]
+                self.assertEqual((lazy_option["requested"], lazy_option["applied"]), (lazy, False))
+                # Sorted contacts: the narrow phase's output order no longer depends on thread scheduling.
+                pipeline = newton.CollisionPipeline(model, deterministic=True)
+                contacts, control = pipeline.contacts(), model.control()
+                states, kinematics = [model.state(), model.state()], model.state()
+                states[0].joint_q.assign(joint_q)
+                newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+                carried = False
+                for step in range(16):
+                    pipeline.collide(states[0], contacts)
+                    states[0].body_f.assign(torque)
+                    released.clear()
+                    with mock.patch.object(solver_module.wp, "launch", release_inputs):
+                        solver.step(states[0], states[1], control, contacts, DT)
+                    states.reverse()
+                    self.assertTrue(released, f"The release test must run at step {step}")
+                    newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, kinematics)
+                    published = (states[0].body_q.numpy(), states[0].body_qd.numpy())
+                    checked = [*(("release input", inputs) for inputs in released), ("published state", published)]
+                    for label, (body_q, body_qd) in checked:
+                        np.testing.assert_allclose(
+                            body_q,
+                            kinematics.body_q.numpy(),
+                            rtol=0.0,
+                            atol=2e-5,
+                            err_msg=f"{label} body_q, step {step}",
+                        )
+                        np.testing.assert_allclose(
+                            body_qd,
+                            kinematics.body_qd.numpy(),
+                            rtol=0.0,
+                            atol=1e-4,
+                            err_msg=f"{label} body_qd, step {step}",
+                        )
+                    carried |= bool(solver._friction_patches.previous.valid.numpy().any())
+                self.assertTrue(carried, "Anchors must carry history before they slip")
+                spin = states[0].body_qd.numpy()[children[boxes], 5]
+                self.assertTrue(np.all(np.abs(spin) > 1.0), "Every twisted box must slip")
+                # Slipping boxes release their anchors at the release test.
+                count = int(contacts.rigid_contact_count.numpy()[0])
+                shapes = (contacts.rigid_contact_shape0.numpy()[:count], contacts.rigid_contact_shape1.numpy()[:count])
+                box_contacts = [c for c in range(count) if {int(shape_body[s[c]]) for s in shapes} & box_bodies]
+                self.assertTrue(box_contacts)
+                np.testing.assert_array_equal(solver._friction_patches.previous.valid.numpy()[box_contacts], 0)
+                # Publishing again on request reproduces the already published state.
+                solver.publish_kinematics(states[0])
+                np.testing.assert_array_equal(states[0].body_q.numpy(), published[0])
+                np.testing.assert_array_equal(states[0].body_qd.numpy(), published[1])
 
     def test_pooled_coulomb_budget(self):
         """Share the loaded middle normal's budget across two unloaded anchor normals."""
