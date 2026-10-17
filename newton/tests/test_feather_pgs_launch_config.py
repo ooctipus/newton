@@ -3,6 +3,7 @@
 
 import ast
 import inspect
+import os
 import textwrap
 import unittest
 from unittest import mock
@@ -12,6 +13,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import kernels as feather_pgs_kernels
+from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _DENSE_META_MAX_PARENT,
     _DENSE_META_ROW_TYPE_MASK,
@@ -223,7 +225,12 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 self.assertEqual(parameters[name].kind, inspect.Parameter.KEYWORD_ONLY)
 
     def test_point_row_builders_preserve_main_contact_defaults(self):
-        """Admit legacy row switches only for explicit point friction, including debug dispatch."""
+        """Admit legacy row switches for explicit point friction, including debug dispatch.
+
+        Patch friction takes the masked builder's patch-law variant by policy
+        (FEATHER_PGS_PATCH_DENSE_PATHS), never the point-only native rows, row
+        checks or Jacobian-clear skip.
+        """
         model = _build_chain_model(num_links=12, num_worlds=1)
         source = textwrap.dedent(inspect.getsource(SolverFeatherPGS._stage4_build_rows))
         assignments = {
@@ -232,7 +239,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             if isinstance(node, ast.Assign)
             and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id in ("masked_sizes", "masked", "check_rows")
+            and node.targets[0].id in ("masked_law", "masked_sizes", "masked", "check_rows")
         }
         step = ast.parse(textwrap.dedent(inspect.getsource(SolverFeatherPGS.step)))
         skip_clear = next(
@@ -240,25 +247,34 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             for node in ast.walk(step)
             if isinstance(node, ast.If) and "_SKIP_J_CLEAR" in ast.unparse(node.test)
         )
-        for beta, allowed in ((None, False), (0.0, True)):
-            solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
-            self.assertEqual(solver._point_contact_paths, allowed)
+        for beta, environment, point, patch_masked in (
+            (None, {}, False, True),
+            (None, {"FEATHER_PGS_PATCH_DENSE_PATHS": "0"}, False, False),
+            (0.0, {}, True, False),
+        ):
+            with mock.patch.dict(os.environ, environment):
+                solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
+            self.assertEqual(solver._point_contact_paths, point)
             for switch in ("_ROWS_MASKED", "_ROWS_NATIVE", "_CHECK_ROWS"):
-                with self.subTest(beta=beta, switch=switch):
+                with self.subTest(beta=beta, environment=environment, switch=switch):
                     values = dict.fromkeys(("_ROWS_MASKED", "_ROWS_NATIVE", "_CHECK_ROWS"), False)
                     values.update(self=solver, size=12, _SKIP_J_CLEAR=True)
                     values[switch] = True
-                    # Execute the actual dispatch expressions without CUDA row launches.
+                    # Execute the actual dispatch expressions without CUDA row launches;
+                    # the solver's own admission reads the module's switches.
                     # Older code read the debug switch directly instead of gating it.
                     values["check_rows"] = values["_CHECK_ROWS"]
-                    for node in sorted(assignments.values(), key=lambda node: node.lineno):
-                        exec(compile(ast.Module(body=[node], type_ignores=[]), "<row-dispatch>", "exec"), values)
-                    self.assertEqual(values["masked"], allowed and switch != "_CHECK_ROWS")
-                    self.assertEqual(bool(values["masked_sizes"]), allowed and switch == "_ROWS_MASKED")
-                    self.assertEqual(values["check_rows"], allowed and switch == "_CHECK_ROWS")
+                    switches = {name: values[name] for name in ("_ROWS_MASKED", "_ROWS_NATIVE", "_CHECK_ROWS")}
+                    with mock.patch.multiple(solver_module, **switches):
+                        for node in sorted(assignments.values(), key=lambda node: node.lineno):
+                            exec(compile(ast.Module(body=[node], type_ignores=[]), "<row-dispatch>", "exec"), values)
+                    masked = (point and switch != "_CHECK_ROWS") or (patch_masked and switch == "_ROWS_MASKED")
+                    self.assertEqual(values["masked"], masked)
+                    self.assertEqual(bool(values["masked_sizes"]), (point or patch_masked) and switch == "_ROWS_MASKED")
+                    self.assertEqual(values["check_rows"], point and switch == "_CHECK_ROWS")
                     self.assertEqual(
                         eval(compile(ast.Expression(skip_clear), "<row-clear>", "eval"), values),
-                        allowed and switch != "_CHECK_ROWS",
+                        point and switch != "_CHECK_ROWS",
                     )
 
     def test_launch_geometry_kernels_use_dedicated_modules(self):

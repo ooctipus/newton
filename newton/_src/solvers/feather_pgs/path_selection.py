@@ -267,9 +267,10 @@ def _contact_rows(solver, source) -> dict:
     if producer == "general":
         # Mirrors _stage4_build_rows; the debug row checks are not routes.
         masked_sizes = [int(size) for size in solver.size_groups if size <= 32]
+        masked_law = solver._masked_contact_rows()
         methods = {}
         for size in solver.size_groups:
-            if not point or size > 32 or not (source._ROWS_MASKED or source._ROWS_NATIVE):
+            if not masked_law or size > 32 or not (source._ROWS_MASKED or source._ROWS_NATIVE):
                 method = "per_contact"
             elif source._ROWS_NATIVE:
                 method = "native"

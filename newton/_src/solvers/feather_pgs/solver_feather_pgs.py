@@ -57,7 +57,7 @@ from .contact_torsion import (
 )
 from .dense_row_state import get_dense_row_state_kernel
 from .friction import FRICTION_PAIR_CUDA
-from .friction_patches import _FrictionPatchState, patch_routes
+from .friction_patches import PatchRowLaw, _FrictionPatchState, patch_routes
 from .fused_dynamics import fused_dynamics_launch_shape, get_fused_dynamics_kernel, template_supported
 from .grouped_dynamics import (
     GroupedTopology,
@@ -231,7 +231,12 @@ from .response_block_sweep import (
     get_response_block_sweep_warp_kernel,
     list_count_slots,
 )
-from .row_build import contact_row_prelude, populate_world_J_masked
+from .row_build import (
+    contact_row_prelude,
+    contact_row_prelude_patch,
+    populate_world_J_masked,
+    populate_world_J_masked_patch,
+)
 from .row_build_native import get_row_build_native_kernel
 from .row_build_rows import build_contact_rows
 from .row_inputs import make_row_kernel
@@ -2755,9 +2760,10 @@ class SolverFeatherPGS(SolverBase):
         # only under the opt-in FEATHER_PGS_PATCH_PARALLEL_ROWS=1; by default it keeps
         # its serial sweeps and ordinary rows.
         self._parallel_contact_paths, self._parallel_contact_paths_reason = self._admit_parallel_contact_paths()
-        # Patch friction on the dense paired route: the paired factor sweep walks
-        # patch contact units. FEATHER_PGS_PATCH_DENSE_PATHS=0 restores the
-        # general paired sweep.
+        # Patch friction on the dense route: the paired factor sweep walks patch
+        # contact units and the masked row builder writes the patch row law.
+        # FEATHER_PGS_PATCH_DENSE_PATHS=0 restores the general paired sweep and
+        # the per-contact row builder.
         self._patch_dense_paths = bool(
             self._law_agnostic_contact_paths
             and self._friction_anchors_enabled
@@ -14125,14 +14131,15 @@ class SolverFeatherPGS(SolverBase):
                         )
             else:
                 check_rows = self._point_contact_paths and _CHECK_ROWS
+                masked_law = self._masked_contact_rows()
                 masked_sizes = (
                     [int(sz) for sz in self.size_groups if sz <= 32]
-                    if (self._point_contact_paths and _ROWS_MASKED and not _ROWS_NATIVE and not check_rows)
+                    if (masked_law and _ROWS_MASKED and not _ROWS_NATIVE and not check_rows)
                     else []
                 )
                 combined_done = False
                 for size in self.size_groups:
-                    masked = self._point_contact_paths and (_ROWS_MASKED or _ROWS_NATIVE) and size <= 32
+                    masked = masked_law and (_ROWS_MASKED or _ROWS_NATIVE) and size <= 32
                     if masked_sizes and 1 <= len(masked_sizes) <= 2 and size in masked_sizes:
                         if combined_done:
                             continue
@@ -14171,6 +14178,11 @@ class SolverFeatherPGS(SolverBase):
                             continue
 
                         def _launch_prelude(size_a=size_a, size_b=size_b, rows_threads=rows_threads, pre=pre):
+                            if self._friction_anchors_enabled:
+                                self._launch_patch_contact_prelude(
+                                    contacts, state_in, state_aug, size_a, size_b, rows_threads, pre["flags"]
+                                )
+                                return
                             wp.launch(
                                 contact_row_prelude,
                                 dim=rows_threads * 3,
@@ -14240,6 +14252,19 @@ class SolverFeatherPGS(SolverBase):
                             flags=pre["flags"],
                             rows_threads=rows_threads,
                         ):
+                            if self._friction_anchors_enabled:
+                                self._launch_patch_contact_jacobian(
+                                    contacts,
+                                    state_in,
+                                    state_aug,
+                                    size_a,
+                                    size_b,
+                                    rows_threads * max(size_a, size_b if size_b > 0 else 1),
+                                    flags,
+                                    J_a,
+                                    J_b,
+                                )
+                                return
                             wp.launch(
                                 populate_world_J_masked,
                                 dim=rows_threads * max(size_a, size_b if size_b > 0 else 1),
@@ -14406,6 +14431,14 @@ class SolverFeatherPGS(SolverBase):
                             J_out = wp.clone(J_out)
                             meta_out = [wp.clone(a) for a in meta_out]
                         rows_threads = min(cap, _ROWS_THREADS_X * _CONTACT_BUILD_THREAD_CAP)
+                        if self._friction_anchors_enabled:
+                            self._launch_patch_contact_prelude(
+                                contacts, state_in, state_aug, size, -1, rows_threads, pre["flags"]
+                            )
+                            self._launch_patch_contact_jacobian(
+                                contacts, state_in, state_aug, size, -1, rows_threads * 32, pre["flags"], J_out, J_out
+                            )
+                            continue
                         wp.launch(
                             contact_row_prelude,
                             dim=rows_threads * 3,
@@ -15338,6 +15371,116 @@ class SolverFeatherPGS(SolverBase):
             outputs=[self.C, self.diag, self.Y_by_size[size]],
             block_dim=self.tile_threads,
             device=model.device,
+        )
+
+    def _masked_contact_rows(self) -> bool:
+        """Whether the masked builder (FEATHER_PGS_ROWS_MASKED) may write this friction law's contact rows.
+
+        Point friction may. Patch friction takes the masked builder's patch-law variants (row_build.py),
+        unless FEATHER_PGS_PATCH_DENSE_PATHS=0, a point-only row experiment (native or fused rows, or
+        their checks) is on, or the sweep builds its worlds' rows in-kernel: that defers the masked
+        launches past the patch link, which must stay the last writer of ring parents and friction
+        coefficients.
+        """
+        if self._point_contact_paths:
+            return True
+        return bool(
+            self._patch_dense_paths
+            and not (_ROWS_NATIVE or _ROWS_FUSED or _CHECK_ROWS or _CHECK_ROWS_FUSED)
+            and self._world_rows_owned_le() == 0
+        )
+
+    def _patch_row_law(self) -> PatchRowLaw:
+        law = PatchRowLaw()
+        law.patches = self._friction_patches.view
+        law.beta = self.friction_anchor_beta
+        return law
+
+    def _launch_patch_contact_prelude(self, contacts, state_in, state_aug, size_a, size_b, rows_threads, flags):
+        """Write the patch row law's contact row metadata and the masked builder's per-contact flags."""
+        wp.launch(
+            contact_row_prelude_patch,
+            dim=rows_threads * 3,
+            inputs=[
+                contacts.rigid_contact_count,
+                rows_threads * 3,
+                contacts.rigid_contact_point0,
+                contacts.rigid_contact_point1,
+                contacts.rigid_contact_normal,
+                contacts.rigid_contact_shape0,
+                contacts.rigid_contact_shape1,
+                contacts.rigid_contact_margin0,
+                contacts.rigid_contact_margin1,
+                self.contact_world,
+                self.contact_slot,
+                self.contact_art_a,
+                self.contact_art_b,
+                self.contact_path,
+                self.contact_slots_needed,
+                size_a,
+                size_b,
+                self.articulation_response_dof_count,
+                self.articulation_origin,
+                self.model.shape_body,
+                state_in.body_q,
+                state_aug.body_v_s,
+                self._prescribed_articulation,
+                self.shape_material_mu,
+                self.shape_material_restitution,
+                self.contact_friction_scale,
+                int(self.contact_shared_anchor),
+                self.pgs_beta,
+                self.pgs_cfm,
+                self._patch_row_law(),
+            ],
+            outputs=[
+                flags,
+                self.row_type,
+                self.row_parent,
+                self.row_mu,
+                self.row_beta,
+                self.row_cfm,
+                self.phi,
+                self.target_velocity,
+                self.row_restitution,
+            ],
+            device=self.model.device,
+        )
+
+    def _launch_patch_contact_jacobian(self, contacts, state_in, state_aug, size_a, size_b, threads, flags, J_a, J_b):
+        """Write the patch rows' Jacobians, tangent rows at the patch friction location, one thread per DOF."""
+        wp.launch(
+            populate_world_J_masked_patch,
+            dim=threads,
+            inputs=[
+                contacts.rigid_contact_count,
+                threads,
+                contacts.rigid_contact_point0,
+                contacts.rigid_contact_point1,
+                contacts.rigid_contact_normal,
+                contacts.rigid_contact_shape0,
+                contacts.rigid_contact_shape1,
+                contacts.rigid_contact_margin0,
+                contacts.rigid_contact_margin1,
+                self.contact_slot,
+                self.contact_art_a,
+                self.contact_art_b,
+                size_a,
+                size_b,
+                self.articulation_response_dof_count,
+                self.art_group_idx,
+                self.articulation_dof_start,
+                self.articulation_origin,
+                self.body_response_dof_mask,
+                state_aug.joint_S_s,
+                self.model.shape_body,
+                state_in.body_q,
+                int(self.contact_shared_anchor),
+                self._patch_row_law(),
+                flags,
+            ],
+            outputs=[J_a, J_b],
+            device=self.model.device,
         )
 
     def _launch_fused_contact_rows(

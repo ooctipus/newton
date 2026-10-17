@@ -57,6 +57,8 @@ _PATCH_ONLY = frozenset(
         "friction_patches.link_patch_rows",
         "friction_patches.seed_patch_impulses",
         "friction_patches.seed_patch_routes",
+        "row_build.contact_row_prelude_patch",
+        "row_build.populate_world_J_masked_patch",
         "row_packets.materialize_patch_fallback",
         "row_packets.produce_patch_contacts",
         # Sparse-diagonal schedules over patch contact units.

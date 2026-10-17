@@ -353,7 +353,8 @@ FLAGS = declare(
         "FEATHER_PGS_PATCH_DENSE_PATHS",
         "policy",
         _SOLVER,
-        "=0 keeps patch friction on the general paired factor sweep instead of its contact units (default on).",
+        "=0 keeps patch friction on the general paired factor sweep and the per-contact row builder instead of "
+        "contact units and masked rows (default on).",
     ),
     _flag(
         "FEATHER_PGS_PATCH_PARALLEL_ROWS",
