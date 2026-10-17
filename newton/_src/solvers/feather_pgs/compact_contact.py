@@ -5,9 +5,10 @@
 
 Allocation, contact admission, scheduling, RHS and the solve remain authoritative
 in the original pipeline. This module only changes the representation producer.
-Persistent patch friction writes its tangent rows with the patch row law; patch
-ring links and the divided friction coefficient stay with ``link_patch_rows``,
-which runs after this producer.
+Persistent patch friction writes its tangent rows with the patch row law. The
+patch link, ``_FrictionPatchState.link``, runs after this producer and alone
+links the patch rings and divides the friction coefficient; its
+``link_patch_routes`` kernel shares ``_link_contact`` with ``link_patch_rows``.
 """
 
 import warp as wp
@@ -655,8 +656,9 @@ def launch_contacts(solver, state_in, state_aug, contacts, workers):
     )
     order = solver._compact_contact_order
     # Persistent patches write their tangent rows with the patch row law. The
-    # original link_patch_rows still runs after this producer: it alone links
-    # normal rows into patch rings and divides the tangent coefficient.
+    # patch link (_FrictionPatchState.link, one link_patch_routes launch) still
+    # runs after this producer: it alone links normal rows into patch rings and
+    # divides the tangent coefficient.
     law = None
     if solver._friction_anchors_enabled:
         law = PatchRowLaw()

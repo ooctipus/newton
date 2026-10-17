@@ -70,7 +70,8 @@ class PatchRowLaw:
 
     A tangent row acts at its patch's friction location, carries the anchor's tangential
     displacement as phi and corrects it with ``beta`` (``friction_anchor_beta``). Producers write
-    the undivided friction coefficient; ``link_patch_rows`` divides it and links the ring.
+    the undivided friction coefficient; the patch link (``_FrictionPatchState.link``, which
+    launches ``link_patch_routes``) divides it and links the ring.
     """
 
     patches: FrictionPatches
