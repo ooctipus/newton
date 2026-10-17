@@ -90,9 +90,9 @@ def _graph_and_reset_rollout(model, sparse, cached_dynamics, **options):
     return solver, contacts, state
 
 
-def _launched_kernel_keys(model, solver):
+def _launched_kernel_keys(model, solver, **pipeline_options):
     """Step once through the collision pipeline and return the key of every kernel the step launched."""
-    pipeline = newton.CollisionPipeline(model)
+    pipeline = newton.CollisionPipeline(model, **pipeline_options)
     contacts = pipeline.contacts()
     state_in, state_out = model.state(), model.state()
     newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
@@ -521,7 +521,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     self.assertEqual(routes["sparse_mass_matrix"]["velocity_limits"], bool(options))
                     # A placeholder stands in for the dense response that the install would read.
                     self.assertEqual(solver.Y_by_size[9].shape, (1, 1, 1))
-                    keys = _launched_kernel_keys(model, solver)
+                    # Contact warm start carries impulses by matched contact identity.
+                    keys = _launched_kernel_keys(model, solver, contact_matching="latest")
                     self.assertIn(routes["sweep"]["sparse"], keys)
                     self.assertNotIn("apply_impulses_world_par_dof", keys)
 
