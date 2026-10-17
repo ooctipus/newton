@@ -5492,8 +5492,10 @@ class SolverFeatherPGS(SolverBase):
         Point friction fuses them in the active-row scan. Patch friction fuses its anchor
         units, pooling their ring loads as the ordinary pair update does, in the active
         scan or else in the full ordered sweep; split, velocity-limit, free-body and
-        packed small-world sweeps keep ordinary updates. Either way the transaction is
-        bitwise equal to the same sweep without it.
+        packed small-world sweeps keep ordinary updates. The patch transaction is bitwise
+        equal to the same sweep without it. The point transaction is too, unless
+        ``pgs_relative_change_tolerance > 0``: its early exit bounds the tangent changes
+        by the new normal impulse instead of the new tangent impulse.
 
         Args:
             active_rows: Whether the sweep selects its rows at sweep entry.

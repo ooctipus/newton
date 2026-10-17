@@ -167,7 +167,7 @@ class DeviceSolve:
             int(data["iterations"]),
             float(data["omega"]),
             0.0,
-            0.0,
+            float(data.get("relative_change_tolerance", 0.0)),
             int(data["friction_start_iteration"]),
             int(data["iteration_offset"]),
         ]
@@ -618,7 +618,9 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
         its last member, interleaved one- and three-row units and an unlinked anchor,
         with and without a 30-row lead that moves records and rings across 32-row
         words; zero and seeded impulses, delayed friction and relaxation, in the
-        linked active scan and in the full sweep.
+        linked active scan and in the full sweep. A relative change tolerance ends
+        sweeps early on the same decisions: the normal bounds its change by its new
+        impulse and the pair by its new first tangent, as their ordinary updates do.
         """
         settings = (
             {},
@@ -627,9 +629,13 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
             {"seeded": True, "delay": 3, "iteration_offset": 4},
             {"seeded": True, "omega": -0.5},
         )
-        for (name, layout), pad, options, active in product(_LINKED_LAYOUTS.items(), (0, 30), settings, (True, False)):
-            with self.subTest(layout=name, pad=pad, active=active, **options):
+        early_exits = 0
+        for (name, layout), pad, options, active, relative in product(
+            _LINKED_LAYOUTS.items(), (0, 30), settings, (True, False), (0.0, 0.05)
+        ):
+            with self.subTest(layout=name, pad=pad, active=active, relative=relative, **options):
                 data, physical = linked_fixture(layout, pad=pad, active=active, **options)
+                data["relative_change_tolerance"] = relative
                 control = DeviceSolve(data, candidate=False, active=active, linked=True)
                 candidate = DeviceSolve(data, candidate=True, active=active, linked=True)
                 self.assertIn("_contact_triplets_linked", candidate.kernel.key)
@@ -639,9 +645,19 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
                 delta, impulses = candidate.result()
                 np.testing.assert_array_equal(delta, control.result()[0])
                 np.testing.assert_array_equal(impulses, control.result()[1])
+                if relative:
+                    # The eight-sweep oracle does not apply once the tolerance ends a solve early.
+                    every_sweep = DeviceSolve(
+                        {**data, "relative_change_tolerance": 0.0}, candidate=False, active=active, linked=True
+                    )
+                    every_sweep.launch()
+                    early_exits += not np.array_equal(every_sweep.result()[1], impulses)
+                    continue
                 # The oracle pools each ring as the ordinary update does; a fused radius
                 # without the ring would leave it.
                 assert_output(self, data, delta, impulses, physical=physical)
+        # The tolerance must end solves early, or its cases would prove nothing.
+        self.assertGreater(early_exits, 20)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse construction requires CUDA")
     def test_patch_host_admission_cuda(self):

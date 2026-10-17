@@ -77,7 +77,8 @@ def _get_pgs_solve_sparse_kernel(
     runtime metadata guards retain the ordinary update for other rows. With
     ``linked_rows`` the transaction also admits ring-linked patch anchors, in
     the active or the full sweep: its radius pools the ring from the new
-    normal on, in the order the ordinary pair update pools it.
+    normal on, in the order the ordinary pair update pools it, and its early
+    exit tests each change as the ordinary updates do.
 
     Small complete articulated sweeps may use 8 or 16 lanes per world, as in
     the local response/solve owner. Launch with ``ceil(world_count / (64 /
@@ -760,7 +761,10 @@ def _contact_triplet_code(
     """Native additions for one-call metrics and ordered register-held updates.
 
     ``linked`` admits ring-linked patch normals: the fused radius pools the ring
-    from the new normal on, in the order the ordinary pair update pools it.
+    from the new normal on, in the order the ordinary pair update pools it, and
+    the normal and the pair bound their changes as their ordinary updates do,
+    so the early exit matches under a relative change tolerance too. Unlinked
+    transactions bound every change by the new normal.
     ``active`` fuses selected rows of the active-row scan; otherwise the
     transaction runs inside the full ordered sweep.
     """
@@ -771,6 +775,11 @@ def _contact_triplet_code(
     selected_guard = "\n                && ((selected_words[(row + 1) / 32] >> ((row + 1) & 31)) & 1u) != 0u"
     selected_guard = selected_guard if active else ""
     ring_load, load = "", "new_normal"
+    tangent_state = "float tangent_change = 0.0f, sibling_change = 0.0f;"
+    tangent_keep = ""
+    change_test = """if (!(fabsf(normal_change) <= change_tolerance + relative_change_tolerance * fabsf(new_normal)
+                          && fabsf(tangent_change) <= change_tolerance + relative_change_tolerance * fabsf(new_normal)
+                          && fabsf(sibling_change) <= change_tolerance + relative_change_tolerance * fabsf(new_normal))) changed = 1;"""
     if linked:
         ring_load = """
                 float load = new_normal;
@@ -778,6 +787,16 @@ def _contact_triplet_code(
                      next = world_row_parent.data[offset + next])
                     load += impulse[next];"""
         load = "load"
+        tangent_state = "float tangent_change = 0.0f, sibling_change = 0.0f, tangent_value = 0.0f;"
+        tangent_keep = "\n                    tangent_value = new_tangent;"
+        # Rows r and r + 1 bound their changes by their own new impulses, the pair by its first tangent.
+        change_test = """if (normal_change != 0.0f
+                        && !(fabsf(normal_change) <= change_tolerance + relative_change_tolerance * fabsf(new_normal)))
+                        changed = 1;
+                    if ((tangent_change != 0.0f || sibling_change != 0.0f)
+                        && !(fabsf(tangent_change) <= change_tolerance + relative_change_tolerance * fabsf(tangent_value)
+                             && fabsf(sibling_change) <= change_tolerance + relative_change_tolerance * fabsf(tangent_value)))
+                        changed = 1;"""
     setup = f"""
     __shared__ float metric_storage[{2 * cache_size * 5}];
     __shared__ signed char metric_map_storage[{2 * pairs}];
@@ -856,7 +875,7 @@ def _contact_triplet_code(
                 const float normal_change = new_normal - old_normal;{ring_load}
                 const float radius = fmaxf(world_row_mu.data[offset + tangent] * {load}, 0.0f);
                 const float old_tangent = impulse[tangent], old_sibling = impulse[sibling];
-                float tangent_change = 0.0f, sibling_change = 0.0f;
+                {tangent_state}
                 if (lane == 0) impulse[row] = new_normal;
                 #pragma unroll
                 for (int q = 0; q < {Q}; ++q)
@@ -898,7 +917,7 @@ def _contact_triplet_code(
                     const float scale = magnitude > radius ? radius / magnitude : 1.0f;
                     const float new_tangent = pair.x * scale, new_sibling = pair.y * scale;
                     tangent_change = new_tangent - old_tangent;
-                    sibling_change = new_sibling - old_sibling;
+                    sibling_change = new_sibling - old_sibling;{tangent_keep}
                     if (lane == 0) {{ impulse[tangent] = new_tangent; impulse[sibling] = new_sibling; }}
                     #pragma unroll
                     for (int q = 0; q < {Q}; ++q) {{
@@ -909,9 +928,7 @@ def _contact_triplet_code(
                     }}
                 }}
                 if (normal_change != 0.0f || tangent_change != 0.0f || sibling_change != 0.0f) {{
-                    if (!(fabsf(normal_change) <= change_tolerance + relative_change_tolerance * fabsf(new_normal)
-                          && fabsf(tangent_change) <= change_tolerance + relative_change_tolerance * fabsf(new_normal)
-                          && fabsf(sibling_change) <= change_tolerance + relative_change_tolerance * fabsf(new_normal))) changed = 1;
+                    {change_test}
                     #pragma unroll
                     for (int q = 0; q < {Q}; ++q)
                         if (indices[q] >= 0) delta[indices[q]] = velocities[q];
