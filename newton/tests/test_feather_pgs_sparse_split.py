@@ -31,11 +31,13 @@ from newton.tests.feather_pgs_patch_parity import (
     assert_loaded_anchors,
     assert_patch_impulses_close,
     assert_patch_rows_close,
+    assert_patch_seeds,
     assert_region_impulses_close,
     assert_ring_coulomb,
     assert_sparse_rows_consistent,
     assert_states_close,
     patch_rows,
+    recorded_patch_seeds,
     ring_budget_ratios,
     standing_model,
 )
@@ -584,18 +586,28 @@ class TestSparseSplitPatchPhysics(unittest.TestCase):
                     self.assertTrue(linked, "A box foot must link several normals in one ring")
 
     def test_warm_start_seeds_patch_impulses(self):
-        """Seed carried patch impulses through the sparse factor delta as dense split rows do."""
+        """Seed carried patch impulses through the sparse factor delta as dense split rows do.
+
+        The stance's per-anchor friction is not determined, so the arms' impulses cannot show a lost or
+        halved seed; each arm checks its own. Every step launches the patch seed with the configured
+        decay, which writes each carried anchor's friction rows as the seeding law defines them, and the
+        sweep starts from those rows (assert_patch_seeds); the sparse arm's factor delta must then carry
+        them (assert_sparse_rows_consistent, in _assert_patch).
+        """
         dense, sparse = self._pair(standing=True, pgs_warmstart=True, contact_matching="latest")
         self.assertTrue(sparse[1]._pgs_solve_sparse_kernel.key.endswith("_warm_start"))
+        largest = 0.0
         for index in range(8):
             for case in (dense, sparse):
-                _step(case)
+                with recorded_patch_seeds() as seeds:
+                    _step(case)
+                decay = case[1].pgs_warmstart_decay
+                largest = max(largest, assert_patch_seeds(seeds, scale=decay, carried=index > 0))
             self._assert_patch(dense, sparse, bounds=STANDING_REGION_BOUNDS)
             # Matched anchors carry their friction impulse into the next step's seed.
             for case in (dense, sparse):
                 assert_loaded_anchors(case[1], case[-1], carried=index > 0)
-        patches = sparse[1]._friction_patches.previous
-        self.assertGreater(float(np.abs(patches.tangent_impulse.numpy()[patches.valid.numpy() != 0]).max()), 0.0)
+        self.assertGreater(largest, 1.0e-4, "Carried anchors must seed friction")
 
     def test_graph_replay(self):
         """Replay captured sparse patch steps against eager dense split steps."""

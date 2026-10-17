@@ -12,7 +12,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.friction_patches import link_patch_routes
+from newton._src.solvers.feather_pgs.friction_patches import link_patch_routes, seed_patch_routes
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -34,12 +34,14 @@ from newton.tests.feather_pgs_patch_parity import (
     assert_history_matches_rows,
     assert_loaded_anchors,
     assert_patch_rows_close,
+    assert_patch_seeds,
     assert_region_impulses_close,
     assert_ring_coulomb,
     assert_rows_close,
     assert_states_close,
     contact_rows,
     patch_rows,
+    recorded_patch_seeds,
     ring_budget_ratios,
     ring_load,
     standing_model,
@@ -335,6 +337,69 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
         small.store(state)
         with self.assertRaisesRegex(AssertionError, "hold 8 and 16 contact slots"):
             assert_history_close(small, large)
+
+    def test_patch_seeds_follow_the_seeding_law(self):
+        """Record each step's patch seed and reject a skipped, rescaled, altered or overwritten one.
+
+        The warm-started dense split stance carries every loaded anchor's
+        friction into the next step's seed. A step whose seed launch is
+        skipped, runs at half the decay, writes other values than the seeding
+        law, or whose seeded rows are overwritten before the sweep fails.
+        """
+        case = split._case(
+            False,
+            options={**_DENSE_SPLIT, "pgs_warmstart": True},
+            contact_matching="latest",
+            deterministic=True,
+            standing=True,
+            device="cpu",
+        )
+        solver, patches = case[1], case[1]._friction_patches
+        decay = solver.pgs_warmstart_decay
+
+        def seeded_step():
+            with recorded_patch_seeds() as seeds:
+                split._step(case)
+            return seeds
+
+        def scale_carried_friction(factor):
+            count = int(case[-1].rigid_contact_count.numpy()[0])
+            source = patches.current.source.numpy()[:count]
+            slot, world = solver.contact_slot.numpy()[:count], solver.contact_world.numpy()[:count]
+            needed, impulses = solver.contact_slots_needed.numpy()[:count], solver.impulses.numpy()
+            for c in np.flatnonzero((source >= 0) & (slot >= 0) & (needed == 3)):
+                impulses[world[c], slot[c] + 1 : slot[c] + 3] *= factor
+            solver.impulses.assign(impulses)
+
+        seed, regularize, launch = patches.seed, solver._stage6_apply_contact_regularization, wp.launch
+
+        def rescaled(state, world, slot, path, slots_needed, routes):
+            routes.scale = wp.vec3(0.5 * routes.scale[0], routes.scale[1], routes.scale[2])
+            seed(state, world, slot, path, slots_needed, routes)
+
+        def altered(kernel, *args, **kwargs):
+            # The seed launch itself writes half the law's values.
+            result = launch(kernel, *args, **kwargs)
+            if kernel is seed_patch_routes:
+                scale_carried_friction(0.5)
+            return result
+
+        def overwritten():
+            regularize()
+            scale_carried_friction(0.0)
+
+        self.assertEqual(assert_patch_seeds(seeded_step(), scale=decay, carried=False), 0.0)
+        largest = max(assert_patch_seeds(seeded_step(), scale=decay) for _ in range(3))
+        self.assertGreater(largest, 1.0e-4, "Carried anchors must seed friction")
+        defects = {
+            "not 0 times": mock.patch.object(patches, "seed", lambda *args: None),
+            "warm-start scale": mock.patch.object(patches, "seed", rescaled),
+            "seeded friction rows": mock.patch.object(wp, "launch", altered),
+            "the sweep starts from": mock.patch.object(solver, "_stage6_apply_contact_regularization", overwritten),
+        }
+        for message, defect in defects.items():
+            with self.subTest(defect=message), defect, self.assertRaisesRegex(AssertionError, message):
+                assert_patch_seeds(seeded_step(), scale=decay)
 
     def test_sparse_rows_must_carry_their_impulses(self):
         """Reject a factor delta without a seeded row's response, a stale incident and an undecoded velocity.

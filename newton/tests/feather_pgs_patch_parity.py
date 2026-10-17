@@ -17,10 +17,14 @@ friction location, and compares impulses and history where they are well posed.
 This module holds shared test helpers; it defines no tests.
 """
 
+import contextlib
+from unittest import mock
+
 import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.friction_patches import seed_patch_routes
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 
 # Per route: constraint count, row type, parent, mu, right-hand side, impulse, phi and
@@ -575,6 +579,123 @@ def assert_history_matches_rows(solver, contacts, *, atol=1e-6, rtol=1e-6):
             raise AssertionError(f"Contact {c} stored tangent impulse {stored}; its friction rows solved {solved}")
         checked += 1
     return checked
+
+
+def _rotate(quaternion, vector):
+    """Rotate ``vector`` by a warp quaternion (x, y, z, w)."""
+    axis, w = np.asarray(quaternion[:3], dtype=np.float64), float(quaternion[3])
+    twice = 2.0 * np.cross(axis, vector)
+    return vector + w * twice + np.cross(axis, twice)
+
+
+def _seed_record(inputs):
+    """Describe one ``seed_patch_routes`` launch: route 0's scale and each carried route-0 anchor's seed."""
+    extent, frame, previous, body_q, world, slot, path, needed, routes = inputs[:9]
+    record = {"scale": None, "anchors": [], "impulses": None}
+    if not routes.enabled[0]:
+        return record
+    record["scale"], record["impulses"] = float(routes.scale[0]), routes.impulses0
+    live = int(extent.numpy()[1])
+    source, body = frame.source.numpy()[:live], frame.body_a.numpy()[:live]
+    flipped, normal = frame.flipped.numpy()[:live], frame.normal.numpy()[:live].astype(np.float64)
+    world, slot, path, needed = (array.numpy()[:live] for array in (world, slot, path, needed))
+    stored, poses = previous.tangent_impulse.numpy().astype(np.float64), body_q.numpy().astype(np.float64)
+    parents, mu, impulses = routes.parents0.numpy(), routes.mu0.numpy(), routes.impulses0.numpy()
+    for c in np.flatnonzero((source >= 0) & (slot >= 0) & (path == 0) & (needed == 3)):
+        tangent = stored[source[c]] * record["scale"]
+        if body[c] >= 0:
+            tangent = _rotate(poses[body[c], 3:], tangent)
+        n = normal[c]
+        if flipped[c] != 0:
+            n, tangent = -n, -tangent
+        first, second = _tangent_basis(n)
+        value = np.array([tangent @ first, tangent @ second])
+        w, s = int(world[c]), int(slot[c])
+        budget = max(float(mu[w, s + 1]) * ring_load(parents[w], impulses[w], s), 0.0)
+        magnitude = float(np.linalg.norm(value))
+        if magnitude > budget and magnitude > 0.0:
+            value *= budget / magnitude
+        record["anchors"].append(
+            {
+                "contact": int(c),
+                "world": w,
+                "slot": s,
+                "expected": value,
+                "seeded": impulses[w, s + 1 : s + 3].astype(np.float64),
+                "swept": None,
+            }
+        )
+    return record
+
+
+@contextlib.contextmanager
+def recorded_patch_seeds():
+    """Record each patch seed launch inside the block and the friction rows the next PGS sweep starts from.
+
+    Yields a list that receives one record per ``seed_patch_routes`` launch:
+    route 0's warm-start ``scale`` (None when the launch leaves route 0 out)
+    and, for each anchor that carries history into a route-0 row, its
+    ``expected`` seed, the ``seeded`` friction rows the launch wrote and the
+    ``swept`` rows the first ``pgs_solve*`` kernel launched after it reads.
+    The expected seed follows the patch seeding law: the stored tangent
+    impulse times the scale, rotated by the body pose, projected on the
+    contact's tangent pair and clamped to the anchor's pooled budget (divided
+    mu times its ring's seeded normal load).
+    """
+    records = []
+
+    def spy(launch):
+        def run(kernel, *args, **kwargs):
+            if records and records[-1]["impulses"] is not None and kernel.key.startswith("pgs_solve"):
+                record = records[-1]
+                impulses, record["impulses"] = record["impulses"].numpy(), None
+                for anchor in record["anchors"]:
+                    s = anchor["slot"]
+                    anchor["swept"] = impulses[anchor["world"], s + 1 : s + 3].astype(np.float64)
+            result = launch(kernel, *args, **kwargs)
+            if kernel is seed_patch_routes:
+                records.append(_seed_record(kwargs["inputs"]))
+            return result
+
+        return run
+
+    # The solver modules call warp through its module attributes, and launch_tiled does not go through
+    # wp.launch, so both are spied on.
+    with mock.patch.object(wp, "launch", spy(wp.launch)), mock.patch.object(wp, "launch_tiled", spy(wp.launch_tiled)):
+        yield records
+
+
+def assert_patch_seeds(records, *, scale, carried=True):
+    """Require one step's patch seed to follow the seeding law and to start the sweep.
+
+    ``records`` come from :func:`recorded_patch_seeds` around one step: the
+    seed launches once with route 0's warm-start ``scale``, each carried
+    anchor's friction rows hold its expected seed within float32 rounding of
+    the law, and the PGS sweep reads them unchanged. ``carried`` expects at
+    least one anchor to carry history into the seed. Returns the largest
+    expected seed magnitude.
+    """
+    if len(records) != 1:
+        raise AssertionError(f"A step must launch the patch seed once, not {len(records)} times")
+    (record,) = records
+    if record["scale"] is None:
+        raise AssertionError("The patch seed launch leaves out route 0's rows")
+    np.testing.assert_allclose(record["scale"], scale, rtol=1e-6, err_msg="route 0 warm-start scale")
+    if carried and not record["anchors"]:
+        raise AssertionError("No route-0 anchor carries history into the seed")
+    largest = 0.0
+    for anchor in record["anchors"]:
+        label = f"contact {anchor['contact']}"
+        np.testing.assert_allclose(
+            anchor["seeded"], anchor["expected"], atol=1e-6, rtol=1e-5, err_msg=f"{label} seeded friction rows"
+        )
+        if anchor["swept"] is None:
+            raise AssertionError("No PGS sweep launched after the patch seed")
+        np.testing.assert_array_equal(
+            anchor["swept"], anchor["seeded"], err_msg=f"{label} friction rows the sweep starts from"
+        )
+        largest = max(largest, float(np.linalg.norm(anchor["expected"])))
+    return largest
 
 
 def assert_factor_rows_consistent(z, jacobian, impulses, incident, delta, v_hat, v_out, *, label=""):
