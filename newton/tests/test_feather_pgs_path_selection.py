@@ -15,6 +15,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import friction_patches
+from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.path_selection import applied_options
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import (
@@ -92,14 +93,19 @@ def _cpu_separate_worlds_model():
     return builder.finalize(device="cpu")
 
 
-def _branched_arm_and_box(device="cuda:0", worlds=2):
-    """A fixed-base arm of two four-link branches (eight DOFs that sparse factors admit) and a free box per world."""
+def _branched_arm_and_box(device="cuda:0", worlds=2, depth=9):
+    """A fixed-base arm of two ``depth``-link branches, which sparse factors admit, and a free box per world.
+
+    Nine links per branch give the arm 18 DOFs: the paired factor response pairs it with the box, as
+    in the Kuka scenes, and its contact rows come from the general builders rather than the compact
+    producer (up to 10 DOFs).
+    """
     scene = newton.ModelBuilder()
     base = scene.add_link(mass=2.0, inertia=wp.mat33(np.eye(3) * 0.1))
     joints = [scene.add_joint_fixed(-1, base, parent_xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()))]
     for side in (-1.0, 1.0):
         parent = base
-        for _ in range(4):
+        for _ in range(depth):
             child = scene.add_link(mass=0.5, inertia=wp.mat33(np.eye(3) * 0.05))
             joints.append(
                 scene.add_joint_revolute(
@@ -782,27 +788,33 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
     def test_free_body_worlds_keep_the_dense_route_for_both_laws(self):
         """A branched arm with a free body per world stays dense with the tree cache, under patch friction too.
 
-        Sparse factors admit the arm alone; FEATHER_PGS_PATCH_DENSE_PATHS=0 returns patch friction's
-        free-body worlds to them.
+        Sparse factors admit the arm alone. On the dense route patch friction keeps the bundle that makes
+        it worth taking: contact units in the paired factor sweep, masked rows (FEATHER_PGS_ROWS_MASKED,
+        set by the recipes) and the resolved-world classifier. FEATHER_PGS_PATCH_DENSE_PATHS=0 returns
+        patch friction's free-body worlds to sparse factors.
         """
         model = _branched_arm_and_box()
-        classified = {}
         for law, beta in (("patch", None), ("point", 0.0)):
-            with self.subTest(law=law):
-                solver = _make_solver(model, True, friction_anchor_beta=beta)
+            with self.subTest(law=law), patch.object(solver_module, "_ROWS_MASKED", True):
+                solver = _make_solver(model, True, friction_anchor_beta=beta, dense_max_constraints=96)
                 selected = solver.get_path_selection()
-                self.assertEqual(selected["routes"]["friction"]["law"], law)
+                routes = selected["routes"]
+                self.assertEqual(routes["friction"]["law"], law)
                 self.assertEqual(selected["sparse_mass_matrix"], "off")
                 self.assertIn("free rigid bodies", selected["reasons"]["sparse_mass_matrix"])
                 self.assertEqual(selected["cached_prediction"], "tree")
-                classified[law] = selected["routes"]["resolved_worlds"]["enabled"]
-        # The classifier's admission does not depend on the friction law.
-        self.assertEqual(classified["patch"], classified["point"])
+                self.assertTrue(routes["paired_response"]["factor_coordinates"])
+                if law == "patch":
+                    self.assertTrue(routes["paired_response"]["contact_units"])
+                    self.assertEqual(
+                        routes["contact_rows"]["general_method_by_dof"],
+                        {"18": "masked_combined", "6": "masked_combined"},
+                    )
+                    self.assertTrue(routes["resolved_worlds"]["enabled"], routes["resolved_worlds"]["reason"])
+                    self.assertIn("patch-friction rows", routes["resolved_worlds"]["reason"])
         with patch.dict(os.environ, {"FEATHER_PGS_PATCH_DENSE_PATHS": "0"}):
-            solver = _make_solver(model, True)
-        selected = solver.get_path_selection()
-        self.assertEqual(selected["sparse_mass_matrix"], "on")
-        self.assertFalse(selected["routes"]["resolved_worlds"]["enabled"])
+            solver = _make_solver(model, True, dense_max_constraints=96)
+        self.assertEqual(solver.get_path_selection()["sparse_mass_matrix"], "on")
 
     @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
     def test_cached_dynamics_contact_graph_and_reset(self):
