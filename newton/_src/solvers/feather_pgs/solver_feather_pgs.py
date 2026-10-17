@@ -28064,6 +28064,7 @@ def _get_pgs_solve_parallel_kernel(
     kernel._fpgs_block_dim = NT  # two warps per world above 32 rows
     kernel._fpgs_extra_inputs = True  # takes the in-kernel response inputs after defer_dense_response
     kernel._fpgs_world_rows = bool(WR)
+    kernel._fpgs_linked_rows = bool(linked_rows)  # recorded as routes.sweep.tiers.linked_rows
     return kernel
 
 

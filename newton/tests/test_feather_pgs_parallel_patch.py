@@ -24,7 +24,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import keyed_rows
+from newton._src.solvers.feather_pgs import keyed_rows, path_selection
 from newton._src.solvers.feather_pgs import solver_feather_pgs as source
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -541,6 +541,28 @@ class TestPatchParallelAdmission(unittest.TestCase):
         admitted, reason = SolverFeatherPGS._admit_parallel_contact_paths(other_law)
         self.assertFalse(admitted)
         self.assertIn("torsion", reason)
+
+    def test_route_record_reads_the_built_tiers(self):
+        """Record the tiers' ring-pooled projection from the kernels built, not from the friction law."""
+        options = {"rows": 32, "sweeps": 24, "matrix_free": True}
+        for anchors, linked in itertools.product((False, True), repeat=2):
+            kernel = source._get_pgs_solve_parallel_kernel(_CAPACITY, 32, _DOFS, "120", linked_rows=linked, **options)
+            probe = SimpleNamespace(
+                _pgs_solve_mf_gs_incremental_kernels=[kernel],
+                _par_tiers=[(32, 0)],
+                _ink_rows=32,
+                _ink_sizes=None,
+                _keyed_rows=None,
+                _friction_anchors_enabled=anchors,
+                mf_gs_parallel_nesterov=True,
+                mf_gs_parallel_matrix_free=True,
+                mf_gs_parallel_sweeps=24,
+                mf_gs_parallel_tol=0.0,
+            )
+            with self.subTest(anchors=anchors, linked=linked):
+                tiers = path_selection._tiers(probe)
+                self.assertEqual(tiers["linked_rows"], linked)
+                self.assertEqual(tiers["tiers"][0]["kernel"].endswith("_linked"), linked)
 
     def test_in_sweep_world_rows_serve_point_friction_only(self):
         """Build contact rows inside the sweep only under point friction, the law that builder writes.

@@ -557,8 +557,8 @@ def _tiers(solver) -> dict | None:
             "family": "keyed_parallel" if solver._keyed_rows is not None else "parallel",
             # FEATHER_PGS_INK: the tier kernels build their world's response in-kernel.
             "inkernel_response": solver._ink_sizes is not None,
-            # Patch friction: each friction pair projects on its patch ring's pooled normal load.
-            "linked_rows": bool(solver._friction_anchors_enabled),
+            # Every built tier projects each friction pair on its patch ring's pooled normal load (patch friction).
+            "linked_rows": all(getattr(kernel, "_fpgs_linked_rows", False) for kernel in kernels),
             "nesterov": bool(solver.mf_gs_parallel_nesterov),
             "matrix_free": bool(solver.mf_gs_parallel_matrix_free),
             "sweeps": int(solver.mf_gs_parallel_sweeps),

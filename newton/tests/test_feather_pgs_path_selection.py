@@ -513,7 +513,10 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 parallel = tiers is not None and tiers["family"] in ("parallel", "keyed_parallel")
                 self.assertEqual(applied["mf_gs_parallel_rows"], tiers["tiers"][-1]["rows"] if parallel else 0)
                 if parallel:
-                    self.assertEqual(tiers["linked_rows"], routes["friction"]["law"] == "patch")
+                    linked = routes["friction"]["law"] == "patch"
+                    self.assertEqual(tiers["linked_rows"], linked)
+                    for tier in tiers["tiers"]:
+                        self.assertEqual(tier["kernel"].endswith("_linked"), linked, tier)
                 self.assertEqual(applied["grouped_dynamics"], routes["dynamics"]["grouped_topology"])
                 self.assertEqual(
                     applied["lazy_kinematics"],
