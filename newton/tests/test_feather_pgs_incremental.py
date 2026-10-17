@@ -3,6 +3,7 @@
 
 """Check directed responses in the incremental-residual contact solve."""
 
+import functools
 import inspect
 import unittest
 
@@ -17,11 +18,22 @@ from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_solver as sparse_tests
 from newton.tests import test_feather_pgs_sparse_split as split_tests
 from newton.tests.feather_pgs_patch_parity import (
-    assert_contact_impulses_close,
-    assert_history_close,
+    SLIDING_FEET,
+    SLIDING_ITERATIONS,
+    SLIDING_REGION_BOUNDS,
+    STANDING_REGION_BOUNDS,
+    STANDING_VELOCITY_ATOL,
+    anchor_sites,
+    assert_anchor_sites_close,
+    assert_history_matches_rows,
     assert_loaded_anchors,
+    assert_patch_impulses_close,
+    assert_patch_rows_close,
+    assert_region_impulses_close,
     assert_ring_coulomb,
-    contact_rows,
+    assert_states_close,
+    patch_rows,
+    ring_budget_ratios,
     standing_model,
 )
 
@@ -111,7 +123,7 @@ class TestFeatherPGSIncremental(unittest.TestCase):
                         )
 
 
-def _patch_case(model, incremental_rows):
+def _patch_case(model, incremental_rows, *, iterations=8):
     """Solve dense matrix-free rows under patch friction, optionally through the incremental kernel."""
     # Sorted contacts: both arms see the same contact order, which the by-contact patch checks key on.
     # The pipeline sets model.rigid_contact_max, which sizes the solver's contact and patch buffers, so it is
@@ -120,7 +132,7 @@ def _patch_case(model, incremental_rows):
     solver = SolverFeatherPGS(
         model,
         pgs_mode="matrix_free",
-        pgs_iterations=8,
+        pgs_iterations=iterations,
         enable_joint_limits=True,
         friction_anchor_beta=0.2,
         sparse_mass_matrix="off",
@@ -141,15 +153,22 @@ class TestFeatherPGSIncrementalPatch(unittest.TestCase):
         """Solve linked patch rows through the incremental kernel as the ordinary matrix-free sweep does.
 
         The standing fixture keeps loaded, ring-linked anchors on its box feet at every step, so the
-        anchor history comparison covers carried anchors; the tripod covers limit rows beside contacts.
+        anchor history comparison covers carried anchors; the tripod covers limit rows beside contacts;
+        the sliding feet hold every anchor at its pooled ring budget, which the incremental kernel's
+        projection must pool as the ordinary sweep does. Rows compare by contact for normal rows and by
+        friction location for anchors (feather_pgs_patch_parity): rounding picks which corner of a
+        rectangular foot's support edge carries the edge's friction rows.
         """
-        for name, build in (
-            ("standing", standing_model),
-            ("tripod", sparse_tests._build_model),
+        for name, build, iterations, bounds in (
+            ("standing", standing_model, 8, STANDING_REGION_BOUNDS),
+            ("tripod", sparse_tests._build_model, 8, None),
+            ("sliding", functools.partial(standing_model, **SLIDING_FEET), SLIDING_ITERATIONS, SLIDING_REGION_BOUNDS),
         ):
+            sliding = name == "sliding"
             with self.subTest(fixture=name):
                 model = build()
-                reference, candidate = _patch_case(model, 0), _patch_case(model, 32)
+                reference = _patch_case(model, 0, iterations=iterations)
+                candidate = _patch_case(model, 32, iterations=iterations)
                 self.assertEqual(reference[1]._friction_patches.capacity, candidate[1]._friction_patches.capacity)
                 self.assertEqual(reference[1]._incremental_rows, 0)
                 self.assertEqual(candidate[1]._incremental_rows, 32)
@@ -162,14 +181,21 @@ class TestFeatherPGSIncrementalPatch(unittest.TestCase):
                     tiers = selected["routes"]["sweep"]["tiers"]
                     self.assertEqual(None if tiers is None else tiers["family"], "incremental" if rows else None)
                 linked = carried = False
+                ratios = []
                 for index in range(12):
                     for case in (reference, candidate):
                         split_tests._step(case)
                     # Only float order differs; it compounds through the rollout like other route changes.
-                    sparse_tests.TestFeatherPGSSparseSolver.assert_states_close(self, reference[2], candidate[2])
-                    # Contact rows by contact (their slots come from per-world atomics), the other rows by slot.
-                    rows = contact_rows(candidate[1], candidate[-1])
-                    assert_contact_impulses_close(contact_rows(reference[1], reference[-1]), rows)
+                    velocity_atol = 2e-3 if bounds is None else STANDING_VELOCITY_ATOL
+                    assert_states_close(reference[2], candidate[2], velocity_atol=velocity_atol)
+                    rows = patch_rows(reference[1], reference[-1], split_tests.DT)
+                    candidate_rows = patch_rows(candidate[1], candidate[-1], split_tests.DT)
+                    assert_patch_rows_close(rows, candidate_rows, lifecycle=not sliding)
+                    if bounds is None:
+                        assert_patch_impulses_close(rows, candidate_rows)
+                    else:
+                        assert_region_impulses_close(rows, candidate_rows, **bounds)
+                    # The other rows keep their slots.
                     for world, count in enumerate(reference[1].constraint_count.numpy()):
                         kinds = reference[1].row_type.numpy()[world, :count]
                         other = (kinds != CONTACT) & (kinds != FRICTION)
@@ -182,14 +208,27 @@ class TestFeatherPGSIncrementalPatch(unittest.TestCase):
                         )
                     for case in (reference, candidate):
                         assert_ring_coulomb(case[1])
-                    assert_history_close(reference[1], candidate[1])
+                        assert_history_matches_rows(case[1], case[-1])
+                        if sliding:
+                            ratios.extend(ring_budget_ratios(case[1]))
+                    if not sliding:
+                        assert_anchor_sites_close(
+                            anchor_sites(reference[1], reference[-1]),
+                            anchor_sites(candidate[1], candidate[-1]),
+                            tangent=bounds is None,
+                        )
                     if name == "standing":
                         for case in (reference, candidate):
                             assert_loaded_anchors(case[1], case[-1], carried=index > 0)
-                    linked |= any(record["parents"][0] not in (-1, c) for c, record in rows.items())
+                    linked |= any(record["next"] not in (-1, c) for c, record in candidate_rows["normals"].items())
                     carried |= bool(candidate[1]._friction_patches.previous.valid.numpy().any())
-                self.assertTrue(carried, "Anchors must carry history between steps")
-                if name == "standing":
+                if sliding:
+                    self.assertGreater(
+                        float(np.mean(np.asarray(ratios) > 0.99)), 0.9, "Sliding anchors must load their budget"
+                    )
+                else:
+                    self.assertTrue(carried, "Anchors must carry history between steps")
+                if name != "tripod":
                     self.assertTrue(linked, "A box foot must link several normals in one ring")
 
 

@@ -20,11 +20,22 @@ from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_contact_triplets as triplet_tests
 from newton.tests import test_feather_pgs_sparse_solver as sparse_tests
 from newton.tests.feather_pgs_patch_parity import (
-    assert_history_close,
+    SLIDING_FEET,
+    SLIDING_ITERATIONS,
+    SLIDING_REGION_BOUNDS,
+    STANDING_REGION_BOUNDS,
+    STANDING_VELOCITY_ATOL,
+    anchor_sites,
+    assert_anchor_sites_close,
+    assert_history_matches_rows,
     assert_loaded_anchors,
+    assert_patch_impulses_close,
+    assert_patch_rows_close,
+    assert_region_impulses_close,
     assert_ring_coulomb,
-    assert_rows_close,
-    contact_rows,
+    assert_states_close,
+    patch_rows,
+    ring_budget_ratios,
     standing_model,
 )
 from newton.tests.test_feather_pgs_sparse_pgs import _sweep
@@ -202,9 +213,13 @@ class TestSparseSplitAdmission(unittest.TestCase):
 
 @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
 class TestSparseSplitPhysics(unittest.TestCase):
-    def _assert_state(self, dense, sparse):
-        """Use the existing integrated sparse-state physical error allowances."""
-        sparse_tests.TestFeatherPGSSparseSolver.assert_states_close(self, dense[2], sparse[2])
+    def _assert_state(self, dense, sparse, *, velocity_atol=2e-3):
+        """Use the existing integrated sparse-state physical error allowances.
+
+        ``velocity_atol`` bounds twists and momentum; resting feet amplify rounding into velocity
+        (STANDING_VELOCITY_ATOL).
+        """
+        assert_states_close(dense[2], sparse[2], velocity_atol=velocity_atol)
         for case in (dense, sparse):
             for field in STATE_FIELDS:
                 self.assertTrue(np.isfinite(getattr(case[2], field).numpy()).all(), field)
@@ -214,7 +229,7 @@ class TestSparseSplitPhysics(unittest.TestCase):
             (case[0].body_mass.numpy()[:, None] * case[2].body_qd.numpy()[:, :3]).sum(axis=0)
             for case in (dense, sparse)
         ]
-        np.testing.assert_allclose(momentum[1], momentum[0], atol=2e-3, rtol=2e-4)
+        np.testing.assert_allclose(momentum[1], momentum[0], atol=velocity_atol, rtol=2e-4)
 
     def _assert_rows(self, dense, sparse):
         """Compare the physical operator and residuals in the same ordered live rows."""
@@ -473,10 +488,14 @@ class TestSparseSplitPhysics(unittest.TestCase):
 
 @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
 class TestSparseSplitPatchPhysics(unittest.TestCase):
-    """Run persistent patch friction (friction_anchor_beta=0.2) through dense and sparse split rows."""
+    """Run persistent patch friction (friction_anchor_beta=0.2) through dense and sparse split rows.
+
+    Rows compare by contact for normal rows and by friction location for anchors: on a rectangular foot,
+    float32 rounding picks which corner of a support edge carries the edge's friction rows.
+    """
 
     def _pair(self, **options):
-        names = ("floating", "branches", "depth", "foot", "standing")
+        names = ("floating", "branches", "depth", "foot", "standing", "mu", "speed")
         shape = {name: options.pop(name) for name in names if name in options}
         matching = options.pop("contact_matching", None)
         options["friction_anchor_beta"] = 0.2
@@ -497,14 +516,31 @@ class TestSparseSplitPatchPhysics(unittest.TestCase):
             self.assertTrue(case[1]._friction_anchors_enabled)
         return dense, sparse
 
-    def _assert_patch(self, dense, sparse):
-        """Match states, patch rows by contact, the pooled Coulomb bound and the anchor lifecycle."""
-        TestSparseSplitPhysics._assert_state(self, dense, sparse)
-        rows = contact_rows(dense[1], dense[-1])
-        assert_rows_close(rows, contact_rows(sparse[1], sparse[-1], incident=True))
+    def _assert_patch(self, dense, sparse, *, bounds=None, lifecycle=True):
+        """Match states, patch rows, impulses, the pooled Coulomb bound and the anchor history.
+
+        With ``bounds`` (the standing feet), region impulse sums compare within them, and twists within
+        STANDING_VELOCITY_ATOL: the feet's contact rows outnumber the degrees of freedom, so float order
+        redistributes load among the rows. Without, impulses compare per normal row and per anchor.
+        ``lifecycle`` compares anchor phi and the stored anchors, which sliding anchors release at the
+        cone boundary.
+        """
+        velocity_atol = 2e-3 if bounds is None else STANDING_VELOCITY_ATOL
+        TestSparseSplitPhysics._assert_state(self, dense, sparse, velocity_atol=velocity_atol)
+        rows = patch_rows(dense[1], dense[-1], DT)
+        candidate = patch_rows(sparse[1], sparse[-1], DT)
+        assert_patch_rows_close(rows, candidate, lifecycle=lifecycle)
+        if bounds is None:
+            assert_patch_impulses_close(rows, candidate)
+        else:
+            assert_region_impulses_close(rows, candidate, **bounds)
         for case in (dense, sparse):
             assert_ring_coulomb(case[1])
-        assert_history_close(dense[1], sparse[1])
+            assert_history_matches_rows(case[1], case[-1])
+        if lifecycle:
+            assert_anchor_sites_close(
+                anchor_sites(dense[1], dense[-1]), anchor_sites(sparse[1], sparse[-1]), tangent=bounds is None
+            )
         return rows
 
     def test_patch_steps_and_masked_resets(self):
@@ -522,6 +558,7 @@ class TestSparseSplitPatchPhysics(unittest.TestCase):
         ):
             with self.subTest(shape=shape):
                 dense, sparse = self._pair(**shape)
+                bounds = STANDING_REGION_BOUNDS if shape.get("standing") else None
                 linked = carried = False
                 for index in range(24):
                     reset_worlds = ()
@@ -532,11 +569,11 @@ class TestSparseSplitPatchPhysics(unittest.TestCase):
                             case[1].reset(case[2], world_mask=wp.array(selected, dtype=wp.bool, device=case[0].device))
                     for case in (dense, sparse):
                         _step(case)
-                    rows = self._assert_patch(dense, sparse)
+                    rows = self._assert_patch(dense, sparse, bounds=bounds)
                     if shape.get("standing"):
                         for case in (dense, sparse):
                             assert_loaded_anchors(case[1], case[-1], carried=index > 0, reset_worlds=reset_worlds)
-                    linked |= any(record["parents"][0] not in (-1, c) for c, record in rows.items())
+                    linked |= any(record["next"] not in (-1, c) for c, record in rows["normals"].items())
                     carried |= bool(sparse[1]._friction_patches.previous.valid.numpy().any())
                 self.assertTrue(carried, "Anchors must carry history between steps")
                 if shape.get("foot") == "box" or shape.get("standing"):
@@ -549,7 +586,7 @@ class TestSparseSplitPatchPhysics(unittest.TestCase):
         for index in range(8):
             for case in (dense, sparse):
                 _step(case)
-            self._assert_patch(dense, sparse)
+            self._assert_patch(dense, sparse, bounds=STANDING_REGION_BOUNDS)
             # Matched anchors carry their friction impulse into the next step's seed.
             for case in (dense, sparse):
                 assert_loaded_anchors(case[1], case[-1], carried=index > 0)
@@ -568,10 +605,28 @@ class TestSparseSplitPatchPhysics(unittest.TestCase):
             _step(dense)
             _step(dense)
             wp.capture_launch(capture.graph)
-            self._assert_patch(dense, sparse)
+            self._assert_patch(dense, sparse, bounds=STANDING_REGION_BOUNDS)
             # Replayed steps carry the loaded ring-linked anchors as eager steps do.
             for case in (dense, sparse):
                 assert_loaded_anchors(case[1], case[-1])
+
+    def test_sliding_feet_share_the_pooled_budget(self):
+        """Slide both box feet at their pooled ring budgets through dense and sparse split rows.
+
+        Kinetic friction fixes each region's friction at its coefficient times the region's normal
+        load, so the region comparison resolves an anchor budget that pools only its own normal
+        (TestFeatherPGSPatchParity.test_sliding_feet_expose_a_dropped_ring_pool). The sticking stance
+        cannot: its friction stays far inside the pooled budget.
+        """
+        dense, sparse = self._pair(standing=True, pgs_iterations=SLIDING_ITERATIONS, **SLIDING_FEET)
+        ratios = []
+        for _ in range(24):
+            for case in (dense, sparse):
+                _step(case)
+            self._assert_patch(dense, sparse, bounds=SLIDING_REGION_BOUNDS, lifecycle=False)
+            for case in (dense, sparse):
+                ratios.extend(ring_budget_ratios(case[1]))
+        self.assertGreater(float(np.mean(np.asarray(ratios) > 0.99)), 0.9, "Sliding anchors must load their budget")
 
 
 if __name__ == "__main__":
