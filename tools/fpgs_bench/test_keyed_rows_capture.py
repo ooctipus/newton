@@ -55,6 +55,8 @@ def fixture(snapshot, device):
         if key.startswith("model_"):
             setattr(model, key[6:], array(key))
     solver = SimpleNamespace(model=model, **json.loads(str(snapshot["metadata_json"])))
+    # The captures solve point friction: keyed rows served no other law when they were taken.
+    solver.friction_anchor_beta, solver._friction_anchors_enabled = 0.0, False
     for key in snapshot.files:
         if key.startswith("solver_"):
             name = key[7:]
