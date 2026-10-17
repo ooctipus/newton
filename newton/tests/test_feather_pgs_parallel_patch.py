@@ -16,6 +16,7 @@ import inspect
 import itertools
 import math
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -470,6 +471,25 @@ class TestKeyedPatchRows(unittest.TestCase):
         self.assertIn("patch_law.patches.point_a.data[contact]", text)
         self.assertIn("patch_law.patches.phi.data[contact][r - 1]", text)
         self.assertEqual(text.count("load += s_x[ring];"), 2)
+
+
+class TestPatchParallelAdmission(unittest.TestCase):
+    def test_in_sweep_world_rows_serve_point_friction_only(self):
+        """Build contact rows inside the sweep only under point friction, the law that builder writes.
+
+        The builder runs after the patch link and writes parents -1 and undivided
+        coefficients, so patch friction keeps the rows its producers linked.
+        """
+        for point, keyed, inkernel, switch in itertools.product((False, True), repeat=4):
+            probe = SimpleNamespace(
+                _point_contact_paths=point,
+                _keyed_rows=object() if keyed else None,
+                _ink_sizes=(18, 0, 0, 0) if inkernel else None,
+            )
+            with self.subTest(point=point, keyed=keyed, inkernel=inkernel, switch=switch):
+                with patch.object(source, "_WR_ON", switch):
+                    admitted = SolverFeatherPGS._admit_world_rows(probe)
+                self.assertEqual(admitted, point and not keyed and inkernel and switch)
 
 
 def _dummy(arg):

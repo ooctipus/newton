@@ -7221,6 +7221,7 @@ class SolverFeatherPGS(SolverBase):
         self._pgs_solve_mf_gs_incremental_kernels = []
         self._ink_sizes = None
         self._ink_rows = 0
+        self._world_rows = False
         # Row budget of the built incremental tiers (0 when none); recorded by get_path_selection().
         self._incremental_rows = 0
         self._rb_build_kernel = None
@@ -7376,7 +7377,8 @@ class SolverFeatherPGS(SolverBase):
             self._ink_sizes = self._build_inkernel_response_meta() if (parallel_rows > 0 and _INK_ON) else None
             self._ink_rows = int(parallel_rows)
             self._incremental_rows = int(incremental_rows)
-            if _WR_ON and self._ink_sizes is not None and self._keyed_rows is None:
+            self._world_rows = self._admit_world_rows()
+            if self._world_rows:
                 self._wr_world_contacts = wp.empty(
                     (self.world_count, int(self.dense_max_constraints)), dtype=wp.int32, device=model.device
                 )
@@ -7421,7 +7423,7 @@ class SolverFeatherPGS(SolverBase):
                             inkernel_response=self._ink_sizes,
                             has_drive_rows=has_drive_rows,
                             exact_row_sums=_MF_EXACT_ROWSUM,
-                            world_rows=bool(_WR_ON and self._ink_sizes is not None and self._keyed_rows is None),
+                            world_rows=self._world_rows,
                         )
                     )
                     self._pgs_solve_mf_gs_incremental_kernels[-1]._fpgs_tier = tier_index
@@ -7443,7 +7445,7 @@ class SolverFeatherPGS(SolverBase):
                             inkernel_response=self._ink_sizes,
                             has_drive_rows=has_drive_rows,
                             exact_row_sums=_MF_EXACT_ROWSUM,
-                            world_rows=bool(_WR_ON and self._ink_sizes is not None and self._keyed_rows is None),
+                            world_rows=self._world_rows,
                             lean_sweep=os.environ.get("FEATHER_PGS_SHADOW_VARIANT", "lean") == "lean",
                             bound_finger=os.environ.get("FEATHER_PGS_SHADOW_VARIANT", "lean") == "finger",
                         )
@@ -15493,6 +15495,15 @@ class SolverFeatherPGS(SolverBase):
         if size in self._free_body_inertia_sizes and not _GROUPED_HINV_FREE:
             return False
         return True
+
+    def _admit_world_rows(self) -> bool:
+        """Whether the in-kernel-response tiers build their worlds' contact rows themselves (WORLD_ROWS).
+
+        The in-sweep builder writes point rows after the patch link: tangents at the
+        contact witnesses, ``rhs = -target``, parent -1 and undivided coefficients.
+        Patch friction keeps the linked rows its producers wrote.
+        """
+        return bool(_WR_ON and self._ink_sizes is not None and self._keyed_rows is None and self._point_contact_paths)
 
     def _world_rows_owned_le(self) -> int:
         """Dense-row budget of worlds whose contact rows the sweep kernel builds itself (0 when world_rows is off)."""
