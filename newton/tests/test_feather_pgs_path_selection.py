@@ -483,6 +483,24 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(selected["sparse_mass_matrix"], "on")
         self.assertIn("topology", selected["reasons"]["sparse_mass_matrix"])
 
+    @unittest.skipUnless(wp.is_cuda_available(), "Sparse admission requires CUDA")
+    def test_sparse_warm_start_installs_no_dense_response(self):
+        """Seed warm starts in the native sparse sweep, which keeps no dense response for the Y*lambda install."""
+        model = _build_model()
+        for beta in (0.0, 0.2):
+            for options in ({}, {"enable_joint_velocity_limits": True}):
+                with self.subTest(friction_anchor_beta=beta, **options):
+                    solver = _make_solver(model, True, pgs_warmstart=True, friction_anchor_beta=beta, **options)
+                    routes = solver.get_path_selection()["routes"]
+                    self.assertEqual(routes["sweep"]["route"], "sparse_pgs")
+                    self.assertTrue(routes["sweep"]["sparse"].endswith("_warm_start"))
+                    self.assertEqual(routes["sparse_mass_matrix"]["velocity_limits"], bool(options))
+                    # A placeholder stands in for the dense response that the install would read.
+                    self.assertEqual(solver.Y_by_size[9].shape, (1, 1, 1))
+                    keys = _launched_kernel_keys(model, solver)
+                    self.assertIn(routes["sweep"]["sparse"], keys)
+                    self.assertNotIn("apply_impulses_world_par_dof", keys)
+
     @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
     def test_cache_selection_reports_environment_and_explicit_precedence(self):
         """Retain construction-time cache decisions after environment overrides change."""

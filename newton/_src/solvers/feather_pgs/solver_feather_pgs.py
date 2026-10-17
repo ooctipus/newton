@@ -10628,10 +10628,12 @@ class SolverFeatherPGS(SolverBase):
 
                 # Initialize v_out = v_hat before GS loop
                 self._stage6_prepare_world_velocity()
-                if self.pgs_warmstart:
+                if self.pgs_warmstart and self._sparse_mass_matrix_size is None:
                     # Matrix-free GS updates velocity from impulse deltas, so
                     # cached dense lambdas must be represented in v_out before
-                    # the first delta is computed.
+                    # the first delta is computed. Native sparse factors keep no
+                    # dense response (Y is a placeholder): their sweep seeds its
+                    # factor delta from the carried impulses instead.
                     for size in self.size_groups:
                         self._stage6_apply_impulses_world(size)
                 self._apply_mf_warmstart_velocity(self.v_out, set_output_to_delta=False)
