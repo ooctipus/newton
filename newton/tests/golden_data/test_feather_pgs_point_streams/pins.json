@@ -23,6 +23,8 @@
   "friction_patches._invalidate_geometry_history": "4d74fee47e8f781f7d15f15ba3ec68da6df8aa8d38d864226ee69305cd69cb12",
   "friction_patches._merge_runs": "baef4dc3650a96bce38e2efa20bec2fb533c1d8636503f63d19fba12ca923b66",
   "friction_patches._prepare": "d1be5bb1873ff45f457c586738a25b113ed66b75e41e41eb03165373b0f986cc",
+  "friction_patches._prepare_frame": "f8b7c25f2feaa944443ea8eb82a3f6ce7db22f501c5414e71f6b676304b8250a",
+  "friction_patches._record_sorted_frame": "85e02ddb0b859279ae49f35bfd501560a375f0ab3af30585cde8de1a60998dff",
   "friction_patches._reset_history": "c0593949f72aca98aeb214e9f565b85fb3a15b1edeeeffd8162fee7524387533",
   "friction_patches._sort_chunks": "48ce5b40d45178e2413f7d680517a23ca7fd82fe94a5aa4784fdb3a7c9f1aff0",
   "friction_patches.finish_patch_impulses": "894f6105b0222864cc1509506a2ed0179845a95423a56b32aeadea8e4b71acbe",

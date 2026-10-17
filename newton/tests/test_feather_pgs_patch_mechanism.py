@@ -151,8 +151,10 @@ class _Scene:
             self._add_pair(-1, -1, (0.0, 0.0, -1.0))
         self.active = rng.random(len(self.pairs)) < 0.6
         self.capacity = contacts
+        self.generation = 0
         self.contacts = SimpleNamespace(
             rigid_contact_max=contacts,
+            contact_generation=wp.zeros(1, dtype=wp.int32, device=device),
             rigid_contact_count=wp.zeros(1, dtype=int, device=device),
             rigid_contact_shape0=wp.full(contacts, -1, dtype=int, device=device),
             rigid_contact_shape1=wp.full(contacts, -1, dtype=int, device=device),
@@ -210,8 +212,11 @@ class _Scene:
 
         ``mode`` is ``"live"`` (the active pairs), ``"sparse"`` (a single pair),
         ``"empty"`` (no contacts) or ``"overflow"`` (a count beyond the arrays).
-        ``churn`` toggles a few pairs and footprint sizes first.
+        ``churn`` toggles a few pairs and footprint sizes first. The contact
+        generation advances, as in a collision pass.
         """
+        self.generation += 1
+        self.contacts.contact_generation.assign([self.generation])
         rng = self.rng
         if churn:
             self.active ^= rng.random(len(self.pairs)) < 0.1
@@ -1206,6 +1211,470 @@ class TestPatchLiveSort(unittest.TestCase):
         """Match the reference with the live sort on multi-block grids, through merges and graph replay."""
         run_reference_differential("cuda:0", 12, worlds=160, contacts=8192, capacity=8192, live_sort=True)
         run_graph_replay("cuda:0", worlds=160, contacts=8192, capacity=8192, live_sort=True)
+
+
+def _host_branch(condition, on_true, **kwargs):
+    """Branch as :func:`warp.capture_if` does on replay: run ``on_true`` for a nonzero condition."""
+    if condition.numpy()[0]:
+        on_true(**kwargs)
+
+
+def _reusing_pair(scene, capacity, branch=_host_branch):
+    """Return a frame-reusing patch state, its reference and the list each of its pair sorts appends to.
+
+    ``branch`` stands in for :func:`warp.capture_if`; ``None`` builds eagerly.
+    """
+    phi = [wp.zeros(capacity, dtype=wp.vec2, device=scene.device) for _ in range(2)]
+    patches = _FrictionPatchState(scene.model, capacity, True, phi[0], reuse_frames=True)
+    patches._capture_branch = lambda: branch
+    sorts = []
+    order = patches._order_pairs
+
+    def counted(**kwargs):
+        sorts.append(int(patches.extent.numpy()[1]))
+        order(**kwargs)
+
+    patches._order_pairs = counted
+    return patches, ReferencePatches(scene.model, capacity, phi[1]), sorts
+
+
+_CONTACT_FIELDS = (
+    "rigid_contact_shape0",
+    "rigid_contact_shape1",
+    "rigid_contact_point0",
+    "rigid_contact_point1",
+    "rigid_contact_normal",
+    "rigid_contact_margin0",
+    "rigid_contact_margin1",
+)
+
+
+def _swapped_stream(scene, live, rng, stream=None):
+    """Return another contact stream of equal generation and count, holding the live contacts reordered.
+
+    ``stream`` receives the copy in place, for a graph captured over it.
+    """
+    if stream is None:
+        names = ("contact_generation", "rigid_contact_count", *_CONTACT_FIELDS)
+        stream = SimpleNamespace(
+            rigid_contact_max=scene.capacity, **{name: wp.empty_like(getattr(scene.contacts, name)) for name in names}
+        )
+    order = np.concatenate((rng.permutation(live), np.arange(live, scene.capacity)))
+    for name in _CONTACT_FIELDS:
+        getattr(stream, name).assign(getattr(scene.contacts, name).numpy()[order])
+    stream.contact_generation.assign(scene.contacts.contact_generation)
+    stream.rigid_contact_count.assign(scene.contacts.rigid_contact_count)
+    return stream
+
+
+def _frame_identity(contacts):
+    """Return the host's view of a contact frame: stream, generation and raw count."""
+    generation = contacts.contact_generation
+    return generation.ptr, int(generation.numpy()[0]), int(contacts.rigid_contact_count.numpy()[0])
+
+
+def _after_build(sorted_frame, identity, live):
+    """Return the frame the slots hold sorted after a build, ``None`` when no frame is recorded.
+
+    A build records the frame it sorts. A new frame without live contacts sorts
+    nothing and overwrites the slots, so it drops the record instead.
+    """
+    if live > 0 or identity == sorted_frame:
+        return identity
+    return None
+
+
+def _assert_record(test, patches, sorted_frame, context):
+    """Require the device record to name ``sorted_frame``, or to hold the sentinel generation for ``None``."""
+    record = patches.sorted_frame.numpy()
+    if sorted_frame is None:
+        test.assertEqual(int(record[0]), -1, f"{context} record")
+    else:
+        np.testing.assert_array_equal(record, sorted_frame[1:] + sorted_frame[:1], f"{context} record")
+
+
+# Collision frames of the frame-reuse differential and the substeps that solve each.
+# "live", "sparse", "empty" and "overflow" write a new frame, "repeat" advances the
+# generation over unchanged contacts and "same" keeps the last frame. Before the
+# second substep, "truncate" lowers the count without a new generation, "clear"
+# empties it and restores it before the third, "swap" moves to another contact
+# stream of equal generation and count (and back before the third), "geometry"
+# edits a shape and "forget" drops the sorted frame. "reset" resets some worlds
+# after its first substep, and "unstored" solves no rows and stores nothing in its
+# first substep.
+_REUSE_PLAN = (
+    ("live", 2),
+    ("same", 2),
+    ("live", 3),
+    ("repeat", 2),
+    ("empty", 2),
+    ("same", 1),
+    ("live", 2),
+    ("truncate", 3),
+    ("live", 1),
+    ("clear", 4),
+    ("sparse", 2),
+    ("overflow", 2),
+    ("same", 1),
+    ("live", 2),
+    ("swap", 3),
+    ("geometry", 2),
+    ("forget", 2),
+    ("unstored", 2),
+    ("reset", 2),
+    ("live", 1),
+    ("live", 2),
+)
+
+_NEW_FRAMES = ("live", "sparse", "empty", "overflow")
+
+
+def run_frame_reuse_differential(
+    test, device, seed, *, worlds=3, contacts=96, capacity=128, threads=None, live_sort=None, plan=_REUSE_PLAN
+):
+    """Solve collision frames over substeps that reuse their sorted pairs, comparing every launch group.
+
+    The patch state branches on its sort flag on the host, as a conditional
+    graph node does on replay. It must sort exactly when the contact frame
+    differs from the last one it sorted and holds live contacts, and match the
+    full-capacity reference (:func:`assert_same_patches`). Returns the counts of
+    builds that reused sorted live pairs and of sorts.
+    """
+    rng = np.random.default_rng(2000 + seed)
+    scene = _Scene(device, seed, worlds=worlds, contacts=contacts)
+    patches, reference, sorts = _reusing_pair(scene, capacity)
+    if threads is not None:
+        patches.threads, patches.build_threads = threads
+    if live_sort is not None:
+        patches.live_sort = live_sort
+    rows = _Rows(scene, capacity, rng)
+    coverage = {"reused": 0, "sorted": 0}
+    dt = 1.0 / 240.0
+    live = 0
+    sorted_frame = None
+    for step, (event, substeps) in enumerate(plan):
+        scene.move()
+        if event in _NEW_FRAMES:
+            live = scene.frame(event)
+        elif event == "repeat":
+            scene.generation += 1
+            scene.contacts.contact_generation.assign([scene.generation])
+        contacts = scene.contacts
+        for substep in range(substeps):
+            context = f"seed {seed} step {step} {event} substep {substep}"
+            if substep > 0:
+                scene.move()
+            if substep == 1 and event == "truncate":
+                test.assertGreater(live, 0, context)
+                live -= int(rng.integers(1, live + 1))
+                contacts.rigid_contact_count.assign([live])
+            if event == "clear" and substep in (1, 2):
+                # Empty the frame, then restore its count, without a new generation.
+                if substep == 1:
+                    test.assertGreater(live, 0, context)
+                    cleared, live = live, 0
+                else:
+                    live = cleared
+                contacts.rigid_contact_count.assign([live])
+            if event == "swap":
+                contacts = _swapped_stream(scene, live, rng) if substep == 1 else scene.contacts
+            if substep == 1 and event == "geometry":
+                transforms = scene.model.shape_transform.numpy()
+                transforms[int(rng.integers(0, len(transforms))), 0] += 1.0e-3
+                scene.model.shape_transform.assign(transforms)
+                for state in (patches, reference):
+                    state.update_geometry(scene.model)
+                sorted_frame = None
+            if substep == 1 and event == "forget":
+                patches.forget_frame()
+                sorted_frame = None
+            identity = _frame_identity(contacts)
+            expected = int(live > 0 and identity != sorted_frame)
+            sorted_frame = _after_build(sorted_frame, identity, live)
+            before = len(sorts)
+            for state in (patches, reference):
+                state.build(scene.model, scene.state, contacts)
+            test.assertEqual(len(sorts) - before, expected, f"{context} sorts")
+            coverage["sorted"] += expected
+            coverage["reused"] += int(live > 0 and not expected)
+            assert_same_patches(patches, reference, live, f"{context} build")
+            assert_empty_tail(patches, f"{context} build")
+            _assert_record(test, patches, sorted_frame, context)
+            if event == "unstored" and substep == 0:
+                continue
+            rows.generate(reference, live)
+            mine_maps, mine_routes = rows.arrays()
+            their_maps, their_routes = rows.arrays()
+            patches.link(*mine_maps, patch_routes(mine_routes))
+            reference.link(contacts, *their_maps, their_routes)
+            seeded = [row for row in mine_routes if row[4] > 0.0]
+            if seeded:
+                patches.seed(scene.state, *mine_maps, patch_routes(seeded))
+            reference.seed(contacts, scene.state, *their_maps, their_routes)
+            out, com = _solved_state(scene, rng)
+            patches.finish(scene.state, out, com, *mine_maps, patch_routes(mine_routes), dt)
+            reference.finish(contacts, scene.state, out, com, *their_maps, their_routes, dt)
+            _assert_same_rows(mine_routes, their_routes, rows, f"{context} rows")
+            assert_same_patches(patches, reference, live, f"{context} finish")
+            assert_empty_tail(patches, f"{context} finish")
+            if substep == 0 and event == "reset":
+                mask = wp.array(rng.random(scene.worlds) < 0.5, dtype=wp.bool, device=device)
+                for state in (patches, reference):
+                    state.reset(mask)
+                assert_same_patches(patches, reference, live, f"{context} reset")
+    return coverage
+
+
+@wp.kernel(enable_backward=False)
+def _nudge_poses(q: wp.array[wp.transform], step: float):
+    """Translate each body by a small body-dependent offset, as integrating a substep would."""
+    b = wp.tid()
+    pose = q[b]
+    offset = step * wp.vec3(float(b % 3) - 1.0, float(b % 5) - 2.0, 1.0)
+    q[b] = wp.transform(wp.transform_get_translation(pose) + offset, wp.transform_get_rotation(pose))
+
+
+# Replays of the two captured substeps, after "live", "sparse", "empty" or "overflow"
+# write a new frame, "repeat" advances the generation over unchanged contacts, "same"
+# keeps the frame, "truncate" lowers the count without a new generation, "clear"
+# empties it and "restore" brings it back, both without a new generation, "swap"
+# replays the second graph over another stream of equal generation and count,
+# "forget" drops the sorted frame and "geometry" edits a shape.
+_GRAPH_PLAN = (
+    "same",
+    "live",
+    "same",
+    "empty",
+    "same",
+    "live",
+    "truncate",
+    "same",
+    "overflow",
+    "sparse",
+    "clear",
+    "restore",
+    "same",
+    "repeat",
+    "swap",
+    "same",
+    "forget",
+    "geometry",
+    "live",
+    "same",
+)
+
+
+def run_frame_reuse_graph(test, device, *, worlds=32, contacts=1536, capacity=2048, live_sort=None):
+    """Replay two captured substeps per collision frame and compare each replay with the reference.
+
+    Conditional nodes must sort exactly the changed live frames, which the first
+    substep's flag records; the second substep always shares the frame. With the
+    radix sort, a replay that sorts nothing leaves the sort's poisoned scratch half
+    intact. A second graph captured over another contact stream of equal
+    generation and count must sort whenever replays alternate between streams.
+    """
+    rng = np.random.default_rng(31)
+    scene = _Scene(device, 33, worlds=worlds, contacts=contacts)
+    phi = [wp.zeros(capacity, dtype=wp.vec2, device=device) for _ in range(2)]
+    patches = _FrictionPatchState(scene.model, capacity, True, phi[0], reuse_frames=True)
+    reference = ReferencePatches(scene.model, capacity, phi[1])
+    if live_sort is not None:
+        patches.live_sort = live_sort
+    rows = _Rows(scene, capacity, rng)
+    reference_state = SimpleNamespace(body_q=wp.clone(scene.state.body_q))
+    other = _swapped_stream(scene, 0, rng)
+    cleared = []
+    flags = wp.zeros(2, dtype=wp.int32, device=device)
+    poison = -12345
+    dt = 1.0 / 240.0
+    decay = np.array([0.8, 0.0, 0.6])
+
+    def prepare(event):
+        scene.move()
+        live = int(scene.contacts.rigid_contact_count.numpy()[0])
+        live = min(live, capacity) if live <= scene.capacity else 0
+        stream = scene.contacts
+        if event in _NEW_FRAMES:
+            live = scene.frame(event)
+        elif event == "repeat":
+            scene.generation += 1
+            scene.contacts.contact_generation.assign([scene.generation])
+        elif event == "truncate":
+            test.assertGreater(live, 0)
+            live -= int(rng.integers(1, live + 1))
+            scene.contacts.rigid_contact_count.assign([live])
+        elif event in ("clear", "restore"):
+            if event == "clear":
+                test.assertGreater(live, 0)
+                cleared.append(live)
+            live = cleared.pop() if event == "restore" else 0
+            scene.contacts.rigid_contact_count.assign([live])
+        elif event == "swap":
+            stream = _swapped_stream(scene, live, rng, other)
+        elif event == "forget":
+            patches.forget_frame()
+        elif event == "geometry":
+            transforms = scene.model.shape_transform.numpy()
+            transforms[int(rng.integers(0, len(transforms))), 0] += 1.0e-3
+            scene.model.shape_transform.assign(transforms)
+            for state in (patches, reference):
+                state.update_geometry(scene.model)
+        reference_state.body_q.assign(scene.state.body_q)
+        reference.build(scene.model, reference_state, stream)
+        rows.generate(reference, live)
+        rows.decay = decay
+        return live, stream
+
+    def substeps(stream, maps, linked, seeded, out, com):
+        for index in range(2):
+            patches.build(scene.model, scene.state, stream)
+            wp.copy(flags, patches.sort_pairs, dest_offset=index, count=1)
+            patches.link(*maps, linked)
+            patches.seed(scene.state, *maps, seeded)
+            patches.finish(scene.state, out, com, *maps, linked, dt)
+            if index == 0:
+                wp.launch(_nudge_poses, dim=scene.body_count, inputs=[scene.state.body_q, 1.0e-4], device=device)
+
+    def reference_substeps(stream, out, com):
+        maps, routes = rows.arrays()
+        for index in range(2):
+            if index:
+                reference.build(scene.model, reference_state, stream)
+            reference.link(stream, *maps, routes)
+            reference.seed(stream, reference_state, *maps, routes)
+            reference.finish(stream, reference_state, out, com, *maps, routes, dt)
+            if index == 0:
+                wp.launch(_nudge_poses, dim=scene.body_count, inputs=[reference_state.body_q, 1.0e-4], device=device)
+        return routes
+
+    def assign(fixed, out, com):
+        (maps, routes), (fresh_maps, fresh_routes) = fixed, rows.arrays()
+        for array, values in zip(maps, fresh_maps, strict=True):
+            array.assign(values)
+        for row, values in zip(routes, fresh_routes, strict=True):
+            for array, fresh in zip(row[1:4], values[1:4], strict=True):
+                array.assign(fresh)
+        solved, centers = _solved_state(scene, rng)
+        out.body_q.assign(solved.body_q)
+        out.body_qd.assign(solved.body_qd)
+        com.assign(centers)
+
+    live, _ = prepare("live")
+    fixed = rows.arrays()
+    out, com = _solved_state(scene, rng)
+    maps, routes = fixed
+    linked, seeded = patch_routes(routes), patch_routes(row for row in routes if row[4] > 0.0)
+    substeps(scene.contacts, maps, linked, seeded, out, com)
+    their_routes = reference_substeps(scene.contacts, out, com)
+    assert_same_patches(patches, reference, live, "eager")
+    _assert_same_rows(routes, their_routes, rows, "eager")
+    graphs = {}
+    for stream in (scene.contacts, other):
+        with wp.ScopedCapture(device=device) as capture:
+            substeps(stream, maps, linked, seeded, out, com)
+        graphs[id(stream)] = capture.graph
+    sorted_frame = _frame_identity(scene.contacts)
+    reused = 0
+    n = capacity
+    for index, event in enumerate(_GRAPH_PLAN):
+        context = f"replay {index} {event}"
+        live, stream = prepare(event)
+        if event in ("forget", "geometry"):
+            sorted_frame = None
+        identity = _frame_identity(stream)
+        expected = int(live > 0 and identity != sorted_frame)
+        sorted_frame = _after_build(sorted_frame, identity, live)
+        reused += int(live > 0 and not expected)
+        assign(fixed, out, com)
+        keys = patches.current.keys.numpy()
+        keys[n:] = poison
+        patches.current.keys.assign(keys)
+        wp.capture_launch(graphs[id(stream)])
+        their_routes = reference_substeps(stream, out, com)
+        np.testing.assert_array_equal(flags.numpy(), [expected, 0], f"{context} sort flags")
+        _assert_record(test, patches, sorted_frame, context)
+        if not patches.live_sort:
+            intact = bool(np.all(patches.current.keys.numpy()[n:] == poison))
+            test.assertEqual(intact, not expected, f"{context} the radix sort ran {'never' if intact else 'once'}")
+        np.testing.assert_array_equal(scene.state.body_q.numpy(), reference_state.body_q.numpy(), context)
+        assert_same_patches(patches, reference, live, context)
+        assert_empty_tail(patches, context)
+        _assert_same_rows(routes, their_routes, rows, context)
+    test.assertGreater(reused, 0, "replays must reuse sorted live pairs")
+
+
+class TestPatchFrameReuse(unittest.TestCase):
+    def test_reused_frames_match_the_full_capacity_reference(self):
+        """Sort only changed live frames and match the reference bitwise when substeps reuse sorted pairs."""
+        totals = {"reused": 0, "sorted": 0}
+        for seed, threads in ((0, None), (1, (7, 5)), (2, (1, 3)), (3, (32, 64))):
+            with self.subTest(seed=seed, threads=threads):
+                coverage = run_frame_reuse_differential(self, "cpu", seed, threads=threads)
+                for name in totals:
+                    totals[name] += coverage[name]
+        self.assertGreater(totals["reused"], 0, "substeps must reuse sorted live pairs")
+        self.assertGreater(totals["sorted"], 0, "changed frames must sort their pairs")
+
+    def test_reused_frames_match_with_the_live_sort(self):
+        """Reuse frames sorted by the live sort, over one chunk and over several merged chunks."""
+        run_frame_reuse_differential(self, "cpu", 4, capacity=160, threads=(7, 5), live_sort=True)
+        plan = (("live", 2), ("same", 2), ("truncate", 2), ("live", 3), ("swap", 3), ("repeat", 2))
+        coverage = run_frame_reuse_differential(
+            self, "cpu", 5, worlds=110, contacts=4096, capacity=4600, threads=(97, 61), live_sort=True, plan=plan
+        )
+        self.assertGreater(coverage["reused"], 0)
+
+    def test_eager_builds_sort_every_frame(self):
+        """Sort on every eager build, without reading a condition back, and record each sorted frame."""
+        scene = _Scene("cpu", 6)
+        patches, reference, sorts = _reusing_pair(scene, 128, branch=None)
+        for builds, mode in enumerate(("live", None, "sparse", None, "empty", "live"), start=1):
+            scene.move()
+            live = scene.frame(mode) if mode else int(scene.contacts.rigid_contact_count.numpy()[0])
+            for state in (patches, reference):
+                state.build(scene.model, scene.state, scene.contacts)
+                state.store(scene.state)
+            self.assertEqual(len(sorts), builds)
+            assert_same_patches(patches, reference, live, f"build {builds}")
+            identity = _frame_identity(scene.contacts)
+            np.testing.assert_array_equal(patches.sorted_frame.numpy(), identity[1:] + identity[:1])
+
+    def test_patches_without_reuse_keep_the_original_chain(self):
+        """Launch the unconditional chain when frame reuse is off or the contacts carry no generation."""
+        scene = _Scene("cpu", 7)
+        scene.frame()
+        launched = []
+        original = wp.launch
+
+        def record(kernel, *args, **kwargs):
+            launched.append(kernel.key)
+            return original(kernel, *args, **kwargs)
+
+        anonymous = SimpleNamespace(**{k: v for k, v in vars(scene.contacts).items() if k != "contact_generation"})
+        phi = wp.zeros(128, dtype=wp.vec2, device="cpu")
+        for reuse, contacts in ((False, scene.contacts), (True, anonymous)):
+            with self.subTest(reuse=reuse):
+                patches = _FrictionPatchState(scene.model, 128, True, phi, reuse_frames=reuse)
+                launched.clear()
+                with mock.patch.object(wp, "launch", record):
+                    patches.build(scene.model, scene.state, contacts)
+                self.assertEqual(launched, ["_prepare", "_build"])
+                np.testing.assert_array_equal(patches.sorted_frame.numpy(), -1)
+        self.assertFalse(_FrictionPatchState(scene.model, 128, False, phi, reuse_frames=True).reuse_frames)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "multi-block grids need CUDA")
+    def test_reused_frames_match_on_many_blocks(self):
+        """Keep and reuse sorted pairs as the reference does while many blocks stride over the slots."""
+        run_frame_reuse_differential(self, "cuda:0", 8, worlds=48, contacts=2048, capacity=3072)
+        run_frame_reuse_differential(self, "cuda:0", 9, worlds=48, contacts=2048, capacity=3072, threads=(1000, 600))
+
+    @unittest.skipUnless(wp.is_cuda_available(), "conditional graph nodes need CUDA")
+    def test_graph_replay_skips_the_sort_of_reused_frames(self):
+        """Sort under a conditional node only for changed live frames, matching the reference on every replay."""
+        if not wp.is_conditional_graph_supported():
+            self.skipTest("Conditional graph nodes need a CUDA 12.4+ driver and Warp build")
+        run_frame_reuse_graph(self, "cuda:0")
+        run_frame_reuse_graph(self, "cuda:0", worlds=160, contacts=8192, capacity=8192, live_sort=True)
 
 
 if __name__ == "__main__":
