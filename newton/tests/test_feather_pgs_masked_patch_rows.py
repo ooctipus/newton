@@ -25,6 +25,31 @@ from newton.tests.test_feather_pgs_response_diagonal import _build_mixed_respons
 
 _DT = 1.0 / 240.0
 
+# The dense route's row arrays and the contact routing that indexes them.
+_ROW_ARRAYS = (
+    "constraint_count",
+    "contact_slot",
+    "contact_path",
+    "contact_slots_needed",
+    "row_type",
+    "row_parent",
+    "row_mu",
+    "row_beta",
+    "row_cfm",
+    "phi",
+    "target_velocity",
+    "row_restitution",
+    "rhs",
+    "impulses",
+)
+
+
+def _arrays(solver):
+    """Host copies of the whole row arrays and Jacobian blocks, the slots past each world's row count included."""
+    arrays = {name: getattr(solver, name).numpy().copy() for name in _ROW_ARRAYS}
+    arrays.update({f"J_by_size[{size}]": solver.J_by_size[size].numpy().copy() for size in solver.size_groups})
+    return arrays
+
 
 def _rows(solver, contacts):
     """Each routed contact's rows by contact index, with the Jacobian rows of every articulation it touches.
@@ -50,7 +75,10 @@ def _rows(solver, contacts):
 
 
 def _rollout(model, *, masked, steps, environment=None, **solver_kwargs):
-    """Step the scene with the masked builder on or off; return the solver and each step's rows by contact."""
+    """Step the scene with the masked builder on or off; return the solver and each step's rows by contact.
+
+    Each step records its rows by contact, the body poses and, on CPU, the whole row arrays.
+    """
     with mock.patch.dict(os.environ, environment or {}), mock.patch.object(solver_module, "_ROWS_MASKED", masked):
         solver = SolverFeatherPGS(model, **solver_kwargs)
         pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False)
@@ -64,7 +92,8 @@ def _rollout(model, *, masked, steps, environment=None, **solver_kwargs):
             pipeline.collide(states[0], contacts)
             solver.step(states[0], states[1], control, contacts, _DT)
             states.reverse()
-            records.append((_rows(solver, contacts), states[0].body_q.numpy().copy()))
+            arrays = None if model.device.is_cuda else _arrays(solver)
+            records.append((_rows(solver, contacts), states[0].body_q.numpy().copy(), arrays))
         # The record mirrors the row builders under the same import-time switches.
         methods = solver.get_path_selection()["routes"]["contact_rows"]["general_method_by_dof"]
     return solver, records, set(methods.values())
@@ -80,7 +109,7 @@ def _mixed_model(device, dof_count):
 
 
 def _anchor_count(records):
-    return sum(len(record["types"]) == 3 for rows, _ in records for record in rows.values())
+    return sum(len(record["types"]) == 3 for rows, _, _ in records for record in rows.values())
 
 
 class TestMaskedPatchRowAdmission(unittest.TestCase):
@@ -119,17 +148,36 @@ class TestMaskedPatchRows(unittest.TestCase):
         self.assertEqual(masked_methods, {"masked_combined"})
         self.assertEqual(general_methods, {"per_contact"})
         self.assertGreater(_anchor_count(masked), 0, "no contact owned an anchor")
-        self.assertGreater(sum(len(rows) for rows, _ in masked), _anchor_count(masked), "every contact owned an anchor")
-        for step, ((rows, poses), (expected_rows, expected_poses)) in enumerate(zip(masked, general, strict=True)):
+        self.assertGreater(
+            sum(len(rows) for rows, _, _ in masked), _anchor_count(masked), "every contact owned an anchor"
+        )
+        # One CPU thread reserves rows in contact order, so both rollouts give each contact the same
+        # slots and the builders agree bit for bit. The whole row arrays then also compare, past each
+        # world's row count and on rows other contacts own, where a builder that writes rows its contact
+        # did not reserve shows even when a later contact overwrites them. CUDA reserves slots in atomic
+        # order: rows compare by contact.
+        exact = not model.device.is_cuda
+        for step, (record, expected) in enumerate(zip(masked, general, strict=True)):
+            (rows, poses, arrays), (expected_rows, expected_poses, expected_arrays) = record, expected
             with self.subTest(step=step):
-                assert_rows_close(rows, expected_rows, atol=1.0e-6, rtol=1.0e-6)
-                assert_contact_impulses_close(rows, expected_rows)
-                np.testing.assert_allclose(poses, expected_poses, atol=2.0e-5, rtol=0.0)
-        assert_history_close(masked_solver, general_solver)
+                if exact:
+                    for name, values in arrays.items():
+                        np.testing.assert_array_equal(values, expected_arrays[name], err_msg=name)
+                    assert_rows_close(rows, expected_rows, atol=0.0, rtol=0.0)
+                    assert_contact_impulses_close(rows, expected_rows, atol=0.0, rtol=0.0)
+                    np.testing.assert_array_equal(poses, expected_poses)
+                else:
+                    assert_rows_close(rows, expected_rows, atol=1.0e-6, rtol=1.0e-6)
+                    assert_contact_impulses_close(rows, expected_rows)
+                    np.testing.assert_allclose(poses, expected_poses, atol=2.0e-5, rtol=0.0)
+        if exact:
+            assert_history_close(masked_solver, general_solver, atol=0.0, rtol=0.0)
+        else:
+            assert_history_close(masked_solver, general_solver)
         return masked_solver
 
     def test_cpu_masked_patch_rows_match_the_per_contact_builder(self):
-        """Patch rows, ring links, Jacobians and steps agree with the per-contact builder (split mode)."""
+        """Patch rows, ring links, Jacobians and steps equal the per-contact builder's bit for bit (split mode)."""
         for name, model, steps in (
             ("standing", standing_model("cpu"), 4),
             ("arm_and_box", _mixed_model("cpu", 13), 8),
