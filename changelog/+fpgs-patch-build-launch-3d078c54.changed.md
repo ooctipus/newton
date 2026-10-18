@@ -1,0 +1,1 @@
+Launch the persistent patch-friction builder of `SolverFeatherPGS` (`friction_anchor_beta > 0`) in one-warp blocks on twice the former CUDA grid, which takes 15-19% less GPU time per build in measured scenes and leaves results unchanged.

@@ -36,6 +36,7 @@ import gc
 import inspect
 import itertools
 import os
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -272,6 +273,12 @@ def _pair(scene, capacity):
     return _FrictionPatchState(scene.model, capacity, True, phi[0]), ReferencePatches(scene.model, capacity, phi[1])
 
 
+def _set_threads(patches, threads):
+    """Stride ``patches``' light launches and builds with ``threads``; the live sort's merges stride as builds."""
+    patches.threads, patches.build_threads = threads
+    patches.merge_threads = patches.build_threads
+
+
 def _twin(patches, scene):
     """Return a second patch state on another grid, which CUDA tests step alongside ``patches``, or None on the CPU.
 
@@ -287,7 +294,7 @@ def _twin(patches, scene):
     twin = _FrictionPatchState(
         scene.model, patches.capacity, True, wp.zeros_like(patches.view.phi), reuse_frames=patches.reuse_frames
     )
-    twin.threads, twin.build_threads = _TWIN_THREADS
+    _set_threads(twin, _TWIN_THREADS)
     twin.sort_blocks = 1
     twin.live_sort = patches.live_sort
     if twin.reuse_frames:
@@ -715,7 +722,7 @@ def run_reference_differential(
     scene = _Scene(device, seed, worlds=worlds, bodies=bodies, contacts=contacts)
     patches, reference = _pair(scene, capacity)
     if threads is not None:
-        patches.threads, patches.build_threads = threads
+        _set_threads(patches, threads)
     if live_sort is not None:
         patches.live_sort = live_sort
     twin = _twin(patches, scene)
@@ -961,7 +968,7 @@ def run_unstored_builds(device, seed, *, worlds=3, contacts=96, capacity=96, thr
     scene = _Scene(device, seed, worlds=worlds, contacts=contacts)
     patches, reference = _pair(scene, capacity)
     if threads is not None:
-        patches.threads, patches.build_threads = threads
+        _set_threads(patches, threads)
     twin = _twin(patches, scene)
     scene.active[:] = True
     for mode in ("live", "overflow", "live", "sparse", "empty"):
@@ -1224,6 +1231,241 @@ class TestPatchLiveSort(unittest.TestCase):
         run_graph_replay("cuda:0", worlds=160, contacts=8192, capacity=8192, live_sort=True)
 
 
+def _shape(capacity, sms, *, light, build, block, merge=4, sort=2):
+    """Return the launch attributes of a patch state with ``capacity`` slots on ``sms`` SMs.
+
+    ``light``, ``build`` and ``merge`` count 256-thread blocks per SM of the light
+    launches, ``_build`` and ``_merge_runs``, ``block`` is ``_build``'s block size,
+    and ``sort`` counts the live sort's chunk blocks per SM.
+    """
+    return {
+        "threads": max(1, min(capacity, light * sms * 256)),
+        "build_threads": max(1, min(capacity, build * sms * 256)),
+        "build_block_dim": block,
+        "merge_threads": max(1, min(capacity, merge * sms * 256)),
+        "sort_blocks": max(1, min(-(-capacity // 2048), sort * sms)),
+    }
+
+
+# Launch shapes before and since one-warp _build blocks on a wider grid.
+_FORMER_SHAPE = {"light": 2, "build": 4, "block": 256}
+_SHAPE = {"light": 2, "build": 8, "block": 32}
+# An odd shape, far below the live counts, on any device.
+_ODD_SHAPE = {"threads": 7, "build_threads": 5, "build_block_dim": 32, "merge_threads": 3, "sort_blocks": 1}
+
+# Collision frames of the launch-shape differential and the substeps that solve
+# each: "grow" activates more pairs, "sparse" keeps one pair, "empty" and
+# "overflow" leave no live contact, "unstored" first builds a sparse frame that
+# no store follows and resets every world, "store" stores the frame again
+# without finishing it, and "masked" resets some worlds after its substeps.
+_SHAPE_PLAN = (
+    ("grow", 2),
+    ("grow", 1),
+    ("grow", 2),
+    ("live", 2),
+    ("sparse", 1),
+    ("unstored", 2),
+    ("live", 1),
+    ("empty", 1),
+    ("store", 1),
+    ("overflow", 2),
+    ("live", 2),
+    ("masked", 2),
+    ("live", 1),
+)
+
+
+def run_launch_shapes(device, seed, shapes, *, worlds=3, contacts=96, capacity=128, live_sort=None, reuse=False):
+    """Step one patch state per launch shape on identical inputs; every array must match the first state's bitwise.
+
+    ``shapes`` holds attribute overrides (:func:`_shape`), ``None`` for the
+    constructor's own shape. Each frame is built, linked, seeded and finished
+    over its substeps, which reuse its sorted pairs with ``reuse``, branching
+    on the host as a graph replay's conditional node does (:func:`_host_branch`).
+    After each launch group every array of every state, sort halves and scratch
+    included, and every row array must equal the first state's (frames follow
+    ``_SHAPE_PLAN``). Returns the largest live count and the carried anchors.
+    """
+    rng = np.random.default_rng(4000 + seed)
+    scene = _Scene(device, seed, worlds=worlds, contacts=contacts)
+    states = []
+    for shape in shapes:
+        phi = wp.zeros(capacity, dtype=wp.vec2, device=device)
+        state = _FrictionPatchState(scene.model, capacity, True, phi, reuse_frames=reuse)
+        for name, value in (shape or {}).items():
+            setattr(state, name, value)
+        if live_sort is not None:
+            state.live_sort = live_sort
+        if reuse:
+            state._capture_branch = lambda: _host_branch
+            state._capture_can_pause = lambda: True
+        states.append(state)
+    first = states[0]
+    rows = _Rows(scene, capacity, rng)
+    coverage = {"live": 0, "carried": 0}
+    dt = 1.0 / 240.0
+    fraction = 0.2
+
+    def check(context, routes=None):
+        for index, state in enumerate(states[1:], start=1):
+            assert_same_state(state, first, f"{context} shape {index}")
+            if routes is not None:
+                _assert_same_rows(routes[index], routes[0], rows, f"{context} shape {index}", exact=True)
+
+    def each(method, *args):
+        for state in states:
+            getattr(state, method)(*args)
+
+    for step, (event, substeps) in enumerate(_SHAPE_PLAN):
+        context = f"seed {seed} step {step} {event}"
+        scene.move()
+        if event == "grow":
+            fraction = min(1.0, fraction + 0.4)
+            scene.active = scene.rng.random(len(scene.pairs)) < fraction
+        if event == "unstored":
+            scene.frame("sparse")
+            each("build", scene.model, scene.state, scene.contacts)
+            check(f"{context} unstored build")
+            each("reset", None)
+            check(f"{context} unstored reset")
+        if event == "store":
+            each("store", scene.state)
+            check(f"{context} store")
+            continue
+        live = scene.frame({"sparse": "sparse", "empty": "empty", "overflow": "overflow"}.get(event, "live"))
+        coverage["live"] = max(coverage["live"], live)
+        for substep in range(substeps):
+            stage = f"{context} substep {substep}"
+            if substep > 0:
+                scene.move()
+            each("build", scene.model, scene.state, scene.contacts)
+            check(f"{stage} build")
+            coverage["carried"] += int(np.count_nonzero(first.current.source.numpy()[:live] >= 0))
+            rows.generate(first, live)
+            arrays = [rows.arrays() for _ in states]
+            routes = [row for _, row in arrays]
+            for state, (maps, row) in zip(states, arrays, strict=True):
+                state.link(*maps, patch_routes(row))
+            check(f"{stage} link", routes)
+            for state, (maps, row) in zip(states, arrays, strict=True):
+                seeded = [entry for entry in row if entry[4] > 0.0]
+                if seeded:
+                    state.seed(scene.state, *maps, patch_routes(seeded))
+            check(f"{stage} seed", routes)
+            out, com = _solved_state(scene, rng)
+            for state, (maps, row) in zip(states, arrays, strict=True):
+                state.finish(scene.state, out, com, *maps, patch_routes(row), dt)
+            check(f"{stage} finish", routes)
+        if event == "masked":
+            each("reset", wp.array(rng.random(scene.worlds) < 0.5, dtype=wp.bool, device=device))
+            check(f"{context} reset")
+    return coverage
+
+
+@contextlib.contextmanager
+def _patch_variants_compiled_here():
+    """Compile the patch module's block-size variants in this process, into a temporary kernel cache.
+
+    Which product of a sum NVRTC leaves unfused can follow the order in which
+    Warp emits a module's kernels, and that order differs between processes
+    (module docstring). _build launches from a variant of its own block size,
+    so two cached variants that two processes compiled may round carried
+    displacements differently. Variants compiled by one process share the
+    emission order and must match bitwise.
+    """
+    module = friction_patches._build.module
+    cache = wp.config.kernel_cache_dir
+    with tempfile.TemporaryDirectory() as directory:
+        module.unload()
+        wp.config.kernel_cache_dir = directory
+        try:
+            yield
+        finally:
+            wp.config.kernel_cache_dir = cache
+            module.unload()
+
+
+class TestPatchLaunchShapes(unittest.TestCase):
+    def test_builds_launch_one_warp_blocks_on_a_wider_grid(self):
+        """Launch _build in one-warp blocks over twice the former grid; merges and light passes keep theirs."""
+        scene = _Scene("cpu", 1, worlds=110, contacts=4096)
+        scene.active[:] = True
+        for capacity in (96, 3000, 4600, 10000):
+            with self.subTest(capacity=capacity):
+                phi = wp.zeros(capacity, dtype=wp.vec2, device="cpu")
+                state = _FrictionPatchState(scene.model, capacity, True, phi)
+                # The CPU counts as one SM.
+                expected = _shape(capacity, 1, **_SHAPE)
+                self.assertEqual({name: getattr(state, name) for name in expected}, expected)
+        state.live_sort = True
+        launched = set()
+        original = wp.launch
+
+        def record(kernel, **kwargs):
+            # Each launch strides over the slots by its own thread count.
+            arguments = [*kwargs.get("inputs", ()), *kwargs.get("outputs", ())]
+            stride = dict(zip((arg.label for arg in kernel.adj.args), arguments, strict=True))["threads"]
+            launched.add((kernel.key, kwargs["dim"], stride, kwargs.get("block_dim")))
+            return original(kernel, **kwargs)
+
+        self.assertGreater(scene.frame(), 2048, "more than one chunk of live contacts runs the merges")
+        with mock.patch.object(wp, "launch", record):
+            state.build(scene.model, scene.state, scene.contacts)
+        self.assertEqual(
+            launched, {("_prepare", 512, 512, None), ("_merge_runs", 1024, 1024, None), ("_build", 2048, 2048, 32)}
+        )
+
+    def test_launch_shapes_match_bitwise(self):
+        """Build, link, seed, finish, store and reset bitwise on every grid, with each sort, reusing frames or not."""
+        shapes = (None, _shape(4600, 1, **_FORMER_SHAPE), _ODD_SHAPE)
+        for live_sort, reuse in itertools.product((False, True), (False, True)):
+            with self.subTest(live_sort=live_sort, reuse=reuse):
+                coverage = run_launch_shapes(
+                    "cpu", 2, shapes, worlds=110, contacts=4096, capacity=4600, live_sort=live_sort, reuse=reuse
+                )
+                self.assertGreater(coverage["live"], 2048, "the live sort must merge chunks")
+                self.assertGreater(coverage["carried"], 0, "the frames must carry anchor history")
+
+    @unittest.skipUnless(wp.is_cuda_available(), "launch shapes need CUDA")
+    def test_launch_shapes_match_bitwise_on_the_device(self):
+        """Match the former 256-thread _build blocks and grids bitwise with one-warp blocks on the device.
+
+        The device shapes differ only in _build's block size at this capacity; the
+        one-SM shapes and the odd shape also stride over the live slots. Both
+        block-size variants of the patch module compile in this process
+        (:func:`_patch_variants_compiled_here`).
+        """
+        device = wp.get_device("cuda:0")
+        capacity = 4600
+        default = _shape(capacity, device.sm_count, **_SHAPE)
+        shapes = (
+            None,
+            _shape(capacity, device.sm_count, **_FORMER_SHAPE),
+            _shape(capacity, 1, **_FORMER_SHAPE),
+            _shape(capacity, 1, **_SHAPE),
+            _ODD_SHAPE,
+        )
+        with _patch_variants_compiled_here():
+            for live_sort, reuse in itertools.product((False, True), (False, True)):
+                with self.subTest(live_sort=live_sort, reuse=reuse):
+                    coverage = run_launch_shapes(
+                        device,
+                        3,
+                        shapes,
+                        worlds=110,
+                        contacts=4096,
+                        capacity=capacity,
+                        live_sort=live_sort,
+                        reuse=reuse,
+                    )
+                    self.assertGreater(coverage["live"], 2048, "the live sort must merge chunks")
+                    self.assertGreater(coverage["carried"], 0, "the frames must carry anchor history")
+        state = _FrictionPatchState(
+            _Scene(device, 0).model, capacity, True, wp.zeros(capacity, dtype=wp.vec2, device=device)
+        )
+        self.assertEqual({name: getattr(state, name) for name in default}, default)
+
+
 def _bare_solver(**attributes):
     """Return a ``SolverFeatherPGS`` that skipped construction, with ``attributes`` and a deviceless model."""
     solver = object.__new__(SolverFeatherPGS)
@@ -1396,7 +1638,7 @@ def run_frame_reuse_differential(
     scene = _Scene(device, seed, worlds=worlds, contacts=contacts)
     patches, reference, sorts = _reusing_pair(scene, capacity)
     if threads is not None:
-        patches.threads, patches.build_threads = threads
+        _set_threads(patches, threads)
     if live_sort is not None:
         patches.live_sort = live_sort
     twin = _twin(patches, scene)

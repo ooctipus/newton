@@ -52,11 +52,24 @@ from ...sim.contacts import GENERATION_SENTINEL
 from .capture_joins import capture_has_unjoined_work
 from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
 
-# Grids are fixed at construction so CUDA graphs replay them. The sizes are
-# provisional until calibrated against the measured empty-launch floor.
+# Grids are fixed at construction so CUDA graphs replay them. Their sizes count
+# _BLOCK_THREADS threads per SM (one SM on the CPU); launches stride over the
+# live slots, so no grid changes any output. The light grid is provisional
+# until calibrated against the measured empty-launch floor.
 _BLOCK_THREADS = 256
 _LIGHT_BLOCKS_PER_SM = 2
-_BUILD_BLOCKS_PER_SM = 4
+# A _build thread walks one body pair's run, a chain of dependent loads at 96
+# registers. One-warp blocks fit 21 warps per SM instead of two 256-thread
+# blocks' 16, free each warp's slot when it finishes rather than with its
+# slowest block-mate, and spread a short frame's runs over every SM; the wider
+# grid leaves no thread a second run below 8 * SMs * 256 live slots. Measured
+# on a 188-SM GPU: 0.82x the time per build with 512k live contacts, 0.85x
+# with 346k, 0.81x with 1.6k of a 4M capacity.
+_BUILD_BLOCK_DIM = 32
+_BUILD_BLOCKS_PER_SM = 8
+# _merge_runs keeps the former build grid: a live sort launches it for every
+# merge round its capacity allows, mostly over few live slots.
+_MERGE_BLOCKS_PER_SM = 4
 # From this contact capacity on, the pair sort orders only the live slots
 # instead of the whole capacity. Provisional: calibrate against the full radix
 # sort on the GPU at large capacities and at high occupancy.
@@ -1282,6 +1295,8 @@ class _FrictionPatchState:
         blocks = device.sm_count if device.is_cuda else 1
         self.threads = max(1, min(capacity, _LIGHT_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
         self.build_threads = max(1, min(capacity, _BUILD_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
+        self.build_block_dim = _BUILD_BLOCK_DIM
+        self.merge_threads = max(1, min(capacity, _MERGE_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
         self.live_sort = _uses_live_sort(capacity, self.key_bits)
         self.sort_blocks = max(1, min(-(-capacity // _SORT_CHUNK), _LIGHT_BLOCKS_PER_SM * blocks))
         self.merges = 0
@@ -1502,7 +1517,17 @@ class _FrictionPatchState:
                     self._order_pairs(record=record)
                 else:
                     branch(self.sort_pairs, on_true=self._order_pairs, record=record)
-        wp.launch(_build, dim=self.build_threads, inputs=build_inputs, outputs=[self.built], device=model.device)
+        # Warp compiles this module once more for _build's block size; the
+        # variants differ only in the tile block size, which no _build
+        # arithmetic reads.
+        wp.launch(
+            _build,
+            dim=self.build_threads,
+            inputs=build_inputs,
+            outputs=[self.built],
+            device=model.device,
+            block_dim=self.build_block_dim,
+        )
 
     def _capture_branch(self):
         """Return :func:`warp.capture_if` while Warp captures this device's stream, else ``None``.
@@ -1556,8 +1581,8 @@ class _FrictionPatchState:
         for merge in range(self.merges):
             wp.launch(
                 _merge_runs,
-                dim=self.build_threads,
-                inputs=[keys, indices, self.extent, self.capacity, merge, self.build_threads],
+                dim=self.merge_threads,
+                inputs=[keys, indices, self.extent, self.capacity, merge, self.merge_threads],
                 device=self.device,
             )
 
