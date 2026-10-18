@@ -1285,7 +1285,164 @@ _SHAPE_PLAN = (
 )
 
 
-def run_launch_shapes(device, seed, shapes, *, worlds=3, contacts=96, capacity=128, live_sort=None, reuse=False):
+class _TiledScene:
+    """Copies of a :class:`_Scene` side by side in one model, for live contact counts of device scale.
+
+    Copy k holds the base scene's worlds, bodies and shapes from k times their
+    counts on, at the base poses. Each frame repeats the base frame in every
+    copy, with all copies' contacts in one random order, so a pair's contacts
+    differ between copies only in their order. The base has no shapeless
+    pairs: the pair of two missing shapes would join every copy's contacts in
+    one run.
+    """
+
+    # Per-contact arrays of a frame.
+    _FIELDS = ("shape0", "shape1", "point0", "point1", "normal", "margin0", "margin1")
+
+    def __init__(self, device, seed, copies, *, worlds, contacts):
+        self.base = base = _Scene("cpu", seed, worlds=worlds, contacts=contacts, shapeless_pairs=False)
+        self.copies = copies
+        self.device = device
+        self.worlds = base.worlds * copies
+        self.body_count = base.body_count * copies
+        self.capacity = base.capacity * copies
+        self.shape_count = base.model.shape_body.shape[0]
+        copy = np.arange(copies)[:, None]
+        self.body_world = (base.body_world + base.worlds * copy).ravel().astype(np.int32)
+        arrays = {}
+        for name, array in vars(base.model).items():
+            if isinstance(array, wp.array):
+                values = array.numpy()
+                tiled = np.tile(values, (copies,) + (1,) * (values.ndim - 1))
+                arrays[name] = wp.array(tiled, dtype=array.dtype, device=device)
+        shape_body = base.model.shape_body.numpy()
+        shape_body = np.where(shape_body >= 0, shape_body + base.body_count * copy, -1).ravel()
+        arrays["shape_body"] = wp.array(shape_body, dtype=int, device=device)
+        arrays["body_world"] = wp.array(self.body_world, dtype=int, device=device)
+        self.model = SimpleNamespace(device=wp.get_device(device), body_count=self.body_count, **arrays)
+        self.poses = np.tile(base.poses, (copies, 1))
+        self.state = SimpleNamespace(body_q=wp.array(self.poses, dtype=wp.transform, device=device))
+        self.contacts = SimpleNamespace(
+            rigid_contact_max=self.capacity,
+            contact_generation=wp.zeros(1, dtype=wp.int32, device=device),
+            rigid_contact_count=wp.zeros(1, dtype=int, device=device),
+        )
+        for name in self._FIELDS:
+            array = getattr(base.contacts, f"rigid_contact_{name}")
+            setattr(self.contacts, f"rigid_contact_{name}", wp.zeros(self.capacity, dtype=array.dtype, device=device))
+
+    @property
+    def rng(self):
+        return self.base.rng
+
+    @property
+    def pairs(self):
+        return self.base.pairs
+
+    @property
+    def active(self):
+        return self.base.active
+
+    @active.setter
+    def active(self, value):
+        self.base.active = value
+
+    def move(self, scale=1.0):
+        """Move the base scene's bodies and every copy of them alike."""
+        self.base.move(scale)
+        self.poses = np.tile(self.base.poses, (self.copies, 1))
+        self.state.body_q.assign(self.poses)
+
+    def frame(self, mode="live", churn=True):
+        """Repeat a base frame (:meth:`_Scene.frame`) in every copy and return the live contact count."""
+        base = self.base
+        base.frame(mode, churn)
+        count = int(base.contacts.rigid_contact_count.numpy()[0])
+        self.contacts.contact_generation.assign([base.generation])
+        if count > base.capacity:
+            # An overflowing count stays as far past the copies' capacity.
+            self.contacts.rigid_contact_count.assign([self.capacity + count - base.capacity])
+            return 0
+        live = count * self.copies
+        copy, contact = np.divmod(self.rng.permutation(live), max(count, 1))
+        for name in self._FIELDS:
+            values = getattr(base.contacts, f"rigid_contact_{name}").numpy()[contact]
+            empty = 0
+            if name.startswith("shape"):
+                values = np.where(values >= 0, values + self.shape_count * copy, -1)
+                empty = -1
+            tiled = np.full((self.capacity, *values.shape[1:]), empty, dtype=values.dtype)
+            tiled[:live] = values
+            getattr(self.contacts, f"rigid_contact_{name}").assign(tiled)
+        self.contacts.rigid_contact_count.assign([live])
+        return live
+
+
+class _WideRows(_Rows):
+    """:class:`_Rows` for frames of device scale, with as many rows per world as the fullest world needs.
+
+    Live contacts get the world, route, slot and row values :class:`_Rows`
+    gives them, from array operations: each route reserves a world's slots in
+    one random order of the live contacts. Slots past the live count keep
+    stale values, and the row arrays need not hold three rows per slot of the
+    capacity in every world.
+    """
+
+    def generate(self, reference, live, routes=(0, 1, 2)):
+        rng, n, worlds = self.rng, self.capacity, self.scene.worlds
+        body_a = reference.current.body_a.numpy()[:live]
+        body_b = reference.current.body_b.numpy()[:live]
+        weight = reference.view.weight.numpy()[:live]
+        world = rng.integers(0, worlds, size=n)
+        path = rng.integers(0, 3, size=n)
+        needed = rng.choice([1, 3], size=n)
+        body = np.where(body_a >= 0, body_a, body_b)
+        world[:live] = np.where(body >= 0, self.scene.body_world[np.maximum(body, 0)], 0)
+        # Contacts of one pair mostly share a route, as the allocator assigns them.
+        shared = rng.random(live) < 0.9
+        path[:live] = np.where(shared, (np.maximum(body_a, body_b) + 7) % 3, rng.integers(0, 3, size=live))
+        needed[:live] = np.where((weight > 0.0) & (rng.random(live) < 0.9), 3, 1)
+        # Capacity rejections and routes without rows get no slot.
+        order = rng.permutation(live)
+        order = order[(rng.random(live) >= 0.05) & np.isin(path[order], routes)]
+        order = order[np.argsort(path[order] * worlds + world[order], kind="stable")]
+        group = path[order] * worlds + world[order]
+        end = np.cumsum(needed[order])
+        first = (end - needed[order])[np.searchsorted(group, group)]
+        start = end - needed[order] - first
+        self.rows = rows = int((end - first).max(initial=0)) + 8
+        slot = rng.integers(0, rows - 3, size=n)
+        slot[:live] = -1
+        slot[order] = start
+        parents = rng.integers(-1, rows, size=(3, worlds, rows))
+        mu = rng.uniform(0.0, 1.0, size=(3, worlds, rows))
+        impulses = rng.uniform(-1.0, 1.0, size=(3, worlds, rows))
+        r, w, s = path[order], world[order], start
+        load = np.where(rng.random(len(order)) < 0.15, 0.0, rng.uniform(0.1, 2.0, size=len(order)))
+        budget = rng.uniform(0.2, 1.0, size=len(order))
+        parents[r, w, s] = -1
+        impulses[r, w, s] = load
+        mu[r, w, s] = budget
+        friction = needed[order] == 3
+        r, w, s, budget, load = r[friction], w[friction], s[friction], budget[friction], load[friction]
+        tangent = rng.normal(size=(len(s), 2))
+        tangent *= (budget * load * rng.uniform(0.0, 3.0, size=len(s)) / np.maximum(np.hypot(*tangent.T), 1.0e-9))[
+            :, None
+        ]
+        for k in (1, 2):
+            parents[r, w, s + k] = s
+            mu[r, w, s + k] = budget
+            impulses[r, w, s + k] = tangent[:, k - 1]
+        self.maps = (world, slot, path, needed)
+        self.values = (parents, mu, impulses)
+        self.routes = routes
+        self.live = live
+        self.decay = np.where(rng.random(3) < 0.3, 0.0, rng.uniform(0.3, 1.0, size=3))
+
+
+def run_launch_shapes(
+    device, seed, shapes, *, worlds=3, contacts=96, capacity=128, live_sort=None, reuse=False, copies=1, stages=None
+):
     """Step one patch state per launch shape on identical inputs; every array must match the first state's bitwise.
 
     ``shapes`` holds attribute overrides (:func:`_shape`), ``None`` for the
@@ -1294,10 +1451,20 @@ def run_launch_shapes(device, seed, shapes, *, worlds=3, contacts=96, capacity=1
     on the host as a graph replay's conditional node does (:func:`_host_branch`).
     After each launch group every array of every state, sort halves and scratch
     included, and every row array must equal the first state's (frames follow
-    ``_SHAPE_PLAN``). Returns the largest live count and the carried anchors.
+    ``_SHAPE_PLAN``); ``stages`` limits the comparisons to the named launch
+    groups ("build", "link", "seed", "finish", "store" and "reset"). With
+    ``copies`` above one the scene is that many copies of a scene of
+    ``worlds`` and ``contacts`` (:class:`_TiledScene`), and ``capacity`` counts
+    slots per copy. Returns the largest live count and the carried anchors.
     """
     rng = np.random.default_rng(4000 + seed)
-    scene = _Scene(device, seed, worlds=worlds, contacts=contacts)
+    if copies == 1:
+        scene = _Scene(device, seed, worlds=worlds, contacts=contacts)
+        rows = _Rows(scene, capacity, rng)
+    else:
+        scene = _TiledScene(device, seed, copies, worlds=worlds, contacts=contacts)
+        capacity *= copies
+        rows = _WideRows(scene, capacity, rng)
     states = []
     for shape in shapes:
         phi = wp.zeros(capacity, dtype=wp.vec2, device=device)
@@ -1311,12 +1478,13 @@ def run_launch_shapes(device, seed, shapes, *, worlds=3, contacts=96, capacity=1
             state._capture_can_pause = lambda: True
         states.append(state)
     first = states[0]
-    rows = _Rows(scene, capacity, rng)
     coverage = {"live": 0, "carried": 0}
     dt = 1.0 / 240.0
     fraction = 0.2
 
-    def check(context, routes=None):
+    def check(group, context, routes=None):
+        if stages is not None and group not in stages:
+            return
         for index, state in enumerate(states[1:], start=1):
             assert_same_state(state, first, f"{context} shape {index}")
             if routes is not None:
@@ -1335,12 +1503,12 @@ def run_launch_shapes(device, seed, shapes, *, worlds=3, contacts=96, capacity=1
         if event == "unstored":
             scene.frame("sparse")
             each("build", scene.model, scene.state, scene.contacts)
-            check(f"{context} unstored build")
+            check("build", f"{context} unstored build")
             each("reset", None)
-            check(f"{context} unstored reset")
+            check("reset", f"{context} unstored reset")
         if event == "store":
             each("store", scene.state)
-            check(f"{context} store")
+            check("store", f"{context} store")
             continue
         live = scene.frame({"sparse": "sparse", "empty": "empty", "overflow": "overflow"}.get(event, "live"))
         coverage["live"] = max(coverage["live"], live)
@@ -1349,26 +1517,26 @@ def run_launch_shapes(device, seed, shapes, *, worlds=3, contacts=96, capacity=1
             if substep > 0:
                 scene.move()
             each("build", scene.model, scene.state, scene.contacts)
-            check(f"{stage} build")
+            check("build", f"{stage} build")
             coverage["carried"] += int(np.count_nonzero(first.current.source.numpy()[:live] >= 0))
             rows.generate(first, live)
             arrays = [rows.arrays() for _ in states]
             routes = [row for _, row in arrays]
             for state, (maps, row) in zip(states, arrays, strict=True):
                 state.link(*maps, patch_routes(row))
-            check(f"{stage} link", routes)
+            check("link", f"{stage} link", routes)
             for state, (maps, row) in zip(states, arrays, strict=True):
                 seeded = [entry for entry in row if entry[4] > 0.0]
                 if seeded:
                     state.seed(scene.state, *maps, patch_routes(seeded))
-            check(f"{stage} seed", routes)
+            check("seed", f"{stage} seed", routes)
             out, com = _solved_state(scene, rng)
             for state, (maps, row) in zip(states, arrays, strict=True):
                 state.finish(scene.state, out, com, *maps, patch_routes(row), dt)
-            check(f"{stage} finish", routes)
+            check("finish", f"{stage} finish", routes)
         if event == "masked":
             each("reset", wp.array(rng.random(scene.worlds) < 0.5, dtype=wp.bool, device=device))
-            check(f"{context} reset")
+            check("reset", f"{context} reset")
     return coverage
 
 
@@ -1492,6 +1660,40 @@ class TestPatchLaunchShapes(unittest.TestCase):
             _Scene(device, 0).model, capacity, True, wp.zeros(capacity, dtype=wp.vec2, device=device)
         )
         self.assertEqual({name: getattr(state, name) for name in default}, default)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "launch shapes need CUDA")
+    def test_launch_shapes_match_bitwise_at_device_scale(self):
+        """Match the former device grids bitwise where the live contacts outnumber every grid's threads.
+
+        A full frame of the scene's copies (:class:`_TiledScene`) holds a
+        quarter more live contacts than _build's grid has threads, eight
+        256-thread blocks per SM, so no grid is capped by the capacity and each
+        launch strides over the live slots. The states compare after each
+        finish, store and reset, with and without frame reuse.
+        """
+        device = wp.get_device("cuda:0")
+        widest = _SHAPE["build"] * device.sm_count * 256
+        worlds, contacts, capacity = 64, 2048, 2304
+        copies = -(-5 * widest // (4 * contacts))
+        shapes = (None, _shape(capacity * copies, device.sm_count, **_FORMER_SHAPE))
+        with _patch_variants_compiled_here(device):
+            for reuse in (False, True):
+                with self.subTest(reuse=reuse):
+                    coverage = run_launch_shapes(
+                        device,
+                        4,
+                        shapes,
+                        worlds=worlds,
+                        contacts=contacts,
+                        capacity=capacity,
+                        reuse=reuse,
+                        copies=copies,
+                        stages=("finish", "store", "reset"),
+                    )
+                    self.assertGreater(
+                        coverage["live"], widest, "the live contacts must outnumber every grid's threads"
+                    )
+                    self.assertGreater(coverage["carried"], 0, "the frames must carry anchor history")
 
 
 def _ring_case(device, seed, *, contacts=600, worlds=3):
