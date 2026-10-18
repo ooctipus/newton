@@ -2291,9 +2291,11 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
     def test_solver_graphs_replay_empty_contact_frames(self):
         """Replay graphs bitwise as eager flag-off steps over empty, live and again empty contact frames.
 
-        Boxes fall, rest on the ground, are thrown up while their anchors are stored
-        and land again. A second eager twin is an A/A control: the graph must match
-        bitwise for as long as the eager twins do, which must cover every transition.
+        Boxes fall and rest on the ground; a Contacts.clear() empties the frame of a
+        replay without a collision pass while their anchors are stored; they collide
+        again, are thrown up and land again. A second eager twin is an A/A control:
+        the graph must match bitwise for as long as the eager twins do, which must
+        cover every transition.
         """
         if not wp.is_conditional_graph_supported():
             self.skipTest("Conditional graph nodes need a CUDA 12.4+ driver and Warp build")
@@ -2303,28 +2305,38 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         twins = (graph, eager, control)
         for twin in twins:
             twin.pair(collide=True)
-        with wp.ScopedCapture(device="cuda:0") as capture:
-            graph.solver.seed_double_buffer_events()
-            graph.pair(collide=True)
-        live, stored = [], []
-        for replay in range(140):
-            if replay == 70:
+        captured = {}
+        for collide in (True, False):
+            with wp.ScopedCapture(device="cuda:0") as capture:
+                graph.solver.seed_double_buffer_events()
+                graph.pair(collide=collide)
+            captured[collide] = capture.graph
+        live, cleared = [], None
+        for replay in range(120):
+            collide = replay != 40
+            if not collide:
+                for twin in twins:
+                    twin.streams[0].clear()
+                cleared = int(np.count_nonzero(graph.patches.previous.valid.numpy()))
+            if replay == 60:
                 for twin in twins:
                     twin.throw(1.2)
-            wp.capture_launch(capture.graph)
+            wp.capture_launch(captured[collide])
             for twin in (eager, control):
-                twin.pair(collide=True)
+                twin.pair(collide=collide)
             if not eager.same_steps(control):
                 break
             _assert_same_twins(graph, eager, f"replay {replay}")
             live.append(int(graph.streams[0].rigid_contact_count.numpy()[0]))
-            stored.append(int(np.count_nonzero(graph.patches.previous.valid.numpy())))
         # Covered: empty frames before landing, live frames, an empty frame while
-        # anchors were stored, and live frames after landing again.
-        emptied = [i for i in range(1, len(live)) if live[i] == 0 and live[i - 1] > 0 and stored[i - 1] > 0]
-        self.assertTrue(live and live[0] == 0, f"the boxes must start in the air: {live}")
-        self.assertTrue(emptied, f"the frames must empty while anchors are stored: {live} {stored}")
-        self.assertGreater(max(live[emptied[0] :]), 0, f"the boxes must land again: {live}")
+        # anchors are stored, empty frames in the air after contact, and landing again.
+        self.assertGreater(len(live), 100, f"the eager twins must agree long enough: {len(live)} replays")
+        self.assertEqual(live[0], 0, f"the boxes must start in the air: {live}")
+        self.assertGreater(cleared, 0, "anchors must be stored when the frame is cleared")
+        self.assertEqual(live[40], 0, "the cleared frame must hold no contacts")
+        flights = [i for i in range(61, len(live)) if live[i] == 0 and live[i - 1] > 0]
+        self.assertTrue(flights, f"the thrown boxes must lose contact: {live}")
+        self.assertGreater(max(live[flights[0] :]), 0, f"the boxes must land again: {live}")
 
 
 def _poison_sort_scratch(twin):
