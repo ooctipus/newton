@@ -279,13 +279,20 @@ def _twin(patches, scene):
     ``_TWIN_THREADS`` and one sort block, so it must match ``patches`` bitwise
     (:func:`assert_same_state`): a race or any other grid-dependent result makes
     them differ, however small. The CPU compares with the reference bitwise.
+    The twin of a frame-reusing state reuses frames too and branches on the
+    host (:func:`_host_branch`), as a graph replay's conditional node does.
     """
     if not patches.device.is_cuda:
         return None
-    twin = _FrictionPatchState(scene.model, patches.capacity, True, wp.zeros_like(patches.view.phi))
+    twin = _FrictionPatchState(
+        scene.model, patches.capacity, True, wp.zeros_like(patches.view.phi), reuse_frames=patches.reuse_frames
+    )
     twin.threads, twin.build_threads = _TWIN_THREADS
     twin.sort_blocks = 1
     twin.live_sort = patches.live_sort
+    if twin.reuse_frames:
+        twin._capture_branch = lambda: _host_branch
+        twin._capture_can_pause = lambda: True
     return twin
 
 
@@ -501,7 +508,7 @@ def assert_empty_tail(patches, context=""):
 
 
 def assert_same_state(twin, patches, context=""):
-    """Require bitwise-equal arrays in two patch states, scratch included."""
+    """Require bitwise-equal arrays in two patch states, scratch and the sorted-frame record included."""
     for frame in ("current", "previous"):
         for name in _PatchFrame.vars:
             np.testing.assert_array_equal(
@@ -513,7 +520,7 @@ def assert_same_state(twin, patches, context=""):
         np.testing.assert_array_equal(
             getattr(twin.view, name).numpy(), getattr(patches.view, name).numpy(), f"{context} view.{name}"
         )
-    for name in ("previous_world", "previous_q", "stored", "built", "extent"):
+    for name in ("previous_world", "previous_q", "stored", "built", "extent", "sorted_frame", "sort_pairs"):
         np.testing.assert_array_equal(getattr(twin, name).numpy(), getattr(patches, name).numpy(), f"{context} {name}")
 
 
@@ -1381,8 +1388,9 @@ def run_frame_reuse_differential(
     The patch state branches on its sort flag on the host, as a conditional
     graph node does on replay. It must sort exactly when the contact frame
     differs from the last one it sorted and holds live contacts, and match the
-    full-capacity reference (:func:`assert_same_patches`). Returns the counts of
-    builds that reused sorted live pairs and of sorts.
+    full-capacity reference (:func:`assert_same_patches`). On CUDA a twin steps
+    alongside (:func:`_twin`). Returns the counts of builds that reused sorted
+    live pairs and of sorts.
     """
     rng = np.random.default_rng(2000 + seed)
     scene = _Scene(device, seed, worlds=worlds, contacts=contacts)
@@ -1391,6 +1399,9 @@ def run_frame_reuse_differential(
         patches.threads, patches.build_threads = threads
     if live_sort is not None:
         patches.live_sort = live_sort
+    twin = _twin(patches, scene)
+    live_states = [state for state in (patches, twin) if state is not None]
+    states = [*live_states, reference]
     rows = _Rows(scene, capacity, rng)
     coverage = {"reused": 0, "sorted": 0}
     dt = 1.0 / 240.0
@@ -1423,45 +1434,49 @@ def run_frame_reuse_differential(
             if event == "swap":
                 contacts = _swapped_stream(scene, live, rng) if substep == 1 else scene.contacts
             if substep == 1 and event == "geometry":
-                _edit_geometry(scene, rng, (patches, reference), live)
+                _edit_geometry(scene, rng, states, live)
                 sorted_frame = None
             if substep == 1 and event == "forget":
-                patches.forget_frame()
+                for state in live_states:
+                    state.forget_frame()
                 sorted_frame = None
             identity = _frame_identity(patches, contacts)
             expected = int(live > 0 and identity != sorted_frame)
             sorted_frame = _after_build(sorted_frame, identity, live)
             before = len(sorts)
-            for state in (patches, reference):
+            for state in states:
                 state.build(scene.model, scene.state, contacts)
             test.assertEqual(len(sorts) - before, expected, f"{context} sorts")
             coverage["sorted"] += expected
             coverage["reused"] += int(live > 0 and not expected)
-            assert_same_patches(patches, reference, live, f"{context} build")
+            assert_same_patches(patches, reference, live, f"{context} build", twin)
             assert_empty_tail(patches, f"{context} build")
             _assert_record(test, patches, sorted_frame, context)
             if event == "unstored" and substep == 0:
                 continue
             rows.generate(reference, live)
-            mine_maps, mine_routes = rows.arrays()
+            mine = [rows.arrays() for _ in live_states]
             their_maps, their_routes = rows.arrays()
-            patches.link(*mine_maps, patch_routes(mine_routes))
+            for state, (maps, routes) in zip(live_states, mine, strict=True):
+                state.link(*maps, patch_routes(routes))
             reference.link(contacts, *their_maps, their_routes)
-            seeded = [row for row in mine_routes if row[4] > 0.0]
-            if seeded:
-                patches.seed(scene.state, *mine_maps, patch_routes(seeded))
+            for state, (maps, routes) in zip(live_states, mine, strict=True):
+                seeded = [row for row in routes if row[4] > 0.0]
+                if seeded:
+                    state.seed(scene.state, *maps, patch_routes(seeded))
             reference.seed(contacts, scene.state, *their_maps, their_routes)
             out, com = _solved_state(scene, rng)
-            patches.finish(scene.state, out, com, *mine_maps, patch_routes(mine_routes), dt)
+            for state, (maps, routes) in zip(live_states, mine, strict=True):
+                state.finish(scene.state, out, com, *maps, patch_routes(routes), dt)
             reference.finish(contacts, scene.state, out, com, *their_maps, their_routes, dt)
-            _assert_same_rows(mine_routes, their_routes, rows, f"{context} rows")
-            assert_same_patches(patches, reference, live, f"{context} finish")
+            _assert_live_rows(mine, their_routes, rows, f"{context} rows")
+            assert_same_patches(patches, reference, live, f"{context} finish", twin)
             assert_empty_tail(patches, f"{context} finish")
             if substep == 0 and event == "reset":
                 mask = wp.array(rng.random(scene.worlds) < 0.5, dtype=wp.bool, device=device)
-                for state in (patches, reference):
+                for state in states:
                     state.reset(mask)
-                assert_same_patches(patches, reference, live, f"{context} reset")
+                assert_same_patches(patches, reference, live, f"{context} reset", twin)
     return coverage
 
 
@@ -1512,7 +1527,9 @@ def run_frame_reuse_graph(test, device, *, worlds=32, contacts=1536, capacity=20
     substep's flag records; the second substep always shares the frame. With the
     radix sort, a replay that sorts nothing leaves the sort's poisoned scratch half
     intact. A second graph captured over another contact stream of equal
-    generation and count must sort whenever replays alternate between streams.
+    generation and count must sort whenever replays alternate between streams. A
+    twin steps the substeps eagerly alongside the replays, branching on the host
+    as the nodes do, with its scratch half poisoned as well (:func:`_twin`).
     """
     rng = np.random.default_rng(31)
     scene = _Scene(device, 33, worlds=worlds, contacts=contacts)
@@ -1521,8 +1538,10 @@ def run_frame_reuse_graph(test, device, *, worlds=32, contacts=1536, capacity=20
     reference = ReferencePatches(scene.model, capacity, phi[1])
     if live_sort is not None:
         patches.live_sort = live_sort
+    twin = _twin(patches, scene)
     rows = _Rows(scene, capacity, rng)
     reference_state = SimpleNamespace(body_q=wp.clone(scene.state.body_q))
+    twin_state = SimpleNamespace(body_q=wp.clone(scene.state.body_q))
     other = _swapped_stream(scene, 0, rng)
     cleared = []
     flags = wp.zeros(2, dtype=wp.int32, device=device)
@@ -1553,10 +1572,12 @@ def run_frame_reuse_graph(test, device, *, worlds=32, contacts=1536, capacity=20
         elif event == "swap":
             stream = _swapped_stream(scene, live, rng, other)
         elif event == "forget":
-            patches.forget_frame()
+            for state in (patches, twin):
+                state.forget_frame()
         elif event == "geometry":
-            _edit_geometry(scene, rng, (patches, reference), live)
+            _edit_geometry(scene, rng, (patches, twin, reference), live)
         reference_state.body_q.assign(scene.state.body_q)
+        twin_state.body_q.assign(scene.state.body_q)
         reference.build(scene.model, reference_state, stream)
         rows.generate(reference, live)
         rows.decay = decay
@@ -1584,6 +1605,24 @@ def run_frame_reuse_graph(test, device, *, worlds=32, contacts=1536, capacity=20
                 wp.launch(_nudge_poses, dim=scene.body_count, inputs=[reference_state.body_q, 1.0e-4], device=device)
         return routes
 
+    def twin_substeps(stream, out, com, branch=_host_branch):
+        """Step the twin through both substeps on fresh copies of the rows.
+
+        ``branch`` stands in for the conditional nodes; ``None`` sorts every build,
+        as the eager substeps before the captures do.
+        """
+        twin._capture_branch = lambda: branch
+        maps, routes = rows.arrays()
+        linked, seeded = patch_routes(routes), patch_routes(row for row in routes if row[4] > 0.0)
+        for index in range(2):
+            twin.build(scene.model, twin_state, stream)
+            twin.link(*maps, linked)
+            twin.seed(twin_state, *maps, seeded)
+            twin.finish(twin_state, out, com, *maps, linked, dt)
+            if index == 0:
+                wp.launch(_nudge_poses, dim=scene.body_count, inputs=[twin_state.body_q, 1.0e-4], device=device)
+        return routes
+
     def assign(fixed, out, com):
         (maps, routes), (fresh_maps, fresh_routes) = fixed, rows.arrays()
         for array, values in zip(maps, fresh_maps, strict=True):
@@ -1602,9 +1641,11 @@ def run_frame_reuse_graph(test, device, *, worlds=32, contacts=1536, capacity=20
     maps, routes = fixed
     linked, seeded = patch_routes(routes), patch_routes(row for row in routes if row[4] > 0.0)
     substeps(scene.contacts, maps, linked, seeded, out, com)
+    twin_routes = twin_substeps(scene.contacts, out, com, branch=None)
     their_routes = reference_substeps(scene.contacts, out, com)
-    assert_same_patches(patches, reference, live, "eager")
+    assert_same_patches(patches, reference, live, "eager", twin)
     _assert_same_rows(routes, their_routes, rows, "eager")
+    _assert_same_rows(twin_routes, routes, rows, "eager twin", exact=True)
     graphs = {}
     for stream in (scene.contacts, other):
         with wp.ScopedCapture(device=device) as capture:
@@ -1623,10 +1664,12 @@ def run_frame_reuse_graph(test, device, *, worlds=32, contacts=1536, capacity=20
         sorted_frame = _after_build(sorted_frame, identity, live)
         reused += int(live > 0 and not expected)
         assign(fixed, out, com)
-        keys = patches.current.keys.numpy()
-        keys[n:] = poison
-        patches.current.keys.assign(keys)
+        for state in (patches, twin):
+            keys = state.current.keys.numpy()
+            keys[n:] = poison
+            state.current.keys.assign(keys)
         wp.capture_launch(graphs[id(stream)])
+        twin_routes = twin_substeps(stream, out, com)
         their_routes = reference_substeps(stream, out, com)
         np.testing.assert_array_equal(flags.numpy(), [expected, 0], f"{context} sort flags")
         _assert_record(test, patches, sorted_frame, context)
@@ -1634,9 +1677,10 @@ def run_frame_reuse_graph(test, device, *, worlds=32, contacts=1536, capacity=20
             intact = bool(np.all(patches.current.keys.numpy()[n:] == poison))
             test.assertEqual(intact, not expected, f"{context} the radix sort ran {'never' if intact else 'once'}")
         np.testing.assert_array_equal(scene.state.body_q.numpy(), reference_state.body_q.numpy(), context)
-        assert_same_patches(patches, reference, live, context)
+        assert_same_patches(patches, reference, live, context, twin)
         assert_empty_tail(patches, context)
         _assert_same_rows(routes, their_routes, rows, context)
+        _assert_same_rows(twin_routes, routes, rows, f"{context} twin", exact=True)
     test.assertGreater(reused, 0, "replays must reuse sorted live pairs")
 
 
