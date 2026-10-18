@@ -24,6 +24,11 @@ from newton.tests.feather_pgs_patch_parity import (
 from newton.tests.test_feather_pgs_response_diagonal import _build_mixed_response_model
 
 _DT = 1.0 / 240.0
+# On CUDA the masked and per-contact kernels contract FMAs differently. Over six steps of the 13-DOF,
+# 23-DOF and three-size scenes the rows differed by at most 6.0e-8 in a Jacobian entry (6.0e-7
+# relative), 5.1e-8 in a right-hand side and 1.1e-9 in phi; coefficients, targets, impulses, poses
+# and anchor history were equal.
+_CUDA_ROW_TOLERANCE = 1.0e-6
 
 # The dense route's row arrays and the contact routing that indexes them.
 _ROW_ARRAYS = (
@@ -269,7 +274,7 @@ class TestMaskedPatchRows(unittest.TestCase):
                     assert_contact_impulses_close(rows, expected_rows, atol=0.0, rtol=0.0)
                     np.testing.assert_array_equal(poses, expected_poses)
                 else:
-                    assert_rows_close(rows, expected_rows, atol=1.0e-6, rtol=1.0e-6)
+                    assert_rows_close(rows, expected_rows, atol=_CUDA_ROW_TOLERANCE, rtol=_CUDA_ROW_TOLERANCE)
                     assert_contact_impulses_close(rows, expected_rows)
                     np.testing.assert_allclose(poses, expected_poses, atol=2.0e-5, rtol=0.0)
         if exact:
@@ -344,7 +349,7 @@ class TestMaskedPatchRows(unittest.TestCase):
         self.assertTrue(solver._has_prescribed_response)
         self.assertFalse(solver._compact_contact_jacobian)
         (rows, _, _), (expected, _, _) = masked[0], general[0]
-        assert_rows_close(rows, expected, atol=1.0e-6, rtol=1.0e-6)
+        assert_rows_close(rows, expected, atol=_CUDA_ROW_TOLERANCE, rtol=_CUDA_ROW_TOLERANCE)
         anchors = [record["target"] for record in rows.values() if len(record["types"]) == 3]
         self.assertGreater(len(anchors), 0, "no contact owned an anchor")
         # The plate's surface moves at about 0.2 m/s along the ground and rises at 0.02 m/s.
