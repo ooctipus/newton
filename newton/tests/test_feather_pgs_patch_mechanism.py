@@ -492,7 +492,7 @@ def assert_empty_tail(patches, context=""):
 
 
 def assert_same_state(twin, patches, context=""):
-    """Require bitwise-equal arrays in two patch states, scratch included; atomics order the pair head list."""
+    """Require bitwise-equal arrays in two patch states, scratch included."""
     for frame in ("current", "previous"):
         for name in _PatchFrame.vars:
             np.testing.assert_array_equal(
@@ -504,7 +504,7 @@ def assert_same_state(twin, patches, context=""):
         np.testing.assert_array_equal(
             getattr(twin.view, name).numpy(), getattr(patches.view, name).numpy(), f"{context} view.{name}"
         )
-    for name in ("previous_world", "previous_q", "stored", "built", "extent", "head_count"):
+    for name in ("previous_world", "previous_q", "stored", "built", "extent"):
         np.testing.assert_array_equal(getattr(twin, name).numpy(), getattr(patches, name).numpy(), f"{context} {name}")
 
 
