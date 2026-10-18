@@ -352,27 +352,61 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(debug["sweep"]["driver"], "debug_loop")
 
     def test_cpu_patch_record_states_the_route_precedence(self):
-        """Name which patch route claims a world first, and list the classifier as point-only only when it is."""
+        """State the patch route precedence where it governs the solver, and the torsion exception where it does not.
+
+        A law-agnostic patch solver's record names the claims in the order the solver tries them, and its
+        CPU decisions follow the flag-dependent clauses: masked rows take the patch row law and the classifier
+        serves patch friction unless FEATHER_PGS_PATCH_DENSE_PATHS=0. The route claims are decided in
+        test_patch_route_claims_follow_the_recorded_precedence (sparse admission) and the paired factor
+        sweep's exclusions in test_paired_factor_sweep_excludes_a_requested_patch_tier (CUDA). Contact torsion
+        takes none of these routes whatever the flags say, and its record says that instead.
+        """
+        model = _cpu_free_body_model()
+        claims = ("parallel tier", "free rigid bodies", "native sparse factors take", "paired factor sweep", "producer")
         for flag in (None, "0"):
-            with self.subTest(FEATHER_PGS_PATCH_DENSE_PATHS=flag), patch.dict(os.environ):
+            with (
+                self.subTest(FEATHER_PGS_PATCH_DENSE_PATHS=flag),
+                patch.dict(os.environ),
+                patch.object(solver_module, "_ROWS_MASKED", True),
+            ):
                 os.environ.pop("FEATHER_PGS_PATCH_DENSE_PATHS", None)
                 if flag is not None:
                     os.environ["FEATHER_PGS_PATCH_DENSE_PATHS"] = flag
-                friction = SolverFeatherPGS(_cpu_free_body_model()).get_path_selection()["routes"]["friction"]
+                routes = SolverFeatherPGS(model).get_path_selection()["routes"]
+                friction = routes["friction"]
                 self.assertEqual(friction["law"], "patch")
                 owners, precedence = friction["reason"].split(" need point friction.")
                 # The resolved-world classifier serves patch friction unless FEATHER_PGS_PATCH_DENSE_PATHS=0.
                 self.assertEqual("resolved-world classifier" in owners, flag == "0")
-                # Route claims, then row producers, each in the order the solver tries them.
-                for claims in (
-                    ("parallel tier", "free-body worlds", "native sparse factors"),
-                    ("local_packets", "keyed_rows", "compact producers", "general"),
-                ):
-                    positions = [precedence.find(claim) for claim in claims]
-                    self.assertNotIn(-1, positions, claims)
-                    self.assertEqual(positions, sorted(positions), claims)
+                # Route claims, the paired factor sweep's exclusions, then row producers, in the solver's order.
+                positions = [precedence.find(claim) for claim in claims]
+                self.assertNotIn(-1, positions)
+                self.assertEqual(positions, sorted(positions))
+                self.assertIn("excludes the parallel tiers, keyed_rows and local_packets", precedence)
+                self.assertIn("local_packets, keyed_rows (FEATHER_PGS_PATCH_PARALLEL_ROWS=1)", precedence)
+                # The general builder's masked rows take the patch row law unless FEATHER_PGS_PATCH_DENSE_PATHS=0.
+                method = "per_contact" if flag == "0" else "masked_combined"
+                self.assertEqual(routes["contact_rows"]["general_method_by_dof"], {"6": method, "1": method})
+        # Contact torsion keeps ordinary factors, rows and serial sweeps under every patch route flag.
+        for flags in ({}, {"FEATHER_PGS_PATCH_PARALLEL_ROWS": "1", "FEATHER_PGS_PATCH_DENSE_PATHS": "1"}):
+            with (
+                self.subTest(torsion=True, **flags),
+                patch.dict(os.environ, flags),
+                patch.object(solver_module, "_ROWS_MASKED", True),
+                # Construct on the CPU, as TestTorsionNeutralRoute does; nothing is stepped.
+                patch("newton._src.solvers.feather_pgs.contact_torsion._validate_torsion_mode"),
+            ):
+                routes = SolverFeatherPGS(model, contact_torsion_radius=0.01).get_path_selection()["routes"]
+                friction = routes["friction"]
+                self.assertEqual((friction["law"], friction["torsion"]), ("patch", True))
+                self.assertNotIn("first claim", friction["reason"])
+                self.assertTrue(friction["reason"].endswith(" select no route."), friction["reason"])
+                self.assertFalse(friction["parallel_rows"]["admitted"])
+                self.assertEqual(
+                    routes["contact_rows"]["general_method_by_dof"], {"6": "per_contact", "1": "per_contact"}
+                )
         # Point friction's record names no patch route.
-        point = SolverFeatherPGS(_cpu_free_body_model(), friction_anchor_beta=0.0).get_path_selection()
+        point = SolverFeatherPGS(model, friction_anchor_beta=0.0).get_path_selection()
         self.assertEqual(point["routes"]["friction"]["reason"], "friction_anchor_beta passed explicitly.")
 
     def test_cpu_grouped_record_follows_the_response_dispatch(self):
@@ -839,6 +873,31 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         with patch.dict(os.environ, {"FEATHER_PGS_PATCH_DENSE_PATHS": "0"}):
             solver = _make_solver(model, True, dense_max_constraints=96)
         self.assertEqual(solver.get_path_selection()["sparse_mass_matrix"], "on")
+
+    @unittest.skipUnless(wp.is_cuda_available(), "The paired factor sweep requires CUDA")
+    def test_paired_factor_sweep_excludes_a_requested_patch_tier(self):
+        """Serve a free-body world with the paired factor sweep even when a requested patch tier declined sparse factors.
+
+        Under FEATHER_PGS_PATCH_PARALLEL_ROWS=1 a tier that mf_gs_parallel_rows requests declines sparse factors
+        before the free-body rule does, as the friction record says. The paired factor sweep then admitted on the
+        dense route excludes the tiers and keyed rows, so it walks the patch contact units and no tier is built.
+        """
+        model = _branched_arm_and_box()
+        with patch.dict(os.environ, {"FEATHER_PGS_PATCH_PARALLEL_ROWS": "1"}):
+            solver = _make_solver(
+                model, True, dense_max_constraints=96, mf_gs_parallel_rows=32, mf_gs_parallel_matrix_free=True
+            )
+        selected = solver.get_path_selection()
+        routes = selected["routes"]
+        self.assertEqual(routes["friction"]["law"], "patch")
+        self.assertTrue(routes["friction"]["parallel_rows"]["admitted"])
+        self.assertEqual(selected["sparse_mass_matrix"], "off")
+        self.assertIn("competing", selected["reasons"]["sparse_mass_matrix"])
+        self.assertTrue(routes["paired_response"]["factor_coordinates"])
+        self.assertTrue(routes["paired_response"]["contact_units"])
+        self.assertIsNone(routes["sweep"]["tiers"])
+        self.assertFalse(routes["contact_rows"]["keyed_rows"]["enabled"])
+        self.assertEqual(selected["options"]["mf_gs_parallel_rows"]["applied"], 0)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
     def test_cached_dynamics_contact_graph_and_reset(self):

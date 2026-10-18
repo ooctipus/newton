@@ -5191,7 +5191,9 @@ class SolverFeatherPGS(SolverBase):
             return
         # A parallel tier or response block that serves the active friction law owns the
         # ordinary buffers. Patch friction yields only to a parallel tier, which split mode
-        # never builds; point friction keeps its unconditional yield.
+        # never builds; point friction keeps its unconditional yield. The yield reserves the
+        # dense route, not the tier: a paired factor sweep admitted there later excludes the
+        # tiers, response blocks and keyed rows under both laws (_init_tiled_kernels, keyed_rows).
         parallel_tier = self.mf_gs_parallel_rows > 0 and (
             self._point_contact_paths or (self._parallel_contact_paths and self.pgs_mode == "matrix_free")
         )
@@ -5208,8 +5210,9 @@ class SolverFeatherPGS(SolverBase):
             # Both friction laws: patch friction walks contact units in the paired
             # sweep, writes masked patch rows and keeps the resolved-world
             # classifier, unless FEATHER_PGS_PATCH_DENSE_PATHS=0. An opted-in
-            # parallel tier claims the buffers first (above); the active-row scan
-            # below serves only worlds sparse factors keep, never free-body ones.
+            # parallel tier's request declines sparse factors first (above); the
+            # active-row scan below serves only worlds sparse factors keep, never
+            # free-body ones.
             self._sparse_selection_reason = (
                 "Worlds with free rigid bodies keep the dense route for the held-tree owner and paired response."
             )

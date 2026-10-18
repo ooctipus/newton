@@ -33,14 +33,26 @@ _BETA_REASONS = {
 }
 
 # Which claim wins where two patch routes could serve the same world: the order of the
-# declines in _setup_sparse_mass_matrix and of the row producers in _stage4_build_rows.
+# declines in _setup_sparse_mass_matrix, the paired factor sweep's exclusions (keyed_rows,
+# row_packets and the tier gate of _init_tiled_kernels) and the order of the row producers
+# in _stage4_build_rows. It governs law-agnostic solvers only.
 _PATCH_ROUTE_PRECEDENCE = (
-    " Patch routes, first claim first: an opted-in parallel tier (FEATHER_PGS_PATCH_PARALLEL_ROWS=1), then the"
-    " dense route of free-body worlds (FEATHER_PGS_PATCH_DENSE_PATHS), before native sparse factors, which select"
-    " patch rows at sweep entry (FEATHER_PGS_PATCH_ACTIVE_ROWS) and own their worlds' rows. On the dense route"
-    " contact_rows.producer is the first admitted of local_packets, keyed_rows (FEATHER_PGS_PATCH_PARALLEL_ROWS=1),"
-    " the compact producers and general, whose masked rows take the patch row law unless"
-    " FEATHER_PGS_PATCH_DENSE_PATHS=0."
+    " Patch routes, first claim first: a parallel tier that mf_gs_parallel_rows requests under"
+    " FEATHER_PGS_PATCH_PARALLEL_ROWS=1 declines native sparse factors, worlds with free rigid bodies then keep the"
+    " dense route unless FEATHER_PGS_PATCH_DENSE_PATHS=0, and native sparse factors take the worlds whose topology"
+    " they admit, own their rows and may select patch rows at sweep entry (sparse_mass_matrix.active_rows,"
+    " FEATHER_PGS_PATCH_ACTIVE_ROWS). On the dense route an admitted paired factor sweep"
+    " (paired_response.factor_coordinates) excludes the parallel tiers, keyed_rows and local_packets, even a tier"
+    " whose request declined sparse factors, and walks patch contact units (paired_response.contact_units) unless"
+    " FEATHER_PGS_PATCH_DENSE_PATHS=0. The row producer (contact_rows.producer) is the first admitted of"
+    " local_packets, keyed_rows (FEATHER_PGS_PATCH_PARALLEL_ROWS=1), the compact and sparse producers and general,"
+    " whose masked rows take the patch row law unless FEATHER_PGS_PATCH_DENSE_PATHS=0."
+)
+# Contact torsion (patch friction does not admit compliance) takes none of those routes.
+_ORDINARY_PATCH_ROUTES = (
+    " Contact torsion and compliance keep ordinary factors, rows and serial sweeps, so"
+    " FEATHER_PGS_PATCH_ACTIVE_ROWS, FEATHER_PGS_PATCH_DENSE_PATHS and FEATHER_PGS_PATCH_PARALLEL_ROWS select no"
+    " route."
 )
 
 
@@ -707,9 +719,10 @@ def _friction(solver) -> dict:
         classifier = "" if solver._patch_dense_paths else "the resolved-world classifier, "
         # FEATHER_PGS_PATCH_ACTIVE_ROWS=0 keeps patch friction off the sparse active-row scan.
         sparse = "sparse triplets" if solver._patch_active_rows else "sparse active rows and triplets"
+        routes = _PATCH_ROUTE_PRECEDENCE if solver._law_agnostic_contact_paths else _ORDINARY_PATCH_ROUTES
         reason += (
             f" Point-contact owners ({parallel}response blocks, {classifier}multiblock sweeps, {sparse}) need point"
-            f" friction.{_PATCH_ROUTE_PRECEDENCE}"
+            f" friction.{routes}"
         )
     return {
         "law": "patch" if patch else "point",

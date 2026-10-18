@@ -270,6 +270,39 @@ class TestSparseResearchAdmission(unittest.TestCase):
                     with self.assertRaises(_TopologyReached):
                         SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
 
+    def test_patch_route_claims_follow_the_recorded_precedence(self):
+        """Claim a patch free-body world for a requested tier, then for the dense route, then for sparse factors.
+
+        This is the order the patch friction record states. A tier that mf_gs_parallel_rows requests under
+        FEATHER_PGS_PATCH_PARALLEL_ROWS=1 declines sparse factors first, whatever FEATHER_PGS_PATCH_DENSE_PATHS
+        says; without it the free-body rule keeps the world dense unless FEATHER_PGS_PATCH_DENSE_PATHS=0; with
+        neither the world reaches sparse topology admission.
+        """
+        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
+        for switch, dense_paths, declined in (
+            (True, None, "competing"),
+            (True, "0", "competing"),
+            (False, None, "free rigid bodies"),
+            (False, "0", None),
+        ):
+            environment = {} if dense_paths is None else {"FEATHER_PGS_PATCH_DENSE_PATHS": dense_paths}
+            with (
+                self.subTest(parallel_rows=switch, FEATHER_PGS_PATCH_DENSE_PATHS=dense_paths),
+                mock.patch.dict(os.environ, environment, clear=True),
+            ):
+                solver = _eligible_solver()
+                solver._friction_anchors_enabled = True
+                solver._has_free_rigid_bodies = True
+                solver.mf_gs_parallel_rows = 48
+                solver._patch_parallel_rows = switch
+                if declined is None:
+                    with self.assertRaises(_TopologyReached):
+                        SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+                else:
+                    SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+                    self.assertIsNone(solver._sparse_mass_matrix_size)
+                    self.assertIn(declined, solver._sparse_selection_reason)
+
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse construction requires CUDA")
     def test_branched_18_dof_trees_select_general_sparse(self):
         """Admit both wide and deeper trees without activating a second representation."""
