@@ -42,7 +42,7 @@ _SENSING_OBJ_SHAPES_DEPRECATION_MSG = (
 
 
 @wp.kernel(enable_backward=False)
-def compute_sensing_transforms_kernel(
+def prepare_sensing_rows_kernel(
     indices: wp.array[wp.int32],
     sensing_kinds: wp.array[wp.int32],
     shape_body: wp.array[wp.int32],
@@ -50,8 +50,30 @@ def compute_sensing_transforms_kernel(
     body_q: wp.array[wp.transform],
     # output
     transforms: wp.array[wp.transform],
+    total_force: wp.array[wp.vec3],
+    total_force_friction: wp.array[wp.vec3],
+    force_matrix: wp.array2d[wp.vec3],
+    force_matrix_friction: wp.array2d[wp.vec3],
+    position_matrix: wp.array2d[wp.vec3],
+    position_weight: wp.array2d[float],
 ):
+    """Clear one sensing row's accumulated outputs and, given body transforms, update its transform.
+
+    Positions are cleared together with forces so that an entry never pairs a fresh force with a
+    stale position. One thread per row replaces a separate clear of each output.
+    """
     tid = wp.tid()
+    if total_force:
+        total_force[tid] = wp.vec3(0.0)
+        total_force_friction[tid] = wp.vec3(0.0)
+    if force_matrix:
+        for col in range(force_matrix.shape[1]):
+            force_matrix[tid, col] = wp.vec3(0.0)
+            force_matrix_friction[tid, col] = wp.vec3(0.0)
+            position_matrix[tid, col] = wp.vec3(0.0)
+            position_weight[tid, col] = 0.0
+    if not body_q:
+        return
     index = indices[tid]
     sensing_kind = sensing_kinds[tid]
     if sensing_kind == wp.static(_SENSING_KIND_BODY):
@@ -697,26 +719,9 @@ class SensorContact:
             contacts: The contact data to evaluate.
 
         Raises:
-            ValueError: If ``contacts.force`` is None.
-            ValueError: If ``contacts.device`` does not match the sensor's device.
+            ValueError: If ``contacts.force`` is None; no output changes.
+            ValueError: If ``contacts.device`` does not match the sensor's device; no output changes.
         """
-        # update sensing transforms
-        n = len(self._sensing_indices)
-        if n > 0 and state is not None and state.body_q is not None:
-            wp.launch(
-                compute_sensing_transforms_kernel,
-                dim=n,
-                inputs=[
-                    self._sensing_indices,
-                    self._sensing_kinds,
-                    self._model.shape_body,
-                    self._model.shape_transform,
-                    state.body_q,
-                ],
-                outputs=[self.sensing_transforms],
-                device=self.device,
-            )
-
         if contacts.force is None:
             raise ValueError(
                 "SensorContact requires a ``Contacts`` object with ``force`` allocated. "
@@ -724,19 +729,32 @@ class SensorContact:
             )
         if contacts.device != self.device:
             raise ValueError(f"Contacts device ({contacts.device}) does not match sensor device ({self.device}).")
+        # One launch clears every output row and, given body transforms, updates the sensing transforms.
+        wp.launch(
+            prepare_sensing_rows_kernel,
+            dim=len(self._sensing_indices),
+            inputs=[
+                self._sensing_indices,
+                self._sensing_kinds,
+                self._model.shape_body,
+                self._model.shape_transform,
+                state.body_q if state is not None else None,
+            ],
+            outputs=[
+                self.sensing_transforms,
+                self.total_force,
+                self.total_force_friction,
+                self.force_matrix,
+                self.force_matrix_friction,
+                self.position_matrix,
+                self._position_weight,
+            ],
+            device=self.device,
+        )
         self._eval_forces(state, contacts)
 
     def _eval_forces(self, state: State | None, contacts: Contacts):
-        """Recompute force outputs and, when ``state.body_q`` is available, contact positions."""
-        if self.total_force is not None:
-            self.total_force.zero_()
-            self.total_force_friction.zero_()
-        if self.force_matrix is not None:
-            self.force_matrix.zero_()
-            self.force_matrix_friction.zero_()
-            # reset positions together with forces so entries never pair a fresh force with a stale position
-            self.position_matrix.zero_()
-            self._position_weight.zero_()
+        """Accumulate the outputs :meth:`update` cleared and, when ``state.body_q`` is available, contact positions."""
         update_contact_positions = self.position_matrix is not None and state is not None and state.body_q is not None
         wp.launch(
             accumulate_contact_forces_kernel,
