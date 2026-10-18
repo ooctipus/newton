@@ -52,7 +52,8 @@ _PATCH_ROUTE_PRECEDENCE = (
     " whose request declined sparse factors, and walks patch contact units (paired_response.contact_units) unless"
     " FEATHER_PGS_PATCH_DENSE_PATHS=0. The row producer (contact_rows.producer) is the first admitted of"
     " local_packets, keyed_rows (FEATHER_PGS_PATCH_PARALLEL_ROWS=1), the compact and sparse producers and general,"
-    " whose masked rows take the patch row law unless FEATHER_PGS_PATCH_DENSE_PATHS=0."
+    " whose masked rows take the patch row law unless FEATHER_PGS_PATCH_DENSE_PATHS=0;"
+    " contact_rows.builder_by_dof names each size's builder kernels and the law they write."
 )
 # Contact torsion (patch friction does not admit compliance) takes none of those routes.
 _ORDINARY_PATCH_ROUTES = (
@@ -276,6 +277,83 @@ def _tree_group(group) -> dict:
     }
 
 
+def _row_builder(solver, plan, size, source) -> dict:
+    """Name the kernels that build one DOF size's contact rows, in launch order, and the law they write.
+
+    Mirrors the producers' launches: _stage4_build_rows for the shared-metadata and general
+    builders, compact_contact.launch_contacts, LocalRowPackets.produce_contacts and finish_rows,
+    and KeyedRows.produce_contacts and finish_rows. A launch shared by several sizes (the row
+    metadata, a combined masked launch, a producer's contact kernel) is named under each of them.
+    The debug row checks (ContactRowPlan.check) are not routes.
+    """
+    method, law = plan.methods[size], plan.law
+    patch = law == "patch"
+    prepare = (source.prepare_world_contact_rows,) if plan.prepare_rows else ()
+    if method == "local_packets":
+        from . import row_packets  # noqa: PLC0415 - the owner's module; loaded with the owner
+
+        # The owner fixes its friction law at construction.
+        patch = bool(solver._row_packets.patch_friction)
+        kernels = (
+            (row_packets.produce_patch_contacts, row_packets.materialize_patch_fallback)
+            if patch
+            else (row_packets.produce_contacts, row_packets.materialize_fallback)
+        )
+    elif method == "keyed_rows":
+        from . import keyed_rows  # noqa: PLC0415 - the owner's module; loaded with the owner
+
+        owner = solver._keyed_rows
+        patch = bool(owner.patch)
+        # The parallel tiers (routes.sweep.tiers) build the direct rows in the sweep; the fallback
+        # materializes the rows of every other world.
+        kernels = (
+            (keyed_rows.scatter_patch_contact_keys, keyed_rows.get_patch_fallback_kernel(owner.layout))
+            if patch
+            else (keyed_rows.scatter_contact_keys, keyed_rows.get_fallback_kernel(owner.layout))
+        )
+    elif method == "compact_contact_boundary":
+        from . import compact_contact  # noqa: PLC0415 - the owner's module; loaded with the owner
+
+        if solver._compact_contact_order is not None:
+            ordered = (
+                compact_contact._produce_ordered_patch_contacts if patch else compact_contact._produce_ordered_contacts
+            )
+            produce = (compact_contact._build_contact_order, ordered)
+        else:
+            produce = (compact_contact.produce_patch_contacts if patch else compact_contact.produce_contacts,)
+        if size == solver._sparse_diagonal_response_size:
+            # The marker encodes schedule links into the freshly published sparse DOF slots.
+            kernels = (*produce, solver._mark_independent_sparse_contact_candidates_kernel)
+        else:
+            kernels = (compact_contact.clear_contact_response, *produce)
+    elif method in ("sparse_response", "sparse_free_response"):
+        kernels = (*prepare, solver._sparse_contact_response_kernel)
+    elif method == "sparse_diagonal":
+        kernels = (*prepare, source.populate_sparse_diagonal_contact_response)
+        if solver._sparse_diagonal_contact_triples or solver._sparse_diagonal_contact_units:
+            kernels = (*kernels, solver._mark_independent_sparse_contact_candidates_kernel)
+    elif method == "compact_jacobian":
+        kernels = (*prepare, source.populate_world_J_for_compact_size)
+    elif method in ("masked", "masked_combined"):
+        kernels = (
+            (source.contact_row_prelude_patch, source.populate_world_J_masked_patch)
+            if patch
+            else (source.contact_row_prelude, source.populate_world_J_masked)
+        )
+    elif method == "native":
+        # get_row_build_native_kernel builds a new kernel object per call; name it without one.
+        kernels = ("populate_world_J_native",)
+    elif method == "fused_rows":
+        kernels = (source.build_contact_rows,)
+    else:
+        kernels = (source.populate_world_J_for_size,)
+    return {
+        "method": method,
+        "kernels": [kernel if isinstance(kernel, str) else _key(kernel) for kernel in kernels],
+        "law": "patch" if patch else "point",
+    }
+
+
 def _contact_rows(solver, source) -> dict:
     point = bool(solver._point_contact_paths)
     # The plan _stage4_build_rows dispatches on: the first admitted producer writes every
@@ -301,6 +379,9 @@ def _contact_rows(solver, source) -> dict:
     packets = solver._row_packets
     return {
         "producer": plan.producer,
+        "law": plan.law,
+        # Every producer, every size: the builder method, its kernels in launch order and the law they write.
+        "builder_by_dof": {str(int(size)): _row_builder(solver, plan, size, source) for size in plan.methods},
         "general_method_by_dof": methods,
         "point_contact_paths": point,
         "row_packets": {

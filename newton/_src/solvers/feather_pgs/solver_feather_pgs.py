@@ -3344,11 +3344,12 @@ class SolverFeatherPGS(SolverBase):
 
         ``routes`` records every construction-time owner and variant that decides
         which kernels run: the held-tree owner and its lane layouts, the contact-row
-        producer, local, paired and sparse responses, the sweep kernels per route
-        and tier and what drives them, resolved worlds, publication, velocity
-        limits, free bodies, the friction law and the grouped-dynamics kernels,
-        each with a reason; a size whose response the grouped kernel solves
-        reports ``hinv_jt_kernel`` ``"grouped"``. ``measurements`` holds the
+        producer with each DOF size's row-builder kernels and friction law (from
+        the plan the row build dispatches on), local, paired and sparse responses,
+        the sweep kernels per route and tier and what drives them, resolved worlds,
+        publication, velocity limits, free bodies, the friction law and the
+        grouped-dynamics kernels, each with a reason; a size whose response the
+        grouped kernel solves reports ``hinv_jt_kernel`` ``"grouped"``. ``measurements`` holds the
         construction-time lane timings, kept out of ``routes`` so that two runs of
         one configuration compare equal. ``options`` records every constructor
         option's requested, declared-default and applied value, captured once at

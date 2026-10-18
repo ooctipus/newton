@@ -24,6 +24,7 @@ from newton.tests.feather_pgs_patch_parity import (
     assert_rows_close,
     contact_rows,
 )
+from newton.tests.feather_pgs_row_builders import assert_row_builders_named, launched_kernels
 from newton.tests.test_feather_pgs_compact_contact import assert_patch_tangent_law
 from newton.tests.test_feather_pgs_mixed_tree_free_body import DT, _build
 
@@ -780,11 +781,23 @@ class TestRowPacketsCUDA(unittest.TestCase):
         self.assertEqual(routes["friction"]["law"], "patch")
         self.assertEqual(routes["contact_rows"]["producer"], "local_packets")
         self.assertEqual(routes["sweep"]["local"]["factory"], "row_packets")
+        # The packets' patch producer and the fallback materialization of the general worlds, for every size.
+        builder = {
+            "method": "local_packets",
+            "kernels": ["produce_patch_contacts", "materialize_patch_fallback"],
+            "law": "patch",
+        }
+        builders = routes["contact_rows"]["builder_by_dof"]
+        self.assertEqual(builders, dict.fromkeys(builders, builder))
         anchors, carried, poses = 0, 0, []
         for step in range(40):
-            contacts = _step(plain)
-            _step(packets, contacts)
+            with launched_kernels() as plain_keys:
+                contacts = _step(plain)
+            with launched_kernels() as packet_keys:
+                _step(packets, contacts)
             if step == 0:
+                for arm, keys in ((plain, plain_keys), (packets, packet_keys)):
+                    assert_row_builders_named(self, arm.solver.get_path_selection()["routes"]["contact_rows"], keys)
                 first = [contact_rows(arm.solver, contacts) for arm in (plain, packets)]
                 self.assertTrue(
                     any(len(record["types"]) == 3 and np.any(record["impulses"][1:]) for record in first[0].values()),
