@@ -186,6 +186,30 @@ def _definition(function):
     return ast.parse(textwrap.dedent(inspect.getsource(function.func))).body[0]
 
 
+def _reserves_first(statements):
+    """Whether every path through ``statements`` reserves rows before it returns.
+
+    Returns True when each path reaches a ``wp.atomic_add`` reservation before
+    any ``return``, False when some path returns first, and None when a path
+    falls through without either. A reservation inside a loop does not count,
+    since the loop may not run.
+    """
+    for statement in statements:
+        if isinstance(statement, ast.If):
+            outcomes = {_reserves_first(statement.body), _reserves_first(statement.orelse)}
+            if False in outcomes:
+                return False
+            if outcomes == {True}:
+                return True
+        elif any(isinstance(node, ast.Return) for node in ast.walk(statement)):
+            return False
+        elif not isinstance(statement, (ast.For, ast.While)) and any(
+            isinstance(node, ast.Call) and ast.unparse(node.func) == "wp.atomic_add" for node in ast.walk(statement)
+        ):
+            return True
+    return None
+
+
 class TestResolvedWorlds(unittest.TestCase):
     def test_current_predictor_not_incoming_body_twist(self):
         """Reject a closing predictor despite a separating stale body twist."""
@@ -438,6 +462,8 @@ class TestResolvedWorlds(unittest.TestCase):
             [ast.unparse(statement) for statement in marking],
             ["contact_slot[c] = -1", "contact_path[c] = CONTACT_PATH_RESOLVED"],
         )
+        # Past those checks only classification runs: every path reserves rows before any exit.
+        self.assertIs(_reserves_first(helper.body[1 + len(checks) :]), True)
 
     def test_patch_finish_releases_resolved_contacts_only(self):
         """The finish epilogue releases CONTACT_PATH_RESOLVED anchors, keeps unrouted ones and finishes routed ones."""
