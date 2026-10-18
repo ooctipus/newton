@@ -53,7 +53,9 @@ def _color_counts(solver):
 def _settle(model, steps=12, *, response="propagation-colored", **solver_kwargs):
     """Step ``model`` under one contact response; return the solver, final state and contact count.
 
-    Every response gets the same row capacities, large enough for the heaps here.
+    Every response gets the same row capacities, large enough for the heaps here, and every caller
+    runs on its complete row set: ``check_constraint_capacity()`` raises if, on any step, a world
+    requested more rows than a family holds, dropped rows or overflowed the contact buffer.
     """
     model.rigid_contact_max = 8192  # sizes the solver's contact scratch; set before construction
     solver = newton.solvers.SolverFeatherPGS(
@@ -74,6 +76,8 @@ def _settle(model, steps=12, *, response="propagation-colored", **solver_kwargs)
         pipeline.collide(state_0, contacts)
         solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
         state_0, state_1 = state_1, state_0
+    # The status is sticky until reset, so one check covers every step.
+    solver.check_constraint_capacity()
     return solver, state_0, int(contacts.rigid_contact_count.numpy()[0])
 
 
@@ -136,20 +140,18 @@ class TestFeatherPGSColoredScheduling(unittest.TestCase):
         order, which the default collision pipeline does not fix.
         """
         model, _ = _heap(nx=4, ny=4, nz=2)
-        colored_solver, colored, _ = _settle(model, steps=24)
+        _, colored, _ = _settle(model, steps=24)
         model_ref, _ = _heap(nx=4, ny=4, nz=2)
-        reference_solver, reference, _ = _settle(model_ref, steps=24, response="immediate")
-        for name, solver in (("colored", colored_solver), ("reference", reference_solver)):
-            # Sticky since construction: a row family over capacity (the overflow warnings) or a dropped row.
-            status = solver.constraint_capacity_status()
-            self.assertFalse(any(status.values()), f"{name} solver exceeded a capacity: {status}")
-            self.assertFalse(solver.constraint_overflow.numpy().any(), f"{name} solver dropped rows")
+        _, reference, _ = _settle(model_ref, steps=24, response="immediate")
 
         a = colored.body_q.numpy()[:, :3]
         b = reference.body_q.numpy()[:, :3]
         self.assertTrue(np.isfinite(b).all())
-        # Different sweep order, so not bitwise equal; the heap must still stand.
-        self.assertLess(float(np.max(np.abs(a[:, 2] - b[:, 2]))), 0.01)
+        # Different sweep order, so not bitwise equal. On complete rows the arms' heights differed by at
+        # most 2e-5 m over 10 GPU repeats (3e-5 m with deterministic pipelines, so the default ones stay);
+        # 1e-3 m is 50x that and still catches a millimetre-scale settling difference such as the
+        # ~3 mm sink of the old row-dropping reference.
+        self.assertLess(float(np.max(np.abs(a[:, 2] - b[:, 2]))), 1.0e-3)
 
     def test_coloring_is_deterministic_for_a_fixed_contact_set(self):
         """Same state and contacts must give the same partition and the same velocities.
@@ -180,6 +182,8 @@ class TestFeatherPGSColoredScheduling(unittest.TestCase):
                 dense_max_constraints=64,
             )
             trial.step(state_in, state_out, control, contacts, 1.0 / 240.0)
+            # Color the complete row set, as _settle requires of every heap.
+            trial.check_constraint_capacity()
             entries = PROPAGATION_COLOR_TAIL + 2
             offsets = trial.color_world_offsets.numpy()[:entries].copy()
             order = trial.color_unit_sorted.numpy()[: offsets[-1]].copy()
