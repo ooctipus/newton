@@ -32,10 +32,12 @@ steps alongside on CUDA and must match the state under test bitwise
 """
 
 import contextlib
+import ctypes
 import gc
 import inspect
 import itertools
 import os
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -45,6 +47,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.sim import contacts as contacts_module
 from newton._src.sim.contacts import note_contact_frame_write
 from newton._src.solvers.feather_pgs import environment_flags as fpgs_flags
 from newton._src.solvers.feather_pgs import friction_patches
@@ -3337,196 +3340,196 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
     def test_solver_graphs_reuse_sorted_frames(self):
-        """Replay collide and substep graphs bitwise as eager flag-off steps, sorting only changed frames in a node."""
-        if not wp.is_conditional_graph_supported():
-            self.skipTest("Conditional graph nodes need a CUDA 12.4+ driver and Warp build")
-        rng = np.random.default_rng(6)
-        with _nodes_flag("1"):
-            graph = _SolverTwin("cuda:0", jaws=True)
-        eager = _SolverTwin("cuda:0", reuse=False, nodes=False, jaws=True)
-        self.assertTrue(graph.patches.reuse_frames)
-        self.assertTrue(graph.patches.conditional_nodes)
-        # The radix sort's poisoned scratch half shows whether a replay sorted.
-        graph.patches.live_sort = False
-        # The memset stream forked at each step's end must stay valid across the node's capture pause.
-        self.assertIsNotNone(graph.solver._memset_stream, "the jaws double-buffer their mass matrices")
-        for _ in range(3):
-            for twin in (graph, eager):
-                twin.pair(collide=True)
-        captured = {}
-        for name, stream, collide in (("collide", 0, True), ("step", 0, False), ("swap", 1, False)):
-            with wp.ScopedCapture(device="cuda:0") as capture:
-                graph.solver.seed_double_buffer_events()
-                graph.pair(stream, collide)
-            captured[name] = capture.graph
-        n = graph.patches.capacity
-        for index, event in enumerate(_SOLVER_PLAN):
-            context = f"pair {index} {event}"
-            stream = _change((graph, eager), event, rng)
-            keys = graph.patches.current.keys.numpy()
-            keys[n:] = -12345
-            graph.patches.current.keys.assign(keys)
-            wp.capture_launch(captured[event if event in ("collide", "swap") else "step"])
-            eager.pair(stream, collide=event == "collide")
-            sorted_any = any(_sorts_each_substep(event))
-            intact = bool(np.all(graph.patches.current.keys.numpy()[n:] == -12345))
-            self.assertEqual(intact, not sorted_any, f"{context}: the radix sort ran {'never' if intact else 'once'}")
-            graph.assert_sorted(self, stream, context)
-            _assert_same_twins(graph, eager, context)
+        """Replay collide and substep graphs bitwise as eager always-sort steps, sorting once per graph or per change.
+
+        By default each graph sorts its first build and keeps the second, without
+        a conditional node; under the opt-in nodes the first build sorts only a
+        changed frame.
+        """
+        for nodes in _node_modes():
+            with self.subTest(nodes=nodes):
+                rng = np.random.default_rng(6)
+                graph = _graph_twin(nodes, jaws=True)
+                eager = _SolverTwin("cuda:0", reuse=False, nodes=False, jaws=True)
+                # The memset stream forked at each step's end must stay valid across a node's capture pause.
+                self.assertIsNotNone(graph.solver._memset_stream, "the jaws double-buffer their mass matrices")
+                for _ in range(3):
+                    for twin in (graph, eager):
+                        twin.pair(collide=True)
+                captured = {}
+                outcomes = _admitted_modes(graph.patches)
+                for name, stream, collide in (("collide", 0, True), ("step", 0, False), ("swap", 1, False)):
+                    with _capture_without_nodes(nodes) as capture:
+                        graph.solver.seed_double_buffer_events()
+                        graph.pair(stream, collide)
+                    captured[name] = capture.graph
+                    self.assertEqual(_conditional_node_count(capture.graph) > 0, nodes == "1", name)
+                first = "sort" if nodes is None else "node"
+                self.assertEqual(outcomes, [first, "keep"] * 3)
+                n = graph.patches.capacity
+                for index, event in enumerate(_SOLVER_PLAN):
+                    context = f"pair {index} {event}"
+                    stream = _change((graph, eager), event, rng)
+                    keys = graph.patches.current.keys.numpy()
+                    keys[n:] = -12345
+                    graph.patches.current.keys.assign(keys)
+                    wp.capture_launch(captured[event if event in ("collide", "swap") else "step"])
+                    eager.pair(stream, collide=event == "collide")
+                    sorted_any = nodes is None or any(_sorts_each_substep(event))
+                    intact = bool(np.all(graph.patches.current.keys.numpy()[n:] == -12345))
+                    self.assertEqual(
+                        intact, not sorted_any, f"{context}: the radix sort ran {'never' if intact else 'once'}"
+                    )
+                    graph.assert_sorted(self, stream, context)
+                    _assert_same_twins(graph, eager, context)
+                self.assertFalse(graph.solver.constraint_capacity_status()["patch_frames"])
 
     @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
     def test_graphs_sort_a_stream_allocated_at_a_freed_address(self):
         """Sort the first captured build over a Contacts the allocator placed where a freed one was."""
-        if not wp.is_conditional_graph_supported():
-            self.skipTest("Conditional graph nodes need a CUDA 12.4+ driver and Warp build")
-        rng = np.random.default_rng(8)
-        with _nodes_flag("1"):
-            graph = _SolverTwin("cuda:0", jaws=True)
-        eager = _SolverTwin("cuda:0", reuse=False, nodes=False, jaws=True)
-        self.assertTrue(graph.patches.reuse_frames)
-        self.assertTrue(graph.patches.conditional_nodes)
-        # The radix sort's poisoned scratch half shows whether a replay sorted.
-        graph.patches.live_sort = False
-        # Eager steps leave the slots holding the first stream's frame, recorded as sorted.
-        for twin in (graph, eager):
-            twin.pair(collide=True)
-        count = int(graph.streams[0].rigid_contact_count.numpy()[0])
-        order = np.concatenate((rng.permutation(count), np.arange(count, graph.streams[0].rigid_contact_max)))
-        # The replacement holds the frame reordered, with the same generation and count.
-        reused = [_replace_first_stream(twin, order) for twin in (graph, eager)]
-        self.assertTrue(reused[0], "the replacement's generation counter must sit at the freed address")
-        with wp.ScopedCapture(device="cuda:0") as capture:
-            graph.solver.seed_double_buffer_events()
-            graph.pair()
-        _poison_sort_scratch(graph)
-        wp.capture_launch(capture.graph)
-        eager.pair()
-        self.assertFalse(_sort_scratch_intact(graph), "the replacement must sort")
-        graph.assert_sorted(self, 0, "replacement")
-        _assert_same_twins(graph, eager, "replacement")
+        for nodes in _node_modes():
+            with self.subTest(nodes=nodes):
+                rng = np.random.default_rng(8)
+                graph = _graph_twin(nodes, jaws=True)
+                eager = _SolverTwin("cuda:0", reuse=False, nodes=False, jaws=True)
+                # Eager steps leave the slots holding the first stream's frame, recorded as sorted.
+                for twin in (graph, eager):
+                    twin.pair(collide=True)
+                count = int(graph.streams[0].rigid_contact_count.numpy()[0])
+                order = np.concatenate((rng.permutation(count), np.arange(count, graph.streams[0].rigid_contact_max)))
+                # The replacement holds the frame reordered, with the same generation and count.
+                reused = [_replace_first_stream(twin, order) for twin in (graph, eager)]
+                self.assertTrue(reused[0], "the replacement's generation counter must sit at the freed address")
+                with _capture_without_nodes(nodes) as capture:
+                    graph.solver.seed_double_buffer_events()
+                    graph.pair()
+                _poison_sort_scratch(graph)
+                wp.capture_launch(capture.graph)
+                eager.pair()
+                self.assertFalse(_sort_scratch_intact(graph), "the replacement must sort")
+                graph.assert_sorted(self, 0, "replacement")
+                _assert_same_twins(graph, eager, "replacement")
 
     @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
     def test_graphs_with_a_caller_fork_across_steps_sort_without_a_node(self):
-        """Sort unconditionally, bitwise as eager flag-off steps, while a stream the caller forked is unjoined."""
-        if not wp.is_conditional_graph_supported():
-            self.skipTest("Conditional graph nodes need a CUDA 12.4+ driver and Warp build")
-        with _nodes_flag("1"):
-            graph = _SolverTwin("cuda:0", jaws=True)
-        eager = _SolverTwin("cuda:0", reuse=False, nodes=False, jaws=True)
-        self.assertTrue(graph.patches.reuse_frames)
-        self.assertTrue(graph.patches.conditional_nodes)
-        # The radix sort's poisoned scratch half shows whether a replay sorted.
-        graph.patches.live_sort = False
-        for _ in range(3):
-            for twin in (graph, eager):
-                twin.pair(collide=True)
-        side = wp.Stream("cuda:0")
-        overlapped = wp.zeros(1024, dtype=float, device="cuda:0")
-        with wp.ScopedCapture(device="cuda:0") as capture:
-            graph.solver.seed_double_buffer_events()
-            main = wp.get_stream("cuda:0")
-            side.wait_event(main.record_event())
-            with wp.ScopedStream(side, sync_enter=False):
-                overlapped.fill_(1.0)
-            # Both substeps share the last collision frame, which a node would not sort.
-            graph.pair()
-            main.wait_event(side.record_event())
-        _poison_sort_scratch(graph)
-        wp.capture_launch(capture.graph)
-        eager.pair()
-        self.assertFalse(_sort_scratch_intact(graph), "the builds must sort without a node")
-        np.testing.assert_array_equal(overlapped.numpy(), 1.0)
-        graph.assert_sorted(self, 0, "caller fork")
-        _assert_same_twins(graph, eager, "caller fork")
+        """Step bitwise as eager always-sort steps while a stream the caller forked is unjoined.
+
+        No build can pause the capture for a node, so with the opt-in nodes the
+        first build sorts unconditionally; the second keeps its pairs either way.
+        """
+        for nodes in _node_modes():
+            with self.subTest(nodes=nodes):
+                graph = _graph_twin(nodes, jaws=True)
+                eager = _SolverTwin("cuda:0", reuse=False, nodes=False, jaws=True)
+                for _ in range(3):
+                    for twin in (graph, eager):
+                        twin.pair(collide=True)
+                side = wp.Stream("cuda:0")
+                overlapped = wp.zeros(1024, dtype=float, device="cuda:0")
+                outcomes = _admitted_modes(graph.patches)
+                with wp.ScopedCapture(device="cuda:0") as capture:
+                    graph.solver.seed_double_buffer_events()
+                    main = wp.get_stream("cuda:0")
+                    side.wait_event(main.record_event())
+                    with wp.ScopedStream(side, sync_enter=False):
+                        overlapped.fill_(1.0)
+                    graph.pair()
+                    main.wait_event(side.record_event())
+                self.assertEqual(outcomes, ["sort", "keep"])
+                self.assertEqual(_conditional_node_count(capture.graph), 0)
+                _poison_sort_scratch(graph)
+                wp.capture_launch(capture.graph)
+                eager.pair()
+                self.assertFalse(_sort_scratch_intact(graph), "the first build must sort without a node")
+                np.testing.assert_array_equal(overlapped.numpy(), 1.0)
+                graph.assert_sorted(self, 0, "caller fork")
+                _assert_same_twins(graph, eager, "caller fork")
 
     @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
     def test_double_buffered_solvers_share_a_graph(self):
         """Capture two double-buffered solvers in one graph, seeded together or each before its steps."""
-        if not wp.is_conditional_graph_supported():
-            self.skipTest("Conditional graph nodes need a CUDA 12.4+ driver and Warp build")
-        with _nodes_flag("1"):
-            graphs = (_SolverTwin("cuda:0", jaws=True), _SolverTwin("cuda:0", boxes=True))
-        eagers = (
-            _SolverTwin("cuda:0", reuse=False, nodes=False, jaws=True),
-            _SolverTwin("cuda:0", reuse=False, nodes=False, boxes=True),
-        )
-        for twin in graphs:
-            self.assertTrue(twin.patches.reuse_frames)
-            self.assertIsNotNone(twin.solver._memset_stream, "both solvers double-buffer their mass matrices")
-        # The boxes land before the captures.
-        for _ in range(12):
-            for twin in (*graphs, *eagers):
-                twin.pair(collide=True)
-        captured = []
-        for together in (True, False):
-            with wp.ScopedCapture(device="cuda:0") as capture:
-                for twin in graphs if together else ():
-                    twin.solver.seed_double_buffer_events()
+        for nodes in _node_modes():
+            with self.subTest(nodes=nodes):
+                graphs = (_graph_twin(nodes, jaws=True), _graph_twin(nodes, boxes=True))
+                eagers = (
+                    _SolverTwin("cuda:0", reuse=False, nodes=False, jaws=True),
+                    _SolverTwin("cuda:0", reuse=False, nodes=False, boxes=True),
+                )
                 for twin in graphs:
-                    if not together:
-                        twin.solver.seed_double_buffer_events()
-                    twin.pair(collide=True)
-            captured.append(capture.graph)
-        for replay in range(4):
-            wp.capture_launch(captured[replay % 2])
-            for twin in eagers:
-                twin.pair(collide=True)
-            for name, graph, eager in zip(("jaws", "boxes"), graphs, eagers, strict=True):
-                _assert_same_twins(graph, eager, f"replay {replay} {name}")
-        self.assertGreater(int(graphs[1].streams[0].rigid_contact_count.numpy()[0]), 0, "the boxes must touch")
+                    self.assertIsNotNone(twin.solver._memset_stream, "both solvers double-buffer their mass matrices")
+                # The boxes land before the captures.
+                for _ in range(12):
+                    for twin in (*graphs, *eagers):
+                        twin.pair(collide=True)
+                captured = []
+                for together in (True, False):
+                    with _capture_without_nodes(nodes) as capture:
+                        for twin in graphs if together else ():
+                            twin.solver.seed_double_buffer_events()
+                        for twin in graphs:
+                            if not together:
+                                twin.solver.seed_double_buffer_events()
+                            twin.pair(collide=True)
+                    captured.append(capture.graph)
+                for replay in range(4):
+                    wp.capture_launch(captured[replay % 2])
+                    for twin in eagers:
+                        twin.pair(collide=True)
+                    for name, graph, eager in zip(("jaws", "boxes"), graphs, eagers, strict=True):
+                        _assert_same_twins(graph, eager, f"replay {replay} {name}")
+                self.assertGreater(int(graphs[1].streams[0].rigid_contact_count.numpy()[0]), 0, "the boxes must touch")
 
     @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
     def test_solver_graphs_replay_empty_contact_frames(self):
-        """Replay graphs bitwise as eager flag-off steps over empty, live and again empty contact frames.
+        """Replay graphs bitwise as eager always-sort steps over empty, live and again empty contact frames.
 
         Boxes fall and rest on the ground; a Contacts.clear() empties the frame of a
         replay without a collision pass while their anchors are stored; they collide
         again, are thrown up and land again. A second eager twin is an A/A control:
         the graph must match bitwise for as long as the eager twins do, which must
-        cover every transition.
+        cover every transition. The boxes' 128 contact slots take the live sort,
+        which needs no node to skip empty frames.
         """
-        if not wp.is_conditional_graph_supported():
-            self.skipTest("Conditional graph nodes need a CUDA 12.4+ driver and Warp build")
-        with _nodes_flag("1"):
-            graph = _SolverTwin("cuda:0", boxes=True)
-        eager, control = (_SolverTwin("cuda:0", reuse=False, nodes=False, boxes=True) for _ in range(2))
-        self.assertTrue(graph.patches.reuse_frames)
-        self.assertTrue(graph.patches.conditional_nodes)
-        twins = (graph, eager, control)
-        for twin in twins:
-            twin.pair(collide=True)
-        captured = {}
-        for collide in (True, False):
-            with wp.ScopedCapture(device="cuda:0") as capture:
-                graph.solver.seed_double_buffer_events()
-                graph.pair(collide=collide)
-            captured[collide] = capture.graph
-        live, cleared = [], None
-        for replay in range(120):
-            collide = replay != 40
-            if not collide:
+        for nodes in _node_modes():
+            with self.subTest(nodes=nodes):
+                graph = _graph_twin(nodes, boxes=True, radix=False)
+                self.assertTrue(graph.patches.live_sort)
+                eager, control = (_SolverTwin("cuda:0", reuse=False, nodes=False, boxes=True) for _ in range(2))
+                twins = (graph, eager, control)
                 for twin in twins:
-                    twin.streams[0].clear()
-                cleared = int(np.count_nonzero(graph.patches.previous.valid.numpy()))
-            if replay == 60:
-                for twin in twins:
-                    twin.throw(1.2)
-            wp.capture_launch(captured[collide])
-            for twin in (eager, control):
-                twin.pair(collide=collide)
-            if not eager.same_steps(control):
-                break
-            _assert_same_twins(graph, eager, f"replay {replay}")
-            live.append(int(graph.streams[0].rigid_contact_count.numpy()[0]))
-        # Covered: empty frames before landing, live frames, an empty frame while
-        # anchors are stored, empty frames in the air after contact, and landing again.
-        self.assertGreater(len(live), 100, f"the eager twins must agree long enough: {len(live)} replays")
-        self.assertEqual(live[0], 0, f"the boxes must start in the air: {live}")
-        self.assertGreater(cleared, 0, "anchors must be stored when the frame is cleared")
-        self.assertEqual(live[40], 0, "the cleared frame must hold no contacts")
-        flights = [i for i in range(61, len(live)) if live[i] == 0 and live[i - 1] > 0]
-        self.assertTrue(flights, f"the thrown boxes must lose contact: {live}")
-        self.assertGreater(max(live[flights[0] :]), 0, f"the boxes must land again: {live}")
+                    twin.pair(collide=True)
+                captured = {}
+                for collide in (True, False):
+                    with _capture_without_nodes(nodes) as capture:
+                        graph.solver.seed_double_buffer_events()
+                        graph.pair(collide=collide)
+                    captured[collide] = capture.graph
+                live, cleared = [], None
+                for replay in range(120):
+                    collide = replay != 40
+                    if not collide:
+                        for twin in twins:
+                            twin.streams[0].clear()
+                        cleared = int(np.count_nonzero(graph.patches.previous.valid.numpy()))
+                    if replay == 60:
+                        for twin in twins:
+                            twin.throw(1.2)
+                    wp.capture_launch(captured[collide])
+                    for twin in (eager, control):
+                        twin.pair(collide=collide)
+                    if not eager.same_steps(control):
+                        break
+                    _assert_same_twins(graph, eager, f"replay {replay}")
+                    live.append(int(graph.streams[0].rigid_contact_count.numpy()[0]))
+                # Covered: empty frames before landing, live frames, an empty frame while
+                # anchors are stored, empty frames in the air after contact, and landing again.
+                self.assertGreater(len(live), 100, f"the eager twins must agree long enough: {len(live)} replays")
+                self.assertEqual(live[0], 0, f"the boxes must start in the air: {live}")
+                self.assertGreater(cleared, 0, "anchors must be stored when the frame is cleared")
+                self.assertEqual(live[40], 0, "the cleared frame must hold no contacts")
+                flights = [i for i in range(61, len(live)) if live[i] == 0 and live[i - 1] > 0]
+                self.assertTrue(flights, f"the thrown boxes must lose contact: {live}")
+                self.assertGreater(max(live[flights[0] :]), 0, f"the boxes must land again: {live}")
 
 
 def _poison_sort_scratch(twin):
@@ -3553,6 +3556,443 @@ def _assert_same_twins(graph, eager, context):
             getattr(eager.patches.previous, name).numpy(),
             f"{context} previous.{name}",
         )
+
+
+_TEST_CAPTURE_SERIALS = itertools.count(1)
+
+
+@contextlib.contextmanager
+def _cpu_capture_scopes():
+    """Give CPU graph captures a capture scope for the duration, as Warp's registry gives CUDA captures.
+
+    Warp records a CPU capture into a byte stream that :func:`warp.capture_launch`
+    replays. Newton counts it as eager; these tests name it the way
+    ``capture_scope`` names a CUDA capture. They capture no conditional bodies.
+    """
+    from warp._src import context  # noqa: PLC0415
+
+    real = contacts_module.capture_scope
+
+    def scope(device):
+        graph = context.runtime._apic_graph
+        if device.is_cpu and graph is not None:
+            serial = getattr(graph, "_test_capture_serial", None)
+            if serial is None:
+                serial = graph._test_capture_serial = next(_TEST_CAPTURE_SERIALS)
+            return serial, None
+        return real(device)
+
+    with (
+        mock.patch.object(friction_patches, "capture_scope", scope),
+        mock.patch.object(contacts_module, "capture_scope", scope),
+    ):
+        yield
+
+
+@contextlib.contextmanager
+def _capture_without_nodes(nodes, device="cuda:0"):
+    """Capture a graph on ``device``; unless ``nodes`` is "1", no build may insert a conditional node.
+
+    CPU captures get a capture scope (:func:`_cpu_capture_scopes`).
+    """
+    with contextlib.ExitStack() as stack:
+        if nodes != "1":
+            refuse = AssertionError("the patch build inserted a conditional node")
+            stack.enter_context(mock.patch.object(wp, "capture_if", side_effect=refuse))
+        if not wp.get_device(device).is_cuda:
+            stack.enter_context(_cpu_capture_scopes())
+        yield stack.enter_context(wp.ScopedCapture(device=device))
+
+
+def _conditional_node_count(graph):
+    """Count the conditional nodes of a captured CUDA graph, those of child graphs included."""
+    driver = ctypes.CDLL("nvcuda.dll" if sys.platform == "win32" else "libcuda.so.1")
+    get_nodes, get_type, get_child = (
+        driver.cuGraphGetNodes,
+        driver.cuGraphNodeGetType,
+        driver.cuGraphChildGraphNodeGetGraph,
+    )
+    for query in (get_nodes, get_type, get_child):
+        query.restype = ctypes.c_int
+    conditional, child = 13, 4  # CU_GRAPH_NODE_TYPE_CONDITIONAL, CU_GRAPH_NODE_TYPE_GRAPH
+
+    def count(handle):
+        size = ctypes.c_size_t()
+        if get_nodes(handle, None, ctypes.byref(size)) != 0:
+            raise RuntimeError("cuGraphGetNodes failed")
+        nodes = (ctypes.c_void_p * size.value)()
+        if size.value and get_nodes(handle, nodes, ctypes.byref(size)) != 0:
+            raise RuntimeError("cuGraphGetNodes failed")
+        total = 0
+        for node in nodes[: size.value]:
+            kind = ctypes.c_int()
+            if get_type(ctypes.c_void_p(node), ctypes.byref(kind)) != 0:
+                raise RuntimeError("cuGraphNodeGetType failed")
+            if kind.value == conditional:
+                total += 1
+            elif kind.value == child:
+                body = ctypes.c_void_p()
+                if get_child(ctypes.c_void_p(node), ctypes.byref(body)) != 0:
+                    raise RuntimeError("cuGraphChildGraphNodeGetGraph failed")
+                total += count(body)
+        return total
+
+    return count(graph.graph)
+
+
+def _node_modes():
+    """The FEATHER_PGS_PATCH_CONDITIONAL_NODES values a CUDA graph test runs: unset, and =1 where nodes work."""
+    return (None, "1") if wp.is_conditional_graph_supported() else (None,)
+
+
+def _graph_twin(nodes, *, radix=True, **options):
+    """Return a CUDA twin with default frame reuse under the nodes flag ``nodes``, to capture graphs of.
+
+    ``radix`` keeps the radix sort, whose poisoned scratch half shows whether a
+    replay sorted (:func:`_poison_sort_scratch`).
+    """
+    with _nodes_flag(nodes):
+        twin = _SolverTwin("cuda:0", **options)
+    if not twin.patches.reuse_frames or twin.patches.conditional_nodes != (nodes == "1"):
+        raise AssertionError(f"the twin must reuse frames, with conditional nodes only under =1 (flag {nodes!r})")
+    if radix:
+        twin.patches.live_sort = False
+    return twin
+
+
+@wp.kernel(enable_backward=False)
+def _reverse_live_contacts(
+    count: wp.array[wp.int32],
+    shape0: wp.array[wp.int32],
+    shape1: wp.array[wp.int32],
+    point_id: wp.array[wp.int32],
+    tids: wp.array[wp.int32],
+    point0: wp.array[wp.vec3],
+    point1: wp.array[wp.vec3],
+    offset0: wp.array[wp.vec3],
+    offset1: wp.array[wp.vec3],
+    normal: wp.array[wp.vec3],
+    margin0: wp.array[float],
+    margin1: wp.array[float],
+):
+    """Reverse the order of the live contacts, so that slot order no longer follows pair order."""
+    i = wp.tid()
+    j = wp.min(count[0], shape0.shape[0]) - 1 - i
+    if i >= j:
+        return
+    s0 = shape0[i]
+    shape0[i] = shape0[j]
+    shape0[j] = s0
+    s1 = shape1[i]
+    shape1[i] = shape1[j]
+    shape1[j] = s1
+    p = point_id[i]
+    point_id[i] = point_id[j]
+    point_id[j] = p
+    t = tids[i]
+    tids[i] = tids[j]
+    tids[j] = t
+    a0 = point0[i]
+    point0[i] = point0[j]
+    point0[j] = a0
+    a1 = point1[i]
+    point1[i] = point1[j]
+    point1[j] = a1
+    o0 = offset0[i]
+    offset0[i] = offset0[j]
+    offset0[j] = o0
+    o1 = offset1[i]
+    offset1[i] = offset1[j]
+    offset1[j] = o1
+    n = normal[i]
+    normal[i] = normal[j]
+    normal[j] = n
+    m0 = margin0[i]
+    margin0[i] = margin0[j]
+    margin0[j] = m0
+    m1 = margin1[i]
+    margin1[i] = margin1[j]
+    margin1[j] = m1
+
+
+def _reverse_contacts(contacts):
+    """Reverse the order of a contact stream's live contacts in place."""
+    wp.launch(
+        _reverse_live_contacts,
+        dim=max(1, contacts.rigid_contact_max // 2),
+        inputs=[
+            contacts.rigid_contact_count,
+            contacts.rigid_contact_shape0,
+            contacts.rigid_contact_shape1,
+            contacts.rigid_contact_point_id,
+            contacts.rigid_contact_tids,
+            contacts.rigid_contact_point0,
+            contacts.rigid_contact_point1,
+            contacts.rigid_contact_offset0,
+            contacts.rigid_contact_offset1,
+            contacts.rigid_contact_normal,
+            contacts.rigid_contact_margin0,
+            contacts.rigid_contact_margin1,
+        ],
+        device=contacts.device,
+    )
+
+
+def _step_passes(twin, passes):
+    """Step ``twin`` through collision passes, each a substep count, colliding on each pass's first substep.
+
+    Each pass reverses its live contacts after colliding, so that the slots hold
+    pairs out of order and a kept build that lost its sorted pairs shows.
+    """
+    for substeps in passes:
+        for substep in range(substeps):
+            if substep == 0:
+                twin.pipeline.collide(twin.states[0], twin.streams[0])
+                _reverse_contacts(twin.streams[0])
+            twin.substep()
+
+
+# Collision passes captured in one graph, each a substep count: one pass of two
+# substeps, as most tasks capture per launch; four such passes, as tasks whose
+# whole step is graphable capture per launch; and two passes of one substep.
+_COLLISION_PASSES = {
+    "collide, step, step": (2,),
+    "four passes of two steps": (2, 2, 2, 2),
+    "two passes of one step": (1, 1),
+}
+
+
+def run_captured_collision_passes(test, device, replays):
+    """Replay graphs of collision passes bitwise as the eager always-sort chain, sorting once per pass.
+
+    No graph holds a conditional node. On CUDA the graph twin keeps the radix
+    sort, whose poisoned scratch half shows that every replay sorted.
+    """
+    cuda = wp.get_device(device).is_cuda
+    # The squeezing jaws need CUDA; on the CPU, boxes landed on the ground keep their contacts.
+    scene = {"jaws": True} if cuda else {"boxes": True}
+    for name, passes in _COLLISION_PASSES.items():
+        with test.subTest(device=device, passes=name):
+            graph = _SolverTwin(device, nodes=False, **scene)
+            eager = _SolverTwin(device, reuse=False, nodes=False, **scene)
+            test.assertTrue(graph.patches.reuse_frames)
+            for _ in range(2 if cuda else 12):
+                for twin in (graph, eager):
+                    twin.pair(collide=True)
+            if cuda:
+                graph.patches.live_sort = False
+            outcomes = _admitted_modes(graph.patches)
+            with _capture_without_nodes(None, device) as capture:
+                graph.solver.seed_double_buffer_events()
+                _step_passes(graph, passes)
+            test.assertEqual(outcomes, [mode for count in passes for mode in ("sort", *("keep",) * (count - 1))])
+            if cuda:
+                test.assertEqual(_conditional_node_count(capture.graph), 0)
+            for replay in range(replays):
+                if cuda:
+                    _poison_sort_scratch(graph)
+                wp.capture_launch(capture.graph)
+                _step_passes(eager, passes)
+                if cuda:
+                    test.assertFalse(_sort_scratch_intact(graph), f"{name} replay {replay} must sort")
+                _assert_same_twins(graph, eager, f"{name} replay {replay}")
+            test.assertGreater(int(graph.streams[0].rigid_contact_count.numpy()[0]), 0, "the bodies must touch")
+            test.assertTrue(np.any(graph.patches.previous.valid.numpy()), "the passes must carry anchors")
+            test.assertFalse(graph.solver.constraint_capacity_status()["patch_frames"])
+
+
+def run_captured_steps_without_a_collision_pass(test, device, replays):
+    """Sort the first build of a graph without a collision pass and keep the second, whatever ran in between.
+
+    Collision passes, a model change and a Contacts.clear() run eagerly between
+    replays, as they may around a graph of substeps.
+    """
+    graph = _SolverTwin(device, nodes=False, boxes=True)
+    eager = _SolverTwin(device, reuse=False, nodes=False, boxes=True)
+    for _ in range(12):
+        for twin in (graph, eager):
+            twin.pair(collide=True)
+    outcomes = _admitted_modes(graph.patches)
+    with _capture_without_nodes(None, device) as capture:
+        graph.solver.seed_double_buffer_events()
+        graph.pair()
+    test.assertEqual(outcomes, ["sort", "keep"])
+    for replay in range(replays):
+        for twin in (graph, eager):
+            if replay % 3 == 0:
+                twin.pipeline.collide(twin.states[0], twin.streams[0])
+            elif replay % 3 == 1:
+                twin.solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
+            elif replay == 5:
+                twin.streams[0].clear()
+        wp.capture_launch(capture.graph)
+        eager.pair()
+        _assert_same_twins(graph, eager, f"replay {replay}")
+    test.assertFalse(graph.solver.constraint_capacity_status()["patch_frames"])
+
+
+@wp.kernel(enable_backward=False)
+def _lower_contact_count(count: wp.array[wp.int32]):
+    count[0] = count[0] - 1
+
+
+@wp.kernel(enable_backward=False)
+def _advance_contact_generation(generation: wp.array[wp.int32]):
+    generation[0] = generation[0] + 1
+
+
+def run_captured_contact_writes(test, device):
+    """Solve a kept substep that a caller's kernel rewrote without patch rows and report it; a cleared one sorts.
+
+    The caller's kernel runs between the two captured substeps of a collision
+    pass: lowering the count or advancing the generation without a noted write
+    breaks the capture contract, while Contacts.clear() followed by restoring the
+    count is a noted write, after which the substep sorts and steps bitwise as
+    the always-sort chain.
+    """
+    for write in ("count", "generation", "clear"):
+        with test.subTest(device=device, write=write):
+            graph = _SolverTwin(device, nodes=False, boxes=True)
+            eager = _SolverTwin(device, reuse=False, nodes=False, boxes=True)
+            for _ in range(12):
+                for twin in (graph, eager):
+                    twin.pair(collide=True)
+            test.assertTrue(np.any(graph.patches.previous.valid.numpy()), "the landed boxes must store anchors")
+            saved = {twin: wp.zeros(1, dtype=wp.int32, device=device) for twin in (graph, eager)}
+
+            def rewrite(twin, write=write, saved=saved):
+                contacts = twin.streams[0]
+                if write == "count":
+                    wp.launch(_lower_contact_count, dim=1, inputs=[contacts.rigid_contact_count], device=device)
+                elif write == "generation":
+                    wp.launch(_advance_contact_generation, dim=1, inputs=[contacts.contact_generation], device=device)
+                else:
+                    wp.copy(saved[twin], contacts.rigid_contact_count)
+                    contacts.clear()
+                    wp.copy(contacts.rigid_contact_count, saved[twin])
+
+            def collision_pass(twin, rewrite=rewrite):
+                twin.substep(collide=True)
+                rewrite(twin)
+                twin.substep()
+
+            outcomes = _admitted_modes(graph.patches)
+            with _capture_without_nodes(None, device) as capture:
+                graph.solver.seed_double_buffer_events()
+                collision_pass(graph)
+            test.assertEqual(outcomes, ["sort", "sort" if write == "clear" else "keep"])
+            wp.capture_launch(capture.graph)
+            collision_pass(eager)
+            test.assertTrue(np.all(np.isfinite(graph.states[0].body_qd.numpy())))
+            if write == "clear":
+                _assert_same_twins(graph, eager, write)
+                test.assertFalse(graph.solver.constraint_capacity_status()["patch_frames"])
+                continue
+            test.assertFalse(np.any(graph.patches.previous.valid.numpy()), "the empty frame releases every anchor")
+            test.assertTrue(np.any(eager.patches.previous.valid.numpy()), "the sorted frame keeps its anchors")
+            with test.assertRaisesRegex(RuntimeError, "without patch friction"):
+                graph.solver.check_constraint_capacity()
+            test.assertTrue(graph.solver.constraint_capacity_status(clear=True)["patch_frames"])
+            graph.solver.check_constraint_capacity()
+
+
+def run_captured_entry_filter(test, device, replays):
+    """Keep patch pairs across substeps of a coupled entry's filtered contacts, sorting after each filter pass.
+
+    A graph collides, filters the contacts for a coupled entry and builds the
+    patch frame of the filtered buffer twice, as an entry's substeps do; replays
+    match an always-sort patch state bitwise.
+    """
+    from newton.solvers import SolverSemiImplicit  # noqa: PLC0415
+    from newton.solvers.experimental.coupled import SolverCoupled  # noqa: PLC0415
+
+    model = _falling_boxes(device)
+    coupled = SolverCoupled(
+        model=model,
+        entries=[
+            SolverCoupled.Entry(
+                name="boxes",
+                solver=SolverSemiImplicit,
+                bodies=list(range(model.body_count)),
+                shapes=list(range(model.shape_count)),
+            )
+        ],
+    )
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=128, broad_phase="nxn", deterministic=True)
+    contacts = pipeline.contacts()
+    state = model.state()
+    poses = state.body_q.numpy()
+    poses[:, 2] = 0.019
+    state.body_q.assign(poses)
+    phi = [wp.zeros(128, dtype=wp.vec2, device=device) for _ in range(2)]
+    plain = _FrictionPatchState(model, 128, True, phi[0])
+    patches = _FrictionPatchState(model, 128, True, phi[1], reuse_frames=True)
+
+    def entry_substeps(states):
+        pipeline.collide(state, contacts)
+        filtered = coupled.entry_contacts("boxes", contacts)
+        for substep in range(2):
+            for patch_state in states:
+                patch_state.build(model, state, filtered)
+                patch_state.store(state)
+            if substep == 0:
+                wp.launch(_nudge_poses, dim=model.body_count, inputs=[state.body_q, 1.0e-4], device=device)
+        return filtered
+
+    filtered = entry_substeps((plain, patches))
+    test.assertIsNot(filtered, contacts)
+    test.assertGreater(int(filtered.rigid_contact_count.numpy()[0]), 0, "the boxes must touch the ground")
+    outcomes = _admitted_modes(patches)
+    with _capture_without_nodes(None, device) as capture:
+        entry_substeps((patches,))
+    test.assertEqual(outcomes, ["sort", "keep"])
+    for replay in range(replays):
+        before = wp.clone(state.body_q)
+        wp.capture_launch(capture.graph)
+        state.body_q.assign(before)
+        entry_substeps((plain,))
+        assert_same_state(patches, plain, f"replay {replay}", records=False)
+    test.assertEqual(int(patches.frame_status.numpy()[0]), 0)
+
+
+class TestPatchCapturedFrameReuse(unittest.TestCase):
+    """Graphs captured as Isaac Lab captures them, replayed on the CPU and on CUDA."""
+
+    def test_collision_pass_graphs_step_as_the_always_sort_chain(self):
+        """Replay [collide, step, ...] graphs bitwise as eager always-sort steps, sorting once per collision pass."""
+        run_captured_collision_passes(self, "cpu", replays=4)
+
+    def test_graphs_without_a_collision_pass_sort_their_first_build(self):
+        """Sort the first build of a substep graph each replay and keep the second, bitwise as eager steps."""
+        run_captured_steps_without_a_collision_pass(self, "cpu", replays=6)
+
+    def test_unnoted_contact_writes_between_captured_steps_are_reported(self):
+        """Report a captured kept substep rewritten by a caller's kernel; Contacts.clear() makes it sort instead."""
+        run_captured_contact_writes(self, "cpu")
+
+    def test_coupled_entry_filters_start_new_frames(self):
+        """Sort after each coupled entry filter pass and keep the pairs on the entry's later substeps."""
+        run_captured_entry_filter(self, "cpu", replays=4)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
+    def test_collision_pass_graphs_step_as_the_always_sort_chain_on_the_device(self):
+        """Replay collision-pass graphs on CUDA bitwise as eager always-sort steps, with one sort per pass."""
+        run_captured_collision_passes(self, "cuda:0", replays=30)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
+    def test_graphs_without_a_collision_pass_sort_their_first_build_on_the_device(self):
+        """Sort the first build of a CUDA substep graph each replay and keep the second, bitwise as eager steps."""
+        run_captured_steps_without_a_collision_pass(self, "cuda:0", replays=30)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
+    def test_unnoted_contact_writes_between_captured_steps_are_reported_on_the_device(self):
+        """Report a CUDA-captured kept substep rewritten by a caller's kernel; a cleared one sorts."""
+        run_captured_contact_writes(self, "cuda:0")
+
+    @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
+    def test_coupled_entry_filters_start_new_frames_on_the_device(self):
+        """Sort after each coupled entry filter pass in a CUDA graph and keep the pairs on later substeps."""
+        run_captured_entry_filter(self, "cuda:0", replays=30)
 
 
 if __name__ == "__main__":
