@@ -250,7 +250,7 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
         runs = {name: _rollout(solver, model, steps=120, slide_world=1, speed=0.6) for name, solver in solvers.items()}
         np.testing.assert_array_equal(runs["1"][0], runs["0"][0])
         np.testing.assert_array_equal(runs["1"][1], runs["0"][1])
-        self.assertLess(runs["0"][0][5:30, 1].mean(), 4.0, "The sliding world must release anchors")
+        self.assertTrue(np.any(runs["0"][0][:, 1] < 4), "The sliding world must release anchors")
         for fused, ordinary in zip(runs["1"][2], runs["0"][2], strict=True):
             for value_fused, value_ordinary in zip(fused, ordinary, strict=True):
                 np.testing.assert_array_equal(value_fused, value_ordinary)
@@ -260,10 +260,17 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
 
         The deferral law changes iterates, not the solved problem: anchors, contacts
         and states follow the full sweep through the slide, the stop and the rest.
-        Measured on the RTX: equal anchor counts on all 240 steps, poses within
-        4.8e-6 m and velocities within 3.4e-3 (point friction's law on this
-        fixture: 2.0e-5 m, 7.6e-4). The bounds leave room for a few anchor flips
-        at the release margins and for other float orders.
+        The resting world settles alike: measured on the RTX, equal anchor counts on
+        all 240 steps, poses within 4.8e-6 m and velocities within 3.4e-3.
+
+        The sliding world is chaotic: scaling its initial speed by 1 + 1e-7 changes
+        the full sweep's own anchor counts on 13 of the 240 steps and its poses by
+        5e-4 m. Its bounds therefore come from the law against the full sweep at ten
+        such speeds (0.6 m/s scaled by 1 + s, |s| from 1e-7 to 1e-2): anchor counts
+        differ on at most 6 steps, by 1, poses by 1.0e-5 m and velocities by 1.14e-2.
+        Releases happen on 3 to 28 of the steps, so only their presence is asserted.
+        The pair selection by a pair's own normal alone (a law error) differs on 25
+        steps, by 3, and moves velocities by 0.79.
         """
         model = standing_model("cuda:0", worlds=2)
         options = {"dense_max_constraints": 96, "pgs_iterations": 8, "enable_joint_limits": False}
@@ -274,21 +281,28 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
         self.assertFalse(solvers["full"]._sparse_active_rows)
         runs = {name: _rollout(solver, model, steps=240, slide_world=1, speed=0.6) for name, solver in solvers.items()}
         anchors, full_anchors = runs["active"][0], runs["full"][0]
-        # Two box feet, four ring-linked corners each, hold two anchors per foot at rest.
-        np.testing.assert_array_equal(full_anchors[-40:], 4)
-        self.assertLess(full_anchors[5:30, 1].mean(), 4.0, "The sliding world must release anchors")
         np.testing.assert_array_equal(runs["active"][1], runs["full"][1])
-        np.testing.assert_array_equal(anchors[-40:], 4)
-        mismatched = np.abs(anchors - full_anchors).sum(axis=1) > 0
+        for history in (anchors, full_anchors):
+            # Two box feet, four ring-linked corners each, hold two anchors per foot at rest.
+            np.testing.assert_array_equal(history[-40:], 4)
+            self.assertTrue(np.any(history[:, 1] < 4), "The sliding world must release anchors")
+        np.testing.assert_array_equal(anchors[:, 0], full_anchors[:, 0])
+        mismatched = anchors[:, 1] != full_anchors[:, 1]
         self.assertLessEqual(
-            int(mismatched.sum()), 6, f"steps with different anchor counts: {np.flatnonzero(mismatched)}"
+            int(mismatched.sum()), 18, f"steps with different anchor counts: {np.flatnonzero(mismatched)}"
         )
-        self.assertLessEqual(np.abs(anchors - full_anchors).max(), 2)
+        self.assertLessEqual(np.abs(anchors[:, 1] - full_anchors[:, 1]).max(), 2)
         states = list(zip(runs["active"][2], runs["full"][2], strict=True))
         # The law must act on this fixture, or the comparison would prove nothing.
         self.assertFalse(all(np.array_equal(active[1], full[1]) for active, full in states))
-        self.assertLess(max(np.abs(active[0][:, :3] - full[0][:, :3]).max() for active, full in states), 5.0e-5)
-        self.assertLess(max(np.abs(active[1] - full[1]).max() for active, full in states), 1.0e-2)
+        bodies = model.body_count // model.world_count
+        for world, pose_bound, velocity_bound in ((0, 5.0e-5, 1.0e-2), (1, 5.0e-5, 3.0e-2)):
+            with self.subTest(world=world):
+                body = slice(world * bodies, (world + 1) * bodies)
+                pose_gap = max(np.abs(active[0][body, :3] - full[0][body, :3]).max() for active, full in states)
+                velocity_gap = max(np.abs(active[1][body] - full[1][body]).max() for active, full in states)
+                self.assertLess(pose_gap, pose_bound)
+                self.assertLess(velocity_gap, velocity_bound)
 
 
 if __name__ == "__main__":
