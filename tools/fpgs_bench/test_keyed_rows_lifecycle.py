@@ -25,17 +25,21 @@ from tools.fpgs_bench.test_keyed_rows_capture import captures
 
 
 @contextmanager
-def mode(enabled):
+def mode(enabled, *, patch_friction=False):
     """Bind the existing INK recipe and the new flag before construction.
 
     Patch friction opts in to keyed rows and the parallel tiers explicitly
-    (``FEATHER_PGS_PATCH_PARALLEL_ROWS=1``; off by default), so the exported
-    environment cannot change the route.
+    (``FEATHER_PGS_PATCH_PARALLEL_ROWS=1``; off by default); point friction runs
+    with the switch unset, its default. Either way the exported environment
+    cannot change the route.
     """
     with (
-        patch.dict(os.environ, {"FEATHER_PGS_KEYED_ROWS": str(int(enabled)), "FEATHER_PGS_PATCH_PARALLEL_ROWS": "1"}),
+        patch.dict(os.environ, {"FEATHER_PGS_KEYED_ROWS": str(int(enabled))}),
         patch.object(source, "_INK_ON", True),
     ):
+        os.environ.pop("FEATHER_PGS_PATCH_PARALLEL_ROWS", None)
+        if patch_friction:
+            os.environ["FEATHER_PGS_PATCH_PARALLEL_ROWS"] = "1"
         yield
 
 
@@ -123,7 +127,7 @@ def make_solver(model, enabled, **overrides):
         "grouped_dynamics": True,
     }
     options.update(overrides)
-    with mode(enabled):
+    with mode(enabled, patch_friction=options["friction_anchor_beta"] > 0.0):
         return source.SolverFeatherPGS(model, **options)
 
 
@@ -176,12 +180,17 @@ class TestAllegroKineticLifecycleCPU(unittest.TestCase):
                     self.assertIsNone(rows.create_owner(admitted))
 
     def test_solver_friction_laws(self):
-        """Build point friction unless a test asks for patch friction, which keyed rows then admit."""
+        """Build point friction unless a test asks for patch friction; keyed rows admit both laws.
+
+        Point friction is admitted with the patch switch unset, its default; patch
+        friction is admitted because make_solver opts it in.
+        """
         model = saved_model("cpu")
         options = {"pgs_mode": "split", "enable_joint_velocity_limits": False}
         point = make_solver(model, True, **options)
         self.assertEqual(point.friction_anchor_beta, 0.0)
         self.assertTrue(point._point_contact_paths)
+        self.assertTrue(point._parallel_contact_paths)
         patch_friction = make_solver(model, True, friction_anchor_beta=0.2, **options)
         self.assertTrue(patch_friction._friction_anchors_enabled)
         self.assertTrue(patch_friction._parallel_contact_paths)

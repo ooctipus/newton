@@ -37,18 +37,17 @@ def make_case(
 ):
     model = _build_model(free_count=free_count) if model_factory is None else model_factory()
     with (
-        patch.dict(
-            os.environ,
-            {
-                "FEATHER_PGS_KEYED_ROWS": ("" if enabled is None else str(int(enabled))),
-                "FEATHER_PGS_PATCH_PARALLEL_ROWS": "1",
-            },
-        ),
+        patch.dict(os.environ, {"FEATHER_PGS_KEYED_ROWS": ("" if enabled is None else str(int(enabled)))}),
         patch.object(source, "_INK_ON", True),
         patch.object(source, "_MF_EXACT_ROWSUM", exact),
         patch.object(source, "_WR_ON", world_rows and not enabled),
         patch.object(source, "_REGISTER_WHITENING", exact),
     ):
+        # Patch friction opts in to the parallel tiers and keyed rows; point friction runs with the
+        # switch unset, its default, whatever the exported environment says.
+        os.environ.pop("FEATHER_PGS_PATCH_PARALLEL_ROWS", None)
+        if beta > 0.0:
+            os.environ["FEATHER_PGS_PATCH_PARALLEL_ROWS"] = "1"
         solver = _make_solver(
             model,
             False,
