@@ -7,6 +7,7 @@ import unittest
 import numpy as np
 import warp as wp
 
+from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
 from newton.tests.test_feather_pgs_contact_torsion import (
     PATCH_OPTIONS,
     TORSION_OFF_ROUTE,
@@ -21,16 +22,25 @@ class TestTorsionRegularization(unittest.TestCase):
         """Bound final shared impulses and account for their entire velocity response."""
         count = int(result["count"][0])
         impulses = result["impulses"][0, :count]
-        # Compare full velocities in float64 rather than subtracting two large
-        # float32 spins. Repeated in-place updates at 100rad/s accumulate several
-        # velocity ULPs even though the impulse budget and linear response agree.
-        response = result["Y_world"][0, :count].astype(np.float64).T @ impulses.astype(np.float64)
-        np.testing.assert_allclose(
-            result["v_out"],
-            result["v_hat"].astype(np.float64) + response,
-            rtol=8 * np.finfo(np.float32).eps,
-            atol=2e-5,
+        types = result["row_type"][0, :count]
+        response = result["Y_world"][0, :count].astype(np.float64)
+        expected = result["v_hat"].astype(np.float64) + response.T @ impulses.astype(np.float64)
+        # Compare full velocities in float64 within the rounding of the sweep's float32 velocity.
+        # Each PGS sweep (no velocity pass here) adds a changed row's response to it in place,
+        # once per row that reaches a coordinate (a friction pair adds its sibling's response and
+        # its own), and the torsion pass adds once more per anchor pair it rescales to the final
+        # pooled load. Each add rounds by at most half an ulp of the running value, which contact
+        # and friction keep within the coordinate's larger end value; atol covers the rounding of
+        # products and impulse differences. Velocity-limit rows (limits of 1e6 here) never fire,
+        # and their stateless impulses would not account for a response.
+        reach = response != 0.0
+        rows = np.count_nonzero(reach[types != PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT], axis=0)
+        pairs = sum(
+            reach[n + 1] | reach[n + 2] for group in solver._torsion_stats["groups"] for n in group["anchor_rows"]
         )
+        adds = solver.pgs_iterations * (rows + pairs)
+        magnitude = np.maximum(np.abs(result["v_hat"]), np.abs(expected)).astype(np.float32)
+        np.testing.assert_array_less(np.abs(result["v_out"] - expected), adds * np.spacing(magnitude) / 2 + 2e-5)
         self.assertTrue(solver._torsion_stats["groups"])
         for group in solver._torsion_stats["groups"]:
             load = sum(max(float(impulses[n]), 0.0) for n in group["normal_rows"])
