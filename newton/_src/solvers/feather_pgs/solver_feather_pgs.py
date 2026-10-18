@@ -14070,7 +14070,7 @@ class SolverFeatherPGS(SolverBase):
 
                 launch_contacts(self, state_in, state_aug, contacts, contact_build_threads)
             elif plan.producer in SHARED_METADATA_PRODUCERS:
-                if plan.prepare_rows:
+                if plan.metadata_launch:
                     wp.launch(
                         prepare_world_contact_rows,
                         dim=contact_build_threads,

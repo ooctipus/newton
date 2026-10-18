@@ -35,8 +35,12 @@ class ContactRowPlan:
     """General producer, debug only: the builder a row check compares (``FEATHER_PGS_CHECK_ROWS``:
     ``"native"`` or ``"masked"`` into copies, then the per-contact rows; ``FEATHER_PGS_CHECK_ROWS_FUSED``:
     ``"fused_rows"`` after the combined masked rows)."""
-    prepare_rows: bool = False
-    """Shared-metadata producers: ``prepare_world_contact_rows`` writes the row metadata."""
+    metadata_launch: bool = False
+    """Shared-metadata producers: a separate ``prepare_world_contact_rows`` launch writes the row metadata.
+
+    False for native sparse factors whose response kernel prepares the rows itself. The sparse response
+    factory's ``prepare_rows`` option has the opposite sense: ``True`` selects that kernel (suffix
+    ``_prepared``), which needs no metadata launch."""
 
 
 def contact_row_plan(solver) -> ContactRowPlan:
@@ -69,6 +73,10 @@ def contact_row_plan(solver) -> ContactRowPlan:
         return ContactRowPlan("compact_contact_boundary", law, dict.fromkeys(sizes, "compact_contact_boundary"))
     sparse_size = solver._sparse_mass_matrix_size
     diagonal = bool(solver._sparse_diagonal_contact_solve)
+    if sparse_size is not None and diagonal:
+        # _setup_sparse_mass_matrix declines native sparse factors where the sparse-diagonal owner owns the
+        # response, so one producer ranks first; the row build launches the diagonal response for that owner only.
+        raise RuntimeError("Native sparse factors and the sparse-diagonal contact owner cannot both own contact rows.")
     if sparse_size is not None or diagonal or solver._compact_contact_jacobian:
         methods = {}
         for size in sizes:
@@ -85,7 +93,7 @@ def contact_row_plan(solver) -> ContactRowPlan:
             producer = "sparse_diagonal"
         else:
             producer = "compact_jacobian"
-        return ContactRowPlan(producer, law, methods, prepare_rows=not solver._sparse_prepare_contacts)
+        return ContactRowPlan(producer, law, methods, metadata_launch=not solver._sparse_prepare_contacts)
     check_rows = bool(solver._point_contact_paths and source._CHECK_ROWS)
     masked_law = solver._masked_contact_rows()
     masked_sizes = ()

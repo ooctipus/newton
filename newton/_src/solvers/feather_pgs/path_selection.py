@@ -37,8 +37,9 @@ _BETA_REASONS = {
 # Which claim wins where two patch routes could serve the same world: the order of the
 # declines in _setup_sparse_mass_matrix, the paired factor sweep's exclusions (keyed_rows,
 # row_packets and the tier gate of _init_tiled_kernels) and the order of the row producers
-# in _stage4_build_rows; and which native sparse sweeps fuse patch anchor triplets
-# (_admit_sparse_contact_triplets). It governs law-agnostic solvers only.
+# in contact_row_plan (which _stage4_build_rows dispatches on); and which native sparse
+# sweeps fuse patch anchor triplets (_admit_sparse_contact_triplets). It governs
+# law-agnostic solvers only.
 _PATCH_ROUTE_PRECEDENCE = (
     " Patch routes, first claim first: a parallel tier that mf_gs_parallel_rows requests under"
     " FEATHER_PGS_PATCH_PARALLEL_ROWS=1 declines native sparse factors, worlds with free rigid bodies then keep the"
@@ -288,7 +289,7 @@ def _row_builder(solver, plan, size, source) -> dict:
     """
     method, law = plan.methods[size], plan.law
     patch = law == "patch"
-    prepare = (source.prepare_world_contact_rows,) if plan.prepare_rows else ()
+    prepare = (source.prepare_world_contact_rows,) if plan.metadata_launch else ()
     if method == "local_packets":
         from . import row_packets  # noqa: PLC0415 - the owner's module; loaded with the owner
 

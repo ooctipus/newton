@@ -17,6 +17,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import friction_patches, keyed_rows
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
+from newton._src.solvers.feather_pgs.contact_row_plan import contact_row_plan
 from newton._src.solvers.feather_pgs.path_selection import applied_options
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import (
@@ -128,6 +129,29 @@ def _resting_arms_and_box(*links, device="cpu"):
     builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.1)
     builder.add_ground_plane()
     return builder.finalize(device=device)
+
+
+def _plan_stand_in(law, sizes=(108, 6), **attributes):
+    """A host stand-in with the attributes contact_row_plan and the route record read; no owner is admitted."""
+    values = {
+        "_friction_anchors_enabled": law == "patch",
+        "_point_contact_paths": law == "point",
+        "size_groups": list(sizes),
+        "_row_packets": None,
+        "_keyed_rows": None,
+        "_compact_contact_boundary": False,
+        "_compact_contact_order": None,
+        "_sparse_mass_matrix_size": None,
+        "_sparse_prepare_contacts": False,
+        "_sparse_diagonal_contact_solve": False,
+        "_sparse_diagonal_response_size": None,
+        "_sparse_diagonal_contact_triples": False,
+        "_sparse_diagonal_contact_units": False,
+        "_compact_contact_jacobian": False,
+        "_masked_contact_rows": lambda: True,
+    }
+    values.update(attributes)
+    return SimpleNamespace(**values)
 
 
 def _install_cpu_keyed_rows(solver):
@@ -621,6 +645,31 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         # One combined masked launch for both sizes, then one per-contact launch per size.
         self.assertEqual([key for key in masked if key in builders], list(builders[:2]))
         self.assertEqual([key for key in forced if key in builders], [builders[2]] * 2)
+
+    def test_plan_refuses_sparse_factors_beside_the_sparse_diagonal_owner(self):
+        """Refuse a plan in which native sparse factors and the sparse-diagonal owner both own contact rows.
+
+        _setup_sparse_mass_matrix declines sparse factors where the sparse-diagonal owner owns the
+        response. The plan ranks sparse factors first and the row build launches the diagonal response
+        for the sparse-diagonal producer only, so both owners together would drop that response.
+        """
+        for law in ("point", "patch"):
+            with self.subTest(law=law):
+                both = _plan_stand_in(
+                    law,
+                    _sparse_mass_matrix_size=6,
+                    _sparse_diagonal_contact_solve=True,
+                    _sparse_diagonal_response_size=108,
+                )
+                with self.assertRaisesRegex(RuntimeError, "sparse-diagonal contact owner"):
+                    contact_row_plan(both)
+                # Either owner alone produces its own rows.
+                for producer, owner in (
+                    ("sparse_contact_response", {"_sparse_mass_matrix_size": 6}),
+                    ("sparse_diagonal", {"_sparse_diagonal_contact_solve": True}),
+                ):
+                    plan = contact_row_plan(_plan_stand_in(law, _sparse_diagonal_response_size=108, **owner))
+                    self.assertEqual(plan.producer, producer)
 
     def test_cpu_split_route_reports_free_body_velocity_limit_rows(self):
         """Report free-body velocity-limit rows in split mode, where the row builder allocates them as well."""
