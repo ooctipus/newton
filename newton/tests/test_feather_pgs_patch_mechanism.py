@@ -2682,6 +2682,29 @@ class TestPatchFrameModes(unittest.TestCase):
                 self.assertEqual(tuple(outcomes), expected)
                 np.testing.assert_array_equal(patches.frame_status.numpy(), [0])
 
+    def test_forget_frame_drops_the_device_record_only_for_conditional_nodes(self):
+        """Make the next build sort after forget_frame(); only nodes, which trust the record, need it dropped too.
+
+        Isaac Lab notifies model changes eagerly before most graph launches, so
+        frame reuse alone must not add a launch there.
+        """
+        scene = _Scene("cpu", 47)
+        scene.frame()
+        for nodes in (False, True):
+            with self.subTest(nodes=nodes):
+                phi = wp.zeros(128, dtype=wp.vec2, device="cpu")
+                patches = _FrictionPatchState(scene.model, 128, True, phi, reuse_frames=True, conditional_nodes=nodes)
+                _captured(patches)
+                patches.build(scene.model, scene.state, scene.contacts)
+                identity = _frame_identity(patches, scene.contacts)
+                _assert_record(self, patches, identity, "sorted")
+                self.assertIsNotNone(patches._last_build)
+                with mock.patch.object(wp.array, "fill_", autospec=True, side_effect=wp.array.fill_) as fill:
+                    patches.forget_frame()
+                self.assertIsNone(patches._last_build)
+                self.assertEqual(fill.call_count, int(nodes))
+                _assert_record(self, patches, None if nodes else identity, "forgotten")
+
     def test_sorting_prepare_matches_prepare_and_records_the_frame(self):
         """Prepare bitwise as _prepare where the sort follows, and record the frame in the same launch."""
         rng = np.random.default_rng(41)
@@ -2766,11 +2789,11 @@ class TestPatchFrameModes(unittest.TestCase):
         """Leave a kept build without live contacts and latch the status when its frame is not the recorded one.
 
         Writing the generation or the count directly, unnoted, breaks the capture
-        contract and is admitted as a reuse; another stream or a forgotten record
+        contract and is admitted as a reuse; another stream or a dropped record
         is not, and is forced here.
         """
         rng = np.random.default_rng(43)
-        for change in ("generation", "count", "stream", "forget"):
+        for change in ("generation", "count", "stream", "record"):
             with self.subTest(change=change):
                 scene = _Scene("cpu", 43)
                 _, patches = _recording_pair(scene, 128)
@@ -2789,7 +2812,7 @@ class TestPatchFrameModes(unittest.TestCase):
                 elif change == "stream":
                     contacts = _swapped_stream(scene, live, rng)
                 else:
-                    patches.forget_frame()
+                    patches.sorted_frame.fill_(-1)
                 if change in ("generation", "count"):
                     patches.build(scene.model, scene.state, contacts)
                     self.assertEqual(len(sorts), 1, "the unnoted rewrite is admitted as a reuse")

@@ -1543,9 +1543,13 @@ class _FrictionPatchState:
         self.forget_frame()
 
     def forget_frame(self):
-        """Make the next build sort its pairs, as it does for a new contact frame."""
+        """Make the next build sort its pairs, as it does for a new contact frame.
+
+        Only a conditional node trusts the device record across builds; a kept
+        build follows a sort of its own capture scope, which records its frame.
+        """
         self._last_build = None
-        if self.reuse_frames or self.conditional_nodes:
+        if self.conditional_nodes:
             self.sorted_frame.fill_(GENERATION_SENTINEL)
 
     def stream_token(self, generation):
