@@ -913,17 +913,12 @@ class TestPatchLiveExtent(unittest.TestCase):
 
     def test_unstored_builds_clear_their_slots(self):
         """Clear the slots of a build that no store followed, as a full-capacity frame does."""
-        scene = _Scene("cpu", 8)
-        patches, reference = _pair(scene, 96)
-        patches.threads, patches.build_threads = 5, 3
-        scene.active[:] = True
-        for mode in ("live", "overflow", "live", "sparse", "empty"):
-            scene.move()
-            live = scene.frame(mode)
-            for state in (patches, reference):
-                state.build(scene.model, scene.state, scene.contacts)
-            assert_same_patches(patches, reference, live, mode)
-            assert_empty_tail(patches, mode)
+        run_unstored_builds("cpu", 8, capacity=96, threads=(5, 3))
+
+    @unittest.skipUnless(wp.is_cuda_available(), "multi-block grids need CUDA")
+    def test_unstored_builds_clear_their_slots_on_many_blocks(self):
+        """Clear an unstored build's slots on many blocks when the next frame is smaller and nothing is stored."""
+        run_unstored_builds("cuda:0", 18, worlds=48, contacts=2048, capacity=3072)
 
     @unittest.skipUnless(wp.is_cuda_available(), "multi-block grids need CUDA")
     def test_live_extent_matches_the_reference_on_many_blocks(self):
@@ -939,6 +934,28 @@ class TestPatchLiveExtent(unittest.TestCase):
     def test_graph_replay_follows_changing_counts(self):
         """Replay one captured patch step over rising, empty, overflowing and sharply dropping counts."""
         run_graph_replay("cuda:0")
+
+
+def run_unstored_builds(device, seed, *, worlds=3, contacts=96, capacity=96, threads=None):
+    """Build full, overflowing, sparse and empty frames that no store follows, comparing every build.
+
+    Every pair is active, so each full frame leaves more built slots than the
+    next frame holds and no store ever records them.
+    """
+    scene = _Scene(device, seed, worlds=worlds, contacts=contacts)
+    patches, reference = _pair(scene, capacity)
+    if threads is not None:
+        patches.threads, patches.build_threads = threads
+    twin = _twin(patches, scene)
+    scene.active[:] = True
+    for mode in ("live", "overflow", "live", "sparse", "empty"):
+        scene.move()
+        live = scene.frame(mode)
+        for state in (patches, twin, reference):
+            if state is not None:
+                state.build(scene.model, scene.state, scene.contacts)
+        assert_same_patches(patches, reference, live, mode, twin)
+        assert_empty_tail(patches, mode)
 
 
 def run_graph_replay(device, *, worlds=32, contacts=1536, capacity=2048, live_sort=None):
