@@ -592,7 +592,7 @@ def _rollout(
             sparse_mass_matrix="off",
             **(solver_kwargs or {}),
         )
-    pipeline = newton.CollisionPipeline(model)
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
     contacts = pipeline.contacts()
     states = [model.state() for _ in range(2)]
     newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
