@@ -1,0 +1,1 @@
+Clear the internal Jacobian scratch of `newton.eval_mass_matrix` only where the mass-matrix kernel reads it, and stop zero-filling its spatial-inertia scratch, which is fully overwritten. Results are unchanged; no migration is required.

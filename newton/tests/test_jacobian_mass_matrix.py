@@ -846,6 +846,57 @@ def test_articulation_view_jacobian_writes_only_view_blocks(test, device):
             np.testing.assert_array_equal(J_np[~selected], np.full_like(J_ref[~selected], _SENTINEL))
 
 
+def test_mass_matrix_mask_zeroes_unselected_articulations(test, device):
+    """Return exact selected blocks and zeros elsewhere from a masked eval_mass_matrix.
+
+    This is the mask convention that eval_inverse_dynamics_passive documents as
+    mirroring eval_mass_matrix. It must hold when H holds stale values and the
+    supplied Jacobian carries NaN in every block eval_jacobian left unselected.
+    """
+    model, state = _build_mixed_articulations(device)
+    H_ref = newton.eval_mass_matrix(model, state).numpy()
+
+    for name, selected in _mixed_selections(model).items():
+        mask = wp.array(selected, dtype=bool, device=device)
+        J = _filled(_jacobian_shape(model), np.nan, device)
+        newton.eval_jacobian(model, state, J, mask=mask)
+        for source, supplied in (("supplied", J), ("internal", None)):
+            with test.subTest(selection=name, jacobian=source):
+                H = _filled(H_ref.shape, _SENTINEL, device)
+                test.assertIs(newton.eval_mass_matrix(model, state, H, J=supplied, mask=mask), H)
+
+                H_np = H.numpy()
+                np.testing.assert_array_equal(H_np[selected], H_ref[selected])
+                np.testing.assert_array_equal(H_np[~selected], np.zeros_like(H_ref[~selected]))
+
+
+def test_mass_matrix_scratch_skips_redundant_clears(test, device):
+    """Clear eval_mass_matrix's internal scratch only where its kernels read it.
+
+    The internal Jacobian is cleared once without a mask and never as a whole with one;
+    the spatial-inertia scratch is fully overwritten and never zero-filled. H keeps its
+    single clear, which the documented zeros of unselected articulations need.
+    """
+    model, state = _build_mixed_articulations(device)
+    mask = wp.array(_mixed_selections(model)["fan"], dtype=bool, device=device)
+    J_shape = _jacobian_shape(model)
+    H_shape = (model.articulation_count, model.max_dofs_per_articulation, model.max_dofs_per_articulation)
+
+    patches, cleared = _record_clears()
+    with patches[0], patches[1]:
+        newton.eval_mass_matrix(model, state, mask=mask)
+        masked = list(cleared)
+        cleared.clear()
+        newton.eval_mass_matrix(model, state)
+        unmasked = list(cleared)
+
+    for name, events, jacobian_clears in (("masked", masked, 0), ("unmasked", unmasked, 1)):
+        with test.subTest(call=name):
+            test.assertEqual(sum(shape == J_shape for _ptr, shape, _dtype in events), jacobian_clears)
+            test.assertEqual(sum(shape == H_shape for _ptr, shape, _dtype in events), 1)
+            test.assertFalse([dtype for _ptr, _shape, dtype in events if dtype == wp.spatial_matrix])
+
+
 def test_zero_selected_blocks_matches_numpy(test, device):
     """Zero exactly the selected per-articulation blocks, through the device path and through the kernels.
 
@@ -1568,6 +1619,18 @@ add_function_test(
     TestJacobianMassMatrix,
     "test_articulation_view_jacobian_writes_only_view_blocks",
     test_articulation_view_jacobian_writes_only_view_blocks,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_mass_matrix_mask_zeroes_unselected_articulations",
+    test_mass_matrix_mask_zeroes_unselected_articulations,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_mass_matrix_scratch_skips_redundant_clears",
+    test_mass_matrix_scratch_skips_redundant_clears,
     devices=devices,
 )
 add_function_test(

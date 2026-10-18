@@ -1839,13 +1839,17 @@ def eval_mass_matrix(
         H: Optional output array for mass matrix, shape (articulation_count, max_dofs, max_dofs).
            If None, allocates internally.
         J: Optional pre-computed Jacobian. If None, computes internally.
-           Shape (articulation_count, max_links*6, max_dofs).
+           Shape (articulation_count, max_links*6, max_dofs). Only the blocks of
+           selected articulations are read, so :func:`eval_jacobian` with the same
+           mask provides enough.
         body_I_s: Optional pre-allocated temp array for spatial inertias,
                   shape (body_count,), dtype wp.spatial_matrix. If None, allocates internally.
         joint_S_s: Optional pre-allocated temp array for motion subspaces (only used if J is None),
                    shape (joint_dof_count,), dtype wp.spatial_vector. If None, allocates internally.
         mask: Optional boolean mask to select which articulations to compute.
               Shape [articulation_count]. If None, computes for all articulations.
+              Entries of unselected articulations, and the rows and columns past
+              each articulation's DOF count, are zero in ``H``.
 
     Returns:
         The mass matrix array H, or None if the model has no articulations.
@@ -1862,12 +1866,12 @@ def eval_mass_matrix(
             device=model.device,
         )
 
-    # Zero the output buffer
+    # Zero the whole output: unselected articulations and padding must read as zero.
     H.zero_()
 
-    # Allocate or use provided body_I_s
+    # Every body's spatial inertia is written below, so the scratch needs no clear.
     if body_I_s is None:
-        body_I_s = wp.zeros(
+        body_I_s = wp.empty(
             model.body_count,
             dtype=wp.spatial_matrix,
             device=model.device,
@@ -1886,11 +1890,12 @@ def eval_mass_matrix(
         device=model.device,
     )
 
-    # Compute Jacobian if not provided
+    # Compute Jacobian if not provided. eval_jacobian clears every block that the
+    # mass-matrix kernel reads, so the scratch needs no clear of its own.
     if J is None:
         max_links = model.max_joints_per_articulation
         max_dofs = model.max_dofs_per_articulation
-        J = wp.zeros(
+        J = wp.empty(
             (model.articulation_count, max_links * 6, max_dofs),
             dtype=float,
             device=model.device,

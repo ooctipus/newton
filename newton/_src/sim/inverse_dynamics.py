@@ -461,11 +461,12 @@ def eval_inverse_dynamics_passive(
     )
 
     if mass_matrix is not None:
-        # eval_jacobian zeros scratch.J internally; jcalc_motion_subspace
-        # fully overwrites every DOF of scratch.joint_S_s;
-        # compute_body_spatial_inertia fully overwrites every body's
-        # scratch.body_I_s; eval_mass_matrix zeros mass_matrix internally.
-        # No pre-zeroing required here.
+        # eval_jacobian clears the scratch.J blocks of the selected
+        # articulations, the only ones eval_mass_matrix reads;
+        # jcalc_motion_subspace overwrites every selected DOF of
+        # scratch.joint_S_s; compute_body_spatial_inertia fully overwrites
+        # every body's scratch.body_I_s; eval_mass_matrix zeros mass_matrix
+        # internally. No pre-zeroing required here.
         eval_jacobian(model, state, J=scratch.J, joint_S_s=scratch.joint_S_s, mask=mask)
         eval_mass_matrix(
             model,
