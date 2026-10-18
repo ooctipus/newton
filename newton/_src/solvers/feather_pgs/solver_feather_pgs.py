@@ -3349,7 +3349,12 @@ class SolverFeatherPGS(SolverBase):
         the sweep kernels per route and tier and what drives them, resolved worlds,
         publication, velocity limits, free bodies, the friction law and the
         grouped-dynamics kernels, each with a reason; a size whose response the
-        grouped kernel solves reports ``hinv_jt_kernel`` ``"grouped"``. ``measurements`` holds the
+        grouped kernel solves reports ``hinv_jt_kernel`` ``"grouped"``. The
+        row builders (``contact_rows.builder_by_dof``) are those of the dense
+        contact rows built outside the sweep: the parallel tiers build keyed rows'
+        direct rows in the sweep (``direct_rows``), the free-body matrix-free and
+        propagation rows follow ``free_rigid_bodies``, and the debug row checks
+        name their own builders (``row_check_by_dof``). ``measurements`` holds the
         construction-time lane timings, kept out of ``routes`` so that two runs of
         one configuration compare equal. ``options`` records every constructor
         option's requested, declared-default and applied value, captured once at

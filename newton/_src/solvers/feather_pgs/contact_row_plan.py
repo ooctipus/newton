@@ -17,6 +17,22 @@ SHARED_METADATA_PRODUCERS = ("sparse_contact_response", "sparse_diagonal", "comp
 # General-builder methods whose one launch builds the rows of up to two sizes.
 COMBINED_METHODS = ("masked_combined", "fused_rows")
 
+# Every builder method a plan can name, by producer; the route record names each one's kernels.
+BUILDER_METHODS = (
+    "local_packets",
+    "keyed_rows",
+    "compact_contact_boundary",
+    "sparse_response",
+    "sparse_free_response",
+    "sparse_diagonal",
+    "compact_jacobian",
+    "per_contact",
+    "masked",
+    "masked_combined",
+    "native",
+    "fused_rows",
+)
+
 
 @dataclasses.dataclass(frozen=True)
 class ContactRowPlan:

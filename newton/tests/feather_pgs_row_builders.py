@@ -5,7 +5,8 @@
 
 ``get_path_selection()["routes"]["contact_rows"]["builder_by_dof"]`` names, per DOF
 size, the kernels that build the dense contact rows outside the sweep, in launch
-order. :func:`assert_row_builders_named` requires those names to be exactly the
+order, and ``row_check_by_dof`` those the debug row checks add.
+:func:`assert_row_builders_named` requires those names to be exactly the
 contact-row builders among the kernels one recorded step launched, in that order
 and with one launch per step or per size. The module also holds the keyed-row CPU
 stand-in and the row-builder switch table the record tests share. It defines no
@@ -120,11 +121,12 @@ def _launches_per_step(builders) -> collections.Counter:
 
 
 def assert_row_builders_named(test, contact_rows, keys):
-    """Require ``builder_by_dof`` to name exactly the contact-row builders among ``keys``, in order and count.
+    """Require the record to name exactly the contact-row builders among ``keys``, in order and count.
 
-    Every launched builder is named and every named builder launched; each entry's kernels launch in
-    the order the entry lists them (their launches, with repeats removed, start with the list); a
-    per-size builder launches once for each size that names it and every other builder once.
+    ``builder_by_dof``, with the debug checks' ``row_check_by_dof`` when a check runs, names every
+    launched builder and only those; each entry's kernels launch in the order the entry lists them
+    (their launches, with repeats removed, start with the list); a per-size builder launches once for
+    each size that names it and every other builder once.
 
     Args:
         test: The running test case.
@@ -132,15 +134,16 @@ def assert_row_builders_named(test, contact_rows, keys):
             the recorded step ran with.
         keys: The kernel keys of one whole step.
     """
-    builders = contact_rows["builder_by_dof"]
+    groups = [contact_rows["builder_by_dof"], contact_rows["row_check_by_dof"] or {}]
+    entries = [(size, entry) for group in groups for size, entry in group.items()]
     launched = [key for key in keys if is_row_builder(key)]
-    named = {kernel for entry in builders.values() for kernel in entry["kernels"]}
-    test.assertTrue(named, builders)
-    test.assertEqual(set(launched), named, builders)
-    test.assertEqual(collections.Counter(launched), _launches_per_step(builders), builders)
-    for size, entry in builders.items():
+    named = {kernel for _, entry in entries for kernel in entry["kernels"]}
+    test.assertTrue(named, groups)
+    test.assertEqual(set(launched), named, groups)
+    test.assertEqual(collections.Counter(launched), sum(map(_launches_per_step, groups), collections.Counter()), groups)
+    for size, entry in entries:
         own = [key for key in launched if key in entry["kernels"]]
         own = [key for index, key in enumerate(own) if index == 0 or own[index - 1] != key]
         test.assertEqual(own[: len(entry["kernels"])], entry["kernels"], (size, entry, launched))
     # Every producer writes the solver's friction law for every size.
-    test.assertEqual({entry["law"] for entry in builders.values()}, {contact_rows["law"]}, builders)
+    test.assertEqual({entry["law"] for _, entry in entries}, {contact_rows["law"]}, groups)

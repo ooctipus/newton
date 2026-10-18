@@ -278,14 +278,38 @@ def _tree_group(group) -> dict:
     }
 
 
-def _row_builder(solver, plan, size, source) -> dict:
-    """Name the kernels that build one DOF size's contact rows, in launch order, and the law they write.
+def _kernel_names(kernels) -> list:
+    return [kernel if isinstance(kernel, str) else _key(kernel) for kernel in kernels]
 
-    Mirrors the producers' launches: _stage4_build_rows for the shared-metadata and general
-    builders, compact_contact.launch_contacts, LocalRowPackets.produce_contacts and finish_rows,
-    and KeyedRows.produce_contacts and finish_rows. A launch shared by several sizes (the row
-    metadata, a combined masked launch, a producer's contact kernel) is named under each of them.
-    The debug row checks (ContactRowPlan.check) are not routes.
+
+def _general_kernels(method, patch, source) -> tuple:
+    """The general builder's kernels for one method, in launch order (_stage4_build_rows)."""
+    if method in ("masked", "masked_combined"):
+        if patch:
+            return (source.contact_row_prelude_patch, source.populate_world_J_masked_patch)
+        return (source.contact_row_prelude, source.populate_world_J_masked)
+    if method == "native":
+        # get_row_build_native_kernel builds a new kernel object per call; name it without one.
+        return ("populate_world_J_native",)
+    if method == "fused_rows":
+        return (source.build_contact_rows,)
+    if method == "per_contact":
+        return (source.populate_world_J_for_size,)
+    raise ValueError(f"No contact-row builder kernels are known for the method {method!r}.")
+
+
+def _row_builder(solver, plan, size, source) -> dict:
+    """Name the kernels that build one DOF size's dense contact rows outside the sweep, and their law.
+
+    Mirrors the producers' launches, in launch order: _stage4_build_rows for the shared-metadata
+    and general builders, compact_contact.launch_contacts, LocalRowPackets.produce_contacts and
+    finish_rows, and KeyedRows.produce_contacts and finish_rows. A launch shared by several sizes
+    (the row metadata, a combined masked launch, a producer's contact kernel) is named under each
+    of them. Rows built elsewhere are not named: keyed rows' direct rows, which the parallel tiers
+    build in the sweep (``direct_rows`` points to routes.sweep.tiers), the in-sweep world rows of
+    the FEATHER_PGS_WORLD_ROWS experiment, and the free-body matrix-free and propagation rows, which
+    build_mf_contact_rows and build_propagation_contact_rows write for the contacts the allocation
+    routes to them (routes.free_rigid_bodies). _row_check names the debug row checks' builders.
     """
     method, law = plan.methods[size], plan.law
     patch = law == "patch"
@@ -335,23 +359,28 @@ def _row_builder(solver, plan, size, source) -> dict:
             kernels = (*kernels, solver._mark_independent_sparse_contact_candidates_kernel)
     elif method == "compact_jacobian":
         kernels = (*prepare, source.populate_world_J_for_compact_size)
-    elif method in ("masked", "masked_combined"):
-        kernels = (
-            (source.contact_row_prelude_patch, source.populate_world_J_masked_patch)
-            if patch
-            else (source.contact_row_prelude, source.populate_world_J_masked)
-        )
-    elif method == "native":
-        # get_row_build_native_kernel builds a new kernel object per call; name it without one.
-        kernels = ("populate_world_J_native",)
-    elif method == "fused_rows":
-        kernels = (source.build_contact_rows,)
     else:
-        kernels = (source.populate_world_J_for_size,)
+        kernels = _general_kernels(method, patch, source)
+    entry = {"method": method, "kernels": _kernel_names(kernels), "law": "patch" if patch else "point"}
+    if method == "keyed_rows":
+        entry["direct_rows"] = "routes.sweep.tiers"
+    return entry
+
+
+def _row_check(plan, source) -> dict | None:
+    """Name, by DOF size, the builders the debug row checks launch besides builder_by_dof's.
+
+    FEATHER_PGS_CHECK_ROWS builds every size's native or masked rows into copies and compares them
+    with the per-contact rows the solve uses. FEATHER_PGS_CHECK_ROWS_FUSED rebuilds the combined
+    masked sizes' rows with the fused builder and compares them with the masked rows. None without
+    a check (ContactRowPlan.check).
+    """
+    if plan.check is None:
+        return None
+    sizes = plan.combined if plan.check == "fused_rows" else tuple(plan.methods)
+    kernels = _general_kernels(plan.check, plan.law == "patch", source)
     return {
-        "method": method,
-        "kernels": [kernel if isinstance(kernel, str) else _key(kernel) for kernel in kernels],
-        "law": "patch" if patch else "point",
+        str(int(size)): {"method": plan.check, "kernels": _kernel_names(kernels), "law": plan.law} for size in sizes
     }
 
 
@@ -381,8 +410,11 @@ def _contact_rows(solver, source) -> dict:
     return {
         "producer": plan.producer,
         "law": plan.law,
-        # Every producer, every size: the builder method, its kernels in launch order and the law they write.
+        # Every producer, every size: the builder method, its kernels in launch order and the law they write,
+        # for the dense contact rows built outside the sweep (_row_builder names the rows built elsewhere).
         "builder_by_dof": {str(int(size)): _row_builder(solver, plan, size, source) for size in plan.methods},
+        # The debug row checks only: the builders they launch besides those (None otherwise).
+        "row_check_by_dof": _row_check(plan, source),
         "general_method_by_dof": methods,
         "point_contact_paths": point,
         "row_packets": {

@@ -8,6 +8,7 @@ import dataclasses
 import inspect
 import json
 import os
+import types
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -16,9 +17,10 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import friction_patches, path_selection
+from newton._src.solvers.feather_pgs import friction_patches, keyed_rows, path_selection
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
-from newton._src.solvers.feather_pgs.contact_row_plan import contact_row_plan
+from newton._src.solvers.feather_pgs.contact_row_plan import BUILDER_METHODS, contact_row_plan
+from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton._src.solvers.feather_pgs.path_selection import applied_options
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import (
@@ -39,6 +41,7 @@ from newton.tests.feather_pgs_row_builders import (
     ROW_SWITCHES_OFF,
     assert_row_builders_named,
     install_cpu_keyed_rows,
+    is_row_builder,
     launched_kernels,
 )
 from newton.tests.test_feather_pgs_sparse_solver import _build_model, _make_solver
@@ -134,10 +137,15 @@ def _resting_arms_and_box(*links, device="cpu"):
 
 
 def _plan_stand_in(law, sizes=(108, 6), **attributes):
-    """A host stand-in with the attributes contact_row_plan and the route record read; no owner is admitted."""
+    """A host stand-in with the attributes contact_row_plan and the route record read; no owner is admitted.
+
+    The general builder's admission is the solver's own _masked_contact_rows, bound to the stand-in.
+    """
     values = {
         "_friction_anchors_enabled": law == "patch",
         "_point_contact_paths": law == "point",
+        "_patch_dense_paths": law == "patch",
+        "_world_rows_owned_le": lambda: 0,
         "size_groups": list(sizes),
         "_row_packets": None,
         "_keyed_rows": None,
@@ -150,10 +158,11 @@ def _plan_stand_in(law, sizes=(108, 6), **attributes):
         "_sparse_diagonal_contact_triples": False,
         "_sparse_diagonal_contact_units": False,
         "_compact_contact_jacobian": False,
-        "_masked_contact_rows": lambda: True,
     }
     values.update(attributes)
-    return SimpleNamespace(**values)
+    stand_in = SimpleNamespace(**values)
+    stand_in._masked_contact_rows = types.MethodType(SolverFeatherPGS._masked_contact_rows, stand_in)
+    return stand_in
 
 
 def _branched_arm_and_box(device="cuda:0", worlds=2, depth=9):
@@ -583,6 +592,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 self.assertEqual((record["producer"], record["law"]), ("general", law))
                 self.assertEqual({size: entry["method"] for size, entry in record["builder_by_dof"].items()}, methods)
                 self.assertEqual(record["general_method_by_dof"], methods)
+                self.assertIsNone(record["row_check_by_dof"])
                 assert_row_builders_named(self, record, keys)
         model = standing_model(device="cpu", worlds=2)
         for law, beta in (("patch", 0.2), ("point", 0.0)):
@@ -600,7 +610,267 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 self.assertEqual((record["producer"], record["law"]), ("keyed_rows", law))
                 self.assertIsNone(record["general_method_by_dof"])
                 self.assertEqual({entry["method"] for entry in record["builder_by_dof"].values()}, {"keyed_rows"})
+                # The parallel tiers build the direct rows in the sweep; on CPU every world takes the fallback.
+                self.assertEqual(
+                    {entry["direct_rows"] for entry in record["builder_by_dof"].values()}, {"routes.sweep.tiers"}
+                )
                 assert_row_builders_named(self, record, keys)
+
+    def test_cpu_record_names_the_debug_row_check_builders(self):
+        """Name the builders the debug row checks launch in row_check_by_dof, and none without a check.
+
+        FEATHER_PGS_CHECK_ROWS (point friction) builds every size's masked or native rows into copies
+        and compares them with the per-contact rows the solve uses, which builder_by_dof and
+        general_method_by_dof name. FEATHER_PGS_CHECK_ROWS_FUSED rebuilds the combined masked sizes'
+        rows with the fused builder. Patch friction runs neither check. One CPU step launches exactly
+        the builders the two maps name, and each check compares the sizes its map lists.
+        """
+        model = _cpu_free_body_model()
+        pair = ("6", "1")
+        fused_check = "rows_fused(J_a,J_b,type,parent,mu,beta,cfm,phi,target,rest)"
+        cases = (
+            # (switches, friction_anchor_beta, builder method, checked method or None, comparisons)
+            ({"_CHECK_ROWS": True}, 0.0, "per_contact", "masked", ["rows_J_6", "rows_J_1"]),
+            ({"_CHECK_ROWS": True, "_ROWS_MASKED": True}, 0.0, "per_contact", "masked", ["rows_J_6", "rows_J_1"]),
+            ({"_CHECK_ROWS": True, "_ROWS_NATIVE": True}, 0.0, "per_contact", "native", ["rows_J_6", "rows_J_1"]),
+            ({"_CHECK_ROWS_FUSED": True, "_ROWS_MASKED": True}, 0.0, "masked_combined", "fused_rows", [fused_check]),
+            ({"_CHECK_ROWS": True, "_ROWS_MASKED": True}, None, "per_contact", None, []),
+            ({"_CHECK_ROWS_FUSED": True, "_ROWS_MASKED": True}, None, "per_contact", None, []),
+        )
+        for switches, beta, method, check, comparisons in cases:
+            compared = []
+            with (
+                self.subTest(switches=switches, law="patch" if beta is None else "point"),
+                patch.dict(os.environ),
+                patch.multiple(solver_module, **{**ROW_SWITCHES_OFF, **switches}),
+                # The checks print their comparisons; keep the names of the compared outputs instead.
+                patch.object(
+                    solver_module, "_report_grouped_check", lambda name, *_, compared=compared: compared.append(name)
+                ),
+            ):
+                os.environ.pop("FEATHER_PGS_PATCH_DENSE_PATHS", None)
+                solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
+                record = solver.get_path_selection()["routes"]["contact_rows"]
+                keys = _launched_kernel_keys(model, solver)
+                self.assertEqual(record["general_method_by_dof"], dict.fromkeys(pair, method))
+                checked = record["row_check_by_dof"]
+                if check is None:
+                    self.assertIsNone(checked)
+                else:
+                    self.assertEqual(
+                        {size: entry["method"] for size, entry in checked.items()}, dict.fromkeys(pair, check)
+                    )
+                assert_row_builders_named(self, record, keys)
+                self.assertEqual([name for name in compared if name.startswith(("rows_J_", "rows_fused"))], comparisons)
+
+    def test_host_record_maps_every_producer_plan(self):
+        """Map every producer's plan to its builder methods, kernels and law from host attributes alone.
+
+        Stand-ins carry what contact_row_plan and the record read, so the producers that need CUDA are
+        pinned on CPU as well: local row packets, keyed rows, the compact contact boundary (unordered and
+        ordered), native sparse factors (with and without a metadata launch, with the free-body size), the
+        sparse-diagonal owner (with and without its schedule marker) and the compact Jacobian, beside the
+        general builder's methods and debug checks, each under both laws. The cases name every builder
+        method, and every kernel they name is one the launch check recognizes.
+        """
+        layout = KeyedLayout(16, 6, 0, 16, 128, False, 0)
+        marker = SimpleNamespace(key="mark_independent_sparse_contact_candidates_stand_in")
+        response = SimpleNamespace(key="populate_sparse_contact_response_stand_in")
+        prepare, compact = "prepare_world_contact_rows", "populate_world_J_for_compact_size"
+        per_contact, native, fused = ["populate_world_J_for_size"], ["populate_world_J_native"], ["build_contact_rows"]
+        point_masked = ["contact_row_prelude", "populate_world_J_masked"]
+        named, methods = set(), set()
+        for law in ("point", "patch"):
+            point = law == "point"
+            p = "" if point else "patch_"
+            produce = f"produce_{p}contacts"
+            ordered = ["_build_contact_order", f"_produce_ordered_{p}contacts"]
+            masked = point_masked if point else ["contact_row_prelude_patch", "populate_world_J_masked_patch"]
+            fallback = (keyed_rows.get_fallback_kernel if point else keyed_rows.get_patch_fallback_kernel)(layout).key
+            diagonal = {
+                "_sparse_diagonal_contact_solve": True,
+                "_sparse_diagonal_response_size": 108,
+                "_mark_independent_sparse_contact_candidates_kernel": marker,
+            }
+            schedule = {"_sparse_diagonal_contact_triples": point, "_sparse_diagonal_contact_units": not point}
+            sparse = {"_sparse_mass_matrix_size": 18, "_sparse_contact_response_kernel": response}
+
+            def same(sizes, method, kernels):
+                return dict.fromkeys(sizes, (method, kernels))
+
+            # Under patch friction the general builder's point-only experiments and checks keep per-contact rows.
+            cases = (
+                # (attributes, switches, sizes, producer, {size: (method, kernels)}, row check {size: (method, kernels)})
+                (
+                    {"_row_packets": SimpleNamespace(patch_friction=not point)},
+                    {},
+                    (18, 6),
+                    "local_packets",
+                    same((18, 6), "local_packets", [produce, f"materialize_{p}fallback"]),
+                    None,
+                ),
+                (
+                    {"_keyed_rows": SimpleNamespace(patch=not point, layout=layout)},
+                    {},
+                    (16, 6),
+                    "keyed_rows",
+                    same((16, 6), "keyed_rows", [f"scatter_{p}contact_keys", fallback]),
+                    None,
+                ),
+                (
+                    {"_compact_contact_boundary": True, **diagonal, **schedule},
+                    {},
+                    (108, 6),
+                    "compact_contact_boundary",
+                    {
+                        108: ("compact_contact_boundary", [produce, marker.key]),
+                        6: ("compact_contact_boundary", ["clear_contact_response", produce]),
+                    },
+                    None,
+                ),
+                (
+                    {"_compact_contact_boundary": True, "_compact_contact_order": object(), **diagonal, **schedule},
+                    {},
+                    (108, 6),
+                    "compact_contact_boundary",
+                    {
+                        108: ("compact_contact_boundary", [*ordered, marker.key]),
+                        6: ("compact_contact_boundary", ["clear_contact_response", *ordered]),
+                    },
+                    None,
+                ),
+                (
+                    {**sparse, "_sparse_prepare_contacts": True},
+                    {},
+                    (18, 6),
+                    "sparse_contact_response",
+                    {18: ("sparse_response", [response.key]), 6: ("sparse_free_response", [response.key])},
+                    None,
+                ),
+                (
+                    sparse,
+                    {},
+                    (18, 6),
+                    "sparse_contact_response",
+                    {
+                        18: ("sparse_response", [prepare, response.key]),
+                        6: ("sparse_free_response", [prepare, response.key]),
+                    },
+                    None,
+                ),
+                (
+                    {**diagonal, **schedule},
+                    {},
+                    (108, 6),
+                    "sparse_diagonal",
+                    {
+                        108: ("sparse_diagonal", [prepare, "populate_sparse_diagonal_contact_response", marker.key]),
+                        6: ("compact_jacobian", [prepare, compact]),
+                    },
+                    None,
+                ),
+                (
+                    diagonal,
+                    {},
+                    (108, 6),
+                    "sparse_diagonal",
+                    {
+                        108: ("sparse_diagonal", [prepare, "populate_sparse_diagonal_contact_response"]),
+                        6: ("compact_jacobian", [prepare, compact]),
+                    },
+                    None,
+                ),
+                (
+                    {"_compact_contact_jacobian": True},
+                    {},
+                    (6, 1),
+                    "compact_jacobian",
+                    same((6, 1), "compact_jacobian", [prepare, compact]),
+                    None,
+                ),
+                ({}, {}, (34, 6), "general", same((34, 6), "per_contact", per_contact), None),
+                ({}, {"_ROWS_MASKED": True}, (6, 2, 1), "general", same((6, 2, 1), "masked", masked), None),
+                (
+                    {},
+                    {"_ROWS_MASKED": True},
+                    (34, 6),
+                    "general",
+                    {34: ("per_contact", per_contact), 6: ("masked_combined", masked)},
+                    None,
+                ),
+                (
+                    {},
+                    {"_ROWS_NATIVE": True},
+                    (6, 1),
+                    "general",
+                    same((6, 1), "native", native) if point else same((6, 1), "per_contact", per_contact),
+                    None,
+                ),
+                (
+                    {},
+                    {"_ROWS_MASKED": True, "_ROWS_FUSED": True},
+                    (6, 1),
+                    "general",
+                    same((6, 1), "fused_rows", fused) if point else same((6, 1), "per_contact", per_contact),
+                    None,
+                ),
+                (
+                    {},
+                    {"_CHECK_ROWS": True, "_ROWS_MASKED": True},
+                    (6, 1),
+                    "general",
+                    same((6, 1), "per_contact", per_contact),
+                    same((6, 1), "masked", point_masked) if point else None,
+                ),
+                (
+                    {},
+                    {"_CHECK_ROWS": True, "_ROWS_NATIVE": True},
+                    (6, 1),
+                    "general",
+                    same((6, 1), "per_contact", per_contact),
+                    same((6, 1), "native", native) if point else None,
+                ),
+                (
+                    {},
+                    {"_CHECK_ROWS_FUSED": True, "_ROWS_MASKED": True},
+                    (34, 6),
+                    "general",
+                    {
+                        34: ("per_contact", per_contact),
+                        6: ("masked_combined" if point else "per_contact", masked if point else per_contact),
+                    },
+                    {6: ("fused_rows", fused)} if point else None,
+                ),
+            )
+            for attributes, switches, sizes, producer, expected, check in cases:
+                with (
+                    self.subTest(producer, law=law, attributes=sorted(attributes), switches=switches),
+                    patch.multiple(solver_module, **{**ROW_SWITCHES_OFF, **switches}),
+                ):
+                    stand_in = _plan_stand_in(law, sizes, **attributes)
+                    plan = contact_row_plan(stand_in)
+                    builders = {
+                        size: path_selection._row_builder(stand_in, plan, size, solver_module) for size in plan.methods
+                    }
+                    checked = path_selection._row_check(plan, solver_module)
+                    self.assertEqual(plan.producer, producer)
+                    self.assertEqual(
+                        {size: (entry["method"], entry["kernels"]) for size, entry in builders.items()}, expected
+                    )
+                    self.assertEqual({entry["law"] for entry in builders.values()}, {law})
+                    pointer = "routes.sweep.tiers" if producer == "keyed_rows" else None
+                    self.assertEqual({entry.get("direct_rows") for entry in builders.values()}, {pointer})
+                    if check is None:
+                        self.assertIsNone(checked)
+                    else:
+                        self.assertEqual(
+                            {int(size): (entry["method"], entry["kernels"]) for size, entry in checked.items()}, check
+                        )
+                    for entry in [*builders.values(), *(checked or {}).values()]:
+                        methods.add(entry["method"])
+                        named.update(entry["kernels"])
+        self.assertEqual(methods, set(BUILDER_METHODS))
+        self.assertEqual({kernel for kernel in named if not is_row_builder(kernel)}, set())
 
     def test_cpu_row_builder_check_rejects_wrong_order_and_counts(self):
         """Fail the launch check for a record that names the launched kernels in the wrong order or count.
