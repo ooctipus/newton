@@ -48,6 +48,7 @@ import warp as wp
 
 from ...math.spatial import velocity_at_point
 from ...sim.contacts import GENERATION_SENTINEL
+from .capture_joins import capture_has_unjoined_work
 from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
 
 # Grids are fixed at construction so CUDA graphs replay them. The sizes are
@@ -1411,9 +1412,11 @@ class _FrictionPatchState:
         """Build the current patch frame from ``contacts``.
 
         ``capture_pause`` returns a context manager entered around a captured
-        conditional node. The node pauses the graph capture to record its body,
-        so the caller can join its forked streams there and record again the
-        events it waits on later.
+        build. Its conditional node pauses the graph capture to record its body,
+        so the caller joins its forked streams on entry and records again the
+        events it waits on later. A capture that still holds forked work nobody
+        joined cannot pause; that build sorts unconditionally, as an eager build
+        does.
         """
         bodies = 0 if state.body_q is None else state.body_q.shape[0]
         if bodies + model.shape_body.shape[0] + 2 != self.key_stride:
@@ -1478,18 +1481,20 @@ class _FrictionPatchState:
             # with other Contacts instances.
             stream = self.stream_token(generation)
             branch = self._capture_branch()
-            wp.launch(
-                _prepare_frame,
-                dim=self.threads,
-                inputs=[*prepare_inputs, generation, stream, int(branch is not None), self.sorted_frame],
-                outputs=[self.extent, self.sort_pairs],
-                device=model.device,
-            )
-            record = (generation, contacts.rigid_contact_count, stream)
-            if branch is None:
-                self._order_pairs(record=record)
-            else:
-                with capture_pause():
+            with nullcontext() if branch is None else capture_pause():
+                if branch is not None and capture_has_unjoined_work(self.device):
+                    branch = None
+                wp.launch(
+                    _prepare_frame,
+                    dim=self.threads,
+                    inputs=[*prepare_inputs, generation, stream, int(branch is not None), self.sorted_frame],
+                    outputs=[self.extent, self.sort_pairs],
+                    device=model.device,
+                )
+                record = (generation, contacts.rigid_contact_count, stream)
+                if branch is None:
+                    self._order_pairs(record=record)
+                else:
                     branch(self.sort_pairs, on_true=self._order_pairs, record=record)
         wp.launch(_build, dim=self.build_threads, inputs=build_inputs, outputs=[self.built], device=model.device)
 

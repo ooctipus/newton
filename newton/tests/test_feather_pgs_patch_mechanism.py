@@ -37,6 +37,7 @@ import inspect
 import itertools
 import os
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest import mock
 
@@ -45,6 +46,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import friction_patches
+from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.friction_patches import _FrictionPatchState, _PatchFrame, patch_routes
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_reference import SENTINEL, ReferencePatches, pair_codes
@@ -1216,6 +1218,19 @@ class TestPatchLiveSort(unittest.TestCase):
         run_graph_replay("cuda:0", worlds=160, contacts=8192, capacity=8192, live_sort=True)
 
 
+def _bare_solver(**attributes):
+    """Return a ``SolverFeatherPGS`` that skipped construction, with ``attributes`` and a deviceless model."""
+    solver = object.__new__(SolverFeatherPGS)
+    solver.model = SimpleNamespace(device=SimpleNamespace(is_cuda=False))
+    for name, value in attributes.items():
+        setattr(solver, name, value)
+    return solver
+
+
+class _Handle:
+    """A weakly referenced stand-in for a captured graph."""
+
+
 def _host_branch(condition, on_true, **kwargs):
     """Branch as :func:`warp.capture_if` does on replay: run ``on_true`` for a nonzero condition."""
     if condition.numpy()[0]:
@@ -1724,6 +1739,38 @@ class TestPatchFrameReuse(unittest.TestCase):
             assert_same_patches(patches, reference, live, f"build {build}")
         _assert_record(self, patches, _frame_identity(patches, scene.contacts), "return")
 
+    def test_captures_with_unjoined_work_sort_without_a_node(self):
+        """Sort unconditionally and record the frame when forked work keeps a capture from pausing."""
+        scene = _Scene("cpu", 15)
+        live = scene.frame()
+        self.assertGreater(live, 0)
+        log = []
+
+        def refuse(condition, on_true, **kwargs):
+            raise AssertionError("a capture holding unjoined work cannot pause for a node")
+
+        @contextlib.contextmanager
+        def pause():
+            log.append("pause")
+            yield
+            log.append("resume")
+
+        for unjoined, branch, builds in ((True, refuse, (1, 1)), (False, _host_branch, (1, 0))):
+            with self.subTest(unjoined=unjoined):
+                patches, reference, sorts = _reusing_pair(scene, 128, branch=branch)
+                with mock.patch.object(friction_patches, "capture_has_unjoined_work", return_value=unjoined) as probe:
+                    for build, expected in enumerate(builds):
+                        log.clear()
+                        before = len(sorts)
+                        patches.build(scene.model, scene.state, scene.contacts, capture_pause=pause)
+                        reference.build(scene.model, scene.state, scene.contacts)
+                        self.assertEqual(len(sorts) - before, expected, f"build {build} sorts")
+                        # The caller joins its own streams before the check.
+                        self.assertEqual(log, ["pause", "resume"], f"build {build}")
+                        assert_same_patches(patches, reference, live, f"build {build}")
+                        _assert_record(self, patches, _frame_identity(patches, scene.contacts), f"build {build}")
+                self.assertEqual(probe.call_count, len(builds))
+
     def test_capture_pause_wraps_each_conditional_node(self):
         """Enter the caller's capture pause around each captured node, sorting or not, and never eagerly."""
         scene = _Scene("cpu", 8)
@@ -1987,14 +2034,22 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
                     self.assertIn(reason, record["reason"])
 
     def test_solver_falls_back_without_conditional_node_support(self):
-        """Keep the patch pair sort unconditional on a CUDA device whose Warp or driver lacks conditional nodes."""
+        """Keep the patch pair sort unconditional where Warp, the driver or its capture queries lack support."""
         solver, cuda = SimpleNamespace(_friction_anchors_enabled=True), SimpleNamespace(is_cuda=True)
+        cases = (
+            (False, True, "CUDA 12.4+ driver"),
+            (True, False, "stream capture queries"),
+            (True, True, "conditional node"),
+        )
         with mock.patch.dict(os.environ, {"FEATHER_PGS_PATCH_CONDITIONAL_NODES": "1"}):
-            for supported in (False, True):
-                with mock.patch.object(wp, "is_conditional_graph_supported", return_value=supported):
-                    enabled, reason = SolverFeatherPGS._patch_conditional_nodes(solver, cuda)
-                self.assertEqual(enabled, supported)
-                self.assertIn("conditional node" if supported else "CUDA 12.4+ driver", reason)
+            for supported, queries, reason in cases:
+                with (
+                    mock.patch.object(wp, "is_conditional_graph_supported", return_value=supported),
+                    mock.patch.object(solver_module, "capture_queries_available", return_value=queries),
+                ):
+                    enabled, record = SolverFeatherPGS._patch_conditional_nodes(solver, cuda)
+                self.assertEqual(enabled, supported and queries)
+                self.assertIn(reason, record)
 
     def test_capture_pause_joins_the_double_buffer(self):
         """Wait for the memset slots before a capture pause and record them on the main stream after it."""
@@ -2020,10 +2075,10 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         for capturing, events, expected, after in cases:
             with self.subTest(capturing=capturing, events=str(events)):
                 log.clear()
-                solver = SimpleNamespace(
-                    model=SimpleNamespace(device=None),
+                solver = _bare_solver(
                     _memset_stream=None if capturing is None else SimpleNamespace(is_capturing=capturing),
                     _memset_done_event=events,
+                    _memset_done_segment=None if events is None else [None] * len(events),
                 )
                 with mock.patch.object(wp, "get_stream", return_value=main) as get_stream:
                     with SolverFeatherPGS._double_buffer_capture_pause(solver):
@@ -2031,6 +2086,42 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
                 self.assertEqual(log, expected)
                 self.assertEqual(solver._memset_done_event, after)
                 self.assertEqual(get_stream.called, events is not None)
+
+    def test_memset_waits_drop_events_of_earlier_capture_segments(self):
+        """Wait for a buffer slot's memset unless its event was recorded before a pause of the same capture."""
+        graph, other = _Handle(), _Handle()
+        waits = []
+        stream = SimpleNamespace(wait_event=waits.append)
+        segment = {
+            None: None,
+            "1": (weakref.ref(graph), 1),
+            "2": (weakref.ref(graph), 2),
+            "other": (weakref.ref(other), 1),
+        }
+        # (segment the event was recorded in, current segment, whether the stream waits)
+        cases = (
+            (None, None, True),
+            ("1", "1", True),
+            ("1", "2", False),
+            ("other", "2", True),
+            ("1", None, True),
+            (None, "2", True),
+        )
+        for recorded, current, waited in cases:
+            with self.subTest(recorded=recorded, current=current):
+                waits.clear()
+                solver = _bare_solver(
+                    _memset_done_event=["event", None], _memset_done_segment=[segment[recorded], None]
+                )
+                solver._capture_segment = lambda current=current: segment[current]
+                solver._wait_memset_done(stream, 0)
+                solver._wait_memset_done(stream, 1)
+                self.assertEqual(waits, ["event"] if waited else [])
+        solver = _bare_solver(_memset_done_event=[None, None], _memset_done_segment=[None, None])
+        solver._capture_segment = lambda: segment["2"]
+        solver._record_memset_done(1, "recorded")
+        self.assertEqual(solver._memset_done_event, [None, "recorded"])
+        self.assertEqual(solver._memset_done_segment, [None, segment["2"]])
 
     def test_reused_frames_step_bitwise_as_the_unconditional_chain(self):
         """Step bitwise as with the flag off while substeps share frames and only changed frames sort."""
@@ -2130,15 +2221,71 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         with wp.ScopedCapture(device="cuda:0") as capture:
             graph.solver.seed_double_buffer_events()
             graph.pair()
-        n = graph.patches.capacity
-        keys = graph.patches.current.keys.numpy()
-        keys[n:] = -12345
-        graph.patches.current.keys.assign(keys)
+        _poison_sort_scratch(graph)
         wp.capture_launch(capture.graph)
         eager.pair()
-        self.assertFalse(np.all(graph.patches.current.keys.numpy()[n:] == -12345), "the replacement must sort")
+        self.assertFalse(_sort_scratch_intact(graph), "the replacement must sort")
         graph.assert_sorted(self, 0, "replacement")
         _assert_same_twins(graph, eager, "replacement")
+
+    @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
+    def test_graphs_with_a_caller_fork_across_steps_sort_without_a_node(self):
+        """Sort unconditionally, bitwise as eager flag-off steps, while a stream the caller forked is unjoined."""
+        if not wp.is_conditional_graph_supported():
+            self.skipTest("Conditional graph nodes need a CUDA 12.4+ driver and Warp build")
+        graph, eager = _SolverTwin("cuda:0", jaws=True), _SolverTwin("cuda:0", reuse=False, jaws=True)
+        for _ in range(3):
+            for twin in (graph, eager):
+                twin.pair(collide=True)
+        side = wp.Stream("cuda:0")
+        overlapped = wp.zeros(1024, dtype=float, device="cuda:0")
+        with wp.ScopedCapture(device="cuda:0") as capture:
+            graph.solver.seed_double_buffer_events()
+            main = wp.get_stream("cuda:0")
+            side.wait_event(main.record_event())
+            with wp.ScopedStream(side, sync_enter=False):
+                overlapped.fill_(1.0)
+            # Both substeps share the last collision frame, which a node would not sort.
+            graph.pair()
+            main.wait_event(side.record_event())
+        _poison_sort_scratch(graph)
+        wp.capture_launch(capture.graph)
+        eager.pair()
+        self.assertFalse(_sort_scratch_intact(graph), "the builds must sort without a node")
+        np.testing.assert_array_equal(overlapped.numpy(), 1.0)
+        graph.assert_sorted(self, 0, "caller fork")
+        _assert_same_twins(graph, eager, "caller fork")
+
+    @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
+    def test_double_buffered_solvers_share_a_graph(self):
+        """Capture two double-buffered solvers in one graph, seeded together or each before its steps."""
+        if not wp.is_conditional_graph_supported():
+            self.skipTest("Conditional graph nodes need a CUDA 12.4+ driver and Warp build")
+        graphs = (_SolverTwin("cuda:0", jaws=True), _SolverTwin("cuda:0", boxes=True))
+        eagers = (_SolverTwin("cuda:0", reuse=False, jaws=True), _SolverTwin("cuda:0", reuse=False, boxes=True))
+        for twin in graphs:
+            self.assertIsNotNone(twin.solver._memset_stream, "both solvers double-buffer their mass matrices")
+        # The boxes land before the captures.
+        for _ in range(12):
+            for twin in (*graphs, *eagers):
+                twin.pair(collide=True)
+        captured = []
+        for together in (True, False):
+            with wp.ScopedCapture(device="cuda:0") as capture:
+                for twin in graphs if together else ():
+                    twin.solver.seed_double_buffer_events()
+                for twin in graphs:
+                    if not together:
+                        twin.solver.seed_double_buffer_events()
+                    twin.pair(collide=True)
+            captured.append(capture.graph)
+        for replay in range(4):
+            wp.capture_launch(captured[replay % 2])
+            for twin in eagers:
+                twin.pair(collide=True)
+            for name, graph, eager in zip(("jaws", "boxes"), graphs, eagers, strict=True):
+                _assert_same_twins(graph, eager, f"replay {replay} {name}")
+        self.assertGreater(int(graphs[1].streams[0].rigid_contact_count.numpy()[0]), 0, "the boxes must touch")
 
     @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
     def test_solver_graphs_replay_empty_contact_frames(self):
@@ -2178,6 +2325,18 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         self.assertTrue(live and live[0] == 0, f"the boxes must start in the air: {live}")
         self.assertTrue(emptied, f"the frames must empty while anchors are stored: {live} {stored}")
         self.assertGreater(max(live[emptied[0] :]), 0, f"the boxes must land again: {live}")
+
+
+def _poison_sort_scratch(twin):
+    """Fill the second half of the radix sort's keys, which only the sort writes."""
+    keys = twin.patches.current.keys.numpy()
+    keys[twin.patches.capacity :] = -12345
+    twin.patches.current.keys.assign(keys)
+
+
+def _sort_scratch_intact(twin):
+    """Whether no radix sort ran since :func:`_poison_sort_scratch`."""
+    return bool(np.all(twin.patches.current.keys.numpy()[twin.patches.capacity :] == -12345))
 
 
 def _assert_same_twins(graph, eager, context):

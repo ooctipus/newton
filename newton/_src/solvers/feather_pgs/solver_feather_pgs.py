@@ -20,6 +20,7 @@ import os
 import sys
 import time
 import warnings
+import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cache
@@ -48,6 +49,7 @@ from . import environment_flags as _environment_flags
 from . import execution_plan as _execution_plan
 from . import row_metadata as _row_metadata
 from .body_mapping import build_body_maps
+from .capture_joins import capture_queries_available
 from .configuration import resolve_kernel_choices
 from .contact_torsion import (
     configure_contact_torsion,
@@ -1496,7 +1498,11 @@ class SolverFeatherPGS(SolverBase):
                 same ``Contacts`` instance, ``contact_generation`` and contact count) reuses that
                 order, so code that rewrites contact arrays between captured steps without a
                 collision pass must advance ``contact_generation`` (for example with
-                :meth:`~newton.Contacts.clear`) or change the count.
+                :meth:`~newton.Contacts.clear`) or change the count. The conditional graph node that
+                skips the sort pauses the capture once per step: an event recorded before ``step()``
+                cannot be waited on after it, and a step taken while a stream forked by the caller
+                still holds unjoined work sorts unconditionally. The environment variable
+                ``FEATHER_PGS_PATCH_CONDITIONAL_NODES=0`` keeps the sort unconditional.
                 Defaults to None.
             contact_speculative_scale (float, optional): Multiplies the positive-gap position RHS
                 for normal contact rows on the dense, matrix-free free-rigid, and propagation
@@ -7912,8 +7918,10 @@ class SolverFeatherPGS(SolverBase):
         self._memset_stream = wp.Stream(self.model.device)
         self._j_active_counts = [wp.zeros_like(self.constraint_count), wp.zeros_like(self.constraint_count)]
         # Track the last memset-done event per buffer slot so the main stream
-        # can wait only for the specific buffer it needs.
+        # can wait only for the specific buffer it needs, and the capture
+        # segment each was recorded in (see _wait_memset_done).
         self._memset_done_event: list[wp.Event | None] = [None, None]
+        self._memset_done_segment: list[tuple | None] = [None, None]
 
     def seed_double_buffer_events(self):
         """Record initial memset_done events on the main stream.
@@ -7926,20 +7934,52 @@ class SolverFeatherPGS(SolverBase):
         if self._memset_stream is None:
             return
         main_stream = wp.get_stream(self.model.device)
-        self._memset_done_event[0] = main_stream.record_event()
-        self._memset_done_event[1] = main_stream.record_event()
+        self._record_memset_done(0, main_stream.record_event())
+        self._record_memset_done(1, main_stream.record_event())
+
+    def _capture_segment(self):
+        """Return the graph the main stream captures into and its capture id, or ``None`` outside a capture.
+
+        Every pause of a capture, such as a conditional node recording its body,
+        resumes it under a new capture id.
+        """
+        device = self.model.device
+        graph = device.captures.get(wp.get_stream(device)) if device.is_cuda else None
+        return None if graph is None else (weakref.ref(graph), graph.capture_id)
+
+    def _record_memset_done(self, slot, event):
+        """Record the event a buffer slot's consumer waits for, with its capture segment."""
+        self._memset_done_event[slot] = event
+        self._memset_done_segment[slot] = self._capture_segment()
+
+    def _wait_memset_done(self, stream, slot):
+        """Make ``stream`` wait for a buffer slot's memset.
+
+        An event recorded before a pause of the current capture, by any solver or
+        caller, cannot be waited on after it. The resumed capture depends on every
+        node captured before the pause, so such a wait is already satisfied and
+        is dropped.
+        """
+        event = self._memset_done_event[slot]
+        if event is None:
+            return
+        recorded, current = self._memset_done_segment[slot], self._capture_segment()
+        if recorded is not None and current is not None and recorded[0]() is current[0]() and recorded[1] != current[1]:
+            return
+        stream.wait_event(event)
 
     @contextmanager
     def _double_buffer_capture_pause(self):
         """Keep the double buffer valid across a pause of the graph capture.
 
-        A conditional node pauses the capture to record its body. The pause ends
-        the capture, which must then have joined every forked stream, and no
-        event recorded before it can be waited on after it. The memset stream
-        forked at the end of a step is joined two steps later, so while it takes
-        part in the capture the main stream waits for both buffer slots before
-        the pause. Both slots are recorded again after it; each slot's consumer
-        still waits for its memset.
+        The patch build enters this around a captured build, whose conditional
+        node pauses the capture to record its body. The pause ends the capture,
+        which must then have joined every forked stream, and no event recorded
+        before it can be waited on after it. The memset stream forked at the end
+        of a step is joined two steps later, so while it takes part in the
+        capture the main stream waits for both buffer slots on entry, before the
+        build looks for unjoined work. Both slots are recorded again on exit;
+        each slot's consumer still waits for its memset.
         """
         stream = self._memset_stream
         events = self._memset_done_event if stream is not None else []
@@ -7947,13 +7987,12 @@ class SolverFeatherPGS(SolverBase):
         if stream is not None and stream.is_capturing:
             # Forked by an earlier step of this capture, so both slots hold
             # events of this capture: that step's and one already waited on.
-            for event in events:
-                if event is not None:
-                    main_stream.wait_event(event)
+            for slot in range(len(events)):
+                self._wait_memset_done(main_stream, slot)
         yield
         for slot, event in enumerate(events):
             if event is not None:
-                events[slot] = main_stream.record_event()
+                self._record_memset_done(slot, main_stream.record_event())
 
     def reset_diagnostic_logs(self) -> None:
         """Clear per-step PGS diagnostic logs populated when ``pgs_debug=True``.
@@ -10446,9 +10485,7 @@ class SolverFeatherPGS(SolverBase):
             if self._jy_world_aliased:
                 # J_world aliases the active J buffer; track the ping-pong.
                 self.J_world = self.J_by_size[self.size_groups[0]]
-            evt = self._memset_done_event[self._buf_idx]
-            if evt is not None:
-                wp.get_stream(model.device).wait_event(evt)
+            self._wait_memset_done(wp.get_stream(model.device), self._buf_idx)
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 1: FK/ID + drives + CRBA
@@ -11221,7 +11258,7 @@ class SolverFeatherPGS(SolverBase):
                             block_dim=256,
                             device=self.model.device,
                         )
-                self._memset_done_event[self._buf_idx] = self._memset_stream.record_event()
+                self._record_memset_done(self._buf_idx, self._memset_stream.record_event())
                 self._buf_idx = 1 - self._buf_idx
 
         # Opt-in row high-water telemetry (behavior-neutral). Launched here, at
@@ -13122,6 +13159,11 @@ class SolverFeatherPGS(SolverBase):
             return False, (
                 "Conditional graph nodes need a CUDA 12.4+ driver and a Warp build with CUDA 12.4+; "
                 "the patch pair sort is unconditional."
+            )
+        if not capture_queries_available():
+            return False, (
+                "The CUDA driver's stream capture queries, which tell whether a capture can pause for a "
+                "conditional node, could not be loaded; the patch pair sort is unconditional."
             )
         return True, (
             "Captured graphs sort patch pairs under a conditional node that skips empty contact frames and "
