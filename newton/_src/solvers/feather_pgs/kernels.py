@@ -24,7 +24,6 @@ from ...sim.articulation import (
     compute_3d_rotational_dofs,
     eval_single_articulation_fk,
 )
-from . import contact_allocation_source
 from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
 from .friction import friction_pair_candidate
 from .friction_patches import CONTACT_PATH_RESOLVED, FrictionPatches, contact_tangent_basis, patch_normal_load
@@ -4649,20 +4648,726 @@ def populate_joint_velocity_limit_J_for_size(
 # world. The constraint system becomes world-level instead of per-articulation.
 
 
-_contact_allocator = contact_allocation_source.bind(
-    globals()
-    | {
-        "contact_normal_gap_limit": contact_normal_gap_limit,
-        "contact_friction_eligible": contact_friction_eligible,
-        "BodyFlags": BodyFlags,
-        "FrictionPatches": FrictionPatches,
-        "CONTACT_PATH_RESOLVED": CONTACT_PATH_RESOLVED,
-    }
-)
-_allocate_world_contact_slot = _contact_allocator[0]
-allocate_world_contact_slots = _contact_allocator[1]
-# Persistent patch friction with the resolved-world classifier (contact_allocation_source.get_source).
-allocate_world_contact_slots_patch_resolved = _contact_allocator[2]
+@wp.func
+def _allocate_world_contact_slot(
+    c: int,
+    total_contacts: int,
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    contact_point0: wp.array[wp.vec3],
+    contact_point1: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    contact_thickness0: wp.array[float],
+    contact_thickness1: wp.array[float],
+    body_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[int],
+    body_to_articulation: wp.array[int],
+    art_to_world: wp.array[int],
+    articulation_response_dof_count: wp.array[int],
+    body_flags: wp.array[wp.int32],
+    body_has_response_dofs: wp.array[int],
+    is_free_rigid: wp.array[int],
+    has_free_rigid: int,
+    propagation_articulated_contacts: int,
+    propagation_same_articulation: int,
+    propagation_free_free: int,
+    contact_gap_gate: float,
+    same_articulation_contact_gap_gate: float,
+    articulation_pair_contact_gap_gate: float,
+    max_constraints: int,
+    mf_max_constraints: int,
+    propagation_max_constraints: int,
+    enable_friction: int,
+    contact_friction_gap_threshold: float,
+    contact_friction_articulation_pairs_only: int,
+    row_capacity_telemetry: int,
+    friction_patches: FrictionPatches,
+    # outputs
+    contact_world: wp.array[int],
+    contact_slot: wp.array[int],
+    contact_art_a: wp.array[int],
+    contact_art_b: wp.array[int],
+    world_slot_counter: wp.array[int],
+    contact_path: wp.array[int],
+    mf_slot_counter: wp.array[int],
+    propagation_slot_counter: wp.array[int],
+    dense_contact_world_flag: wp.array[int],
+    contact_slots_needed: wp.array[int],
+    dense_dropped_contact_rows: wp.array[int],
+    mf_dropped_contact_rows: wp.array[int],
+    propagation_dropped_contact_rows: wp.array[int],
+    dense_first_rejected_slot: wp.array[int],
+    mf_first_rejected_slot: wp.array[int],
+    propagation_first_rejected_slot: wp.array[int],
+    capacity_status: wp.array[int],
+):
+    """Classify and allocate rows for one active contact.
+
+    Allocates world-level constraint slots for each contact and records
+    which articulations are involved. Contacts where both sides are free
+    rigid bodies (or ground) are routed to the matrix-free path.
+
+    Each contact reserves 1 slot for the normal row and, when enabled below the
+    friction gap threshold, 2 adjacent slots for Coulomb friction rows.
+    A positive contact gap gate excludes wider speculative contacts before any
+    route reserves slots; zero disables the gate.
+
+    """
+    shape_a = contact_shape0[c]
+    shape_b = contact_shape1[c]
+
+    # Get bodies and articulations
+    body_a = -1
+    body_b = -1
+    if shape_a >= 0:
+        body_a = shape_body[shape_a]
+    if shape_b >= 0:
+        body_b = shape_body[shape_b]
+
+    art_a = -1
+    art_b = -1
+    if body_a >= 0:
+        art_a = body_to_articulation[body_a]
+    if body_b >= 0:
+        art_b = body_to_articulation[body_b]
+
+    a_has_dofs = art_a >= 0 and articulation_response_dof_count[art_a] > 0
+    b_has_dofs = art_b >= 0 and articulation_response_dof_count[art_b] > 0
+    a_can_respond = (
+        a_has_dofs and body_has_response_dofs[body_a] != 0 and (body_flags[body_a] & BodyFlags.KINEMATIC) == 0
+    )
+    b_can_respond = (
+        b_has_dofs and body_has_response_dofs[body_b] != 0 and (body_flags[body_b] & BodyFlags.KINEMATIC) == 0
+    )
+    if not a_can_respond and not b_can_respond:
+        contact_slot[c] = -1
+        contact_path[c] = -1
+        return
+
+    # Determine world (both bodies must be in same world, or one is ground)
+    world = -1
+    if art_a >= 0:
+        world = art_to_world[art_a]
+    if art_b >= 0:
+        world_b = art_to_world[art_b]
+        if world >= 0 and world_b != world:
+            # Cross-world contact - shouldn't happen, skip
+            contact_slot[c] = -1
+            contact_path[c] = -1
+            return
+        world = world_b
+
+    if world < 0:
+        # No articulation involved (ground-ground?)
+        contact_slot[c] = -1
+        contact_path[c] = -1
+        return
+
+    # Compute phi (same logic as populate_world_J_for_size)
+    # contact normal stored as A-to-B; negate to get B-to-A used internally
+    normal = -contact_normal[c]
+    point_a_local = contact_point0[c]
+    point_b_local = contact_point1[c]
+    thickness_a = contact_thickness0[c]
+    thickness_b = contact_thickness1[c]
+
+    point_a_world = wp.vec3(0.0)
+    point_b_world = wp.vec3(0.0)
+
+    if body_a >= 0:
+        X_wb_a = body_q[body_a]
+        # Contact points are stored in body frame by collision detection
+        point_a_world = wp.transform_point(X_wb_a, point_a_local) - thickness_a * normal
+    else:
+        point_a_world = point_a_local - thickness_a * normal
+
+    if body_b >= 0:
+        X_wb_b = body_q[body_b]
+        # Contact points are stored in body frame by collision detection
+        point_b_world = wp.transform_point(X_wb_b, point_b_local) + thickness_b * normal
+    else:
+        point_b_world = point_b_local + thickness_b * normal
+    phi = wp.dot(normal, point_a_world - point_b_world)
+
+    # Use the same eligibility as patch selection before reserving row storage.
+    a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
+    b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
+    normal_gap_limit = contact_normal_gap_limit(
+        a_non_free,
+        b_non_free,
+        art_a == art_b,
+        contact_gap_gate,
+        articulation_pair_contact_gap_gate,
+        same_articulation_contact_gap_gate,
+    )
+    if phi > normal_gap_limit:
+        contact_slot[c] = -1
+        contact_path[c] = -1
+        return
+
+    # Classify: MF path if both sides are free rigid or ground.
+    # Propagation path is an opt-in matrix-free route for any contact touching a
+    # non-free articulation. It stores fixed-size body-space rows instead of
+    # D-wide generalized rows.
+    is_mf = 0
+    is_propagation = 0
+    a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
+    b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
+    if has_free_rigid != 0:
+        a_is_mf_compatible = not a_has_dofs or is_free_rigid[art_a] != 0
+        b_is_mf_compatible = not b_has_dofs or is_free_rigid[art_b] != 0
+        if a_is_mf_compatible and b_is_mf_compatible:
+            is_mf = 1
+    if propagation_free_free != 0 and is_mf == 1:
+        # Opt-in: route free/free (and free/ground) contact rows to the
+        # propagation family. The row math is identical (free bodies use the
+        # plain spatial inverse inertia response seeded by
+        # copy_free_rigid_propagation_body_response); this puts pile rows on
+        # the colored solve path. Velocity-limit rows stay on the MF family.
+        is_mf = 0
+        is_propagation = 1
+    if propagation_articulated_contacts != 0 and is_mf == 0 and is_propagation == 0:
+        # Same-articulation two-link contacts need cross response terms between
+        # the two touched links. They route to propagation rows only when the
+        # cross-response path is enabled; otherwise they stay on the dense
+        # generalized-row path.
+        same_non_free_articulation = a_non_free and b_non_free and art_a == art_b
+        if a_non_free or b_non_free:
+            if propagation_same_articulation != 0 or not same_non_free_articulation:
+                is_propagation = 1
+
+    # Every normal survives; only the selected patch anchors receive tangent rows.
+    slots_needed = 1
+    add_friction = enable_friction != 0 and contact_friction_eligible(
+        phi, a_non_free, b_non_free, contact_friction_articulation_pairs_only, contact_friction_gap_threshold
+    )
+    if friction_patches.enabled != 0:
+        add_friction = add_friction and friction_patches.weight[c] > 0.0
+    if add_friction:
+        slots_needed = 3
+    contact_slots_needed[c] = slots_needed
+
+    if is_mf != 0:
+        # Matrix-free path
+        slot = wp.atomic_add(mf_slot_counter, world, slots_needed)
+        if slot + slots_needed > mf_max_constraints:
+            wp.atomic_min(mf_first_rejected_slot, world, slot)
+            wp.atomic_max(capacity_status, 1, 1)
+            if row_capacity_telemetry != 0:
+                wp.atomic_add(mf_dropped_contact_rows, world, slots_needed)
+            contact_slot[c] = -1
+            contact_path[c] = -1
+            return
+        contact_world[c] = world
+        contact_slot[c] = slot
+        contact_art_a[c] = art_a
+        contact_art_b[c] = art_b
+        contact_path[c] = 1
+    elif is_propagation != 0:
+        # Propagation articulated matrix-free path
+        slot = wp.atomic_add(propagation_slot_counter, world, slots_needed)
+        if slot + slots_needed > propagation_max_constraints:
+            wp.atomic_min(propagation_first_rejected_slot, world, slot)
+            wp.atomic_max(capacity_status, 2, 1)
+            if row_capacity_telemetry != 0:
+                wp.atomic_add(propagation_dropped_contact_rows, world, slots_needed)
+            contact_slot[c] = -1
+            contact_path[c] = -1
+            return
+        contact_world[c] = world
+        contact_slot[c] = slot
+        contact_art_a[c] = art_a
+        contact_art_b[c] = art_b
+        contact_path[c] = 2
+    else:
+        # Dense path
+        slot = wp.atomic_add(world_slot_counter, world, slots_needed)
+        if slot + slots_needed > max_constraints:
+            wp.atomic_min(dense_first_rejected_slot, world, slot)
+            wp.atomic_max(capacity_status, 0, 1)
+            if row_capacity_telemetry != 0:
+                wp.atomic_add(dense_dropped_contact_rows, world, slots_needed)
+            contact_slot[c] = -1
+            contact_path[c] = -1
+            return
+        contact_world[c] = world
+        contact_slot[c] = slot
+        contact_art_a[c] = art_a
+        contact_art_b[c] = art_b
+        contact_path[c] = 0
+        # Dense contact rows write articulated generalized velocities during
+        # split GS phases; propagation tree refresh keys off this per world.
+        dense_contact_world_flag[world] = 1
+
+
+@wp.func
+def _mark_resolved_patch_contact(
+    c: int,
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    contact_point0: wp.array[wp.vec3],
+    contact_point1: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    contact_thickness0: wp.array[float],
+    contact_thickness1: wp.array[float],
+    body_q: wp.array[wp.transform],
+    shape_body: wp.array[int],
+    body_to_articulation: wp.array[int],
+    art_to_world: wp.array[int],
+    articulation_response_dof_count: wp.array[int],
+    body_flags: wp.array[wp.int32],
+    body_has_response_dofs: wp.array[int],
+    is_free_rigid: wp.array[int],
+    contact_gap_gate: float,
+    same_articulation_contact_gap_gate: float,
+    articulation_pair_contact_gap_gate: float,
+    # outputs
+    contact_slot: wp.array[int],
+    contact_path: wp.array[int],
+):
+    """Mark a contact of a resolved world that the row allocator would reserve rows for.
+
+    Repeats the allocator's checks before any reservation: a responding
+    endpoint, one world and the normal gap limit. Such a contact gets
+    CONTACT_PATH_RESOLVED and no slot; persistent patch friction releases its
+    anchor at the finish, as the complete path releases an anchor whose rows
+    solve zero load. Every other contact keeps path -1, and its anchor history.
+    """
+    shape_a = contact_shape0[c]
+    shape_b = contact_shape1[c]
+
+    # Get bodies and articulations
+    body_a = -1
+    body_b = -1
+    if shape_a >= 0:
+        body_a = shape_body[shape_a]
+    if shape_b >= 0:
+        body_b = shape_body[shape_b]
+
+    art_a = -1
+    art_b = -1
+    if body_a >= 0:
+        art_a = body_to_articulation[body_a]
+    if body_b >= 0:
+        art_b = body_to_articulation[body_b]
+
+    a_has_dofs = art_a >= 0 and articulation_response_dof_count[art_a] > 0
+    b_has_dofs = art_b >= 0 and articulation_response_dof_count[art_b] > 0
+    a_can_respond = (
+        a_has_dofs and body_has_response_dofs[body_a] != 0 and (body_flags[body_a] & BodyFlags.KINEMATIC) == 0
+    )
+    b_can_respond = (
+        b_has_dofs and body_has_response_dofs[body_b] != 0 and (body_flags[body_b] & BodyFlags.KINEMATIC) == 0
+    )
+    if not a_can_respond and not b_can_respond:
+        contact_slot[c] = -1
+        contact_path[c] = -1
+        return
+
+    # Determine world (both bodies must be in same world, or one is ground)
+    world = -1
+    if art_a >= 0:
+        world = art_to_world[art_a]
+    if art_b >= 0:
+        world_b = art_to_world[art_b]
+        if world >= 0 and world_b != world:
+            # Cross-world contact - shouldn't happen, skip
+            contact_slot[c] = -1
+            contact_path[c] = -1
+            return
+        world = world_b
+
+    if world < 0:
+        # No articulation involved (ground-ground?)
+        contact_slot[c] = -1
+        contact_path[c] = -1
+        return
+
+    # Compute phi (same logic as populate_world_J_for_size)
+    # contact normal stored as A-to-B; negate to get B-to-A used internally
+    normal = -contact_normal[c]
+    point_a_local = contact_point0[c]
+    point_b_local = contact_point1[c]
+    thickness_a = contact_thickness0[c]
+    thickness_b = contact_thickness1[c]
+
+    point_a_world = wp.vec3(0.0)
+    point_b_world = wp.vec3(0.0)
+
+    if body_a >= 0:
+        X_wb_a = body_q[body_a]
+        # Contact points are stored in body frame by collision detection
+        point_a_world = wp.transform_point(X_wb_a, point_a_local) - thickness_a * normal
+    else:
+        point_a_world = point_a_local - thickness_a * normal
+
+    if body_b >= 0:
+        X_wb_b = body_q[body_b]
+        # Contact points are stored in body frame by collision detection
+        point_b_world = wp.transform_point(X_wb_b, point_b_local) + thickness_b * normal
+    else:
+        point_b_world = point_b_local + thickness_b * normal
+    phi = wp.dot(normal, point_a_world - point_b_world)
+
+    a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
+    b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
+    normal_gap_limit = contact_normal_gap_limit(
+        a_non_free,
+        b_non_free,
+        art_a == art_b,
+        contact_gap_gate,
+        articulation_pair_contact_gap_gate,
+        same_articulation_contact_gap_gate,
+    )
+    if phi > normal_gap_limit:
+        contact_slot[c] = -1
+        contact_path[c] = -1
+        return
+
+    contact_slot[c] = -1
+    contact_path[c] = CONTACT_PATH_RESOLVED
+
+
+@wp.kernel
+def allocate_world_contact_slots(
+    contact_count: wp.array[int],
+    total_num_threads: int,
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    contact_point0: wp.array[wp.vec3],
+    contact_point1: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    contact_thickness0: wp.array[float],
+    contact_thickness1: wp.array[float],
+    body_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[int],
+    body_to_articulation: wp.array[int],
+    art_to_world: wp.array[int],
+    articulation_response_dof_count: wp.array[int],
+    body_flags: wp.array[wp.int32],
+    body_has_response_dofs: wp.array[int],
+    is_free_rigid: wp.array[int],
+    has_free_rigid: int,
+    propagation_articulated_contacts: int,
+    propagation_same_articulation: int,
+    propagation_free_free: int,
+    contact_gap_gate: float,
+    same_articulation_contact_gap_gate: float,
+    articulation_pair_contact_gap_gate: float,
+    max_constraints: int,
+    mf_max_constraints: int,
+    propagation_max_constraints: int,
+    enable_friction: int,
+    contact_friction_gap_threshold: float,
+    contact_friction_articulation_pairs_only: int,
+    row_capacity_telemetry: int,
+    friction_patches: FrictionPatches,
+    resolved_worlds: wp.array[int],
+    # outputs
+    contact_world: wp.array[int],
+    contact_slot: wp.array[int],
+    contact_art_a: wp.array[int],
+    contact_art_b: wp.array[int],
+    world_slot_counter: wp.array[int],
+    contact_path: wp.array[int],
+    mf_slot_counter: wp.array[int],
+    propagation_slot_counter: wp.array[int],
+    dense_contact_world_flag: wp.array[int],
+    contact_slots_needed: wp.array[int],
+    dense_dropped_contact_rows: wp.array[int],
+    mf_dropped_contact_rows: wp.array[int],
+    propagation_dropped_contact_rows: wp.array[int],
+    dense_first_rejected_slot: wp.array[int],
+    mf_first_rejected_slot: wp.array[int],
+    propagation_first_rejected_slot: wp.array[int],
+    capacity_status: wp.array[int],
+):
+    """Allocate active contacts with work proportional to the materialized prefix.
+
+    The narrow phase increments :paramref:`contact_count` before checking its
+    output capacity. An overflowed count therefore does not describe a fully
+    materialized prefix; clear the routing arrays and reject that frame.
+
+    Slot counters only grow. A contact whose reservation does not fit records its
+    slot in the family's ``*_first_rejected_slot`` (per world, preset to a large
+    value) instead of rolling the counter back: every later reservation starts at
+    or past that slot, so the finalize kernels truncate the row count there and
+    no accepted contact can hold a slot at or beyond the count. Rolling back
+    raced with concurrent reservations and left accepted rows past the count,
+    which the friction patch links then chained into.
+    """
+    thread = wp.tid()
+    total_contacts = contact_count[0]
+    capacity = contact_shape0.shape[0]
+    if total_contacts > capacity:
+        if thread == 0:
+            wp.atomic_max(capacity_status, 3, 1)
+        for c in range(thread, capacity, total_num_threads):
+            contact_slot[c] = -1
+            contact_path[c] = -1
+            contact_slots_needed[c] = 0
+        return
+
+    for c in range(thread, total_contacts, total_num_threads):
+        if resolved_worlds.shape[0] > 0:
+            shape_a = contact_shape0[c]
+            shape_b = contact_shape1[c]
+            body_a = shape_body[shape_a] if shape_a >= 0 else -1
+            body_b = shape_body[shape_b] if shape_b >= 0 else -1
+            art_a = body_to_articulation[body_a] if body_a >= 0 else -1
+            art_b = body_to_articulation[body_b] if body_b >= 0 else -1
+            world_a = art_to_world[art_a] if art_a >= 0 else -1
+            world_b = art_to_world[art_b] if art_b >= 0 else -1
+            world = world_a if world_a >= 0 else world_b
+            same_world = world_a < 0 or world_b < 0 or world_a == world_b
+            if same_world and world >= 0 and world < resolved_worlds.shape[0] and resolved_worlds[world] != 0:
+                # Refresh every active mapping each solve. The original force
+                # converter publishes zero before reading any row for this path.
+                contact_world[c] = world
+                contact_art_a[c] = art_a
+                contact_art_b[c] = art_b
+                contact_slot[c] = -1
+                contact_path[c] = -1
+                contact_slots_needed[c] = 0
+                continue
+        _allocate_world_contact_slot(
+            c,
+            total_contacts,
+            contact_shape0,
+            contact_shape1,
+            contact_point0,
+            contact_point1,
+            contact_normal,
+            contact_thickness0,
+            contact_thickness1,
+            body_q,
+            shape_transform,
+            shape_body,
+            body_to_articulation,
+            art_to_world,
+            articulation_response_dof_count,
+            body_flags,
+            body_has_response_dofs,
+            is_free_rigid,
+            has_free_rigid,
+            propagation_articulated_contacts,
+            propagation_same_articulation,
+            propagation_free_free,
+            contact_gap_gate,
+            same_articulation_contact_gap_gate,
+            articulation_pair_contact_gap_gate,
+            max_constraints,
+            mf_max_constraints,
+            propagation_max_constraints,
+            enable_friction,
+            contact_friction_gap_threshold,
+            contact_friction_articulation_pairs_only,
+            row_capacity_telemetry,
+            friction_patches,
+            contact_world,
+            contact_slot,
+            contact_art_a,
+            contact_art_b,
+            world_slot_counter,
+            contact_path,
+            mf_slot_counter,
+            propagation_slot_counter,
+            dense_contact_world_flag,
+            contact_slots_needed,
+            dense_dropped_contact_rows,
+            mf_dropped_contact_rows,
+            propagation_dropped_contact_rows,
+            dense_first_rejected_slot,
+            mf_first_rejected_slot,
+            propagation_first_rejected_slot,
+            capacity_status,
+        )
+
+
+# Persistent patch friction with the resolved-world classifier: in a world the classifier skips,
+# the twin of the kernel above marks the contacts that kernel would reserve rows for with
+# CONTACT_PATH_RESOLVED, so the patch finish releases their anchors as the complete path does.
+# It differs from that kernel only by the _mark_resolved_patch_contact call.
+@wp.kernel
+def allocate_world_contact_slots_patch_resolved(
+    contact_count: wp.array[int],
+    total_num_threads: int,
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    contact_point0: wp.array[wp.vec3],
+    contact_point1: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    contact_thickness0: wp.array[float],
+    contact_thickness1: wp.array[float],
+    body_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[int],
+    body_to_articulation: wp.array[int],
+    art_to_world: wp.array[int],
+    articulation_response_dof_count: wp.array[int],
+    body_flags: wp.array[wp.int32],
+    body_has_response_dofs: wp.array[int],
+    is_free_rigid: wp.array[int],
+    has_free_rigid: int,
+    propagation_articulated_contacts: int,
+    propagation_same_articulation: int,
+    propagation_free_free: int,
+    contact_gap_gate: float,
+    same_articulation_contact_gap_gate: float,
+    articulation_pair_contact_gap_gate: float,
+    max_constraints: int,
+    mf_max_constraints: int,
+    propagation_max_constraints: int,
+    enable_friction: int,
+    contact_friction_gap_threshold: float,
+    contact_friction_articulation_pairs_only: int,
+    row_capacity_telemetry: int,
+    friction_patches: FrictionPatches,
+    resolved_worlds: wp.array[int],
+    # outputs
+    contact_world: wp.array[int],
+    contact_slot: wp.array[int],
+    contact_art_a: wp.array[int],
+    contact_art_b: wp.array[int],
+    world_slot_counter: wp.array[int],
+    contact_path: wp.array[int],
+    mf_slot_counter: wp.array[int],
+    propagation_slot_counter: wp.array[int],
+    dense_contact_world_flag: wp.array[int],
+    contact_slots_needed: wp.array[int],
+    dense_dropped_contact_rows: wp.array[int],
+    mf_dropped_contact_rows: wp.array[int],
+    propagation_dropped_contact_rows: wp.array[int],
+    dense_first_rejected_slot: wp.array[int],
+    mf_first_rejected_slot: wp.array[int],
+    propagation_first_rejected_slot: wp.array[int],
+    capacity_status: wp.array[int],
+):
+    """Allocate active contacts with work proportional to the materialized prefix.
+
+    The narrow phase increments :paramref:`contact_count` before checking its
+    output capacity. An overflowed count therefore does not describe a fully
+    materialized prefix; clear the routing arrays and reject that frame.
+
+    Slot counters only grow. A contact whose reservation does not fit records its
+    slot in the family's ``*_first_rejected_slot`` (per world, preset to a large
+    value) instead of rolling the counter back: every later reservation starts at
+    or past that slot, so the finalize kernels truncate the row count there and
+    no accepted contact can hold a slot at or beyond the count. Rolling back
+    raced with concurrent reservations and left accepted rows past the count,
+    which the friction patch links then chained into.
+    """
+    thread = wp.tid()
+    total_contacts = contact_count[0]
+    capacity = contact_shape0.shape[0]
+    if total_contacts > capacity:
+        if thread == 0:
+            wp.atomic_max(capacity_status, 3, 1)
+        for c in range(thread, capacity, total_num_threads):
+            contact_slot[c] = -1
+            contact_path[c] = -1
+            contact_slots_needed[c] = 0
+        return
+
+    for c in range(thread, total_contacts, total_num_threads):
+        if resolved_worlds.shape[0] > 0:
+            shape_a = contact_shape0[c]
+            shape_b = contact_shape1[c]
+            body_a = shape_body[shape_a] if shape_a >= 0 else -1
+            body_b = shape_body[shape_b] if shape_b >= 0 else -1
+            art_a = body_to_articulation[body_a] if body_a >= 0 else -1
+            art_b = body_to_articulation[body_b] if body_b >= 0 else -1
+            world_a = art_to_world[art_a] if art_a >= 0 else -1
+            world_b = art_to_world[art_b] if art_b >= 0 else -1
+            world = world_a if world_a >= 0 else world_b
+            same_world = world_a < 0 or world_b < 0 or world_a == world_b
+            if same_world and world >= 0 and world < resolved_worlds.shape[0] and resolved_worlds[world] != 0:
+                # Refresh every active mapping each solve. The original force
+                # converter publishes zero before reading any row for this path.
+                contact_world[c] = world
+                contact_art_a[c] = art_a
+                contact_art_b[c] = art_b
+                contact_slot[c] = -1
+                contact_path[c] = -1
+                contact_slots_needed[c] = 0
+                _mark_resolved_patch_contact(
+                    c,
+                    contact_shape0,
+                    contact_shape1,
+                    contact_point0,
+                    contact_point1,
+                    contact_normal,
+                    contact_thickness0,
+                    contact_thickness1,
+                    body_q,
+                    shape_body,
+                    body_to_articulation,
+                    art_to_world,
+                    articulation_response_dof_count,
+                    body_flags,
+                    body_has_response_dofs,
+                    is_free_rigid,
+                    contact_gap_gate,
+                    same_articulation_contact_gap_gate,
+                    articulation_pair_contact_gap_gate,
+                    contact_slot,
+                    contact_path,
+                )
+                continue
+        _allocate_world_contact_slot(
+            c,
+            total_contacts,
+            contact_shape0,
+            contact_shape1,
+            contact_point0,
+            contact_point1,
+            contact_normal,
+            contact_thickness0,
+            contact_thickness1,
+            body_q,
+            shape_transform,
+            shape_body,
+            body_to_articulation,
+            art_to_world,
+            articulation_response_dof_count,
+            body_flags,
+            body_has_response_dofs,
+            is_free_rigid,
+            has_free_rigid,
+            propagation_articulated_contacts,
+            propagation_same_articulation,
+            propagation_free_free,
+            contact_gap_gate,
+            same_articulation_contact_gap_gate,
+            articulation_pair_contact_gap_gate,
+            max_constraints,
+            mf_max_constraints,
+            propagation_max_constraints,
+            enable_friction,
+            contact_friction_gap_threshold,
+            contact_friction_articulation_pairs_only,
+            row_capacity_telemetry,
+            friction_patches,
+            contact_world,
+            contact_slot,
+            contact_art_a,
+            contact_art_b,
+            world_slot_counter,
+            contact_path,
+            mf_slot_counter,
+            propagation_slot_counter,
+            dense_contact_world_flag,
+            contact_slots_needed,
+            dense_dropped_contact_rows,
+            mf_dropped_contact_rows,
+            propagation_dropped_contact_rows,
+            dense_first_rejected_slot,
+            mf_first_rejected_slot,
+            propagation_first_rejected_slot,
+            capacity_status,
+        )
 
 
 @wp.func

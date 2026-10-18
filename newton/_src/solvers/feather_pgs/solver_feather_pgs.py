@@ -13982,7 +13982,7 @@ class SolverFeatherPGS(SolverBase):
             self._build_friction_patches(state_in, contacts)
 
             # Under persistent patch friction, contacts of resolved worlds that the complete path would
-            # give rows are marked so the patch finish releases their anchors (contact_allocation_source).
+            # give rows are marked so the patch finish releases their anchors (kernels.py).
             allocator = (
                 allocate_world_contact_slots_patch_resolved
                 if self._friction_anchors_enabled and self._resolved_worlds_owner is not None

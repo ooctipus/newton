@@ -3,9 +3,11 @@
 
 """CPU tests for the predictor-resolved world classifier."""
 
+import ast
 import inspect
 import itertools
 import os
+import textwrap
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -177,6 +179,11 @@ def _allocate(kernel, resolved):
     }
     wp.launch(kernel, dim=1, inputs=[arrays[name] for name in inspect.signature(kernel.func).parameters], device="cpu")
     return {name: value.numpy() for name, value in arrays.items() if isinstance(value, wp.array)}
+
+
+def _definition(function):
+    """Parse the live source of a Warp kernel's or function's Python definition."""
+    return ast.parse(textwrap.dedent(inspect.getsource(function.func))).body[0]
 
 
 class TestResolvedWorlds(unittest.TestCase):
@@ -389,6 +396,48 @@ class TestResolvedWorlds(unittest.TestCase):
         self.assertEqual(int(patch_friction["world_slot_counter"][0]) + int(patch_friction["mf_slot_counter"][0]), 0)
         for name in ("contact_slot", "contact_path", "contact_slots_needed"):
             np.testing.assert_array_equal(patch_friction[name][~world_zero], complete[name][~world_zero], err_msg=name)
+
+    def test_patch_allocator_adds_only_the_release_call(self):
+        """Keep the persistent-patch allocator the plain allocator plus one release call in resolved worlds."""
+        base = _definition(kernels.allocate_world_contact_slots)
+        twin = _definition(kernels.allocate_world_contact_slots_patch_resolved)
+        release = _definition(kernels._mark_resolved_patch_contact)
+        calls = [
+            (block, statement)
+            for node in ast.walk(twin)
+            for block in (getattr(node, field, None) for field in ("body", "orelse", "finalbody"))
+            if isinstance(block, list)
+            for statement in block
+            if isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Call)
+            and ast.unparse(statement.value.func) == release.name
+        ]
+        self.assertEqual(len(calls), 1)
+        block, call = calls[0]
+        # The release reads the allocator's operands of the same names, in its own parameter order.
+        self.assertEqual([ast.unparse(argument) for argument in call.value.args], [a.arg for a in release.args.args])
+        self.assertEqual(call.value.keywords, [])
+        block.remove(call)
+        twin.name = base.name
+        self.assertEqual(ast.dump(twin), ast.dump(base))
+
+    def test_patch_release_repeats_the_allocator_admission(self):
+        """Mark a resolved contact after exactly the checks that precede the allocator's row reservation."""
+        helper = _definition(kernels._allocate_world_contact_slot)
+        release = _definition(kernels._mark_resolved_patch_contact)
+        parameters = {argument.arg: ast.dump(argument.annotation) for argument in helper.args.args}
+        for argument in release.args.args:
+            with self.subTest(parameter=argument.arg):
+                self.assertEqual(ast.dump(argument.annotation), parameters.get(argument.arg))
+        # Docstrings aside, the release is the helper's leading checks, through the normal gap
+        # rejection, followed by the resolved marking.
+        checks, marking = release.body[1:-2], release.body[-2:]
+        self.assertEqual([ast.dump(s) for s in checks], [ast.dump(s) for s in helper.body[1 : 1 + len(checks)]])
+        self.assertEqual(ast.unparse(checks[-1].test), "phi > normal_gap_limit")
+        self.assertEqual(
+            [ast.unparse(statement) for statement in marking],
+            ["contact_slot[c] = -1", "contact_path[c] = CONTACT_PATH_RESOLVED"],
+        )
 
     def test_patch_finish_releases_resolved_contacts_only(self):
         """The finish epilogue releases CONTACT_PATH_RESOLVED anchors, keeps unrouted ones and finishes routed ones."""
