@@ -39,6 +39,8 @@ contact frame whose pairs the slots already hold sorted, which is the case on
 every solver substep that shares a collision frame.
 """
 
+import itertools
+import weakref
 from contextlib import nullcontext
 
 import numpy as np
@@ -1230,7 +1232,8 @@ class _FrictionPatchState:
     skips empty frames and that recorded frame. Contact frames are identified by
     ``Contacts.contact_generation``, which every collision pass and
     :meth:`newton.Contacts.clear` advance, together with the raw contact count and
-    the contact stream. Eager builds always sort.
+    the contact stream, a token of the generation counter array that is never
+    reused (see :meth:`stream_token`). Eager builds always sort.
     """
 
     def __init__(self, model, capacity, enabled, phi, *, reuse_frames=False):
@@ -1258,6 +1261,8 @@ class _FrictionPatchState:
         # sort, and _record_sorted_frame records each sorted frame.
         self.sorted_frame = wp.full(3, GENERATION_SENTINEL, dtype=wp.int64, device=device)
         self.sort_pairs = wp.zeros(1, dtype=wp.int32, device=device)
+        self._stream_tokens = weakref.WeakKeyDictionary()
+        self._next_stream_token = itertools.count(1)
         self.update_geometry(model)
         self.current = self._frame(capacity, device)
         self.previous = self._frame(capacity, device)
@@ -1334,6 +1339,18 @@ class _FrictionPatchState:
         """Make the next build sort its pairs, as it does for a new contact frame."""
         if self.reuse_frames:
             self.sorted_frame.fill_(GENERATION_SENTINEL)
+
+    def stream_token(self, generation):
+        """Return the token that names the contact stream whose generation counter is ``generation``.
+
+        A token is never reused, unlike the address of a freed counter, which the
+        allocator can hand to the next ``Contacts``: a stream allocated in its place
+        is a new stream. Graphs bake the token of the stream they were captured with.
+        """
+        token = self._stream_tokens.get(generation)
+        if token is None:
+            token = self._stream_tokens[generation] = next(self._next_stream_token)
+        return token
 
     @staticmethod
     def _frame(n, device):
@@ -1455,9 +1472,9 @@ class _FrictionPatchState:
             )
             self._order_pairs()
         else:
-            # The generation counter's address identifies the contact stream, also
-            # across graphs captured with other Contacts instances.
-            stream = generation.ptr
+            # The token identifies the contact stream, also across graphs captured
+            # with other Contacts instances.
+            stream = self.stream_token(generation)
             branch = self._capture_branch()
             wp.launch(
                 _prepare_frame,
@@ -1491,7 +1508,7 @@ class _FrictionPatchState:
         A captured build runs this as the body of its conditional node, so this is
         the one place that lists what an empty or reused frame skips; work added
         here must leave outputs that stay valid while later builds reuse the frame.
-        ``record``, the contact frame's ``(generation, count array, stream)``,
+        ``record``, the contact frame's ``(generation, count array, stream token)``,
         is stored as the frame the slots now hold sorted.
         """
         if self.live_sort:

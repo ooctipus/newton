@@ -32,6 +32,7 @@ steps alongside on CUDA and must match the state under test bitwise
 """
 
 import contextlib
+import gc
 import inspect
 import itertools
 import os
@@ -1269,10 +1270,14 @@ def _swapped_stream(scene, live, rng, stream=None):
     return stream
 
 
-def _frame_identity(contacts):
-    """Return the host's view of a contact frame: stream, generation and raw count."""
+def _frame_identity(patches, contacts):
+    """Return the host's view of a contact frame: stream token, generation and raw count."""
     generation = contacts.contact_generation
-    return generation.ptr, int(generation.numpy()[0]), int(contacts.rigid_contact_count.numpy()[0])
+    return (
+        patches.stream_token(generation),
+        int(generation.numpy()[0]),
+        int(contacts.rigid_contact_count.numpy()[0]),
+    )
 
 
 def _after_build(sorted_frame, identity, live):
@@ -1390,7 +1395,7 @@ def run_frame_reuse_differential(
             if substep == 1 and event == "forget":
                 patches.forget_frame()
                 sorted_frame = None
-            identity = _frame_identity(contacts)
+            identity = _frame_identity(patches, contacts)
             expected = int(live > 0 and identity != sorted_frame)
             sorted_frame = _after_build(sorted_frame, identity, live)
             before = len(sorts)
@@ -1575,7 +1580,7 @@ def run_frame_reuse_graph(test, device, *, worlds=32, contacts=1536, capacity=20
         with wp.ScopedCapture(device=device) as capture:
             substeps(stream, maps, linked, seeded, out, com)
         graphs[id(stream)] = capture.graph
-    sorted_frame = _frame_identity(scene.contacts)
+    sorted_frame = _frame_identity(patches, scene.contacts)
     reused = 0
     n = capacity
     for index, event in enumerate(_GRAPH_PLAN):
@@ -1583,7 +1588,7 @@ def run_frame_reuse_graph(test, device, *, worlds=32, contacts=1536, capacity=20
         live, stream = prepare(event)
         if event in ("forget", "geometry"):
             sorted_frame = None
-        identity = _frame_identity(stream)
+        identity = _frame_identity(patches, stream)
         expected = int(live > 0 and identity != sorted_frame)
         sorted_frame = _after_build(sorted_frame, identity, live)
         reused += int(live > 0 and not expected)
@@ -1638,8 +1643,29 @@ class TestPatchFrameReuse(unittest.TestCase):
                 state.store(scene.state)
             self.assertEqual(len(sorts), builds)
             assert_same_patches(patches, reference, live, f"build {builds}")
-            identity = _frame_identity(scene.contacts)
+            identity = _frame_identity(patches, scene.contacts)
             np.testing.assert_array_equal(patches.sorted_frame.numpy(), identity[1:] + identity[:1])
+
+    def test_a_stream_at_a_recycled_address_sorts_its_pairs(self):
+        """Name contact streams by token, so a generation counter at a freed counter's address is a new stream."""
+        rng = np.random.default_rng(13)
+        scene = _Scene("cpu", 13)
+        live = scene.frame()
+        self.assertGreater(live, 0)
+        patches, reference, sorts = _reusing_pair(scene, 128)
+        for state in (patches, reference):
+            state.build(scene.model, scene.state, scene.contacts)
+        # The frame reordered behind another counter array at the recorded counter's
+        # address, as when a new Contacts is allocated where a freed one was.
+        other = _swapped_stream(scene, live, rng)
+        other.contact_generation = wp.array(
+            ptr=scene.contacts.contact_generation.ptr, dtype=wp.int32, shape=(1,), device="cpu"
+        )
+        for state in (patches, reference):
+            state.build(scene.model, scene.state, other)
+        self.assertEqual(len(sorts), 2, "the stream at the recycled address sorts its pairs")
+        assert_same_patches(patches, reference, live, "recycled address")
+        _assert_record(self, patches, _frame_identity(patches, other), "recycled address")
 
     def test_patches_without_reuse_keep_the_original_chain(self):
         """Launch the unconditional chain when frame reuse is off or the contacts carry no generation."""
@@ -1738,6 +1764,20 @@ def _permute_contacts(contacts, target, order):
             getattr(target, name).assign(value.numpy()[order])
     target.rigid_contact_count.assign(contacts.rigid_contact_count)
     target.contact_generation.assign(contacts.contact_generation)
+
+
+def _replace_first_stream(twin, order):
+    """Free a twin's first contact stream and copy its frame, reordered by ``order``, into a new one."""
+    stream = twin.streams[0]
+    frame = SimpleNamespace(
+        rigid_contact_max=stream.rigid_contact_max,
+        **{name: wp.clone(value, device="cpu") for name, value in vars(stream).items() if isinstance(value, wp.array)},
+    )
+    twin.streams[0] = stream = None
+    gc.collect()
+    wp.synchronize_device(twin.model.device)
+    twin.streams[0] = twin.pipeline.contacts()
+    _permute_contacts(frame, twin.streams[0], order)
 
 
 class _SolverTwin:
@@ -1997,16 +2037,51 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
             intact = bool(np.all(graph.patches.current.keys.numpy()[n:] == -12345))
             self.assertEqual(intact, not sorted_any, f"{context}: the radix sort ran {'never' if intact else 'once'}")
             graph.assert_sorted(self, stream, context)
-            for name in ("body_q", "body_qd", "joint_q", "joint_qd"):
-                np.testing.assert_array_equal(
-                    getattr(graph.states[0], name).numpy(), getattr(eager.states[0], name).numpy(), f"{context} {name}"
-                )
-            for name in ("valid", "tangent_impulse", "displacement"):
-                np.testing.assert_array_equal(
-                    getattr(graph.patches.previous, name).numpy(),
-                    getattr(eager.patches.previous, name).numpy(),
-                    f"{context} previous.{name}",
-                )
+            _assert_same_twins(graph, eager, context)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
+    def test_graphs_sort_a_stream_allocated_at_a_freed_address(self):
+        """Sort the first captured build over a Contacts the allocator placed where a freed one was."""
+        if not wp.is_conditional_graph_supported():
+            self.skipTest("Conditional graph nodes need a CUDA 12.4+ driver and Warp build")
+        rng = np.random.default_rng(8)
+        graph, eager = _SolverTwin("cuda:0", jaws=True), _SolverTwin("cuda:0", reuse=False, jaws=True)
+        # Eager steps leave the slots holding the first stream's frame, recorded as sorted.
+        for twin in (graph, eager):
+            twin.pair(collide=True)
+        freed = graph.streams[0].contact_generation.ptr
+        count = int(graph.streams[0].rigid_contact_count.numpy()[0])
+        order = np.concatenate((rng.permutation(count), np.arange(count, graph.streams[0].rigid_contact_max)))
+        # The replacement holds the frame reordered, with the same generation and count.
+        for twin in (graph, eager):
+            _replace_first_stream(twin, order)
+        self.assertEqual(graph.streams[0].contact_generation.ptr, freed, "the replacement must reuse the address")
+        with wp.ScopedCapture(device="cuda:0") as capture:
+            graph.solver.seed_double_buffer_events()
+            graph.pair()
+        n = graph.patches.capacity
+        keys = graph.patches.current.keys.numpy()
+        keys[n:] = -12345
+        graph.patches.current.keys.assign(keys)
+        wp.capture_launch(capture.graph)
+        eager.pair()
+        self.assertFalse(np.all(graph.patches.current.keys.numpy()[n:] == -12345), "the replacement must sort")
+        graph.assert_sorted(self, 0, "replacement")
+        _assert_same_twins(graph, eager, "replacement")
+
+
+def _assert_same_twins(graph, eager, context):
+    """Require bitwise-equal bodies, joints and stored patch history of two solver twins."""
+    for name in ("body_q", "body_qd", "joint_q", "joint_qd"):
+        np.testing.assert_array_equal(
+            getattr(graph.states[0], name).numpy(), getattr(eager.states[0], name).numpy(), f"{context} {name}"
+        )
+    for name in ("valid", "tangent_impulse", "displacement"):
+        np.testing.assert_array_equal(
+            getattr(graph.patches.previous, name).numpy(),
+            getattr(eager.patches.previous, name).numpy(),
+            f"{context} previous.{name}",
+        )
 
 
 if __name__ == "__main__":
