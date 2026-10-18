@@ -622,14 +622,13 @@ def _cpu_arm():
 
 
 class TestPatchParallelAdmission(unittest.TestCase):
-    def test_policy_switch_admits_patch_friction_and_records_why(self):
+    def test_opt_in_switch_admits_patch_friction_and_records_why(self):
         """Keep patch friction on its serial sweeps by default, admit it under the switch, and record why.
 
         Only ``FEATHER_PGS_PATCH_PARALLEL_ROWS=1`` admits patch friction to the parallel
         tiers and keyed rows; unset or ``0`` it keeps its serial sweeps and ordinary
-        rows. Point friction is admitted whatever the switch says. This is the one test
-        of the switch's default (the unset rows); every other test that needs patch
-        admission sets the switch.
+        rows. Point friction is admitted whatever the switch says. Tests that need
+        patch admission set the switch rather than rely on its default.
         """
         model = _cpu_arm()
         for beta, switch, admitted in (
