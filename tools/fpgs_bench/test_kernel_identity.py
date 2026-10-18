@@ -114,11 +114,17 @@ class TestKernelIdentity(unittest.TestCase):
         """Record a kernel's point-stream pin as its hash, beside its CUDA and CPU code digests."""
         import warp as wp  # noqa: PLC0415
 
+        pins = Path(__file__).resolve().parents[2] / "newton/tests/golden_data/test_feather_pgs_point_streams/pins.json"
+        record = json.loads(pins.read_text(encoding="utf-8"))
+        # As the point-stream test: the pins use Warp's private hasher of one version and no switches.
+        if record["warp"] != wp.config.version:
+            self.skipTest(f"Pins use Warp's private ModuleHasher of {record['warp']}; running Warp {wp.config.version}")
+        if identity._switches():
+            self.skipTest(f"Import-time switches select other generated kernels: {', '.join(identity._switches())}")
+        stored = record["kernels"]
         wp.init()
         kernels, rejected = identity.inventory(("pins",), ("kernels.allocate_world_contact_slots",))
         self.assertEqual(rejected, {})
-        pins = Path(__file__).resolve().parents[2] / "newton/tests/golden_data/test_feather_pgs_point_streams/pins.json"
-        stored = json.loads(pins.read_text(encoding="utf-8"))["kernels"]
         self.assertEqual(len(kernels), 2)
         for name, (family, kernel) in kernels.items():
             with self.subTest(kernel=name):
