@@ -198,7 +198,7 @@
   "prismatic_publication.finalize_prismatic_body_dynamics": "eccc1a697b148a6e4b8756c68dc8f1860c8cda1d74926a4fb244feea0d2256ce",
   "resolved_worlds.build_predicted_body_twists": "d89efee4b055975590188982c9006309dbc8f15d8527b22d64bb9645292812d8",
   "resolved_worlds.check_free_bodies": "be8497968cb2e5ce1eead5648d1bda8eeadfd23a8c438e7622b61b9c970ec0a5",
-  "resolved_worlds.check_raw_contact_normals": "981bcb479bb1d5ff3aa0dd8b845203bfb936585d05b1ad3c9e53ae6bee72e23a",
+  "resolved_worlds.check_raw_contact_normals": "cfc25a68015e501770731f498a6a6c8be8451de111399785f53fdc8365e75905",
   "resolved_worlds.check_world_limits": "a157f041e7fede7d967bd6c86dd709b9cb598d2941ca822a1397414ba1314dee",
   "resolved_worlds.finalize_resolved_worlds": "45391edec79668838ace7054663c22ff01ccbf3aa482af0684c6962e549448c8",
   "resolved_worlds.reset_world_decisions": "abb39b138413caa20d1702f62b158e8d0f3a49360ddae8c907e2446bd2cd7e56",

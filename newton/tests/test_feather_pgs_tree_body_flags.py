@@ -89,6 +89,62 @@ def _chain(*, floating):
     return builder.finalize(device="cuda:0"), links
 
 
+def _arm_and_box():
+    """A fixed-base arm of two revolute links and a free box 6 mm below its last link, in zero gravity.
+
+    Returns the model, the box and the arm's last link.
+    """
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    mount = wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity())
+    base = builder.add_link(xform=mount, mass=1.0)
+    builder.add_shape_sphere(base, radius=0.02)
+    joints = [builder.add_joint_fixed(-1, base, parent_xform=mount)]
+    middle = builder.add_link(xform=wp.transform(wp.vec3(0.1, 0.0, 0.5), wp.quat_identity()), mass=1.0)
+    builder.add_shape_box(middle, hx=0.08, hy=0.03, hz=0.03)
+    joints.append(
+        builder.add_joint_revolute(
+            base, middle, axis=newton.Axis.Z, child_xform=wp.transform(wp.vec3(-0.1, 0.0, 0.0), wp.quat_identity())
+        )
+    )
+    # The last link spans y in [-0.05, 0.05]; the box's upper face sits at y = -0.056.
+    link = builder.add_link(xform=wp.transform(wp.vec3(0.4, 0.0, 0.5), wp.quat_identity()), mass=1.0)
+    builder.add_shape_box(link, hx=0.1, hy=0.05, hz=0.05)
+    joints.append(
+        builder.add_joint_revolute(
+            middle,
+            link,
+            axis=newton.Axis.Z,
+            parent_xform=wp.transform(wp.vec3(0.1, 0.0, 0.0), wp.quat_identity()),
+            child_xform=wp.transform(wp.vec3(-0.2, 0.0, 0.0), wp.quat_identity()),
+        )
+    )
+    builder.add_articulation(joints)
+    box = builder.add_body(xform=wp.transform(wp.vec3(0.45, -0.106, 0.5), wp.quat_identity()), mass=1.0)
+    builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05)
+    return builder.finalize(device="cuda:0"), box, link
+
+
+def _kinematic_root_and_box():
+    """A tree with a kinematic floating root and a dynamic link, and a free box 6 mm ahead of the root along x.
+
+    Returns the model, the root and the box.
+    """
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    root = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()), mass=1.0, is_kinematic=True)
+    builder.add_shape_box(root, hx=0.1, hy=0.1, hz=0.1)
+    child = builder.add_link(xform=wp.transform(wp.vec3(-0.3, 0.0, 0.5), wp.quat_identity()), mass=0.5)
+    builder.add_shape_box(child, hx=0.1, hy=0.05, hz=0.05)
+    hinge = wp.transform(wp.vec3(-0.3, 0.0, 0.0), wp.quat_identity())
+    joints = [
+        builder.add_joint_free(root),
+        builder.add_joint_revolute(root, child, axis=newton.Axis.Y, parent_xform=hinge),
+    ]
+    builder.add_articulation(joints)
+    box = builder.add_body(xform=wp.transform(wp.vec3(0.156, 0.0, 0.5), wp.quat_identity()), mass=1.0)
+    builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05)
+    return builder.finalize(device="cuda:0"), root, box
+
+
 def _sparse_case(beta, cached, *, kinematic_body=None):
     """The scene of test_feather_pgs_sparse_split on its native sparse matrix-free route."""
     model = sparse_split._model()
@@ -193,6 +249,28 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
             self._notify(model, solver, body, flag)
             phases.append(rollout.run(steps))
         return phases
+
+    def _drive(self, model, solver, body, axis, *, steps):
+        """State after each step while ``body``'s free-joint coordinate ``axis`` advances at 1 m/s.
+
+        A kinematic joint keeps its coordinates, so the pose and the velocity
+        are set before every step, as a user drives a kinematic body.
+        """
+        rollout = _Rollout(model, solver, body, np.zeros(6, np.float32))
+        state = rollout.state
+        joint = int(np.flatnonzero(model.joint_child.numpy() == body)[0])
+        q_index = int(model.joint_q_start.numpy()[joint]) + axis
+        qd_index = int(model.joint_qd_start.numpy()[joint]) + axis
+        start = float(state.joint_q.numpy()[q_index])
+        snapshots = []
+        for step in range(1, steps + 1):
+            q, qd = state.joint_q.numpy(), state.joint_qd.numpy()
+            q[q_index], qd[qd_index] = start + step * DT, 1.0
+            state.joint_q.assign(q)
+            state.joint_qd.assign(qd)
+            newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+            snapshots.append(rollout.run(1))
+        return snapshots
 
     def test_wrench_on_a_kinematic_link_stays_off_its_ancestors(self):
         """An external wrench on a kinematic link moves nothing under the owner, as under ordinary dynamics.
@@ -364,6 +442,37 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                             phases.append(_snapshot(case[2]))
                         runs[cached] = phases
                     self._assert_phases_close(runs["auto"], runs["off"])
+
+    def test_moving_kinematic_body_keeps_its_contact_rows(self):
+        """A kinematic body closing on a dynamic one keeps its world's contact rows under the owner.
+
+        Under point friction in matrix-free mode the resolved-world classifier
+        reads the twists the owner's predictor publishes. It took a kinematic
+        body of a responding tree as still, where the ordinary route keeps the
+        world's rows: a free box made kinematic at runtime, which the owner
+        now absorbs, and a kinematic floating root built with a dynamic link.
+        The owner skipped the first contact step and over-corrected after it.
+        """
+        cases = (
+            # (case, scene, made kinematic at runtime, driven coordinate of the kinematic free joint)
+            ("free box made kinematic", _arm_and_box, True, 1),
+            ("kinematic root built", _kinematic_root_and_box, False, 0),
+        )
+        for case, scene, toggle, axis in cases:
+            with self.subTest(case=case):
+                runs = {}
+                for cached in ("off", "auto"):
+                    model, driver, struck = scene()
+                    solver = _solver(model, FRICTION_LAWS["point"], cached, pgs_mode="matrix_free")
+                    if cached == "auto":
+                        self.assertIsInstance(solver._tree_kinetic_state, MixedTreeKineticState)
+                        self.assertTrue(solver._resolved_worlds_owner.published)
+                    if toggle:
+                        self._notify(model, solver, driver, KINEMATIC)
+                    runs[cached] = self._drive(model, solver, driver, axis, steps=8)
+                # The arm's last link turns away, or the box is pushed ahead of the root.
+                self.assertGreater(float(np.abs(runs["off"][-1]["body_qd"][struck]).max()), 0.5)
+                self._assert_phases_close(runs["auto"], runs["off"], atol=1.0e-4)
 
     def test_rejected_toggle_raises_the_ordinary_error_before_any_change(self):
         """A prescribed root made dynamic raises the ordinary error on both routes and changes no solver state."""

@@ -323,6 +323,23 @@ def _body_twist(body: int, art: int, data: ResolvedWorldInput, scratch: Resolved
 
 
 @wp.func
+def _published_twist_known(body: int, art: int, data: ResolvedWorldInput):
+    """Whether :func:`_body_twist` returns the endpoint body's predicted twist on the published path.
+
+    A kinematic body with response DOFs outside a prescribed articulation, such
+    as a free body made kinematic after construction or a kinematic root of a
+    dynamic tree, moves at its prescribed joint velocity, which the published
+    path does not read. The body pass rejects every world that holds such a
+    body; the published path rejects every contact that touches one. A
+    kinematic body without response DOFs is welded to the world, so its zero
+    twist is exact.
+    """
+    if data.prescribed_articulation[art] != 0 or data.body_has_response_dofs[body] == 0:
+        return True
+    return (data.body_flags[body] & 2) == 0
+
+
+@wp.func
 def _endpoint_speed(
     body: int,
     art: int,
@@ -406,13 +423,13 @@ def _check_normal(c: int, raw: RawContacts, data: ResolvedWorldInput, scratch: R
     if body_a >= 0 and art_a >= 0:
         twist_a = _body_twist(body_a, art_a, data, scratch)
         if data.use_published != 0:
-            valid = valid and _finite6(twist_a)
+            valid = valid and _published_twist_known(body_a, art_a, data) and _finite6(twist_a)
         else:
             valid = valid and scratch.body_valid[body_a] != 0
     if body_b >= 0 and art_b >= 0:
         twist_b = _body_twist(body_b, art_b, data, scratch)
         if data.use_published != 0:
-            valid = valid and _finite6(twist_b)
+            valid = valid and _published_twist_known(body_b, art_b, data) and _finite6(twist_b)
         else:
             valid = valid and scratch.body_valid[body_b] != 0
     n = -raw.normal[c]
@@ -703,7 +720,8 @@ def launch(data, raw, scratch, contact_capacity, device, *, enabled=1, published
     """Run the decision launches in stream order on ``device``.
 
     With published twists the body pass is replaced by the free bodies'
-    velocity-cap check; otherwise the body pass builds the twists itself.
+    velocity-cap check, and the contact check rejects an endpoint whose twist
+    is not published; otherwise the body pass builds the twists itself.
     """
     worlds = scratch.resolved.shape[0]
     wp.launch(reset_world_decisions, dim=worlds, inputs=[enabled, data, scratch], device=device)

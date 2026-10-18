@@ -72,9 +72,14 @@ def make_case(*, free=False):
     return data, raw, scratch
 
 
-def evaluate(data, raw, scratch, *, enabled=1):
-    """Execute the same five kernels on CPU, without initializing CUDA."""
-    rw.launch(data, raw, scratch, 1, "cpu", enabled=enabled)
+def evaluate(data, raw, scratch, *, enabled=1, published=False):
+    """Execute the decision kernels on CPU, without initializing CUDA.
+
+    ``published`` reads the predictor twists in ``data.predicted_twist``, as
+    on the held-tree owner, instead of running the classifier's body pass.
+    """
+    data.use_published = int(published)
+    rw.launch(data, raw, scratch, 1, "cpu", enabled=enabled, published=published)
     return int(scratch.resolved.numpy()[0])
 
 
@@ -144,6 +149,37 @@ class TestResolvedWorlds(unittest.TestCase):
         self.assertAlmostEqual(float(scratch.minimum_residual.numpy()[0]), -2.0, places=6)
         data.body_v_s.assign([[999, 0, 0, 0, 0, 0], [-1, 0, 0, 0, 0, 0]])
         self.assertEqual(evaluate(data, raw, scratch), 1)
+
+    def test_kinematic_body_of_a_responding_tree_keeps_its_rows(self):
+        """A contact with a kinematic body of a responding articulation is never resolved, on either twist source.
+
+        Such a body, a free body made kinematic after construction or a
+        kinematic root of a dynamic tree, moves with its prescribed velocity.
+        The body pass rejects its world. The published path reads no twist
+        for it and took it as still, resolving a world it was closing on.
+        """
+        data, raw, scratch = make_case()
+
+        def a(value, dtype=wp.float32):
+            return wp.array(value, dtype=dtype, device="cpu")
+
+        # Body 1 becomes a one-DOF body of its own responding, non-prescribed articulation.
+        data.world_dof_indices, data.world_dof_count = a([[0, 1]], wp.int32), a([2], wp.int32)
+        data.limit_q_index = a([-1, -1], wp.int32)
+        data.lower, data.upper, data.v_hat = a([-np.inf] * 2), a([np.inf] * 2), a([0.0, 0.0])
+        data.joint_S_s = a(np.eye(6, dtype=np.float32)[[0, 0]], wp.spatial_vector)
+        data.articulation_response_dof_count = a([1, 1], wp.int32)
+        data.prescribed_articulation = a([0, 0], wp.int32)
+        data.body_has_response_dofs = a([1, 1], wp.int32)
+        data.body_response_dof_mask = a([1, 1], wp.uint32)
+        # (flag of body 1, its speed along the contact normal, resolved); positive speed closes the gap.
+        for flag, speed, resolved in ((1, 2.0, 0), (1, -2.0, 1), (2, 2.0, 0), (2, -2.0, 0)):
+            data.body_flags.assign([1, flag])
+            data.v_hat.assign([0.0, speed])
+            data.predicted_twist.assign([[0.0] * 6, [speed, 0.0, 0.0, 0.0, 0.0, 0.0]])
+            for published in (False, True):
+                with self.subTest(kinematic=flag == 2, speed=speed, published=published):
+                    self.assertEqual(evaluate(data, raw, scratch, published=published), resolved)
 
     def test_zero_friction_radius_allows_slip(self):
         """Accept zero normal impulse without requiring zero tangential speed."""
