@@ -87,6 +87,15 @@ _PATCH_ONLY = frozenset(
         "use_support_table=True, warm_start=False)",
         "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, linked_rows=True, "
         "use_support_table=True, warm_start=True)",
+        # Their ring-pooled contact triplets, in the active and the full sweep.
+        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=False, contact_triplets=True, "
+        "linked_rows=True, use_support_table=True, warm_start=False)",
+        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=False, contact_triplets=True, "
+        "linked_rows=True, use_support_table=True, warm_start=True)",
+        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, contact_triplets=True, "
+        "linked_rows=True, use_support_table=True, warm_start=False)",
+        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, contact_triplets=True, "
+        "linked_rows=True, use_support_table=True, warm_start=True)",
         # Paired factor sweeps over patch contact units.
         "solver_feather_pgs._get_pgs_solve_paired_factor_kernel(192, 29, 23, 6, '120', False, False, "
         "contact_units=True)",
@@ -199,6 +208,15 @@ def _linked_sweep_calls():
     factory = _get_pgs_solve_sparse_kernel.__wrapped__
     for table, warm in itertools.product((False, True), repeat=2):
         kwargs = {"active_rows": True, "use_support_table": table, "warm_start": warm, "linked_rows": True}
+        yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, (48, 18, 12), kwargs
+    for active, warm in itertools.product((False, True), repeat=2):
+        kwargs = {
+            "active_rows": active,
+            "use_support_table": True,
+            "contact_triplets": True,
+            "warm_start": warm,
+            "linked_rows": True,
+        }
         yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, (48, 18, 12), kwargs
 
 

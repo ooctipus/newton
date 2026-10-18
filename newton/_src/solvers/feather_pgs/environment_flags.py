@@ -347,7 +347,9 @@ FLAGS = declare(
         "FEATHER_PGS_PATCH_ACTIVE_ROWS",
         "policy",
         _SOLVER,
-        "=0 keeps patch friction on the full ordered sparse sweep instead of the active-row scan (default on).",
+        "=0 keeps patch friction on the full ordered sparse sweep instead of the active-row scan (default on); "
+        "with FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1 that sweep fuses anchor triplets, so the previous kernel "
+        "needs both off.",
     ),
     _flag(
         "FEATHER_PGS_PATCH_CONDITIONAL_NODES",
@@ -462,7 +464,8 @@ FLAGS = declare(
         "FEATHER_PGS_SPARSE_CONTACT_TRIPLETS",
         "experiment",
         _SOLVER,
-        "=1 caches tangent metrics per contact triplet in the active sparse sweep.",
+        "=1 fuses contact triplets in the sparse sweep: point friction's in the active-row scan, patch "
+        "friction's anchor units in whichever sweep it runs.",
     ),
     _flag(
         "FEATHER_PGS_SPARSE_FACTOR",

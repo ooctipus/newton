@@ -491,12 +491,13 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertIn("_active", routes["sweep"]["sparse"])
         if sparse["contact_triplets"]:
             self.assertIn("_contact_triplets", routes["sweep"]["sparse"])
+        # The 9-DOF, 32-row tripod is a small world: patch friction keeps its packed full sweep.
         patch_sparse = patch_selected["routes"]["sparse_mass_matrix"]
         self.assertFalse(patch_sparse["active_rows"])
         self.assertFalse(patch_sparse["contact_triplets"])
         if patch_sparse["size"] is not None:
             self.assertIn("friction_anchor_beta", patch_sparse["active_rows_reason"])
-            self.assertIn("active-row scan", patch_sparse["contact_triplets_reason"])
+            self.assertIn("small worlds", patch_sparse["contact_triplets_reason"])
         tree = routes["held_tree"]
         self.assertEqual(tree["owner"] is None, point._tree_kinetic_state is None)
         for group in tree["groups"]:
