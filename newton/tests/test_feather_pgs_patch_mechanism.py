@@ -26,7 +26,9 @@ arithmetic passes. The bound does not tell contraction from other codegen
 changes of a few rounding errors: a fast-math build of the patch module exceeds
 it only in phi, in one sequence. Integers and floats the kernels compute
 without a product compare bitwise on every device, and every field compares
-bitwise on the CPU.
+bitwise on the CPU. A twin state on another grid of the same compiled module
+steps alongside on CUDA and must match the state under test bitwise
+(:func:`_twin`), so races do not hide below the payload bound.
 """
 
 import contextlib
@@ -53,6 +55,9 @@ _PIECE_OFFSET = 0.04
 # more places.
 _FMA_ULPS = 8
 _EPS32 = float(np.finfo(np.float32).eps)
+# The twin's (threads, build_threads): one block that strides over every slot,
+# where the states under test launch many blocks.
+_TWIN_THREADS = (97, 61)
 
 
 def _rotation(rng, angle):
@@ -258,6 +263,23 @@ def _pair(scene, capacity):
     return _FrictionPatchState(scene.model, capacity, True, phi[0]), ReferencePatches(scene.model, capacity, phi[1])
 
 
+def _twin(patches, scene):
+    """Return a second patch state on another grid, which CUDA tests step alongside ``patches``, or None on the CPU.
+
+    The twin runs the module under test on the same inputs, with
+    ``_TWIN_THREADS`` and one sort block, so it must match ``patches`` bitwise
+    (:func:`assert_same_state`): a race or any other grid-dependent result makes
+    them differ, however small. The CPU compares with the reference bitwise.
+    """
+    if not patches.device.is_cuda:
+        return None
+    twin = _FrictionPatchState(scene.model, patches.capacity, True, wp.zeros_like(patches.view.phi))
+    twin.threads, twin.build_threads = _TWIN_THREADS
+    twin.sort_blocks = 1
+    twin.live_sort = patches.live_sort
+    return twin
+
+
 def _magnitude(values):
     """Return each row's largest absolute component: rows run along the first axis."""
     values = np.abs(np.asarray(values, dtype=np.float64))
@@ -346,7 +368,7 @@ def _scale(kind, values, world):
     return {"own": _magnitude(values), "world": world, "field": _largest(values)}[kind]
 
 
-def assert_same_patches(patches, reference, live, context=""):
+def assert_same_patches(patches, reference, live, context="", twin=None):
     """Require the reference's patch state on every index a patch kernel reads.
 
     Sorted keys, validity, ownership, sources, the patch view and stored worlds
@@ -356,8 +378,11 @@ def assert_same_patches(patches, reference, live, context=""):
     (``members``, ``used``) and the sort's second halves are excluded. Integer
     fields and floats computed without a product compare bitwise on every
     device; computed float payloads compare bitwise on the CPU and within
-    :func:`_assert_payload_equal`'s bound on CUDA.
+    :func:`_assert_payload_equal`'s bound on CUDA. A ``twin`` must match
+    ``patches`` bitwise in every array (:func:`assert_same_state`).
     """
+    if twin is not None:
+        assert_same_state(twin, patches, f"{context} twin")
     n = reference.capacity
     stride = patches.key_stride
     cuda = reference.view.weight.device.is_cuda
@@ -466,6 +491,23 @@ def assert_empty_tail(patches, context=""):
     np.testing.assert_array_equal(patches.previous_world.numpy()[stored:], -1, f"{context} previous_world tail")
 
 
+def assert_same_state(twin, patches, context=""):
+    """Require bitwise-equal arrays in two patch states, scratch included; atomics order the pair head list."""
+    for frame in ("current", "previous"):
+        for name in _PatchFrame.vars:
+            np.testing.assert_array_equal(
+                getattr(getattr(twin, frame), name).numpy(),
+                getattr(getattr(patches, frame), name).numpy(),
+                f"{context} {frame}.{name}",
+            )
+    for name in ("weight", "next_contact", "point_a", "point_b", "phi"):
+        np.testing.assert_array_equal(
+            getattr(twin.view, name).numpy(), getattr(patches.view, name).numpy(), f"{context} view.{name}"
+        )
+    for name in ("previous_world", "previous_q", "stored", "built", "extent", "head_count"):
+        np.testing.assert_array_equal(getattr(twin, name).numpy(), getattr(patches, name).numpy(), f"{context} {name}")
+
+
 class _Rows:
     """Synthetic contact routing and row arrays of routes 0, 1 and 2.
 
@@ -554,12 +596,12 @@ class _Rows:
         return maps, routes
 
 
-def _assert_same_rows(mine, theirs, rows, context=""):
+def _assert_same_rows(mine, theirs, rows, context="", exact=False):
     """Require the reference's row arrays: parents and friction budgets bitwise, impulses as computed payload.
 
     Linking divides copied budgets by an anchor count, which matches bitwise on
     every device; seeding computes impulses (:func:`_assert_payload_equal`, at
-    the scale of ``rows``).
+    the scale of ``rows``). ``exact`` compares impulses bitwise too, as twins do.
     """
     for (route, *arrays), (_, *expected) in zip(mine, theirs, strict=True):
         for name, array, reference in zip(("parents", "mu"), arrays[:2], expected[:2], strict=True):
@@ -569,7 +611,7 @@ def _assert_same_rows(mine, theirs, rows, context=""):
             arrays[2].numpy(),
             impulses,
             f"{context} route {route} impulses",
-            arrays[2].device.is_cuda,
+            arrays[2].device.is_cuda and not exact,
             rows.impulse_scale(route, impulses),
         )
 
@@ -647,10 +689,11 @@ def run_reference_differential(
 ):
     """Step a patch state and the reference through ``plan``, comparing after every launch group.
 
-    ``live_sort`` overrides the capacity's choice of pair sort. Returns counts of
-    carried anchors, of anchors released by finishing and of stored anchors past
-    an unstored build's live count, and the largest live count, so callers can
-    require the sequence to exercise them.
+    ``live_sort`` overrides the capacity's choice of pair sort. On CUDA a twin
+    steps alongside (:func:`_twin`). Returns counts of carried anchors, of
+    anchors released by finishing and of stored anchors past an unstored
+    build's live count, and the largest live count, so callers can require the
+    sequence to exercise them.
     """
     rng = np.random.default_rng(1000 + seed)
     scene = _Scene(device, seed, worlds=worlds, bodies=bodies, contacts=contacts)
@@ -659,6 +702,9 @@ def run_reference_differential(
         patches.threads, patches.build_threads = threads
     if live_sort is not None:
         patches.live_sort = live_sort
+    twin = _twin(patches, scene)
+    live_states = [state for state in (patches, twin) if state is not None]
+    states = [*live_states, reference]
     rows = _Rows(scene, capacity, rng)
     coverage = {"carried": 0, "released": 0, "unstored": 0, "live": 0}
     fraction = 0.1
@@ -673,13 +719,13 @@ def run_reference_differential(
             transforms = scene.model.shape_transform.numpy()
             transforms[int(rng.integers(0, len(transforms))), 0] += 1.0e-3
             scene.model.shape_transform.assign(transforms)
-            for state in (patches, reference):
+            for state in states:
                 state.update_geometry(scene.model)
-            assert_same_patches(patches, reference, 0, f"{context} invalidate")
+            assert_same_patches(patches, reference, 0, f"{context} invalidate", twin)
         if event == "none":
-            for state in (patches, reference):
+            for state in states:
                 state.previous.valid.zero_()
-            assert_same_patches(patches, reference, 0, context)
+            assert_same_patches(patches, reference, 0, context, twin)
             assert_empty_tail(patches, context)
             continue
         if event == "noframe":
@@ -689,64 +735,75 @@ def run_reference_differential(
             out, com = _solved_state(scene, rng)
             maps, routes = rows.arrays()
             reference.finish(empty, scene.state, out, com, *maps, routes, dt)
-            patches.store(scene.state)
-            assert_same_patches(patches, reference, 0, context)
+            for state in live_states:
+                state.store(scene.state)
+            assert_same_patches(patches, reference, 0, context, twin)
             assert_empty_tail(patches, context)
             continue
         mode = {"sparse": "sparse", "empty": "empty", "overflow": "overflow"}.get(event, "live")
         gates = _gates(scene, rng) if event == "gates" else {}
         if event == "rebuild":
             scene.frame("live")
-            for state in (patches, reference):
+            for state in states:
                 state.build(scene.model, scene.state, scene.contacts)
             mode = "sparse"
         if event == "unstored":
             # The reset must reach every stored anchor, also past the live count
             # of a build that no store followed.
             sparse = scene.frame("sparse")
-            for state in (patches, reference):
+            for state in states:
                 state.build(scene.model, scene.state, scene.contacts)
-            assert_same_patches(patches, reference, sparse, f"{context} unstored build")
+            assert_same_patches(patches, reference, sparse, f"{context} unstored build", twin)
             coverage["unstored"] += int(np.count_nonzero(reference.previous.valid.numpy()[sparse:]))
-            for state in (patches, reference):
+            for state in states:
                 state.reset(None)
-            assert_same_patches(patches, reference, sparse, f"{context} unstored reset")
+            assert_same_patches(patches, reference, sparse, f"{context} unstored reset", twin)
             assert_empty_tail(patches, f"{context} unstored reset")
         live = scene.frame(mode)
-        for state in (patches, reference):
+        for state in states:
             state.build(scene.model, scene.state, scene.contacts, **gates)
-        assert_same_patches(patches, reference, live, f"{context} build")
+        assert_same_patches(patches, reference, live, f"{context} build", twin)
         assert_empty_tail(patches, f"{context} build")
         coverage["live"] = max(coverage["live"], live)
         coverage["carried"] += int(np.count_nonzero(reference.current.source.numpy()[:live] >= 0))
         routes_present = (0, 1, 2) if rng.random() < 0.7 else (0, 1)
         rows.generate(reference, live, routes_present)
-        mine_maps, mine_routes = rows.arrays()
+        mine = [rows.arrays() for _ in live_states]
         their_maps, their_routes = rows.arrays()
-        patches.link(*mine_maps, patch_routes(mine_routes))
+        for state, (maps, routes) in zip(live_states, mine, strict=True):
+            state.link(*maps, patch_routes(routes))
         reference.link(scene.contacts, *their_maps, their_routes)
-        _assert_same_rows(mine_routes, their_routes, rows, f"{context} link")
-        seeded = [row for row in mine_routes if row[4] > 0.0]
-        if seeded:
-            patches.seed(scene.state, *mine_maps, patch_routes(seeded))
+        _assert_live_rows(mine, their_routes, rows, f"{context} link")
+        for state, (maps, routes) in zip(live_states, mine, strict=True):
+            seeded = [row for row in routes if row[4] > 0.0]
+            if seeded:
+                state.seed(scene.state, *maps, patch_routes(seeded))
         reference.seed(scene.contacts, scene.state, *their_maps, their_routes)
-        _assert_same_rows(mine_routes, their_routes, rows, f"{context} seed")
+        _assert_live_rows(mine, their_routes, rows, f"{context} seed")
         out, com = _solved_state(scene, rng)
         before = int(np.count_nonzero(reference.current.valid.numpy()[:live]))
-        patches.finish(scene.state, out, com, *mine_maps, patch_routes(mine_routes), dt)
+        for state, (maps, routes) in zip(live_states, mine, strict=True):
+            state.finish(scene.state, out, com, *maps, patch_routes(routes), dt)
         reference.finish(scene.contacts, scene.state, out, com, *their_maps, their_routes, dt)
         coverage["released"] += before - int(np.count_nonzero(reference.current.valid.numpy()[:live]))
-        assert_same_patches(patches, reference, live, f"{context} finish")
+        assert_same_patches(patches, reference, live, f"{context} finish", twin)
         assert_empty_tail(patches, f"{context} finish")
         if event in ("reset", "masked"):
             mask = None
             if event == "masked":
                 mask = wp.array(rng.random(scene.worlds) < 0.5, dtype=wp.bool, device=device)
-            for state in (patches, reference):
+            for state in states:
                 state.reset(mask)
-            assert_same_patches(patches, reference, live, f"{context} reset")
+            assert_same_patches(patches, reference, live, f"{context} reset", twin)
             assert_empty_tail(patches, f"{context} reset")
     return coverage
+
+
+def _assert_live_rows(mine, theirs, rows, context):
+    """Compare the state under test's rows, ``mine[0]``, with the reference's, and a twin's with them bitwise."""
+    _assert_same_rows(mine[0][1], theirs, rows, context)
+    for _, routes in mine[1:]:
+        _assert_same_rows(routes, mine[0][1], rows, f"{context} twin", exact=True)
 
 
 class TestPatchSortKeys(unittest.TestCase):
@@ -885,12 +942,16 @@ class TestPatchLiveExtent(unittest.TestCase):
 
 
 def run_graph_replay(device, *, worlds=32, contacts=1536, capacity=2048, live_sort=None):
-    """Capture one patch step, replay it over changing counts, and compare each replay with the reference."""
+    """Capture one patch step, replay it over changing counts, and compare each replay with the reference.
+
+    On CUDA a twin steps eagerly alongside the replays (:func:`_twin`).
+    """
     rng = np.random.default_rng(7)
     scene = _Scene(device, 21, worlds=worlds, contacts=contacts)
     patches, reference = _pair(scene, capacity)
     if live_sort is not None:
         patches.live_sort = live_sort
+    twin = _twin(patches, scene)
     rows = _Rows(scene, capacity, rng)
     dt = 1.0 / 240.0
     decay = np.array([0.8, 0.0, 0.6])
@@ -934,9 +995,21 @@ def run_graph_replay(device, *, worlds=32, contacts=1536, capacity=2048, live_so
         reference.finish(scene.contacts, scene.state, out, com, *their_maps, their_routes, dt)
         return their_routes
 
+    def twin_step(context):
+        """Step the twin on fresh copies of the rows and compare its rows with the replayed ones."""
+        if twin is None:
+            return
+        twin_maps, twin_routes = rows.arrays()
+        twin.build(scene.model, scene.state, scene.contacts)
+        twin.link(*twin_maps, patch_routes(twin_routes))
+        twin.seed(scene.state, *twin_maps, patch_routes(row for row in twin_routes if row[4] > 0.0))
+        twin.finish(scene.state, out, com, *twin_maps, patch_routes(twin_routes), dt)
+        _assert_same_rows(twin_routes, routes, rows, f"{context} twin", exact=True)
+
     step()
+    twin_step("eager")
     reference_step()
-    assert_same_patches(patches, reference, live, "eager")
+    assert_same_patches(patches, reference, live, "eager", twin)
     with wp.ScopedCapture(device=device) as capture:
         step()
     for index, mode in enumerate(("live", "sparse", "empty", "live", "overflow", "live", "sparse", "live")):
@@ -944,8 +1017,9 @@ def run_graph_replay(device, *, worlds=32, contacts=1536, capacity=2048, live_so
         live = prepare(mode)
         assign(fixed, out, com)
         wp.capture_launch(capture.graph)
+        twin_step(f"replay {index} {mode}")
         their_routes = reference_step()
-        assert_same_patches(patches, reference, live, f"replay {index} {mode}")
+        assert_same_patches(patches, reference, live, f"replay {index} {mode}", twin)
         assert_empty_tail(patches, f"replay {index} {mode}")
         _assert_same_rows(routes, their_routes, rows, f"replay {index} {mode}")
 
