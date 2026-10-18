@@ -448,7 +448,12 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "Matrix-free routes require CUDA")
     def test_route_record_is_json_across_routes(self):
-        """Build a JSON-compliant record for every major admitted construction route."""
+        """Build a JSON-compliant record for every major admitted construction route.
+
+        Every case runs with ``FEATHER_PGS_PATCH_PARALLEL_ROWS`` unset, its default; the
+        patch-friction parallel case also runs opted in (``=1``).
+        """
+        patch_parallel = ({"sparse_mass_matrix": "off", "mf_gs_parallel_rows": 48}, {"free_count": 2})
         cases = (
             ({}, {}),
             ({"friction_anchor_beta": 0.0}, {}),
@@ -464,8 +469,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             ({"grouped_dynamics": True}, {}),
             ({"grouped_dynamics": True, "sparse_mass_matrix": "off", "friction_anchor_beta": 0.0}, {}),
             ({"enable_joint_velocity_limits": True}, {}),
-            # Opted in, patch friction builds ring-pooled (linked) parallel tiers, as point friction builds its tiers.
-            ({"sparse_mass_matrix": "off", "mf_gs_parallel_rows": 48}, {"free_count": 2}),
+            # By default patch friction builds no parallel tier, whatever the requested budget; opted in, it builds
+            # ring-pooled (linked) parallel tiers, as point friction builds its tiers.
+            patch_parallel,
             ({"sparse_mass_matrix": "off", "pgs_schedule": "physx_grasp", "friction_anchor_beta": 0.0}, {}),
             # Lazy publication defers only on the fused world-dynamics kernel, and never under patch friction.
             (
@@ -488,16 +494,20 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 {},
             ),
         )
-        built = 0
-        for options, model_options in cases:
-            with self.subTest(options=options, model=model_options):
+        built = opted_in = 0
+        for (options, model_options), switch in [(case, None) for case in cases] + [(patch_parallel, "1")]:
+            with self.subTest(options=options, model=model_options, switch=switch):
                 try:
-                    # Opt in, so the patch-friction parallel case builds linked tiers whatever the environment says.
-                    with patch.dict(os.environ, {"FEATHER_PGS_PATCH_PARALLEL_ROWS": "1"}):
+                    # Set the switch as the arm says, whatever the exported environment holds.
+                    with patch.dict(os.environ):
+                        os.environ.pop("FEATHER_PGS_PATCH_PARALLEL_ROWS", None)
+                        if switch is not None:
+                            os.environ["FEATHER_PGS_PATCH_PARALLEL_ROWS"] = switch
                         solver = _make_solver(_build_model(**model_options), True, **options)
                 except (ValueError, NotImplementedError):
                     continue  # The record describes admitted constructors only.
                 built += 1
+                opted_in += switch is not None
                 with assert_host_only():
                     selected = solver.get_path_selection()
                 json.dumps(selected, allow_nan=False)
@@ -514,11 +524,16 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 tiers = routes["sweep"]["tiers"]
                 parallel = tiers is not None and tiers["family"] in ("parallel", "keyed_parallel")
                 self.assertEqual(applied["mf_gs_parallel_rows"], tiers["tiers"][-1]["rows"] if parallel else 0)
+                # Patch friction is admitted to the parallel tiers only opted in, and its opted-in arm builds
+                # them: ring-pooled (linked) tiers, where point friction builds point tiers.
+                patch_law = routes["friction"]["law"] == "patch"
+                self.assertEqual(routes["friction"]["parallel_rows"]["admitted"], not patch_law or switch == "1")
+                if patch_law:
+                    self.assertEqual(parallel, switch == "1")
                 if parallel:
-                    linked = routes["friction"]["law"] == "patch"
-                    self.assertEqual(tiers["linked_rows"], linked)
+                    self.assertEqual(tiers["linked_rows"], patch_law)
                     for tier in tiers["tiers"]:
-                        self.assertEqual(tier["kernel"].endswith("_linked"), linked, tier)
+                        self.assertEqual(tier["kernel"].endswith("_linked"), patch_law, tier)
                 self.assertEqual(applied["grouped_dynamics"], routes["dynamics"]["grouped_topology"])
                 self.assertEqual(
                     applied["lazy_kinematics"],
@@ -538,6 +553,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 if grouped is not None:
                     self.assertEqual(grouped["lanes_per_articulation"], solver._grouped_topology.lanes_per_articulation)
         self.assertGreaterEqual(built, 8)
+        self.assertEqual(opted_in, 1, "The opted-in patch-friction parallel arm must build")
 
     def test_private_override_validation_and_cpu_precedence(self):
         """Validate effective overrides while preserving explicit choices and CPU fallbacks."""
