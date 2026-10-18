@@ -87,7 +87,7 @@ def _rollout(model, *, masked, steps, environment=None, **solver_kwargs):
     """
     with mock.patch.dict(os.environ, environment or {}), mock.patch.object(solver_module, "_ROWS_MASKED", masked):
         solver = SolverFeatherPGS(model, **solver_kwargs)
-        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False)
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False, deterministic=True)
         contacts = pipeline.contacts()
         states = [model.state(), model.state()]
         control = model.control()
