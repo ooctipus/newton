@@ -438,9 +438,15 @@ class TreeKineticState:
         after rejecting any flag change it cannot absorb.
 
         Returns:
-            Whether the proof ran: every baked plan array, the joint frames
-            ``joint_X_p`` and ``joint_X_c`` and the joint axes included, is
-            unchanged. Numeric notifications skip the proof and return ``False``.
+            Whether the proof ran and passed: the device checksums of every
+            baked plan array, the joint frames ``joint_X_p`` and ``joint_X_c``
+            and the joint axes included, match their construction values. A
+            device checksum is two position-sensitive 32-bit sums, not a
+            word-by-word compare: one changed word always shows, and a random
+            multi-word change collides with a probability of about 2**-64.
+            Arrays the proof cannot view as device words (every array on CPU)
+            compare by an exact host fingerprint. Numeric notifications skip
+            the proof and return ``False``.
         """
         if flags is not None and int(flags) != 0 and int(flags) & ~_NUMERIC_FLAGS == 0:
             return False
