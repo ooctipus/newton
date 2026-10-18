@@ -13,6 +13,7 @@ import numpy as np
 import warp as wp
 
 from newton import JointType
+from newton._src.sim.contacts import contact_capacity_blocks
 from newton._src.solvers.feather_pgs import keyed_rows as rows
 from newton._src.solvers.feather_pgs.kernels import compute_world_contact_bias
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_parallel_kernel
@@ -70,6 +71,7 @@ def fixture(snapshot, device):
     solver.diag = wp.zeros_like(solver.rhs)
     solver.row_w = wp.zeros_like(solver.rhs)
     solver._contact_w = 1.0
+    solver._contact_capacity_blocks = contact_capacity_blocks(model.device)
     solver._joint_limit_q_index_host = solver._joint_limit_q_index.numpy()
     world_indices = snapshot["solver_world_dof_indices"]
     offsets = [

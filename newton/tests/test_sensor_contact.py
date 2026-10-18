@@ -3,11 +3,14 @@
 
 import types
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import warp as wp
 
 import newton
+from newton._src.sensors.sensor_contact import accumulate_contact_forces_kernel
+from newton._src.sim.contacts import contact_capacity_blocks
 from newton._src.solvers.kamino._src.geometry import ContactAggregation
 from newton._src.utils import is_graph_capture_allocation_enabled
 from newton.sensors import SensorContact
@@ -708,6 +711,82 @@ class TestSensorContact(unittest.TestCase):
         np.testing.assert_allclose(friction[0], expected_friction, atol=1e-5)
         # Verify orthogonality
         self.assertAlmostEqual(np.dot(friction[0], n), 0.0, places=5)
+
+    def test_accumulation_grid_strides_over_one_wave(self):
+        """Accumulate over the capacity on one resident wave of blocks, exactly as on the full grid.
+
+        The forces, normals and points are small integers along the axes, so every sum is exact
+        in any order: one block, which loops over all the contacts, must reproduce the full grid
+        bit for bit. CPU launches ignore the block count.
+        """
+        device = wp.get_device()
+        model = _make_two_world_model(device=device, include_ground=True)
+        contacts = _exact_contacts(device, capacity=3000, count=2600)
+        state = types.SimpleNamespace(
+            body_q=wp.array(
+                [wp.transform(wp.vec3(1.0, 2.0, 3.0), wp.quat_identity()), wp.transform_identity()],
+                dtype=wp.transform,
+                device=device,
+            )
+        )
+        outputs, blocks = [], []
+        for capped in (False, True):
+            sensor = SensorContact(model, sensing_bodies="*", counterpart_shapes="*")
+            self.assertEqual(sensor._capacity_blocks, contact_capacity_blocks(model.device))
+            if capped:
+                sensor._capacity_blocks = 1
+            launch = wp.launch
+
+            def record(kernel, *args, launch=launch, **kwargs):
+                if kernel is accumulate_contact_forces_kernel:
+                    blocks.append(kwargs.get("max_blocks", 0))
+                return launch(kernel, *args, **kwargs)
+
+            with patch.object(wp, "launch", record):
+                sensor.update(state, contacts)
+            outputs.append(
+                [
+                    getattr(sensor, name).numpy()
+                    for name in (
+                        "total_force",
+                        "total_force_friction",
+                        "force_matrix",
+                        "force_matrix_friction",
+                        "position_matrix",
+                    )
+                ]
+            )
+        self.assertEqual(blocks, [contact_capacity_blocks(model.device), 1])
+        self.assertGreater(np.abs(outputs[0][0]).sum(), 0.0)
+        self.assertGreater(np.abs(outputs[0][1]).sum(), 0.0)
+        self.assertGreater(np.abs(outputs[0][4]).sum(), 0.0)
+        for full, capped in zip(*outputs, strict=True):
+            np.testing.assert_array_equal(capped, full)
+
+
+def _exact_contacts(device, *, capacity, count):
+    """Contacts between the two bodies' shapes and the ground with exactly summable data.
+
+    Forces are integer multiples of an axis, normals are signed axes and points are integers,
+    so friction components, force magnitudes and weighted midpoints are exact in float32.
+    """
+    rng = np.random.default_rng(7)
+    pairs = np.array([(0, 2), (2, 0), (1, 2), (2, 1)], dtype=np.int32)[rng.integers(0, 4, capacity)]
+    axes = np.eye(3, dtype=np.float32)
+    force = axes[rng.integers(0, 3, capacity)] * rng.integers(1, 4, (capacity, 1)).astype(np.float32)
+    normal = axes[rng.integers(0, 3, capacity)] * rng.choice([-1.0, 1.0], (capacity, 1)).astype(np.float32)
+    contacts = newton.Contacts(capacity, 0, device=device, requested_attributes={"force"})
+    with wp.ScopedDevice(device):
+        contacts.rigid_contact_shape0 = wp.array(pairs[:, 0], dtype=wp.int32)
+        contacts.rigid_contact_shape1 = wp.array(pairs[:, 1], dtype=wp.int32)
+        contacts.rigid_contact_normal = wp.array(normal, dtype=wp.vec3)
+        contacts.rigid_contact_point0 = wp.array(rng.integers(-5, 6, (capacity, 3)).astype(np.float32), dtype=wp.vec3)
+        contacts.rigid_contact_point1 = wp.array(rng.integers(-5, 6, (capacity, 3)).astype(np.float32), dtype=wp.vec3)
+        contacts.rigid_contact_offset0 = wp.zeros(capacity, dtype=wp.vec3)
+        contacts.rigid_contact_offset1 = wp.zeros(capacity, dtype=wp.vec3)
+        contacts.rigid_contact_count = wp.array([count], dtype=wp.int32)
+        contacts.force = wp.array(np.hstack([force, np.zeros_like(force)]), dtype=wp.spatial_vector)
+    return contacts
 
 
 class TestSensorContactMuJoCo(unittest.TestCase):

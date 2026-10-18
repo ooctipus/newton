@@ -591,6 +591,7 @@ class KeyedRows:
                 dim=self.contact_input.point0.shape[0],
                 inputs=[self.contact_input, self.data],
                 device=self.solver.model.device,
+                max_blocks=self.solver._contact_capacity_blocks,
             )
 
     def finish_rows(self):
@@ -602,6 +603,7 @@ class KeyedRows:
                 dim=self.contact_input.point0.shape[0],
                 inputs=[self.contact_input, self.data],
                 device=s.model.device,
+                max_blocks=s._contact_capacity_blocks,
             )
         na, nb = self.layout.primary, self.layout.secondary
         fallback = get_patch_fallback_kernel(self.layout) if self.patch else get_fallback_kernel(self.layout)

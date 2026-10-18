@@ -115,6 +115,26 @@ def contact_surface_point(
     return wp.transform_point(X_wb, point_local + offset_local)
 
 
+CAPACITY_BLOCKS_PER_SM = 8
+"""Resident 256-thread blocks per SM in one wave of a launch over a contact buffer's capacity."""
+
+
+def contact_capacity_blocks(device: wp.Device) -> int:
+    """Block count for a launch over a contact buffer's capacity whose threads exit past the live count.
+
+    Warp kernels loop grid-stride, so one resident wave of 256-thread blocks
+    still visits every slot, while a mostly empty buffer no longer schedules a
+    block per 256 slots.
+
+    Args:
+        device: The launch device.
+
+    Returns:
+        The ``max_blocks`` of :func:`warp.launch`: one wave on CUDA, 0 (uncapped) on CPU.
+    """
+    return CAPACITY_BLOCKS_PER_SM * int(device.sm_count) if device.is_cuda else 0
+
+
 class _ContactsGraphLease:
     """Keep graph-captured contact users and their storage alive.
 

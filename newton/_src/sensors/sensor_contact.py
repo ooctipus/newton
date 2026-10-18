@@ -11,7 +11,7 @@ import numpy as np
 import warp as wp
 
 from ..sim import Contacts, Model, State
-from ..sim.contacts import contact_surface_point
+from ..sim.contacts import contact_capacity_blocks, contact_surface_point
 from ..utils.selection import match_labels
 
 _UNSET = object()
@@ -513,6 +513,8 @@ class SensorContact:
             raise ValueError("At most one of `counterpart_bodies` and `counterpart_shapes` may be specified.")
 
         self.device = model.device
+        # The accumulation launches over the contact capacity; one resident wave covers it.
+        self._capacity_blocks = contact_capacity_blocks(self.device)
         self.verbose = verbose if verbose is not None else wp.config.log_level <= wp.LOG_DEBUG
 
         # request contact force attribute
@@ -765,6 +767,7 @@ class SensorContact:
                 self._position_weight if update_contact_positions else None,
             ],
             device=self.device,
+            max_blocks=self._capacity_blocks,
         )
         if update_contact_positions:
             wp.launch(

@@ -31,6 +31,7 @@ import warp as wp
 from ...core.types import override
 from ...sim import Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
 from ...sim.articulation import eval_fk
+from ...sim.contacts import contact_capacity_blocks
 from ...sim.enums import BodyFlags, JointType
 from ..semi_implicit.kernels_contact import (
     eval_particle_body_contact_forces,
@@ -2385,6 +2386,9 @@ class SolverFeatherPGS(SolverBase):
         self.tile_threads = int(tile_threads)
         if self.tile_threads not in (32, 64, 128, 256):
             raise ValueError(f"tile_threads must be one of (32, 64, 128, 256), got {tile_threads!r}")
+        # Launches over the contact capacity (the force export, the warm-start snapshot
+        # and gathers, the keyed-row key scatters) grid-stride over one resident wave.
+        self._contact_capacity_blocks = contact_capacity_blocks(model.device)
 
         self.cholesky_kernel = cholesky_kernel
         self.trisolve_kernel = trisolve_kernel
@@ -10828,6 +10832,7 @@ class SolverFeatherPGS(SolverBase):
                     ],
                     outputs=[self.impulses],
                     device=self.model.device,
+                    max_blocks=self._contact_capacity_blocks,
                 )
 
         if self._friction_anchors_enabled and self._patch_frame_built(contacts):
@@ -11309,6 +11314,7 @@ class SolverFeatherPGS(SolverBase):
                         self._ws_prev_contact_normal,
                     ],
                     device=model.device,
+                    max_blocks=self._contact_capacity_blocks,
                 )
             self._ws_prev_dt = float(dt)
 
@@ -11638,6 +11644,7 @@ class SolverFeatherPGS(SolverBase):
             ],
             outputs=[contacts.rigid_contact_force],
             device=self.model.device,
+            max_blocks=self._contact_capacity_blocks,
         )
 
         if contacts.force is not None:
@@ -11650,6 +11657,7 @@ class SolverFeatherPGS(SolverBase):
                 ],
                 outputs=[contacts.force],
                 device=self.model.device,
+                max_blocks=self._contact_capacity_blocks,
             )
 
     def _prepare_augmented_state(
@@ -14927,6 +14935,7 @@ class SolverFeatherPGS(SolverBase):
                         self.color_unit_len,
                     ],
                     device=model.device,
+                    max_blocks=self._contact_capacity_blocks,
                 )
                 wp.launch_tiled(
                     self._color_propagation_prebuild_kernel,
@@ -15051,6 +15060,7 @@ class SolverFeatherPGS(SolverBase):
                         ],
                         outputs=[self.propagation_impulses],
                         device=model.device,
+                        max_blocks=self._contact_capacity_blocks,
                     )
                 if self._propagation_cached_response_active:
                     # Partitioned build: cache-eligible bodies claim the slot
@@ -15178,6 +15188,7 @@ class SolverFeatherPGS(SolverBase):
                         ],
                         outputs=[self.mf_impulses],
                         device=model.device,
+                        max_blocks=self._contact_capacity_blocks,
                     )
 
         self._link_friction_patches(contacts)

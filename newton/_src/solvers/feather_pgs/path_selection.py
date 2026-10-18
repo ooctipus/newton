@@ -199,6 +199,7 @@ def route_selection(solver) -> dict:
         "articulations_by_dof": {str(int(size)): int(count) for size, count in solver.n_arts_by_size.items()},
         "held_tree": _held_tree(solver),
         "contact_rows": _contact_rows(solver, source),
+        "contact_consumers": _contact_consumers(solver),
         "local_solve": _local_solve(solver),
         "paired_response": _paired_response(solver),
         "sparse_diagonal": _sparse_diagonal(solver),
@@ -433,6 +434,19 @@ def _contact_rows(solver, source) -> dict:
             "reason": compact_reason,
         },
         "compact_jacobian": bool(solver._compact_contact_jacobian),
+    }
+
+
+def _contact_consumers(solver) -> dict:
+    blocks = int(solver._contact_capacity_blocks)
+    return {
+        "max_blocks": blocks,
+        "reason": (
+            "Launches over the contact capacity (force export, warm-start snapshot and gathers, keyed-row key"
+            " scatters) grid-stride over one resident wave of 256-thread blocks."
+            if blocks
+            else "Uncapped: a CPU launch loops over every slot."
+        ),
     }
 
 

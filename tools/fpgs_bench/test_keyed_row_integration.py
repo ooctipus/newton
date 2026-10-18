@@ -208,6 +208,37 @@ class TestKeyedRowIntegration(unittest.TestCase):
                 if name == "standing":
                     self.assertTrue(linked, "A box foot must link several normals in one ring")
 
+    def test_key_scatters_take_the_recorded_blocks(self):
+        """Launch the key scatters over the route record's block count, solving as on the full grid.
+
+        Point friction scatters its keys after the fallback counts and patch friction before the
+        patch link. One block loops over every contact, so a solver forced to one block solves the
+        same rows as the default one-wave grid.
+        """
+        device = wp.get_device("cuda:0")
+        for beta, scatter in ((0.0, rows.scatter_contact_keys), (0.2, rows.scatter_patch_contact_keys)):
+            with self.subTest(friction_anchor_beta=beta):
+                with patch.dict(os.environ, {"FEATHER_PGS_RESOLVED_WORLDS": "0"}):
+                    wave, single = (make_case(True, 32, 1, beta=beta, deterministic=True) for _ in range(2))
+                self.assertEqual(wave[1]._keyed_rows.patch, beta > 0.0)
+                record = wave[1].get_path_selection()["routes"]["contact_consumers"]
+                self.assertEqual(record["max_blocks"], 8 * device.sm_count)
+                single[1]._contact_capacity_blocks = 1
+                blocks, launch = [], wp.launch
+
+                def recording(kernel, *args, scatter=scatter, blocks=blocks, launch=launch, **kwargs):
+                    if kernel is scatter:
+                        blocks.append(kwargs.get("max_blocks", 0))
+                    return launch(kernel, *args, **kwargs)
+
+                for _ in range(4):
+                    _step(wave)
+                    with patch.object(wp, "launch", recording):
+                        _step(single)
+                    self.assertGreater(int(single[-1].rigid_contact_count.numpy()[0]), 0)
+                    self.compare(wave, single)
+                self.assertEqual(blocks, [1] * 4)
+
     def test_physical_reader_against_captured_allegro_operator(self):
         """Compare the physical reader with independent captured mass actions."""
         from tools.fpgs_bench import test_keyed_rows_capture as capture  # noqa: PLC0415
