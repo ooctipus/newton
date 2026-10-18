@@ -752,8 +752,9 @@ def test_multiworld_restitution_keeps_case_data_isolated(test, device):
     resolved-world classifier skips that world: its contact takes no rows, since
     zero impulse solves the world exactly. FEATHER_PGS_PATCH_DENSE_PATHS=0 keeps
     the solver's default patch friction off the classifier, so the contact takes
-    a matrix-free row beside the crossing worlds' rows. Both routes must give
-    every world its own result.
+    a matrix-free row beside the crossing worlds' rows, and also restores the
+    per-contact row builder (the general producer's ordinary rows). Both routes
+    must give every world its own result.
     """
     # (e, speed, mass, toi/dt); the third case is deliberately non-crossing.
     cases = ((0.25, 2.0, 1.0, 0.4), (0.75, 4.0, 10.0, 0.7), (1.0, 3.0, 0.5, 1.25), (0.0, 5.0, 2.0, 0.2))
@@ -775,8 +776,11 @@ def test_multiworld_restitution_keeps_case_data_isolated(test, device):
                 world.add_ground_plane(cfg=cfg)
                 scene.add_world(world)
             model = scene.finalize(device=device)
-            # The solver reads the variable, and admits the classifier, at construction.
-            with mock.patch.dict("os.environ", {"FEATHER_PGS_PATCH_DENSE_PATHS": dense_paths}):
+            # The solver reads both variables, and admits the classifier, only at construction. The
+            # classifier's own switch keeps its default "1", pinned so that an exported "0" cannot fail
+            # the default arm: the bundle's opt-out is the only difference between the arms.
+            environment = {"FEATHER_PGS_PATCH_DENSE_PATHS": dense_paths, "FEATHER_PGS_RESOLVED_WORLDS": "1"}
+            with mock.patch.dict("os.environ", environment):
                 solver = _make_solver(model)
             classified = dense_paths == "1"
             classifier = solver.get_path_selection()["routes"]["resolved_worlds"]
