@@ -13,7 +13,6 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import keyed_rows as rows
 from newton._src.solvers.feather_pgs import solver_feather_pgs as source
-from newton._src.solvers.feather_pgs.friction_patches import CONTACT_PATH_RESOLVED
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
@@ -161,50 +160,51 @@ class TestKeyedRowIntegration(unittest.TestCase):
         """Solve patch friction through keyed rows as through ordinary rows in the same linked tiers.
 
         Both arms run the ring-pooled parallel law, so they agree up to float
-        order: the same routed contacts, row types, ring links and divided
-        coefficients, impulses by contact, states within the point twin's
-        tolerance, pooled cones and anchor history. Sorted contacts let the
-        by-contact checks pair the arms' contacts. Keyed rows do not take the
-        resolved-world classifier: where the ordinary arm resolves a world, its
-        contacts hold CONTACT_PATH_RESOLVED and no rows, since zero impulse solves
-        that world exactly, and the keyed arm's rows for them must solve to zero.
+        order: the same contacts, row types, ring links and divided coefficients,
+        impulses by contact, states within the point twin's tolerance, pooled cones
+        and anchor history. Sorted contacts let the by-contact checks pair the arms'
+        contacts. Keyed rows decline the resolved-world classifier, which would
+        resolve the tripod's worlds after their first step and leave the ordinary
+        arm without rows, so the test turns the classifier off
+        (FEATHER_PGS_RESOLVED_WORLDS=0) to compare rows on every step.
+        test_patch_resolved_worlds_match_the_complete_path in
+        test_feather_pgs_resolved_worlds covers the classifier's exactness under
+        patch friction.
         """
         for name, factory, free_count in (("tripod", None, 1), ("standing", standing_model, 0)):
             with self.subTest(fixture=name):
-                ordinary, keyed = (
-                    make_case(enabled, 32, free_count, model_factory=factory, beta=0.2, deterministic=True)
-                    for enabled in (False, True)
-                )
+                # The solver reads the switch only at construction; the classifier owner built there
+                # selects the allocator variant and the predictor's twist publication on every step.
+                with patch.dict(os.environ, {"FEATHER_PGS_RESOLVED_WORLDS": "0"}):
+                    ordinary, keyed = (
+                        make_case(enabled, 32, free_count, model_factory=factory, beta=0.2, deterministic=True)
+                        for enabled in (False, True)
+                    )
+                for case in (ordinary, keyed):
+                    classifier = case[1].get_path_selection()["routes"]["resolved_worlds"]
+                    self.assertFalse(classifier["enabled"], classifier["reason"])
                 self.assertIsNone(ordinary[1]._keyed_rows)
                 self.assertTrue(keyed[1]._keyed_rows.patch)
                 for case in (ordinary, keyed):
                     kernels = case[1]._pgs_solve_mf_gs_incremental_kernels
                     self.assertTrue(kernels)
                     self.assertTrue(all(kernel.key.endswith("_linked") for kernel in kernels))
-                linked, compared = False, 0
+                linked = False
                 for _ in range(8):
                     _step(ordinary)
                     _step(keyed)
                     self.compare(ordinary, keyed)
                     expected, actual = contact_rows(ordinary[1], ordinary[-1]), contact_rows(keyed[1], keyed[-1])
-                    count = int(ordinary[-1].rigid_contact_count.numpy()[0])
-                    path = ordinary[1].contact_path.numpy()[:count]
-                    resolved = set(np.flatnonzero(path == int(CONTACT_PATH_RESOLVED)).tolist())
-                    self.assertEqual(sorted(set(actual) - resolved), sorted(expected))
-                    # Hold keyed rows of resolved contacts to zero impulse under the by-contact contract (atol 2e-5).
-                    zero = {c: {"impulses": np.zeros_like(actual[c]["impulses"])} for c in resolved & set(actual)}
-                    assert_contact_impulses_close({**expected, **zero}, actual)
+                    self.assertEqual(sorted(actual), sorted(expected))
+                    assert_contact_impulses_close(expected, actual)
                     for c, record in expected.items():
                         np.testing.assert_array_equal(actual[c]["types"], record["types"])
                         np.testing.assert_array_equal(actual[c]["parents"], record["parents"])
                         np.testing.assert_allclose(actual[c]["mu"], record["mu"], rtol=1.0e-6)
                         linked |= record["parents"][0] not in (-1, c)
-                    compared += len(expected)
                     for case in (ordinary, keyed):
                         assert_ring_coulomb(case[1])
                     assert_history_close(ordinary[1], keyed[1])
-                # A resolved step holds no ordinary rows to compare.
-                self.assertGreater(compared, 0, "No step compared keyed rows with ordinary rows")
                 if name == "standing":
                     self.assertTrue(linked, "A box foot must link several normals in one ring")
 
