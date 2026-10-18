@@ -464,7 +464,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             ({"grouped_dynamics": True}, {}),
             ({"grouped_dynamics": True, "sparse_mass_matrix": "off", "friction_anchor_beta": 0.0}, {}),
             ({"enable_joint_velocity_limits": True}, {}),
-            # Patch friction builds ring-pooled (linked) parallel tiers, as point friction builds its tiers.
+            # Opted in, patch friction builds ring-pooled (linked) parallel tiers, as point friction builds its tiers.
             ({"sparse_mass_matrix": "off", "mf_gs_parallel_rows": 48}, {"free_count": 2}),
             ({"sparse_mass_matrix": "off", "pgs_schedule": "physx_grasp", "friction_anchor_beta": 0.0}, {}),
             # Lazy publication defers only on the fused world-dynamics kernel, and never under patch friction.
@@ -492,7 +492,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         for options, model_options in cases:
             with self.subTest(options=options, model=model_options):
                 try:
-                    # The patch-friction parallel case builds linked tiers whatever the environment says.
+                    # Opt in, so the patch-friction parallel case builds linked tiers whatever the environment says.
                     with patch.dict(os.environ, {"FEATHER_PGS_PATCH_PARALLEL_ROWS": "1"}):
                         solver = _make_solver(_build_model(**model_options), True, **options)
                 except (ValueError, NotImplementedError):

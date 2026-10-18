@@ -1589,9 +1589,9 @@ class SolverFeatherPGS(SolverBase):
                 ``0`` disables it. Requires the same conditions as ``mf_gs_incremental_rows`` and takes precedence.
                 Consider small contact sets, such as an arm against fixed geometry; worlds with mixed/free-body
                 rows or excess rows retain serial solving. The effective limit is capped at 96 for response-block
-                sweeps or 128 for matrix-free sweeps, and rounded down to a multiple of four. Under persistent
-                patch friction each tangent pair projects on its patch's pooled normal load;
-                ``FEATHER_PGS_PATCH_PARALLEL_ROWS=0`` keeps patch friction on the serial kernels.
+                sweeps or 128 for matrix-free sweeps, and rounded down to a multiple of four. Persistent patch
+                friction keeps the serial kernels unless ``FEATHER_PGS_PATCH_PARALLEL_ROWS=1`` opts it in; each
+                tangent pair then projects on its patch's pooled normal load.
             mf_gs_parallel_sweeps (int, optional): Maximum number of parallel sweeps per launch (early exit when no
                 impulse changes). Independent of ``pgs_iterations``; preserve the sweep allowance when comparing
                 execution speed, and validate convergence separately.
@@ -2743,9 +2743,10 @@ class SolverFeatherPGS(SolverBase):
         self._law_agnostic_contact_paths = not (self._contact_torsion_enabled or self.contact_compliance)
         self._point_contact_paths = self._law_agnostic_contact_paths and not self._friction_anchors_enabled
         # The parallel matrix-free tiers pool each friction pair's cone over its patch
-        # ring and keyed rows write the patch row law, so both serve point and patch
-        # friction (Jacobi sweeps, not the serial patch sweep). The policy switch keeps
-        # patch friction on its serial sweeps and ordinary rows.
+        # ring and keyed rows write the patch row law, so both can serve point and patch
+        # friction (Jacobi sweeps, not the serial patch sweep). Patch friction takes them
+        # only under the opt-in FEATHER_PGS_PATCH_PARALLEL_ROWS=1; by default it keeps
+        # its serial sweeps and ordinary rows.
         self._parallel_contact_paths, self._parallel_contact_paths_reason = self._admit_parallel_contact_paths()
         if self.pgs_mode == "matrix_free":
             self._jy_world_aliased = self._detect_jy_world_identity()
@@ -2971,7 +2972,7 @@ class SolverFeatherPGS(SolverBase):
             self._keyed_rows_reason = (
                 "Keyed rows write the point and patch row laws; torsion and compliance keep ordinary rows."
                 if not self._law_agnostic_contact_paths
-                else "FEATHER_PGS_PATCH_PARALLEL_ROWS=0 keeps patch friction on ordinary rows."
+                else "Patch friction keeps ordinary rows unless FEATHER_PGS_PATCH_PARALLEL_ROWS=1 opts it in."
             )
         elif os.environ.get("FEATHER_PGS_KEYED_ROWS", "1") == "0":
             self._keyed_rows_reason = "FEATHER_PGS_KEYED_ROWS=0 disables keyed rows."
@@ -15517,23 +15518,26 @@ class SolverFeatherPGS(SolverBase):
         """Decide whether the parallel tiers and keyed rows may serve this contact law, and why.
 
         They pool each friction pair's cone over its patch ring and write the patch
-        row law, so patch friction honors ``mf_gs_parallel_rows`` and keyed rows as
-        point friction does, unless ``FEATHER_PGS_PATCH_PARALLEL_ROWS=0`` restores
-        its serial sweeps. Torsion and compliance keep ordinary rows.
+        row law, so under ``FEATHER_PGS_PATCH_PARALLEL_ROWS=1`` patch friction honors
+        ``mf_gs_parallel_rows`` and keyed rows as point friction does. The switch is
+        opt-in: the tiers scale a sliding pair's impulse radially after per-row step
+        scales, a different fixed point than the serial sweep's, which moved
+        body-velocity RMS by 0.4-0.9% on Allegro and ANYmal flat. By default patch
+        friction keeps its serial sweeps. Torsion and compliance keep ordinary rows.
         """
         if self._point_contact_paths:
             return True, "Point friction: parallel tiers and keyed rows serve it."
         if not self._law_agnostic_contact_paths:
             return False, "Contact torsion and compliance keep serial sweeps and ordinary rows."
-        if os.environ.get("FEATHER_PGS_PATCH_PARALLEL_ROWS", "1") == "0":
+        if os.environ.get("FEATHER_PGS_PATCH_PARALLEL_ROWS") != "1":
             return False, (
-                "FEATHER_PGS_PATCH_PARALLEL_ROWS=0: patch friction ignores mf_gs_parallel_rows and keyed rows "
-                "and keeps its serial sweeps."
+                "Patch friction ignores mf_gs_parallel_rows and keyed rows and keeps its serial sweeps "
+                "unless FEATHER_PGS_PATCH_PARALLEL_ROWS=1 opts it in (default off)."
             )
         return True, (
             "Patch friction honors mf_gs_parallel_rows and keyed rows: in the parallel (Jacobi) sweeps each tangent "
             "pair projects on its patch ring's pooled normal load, as point pairs project on their own normal. "
-            "FEATHER_PGS_PATCH_PARALLEL_ROWS=0 restores the serial patch route."
+            "FEATHER_PGS_PATCH_PARALLEL_ROWS=1 opted in; by default patch friction keeps its serial sweeps."
         )
 
     def _admit_world_rows(self) -> bool:

@@ -28,8 +28,9 @@ from tools.fpgs_bench.test_keyed_rows_capture import captures
 def mode(enabled):
     """Bind the existing INK recipe and the new flag before construction.
 
-    Patch friction is admitted to keyed rows and the parallel tiers explicitly,
-    so an exported ``FEATHER_PGS_PATCH_PARALLEL_ROWS=0`` cannot change the route.
+    Patch friction opts in to keyed rows and the parallel tiers explicitly
+    (``FEATHER_PGS_PATCH_PARALLEL_ROWS=1``; off by default), so the exported
+    environment cannot change the route.
     """
     with (
         patch.dict(os.environ, {"FEATHER_PGS_KEYED_ROWS": str(int(enabled)), "FEATHER_PGS_PATCH_PARALLEL_ROWS": "1"}),

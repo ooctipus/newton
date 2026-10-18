@@ -345,9 +345,9 @@ FLAGS = declare(
     ),
     _flag(
         "FEATHER_PGS_PATCH_PARALLEL_ROWS",
-        "policy",
+        "experiment",
         _SOLVER,
-        "=0 keeps patch friction off the parallel tiers and keyed rows, on its serial sweeps (default on).",
+        "=1 admits patch friction to the parallel tiers and keyed rows (default off: it keeps its serial sweeps).",
     ),
     _flag(
         "FEATHER_PGS_PREDICTED_TWISTS",

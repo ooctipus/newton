@@ -623,20 +623,22 @@ def _cpu_arm():
 
 class TestPatchParallelAdmission(unittest.TestCase):
     def test_policy_switch_admits_patch_friction_and_records_why(self):
-        """Admit patch friction to the parallel tiers and keyed rows by default, record why, and honor the switch.
+        """Keep patch friction on its serial sweeps by default, admit it under the switch, and record why.
 
-        ``FEATHER_PGS_PATCH_PARALLEL_ROWS=0`` keeps patch friction on its serial sweeps
-        and ordinary rows; point friction is admitted whatever the switch says. This is
-        the one test of the switch's default (the unset rows); every other test that
-        needs patch admission sets the switch.
+        Only ``FEATHER_PGS_PATCH_PARALLEL_ROWS=1`` admits patch friction to the parallel
+        tiers and keyed rows; unset or ``0`` it keeps its serial sweeps and ordinary
+        rows. Point friction is admitted whatever the switch says. This is the one test
+        of the switch's default (the unset rows); every other test that needs patch
+        admission sets the switch.
         """
         model = _cpu_arm()
         for beta, switch, admitted in (
             (0.0, None, True),
             (0.0, "0", True),
-            (0.2, None, True),  # the default: on
-            (0.2, "1", True),
+            (0.0, "1", True),
+            (0.2, None, False),  # the default: off
             (0.2, "0", False),
+            (0.2, "1", True),
         ):
             with self.subTest(beta=beta, switch=switch), patch.dict(os.environ):
                 os.environ.pop(_SWITCH, None)
@@ -652,15 +654,18 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 if beta == 0.0:
                     self.assertIn("Point friction", friction["parallel_rows"]["reason"])
                     continue
-                # Without the switch the only parallel-row owners left to point friction are the response blocks.
+                # Under the switch the only parallel-row owners left to point friction are the response blocks.
                 self.assertEqual("keyed rows" in friction["reason"], not admitted)
                 self.assertIn("need point friction", friction["reason"])
                 if admitted:
                     self.assertIn("patch ring", friction["parallel_rows"]["reason"])
                     self.assertNotIn("point contacts", keyed["reason"])
                 else:
-                    self.assertIn(f"{_SWITCH}=0", friction["parallel_rows"]["reason"])
-                    self.assertIn(f"{_SWITCH}=0", keyed["reason"])
+                    # The serial patch route; both reasons name the opt-in.
+                    self.assertIn("serial sweeps", friction["parallel_rows"]["reason"])
+                    self.assertNotIn("patch ring", friction["parallel_rows"]["reason"])
+                    self.assertIn(f"{_SWITCH}=1", friction["parallel_rows"]["reason"])
+                    self.assertIn(f"{_SWITCH}=1", keyed["reason"])
         # Torsion and compliance (CUDA-only laws here) keep ordinary rows whatever the switch says.
         other_law = SimpleNamespace(_point_contact_paths=False, _law_agnostic_contact_paths=False)
         admitted, reason = SolverFeatherPGS._admit_parallel_contact_paths(other_law)
@@ -927,16 +932,16 @@ def _friction_pairs(solver, world):
 
 @unittest.skipUnless(wp.is_cuda_available(), "Parallel matrix-free tiers require CUDA")
 class TestPatchParallelRoutes(unittest.TestCase):
-    def test_patch_runs_linked_tiers_unless_switched_off(self):
-        """Build linked tiers for patch friction, point tiers for point friction, and today's route when switched off."""
+    def test_patch_runs_linked_tiers_only_when_switched_on(self):
+        """Build linked tiers for patch friction only under the switch, and point tiers for point friction."""
         model = standing_model()
         options = {"sparse_mass_matrix": "auto", "cached_dynamics": "auto"}
         with patch.dict(os.environ, {_SWITCH: "1"}):
             patch_tiers = _matrix_free_solver(model, beta=0.2, parallel_rows=32, **options)
             point_tiers = _matrix_free_solver(model, beta=0.0, parallel_rows=32, **options)
             serial = _matrix_free_solver(model, beta=0.2, parallel_rows=0, **options)
-            os.environ[_SWITCH] = "0"
-            switched = _matrix_free_solver(model, beta=0.2, parallel_rows=32, **options)
+            del os.environ[_SWITCH]  # the default
+            default = _matrix_free_solver(model, beta=0.2, parallel_rows=32, **options)
         for solver, linked in ((patch_tiers, True), (point_tiers, False)):
             self.assertEqual(solver._ink_rows, 32)
             # The tier owns the ordinary buffers for either law.
@@ -946,10 +951,10 @@ class TestPatchParallelRoutes(unittest.TestCase):
             self.assertTrue(all(key.endswith("_linked") == linked for key in keys), keys)
             tiers = solver.get_path_selection()["routes"]["sweep"]["tiers"]
             self.assertEqual((tiers["family"], tiers["linked_rows"]), ("parallel", linked))
-        # Switched off, patch friction keeps the serial route it had before the tiers learned the ring.
-        self.assertEqual(switched._ink_rows, 0)
-        self.assertEqual(switched._pgs_solve_mf_gs_incremental_kernels, [])
-        expected, actual = serial.get_path_selection(), switched.get_path_selection()
+        # By default, patch friction keeps the serial route it had before the tiers learned the ring.
+        self.assertEqual(default._ink_rows, 0)
+        self.assertEqual(default._pgs_solve_mf_gs_incremental_kernels, [])
+        expected, actual = serial.get_path_selection(), default.get_path_selection()
         for record in (expected, actual):
             record["routes"]["contact_rows"]["keyed_rows"].pop("reason")
         for name in ("sweep", "sparse_mass_matrix", "dynamics", "publication", "contact_rows"):
@@ -958,6 +963,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
         self.assertEqual(actual["routes"]["held_tree"]["owner"], expected["routes"]["held_tree"]["owner"])
         self.assertEqual(actual["kernel_plan_by_dof"], expected["kernel_plan_by_dof"])
         self.assertFalse(actual["routes"]["friction"]["parallel_rows"]["admitted"])
+        self.assertIn(f"{_SWITCH}=1", actual["routes"]["friction"]["parallel_rows"]["reason"])
 
     def test_in_sweep_world_rows_stay_point_only(self):
         """Own no in-sweep world rows under patch friction with INK and WORLD_ROWS and keyed rows declined."""
