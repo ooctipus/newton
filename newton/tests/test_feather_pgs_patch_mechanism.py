@@ -1245,6 +1245,8 @@ def _reusing_pair(scene, capacity, branch=_host_branch):
     phi = [wp.zeros(capacity, dtype=wp.vec2, device=scene.device) for _ in range(2)]
     patches = _FrictionPatchState(scene.model, capacity, True, phi[0], reuse_frames=True)
     patches._capture_branch = lambda: branch
+    # The host branch stands for a capture with no unjoined forked work.
+    patches._capture_can_pause = lambda: True
     sorts = []
     order = patches._order_pairs
 
@@ -1758,18 +1760,31 @@ class TestPatchFrameReuse(unittest.TestCase):
         for unjoined, branch, builds in ((True, refuse, (1, 1)), (False, _host_branch, (1, 0))):
             with self.subTest(unjoined=unjoined):
                 patches, reference, sorts = _reusing_pair(scene, 128, branch=branch)
-                with mock.patch.object(friction_patches, "capture_has_unjoined_work", return_value=unjoined) as probe:
-                    for build, expected in enumerate(builds):
-                        log.clear()
-                        before = len(sorts)
-                        patches.build(scene.model, scene.state, scene.contacts, capture_pause=pause)
-                        reference.build(scene.model, scene.state, scene.contacts)
-                        self.assertEqual(len(sorts) - before, expected, f"build {build} sorts")
-                        # The caller joins its own streams before the check.
-                        self.assertEqual(log, ["pause", "resume"], f"build {build}")
-                        assert_same_patches(patches, reference, live, f"build {build}")
-                        _assert_record(self, patches, _frame_identity(patches, scene.contacts), f"build {build}")
-                self.assertEqual(probe.call_count, len(builds))
+                asked = []
+
+                def can_pause(unjoined=unjoined, asked=asked):
+                    # The caller joins its own streams before the check.
+                    asked.append(list(log))
+                    return not unjoined
+
+                patches._capture_can_pause = can_pause
+                for build, expected in enumerate(builds):
+                    log.clear()
+                    before = len(sorts)
+                    patches.build(scene.model, scene.state, scene.contacts, capture_pause=pause)
+                    reference.build(scene.model, scene.state, scene.contacts)
+                    self.assertEqual(len(sorts) - before, expected, f"build {build} sorts")
+                    self.assertEqual(log, ["pause", "resume"], f"build {build}")
+                    assert_same_patches(patches, reference, live, f"build {build}")
+                    _assert_record(self, patches, _frame_identity(patches, scene.contacts), f"build {build}")
+                self.assertEqual(asked, [["pause"]] * len(builds))
+        # A capture can pause exactly when the driver reports no unjoined work on the patch device.
+        phi = wp.zeros(128, dtype=wp.vec2, device="cpu")
+        patches = _FrictionPatchState(scene.model, 128, True, phi, reuse_frames=True)
+        for unjoined in (True, False):
+            with mock.patch.object(friction_patches, "capture_has_unjoined_work", return_value=unjoined) as probe:
+                self.assertEqual(patches._capture_can_pause(), not unjoined)
+            probe.assert_called_once_with(patches.device)
 
     def test_capture_pause_wraps_each_conditional_node(self):
         """Enter the caller's capture pause around each captured node, sorting or not, and never eagerly."""

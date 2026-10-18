@@ -1486,7 +1486,7 @@ class _FrictionPatchState:
             # stride over the frame's extent at other stages of the step, where
             # each node would pause the capture again to skip microseconds of work.
             with nullcontext() if branch is None else capture_pause():
-                if branch is not None and capture_has_unjoined_work(self.device):
+                if branch is not None and not self._capture_can_pause():
                     branch = None
                 wp.launch(
                     _prepare_frame,
@@ -1512,6 +1512,10 @@ class _FrictionPatchState:
         if device.is_cuda and device.captures.get(device.stream) is not None:
             return wp.capture_if
         return None
+
+    def _capture_can_pause(self):
+        """Whether the capture can pause for a conditional node: no forked stream holds unjoined work."""
+        return not capture_has_unjoined_work(self.device)
 
     def _order_pairs(self, record=None):
         """Sort the prepared slots by pair key, the work that only a new contact frame needs.
