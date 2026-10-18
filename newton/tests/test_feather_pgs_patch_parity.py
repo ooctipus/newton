@@ -264,15 +264,15 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
             assert_history_close(*histories)
 
     def test_patch_rows_ignore_which_edge_member_carries_an_anchor(self):
-        """Match the standing fixture and a one-ulp twin by anchor location while rounding moves anchor rows.
+        """Match the standing fixture and a one-ulp twin by anchor location, with rounding unable to move anchor rows.
 
-        On the rectangular feet the two corners of each short support edge tie,
-        and float32 rounding picks the corner that carries the edge's friction
-        rows. The twin's torsos start one ulp higher. Within a few steps the two
-        put some anchor rows on different corners, so by-contact rows disagree,
-        while the states (twists within STANDING_VELOCITY_ATOL), the
-        carrier-agnostic rows, the region bounds, the anchor sites and each arm's
-        stored history hold at every step of the masked-reset schedule.
+        On the rectangular feet the two corners of each short support edge tie.
+        The builder keeps an edge whole and carries its friction rows on the
+        edge's last contact, so float32 rounding no longer picks the carrier.
+        The twin's torsos start one ulp higher. The states (twists within
+        STANDING_VELOCITY_ATOL), the carrier-agnostic rows, the region bounds, the
+        anchor sites and each arm's stored history hold at every step of the
+        masked-reset schedule, and both arms keep the same carriers throughout.
         """
         cases = _standing_cases(2, twin=True)
         moved = 0
@@ -295,7 +295,7 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
                 for record in rows
             ]
             moved += carriers[0] != carriers[1]
-        self.assertGreater(moved, 0, "Rounding must move some anchor's rows to the other corner of its edge")
+        self.assertEqual(moved, 0, "Rounding must not move an anchor's rows to the other corner of its edge")
 
     def test_sliding_feet_expose_a_dropped_ring_pool(self):
         """Keep sliding anchors at their pooled budget and reject a budget that pools only its own normal.
