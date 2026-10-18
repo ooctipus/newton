@@ -605,6 +605,50 @@ def assert_patch_tangent_law(solver, contacts):
     return anchors
 
 
+# The three solver arms of the CUDA tests: the sparse-diagonal owner, then the compact boundary unordered and ordered.
+_ARMS = ("sparse_diagonal", "unordered", "ordered")
+
+
+def check_compact_records(test, solvers, law):
+    """Check and return the contact-row records of the three arms of ``build_solver_fixture`` under ``law``.
+
+    Each names the builders of the diagonal-mass size (108) and the dense six with the friction law's
+    variants. The marker encodes schedule links into the sparse rows: of point friction's triples, or of
+    patch friction's units.
+    """
+    records = []
+    for solver, arm in zip(solvers, _ARMS, strict=True):
+        record = solver.get_path_selection()["routes"]["contact_rows"]
+        marker = solver._mark_independent_sparse_contact_candidates_kernel.key
+        if arm == "sparse_diagonal":
+            metadata = "prepare_world_contact_rows"
+            expected = {
+                "108": ("sparse_diagonal", [metadata, "populate_sparse_diagonal_contact_response", marker]),
+                "6": ("compact_jacobian", [metadata, "populate_world_J_for_compact_size"]),
+            }
+        else:
+            p = "patch_" if law == "patch" else ""
+            produce = (
+                [f"produce_{p}contacts"]
+                if arm == "unordered"
+                else ["_build_contact_order", f"_produce_ordered_{p}contacts"]
+            )
+            expected = {
+                "108": ("compact_contact_boundary", [*produce, marker]),
+                "6": ("compact_contact_boundary", ["clear_contact_response", *produce]),
+            }
+        test.assertEqual(
+            record["producer"], "sparse_diagonal" if arm == "sparse_diagonal" else "compact_contact_boundary"
+        )
+        test.assertEqual(record["law"], law)
+        test.assertEqual(
+            {size: (entry["method"], entry["kernels"]) for size, entry in record["builder_by_dof"].items()}, expected
+        )
+        test.assertIsNone(record["row_check_by_dof"])
+        records.append(record)
+    return records
+
+
 def ring_carries_friction(records, first):
     """Whether contact ``first``'s patch ring, walked through ``contact_rows`` parents, holds friction."""
     contact = first
@@ -899,7 +943,11 @@ class TestCompactContact(unittest.TestCase):
         self.assertFalse(solver._compact_contact_boundary)
 
     def test_cuda_actual_solver_step_reset_notify_and_graphs(self):
-        """Use the actual allocator, scheduler, RHS and eight-sweep solve with loaded contacts."""
+        """Use the actual allocator, scheduler, RHS and eight-sweep solve with loaded contacts.
+
+        Point friction runs the triple schedule; each arm's route record names exactly the row
+        builders its first step launches.
+        """
         devices = wp.get_cuda_devices()
         if not devices:
             self.skipTest("Actual sparse constructor and parallel-stream capture require CUDA")
@@ -932,6 +980,9 @@ class TestCompactContact(unittest.TestCase):
             self.assertIsNone(solvers[1]._compact_contact_order)
             self.assertIsNotNone(solvers[2]._compact_contact_order)
             self.assertLessEqual(solvers[1]._dense_internal_max_rows, 12)
+            for solver in solvers:
+                self.assertTrue(solver._sparse_diagonal_contact_triples)
+            records = check_compact_records(self, solvers, "point")
             states = [[model.state(), model.state()] for _ in solvers]
             controls = [model.control() for _ in solvers]
             contacts = [newton.Contacts(model.rigid_contact_max, 0, device=device) for _ in solvers]
@@ -963,7 +1014,10 @@ class TestCompactContact(unittest.TestCase):
                     current, following = states[index]
                     if step == 2:
                         solver.reset(current, wp.array([True, False], dtype=bool, device=device))
-                    solver.step(current, following, controls[index], contacts[index], 1 / 240)
+                    with launched_kernels() as keys:
+                        solver.step(current, following, controls[index], contacts[index], 1 / 240)
+                    if step == 0:
+                        assert_row_builders_named(self, records[index], keys)
                     states[index] = [following, current]
                 compare()
             graphs = []
@@ -1010,40 +1064,12 @@ class TestCompactContact(unittest.TestCase):
                             mf_max_constraints=64,
                         )
                     )
-            records = []
             for solver, enabled in zip(solvers, (False, True, True), strict=True):
                 self.assertTrue(solver._friction_anchors_enabled)
                 self.assertTrue(solver._sparse_diagonal_contact_units)
                 self.assertEqual(solver._compact_contact_boundary, enabled)
-                record = solver.get_path_selection()["routes"]["contact_rows"]
-                self.assertEqual(record["producer"], "compact_contact_boundary" if enabled else "sparse_diagonal")
-                records.append(record)
             self.assertIsNotNone(solvers[2]._compact_contact_order)
-            # The builders of the diagonal-mass size (108) and the dense six, with the patch row law; the
-            # marker encodes the schedule links into the sparse rows.
-            for solver, record, produce in zip(
-                solvers,
-                records,
-                (None, ["produce_patch_contacts"], ["_build_contact_order", "_produce_ordered_patch_contacts"]),
-                strict=True,
-            ):
-                marker = solver._mark_independent_sparse_contact_candidates_kernel.key
-                if produce is None:
-                    metadata = "prepare_world_contact_rows"
-                    expected = {
-                        "108": ("sparse_diagonal", [metadata, "populate_sparse_diagonal_contact_response", marker]),
-                        "6": ("compact_jacobian", [metadata, "populate_world_J_for_compact_size"]),
-                    }
-                else:
-                    expected = {
-                        "108": ("compact_contact_boundary", [*produce, marker]),
-                        "6": ("compact_contact_boundary", ["clear_contact_response", *produce]),
-                    }
-                self.assertEqual(record["law"], "patch")
-                self.assertEqual(
-                    {size: (entry["method"], entry["kernels"]) for size, entry in record["builder_by_dof"].items()},
-                    expected,
-                )
+            records = check_compact_records(self, solvers, "patch")
             states = [[model.state(), model.state()] for _ in solvers]
             controls = [model.control() for _ in solvers]
             contacts = [newton.Contacts(model.rigid_contact_max, 0, device=device) for _ in solvers]

@@ -35,7 +35,12 @@ from newton._src.solvers.feather_pgs.kernels import (
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import assert_loaded_anchors, assert_ring_coulomb, standing_model
-from newton.tests.feather_pgs_row_builders import install_cpu_keyed_rows
+from newton.tests.feather_pgs_row_builders import (
+    ROW_SWITCHES_OFF,
+    assert_row_builders_named,
+    install_cpu_keyed_rows,
+    launched_kernels,
+)
 
 _DOFS = 6
 _CAPACITY = 64
@@ -979,6 +984,43 @@ class TestPatchParallelRoutes(unittest.TestCase):
         self.assertEqual((over_incremental._ink_rows, over_incremental._incremental_rows), (32, 0))
         tiers = over_incremental.get_path_selection()["routes"]["sweep"]["tiers"]
         self.assertEqual((tiers["family"], tiers["linked_rows"]), ("parallel", True))
+
+    def test_keyed_rows_record_names_the_launched_builders(self):
+        """Name in the route record the keyed-row builders one step launches, under both laws.
+
+        The in-kernel parallel sweep (FEATHER_PGS_INK=1) admits keyed rows on CUDA, for patch friction
+        under FEATHER_PGS_PATCH_PARALLEL_ROWS=1. The keyed parallel tiers build the direct rows in the
+        sweep, which every entry points to; the scatter and the fallback are the row builders a step
+        launches outside it.
+        """
+        model = standing_model()
+        with patch.object(source, "_INK_ON", True), patch.dict(os.environ, {_SWITCH: "1"}):
+            os.environ.pop("FEATHER_PGS_KEYED_ROWS", None)
+            for law, beta in (("point", 0.0), ("patch", 0.2)):
+                with self.subTest(law=law), patch.multiple(source, **ROW_SWITCHES_OFF):
+                    solver = _matrix_free_solver(model, beta=beta, parallel_rows=32, enable_joint_limits=True)
+                    routes = solver.get_path_selection()["routes"]
+                    record = routes["contact_rows"]
+                    self.assertTrue(record["keyed_rows"]["enabled"], record["keyed_rows"]["reason"])
+                    self.assertEqual(routes["sweep"]["tiers"]["family"], "keyed_parallel")
+                    self.assertEqual((record["producer"], record["law"]), ("keyed_rows", law))
+                    layout = solver._keyed_rows.layout
+                    scatter, fallback = (
+                        ("scatter_contact_keys", keyed_rows.get_fallback_kernel(layout))
+                        if law == "point"
+                        else ("scatter_patch_contact_keys", keyed_rows.get_patch_fallback_kernel(layout))
+                    )
+                    builder = {
+                        "method": "keyed_rows",
+                        "kernels": [scatter, fallback.key],
+                        "law": law,
+                        "direct_rows": "routes.sweep.tiers",
+                    }
+                    self.assertEqual(record["builder_by_dof"], dict.fromkeys(record["builder_by_dof"], builder))
+                    self.assertIsNone(record["row_check_by_dof"])
+                    with launched_kernels() as keys:
+                        _rollout(model, solver, 1)
+                    assert_row_builders_named(self, record, keys)
 
     def test_in_sweep_world_rows_stay_point_only(self):
         """Own no in-sweep world rows under patch friction with INK and WORLD_ROWS and keyed rows declined."""

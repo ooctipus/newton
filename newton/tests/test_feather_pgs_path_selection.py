@@ -1386,8 +1386,10 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
 
         Native sparse factors (with the free-body size FEATHER_PGS_PATCH_DENSE_PATHS=0 returns to
         them), the compact Jacobian and combined masked rows on the dense route. The compact contact
-        boundary, the sparse-diagonal owner and local row packets are checked in their own modules,
-        and keyed rows on CPU stand-ins (test_cpu_record_names_every_launched_row_builder).
+        boundary and the sparse-diagonal owner (both laws), local row packets and keyed rows (both
+        laws) are checked in their own modules, keyed rows also on CPU stand-ins
+        (test_cpu_record_names_every_launched_row_builder), and every producer's plan-to-record
+        mapping on host stand-ins (test_host_record_maps_every_producer_plan).
         """
         tripod, arm, small = _build_model(), _branched_arm_and_box(), _resting_arms_and_box(1, device="cuda:0")
         cases = (
