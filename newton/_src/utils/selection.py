@@ -1974,6 +1974,17 @@ class ArticulationView:
                 )
             return articulation_mask
 
+    def _get_evaluation_mask(self, mask: wp.array[bool] | wp.array2d[bool] | None) -> wp.array[bool] | None:
+        """Return the Model articulation mask for an evaluation, or ``None`` if it selects every articulation.
+
+        A view of every Model articulation selects them all by default, and the
+        unmasked evaluation then gives the same values while clearing whole
+        buffers with one memset instead of a kernel over every block.
+        """
+        if mask is None and self.count == self.model.articulation_count:
+            return None
+        return self.get_model_articulation_mask(mask=mask)
+
     def eval_fk(
         self,
         target: Model | State,
@@ -2012,7 +2023,7 @@ class ArticulationView:
         Returns:
             The Jacobian array J, or None if the model has no articulations.
         """
-        articulation_mask = self.get_model_articulation_mask(mask=mask)
+        articulation_mask = self._get_evaluation_mask(mask)
         return eval_jacobian(self.model, state, J, joint_S_s=joint_S_s, mask=articulation_mask)
 
     def eval_mass_matrix(self, state: State, H=None, J=None, body_I_s=None, joint_S_s=None, mask=None):
@@ -2037,7 +2048,7 @@ class ArticulationView:
         Returns:
             The mass matrix array H, or None if the model has no articulations.
         """
-        articulation_mask = self.get_model_articulation_mask(mask=mask)
+        articulation_mask = self._get_evaluation_mask(mask)
         return eval_mass_matrix(
             self.model, state, H, J=J, body_I_s=body_I_s, joint_S_s=joint_S_s, mask=articulation_mask
         )

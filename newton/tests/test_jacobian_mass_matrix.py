@@ -846,6 +846,39 @@ def test_articulation_view_jacobian_writes_only_view_blocks(test, device):
             np.testing.assert_array_equal(J_np[~selected], np.full_like(J_ref[~selected], _SENTINEL))
 
 
+def test_articulation_view_of_every_articulation_clears_whole_buffers(test, device):
+    """Evaluate a view of every articulation like the unmasked functions, whole-buffer clears included.
+
+    Without a mask such a view selects everything, so the unmasked paths give the same
+    values and clear the caller's Jacobian and the internal one with a memset each. A
+    mask still restricts the selection.
+    """
+    model, state = _build_mixed_articulations(device)
+    view = newton.selection.ArticulationView(model, "*", verbose=False)
+    test.assertEqual(view.count, model.articulation_count)
+    J_ref = newton.eval_jacobian(model, state).numpy()
+    H_ref = newton.eval_mass_matrix(model, state).numpy()
+    J = _filled(J_ref.shape, _SENTINEL, device)
+
+    patches, cleared = _record_clears()
+    with patches[0], patches[1]:
+        test.assertIs(view.eval_jacobian(state, J), J)
+        H = view.eval_mass_matrix(state)
+
+    jacobian_clears = [ptr for ptr, shape, _dtype in cleared if shape == J_ref.shape]
+    test.assertEqual(len(jacobian_clears), 2)
+    test.assertIn(J.ptr, jacobian_clears)
+    np.testing.assert_array_equal(J.numpy(), J_ref)
+    np.testing.assert_array_equal(H.numpy(), H_ref)
+
+    J = _filled(J_ref.shape, _SENTINEL, device)
+    view.eval_jacobian(state, J, mask=wp.array([False, True, False], dtype=bool, device=device))
+    selected = model.articulation_world.numpy() == 1
+    J_np = J.numpy()
+    np.testing.assert_array_equal(J_np[selected], J_ref[selected])
+    np.testing.assert_array_equal(J_np[~selected], np.full_like(J_ref[~selected], _SENTINEL))
+
+
 def test_mass_matrix_mask_zeroes_unselected_articulations(test, device):
     """Return exact selected blocks and zeros elsewhere from a masked eval_mass_matrix.
 
@@ -1619,6 +1652,12 @@ add_function_test(
     TestJacobianMassMatrix,
     "test_articulation_view_jacobian_writes_only_view_blocks",
     test_articulation_view_jacobian_writes_only_view_blocks,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_articulation_view_of_every_articulation_clears_whole_buffers",
+    test_articulation_view_of_every_articulation_clears_whole_buffers,
     devices=devices,
 )
 add_function_test(
