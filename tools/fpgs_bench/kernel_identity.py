@@ -16,6 +16,10 @@ kernel names. A refactor is then exact:
 * by generated code when hashes changed but no code digest did, as when only
   the Python text of a kernel changed (formatting, comments, its position).
 
+A kernel recorded without a requested code digest (``--hash-only``) is identical
+only by an unchanged hash; with a changed hash the diff reports it as not
+compared and fails.
+
 Warp's generated code also depends on the process that generates it: user
 functions are numbered by how many functions of their name the process created
 before, a function emits its adjoint once any earlier build used it backward,
@@ -455,13 +459,24 @@ def record(path, *, root=None, families=FAMILIES, select=(), codegen=True, allow
 
 
 def compare(parent, child, columns=COLUMNS):
-    """Split two records into changed kernels (with their changed columns), added and removed ones."""
+    """Split two records into changed and uncompared kernels, added and removed ones, and changed rejections.
+
+    A shared kernel is compared on every requested column both rows carry. A
+    requested column that either row lacks (a ``--hash-only`` row has no code
+    digests) leaves the kernel uncompared, unless both rows carry the same
+    content hash: the hash covers every input of code generation, so an
+    unchanged hash also proves the generated code unchanged.
+    """
     old, new = parent["kernels"], child["kernels"]
-    changed = {}
+    changed, uncompared = {}, {}
     for key in sorted(old.keys() & new.keys()):
-        differ = [c for c in columns if c in old[key] and c in new[key] and old[key][c] != new[key][c]]
+        before, after = old[key], new[key]
+        differ = [c for c in columns if c in before and c in after and before[c] != after[c]]
         if differ:
             changed[key] = differ
+        absent = [c for c in columns if c not in before or c not in after]
+        if absent and not ("hash" in before and "hash" in after and before["hash"] == after["hash"]):
+            uncompared[key] = absent
     rejections = sorted(
         key
         for key in parent.get("rejected", {}).keys() | child.get("rejected", {}).keys()
@@ -469,6 +484,7 @@ def compare(parent, child, columns=COLUMNS):
     )
     return {
         "changed": changed,
+        "uncompared": uncompared,
         "added": sorted(new.keys() - old.keys()),
         "removed": sorted(old.keys() - new.keys()),
         "rejections": rejections,
@@ -476,13 +492,19 @@ def compare(parent, child, columns=COLUMNS):
 
 
 def report(parent, child, columns=COLUMNS):
-    """Print the comparison; return 1 when a shared kernel changed or a kernel disappeared, else 0."""
+    """Print the comparison; return 1 when a shared kernel changed or went uncompared, or a kernel disappeared."""
     for field in ("warp", "hash_seed", "switches", "families", "select", "codegen"):
         if parent.get(field) != child.get(field):
             print(f"warning: the records differ in {field}: {parent.get(field)!r} against {child.get(field)!r}")
     result = compare(parent, child, columns)
     shared = len(parent["kernels"].keys() & child["kernels"].keys())
-    print(f"{shared} shared kernels compared on {', '.join(columns)}: {len(result['changed'])} changed")
+    uncompared = {key: absent for key, absent in result["uncompared"].items() if key not in result["changed"]}
+    print(
+        f"{shared} shared kernels compared on {', '.join(columns)}: "
+        f"{len(result['changed'])} changed, {len(uncompared)} not compared"
+    )
+    for key, absent in uncompared.items():
+        print(f"  not compared (no {', '.join(absent)} on both sides, and the hash changed or is missing): {key}")
     for key, differ in result["changed"].items():
         compared = [
             c for c in ("cuda", "cpu") if c in columns and c in parent["kernels"][key] and c in child["kernels"][key]
@@ -498,7 +520,7 @@ def report(parent, child, columns=COLUMNS):
         print(f"{len(result[field])} {field}")
         for key in result[field]:
             print(f"  {item}: {key}")
-    return int(bool(result["changed"] or result["removed"] or result["rejections"]))
+    return int(bool(result["changed"] or uncompared or result["removed"] or result["rejections"]))
 
 
 def main(argv=None):

@@ -89,6 +89,22 @@ class TestKernelIdentity(unittest.TestCase):
         self.assertIn("changed (hash changed, generated code not compared): a", output.getvalue())
         self.assertNotIn("generated code identical", output.getvalue())
 
+    def test_code_diff_fails_kernels_without_code_digests(self):
+        """Fail a generated-code diff of a changed hash that no code digest covers; pass an unchanged hash."""
+        full = _record(a=("1", "c", "p"), b=("2", "c", "p"))
+        hash_only = {"kernels": {"a": {"hash": "1"}, "b": {"hash": "3"}}}
+        for parent, child in ((hash_only, {"kernels": {"a": {"hash": "1"}, "b": {"hash": "4"}}}), (full, hash_only)):
+            with self.subTest(parent=parent), contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(identity.report(parent, child, ("cuda", "cpu")), 1)
+                self.assertEqual(identity.compare(parent, child, ("cuda", "cpu"))["uncompared"], {"b": ["cuda", "cpu"]})
+            self.assertIn("1 not compared", output.getvalue())
+            self.assertIn(
+                "not compared (no cuda, cpu on both sides, and the hash changed or is missing): b", output.getvalue()
+            )
+        # The content hash covers every input of code generation.
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(identity.report(hash_only, hash_only, ("cuda", "cpu")), 0)
+
     def test_label_names_calls_like_the_pins(self):
         """Label calls with positional values, sorted keywords and named layouts."""
         layout = identity.Named("chain9", object())
