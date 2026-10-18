@@ -239,6 +239,19 @@ _LINKED_LAYOUTS = {
     # Four lightly loaded normals hold two sliding anchors, so the fused radius rounds
     # as the ring order sums it.
     "loaded_ring": ((0, True, -0.04), (0, False, -0.07), (0, False, -0.03), (0, True, -0.05)),
+    # Patch regions have no member limit. Only the sixth member is violated: selecting the
+    # pair, and the full sweep's fused radius, need the whole ring.
+    "long_ring": ((0, True, 0.6), (0, False, 0.6), (0, False, 0.6), (0, False, 0.6), (0, False, 0.6), (0, False, -0.3)),
+    # Six lightly loaded normals hold anchors at the first and fourth members, so the
+    # active scan fuses both pairs with radii pooled over the whole ring.
+    "long_loaded_ring": (
+        (0, True, -0.04),
+        (0, False, -0.07),
+        (0, False, -0.03),
+        (0, True, -0.05),
+        (0, False, -0.06),
+        (0, False, -0.02),
+    ),
     "mixed_units": (
         (0, True, -0.2),
         (1, False, -0.1),
@@ -617,13 +630,15 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
     def test_linked_triplets_equal_linked_sweeps_bitwise_cuda(self):
         """Match the same linked sweep without triplets bitwise, and the ring-pooled physical reference.
 
-        Self-loops, two- and three-member rings, a four-member ring loaded only through
-        its last member, a four-member loaded ring whose sliding anchors' radii round
-        by the ring order, interleaved one- and three-row units and an unlinked
-        anchor, with and without a 30-row lead that moves records and rings across
-        32-row words; zero and seeded impulses, delayed friction and relaxation, in
-        the linked active scan and in the full sweep. A relative change tolerance ends
-        sweeps early on the same decisions: the normal bounds its change by its new
+        Self-loops, two- and three-member rings, four- and six-member rings loaded only
+        through their last member, a four-member loaded ring whose sliding anchors' radii
+        round by the ring order, a six-member loaded ring whose anchors the active scan
+        fuses, interleaved one- and three-row units and an unlinked anchor, with and
+        without a 30-row lead that moves records and rings across 32-row words; zero and
+        seeded impulses, delayed friction and relaxation, in the linked active scan and in
+        the full sweep. The six-member rings catch a fused radius, in either sweep, or a
+        pair selection that stops after up to five members. A relative change tolerance
+        ends sweeps early on the same decisions: the normal bounds its change by its new
         impulse and the pair by its new first tangent, as their ordinary updates do.
         """
         settings = (
