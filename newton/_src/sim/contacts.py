@@ -124,15 +124,20 @@ def contact_capacity_blocks(device: wp.Device) -> int:
 
     Warp kernels loop grid-stride, so one resident wave of 256-thread blocks
     still visits every slot, while a mostly empty buffer no longer schedules a
-    block per 256 slots.
+    block per 256 slots. A lean kernel, compiled without the grid-stride loop,
+    cannot take a block cap.
 
     Args:
         device: The launch device.
 
     Returns:
-        The ``max_blocks`` of :func:`warp.launch`: one wave on CUDA, 0 (uncapped) on CPU.
+        The ``max_blocks`` of :func:`warp.launch`: one wave on CUDA; 0 (uncapped) on CPU and
+        while ``warp.config.default_grid_stride`` is off, under which Warp compiles the
+        consumers lean. Callers read it at construction.
     """
-    return CAPACITY_BLOCKS_PER_SM * int(device.sm_count) if device.is_cuda else 0
+    if not device.is_cuda or not getattr(wp.config, "default_grid_stride", True):
+        return 0
+    return CAPACITY_BLOCKS_PER_SM * int(device.sm_count)
 
 
 class _ContactsGraphLease:

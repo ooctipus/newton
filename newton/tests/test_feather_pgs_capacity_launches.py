@@ -4,6 +4,7 @@
 """Launch the solver's contact-capacity consumers over one resident wave of blocks."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -243,6 +244,18 @@ class TestFeatherPGSCapacityLaunches(unittest.TestCase):
                 expected = CAPACITY_BLOCKS_PER_SM * device.sm_count if device.is_cuda else 0
                 self.assertEqual(contact_capacity_blocks(device), expected)
         self.assertEqual(CAPACITY_BLOCKS_PER_SM, 8)
+
+    def test_lean_kernels_keep_the_full_grid(self):
+        """Leave capacity launches uncapped while Warp compiles kernels without the grid-stride loop.
+
+        A lean kernel raises on ``max_blocks > 0``, so with ``wp.config.default_grid_stride`` off the
+        block count every consumer reads at construction is 0, the full grid, on CUDA as on CPU.
+        """
+        device = SimpleNamespace(is_cuda=True, sm_count=188)
+        self.assertEqual(contact_capacity_blocks(device), CAPACITY_BLOCKS_PER_SM * 188)
+        with patch.object(wp.config, "default_grid_stride", False):
+            self.assertEqual(contact_capacity_blocks(device), 0)
+            self.assertEqual(contact_capacity_blocks(wp.get_device("cpu")), 0)
 
 
 if __name__ == "__main__":
