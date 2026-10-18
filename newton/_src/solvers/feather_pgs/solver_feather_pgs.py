@@ -7706,6 +7706,7 @@ class SolverFeatherPGS(SolverBase):
                         )
                         shadow._fpgs_tier = tier_index
                         self._pgs_solve_mf_gs_incremental_kernels[-1]._fpgs_shadow = shadow
+                self._allocate_tier_placeholders()
             if incremental_rows > 0:
                 # Two tiers above 32 rows: the 32-row instance keeps its 4 KB response block and
                 # occupancy; the wider instance (two rows per lane) takes worlds with 33..N rows.
@@ -15867,13 +15868,40 @@ class SolverFeatherPGS(SolverBase):
         self._ink_dummy3 = wp.zeros((1, 1, 1), dtype=wp.float32, device=self.model.device)
         return (sizes[0], nb, offsets[0], offsets[1])
 
+    def _allocate_tier_placeholders(self) -> None:
+        """Allocate the inputs the parallel tiers take in place of a feature they were built without.
+
+        No tier writes them. Allocated at the tiers' first launch, which is often inside the
+        capture of the first step, each ``wp.zeros`` would become a memset node that every replay
+        runs again. The in-kernel warm start's contact table (``FEATHER_PGS_WR_WARM`` with
+        world rows) is tier state, not a placeholder, and keeps its allocation at first use.
+        """
+        dev = self.model.device
+        if self._ink_sizes is None:
+            self._ink_dummy3 = wp.zeros((1, 1, 1), dtype=wp.float32, device=dev)
+            self._ink_meta = wp.zeros((4,), dtype=wp.int32, device=dev)
+        self._wr_dummies = {
+            "i": wp.zeros(1, dtype=wp.int32, device=dev),
+            "i2": wp.zeros((1, 1), dtype=wp.int32, device=dev),
+            "f": wp.zeros(1, dtype=wp.float32, device=dev),
+            "v3": wp.zeros(1, dtype=wp.vec3, device=dev),
+            "tf": wp.zeros(1, dtype=wp.transform, device=dev),
+            "sv": wp.zeros(1, dtype=wp.spatial_vector, device=dev),
+            "u": wp.zeros(1, dtype=wp.uint32, device=dev),
+        }
+        if not (_WR_WARM and getattr(self, "_wr_world_contacts", None) is not None):
+            self._ww_table = {
+                "count": wp.zeros(1, dtype=wp.int32, device=dev),
+                "s0": wp.zeros((1, 1), dtype=wp.int32, device=dev),
+                "s1": wp.zeros((1, 1), dtype=wp.int32, device=dev),
+                "p": wp.zeros((1, 1), dtype=wp.vec3, device=dev),
+                "lam": wp.zeros((1, 1), dtype=wp.vec3, device=dev),
+            }
+
     def _inkernel_response_inputs(self) -> list:
         sizes = getattr(self, "_ink_sizes", None)
         if sizes is None:
-            d = getattr(self, "_ink_dummy3", None)
-            if d is None:
-                d = self._ink_dummy3 = wp.zeros((1, 1, 1), dtype=wp.float32, device=self.model.device)
-                self._ink_meta = wp.zeros((4,), dtype=wp.int32, device=self.model.device)
+            d = self._ink_dummy3
             return [self._ink_meta, d, d, d, d, self.row_cfm]
         na, nb = sizes[0], sizes[1]
         L_b = self.L_by_size[nb] if nb else self._ink_dummy3
@@ -15881,19 +15909,8 @@ class SolverFeatherPGS(SolverBase):
         return [self._ink_meta, self.L_by_size[na], L_b, self.J_by_size[na], J_b, self.row_cfm]
 
     def _world_rows_inputs(self) -> list:
-        """Inputs of the in-kernel contact row build (typed dummies when the kernel was built without it)."""
-        dev = self.model.device
-        dm = getattr(self, "_wr_dummies", None)
-        if dm is None:
-            dm = self._wr_dummies = {
-                "i": wp.zeros(1, dtype=wp.int32, device=dev),
-                "i2": wp.zeros((1, 1), dtype=wp.int32, device=dev),
-                "f": wp.zeros(1, dtype=wp.float32, device=dev),
-                "v3": wp.zeros(1, dtype=wp.vec3, device=dev),
-                "tf": wp.zeros(1, dtype=wp.transform, device=dev),
-                "sv": wp.zeros(1, dtype=wp.spatial_vector, device=dev),
-                "u": wp.zeros(1, dtype=wp.uint32, device=dev),
-            }
+        """Inputs of the in-kernel contact row build (typed placeholders when the kernel was built without it)."""
+        dm = self._wr_dummies
         ctx = getattr(self, "_wr_ctx", None)
         if getattr(self, "_wr_world_contacts", None) is None or ctx is None:
             return [
@@ -15982,26 +15999,17 @@ class SolverFeatherPGS(SolverBase):
         ]
 
     def _warm_table_inputs(self) -> list:
-        dev = self.model.device
         tb = getattr(self, "_ww_table", None)
         if tb is None:
-            if _WR_WARM and getattr(self, "_wr_world_contacts", None) is not None:
-                W, C = self.world_count, 64
-                tb = self._ww_table = {
-                    "count": wp.zeros(W, dtype=wp.int32, device=dev),
-                    "s0": wp.zeros((W, C), dtype=wp.int32, device=dev),
-                    "s1": wp.zeros((W, C), dtype=wp.int32, device=dev),
-                    "p": wp.zeros((W, C), dtype=wp.vec3, device=dev),
-                    "lam": wp.zeros((W, C), dtype=wp.vec3, device=dev),
-                }
-            else:
-                tb = self._ww_table = {
-                    "count": wp.zeros(1, dtype=wp.int32, device=dev),
-                    "s0": wp.zeros((1, 1), dtype=wp.int32, device=dev),
-                    "s1": wp.zeros((1, 1), dtype=wp.int32, device=dev),
-                    "p": wp.zeros((1, 1), dtype=wp.vec3, device=dev),
-                    "lam": wp.zeros((1, 1), dtype=wp.vec3, device=dev),
-                }
+            # Only the in-kernel warm start's table is left to its first use (_allocate_tier_placeholders).
+            dev, W, C = self.model.device, self.world_count, 64
+            tb = self._ww_table = {
+                "count": wp.zeros(W, dtype=wp.int32, device=dev),
+                "s0": wp.zeros((W, C), dtype=wp.int32, device=dev),
+                "s1": wp.zeros((W, C), dtype=wp.int32, device=dev),
+                "p": wp.zeros((W, C), dtype=wp.vec3, device=dev),
+                "lam": wp.zeros((W, C), dtype=wp.vec3, device=dev),
+            }
         return [tb["count"], tb["s0"], tb["s1"], tb["p"], tb["lam"], float(getattr(self, "pgs_warmstart_decay", 1.0))]
 
     def _use_grouped_hinv_jt(self, size: int) -> bool:

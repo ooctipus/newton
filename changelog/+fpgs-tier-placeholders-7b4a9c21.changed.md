@@ -1,0 +1,1 @@
+Allocate the placeholder inputs of `SolverFeatherPGS`'s parallel matrix-free tiers (`mf_gs_parallel_rows`) with the tiers at construction instead of at their first launch, which is often inside the capture of the first step and so added a memset node to every replay of the captured graph.
