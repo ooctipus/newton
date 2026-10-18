@@ -689,10 +689,10 @@ def _friction(solver) -> dict:
     if patch:
         parallel = "" if solver._parallel_contact_paths else "keyed rows, parallel matrix-free tiers and "
         # FEATHER_PGS_PATCH_ACTIVE_ROWS=0 keeps patch friction off the sparse active-row scan.
-        sparse = "" if solver._patch_active_rows else ", sparse active rows"
+        sparse = "sparse triplets" if solver._patch_active_rows else "sparse active rows and triplets"
         reason += (
-            f" Point-contact owners ({parallel}response blocks, the resolved-world classifier, multiblock"
-            f" sweeps{sparse}) need point friction."
+            f" Point-contact owners ({parallel}response blocks, the resolved-world classifier, multiblock sweeps,"
+            f" {sparse}) need point friction."
         )
     return {
         "law": "patch" if patch else "point",
