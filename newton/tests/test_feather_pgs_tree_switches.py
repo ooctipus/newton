@@ -24,7 +24,6 @@ _LAYOUT = TreeLayout(4, 3, 6, 3, 2, 0, (2, 1, 0), lanes=8)
 _GENERATION_MODULES = (
     "cached_force.py",
     "cached_state.py",
-    "cached_state_forest.py",
     "response_operator.py",
     "tree_chain_scan.py",
     "tree_kinetic_layout.py",
