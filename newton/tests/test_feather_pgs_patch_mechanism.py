@@ -47,9 +47,17 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import friction_patches
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
-from newton._src.solvers.feather_pgs.friction_patches import _FrictionPatchState, _PatchFrame, patch_routes
+from newton._src.solvers.feather_pgs.friction_patches import (
+    FrictionPatches,
+    _FrictionPatchState,
+    _PatchFrame,
+    link_patch_routes,
+    link_patch_rows,
+    patch_routes,
+)
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_reference import SENTINEL, ReferencePatches, pair_codes
+from newton.tests.feather_pgs_patch_reference import link_patch_rows as reference_link_patch_rows
 from newton.tests.test_feather_pgs_mixed_tree_free_body import _build as _arm_over_box
 
 _PIECE_OFFSET = 0.04
@@ -1468,6 +1476,142 @@ class TestPatchLaunchShapes(unittest.TestCase):
             _Scene(device, 0).model, capacity, True, wp.zeros(capacity, dtype=wp.vec2, device=device)
         )
         self.assertEqual({name: getattr(state, name) for name in default}, default)
+
+
+def _ring_case(device, seed, *, contacts=600, worlds=3):
+    """Return random patch rings, their contact maps and route rows for one link.
+
+    Most rings hold one contact: anchors with three slots, carry-only contacts
+    (zero weight), anchors with a normal row only, and contacts without rows.
+    The others hold two to five members, some of which sit on another route or
+    world than their ring or have no rows. The last contacts belong to no ring.
+    Returns the patch view, the live count, the contact maps, numpy parents and
+    friction budgets per route, and the counts of one-contact rings with rows.
+    """
+    rng = np.random.default_rng(seed)
+    live = contacts - 24
+    order = rng.permutation(live)
+    sizes = []
+    while sum(sizes) < live:
+        sizes.append(int(rng.choice([1, 1, 1, 1, 1, 2, 3, 5])))
+    sizes[-1] -= sum(sizes) - live
+    next_contact = np.full(contacts, -1, dtype=np.int32)
+    weight = np.zeros(contacts, dtype=np.float32)
+    world = rng.integers(0, worlds, size=contacts)
+    path = rng.integers(0, 3, size=contacts)
+    start = 0
+    for size in sizes:
+        ring = order[start : start + size]
+        start += size
+        next_contact[ring] = np.roll(ring, -1)
+        anchors = min(size, int(rng.integers(0, 3)))
+        weight[ring[:anchors]] = 1.0 / max(anchors, 1)
+        world[ring] = rng.integers(0, worlds)
+        path[ring] = rng.integers(0, 3)
+        stray = ring[rng.random(size) < 0.1]
+        world[stray] = rng.integers(0, worlds, size=len(stray))
+        path[stray] = rng.integers(0, 3, size=len(stray))
+    needed = np.where((weight > 0.0) & (rng.random(contacts) < 0.8), 3, 1)
+    rows = 3 * contacts + 8
+    slot = np.full(contacts, -1, dtype=np.int64)
+    counters = np.zeros((3, worlds), dtype=np.int64)
+    for c in range(contacts):
+        if rng.random() < 0.08:
+            continue  # A capacity rejection, or a route without rows.
+        slot[c] = counters[path[c], world[c]]
+        counters[path[c], world[c]] += needed[c]
+    parents = rng.integers(-1, rows, size=(3, worlds, rows)).astype(np.int32)
+    mu = rng.uniform(0.2, 1.0, size=(3, worlds, rows)).astype(np.float32)
+    view = FrictionPatches()
+    view.enabled = 1
+    view.weight = wp.array(weight, dtype=float, device=device)
+    view.next_contact = wp.array(next_contact, dtype=int, device=device)
+    view.point_a = wp.zeros(contacts, dtype=wp.vec3, device=device)
+    view.point_b = wp.zeros(contacts, dtype=wp.vec3, device=device)
+    view.phi = wp.zeros(contacts, dtype=wp.vec2, device=device)
+    maps = [wp.array(values.astype(np.int32), dtype=int, device=device) for values in (world, slot, path, needed)]
+    single = (next_contact == np.arange(contacts)) & (slot >= 0)
+    singles = {
+        "anchors with three slots": int(np.count_nonzero(single & (weight > 0.0) & (needed == 3))),
+        "carry-only contacts": int(np.count_nonzero(single & (weight == 0.0))),
+        "anchors with one slot": int(np.count_nonzero(single & (weight > 0.0) & (needed == 1))),
+    }
+    return view, live, maps, (parents, mu), singles
+
+
+def run_ring_links(test, device, seed):
+    """Link random rings with the patch link and with the reference's per-route kernel; require equal rows.
+
+    ``link_patch_routes`` (all routes in one launch, one thread per contact or
+    seven striding threads) and ``link_patch_rows`` (one launch per route) must
+    write the reference's parents and divided friction budgets bitwise.
+    """
+    view, live, maps, (parents, mu), singles = _ring_case(device, seed)
+    for name, count in singles.items():
+        test.assertGreater(count, 0, f"one-contact rings: {name}")
+    contacts = view.weight.shape[0]
+    count = wp.array([live], dtype=int, device=device)
+
+    def rows():
+        return [
+            (
+                route,
+                wp.array(parents[route], dtype=int, device=device),
+                wp.array(mu[route], dtype=float, device=device),
+                wp.zeros(mu[route].shape, dtype=float, device=device),
+                0.0,
+            )
+            for route in range(3)
+        ]
+
+    def assert_rows(mine, context):
+        for (route, *arrays), (_, *reference) in zip(mine, expected, strict=True):
+            for name, array, desired in zip(("parents", "mu"), arrays[:2], reference[:2], strict=True):
+                np.testing.assert_array_equal(
+                    array.numpy(), desired.numpy(), f"seed {seed} {context} route {route} {name}"
+                )
+
+    expected = rows()
+    for route, route_parents, route_mu, _, _ in expected:
+        wp.launch(
+            reference_link_patch_rows,
+            dim=contacts,
+            inputs=[count, view, *maps, route, route_parents, route_mu],
+            device=device,
+        )
+    for threads in (contacts, 7):
+        joint = rows()
+        wp.launch(
+            link_patch_routes,
+            dim=threads,
+            inputs=[wp.array([live, live], dtype=int, device=device), view, *maps, patch_routes(joint), threads],
+            device=device,
+        )
+        assert_rows(joint, f"link_patch_routes on {threads} threads")
+    per_route = rows()
+    for route, route_parents, route_mu, _, _ in per_route:
+        wp.launch(
+            link_patch_rows,
+            dim=contacts,
+            inputs=[count, view, *maps, route, route_parents, route_mu],
+            device=device,
+        )
+    assert_rows(per_route, "link_patch_rows")
+
+
+class TestPatchRingLinks(unittest.TestCase):
+    def test_links_match_the_reference_on_random_rings(self):
+        """Link one-contact and longer rings on every route as the reference does, bitwise."""
+        for seed in range(3):
+            with self.subTest(seed=seed):
+                run_ring_links(self, "cpu", seed)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "the device link needs CUDA")
+    def test_links_match_the_reference_on_the_device(self):
+        """Link one-contact and longer rings on every route as the reference does on the device, bitwise."""
+        for seed in range(3):
+            with self.subTest(seed=seed):
+                run_ring_links(self, "cuda:0", 10 + seed)
 
 
 def _bare_solver(**attributes):

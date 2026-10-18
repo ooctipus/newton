@@ -1784,6 +1784,11 @@ def _link_contact(
     row = patches.next_contact[c]
     if row < 0:
         return
+    if row == c:
+        # A one-contact region's normal row closes its own ring, and its budget
+        # stays whole: the general path divides it by one anchor or not at all.
+        parents[world[c], slot[c]] = slot[c]
+        return
     next_slot = slot[c]
     anchors = int(patches.weight[c] > 0.0 and slots_needed[c] == 3)
     while row != c:
