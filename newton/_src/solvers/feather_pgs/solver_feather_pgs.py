@@ -60,7 +60,13 @@ from .contact_torsion import (
 )
 from .dense_row_state import get_dense_row_state_kernel
 from .friction import FRICTION_PAIR_CUDA
-from .friction_patches import PatchRowLaw, _FrictionPatchState, patch_routes
+from .friction_patches import (
+    _CHUNK_SORT_CAPACITY,
+    _LIVE_SORT_CAPACITY,
+    PatchRowLaw,
+    _FrictionPatchState,
+    patch_routes,
+)
 from .fused_dynamics import fused_dynamics_launch_shape, get_fused_dynamics_kernel, template_supported
 from .grouped_dynamics import (
     GroupedTopology,
@@ -6265,6 +6271,9 @@ class SolverFeatherPGS(SolverBase):
             wp.zeros(max_contacts, dtype=wp.vec2, device=device),
             reuse_frames=frame_reuse,
             conditional_nodes=conditional_nodes,
+            # Small frames sort their live slots only, so empty ones cost no sort; the
+            # opt-out keeps the radix sort of every frame, the previous path.
+            small_live_sort=frame_reuse,
         )
         self._ws_prev_contact_normal = (
             wp.zeros(max_contacts, dtype=wp.vec3, device=device) if self.pgs_warmstart else None
@@ -13360,11 +13369,15 @@ class SolverFeatherPGS(SolverBase):
         if not self._friction_anchors_enabled:
             return False, "Point friction sorts no patch pairs."
         if os.environ.get("FEATHER_PGS_PATCH_FRAME_REUSE", "1") == "0":
-            return False, "FEATHER_PGS_PATCH_FRAME_REUSE=0 sorts the patch pairs of every build."
+            return False, (
+                "FEATHER_PGS_PATCH_FRAME_REUSE=0 sorts the patch pairs of every build, over the whole capacity "
+                f"below {_LIVE_SORT_CAPACITY:,} contact slots."
+            )
         return True, (
             "A captured build keeps the sorted patch pairs of the previous build captured in the same graph over the "
             "same Contacts when the host noted no write of them in between (a collision pass, Contacts.clear() or a "
-            "coupled-solver filter); other builds sort."
+            f"coupled-solver filter); other builds sort, only their live slots up to {_CHUNK_SORT_CAPACITY:,} contact "
+            "slots."
         )
 
     def _patch_conditional_nodes(self, device, *, frame_reuse=False) -> tuple[bool, str]:

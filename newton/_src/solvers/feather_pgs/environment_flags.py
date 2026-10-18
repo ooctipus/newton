@@ -375,8 +375,8 @@ FLAGS = declare(
         "FEATHER_PGS_PATCH_FRAME_REUSE",
         "policy",
         _SOLVER,
-        "=0 sorts the patch pairs of every build instead of keeping them on captured builds that reuse the previous "
-        "captured build's contact frame (default on).",
+        "=0 sorts the patch pairs of every build, small frames over their whole capacity, instead of keeping them "
+        "on captured builds that reuse the previous captured build's contact frame (default on).",
     ),
     _flag(
         "FEATHER_PGS_PATCH_PARALLEL_ROWS",

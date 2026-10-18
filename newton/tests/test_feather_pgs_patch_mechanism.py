@@ -1238,9 +1238,12 @@ class TestPatchLiveSort(unittest.TestCase):
             with mock.patch.object(friction_patches, "_LIVE_SORT_CAPACITY", 96):
                 self.assertTrue(_FrictionPatchState(scene.model, 96, True, phi).live_sort)
                 self.assertFalse(_FrictionPatchState(scene.model, 95, True, phi[:95]).live_sort)
+        self.assertFalse(_FrictionPatchState(scene.model, 96, True, phi, small_live_sort=False).live_sort)
         self.assertEqual(friction_patches._CHUNK_SORT_CAPACITY, 16_384)
         self.assertTrue(friction_patches._uses_live_sort(16_384, 51))
+        self.assertFalse(friction_patches._uses_live_sort(16_384, 51, small=False))
         self.assertFalse(friction_patches._uses_live_sort(16_385, 51))
+        self.assertTrue(friction_patches._uses_live_sort(friction_patches._LIVE_SORT_CAPACITY, 51, small=False))
         self.assertTrue(friction_patches._uses_live_sort(friction_patches._LIVE_SORT_CAPACITY, 51))
         # Pair keys of 52 bits and more fall back to the radix sort: their 11-bit
         # slot would reach the chunk keys' pad bit.
@@ -3117,7 +3120,7 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
                         self.assertIn("previous build captured in the same graph", friction["frame_reuse"]["reason"])
 
     def test_frame_reuse_opt_out_records_the_route_before_frame_reuse(self):
-        """Record under FEATHER_PGS_PATCH_FRAME_REUSE=0 the conditional-node route of b7932853, besides frame_reuse.
+        """Take and record under FEATHER_PGS_PATCH_FRAME_REUSE=0 the sort and node route of b7932853.
 
         Both arms record the same routes apart from the frame_reuse field and the
         conditional-node reason, which with frame reuse names only the builds that
@@ -3127,7 +3130,11 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         routes = {}
         for reuse in (None, "0"):
             with _flags(reuse=reuse, nodes=None):
-                routes[reuse] = SolverFeatherPGS(_arm_over_box(wp.get_device("cpu"), worlds=2)).get_path_selection()
+                solver = SolverFeatherPGS(_arm_over_box(wp.get_device("cpu"), worlds=2))
+            routes[reuse] = solver.get_path_selection()
+            # Small frames sort their live slots only with frame reuse; the opt-out keeps the radix sort.
+            self.assertLessEqual(solver._friction_patches.capacity, friction_patches._CHUNK_SORT_CAPACITY)
+            self.assertEqual(solver._friction_patches.live_sort, reuse is None)
         self.assertEqual(routes["0"]["routes"]["friction"]["conditional_nodes"], _UNCONDITIONAL_NODES_RECORD)
         self.assertIn("do not keep their pairs", routes[None]["routes"]["friction"]["conditional_nodes"]["reason"])
         for selected in routes.values():

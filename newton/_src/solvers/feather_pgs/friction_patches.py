@@ -1393,14 +1393,15 @@ def _pair_key_layout(bodies, shapes):
     return stride, (stride * stride - 1).bit_length()
 
 
-def _uses_live_sort(capacity, key_bits):
+def _uses_live_sort(capacity, key_bits, *, small=True):
     """Whether the pair sort orders only the live slots instead of the whole capacity.
 
-    It does up to _CHUNK_SORT_CAPACITY and from _LIVE_SORT_CAPACITY on, unless a
-    chunk key, the pair key with an 11-bit slot appended, would reach the pad bit.
-    Both sorts leave the unique (key, slot) order.
+    It does from _LIVE_SORT_CAPACITY on, and with ``small`` up to
+    _CHUNK_SORT_CAPACITY, unless a chunk key, the pair key with an 11-bit slot
+    appended, would reach the pad bit. Both sorts leave the unique (key, slot)
+    order.
     """
-    sized = capacity <= _CHUNK_SORT_CAPACITY or capacity >= _LIVE_SORT_CAPACITY
+    sized = (small and capacity <= _CHUNK_SORT_CAPACITY) or capacity >= _LIVE_SORT_CAPACITY
     return sized and key_bits + _SORT_SLOT_BITS <= 62
 
 
@@ -1418,6 +1419,9 @@ class _FrictionPatchState:
     writer the host never saw leaves that build empty and latches
     ``frame_status``, so stale pairs never group contacts.
 
+    ``small_live_sort`` lets capacities up to ``_CHUNK_SORT_CAPACITY`` sort only
+    their live slots, as capacities from ``_LIVE_SORT_CAPACITY`` on do.
+
     With ``conditional_nodes``, captured builds that do not keep their pairs sort
     under a conditional node that skips empty frames and the recorded frame;
     eager builds then record the frames they sort for such a node. Contact frames
@@ -1427,7 +1431,9 @@ class _FrictionPatchState:
     is never reused (see :meth:`stream_token`). Eager builds always sort.
     """
 
-    def __init__(self, model, capacity, enabled, phi, *, reuse_frames=False, conditional_nodes=False):
+    def __init__(
+        self, model, capacity, enabled, phi, *, reuse_frames=False, conditional_nodes=False, small_live_sort=True
+    ):
         self.view = FrictionPatches()
         self.view.enabled = int(enabled)
         self.view.phi = phi
@@ -1480,7 +1486,7 @@ class _FrictionPatchState:
         self.build_threads = max(1, min(capacity, _BUILD_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
         self.build_block_dim = _BUILD_BLOCK_DIM
         self.merge_threads = max(1, min(capacity, _MERGE_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
-        self.live_sort = _uses_live_sort(capacity, self.key_bits)
+        self.live_sort = _uses_live_sort(capacity, self.key_bits, small=small_live_sort)
         self.sort_blocks = max(1, min(-(-capacity // _SORT_CHUNK), _SORT_BLOCKS_PER_SM * blocks))
         self.merges = 0
         while _SORT_CHUNK << self.merges < capacity:
