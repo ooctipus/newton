@@ -1,0 +1,1 @@
+Sort the patch-friction contact pairs of `SolverFeatherPGS` (`friction_anchor_beta > 0`) over the live contacts only when the solver holds at most 16,384 contact slots, as it already did from 2,000,000 slots on: a step without contacts no longer runs a radix sort over the whole capacity. The pair order, and so every result, is unchanged.

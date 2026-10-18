@@ -85,6 +85,11 @@ _MERGE_BLOCKS_PER_SM = 4
 # instead of the whole capacity. Provisional: calibrate against the full radix
 # sort on the GPU at large capacities and at high occupancy.
 _LIVE_SORT_CAPACITY = 2_000_000
+# Up to this contact capacity the pair sort orders only the live slots too: its
+# launches do no work without live contacts, where a radix sort still passes over
+# the whole capacity (52-55 us at 16,384 slots on the RTX PRO 6000). Provisional:
+# tune against the radix sort in a captured graph at partial occupancy.
+_CHUNK_SORT_CAPACITY = 16_384
 # The live sort orders chunks of _SORT_CHUNK slots in shared memory by
 # (key, slot) and then merges sorted runs pairwise.
 _SORT_CHUNK = wp.constant(2048)
@@ -1388,10 +1393,12 @@ def _pair_key_layout(bodies, shapes):
 def _uses_live_sort(capacity, key_bits):
     """Whether the pair sort orders only the live slots instead of the whole capacity.
 
-    It does from _LIVE_SORT_CAPACITY on, unless a chunk key, the pair key with an
-    11-bit slot appended, would reach the pad bit.
+    It does up to _CHUNK_SORT_CAPACITY and from _LIVE_SORT_CAPACITY on, unless a
+    chunk key, the pair key with an 11-bit slot appended, would reach the pad bit.
+    Both sorts leave the unique (key, slot) order.
     """
-    return capacity >= _LIVE_SORT_CAPACITY and key_bits + _SORT_SLOT_BITS <= 62
+    sized = capacity <= _CHUNK_SORT_CAPACITY or capacity >= _LIVE_SORT_CAPACITY
+    return sized and key_bits + _SORT_SLOT_BITS <= 62
 
 
 class _FrictionPatchState:

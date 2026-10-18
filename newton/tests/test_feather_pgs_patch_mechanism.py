@@ -872,6 +872,7 @@ class TestPatchSortKeys(unittest.TestCase):
             with self.subTest(seed=seed, capacity=capacity):
                 scene = _Scene("cpu", seed)
                 patches, reference = _pair(scene, capacity)
+                patches.live_sort = False
                 self.assertLessEqual(patches.key_bits, 62)
                 self.assertLess(patches.key_bits, 64 - 8, "the sort must skip at least one byte")
                 carried = 0
@@ -941,15 +942,16 @@ class TestPatchLiveExtent(unittest.TestCase):
     def test_live_extent_matches_the_full_capacity_reference(self):
         """Match the full-capacity mechanism bitwise through rising, dropping, overflowing and missing frames."""
         totals = {"carried": 0, "released": 0, "unstored": 0}
-        for seed, contacts, capacity, threads in (
-            (0, 96, 96, None),
-            (1, 96, 128, (7, 5)),
-            (2, 64, 160, (1, 3)),
-            (3, 128, 128, (32, 64)),
+        # Small capacities take the live sort; the radix sort runs where forced.
+        for seed, contacts, capacity, threads, live_sort in (
+            (0, 96, 96, None, None),
+            (1, 96, 128, (7, 5), False),
+            (2, 64, 160, (1, 3), None),
+            (3, 128, 128, (32, 64), False),
         ):
-            with self.subTest(seed=seed, capacity=capacity, threads=threads):
+            with self.subTest(seed=seed, capacity=capacity, threads=threads, live_sort=live_sort):
                 coverage = run_reference_differential(
-                    "cpu", seed, contacts=contacts, capacity=capacity, threads=threads
+                    "cpu", seed, contacts=contacts, capacity=capacity, threads=threads, live_sort=live_sort
                 )
                 for name in totals:
                     totals[name] += coverage[name]
@@ -979,7 +981,7 @@ class TestPatchLiveExtent(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
     def test_graph_replay_follows_changing_counts(self):
         """Replay one captured patch step over rising, empty, overflowing and sharply dropping counts."""
-        run_graph_replay("cuda:0")
+        run_graph_replay("cuda:0", live_sort=False)
 
 
 def run_unstored_builds(device, seed, *, worlds=3, contacts=96, capacity=96, threads=None):
@@ -1199,7 +1201,12 @@ def run_live_sort_cases(test, device, capacities, extra_counts=()):
         for live in sorted(count for count in counts if 0 <= count <= capacity):
             with test.subTest(capacity=capacity, live=live):
                 keys = _fill_sort_case(patches, live, rng, codes)
+                # CPU arrays expose their memory; copies keep what the slots held.
+                before = (patches.current.keys.numpy().copy(), patches.current.indices.numpy().copy())
                 patches._sort_live()
+                if live == 0:
+                    np.testing.assert_array_equal(patches.current.keys.numpy(), before[0], "no slot changes")
+                    np.testing.assert_array_equal(patches.current.indices.numpy(), before[1], "no slot changes")
                 sorted_keys = patches.current.keys.numpy()[:capacity]
                 sorted_indices = patches.current.indices.numpy()[:capacity]
                 order = np.argsort(keys[:live], kind="stable")
@@ -1214,21 +1221,28 @@ def run_live_sort_cases(test, device, capacities, extra_counts=()):
 
 class TestPatchLiveSort(unittest.TestCase):
     def test_live_sort_matches_stable_argsort_and_radix_sort(self):
-        """Sort the live prefix exactly as a stable sort, from no contacts through several merges."""
-        run_live_sort_cases(self, "cpu", (2047, 3000, 4096, 10000))
+        """Sort the live prefix exactly as a stable sort, from no contacts, which no slot sees, through merges."""
+        run_live_sort_cases(self, "cpu", (2047, 3000, 4096, 10000, friction_patches._CHUNK_SORT_CAPACITY))
 
-    def test_capacity_threshold_selects_the_live_sort(self):
-        """Sort only the live prefix from the capacity threshold on, while chunk keys fit."""
+    def test_capacity_thresholds_select_the_live_sort(self):
+        """Sort only the live prefix up to the small capacity threshold and from the large one on, while keys fit."""
         scene = _Scene("cpu", 0)
         phi = wp.zeros(96, dtype=wp.vec2, device="cpu")
-        self.assertFalse(_FrictionPatchState(scene.model, 96, True, phi).live_sort)
-        with mock.patch.object(friction_patches, "_LIVE_SORT_CAPACITY", 96):
-            self.assertTrue(_FrictionPatchState(scene.model, 96, True, phi).live_sort)
-            self.assertFalse(_FrictionPatchState(scene.model, 95, True, phi[:95]).live_sort)
-            # Pair keys of 52 bits and more fall back to the radix sort: their 11-bit
-            # slot would reach the chunk keys' pad bit.
-            self.assertTrue(friction_patches._uses_live_sort(96, 51))
-            self.assertFalse(friction_patches._uses_live_sort(96, 52))
+        self.assertTrue(_FrictionPatchState(scene.model, 96, True, phi).live_sort, "small capacities sort live slots")
+        with mock.patch.object(friction_patches, "_CHUNK_SORT_CAPACITY", 64):
+            self.assertFalse(_FrictionPatchState(scene.model, 96, True, phi).live_sort)
+            self.assertTrue(_FrictionPatchState(scene.model, 64, True, phi[:64]).live_sort)
+            with mock.patch.object(friction_patches, "_LIVE_SORT_CAPACITY", 96):
+                self.assertTrue(_FrictionPatchState(scene.model, 96, True, phi).live_sort)
+                self.assertFalse(_FrictionPatchState(scene.model, 95, True, phi[:95]).live_sort)
+        self.assertEqual(friction_patches._CHUNK_SORT_CAPACITY, 16_384)
+        self.assertTrue(friction_patches._uses_live_sort(16_384, 51))
+        self.assertFalse(friction_patches._uses_live_sort(16_385, 51))
+        self.assertTrue(friction_patches._uses_live_sort(friction_patches._LIVE_SORT_CAPACITY, 51))
+        # Pair keys of 52 bits and more fall back to the radix sort: their 11-bit
+        # slot would reach the chunk keys' pad bit.
+        self.assertFalse(friction_patches._uses_live_sort(96, 52))
+        self.assertFalse(friction_patches._uses_live_sort(friction_patches._LIVE_SORT_CAPACITY, 52))
 
     def test_live_sort_builds_match_the_full_capacity_reference(self):
         """Build, link, seed, finish and store bitwise as the reference with the live sort."""
@@ -2344,9 +2358,9 @@ class TestPatchFrameReuse(unittest.TestCase):
     def test_reused_frames_match_the_full_capacity_reference(self):
         """Sort only changed live frames and match the reference bitwise when substeps reuse sorted pairs."""
         totals = {"reused": 0, "sorted": 0}
-        for seed, threads in ((0, None), (1, (7, 5)), (2, (1, 3)), (3, (32, 64))):
-            with self.subTest(seed=seed, threads=threads):
-                coverage = run_frame_reuse_differential(self, "cpu", seed, threads=threads)
+        for seed, threads, live_sort in ((0, None, False), (1, (7, 5), None), (2, (1, 3), False), (3, (32, 64), None)):
+            with self.subTest(seed=seed, threads=threads, live_sort=live_sort):
+                coverage = run_frame_reuse_differential(self, "cpu", seed, threads=threads, live_sort=live_sort)
                 for name in totals:
                     totals[name] += coverage[name]
         self.assertGreater(totals["reused"], 0, "substeps must reuse sorted live pairs")
@@ -2520,7 +2534,7 @@ class TestPatchFrameReuse(unittest.TestCase):
         """Sort under a conditional node only for changed live frames, matching the reference on every replay."""
         if not wp.is_conditional_graph_supported():
             self.skipTest("Conditional graph nodes need a CUDA 12.4+ driver and Warp build")
-        run_frame_reuse_graph(self, "cuda:0")
+        run_frame_reuse_graph(self, "cuda:0", live_sort=False)
         run_frame_reuse_graph(self, "cuda:0", worlds=160, contacts=8192, capacity=8192, live_sort=True)
 
 
@@ -3311,6 +3325,9 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
             graph = _SolverTwin("cuda:0", jaws=True)
         eager = _SolverTwin("cuda:0", reuse=False, nodes=False, jaws=True)
         self.assertTrue(graph.patches.reuse_frames)
+        self.assertTrue(graph.patches.conditional_nodes)
+        # The radix sort's poisoned scratch half shows whether a replay sorted.
+        graph.patches.live_sort = False
         # The memset stream forked at each step's end must stay valid across the node's capture pause.
         self.assertIsNotNone(graph.solver._memset_stream, "the jaws double-buffer their mass matrices")
         for _ in range(3):
@@ -3347,6 +3364,9 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
             graph = _SolverTwin("cuda:0", jaws=True)
         eager = _SolverTwin("cuda:0", reuse=False, nodes=False, jaws=True)
         self.assertTrue(graph.patches.reuse_frames)
+        self.assertTrue(graph.patches.conditional_nodes)
+        # The radix sort's poisoned scratch half shows whether a replay sorted.
+        graph.patches.live_sort = False
         # Eager steps leave the slots holding the first stream's frame, recorded as sorted.
         for twin in (graph, eager):
             twin.pair(collide=True)
@@ -3374,6 +3394,9 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
             graph = _SolverTwin("cuda:0", jaws=True)
         eager = _SolverTwin("cuda:0", reuse=False, nodes=False, jaws=True)
         self.assertTrue(graph.patches.reuse_frames)
+        self.assertTrue(graph.patches.conditional_nodes)
+        # The radix sort's poisoned scratch half shows whether a replay sorted.
+        graph.patches.live_sort = False
         for _ in range(3):
             for twin in (graph, eager):
                 twin.pair(collide=True)
@@ -3448,6 +3471,7 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
             graph = _SolverTwin("cuda:0", boxes=True)
         eager, control = (_SolverTwin("cuda:0", reuse=False, nodes=False, boxes=True) for _ in range(2))
         self.assertTrue(graph.patches.reuse_frames)
+        self.assertTrue(graph.patches.conditional_nodes)
         twins = (graph, eager, control)
         for twin in twins:
             twin.pair(collide=True)
