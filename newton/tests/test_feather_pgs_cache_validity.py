@@ -20,6 +20,9 @@ from newton.tests.test_feather_pgs_sparse_solver import STATE_FIELDS, _build_mod
 
 DT = 1.0 / 240.0
 JOINT = newton.ModelFlags.JOINT_PROPERTIES
+# One tree per block: by default each held-tree group times its candidate lane widths at
+# construction, so two solver instances could run different layouts (and reduction orders).
+ONE_TREE_PER_BLOCK = {"FEATHER_PGS_TREE_LANE_PACK": "0"}
 
 
 def _groups(owner):
@@ -50,6 +53,7 @@ def _mixed_solver(model, *, forest=False, owner=True):
         "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": str(int(owner)),
         "FEATHER_PGS_TREE_KINETIC_STATE": "0",
         "FEATHER_PGS_TREE_FOREST": str(int(forest)),
+        **ONE_TREE_PER_BLOCK,
     }
     with patch.dict(os.environ, environment):
         return SolverFeatherPGS(
@@ -71,14 +75,16 @@ def _owned_case(name, device):
         model = _build(device, worlds=4, prescribed=True)
         return model, _mixed_solver(model, forest=True)
     model = _build_model()
-    return model, _make_solver(model, True, cached_dynamics="on", friction_anchor_beta=0.0)
+    with patch.dict(os.environ, ONE_TREE_PER_BLOCK):
+        return model, _make_solver(model, True, cached_dynamics="on", friction_anchor_beta=0.0)
 
 
 class _Rollout:
     """Ping-pong one solver's states over sorted contacts, as a captured Isaac Lab physics step does.
 
-    Two rollouts compare within 1e-4: they run the same kernels from the same inputs, and the bound
-    only leaves room for float-order differences between solver instances.
+    Rollouts of separate solver instances compare within 2e-6 (rtol 0), the bound the repository's
+    other cross-instance tests use. Their held-tree lane width is pinned (``ONE_TREE_PER_BLOCK``);
+    what can remain between instances is the order of float atomic accumulations.
     """
 
     def __init__(self, model, solver):
@@ -215,6 +221,9 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
                     model, solver = _owned_case(name, device)
                     owner = solver._tree_kinetic_state
                     self.assertIsNotNone(owner, "The fixture must admit a held-tree owner")
+                    if name == "forest":
+                        self.assertEqual(len(owner.groups), 1, owner.forest_reason)
+                        self.assertTrue(owner.groups[0].layout.forest, owner.forest_reason)
                     rollout = _Rollout(model, solver)
                     rollout.step()  # the first repair builds every cache
                     before = _generations(owner)
@@ -229,8 +238,8 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
                     np.testing.assert_allclose(
                         getattr(finals[1], field).numpy(),
                         getattr(finals[0], field).numpy(),
-                        rtol=1e-4,
-                        atol=1e-4,
+                        rtol=0.0,
+                        atol=2e-6,
                         err_msg=field,
                     )
 
@@ -272,7 +281,7 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
                     np.testing.assert_array_equal(end - start, 2 + np.isin(world, reset), err_msg=f"{captured=}")
             finals.append({field: getattr(rollout.states[0], field).numpy().copy() for field in STATE_FIELDS})
         for field in STATE_FIELDS:
-            np.testing.assert_allclose(finals[1][field], finals[0][field], rtol=1e-4, atol=1e-4, err_msg=field)
+            np.testing.assert_allclose(finals[1][field], finals[0][field], rtol=0.0, atol=2e-6, err_msg=field)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
     def test_cuda_moved_frames_and_other_inputs_keep_their_contract(self):
@@ -416,7 +425,7 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
             finals.append({field: getattr(rollout.states[0], field).numpy() for field in STATE_FIELDS})
         for field in STATE_FIELDS:
             self.assertTrue(np.isfinite(finals[1][field]).all(), field)
-            np.testing.assert_allclose(finals[1][field], finals[0][field], rtol=1e-4, atol=1e-4, err_msg=field)
+            np.testing.assert_allclose(finals[1][field], finals[0][field], rtol=0.0, atol=2e-6, err_msg=field)
 
 
 if __name__ == "__main__":

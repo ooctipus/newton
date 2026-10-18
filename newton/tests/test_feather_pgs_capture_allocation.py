@@ -30,9 +30,14 @@ _CONFIGURATIONS = {
 
 
 def _tier_solver(model, name):
+    """The named tier configuration; a held-tree owner, if admitted, keeps one tree per block.
+
+    The default times the owner's lane widths at construction, so two instances could run
+    different layouts.
+    """
     switches, environment = _CONFIGURATIONS[name]
     with contextlib.ExitStack() as stack:
-        stack.enter_context(patch.dict(os.environ, environment))
+        stack.enter_context(patch.dict(os.environ, {**environment, "FEATHER_PGS_TREE_LANE_PACK": "0"}))
         for switch, value in switches.items():
             stack.enter_context(patch.object(source, switch, value))
         return _matrix_free_solver(model, beta=0.0, parallel_rows=32)
@@ -116,6 +121,9 @@ class TestFeatherPGSCaptureAllocation(unittest.TestCase):
                 tiers = captured.solver._pgs_solve_mf_gs_incremental_kernels
                 self.assertTrue(tiers)
                 self.assertTrue(all(getattr(kernel, "_fpgs_extra_inputs", False) for kernel in tiers))
+                if name == "in_kernel_rows":
+                    self.assertIsNotNone(captured.solver._ink_sizes, "The in-kernel response must be admitted")
+                    self.assertTrue(captured.solver._world_rows, "In-sweep world rows must be admitted")
                 allocated, tier_inputs = [], []
                 zeros, launch_tiled = wp.zeros, wp.launch_tiled
 
@@ -141,7 +149,7 @@ class TestFeatherPGSCaptureAllocation(unittest.TestCase):
                 for field in STATE_FIELDS:
                     expected, actual = getattr(eager.out, field).numpy(), getattr(captured.out, field).numpy()
                     self.assertTrue(np.isfinite(actual).all(), field)
-                    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-4, err_msg=field)
+                    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=2e-6, err_msg=field)
 
 
 if __name__ == "__main__":
