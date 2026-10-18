@@ -114,7 +114,4 @@ def make_dispatch(native):
     closure = {"pgs_solve_mf_gs_native": native}
     declaration = "def " + name + "(" + signature + "):\n" + indent(body, "    ")
     source = "def _bind(" + ", ".join(closure) + "):\n" + indent(declaration, "    ") + "    return " + name + "\n"
-    result = _compile(source, dict(globals()))["_bind"](**closure)
-    result.mf_dispatch_source = declaration
-    result.mf_dispatch_policy = "plain"
-    return result
+    return _compile(source, dict(globals()))["_bind"](**closure)
