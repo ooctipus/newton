@@ -81,6 +81,14 @@ class TestKernelIdentity(unittest.TestCase):
             self.assertEqual(identity.report(parent, _record(b=("1", "c", "p"))), 1)
         self.assertIn("changed (hash only, generated code identical): a", output.getvalue())
 
+    def test_report_claims_identical_code_only_when_compared(self):
+        """Name a hash change of records without code digests as not compared, not as identical code."""
+        parent, child = {"kernels": {"a": {"hash": "1"}}}, {"kernels": {"a": {"hash": "2"}}}
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(identity.report(parent, child), 1)
+        self.assertIn("changed (hash changed, generated code not compared): a", output.getvalue())
+        self.assertNotIn("generated code identical", output.getvalue())
+
     def test_label_names_calls_like_the_pins(self):
         """Label calls with positional values, sorted keywords and named layouts."""
         layout = identity.Named("chain9", object())

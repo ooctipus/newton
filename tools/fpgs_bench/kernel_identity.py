@@ -484,7 +484,15 @@ def report(parent, child, columns=COLUMNS):
     shared = len(parent["kernels"].keys() & child["kernels"].keys())
     print(f"{shared} shared kernels compared on {', '.join(columns)}: {len(result['changed'])} changed")
     for key, differ in result["changed"].items():
-        kind = "hash only, generated code identical" if set(differ) == {"hash"} else "generated code changed"
+        compared = [
+            c for c in ("cuda", "cpu") if c in columns and c in parent["kernels"][key] and c in child["kernels"][key]
+        ]
+        if set(differ) != {"hash"}:
+            kind = "generated code changed"
+        elif compared:
+            kind = "hash only, generated code identical"
+        else:
+            kind = "hash changed, generated code not compared"
         print(f"  changed ({kind}): {key}")
     for field, item in (("added", "added"), ("removed", "removed"), ("rejections", "rejection changed")):
         print(f"{len(result[field])} {field}")
