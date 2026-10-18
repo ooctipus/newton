@@ -7,8 +7,6 @@ import hashlib
 import linecache
 from string import Template
 
-from .kinetic_source import checked_definitions
-
 _BODIES = r"""    # Get bodies and articulations
     body_a = -1
     body_b = -1
@@ -537,21 +535,6 @@ def get_source(*, patch_resolved=False):
     finish releases their anchors as the complete path does. The first kernel's text does not
     depend on the option.
     """
-    checked_definitions(
-        "contact_allocation_source.py",
-        (
-            "_BODIES",
-            "_WORLD",
-            "_PHI",
-            "_RESOLVED",
-            "_HELPER",
-            "_RESOLVED_PATCH",
-            "_RELEASE_CALL",
-            "_KERNEL",
-            "get_source",
-            "bind",
-        ),
-    )
     helper_name = "_allocate_world_contact_slot"
     helper = Template(_HELPER).substitute(helper_name=helper_name, extra="", bodies=_BODIES, world=_WORLD, phi=_PHI)
     kernels = {"allocate_world_contact_slots": ""}
