@@ -361,8 +361,8 @@ FLAGS = declare(
         "FEATHER_PGS_PATCH_CONDITIONAL_NODES",
         "experiment",
         _SOLVER,
-        "=1 skips the captured patch pair sort of empty and reused contact frames with a conditional graph node "
-        "(default 0: other values keep the sort unconditional).",
+        "=1 sorts captured patch builds that do not keep their pairs under a conditional graph node that skips "
+        "empty and already sorted contact frames (default 0: other values keep that sort unconditional).",
     ),
     _flag(
         "FEATHER_PGS_PATCH_DENSE_PATHS",
@@ -370,6 +370,13 @@ FLAGS = declare(
         _SOLVER,
         "=0 keeps patch friction off the paired factor sweep's contact units, masked rows, the resolved-world "
         "classifier and the dense route for free-body worlds (default on).",
+    ),
+    _flag(
+        "FEATHER_PGS_PATCH_FRAME_REUSE",
+        "policy",
+        _SOLVER,
+        "=0 sorts the patch pairs of every build instead of keeping them on captured builds that reuse the previous "
+        "captured build's contact frame (default on).",
     ),
     _flag(
         "FEATHER_PGS_PATCH_PARALLEL_ROWS",

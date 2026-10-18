@@ -34,10 +34,13 @@ Sorting body pairs makes construction local to a pair and preserves CUDA graph
 capture: all buffers and the radix-sort workspace have fixed capacity. Launches
 stride over the live contacts and the slots earlier frames used, so their work
 follows the live contact count rather than the capacity. With frame reuse, the
-solver's experimental opt-in ``FEATHER_PGS_PATCH_CONDITIONAL_NODES=1``, a
-conditional node in a captured graph skips the pair sort for an empty contact
-frame and for the contact frame whose pairs the slots already hold sorted, which
-is the case on every solver substep that shares a collision frame.
+solver's default, a captured build skips the pair sort when the previous build
+was captured in the same graph over the same contacts and the host issued no
+contact write in between, which is the case on every solver substep that shares
+a collision frame (see :class:`_FrictionPatchState`). The solver's experimental
+opt-in ``FEATHER_PGS_PATCH_CONDITIONAL_NODES=1`` sorts the other captured builds
+under a conditional node that also skips empty frames and the frame whose pairs
+the slots already hold sorted.
 """
 
 import itertools
@@ -48,7 +51,7 @@ import numpy as np
 import warp as wp
 
 from ...math.spatial import velocity_at_point
-from ...sim.contacts import GENERATION_SENTINEL
+from ...sim.contacts import GENERATION_SENTINEL, capture_scope, contact_frame_write
 from .capture_joins import capture_has_unjoined_work
 from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
 
@@ -1394,16 +1397,27 @@ def _uses_live_sort(capacity, key_bits):
 class _FrictionPatchState:
     """Own preallocated patch frames; never read device counters on the host.
 
-    With ``reuse_frames``, builds record which contact frame the slots hold sorted
-    pairs of, and a captured CUDA graph sorts only under a conditional node that
-    skips empty frames and that recorded frame. Contact frames are identified by
-    ``Contacts.contact_generation``, which every collision pass and
-    :meth:`newton.Contacts.clear` advance, together with the raw contact count and
-    the contact stream, a token of the generation counter array that is never
-    reused (see :meth:`stream_token`). Eager builds always sort.
+    With ``reuse_frames``, the host admits each captured build statically. A
+    build keeps the sorted pairs the previous build left in the slots when that
+    build was captured in the same scope (one graph, or one conditional body;
+    :func:`~newton._src.sim.contacts.capture_scope`) over the same
+    ``contact_generation`` array, and no write of that contact stream was noted
+    since (:func:`~newton._src.sim.contacts.note_contact_frame_write`) nor
+    :meth:`forget_frame` called. Every other build sorts. The device checks each
+    kept build against the frame the last sort recorded: a frame rewritten by a
+    writer the host never saw leaves that build empty and latches
+    ``frame_status``, so stale pairs never group contacts.
+
+    With ``conditional_nodes``, captured builds that do not keep their pairs sort
+    under a conditional node that skips empty frames and the recorded frame;
+    eager builds then record the frames they sort for such a node. Contact frames
+    are identified by ``Contacts.contact_generation``, which every collision
+    pass and :meth:`newton.Contacts.clear` advance, together with the raw contact
+    count and the contact stream, a token of the generation counter array that
+    is never reused (see :meth:`stream_token`). Eager builds always sort.
     """
 
-    def __init__(self, model, capacity, enabled, phi, *, reuse_frames=False):
+    def __init__(self, model, capacity, enabled, phi, *, reuse_frames=False, conditional_nodes=False):
         self.view = FrictionPatches()
         self.view.enabled = int(enabled)
         self.view.phi = phi
@@ -1415,6 +1429,10 @@ class _FrictionPatchState:
         self.view.point_a = wp.zeros(n, dtype=wp.vec3, device=device)
         self.view.point_b = wp.zeros(n, dtype=wp.vec3, device=device)
         self.reuse_frames = bool(reuse_frames and enabled)
+        self.conditional_nodes = bool(conditional_nodes and enabled)
+        # (capture scope, weak generation array, frame-write tick) of the previous
+        # captured build, which a build in the same scope may keep the pairs of.
+        self._last_build = None
         if not enabled:
             return
         self.device = device
@@ -1510,7 +1528,8 @@ class _FrictionPatchState:
 
     def forget_frame(self):
         """Make the next build sort its pairs, as it does for a new contact frame."""
-        if self.reuse_frames:
+        self._last_build = None
+        if self.reuse_frames or self.conditional_nodes:
             self.sorted_frame.fill_(GENERATION_SENTINEL)
 
     def stream_token(self, generation):
@@ -1583,12 +1602,14 @@ class _FrictionPatchState:
     ):
         """Build the current patch frame from ``contacts``.
 
-        ``capture_pause`` returns a context manager entered around a captured
-        build. Its conditional node pauses the graph capture to record its body,
-        so the caller joins its forked streams on entry and records again the
-        events it waits on later. A capture that still holds forked work nobody
-        joined cannot pause; that build sorts unconditionally, as an eager build
-        does.
+        With frame reuse, a captured build whose contact frame the previous
+        build of its capture scope sorted keeps those pairs instead of sorting
+        (see :class:`_FrictionPatchState`). ``capture_pause`` returns a context
+        manager entered around a build sorted under the opt-in conditional node,
+        which pauses the graph capture to record its body, so the caller joins
+        its forked streams on entry and records again the events it waits on
+        later. A capture that still holds forked work nobody joined cannot
+        pause; that build sorts unconditionally, as an eager build does.
         """
         bodies = 0 if state.body_q is None else state.body_q.shape[0]
         if bodies + model.shape_body.shape[0] + 2 != self.key_stride:
@@ -1608,39 +1629,77 @@ class _FrictionPatchState:
             friction_gap=friction_gap,
             friction_articulation_pairs_only=friction_articulation_pairs_only,
         )
-        generation = getattr(contacts, "contact_generation", None) if self.reuse_frames else None
+        tracked = self.reuse_frames or self.conditional_nodes
+        generation = getattr(contacts, "contact_generation", None) if tracked else None
+        scope = None
+        tick = None
         if generation is None:
             # The slots receive a frame no record can name.
             self.forget_frame()
-            wp.launch(
-                _prepare,
-                dim=self.threads,
-                inputs=prepare_inputs,
-                outputs=[self.extent],
-                device=model.device,
-            )
-            self._order_pairs()
+            self._prepare_and_sort(prepare_inputs)
         else:
             # The token identifies the contact stream, also across graphs captured
             # with other Contacts instances.
             stream = self.stream_token(generation)
-            branch = self._capture_branch()
-            # Only _order_pairs runs under the node: _prepare_frame computes the
-            # condition, and _build, the link, the seed and the finish stride over
-            # the frame's extent at other stages of the step, where each node
-            # would pause the capture again to skip microseconds of work.
-            with nullcontext() if branch is None else capture_pause():
-                if branch is not None and not self._capture_can_pause():
-                    branch = None
-                if branch is None:
-                    # The prepare records the frame that the sort then orders.
-                    self._launch_prepare_frame(prepare_inputs, generation, stream, _FRAME_SORT)
-                    self._order_pairs()
-                else:
-                    self._launch_prepare_frame(prepare_inputs, generation, stream, _FRAME_DETECT)
-                    record = (generation, contacts.rigid_contact_count, stream)
-                    branch(self.sort_pairs, on_true=self._order_pairs, record=record)
+            write = contact_frame_write(generation)
+            tick = None if write is None else write.tick
+            scope = self._capture_scope()
+            if self._keeps_pairs(scope, generation, tick):
+                # The previous build of this capture scope sorted this stream's frame
+                # and the host issued no write of it since.
+                self._launch_prepare_frame(prepare_inputs, generation, stream, _FRAME_KEEP)
+            elif scope is None and not self.conditional_nodes:
+                # Eager builds sort as without frame reuse: no later build keeps
+                # their pairs, so their frame needs no record.
+                self._prepare_and_sort(prepare_inputs)
+            else:
+                self._sort_frame(prepare_inputs, contacts, generation, stream, scope, capture_pause)
+                # A node pauses the capture, after which Warp names the main graph's
+                # raw handle; later builds of the graph compare with that scope.
+                scope = self._capture_scope()
+        self._last_build = None if scope is None else (scope, weakref.ref(generation), tick)
         self._launch_build(model, state)
+
+    def _keeps_pairs(self, scope, generation, tick):
+        """Whether a build in capture ``scope`` keeps the sorted pairs the previous build left in the slots.
+
+        The previous build must be captured in the same scope over the same
+        generation array, with ``tick``, the stream's last noted frame write,
+        unchanged since and no :meth:`forget_frame` in between.
+        """
+        last = self._last_build
+        return (
+            self.reuse_frames
+            and scope is not None
+            and last is not None
+            and last[0] == scope
+            and last[1]() is generation
+            and last[2] == tick
+        )
+
+    def _prepare_and_sort(self, prepare_inputs):
+        """Prepare and sort a frame that no record names, as builds without frame reuse do."""
+        wp.launch(_prepare, dim=self.threads, inputs=prepare_inputs, outputs=[self.extent], device=self.device)
+        self._order_pairs()
+
+    def _sort_frame(self, prepare_inputs, contacts, generation, stream, scope, capture_pause):
+        """Prepare and sort a frame-tracking build, under a conditional node where the opt-in allows one."""
+        branch = self._capture_branch() if self.conditional_nodes and scope is not None else None
+        # Only _order_pairs runs under the node: _prepare_frame computes the
+        # condition, and _build, the link, the seed and the finish stride over
+        # the frame's extent at other stages of the step, where each node
+        # would pause the capture again to skip microseconds of work.
+        with nullcontext() if branch is None else capture_pause():
+            if branch is not None and not self._capture_can_pause():
+                branch = None
+            if branch is None:
+                # The prepare records the frame that the sort then orders.
+                self._launch_prepare_frame(prepare_inputs, generation, stream, _FRAME_SORT)
+                self._order_pairs()
+            else:
+                self._launch_prepare_frame(prepare_inputs, generation, stream, _FRAME_DETECT)
+                record = (generation, contacts.rigid_contact_count, stream)
+                branch(self.sort_pairs, on_true=self._order_pairs, record=record)
 
     def _launch_build(self, model, state):
         """Build the pairs of the prepared, sorted slots."""
@@ -1722,6 +1781,10 @@ class _FrictionPatchState:
             outputs=[self.extent, self.sort_pairs, self.frame_status],
             device=self.device,
         )
+
+    def _capture_scope(self):
+        """Return the capture scope that this device's current stream records into, ``None`` when eager."""
+        return capture_scope(self.device)
 
     def _capture_branch(self):
         """Return :func:`warp.capture_if` while Warp captures this device's stream, else ``None``.

@@ -1548,16 +1548,23 @@ class SolverFeatherPGS(SolverBase):
                 ``contact_friction_shared_anchor`` apply only to normal rows and velocity-only friction.
                 Requires ``friction_mode="current"`` and ``pgs_kernel="loop"`` or ``"tiled_row"``.
                 Explicit positive gains with an incompatible point algorithm raise an error.
-                Each step sorts its patch contact pairs; the experimental opt-in
-                ``FEATHER_PGS_PATCH_CONDITIONAL_NODES=1`` lets captured CUDA graphs skip that sort for
-                empty and reused contact frames. With it, a captured step that receives the contact
-                frame it sorted last (the same ``Contacts`` instance, ``contact_generation`` and
-                contact count) reuses that order, so code that rewrites contact arrays between
-                captured steps without a collision pass must advance ``contact_generation`` (for
-                example with :meth:`~newton.Contacts.clear`) or change the count. The conditional
-                graph node that skips the sort pauses the capture once per step: an event recorded
-                before ``step()`` cannot be waited on after it, and a step taken while a stream forked
-                by the caller still holds unjoined work sorts unconditionally.
+                Each step sorts its patch contact pairs, except a step captured in a CUDA graph
+                right after another captured step of the same graph over the same ``Contacts``,
+                with no collision pass, :meth:`~newton.Contacts.clear` or coupled-solver contact
+                filter in between: it reuses that step's sorted pairs, which saves the sort on
+                every substep that shares a collision pass. Code that rewrites contact arrays
+                between two such captured steps must do so through those writers. A step that
+                finds its contacts rewritten otherwise (a different ``contact_generation``, count
+                or ``Contacts``) is solved without patch friction rows and its anchors are
+                released; :meth:`constraint_capacity_status` reports it as ``patch_frames`` and
+                :meth:`check_constraint_capacity` raises. ``FEATHER_PGS_PATCH_FRAME_REUSE=0``
+                sorts every step. The experimental opt-in ``FEATHER_PGS_PATCH_CONDITIONAL_NODES=1``
+                sorts the other captured steps under a conditional graph node that skips empty
+                contact frames and the frame sorted last (the same ``Contacts``,
+                ``contact_generation`` and contact count). The node pauses the capture once per
+                such step: an event recorded before ``step()`` cannot be waited on after it, and a
+                step taken while a stream forked by the caller still holds unjoined work sorts
+                unconditionally.
                 Defaults to None.
             contact_speculative_scale (float, optional): Multiplies the positive-gap position RHS
                 for normal contact rows on the dense, matrix-free free-rigid, and propagation
@@ -6247,13 +6254,17 @@ class SolverFeatherPGS(SolverBase):
         # Row builders always receive a zero phi view when patch friction is off.
         # Persistent state is owned by the body-pair patch builder, independently
         # of collision matching and the contact warm-start tables.
-        reuse_frames, self._patch_conditional_nodes_reason = self._patch_conditional_nodes(device)
+        frame_reuse, self._patch_frame_reuse_reason = self._patch_frame_reuse()
+        conditional_nodes, self._patch_conditional_nodes_reason = self._patch_conditional_nodes(
+            device, frame_reuse=frame_reuse
+        )
         self._friction_patches = _FrictionPatchState(
             model,
             max_contacts,
             self._friction_anchors_enabled,
             wp.zeros(max_contacts, dtype=wp.vec2, device=device),
-            reuse_frames=reuse_frames,
+            reuse_frames=frame_reuse,
+            conditional_nodes=conditional_nodes,
         )
         self._ws_prev_contact_normal = (
             wp.zeros(max_contacts, dtype=wp.vec3, device=device) if self.pgs_warmstart else None
@@ -11487,11 +11498,16 @@ class SolverFeatherPGS(SolverBase):
 
         The keys ``dense``, ``matrix_free``, and ``propagation`` identify row
         buffers whose capacity omitted constraints. ``contacts`` identifies an
-        incoming contact count exceeding its materialized storage. Flags remain
-        set across later successful steps and :meth:`reset` calls.
+        incoming contact count exceeding its materialized storage.
+        ``patch_frames`` identifies a captured step of patch friction that
+        found its contact frame rewritten since the previous captured step of
+        the same graph without a collision pass or :meth:`~newton.Contacts.clear`,
+        and solved that step without patch friction rows (see
+        ``friction_anchor_beta``). Flags remain set across later successful
+        steps and :meth:`reset` calls.
 
         Call outside CUDA graph capture, on the solver's execution stream or
-        after explicitly joining that stream. This copies four integers to the
+        after explicitly joining that stream. This copies five integers to the
         host. Graph replays update the same device flags without host reads.
 
         Args:
@@ -11507,8 +11523,12 @@ class SolverFeatherPGS(SolverBase):
             raise RuntimeError("Constraint capacity status must be read outside CUDA graph capture")
         values = self._constraint_capacity_status.numpy()
         result = dict(zip(("dense", "matrix_free", "propagation", "contacts"), map(bool, values), strict=True))
+        frame_status = getattr(self._friction_patches, "frame_status", None)
+        result["patch_frames"] = frame_status is not None and bool(frame_status.numpy()[0])
         if clear:
             self._constraint_capacity_status.zero_()
+            if frame_status is not None:
+                frame_status.zero_()
         return result
 
     def check_constraint_capacity(self) -> None:
@@ -11520,7 +11540,8 @@ class SolverFeatherPGS(SolverBase):
         inspect it without host synchronization. Status remains set until
         :meth:`reset` clears the affected worlds. Increasing capacity requires
         constructing a solver and recapturing graphs before restarting the
-        invalidated transition.
+        invalidated transition. Also raises while the ``patch_frames`` flag of
+        :meth:`constraint_capacity_status` is set, until that method clears it.
         """
         if self.model.device.is_cuda and self.model.device.is_capturing:
             raise RuntimeError("check_constraint_capacity() must run outside CUDA graph capture")
@@ -11529,6 +11550,14 @@ class SolverFeatherPGS(SolverBase):
             raise RuntimeError(
                 f"FeatherPGS constraint/contact capacity exceeded in worlds {worlds[:16].tolist()}"
                 f" ({worlds.size} invalid worlds); increase capacities and reset before accepting transitions."
+            )
+        frame_status = getattr(self._friction_patches, "frame_status", None)
+        if frame_status is not None and frame_status.numpy()[0]:
+            raise RuntimeError(
+                "FeatherPGS solved captured steps without patch friction: their contacts were rewritten since the "
+                "previous captured step of the same graph without a collision pass or Contacts.clear(). Write "
+                "contacts between captured steps through those, or set FEATHER_PGS_PATCH_FRAME_REUSE=0; "
+                "constraint_capacity_status(clear=True) clears the flag."
             )
 
     def constraint_row_watermarks(self) -> dict:
@@ -13320,32 +13349,60 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
-    def _patch_conditional_nodes(self, device) -> tuple[bool, str]:
+    def _patch_frame_reuse(self) -> tuple[bool, str]:
+        """Return whether captured patch builds keep the sorted pairs of a reused contact frame, with the reason.
+
+        A captured build keeps them when the previous build was captured in the same
+        graph over the same ``Contacts`` and the host issued no contact write in
+        between (see :class:`_FrictionPatchState`). On by default;
+        ``FEATHER_PGS_PATCH_FRAME_REUSE=0`` sorts every build.
+        """
+        if not self._friction_anchors_enabled:
+            return False, "Point friction sorts no patch pairs."
+        if os.environ.get("FEATHER_PGS_PATCH_FRAME_REUSE", "1") == "0":
+            return False, "FEATHER_PGS_PATCH_FRAME_REUSE=0 sorts the patch pairs of every build."
+        return True, (
+            "A captured build keeps the sorted patch pairs of the previous build captured in the same graph over the "
+            "same Contacts when the host noted no write of them in between (a collision pass, Contacts.clear() or a "
+            "coupled-solver filter); other builds sort."
+        )
+
+    def _patch_conditional_nodes(self, device, *, frame_reuse=False) -> tuple[bool, str]:
         """Return whether captured graphs branch around the patch pair sort, with the reason.
 
-        Conditional nodes skip the sort for an empty contact frame and on substeps
-        that share the last sorted collision frame (see :class:`_FrictionPatchState`).
-        They are an experimental opt-in: only ``FEATHER_PGS_PATCH_CONDITIONAL_NODES=1``
+        Conditional nodes skip the sort for an empty contact frame and for the last
+        sorted frame (see :class:`_FrictionPatchState`); with ``frame_reuse`` only
+        builds that do not keep their pairs statically take one. They are an
+        experimental opt-in: only ``FEATHER_PGS_PATCH_CONDITIONAL_NODES=1``
         requests them.
         """
         if not self._friction_anchors_enabled:
             return False, "Point friction sorts no patch pairs."
+        unconditional = (
+            "captured builds that do not keep their pairs sort unconditionally"
+            if frame_reuse
+            else "the patch pair sort is unconditional"
+        )
         if os.environ.get("FEATHER_PGS_PATCH_CONDITIONAL_NODES", "0") != "1":
             return False, (
                 "Conditional graph nodes are an experimental opt-in that FEATHER_PGS_PATCH_CONDITIONAL_NODES=1 "
-                "enables; the patch pair sort is unconditional."
+                f"enables; {unconditional}."
             )
         if not device.is_cuda:
-            return False, "Conditional graph nodes need a CUDA device; the patch pair sort is unconditional."
+            return False, f"Conditional graph nodes need a CUDA device; {unconditional}."
         if not wp.is_conditional_graph_supported():
             return False, (
-                "Conditional graph nodes need a CUDA 12.4+ driver and a Warp build with CUDA 12.4+; "
-                "the patch pair sort is unconditional."
+                f"Conditional graph nodes need a CUDA 12.4+ driver and a Warp build with CUDA 12.4+; {unconditional}."
             )
         if not capture_queries_available():
             return False, (
                 "The CUDA driver's stream capture queries, which tell whether a capture can pause for a "
-                "conditional node, could not be loaded; the patch pair sort is unconditional."
+                f"conditional node, could not be loaded; {unconditional}."
+            )
+        if frame_reuse:
+            return True, (
+                "Captured builds that do not keep their pairs sort under a conditional node that skips empty "
+                "contact frames and the last sorted frame."
             )
         return True, (
             "Captured graphs sort patch pairs under a conditional node that skips empty contact frames and "

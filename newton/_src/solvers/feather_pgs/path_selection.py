@@ -891,8 +891,12 @@ def _friction(solver) -> dict:
             "reason": solver._parallel_contact_paths_reason,
         },
         "reason": reason,
-        "conditional_nodes": {
+        "frame_reuse": {
             "enabled": solver._friction_patches.reuse_frames,
+            "reason": solver._patch_frame_reuse_reason,
+        },
+        "conditional_nodes": {
+            "enabled": solver._friction_patches.conditional_nodes,
             "reason": solver._patch_conditional_nodes_reason,
         },
     }
