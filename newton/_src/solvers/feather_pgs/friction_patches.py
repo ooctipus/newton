@@ -1527,7 +1527,9 @@ class _FrictionPatchState:
                     branch(self.sort_pairs, on_true=self._order_pairs, record=record)
         # Warp compiles this module once more for _build's block size; the
         # variants differ only in the tile block size, which no _build
-        # arithmetic reads.
+        # arithmetic reads. That variant also tiles _sort_chunks for 32
+        # threads, which no launch uses and which about doubles the variant's
+        # compile time on a cold kernel cache.
         wp.launch(
             _build,
             dim=self.build_threads,
