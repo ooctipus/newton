@@ -167,7 +167,9 @@ def make_plan(model, operator, *, complete=True):
         for r, root in enumerate(root_locals):
             if families[r] == 0 and not np.all(kinematic[:, root]):
                 raise ValueError("A zero-family forest root must be a kinematic free body")
-            # Construction places the forest's held families on dynamic roots only.
+            # Construction places the forest's held families on dynamic roots
+            # only. A root made kinematic later keeps the built forest, which
+            # serves it as above, although a new plan would refuse it here.
             if families[r] != 0 and np.any(kinematic[:, root]):
                 raise ValueError("A dynamic forest root must not be kinematic")
     mass = _SparseMassMatrixPlan.build(parent, counts[0])
