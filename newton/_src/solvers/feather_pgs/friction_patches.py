@@ -33,10 +33,11 @@ strength is the only new user control.
 Sorting body pairs makes construction local to a pair and preserves CUDA graph
 capture: all buffers and the radix-sort workspace have fixed capacity. Launches
 stride over the live contacts and the slots earlier frames used, so their work
-follows the live contact count rather than the capacity. In a captured graph, a
-conditional node skips the pair sort for an empty contact frame and for the
-contact frame whose pairs the slots already hold sorted, which is the case on
-every solver substep that shares a collision frame.
+follows the live contact count rather than the capacity. With frame reuse, the
+solver's experimental opt-in ``FEATHER_PGS_PATCH_CONDITIONAL_NODES=1``, a
+conditional node in a captured graph skips the pair sort for an empty contact
+frame and for the contact frame whose pairs the slots already hold sorted, which
+is the case on every solver substep that shares a collision frame.
 """
 
 import itertools

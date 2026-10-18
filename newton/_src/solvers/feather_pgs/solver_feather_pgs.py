@@ -1504,15 +1504,16 @@ class SolverFeatherPGS(SolverBase):
                 ``contact_friction_shared_anchor`` apply only to normal rows and velocity-only friction.
                 Requires ``friction_mode="current"`` and ``pgs_kernel="loop"`` or ``"tiled_row"``.
                 Explicit positive gains with an incompatible point algorithm raise an error.
-                In a captured CUDA graph, a step that receives the contact frame it sorted last (the
-                same ``Contacts`` instance, ``contact_generation`` and contact count) reuses that
-                order, so code that rewrites contact arrays between captured steps without a
-                collision pass must advance ``contact_generation`` (for example with
-                :meth:`~newton.Contacts.clear`) or change the count. The conditional graph node that
-                skips the sort pauses the capture once per step: an event recorded before ``step()``
-                cannot be waited on after it, and a step taken while a stream forked by the caller
-                still holds unjoined work sorts unconditionally. The environment variable
-                ``FEATHER_PGS_PATCH_CONDITIONAL_NODES=0`` keeps the sort unconditional.
+                Each step sorts its patch contact pairs; the experimental opt-in
+                ``FEATHER_PGS_PATCH_CONDITIONAL_NODES=1`` lets captured CUDA graphs skip that sort for
+                empty and reused contact frames. With it, a captured step that receives the contact
+                frame it sorted last (the same ``Contacts`` instance, ``contact_generation`` and
+                contact count) reuses that order, so code that rewrites contact arrays between
+                captured steps without a collision pass must advance ``contact_generation`` (for
+                example with :meth:`~newton.Contacts.clear`) or change the count. The conditional
+                graph node that skips the sort pauses the capture once per step: an event recorded
+                before ``step()`` cannot be waited on after it, and a step taken while a stream forked
+                by the caller still holds unjoined work sorts unconditionally.
                 Defaults to None.
             contact_speculative_scale (float, optional): Multiplies the positive-gap position RHS
                 for normal contact rows on the dense, matrix-free free-rigid, and propagation
@@ -13171,11 +13172,16 @@ class SolverFeatherPGS(SolverBase):
 
         Conditional nodes skip the sort for an empty contact frame and on substeps
         that share the last sorted collision frame (see :class:`_FrictionPatchState`).
+        They are an experimental opt-in: only ``FEATHER_PGS_PATCH_CONDITIONAL_NODES=1``
+        requests them.
         """
         if not self._friction_anchors_enabled:
             return False, "Point friction sorts no patch pairs."
-        if os.environ.get("FEATHER_PGS_PATCH_CONDITIONAL_NODES", "1") != "1":
-            return False, "FEATHER_PGS_PATCH_CONDITIONAL_NODES keeps the patch pair sort unconditional."
+        if os.environ.get("FEATHER_PGS_PATCH_CONDITIONAL_NODES", "0") != "1":
+            return False, (
+                "Conditional graph nodes are an experimental opt-in that FEATHER_PGS_PATCH_CONDITIONAL_NODES=1 "
+                "enables; the patch pair sort is unconditional."
+            )
         if not device.is_cuda:
             return False, "Conditional graph nodes need a CUDA device; the patch pair sort is unconditional."
         if not wp.is_conditional_graph_supported():

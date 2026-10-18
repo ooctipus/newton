@@ -353,9 +353,10 @@ FLAGS = declare(
     ),
     _flag(
         "FEATHER_PGS_PATCH_CONDITIONAL_NODES",
-        "policy",
+        "experiment",
         _SOLVER,
-        "Values other than 1 keep the captured patch pair sort unconditional (no skip of empty or reused frames).",
+        "=1 skips the captured patch pair sort of empty and reused contact frames with a conditional graph node "
+        "(default 0: other values keep the sort unconditional).",
     ),
     _flag(
         "FEATHER_PGS_PATCH_DENSE_PATHS",

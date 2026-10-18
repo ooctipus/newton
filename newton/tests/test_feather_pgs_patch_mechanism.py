@@ -1954,13 +1954,24 @@ def _falling_boxes(device):
         return builder.finalize()
 
 
+@contextlib.contextmanager
+def _nodes_flag(value):
+    """Set ``FEATHER_PGS_PATCH_CONDITIONAL_NODES`` to ``value``, or unset it for ``None``, for the duration."""
+    with mock.patch.dict(os.environ):
+        os.environ.pop("FEATHER_PGS_PATCH_CONDITIONAL_NODES", None)
+        if value is not None:
+            os.environ["FEATHER_PGS_PATCH_CONDITIONAL_NODES"] = value
+        yield
+
+
 class _SolverTwin:
     """A FeatherPGS scene under default patch friction with two contact streams and double-buffered states.
 
     ``reuse`` forces frame reuse on (also on the CPU, where conditional graph
     nodes do not exist) or turns it off with the registry flag; ``None`` keeps
-    the solver's own choice. ``jaws`` selects the squeezing gripper of the
-    friction-anchor tests, whose graphs capture two solver steps each, and
+    the solver's own choice, which takes the opt-in nodes only where the flag
+    requests them (:func:`_nodes_flag`). ``jaws`` selects the squeezing gripper of
+    the friction-anchor tests, whose graphs capture two solver steps each, and
     ``boxes`` free boxes above a ground plane, whose contact frames are empty
     until they land, instead of the arms over boxes. Both pipelines sort the
     contacts, so twins collide into the same slots: the CUDA narrow phase
@@ -2092,20 +2103,24 @@ def _sorts_each_substep(event):
 
 class TestPatchSolverFrameReuse(unittest.TestCase):
     def test_solver_records_its_conditional_nodes(self):
-        """Report whether captured graphs branch around the patch pair sort, and why."""
+        """Report whether captured graphs branch around the patch pair sort, and why; only =1 requests nodes."""
         devices = ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else [])
+        opt_in = "experimental opt-in that FEATHER_PGS_PATCH_CONDITIONAL_NODES=1 enables"
         for device in devices:
             model = _arm_over_box(wp.get_device(device), worlds=2)
             supported = device != "cpu" and wp.is_conditional_graph_supported()
-            default = "conditional node" if supported else "CUDA device" if device == "cpu" else "12.4"
+            requested = "conditional node" if supported else "CUDA device" if device == "cpu" else "12.4"
             cases = (
-                ({}, {}, supported, default),
-                ({"friction_anchor_beta": 0.0}, {}, False, "Point friction"),
-                ({}, {"FEATHER_PGS_PATCH_CONDITIONAL_NODES": "0"}, False, "FEATHER_PGS_PATCH_CONDITIONAL_NODES"),
+                ({}, None, False, opt_in),
+                ({}, "0", False, opt_in),
+                ({}, "true", False, opt_in),
+                ({}, "1", supported, requested),
+                ({"friction_anchor_beta": 0.0}, None, False, "Point friction"),
+                ({"friction_anchor_beta": 0.0}, "1", False, "Point friction"),
             )
-            for options, environment, enabled, reason in cases:
-                with self.subTest(device=device, options=options, environment=environment):
-                    with mock.patch.dict(os.environ, environment):
+            for options, flag, enabled, reason in cases:
+                with self.subTest(device=device, options=options, flag=flag):
+                    with _nodes_flag(flag):
                         solver = SolverFeatherPGS(model, **options)
                     record = solver.get_path_selection()["routes"]["friction"]["conditional_nodes"]
                     self.assertEqual(record["enabled"], enabled)
@@ -2129,6 +2144,37 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
                     enabled, record = SolverFeatherPGS._patch_conditional_nodes(solver, cuda)
                 self.assertEqual(enabled, supported and queries)
                 self.assertIn(reason, record)
+
+    def test_unset_flag_keeps_the_nodes_off(self):
+        """Keep the patch pair sort unconditional with the flag unset, as =0 does, even where nodes are supported.
+
+        The gate runs on a stand-in CUDA device that supports conditional nodes, so
+        only the flag decides; a CPU solver then records the same routes unset and
+        under =0.
+        """
+        solver, cuda = SimpleNamespace(_friction_anchors_enabled=True), SimpleNamespace(is_cuda=True)
+        choices = {}
+        with (
+            mock.patch.object(wp, "is_conditional_graph_supported", return_value=True),
+            mock.patch.object(solver_module, "capture_queries_available", return_value=True),
+        ):
+            for flag in (None, "0", "", "true", "on", "yes", "2", "1"):
+                with _nodes_flag(flag):
+                    choices[flag] = SolverFeatherPGS._patch_conditional_nodes(solver, cuda)
+        self.assertTrue(choices.pop("1")[0], "=1 requests the nodes")
+        unset = choices[None]
+        self.assertFalse(unset[0])
+        self.assertIn("experimental opt-in that FEATHER_PGS_PATCH_CONDITIONAL_NODES=1 enables", unset[1])
+        for flag, choice in choices.items():
+            self.assertEqual(choice, unset, f"flag {flag!r}")
+        routes = {}
+        for flag in (None, "0"):
+            with _nodes_flag(flag):
+                selected = SolverFeatherPGS(_arm_over_box(wp.get_device("cpu"), worlds=2))
+            self.assertFalse(selected._friction_patches.reuse_frames)
+            routes[flag] = selected.get_path_selection()["routes"]
+        self.assertEqual(routes[None]["friction"]["conditional_nodes"], {"enabled": False, "reason": unset[1]})
+        self.assertEqual(routes[None], routes["0"])
 
     def test_capture_pause_joins_the_double_buffer(self):
         """Wait for the memset slots before a capture pause and record them on the main stream after it."""
@@ -2244,7 +2290,9 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         if not wp.is_conditional_graph_supported():
             self.skipTest("Conditional graph nodes need a CUDA 12.4+ driver and Warp build")
         rng = np.random.default_rng(6)
-        graph, eager = _SolverTwin("cuda:0", jaws=True), _SolverTwin("cuda:0", reuse=False, jaws=True)
+        with _nodes_flag("1"):
+            graph = _SolverTwin("cuda:0", jaws=True)
+        eager = _SolverTwin("cuda:0", reuse=False, jaws=True)
         self.assertTrue(graph.patches.reuse_frames)
         # The memset stream forked at each step's end must stay valid across the node's capture pause.
         self.assertIsNotNone(graph.solver._memset_stream, "the jaws double-buffer their mass matrices")
@@ -2278,7 +2326,10 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         if not wp.is_conditional_graph_supported():
             self.skipTest("Conditional graph nodes need a CUDA 12.4+ driver and Warp build")
         rng = np.random.default_rng(8)
-        graph, eager = _SolverTwin("cuda:0", jaws=True), _SolverTwin("cuda:0", reuse=False, jaws=True)
+        with _nodes_flag("1"):
+            graph = _SolverTwin("cuda:0", jaws=True)
+        eager = _SolverTwin("cuda:0", reuse=False, jaws=True)
+        self.assertTrue(graph.patches.reuse_frames)
         # Eager steps leave the slots holding the first stream's frame, recorded as sorted.
         for twin in (graph, eager):
             twin.pair(collide=True)
@@ -2302,7 +2353,10 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         """Sort unconditionally, bitwise as eager flag-off steps, while a stream the caller forked is unjoined."""
         if not wp.is_conditional_graph_supported():
             self.skipTest("Conditional graph nodes need a CUDA 12.4+ driver and Warp build")
-        graph, eager = _SolverTwin("cuda:0", jaws=True), _SolverTwin("cuda:0", reuse=False, jaws=True)
+        with _nodes_flag("1"):
+            graph = _SolverTwin("cuda:0", jaws=True)
+        eager = _SolverTwin("cuda:0", reuse=False, jaws=True)
+        self.assertTrue(graph.patches.reuse_frames)
         for _ in range(3):
             for twin in (graph, eager):
                 twin.pair(collide=True)
@@ -2330,9 +2384,11 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         """Capture two double-buffered solvers in one graph, seeded together or each before its steps."""
         if not wp.is_conditional_graph_supported():
             self.skipTest("Conditional graph nodes need a CUDA 12.4+ driver and Warp build")
-        graphs = (_SolverTwin("cuda:0", jaws=True), _SolverTwin("cuda:0", boxes=True))
+        with _nodes_flag("1"):
+            graphs = (_SolverTwin("cuda:0", jaws=True), _SolverTwin("cuda:0", boxes=True))
         eagers = (_SolverTwin("cuda:0", reuse=False, jaws=True), _SolverTwin("cuda:0", reuse=False, boxes=True))
         for twin in graphs:
+            self.assertTrue(twin.patches.reuse_frames)
             self.assertIsNotNone(twin.solver._memset_stream, "both solvers double-buffer their mass matrices")
         # The boxes land before the captures.
         for _ in range(12):
@@ -2368,7 +2424,8 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         """
         if not wp.is_conditional_graph_supported():
             self.skipTest("Conditional graph nodes need a CUDA 12.4+ driver and Warp build")
-        graph = _SolverTwin("cuda:0", boxes=True)
+        with _nodes_flag("1"):
+            graph = _SolverTwin("cuda:0", boxes=True)
         eager, control = (_SolverTwin("cuda:0", reuse=False, boxes=True) for _ in range(2))
         self.assertTrue(graph.patches.reuse_frames)
         twins = (graph, eager, control)
