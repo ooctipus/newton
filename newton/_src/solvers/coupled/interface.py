@@ -93,6 +93,7 @@ import warp as wp
 
 from ...geometry import ParticleFlags
 from ...sim import BodyFlags, StateFlags
+from ...sim.contacts import note_contact_frame_write
 from .proxy_utils import (
     filter_proxy_rigid_contacts_kernel,
     harvest_proxy_momentum_forces_kernel,
@@ -450,6 +451,10 @@ class CouplingInterface:
             return contacts
 
         model = self.model
+        # Encoding shape ids in place rewrites the frame without a new generation.
+        generation = getattr(contacts, "contact_generation", None)
+        if generation is not None:
+            note_contact_frame_write(generation)
         wp.launch(
             filter_proxy_rigid_contacts_kernel,
             dim=contacts.rigid_contact_shape0.shape[0],

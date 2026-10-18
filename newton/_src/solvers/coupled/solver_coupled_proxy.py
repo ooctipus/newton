@@ -15,6 +15,7 @@ import warp as wp
 
 from ...core.reset import reset_world_selected
 from ...sim import JointType, ModelFlags, StateFlags
+from ...sim.contacts import note_contact_frame_write
 from .interface import (
     CouplingEndpointKind,
 )
@@ -1533,6 +1534,7 @@ class SolverCoupledProxy(SolverCoupled):
                 )
             finally:
                 if restore_external_contacts is not None:
+                    note_contact_frame_write(restore_external_contacts.contact_generation)
                     wp.launch(
                         restore_filtered_proxy_rigid_contacts_kernel,
                         dim=restore_external_contacts.rigid_contact_shape0.shape[0],

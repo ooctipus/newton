@@ -46,7 +46,7 @@ from ..geometry.support_function import (
     pack_mesh_ptr,
 )
 from ..geometry.types import GeoType
-from ..sim.contacts import Contacts
+from ..sim.contacts import Contacts, note_contact_frame_write
 from ..sim.model import Model
 from ..sim.state import State
 
@@ -3439,6 +3439,7 @@ class CollisionPipeline:
 
         # Compute AABBs for all shapes, zero counters, bump generation.
         # Fuses contacts.clear() + broad_phase_pair_count.zero_() + AABB update.
+        note_contact_frame_write(contacts.contact_generation)
         aabb_kernel = compute_shape_aabbs
         aabb_dim = model.shape_count
         aabb_index_inputs = []
