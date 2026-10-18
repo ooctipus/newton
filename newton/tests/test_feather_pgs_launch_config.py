@@ -14,6 +14,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import kernels as feather_pgs_kernels
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
+from newton._src.solvers.feather_pgs.contact_row_plan import contact_row_plan
 from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _DENSE_META_MAX_PARENT,
     _DENSE_META_ROW_TYPE_MASK,
@@ -229,18 +230,10 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
 
         Patch friction takes the masked builder's patch-law variant by policy
         (FEATHER_PGS_PATCH_DENSE_PATHS), never the point-only native rows, row
-        checks or Jacobian-clear skip.
+        checks or Jacobian-clear skip. The row build dispatches on contact_row_plan.
         """
-        model = _build_chain_model(num_links=12, num_worlds=1)
-        source = textwrap.dedent(inspect.getsource(SolverFeatherPGS._stage4_build_rows))
-        assignments = {
-            node.targets[0].id: node
-            for node in ast.walk(ast.parse(source))
-            if isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id in ("masked_law", "masked_sizes", "masked", "check_rows")
-        }
+        with wp.ScopedDevice("cpu"):  # the general builder; CUDA admits other producers first
+            model = _build_chain_model(num_links=12, num_worlds=1)
         step = ast.parse(textwrap.dedent(inspect.getsource(SolverFeatherPGS.step)))
         skip_clear = next(
             node.test
@@ -257,21 +250,20 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             self.assertEqual(solver._point_contact_paths, point)
             for switch in ("_ROWS_MASKED", "_ROWS_NATIVE", "_CHECK_ROWS"):
                 with self.subTest(beta=beta, environment=environment, switch=switch):
-                    values = dict.fromkeys(("_ROWS_MASKED", "_ROWS_NATIVE", "_CHECK_ROWS"), False)
-                    values.update(self=solver, size=12, _SKIP_J_CLEAR=True)
-                    values[switch] = True
-                    # Execute the actual dispatch expressions without CUDA row launches;
-                    # the solver's own admission reads the module's switches.
-                    # Older code read the debug switch directly instead of gating it.
-                    values["check_rows"] = values["_CHECK_ROWS"]
-                    switches = {name: values[name] for name in ("_ROWS_MASKED", "_ROWS_NATIVE", "_CHECK_ROWS")}
+                    switches = dict.fromkeys(("_ROWS_MASKED", "_ROWS_NATIVE", "_ROWS_FUSED", "_CHECK_ROWS"), False)
+                    switches["_CHECK_ROWS_FUSED"] = False
+                    switches[switch] = True
+                    # The plan reads the module's switches, as the solver's own admission does.
                     with mock.patch.multiple(solver_module, **switches):
-                        for node in sorted(assignments.values(), key=lambda node: node.lineno):
-                            exec(compile(ast.Module(body=[node], type_ignores=[]), "<row-dispatch>", "exec"), values)
+                        plan = contact_row_plan(solver)
+                    self.assertEqual(plan.producer, "general")
                     masked = (point and switch != "_CHECK_ROWS") or (patch_masked and switch == "_ROWS_MASKED")
-                    self.assertEqual(values["masked"], masked)
-                    self.assertEqual(bool(values["masked_sizes"]), (point or patch_masked) and switch == "_ROWS_MASKED")
-                    self.assertEqual(values["check_rows"], point and switch == "_CHECK_ROWS")
+                    method = {"_ROWS_MASKED": "masked_combined", "_ROWS_NATIVE": "native"}.get(switch, "per_contact")
+                    self.assertEqual(plan.methods, {12: method if masked else "per_contact"})
+                    self.assertEqual(bool(plan.combined), (point or patch_masked) and switch == "_ROWS_MASKED")
+                    # FEATHER_PGS_CHECK_ROWS checks the masked rows against the per-contact rows, point friction only.
+                    self.assertEqual(plan.check, "masked" if point and switch == "_CHECK_ROWS" else None)
+                    values = {**switches, "self": solver, "size": 12, "_SKIP_J_CLEAR": True}
                     self.assertEqual(
                         eval(compile(ast.Expression(skip_clear), "<row-clear>", "eval"), values),
                         point and switch != "_CHECK_ROWS",

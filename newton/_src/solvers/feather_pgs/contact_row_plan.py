@@ -1,0 +1,109 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+"""Which producer writes a FeatherPGS solver's contact rows, and which builder each DOF size takes.
+
+The plan reads host state only and launches nothing. ``_stage4_build_rows``
+dispatches on it and ``get_path_selection()`` records it under
+``routes.contact_rows``, so the record names the builders that launch.
+"""
+
+import dataclasses
+
+# Producers that write the row metadata with prepare_world_contact_rows (unless native sparse
+# factors prepare their rows in the response kernel) and build each size's response or Jacobian.
+SHARED_METADATA_PRODUCERS = ("sparse_contact_response", "sparse_diagonal", "compact_jacobian")
+
+# General-builder methods whose one launch builds the rows of up to two sizes.
+COMBINED_METHODS = ("masked_combined", "fused_rows")
+
+
+@dataclasses.dataclass(frozen=True)
+class ContactRowPlan:
+    """The contact-row producer of one solver and the builder method of each DOF size."""
+
+    producer: str
+    """The first admitted producer: ``local_packets``, ``keyed_rows``, ``compact_contact_boundary``,
+    ``sparse_contact_response``, ``sparse_diagonal``, ``compact_jacobian`` or ``general``."""
+    law: str
+    """The friction law of the contact rows: ``"point"`` or ``"patch"``."""
+    methods: dict[int, str]
+    """Builder method by DOF size, in ``size_groups`` order."""
+    combined: tuple[int, ...] = ()
+    """General producer: the sizes whose rows one masked or fused launch builds, in ``size_groups`` order."""
+    check: str | None = None
+    """General producer, debug only: the builder a row check compares (``FEATHER_PGS_CHECK_ROWS``:
+    ``"native"`` or ``"masked"`` into copies, then the per-contact rows; ``FEATHER_PGS_CHECK_ROWS_FUSED``:
+    ``"fused_rows"`` after the combined masked rows)."""
+    prepare_rows: bool = False
+    """Shared-metadata producers: ``prepare_world_contact_rows`` writes the row metadata."""
+
+
+def contact_row_plan(solver) -> ContactRowPlan:
+    """Decide the contact-row producer and each DOF size's builder method.
+
+    The first admitted producer writes every contact row: local row packets, keyed rows, the
+    compact contact boundary, then the shared-metadata producers (native sparse factors' response,
+    the sparse-diagonal owner, the compact Jacobian) and last the general builder. Owners decided at
+    construction admit the producers, so the plan stays fixed for a solver; it is evaluated from the
+    solver's current attributes and the solver module's import-time switches.
+
+    Builder methods by producer:
+
+    - ``local_packets``, ``keyed_rows``, ``compact_contact_boundary``: the owner's own builder.
+    - Shared-metadata producers: ``sparse_response`` for the factored size, ``sparse_free_response``
+      for the free-body size, whose response the sparse kernel writes; ``sparse_diagonal`` for the
+      diagonal-mass size; ``compact_jacobian`` for every other size.
+    - ``general``: ``fused_rows`` or ``masked_combined`` (one launch for the one or two sizes of at
+      most 32 DOFs), ``native`` or ``masked`` (one launch per size), else ``per_contact``.
+    """
+    from . import solver_feather_pgs as source  # noqa: PLC0415 - the solver module's import-time switches
+
+    law = "patch" if solver._friction_anchors_enabled else "point"
+    sizes = solver.size_groups
+    if solver._row_packets is not None:
+        return ContactRowPlan("local_packets", law, dict.fromkeys(sizes, "local_packets"))
+    if solver._keyed_rows is not None:
+        return ContactRowPlan("keyed_rows", law, dict.fromkeys(sizes, "keyed_rows"))
+    if solver._compact_contact_boundary:
+        return ContactRowPlan("compact_contact_boundary", law, dict.fromkeys(sizes, "compact_contact_boundary"))
+    sparse_size = solver._sparse_mass_matrix_size
+    diagonal = bool(solver._sparse_diagonal_contact_solve)
+    if sparse_size is not None or diagonal or solver._compact_contact_jacobian:
+        methods = {}
+        for size in sizes:
+            if sparse_size is not None:
+                # Native sparse factors admit one articulated size; the other is the free bodies'.
+                methods[size] = "sparse_response" if size == sparse_size else "sparse_free_response"
+            elif diagonal and size == solver._sparse_diagonal_response_size:
+                methods[size] = "sparse_diagonal"
+            else:
+                methods[size] = "compact_jacobian"
+        if sparse_size is not None:
+            producer = "sparse_contact_response"
+        elif diagonal:
+            producer = "sparse_diagonal"
+        else:
+            producer = "compact_jacobian"
+        return ContactRowPlan(producer, law, methods, prepare_rows=not solver._sparse_prepare_contacts)
+    check_rows = bool(solver._point_contact_paths and source._CHECK_ROWS)
+    masked_law = solver._masked_contact_rows()
+    masked_sizes = ()
+    if masked_law and source._ROWS_MASKED and not source._ROWS_NATIVE and not check_rows:
+        masked_sizes = tuple(size for size in sizes if size <= 32)
+    combined = masked_sizes if 1 <= len(masked_sizes) <= 2 else ()
+    methods = {}
+    for size in sizes:
+        if size in combined:
+            methods[size] = "fused_rows" if source._ROWS_FUSED and not source._CHECK_ROWS_FUSED else "masked_combined"
+        elif masked_law and (source._ROWS_MASKED or source._ROWS_NATIVE) and size <= 32 and not check_rows:
+            methods[size] = "native" if source._ROWS_NATIVE else "masked"
+        else:
+            methods[size] = "per_contact"
+    if check_rows:
+        check = "native" if source._ROWS_NATIVE else "masked"
+    elif combined and source._CHECK_ROWS_FUSED:
+        check = "fused_rows"
+    else:
+        check = None
+    return ContactRowPlan("general", law, methods, combined=combined, check=check)

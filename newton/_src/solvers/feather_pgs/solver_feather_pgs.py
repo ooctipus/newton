@@ -50,6 +50,7 @@ from . import row_metadata as _row_metadata
 from .body_mapping import build_body_maps
 from .capture_joins import capture_queries_available
 from .configuration import resolve_kernel_choices
+from .contact_row_plan import COMBINED_METHODS, SHARED_METADATA_PRODUCERS, contact_row_plan
 from .contact_torsion import (
     configure_contact_torsion,
     prepare_torsion_rows,
@@ -14057,20 +14058,18 @@ class SolverFeatherPGS(SolverBase):
             # order is the row precedence: the packets (Franka) and keyed rows opted in with
             # FEATHER_PGS_PATCH_PARALLEL_ROWS=1 take their worlds' rows before the general builder's
             # masked patch rows (_masked_contact_rows), and native sparse factors admit neither.
-            if self._row_packets is not None:
+            # get_path_selection() records the same plan (routes.contact_rows).
+            plan = contact_row_plan(self)
+            if plan.producer == "local_packets":
                 self._row_packets.produce_contacts(state_in, state_aug, contacts, dt)
-            elif self._keyed_rows is not None:
+            elif plan.producer == "keyed_rows":
                 self._keyed_rows.produce_contacts(state_in, state_aug, contacts, dt)
-            elif self._compact_contact_boundary:
+            elif plan.producer == "compact_contact_boundary":
                 from .compact_contact import launch_contacts  # noqa: PLC0415
 
                 launch_contacts(self, state_in, state_aug, contacts, contact_build_threads)
-            elif (
-                self._compact_contact_jacobian
-                or self._sparse_diagonal_contact_solve
-                or self._sparse_mass_matrix_size is not None
-            ):
-                if not self._sparse_prepare_contacts:
+            elif plan.producer in SHARED_METADATA_PRODUCERS:
+                if plan.prepare_rows:
                     wp.launch(
                         prepare_world_contact_rows,
                         dim=contact_build_threads,
@@ -14119,9 +14118,10 @@ class SolverFeatherPGS(SolverBase):
                     )
                 contact_jacobian_workers = min(contacts.rigid_contact_max, _CONTACT_JACOBIAN_WORKER_CAP)
                 for size in self.size_groups:
-                    if self._sparse_mass_matrix_size is not None and size != self._sparse_mass_matrix_size:
-                        continue
-                    if size == self._sparse_mass_matrix_size:
+                    method = plan.methods[size]
+                    if method == "sparse_free_response":
+                        continue  # The sparse response kernel writes the free bodies' response.
+                    if method == "sparse_response":
                         indices = self._sparse_mass_matrix_indices
                         sparse_contact_workers = min(
                             contact_build_threads, contact_jacobian_workers * 32 // self._sparse_contact_lanes
@@ -14178,8 +14178,8 @@ class SolverFeatherPGS(SolverBase):
                             device=model.device,
                         )
                         continue
-                    if self._sparse_diagonal_contact_solve and size == self._sparse_diagonal_response_size:
-                        continue
+                    if method == "sparse_diagonal":
+                        continue  # populate_sparse_diagonal_contact_response below writes these rows.
                     wp.launch(
                         populate_world_J_for_compact_size,
                         dim=(contact_jacobian_workers, 32),
@@ -14214,7 +14214,7 @@ class SolverFeatherPGS(SolverBase):
                         outputs=[self.J_by_size[size]],
                         device=model.device,
                     )
-                if self._sparse_diagonal_contact_solve:
+                if plan.producer == "sparse_diagonal":
                     # The dense builder has 32 lanes per worker. Give the scalar
                     # builder the contact-build thread budget; its live-prefix
                     # stride covers larger counts without visiting unused slots.
@@ -14280,17 +14280,13 @@ class SolverFeatherPGS(SolverBase):
                             device=model.device,
                         )
             else:
-                check_rows = self._point_contact_paths and _CHECK_ROWS
-                masked_law = self._masked_contact_rows()
-                masked_sizes = (
-                    [int(sz) for sz in self.size_groups if sz <= 32]
-                    if (masked_law and _ROWS_MASKED and not _ROWS_NATIVE and not check_rows)
-                    else []
-                )
+                # FEATHER_PGS_CHECK_ROWS builds the native or masked rows into copies, then the
+                # per-contact rows the solve uses, and compares them.
+                check_rows = plan.check in ("native", "masked")
                 combined_done = False
                 for size in self.size_groups:
-                    masked = masked_law and (_ROWS_MASKED or _ROWS_NATIVE) and size <= 32
-                    if masked_sizes and 1 <= len(masked_sizes) <= 2 and size in masked_sizes:
+                    method = plan.methods[size]
+                    if method in COMBINED_METHODS:
                         if combined_done:
                             continue
                         combined_done = True
@@ -14299,12 +14295,12 @@ class SolverFeatherPGS(SolverBase):
                         if pre is None or pre["flags"].shape[0] != cap:
                             pre = {"flags": wp.empty(cap, dtype=wp.int32, device=model.device)}
                             self._rows_prelude = pre
-                        size_a = masked_sizes[0]
-                        size_b = masked_sizes[1] if len(masked_sizes) > 1 else -1
+                        size_a = plan.combined[0]
+                        size_b = plan.combined[1] if len(plan.combined) > 1 else -1
                         J_a = self.J_by_size[size_a]
                         J_b = self.J_by_size[size_b] if size_b > 0 else J_a
                         rows_threads = min(cap, _ROWS_THREADS_X * _CONTACT_BUILD_THREAD_CAP)
-                        if _ROWS_FUSED and not _CHECK_ROWS_FUSED:
+                        if method == "fused_rows":
                             meta_arrays = [
                                 self.row_type,
                                 self.row_parent,
@@ -14458,7 +14454,7 @@ class SolverFeatherPGS(SolverBase):
                             self._deferred_row_launches.append(_launch_j_pass)
                         else:
                             _launch_j_pass()
-                        if _CHECK_ROWS_FUSED:
+                        if plan.check == "fused_rows":
                             meta_arrays = [
                                 self.row_type,
                                 self.row_parent,
@@ -14486,7 +14482,7 @@ class SolverFeatherPGS(SolverBase):
                                 ref,
                             )
                         continue
-                    if (masked or check_rows) and _ROWS_NATIVE:
+                    if "native" in (method, plan.check):
                         kern = getattr(self, "_row_build_native_kernel", None)
                         if kern is None:
                             kern = get_row_build_native_kernel()
@@ -14556,9 +14552,9 @@ class SolverFeatherPGS(SolverBase):
                         )
                         if check_rows:
                             self._rows_check = (size, J_out, meta_out)
-                        if masked and not check_rows:
+                        if method == "native":
                             continue
-                    elif masked or check_rows:
+                    elif "masked" in (method, plan.check):
                         cap = int(contacts.rigid_contact_point0.shape[0])
                         pre = getattr(self, "_rows_prelude", None)
                         if pre is None or pre["flags"].shape[0] != cap:
@@ -14673,7 +14669,7 @@ class SolverFeatherPGS(SolverBase):
                         )
                         if check_rows:
                             self._rows_check = (size, J_out, meta_out)
-                        if masked and not check_rows:
+                        if method == "masked":
                             continue
                     wp.launch(
                         populate_world_J_for_size,
@@ -15532,9 +15528,9 @@ class SolverFeatherPGS(SolverBase):
         launches past the patch link, which must stay the last writer of ring parents and friction
         coefficients.
 
-        This decides only the general builder's method. Local row packets, keyed rows (under patch
-        friction only with FEATHER_PGS_PATCH_PARALLEL_ROWS=1), the compact producers and native sparse
-        factors own their worlds' rows first (_stage4_build_rows), so masked patch rows serve the rest.
+        This decides only the general builder's method (contact_row_plan). Local row packets, keyed
+        rows (under patch friction only with FEATHER_PGS_PATCH_PARALLEL_ROWS=1), the compact producers
+        and native sparse factors own their worlds' rows first, so masked patch rows serve the rest.
         """
         if self._point_contact_paths:
             return True

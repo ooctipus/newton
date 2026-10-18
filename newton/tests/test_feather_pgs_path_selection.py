@@ -3,6 +3,7 @@
 
 """Exercise public automatic choices and forced implementation contracts."""
 
+import dataclasses
 import inspect
 import json
 import os
@@ -36,6 +37,10 @@ from newton.tests.test_feather_pgs_sparse_solver import _build_model, _make_solv
 from newton.tests.unittest_utils import assert_host_only
 
 STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
+# The import-time row-builder switches, held off unless a case sets one, whatever the shell exports.
+_ROW_SWITCHES_OFF = dict.fromkeys(
+    ("_ROWS_MASKED", "_ROWS_NATIVE", "_ROWS_FUSED", "_CHECK_ROWS", "_CHECK_ROWS_FUSED"), False
+)
 PATCH_DT = 1.0 / 400.0
 # The first step of the cached patch route against the ordinary route, from one state. The owner's forward
 # kinematics writes the input poses a few float32 ulps from the ordinary FK, and the resting feet's 1/dt
@@ -459,6 +464,31 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 methods = routes["contact_rows"]["general_method_by_dof"]
                 self.assertEqual(keys.count("populate_world_J_for_size"), list(methods.values()).count("per_contact"))
                 self.assertEqual(routes["velocity_limits"]["root_clamp"], "clamp_free_root_velocity_limits" in keys)
+
+    def test_cpu_row_build_dispatches_on_the_recorded_plan(self):
+        """Launch the builders the contact-row plan names: the row build and the record share one plan.
+
+        A plan that names per-contact rows where the switches select combined masked rows makes the
+        row build launch the per-contact builder, so the record cannot describe a dispatch of its own.
+        """
+        model = _cpu_free_body_model()
+        plan_rows = solver_module.contact_row_plan
+
+        def per_contact(solver):
+            plan = plan_rows(solver)
+            return dataclasses.replace(plan, methods=dict.fromkeys(plan.methods, "per_contact"), combined=())
+
+        with patch.multiple(solver_module, **{**_ROW_SWITCHES_OFF, "_ROWS_MASKED": True}):
+            solver = SolverFeatherPGS(model)
+            record = solver.get_path_selection()["routes"]["contact_rows"]
+            masked = _launched_kernel_keys(model, solver)
+            with patch.object(solver_module, "contact_row_plan", per_contact):
+                forced = _launched_kernel_keys(model, solver)
+        self.assertEqual(record["general_method_by_dof"], {"6": "masked_combined", "1": "masked_combined"})
+        builders = ("contact_row_prelude_patch", "populate_world_J_masked_patch", "populate_world_J_for_size")
+        # One combined masked launch for both sizes, then one per-contact launch per size.
+        self.assertEqual([key for key in masked if key in builders], list(builders[:2]))
+        self.assertEqual([key for key in forced if key in builders], [builders[2]] * 2)
 
     def test_cpu_split_route_reports_free_body_velocity_limit_rows(self):
         """Report free-body velocity-limit rows in split mode, where the row builder allocates them as well."""

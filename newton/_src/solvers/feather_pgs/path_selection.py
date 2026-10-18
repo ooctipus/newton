@@ -15,6 +15,8 @@ import math
 
 import numpy as np
 
+from .contact_row_plan import contact_row_plan
+
 # Options whose applied value lives under another attribute after construction.
 _APPLIED_ATTRIBUTES = {
     "double_buffer": "_double_buffer",
@@ -276,38 +278,12 @@ def _tree_group(group) -> dict:
 
 def _contact_rows(solver, source) -> dict:
     point = bool(solver._point_contact_paths)
-    # The first admitted producer writes every contact row, as in _stage4_build_rows; the
-    # general builder's masked patch rows serve only solvers no earlier producer took.
-    if solver._row_packets is not None:
-        producer = "local_packets"
-    elif solver._keyed_rows is not None:
-        producer = "keyed_rows"
-    elif solver._compact_contact_boundary:
-        producer = "compact_contact_boundary"
-    elif solver._sparse_mass_matrix_size is not None:
-        producer = "sparse_contact_response"
-    elif solver._sparse_diagonal_contact_solve:
-        producer = "sparse_diagonal"
-    elif solver._compact_contact_jacobian:
-        producer = "compact_jacobian"
-    else:
-        producer = "general"
+    # The plan _stage4_build_rows dispatches on: the first admitted producer writes every
+    # contact row; the general builder's masked patch rows serve only solvers no earlier producer took.
+    plan = contact_row_plan(solver)
     methods = None
-    if producer == "general":
-        # Mirrors _stage4_build_rows; the debug row checks are not routes.
-        masked_sizes = [int(size) for size in solver.size_groups if size <= 32]
-        masked_law = solver._masked_contact_rows()
-        methods = {}
-        for size in solver.size_groups:
-            if not masked_law or size > 32 or not (source._ROWS_MASKED or source._ROWS_NATIVE):
-                method = "per_contact"
-            elif source._ROWS_NATIVE:
-                method = "native"
-            elif 1 <= len(masked_sizes) <= 2:
-                method = "fused_rows" if source._ROWS_FUSED and not source._CHECK_ROWS_FUSED else "masked_combined"
-            else:
-                method = "masked"
-            methods[str(int(size))] = method
+    if plan.producer == "general":
+        methods = {str(int(size)): method for size, method in plan.methods.items()}
     if solver._compact_contact_boundary:
         compact_reason = (
             "FEATHER_PGS_COMPACT_CONTACT_BOUNDARY admitted the six-coordinate sparse-diagonal triples or units."
@@ -324,7 +300,7 @@ def _contact_rows(solver, source) -> dict:
         )
     packets = solver._row_packets
     return {
-        "producer": producer,
+        "producer": plan.producer,
         "general_method_by_dof": methods,
         "point_contact_paths": point,
         "row_packets": {
