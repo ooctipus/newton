@@ -43,7 +43,7 @@ class TestRegisterWhitening(unittest.TestCase):
         args.update(changes)
         return solver._parallel_register_whitening_mode(**args)
 
-    def _source(self, rows=32, arch=120, enabled=False, **changes):
+    def _source(self, rows=32, arch=120, enabled=False, capacity=192, **changes):
         kwargs = {
             "rows": rows,
             "min_rows": 0 if rows == 32 else 32,
@@ -62,7 +62,7 @@ class TestRegisterWhitening(unittest.TestCase):
             return native(snippet, *args, **kwargs)
 
         with patch.object(solver, "_REGISTER_WHITENING", enabled), patch.object(wp, "func_native", capture):
-            kernel = solver._get_pgs_solve_parallel_kernel(192, 32, 18, arch, **kwargs)
+            kernel = solver._get_pgs_solve_parallel_kernel(capacity, 32, 18, arch, **kwargs)
         self.assertEqual(len(snippets), 1)
         return kernel, snippets[0]
 
@@ -104,11 +104,12 @@ class TestRegisterWhitening(unittest.TestCase):
     def test_default_native_identity(self):
         """Emit the opt-out native text and kernel for an architecture without a measured layout.
 
-        The point-stream pins hold the opt-out text of these parallel tiers.
+        The reference is the point-stream pins' call of these tiers (64 rows, architecture
+        '120'), so the pins hold its text.
         """
         for rows in (32, 48):
-            reference, source = self._source(rows=rows)
-            fallback, fallback_source = self._source(rows=rows, arch=999, enabled=True)
+            reference, source = self._source(rows=rows, arch="120", capacity=64)
+            fallback, fallback_source = self._source(rows=rows, arch=999, enabled=True, capacity=64)
             self.assertEqual(fallback_source, source)
             self.assertEqual(fallback.key, reference.key)
 
