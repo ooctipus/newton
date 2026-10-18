@@ -1969,17 +1969,6 @@ def _frame_identity(patches, contacts):
     )
 
 
-def _after_build(sorted_frame, identity, live):
-    """Return the frame the slots hold sorted after a build, ``None`` when no frame is recorded.
-
-    A build records the frame it sorts. A new frame without live contacts sorts
-    nothing and overwrites the slots, so it drops the record instead.
-    """
-    if live > 0 or identity == sorted_frame:
-        return identity
-    return None
-
-
 def _edit_geometry(scene, rng, states, live):
     """Nudge a shape and move a live contact's body piece to a neighbouring body of its world.
 
@@ -2112,7 +2101,8 @@ def run_frame_reuse_differential(
                 sorted_frame = None
             identity = _frame_identity(patches, contacts)
             expected = int(live > 0 and identity != sorted_frame)
-            sorted_frame = _after_build(sorted_frame, identity, live)
+            # Every build records its frame: a sorted one, or one without live contacts.
+            sorted_frame = identity
             before = len(sorts)
             for state in states:
                 state.build(scene.model, scene.state, contacts)
@@ -2331,7 +2321,8 @@ def run_frame_reuse_graph(test, device, *, worlds=32, contacts=1536, capacity=20
             sorted_frame = None
         identity = _frame_identity(patches, stream)
         expected = int(live > 0 and identity != sorted_frame)
-        sorted_frame = _after_build(sorted_frame, identity, live)
+        # Every build records its frame: a sorted one, or one without live contacts.
+        sorted_frame = identity
         reused += int(live > 0 and not expected)
         assign(fixed, out, com)
         for state in (patches, twin):
@@ -2374,6 +2365,35 @@ class TestPatchFrameReuse(unittest.TestCase):
             self, "cpu", 5, worlds=110, contacts=4096, capacity=4600, threads=(97, 61), live_sort=True, plan=plan
         )
         self.assertGreater(coverage["reused"], 0)
+
+    def test_nodes_with_frame_reuse_keep_frames_the_node_left_unsorted(self):
+        """Keep a node build's frame on the next substep, also an empty one the node had no pairs to sort for.
+
+        Frame reuse keeps the second substep and a node branches on the first, as
+        with both switches on. Without live contacts the node sorts nothing, so it
+        must still record the frame; the kept substep would otherwise find no
+        record and latch the frame status.
+        """
+        scene = _Scene("cpu", 46)
+        phi = [wp.zeros(128, dtype=wp.vec2, device="cpu") for _ in range(2)]
+        plain = _FrictionPatchState(scene.model, 128, True, phi[0])
+        patches = _FrictionPatchState(scene.model, 128, True, phi[1], reuse_frames=True, conditional_nodes=True)
+        _branch_on_the_host(patches)
+        outcomes = _admitted_modes(patches)
+        for step, mode in enumerate(("live", "empty", "live", "overflow", "sparse", "empty")):
+            scene.move()
+            scene.frame(mode)
+            for substep in range(2):
+                context = f"step {step} {mode} substep {substep}"
+                if substep:
+                    scene.move()
+                for state in (plain, patches):
+                    state.build(scene.model, scene.state, scene.contacts)
+                    state.store(scene.state)
+                assert_same_state(patches, plain, context, records=False)
+                _assert_record(self, patches, _frame_identity(patches, scene.contacts), context)
+                np.testing.assert_array_equal(patches.frame_status.numpy(), [0], context)
+        self.assertEqual(outcomes, ["node", "keep"] * 6)
 
     def test_eager_builds_sort_every_frame(self):
         """Sort on every eager build, without reading a condition back, and record each sorted frame."""

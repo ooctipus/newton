@@ -627,9 +627,10 @@ def _prepare_frame(
     the host noted, is left empty instead: no contact is live, the record is
     dropped and ``frame_status`` latches, because stale pairs would group
     other contacts. ``_FRAME_DETECT`` keeps the recorded frame's pairs the same
-    way, drops the record of any other frame and publishes in ``sort_pairs``
-    whether that frame's live contacts need sorting. Threads agree on the
-    frame whether they read the record before or after thread 0 drops it.
+    way and publishes in ``sort_pairs`` whether another frame's live contacts
+    need sorting; it drops the record of such a frame and records a new frame
+    without live contacts, which needs no sort. Threads agree on the frame
+    whether they read the record before or after thread 0 writes it.
     """
     thread = wp.tid()
     raw = count[0]
@@ -651,7 +652,9 @@ def _prepare_frame(
     if thread == 0:
         extent[0] = end
         extent[1] = live
-        if mode == _FRAME_SORT:
+        # The slots hold a frame without live contacts sorted as soon as it is
+        # prepared; a thread that reads its record keeps no slot.
+        if mode == _FRAME_SORT or (mode == _FRAME_DETECT and recorded == 0 and live == 0):
             sorted_frame[0] = wp.int64(generation[0])
             sorted_frame[1] = wp.int64(raw)
             sorted_frame[2] = stream
