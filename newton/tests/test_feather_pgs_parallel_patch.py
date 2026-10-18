@@ -35,6 +35,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import assert_loaded_anchors, assert_ring_coulomb, standing_model
+from newton.tests.feather_pgs_row_builders import install_cpu_keyed_rows
 
 _DOFS = 6
 _CAPACITY = 64
@@ -528,13 +529,8 @@ class TestKeyedPatchRows(unittest.TestCase):
         }
         general = SolverFeatherPGS(model, **options)
         keyed = SolverFeatherPGS(model, **options)
-        # Stand-ins for the matrix-free world layout keyed rows read: one articulation per world.
-        keyed.max_world_dofs = int(model.joint_dof_count) // keyed.world_count
-        keyed.articulation_world_dof_offset = wp.zeros(model.articulation_count, dtype=int, device=model.device)
-        keyed.mf_constraint_count = wp.zeros(keyed.world_count, dtype=int, device=model.device)
-        keyed.mf_gs_parallel_rows = 4
         keyed._friction_patches = general._friction_patches
-        keyed._keyed_rows = keyed_rows.KeyedRows(keyed)
+        install_cpu_keyed_rows(keyed)
         if late_beta is not None:
             general.friction_anchor_beta = keyed.friction_anchor_beta = late_beta
         state, out = model.state(), model.state()

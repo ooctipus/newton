@@ -1054,12 +1054,12 @@ class TestCompactContact(unittest.TestCase):
             linked = pooled = False
             independent = [False] * len(solvers)
             serial = [False] * len(solvers)
-            for _step in range(6):
+            for step in range(6):
                 for index, solver in enumerate(solvers):
                     current, following = states[index]
                     with launched_kernels() as keys:
                         solver.step(current, following, controls[index], contacts[index], 1 / 240)
-                    if _step == 0:
+                    if step == 0:
                         assert_row_builders_named(self, records[index], keys)
                     states[index] = [following, current]
                 reference = contact_rows(solvers[0], contacts[0])

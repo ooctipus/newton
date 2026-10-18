@@ -4,19 +4,32 @@
 """Check the contact-row builders a FeatherPGS route record names against the kernels a step launches.
 
 ``get_path_selection()["routes"]["contact_rows"]["builder_by_dof"]`` names, per DOF
-size, the kernels that build the contact rows. :func:`assert_row_builders_named`
-requires those names to be exactly the contact-row builders among the kernels one
-recorded step launched. This module holds shared test helpers; it defines no tests.
+size, the kernels that build the dense contact rows outside the sweep, in launch
+order. :func:`assert_row_builders_named` requires those names to be exactly the
+contact-row builders among the kernels one recorded step launched, in that order
+and with one launch per step or per size. The module also holds the keyed-row CPU
+stand-in and the row-builder switch table the record tests share. It defines no
+tests.
 """
 
+import collections
 import contextlib
 from unittest import mock
 
 import warp as wp
 
-# Every kernel a contact-row producer launches to write dense contact rows: the general builder's
-# methods, the shared-metadata producers, the compact contact boundary, local row packets and keyed
-# rows. The free-body matrix-free and propagation rows follow the allocation path, not a producer.
+from newton._src.solvers.feather_pgs import keyed_rows
+
+# The import-time row-builder switches of the solver module, held off unless a case sets one, whatever the
+# shell exports.
+ROW_SWITCHES_OFF = dict.fromkeys(
+    ("_ROWS_MASKED", "_ROWS_NATIVE", "_ROWS_FUSED", "_CHECK_ROWS", "_CHECK_ROWS_FUSED"), False
+)
+
+# Every kernel a contact-row producer launches to write dense contact rows outside the sweep: the general
+# builder's methods, the shared-metadata producers, the compact contact boundary, local row packets and keyed
+# rows. The free-body matrix-free and propagation rows follow the allocation path, not a producer. Add every
+# new producer kernel here: a launched builder missing from this list is invisible to the check below.
 ROW_BUILDER_KERNELS = frozenset(
     (
         "populate_world_J_for_size",
@@ -45,16 +58,25 @@ ROW_BUILDER_KERNELS = frozenset(
 # keyed-row fallbacks.
 _GENERATED_PREFIXES = ("populate_sparse_contact_response_", "mark_independent_sparse_contact_candidates")
 _GENERATED_SUFFIXES = ("keyed_rows_fallback", "keyed_rows_patch_fallback")
+# Builders that launch once for every DOF size whose entry names them. Every other named builder serves all
+# the sizes that name it in one launch per step (the row metadata, a producer's contact kernels, a combined
+# masked or fused launch), except the masked builder's per-size method, "masked".
+PER_SIZE_KERNELS = frozenset(
+    (
+        "populate_world_J_for_size",
+        "populate_world_J_for_compact_size",
+        "populate_world_J_native",
+        "materialize_fallback",
+        "materialize_patch_fallback",
+    )
+)
 
 
-def row_builder_kernels(keys) -> set:
-    """Return the contact-row builder kernels among launched kernel keys."""
-    return {
-        key
-        for key in keys
-        if key is not None
-        and (key in ROW_BUILDER_KERNELS or key.startswith(_GENERATED_PREFIXES) or key.endswith(_GENERATED_SUFFIXES))
-    }
+def is_row_builder(key) -> bool:
+    """Whether a launched kernel key is a contact-row builder."""
+    return key is not None and (
+        key in ROW_BUILDER_KERNELS or key.startswith(_GENERATED_PREFIXES) or key.endswith(_GENERATED_SUFFIXES)
+    )
 
 
 @contextlib.contextmanager
@@ -73,18 +95,52 @@ def launched_kernels():
         yield keys
 
 
+def install_cpu_keyed_rows(solver):
+    """Install keyed rows on a CPU solver, with stand-ins for the matrix-free world layout they read.
+
+    The CUDA admission (keyed_rows.create_owner) needs the in-kernel parallel sweep; these stand-ins
+    take one articulation per world and no matrix-free rows. A solver that shares another's friction
+    patches must take them before this call, since the owner binds the patch law here.
+    """
+    model = solver.model
+    solver.max_world_dofs = int(model.joint_dof_count) // solver.world_count
+    solver.articulation_world_dof_offset = wp.zeros(model.articulation_count, dtype=int, device=model.device)
+    solver.mf_constraint_count = wp.zeros(solver.world_count, dtype=int, device=model.device)
+    solver.mf_gs_parallel_rows = 4
+    solver._keyed_rows = keyed_rows.KeyedRows(solver)
+
+
+def _launches_per_step(builders) -> collections.Counter:
+    """How many times one step launches each kernel the entries name."""
+    counts = collections.Counter()
+    for entry in builders.values():
+        for kernel in entry["kernels"]:
+            counts[kernel] += kernel in PER_SIZE_KERNELS or entry["method"] == "masked"
+    return collections.Counter({kernel: count or 1 for kernel, count in counts.items()})
+
+
 def assert_row_builders_named(test, contact_rows, keys):
-    """Require ``builder_by_dof`` to name exactly the contact-row builders among ``keys``.
+    """Require ``builder_by_dof`` to name exactly the contact-row builders among ``keys``, in order and count.
+
+    Every launched builder is named and every named builder launched; each entry's kernels launch in
+    the order the entry lists them (their launches, with repeats removed, start with the list); a
+    per-size builder launches once for each size that names it and every other builder once.
 
     Args:
         test: The running test case.
         contact_rows: ``get_path_selection()["routes"]["contact_rows"]``, taken under the switches
             the recorded step ran with.
-        keys: The kernel keys of at least one whole step.
+        keys: The kernel keys of one whole step.
     """
     builders = contact_rows["builder_by_dof"]
+    launched = [key for key in keys if is_row_builder(key)]
     named = {kernel for entry in builders.values() for kernel in entry["kernels"]}
     test.assertTrue(named, builders)
-    test.assertEqual(row_builder_kernels(keys), named, builders)
+    test.assertEqual(set(launched), named, builders)
+    test.assertEqual(collections.Counter(launched), _launches_per_step(builders), builders)
+    for size, entry in builders.items():
+        own = [key for key in launched if key in entry["kernels"]]
+        own = [key for index, key in enumerate(own) if index == 0 or own[index - 1] != key]
+        test.assertEqual(own[: len(entry["kernels"])], entry["kernels"], (size, entry, launched))
     # Every producer writes the solver's friction law for every size.
     test.assertEqual({entry["law"] for entry in builders.values()}, {contact_rows["law"]}, builders)
