@@ -20,7 +20,6 @@ import os
 import sys
 import time
 import warnings
-import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cache
@@ -7918,10 +7917,10 @@ class SolverFeatherPGS(SolverBase):
         self._memset_stream = wp.Stream(self.model.device)
         self._j_active_counts = [wp.zeros_like(self.constraint_count), wp.zeros_like(self.constraint_count)]
         # Track the last memset-done event per buffer slot so the main stream
-        # can wait only for the specific buffer it needs, and the capture
-        # segment each was recorded in (see _wait_memset_done).
+        # can wait only for the specific buffer it needs, and whether it is a
+        # seeded event (see _wait_memset_done).
         self._memset_done_event: list[wp.Event | None] = [None, None]
-        self._memset_done_segment: list[tuple | None] = [None, None]
+        self._memset_done_seeded = [False, False]
 
     def seed_double_buffer_events(self):
         """Record initial memset_done events on the main stream.
@@ -7934,39 +7933,23 @@ class SolverFeatherPGS(SolverBase):
         if self._memset_stream is None:
             return
         main_stream = wp.get_stream(self.model.device)
-        self._record_memset_done(0, main_stream.record_event())
-        self._record_memset_done(1, main_stream.record_event())
+        self._record_memset_done(0, main_stream.record_event(), seeded=True)
+        self._record_memset_done(1, main_stream.record_event(), seeded=True)
 
-    def _capture_segment(self):
-        """Return the graph the main stream captures into and its capture id, or ``None`` outside a capture.
-
-        Every pause of a capture, such as a conditional node recording its body,
-        resumes it under a new capture id.
-        """
-        device = self.model.device
-        graph = device.captures.get(wp.get_stream(device)) if device.is_cuda else None
-        return None if graph is None else (weakref.ref(graph), graph.capture_id)
-
-    def _record_memset_done(self, slot, event):
-        """Record the event a buffer slot's consumer waits for, with its capture segment."""
+    def _record_memset_done(self, slot, event, *, seeded=False):
+        """Record the event a buffer slot's consumer waits for."""
         self._memset_done_event[slot] = event
-        self._memset_done_segment[slot] = self._capture_segment()
+        self._memset_done_seeded[slot] = seeded
 
     def _wait_memset_done(self, stream, slot):
-        """Make ``stream`` wait for a buffer slot's memset.
+        """Make ``stream``, the main stream, wait for a buffer slot's memset.
 
-        An event recorded before a pause of the current capture, by any solver or
-        caller, cannot be waited on after it. The resumed capture depends on every
-        node captured before the pause, so such a wait is already satisfied and
-        is dropped.
+        A seeded event, recorded on the main stream itself, orders nothing, so it
+        is not waited on: a capture paused since it was recorded, for example by
+        another solver's conditional node, would reject the wait.
         """
-        event = self._memset_done_event[slot]
-        if event is None:
-            return
-        recorded, current = self._memset_done_segment[slot], self._capture_segment()
-        if recorded is not None and current is not None and recorded[0]() is current[0]() and recorded[1] != current[1]:
-            return
-        stream.wait_event(event)
+        if self._memset_done_event[slot] is not None and not self._memset_done_seeded[slot]:
+            stream.wait_event(self._memset_done_event[slot])
 
     @contextmanager
     def _double_buffer_capture_pause(self):

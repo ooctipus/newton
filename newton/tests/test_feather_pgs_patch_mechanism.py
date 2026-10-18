@@ -37,7 +37,6 @@ import inspect
 import itertools
 import os
 import unittest
-import weakref
 from types import SimpleNamespace
 from unittest import mock
 
@@ -1227,10 +1226,6 @@ def _bare_solver(**attributes):
     return solver
 
 
-class _Handle:
-    """A weakly referenced stand-in for a captured graph."""
-
-
 def _host_branch(condition, on_true, **kwargs):
     """Branch as :func:`warp.capture_if` does on replay: run ``on_true`` for a nonzero condition."""
     if condition.numpy()[0]:
@@ -2073,70 +2068,62 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
             wait_event=lambda event: log.append(f"wait {event}"),
             record_event=lambda: log.append("record") or f"main {len(log)}",
         )
-        # (memset stream in the capture, slots before, calls, slots after); the
-        # first capture step's stream has not been forked into the capture yet.
+        # (memset stream in the capture, slots before, seeded slots, calls, slots
+        # after); the first capture step's stream has not been forked into the
+        # capture yet, and a seeded slot orders nothing.
         cases = (
             (
                 True,
                 ["main 0", "memset 1"],
+                [False, False],
                 ["wait main 0", "wait memset 1", "node", "record", "record"],
                 ["main 4", "main 5"],
             ),
-            (True, ["memset 0", None], ["wait memset 0", "node", "record"], ["main 3", None]),
-            (False, ["seed 0", "seed 1"], ["node", "record", "record"], ["main 2", "main 3"]),
-            (False, [None, "eager 1"], ["node", "record"], [None, "main 2"]),
-            (None, None, ["node"], None),
+            (True, ["memset 0", None], [False, False], ["wait memset 0", "node", "record"], ["main 3", None]),
+            (True, ["seed 0", "memset 1"], [True, False], ["wait memset 1", "node", "record", "record"], None),
+            (False, ["seed 0", "seed 1"], [True, True], ["node", "record", "record"], ["main 2", "main 3"]),
+            (False, [None, "eager 1"], [False, False], ["node", "record"], [None, "main 2"]),
+            (None, None, None, ["node"], None),
         )
-        for capturing, events, expected, after in cases:
-            with self.subTest(capturing=capturing, events=str(events)):
+        for capturing, events, seeded, expected, after in cases:
+            with self.subTest(capturing=capturing, events=str(events), seeded=str(seeded)):
                 log.clear()
                 solver = _bare_solver(
                     _memset_stream=None if capturing is None else SimpleNamespace(is_capturing=capturing),
                     _memset_done_event=events,
-                    _memset_done_segment=None if events is None else [None] * len(events),
+                    _memset_done_seeded=seeded,
                 )
                 with mock.patch.object(wp, "get_stream", return_value=main) as get_stream:
                     with SolverFeatherPGS._double_buffer_capture_pause(solver):
                         log.append("node")
                 self.assertEqual(log, expected)
-                self.assertEqual(solver._memset_done_event, after)
+                if after is not None:
+                    self.assertEqual(solver._memset_done_event, after)
+                if events is not None:
+                    self.assertEqual(solver._memset_done_seeded, [False, False], "recorded slots are not seeded")
                 self.assertEqual(get_stream.called, events is not None)
 
-    def test_memset_waits_drop_events_of_earlier_capture_segments(self):
-        """Wait for a buffer slot's memset unless its event was recorded before a pause of the same capture."""
-        graph, other = _Handle(), _Handle()
-        waits = []
-        stream = SimpleNamespace(wait_event=waits.append)
-        segment = {
-            None: None,
-            "1": (weakref.ref(graph), 1),
-            "2": (weakref.ref(graph), 2),
-            "other": (weakref.ref(other), 1),
-        }
-        # (segment the event was recorded in, current segment, whether the stream waits)
-        cases = (
-            (None, None, True),
-            ("1", "1", True),
-            ("1", "2", False),
-            ("other", "2", True),
-            ("1", None, True),
-            (None, "2", True),
+    def test_memset_waits_skip_seeded_events(self):
+        """Wait for each recorded memset event, never for a seeded one, which another solver's pause can outdate."""
+        log = []
+        main = SimpleNamespace(
+            wait_event=lambda event: log.append(f"wait {event}"),
+            record_event=lambda: log.append("record") or f"seed {len(log)}",
         )
-        for recorded, current, waited in cases:
-            with self.subTest(recorded=recorded, current=current):
-                waits.clear()
-                solver = _bare_solver(
-                    _memset_done_event=["event", None], _memset_done_segment=[segment[recorded], None]
-                )
-                solver._capture_segment = lambda current=current: segment[current]
-                solver._wait_memset_done(stream, 0)
-                solver._wait_memset_done(stream, 1)
-                self.assertEqual(waits, ["event"] if waited else [])
-        solver = _bare_solver(_memset_done_event=[None, None], _memset_done_segment=[None, None])
-        solver._capture_segment = lambda: segment["2"]
-        solver._record_memset_done(1, "recorded")
-        self.assertEqual(solver._memset_done_event, [None, "recorded"])
-        self.assertEqual(solver._memset_done_segment, [None, segment["2"]])
+        solver = _bare_solver(
+            _memset_stream=object(), _memset_done_event=[None, None], _memset_done_seeded=[False, False]
+        )
+        with mock.patch.object(wp, "get_stream", return_value=main):
+            solver.seed_double_buffer_events()
+        self.assertEqual(solver._memset_done_seeded, [True, True])
+        for slot in (0, 1):
+            solver._wait_memset_done(main, slot)
+        self.assertEqual(log, ["record", "record"], "seeded events order nothing on the main stream")
+        solver._record_memset_done(1, "memset 1")
+        for slot in (0, 1):
+            solver._wait_memset_done(main, slot)
+        self.assertEqual(log[2:], ["wait memset 1"])
+        self.assertEqual(solver._memset_done_seeded, [True, False])
 
     def test_reused_frames_step_bitwise_as_the_unconditional_chain(self):
         """Step bitwise as with the flag off while substeps share frames and only changed frames sort."""
