@@ -107,7 +107,8 @@ class PatchRowLaw:
     launches ``link_patch_routes``) divides it and links the ring. The compact contact boundary
     and the local row packets apply the law through :func:`patch_row_frame` and
     :func:`patch_tangent_row`; keyed rows write it in their native row source
-    (``keyed_rows._patch_row_law``).
+    (``keyed_rows._patch_row_law``), and the masked row builder's patch variants
+    (``row_build.contact_row_prelude_patch``) as the per-contact builder does.
     """
 
     patches: FrictionPatches

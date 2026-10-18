@@ -5207,7 +5207,9 @@ class SolverFeatherPGS(SolverBase):
             # (measured: Kuka lift 12.7 ms there against 15.5 on sparse factors).
             # Both friction laws: patch friction walks contact units in the paired
             # sweep, writes masked patch rows and keeps the resolved-world
-            # classifier, unless FEATHER_PGS_PATCH_DENSE_PATHS=0.
+            # classifier, unless FEATHER_PGS_PATCH_DENSE_PATHS=0. An opted-in
+            # parallel tier claims the buffers first (above); the active-row scan
+            # below serves only worlds sparse factors keep, never free-body ones.
             self._sparse_selection_reason = (
                 "Worlds with free rigid bodies keep the dense route for the held-tree owner and paired response."
             )
@@ -14006,6 +14008,11 @@ class SolverFeatherPGS(SolverBase):
                     self.J_by_size[size].zero_()
                 j_buffers_zeroed = True
 
+            # The first admitted producer writes every contact row: local row packets, keyed rows,
+            # the compact and sparse producers, then the general builder. Under patch friction this
+            # order is the row precedence: the packets (Franka) and keyed rows opted in with
+            # FEATHER_PGS_PATCH_PARALLEL_ROWS=1 take their worlds' rows before the general builder's
+            # masked patch rows (_masked_contact_rows), and native sparse factors admit neither.
             if self._row_packets is not None:
                 self._row_packets.produce_contacts(state_in, state_aug, contacts, dt)
             elif self._keyed_rows is not None:
@@ -15480,6 +15487,10 @@ class SolverFeatherPGS(SolverBase):
         their checks) is on, or the sweep builds its worlds' rows in-kernel: that defers the masked
         launches past the patch link, which must stay the last writer of ring parents and friction
         coefficients.
+
+        This decides only the general builder's method. Local row packets, keyed rows (under patch
+        friction only with FEATHER_PGS_PATCH_PARALLEL_ROWS=1), the compact producers and native sparse
+        factors own their worlds' rows first (_stage4_build_rows), so masked patch rows serve the rest.
         """
         if self._point_contact_paths:
             return True

@@ -32,6 +32,17 @@ _BETA_REASONS = {
     "argument": "friction_anchor_beta passed explicitly.",
 }
 
+# Which claim wins where two patch routes could serve the same world: the order of the
+# declines in _setup_sparse_mass_matrix and of the row producers in _stage4_build_rows.
+_PATCH_ROUTE_PRECEDENCE = (
+    " Patch routes, first claim first: an opted-in parallel tier (FEATHER_PGS_PATCH_PARALLEL_ROWS=1), then the"
+    " dense route of free-body worlds (FEATHER_PGS_PATCH_DENSE_PATHS), before native sparse factors, which select"
+    " patch rows at sweep entry (FEATHER_PGS_PATCH_ACTIVE_ROWS) and own their worlds' rows. On the dense route"
+    " contact_rows.producer is the first admitted of local_packets, keyed_rows (FEATHER_PGS_PATCH_PARALLEL_ROWS=1),"
+    " the compact producers and general, whose masked rows take the patch row law unless"
+    " FEATHER_PGS_PATCH_DENSE_PATHS=0."
+)
+
 
 def json_value(value):
     """Return a JSON-compliant host copy of a scalar, sequence or mapping without reading device memory."""
@@ -249,6 +260,8 @@ def _tree_group(group) -> dict:
 
 def _contact_rows(solver, source) -> dict:
     point = bool(solver._point_contact_paths)
+    # The first admitted producer writes every contact row, as in _stage4_build_rows; the
+    # general builder's masked patch rows serve only solvers no earlier producer took.
     if solver._row_packets is not None:
         producer = "local_packets"
     elif solver._keyed_rows is not None:
@@ -690,11 +703,13 @@ def _friction(solver) -> dict:
     reason = _BETA_REASONS[solver._friction_anchor_beta_source]
     if patch:
         parallel = "" if solver._parallel_contact_paths else "keyed rows, parallel matrix-free tiers and "
+        # FEATHER_PGS_PATCH_DENSE_PATHS=0 keeps patch friction off the resolved-world classifier.
+        classifier = "" if solver._patch_dense_paths else "the resolved-world classifier, "
         # FEATHER_PGS_PATCH_ACTIVE_ROWS=0 keeps patch friction off the sparse active-row scan.
         sparse = "sparse triplets" if solver._patch_active_rows else "sparse active rows and triplets"
         reason += (
-            f" Point-contact owners ({parallel}response blocks, the resolved-world classifier, multiblock sweeps,"
-            f" {sparse}) need point friction."
+            f" Point-contact owners ({parallel}response blocks, {classifier}multiblock sweeps, {sparse}) need point"
+            f" friction.{_PATCH_ROUTE_PRECEDENCE}"
         )
     return {
         "law": "patch" if patch else "point",

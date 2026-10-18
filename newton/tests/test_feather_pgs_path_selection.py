@@ -351,6 +351,30 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         debug = SolverFeatherPGS(_cpu_model(), pgs_debug=True).get_path_selection()["routes"]
         self.assertEqual(debug["sweep"]["driver"], "debug_loop")
 
+    def test_cpu_patch_record_states_the_route_precedence(self):
+        """Name which patch route claims a world first, and list the classifier as point-only only when it is."""
+        for flag in (None, "0"):
+            with self.subTest(FEATHER_PGS_PATCH_DENSE_PATHS=flag), patch.dict(os.environ):
+                os.environ.pop("FEATHER_PGS_PATCH_DENSE_PATHS", None)
+                if flag is not None:
+                    os.environ["FEATHER_PGS_PATCH_DENSE_PATHS"] = flag
+                friction = SolverFeatherPGS(_cpu_free_body_model()).get_path_selection()["routes"]["friction"]
+                self.assertEqual(friction["law"], "patch")
+                owners, precedence = friction["reason"].split(" need point friction.")
+                # The resolved-world classifier serves patch friction unless FEATHER_PGS_PATCH_DENSE_PATHS=0.
+                self.assertEqual("resolved-world classifier" in owners, flag == "0")
+                # Route claims, then row producers, each in the order the solver tries them.
+                for claims in (
+                    ("parallel tier", "free-body worlds", "native sparse factors"),
+                    ("local_packets", "keyed_rows", "compact producers", "general"),
+                ):
+                    positions = [precedence.find(claim) for claim in claims]
+                    self.assertNotIn(-1, positions, claims)
+                    self.assertEqual(positions, sorted(positions), claims)
+        # Point friction's record names no patch route.
+        point = SolverFeatherPGS(_cpu_free_body_model(), friction_anchor_beta=0.0).get_path_selection()
+        self.assertEqual(point["routes"]["friction"]["reason"], "friction_anchor_beta passed explicitly.")
+
     def test_cpu_grouped_record_follows_the_response_dispatch(self):
         """Label the sizes a grouped topology would serve, with their reasons, from host state alone."""
         solver = SolverFeatherPGS(_cpu_free_body_model())
