@@ -725,7 +725,8 @@ def test_jacobian_with_mask(test, device):
     # First articulation should have non-zero Jacobian
     test.assertNotEqual(np.abs(J_np[0]).max(), 0.0)
 
-    # Second articulation should be zero (masked out)
+    # The second articulation is masked out, so its block keeps the zeros of the
+    # zero-initialized buffer: a masked eval_jacobian leaves unselected blocks untouched.
     test.assertEqual(np.abs(J_np[1]).max(), 0.0)
 
 
@@ -1360,7 +1361,9 @@ def test_articulation_view_api(test, device):
     J2_np = J2.numpy()
     H2_np = H2.numpy()
 
-    # robot_a should be zero (not in view_b)
+    # robot_a is not in view_b. Its Jacobian block keeps the zeros of the zero-initialized
+    # J2, since the view leaves blocks outside it untouched; eval_mass_matrix zeroes its H2
+    # entries.
     test.assertEqual(np.abs(J2_np[0]).max(), 0.0)
     test.assertEqual(H2_np[0, 0, 0], 0.0)
     # robot_b should have values

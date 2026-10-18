@@ -1840,8 +1840,8 @@ def eval_mass_matrix(
            If None, allocates internally.
         J: Optional pre-computed Jacobian. If None, computes internally.
            Shape (articulation_count, max_links*6, max_dofs). Only the blocks of
-           selected articulations are read, so :func:`eval_jacobian` with the same
-           mask provides enough.
+           selected articulations are read, so :func:`~newton.eval_jacobian` with the
+           same mask provides enough.
         body_I_s: Optional pre-allocated temp array for spatial inertias,
                   shape (body_count,), dtype wp.spatial_matrix. If None, allocates internally.
         joint_S_s: Optional pre-allocated temp array for motion subspaces (only used if J is None),
