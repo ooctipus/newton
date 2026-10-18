@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Validate opt-in, load-bounded spin resistance on articulated contacts."""
 
+import os
 import unittest
 import warnings
 from types import SimpleNamespace
@@ -21,6 +22,27 @@ from newton.tests.test_feather_pgs_friction_patches import _patch_fixture
 PATCH_OPTIONS = {"friction_anchor_beta": 0.2, "contact_shared_anchor": False, "contact_friction_shared_anchor": False}
 
 
+def pads(device, *, mu=0.5, separation=0.0, restitution=0.0):
+    """Build two equal articulated rectangular pads facing each other along z, each on a D6 joint."""
+    b = newton.ModelBuilder(gravity=(0, 0, 0))
+    for side in (-1, 1):
+        pose = wp.transform(wp.vec3(0, 0, side * (0.025 + separation / 2)), wp.quat_identity())
+        body = b.add_link(
+            xform=pose, mass=0.3, inertia=wp.mat33(np.diag([0.00012, 0.00012, 0.00008]).astype(np.float32))
+        )
+        axes = [newton.ModelBuilder.JointDofConfig(axis=wp.vec3(*a)) for a in ((1, 0, 0), (0, 1, 0), (0, 0, 1))]
+        joint = b.add_joint_d6(-1, body, parent_xform=pose, linear_axes=axes, angular_axes=axes)
+        b.add_articulation([joint])
+        b.add_shape_box(
+            body,
+            hx=0.02,
+            hy=0.015,
+            hz=0.025,
+            cfg=newton.ModelBuilder.ShapeConfig(density=0, mu=mu, restitution=restitution),
+        )
+    return b.finalize(device=device)
+
+
 def fixture(
     radius=None,
     *,
@@ -38,23 +60,7 @@ def fixture(
     **solver_overrides,
 ):
     """Solve two equal articulated rectangular pads touching face to face."""
-    b = newton.ModelBuilder(gravity=(0, 0, 0))
-    for side in (-1, 1):
-        pose = wp.transform(wp.vec3(0, 0, side * (0.025 + separation / 2)), wp.quat_identity())
-        body = b.add_link(
-            xform=pose, mass=0.3, inertia=wp.mat33(np.diag([0.00012, 0.00012, 0.00008]).astype(np.float32))
-        )
-        axes = [newton.ModelBuilder.JointDofConfig(axis=wp.vec3(*a)) for a in ((1, 0, 0), (0, 1, 0), (0, 0, 1))]
-        joint = b.add_joint_d6(-1, body, parent_xform=pose, linear_axes=axes, angular_axes=axes)
-        b.add_articulation([joint])
-        b.add_shape_box(
-            body,
-            hx=0.02,
-            hy=0.015,
-            hz=0.025,
-            cfg=newton.ModelBuilder.ShapeConfig(density=0, mu=mu, restitution=restitution),
-        )
-    model = b.finalize(device="cuda:0")
+    model = pads("cuda:0", mu=mu, separation=separation, restitution=restitution)
     a, z = model.state(), model.state()
     a.joint_qd.assign(np.array([sliding, 0, closing, 0, 0, spin, -sliding, 0, -closing, 0, 0, -spin], np.float32))
     newton.eval_fk(model, a.joint_q, a.joint_qd, a)
@@ -144,9 +150,10 @@ def torsion_neutral_route(solver):
     """Return a solver's route record without the entries that name its torsion configuration.
 
     A zero-radius solver and a positive-radius solver with no shape selected differ by construction
-    only in the torsion options, the friction record's torsion flag, the point-contact flag that
-    torsion clears and the torsion specialization of the matrix-free sweep kernel. Reasons are text
-    and lane timings are measurements; every other selection and applied option must match.
+    only in the torsion options, the friction record's torsion flag, the point-contact flag and the
+    parallel-row admission that torsion clears, and the torsion specialization of the matrix-free
+    sweep kernel. Reasons are text and lane timings are measurements; every other selection and
+    applied option must match, the tiers and keyed rows the parallel-row admission gates included.
     """
     record = _without_reasons(solver.get_path_selection())
     del record["measurements"]
@@ -154,6 +161,7 @@ def torsion_neutral_route(solver):
         del record["options"][name]
     routes = record["routes"]
     del routes["friction"]["torsion"]
+    del routes["friction"]["parallel_rows"]
     del routes["contact_rows"]["point_contact_paths"]
     if routes["sweep"]["mf_gs"] is not None:
         routes["sweep"]["mf_gs"] = routes["sweep"]["mf_gs"].replace("_torsion", "")
@@ -365,6 +373,38 @@ class TestContactTorsionPatchGrouping(unittest.TestCase):
         solver.row_parent.assign(parents)
         with self.assertRaisesRegex(RuntimeError, "load ring"):
             _contact_groups(solver, state, contacts)
+
+
+class TestTorsionNeutralRoute(unittest.TestCase):
+    """Compare the torsion comparison arms' route records on the CPU, where their CUDA classes cannot run."""
+
+    def test_selected_out_record_matches_zero_radius(self):
+        """Leave only the entries torsion_neutral_route drops between the arms, under both friction laws.
+
+        The CUDA comparisons of a zero radius against a selected-out radius require equal neutral
+        records before comparing states. Records are decided at construction, so both arms are
+        built here in split mode, with the CUDA-only torsion mode check patched out, and neither
+        is stepped. ``FEATHER_PGS_PATCH_PARALLEL_ROWS=1`` admits patch friction to the parallel
+        rows that torsion keeps a solver out of, as point friction is admitted.
+        """
+        model = pads("cpu")
+        split = {"pgs_mode": "split", "friction_anchor_beta": 0.0, "pgs_warmstart": False, **TORSION_OFF_ROUTE}
+        for law, options in (("point", {}), ("patch", PATCH_OPTIONS)):
+            for switch in (None, "1"):
+                with (
+                    self.subTest(law=law, FEATHER_PGS_PATCH_PARALLEL_ROWS=switch),
+                    patch.dict(os.environ),
+                    patch("newton._src.solvers.feather_pgs.contact_torsion._validate_torsion_mode"),
+                ):
+                    os.environ.pop("FEATHER_PGS_PATCH_PARALLEL_ROWS", None)
+                    if switch is not None:
+                        os.environ["FEATHER_PGS_PATCH_PARALLEL_ROWS"] = switch
+                    reference = SolverFeatherPGS(model, contact_torsion_radius=0.0, **{**split, **options})
+                    selected_out = SolverFeatherPGS(
+                        model, contact_torsion_radius=0.01, contact_torsion_shape_indices=(), **{**split, **options}
+                    )
+                    self.assertTrue(selected_out._contact_torsion_enabled)
+                    self.assertEqual(torsion_neutral_route(selected_out), torsion_neutral_route(reference))
 
 
 @unittest.skipUnless(wp.get_device().is_cuda, "Contact torsion currently requires CUDA")
