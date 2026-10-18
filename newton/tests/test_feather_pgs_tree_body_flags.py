@@ -446,12 +446,13 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
     def test_moving_kinematic_body_keeps_its_contact_rows(self):
         """A kinematic body closing on a dynamic one keeps its world's contact rows under the owner.
 
-        Under point friction in matrix-free mode the resolved-world classifier
-        reads the twists the owner's predictor publishes. It took a kinematic
-        body of a responding tree as still, where the ordinary route keeps the
-        world's rows: a free box made kinematic at runtime, which the owner
-        now absorbs, and a kinematic floating root built with a dynamic link.
-        The owner skipped the first contact step and over-corrected after it.
+        In matrix-free mode the resolved-world classifier reads the twists the
+        owner's predictor publishes, under point friction and, with its row
+        bound, under persistent patch friction. It took a kinematic body of a
+        responding tree as still, where the ordinary route keeps the world's
+        rows: a free box made kinematic at runtime, which the owner now
+        absorbs, and a kinematic floating root built with a dynamic link. The
+        owner skipped the first contact step and over-corrected after it.
         """
         cases = (
             # (case, scene, made kinematic at runtime, driven coordinate of the kinematic free joint)
@@ -459,20 +460,25 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
             ("kinematic root built", _kinematic_root_and_box, False, 0),
         )
         for case, scene, toggle, axis in cases:
-            with self.subTest(case=case):
-                runs = {}
-                for cached in ("off", "auto"):
-                    model, driver, struck = scene()
-                    solver = _solver(model, FRICTION_LAWS["point"], cached, pgs_mode="matrix_free")
-                    if cached == "auto":
-                        self.assertIsInstance(solver._tree_kinetic_state, MixedTreeKineticState)
-                        self.assertTrue(solver._resolved_worlds_owner.published)
-                    if toggle:
-                        self._notify(model, solver, driver, KINEMATIC)
-                    runs[cached] = self._drive(model, solver, driver, axis, steps=8)
-                # The arm's last link turns away, or the box is pushed ahead of the root.
-                self.assertGreater(float(np.abs(runs["off"][-1]["body_qd"][struck]).max()), 0.5)
-                self._assert_phases_close(runs["auto"], runs["off"], atol=1.0e-4)
+            for law, beta in FRICTION_LAWS.items():
+                with self.subTest(case=case, law=law):
+                    runs = {}
+                    for cached in ("off", "auto"):
+                        model, driver, struck = scene()
+                        solver = _solver(model, beta, cached, pgs_mode="matrix_free")
+                        if cached == "auto":
+                            self.assertIsInstance(solver._tree_kinetic_state, MixedTreeKineticState)
+                            classifier = solver._resolved_worlds_owner
+                            self.assertIsNotNone(classifier, solver._resolved_worlds_reason)
+                            self.assertTrue(classifier.published)
+                            # Patch friction takes the classifier's capacity-bounded decision.
+                            self.assertEqual(classifier.row_bound is not None, law == "patch")
+                        if toggle:
+                            self._notify(model, solver, driver, KINEMATIC)
+                        runs[cached] = self._drive(model, solver, driver, axis, steps=8)
+                    # The arm's last link turns away, or the box is pushed ahead of the root.
+                    self.assertGreater(float(np.abs(runs["off"][-1]["body_qd"][struck]).max()), 0.5)
+                    self._assert_phases_close(runs["auto"], runs["off"], atol=1.0e-4)
 
     def test_rejected_toggle_raises_the_ordinary_error_before_any_change(self):
         """A prescribed root made dynamic raises the ordinary error on both routes and changes no solver state."""
