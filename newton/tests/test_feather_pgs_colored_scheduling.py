@@ -50,12 +50,16 @@ def _color_counts(solver):
     return counts[:PROPAGATION_COLOR_TAIL], int(counts[PROPAGATION_COLOR_TAIL])
 
 
-def _settle(model, steps=12, **solver_kwargs):
+def _settle(model, steps=12, *, response="propagation-colored", **solver_kwargs):
+    """Step ``model`` under one contact response; return the solver, final state and contact count.
+
+    Every response gets the same row capacities, large enough for the heaps here.
+    """
     model.rigid_contact_max = 8192  # sizes the solver's contact scratch; set before construction
     solver = newton.solvers.SolverFeatherPGS(
         model,
         pgs_mode="matrix_free",
-        articulated_contact_response="propagation-colored",
+        articulated_contact_response=response,
         pgs_iterations=6,
         mf_max_constraints=8192,
         dense_max_constraints=64,
@@ -125,26 +129,24 @@ class TestFeatherPGSColoredScheduling(unittest.TestCase):
         )
 
     def test_colored_result_matches_the_immediate_response(self):
-        """The colored schedule must settle the heap like the reference row path."""
+        """The colored schedule must settle the heap like the reference row path.
+
+        Both arms settle through ``_settle``, so they share row capacities and stepping, and
+        neither may drop rows: which rows an overflowing solver drops depends on the contact
+        order, which the default collision pipeline does not fix.
+        """
         model, _ = _heap(nx=4, ny=4, nz=2)
-        _, colored, _ = _settle(model, steps=24)
+        colored_solver, colored, _ = _settle(model, steps=24)
         model_ref, _ = _heap(nx=4, ny=4, nz=2)
-        model_ref.rigid_contact_max = 8192
-        solver = newton.solvers.SolverFeatherPGS(
-            model_ref, pgs_mode="matrix_free", articulated_contact_response="immediate", pgs_iterations=6
-        )
-        pipeline = newton.CollisionPipeline(model_ref, rigid_contact_max=8192)
-        contacts = pipeline.contacts()
-        s0, s1 = model_ref.state(), model_ref.state()
-        control = model_ref.control()
-        for _ in range(24):
-            s0.clear_forces()
-            pipeline.collide(s0, contacts)
-            solver.step(s0, s1, control, contacts, 1.0 / 240.0)
-            s0, s1 = s1, s0
+        reference_solver, reference, _ = _settle(model_ref, steps=24, response="immediate")
+        for name, solver in (("colored", colored_solver), ("reference", reference_solver)):
+            # Sticky since construction: a row family over capacity (the overflow warnings) or a dropped row.
+            status = solver.constraint_capacity_status()
+            self.assertFalse(any(status.values()), f"{name} solver exceeded a capacity: {status}")
+            self.assertFalse(solver.constraint_overflow.numpy().any(), f"{name} solver dropped rows")
 
         a = colored.body_q.numpy()[:, :3]
-        b = s0.body_q.numpy()[:, :3]
+        b = reference.body_q.numpy()[:, :3]
         self.assertTrue(np.isfinite(b).all())
         # Different sweep order, so not bitwise equal; the heap must still stand.
         self.assertLess(float(np.max(np.abs(a[:, 2] - b[:, 2]))), 0.01)
