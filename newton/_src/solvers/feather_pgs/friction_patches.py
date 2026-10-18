@@ -1481,10 +1481,10 @@ class _FrictionPatchState:
             # with other Contacts instances.
             stream = self.stream_token(generation)
             branch = self._capture_branch()
-            # Only the sort runs under the node (_order_pairs): _prepare_frame
-            # computes the condition, and _build, the link, the seed and the finish
-            # stride over the frame's extent at other stages of the step, where
-            # each node would pause the capture again to skip microseconds of work.
+            # Only _order_pairs runs under the node: _prepare_frame computes the
+            # condition, and _build, the link, the seed and the finish stride over
+            # the frame's extent at other stages of the step, where each node
+            # would pause the capture again to skip microseconds of work.
             with nullcontext() if branch is None else capture_pause():
                 if branch is not None and not self._capture_can_pause():
                     branch = None
