@@ -18,10 +18,15 @@ so two caches can hold different code under one module hash. The projection
 ``error -= n * wp.dot(error, n)`` in ``_build_pair`` rounds either ``n.x * e.x``
 or ``n.y * e.y`` on its own; over the CUDA differentials (NVRTC 12.9, sm_120)
 the two choices moved phi and carried displacements by at most 1.12 * 2**-23
-times the field's largest magnitude and changed no other field. Computed float
-payloads therefore compare within ``_FMA_ULPS`` float32 epsilons of their scale
-on CUDA (:func:`_assert_payload_equal`). Integers and floats the kernels compute
-without a product, and every field on the CPU, compare bitwise.
+times the field's largest magnitude and changed no other field. On CUDA,
+computed float payloads therefore compare with the reference within
+``_FMA_ULPS`` float32 epsilons of the magnitude each row is computed from
+(:func:`_assert_payload_equal`), so a contraction choice anywhere in the patch
+arithmetic passes. The bound does not tell contraction from other codegen
+changes of a few rounding errors: a fast-math build of the patch module exceeds
+it only in phi, in one sequence. Integers and floats the kernels compute
+without a product compare bitwise on every device, and every field compares
+bitwise on the CPU.
 """
 
 import contextlib
@@ -42,9 +47,10 @@ from newton.tests.test_feather_pgs_mixed_tree_free_body import _build as _arm_ov
 
 _PIECE_OFFSET = 0.04
 # Float32 epsilons of its scale by which a computed payload may differ on CUDA
-# (module docstring): about seven times the largest measured difference,
-# 1.12 * 2**-23 * scale, so a compile that fuses a carried anchor's arithmetic
-# differently in more than one place still passes.
+# (module docstring). The largest measured difference is 1.12 epsilons at this
+# revision and 2.87, in phi, with the anchor choice of the patch-determinism
+# work; 8 leaves room for a compile that fuses carried arithmetic differently in
+# more places.
 _FMA_ULPS = 8
 _EPS32 = float(np.finfo(np.float32).eps)
 
@@ -252,26 +258,55 @@ def _pair(scene, capacity):
     return _FrictionPatchState(scene.model, capacity, True, phi[0]), ReferencePatches(scene.model, capacity, phi[1])
 
 
-def _assert_payload_equal(actual, desired, err_msg, cuda, scale=None):
-    """Compare a computed float payload: bitwise on the CPU, within ``_FMA_ULPS`` epsilons of ``scale`` on CUDA.
+def _magnitude(values):
+    """Return each row's largest absolute component: rows run along the first axis."""
+    values = np.abs(np.asarray(values, dtype=np.float64))
+    return values.max(axis=tuple(range(1, values.ndim)), initial=0.0)
 
-    ``scale`` defaults to the payload's largest magnitude, the scale of the
-    measured bound; points pass the largest contact coordinate, since they are
-    computed from world coordinates.
+
+def _assert_payload_equal(actual, desired, err_msg, cuda, scale):
+    """Compare a computed float payload: bitwise on the CPU, on CUDA within ``_FMA_ULPS`` epsilons of its scale.
+
+    ``scale`` holds the magnitude each row is computed from, broadcast over the
+    row's trailing components; a float applies to every row. An element's own
+    magnitude also counts, so a zero scale bounds the difference relative to
+    the values themselves.
     """
     if not cuda:
         np.testing.assert_array_equal(actual, desired, err_msg)
         return
-    if scale is None:
-        scale = float(np.abs(desired).max(initial=0.0))
-    np.testing.assert_allclose(actual, desired, rtol=0.0, atol=_FMA_ULPS * _EPS32 * scale, err_msg=err_msg)
+    actual, desired = np.asarray(actual, dtype=np.float64), np.asarray(desired, dtype=np.float64)
+    if actual.shape != desired.shape:
+        raise AssertionError(f"{err_msg}\nshapes {actual.shape} and {desired.shape} differ")
+    scale = np.asarray(scale, dtype=np.float64)
+    scale = scale.reshape(scale.shape + (1,) * (desired.ndim - scale.ndim))
+    bound = _FMA_ULPS * _EPS32 * np.maximum(scale, np.maximum(np.abs(actual), np.abs(desired)))
+    difference = np.abs(actual - desired)
+    close = (actual == desired) | (difference <= bound) | (np.isnan(actual) & np.isnan(desired))
+    if not close.all():
+        far = np.argwhere(~close)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            excess = np.where(np.isnan(difference), np.inf, difference / bound)[~close]
+        worst = tuple(int(i) for i in far[np.argmax(excess)])
+        raise AssertionError(
+            f"{err_msg}\n{len(far)} / {close.size} elements differ by more than {_FMA_ULPS} float32 epsilons of"
+            f" their scale; worst {worst}: {float(actual[worst])!r} vs {float(desired[worst])!r},"
+            f" bound {float(bound[worst]):.3e}"
+        )
+
+
+def _largest(values):
+    return float(np.abs(values).max(initial=0.0))
 
 
 # Integer fields, and floats the kernels copy, negate, add without a product or
 # take a min or max of, compare bitwise on every device: contraction only fuses a
 # product into an add. The others are computed payloads, listed with the scale
-# they compare at (None: the field's largest magnitude; "world": the largest
-# contact coordinate).
+# they compare at: "own", each row's largest component; "world", the largest
+# coordinate of the contact or the stored bodies, for points that body poses map
+# from world coordinates; "field", the field's largest magnitude, for carried
+# displacements, which combine two stored anchors through world-coordinate lever
+# arms: their rows moved by up to 114 epsilons of their own magnitude.
 _CURRENT_EXACT = (
     "normal",
     "mu",
@@ -285,24 +320,30 @@ _CURRENT_EXACT = (
     "eligible",
 )
 _CURRENT_COMPUTED = (
-    ("center", "world"),
+    ("center", "own"),
     ("surface_a", "world"),
     ("surface_b", "world"),
-    ("anchor_a", "world"),
-    ("anchor_b", "world"),
-    ("displacement", None),
-    ("tangent_impulse", None),
+    ("displacement", "field"),
+    ("tangent_impulse", "own"),
 )
+# Current anchors compare at the "world" scale on valid contacts, the only ones
+# whose anchors _build writes and later kernels read.
+_CURRENT_ANCHORS = ("anchor_a", "anchor_b")
 _PREVIOUS_EXACT = ("mu", "body_a", "body_b", "owner", "shape_a", "shape_b")
 _PREVIOUS_COMPUTED = (
-    ("normal", None),
-    ("displacement", None),
+    ("normal", "own"),
+    ("displacement", "field"),
     ("anchor_a", "world"),
     ("anchor_b", "world"),
     ("surface_a", "world"),
     ("surface_b", "world"),
-    ("tangent_impulse", None),
+    ("tangent_impulse", "own"),
 )
+
+
+def _scale(kind, values, world):
+    """Return the scale of ``kind`` for the reference's ``values``; ``world`` holds each row's world magnitude."""
+    return {"own": _magnitude(values), "world": world, "field": _largest(values)}[kind]
 
 
 def assert_same_patches(patches, reference, live, context=""):
@@ -310,17 +351,16 @@ def assert_same_patches(patches, reference, live, context=""):
 
     Sorted keys, validity, ownership, sources, the patch view and stored worlds
     compare everywhere; sorted indices where a pair key is live; contact payload
-    on the live contacts; stored payload on valid anchors; history poses on the
-    bodies of valid anchors. Scratch arrays (``members``, ``used``) and the
-    sort's second halves are excluded. Integer fields and floats computed
-    without a product compare bitwise on every device; computed float payloads
-    compare bitwise on the CPU and within :func:`_assert_payload_equal`'s bound
-    on CUDA.
+    on the live contacts and anchors on the valid ones; stored payload on valid
+    anchors; history poses on the bodies of valid anchors. Scratch arrays
+    (``members``, ``used``) and the sort's second halves are excluded. Integer
+    fields and floats computed without a product compare bitwise on every
+    device; computed float payloads compare bitwise on the CPU and within
+    :func:`_assert_payload_equal`'s bound on CUDA.
     """
     n = reference.capacity
     stride = patches.key_stride
     cuda = reference.view.weight.device.is_cuda
-    scales = {None: None, "world": float(np.abs(reference.current.center.numpy()).max(initial=0.0))}
     for name in ("current", "previous"):
         mine, theirs = getattr(patches, name), getattr(reference, name)
         codes = pair_codes(theirs.keys.numpy()[:n])
@@ -340,13 +380,11 @@ def assert_same_patches(patches, reference, live, context=""):
         np.testing.assert_array_equal(
             getattr(patches.view, name).numpy(), getattr(reference.view, name).numpy(), f"{context} view.{name}"
         )
-    for name, scale in (("phi", None), ("point_a", "world"), ("point_b", "world")):
+    # Friction locations are world coordinates; phi projects carried displacements.
+    for name, kind in (("phi", "field"), ("point_a", "own"), ("point_b", "own")):
+        theirs = getattr(reference.view, name).numpy()
         _assert_payload_equal(
-            getattr(patches.view, name).numpy(),
-            getattr(reference.view, name).numpy(),
-            f"{context} view.{name}",
-            cuda,
-            scales[scale],
+            getattr(patches.view, name).numpy(), theirs, f"{context} view.{name}", cuda, _scale(kind, theirs, None)
         )
     np.testing.assert_array_equal(
         patches.previous_world.numpy(), reference.previous_world.numpy(), f"{context} previous_world"
@@ -357,13 +395,25 @@ def assert_same_patches(patches, reference, live, context=""):
             getattr(reference.current, name).numpy()[:live],
             f"{context} current.{name}",
         )
-    for name, scale in _CURRENT_COMPUTED:
+    # A live contact's body poses lie within a body radius of its center.
+    world = _magnitude(reference.current.center.numpy()[:live])
+    for name, kind in _CURRENT_COMPUTED:
+        theirs = getattr(reference.current, name).numpy()[:live]
         _assert_payload_equal(
             getattr(patches.current, name).numpy()[:live],
-            getattr(reference.current, name).numpy()[:live],
+            theirs,
             f"{context} current.{name}",
             cuda,
-            scales[scale],
+            _scale(kind, theirs, world),
+        )
+    anchors = reference.current.valid.numpy()[:live] != 0
+    for name in _CURRENT_ANCHORS:
+        _assert_payload_equal(
+            getattr(patches.current, name).numpy()[:live][anchors],
+            getattr(reference.current, name).numpy()[:live][anchors],
+            f"{context} current.{name}",
+            cuda,
+            world[anchors],
         )
     valid = reference.previous.valid.numpy() != 0
     for name in _PREVIOUS_EXACT:
@@ -372,13 +422,21 @@ def assert_same_patches(patches, reference, live, context=""):
             getattr(reference.previous, name).numpy()[valid],
             f"{context} previous.{name}",
         )
-    for name, scale in _PREVIOUS_COMPUTED:
+    # The last store saved the poses that mapped each stored anchor's points; a
+    # static side keeps world coordinates, which its own magnitude covers.
+    poses = _magnitude(reference.previous_q.numpy()[:, :3])
+    stored_world = np.zeros(np.count_nonzero(valid))
+    for side in ("body_a", "body_b"):
+        body = getattr(reference.previous, side).numpy()[valid]
+        stored_world = np.maximum(stored_world, np.where(body >= 0, poses[body], 0.0))
+    for name, kind in _PREVIOUS_COMPUTED:
+        theirs = getattr(reference.previous, name).numpy()[valid]
         _assert_payload_equal(
             getattr(patches.previous, name).numpy()[valid],
-            getattr(reference.previous, name).numpy()[valid],
+            theirs,
             f"{context} previous.{name}",
             cuda,
-            scales[scale],
+            _scale(kind, theirs, stored_world),
         )
     bodies = np.concatenate((reference.previous.body_a.numpy()[valid], reference.previous.body_b.numpy()[valid]))
     bodies = np.unique(bodies[bodies >= 0])
@@ -461,7 +519,22 @@ class _Rows:
         self.maps = (world, slot, path, needed)
         self.values = (parents, mu, impulses)
         self.routes = routes
+        self.live = live
         self.decay = np.where(rng.random(3) < 0.3, 0.0, rng.uniform(0.3, 1.0, size=3))
+
+    def impulse_scale(self, route, impulses):
+        """Return the magnitude each row impulse is computed from: its friction pair's largest, else its own.
+
+        Seeding writes both friction rows of a contact from one tangent impulse.
+        """
+        world, slot, path, needed = (values[: self.live] for values in self.maps)
+        scale = np.abs(np.asarray(impulses, dtype=np.float64))
+        friction = (path == route) & (slot >= 0) & (needed == 3)
+        w, s = world[friction], slot[friction]
+        pair = np.maximum(scale[w, s + 1], scale[w, s + 2])
+        scale[w, s + 1] = pair
+        scale[w, s + 2] = pair
+        return scale
 
     def arrays(self):
         """Return device copies: contact maps and ``(route, parents, mu, impulses, decay)`` rows."""
@@ -481,17 +554,23 @@ class _Rows:
         return maps, routes
 
 
-def _assert_same_rows(mine, theirs, context=""):
+def _assert_same_rows(mine, theirs, rows, context=""):
     """Require the reference's row arrays: parents and friction budgets bitwise, impulses as computed payload.
 
     Linking divides copied budgets by an anchor count, which matches bitwise on
-    every device; seeding computes impulses (:func:`_assert_payload_equal`).
+    every device; seeding computes impulses (:func:`_assert_payload_equal`, at
+    the scale of ``rows``).
     """
     for (route, *arrays), (_, *expected) in zip(mine, theirs, strict=True):
         for name, array, reference in zip(("parents", "mu"), arrays[:2], expected[:2], strict=True):
             np.testing.assert_array_equal(array.numpy(), reference.numpy(), f"{context} route {route} {name}")
+        impulses = expected[2].numpy()
         _assert_payload_equal(
-            arrays[2].numpy(), expected[2].numpy(), f"{context} route {route} impulses", arrays[2].device.is_cuda
+            arrays[2].numpy(),
+            impulses,
+            f"{context} route {route} impulses",
+            arrays[2].device.is_cuda,
+            rows.impulse_scale(route, impulses),
         )
 
 
@@ -646,12 +725,12 @@ def run_reference_differential(
         their_maps, their_routes = rows.arrays()
         patches.link(*mine_maps, patch_routes(mine_routes))
         reference.link(scene.contacts, *their_maps, their_routes)
-        _assert_same_rows(mine_routes, their_routes, f"{context} link")
+        _assert_same_rows(mine_routes, their_routes, rows, f"{context} link")
         seeded = [row for row in mine_routes if row[4] > 0.0]
         if seeded:
             patches.seed(scene.state, *mine_maps, patch_routes(seeded))
         reference.seed(scene.contacts, scene.state, *their_maps, their_routes)
-        _assert_same_rows(mine_routes, their_routes, f"{context} seed")
+        _assert_same_rows(mine_routes, their_routes, rows, f"{context} seed")
         out, com = _solved_state(scene, rng)
         before = int(np.count_nonzero(reference.current.valid.numpy()[:live]))
         patches.finish(scene.state, out, com, *mine_maps, patch_routes(mine_routes), dt)
@@ -868,7 +947,7 @@ def run_graph_replay(device, *, worlds=32, contacts=1536, capacity=2048, live_so
         their_routes = reference_step()
         assert_same_patches(patches, reference, live, f"replay {index} {mode}")
         assert_empty_tail(patches, f"replay {index} {mode}")
-        _assert_same_rows(routes, their_routes, f"replay {index} {mode}")
+        _assert_same_rows(routes, their_routes, rows, f"replay {index} {mode}")
 
 
 @contextlib.contextmanager
