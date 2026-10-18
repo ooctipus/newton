@@ -20,6 +20,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.friction_patches import CONTACT_PATH_RESOLVED
 from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices
 
 RADIUS = 0.05
@@ -31,6 +32,9 @@ IMPACT_FRACTION = 0.4
 PATH_DENSE = 0
 PATH_MATRIX_FREE = 1
 PATH_PROPAGATION = 2
+# No rows: the resolved-world classifier skipped the contact's world, whose
+# every candidate row separates at the predictor.
+PATH_RESOLVED = int(CONTACT_PATH_RESOLVED)
 
 RESPONSE_MODES = ("immediate", "propagation", "propagation-fused", "propagation-colored")
 EXPECTED_PATHS = {
@@ -742,60 +746,92 @@ def test_dense_and_production_split_modes_enforce_restitution_without_velocity_i
 
 
 def test_multiworld_restitution_keeps_case_data_isolated(test, device):
-    """Apply each world's coefficient and crossing state without cross-world leakage."""
+    """Apply each world's coefficient and crossing state without cross-world leakage.
+
+    The non-crossing world's contact separates at the predictor. By default the
+    resolved-world classifier skips that world: its contact takes no rows, since
+    zero impulse solves the world exactly. FEATHER_PGS_PATCH_DENSE_PATHS=0 keeps
+    the solver's default patch friction off the classifier, so the contact takes
+    a matrix-free row beside the crossing worlds' rows. Both routes must give
+    every world its own result.
+    """
     # (e, speed, mass, toi/dt); the third case is deliberately non-crossing.
     cases = ((0.25, 2.0, 1.0, 0.4), (0.75, 4.0, 10.0, 0.7), (1.0, 3.0, 0.5, 1.25), (0.0, 5.0, 2.0, 0.2))
-    scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    for restitution, speed, mass, impact_fraction in cases:
-        world = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-        separation = speed * DEFAULT_DT * impact_fraction
-        body = world.add_body(
-            xform=wp.transform(wp.vec3(0.0, 0.0, RADIUS + separation), wp.quat_identity()),
-            mass=mass,
-            inertia=_sphere_inertia(mass),
-            lock_inertia=True,
-        )
-        cfg = _shape_cfg(restitution)
-        world.add_shape_sphere(body, radius=RADIUS, cfg=cfg)
-        world.add_ground_plane(cfg=cfg)
-        scene.add_world(world)
-    model = scene.finalize(device=device)
-    solver = _make_solver(model)
-    state_in, state_out = model.state(), model.state()
-    joint_qd = np.zeros((len(cases), 6), dtype=np.float32)
-    joint_qd[:, 2] = [-case[1] for case in cases]
-    state_in.joint_qd.assign(joint_qd.reshape(-1))
-    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-    pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
-    contacts = pipeline.contacts()
-    pipeline.collide(state_in, contacts)
-    solver.step(state_in, state_out, model.control(), contacts, DEFAULT_DT)
-
-    count = int(contacts.rigid_contact_count.numpy()[0])
-    after = state_out.body_qd.numpy()[:, 2]
-    end_gap = state_out.body_q.numpy()[:, 2] - RADIUS
-    paths = solver.contact_path.numpy()[:count]
-    test.assertEqual(count, len(cases), "expected exactly one contact in every world")
-    test.assertTrue(np.all(paths == PATH_MATRIX_FREE), f"multiworld contacts used paths {paths.tolist()}")
-    for world, (restitution, speed, _mass, impact_fraction) in enumerate(cases):
-        with test.subTest(world=world):
-            crossing = impact_fraction < 1.0
-            if crossing and restitution > 0.0:
-                expected = restitution * speed
-            elif crossing:
-                expected = -impact_fraction * speed
-            else:
-                expected = -speed
-            _assert_velocity(test, float(after[world]), expected, speed, f"world {world}")
-            if crossing and restitution > 0.0:
-                expected_gap = impact_fraction * speed * DEFAULT_DT + restitution * speed * DEFAULT_DT
-                test.assertAlmostEqual(
-                    float(end_gap[world]), expected_gap, delta=2.0e-4, msg=f"world {world} wrong row trajectory"
+    # "1" is the default; pinning it keeps an exported "0" from merging the two routes.
+    for dense_paths in ("1", "0"):
+        with test.subTest(FEATHER_PGS_PATCH_DENSE_PATHS=dense_paths):
+            scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+            for restitution, speed, mass, impact_fraction in cases:
+                world = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+                separation = speed * DEFAULT_DT * impact_fraction
+                body = world.add_body(
+                    xform=wp.transform(wp.vec3(0.0, 0.0, RADIUS + separation), wp.quat_identity()),
+                    mass=mass,
+                    inertia=_sphere_inertia(mass),
+                    lock_inertia=True,
                 )
-            elif crossing:
-                test.assertLess(abs(float(end_gap[world])), 2.0e-4, f"world {world} missed the surface")
-            else:
-                test.assertGreater(float(end_gap[world]), 0.0, f"world {world} unexpectedly reached the surface")
+                cfg = _shape_cfg(restitution)
+                world.add_shape_sphere(body, radius=RADIUS, cfg=cfg)
+                world.add_ground_plane(cfg=cfg)
+                scene.add_world(world)
+            model = scene.finalize(device=device)
+            # The solver reads the variable, and admits the classifier, at construction.
+            with mock.patch.dict("os.environ", {"FEATHER_PGS_PATCH_DENSE_PATHS": dense_paths}):
+                solver = _make_solver(model)
+            classified = dense_paths == "1"
+            classifier = solver.get_path_selection()["routes"]["resolved_worlds"]
+            test.assertEqual(classifier["enabled"], classified, classifier["reason"])
+            state_in, state_out = model.state(), model.state()
+            joint_qd = np.zeros((len(cases), 6), dtype=np.float32)
+            joint_qd[:, 2] = [-case[1] for case in cases]
+            state_in.joint_qd.assign(joint_qd.reshape(-1))
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+            pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+            contacts = pipeline.contacts()
+            pipeline.collide(state_in, contacts)
+            solver.step(state_in, state_out, model.control(), contacts, DEFAULT_DT)
+
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            after = state_out.body_qd.numpy()[:, 2]
+            end_gap = state_out.body_q.numpy()[:, 2] - RADIUS
+            paths = solver.contact_path.numpy()[:count]
+            # Each contact pairs a world's sphere with that world's plane, which has no body.
+            shapes = np.stack(
+                (contacts.rigid_contact_shape0.numpy()[:count], contacts.rigid_contact_shape1.numpy()[:count])
+            )
+            contact_world = model.body_world.numpy()[model.shape_body.numpy()[shapes].max(axis=0)]
+            test.assertEqual(count, len(cases), "expected exactly one contact in every world")
+            for world, (restitution, speed, _mass, impact_fraction) in enumerate(cases):
+                with test.subTest(world=world):
+                    crossing = impact_fraction < 1.0
+                    # A contact that cannot reach the surface this step separates at the predictor.
+                    expected_path = PATH_MATRIX_FREE if crossing or not classified else PATH_RESOLVED
+                    test.assertEqual(
+                        paths[contact_world == world].tolist(),
+                        [expected_path],
+                        f"multiworld contacts of worlds {contact_world.tolist()} used paths {paths.tolist()}",
+                    )
+                    if crossing and restitution > 0.0:
+                        expected = restitution * speed
+                    elif crossing:
+                        expected = -impact_fraction * speed
+                    else:
+                        expected = -speed
+                    _assert_velocity(test, float(after[world]), expected, speed, f"world {world}")
+                    if crossing and restitution > 0.0:
+                        expected_gap = impact_fraction * speed * DEFAULT_DT + restitution * speed * DEFAULT_DT
+                        test.assertAlmostEqual(
+                            float(end_gap[world]),
+                            expected_gap,
+                            delta=2.0e-4,
+                            msg=f"world {world} wrong row trajectory",
+                        )
+                    elif crossing:
+                        test.assertLess(abs(float(end_gap[world])), 2.0e-4, f"world {world} missed the surface")
+                    else:
+                        test.assertGreater(
+                            float(end_gap[world]), 0.0, f"world {world} unexpectedly reached the surface"
+                        )
 
 
 def test_restitution_uses_ordinary_rows_and_validates_configuration(test, device):
