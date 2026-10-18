@@ -3250,6 +3250,7 @@ class SolverFeatherPGS(SolverBase):
         from .cached_dynamics import install as install_cached_dynamics  # noqa: PLC0415
 
         install_cached_dynamics(self)
+        self._unread_mass_sizes = self._unread_mass_matrix_sizes()
         # Decide the fused publication now: its host checks must not run inside
         # a later graph capture of the first step.
         self._fused_publication_admitted()
@@ -11337,13 +11338,15 @@ class SolverFeatherPGS(SolverBase):
         # apply_augmented_mass_diagonal_grouped adds onto the freshly stored
         # diagonal, structural zeros are never written after allocation, and
         # the Cholesky kernels never read H when mass_update_mask is 0.
+        # Sizes a held-tree owner factors from its own geometry have no H
+        # reader at all (_unread_mass_matrix_sizes) and are never cleared.
         if self._memset_stream is not None:
             with wp.ScopedTimer("DB_Memset", print=False, use_nvtx=self._nvtx, synchronize=False):
                 if self._row_packets is None and self._keyed_rows is None:
                     wp.copy(self._j_active_counts[self._buf_idx], self.constraint_count)
                 with wp.ScopedStream(self._memset_stream):
                     for size in self.size_groups:
-                        if self._mass_update_global_flag:
+                        if self._mass_update_global_flag and size not in self._unread_mass_sizes:
                             self._H_bufs[self._buf_idx][size].zero_()
                         if self._row_packets is not None or self._keyed_rows is not None:
                             continue  # Private J is current; general active rows are cleared before materialization.
@@ -12987,6 +12990,30 @@ class SolverFeatherPGS(SolverBase):
                         f"upper fused max {np.nanmax(np.abs(a[:, ~tri])):.3e} legacy {np.nanmax(np.abs(b[:, ~tri])):.3e}",
                         flush=True,
                     )
+
+    def _unread_mass_matrix_sizes(self) -> tuple[int, ...]:
+        """DOF sizes whose dense mass matrix H no stage reads while a held-tree owner is installed.
+
+        The owner refreshes every factor from its own geometry, and ``_stage1_crba``
+        returns before any H write. Stage 2, whose dispatch this mirrors, reads H only
+        where it factors it: a diagonal-mass size, or a tiled or loop size without the
+        fused CRBA-Cholesky kernel whose place the owner's refresh takes. Compact and
+        sparse sizes keep a placeholder H.
+        """
+        if self._tree_kinetic_state is None:
+            return ()
+        sizes = []
+        for size in self.size_groups:
+            if size in (self._compact_diagonal_mass_size, self._sparse_mass_matrix_size):
+                sizes.append(size)
+            elif self._execution_plan.use_diagonal_mass(size):
+                continue
+            elif self._execution_plan.use_tiled_cholesky(size):
+                if self._crba_cholesky_kernels_by_size[size] is not None:
+                    sizes.append(size)
+            elif self._crba_cholesky_warp_kernels_by_size[size] is not None:
+                sizes.append(size)
+        return tuple(sizes)
 
     def _stage2_cholesky_diagonal(self, size: int) -> None:
         """Factor an articulation group known to have diagonal generalized inertia."""

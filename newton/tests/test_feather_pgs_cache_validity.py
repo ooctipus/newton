@@ -5,6 +5,7 @@
 
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -43,9 +44,10 @@ def _fixed_root(model, world):
     return int(np.flatnonzero(roots & (model.joint_world.numpy() == world))[0])
 
 
-def _mixed_solver(model, *, forest=False):
+def _mixed_solver(model, *, forest=False, owner=True):
+    """A dense-route solver with the mixed held-tree owner, or with ordinary dynamics when ``owner`` is False."""
     environment = {
-        "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": "1",
+        "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": str(int(owner)),
         "FEATHER_PGS_TREE_KINETIC_STATE": "0",
         "FEATHER_PGS_TREE_FOREST": str(int(forest)),
     }
@@ -292,6 +294,125 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 0)
         for group in owner.groups:
             np.testing.assert_array_equal(group.geometry_valid.numpy(), 0)
+
+
+def _mass_matrices(solver):
+    """Both double-buffer slots' dense mass matrices, by slot and DOF size."""
+    return [(slot, size, array) for slot, buffers in enumerate(solver._H_bufs) for size, array in buffers.items()]
+
+
+class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
+    def test_unread_sizes_mirror_the_factor_dispatch(self):
+        """Report exactly the sizes whose stage-2 factorization reads no dense mass matrix under an owner.
+
+        A compact size passes; a diagonal size, and a tiled or loop size without its fused
+        CRBA-Cholesky kernel, factor H; the fused kernels' sizes return before reading it.
+        """
+        sizes = (2, 4, 6, 18, 24, 25)
+        fused_tiled = {24}
+        fused_warp = {6, 25}
+
+        def opaque():
+            return {size: object() for size in sizes}
+
+        solver = SimpleNamespace(
+            _tree_kinetic_state=object(),
+            size_groups=list(sizes),
+            _compact_diagonal_mass_size=2,
+            _sparse_mass_matrix_size=None,
+            _execution_plan=SimpleNamespace(
+                use_diagonal_mass=lambda size: size == 4, use_tiled_cholesky=lambda size: size >= 20
+            ),
+            _crba_cholesky_kernels_by_size={size: object() if size in fused_tiled else None for size in sizes},
+            _crba_cholesky_warp_kernels_by_size={size: object() if size in fused_warp else None for size in sizes},
+            _cholesky_kernels_by_size=opaque(),
+            _paired_response_primary_size=None,
+            _paired_factor_coordinates=False,
+            model=SimpleNamespace(device="cpu"),
+            n_arts_by_size=dict.fromkeys(sizes, 3),
+            tile_threads=64,
+            mass_update_mask=object(),
+            H_by_size=opaque(),
+            R_by_size=opaque(),
+            L_by_size=opaque(),
+            group_to_art=opaque(),
+        )
+        unread = SolverFeatherPGS._unread_mass_matrix_sizes(solver)
+        self.assertEqual(unread, (2, 6, 24))
+        launched = []
+
+        def record(kernel, *args, inputs=(), **kwargs):
+            launched.extend(inputs)
+
+        with patch.object(wp, "launch", record), patch.object(wp, "launch_tiled", record):
+            for size in sizes:
+                launched.clear()
+                if size == solver._compact_diagonal_mass_size:
+                    pass  # stage 2 skips compact sizes
+                elif solver._execution_plan.use_diagonal_mass(size):
+                    SolverFeatherPGS._stage2_cholesky_diagonal(solver, size)
+                elif solver._execution_plan.use_tiled_cholesky(size):
+                    SolverFeatherPGS._stage2_cholesky_tiled(solver, size)
+                else:
+                    SolverFeatherPGS._stage2_cholesky_loop(solver, size)
+                reads = any(item is solver.H_by_size[size] for item in launched)
+                self.assertEqual(reads, size not in unread, f"size {size}")
+        solver._tree_kinetic_state = None
+        self.assertEqual(SolverFeatherPGS._unread_mass_matrix_sizes(solver), ())
+
+    @unittest.skipUnless(wp.is_cuda_available(), "The double-buffered mass matrix is a CUDA path")
+    def test_cuda_held_owner_clears_no_mass_matrix(self):
+        """Issue no end-of-step mass matrix clear under a held-tree owner, and every clear without one."""
+        device = wp.get_device("cuda:0")
+        for owner in (True, False):
+            with self.subTest(owner=owner):
+                model = _build(device, worlds=4)
+                solver = _mixed_solver(model, owner=owner)
+                self.assertEqual(solver._tree_kinetic_state is not None, owner)
+                self.assertIsNotNone(solver._memset_stream)
+                record = solver.get_path_selection()["routes"]["dynamics"]["mass_matrix_clear_dofs"]
+                self.assertEqual(record, [] if owner else sorted(int(size) for size in solver.size_groups))
+                matrices = _mass_matrices(solver)
+                rollout = _Rollout(model, solver)
+                zeroed, zero = [], wp.array.zero_
+
+                def recording(array, zeroed=zeroed, zero=zero):
+                    zeroed.append(array)
+                    return zero(array)
+
+                with patch.object(wp.array, "zero_", recording):
+                    for _ in range(6):
+                        rollout.step()
+                cleared = {(slot, size) for slot, size, array in matrices if any(array is z for z in zeroed)}
+                # With update_mass_matrix_interval=2 the refresh steps use slot 0 alone.
+                expected = set() if owner else {(0, int(size)) for size in solver.size_groups}
+                self.assertEqual(cleared, expected)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "The double-buffered mass matrix is a CUDA path")
+    def test_cuda_poisoned_mass_matrix_is_never_read(self):
+        """Step identically with both mass matrix slots poisoned by NaN under a held-tree owner.
+
+        The poison is never cleared and never reaches the state, so no stage reads H.
+        """
+        device = wp.get_device("cuda:0")
+        finals = []
+        for poisoned in (False, True):
+            model = _build(device, worlds=4)
+            solver = _mixed_solver(model)
+            self.assertIsNotNone(solver._tree_kinetic_state)
+            if poisoned:
+                for _, _, array in _mass_matrices(solver):
+                    array.fill_(float("nan"))
+            rollout = _Rollout(model, solver)
+            for _ in range(20):
+                rollout.step()
+            if poisoned:
+                for slot, size, array in _mass_matrices(solver):
+                    self.assertTrue(np.isnan(array.numpy()).all(), f"slot {slot}, size {size}")
+            finals.append({field: getattr(rollout.states[0], field).numpy() for field in STATE_FIELDS})
+        for field in STATE_FIELDS:
+            self.assertTrue(np.isfinite(finals[1][field]).all(), field)
+            np.testing.assert_allclose(finals[1][field], finals[0][field], rtol=1e-6, atol=1e-6, err_msg=field)
 
 
 if __name__ == "__main__":

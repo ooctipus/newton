@@ -971,6 +971,11 @@ def _dynamics(solver, source) -> dict:
         "async_augmented_drives": bool(solver._async_augmented_drives),
         "parallel_augmented_drive_topology": bool(solver._parallel_augmented_drive_topology),
         "double_buffer": bool(solver._double_buffer),
+        # Sizes whose double-buffered mass matrix the end of a refresh step clears; the sizes a
+        # held-tree owner factors from its own geometry have no reader (_unread_mass_matrix_sizes).
+        "mass_matrix_clear_dofs": []
+        if solver._memset_stream is None
+        else sorted(int(size) for size in solver.size_groups if size not in solver._unread_mass_sizes),
         "size_group_streams": any(stream is not None for stream in solver._size_streams.values()),
         "preelimination": bool(solver._preelim_active),
         "mimic_rows": int(solver._mimic_count or 0),
