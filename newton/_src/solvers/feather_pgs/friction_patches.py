@@ -54,10 +54,18 @@ from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
 
 # Grids are fixed at construction so CUDA graphs replay them. Their sizes count
 # _BLOCK_THREADS threads per SM (one SM on the CPU); launches stride over the
-# live slots, so no grid changes any output. The light grid is provisional
-# until calibrated against the measured empty-launch floor.
+# live slots, so no grid changes any output.
 _BLOCK_THREADS = 256
-_LIGHT_BLOCKS_PER_SM = 2
+# The light launches (prepare, link, seed, finish and store, reset) handle one
+# slot per loop iteration at 40 to 48 registers, which fit five or six blocks
+# per SM, and their reads through slots and rings wait on memory; blocks past
+# the live slots only read the counts. Measured on a 188-SM GPU against two
+# blocks per SM: the finish 0.88x, the link 0.80x and a reused frame's prepare
+# 0.77x per call with 512k live contacts, the link 0.67x with 346k, a new
+# frame's prepare 0.98x to 1.05x, and no change with 1.6k.
+_LIGHT_BLOCKS_PER_SM = 6
+# Each of the live sort's chunk blocks sorts 2048 slots in shared memory.
+_SORT_BLOCKS_PER_SM = 2
 # A _build thread walks one body pair's run, a chain of dependent loads at 96
 # registers. One-warp blocks fit 21 warps per SM instead of two 256-thread
 # blocks' 16, free each warp's slot when it finishes rather than with its
@@ -1298,7 +1306,7 @@ class _FrictionPatchState:
         self.build_block_dim = _BUILD_BLOCK_DIM
         self.merge_threads = max(1, min(capacity, _MERGE_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
         self.live_sort = _uses_live_sort(capacity, self.key_bits)
-        self.sort_blocks = max(1, min(-(-capacity // _SORT_CHUNK), _LIGHT_BLOCKS_PER_SM * blocks))
+        self.sort_blocks = max(1, min(-(-capacity // _SORT_CHUNK), _SORT_BLOCKS_PER_SM * blocks))
         self.merges = 0
         while _SORT_CHUNK << self.merges < capacity:
             self.merges += 1

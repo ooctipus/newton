@@ -1247,9 +1247,10 @@ def _shape(capacity, sms, *, light, build, block, merge=4, sort=2):
     }
 
 
-# Launch shapes before and since one-warp _build blocks on a wider grid.
+# Launch shapes before and since one-warp _build blocks on twice the grid and
+# light launches on three times theirs.
 _FORMER_SHAPE = {"light": 2, "build": 4, "block": 256}
-_SHAPE = {"light": 2, "build": 8, "block": 32}
+_SHAPE = {"light": 6, "build": 8, "block": 32}
 # An odd shape, far below the live counts, on any device.
 _ODD_SHAPE = {"threads": 7, "build_threads": 5, "build_block_dim": 32, "merge_threads": 3, "sort_blocks": 1}
 
@@ -1387,7 +1388,10 @@ def _patch_variants_compiled_here():
 
 class TestPatchLaunchShapes(unittest.TestCase):
     def test_builds_launch_one_warp_blocks_on_a_wider_grid(self):
-        """Launch _build in one-warp blocks over twice the former grid; merges and light passes keep theirs."""
+        """Launch _build in one-warp blocks over twice the former grid and light passes over three times theirs.
+
+        The live sort's merges and chunk blocks keep their grids.
+        """
         scene = _Scene("cpu", 1, worlds=110, contacts=4096)
         scene.active[:] = True
         for capacity in (96, 3000, 4600, 10000):
@@ -1412,7 +1416,7 @@ class TestPatchLaunchShapes(unittest.TestCase):
         with mock.patch.object(wp, "launch", record):
             state.build(scene.model, scene.state, scene.contacts)
         self.assertEqual(
-            launched, {("_prepare", 512, 512, None), ("_merge_runs", 1024, 1024, None), ("_build", 2048, 2048, 32)}
+            launched, {("_prepare", 1536, 1536, None), ("_merge_runs", 1024, 1024, None), ("_build", 2048, 2048, 32)}
         )
 
     def test_launch_shapes_match_bitwise(self):

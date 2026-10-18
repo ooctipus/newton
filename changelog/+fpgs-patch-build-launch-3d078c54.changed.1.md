@@ -1,0 +1,1 @@
+Launch the per-contact passes of `SolverFeatherPGS` persistent patch friction (`friction_anchor_beta > 0`) on three times the former CUDA grid, which takes 5-33% less GPU time per call in the patch link and finish passes of large measured contact frames and leaves results unchanged.
