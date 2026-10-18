@@ -523,8 +523,12 @@ def assert_empty_tail(patches, context=""):
     np.testing.assert_array_equal(patches.previous_world.numpy()[stored:], -1, f"{context} previous_world tail")
 
 
-def assert_same_state(twin, patches, context=""):
-    """Require bitwise-equal arrays in two patch states, scratch and the sorted-frame record included."""
+def assert_same_state(twin, patches, context="", records=True):
+    """Require bitwise-equal arrays in two patch states, scratch included.
+
+    ``records`` compares the frame records as well: the sorted frame, the sort
+    flag and the frame status.
+    """
     for frame in ("current", "previous"):
         for name in _PatchFrame.vars:
             np.testing.assert_array_equal(
@@ -536,7 +540,10 @@ def assert_same_state(twin, patches, context=""):
         np.testing.assert_array_equal(
             getattr(twin.view, name).numpy(), getattr(patches.view, name).numpy(), f"{context} view.{name}"
         )
-    for name in ("previous_world", "previous_q", "stored", "built", "extent", "sorted_frame", "sort_pairs"):
+    names = ["previous_world", "previous_q", "stored", "built", "extent"]
+    if records:
+        names += ["sorted_frame", "sort_pairs", "frame_status"]
+    for name in names:
         np.testing.assert_array_equal(getattr(twin, name).numpy(), getattr(patches, name).numpy(), f"{context} {name}")
 
 
@@ -2495,6 +2502,140 @@ class TestPatchFrameReuse(unittest.TestCase):
             self.skipTest("Conditional graph nodes need a CUDA 12.4+ driver and Warp build")
         run_frame_reuse_graph(self, "cuda:0")
         run_frame_reuse_graph(self, "cuda:0", worlds=160, contacts=8192, capacity=8192, live_sort=True)
+
+
+def _reused_build(patches, scene, contacts, mode=friction_patches._FRAME_KEEP):
+    """Build ``contacts`` as an admitted reuse does: _prepare_frame in ``mode``, no pair sort, then the pairs."""
+    generation = contacts.contact_generation
+    inputs = patches._prepare_inputs(scene.model, scene.state, contacts)
+    patches._launch_prepare_frame(inputs, generation, patches.stream_token(generation), mode)
+    patches._launch_build(scene.model, scene.state)
+
+
+def _recording_pair(scene, capacity):
+    """Return a patch state that prepares with _prepare and one that prepares and records with _prepare_frame."""
+    phi = [wp.zeros(capacity, dtype=wp.vec2, device=scene.device) for _ in range(2)]
+    plain = _FrictionPatchState(scene.model, capacity, True, phi[0])
+    recording = _FrictionPatchState(scene.model, capacity, True, phi[1], reuse_frames=True)
+    return plain, recording
+
+
+class TestPatchFrameModes(unittest.TestCase):
+    def test_sorting_prepare_matches_prepare_and_records_the_frame(self):
+        """Prepare bitwise as _prepare where the sort follows, and record the frame in the same launch."""
+        rng = np.random.default_rng(41)
+        scene = _Scene("cpu", 41)
+        plain, recording = _recording_pair(scene, 128)
+        launched = []
+        original = wp.launch
+
+        def record(kernel, *args, **kwargs):
+            launched.append(kernel.key)
+            return original(kernel, *args, **kwargs)
+
+        for step, mode in enumerate(("live", "live", "sparse", "overflow", "live", "empty", "gates", "live")):
+            context = f"step {step} {mode}"
+            scene.move()
+            scene.frame("live" if mode == "gates" else mode)
+            gates = _gates(scene, rng) if mode == "gates" else {}
+            plain.build(scene.model, scene.state, scene.contacts, **gates)
+            launched.clear()
+            with mock.patch.object(wp, "launch", record):
+                recording.build(scene.model, scene.state, scene.contacts, **gates)
+            self.assertEqual(launched.count("_prepare_frame"), 1, context)
+            self.assertNotIn("_record_sorted_frame", launched, f"{context}: the prepare records the frame")
+            assert_same_state(recording, plain, f"{context} build", records=False)
+            _assert_record(self, recording, _frame_identity(recording, scene.contacts), context)
+            for state in (plain, recording):
+                state.store(scene.state)
+            assert_same_state(recording, plain, f"{context} store", records=False)
+
+    def test_keep_mode_reuses_the_sorted_pairs_of_the_recorded_frame(self):
+        """Prepare a recorded frame again with its sorted pairs kept, bitwise as a build that sorts it anew."""
+        scene = _Scene("cpu", 42)
+        plain, recording = _recording_pair(scene, 128)
+        kept = 0
+        for step, mode in enumerate(("live", "sparse", "live", "empty", "live", "overflow", "live")):
+            scene.move()
+            live = scene.frame(mode)
+            for state in (plain, recording):
+                state.build(scene.model, scene.state, scene.contacts)
+                state.store(scene.state)
+            for substep in range(1, 3):
+                context = f"step {step} {mode} substep {substep}"
+                scene.move()
+                plain.build(scene.model, scene.state, scene.contacts)
+                _reused_build(recording, scene, scene.contacts)
+                assert_same_state(recording, plain, context, records=False)
+                _assert_record(self, recording, _frame_identity(recording, scene.contacts), context)
+                np.testing.assert_array_equal(recording.frame_status.numpy(), [0], context)
+                assert_empty_tail(recording, context)
+                kept += live
+                for state in (plain, recording):
+                    state.store(scene.state)
+                assert_same_state(recording, plain, f"{context} store", records=False)
+        self.assertGreater(kept, 0, "substeps must reuse live pairs")
+
+    def test_keep_mode_writes_no_live_pair_slot(self):
+        """Leave the pair keys and indices of a recorded frame's live slots unwritten, and empty slots past them."""
+        scene = _Scene("cpu", 44)
+        _, patches = _recording_pair(scene, 128)
+        scene.active[:] = True
+        live = scene.frame()
+        self.assertGreater(live, 0)
+        patches.build(scene.model, scene.state, scene.contacts)
+        # CPU arrays expose their memory; copies keep what the slots held.
+        keys, indices = patches.current.keys.numpy().copy(), patches.current.indices.numpy().copy()
+        # Values no prepare writes: a kept slot must hold them afterwards.
+        keys[:live] = np.arange(live) + 12345
+        indices[:live] = np.arange(live)[::-1] + 1000
+        patches.current.keys.assign(keys)
+        patches.current.indices.assign(indices)
+        generation = scene.contacts.contact_generation
+        inputs = patches._prepare_inputs(scene.model, scene.state, scene.contacts)
+        patches._launch_prepare_frame(
+            inputs, generation, patches.stream_token(generation), friction_patches._FRAME_KEEP
+        )
+        np.testing.assert_array_equal(patches.current.keys.numpy(), keys)
+        np.testing.assert_array_equal(patches.current.indices.numpy(), indices)
+        np.testing.assert_array_equal(patches.extent.numpy(), [live, live])
+
+    def test_keep_mode_empties_a_frame_rewritten_since_its_record(self):
+        """Leave a reused build without live contacts and latch the status when its frame is not the recorded one."""
+        rng = np.random.default_rng(43)
+        for change in ("generation", "count", "stream", "forget"):
+            with self.subTest(change=change):
+                scene = _Scene("cpu", 43)
+                _, patches = _recording_pair(scene, 128)
+                scene.active[:] = True
+                live = scene.frame()
+                self.assertGreater(live, 1)
+                patches.build(scene.model, scene.state, scene.contacts)
+                patches.store(scene.state)
+                self.assertTrue(np.any(patches.previous.valid.numpy()), "the frame must store anchors")
+                contacts = scene.contacts
+                if change == "generation":
+                    scene.generation += 1
+                    contacts.contact_generation.assign([scene.generation])
+                elif change == "count":
+                    contacts.rigid_contact_count.assign([live - 1])
+                elif change == "stream":
+                    contacts = _swapped_stream(scene, live, rng)
+                else:
+                    patches.forget_frame()
+                _reused_build(patches, scene, contacts)
+                np.testing.assert_array_equal(patches.extent.numpy(), [live, 0])
+                np.testing.assert_array_equal(patches.frame_status.numpy(), [1])
+                self.assertEqual(int(patches.sorted_frame.numpy()[0]), -1, "the record is dropped")
+                np.testing.assert_array_equal(patches.current.keys.numpy()[: patches.capacity], SENTINEL)
+                assert_empty_tail(patches, change)
+                patches.store(scene.state)
+                self.assertFalse(np.any(patches.previous.valid.numpy()), "the empty frame releases every anchor")
+                assert_empty_tail(patches, f"{change} store")
+                # A sorting build records the frame again; only the host clears the status.
+                patches.build(scene.model, scene.state, contacts)
+                _assert_record(self, patches, _frame_identity(patches, contacts), f"{change} sort")
+                np.testing.assert_array_equal(patches.frame_status.numpy(), [1])
 
 
 def _expected_pairs(model, contacts, capacity):

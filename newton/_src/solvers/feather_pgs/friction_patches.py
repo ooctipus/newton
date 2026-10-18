@@ -105,6 +105,12 @@ _FOOTPRINT_TOLERANCE = wp.constant(1.0e-3)
 CONTACT_PATH_RESOLVED = wp.constant(-2)
 # The contact generation no frame has: a recorded frame with it never matches.
 _FRAME_SENTINEL = wp.constant(wp.int64(GENERATION_SENTINEL))
+# Modes of _prepare_frame, the host's admission of a frame-reusing build: the
+# pair sort follows unconditionally, a conditional node sorts if the frame is
+# new, or the slots keep the sorted pairs of the frame an earlier build recorded.
+_FRAME_SORT = wp.constant(0)
+_FRAME_DETECT = wp.constant(1)
+_FRAME_KEEP = wp.constant(2)
 
 
 @wp.struct
@@ -359,6 +365,133 @@ def _prepare_contact(
     frame.radius[c] = wp.max(r, 1.0e-4)
 
 
+@wp.func
+def _prepare_contact_fields(
+    c: int,
+    live: int,
+    shape0: wp.array[int],
+    shape1: wp.array[int],
+    point0: wp.array[wp.vec3],
+    point1: wp.array[wp.vec3],
+    normal: wp.array[wp.vec3],
+    margin0: wp.array[float],
+    margin1: wp.array[float],
+    shape_body: wp.array[int],
+    shape_mu: wp.array[float],
+    shape_gap: wp.array[float],
+    body_radius: wp.array[float],
+    q: wp.array[wp.transform],
+    body_to_articulation: wp.array[int],
+    is_free_rigid: wp.array[int],
+    contact_gap_gate: float,
+    same_articulation_gap_gate: float,
+    articulation_pair_gap_gate: float,
+    friction_gap: float,
+    friction_articulation_pairs_only: int,
+    key_stride: int,
+    frame: _PatchFrame,
+    patches: FrictionPatches,
+):
+    """Prepare contact ``c`` as :func:`_prepare_contact` does, except slot ``c``'s pair key and index.
+
+    Returns the pair key :func:`_prepare_contact` stores in slot ``c``, the
+    empty key past ``live``, so a build that reuses sorted pairs can leave the
+    slots' keys and indices untouched. Keep the arithmetic in step with
+    :func:`_prepare_contact`; the frame-reuse tests compare the two bitwise.
+    """
+    frame.owner[c] = -1
+    frame.valid[c] = 0
+    frame.used[c] = 0
+    frame.source[c] = -1
+    frame.eligible[c] = 0
+    frame.tangent_impulse[c] = wp.vec3(0.0)
+    patches.weight[c] = 0.0
+    patches.next_contact[c] = -1
+    patches.phi[c] = wp.vec2(0.0)
+    if c >= live:
+        return wp.int64(0x7FFFFFFFFFFFFFFF)
+    sa = shape0[c]
+    sb = shape1[c]
+    a = int(-1)
+    b = int(-1)
+    if sa >= 0:
+        a = shape_body[sa]
+    if sb >= 0:
+        b = shape_body[sb]
+    ka = a + 1
+    kb = b + 1
+    if a < 0:
+        ka = q.shape[0] + (sa if sa >= 0 else shape_body.shape[0]) + 1
+    if b < 0:
+        kb = q.shape[0] + (sb if sb >= 0 else shape_body.shape[0]) + 1
+    n = -normal[c]
+    pa = _world_point(q, a, point0[c]) - margin0[c] * n
+    pb = _world_point(q, b, point1[c]) + margin1[c] * n
+    gap = wp.dot(n, pa - pb)
+    art_a = int(-1)
+    art_b = int(-1)
+    if a >= 0 and a < body_to_articulation.shape[0]:
+        art_a = body_to_articulation[a]
+    if b >= 0 and b < body_to_articulation.shape[0]:
+        art_b = body_to_articulation[b]
+    a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
+    b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
+    support_gap_limit = float(0.0)
+    if sa >= 0:
+        support_gap_limit += shape_gap[sa]
+    if sb >= 0:
+        support_gap_limit += shape_gap[sb]
+    normal_gap_limit = contact_normal_gap_limit(
+        a_non_free,
+        b_non_free,
+        art_a == art_b,
+        contact_gap_gate,
+        articulation_pair_gap_gate,
+        same_articulation_gap_gate,
+    )
+    support_gap_limit = wp.min(support_gap_limit, normal_gap_limit)
+    eligible = gap <= normal_gap_limit and contact_friction_eligible(
+        gap, a_non_free, b_non_free, friction_articulation_pairs_only, friction_gap
+    )
+    frame.support_gap_limit[c] = wp.max(support_gap_limit, 0.0)
+    frame.eligible[c] = int(eligible)
+    flip = int(ka > kb)
+    if flip != 0:
+        t = a
+        a = b
+        b = t
+        t = ka
+        ka = kb
+        kb = t
+        t = sa
+        sa = sb
+        sb = t
+        n = -n
+    frame.body_a[c] = a
+    frame.body_b[c] = b
+    frame.shape_a[c] = sa
+    frame.shape_b[c] = sb
+    frame.flipped[c] = flip
+    frame.surface_a[c] = _local_point(q, a, pb if flip != 0 else pa)
+    frame.surface_b[c] = _local_point(q, b, pa if flip != 0 else pb)
+    frame.center[c] = 0.5 * (pa + pb)
+    frame.normal[c] = n
+    mu_a = float(0.0)
+    mu_b = float(0.0)
+    if sa >= 0:
+        mu_a = shape_mu[sa]
+    if sb >= 0:
+        mu_b = shape_mu[sb]
+    frame.mu[c] = wp.vec2(mu_a, mu_b)
+    r = float(1.0e10)
+    if a >= 0:
+        r = wp.min(r, body_radius[a])
+    if b >= 0:
+        r = wp.min(r, body_radius[b])
+    frame.radius[c] = wp.max(r, 1.0e-4)
+    return wp.int64(ka) * wp.int64(key_stride) + wp.int64(kb)
+
+
 @wp.kernel(enable_backward=False)
 def _prepare(
     count: wp.array[int],
@@ -469,51 +602,61 @@ def _prepare_frame(
     patches: FrictionPatches,
     generation: wp.array[wp.int32],
     stream: wp.int64,
-    detect: int,
+    mode: int,
     sorted_frame: wp.array[wp.int64],
     extent: wp.array[int],
     sort_pairs: wp.array[wp.int32],
+    frame_status: wp.array[wp.int32],
 ):
-    """Prepare as :func:`_prepare` does, keeping the sorted pairs of the frame the slots hold.
+    """Prepare as :func:`_prepare` does, in the host's admission ``mode`` of a frame-reusing build.
 
-    With ``detect``, a contact frame whose generation, raw count and contact
-    stream equal ``sorted_frame`` is the frame whose pairs the slots hold sorted:
-    its live slots keep their keys and indices. Thread 0 publishes whether the
-    pairs need sorting, which only a new frame with live contacts does: the empty
-    record is already in sorted order. For a new frame it also drops the record,
-    whose slots this launch overwrites; every thread finds the frame new whether
-    it reads the record before or after.
+    ``sorted_frame`` records the contact frame whose pairs the slots hold
+    sorted: its generation, raw count and contact stream. ``_FRAME_SORT``
+    prepares a frame the pair sort follows unconditionally, so thread 0
+    records it. ``_FRAME_KEEP`` reuses the pairs an earlier build sorted: live
+    slots keep their keys and indices, which other modes overwrite. Its frame
+    must be the recorded one. A frame rewritten since then, without a write
+    the host noted, is left empty instead: no contact is live, the record is
+    dropped and ``frame_status`` latches, because stale pairs would group
+    other contacts. ``_FRAME_DETECT`` keeps the recorded frame's pairs the same
+    way, drops the record of any other frame and publishes in ``sort_pairs``
+    whether that frame's live contacts need sorting. Threads agree on the
+    frame whether they read the record before or after thread 0 drops it.
     """
     thread = wp.tid()
-    live = count[0]
+    raw = count[0]
+    live = raw
     if live < 0 or live > shape0.shape[0]:
         live = 0
     live = wp.min(live, frame.valid.shape[0])
     end = wp.max(live, wp.max(stored[0], built[0]))
-    sorted_pairs = int(0)
+    recorded = int(0)
     if (
-        detect != 0
+        mode != _FRAME_SORT
         and sorted_frame[0] == wp.int64(generation[0])
-        and sorted_frame[1] == wp.int64(count[0])
+        and sorted_frame[1] == wp.int64(raw)
         and sorted_frame[2] == stream
     ):
-        sorted_pairs = 1
+        recorded = 1
+    if mode == _FRAME_KEEP and recorded == 0:
+        live = 0
     if thread == 0:
         extent[0] = end
         extent[1] = live
-        sort_pairs[0] = 0
-        if sorted_pairs == 0:
+        if mode == _FRAME_SORT:
+            sorted_frame[0] = wp.int64(generation[0])
+            sorted_frame[1] = wp.int64(raw)
+            sorted_frame[2] = stream
+        elif recorded == 0:
             sorted_frame[0] = _FRAME_SENTINEL
-            if live > 0:
+            if mode == _FRAME_KEEP:
+                frame_status[0] = 1
+        if mode == _FRAME_DETECT:
+            sort_pairs[0] = 0
+            if recorded == 0 and live > 0:
                 sort_pairs[0] = 1
     for c in range(thread, end, threads):
-        keep = sorted_pairs != 0 and c < live
-        key = wp.int64(0)
-        index = int(0)
-        if keep:
-            key = frame.keys[c]
-            index = frame.indices[c]
-        _prepare_contact(
+        key = _prepare_contact_fields(
             c,
             live,
             shape0,
@@ -539,10 +682,10 @@ def _prepare_frame(
             frame,
             patches,
         )
-        if keep:
-            # Slot c holds the sorted pair at position c, not contact c's key.
+        # A kept slot holds the sorted pair at position c, not contact c's key.
+        if recorded == 0 or c >= live:
+            frame.indices[c] = c
             frame.keys[c] = key
-            frame.indices[c] = index
 
 
 @wp.func
@@ -1281,10 +1424,14 @@ class _FrictionPatchState:
         self.body_radius = wp.zeros(model.body_count, dtype=float, device=device)
         # The contact frame whose pairs the current slots hold sorted, as
         # (generation, raw count, contact stream); the sentinel generation makes
-        # the next build sort. _prepare_frame compares it and publishes whether to
-        # sort, and _record_sorted_frame records each sorted frame.
+        # the next build sort. _prepare_frame records a frame the sort follows,
+        # compares a reused one and publishes whether a node sorts, and
+        # _record_sorted_frame records the frame a node sorted.
         self.sorted_frame = wp.full(3, GENERATION_SENTINEL, dtype=wp.int64, device=device)
         self.sort_pairs = wp.zeros(1, dtype=wp.int32, device=device)
+        # Latched when a build that reuses sorted pairs finds another contact
+        # frame than the recorded one and is left empty; only the host clears it.
+        self.frame_status = wp.zeros(1, dtype=wp.int32, device=device)
         self._stream_tokens = weakref.WeakKeyDictionary()
         self._next_stream_token = itertools.count(1)
         self.update_geometry(model)
@@ -1449,7 +1596,95 @@ class _FrictionPatchState:
                 "Friction patch pair keys were sized for another model: "
                 f"{bodies} body poses and {model.shape_body.shape[0]} shapes"
             )
-        prepare_inputs = [
+        prepare_inputs = self._prepare_inputs(
+            model,
+            state,
+            contacts,
+            body_to_articulation=body_to_articulation,
+            is_free_rigid=is_free_rigid,
+            contact_gap_gate=contact_gap_gate,
+            same_articulation_gap_gate=same_articulation_gap_gate,
+            articulation_pair_gap_gate=articulation_pair_gap_gate,
+            friction_gap=friction_gap,
+            friction_articulation_pairs_only=friction_articulation_pairs_only,
+        )
+        generation = getattr(contacts, "contact_generation", None) if self.reuse_frames else None
+        if generation is None:
+            # The slots receive a frame no record can name.
+            self.forget_frame()
+            wp.launch(
+                _prepare,
+                dim=self.threads,
+                inputs=prepare_inputs,
+                outputs=[self.extent],
+                device=model.device,
+            )
+            self._order_pairs()
+        else:
+            # The token identifies the contact stream, also across graphs captured
+            # with other Contacts instances.
+            stream = self.stream_token(generation)
+            branch = self._capture_branch()
+            # Only _order_pairs runs under the node: _prepare_frame computes the
+            # condition, and _build, the link, the seed and the finish stride over
+            # the frame's extent at other stages of the step, where each node
+            # would pause the capture again to skip microseconds of work.
+            with nullcontext() if branch is None else capture_pause():
+                if branch is not None and not self._capture_can_pause():
+                    branch = None
+                if branch is None:
+                    # The prepare records the frame that the sort then orders.
+                    self._launch_prepare_frame(prepare_inputs, generation, stream, _FRAME_SORT)
+                    self._order_pairs()
+                else:
+                    self._launch_prepare_frame(prepare_inputs, generation, stream, _FRAME_DETECT)
+                    record = (generation, contacts.rigid_contact_count, stream)
+                    branch(self.sort_pairs, on_true=self._order_pairs, record=record)
+        self._launch_build(model, state)
+
+    def _launch_build(self, model, state):
+        """Build the pairs of the prepared, sorted slots."""
+        # Warp compiles this module once more for _build's block size; the
+        # variants differ only in the tile block size, which no _build
+        # arithmetic reads. That variant also tiles _sort_chunks for 32
+        # threads, which no launch uses and which about doubles the variant's
+        # compile time on a cold kernel cache.
+        wp.launch(
+            _build,
+            dim=self.build_threads,
+            inputs=[
+                self.extent,
+                self.stored,
+                state.body_q,
+                self.previous_q,
+                model.shape_transform,
+                model.shape_collision_radius,
+                self.build_threads,
+                self.current,
+                self.previous,
+                self.view,
+            ],
+            outputs=[self.built],
+            device=model.device,
+            block_dim=self.build_block_dim,
+        )
+
+    def _prepare_inputs(
+        self,
+        model,
+        state,
+        contacts,
+        *,
+        body_to_articulation=None,
+        is_free_rigid=None,
+        contact_gap_gate=0.0,
+        same_articulation_gap_gate=0.0,
+        articulation_pair_gap_gate=0.0,
+        friction_gap=float("inf"),
+        friction_articulation_pairs_only=False,
+    ):
+        """Return the inputs that :func:`_prepare` and :func:`_prepare_frame` share, with :meth:`build`'s gates."""
+        return [
             contacts.rigid_contact_count,
             contacts.rigid_contact_shape0,
             contacts.rigid_contact_shape1,
@@ -1477,66 +1712,15 @@ class _FrictionPatchState:
             self.current,
             self.view,
         ]
-        build_inputs = [
-            self.extent,
-            self.stored,
-            state.body_q,
-            self.previous_q,
-            model.shape_transform,
-            model.shape_collision_radius,
-            self.build_threads,
-            self.current,
-            self.previous,
-            self.view,
-        ]
-        generation = getattr(contacts, "contact_generation", None) if self.reuse_frames else None
-        if generation is None:
-            # The slots receive a frame no record can name.
-            self.forget_frame()
-            wp.launch(
-                _prepare,
-                dim=self.threads,
-                inputs=prepare_inputs,
-                outputs=[self.extent],
-                device=model.device,
-            )
-            self._order_pairs()
-        else:
-            # The token identifies the contact stream, also across graphs captured
-            # with other Contacts instances.
-            stream = self.stream_token(generation)
-            branch = self._capture_branch()
-            # Only _order_pairs runs under the node: _prepare_frame computes the
-            # condition, and _build, the link, the seed and the finish stride over
-            # the frame's extent at other stages of the step, where each node
-            # would pause the capture again to skip microseconds of work.
-            with nullcontext() if branch is None else capture_pause():
-                if branch is not None and not self._capture_can_pause():
-                    branch = None
-                wp.launch(
-                    _prepare_frame,
-                    dim=self.threads,
-                    inputs=[*prepare_inputs, generation, stream, int(branch is not None), self.sorted_frame],
-                    outputs=[self.extent, self.sort_pairs],
-                    device=model.device,
-                )
-                record = (generation, contacts.rigid_contact_count, stream)
-                if branch is None:
-                    self._order_pairs(record=record)
-                else:
-                    branch(self.sort_pairs, on_true=self._order_pairs, record=record)
-        # Warp compiles this module once more for _build's block size; the
-        # variants differ only in the tile block size, which no _build
-        # arithmetic reads. That variant also tiles _sort_chunks for 32
-        # threads, which no launch uses and which about doubles the variant's
-        # compile time on a cold kernel cache.
+
+    def _launch_prepare_frame(self, prepare_inputs, generation, stream, mode):
+        """Prepare a frame-reusing build in ``mode`` (``_FRAME_SORT``, ``_FRAME_DETECT`` or ``_FRAME_KEEP``)."""
         wp.launch(
-            _build,
-            dim=self.build_threads,
-            inputs=build_inputs,
-            outputs=[self.built],
-            device=model.device,
-            block_dim=self.build_block_dim,
+            _prepare_frame,
+            dim=self.threads,
+            inputs=[*prepare_inputs, generation, stream, int(mode), self.sorted_frame],
+            outputs=[self.extent, self.sort_pairs, self.frame_status],
+            device=self.device,
         )
 
     def _capture_branch(self):
