@@ -209,15 +209,17 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         """Repair no group when a proven joint notification precedes every step, for every owner kind.
 
         A finish adds one to each group's generation and a recomputing repair adds another, so a
-        steady ping-pong rollout adds exactly one per step. The trajectory equals the rollout
-        without notifications.
+        steady ping-pong rollout adds exactly one per step. A third rollout invalidates every group
+        before each step, as each joint notification did before, and adds two. The notified
+        trajectory matches both: the cache a finish publishes is what a repair recomputes from the
+        same coordinates.
         """
         device = wp.get_device("cuda:0")
         steps = 6
         for name in ("mixed", "forest", "sparse"):
             with self.subTest(owner=name):
-                finals = []
-                for notified in (False, True):
+                finals = {}
+                for mode, per_step in (("plain", 1), ("notified", 1), ("invalidated", 2)):
                     model, solver = _owned_case(name, device)
                     owner = solver._tree_kinetic_state
                     self.assertIsNotNone(owner, "The fixture must admit a held-tree owner")
@@ -228,20 +230,23 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
                     rollout.step()  # the first repair builds every cache
                     before = _generations(owner)
                     for _ in range(steps):
-                        if notified:
+                        if mode == "notified":
                             solver.notify_model_changed(JOINT)
+                        elif mode == "invalidated":
+                            owner.invalidate()
                         rollout.step()
                     for start, end in zip(before, _generations(owner), strict=True):
-                        np.testing.assert_array_equal(end - start, steps, err_msg=f"{notified=}")
-                    finals.append(rollout.states[0])
-                for field in STATE_FIELDS:
-                    np.testing.assert_allclose(
-                        getattr(finals[1], field).numpy(),
-                        getattr(finals[0], field).numpy(),
-                        rtol=0.0,
-                        atol=2e-6,
-                        err_msg=field,
-                    )
+                        np.testing.assert_array_equal(end - start, per_step * steps, err_msg=mode)
+                    finals[mode] = {field: getattr(rollout.states[0], field).numpy() for field in STATE_FIELDS}
+                for reference in ("plain", "invalidated"):
+                    for field in STATE_FIELDS:
+                        np.testing.assert_allclose(
+                            finals["notified"][field],
+                            finals[reference][field],
+                            rtol=0.0,
+                            atol=2e-6,
+                            err_msg=f"{field} against the {reference} rollout",
+                        )
 
     @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
     def test_cuda_reset_worlds_alone_repair_around_pose_writes(self):
