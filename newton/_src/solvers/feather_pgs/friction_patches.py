@@ -1463,6 +1463,8 @@ class _FrictionPatchState:
         ]
         generation = getattr(contacts, "contact_generation", None) if self.reuse_frames else None
         if generation is None:
+            # The slots receive a frame no record can name.
+            self.forget_frame()
             wp.launch(
                 _prepare,
                 dim=self.threads,

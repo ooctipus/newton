@@ -1690,6 +1690,22 @@ class TestPatchFrameReuse(unittest.TestCase):
                 np.testing.assert_array_equal(patches.sorted_frame.numpy(), -1)
         self.assertFalse(_FrictionPatchState(scene.model, 128, False, phi, reuse_frames=True).reuse_frames)
 
+    def test_builds_without_a_generation_drop_the_sorted_frame(self):
+        """Sort a recorded frame again after a build from contacts without a generation re-sorted the slots."""
+        rng = np.random.default_rng(14)
+        scene = _Scene("cpu", 14)
+        live = scene.frame()
+        self.assertGreater(live, 0)
+        patches, reference, sorts = _reusing_pair(scene, 128)
+        other = _swapped_stream(scene, live, rng)
+        anonymous = SimpleNamespace(**{k: v for k, v in vars(other).items() if k != "contact_generation"})
+        for build, contacts in enumerate((scene.contacts, anonymous, scene.contacts)):
+            for state in (patches, reference):
+                state.build(scene.model, scene.state, contacts)
+            self.assertEqual(len(sorts), build + 1, f"build {build} sorts")
+            assert_same_patches(patches, reference, live, f"build {build}")
+        _assert_record(self, patches, _frame_identity(patches, scene.contacts), "return")
+
     def test_capture_pause_wraps_each_conditional_node(self):
         """Enter the caller's capture pause around each captured node, sorting or not, and never eagerly."""
         scene = _Scene("cpu", 8)
