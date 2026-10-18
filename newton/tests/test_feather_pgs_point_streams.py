@@ -309,6 +309,62 @@ def _solver_factory_calls():
         yield label, solver._get_pgs_solve_parallel_kernel, args, kwargs
 
 
+def _spliced_sweep_calls():
+    """Sweeps that splice the friction law or vote a sweep exit, beyond the factories above.
+
+    Local owners, plain and over packet rows: a contactless subwarp articulation,
+    an articulation pair and the pair's residual with matrix-free rows. Then the
+    tiled-row sweep with and without row budgets, the legacy matrix-free sweep,
+    the four propagation sweeps and the response-block sweeps.
+    """
+    from newton._src.solvers.feather_pgs import response_block_sweep, row_packets  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.kernels import PROPAGATION_COLOR_TAIL  # noqa: PLC0415
+
+    name = "solver_feather_pgs."
+    local = solver._get_pgs_solve_local_owned_kernel.__wrapped__
+    packets = row_packets.get_local_factory.__wrapped__(9, 6, 40)
+    pair = {"paired_dof_count": 6, "persistent_queue": True}
+    for args, options in (
+        ((192, 9, 9, _ARCH), {"lanes_per_world": 8, "contact_capable": False}),
+        ((192, 20, 9, _ARCH), pair),
+        ((192, 40, 9, _ARCH), {**pair, "mf_max_constraints": 64, "local_mf_max_constraints": 12}),
+    ):
+        kwargs = {**options, "warps_per_block": 2, "dense_response_matrix": True}
+        yield name + "_get_pgs_solve_local_owned_kernel", local, args, kwargs
+        yield "row_packets.get_local_factory(9, 6, 40)", packets, args, kwargs
+    tiled = solver._get_pgs_solve_tiled_row_kernel.__wrapped__
+    for capacity in (64, 128):
+        yield name + "_get_pgs_solve_tiled_row_kernel", tiled, (capacity, _ARCH), {}
+        for budget, minimum in ((32, 0), (capacity, 32)):
+            kwargs = {"row_budget": budget, "min_rows": minimum}
+            yield name + "_get_pgs_solve_tiled_row_kernel", tiled, (capacity, _ARCH), kwargs
+    yield name + "_get_pgs_solve_mf_kernel", solver._get_pgs_solve_mf_kernel.__wrapped__, (32, 8, _ARCH), {}
+    entries = PROPAGATION_COLOR_TAIL + 2
+    factory = solver._get_pgs_solve_propagation_colored_warp_kernel.__wrapped__
+    for lanes in (1, 4):
+        yield name + "_get_pgs_solve_propagation_colored_warp_kernel", factory, (64, entries, 16, lanes, 2, _ARCH), {}
+    # Shared-memory body staging, and the global-memory path above its body cap.
+    factory = solver._get_pgs_solve_propagation_colored_block_kernel.__wrapped__
+    for bodies in (16, 512):
+        yield name + "_get_pgs_solve_propagation_colored_block_kernel", factory, (64, entries, 64, bodies, _ARCH), {}
+    factory = solver._get_pgs_solve_propagation_contact_kernel
+    yield name + "_get_pgs_solve_propagation_contact_kernel", factory, (64, _ARCH), {"worlds_per_block": 2}
+    factory = solver._get_pgs_solve_propagation_full_iteration_kernel.__wrapped__
+    shape = (64, 32, 18, 64, 16, 18, _ARCH)
+    for fuse in (False, True):
+        kwargs = {"worlds_per_block": 1, "fuse_vel_limits": fuse}
+        yield name + "_get_pgs_solve_propagation_full_iteration_kernel", factory, shape, kwargs
+    name = "response_block_sweep."
+    for drives in (False, True):
+        kwargs = {"lane_rows": 16, "has_drive_rows": drives}
+        factory = response_block_sweep.get_response_block_sweep_lane_kernel
+        yield name + "get_response_block_sweep_lane_kernel", factory, (192, 64, 22), kwargs
+        for rows in (32, 64):
+            factory = response_block_sweep.get_response_block_sweep_warp_kernel
+            yield name + "get_response_block_sweep_warp_kernel", factory, (192, 64, 22), {**kwargs, "rows": rows}
+
+
 def _keyed_row_calls():
     """Keyed rows of a 16+6 coordinate world (keyed_rows.py), including their parallel tiers."""
     from newton._src.solvers.feather_pgs import keyed_rows  # noqa: PLC0415
@@ -339,6 +395,7 @@ def _factory_kernels():
         _linked_sweep_calls(),
         _sparse_contact_calls(),
         _solver_factory_calls(),
+        _spliced_sweep_calls(),
         _keyed_row_calls(),
     ):
         try:
@@ -506,6 +563,26 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
         linked = [name for name in self.current if "linked_rows=True" in name]
         self.assertTrue(linked)
         self.assertTrue(set(linked) <= _PATCH_ONLY)
+
+    def test_inventory_covers_the_spliced_sweeps(self):
+        """Reach the sweeps that splice the friction law or vote an exit, beyond the patch-varied factories."""
+        families = {name.split("(", 1)[0] for name in self.current}
+        for family in (
+            "solver_feather_pgs._get_pgs_solve_local_owned_kernel",
+            "row_packets.get_local_factory",
+            "solver_feather_pgs._get_pgs_solve_tiled_row_kernel",
+            "solver_feather_pgs._get_pgs_solve_mf_kernel",
+            "solver_feather_pgs._get_pgs_solve_propagation_colored_warp_kernel",
+            "solver_feather_pgs._get_pgs_solve_propagation_colored_block_kernel",
+            "solver_feather_pgs._get_pgs_solve_propagation_contact_kernel",
+            "solver_feather_pgs._get_pgs_solve_propagation_full_iteration_kernel",
+            "response_block_sweep.get_response_block_sweep_lane_kernel",
+            "response_block_sweep.get_response_block_sweep_warp_kernel",
+        ):
+            with self.subTest(family=family):
+                self.assertIn(family, families)
+                # Every friction law launches these sweeps, so their pins are point pins.
+                self.assertFalse({name for name in self.current if name.startswith(family + "(")} & _PATCH_ONLY)
 
 
 def record():
