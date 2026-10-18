@@ -153,7 +153,9 @@ def torsion_neutral_route(solver):
     only in the torsion options, the friction record's torsion flag, the point-contact flag and the
     parallel-row admission that torsion clears, and the torsion specialization of the matrix-free
     sweep kernel. Reasons are text and lane timings are measurements; every other selection and
-    applied option must match, the tiers and keyed rows the parallel-row admission gates included.
+    applied option must match. Of the parallel-row record only the admission flag is dropped: the
+    zero-radius arm's follows its friction law and ``FEATHER_PGS_PATCH_PARALLEL_ROWS``, and
+    :func:`assert_torsion_neutral_routes` requires the torsion arm's to be False.
     """
     record = _without_reasons(solver.get_path_selection())
     del record["measurements"]
@@ -161,7 +163,7 @@ def torsion_neutral_route(solver):
         del record["options"][name]
     routes = record["routes"]
     del routes["friction"]["torsion"]
-    del routes["friction"]["parallel_rows"]
+    del routes["friction"]["parallel_rows"]["admitted"]
     del routes["contact_rows"]["point_contact_paths"]
     if routes["sweep"]["mf_gs"] is not None:
         routes["sweep"]["mf_gs"] = routes["sweep"]["mf_gs"].replace("_torsion", "")
@@ -169,7 +171,13 @@ def torsion_neutral_route(solver):
 
 
 def assert_torsion_neutral_routes(test, reference, selected_out):
-    """Require a zero-radius and a selected-out torsion solver to share the pinned ordinary route."""
+    """Require a zero-radius and a selected-out torsion solver to share the pinned ordinary route.
+
+    The selected-out arm runs the torsion sweep on ordinary rows, so it must decline the parallel
+    tiers (they have no torsion pass) and keyed rows whatever its friction law and the opt-in
+    ``FEATHER_PGS_PATCH_PARALLEL_ROWS`` say.
+    """
+    test.assertFalse(selected_out.get_path_selection()["routes"]["friction"]["parallel_rows"]["admitted"])
     route = torsion_neutral_route(reference)
     test.assertEqual(torsion_neutral_route(selected_out), route)
     test.assertEqual(route["sparse_mass_matrix"], "off")
@@ -385,7 +393,8 @@ class TestTorsionNeutralRoute(unittest.TestCase):
         records before comparing states. Records are decided at construction, so both arms are
         built here in split mode, with the CUDA-only torsion mode check patched out, and neither
         is stepped. ``FEATHER_PGS_PATCH_PARALLEL_ROWS=1`` admits patch friction to the parallel
-        rows that torsion keeps a solver out of, as point friction is admitted.
+        rows that torsion keeps a solver out of, as point friction is admitted: the zero-radius arm
+        is admitted in three of the four cases, the selected-out arm in none.
         """
         model = pads("cpu")
         split = {"pgs_mode": "split", "friction_anchor_beta": 0.0, "pgs_warmstart": False, **TORSION_OFF_ROUTE}
@@ -404,7 +413,9 @@ class TestTorsionNeutralRoute(unittest.TestCase):
                         model, contact_torsion_radius=0.01, contact_torsion_shape_indices=(), **{**split, **options}
                     )
                     self.assertTrue(selected_out._contact_torsion_enabled)
-                    self.assertEqual(torsion_neutral_route(selected_out), torsion_neutral_route(reference))
+                    friction = reference.get_path_selection()["routes"]["friction"]
+                    self.assertEqual(friction["parallel_rows"]["admitted"], law == "point" or switch == "1")
+                    assert_torsion_neutral_routes(self, reference, selected_out)
 
 
 @unittest.skipUnless(wp.get_device().is_cuda, "Contact torsion currently requires CUDA")

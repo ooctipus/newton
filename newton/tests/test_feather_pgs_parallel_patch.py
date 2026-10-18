@@ -667,9 +667,14 @@ class TestPatchParallelAdmission(unittest.TestCase):
                     self.assertIn(f"{_SWITCH}=1", keyed["reason"])
         # Torsion and compliance (CUDA-only laws here) keep ordinary rows whatever the switch says.
         other_law = SimpleNamespace(_point_contact_paths=False, _law_agnostic_contact_paths=False)
-        admitted, reason = SolverFeatherPGS._admit_parallel_contact_paths(other_law)
-        self.assertFalse(admitted)
-        self.assertIn("torsion", reason)
+        for switch in (None, "0", "1"):
+            with self.subTest(law="torsion or compliance", switch=switch), patch.dict(os.environ):
+                os.environ.pop(_SWITCH, None)
+                if switch is not None:
+                    os.environ[_SWITCH] = switch
+                admitted, reason = SolverFeatherPGS._admit_parallel_contact_paths(other_law)
+                self.assertFalse(admitted)
+                self.assertIn("torsion", reason)
 
     def test_route_record_reads_the_built_tiers(self):
         """Record the tiers' ring-pooled projection from the kernels built, not from the friction law."""
