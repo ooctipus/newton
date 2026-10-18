@@ -932,15 +932,24 @@ def _friction_pairs(solver, world):
 @unittest.skipUnless(wp.is_cuda_available(), "Parallel matrix-free tiers require CUDA")
 class TestPatchParallelRoutes(unittest.TestCase):
     def test_patch_runs_linked_tiers_only_when_switched_on(self):
-        """Build linked tiers for patch friction only under the switch, and point tiers for point friction."""
+        """Build linked tiers for patch friction only under the switch, and point tiers for point friction.
+
+        By default patch friction keeps the route it had before the tiers learned the
+        ring: the serial sweep, or the incremental tier that the constructor's default
+        ``mf_gs_incremental_rows=32`` requests and an admitted parallel tier replaces.
+        Point friction builds its tiers with the switch unset, as it runs by default.
+        """
         model = standing_model()
         options = {"sparse_mass_matrix": "auto", "cached_dynamics": "auto"}
         with patch.dict(os.environ, {_SWITCH: "1"}):
             patch_tiers = _matrix_free_solver(model, beta=0.2, parallel_rows=32, **options)
-            point_tiers = _matrix_free_solver(model, beta=0.0, parallel_rows=32, **options)
             serial = _matrix_free_solver(model, beta=0.2, parallel_rows=0, **options)
+            # Both tiers requested on the dense route (sparse factors off), so only the switch picks one.
+            over_incremental = _matrix_free_solver(model, beta=0.2, parallel_rows=32, mf_gs_incremental_rows=32)
             del os.environ[_SWITCH]  # the default
             default = _matrix_free_solver(model, beta=0.2, parallel_rows=32, **options)
+            incremental = _matrix_free_solver(model, beta=0.2, parallel_rows=32, mf_gs_incremental_rows=32)
+            point_tiers = _matrix_free_solver(model, beta=0.0, parallel_rows=32, **options)
         for solver, linked in ((patch_tiers, True), (point_tiers, False)):
             self.assertEqual(solver._ink_rows, 32)
             # The tier owns the ordinary buffers for either law.
@@ -963,6 +972,12 @@ class TestPatchParallelRoutes(unittest.TestCase):
         self.assertEqual(actual["kernel_plan_by_dof"], expected["kernel_plan_by_dof"])
         self.assertFalse(actual["routes"]["friction"]["parallel_rows"]["admitted"])
         self.assertIn(f"{_SWITCH}=1", actual["routes"]["friction"]["parallel_rows"]["reason"])
+        # With the incremental tier requested too, the default keeps it; opted in, the linked tiers replace it.
+        self.assertEqual((incremental._ink_rows, incremental._incremental_rows), (0, 32))
+        self.assertEqual(incremental.get_path_selection()["routes"]["sweep"]["tiers"]["family"], "incremental")
+        self.assertEqual((over_incremental._ink_rows, over_incremental._incremental_rows), (32, 0))
+        tiers = over_incremental.get_path_selection()["routes"]["sweep"]["tiers"]
+        self.assertEqual((tiers["family"], tiers["linked_rows"]), ("parallel", True))
 
     def test_in_sweep_world_rows_stay_point_only(self):
         """Own no in-sweep world rows under patch friction with INK and WORLD_ROWS and keyed rows declined."""
