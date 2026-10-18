@@ -1372,26 +1372,36 @@ def run_launch_shapes(device, seed, shapes, *, worlds=3, contacts=96, capacity=1
 
 
 @contextlib.contextmanager
-def _patch_variants_compiled_here():
-    """Compile the patch module's block-size variants in this process, into a temporary kernel cache.
+def _patch_variants_compiled_here(device, block_dims=(256, friction_patches._BUILD_BLOCK_DIM)):
+    """Run the body on block-size variants of the patch module that this process compiled.
 
     Which product of a sum NVRTC leaves unfused can follow the order in which
     Warp emits a module's kernels, and that order differs between processes
     (module docstring). _build launches from a variant of its own block size,
     so two cached variants that two processes compiled may round carried
     displacements differently. Variants compiled by one process share the
-    emission order and must match bitwise.
+    emission order and must match bitwise. The variants of ``block_dims``
+    compile into a temporary kernel cache before the body runs, and every
+    other module loads from the kernel cache as usual; the body must launch
+    the patch module from these variants only.
     """
     module = friction_patches._build.module
     cache = wp.config.kernel_cache_dir
+    module.unload()
     with tempfile.TemporaryDirectory() as directory:
-        module.unload()
         wp.config.kernel_cache_dir = directory
         try:
-            yield
+            for block_dim in block_dims:
+                wp.load_module(module, device=device, block_dim=block_dim)
         finally:
             wp.config.kernel_cache_dir = cache
-            module.unload()
+    compiled = dict(module.execs)
+    try:
+        yield
+        if module.execs != compiled:
+            raise AssertionError(f"the patch module loaded variants other than block sizes {block_dims}")
+    finally:
+        module.unload()
 
 
 class TestPatchLaunchShapes(unittest.TestCase):
@@ -1457,7 +1467,7 @@ class TestPatchLaunchShapes(unittest.TestCase):
             _shape(capacity, 1, **_SHAPE),
             _ODD_SHAPE,
         )
-        with _patch_variants_compiled_here():
+        with _patch_variants_compiled_here(device):
             for live_sort, reuse in itertools.product((False, True), (False, True)):
                 with self.subTest(live_sort=live_sort, reuse=reuse):
                     coverage = run_launch_shapes(
