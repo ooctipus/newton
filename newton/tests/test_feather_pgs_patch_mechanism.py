@@ -1291,6 +1291,31 @@ def _after_build(sorted_frame, identity, live):
     return None
 
 
+def _edit_geometry(scene, rng, states, live):
+    """Nudge a shape and move a live contact's body piece to a neighbouring body of its world.
+
+    The move changes the pair keys of the unchanged contact frame, so a build that
+    kept the frame's sorted pairs across the edit would hold stale pairs.
+    """
+    transforms = scene.model.shape_transform.numpy()
+    transforms[int(rng.integers(0, len(transforms))), 0] += 1.0e-3
+    scene.model.shape_transform.assign(transforms)
+    shape_body = scene.model.shape_body.numpy()
+    shapes = np.concatenate([getattr(scene.contacts, f"rigid_contact_shape{side}").numpy()[:live] for side in (0, 1)])
+    pieces = np.unique(shapes[shapes >= 0])
+    pieces = pieces[shape_body[pieces] >= 0]
+    if not len(pieces):
+        pieces = np.flatnonzero(shape_body >= 0)
+    piece = int(rng.choice(pieces))
+    body = shape_body[piece]
+    after = body + 1 < scene.body_count and scene.body_world[body + 1] == scene.body_world[body]
+    shape_body[piece] = body + 1 if after else body - 1
+    scene.model.shape_body.assign(shape_body)
+    scene.shape_body = shape_body
+    for state in states:
+        state.update_geometry(scene.model)
+
+
 def _assert_record(test, patches, sorted_frame, context):
     """Require the device record to name ``sorted_frame``, or to hold the sentinel generation for ``None``."""
     record = patches.sorted_frame.numpy()
@@ -1306,9 +1331,9 @@ def _assert_record(test, patches, sorted_frame, context):
 # second substep, "truncate" lowers the count without a new generation, "clear"
 # empties it and restores it before the third, "swap" moves to another contact
 # stream of equal generation and count (and back before the third), "geometry"
-# edits a shape and "forget" drops the sorted frame. "reset" resets some worlds
-# after its first substep, and "unstored" solves no rows and stores nothing in its
-# first substep.
+# edits a shape and moves a live contact's piece to another body, and "forget"
+# drops the sorted frame. "reset" resets some worlds after its first substep, and
+# "unstored" solves no rows and stores nothing in its first substep.
 _REUSE_PLAN = (
     ("live", 2),
     ("same", 2),
@@ -1386,11 +1411,7 @@ def run_frame_reuse_differential(
             if event == "swap":
                 contacts = _swapped_stream(scene, live, rng) if substep == 1 else scene.contacts
             if substep == 1 and event == "geometry":
-                transforms = scene.model.shape_transform.numpy()
-                transforms[int(rng.integers(0, len(transforms))), 0] += 1.0e-3
-                scene.model.shape_transform.assign(transforms)
-                for state in (patches, reference):
-                    state.update_geometry(scene.model)
+                _edit_geometry(scene, rng, (patches, reference), live)
                 sorted_frame = None
             if substep == 1 and event == "forget":
                 patches.forget_frame()
@@ -1446,7 +1467,8 @@ def _nudge_poses(q: wp.array[wp.transform], step: float):
 # keeps the frame, "truncate" lowers the count without a new generation, "clear"
 # empties it and "restore" brings it back, both without a new generation, "swap"
 # replays the second graph over another stream of equal generation and count,
-# "forget" drops the sorted frame and "geometry" edits a shape.
+# "forget" drops the sorted frame and "geometry" edits a shape and moves a live
+# contact's piece to another body.
 _GRAPH_PLAN = (
     "same",
     "live",
@@ -1521,11 +1543,7 @@ def run_frame_reuse_graph(test, device, *, worlds=32, contacts=1536, capacity=20
         elif event == "forget":
             patches.forget_frame()
         elif event == "geometry":
-            transforms = scene.model.shape_transform.numpy()
-            transforms[int(rng.integers(0, len(transforms))), 0] += 1.0e-3
-            scene.model.shape_transform.assign(transforms)
-            for state in (patches, reference):
-                state.update_geometry(scene.model)
+            _edit_geometry(scene, rng, (patches, reference), live)
         reference_state.body_q.assign(scene.state.body_q)
         reference.build(scene.model, reference_state, stream)
         rows.generate(reference, live)
