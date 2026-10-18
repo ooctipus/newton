@@ -3641,6 +3641,11 @@ class SolverFeatherPGS(SolverBase):
         prescribed-response articulation dynamic, or a DOF of a sparse split or
         velocity-limit response kinematic, raise before any solver state
         changes; reconstruct the solver for them.
+
+        With cached dynamics active, a notification whose only flag among the
+        cached inputs is :attr:`~newton.ModelFlags.JOINT_PROPERTIES` keeps the
+        cache once the cache's check finds every joint frame and axis
+        unchanged; a changed joint frame raises, as before.
         """
         # Derive the kinematic state first: a body-flag change the solver
         # cannot absorb raises here, before any mask, cache or owner changes.
@@ -3656,28 +3661,26 @@ class SolverFeatherPGS(SolverBase):
             # properties keep their history and live materials are checked per step.
             self._friction_patches.update_geometry(self.model)
         tree_kinetic = getattr(self, "_tree_kinetic_state", None)
-        if tree_kinetic is not None:
-            tree_kinetic.validate_model(flags)
+        frames_proven = tree_kinetic is not None and tree_kinetic.validate_model(flags)
         if self._row_packets is not None:
             self._row_packets.validate_notification(flags)
         if self._keyed_rows is not None:
             self._keyed_rows.validate_notification(flags)
-        tree_cache = getattr(self, "_tree_kinetic_state", None)
-        if tree_cache is not None and flags & (
+        cache_inputs = int(flags) & int(
             ModelFlags.JOINT_PROPERTIES
             | ModelFlags.JOINT_DOF_PROPERTIES
             | ModelFlags.BODY_PROPERTIES
             | ModelFlags.BODY_INERTIAL_PROPERTIES
             | ModelFlags.MODEL_PROPERTIES
-        ):
-            tree_cache.invalidate()
-        if self._fk_id_cache_enabled and flags & (
-            ModelFlags.JOINT_PROPERTIES
-            | ModelFlags.JOINT_DOF_PROPERTIES
-            | ModelFlags.BODY_PROPERTIES
-            | ModelFlags.BODY_INERTIAL_PROPERTIES
-            | ModelFlags.MODEL_PROPERTIES
-        ):
+        )
+        if frames_proven and cache_inputs == int(ModelFlags.JOINT_PROPERTIES):
+            # The owner's proof just found every joint frame and axis bitwise
+            # unchanged, and stepping never reads Model.joint_q: every cache
+            # input is as it was. Isaac Lab notifies so on each fixed-root pose write.
+            cache_inputs = 0
+        if tree_kinetic is not None and cache_inputs:
+            tree_kinetic.invalidate()
+        if self._fk_id_cache_enabled and cache_inputs:
             self._fk_id_cache_valid.zero_()
         if kinematic is not None:
             self._apply_kinematic_state(kinematic)

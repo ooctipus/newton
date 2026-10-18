@@ -436,9 +436,14 @@ class TreeKineticState:
         a notification on every reset. Body flags are not baked: the kernels
         read the kinematic masks and armature the solver re-derives in place,
         after rejecting any flag change it cannot absorb.
+
+        Returns:
+            Whether the proof ran: every baked plan array, the joint frames
+            ``joint_X_p`` and ``joint_X_c`` and the joint axes included, is
+            unchanged. Numeric notifications skip the proof and return ``False``.
         """
         if flags is not None and int(flags) != 0 and int(flags) & ~_NUMERIC_FLAGS == 0:
-            return
+            return False
         if self._dimensions() != self._plan_dimensions:
             raise RuntimeError("Tree kinetic dimensions changed; reconstruct and recapture")
 
@@ -448,6 +453,7 @@ class TreeKineticState:
             return getattr(self.solver.model, label)
 
         self._proof.validate(current, "Tree kinetic static")
+        return True
 
     def invalidate(self, world_mask=None):
         """Invalidate current state for every owned articulation in selected worlds."""

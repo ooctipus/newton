@@ -581,10 +581,14 @@ class MixedTreeKineticState:
         yield "prescribed_articulation", solver._prescribed_articulation
 
     def validate_model(self, flags=None):
-        """Reject ownership changes before any cache or notification mutation."""
+        """Reject ownership changes before any cache or notification mutation.
+
+        Returns:
+            Whether every group's proof ran (see :meth:`TreeKineticState.validate_model`).
+        """
         if flags is not None and int(flags) != 0 and int(flags) & ~_NUMERIC_FLAGS == 0:
             # Numeric notifications cannot change ownership; see TreeKineticState.
-            return
+            return False
         solver = self.solver
         sizes = (
             tuple(solver.size_groups),
@@ -599,9 +603,9 @@ class MixedTreeKineticState:
             raise RuntimeError("Mixed tree factor groups changed; reconstruct and recapture")
         current = dict(self._coverage_arrays())
         self._proof.validate(current.__getitem__, "Mixed tree factor")
-        for group in self.groups:
-            # Each group's plan binds the same group map it was built from.
-            group.validate_model(flags)
+        # Each group's plan binds the same group map it was built from.
+        proven = [group.validate_model(flags) for group in self.groups]
+        return bool(proven) and all(proven)
 
     def invalidate(self, world_mask=None):
         """Invalidate all component caches for selected worlds."""

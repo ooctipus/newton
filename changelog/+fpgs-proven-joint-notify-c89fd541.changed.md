@@ -1,0 +1,1 @@
+Keep `SolverFeatherPGS`'s cached dynamics valid across `notify_model_changed(ModelFlags.JOINT_PROPERTIES)` when the cache's device check finds every joint frame and axis unchanged, instead of rebuilding every world's cache on the next step; Isaac Lab sends this notification on each fixed-root pose write. Other cache inputs still invalidate, and a changed joint frame still raises.
