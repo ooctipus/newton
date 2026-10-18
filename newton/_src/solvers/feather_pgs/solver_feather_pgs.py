@@ -2962,7 +2962,8 @@ class SolverFeatherPGS(SolverBase):
         # Worlds of one limited articulation and at most one other get their
         # limit prefix and contact packets built in place for the local solve
         # owners (row_packets.py), with the point or the patch row law;
-        # FEATHER_PGS_ROW_PACKETS=0 opts out. The keyed rows below stay point-only.
+        # FEATHER_PGS_ROW_PACKETS=0 opts out. The keyed rows below take patch
+        # friction only under FEATHER_PGS_PATCH_PARALLEL_ROWS=1.
         self._row_packets = None
         if self._sparse_mass_matrix_size is not None:
             self._row_packets_reason = "Native sparse factors own the contact rows."
