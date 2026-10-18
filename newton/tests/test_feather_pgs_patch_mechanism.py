@@ -43,7 +43,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import friction_patches
-from newton._src.solvers.feather_pgs.friction_patches import _FrictionPatchState, patch_routes
+from newton._src.solvers.feather_pgs.friction_patches import _FrictionPatchState, _PatchFrame, patch_routes
 from newton.tests.feather_pgs_patch_reference import SENTINEL, ReferencePatches, pair_codes
 from newton.tests.test_feather_pgs_mixed_tree_free_body import _build as _arm_over_box
 
