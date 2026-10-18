@@ -68,8 +68,9 @@ _PIECE_OFFSET = 0.04
 # more places.
 _FMA_ULPS = 8
 _EPS32 = float(np.finfo(np.float32).eps)
-# The twin's (threads, build_threads): one block that strides over every slot,
-# where the states under test launch many blocks.
+# The twin's (threads, build_threads): grids of one block, or two of _build's
+# 32-thread blocks, that stride over every slot, where the states under test
+# launch many blocks.
 _TWIN_THREADS = (97, 61)
 
 
@@ -1438,9 +1439,14 @@ class TestPatchLaunchShapes(unittest.TestCase):
         )
 
     def test_launch_shapes_match_bitwise(self):
-        """Build, link, seed, finish, store and reset bitwise on every grid, with each sort, reusing frames or not."""
+        """Build, link, seed, finish, store and reset bitwise on every grid, with each sort and each prepare.
+
+        CPU launches run one thread at a time, so they check how each grid
+        strides over the slots; the device tests run every combination of sort
+        and frame reuse.
+        """
         shapes = (None, _shape(4600, 1, **_FORMER_SHAPE), _ODD_SHAPE)
-        for live_sort, reuse in itertools.product((False, True), (False, True)):
+        for live_sort, reuse in ((False, False), (True, True)):
             with self.subTest(live_sort=live_sort, reuse=reuse):
                 coverage = run_launch_shapes(
                     "cpu", 2, shapes, worlds=110, contacts=4096, capacity=4600, live_sort=live_sort, reuse=reuse
