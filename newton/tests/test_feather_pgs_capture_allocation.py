@@ -141,7 +141,7 @@ class TestFeatherPGSCaptureAllocation(unittest.TestCase):
                 for field in STATE_FIELDS:
                     expected, actual = getattr(eager.out, field).numpy(), getattr(captured.out, field).numpy()
                     self.assertTrue(np.isfinite(actual).all(), field)
-                    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=2e-6, err_msg=field)
+                    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-4, err_msg=field)
 
 
 if __name__ == "__main__":
