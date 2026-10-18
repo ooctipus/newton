@@ -1814,19 +1814,34 @@ def _replace_first_stream(twin, order):
     _permute_contacts(frame, twin.streams[0], order)
 
 
+def _falling_boxes(device):
+    """Free boxes in three worlds, released just above a ground plane."""
+    world = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    world.rigid_gap = 0.005
+    box = world.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.06), wp.quat_rpy(0.05, 0.02, 0.1)))
+    world.add_shape_box(box, hx=0.02, hy=0.03, hz=0.02, cfg=newton.ModelBuilder.ShapeConfig(density=500.0, mu=0.6))
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    builder.rigid_gap = 0.005
+    builder.replicate(world, 3)
+    builder.add_ground_plane()
+    with wp.ScopedDevice(device):
+        return builder.finalize()
+
+
 class _SolverTwin:
     """A FeatherPGS scene under default patch friction with two contact streams and double-buffered states.
 
     ``reuse`` forces frame reuse on (also on the CPU, where conditional graph
     nodes do not exist) or turns it off with the registry flag; ``None`` keeps
     the solver's own choice. ``jaws`` selects the squeezing gripper of the
-    friction-anchor tests, whose graphs capture two solver steps each, instead
-    of the arms over boxes. Its pipeline sorts the contacts, so twins collide
-    into the same slots: the CUDA narrow phase assigns them in a run-dependent
-    order.
+    friction-anchor tests, whose graphs capture two solver steps each, and
+    ``boxes`` free boxes above a ground plane, whose contact frames are empty
+    until they land, instead of the arms over boxes. Both pipelines sort the
+    contacts, so twins collide into the same slots: the CUDA narrow phase
+    assigns them in a run-dependent order.
     """
 
-    def __init__(self, device, *, reuse=None, jaws=False):
+    def __init__(self, device, *, reuse=None, jaws=False, boxes=False):
         if jaws:
             from newton.tests.test_feather_pgs_friction_anchors import _SQUEEZE_SOLVER, _build_v_jaws  # noqa: PLC0415
 
@@ -1834,6 +1849,10 @@ class _SolverTwin:
                 self.model, _, _ = _build_v_jaws(5.0)
             options = dict(_SQUEEZE_SOLVER)
             pipeline_options = {"rigid_contact_max": 256, "broad_phase": "nxn", "deterministic": True}
+        elif boxes:
+            self.model = _falling_boxes(device)
+            options = {"pgs_iterations": 16}
+            pipeline_options = {"rigid_contact_max": 128, "broad_phase": "nxn", "deterministic": True}
         else:
             self.model = _arm_over_box(wp.get_device(device), worlds=2)
             options, pipeline_options = {"pgs_iterations": 8}, {}
@@ -1867,6 +1886,24 @@ class _SolverTwin:
         """Two substeps that return to ``states[0]``, collided first when ``collide``."""
         self.substep(stream, collide)
         self.substep(stream)
+
+    def throw(self, speed):
+        """Give every free body of ``states[0]`` an upward velocity."""
+        state = self.states[0]
+        qd = state.joint_qd.numpy().reshape(-1, 6)
+        qd[:, 2] = speed
+        state.joint_qd.assign(qd.reshape(-1))
+        body_qd = state.body_qd.numpy()
+        body_qd[:, 2] = speed
+        state.body_qd.assign(body_qd)
+
+    def same_steps(self, other):
+        """Whether two twins hold bitwise-equal bodies, joints and stored patch history."""
+        try:
+            _assert_same_twins(self, other, "")
+        except AssertionError:
+            return False
+        return True
 
     def assert_sorted(self, test, stream, context):
         """Require the slots to hold the host-sorted pairs of a stream's live contacts."""
@@ -2102,6 +2139,45 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         self.assertFalse(np.all(graph.patches.current.keys.numpy()[n:] == -12345), "the replacement must sort")
         graph.assert_sorted(self, 0, "replacement")
         _assert_same_twins(graph, eager, "replacement")
+
+    @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
+    def test_solver_graphs_replay_empty_contact_frames(self):
+        """Replay graphs bitwise as eager flag-off steps over empty, live and again empty contact frames.
+
+        Boxes fall, rest on the ground, are thrown up while their anchors are stored
+        and land again. A second eager twin is an A/A control: the graph must match
+        bitwise for as long as the eager twins do, which must cover every transition.
+        """
+        if not wp.is_conditional_graph_supported():
+            self.skipTest("Conditional graph nodes need a CUDA 12.4+ driver and Warp build")
+        graph = _SolverTwin("cuda:0", boxes=True)
+        eager, control = (_SolverTwin("cuda:0", reuse=False, boxes=True) for _ in range(2))
+        self.assertTrue(graph.patches.reuse_frames)
+        twins = (graph, eager, control)
+        for twin in twins:
+            twin.pair(collide=True)
+        with wp.ScopedCapture(device="cuda:0") as capture:
+            graph.solver.seed_double_buffer_events()
+            graph.pair(collide=True)
+        live, stored = [], []
+        for replay in range(140):
+            if replay == 70:
+                for twin in twins:
+                    twin.throw(1.2)
+            wp.capture_launch(capture.graph)
+            for twin in (eager, control):
+                twin.pair(collide=True)
+            if not eager.same_steps(control):
+                break
+            _assert_same_twins(graph, eager, f"replay {replay}")
+            live.append(int(graph.streams[0].rigid_contact_count.numpy()[0]))
+            stored.append(int(np.count_nonzero(graph.patches.previous.valid.numpy())))
+        # Covered: empty frames before landing, live frames, an empty frame while
+        # anchors were stored, and live frames after landing again.
+        emptied = [i for i in range(1, len(live)) if live[i] == 0 and live[i - 1] > 0 and stored[i - 1] > 0]
+        self.assertTrue(live and live[0] == 0, f"the boxes must start in the air: {live}")
+        self.assertTrue(emptied, f"the frames must empty while anchors are stored: {live} {stored}")
+        self.assertGreater(max(live[emptied[0] :]), 0, f"the boxes must land again: {live}")
 
 
 def _assert_same_twins(graph, eager, context):
