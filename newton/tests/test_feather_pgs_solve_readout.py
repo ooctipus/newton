@@ -23,11 +23,15 @@ exactly the exact-law sweeps, so its outputs equal the exact law's at that
 budget, and the trace of an exact solve predicts that sweep for every grid
 tolerance. On the solver routes the trace changes no result and records every
 solve once per grid tolerance, and a tolerance compiled into every counted
-sweep keeps the trajectory near the exact law's in no more sweeps.
+sweep keeps the trajectory near the exact law's in no more sweeps. Velocity-limit
+rows vote under both velocity-limit laws in the kernel tests, and bind under the
+accumulated law on a route of their own.
 """
 
+import itertools
 import unittest
 import warnings
+from functools import partial
 from unittest import mock
 
 import numpy as np
@@ -37,10 +41,12 @@ import newton
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
+    PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PGS_CONSTRAINT_TYPE_MIMIC,
     PGS_LOCAL_SOLVE_OWNER_GENERAL,
     PGS_LOCAL_SOLVE_OWNER_SINGLE,
 )
+from newton._src.solvers.feather_pgs.row_metadata import _DENSE_META_ROW_TYPE_MASK
 from newton._src.solvers.feather_pgs.solve_policy import (
     SOLVE_PASSES,
     TRACE_GRID,
@@ -50,9 +56,14 @@ from newton._src.solvers.feather_pgs.solve_policy import (
     SolveReadout,
     SolveTrace,
 )
-from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_local_owned_kernel
+from newton._src.solvers.feather_pgs.solver_feather_pgs import (
+    _get_pgs_solve_local_owned_kernel,
+    _get_pgs_solve_mf_gs_incremental_kernel,
+    _get_pgs_solve_mf_gs_kernel,
+)
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
 from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel
+from newton._src.solvers.feather_pgs.velocity_limit_law import VELOCITY_LIMIT_LAWS
 from newton.solvers import SolverFeatherPGS
 
 SWEEPS = SolvePolicy(readout="sweeps")
@@ -106,6 +117,36 @@ def _violation_problem():
         zeros,
         diagonal,
     )
+
+
+# Two velocity-limit DOFs whose positive mass coupling makes braking either one speed the other up.
+_PAIR_MASS = np.array([[3.0, 0.6], [0.6, 1.0]])
+_PAIR_VELOCITY = np.array([2.0, 2.5])
+
+
+def _velocity_limit_pair(device, *, row_phase, iterations):
+    """One world's launch values of two coupled velocity-limit rows that keep pushing each other's DOF past its limit.
+
+    The values of test_feather_pgs_velocity_limit_law's chain (upper limits of 1 on both DOFs, the
+    rows in order) with another mass matrix and start: both DOFs start beyond their limits, and
+    braking one speeds the other up, so every correction is a push and the stateless corrections
+    add up to the accumulated impulses. The sweeps then converge to both limits geometrically under
+    either law, by about 0.12 per sweep: the largest velocity-scaled change falls from about 2 in
+    the first sweep to about 1e-6 in the eighth.
+    """
+    from newton.tests.test_feather_pgs_velocity_limit_law import _dense_row_values  # noqa: PLC0415
+
+    values = _dense_row_values(device, order=(0, 1), row_phase=row_phase, iterations=iterations)
+    jacobian = values["J_world"].numpy()[0, :2]
+    response, diagonal = values["Y_world"].numpy(), values["world_diag"].numpy()
+    response[0, :2] = np.linalg.solve(_PAIR_MASS, jacobian.T).T
+    diagonal[0, :2] = np.einsum("ij,ij->i", jacobian, response[0, :2])
+    values.update(
+        Y_world=wp.array(response, dtype=wp.float32, device=device),
+        world_diag=wp.array(diagonal, dtype=wp.float32, device=device),
+        v_out=wp.array(_PAIR_VELOCITY, dtype=wp.float32, device=device),
+    )
+    return values
 
 
 def _expected_counts(outputs, *, offset=0, friction_start=0):
@@ -430,6 +471,61 @@ class TestSolveReadoutKernels(unittest.TestCase):
                 for actual_array, expected_array in zip(case.read()[0], outputs[executed][0], strict=True):
                     np.testing.assert_array_equal(actual_array, expected_array)
 
+    def test_velocity_limit_trace_predicts_where_each_tolerance_stops(self):
+        """Stop the tolerance runs of velocity-limit rows where the exact trace predicted, under either law.
+
+        Two coupled velocity-limit rows (:func:`_velocity_limit_pair`) go through the matrix-free and
+        incremental sweeps, which visit them in the end-of-iteration pass of row phase 0 and in the
+        main row loop of phase 5. A row votes the correction it applies under the stateless law and
+        the change of its stored total under the accumulated law, each scaled by its A_ii. The trace
+        of an exact solve changes no output and predicts the sweep after which each tolerance run
+        stops; that run has the exact law's outputs there and leaves neither DOF beyond its limit by
+        more than the tolerance, and the largest tolerance stops several sweeps before the budget.
+        """
+        from newton.tests.test_feather_pgs_velocity_limit_law import _launch_inputs  # noqa: PLC0415
+
+        device = wp.get_device("cuda:0")
+        arch = str(device.arch)
+        factories = {
+            "mf_gs": partial(_get_pgs_solve_mf_gs_kernel, 4, 1, 2, arch, has_drive_rows=False),
+            "incremental": partial(
+                _get_pgs_solve_mf_gs_incremental_kernel, 4, 1, 2, arch, incremental_rows=4, has_drive_rows=False
+            ),
+        }
+        for (name, factory), law, row_phase in itertools.product(factories.items(), VELOCITY_LIMIT_LAWS, (0, 5)):
+            with self.subTest(kernel=name, law=law, row_phase=row_phase):
+
+                def run(policy, budget, operand=None, factory=factory, law=law, row_phase=row_phase):
+                    kernel = factory(velocity_limit_law=law, solve_policy=policy)
+                    values = _velocity_limit_pair(device, row_phase=row_phase, iterations=budget)
+                    if operand is not None:
+                        values["readout"] = operand
+                    inputs = _launch_inputs(kernel, values)
+                    wp.launch_tiled(kernel, dim=[1], inputs=inputs, block_dim=32, device=device)
+                    return values["v_out"].numpy(), values["world_impulses"].numpy()[0]
+
+                outputs = [run(SolvePolicy(), budget) for budget in range(BUDGET + 1)]
+                trace = _trace(device, 1)
+                _assert_bitwise([run(SolvePolicy(readout="trace"), BUDGET, trace)], [outputs[BUDGET]])
+                self.assertEqual(int(trace.reasons.numpy().sum()), 1)
+                stops = trace.stops.numpy()
+                earliest = BUDGET + 1
+                for point in (4, 8, 12):
+                    tolerance = TRACE_GRID[point]
+                    stop = int(np.flatnonzero(stops[point])[0])
+                    operand = _readout(device, 1)
+                    policy = SolvePolicy(readout="sweeps", velocity_change_tolerance=tolerance)
+                    velocity, impulses = run(policy, BUDGET, operand)
+                    executed = int(np.flatnonzero(operand.sweeps.numpy()[:, 0])[0])
+                    self.assertEqual(executed, min(stop, BUDGET), tolerance)
+                    self.assertEqual(int(operand.exhausted.numpy()[0]), int(stop > BUDGET), tolerance)
+                    # Before its exit a tolerance run sweeps exactly as the exact law does.
+                    _assert_bitwise([(velocity, impulses)], [outputs[executed]])
+                    if stop <= BUDGET:
+                        self.assertLessEqual(float(np.max(velocity - 1.0)), tolerance + 1.0e-6, tolerance)
+                    earliest = min(earliest, stop)
+                self.assertLess(earliest, BUDGET - 2)
+
     def test_local_counts_sweeps_to_the_stationary_exit(self):
         """Count only the owned world's sweeps to its first stationary sweep, with bitwise outputs."""
         case = _LocalCase(wp.get_cuda_device())
@@ -603,6 +699,44 @@ def _incremental_route():
     }
 
 
+def _velocity_limit_route():
+    """The incremental route's tripods with velocity-limited legs under the accumulated velocity-limit law.
+
+    Each leg joint is limited to 1 rad/s and starts at 2 rad/s, so the velocity-limit rows bind
+    from the first step, and the accumulated law keeps each row's total across sweeps, which the
+    votes measure as the change of that total. The rows start from half the limit and add at most
+    two per leg to a world's rows; the matrix-free sweep stands among the owners in case a world
+    outgrows the incremental tier's 32 rows.
+    """
+    route = _incremental_route()
+    model = route["model"]
+    joint_type, starts = model.joint_type.numpy(), model.joint_qd_start.numpy()
+    legs = starts[np.flatnonzero(joint_type == int(newton.JointType.REVOLUTE))]
+    limits = model.joint_velocity_limit.numpy()
+    limits[legs] = 1.0
+    model.joint_velocity_limit.assign(limits)
+
+    def prepare(solver, state):
+        joint_qd = state.joint_qd.numpy()
+        joint_qd[legs] = 2.0
+        state.joint_qd.assign(joint_qd)
+
+    route["options"] = {
+        **route["options"],
+        "enable_joint_velocity_limits": True,
+        "velocity_limit_activation_fraction": 0.5,
+        "velocity_limit_law": "accumulated",
+    }
+    route.update(
+        name="velocity_limits",
+        labels={"mf_gs_incremental", "mf_gs"},
+        owners=({"mf_gs_incremental", "mf_gs"},),
+        solving=set(),
+        prepare=prepare,
+    )
+    return route
+
+
 def _tier_worlds(solver):
     """Worlds of the solver's last step that its parallel tiers own.
 
@@ -666,8 +800,16 @@ def _paired_route():
 
 
 def _policy_routes():
-    """The routes whose local, paired, matrix-free and incremental sweeps compile the velocity law and trace."""
-    return (_local_route(), _paired_route(), _matrix_free_route(), _incremental_route())
+    """The routes whose local, paired, matrix-free and incremental sweeps compile the velocity law and trace.
+
+    The last one binds velocity-limit rows under the accumulated velocity-limit law.
+    """
+    return (_local_route(), _paired_route(), _matrix_free_route(), _incremental_route(), _velocity_limit_route())
+
+
+def _route_name(route):
+    """A route's name in subtests: its own, or its counted labels."""
+    return route.get("name", "+".join(sorted(route["labels"])))
 
 
 def _propagation_route():
@@ -849,6 +991,31 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         self.assertGreater(skipped["solves"], 0)
         self.assertLessEqual(skipped["worlds"], model.world_count)
 
+    def test_velocity_limit_route_counts_without_changing_results(self):
+        """Count the sweeps of binding velocity-limit rows under the accumulated law, every world-solve once.
+
+        Under ``velocity_limit_law="accumulated"`` a velocity-limit row keeps its total across sweeps,
+        and the counted sweeps carry that law. The route's first step holds velocity-limit rows with
+        positive totals; the readout changes no result and counts every world-solve once.
+        """
+        route = _velocity_limit_route()
+        (probe,) = self._solvers(route, [{"pgs_solve_readout": "sweeps"}])
+        self.assertEqual(probe.get_path_selection()["routes"]["velocity_limits"]["law"], "accumulated")
+        self.assertTrue(probe._solve_readout.kernels)
+        for key in probe._solve_readout.kernels:
+            self.assertIn("_vacc", key)
+        for _ in self._steps(route, [probe], 1):
+            counts = probe.constraint_count.numpy()
+            types = probe.row_type.numpy() & _DENSE_META_ROW_TYPE_MASK
+            impulses = probe.impulses.numpy()
+            totals = [
+                impulses[world, :count][types[world, :count] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT]
+                for world, count in enumerate(counts)
+            ]
+            self.assertTrue(any(np.any(world_totals > 0.0) for world_totals in totals), totals)
+        _, summary, _ = self._lockstep(route)
+        self.assertGreater(sum(slot["solves"] for slot in summary["slots"]), 0)
+
     def test_parallel_tier_worlds_are_named_not_counted(self):
         """Name the parallel tiers' worlds as uncounted and count every other world-solve once, none twice.
 
@@ -1001,7 +1168,7 @@ class TestSolveReadoutRoutes(unittest.TestCase):
     def test_trace_changes_no_result_and_records_every_solve(self):
         """Trace the local, paired and matrix-free sweeps unchanged, once per solve and grid tolerance."""
         for route in _policy_routes():
-            with self.subTest(labels=sorted(route["labels"])):
+            with self.subTest(route=_route_name(route)):
                 solver, summary, _ = self._lockstep(route, readout="trace")
                 self.assertEqual(solver.get_path_selection()["routes"]["sweep"]["readout"]["declined"], {})
                 for slot in summary["slots"]:
@@ -1022,7 +1189,7 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         steps, tolerance = 12, 1.0e-3
         savings = {}
         for route in _policy_routes():
-            name = "+".join(sorted(route["labels"]))
+            name = _route_name(route)
             with self.subTest(route=name):
                 variants = [
                     {"pgs_solve_readout": "sweeps"},
