@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The tree kernels' reference and stage-clock switches are factory arguments, read once by the owner."""
+"""The tree kernels' reference, stage-clock and host-scratch switches are factory arguments, set once by the owner."""
 
 import ast
 import os
@@ -10,8 +10,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
 import warp as wp
 
+import newton
 from newton._src.solvers.feather_pgs import tree_kinetic_state
 from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
@@ -223,6 +225,46 @@ class TestTreeKernelSwitches(unittest.TestCase):
                 with self.subTest(layout=default.layout.root_families, kernel=kernel):
                     self.assertIsNot(getattr(reference, kernel), getattr(default, kernel))
                     self.assertIsNot(getattr(clocked, kernel), getattr(default, kernel))
+
+    def test_cpu_owner_publishes_forward_kinematics(self):
+        """Repair a CPU owner's caches and publish the poses and twists forward kinematics gives.
+
+        Warp's CPU JIT links no malloc or free, so an owner on the CPU builds its
+        repair and finish kernels with static scratch; the CUDA form stays the
+        factories' default.
+        """
+        model = _build(wp.get_device("cpu"), worlds=2)
+        solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+        owner = MixedTreeKineticState(solver)
+        self.assertTrue(owner.groups)
+        state, expected = model.state(), model.state()
+        joint_q, joint_qd = model.joint_q.numpy(), np.zeros(model.joint_dof_count, np.float32)
+        q_start, qd_start = model.joint_q_start.numpy(), model.joint_qd_start.numpy()
+        rng = np.random.default_rng(29)
+        for joint in np.flatnonzero(model.joint_type.numpy() == int(newton.JointType.REVOLUTE)):
+            joint_q[q_start[joint]] += rng.uniform(-0.6, 0.6)
+            joint_qd[qd_start[joint]] = rng.uniform(-1.0, 1.0)
+        state.joint_q.assign(joint_q)
+        state.joint_qd.assign(joint_qd)
+        newton.eval_fk(model, state.joint_q, state.joint_qd, expected)
+        augmented = solver._prepare_augmented_state(state, model.state(), model.control())
+        self.assertGreater(np.max(np.abs(state.body_q.numpy() - expected.body_q.numpy())), 1e-2)
+        owner.begin(state, augmented, state.joint_qd, 1.0 / 240.0, True)
+        np.testing.assert_allclose(state.body_q.numpy(), expected.body_q.numpy(), atol=2e-6)
+        np.testing.assert_allclose(state.body_qd.numpy(), expected.body_qd.numpy(), atol=2e-5)
+        for group in owner.groups:
+            np.testing.assert_array_equal(group.data.status.numpy(), 0)
+            default = tree_kinetic_state.get_state_kernel(
+                False,
+                group.chain_scan,
+                layout=group.layout,
+                body_velocity=group._body_velocity,
+                motion_velocity=group.motion_velocity,
+                copy_reuse=group.copy_reuse,
+                reference=group.reference,
+                clocked=group.clocked,
+            )
+            self.assertIsNot(group.repair_kernel, default)
 
 
 if __name__ == "__main__":

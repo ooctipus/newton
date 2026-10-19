@@ -307,6 +307,7 @@ class TreeKineticState:
         from . import tree_kinetic_state as native  # noqa: PLC0415
 
         layout = self.layout
+        host = self.solver.model.device.is_cpu
         self.repair_kernel = native.get_state_kernel(
             False,
             self.chain_scan,
@@ -316,6 +317,7 @@ class TreeKineticState:
             copy_reuse=self.copy_reuse,
             reference=self.reference,
             clocked=self.clocked,
+            host=host,
         )
         self.finish_kernel = native.get_state_kernel(
             True,
@@ -325,6 +327,7 @@ class TreeKineticState:
             copy_reuse=self.copy_reuse,
             reference=self.reference,
             clocked=self.clocked,
+            host=host,
         )
         self.predictor_kernel = native.get_predictor_kernel(
             self.chain_scan, layout=layout, response=self._response, reference=self.reference, clocked=self.clocked

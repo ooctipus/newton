@@ -675,6 +675,32 @@ _STORAGE_SOURCE = r"""
 #endif
 """
 
+# Warp's CPU JIT links only a curated C runtime subset, without malloc and
+# free, so the heap form above has no CPU kernel. An owner on the CPU builds
+# this form instead: a CPU launch runs its blocks one after another on the
+# launching thread, and each block is done with the scratch before the next.
+_HOST_STORAGE_SOURCE = r"""
+#if defined(__CUDA_ARCH__)
+    $STATE_SCRATCH_DECL
+#else
+    static float values[$TOTAL];return reinterpret_cast<uint64_t>(values);
+#endif
+"""
+
+
+def _host_storage(layout):
+    """Return the scratch of an owner on the CPU, which the kernels release with ``_keep_static``."""
+
+    @wp.func_native(layout.render(_HOST_STORAGE_SOURCE))
+    def _storage() -> wp.uint64: ...
+
+    return _storage
+
+
+@wp.func_native("")
+def _keep_static(address: wp.uint64): ...
+
+
 _STORE_TERMS_SOURCE = r"""
     float* s=reinterpret_cast<float*>(address);
     for(int k=0;k<6;++k)s[$WRENCH+6*body+k]=wrench[k];
@@ -696,6 +722,7 @@ def get_helpers(
     *,
     reference: bool = False,
     clocked: bool = False,
+    host: bool = False,
 ):
     """Bind one physical tree evaluation to its storage and traversal schedule.
 
@@ -703,6 +730,8 @@ def get_helpers(
     reduction on warp-sized layouts (the forms the A/B tests compare against);
     ``clocked`` adds the collection stage counters. Both change the emitted
     code, so they are arguments (cache-key members), never environment reads.
+    ``host`` keeps the CPU scratch in static storage (see
+    ``_HOST_STORAGE_SOURCE``); the default is the form CUDA owners launch.
     """
     plan_type = tree_chain_scan.ChainPlan if chain_scan else KineticPlan
     # A warp-sized layout scans in registers through shuffles; two-warp layouts
@@ -836,7 +865,7 @@ if data.is_free_rigid[data.body_to_articulation[body]] != 0:
         _load_origin=_load_origin,
         _scan_motion=_scan_motion,
         _scan_poses=_scan_poses,
-        _storage=_storage,
+        _storage=_host_storage(layout) if host else _storage,
         _store_axis=_store_axis,
         _store_motion=_store_motion,
         _store_origin=_store_origin,
@@ -855,17 +884,20 @@ def get_state_kernel(
     copy_reuse: bool = False,
     reference: bool = False,
     clocked: bool = False,
+    host: bool = False,
 ):
     """Build complete repair/finish using original generalized integration laws.
 
     ``reference`` and ``clocked`` select the comparison forms and the stage
-    counters (see :func:`get_helpers`).
+    counters; ``host`` the static CPU scratch of an owner on the CPU (see
+    :func:`get_helpers`).
     """
     if finish and motion_velocity:
         raise ValueError("Alternate motion velocity is a repair-only contract")
     if copy_reuse and (layout.root_dofs or motion_velocity):
         raise ValueError("Copied-state reuse requires fixed scalar coordinates and ordinary motion")
-    h = get_helpers(layout, chain_scan, body_velocity, reference=reference, clocked=clocked)
+    h = get_helpers(layout, chain_scan, body_velocity, reference=reference, clocked=clocked, host=host)
+    release = _keep_static if host else _release
     plan_type = h.plan_type
     _lanes, _sync, _sub, _different_motion = _thread_helpers(layout)
     pack = layout.pack
@@ -1073,7 +1105,7 @@ if lane == 0:
         signature,
         operands,
         stages,
-        dict(globals(), **locals()),
+        dict(globals(), **locals(), _release=release),
         finish=finish,
         clocked=clocked,
     )
