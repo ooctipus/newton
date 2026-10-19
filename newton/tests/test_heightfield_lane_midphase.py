@@ -24,8 +24,9 @@ import newton
 from newton._src.core.environment_flags import NEWTON_FLAGS
 from newton._src.geometry import heightfield_cells, heightfield_geometric, heightfield_lanes
 from newton._src.geometry.heightfield_geometric import PairProjection
-from newton._src.geometry.heightfield_lanes import CellWindow
+from newton._src.geometry.heightfield_lanes import CellWindow, _cell_window
 from newton._src.geometry.narrow_phase import NarrowPhase
+from newton._src.utils.heightfield import HeightfieldData
 from newton.tests.test_heightfield_packed_pairs import logical
 from newton.tests.test_heightfield_row_gate import raw_multiset, rough_terrain_model
 
@@ -190,6 +191,20 @@ def last_height(holds, low, high):
         else:
             high_bits = middle
     return low_bits
+
+
+@wp.kernel(enable_backward=False)
+def window_kernel(
+    heightfield: HeightfieldData,
+    transforms: wp.array[wp.transform],
+    lower: wp.array[wp.vec3],
+    upper: wp.array[wp.vec3],
+    data: wp.array[wp.vec4],
+    gaps: wp.array[float],
+    windows: wp.array[CellWindow],
+):
+    """Build the lane window of the pair (shape 0, shape 1)."""
+    windows[0] = _cell_window(0, 0, 1, heightfield, transforms, lower, upper, data, gaps, True)
 
 
 def deferred_stored(narrow):
@@ -538,6 +553,32 @@ class TestHeightfieldLaneMidphase(unittest.TestCase):
     def test_window_boundaries_cuda(self):
         """Match the original midphase at ulp-level bounds on CUDA, where each pass is compiled separately."""
         self.check_window_boundaries("cuda:0")
+
+    def test_inverted_window_is_empty_cpu(self):
+        """Keep a window empty when an inverted, huge local box saturates its cell bounds.
+
+        aarch64 and CUDA saturate float-to-int conversions, so the first row and
+        column become INT_MAX and the last ones INT_MIN. The original range is
+        then empty, but ``last - first + 1`` wraps around to 2 in int32: such a
+        window would hand pass 2 cells far outside the elevation array. (x86-64
+        converts both to INT_MIN, which does not wrap.)
+        """
+        heightfield = HeightfieldData()
+        heightfield.data_offset, heightfield.nrow, heightfield.ncol = 0, 8, 8
+        heightfield.hx, heightfield.hy, heightfield.min_z, heightfield.max_z = 0.5, 0.5, 0.0, 1.0
+        huge = 1.0e30
+        inputs = [
+            heightfield,
+            wp.array([wp.transform_identity(), wp.transform_identity()], dtype=wp.transform, device="cpu"),
+            wp.array([(-1.0, -1.0, -1.0), (huge, huge, huge)], dtype=wp.vec3, device="cpu"),
+            wp.array([(1.0, 1.0, 1.0), (-huge, -huge, -huge)], dtype=wp.vec3, device="cpu"),
+            wp.zeros(2, dtype=wp.vec4, device="cpu"),
+            wp.zeros(2, dtype=float, device="cpu"),
+        ]
+        windows = wp.zeros(1, dtype=CellWindow, device="cpu")
+        wp.launch(window_kernel, 1, inputs=inputs, outputs=[windows], device="cpu")
+        window = windows.numpy()[0]
+        self.assertEqual((int(window["rows"]), int(window["cols"])), (0, 0))
 
     def test_deferred_storage_overflow_cpu(self):
         """Walk pairs in place once the deferred storage is full."""

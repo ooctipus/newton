@@ -185,8 +185,10 @@ def _cell_window(
     window.b = b
     window.row = row_min
     window.col = col_min
-    window.rows = wp.max(row_max - row_min + 1, 0)
-    window.cols = wp.max(col_max - col_min + 1, 0)
+    # Saturated float-to-int bounds of an inverted window could wrap ``last - first + 1``;
+    # 0 <= first and last <= n - 2 keep the difference of an ordered range in int32.
+    window.rows = wp.where(row_max >= row_min, row_max - row_min + 1, 0)
+    window.cols = wp.where(col_max >= col_min, col_max - col_min + 1, 0)
     window.reject = reject_cells and wp.isfinite(aabb_lower[2]) and wp.isfinite(padding)
     window.lower_z = aabb_lower[2]
     window.padding = padding
