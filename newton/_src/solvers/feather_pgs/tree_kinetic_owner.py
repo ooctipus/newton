@@ -125,10 +125,21 @@ class TreeKineticState:
 
     A repair proves each group's cache by the input bank's identity (the bank
     the last finish or repair stamped) or, outside motion-velocity layouts
-    (:attr:`bank_compare`), by its content: when the stamps name the step's
-    output bank instead, as after a caller copies the output bank back into
-    the input bank, a comparison pass before the repair moves the stamp of
-    every group whose two banks hold the same words to the input bank.
+    (:attr:`bank_compare`), by its content: when a group is stamped with the
+    step's output bank instead, as after a caller copies the output bank back
+    into the input bank, the two banks are compared and a group whose banks
+    hold the same words is restamped with the input bank and keeps its cache.
+    A classified repair compares in a pass of its own over the blocks its
+    classification lists for comparison; a one-pass repair compares inside
+    its blocks (a second repair kernel, launched only by repairs that compare).
+
+    The host chooses the launch from the bank it expects the stamps to name.
+    It knows that bank eagerly once a repair or finish ran, and inside a graph
+    capture once a repair or finish of the same capture ran. The first repair
+    of a capture runs on every replay after whatever the host does not see
+    (eager steps, resets, copies, other graphs), so it lets the device decide:
+    it compares whenever the output bank is another bank and is classified
+    whenever the layout classifies.
 
     Within one graph capture, a repair that follows this owner's finish and
     reads the bank that finish published launches nothing outside
@@ -137,10 +148,11 @@ class TreeKineticState:
     from every host call that changes validity, requests or the step.
 
     On CUDA (:attr:`classify_first`), a repair of more blocks than the capped
-    grid of :func:`listed_repair_blocks`, whose groups are expected to be
-    stamped with the input bank, lists the blocks that need it, one thread per
-    block, and repairs over that list on the capped grid, instead of launching
-    a block per group that mostly confirms its cache.
+    grid of :func:`listed_repair_blocks` lists the blocks that need it, one
+    thread per block, and repairs over that list on the capped grid, instead
+    of launching a block per group that mostly confirms its cache: inside a
+    capture, and eagerly when the groups are expected to be stamped with the
+    input bank or compared with the output bank.
     """
 
     def __init__(
@@ -353,10 +365,11 @@ class TreeKineticState:
         self.data.source_q = wp.zeros(groups, dtype=wp.uint64, device=device)
         self.data.source_qd = wp.zeros(groups, dtype=wp.uint64, device=device)
         self.data.status = wp.zeros(groups, dtype=int, device=device)
-        # A listed repair's blocks (at most one per group) and their count, allocated
-        # before any capture.
+        # A classified repair's block lists (at most one entry per block each) and their
+        # counts (repair, comparison), allocated before any capture.
         self._repair_blocks = wp.empty(groups, dtype=int, device=device)
-        self._repair_count = wp.zeros(1, dtype=int, device=device)
+        self._compare_blocks = wp.empty(groups, dtype=int, device=device)
+        self._list_counts = wp.zeros(2, dtype=int, device=device)
         self._repair_grid = listed_repair_blocks(device)
         self.data.current_valid.zero_()
         self.bias = self.data.bias
@@ -367,9 +380,11 @@ class TreeKineticState:
         self._response = response
         self.lane_timing = {}
         # Pointers of the bank every current group is stamped with after the last
-        # finish (its output bank) or repair (its input bank), as the host knows it.
-        # It only chooses launches; the kernels check each group's own stamp.
+        # finish (its output bank) or repair (its input bank), as the host knows it,
+        # and the capture that launch was recorded in (0 eagerly). It only chooses
+        # launches; the kernels check each group's own stamp.
         self._published = None
+        self._published_capture = 0
         self._bind_kernels()
         if not self.chain_scan:
             self._choose_lanes()
@@ -390,7 +405,7 @@ class TreeKineticState:
         self.launch_count = self.group_count // layout.pack
         # Only a launch of more blocks than the listed repair's grid is classified: one of
         # at most that many blocks ends in about a wave of early exits, which costs no more
-        # than the classification's three launches (Allegro's 4096-block repairs: 5.6-6.5 us).
+        # than the classification's launches (a 4096-block packed repair ran 5.6-6.5 us).
         self.classify_first = self._classify_switch and 0 < self._repair_grid < self.launch_count
         self.repair_kernel = native.get_state_kernel(
             False,
@@ -402,11 +417,11 @@ class TreeKineticState:
             clocked=self.clocked,
             host=on_cpu,
         )
-        # A classified repair takes the comparison as a pass of its own, so the classification
-        # sees the restamped groups. Otherwise a second one-pass repair kernel compares inside
-        # its blocks, and only steps that compare launch it: no extra launch, and every other
-        # step keeps its kernel (comparing inside raises a chain-scan repair's registers, 80 to
-        # 151 on a 13-body chain on sm_120, but not a packed one's, 72 either way).
+        # A classified repair compares in a pass of its own over the blocks its classification
+        # lists for comparison. Otherwise a second one-pass repair kernel compares inside its
+        # blocks, and only repairs that compare launch it: no extra launch, and every other
+        # repair keeps its kernel (comparing inside raises a chain-scan repair's registers, 80
+        # to 151 on a 13-body chain on sm_120, but not a packed one's, 72 either way).
         self.bank_kernel = self.bank_repair_kernel = None
         if self.bank_compare and self.classify_first:
             self.bank_kernel = native.get_bank_kernel(self.chain_scan, layout=layout, coordinates=self.bank_coordinates)
@@ -640,11 +655,12 @@ class TreeKineticState:
         binding = self._validate_motion(state_in, state_aug, stage3_qd)
         device = self.solver.model.device
         source = _bank_pointers(state_in)
+        capture = capture_joins.capture_id(device)
         continuity, self._continuity = self._continuity, None
         if (
             continuity is not None
             and source == self._published
-            and continuity[0] == capture_joins.capture_id(device)
+            and continuity[0] == capture
             and (not global_refresh or continuity[1])
         ):
             # This capture's last finish published into this bank and no host call
@@ -657,23 +673,7 @@ class TreeKineticState:
             self._motion_binding = binding
             return
         data = self._publication(state_in, state_aug, state_in, dt)
-        # The stamps name the output bank: an odd substep count copied it back into
-        # the input bank, or the caller passes a copy of it.
-        compared = (
-            self.bank_compare
-            and state_out is not None
-            and self._published == _bank_pointers(state_out)
-            and source != self._published
-        )
-        bank = self._bank(state_out, state_in) if compared else None
-        if compared and self.classify_first:
-            wp.launch_tiled(
-                self.bank_kernel,
-                dim=[self.launch_count],
-                inputs=[self.sparse.plan, self.plan, data, self.data, bank],
-                block_dim=self.block_dim,
-                device=device,
-            )
+        compare, classify = self._repair_form(source, state_out, capture, device)
         arguments = [
             self.sparse.plan,
             self.plan,
@@ -684,32 +684,48 @@ class TreeKineticState:
         ]
         if self.motion_velocity:
             arguments.append(stage3_qd)
-        if self.classify_first and (compared or source == self._published):
-            # Most groups should be stamped with this bank and only confirm their
-            # caches: list the blocks that repair and run the repair over the list.
-            # Without that expectation (first step, an identity invalidation) every
-            # group repairs and the one-pass launch is cheaper.
-            self._repair_count.zero_()
+        if classify:
+            # List the blocks that repair (and, when comparing, those that compare
+            # first) and run the repair over the list on the capped grid. Passing the
+            # input bank as the comparison bank lists nothing for comparison.
+            bank = self._bank(state_out if compare else state_in, state_in)
+            self._list_counts.zero_()
             wp.launch(
                 self.classify_kernel,
                 dim=self.launch_count,
-                inputs=[*arguments[:6], stage3_qd, self._repair_blocks, self._repair_count],
+                inputs=[
+                    *arguments[:6],
+                    stage3_qd,
+                    bank,
+                    self._repair_blocks,
+                    self._compare_blocks,
+                    self._list_counts,
+                ],
                 block_dim=64,
                 device=device,
             )
+            if compare:
+                wp.launch_tiled(
+                    self.bank_kernel,
+                    dim=[self.launch_count],
+                    inputs=[*arguments[:6], bank, self._compare_blocks, self._repair_blocks, self._list_counts],
+                    block_dim=self.block_dim,
+                    max_blocks=self._repair_grid,
+                    device=device,
+                )
             wp.launch_tiled(
                 self.listed_repair_kernel,
                 dim=[self.launch_count],
-                inputs=[*arguments, self._repair_blocks, self._repair_count],
+                inputs=[*arguments, self._repair_blocks, self._list_counts],
                 block_dim=self.block_dim,
                 max_blocks=self._repair_grid,
                 device=device,
             )
-        elif compared:
+        elif compare:
             wp.launch_tiled(
                 self.bank_repair_kernel,
                 dim=[self.launch_count],
-                inputs=[*arguments, bank],
+                inputs=[*arguments, self._bank(state_out, state_in)],
                 block_dim=self.block_dim,
                 device=device,
             )
@@ -721,8 +737,32 @@ class TreeKineticState:
                 block_dim=self.block_dim,
                 device=device,
             )
-        self._published = source
+        self._published, self._published_capture = source, capture
         self._motion_binding = binding
+
+    def _repair_form(self, source, state_out, capture, device):
+        """Choose whether a repair compares input banks and whether it is classified.
+
+        Returns:
+            ``(compare, classify)``.
+        """
+        output = None if state_out is None else _bank_pointers(state_out)
+        distinct = output is not None and output != source
+        if (capture != 0 or device.is_capturing) and (capture == 0 or self._published_capture != capture):
+            # The first repair of a capture (or of one whose id is unknown) runs on every
+            # replay after whatever the host does not see, such as a copy of the output
+            # bank back into the input bank or an eager reset: the device decides.
+            return self.bank_compare and distinct, self.classify_first
+        if self._published is None:
+            # The first eager step: every cache is invalid, and every group repairs in
+            # the one-pass launch.
+            return False, False
+        # The last repair or finish ran right before this one: eagerly, or earlier in this
+        # capture. The stamps name its bank. The output bank, as after an odd substep
+        # count copied it back into the input bank, is compared; any other bank but the
+        # input bank repairs every group, which the one-pass launch does more cheaply.
+        compare = self.bank_compare and distinct and self._published == output
+        return compare, self.classify_first and (compare or source == self._published)
 
     def _validate_motion(self, state, state_aug, velocity):
         """Reject invalid working descriptors before changing current-cache validity."""
@@ -803,6 +843,6 @@ class TreeKineticState:
             block_dim=self.block_dim,
             device=self.solver.model.device,
         )
-        self._published = _bank_pointers(state_out)
-        capture = capture_joins.capture_id(self.solver.model.device) if self.skip_captured_repairs else 0
-        self._continuity = (capture, bool(next_refresh)) if capture else None
+        capture = capture_joins.capture_id(self.solver.model.device)
+        self._published, self._published_capture = _bank_pointers(state_out), capture
+        self._continuity = (capture, bool(next_refresh)) if capture and self.skip_captured_repairs else None

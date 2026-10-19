@@ -273,9 +273,10 @@ def _tree_group(group) -> dict:
         # Within one graph capture, a repair after this group's finish on the bank it published
         # launches nothing (FEATHER_PGS_TREE_REPAIR_SKIP=0 keeps it; motion-velocity layouts always launch).
         "captured_repair_skip": bool(group.skip_captured_repairs),
-        # On CUDA, a repair of more blocks than the listed grid whose groups should be stamped with the
-        # step's input bank lists the blocks that repair and repairs over the list
-        # (FEATHER_PGS_TREE_REPAIR_CLASSIFY=0 keeps one launch per block).
+        # On CUDA, a repair of more blocks than the listed grid lists the blocks that repair (and
+        # compare) and repairs over the list: always inside a capture, eagerly when the groups should
+        # be stamped with the input bank or compared (FEATHER_PGS_TREE_REPAIR_CLASSIFY=0 keeps one
+        # launch per block).
         "classify_first": bool(group.classify_first),
         "motion_velocity": bool(group.motion_velocity),
         "publishes_twists": bool(group.publishes_twists),
@@ -286,8 +287,9 @@ def _tree_group(group) -> dict:
             "repair": _key(group.repair_kernel),
             "finish": _key(group.finish_kernel),
             "predict": _key(group.predictor_kernel),
-            # The input-bank comparison: a pass before a classified repair ("bank") or inside a
-            # second one-pass repair ("bank_repair"); None where the group does not compare or classify.
+            # The input-bank comparison: a pass over the blocks a classified repair's classification lists
+            # for comparison ("bank") or inside a second one-pass repair ("bank_repair"); None where the
+            # group does not compare or classify.
             "bank": _key(group.bank_kernel),
             "bank_repair": _key(group.bank_repair_kernel),
             "classify": _key(group.classify_kernel),

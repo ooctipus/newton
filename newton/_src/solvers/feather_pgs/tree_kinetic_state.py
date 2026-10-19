@@ -261,6 +261,30 @@ def _bank_binding(coordinates, layout):
     return matches
 
 
+_BLOCK_VOTE = r"""
+#if defined(__CUDA_ARCH__)
+    return $VOTE value);
+#else
+    return value;
+#endif
+"""
+
+
+@functools.cache
+def _block_vote(layout):
+    """Whether any thread of a launch block passes a nonzero value; every thread of the block must call it.
+
+    A packed layout's block is one warp of several trees, so the vote spans the
+    warp; an unpacked block holds one tree and votes over the block.
+    """
+    source = _BLOCK_VOTE.replace("$VOTE", "__any_sync(0xffffffffu," if layout.lanes < 32 else "__syncthreads_or(")
+
+    @wp.func_native(source)
+    def block_any(value: int) -> int: ...
+
+    return block_any
+
+
 @wp.func_native("float* s=reinterpret_cast<float*>(address);for(int k=0;k<7;++k)s[7*body+k]=pose[k];")
 def _store_pose(address: wp.uint64, body: int, pose: wp.transform): ...
 
@@ -885,20 +909,21 @@ def get_state_kernel(
     """Build complete repair/finish using original generalized integration laws.
 
     ``listed`` builds the repair over the block list of
-    :func:`get_classify_kernel`: logical block ``item`` repairs listed block
-    ``repair_blocks[item]`` and items past ``repair_count[0]`` return at once,
-    so a launch over every block on a capped grid (Warp's grid-stride loop)
-    costs little more than the listed blocks. Each listed group runs the
-    repair unchanged, early exit included.
+    :func:`get_classify_kernel` and :func:`get_bank_kernel`: logical block
+    ``item`` repairs listed block ``repair_blocks[item]`` and items past
+    ``repair_count[0]`` return at once, so a launch over every block on a
+    capped grid (Warp's grid-stride loop) costs little more than the listed
+    blocks. Each listed group runs the repair unchanged, early exit included.
 
     ``bank_coordinates`` (a group's coordinate count) builds the one-pass
-    repair that also takes the comparison of :func:`get_bank_kernel`: a valid
-    group stamped with the ``bank`` argument compares the two banks and, when
-    they are equal, is restamped and takes the early exit. It serves launches
-    too small to classify, where a separate comparison pass would cost a
-    launch. ``reference`` and ``clocked`` select the comparison forms and the
-    stage counters; ``host`` the static CPU scratch of an owner on the CPU
-    (see :func:`get_helpers`).
+    repair that compares input banks inside its blocks: a valid group stamped
+    with the ``bank`` argument compares the two banks (see
+    :func:`_bank_binding`) and, when they are equal, is restamped and takes the
+    early exit. It serves launches too small to classify, where a comparison
+    pass of its own would cost a launch. Classified launches compare in
+    :func:`get_bank_kernel` instead. ``reference`` and ``clocked`` select the
+    comparison forms and the stage counters; ``host`` the static CPU scratch
+    of an owner on the CPU (see :func:`get_helpers`).
     """
     if finish and motion_velocity:
         raise ValueError("Alternate motion velocity is a repair-only contract")
@@ -1129,19 +1154,26 @@ if lane == 0:
 
 @functools.cache
 def get_bank_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFERENCE_LAYOUT, coordinates: int = 1):
-    """Restamp the valid groups whose input bank repeats the bank their cache was published into.
+    """Compare the input banks of the blocks :func:`get_classify_kernel` listed for comparison.
 
-    A group qualifies when its cache is valid and stamped with the ``bank``
-    argument (the step's output bank, into which the last finish published)
-    rather than with the input bank. If the two banks hold the same words
-    (see :func:`_bank_binding`), the group's stamp moves to the input bank, so
-    the repair that follows takes its early exit. Every other group is left
-    alone. A separate pass keeps the repair kernels unchanged: comparing inside
-    them raised their register counts (sm_120: 80 to 151 on a 13-body chain).
+    Logical block ``item`` takes listed block ``compare_blocks[item]`` (items
+    past ``counts[1]`` return at once, so a capped grid strides the list). A
+    group of that block whose repair would exit early but for its stamp, which
+    names the ``bank`` argument (the step's output bank, into which the last
+    finish published) instead of the input bank, compares the two banks (see
+    :func:`_bank_binding`); when they hold the same words its stamp moves to
+    the input bank. The block is then appended to the repair list
+    (``repair_blocks``, counted in ``counts[0]``) unless every group in it takes
+    its early exit, so the classification never lists it there itself and no
+    block is listed twice. A pass of its own, rather than the comparison
+    inside the listed repair, keeps that repair's registers: inside, the
+    comparison raised a chain-scan repair's from 80 to 151 on a 13-body chain
+    (sm_120).
     """
     plan_type = tree_chain_scan.ChainPlan if chain_scan else KineticPlan
     _lanes, _, _, _ = _thread_helpers(layout)
     matches = _bank_binding(coordinates, layout)
+    block_any = _block_vote(layout)
     pack, roots, forest = layout.pack, len(layout.roots), layout.forest
 
     def bank_pass(
@@ -1149,39 +1181,55 @@ def get_bank_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFERENCE_
         plan: plan_type,
         data: PublicationData,
         cache: KineticData,
+        requests: wp.array[int],
+        global_refresh: int,
         bank: StateBank,
+        compare_blocks: wp.array[int],
+        repair_blocks: wp.array[int],
+        counts: wp.array[int],
     ):
-        block, logical_lane = wp.tid()
+        item, logical_lane = wp.tid()
         lanes = _lanes()
         lane, stride = lanes[0], lanes[1]
         if stride == 1 and logical_lane != 0:
             return
+        if item >= counts[1]:
+            return
+        block = compare_blocks[item]
         group = block * wp.static(pack) + lanes[2]
         art = p.group_to_art[group]
         valid = cache.current_valid[art]
+        refresh = int(global_refresh != 0 or requests[art] != 0)
         if wp.static(forest):
             for root in range(1, wp.static(roots)):
                 valid = wp.min(valid, cache.current_valid[plan.arts[group, root]])
-        if valid == 0:
-            return
-        if _same_source(cache, group, data.joint_q, data.joint_qd) != 0:
-            return
-        if _same_source(cache, group, bank.joint_q, bank.joint_qd) == 0:
-            return
-        js = p.art_joint_start[art]
-        equal = matches(
-            bank,
-            data.joint_q_start[js],
-            p.art_dof_start[art],
-            js,
-            data.joint_q,
-            data.joint_qd,
-            data.joint_child,
-            data.body_q,
-            data.body_qd,
-        )
-        if equal != 0 and lane == 0:
-            _stamp_source(cache, group, data.joint_q, data.joint_qd)
+                refresh = int(refresh != 0 or requests[plan.arts[group, root]] != 0)
+        current = int(valid != 0)
+        if current != 0 and refresh != 0:
+            current = int(
+                cache.geometry_valid[group] != 0 and cache.geometry_generation[group] == cache.generation[group]
+            )
+        exits = int(0)
+        if current != 0:
+            exits = _same_source(cache, group, data.joint_q, data.joint_qd)
+            if exits == 0 and _same_source(cache, group, bank.joint_q, bank.joint_qd) != 0:
+                js = p.art_joint_start[art]
+                exits = matches(
+                    bank,
+                    data.joint_q_start[js],
+                    p.art_dof_start[art],
+                    js,
+                    data.joint_q,
+                    data.joint_qd,
+                    data.joint_child,
+                    data.body_q,
+                    data.body_qd,
+                )
+                if exits != 0 and lane == 0:
+                    _stamp_source(cache, group, data.joint_q, data.joint_qd)
+        # Every thread of the block votes (no thread returned since the block-uniform item test).
+        if block_any(int(exits == 0)) != 0 and logical_lane == 0:
+            repair_blocks[wp.atomic_add(counts, 0, 1)] = block
 
     name = f"tree_kinetic_bank{layout.bodies}"
     if forest:
@@ -1210,11 +1258,17 @@ def get_classify_kernel(
 ):
     """List the repair blocks holding a group whose repair would not take its early exit; one thread per block.
 
-    A group needs its repair unless the repair's setup would return early: its
-    cache and its forest roots' caches are valid, it is stamped with the input
-    bank, its motion velocity is unchanged (motion-velocity layouts only), and
-    the step does not refresh it or its geometry is current. A block is listed,
-    in no set order, when any of its groups needs its repair. The listed repair
+    A group takes its early exit when its cache and its forest roots' caches
+    are valid, it is stamped with the input bank, its motion velocity is
+    unchanged (motion-velocity layouts only), and the step does not refresh it
+    or its geometry is current. A group of ordinary motion that meets every
+    condition but the stamp, which names the ``bank`` argument instead, is
+    left to the comparison: its block goes to ``compare_blocks`` (counted in
+    ``counts[1]``), and :func:`get_bank_kernel` appends the block to the
+    repair list unless every group in it then exits. Any other block with a
+    group that does not exit goes to ``repair_blocks`` (counted in
+    ``counts[0]``). The lists have no set order. Passing the input bank as
+    ``bank`` lists nothing for comparison. The listed repair
     (``get_state_kernel(listed=True)``) runs each listed group's repair
     unchanged; blocks share no cache, state or publication entries, so every
     group computes the same values as in the one-pass launch.
@@ -1230,11 +1284,14 @@ def get_classify_kernel(
         requests: wp.array[int],
         global_refresh: int,
         motion_qd: wp.array[float],
+        bank: StateBank,
         repair_blocks: wp.array[int],
-        repair_count: wp.array[int],
+        compare_blocks: wp.array[int],
+        counts: wp.array[int],
     ):
         block = wp.tid()
         needed = int(0)
+        compared = int(0)
         for sub in range(wp.static(pack)):
             group = block * wp.static(pack) + sub
             art = p.group_to_art[group]
@@ -1244,20 +1301,31 @@ def get_classify_kernel(
                 for root in range(1, wp.static(roots)):
                     valid = wp.min(valid, cache.current_valid[plan.arts[group, root]])
                     refresh = int(refresh != 0 or requests[plan.arts[group, root]] != 0)
-            exits = int(valid != 0)
-            if exits != 0:
-                exits = _same_source(cache, group, data.joint_q, data.joint_qd)
-            if exits != 0 and refresh != 0:
-                exits = int(
+            current = int(valid != 0)
+            if current != 0 and refresh != 0:
+                current = int(
                     cache.geometry_valid[group] != 0 and cache.geometry_generation[group] == cache.generation[group]
                 )
+            own = int(0)
+            if current != 0:
+                own = _same_source(cache, group, data.joint_q, data.joint_qd)
+            exits = own
             if wp.static(motion_velocity):
                 if exits != 0:
                     exits = int(_motion_differs(data.joint_qd, motion_qd, p.art_dof_start[art], wp.static(dofs)) == 0)
             if exits == 0:
-                needed = 1
-        if needed != 0:
-            repair_blocks[wp.atomic_add(repair_count, 0, 1)] = block
+                candidate = int(0)
+                if wp.static(not motion_velocity):
+                    if current != 0 and own == 0:
+                        candidate = _same_source(cache, group, bank.joint_q, bank.joint_qd)
+                if candidate != 0:
+                    compared = 1
+                else:
+                    needed = 1
+        if compared != 0:
+            compare_blocks[wp.atomic_add(counts, 1, 1)] = block
+        elif needed != 0:
+            repair_blocks[wp.atomic_add(counts, 0, 1)] = block
 
     name = f"tree_kinetic_classify{layout.bodies}"
     if forest:
