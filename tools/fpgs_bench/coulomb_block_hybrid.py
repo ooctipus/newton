@@ -5,6 +5,7 @@
 
 import hashlib
 import importlib.util
+import unittest
 from pathlib import Path
 
 import numpy as np
@@ -13,11 +14,24 @@ from tools.fpgs_bench import coulomb_block_control as block
 
 REFERENCE_PATH = Path("/tmp/fpgs-anymal-lazy-reference-zE5yUe/method.py")
 REFERENCE_SHA = "553c12619971e9cbeb950e1940797d91057950d70d789c1202861f1e6fcf485f"
-if hashlib.sha256(REFERENCE_PATH.read_bytes()).hexdigest() != REFERENCE_SHA:
-    raise RuntimeError("Original parallel CPU reference changed")
-_spec = importlib.util.spec_from_file_location("_pinned_anymal_parallel_reference", REFERENCE_PATH)
-reference = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(reference)
+
+
+class _MissingReference:
+    """Stand in for an absent reference: every use skips the test that makes it."""
+
+    def __getattr__(self, name):
+        raise unittest.SkipTest(f"Pinned parallel CPU reference {REFERENCE_PATH} is unavailable")
+
+
+if REFERENCE_PATH.is_file():
+    if hashlib.sha256(REFERENCE_PATH.read_bytes()).hexdigest() != REFERENCE_SHA:
+        raise RuntimeError("Original parallel CPU reference changed")
+    _spec = importlib.util.spec_from_file_location("_pinned_anymal_parallel_reference", REFERENCE_PATH)
+    reference = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(reference)
+else:
+    # A local study artifact pinned by hash, never committed.
+    reference = _MissingReference()
 
 
 def parallel_continue(Z, diagonal, rhs, types, parents, mu, incoming, *, iterations):
