@@ -2002,6 +2002,11 @@ class TestScalarBranchOwner(unittest.TestCase):
         )
         self.assertEqual(groups["ScalarBranchState"]["kernels"]["predict"], sb.predict_prismatic_branches.key)
         self.assertEqual(groups["TreeHeldOperator"]["dofs"], ARM_DOFS)
+        # The scalar group holds no bank stamps, so the arm group beside it validates a changed input
+        # bank by identity, as the owner does, and binds no comparison pass or banked repair.
+        for name, group in groups.items():
+            self.assertEqual(group["input_validation"], "identity", name)
+            self.assertEqual((group["kernels"]["bank"], group["kernels"]["bank_repair"]), (None, None), name)
         self.assertEqual(len(record["measurements"]["held_tree_lane_timing_us"]), 2)
         self.assertEqual((publication["owner"], publication["prismatic_publication"]), ("cached", False))
         self.assertFalse(publication["prismatic_linear_state"])
