@@ -1555,17 +1555,19 @@ class SolverFeatherPGS(SolverBase):
                 Requires ``friction_mode="current"`` and ``pgs_kernel="loop"`` or ``"tiled_row"``.
                 Explicit positive gains with an incompatible point algorithm raise an error.
                 Each step sorts its patch contact pairs, except a step captured in a CUDA graph
-                right after another captured step of the same graph over the same ``Contacts``,
-                with no write of those contacts by Newton in between (a collision pass,
-                :meth:`~newton.Contacts.clear`, a coupled-solver contact filter or
-                :meth:`~newton.solvers.SolverMuJoCo.update_contacts`): it reuses that step's
-                sorted pairs, which saves the sort on every substep that shares a collision
-                pass. Code that rewrites contact arrays between two such captured steps must
-                call :meth:`~newton.Contacts.clear` first, which makes the next step sort, or set
-                ``FEATHER_PGS_PATCH_FRAME_REUSE=0``. Otherwise only a change of
-                ``contact_generation`` or of the contact count is detected: that step is solved
-                without patch friction rows and its anchors are released;
-                :meth:`constraint_capacity_status` reports it as ``patch_frames`` and
+                right after another captured step of the same graph over the same contact stream
+                (the same ``contact_generation`` array, which every object wrapping the arrays of
+                one :class:`~newton.Contacts` shares), with no write of that stream by Newton in
+                between (a collision pass, :meth:`~newton.Contacts.clear`, a coupled-solver
+                contact filter or :meth:`~newton.solvers.SolverMuJoCo.update_contacts`): it
+                reuses that step's sorted pairs, which saves the sort on every substep that
+                shares a collision pass. Code that rewrites contact arrays between two such
+                captured steps, including passing other contact arrays with the same
+                ``contact_generation`` array, must call :meth:`~newton.Contacts.clear` first,
+                which makes the next step sort, or set ``FEATHER_PGS_PATCH_FRAME_REUSE=0``.
+                Otherwise only a change of ``contact_generation`` or of the contact count is
+                detected: that step is solved without patch friction rows and its anchors are
+                released; :meth:`constraint_capacity_status` reports it as ``patch_frames`` and
                 :meth:`check_constraint_capacity` raises. A rewrite that keeps both but changes
                 which shapes a contact slot pairs, or reorders contacts, is not detected: that
                 step groups its contacts by the previous step's sorted pairs. Rewriting only
@@ -1573,8 +1575,8 @@ class SolverFeatherPGS(SolverBase):
                 alone and every step recomputes the rest. ``FEATHER_PGS_PATCH_FRAME_REUSE=0``
                 sorts every step. The experimental opt-in ``FEATHER_PGS_PATCH_CONDITIONAL_NODES=1``
                 sorts the other captured steps under a conditional graph node that skips empty
-                contact frames and the frame sorted last (the same ``Contacts``,
-                ``contact_generation`` and contact count). The node pauses the capture once per
+                contact frames and the frame sorted last (the same contact stream,
+                ``contact_generation`` value and contact count). The node pauses the capture once per
                 such step: an event recorded before ``step()`` cannot be waited on after it, and a
                 step taken while a stream forked by the caller still holds unjoined work sorts
                 unconditionally.
@@ -13383,8 +13385,9 @@ class SolverFeatherPGS(SolverBase):
         """Return whether captured patch builds keep the sorted pairs of a reused contact frame, with the reason.
 
         A captured build keeps them when the previous build was captured in the same
-        graph over the same ``Contacts`` and the host issued no contact write in
-        between (see :class:`_FrictionPatchState`). On by default;
+        graph over the same contact stream, its ``contact_generation`` array, and the
+        host issued no write of that stream in between (see :class:`_FrictionPatchState`).
+        On by default;
         ``FEATHER_PGS_PATCH_FRAME_REUSE=0`` sorts every build.
         """
         if not self._friction_anchors_enabled:
@@ -13396,8 +13399,9 @@ class SolverFeatherPGS(SolverBase):
             )
         return True, (
             "A captured build keeps the sorted patch pairs of the previous build captured in the same graph over the "
-            "same Contacts when the host noted no write of them in between (such as a collision pass, "
-            "Contacts.clear() or a coupled-solver filter); other builds sort, only their live slots up to "
+            "same contact stream (its contact_generation array, which wrappers of one Contacts share) when the host "
+            "noted no write of that stream in between (such as a collision pass, Contacts.clear() or a "
+            "coupled-solver filter); other builds sort, only their live slots up to "
             f"{_CHUNK_SORT_CAPACITY:,} contact slots."
         )
 

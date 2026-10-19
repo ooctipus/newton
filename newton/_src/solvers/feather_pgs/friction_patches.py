@@ -35,8 +35,9 @@ capture: all buffers and the radix-sort workspace have fixed capacity. Launches
 stride over the live contacts and the slots earlier frames used, so their work
 follows the live contact count rather than the capacity. With frame reuse, the
 solver's default, a captured build skips the pair sort when the previous build
-was captured in the same graph over the same contacts and the host issued no
-contact write in between, which is the case on every solver substep that shares
+was captured in the same graph over the same contact stream (its
+``contact_generation`` array) and the host issued no write of that stream in
+between, which is the case on every solver substep that shares
 a collision frame (see :class:`_FrictionPatchState`). The solver's experimental
 opt-in ``FEATHER_PGS_PATCH_CONDITIONAL_NODES=1`` sorts the other captured builds
 under a conditional node that also skips empty frames and the frame whose pairs
