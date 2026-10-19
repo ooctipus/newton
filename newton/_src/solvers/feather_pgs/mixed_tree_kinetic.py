@@ -13,7 +13,7 @@ from .device_proof import DeviceProof
 from .small_cholesky import geometric_kernel
 from .sparse_factor import bind_operator_plan, operator_metadata
 from .sparse_mass_matrix import _SparseMassMatrixPlan
-from .tree_kinetic_owner import _NUMERIC_FLAGS, TreeKineticState, kernel_switches, launch_switches
+from .tree_kinetic_owner import TreeKineticState, kernel_switches, launch_switches, proof_runs
 from .tree_kinetic_plan import make_plan
 from .tree_kinetic_state import HeldResponse
 
@@ -617,7 +617,7 @@ class MixedTreeKineticState:
         Returns:
             Whether every group's proof ran and passed (see :meth:`TreeKineticState.validate_model`).
         """
-        if flags is not None and int(flags) != 0 and int(flags) & ~_NUMERIC_FLAGS == 0:
+        if not proof_runs(flags):
             # Numeric notifications cannot change ownership; see TreeKineticState.
             return False
         solver = self.solver

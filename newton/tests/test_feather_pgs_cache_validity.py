@@ -230,6 +230,14 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
             launched = invalidating_launches(JOINT)
             self.assertEqual(bool(launched), not kept)
             self.assertEqual(validity(), valid if kept else invalid)
+        # A move announced under another non-numeric flag invalidates as well: the proof that
+        # stores the moved frame must not leave caches built from the old one.
+        actuator = newton.ModelFlags.ACTUATOR_PROPERTIES
+        for written, kept in ((moved, False), (moved, True), (frames, False)):
+            mark_valid()
+            model.joint_X_p.assign(written)
+            self.assertEqual(bool(invalidating_launches(actuator)), not kept)
+            self.assertEqual(validity(), valid if kept else invalid)
         # A changed joint axis raises before any cache changes.
         mark_valid()
         axes = model.joint_axis.numpy().copy()

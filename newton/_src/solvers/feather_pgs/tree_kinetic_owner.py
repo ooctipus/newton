@@ -68,6 +68,16 @@ def dfs_intervals(parent):
     return np.asarray(order, np.int32), end
 
 
+def proof_runs(flags) -> bool:
+    """Whether a held-tree group's ``validate_model`` runs its proof for a notification's flags.
+
+    Numeric notifications alone (joint DOF, inertial, shape and model
+    properties) cannot change what the proof covers and skip it; every other
+    notification, and one without flags, runs it.
+    """
+    return flags is None or int(flags) == 0 or int(flags) & ~_NUMERIC_FLAGS != 0
+
+
 def _bank_pointers(state):
     """The pointers a cache stamp records for a state bank: its coordinates and velocities."""
     return state.joint_q.ptr, state.joint_qd.ptr
@@ -641,7 +651,7 @@ class TreeKineticState:
             fingerprint. Numeric notifications skip the proof and return
             ``False``.
         """
-        if flags is not None and int(flags) != 0 and int(flags) & ~_NUMERIC_FLAGS == 0:
+        if not proof_runs(flags):
             return False
         if self._dimensions() != self._plan_dimensions:
             raise RuntimeError("Tree kinetic dimensions changed; reconstruct and recapture")

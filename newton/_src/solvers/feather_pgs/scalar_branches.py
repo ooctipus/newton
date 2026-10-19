@@ -54,7 +54,7 @@ from ...sim import BodyFlags, JointType
 from . import cached_state_binding
 from .device_proof import DeviceProof
 from .kernels import mul_com_spatial_inertia, transform_com_inertia_terms
-from .tree_kinetic_owner import _NUMERIC_FLAGS
+from .tree_kinetic_owner import proof_runs
 
 # Lanes of the repair launch: one warp per articulation, so a valid cache exits per warp.
 _REPAIR_LANES = wp.constant(32)
@@ -862,7 +862,7 @@ class ScalarBranchState:
             own, ``True``: the owner's tree groups prove the same model arrays,
             and the owner keeps the caches only when every proof passes.
         """
-        if flags is not None and int(flags) != 0 and int(flags) & ~_NUMERIC_FLAGS == 0:
+        if not proof_runs(flags):
             return False
         if self._dimensions() != self._plan_dimensions:
             raise RuntimeError("Scalar branch dimensions changed; reconstruct and recapture")

@@ -3806,12 +3806,14 @@ class SolverFeatherPGS(SolverBase):
         With cached dynamics active, a notification whose only flag among the
         cached inputs is :attr:`~newton.ModelFlags.JOINT_PROPERTIES` keeps the
         cache once the cache's device checksums of every joint frame and axis
-        match their stored values. A moved joint frame, as when Isaac Lab
-        re-poses a fixed root through :attr:`~newton.Model.joint_X_p`,
-        invalidates every cache instead, and a changed joint axis raises. That
-        flag covers the :class:`~newton.Model` joint arrays only: after writing
-        :class:`~newton.State` joint coordinates outside :meth:`step`, call
-        :meth:`reset` with a world mask or :meth:`notify_state_changed`.
+        match their stored values. A notification whose flags are not all
+        numeric runs that check, and one that finds a moved joint frame, as
+        when Isaac Lab re-poses a fixed root through
+        :attr:`~newton.Model.joint_X_p`, invalidates every cache instead, while
+        a changed joint axis raises. That flag covers the :class:`~newton.Model`
+        joint arrays only: after writing :class:`~newton.State` joint
+        coordinates outside :meth:`step`, call :meth:`reset` with a world mask
+        or :meth:`notify_state_changed`.
         """
         # Derive the kinematic state first: a body-flag change the solver
         # cannot absorb raises here, before any mask, cache or owner changes.
@@ -3847,6 +3849,14 @@ class SolverFeatherPGS(SolverBase):
             # on each fixed-root pose write. A moved frame leaves the flag in place
             # and invalidates every cache below.
             cache_inputs = 0
+        elif tree_kinetic is not None and not frames_proven:
+            from .tree_kinetic_owner import proof_runs  # noqa: PLC0415
+
+            if proof_runs(flags):
+                # The owner's proof ran and found a moved joint frame (or a moved axis of
+                # a scalar-branch group, which reads axes live): invalidate every cache,
+                # whichever flag announced the move.
+                cache_inputs |= int(ModelFlags.JOINT_PROPERTIES)
         if tree_kinetic is not None and cache_inputs:
             tree_kinetic.invalidate()
         if self._fk_id_cache_enabled and cache_inputs:
