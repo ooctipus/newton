@@ -85,6 +85,55 @@ def deferred_stored(narrow):
     return min(int(deferred.count.numpy()[0]), deferred.windows.shape[0])
 
 
+def stored_windows(narrow):
+    """Return the windows the last pass stored for the lane pass as {(heightfield, shape): (row, col, rows, cols)}."""
+    windows = narrow._heightfield_lane_deferred.windows.numpy()[: deferred_stored(narrow)]
+    return {(int(w["a"]), int(w["b"])): (int(w["row"]), int(w["col"]), int(w["rows"]), int(w["cols"])) for w in windows}
+
+
+# The cells around an elevation sample, as (row, column) offsets, and their triangles that use the sample as a vertex.
+_CORNER_CELLS = ((0, 0, (0, 1)), (0, -1, (0,)), (-1, -1, (0, 1)), (-1, 0, (1,)))
+
+
+def corner_cells(sample, samples):
+    """Yield (row, column, triangle) for every grid triangle with this elevation sample as a vertex."""
+    sample_row, sample_col = divmod(sample, samples)
+    for row_offset, col_offset, subs in _CORNER_CELLS:
+        row, col = sample_row + row_offset, sample_col + col_offset
+        if 0 <= row < samples - 1 and 0 <= col < samples - 1:
+            for sub in subs:
+                yield row, col, (row * (samples - 1) + col) * 2 + sub
+
+
+def corner_triangles(sample, samples):
+    """Return the grid triangles with this elevation sample as a vertex."""
+    return {triangle for _row, _col, triangle in corner_cells(sample, samples)}
+
+
+def touching_windows(sample, windows, pairs, samples):
+    """Return the (heightfield, shape, triangle) triples of these pairs' window cells with the sample as a vertex."""
+    found = set()
+    for pair in pairs:
+        first_row, first_col, rows, cols = windows[pair]
+        for row, col, triangle in corner_cells(sample, samples):
+            if first_row <= row < first_row + rows and first_col <= col < first_col + cols:
+                found.add((*pair, triangle))
+    return found
+
+
+def edited_corner(windows, pairs, emitted, samples, exclude=()):
+    """Pick the window corner of these pairs whose triangles the original midphase rejected most often."""
+    candidates = {
+        row * samples + col
+        for pair in pairs
+        for row in range(windows[pair][0], windows[pair][0] + windows[pair][2] + 1)
+        for col in range(windows[pair][1], windows[pair][1] + windows[pair][3] + 1)
+    }
+    return max(
+        sorted(candidates - set(exclude)), key=lambda s: len(touching_windows(s, windows, pairs, samples) - emitted)
+    )
+
+
 class TestHeightfieldLaneMidphase(unittest.TestCase):
     def assert_tags_name_pairs(self, narrow):
         """Every pair-CSR tag must index the shape pair that emitted the triangle."""
@@ -127,7 +176,15 @@ class TestHeightfieldLaneMidphase(unittest.TestCase):
                 actual = pipeline(model, route, True, **capacities)
                 before, after = self.collide(reference, state), self.collide(actual, state)
                 self.assertGreater(int(reference.narrow_phase.triangle_pairs_count.numpy()[0]), 0)
-                # The device's own schedule: on CPU nothing is deferred and the stream keeps its order.
+                # The device's own schedule: on CPU nothing is deferred and the stream keeps its
+                # order; on CUDA, windows of more than 16 cells take 16 lanes each.
+                narrow = actual.narrow_phase
+                schedule = (narrow._heightfield_lane_small_cells, narrow._heightfield_lane_width)
+                self.assertEqual(schedule, (-1, 1) if cpu else (16, 16))
+                if cpu:
+                    self.assertEqual(int(narrow._heightfield_lane_deferred.count.numpy()[0]), 0)
+                else:
+                    self.assertGreater(deferred_stored(narrow), 0)
                 self.assert_same_stream(reference, actual, ordered=cpu)
                 if cpu:
                     np.testing.assert_array_equal(
@@ -136,7 +193,6 @@ class TestHeightfieldLaneMidphase(unittest.TestCase):
                     self.assertEqual(
                         int(before.rigid_contact_count.numpy()[0]), int(after.rigid_contact_count.numpy()[0])
                     )
-                narrow = actual.narrow_phase
                 for small_cells, lanes in schedules:
                     with self.subTest(small_cells=small_cells, lanes=lanes):
                         narrow._set_lane_schedule(small_cells, lanes)
@@ -157,27 +213,42 @@ class TestHeightfieldLaneMidphase(unittest.TestCase):
         self.check_original_triangles("cuda:0", model, ((0, 16), (6, 32), (16, 8)), **capacities)
 
     def check_current_geometry(self, device):
-        """Read current elevations, poses and dimensions every pass, including non-finite heights."""
-        model = rough_terrain_model(device, KINDS, per_kind=2, samples=24, half=1.0)
+        """Read current elevations, poses and dimensions every pass, and keep cells with non-finite corners.
+
+        Every epoch moves, grows and partly removes the shapes, then writes
+        non-finite values into three samples: a corner of a window cell of a pair
+        that pass 2 splits over lanes, a corner of a window cell of a pair that
+        pass 1 walks in place, and, as a control, a sample outside every window.
+        The two window samples are chosen where the original midphase rejected
+        triangles before the edit. A cell with a non-finite corner is never
+        rejected, so every window triangle that has the edited corner as a vertex
+        must then be emitted by both midphases.
+        """
+        # Windows of up to 9 cells stay in place: hovering boxes then supply rejected corners to both passes.
+        samples, small_cells, lanes = 24, 9, 8
+        model = rough_terrain_model(device, KINDS, per_kind=2, samples=samples, half=1.0)
         state = model.state()
+        heights = model.heightfield_elevations.numpy().copy()
+        poses = state.body_q.numpy().copy()
+        scales = model.shape_scale.numpy().copy()
         for route in ("cell", "geometric"):
             reference, actual = pipeline(model, route, False), pipeline(model, route, True)
-            actual.narrow_phase._set_lane_schedule(3, 8)
-            heights = model.heightfield_elevations.numpy().copy()
-            poses = state.body_q.numpy().copy()
-            scales = model.shape_scale.numpy().copy()
+            narrow = actual.narrow_phase
+            bound = narrow.max_heightfield_pairs
+            # Room for every long pair: which pairs pass 2 takes then follows from the window sizes alone.
+            narrow._set_lane_schedule(small_cells, lanes, capacity=bound)
+            # The probe hands every non-empty window to pass 2, so its storage lists every pair's window.
+            probe = pipeline(model, route, True)
+            probe.narrow_phase._set_lane_schedule(0, lanes, capacity=bound)
             graph = None
             if wp.get_device(device).is_cuda:
                 contacts = actual.contacts()
+                actual.collide(state, contacts)  # Load every module before the capture.
                 with wp.ScopedCapture(device=device) as capture:
                     actual.collide(state, contacts)
                 graph = capture.graph
             for epoch in range(4):
                 with self.subTest(device=device, route=route, epoch=epoch):
-                    current = heights.copy()
-                    current[(7 * epoch + 3) % len(current)] = (np.nan, np.inf, -np.inf, 0.2)[epoch]
-                    current[(11 * epoch + 5) % len(current)] += 0.05
-                    model.heightfield_elevations.assign(current)
                     moved = poses.copy()
                     moved[:, 0] += 0.03 * epoch
                     # The last bodies leave the grid in x: part of their window falls outside it.
@@ -186,23 +257,52 @@ class TestHeightfieldLaneMidphase(unittest.TestCase):
                     sized = scales.copy()
                     sized[1:, :2] *= 1.0 + 0.1 * epoch
                     model.shape_scale.assign(sized)
+                    model.heightfield_elevations.assign(heights)
+                    self.collide(probe, state)
+                    self.collide(reference, state)
+                    windows = stored_windows(probe.narrow_phase)
+                    self.assertEqual(len(windows), int(probe.narrow_phase._heightfield_lane_deferred.count.numpy()[0]))
+                    emitted = set(map(tuple, stream(reference.narrow_phase)[0].tolist()))
+                    split = {pair for pair, window in windows.items() if window[2] * window[3] > small_cells}
+                    walked = set(windows) - split
+                    self.assertTrue(split and walked)
+                    deferred_corner = edited_corner(windows, split, emitted, samples)
+                    in_place_corner = edited_corner(windows, walked, emitted, samples, exclude={deferred_corner})
+                    control = next(
+                        s for s in range(len(heights)) if not touching_windows(s, windows, set(windows), samples)
+                    )
+                    current = heights.copy()
+                    current[deferred_corner] = (np.nan, np.inf, -np.inf, np.nan)[epoch]
+                    current[in_place_corner] = (-np.inf, np.nan, np.inf, np.inf)[epoch]
+                    current[control] = (np.inf, -np.inf, np.nan, -np.inf)[epoch]
+                    model.heightfield_elevations.assign(current)
                     self.collide(reference, state)
                     if graph is None:
                         self.collide(actual, state)
                     else:
                         wp.capture_launch(graph)
                     self.assert_same_stream(reference, actual, ordered=False)
+                    self.assertEqual(set(stored_windows(narrow)), split)
+                    original = set(map(tuple, stream(reference.narrow_phase)[0].tolist()))
+                    lanes_stream = set(map(tuple, stream(narrow)[0].tolist()))
+                    for corner, pairs in ((deferred_corner, split), (in_place_corner, walked)):
+                        expected = touching_windows(corner, windows, pairs, samples)
+                        # The edit uncovered triangles the original midphase had rejected.
+                        self.assertTrue(expected - emitted)
+                        self.assertLessEqual(expected, original)
+                        self.assertLessEqual(expected, lanes_stream)
+                    self.assertFalse({tri for _a, _b, tri in original} & corner_triangles(control, samples))
             model.heightfield_elevations.assign(heights)
             state.body_q.assign(poses)
             model.shape_scale.assign(scales)
 
     def test_current_geometry_cpu(self):
-        """Follow geometry edits between CPU passes with deferred pairs."""
+        """Follow geometry edits and non-finite corners between CPU passes in both lane passes."""
         self.check_current_geometry("cpu")
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
     def test_current_geometry_cuda(self):
-        """Follow geometry edits inside a replayed CUDA graph with deferred pairs."""
+        """Follow geometry edits and non-finite corners inside a replayed CUDA graph in both lane passes."""
         self.check_current_geometry("cuda:0")
 
     def test_deferred_storage_overflow_cpu(self):
