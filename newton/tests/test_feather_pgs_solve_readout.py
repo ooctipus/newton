@@ -397,7 +397,10 @@ class TestSolveReadoutKernels(unittest.TestCase):
                     case.run(case.kernel(), budget)
                     outputs.append(case.read())
                 delta, impulses = outputs[1][0]
-                np.testing.assert_allclose(impulses * np.array([1.0, 10.0]), [omega, 0.0], rtol=1.0e-5)
+                # The impulse buffer holds the case's padded capacity; only the leading rows are live.
+                live, padding = impulses[: len(rows)], impulses[len(rows) :]
+                np.testing.assert_allclose(live, [omega, 0.0], rtol=1.0e-5, atol=0.0)
+                np.testing.assert_array_equal(padding, 0.0)
                 np.testing.assert_allclose(rows[1] @ delta + 0.5, -violation, rtol=1.0e-5)
                 operand = _readout(device, case.worlds)
                 policy = SolvePolicy(readout="sweeps", velocity_change_tolerance=tolerance)
