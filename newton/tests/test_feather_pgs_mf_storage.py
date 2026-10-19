@@ -298,11 +298,20 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "streamed metadata"):
             get_source(**_LARGE_STREAMED_SHAPE, resident_row_metadata=True)
 
-    def test_packed_row_metadata_decodes_every_row_type_and_parent(self):
-        """Run the source's own packing and decoding on the CPU: every type and parent comes back exactly."""
+    def test_packed_row_metadata_decodes_row_types_and_parents(self):
+        """Run the source's own packing and decoding on the CPU: row types and parents come back exactly.
+
+        Every row type is packed with the boundary parents (none, the first rows, the shape's last
+        rows and the largest the packing holds), and 2^16 random rows pair a random type with a
+        random parent from -1 to the largest.
+        """
         source = _streamed_source(resident_row_metadata=True)
-        pairs = itertools.product(range(PGS_CONSTRAINT_TYPE_COUNT), (-1, 0, 1, 2302, 2303, _DENSE_META_MAX_PARENT))
-        types, parents = np.array(list(pairs), np.int32).T.copy()
+        boundary = itertools.product(range(PGS_CONSTRAINT_TYPE_COUNT), (-1, 0, 1, 2302, 2303, _DENSE_META_MAX_PARENT))
+        rng = np.random.default_rng(3)
+        random_types = rng.integers(0, PGS_CONSTRAINT_TYPE_COUNT, 1 << 16)
+        random_parents = rng.integers(-1, _DENSE_META_MAX_PARENT, 1 << 16, endpoint=True)
+        pairs = np.concatenate([np.array(list(boundary)), np.stack([random_types, random_parents], axis=1)])
+        types, parents = pairs.astype(np.int32).T.copy()
         decoded = wp.zeros((len(types), 3), dtype=int, device="cpu")
         wp.launch(
             _row_metadata_codec(source),
