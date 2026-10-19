@@ -158,71 +158,6 @@ def _has_generic_convex_pairs(
     return True if count is None else count > 0
 
 
-class _WeldTopology:
-    """Host copy of the joint topology that welds bodies to the world.
-
-    A body is welded when it has a parent joint and every joint that names it as the
-    child is a fixed joint from the world or from another welded body, so it has no
-    degree of freedom of its own. A shape is structurally immobile when it is static or
-    belongs to a welded body. Joints and shape ownership are fixed once a model is
-    finalized and are read here once; body flags and joint enables are runtime state,
-    read on each :meth:`welded_bodies` call that passes the model.
-    """
-
-    def __init__(self, model: Model):
-        self.body_count = int(model.body_count)
-        empty = np.empty(0, dtype=np.int32)
-        self.shape_body = model.shape_body.numpy() if model.shape_count else empty
-        has_joints = self.body_count > 0 and int(model.joint_count) > 0
-        joint_type = model.joint_type.numpy() if has_joints else empty
-        parent = model.joint_parent.numpy() if has_joints else empty
-        child = model.joint_child.numpy() if has_joints else empty
-        attached = (child >= 0) & (child < self.body_count)
-        self.fixed_joints = np.flatnonzero(attached & (joint_type == int(JointType.FIXED)))
-        self.fixed_parent = parent[self.fixed_joints]
-        self.fixed_child = child[self.fixed_joints]
-        self.parent_joints = np.bincount(child[attached], minlength=self.body_count)
-
-    def welded_bodies(self, model: Model | None) -> np.ndarray:
-        """Return a host mask of the welded bodies.
-
-        Args:
-            model: The model whose current :attr:`~newton.Model.joint_enabled` and
-                :attr:`~newton.Model.body_flags` apply: a disabled joint does not weld,
-                and only a dynamic body welds, because the user can move a kinematic
-                body and everything welded to it. ``None`` ignores both, which bounds
-                the welded set over every state they can take.
-        """
-        fixed_parent, fixed_child = self.fixed_parent, self.fixed_child
-        eligible = self.parent_joints > 0
-        if model is not None:
-            if model.joint_enabled is not None and len(self.fixed_joints):
-                enabled = model.joint_enabled.numpy()[self.fixed_joints].astype(bool)
-                fixed_parent, fixed_child = fixed_parent[enabled], fixed_child[enabled]
-            if model.body_flags is not None and self.body_count:
-                flags = model.body_flags.numpy()
-                eligible &= ((flags & int(BodyFlags.DYNAMIC)) != 0) & ((flags & int(BodyFlags.KINEMATIC)) == 0)
-        # Every parent joint must weld; a body with another parent joint keeps its freedom.
-        eligible &= np.bincount(fixed_child, minlength=self.body_count) == self.parent_joints
-        welded = np.zeros(self.body_count, dtype=bool)
-        from_world = fixed_parent < 0
-        parent_index = np.where(from_world, 0, fixed_parent)
-        # Weld outward from the world, one fixed joint per pass, until the set stops growing.
-        while True:
-            anchored = from_world | welded[parent_index]
-            grown = eligible & (np.bincount(fixed_child[anchored], minlength=self.body_count) == self.parent_joints)
-            if np.array_equal(grown, welded):
-                return welded
-            welded = grown
-
-    def immobile_shapes(self, welded: np.ndarray) -> np.ndarray:
-        """Return a host mask of the static shapes and the shapes of ``welded`` bodies."""
-        immobile = self.shape_body < 0
-        on_body = ~immobile
-        immobile[on_body] = welded[self.shape_body[on_body]]
-        return immobile
-
-
 @wp.struct
 class ContactWriterData:
     """Contact writer data for collide write_contact function."""
@@ -3466,6 +3401,70 @@ class CollisionPipeline:
             device=model.device,
         )
 
+    class _WeldTopology:
+        """Host copy of the joint topology that welds bodies to the world.
+
+        A body is welded when it has a parent joint and every joint that names it as the
+        child is a fixed joint from the world or from another welded body, so it has no
+        degree of freedom of its own. A shape is structurally immobile when it is static or
+        belongs to a welded body. Joints and shape ownership are fixed once a model is
+        finalized and are read here once; body flags and joint enables are runtime state,
+        read on each :meth:`welded_bodies` call that passes the model.
+        """
+
+        def __init__(self, model: Model):
+            self.body_count = int(model.body_count)
+            empty = np.empty(0, dtype=np.int32)
+            self.shape_body = model.shape_body.numpy() if model.shape_count else empty
+            has_joints = self.body_count > 0 and int(model.joint_count) > 0
+            joint_type = model.joint_type.numpy() if has_joints else empty
+            parent = model.joint_parent.numpy() if has_joints else empty
+            child = model.joint_child.numpy() if has_joints else empty
+            attached = (child >= 0) & (child < self.body_count)
+            self.fixed_joints = np.flatnonzero(attached & (joint_type == int(JointType.FIXED)))
+            self.fixed_parent = parent[self.fixed_joints]
+            self.fixed_child = child[self.fixed_joints]
+            self.parent_joints = np.bincount(child[attached], minlength=self.body_count)
+
+        def welded_bodies(self, model: Model | None) -> np.ndarray:
+            """Return a host mask of the welded bodies.
+
+            Args:
+                model: The model whose current :attr:`~newton.Model.joint_enabled` and
+                    :attr:`~newton.Model.body_flags` apply: a disabled joint does not weld,
+                    and only a dynamic body welds, because the user can move a kinematic
+                    body and everything welded to it. ``None`` ignores both, which bounds
+                    the welded set over every state they can take.
+            """
+            fixed_parent, fixed_child = self.fixed_parent, self.fixed_child
+            eligible = self.parent_joints > 0
+            if model is not None:
+                if model.joint_enabled is not None and len(self.fixed_joints):
+                    enabled = model.joint_enabled.numpy()[self.fixed_joints].astype(bool)
+                    fixed_parent, fixed_child = fixed_parent[enabled], fixed_child[enabled]
+                if model.body_flags is not None and self.body_count:
+                    flags = model.body_flags.numpy()
+                    eligible &= ((flags & int(BodyFlags.DYNAMIC)) != 0) & ((flags & int(BodyFlags.KINEMATIC)) == 0)
+            # Every parent joint must weld; a body with another parent joint keeps its freedom.
+            eligible &= np.bincount(fixed_child, minlength=self.body_count) == self.parent_joints
+            welded = np.zeros(self.body_count, dtype=bool)
+            from_world = fixed_parent < 0
+            parent_index = np.where(from_world, 0, fixed_parent)
+            # Weld outward from the world, one fixed joint per pass, until the set stops growing.
+            while True:
+                anchored = from_world | welded[parent_index]
+                grown = eligible & (np.bincount(fixed_child[anchored], minlength=self.body_count) == self.parent_joints)
+                if np.array_equal(grown, welded):
+                    return welded
+                welded = grown
+
+        def immobile_shapes(self, welded: np.ndarray) -> np.ndarray:
+            """Return a host mask of the static shapes and the shapes of ``welded`` bodies."""
+            immobile = self.shape_body < 0
+            on_body = ~immobile
+            immobile[on_body] = welded[self.shape_body[on_body]]
+            return immobile
+
     def _configure_immobile_pairs(self, model: Model, requested: bool, source: str) -> None:
         """Decide once, at construction, whether the broad phase drops pairs of structurally immobile shapes.
 
@@ -3475,7 +3474,7 @@ class CollisionPipeline:
         ``"sap"``, from the model's pair list, which applies the same world, group and
         filter-pair rules as those broad phases.
         """
-        self._weld_topology = topology = _WeldTopology(model)
+        self._weld_topology = topology = self._WeldTopology(model)
         self._colliding_shapes = _shape_collide_mask(model, len(topology.shape_body))
         self._immobile_shape_body = None
         self._no_body_flags = None
