@@ -900,9 +900,17 @@ def test_graph_replays_template_broad_phase(test, device):
 
 
 @contextlib.contextmanager
-def _host_reads_while_capturing(device):
-    """Record the device reads and synchronizations made while ``device`` captures a graph."""
+def _recorded_while_capturing(device):
+    """Record host reads, synchronizations and template-launch allocations made while ``device`` captures a graph.
+
+    Reads and synchronizations are seen through the ``wp.*`` entry points Newton calls:
+    ``wp.array.numpy()`` (which ``list()`` and ``str()`` read through) and ``wp.synchronize()``,
+    ``synchronize_device()``, ``synchronize_stream()`` and ``synchronize_event()``. A call into
+    ``warp._src`` that bypasses them is not seen. Inside :meth:`BroadPhaseExplicitTemplates.launch`,
+    every Warp array that allocates memory is recorded too.
+    """
     calls = []
+    template_launches = []
 
     def recorded(name, function):
         def call(*args, **kwargs):
@@ -912,10 +920,28 @@ def _host_reads_while_capturing(device):
 
         return call
 
+    array_init = wp.array.__init__
+    template_launch = BroadPhaseExplicitTemplates.launch
+
+    def init(array, *args, **kwargs):
+        array_init(array, *args, **kwargs)
+        # Arrays that own their memory carry its deleter; views and wrapped pointers do not.
+        if template_launches and device.is_capturing and array.deleter is not None:
+            calls.append(f"allocation in the template launch, shape {array.shape}")
+
+    def launch(layout, *args, **kwargs):
+        template_launches.append(layout)
+        try:
+            return template_launch(layout, *args, **kwargs)
+        finally:
+            template_launches.pop()
+
     with contextlib.ExitStack() as stack:
         stack.enter_context(mock.patch.object(wp.array, "numpy", recorded("numpy", wp.array.numpy)))
-        for name in ("synchronize", "synchronize_device", "synchronize_stream"):
+        for name in ("synchronize", "synchronize_device", "synchronize_stream", "synchronize_event"):
             stack.enter_context(mock.patch.object(wp, name, recorded(name, getattr(wp, name))))
+        stack.enter_context(mock.patch.object(wp.array, "__init__", init))
+        stack.enter_context(mock.patch.object(BroadPhaseExplicitTemplates, "launch", launch))
         yield calls
 
 
@@ -923,7 +949,8 @@ def test_first_captured_collide_matches_eager(test, device):
     """Capture a pipeline's first collide(), templates on and off, and replay it like eager runs on live state.
 
     Each broad-phase mode is captured without a warm-up and reads nothing back from the device
-    inside the capture; the world templates are verified and uploaded when the pipeline is built.
+    inside the capture; the world templates are verified and uploaded when the pipeline is built,
+    so the captured template launch allocates nothing.
     """
     model = _finalize(_replicated_builder(), device)
     for broad_phase, setting in itertools.product(("explicit", "nxn", "sap"), ("1", "0")):
@@ -941,9 +968,9 @@ def test_first_captured_collide_matches_eager(test, device):
             if templated:
                 test.assertIsNotNone(captured._pair_templates.data)
             contacts = captured.contacts()
-            with _host_reads_while_capturing(wp.get_device(device)) as reads:
+            with _recorded_while_capturing(wp.get_device(device)) as recorded:
                 graph, launches = _launched(functools.partial(_capture_collide, captured, state, contacts))
-            test.assertEqual(reads, [])
+            test.assertEqual(recorded, [])
             test.assertEqual(
                 launches, {"templates": int(templated), "flat": int(broad_phase == "explicit" and not templated)}
             )
