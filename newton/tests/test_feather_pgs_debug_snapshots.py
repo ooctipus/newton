@@ -170,12 +170,14 @@ def _signature(array):
     return (tuple(array.shape), array.dtype, str(array.device))
 
 
-def _rollout(model, *, snapshots, steps=6, **solver_kwargs):
+def _rollout(model, *, snapshots, steps=6, record_values=False, **solver_kwargs):
     """Step eagerly through the collision pipeline, recording every copy and kernel launch per step.
 
     Returns the solver, the states after each step, and per step the copies
-    (destination, source, the source's values when the destination is a
-    snapshot) and the launched kernel keys.
+    (destination, source and, with ``record_values``, the source's values when
+    the destination is a snapshot) and the launched kernel keys. Reading the
+    values synchronizes a CUDA device inside the step, so only the test that
+    compares them asks for them.
     """
     with _snapshot_flag(snapshots):
         solver = SolverFeatherPGS(model, **solver_kwargs)
@@ -195,7 +197,7 @@ def _rollout(model, *, snapshots, steps=6, **solver_kwargs):
         if reading:
             return result  # a CUDA array's numpy() below copies to the host through wp.copy
         values = None
-        if _is_snapshot(solver, dest):
+        if record_values and _is_snapshot(solver, dest):
             reading = True
             try:
                 values = src.numpy().copy()
@@ -274,7 +276,7 @@ def test_opt_in_keeps_snapshot_attributes(test, device):
     model = _scene(device)
     for label, options in _configurations(device).items():
         with test.subTest(configuration=label):
-            run = _rollout(model, snapshots=True, **options)
+            run = _rollout(model, snapshots=True, record_values=True, **options)
             solver = run["solver"]
             for name in SNAPSHOTS:
                 snapshot = getattr(solver, name)
@@ -403,26 +405,33 @@ class TestFeatherPGSDebugSnapshots(unittest.TestCase):
 
 
 def _graph_node_types(graph):
-    """Count a captured CUDA graph's top-level nodes by driver node type, or None without a driver query."""
+    """Count a captured CUDA graph's top-level nodes by driver node type.
+
+    Returns the counts, or a message saying why the driver query failed.
+    """
     try:
         library = ctypes.CDLL("nvcuda.dll" if sys.platform == "win32" else "libcuda.so.1")
         get_nodes, get_type = library.cuGraphGetNodes, library.cuGraphNodeGetType
-    except (OSError, AttributeError):
-        return None
+    except (OSError, AttributeError) as error:
+        return f"no cuGraphGetNodes query: {error}"
     get_nodes.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_size_t)]
     get_type.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
     get_nodes.restype = get_type.restype = ctypes.c_int
     count = ctypes.c_size_t()
-    if get_nodes(graph.graph, None, ctypes.byref(count)) != 0:
-        return None
+    result = get_nodes(graph.graph, None, ctypes.byref(count))
+    if result != 0:
+        return f"cuGraphGetNodes returned CUresult {result}"
     nodes = (ctypes.c_void_p * count.value)()
-    if count.value and get_nodes(graph.graph, nodes, ctypes.byref(count)) != 0:
-        return None
+    if count.value:
+        result = get_nodes(graph.graph, nodes, ctypes.byref(count))
+        if result != 0:
+            return f"cuGraphGetNodes returned CUresult {result}"
     types = {}
     for node in nodes[: count.value]:
         kind = ctypes.c_int()
-        if get_type(node, ctypes.byref(kind)) != 0:
-            return None
+        result = get_type(node, ctypes.byref(kind))
+        if result != 0:
+            return f"cuGraphNodeGetType returned CUresult {result}"
         types[kind.value] = types.get(kind.value, 0) + 1
     return types
 
@@ -497,14 +506,18 @@ class TestFeatherPGSDebugSnapshotsGraph(unittest.TestCase):
                         if not _is_snapshot(on["solver"], dest)
                     ]
                     self.assertEqual([(_signature(dest), _signature(src)) for dest, src in off_copies], kept)
+                for name, values in off["final"].items():
+                    _assert_same(self, device, on["final"][name], values, name)
+                failed = [types for types in off["node_types"] + on["node_types"] if isinstance(types, str)]
+                if failed:
+                    # Warp found the driver, so on Linux libcuda.so.1 is loaded: a failed query is a bug here.
+                    if sys.platform.startswith("linux"):
+                        self.fail(failed[0])
+                    self.skipTest(f"memcpy node counts not checked: {failed[0]}")
                 for off_types, on_types in zip(off["node_types"], on["node_types"], strict=True):
-                    if off_types is None or on_types is None:
-                        continue  # no driver query: the captured-copy spy above still applies
                     self.assertEqual(on_types.get(MEMCPY_NODE, 0) - off_types.get(MEMCPY_NODE, 0), len(SNAPSHOTS))
                     for kind in (KERNEL_NODE, MEMSET_NODE):
                         self.assertEqual(on_types.get(kind, 0), off_types.get(kind, 0), kind)
-                for name, values in off["final"].items():
-                    _assert_same(self, device, on["final"][name], values, name)
 
 
 for _device in get_test_devices():
