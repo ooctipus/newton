@@ -20,6 +20,7 @@ from .row_metadata import (
     _mf_parent_expression,
     _validate_dense_metadata_encoding,
 )
+from .velocity_limit_law import accumulated_update, check_velocity_limit_law
 
 
 @dataclass(frozen=True)
@@ -57,16 +58,23 @@ def get_source(
     held_policy: tuple[str, str, str] | None = None,
     shared_arena: bool = False,
     cpu_body: str = "",
+    velocity_limit_law: str = "stateless",
 ) -> GeneratedSource:
     """Build the shared recurrence with explicit physical or held bindings.
 
     ``resident_row_metadata`` keeps the packed dense row types and parents
     resident in a streamed-metadata (``shared_metadata=False``) source.
+
+    ``velocity_limit_law`` selects how every visit of a velocity-limit row projects it
+    (:mod:`.velocity_limit_law`): the end-of-iteration dense and matrix-free passes and
+    the dense rows of a velocity-limit row phase. The stateless law keeps the source
+    byte-identical.
     """
     if resident_row_metadata and shared_metadata:
         raise ValueError("resident_row_metadata applies to streamed metadata (shared_metadata=False)")
     if resident_row_metadata and dense_support_tiles:
         raise ValueError("resident_row_metadata does not apply to dense support tiles, whose row metadata streams")
+    accumulated_limits = check_velocity_limit_law(velocity_limit_law) == "accumulated"
     if fuse_vel_limits and not has_drive_rows:
         raise ValueError("fuse_vel_limits requires has_drive_rows")
     if stage_velocities and not dense_support_tiles:
@@ -1177,6 +1185,83 @@ def get_source(
                 continue;
             }"""
     )
+    # Every visit of a velocity-limit row: the end-of-iteration dense and free-body passes, the
+    # dense rows of a velocity-limit row phase (row_phase 5), and the contact loop's free-body
+    # branch, which the contact-first row order never reaches.
+    if accumulated_limits:
+        # Lane 0 owns a dense total, as it owns the scalar dense rows' impulses.
+        dense_velocity_limit_law = (
+            "                const float old_vlim = __shfl_sync(MASK, lane == 0 ? s_lam_dense[i] : 0.0f, 0);\n"
+            + accumulated_update(
+                "old_vlim",
+                "residual_vlim / denom",
+                new="new_vlim",
+                delta="delta_impulse_vlim",
+                indent=" " * 16,
+                declare="float ",
+            )
+            + "                __syncwarp();\n"
+            + "                if (lane == 0) s_lam_dense[i] = new_vlim;"
+        )
+        # Every lane reads a free-body total before lane 0 stores the new one: a plain read stays
+        # warp-uniform when streamed impulses rewrite it into a lane-0 broadcast.
+        mf_velocity_limit_law = (
+            "                const float old_mf_vlim = s_lam_mf[i];\n"
+            + accumulated_update(
+                "old_mf_vlim",
+                "residual_mf_vlim * mf_diag",
+                new="new_mf_vlim",
+                delta="delta_impulse_mf_vlim",
+                indent=" " * 16,
+                declare="float ",
+            )
+            + "                __syncwarp();\n"
+            + "                if (lane == 0) s_lam_mf[i] = new_mf_vlim;"
+        )
+        dense_velocity_limit_row = (
+            "            // row_type 4=JOINT_VELOCITY_LIMIT: an accumulated unilateral row,\n"
+            "            // unrelaxed, as in the end-of-iteration velocity-limit pass.\n"
+            "            else if (row_type == 4) {\n"
+            + accumulated_update(
+                "old_impulse", "residual / denom", new="new_impulse", delta="delta_impulse", indent=" " * 16
+            )
+            + "            }"
+        )
+        mf_velocity_limit_row = accumulated_update(
+            "old_impulse", "residual * mf_diag", new="new_impulse", delta="delta_impulse", indent=" " * 16
+        ).rstrip("\n")
+    else:
+        dense_velocity_limit_law = """                float delta_vlim = -residual_vlim / denom;
+                float delta_impulse_vlim = 0.0f;
+                if (residual_vlim < 0.0f) delta_impulse_vlim = delta_vlim;
+                if (lane == 0) s_lam_dense[i] = delta_impulse_vlim;"""
+        mf_velocity_limit_law = """                float delta_mf_vlim = -residual_mf_vlim * mf_diag;
+                float delta_impulse_mf_vlim = 0.0f;
+                if (residual_mf_vlim < 0.0f) delta_impulse_mf_vlim = delta_mf_vlim;
+                if (lane == 0) s_lam_mf[i] = delta_impulse_mf_vlim;"""
+        dense_velocity_limit_row = """            // row_type 4=JOINT_VELOCITY_LIMIT:
+            // PhysX-style stateless bilateral speed projection. The row
+            // uses a signed Jacobian and target velocity so residual < 0
+            // means that side of the velocity box is currently violated.
+            // Do not accumulate lambda: each visit recomputes jointV and
+            // applies only the impulse needed for the current overshoot.
+            else if (row_type == 4) {
+                if (residual < 0.0f) {
+                    // PhysX applies the clamp delta directly; it is not
+                    // a relaxed PGS correction.
+                    delta_impulse = delta;
+                    new_impulse = delta_impulse;
+                } else {
+                    new_impulse = 0.0f;
+                }
+            }"""
+        mf_velocity_limit_row = """                if (residual < 0.0f) {
+                    delta_impulse = delta;
+                    new_impulse = delta_impulse;
+                } else {
+                    delta_impulse = 0.0f;
+                    new_impulse = 0.0f;
+                }"""
     dense_velocity_limit_phase = (
         f"""
         if (row_phase == 0 || row_phase == 2) {{
@@ -1198,10 +1283,7 @@ def get_source(
                 float jv_vlim = __shfl_sync(MASK, my_sum_vlim, 0);
 
                 float residual_vlim = jv_vlim + s_rhs_dense[i];
-                float delta_vlim = -residual_vlim / denom;
-                float delta_impulse_vlim = 0.0f;
-                if (residual_vlim < 0.0f) delta_impulse_vlim = delta_vlim;
-                if (lane == 0) s_lam_dense[i] = delta_impulse_vlim;
+{dense_velocity_limit_law}
 
                 if (delta_impulse_vlim != 0.0f) {{
                     iteration_changed = 1;
@@ -1388,13 +1470,7 @@ def get_source(
             if (mf_rt == 0) {{
                 if (new_impulse < 0.0f) new_impulse = 0.0f;
             }} else if (mf_rt == 4) {{
-                if (residual < 0.0f) {{
-                    delta_impulse = delta;
-                    new_impulse = delta_impulse;
-                }} else {{
-                    delta_impulse = 0.0f;
-                    new_impulse = 0.0f;
-                }}
+{mf_velocity_limit_row}
             }} else if (mf_rt == 2) {{
                 {mf_friction_block}
             }}
@@ -1453,10 +1529,7 @@ def get_source(
                 float jv_mf_vlim = __shfl_sync(MASK, my_sum_mf_vlim, 0);
 
                 float residual_mf_vlim = jv_mf_vlim + __int_as_float(meta.z);
-                float delta_mf_vlim = -residual_mf_vlim * mf_diag;
-                float delta_impulse_mf_vlim = 0.0f;
-                if (residual_mf_vlim < 0.0f) delta_impulse_mf_vlim = delta_mf_vlim;
-                if (lane == 0) s_lam_mf[i] = delta_impulse_mf_vlim;
+{mf_velocity_limit_law}
 
                 if (delta_impulse_mf_vlim != 0.0f) {{
                     iteration_changed = 1;
@@ -1632,22 +1705,7 @@ def get_source(
             // computeDriveImpulse(lambda, jointVel, jointDeltaPos=0,
             // elapsedTime=0, driveDesc), then clamp to maxForce * dt.
 {drive_projection}
-            // row_type 4=JOINT_VELOCITY_LIMIT:
-            // PhysX-style stateless bilateral speed projection. The row
-            // uses a signed Jacobian and target velocity so residual < 0
-            // means that side of the velocity box is currently violated.
-            // Do not accumulate lambda: each visit recomputes jointV and
-            // applies only the impulse needed for the current overshoot.
-            else if (row_type == 4) {{
-                if (residual < 0.0f) {{
-                    // PhysX applies the clamp delta directly; it is not
-                    // a relaxed PGS correction.
-                    delta_impulse = delta;
-                    new_impulse = delta_impulse;
-                }} else {{
-                    new_impulse = 0.0f;
-                }}
-            }}
+{dense_velocity_limit_row}
             // row_type 0=CONTACT, 3=JOINT_LIMIT: unilateral lambda >= 0
             // projector with accumulated impulse.
             else if (row_type == 0 || row_type == 3) {{

@@ -18,6 +18,7 @@ import json
 import math
 import os
 import sys
+import textwrap
 import time
 import warnings
 from contextlib import contextmanager
@@ -274,6 +275,7 @@ from .sparse_pgs import (
     _SPARSE_LOCAL_WORKSPACE_BYTES,
     _get_pgs_solve_sparse_kernel,
 )
+from .velocity_limit_law import accumulated_update, check_velocity_limit_law, velocity_limit_law_suffix
 
 # --- env-gated capture of pgs_solve_mf_gs kernel inputs, for standalone replay/bench ---
 # Off unless FEATHER_PGS_CAPTURE_KERNEL=1. Snapshots the dominant FPGS contact-solve
@@ -21877,6 +21879,19 @@ _FVL_LAST_WORD_CLAMP_SNIPPET = """\
 """
 
 
+# The phase-5 velocity-limit row of the propagation full-iteration kernel under the stateless
+# law (PhysX's clamp), dense and matrix-free; substituted at //VLIM_DENSE_LAW and //VLIM_MF_LAW.
+_PROPAGATION_STATELESS_VELOCITY_LIMIT = """\
+if (residual < 0.0f) {
+    delta_impulse = delta;
+    new_impulse = delta_impulse;
+} else {
+    delta_impulse = 0.0f;
+    new_impulse = 0.0f;
+}
+"""
+
+
 @cache
 def _get_pgs_solve_propagation_full_iteration_kernel(
     max_constraints: int,
@@ -21888,6 +21903,8 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
     device_arch: str,
     worlds_per_block: int = 1,
     fuse_vel_limits: bool = False,
+    *,
+    velocity_limit_law: str = "stateless",
 ) -> "wp.Kernel":
     """Build a block-per-world kernel that fuses the whole propagation GS iteration.
 
@@ -21905,8 +21922,13 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
     ``drive_vel_limit`` array, a (1, 1) dummy when the feature is off — and
     the flag only gates the clamp code emission, so the generated source with
     the flag off stays byte-identical to before the feature existed.
+
+    ``velocity_limit_law`` selects the law of the phase-5 velocity-limit rows,
+    dense and matrix-free, as in :func:`_get_pgs_solve_mf_gs_kernel`; the
+    stateless default keeps the generated source byte-identical.
     """
 
+    accumulated_limits = check_velocity_limit_law(velocity_limit_law) == "accumulated"
     M_D = max_constraints
     M_MF = mf_max_constraints
     D = max_world_dofs
@@ -22061,13 +22083,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                     if (new_impulse < -max_imp) new_impulse = -max_imp;
                     delta_impulse = new_impulse - old_impulse;
                 } else if (row_type == 4) {
-                    if (residual < 0.0f) {
-                        delta_impulse = delta;
-                        new_impulse = delta_impulse;
-                    } else {
-                        delta_impulse = 0.0f;
-                        new_impulse = 0.0f;
-                    }
+//VLIM_DENSE_LAW
                 } else if (row_type == 0 || row_type == 3) {
                     if (new_impulse < 0.0f) new_impulse = 0.0f;
                     delta_impulse = new_impulse - old_impulse;
@@ -22194,13 +22210,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
                     if (mf_rt == 0) {
                         if (new_impulse < 0.0f) new_impulse = 0.0f;
                     } else if (mf_rt == 4) {
-                        if (residual < 0.0f) {
-                            delta_impulse = delta;
-                            new_impulse = delta_impulse;
-                        } else {
-                            delta_impulse = 0.0f;
-                            new_impulse = 0.0f;
-                        }
+//VLIM_MF_LAW
                     } else if (mf_rt == 2) {
                         int mf_par = packed_tp >> 16;
                         if (i != mf_par + 1) {
@@ -22685,6 +22695,24 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
     for marker, code in fvl_subs.items():
         assert snippet.count(marker) == 1
         snippet = snippet.replace(marker, code)
+    # Phase-5 velocity-limit rows, dense and matrix-free.
+    if accumulated_limits:
+        vlim_subs = {
+            "//VLIM_DENSE_LAW\n": accumulated_update(
+                "old_impulse", "residual / denom", new="new_impulse", delta="delta_impulse", indent=" " * 20
+            ),
+            "//VLIM_MF_LAW\n": accumulated_update(
+                "old_impulse", "residual * mf_diag", new="new_impulse", delta="delta_impulse", indent=" " * 24
+            ),
+        }
+    else:
+        vlim_subs = {
+            "//VLIM_DENSE_LAW\n": textwrap.indent(_PROPAGATION_STATELESS_VELOCITY_LIMIT, " " * 20),
+            "//VLIM_MF_LAW\n": textwrap.indent(_PROPAGATION_STATELESS_VELOCITY_LIMIT, " " * 24),
+        }
+    for marker, code in vlim_subs.items():
+        assert snippet.count(marker) == 1
+        snippet = snippet.replace(marker, code)
 
     replacements = {
         "__M_D__": str(M_D),
@@ -22941,6 +22969,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
     name = f"pgs_solve_propagation_full_iteration_{M_D}_{M_MF}_{D}_{M_PROP}_{B_PROP}_{target_size}_w{max(int(worlds_per_block), 1)}"
     if fuse_vel_limits:
         name += "_fvl"
+    name += velocity_limit_law_suffix(velocity_limit_law)
     pgs_solve_propagation_full_iteration_template.__name__ = name
     pgs_solve_propagation_full_iteration_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_propagation_full_iteration_template)
@@ -27055,6 +27084,7 @@ def _get_pgs_solve_mf_gs_kernel(
     independent_components: bool = False,
     dense_support_tiles: bool = False,
     stage_velocities: bool = False,
+    velocity_limit_law: str = "stateless",
 ) -> "wp.Kernel":
     """Two-phase GS PGS kernel: dense + matrix-free in one pass.
 
@@ -27103,6 +27133,11 @@ def _get_pgs_solve_mf_gs_kernel(
     additionally restricts velocity staging to their world union; otherwise the
     world mask is ignored and full world-velocity staging is retained.
     The legacy kernel signature and projector mathematics remain unchanged.
+
+    ``velocity_limit_law="accumulated"`` projects every visit of a dense or
+    matrix-free velocity-limit row as an accumulated unilateral row
+    (:mod:`.velocity_limit_law`); the name gains ``_vacc``. The stateless default
+    keeps the generated source byte-identical.
     """
     from .mf_gs_source import get_source  # noqa: PLC0415
 
@@ -27128,6 +27163,7 @@ def _get_pgs_solve_mf_gs_kernel(
         independent_components=independent_components,
         dense_support_tiles=dense_support_tiles,
         stage_velocities=stage_velocities,
+        velocity_limit_law=velocity_limit_law,
     ).native
 
     from .mf_dispatch import make_dispatch, make_native  # noqa: PLC0415
@@ -27297,6 +27333,7 @@ def _get_pgs_solve_mf_gs_kernel(
     name = (
         f"pgs_solve_mf_gs_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_{friction_mode}"
         f"_drive{int(has_drive_rows)}_densevlim{int(has_dense_velocity_limit_rows)}"
+        + velocity_limit_law_suffix(velocity_limit_law)
     )
     if fuse_vel_limits:
         name += "_fvl"
@@ -27344,6 +27381,7 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
     has_dense_velocity_limit_rows: bool = True,
     skip_local_internal_worlds: bool = False,
     min_rows: int = 0,
+    velocity_limit_law: str = "stateless",
 ) -> "wp.Kernel":
     """Incremental-residual Gauss-Seidel for worlds with only dense articulated rows.
 
@@ -27361,9 +27399,11 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
     generalized velocity is reconstructed once after the sweeps from the impulses that
     were applied. Row semantics (types, phases, friction gating, regularization, PhysX
     drive and velocity-limit projections, stationary-sweep exit) follow the legacy
-    kernel; only the order of floating-point operations differs.
+    kernel; only the order of floating-point operations differs. ``velocity_limit_law``
+    selects the velocity-limit rows' law as in the legacy kernel.
     """
     _validate_dense_metadata_encoding(max_constraints)
+    accumulated_limits = check_velocity_limit_law(velocity_limit_law) == "accumulated"
     M_D = max_constraints
     D = max_world_dofs
     AM = int(incremental_rows)
@@ -27419,17 +27459,40 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
     )
     # Type-1 rows are skipped when the drive model does not produce PhysX rows.
     drive_row_admit = "1" if has_drive_rows else "(row_type != 1)"
+    if accumulated_limits:
+        vlim_law = "                const float old_vlim = s_lam[i];\n" + accumulated_update(
+            "old_vlim",
+            "residual_vlim * s_inv_diag[i]",
+            new="new_vlim",
+            delta="delta_impulse_vlim",
+            indent=" " * 16,
+            declare="float ",
+        ).rstrip("\n")
+        vlim_stored = "new_vlim"
+        # A velocity-limit row phase (row_phase 5) visits its rows in the main loop with the same law.
+        vlim_main = accumulated_update(
+            "old_impulse", "residual * s_inv_diag[i]", new="new_impulse", delta="delta_impulse", indent=" " * 20
+        ).rstrip("\n")
+    else:
+        vlim_law = """                float delta_impulse_vlim = 0.0f;
+                if (residual_vlim < 0.0f) delta_impulse_vlim = -residual_vlim * s_inv_diag[i];"""
+        vlim_stored = "delta_impulse_vlim"
+        vlim_main = """                    if (residual < 0.0f) {
+                        delta_impulse = delta;
+                        new_impulse = delta_impulse;
+                    } else {
+                        new_impulse = 0.0f;
+                    }"""
     vlim_pass = (
         f"""
         if (row_phase == 0 || row_phase == 2) {{
             for (int k = 0; k < n_vlim; k++) {{
                 const int i = s_vlim_rows[k];
                 const float residual_vlim = s_res[i];
-                float delta_impulse_vlim = 0.0f;
-                if (residual_vlim < 0.0f) delta_impulse_vlim = -residual_vlim * s_inv_diag[i];
+{vlim_law}
                 __syncwarp();
                 if (lane == 0) {{
-                    s_lam[i] = delta_impulse_vlim;
+                    s_lam[i] = {vlim_stored};
                     s_app[i] += delta_impulse_vlim;
                 }}
                 if (delta_impulse_vlim != 0.0f) {{
@@ -27620,12 +27683,7 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
                     }}
                     delta_impulse = new_impulse - old_impulse;
                 }} else if (kind == 2) {{
-                    if (residual < 0.0f) {{
-                        delta_impulse = delta;
-                        new_impulse = delta_impulse;
-                    }} else {{
-                        new_impulse = 0.0f;
-                    }}{drive_kind_case}
+{vlim_main}{drive_kind_case}
                 }} else {{
                     delta_impulse = new_impulse - old_impulse;
                 }}
@@ -27833,6 +27891,7 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
     name = (
         f"pgs_solve_mf_gs_incremental_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_rows{AM}_min{MIN_ROWS}"
         f"_drive{int(has_drive_rows)}_densevlim{int(has_dense_velocity_limit_rows)}"
+        + velocity_limit_law_suffix(velocity_limit_law)
     )
     if skip_local_internal_worlds:
         name += "_local_fallback"

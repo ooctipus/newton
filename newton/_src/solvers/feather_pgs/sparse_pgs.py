@@ -15,6 +15,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
 from .sparse_mass_matrix import _SparseRowSupport
+from .velocity_limit_law import accumulated_impulse, accumulated_update, check_velocity_limit_law
 
 _SPARSE_CONTACT_METRIC_CACHE_SIZE = 12
 _SPARSE_LOCAL_WORKSPACE_BYTES = 8 * 1024
@@ -36,6 +37,7 @@ def _get_pgs_solve_sparse_kernel(
     local_factors: bool = False,
     warm_start: bool = False,
     linked_rows: bool = False,
+    velocity_limit_law: str = "stateless",
 ) -> wp.Kernel:
     """Build a CUDA sweep over factored articulations and physical free bodies.
 
@@ -94,6 +96,13 @@ def _get_pgs_solve_sparse_kernel(
     contact impulses act on the velocity exactly as the ordinary route
     installs them in ``v_out``. Velocity-limit rows stay stateless. It
     requires no independent free-body rows.
+
+    ``velocity_limit_law="accumulated"`` makes the final velocity-limit pass
+    and independent free-body velocity-limit rows accumulate unrelaxed
+    unilateral impulses (:mod:`.velocity_limit_law`); velocity-limit rows enter
+    every solve with zero impulse, so warm starting still seeds none of them.
+    The stateless default keeps the generated source byte-identical, and a
+    sweep without velocity-limit rows ignores the law.
     """
     M, D, S = int(max_constraints), int(max_world_dofs), int(max_row_dofs)
     F = int(mf_max_constraints)
@@ -113,6 +122,8 @@ def _get_pgs_solve_sparse_kernel(
         raise ValueError("local factor storage requires a small complete articulated sweep")
     if warm_start and F:
         raise ValueError("sparse warm starting requires no independent free-body rows")
+    # Only a sweep that can hold velocity-limit rows has a law to choose; the others share one variant.
+    accumulated_limits = check_velocity_limit_law(velocity_limit_law) == "accumulated" and bool(velocity_limits or F)
     index_read = (
         f"support.class_dof.data[support.row_class.data[offset + row] * {S} + entry]"
         if use_support_table
@@ -238,6 +249,16 @@ def _get_pgs_solve_sparse_kernel(
                 pending &= pending - 1u;"""
         row_loop_end = "            }\n        }"
     mf_storage = mf_initialize = mf_sweep = mf_writeback = ""
+    if accumulated_limits:
+        free_velocity_limit = (
+            "                // Velocity limits accumulate an unrelaxed unilateral impulse.\n"
+            f"                new_impulse = {accumulated_impulse('old_impulse', 'residual * inverse_diagonal')};"
+        )
+        free_change = "const float change = new_impulse - old_impulse;"
+    else:
+        free_velocity_limit = """                // Velocity limits apply a stateless, unrelaxed correction.
+                new_impulse = residual < 0.0f ? -residual * inverse_diagonal : 0.0f;"""
+        free_change = f"const float change = kind == {velocity_limit_type} ? new_impulse : new_impulse - old_impulse;"
     if F:
         mf_storage = f"""
     __shared__ float mf_impulse_storage[{W * F}];
@@ -355,13 +376,12 @@ def _get_pgs_solve_sparse_kernel(
                 sibling_change = new_sibling - old_sibling;
                 if (lane == 0) mf_impulse[sibling] = new_sibling;
             }} else if (kind == {velocity_limit_type}) {{
-                // Velocity limits apply a stateless, unrelaxed correction.
-                new_impulse = residual < 0.0f ? -residual * inverse_diagonal : 0.0f;
+{free_velocity_limit}
             }} else {{
                 new_impulse = old_impulse - omega * residual * inverse_diagonal;
                 if (kind == {contact_type}) new_impulse = fmaxf(new_impulse, 0.0f);
             }}
-            const float change = kind == {velocity_limit_type} ? new_impulse : new_impulse - old_impulse;
+            {free_change}
             if (lane == 0) mf_impulse[row] = new_impulse;
             if (change != 0.0f || sibling_change != 0.0f) {{
                 if (!(fabsf(change) <= change_tolerance + relative_change_tolerance * fabsf(new_impulse)
@@ -443,6 +463,25 @@ def _get_pgs_solve_sparse_kernel(
         velocity_filter = f"""
             if (row_type == {velocity_limit_type}) continue;
 """
+        if accumulated_limits:
+            final_velocity_limit = (
+                "            // An accumulated total: its change applies to the delta.\n"
+                "            const float old_vlim = impulse[row];\n"
+                + accumulated_update(
+                    "old_vlim",
+                    "residual / denominator",
+                    new="new_vlim",
+                    delta="correction",
+                    indent=" " * 12,
+                    declare="const float ",
+                )
+                + "            __syncwarp(MASK);\n"
+                + "            if (lane == 0) impulse[row] = new_vlim;"
+            )
+        else:
+            final_velocity_limit = """            // Limits report this correction without undoing earlier ones.
+            const float correction = residual < 0.0f ? -residual / denominator : 0.0f;
+            if (lane == 0) impulse[row] = correction;"""
         velocity_sweep = f"""
         for (int row = 0; row < count; ++row) {{
             if (type[row] != {velocity_limit_type}) continue;
@@ -463,9 +502,7 @@ def _get_pgs_solve_sparse_kernel(
             for (int shift = {L // 2}; shift > 0; shift >>= 1)
                 dot += __shfl_down_sync(MASK, dot, shift, {L});
             const float residual = __shfl_sync(MASK, dot, 0, {L}) + rhs[row];
-            // Limits report this correction without undoing earlier ones.
-            const float correction = residual < 0.0f ? -residual / denominator : 0.0f;
-            if (lane == 0) impulse[row] = correction;
+{final_velocity_limit}
             if (correction != 0.0f) {{
                 if (!(fabsf(correction) <= change_tolerance)) changed = 1;
                 #pragma unroll
@@ -744,6 +781,8 @@ def _get_pgs_solve_sparse_kernel(
         suffix += "_linked"
     if velocity_limits:
         suffix += "_velocity_limits"
+    if accumulated_limits:
+        suffix += "_vacc"
     if L != 32:
         suffix += f"_lanes{L}"
     if local_factors:

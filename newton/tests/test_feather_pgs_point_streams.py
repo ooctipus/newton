@@ -248,6 +248,22 @@ def _sparse_sweep_calls():
             yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, size, kwargs
 
 
+def _accumulated_sparse_calls():
+    """Native sparse sweeps whose velocity-limit rows accumulate (``velocity_limit_law="accumulated"``)."""
+    from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel  # noqa: PLC0415
+
+    factory = _get_pgs_solve_sparse_kernel.__wrapped__
+    # The final pass of articulated limits, and the free-body rows of independent free bodies.
+    for size, (free, velocity) in itertools.product(((32, 8, 8), (48, 18, 12)), (((0, 0), True), ((32, 6), False))):
+        kwargs = {
+            "mf_max_constraints": free[0],
+            "free_row_dofs": free[1],
+            "velocity_limits": velocity,
+            "velocity_limit_law": "accumulated",
+        }
+        yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, size, kwargs
+
+
 def _linked_sweep_calls():
     """Patch-only native sparse sweeps over linked rows (sparse_pgs.py)."""
     from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel  # noqa: PLC0415
@@ -278,6 +294,12 @@ def _sparse_contact_calls():
 
 def _solver_factory_calls():
     from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.response_block_sweep import (  # noqa: PLC0415
+        get_response_block_sweep_lane_kernel as rb_lane,
+    )
+    from newton._src.solvers.feather_pgs.response_block_sweep import (  # noqa: PLC0415
+        get_response_block_sweep_warp_kernel as rb_warp,
+    )
 
     name = "solver_feather_pgs."
     for triples, batches in itertools.product((False, True), repeat=2):
@@ -334,6 +356,37 @@ def _solver_factory_calls():
         }
         factory = solver._get_pgs_solve_mf_gs_kernel.__wrapped__
         yield name + "_get_pgs_solve_mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
+    # The accumulated velocity-limit law of the serial sweeps; the stateless law keeps the pins above.
+    for skip_rows, drives in itertools.product((0, 32), (False, True)):
+        kwargs = {"skip_incremental_rows": skip_rows, "has_drive_rows": drives, "velocity_limit_law": "accumulated"}
+        factory = solver._get_pgs_solve_mf_gs_kernel.__wrapped__
+        yield name + "_get_pgs_solve_mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
+    for tier, drives, local in itertools.product(((32, 0), (64, 32)), *([(False, True)] * 2)):
+        kwargs = {
+            "incremental_rows": tier[0],
+            "min_rows": tier[1],
+            "has_drive_rows": drives,
+            "has_dense_velocity_limit_rows": True,
+            "skip_local_internal_worlds": local,
+            "velocity_limit_law": "accumulated",
+        }
+        factory = solver._get_pgs_solve_mf_gs_incremental_kernel.__wrapped__
+        yield name + "_get_pgs_solve_mf_gs_incremental_kernel", factory, (64, 32, 12, _ARCH), kwargs
+    # The propagation full-iteration kernel and the response-block sweeps, under either law.
+    for fused, accumulated in itertools.product((False, True), repeat=2):
+        kwargs = {"worlds_per_block": 1, "fuse_vel_limits": fused}
+        if accumulated:
+            kwargs["velocity_limit_law"] = "accumulated"
+        factory = solver._get_pgs_solve_propagation_full_iteration_kernel.__wrapped__
+        yield name + "_get_pgs_solve_propagation_full_iteration_kernel", factory, (64, 32, 18, 48, 8, 18, _ARCH), kwargs
+    for rows, accumulated in itertools.product((0, 32, 64), (False, True)):
+        law = {"velocity_limit_law": "accumulated"} if accumulated else {}
+        if rows:
+            kwargs = {"rows": rows, "lane_rows": 16, "has_drive_rows": False, **law}
+            yield "response_block_sweep.get_response_block_sweep_warp_kernel", rb_warp, (64, 32, 18), kwargs
+        else:
+            kwargs = {"lane_rows": 16, "has_drive_rows": False, **law}
+            yield "response_block_sweep.get_response_block_sweep_lane_kernel", rb_lane, (64, 32, 18), kwargs
     for triples, components in itertools.product((False, True), repeat=2):
         factory = solver._get_pgs_solve_paired_factor_kernel.__wrapped__
         yield name + "_get_pgs_solve_paired_factor_kernel", factory, (192, 29, 23, 6, _ARCH, triples, components), {}
@@ -537,6 +590,7 @@ def _factory_kernels():
     kernels = {"row_build_native.get_row_build_native_kernel()": get_row_build_native_kernel()}
     for name, factory, args, kwargs in itertools.chain(
         _sparse_sweep_calls(),
+        _accumulated_sparse_calls(),
         _linked_sweep_calls(),
         _sparse_contact_calls(),
         _solver_factory_calls(),
@@ -685,6 +739,9 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
             "solver_feather_pgs._get_pgs_solve_mf_gs_incremental_kernel",
             "solver_feather_pgs._get_pgs_solve_parallel_kernel",
             "solver_feather_pgs._get_pgs_solve_paired_factor_kernel",
+            "solver_feather_pgs._get_pgs_solve_propagation_full_iteration_kernel",
+            "response_block_sweep.get_response_block_sweep_lane_kernel",
+            "response_block_sweep.get_response_block_sweep_warp_kernel",
             "keyed_rows.get_fallback_kernel",
             "keyed_rows.get_parallel_factory",
             "kernels.allocate_world_contact_slots",
@@ -705,6 +762,19 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
         ):
             with self.subTest(flag=flag):
                 self.assertTrue(any(flag in name for name in sparse))
+        # Every serial sweep family with velocity-limit rows is pinned under the accumulated law too.
+        accumulated = {name.split("(", 1)[0] for name in self.current if "velocity_limit_law='accumulated'" in name}
+        self.assertEqual(
+            accumulated,
+            {
+                "sparse_pgs._get_pgs_solve_sparse_kernel",
+                "solver_feather_pgs._get_pgs_solve_mf_gs_kernel",
+                "solver_feather_pgs._get_pgs_solve_mf_gs_incremental_kernel",
+                "solver_feather_pgs._get_pgs_solve_propagation_full_iteration_kernel",
+                "response_block_sweep.get_response_block_sweep_lane_kernel",
+                "response_block_sweep.get_response_block_sweep_warp_kernel",
+            },
+        )
         # The patch-only linked tiers are pinned beside the point tiers they extend.
         linked = [name for name in self.current if "linked_rows=True" in name]
         self.assertTrue(linked)

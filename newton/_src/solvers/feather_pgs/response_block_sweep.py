@@ -50,6 +50,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PGS_LOCAL_SOLVE_OWNER_GENERAL,
 )
+from .velocity_limit_law import accumulated_update, check_velocity_limit_law, velocity_limit_law_suffix
 
 # Per-row vector slots in the blob (row-major per world, stride RB_STRIDE).
 RB_V_RHS = 0
@@ -517,13 +518,22 @@ def _lane_res_update(RS: int, col: int, delta: str) -> str:
     return " ".join(f"res[{j}] += sA[{_pk(j, col)}][lane] * {delta};" for j in range(RS))
 
 
-def _lane_row_code(i: int, RS: int, has_drive_rows: bool) -> str:
+def _lane_row_code(i: int, RS: int, has_drive_rows: bool, accumulated_limits: bool = False) -> str:
     """Branch-free row update for unified row ``i`` (lane per world, compile-time indices).
 
     Row-uniform flags (``u_*``) are ballots taken once before the sweeps; inside a row every
     lane runs the same straight-line code with per-lane selects, so the shared loads of the
     residual update can be scheduled early and no divergence barriers are emitted.
+    ``accumulated_limits`` projects the velocity-limit rows of a velocity-limit row phase with
+    the accumulated law (:mod:`.velocity_limit_law`).
     """
+    if accumulated_limits:
+        velocity_limit = accumulated_update(
+            "old_impulse", f"residual * ca[{i}]", new="new_impulse", delta="delta_impulse", indent=" " * 16
+        ).rstrip("\n")
+    else:
+        velocity_limit = """                delta_impulse = (residual < 0.0f) ? delta : 0.0f;
+                new_impulse = delta_impulse;"""
     par_first = f"lam[{i - 1}]" if i >= 1 else "0.0f"
     par_second = f"lam[{i - 2}]" if i >= 2 else "0.0f"
     sib_first = i + 1 if i + 1 < RS else None
@@ -578,8 +588,7 @@ def _lane_row_code(i: int, RS: int, has_drive_rows: bool) -> str:
             float new_impulse = (k == {_K_UNI}) ? fmaxf(relaxed, 0.0f) : relaxed;
             float delta_impulse = new_impulse - old_impulse;
             if (k == {_K_VLIM}) {{
-                delta_impulse = (residual < 0.0f) ? delta : 0.0f;
-                new_impulse = delta_impulse;
+{velocity_limit}
             }}{drive}
             float sib_new = 0.0f, sib_delta = 0.0f;
             const bool first = (kind & {_KB_FIRST}) != 0;
@@ -613,14 +622,22 @@ def _lane_row_code(i: int, RS: int, has_drive_rows: bool) -> str:
         }}"""
 
 
-def _lane_vlim_code(i: int, RS: int) -> str:
+def _lane_vlim_code(i: int, RS: int, accumulated_limits: bool = False) -> str:
+    if accumulated_limits:
+        law = accumulated_update(
+            f"lam[{i}]", f"residual * ca[{i}]", new="new_vlim", delta="d", indent=" " * 12, declare="float "
+        ).rstrip("\n")
+        stored = "new_vlim"
+    else:
+        law = f"            float d = (residual < 0.0f) ? -residual * ca[{i}] : 0.0f;"
+        stored = "d"
     return f"""
         if ((u_vlim >> {i}) & 1u) {{
             const bool act = (admit_vlim >> {i}) & 1u;
             const float residual = res[{i}];
-            float d = (residual < 0.0f) ? -residual * ca[{i}] : 0.0f;
+{law}
             if (!act) d = 0.0f;
-            lam[{i}] = act ? d : lam[{i}];
+            lam[{i}] = act ? {stored} : lam[{i}];
             app[{i}] += d;
             changed |= (d != 0.0f);
             {_lane_res_update(RS, i, "d")}
@@ -634,14 +651,17 @@ def get_response_block_sweep_lane_kernel(
     *,
     lane_rows: int,
     has_drive_rows: bool,
+    velocity_limit_law: str = "stateless",
 ) -> wp.Kernel:
     """Lane-per-world sweep: 32 worlds per block, each lane runs its world's sequential sweep.
 
     Per-lane state lives in registers (rows are unrolled at codegen time) and the packed
     symmetric response block in shared memory, lane-minor. Row kind flags are warp-uniform
     ballots over the lanes that own a world; inside a row every lane runs the same
-    straight-line code with per-lane selects.
+    straight-line code with per-lane selects. ``velocity_limit_law`` selects the velocity-limit
+    rows' law as in ``pgs_solve_mf_gs``; the stateless default keeps the source byte-identical.
     """
+    accumulated_limits = check_velocity_limit_law(velocity_limit_law) == "accumulated"
     M_D = int(max_constraints)
     M_MF = int(mf_max_constraints)
     D = int(max_world_dofs)
@@ -674,8 +694,8 @@ def get_response_block_sweep_lane_kernel(
     }}"""
         for i in range(RS)
     )
-    main_pass = "\n".join(_lane_row_code(i, RS, has_drive_rows) for i in range(RS))
-    vlim_pass = "\n".join(_lane_vlim_code(i, RS) for i in range(RS))
+    main_pass = "\n".join(_lane_row_code(i, RS, has_drive_rows, accumulated_limits) for i in range(RS))
+    vlim_pass = "\n".join(_lane_vlim_code(i, RS, accumulated_limits) for i in range(RS))
     load_a_lines = []
     for r in range(RS):
         for c in range(r + 1):
@@ -880,7 +900,10 @@ def get_response_block_sweep_lane_kernel(
             v_out,
         )
 
-    name = f"pgs_rb_sweep_lane_{M_D}_{M_MF}_{D}_rows{RS}_drive{int(has_drive_rows)}"
+    name = (
+        f"pgs_rb_sweep_lane_{M_D}_{M_MF}_{D}_rows{RS}_drive{int(has_drive_rows)}"
+        f"{velocity_limit_law_suffix(velocity_limit_law)}"
+    )
     rb_sweep_lane_template.__name__ = name
     rb_sweep_lane_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(rb_sweep_lane_template)
@@ -899,14 +922,32 @@ def get_response_block_sweep_warp_kernel(
     rows: int,
     lane_rows: int,
     has_drive_rows: bool,
+    velocity_limit_law: str = "stateless",
 ) -> wp.Kernel:
     """Warp-per-world sweep for ``rows`` in {32, 64} over the matching class list.
 
     The response block lives in shared memory (row-minor so a column read is conflict-free)
     and the row loop is a runtime loop: row ``i`` is owned by lane ``i & 31`` in half
     ``i >> 5``. Every lane computes the projection from a few broadcasts of the owner's state,
-    so the only branches are warp-uniform.
+    so the only branches are warp-uniform. ``velocity_limit_law`` selects the velocity-limit
+    rows' law as in ``pgs_solve_mf_gs``; the stateless default keeps the source byte-identical.
     """
+    accumulated_limits = check_velocity_limit_law(velocity_limit_law) == "accumulated"
+    if accumulated_limits:
+        main_velocity_limit = accumulated_update(
+            "old_impulse", "residual * ca_", new="new_impulse", delta="delta_impulse", indent=" " * 20
+        ).rstrip("\n")
+        pass_velocity_limit = "                const float old_vlim = __shfl_sync(MASK, h ? l1 : l0, o);\n" + (
+            accumulated_update(
+                "old_vlim", "residual * ca_", new="new_vlim", delta="d_", indent=" " * 16, declare="const float "
+            ).rstrip("\n")
+        )
+        pass_stored = "new_vlim"
+    else:
+        main_velocity_limit = """                    delta_impulse = (residual < 0.0f) ? delta : 0.0f;
+                    new_impulse = delta_impulse;"""
+        pass_velocity_limit = "                const float d_ = (residual < 0.0f) ? -residual * ca_ : 0.0f;"
+        pass_stored = "d_"
     M_D = int(max_constraints)
     M_MF = int(mf_max_constraints)
     D = int(max_world_dofs)
@@ -1094,8 +1135,7 @@ def get_response_block_sweep_warp_kernel(
                     new_impulse = fmaxf(relaxed, 0.0f);
                     delta_impulse = new_impulse - old_impulse;
                 }} else if ((kvlim >> o) & 1u) {{
-                    delta_impulse = (residual < 0.0f) ? delta : 0.0f;
-                    new_impulse = delta_impulse;{drive_update}
+{main_velocity_limit}{drive_update}
                 }} else {{
                     delta_impulse = new_impulse - old_impulse;
                 }}
@@ -1125,10 +1165,10 @@ def get_response_block_sweep_warp_kernel(
                 if (!((admit >> o) & 1u)) continue;
                 const float residual = __shfl_sync(MASK, h ? res1 : res0, o);
                 const float ca_ = __shfl_sync(MASK, h ? ca1 : ca0, o);
-                const float d_ = (residual < 0.0f) ? -residual * ca_ : 0.0f;
+{pass_velocity_limit}
                 if (lane == o) {{
-                    if (h) {{ l1 = d_; app1 += d_; }}
-                    else {{ l0 = d_; app0 += d_; }}
+                    if (h) {{ l1 = {pass_stored}; app1 += d_; }}
+                    else {{ l0 = {pass_stored}; app0 += d_; }}
                 }}
                 if (d_ != 0.0f) {{
                     changed = 1;
@@ -1271,7 +1311,10 @@ def get_response_block_sweep_warp_kernel(
             )
             idx += grid_stride
 
-    name = f"pgs_rb_sweep_warp_{M_D}_{M_MF}_{D}_rows{RB}_lane{RS}_drive{int(has_drive_rows)}"
+    name = (
+        f"pgs_rb_sweep_warp_{M_D}_{M_MF}_{D}_rows{RB}_lane{RS}_drive{int(has_drive_rows)}"
+        f"{velocity_limit_law_suffix(velocity_limit_law)}"
+    )
     rb_sweep_warp_template.__name__ = name
     rb_sweep_warp_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(rb_sweep_warp_template)

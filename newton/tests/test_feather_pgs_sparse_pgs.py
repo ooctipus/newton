@@ -31,6 +31,69 @@ def _ring(parents, first):
     return rows
 
 
+def _launch_free_velocity_limits(law):
+    """Sweep two worlds' free-body velocity-limit row once with ``law``; return the impulses and the delta.
+
+    Each world holds one row on the free body's first coordinate, inverse diagonal
+    0.5, a stored impulse of 3 and an incident velocity of -2 (world 0, violated)
+    or 2 (world 1, inside the limit by 2).
+    """
+    device = "cuda:0"
+
+    def array(value, dtype=float):
+        return wp.array(value, dtype=dtype, device=device)
+
+    meta = np.zeros((2, 4), dtype=np.int32)
+    meta[:, 0] = 0xFFFF  # Active endpoint at offset zero; static endpoint -1.
+    meta[:, 1] = np.float32(0.5).view(np.int32)
+    meta[:, 3] = PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT | (-1 << 16)
+    rows = np.zeros((2, 1, 6), dtype=np.float32)
+    rows[:, 0, 0] = 1.0
+    velocity = np.zeros((2, 6), dtype=np.float32)
+    velocity[:, 0] = [-2.0, 2.0]
+    impulses = array([[3.0], [3.0]])
+    delta = wp.zeros((2, 6), device=device)
+    wp.launch_tiled(
+        _get_pgs_solve_sparse_kernel(1, 6, 6, mf_max_constraints=1, velocity_limit_law=law),
+        dim=[1],
+        inputs=[
+            2,
+            array([0, 0], int),
+            array([[0.0], [0.0]]),
+            array([[1.0], [1.0]]),
+            array([[0.0], [0.0]]),
+            array(np.full((2, 1, 6), -1), int),
+            array(np.zeros((2, 1, 6))),
+            array(np.zeros((2, 1, 12))),
+            array([[0.0], [0.0]]),
+            array([[0], [0]], int),
+            array([[-1], [-1]], int),
+            array([[0.0], [0.0]]),
+            array(np.ones((2, 6)), int),
+            array(np.arange(12).reshape(2, 6), int),
+            array(velocity.reshape(-1)),
+            array([1, 1], int),
+            array(meta, int),
+            impulses,
+            array(rows),
+            array(np.zeros_like(rows)),
+            array(rows),
+            array(np.zeros_like(rows)),
+            array([[0.0], [0.0]]),
+            1,
+            0.4,
+            0.0,
+            0.0,
+            0,
+            0,
+        ],
+        outputs=[delta, _SparseRowSupport()],
+        block_dim=64,
+        device=device,
+    )
+    return impulses.numpy(), delta.numpy()
+
+
 def _sweep(
     jacobian,
     response,
@@ -304,63 +367,25 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
     def test_cuda_free_velocity_limit_is_stateless(self):
         """Apply free-body velocity limits without undoing old impulses or applying relaxation."""
-        device = "cuda:0"
-
-        def array(value, dtype=float):
-            return wp.array(value, dtype=dtype, device=device)
-
-        meta = np.zeros((2, 4), dtype=np.int32)
-        meta[:, 0] = 0xFFFF  # Active endpoint at offset zero; static endpoint -1.
-        meta[:, 1] = np.float32(0.5).view(np.int32)
-        meta[:, 3] = PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT | (-1 << 16)
-        rows = np.zeros((2, 1, 6), dtype=np.float32)
-        rows[:, 0, 0] = 1.0
-        velocity = np.zeros((2, 6), dtype=np.float32)
-        velocity[:, 0] = [-2.0, 2.0]
-        impulses = array([[3.0], [3.0]])
-        delta = wp.zeros((2, 6), device=device)
-        wp.launch_tiled(
-            _get_pgs_solve_sparse_kernel(1, 6, 6, mf_max_constraints=1),
-            dim=[1],
-            inputs=[
-                2,
-                array([0, 0], int),
-                array([[0.0], [0.0]]),
-                array([[1.0], [1.0]]),
-                array([[0.0], [0.0]]),
-                array(np.full((2, 1, 6), -1), int),
-                array(np.zeros((2, 1, 6))),
-                array(np.zeros((2, 1, 12))),
-                array([[0.0], [0.0]]),
-                array([[0], [0]], int),
-                array([[-1], [-1]], int),
-                array([[0.0], [0.0]]),
-                array(np.ones((2, 6)), int),
-                array(np.arange(12).reshape(2, 6), int),
-                array(velocity.reshape(-1)),
-                array([1, 1], int),
-                array(meta, int),
-                impulses,
-                array(rows),
-                array(np.zeros_like(rows)),
-                array(rows),
-                array(np.zeros_like(rows)),
-                array([[0.0], [0.0]]),
-                1,
-                0.4,
-                0.0,
-                0.0,
-                0,
-                0,
-            ],
-            outputs=[delta, _SparseRowSupport()],
-            block_dim=64,
-            device=device,
-        )
-        np.testing.assert_array_equal(impulses.numpy(), [[1.0], [0.0]])
+        impulses, delta = _launch_free_velocity_limits("stateless")
+        np.testing.assert_array_equal(impulses, [[1.0], [0.0]])
         expected = np.zeros((2, 6))
         expected[0, 0] = 1.0
-        np.testing.assert_array_equal(delta.numpy(), expected)
+        np.testing.assert_array_equal(delta, expected)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
+    def test_cuda_free_velocity_limit_accumulates(self):
+        """Accumulate free-body velocity-limit totals, releasing the part the velocity no longer needs.
+
+        Both rows hold a total of 3 whose response the velocity already carries. The
+        violated row adds its correction (1) to that total; the other row releases its
+        slack times its inverse diagonal (1 of 3), without relaxation.
+        """
+        impulses, delta = _launch_free_velocity_limits("accumulated")
+        np.testing.assert_array_equal(impulses, [[4.0], [2.0]])
+        expected = np.zeros((2, 6))
+        expected[:, 0] = [1.0, -1.0]
+        np.testing.assert_array_equal(delta, expected)
 
     def test_mixed_factor_sweeps_preserve_supplied_response(self):
         """Preserve dense-then-MF row order and distinct free-body responses."""
