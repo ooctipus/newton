@@ -20,6 +20,7 @@ import itertools
 import math
 import os
 import unittest
+from fractions import Fraction
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
@@ -1261,25 +1262,39 @@ class TestLinkedTierSweeps(unittest.TestCase):
                         SolverFeatherPGS(model)
 
     def test_auto_budget_grows_with_iterations_and_tier_rows(self):
-        """Sweep ceil(3 * pgs_iterations * sqrt(rows / 32)) times within the linked tiers' bounds.
+        """Sweep ceil(15/4 * pgs_iterations * sqrt(rows / 32)) times within the linked tiers' bounds.
 
         The budget is at least mf_gs_parallel_sweeps and at most 128, unless
-        mf_gs_parallel_sweeps is larger.
+        mf_gs_parallel_sweeps is larger. The factor is refit per row bucket (see
+        _LINKED_SWEEPS_PER_ITERATION): at 12 iterations the four tiers sweep 45, 64,
+        78 and 90 times, at 8 iterations the 32- and 48-row tiers 30 and 37 times.
         """
+        self.assertEqual(source._LINKED_SWEEPS_PER_ITERATION, Fraction(15, 4))
         for rows, iterations, sweeps, expected in (
-            (32, 12, 24, 36),
-            (64, 12, 24, 51),
-            (96, 12, 24, 63),
-            (128, 12, 24, 72),  # 3 * 12 * 2 exactly: no rounding up past a whole budget
-            (48, 8, 24, 30),
-            (64, 8, 24, 34),
-            (32, 8, 24, 24),  # never fewer sweeps than mf_gs_parallel_sweeps
+            (32, 12, 24, 45),  # 15/4 * 12 exactly: no rounding up past a whole budget
+            (64, 12, 24, 64),
+            (96, 12, 24, 78),
+            (128, 12, 24, 90),  # 15/4 * 12 * 2 exactly
+            (32, 8, 24, 30),  # 15/4 * 8 exactly
+            (48, 8, 24, 37),
+            (64, 8, 24, 43),
+            (32, 6, 24, 24),  # 22.5 rounds up to 23: never fewer sweeps than mf_gs_parallel_sweeps
             (128, 40, 24, 128),  # the cap
             (32, 4, 160, 160),  # mf_gs_parallel_sweeps above the cap keeps its own budget
             (64, 0, 24, 24),
         ):
             with self.subTest(rows=rows, iterations=iterations, sweeps=sweeps):
                 self.assertEqual(source._auto_linked_sweeps(rows, iterations, sweeps), expected)
+        # The integer arithmetic is the exact ceiling: the least n with 32 (q n)^2 >= (p iterations)^2 rows.
+        p, q = source._LINKED_SWEEPS_PER_ITERATION.numerator, source._LINKED_SWEEPS_PER_ITERATION.denominator
+        wrong = []
+        for rows, iterations in itertools.product(range(1, 129), range(41)):
+            exact = 0
+            while 32 * (q * exact) ** 2 < (p * iterations) ** 2 * rows:
+                exact += 1
+            if source._auto_linked_sweeps(rows, iterations, 1) != min(max(exact, 1), 128):
+                wrong.append((rows, iterations))
+        self.assertEqual(wrong, [])
 
     def test_solver_budgets_linked_tiers_only(self):
         """Budget linked tiers by the request and point tiers by mf_gs_parallel_sweeps; record the rule and source."""
@@ -1299,7 +1314,8 @@ class TestLinkedTierSweeps(unittest.TestCase):
                     self.assertIn("mf_gs_parallel_sweeps", reason)
                     continue
                 if linked == "auto":
-                    self.assertEqual((budgets, rule), ([36, 51, 63, 72], "auto"))
+                    self.assertEqual((budgets, rule), ([45, 64, 78, 90], "auto"))
+                    self.assertIn("ceil(15/4 * pgs_iterations * sqrt(R / 32))", reason)
                     self.assertIn("pgs_iterations=12", reason)
                     self.assertIn("at least mf_gs_parallel_sweeps=24 and at most 128", reason)
                 else:
@@ -1900,7 +1916,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
                 if not beta or linked is None:
                     expected, rule = [24, 24], "mf_gs_parallel_sweeps"
                 elif linked == "auto":
-                    expected, rule = [24, 34], "auto"  # ceil(3 * 8 * sqrt(rows / 32)) over 24 for 64 rows
+                    expected, rule = [30, 43], "auto"  # ceil(15/4 * 8 * sqrt(rows / 32)) for 32 and 64 rows
                 else:
                     expected, rule = [40, 40], "mf_gs_parallel_linked_sweeps"
                 keys = [kernel.key for kernel in solver._pgs_solve_mf_gs_incremental_kernels]

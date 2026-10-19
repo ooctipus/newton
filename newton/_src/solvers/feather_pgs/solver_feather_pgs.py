@@ -23,6 +23,7 @@ import time
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
+from fractions import Fraction
 from functools import cache
 from typing import ClassVar, Literal
 
@@ -1736,10 +1737,11 @@ class SolverFeatherPGS(SolverBase):
                 couple through one body, so a contact-rich patch world can need more than
                 ``mf_gs_parallel_sweeps`` to reach the serial sweep's accuracy. ``None`` uses
                 ``mf_gs_parallel_sweeps``; a positive count sets every linked tier's budget. ``"auto"`` gives
-                each linked tier serving up to ``R`` rows ``ceil(3 * pgs_iterations * sqrt(R / 32))`` sweeps,
+                each linked tier serving up to ``R`` rows ``ceil(15/4 * pgs_iterations * sqrt(R / 32))`` sweeps,
                 at least ``mf_gs_parallel_sweeps`` and at most 128 unless ``mf_gs_parallel_sweeps`` is larger,
                 from ``pgs_iterations`` at construction: the serial sweep's iteration count sets the accuracy to
-                match, and larger worlds converge more slowly.
+                match, and larger worlds converge more slowly. The factor brings every tier's worlds to the serial
+                sweep's accuracy on two contact-rich patch-friction workloads.
                 Every world still exits early once its impulses change by less than ``mf_gs_parallel_tol``.
                 The environment variable ``FEATHER_PGS_PATCH_PARALLEL_SWEEPS`` (a positive count or ``auto``)
                 overrides the argument. ``get_path_selection()`` reports each tier's budget under
@@ -28095,11 +28097,14 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
 
 # mf_gs_parallel_linked_sweeps="auto": the budget grows with the serial sweep's iteration count, whose accuracy the
 # linked tiers must match, and with the square root of a tier's row bound, as Jacobi sweeps with momentum need more
-# passes where more rows couple through one body. The factor is a two-workload fit (contact-rich patch friction at 8
-# and 12 iterations) to the global p90 accuracy gate, not to every row bucket: at 12 iterations the 32-row tier's
-# 36 sweeps leave its worlds at 1.57x the serial sweep's p90 error, and the measured buckets first all reach parity
-# near a factor of 3.5. Refit it from per-bucket probe data before any default relies on it.
-_LINKED_SWEEPS_PER_ITERATION = 3
+# passes where more rows couple through one body. The factor, in eighths, is the smallest that brings every tier's
+# worlds to the serial sweep's accuracy on two contact-rich patch-friction workloads (12 and 8 iterations): per row
+# bucket, the p90 energy-norm velocity error against a converged reference over the serial route's, 95% CI upper
+# bound at most 1 (per-world errors measured at fixed caps, interpolated between them). The serial sweep is most
+# accurate on small worlds, so the 12-iteration workload's 32-row tier sets it: 3 left those worlds at 1.57x the
+# serial error and 29/8 at 0.92x (CI upper 1.01); 15/4 gives 0.89x (0.97), its larger tiers 0.41x and 0.55x, and the
+# 8-iteration workload's tiers 0.18x and 0.51x. A fraction keeps the budget in exact integer arithmetic.
+_LINKED_SWEEPS_PER_ITERATION = Fraction(15, 4)
 _LINKED_SWEEPS_CAP = 128
 
 
@@ -28121,11 +28126,14 @@ def _linked_sweeps_request(value, name: str) -> int | str | None:
 def _auto_linked_sweeps(rows: int, iterations: int, sweeps: int) -> int:
     """The ``"auto"`` sweep budget of a linked tier serving up to ``rows`` rows.
 
-    ``ceil(3 * iterations * sqrt(rows / 32))``, at least ``sweeps`` (``mf_gs_parallel_sweeps``)
-    and at most 128 unless ``sweeps`` is larger. The ceiling is exact: the least ``n`` with
-    ``32 n^2 >= (3 iterations)^2 rows``.
+    ``ceil(c * iterations * sqrt(rows / 32))`` for the factor ``c = p / q``
+    (:data:`_LINKED_SWEEPS_PER_ITERATION`), at least ``sweeps`` (``mf_gs_parallel_sweeps``) and
+    at most 128 unless ``sweeps`` is larger. The ceiling is exact: the least ``n`` with
+    ``32 q^2 n^2 >= (p iterations)^2 rows``.
     """
-    square = -(-((_LINKED_SWEEPS_PER_ITERATION * int(iterations)) ** 2 * int(rows)) // 32)
+    factor = _LINKED_SWEEPS_PER_ITERATION
+    numerator = (factor.numerator * int(iterations)) ** 2 * int(rows)
+    square = -(-numerator // (32 * factor.denominator**2))
     raw = math.isqrt(square - 1) + 1 if square > 0 else 0
     return max(int(sweeps), min(raw, _LINKED_SWEEPS_CAP))
 
