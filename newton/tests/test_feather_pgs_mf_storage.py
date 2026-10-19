@@ -27,8 +27,9 @@ from newton._src.solvers.feather_pgs.row_metadata import _DENSE_META_MAX_PARENT
 from newton.tests.feather_pgs_paired_fixture import pack_endpoints, solve_fixture
 from newton.tests.test_feather_pgs_masked_patch_rows import _three_size_model
 
-# The cube puzzle's streamed-metadata shape: 2304 dense and matrix-free rows over 75 coordinates.
-_CUBE = {
+# A large streamed-metadata shape without drive or velocity-limit rows: 2304 dense and matrix-free rows
+# over 75 coordinates.
+_LARGE_STREAMED_SHAPE = {
     "max_constraints": 2304,
     "mf_max_constraints": 2304,
     "max_world_dofs": 75,
@@ -61,8 +62,8 @@ _STREAMED_OPTIONS = (
 
 
 def _streamed_source(**options):
-    """Generate a streamed-metadata MF-GS source for the cube shape with ``options`` applied."""
-    return get_source(**{**_CUBE, "shared_metadata": False, **options}).native
+    """Generate a streamed-metadata MF-GS source for the large shape with ``options`` applied."""
+    return get_source(**{**_LARGE_STREAMED_SHAPE, "shared_metadata": False, **options}).native
 
 
 def _row_metadata_read_globally(source):
@@ -229,18 +230,18 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
         def select(shape, shared_memory, blocks, sms=188):
             return fpgs._select_mfgs_storage(*shape, shared_memory, **options, block_count=blocks, sm_count=sms)
 
-        cube = (2304, 2304, 75)
+        large = (2304, 2304, 75)
         # 128 worlds, one block each, on 188 SMs: velocities, dense and MF impulses and the packed
         # row metadata take 128 + 4 * (75 + 3 * 2304) = 28076 bytes; the float metadata streams.
-        storage = select(cube, 101376, 128)
+        storage = select(large, 101376, 128)
         self.assertEqual(storage[:3], (False, False, True))
         self.assertIn("28076 <= 49152 bytes", storage.reason)
-        self.assertEqual(select(cube, 232448, 128)[:3], (False, False, True))
+        self.assertEqual(select(large, 232448, 128)[:3], (False, False, True))
         # A grid of one block per SM is the largest that cannot lose concurrency to the extra bytes.
-        self.assertTrue(select(cube, 101376, 188).resident_row_metadata)
+        self.assertTrue(select(large, 101376, 188).resident_row_metadata)
         for blocks in (189, 16384):
             with self.subTest(blocks=blocks):
-                storage = select(cube, 101376, blocks)
+                storage = select(large, 101376, blocks)
                 self.assertEqual(storage[:3], (False, False, False))
                 self.assertIn(f"{blocks}-block grid exceeds one block per SM (188 SMs)", storage.reason)
         # 48 KiB of static shared memory: 128 + 4 * (5344 + 2 * 2304 + 2304) bytes is exactly the budget.
@@ -249,8 +250,8 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
         self.assertFalse(storage.resident_row_metadata)
         self.assertIn("49156 bytes of static shared memory, over the 49152-byte budget", storage.reason)
         # A device that exposes less than 48 KiB sets the budget.
-        self.assertTrue(select(cube, 28076, 128).resident_row_metadata)
-        self.assertFalse(select(cube, 28075, 128).resident_row_metadata)
+        self.assertTrue(select(large, 28076, 128).resident_row_metadata)
+        self.assertFalse(select(large, 28075, 128).resident_row_metadata)
         # Streamed MF impulses leave room: 128 + 4 * (1551 + 2 * 256) = 8380 bytes.
         storage = select((256, 37248, 1551), 101376, 32)
         self.assertEqual(storage[:3], (False, True, True))
@@ -261,7 +262,7 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
         storage = select((192, 64, 22), 101376, 16384)
         self.assertEqual(storage[:3], (True, False, False))
         self.assertIn("Row metadata is resident", storage.reason)
-        storage = fpgs._select_mfgs_storage(*cube, 101376, **options)
+        storage = fpgs._select_mfgs_storage(*large, 101376, **options)
         self.assertEqual(storage[:3], (False, False, False))
         self.assertIn("launch shape is unknown", storage.reason)
 
@@ -278,7 +279,7 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
             with self.subTest(options=options):
                 streamed = _streamed_source(**options)
                 resident = _streamed_source(**options, resident_row_metadata=True)
-                rows = options.get("max_constraints", _CUBE["max_constraints"])
+                rows = options.get("max_constraints", _LARGE_STREAMED_SHAPE["max_constraints"])
                 self.assertNotIn("s_meta_dense", streamed)
                 self.assertEqual(resident.count(f"__shared__ int   s_meta_dense[{rows}];"), 1)
                 self.assertIn("int row_type = s_meta_dense[i] &", resident)
@@ -292,10 +293,10 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
                 shared = ["s_v", "s_lam_dense"] + ([] if options.get("stream_mf_impulses") else ["s_lam_mf"])
                 self.assertEqual(re.findall(r"__shared__ float\s+(\w+)", resident), shared)
                 self.assertEqual(_row_metadata_read_globally(resident), streamed)
-        # The cube's patch rings walk the resident array.
+        # Patch rings walk the resident array.
         self.assertIn("patch_row = ((s_meta_dense[patch_row] >> 3) - 1)", _streamed_source(resident_row_metadata=True))
         with self.assertRaisesRegex(ValueError, "streamed metadata"):
-            get_source(**_CUBE, resident_row_metadata=True)
+            get_source(**_LARGE_STREAMED_SHAPE, resident_row_metadata=True)
 
     def test_packed_row_metadata_decodes_every_row_type_and_parent(self):
         """Run the source's own packing and decoding on the CPU: every type and parent comes back exactly."""
@@ -593,7 +594,7 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
     def test_resident_row_metadata_matches_streamed_on_patch_rings(self):
         """Solve dense patch rings with resident row types and parents: identical bits out in every row phase.
 
-        Random patch layouts at a small and at the cube puzzle's dense capacity run every row
+        Random patch layouts at a small and at a large dense capacity run every row
         phase, from warm and signed-zero impulses, with delayed friction, iteration offsets,
         regularization and deferred responses, both one world per block and through a two-block
         queue whose blocks reuse their shared memory across worlds, then once more from a captured
@@ -603,11 +604,11 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
         device = wp.get_device()
         if not device.is_cuda:
             self.skipTest("Select a CUDA device for native MF-GS execution")
-        cube = {"has_drive_rows": False, "has_dense_velocity_limit_rows": False, "skip_incremental_rows": 32}
+        contacts = {"has_drive_rows": False, "has_dense_velocity_limit_rows": False, "skip_incremental_rows": 32}
         limits = {"has_drive_rows": True, "has_dense_velocity_limit_rows": True, "fuse_vel_limits": True}
         cases = (
-            ("cube_capacity", (2304, 48, 75), cube, (220, 300)),
-            ("cube_options", (48, 12, 29), cube, (5, 9)),
+            ("large_capacity", (2304, 48, 75), contacts, (220, 300)),
+            ("small_capacity", (48, 12, 29), contacts, (5, 9)),
             ("drives_and_limits", (48, 12, 29), limits, (5, 9)),
             ("bisection", (48, 12, 29), {"friction_mode": "bisection", "has_drive_rows": False}, (5, 9)),
             ("streamed_impulses", (48, 12, 29), {"stream_mf_impulses": True, "has_drive_rows": False}, (5, 9)),
