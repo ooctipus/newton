@@ -10,6 +10,11 @@ stateless law pushes a row only while its limit is violated (``J v + rhs < 0``),
 whatever ``pgs_omega`` relaxes, and keeps that correction rather than an accumulated impulse. A sweep that
 relaxes these rows as bilateral rows drives every limited axis onto its limit instead, so it accelerates a
 body that moves below its limit.
+
+Split mode also scales each free body's predicted velocity onto its speed limits before the rows are built,
+and its solved velocity after the sweep (the root clamp). In free flight every row therefore finds its limit
+satisfied and must not move the body. The rows act inside a step where another row of the sweep pushes a
+body past a limit, as a contact row pushes a body out of the ground.
 """
 
 import unittest
@@ -19,7 +24,10 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
+from newton._src.solvers.feather_pgs.kernels import (
+    PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+)
 from newton.solvers import SolverFeatherPGS
 
 DT = 1.0 / 60.0
@@ -29,11 +37,11 @@ ANGULAR_LIMIT = 3.0
 LIMITS = np.array([LINEAR_LIMIT] * 3 + [ANGULAR_LIMIT] * 3)
 # Registered speed attributes that limit nothing [m/s, rad/s].
 INFINITE_LIMITS = (float("inf"), float("inf"))
-# A 1 kg box with a spherical inertia: its axes decouple and free flight keeps its angular velocity.
+# A 1 kg body with a spherical inertia: its axes decouple and free flight keeps its angular velocity.
 MASS = 1.0
 INERTIA = 0.1
 # Velocities agree to this fraction of their axis's limit: the default pgs_cfm leaves 1e-6 of each correction
-# on a 1 kg box (1e-7 on its 0.1 kg m^2 axes), and free flight keeps a velocity to float32 rounding.
+# on a 1 kg body (1e-7 on its 0.1 kg m^2 axes), and free flight keeps a velocity to float32 rounding.
 RTOL = 1.0e-5
 # An under-relaxed sweep: the other rows take this fraction of their correction, the velocity-limit rows all of it.
 RELAXED_OMEGA = 0.6
@@ -54,6 +62,88 @@ PAST = (
 SWEEP_LINEAR = ((3.0, -2.5, 1.0), (-1.0, 0.5, -2.0), (0.0, 4.0, -7.0))
 SWEEP_ANGULAR = ((-3.5, 0.0, 2.9), (5.0, -1.0, -3.0), (0.2, -6.0, 3.1))
 
+# Spheres pressed into the ground [m], one per world. A contact row pushes each out at its Baumgarte speed
+# (pgs_beta * depth / DT: 0.06, 0.12 and 0.24 m/s), below or past the linear limit CONTACT_LIMIT [m/s].
+RADIUS = 0.1
+DEPTHS = (0.005, 0.01, 0.02)
+CONTACT_LIMIT = 0.1
+CONTACT_LIMITS = np.array([CONTACT_LIMIT] * 3 + [ANGULAR_LIMIT] * 3)
+
+
+def _begin_model(limits):
+    """Start a model without gravity, registering the rigid-body speed attributes unless ``limits`` is None."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    if limits is not None:
+        SolverFeatherPGS.register_custom_attributes(builder)
+    return builder
+
+
+def _speed_attributes(limits):
+    """Body attributes for (linear [m/s], angular [rad/s]) speed ``limits``; None sets none."""
+    if limits is None:
+        return None
+    return {"rigid_body_max_linear_velocity": limits[0], "rigid_body_max_angular_velocity": limits[1]}
+
+
+def _add_body(builder, xform, limits):
+    """Add a 1 kg free body with a spherical inertia that its shapes do not change."""
+    return builder.add_body(
+        xform=xform,
+        mass=MASS,
+        inertia=wp.mat33(np.eye(3) * INERTIA),
+        lock_inertia=True,
+        custom_attributes=_speed_attributes(limits),
+    )
+
+
+def _add_arm(builder):
+    """Add a one-joint arm to the current world, so the split driver interleaves the dense and free-body sweeps."""
+    link = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.1))
+    builder.add_articulation([builder.add_joint_revolute(-1, link, axis=newton.Axis.Y)])
+
+
+def _split_run(builder, device, bodies, *, velocities=None, wrenches=None, **options):
+    """Finalize ``builder`` on ``device`` with a split-mode solver and a collision pipeline.
+
+    Args:
+        builder: The model, one world per entry of ``bodies``.
+        device: Warp device of the model and solver.
+        bodies: The free bodies whose velocities :func:`_step` returns, one per world.
+        velocities: Initial [world, 6] (linear [m/s], angular [rad/s]) velocity of each body; zero if None.
+        wrenches: Velocity change [m/s, rad/s] that a constant body wrench adds over one step, per world.
+        options: Further :class:`~newton.solvers.SolverFeatherPGS` options.
+    """
+    model = builder.finalize(device=device)
+    # Without angular damping, free flight keeps the angular velocity exactly.
+    solver = SolverFeatherPGS(model, pgs_mode="split", angular_damping=0.0, **options)
+    state_0, state_1 = model.state(), model.state()
+    starts = model.joint_qd_start.numpy()
+    joints = [int(np.flatnonzero(model.joint_child.numpy() == body)[0]) for body in bodies]
+    dofs = np.array([np.arange(starts[joint], starts[joint] + 6) for joint in joints])
+    if velocities is not None:
+        qd = state_0.joint_qd.numpy()
+        qd[dofs] = velocities
+        state_0.joint_qd.assign(qd)
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+    body_f = None
+    if wrenches is not None:
+        # A world-frame wrench at the center of mass that changes the body velocity by ``wrenches`` over one step.
+        scale = np.array([MASS] * 3 + [INERTIA] * 3) / DT
+        body_f = np.zeros((model.body_count, 6), dtype=np.float32)
+        body_f[bodies] = np.array(wrenches) * scale
+    pipeline = newton.CollisionPipeline(model)
+    return SimpleNamespace(
+        model=model,
+        solver=solver,
+        states=(state_0, state_1),
+        control=model.control(),
+        pipeline=pipeline,
+        contacts=pipeline.contacts(),
+        bodies=bodies,
+        dofs=dofs,
+        body_f=body_f,
+    )
+
 
 def _free_boxes(
     device, worlds, *, articulated=False, limits=(LINEAR_LIMIT, ANGULAR_LIMIT), fraction=0.0, omega=1.0, wrenches=None
@@ -71,66 +161,46 @@ def _free_boxes(
         omega: The solver's ``pgs_omega``.
         wrenches: Velocity change [m/s, rad/s] that a constant body wrench adds over one step, per world.
     """
-    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    attributes = None
-    if limits is not None:
-        SolverFeatherPGS.register_custom_attributes(builder)
-        attributes = {"rigid_body_max_linear_velocity": limits[0], "rigid_body_max_angular_velocity": limits[1]}
+    builder = _begin_model(limits)
     boxes = []
     for world in range(len(worlds)):
         builder.begin_world()
-        box = builder.add_body(
-            xform=wp.transform(wp.vec3(0.0, 0.0, 1.0 + world), wp.quat_identity()),
-            mass=MASS,
-            inertia=wp.mat33(np.eye(3) * INERTIA),
-            lock_inertia=True,
-            custom_attributes=attributes,
-        )
+        box = _add_body(builder, wp.transform(wp.vec3(0.0, 0.0, 1.0 + world), wp.quat_identity()), limits)
         builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.1)
         boxes.append(box)
         if articulated:
-            link = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.1))
-            builder.add_articulation([builder.add_joint_revolute(-1, link, axis=newton.Axis.Y)])
+            _add_arm(builder)
         builder.end_world()
-    model = builder.finalize(device=device)
-    # Without angular damping, free flight keeps the angular velocity exactly.
-    solver = SolverFeatherPGS(
-        model,
-        pgs_mode="split",
+    return _split_run(
+        builder,
+        device,
+        boxes,
+        velocities=np.array([np.concatenate(world) for world in worlds]),
+        wrenches=wrenches,
         velocity_limit_activation_fraction=fraction,
         pgs_omega=omega,
-        angular_damping=0.0,
     )
-    state_0, state_1 = model.state(), model.state()
-    starts = model.joint_qd_start.numpy()
-    joints = [int(np.flatnonzero(model.joint_child.numpy() == box)[0]) for box in boxes]
-    dofs = np.array([np.arange(starts[joint], starts[joint] + 6) for joint in joints])
-    qd = state_0.joint_qd.numpy()
-    qd[dofs] = np.array([np.concatenate(world) for world in worlds])
-    state_0.joint_qd.assign(qd)
-    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
-    body_f = None
-    if wrenches is not None:
-        # A world-frame wrench at the center of mass that changes the box velocity by ``wrenches`` over one step.
-        scale = np.array([MASS] * 3 + [INERTIA] * 3) / DT
-        body_f = np.zeros((model.body_count, 6), dtype=np.float32)
-        body_f[boxes] = np.array(wrenches) * scale
-    pipeline = newton.CollisionPipeline(model)
-    return SimpleNamespace(
-        model=model,
-        solver=solver,
-        states=(state_0, state_1),
-        control=model.control(),
-        pipeline=pipeline,
-        contacts=pipeline.contacts(),
-        boxes=boxes,
-        dofs=dofs,
-        body_f=body_f,
-    )
+
+
+def _pressed_spheres(device, *, articulated=False):
+    """One sphere per world at rest, pressed ``DEPTHS`` into a ground plane, with a ``CONTACT_LIMIT`` speed limit."""
+    limits = (CONTACT_LIMIT, ANGULAR_LIMIT)
+    builder = _begin_model(limits)
+    spheres = []
+    for world, depth in enumerate(DEPTHS):
+        builder.begin_world()
+        sphere = _add_body(builder, wp.transform(wp.vec3(0.5 * world, 0.0, RADIUS - depth), wp.quat_identity()), limits)
+        builder.add_shape_sphere(sphere, radius=RADIUS)
+        spheres.append(sphere)
+        if articulated:
+            _add_arm(builder)
+        builder.end_world()
+    builder.add_ground_plane()
+    return _split_run(builder, device, spheres)
 
 
 def _step(run):
-    """Advance one step and return each box's (linear, angular) velocity."""
+    """Advance one step and return each body's (linear, angular) velocity."""
     state_0, state_1 = run.states
     state_0.clear_forces()
     if run.body_f is not None:
@@ -141,8 +211,8 @@ def _step(run):
     return state_1.joint_qd.numpy()[run.dofs]
 
 
-def _box_rows(run):
-    """Return each world's free-body row types, axes and signs: [world, row]."""
+def _free_body_rows(run):
+    """Return each world's free-body row types, axes, signs, right-hand sides and impulses: [world, row]."""
     solver = run.solver
     count = solver.mf_constraint_count.numpy()
     rows = int(count.max())
@@ -155,12 +225,20 @@ def _box_rows(run):
         sign=np.sign(np.take_along_axis(jacobian, axis[..., None], axis=2)[..., 0]),
         rhs=solver.mf_rhs.numpy()[:, :rows],
         eff_mass_inv=solver.mf_eff_mass_inv.numpy()[:, :rows],
+        impulses=solver.mf_impulses.numpy()[:, :rows],
     )
 
 
-def _assert_on_limit_scale(actual, desired):
+def _velocity_limit_impulses(run):
+    """Return the impulses the last sweep left in velocity-limit rows, zero in every other entry: [world, row]."""
+    rows = _free_body_rows(run)
+    live = np.arange(rows.type.shape[1])[None, :] < rows.count[:, None]
+    return np.where(live & (rows.type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT), rows.impulses, 0.0)
+
+
+def _assert_on_limit_scale(actual, desired, limits=LIMITS):
     """Compare [world, 6] velocities to ``RTOL`` of each axis's limit."""
-    np.testing.assert_allclose(np.asarray(actual) / LIMITS, np.asarray(desired) / LIMITS, rtol=0.0, atol=RTOL)
+    np.testing.assert_allclose(np.asarray(actual) / limits, np.asarray(desired) / limits, rtol=0.0, atol=RTOL)
 
 
 def _clamped_magnitudes(velocity):
@@ -184,7 +262,7 @@ def _sweep(device, *, iterations, articulated=False, omega=1.0):
     _step(run)
     solver = run.solver
     # The sweep reads the response DOFs the free-body map assigns, not the joint coordinates.
-    articulation = solver.body_to_articulation.numpy()[run.boxes]
+    articulation = solver.body_to_articulation.numpy()[run.bodies]
     dofs = solver.articulation_dof_start.numpy()[articulation][:, None] + np.arange(6)
     start = np.hstack([np.array(SWEEP_LINEAR), np.array(SWEEP_ANGULAR)]).astype(np.float32)
     velocity = solver.v_out.numpy()
@@ -192,13 +270,8 @@ def _sweep(device, *, iterations, articulated=False, omega=1.0):
     solver.v_out.assign(velocity)
     solver.mf_impulses.zero_()
     solver._mf_pgs_solve(iterations)
-    rows = _box_rows(run)
-    return SimpleNamespace(
-        start=start,
-        velocity=solver.v_out.numpy()[dofs],
-        impulses=solver.mf_impulses.numpy()[:, : rows.type.shape[1]],
-        rows=rows,
-    )
+    rows = _free_body_rows(run)
+    return SimpleNamespace(start=start, velocity=solver.v_out.numpy()[dofs], impulses=rows.impulses, rows=rows)
 
 
 class _SplitVelocityLimitChecks:
@@ -208,7 +281,7 @@ class _SplitVelocityLimitChecks:
 
     def check_rows_are_velocity_limits(self, run):
         """Every box owns its twelve velocity-limit rows, on both sides of each axis."""
-        rows = _box_rows(run)
+        rows = _free_body_rows(run)
         np.testing.assert_array_equal(rows.count, 12)
         np.testing.assert_array_equal(rows.type, PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
         for world in range(rows.type.shape[0]):
@@ -241,7 +314,11 @@ class _SplitVelocityLimitChecks:
         self.assertLess(np.abs(swept.impulses).max(), 1.0e-4)
 
     def test_step_keeps_speeds_below_the_limits(self):
-        """Keep the velocity of a free body that moves below its limits and feels no other force."""
+        """Keep the velocity of a free body that moves below its limits and feels no other force.
+
+        The root clamp leaves such a velocity alone, so every velocity-limit row finds its limit satisfied
+        and must not move the body: a bilateral relaxation would drive each axis onto a limit.
+        """
         for articulated in (False, True):
             for fraction in (0.0, 0.7):
                 with self.subTest(articulated=articulated, fraction=fraction):
@@ -252,12 +329,18 @@ class _SplitVelocityLimitChecks:
                         if fraction == 0.0:
                             self.check_rows_are_velocity_limits(run)
                         _assert_on_limit_scale(velocity, start)
+                        np.testing.assert_allclose(_velocity_limit_impulses(run), 0.0, rtol=0.0, atol=1.0e-6)
                     if fraction == 0.7:
                         # The activation gate reserved rows only for axes within 30% of their limit.
                         self.assertGreater(int(run.solver.mf_constraint_count.numpy().sum()), 0)
 
     def test_step_clamps_speeds_past_the_limits(self):
-        """Hold a free body launched or pushed past its limits on them, along its own direction."""
+        """Hold a free body launched or pushed past its limits on them, along its own direction.
+
+        The root clamp scales the predicted velocity onto the limits before the rows are built, so the rows
+        find their limits satisfied and must not move the body; :meth:`test_step_holds_a_contact_push_on_the_limit`
+        covers the rows holding a body inside a step.
+        """
         worlds = [(linear, angular) for linear, angular, _, _ in PAST]
         wrenches = [np.concatenate((force, torque)) for _, _, force, torque in PAST]
         predicted = np.array([np.concatenate(world) for world in worlds]) + np.array(wrenches)
@@ -272,6 +355,37 @@ class _SplitVelocityLimitChecks:
                     (np.linalg.norm(velocity[:, :3], axis=1), np.linalg.norm(velocity[:, 3:], axis=1)), axis=1
                 )
                 np.testing.assert_allclose(speeds, [[LINEAR_LIMIT, ANGULAR_LIMIT]] * len(PAST), rtol=RTOL)
+                np.testing.assert_allclose(_velocity_limit_impulses(run), 0.0, rtol=0.0, atol=1.0e-6)
+
+    def test_step_holds_a_contact_push_on_the_limit(self):
+        """End a step on the limit that a contact row pushed a free body past, keeping only the last correction.
+
+        A sphere pressed into the ground leaves it at the Baumgarte speed ``-rhs`` of its contact row, which
+        the root clamp before the sweep does not see. In every iteration the contact row pushes the sphere
+        to that speed and the velocity-limit rows behind it take the overshoot back, so the step ends on the
+        limit and the upper row keeps the overshoot of the last iteration, not the sum over all iterations.
+        """
+        for articulated in (False, True):
+            with self.subTest(articulated=articulated):
+                run = _pressed_spheres(self.device, articulated=articulated)
+                velocity = _step(run)
+                rows = _free_body_rows(run)
+                contact = rows.type == PGS_CONSTRAINT_TYPE_CONTACT
+                limit = rows.type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
+                np.testing.assert_array_equal(contact.sum(axis=1), 1)
+                np.testing.assert_array_equal(limit.sum(axis=1), 12)
+                push = -rows.rhs[contact]
+                # One sphere leaves below its limit; the others would overshoot it.
+                self.assertTrue(np.any(push < CONTACT_LIMIT) and np.any(push > 1.1 * CONTACT_LIMIT))
+                expected = np.zeros((len(DEPTHS), 6))
+                expected[:, 2] = np.minimum(push, CONTACT_LIMIT)
+                _assert_on_limit_scale(velocity, expected, CONTACT_LIMITS)
+                upper_z = limit & (rows.axis == 2) & (rows.sign < 0.0)
+                overshoot = np.maximum(push - CONTACT_LIMIT, 0.0)[:, None]
+                correction = np.where(upper_z, overshoot * rows.eff_mass_inv, 0.0)
+                np.testing.assert_allclose(
+                    np.where(limit, rows.impulses, 0.0), correction, rtol=0.0, atol=RTOL * CONTACT_LIMIT * MASS
+                )
 
     def test_route_records_the_velocity_limit_sweep(self):
         """Record the stateless free-body law, and on CUDA its ``_vlim`` sweep, wherever limit rows can exist."""
@@ -341,6 +455,21 @@ class TestSplitFreeBodyVelocityLimitsCUDA(_SplitVelocityLimitChecks, unittest.Te
                 )
                 for _ in range(3):
                     _assert_on_limit_scale(_step(cuda), _step(cpu))
+
+    def test_cuda_contact_step_matches_the_cpu(self):
+        """Reproduce on CUDA the CPU steps in which a contact row pushes free bodies past their limits."""
+        for articulated in (False, True):
+            with self.subTest(articulated=articulated):
+                cpu, cuda = (_pressed_spheres(device, articulated=articulated) for device in ("cpu", self.device))
+                for _ in range(3):
+                    velocity = _step(cuda)
+                    _assert_on_limit_scale(velocity, _step(cpu), CONTACT_LIMITS)
+                    # Every axis stays within its limit.
+                    np.testing.assert_array_less(np.abs(velocity), CONTACT_LIMITS * (1.0 + RTOL))
+                    expected, actual = _free_body_rows(cpu), _free_body_rows(cuda)
+                    np.testing.assert_array_equal(actual.count, expected.count)
+                    np.testing.assert_array_equal(actual.type, expected.type)
+                    np.testing.assert_allclose(actual.impulses, expected.impulses, rtol=RTOL, atol=1.0e-6)
 
 
 if __name__ == "__main__":
