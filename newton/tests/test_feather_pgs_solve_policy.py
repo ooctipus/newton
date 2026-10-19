@@ -11,6 +11,7 @@ it on one call of every factory that takes a policy.
 
 import dataclasses
 import inspect
+import itertools
 import json
 import unittest
 from types import SimpleNamespace
@@ -53,6 +54,7 @@ from newton.tests.test_feather_pgs_point_streams import _kernel_hash
 SWEEPS = SolvePolicy(readout="sweeps")
 VELOCITY = SolvePolicy(velocity_change_tolerance=1.0e-3)
 TRACE = SolvePolicy(readout="trace")
+TRACED_VELOCITY = SolvePolicy(readout="trace", velocity_change_tolerance=1.0e-3)
 
 # Velocity-scaled votes each factory call must emit at a positive tolerance: every vote site with its own A_ii.
 _SCALED_VOTES = {
@@ -145,6 +147,101 @@ def _factory_calls():
     )
 
 
+def _axis(name, values=(False, True)):
+    """One census axis: a keyword over its values."""
+    return tuple({name: value} for value in values)
+
+
+def _vote_census():
+    """Every combination of the flags that add or remove vote sites, per policy factory: ``(name, factory, args, kwargs)``.
+
+    The axes follow the exit-voting factories' census in ``tools/fpgs_bench/kernel_identity.py`` at one
+    shape each. The matrix-free sweep keeps the current friction law without torsion or dense tiles, the
+    variants that compile the velocity law; the census pins the others' text unchanged.
+    """
+    local = (
+        _axis("paired_dof_count", (0, 6)),
+        _axis("persistent_queue"),
+        _axis("warps_per_block", (1, 2)),
+        _axis("lanes_per_world", (32, 16, 8)),
+        _axis("contact_capable"),
+        ({}, {"mf_max_constraints": 64, "local_mf_max_constraints": 12}),
+        _axis("dense_response_matrix"),
+    )
+    specs = (
+        (
+            "sparse",
+            _get_pgs_solve_sparse_kernel.__wrapped__,
+            (48, 18, 12),
+            (
+                ({}, {"mf_max_constraints": 32, "free_row_dofs": 6}),
+                _axis("active_rows"),
+                _axis("use_support_table"),
+                _axis("contact_triplets"),
+                _axis("velocity_limits"),
+                _axis("local_factors"),
+                _axis("warm_start"),
+                _axis("linked_rows"),
+            ),
+        ),
+        (
+            "sparse_lanes",
+            _get_pgs_solve_sparse_kernel.__wrapped__,
+            (32, 8, 8),
+            (_axis("lanes_per_world", (16, 8)), _axis("velocity_limits"), _axis("local_factors"), _axis("warm_start")),
+        ),
+        (
+            "mf_gs",
+            solver._get_pgs_solve_mf_gs_kernel.__wrapped__,
+            (64, 32, 12, "120"),
+            (
+                _axis("software_pipeline"),
+                _axis("shared_metadata"),
+                _axis("stream_mf_impulses"),
+                _axis("has_drive_rows"),
+                _axis("has_dense_velocity_limit_rows"),
+                _axis("fuse_vel_limits"),
+                ({}, {"skip_local_internal_worlds": True, "local_internal_max_constraints": 19}),
+                _axis("factor_coordinates"),
+                _axis("skip_incremental_rows", (0, 32)),
+                _axis("skip_response_block"),
+                _axis("independent_components"),
+            ),
+        ),
+        (
+            "paired",
+            solver._get_pgs_solve_paired_factor_kernel.__wrapped__,
+            (192, 29, 23, 6, "120"),
+            (_axis("contact_triples"), _axis("independent_components"), _axis("contact_units")),
+        ),
+        ("local", solver._get_pgs_solve_local_owned_kernel.__wrapped__, (192, 20, 9, "120"), local),
+        ("packets", row_packets.get_local_factory.__wrapped__(9, 6, 40), (192, 20, 9, "120"), local),
+        (
+            "sparse_diagonal",
+            solver._get_pgs_solve_sparse_diagonal_kernel.__wrapped__,
+            (64, 10, 9, "120"),
+            (_axis("contact_triples"), _axis("speculative_contact_batches"), _axis("contact_units")),
+        ),
+        (
+            "incremental",
+            solver._get_pgs_solve_mf_gs_incremental_kernel.__wrapped__,
+            (64, 32, 12, "120"),
+            (
+                ({"incremental_rows": 32}, {"incremental_rows": 64, "min_rows": 32}),
+                _axis("has_drive_rows"),
+                _axis("has_dense_velocity_limit_rows"),
+                _axis("skip_local_internal_worlds"),
+            ),
+        ),
+    )
+    for name, factory, args, axes in specs:
+        for options in itertools.product(*axes):
+            kwargs = {}
+            for option in options:
+                kwargs.update(option)
+            yield name, factory, args, kwargs
+
+
 class TestSolvePolicy(unittest.TestCase):
     """The frozen policy, its emitters and the factories that take it."""
 
@@ -173,9 +270,13 @@ class TestSolvePolicy(unittest.TestCase):
         self.assertIsNot(first, _get_pgs_solve_sparse_kernel(16, 6, 4))
 
     def test_policy_and_readout_options_are_keyword_only(self):
-        """Take the policy and the solver's readout option by keyword only, defaulting to the exact law."""
-        parameters = inspect.signature(SolverFeatherPGS).parameters["pgs_solve_readout"]
-        self.assertEqual((parameters.kind, parameters.default), (inspect.Parameter.KEYWORD_ONLY, "off"))
+        """Take the policy and the solver's readout and tolerance options by keyword only, defaulting to the exact law."""
+        parameters = inspect.signature(SolverFeatherPGS).parameters
+        for option, default in (("pgs_solve_readout", "off"), ("pgs_velocity_change_tolerance", 0.0)):
+            with self.subTest(option=option):
+                self.assertEqual(
+                    (parameters[option].kind, parameters[option].default), (inspect.Parameter.KEYWORD_ONLY, default)
+                )
         factories = [(name, factory) for name, factory, _, _ in _factory_calls()]
         factories += [("mf_gs_source", mf_gs_source.get_source), ("paired_source", paired_factor_source.get_source)]
         for name, factory in factories:
@@ -311,6 +412,38 @@ class TestVelocityExitLaw(unittest.TestCase):
                     self.assertIn("<= 0.001f", line)
                 for expected in _SCALED_VOTES[name]:
                     self.assertIn(expected, snippet)
+
+    def test_every_flag_combination_compiles_the_law_at_every_vote(self):
+        """Compile the velocity law, traced or not, into every vote of every valid flag combination.
+
+        A combination is valid when the factory builds it under the exact law; under a tolerance it
+        must then build as well, with every change vote bounded by the tolerance and, traced, one
+        exit record. Vote sites that only some flags emit (velocity-limit lanes, free-body rows, fused
+        drive clamps, streamed impulses, local matrix-free rows) would otherwise keep the exact law
+        unnoticed.
+        """
+        checked = dict.fromkeys(_SCALED_VOTES, 0)
+        for name, factory, args, kwargs in _vote_census():
+            try:
+                factory(*args, **kwargs)
+            except (ValueError, NotImplementedError, RuntimeError, AssertionError):
+                continue
+            for policy in (VELOCITY, TRACED_VELOCITY):
+                kernel = factory(*args, solve_policy=policy, **kwargs)
+                snippets = {snippet for snippet in _native_snippets(kernel) if "0.001f" in snippet}
+                if len(snippets) != 1:
+                    self.fail(f"{kernel.key}: {len(snippets)} snippets hold the tolerance")
+                (snippet,) = snippets
+                votes = [line.strip() for line in snippet.splitlines() if "changed = 1;" in line]
+                unbounded = [line for line in votes if "<= 0.001f" not in line]
+                if not votes or unbounded:
+                    self.fail(f"{kernel.key} {kwargs}: unbounded votes {unbounded[:2] or 'none found'}")
+                if policy.traces and (
+                    snippet.count("solve_trace_sweep(") != 1 or snippet.count("solve_trace_change(") < len(votes)
+                ):
+                    self.fail(f"{kernel.key} {kwargs}: the trace misses a vote or the exit")
+            checked[name] += 1
+        self.assertTrue(all(checked.values()), checked)
 
     def test_trace_records_every_vote_and_each_sweep(self):
         """Record each change before its vote and every sweep at its exit, under the exact law."""
