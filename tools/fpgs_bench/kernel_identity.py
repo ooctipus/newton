@@ -314,44 +314,51 @@ def held_factor_calls():
 
 
 def held_tree_layouts():
-    """Return ``{name: (layout, chain_scan, response, repair_options)}`` shaped after the suite's held trees.
+    """Return ``{name: (layout, chain_scan, response, repair_options)}`` at the suite's held-tree shapes.
 
-    Chain plans with free and fixed roots (one at 64 lanes, one with a stored
-    factor permutation), kinetic plans at 4, 8, 16, 32 and 64 lanes, and forests
-    with a free and a prescribed root, with sparse, Cholesky and diagonal
-    responses, input banks compared in the repair and an alternate repair
-    motion.
+    Chain plans with free and fixed roots (two at 64 lanes, one of them with a
+    stored factor permutation), kinetic plans at 4, 8, 16, 32 and 64 lanes, and
+    forests with a free and a prescribed root, with sparse, Cholesky and
+    diagonal responses and an alternate repair motion. Every layout but
+    ``chain_free44_l64_permuted``, ``kinetic_free17``, ``kinetic_free44_l64``
+    and ``forest10_free`` has the sizes, entry count, depth and permutation of
+    a tree the suite runs, so its finish and repair compile as that tree's do.
+    The depth of a chain plan reaches none of its kernels.
     """
     from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout  # noqa: PLC0415
 
     def reverse(dofs):
         return tuple(range(dofs - 1, -1, -1))
 
-    def tree(bodies, dofs, depth, root, *, lanes=0, entries=None, permutation=None, **forest):
+    def tree(bodies, dofs, depth, root, *, lanes=0, entries=None, inverse=None, permutation=None, **forest):
         entries = dofs * (dofs + 1) // 2 if entries is None else entries
+        inverse = dofs if inverse is None else inverse
         permutation = reverse(dofs) if permutation is None else permutation
-        return TreeLayout(bodies, dofs, entries, dofs, depth, root, permutation, lanes, **forest)
+        return TreeLayout(bodies, dofs, entries, inverse, depth, root, permutation, lanes, **forest)
 
     motion = {"motion_velocity": True}
-
-    def compared(coordinates):
-        # The one-pass repair that compares a group's input banks (a launch too small to classify); a fixed root's
-        # coordinates are its scalar joints'.
-        return {"bank_coordinates": coordinates}
-
     return {
-        "chain_free9": (tree(9, 14, 2, 6, entries=63), True, "sparse", {}),
-        "chain_free13": (tree(13, 18, 5, 6, entries=120), True, "sparse", {}),
-        "chain_free20": (tree(20, 25, 5, 6, entries=180), True, "sparse", {}),
-        "chain_free44_l64": (tree(44, 43, 10, 6, entries=434, permutation=tuple(range(43))), True, "sparse", {}),
+        "chain_free9": (tree(9, 14, 2, 6, entries=81, inverse=8), True, "sparse", {}),
+        "chain_free13": (tree(13, 18, 5, 6, entries=135, inverse=12), True, "sparse", {}),
+        "chain_free16": (tree(16, 27, 5, 6, entries=243), True, "sparse", {}),
+        "chain_free17": (tree(17, 18, 4, 6, entries=117, inverse=9), True, "sparse", {}),
+        "chain_free19": (tree(19, 18, 4, 6, entries=117, inverse=9), True, "sparse", {}),
+        "chain_free20": (tree(20, 25, 5, 6, entries=194, inverse=11), True, "sparse", {}),
+        "chain_free44_l64": (tree(44, 43, 10, 6, entries=434), True, "sparse", {}),
+        "chain_free44_l64_permuted": (
+            tree(44, 43, 10, 6, entries=434, permutation=tuple(range(43))),
+            True,
+            "sparse",
+            {},
+        ),
         "chain_fixed8": (tree(8, 6, 6, 0), True, "sparse", motion),
-        "chain_fixed11": (tree(11, 9, 8, 0), True, "sparse", motion),
-        "kinetic_fixed3_l4": (tree(3, 2, 2, 0, lanes=4), False, "cholesky", compared(2)),
+        "chain_fixed11": (tree(11, 9, 8, 0, entries=44), True, "sparse", motion),
+        "kinetic_fixed3_l4": (tree(3, 2, 2, 0, lanes=4), False, "cholesky", {}),
         "kinetic_free1_l8": (tree(1, 6, 0, 6, lanes=8), False, "cholesky", motion),
-        "kinetic_fixed11_l16": (tree(11, 9, 4, 0, lanes=16), False, "cholesky", compared(9)),
-        "kinetic_fixed9_l16_diagonal": (tree(9, 4, 4, 0, lanes=16), False, "diagonal", compared(4)),
+        "kinetic_fixed11_l16": (tree(11, 9, 9, 0, lanes=16, entries=44), False, "cholesky", {}),
+        "kinetic_fixed9_l16_diagonal": (tree(9, 4, 2, 0, lanes=16, entries=4), False, "diagonal", {}),
         "kinetic_free17": (tree(17, 18, 4, 6), False, "cholesky", {}),
-        "kinetic_fixed21": (tree(21, 16, 4, 0), False, "cholesky", motion),
+        "kinetic_fixed21": (tree(21, 16, 6, 0, entries=40), False, "cholesky", motion),
         "kinetic_free44_l64": (tree(44, 43, 10, 6), False, "sparse", {}),
         "forest13_l16": (
             tree(
@@ -360,7 +367,7 @@ def held_tree_layouts():
                 9,
                 0,
                 lanes=16,
-                entries=87,
+                entries=86,
                 roots=(0, 11, 12),
                 root_coordinates=(0, 6, 6),
                 root_offsets=(0, 9, 15),
@@ -374,9 +381,9 @@ def held_tree_layouts():
             tree(
                 32,
                 35,
-                10,
+                14,
                 0,
-                entries=318,
+                entries=222,
                 roots=(0, 30, 31),
                 root_coordinates=(0, 6, 6),
                 root_offsets=(0, 23, 29),
@@ -407,11 +414,16 @@ def held_tree_layouts():
 
 
 def held_tree_calls():
-    """Yield the repair, finish and predictor of every held-tree layout, plus the switch variants of three.
+    """Yield every held-tree layout's kernels as they run, plus the switch variants of four layouts.
 
-    The three switched layouts also yield the kernels of a launch large enough
-    to classify: the classification, the listed repair and, for a layout whose
-    repair compares input banks, the comparison pass.
+    Every held-tree operator requires body velocity, so the state kernels are
+    recorded with it. Each layout yields its repair, finish and predictor;
+    outside motion-velocity layouts, whose stamps a copied bank may name, the
+    one-pass repair that compares input banks (the first repair of a captured
+    step); and the kernels of a launch large enough to classify: the
+    classification, the listed repair and, outside motion-velocity layouts,
+    the comparison pass. The switched layouts add the comparison forms, the
+    stage clocks and the repair and finish without body velocity.
     """
     from newton._src.solvers.feather_pgs import tree_kinetic_state as native  # noqa: PLC0415
 
@@ -419,30 +431,34 @@ def held_tree_calls():
     predictor = _unwrapped(native.get_predictor_kernel)
     classify = _unwrapped(native.get_classify_kernel)
     bank = _unwrapped(native.get_bank_kernel)
-    switched = ("chain_free13", "kinetic_fixed11_l16", "forest13_l16")
+    switched = ("chain_free13", "kinetic_fixed11_l16", "forest13_l16", "forest32")
     for layout_name, (tree, chain, response, repair_options) in held_tree_layouts().items():
         layout = {"layout": Named(layout_name, tree)}
-        # The alternate motion and a compared input bank are repair-only contracts, body velocity a state-kernel one.
-        finish_options = {
-            key: value for key, value in repair_options.items() if key not in ("motion_velocity", "bank_coordinates")
-        }
+        # The alternate motion is a repair-only contract, body velocity a state-kernel one.
+        finish_options = {key: value for key, value in repair_options.items() if key != "motion_velocity"}
         variants = [{}]
         if layout_name in switched:
-            variants += [{"reference": True}, {"clocked": True}, {"body_velocity": True}]
+            variants += [{"reference": True}, {"clocked": True}, {"body_velocity": False}]
         for options in variants:
-            yield "tree_kinetic_state.get_state_kernel", state, (False, chain), {**layout, **repair_options, **options}
-            yield "tree_kinetic_state.get_state_kernel", state, (True, chain), {**layout, **finish_options, **options}
-            if "body_velocity" not in options:
+            state_options = {"body_velocity": True, **options}
+            kwargs = {**layout, **repair_options, **state_options}
+            yield "tree_kinetic_state.get_state_kernel", state, (False, chain), kwargs
+            kwargs = {**layout, **finish_options, **state_options}
+            yield "tree_kinetic_state.get_state_kernel", state, (True, chain), kwargs
+            if options.keys() <= {"reference", "clocked"}:
                 kwargs = {**layout, "response": response, **options}
                 yield "tree_kinetic_state.get_predictor_kernel", predictor, (chain,), kwargs
-        if layout_name in switched:
-            motion_options = {key: value for key, value in repair_options.items() if key == "motion_velocity"}
-            yield "tree_kinetic_state.get_classify_kernel", classify, (chain,), {**layout, **motion_options}
-            listed = {**layout, **motion_options, "listed": True}
-            yield "tree_kinetic_state.get_state_kernel", state, (False, chain), listed
-            if "bank_coordinates" in repair_options:
-                coordinates = {**layout, "coordinates": repair_options["bank_coordinates"]}
-                yield "tree_kinetic_state.get_bank_kernel", bank, (chain,), coordinates
+        # A group's coordinates: a free root's quaternion takes one more than its three rotation velocities.
+        coordinates = tree.dofs + tree.free_roots
+        compares = "motion_velocity" not in repair_options
+        if compares:
+            kwargs = {**layout, "body_velocity": True, "bank_coordinates": coordinates}
+            yield "tree_kinetic_state.get_state_kernel", state, (False, chain), kwargs
+        yield "tree_kinetic_state.get_classify_kernel", classify, (chain,), {**layout, **repair_options}
+        kwargs = {**layout, **repair_options, "body_velocity": True, "listed": True}
+        yield "tree_kinetic_state.get_state_kernel", state, (False, chain), kwargs
+        if compares:
+            yield "tree_kinetic_state.get_bank_kernel", bank, (chain,), {**layout, "coordinates": coordinates}
 
 
 def _axis(name, values=(False, True)):

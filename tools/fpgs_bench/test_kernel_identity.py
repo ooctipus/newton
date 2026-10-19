@@ -119,6 +119,38 @@ class TestKernelIdentity(unittest.TestCase):
         expected = {(16, 40, False), (6, 21, False), (9, 86, True), (6, 86, True), (23, 222, True), (6, 222, True)}
         self.assertEqual(observed, expected)
 
+    def test_held_tree_grid_records_the_kernels_as_they_run(self):
+        """Record every layout's state kernels with body velocity, which every held-tree operator requires.
+
+        Every layout records its finish, its repair, its classification and its
+        listed repair and, outside motion-velocity layouts, its one-pass repair
+        that compares input banks and its comparison pass. The state kernels
+        without body velocity stay recorded as a switch of four layouts, both
+        forests among them.
+        """
+        calls = [
+            (name, args, kwargs["layout"].name, {key: value for key, value in kwargs.items() if key != "layout"})
+            for name, _, args, kwargs in identity.held_tree_calls()
+        ]
+        state = "tree_kinetic_state.get_state_kernel"
+        for name, (tree, chain, _, options) in identity.held_tree_layouts().items():
+            with self.subTest(layout=name):
+                for finish in (False, True):
+                    running = {
+                        key: value for key, value in options.items() if not (finish and key == "motion_velocity")
+                    }
+                    self.assertIn((state, (finish, chain), name, {**running, "body_velocity": True}), calls)
+                self.assertIn(("tree_kinetic_state.get_classify_kernel", (chain,), name, options), calls)
+                self.assertIn((state, (False, chain), name, {**options, "body_velocity": True, "listed": True}), calls)
+                coordinates = tree.dofs + tree.free_roots
+                compares = not options.get("motion_velocity", False)
+                banked = {"body_velocity": True, "bank_coordinates": coordinates}
+                self.assertEqual((state, (False, chain), name, banked) in calls, compares)
+                passes = ("tree_kinetic_state.get_bank_kernel", (chain,), name, {"coordinates": coordinates})
+                self.assertEqual(passes in calls, compares)
+        without = {layout for _, _, layout, options in calls if options.get("body_velocity") is False}
+        self.assertEqual(without, {"chain_free13", "kinetic_fixed11_l16", "forest13_l16", "forest32"})
+
     def test_combinations_take_one_option_of_every_axis(self):
         """Merge one option of every census axis, for every combination of options."""
         axes = (identity._axis("a"), ({}, {"b": 1, "c": 2}))
