@@ -3826,10 +3826,13 @@ class SolverFeatherPGS(SolverBase):
         numeric runs that check, and one that finds a moved joint frame, as
         when Isaac Lab re-poses a fixed root through
         :attr:`~newton.Model.joint_X_p`, invalidates every cache instead, while
-        a changed joint axis raises. That flag covers the :class:`~newton.Model`
-        joint arrays only: after writing :class:`~newton.State` joint
-        coordinates outside :meth:`step`, call :meth:`reset` with a world mask
-        or :meth:`notify_state_changed`.
+        a changed joint axis raises. Cached mass factors take a moved frame at
+        their next mass refresh, as ordinary dynamics' mass matrix does: a
+        rigid re-pose of a fixed root leaves them unchanged up to rounding, and
+        :meth:`reset` requests that refresh for the worlds it selects. That
+        flag covers the :class:`~newton.Model` joint arrays only: after
+        writing :class:`~newton.State` joint coordinates outside :meth:`step`,
+        call :meth:`reset` with a world mask or :meth:`notify_state_changed`.
         """
         # Derive the kinematic state first: a body-flag change the solver
         # cannot absorb raises here, before any mask, cache or owner changes.
