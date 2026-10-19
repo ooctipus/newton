@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import gc
+import threading
 import unittest
 import weakref
 from unittest import mock
@@ -14,6 +15,7 @@ import numpy as np
 import warp as wp
 
 import newton
+import newton._src.sim.articulation as articulation_module
 from newton._src.sim.articulation import (
     _CLEAR_REPLAY_CAPACITY,
     _clear_replays,
@@ -1089,6 +1091,79 @@ def test_zero_selected_blocks_replay_holds_no_buffers(test, device):
             _launch_zero_selected_blocks(blocks, mask, 4, device)
         test.assertEqual(len(_clear_replays), _CLEAR_REPLAY_CAPACITY)
 
+        # The oldest records went first: the last buffers replay and the first records anew.
+        with mock.patch.object(wp, "launch", wraps=wp.launch) as launch:
+            for blocks in kept[3:]:
+                _launch_zero_selected_blocks(blocks, mask, 4, device)
+            test.assertEqual(launch.call_count, 0)
+            _launch_zero_selected_blocks(kept[0], mask, 4, device)
+            test.assertEqual(launch.call_count, 1)
+
+
+def test_zero_selected_blocks_replay_cache_takes_concurrent_records(test, device):
+    """Keep the replay cache bounded and consistent when two threads record clears at once.
+
+    The cache below makes each thread read its size, or its oldest key, and then
+    wait until the other thread has read it too, as an unlucky thread switch can.
+    Without a lock around the eviction and the insertion, both threads then see room
+    for one more record and the cache overflows, or both drop the same oldest record
+    and the second drop raises KeyError. With the lock, the second thread reads only
+    after the first has finished, and the wait times out.
+    """
+    meet_at_size, meet_at_oldest = threading.Barrier(2, timeout=0.1), threading.Barrier(2, timeout=0.1)
+
+    def meet(barrier):
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:
+            pass
+
+    class InterleavingDict(dict):
+        def __len__(self):
+            size = super().__len__()
+            meet(meet_at_size)
+            return size
+
+        def __iter__(self):
+            keys = list(super().__iter__())
+            meet(meet_at_oldest)
+            return iter(keys)
+
+    mask = wp.array([True, False, True, False], dtype=bool, device=device)
+    values = np.ones((4, 6, 2), dtype=np.float32)
+    expected = values.copy()
+    expected[[0, 2]] = 0.0
+    # Load the module before the threads record their launches.
+    _launch_zero_selected_blocks(wp.array(values, dtype=float, device=device), mask, 4, device)
+    for free_records in (1, 0):
+        with test.subTest(free_records=free_records):
+            for barrier in (meet_at_size, meet_at_oldest):
+                barrier.reset()
+            cache = InterleavingDict({("other", i): None for i in range(_CLEAR_REPLAY_CAPACITY - free_records)})
+            buffers = [wp.array(values, dtype=float, device=device) for _ in range(2)]
+            errors = []
+
+            def clear(blocks, errors=errors):
+                try:
+                    _launch_zero_selected_blocks(blocks, mask, 4, device)
+                except Exception as error:
+                    errors.append(error)
+
+            with mock.patch.object(articulation_module, "_clear_replays", cache):
+                threads = [threading.Thread(target=clear, args=(blocks,)) for blocks in buffers]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+            for barrier in (meet_at_size, meet_at_oldest):
+                barrier.abort()
+
+            test.assertEqual(errors, [])
+            test.assertEqual(len(cache), _CLEAR_REPLAY_CAPACITY)
+            test.assertEqual(sum(key[0] == "other" for key in cache), _CLEAR_REPLAY_CAPACITY - 2)
+            for blocks in buffers:
+                _assert_bits_equal(blocks.numpy(), expected)
+
 
 def test_zero_selected_blocks_fills_cpu_memory_on_host(test, device):
     """Clear selected CPU blocks with a host fill, not the kernel, whose per-entry loop runs far slower on CPU."""
@@ -1708,6 +1783,12 @@ add_function_test(
     "test_zero_selected_blocks_replay_holds_no_buffers",
     test_zero_selected_blocks_replay_holds_no_buffers,
     devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_zero_selected_blocks_replay_cache_takes_concurrent_records",
+    test_zero_selected_blocks_replay_cache_takes_concurrent_records,
+    devices=[device for device in devices if device.is_cpu],
 )
 add_function_test(
     TestJacobianMassMatrix,

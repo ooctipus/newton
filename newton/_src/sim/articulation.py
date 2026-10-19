@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import warp as wp
 
 from ..math import quat_decompose, transform_twist, velocity_at_point
@@ -1253,6 +1255,9 @@ _CLEAR_REPLAY_CAPACITY = 16
 _clear_replays: dict[tuple, wp.Launch] = {}
 """Recorded clear launches, keyed by every argument value they pack."""
 
+_clear_replays_lock = threading.Lock()
+"""Serializes changes to :data:`_clear_replays`; lookups read it without the lock."""
+
 
 def _unowned_view(array: wp.array, dtype=None, shape: tuple[int, ...] | None = None) -> wp.array:
     """Return a view of ``array``'s memory that does not keep the memory alive.
@@ -1356,9 +1361,11 @@ def _launch_zero_selected_blocks(
         )
         if launch is None:
             return  # warp.launch launches nothing either
-        if len(_clear_replays) >= _CLEAR_REPLAY_CAPACITY:
-            del _clear_replays[next(iter(_clear_replays))]
-        _clear_replays[key] = launch
+        with _clear_replays_lock:
+            if key not in _clear_replays:
+                while len(_clear_replays) >= _CLEAR_REPLAY_CAPACITY:
+                    del _clear_replays[next(iter(_clear_replays))]
+            _clear_replays[key] = launch
     launch.launch()
 
 
